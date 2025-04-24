@@ -30,8 +30,10 @@ public:
 
     uint32_t getRowPitch() const;
 
-    void hostImageCopyFrom(void *ptr);
+    void hostImageCopyFrom(VkInstance instance, void *ptr);
+    void hostImageCopyTo(VkInstance instance, void *ptr);
 
+    void hostImaggeTransition(VkInstance instance, VkImageLayout newLayout);
 private:
     VkExtent3D m_dim;
     VkFormat m_format;

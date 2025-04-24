@@ -35,11 +35,31 @@ void VulkanDevice::getProperties() {
         std::cout << "device extension " << ext.extensionName << std::endl;
     }
 
-    VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
-    subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    subgroup_properties.pNext = nullptr;
     VkPhysicalDeviceProperties2 properties2 = {};
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+
+#ifdef VK_EXT_host_image_copy
+    VkPhysicalDeviceHostImageCopyProperties hostimagecopyproperty = {};
+    hostimagecopyproperty.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES;
+    hostimagecopyproperty.pNext = nullptr;
+
+    properties2.pNext = &hostimagecopyproperty;
+
+    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
+    this->copySrcLayout.resize(hostimagecopyproperty.copySrcLayoutCount);
+    this->copyDstLayout.resize(hostimagecopyproperty.copyDstLayoutCount);
+    hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout.data();
+    hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout.data();
+#endif
+
+    VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
+    subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+#ifdef VK_EXT_host_image_copy
+    subgroup_properties.pNext = &hostimagecopyproperty;
+#else
+    subgroup_properties.pNext = nullptr;
+#endif
+
     properties2.pNext = &subgroup_properties;
 
     vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);

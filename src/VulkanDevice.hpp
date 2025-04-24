@@ -28,6 +28,17 @@ public:
 
     float getTimestampPeriod() const { return timestampPeriod; }
 
+    
+    bool checkHostImageCopyDstLayoutSupport(VkImageLayout layout)
+    {
+        for (auto i : this->copyDstLayout) {
+            if (i == layout) {
+                return true;
+            }
+        }
+        return false;
+    }
+
 private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice logicalDevice = VK_NULL_HANDLE;
@@ -38,6 +49,9 @@ private:
     std::vector<VkExtensionProperties> ext_properties;
     VkPhysicalDeviceProperties deviceProperties;
     float timestampPeriod;
+
+    std::vector<VkImageLayout> copySrcLayout;
+    std::vector<VkImageLayout> copyDstLayout;
 
     std::vector<uintptr_t> enabledFeatures;
     std::vector<const char *> enabledExtensions;

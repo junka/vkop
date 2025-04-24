@@ -62,7 +62,7 @@ void VulkanImage::createImage()
     imageCreateInfo.mipLevels = 1;
     imageCreateInfo.arrayLayers = 1;
     imageCreateInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageCreateInfo.tiling = VK_IMAGE_TILING_LINEAR;
+    imageCreateInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
     imageCreateInfo.usage = m_usage;
     imageCreateInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageCreateInfo.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
@@ -219,7 +219,38 @@ uint32_t VulkanImage::getRowPitch() const
     return rowPitch;
 }
 
-void VulkanImage::hostImageCopyFrom(void *ptr) {
+/*
+* For host image copy image layout transition
+* This is done on host
+*/
+void VulkanImage::hostImaggeTransition(VkInstance instance, VkImageLayout newLayout) {
+#ifdef VK_EXT_host_image_copy
+
+    VkImageSubresourceRange subrange = {};
+    subrange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subrange.baseMipLevel = 0;
+    subrange.baseArrayLayer = 0;
+    subrange.levelCount = 1;
+    subrange.layerCount = 1;
+
+    VkHostImageLayoutTransitionInfo transinfo = {};
+    transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
+    transinfo.oldLayout = m_layout;
+    transinfo.newLayout = newLayout;
+    transinfo.image = m_image;
+    transinfo.subresourceRange = subrange;
+    auto vkTransitionImageLayoutEXT = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+                vkGetInstanceProcAddr(instance, "vkTransitionImageLayoutEXT"));
+    if (vkTransitionImageLayoutEXT) {
+        vkTransitionImageLayoutEXT(m_device, 1, &transinfo);
+        m_layout = newLayout;
+    }
+#else
+    (void)newLayout;
+#endif
+}
+
+void VulkanImage::hostImageCopyFrom(VkInstance instance, void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkMemoryToImageCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
@@ -237,10 +268,43 @@ void VulkanImage::hostImageCopyFrom(void *ptr) {
     copyinfo.dstImageLayout = m_layout;
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
-
-    vkCopyMemoryToImage(m_device, &copyinfo);
+    auto vkCopyMemoryToImageEXT = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(
+                vkGetInstanceProcAddr(instance, "vkCopyMemoryToImageEXT"));
+    if (vkCopyMemoryToImageEXT)
+        vkCopyMemoryToImageEXT(m_device, &copyinfo);
 #else
+    (void)(ptr);
+#endif
+}
 
+
+
+void VulkanImage::hostImageCopyTo(VkInstance instance, void *ptr) {
+#ifdef VK_EXT_host_image_copy
+    VkImageToMemoryCopy region = {};
+    region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = m_dim;
+    region.pHostPointer = ptr;
+    region.memoryRowLength = m_dim.width;
+    region.memoryImageHeight = m_dim.height;
+
+    VkCopyImageToMemoryInfo copyinfo = {};
+    copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
+    // copyinfo.flags = VK_HOST_IMAGE_COPY_MEMCPY;
+    copyinfo.srcImage = m_image;
+    copyinfo.srcImageLayout = m_layout;
+    copyinfo.regionCount = 1;
+    copyinfo.pRegions = &region;
+    auto vkCopyImageToMemoryEXT = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(
+                vkGetInstanceProcAddr(instance, "vkCopyImageToMemoryEXT"));
+    if (vkCopyImageToMemoryEXT)
+        vkCopyImageToMemoryEXT(m_device, &copyinfo);
+#else
+    (void)(ptr);
 #endif
 }
 

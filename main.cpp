@@ -188,7 +188,7 @@ struct test_params {
 };
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
-void setImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanImage> image)
+void setImageData(VkInstance ins, float *data, std::vector<int> nchw, std::shared_ptr<VulkanImage> image)
 {
     int batch = nchw[0];//1
     int depth = nchw[1];//6
@@ -199,17 +199,13 @@ void setImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanImag
     int stride_h = width;
     int stride_c = width * height;
     int stride_n = width * height * depth;
-
-    
-    // int size = batch * depth * height * width;
-
-    // int realwidth = width * UP_DIV(depth, 4);
     int realdepth = UP_DIV(depth, 4);
-    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
-    void *ptr = image->getMappedMemory();
+    int realwidth = width * UP_DIV(depth, 4);
 
-    const uint32_t rowPitch = image->getRowPitch();
-    // std::cout << "height " << height << ", width " << width << std::endl;
+    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
+    float *ptr = (float *)malloc(batch * height * realdepth * realwidth * 4 * sizeof(float));
+
+    uint32_t rowPitch = realwidth * 4 * sizeof(float);
     float *dst = reinterpret_cast<float *>(ptr);
     for (int b = 0; b < batch; b++) {
         float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
@@ -218,15 +214,11 @@ void setImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanImag
             for (int h = 0; h < height; h++) {
                 for (int w = 0; w < width; w++) {
                     int offset = b * stride_n + 4 * c * stride_c + h * stride_h + w * stride_w;
-                    // Extract RGBA values from NCHW data
-                    // if (4 *c >= 4) {
-                    //     std::cout << depth << "c " << 4*c << " h " << h << " w " << w << " offset " << offset  << " data " << data[offset] << std::endl;
-                    // }
+
                     float r = data[offset];
                     float g = (4 * c + 1 < depth) ? data[stride_c + offset] : 0.0f;
                     float b = (4 * c + 2 < depth) ? data[2 * stride_c + offset] : 0.0f;
                     float a = (4 * c + 3 < depth) ? data[3 * stride_c + offset] : 0.0f;
-                    
 
                     // Write RGBA values to the Vulkan image memory
                     dst[w * 4 + 0] = r;
@@ -239,11 +231,12 @@ void setImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanImag
             }
         }
     }
-    // std::cout << "set image data " << q << " size: " << size << std::endl;
-    image->unmapMemory();
+    image->hostImageCopyFrom(ins, ptr);
+    free(ptr);
 }
 
-bool verifyImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanImage> image) {
+
+bool verifyImageData(VkInstance ins, float *data, std::vector<int> nchw, std::shared_ptr<VulkanImage> image) {
     int batch = nchw[0];
     int depth = nchw[1];
     int height = nchw[2];
@@ -254,17 +247,16 @@ bool verifyImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanI
     int stride_c = width * height;
     int stride_n = width * height * depth;
 
-    // size_t size = batch * depth * width * height;
     bool ret = true;
-    void *ptr = image->getMappedMemory();
     int realdepth = UP_DIV(depth, 4);
+    int realwidth = width * UP_DIV(depth, 4);
+    
+    float *ptr = (float *)malloc(batch * height * realdepth * realwidth * 4 * sizeof(float));
+    image->hostImageCopyTo(ins, ptr);
 
-    const uint32_t rowPitch = image->getRowPitch();
+    uint32_t rowPitch = realwidth * 4 * sizeof(float);
     // since format is VK_FORMAT_R32G32B32A32_SFLOAT
     float *dst = reinterpret_cast<float *>(ptr);
-    // for (int i = 0; i < (int)size; i++) {
-    //     std::cout << "expect at " << i << ", " << " expect " << data[i] << std::endl;
-    // }
     for (int b = 0; b < batch; b++) {
         float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
         for (int c = 0; c < realdepth; c++) {
@@ -294,17 +286,13 @@ bool verifyImageData(float *data, std::vector<int> nchw, std::shared_ptr<VulkanI
             }
         }
     }
-
-    image->unmapMemory();
+    free(ptr);
     return ret;
 }
 
 int main() {
     struct test_params test_params;
     test_params.initTestdata();
-    // for (int i = 0; i < test_params.originGridData.size() ; i++) {
-    //     std::cout << "img3 data "<< i << ": " << inputPtr[i] << std::endl;
-    // }
     try {
         VulkanInstance instance;
 
@@ -318,14 +306,12 @@ int main() {
 
             VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
 
-            VulkanCommandBuffer cmd(device, cmdpool.getCommandPool());
-
             auto img1 = std::make_shared<VulkanImage>(pdev, dev->getComputeQueueFamilyIndex(), device, VkExtent3D {
                 (uint32_t)test_params.outWidth * UP_DIV(test_params.depth, 4),
                 (uint32_t)test_params.outHeight,
                 1
             }, VK_FORMAT_R32G32B32A32_SFLOAT,
-                VK_IMAGE_USAGE_STORAGE_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+                VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 VK_IMAGE_TYPE_2D);
 
             auto img2 = std::make_shared<VulkanImage>(pdev, dev->getComputeQueueFamilyIndex(), device, VkExtent3D{
@@ -333,7 +319,7 @@ int main() {
                 (uint32_t)test_params.inHeight,
                 1
             }, VK_FORMAT_R32G32B32A32_SFLOAT,
-                VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 VK_IMAGE_TYPE_2D);
 
             auto img3 = std::make_shared<VulkanImage>(pdev, dev->getComputeQueueFamilyIndex(), device, VkExtent3D{
@@ -341,17 +327,24 @@ int main() {
                 (uint32_t)test_params.outWidth,
                 1
             }, VK_FORMAT_R32G32B32A32_SFLOAT,
-                VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT|VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 VK_IMAGE_TYPE_2D);//VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
 
             auto b = std::make_shared<VulkanBuffer>(pdev, dev->getComputeQueueFamilyIndex(), device, sizeof(GpuGridSampleParam),
                 VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-            cmd.begin();
-            img1->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
-            img2->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
-            img3->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
-            cmd.end();
+            // cmd.begin();
+            // img1->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
+            // img2->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
+            // img3->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
+            // cmd.end();
+            if (dev->checkHostImageCopyDstLayoutSupport(VK_IMAGE_LAYOUT_GENERAL)) {
+                img1->hostImaggeTransition(instance.getInstance(), VK_IMAGE_LAYOUT_GENERAL);
+            } else {
+                img1->hostImaggeTransition(instance.getInstance(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            }
+            img2->hostImaggeTransition(instance.getInstance(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            img3->hostImaggeTransition(instance.getInstance(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             
             // Ensure shared pointers are retained before cmd.submit
             std::vector<std::shared_ptr<VulkanResource>> objs = {
@@ -361,14 +354,18 @@ int main() {
                 b
             };
 
-            cmd.submit(dev->getComputeQueue());
-
             float *inputPtr = test_params.originInputData.data();
             float *gridPtr = test_params.originGridData.data();
-            setImageData(inputPtr, {test_params.batch, test_params.depth, test_params.inHeight, test_params.inWidth}, img2);
-            setImageData(gridPtr, {test_params.batch, test_params.outHeight, test_params.outWidth, 2}, img3);
-            // img2.setImageData(inputPtr, {test_params.batch, test_params.depth, test_params.inHeight, test_params.inWidth});
-            // img3.setImageData(gridPtr, {test_params.batch, test_params.outHeight, test_params.outWidth, 2});
+            setImageData(instance.getInstance(), inputPtr, {test_params.batch, test_params.depth, test_params.inHeight, test_params.inWidth}, img2);
+            setImageData(instance.getInstance(), gridPtr, {test_params.batch, test_params.outHeight, test_params.outWidth, 2}, img3);
+
+            // can not do transition with host image copy since the limit to dst layout?
+            VulkanCommandBuffer cmd(device, cmdpool.getCommandPool());
+            cmd.begin();
+            img2->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
+            img3->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
 
             struct GpuGridSampleParam *para = reinterpret_cast<GpuGridSampleParam*>(b->getMappedMemory());
             para->outImgSize[0] = test_params.outWidth;
@@ -402,7 +399,7 @@ int main() {
             double ts = double(r[1]-r[0])* double(1e-9) * dev->getTimestampPeriod();
             std::cout << "Time: " << ts  << " s" << std::endl;
 
-            bool ret = verifyImageData(test_params.expectedOutput.data(), {test_params.batch, test_params.depth, test_params.outHeight, test_params.outWidth}, img1);
+            bool ret = verifyImageData(instance.getInstance(), test_params.expectedOutput.data(), {test_params.batch, test_params.depth, test_params.outHeight, test_params.outWidth}, img1);
             // bool ret = img1.verifyImageData(test_params.expectedOutput.data(), {test_params.batch, test_params.depth, test_params.outHeight, test_params.outWidth});
             if (ret) {
                 std::cout << "Test Passed" << std::endl;

@@ -81,10 +81,7 @@ namespace vkop {
     PFN(vkResetQueryPool) \
     PFN(vkGetImageMemoryRequirements2) \
     PFN(vkGetBufferMemoryRequirements2) \
-    PFN(vkGetImageSparseMemoryRequirements2) \
-    PFN(vkCopyMemoryToImage) \
-    PFN(vkCopyImageToMemory) \
-    PFN(vkCopyImageToImage)
+    PFN(vkGetImageSparseMemoryRequirements2)
 
 class VulkanLib {
 public:
