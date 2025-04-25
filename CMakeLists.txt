@@ -10,9 +10,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -Wall -Wextra -Werror -fno-omit-f
 
 find_package(Vulkan REQUIRED)
 include_directories(${Vulkan_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/src)
+include_directories(${CMAKE_SOURCE_DIR}/ops)
 
 # Source files
-file(GLOB_RECURSE SRC_FILES main.cpp src/*.cpp src/*.h)
+file(GLOB_RECURSE SRC_FILES main.cpp src/*.cpp src/*.hpp ops/*.cpp ops/*.hpp)
 
 # Add executable
 add_executable(vkop ${SRC_FILES})

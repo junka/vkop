@@ -7,7 +7,7 @@
 
 namespace vkop {
 
-VulkanInstance::VulkanInstance() : instance(VK_NULL_HANDLE) {
+VulkanInstance::VulkanInstance() : m_instance(VK_NULL_HANDLE) {
     createInstance("vkop", VK_MAKE_VERSION(1, 0, 0));
 
 #if VK_EXT_debug_utils
@@ -22,26 +22,11 @@ VulkanInstance::VulkanInstance() : instance(VK_NULL_HANDLE) {
 }
 
 VulkanInstance::~VulkanInstance() {
-#if VK_EXT_debug_utils
-    if (callback.utils && !extensions.empty() && 
-        std::string(extensions[0]).compare(VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
-        auto vkDestroyDebugUtilsMessengerEXT = reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
-                vkGetInstanceProcAddr(instance, "vkDestroyDebugUtilsMessengerEXT"));
-        if (vkDestroyDebugUtilsMessengerEXT)
-            vkDestroyDebugUtilsMessengerEXT(instance, callback.utils, nullptr);
-    }
-#endif
-#if VK_EXT_debug_report
-    if (callback.report && !extensions.empty() &&
-        std::string(extensions[0]).compare(VK_EXT_DEBUG_REPORT_EXTENSION_NAME) == 0) {
-        auto vkDestroyDebugReportCallbackEXT = reinterpret_cast<PFN_vkDestroyDebugReportCallbackEXT>(
-                vkGetInstanceProcAddr(instance, "vkDestroyDebugReportCallbackEXT"));
-        if (vkDestroyDebugReportCallbackEXT)
-            vkDestroyDebugReportCallbackEXT(instance, callback.report, nullptr);
-    }
-#endif
+    std::cout << "VulkanInstance::~VulkanInstance" << std::endl;
     destroyInstance();
 }
+
+
 uint32_t VulkanInstance::getVulkanVersion(void)
     {
         uint32_t version = VK_API_VERSION_1_0;
@@ -50,7 +35,7 @@ uint32_t VulkanInstance::getVulkanVersion(void)
         return version;
     }
 void VulkanInstance::createInstance(const std::string& applicationName, uint32_t appVersion) {
-    if (instance != VK_NULL_HANDLE) {
+    if (m_instance != VK_NULL_HANDLE) {
         throw std::runtime_error("Vulkan instance is already initialized.");
     }
 
@@ -86,20 +71,42 @@ void VulkanInstance::createInstance(const std::string& applicationName, uint32_t
     }
 
     // Create Vulkan instance
-    if (vkCreateInstance(&createInfo, nullptr, &instance) != VK_SUCCESS) {
+    if (vkCreateInstance(&createInfo, nullptr, &m_instance) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan instance.");
     }
 }
 
 void VulkanInstance::destroyInstance() {
-    if (instance != VK_NULL_HANDLE) {
-        vkDestroyInstance(instance, nullptr);
-        instance = VK_NULL_HANDLE;
+#if VK_EXT_debug_utils
+    if (callback.utils && !extensions.empty() && 
+        std::string(extensions[0]).compare(VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0) {
+        auto vkDestroyDebugUtilsMessengerEXT =
+        reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkDestroyDebugUtilsMessengerEXT"));
+        if (vkDestroyDebugUtilsMessengerEXT)
+            vkDestroyDebugUtilsMessengerEXT(m_instance, callback.utils, nullptr);
+    }
+#endif
+#if VK_EXT_debug_report
+    if (callback.report && !extensions.empty() &&
+        std::string(extensions[0]).compare(VK_EXT_DEBUG_REPORT_EXTENSION_NAME) == 0) {
+        auto vkDestroyDebugReportCallbackEXT =
+        reinterpret_cast<PFN_vkDestroyDebugReportCallbackEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkDestroyDebugReportCallbackEXT"));
+    
+        if (vkDestroyDebugReportCallbackEXT)
+            vkDestroyDebugReportCallbackEXT(m_instance, callback.report, nullptr);
+    }
+#endif
+
+    if (m_instance != VK_NULL_HANDLE) {
+        vkDestroyInstance(m_instance, nullptr);
+        m_instance = VK_NULL_HANDLE;
     }
 }
 
 VkInstance VulkanInstance::getInstance() const {
-    return instance;
+    return m_instance;
 }
 
 
@@ -188,10 +195,10 @@ VkDebugUtilsMessengerEXT VulkanInstance::CreateDebugUtilsMessenger(void)
 
     VkDebugUtilsMessengerEXT callback = VK_NULL_HANDLE;
     auto vkCreateDebugUtilsMessengerEXT =
-    reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
-        vkGetInstanceProcAddr(instance, "vkCreateDebugUtilsMessengerEXT"));
+        reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkCreateDebugUtilsMessengerEXT"));
     if (vkCreateDebugUtilsMessengerEXT) {
-        error = vkCreateDebugUtilsMessengerEXT(instance, &callbackCreateInfo, nullptr,
+        error = vkCreateDebugUtilsMessengerEXT(m_instance, &callbackCreateInfo, nullptr,
                                         &callback);
         if (error != VK_SUCCESS) {
             std::cerr << "Failed to create debug callback" << std::endl;
@@ -216,10 +223,10 @@ VkDebugReportCallbackEXT VulkanInstance::CreateDebugReportCallback(void)
     callbackCreateInfo.pUserData = nullptr;
     VkDebugReportCallbackEXT callback = VK_NULL_HANDLE;
     auto vkCreateDebugReportCallbackEXT =
-    reinterpret_cast<PFN_vkCreateDebugReportCallbackEXT>(
-        vkGetInstanceProcAddr(instance, "vkCreateDebugReportCallbackEXT"));
+        reinterpret_cast<PFN_vkCreateDebugReportCallbackEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkCreateDebugReportCallbackEXT"));
     if (vkCreateDebugReportCallbackEXT) {
-        error = vkCreateDebugReportCallbackEXT(instance, &callbackCreateInfo, nullptr,
+        error = vkCreateDebugReportCallbackEXT(m_instance, &callbackCreateInfo, nullptr,
                                         &callback);
         if (error != VK_SUCCESS) {
             // std::cout << "Failed to create debug report callback" << std::endl;
@@ -235,12 +242,12 @@ VkDebugReportCallbackEXT VulkanInstance::CreateDebugReportCallback(void)
 void VulkanInstance::enumPhysicalDevices(void)
 {
     uint32_t count;
-    VkResult error = vkEnumeratePhysicalDevices(instance, &count, nullptr);
+    VkResult error = vkEnumeratePhysicalDevices(m_instance, &count, nullptr);
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
     physicalDevices.resize(count);
-    error = vkEnumeratePhysicalDevices(instance, &count, physicalDevices.data());
+    error = vkEnumeratePhysicalDevices(m_instance, &count, physicalDevices.data());
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
@@ -254,7 +261,9 @@ void VulkanInstance::enumPhysicalDevices(void)
 
 void VulkanInstance::getToolinfo(VkPhysicalDevice physicalDevice) {
     uint32_t toolCount = 0;
-    auto vkGetPhysicalDeviceToolPropertiesEXT = reinterpret_cast<PFN_vkGetPhysicalDeviceToolPropertiesEXT>(vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceToolPropertiesEXT"));
+    auto vkGetPhysicalDeviceToolPropertiesEXT =
+        reinterpret_cast<PFN_vkGetPhysicalDeviceToolPropertiesEXT>(
+            vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceToolPropertiesEXT"));
     if (vkGetPhysicalDeviceToolPropertiesEXT == nullptr) {
         std::cout << "vkGetPhysicalDeviceToolPropertiesEXT not found" << std::endl;
         return;

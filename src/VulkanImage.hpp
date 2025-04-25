@@ -30,10 +30,13 @@ public:
 
     uint32_t getRowPitch() const;
 
-    void hostImageCopyFrom(VkInstance instance, void *ptr);
-    void hostImageCopyTo(VkInstance instance, void *ptr);
+    void hostImageCopyFrom(void *ptr);
+    void hostImageCopyTo(void *ptr);
 
-    void hostImaggeTransition(VkInstance instance, VkImageLayout newLayout);
+    void hostImaggeTransition(VkImageLayout newLayout);
+
+    void convertNCHWToRGBA(const float *data, std::vector<int> nchw);
+    std::vector<float> convertRGBAToNCHW(std::vector<int> nchw);
 private:
     VkExtent3D m_dim;
     VkFormat m_format;

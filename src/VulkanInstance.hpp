@@ -1,6 +1,8 @@
 #ifndef VULKAN_INSTANCE_HPP
 #define VULKAN_INSTANCE_HPP
+
 #include "vulkan/vulkan.hpp"
+
 #include <vector>
 #include <string>
 
@@ -11,18 +13,25 @@ public:
     VulkanInstance();
     ~VulkanInstance();
 
-    // Initialize the Vulkan instance
-    void createInstance(const std::string& applicationName, uint32_t applicationVersion);
-
-    // Destroy the Vulkan instance
-    void destroyInstance();
+    VulkanInstance(const VulkanInstance&) = delete;
+    VulkanInstance& operator=(const VulkanInstance&) = delete;
 
     // Get the Vulkan instance handle
     VkInstance getInstance() const;
+    
+    static VulkanInstance& getVulkanInstance(void) {
+        static VulkanInstance ins;// = new VulkanInstance();
+        return ins;
+    }
 
+    void destroyInstance();
     std::vector<VkPhysicalDevice> getPhysicalDevices(void) { return physicalDevices;}
 
 private:
+
+    // Initialize the Vulkan instance
+    void createInstance(const std::string& applicationName, uint32_t applicationVersion);
+
     uint32_t getVulkanVersion(void);
     // Check if a specific extension is supported
     bool isExtensionSupported(const char* extensionName) const;
@@ -88,7 +97,7 @@ private:
 #if VK_EXT_debug_utils
     VkDebugUtilsMessengerEXT CreateDebugUtilsMessenger(void);
 #endif
-    VkInstance instance;
+    VkInstance m_instance;
     mutable std::vector<const char*> validationLayers;
     mutable std::vector<const char*> extensions;
     union {

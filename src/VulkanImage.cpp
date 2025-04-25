@@ -1,4 +1,5 @@
 #include "VulkanLib.hpp"
+#include "VulkanInstance.hpp"
 #include "VulkanImage.hpp"
 
 #include <iostream>
@@ -48,7 +49,6 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFa
 }
 
 VulkanImage::~VulkanImage() {
-    std::cout << "VulkanImage::~VulkanImage()" << std::endl;
     destroyImage();
 }
 
@@ -223,7 +223,7 @@ uint32_t VulkanImage::getRowPitch() const
 * For host image copy image layout transition
 * This is done on host
 */
-void VulkanImage::hostImaggeTransition(VkInstance instance, VkImageLayout newLayout) {
+void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 #ifdef VK_EXT_host_image_copy
 
     VkImageSubresourceRange subrange = {};
@@ -240,7 +240,7 @@ void VulkanImage::hostImaggeTransition(VkInstance instance, VkImageLayout newLay
     transinfo.image = m_image;
     transinfo.subresourceRange = subrange;
     auto vkTransitionImageLayoutEXT = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
-                vkGetInstanceProcAddr(instance, "vkTransitionImageLayoutEXT"));
+                vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(), "vkTransitionImageLayoutEXT"));
     if (vkTransitionImageLayoutEXT) {
         vkTransitionImageLayoutEXT(m_device, 1, &transinfo);
         m_layout = newLayout;
@@ -250,7 +250,7 @@ void VulkanImage::hostImaggeTransition(VkInstance instance, VkImageLayout newLay
 #endif
 }
 
-void VulkanImage::hostImageCopyFrom(VkInstance instance, void *ptr) {
+void VulkanImage::hostImageCopyFrom(void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkMemoryToImageCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
@@ -269,7 +269,7 @@ void VulkanImage::hostImageCopyFrom(VkInstance instance, void *ptr) {
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
     auto vkCopyMemoryToImageEXT = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(
-                vkGetInstanceProcAddr(instance, "vkCopyMemoryToImageEXT"));
+        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(), "vkCopyMemoryToImageEXT"));
     if (vkCopyMemoryToImageEXT)
         vkCopyMemoryToImageEXT(m_device, &copyinfo);
 #else
@@ -279,7 +279,7 @@ void VulkanImage::hostImageCopyFrom(VkInstance instance, void *ptr) {
 
 
 
-void VulkanImage::hostImageCopyTo(VkInstance instance, void *ptr) {
+void VulkanImage::hostImageCopyTo(void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkImageToMemoryCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
@@ -300,12 +300,106 @@ void VulkanImage::hostImageCopyTo(VkInstance instance, void *ptr) {
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
     auto vkCopyImageToMemoryEXT = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(
-                vkGetInstanceProcAddr(instance, "vkCopyImageToMemoryEXT"));
+        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(), "vkCopyImageToMemoryEXT"));
     if (vkCopyImageToMemoryEXT)
         vkCopyImageToMemoryEXT(m_device, &copyinfo);
 #else
     (void)(ptr);
 #endif
 }
+
+
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+void VulkanImage::convertNCHWToRGBA(const float *data, std::vector<int> nchw)
+{
+    int batch = nchw[0];//1
+    int depth = nchw[1];//6
+    int height = nchw[2];//17
+    int width = nchw[3];//2
+
+    int stride_w = 1;
+    int stride_h = width;
+    int stride_c = width * height;
+    int stride_n = width * height * depth;
+    int realdepth = UP_DIV(depth, 4);
+    int realwidth = width * UP_DIV(depth, 4);
+
+    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
+    float *ptr = (float *)malloc(batch * height * realdepth * realwidth * 4 * sizeof(float));
+
+    uint32_t rowPitch = realwidth * 4 * sizeof(float);
+    float *dst = reinterpret_cast<float *>(ptr);
+    for (int b = 0; b < batch; b++) {
+        float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
+        for (int c = 0; c < realdepth; c++) {
+            dst = reinterpret_cast<float *>(batchstart) + c * 4 * width;
+            for (int h = 0; h < height; h++) {
+                for (int w = 0; w < width; w++) {
+                    int offset = b * stride_n + 4 * c * stride_c + h * stride_h + w * stride_w;
+
+                    float r = data[offset];
+                    float g = (4 * c + 1 < depth) ? data[stride_c + offset] : 0.0f;
+                    float b = (4 * c + 2 < depth) ? data[2 * stride_c + offset] : 0.0f;
+                    float a = (4 * c + 3 < depth) ? data[3 * stride_c + offset] : 0.0f;
+
+                    // Write RGBA values to the Vulkan image memory
+                    dst[w * 4 + 0] = r;
+                    dst[w * 4 + 1] = g;
+                    dst[w * 4 + 2] = b;
+                    dst[w * 4 + 3] = a;
+                }
+                // Move to the next row in the Vulkan image memory
+                dst = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst) + rowPitch);
+            }
+        }
+    }
+    hostImageCopyFrom(ptr);
+    free(ptr);
+}
+
+
+std::vector<float> VulkanImage::convertRGBAToNCHW(std::vector<int> nchw) {
+    int batch = nchw[0];
+    int depth = nchw[1];
+    int height = nchw[2];
+    int width = nchw[3];
+
+    int stride_w = 1;
+    int stride_h = width;
+    int stride_c = width * height;
+    int stride_n = width * height * depth;
+
+    int realdepth = UP_DIV(depth, 4);
+    int realwidth = width * UP_DIV(depth, 4);
+    
+    std::vector<float> retdata(batch * height * depth * width);
+    std::vector<float> tmp(batch * height * realdepth * realwidth * 4);
+    float *ptr = tmp.data();
+    float *data = retdata.data();
+    hostImageCopyTo(ptr);
+
+    uint32_t rowPitch = realwidth * 4 * sizeof(float);
+    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
+    float *dst = reinterpret_cast<float *>(ptr);
+    for (int b = 0; b < batch; b++) {
+        float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
+        for (int c = 0; c < realdepth; c++) {
+            dst = reinterpret_cast<float *>(batchstart) + c * width * 4;
+            for (int h = 0; h < height; h++) {
+                for (int w = 0; w < width; w++) {
+                    int offset = b * stride_n + 4 * c * stride_c + h * stride_h + w * stride_w;
+                    data[offset] = dst[w * 4 + 0];
+                    data[stride_c + offset] = (4 * c + 1 < depth) ? dst[w * 4 + 1] : 0.0f;
+                    data[stride_c * 2 + offset] = (4 * c + 2 < depth) ? dst[w * 4 + 1] : 0.0f;
+                    data[stride_c * 3 + offset] = (4 * c + 3 < depth) ? dst[w * 4 + 1] : 0.0f;
+                }
+                dst = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst) + rowPitch);
+            }
+        }
+    }
+    return retdata;
+}
+
+
 
 }
