@@ -12,12 +12,13 @@ find_package(Vulkan REQUIRED)
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/ops)
+include_directories(${CMAKE_SOURCE_DIR}/core)
 
 # Source files
-file(GLOB_RECURSE SRC_FILES main.cpp src/*.cpp src/*.hpp ops/*.cpp ops/*.hpp)
+file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*cpp)
 
 # Add executable
-add_executable(vkop ${SRC_FILES})
+add_library(vkop ${SRC_FILES})
 
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
@@ -57,3 +58,10 @@ add_dependencies(vkop compile_shaders)
 # Include SPIR-V headers
 target_include_directories(vkop PRIVATE ${SPIRV_DIR})
 target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
+
+add_executable(vkopmain main.cpp)
+target_link_libraries(vkopmain vkop)
+
+enable_testing()
+
+add_subdirectory(tests)

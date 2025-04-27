@@ -3,7 +3,7 @@
 
 #include <vector>
 
-#include "operator.hpp"
+#include "Operator.hpp"
 #include "vulkan/vulkan.hpp"
 
 #include "VulkanDevice.hpp"
