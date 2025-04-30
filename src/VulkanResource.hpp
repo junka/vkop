@@ -15,7 +15,7 @@ enum class ResourceType {
 // Abstract base class for Vulkan resources
 class VulkanResource {
 public:
-    VulkanResource(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device) : m_physicalDevice(physicalDevice), m_queueFamilyIndex(queueFamilyIndex), m_device(device) {}
+    explicit VulkanResource(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device) : m_physicalDevice(physicalDevice), m_queueFamilyIndex(queueFamilyIndex), m_device(device) {}
     ~VulkanResource() {
         if (m_memory)
             vkFreeMemory(m_device, m_memory, nullptr);
@@ -69,6 +69,11 @@ public:
         vkUnmapMemory(m_device, m_memory);
     }
 
+    VulkanResource() = delete;
+    VulkanResource(const VulkanResource& buff)  = delete;
+    VulkanResource(const VulkanResource&& buff) = delete;
+    VulkanResource& operator=(const VulkanResource&) = delete;
+    VulkanResource& operator=(const VulkanResource&&) = delete;
     // Pure virtual method to bind memory, must be implemented in subclasses
     // virtual void bindMemory(VkDeviceSize memoryOffset = 0) = 0;
 protected:

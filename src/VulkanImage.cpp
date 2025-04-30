@@ -2,15 +2,18 @@
 #include "VulkanInstance.hpp"
 #include "VulkanImage.hpp"
 
+#include <bits/stdint-uintn.h>
 #include <iostream>
+#include <vector>
+#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 
 VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device, VkExtent3D dim,
-        VkFormat format, VkImageUsageFlags usage, VkMemoryPropertyFlags requireProperties,
-        VkImageType imagetype)
+        VkFormat format, VkImageUsageFlags usage, VkMemoryPropertyFlags requireProperties)
 : VulkanResource(physicalDevice, queueFamilyIndex, device), m_dim(dim), m_format(format),
-  m_usage(usage), m_imagetype(imagetype), m_layout(VK_IMAGE_LAYOUT_UNDEFINED), m_access(0)
+  m_usage(usage), m_layout(VK_IMAGE_LAYOUT_UNDEFINED),
+  m_access(0), m_rowPitch(0)
 {
     if (m_device == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan device handle.");
@@ -21,6 +24,7 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFa
     if (m_usage == 0) {
         throw std::runtime_error("Invalid Vulkan image usage.");
     }
+    calcImageSize();
     createImage();
 #ifdef VK_KHR_get_memory_requirements2
     VkMemoryRequirements2 memRequirements2 = {};
@@ -45,6 +49,166 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFa
 
     createImageView();
     createSampler();
+#ifndef VK_EXT_host_image_copy
+    createStagingBuffer();
+#endif
+}
+
+void VulkanImage::calcImageSize() {
+    switch(m_format) {
+        case VK_FORMAT_R8_UNORM:
+        case VK_FORMAT_R8_SNORM:
+        case VK_FORMAT_R8_USCALED:
+        case VK_FORMAT_R8_SSCALED:
+        case VK_FORMAT_R8_UINT:
+        case VK_FORMAT_R8_SINT:
+        case VK_FORMAT_R8_SRGB:
+        case VK_FORMAT_S8_UINT:
+            m_chansize = 1;
+            m_chans = 1;
+            break;
+        case VK_FORMAT_R8G8_UNORM:
+        case VK_FORMAT_R8G8_SNORM:
+        case VK_FORMAT_R8G8_USCALED:
+        case VK_FORMAT_R8G8_SSCALED:
+        case VK_FORMAT_R8G8_UINT:
+        case VK_FORMAT_R8G8_SINT:
+        case VK_FORMAT_R8G8_SRGB:
+            m_chansize = 1;
+            m_chans = 2;
+            break;
+        case VK_FORMAT_R16_UNORM:
+        case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_USCALED:
+        case VK_FORMAT_R16_UINT:
+        case VK_FORMAT_R16_SINT:
+        case VK_FORMAT_R16_SFLOAT:
+        case VK_FORMAT_D16_UNORM:
+            m_chansize = 2;
+            m_chans = 1;
+            break;
+        case VK_FORMAT_R8G8B8_UNORM:
+        case VK_FORMAT_R8G8B8_SNORM:
+        case VK_FORMAT_R8G8B8_USCALED:
+        case VK_FORMAT_R8G8B8_SSCALED:
+        case VK_FORMAT_R8G8B8_UINT:
+        case VK_FORMAT_R8G8B8_SINT:
+        case VK_FORMAT_R8G8B8_SRGB:
+        case VK_FORMAT_B8G8R8_UNORM:
+        case VK_FORMAT_B8G8R8_SNORM:
+        case VK_FORMAT_B8G8R8_USCALED:
+        case VK_FORMAT_B8G8R8_SSCALED:
+        case VK_FORMAT_B8G8R8_UINT:
+        case VK_FORMAT_B8G8R8_SINT:
+        case VK_FORMAT_B8G8R8_SRGB:
+            m_chansize = 1;
+            m_chans = 3;
+            break;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SNORM:
+        case VK_FORMAT_R8G8B8A8_USCALED:
+        case VK_FORMAT_R8G8B8A8_SSCALED:
+        case VK_FORMAT_R8G8B8A8_UINT:
+        case VK_FORMAT_R8G8B8A8_SINT:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SNORM:
+        case VK_FORMAT_B8G8R8A8_USCALED:
+        case VK_FORMAT_B8G8R8A8_SSCALED:
+        case VK_FORMAT_B8G8R8A8_UINT:
+        case VK_FORMAT_B8G8R8A8_SINT:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+        case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+        case VK_FORMAT_A8B8G8R8_SNORM_PACK32:
+        case VK_FORMAT_A8B8G8R8_USCALED_PACK32:
+        case VK_FORMAT_A8B8G8R8_SSCALED_PACK32:
+        case VK_FORMAT_A8B8G8R8_UINT_PACK32:
+        case VK_FORMAT_A8B8G8R8_SINT_PACK32:
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+            m_chansize = 1;
+            m_chans = 4;
+            break;
+        case VK_FORMAT_R16G16_UNORM:
+        case VK_FORMAT_R16G16_SNORM:
+        case VK_FORMAT_R16G16_USCALED:
+        case VK_FORMAT_R16G16_SSCALED:
+        case VK_FORMAT_R16G16_UINT:
+        case VK_FORMAT_R16G16_SINT:
+        case VK_FORMAT_R16G16_SFLOAT:
+            m_chansize = 2;
+            m_chans = 2;
+            break;
+        case VK_FORMAT_R32_UINT:
+        case VK_FORMAT_R32_SINT:
+        case VK_FORMAT_R32_SFLOAT:
+            m_chansize = 4;
+            m_chans = 1;
+            break;
+        case VK_FORMAT_R16G16B16_UNORM:
+        case VK_FORMAT_R16G16B16_SNORM:
+        case VK_FORMAT_R16G16B16_USCALED:
+        case VK_FORMAT_R16G16B16_SSCALED:
+        case VK_FORMAT_R16G16B16_UINT:
+        case VK_FORMAT_R16G16B16_SINT:
+        case VK_FORMAT_R16G16B16_SFLOAT:
+            m_chansize = 2;
+            m_chans = 3;
+            break;
+        case VK_FORMAT_R16G16B16A16_UNORM:
+        case VK_FORMAT_R16G16B16A16_SNORM:
+        case VK_FORMAT_R16G16B16A16_USCALED:
+        case VK_FORMAT_R16G16B16A16_SSCALED:
+        case VK_FORMAT_R16G16B16A16_UINT:
+        case VK_FORMAT_R16G16B16A16_SINT:
+        case VK_FORMAT_R16G16B16A16_SFLOAT:
+            m_chansize = 2;
+            m_chans = 4;
+            break;
+        case VK_FORMAT_R32G32_UINT:
+        case VK_FORMAT_R32G32_SINT:
+        case VK_FORMAT_R32G32_SFLOAT:
+            m_chansize = 4;
+            m_chans = 2;
+            break;
+        case VK_FORMAT_R64_UINT:
+        case VK_FORMAT_R64_SINT:
+        case VK_FORMAT_R64_SFLOAT:
+            m_chansize = 8;
+            m_chans = 1;
+            break;
+        case VK_FORMAT_R32G32B32_UINT:
+        case VK_FORMAT_R32G32B32_SINT:
+        case VK_FORMAT_R32G32B32_SFLOAT:
+            m_chansize = 4;
+            m_chans = 3;
+            break;
+        case VK_FORMAT_R32G32B32A32_UINT:
+        case VK_FORMAT_R32G32B32A32_SINT:
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            m_chansize = 4;
+            m_chans = 4;
+            break;
+        case VK_FORMAT_R64G64_UINT:
+        case VK_FORMAT_R64G64_SINT:
+        case VK_FORMAT_R64G64_SFLOAT:
+            m_chansize = 8;
+            m_chans = 2;
+            break;
+        case VK_FORMAT_R64G64B64_UINT:
+        case VK_FORMAT_R64G64B64_SINT:
+        case VK_FORMAT_R64G64B64_SFLOAT:
+            m_chansize = 8;
+            m_chans = 3;
+            break;
+        case VK_FORMAT_R64G64B64A64_UINT:
+        case VK_FORMAT_R64G64B64A64_SINT:
+        case VK_FORMAT_R64G64B64A64_SFLOAT:
+            m_chansize = 8;
+            m_chans = 4;
+            break;
+        default:
+            break;
+    }
 
 }
 
@@ -52,8 +216,23 @@ VulkanImage::~VulkanImage() {
     destroyImage();
 }
 
+void VulkanImage::createStagingBuffer()
+{
+    auto size = getImageSize();
+    m_stagingBuffer = std::make_unique<VulkanBuffer>(m_physicalDevice, m_queueFamilyIndex, m_device, size,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+}
+
 void VulkanImage::createImage()
 {
+    m_imagetype = VK_IMAGE_TYPE_3D;
+    if (m_dim.depth == 1) {
+        m_imagetype = VK_IMAGE_TYPE_2D;
+        if (m_dim.height == 1) {
+            m_imagetype = VK_IMAGE_TYPE_1D;
+        }
+    }
+
     VkImageCreateInfo imageCreateInfo = {};
     imageCreateInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageCreateInfo.imageType = m_imagetype;
@@ -206,17 +385,34 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer&
     transitionImageLayout(commandBuffer, old_layout, old_access);
 }
 
-uint32_t VulkanImage::getRowPitch() const
-{
-    VkSubresourceLayout layout;
-    VkImageSubresource subresource = {};
-    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    subresource.mipLevel = 0;
-    subresource.arrayLayer = 0;
 
-    vkGetImageSubresourceLayout(m_device, m_image, &subresource, &layout);
-    const uint32_t rowPitch = layout.rowPitch;
-    return rowPitch;
+void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer& buffer)
+{
+    VkBuffer srcbuff = buffer.getBuffer();
+    VkImageLayout old_layout = m_layout;
+    VkAccessFlags old_access = m_access;
+    // Ensure the image is in a readable layout
+    if (m_layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                              VK_ACCESS_TRANSFER_WRITE_BIT);
+    }
+
+    VkBufferImageCopy region = {};
+    region.bufferOffset = 0;
+    region.bufferRowLength = 0;
+    region.bufferImageHeight = 0;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageOffset = {0, 0, 0};
+    region.imageExtent = m_dim;
+
+    // Perform the copy operation
+    vkCmdCopyBufferToImage(commandBuffer, srcbuff, m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+    // Optionally transition the image back to its original layout
+    transitionImageLayout(commandBuffer, old_layout, old_access);
 }
 
 /*
@@ -263,7 +459,6 @@ void VulkanImage::hostImageCopyFrom(void *ptr) {
 
     VkCopyMemoryToImageInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
-    // copyinfo.flags = VK_HOST_IMAGE_COPY_MEMCPY;
     copyinfo.dstImage = m_image;
     copyinfo.dstImageLayout = m_layout;
     copyinfo.regionCount = 1;
@@ -277,8 +472,6 @@ void VulkanImage::hostImageCopyFrom(void *ptr) {
 #endif
 }
 
-
-
 void VulkanImage::hostImageCopyTo(void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkImageToMemoryCopy region = {};
@@ -289,12 +482,11 @@ void VulkanImage::hostImageCopyTo(void *ptr) {
     region.imageSubresource.layerCount = 1;
     region.imageExtent = m_dim;
     region.pHostPointer = ptr;
-    region.memoryRowLength = m_dim.width;
-    region.memoryImageHeight = m_dim.height;
+    region.memoryRowLength = 0;
+    region.memoryImageHeight = 0;
 
     VkCopyImageToMemoryInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
-    // copyinfo.flags = VK_HOST_IMAGE_COPY_MEMCPY;
     copyinfo.srcImage = m_image;
     copyinfo.srcImageLayout = m_layout;
     copyinfo.regionCount = 1;
@@ -308,96 +500,29 @@ void VulkanImage::hostImageCopyTo(void *ptr) {
 #endif
 }
 
-
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
-void VulkanImage::convertNCHWToRGBA(const float *data, std::vector<int> nchw)
+void VulkanImage::stagingBufferCopyFrom(VkCommandBuffer commandBuffer, void *ptr)
 {
-    int batch = nchw[0];//1
-    int depth = nchw[1];//6
-    int height = nchw[2];//17
-    int width = nchw[3];//2
-
-    int stride_w = 1;
-    int stride_h = width;
-    int stride_c = width * height;
-    int stride_n = width * height * depth;
-    int realdepth = UP_DIV(depth, 4);
-    int realwidth = width * UP_DIV(depth, 4);
-
-    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
-    float *ptr = (float *)malloc(batch * height * realdepth * realwidth * 4 * sizeof(float));
-
-    uint32_t rowPitch = realwidth * 4 * sizeof(float);
-    float *dst = reinterpret_cast<float *>(ptr);
-    for (int b = 0; b < batch; b++) {
-        float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
-        for (int c = 0; c < realdepth; c++) {
-            dst = reinterpret_cast<float *>(batchstart) + c * 4 * width;
-            for (int h = 0; h < height; h++) {
-                for (int w = 0; w < width; w++) {
-                    int offset = b * stride_n + 4 * c * stride_c + h * stride_h + w * stride_w;
-
-                    float r = data[offset];
-                    float g = (4 * c + 1 < depth) ? data[stride_c + offset] : 0.0f;
-                    float b = (4 * c + 2 < depth) ? data[2 * stride_c + offset] : 0.0f;
-                    float a = (4 * c + 3 < depth) ? data[3 * stride_c + offset] : 0.0f;
-
-                    // Write RGBA values to the Vulkan image memory
-                    dst[w * 4 + 0] = r;
-                    dst[w * 4 + 1] = g;
-                    dst[w * 4 + 2] = b;
-                    dst[w * 4 + 3] = a;
-                }
-                // Move to the next row in the Vulkan image memory
-                dst = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst) + rowPitch);
-            }
-        }
-    }
-    hostImageCopyFrom(ptr);
-    free(ptr);
+    void *m = m_stagingBuffer->getMappedMemory();
+    auto imagesize = getImageSize();
+    float *src = static_cast<float*>(ptr);
+    float *dst = static_cast<float *>(m);
+    memcpy(dst, src, imagesize);
+    m_stagingBuffer->unmapMemory();
+    copyBufferToImage(commandBuffer, *m_stagingBuffer);
 }
 
 
-std::vector<float> VulkanImage::convertRGBAToNCHW(std::vector<int> nchw) {
-    int batch = nchw[0];
-    int depth = nchw[1];
-    int height = nchw[2];
-    int width = nchw[3];
+void VulkanImage::stagingBufferCopyTo(VkCommandBuffer commandBuffer, void *ptr)
+{
+    auto imagesize = getImageSize();
+    copyImageToBuffer(commandBuffer, *m_stagingBuffer);
+    void *m = m_stagingBuffer->getMappedMemory();
 
-    int stride_w = 1;
-    int stride_h = width;
-    int stride_c = width * height;
-    int stride_n = width * height * depth;
-
-    int realdepth = UP_DIV(depth, 4);
-    int realwidth = width * UP_DIV(depth, 4);
-    
-    std::vector<float> retdata(batch * height * depth * width);
-    std::vector<float> tmp(batch * height * realdepth * realwidth * 4);
-    float *ptr = tmp.data();
-    float *data = retdata.data();
-    hostImageCopyTo(ptr);
-
-    uint32_t rowPitch = realwidth * 4 * sizeof(float);
-    // since format is VK_FORMAT_R32G32B32A32_SFLOAT
-    float *dst = reinterpret_cast<float *>(ptr);
-    for (int b = 0; b < batch; b++) {
-        float* batchstart = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
-        for (int c = 0; c < realdepth; c++) {
-            dst = reinterpret_cast<float *>(batchstart) + c * width * 4;
-            for (int h = 0; h < height; h++) {
-                for (int w = 0; w < width; w++) {
-                    int offset = b * stride_n + 4 * c * stride_c + h * stride_h + w * stride_w;
-                    data[offset] = dst[w * 4 + 0];
-                    data[stride_c + offset] = (4 * c + 1 < depth) ? dst[w * 4 + 1] : 0.0f;
-                    data[stride_c * 2 + offset] = (4 * c + 2 < depth) ? dst[w * 4 + 1] : 0.0f;
-                    data[stride_c * 3 + offset] = (4 * c + 3 < depth) ? dst[w * 4 + 1] : 0.0f;
-                }
-                dst = reinterpret_cast<float *>(reinterpret_cast<uint8_t *>(dst) + rowPitch);
-            }
-        }
-    }
-    return retdata;
+    float *dst = static_cast<float*>(ptr);
+    float *src = static_cast<float *>(m);
+    memcpy(dst, src, imagesize);
+        
+    m_stagingBuffer->unmapMemory();
 }
 
 

@@ -38,7 +38,9 @@ public:
         }
         return false;
     }
-
+    bool is_support_host_image_copy() const {
+        return m_support_host_image_copy;
+    }
 private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice logicalDevice = VK_NULL_HANDLE;
@@ -68,6 +70,7 @@ private:
 
     bool checkDeviceExtensionFeature(const char *name) const;
 
+    bool m_support_host_image_copy;
 };
 
 } // namespace vkop

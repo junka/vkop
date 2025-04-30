@@ -14,40 +14,45 @@ namespace ops {
 
 void GridSample::prepare(const std::vector<int>& input_shape, const std::vector<int>& grid_shape)
 {
+    int batch = input_shape[0];
+    int depth = input_shape[1];
+    int gridbatch = grid_shape[0];
     int inHeight = input_shape[2];
     int inWidth = input_shape[3];
     int outHeight = grid_shape[1];
     int outWidth = grid_shape[2];
-    int depth = input_shape[1];
 
     VkDevice device = m_dev->getLogicalDevice();
+    int exflags = 0;
+    if (m_dev->is_support_host_image_copy()) {
+#ifdef VK_EXT_host_image_copy
+        exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+#endif
+    }
     outputImage = std::make_shared<VulkanImage>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, VkExtent3D {
         (uint32_t)outWidth * UP_DIV(depth, 4),
-        (uint32_t)outHeight,
+        (uint32_t)outHeight * batch,
         1
     }, VK_FORMAT_R32G32B32A32_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        VK_IMAGE_TYPE_2D);
+        VK_IMAGE_USAGE_STORAGE_BIT|exflags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     inputImage = std::make_shared<VulkanImage>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, VkExtent3D{
         (uint32_t)inWidth * UP_DIV(depth, 4),
-        (uint32_t)inHeight,
+        (uint32_t)inHeight * batch,
         1
     }, VK_FORMAT_R32G32B32A32_SFLOAT,
-        VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        VK_IMAGE_TYPE_2D);
+        VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|exflags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     gridImage = std::make_shared<VulkanImage>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, VkExtent3D{
         2 * UP_DIV((uint32_t)outHeight, 4),
-        (uint32_t)outWidth,
+        (uint32_t)outWidth * gridbatch,
         1
     }, VK_FORMAT_R32G32B32A32_SFLOAT,
-        VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|VK_IMAGE_USAGE_HOST_TRANSFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-        VK_IMAGE_TYPE_2D);
+        VK_IMAGE_USAGE_SAMPLED_BIT|VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_DST_BIT|exflags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     paramBuffer = std::make_shared<VulkanBuffer>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, sizeof(GpuGridSampleParam),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
+#ifdef VK_EXT_host_image_copy
     if (m_dev->checkHostImageCopyDstLayoutSupport(VK_IMAGE_LAYOUT_GENERAL)) {
         outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
     } else {
@@ -55,7 +60,15 @@ void GridSample::prepare(const std::vector<int>& input_shape, const std::vector<
     }
     inputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
     gridImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-
+#else
+    VulkanCommandBuffer cmd(device, m_cmdpool->getCommandPool());
+    cmd.begin();
+    outputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
+    inputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
+    gridImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
+    cmd.end();
+    cmd.submit(m_dev->getComputeQueue());
+#endif
 }
 
 void GridSample::submit(int outWidth, int outHeight)

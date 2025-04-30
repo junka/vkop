@@ -8,7 +8,7 @@
 namespace vkop {
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
-    : physicalDevice(physicalDevice) {
+    : physicalDevice(physicalDevice), m_support_host_image_copy(false) {
     if (physicalDevice == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan physical device handle.");
     }
@@ -157,6 +157,7 @@ bool VulkanDevice::createLogicalDevice() {
         hostImageCopyFeatures.hostImageCopy = VK_TRUE;
         enabledExtensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
         enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&hostImageCopyFeatures));
+        m_support_host_image_copy = true;
     }
 #endif
     if (devicefloat16Int8Features.shaderInt8) {
@@ -277,10 +278,10 @@ bool VulkanDevice::createLogicalDevice() {
     createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
     createInfo.ppEnabledExtensionNames = enabledExtensions.data();
     createInfo.pNext = pFirst;
-    std::cout << "enabled extensions count " << enabledExtensions.size() << std::endl;
-    for (auto e: enabledExtensions) {
-        std::cout << "enabled extension: " << e << std::endl;
-    }
+    // std::cout << "enabled extensions count " << enabledExtensions.size() << std::endl;
+    // for (auto e: enabledExtensions) {
+    //     std::cout << "enabled extension: " << e << std::endl;
+    // }
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &logicalDevice) != VK_SUCCESS) {
         std::cerr << "Failed to create logical device!" << std::endl;
@@ -304,7 +305,7 @@ int VulkanDevice::findComputeQueueFamily(VkPhysicalDevice device) {
     vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
 
     for (uint32_t i = 0; i < queueFamilies.size(); i++) {
-        if (queueFamilies[i].queueFlags & VK_QUEUE_COMPUTE_BIT) {
+        if (queueFamilies[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) {
             return i;
         }
     }

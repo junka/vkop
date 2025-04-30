@@ -68,10 +68,12 @@ public:
         prepare(input_shape, grid_shape);
 
         struct GpuGridSampleParam *para = reinterpret_cast<GpuGridSampleParam*>(paramBuffer->getMappedMemory());
-        para->outImgSize[0] = outWidth;
-        para->outImgSize[1] = outHeight;
+        // vkimage params
+        para->outImgSize[0] = UP_DIV(depth, 4) * outWidth;
+        para->outImgSize[1] = outHeight * batch;
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
+        // original params
         para->inShape[0] = inWidth;
         para->inShape[1] = inHeight;
         para->outShape[0] = outWidth;
@@ -93,8 +95,9 @@ public:
 
         submit(outWidth, outHeight);
 
-        std::vector<T> output = outputImage->convertRGBAToNCHW({batch, depth, outHeight, outWidth});
+        // outputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
 
+        std::vector<T> output = outputImage->convertRGBAToNCHW<T>({batch, depth, outHeight, outWidth});
         return output;
     }
 

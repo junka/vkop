@@ -135,7 +135,7 @@ private:
     {
         std::vector<int> t = {
             // 1, 3, 5, 10, 5, 10
-            1, 4, 6, 16, 6, 17
+            2, 5, 4, 4, 4, 4
         };
         batch = t[0];
         depth = t[1];
@@ -185,7 +185,7 @@ private:
 
 
 int main() {
-    GridSampleTest test_params;
+    GridSampleTest tp;
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto pdev : phydevs) {
@@ -200,14 +200,14 @@ int main() {
             ops::GridSample gs;
             gs.set_runtime_device(pdev, dev, &cmdpool);
             // Ensure shared pointers are retained before cmd.submit
-            auto ret = gs.apply<float>(test_params.originInputData, test_params.originGridData,
-                {test_params.batch, test_params.depth, test_params.inHeight, test_params.inWidth},
-                {test_params.batch, test_params.outHeight, test_params.outWidth, 2});
-            
+            auto ret = gs.apply<float>(tp.originInputData, tp.originGridData,
+                {tp.batch, tp.depth, tp.inHeight, tp.inWidth},
+                {tp.batch, tp.outHeight, tp.outWidth, 2});
+
             for (uint32_t i = 0; i < ret.size(); i++) {
-                if (ret.data()[i] != test_params.expectedOutput.data()[i]) {
-                    std::cout << "Test Passed" << std::endl;
-                    return 0;
+                if (std::fabs(ret.data()[i] - tp.expectedOutput.data()[i]) > 0.01) {
+                    std::cout << "Test Fail at ("<< i<<"): "<< ret.data()[i] << ", " << tp.expectedOutput.data()[i] << std::endl;
+                    return -1;
                 }
             }
             
