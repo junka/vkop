@@ -80,24 +80,53 @@ public:
         para->outShape[1] = outHeight;
         paramBuffer->unmapMemory();
 
+        VkDevice device = m_dev->getLogicalDevice();
+
         const T* inputPtr = input.data();
         const T* gridPtr = grid.data();
-        inputImage->convertNCHWToRGBA(inputPtr, input_shape);
-        gridImage->convertNCHWToRGBA(gridPtr, grid_shape);
+        auto inputRGBA = inputImage->convertNCHWToRGBA(inputPtr, input_shape);
+        auto gridRGBA = gridImage->convertNCHWToRGBA(gridPtr, grid_shape);
+#ifdef VK_EXT_host_image_copy
+        if (m_dev->is_support_host_image_copy()) {
+            inputImage->hostImageCopyToDevice(inputRGBA.data());
+            gridImage->hostImageCopyToDevice(gridRGBA.data());
+        } else
+#endif
+        {
+            VulkanCommandBuffer cmdstg(device, m_cmdpool->getCommandPool());
+            cmdstg.begin();
+            inputImage->stagingBufferCopyToImage(cmdstg.get(), inputRGBA.data());
+            gridImage->stagingBufferCopyToImage(cmdstg.get(), gridRGBA.data());
+            cmdstg.end();
+            cmdstg.submit(m_dev->getComputeQueue());
+        }
 
-        VkDevice device = m_dev->getLogicalDevice();
         VulkanCommandBuffer cmd(device, m_cmdpool->getCommandPool());
         cmd.begin();
-        inputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
-        gridImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_ACCESS_SHADER_READ_BIT);
+        inputImage->readBarrier(cmd.get());
+        gridImage->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(m_dev->getComputeQueue());
 
         submit(outWidth, outHeight);
 
-        // outputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
-
-        std::vector<T> output = outputImage->convertRGBAToNCHW<T>({batch, depth, outHeight, outWidth});
+        int realwidth = outWidth * UP_DIV(depth, 4);
+        int realheight = outHeight * batch;
+        std::vector<T> tmp(realheight * realwidth * 4);
+        T *ptr = tmp.data();
+#ifdef VK_EXT_host_image_copy
+        if (m_dev->is_support_host_image_copy()) {
+            outputImage->hostImageCopyToHost(ptr);
+        } else
+#endif
+        {
+            VulkanCommandBuffer cmdstg1(device, m_cmdpool->getCommandPool());
+            cmdstg1.begin();
+            outputImage->stagingBufferCopyToHost(cmdstg1.get(), ptr);
+            cmdstg1.end();
+            cmdstg1.submit(m_dev->getComputeQueue());
+        }
+        std::vector<T> output = outputImage->convertRGBAToNCHW<T>(ptr, {batch, depth, outHeight, outWidth});
         return output;
     }
 

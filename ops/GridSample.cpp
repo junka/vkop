@@ -34,7 +34,7 @@ void GridSample::prepare(const std::vector<int>& input_shape, const std::vector<
         (uint32_t)outHeight * batch,
         1
     }, VK_FORMAT_R32G32B32A32_SFLOAT,
-        VK_IMAGE_USAGE_STORAGE_BIT|exflags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VK_IMAGE_USAGE_STORAGE_BIT|VK_IMAGE_USAGE_TRANSFER_SRC_BIT|exflags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
     inputImage = std::make_shared<VulkanImage>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, VkExtent3D{
         (uint32_t)inWidth * UP_DIV(depth, 4),
@@ -53,22 +53,25 @@ void GridSample::prepare(const std::vector<int>& input_shape, const std::vector<
     paramBuffer = std::make_shared<VulkanBuffer>(m_phydev, m_dev->getComputeQueueFamilyIndex(), device, sizeof(GpuGridSampleParam),
         VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 #ifdef VK_EXT_host_image_copy
-    if (m_dev->checkHostImageCopyDstLayoutSupport(VK_IMAGE_LAYOUT_GENERAL)) {
-        outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
-    } else {
-        outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    }
-    inputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    gridImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-#else
-    VulkanCommandBuffer cmd(device, m_cmdpool->getCommandPool());
-    cmd.begin();
-    outputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_GENERAL, VK_ACCESS_SHADER_WRITE_BIT);
-    inputImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
-    gridImage->transitionImageLayout(cmd.get(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_ACCESS_SHADER_WRITE_BIT);
-    cmd.end();
-    cmd.submit(m_dev->getComputeQueue());
+    if (m_dev->is_support_host_image_copy()) {
+        if (m_dev->checkHostImageCopyDstLayoutSupport(VK_IMAGE_LAYOUT_GENERAL)) {
+            outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+        } else {
+            outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        }
+        inputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        gridImage->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    } else 
 #endif
+    {
+        VulkanCommandBuffer cmd(device, m_cmdpool->getCommandPool());
+        cmd.begin();
+        outputImage->writeBarrier(cmd.get());
+        inputImage->readBarrier(cmd.get());
+        gridImage->readBarrier(cmd.get());
+        cmd.end();
+        cmd.submit(m_dev->getComputeQueue());
+    }
 }
 
 void GridSample::submit(int outWidth, int outHeight)

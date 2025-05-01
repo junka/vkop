@@ -41,6 +41,7 @@ public:
     bool is_support_host_image_copy() const {
         return m_support_host_image_copy;
     }
+    bool checkDeviceUnifiedMemoryAccess();
 private:
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice logicalDevice = VK_NULL_HANDLE;

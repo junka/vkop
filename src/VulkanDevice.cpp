@@ -19,6 +19,7 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
         throw std::runtime_error("Compute queue already created.");
     }
     create();
+    checkDeviceUnifiedMemoryAccess();
 }
 
 VulkanDevice::~VulkanDevice() {
@@ -324,5 +325,29 @@ bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const
     return false;
 }
 
+
+bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
+    VkPhysicalDeviceMemoryProperties memoryProperties;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
+
+    bool isUnifiedMemory = false;
+
+    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
+        const VkMemoryType& memType = memoryProperties.memoryTypes[i];
+
+        if ((memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            isUnifiedMemory = true;
+            std::cout << "Unified memory type found at index: " << i << std::endl;
+        }
+    }
+
+    if (isUnifiedMemory) {
+        std::cout << "This device supports Unified Memory Architecture (UMA)." << std::endl;
+    } else {
+        std::cout << "This device does not support Unified Memory Architecture." << std::endl;
+    }
+    return isUnifiedMemory;
+}
 
 } // namespace vkop

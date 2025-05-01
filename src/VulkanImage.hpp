@@ -29,21 +29,28 @@ public:
     std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo> getDescriptorInfo() const override;
 
     void transitionImageLayout(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
-                VkAccessFlags dstAccessMask);
+                VkAccessFlags dstAccessMask, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage);
+
+    void transferBarrier(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
+        VkAccessFlags dstAccessMask);
+
+    void readBarrier(VkCommandBuffer commandBuffer);
+
+    void writeBarrier(VkCommandBuffer commandBuffer);
 
     void copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer& buffer);
     void copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer& buffer);
 
-    void hostImageCopyFrom(void *ptr);
-    void hostImageCopyTo(void *ptr);
+    void hostImageCopyToDevice(void *ptr);
+    void hostImageCopyToHost(void *ptr);
 
-    void stagingBufferCopyFrom(VkCommandBuffer commandBuffer, void *ptr);
-    void stagingBufferCopyTo(VkCommandBuffer commandBuffer, void *ptr);
+    void stagingBufferCopyToImage(VkCommandBuffer commandBuffer, void *ptr);
+    void stagingBufferCopyToHost(VkCommandBuffer commandBuffer, void *ptr);
 
     void hostImaggeTransition(VkImageLayout newLayout);
 
     template<typename T>
-    void convertNCHWToRGBA(const T *data, std::vector<int> nchw)
+    std::vector<T> convertNCHWToRGBA(const T *data, std::vector<int> nchw)
     {
         int batch = nchw[0];
         int depth = nchw[1];
@@ -79,10 +86,10 @@ public:
                 }
             }
         }
-        hostImageCopyFrom(ptr);
+        return tmp;
     }
     template<typename T>
-    std::vector<T> convertRGBAToNCHW(std::vector<int> nchw)
+    std::vector<T> convertRGBAToNCHW(T *ptr, std::vector<int> nchw)
     {
         int batch = nchw[0];
         int depth = nchw[1];
@@ -96,16 +103,12 @@ public:
 
         int realdepth = UP_DIV(depth, 4);
         int realwidth = width * UP_DIV(depth, 4);
-        int realheight = height * batch;
         
         std::vector<T> retdata(batch * height * depth * width);
-        std::vector<T> tmp(realheight * realwidth * 4);
-        T *ptr = tmp.data();
         T *data = retdata.data();
-        hostImageCopyTo(ptr);
 
         uint32_t rowPitch = realwidth * 4 * sizeof(T);
-        T *dst = reinterpret_cast<T *>(ptr);
+        T *dst;
         for (int b = 0; b < batch; b++) {
             T* batchstart = reinterpret_cast<T *>(reinterpret_cast<uint8_t *>(ptr) + b * height * rowPitch);
             for (int c = 0; c < realdepth; c++) {
@@ -165,7 +168,7 @@ private:
 
     void destroyImage();
 
-    void createStagingBuffer();
+    void createStagingBuffer(bool writeonly);
 };
 }
 #endif

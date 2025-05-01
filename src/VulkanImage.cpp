@@ -49,9 +49,11 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFa
 
     createImageView();
     createSampler();
-#ifndef VK_EXT_host_image_copy
-    createStagingBuffer();
-#endif
+    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        createStagingBuffer(false);
+    } else {
+        createStagingBuffer(true);
+    }
 }
 
 void VulkanImage::calcImageSize() {
@@ -216,13 +218,17 @@ VulkanImage::~VulkanImage() {
     destroyImage();
 }
 
-void VulkanImage::createStagingBuffer()
+void VulkanImage::createStagingBuffer(bool writeonly)
 {
     auto size = getImageSize();
-    m_stagingBuffer = std::make_unique<VulkanBuffer>(m_physicalDevice, m_queueFamilyIndex, m_device, size,
-        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (writeonly) {
+        m_stagingBuffer = std::make_unique<VulkanBuffer>(m_physicalDevice, m_queueFamilyIndex, m_device, size,
+            VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    } else {
+        m_stagingBuffer = std::make_unique<VulkanBuffer>(m_physicalDevice, m_queueFamilyIndex, m_device, size,
+            VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    }
 }
-
 void VulkanImage::createImage()
 {
     m_imagetype = VK_IMAGE_TYPE_3D;
@@ -319,7 +325,8 @@ std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo> VulkanImage::getDesc
 }
 
 void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
-                VkAccessFlags dstAccessMask) {
+                VkAccessFlags dstAccessMask, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage) {
+    std::cout << "transitionImageLayout " << newLayout << std::endl;
     if (m_layout == newLayout) {
         return;
     }
@@ -342,9 +349,6 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer, VkImageLa
     barrier.srcAccessMask = m_access;
     barrier.dstAccessMask = dstAccessMask;
 
-    VkPipelineStageFlags sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-
     vkCmdPipelineBarrier(
         commandBuffer, sourceStage, destinationStage,
         0, 0, nullptr, 0, nullptr,
@@ -355,6 +359,26 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer, VkImageLa
     m_access = dstAccessMask;
 }
 
+void VulkanImage::transferBarrier(VkCommandBuffer commandBuffer, VkImageLayout newLayout, VkAccessFlags dstAccessMask)
+{    
+    VkPipelineStageFlags sourceStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags destinationStage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT|VK_PIPELINE_STAGE_TRANSFER_BIT;
+    transitionImageLayout(commandBuffer, newLayout, dstAccessMask, sourceStage, destinationStage);
+}
+
+void VulkanImage::readBarrier(VkCommandBuffer commandBuffer)
+{
+    transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
+void VulkanImage::writeBarrier(VkCommandBuffer commandBuffer)
+{
+    transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+        VK_ACCESS_SHADER_WRITE_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
+
 void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer& buffer)
 {
     VkBuffer bufferHandle = buffer.getBuffer();
@@ -362,7 +386,8 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer&
     VkAccessFlags old_access = m_access;
     // Ensure the image is in a readable layout
     if (m_layout != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
-        transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        std::cout << "image to VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL" << std::endl;
+        transferBarrier(commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                               VK_ACCESS_TRANSFER_READ_BIT);
     }
 
@@ -378,11 +403,11 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer&
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim;
 
-    // Perform the copy operation
     vkCmdCopyImageToBuffer(commandBuffer, m_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, bufferHandle, 1, &region);
 
     // Optionally transition the image back to its original layout
-    transitionImageLayout(commandBuffer, old_layout, old_access);
+    transferBarrier(commandBuffer, old_layout, old_access);
+    std::cout << "image to " << old_layout << std::endl;
 }
 
 
@@ -393,7 +418,8 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer&
     VkAccessFlags old_access = m_access;
     // Ensure the image is in a readable layout
     if (m_layout != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
-        transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        std::cout << "image to VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL" << std::endl;
+        transferBarrier(commandBuffer, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                               VK_ACCESS_TRANSFER_WRITE_BIT);
     }
 
@@ -408,11 +434,11 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer&
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim;
 
-    // Perform the copy operation
     vkCmdCopyBufferToImage(commandBuffer, srcbuff, m_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
     // Optionally transition the image back to its original layout
-    transitionImageLayout(commandBuffer, old_layout, old_access);
+    transferBarrier(commandBuffer, old_layout, old_access);
+    std::cout << "image to " << old_layout << std::endl;
 }
 
 /*
@@ -446,7 +472,7 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 #endif
 }
 
-void VulkanImage::hostImageCopyFrom(void *ptr) {
+void VulkanImage::hostImageCopyToDevice(void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkMemoryToImageCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
@@ -472,7 +498,7 @@ void VulkanImage::hostImageCopyFrom(void *ptr) {
 #endif
 }
 
-void VulkanImage::hostImageCopyTo(void *ptr) {
+void VulkanImage::hostImageCopyToHost(void *ptr) {
 #ifdef VK_EXT_host_image_copy
     VkImageToMemoryCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
@@ -500,22 +526,55 @@ void VulkanImage::hostImageCopyTo(void *ptr) {
 #endif
 }
 
-void VulkanImage::stagingBufferCopyFrom(VkCommandBuffer commandBuffer, void *ptr)
+void VulkanImage::stagingBufferCopyToImage(VkCommandBuffer commandBuffer, void *ptr)
 {
-    void *m = m_stagingBuffer->getMappedMemory();
+    float *dst = static_cast<float *>(m_stagingBuffer->getMappedMemory());
     auto imagesize = getImageSize();
     float *src = static_cast<float*>(ptr);
-    float *dst = static_cast<float *>(m);
     memcpy(dst, src, imagesize);
     m_stagingBuffer->unmapMemory();
+
+    std::cout << "copy size " << imagesize << std::endl;
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+1] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+2] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+3] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
     copyBufferToImage(commandBuffer, *m_stagingBuffer);
 }
 
 
-void VulkanImage::stagingBufferCopyTo(VkCommandBuffer commandBuffer, void *ptr)
+void VulkanImage::stagingBufferCopyToHost(VkCommandBuffer commandBuffer, void *ptr)
 {
     auto imagesize = getImageSize();
     copyImageToBuffer(commandBuffer, *m_stagingBuffer);
+    
     void *m = m_stagingBuffer->getMappedMemory();
 
     float *dst = static_cast<float*>(ptr);
@@ -523,6 +582,38 @@ void VulkanImage::stagingBufferCopyTo(VkCommandBuffer commandBuffer, void *ptr)
     memcpy(dst, src, imagesize);
         
     m_stagingBuffer->unmapMemory();
+    std::cout << "copy size " << imagesize << std::endl;
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+1] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+2] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
+    for (int i = 0; i < getImageHeight(); i++) {
+        for (int j = 0; j < getImageWidth(); j++) {
+            std::cout << dst[getImageWidth() * i * 4 + j * 4+3] << ", ";
+        }
+        std::cout << std::endl;
+    }
+    std::cout << std::endl;
+
 }
 
 

@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include "VulkanDevice.hpp"
 #include "VulkanInstance.hpp"
+// #include "Renderdoc.hpp"
 
 #include "GridSample.hpp"
 
@@ -134,8 +135,8 @@ private:
     void initTestdata(void)
     {
         std::vector<int> t = {
-            // 1, 3, 5, 10, 5, 10
-            2, 5, 4, 4, 4, 4
+            1, 3, 4, 4, 4, 4
+            // 2, 5, 4, 4, 4, 4
         };
         batch = t[0];
         depth = t[1];
@@ -186,6 +187,7 @@ private:
 
 int main() {
     GridSampleTest tp;
+    // auto rdoc = Renderdoc(VulkanInstance::getVulkanInstance().getInstance());
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto pdev : phydevs) {
@@ -203,7 +205,6 @@ int main() {
             auto ret = gs.apply<float>(tp.originInputData, tp.originGridData,
                 {tp.batch, tp.depth, tp.inHeight, tp.inWidth},
                 {tp.batch, tp.outHeight, tp.outWidth, 2});
-
             for (uint32_t i = 0; i < ret.size(); i++) {
                 if (std::fabs(ret.data()[i] - tp.expectedOutput.data()[i]) > 0.01) {
                     std::cout << "Test Fail at ("<< i<<"): "<< ret.data()[i] << ", " << tp.expectedOutput.data()[i] << std::endl;
