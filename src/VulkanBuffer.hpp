@@ -19,6 +19,9 @@ public:
     }
     std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo> getDescriptorInfo() const override;
 
+    void transferWriteBarrier(VkCommandBuffer commandBuffer);
+    void transferReadBarrier(VkCommandBuffer commandBuffer);
+
 private:
     VkBuffer m_buffer;
 

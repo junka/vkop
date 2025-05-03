@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <variant>
 #include <memory>
-#include <iostream>
 
 #include "VulkanResource.hpp"
 #include "VulkanBuffer.hpp"
@@ -33,10 +32,13 @@ public:
 
     void transferBarrier(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
         VkAccessFlags dstAccessMask);
+    void transferReadBarrier(VkCommandBuffer commandBuffer);
+    void transferWriteBarrier(VkCommandBuffer commandBuffer);
 
     void readBarrier(VkCommandBuffer commandBuffer);
 
     void writeBarrier(VkCommandBuffer commandBuffer);
+    
 
     void copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer& buffer);
     void copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer& buffer);

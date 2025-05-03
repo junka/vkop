@@ -1,8 +1,8 @@
 
 #include <cstdint>
-#include <iostream>
 #include <memory>
 #include <cmath>
+#include "logger.hpp"
 
 #include "GridSample.hpp"
 
@@ -102,7 +102,7 @@ void GridSample::submit(int outWidth, int outHeight)
     cmd2.submit(m_dev->getComputeQueue());
     auto r = queryPool.getResults();
     double ts = double(r[1]-r[0])* double(1e-9) * m_dev->getTimestampPeriod();
-    std::cout << "Time: " << ts  << " s" << std::endl;
+    LOG_INFO("Time: %f s", ts);
 }
 
 }

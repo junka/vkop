@@ -10,6 +10,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -Wall -Wextra -Werror -fno-omit-f
 
 find_package(Vulkan REQUIRED)
 include_directories(${Vulkan_INCLUDE_DIRS})
+include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/ops)
 include_directories(${CMAKE_SOURCE_DIR}/core)
@@ -36,7 +37,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -o ${SPIRV_FILE}
+        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )

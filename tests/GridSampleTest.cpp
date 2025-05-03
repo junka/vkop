@@ -1,6 +1,5 @@
 
 #include <cstdint>
-#include <iostream>
 #include <memory>
 #include <random>
 #include <chrono>
@@ -8,7 +7,9 @@
 #include <sys/types.h>
 #include "VulkanDevice.hpp"
 #include "VulkanInstance.hpp"
-// #include "Renderdoc.hpp"
+#include "Renderdoc.hpp"
+
+#include "logger.hpp"
 
 #include "GridSample.hpp"
 
@@ -178,7 +179,7 @@ private:
         reference_grid_sample<float>(inputPtr, gridPtr, expectedOutput, batch, inHeight, inWidth, outHeight, outWidth, depth, false);
         std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
-        std::cout << "reference grid sample time: " << duration.count() << " s" << std::endl;
+        LOG_INFO("reference grid sample time: %f s", duration.count());
     }
 };
 
@@ -186,12 +187,15 @@ private:
 
 
 int main() {
+    Logger::getInstance().setLevel(LOG_INFO);
+    Logger::getInstance().enableFileOutput("log", true);
     GridSampleTest tp;
     // auto rdoc = Renderdoc(VulkanInstance::getVulkanInstance().getInstance());
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto pdev : phydevs) {
             auto dev = std::make_shared<VulkanDevice>(pdev);
+            LOG_INFO("try device %s", dev->getDeviceName().c_str());
             if (dev->getDeviceName().find("llvmpipe")!= std::string::npos) {
                 continue;
             }
@@ -207,18 +211,19 @@ int main() {
                 {tp.batch, tp.outHeight, tp.outWidth, 2});
             for (uint32_t i = 0; i < ret.size(); i++) {
                 if (std::fabs(ret.data()[i] - tp.expectedOutput.data()[i]) > 0.01) {
-                    std::cout << "Test Fail at ("<< i<<"): "<< ret.data()[i] << ", " << tp.expectedOutput.data()[i] << std::endl;
+                    LOG_ERROR("Test Fail at (%d): %f, %f", i, ret.data()[i], tp.expectedOutput.data()[i]);
                     return -1;
                 }
             }
             
-            std::cout << "Test Passed" << std::endl;
+            LOG_INFO("Test Passed");
 
         }
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        LOG_ERROR("%s\n", e.what());
         return EXIT_FAILURE;
     }
+    // rdoc.EndRenderDocCapture(VulkanInstance::getVulkanInstance().getInstance());
 
     return EXIT_SUCCESS;
 }

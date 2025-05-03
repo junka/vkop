@@ -1,9 +1,10 @@
 #include "VulkanLib.hpp"
 #include "VulkanDevice.hpp"
 #include <cstdint>
-#include <iostream>
 #include <stdexcept>
 #include <vector>
+
+#include "logger.hpp"
 
 namespace vkop {
 
@@ -33,7 +34,7 @@ void VulkanDevice::getProperties() {
     ext_properties.resize(pPropertyCount);
     vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &pPropertyCount, ext_properties.data());
     for (auto ext : this->ext_properties) {
-        std::cout << "device extension " << ext.extensionName << std::endl;
+        LOG_INFO("device extension %s", ext.extensionName);
     }
 
     VkPhysicalDeviceProperties2 properties2 = {};
@@ -66,13 +67,13 @@ void VulkanDevice::getProperties() {
     vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
     this->deviceProperties = properties2.properties;
     this->timestampPeriod = deviceProperties.limits.timestampPeriod;
-    std::cout << "GPU " << deviceProperties.deviceName << std::endl;
+    LOG_INFO("GPU %s", deviceProperties.deviceName);
 }
 
 void VulkanDevice::create() {
     getProperties();
     if (!createLogicalDevice()) {
-        std::cerr << "Failed to create logical device!" << std::endl;
+        LOG_ERROR("Failed to create logical device!");
         return;
     }
 }
@@ -207,9 +208,9 @@ bool VulkanDevice::createLogicalDevice() {
     }
 #endif
 #ifdef VK_KHR_shader_non_semantic_info
-// #ifndef VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME
-// #define VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME "VK_KHR_shader_non_semantic_info"
-// #endif
+#ifndef VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME
+#define VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME "VK_KHR_shader_non_semantic_info"
+#endif
     if (checkDeviceExtensionFeature(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
         enabledExtensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
@@ -251,7 +252,6 @@ bool VulkanDevice::createLogicalDevice() {
     };
     void* pFirst = nullptr;
     if (enabledFeatures.size() > 0) {        
-        // std::cout << "enabledFeatures.size() = " << enabledFeatures.size() << std::endl;
         pFirst = reinterpret_cast<void *>(enabledFeatures[0]);
         struct GeneralFeature* ptr = reinterpret_cast<struct GeneralFeature*>(pFirst);
         for (size_t i = 1; i < enabledFeatures.size(); i++) {
@@ -285,7 +285,7 @@ bool VulkanDevice::createLogicalDevice() {
     // }
 
     if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &logicalDevice) != VK_SUCCESS) {
-        std::cerr << "Failed to create logical device!" << std::endl;
+        LOG_ERROR("Failed to create logical device!");
         return false;
     }
 
@@ -325,7 +325,6 @@ bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const
     return false;
 }
 
-
 bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
     VkPhysicalDeviceMemoryProperties memoryProperties;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
@@ -338,14 +337,14 @@ bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
         if ((memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
             (memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
             isUnifiedMemory = true;
-            std::cout << "Unified memory type found at index: " << i << std::endl;
+            LOG_INFO("Unified memory type found at index: %d", i);
         }
     }
 
     if (isUnifiedMemory) {
-        std::cout << "This device supports Unified Memory Architecture (UMA)." << std::endl;
+        LOG_INFO("This device supports Unified Memory Architecture (UMA).");
     } else {
-        std::cout << "This device does not support Unified Memory Architecture." << std::endl;
+        LOG_INFO("This device does not support Unified Memory Architecture.");
     }
     return isUnifiedMemory;
 }

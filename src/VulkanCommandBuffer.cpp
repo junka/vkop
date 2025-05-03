@@ -74,7 +74,7 @@ void VulkanCommandBuffer::end(int idx) {
     }
 }
 
-void VulkanCommandBuffer::submit(VkQueue queue, VkFence fence)
+int VulkanCommandBuffer::submit(VkQueue queue, VkFence fence)
 {
     VkSubmitInfo submitInfo{};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -84,7 +84,7 @@ void VulkanCommandBuffer::submit(VkQueue queue, VkFence fence)
     if (vkQueueSubmit(queue, 1, &submitInfo, fence) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
-    vkQueueWaitIdle(queue);
+    return vkQueueWaitIdle(queue);
 }
 
 void VulkanCommandBuffer::reset(int idx) {

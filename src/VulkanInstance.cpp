@@ -1,10 +1,9 @@
 #include "VulkanLib.hpp"
 #include "VulkanInstance.hpp"
-#include <iostream>
 #include <stdexcept>
 #include <string>
 #include <vector>
-
+#include "logger.hpp"
 namespace vkop {
 
 VulkanInstance::VulkanInstance() : m_instance(VK_NULL_HANDLE) {
@@ -22,7 +21,6 @@ VulkanInstance::VulkanInstance() : m_instance(VK_NULL_HANDLE) {
 }
 
 VulkanInstance::~VulkanInstance() {
-    std::cout << "VulkanInstance::~VulkanInstance" << std::endl;
     destroyInstance();
 }
 
@@ -31,7 +29,7 @@ uint32_t VulkanInstance::getVulkanVersion(void)
     {
         uint32_t version = VK_API_VERSION_1_0;
         vkEnumerateInstanceVersion(&version);
-        std::cout << "vulkan version " << VK_VERSION_MAJOR(version) << "." << VK_VERSION_MINOR(version) << "." << VK_VERSION_PATCH(version) << std::endl;
+        LOG_INFO("vulkan version %d.%d.%d", VK_VERSION_MAJOR(version), VK_VERSION_MINOR(version),VK_VERSION_PATCH(version));
         return version;
     }
 void VulkanInstance::createInstance(const std::string& applicationName, uint32_t appVersion) {
@@ -150,6 +148,11 @@ void VulkanInstance::getRequiredExtensions() const {
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     }
 #endif
+#ifdef VK_EXT_debug_marker
+    if (isExtensionSupported(VK_EXT_DEBUG_MARKER_EXTENSION_NAME)) {
+        extensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
+    }
+#endif
 }
 
 bool VulkanInstance::checkValidationLayerSupport() const{
@@ -167,7 +170,7 @@ bool VulkanInstance::checkValidationLayerSupport() const{
         };
         for (auto layerName : valid) {
             if (strcmp(layer.layerName, layerName) == 0) {
-                std::cout << "validation layer found " << layer.layerName << std::endl;
+                LOG_INFO("validation layer found %s", layer.layerName);
                 validationLayers.push_back(layerName);
                 return true;
             }
@@ -229,7 +232,6 @@ VkDebugReportCallbackEXT VulkanInstance::CreateDebugReportCallback(void)
         error = vkCreateDebugReportCallbackEXT(m_instance, &callbackCreateInfo, nullptr,
                                         &callback);
         if (error != VK_SUCCESS) {
-            // std::cout << "Failed to create debug report callback" << std::endl;
             return nullptr;
         }
     }
@@ -246,13 +248,12 @@ void VulkanInstance::enumPhysicalDevices(void)
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
-    physicalDevices.resize(count);
-    error = vkEnumeratePhysicalDevices(m_instance, &count, physicalDevices.data());
+    m_physicalDevices.resize(count);
+    error = vkEnumeratePhysicalDevices(m_instance, &count, m_physicalDevices.data());
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
-    std::cout << "Found " << count << " physical devices." << std::endl;
-
+    LOG_INFO("Found %d physical devices.", count);
 }
 
 
@@ -265,7 +266,7 @@ void VulkanInstance::getToolinfo(VkPhysicalDevice physicalDevice) {
         reinterpret_cast<PFN_vkGetPhysicalDeviceToolPropertiesEXT>(
             vkGetInstanceProcAddr(m_instance, "vkGetPhysicalDeviceToolPropertiesEXT"));
     if (vkGetPhysicalDeviceToolPropertiesEXT == nullptr) {
-        std::cout << "vkGetPhysicalDeviceToolPropertiesEXT not found" << std::endl;
+        LOG_WARN("vkGetPhysicalDeviceToolPropertiesEXT not found");
         return;
     }
     vkGetPhysicalDeviceToolPropertiesEXT(physicalDevice, &toolCount, nullptr);
@@ -277,10 +278,10 @@ void VulkanInstance::getToolinfo(VkPhysicalDevice physicalDevice) {
 
     vkGetPhysicalDeviceToolPropertiesEXT(physicalDevice, &toolCount, toolinfos.data());
     for (uint32_t i = 0; i < toolCount; i++) {
-        std::cout << "tool info: " << toolinfos[i].name << std::endl;
-        std::cout << "tool info: " << toolinfos[i].description << std::endl;
-        std::cout << "tool info: " << toolinfos[i].version << std::endl;
-        std::cout << "tool info: " << toolinfos[i].layer << std::endl;
+        LOG_INFO("tool info: %s", toolinfos[i].name);
+        LOG_INFO("tool info: %s", toolinfos[i].description);
+        LOG_INFO("tool info: %s", toolinfos[i].version);
+        LOG_INFO("tool info: %s", toolinfos[i].layer);
     }
 }
 
