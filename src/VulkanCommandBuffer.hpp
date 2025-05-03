@@ -25,7 +25,7 @@ public:
     void bind(VulkanPipeline &pipeline);
 
     // Submit the command buffer to a queue
-    void submit(VkQueue queue, VkFence fence = VK_NULL_HANDLE);
+    int submit(VkQueue queue, VkFence fence = VK_NULL_HANDLE);
 
     // Reset the command buffer
     void reset(int idx = 0);

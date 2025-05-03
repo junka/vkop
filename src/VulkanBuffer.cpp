@@ -2,6 +2,7 @@
 #include "VulkanResource.hpp"
 #include "VulkanBuffer.hpp"
 #include <stdexcept>
+#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags requireProperties)
@@ -61,6 +62,47 @@ void VulkanBuffer::cleanup() {
     if (m_buffer != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_device, m_buffer, nullptr);
     }
+}
+
+void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer)
+{
+    VkBufferMemoryBarrier barrier;
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.pNext = 0;
+    barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = m_buffer;
+    barrier.offset = 0;
+    barrier.size = m_size;
+
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_HOST_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer, src_stage, dst_stage, 0, 0, 0, 1, &barrier, 0, 0);
+
+}
+
+
+void VulkanBuffer::transferWriteBarrier(VkCommandBuffer commandBuffer)
+{
+    VkBufferMemoryBarrier barrier;
+    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+    barrier.pNext = 0;
+    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.buffer = m_buffer;
+    barrier.offset = 0;
+    barrier.size = m_size;
+
+    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+
+    vkCmdPipelineBarrier(commandBuffer, src_stage, dst_stage, 0, 0, 0, 1, &barrier, 0, 0);
+
 }
 
 } // namespace vkop

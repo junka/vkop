@@ -2,8 +2,8 @@
 
 #include <cstddef>
 #include <stdexcept>
+#include <sys/syslog.h>
 #include <vector>
-#include <iostream>
 #include <map>
 
 #include "VulkanShader.hpp"
@@ -27,7 +27,6 @@ VulkanPipeline::VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> ty
 }
 
 VulkanPipeline::~VulkanPipeline() {
-    std::cout << "VulkanPipeline::~VulkanPipeline" << std::endl;
     cleanup();
 }
 

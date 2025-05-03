@@ -2,6 +2,7 @@
 #define GRIDSAMPLE_HPP
 
 #include <vector>
+#include <unistd.h>
 
 #include "Operator.hpp"
 #include "vulkan/vulkan.hpp"
@@ -13,6 +14,8 @@
 #include "VulkanCommandPool.hpp"
 #include "VulkanCommandBuffer.hpp"
 #include "VulkanQueryPool.hpp"
+
+#include "logger.hpp"
 
 
 namespace vkop {
@@ -65,12 +68,15 @@ public:
         int outHeight = grid_shape[1];
         int outWidth = grid_shape[2];
 
+        int realwidth = outWidth * UP_DIV(depth, 4);
+        int realheight = outHeight * batch;
+
         prepare(input_shape, grid_shape);
 
         struct GpuGridSampleParam *para = reinterpret_cast<GpuGridSampleParam*>(paramBuffer->getMappedMemory());
         // vkimage params
-        para->outImgSize[0] = UP_DIV(depth, 4) * outWidth;
-        para->outImgSize[1] = outHeight * batch;
+        para->outImgSize[0] = realwidth;
+        para->outImgSize[1] = realheight;
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
         // original params
@@ -109,9 +115,9 @@ public:
         cmd.submit(m_dev->getComputeQueue());
 
         submit(outWidth, outHeight);
+        
+        sleep(2);
 
-        int realwidth = outWidth * UP_DIV(depth, 4);
-        int realheight = outHeight * batch;
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
@@ -126,6 +132,38 @@ public:
             cmdstg1.end();
             cmdstg1.submit(m_dev->getComputeQueue());
         }
+        // std::cout << "copy size " << imagesize << std::endl;
+        for (int i = 0; i < realheight; i++) {
+            for (int j = 0; j < realwidth; j++) {
+                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4]);
+            }
+            LOG_INFO("\n");
+        }
+        LOG_INFO("\n");
+        for (int i = 0; i < realheight; i++) {
+            for (int j = 0; j < realwidth; j++) {
+                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+1]);
+            }
+            LOG_INFO("\n");
+        }
+        LOG_INFO("\n");
+    
+        for (int i = 0; i < realheight; i++) {
+            for (int j = 0; j < realwidth; j++) {
+                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+2]);
+            }
+            LOG_INFO("\n");
+        }
+        LOG_INFO("\n");
+    
+        for (int i = 0; i < realheight; i++) {
+            for (int j = 0; j < realwidth; j++) {
+                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+3]);
+            }
+            LOG_INFO("\n");
+        }
+        LOG_INFO("\n");
+    
         std::vector<T> output = outputImage->convertRGBAToNCHW<T>(ptr, {batch, depth, outHeight, outWidth});
         return output;
     }

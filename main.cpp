@@ -1,5 +1,4 @@
 #include <cstdint>
-#include <iostream>
 #include <memory>
 #include <random>
 #include <chrono>
@@ -8,18 +7,21 @@
 #include "VulkanDevice.hpp"
 #include "VulkanInstance.hpp"
 
+#include "logger.hpp"
+
 using namespace vkop;
 
 int main() {
+    Logger::getInstance().setLevel(LOG_INFO);
+    Logger::getInstance().enableFileOutput("log", true);
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto pdev : phydevs) {
             auto dev = std::make_shared<VulkanDevice>(pdev);
-            std::cout << dev->getDeviceName() << std::endl;
-
+            LOG_INFO("%s",dev->getDeviceName().c_str());
         }
     } catch (const std::exception &e) {
-        std::cerr << "Error: " << e.what() << std::endl;
+        LOG_ERROR("%s", e.what());
         return EXIT_FAILURE;
     }
 

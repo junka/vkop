@@ -25,7 +25,7 @@ public:
     }
 
     void destroyInstance();
-    std::vector<VkPhysicalDevice> getPhysicalDevices(void) { return physicalDevices;}
+    std::vector<VkPhysicalDevice> getPhysicalDevices(void) { return m_physicalDevices;}
 
 private:
 
@@ -111,7 +111,7 @@ private:
 
     std::vector<VkExtensionProperties> availableExtensions;
 
-    std::vector<VkPhysicalDevice> physicalDevices;
+    std::vector<VkPhysicalDevice> m_physicalDevices;
 };
 
 } // namespace vkop

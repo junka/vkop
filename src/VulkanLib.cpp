@@ -1,7 +1,7 @@
 #include "VulkanLib.hpp"
 #include <dlfcn.h>
 
-#include <iostream>
+#include <logger.hpp>
 
 namespace vkop {
 
@@ -20,11 +20,11 @@ VulkanLib::VulkanLib() {
             lib = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
 #endif
         if (!lib) {
-            std::cerr << "Failed to load vulkan library ," << dlerror() << std::endl;
+            LOG_ERROR("Failed to load vulkan library , %s", dlerror());
             return ;
         }
 
-#define PFN(name) name = reinterpret_cast<PFN_##name>(dlsym(lib, #name));
+#define PFN(name) name = reinterpret_cast<PFN_##name>(dlsym(lib, #name)); assert(name != nullptr);
             VK_FUNCTION_LIST
 #undef PFN
 }
