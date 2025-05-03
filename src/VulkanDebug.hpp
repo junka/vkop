@@ -3,8 +3,6 @@
 
 #include "VulkanLib.hpp"
 #include "vulkan/vulkan.hpp"
-#include <bits/stdint-uintn.h>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 

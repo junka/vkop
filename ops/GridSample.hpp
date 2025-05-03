@@ -41,6 +41,9 @@ struct GpuGridSampleParam {
     ivec4 outImgSize;
     ivec2 inShape;
     ivec2 outShape;
+    bool align_corners;
+    int padding_mode;
+    int interpolation_mode;
 };
 
 class GridSample: public Operator {
@@ -84,6 +87,9 @@ public:
         para->inShape[1] = inHeight;
         para->outShape[0] = outWidth;
         para->outShape[1] = outHeight;
+        para->align_corners = align_corners;
+        para->padding_mode = (int)padding_mode;
+        para->interpolation_mode = (int)interpolation_mode;
         paramBuffer->unmapMemory();
 
         VkDevice device = m_dev->getLogicalDevice();

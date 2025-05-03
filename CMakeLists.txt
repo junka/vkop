@@ -44,7 +44,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${HEADER_FILE}
-        COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${HEADER_FILE}
+        COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-zA-Z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${HEADER_FILE}
         DEPENDS ${SPIRV_FILE}
         COMMENT "Converting ${SPIRV_FILE} to header file"
     )

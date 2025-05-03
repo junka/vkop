@@ -46,6 +46,7 @@ public:
         if (ret != 1) {
             LOG_WARN("RenderDoc initialization failed");
         }
+    #elif defined(__APPLE__)
         
     #else
         #warning "RenderDoc integration not implemented on this platform";

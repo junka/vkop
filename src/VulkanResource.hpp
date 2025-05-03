@@ -16,7 +16,7 @@ enum class ResourceType {
 class VulkanResource {
 public:
     explicit VulkanResource(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device) : m_physicalDevice(physicalDevice), m_queueFamilyIndex(queueFamilyIndex), m_device(device) {}
-    ~VulkanResource() {
+    virtual ~VulkanResource() {
         if (m_memory)
             vkFreeMemory(m_device, m_memory, nullptr);
     };

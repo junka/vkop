@@ -147,7 +147,6 @@ private:
     VkImageView m_imageView;
     VkSampler m_sampler;
 
-    uint32_t m_rowPitch;
     int m_chansize;
     int m_chans;
 

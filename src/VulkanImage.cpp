@@ -12,7 +12,7 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice, const uint32_t queueFa
         VkFormat format, VkImageUsageFlags usage, VkMemoryPropertyFlags requireProperties)
 : VulkanResource(physicalDevice, queueFamilyIndex, device), m_dim(dim), m_format(format),
   m_usage(usage), m_layout(VK_IMAGE_LAYOUT_UNDEFINED),
-  m_access(0), m_rowPitch(0)
+  m_access(0)
 {
     if (m_device == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan device handle.");
