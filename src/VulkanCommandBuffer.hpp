@@ -3,7 +3,6 @@
 
 #include "VulkanPipeline.hpp"
 #include <vulkan/vulkan.hpp>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 class VulkanCommandBuffer {

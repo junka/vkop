@@ -195,7 +195,6 @@ int main() {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto pdev : phydevs) {
             auto dev = std::make_shared<VulkanDevice>(pdev);
-            LOG_INFO("try device %s", dev->getDeviceName().c_str());
             if (dev->getDeviceName().find("llvmpipe")!= std::string::npos) {
                 continue;
             }

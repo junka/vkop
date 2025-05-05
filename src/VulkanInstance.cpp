@@ -204,7 +204,7 @@ VkDebugUtilsMessengerEXT VulkanInstance::CreateDebugUtilsMessenger(void)
         error = vkCreateDebugUtilsMessengerEXT(m_instance, &callbackCreateInfo, nullptr,
                                         &callback);
         if (error != VK_SUCCESS) {
-            std::cerr << "Failed to create debug callback" << std::endl;
+            LOG_ERROR("Failed to create debug callback");
             return nullptr;
         }
     }

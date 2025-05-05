@@ -2,8 +2,6 @@
 #include "VulkanInstance.hpp"
 #include "VulkanLib.hpp"
 #include "VulkanDebug.hpp"
-#include <vulkan/vulkan_core.h>
-
 
 namespace vkop {
 

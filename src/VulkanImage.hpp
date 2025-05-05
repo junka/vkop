@@ -47,7 +47,8 @@ public:
     void hostImageCopyToHost(void *ptr);
 
     void stagingBufferCopyToImage(VkCommandBuffer commandBuffer, void *ptr);
-    void stagingBufferCopyToHost(VkCommandBuffer commandBuffer, void *ptr);
+    void stagingBufferCopyToHost(VkCommandBuffer commandBuffer);
+    void readStaingBuffer(void *ptr);
 
     void hostImaggeTransition(VkImageLayout newLayout);
 

@@ -88,7 +88,7 @@ void VulkanDevice::destroy() {
 bool VulkanDevice::createLogicalDevice() {
     computeQueueFamilyIndex = findComputeQueueFamily(physicalDevice);
     if (computeQueueFamilyIndex == -1) {
-        std::cerr << "Failed to find a suitable compute queue family!" << std::endl;
+        LOG_ERROR("Failed to find a suitable compute queue family!");
         return false;
     }
 
@@ -244,6 +244,15 @@ bool VulkanDevice::createLogicalDevice() {
 #ifdef VK_EXT_subgroup_size_control
     if (checkDeviceExtensionFeature(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
         enabledExtensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_EXT_image_robustness
+    VkPhysicalDeviceImageRobustnessFeatures imagerobustfeature;
+    imagerobustfeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
+    if (checkDeviceExtensionFeature(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
+        imagerobustfeature.robustImageAccess = VK_TRUE;
+        enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&imagerobustfeature));
+        enabledExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     }
 #endif
     struct GeneralFeature {

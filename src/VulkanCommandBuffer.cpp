@@ -1,5 +1,4 @@
 #include "VulkanLib.hpp"
-#include <vulkan/vulkan_core.h>
 #include "VulkanCommandBuffer.hpp"
 
 namespace vkop {

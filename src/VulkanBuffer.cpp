@@ -2,7 +2,6 @@
 #include "VulkanResource.hpp"
 #include "VulkanBuffer.hpp"
 #include <stdexcept>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(VkPhysicalDevice physicalDevice, const uint32_t queueFamilyIndex, VkDevice device, VkDeviceSize size, VkBufferUsageFlags usage, VkMemoryPropertyFlags requireProperties)

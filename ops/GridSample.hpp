@@ -121,8 +121,6 @@ public:
         cmd.submit(m_dev->getComputeQueue());
 
         submit(outWidth, outHeight);
-        
-        sleep(2);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -134,46 +132,15 @@ public:
         {
             VulkanCommandBuffer cmdstg1(device, m_cmdpool->getCommandPool());
             cmdstg1.begin();
-            outputImage->stagingBufferCopyToHost(cmdstg1.get(), ptr);
+            outputImage->stagingBufferCopyToHost(cmdstg1.get());
             cmdstg1.end();
             cmdstg1.submit(m_dev->getComputeQueue());
+            outputImage->readStaingBuffer(ptr);
         }
-        // std::cout << "copy size " << imagesize << std::endl;
-        for (int i = 0; i < realheight; i++) {
-            for (int j = 0; j < realwidth; j++) {
-                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4]);
-            }
-            LOG_INFO("\n");
-        }
-        LOG_INFO("\n");
-        for (int i = 0; i < realheight; i++) {
-            for (int j = 0; j < realwidth; j++) {
-                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+1]);
-            }
-            LOG_INFO("\n");
-        }
-        LOG_INFO("\n");
-    
-        for (int i = 0; i < realheight; i++) {
-            for (int j = 0; j < realwidth; j++) {
-                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+2]);
-            }
-            LOG_INFO("\n");
-        }
-        LOG_INFO("\n");
-    
-        for (int i = 0; i < realheight; i++) {
-            for (int j = 0; j < realwidth; j++) {
-                LOG_INFO("%f ,", ptr[realwidth * i * 4 + j * 4+3]);
-            }
-            LOG_INFO("\n");
-        }
-        LOG_INFO("\n");
     
         std::vector<T> output = outputImage->convertRGBAToNCHW<T>(ptr, {batch, depth, outHeight, outWidth});
         return output;
     }
-
 
     void set_runtime_device(VkPhysicalDevice phydev, std::shared_ptr<VulkanDevice> dev, VulkanCommandPool *cmdpool) {
         m_phydev = phydev;
