@@ -14,6 +14,7 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/ops)
 include_directories(${CMAKE_SOURCE_DIR}/core)
+include_directories(${CMAKE_SOURCE_DIR}/model)
 
 # Source files
 file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*cpp)
@@ -60,8 +61,10 @@ add_dependencies(vkop compile_shaders)
 target_include_directories(vkop PRIVATE ${SPIRV_DIR})
 target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 
+add_subdirectory(model)
+
 add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain vkop)
+target_link_libraries(vkopmain vkop vload)
 
 enable_testing()
 

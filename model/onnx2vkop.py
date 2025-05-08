@@ -7,7 +7,7 @@ import onnx
 import numpy as np
 from onnx import numpy_helper
 
-class CustomModel:
+class VkModel:
     def __init__(self):
         self.inputs = []
         self.outputs = []
@@ -46,26 +46,26 @@ class CustomModel:
     def _write_list_with_shapes(f, lst):
         f.write(struct.pack('I', len(lst)))
         for item in lst:
-            CustomModel._write_string(f, item['name'])
-            CustomModel._write_list(f, item['shape'])
+            VkModel._write_string(f, item['name'])
+            VkModel._write_list(f, item['shape'])
 
     @staticmethod
     def _write_list(f, lst):
         f.write(struct.pack('I', len(lst)))
         for item in lst:
             if isinstance(item, int):
-                f.write(struct.pack('Q', item))  # For dimensions
+                f.write(struct.pack('I', item))  # For dimensions
             else:
-                CustomModel._write_string(f, item)  # For names
+                VkModel._write_string(f, item)  # For names
 
     @staticmethod
     def _write_dict(f, d):
         f.write(struct.pack('I', len(d)))
         for key, value in d.items():
-            CustomModel._write_string(f, key)
+            VkModel._write_string(f, key)
             if isinstance(value, str):
                 f.write(b'\x00')  # Tag for string
-                CustomModel._write_string(f, value)
+                VkModel._write_string(f, value)
             elif isinstance(value, int):
                 f.write(b'\x01')  # Tag for int
                 f.write(struct.pack('q', value))
@@ -78,37 +78,38 @@ class CustomModel:
         arr = np.ascontiguousarray(arr)
         dtype = arr.dtype.name
         shape = list(arr.shape)
-        CustomModel._write_string(f, dtype)
+        VkModel._write_string(f, dtype)
         f.write(struct.pack('I', len(shape)))
         for dim in shape:
-            f.write(struct.pack('Q', dim))
+            f.write(struct.pack('I', dim))
         data = arr.tobytes()
         f.write(struct.pack('Q', len(data)))
         f.write(data)
 
     @staticmethod
     def load_from_binary(file_path):
-        model = CustomModel()
+        model = VkModel()
         with open(file_path, 'rb') as f:
-            model.inputs = CustomModel._read_list_with_shapes(f)
-            model.outputs = CustomModel._read_list_with_shapes(f)
+            model.inputs = VkModel._read_list_with_shapes(f)
+            model.outputs = VkModel._read_list_with_shapes(f)
 
             num_nodes = struct.unpack('I', f.read(4))[0]
             for _ in range(num_nodes):
-                op_type = CustomModel._read_string(f)
-                attributes = CustomModel._read_dict(f)
-                inputs = CustomModel._read_list_with_shapes(f)
-                outputs = CustomModel._read_list_with_shapes(f)
-                model.nodes.append({'op_type': op_type, 'attributes': attributes, 'inputs': inputs, 'outputs': outputs})
+                op_type = VkModel._read_string(f)
+                attributes = VkModel._read_dict(f)
+                inputs = VkModel._read_list_with_shapes(f)
+                outputs = VkModel._read_list_with_shapes(f)
+                model.nodes.append({'op_type': op_type, 'attributes': attributes,
+                                    'inputs': inputs, 'outputs': outputs})
 
             num_inits = struct.unpack('I', f.read(4))[0]
             for _ in range(num_inits):
-                name = CustomModel._read_string(f)
-                dtype = CustomModel._read_string(f)
-                ndims = struct.unpack('I', f.read(4))[0]
-                shape = []
-                for _ in range(ndims):
-                    shape.append(struct.unpack('Q', f.read(8))[0])
+                name = VkModel._read_string(f)
+                dtype = VkModel._read_string(f)
+                shape = [
+                    struct.unpack('I', f.read(4))[0]
+                    for _ in range(struct.unpack('I', f.read(4))[0])
+                ]
                 data_len = struct.unpack('Q', f.read(8))[0]
                 data = f.read(data_len)
                 arr = np.frombuffer(data, dtype=np.dtype(dtype))
@@ -125,47 +126,60 @@ class CustomModel:
     @staticmethod
     def _read_list_with_shapes(f):
         count = struct.unpack('I', f.read(4))[0]
-        return [{'name': CustomModel._read_string(f), 'shape': [struct.unpack('Q', f.read(8))[0] for _ in range(struct.unpack('I', f.read(4))[0])]} for _ in range(count)]
-
-    @staticmethod
-    def _read_list(f):
-        count = struct.unpack('I', f.read(4))[0]
-        return [struct.unpack('Q', f.read(8))[0] if i == 0 else CustomModel._read_string(f) for i in range(count)]
+        return [
+            {
+            'name': VkModel._read_string(f),
+            'shape': [
+                struct.unpack('I', f.read(4))[0]
+                for _ in range(struct.unpack('I', f.read(4))[0])
+            ]
+            }
+            for _ in range(count)
+        ]
 
     @staticmethod
     def _read_dict(f):
         count = struct.unpack('I', f.read(4))[0]
-        return {CustomModel._read_string(f): CustomModel._read_value(f) for _ in range(count)}
+        return {
+            VkModel._read_string(f): VkModel._read_value(f)
+            for _ in range(count)
+        }
 
     @staticmethod
     def _read_value(f):
         tag = f.read(1)
         if tag == b'\x00':
-            return CustomModel._read_string(f)
-        elif tag == b'\x01':
+            return VkModel._read_string(f)
+        if tag == b'\x01':
             return struct.unpack('q', f.read(8))[0]
-        elif tag == b'\x02':
+        if tag == b'\x02':
             return struct.unpack('d', f.read(8))[0]
+        return "unknown"
 
 
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
-    custom_model = CustomModel()
+    vk_model = VkModel()
 
     graph = model.graph
 
     # Inputs with shapes
     for inp in graph.input:
         tensor_type = inp.type.tensor_type
-        shape_dims = [dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim]
-        custom_model.inputs.append({'name': inp.name, 'shape': shape_dims})
+        shape_dims = [
+            dim.dim_value if dim.HasField("dim_value") else 1
+            for dim in tensor_type.shape.dim
+        ]
+        vk_model.inputs.append({'name': inp.name, 'shape': shape_dims})
 
     # Outputs with shapes
     for out in graph.output:
         tensor_type = out.type.tensor_type
-        shape_dims = [dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim]
-        custom_model.outputs.append({'name': out.name, 'shape': shape_dims})
-
+        shape_dims = [
+            dim.dim_value if dim.HasField("dim_value") else 1
+            for dim in tensor_type.shape.dim
+        ]
+        vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
     # Nodes with attributes and shapes of inputs/outputs
     for node in graph.node:
         attributes = {}
@@ -183,8 +197,13 @@ def parse_onnx_model(onnx_path):
             for inp in graph.input:
                 if inp.name == input_name:
                     tensor_type = inp.type.tensor_type
-                    shape_dims = [dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim]
-                    inputs_with_shape.append({'name': input_name, 'shape': shape_dims})
+                    shape_dims = [
+                        dim.dim_value if dim.HasField("dim_value") else 1
+                        for dim in tensor_type.shape.dim
+                    ]
+                    inputs_with_shape.append(
+                        {'name': input_name, 'shape': shape_dims}
+                    )
                     break
 
         outputs_with_shape = []
@@ -192,11 +211,16 @@ def parse_onnx_model(onnx_path):
             for out in graph.output:
                 if out.name == output_name:
                     tensor_type = out.type.tensor_type
-                    shape_dims = [dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim]
-                    outputs_with_shape.append({'name': output_name, 'shape': shape_dims})
+                    shape_dims = [
+                        dim.dim_value if dim.HasField("dim_value") else 1
+                        for dim in tensor_type.shape.dim
+                    ]
+                    outputs_with_shape.append(
+                        {'name': output_name, 'shape': shape_dims}
+                    )
                     break
 
-        custom_model.nodes.append({
+        vk_model.nodes.append({
             'op_type': node.op_type,
             'attributes': attributes,
             'inputs': inputs_with_shape,
@@ -210,9 +234,9 @@ def parse_onnx_model(onnx_path):
         # data_type = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
         # raw_data = initializer.raw_data
         arr = numpy_helper.to_array(initializer)
-        custom_model.initializers[name] = arr
+        vk_model.initializers[name] = arr
 
-    return custom_model
+    return vk_model
 
 
 if __name__ == "__main__":
@@ -230,7 +254,7 @@ if __name__ == "__main__":
     onnxmodel.save_to_binary(output_bin_path)
 
     print("Loading back from binary...")
-    loaded_model = CustomModel.load_from_binary(output_bin_path)
+    loaded_model = VkModel.load_from_binary(output_bin_path)
 
     print("\nInputs:")
     for inp in loaded_model.inputs:
