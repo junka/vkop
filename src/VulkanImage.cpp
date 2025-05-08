@@ -488,9 +488,10 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     copyinfo.pRegions = &region;
     auto vkCopyMemoryToImageEXT = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(
         vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(), "vkCopyMemoryToImageEXT"));
-    if (vkCopyMemoryToImageEXT)
+    if (vkCopyMemoryToImageEXT) {
         ret = vkCopyMemoryToImageEXT(m_device, &copyinfo);
-    assert(ret == VK_SUCCESS);
+        assert(ret == VK_SUCCESS);
+    }
 #else
     (void)(ptr);
 #endif

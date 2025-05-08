@@ -1,9 +1,10 @@
 #!/bin/env python3
 
-import os, sys
-import numpy as np
+import os
+import sys
 import struct
 import onnx
+import numpy as np
 from onnx import numpy_helper
 
 class CustomModel:
@@ -126,7 +127,7 @@ class CustomModel:
         count = struct.unpack('I', f.read(4))[0]
         return [{'name': CustomModel._read_string(f), 'shape': [struct.unpack('Q', f.read(8))[0] for _ in range(struct.unpack('I', f.read(4))[0])]} for _ in range(count)]
 
-        return [struct.unpack('Q', f.read(8))[0] if isinstance(i, int) else CustomModel._read_string(f) for i in range(count)]
+    @staticmethod
     def _read_list(f):
         count = struct.unpack('I', f.read(4))[0]
         return [struct.unpack('Q', f.read(8))[0] if i == 0 else CustomModel._read_string(f) for i in range(count)]
@@ -205,9 +206,9 @@ def parse_onnx_model(onnx_path):
     # Initializers (parameters)
     for initializer in graph.initializer:
         name = initializer.name
-        shape = tuple(initializer.dims)
-        data_type = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
-        raw_data = initializer.raw_data
+        # shape = tuple(initializer.dims)
+        # data_type = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
+        # raw_data = initializer.raw_data
         arr = numpy_helper.to_array(initializer)
         custom_model.initializers[name] = arr
 
@@ -223,10 +224,10 @@ if __name__ == "__main__":
     output_bin_path = os.path.splitext(onnx_model_path)[0] + ".bin"
 
     print("Parsing ONNX model...")
-    custom_model = parse_onnx_model(onnx_model_path)
+    onnxmodel = parse_onnx_model(onnx_model_path)
 
     print("Saving to binary format...")
-    custom_model.save_to_binary(output_bin_path)
+    onnxmodel.save_to_binary(output_bin_path)
 
     print("Loading back from binary...")
     loaded_model = CustomModel.load_from_binary(output_bin_path)
@@ -242,10 +243,10 @@ if __name__ == "__main__":
     print("\nNodes:")
     for node in loaded_model.nodes:
         print(f"  OpType: {node['op_type']}, Attributes: {node['attributes']}")
-        print(f"    Inputs:")
+        print("    Inputs:")
         for input_info in node['inputs']:
             print(f"      Name: {input_info['name']}, Shape: {input_info['shape']}")
-        print(f"    Outputs:")
+        print("    Outputs:")
         for output_info in node['outputs']:
             print(f"      Name: {output_info['name']}, Shape: {output_info['shape']}")
 
