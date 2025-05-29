@@ -1,22 +1,22 @@
-#ifndef OPERATOR_HPP
-#define OPERATOR_HPP
+// Copyright 2025 @junka
+#ifndef OPS_OPERATOR_HPP_
+#define OPS_OPERATOR_HPP_
 
 namespace vkop {
 
 namespace ops {
 
 class Operator {
-public:
+  public:
     Operator() = default;
     virtual ~Operator() = default;
-    Operator(const Operator&) = delete;
-    Operator& operator=(const Operator&) = delete;
-    Operator(Operator&&) = delete;
-    Operator& operator=(Operator&&) = delete;
+    Operator(const Operator &) = delete;
+    Operator &operator=(const Operator &) = delete;
+    Operator(Operator &&) = delete;
+    Operator &operator=(Operator &&) = delete;
 };
 
+} // namespace ops
 
-}
-
-}
-#endif // OPERATOR_HPP
+} // namespace vkop
+#endif // OPS_OPERATOR_HPP_

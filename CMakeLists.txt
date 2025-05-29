@@ -5,6 +5,8 @@ project(vkop)
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_CLANG_TIDY clang-tidy)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -Wall -Wextra -Werror -fno-omit-frame-pointer")
 
@@ -18,9 +20,7 @@ include_directories(${CMAKE_SOURCE_DIR}/model)
 
 # Source files
 file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*cpp)
-
-# Add executable
-add_library(vkop ${SRC_FILES})
+file(GLOB_RECURSE ALL_SOURCE_FILES src/*.cpp src/*.hpp ops/*.cpp core/*cpp ops/*.hpp core/*hpp)
 
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
@@ -34,7 +34,7 @@ file(MAKE_DIRECTORY ${SPIRV_DIR})
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
     set(SPIRV_FILE ${SPIRV_DIR}/${SHADER_NAME}.spv)
-    set(HEADER_FILE ${SPIRV_DIR}/${SHADER_NAME}.h)
+    set(SPIRV_SOURCE_FILE ${SPIRV_DIR}/${SHADER_NAME}.c)
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
@@ -44,14 +44,19 @@ foreach(SHADER ${SHADER_FILES})
     )
 
     add_custom_command(
-        OUTPUT ${HEADER_FILE}
-        COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-zA-Z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${HEADER_FILE}
+        OUTPUT ${SPIRV_SOURCE_FILE}
+        COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-zA-Z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${SPIRV_SOURCE_FILE}
         DEPENDS ${SPIRV_FILE}
         COMMENT "Converting ${SPIRV_FILE} to header file"
     )
 
-    list(APPEND SPIRV_HEADERS ${HEADER_FILE})
+    list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE})
+    list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE})
 endforeach()
+
+
+# Add executable
+add_library(vkop ${SRC_FILES})
 
 # Add generated headers to the target
 add_custom_target(compile_shaders DEPENDS ${SPIRV_HEADERS})
@@ -65,6 +70,34 @@ add_subdirectory(model)
 
 add_executable(vkopmain main.cpp)
 target_link_libraries(vkopmain vkop vload)
+
+
+find_program(CLANG_FORMAT "clang-format")
+if(NOT CLANG_FORMAT)
+  message(WARNING "clang-format not found, formatting step will be skipped.")
+else()
+  add_custom_target(
+    format-code
+    COMMAND ${CLANG_FORMAT} -style=file -i ${ALL_SOURCE_FILES}
+    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+    COMMENT "Formatting all C++ source and header files..."
+  )
+
+  add_dependencies(vkopmain format-code)
+endif()
+
+find_program(CPPLINT "cpplint")
+if(NOT CPPLINT)
+    message(WARNING "cpplint not found, linting step will be skipped.")
+else()
+    add_custom_target(
+        lint-code
+        COMMAND ${CPPLINT} --extensions=cpp,hpp --counting=detailed ${ALL_SOURCE_FILES}
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Running cpplint on all C++ source and header files..."
+    )
+    # add_dependencies(vkopmain lint-code)
+endif()
 
 enable_testing()
 

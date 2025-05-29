@@ -1,41 +1,34 @@
-#ifndef GRIDSAMPLE_HPP
-#define GRIDSAMPLE_HPP
+// Copyright 2025 @junka
+#ifndef OPS_GRIDSAMPLE_HPP_
+#define OPS_GRIDSAMPLE_HPP_
 
-#include <vector>
 #include <unistd.h>
+#include <vector>
 
 #include "Operator.hpp"
 #include "vulkan/vulkan.hpp"
 
-#include "VulkanDevice.hpp"
 #include "VulkanBuffer.hpp"
+#include "VulkanCommandBuffer.hpp"
+#include "VulkanCommandPool.hpp"
+#include "VulkanDevice.hpp"
 #include "VulkanImage.hpp"
 #include "VulkanPipeline.hpp"
-#include "VulkanCommandPool.hpp"
-#include "VulkanCommandBuffer.hpp"
 #include "VulkanQueryPool.hpp"
 
 #include "logger.hpp"
 
-
 namespace vkop {
 namespace ops {
 
-enum class InterpolationMode {
-    Bilinear,
-    Nearest
-};
+enum class InterpolationMode { BILINEAR, NEAREST };
 
-enum class PaddingMode {
-    Zeros,
-    Border,
-    Reflection
-};
+enum class PaddingMode { ZEROS, BORDER, REFLECTION };
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
-typedef int ivec4[4];
-typedef int ivec2[2];
+using ivec4 = int[4];
+using ivec2 = int[2];
 
 struct GpuGridSampleParam {
     ivec4 outImgSize;
@@ -46,58 +39,59 @@ struct GpuGridSampleParam {
     int interpolation_mode;
 };
 
-class GridSample: public Operator {
-public:
-    GridSample(InterpolationMode interp_mode = InterpolationMode::Bilinear,
-               PaddingMode pad_mode = PaddingMode::Zeros,
-               bool align_corners = false)
-        : interpolation_mode(interp_mode),
-          padding_mode(pad_mode),
-          align_corners(align_corners) {}
+class GridSample : public Operator {
+  public:
+    explicit GridSample(
+        InterpolationMode interp_mode = InterpolationMode::BILINEAR,
+        PaddingMode pad_mode = PaddingMode::ZEROS, bool align_corners = false)
+        : interpolation_mode_(interp_mode), padding_mode_(pad_mode),
+          align_corners_(align_corners) {}
 
     template <typename T>
-    std::vector<T> apply(const std::vector<T>& input,
-                        const std::vector<T>& grid,
-                        const std::vector<int>& input_shape,
-                        const std::vector<int>& grid_shape)
-    {
+    std::vector<T> apply(const std::vector<T> &input,
+                         const std::vector<T> &grid,
+                         const std::vector<int> &input_shape,
+                         const std::vector<int> &grid_shape) {
         if (input_shape.size() != 4 || grid_shape.size() != 4) {
-            throw std::invalid_argument("Input and grid must have 4 dimensions.");
+            throw std::invalid_argument(
+                "Input and grid must have 4 dimensions.");
         }
         int batch = input_shape[0];
         int depth = input_shape[1];
-        int inHeight = input_shape[2];
-        int inWidth = input_shape[3];
-        int outHeight = grid_shape[1];
-        int outWidth = grid_shape[2];
+        int in_height = input_shape[2];
+        int in_width = input_shape[3];
+        int out_height = grid_shape[1];
+        int out_width = grid_shape[2];
 
-        int realwidth = outWidth * UP_DIV(depth, 4);
-        int realheight = outHeight * batch;
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
 
         prepare(input_shape, grid_shape);
 
-        struct GpuGridSampleParam *para = reinterpret_cast<GpuGridSampleParam*>(paramBuffer->getMappedMemory());
+        auto *para = reinterpret_cast<GpuGridSampleParam *>(
+            paramBuffer_->getMappedMemory());
         // vkimage params
         para->outImgSize[0] = realwidth;
         para->outImgSize[1] = realheight;
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
         // original params
-        para->inShape[0] = inWidth;
-        para->inShape[1] = inHeight;
-        para->outShape[0] = outWidth;
-        para->outShape[1] = outHeight;
-        para->align_corners = align_corners;
-        para->padding_mode = (int)padding_mode;
-        para->interpolation_mode = (int)interpolation_mode;
-        paramBuffer->unmapMemory();
+        para->inShape[0] = in_width;
+        para->inShape[1] = in_height;
+        para->outShape[0] = out_width;
+        para->outShape[1] = out_height;
+        para->align_corners = align_corners_;
+        para->padding_mode = static_cast<int>(padding_mode_);
+        para->interpolation_mode = static_cast<int>(interpolation_mode_);
+        paramBuffer_->unmapMemory();
 
-        VkDevice device = m_dev->getLogicalDevice();
+        VkDevice device = m_dev_->getLogicalDevice();
 
-        const T* inputPtr = input.data();
-        const T* gridPtr = grid.data();
-        auto inputRGBA = inputImage->convertNCHWToRGBA(inputPtr, input_shape);
-        auto gridRGBA = gridImage->convertNCHWToRGBA(gridPtr, grid_shape);
+        const T *input_ptr = input.data();
+        const T *grid_ptr = grid.data();
+        auto input_rgba =
+            inputImage_->convertNCHWToRGBA(input_ptr, input_shape);
+        auto grid_rgba = gridImage_->convertNCHWToRGBA(grid_ptr, grid_shape);
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             inputImage->hostImageCopyToDevice(inputRGBA.data());
@@ -105,22 +99,24 @@ public:
         } else
 #endif
         {
-            VulkanCommandBuffer cmdstg(device, m_cmdpool->getCommandPool());
+            VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
             cmdstg.begin();
-            inputImage->stagingBufferCopyToImage(cmdstg.get(), inputRGBA.data());
-            gridImage->stagingBufferCopyToImage(cmdstg.get(), gridRGBA.data());
+            inputImage_->stagingBufferCopyToImage(cmdstg.get(),
+                                                  input_rgba.data());
+            gridImage_->stagingBufferCopyToImage(cmdstg.get(),
+                                                 grid_rgba.data());
             cmdstg.end();
-            cmdstg.submit(m_dev->getComputeQueue());
+            cmdstg.submit(m_dev_->getComputeQueue());
         }
 
-        VulkanCommandBuffer cmd(device, m_cmdpool->getCommandPool());
+        VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
         cmd.begin();
-        inputImage->readBarrier(cmd.get());
-        gridImage->readBarrier(cmd.get());
+        inputImage_->readBarrier(cmd.get());
+        gridImage_->readBarrier(cmd.get());
         cmd.end();
-        cmd.submit(m_dev->getComputeQueue());
+        cmd.submit(m_dev_->getComputeQueue());
 
-        submit(outWidth, outHeight);
+        submit(out_width, out_height);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -130,44 +126,47 @@ public:
         } else
 #endif
         {
-            VulkanCommandBuffer cmdstg1(device, m_cmdpool->getCommandPool());
+            VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
             cmdstg1.begin();
-            outputImage->stagingBufferCopyToHost(cmdstg1.get());
+            outputImage_->stagingBufferCopyToHost(cmdstg1.get());
             cmdstg1.end();
-            cmdstg1.submit(m_dev->getComputeQueue());
-            outputImage->readStaingBuffer(ptr);
+            cmdstg1.submit(m_dev_->getComputeQueue());
+            outputImage_->readStaingBuffer(ptr);
         }
-    
-        std::vector<T> output = outputImage->convertRGBAToNCHW<T>(ptr, {batch, depth, outHeight, outWidth});
+
+        std::vector<T> output = outputImage_->convertRGBAToNCHW<T>(
+            ptr, {batch, depth, out_height, out_width});
         return output;
     }
 
-    void set_runtime_device(VkPhysicalDevice phydev, std::shared_ptr<VulkanDevice> dev, VulkanCommandPool *cmdpool) {
-        m_phydev = phydev;
-        m_dev = dev;
-        m_cmdpool = cmdpool;
-    };
+    void set_runtime_device(VkPhysicalDevice phydev,
+                            std::shared_ptr<VulkanDevice> dev,
+                            VulkanCommandPool *cmdpool) {
+        m_phydev_ = phydev;
+        m_dev_ = std::move(dev);
+        m_cmdpool_ = cmdpool;
+    }
 
-private:
-    InterpolationMode interpolation_mode;
-    PaddingMode padding_mode;
-    bool align_corners;
+  private:
+    InterpolationMode interpolation_mode_;
+    PaddingMode padding_mode_;
+    bool align_corners_;
 
-    std::shared_ptr<VulkanImage> outputImage;
-    std::shared_ptr<VulkanImage> inputImage;
-    std::shared_ptr<VulkanImage> gridImage;
-    std::shared_ptr<VulkanBuffer> paramBuffer;
+    std::shared_ptr<VulkanImage> outputImage_;
+    std::shared_ptr<VulkanImage> inputImage_;
+    std::shared_ptr<VulkanImage> gridImage_;
+    std::shared_ptr<VulkanBuffer> paramBuffer_;
 
+    VkPhysicalDevice m_phydev_;
+    std::shared_ptr<VulkanDevice> m_dev_;
+    VulkanCommandPool *m_cmdpool_;
 
-    VkPhysicalDevice m_phydev;
-    std::shared_ptr<VulkanDevice> m_dev;
-    VulkanCommandPool *m_cmdpool;
-
-    void prepare(const std::vector<int>& input_shape, const std::vector<int>& grid_shape);
-    void submit(int outWidth, int outHeight);
+    void prepare(const std::vector<int> &input_shape,
+                 const std::vector<int> &grid_shape);
+    void submit(int out_width, int out_height);
 };
 
 } // namespace ops
 } // namespace vkop
 
-#endif // GRIDSAMPLE_HPP
+#endif // OPS_GRIDSAMPLE_HPP_

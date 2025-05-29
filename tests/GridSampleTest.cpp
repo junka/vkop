@@ -13,9 +13,12 @@
 
 #include "GridSample.hpp"
 
-using namespace vkop;
+using vkop::VulkanInstance;
+using vkop::VulkanDevice;
+using vkop::VulkanCommandPool;
+using vkop::ops::GridSample;
 
-
+namespace {
 // 反归一化处理坐标
 /*
 * x_norm 范围在 [-1.0, 1.0], 那么首先 +1 后范围在 [0, 2]
@@ -23,18 +26,18 @@ using namespace vkop;
 * 再除以 2 后范围在 [0, range - 0.5]
 */
 template <typename T>
-static T getPosition(T x_norm, int range, bool alignCorners) {
-    T a = alignCorners ? 1.0f : 0.0f;
-    T b = alignCorners ? 0.0f : 1.0f;
-    return (T)(((1.0f + x_norm) * (range - a) - b) * 0.5f);
+T getPosition(T x_norm, int range, bool alignCorners) {
+    T a = alignCorners ? 1.0F : 0.0F;
+    T b = alignCorners ? 0.0F : 1.0F;
+    return static_cast<T>(((1.0F + x_norm) * (range - a) - b) * 0.5F);
 }
 
 // padding zero
 // 获取坐标对应的值, 如果超过范围, 补零
 template <typename T>
-static T sample(int y, int x, const T *buffer, int height, int width) {
+T sample(int y, int x, const T *buffer, int height, int width) {
     if (y < 0 || y >= height || x < 0 || x >= width) {
-        return 0.0f;
+        return 0.0F;
     }
 
     return buffer[y * width + x];
@@ -47,7 +50,7 @@ static T sample(int y, int x, const T *buffer, int height, int width) {
 * 计算出权重,
 */
 template <typename T>
-static T interpolate(T h, T w, const T *buffer, int height, int width) {
+T interpolate(T h, T w, const T *buffer, int height, int width) {
     // mode == GridSampleMode_BILINEAR
     int w0_h = ::floor(h);
     int w0_w = ::floor(w);
@@ -66,11 +69,11 @@ static T interpolate(T h, T w, const T *buffer, int height, int width) {
     // 权重, 左边界归一化
     T fx2 = w - w0_w;
     // 右边界归一化
-    T fx1 = 1.0f - fx2;
+    T fx1 = 1.0F - fx2;
     // 上边界归一化
     T fy2 = h - w0_h;
     // 下边界归一化
-    T fy1 = 1.0f - fy2;
+    T fy1 = 1.0F - fy2;
 
     // 插值. 水平方向
     T i0 = ((i00) * fx1 + (i01) * fx2);
@@ -81,35 +84,35 @@ static T interpolate(T h, T w, const T *buffer, int height, int width) {
 }
 
 template <typename T>
-static void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &output,
+void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &output,
                         int batch, int inHeight, int inWidth, int outHeight, int outWidth, int depth,
                         bool alignCorners) {
     output.resize(batch * outHeight * outWidth * depth);
 
-    T *outputPtr = output.data();
+    T *output_ptr = output.data();
 
     // 按照 NCHW 的顺序, HW 以output 为目标,
     // grid 的hw 和output是一致的
     // input不参与循环hw, 在每个NC的循环中, 直接整个图以HW尺寸输入,保证grid操作单个channel
     for (auto b = 0; b < batch; ++b) {
-        const T *_inputPtr = inputPtr + b * inHeight * inWidth * depth;
-        const T *_gridPtr = gridPtr + b * outHeight * outWidth * 2;
-        T *_outputPtr = outputPtr + b * outHeight * outWidth * depth;
+        const T *b_input_ptr = inputPtr + b * inHeight * inWidth * depth;
+        const T *b_grid_ptr = gridPtr + b * outHeight * outWidth * 2;
+        T *b_output_ptr = output_ptr + b * outHeight * outWidth * depth;
 
         for (auto c = 0; c < depth; ++c) {
-            auto __inputPtr = _inputPtr + c * inHeight * inWidth;
-            auto __outputPtr = _outputPtr + c * outHeight * outWidth;
+            auto *c_input_ptr = b_input_ptr + c * inHeight * inWidth;
+            auto *c_output_ptr = b_output_ptr + c * outHeight * outWidth;
 
             for (auto h = 0; h < outHeight; ++h) {
-                auto __gridPtr = _gridPtr + h * outWidth * 2;
-                auto ___outputPtr = __outputPtr + h * outWidth;
+                auto * h_grid_ptr = b_grid_ptr + h * outWidth * 2;
+                auto * h_output_ptr = c_output_ptr + h * outWidth;
 
                 for (auto w = 0; w < outWidth; ++w) {
                     // 首先反归一化得到坐标
-                    auto x = getPosition(__gridPtr[2 * w + 0], inWidth, alignCorners);
-                    auto y = getPosition(__gridPtr[2 * w + 1], inHeight, alignCorners);
+                    auto x = getPosition(h_grid_ptr[2 * w + 0], inWidth, alignCorners);
+                    auto y = getPosition(h_grid_ptr[2 * w + 1], inHeight, alignCorners);
                     // 然后插值,得到的值输出
-                    ___outputPtr[w] = interpolate(y, x, __inputPtr, inHeight, inWidth);
+                    h_output_ptr[w] = interpolate(y, x, c_input_ptr, inHeight, inWidth);
                 }
             }
         }
@@ -118,12 +121,12 @@ static void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vect
 
 class GridSampleTest {
 public:
-    int batch;
-    int depth;
-    int inHeight;
-    int inWidth ;
-    int outHeight;
-    int outWidth;
+    int batch_;
+    int depth_;
+    int inHeight_;
+    int inWidth_;
+    int outHeight_;
+    int outWidth_;
 
     std::vector<float> originInputData;
     std::vector<float> originGridData;
@@ -133,57 +136,57 @@ public:
         initTestdata();
     }
 private:
-    void initTestdata(void)
+    void initTestdata()
     {
         std::vector<int> t = {
             1, 3, 4, 4, 4, 4
             // 2, 5, 4, 4, 4, 4
         };
-        batch = t[0];
-        depth = t[1];
-        inHeight = t[2];
-        inWidth = t[3];
-        outHeight = t[4];
-        outWidth = t[5];
+        batch_ = t[0];
+        depth_ = t[1];
+        inHeight_ = t[2];
+        inWidth_ = t[3];
+        outHeight_ = t[4];
+        outWidth_ = t[5];
 
-        auto inputSize = batch * depth * inHeight * inWidth;
-        auto gridSize = batch * outHeight * outWidth * 2;
-        auto outputSize = batch * outHeight * outWidth * depth;
+        auto input_size = batch_ * depth_ * inHeight_ * inWidth_;
+        auto grid_size = batch_ * outHeight_ * outWidth_ * 2;
+        auto output_size = batch_ * outHeight_ * outWidth_ * depth_;
 
-        originInputData.resize(inputSize);
-        originGridData.resize(gridSize); //for 2d, last dim is x,y
-        expectedOutput.resize(outputSize);
+        originInputData.resize(input_size);
+        originGridData.resize(grid_size); //for 2d, last dim is x,y
+        expectedOutput.resize(output_size);
 
-        float *inputPtr = originInputData.data();
-        float *gridPtr = originGridData.data();
+        float *input_ptr = originInputData.data();
+        float *grid_ptr = originGridData.data();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> inputDist{0.0f, 1.0};
-        std::normal_distribution<> gridDist{0.0f, 3.0f / outWidth};
-        for (int i = 0; i < inputSize; i++) {
-            inputPtr[i] = inputDist(gen);
+        std::normal_distribution<> input_dist{0.0F, 1.0F};
+        std::normal_distribution<> grid_dist{0.0F, 3.0F / outWidth_};
+        for (int i = 0; i < input_size; i++) {
+            input_ptr[i] = input_dist(gen);
         }
-        for (int b = 0; b < batch; b++) {
-            for (int h = 0; h < outHeight; h++) {
-                for (int w = 0; w < outWidth; w++) {
-                    float offsetH = gridDist(gen);
-                    float offsetW = gridDist(gen);
-                    gridPtr[b * outHeight * outWidth * 2 + h * outWidth * 2 + w * 2 + 0] = (2.0f * w / (outWidth-1) - 1.0f + offsetW);
-                    gridPtr[b * outHeight * outWidth * 2 + h * outWidth * 2 + w * 2 + 1] = (2.0f * h / (outHeight-1) - 1.0f + offsetH);
+        for (int b = 0; b < batch_; b++) {
+            for (int h = 0; h < outHeight_; h++) {
+                for (int w = 0; w < outWidth_; w++) {
+                    float offset_h = grid_dist(gen);
+                    float offset_w = grid_dist(gen);
+                    grid_ptr[b * outHeight_ * outWidth_ * 2 + h * outWidth_ * 2 + w * 2 + 0] = (2.0F * w / (outWidth_ - 1) - 1.0F + offset_w);
+                    grid_ptr[b * outHeight_ * outWidth_ * 2 + h * outWidth_ * 2 + w * 2 + 1] = (2.0F * h / (outHeight_ - 1) - 1.0F + offset_h);
                 }
             }
         }
         std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_grid_sample<float>(inputPtr, gridPtr, expectedOutput, batch, inHeight, inWidth, outHeight, outWidth, depth, false);
+        reference_grid_sample<float>(input_ptr, grid_ptr, expectedOutput, batch_, inHeight_, inWidth_, outHeight_, outWidth_, depth_, false);
         std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         LOG_INFO("reference grid sample time: %f s", duration.count());
     }
 };
 
-
+}
 
 
 int main() {
@@ -193,7 +196,7 @@ int main() {
     // auto rdoc = Renderdoc(VulkanInstance::getVulkanInstance().getInstance());
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        for (auto pdev : phydevs) {
+        for (auto *pdev : phydevs) {
             auto dev = std::make_shared<VulkanDevice>(pdev);
             if (dev->getDeviceName().find("llvmpipe")!= std::string::npos) {
                 continue;
@@ -202,18 +205,19 @@ int main() {
             VkDevice device = dev->getLogicalDevice();
             VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
 
-            ops::GridSample gs;
+            GridSample gs;
             gs.set_runtime_device(pdev, dev, &cmdpool);
             // Ensure shared pointers are retained before cmd.submit
             auto ret = gs.apply<float>(tp.originInputData, tp.originGridData,
-                {tp.batch, tp.depth, tp.inHeight, tp.inWidth},
-                {tp.batch, tp.outHeight, tp.outWidth, 2});
+                {tp.batch_, tp.depth_, tp.inHeight_, tp.inWidth_},
+                {tp.batch_, tp.outHeight_, tp.outWidth_, 2});
             for (uint32_t i = 0; i < ret.size(); i++) {
-                if (std::fabs(ret.data()[i] - tp.expectedOutput.data()[i]) > 0.01) {
-                    LOG_ERROR("Test Fail at (%d): %f, %f", i, ret.data()[i], tp.expectedOutput.data()[i]);
+                if (std::fabs(ret[i] - tp.expectedOutput[i]) > 0.01) {
+                    LOG_ERROR("Test Fail at (%d): %f, %f", i, ret[i], tp.expectedOutput[i]);
                     return -1;
                 }
             }
+            sleep(100000);
             
             LOG_INFO("Test Passed");
 

@@ -1,26 +1,28 @@
+#include "VulkanDevice.hpp"
+#include "VulkanInstance.hpp"
+#include "logger.hpp"
+#include "Tensor.hpp"
+#include "load.hpp"
+
 #include <cstdint>
 #include <memory>
 #include <random>
 #include <chrono>
 #include <cmath>
+
 #include <sys/types.h>
-#include "VulkanDevice.hpp"
-#include "VulkanInstance.hpp"
 
-#include "logger.hpp"
-
-#include "load.hpp"
-#include "Tensor.hpp"
-
-
-using namespace vkop;
+using vkop::VulkanInstance;
+using vkop::VulkanDevice;
+using vkop::Tensor;
+using vkop::VkModel;
 
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        for (auto pdev : phydevs) {
+        for (auto *pdev : phydevs) {
             auto dev = std::make_shared<VulkanDevice>(pdev);
             LOG_INFO("%s",dev->getDeviceName().c_str());
         }
@@ -34,8 +36,8 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     try {
-        std::string binaryFilePath = argv[1];
-        VkModel model(binaryFilePath);
+        std::string binary_file_path = argv[1];
+        VkModel model(binary_file_path);
 
         std::cout << "Inputs:" << std::endl;
         for (const auto& input : model.inputs) {
@@ -60,7 +62,7 @@ int main(int argc, char *argv[]) {
             std::cout << "  OpType: " << node.op_type;
             if (!node.attributes.empty()) {
                 std::cout << ", Attributes: {";
-                for (auto attr: node.attributes) {
+                for (const auto& attr : node.attributes) {
                     std::cout << attr.first << ": " << attr.second << ", ";
                 }
                 std::cout << "}";

@@ -1,13 +1,15 @@
-#ifndef VULKAN_COMMAND_BUFFER_HPP
-#define VULKAN_COMMAND_BUFFER_HPP
+// Copyright 2025 @junka
+#ifndef SRC_VULKANCOMMANDBUFFER_HPP_
+#define SRC_VULKANCOMMANDBUFFER_HPP_
 
 #include "VulkanPipeline.hpp"
 #include <vulkan/vulkan.hpp>
 
 namespace vkop {
 class VulkanCommandBuffer {
-public:
-    VulkanCommandBuffer(VkDevice device, VkCommandPool commandPool, int count = 1);
+  public:
+    VulkanCommandBuffer(VkDevice device, VkCommandPool commandPool,
+                        int count = 1);
     ~VulkanCommandBuffer();
 
     // Allocate command buffers
@@ -30,19 +32,18 @@ public:
     void reset(int idx = 0);
 
     // Get the Vulkan command buffer handle
-    VkCommandBuffer get() const { return m_commandBuffers[m_avail]; };
+    VkCommandBuffer get() const { return m_commandBuffers_[m_avail_]; }
 
     void dispatch(int w, int h, int z);
 
-private:
-    VkDevice m_device;
-    VkCommandPool m_commandPool;
+  private:
+    VkDevice m_device_;
+    VkCommandPool m_commandPool_;
     // VkCommandBuffer m_commandBuffer;
-    std::vector<VkCommandBuffer> m_commandBuffers;
-    int m_avail = 0;
-
+    std::vector<VkCommandBuffer> m_commandBuffers_;
+    int m_avail_ = 0;
 };
 
-}
+} // namespace vkop
 
-#endif // VULKAN_COMMAND_BUFFER_HPP
+#endif // SRC_VULKANCOMMANDBUFFER_HPP_

@@ -1,3 +1,4 @@
+// Copyright 2025 @junka
 #ifndef LOGGER_H
 #define LOGGER_H
 
@@ -7,7 +8,7 @@
 #include <memory>
 #include <string>
 #include <mutex>
-#include <time.h>
+#include <ctime>
 
 enum LogLevel {
     LOG_INFO,
@@ -23,19 +24,19 @@ public:
     }
 
     void setLevel(LogLevel level) {
-        logLevel = level;
+        logLevel_ = level;
     }
 
     void enableFileOutput(const std::string& filePath, bool enable = true) {
-        fileOutputEnabled = enable;
+        fileOutputEnabled_ = enable;
         if (enable) {
-            logFile.open(filePath, std::ofstream::out | std::ofstream::app);
-            if (!logFile.is_open()) {
+            logFile_.open(filePath, std::ofstream::out | std::ofstream::app);
+            if (!logFile_.is_open()) {
                 std::cerr << "Failed to open log file: " << filePath << std::endl;
             }
         } else {
-            if (logFile.is_open()) {
-                logFile.close();
+            if (logFile_.is_open()) {
+                logFile_.close();
             }
         }
     }
@@ -55,30 +56,30 @@ public:
         log(LOG_ERROR, "[ERROR] " + format, args...);
     }
 
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
 private:
-    LogLevel logLevel = LOG_INFO;
-    bool fileOutputEnabled = false;
-    std::ofstream logFile;
-    std::mutex mutex;
+    LogLevel logLevel_ = LOG_INFO;
+    bool fileOutputEnabled_ = false;
+    std::ofstream logFile_;
+    std::mutex mutex_;
 
     Logger() = default;
     ~Logger() {
-        if (logFile.is_open()) {
-            logFile.close();
+        if (logFile_.is_open()) {
+            logFile_.close();
         }
     }
-    Logger(const Logger&) = delete;
-    Logger& operator=(const Logger&) = delete;
 
     template <typename... Args>
     void log(LogLevel level, const std::string& format, Args... args) {
-        if (level < logLevel) return;
+        if (level < logLevel_) return;
 
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<std::mutex> lock(mutex_);
         auto now = std::chrono::system_clock::now();
-        auto timeNow = std::chrono::system_clock::to_time_t(now);
-        char timeStr[25];
-        std::strftime(timeStr, sizeof(timeStr), "%Y-%m-%d %H:%M:%S", std::localtime(&timeNow));
+        auto time_now = std::chrono::system_clock::to_time_t(now);
+        char time_str[25];
+        std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", std::localtime(&time_now));
 
         // Format the message
         size_t size;
@@ -92,11 +93,11 @@ private:
             buffer = std::make_unique<char[]>(size);
             snprintf(buffer.get(), size, format.c_str(), args...);
         }
-        std::string formattedMessage(buffer.get(), buffer.get() + size - 1);
+        std::string formatted_message(buffer.get(), buffer.get() + size - 1);
 
-        std::cout << timeStr << " " << formattedMessage << std::endl;
-        if (fileOutputEnabled && logFile.is_open()) {
-            logFile << timeStr << " " << formattedMessage << std::endl;
+        std::cout << time_str << " " << formatted_message << std::endl;
+        if (fileOutputEnabled_ && logFile_.is_open()) {
+            logFile_ << time_str << " " << formatted_message << std::endl;
         }
     }
 };

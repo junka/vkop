@@ -1,22 +1,24 @@
-#ifndef VULKAN_QUERY_POOL_HPP
-#define VULKAN_QUERY_POOL_HPP
+// Copyright 2025 @junka
+#ifndef SRC_VULKANQUERYPOOL_HPP_
+#define SRC_VULKANQUERYPOOL_HPP_
 
-#include <vulkan/vulkan.hpp>
 #include <vector>
+#include <vulkan/vulkan.hpp>
 
 namespace vkop {
 
 class VulkanQueryPool {
-public:
-    VulkanQueryPool(VkDevice device, uint32_t queryCount, VkQueryType queryType);
+  public:
+    VulkanQueryPool(VkDevice device, uint32_t queryCount,
+                    VkQueryType queryType);
 
     ~VulkanQueryPool();
 
-    VulkanQueryPool(const VulkanQueryPool&) = delete;
-    VulkanQueryPool& operator=(const VulkanQueryPool&) = delete;
-    VulkanQueryPool& operator=(VulkanQueryPool&& other) = delete;
+    VulkanQueryPool(const VulkanQueryPool &) = delete;
+    VulkanQueryPool &operator=(const VulkanQueryPool &) = delete;
+    VulkanQueryPool &operator=(VulkanQueryPool &&other) = delete;
 
-    VkQueryPool get() const { return m_queryPool; }
+    VkQueryPool get() const { return m_queryPool_; }
 
     uint64_t getOneResult(int index);
 
@@ -28,12 +30,12 @@ public:
 
     void end(VkCommandBuffer cmd);
 
-private:
-    VkDevice m_device;
-    uint32_t m_queryCount;
-    VkQueryPool m_queryPool;
+  private:
+    VkDevice m_device_;
+    uint32_t m_queryCount_;
+    VkQueryPool m_queryPool_;
 };
 
 } // namespace vkop
 
-#endif
+#endif // SRC_VULKANQUERYPOOL_HPP_

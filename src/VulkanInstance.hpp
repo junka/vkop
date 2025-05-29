@@ -1,85 +1,75 @@
-#ifndef VULKAN_INSTANCE_HPP
-#define VULKAN_INSTANCE_HPP
+// Copyright 2025 @junka
+#ifndef SRC_VULKANINSTANCE_HPP_
+#define SRC_VULKANINSTANCE_HPP_
 
 #include "vulkan/vulkan.hpp"
 
-#include <vector>
 #include <string>
+#include <vector>
 
 namespace vkop {
 
 class VulkanInstance {
-public:
+  public:
     VulkanInstance();
     ~VulkanInstance();
 
-    VulkanInstance(const VulkanInstance&) = delete;
-    VulkanInstance& operator=(const VulkanInstance&) = delete;
+    VulkanInstance(const VulkanInstance &) = delete;
+    VulkanInstance &operator=(const VulkanInstance &) = delete;
 
     // Get the Vulkan instance handle
     VkInstance getInstance() const;
-    
-    static VulkanInstance& getVulkanInstance(void) {
-        static VulkanInstance ins;// = new VulkanInstance();
+
+    static VulkanInstance &getVulkanInstance() {
+        static VulkanInstance ins; // = new VulkanInstance();
         return ins;
     }
 
     void destroyInstance();
-    std::vector<VkPhysicalDevice> getPhysicalDevices(void) { return m_physicalDevices;}
+    std::vector<VkPhysicalDevice> getPhysicalDevices() {
+        return m_physical_devices_;
+    }
 
-private:
-
+  private:
     // Initialize the Vulkan instance
-    void createInstance(const std::string& applicationName, uint32_t applicationVersion);
+    void createInstance(const std::string &app_name, uint32_t app_version);
 
-    uint32_t getVulkanVersion(void);
     // Check if a specific extension is supported
-    bool isExtensionSupported(const char* extensionName) const;
+    bool isExtensionSupported(const char *extensionName) const;
     // Check if validation layers are supported
     bool checkValidationLayerSupport() const;
     // Check for required extensions
     void getRequiredExtensions() const;
 
-    void enumPhysicalDevices(void);
+    void enumPhysicalDevices();
 
-    void enumInstanceExtensions(void);
+    void enumInstanceExtensions();
 
-    
     void getToolinfo(VkPhysicalDevice physicalDevice);
-
 
 #if VK_EXT_debug_utils
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugUtilsCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
         VkDebugUtilsMessageTypeFlagsEXT messageTypes,
-        const VkDebugUtilsMessengerCallbackDataEXT* pCallbackData,
-        void* pUserData)
-    {
+        const VkDebugUtilsMessengerCallbackDataEXT *pCallbackData,
+        void *pUserData) {
         (void)messageTypes;
         (void)pUserData;
         if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
             fprintf(stderr, "%s [%d]: %s\n", pCallbackData->pMessageIdName,
-                pCallbackData->messageIdNumber,
-                pCallbackData->pMessage);
+                    pCallbackData->messageIdNumber, pCallbackData->pMessage);
         } else {
             fprintf(stdout, "%s [%d]: %s\n", pCallbackData->pMessageIdName,
-                pCallbackData->messageIdNumber,
-                pCallbackData->pMessage);
+                    pCallbackData->messageIdNumber, pCallbackData->pMessage);
         }
         return VK_FALSE;
     }
 #endif
 #if VK_EXT_debug_report
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugReportCallback(
-        VkDebugReportFlagsEXT flags,
-        VkDebugReportObjectTypeEXT objectType,
-        uint64_t object,
-        size_t location,
-        int32_t messageCode,
-        const char *pLayerPrefix,
-        const char *pMessage,
-        void *pUserData)
-    {
+        VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT objectType,
+        uint64_t object, size_t location, int32_t messageCode,
+        const char *pLayerPrefix, const char *pMessage, void *pUserData) {
         (void)flags;
         (void)objectType;
         (void)object;
@@ -92,14 +82,14 @@ private:
     }
 #endif
 #if VK_EXT_debug_report
-    VkDebugReportCallbackEXT CreateDebugReportCallback(void);
+    VkDebugReportCallbackEXT CreateDebugReportCallback();
 #endif
 #if VK_EXT_debug_utils
-    VkDebugUtilsMessengerEXT CreateDebugUtilsMessenger(void);
+    VkDebugUtilsMessengerEXT CreateDebugUtilsMessenger();
 #endif
-    VkInstance m_instance;
-    mutable std::vector<const char*> validationLayers;
-    mutable std::vector<const char*> extensions;
+    VkInstance m_instance_ = VK_NULL_HANDLE;
+    mutable std::vector<const char *> validation_layers_;
+    mutable std::vector<const char *> extensions_;
     union {
 #if VK_EXT_debug_utils
         VkDebugUtilsMessengerEXT utils;
@@ -107,13 +97,13 @@ private:
 #if VK_EXT_debug_report
         VkDebugReportCallbackEXT report;
 #endif
-    } callback;
+    } callback_;
 
-    std::vector<VkExtensionProperties> availableExtensions;
+    std::vector<VkExtensionProperties> available_extensions_;
 
-    std::vector<VkPhysicalDevice> m_physicalDevices;
+    std::vector<VkPhysicalDevice> m_physical_devices_;
 };
 
 } // namespace vkop
 
-#endif // VULKAN_INSTANCE_HPP
+#endif // SRC_VULKANINSTANCE_HPP_

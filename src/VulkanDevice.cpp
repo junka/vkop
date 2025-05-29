@@ -1,5 +1,6 @@
-#include "VulkanLib.hpp"
+// Copyright 2025 @junka
 #include "VulkanDevice.hpp"
+#include "VulkanLib.hpp"
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -9,31 +10,30 @@
 namespace vkop {
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
-    : physicalDevice(physicalDevice), m_support_host_image_copy(false) {
+    : physicalDevice_(physicalDevice) {
     if (physicalDevice == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan physical device handle.");
     }
-    if (logicalDevice != VK_NULL_HANDLE) {
+    if (logicalDevice_ != VK_NULL_HANDLE) {
         throw std::runtime_error("Logical device already created.");
     }
-    if (computeQueue != VK_NULL_HANDLE) {
+    if (computeQueue_ != VK_NULL_HANDLE) {
         throw std::runtime_error("Compute queue already created.");
     }
     create();
     checkDeviceUnifiedMemoryAccess();
 }
 
-VulkanDevice::~VulkanDevice() {
-    destroy();
-}
+VulkanDevice::~VulkanDevice() { destroy(); }
 
 void VulkanDevice::getProperties() {
-    
-    uint32_t pPropertyCount = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &pPropertyCount, nullptr);
-    ext_properties.resize(pPropertyCount);
-    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &pPropertyCount, ext_properties.data());
-    for (auto ext : this->ext_properties) {
+    uint32_t p_property_count = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr,
+                                         &p_property_count, nullptr);
+    ext_properties_.resize(p_property_count);
+    vkEnumerateDeviceExtensionProperties(
+        physicalDevice_, nullptr, &p_property_count, ext_properties_.data());
+    for (auto ext : this->ext_properties_) {
         LOG_INFO("device extension %s", ext.extensionName);
     }
 
@@ -42,7 +42,8 @@ void VulkanDevice::getProperties() {
 
 #ifdef VK_EXT_host_image_copy
     VkPhysicalDeviceHostImageCopyProperties hostimagecopyproperty = {};
-    hostimagecopyproperty.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES;
+    hostimagecopyproperty.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES;
     hostimagecopyproperty.pNext = nullptr;
 
     properties2.pNext = &hostimagecopyproperty;
@@ -55,7 +56,8 @@ void VulkanDevice::getProperties() {
 #endif
 
     VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
-    subgroup_properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    subgroup_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
 #ifdef VK_EXT_host_image_copy
     subgroup_properties.pNext = &hostimagecopyproperty;
 #else
@@ -64,10 +66,10 @@ void VulkanDevice::getProperties() {
 
     properties2.pNext = &subgroup_properties;
 
-    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
-    this->deviceProperties = properties2.properties;
-    this->timestampPeriod = deviceProperties.limits.timestampPeriod;
-    LOG_INFO("GPU %s", deviceProperties.deviceName);
+    vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+    this->deviceProperties_ = properties2.properties;
+    this->timestampPeriod_ = deviceProperties_.limits.timestampPeriod;
+    LOG_INFO("GPU %s", deviceProperties_.deviceName);
 }
 
 void VulkanDevice::create() {
@@ -79,72 +81,104 @@ void VulkanDevice::create() {
 }
 
 void VulkanDevice::destroy() {
-    if (logicalDevice != VK_NULL_HANDLE) {
-        vkDestroyDevice(logicalDevice, nullptr);
-        logicalDevice = VK_NULL_HANDLE;
+    if (logicalDevice_ != VK_NULL_HANDLE) {
+        vkDestroyDevice(logicalDevice_, nullptr);
+        logicalDevice_ = VK_NULL_HANDLE;
     }
 }
 
+bool VulkanDevice::isDeviceSuitable() {
+    int queue_family_index = findComputeQueueFamily();
+    return queue_family_index != -1;
+}
+
+int VulkanDevice::findComputeQueueFamily() {
+    uint32_t queue_family_count = 0;
+    vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_,
+                                             &queue_family_count, nullptr);
+
+    std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
+    vkGetPhysicalDeviceQueueFamilyProperties(
+        physicalDevice_, &queue_family_count, queue_families.data());
+
+    for (uint32_t i = 0; i < queue_families.size(); i++) {
+        if (queue_families[i].queueFlags &
+            (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 bool VulkanDevice::createLogicalDevice() {
-    computeQueueFamilyIndex = findComputeQueueFamily(physicalDevice);
-    if (computeQueueFamilyIndex == -1) {
+    computeQueueFamilyIndex_ = findComputeQueueFamily();
+    if (computeQueueFamilyIndex_ == -1) {
         LOG_ERROR("Failed to find a suitable compute queue family!");
         return false;
     }
 
+    VkPhysicalDeviceFeatures device_features = {};
+    vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
 
-    VkPhysicalDeviceFeatures deviceFeatures = {};
-    vkGetPhysicalDeviceFeatures(physicalDevice, &deviceFeatures);
-
-    VkPhysicalDeviceShaderFloat16Int8Features devicefloat16Int8Features = {};
-    devicefloat16Int8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
+    VkPhysicalDeviceShaderFloat16Int8Features devicefloat16_int8_features = {};
+    devicefloat16_int8_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
 #if VK_KHR_shader_integer_dot_product
-    VkPhysicalDeviceShaderIntegerDotProductFeatures integerDotProductFeatures = {};
-    integerDotProductFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+    VkPhysicalDeviceShaderIntegerDotProductFeatures integerDotProductFeatures =
+        {};
+    integerDotProductFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
     devicefloat16Int8Features.pNext = &integerDotProductFeatures;
 #endif
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-    features2.pNext = &devicefloat16Int8Features;
+    features2.pNext = &devicefloat16_int8_features;
 
-    vkGetPhysicalDeviceFeatures2(physicalDevice, &features2);
+    vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
 
     VkPhysicalDeviceFeatures features = {};
     features.robustBufferAccess = VK_TRUE;
-    if (deviceFeatures.shaderInt64)
+    if (device_features.shaderInt64)
         features.shaderInt64 = VK_TRUE;
-    if (deviceFeatures.shaderFloat64)
+    if (device_features.shaderFloat64)
         features.shaderFloat64 = VK_TRUE;
-    if (deviceFeatures.shaderInt16)
+    if (device_features.shaderInt16)
         features.shaderInt16 = VK_TRUE;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
 
-    VkPhysicalDeviceFloat16Int8FeaturesKHR float16Int8Features = {};
-    float16Int8Features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
+    VkPhysicalDeviceFloat16Int8FeaturesKHR float16_int8_features = {};
+    float16_int8_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT16_INT8_FEATURES_KHR;
 
-    VkPhysicalDevice8BitStorageFeatures storage8bitFeatures = {};
-    storage8bitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
-    storage8bitFeatures.uniformAndStorageBuffer8BitAccess = VK_TRUE;
-    storage8bitFeatures.storageBuffer8BitAccess = VK_TRUE;
+    VkPhysicalDevice8BitStorageFeatures storage8bit_features = {};
+    storage8bit_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES;
+    storage8bit_features.uniformAndStorageBuffer8BitAccess = VK_TRUE;
+    storage8bit_features.storageBuffer8BitAccess = VK_TRUE;
 
 #ifdef VK_KHR_16bit_storage
-    VkPhysicalDevice16BitStorageFeatures storage16bitFeatures = {};
-    storage16bitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
-    storage16bitFeatures.uniformAndStorageBuffer16BitAccess = VK_TRUE;
-    storage16bitFeatures.storageBuffer16BitAccess = VK_TRUE;
-    storage16bitFeatures.storageInputOutput16 = VK_TRUE;
+    VkPhysicalDevice16BitStorageFeatures storage16bit_features = {};
+    storage16bit_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    storage16bit_features.uniformAndStorageBuffer16BitAccess = VK_TRUE;
+    storage16bit_features.storageBuffer16BitAccess = VK_TRUE;
+    storage16bit_features.storageInputOutput16 = VK_TRUE;
 #elif defined VK_VERSION_1_1
     VkPhysicalDeviceVulkan11Features storage16bitFeatures = {};
-    storage16bitFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
+    storage16bitFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES;
     storage16bitFeatures.storageBuffer16BitAccess = VK_TRUE;
     storage16bitFeatures.storageInputOutput16 = VK_TRUE;
     storage16bitFeatures.uniformAndStorageBuffer16BitAccess = VK_TRUE;
 #endif
 
-#ifdef VK_KHR_shader_integer_dot_product 
-    VkPhysicalDeviceShaderIntegerDotProductFeatures shaderIntegerDotProductFeatures = {};
-    shaderIntegerDotProductFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
+#ifdef VK_KHR_shader_integer_dot_product
+    VkPhysicalDeviceShaderIntegerDotProductFeatures
+        shaderIntegerDotProductFeatures = {};
+    shaderIntegerDotProductFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
     shaderIntegerDotProductFeatures.shaderIntegerDotProduct = VK_TRUE;
 #elif defined VK_VERSION_1_3
     VkPhysicalDeviceVulkan13Features features13 = {};
@@ -154,180 +188,188 @@ bool VulkanDevice::createLogicalDevice() {
 
 #ifdef VK_EXT_host_image_copy
     VkPhysicalDeviceHostImageCopyFeatures hostImageCopyFeatures = {};
-    hostImageCopyFeatures.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
+    hostImageCopyFeatures.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
     if (checkDeviceExtensionFeature(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
         hostImageCopyFeatures.hostImageCopy = VK_TRUE;
         enabledExtensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
-        enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&hostImageCopyFeatures));
-        m_support_host_image_copy = true;
+        enabledFeatures_.push_back(
+            reinterpret_cast<uintptr_t>(&hostImageCopyFeatures));
+        m_support_host_image_copy_ = true;
     }
 #endif
-    if (devicefloat16Int8Features.shaderInt8) {
-        float16Int8Features.shaderInt8 = VK_TRUE;
+    if (devicefloat16_int8_features.shaderInt8) {
+        float16_int8_features.shaderInt8 = VK_TRUE;
         if (checkDeviceExtensionFeature(VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
-            enabledExtensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
-            enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&storage8bitFeatures));
+            enabledExtensions_.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+            enabledFeatures_.push_back(
+                reinterpret_cast<uintptr_t>(&storage8bit_features));
         }
     }
-    if (devicefloat16Int8Features.shaderFloat16) {
-        float16Int8Features.shaderFloat16 = VK_TRUE;
+    if (devicefloat16_int8_features.shaderFloat16) {
+        float16_int8_features.shaderFloat16 = VK_TRUE;
         if (checkDeviceExtensionFeature(VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
-            enabledExtensions.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
-            if (deviceProperties.vendorID != 4318) {
-                // tested on Nvidia A2000, it supports 16bit storage feature but did not need to enable it
-                // enable it will cause validation error VK_ERROR_FEATURE_NOT_PRESENT
-                enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&storage16bitFeatures));
+            enabledExtensions_.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+            if (deviceProperties_.vendorID != 4318) {
+                // tested on Nvidia A2000, it supports 16bit storage feature but
+                // did not need to enable it enable it will cause validation
+                // error VK_ERROR_FEATURE_NOT_PRESENT
+                enabledFeatures_.push_back(
+                    reinterpret_cast<uintptr_t>(&storage16bit_features));
             }
         }
 #ifdef VK_AMD_gpu_shader_half_float
-        if (deviceProperties.vendorID == 4098) {
-            // for AMD card, do we really need this ? over VK_KHR_shader_float16_int8
-            if (checkDeviceExtensionFeature(VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME)) {
-                enabledExtensions.push_back(VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME);
+        if (deviceProperties_.vendorID == 4098) {
+            // for AMD card, do we really need this ? over
+            // VK_KHR_shader_float16_int8
+            if (checkDeviceExtensionFeature(
+                    VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME)) {
+                enabledExtensions_.push_back(
+                    VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME);
             }
         }
 #endif
     }
-    if (devicefloat16Int8Features.shaderFloat16 || devicefloat16Int8Features.shaderInt8) {
-        if (checkDeviceExtensionFeature(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
-            enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&float16Int8Features));
-            enabledExtensions.push_back(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+    if (devicefloat16_int8_features.shaderFloat16 ||
+        devicefloat16_int8_features.shaderInt8) {
+        if (checkDeviceExtensionFeature(
+                VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
+            enabledFeatures_.push_back(
+                reinterpret_cast<uintptr_t>(&float16_int8_features));
+            enabledExtensions_.push_back(
+                VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         }
     }
 #ifdef VK_KHR_shader_integer_dot_product
     if (integerDotProductFeatures.shaderIntegerDotProduct) {
-        if (checkDeviceExtensionFeature(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
-            enabledExtensions.push_back(VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
-            enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&shaderIntegerDotProductFeatures));
+        if (checkDeviceExtensionFeature(
+                VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+            enabledExtensions.push_back(
+                VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+            enabledFeatures_.push_back(
+                reinterpret_cast<uintptr_t>(&shaderIntegerDotProductFeatures));
         }
     }
 #endif
 #ifdef VK_KHR_bind_memory2
     if (checkDeviceExtensionFeature(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
+        enabledExtensions_.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_KHR_shader_non_semantic_info
 #ifndef VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME
-#define VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME "VK_KHR_shader_non_semantic_info"
+#define VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME                         \
+    "VK_KHR_shader_non_semantic_info"
 #endif
-    if (checkDeviceExtensionFeature(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(
+            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
+        enabledExtensions.push_back(
+            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_KHR_get_physical_device_properties2
-    if (checkDeviceExtensionFeature(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_KHR_get_memory_requirements2
-    if (checkDeviceExtensionFeature(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(
+            VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
     }
 #endif
 
 #ifdef VK_KHR_format_feature_flags2
-    if (checkDeviceExtensionFeature(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(
+            VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_KHR_copy_commands2
     if (checkDeviceExtensionFeature(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
+        enabledExtensions_.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_EXT_tooling_info
     if (checkDeviceExtensionFeature(VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+        enabledExtensions_.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_EXT_subgroup_size_control
-    if (checkDeviceExtensionFeature(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
-        enabledExtensions.push_back(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(
+            VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_EXT_image_robustness
     VkPhysicalDeviceImageRobustnessFeatures imagerobustfeature;
-    imagerobustfeature.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
+    imagerobustfeature.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
     if (checkDeviceExtensionFeature(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
         imagerobustfeature.robustImageAccess = VK_TRUE;
-        enabledFeatures.push_back(reinterpret_cast<uintptr_t>(&imagerobustfeature));
+        enabledFeatures_.push_back(
+            reinterpret_cast<uintptr_t>(&imagerobustfeature));
         enabledExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     }
 #endif
     struct GeneralFeature {
         VkStructureType sType;
-        void*     pNext;
+        void *pNext;
     };
-    void* pFirst = nullptr;
-    if (enabledFeatures.size() > 0) {        
-        pFirst = reinterpret_cast<void *>(enabledFeatures[0]);
-        struct GeneralFeature* ptr = reinterpret_cast<struct GeneralFeature*>(pFirst);
-        for (size_t i = 1; i < enabledFeatures.size(); i++) {
-            struct GeneralFeature* feat = reinterpret_cast<struct GeneralFeature*>(enabledFeatures[i]);
+    void *p_first = nullptr;
+    if (!enabledFeatures_.empty()) {
+        p_first = reinterpret_cast<void *>(enabledFeatures_[0]);
+        auto *ptr = reinterpret_cast<struct GeneralFeature *>(p_first);
+        for (size_t i = 1; i < enabledFeatures_.size(); i++) {
+            auto *feat =
+                reinterpret_cast<struct GeneralFeature *>(enabledFeatures_[i]);
             ptr->pNext = feat;
             ptr = feat;
         }
     }
 
+    float queue_priority = 1.0F;
+    VkDeviceQueueCreateInfo queue_create_info = {};
+    queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+    queue_create_info.queueFamilyIndex = computeQueueFamilyIndex_;
+    queue_create_info.queueCount = 1;
+    queue_create_info.pQueuePriorities = &queue_priority;
 
-    float queuePriority = 1.0f;
-    VkDeviceQueueCreateInfo queueCreateInfo = {};
-    queueCreateInfo.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queueCreateInfo.queueFamilyIndex = computeQueueFamilyIndex;
-    queueCreateInfo.queueCount = 1;
-    queueCreateInfo.pQueuePriorities = &queuePriority;
-
-    VkDeviceCreateInfo createInfo = {};
-    createInfo.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    createInfo.queueCreateInfoCount = 1;
-    createInfo.pQueueCreateInfos = &queueCreateInfo;
-    createInfo.enabledLayerCount = 0;
-    createInfo.ppEnabledLayerNames = nullptr;
-    createInfo.pEnabledFeatures = &features;
-    createInfo.enabledExtensionCount = static_cast<uint32_t>(enabledExtensions.size());
-    createInfo.ppEnabledExtensionNames = enabledExtensions.data();
-    createInfo.pNext = pFirst;
-    // std::cout << "enabled extensions count " << enabledExtensions.size() << std::endl;
-    // for (auto e: enabledExtensions) {
+    VkDeviceCreateInfo create_info = {};
+    create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    create_info.queueCreateInfoCount = 1;
+    create_info.pQueueCreateInfos = &queue_create_info;
+    create_info.enabledLayerCount = 0;
+    create_info.ppEnabledLayerNames = nullptr;
+    create_info.pEnabledFeatures = &features;
+    create_info.enabledExtensionCount =
+        static_cast<uint32_t>(enabledExtensions_.size());
+    create_info.ppEnabledExtensionNames = enabledExtensions_.data();
+    create_info.pNext = p_first;
+    // std::cout << "enabled extensions count " << enabledExtensions.size() <<
+    // std::endl; for (auto e: enabledExtensions) {
     //     std::cout << "enabled extension: " << e << std::endl;
     // }
 
-    if (vkCreateDevice(physicalDevice, &createInfo, nullptr, &logicalDevice) != VK_SUCCESS) {
+    if (vkCreateDevice(physicalDevice_, &create_info, nullptr,
+                       &logicalDevice_) != VK_SUCCESS) {
         LOG_ERROR("Failed to create logical device!");
         return false;
     }
 
-    vkGetDeviceQueue(logicalDevice, computeQueueFamilyIndex, 0, &computeQueue);
+    vkGetDeviceQueue(logicalDevice_, computeQueueFamilyIndex_, 0,
+                     &computeQueue_);
     return true;
 }
 
-bool VulkanDevice::isDeviceSuitable(VkPhysicalDevice device) {
-    int queueFamilyIndex = findComputeQueueFamily(device);
-    return queueFamilyIndex != -1;
-}
-
-int VulkanDevice::findComputeQueueFamily(VkPhysicalDevice device) {
-    uint32_t queueFamilyCount = 0;
-    vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, nullptr);
-
-    std::vector<VkQueueFamilyProperties> queueFamilies(queueFamilyCount);
-    vkGetPhysicalDeviceQueueFamilyProperties(device, &queueFamilyCount, queueFamilies.data());
-
-    for (uint32_t i = 0; i < queueFamilies.size(); i++) {
-        if (queueFamilies[i].queueFlags & (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) {
-            return i;
-        }
-    }
-
-    return -1;
-}
-
-
-bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const 
-{
-    for (auto ext : this->ext_properties) {
-        if (std::string(ext.extensionName).compare(name) == 0) {
+bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const {
+    for (auto ext : this->ext_properties_) {
+        if (std::string(ext.extensionName) == name) {
             return true;
         }
     }
@@ -335,27 +377,27 @@ bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const
 }
 
 bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
-    VkPhysicalDeviceMemoryProperties memoryProperties;
-    vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memoryProperties);
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memory_properties);
 
-    bool isUnifiedMemory = false;
+    bool is_unified_memory = false;
 
-    for (uint32_t i = 0; i < memoryProperties.memoryTypeCount; ++i) {
-        const VkMemoryType& memType = memoryProperties.memoryTypes[i];
+    for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+        const VkMemoryType &mem_type = memory_properties.memoryTypes[i];
 
-        if ((memType.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
-            (memType.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            isUnifiedMemory = true;
+        if ((mem_type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+            (mem_type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            is_unified_memory = true;
             LOG_INFO("Unified memory type found at index: %d", i);
         }
     }
 
-    if (isUnifiedMemory) {
+    if (is_unified_memory) {
         LOG_INFO("This device supports Unified Memory Architecture (UMA).");
     } else {
         LOG_INFO("This device does not support Unified Memory Architecture.");
     }
-    return isUnifiedMemory;
+    return is_unified_memory;
 }
 
 } // namespace vkop
