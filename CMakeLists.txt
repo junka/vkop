@@ -58,6 +58,8 @@ endforeach()
 # Add executable
 add_library(vkop ${SRC_FILES})
 
+# Ensure whole-archive is used when linking vkop
+
 # Add generated headers to the target
 add_custom_target(compile_shaders DEPENDS ${SPIRV_HEADERS})
 add_dependencies(vkop compile_shaders)
@@ -69,7 +71,7 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 add_subdirectory(model)
 
 add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain vkop vload)
+target_link_libraries(vkopmain -Wl,--whole-archive vkop -Wl,--no-whole-archive vload)
 
 
 find_program(CLANG_FORMAT "clang-format")

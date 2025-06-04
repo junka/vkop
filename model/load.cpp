@@ -12,6 +12,7 @@
 #include "load.hpp"
 
 namespace vkop {
+namespace load {
 
 VkModel::VkModel(const std::string& filePath) {
     loadFromBinary(filePath);
@@ -78,4 +79,5 @@ void VkModel::loadFromBinary(const std::string& filePath) {
     munmap(const_cast<char*>(static_cast<const char*>(mapped_data)), file_size);
 }
 
-}
+} // namespace load
+} // namespace vkop

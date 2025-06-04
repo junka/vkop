@@ -49,6 +49,8 @@ struct GPUConv2dParam {
 
 class Conv2d : public Operator {
   public:
+    Conv2d() = default;
+
     explicit Conv2d(
         int in_channels, int out_channels, int kernel_size, int stride,
         int padding, int dilation = 1, int groups = 1, bool bias = true,
@@ -81,9 +83,28 @@ class Conv2d : public Operator {
           padding_(std::move(padding)), dilation_(std::move(dilation)),
           groups_(groups), bias_(bias), padding_mode_(padding_mode) {}
 
-    template <typename T> void prepare(std::vector<core::Tensor<T> *> inputs) {
-        core::Tensor<T> *input = inputs[0];
-        core::Tensor<T> *weight = inputs[1];
+    void setAttribute(
+        int in_channels, int out_channels,
+        std::pair<int, int> kernel_size = {1, 1},
+        std::pair<int, int> stride = {1, 1},
+        std::pair<int, int> padding = {0, 0},
+        std::pair<int, int> dilation = {1, 1}, int groups = 1, bool bias = true,
+        conv2d::PaddingMode padding_mode = conv2d::PaddingMode::ZEROS) {
+        in_channels_ = in_channels;
+        out_channels_ = out_channels;
+        kernel_size_ = std::move(kernel_size);
+        stride_ = std::move(stride);
+        padding_ = std::move(padding);
+        dilation_ = std::move(dilation);
+        groups_ = groups;
+        bias_ = bias;
+        padding_mode_ = padding_mode;
+    }
+
+    template <typename T>
+    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs) {
+        auto input = inputs[0];
+        auto weight = inputs[1];
         // core::Tensor<T> *bias = inputs[2];
         auto input_shape = input->getTensorShape();
         auto weight_shape = weight->getTensorShape();
@@ -165,12 +186,13 @@ class Conv2d : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<core::Tensor<T> *> inputs,
-               std::vector<core::Tensor<T> *> outputs) {
-        core::Tensor<T> *input = inputs[0];
-        core::Tensor<T> *weight = inputs[1];
-        core::Tensor<T> *bias = inputs[2];
-        core::Tensor<T> *output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
+               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
+        auto input = inputs[0];
+        auto weight = inputs[1];
+        auto bias = inputs[2];
+        auto output = outputs[0];
+
         auto input_shape = input->getTensorShape();
         auto weight_shape = weight->getTensorShape();
 
@@ -189,11 +211,12 @@ class Conv2d : public Operator {
                          dilation_.second * (weight_shape[3] - 1) - 1) /
                             stride_.second +
                         1;
-
-        output->resize(out_batch, out_depth, out_height, out_width);
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
+        if (output->size() == 0) {
+            output->resize(out_batch, out_depth, out_height, out_width);
+        }
         prepare(inputs);
 
         auto *para = paramBuffer_->getMappedMemory<conv2d::GPUConv2dParam>();
@@ -321,6 +344,13 @@ class Conv2d : public Operator {
         // out_width);
         output->convertRGBAToTensor(ptr);
     }
+
+    void
+    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
+    void
+    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
 
   private:
     int in_channels_;

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "OperatorFactory.hpp"
 #include "logger.hpp"
 
 /* definition in spriv generate source file to avoid violate ODR */
@@ -42,6 +43,22 @@ void GridSample::submit(int out_width, int out_height) {
                 m_dev_->getTimestampPeriod();
     LOG_INFO("Time: %f s", ts);
 }
+
+void GridSample::execute(
+    std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+    std::vector<std::shared_ptr<core::Tensor<float>>> outputs) {
+    apply<float>(inputs, outputs);
+}
+
+void GridSample::execute(
+    std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+    std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
+    apply<int>(inputs, outputs);
+}
+
+namespace {
+REGISTER_OPERATOR("GridSample", GridSample);
+} // namespace
 
 } // namespace ops
 } // namespace vkop

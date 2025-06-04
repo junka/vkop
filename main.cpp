@@ -3,6 +3,7 @@
 #include "logger.hpp"
 #include "Tensor.hpp"
 #include "load.hpp"
+#include "OperatorFactory.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -15,7 +16,8 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
-using vkop::VkModel;
+using vkop::load::VkModel;
+using vkop::ops::OperatorFactory;
 
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
@@ -97,6 +99,7 @@ int main(int argc, char *argv[]) {
         }
 
         std::vector<std::shared_ptr<Tensor<float>>> inputs;
+        std::vector<std::shared_ptr<Tensor<float>>> outputs;
         for (const auto& i : model.inputs) {
             auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
@@ -104,7 +107,16 @@ int main(int argc, char *argv[]) {
         for (const auto& i : inputs) {
             i->printTensorShape();
         }
+        for (const auto& o: model.outputs) {
+            auto t = std::make_shared<Tensor<float>>(o.dims);
+            outputs.push_back(t);
+        }
 
+        for (const auto& n: model.nodes) {
+            auto op = OperatorFactory::get_instance().create(n.op_type);
+            // op->execute(inputs, outputs);
+            std::cout << "run ops " << n.op_type << std::endl;
+        }
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;

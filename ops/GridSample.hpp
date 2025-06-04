@@ -42,17 +42,30 @@ struct GpuGridSampleParam {
 
 class GridSample : public Operator {
   public:
-    explicit GridSample(
+    GridSample() = default;
+
+    // explicit GridSample(
+    //     gridsample::InterpolationMode interp_mode =
+    //         gridsample::InterpolationMode::BILINEAR,
+    //     gridsample::PaddingMode pad_mode = gridsample::PaddingMode::ZEROS,
+    //     bool align_corners = false)
+    //     : interpolation_mode_(interp_mode), padding_mode_(pad_mode),
+    //       align_corners_(align_corners) {}
+
+    void setAttribute(
         gridsample::InterpolationMode interp_mode =
             gridsample::InterpolationMode::BILINEAR,
         gridsample::PaddingMode pad_mode = gridsample::PaddingMode::ZEROS,
-        bool align_corners = false)
-        : interpolation_mode_(interp_mode), padding_mode_(pad_mode),
-          align_corners_(align_corners) {}
+        bool align_corners = false) {
+        interpolation_mode_ = interp_mode;
+        padding_mode_ = pad_mode;
+        align_corners_ = align_corners;
+    }
 
-    template <typename T> void prepare(std::vector<core::Tensor<T> *> inputs) {
-        core::Tensor<T> *input = inputs[0];
-        core::Tensor<T> *grid = inputs[1];
+    template <typename T>
+    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs) {
+        auto input = inputs[0];
+        auto grid = inputs[1];
 
         auto input_shape = input->getTensorShape();
         auto grid_shape = grid->getTensorShape();
@@ -123,11 +136,11 @@ class GridSample : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<core::Tensor<T> *> inputs,
-               std::vector<core::Tensor<T> *> outputs) {
-        core::Tensor<T> *input = inputs[0];
-        core::Tensor<T> *grid = inputs[1];
-        core::Tensor<T> *output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
+               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
+        auto input = inputs[0];
+        auto grid = inputs[1];
+        auto output = outputs[0];
         auto input_shape = input->getTensorShape();
         auto grid_shape = grid->getTensorShape();
 
@@ -145,7 +158,9 @@ class GridSample : public Operator {
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
-        output->resize(batch, depth, out_height, out_width);
+        if (output->size() == 0) {
+            output->resize(batch, depth, out_height, out_width);
+        }
         prepare(inputs);
 
         auto *para =
@@ -218,6 +233,13 @@ class GridSample : public Operator {
 
         output->convertRGBAToTensor(ptr);
     }
+
+    void
+    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
+    void
+    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
 
   private:
     gridsample::InterpolationMode interpolation_mode_;

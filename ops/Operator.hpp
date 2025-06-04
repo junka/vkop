@@ -2,10 +2,11 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <vector>
+
+#include "Tensor.hpp"
 #include "VulkanCommandPool.hpp"
 #include "VulkanDevice.hpp"
-
-#include <vector>
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
@@ -29,6 +30,13 @@ class Operator {
         m_dev_ = dev.get();
         m_cmdpool_ = cmdpool;
     }
+
+    virtual void
+    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) = 0;
+    virtual void
+    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) = 0;
 
   protected:
     VkPhysicalDevice m_phydev_;

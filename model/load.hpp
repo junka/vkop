@@ -11,6 +11,7 @@
 
 namespace vkop {
 
+namespace load {
 struct Shape {
     std::string name;
     std::vector<uint32_t> dims;
@@ -121,5 +122,6 @@ private:
 
 };
 
-}
+} // namespace load
+} // namespace vkop
 #endif /* MODEL_LOAD_HPP_ */

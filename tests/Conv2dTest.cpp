@@ -23,7 +23,7 @@ using vkop::core::Tensor;
 namespace {
 
 template<typename T>
-std::unique_ptr<Tensor<T>> generateWeight(std::unique_ptr<Tensor<T>> weight, int group) {
+void generateWeight(std::shared_ptr<Tensor<T>> &weight, int group) {
     auto shape = weight->getTensorShape();
     auto ic = shape[0];
     auto oc = shape[1];
@@ -36,7 +36,6 @@ std::unique_ptr<Tensor<T>> generateWeight(std::unique_ptr<Tensor<T>> weight, int
         auto fdata = static_cast<T>(data % 255) / 255.0F / 1000.0F;
         *(data_ptr++) = fdata;
     }
-    return weight;
 }
 
 
@@ -151,10 +150,10 @@ public:
     int p_ = 2;
 
 
-    std::unique_ptr<Tensor<T>> weight_data_;
-    std::unique_ptr<Tensor<T>> bias_data_;
+    std::shared_ptr<Tensor<T>> weight_data_;
+    std::shared_ptr<Tensor<T>> bias_data_;
 
-    std::unique_ptr<Tensor<T>> input_data_;
+    std::shared_ptr<Tensor<T>> input_data_;
     std::vector<T> output_data_;
     std::vector<T> output_data_separate_bias_;
 
@@ -164,8 +163,8 @@ public:
 
 private:
     void reference_conv2d_depthwise(int batch, int ic, int oc, int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w, int dilation_h, int dilation_w, int group) {
-        weight_data_ = std::make_unique<Tensor<T>>(ic, oc, kh, kw);
-        weight_data_ = generateWeight(std::move(weight_data_), group);
+        weight_data_ = std::make_shared<Tensor<T>>(ic, oc, kh, kw);
+        generateWeight(weight_data_, group);
 
         bias_data_ = std::make_unique<Tensor<T>>(oc, 1, 1, 1);
         auto *bias_ptr = bias_data_->data();
@@ -239,11 +238,11 @@ int main() {
             Conv2d cd(tp.ic_, tp.oc_, tp.kh_, tp.kw_, tp.s_, tp.s_, tp.p_, tp.p_, tp.d_, tp.d_, 1, true, vkop::ops::conv2d::PaddingMode::ZEROS);
             cd.set_runtime_device(pdev, dev, &cmdpool);
 
-            Tensor<float> output;
+            auto output = std::make_shared<Tensor<float>>();
             // Ensure shared pointers are retained before cmd.submit
-            cd.apply<float>(std::vector<Tensor<float> *> {tp.input_data_.get(), tp.weight_data_.get(), tp.bias_data_.get()}, std::vector<Tensor<float> *> {&output});
-            auto *out_ptr = output.data();
-            for (int i = 0; i < output.num_elements(); i++) {
+            cd.apply<float>(std::vector<std::shared_ptr<Tensor<float>>> {tp.input_data_, tp.weight_data_, tp.bias_data_}, std::vector<std::shared_ptr<Tensor<float>>> {output});
+            auto *out_ptr = output->data();
+            for (int i = 0; i < output->num_elements(); i++) {
                 if (std::fabs(out_ptr[i] - tp.output_data_[i]) > 0.01) {
                     LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], tp.output_data_[i]);
                     return -1;

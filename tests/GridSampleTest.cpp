@@ -9,6 +9,7 @@
 #include "VulkanDevice.hpp"
 #include "VulkanInstance.hpp"
 #include "Renderdoc.hpp"
+#include "OperatorFactory.hpp"
 
 #include "logger.hpp"
 
@@ -17,8 +18,8 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::VulkanCommandPool;
-using vkop::ops::GridSample;
 using vkop::core::Tensor;
+using vkop::ops::OperatorFactory;
 
 namespace {
 // 反归一化处理坐标
@@ -130,8 +131,8 @@ public:
     int outHeight_;
     int outWidth_;
 
-    std::unique_ptr<Tensor<float>> input;
-    std::unique_ptr<Tensor<float>> grid;
+    std::shared_ptr<Tensor<float>> input;
+    std::shared_ptr<Tensor<float>> grid;
     // std::vector<float> originInputData;
     // std::vector<float> originGridData;
     std::vector<float> expectedOutput;
@@ -157,8 +158,8 @@ private:
         // auto grid_size = batch_ * outHeight_ * outWidth_ * 2;
         // auto output_size = batch_ * outHeight_ * outWidth_ * depth_;
 
-        input = std::make_unique<Tensor<float>>(batch_, depth_, inHeight_, inWidth_);
-        grid = std::make_unique<Tensor<float>>(batch_, outHeight_, outWidth_, 2);
+        input = std::make_shared<Tensor<float>>(batch_, depth_, inHeight_, inWidth_);
+        grid = std::make_shared<Tensor<float>>(batch_, outHeight_, outWidth_, 2);
 
         auto *input_ptr = input->data();
         auto *grid_ptr = grid->data();
@@ -208,15 +209,16 @@ int main() {
             VkDevice device = dev->getLogicalDevice();
             VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
 
-            GridSample gs;
-            gs.set_runtime_device(pdev, dev, &cmdpool);
+            auto op = OperatorFactory::get_instance().create("GridSample");
+            // op->setAttribute();
+            op->set_runtime_device(pdev, dev, &cmdpool);
             // Ensure shared pointers are retained before cmd.submit
             
-            Tensor<float> output;
-            gs.apply<float>(std::vector<Tensor<float> *> {tp.input.get(), tp.grid.get()},
-                        std::vector<Tensor<float> *> {&output});
-            auto *out_ptr = output.data();
-            for (int i = 0; i < output.num_elements(); i++) {
+            auto output = std::make_shared<Tensor<float>>();
+            op->execute(std::vector<std::shared_ptr<Tensor<float>>> {tp.input, tp.grid},
+                        std::vector<std::shared_ptr<Tensor<float>>> {output});
+            auto *out_ptr = output->data();
+            for (int i = 0; i < output->num_elements(); i++) {
                 if (std::fabs(out_ptr[i] - tp.expectedOutput[i]) > 0.01) {
                     LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], tp.expectedOutput[i]);
                     return -1;

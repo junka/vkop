@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 
+#include "OperatorFactory.hpp"
 #include "logger.hpp"
 
 extern unsigned char conv2d_spv[];
@@ -41,6 +42,21 @@ void Conv2d::submit(int out_width, int out_height) {
                 m_dev_->getTimestampPeriod();
     LOG_INFO("Time: %f s", ts);
 }
+
+void Conv2d::execute(
+    std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+    std::vector<std::shared_ptr<core::Tensor<float>>> outputs) {
+    apply<float>(inputs, outputs);
+}
+
+void Conv2d::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+                     std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
+    apply<int>(inputs, outputs);
+}
+
+namespace {
+REGISTER_OPERATOR("Conv2d", Conv2d);
+} // namespace
 
 } // namespace ops
 } // namespace vkop
