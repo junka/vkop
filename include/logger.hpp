@@ -87,7 +87,7 @@ private:
         if constexpr (sizeof...(args) == 0) {
             size = format.size() + 1;
             buffer = std::make_unique<char[]>(size);
-            strncpy(buffer.get(), format.c_str(), size);
+            snprintf(buffer.get(), size, "%s", format.c_str());
         } else {
             size = snprintf(nullptr, 0, format.c_str(), args...) + 1;
             buffer = std::make_unique<char[]>(size);

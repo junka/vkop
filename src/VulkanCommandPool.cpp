@@ -10,7 +10,12 @@ VulkanCommandPool::VulkanCommandPool(VkDevice device, uint32_t queueFamilyIndex)
     createCommandPool(queueFamilyIndex);
 }
 
-VulkanCommandPool::~VulkanCommandPool() { destroyCommandPool(); }
+VulkanCommandPool::~VulkanCommandPool() {
+    if (m_commandPool_ != VK_NULL_HANDLE) {
+        vkDestroyCommandPool(m_device_, m_commandPool_, nullptr);
+        m_commandPool_ = VK_NULL_HANDLE;
+    }
+}
 
 void VulkanCommandPool::createCommandPool(uint32_t queueFamilyIndex) {
     VkCommandPoolCreateInfo pool_info{};
@@ -22,13 +27,6 @@ void VulkanCommandPool::createCommandPool(uint32_t queueFamilyIndex) {
     if (vkCreateCommandPool(m_device_, &pool_info, nullptr, &m_commandPool_) !=
         VK_SUCCESS) {
         throw std::runtime_error("Failed to create command pool");
-    }
-}
-
-void VulkanCommandPool::destroyCommandPool() {
-    if (m_commandPool_ != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(m_device_, m_commandPool_, nullptr);
-        m_commandPool_ = VK_NULL_HANDLE;
     }
 }
 

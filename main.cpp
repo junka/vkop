@@ -14,7 +14,7 @@
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
-using vkop::Tensor;
+using vkop::core::Tensor;
 using vkop::VkModel;
 
 int main(int argc, char *argv[]) {
@@ -96,13 +96,13 @@ int main(int argc, char *argv[]) {
             std::cout << "], DType: " << initializer.dtype << std::endl;
         }
 
-        std::vector<std::shared_ptr<Tensor>> inputs;
+        std::vector<std::shared_ptr<Tensor<float>>> inputs;
         for (const auto& i : model.inputs) {
-            auto t = std::make_shared<Tensor>(i.dims);
+            auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
         }
         for (const auto& i : inputs) {
-            i->printTensor();
+            i->printTensorShape();
         }
 
     } catch (const std::exception& ex) {

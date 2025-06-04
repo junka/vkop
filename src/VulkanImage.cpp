@@ -450,10 +450,10 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
 }
 
 void VulkanImage::stagingBufferCopyToImage(VkCommandBuffer commandBuffer,
-                                           void *ptr) {
-    auto *dst = static_cast<float *>(m_stagingBuffer_->getMappedMemory());
+                                           const void *ptr) {
+    auto *dst = m_stagingBuffer_->getMappedMemory<float>();
     auto imagesize = getImageSize();
-    auto *src = static_cast<float *>(ptr);
+    const auto *src = static_cast<const float *>(ptr);
     memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
 
@@ -466,9 +466,8 @@ void VulkanImage::stagingBufferCopyToHost(VkCommandBuffer commandBuffer) {
 
 void VulkanImage::readStaingBuffer(void *ptr) {
     auto imagesize = getImageSize();
-    void *m = m_stagingBuffer_->getMappedMemory();
+    void *src = m_stagingBuffer_->getMappedMemory<float>();
     auto *dst = static_cast<float *>(ptr);
-    auto *src = static_cast<float *>(m);
     memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
 }

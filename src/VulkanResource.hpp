@@ -63,10 +63,10 @@ class VulkanResource {
 
     VkDeviceMemory getMemory() const { return m_memory_; }
 
-    void *getMappedMemory() const {
+    template <typename T> T *getMappedMemory() const {
         void *data;
         vkMapMemory(m_device_, m_memory_, 0, VK_WHOLE_SIZE, 0, &data);
-        return data;
+        return reinterpret_cast<T *>(data);
     }
     void unmapMemory() { vkUnmapMemory(m_device_, m_memory_); }
 

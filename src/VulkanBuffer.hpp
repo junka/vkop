@@ -12,8 +12,8 @@ namespace vkop {
 
 class VulkanBuffer : public VulkanResource {
   public:
-    VulkanBuffer(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
-                 VkDevice device, VkDeviceSize size, VkBufferUsageFlags usage,
+    VulkanBuffer(VkPhysicalDevice &physicalDevice, uint32_t queueFamilyIndex,
+                 VkDevice &device, VkDeviceSize size, VkBufferUsageFlags usage,
                  VkMemoryPropertyFlags properties);
     ~VulkanBuffer() override;
 
@@ -34,7 +34,6 @@ class VulkanBuffer : public VulkanResource {
     // VkDeviceSize m_offset;
 
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
-    void cleanup();
 };
 } // namespace vkop
 #endif // SRC_VULKANBUFFER_HPP_

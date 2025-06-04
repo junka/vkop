@@ -4,7 +4,6 @@
 
 #include <vector>
 #include <vulkan/vulkan.hpp>
-#include <vulkan/vulkan_core.h>
 
 #include "VulkanCommandBuffer.hpp"
 
@@ -24,7 +23,6 @@ class VulkanCommandPool {
     std::vector<VulkanCommandBuffer> buffers_;
 
     void createCommandPool(uint32_t queueFamilyIndex);
-    void destroyCommandPool();
 };
 
 } // namespace vkop

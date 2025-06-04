@@ -24,7 +24,12 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
     checkDeviceUnifiedMemoryAccess();
 }
 
-VulkanDevice::~VulkanDevice() { destroy(); }
+VulkanDevice::~VulkanDevice() {
+    if (logicalDevice_ != VK_NULL_HANDLE) {
+        vkDestroyDevice(logicalDevice_, nullptr);
+        logicalDevice_ = VK_NULL_HANDLE;
+    }
+}
 
 void VulkanDevice::getProperties() {
     uint32_t p_property_count = 0;
@@ -77,13 +82,6 @@ void VulkanDevice::create() {
     if (!createLogicalDevice()) {
         LOG_ERROR("Failed to create logical device!");
         return;
-    }
-}
-
-void VulkanDevice::destroy() {
-    if (logicalDevice_ != VK_NULL_HANDLE) {
-        vkDestroyDevice(logicalDevice_, nullptr);
-        logicalDevice_ = VK_NULL_HANDLE;
     }
 }
 

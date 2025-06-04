@@ -1,5 +1,5 @@
 // Copyright 2025 @junka
-#include "GridSample.hpp"
+#include "Conv2d.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -7,26 +7,25 @@
 
 #include "logger.hpp"
 
-/* definition in spriv generate source file to avoid violate ODR */
-extern unsigned char grid_sample_spv[];
-extern unsigned int grid_sample_spv_len;
+extern unsigned char conv2d_spv[];
+extern unsigned int conv2d_spv_len;
 
 namespace vkop {
-
 namespace ops {
 
-void GridSample::submit(int out_width, int out_height) {
+void Conv2d::submit(int out_width, int out_height) {
     std::vector<VkDescriptorType> types = {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
     std::vector<std::shared_ptr<VulkanResource>> objs = {
-        outputImage_, inputImage_, gridImage_, paramBuffer_};
+        outputImage_, inputImage_, weightImage_, biasImage_, paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
-                            reinterpret_cast<const uint32_t *>(grid_sample_spv),
-                            grid_sample_spv_len);
+                            reinterpret_cast<const uint32_t *>(conv2d_spv),
+                            conv2d_spv_len);
 
     VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
     VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);

@@ -6,8 +6,8 @@
 #include <vector>
 
 #include "Operator.hpp"
-#include "vulkan/vulkan.hpp"
 
+#include "Tensor.hpp"
 #include "VulkanBuffer.hpp"
 #include "VulkanCommandBuffer.hpp"
 #include "VulkanCommandPool.hpp"
@@ -21,11 +21,10 @@
 namespace vkop {
 namespace ops {
 
+namespace gridsample {
 enum class InterpolationMode { BILINEAR, NEAREST };
 
 enum class PaddingMode { ZEROS, BORDER, REFLECTION };
-
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -39,19 +38,99 @@ struct GpuGridSampleParam {
     int interpolation_mode;
 };
 
+} // namespace gridsample
+
 class GridSample : public Operator {
   public:
     explicit GridSample(
-        InterpolationMode interp_mode = InterpolationMode::BILINEAR,
-        PaddingMode pad_mode = PaddingMode::ZEROS, bool align_corners = false)
+        gridsample::InterpolationMode interp_mode =
+            gridsample::InterpolationMode::BILINEAR,
+        gridsample::PaddingMode pad_mode = gridsample::PaddingMode::ZEROS,
+        bool align_corners = false)
         : interpolation_mode_(interp_mode), padding_mode_(pad_mode),
           align_corners_(align_corners) {}
 
+    template <typename T> void prepare(std::vector<core::Tensor<T> *> inputs) {
+        core::Tensor<T> *input = inputs[0];
+        core::Tensor<T> *grid = inputs[1];
+
+        auto input_shape = input->getTensorShape();
+        auto grid_shape = grid->getTensorShape();
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        // int gridbatch = grid_shape[0];
+        // int in_height = input_shape[2];
+        // int in_width = input_shape[3];
+        int out_height = grid_shape[1];
+        int out_width = grid_shape[2];
+
+        VkDevice device = m_dev_->getLogicalDevice();
+        int exflags = 0;
+        if (m_dev_->is_support_host_image_copy()) {
+#ifdef VK_EXT_host_image_copy
+            exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+#endif
+        }
+        outputImage_ = std::make_shared<VulkanImage>(
+            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            VkExtent3D{static_cast<uint32_t>(out_width) * UP_DIV(depth, 4),
+                       static_cast<uint32_t>(out_height) * batch, 1},
+            VK_FORMAT_R32G32B32A32_SFLOAT,
+            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                exflags,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        inputImage_ = input->make_vkimg(
+            m_phydev_, m_dev_,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+
+        gridImage_ = grid->make_vkimg(
+            m_phydev_, m_dev_,
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+
+        paramBuffer_ = std::make_shared<VulkanBuffer>(
+            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            sizeof(gridsample::GpuGridSampleParam),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+#ifdef VK_EXT_host_image_copy
+        if (m_dev->is_support_host_image_copy()) {
+            if (m_dev->checkHostImageCopyDstLayoutSupport(
+                    VK_IMAGE_LAYOUT_GENERAL)) {
+                outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+            } else {
+                outputImage->hostImaggeTransition(
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            }
+            inputImage->hostImaggeTransition(
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            gridImage->hostImaggeTransition(
+                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        } else
+#endif
+        {
+            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
+            cmd.begin();
+            outputImage_->writeBarrier(cmd.get());
+            inputImage_->readBarrier(cmd.get());
+            gridImage_->readBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(m_dev_->getComputeQueue());
+        }
+    }
+
     template <typename T>
-    std::vector<T> apply(const std::vector<T> &input,
-                         const std::vector<T> &grid,
-                         const std::vector<int> &input_shape,
-                         const std::vector<int> &grid_shape) {
+    void apply(std::vector<core::Tensor<T> *> inputs,
+               std::vector<core::Tensor<T> *> outputs) {
+        core::Tensor<T> *input = inputs[0];
+        core::Tensor<T> *grid = inputs[1];
+        core::Tensor<T> *output = outputs[0];
+        auto input_shape = input->getTensorShape();
+        auto grid_shape = grid->getTensorShape();
+
         if (input_shape.size() != 4 || grid_shape.size() != 4) {
             throw std::invalid_argument(
                 "Input and grid must have 4 dimensions.");
@@ -66,10 +145,11 @@ class GridSample : public Operator {
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
-        prepare(input_shape, grid_shape);
+        output->resize(batch, depth, out_height, out_width);
+        prepare(inputs);
 
-        auto *para = reinterpret_cast<GpuGridSampleParam *>(
-            paramBuffer_->getMappedMemory());
+        auto *para =
+            paramBuffer_->getMappedMemory<gridsample::GpuGridSampleParam>();
         // vkimage params
         para->outImgSize[0] = realwidth;
         para->outImgSize[1] = realheight;
@@ -87,11 +167,10 @@ class GridSample : public Operator {
 
         VkDevice device = m_dev_->getLogicalDevice();
 
-        const T *input_ptr = input.data();
-        const T *grid_ptr = grid.data();
-        auto input_rgba =
-            inputImage_->convertNCHWToRGBA(input_ptr, input_shape);
-        auto grid_rgba = gridImage_->convertNCHWToRGBA(grid_ptr, grid_shape);
+        // auto input_rgba = inputImage_->convertNCHWToRGBA(input);
+        auto input_rgba = input->convertTensorToRGBA();
+        // auto grid_rgba = gridImage_->convertNCHWToRGBA(grid);
+        auto grid_rgba = grid->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             inputImage->hostImageCopyToDevice(inputRGBA.data());
@@ -134,22 +213,15 @@ class GridSample : public Operator {
             outputImage_->readStaingBuffer(ptr);
         }
 
-        std::vector<T> output = outputImage_->convertRGBAToNCHW<T>(
-            ptr, {batch, depth, out_height, out_width});
-        return output;
-    }
+        input->destroy_vkimg();
+        grid->destroy_vkimg();
 
-    void set_runtime_device(VkPhysicalDevice phydev,
-                            std::shared_ptr<VulkanDevice> dev,
-                            VulkanCommandPool *cmdpool) {
-        m_phydev_ = phydev;
-        m_dev_ = std::move(dev);
-        m_cmdpool_ = cmdpool;
+        output->convertRGBAToTensor(ptr);
     }
 
   private:
-    InterpolationMode interpolation_mode_;
-    PaddingMode padding_mode_;
+    gridsample::InterpolationMode interpolation_mode_;
+    gridsample::PaddingMode padding_mode_;
     bool align_corners_;
 
     std::shared_ptr<VulkanImage> outputImage_;
@@ -157,13 +229,7 @@ class GridSample : public Operator {
     std::shared_ptr<VulkanImage> gridImage_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
 
-    VkPhysicalDevice m_phydev_;
-    std::shared_ptr<VulkanDevice> m_dev_;
-    VulkanCommandPool *m_cmdpool_;
-
-    void prepare(const std::vector<int> &input_shape,
-                 const std::vector<int> &grid_shape);
-    void submit(int out_width, int out_height);
+    void submit(int out_width, int out_height) override;
 };
 
 } // namespace ops

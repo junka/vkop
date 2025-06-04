@@ -14,7 +14,6 @@ class VulkanDevice {
 
     // Initialization and cleanup
     void create();
-    void destroy();
 
     // Getters
     VkDevice getLogicalDevice() const { return logicalDevice_; }

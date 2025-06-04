@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <sys/types.h>
+#include "Tensor.hpp"
 #include "VulkanDevice.hpp"
 #include "VulkanInstance.hpp"
 #include "Renderdoc.hpp"
@@ -17,6 +18,7 @@ using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::VulkanCommandPool;
 using vkop::ops::GridSample;
+using vkop::core::Tensor;
 
 namespace {
 // 反归一化处理坐标
@@ -128,8 +130,10 @@ public:
     int outHeight_;
     int outWidth_;
 
-    std::vector<float> originInputData;
-    std::vector<float> originGridData;
+    std::unique_ptr<Tensor<float>> input;
+    std::unique_ptr<Tensor<float>> grid;
+    // std::vector<float> originInputData;
+    // std::vector<float> originGridData;
     std::vector<float> expectedOutput;
 
     GridSampleTest() {
@@ -150,15 +154,14 @@ private:
         outWidth_ = t[5];
 
         auto input_size = batch_ * depth_ * inHeight_ * inWidth_;
-        auto grid_size = batch_ * outHeight_ * outWidth_ * 2;
-        auto output_size = batch_ * outHeight_ * outWidth_ * depth_;
+        // auto grid_size = batch_ * outHeight_ * outWidth_ * 2;
+        // auto output_size = batch_ * outHeight_ * outWidth_ * depth_;
 
-        originInputData.resize(input_size);
-        originGridData.resize(grid_size); //for 2d, last dim is x,y
-        expectedOutput.resize(output_size);
+        input = std::make_unique<Tensor<float>>(batch_, depth_, inHeight_, inWidth_);
+        grid = std::make_unique<Tensor<float>>(batch_, outHeight_, outWidth_, 2);
 
-        float *input_ptr = originInputData.data();
-        float *grid_ptr = originGridData.data();
+        auto *input_ptr = input->data();
+        auto *grid_ptr = grid->data();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -208,17 +211,17 @@ int main() {
             GridSample gs;
             gs.set_runtime_device(pdev, dev, &cmdpool);
             // Ensure shared pointers are retained before cmd.submit
-            auto ret = gs.apply<float>(tp.originInputData, tp.originGridData,
-                {tp.batch_, tp.depth_, tp.inHeight_, tp.inWidth_},
-                {tp.batch_, tp.outHeight_, tp.outWidth_, 2});
-            for (uint32_t i = 0; i < ret.size(); i++) {
-                if (std::fabs(ret[i] - tp.expectedOutput[i]) > 0.01) {
-                    LOG_ERROR("Test Fail at (%d): %f, %f", i, ret[i], tp.expectedOutput[i]);
+            
+            Tensor<float> output;
+            gs.apply<float>(std::vector<Tensor<float> *> {tp.input.get(), tp.grid.get()},
+                        std::vector<Tensor<float> *> {&output});
+            auto *out_ptr = output.data();
+            for (int i = 0; i < output.num_elements(); i++) {
+                if (std::fabs(out_ptr[i] - tp.expectedOutput[i]) > 0.01) {
+                    LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], tp.expectedOutput[i]);
                     return -1;
                 }
             }
-            sleep(100000);
-            
             LOG_INFO("Test Passed");
 
         }

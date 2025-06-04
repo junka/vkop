@@ -19,8 +19,8 @@ include_directories(${CMAKE_SOURCE_DIR}/core)
 include_directories(${CMAKE_SOURCE_DIR}/model)
 
 # Source files
-file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*cpp)
-file(GLOB_RECURSE ALL_SOURCE_FILES src/*.cpp src/*.hpp ops/*.cpp core/*cpp ops/*.hpp core/*hpp)
+file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*.cpp)
+file(GLOB_RECURSE ALL_SOURCE_FILES src/*.cpp src/*.hpp ops/*.cpp core/*.cpp ops/*.hpp core/*.hpp)
 
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)

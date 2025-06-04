@@ -5,8 +5,8 @@
 #include <stdexcept>
 
 namespace vkop {
-VulkanBuffer::VulkanBuffer(VkPhysicalDevice physicalDevice,
-                           const uint32_t queueFamilyIndex, VkDevice device,
+VulkanBuffer::VulkanBuffer(VkPhysicalDevice &physicalDevice,
+                           const uint32_t queueFamilyIndex, VkDevice &device,
                            VkDeviceSize size, VkBufferUsageFlags usage,
                            VkMemoryPropertyFlags requireProperties)
     : VulkanResource(physicalDevice, queueFamilyIndex, device), m_size_(size) {
@@ -29,7 +29,11 @@ VulkanBuffer::VulkanBuffer(VkPhysicalDevice physicalDevice,
     vkBindBufferMemory(m_device_, m_buffer_, getMemory(), 0);
 }
 
-VulkanBuffer::~VulkanBuffer() { cleanup(); }
+VulkanBuffer::~VulkanBuffer() {
+    if (m_buffer_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(m_device_, m_buffer_, nullptr);
+    }
+}
 
 VkBuffer VulkanBuffer::getBuffer() const { return m_buffer_; }
 
@@ -55,12 +59,6 @@ VulkanBuffer::getDescriptorInfo() const {
     buffer_info.offset = 0;
     buffer_info.range = m_size_;
     return buffer_info;
-}
-
-void VulkanBuffer::cleanup() {
-    if (m_buffer_ != VK_NULL_HANDLE) {
-        vkDestroyBuffer(m_device_, m_buffer_, nullptr);
-    }
 }
 
 void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer) {
