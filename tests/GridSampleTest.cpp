@@ -5,21 +5,13 @@
 #include <chrono>
 #include <cmath>
 #include <sys/types.h>
+
 #include "Tensor.hpp"
-#include "VulkanDevice.hpp"
-#include "VulkanInstance.hpp"
-#include "Renderdoc.hpp"
-#include "OperatorFactory.hpp"
-
 #include "logger.hpp"
+#include "setup.hpp"
 
-#include "GridSample.hpp"
-
-using vkop::VulkanInstance;
-using vkop::VulkanDevice;
-using vkop::VulkanCommandPool;
 using vkop::core::Tensor;
-using vkop::ops::OperatorFactory;
+using vkop::tests::TestCase;
 
 namespace {
 // 反归一化处理坐标
@@ -122,7 +114,7 @@ void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &
     }
 }
 
-class GridSampleTest {
+class GridSampleTest: public TestCase {
 public:
     int batch_;
     int depth_;
@@ -137,7 +129,7 @@ public:
     // std::vector<float> originGridData;
     std::vector<float> expectedOutput;
 
-    GridSampleTest() {
+    GridSampleTest(): TestCase("GridSample") {
         initTestdata();
     }
 private:
@@ -196,42 +188,9 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    GridSampleTest tp;
-    // auto rdoc = Renderdoc(VulkanInstance::getVulkanInstance().getInstance());
-    try {
-        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        for (auto *pdev : phydevs) {
-            auto dev = std::make_shared<VulkanDevice>(pdev);
-            if (dev->getDeviceName().find("llvmpipe")!= std::string::npos) {
-                continue;
-            }
-
-            VkDevice device = dev->getLogicalDevice();
-            VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
-
-            auto op = OperatorFactory::get_instance().create("GridSample");
-            // op->setAttribute();
-            op->set_runtime_device(pdev, dev, &cmdpool);
-            // Ensure shared pointers are retained before cmd.submit
-            
-            auto output = std::make_shared<Tensor<float>>();
-            op->execute(std::vector<std::shared_ptr<Tensor<float>>> {tp.input, tp.grid},
-                        std::vector<std::shared_ptr<Tensor<float>>> {output});
-            auto *out_ptr = output->data();
-            for (int i = 0; i < output->num_elements(); i++) {
-                if (std::fabs(out_ptr[i] - tp.expectedOutput[i]) > 0.01) {
-                    LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], tp.expectedOutput[i]);
-                    return -1;
-                }
-            }
-            LOG_INFO("Test Passed");
-
-        }
-    } catch (const std::exception &e) {
-        LOG_ERROR("%s\n", e.what());
-        return EXIT_FAILURE;
+    GridSampleTest gst;
+    if (!gst.run_test({gst.input, gst.grid}, gst.expectedOutput)) {
+        return -1;
     }
-    // rdoc.EndRenderDocCapture(VulkanInstance::getVulkanInstance().getInstance());
-
     return EXIT_SUCCESS;
 }

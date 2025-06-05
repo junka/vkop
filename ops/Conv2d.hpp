@@ -102,19 +102,17 @@ class Conv2d : public Operator {
     }
 
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs) {
+    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
+                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
         auto weight = inputs[1];
         // core::Tensor<T> *bias = inputs[2];
+
+        auto output = outputs[0];
         auto input_shape = input->getTensorShape();
         auto weight_shape = weight->getTensorShape();
 
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-
         int out_channel = weight_shape[0];
-        int out_height = weight_shape[1];
-        int out_width = weight_shape[2];
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -123,14 +121,11 @@ class Conv2d : public Operator {
             exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
 #endif
         }
-        outputImage_ = std::make_shared<VulkanImage>(
-            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
-            VkExtent3D{static_cast<uint32_t>(out_width) * UP_DIV(depth, 4),
-                       static_cast<uint32_t>(out_height) * batch, 1},
-            VK_FORMAT_R32G32B32A32_SFLOAT,
-            VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                exflags,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+        outputImage_ =
+            output->make_vkimg(m_phydev_, m_dev_,
+                               VK_IMAGE_USAGE_STORAGE_BIT |
+                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
         inputImage_ = input->make_vkimg(
             m_phydev_, m_dev_,
@@ -217,7 +212,7 @@ class Conv2d : public Operator {
         if (output->size() == 0) {
             output->resize(out_batch, out_depth, out_height, out_width);
         }
-        prepare(inputs);
+        prepare(inputs, outputs);
 
         auto *para = paramBuffer_->getMappedMemory<conv2d::GPUConv2dParam>();
         // vkimage params
@@ -338,10 +333,6 @@ class Conv2d : public Operator {
             outputImage_->readStaingBuffer(ptr);
         }
 
-        input->destroy_vkimg();
-        weight->destroy_vkimg();
-        // auto *output = new core::Tensor<T>(batch, depth, out_height,
-        // out_width);
         output->convertRGBAToTensor(ptr);
     }
 

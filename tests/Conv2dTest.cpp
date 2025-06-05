@@ -7,18 +7,11 @@
 #include <chrono>
 
 #include "Tensor.hpp"
-#include "VulkanDevice.hpp"
-#include "VulkanInstance.hpp"
 #include "logger.hpp"
-#include "Conv2d.hpp"
+#include "setup.hpp"
 
-
-
-using vkop::VulkanInstance;
-using vkop::VulkanDevice;
-using vkop::VulkanCommandPool;
-using vkop::ops::Conv2d;
 using vkop::core::Tensor;
+using vkop::tests::TestCase;
 
 namespace {
 
@@ -136,7 +129,7 @@ void reference_conv2d(const T* input, const T* weight,
 }  // namespace
 
 template<typename T>
-class Conv2dTest {
+class Conv2dTest: public TestCase {
 public:
     int b_ = 1;
     int oc_ = 16;
@@ -157,7 +150,7 @@ public:
     std::vector<T> output_data_;
     std::vector<T> output_data_separate_bias_;
 
-    Conv2dTest() {
+    Conv2dTest(): TestCase("Conv2d") {
         initTestData();
     }
 
@@ -223,37 +216,9 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    Conv2dTest<float> tp;
-    try {
-        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        for (auto *pdev : phydevs) {
-            auto dev = std::make_shared<VulkanDevice>(pdev);
-            if (dev->getDeviceName().find("llvmpipe")!= std::string::npos) {
-                continue;
-            }
-
-            VkDevice device = dev->getLogicalDevice();
-            VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
-
-            Conv2d cd(tp.ic_, tp.oc_, tp.kh_, tp.kw_, tp.s_, tp.s_, tp.p_, tp.p_, tp.d_, tp.d_, 1, true, vkop::ops::conv2d::PaddingMode::ZEROS);
-            cd.set_runtime_device(pdev, dev, &cmdpool);
-
-            auto output = std::make_shared<Tensor<float>>();
-            // Ensure shared pointers are retained before cmd.submit
-            cd.apply<float>(std::vector<std::shared_ptr<Tensor<float>>> {tp.input_data_, tp.weight_data_, tp.bias_data_}, std::vector<std::shared_ptr<Tensor<float>>> {output});
-            auto *out_ptr = output->data();
-            for (int i = 0; i < output->num_elements(); i++) {
-                if (std::fabs(out_ptr[i] - tp.output_data_[i]) > 0.01) {
-                    LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], tp.output_data_[i]);
-                    return -1;
-                }
-            }
-            LOG_INFO("Test Passed");
-
-        }
-    } catch (const std::exception &e) {
-        LOG_ERROR("%s\n", e.what());
-        return EXIT_FAILURE;
+    Conv2dTest<float> ct;
+    if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_)) {
+        return -1;
     }
 
     return 0;

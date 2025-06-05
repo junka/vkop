@@ -105,7 +105,7 @@ template <typename T> class Tensor {
     int size() { return size_; }
     int num_elements() { return size_ / ele_size_; }
 
-    void *map() { return vkobj_.get(); }
+    void *map() { return nullptr; }
     void unmap() { (void)vkobj_; }
 
     /**
@@ -139,8 +139,9 @@ template <typename T> class Tensor {
      * image formats and facilitates efficient GPU operations.
      */
     std::vector<T> convertTensorToRGBA() {
-        assert(vkobj_->getResourceType() == ResourceType::VK_IMAGE);
-        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        auto obj = vkobj_.lock();
+        assert(obj->getResourceType() == ResourceType::VK_IMAGE);
+        auto img = std::dynamic_pointer_cast<VulkanImage>(obj);
         if (!img) {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
@@ -248,7 +249,6 @@ template <typename T> class Tensor {
         vkobj_ = vkimg;
         return vkimg;
     }
-    void destroy_vkimg() { vkobj_ = nullptr; }
 
   private:
     int n_;
@@ -260,7 +260,7 @@ template <typename T> class Tensor {
     int size_;
 
     std::vector<T> data_;
-    std::shared_ptr<VulkanResource> vkobj_;
+    std::weak_ptr<VulkanResource> vkobj_;
 };
 
 } // namespace core

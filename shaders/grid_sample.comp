@@ -37,7 +37,6 @@ vec4 LoadSample(int positionX, int positionY, int width, int height, int c, int 
 
 void main()
 {
-	// debugPrintfEXT("hahahaa");
 	ivec3 pos = ivec3(gl_GlobalInvocationID);
 
 	ivec3 outputImgSize = uGridSampleParam.outImgSize.xyz;
