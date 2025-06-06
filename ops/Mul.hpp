@@ -2,7 +2,7 @@
 #ifndef OPS_MUL_HPP_
 #define OPS_MUL_HPP_
 
-#include "ElementWiseFactory.hpp"
+#include "BinaryFactory.hpp"
 
 extern unsigned char mul_spv[];
 extern unsigned int mul_spv_len;
@@ -10,7 +10,7 @@ extern unsigned int mul_spv_len;
 namespace vkop {
 namespace ops {
 
-class Mul : public ElementWiseFactory {
+class Mul : public BinaryFactory {
   public:
     Mul() { set_vulkan_spv(mul_spv, mul_spv_len); }
 };

@@ -52,7 +52,7 @@ void Conv2d::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
 }
 
 namespace {
-REGISTER_OPERATOR("Conv2d", Conv2d);
+REGISTER_OPERATOR(Conv2d);
 } // namespace
 
 } // namespace ops

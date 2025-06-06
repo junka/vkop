@@ -39,3 +39,15 @@ add_executable(DivTest DivTest.cpp)
 target_link_libraries(DivTest -Wl,--whole-archive vkop -Wl,--no-whole-archive)
 
 add_test(NAME DivTest COMMAND DivTest)
+
+
+add_executable(ErfTest ErfTest.cpp)
+target_link_libraries(ErfTest -Wl,--whole-archive vkop -Wl,--no-whole-archive)
+
+add_test(NAME ErfTest COMMAND ErfTest)
+
+
+add_executable(ReluTest ReluTest.cpp)
+target_link_libraries(ReluTest -Wl,--whole-archive vkop -Wl,--no-whole-archive)
+
+add_test(NAME ReluTest COMMAND ReluTest)

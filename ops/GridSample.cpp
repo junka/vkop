@@ -53,7 +53,7 @@ void GridSample::execute(
 }
 
 namespace {
-REGISTER_OPERATOR("GridSample", GridSample);
+REGISTER_OPERATOR(GridSample);
 } // namespace
 
 } // namespace ops

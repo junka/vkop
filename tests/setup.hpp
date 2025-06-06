@@ -49,7 +49,7 @@ public:
                 op->execute(inputs, std::vector<std::shared_ptr<core::Tensor<float>>> {output});
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
-                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.01) {
+                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
                         LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
                         return false;
                     }

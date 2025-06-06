@@ -39,10 +39,10 @@ class OperatorFactory {
 } // namespace ops
 } // namespace vkop
 
-#define REGISTER_OPERATOR(name, className)                                     \
-    bool register_##className##_dummy = []() {                                 \
+#define REGISTER_OPERATOR(name)                                                \
+    bool register_##name##_dummy = []() {                                      \
         OperatorFactory::get_instance().register_operator(                     \
-            name, []() { return std::make_unique<className>(); });             \
+            #name, []() { return std::make_unique<name>(); });                 \
         return true;                                                           \
     }();
 

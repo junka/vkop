@@ -8,10 +8,10 @@
 namespace vkop {
 namespace ops {
 
-REGISTER_OPERATOR("Add", Add);
-REGISTER_OPERATOR("Sub", Sub);
-REGISTER_OPERATOR("Mul", Mul);
-REGISTER_OPERATOR("Div", Div);
+REGISTER_OPERATOR(Add);
+REGISTER_OPERATOR(Sub);
+REGISTER_OPERATOR(Mul);
+REGISTER_OPERATOR(Div);
 
 } // namespace ops
 } // namespace vkop

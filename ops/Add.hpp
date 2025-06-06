@@ -2,7 +2,7 @@
 #ifndef OPS_ADD_HPP_
 #define OPS_ADD_HPP_
 
-#include "ElementWiseFactory.hpp"
+#include "BinaryFactory.hpp"
 
 extern unsigned char add_spv[];
 extern unsigned int add_spv_len;
@@ -10,7 +10,7 @@ extern unsigned int add_spv_len;
 namespace vkop {
 namespace ops {
 
-class Add : public ElementWiseFactory {
+class Add : public BinaryFactory {
   public:
     Add() { set_vulkan_spv(add_spv, add_spv_len); }
 };

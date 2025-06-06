@@ -2,7 +2,7 @@
 #ifndef OPS_DIV_HPP_
 #define OPS_DIV_HPP_
 
-#include "ElementWiseFactory.hpp"
+#include "BinaryFactory.hpp"
 
 extern unsigned char div_spv[];
 extern unsigned int div_spv_len;
@@ -10,7 +10,7 @@ extern unsigned int div_spv_len;
 namespace vkop {
 namespace ops {
 
-class Div : public ElementWiseFactory {
+class Div : public BinaryFactory {
   public:
     Div() { set_vulkan_spv(div_spv, div_spv_len); }
 };

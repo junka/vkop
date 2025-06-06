@@ -11,9 +11,6 @@ layout(binding = 2) uniform sampler2D inputB;
 void main() {
     ivec2 texCoord = ivec2(gl_GlobalInvocationID);
 
-    // Calculate texture coordinates
-    // ivec2 texCoord = ivec2(index % textureSize(inputA, 0).x, index / textureSize(inputA, 0).x);
-
     // Fetch data from RGBA texture memory and perform element-wise addition
     vec4 a = texelFetch(inputA, texCoord, 0);
     vec4 b = texelFetch(inputB, texCoord, 0);
