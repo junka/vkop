@@ -11,7 +11,7 @@ using vkop::tests::TestCase;
 
 namespace {
 
-class AddTest : public TestCase {
+class MulTest : public TestCase {
 public:
     int batch_;
     int depth_;
@@ -21,7 +21,7 @@ public:
     std::shared_ptr<Tensor<float>> inputb;
     std::vector<float> expectedOutput;
 
-    AddTest():TestCase("Add") {
+    MulTest():TestCase("Mul") {
         initTestdata();
     }
 private:
@@ -49,7 +49,7 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             inputa_ptr[i] = inputa_dist(gen);
             inputb_ptr[i] = inputa_dist(gen);
-            expectedOutput[i] = inputa_ptr[i] + inputb_ptr[i];
+            expectedOutput[i] = inputa_ptr[i] * inputb_ptr[i];
         }
     }
 };
@@ -59,8 +59,8 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
 
-    AddTest addtest;
-    if (!addtest.run_test({addtest.inputa, addtest.inputb}, addtest.expectedOutput)) {
+    MulTest multest;
+    if (!multest.run_test({multest.inputa, multest.inputb}, multest.expectedOutput)) {
         return -1;
     }
 

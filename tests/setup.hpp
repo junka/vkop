@@ -1,3 +1,6 @@
+#ifndef VKOP_TESTS_HPP_
+#define VKOP_TESTS_HPP_
+
 #include <cmath>
 #include <string>
 #include <vector>
@@ -36,6 +39,10 @@ public:
                 VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
 
                 auto op = ops::OperatorFactory::get_instance().create(name_);
+                if (!op) {
+                    LOG_ERROR("Fail to create oprator");
+                    return false;
+                }
                 op->set_runtime_device(pdev, dev, &cmdpool);
 
                 auto output = std::make_shared<core::Tensor<float>>();
@@ -60,3 +67,5 @@ public:
 
 } // namespace tests
 } // namespace vkop
+
+#endif // VKOP_TESTS_HPP_

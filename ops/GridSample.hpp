@@ -18,6 +18,9 @@
 
 #include "logger.hpp"
 
+extern unsigned char grid_sample_spv[];
+extern unsigned int grid_sample_spv_len;
+
 namespace vkop {
 namespace ops {
 
@@ -37,7 +40,6 @@ struct GpuGridSampleParam {
     int padding_mode;
     int interpolation_mode;
 };
-
 } // namespace gridsample
 
 class GridSample : public Operator {
@@ -202,7 +204,7 @@ class GridSample : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(out_width, out_height);
+        submit(grid_sample_spv, grid_sample_spv_len, out_width, out_height);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -240,7 +242,8 @@ class GridSample : public Operator {
     std::shared_ptr<VulkanImage> gridImage_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
 
-    void submit(int out_width, int out_height) override;
+    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
+                int out_height) override;
 };
 
 } // namespace ops

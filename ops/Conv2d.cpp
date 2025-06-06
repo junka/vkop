@@ -8,13 +8,11 @@
 #include "OperatorFactory.hpp"
 #include "logger.hpp"
 
-extern unsigned char conv2d_spv[];
-extern unsigned int conv2d_spv_len;
-
 namespace vkop {
 namespace ops {
 
-void Conv2d::submit(int out_width, int out_height) {
+void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
+                    int out_width, int out_height) {
     std::vector<VkDescriptorType> types = {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -25,8 +23,7 @@ void Conv2d::submit(int out_width, int out_height) {
         outputImage_, inputImage_, weightImage_, biasImage_, paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
-                            reinterpret_cast<const uint32_t *>(conv2d_spv),
-                            conv2d_spv_len);
+                            reinterpret_cast<const uint32_t *>(spv), spv_len);
 
     VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
     VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);

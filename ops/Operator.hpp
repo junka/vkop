@@ -43,7 +43,8 @@ class Operator {
     VulkanDevice *m_dev_;
     VulkanCommandPool *m_cmdpool_;
 
-    virtual void submit(int out_width, int out_height) = 0;
+    virtual void submit(const unsigned char *spv, unsigned int spv_len,
+                        int out_width, int out_height) = 0;
 };
 
 } // namespace ops

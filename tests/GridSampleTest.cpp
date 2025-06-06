@@ -187,7 +187,7 @@ private:
 
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", true);
+    Logger::getInstance().enableFileOutput("log", false);
     GridSampleTest gst;
     if (!gst.run_test({gst.input, gst.grid}, gst.expectedOutput)) {
         return -1;

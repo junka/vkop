@@ -16,6 +16,8 @@
 #include "VulkanPipeline.hpp"
 #include "VulkanQueryPool.hpp"
 
+extern unsigned char conv2d_spv[];
+extern unsigned int conv2d_spv_len;
 namespace vkop {
 namespace ops {
 
@@ -313,7 +315,7 @@ class Conv2d : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(out_width, out_height);
+        submit(conv2d_spv, conv2d_spv_len, out_width, out_height);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -360,7 +362,8 @@ class Conv2d : public Operator {
     std::shared_ptr<VulkanBuffer> paramBuffer_;
     std::shared_ptr<VulkanImage> biasImage_;
 
-    void submit(int out_width, int out_height) override;
+    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
+                int out_height) override;
 };
 
 } // namespace ops

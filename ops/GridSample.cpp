@@ -8,15 +8,12 @@
 #include "OperatorFactory.hpp"
 #include "logger.hpp"
 
-/* definition in spriv generate source file to avoid violate ODR */
-extern unsigned char grid_sample_spv[];
-extern unsigned int grid_sample_spv_len;
-
 namespace vkop {
 
 namespace ops {
 
-void GridSample::submit(int out_width, int out_height) {
+void GridSample::submit(const unsigned char *spv, unsigned int spv_len,
+                        int out_width, int out_height) {
     std::vector<VkDescriptorType> types = {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -26,8 +23,7 @@ void GridSample::submit(int out_width, int out_height) {
         outputImage_, inputImage_, gridImage_, paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
-                            reinterpret_cast<const uint32_t *>(grid_sample_spv),
-                            grid_sample_spv_len);
+                            reinterpret_cast<const uint32_t *>(spv), spv_len);
 
     VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
     VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
