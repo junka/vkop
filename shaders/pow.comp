@@ -1,4 +1,5 @@
 #version 450 core
+precision highp float;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -11,11 +12,10 @@ layout(binding = 2) uniform sampler2D inputB;
 void main() {
     ivec2 texCoord = ivec2(gl_GlobalInvocationID);
 
-    // Fetch data from RGBA texture memory and perform element-wise addition
+    // Fetch data from RGBA texture memory and perform element-wise power operation
     vec4 a = texelFetch(inputA, texCoord, 0);
     vec4 b = texelFetch(inputB, texCoord, 0);
-    vec4 sum = a + b;
+    vec4 result = pow(a, b);
 
-    // Write the result to the output RGBA texture
-    imageStore(uOutput, texCoord, sum);
+    imageStore(uOutput, texCoord, result);
 }

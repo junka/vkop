@@ -95,10 +95,6 @@ double erf(double x) {
 
 class ErfTest : public TestCase {
 public:
-    int batch_;
-    int depth_;
-    int height_;
-    int width_;
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
 
@@ -111,11 +107,7 @@ private:
         std::vector<int> t = {
             1, 3, 64, 64
         };
-        batch_ = t[0];
-        depth_ = t[1];
-        height_ = t[2];
-        width_ = t[3];
-        input = std::make_shared<Tensor<float>>(batch_, depth_, height_, width_);
+        input = std::make_shared<Tensor<float>>(t);
 
         auto *input_ptr = input->data();
         expectedOutput.resize(input->num_elements());

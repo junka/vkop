@@ -13,10 +13,6 @@ namespace {
 
 class DivTest : public TestCase {
 public:
-    int batch_;
-    int depth_;
-    int height_;
-    int width_;
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
     std::vector<float> expectedOutput;
@@ -30,12 +26,8 @@ private:
         std::vector<int> t = {
             1, 3, 64, 64
         };
-        batch_ = t[0];
-        depth_ = t[1];
-        height_ = t[2];
-        width_ = t[3];
-        inputa = std::make_shared<Tensor<float>>(batch_, depth_, height_, width_);
-        inputb = std::make_shared<Tensor<float>>(batch_, depth_, height_, width_);
+        inputa = std::make_shared<Tensor<float>>(t);
+        inputb = std::make_shared<Tensor<float>>(t);
 
         auto *inputa_ptr = inputa->data();
         auto *inputb_ptr = inputb->data();

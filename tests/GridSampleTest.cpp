@@ -116,17 +116,8 @@ void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &
 
 class GridSampleTest: public TestCase {
 public:
-    int batch_;
-    int depth_;
-    int inHeight_;
-    int inWidth_;
-    int outHeight_;
-    int outWidth_;
-
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> grid;
-    // std::vector<float> originInputData;
-    // std::vector<float> originGridData;
     std::vector<float> expectedOutput;
 
     GridSampleTest(): TestCase("GridSample") {
@@ -139,19 +130,15 @@ private:
             1, 3, 4, 4, 4, 4
             // 2, 5, 4, 4, 4, 4
         };
-        batch_ = t[0];
-        depth_ = t[1];
-        inHeight_ = t[2];
-        inWidth_ = t[3];
-        outHeight_ = t[4];
-        outWidth_ = t[5];
+        auto batch = t[0];
+        auto depth = t[1];
+        auto in_height = t[2];
+        auto in_width = t[3];
+        auto out_height = t[4];
+        auto out_width = t[5];
 
-        auto input_size = batch_ * depth_ * inHeight_ * inWidth_;
-        // auto grid_size = batch_ * outHeight_ * outWidth_ * 2;
-        // auto output_size = batch_ * outHeight_ * outWidth_ * depth_;
-
-        input = std::make_shared<Tensor<float>>(batch_, depth_, inHeight_, inWidth_);
-        grid = std::make_shared<Tensor<float>>(batch_, outHeight_, outWidth_, 2);
+        input = std::make_shared<Tensor<float>>(batch, depth, in_height, in_width);
+        grid = std::make_shared<Tensor<float>>(batch, out_height, out_width, 2);
 
         auto *input_ptr = input->data();
         auto *grid_ptr = grid->data();
@@ -160,22 +147,22 @@ private:
         std::mt19937 gen{rd()};
         gen.seed(1024);
         std::normal_distribution<> input_dist{0.0F, 1.0F};
-        std::normal_distribution<> grid_dist{0.0F, 3.0F / outWidth_};
-        for (int i = 0; i < input_size; i++) {
+        std::normal_distribution<> grid_dist{0.0F, 3.0F / out_width};
+        for (int i = 0; i < input->num_elements(); i++) {
             input_ptr[i] = input_dist(gen);
         }
-        for (int b = 0; b < batch_; b++) {
-            for (int h = 0; h < outHeight_; h++) {
-                for (int w = 0; w < outWidth_; w++) {
+        for (int b = 0; b < batch; b++) {
+            for (int h = 0; h < out_height; h++) {
+                for (int w = 0; w < out_width; w++) {
                     float offset_h = grid_dist(gen);
                     float offset_w = grid_dist(gen);
-                    grid_ptr[b * outHeight_ * outWidth_ * 2 + h * outWidth_ * 2 + w * 2 + 0] = (2.0F * w / (outWidth_ - 1) - 1.0F + offset_w);
-                    grid_ptr[b * outHeight_ * outWidth_ * 2 + h * outWidth_ * 2 + w * 2 + 1] = (2.0F * h / (outHeight_ - 1) - 1.0F + offset_h);
+                    grid_ptr[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
+                    grid_ptr[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
                 }
             }
         }
         std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_grid_sample<float>(input_ptr, grid_ptr, expectedOutput, batch_, inHeight_, inWidth_, outHeight_, outWidth_, depth_, false);
+        reference_grid_sample<float>(input_ptr, grid_ptr, expectedOutput, batch, in_height, in_width, out_height, out_width, depth, false);
         std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         LOG_INFO("reference grid sample time: %f s", duration.count());

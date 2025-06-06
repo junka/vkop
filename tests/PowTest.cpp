@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <vector>
 #include <random>
+#include <cmath>
 
 #include "setup.hpp"
 #include "Tensor.hpp"
@@ -11,13 +12,13 @@ using vkop::tests::TestCase;
 
 namespace {
 
-class MulTest : public TestCase {
+class PowTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
     std::vector<float> expectedOutput;
 
-    MulTest():TestCase("Mul") {
+    PowTest():TestCase("Pow") {
         initTestdata();
     }
 private:
@@ -41,7 +42,7 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             inputa_ptr[i] = inputa_dist(gen);
             inputb_ptr[i] = inputa_dist(gen);
-            expectedOutput[i] = inputa_ptr[i] * inputb_ptr[i];
+            expectedOutput[i] = std::pow(inputa_ptr[i], inputb_ptr[i]);
         }
     }
 };
@@ -51,8 +52,8 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
 
-    MulTest multest;
-    if (!multest.run_test({multest.inputa, multest.inputb}, multest.expectedOutput)) {
+    PowTest powtest;
+    if (!powtest.run_test({powtest.inputa, powtest.inputb}, powtest.expectedOutput)) {
         return -1;
     }
 
