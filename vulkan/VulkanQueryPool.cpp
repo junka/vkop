@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#include "VulkanQueryPool.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanQueryPool.hpp"
+#include "vulkan/VulkanLib.hpp"
 
 #include <cstdint>
 #include <stdexcept>

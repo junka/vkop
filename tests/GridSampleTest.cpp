@@ -6,8 +6,8 @@
 #include <cmath>
 #include <sys/types.h>
 
-#include "Tensor.hpp"
-#include "logger.hpp"
+#include "core/Tensor.hpp"
+#include "include/logger.hpp"
 #include "setup.hpp"
 
 using vkop::core::Tensor;

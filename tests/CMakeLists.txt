@@ -14,6 +14,8 @@ set(TESTS
     PowTest
     ErfTest
     ReluTest
+    BatchNorm2dTest
+    SoftmaxTest
 )
 
 foreach(TEST ${TESTS})

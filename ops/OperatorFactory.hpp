@@ -5,7 +5,7 @@
 #include <functional>
 #include <unordered_map>
 
-#include "Operator.hpp"
+#include "ops/Operator.hpp"
 
 namespace vkop {
 

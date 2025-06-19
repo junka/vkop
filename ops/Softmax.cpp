@@ -1,5 +1,5 @@
 // Copyright 2025 @junka
-#include "Conv2d.hpp"
+#include "Softmax.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -11,16 +11,14 @@
 namespace vkop {
 namespace ops {
 
-void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
-                    int out_width, int out_height) {
+void Softmax::submit(const unsigned char *spv, unsigned int spv_len,
+                     int out_width, int out_height) {
     std::vector<VkDescriptorType> types = {
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
     std::vector<std::shared_ptr<VulkanResource>> objs = {
-        outputImage_, inputImage_, weightImage_, biasImage_, paramBuffer_};
+        outputImage_, inputImage_, paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
                             reinterpret_cast<const uint32_t *>(spv), spv_len);
@@ -40,19 +38,19 @@ void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
     LOG_INFO("Time: %f s", ts);
 }
 
-void Conv2d::execute(
+void Softmax::execute(
     std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
     std::vector<std::shared_ptr<core::Tensor<float>>> outputs) {
     apply<float>(inputs, outputs);
 }
 
-void Conv2d::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-                     std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
+void Softmax::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
+                      std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
     apply<int>(inputs, outputs);
 }
 
 namespace {
-REGISTER_OPERATOR(Conv2d);
+REGISTER_OPERATOR(Softmax);
 } // namespace
 
 } // namespace ops

@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#include "VulkanCommandBuffer.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanLib.hpp"
 
 namespace vkop {
 

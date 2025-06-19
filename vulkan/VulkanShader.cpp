@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#include "VulkanShader.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanShader.hpp"
+#include "vulkan/VulkanLib.hpp"
 
 #include <stdexcept>
 

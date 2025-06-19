@@ -4,8 +4,8 @@
 #include <cmath>
 
 #include "setup.hpp"
-#include "Tensor.hpp"
-#include "logger.hpp"
+#include "core/Tensor.hpp"
+#include "include/logger.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
@@ -37,8 +37,8 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> inputa_dist{0.0F, 1.0F};
-        std::normal_distribution<> inputb_dist{1.0F, 2.0F};
+        std::normal_distribution<> inputa_dist{1.0F, 0.5F};
+        std::normal_distribution<> inputb_dist{0.0F, 1.5F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             inputa_ptr[i] = inputa_dist(gen);
             inputb_ptr[i] = inputa_dist(gen);

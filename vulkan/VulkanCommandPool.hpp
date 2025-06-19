@@ -5,7 +5,7 @@
 #include <vector>
 #include <vulkan/vulkan.hpp>
 
-#include "VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
 
 namespace vkop {
 class VulkanCommandPool {

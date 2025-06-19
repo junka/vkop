@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#ifndef OPS_BINARY_FACTORY_HPP_
-#define OPS_BINARY_FACTORY_HPP_
+#ifndef OPS_BATCHNORM2D_HPP_
+#define OPS_BATCHNORM2D_HPP_
 
 #include "Operator.hpp"
 
@@ -12,18 +12,31 @@
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanQueryPool.hpp"
 
+#include <memory>
+
 namespace vkop {
 namespace ops {
+namespace batchnorm {
 
-class BinaryFactory : public Operator {
+using ivec2 = int[2];
+using vec4 = float[4];
+
+struct GpuBatchNormParam {
+    ivec2 outShape;
+    int num_feature; // C from nchw
+    float eps;       // default 1e-5
+    vec4 attr[];     // mean, variance, scale, bias
+};
+} // namespace batchnorm
+
+class BatchNorm2d : public Operator {
   public:
-    BinaryFactory() = default;
+    BatchNorm2d() = default;
 
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input_a = inputs[0];
-        auto input_b = inputs[1];
+        auto input = inputs[0];
         auto output = outputs[0];
 
         VkDevice device = m_dev_->getLogicalDevice();
@@ -39,14 +52,14 @@ class BinaryFactory : public Operator {
                                VK_IMAGE_USAGE_STORAGE_BIT |
                                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
-        inputAImage_ = input_a->make_vkimg(
+        inputImage_ = input->make_vkimg(
             m_phydev_, m_dev_,
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
-        inputBImage_ = input_b->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+
+        paramBuffer_ = std::make_shared<VulkanBuffer>(
+            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            sizeof(batchnorm::GpuBatchNormParam));
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             if (m_dev->checkHostImageCopyDstLayoutSupport(
@@ -56,9 +69,7 @@ class BinaryFactory : public Operator {
                 outputImage->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
-            inputAImage->hostImaggeTransition(
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            inputBImage->hostImaggeTransition(
+            inputImage->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -66,8 +77,7 @@ class BinaryFactory : public Operator {
             VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
-            inputAImage_->readBarrier(cmd.get());
-            inputBImage_->readBarrier(cmd.get());
+            inputImage_->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
@@ -75,11 +85,10 @@ class BinaryFactory : public Operator {
     template <typename T>
     void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input_a = inputs[0];
-        auto input_b = inputs[1];
+        auto input = inputs[0];
         auto output = outputs[0];
 
-        auto input_shape = input_a->getTensorShape();
+        auto input_shape = input->getTensorShape();
         int batch = input_shape[0];
         int depth = input_shape[1];
         int out_height = input_shape[2];
@@ -88,34 +97,29 @@ class BinaryFactory : public Operator {
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
         if (output->size() == 0) {
-            output->resize(input_a->getTensorShape());
+            output->resize(input->getTensorShape());
         }
         prepare(inputs, outputs);
 
         VkDevice device = m_dev_->getLogicalDevice();
 
-        auto inputa_rgba = input_a->convertTensorToRGBA();
-        auto inputb_rgba = input_b->convertTensorToRGBA();
+        auto input_rgba = input->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
-            inputAImage_->hostImageCopyToDevice(inputa_rgba.data());
-            inputBImage_->hostImageCopyToDevice(inputb_rgba.data());
+            inputImage_->hostImageCopyToDevice(input_rgba.data());
         } else
 #endif
         {
             VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
             cmdstg.begin();
-            inputAImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   inputa_rgba.data());
-            inputBImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   inputb_rgba.data());
+            inputImage_->stagingBufferCopyToImage(cmdstg.get(),
+                                                  input_rgba.data());
             cmdstg.end();
             cmdstg.submit(m_dev_->getComputeQueue());
         }
         VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
         cmd.begin();
-        inputAImage_->readBarrier(cmd.get());
-        inputBImage_->readBarrier(cmd.get());
+        inputImage_->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
@@ -162,8 +166,8 @@ class BinaryFactory : public Operator {
 
   private:
     std::shared_ptr<VulkanImage> outputImage_;
-    std::shared_ptr<VulkanImage> inputAImage_;
-    std::shared_ptr<VulkanImage> inputBImage_;
+    std::shared_ptr<VulkanImage> inputImage_;
+    std::shared_ptr<VulkanBuffer> paramBuffer_;
     unsigned char *spv_;
     unsigned int spv_len_;
 
@@ -171,10 +175,9 @@ class BinaryFactory : public Operator {
                 int out_height) override {
         std::vector<VkDescriptorType> types = {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputAImage_, inputBImage_};
+        std::vector<std::shared_ptr<VulkanResource>> objs = {outputImage_,
+                                                             inputImage_};
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanPipeline pipeline(device, types, objs,
                                 reinterpret_cast<const uint32_t *>(spv),
@@ -198,4 +201,4 @@ class BinaryFactory : public Operator {
 
 } // namespace ops
 } // namespace vkop
-#endif // OPS_ELEMENT_WISE_FACTORY_HPP_
+#endif // OPS_BATCHNORM2D_HPP_

@@ -4,9 +4,9 @@
 
 #include <vector>
 
-#include "Tensor.hpp"
-#include "VulkanCommandPool.hpp"
-#include "VulkanDevice.hpp"
+#include "core/Tensor.hpp"
+#include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDevice.hpp"
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
@@ -17,18 +17,22 @@ namespace ops {
 class Operator {
   public:
     Operator() = default;
-    virtual ~Operator() = default;
+    virtual ~Operator() {
+        m_cmdpool_ = nullptr;
+        m_dev_ = nullptr;
+    };
     Operator(const Operator &) = delete;
     Operator &operator=(const Operator &) = delete;
     Operator(Operator &&) = delete;
     Operator &operator=(Operator &&) = delete;
 
-    virtual void set_runtime_device(VkPhysicalDevice phydev,
-                                    std::shared_ptr<VulkanDevice> &dev,
-                                    VulkanCommandPool *cmdpool) {
+    virtual void
+    set_runtime_device(VkPhysicalDevice phydev,
+                       std::shared_ptr<VulkanDevice> dev,
+                       std::shared_ptr<VulkanCommandPool> cmdpool) {
         m_phydev_ = phydev;
-        m_dev_ = dev.get();
-        m_cmdpool_ = cmdpool;
+        m_dev_ = std::move(dev);
+        m_cmdpool_ = std::move(cmdpool);
     }
 
     virtual void
@@ -40,14 +44,13 @@ class Operator {
 
   protected:
     VkPhysicalDevice m_phydev_;
-    VulkanDevice *m_dev_;
-    VulkanCommandPool *m_cmdpool_;
+    std::shared_ptr<VulkanDevice> m_dev_;
+    std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     virtual void submit(const unsigned char *spv, unsigned int spv_len,
                         int out_width, int out_height) = 0;
 };
 
 } // namespace ops
-
 } // namespace vkop
 #endif // OPS_OPERATOR_HPP_

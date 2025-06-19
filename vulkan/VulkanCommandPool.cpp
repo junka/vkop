@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#include "VulkanCommandPool.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanLib.hpp"
 #include <stdexcept>
 
 namespace vkop {

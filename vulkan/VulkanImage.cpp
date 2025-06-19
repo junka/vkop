@@ -1,7 +1,7 @@
 // Copyright 2025 @junka
-#include "VulkanImage.hpp"
-#include "VulkanInstance.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanImage.hpp"
+#include "vulkan/VulkanInstance.hpp"
+#include "vulkan/VulkanLib.hpp"
 
 namespace vkop {
 

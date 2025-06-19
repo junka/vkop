@@ -1,0 +1,33 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set=0, binding = 0) writeonly uniform image2D outputImage;
+layout(set=0, binding = 1) uniform sampler2D inputImage;
+
+layout(set=0, binding=2) readonly uniform batchNormBuffer{
+	ivec2 outShape;    // 输出图像的宽度和高度
+    int num_feature;
+    float eps; //default 1e-5
+    vec4 attr[128];  // Mean Variance Scale bias, dynamically sized array
+} uBatchNormParam;
+
+void main() {
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+
+    int c = gid.x / uBatchNormParam.outShape.x;
+
+    vec4 inputPixel = texelFetch(inputImage, gid, 0);
+
+    float mean = uBatchNormParam.attr[c].x;
+    float variance = uBatchNormParam.attr[c].y;
+    float scale = uBatchNormParam.attr[c].z;
+    float bias = uBatchNormParam.attr[c].w;
+
+    // Batch normalization formula: output = scale * ((input - mean) / sqrt(variance + epsilon)) + bias
+    const float epsilon = 1e-5;
+    vec4 normalized = (inputPixel - mean) / sqrt(variance + vec4(epsilon));
+    vec4 outputPixel = scale * normalized + bias;
+
+    imageStore(outputImage, gid, outputPixel);
+}

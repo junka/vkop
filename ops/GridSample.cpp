@@ -6,7 +6,6 @@
 #include <memory>
 
 #include "OperatorFactory.hpp"
-#include "logger.hpp"
 
 namespace vkop {
 

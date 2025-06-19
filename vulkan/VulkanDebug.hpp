@@ -2,8 +2,8 @@
 #ifndef SRC_VULKANDEBUG_HPP_
 #define SRC_VULKANDEBUG_HPP_
 
-#include "VulkanInstance.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanInstance.hpp"
+#include "vulkan/VulkanLib.hpp"
 
 namespace vkop {
 

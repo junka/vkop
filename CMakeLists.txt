@@ -12,15 +12,11 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -Wall -Wextra -Werror -fno-omit-f
 
 find_package(Vulkan REQUIRED)
 include_directories(${Vulkan_INCLUDE_DIRS})
-include_directories(${CMAKE_SOURCE_DIR}/include)
-include_directories(${CMAKE_SOURCE_DIR}/src)
-include_directories(${CMAKE_SOURCE_DIR}/ops)
-include_directories(${CMAKE_SOURCE_DIR}/core)
-include_directories(${CMAKE_SOURCE_DIR}/model)
+include_directories(${CMAKE_SOURCE_DIR})
 
 # Source files
-file(GLOB_RECURSE SRC_FILES src/*.cpp ops/*.cpp core/*.cpp)
-file(GLOB_RECURSE ALL_SOURCE_FILES src/*.cpp src/*.hpp ops/*.cpp core/*.cpp ops/*.hpp core/*.hpp)
+file(GLOB_RECURSE SRC_FILES vulkan/*.cpp ops/*.cpp core/*.cpp)
+file(GLOB_RECURSE ALL_SOURCE_FILES vulkan/*.cpp vulkan/*.hpp ops/*.cpp core/*.cpp ops/*.hpp core/*.hpp)
 
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)

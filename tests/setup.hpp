@@ -5,14 +5,16 @@
 #include <string>
 #include <vector>
 
-#include "Tensor.hpp"
-#include "VulkanDevice.hpp"
-#include "VulkanInstance.hpp"
-#include "logger.hpp"
-#include "OperatorFactory.hpp"
+#include "core/Tensor.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanInstance.hpp"
+#include "include/logger.hpp"
+#include "ops/OperatorFactory.hpp"
 
 namespace vkop {
 namespace tests {
+
+using vkop::core::Tensor;
 
 class TestCase {
 private:
@@ -25,8 +27,9 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
-    virtual bool run_test(const std::vector<std::shared_ptr<core::Tensor<float>>> &inputs,
-                    const std::vector<float> &expectedOutput)
+    virtual bool run_test(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
+        const std::vector<float> &expectedOutput,
+        const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func)
     {
         try {
             auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -35,18 +38,23 @@ public:
                 if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
                     continue;
                 }
-                VkDevice device = dev->getLogicalDevice();
-                VulkanCommandPool cmdpool(device, dev->getComputeQueueFamilyIndex());
+                auto *device = dev->getLogicalDevice();
+                auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
                 auto op = ops::OperatorFactory::get_instance().create(name_);
                 if (!op) {
-                    LOG_ERROR("Fail to create oprator");
+                    LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(pdev, dev, &cmdpool);
+                op->set_runtime_device(pdev, dev, cmdpool);
 
-                auto output = std::make_shared<core::Tensor<float>>();
-                op->execute(inputs, std::vector<std::shared_ptr<core::Tensor<float>>> {output});
+                // Apply the attribute function callback if provided
+                if (attribute_func) {
+                    attribute_func(op);
+                }
+
+                auto output = std::make_shared<Tensor<float>>();
+                op->execute(inputs, std::vector<std::shared_ptr<Tensor<float>>> {output});
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
@@ -63,6 +71,43 @@ public:
         return true;
     }
 
+    virtual bool run_test(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
+        const std::vector<float> &expectedOutput)
+    {
+        try {
+            auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+            for (auto *pdev : phydevs) {
+                auto dev = std::make_shared<VulkanDevice>(pdev);
+                if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
+                    continue;
+                }
+                auto *device = dev->getLogicalDevice();
+                auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
+
+                auto op = ops::OperatorFactory::get_instance().create(name_);
+                if (!op) {
+                    LOG_ERROR("Fail to create operator");
+                    return false;
+                }
+                op->set_runtime_device(pdev, dev, cmdpool);
+
+                auto output = std::make_shared<Tensor<float>>();
+                op->execute(inputs, std::vector<std::shared_ptr<Tensor<float>>> {output});
+                auto *out_ptr = output->data();
+                for (int i = 0; i < output->num_elements(); i++) {
+                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
+                        LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
+                        return false;
+                    }
+                }
+                LOG_INFO("Test Passed for operator: %s", name_.c_str());
+            }
+        } catch (const std::exception &e) {
+            LOG_ERROR("%s\n", e.what());
+            return false;
+        }
+        return true;
+    }
 };
 
 } // namespace tests

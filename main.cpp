@@ -1,9 +1,9 @@
-#include "VulkanDevice.hpp"
-#include "VulkanInstance.hpp"
-#include "logger.hpp"
-#include "Tensor.hpp"
-#include "load.hpp"
-#include "OperatorFactory.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanInstance.hpp"
+#include "include/logger.hpp"
+#include "core/Tensor.hpp"
+#include "model/load.hpp"
+#include "ops/OperatorFactory.hpp"
 
 #include <cstdint>
 #include <memory>

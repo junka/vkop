@@ -1,11 +1,11 @@
 // Copyright 2025 @junka
-#include "VulkanDevice.hpp"
-#include "VulkanLib.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanLib.hpp"
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
 
-#include "logger.hpp"
+#include "include/logger.hpp"
 
 namespace vkop {
 
@@ -38,9 +38,9 @@ void VulkanDevice::getProperties() {
     ext_properties_.resize(p_property_count);
     vkEnumerateDeviceExtensionProperties(
         physicalDevice_, nullptr, &p_property_count, ext_properties_.data());
-    for (auto ext : this->ext_properties_) {
-        LOG_INFO("device extension %s", ext.extensionName);
-    }
+    // for (auto ext : this->ext_properties_) {
+    //     LOG_INFO("device extension %s", ext.extensionName);
+    // }
 
     VkPhysicalDeviceProperties2 properties2 = {};
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;

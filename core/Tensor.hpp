@@ -7,10 +7,10 @@
 #include <memory>
 #include <vector>
 
-#include "VulkanCommandBuffer.hpp"
-#include "VulkanDevice.hpp"
-#include "VulkanImage.hpp"
-#include "VulkanResource.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanImage.hpp"
+#include "vulkan/VulkanResource.hpp"
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
@@ -238,7 +238,8 @@ template <typename T> class Tensor {
     }
 
     std::shared_ptr<VulkanImage> make_vkimg(VkPhysicalDevice &phydev,
-                                            VulkanDevice *vd, uint32_t flags) {
+                                            std::shared_ptr<VulkanDevice> &vd,
+                                            uint32_t flags) {
         auto vkimg = std::make_shared<VulkanImage>(
             phydev, vd->getComputeQueueFamilyIndex(), vd->getLogicalDevice(),
             VkExtent3D{static_cast<uint32_t>(w_ * UP_DIV(c_, 4)),

@@ -2,7 +2,7 @@
 #ifndef SRC_VULKANCOMMANDBUFFER_HPP_
 #define SRC_VULKANCOMMANDBUFFER_HPP_
 
-#include "VulkanPipeline.hpp"
+#include "vulkan/VulkanPipeline.hpp"
 #include <vulkan/vulkan.hpp>
 
 namespace vkop {

@@ -7,14 +7,12 @@
 
 #include "Operator.hpp"
 
-#include "Tensor.hpp"
-#include "VulkanBuffer.hpp"
-#include "VulkanCommandBuffer.hpp"
-#include "VulkanCommandPool.hpp"
-#include "VulkanDevice.hpp"
-#include "VulkanImage.hpp"
-#include "VulkanPipeline.hpp"
-#include "VulkanQueryPool.hpp"
+#include "core/Tensor.hpp"
+#include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanImage.hpp"
+#include "vulkan/VulkanPipeline.hpp"
+#include "vulkan/VulkanQueryPool.hpp"
 
 extern unsigned char conv2d_spv[];
 extern unsigned int conv2d_spv_len;

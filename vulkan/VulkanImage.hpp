@@ -8,8 +8,8 @@
 #include <memory>
 #include <variant>
 
-#include "VulkanBuffer.hpp"
-#include "VulkanResource.hpp"
+#include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanResource.hpp"
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 

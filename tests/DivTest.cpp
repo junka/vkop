@@ -3,8 +3,8 @@
 #include <random>
 
 #include "setup.hpp"
-#include "Tensor.hpp"
-#include "logger.hpp"
+#include "core/Tensor.hpp"
+#include "include/logger.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;

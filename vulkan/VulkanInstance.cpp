@@ -1,7 +1,7 @@
 // Copyright 2025 @junka
-#include "VulkanInstance.hpp"
-#include "VulkanLib.hpp"
-#include "logger.hpp"
+#include "vulkan/VulkanInstance.hpp"
+#include "include/logger.hpp"
+#include "vulkan/VulkanLib.hpp"
 #include <stdexcept>
 #include <string>
 #include <vector>

@@ -6,7 +6,7 @@
 #include <vector>
 #include <vulkan/vulkan.h>
 
-#include "VulkanResource.hpp"
+#include "vulkan/VulkanResource.hpp"
 
 namespace vkop {
 class VulkanPipeline {

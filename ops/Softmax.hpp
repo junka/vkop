@@ -1,58 +1,34 @@
 // Copyright 2025 @junka
-#ifndef OPS_GRIDSAMPLE_HPP_
-#define OPS_GRIDSAMPLE_HPP_
+#ifndef OPS_SOFTMAX_HPP_
+#define OPS_SOFTMAX_HPP_
 
-#include <unistd.h>
-#include <vector>
+#include "UnaryFactory.hpp"
 
-#include "Operator.hpp"
-
-#include "core/Tensor.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
-#include "include/logger.hpp"
-
-extern unsigned char grid_sample_spv[];
-extern unsigned int grid_sample_spv_len;
+extern unsigned char softmax_spv[];
+extern unsigned int softmax_spv_len;
 
 namespace vkop {
 namespace ops {
-
-namespace gridsample {
-enum class InterpolationMode { BILINEAR, NEAREST };
-
-enum class PaddingMode { ZEROS, BORDER, REFLECTION };
+namespace softmax {
 
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct GpuGridSampleParam {
+struct GpuSoftMaxParam {
     ivec4 outImgSize;
-    ivec2 inShape;
     ivec2 outShape;
-    bool align_corners;
-    int padding_mode;
-    int interpolation_mode;
+    int groupSize;
+    int totalGroups;
+    int axis; // 0: N, 1: C, 2: H, 3: W
 };
-} // namespace gridsample
 
-class GridSample : public Operator {
+} // namespace softmax
+
+class Softmax : public Operator {
   public:
-    GridSample() = default;
+    Softmax() = default;
 
-    void setAttribute(
-        gridsample::InterpolationMode interp_mode =
-            gridsample::InterpolationMode::BILINEAR,
-        gridsample::PaddingMode pad_mode = gridsample::PaddingMode::ZEROS,
-        bool align_corners = false) {
-        interpolation_mode_ = interp_mode;
-        padding_mode_ = pad_mode;
-        align_corners_ = align_corners;
-    }
+    void setAttribute(int axis = 1) { axis_ = axis; }
 
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
@@ -82,14 +58,9 @@ class GridSample : public Operator {
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
-        gridImage_ = grid->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
-
         paramBuffer_ = std::make_shared<VulkanBuffer>(
             m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
-            sizeof(gridsample::GpuGridSampleParam),
+            sizeof(softmax::GpuSoftMaxParam),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -113,7 +84,6 @@ class GridSample : public Operator {
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
             inputImage_->readBarrier(cmd.get());
-            gridImage_->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
@@ -123,21 +93,17 @@ class GridSample : public Operator {
     void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
-        auto grid = inputs[1];
         auto output = outputs[0];
         auto input_shape = input->getTensorShape();
-        auto grid_shape = grid->getTensorShape();
 
-        if (input_shape.size() != 4 || grid_shape.size() != 4) {
+        if (input_shape.size() != 4) {
             throw std::invalid_argument(
                 "Input and grid must have 4 dimensions.");
         }
         int batch = input_shape[0];
         int depth = input_shape[1];
-        int in_height = input_shape[2];
-        int in_width = input_shape[3];
-        int out_height = grid_shape[1];
-        int out_width = grid_shape[2];
+        int out_height = input_shape[1];
+        int out_width = input_shape[2];
 
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
@@ -147,29 +113,29 @@ class GridSample : public Operator {
         }
         prepare(inputs, outputs);
 
-        auto *para =
-            paramBuffer_->getMappedMemory<gridsample::GpuGridSampleParam>();
+        auto *para = paramBuffer_->getMappedMemory<softmax::GpuSoftMaxParam>();
         // vkimage params
         para->outImgSize[0] = realwidth;
         para->outImgSize[1] = realheight;
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
-        // original params
-        para->inShape[0] = in_width;
-        para->inShape[1] = in_height;
-        para->outShape[0] = out_width;
-        para->outShape[1] = out_height;
-        para->align_corners = align_corners_;
-        para->padding_mode = static_cast<int>(padding_mode_);
-        para->interpolation_mode = static_cast<int>(interpolation_mode_);
+        para->outShape[0] = out_height;
+        para->outShape[1] = out_width;
+        int total_groups = 1;
+        for (int i = 0; i < 4; ++i) {
+            if (i != axis_) {
+                total_groups *= input_shape[i];
+            }
+        }
+        para->groupSize = input_shape[axis_];
+        para->totalGroups = total_groups;
+        para->axis = axis_;
         paramBuffer_->unmapMemory();
 
         VkDevice device = m_dev_->getLogicalDevice();
 
         // auto input_rgba = inputImage_->convertNCHWToRGBA(input);
         auto input_rgba = input->convertTensorToRGBA();
-        // auto grid_rgba = gridImage_->convertNCHWToRGBA(grid);
-        auto grid_rgba = grid->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             inputImage->hostImageCopyToDevice(inputRGBA.data());
@@ -181,8 +147,6 @@ class GridSample : public Operator {
             cmdstg.begin();
             inputImage_->stagingBufferCopyToImage(cmdstg.get(),
                                                   input_rgba.data());
-            gridImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                 grid_rgba.data());
             cmdstg.end();
             cmdstg.submit(m_dev_->getComputeQueue());
         }
@@ -190,11 +154,10 @@ class GridSample : public Operator {
         VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
         cmd.begin();
         inputImage_->readBarrier(cmd.get());
-        gridImage_->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(grid_sample_spv, grid_sample_spv_len, out_width, out_height);
+        submit(softmax_spv, softmax_spv_len, out_width, out_height);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -223,13 +186,11 @@ class GridSample : public Operator {
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
 
   private:
-    gridsample::InterpolationMode interpolation_mode_;
-    gridsample::PaddingMode padding_mode_;
-    bool align_corners_;
+    int axis_;
 
     std::shared_ptr<VulkanImage> outputImage_;
     std::shared_ptr<VulkanImage> inputImage_;
-    std::shared_ptr<VulkanImage> gridImage_;
+
     std::shared_ptr<VulkanBuffer> paramBuffer_;
 
     void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
@@ -238,5 +199,4 @@ class GridSample : public Operator {
 
 } // namespace ops
 } // namespace vkop
-
-#endif // OPS_GRIDSAMPLE_HPP_
+#endif // OPS_SOFTMAX_HPP_

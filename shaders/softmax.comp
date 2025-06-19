@@ -1,0 +1,44 @@
+#version 450 core
+
+#extension GL_EXT_scalar_block_layout : enable
+// Compute shader for Softmax operation using image2D
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set=0, binding = 0) writeonly uniform image2D OutputImage;
+layout(set=0, binding = 1) uniform sampler2D InputImage;
+
+layout(set=0, binding = 2) readonly uniform constBuffer {
+    ivec4 outImgSize;  // 输出图像的大小，HWNC
+    ivec2 outShape;    // 输出图像的宽度和高度 w, h
+    int axis;          // Axis for Softmax
+} uConst;
+
+shared vec4 sharedMax[256];
+shared vec4 sharedSum[256];
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+    ivec3 outputImgSize = uConst.outImgSize.xyz;
+    ivec2 outputShape = uConst.outShape;
+
+   //  
+
+
+    // int n = pos.x / (outputShape.z / 4); // Batch index
+    // int c = (pos.x % (outputShape.z / 4)) * 4 + pos.x; // Channel index
+    // int h = pos.y / outputShape.w; // Height index
+    // int w = pos.y % outputShape.w; // Width index
+    int n = pos.y / outputShape.y;
+    int h = pos.y % outputShape.y;
+    int c = pos.x / outputShape.x;
+    int w = pos.x % outputShape.x;
+
+    int h_C4 = h/4;
+    int remain = h % 4;
+
+    vec4 localMax = vec4(-3.402823466e+38); // Minimum float value
+    vec4 localSum = vec4(0.0);
+
+    if (uConst.axis == 1) { // Softmax along the channel axis
+    }
+}

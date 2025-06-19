@@ -7,8 +7,8 @@
 #include <sys/syslog.h>
 #include <vector>
 
-#include "VulkanPipeline.hpp"
-#include "VulkanShader.hpp"
+#include "vulkan/VulkanPipeline.hpp"
+#include "vulkan/VulkanShader.hpp"
 
 namespace vkop {
 VulkanPipeline::VulkanPipeline(
