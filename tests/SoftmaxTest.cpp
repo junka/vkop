@@ -62,6 +62,7 @@ void softmax_nd(const float* input, float* output,
             int idx = 0;
             int temp = g;
             int stride = group_size;
+
             for (int d = 3; d >= 0; --d) {
                 if (d == axis) {
                     idx += i * (temp % dims[d]) * stride / dims[d];
@@ -128,7 +129,7 @@ public:
     std::vector<float> expectedOutput;
     int axis = 0;
 
-    SoftmaxTest():TestCase("Erf") {
+    SoftmaxTest():TestCase("Softmax") {
         initTestdata();
     }
 private:
@@ -150,9 +151,6 @@ private:
             input_ptr[i] = input_dist(gen);
         }
         softmax_nd(input_ptr, expectedOutput.data(), t[0], t[1], t[2], t[3], axis);
-        for (float i : expectedOutput) {
-            std::cout << i << std::endl;
-        }
     }
 };
 }

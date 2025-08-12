@@ -188,7 +188,7 @@ class BatchNorm2d : public Operator {
         cmd2.begin();
         cmd2.bind(pipeline);
         query_pool.begin(cmd2.get());
-        cmd2.dispatch(out_width, out_height, 1);
+        cmd2.dispatch(out_width, out_height);
         query_pool.end(cmd2.get());
         cmd2.end();
         cmd2.submit(m_dev_->getComputeQueue());

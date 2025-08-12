@@ -8,37 +8,272 @@ layout(set=0, binding = 0) writeonly uniform image2D OutputImage;
 layout(set=0, binding = 1) uniform sampler2D InputImage;
 
 layout(set=0, binding = 2) readonly uniform constBuffer {
-    ivec4 outImgSize;  // 输出图像的大小，HWNC
-    ivec2 outShape;    // 输出图像的宽度和高度 w, h
+    ivec4 outImgSize;  // 输出图像的大小，realHeight, realWidth, 1, 0
+    ivec4 outShape;    // tensor [N, H, W, C]
+    int groupSize;
+    int totalGroups;
     int axis;          // Axis for Softmax
 } uConst;
 
-shared vec4 sharedMax[256];
-shared vec4 sharedSum[256];
+shared vec4 sharedInput[1024];  // 输入缓存
+shared vec4 sharedMax[1024];
+shared vec4 sharedSum[1024];
+shared vec4 sharedOutput[1024]; // 输出缓存
+
+
+// 获取 NC4HW4 中某个具体值
+float getData(uint n, uint h, uint w, uint c_group, uint channel_in_vec) {
+    int W = uConst.outShape.z;
+    int H = uConst.outShape.y;
+
+    ivec2 coord = ivec2(w + c_group * W, h + n * H);
+    vec4 pixel = texelFetch(InputImage, coord, 0);
+    return pixel[channel_in_vec];
+}
+
+vec4 getData(uint n, uint h, uint w, uint c_group) {
+    int W = uConst.outShape.z;
+    int H = uConst.outShape.y;
+
+    ivec2 coord = ivec2(w + c_group * W, h + n * H);
+    return texelFetch(InputImage, coord, 0);
+}
+
+// 一次性写入整个 vec4
+void setData(int n, int h, int w, int c_group, vec4 result) {
+    int W = uConst.outShape.z;
+    int H = uConst.outShape.y;
+    ivec2 coord = ivec2(w + c_group * W, h + n * H);
+    imageStore(OutputImage, coord, result);
+}
+
+void softmax_axis0(int n, int h, int w, int c_group) {
+    uint lid = gl_LocalInvocationIndex;
+    int N = uConst.outShape.x;
+    int C = uConst.outShape.w;
+
+    // Step 1: Load data into shared memory
+    if (lid < N) {
+        sharedInput[lid] = getData(lid, h, w, c_group);
+        sharedMax[lid] = sharedInput[lid];
+    }
+    barrier();
+
+    // Step 2: Reduce Max across batch
+    for (uint s = N >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
+        }
+        barrier();
+    }
+
+    float max_val = sharedMax[0].x;
+
+    // Step 3: Compute exp(x - max)
+    if (lid < N) {
+        sharedSum[lid] = vec4(0.0);
+        for (int i = 0; i < 4; i++) {
+            int c_idx = c_group * 4 + i;
+            if (c_idx >= C) continue;
+            sharedSum[lid][i] = exp(sharedInput[lid][i] - max_val);
+        }
+    }
+    barrier();
+
+    // Step 4: Reduce Sum across batch
+    for (uint s = N >> 1; s > 0; s >>= 1) {
+        if (lid < s && (lid / s) == ((lid + s) / s)) { // Ensure summation is within the same group
+            sharedSum[lid] += sharedSum[lid + s];
+        }
+        barrier();
+    }
+
+    float sum_exp = dot(sharedSum[0], vec4(1.0)); // total sum of all components
+
+    // Step 5: Normalize and Store
+    // if (lid == 0) { // only one thread writes the final output
+        vec4 result = vec4(0.0);
+        for (int i = 0; i < 4; i++) {
+            int c_idx = c_group * 4 + i;
+            if (c_idx >= C) continue;
+            result[i] = exp(sharedInput[n][i] - max_val) / max(sum_exp, 1e-8);
+        }
+        setData(n, h, w, c_group, result);
+    // }
+}
+
+void softmax_axis1(int n, int h, int w, int c_group) {
+    uint lid = gl_LocalInvocationIndex;
+
+    // Step 1: 加载每个线程对应的 channel 数据到 sharedInput 的对应分量中
+    if (lid < 4) {
+        sharedInput[lid] = vec4(-1e9);
+        sharedInput[lid][lid] = getData(n, h, w, c_group, lid);  // ✅ 正确赋值到 vec4 的 .x/.y/.z/.w
+        sharedMax[lid] = sharedInput[lid];  // 初始化 max 缓存
+    } else {
+        sharedInput[lid] = vec4(-1e9);
+        sharedMax[lid] = vec4(-1e9);
+    }
+    barrier();
+
+    // Step 2: 并行规约求最大值（逐通道）
+    for (uint s = 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
+        }
+        barrier();
+    }
+
+    vec4 max_val = sharedMax[0];  // 所有通道的最大值都在 sharedMax[0]
+
+    // Step 3: 计算 exp(x - max)
+    if (lid < 4) {
+        sharedSum[lid] = exp(sharedInput[lid] - max_val);
+    }
+    barrier();
+
+    // Step 4: 并行规约求和（逐通道）
+    for (uint s = 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedSum[lid] += sharedSum[lid + s];
+        }
+        barrier();
+    }
+
+    vec4 sum_exp = sharedSum[0];  // 各通道的总和都在 sharedSum[0]
+
+    // Step 5: 计算 softmax 结果并保存到 sharedOutput
+    if (lid < 4) {
+        sharedOutput[lid] = exp(sharedInput[lid] - max_val) / max(sum_exp, 1e-8);
+    }
+    barrier();
+
+    // Step 6: 线程 0 合成 vec4 并写入图像
+    if (lid == 0) {
+        vec4 result = vec4(
+            sharedOutput[0].x,
+            sharedOutput[1].y,
+            sharedOutput[2].z,
+            sharedOutput[3].w
+        );
+        setData(n, h, w, c_group, result);
+    }
+}
+
+void softmax_axis2(int n, int h, int w, int c_group) {
+    uint lid = gl_LocalInvocationIndex;
+    int H = uConst.outShape.y;
+
+    if (lid < H) {
+        sharedInput[lid] = vec4(
+            getData(n, lid, w, c_group, 0),
+            getData(n, lid, w, c_group, 1),
+            getData(n, lid, w, c_group, 2),
+            getData(n, lid, w, c_group, 3)
+        );
+    }
+    barrier();
+
+    for (uint s = H >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
+        }
+        barrier();
+    }
+
+    float max_val = sharedMax[0].x;
+
+    if (lid < H) {
+        sharedSum[lid] = exp(sharedInput[lid] - max_val);
+    }
+    barrier();
+
+    for (uint s = H >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedSum[lid] += sharedSum[lid + s];
+        }
+        barrier();
+    }
+
+    vec4 sum_exp = sharedSum[0];
+
+    if (lid == 0) {
+        vec4 result = exp(sharedInput[h] - max_val) / max(sum_exp, 1e-8);
+        setData(n, h, w, c_group, result);
+    }
+}
+
+void softmax_axis3(int n, int h, int w, int c_group) {
+    uint lid = gl_LocalInvocationIndex;
+    int W = uConst.outShape.z;
+
+    if (lid < W) {
+        sharedInput[lid] = vec4(
+            getData(n, h, lid, c_group, 0),
+            getData(n, h, lid, c_group, 1),
+            getData(n, h, lid, c_group, 2),
+            getData(n, h, lid, c_group, 3)
+        );
+    }
+    barrier();
+
+    for (uint s = W >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
+        }
+        barrier();
+    }
+
+    float max_val = sharedMax[0].x;
+
+    if (lid < W) {
+        sharedSum[lid] = exp(sharedInput[lid] - max_val);
+    }
+    barrier();
+
+    for (uint s = W >> 1; s > 0; s >>= 1) {
+        if (lid < s) {
+            sharedSum[lid] += sharedSum[lid + s];
+        }
+        barrier();
+    }
+
+    vec4 sum_exp = sharedSum[0];
+
+    if (lid == 0) {
+        vec4 result = exp(sharedInput[w] - max_val) / max(sum_exp, 1e-8);
+        setData(n, h, w, c_group, result);
+    }
+}
 
 void main() {
     ivec3 pos = ivec3(gl_GlobalInvocationID);
     ivec3 outputImgSize = uConst.outImgSize.xyz;
-    ivec2 outputShape = uConst.outShape;
+    ivec4 outputShape = uConst.outShape;
 
-   //  
+    int N = outputShape.x;
+    int H = outputShape.y;
+    int W = outputShape.z;
+    int C = outputShape.w;
 
+    int n = pos.y / H;
+    int h = pos.y % H;
+    int c = pos.x / W; // c group
+    int w = pos.x % W;
 
-    // int n = pos.x / (outputShape.z / 4); // Batch index
-    // int c = (pos.x % (outputShape.z / 4)) * 4 + pos.x; // Channel index
-    // int h = pos.y / outputShape.w; // Height index
-    // int w = pos.y % outputShape.w; // Width index
-    int n = pos.y / outputShape.y;
-    int h = pos.y % outputShape.y;
-    int c = pos.x / outputShape.x;
-    int w = pos.x % outputShape.x;
+    // if (uConst.groupSize == 1) {
+    //     // all ones
+    //     setData(n, h, w, c, vec4(1.0));
+    //     return;
+    // }
 
-    int h_C4 = h/4;
-    int remain = h % 4;
-
-    vec4 localMax = vec4(-3.402823466e+38); // Minimum float value
-    vec4 localSum = vec4(0.0);
-
-    if (uConst.axis == 1) { // Softmax along the channel axis
+    if (uConst.axis == 0) {
+        softmax_axis0(n, h, w, c);
+    } else if (uConst.axis == 1) {
+        softmax_axis1(n, h, w, c);
+    } else if (uConst.axis == 2) {
+        softmax_axis2(n, h, w, c);
+    } else if (uConst.axis == 3) {
+        softmax_axis3(n, h, w, c);
     }
 }

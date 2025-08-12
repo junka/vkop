@@ -34,7 +34,7 @@ class VulkanCommandBuffer {
     // Get the Vulkan command buffer handle
     VkCommandBuffer get() const { return m_commandBuffers_[m_avail_]; }
 
-    void dispatch(int w, int h, int z);
+    void dispatch(int w = 1, int h = 1, int z = 1);
 
   private:
     VkDevice m_device_;

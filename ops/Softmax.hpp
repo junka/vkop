@@ -16,7 +16,7 @@ using ivec2 = int[2];
 
 struct GpuSoftMaxParam {
     ivec4 outImgSize;
-    ivec2 outShape;
+    ivec4 outShape;
     int groupSize;
     int totalGroups;
     int axis; // 0: N, 1: C, 2: H, 3: W
@@ -34,11 +34,9 @@ class Softmax : public Operator {
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
-        auto grid = inputs[1];
         auto output = outputs[0];
 
         auto input_shape = input->getTensorShape();
-        auto grid_shape = grid->getTensorShape();
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -75,8 +73,6 @@ class Softmax : public Operator {
             }
             inputImage->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            gridImage->hostImaggeTransition(
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
         {
@@ -97,13 +93,12 @@ class Softmax : public Operator {
         auto input_shape = input->getTensorShape();
 
         if (input_shape.size() != 4) {
-            throw std::invalid_argument(
-                "Input and grid must have 4 dimensions.");
+            throw std::invalid_argument("Input must have 4 dimensions.");
         }
         int batch = input_shape[0];
         int depth = input_shape[1];
-        int out_height = input_shape[1];
-        int out_width = input_shape[2];
+        int out_height = input_shape[2];
+        int out_width = input_shape[3];
 
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
@@ -119,8 +114,10 @@ class Softmax : public Operator {
         para->outImgSize[1] = realheight;
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
-        para->outShape[0] = out_height;
-        para->outShape[1] = out_width;
+        para->outShape[0] = batch;
+        para->outShape[1] = out_height;
+        para->outShape[2] = out_width;
+        para->outShape[3] = depth;
         int total_groups = 1;
         for (int i = 0; i < 4; ++i) {
             if (i != axis_) {
@@ -139,7 +136,6 @@ class Softmax : public Operator {
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             inputImage->hostImageCopyToDevice(inputRGBA.data());
-            gridImage->hostImageCopyToDevice(gridRGBA.data());
         } else
 #endif
         {
