@@ -45,7 +45,8 @@ class VulkanResource {
         return -1;
     }
     bool allocMemory(VkMemoryRequirements memoryRequirements,
-                     VkMemoryPropertyFlags requiredProperties) {
+                     VkMemoryPropertyFlags requiredProperties,
+                     int ext_fd = -1) {
         VkPhysicalDeviceMemoryProperties memory_properties;
         vkGetPhysicalDeviceMemoryProperties(m_physicalDevice_,
                                             &memory_properties);
@@ -57,6 +58,14 @@ class VulkanResource {
         allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocate_info.allocationSize = memoryRequirements.size;
         allocate_info.memoryTypeIndex = memory_type_index;
+#ifdef VK_KHR_external_memory_fd
+        VkImportMemoryFdInfoKHR importfdinfo = {};
+        importfdinfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+        importfdinfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        importfdinfo.fd = ext_fd;
+        if (ext_fd != -1)
+            allocate_info.pNext = &importfdinfo;
+#endif
         return vkAllocateMemory(m_device_, &allocate_info, nullptr,
                                 &m_memory_) == VK_SUCCESS;
     }

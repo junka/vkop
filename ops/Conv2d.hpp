@@ -152,19 +152,19 @@ class Conv2d : public Operator {
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            if (m_dev->checkHostImageCopyDstLayoutSupport(
+        if (m_dev_->is_support_host_image_copy()) {
+            if (m_dev_->checkHostImageCopyDstLayoutSupport(
                     VK_IMAGE_LAYOUT_GENERAL)) {
-                outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             } else {
-                outputImage->hostImaggeTransition(
+                outputImage_->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
-            inputImage->hostImaggeTransition(
+            inputImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            weightImage->hostImaggeTransition(
+            weightImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            biasImage->hostImaggeTransition(
+            biasImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -287,10 +287,10 @@ class Conv2d : public Operator {
 
         // bias as 1D image data
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            inputImage->hostImageCopyToDevice(inputRGBA.data());
+        if (m_dev_->is_support_host_image_copy()) {
+            inputImage_->hostImageCopyToDevice(input_rgba.data());
             weightImage_->hostImageCopyToDevice(depthwise_rgba.data());
-            biasImage_->hostImageCopyToDevice(bias.data());
+            biasImage_->hostImageCopyToDevice(bias->data());
         } else
 #endif
         {
@@ -318,8 +318,8 @@ class Conv2d : public Operator {
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            outputImage->hostImageCopyToHost(ptr);
+        if (m_dev_->is_support_host_image_copy()) {
+            outputImage_->hostImageCopyToHost(ptr);
         } else
 #endif
         {

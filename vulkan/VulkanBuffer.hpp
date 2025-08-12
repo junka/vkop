@@ -14,7 +14,7 @@ class VulkanBuffer : public VulkanResource {
   public:
     VulkanBuffer(VkPhysicalDevice &physicalDevice, uint32_t queueFamilyIndex,
                  VkDevice &device, VkDeviceSize size, VkBufferUsageFlags usage,
-                 VkMemoryPropertyFlags properties);
+                 VkMemoryPropertyFlags properties, int ext_fd = -1);
     ~VulkanBuffer() override;
 
     VkBuffer getBuffer() const;
@@ -31,7 +31,6 @@ class VulkanBuffer : public VulkanResource {
     VkBuffer m_buffer_ = VK_NULL_HANDLE;
 
     VkDeviceSize m_size_;
-    // VkDeviceSize m_offset;
 
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
 };

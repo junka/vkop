@@ -8,7 +8,7 @@ namespace vkop {
 VulkanBuffer::VulkanBuffer(VkPhysicalDevice &physicalDevice,
                            const uint32_t queueFamilyIndex, VkDevice &device,
                            VkDeviceSize size, VkBufferUsageFlags usage,
-                           VkMemoryPropertyFlags requireProperties)
+                           VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(physicalDevice, queueFamilyIndex, device), m_size_(size) {
     createBuffer(size, usage);
 #ifdef VK_KHR_get_memory_requirements2
@@ -24,7 +24,7 @@ VulkanBuffer::VulkanBuffer(VkPhysicalDevice &physicalDevice,
     VkMemoryRequirements mem_requirements;
     vkGetBufferMemoryRequirements(m_device_, m_buffer_, &mem_requirements);
 #endif
-    allocMemory(mem_requirements, requireProperties);
+    allocMemory(mem_requirements, requireProperties, ext_fd);
 
     vkBindBufferMemory(m_device_, m_buffer_, getMemory(), 0);
 }

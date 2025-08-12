@@ -46,15 +46,15 @@ class UnaryFactory : public Operator {
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            if (m_dev->checkHostImageCopyDstLayoutSupport(
+        if (m_dev_->is_support_host_image_copy()) {
+            if (m_dev_->checkHostImageCopyDstLayoutSupport(
                     VK_IMAGE_LAYOUT_GENERAL)) {
-                outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             } else {
-                outputImage->hostImaggeTransition(
+                outputImage_->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
-            inputImage->hostImaggeTransition(
+            inputImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -90,7 +90,7 @@ class UnaryFactory : public Operator {
 
         auto input_rgba = input->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
+        if (m_dev_->is_support_host_image_copy()) {
             inputImage_->hostImageCopyToDevice(input_rgba.data());
         } else
 #endif
@@ -113,8 +113,8 @@ class UnaryFactory : public Operator {
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            outputImage->hostImageCopyToHost(ptr);
+        if (m_dev_->is_support_host_image_copy()) {
+            outputImage_->hostImageCopyToHost(ptr);
         } else
 #endif
         {

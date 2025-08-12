@@ -9,7 +9,7 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
                          const uint32_t queueFamilyIndex, VkDevice device,
                          VkExtent3D dim, VkFormat format,
                          VkImageUsageFlags usage,
-                         VkMemoryPropertyFlags requireProperties)
+                         VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(physicalDevice, queueFamilyIndex, device), m_dim_(dim),
       m_format_(format), m_usage_(usage) {
     if (m_device_ == VK_NULL_HANDLE) {
@@ -36,7 +36,7 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
     VkMemoryRequirements memoryRequirements;
     vkGetImageMemoryRequirements(m_device, m_image, &memoryRequirements);
 #endif
-    if (!allocMemory(memory_requirements, requireProperties)) {
+    if (!allocMemory(memory_requirements, requireProperties, ext_fd)) {
         destroyImage();
         throw std::runtime_error("failed to allocate image memory!");
     }
@@ -470,6 +470,95 @@ void VulkanImage::readStaingBuffer(void *ptr) {
     auto *dst = static_cast<float *>(ptr);
     memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
+}
+
+void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
+#ifdef VK_EXT_host_image_copy
+    VkResult ret;
+    VkImageSubresourceRange subrange = {};
+    subrange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    subrange.baseMipLevel = 0;
+    subrange.baseArrayLayer = 0;
+    subrange.levelCount = 1;
+    subrange.layerCount = 1;
+
+    VkHostImageLayoutTransitionInfo transinfo = {};
+    transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
+    transinfo.oldLayout = m_layout_;
+    transinfo.newLayout = newLayout;
+    transinfo.image = m_image_;
+    transinfo.subresourceRange = subrange;
+    auto vkTransitionImageLayoutEXT =
+        reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(vkGetInstanceProcAddr(
+            VulkanInstance::getVulkanInstance().getInstance(),
+            "vkTransitionImageLayoutEXT"));
+    if (vkTransitionImageLayoutEXT) {
+        ret = vkTransitionImageLayoutEXT(m_device_, 1, &transinfo);
+        assert(ret == VK_SUCCESS);
+        m_layout_ = newLayout;
+    }
+#else
+    (void)newLayout;
+#endif
+}
+
+void VulkanImage::hostImageCopyToDevice(void *ptr) {
+#ifdef VK_EXT_host_image_copy
+    VkResult ret;
+    VkMemoryToImageCopy region = {};
+    region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = m_dim_;
+    region.pHostPointer = ptr;
+
+    VkCopyMemoryToImageInfo copyinfo = {};
+    copyinfo.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
+    copyinfo.dstImage = m_image_;
+    copyinfo.dstImageLayout = m_layout_;
+    copyinfo.regionCount = 1;
+    copyinfo.pRegions = &region;
+    auto vkCopyMemoryToImageEXT = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(
+        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
+                              "vkCopyMemoryToImageEXT"));
+    if (vkCopyMemoryToImageEXT) {
+        ret = vkCopyMemoryToImageEXT(m_device_, &copyinfo);
+        assert(ret == VK_SUCCESS);
+    }
+#else
+    (void)(ptr);
+#endif
+}
+
+void VulkanImage::hostImageCopyToHost(void *ptr) {
+#ifdef VK_EXT_host_image_copy
+    VkImageToMemoryCopy region = {};
+    region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.mipLevel = 0;
+    region.imageSubresource.baseArrayLayer = 0;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent = m_dim_;
+    region.pHostPointer = ptr;
+    region.memoryRowLength = 0;
+    region.memoryImageHeight = 0;
+
+    VkCopyImageToMemoryInfo copyinfo = {};
+    copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
+    copyinfo.srcImage = m_image_;
+    copyinfo.srcImageLayout = m_layout_;
+    copyinfo.regionCount = 1;
+    copyinfo.pRegions = &region;
+    auto vkCopyImageToMemoryEXT = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(
+        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
+                              "vkCopyImageToMemoryEXT"));
+    if (vkCopyImageToMemoryEXT)
+        vkCopyImageToMemoryEXT(m_device_, &copyinfo);
+#else
+    (void)(ptr);
+#endif
 }
 
 } // namespace vkop

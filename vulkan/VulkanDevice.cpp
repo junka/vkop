@@ -38,9 +38,9 @@ void VulkanDevice::getProperties() {
     ext_properties_.resize(p_property_count);
     vkEnumerateDeviceExtensionProperties(
         physicalDevice_, nullptr, &p_property_count, ext_properties_.data());
-    // for (auto ext : this->ext_properties_) {
-    //     LOG_INFO("device extension %s", ext.extensionName);
-    // }
+    for (auto ext : this->ext_properties_) {
+        LOG_INFO("device extension %s", ext.extensionName);
+    }
 
     VkPhysicalDeviceProperties2 properties2 = {};
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
@@ -53,11 +53,11 @@ void VulkanDevice::getProperties() {
 
     properties2.pNext = &hostimagecopyproperty;
 
-    vkGetPhysicalDeviceProperties2(physicalDevice, &properties2);
-    this->copySrcLayout.resize(hostimagecopyproperty.copySrcLayoutCount);
-    this->copyDstLayout.resize(hostimagecopyproperty.copyDstLayoutCount);
-    hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout.data();
-    hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout.data();
+    vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+    this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
+    this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
+    hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
+    hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
 #endif
 
     VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
@@ -127,7 +127,7 @@ bool VulkanDevice::createLogicalDevice() {
         {};
     integerDotProductFeatures.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
-    devicefloat16Int8Features.pNext = &integerDotProductFeatures;
+    devicefloat16_int8_features.pNext = &integerDotProductFeatures;
 #endif
 
     VkPhysicalDeviceFeatures2 features2 = {};
@@ -190,7 +190,7 @@ bool VulkanDevice::createLogicalDevice() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
     if (checkDeviceExtensionFeature(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
         hostImageCopyFeatures.hostImageCopy = VK_TRUE;
-        enabledExtensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+        enabledExtensions_.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
         enabledFeatures_.push_back(
             reinterpret_cast<uintptr_t>(&hostImageCopyFeatures));
         m_support_host_image_copy_ = true;
@@ -242,7 +242,7 @@ bool VulkanDevice::createLogicalDevice() {
     if (integerDotProductFeatures.shaderIntegerDotProduct) {
         if (checkDeviceExtensionFeature(
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
-            enabledExtensions.push_back(
+            enabledExtensions_.push_back(
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
             enabledFeatures_.push_back(
                 reinterpret_cast<uintptr_t>(&shaderIntegerDotProductFeatures));
@@ -261,7 +261,7 @@ bool VulkanDevice::createLogicalDevice() {
 #endif
     if (checkDeviceExtensionFeature(
             VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
-        enabledExtensions.push_back(
+        enabledExtensions_.push_back(
             VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 #endif
@@ -312,7 +312,12 @@ bool VulkanDevice::createLogicalDevice() {
         imagerobustfeature.robustImageAccess = VK_TRUE;
         enabledFeatures_.push_back(
             reinterpret_cast<uintptr_t>(&imagerobustfeature));
-        enabledExtensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+        enabledExtensions_.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_external_memory_fd
+    if (checkDeviceExtensionFeature(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     }
 #endif
     struct GeneralFeature {

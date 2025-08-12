@@ -48,17 +48,17 @@ class BinaryFactory : public Operator {
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            if (m_dev->checkHostImageCopyDstLayoutSupport(
+        if (m_dev_->is_support_host_image_copy()) {
+            if (m_dev_->checkHostImageCopyDstLayoutSupport(
                     VK_IMAGE_LAYOUT_GENERAL)) {
-                outputImage->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             } else {
-                outputImage->hostImaggeTransition(
+                outputImage_->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
-            inputAImage->hostImaggeTransition(
+            inputAImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            inputBImage->hostImaggeTransition(
+            inputBImage_->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -97,7 +97,7 @@ class BinaryFactory : public Operator {
         auto inputa_rgba = input_a->convertTensorToRGBA();
         auto inputb_rgba = input_b->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
+        if (m_dev_->is_support_host_image_copy()) {
             inputAImage_->hostImageCopyToDevice(inputa_rgba.data());
             inputBImage_->hostImageCopyToDevice(inputb_rgba.data());
         } else
@@ -124,8 +124,8 @@ class BinaryFactory : public Operator {
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            outputImage->hostImageCopyToHost(ptr);
+        if (m_dev_->is_support_host_image_copy()) {
+            outputImage_->hostImageCopyToHost(ptr);
         } else
 #endif
         {
