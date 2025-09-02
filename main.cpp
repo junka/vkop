@@ -12,6 +12,7 @@
 #include <cmath>
 
 #include <sys/types.h>
+#include <unistd.h>
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
@@ -121,6 +122,6 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;
     }
-
+    sleep(100000);
     return EXIT_SUCCESS;
 }

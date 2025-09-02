@@ -25,6 +25,7 @@ template <typename T> class Tensor {
     // nchw
     Tensor(int n, int c, int h, int w) : n_(n), c_(c), h_(h), w_(w) {
         ele_size_ = sizeof(T);
+        fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
         data_.resize(n_ * c_ * h_ * w_);
     }
@@ -33,6 +34,7 @@ template <typename T> class Tensor {
     explicit Tensor(const std::vector<int> &dims)
         : n_(dims[0]), c_(dims[1]), h_(dims[2]), w_(dims[3]) {
         ele_size_ = sizeof(T);
+        fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
         data_.resize(n_ * c_ * h_ * w_);
     }
@@ -41,6 +43,7 @@ template <typename T> class Tensor {
     explicit Tensor(const std::vector<uint32_t> &dims)
         : n_(dims[0]), c_(dims[1]), h_(dims[2]), w_(dims[3]) {
         ele_size_ = sizeof(T);
+        fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
         data_.resize(n_ * c_ * h_ * w_);
     }
@@ -51,6 +54,7 @@ template <typename T> class Tensor {
         h_ = h;
         w_ = w;
         ele_size_ = sizeof(T);
+        fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
         data_.resize(n_ * c_ * h_ * w_);
     }
@@ -61,6 +65,7 @@ template <typename T> class Tensor {
         h_ = dims[2];
         w_ = dims[3];
         ele_size_ = sizeof(T);
+        fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
         data_.resize(n_ * c_ * h_ * w_);
     }
@@ -244,8 +249,9 @@ template <typename T> class Tensor {
             phydev, vd->getComputeQueueFamilyIndex(), vd->getLogicalDevice(),
             VkExtent3D{static_cast<uint32_t>(w_ * UP_DIV(c_, 4)),
                        static_cast<uint32_t>(h_ * n_), 1},
-            VK_FORMAT_R32G32B32A32_SFLOAT, flags,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+            (fp16_ ? VK_FORMAT_R16G16B16A16_SFLOAT
+                   : VK_FORMAT_R32G32B32A32_SFLOAT));
 
         vkobj_ = vkimg;
         return vkimg;
@@ -259,6 +265,8 @@ template <typename T> class Tensor {
 
     int ele_size_;
     int size_;
+
+    bool fp16_;
 
     std::vector<T> data_;
     std::weak_ptr<VulkanResource> vkobj_;

@@ -41,6 +41,9 @@ class Operator {
     virtual void
     execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) = 0;
+    virtual void
+    execute(std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) = 0;
 
   protected:
     VkPhysicalDevice m_phydev_;

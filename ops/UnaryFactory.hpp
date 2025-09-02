@@ -142,6 +142,11 @@ class UnaryFactory : public Operator {
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
         apply<int>(inputs, outputs);
     }
+    void execute(
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
+        apply<uint16_t>(inputs, outputs);
+    }
 
   protected:
     void set_vulkan_spv(unsigned char *spv, unsigned int spv_len) {

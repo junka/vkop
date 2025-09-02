@@ -2,6 +2,7 @@
 #define VKOP_TESTS_HPP_
 
 #include <cmath>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -27,8 +28,9 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
-    virtual bool run_test(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
-        const std::vector<float> &expectedOutput,
+    template <typename T>
+    bool run_test(const std::vector<std::shared_ptr<Tensor<T>>> &inputs,
+        const std::vector<T> &expectedOutput,
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func)
     {
         try {
@@ -53,8 +55,8 @@ public:
                     attribute_func(op);
                 }
 
-                auto output = std::make_shared<Tensor<float>>();
-                op->execute(inputs, std::vector<std::shared_ptr<Tensor<float>>> {output});
+                auto output = std::make_shared<Tensor<T>>();
+                op->execute(inputs, std::vector<std::shared_ptr<Tensor<T>>> {output});
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     std::cout << i<< ": " << out_ptr[i] << " vs " <<expectedOutput[i] << std::endl;
@@ -72,8 +74,9 @@ public:
         return true;
     }
 
-    virtual bool run_test(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
-        const std::vector<float> &expectedOutput)
+    template <typename T>
+    bool run_test(const std::vector<std::shared_ptr<Tensor<T>>> &inputs,
+        const std::vector<T> &expectedOutput)
     {
         try {
             auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -92,13 +95,20 @@ public:
                 }
                 op->set_runtime_device(pdev, dev, cmdpool);
 
-                auto output = std::make_shared<Tensor<float>>();
-                op->execute(inputs, std::vector<std::shared_ptr<Tensor<float>>> {output});
+                auto output = std::make_shared<Tensor<T>>();
+                op->execute(inputs, std::vector<std::shared_ptr<Tensor<T>>> {output});
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
-                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
-                        LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
-                        return false;
+                    if (sizeof(T) == 2) {
+                        if (std::fabs(float16_to_float32(out_ptr[i]) - float16_to_float32(expectedOutput[i])) > 0.01) {
+                            LOG_ERROR("Test Fail at1 (%d): %f, %f", i, float16_to_float32(out_ptr[i]), float16_to_float32(expectedOutput[i]));
+                            return false;
+                        }
+                    } else {
+                        if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
+                            LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
+                            return false;
+                        }
                     }
                 }
                 LOG_INFO("Test Passed for operator: %s", name_.c_str());
@@ -108,6 +118,72 @@ public:
             return false;
         }
         return true;
+    }
+
+    static uint16_t float32_to_float16(float f) {
+        uint32_t x;
+        std::memcpy(&x, &f, sizeof(x));
+
+        uint32_t sign = (x >> 16) & 0x8000; // 符号位 (bit 15)
+        uint32_t exp = (x >> 23) & 0xFF;    // 指数 (8 bits)
+        uint32_t mantissa = x & 0x7FFFFF;   // 尾数 (23 bits)
+
+        uint16_t h = 0;
+
+        if (exp == 0) {
+            // FP32 zero or denormal
+            h = static_cast<uint16_t>(sign | (mantissa != 0 ? 1 : 0)); // 保持为 0 或最小正数
+        } else if (exp == 0xFF) {
+            // Inf or NaN
+            h = static_cast<uint16_t>(sign | 0x7C00 | (mantissa ? 0x200 : 0));
+        } else {
+            int new_exp = exp - 127 + 15; // 调整偏移
+
+            if (new_exp >= 31) {
+                // 溢出 → Inf
+                h = static_cast<uint16_t>(sign | 0x7C00);
+            } else if (new_exp <= 0) {
+                // 下溢 → 非规格化或 0
+                if (new_exp < -10) {
+                    h = static_cast<uint16_t>(sign); // underflow to zero
+                } else {
+                    // 生成非规格化数
+                    uint32_t shifted_mantissa = mantissa | 0x800000; // 添加隐含位
+                    shifted_mantissa >>= (1 - new_exp); // 右移
+                    h = static_cast<uint16_t>(sign | (shifted_mantissa >> 13));
+                }
+            } else {
+                // 正规数
+                h = static_cast<uint16_t>(sign | (new_exp << 10) | (mantissa >> 13));
+            }
+        }
+
+        return h;
+    }
+
+    static float float16_to_float32(uint16_t h) {
+        uint32_t sign = (h & 0x8000) << 16; // 符号位
+        uint32_t exponent = (h & 0x7C00);    // 指数位
+        uint32_t mantissa = (h & 0x03FF);    // 尾数位
+    
+        if (exponent == 0x7C00) { // Inf 或 NaN
+            exponent = 0x3FC00; // FP32 的 Inf/Nan 指数
+        } else if (exponent != 0) { // 正规数
+            exponent = (exponent >> 10) + (127 - 15); // 指数偏移调整
+            exponent <<= 23;
+        } else if (mantissa != 0) { // 非规格化数
+            // 处理非规格化数（denormal）
+            int shift = __builtin_clz(mantissa) - 22; // GCC 内置函数
+            mantissa <<= shift;
+            exponent = (127 - 15 - shift + 1) << 23;
+        }
+        // 否则为 0
+    
+        mantissa <<= 13; // 尾数左移
+        auto ret = (sign | exponent | mantissa);
+        float retfloat;
+        std::memcpy(&retfloat, &ret, 4);
+        return retfloat;
     }
 };
 

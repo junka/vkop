@@ -40,7 +40,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
+        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE} -DFP16
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )

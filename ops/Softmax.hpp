@@ -181,6 +181,10 @@ class Softmax : public Operator {
     execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
 
+    void execute(
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
+
   private:
     int axis_;
 

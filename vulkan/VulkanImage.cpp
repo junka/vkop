@@ -7,9 +7,9 @@ namespace vkop {
 
 VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
                          const uint32_t queueFamilyIndex, VkDevice device,
-                         VkExtent3D dim, VkFormat format,
-                         VkImageUsageFlags usage,
-                         VkMemoryPropertyFlags requireProperties, int ext_fd)
+                         VkExtent3D dim, VkImageUsageFlags usage,
+                         VkMemoryPropertyFlags requireProperties,
+                         VkFormat format, int ext_fd)
     : VulkanResource(physicalDevice, queueFamilyIndex, device), m_dim_(dim),
       m_format_(format), m_usage_(usage) {
     if (m_device_ == VK_NULL_HANDLE) {

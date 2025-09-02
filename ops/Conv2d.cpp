@@ -51,6 +51,12 @@ void Conv2d::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
     apply<int>(inputs, outputs);
 }
 
+void Conv2d::execute(
+    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) {
+    apply<uint16_t>(inputs, outputs);
+}
+
 namespace {
 REGISTER_OPERATOR(Conv2d);
 } // namespace

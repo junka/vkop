@@ -2,6 +2,7 @@
 #ifndef OPS_GRIDSAMPLE_HPP_
 #define OPS_GRIDSAMPLE_HPP_
 
+#include <bits/stdint-uintn.h>
 #include <unistd.h>
 #include <vector>
 
@@ -215,6 +216,9 @@ class GridSample : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
+    void execute(
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
     void
     execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
             std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;

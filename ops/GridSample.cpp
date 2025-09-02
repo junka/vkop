@@ -1,6 +1,7 @@
 // Copyright 2025 @junka
 #include "GridSample.hpp"
 
+#include <bits/stdint-uintn.h>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -49,6 +50,12 @@ void GridSample::execute(
     std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
     std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
     apply<int>(inputs, outputs);
+}
+
+void GridSample::execute(
+    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) {
+    apply<uint16_t>(inputs, outputs);
 }
 
 namespace {

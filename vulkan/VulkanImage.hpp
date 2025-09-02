@@ -19,9 +19,10 @@ namespace vkop {
 class VulkanImage : public VulkanResource {
   public:
     VulkanImage(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
-                VkDevice device, VkExtent3D dim, VkFormat format,
-                VkImageUsageFlags usage,
-                VkMemoryPropertyFlags requireProperties, int ext_fd = -1);
+                VkDevice device, VkExtent3D dim, VkImageUsageFlags usage,
+                VkMemoryPropertyFlags requireProperties,
+                VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                int ext_fd = -1);
     ~VulkanImage() override;
 
     ResourceType getResourceType() const override {

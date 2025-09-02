@@ -10,12 +10,13 @@ using vkop::core::Tensor;
 using vkop::tests::TestCase;
 
 namespace {
+    
 
 class AddTest : public TestCase {
 public:
-    std::shared_ptr<Tensor<float>> inputa;
-    std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<uint16_t>> inputa;
+    std::shared_ptr<Tensor<uint16_t>> inputb;
+    std::vector<uint16_t> expectedOutput;
 
     AddTest():TestCase("Add") {
         initTestdata();
@@ -26,8 +27,8 @@ private:
         std::vector<int> t = {
             1, 3, 64, 64
         };
-        inputa = std::make_shared<Tensor<float>>(t);
-        inputb = std::make_shared<Tensor<float>>(t);
+        inputa = std::make_shared<Tensor<uint16_t>>(t);
+        inputb = std::make_shared<Tensor<uint16_t>>(t);
 
         auto *inputa_ptr = inputa->data();
         auto *inputb_ptr = inputb->data();
@@ -39,9 +40,11 @@ private:
         std::normal_distribution<> inputa_dist{0.0F, 1.0F};
         std::normal_distribution<> inputb_dist{1.0F, 2.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            inputa_ptr[i] = inputa_dist(gen);
-            inputb_ptr[i] = inputa_dist(gen);
-            expectedOutput[i] = inputa_ptr[i] + inputb_ptr[i];
+            auto a = inputa_dist(gen);
+            auto b = inputb_dist(gen);
+            inputa_ptr[i] = float32_to_float16(a);
+            inputb_ptr[i] = float32_to_float16(b);
+            expectedOutput[i] = float32_to_float16(a+b);
         }
     }
 };
