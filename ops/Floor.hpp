@@ -1,0 +1,20 @@
+// Copyright 2025 @junka
+#ifndef OPS_FLOOR_HPP_
+#define OPS_FLOOR_HPP_
+
+#include "UnaryFactory.hpp"
+
+extern unsigned char floor_spv[];
+extern unsigned int floor_spv_len;
+
+namespace vkop {
+namespace ops {
+
+class Floor : public UnaryFactory {
+  public:
+    Floor() { set_vulkan_spv(floor_spv, floor_spv_len); }
+};
+
+} // namespace ops
+} // namespace vkop
+#endif // OPS_FLOOR_HPP_

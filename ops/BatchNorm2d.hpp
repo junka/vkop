@@ -59,7 +59,10 @@ class BatchNorm2d : public Operator {
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
             m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
-            sizeof(batchnorm::GpuBatchNormParam));
+            sizeof(batchnorm::GpuBatchNormParam),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 #ifdef VK_EXT_host_image_copy
         if (m_dev->is_support_host_image_copy()) {
             if (m_dev->checkHostImageCopyDstLayoutSupport(
@@ -156,6 +159,12 @@ class BatchNorm2d : public Operator {
     execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
         apply<int>(inputs, outputs);
+    }
+
+    void execute(
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
+        apply<uint16_t>(inputs, outputs);
     }
 
   protected:

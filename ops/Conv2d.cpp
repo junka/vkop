@@ -58,7 +58,7 @@ void Conv2d::execute(
 }
 
 namespace {
-REGISTER_OPERATOR(Conv2d);
+REGISTER_OPERATOR(OpType::CONV2D, Conv2d);
 } // namespace
 
 } // namespace ops

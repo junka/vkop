@@ -71,10 +71,9 @@ template <typename T> class Tensor {
     }
 
     void printTensorShape() const {
-        std::cout << "Tensor dimensions: [";
-        std::cout << n_ << "," << c_ << "," << h_ << "," << w_ << std::endl;
-        std::cout << "]" << std::endl;
-        std::cout << "size: " << sizeof(T) << std::endl;
+        std::cout << "Tensor dimensions: [" << n_ << "," << c_ << "," << h_
+                  << "," << w_ << "], "
+                  << "size: " << sizeof(T) << std::endl;
     }
 
     /**

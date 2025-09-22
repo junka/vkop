@@ -180,8 +180,13 @@ def parse_onnx_model(onnx_path):
             for dim in tensor_type.shape.dim
         ]
         vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
+
     # Nodes with attributes and shapes of inputs/outputs
     for node in graph.node:
+        # Skip identity or other no-op nodes
+        if node.op_type in {"Identity"}:
+            continue
+
         attributes = {}
         for attr in node.attribute:
             if attr.HasField('i'):
@@ -230,9 +235,6 @@ def parse_onnx_model(onnx_path):
     # Initializers (parameters)
     for initializer in graph.initializer:
         name = initializer.name
-        # shape = tuple(initializer.dims)
-        # data_type = onnx.mapping.TENSOR_TYPE_TO_NP_TYPE[initializer.data_type]
-        # raw_data = initializer.raw_data
         arr = numpy_helper.to_array(initializer)
         vk_model.initializers[name] = arr
 

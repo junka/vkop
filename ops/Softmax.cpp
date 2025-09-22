@@ -6,6 +6,7 @@
 #include <memory>
 
 #include "OperatorFactory.hpp"
+#include "Ops.hpp"
 #include "include/logger.hpp"
 
 namespace vkop {
@@ -55,7 +56,7 @@ void Softmax::execute(
 }
 
 namespace {
-REGISTER_OPERATOR(Softmax);
+REGISTER_OPERATOR(OpType::SOFTMAX, Softmax);
 } // namespace
 
 } // namespace ops

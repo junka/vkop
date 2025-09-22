@@ -4,6 +4,7 @@
 #include "core/Tensor.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "ops/Ops.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -19,6 +20,30 @@ using vkop::VulkanDevice;
 using vkop::core::Tensor;
 using vkop::load::VkModel;
 using vkop::ops::OperatorFactory;
+
+static vkop::ops::OpType convert_opstring_to_enum(const std::string &name) {
+    if (name == "Add") return vkop::ops::OpType::ADD;
+    if (name == "Sub") return vkop::ops::OpType::SUB;
+    if (name == "Mul") return vkop::ops::OpType::MUL;
+    if (name == "Div") return vkop::ops::OpType::DIV;
+    if (name == "Atan") return vkop::ops::OpType::ATAN;
+    if (name == "Erf") return vkop::ops::OpType::ERF;
+    if (name == "Pow") return vkop::ops::OpType::POW;
+    if (name == "BatchNormalization") return vkop::ops::OpType::BATCHNORM;
+    if (name == "Relu") return vkop::ops::OpType::RELU;
+    if (name == "Softmax") return vkop::ops::OpType::SOFTMAX;
+    if (name == "Tanh") return vkop::ops::OpType::TANH;
+    if (name == "MatMul") return vkop::ops::OpType::MATMUL;
+    if (name == "Conv2d" || name == "Conv") return vkop::ops::OpType::CONV2D;
+    if (name == "MaxPool2d") return vkop::ops::OpType::MAXPOOL2D;
+    if (name == "AvgPool2d") return vkop::ops::OpType::AVGPOOL2D;
+    if (name == "Upsample2d") return vkop::ops::OpType::UPSAMPLE2D;
+    if (name == "GridSample") return vkop::ops::OpType::GRIDSAMPLE;
+    if (name == "Constant") return vkop::ops::OpType::CONSTANT;
+    if (name == "Floor") return vkop::ops::OpType::FLOOR;
+    printf("Unknown op type: %s\n", name.c_str());
+    return vkop::ops::OpType::UNKNOWN;
+}
 
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
@@ -70,29 +95,29 @@ int main(int argc, char *argv[]) {
                 }
                 std::cout << "}";
             }
-            std::cout << std::endl;
-            std::cout << "Inputs:" << std::endl;
+            std::cout << "  Inputs: " ;
             for (const auto& input : node.inputs) {
-                std::cout << "  Name: " << input.name << ", Shape: [";
+                std::cout << input.name << ", [";
                 for (size_t i = 0; i < input.dims.size(); ++i) {
                     std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
                 }
-                std::cout << "]" << std::endl;
+                std::cout << "]";
             }
 
-            std::cout << "Outputs:" << std::endl;
+            std::cout << "  Outputs: ";
             for (const auto& output : node.outputs) {
-                std::cout << "  Name: " << output.name << ", Shape: [";
+                std::cout << output.name << ", [";
                 for (size_t i = 0; i < output.dims.size(); ++i) {
                     std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
                 }
-                std::cout << "]" << std::endl;
+                std::cout << "]";
             }
+            std::cout << std::endl;
         }
 
         std::cout << "Initializers:" << std::endl;
         for (const auto& [name, initializer] : model.initializers) {
-            std::cout << "  Name: " << name << ", Shape: [";
+            std::cout << name << ", [";
             for (size_t i = 0; i < initializer.dims.size(); ++i) {
                 std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
             }
@@ -114,7 +139,15 @@ int main(int argc, char *argv[]) {
         }
 
         for (const auto& n: model.nodes) {
-            auto op = OperatorFactory::get_instance().create(n.op_type);
+            if (n.op_type == "Identity") {
+                continue;
+            }
+            auto t = convert_opstring_to_enum(n.op_type);
+            if (t == vkop::ops::OpType::CONSTANT || t == vkop::ops::OpType::UNKNOWN) {
+                // make it as input for next ops
+                continue;
+            }
+            auto op = OperatorFactory::get_instance().create(t);
             // op->execute(inputs, outputs);
             std::cout << "run ops " << n.op_type << std::endl;
         }

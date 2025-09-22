@@ -5,15 +5,16 @@
 #include "Sub.hpp"
 
 #include "OperatorFactory.hpp"
+#include "Ops.hpp"
 
 namespace vkop {
 namespace ops {
 
-REGISTER_OPERATOR(Add);
-REGISTER_OPERATOR(Sub);
-REGISTER_OPERATOR(Mul);
-REGISTER_OPERATOR(Div);
-REGISTER_OPERATOR(Pow);
+REGISTER_OPERATOR(OpType::ADD, Add);
+REGISTER_OPERATOR(OpType::SUB, Sub);
+REGISTER_OPERATOR(OpType::MUL, Mul);
+REGISTER_OPERATOR(OpType::DIV, Div);
+REGISTER_OPERATOR(OpType::POW, Pow);
 
 } // namespace ops
 } // namespace vkop

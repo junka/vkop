@@ -1,7 +1,6 @@
 // Copyright 2025 @junka
 #include "GridSample.hpp"
 
-#include <bits/stdint-uintn.h>
 #include <cmath>
 #include <cstdint>
 #include <memory>
@@ -59,7 +58,7 @@ void GridSample::execute(
 }
 
 namespace {
-REGISTER_OPERATOR(GridSample);
+REGISTER_OPERATOR(OpType::GRIDSAMPLE, GridSample);
 } // namespace
 
 } // namespace ops

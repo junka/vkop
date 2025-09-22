@@ -11,6 +11,7 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "include/logger.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "ops/Ops.hpp"
 
 namespace vkop {
 namespace tests {
@@ -28,6 +29,29 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
+    static vkop::ops::OpType convert_opstring_to_enum(const std::string &name) {
+        if (name == "Add") return vkop::ops::OpType::ADD;
+        if (name == "Sub") return vkop::ops::OpType::SUB;
+        if (name == "Mul") return vkop::ops::OpType::MUL;
+        if (name == "Div") return vkop::ops::OpType::DIV;
+        if (name == "Atan") return vkop::ops::OpType::ATAN;
+        if (name == "Erf") return vkop::ops::OpType::ERF;
+        if (name == "Pow") return vkop::ops::OpType::POW;
+        if (name == "BatchNorm") return vkop::ops::OpType::BATCHNORM;
+        if (name == "Relu") return vkop::ops::OpType::RELU;
+        if (name == "Softmax") return vkop::ops::OpType::SOFTMAX;
+        if (name == "Tanh") return vkop::ops::OpType::TANH;
+        if (name == "MatMul") return vkop::ops::OpType::MATMUL;
+        if (name == "Conv2d" || name == "Conv") return vkop::ops::OpType::CONV2D;
+        if (name == "MaxPool2d") return vkop::ops::OpType::MAXPOOL2D;
+        if (name == "AvgPool2d") return vkop::ops::OpType::AVGPOOL2D;
+        if (name == "Upsample2d") return vkop::ops::OpType::UPSAMPLE2D;
+        if (name == "GridSample") return vkop::ops::OpType::GRIDSAMPLE;
+        if (name == "Constant") return vkop::ops::OpType::CONSTANT;
+        if (name == "Floor") return vkop::ops::OpType::FLOOR;
+        return vkop::ops::OpType::UNKNOWN;
+    }
+
     template <typename T>
     bool run_test(const std::vector<std::shared_ptr<Tensor<T>>> &inputs,
         const std::vector<T> &expectedOutput,
@@ -43,7 +67,7 @@ public:
                 auto *device = dev->getLogicalDevice();
                 auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
-                auto op = ops::OperatorFactory::get_instance().create(name_);
+                auto op = ops::OperatorFactory::get_instance().create(convert_opstring_to_enum(name_));
                 if (!op) {
                     LOG_ERROR("Fail to create operator");
                     return false;
@@ -88,7 +112,7 @@ public:
                 auto *device = dev->getLogicalDevice();
                 auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
-                auto op = ops::OperatorFactory::get_instance().create(name_);
+                auto op = ops::OperatorFactory::get_instance().create(convert_opstring_to_enum(name_));
                 if (!op) {
                     LOG_ERROR("Fail to create operator");
                     return false;

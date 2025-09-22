@@ -3,9 +3,11 @@
 #define OPS_OPERATOR_FACTORY_HPP_
 
 #include <functional>
+#include <string>
 #include <unordered_map>
 
 #include "ops/Operator.hpp"
+#include "ops/Ops.hpp"
 
 namespace vkop {
 
@@ -20,29 +22,30 @@ class OperatorFactory {
         return instance;
     }
 
-    void register_operator(const std::string &name, Creator creator) {
-        creators_[name] = std::move(creator);
+    void register_operator(OpType type, Creator creator) {
+        creators_[type] = std::move(creator);
     }
 
-    std::unique_ptr<Operator> create(const std::string &name) const {
-        auto it = creators_.find(name);
+    std::unique_ptr<Operator> create(OpType type) const {
+        auto it = creators_.find(type);
         if (it != creators_.end()) {
             return it->second();
         }
-        throw std::runtime_error("Unknown operator: " + name);
+        throw std::runtime_error("Unknown operator: " +
+                                 std::to_string(static_cast<int>(type)));
     }
 
   private:
-    std::unordered_map<std::string, Creator> creators_;
+    std::unordered_map<OpType, Creator> creators_;
 };
 
 } // namespace ops
 } // namespace vkop
 
-#define REGISTER_OPERATOR(name)                                                \
+#define REGISTER_OPERATOR(type, name)                                          \
     bool register_##name##_dummy = []() {                                      \
         OperatorFactory::get_instance().register_operator(                     \
-            #name, []() { return std::make_unique<name>(); });                 \
+            type, []() { return std::make_unique<name>(); });                  \
         return true;                                                           \
     }();
 

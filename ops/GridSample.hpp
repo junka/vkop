@@ -2,7 +2,6 @@
 #ifndef OPS_GRIDSAMPLE_HPP_
 #define OPS_GRIDSAMPLE_HPP_
 
-#include <bits/stdint-uintn.h>
 #include <unistd.h>
 #include <vector>
 
