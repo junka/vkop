@@ -18,8 +18,8 @@ namespace vkop {
 // VulkanImage class inheriting from VulkanResource
 class VulkanImage : public VulkanResource {
   public:
-    VulkanImage(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex,
-                VkDevice device, VkExtent3D dim, VkImageUsageFlags usage,
+    VulkanImage(std::shared_ptr<VulkanDevice> &vdev, uint32_t queueFamilyIndex,
+                VkExtent3D dim, VkImageUsageFlags usage,
                 VkMemoryPropertyFlags requireProperties,
                 VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT,
                 int ext_fd = -1);
@@ -66,6 +66,12 @@ class VulkanImage : public VulkanResource {
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
 
+#ifdef USE_VMA
+    void *getMappedMemory() override {
+        return VMA::getMappedMemory(&m_vma_image_);
+    };
+#endif
+
   private:
     VkExtent3D m_dim_;
     VkFormat m_format_;
@@ -73,8 +79,11 @@ class VulkanImage : public VulkanResource {
     VkImageType m_imagetype_;
     VkImageLayout m_layout_ = VK_IMAGE_LAYOUT_UNDEFINED;
     VkAccessFlags m_access_ = 0;
-
+#ifndef USE_VMA
     VkImage m_image_;
+#else
+    VMA::VmaImage m_vma_image_;
+#endif
     VkImageView m_imageView_;
     VkSampler m_sampler_;
 

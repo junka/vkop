@@ -34,19 +34,16 @@ class BinaryFactory : public Operator {
 #endif
         }
 
-        outputImage_ =
-            output->make_vkimg(m_phydev_, m_dev_,
-                               VK_IMAGE_USAGE_STORAGE_BIT |
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+        outputImage_ = output->make_vkimg(
+            m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
         inputAImage_ = input_a->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
         inputBImage_ = input_b->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
             if (m_dev_->checkHostImageCopyDstLayoutSupport(

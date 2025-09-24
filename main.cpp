@@ -35,12 +35,13 @@ static vkop::ops::OpType convert_opstring_to_enum(const std::string &name) {
     if (name == "Tanh") return vkop::ops::OpType::TANH;
     if (name == "MatMul") return vkop::ops::OpType::MATMUL;
     if (name == "Conv2d" || name == "Conv") return vkop::ops::OpType::CONV2D;
-    if (name == "MaxPool2d") return vkop::ops::OpType::MAXPOOL2D;
+    if (name == "MaxPool2d"||name == "MaxPool") return vkop::ops::OpType::MAXPOOL2D;
     if (name == "AvgPool2d") return vkop::ops::OpType::AVGPOOL2D;
     if (name == "Upsample2d") return vkop::ops::OpType::UPSAMPLE2D;
     if (name == "GridSample") return vkop::ops::OpType::GRIDSAMPLE;
     if (name == "Constant") return vkop::ops::OpType::CONSTANT;
     if (name == "Floor") return vkop::ops::OpType::FLOOR;
+    if (name == "Resize") return vkop::ops::OpType::RESIZE;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }
@@ -140,6 +141,7 @@ int main(int argc, char *argv[]) {
 
         for (const auto& n: model.nodes) {
             if (n.op_type == "Identity") {
+                // this should be optimized out in onnx graph
                 continue;
             }
             auto t = convert_opstring_to_enum(n.op_type);
@@ -148,7 +150,7 @@ int main(int argc, char *argv[]) {
                 continue;
             }
             auto op = OperatorFactory::get_instance().create(t);
-            // op->execute(inputs, outputs);
+            op->execute(inputs, outputs);
             std::cout << "run ops " << n.op_type << std::endl;
         }
     } catch (const std::exception& ex) {

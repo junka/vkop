@@ -28,6 +28,14 @@ enum class OpType {
     GRIDSAMPLE,
     CONSTANT,
     FLOOR,
+    FLATTEN,
+    RESIZE,
+    CONCAT,
+    SLICE,
+    UNSQUEEZE,
+    SQUEEZE,
+    COL2IM,
+    IM2COL,
 };
 
 } // namespace ops

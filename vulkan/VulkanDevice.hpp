@@ -3,7 +3,8 @@
 #define SRC_VULKANDEVICE_HPP_
 
 #include <vector>
-#include <vulkan/vulkan.hpp>
+
+#include "vulkan/VMA.hpp"
 
 namespace vkop {
 
@@ -34,6 +35,12 @@ class VulkanDevice {
     bool is_support_host_image_copy() const {
         return m_support_host_image_copy_;
     }
+    bool is_support_buffer_device_address() const {
+        return m_support_buffer_device_address_;
+    }
+#ifdef USE_VMA
+    vkop::VMA *getVMA() const { return m_vma_.get(); }
+#endif
 
     bool checkDeviceUnifiedMemoryAccess();
 
@@ -67,6 +74,8 @@ class VulkanDevice {
     bool checkDeviceExtensionFeature(const char *name) const;
 
     bool m_support_host_image_copy_ = false;
+    bool m_support_buffer_device_address_ = false;
+    std::unique_ptr<vkop::VMA> m_vma_;
 };
 
 } // namespace vkop

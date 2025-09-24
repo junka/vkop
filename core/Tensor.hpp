@@ -241,11 +241,10 @@ template <typename T> class Tensor {
         }
     }
 
-    std::shared_ptr<VulkanImage> make_vkimg(VkPhysicalDevice &phydev,
-                                            std::shared_ptr<VulkanDevice> &vd,
+    std::shared_ptr<VulkanImage> make_vkimg(std::shared_ptr<VulkanDevice> &vd,
                                             uint32_t flags) {
         auto vkimg = std::make_shared<VulkanImage>(
-            phydev, vd->getComputeQueueFamilyIndex(), vd->getLogicalDevice(),
+            vd, vd->getComputeQueueFamilyIndex(),
             VkExtent3D{static_cast<uint32_t>(w_ * UP_DIV(c_, 4)),
                        static_cast<uint32_t>(h_ * n_), 1},
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,

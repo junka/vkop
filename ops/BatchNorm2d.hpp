@@ -47,18 +47,16 @@ class BatchNorm2d : public Operator {
 #endif
         }
 
-        outputImage_ =
-            output->make_vkimg(m_phydev_, m_dev_,
-                               VK_IMAGE_USAGE_STORAGE_BIT |
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+        outputImage_ = output->make_vkimg(
+            m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
         inputImage_ = input->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
             sizeof(batchnorm::GpuBatchNormParam),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |

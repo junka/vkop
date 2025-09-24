@@ -49,6 +49,7 @@ public:
         if (name == "GridSample") return vkop::ops::OpType::GRIDSAMPLE;
         if (name == "Constant") return vkop::ops::OpType::CONSTANT;
         if (name == "Floor") return vkop::ops::OpType::FLOOR;
+        if (name == "Resize") return vkop::ops::OpType::RESIZE;
         return vkop::ops::OpType::UNKNOWN;
     }
 

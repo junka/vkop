@@ -40,7 +40,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE} -DFP16
+        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
@@ -101,6 +101,12 @@ else()
         COMMENT "Running cpplint on all C++ source and header files..."
     )
     # add_dependencies(vkopmain lint-code)
+endif()
+
+option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
+
+if(USE_VMA)
+    target_compile_definitions(vkop PUBLIC USE_VMA)
 endif()
 
 enable_testing()

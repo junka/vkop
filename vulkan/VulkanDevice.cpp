@@ -22,9 +22,11 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
     }
     create();
     checkDeviceUnifiedMemoryAccess();
+    m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
 }
 
 VulkanDevice::~VulkanDevice() {
+    m_vma_.reset();
     if (logicalDevice_ != VK_NULL_HANDLE) {
         vkDestroyDevice(logicalDevice_, nullptr);
         logicalDevice_ = VK_NULL_HANDLE;
@@ -129,11 +131,21 @@ bool VulkanDevice::createLogicalDevice() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
     devicefloat16_int8_features.pNext = &integerDotProductFeatures;
 #endif
+#if VK_KHR_buffer_device_address
+    VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features =
+        {};
+    buffer_device_address_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+    buffer_device_address_features.pNext = &devicefloat16_int8_features;
+#endif
 
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+#if VK_KHR_buffer_device_address
+    features2.pNext = &buffer_device_address_features;
+#else
     features2.pNext = &devicefloat16_int8_features;
-
+#endif
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
 
     VkPhysicalDeviceFeatures features = {};
@@ -184,7 +196,7 @@ bool VulkanDevice::createLogicalDevice() {
     features13.shaderIntegerDotProduct = VK_TRUE;
 #endif
 
-#ifdef VK_EXT_host_image_copy
+#if VK_EXT_host_image_copy
     VkPhysicalDeviceHostImageCopyFeatures hostImageCopyFeatures = {};
     hostImageCopyFeatures.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
@@ -216,7 +228,7 @@ bool VulkanDevice::createLogicalDevice() {
                     reinterpret_cast<uintptr_t>(&storage16bit_features));
             }
         }
-#ifdef VK_AMD_gpu_shader_half_float
+#if VK_AMD_gpu_shader_half_float
         if (deviceProperties_.vendorID == 4098) {
             // for AMD card, do we really need this ? over
             // VK_KHR_shader_float16_int8
@@ -249,12 +261,12 @@ bool VulkanDevice::createLogicalDevice() {
         }
     }
 #endif
-#ifdef VK_KHR_bind_memory2
+#if VK_KHR_bind_memory2
     if (checkDeviceExtensionFeature(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME)) {
         enabledExtensions_.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_KHR_shader_non_semantic_info
+#if VK_KHR_shader_non_semantic_info
 #ifndef VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME
 #define VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME                         \
     "VK_KHR_shader_non_semantic_info"
@@ -265,14 +277,14 @@ bool VulkanDevice::createLogicalDevice() {
             VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_KHR_get_physical_device_properties2
+#if VK_KHR_get_physical_device_properties2
     if (checkDeviceExtensionFeature(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
         enabledExtensions_.push_back(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_KHR_get_memory_requirements2
+#if VK_KHR_get_memory_requirements2
     if (checkDeviceExtensionFeature(
             VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
         enabledExtensions_.push_back(
@@ -280,31 +292,31 @@ bool VulkanDevice::createLogicalDevice() {
     }
 #endif
 
-#ifdef VK_KHR_format_feature_flags2
+#if VK_KHR_format_feature_flags2
     if (checkDeviceExtensionFeature(
             VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
         enabledExtensions_.push_back(
             VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_KHR_copy_commands2
+#if VK_KHR_copy_commands2
     if (checkDeviceExtensionFeature(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) {
         enabledExtensions_.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_EXT_tooling_info
+#if VK_EXT_tooling_info
     if (checkDeviceExtensionFeature(VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
         enabledExtensions_.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_EXT_subgroup_size_control
+#if VK_EXT_subgroup_size_control
     if (checkDeviceExtensionFeature(
             VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
         enabledExtensions_.push_back(
             VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_EXT_image_robustness
+#if VK_EXT_image_robustness
     VkPhysicalDeviceImageRobustnessFeatures imagerobustfeature;
     imagerobustfeature.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
@@ -315,9 +327,62 @@ bool VulkanDevice::createLogicalDevice() {
         enabledExtensions_.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     }
 #endif
-#ifdef VK_KHR_external_memory_fd
+#if VK_KHR_external_memory_fd
     if (checkDeviceExtensionFeature(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
         enabledExtensions_.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    }
+#endif
+    // follow up extensions are for vma allocator
+#if VK_KHR_dedicated_allocation
+    if (checkDeviceExtensionFeature(
+            VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+    }
+#endif
+#if VK_KHR_maintenance4
+    if (checkDeviceExtensionFeature(VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+    }
+#endif
+#if VK_KHR_maintenance5
+    if (checkDeviceExtensionFeature(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    }
+#endif
+#if VK_EXT_memory_budget
+    if (checkDeviceExtensionFeature(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    }
+#endif
+#if VK_KHR_buffer_device_address
+    VkPhysicalDeviceBufferDeviceAddressFeaturesKHR
+        physical_device_buffer_device_address_features = {};
+    physical_device_buffer_device_address_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES_KHR;
+    physical_device_buffer_device_address_features.bufferDeviceAddress =
+        VK_TRUE;
+
+    if (checkDeviceExtensionFeature(
+            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) &&
+        buffer_device_address_features.bufferDeviceAddress) {
+        enabledExtensions_.push_back(
+            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        m_support_buffer_device_address_ = true;
+        enabledFeatures_.push_back(reinterpret_cast<uintptr_t>(
+            &physical_device_buffer_device_address_features));
+    }
+#endif
+#if VK_EXT_memory_priority
+    if (checkDeviceExtensionFeature(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    }
+#endif
+#if VK_AMD_device_coherent_memory
+    if (checkDeviceExtensionFeature(
+            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(
+            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
     }
 #endif
     struct GeneralFeature {

@@ -1,31 +1,42 @@
 // Copyright 2025 @junka
-#ifndef OPS_UNARY_FACTORY_HPP_
-#define OPS_UNARY_FACTORY_HPP_
+#ifndef OPS_COL2IM_HPP_
+#define OPS_COL2IM_HPP_
 
-#include "Operator.hpp"
+#include "UnaryFactory.hpp"
 
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanCommandPool.hpp"
-#include "vulkan/VulkanDevice.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
+extern unsigned char col2im_spv[];
+extern unsigned int col2im_spv_len;
 
 namespace vkop {
 namespace ops {
+namespace col2im {
 
-class UnaryFactory : public Operator {
+using ivec4 = int[4];
+using ivec2 = int[2];
+
+struct GpuCol2ImParam {
+    ivec4 outImgSize;
+    ivec4 outShape;
+    int groupSize;
+    int totalGroups;
+    int axis; // 0: N, 1: C, 2: H, 3: W
+};
+
+} // namespace col2im
+
+class Col2im : public Operator {
   public:
-    UnaryFactory() = default;
+    Col2im() = default;
+
+    void setAttribute(int axis = 1) { axis_ = axis; }
 
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
         auto output = outputs[0];
+
+        auto input_shape = input->getTensorShape();
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -43,6 +54,11 @@ class UnaryFactory : public Operator {
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
+        paramBuffer_ = std::make_shared<VulkanBuffer>(
+            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
+            sizeof(col2im::GpuCol2ImParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
             if (m_dev_->checkHostImageCopyDstLayoutSupport(
@@ -65,13 +81,17 @@ class UnaryFactory : public Operator {
             cmd.submit(m_dev_->getComputeQueue());
         }
     }
+
     template <typename T>
     void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
         auto output = outputs[0];
-
         auto input_shape = input->getTensorShape();
+
+        if (input_shape.size() != 4) {
+            throw std::invalid_argument("Input must have 4 dimensions.");
+        }
         int batch = input_shape[0];
         int depth = input_shape[1];
         int out_height = input_shape[2];
@@ -79,13 +99,37 @@ class UnaryFactory : public Operator {
 
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
+
         if (output->size() == 0) {
-            output->resize(input->getTensorShape());
+            output->resize(batch, depth, out_height, out_width);
         }
         prepare(inputs, outputs);
 
+        auto *para = static_cast<col2im::GpuCol2ImParam *>(
+            paramBuffer_->getMappedMemory());
+        // vkimage params
+        para->outImgSize[0] = realwidth;
+        para->outImgSize[1] = realheight;
+        para->outImgSize[2] = 1;
+        para->outImgSize[3] = 0;
+        para->outShape[0] = batch;
+        para->outShape[1] = out_height;
+        para->outShape[2] = out_width;
+        para->outShape[3] = depth;
+        int total_groups = 1;
+        for (int i = 0; i < 4; ++i) {
+            if (i != axis_) {
+                total_groups *= input_shape[i];
+            }
+        }
+        para->groupSize = input_shape[axis_];
+        para->totalGroups = total_groups;
+        para->axis = axis_;
+        paramBuffer_->unmapMemory();
+
         VkDevice device = m_dev_->getLogicalDevice();
 
+        // auto input_rgba = inputImage_->convertNCHWToRGBA(input);
         auto input_rgba = input->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
@@ -100,13 +144,14 @@ class UnaryFactory : public Operator {
             cmdstg.end();
             cmdstg.submit(m_dev_->getComputeQueue());
         }
+
         VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
         cmd.begin();
         inputImage_->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(spv_, spv_len_, out_width, out_height);
+        submit(col2im_spv, col2im_spv_len, out_width, out_height);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -116,8 +161,6 @@ class UnaryFactory : public Operator {
         } else
 #endif
         {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
             VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
             cmdstg1.begin();
             outputImage_->stagingBufferCopyToHost(cmdstg1.get());
@@ -129,63 +172,29 @@ class UnaryFactory : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override {
-        apply<float>(inputs, outputs);
-    }
-
+    void
+    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
+            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
     void
     execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
-        apply<int>(inputs, outputs);
-    }
+            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
+
     void execute(
         std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
-        apply<uint16_t>(inputs, outputs);
-    }
-
-  protected:
-    void set_vulkan_spv(unsigned char *spv, unsigned int spv_len) {
-        spv_ = spv;
-        spv_len_ = spv_len;
-    }
+        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
 
   private:
+    int axis_;
+
     std::shared_ptr<VulkanImage> outputImage_;
     std::shared_ptr<VulkanImage> inputImage_;
-    unsigned char *spv_;
-    unsigned int spv_len_;
+
+    std::shared_ptr<VulkanBuffer> paramBuffer_;
 
     void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
-                int out_height) override {
-        std::vector<VkDescriptorType> types = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {outputImage_,
-                                                             inputImage_};
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types, objs,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
-
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-        cmd2.begin();
-        cmd2.bind(pipeline);
-        query_pool.begin(cmd2.get());
-        cmd2.dispatch(out_width, out_height);
-        query_pool.end(cmd2.get());
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
-        auto r = query_pool.getResults();
-        double ts = static_cast<double>(r[1] - r[0]) * (1e-9) *
-                    m_dev_->getTimestampPeriod();
-        LOG_INFO("Time: %f s", ts);
-    }
+                int out_height) override;
 };
 
 } // namespace ops
 } // namespace vkop
-#endif // OPS_UNARY_FACTORY_HPP_
+#endif // OPS_COL2IM_HPP_

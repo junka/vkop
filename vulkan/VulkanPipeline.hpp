@@ -4,7 +4,6 @@
 
 #include <memory>
 #include <vector>
-#include <vulkan/vulkan.h>
 
 #include "vulkan/VulkanResource.hpp"
 

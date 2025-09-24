@@ -5,16 +5,13 @@
 
 namespace vkop {
 
-VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
-                         const uint32_t queueFamilyIndex, VkDevice device,
-                         VkExtent3D dim, VkImageUsageFlags usage,
+VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev,
+                         const uint32_t queueFamilyIndex, VkExtent3D dim,
+                         VkImageUsageFlags usage,
                          VkMemoryPropertyFlags requireProperties,
                          VkFormat format, int ext_fd)
-    : VulkanResource(physicalDevice, queueFamilyIndex, device), m_dim_(dim),
-      m_format_(format), m_usage_(usage) {
-    if (m_device_ == VK_NULL_HANDLE) {
-        throw std::runtime_error("Invalid Vulkan device handle.");
-    }
+    : VulkanResource(vdev, queueFamilyIndex), m_dim_(dim), m_format_(format),
+      m_usage_(usage) {
     if (m_format_ == VK_FORMAT_UNDEFINED) {
         throw std::runtime_error("Invalid Vulkan image format.");
     }
@@ -23,13 +20,15 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
     }
     calcImageSize();
     createImage();
+#ifndef USE_VMA
 #ifdef VK_KHR_get_memory_requirements2
     VkMemoryRequirements2 mem_requirements2 = {};
     mem_requirements2.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
     VkImageMemoryRequirementsInfo2 image_info{};
     image_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
     image_info.image = m_image_;
-    vkGetImageMemoryRequirements2(m_device_, &image_info, &mem_requirements2);
+    vkGetImageMemoryRequirements2(m_vdev_->getLogicalDevice(), &image_info,
+                                  &mem_requirements2);
     VkMemoryRequirements memory_requirements =
         mem_requirements2.memoryRequirements;
 #else
@@ -40,11 +39,15 @@ VulkanImage::VulkanImage(VkPhysicalDevice physicalDevice,
         destroyImage();
         throw std::runtime_error("failed to allocate image memory!");
     }
-    if (vkBindImageMemory(m_device_, m_image_, getMemory(), 0)) {
+    if (vkBindImageMemory(m_vdev_->getLogicalDevice(), m_image_, getMemory(),
+                          0)) {
         destroyImage();
         throw std::runtime_error("failed to bind image memory!");
     }
-
+#else
+    (void)ext_fd;
+    (void)requireProperties;
+#endif
     createImageView();
     createSampler();
     if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
@@ -217,13 +220,13 @@ void VulkanImage::createStagingBuffer(bool writeonly) {
     auto size = getImageSize();
     if (writeonly) {
         m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_physicalDevice_, m_queueFamilyIndex_, m_device_, size,
+            m_vdev_, m_queueFamilyIndex_, size,
             VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     } else {
         m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_physicalDevice_, m_queueFamilyIndex_, m_device_, size,
+            m_vdev_, m_queueFamilyIndex_, size,
             VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
@@ -253,25 +256,39 @@ void VulkanImage::createImage() {
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_create_info.queueFamilyIndexCount = 1;
     image_create_info.pQueueFamilyIndices = &m_queueFamilyIndex_;
-    if (vkCreateImage(m_device_, &image_create_info, nullptr, &m_image_) !=
-        VK_SUCCESS) {
+#ifdef USE_VMA
+    auto ret =
+        m_vdev_->getVMA()->createImage(&image_create_info, &m_vma_image_);
+#else
+    auto ret = vkCreateImage(m_vdev_->getLogicalDevice(), &image_create_info,
+                             nullptr, &m_image_);
+#endif
+    if (ret != VK_SUCCESS) {
         throw std::runtime_error("failed to create image!");
     }
 }
 
 void VulkanImage::destroyImage() {
     if (m_sampler_)
-        vkDestroySampler(m_device_, m_sampler_, nullptr);
+        vkDestroySampler(m_vdev_->getLogicalDevice(), m_sampler_, nullptr);
     if (m_imageView_ != VK_NULL_HANDLE)
-        vkDestroyImageView(m_device_, m_imageView_, nullptr);
+        vkDestroyImageView(m_vdev_->getLogicalDevice(), m_imageView_, nullptr);
+#ifndef USE_VMA
     if (m_image_)
-        vkDestroyImage(m_device_, m_image_, nullptr);
+        vkDestroyImage(m_vdev_->getLogicalDevice(), m_image_, nullptr);
+#else
+    m_vdev_->getVMA()->destroyImage(&m_vma_image_);
+#endif
 }
 
 void VulkanImage::createImageView() {
     VkImageViewCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+#ifdef USE_VMA
+    info.image = m_vma_image_.image;
+#else
     info.image = m_image_;
+#endif
     info.viewType = VK_IMAGE_VIEW_TYPE_1D;
     if (m_imagetype_ == VK_IMAGE_TYPE_3D) {
         info.viewType = VK_IMAGE_VIEW_TYPE_3D;
@@ -285,8 +302,8 @@ void VulkanImage::createImageView() {
     info.subresourceRange.baseArrayLayer = 0;
     info.subresourceRange.layerCount = 1;
 
-    if (vkCreateImageView(m_device_, &info, nullptr, &m_imageView_) !=
-        VK_SUCCESS) {
+    if (vkCreateImageView(m_vdev_->getLogicalDevice(), &info, nullptr,
+                          &m_imageView_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create image view!");
     }
 }
@@ -309,8 +326,8 @@ void VulkanImage::createSampler() {
     sampler_info.compareEnable = VK_FALSE;
     sampler_info.minLod = 0.0F;
     sampler_info.maxLod = 0.0F;
-    if (vkCreateSampler(m_device_, &sampler_info, nullptr, &m_sampler_) !=
-        VK_SUCCESS) {
+    if (vkCreateSampler(m_vdev_->getLogicalDevice(), &sampler_info, nullptr,
+                        &m_sampler_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create texture sampler!");
     }
 }
@@ -346,7 +363,11 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
     barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+#ifdef USE_VMA
+    barrier.image = m_vma_image_.image;
+#else
     barrier.image = m_image_;
+#endif
     barrier.subresourceRange = subrange;
     barrier.srcAccessMask = m_access_;
     barrier.dstAccessMask = dstAccessMask;
@@ -402,6 +423,11 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
     if (m_layout_ != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
         transferReadBarrier(commandBuffer);
     }
+#ifdef USE_VMA
+    VkImage img = m_vma_image_.image;
+#else
+    VkImage img = m_image_;
+#endif
 
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
@@ -415,8 +441,8 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
     region.imageExtent = m_dim_;
 
     assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vkCmdCopyImageToBuffer(commandBuffer, m_image_, m_layout_,
-                           buffer.getBuffer(), 1, &region);
+    vkCmdCopyImageToBuffer(commandBuffer, img, m_layout_, buffer.getBuffer(), 1,
+                           &region);
 
     // Optionally transition the image back to its original layout
     transferBarrier(commandBuffer, old_layout, old_access);
@@ -430,7 +456,11 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     if (m_layout_ != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
         transferWriteBarrier(commandBuffer);
     }
-
+#ifdef USE_VMA
+    VkImage img = m_vma_image_.image;
+#else
+    VkImage img = m_image_;
+#endif
     VkBufferImageCopy region = {};
     region.bufferOffset = 0;
     region.bufferRowLength = 0;
@@ -442,8 +472,8 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim_;
     assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(commandBuffer, buffer.getBuffer(), m_image_,
-                           m_layout_, 1, &region);
+    vkCmdCopyBufferToImage(commandBuffer, buffer.getBuffer(), img, m_layout_, 1,
+                           &region);
 
     // Optionally transition the image back to its original layout
     transferBarrier(commandBuffer, old_layout, old_access);
@@ -451,9 +481,10 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
 
 void VulkanImage::stagingBufferCopyToImage(VkCommandBuffer commandBuffer,
                                            const void *ptr) {
-    auto *dst = m_stagingBuffer_->getMappedMemory<float>();
+    auto *dst = m_stagingBuffer_->getMappedMemory();
     auto imagesize = getImageSize();
     const auto *src = static_cast<const float *>(ptr);
+    assert(dst != nullptr);
     memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
 
@@ -466,7 +497,7 @@ void VulkanImage::stagingBufferCopyToHost(VkCommandBuffer commandBuffer) {
 
 void VulkanImage::readStaingBuffer(void *ptr) {
     auto imagesize = getImageSize();
-    void *src = m_stagingBuffer_->getMappedMemory<float>();
+    void *src = m_stagingBuffer_->getMappedMemory();
     auto *dst = static_cast<float *>(ptr);
     memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
@@ -481,19 +512,24 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     subrange.baseArrayLayer = 0;
     subrange.levelCount = 1;
     subrange.layerCount = 1;
-
+#ifdef USE_VMA
+    VkImage img = m_vma_image_.image;
+#else
+    VkImage img = m_image_;
+#endif
     VkHostImageLayoutTransitionInfo transinfo = {};
     transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
     transinfo.oldLayout = m_layout_;
     transinfo.newLayout = newLayout;
-    transinfo.image = m_image_;
+    transinfo.image = img;
     transinfo.subresourceRange = subrange;
     auto vkTransitionImageLayoutEXT =
         reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(vkGetInstanceProcAddr(
             VulkanInstance::getVulkanInstance().getInstance(),
             "vkTransitionImageLayoutEXT"));
     if (vkTransitionImageLayoutEXT) {
-        ret = vkTransitionImageLayoutEXT(m_device_, 1, &transinfo);
+        ret = vkTransitionImageLayoutEXT(m_vdev_->getLogicalDevice(), 1,
+                                         &transinfo);
         assert(ret == VK_SUCCESS);
         m_layout_ = newLayout;
     }
@@ -513,10 +549,14 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     region.imageSubresource.layerCount = 1;
     region.imageExtent = m_dim_;
     region.pHostPointer = ptr;
-
+#ifdef USE_VMA
+    VkImage img = m_vma_image_.image;
+#else
+    VkImage img = m_image_;
+#endif
     VkCopyMemoryToImageInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
-    copyinfo.dstImage = m_image_;
+    copyinfo.dstImage = img;
     copyinfo.dstImageLayout = m_layout_;
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
@@ -524,7 +564,7 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
         vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
                               "vkCopyMemoryToImageEXT"));
     if (vkCopyMemoryToImageEXT) {
-        ret = vkCopyMemoryToImageEXT(m_device_, &copyinfo);
+        ret = vkCopyMemoryToImageEXT(m_vdev_->getLogicalDevice(), &copyinfo);
         assert(ret == VK_SUCCESS);
     }
 #else
@@ -544,10 +584,14 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     region.pHostPointer = ptr;
     region.memoryRowLength = 0;
     region.memoryImageHeight = 0;
-
+#ifdef USE_VMA
+    VkImage img = m_vma_image_.image;
+#else
+    VkImage img = m_image_;
+#endif
     VkCopyImageToMemoryInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
-    copyinfo.srcImage = m_image_;
+    copyinfo.srcImage = img;
     copyinfo.srcImageLayout = m_layout_;
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
@@ -555,7 +599,7 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
         vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
                               "vkCopyImageToMemoryEXT"));
     if (vkCopyImageToMemoryEXT)
-        vkCopyImageToMemoryEXT(m_device_, &copyinfo);
+        vkCopyImageToMemoryEXT(m_vdev_->getLogicalDevice(), &copyinfo);
 #else
     (void)(ptr);
 #endif

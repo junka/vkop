@@ -16,6 +16,7 @@ set(TESTS
     ReluTest
     BatchNorm2dTest
     SoftmaxTest
+    FloorTest
 )
 
 foreach(TEST ${TESTS})

@@ -119,6 +119,18 @@ private:
         }
         return dict;
     }
+    static std::vector<uint8_t> readArray(const char*& ptr, const char* end) {
+        std::string dtype = readString(ptr, end);
+        std::vector<uint32_t> shape = readDims(ptr, end);
+        uint64_t size = readUint64(ptr, end);
+
+        if (ptr + size > end) throw std::runtime_error("Unexpected end of file");
+        std::vector<uint8_t> data(size);
+        std::memcpy(data.data(), ptr, size);
+        ptr += size;
+
+        return data;
+    }
 
 };
 

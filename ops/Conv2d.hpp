@@ -122,30 +122,27 @@ class Conv2d : public Operator {
 #endif
         }
 
-        outputImage_ =
-            output->make_vkimg(m_phydev_, m_dev_,
-                               VK_IMAGE_USAGE_STORAGE_BIT |
-                                   VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+        outputImage_ = output->make_vkimg(
+            m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
         inputImage_ = input->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         weightImage_ = weight->make_vkimg(
-            m_phydev_, m_dev_,
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         biasImage_ = std::make_shared<VulkanImage>(
-            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
             VkExtent3D{static_cast<uint32_t>(out_channel), 1, 1},
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_phydev_, m_dev_->getComputeQueueFamilyIndex(), device,
+            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
             sizeof(conv2d::GPUConv2dParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -213,7 +210,8 @@ class Conv2d : public Operator {
         }
         prepare(inputs, outputs);
 
-        auto *para = paramBuffer_->getMappedMemory<conv2d::GPUConv2dParam>();
+        auto *para = static_cast<conv2d::GPUConv2dParam *>(
+            paramBuffer_->getMappedMemory());
         // vkimage params
         para->outImgSize[0] = realwidth;
         para->outImgSize[1] = realheight;
