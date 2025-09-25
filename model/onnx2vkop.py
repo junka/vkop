@@ -38,6 +38,7 @@ class VkModel:
             f.write(struct.pack('I', len(self.nodes)))
             for node in self.nodes:
                 self._write_string(f, node['op_type'])
+                self._write_string(f, node['name'])
                 self._write_dict(f, node['attributes'])  # Attributes
                 self._write_list_with_shapes(f, node['inputs'])
                 self._write_list_with_shapes(f, node['outputs'])
@@ -186,16 +187,42 @@ def parse_onnx_model(onnx_path):
                     if inp.name == input_name:
                         input_tensor = inp
                         break
-            # if input_tensor is None:
-            #     for initializer in graph.initializer:
-            #         if initializer.name == input_name:
-            #             input_tensor = initializer
-            #             break
+            if input_tensor is None:
+                for out in graph.output:
+                    if out.name == input_name:
+                        input_tensor = out
+                        break
+            if input_tensor is None:
+                for initializer in graph.initializer:
+                    if initializer.name == input_name:
+                        data_type_map = {
+                            1: onnx.TensorProto.FLOAT,
+                            2: onnx.TensorProto.UINT8,
+                            3: onnx.TensorProto.INT8,
+                            4: onnx.TensorProto.UINT16,
+                            5: onnx.TensorProto.INT16,
+                            6: onnx.TensorProto.INT32,
+                            7: onnx.TensorProto.INT64,
+                            8: onnx.TensorProto.STRING,
+                            9: onnx.TensorProto.BOOL,
+                            10: onnx.TensorProto.FLOAT16,
+                            11: onnx.TensorProto.DOUBLE,
+                            12: onnx.TensorProto.UINT32,
+                            13: onnx.TensorProto.UINT64,
+                            14: onnx.TensorProto.COMPLEX64,
+                            15: onnx.TensorProto.COMPLEX128,
+                            16: onnx.TensorProto.BFLOAT16
+                        }
+                        data_type = data_type_map.get(initializer.data_type, onnx.TensorProto.UNDEFINED)
+                        input_tensor = onnx.helper.make_tensor_value_info(
+                            initializer.name, data_type, initializer.dims
+                        )
+                        break
+
             if input_tensor is None:
                 print(f"Warning: Input tensor {input_name} not found in graph.")
                 continue
             tensor_type = input_tensor.type.tensor_type
-            print(tensor_type)
             shape_dims = [
                 dim.dim_value if dim.HasField("dim_value") else 1
                 for dim in tensor_type.shape.dim
@@ -232,6 +259,7 @@ def parse_onnx_model(onnx_path):
 
         vk_model.nodes.append({
             'op_type': node.op_type,
+            'name': node.name,
             'attributes': attributes,
             'inputs': inputs_with_shape,
             'outputs': outputs_with_shape

@@ -18,8 +18,8 @@ namespace vkop {
 // VulkanImage class inheriting from VulkanResource
 class VulkanImage : public VulkanResource {
   public:
-    VulkanImage(std::shared_ptr<VulkanDevice> &vdev, uint32_t queueFamilyIndex,
-                VkExtent3D dim, VkImageUsageFlags usage,
+    VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
+                VkImageUsageFlags usage,
                 VkMemoryPropertyFlags requireProperties,
                 VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT,
                 int ext_fd = -1);

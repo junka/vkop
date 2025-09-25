@@ -89,6 +89,7 @@ int main(int argc, char *argv[]) {
         std::cout << "Nodes:" << std::endl;
         for (const auto& node : model.nodes) {
             std::cout << "  OpType: " << node.op_type;
+            std::cout << "  Name: " << node.name;
             if (!node.attributes.empty()) {
                 std::cout << ", Attributes: {";
                 for (const auto& attr : node.attributes) {
@@ -116,27 +117,27 @@ int main(int argc, char *argv[]) {
             std::cout << std::endl;
         }
 
-        std::cout << "Initializers:" << std::endl;
-        for (const auto& [name, initializer] : model.initializers) {
-            std::cout << name << ", [";
-            for (size_t i = 0; i < initializer.dims.size(); ++i) {
-                std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
-            }
-            std::cout << "], DType: " << initializer.dtype << std::endl;
-        }
+        // std::cout << "Initializers:" << std::endl;
+        // for (const auto& [name, initializer] : model.initializers) {
+        //     std::cout << name << ", [";
+        //     for (size_t i = 0; i < initializer.dims.size(); ++i) {
+        //         std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
+        //     }
+        //     std::cout << "], DType: " << initializer.dtype << std::endl;
+        // }
 
         std::vector<std::shared_ptr<Tensor<float>>> inputs;
         std::vector<std::shared_ptr<Tensor<float>>> outputs;
+        std::unordered_map<std::string, std::shared_ptr<Tensor<float>>> tensor_map;
         for (const auto& i : model.inputs) {
             auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
-        }
-        for (const auto& i : inputs) {
-            i->printTensorShape();
+            tensor_map[i.name] = t;
         }
         for (const auto& o: model.outputs) {
             auto t = std::make_shared<Tensor<float>>(o.dims);
             outputs.push_back(t);
+            tensor_map[o.name] = t;
         }
 
         for (const auto& n: model.nodes) {
@@ -149,8 +150,36 @@ int main(int argc, char *argv[]) {
                 // make it as input for next ops
                 continue;
             }
+            std::vector<std::shared_ptr<Tensor<float>>> node_inputs;
+            std::vector<std::shared_ptr<Tensor<float>>> node_outputs;
+            if (!n.inputs.empty()) {
+                for (const auto& in_shape : n.inputs) {
+                    if (tensor_map.find(in_shape.name) != tensor_map.end()) {
+                        node_inputs.push_back(tensor_map[in_shape.name]);
+                        std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << std::endl;
+                    } else {
+                        auto t = std::make_shared<Tensor<float>>(in_shape.dims);
+                        tensor_map[in_shape.name] = t;
+                        node_inputs.push_back(t);
+                        std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
+                    }
+                }
+            }
+            if (!n.outputs.empty()) {
+                for (const auto& out_shape : n.outputs) {
+                    if (tensor_map.find(out_shape.name) != tensor_map.end()) {
+                        node_outputs.push_back(tensor_map[out_shape.name]);
+                        std::cout << "find output tensor " << out_shape.name << " for op " << n.op_type << std::endl;
+                    } else {
+                        auto t = std::make_shared<Tensor<float>>(out_shape.dims);
+                        tensor_map[out_shape.name] = t;
+                        node_outputs.push_back(t);
+                        std::cout << "create empty tensor " << out_shape.name << " for op " << n.op_type << std::endl;
+                    }
+                }
+            }
             auto op = OperatorFactory::get_instance().create(t);
-            op->execute(inputs, outputs);
+            op->execute(node_inputs, node_outputs);
             std::cout << "run ops " << n.op_type << std::endl;
         }
     } catch (const std::exception& ex) {

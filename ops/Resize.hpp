@@ -55,8 +55,8 @@ class Resize : public Operator {
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
-            sizeof(resize::GpuResizeParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            m_dev_, sizeof(resize::GpuResizeParam),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 #ifdef VK_EXT_host_image_copy

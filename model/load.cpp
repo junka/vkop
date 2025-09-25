@@ -56,6 +56,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
     for (uint32_t i = 0; i < num_nodes; ++i) {
         Node node;
         node.op_type = readString(ptr, end);
+        node.name = readString(ptr, end);
         node.attributes = readDict(ptr, end);
         node.inputs = readListWithShapes(ptr, end);
         node.outputs = readListWithShapes(ptr, end);

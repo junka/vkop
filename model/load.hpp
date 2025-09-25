@@ -19,6 +19,7 @@ struct Shape {
 
 struct Node {
     std::string op_type;
+    std::string name;
     std::unordered_map<std::string, std::string> attributes;
     std::vector<Shape> inputs;
     std::vector<Shape> outputs;

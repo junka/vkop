@@ -27,7 +27,6 @@ template <typename T> class Tensor {
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
     }
 
     // nchw in vector
@@ -109,8 +108,8 @@ template <typename T> class Tensor {
     int size() { return size_; }
     int num_elements() { return size_ / ele_size_; }
 
-    void *map() { return nullptr; }
-    void unmap() { (void)vkobj_; }
+    // void *map() { return nullptr; }
+    // void unmap() { (void)vkobj_; }
 
     /**
      * @brief Converts a tensor into an RGBA format suitable for Vulkan image
@@ -244,7 +243,7 @@ template <typename T> class Tensor {
     std::shared_ptr<VulkanImage> make_vkimg(std::shared_ptr<VulkanDevice> &vd,
                                             uint32_t flags) {
         auto vkimg = std::make_shared<VulkanImage>(
-            vd, vd->getComputeQueueFamilyIndex(),
+            vd,
             VkExtent3D{static_cast<uint32_t>(w_ * UP_DIV(c_, 4)),
                        static_cast<uint32_t>(h_ * n_), 1},
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,

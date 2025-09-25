@@ -5,13 +5,11 @@
 
 namespace vkop {
 
-VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev,
-                         const uint32_t queueFamilyIndex, VkExtent3D dim,
+VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
                          VkImageUsageFlags usage,
                          VkMemoryPropertyFlags requireProperties,
                          VkFormat format, int ext_fd)
-    : VulkanResource(vdev, queueFamilyIndex), m_dim_(dim), m_format_(format),
-      m_usage_(usage) {
+    : VulkanResource(vdev), m_dim_(dim), m_format_(format), m_usage_(usage) {
     if (m_format_ == VK_FORMAT_UNDEFINED) {
         throw std::runtime_error("Invalid Vulkan image format.");
     }
@@ -220,14 +218,12 @@ void VulkanImage::createStagingBuffer(bool writeonly) {
     auto size = getImageSize();
     if (writeonly) {
         m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_vdev_, m_queueFamilyIndex_, size,
-            VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            m_vdev_, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     } else {
         m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_vdev_, m_queueFamilyIndex_, size,
-            VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            m_vdev_, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
     }
@@ -255,7 +251,8 @@ void VulkanImage::createImage() {
     image_create_info.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_create_info.queueFamilyIndexCount = 1;
-    image_create_info.pQueueFamilyIndices = &m_queueFamilyIndex_;
+    uint32_t qidx = m_vdev_->getComputeQueueFamilyIndex();
+    image_create_info.pQueueFamilyIndices = &qidx;
 #ifdef USE_VMA
     auto ret =
         m_vdev_->getVMA()->createImage(&image_create_info, &m_vma_image_);

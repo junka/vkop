@@ -13,9 +13,8 @@ enum class ResourceType { VK_IMAGE, VK_BUFFER };
 // Abstract base class for Vulkan resources
 class VulkanResource {
   public:
-    explicit VulkanResource(std::shared_ptr<VulkanDevice> &vdev,
-                            const uint32_t queueFamilyIndex)
-        : m_vdev_(vdev), m_queueFamilyIndex_(queueFamilyIndex) {}
+    explicit VulkanResource(std::shared_ptr<VulkanDevice> &vdev)
+        : m_vdev_(vdev) {}
 
     virtual ~VulkanResource() {
 #ifndef USE_VMA
@@ -96,7 +95,6 @@ class VulkanResource {
 
   protected:
     std::shared_ptr<VulkanDevice> m_vdev_;
-    const uint32_t m_queueFamilyIndex_;
 
   private:
 #ifndef USE_VMA

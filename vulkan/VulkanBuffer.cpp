@@ -6,10 +6,9 @@
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
-                           const uint32_t queueFamilyIndex, VkDeviceSize size,
-                           VkBufferUsageFlags usage,
+                           VkDeviceSize size, VkBufferUsageFlags usage,
                            VkMemoryPropertyFlags requireProperties, int ext_fd)
-    : VulkanResource(vdev, queueFamilyIndex), m_size_(size) {
+    : VulkanResource(vdev), m_size_(size) {
     createBuffer(size, usage);
 #ifndef USE_VMA
 #ifdef VK_KHR_get_memory_requirements2
@@ -60,7 +59,8 @@ void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     buffer_info.queueFamilyIndexCount = 1;
-    buffer_info.pQueueFamilyIndices = &m_queueFamilyIndex_;
+    uint32_t qidx = m_vdev_->getComputeQueueFamilyIndex();
+    buffer_info.pQueueFamilyIndices = &qidx;
 #ifdef USE_VMA
     auto ret = m_vdev_->getVMA()->createBuffer(&buffer_info, &m_vma_buffer_);
 #else

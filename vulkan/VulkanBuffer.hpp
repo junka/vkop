@@ -12,12 +12,9 @@ namespace vkop {
 
 class VulkanBuffer : public VulkanResource {
   public:
-    VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, uint32_t queueFamilyIndex,
-                 VkDeviceSize size, VkBufferUsageFlags usage,
-                 VkMemoryPropertyFlags properties, int ext_fd = -1);
-    // VulkanBuffer(VkPhysicalDevice &physicalDevice, uint32_t queueFamilyIndex,
-    //              VkDevice &device, VkDeviceSize size, VkBufferUsageFlags
-    //              usage);
+    VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, VkDeviceSize size,
+                 VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
+                 int ext_fd = -1);
     ~VulkanBuffer() override;
 
     VkBuffer getBuffer() const;

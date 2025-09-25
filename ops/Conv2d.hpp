@@ -135,15 +135,14 @@ class Conv2d : public Operator {
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         biasImage_ = std::make_shared<VulkanImage>(
-            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
-            VkExtent3D{static_cast<uint32_t>(out_channel), 1, 1},
+            m_dev_, VkExtent3D{static_cast<uint32_t>(out_channel), 1, 1},
             VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                 VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, m_dev_->getComputeQueueFamilyIndex(),
-            sizeof(conv2d::GPUConv2dParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+            m_dev_, sizeof(conv2d::GPUConv2dParam),
+            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
