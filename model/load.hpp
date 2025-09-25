@@ -92,6 +92,22 @@ private:
         return dims;
     }
 
+    template<typename T>
+    static std::vector<T> readList(const char*& ptr, const char* end) {
+        uint32_t count = readUint32(ptr, end);
+        std::vector<T> list(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            if (std::is_same<T, float>::value) {
+                list[i] = static_cast<T>(readFloat32(ptr, end));
+            } else if (std::is_same<T, uint32_t>::value) {
+                list[i] = static_cast<T>(readUint32(ptr, end));
+            } else {
+                throw std::runtime_error("Unsupported type for readList");
+            }
+        }
+        return list;
+    }
+
     static std::vector<Shape> readListWithShapes(const char*& ptr, const char* end) {
         uint32_t count = readUint32(ptr, end);
         std::vector<Shape> shapes(count);
@@ -115,6 +131,22 @@ private:
                 value = std::to_string(readUint64(ptr, end));
             } else if (tag == 2) {
                 value = std::to_string(readFloat64(ptr, end));
+            } else if (tag == 3) {
+                auto l = readList<uint32_t>(ptr, end);
+                value = "[" + std::to_string(l[0]);
+                for (size_t i = 1; i < l.size(); ++i) {
+                    value += ", " + std::to_string(l[i]);
+                }
+                value += "]";
+            } else if (tag == 4) {
+                auto l = readList<float>(ptr, end);
+                value = "[" + std::to_string(l[0]);
+                for (size_t i = 1; i < l.size(); ++i) {
+                    value += ", " + std::to_string(l[i]);
+                }
+                value += "]";
+            } else {
+                throw std::runtime_error("Unknown attribute type tag");
             }
             dict[key] = value;
         }

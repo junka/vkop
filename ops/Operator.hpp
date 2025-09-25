@@ -2,6 +2,8 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -32,6 +34,16 @@ class Operator {
         m_phydev_ = phydev;
         m_dev_ = std::move(dev);
         m_cmdpool_ = std::move(cmdpool);
+    }
+
+    virtual void setAttribute(
+        const std::unordered_map<std::string, std::string> &attributes) {
+        if (!attributes.empty()) {
+            for (const auto &attr : attributes) {
+                std::cout << "Warning: Unused attribute " << attr.first
+                          << " in operator." << std::endl;
+            }
+        }
     }
 
     virtual void

@@ -27,6 +27,7 @@ template <typename T> class Tensor {
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
         size_ = ele_size_ * n_ * c_ * h_ * w_;
+        data_.resize(n_ * c_ * h_ * w_);
     }
 
     // nchw in vector

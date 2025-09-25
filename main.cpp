@@ -179,6 +179,9 @@ int main(int argc, char *argv[]) {
                 }
             }
             auto op = OperatorFactory::get_instance().create(t);
+            if (!n.attributes.empty()) {
+                op->setAttribute(n.attributes);
+            }
             op->execute(node_inputs, node_outputs);
             std::cout << "run ops " << n.op_type << std::endl;
         }

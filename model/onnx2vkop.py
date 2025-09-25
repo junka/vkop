@@ -18,13 +18,11 @@ class VkModel:
             outputs (list): A list to store the output nodes of the graph.
             nodes (list): A list to store all the nodes in the graph.
             initializers (dict): A dictionary to store the initial values of the graph's parameters.
-            graph_edges (list): A list to store the relationships or edges between nodes in the graph.
         """
         self.inputs = []
         self.outputs = []
         self.nodes = []
         self.initializers = {}
-        self.graph_edges = []  # 新增字段，用于保存图关系
 
     def save_to_binary(self, file_path):
         with open(file_path, 'wb') as f:
@@ -42,12 +40,6 @@ class VkModel:
                 self._write_dict(f, node['attributes'])  # Attributes
                 self._write_list_with_shapes(f, node['inputs'])
                 self._write_list_with_shapes(f, node['outputs'])
-
-            # # Save graph edges (optional, for better visualization/debugging)
-            # f.write(struct.pack('I', len(self.graph_edges)))
-            # for edge in self.graph_edges:
-            #     self._write_string(f, edge['from'])
-            #     self._write_string(f, edge['to'])
 
             # Save initializers (name -> numpy array)
             f.write(struct.pack('I', len(self.initializers)))
@@ -74,6 +66,8 @@ class VkModel:
         for item in lst:
             if isinstance(item, int):
                 f.write(struct.pack('I', item))  # For dimensions
+            elif isinstance(item, float):
+                f.write(struct.pack('d', item))  # For float attributes
             else:
                 VkModel._write_string(f, item)  # For names
 
@@ -91,6 +85,15 @@ class VkModel:
             elif isinstance(value, float):
                 f.write(b'\x02')  # Tag for float
                 f.write(struct.pack('d', value))
+            elif isinstance(value, list):
+                if all(isinstance(v, int) for v in value):
+                    f.write(b'\x03')  # Tag for list of ints
+                    VkModel._write_list(f, value)
+                elif all(isinstance(v, float) for v in value):
+                    f.write(b'\x04')  # Tag for list of floats
+                    VkModel._write_list(f, value)
+                else:
+                    raise ValueError(f"Unsupported list type in attribute: {key}")
 
     @staticmethod
     def _write_array(f, arr):
@@ -166,12 +169,20 @@ def parse_onnx_model(onnx_path):
         print("Processing node:", node.name, "of type:", node.op_type)
         attributes = {}
         for attr in node.attribute:
-            if attr.HasField('i'):
+            if attr.type == onnx.AttributeProto.INT:
                 attributes[attr.name] = attr.i
-            elif attr.HasField('f'):
+            elif attr.type == onnx.AttributeProto.FLOAT:
                 attributes[attr.name] = attr.f
-            elif attr.HasField('s'):
+            elif attr.type == onnx.AttributeProto.STRING:
                 attributes[attr.name] = attr.s.decode('utf-8')
+            elif attr.type == onnx.AttributeProto.TENSOR:
+                attributes[attr.name] = numpy_helper.to_array(attr.t)
+            elif attr.type == onnx.AttributeProto.INTS:
+                attributes[attr.name] = list(attr.ints)
+            elif attr.type == onnx.AttributeProto.FLOATS:
+                attributes[attr.name] = list(attr.floats)
+            else:
+                print(f"Warning: Unsupported attribute type {attr.type} for attribute {attr.name}")
 
         inputs_with_shape = []
         for input_name in node.input:
@@ -264,12 +275,6 @@ def parse_onnx_model(onnx_path):
             'inputs': inputs_with_shape,
             'outputs': outputs_with_shape
         })
-
-        # Save graph edges
-        for input_name in node.input:
-            vk_model.graph_edges.append({'from': input_name, 'to': node.name})
-        for output_name in node.output:
-            vk_model.graph_edges.append({'from': node.name, 'to': output_name})
 
     # Initializers (parameters)
     for initializer in graph.initializer:
