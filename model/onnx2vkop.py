@@ -97,14 +97,30 @@ class VkModel:
 
     @staticmethod
     def _write_array(f, arr):
-        arr = np.ascontiguousarray(arr)
-        dtype = arr.dtype.name
-        shape = list(arr.shape)
-        VkModel._write_string(f, dtype)
-        # print("Writing array of dtype:", dtype, "and shape:", shape)
-        f.write(struct.pack('I', len(shape)))
-        for dim in shape:
-            f.write(struct.pack('I', dim))
+        data_type_map = {
+            1: "float32",
+            2: "uint8",
+            3: "int8",
+            4: "uint16",
+            5: "int16",
+            6: "int32",
+            7: "int64",
+            8: "string",
+            9: "bool",
+            10: "float16",
+            11: "float64",
+            12: "uint32",
+            13: "uint64",
+            14: "complex64",
+            15: "complex128",
+            16: "bfloat16"
+        }
+        data_type = data_type_map.get(arr.data_type, onnx.TensorProto.UNDEFINED)
+        VkModel._write_string(f, data_type)
+        VkModel._write_list(f, list(arr.dims))
+        total_elements = np.prod(arr.dims)
+        print("Array shape:", arr.dims, "Data type:", data_type, "Total elements:", total_elements)
+        arr = np.ascontiguousarray(numpy_helper.to_array(arr))
         data = arr.tobytes()
         f.write(struct.pack('Q', len(data)))
         f.write(data)
@@ -279,8 +295,7 @@ def parse_onnx_model(onnx_path):
     # Initializers (parameters)
     for initializer in graph.initializer:
         name = initializer.name
-        arr = numpy_helper.to_array(initializer)
-        vk_model.initializers[name] = arr
+        vk_model.initializers[name] = initializer
 
     return vk_model
 

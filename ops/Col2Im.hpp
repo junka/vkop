@@ -19,7 +19,6 @@ struct GpuCol2ImParam {
     ivec4 outShape;
     int groupSize;
     int totalGroups;
-    int axis; // 0: N, 1: C, 2: H, 3: W
 };
 
 } // namespace col2im
@@ -27,8 +26,6 @@ struct GpuCol2ImParam {
 class Col2im : public Operator {
   public:
     Col2im() = default;
-
-    void setAttribute(int axis = 1) { axis_ = axis; }
 
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
@@ -116,15 +113,7 @@ class Col2im : public Operator {
         para->outShape[1] = out_height;
         para->outShape[2] = out_width;
         para->outShape[3] = depth;
-        int total_groups = 1;
-        for (int i = 0; i < 4; ++i) {
-            if (i != axis_) {
-                total_groups *= input_shape[i];
-            }
-        }
-        para->groupSize = input_shape[axis_];
-        para->totalGroups = total_groups;
-        para->axis = axis_;
+
         paramBuffer_->unmapMemory();
 
         VkDevice device = m_dev_->getLogicalDevice();
@@ -184,8 +173,6 @@ class Col2im : public Operator {
         std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
 
   private:
-    int axis_;
-
     std::shared_ptr<VulkanImage> outputImage_;
     std::shared_ptr<VulkanImage> inputImage_;
 

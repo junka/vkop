@@ -29,7 +29,10 @@ struct Initializer {
     std::string name;
     std::string dtype;
     std::vector<uint32_t> dims;
-    const void* data;
+    std::vector<float> dataf;
+    std::vector<int32_t> datai;
+    std::vector<int64_t> dataii;
+
 };
 
 class VkModel {
@@ -44,7 +47,7 @@ private:
     void loadFromBinary(const std::string& filePath);
 
     static uint32_t readUint32(const char*& ptr, const char* end) {
-        if (ptr + sizeof(uint32_t) > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + sizeof(uint32_t) > end) throw std::runtime_error("Unexpected end of file u32");
         uint32_t value;
         std::memcpy(&value, ptr, sizeof(uint32_t));
         ptr += sizeof(uint32_t);
@@ -52,7 +55,7 @@ private:
     }
 
     static uint64_t readUint64(const char*& ptr, const char* end) {
-        if (ptr + sizeof(uint64_t) > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + sizeof(uint64_t) > end) throw std::runtime_error("Unexpected end of file u64");
         uint64_t value;
         std::memcpy(&value, ptr, sizeof(uint64_t));
         ptr += sizeof(uint64_t);
@@ -60,7 +63,7 @@ private:
     }
 
     static float readFloat32(const char*& ptr, const char* end) {
-        if (ptr + sizeof(float) > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + sizeof(float) > end) throw std::runtime_error("Unexpected end of file f32");
         float value;
         std::memcpy(&value, ptr, sizeof(float));
         ptr += sizeof(float);
@@ -68,7 +71,7 @@ private:
     }
 
     static double readFloat64(const char*& ptr, const char* end) {
-        if (ptr + sizeof(double) > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + sizeof(double) > end) throw std::runtime_error("Unexpected end of file f64");
         double value;
         std::memcpy(&value, ptr, sizeof(double));
         ptr += sizeof(double);
@@ -77,7 +80,7 @@ private:
 
     static std::string readString(const char*& ptr, const char* end) {
         uint32_t length = readUint32(ptr, end);
-        if (ptr + length > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + length > end) throw std::runtime_error("Unexpected end of file str");
         std::string str(ptr, length);
         ptr += length;
         return str;
@@ -157,7 +160,7 @@ private:
         std::vector<uint32_t> shape = readDims(ptr, end);
         uint64_t size = readUint64(ptr, end);
 
-        if (ptr + size > end) throw std::runtime_error("Unexpected end of file");
+        if (ptr + size > end) throw std::runtime_error("Unexpected end of file array");
         std::vector<uint8_t> data(size);
         std::memcpy(data.data(), ptr, size);
         ptr += size;

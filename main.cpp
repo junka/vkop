@@ -158,9 +158,37 @@ int main(int argc, char *argv[]) {
                         node_inputs.push_back(tensor_map[in_shape.name]);
                         std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << std::endl;
                     } else {
-                        auto t = std::make_shared<Tensor<float>>(in_shape.dims);
-                        tensor_map[in_shape.name] = t;
-                        node_inputs.push_back(t);
+                        if (model.initializers.find(in_shape.name) != model.initializers.end()) {
+                            auto& init = model.initializers.at(in_shape.name);
+                            if (init.dims != in_shape.dims) {
+                                throw std::runtime_error("Initializer dims do not match for " + in_shape.name);
+                            }
+                            if (init.dtype == "int64") {
+                                auto t = std::make_shared<Tensor<float>>(in_shape.dims);
+                                for (int i = 0; i < t->num_elements(); ++i) {
+                                    t->data()[i] = static_cast<float>(init.dataii[i]);
+                                }
+                                tensor_map[in_shape.name] = t;
+                                node_inputs.push_back(t);
+                                std::cout << "load int64 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
+                            } else if (init.dtype == "int32") {
+                                auto t = std::make_shared<Tensor<float>>(in_shape.dims);
+                                for (int i = 0; i < t->num_elements(); ++i) {
+                                    t->data()[i] = static_cast<float>(init.dataii[i]);
+                                }
+                                tensor_map[in_shape.name] = t;
+                                node_inputs.push_back(t);
+                                std::cout << "load int32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
+                            } else if (init.dtype == "float32") {
+                                auto t = std::make_shared<Tensor<float>>(in_shape.dims);
+                                std::memcpy(t->data(), init.dataf.data(), t->num_elements() * sizeof(float));
+                                tensor_map[in_shape.name] = t;
+                                node_inputs.push_back(t);
+                                std::cout << "load float32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
+                            } else {
+                                throw std::runtime_error("Only float32 initializer is supported for now " + init.dtype);
+                            }
+                        }
                         std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
                     }
                 }

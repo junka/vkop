@@ -71,7 +71,23 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         initializer.dtype = readString(ptr, end);
         initializer.dims = readDims(ptr, end);
         uint64_t data_size = readUint64(ptr, end);
-        initializer.data = ptr;
+        printf("Initializer %s, dtype: %s, dim %d, %d, %d, %d, size: %lu bytes\n", initializer.name.c_str(), initializer.dtype.c_str(), initializer.dims[0], initializer.dims[1], initializer.dims[2], initializer.dims[3], data_size);
+        if (initializer.dtype == "float32") {
+            uint64_t num_elements = data_size / sizeof(float);
+            initializer.dataf.resize(num_elements);
+            printf("Expect %lu float32 elements\n", num_elements);
+            std::memcpy(initializer.dataf.data(), ptr, data_size);
+        } else if (initializer.dtype == "int32") {
+            uint64_t num_elements = data_size / sizeof(int32_t);
+            initializer.datai.resize(num_elements);
+            std::memcpy(initializer.datai.data(), ptr, data_size);
+        } else if (initializer.dtype == "int64") {
+            uint64_t num_elements = data_size / sizeof(int64_t);
+            initializer.dataii.resize(num_elements);
+            std::memcpy(initializer.dataii.data(), ptr, data_size);
+        } else {
+            throw std::runtime_error("Unsupported initializer dtype: " + initializer.dtype);
+        }
         ptr += data_size;
         this->initializers[initializer.name] = std::move(initializer);
     }

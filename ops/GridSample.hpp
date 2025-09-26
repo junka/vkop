@@ -44,14 +44,42 @@ class GridSample : public Operator {
   public:
     GridSample() = default;
 
-    void setAttribute(
-        gridsample::InterpolationMode interp_mode =
-            gridsample::InterpolationMode::BILINEAR,
-        gridsample::PaddingMode pad_mode = gridsample::PaddingMode::ZEROS,
-        bool align_corners = false) {
-        interpolation_mode_ = interp_mode;
-        padding_mode_ = pad_mode;
-        align_corners_ = align_corners;
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        attributes.find("align_corners") != attributes.end()
+            ? align_corners_ = (attributes.at("align_corners") == "1" ||
+                                attributes.at("align_corners") == "true")
+            : align_corners_ = false;
+        if (attributes.find("interpolation_mode") != attributes.end()) {
+            std::string mode = attributes.at("interpolation_mode");
+            if (mode == "linear" || mode == "bilinear") {
+                interpolation_mode_ = gridsample::InterpolationMode::BILINEAR;
+            } else if (mode == "nearest") {
+                interpolation_mode_ = gridsample::InterpolationMode::NEAREST;
+            } else {
+                LOG_ERROR("Unsupported interpolation_mode: " + mode);
+                throw std::invalid_argument("Unsupported interpolation_mode: " +
+                                            mode);
+            }
+        } else {
+            interpolation_mode_ = gridsample::InterpolationMode::BILINEAR;
+        }
+        if (attributes.find("padding_mode") != attributes.end()) {
+            std::string mode = attributes.at("padding_mode");
+            if (mode == "zeros") {
+                padding_mode_ = gridsample::PaddingMode::ZEROS;
+            } else if (mode == "border") {
+                padding_mode_ = gridsample::PaddingMode::BORDER;
+            } else if (mode == "reflection") {
+                padding_mode_ = gridsample::PaddingMode::REFLECTION;
+            } else {
+                LOG_ERROR("Unsupported padding_mode: " + mode);
+                throw std::invalid_argument("Unsupported padding_mode: " +
+                                            mode);
+            }
+        } else {
+            padding_mode_ = gridsample::PaddingMode::ZEROS;
+        }
     }
 
     template <typename T>

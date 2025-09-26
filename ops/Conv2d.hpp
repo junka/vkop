@@ -3,6 +3,7 @@
 #define OPS_OCONV2D_HPP_
 
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "Operator.hpp"
@@ -35,7 +36,7 @@ struct GPUConv2dParam {
     int in_channels;
     int out_channels;
 
-    ivec2 kernel_size;
+    ivec2 kernel_shape;
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
@@ -51,54 +52,84 @@ class Conv2d : public Operator {
   public:
     Conv2d() = default;
 
-    explicit Conv2d(
-        int in_channels, int out_channels, int kernel_size, int stride,
-        int padding, int dilation = 1, int groups = 1, bool bias = true,
-        conv2d::PaddingMode padding_mode = conv2d::PaddingMode::ZEROS)
-        : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_size_({kernel_size, kernel_size}), stride_({stride, stride}),
-          padding_({padding, padding}), dilation_({dilation, dilation}),
-          groups_(groups), bias_(bias), padding_mode_(padding_mode) {}
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("auto_pad ") != attributes.end()) {
+            std::string auto_pad = attributes.at("auto_pad");
+            if (auto_pad == "VALID") {
+                pads_ = {0, 0};
+            } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+                // SAME would let out_h = ceil(in_h/stride_h)
+                // so padding_h = ((out_h-1)*stride_h + (kernel_h-1)*dilations_h
+                // + 1 - in_h)/2 here we just set padding to kernel_size/2, and
+                // only support stride=1,dilation=1 case
+                if (strides_[0] != 1 || strides_[1] != 1 ||
+                    dilations_[0] != 1 || dilations_[1] != 1) {
+                    throw std::invalid_argument("Only support stride=1 and "
+                                                "dilation=1 for SAME auto_pad");
+                }
+                pads_ = {kernel_shape_[0] / 2, kernel_shape_[1] / 2};
+            } else if (auto_pad == "NOTSET") {
+                // do nothing
+            } else {
+                throw std::invalid_argument("Unsupported auto_pad: " +
+                                            auto_pad);
+            }
+        }
+        if (attributes.find("dilations") != attributes.end()) {
+            std::string dila_str = attributes.at("dilations");
+            if (dila_str.find(',') != std::string::npos) {
+                dilations_ = parse_attr_list(dila_str);
+            } else {
+                int d = std::stoi(dila_str);
+                dilations_ = {d, d};
+            }
+        } else {
+            dilations_ = {1, 1};
+        }
 
-    explicit Conv2d(
-        int in_channels, int out_channels, int kernel_h, int kernel_w,
-        int stride_h, int stride_w, int padding_h, int padding_w,
-        int dilation_h = 1, int dilation_w = 1, int groups = 1,
-        bool bias = true,
-        conv2d::PaddingMode padding_mode = conv2d::PaddingMode::ZEROS)
-        : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_size_({kernel_h, kernel_w}), stride_({stride_h, stride_w}),
-          padding_({padding_h, padding_w}), dilation_({dilation_h, dilation_w}),
-          groups_(groups), bias_(bias), padding_mode_(padding_mode) {}
+        if (attributes.find("group") != attributes.end()) {
+            groups_ = std::stoi(attributes.at("group"));
+        } else {
+            groups_ = 1;
+        }
 
-    explicit Conv2d(
-        int in_channels, int out_channels,
-        std::pair<int, int> kernel_size = {1, 1},
-        std::pair<int, int> stride = {1, 1},
-        std::pair<int, int> padding = {0, 0},
-        std::pair<int, int> dilation = {1, 1}, int groups = 1, bool bias = true,
-        conv2d::PaddingMode padding_mode = conv2d::PaddingMode::ZEROS)
-        : in_channels_(in_channels), out_channels_(out_channels),
-          kernel_size_(std::move(kernel_size)), stride_(std::move(stride)),
-          padding_(std::move(padding)), dilation_(std::move(dilation)),
-          groups_(groups), bias_(bias), padding_mode_(padding_mode) {}
+        if (attributes.find("kernel_shape") != attributes.end()) {
+            std::string kernel_str = attributes.at("kernel_shape");
+            if (kernel_str.find(',') != std::string::npos) {
+                kernel_shape_ = parse_attr_list(kernel_str);
+            } else {
+                int k = std::stoi(kernel_str);
+                kernel_shape_ = {k, k};
+            }
+        } else {
+            // should be inferred from weight shape
+            kernel_shape_ = {0, 0};
+        }
 
-    void setAttribute(
-        int in_channels, int out_channels,
-        std::pair<int, int> kernel_size = {1, 1},
-        std::pair<int, int> stride = {1, 1},
-        std::pair<int, int> padding = {0, 0},
-        std::pair<int, int> dilation = {1, 1}, int groups = 1, bool bias = true,
-        conv2d::PaddingMode padding_mode = conv2d::PaddingMode::ZEROS) {
-        in_channels_ = in_channels;
-        out_channels_ = out_channels;
-        kernel_size_ = std::move(kernel_size);
-        stride_ = std::move(stride);
-        padding_ = std::move(padding);
-        dilation_ = std::move(dilation);
-        groups_ = groups;
-        bias_ = bias;
-        padding_mode_ = padding_mode;
+        if (attributes.find("pads") != attributes.end()) {
+            std::string pad_str = attributes.at("pads");
+            if (pad_str.find(',') != std::string::npos) {
+                pads_ = parse_attr_list(pad_str);
+            } else {
+                int p = std::stoi(pad_str);
+                pads_ = {p, p};
+            }
+        } else {
+            pads_ = {0, 0};
+        }
+
+        if (attributes.find("strides") != attributes.end()) {
+            std::string stride_str = attributes.at("strides");
+            if (stride_str.find(',') != std::string::npos) {
+                strides_ = parse_attr_list(stride_str);
+            } else {
+                int s = std::stoi(stride_str);
+                strides_ = {s, s};
+            }
+        } else {
+            strides_ = {1, 1};
+        }
     }
 
     template <typename T>
@@ -106,7 +137,6 @@ class Conv2d : public Operator {
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
         auto weight = inputs[1];
-        // core::Tensor<T> *bias = inputs[2];
 
         auto output = outputs[0];
         auto input_shape = input->getTensorShape();
@@ -180,7 +210,10 @@ class Conv2d : public Operator {
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
         auto weight = inputs[1];
-        auto bias = inputs[2];
+        std::shared_ptr<core::Tensor<T>> bias;
+        if (inputs.size() > 2) {
+            bias = inputs[2];
+        }
         auto output = outputs[0];
 
         auto input_shape = input->getTensorShape();
@@ -193,13 +226,13 @@ class Conv2d : public Operator {
 
         int out_batch = batch;
         int out_depth = weight_shape[0];
-        int out_height = (in_height + 2 * padding_.first -
-                          dilation_.first * (weight_shape[2] - 1) - 1) /
-                             stride_.first +
+        int out_height = (in_height + 2 * pads_[0] -
+                          dilations_[0] * (weight_shape[2] - 1) - 1) /
+                             strides_[0] +
                          1;
-        int out_width = (in_width + 2 * padding_.second -
-                         dilation_.second * (weight_shape[3] - 1) - 1) /
-                            stride_.second +
+        int out_width = (in_width + 2 * pads_[1] -
+                         dilations_[1] * (weight_shape[3] - 1) - 1) /
+                            strides_[1] +
                         1;
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
@@ -217,21 +250,20 @@ class Conv2d : public Operator {
         para->outImgSize[2] = 1;
         para->outImgSize[3] = 0;
         // original params
-        para->in_channels = in_channels_;
-        para->out_channels = out_channels_;
-        para->kernel_size[0] = kernel_size_.first;
-        para->kernel_size[1] = kernel_size_.second;
-        para->stride[0] = stride_.first;
-        para->stride[1] = stride_.second;
-        para->padding[0] = padding_.first;
-        para->padding[1] = padding_.second;
-        para->dilation[0] = dilation_.first;
-        para->dilation[1] = dilation_.second;
+        para->in_channels = depth;
+        para->out_channels = out_depth;
+        para->kernel_shape[0] = kernel_shape_[0];
+        para->kernel_shape[1] = kernel_shape_[1];
+        para->stride[0] = strides_[0];
+        para->stride[1] = strides_[1];
+        para->padding[0] = pads_[0];
+        para->padding[1] = pads_[1];
+        para->dilation[0] = dilations_[0];
+        para->dilation[1] = dilations_[1];
 
         para->groups = groups_;
-        para->bias = bias_;
+        para->bias = (inputs.size() > 2);
         para->padding_mode = static_cast<int>(padding_mode_);
-        // para->dilation = dilation_;
         paramBuffer_->unmapMemory();
 
         VkDevice device = m_dev_->getLogicalDevice();
@@ -343,14 +375,12 @@ class Conv2d : public Operator {
             std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
 
   private:
-    int in_channels_;
-    int out_channels_;
-    std::pair<int, int> kernel_size_;
-    std::pair<int, int> stride_;
-    std::pair<int, int> padding_;
-    std::pair<int, int> dilation_;
+    std::vector<int> kernel_shape_;
+    std::vector<int> strides_;
+    std::vector<int> pads_;
+    std::vector<int> dilations_;
     int groups_;
-    bool bias_;
+
     conv2d::PaddingMode padding_mode_;
 
     std::shared_ptr<VulkanImage> outputImage_;

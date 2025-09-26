@@ -2,6 +2,7 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -44,6 +45,18 @@ class Operator {
                           << " in operator." << std::endl;
             }
         }
+    }
+    virtual inline std::vector<int> parse_attr_list(const std::string &str) {
+        std::vector<int> result;
+        if (str.front() == '[' && str.back() == ']') {
+            std::string content = str.substr(1, str.size() - 2);
+            std::stringstream ss(content);
+            std::string item;
+            while (std::getline(ss, item, ',')) {
+                result.push_back(std::stoi(item));
+            }
+        }
+        return result;
     }
 
     virtual void
