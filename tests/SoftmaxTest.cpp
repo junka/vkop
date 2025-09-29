@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 #include <random>
 #include <cmath>
@@ -127,7 +128,8 @@ class SoftmaxTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
-    int axis = 0;
+    int axis_ = 0;
+    const std::unordered_map<std::string, std::string> axis = {{"axis", "0"}};
 
     SoftmaxTest():TestCase("Softmax") {
         initTestdata();
@@ -150,7 +152,7 @@ private:
         for (int i = 0; i < input->num_elements(); i++) {
             input_ptr[i] = input_dist(gen);
         }
-        softmax_nd(input_ptr, expectedOutput.data(), t[0], t[1], t[2], t[3], axis);
+        softmax_nd(input_ptr, expectedOutput.data(), t[0], t[1], t[2], t[3], axis_);
     }
 };
 }

@@ -28,8 +28,6 @@ class Resize : public Operator {
   public:
     Resize() = default;
 
-    void setAttribute(int axis = 1) { axis_ = axis; }
-
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {

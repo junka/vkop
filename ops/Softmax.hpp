@@ -28,7 +28,13 @@ class Softmax : public Operator {
   public:
     Softmax() = default;
 
-    void setAttribute(int axis = 1) { axis_ = axis; }
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("axis ") != attributes.end()) {
+            auto axis = std::stoi(attributes.at("axis"));
+            axis_ = axis;
+        }
+    }
 
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,

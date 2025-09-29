@@ -43,7 +43,7 @@ public:
         if (name == "Tanh") return vkop::ops::OpType::TANH;
         if (name == "MatMul") return vkop::ops::OpType::MATMUL;
         if (name == "Conv2d" || name == "Conv") return vkop::ops::OpType::CONV2D;
-        if (name == "MaxPool2d") return vkop::ops::OpType::MAXPOOL2D;
+        if (name == "MaxPool2d" || name == "MaxPool") return vkop::ops::OpType::MAXPOOL2D;
         if (name == "AvgPool2d") return vkop::ops::OpType::AVGPOOL2D;
         if (name == "Upsample2d") return vkop::ops::OpType::UPSAMPLE2D;
         if (name == "GridSample") return vkop::ops::OpType::GRIDSAMPLE;
@@ -85,10 +85,10 @@ public:
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     std::cout << i<< ": " << out_ptr[i] << " vs " <<expectedOutput[i] << std::endl;
-                    // if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
-                    //     LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
-                    //     return false;
-                    // }
+                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 0.001) {
+                        LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
+                        return false;
+                    }
                 }
                 LOG_INFO("Test Passed for operator: %s", name_.c_str());
             }

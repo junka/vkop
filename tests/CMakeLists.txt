@@ -17,6 +17,7 @@ set(TESTS
     BatchNorm2dTest
     SoftmaxTest
     FloorTest
+    MaxPoolTest
 )
 
 foreach(TEST ${TESTS})
