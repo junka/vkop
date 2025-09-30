@@ -13,6 +13,8 @@
 #include "ops/OperatorFactory.hpp"
 #include "ops/Ops.hpp"
 
+#include "Python.h"
+
 namespace vkop {
 namespace tests {
 
@@ -209,6 +211,40 @@ public:
         float retfloat;
         std::memcpy(&retfloat, &ret, 4);
         return retfloat;
+    }
+
+    static void setup_pyenv() {
+        // Initialize Python environment and load necessary libraries
+        Py_Initialize();
+        try {
+            // Import numpy and torch modules
+            PyObject* numpy_name = PyUnicode_DecodeFSDefault("numpy");
+            PyObject* numpy_module = PyImport_Import(numpy_name);
+            Py_DECREF(numpy_name);
+
+            PyObject* torch_name = PyUnicode_DecodeFSDefault("torch");
+            PyObject* torch_module = PyImport_Import(torch_name);
+            Py_DECREF(torch_name);
+
+            if (!numpy_module || !torch_module) {
+                PyErr_Print();
+                fprintf(stderr, "Failed to load numpy or torch module.\n");
+                return;
+            }
+
+            // Store the modules for later use
+            Py_XINCREF(numpy_module);
+            Py_XINCREF(torch_module);
+
+            // Cleanup
+            Py_DECREF(numpy_module);
+            Py_DECREF(torch_module);
+
+            printf("Python environment setup completed. Numpy and Torch loaded successfully.\n");
+        } catch (...) {
+            fprintf(stderr, "An exception occurred while setting up Python environment.\n");
+        }
+        Py_Finalize();
     }
 };
 

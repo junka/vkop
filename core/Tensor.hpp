@@ -2,6 +2,7 @@
 #ifndef CORE_TENSOR_HPP_
 #define CORE_TENSOR_HPP_
 
+#include <bits/c++config.h>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -23,56 +24,60 @@ template <typename T> class Tensor {
     Tensor() = default;
 
     // nchw
-    Tensor(int n, int c, int h, int w) : n_(n), c_(c), h_(h), w_(w) {
+    Tensor(int n, int c, int h, int w) {
+        dims_ = std::vector<int>{n, c, h, w};
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
+        size_ = ele_size_ * n * c * h * w;
+        data_.resize(n * c * h * w);
     }
 
     // nchw in vector
-    explicit Tensor(const std::vector<int> &dims)
-        : n_(dims[0]), c_(dims[1]), h_(dims[2]), w_(dims[3]) {
+    explicit Tensor(const std::vector<int> &dims) {
+        dims_ = dims;
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
+        size_ = ele_size_;
+        for (auto d : dims_) {
+            size_ *= d;
+        }
+        data_.resize(size_ / ele_size_);
     }
 
     // nchw in vector
-    explicit Tensor(const std::vector<uint32_t> &dims)
-        : n_(dims[0]), c_(dims[1]), h_(dims[2]), w_(dims[3]) {
+    explicit Tensor(const std::vector<uint32_t> &dims) {
+        dims_ = std::vector<int>(dims.begin(), dims.end());
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
+        size_ = ele_size_;
+        for (auto d : dims_) {
+            size_ *= d;
+        }
+        data_.resize(size_ / ele_size_);
     }
 
     void resize(int n, int c, int h, int w) {
-        n_ = n;
-        c_ = c;
-        h_ = h;
-        w_ = w;
+        dims_ = std::vector<int>{n, c, h, w};
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
+        size_ = ele_size_ * n * c * h * w;
+        data_.resize(n * c * h * w);
     }
 
     void resize(const std::vector<int> &dims) {
-        n_ = dims[0];
-        c_ = dims[1];
-        h_ = dims[2];
-        w_ = dims[3];
+        dims_ = dims;
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n_ * c_ * h_ * w_;
-        data_.resize(n_ * c_ * h_ * w_);
+        size_ = ele_size_;
+        for (auto d : dims_) {
+            size_ *= d;
+        }
+        data_.resize(size_ / ele_size_);
     }
 
     void printTensorShape() const {
-        std::cout << "Tensor dimensions: [" << n_ << "," << c_ << "," << h_
-                  << "," << w_ << "], "
+        std::cout << "Tensor dimensions: [" << dims_[0] << "," << dims_[1]
+                  << "," << dims_[2] << "," << dims_[3] << "], "
                   << "size: " << sizeof(T) << std::endl;
     }
 
@@ -100,14 +105,27 @@ template <typename T> class Tensor {
 
     const T &operator[](std::size_t index) const { return data_[index]; }
 
-    std::vector<int> getTensorShape() {
-        return std::vector<int>{n_, c_, h_, w_};
+    T &at(std::size_t index) {
+        if (index >= data_.size()) {
+            throw std::out_of_range("Index out of range");
+        }
+        return data_[index];
     }
+
+    const T &at(std::size_t index) const {
+        if (index >= data_.size()) {
+            throw std::out_of_range("Index out of range");
+        }
+        return data_[index];
+    }
+
+    std::vector<int> getTensorShape() { return dims_; }
 
     T *data() { return data_.data(); }
 
     int size() { return size_; }
     int num_elements() { return size_ / ele_size_; }
+    int num_dims() { return dims_.size(); };
 
     // void *map() { return nullptr; }
     // void unmap() { (void)vkobj_; }
@@ -150,10 +168,10 @@ template <typename T> class Tensor {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
         }
-        auto batch = n_;
-        auto depth = c_;
-        auto height = h_;
-        auto width = w_;
+        auto batch = dims_[0];
+        auto depth = dims_[1];
+        auto height = dims_[2];
+        auto width = dims_[3];
 
         int stride_w = 1;
         int stride_h = width;
@@ -199,10 +217,10 @@ template <typename T> class Tensor {
     }
 
     void convertRGBAToTensor(T *ptr) {
-        auto batch = n_;
-        auto depth = c_;
-        auto height = h_;
-        auto width = w_;
+        auto batch = dims_[0];
+        auto depth = dims_[1];
+        auto height = dims_[2];
+        auto width = dims_[3];
 
         int stride_w = 1;
         int stride_h = width;
@@ -245,8 +263,8 @@ template <typename T> class Tensor {
                                             uint32_t flags) {
         auto vkimg = std::make_shared<VulkanImage>(
             vd,
-            VkExtent3D{static_cast<uint32_t>(w_ * UP_DIV(c_, 4)),
-                       static_cast<uint32_t>(h_ * n_), 1},
+            VkExtent3D{static_cast<uint32_t>(dims_[3] * UP_DIV(dims_[1], 4)),
+                       static_cast<uint32_t>(dims_[2] * dims_[0]), 1},
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             (fp16_ ? VK_FORMAT_R16G16B16A16_SFLOAT
                    : VK_FORMAT_R32G32B32A32_SFLOAT));
@@ -256,10 +274,7 @@ template <typename T> class Tensor {
     }
 
   private:
-    int n_;
-    int c_;
-    int h_;
-    int w_;
+    std::vector<int> dims_;
 
     int ele_size_;
     int size_;

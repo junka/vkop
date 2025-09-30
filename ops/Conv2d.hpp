@@ -29,8 +29,9 @@ using ivec2 = int[2];
 
 struct GPUConv2dParam {
 
-    ivec4 outImgSize;
+    // ivec4 outImgSize;
     ivec4 inputSize;
+    ivec4 outputSize;
     // ivec4 offset;  //batchOffset, hOffset, outputHeight, other
 
     int in_channels;
@@ -245,10 +246,18 @@ class Conv2d : public Operator {
         auto *para = static_cast<conv2d::GPUConv2dParam *>(
             paramBuffer_->getMappedMemory());
         // vkimage params
-        para->outImgSize[0] = realwidth;
-        para->outImgSize[1] = realheight;
-        para->outImgSize[2] = 1;
-        para->outImgSize[3] = 0;
+        // para->outImgSize[0] = realwidth;
+        // para->outImgSize[1] = realheight;
+        // para->outImgSize[2] = 1;
+        // para->outImgSize[3] = 0;
+        para->inputSize[0] = in_width;
+        para->inputSize[1] = in_height;
+        para->inputSize[2] = UP_DIV(depth, 4);
+        para->inputSize[3] = batch;
+        para->outputSize[0] = out_width;
+        para->outputSize[1] = out_height;
+        para->outputSize[2] = UP_DIV(out_depth, 4);
+        para->outputSize[3] = out_batch;
         // original params
         para->in_channels = depth;
         para->out_channels = out_depth;
@@ -278,37 +287,39 @@ class Conv2d : public Operator {
         // 1)
 
         // Split the weight into depthwise and pointwise components
-        auto *depthwise_weight = new core::Tensor<T>(
-            weight_shape[1], 1, weight_shape[2], weight_shape[3]);
-        auto *pointwise_weight =
-            new core::Tensor<T>(weight_shape[0], weight_shape[1], 1, 1);
-        auto *weight_ptr = weight->data();
-        auto *depthwise_ptr = depthwise_weight->data();
-        auto *pointwise_ptr = pointwise_weight->data();
+        // auto *depthwise_weight = new core::Tensor<T>(
+        //     weight_shape[1], 1, weight_shape[2], weight_shape[3]);
+        // auto *pointwise_weight =
+        //     new core::Tensor<T>(weight_shape[0], weight_shape[1], 1, 1);
+
+        // auto *weight_ptr = weight->data();
+        // auto *depthwise_ptr = depthwise_weight->data();
+        // auto *pointwise_ptr = pointwise_weight->data();
         // Extract depthwise weights (ic, 1, kh, kw)
-        for (int ic = 0; ic < weight_shape[1]; ++ic) {
-            for (int kh = 0; kh < weight_shape[2]; ++kh) {
-                for (int kw = 0; kw < weight_shape[3]; ++kw) {
-                    depthwise_ptr[ic * weight_shape[2] * weight_shape[3] +
-                                  kh * weight_shape[3] + kw] =
-                        weight_ptr[ic * weight_shape[2] * weight_shape[3] +
-                                   kh * weight_shape[3] + kw];
-                }
-            }
-        }
+        // for (int ic = 0; ic < weight_shape[1]; ++ic) {
+        //     for (int kh = 0; kh < weight_shape[2]; ++kh) {
+        //         for (int kw = 0; kw < weight_shape[3]; ++kw) {
+        //             depthwise_ptr[ic * weight_shape[2] * weight_shape[3] +
+        //                           kh * weight_shape[3] + kw] =
+        //                 weight_ptr[ic * weight_shape[2] * weight_shape[3] +
+        //                            kh * weight_shape[3] + kw];
+        //         }
+        //     }
+        // }
 
         // Extract pointwise weights (oc, ic, 1, 1)
-        for (int oc = 0; oc < weight_shape[0]; ++oc) {
-            for (int ic = 0; ic < weight_shape[1]; ++ic) {
-                pointwise_ptr[oc * weight_shape[1] + ic] =
-                    weight_ptr[oc * weight_shape[1] * weight_shape[2] *
-                                   weight_shape[3] +
-                               ic];
-            }
-        }
+        // for (int oc = 0; oc < weight_shape[0]; ++oc) {
+        //     for (int ic = 0; ic < weight_shape[1]; ++ic) {
+        //         pointwise_ptr[oc * weight_shape[1] + ic] =
+        //             weight_ptr[oc * weight_shape[1] * weight_shape[2] *
+        //                            weight_shape[3] +
+        //                        ic];
+        //     }
+        // }
 
+        auto weight_rgba = weight->convertTensorToRGBA();
         // Convert depthwise and pointwise weights to RGBA format
-        auto depthwise_rgba = depthwise_weight->convertTensorToRGBA();
+        // auto depthwise_rgba = depthwise_weight->convertTensorToRGBA();
         // auto pointwise_rgba = weightImage_->convertNCHWToRGBA(
         //     pointwise_weight.data(), {weight_shape[0], weight_shape[1], 1,
         //     1});
@@ -317,7 +328,7 @@ class Conv2d : public Operator {
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
             inputImage_->hostImageCopyToDevice(input_rgba.data());
-            weightImage_->hostImageCopyToDevice(depthwise_rgba.data());
+            weightImage_->hostImageCopyToDevice(weight_rgba.data());
             biasImage_->hostImageCopyToDevice(bias->data());
         } else
 #endif
@@ -327,7 +338,7 @@ class Conv2d : public Operator {
             inputImage_->stagingBufferCopyToImage(cmdstg.get(),
                                                   input_rgba.data());
             weightImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   depthwise_rgba.data());
+                                                   weight_rgba.data());
             biasImage_->stagingBufferCopyToImage(cmdstg.get(), bias->data());
             cmdstg.end();
             cmdstg.submit(m_dev_->getComputeQueue());

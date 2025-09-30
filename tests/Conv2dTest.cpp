@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <memory>
 #include <random>
+#include <string>
 #include <vector>
 #include <cassert>
 #include <chrono>
@@ -9,28 +10,13 @@
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
 #include "setup.hpp"
+#include "ops/Conv2d.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
+using vkop::ops::Conv2d;
 
 namespace {
-
-template<typename T>
-void generateWeight(std::shared_ptr<Tensor<T>> &weight, int group) {
-    auto shape = weight->getTensorShape();
-    auto ic = shape[0];
-    auto oc = shape[1];
-    auto kh = shape[2];
-    auto kw = shape[3];
-    auto *data_ptr = weight->data();
-
-    for (int i = 0; i < group * (oc/group) * (ic/group) * kw *kh; i++) {
-        auto data = ((((i / kw)% 1317) * ((i / kh) % 1317)) % 1317 + i / ic + i / oc + (((oc - i) % 1317) * ic) % 1317 + i * ((oc - i) % 1317)) % 1317;
-        auto fdata = static_cast<T>(data % 255) / 255.0F / 1000.0F;
-        *(data_ptr++) = fdata;
-    }
-}
-
 
 /**
  * @brief 实现一个参考版本的2D卷积操作。
@@ -61,7 +47,7 @@ void generateWeight(std::shared_ptr<Tensor<T>> &weight, int group) {
  */
 template<typename T>
 void reference_conv2d(const T* input, const T* weight,
-    const T* bias, std::vector<T>& output, std::vector<T>& outputDataSeparateBias, int batch, int ic, int oc,
+    const T* bias, std::vector<T>& output, int batch, int ic, int oc,
     int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
     int dilation_h, int dilation_w, int group) {
     // 计算输出张量的高度和宽度
@@ -78,8 +64,7 @@ void reference_conv2d(const T* input, const T* weight,
     }
 
     // 初始化输出张量的大小
-    output.resize(batch * oh * ow * oc);
-    outputDataSeparateBias.resize(batch * oh * ow * oc);
+    output.resize(static_cast<size_t>(batch) * oh * ow * oc); // Ensure proper resizing
 
     // 每组的输出通道数和输入通道数
     int oc_group = oc / group;
@@ -118,8 +103,7 @@ void reference_conv2d(const T* input, const T* weight,
                     }
 
                     // 将卷积结果加上偏置并存储到输出张量
-                    output[dest_offset] = sum + bias[oz];
-                    outputDataSeparateBias[dest_offset] = sum;
+                    output.at(dest_offset) = sum + bias[oz];
                 }
             }
         }
@@ -128,87 +112,84 @@ void reference_conv2d(const T* input, const T* weight,
 
 }  // namespace
 
+
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    int b_ = 1;
-    int oc_ = 16;
-    int ic_ = 16;
-    int isw_ = 3;
-    int ish_ = 4;
-    int kw_ = 4;
-    int kh_ = 4;
-    int d_ = 1;
-    int s_ = 2;
-    int p_ = 2;
+    std::vector<int> input_shape_ = {1, 16, 8, 8}; // b, ic, ih, iw
+    int kernel_size_ = 4;
+    int stride_ = 2;
+    int pad_ = 0;
+    int group_ = 1;
+    int dilation_ = 1;
+    int feature_size_ = 16; // oc
 
+    std::unordered_map<std::string, std::string> attributes = {
+        {"kernel_shape", std::to_string(kernel_size_)},
+        {"strides", std::to_string(stride_)},
+        {"pads", std::to_string(pad_)},
+        {"dilations", std::to_string(dilation_)},
+        {"group", "1"}
+    };
 
     std::shared_ptr<Tensor<T>> weight_data_;
     std::shared_ptr<Tensor<T>> bias_data_;
 
     std::shared_ptr<Tensor<T>> input_data_;
     std::vector<T> output_data_;
-    std::vector<T> output_data_separate_bias_;
 
     Conv2dTest(): TestCase("Conv2d") {
         initTestData();
     }
 
 private:
-    void reference_conv2d_depthwise(int batch, int ic, int oc, int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w, int dilation_h, int dilation_w, int group) {
-        weight_data_ = std::make_shared<Tensor<T>>(ic, oc, kh, kw);
-        generateWeight(weight_data_, group);
-
-        bias_data_ = std::make_unique<Tensor<T>>(oc, 1, 1, 1);
-        auto *bias_ptr = bias_data_->data();
-        for (int i = 0; i < oc; i++) {
-            auto data =  (((i / kw) % 1317) * ((i / kh) % 1317) + i / ic + i / oc + (oc - i) * ic + i * (oc - i)) % 1317;
-            auto float_data = static_cast<float>(data % 255) / 255.0F;
-            data           = data * data;
-            *(bias_ptr++) = float_data;
-        }
-
-        input_data_ = std::make_unique<Tensor<T>>(batch, ic, ih, iw);
-        auto *input_ptr = input_data_->data();
-        for (int i = 0; i < ih * iw * ic * batch; ++i) {
-            auto data      = ((i / kw) % 1317) * ((i / kh) % 1317) + ((i / ic)% 1317) * ((i / oc) % 1317) + ((oc - i) % 1317) * ic + (i % 1317) * ((oc - i) % 1317);
-            data = data % 1317;
-            data           = (data * data) % 1317;
-            auto float_data = static_cast<T>(data % 255) / 255.0F;
-            *(input_ptr++) = (float_data);
-        }
-        
-        std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_conv2d(input_data_->data(), weight_data_->data(), bias_data_->data(), output_data_, output_data_separate_bias_, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw,
-                        stride_h, stride_w, dilation_h, dilation_w, group);
-        std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
-        LOG_INFO("reference conv2d depthwise time: %f s", duration.count());
-    }
-
     void initTestData() {
-        srand(100);
-        // for (int b = 1; b <= 2; b++) {
-        //     for (int oc = 4; oc <= 16; oc *= 2) {
-        //         for (int ic = oc; ic <= oc; ic++) {
-        //             for (int isw = 1; isw <= 8; isw += 2) {
-        //                 for (int ish = 1; ish <= 8; ish *= 2) {
-        //                     for (int kw = 1; kw <= 4; kw++) {
-        //                         for (int kh = 1; kh <= 4; kh++) {
-        //                             for (int d = 1; d <= 2; d++) {
-        //                                 for (int s = 1; s <= 2; s++) {
-        //                                     for (int p = 0; p <= std::min(kw, kh); p++) {
-                                                reference_conv2d_depthwise(b_, ic_, oc_, ish_, isw_, p_, p_, kh_, kw_, s_, s_, d_, d_, 1);
-        //                                     }
-        //                                 }
-        //                             }
-        //                         }
-        //                     }
-        //                 }
-        //             }
-        //         }
-        //     }
-        // }
+        std::random_device rd{};
+        std::mt19937 gen{rd()};
+        gen.seed(1024);
+        std::normal_distribution<> input_dist{0.0F, 1.0F};
+
+        // Initialize weight data
+        // M, C/group, kh, kw
+        weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
+        for (int i = 0; i < weight_data_->num_elements(); i++) {
+            weight_data_->at(i) = static_cast<T>(input_dist(gen));
+        }
+
+        // Initialize bias data
+        input_dist = std::normal_distribution<>(0.0F, 2.0F);
+        bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
+        for (int i = 0; i < bias_data_->num_elements(); ++i) {
+            bias_data_->at(i) = static_cast<T>(input_dist(gen));
+        }
+
+        // Initialize input data
+        input_dist = std::normal_distribution<>(0.0F, 255.0F);
+        input_data_ = std::make_shared<Tensor<T>>(input_shape_);
+        for (int i = 0; i < input_data_->num_elements(); ++i) {
+            input_data_->at(i) = static_cast<T>(input_dist(gen));
+        }
+
+        int batch = input_shape_[0];
+        int ic = input_shape_[1];
+        int ih = input_shape_[2];
+        int iw = input_shape_[3];
+        int oc = feature_size_;
+        int kh = kernel_size_;
+        int kw = kernel_size_;
+        int stride_h = stride_;
+        int stride_w = stride_;
+        int pad_h = pad_;
+        int pad_w = pad_;
+        int dilation_h = dilation_;
+        int dilation_w = dilation_;
+
+        reference_conv2d(input_data_->data(), weight_data_->data(), bias_data_->data(),
+                 output_data_, batch, ic, oc,
+                 ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w,
+                 dilation_h, dilation_w, group_);
+        
+        printf("%f\n", output_data_[0]);
     }
 };
 
@@ -217,7 +198,16 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
     Conv2dTest<float> ct;
-    if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_)) {
+    if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
+        [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
+        auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+        if (!conv_op) {
+            LOG_ERROR("Failed to cast operator to Softmax");
+            return;
+        }
+        conv_op->setAttribute(ct.attributes);
+
+    })) {
         return -1;
     }
 

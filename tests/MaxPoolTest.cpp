@@ -16,12 +16,18 @@ using vkop::tests::TestCase;
 using vkop::ops::Maxpool2d;
 
 namespace {
-    void maxpool2d_reference(const float *input, float *output, std::vector<int> shape, 
-                       int kernel_h, int kernel_w, int stride_height, int stride_width, int pad_height, int pad_width) {
+    void maxpool2d_reference(const float *input, float *output, std::vector<int> shape,
+                       int kernel_size, int stride_size, int pad_size) {
         int batch = shape[0];
         int channels = shape[1];
         int height = shape[2];
         int width = shape[3];
+        int kernel_h = kernel_size;
+        int kernel_w = kernel_size;
+        int stride_height = stride_size;
+        int stride_width = stride_size;
+        int pad_height = pad_size;
+        int pad_width = pad_size;
 
         int padded_height = height + 2 * pad_height;
         int padded_width = width + 2 * pad_width;
@@ -56,11 +62,14 @@ class MaxpoolTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
+    int stride_ = 1;
+    int kernel_size_ = 4;
+    int pad_ = 1;
 
     std::unordered_map<std::string, std::string> attributes = {
-        {"kernel_shape", "[3, 3]"},
-        {"strides", "[2, 2]"},
-        {"pads", "1"},
+        {"kernel_shape", std::to_string(kernel_size_)},
+        {"strides", std::to_string(stride_)},
+        {"pads", std::to_string(pad_)},
         {"dilations", "1"},
         {"ceil_mode", "0"},
         {"storage_order", "1"}
@@ -72,7 +81,7 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t = {1, 3, 8, 8}; // Batch, Channels, Height, Width
+        std::vector<int> t = {1, 3, 8, 8};
         input = std::make_shared<Tensor<float>>(t);
 
         auto *input_ptr = input->data();
@@ -86,7 +95,7 @@ private:
             input_ptr[i] = input_dist(gen);
         }
 
-        maxpool2d_reference(input_ptr, expectedOutput.data(), t, 3, 3, 2, 2, 1, 1);
+        maxpool2d_reference(input_ptr, expectedOutput.data(), t, kernel_size_, stride_, pad_);
     }
 };
 }
@@ -96,7 +105,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     MaxpoolTest maxtest;
-    if (!maxtest.run_test({maxtest.input}, maxtest.expectedOutput, 
+    if (!maxtest.run_test({maxtest.input}, maxtest.expectedOutput,
         [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
             if (!maxpool_op) {
