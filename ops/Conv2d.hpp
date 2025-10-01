@@ -43,7 +43,7 @@ struct GPUConv2dParam {
     ivec2 dilation;
 
     int groups;
-    bool bias;
+    // bool bias;
     int padding_mode;
 };
 
@@ -271,7 +271,7 @@ class Conv2d : public Operator {
         para->dilation[1] = dilations_[1];
 
         para->groups = groups_;
-        para->bias = (inputs.size() > 2);
+        // para->bias = (inputs.size() > 2);
         para->padding_mode = static_cast<int>(padding_mode_);
         paramBuffer_->unmapMemory();
 

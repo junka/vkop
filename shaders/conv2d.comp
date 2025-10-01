@@ -44,7 +44,7 @@ layout(set=0, binding=4) readonly uniform constBuffer {
     ivec2 dilate;
 
     int groups;
-    bool bias;
+    // bool bias;
     int padding_mode;
 //    ivec4 offset;  //batchOffset, hOffset, outputHeight, other
 } uConstant;

@@ -198,6 +198,17 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
     Conv2dTest<float> ct;
+
+    std::vector<std::vector<int>> shapes;
+    shapes.push_back(ct.input_shape_);
+    shapes.push_back(std::vector<int>{ct.feature_size_, ct.input_shape_[1]/ct.group_, ct.kernel_size_, ct.kernel_size_});
+    shapes.push_back(std::vector<int>{ct.feature_size_});
+    std::tuple<std::vector<float>, std::vector<float>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, ct.attributes);
+    std::vector<float> torch_input = std::get<0>(k);
+    std::vector<float> torch_output = std::get<1>(k);
+    std::vector<int> output_shape = std::get<2>(k);
+    printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+
     if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());
@@ -210,6 +221,7 @@ int main() {
     })) {
         return -1;
     }
+
 
     return 0;
 }
