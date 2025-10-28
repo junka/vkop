@@ -94,7 +94,9 @@ void reference_conv2d(const T* input, const T* weight,
                                 }
 
                                 // 获取卷积核的值
-                                float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
+                                // float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
+                                float y_value = weight[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+
 
                                 // 累加卷积结果
                                 sum += x_value * y_value;
@@ -208,6 +210,12 @@ int main() {
     std::vector<float> torch_output = std::get<1>(k);
     std::vector<int> output_shape = std::get<2>(k);
     printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+    // for (int i = 0; i < static_cast<int>(torch_input.size()); i++) {
+    //     if (i % 8 == 0) {
+    //         printf("\n");
+    //     }
+    //     printf("%0.4f\t", torch_input[i]);
+    // }
 
     if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {

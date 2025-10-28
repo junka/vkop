@@ -30,8 +30,11 @@ class Softmax : public Operator {
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        if (attributes.find("axis ") != attributes.end()) {
+        if (attributes.find("axis") != attributes.end()) {
             auto axis = std::stoi(attributes.at("axis"));
+            axis_ = axis;
+        } else if (attributes.find("dim") != attributes.end()) {
+            auto axis = std::stoi(attributes.at("dim"));
             axis_ = axis;
         }
     }
