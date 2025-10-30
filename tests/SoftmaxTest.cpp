@@ -115,10 +115,10 @@ void softmax_nd(const float* input, float* output,
 class SoftmaxTest : public TestCase {
 public:
 
-    std::vector<int> input_shape_ = {1, 3, 4, 4};
+    std::vector<int> input_shape_ = {1, 5, 4, 4};
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
-    int axis_ = 3;
+    int axis_ = 1;
     const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
 
 
@@ -135,7 +135,7 @@ private:
         std::vector<float> torch_output = std::get<1>(k);
         std::vector<int> output_shape = std::get<2>(k);
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-
+#if 1
         printf("\n===Input==============\n");
         for (int i = 0; i < output_shape[0]; i++) {
             printf("[\n");
@@ -175,6 +175,7 @@ private:
             }
             printf("\n");
         }
+#endif
         input = std::make_shared<Tensor<float>>(input_shape_);
         for (int i = 0; i < input->num_elements(); i++) {
             input->at(i) = torch_input[i];

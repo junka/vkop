@@ -101,8 +101,7 @@ void VulkanCommandBuffer::reset(int idx) {
 }
 
 void VulkanCommandBuffer::dispatch(int w, int h, int z) {
-    vkCmdDispatch(m_commandBuffers_[m_avail_], UP_DIV(w, 16), UP_DIV(h, 16),
-                  UP_DIV(z, 16));
+    vkCmdDispatch(m_commandBuffers_[m_avail_], w, h, z);
 }
 
 } // namespace vkop

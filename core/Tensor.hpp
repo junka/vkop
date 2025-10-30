@@ -178,7 +178,7 @@ template <typename T> class Tensor {
         int stride_c = width * height;
         int stride_n = width * height * depth;
         int realdepth = UP_DIV(depth, 4);
-        int realwidth = width * UP_DIV(depth, 4);
+        int realwidth = width * realdepth;
         int realheight = height * batch;
 
         std::vector<T> tmp(realheight * realwidth * img->getImageChannelNum() *

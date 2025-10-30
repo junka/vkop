@@ -17,8 +17,6 @@ using ivec2 = int[2];
 struct GpuSoftMaxParam {
     ivec4 outImgSize;
     ivec4 outShape;
-    int groupSize;
-    int totalGroups;
     int axis; // 0: N, 1: C, 2: H, 3: W
 };
 
@@ -125,14 +123,6 @@ class Softmax : public Operator {
         para->outShape[1] = out_height;
         para->outShape[2] = out_width;
         para->outShape[3] = depth;
-        int total_groups = 1;
-        for (int i = 0; i < 4; ++i) {
-            if (i != axis_) {
-                total_groups *= input_shape[i];
-            }
-        }
-        para->groupSize = input_shape[axis_];
-        para->totalGroups = total_groups;
         para->axis = axis_;
         paramBuffer_->unmapMemory();
 
@@ -160,8 +150,18 @@ class Softmax : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(softmax_spv, softmax_spv_len, out_width, out_height);
-
+        if (axis_ == 0) {
+            submit(softmax_spv, softmax_spv_len, out_width,
+                   out_height * UP_DIV(depth, 4));
+        } else if (axis_ == 1) {
+            submit(softmax_spv, softmax_spv_len, out_width, out_height * batch);
+        } else if (axis_ == 2) {
+            submit(softmax_spv, softmax_spv_len, out_width,
+                   UP_DIV(depth, 4) * batch);
+        } else if (axis_ == 3) {
+            submit(softmax_spv, softmax_spv_len, out_height,
+                   UP_DIV(depth, 4) * batch);
+        }
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
