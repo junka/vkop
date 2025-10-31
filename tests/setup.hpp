@@ -359,12 +359,11 @@ public:
         printf("\n");
     }
 
-    static std::tuple<std::vector<float>, std::vector<float>, std::vector<int>>
+    static std::tuple<std::vector<std::vector<float>>, std::vector<int>>
     execute_torch_operator(const std::string& op_name,
                         const std::vector<std::vector<int>>& shapes,
                         const std::unordered_map<std::string, std::string>& attributes) {
-        std::vector<float> input_values;
-        std::vector<float> output_values;
+        std::vector<std::vector<float>> ret;
         std::vector<int> output_shape;
 
         if (shapes.empty()) {
@@ -389,7 +388,7 @@ public:
         // 检查 Python 是否初始化
         if (!Py_IsInitialized()) {
             PyErr_SetString(PyExc_RuntimeError, "Python not initialized");
-            return {input_values, output_values, output_shape};
+            return {ret, output_shape};
         }
 
         // 所有 PyObject 指针初始化为 nullptr，便于安全清理
@@ -439,58 +438,52 @@ public:
             }
 
             // === 3. Create shape tuples ===
-            shape_tuple = PyTuple_New(input_shape.size());
-            for (size_t i = 0; i < input_shape.size(); ++i) {
-                PyObject* item = PyLong_FromLong(input_shape[i]);
-                PyTuple_SetItem(shape_tuple, i, item); // Steals reference
-            }
-
-            if (has_weight) {
-                weight_tuple = PyTuple_New(weight_shape.size());
-                for (size_t i = 0; i < weight_shape.size(); ++i) {
-                    PyObject* item = PyLong_FromLong(weight_shape[i]);
-                    PyTuple_SetItem(weight_tuple, i, item);
+            auto create_shape_tuple = [] (std::vector<int> shapes) ->PyObject * {
+                PyObject * shape_tuple = PyTuple_New(shapes.size());
+                for (size_t i = 0; i < shapes.size(); ++i) {
+                    PyObject* item = PyLong_FromLong(shapes[i]);
+                    PyTuple_SetItem(shape_tuple, i, item);
                 }
+                return shape_tuple;
+            };
+ 
+            shape_tuple = create_shape_tuple(input_shape);
+            if (has_weight) {
+                weight_tuple = create_shape_tuple(weight_shape);
             }
 
             if (has_bias) {
-                bias_tuple = PyTuple_New(bias_shape.size());
-                for (size_t i = 0; i < bias_shape.size(); ++i) {
-                    PyObject* item = PyLong_FromLong(bias_shape[i]);
-                    PyTuple_SetItem(bias_tuple, i, item);
-                }
+                bias_tuple = create_shape_tuple(bias_shape);
             }
 
-            // === 4. Generate random input tensors via numpy.random.rand ===
             numpy_random = PyObject_GetAttrString(numpy_module, "random");
             if (!numpy_random) throw std::runtime_error("Failed to get numpy.random");
 
             numpy_rand_func = PyObject_GetAttrString(numpy_random, "rand");
             if (!numpy_rand_func) throw std::runtime_error("Failed to get numpy.random.rand");
 
-            numpy_input = PyObject_CallObject(numpy_rand_func, shape_tuple);
-            if (!numpy_input) throw std::runtime_error("Failed to generate random input");
-            
-            numpy_input = PyObject_CallMethod(numpy_input, "astype", "(O)",
-                                  PyObject_GetAttrString(numpy_module, "float32"));
+            auto numpy_rand_as_float = [&numpy_module, &numpy_rand_func] (PyObject* tuple) {
+                auto *input = PyObject_CallObject(numpy_rand_func, tuple);
+                if (!input) throw std::runtime_error("Failed to generate random input");
+                input = PyObject_CallMethod(input, "astype", "(O)", PyObject_GetAttrString(numpy_module, "float32"));
+                return input;
+            };
+            numpy_input = numpy_rand_as_float(shape_tuple);
 
             if (has_weight) {
-                numpy_weight = PyObject_CallObject(numpy_rand_func, weight_tuple);
-                if (!numpy_weight) throw std::runtime_error("Failed to generate random weight");
+                numpy_weight = numpy_rand_as_float(weight_tuple);
             }
 
             if (has_bias) {
-                numpy_bias = PyObject_CallObject(numpy_rand_func, bias_tuple);
-                if (!numpy_bias) throw std::runtime_error("Failed to generate random bias");
+                numpy_bias = numpy_rand_as_float(bias_tuple);
             }
 
-            // === 5. Convert to torch tensors using torch.from_numpy ===
             PyObject* torch_from_numpy = PyObject_GetAttrString(torch_module, "from_numpy");
             if (!torch_from_numpy) throw std::runtime_error("Failed to get torch.from_numpy");
 
             torch_input = PyObject_CallFunctionObjArgs(torch_from_numpy, numpy_input, nullptr);
             if (!torch_input) throw std::runtime_error("Failed to convert input to torch tensor");
-            Py_DECREF(torch_from_numpy); // Release borrowed reference
+            Py_DECREF(torch_from_numpy);
 
             if (has_weight) {
                 torch_from_numpy = PyObject_GetAttrString(torch_module, "from_numpy");
@@ -505,8 +498,6 @@ public:
                 if (!torch_bias) throw std::runtime_error("Failed to convert bias to torch tensor");
                 Py_DECREF(torch_from_numpy);
             }
-
-            // === 6. Get operator function from torch.nn.functional ===
             op_func = PyObject_GetAttrString(functional_module, op_name.c_str());
             if (!op_func) {
                 PyErr_Print();
@@ -524,10 +515,12 @@ public:
                 if (key == "inplace" || key == "bias") {
                     value = (val_str == "True" || val_str == "true") ? Py_True : Py_False;
                     Py_INCREF(value);
-                } else if (key == "eps" || key == "momentum" || key == "alpha" || key == "p" || key == "value") {
+                } else if (key == "alpha" || key == "p" || key == "value") {
                     value = PyFloat_FromDouble(std::stod(val_str));
                 } else if (key == "padding" && (val_str == "same" || val_str == "valid")) {
                     value = PyUnicode_FromString(val_str.c_str());
+                } else if (key == "momentum" || key == "eps") {
+                    value = PyFloat_FromDouble(std::stof(val_str));
                 } else {
                     // Try int first, then float, then string
                     try {
@@ -580,7 +573,6 @@ public:
                 throw std::runtime_error("Failed to convert output tensor to numpy array");
             }
 
-            // === 11. Extract output shape ===
             numpy_output_shape = PyObject_GetAttrString(numpy_output, "shape");
             if (numpy_output_shape && PyTuple_Check(numpy_output_shape)) {
                 Py_ssize_t ndim = PyTuple_Size(numpy_output_shape);
@@ -590,32 +582,27 @@ public:
             } else {
                 throw std::runtime_error("Failed to get output shape");
             }
-
             // print_numpy_array(numpy_input, "NumPy Input", input_shape);
             // print_numpy_array(numpy_output, "NumPy Output", output_shape);
 
-            // === 12. Flatten and extract output values ===
-            numpy_flat = PyObject_CallMethod(numpy_output, "flatten", nullptr);
-            if (!numpy_flat || !PyArray_Check((PyArrayObject*)numpy_flat)) {
-                throw std::runtime_error("Failed to flatten output array");
-            }
+            auto flatten_values = [] (PyObject * values) -> std::vector<float> {
+                std::vector<float> output;
+                auto *flat = PyObject_CallMethod(values, "flatten", nullptr);
+                if (!flat || !PyArray_Check((PyArrayObject*)flat)) {
+                    throw std::runtime_error("Failed to flatten output array");
+                }
+                auto* out_data = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(flat)));
+                npy_intp num_out = PyArray_SIZE((PyArrayObject*)flat);
+                output.resize(num_out);
+                std::copy(out_data, out_data + num_out, output.begin());
+                return output;
+            };
 
-            // 获取 NumPy 数组的数据指针（更高效）
-            auto* out_data = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(numpy_flat)));
-            npy_intp num_out = PyArray_SIZE((PyArrayObject*)numpy_flat);
-            output_values.resize(num_out);
-            std::copy(out_data, out_data + num_out, output_values.begin());
+            ret.emplace_back(flatten_values(numpy_output));
+            ret.emplace_back(flatten_values(numpy_input));
+            if (has_weight) ret.emplace_back(flatten_values(numpy_weight));
+            if (has_bias) ret.emplace_back(flatten_values(numpy_bias));
 
-            // === 13. Extract input values ===
-            numpy_input_flat = PyObject_CallMethod(numpy_input, "flatten", nullptr);
-            if (!numpy_input_flat || !PyArray_Check((PyArrayObject*)numpy_input_flat)) {
-                throw std::runtime_error("Failed to flatten input array");
-            }
-
-            auto* in_data = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(numpy_input_flat)));
-            npy_intp num_in = PyArray_SIZE((PyArrayObject*)numpy_input_flat);
-            input_values.resize(num_in);
-            std::copy(in_data, in_data + num_in, input_values.begin());
         } catch (const std::exception& e) {
             fprintf(stderr, "C++ Exception: %s\n", e.what());
         } catch (...) {
@@ -647,7 +634,7 @@ public:
         SAFE_DECREF(numpy_input_flat);
     #undef SAFE_DECREF
 
-        return {input_values, output_values, output_shape};
+        return {ret, output_shape};
     }
 };
 

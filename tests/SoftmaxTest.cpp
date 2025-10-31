@@ -114,13 +114,11 @@ void softmax_nd(const float* input, float* output,
 
 class SoftmaxTest : public TestCase {
 public:
-
     std::vector<int> input_shape_ = {1, 5, 4, 4};
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
     int axis_ = 1;
     const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
-
 
     SoftmaxTest():TestCase("Softmax") {
         initTestData();
@@ -130,10 +128,11 @@ private:
         std::vector<std::vector<int>> shapes;
         shapes.push_back(input_shape_);
 
-        std::tuple<std::vector<float>, std::vector<float>, std::vector<int>> k = TestCase::execute_torch_operator("softmax", shapes, dim);
-        std::vector<float> torch_input = std::get<0>(k);
-        std::vector<float> torch_output = std::get<1>(k);
-        std::vector<int> output_shape = std::get<2>(k);
+        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("softmax", shapes, dim);
+        std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
+        auto torch_output = torch_tensors[0];
+        auto torch_input = torch_tensors[1];
+        std::vector<int> output_shape = std::get<1>(k);
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 #if 1
         printf("\n===Input==============\n");

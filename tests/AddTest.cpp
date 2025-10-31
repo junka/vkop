@@ -14,6 +14,9 @@ namespace {
 
 class AddTest : public TestCase {
 public:
+    std::vector<int> input_shape_ = {
+        1, 3, 64, 64
+    };
     std::shared_ptr<Tensor<uint16_t>> inputa;
     std::shared_ptr<Tensor<uint16_t>> inputb;
     std::vector<uint16_t> expectedOutput;
@@ -24,11 +27,8 @@ public:
 private:
     void initTestdata()
     {
-        std::vector<int> t = {
-            1, 3, 64, 64
-        };
-        inputa = std::make_shared<Tensor<uint16_t>>(t);
-        inputb = std::make_shared<Tensor<uint16_t>>(t);
+        inputa = std::make_shared<Tensor<uint16_t>>(input_shape_);
+        inputb = std::make_shared<Tensor<uint16_t>>(input_shape_);
 
         auto *inputa_ptr = inputa->data();
         auto *inputb_ptr = inputb->data();

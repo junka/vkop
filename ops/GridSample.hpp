@@ -218,7 +218,8 @@ class GridSample : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(grid_sample_spv, grid_sample_spv_len, out_width, out_height);
+        submit(grid_sample_spv, grid_sample_spv_len, UP_DIV(out_width, 16),
+               UP_DIV(out_height, 16));
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();

@@ -146,6 +146,69 @@ public:
 
 private:
     void initTestData() {
+        std::vector<std::vector<int>> shapes;
+        shapes.push_back(input_shape_);
+
+        const std::unordered_map<std::string, std::string> param = {{"kernel_shape", std::to_string(kernel_size_)},
+                                                                    {"stride", std::to_string(stride_)},
+                                                                    {"padding", std::to_string(pad_)},
+                                                                    {"dilations", std::to_string(dilation_)},
+                                                                    {"groups", "1"}};
+        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, param);
+        std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
+        auto torch_output = torch_tensors[0];
+        auto torch_input = torch_tensors[1];
+        std::vector<int> output_shape = std::get<1>(k);
+
+        printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+
+#if 1
+        printf("\n===Input==============\n");
+        for (int i = 0; i < output_shape[0]; i++) {
+            printf("[\n");
+            for (int j = 0; j < output_shape[1]; j++) {
+                printf("[\n");
+                for (int k = 0; k < output_shape[2]; k++) {
+                    printf("[");
+                    for (int l = 0; l < output_shape[3]; l++) {
+                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
+                                j * output_shape[2] * output_shape[3] +
+                                k * output_shape[3] +
+                                l;
+                        printf("%.4f, ", torch_input[idx]);
+                    }
+                    printf("],\n");
+                }
+                printf("],\n");
+            }
+            printf("]\n");
+        }
+
+        printf("\n===Output==============\n");
+        for (int i = 0; i < output_shape[0]; i++) {
+            for (int j = 0; j < output_shape[1]; j++) {
+                for (int k = 0; k < output_shape[2]; k++) {
+                    printf("[");
+                    for (int l = 0; l < output_shape[3]; l++) {
+                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
+                                j * output_shape[2] * output_shape[3] +
+                                k * output_shape[3] +
+                                l;
+                        printf("%.4f, ", torch_output[idx]);
+                    }
+                    printf("]\n");
+                }
+                printf("\n");
+            }
+            printf("\n");
+        }
+#endif
+        input_data_ = std::make_shared<Tensor<float>>(input_shape_);
+        for (int i = 0; i < input_data_->num_elements(); i++) {
+            input_data_->at(i) = torch_input[i];
+        }
+        output_data_ = torch_output;
+#if 0
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
@@ -192,6 +255,7 @@ private:
                  dilation_h, dilation_w, group_);
         
         printf("%f\n", output_data_[0]);
+#endif
     }
 };
 
@@ -205,10 +269,11 @@ int main() {
     shapes.push_back(ct.input_shape_);
     shapes.push_back(std::vector<int>{ct.feature_size_, ct.input_shape_[1]/ct.group_, ct.kernel_size_, ct.kernel_size_});
     shapes.push_back(std::vector<int>{ct.feature_size_});
-    std::tuple<std::vector<float>, std::vector<float>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, ct.attributes);
-    std::vector<float> torch_input = std::get<0>(k);
-    std::vector<float> torch_output = std::get<1>(k);
-    std::vector<int> output_shape = std::get<2>(k);
+    std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, ct.attributes);
+    std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
+    auto torch_output = torch_tensors[0];
+    auto torch_input = torch_tensors[1];
+    std::vector<int> output_shape = std::get<1>(k);
     printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
     // for (int i = 0; i < static_cast<int>(torch_input.size()); i++) {
     //     if (i % 8 == 0) {

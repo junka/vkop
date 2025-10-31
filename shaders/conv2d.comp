@@ -56,8 +56,10 @@ layout (local_size_x_id = 0, local_size_y_id = 1, local_size_z_id = 2) in;
 
 void main()
 {
+
     ivec3 pos = ivec3(gl_GlobalInvocationID);
     ivec3 outputSize = uConstant.outputSize.xyz;
+
     int oz = pos.z % uConstant.outputSize.z;
     int ob = pos.z / uConstant.outputSize.z;
 
@@ -83,7 +85,7 @@ void main()
             }
         }
 
-
+        //Relu + Clamp
         color = FLOAT4(max(color, FLOAT4(0)));
         color = FLOAT4(clamp(color, FLOAT4(0), FLOAT4(6)));
         imageStore(uOutput, ivec2(pos.x+oz*uConstant.outputSize.x, pos.y+ob*uConstant.outputSize.y), color);

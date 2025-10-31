@@ -14,29 +14,57 @@
 
 #include <memory>
 
+extern unsigned char batchnorm2d_spv[];
+extern unsigned int batchnorm2d_spv_len;
+
 namespace vkop {
 namespace ops {
 namespace batchnorm {
 
-using ivec2 = int[2];
-using vec4 = float[4];
+using ivec4 = int[4];
 
+// torch.nn.functional.batch_norm(input, running_mean, running_var, weight=None,
+//                                bias=None, training=False, momentum=0.1,
+//                                eps=1e-05)
 struct GpuBatchNormParam {
-    ivec2 outShape;
-    int num_feature; // C from nchw
-    float eps;       // default 1e-5
-    vec4 attr[];     // mean, variance, scale, bias
+    ivec4 outShape;
+    float eps;      // default 1e-5
+    float momentum; // default 0.1
 };
 } // namespace batchnorm
 
 class BatchNorm2d : public Operator {
   public:
     BatchNorm2d() = default;
-
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        attributes.find("training") != attributes.end()
+            ? training_ = (attributes.at("align_corners") == "1" ||
+                           attributes.at("align_corners") == "true")
+            : training_ = false;
+        if (attributes.find("eps") != attributes.end()) {
+            eps_ = std::stof(attributes.at("eps"));
+        }
+        if (attributes.find("momentum") != attributes.end()) {
+            momentum_ = std::stof(attributes.at("momentum"));
+        }
+    }
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
+        auto running_mean = inputs[1];
+        auto running_var = inputs[2];
+
+        std::shared_ptr<core::Tensor<T>> weight;
+        std::shared_ptr<core::Tensor<T>> bias;
+        if (inputs.size() > 3) {
+            weight = inputs[3];
+        }
+        if (inputs.size() > 4) {
+            bias = inputs[4];
+        }
+
         auto output = outputs[0];
 
         VkDevice device = m_dev_->getLogicalDevice();
@@ -54,6 +82,12 @@ class BatchNorm2d : public Operator {
         inputImage_ = input->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+
+        tensorBuffer_ = std::make_shared<VulkanBuffer>(
+            m_dev_, running_mean->size() * 4,
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
             m_dev_, sizeof(batchnorm::GpuBatchNormParam),
@@ -86,6 +120,8 @@ class BatchNorm2d : public Operator {
     void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
+        auto running_mean = inputs[1];
+        auto running_var = inputs[2];
         auto output = outputs[0];
 
         auto input_shape = input->getTensorShape();
@@ -102,6 +138,24 @@ class BatchNorm2d : public Operator {
         prepare(inputs, outputs);
 
         VkDevice device = m_dev_->getLogicalDevice();
+
+        auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
+            paramBuffer_->getMappedMemory());
+        para->eps = eps_;
+        para->momentum = momentum_;
+        para->outShape[0] = batch;
+        para->outShape[1] = depth;
+        para->outShape[2] = out_height;
+        para->outShape[3] = out_width;
+
+        auto *var = static_cast<float *>(tensorBuffer_->getMappedMemory());
+        std::memcpy(var, running_mean->data(), running_mean->size());
+        std::memcpy(var + running_mean->size(), running_var->data(),
+                    running_var->size());
+        for (int i = 0; i < input_shape[1]; i++) {
+            *(var + 2 * input_shape[1] + i) = 1;
+            *(var + 3 * input_shape[1] + i) = 0;
+        }
 
         auto input_rgba = input->convertTensorToRGBA();
 #ifdef VK_EXT_host_image_copy
@@ -123,7 +177,8 @@ class BatchNorm2d : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(spv_, spv_len_, out_width, out_height);
+        submit(batchnorm2d_spv, batchnorm2d_spv_len, UP_DIV(out_width, 16),
+               UP_DIV(out_height, 16));
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -164,26 +219,24 @@ class BatchNorm2d : public Operator {
         apply<uint16_t>(inputs, outputs);
     }
 
-  protected:
-    void set_vulkan_spv(unsigned char *spv, unsigned int spv_len) {
-        spv_ = spv;
-        spv_len_ = spv_len;
-    }
-
   private:
+    bool training_ = false;
+    float momentum_ = 0.1;
+    float eps_ = 1e-5;
     std::shared_ptr<VulkanImage> outputImage_;
     std::shared_ptr<VulkanImage> inputImage_;
+    std::shared_ptr<VulkanBuffer> tensorBuffer_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
-    unsigned char *spv_;
-    unsigned int spv_len_;
 
     void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
                 int out_height) override {
         std::vector<VkDescriptorType> types = {
             VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {outputImage_,
-                                                             inputImage_};
+            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
+        std::vector<std::shared_ptr<VulkanResource>> objs = {
+            outputImage_, inputImage_, tensorBuffer_, paramBuffer_};
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanPipeline pipeline(device, types, objs,
                                 reinterpret_cast<const uint32_t *>(spv),
