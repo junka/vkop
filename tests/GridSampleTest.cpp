@@ -127,8 +127,8 @@ private:
     void initTestdata()
     {
         std::vector<int> t = {
-            1, 3, 4, 4, 4, 4
-            // 2, 5, 4, 4, 4, 4
+            // 1, 3, 4, 4, 4, 4
+            2, 5, 4, 4, 4, 4
         };
         auto batch = t[0];
         auto depth = t[1];

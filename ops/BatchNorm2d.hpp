@@ -124,6 +124,15 @@ class BatchNorm2d : public Operator {
         auto running_var = inputs[2];
         auto output = outputs[0];
 
+        std::shared_ptr<core::Tensor<T>> weight;
+        std::shared_ptr<core::Tensor<T>> bias;
+        if (inputs.size() > 3) {
+            weight = inputs[3];
+        }
+        if (inputs.size() > 4) {
+            bias = inputs[4];
+        }
+
         auto input_shape = input->getTensorShape();
         int batch = input_shape[0];
         int depth = input_shape[1];
@@ -148,13 +157,22 @@ class BatchNorm2d : public Operator {
         para->outShape[2] = out_height;
         para->outShape[3] = out_width;
 
-        auto *var = static_cast<float *>(tensorBuffer_->getMappedMemory());
-        std::memcpy(var, running_mean->data(), running_mean->size());
-        std::memcpy(var + running_mean->size(), running_var->data(),
-                    running_var->size());
-        for (int i = 0; i < input_shape[1]; i++) {
-            *(var + 2 * input_shape[1] + i) = 1;
-            *(var + 3 * input_shape[1] + i) = 0;
+        auto *var_buffer =
+            static_cast<float *>(tensorBuffer_->getMappedMemory());
+        for (int i = 0; i < running_mean->num_elements(); i++) {
+            *(var_buffer + 4 * i) = running_mean->data()[i];
+            printf("mean %f\n", *(var_buffer + 4 * i));
+            *(var_buffer + 4 * i + 1) = running_var->data()[i];
+            if (inputs.size() > 3) {
+                *(var_buffer + 4 * i + 2) = weight->data()[i];
+            } else {
+                *(var_buffer + 4 * i + 2) = 1.0F;
+            }
+            if (inputs.size() > 4) {
+                *(var_buffer + 4 * i + 3) = bias->data()[i];
+            } else {
+                *(var_buffer + 4 * i + 3) = 0.0F;
+            }
         }
 
         auto input_rgba = input->convertTensorToRGBA();
@@ -177,8 +195,7 @@ class BatchNorm2d : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(batchnorm2d_spv, batchnorm2d_spv_len, UP_DIV(out_width, 16),
-               UP_DIV(out_height, 16));
+        submit(batchnorm2d_spv, batchnorm2d_spv_len, realwidth, realheight);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -247,7 +264,7 @@ class BatchNorm2d : public Operator {
         cmd2.begin();
         cmd2.bind(pipeline);
         query_pool.begin(cmd2.get());
-        cmd2.dispatch(out_width, out_height);
+        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
         query_pool.end(cmd2.get());
         cmd2.end();
         cmd2.submit(m_dev_->getComputeQueue());

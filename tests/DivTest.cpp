@@ -24,7 +24,7 @@ private:
     void initTestdata()
     {
         std::vector<int> t = {
-            1, 3, 64, 64
+            6, 9, 64, 64
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);

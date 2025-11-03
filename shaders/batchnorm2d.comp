@@ -18,31 +18,56 @@ layout(set=0, binding=3) readonly uniform batchNormBuffer {
 
 // https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.batch_norm.html
 void main() {
-    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 gid = ivec2(gl_GlobalInvocationID);
 
     int N = uBatchNormParam.outShape.x;
     int C = uBatchNormParam.outShape.y;
     int H = uBatchNormParam.outShape.z;
     int W = uBatchNormParam.outShape.w;
+    int C4 = (C + 3) / 4;
+    if (gid.x >= W * C4 || gid.y >= H * N) {
+        return;
+    }
+    const float epsilon = uBatchNormParam.eps;
 
     int n = gid.y / H;
     int h = gid.y % H;
     int w = gid.x % W;
-    int c = gid.x / W;
-
-    // int c = gid.x / uBatchNormParam.outShape.x;
+    int c4 = gid.x / W;
 
     vec4 inputPixel = texelFetch(inputImage, gid, 0);
 
-    float mean = uMeanVarScaleBias.attr[c].x;
-    float variance = uMeanVarScaleBias.attr[c].y;
-    float scale = uMeanVarScaleBias.attr[c].z;
-    float bias = uMeanVarScaleBias.attr[c].w;
+    vec4 mean4 = vec4(
+        uMeanVarScaleBias.attr[c4*4 + 0].x,
+        uMeanVarScaleBias.attr[c4*4 + 1].x,
+        uMeanVarScaleBias.attr[c4*4 + 2].x,
+        uMeanVarScaleBias.attr[c4*4 + 3].x
+    );
 
-    // Batch normalization formula: output = scale * ((input - mean) / sqrt(variance + epsilon)) + bias
-    const float epsilon = 1e-5;
-    vec4 normalized = (inputPixel - mean) / sqrt(variance + vec4(epsilon));
-    vec4 outputPixel = scale * normalized + bias;
+    vec4 var4 = vec4(
+        uMeanVarScaleBias.attr[c4*4 + 0].y,
+        uMeanVarScaleBias.attr[c4*4 + 1].y,
+        uMeanVarScaleBias.attr[c4*4 + 2].y,
+        uMeanVarScaleBias.attr[c4*4 + 3].y
+    );
+
+    vec4 scale4 = vec4(
+        uMeanVarScaleBias.attr[c4*4 + 0].z,
+        uMeanVarScaleBias.attr[c4*4 + 1].z,
+        uMeanVarScaleBias.attr[c4*4 + 2].z,
+        uMeanVarScaleBias.attr[c4*4 + 3].z
+    );
+
+    vec4 bias4 = vec4(
+        uMeanVarScaleBias.attr[c4*4 + 0].w,
+        uMeanVarScaleBias.attr[c4*4 + 1].w,
+        uMeanVarScaleBias.attr[c4*4 + 2].w,
+        uMeanVarScaleBias.attr[c4*4 + 3].w
+    );
+
+    vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));  // 1/sqrt(var + eps)
+    vec4 normalized = (inputPixel - mean4) * inv_std;
+    vec4 outputPixel = scale4 * normalized + bias4;
 
     imageStore(outputImage, gid, outputPixel);
 }

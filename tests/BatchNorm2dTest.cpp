@@ -11,23 +11,23 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::BatchNorm2d;
-
+#define USE_CPP_REFER 0
 namespace {
 #if USE_CPP_REFER
 
 std::vector<float> batch_norm_2d(std::shared_ptr<Tensor<float>> &input, int batch, int channels, int height, int width,
-                                 const std::vector<float>& weight, const std::vector<float>& bias, const std::vector<float>& mean,
-                                 const std::vector<float>& variance, float epsilon) {
+                                 const std::vector<float>& weight, const std::vector<float>& bias, std::shared_ptr<Tensor<float>>& mean,
+                                 std::shared_ptr<Tensor<float>>& variance, float epsilon) {
     std::vector<float> output(input->num_elements());
     int spatial_size = height * width;
 
     for (int n = 0; n < batch; ++n) {
         for (int c = 0; c < channels; ++c) {
-            float inv_std = 1.0F / std::sqrt(variance[c] + epsilon);
+            float inv_std = 1.0F / std::sqrt(variance->data()[c] + epsilon);
             for (int h = 0; h < height; ++h) {
                 for (int w = 0; w < width; ++w) {
                     int idx = n * channels * spatial_size + c * spatial_size + h * width + w;
-                    output[idx] = weight[c] * (input->data()[idx] - mean[c]) * inv_std + bias[c];
+                    output[idx] = weight[c] * (input->data()[idx] - mean->data()[c]) * inv_std + bias[c];
                 }
             }
         }
@@ -74,18 +74,18 @@ private:
         std::vector<int> output_shape = std::get<1>(k);
         auto torch_output = torch_tensors[0];
         auto torch_input = torch_tensors[1];
-        auto torch_weight = torch_tensors[2];
-        auto torch_bias = torch_tensors[3];
+        auto torch_mean = torch_tensors[2];
+        auto torch_var = torch_tensors[3];
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 #if 1
         printf("=======mean ============\n");
         for (int i = 0; i < output_shape[1]; i++) {
-            printf("%.2f, ", torch_weight[i]);
+            printf("%.4f, ", torch_mean[i]);
         }
         printf("\n=======var ============\n");
         for (int i = 0; i < output_shape[1]; i++) {
-            printf("%.2f, ", torch_bias[i]);
+            printf("%.4f, ", torch_var[i]);
         }
         printf("\n===Input==============\n");
         for (int i = 0; i < output_shape[0]; i++) {
@@ -133,11 +133,11 @@ private:
         }
         mean = std::make_shared<Tensor<float>>(num_feature);
         for (int i = 0; i < mean->num_elements(); i++) {
-            mean->at(i) = torch_weight[i];
+            mean->at(i) = torch_mean[i];
         }
         var = std::make_shared<Tensor<float>>(num_feature);
         for (int i = 0; i < var->num_elements(); i++) {
-            input->at(i) = torch_bias[i];
+            var->at(i) = torch_var[i];
         }
         expectedOutput = torch_output;
     }
@@ -150,24 +150,28 @@ int main() {
 
     BatchNorm2dTest bntest;
 
-
 #if USE_CPP_REFER
     printf("\n===verify C++ refer ==========\n");
-    batch_norm_2d(bntest.input.data(), bntest.input_shape_[0], bntest.input_shape_[1],
-                bntest.input_shape_[2], bntest.input_shape_[3],
-                bntest.eps_);
-    for (int i = 0; i < output_shape[0]; i++) {
+    std::vector<float> torch_weight(bntest.input_shape_[1], 1.0F);
+    std::vector<float> torch_bias(bntest.input_shape_[1], 0.0F);
+    auto bout = batch_norm_2d(bntest.input, bntest.input_shape_[0], bntest.input_shape_[1],
+                bntest.input_shape_[2], bntest.input_shape_[3], torch_weight, torch_bias,
+                bntest.mean, bntest.var, 1e-5);
+    for (int i = 0; i < bntest.input_shape_[0]; i++) {
         printf("[\n");
-        for (int j = 0; j < output_shape[1]; j++) {
+        for (int j = 0; j < bntest.input_shape_[1]; j++) {
             printf("[\n");
-            for (int k = 0; k < output_shape[2]; k++) {
+            for (int k = 0; k < bntest.input_shape_[2]; k++) {
                 printf("[");
-                for (int l = 0; l < output_shape[3]; l++) {
-                    int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                              j * output_shape[2] * output_shape[3] +
-                              k * output_shape[3] +
+                for (int l = 0; l < bntest.input_shape_[3]; l++) {
+                    int idx = i * bntest.input_shape_[1] * bntest.input_shape_[2] * bntest.input_shape_[3] +
+                              j * bntest.input_shape_[2] * bntest.input_shape_[3] +
+                              k * bntest.input_shape_[3] +
                               l;
-                    printf("%.4f, ", torch_output[idx]);
+                    printf("%.4f, ", bout[idx]);
+                    if (fabs(bout[idx] - bntest.expectedOutput[idx]) > 1e-3) {
+                        printf("  <--mismatch ");
+                    }
                 }
                 printf("],\n");
             }

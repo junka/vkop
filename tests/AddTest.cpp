@@ -15,7 +15,7 @@ namespace {
 class AddTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 3, 64, 64
+        1, 8, 64, 64
     };
     std::shared_ptr<Tensor<uint16_t>> inputa;
     std::shared_ptr<Tensor<uint16_t>> inputb;

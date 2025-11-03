@@ -81,7 +81,7 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t = {1, 3, 8, 8};
+        std::vector<int> t = {1, 4, 8, 8};
         input = std::make_shared<Tensor<float>>(t);
 
         auto *input_ptr = input->data();

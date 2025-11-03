@@ -5,6 +5,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 layout(set = 0, binding = 0, rgba32f) writeonly uniform image2D uOutput;
 layout(set = 0, binding = 1) uniform sampler2D uInput;
 
+// relu f(x) = max(0, x)
 void main() {
     ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
     vec4 inputValue = texelFetch(uInput, coord, 0);

@@ -116,7 +116,7 @@ class BinaryFactory : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(spv_, spv_len_, out_width, out_height);
+        submit(spv_, spv_len_, realwidth, realheight);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
@@ -187,7 +187,7 @@ class BinaryFactory : public Operator {
         cmd2.begin();
         cmd2.bind(pipeline);
         query_pool.begin(cmd2.get());
-        cmd2.dispatch(out_width, out_height);
+        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
         query_pool.end(cmd2.get());
         cmd2.end();
         cmd2.submit(m_dev_->getComputeQueue());

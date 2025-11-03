@@ -258,7 +258,7 @@ class Maxpool2d : public Operator {
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
 
-        submit(maxpool2d_spv, maxpool2d_spv_len, out_width, out_height);
+        submit(maxpool2d_spv, maxpool2d_spv_len, realwidth, realheight);
 
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
