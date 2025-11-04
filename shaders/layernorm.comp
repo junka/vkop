@@ -1,0 +1,119 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set=0, binding = 0) writeonly uniform image2D outputImage;
+layout(set=0, binding = 1) uniform sampler2D inputImage;
+layout(set=0, binding = 2) readonly buffer tensorBuffer {
+    vec2 attr[]; // weight, bias
+} uScaleBias;
+
+layout(set=0, binding = 3) readonly uniform layerNormBuffer {
+	ivec4 outShape; // 输出图像的NCHW
+    ivec4 normalizedShape; // 归一化的形状
+    float eps; // default 1e-5
+    int normalizedDim; // 归一化的维度
+    int innerSize; // 归一化的元素个数
+} uLayerhNormParam;
+
+shared vec4 sum[256];      // 当前 workgroup 处理的样本的 sum
+shared vec4 sum_sq[256];   // 当前 workgroup 处理的样本的 sum of squares
+
+shared vec4 shared_mean;
+shared vec4 shared_inv_std;
+
+// torch.nn.functional.layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05)
+
+// dispatch (N * C4, H), 归一化最后一个维度 W
+void norm_for_w () {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint lid = ly * 16 + lx;  // local thread ID [0, 255]
+    int N = uLayerhNormParam.outShape.x;
+    int C = uLayerhNormParam.outShape.y;
+    int H = uLayerhNormParam.outShape.z;
+    int W = uLayerhNormParam.outShape.w;
+    int D = uLayerhNormParam.innerSize;
+    int C4 = (C + 3) / 4;
+
+    const float epsilon = uLayerhNormParam.eps;
+
+    int h = int(gl_WorkGroupID.y);
+    int idx = int(gl_WorkGroupID.x);
+    int n = idx / C4;
+    int c4 = idx % C4;
+    int y = n * H + h;
+
+    sum[lid] = vec4(0.0f);
+    sum_sq[lid] = vec4(0.0f);
+
+    vec4 local_sum = vec4(0.0f);
+    vec4 local_sum_sq = vec4(0.0f);
+
+    // stride loop to accumulate sum and sum_sq
+    for (int w = int(lid); w < W; w += 256) {
+        // int row_offset = n * (C4 * H) + c4 * H + h;
+        int x = w + c4 * W;
+        ivec2 coord = ivec2(x, y);
+        vec4 pixel = texelFetch(inputImage, coord, 0);
+        local_sum += pixel;
+        local_sum_sq += pixel * pixel;
+    }
+    sum[lid] = local_sum;
+    sum_sq[lid] = local_sum_sq;
+    memoryBarrierShared();
+    barrier();
+
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            sum[lid] += sum[lid + stride];
+            sum_sq[lid] += sum_sq[lid + stride];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (lid == 0) {
+        vec4 mean = sum[0] / float(W);
+        vec4 var = sum_sq[0] / float(W) - mean * mean;
+        var = max(var, 0.0);
+        shared_mean = mean;
+        shared_inv_std = inversesqrt(var + epsilon);
+    }
+    barrier();
+
+    // Read input again and write output
+    for (int w = int(lid); w < W; w += 256) {
+        // int row_offset = n * (C4 * H) + c4 * H + h;
+        int x = w + c4 * W;
+        ivec2 coord = ivec2(x, y);
+        vec4 pixel = texelFetch(inputImage, coord, 0);
+
+        vec4 norm = (pixel - shared_mean) * shared_inv_std;
+
+        // Apply weight & bias
+        vec4 weights = vec4(uScaleBias.attr[w].x);
+        vec4 biases = vec4(uScaleBias.attr[w].y);
+
+        vec4 output_pixel = norm * weights + biases;
+        imageStore(outputImage, coord, output_pixel);
+    }
+}
+
+// dispatch (N, C), 归一化最后两个维度 HW
+void norm_for_hw() {
+    
+}
+
+void main() {
+
+    if (uLayerhNormParam.normalizedDim == 1) {
+        norm_for_w();
+    } else if (uLayerhNormParam.normalizedDim == 2) {
+        norm_for_hw();
+        imageStore(outputImage, ivec2(0, 0), vec4(0.5f));
+    } else {
+        // 归一化所有维度 CHW
+        imageStore(outputImage, ivec2(0, 0), vec4(3.0f));
+    }
+}

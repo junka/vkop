@@ -18,6 +18,7 @@ set(TESTS
     SoftmaxTest
     FloorTest
     MaxPoolTest
+    LayerNormTest
 )
 
 find_package(PythonLibs REQUIRED)

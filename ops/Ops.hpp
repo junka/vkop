@@ -17,6 +17,7 @@ enum class OpType {
     ERF,
     POW,
     BATCHNORM,
+    LAYERNORM,
     RELU,
     SOFTMAX,
     TANH,

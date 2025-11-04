@@ -185,7 +185,7 @@ int main() {
         [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *batchnorm_op = dynamic_cast<BatchNorm2d *>(op.get());
             if (!batchnorm_op) {
-                LOG_ERROR("Failed to cast operator to Softmax");
+                LOG_ERROR("Failed to cast operator to BatchNorm2d");
                 return;
             }
             batchnorm_op->setAttribute(bntest.param);

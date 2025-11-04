@@ -48,6 +48,7 @@ public:
         if (name == "Erf") return vkop::ops::OpType::ERF;
         if (name == "Pow") return vkop::ops::OpType::POW;
         if (name == "BatchNorm") return vkop::ops::OpType::BATCHNORM;
+        if (name == "LayerNorm") return vkop::ops::OpType::LAYERNORM;
         if (name == "Relu") return vkop::ops::OpType::RELU;
         if (name == "Softmax") return vkop::ops::OpType::SOFTMAX;
         if (name == "Tanh") return vkop::ops::OpType::TANH;
@@ -240,7 +241,6 @@ public:
                 return nullptr;
             }
 
-            
             import_array();
 
             // Store the modules for later use
@@ -375,6 +375,7 @@ public:
         std::vector<int> bias_shape;
         bool has_weight = false;
         bool has_bias = false;
+        bool has_laynernorm = false;
 
         if (shapes.size() > 1) {
             weight_shape = shapes[1];
@@ -413,6 +414,7 @@ public:
         PyObject* numpy_output_shape = nullptr;
         PyObject* numpy_flat = nullptr;
         PyObject* numpy_input_flat = nullptr;
+        PyObject* nomarlized_shape = nullptr;
 
         auto attrs = onnx_to_pytorch_attrs(attributes);
 
@@ -521,6 +523,20 @@ public:
                     value = PyUnicode_FromString(val_str.c_str());
                 } else if (key == "momentum" || key == "eps") {
                     value = PyFloat_FromDouble(std::stof(val_str));
+                } else if (key == "normalized_shape") {
+                    std::vector<int> normalized_shape;
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        std::string content = val_str.substr(1, val_str.size() - 2);
+                        std::stringstream ss(content);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            normalized_shape.push_back(std::stoi(item));
+                        }
+                    }
+                    printf("Setting normalized_shape: %d\n", normalized_shape[0]);
+                    has_laynernorm = true;
+                    nomarlized_shape = create_shape_tuple(normalized_shape);
+                    continue;
                 } else {
                     // Try int first, then float, then string
                     try {
@@ -540,6 +556,7 @@ public:
             // === 8. Prepare positional arguments dynamically ===
             std::vector<PyObject*> arg_list;
             arg_list.push_back(torch_input);
+            if (has_laynernorm) arg_list.push_back(nomarlized_shape);
             if (has_weight) arg_list.push_back(torch_weight);
             if (has_bias) arg_list.push_back(torch_bias);
 

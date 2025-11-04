@@ -109,7 +109,7 @@ int main() {
         [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
             if (!maxpool_op) {
-                LOG_ERROR("Failed to cast operator to Softmax");
+                LOG_ERROR("Failed to cast operator to Maxpool2d");
                 return;
             }
             maxpool_op->setAttribute(maxtest.attributes);

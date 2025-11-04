@@ -1,6 +1,6 @@
 // Copyright 2025 @junka
-#ifndef OPS_BATCHNORM2D_HPP_
-#define OPS_BATCHNORM2D_HPP_
+#ifndef OPS_LAYERNORM_HPP_
+#define OPS_LAYERNORM_HPP_
 
 #include "Operator.hpp"
 
@@ -14,55 +14,52 @@
 
 #include <memory>
 
-extern unsigned char batchnorm2d_spv[];
-extern unsigned int batchnorm2d_spv_len;
+extern unsigned char layernorm_spv[];
+extern unsigned int layernorm_spv_len;
 
 namespace vkop {
 namespace ops {
-namespace batchnorm {
+namespace layernorm {
 
 using ivec4 = int[4];
 
-// torch.nn.functional.batch_norm(input, running_mean, running_var, weight=None,
-//                                bias=None, training=False, momentum=0.1,
-//                                eps=1e-05)
-struct GpuBatchNormParam {
-    ivec4 outShape;
-    float eps;      // default 1e-5
-    float momentum; // default 0.1
-};
-} // namespace batchnorm
+// torch.nn.functional.layer_norm(input, normalized_shape, weight=None,
+// bias=None, eps=1e-05)
 
-class BatchNorm2d : public Operator {
+struct GpuLayerNormParam {
+    ivec4 outShape;
+    ivec4 normalizedShape;
+    float eps; // default 1e-5
+    int normalizedDim;
+    int innerSize;
+};
+} // namespace layernorm
+
+class LayerNorm : public Operator {
   public:
-    BatchNorm2d() = default;
+    LayerNorm() = default;
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        attributes.find("training") != attributes.end()
-            ? training_ = (attributes.at("align_corners") == "1" ||
-                           attributes.at("align_corners") == "true")
-            : training_ = false;
         if (attributes.find("eps") != attributes.end()) {
             eps_ = std::stof(attributes.at("eps"));
         }
-        if (attributes.find("momentum") != attributes.end()) {
-            momentum_ = std::stof(attributes.at("momentum"));
+        if (attributes.find("normalized_shape") != attributes.end()) {
+            std::string norm_shape_str = attributes.at("normalized_shape");
+            normalized_shape_ = parse_attr_list(norm_shape_str);
         }
     }
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                  std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
-        auto running_mean = inputs[1];
-        auto running_var = inputs[2];
 
         std::shared_ptr<core::Tensor<T>> weight;
         std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 3) {
-            weight = inputs[3];
+        if (inputs.size() > 1) {
+            weight = inputs[1];
         }
-        if (inputs.size() > 4) {
-            bias = inputs[4];
+        if (inputs.size() > 2) {
+            bias = inputs[2];
         }
 
         auto output = outputs[0];
@@ -84,13 +81,12 @@ class BatchNorm2d : public Operator {
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
         tensorBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, running_mean->size() * 4,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            m_dev_, weight->size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(batchnorm::GpuBatchNormParam),
+            m_dev_, sizeof(layernorm::GpuLayerNormParam),
             VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -120,17 +116,15 @@ class BatchNorm2d : public Operator {
     void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
                std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
         auto input = inputs[0];
-        auto running_mean = inputs[1];
-        auto running_var = inputs[2];
         auto output = outputs[0];
 
         std::shared_ptr<core::Tensor<T>> weight;
         std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 3) {
-            weight = inputs[3];
+        if (inputs.size() > 1) {
+            weight = inputs[1];
         }
-        if (inputs.size() > 4) {
-            bias = inputs[4];
+        if (inputs.size() > 2) {
+            bias = inputs[2];
         }
 
         auto input_shape = input->getTensorShape();
@@ -148,29 +142,32 @@ class BatchNorm2d : public Operator {
 
         VkDevice device = m_dev_->getLogicalDevice();
 
-        auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
+        auto *para = static_cast<layernorm::GpuLayerNormParam *>(
             paramBuffer_->getMappedMemory());
         para->eps = eps_;
-        para->momentum = momentum_;
         para->outShape[0] = batch;
         para->outShape[1] = depth;
         para->outShape[2] = out_height;
         para->outShape[3] = out_width;
+        para->normalizedDim = normalized_shape_.size();
+        para->innerSize = 1;
+        for (size_t i = 0; i < normalized_shape_.size(); i++) {
+            para->normalizedShape[i] = normalized_shape_[i];
+            para->innerSize *= normalized_shape_[i];
+        }
 
         auto *var_buffer =
             static_cast<float *>(tensorBuffer_->getMappedMemory());
-        for (int i = 0; i < running_mean->num_elements(); i++) {
-            *(var_buffer + 4 * i) = running_mean->data()[i];
-            *(var_buffer + 4 * i + 1) = running_var->data()[i];
-            if (inputs.size() > 3) {
-                *(var_buffer + 4 * i + 2) = weight->data()[i];
+        for (int i = 0; i < weight->num_elements(); i++) {
+            if (inputs.size() > 1) {
+                *(var_buffer + 2 * i) = weight->data()[i];
             } else {
-                *(var_buffer + 4 * i + 2) = 1.0F;
+                *(var_buffer + 2 * i) = 1.0F;
             }
-            if (inputs.size() > 4) {
-                *(var_buffer + 4 * i + 3) = bias->data()[i];
+            if (inputs.size() > 2) {
+                *(var_buffer + 2 * i + 1) = bias->data()[i];
             } else {
-                *(var_buffer + 4 * i + 3) = 0.0F;
+                *(var_buffer + 2 * i + 1) = 0.0F;
             }
         }
 
@@ -193,9 +190,14 @@ class BatchNorm2d : public Operator {
         inputImage_->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(m_dev_->getComputeQueue());
-
-        submit(batchnorm2d_spv, batchnorm2d_spv_len, realwidth, realheight);
-
+        if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
+            submit(layernorm_spv, layernorm_spv_len, batch * UP_DIV(depth, 4),
+                   out_height);
+        } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
+            submit(layernorm_spv, layernorm_spv_len, batch, UP_DIV(depth, 4));
+        } else { // 归一化所有维度 CHW
+            submit(layernorm_spv, layernorm_spv_len, realwidth, realheight);
+        }
         std::vector<T> tmp(realheight * realwidth * 4);
         T *ptr = tmp.data();
 #ifdef VK_EXT_host_image_copy
@@ -236,9 +238,8 @@ class BatchNorm2d : public Operator {
     }
 
   private:
-    bool training_ = false;
-    float momentum_ = 0.1;
     float eps_ = 1e-5;
+    std::vector<int> normalized_shape_;
     std::shared_ptr<VulkanImage> outputImage_;
     std::shared_ptr<VulkanImage> inputImage_;
     std::shared_ptr<VulkanBuffer> tensorBuffer_;
@@ -263,7 +264,7 @@ class BatchNorm2d : public Operator {
         cmd2.begin();
         cmd2.bind(pipeline);
         query_pool.begin(cmd2.get());
-        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
+        cmd2.dispatch(out_width, out_height);
         query_pool.end(cmd2.get());
         cmd2.end();
         cmd2.submit(m_dev_->getComputeQueue());
@@ -276,4 +277,4 @@ class BatchNorm2d : public Operator {
 
 } // namespace ops
 } // namespace vkop
-#endif // OPS_BATCHNORM2D_HPP_
+#endif // OPS_LAYERNORM_HPP_

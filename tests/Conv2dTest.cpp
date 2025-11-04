@@ -286,7 +286,7 @@ int main() {
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());
         if (!conv_op) {
-            LOG_ERROR("Failed to cast operator to Softmax");
+            LOG_ERROR("Failed to cast operator to Conv2d");
             return;
         }
         conv_op->setAttribute(ct.attributes);

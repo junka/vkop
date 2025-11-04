@@ -30,6 +30,7 @@ static vkop::ops::OpType convert_opstring_to_enum(const std::string &name) {
     if (name == "Erf") return vkop::ops::OpType::ERF;
     if (name == "Pow") return vkop::ops::OpType::POW;
     if (name == "BatchNormalization") return vkop::ops::OpType::BATCHNORM;
+    if (name == "LayerNormalization") return vkop::ops::OpType::LAYERNORM;
     if (name == "Relu") return vkop::ops::OpType::RELU;
     if (name == "Softmax") return vkop::ops::OpType::SOFTMAX;
     if (name == "Tanh") return vkop::ops::OpType::TANH;

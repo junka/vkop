@@ -20,7 +20,6 @@ layout(set=0, binding = 2) readonly uniform constBuffer {
     int axis;          // Axis for Softmax
 } uConst;
 
-
 shared vec4 sharedMax[256];
 shared vec4 sharedSum[256];
 
@@ -89,14 +88,6 @@ void softmax_axis0() {
         int x_coord = w * C4 + c_group;
         vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
         vec4 softmax_val = exp(packed - max_val) / sum_exp;
-
-        // 处理 C % 4 != 0 的情况：屏蔽无效通道
-        // if (c_group == C4 - 1 && C % 4 != 0) {
-        //     int c_last = C % 4;
-        //     if (c_last == 0) c_last = 4;  // 能被4整除
-        //     bvec4 valid = lessThan(ivec4(0,1,2,3), ivec4(c_last));
-        //     softmax_val *= vec4(valid);
-        // }
         imageStore(OutputImage, ivec2(x_coord, y_coord), softmax_val);
     }
 }
