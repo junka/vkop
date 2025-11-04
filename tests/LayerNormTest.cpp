@@ -98,9 +98,9 @@ public:
     std::vector<int> input_shape_ = {
         1, 5, 4, 4
     };
-    std::vector<int> normalized_shape_ = {4};
+    std::vector<int> normalized_shape_ = {4, 4};
     const std::unordered_map<std::string, std::string> param = {
-        {"eps", "1e-5"}, {"normalized_shape", "[4]"}
+        {"eps", "1e-5"}, {"normalized_shape", "[4, 4]"}
     };
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> weight;

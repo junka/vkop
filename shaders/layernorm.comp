@@ -100,9 +100,90 @@ void norm_for_w () {
     }
 }
 
-// dispatch (N, C), 归一化最后两个维度 HW
+// dispatch (N, C4), 归一化最后两个维度 HW
 void norm_for_hw() {
-    
+    int n = int(gl_WorkGroupID.x);
+    int c4 = int(gl_WorkGroupID.y);
+
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint lid = ly * 16 + lx;  // local thread ID [0, 255]
+
+    int N = uLayerhNormParam.outShape.x;
+    int C = uLayerhNormParam.outShape.y;
+    int H = uLayerhNormParam.outShape.z;
+    int W = uLayerhNormParam.outShape.w;
+    int D = uLayerhNormParam.innerSize;  // 应为 H * W
+    float epsilon = uLayerhNormParam.eps;
+    int C4 = (C + 3) / 4;
+
+    if (n >=N || c4 >= C4) return;
+
+
+    vec4 local_sum = vec4(0.0f);
+    vec4 local_sum_sq = vec4(0.0f);
+
+    for (int hw = int(lid); hw < D; hw += 256) {
+        int h = hw / W;
+        int w = hw % W;
+
+        int y_coord = n * H + h;
+        int x_coord = c4 * W + w;
+        ivec2 coord = ivec2(x_coord, y_coord);
+
+        vec4 pixel = texelFetch(inputImage, coord, 0);
+
+        local_sum += pixel;
+        local_sum_sq += pixel * pixel;
+    }
+
+    sum[lid] = local_sum;
+    sum_sq[lid] = local_sum_sq;
+    memoryBarrierShared();
+    barrier();
+
+    // 并行规约求和
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            sum[lid] += sum[lid + stride];
+            sum_sq[lid] += sum_sq[lid + stride];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // lid == 0 的线程计算 mean 和 inv_std
+    vec4 mean, inv_std;
+    if (lid == 0) {
+        mean = sum[0] / float(D);
+        vec4 var = sum_sq[0] / float(D) - mean * mean;
+        var = max(var, 0.0);
+        inv_std = inversesqrt(var + epsilon);
+        shared_mean = mean;
+        shared_inv_std = inv_std;
+    }
+    barrier();
+
+    // ===== 第二步：读取输入，归一化，写入输出 =====
+    for (int hw = int(lid); hw < D; hw += 256) {
+        int h = hw / W;
+        int w = hw % W;
+
+        int y_coord = n * H + h;
+        int x_coord = c4 * W + w;
+        ivec2 coord = ivec2(x_coord, y_coord);
+
+        vec4 pixel = texelFetch(inputImage, coord, 0);
+
+        vec4 norm = (pixel - shared_mean) * shared_inv_std;
+
+        // Apply weight & bias
+        vec4 weight = vec4(uScaleBias.attr[hw].x);
+        vec4 bias = vec4(uScaleBias.attr[hw].y);
+
+        vec4 outputPixel = norm * weight + bias;
+        imageStore(outputImage, coord, outputPixel);
+    }
 }
 
 void main() {
@@ -111,7 +192,6 @@ void main() {
         norm_for_w();
     } else if (uLayerhNormParam.normalizedDim == 2) {
         norm_for_hw();
-        imageStore(outputImage, ivec2(0, 0), vec4(0.5f));
     } else {
         // 归一化所有维度 CHW
         imageStore(outputImage, ivec2(0, 0), vec4(3.0f));
