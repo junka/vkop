@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <vector>
 #include <random>
+#include <iomanip>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -24,7 +25,7 @@ private:
     void initTestdata()
     {
         std::vector<int> t = {
-            6, 9, 64, 64
+            4, 1, 64, 64
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);
@@ -36,12 +37,15 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> inputa_dist{0.0F, 1.0F};
-        std::normal_distribution<> inputb_dist{1.0F, 2.0F};
+        std::normal_distribution<> inputa_dist{0.2F, 3.0F};
+        std::normal_distribution<> inputb_dist{1.0F, 4.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             inputa_ptr[i] = inputa_dist(gen);
             inputb_ptr[i] = inputa_dist(gen);
             expectedOutput[i] = inputa_ptr[i] / inputb_ptr[i];
+            std::cout << "i " << i << ": "<< std::setprecision(15) << inputa_ptr[i];
+            std::cout << ", " << std::setprecision(15) <<  inputb_ptr[i];
+            std::cout << " -> " << std::setprecision(15) << expectedOutput[i] << "\n";
         }
     }
 };

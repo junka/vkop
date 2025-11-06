@@ -1,4 +1,5 @@
 #version 450 core
+precision highp float;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -8,14 +9,16 @@ layout(binding = 0) writeonly uniform image2D uOutput;
 layout(binding = 1) uniform sampler2D inputA;
 layout(binding = 2) uniform sampler2D inputB;
 
+// https://forums.developer.nvidia.com/t/accuracy-of-fp-division/7762
+// GPU 使用倒数实现除法，精度低于CPU大约 2 ULP
 void main() {
     ivec2 texCoord = ivec2(gl_GlobalInvocationID);
 
     // Fetch data from RGBA texture memory and perform element-wise addition
     vec4 a = texelFetch(inputA, texCoord, 0);
     vec4 b = texelFetch(inputB, texCoord, 0);
-    vec4 sum = a / b;
+    vec4 ret = a/b;
 
     // Write the result to the output RGBA texture
-    imageStore(uOutput, texCoord, sum);
+    imageStore(uOutput, texCoord, ret);
 }
