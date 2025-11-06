@@ -16,7 +16,10 @@ using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Conv2d;
 
+#define USE_CPP_REFER 1
+
 namespace {
+#if USE_CPP_REFER
 
 /**
  * @brief 实现一个参考版本的2D卷积操作。
@@ -74,13 +77,14 @@ void reference_conv2d(const T* input, const T* weight,
     for (int b = 0; b < batch; ++b) {
         for (int oz = 0; oz < oc; ++oz) {
             int g_id = oz / oc_group; // 计算当前通道所属的组
+
             for (int oy = 0; oy < oh; ++oy) {
                 for (int ox = 0; ox < ow; ++ox) {
-                    float sum = 0; // 用于存储卷积结果
-                    auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox; // 计算输出张量的偏移量
-
+                    float sum = 0;
+                    
                     // 遍历输入通道和卷积核
                     for (int sz = g_id * ic_group; sz < (g_id + 1) * ic_group; ++sz) {
+
                         for (int ky = 0; ky < kh; ++ky) {
                             for (int kx = 0; kx < kw; ++kx) {
                                 // 计算输入张量的索引
@@ -105,12 +109,15 @@ void reference_conv2d(const T* input, const T* weight,
                     }
 
                     // 将卷积结果加上偏置并存储到输出张量
+                    // 计算输出张量的偏移量
+                    auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
                     output.at(dest_offset) = sum + bias[oz];
                 }
             }
         }
     }
 }
+#endif
 
 }  // namespace
 
@@ -118,20 +125,20 @@ void reference_conv2d(const T* input, const T* weight,
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 16, 8, 8}; // b, ic, ih, iw
-    int kernel_size_ = 4;
-    int stride_ = 2;
+    std::vector<int> input_shape_ = {1, 6, 4, 4}; // b, ic, ih, iw
+    int kernel_size_ = 2;
+    int stride_ = 1;
     int pad_ = 0;
-    int group_ = 1;
+    int group_ = 2;
     int dilation_ = 1;
-    int feature_size_ = 16; // oc
+    int feature_size_ = 4; // oc
 
     std::unordered_map<std::string, std::string> attributes = {
-        {"kernel_shape", std::to_string(kernel_size_)},
         {"strides", std::to_string(stride_)},
         {"pads", std::to_string(pad_)},
         {"dilations", std::to_string(dilation_)},
-        {"group", "1"}
+        {"group", std::to_string(group_)},
+        {"kernel_shape", std::to_string(kernel_size_)}
     };
 
     std::shared_ptr<Tensor<T>> weight_data_;
@@ -148,32 +155,32 @@ private:
     void initTestData() {
         std::vector<std::vector<int>> shapes;
         shapes.push_back(input_shape_);
+        shapes.push_back(std::vector<int>{feature_size_, input_shape_[1]/group_, kernel_size_, kernel_size_});
+        shapes.push_back(std::vector<int>{feature_size_});
 
-        const std::unordered_map<std::string, std::string> param = {{"kernel_shape", std::to_string(kernel_size_)},
-                                                                    {"stride", std::to_string(stride_)},
-                                                                    {"padding", std::to_string(pad_)},
-                                                                    {"dilations", std::to_string(dilation_)},
-                                                                    {"groups", "1"}};
-        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, param);
+        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, attributes);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
         auto torch_output = torch_tensors[0];
         auto torch_input = torch_tensors[1];
+        auto torch_weight = torch_tensors[2];
+        auto torch_bias = torch_tensors[3];
         std::vector<int> output_shape = std::get<1>(k);
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 
-#if 1
+#if USE_CPP_REFER
+
         printf("\n===Input==============\n");
-        for (int i = 0; i < output_shape[0]; i++) {
+        for (int i = 0; i < input_shape_[0]; i++) {
             printf("[\n");
-            for (int j = 0; j < output_shape[1]; j++) {
+            for (int j = 0; j < input_shape_[1]; j++) {
                 printf("[\n");
-                for (int k = 0; k < output_shape[2]; k++) {
+                for (int k = 0; k < input_shape_[2]; k++) {
                     printf("[");
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
+                    for (int l = 0; l < input_shape_[3]; l++) {
+                        int idx = i * input_shape_[1] * input_shape_[2] * input_shape_[3] +
+                                j * input_shape_[2] * input_shape_[3] +
+                                k * input_shape_[3] +
                                 l;
                         printf("%.4f, ", torch_input[idx]);
                     }
@@ -186,14 +193,15 @@ private:
 
         printf("\n===Output==============\n");
         for (int i = 0; i < output_shape[0]; i++) {
+            printf("[\n");
             for (int j = 0; j < output_shape[1]; j++) {
+                printf("[\n");
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
                         int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
                                 j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
-                                l;
+                                k * output_shape[3] + l;
                         printf("%.4f, ", torch_output[idx]);
                     }
                     printf("]\n");
@@ -202,38 +210,46 @@ private:
             }
             printf("\n");
         }
+
+        printf("========weight ==============\n");
+        for (int i = 0; i < feature_size_; i++) {
+            printf("[\n");
+            for (int j = 0; j < input_shape_[1] / group_; j++) {
+                printf("[\n");
+                for (int k = 0; k < kernel_size_; k++) {
+                    printf("[");
+                    for (int l = 0; l < kernel_size_; l++) {
+                        int idx = i * input_shape_[1] / group_ * kernel_size_ * kernel_size_ +
+                                j * kernel_size_ * kernel_size_ +
+                                k * kernel_size_ + l;
+                        printf("%.4f, ", torch_weight[idx]);
+                    }
+                    printf("]\n");
+                }
+                printf("]\n");
+            }
+            printf("]\n");
+        }
+        printf("\n============bias ===========\n");
+        for (int i = 0; i < feature_size_; i ++) {
+            printf("%.4f, ", torch_bias[i]);
+        }
 #endif
         input_data_ = std::make_shared<Tensor<float>>(input_shape_);
         for (int i = 0; i < input_data_->num_elements(); i++) {
             input_data_->at(i) = torch_input[i];
         }
         output_data_ = torch_output;
-#if 0
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{0.0F, 1.0F};
-
-        // Initialize weight data
-        // M, C/group, kh, kw
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
         for (int i = 0; i < weight_data_->num_elements(); i++) {
-            weight_data_->at(i) = static_cast<T>(input_dist(gen));
+            weight_data_->at(i) = torch_weight[i];
         }
-
-        // Initialize bias data
-        input_dist = std::normal_distribution<>(0.0F, 2.0F);
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-        for (int i = 0; i < bias_data_->num_elements(); ++i) {
-            bias_data_->at(i) = static_cast<T>(input_dist(gen));
+        for (int i = 0; i < bias_data_->num_elements(); i++) {
+            bias_data_->at(i) = torch_bias[i];
         }
-
-        // Initialize input data
-        input_dist = std::normal_distribution<>(0.0F, 255.0F);
-        input_data_ = std::make_shared<Tensor<T>>(input_shape_);
-        for (int i = 0; i < input_data_->num_elements(); ++i) {
-            input_data_->at(i) = static_cast<T>(input_dist(gen));
-        }
+        
+#if USE_CPP_REFER
 
         int batch = input_shape_[0];
         int ic = input_shape_[1];
@@ -248,13 +264,31 @@ private:
         int pad_w = pad_;
         int dilation_h = dilation_;
         int dilation_w = dilation_;
-
+        std::vector<float> ref_output_data;
         reference_conv2d(input_data_->data(), weight_data_->data(), bias_data_->data(),
-                 output_data_, batch, ic, oc,
+                 ref_output_data, batch, ic, oc,
                  ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w,
                  dilation_h, dilation_w, group_);
-        
-        printf("%f\n", output_data_[0]);
+        printf("\n===Reference Output==============\n");
+        for (int i = 0; i < output_shape[0]; i++) {
+            for (int j = 0; j < output_shape[1]; j++) {
+                for (int k = 0; k < output_shape[2]; k++) {
+                    printf("[");
+                    for (int l = 0; l < output_shape[3]; l++) {
+                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
+                                j * output_shape[2] * output_shape[3] +
+                                k * output_shape[3] + l;
+                        printf("%.4f, ", ref_output_data[idx]);
+                        if (fabs(ref_output_data[idx] - torch_output[idx]) > 0.0001F) {
+                            printf("  <-- MISMATCH ");
+                        }
+                    }
+                    printf("]\n");
+                }
+                printf("\n");
+            }
+            printf("\n");
+        }
 #endif
     }
 };
@@ -264,23 +298,6 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
     Conv2dTest<float> ct;
-
-    std::vector<std::vector<int>> shapes;
-    shapes.push_back(ct.input_shape_);
-    shapes.push_back(std::vector<int>{ct.feature_size_, ct.input_shape_[1]/ct.group_, ct.kernel_size_, ct.kernel_size_});
-    shapes.push_back(std::vector<int>{ct.feature_size_});
-    std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, ct.attributes);
-    std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
-    auto torch_output = torch_tensors[0];
-    auto torch_input = torch_tensors[1];
-    std::vector<int> output_shape = std::get<1>(k);
-    printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-    // for (int i = 0; i < static_cast<int>(torch_input.size()); i++) {
-    //     if (i % 8 == 0) {
-    //         printf("\n");
-    //     }
-    //     printf("%0.4f\t", torch_input[i]);
-    // }
 
     if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {

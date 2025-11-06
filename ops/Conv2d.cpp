@@ -17,10 +17,9 @@ void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
         VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
+        VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
     std::vector<std::shared_ptr<VulkanResource>> objs = {
-        outputImage_, inputImage_, weightImage_, biasImage_, paramBuffer_};
+        outputImage_, inputImage_, weightImage_, biasBuffer_, paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
                             reinterpret_cast<const uint32_t *>(spv), spv_len);
@@ -30,7 +29,7 @@ void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
     cmd2.begin();
     cmd2.bind(pipeline);
     query_pool.begin(cmd2.get());
-    cmd2.dispatch(out_width, out_height);
+    cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
     query_pool.end(cmd2.get());
     cmd2.end();
     cmd2.submit(m_dev_->getComputeQueue());

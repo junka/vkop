@@ -186,6 +186,9 @@ void norm_for_hw() {
     }
 }
 
+void norm_for_chw () {
+}
+
 void main() {
 
     if (uLayerhNormParam.normalizedDim == 1) {
@@ -193,7 +196,7 @@ void main() {
     } else if (uLayerhNormParam.normalizedDim == 2) {
         norm_for_hw();
     } else {
-        // 归一化所有维度 CHW
+        norm_for_chw();
         imageStore(outputImage, ivec2(0, 0), vec4(3.0f));
     }
 }
