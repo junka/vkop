@@ -104,7 +104,7 @@ public:
                             for (int l = 0; l < oshape[3]; l++) {
                                 int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
                                     k * oshape[3] + l;
-                                printf("%.4f, ", out_ptr[idx]); 
+                                printf("%.4f, ", out_ptr[idx]);
                             }
                             printf("]\n");
                         }

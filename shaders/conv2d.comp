@@ -154,19 +154,19 @@ void main() {
                 for (int ky = 0; ky < K_H; ++ky) {
                     int iy = s0.y + ky * uConstant.dilation.y;
                     // int iy = fma(ky, uConstant.dilation.y, s0.y);
-                    // if (iy < 0 || iy >= H_in) continue;
+                    if (iy < 0 || iy >= H_in) continue;
 
                     for (int kx = 0; kx < K_W; ++kx) {
                         int ix = s0.x + kx * uConstant.dilation.x;
                         // int ix = fma(kx, uConstant.dilation.x, s0.x);
-                        // if (ix < 0 || ix >= W_in) continue;
+                        if (ix < 0 || ix >= W_in) continue;
 
                         ivec2 inputCoord = ivec2(ix + ic4 * W_in, batch * H_in + iy);
                         float input_val = texelFetch(uInput, inputCoord, 0)[ic_comp];
 
-                        int kernel_x = kx + ic4 * K_W;
+                        int kernel_x = kx + (ic - ic_start) /4 * K_W;
                         int kernel_y = ky + oc * K_H;
-                        float weight = texelFetch(uKernel, ivec2(kernel_x, kernel_y), 0)[ic_comp];
+                        float weight = texelFetch(uKernel, ivec2(kernel_x, kernel_y), 0)[(ic - ic_start) % 4];
 
                         sum += input_val * weight;
                     }

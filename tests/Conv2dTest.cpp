@@ -125,7 +125,7 @@ void reference_conv2d(const T* input, const T* weight,
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 6, 4, 4}; // b, ic, ih, iw
+    std::vector<int> input_shape_ = {1, 16, 4, 4}; // b, ic, ih, iw
     int kernel_size_ = 2;
     int stride_ = 1;
     int pad_ = 0;
