@@ -29,7 +29,7 @@ void Resize::submit(const unsigned char *spv, unsigned int spv_len,
     cmd2.begin();
     cmd2.bind(pipeline);
     query_pool.begin(cmd2.get());
-    cmd2.dispatch(out_width, out_height);
+    cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
     query_pool.end(cmd2.get());
     cmd2.end();
     cmd2.submit(m_dev_->getComputeQueue());

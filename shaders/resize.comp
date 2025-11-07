@@ -1,49 +1,150 @@
 #version 450 core
 layout(std430) buffer;
 
-layout(set=0, binding=0) uniform sampler2D uInput;
-layout(set=0, binding=1) writeonly uniform image2D uOutput;
+layout(set=0, binding=0) writeonly uniform image2D uOutput;
+layout(set=0, binding=1) uniform sampler2D uInput;
 
-layout(set = 0, binding = 2) uniform reluBuffer{
+
+layout(set = 0, binding = 2) uniform resizeBuffer{
     ivec4 inImgSize;
-    ivec4 outImgSize;
-    vec4 scale;
+    ivec4 inShape;      // N, C, H_in, W_in
+    ivec4 outShape;     // N, C, H_out, W_out
+    int mode;
+    int nearest_mode;
+    int antialias;
+    int coordinate_transformation_mode;
+    float cubic_coeff_a;
 }uResizeParam;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+
+
+vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int mode) {
+    float oh = out_h;
+    float ow = out_w;
+    float ih = in_h;
+    float iw = in_w;
+    float ih_m1 = ih - 1.0;
+    float iw_m1 = iw - 1.0;
+
+    float in_y, in_x;
+
+    if (mode == 0) { // half_pixel
+        if (uResizeParam.outShape.z > 1) {
+            in_y = (oh + 0.5) * ih / float(uResizeParam.outShape.z) - 0.5;
+        } else {
+            in_y = 0.5 * ih_m1;
+        }
+        if (uResizeParam.outShape.w > 1) {
+            in_x = (ow + 0.5) * iw / float(uResizeParam.outShape.w) - 0.5;
+        } else {
+            in_x = 0.5 * iw_m1;
+        }
+    }
+    else if (mode == 1) { // half_pixel_symmetric
+        float scale_h = max(ih / float(uResizeParam.outShape.z), 1.0);
+        float scale_w = max(iw / float(uResizeParam.outShape.w), 1.0);
+        in_y = (oh + 0.5) * scale_h - 0.5;
+        in_x = (ow + 0.5) * scale_w - 0.5;
+    }
+    else if (mode == 2) { // pytorch_half_pixel
+        if (uResizeParam.outShape.z > 1) {
+            in_y = (oh + 0.5) * ih / float(uResizeParam.outShape.z) - 0.5;
+        } else {
+            in_y = 0.0;
+        }
+        if (uResizeParam.outShape.w > 1) {
+            in_x = (ow + 0.5) * iw / float(uResizeParam.outShape.w) - 0.5;
+        } else {
+            in_x = 0.0;
+        }
+    }
+    else if (mode == 3) { // align_corners
+        if (uResizeParam.outShape.z > 1) {
+            in_y = oh * ih_m1 / (float(uResizeParam.outShape.z) - 1.0);
+        } else {
+            in_y = 0.0;
+        }
+        if (uResizeParam.outShape.w > 1) {
+            in_x = ow * iw_m1 / (float(uResizeParam.outShape.w) - 1.0);
+        } else {
+            in_x = 0.0;
+        }
+    }
+    else if (mode == 4) { // asymmetric
+        in_y = oh * ih / float(uResizeParam.outShape.z);
+        in_x = ow * iw / float(uResizeParam.outShape.w);
+    }
+    else { // mode == 5: tf_crop_and_resize (not supported here)
+        in_y = 0.0;
+        in_x = 0.0;
+    }
+
+    return vec2(in_x, in_y);
+}
+
+// 双线性采样
+vec4 sample_bilinear(sampler2D tex, vec2 uv, int in_w, int in_h) {
+    uv = clamp(uv, vec2(0.0), vec2(float(in_w) - 1e-5, float(in_h) - 1e-5));
+    ivec2 iuv = ivec2(uv);
+    vec2 f = fract(uv);
+
+    vec4 tl = texelFetch(tex, ivec2(iuv.x, iuv.y), 0);
+    vec4 tr = texelFetch(tex, ivec2(min(iuv.x + 1, in_w - 1), iuv.y), 0);
+    vec4 bl = texelFetch(tex, ivec2(iuv.x, min(iuv.y + 1, in_h - 1)), 0);
+    vec4 br = texelFetch(tex, ivec2(min(iuv.x + 1, in_w - 1), min(iuv.y + 1, in_h - 1)), 0);
+
+    vec4 top = mix(tl, tr, f.x);
+    vec4 bot = mix(bl, br, f.x);
+    return mix(top, bot, f.y);
+}
+
 void main()
 {
-	ivec3 pos = ivec3(gl_GlobalInvocationID);
-	// input output layout is NC4HW4
+    int gx = int(gl_GlobalInvocationID.x);
+    int gy = int(gl_GlobalInvocationID.y);
+    // input output layout is NC4HW4
+    int N = uResizeParam.outShape.x;
+    int C = uResizeParam.outShape.y;
+    int H_out = uResizeParam.outShape.z;
+    int W_out = uResizeParam.outShape.w;
+    int C4 = (C+3)/4;
 
-	ivec3 inputImgSize = uResizeParam.inImgSize.xyz;
-	ivec3 outputImgSize = uResizeParam.outImgSize.xyz;
+    // Output layout: width = W_out * C4, height = H_out * N
+    int out_c4 = gx / W_out;
+    int out_w  = gx % W_out;
+    int out_n  = gy / H_out;
+    int out_h  = gy % H_out;
 
-    if(pos.x < outputImgSize.x && pos.y < outputImgSize.y)
-	{
-		float srcX = float(pos.x) * uResizeParam.scale.x + uResizeParam.scale.y;
-		int x1 = int(floor(srcX));
-		int x11 = clamp(x1, 0, inputImgSize.x - 1);
-		int x12 = clamp(x1 + 1, 0, inputImgSize.x - 1);
-		vec4 factorX = vec4(srcX - float(x1));
+    if (out_c4 >= C4 || out_n >= N) {
+        return;
+    }
 
-		float srcY = float(pos.y) * uResizeParam.scale.z + uResizeParam.scale.w;
-		int y1 = int(floor(srcY));
-		int y11 = clamp(y1, 0, inputImgSize.y - 1);
-		int y12 = clamp(y1 + 1, 0, inputImgSize.y - 1);
-		vec4 factorY = vec4(srcY - float(y1));
-        int sz = pos.z % inputImgSize.z;
-        int sb = pos.z / inputImgSize.z;
+    
+    // Input dimensions
+    int H_in = uResizeParam.inShape.z;
+    int W_in = uResizeParam.inShape.w;
 
-		vec4 res1 = texelFetch(uInput, ivec2(x11+sz*inputImgSize.x, y12+sb*inputImgSize.y), 0);
-		vec4 res2 = texelFetch(uInput, ivec2(x12+sz*inputImgSize.x, y12+sb*inputImgSize.y), 0);
-		vec4 res3 = texelFetch(uInput, ivec2(x11+sz*inputImgSize.x, y11+sb*inputImgSize.y), 0);
-		vec4 res4 = texelFetch(uInput, ivec2(x12+sz*inputImgSize.x, y11+sb*inputImgSize.y), 0);
-		vec4 res11 = (vec4(1.0) - factorX) * res1 + factorX * res2;
-		vec4 res12 = (vec4(1.0) - factorX) * res3 + factorX * res4;
-		
-		imageStore(uOutput, ivec2(pos.x+sz*outputImgSize.x, pos.y+sb*outputImgSize.y), factorY * res11 + (vec4(1.0) - factorY) * res12);
-	}
+    // Calculate input coordinates
+    vec2 in_uv = transform_coordinate(float(out_h), float(out_w), float(H_in), float(W_in), uResizeParam.coordinate_transformation_mode);
 
+    // Adjust for batch and channel groups
+    float in_y_batch = float(out_n * H_in) + in_uv.y;
+    float in_x_channel = float(out_c4 * 4); // Start channel within the group
+
+    // Sample using bilinear interpolation
+    vec4 value;
+    if (uResizeParam.mode == 1) { // linear, bilinear
+        float input_x = in_uv.x + float(out_c4 * W_in);
+        float input_y = float(out_n * H_in) + in_uv.y;
+        value = sample_bilinear(uInput, vec2(input_x, input_y), W_in, N * H_in);
+    }
+    // Write to the output image
+    // Assuming we want to write all 4 channels from the sampled value
+    // If only one channel is needed, adjust accordingly
+    int out_x = out_c4 * W_out + out_w;
+    int out_y = out_n * H_out + out_h;
+    imageStore(uOutput, ivec2(out_x, out_y), value);
 }
+

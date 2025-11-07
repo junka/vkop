@@ -532,7 +532,7 @@ public:
                 PyObject* value = nullptr;
 
                 printf("Parsing attribute: %s = %s\n", key.c_str(), val_str.c_str());
-                if (key == "inplace" || key == "bias") {
+                if (key == "inplace" || key == "bias" || key == "align_corners" || key == "antialias") {
                     value = (val_str == "True" || val_str == "true") ? Py_True : Py_False;
                     Py_INCREF(value);
                 } else if (key == "alpha" || key == "p" || key == "value") {
@@ -555,6 +555,17 @@ public:
                     has_laynernorm = true;
                     nomarlized_shape = create_shape_tuple(normalized_shape);
                     continue;
+                } else if (key == "size" || key == "scale_factor") {
+                    std::vector<int> resize_shape;
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        std::string content = val_str.substr(1, val_str.size() - 2);
+                        std::stringstream ss(content);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            resize_shape.push_back(std::stoi(item));
+                        }
+                    }
+                    value = create_shape_tuple(resize_shape);
                 } else {
                     // Try int first, then float, then string
                     try {
