@@ -67,7 +67,11 @@ public:
                 }
 
                 auto output = std::make_shared<Tensor<T>>();
-                op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
+                auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
+                op->apply(inputs, outputs);
+                op->copyTensorToImages<T>(inputs);
+                op->execute(inputs, outputs);
+                op->copyImageToTensor<T>(output);
                 auto *out_ptr = output->data();
                 auto oshape = output->getTensorShape();
                 for (int i = 0; i < oshape[0]; i++) {
@@ -125,7 +129,11 @@ public:
                 op->set_runtime_device(pdev, dev, cmdpool);
 
                 auto output = std::make_shared<Tensor<T>>();
+                auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
+                op->apply(inputs, outputs);
+                op->copyTensorToImages<T>(inputs);
                 op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
+                op->copyImageToTensor<T>(output);
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {

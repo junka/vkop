@@ -51,8 +51,8 @@ class BatchNorm2d : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
         auto input = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
         auto running_mean = core::as_tensor<T>(inputs[1]);
@@ -64,13 +64,7 @@ class BatchNorm2d : public Operator {
             (inputs.size() > 4) ? core::as_tensor<T>(inputs[4]) : nullptr;
 
         auto input_shape = input->getTensorShape();
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
 
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
         if (output->size() == 0) {
             output->resize(input->getTensorShape());
         }
@@ -87,7 +81,7 @@ class BatchNorm2d : public Operator {
             m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
-        inputImage_ = input->make_vkimg(
+        auto input_image = input->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
@@ -119,91 +113,79 @@ class BatchNorm2d : public Operator {
             VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
-            inputImage_->readBarrier(cmd.get());
+            input_image->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
+        inputImages_ = {input_image};
+    }
 
-        auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
-            paramBuffer_->getMappedMemory());
-        para->eps = eps_;
-        para->momentum = momentum_;
-        para->outShape[0] = batch;
-        para->outShape[1] = depth;
-        para->outShape[2] = out_height;
-        para->outShape[3] = out_width;
-
-        auto *var_buffer =
-            static_cast<float *>(tensorBuffer_->getMappedMemory());
-        for (int i = 0; i < running_mean->num_elements(); i++) {
-            *(var_buffer + 4 * i) = running_mean->data()[i];
-            *(var_buffer + 4 * i + 1) = running_var->data()[i];
-            if (inputs.size() > 3) {
-                *(var_buffer + 4 * i + 2) = weight->data()[i];
-            } else {
-                *(var_buffer + 4 * i + 2) = 1.0F;
-            }
-            if (inputs.size() > 4) {
-                *(var_buffer + 4 * i + 3) = bias->data()[i];
-            } else {
-                *(var_buffer + 4 * i + 3) = 0.0F;
-            }
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        if (inputs[0]->dtype() == typeid(float)) {
+            prepare<float>(inputs, outputs);
         }
-
-        auto input_rgba = input->convertTensorToRGBA();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            inputImage_->hostImageCopyToDevice(input_rgba.data());
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
-            cmdstg.begin();
-            inputImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                  input_rgba.data());
-            cmdstg.end();
-            cmdstg.submit(m_dev_->getComputeQueue());
-        }
-        VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-        cmd.begin();
-        inputImage_->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(m_dev_->getComputeQueue());
-
-        submit(batchnorm2d_spv, batchnorm2d_spv_len, realwidth, realheight);
-
-        std::vector<T> tmp(realheight * realwidth * 4);
-        T *ptr = tmp.data();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            outputImage->hostImageCopyToHost(ptr);
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
-            VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
-            cmdstg1.begin();
-            outputImage_->stagingBufferCopyToHost(cmdstg1.get());
-            cmdstg1.end();
-            cmdstg1.submit(m_dev_->getComputeQueue());
-            outputImage_->readStaingBuffer(ptr);
-        }
-
-        output->convertRGBAToTensor(ptr);
     }
 
     void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) override {
-        apply<float>(inputs, outputs);
+        if (inputs[0]->dtype() == typeid(float)) {
+            auto input = core::as_tensor<float>(inputs[0]);
+            auto output = core::as_tensor<float>(outputs[0]);
+            auto running_mean = core::as_tensor<float>(inputs[1]);
+            auto running_var = core::as_tensor<float>(inputs[2]);
+
+            auto weight = (inputs.size() > 3)
+                              ? core::as_tensor<float>(inputs[3])
+                              : nullptr;
+            auto bias = (inputs.size() > 4) ? core::as_tensor<float>(inputs[4])
+                                            : nullptr;
+
+            auto input_shape = input->getTensorShape();
+            int batch = input_shape[0];
+            int depth = input_shape[1];
+            int out_height = input_shape[2];
+            int out_width = input_shape[3];
+
+            int realwidth = out_width * UP_DIV(depth, 4);
+            int realheight = out_height * batch;
+
+            auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
+                paramBuffer_->getMappedMemory());
+            para->eps = eps_;
+            para->momentum = momentum_;
+            para->outShape[0] = batch;
+            para->outShape[1] = depth;
+            para->outShape[2] = out_height;
+            para->outShape[3] = out_width;
+
+            auto *var_buffer =
+                static_cast<float *>(tensorBuffer_->getMappedMemory());
+            for (int i = 0; i < running_mean->num_elements(); i++) {
+                *(var_buffer + 4 * i) = running_mean->data()[i];
+                *(var_buffer + 4 * i + 1) = running_var->data()[i];
+                if (inputs.size() > 3) {
+                    *(var_buffer + 4 * i + 2) = weight->data()[i];
+                } else {
+                    *(var_buffer + 4 * i + 2) = 1.0F;
+                }
+                if (inputs.size() > 4) {
+                    *(var_buffer + 4 * i + 3) = bias->data()[i];
+                } else {
+                    *(var_buffer + 4 * i + 3) = 0.0F;
+                }
+            }
+
+            // do copy before submit
+            submit(batchnorm2d_spv, batchnorm2d_spv_len, realwidth, realheight);
+        }
     }
 
   private:
     bool training_ = false;
     float momentum_ = 0.1;
     float eps_ = 1e-5;
-    std::shared_ptr<VulkanImage> outputImage_;
-    std::shared_ptr<VulkanImage> inputImage_;
+
     std::shared_ptr<VulkanBuffer> tensorBuffer_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
 
@@ -215,7 +197,7 @@ class BatchNorm2d : public Operator {
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
         std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputImage_, tensorBuffer_, paramBuffer_};
+            outputImage_, inputImages_[0], tensorBuffer_, paramBuffer_};
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanPipeline pipeline(device, types, objs,
                                 reinterpret_cast<const uint32_t *>(spv),

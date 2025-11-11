@@ -26,7 +26,10 @@ class BinaryFactory : public Operator {
         auto input_a = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
         auto input_b = core::as_tensor<T>(inputs[1]);
-
+        auto input_shape = input_a->getTensorShape();
+        if (output->size() == 0) {
+            output->resize(input_shape);
+        }
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
         if (m_dev_->is_support_host_image_copy()) {
@@ -39,10 +42,10 @@ class BinaryFactory : public Operator {
             m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
-        inputAImage_ = input_a->make_vkimg(
+        auto inputa_image = input_a->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
-        inputBImage_ = input_b->make_vkimg(
+        auto inputb_image = input_b->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 #ifdef VK_EXT_host_image_copy
@@ -54,9 +57,9 @@ class BinaryFactory : public Operator {
                 outputImage_->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
-            inputAImage_->hostImaggeTransition(
+            inputa_image->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            inputBImage_->hostImaggeTransition(
+            inputb_image->hostImaggeTransition(
                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -64,85 +67,62 @@ class BinaryFactory : public Operator {
             VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
-            inputAImage_->readBarrier(cmd.get());
-            inputBImage_->readBarrier(cmd.get());
+            inputa_image->readBarrier(cmd.get());
+            inputb_image->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
+        inputImages_ = {inputa_image, inputb_image};
     }
-    template <typename T>
+
     void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-               std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input_a = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        auto input_b = core::as_tensor<T>(inputs[1]);
-
-        auto input_shape = input_a->getTensorShape();
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
-
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
-        if (output->size() == 0) {
-            output->resize(input_a->getTensorShape());
+               std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        if (inputs[0]->dtype() == typeid(float)) {
+            prepare<float>(inputs, outputs);
+        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
+            prepare<uint16_t>(inputs, outputs);
+        } else {
+            LOG_ERROR("Unsupported data type");
         }
-        prepare<T>(inputs, outputs);
-
-        VkDevice device = m_dev_->getLogicalDevice();
-
-        auto inputa_rgba = input_a->convertTensorToRGBA();
-        auto inputb_rgba = input_b->convertTensorToRGBA();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            inputAImage_->hostImageCopyToDevice(inputa_rgba.data());
-            inputBImage_->hostImageCopyToDevice(inputb_rgba.data());
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
-            cmdstg.begin();
-            inputAImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   inputa_rgba.data());
-            inputBImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   inputb_rgba.data());
-            cmdstg.end();
-            cmdstg.submit(m_dev_->getComputeQueue());
-        }
-        VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-        cmd.begin();
-        inputAImage_->readBarrier(cmd.get());
-        inputBImage_->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(m_dev_->getComputeQueue());
-
-        submit(spv_, spv_len_, realwidth, realheight);
-
-        std::vector<T> tmp(realheight * realwidth * 4);
-        T *ptr = tmp.data();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            outputImage_->hostImageCopyToHost(ptr);
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
-            VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
-            cmdstg1.begin();
-            outputImage_->stagingBufferCopyToHost(cmdstg1.get());
-            cmdstg1.end();
-            cmdstg1.submit(m_dev_->getComputeQueue());
-            outputImage_->readStaingBuffer(ptr);
-        }
-
-        output->convertRGBAToTensor(ptr);
     }
 
     void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) override {
-        apply<float>(inputs, outputs);
+
+        if (inputs[0]->dtype() == typeid(float)) {
+            auto input_a = core::as_tensor<float>(inputs[0]);
+            auto output = core::as_tensor<float>(outputs[0]);
+            auto input_b = core::as_tensor<float>(inputs[1]);
+
+            auto input_shape = input_a->getTensorShape();
+            int batch = input_shape[0];
+            int depth = input_shape[1];
+            int out_height = input_shape[2];
+            int out_width = input_shape[3];
+
+            int realwidth = out_width * UP_DIV(depth, 4);
+            int realheight = out_height * batch;
+            submit(spv_, spv_len_, realwidth, realheight);
+        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
+            auto input_a = core::as_tensor<uint16_t>(inputs[0]);
+            auto output = core::as_tensor<uint16_t>(outputs[0]);
+            auto input_b = core::as_tensor<uint16_t>(inputs[1]);
+
+            auto input_shape = input_a->getTensorShape();
+            int batch = input_shape[0];
+            int depth = input_shape[1];
+            int out_height = input_shape[2];
+            int out_width = input_shape[3];
+
+            int realwidth = out_width * UP_DIV(depth, 4);
+            int realheight = out_height * batch;
+            if (output->size() == 0) {
+                output->resize(input_a->getTensorShape());
+            }
+            submit(spv_, spv_len_, realwidth, realheight);
+        } else {
+            LOG_ERROR("Unsupported data type");
+        }
     }
 
   protected:
@@ -152,9 +132,6 @@ class BinaryFactory : public Operator {
     }
 
   private:
-    std::shared_ptr<VulkanImage> outputImage_;
-    std::shared_ptr<VulkanImage> inputAImage_;
-    std::shared_ptr<VulkanImage> inputBImage_;
     unsigned char *spv_;
     unsigned int spv_len_;
 
@@ -165,7 +142,7 @@ class BinaryFactory : public Operator {
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
             VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
         std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputAImage_, inputBImage_};
+            outputImage_, inputImages_[0], inputImages_[1]};
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanPipeline pipeline(device, types, objs,
                                 reinterpret_cast<const uint32_t *>(spv),

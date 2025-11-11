@@ -19,7 +19,8 @@ void Conv2d::submit(const unsigned char *spv, unsigned int spv_len,
         VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
         VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
     std::vector<std::shared_ptr<VulkanResource>> objs = {
-        outputImage_, inputImage_, weightImage_, biasBuffer_, paramBuffer_};
+        outputImage_, inputImages_[0], inputImages_[1], biasBuffer_,
+        paramBuffer_};
     VkDevice device = m_dev_->getLogicalDevice();
     VulkanPipeline pipeline(device, types, objs,
                             reinterpret_cast<const uint32_t *>(spv), spv_len);

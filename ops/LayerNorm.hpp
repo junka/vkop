@@ -58,6 +58,10 @@ class LayerNorm : public Operator {
         auto bias =
             (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
+        auto input_shape = input->getTensorShape();
+        if (output->size() == 0) {
+            output->resize(input->getTensorShape());
+        }
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
         if (m_dev_->is_support_host_image_copy()) {
@@ -70,7 +74,7 @@ class LayerNorm : public Operator {
             m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
-        inputImage_ = input->make_vkimg(
+        auto input_image = input->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
@@ -101,124 +105,90 @@ class LayerNorm : public Operator {
             VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
-            inputImage_->readBarrier(cmd.get());
+            input_image->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
+        inputImages_ = {input_image};
     }
-    template <typename T>
+
     void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-               std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-
-        auto weight =
-            (inputs.size() > 1) ? core::as_tensor<T>(inputs[1]) : nullptr;
-        auto bias =
-            (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
-
-        auto input_shape = input->getTensorShape();
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
-
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
-        if (output->size() == 0) {
-            output->resize(input->getTensorShape());
+               std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        if (inputs[0]->dtype() == typeid(float)) {
+            prepare<float>(inputs, outputs);
+        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
+            prepare<uint16_t>(inputs, outputs);
+        } else {
+            LOG_ERROR("Unsupported data type");
         }
-        prepare<T>(inputs, outputs);
-
-        VkDevice device = m_dev_->getLogicalDevice();
-
-        auto *para = static_cast<layernorm::GpuLayerNormParam *>(
-            paramBuffer_->getMappedMemory());
-        para->eps = eps_;
-        para->outShape[0] = batch;
-        para->outShape[1] = depth;
-        para->outShape[2] = out_height;
-        para->outShape[3] = out_width;
-        para->normalizedDim = normalized_shape_.size();
-        para->innerSize = 1;
-        for (size_t i = 0; i < normalized_shape_.size(); i++) {
-            para->normalizedShape[i] = normalized_shape_[i];
-            para->innerSize *= normalized_shape_[i];
-        }
-
-        auto *var_buffer =
-            static_cast<float *>(tensorBuffer_->getMappedMemory());
-        for (int i = 0; i < weight->num_elements(); i++) {
-            if (inputs.size() > 1) {
-                *(var_buffer + 2 * i) = weight->data()[i];
-            } else {
-                *(var_buffer + 2 * i) = 1.0F;
-            }
-            if (inputs.size() > 2) {
-                *(var_buffer + 2 * i + 1) = bias->data()[i];
-            } else {
-                *(var_buffer + 2 * i + 1) = 0.0F;
-            }
-        }
-
-        auto input_rgba = input->convertTensorToRGBA();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            inputImage_->hostImageCopyToDevice(input_rgba.data());
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
-            cmdstg.begin();
-            inputImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                  input_rgba.data());
-            cmdstg.end();
-            cmdstg.submit(m_dev_->getComputeQueue());
-        }
-        VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-        cmd.begin();
-        inputImage_->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(m_dev_->getComputeQueue());
-        if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
-            submit(layernorm_spv, layernorm_spv_len, batch * UP_DIV(depth, 4),
-                   out_height);
-        } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
-            submit(layernorm_spv, layernorm_spv_len, batch, UP_DIV(depth, 4));
-        } else { // 归一化所有维度 CHW
-            submit(layernorm_spv, layernorm_spv_len, realwidth, realheight);
-        }
-        std::vector<T> tmp(realheight * realwidth * 4);
-        T *ptr = tmp.data();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
-            outputImage->hostImageCopyToHost(ptr);
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
-            VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
-            cmdstg1.begin();
-            outputImage_->stagingBufferCopyToHost(cmdstg1.get());
-            cmdstg1.end();
-            cmdstg1.submit(m_dev_->getComputeQueue());
-            outputImage_->readStaingBuffer(ptr);
-        }
-
-        output->convertRGBAToTensor(ptr);
     }
 
     void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) override {
-        apply<float>(inputs, outputs);
+        if (inputs[0]->dtype() == typeid(float)) {
+            auto input = core::as_tensor<float>(inputs[0]);
+            auto output = core::as_tensor<float>(outputs[0]);
+
+            auto weight = (inputs.size() > 1)
+                              ? core::as_tensor<float>(inputs[1])
+                              : nullptr;
+            auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
+                                            : nullptr;
+
+            auto input_shape = input->getTensorShape();
+            int batch = input_shape[0];
+            int depth = input_shape[1];
+            int out_height = input_shape[2];
+            int out_width = input_shape[3];
+
+            int realwidth = out_width * UP_DIV(depth, 4);
+            int realheight = out_height * batch;
+
+            auto *para = static_cast<layernorm::GpuLayerNormParam *>(
+                paramBuffer_->getMappedMemory());
+            para->eps = eps_;
+            para->outShape[0] = batch;
+            para->outShape[1] = depth;
+            para->outShape[2] = out_height;
+            para->outShape[3] = out_width;
+            para->normalizedDim = normalized_shape_.size();
+            para->innerSize = 1;
+            for (size_t i = 0; i < normalized_shape_.size(); i++) {
+                para->normalizedShape[i] = normalized_shape_[i];
+                para->innerSize *= normalized_shape_[i];
+            }
+
+            auto *var_buffer =
+                static_cast<float *>(tensorBuffer_->getMappedMemory());
+            for (int i = 0; i < weight->num_elements(); i++) {
+                if (inputs.size() > 1) {
+                    *(var_buffer + 2 * i) = weight->data()[i];
+                } else {
+                    *(var_buffer + 2 * i) = 1.0F;
+                }
+                if (inputs.size() > 2) {
+                    *(var_buffer + 2 * i + 1) = bias->data()[i];
+                } else {
+                    *(var_buffer + 2 * i + 1) = 0.0F;
+                }
+            }
+
+            // do copy before submit
+            if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
+                submit(layernorm_spv, layernorm_spv_len,
+                       batch * UP_DIV(depth, 4), out_height);
+            } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
+                submit(layernorm_spv, layernorm_spv_len, batch,
+                       UP_DIV(depth, 4));
+            } else { // 归一化所有维度 CHW
+                submit(layernorm_spv, layernorm_spv_len, realwidth, realheight);
+            }
+        }
     }
 
   private:
     float eps_ = 1e-5;
     std::vector<int> normalized_shape_;
-    std::shared_ptr<VulkanImage> outputImage_;
-    std::shared_ptr<VulkanImage> inputImage_;
     std::shared_ptr<VulkanBuffer> tensorBuffer_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
 
@@ -230,7 +200,7 @@ class LayerNorm : public Operator {
             VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
             VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
         std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputImage_, tensorBuffer_, paramBuffer_};
+            outputImage_, inputImages_[0], tensorBuffer_, paramBuffer_};
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanPipeline pipeline(device, types, objs,
                                 reinterpret_cast<const uint32_t *>(spv),

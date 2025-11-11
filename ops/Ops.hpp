@@ -117,9 +117,9 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::ERF;
     if (name == "Pow")
         return vkop::ops::OpType::POW;
-    if (name == "BatchNormalization")
+    if (name == "BatchNormalization" || name == "BatchNorm")
         return vkop::ops::OpType::BATCHNORM;
-    if (name == "LayerNormalization")
+    if (name == "LayerNormalization" || name == "LayerNorm")
         return vkop::ops::OpType::LAYERNORM;
     if (name == "Relu")
         return vkop::ops::OpType::RELU;

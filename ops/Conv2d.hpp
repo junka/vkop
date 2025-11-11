@@ -9,6 +9,7 @@
 #include "Operator.hpp"
 
 #include "core/Tensor.hpp"
+#include "include/logger.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanImage.hpp"
@@ -137,7 +138,23 @@ class Conv2d : public Operator {
         auto input_shape = input->getTensorShape();
         auto weight_shape = weight->getTensorShape();
 
+        int batch = input_shape[0];
+        int in_height = input_shape[2];
+        int in_width = input_shape[3];
+        int out_batch = batch;
+        int out_depth = weight_shape[0];
+        int out_height = (in_height + 2 * pads_[0] -
+                          dilations_[0] * (weight_shape[2] - 1) - 1) /
+                             strides_[0] +
+                         1;
+        int out_width = (in_width + 2 * pads_[1] -
+                         dilations_[1] * (weight_shape[3] - 1) - 1) /
+                            strides_[1] +
+                        1;
         int out_channel = weight_shape[0];
+        if (output->size() == 0) {
+            output->resize(out_batch, out_depth, out_height, out_width);
+        }
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -151,11 +168,11 @@ class Conv2d : public Operator {
             m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
 
-        inputImage_ = input->make_vkimg(
+        auto input_image = input->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
-        weightImage_ = weight->make_vkimg(
+        auto weight_image = weight->make_vkimg(
             m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
                         VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
 
@@ -189,144 +206,98 @@ class Conv2d : public Operator {
             VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
             cmd.begin();
             outputImage_->writeBarrier(cmd.get());
-            inputImage_->readBarrier(cmd.get());
-            weightImage_->readBarrier(cmd.get());
+            input_image->readBarrier(cmd.get());
+            weight_image->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
+        inputImages_ = {input_image, weight_image};
     }
 
-    template <typename T>
     void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-               std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        auto weight = core::as_tensor<T>(inputs[1]);
-        auto bias =
-            (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
-
-        auto input_shape = input->getTensorShape();
-        auto weight_shape = weight->getTensorShape();
-
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int in_height = input_shape[2];
-        int in_width = input_shape[3];
-
-        int out_batch = batch;
-        int out_depth = weight_shape[0];
-        int out_height = (in_height + 2 * pads_[0] -
-                          dilations_[0] * (weight_shape[2] - 1) - 1) /
-                             strides_[0] +
-                         1;
-        int out_width = (in_width + 2 * pads_[1] -
-                         dilations_[1] * (weight_shape[3] - 1) - 1) /
-                            strides_[1] +
-                        1;
-        int realwidth = out_width * UP_DIV(out_depth, 4);
-        int realheight = out_height * batch;
-
-        if (output->size() == 0) {
-            output->resize(out_batch, out_depth, out_height, out_width);
-        }
-        prepare<T>(inputs, outputs);
-
-        auto *para = static_cast<conv2d::GPUConv2dParam *>(
-            paramBuffer_->getMappedMemory());
-        // vkimage params
-        para->inputSize[0] = in_width;
-        para->inputSize[1] = in_height;
-        para->inputSize[2] = depth;
-        para->inputSize[3] = batch;
-        para->outputSize[0] = out_width;
-        para->outputSize[1] = out_height;
-        para->outputSize[2] = out_depth;
-        para->outputSize[3] = out_batch;
-        // original params
-
-        para->kernel_shape[0] = weight_shape[3];
-        para->kernel_shape[1] = weight_shape[2];
-        para->kernel_shape[2] = weight_shape[1];
-        para->kernel_shape[3] = weight_shape[0];
-        para->stride[0] = strides_[0];
-        para->stride[1] = strides_[1];
-        para->padding[0] = pads_[0];
-        para->padding[1] = pads_[1];
-        para->dilation[0] = dilations_[0];
-        para->dilation[1] = dilations_[1];
-
-        para->groups = groups_;
-        paramBuffer_->unmapMemory();
-
-        auto *bias_ptr = static_cast<T *>(biasBuffer_->getMappedMemory());
-        if (bias != nullptr) {
-            for (int i = 0; i < bias->num_elements(); i++) {
-                *(bias_ptr + i) = bias->data()[i];
-            }
+               std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        if (inputs[0]->dtype() == typeid(float)) {
+            prepare<float>(inputs, outputs);
         } else {
-            for (int i = 0; i < out_depth; i++) {
-                *(bias_ptr + i) = static_cast<T>(0);
-            }
+            LOG_ERROR("unsupported");
         }
-        biasBuffer_->unmapMemory();
-
-        VkDevice device = m_dev_->getLogicalDevice();
-
-        auto input_rgba = input->convertTensorToRGBA();
-
-        auto weight_rgba = weight->convertTensorToRGBA();
-
-#ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            inputImage_->hostImageCopyToDevice(input_rgba.data());
-            weightImage_->hostImageCopyToDevice(weight_rgba.data());
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmdstg(device, m_cmdpool_->getCommandPool());
-            cmdstg.begin();
-            inputImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                  input_rgba.data());
-            weightImage_->stagingBufferCopyToImage(cmdstg.get(),
-                                                   weight_rgba.data());
-            cmdstg.end();
-            cmdstg.submit(m_dev_->getComputeQueue());
-        }
-
-        VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-        cmd.begin();
-        inputImage_->readBarrier(cmd.get());
-        weightImage_->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(m_dev_->getComputeQueue());
-
-        submit(conv2d_spv, conv2d_spv_len, realwidth, realheight);
-
-        std::vector<T> tmp(realheight * realwidth * 4);
-        T *ptr = tmp.data();
-#ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            outputImage_->hostImageCopyToHost(ptr);
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
-            VulkanCommandBuffer cmdstg1(device, m_cmdpool_->getCommandPool());
-            cmdstg1.begin();
-            outputImage_->stagingBufferCopyToHost(cmdstg1.get());
-            cmdstg1.end();
-            cmdstg1.submit(m_dev_->getComputeQueue());
-            outputImage_->readStaingBuffer(ptr);
-        }
-
-        output->convertRGBAToTensor(ptr);
     }
 
     void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) override {
 
-        apply<float>(inputs, outputs);
+        if (inputs[0]->dtype() == typeid(float)) {
+            auto input = core::as_tensor<float>(inputs[0]);
+            auto output = core::as_tensor<float>(outputs[0]);
+            auto weight = core::as_tensor<float>(inputs[1]);
+            auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
+                                            : nullptr;
+
+            auto input_shape = input->getTensorShape();
+            auto weight_shape = weight->getTensorShape();
+
+            int batch = input_shape[0];
+            int depth = input_shape[1];
+            int in_height = input_shape[2];
+            int in_width = input_shape[3];
+
+            int out_batch = batch;
+            int out_depth = weight_shape[0];
+            int out_height = (in_height + 2 * pads_[0] -
+                              dilations_[0] * (weight_shape[2] - 1) - 1) /
+                                 strides_[0] +
+                             1;
+            int out_width = (in_width + 2 * pads_[1] -
+                             dilations_[1] * (weight_shape[3] - 1) - 1) /
+                                strides_[1] +
+                            1;
+            int realwidth = out_width * UP_DIV(out_depth, 4);
+            int realheight = out_height * batch;
+
+            auto *para = static_cast<conv2d::GPUConv2dParam *>(
+                paramBuffer_->getMappedMemory());
+            // vkimage params
+            para->inputSize[0] = in_width;
+            para->inputSize[1] = in_height;
+            para->inputSize[2] = depth;
+            para->inputSize[3] = batch;
+            para->outputSize[0] = out_width;
+            para->outputSize[1] = out_height;
+            para->outputSize[2] = out_depth;
+            para->outputSize[3] = out_batch;
+            // original params
+
+            para->kernel_shape[0] = weight_shape[3];
+            para->kernel_shape[1] = weight_shape[2];
+            para->kernel_shape[2] = weight_shape[1];
+            para->kernel_shape[3] = weight_shape[0];
+            para->stride[0] = strides_[0];
+            para->stride[1] = strides_[1];
+            para->padding[0] = pads_[0];
+            para->padding[1] = pads_[1];
+            para->dilation[0] = dilations_[0];
+            para->dilation[1] = dilations_[1];
+
+            para->groups = groups_;
+            paramBuffer_->unmapMemory();
+
+            auto *bias_ptr =
+                static_cast<float *>(biasBuffer_->getMappedMemory());
+            if (bias != nullptr) {
+                for (int i = 0; i < bias->num_elements(); i++) {
+                    *(bias_ptr + i) = bias->data()[i];
+                }
+            } else {
+                for (int i = 0; i < out_depth; i++) {
+                    *(bias_ptr + i) = static_cast<float>(0);
+                }
+            }
+            biasBuffer_->unmapMemory();
+
+            submit(conv2d_spv, conv2d_spv_len, realwidth, realheight);
+        } else {
+            LOG_ERROR("Unsupported data type");
+        }
     }
 
   private:
@@ -338,9 +309,6 @@ class Conv2d : public Operator {
 
     conv2d::PaddingMode padding_mode_;
 
-    std::shared_ptr<VulkanImage> outputImage_;
-    std::shared_ptr<VulkanImage> inputImage_;
-    std::shared_ptr<VulkanImage> weightImage_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
     std::shared_ptr<VulkanBuffer> biasBuffer_;
 
