@@ -7,7 +7,6 @@
 #include "ops/Ops.hpp"
 
 #include <algorithm>
-#include <bits/stdint-intn.h>
 #include <cstdint>
 #include <memory>
 #include <random>
@@ -26,6 +25,156 @@ using vkop::load::VkModel;
 using vkop::ops::OperatorFactory;
 
 
+enum class Category : int {
+    UNKNOWN = 0,
+    HUMAN_FACE = 1,
+    LICENSE_PLATE = 2,
+    OTHERS = 999
+};
+
+using MaskInfo = struct MaskInfo {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+
+    float score;
+    Category category;
+};
+
+static float score_threshold[2] = {0.35F, 0.5F};
+
+std::vector<MaskInfo> postProcessNMS(
+    const float* hm_data, const float* hm_nms_data,
+    const float* reg_data, const float* dim_data,
+    const float* cls_data, int H, int W, int image_h, int image_w,
+    int tensor_h, int tensor_w
+) {
+    auto sigmoid = [](float x) -> float {
+        return 1.0f / (1.0f + std::exp(-x));
+    };
+    const int num_points = H * W;
+
+    std::vector<int> indices(num_points);
+    for (int i = 0; i < num_points; i++) {
+        indices[i] = i;
+    }
+    std::partial_sort(indices.begin(), indices.begin() + 64, indices.end(),
+        [hm_nms_data](const int& i1, const int& i2) {
+            return hm_nms_data[i1] > hm_nms_data[i2];
+        });
+
+    std::vector<MaskInfo> detections;
+    for (int i = 0; i < 64; i++) {
+        int idx = indices.at(i);
+
+        if (std::fabs(hm_data[idx] - hm_nms_data[idx]) > 1e-6F) {
+            continue;
+        }
+
+        float score = sigmoid(hm_nms_data[idx]);
+        int category = 0;
+        const float cls_value1 = cls_data[idx];
+        const float cls_value2 = cls_data[num_points + idx];
+        if (cls_value1 > cls_value2) {
+            category = 0;
+        } else {
+            category = 1;
+        }
+
+        if (score < score_threshold[category]) {
+            continue;
+        }
+
+        int y = idx / W;
+        int x = idx % W;
+        float xo = sigmoid(reg_data[idx]) + x;
+        float yo = sigmoid(reg_data[num_points + idx]) + y;
+        // std::cout << "point at index " << idx << " has (x, y): (" << xo << ", " << yo << ")" << std::endl;
+        xo *= (tensor_w / W);
+        yo *= (tensor_h / H);
+
+        float wo = std::exp(dim_data[idx]) * tensor_w / W;
+        float ho = std::exp(dim_data[num_points + idx]) * tensor_h / H;
+
+        // std::cout << "index " << idx << " score " << score <<" Raw bbox (center x, center y, width, height): (" << xo << ", " << yo << ", " << wo << ", " << ho << ")" << std::endl;
+        xo = xo * W / tensor_w;
+        wo = wo * W / tensor_w;
+        yo = yo * H / tensor_h;
+        ho = ho * H / tensor_h;
+
+        float scale_x = static_cast<float>(tensor_w) / W;
+        float scale_y = static_cast<float>(tensor_h) / H;
+
+        float x1 = (xo - wo * 0.5F) * scale_x * image_w / tensor_w;
+        float y1 = (yo - ho * 0.5F) * scale_y * image_h / tensor_h;
+        float x2 = (xo + wo * 0.5F) * scale_x * image_w / tensor_w;
+        float y2 = (yo + ho * 0.5F) * scale_y * image_h / tensor_h;
+        x1 = std::max(0, static_cast<int>(x1));
+        y1 = std::max(0, static_cast<int>(y1));
+        x2 = std::min(static_cast<int>(x2), image_w - 1);
+        y2 = std::min(static_cast<int>(y2), image_h - 1);
+
+        std::cout << "Detected plate at: (" << x1 << ", " << y1 << ") to (" << x2 << ", " << y2 << ") with score: " << score
+                  << " and category: " << category << std::endl;
+
+        // detections.push_back({x1, y1, x2, y2, score, Category::category});
+    }
+    return detections;
+}
+
+
+
+void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
+    int in_h = t->getTensorShape()[2];
+    int in_w = t->getTensorShape()[3];
+
+    float* data_ptr = t->data();
+
+    float x_ratio = float(image_w - 1) / (in_w - 1);
+    float y_ratio = float(image_h - 1) / (in_h - 1);
+
+    const uint8_t* y_src = raw_image.data();
+    const uint8_t* u_src = raw_image.data() + image_w * image_h;
+    const uint8_t* v_src = raw_image.data() + 2 * image_w * image_h;
+
+    float* y_dst = data_ptr;
+    float* u_dst = data_ptr + in_w * in_h;
+    float* v_dst = data_ptr + 2 * in_w * in_h;
+
+    for (int dy = 0; dy < in_h; ++dy) {
+        for (int dx = 0; dx < in_w; ++dx) {
+            float src_x = dx * x_ratio;
+            float src_y = dy * y_ratio;
+            int x1 = static_cast<int>(src_x);
+            int y1 = static_cast<int>(src_y);
+            int x2 = std::min(x1 + 1, image_w - 1);
+            int y2 = std::min(y1 + 1, image_h - 1);
+
+            float dx_ratio = src_x - x1;
+            float dy_ratio = src_y - y1;
+
+            // 对 Y, U, V 分量分别进行双线性插值
+            auto interpolate = [](const uint8_t* plane, int w, int x1, int y1, int x2, int y2, float dx, float dy) {
+                uint8_t p11 = plane[y1 * w + x1];
+                uint8_t p12 = plane[y1 * w + x2];
+                uint8_t p21 = plane[y2 * w + x1];
+                uint8_t p22 = plane[y2 * w + x2];
+                return static_cast<uint8_t>(
+                    p11 * (1 - dx) * (1 - dy) +
+                    p12 * dx * (1 - dy) +
+                    p21 * (1 - dx) * dy +
+                    p22 * dx * dy
+                );
+            };
+
+            int dst_idx = dy * in_w + dx;
+            y_dst[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            u_dst[dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            v_dst[dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+        }
+    }
+}
 
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
@@ -47,71 +196,27 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    if (argc < 2) {
-        std::cerr << "Usage: " << argv[0] << " <binary_file_path>" << std::endl;
+    if (argc < 3) {
+        std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image.yuv>" << std::endl;
         return 1;
     }
     try {
         std::string binary_file_path = argv[1];
         VkModel model(binary_file_path);
+        // VkModel::dump_model(model);
+        std::string image_file_path = argv[2];
+        std::vector<uint8_t> frame;
 
-        std::cout << "Inputs:" << std::endl;
-        for (const auto& input : model.inputs) {
-            std::cout << "  Name: " << input.name << ", Shape: [";
-            for (size_t i = 0; i < input.dims.size(); ++i) {
-                std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
-            }
-            std::cout << "]" << std::endl;
-        }
+        std::ifstream infile(image_file_path, std::ios::in | std::ios::binary);
+        infile.seekg(0, std::ios::end);
+        size_t file_size = infile.tellg();
+        infile.seekg(0, std::ios::beg);
+        frame.resize(file_size);
+        infile.read(reinterpret_cast<char*>(frame.data()), file_size);
+        infile.close();
 
-        std::cout << "Outputs:" << std::endl;
-        for (const auto& output : model.outputs) {
-            std::cout << "  Name: " << output.name << ", Shape: [";
-            for (size_t i = 0; i < output.dims.size(); ++i) {
-                std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
-            }
-            std::cout << "]" << std::endl;
-        }
-
-        std::cout << "Nodes:" << std::endl;
-        for (const auto& node : model.nodes) {
-            std::cout << "  OpType: " << node.op_type;
-            std::cout << "  Name: " << node.name;
-            if (!node.attributes.empty()) {
-                std::cout << ", Attributes: {";
-                for (const auto& attr : node.attributes) {
-                    std::cout << attr.first << ": " << attr.second << ", ";
-                }
-                std::cout << "}";
-            }
-            std::cout << "  Inputs: " ;
-            for (const auto& input : node.inputs) {
-                std::cout << input.name << ", [";
-                for (size_t i = 0; i < input.dims.size(); ++i) {
-                    std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
-                }
-                std::cout << "]" << std::endl;
-            }
-
-            std::cout << "  Outputs: ";
-            for (const auto& output : node.outputs) {
-                std::cout << output.name << ", [";
-                for (size_t i = 0; i < output.dims.size(); ++i) {
-                    std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
-                }
-                std::cout << "]" << std::endl;
-            }
-            std::cout << std::endl;
-        }
-
-        // std::cout << "Initializers:" << std::endl;
-        // for (const auto& [name, initializer] : model.initializers) {
-        //     std::cout << name << ", [";
-        //     for (size_t i = 0; i < initializer.dims.size(); ++i) {
-        //         std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
-        //     }
-        //     std::cout << "], DType: " << initializer.dtype << std::endl;
-        // }
+        int image_h = 1080;
+        int image_w = 1920;
 
         std::vector<std::shared_ptr<ITensor>> inputs;
         std::vector<std::shared_ptr<ITensor>> outputs;
@@ -123,8 +228,13 @@ int main(int argc, char *argv[]) {
         for (const auto& i : model.inputs) {
             auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
+            t->printTensorShape();
             tensor_map[i.name] = t;
         }
+        
+        auto t = vkop::core::as_tensor<float>(inputs[0]);
+        resize_YUV(frame, image_h, image_w, t);
+
         for (const auto& o: model.outputs) {
             printf("Output %s\n", o.name.c_str());
             auto t = std::make_shared<Tensor<float>>(o.dims);
@@ -150,7 +260,7 @@ int main(int argc, char *argv[]) {
                     node_inputs.push_back(tensor_map[in_shape.name]);
                     // std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << std::endl;
                 } else {
-                    std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
+                    // std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
                     if (in_shape.dims.empty()) {
                         node_inputs.push_back(nullptr);
                         continue;
@@ -161,11 +271,10 @@ int main(int argc, char *argv[]) {
                             throw std::runtime_error("Initializer dims do not match for " + in_shape.name);
                         }
                         if (init.dtype == "int64") {
-                            printf("load int64 initializer %s for op %s\n", in_shape.name.c_str(), n.op_type.c_str());
+                            // printf("load int64 initializer %s for op %s\n", in_shape.name.c_str(), n.op_type.c_str());
                             auto t = std::make_shared<Tensor<int64_t>>(in_shape.dims);
                             for (int i = 0; i < t->num_elements(); ++i) {
                                 t->data()[i] = static_cast<float>(init.dataii[i]);
-                                printf("%ld ", t->data()[i]);
                             }
                             tensor_map[in_shape.name] = t;
                             node_inputs.push_back(t);
@@ -194,9 +303,7 @@ int main(int argc, char *argv[]) {
             for (const auto& out_shape : n.outputs) {
                 if (tensor_map.find(out_shape.name) != tensor_map.end()) {
                     node_outputs.push_back(tensor_map[out_shape.name]);
-                    // std::cout << "find output tensor " << out_shape.name << " for op " << n.op_type << std::endl;
                 } else {
-                    // std::cout << "create empty out tensor " << out_shape.name << " for op " << n.op_type << std::endl;
                     auto t = std::make_shared<Tensor<float>>(out_shape.dims);
                     tensor_map[out_shape.name] = t;
                     node_outputs.push_back(t);
@@ -220,15 +327,18 @@ int main(int argc, char *argv[]) {
             outputs_all.push_back(node_outputs);
         }
 
-
-        // fill input with image
         for (size_t i = 0; i < ops_all.size(); ++i) {
-            printf("execute op %s\n", convert_openum_to_string(ops_all[i]->get_type()).c_str());
             ops_all[i]->execute(inputs_all[i], outputs_all[i]);
         }
-        // for (size_t i = 0; i < outputs.size(); ++i) {
-        //     std::cout << "output " << i << ": " << " " << outputs[i]->num_elements() << std::endl;
-        // }
+        
+        auto hm = vkop::core::as_tensor<float>(outputs[0]);
+        auto reg = vkop::core::as_tensor<float>(outputs[1]);
+        auto dim = vkop::core::as_tensor<float>(outputs[2]);
+        auto cls = vkop::core::as_tensor<float>(outputs[3]);
+        auto hm_nms = vkop::core::as_tensor<float>(outputs[4]);
+        
+        postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
+            t->getTensorShape()[2], t->getTensorShape()[3]);
 
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;

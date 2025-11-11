@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <unordered_map>
 #include <cstring>
+#include <iostream>
 
 namespace vkop {
 
@@ -47,6 +48,65 @@ public:
     std::unordered_map<std::string, Initializer> initializers;
 
     explicit VkModel(const std::string& filePath);
+    static void dump_model(const VkModel& model) {
+        std::cout << "Inputs:" << std::endl;
+        for (const auto& input : model.inputs) {
+            std::cout << "  Name: " << input.name << ", Shape: [";
+            for (size_t i = 0; i < input.dims.size(); ++i) {
+                std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+        }
+
+        std::cout << "Outputs:" << std::endl;
+        for (const auto& output : model.outputs) {
+            std::cout << "  Name: " << output.name << ", Shape: [";
+            for (size_t i = 0; i < output.dims.size(); ++i) {
+                std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
+            }
+            std::cout << "]" << std::endl;
+        }
+
+        std::cout << "Nodes:" << std::endl;
+        for (const auto& node : model.nodes) {
+            std::cout << "  OpType: " << node.op_type;
+            std::cout << "  Name: " << node.name;
+            if (!node.attributes.empty()) {
+                std::cout << ", Attributes: {";
+                for (const auto& attr : node.attributes) {
+                    std::cout << attr.first << ": " << attr.second << ", ";
+                }
+                std::cout << "}";
+            }
+            std::cout << "  Inputs: " ;
+            for (const auto& input : node.inputs) {
+                std::cout << input.name << ", [";
+                for (size_t i = 0; i < input.dims.size(); ++i) {
+                    std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
+                }
+                std::cout << "]" << std::endl;
+            }
+
+            std::cout << "  Outputs: ";
+            for (const auto& output : node.outputs) {
+                std::cout << output.name << ", [";
+                for (size_t i = 0; i < output.dims.size(); ++i) {
+                    std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
+                }
+                std::cout << "]" << std::endl;
+            }
+            std::cout << std::endl;
+        }
+
+        std::cout << "Initializers:" << std::endl;
+        for (const auto& [name, initializer] : model.initializers) {
+            std::cout << name << ", [";
+            for (size_t i = 0; i < initializer.dims.size(); ++i) {
+                std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
+            }
+            std::cout << "], DType: " << initializer.dtype << std::endl;
+        }
+    }
 private:
     void loadFromBinary(const std::string& filePath);
 
