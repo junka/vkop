@@ -6,6 +6,7 @@
 
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
+#include "ops/Ops.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanImage.hpp"
@@ -17,14 +18,14 @@ namespace ops {
 
 class BinaryFactory : public Operator {
   public:
-    BinaryFactory() = default;
+    explicit BinaryFactory(OpType type) : Operator(type) {}
 
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input_a = inputs[0];
-        auto input_b = inputs[1];
-        auto output = outputs[0];
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input_a = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
+        auto input_b = core::as_tensor<T>(inputs[1]);
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -70,11 +71,11 @@ class BinaryFactory : public Operator {
         }
     }
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input_a = inputs[0];
-        auto input_b = inputs[1];
-        auto output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input_a = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
+        auto input_b = core::as_tensor<T>(inputs[1]);
 
         auto input_shape = input_a->getTensorShape();
         int batch = input_shape[0];
@@ -87,7 +88,7 @@ class BinaryFactory : public Operator {
         if (output->size() == 0) {
             output->resize(input_a->getTensorShape());
         }
-        prepare(inputs, outputs);
+        prepare<T>(inputs, outputs);
 
         VkDevice device = m_dev_->getLogicalDevice();
 
@@ -139,21 +140,9 @@ class BinaryFactory : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override {
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
         apply<float>(inputs, outputs);
-    }
-
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
-        apply<int>(inputs, outputs);
-    }
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
-        apply<uint16_t>(inputs, outputs);
     }
 
   protected:

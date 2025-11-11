@@ -35,7 +35,7 @@ struct GpuBatchNormParam {
 
 class BatchNorm2d : public Operator {
   public:
-    BatchNorm2d() = default;
+    BatchNorm2d() : Operator(OpType::BATCHNORM) {}
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         attributes.find("training") != attributes.end()
@@ -49,23 +49,31 @@ class BatchNorm2d : public Operator {
             momentum_ = std::stof(attributes.at("momentum"));
         }
     }
+
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto running_mean = inputs[1];
-        auto running_var = inputs[2];
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
+        auto running_mean = core::as_tensor<T>(inputs[1]);
+        auto running_var = core::as_tensor<T>(inputs[2]);
 
-        std::shared_ptr<core::Tensor<T>> weight;
-        std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 3) {
-            weight = inputs[3];
-        }
-        if (inputs.size() > 4) {
-            bias = inputs[4];
-        }
+        auto weight =
+            (inputs.size() > 3) ? core::as_tensor<T>(inputs[3]) : nullptr;
+        auto bias =
+            (inputs.size() > 4) ? core::as_tensor<T>(inputs[4]) : nullptr;
 
-        auto output = outputs[0];
+        auto input_shape = input->getTensorShape();
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        int out_height = input_shape[2];
+        int out_width = input_shape[3];
+
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
+        if (output->size() == 0) {
+            output->resize(input->getTensorShape());
+        }
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -115,38 +123,6 @@ class BatchNorm2d : public Operator {
             cmd.end();
             cmd.submit(m_dev_->getComputeQueue());
         }
-    }
-    template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto running_mean = inputs[1];
-        auto running_var = inputs[2];
-        auto output = outputs[0];
-
-        std::shared_ptr<core::Tensor<T>> weight;
-        std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 3) {
-            weight = inputs[3];
-        }
-        if (inputs.size() > 4) {
-            bias = inputs[4];
-        }
-
-        auto input_shape = input->getTensorShape();
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
-
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
-        if (output->size() == 0) {
-            output->resize(input->getTensorShape());
-        }
-        prepare(inputs, outputs);
-
-        VkDevice device = m_dev_->getLogicalDevice();
 
         auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
             paramBuffer_->getMappedMemory());
@@ -217,22 +193,9 @@ class BatchNorm2d : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override {
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
         apply<float>(inputs, outputs);
-    }
-
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
-        apply<int>(inputs, outputs);
-    }
-
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
-        apply<uint16_t>(inputs, outputs);
     }
 
   private:

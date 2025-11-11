@@ -12,7 +12,9 @@ namespace ops {
 
 class Atan : public UnaryFactory {
   public:
-    Atan() { set_vulkan_spv(atan_spv, atan_spv_len); }
+    Atan() : UnaryFactory(OpType::ATAN) {
+        set_vulkan_spv(atan_spv, atan_spv_len);
+    }
 };
 
 } // namespace ops

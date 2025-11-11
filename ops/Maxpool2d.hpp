@@ -26,7 +26,7 @@ struct GpuMaxpoolParam {
 
 class Maxpool2d : public Operator {
   public:
-    Maxpool2d() = default;
+    Maxpool2d() : Operator(OpType::MAXPOOL2D) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -115,10 +115,10 @@ class Maxpool2d : public Operator {
         }
     }
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
 
         auto input_shape = input->getTensorShape();
 
@@ -167,10 +167,10 @@ class Maxpool2d : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
         auto input_shape = input->getTensorShape();
 
         if (input_shape.size() != 4) {
@@ -211,7 +211,7 @@ class Maxpool2d : public Operator {
         if (output->size() == 0) {
             output->resize(batch, depth, out_height, out_width);
         }
-        prepare(inputs, outputs);
+        prepare<T>(inputs, outputs);
 
         auto *para = static_cast<maxpool2d::GpuMaxpoolParam *>(
             paramBuffer_->getMappedMemory());
@@ -279,16 +279,10 @@ class Maxpool2d : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
-
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        apply<float>(inputs, outputs);
+    }
 
   private:
     std::vector<int> kernel_shape_;

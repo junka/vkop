@@ -37,7 +37,7 @@ struct GpuLayerNormParam {
 
 class LayerNorm : public Operator {
   public:
-    LayerNorm() = default;
+    LayerNorm() : Operator(OpType::LAYERNORM) {}
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("eps") != attributes.end()) {
@@ -49,20 +49,14 @@ class LayerNorm : public Operator {
         }
     }
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-
-        std::shared_ptr<core::Tensor<T>> weight;
-        std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 1) {
-            weight = inputs[1];
-        }
-        if (inputs.size() > 2) {
-            bias = inputs[2];
-        }
-
-        auto output = outputs[0];
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
+        auto weight =
+            (inputs.size() > 1) ? core::as_tensor<T>(inputs[1]) : nullptr;
+        auto bias =
+            (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
         VkDevice device = m_dev_->getLogicalDevice();
         int exflags = 0;
@@ -113,19 +107,15 @@ class LayerNorm : public Operator {
         }
     }
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
 
-        std::shared_ptr<core::Tensor<T>> weight;
-        std::shared_ptr<core::Tensor<T>> bias;
-        if (inputs.size() > 1) {
-            weight = inputs[1];
-        }
-        if (inputs.size() > 2) {
-            bias = inputs[2];
-        }
+        auto weight =
+            (inputs.size() > 1) ? core::as_tensor<T>(inputs[1]) : nullptr;
+        auto bias =
+            (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
         auto input_shape = input->getTensorShape();
         int batch = input_shape[0];
@@ -138,7 +128,7 @@ class LayerNorm : public Operator {
         if (output->size() == 0) {
             output->resize(input->getTensorShape());
         }
-        prepare(inputs, outputs);
+        prepare<T>(inputs, outputs);
 
         VkDevice device = m_dev_->getLogicalDevice();
 
@@ -219,22 +209,9 @@ class LayerNorm : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override {
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
         apply<float>(inputs, outputs);
-    }
-
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override {
-        apply<int>(inputs, outputs);
-    }
-
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override {
-        apply<uint16_t>(inputs, outputs);
     }
 
   private:

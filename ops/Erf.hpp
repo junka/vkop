@@ -3,6 +3,7 @@
 #define OPS_ERF_HPP_
 
 #include "UnaryFactory.hpp"
+#include "ops/Ops.hpp"
 
 extern unsigned char erf_spv[];
 extern unsigned int erf_spv_len;
@@ -12,7 +13,7 @@ namespace ops {
 
 class Erf : public UnaryFactory {
   public:
-    Erf() { set_vulkan_spv(erf_spv, erf_spv_len); }
+    Erf() : UnaryFactory(OpType::ERF) { set_vulkan_spv(erf_spv, erf_spv_len); }
 };
 
 } // namespace ops

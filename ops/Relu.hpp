@@ -3,6 +3,7 @@
 #define OPS_RELU_HPP_
 
 #include "UnaryFactory.hpp"
+#include "ops/Ops.hpp"
 
 extern unsigned char relu_spv[];
 extern unsigned int relu_spv_len;
@@ -12,7 +13,9 @@ namespace ops {
 
 class Relu : public UnaryFactory {
   public:
-    Relu() { set_vulkan_spv(relu_spv, relu_spv_len); }
+    Relu() : UnaryFactory(OpType::RELU) {
+        set_vulkan_spv(relu_spv, relu_spv_len);
+    }
 };
 
 } // namespace ops

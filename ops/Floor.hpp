@@ -12,7 +12,9 @@ namespace ops {
 
 class Floor : public UnaryFactory {
   public:
-    Floor() { set_vulkan_spv(floor_spv, floor_spv_len); }
+    Floor() : UnaryFactory(OpType::FLOOR) {
+        set_vulkan_spv(floor_spv, floor_spv_len);
+    }
 };
 
 } // namespace ops

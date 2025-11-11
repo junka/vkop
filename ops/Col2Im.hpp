@@ -25,13 +25,13 @@ struct GpuCol2ImParam {
 
 class Col2im : public Operator {
   public:
-    Col2im() = default;
+    Col2im() : Operator(OpType::COL2IM) {}
 
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
 
         auto input_shape = input->getTensorShape();
 
@@ -80,10 +80,10 @@ class Col2im : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
         auto input_shape = input->getTensorShape();
 
         if (input_shape.size() != 4) {
@@ -100,7 +100,7 @@ class Col2im : public Operator {
         if (output->size() == 0) {
             output->resize(batch, depth, out_height, out_width);
         }
-        prepare(inputs, outputs);
+        prepare<T>(inputs, outputs);
 
         auto *para = static_cast<col2im::GpuCol2ImParam *>(
             paramBuffer_->getMappedMemory());
@@ -161,16 +161,10 @@ class Col2im : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
-
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        apply<float>(inputs, outputs);
+    }
 
   private:
     std::shared_ptr<VulkanImage> outputImage_;

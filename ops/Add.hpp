@@ -3,6 +3,7 @@
 #define OPS_ADD_HPP_
 
 #include "BinaryFactory.hpp"
+#include "ops/Ops.hpp"
 
 extern unsigned char add_spv[];
 extern unsigned int add_spv_len;
@@ -12,7 +13,7 @@ namespace ops {
 
 class Add : public BinaryFactory {
   public:
-    Add() { set_vulkan_spv(add_spv, add_spv_len); }
+    Add() : BinaryFactory(OpType::ADD) { set_vulkan_spv(add_spv, add_spv_len); }
 };
 
 } // namespace ops

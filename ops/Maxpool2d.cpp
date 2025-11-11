@@ -39,24 +39,6 @@ void Maxpool2d::submit(const unsigned char *spv, unsigned int spv_len,
     LOG_INFO("Time: %f s", ts);
 }
 
-void Maxpool2d::execute(
-    std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-    std::vector<std::shared_ptr<core::Tensor<float>>> outputs) {
-    apply<float>(inputs, outputs);
-}
-
-void Maxpool2d::execute(
-    std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-    std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
-    apply<int>(inputs, outputs);
-}
-
-void Maxpool2d::execute(
-    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) {
-    apply<uint16_t>(inputs, outputs);
-}
-
 namespace {
 REGISTER_OPERATOR(OpType::MAXPOOL2D, Maxpool2d);
 } // namespace

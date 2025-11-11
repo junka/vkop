@@ -39,23 +39,6 @@ void Resize::submit(const unsigned char *spv, unsigned int spv_len,
     LOG_INFO("Time: %f s", ts);
 }
 
-void Resize::execute(
-    std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-    std::vector<std::shared_ptr<core::Tensor<float>>> outputs) {
-    apply<float>(inputs, outputs);
-}
-
-void Resize::execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-                     std::vector<std::shared_ptr<core::Tensor<int>>> outputs) {
-    apply<int>(inputs, outputs);
-}
-
-void Resize::execute(
-    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-    std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) {
-    apply<uint16_t>(inputs, outputs);
-}
-
 namespace {
 REGISTER_OPERATOR(OpType::RESIZE, Resize);
 } // namespace

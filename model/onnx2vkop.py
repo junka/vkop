@@ -7,6 +7,8 @@ import onnx
 import numpy as np
 from onnx import numpy_helper
 import onnxoptimizer as optimizer
+from collections import defaultdict, deque
+
 
 class VkModel:
     def __init__(self):
@@ -149,6 +151,63 @@ def optimize_onnx_model(onnx_model):
     return optimized_model
 
 
+def is_topologically_sortable(graph):
+    nodes = list(graph.node)
+    n = len(nodes)
+
+    # Step 1: 构建 tensor -> producing node index 映射
+    produced_by = {}
+    for idx, node in enumerate(nodes):
+        for out in node.output:
+            if out == "":  # 跳过空输出（虽然罕见）
+                continue
+            if out in produced_by:
+                raise ValueError(f"Tensor '{out}' is produced by multiple nodes!")
+            produced_by[out] = idx  # 记录生产者索引
+
+    # 初始可用张量：inputs + initializers
+    initial_tensors = {inp.name for inp in graph.input}
+    initial_tensors.update(init.name for init in graph.initializer)
+
+    # Step 2: 计算每个节点的入度（依赖的未满足输入数）
+    in_degree = [0] * n
+    dependents = defaultdict(list)  # idx -> list of dependent node indices
+
+    for idx, node in enumerate(nodes):
+        unmet = 0
+        for inp in node.input:
+            if inp == "":
+                continue
+            if inp in initial_tensors:
+                continue
+            elif inp in produced_by:
+                producer_idx = produced_by[inp]
+                dependents[producer_idx].append(idx)
+                unmet += 1
+            else:
+                raise ValueError(f"Input tensor '{inp}' is not defined in the graph!")
+        in_degree[idx] = unmet
+
+    # Step 3: Kahn's algorithm using indices
+    queue = deque()
+    for i in range(n):
+        if in_degree[i] == 0:
+            queue.append(i)
+
+    executed = 0
+    while queue:
+        u = queue.popleft()
+        executed += 1
+        for v in dependents[u]:
+            in_degree[v] -= 1
+            if in_degree[v] == 0:
+                queue.append(v)
+
+    if executed != n:
+        raise ValueError("Graph has a cycle or unresolved dependencies!")
+    return True
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -158,6 +217,17 @@ def parse_onnx_model(onnx_path):
 
     vk_model = VkModel()
     graph = model.graph
+    try:
+        onnx.checker.check_model(model, full_check=True)
+        print("ONNX model passed full validation.")
+    except onnx.checker.ValidationError as e:
+        print(f"ONNX model full validation failed: {e}")
+
+    # check if graph is topologically sorted
+    if is_topologically_sortable(graph) == False:
+        print("Graph is not topologically sorted. Please sort it before proceeding.")
+        return 
+
 
     # Inputs with shapes
     for inp in graph.input:
@@ -247,7 +317,10 @@ def parse_onnx_model(onnx_path):
                         break
 
             if input_tensor is None:
-                print(f"Warning: Input tensor {input_name} not found in graph.")
+                print(f"Warning: Input tensor \"{input_name}\" not found in graph.")
+                inputs_with_shape.append(
+                    {'name': input_name, 'shape': []}
+                )
                 continue
             tensor_type = input_tensor.type.tensor_type
             shape_dims = [

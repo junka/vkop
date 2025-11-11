@@ -29,7 +29,7 @@ struct GpuResizeParam {
 
 class Resize : public Operator {
   public:
-    Resize() = default;
+    Resize() : Operator(OpType::RESIZE){};
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -125,10 +125,10 @@ class Resize : public Operator {
         }
     }
     template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-                 std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
+    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
 
         auto input_shape = input->getTensorShape();
 
@@ -177,12 +177,15 @@ class Resize : public Operator {
     }
 
     template <typename T>
-    void apply(std::vector<std::shared_ptr<core::Tensor<T>>> inputs,
-               std::vector<std::shared_ptr<core::Tensor<T>>> outputs) {
-        auto input = inputs[0];
-        auto output = outputs[0];
-        auto input_shape = input->getTensorShape();
+    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
+               std::vector<std::shared_ptr<core::ITensor>> outputs) {
+        auto input = core::as_tensor<T>(inputs[0]);
+        auto output = core::as_tensor<T>(outputs[0]);
+        auto roi = core::as_tensor<T>(inputs[1]);
+        auto scales = core::as_tensor<T>(inputs[2]);
+        auto sizes = core::as_tensor<int64_t>(inputs[3]);
 
+        auto input_shape = input->getTensorShape();
         if (input_shape.size() != 4) {
             throw std::invalid_argument("Input must have 4 dimensions.");
         }
@@ -191,6 +194,16 @@ class Resize : public Operator {
         int depth = input_shape[1];
         int out_height = input_shape[2];
         int out_width = input_shape[3];
+
+        if (size_.size() == 4) {
+            size_[0] = size_[2];
+            size_[1] = size_[3];
+            size_.resize(2);
+        } else if (size_.empty()) {
+            size_.resize(2);
+            size_[0] = static_cast<int>((*sizes)[static_cast<std::size_t>(2)]);
+            size_[1] = static_cast<int>((*sizes)[static_cast<std::size_t>(3)]);
+        }
 
         assert(axes_[0] == 2 && axes_[1] == 3);
         assert(axes_.size() == size_.size());
@@ -214,7 +227,7 @@ class Resize : public Operator {
         if (output->size() == 0) {
             output->resize(batch, depth, out_height, out_width);
         }
-        prepare(inputs, outputs);
+        prepare<T>(inputs, outputs);
 
         auto *para = static_cast<resize::GpuResizeParam *>(
             paramBuffer_->getMappedMemory());
@@ -284,16 +297,10 @@ class Resize : public Operator {
         output->convertRGBAToTensor(ptr);
     }
 
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<float>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<float>>> outputs) override;
-    void
-    execute(std::vector<std::shared_ptr<core::Tensor<int>>> inputs,
-            std::vector<std::shared_ptr<core::Tensor<int>>> outputs) override;
-
-    void execute(
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> inputs,
-        std::vector<std::shared_ptr<core::Tensor<uint16_t>>> outputs) override;
+    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+        apply<float>(inputs, outputs);
+    }
 
   private:
     int antialias_ = 0;

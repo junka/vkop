@@ -246,7 +246,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", true);
     ResizeTest<float> rt;
 
-    if (!rt.run_test({rt.input_data_}, rt.output_data_,
+    if (!rt.run_test({rt.input_data_, nullptr, nullptr, nullptr}, rt.output_data_,
         [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *resize_op = dynamic_cast<Resize *>(op.get());
         if (!resize_op) {

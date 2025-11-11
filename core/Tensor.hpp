@@ -18,7 +18,35 @@
 namespace vkop {
 namespace core {
 
-template <typename T> class Tensor {
+template <typename T> class Tensor;
+
+class ITensor {
+  public:
+    virtual ~ITensor() = default;
+    virtual const std::type_info &dtype() const = 0;
+
+    template <typename T> Tensor<T> *as() const {
+        if (dtype() == typeid(T)) {
+            return static_cast<Tensor<T> *>(this);
+        }
+        return nullptr;
+    }
+};
+
+#define VKOP_DISPATCH_DTYPE(t)                                                 \
+    if (((t)->dtype()) == typeid(float)) {                                     \
+        auto *InputType = static_cast<std::shared_ptr<Tensor<float>>>(t);      \
+    } else if (((t)->dtype()) == typeid(int32_t)) {                            \
+        auto *InputType = static_cast<std::shared_ptr<Tensor<int32_t>>>(t);    \
+    } else if (((t)->dtype()) == typeid(int64_t)) {                            \
+        auto *InputType = static_cast<std::shared_ptr<Tensor<int64_t>>>(t);    \
+    } else if (((t)->dtype()) == typeid(uint8_t)) {                            \
+        auto *InputType = static_cast<std::shared_ptr<Tensor<uint8_t>>>(t);    \
+    } else if (((t)->dtype()) == typeid(uint16_t)) {                           \
+        auto *InputType = static_cast<std::shared_ptr<Tensor<uint16_t>>>(t);   \
+    }
+
+template <typename T> class Tensor : public ITensor {
   public:
     // empty
     Tensor() = default;
@@ -55,6 +83,8 @@ template <typename T> class Tensor {
         }
         data_.resize(size_ / ele_size_);
     }
+
+    const std::type_info &dtype() const override { return typeid(T); }
 
     void resize(int n, int c, int h, int w) {
         dims_ = std::vector<int>{n, c, h, w};
@@ -284,6 +314,12 @@ template <typename T> class Tensor {
     std::vector<T> data_;
     std::weak_ptr<VulkanResource> vkobj_;
 };
+
+template <typename T>
+inline std::shared_ptr<Tensor<T>>
+as_tensor(const std::shared_ptr<ITensor> &ptr) {
+    return std::dynamic_pointer_cast<Tensor<T>>(ptr);
+}
 
 } // namespace core
 } // namespace vkop
