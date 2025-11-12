@@ -72,7 +72,6 @@ class Operator {
     template <typename T>
     void copyTensorToImages(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs) {
-
         VkDevice device = m_dev_->getLogicalDevice();
         int cnt = 0;
 #ifdef VK_EXT_host_image_copy
@@ -83,6 +82,9 @@ class Operator {
                 }
 
                 auto t = core::as_tensor<T>(input);
+                if (t->num_dims() < 3) {
+                    continue;
+                }
                 inputImages_[cnt++]->hostImageCopyToDevice(
                     t->convertTensorToRGBA().data());
             }
@@ -96,6 +98,9 @@ class Operator {
                     continue;
                 }
                 auto t = core::as_tensor<T>(input);
+                if (t->num_dims() < 3) {
+                    continue;
+                }
                 inputImages_[cnt++]->stagingBufferCopyToImage(
                     cmdstg.get(), t->convertTensorToRGBA().data());
             }
