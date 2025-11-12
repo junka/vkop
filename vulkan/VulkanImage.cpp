@@ -2,6 +2,7 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
+#include <cstddef>
 
 namespace vkop {
 
@@ -482,7 +483,7 @@ void VulkanImage::stagingBufferCopyToImage(VkCommandBuffer commandBuffer,
     auto imagesize = getImageSize();
     const auto *src = static_cast<const float *>(ptr);
     assert(dst != nullptr);
-    memcpy(dst, src, imagesize);
+    std::memcpy(dst, src, imagesize);
     m_stagingBuffer_->unmapMemory();
 
     copyBufferToImage(commandBuffer, *m_stagingBuffer_);

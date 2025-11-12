@@ -43,6 +43,7 @@ layout(set=0, binding=4) uniform constBuffer {
     ivec2 padding;       // paddingW, paddingH
     ivec2 dilation;      // dilationW, dilationH
     int groups;
+    int relu;
 } uConstant;
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
@@ -184,6 +185,9 @@ void main() {
         }
     }
     acc += bias;
+    if (uConstant.relu == 1) {
+        acc = max(acc, vec4(0.0));
+    }
 
     imageStore(uOutput, gid, acc);
 }

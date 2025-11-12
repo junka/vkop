@@ -15,11 +15,11 @@ namespace {
 class AddTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 8, 64, 64
+        20, 64, 64, 64
     };
-    std::shared_ptr<Tensor<uint16_t>> inputa;
-    std::shared_ptr<Tensor<uint16_t>> inputb;
-    std::vector<uint16_t> expectedOutput;
+    std::shared_ptr<Tensor<float>> inputa;
+    std::shared_ptr<Tensor<float>> inputb;
+    std::vector<float> expectedOutput;
 
     AddTest():TestCase("Add") {
         initTestdata();
@@ -27,8 +27,8 @@ public:
 private:
     void initTestdata()
     {
-        inputa = std::make_shared<Tensor<uint16_t>>(input_shape_);
-        inputb = std::make_shared<Tensor<uint16_t>>(input_shape_);
+        inputa = std::make_shared<Tensor<float>>(input_shape_);
+        inputb = std::make_shared<Tensor<float>>(input_shape_);
 
         auto *inputa_ptr = inputa->data();
         auto *inputb_ptr = inputb->data();
@@ -37,14 +37,14 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> inputa_dist{0.0F, 1.0F};
+        std::normal_distribution<> inputa_dist{-1.0F, 1.0F};
         std::normal_distribution<> inputb_dist{1.0F, 2.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            inputa_ptr[i] = float32_to_float16(a);
-            inputb_ptr[i] = float32_to_float16(b);
-            expectedOutput[i] = float32_to_float16(a+b);
+            inputa_ptr[i] = a;
+            inputb_ptr[i] = b;
+            expectedOutput[i] = a+b;
         }
     }
 };

@@ -2,6 +2,7 @@
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/ops)
+include_directories(${CMAKE_SOURCE_DIR}/model)
 
 set(TESTS
     GridSampleTest
@@ -20,6 +21,7 @@ set(TESTS
     MaxPoolTest
     LayerNormTest
     ResizeTest
+    ModelTest
 )
 
 find_package(PythonLibs REQUIRED)
@@ -32,9 +34,15 @@ endif()
 
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cpp)
-    target_link_libraries(${TEST} -Wl,--whole-archive vkop -Wl,--no-whole-archive)
+    target_link_libraries(${TEST} -Wl,--whole-archive vkop vload -Wl,--no-whole-archive)
     if (PYTHONLIBS_FOUND)
         target_link_libraries(${TEST} ${PYTHON_LIBRARIES})
     endif()
     add_test(NAME ${TEST} COMMAND ${TEST})
 endforeach()
+
+file(COPY ../model/add_model.bin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
+
+target_compile_definitions(ModelTest PRIVATE
+    TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
+)

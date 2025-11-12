@@ -69,9 +69,17 @@ public:
                 auto output = std::make_shared<Tensor<T>>();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
-                op->copyTensorToImages<T>(inputs);
+                for (const auto &input : inputs) {
+                    if (!input || input->num_dims() < 3) {
+                        continue;
+                    }
+                    auto t = core::as_tensor<T>(input);
+                    t->copyToGPU(dev, cmdpool);
+                }
+                // op->copyTensorToImages<T>(inputs);
                 op->execute(inputs, outputs);
-                op->copyImageToTensor<T>(output);
+                // op->copyImageToTensor<T>(output);
+                output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
                 auto oshape = output->getTensorShape();
                 for (int i = 0; i < oshape[0]; i++) {
@@ -131,9 +139,17 @@ public:
                 auto output = std::make_shared<Tensor<T>>();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
-                op->copyTensorToImages<T>(inputs);
+                for (const auto &input : inputs) {
+                    if (!input || input->num_dims() < 3) {
+                        continue;
+                    }
+                    auto t = core::as_tensor<T>(input);
+                    t->copyToGPU(dev, cmdpool);
+                }
+                // op->copyTensorToImages<T>(inputs);
                 op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
-                op->copyImageToTensor<T>(output);
+                // op->copyImageToTensor<T>(output);
+                output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {

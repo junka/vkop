@@ -4,6 +4,7 @@
 
 #include "vulkan/vulkan.hpp"
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <variant>

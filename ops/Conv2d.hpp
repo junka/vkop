@@ -41,6 +41,7 @@ struct GPUConv2dParam {
     ivec2 padding;
     ivec2 dilation;
     int groups;
+    int relu;
 };
 
 } // namespace conv2d

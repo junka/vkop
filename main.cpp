@@ -12,6 +12,7 @@
 #include <random>
 #include <chrono>
 #include <cmath>
+#include <unordered_set>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -120,6 +121,7 @@ std::vector<MaskInfo> postProcessNMS(
 
         // detections.push_back({x1, y1, x2, y2, score, Category::category});
     }
+    printf("done\n");
     return detections;
 }
 
@@ -195,6 +197,8 @@ int main(int argc, char *argv[]) {
         LOG_ERROR("%s", e.what());
         return EXIT_FAILURE;
     }
+    auto *device = dev->getLogicalDevice();
+    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image.yuv>" << std::endl;
@@ -220,6 +224,7 @@ int main(int argc, char *argv[]) {
 
         std::vector<std::shared_ptr<ITensor>> inputs;
         std::vector<std::shared_ptr<ITensor>> outputs;
+        std::unordered_set<std::shared_ptr<ITensor>> output_tensor_set;
         std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
         std::vector<std::unique_ptr<vkop::ops::Operator>> ops_all;
@@ -228,25 +233,18 @@ int main(int argc, char *argv[]) {
         for (const auto& i : model.inputs) {
             auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
-            t->printTensorShape();
             tensor_map[i.name] = t;
         }
-        
-        auto t = vkop::core::as_tensor<float>(inputs[0]);
-        resize_YUV(frame, image_h, image_w, t);
 
         for (const auto& o: model.outputs) {
-            printf("Output %s\n", o.name.c_str());
             auto t = std::make_shared<Tensor<float>>(o.dims);
+            t->toGPU();
             outputs.push_back(t);
+            output_tensor_set.insert(t);
             tensor_map[o.name] = t;
         }
 
         for (const auto& n: model.nodes) {
-            if (n.op_type == "Identity") {
-                // this should be optimized out in onnx graph
-                continue;
-            }
             auto t = vkop::ops::convert_opstring_to_enum(n.op_type);
             if (t == vkop::ops::OpType::CONSTANT || t == vkop::ops::OpType::UNKNOWN) {
                 // make it as input for next ops
@@ -305,6 +303,7 @@ int main(int argc, char *argv[]) {
                     node_outputs.push_back(tensor_map[out_shape.name]);
                 } else {
                     auto t = std::make_shared<Tensor<float>>(out_shape.dims);
+                    t->toGPU();
                     tensor_map[out_shape.name] = t;
                     node_outputs.push_back(t);
                 }
@@ -315,8 +314,6 @@ int main(int argc, char *argv[]) {
                 std::cout << "Fail to create operator" << std::endl;
                 return 1;
             }
-            auto *device = dev->getLogicalDevice();
-            auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
             op->set_runtime_device(phydev, dev, cmdpool);
             if (!n.attributes.empty()) {
@@ -327,8 +324,35 @@ int main(int argc, char *argv[]) {
             outputs_all.push_back(node_outputs);
         }
 
+        auto t = vkop::core::as_tensor<float>(inputs[0]);
+        resize_YUV(frame, image_h, image_w, t);
+        t->printTensorShape();
+        auto start = std::chrono::steady_clock::now();
         for (size_t i = 0; i < ops_all.size(); ++i) {
+            printf("ops %s input tensors %ld\n", vkop::ops::convert_openum_to_string(ops_all[i]->get_type()).c_str(), inputs_all[i].size());
+            ops_all[i]->apply(inputs_all[i], outputs_all[i]);
+            for (auto &p: inputs_all[i]) {
+                if (!p || p->num_dims() < 3) {
+                    continue;
+                }
+                if (p->is_on_GPU()) {
+                    printf("already on GPU\n");
+                } else {
+                    printf("on CPU\n");
+                    auto t = vkop::core::as_tensor<float>(p);
+                    // t->printTensorShape();
+                    t->copyToGPU(dev, cmdpool);
+                }
+            }
+            // ops_all[i]->copyTensorToImages<float>(inputs_all[i]);
             ops_all[i]->execute(inputs_all[i], outputs_all[i]);
+            for (auto & j : outputs_all[i]) {
+                if (output_tensor_set.find(j) != output_tensor_set.end()) {
+                    auto t = vkop::core::as_tensor<float>(j);
+                    // ops_all[i]->copyImageToTensor(t);
+                    t->copyToCPU(dev, cmdpool);
+                }
+            }
         }
         
         auto hm = vkop::core::as_tensor<float>(outputs[0]);
@@ -336,13 +360,17 @@ int main(int argc, char *argv[]) {
         auto dim = vkop::core::as_tensor<float>(outputs[2]);
         auto cls = vkop::core::as_tensor<float>(outputs[3]);
         auto hm_nms = vkop::core::as_tensor<float>(outputs[4]);
+        printf("%f, %f, %f, %f, %f\n", (*hm)[0], (*reg)[0], (*dim)[0], (*cls)[0], (*hm_nms)[0]);
         
         postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
             t->getTensorShape()[2], t->getTensorShape()[3]);
-
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;
     }
+    // sleep(20000);
     return EXIT_SUCCESS;
 }
