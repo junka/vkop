@@ -5,6 +5,7 @@
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "ops/Ops.hpp"
+#include "core/runtime.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -22,6 +23,7 @@ using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
 using vkop::core::ITensor;
+using vkop::core::Runtime;
 using vkop::load::VkModel;
 using vkop::ops::OperatorFactory;
 
@@ -180,7 +182,6 @@ void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::s
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    VkPhysicalDevice phydev = VK_NULL_HANDLE;
     std::shared_ptr<VulkanDevice> dev;
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -189,7 +190,6 @@ int main(int argc, char *argv[]) {
             if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
                 continue;
             }
-            phydev = pdev;
             LOG_INFO("%s",dev->getDeviceName().c_str());
         }
     } catch (const std::exception &e) {
@@ -205,8 +205,6 @@ int main(int argc, char *argv[]) {
     }
     try {
         std::string binary_file_path = argv[1];
-        VkModel model(binary_file_path);
-        // VkModel::dump_model(model);
         std::string image_file_path = argv[2];
         std::vector<uint8_t> frame;
 
@@ -221,154 +219,26 @@ int main(int argc, char *argv[]) {
         int image_h = 1080;
         int image_w = 1920;
 
-        std::vector<std::shared_ptr<ITensor>> inputs;
-        std::vector<std::shared_ptr<ITensor>> outputs;
-        std::unordered_set<std::shared_ptr<ITensor>> output_tensor_set;
-        std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
-        std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
+        auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
+        rt->LoadModel();
 
-        std::vector<std::unique_ptr<vkop::ops::Operator>> ops_all;
-        std::vector<std::vector<std::shared_ptr<ITensor>>> inputs_all;
-        std::vector<std::vector<std::shared_ptr<ITensor>>> outputs_all;
-        for (const auto& i : model.inputs) {
-            auto t = std::make_shared<Tensor<float>>(i.dims);
-            inputs.push_back(t);
-            tensor_map[i.name] = t;
-            tensor_name_map[t] = i.name;
-        }
-
-        for (const auto& o: model.outputs) {
-            auto t = std::make_shared<Tensor<float>>(o.dims);
-            t->toGPU();
-            outputs.push_back(t);
-            output_tensor_set.insert(t);
-            tensor_map[o.name] = t;
-            tensor_name_map[t] = o.name;
-            std::cout << "create output tensor " << o.name << std::endl;
-        }
-
-        for (const auto& n: model.nodes) {
-            auto t = vkop::ops::convert_opstring_to_enum(n.op_type);
-            if (t == vkop::ops::OpType::CONSTANT || t == vkop::ops::OpType::UNKNOWN) {
-                // make it as input for next ops
-                continue;
-            }
-            std::vector<std::shared_ptr<ITensor>> node_inputs;
-            std::vector<std::shared_ptr<ITensor>> node_outputs;
-
-            for (const auto& out_shape : n.outputs) {
-                if (tensor_map.find(out_shape.name) != tensor_map.end()) {
-                    printf("find output tensor %s for op %s\n", out_shape.name.c_str(), n.op_type.c_str());
-                    tensor_map[out_shape.name]->toGPU();
-                    node_outputs.push_back(tensor_map[out_shape.name]);
-                } else {
-                    printf("make tensor on GPU %s\n", out_shape.name.c_str());
-                    auto t = std::make_shared<Tensor<float>>(out_shape.dims);
-                    t->toGPU();
-                    tensor_map[out_shape.name] = t;
-                    tensor_name_map[t] = out_shape.name;
-                    node_outputs.push_back(t);
-                }
-            }
-            for (const auto& in_shape : n.inputs) {
-                if (tensor_map.find(in_shape.name) != tensor_map.end()) {
-                    node_inputs.push_back(tensor_map[in_shape.name]);
-                    std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << " on " << (tensor_map[in_shape.name]->is_on_GPU()? "GPU" : "CPU")<< std::endl;
-                } else {
-                    std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
-                    if (in_shape.dims.empty()) {
-                        node_inputs.push_back(nullptr);
-                        continue;
-                    }
-                    if (model.initializers.find(in_shape.name) != model.initializers.end()) {
-                        auto& init = model.initializers.at(in_shape.name);
-                        if (init.dims != in_shape.dims) {
-                            throw std::runtime_error("Initializer dims do not match for " + in_shape.name);
-                        }
-                        if (init.dtype == "int64") {
-                            // printf("load int64 initializer %s for op %s\n", in_shape.name.c_str(), n.op_type.c_str());
-                            auto t = std::make_shared<Tensor<int64_t>>(in_shape.dims);
-                            for (int i = 0; i < t->num_elements(); ++i) {
-                                t->data()[i] = static_cast<float>(init.dataii[i]);
-                            }
-                            tensor_map[in_shape.name] = t;
-                            tensor_name_map[t] = in_shape.name;
-                            node_inputs.push_back(t);
-                            // std::cout << "load int64 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
-                        } else if (init.dtype == "int32") {
-                            auto t = std::make_shared<Tensor<int>>(in_shape.dims);
-                            for (int i = 0; i < t->num_elements(); ++i) {
-                                t->data()[i] = static_cast<float>(init.dataii[i]);
-                            }
-                            tensor_map[in_shape.name] = t;
-                            tensor_name_map[t] = in_shape.name;
-                            node_inputs.push_back(t);
-                            // std::cout << "load int32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
-                        } else if (init.dtype == "float32") {
-                            auto t = std::make_shared<Tensor<float>>(in_shape.dims);
-                            std::memcpy(t->data(), init.dataf.data(), t->num_elements() * sizeof(float));
-                            tensor_map[in_shape.name] = t;
-                            tensor_name_map[t] = in_shape.name;
-                            node_inputs.push_back(t);
-                            // std::cout << "load float32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
-                        } else {
-                            throw std::runtime_error("Only float32 initializer is supported for now " + init.dtype);
-                        }
-                    }
-                }
-            }
-
-            auto op = OperatorFactory::get_instance().create(t);
-            if (!op) {
-                std::cout << "Fail to create operator" << std::endl;
-                return 1;
-            }
-
-            op->set_runtime_device(phydev, dev, cmdpool);
-            if (!n.attributes.empty()) {
-                op->setAttribute(n.attributes);
-            }
-            ops_all.push_back(std::move(op));
-            inputs_all.push_back(node_inputs);
-            outputs_all.push_back(node_outputs);
-        }
-
-        auto t = vkop::core::as_tensor<float>(inputs[0]);
+        auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
         resize_YUV(frame, image_h, image_w, t);
         t->printTensorShape();
-        auto start = std::chrono::steady_clock::now();
-        for (size_t i = 0; i < ops_all.size(); ++i) {
-            printf("ops %s input tensors %ld\n", vkop::ops::convert_openum_to_string(ops_all[i]->get_type()).c_str(), inputs_all[i].size());
-            ops_all[i]->apply(inputs_all[i], outputs_all[i]);
-            for (auto &p: inputs_all[i]) {
-                if (!p || p->num_dims() < 3) {
-                    continue;
-                }
-                if (p->is_on_GPU()) {
-                    printf("tensor %s already on GPU\n", tensor_name_map[p].c_str());
-                } else {
-                    printf("tensor %s on CPU\n", tensor_name_map[p].c_str());
-                    auto t = vkop::core::as_tensor<float>(p);
-                    t->copyToGPU(dev, cmdpool);
-                }
-            }
-            ops_all[i]->execute(inputs_all[i], outputs_all[i]);
-        }
-        for (auto &p : outputs) {
-            auto t = vkop::core::as_tensor<float>(p);
-            t->copyToCPU(dev, cmdpool);
-        }
-        auto hm = vkop::core::as_tensor<float>(tensor_map["hm"]);
-        auto reg = vkop::core::as_tensor<float>(tensor_map["reg"]);
-        auto dim = vkop::core::as_tensor<float>(tensor_map["dim"]);
-        auto cls = vkop::core::as_tensor<float>(tensor_map["cls"]);
-        auto hm_nms = vkop::core::as_tensor<float>(tensor_map["hm_nms"]);
+    
+        t->as_input_image(dev, cmdpool);
+        t->copyToGPU(dev, cmdpool);
+
+        rt->Run();
+
+        auto hm = vkop::core::as_tensor<float>(rt->GetOutput("hm"));
+        auto reg = vkop::core::as_tensor<float>(rt->GetOutput("reg"));
+        auto dim = vkop::core::as_tensor<float>(rt->GetOutput("dim"));
+        auto cls = vkop::core::as_tensor<float>(rt->GetOutput("cls"));
+        auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
 
         postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
             t->getTensorShape()[2], t->getTensorShape()[3]);
-        auto end = std::chrono::steady_clock::now();
-        std::chrono::duration<double> elapsed = end - start;
-        std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;

@@ -30,10 +30,8 @@ class Operator {
     Operator &operator=(Operator &&) = delete;
 
     virtual void
-    set_runtime_device(VkPhysicalDevice phydev,
-                       std::shared_ptr<VulkanDevice> dev,
+    set_runtime_device(std::shared_ptr<VulkanDevice> dev,
                        std::shared_ptr<VulkanCommandPool> cmdpool) {
-        m_phydev_ = phydev;
         m_dev_ = std::move(dev);
         m_cmdpool_ = std::move(cmdpool);
     }
@@ -71,7 +69,6 @@ class Operator {
           const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
 
   protected:
-    VkPhysicalDevice m_phydev_;
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     OpType type_;

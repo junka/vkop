@@ -262,7 +262,8 @@ void VulkanImage::createImage() {
                              nullptr, &m_image_);
 #endif
     if (ret != VK_SUCCESS) {
-        throw std::runtime_error("failed to create image!");
+        throw std::runtime_error("failed to create image!" +
+                                 std::to_string(ret));
     }
 }
 

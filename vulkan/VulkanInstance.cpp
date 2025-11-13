@@ -153,6 +153,7 @@ void VulkanInstance::getRequiredExtensions() const {
 }
 
 bool VulkanInstance::checkValidationLayerSupport() const {
+#ifdef USE_VALIDATION_LAYERS
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
 
@@ -172,7 +173,7 @@ bool VulkanInstance::checkValidationLayerSupport() const {
             }
         }
     }
-
+#endif
     return false;
 }
 #ifdef VK_EXT_debug_utils

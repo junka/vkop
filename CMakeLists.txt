@@ -103,7 +103,9 @@ else()
     # add_dependencies(vkopmain lint-code)
 endif()
 
-option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
+option(USE_VALIDATION_LAYERS "Enable validation layers" OFF)
+option(USE_MEASURE_TIME "Enable measuring time" OFF)
+option(USE_VMA "Enable usage of Vulkan Memory Allocator" OFF)
 
 if(USE_VMA)
     target_compile_definitions(vkop PUBLIC USE_VMA)

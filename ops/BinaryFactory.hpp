@@ -115,18 +115,25 @@ class BinaryFactory : public Operator {
                                 spv_len);
 
         VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
+#ifdef USE_MEASURE_TIME
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
+#endif
         cmd2.begin();
         cmd2.bind(pipeline);
+#ifdef USE_MEASURE_TIME
         query_pool.begin(cmd2.get());
+#endif
         cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
+#ifdef USE_MEASURE_TIME
         query_pool.end(cmd2.get());
+#endif
         cmd2.end();
         cmd2.submit(m_dev_->getComputeQueue());
+#ifdef USE_MEASURE_TIME
         auto r = query_pool.getResults();
-        double ts = static_cast<double>(r[1] - r[0]) * (1e-9) *
-                    m_dev_->getTimestampPeriod();
-        LOG_INFO("Time: %f s", ts);
+        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
+                                   m_dev_->getTimestampPeriod());
+#endif
     }
 };
 

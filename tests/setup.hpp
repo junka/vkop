@@ -59,7 +59,7 @@ public:
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(pdev, dev, cmdpool);
+                op->set_runtime_device(dev, cmdpool);
 
                 // Apply the attribute function callback if provided
                 if (attribute_func) {
@@ -134,7 +134,7 @@ public:
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(pdev, dev, cmdpool);
+                op->set_runtime_device(dev, cmdpool);
 
                 auto output = std::make_shared<Tensor<T>>();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};

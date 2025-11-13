@@ -44,7 +44,6 @@ public:
     std::vector<Shape> inputs;
     std::vector<Shape> outputs;
     std::vector<Node> nodes;
-    std::vector<uint32_t> execution_order; // execution order for DAG scheduling
     std::unordered_map<std::string, Initializer> initializers;
 
     explicit VkModel(const std::string& filePath);
