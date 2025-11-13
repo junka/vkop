@@ -233,9 +233,6 @@ void VulkanImage::createImage() {
     m_imagetype_ = VK_IMAGE_TYPE_3D;
     if (m_dim_.depth == 1) {
         m_imagetype_ = VK_IMAGE_TYPE_2D;
-        if (m_dim_.height == 1) {
-            m_imagetype_ = VK_IMAGE_TYPE_1D;
-        }
     }
 
     VkImageCreateInfo image_create_info = {};

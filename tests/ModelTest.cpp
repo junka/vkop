@@ -18,9 +18,6 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
-using vkop::core::ITensor;
-using vkop::load::VkModel;
-using vkop::ops::OperatorFactory;
 using vkop::core::Runtime;
 
 namespace {
@@ -30,7 +27,6 @@ public:
 
     ModelTest() = default;
     void initTestData(const std::shared_ptr<Tensor<float>>& ta, const std::shared_ptr<Tensor<float>>& tb) {
-        ta->printTensorShape();
         auto *inputa_ptr = ta->data();
         auto *inputb_ptr = tb->data();
         expectedOutput.resize(ta->num_elements());
@@ -127,16 +123,18 @@ int main() {
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto *pdev : phydevs) {
-            dev = std::make_shared<VulkanDevice>(pdev);
-            if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
+            auto vdev = std::make_shared<VulkanDevice>(pdev);
+            if (vdev->getDeviceName().find("llvmpipe") != std::string::npos) {
                 continue;
             }
-            LOG_INFO("%s",dev->getDeviceName().c_str());
+            dev = vdev;
         }
     } catch (const std::exception &e) {
         LOG_ERROR("%s", e.what());
         return EXIT_FAILURE;
     }
+
+    LOG_INFO("%s",dev->getDeviceName().c_str());
     auto *device = dev->getLogicalDevice();
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
     std::string binary_file_path = TEST_DATA_PATH"/add_conv_model.bin";
@@ -149,11 +147,10 @@ int main() {
 
     ModelTest test;
     test.initTestData(t1, t2);
-    t1->as_input_image(dev, cmdpool);
-    t2->as_input_image(dev, cmdpool);
     t1->copyToGPU(dev, cmdpool);
     t2->copyToGPU(dev, cmdpool);
     rt->Run();
+    rt->ReadResult();
 
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));

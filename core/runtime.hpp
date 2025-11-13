@@ -54,6 +54,8 @@ class Runtime {
     std::shared_ptr<ITensor> GetInitializer(const std::string &name);
 
     void Run();
+
+    void ReadResult();
 };
 
 } // namespace core

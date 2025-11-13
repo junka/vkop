@@ -25,6 +25,7 @@ void Runtime::LoadModel() {
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
         tensor_name_map[t] = i.name;
+        t->as_input_image(m_dev_, m_cmdpool_);
     }
 
     for (const auto &o : model.outputs) {
@@ -160,13 +161,16 @@ void Runtime::Run() {
         node_ops_[i]->apply(node_input_tensors_[i], node_output_tensors_[i]);
         node_ops_[i]->execute(node_input_tensors_[i], node_output_tensors_[i]);
     }
+    auto end = std::chrono::steady_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
+}
+
+void Runtime::ReadResult() {
     for (auto &p : outputs_) {
         auto t = vkop::core::as_tensor<float>(p.second);
         t->copyToCPU(m_dev_, m_cmdpool_);
     }
-    auto end = std::chrono::steady_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
-    std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
 }
 
 } // namespace core

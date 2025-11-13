@@ -22,11 +22,15 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
     }
     create();
     checkDeviceUnifiedMemoryAccess();
+#ifdef USE_VMA
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
+#endif
 }
 
 VulkanDevice::~VulkanDevice() {
+#ifdef USE_VMA
     m_vma_.reset();
+#endif
     if (logicalDevice_ != VK_NULL_HANDLE) {
         vkDestroyDevice(logicalDevice_, nullptr);
         logicalDevice_ = VK_NULL_HANDLE;

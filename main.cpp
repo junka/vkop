@@ -22,11 +22,7 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
-using vkop::core::ITensor;
 using vkop::core::Runtime;
-using vkop::load::VkModel;
-using vkop::ops::OperatorFactory;
-
 
 enum class Category : int {
     UNKNOWN = 0,
@@ -126,8 +122,6 @@ std::vector<MaskInfo> postProcessNMS(
     return detections;
 }
 
-
-
 void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
     int in_h = t->getTensorShape()[2];
     int in_w = t->getTensorShape()[3];
@@ -186,16 +180,17 @@ int main(int argc, char *argv[]) {
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         for (auto *pdev : phydevs) {
-            dev = std::make_shared<VulkanDevice>(pdev);
-            if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
+            auto vdev = std::make_shared<VulkanDevice>(pdev);
+            if (vdev->getDeviceName().find("llvmpipe") != std::string::npos) {
                 continue;
             }
-            LOG_INFO("%s",dev->getDeviceName().c_str());
+            dev = vdev;
         }
     } catch (const std::exception &e) {
         LOG_ERROR("%s", e.what());
         return EXIT_FAILURE;
     }
+    printf("using %s\n",dev->getDeviceName().c_str());
     auto *device = dev->getLogicalDevice();
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
@@ -224,18 +219,16 @@ int main(int argc, char *argv[]) {
 
         auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
         resize_YUV(frame, image_h, image_w, t);
-        t->printTensorShape();
-    
-        t->as_input_image(dev, cmdpool);
+
         t->copyToGPU(dev, cmdpool);
-
         rt->Run();
-
+        rt->ReadResult();
         auto hm = vkop::core::as_tensor<float>(rt->GetOutput("hm"));
         auto reg = vkop::core::as_tensor<float>(rt->GetOutput("reg"));
         auto dim = vkop::core::as_tensor<float>(rt->GetOutput("dim"));
         auto cls = vkop::core::as_tensor<float>(rt->GetOutput("cls"));
         auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
+        assert(hm != nullptr);
 
         postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
             t->getTensorShape()[2], t->getTensorShape()[3]);

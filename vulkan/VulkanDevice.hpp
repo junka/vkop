@@ -75,7 +75,9 @@ class VulkanDevice {
 
     bool m_support_host_image_copy_ = false;
     bool m_support_buffer_device_address_ = false;
+#ifdef USE_VMA
     std::unique_ptr<vkop::VMA> m_vma_;
+#endif
 };
 
 } // namespace vkop

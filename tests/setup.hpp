@@ -51,6 +51,7 @@ public:
                 if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
                     continue;
                 }
+                LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto *device = dev->getLogicalDevice();
                 auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 
@@ -126,6 +127,7 @@ public:
                 if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
                     continue;
                 }
+                LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto *device = dev->getLogicalDevice();
                 auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
 

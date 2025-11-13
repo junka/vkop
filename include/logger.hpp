@@ -102,7 +102,7 @@ private:
     }
 };
 
-#ifdef DEBUG
+#ifndef NDEBUG
 #define LOG_INFO(...) Logger::getInstance().info(__VA_ARGS__)
 #define LOG_ERROR(...) Logger::getInstance().error(__VA_ARGS__)
 #define LOG_WARN(...) Logger::getInstance().warning(__VA_ARGS__)
