@@ -2,7 +2,6 @@
 #ifndef CORE_TENSOR_HPP_
 #define CORE_TENSOR_HPP_
 
-#include <bits/c++config.h>
 #include <cstdint>
 #include <iostream>
 #include <memory>
@@ -62,7 +61,7 @@ template <typename T> class Tensor : public ITensor {
         dims_ = dims;
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_;
+        size_ = dims_.size() ? ele_size_ : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
@@ -74,7 +73,7 @@ template <typename T> class Tensor : public ITensor {
         dims_ = std::vector<int>(dims.begin(), dims.end());
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_;
+        size_ = dims_.size() ? ele_size_ : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
@@ -95,7 +94,7 @@ template <typename T> class Tensor : public ITensor {
         dims_ = dims;
         ele_size_ = sizeof(T);
         fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_;
+        size_ = dims_.size() ? ele_size_ : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
@@ -158,6 +157,77 @@ template <typename T> class Tensor : public ITensor {
     // void *map() { return nullptr; }
     // void unmap() { (void)vkobj_; }
 
+    std::shared_ptr<VulkanImage>
+    as_input_image(std::shared_ptr<VulkanDevice> &vd,
+                   std::shared_ptr<VulkanCommandPool> &cmdpool) {
+
+        if (!vkobj_) {
+            int exflags = 0;
+            if (vd->is_support_host_image_copy()) {
+#ifdef VK_EXT_host_image_copy
+                exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+#endif
+            }
+            make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT |
+                               VK_IMAGE_USAGE_STORAGE_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+        }
+
+#ifdef VK_EXT_host_image_copy
+        if (m_dev_->is_support_host_image_copy()) {
+            vkobj_->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        } else
+#endif
+        {
+            auto *device = vd->getLogicalDevice();
+            VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
+            cmd.begin();
+            vkobj_->readBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(vd->getComputeQueue());
+        }
+
+        return vkobj_;
+    }
+
+    std::shared_ptr<VulkanImage>
+    as_output_image(std::shared_ptr<VulkanDevice> &vd,
+                    std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        if (!vkobj_) {
+            int exflags = 0;
+            if (vd->is_support_host_image_copy()) {
+#ifdef VK_EXT_host_image_copy
+                exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+#endif
+            }
+            make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT |
+                               VK_IMAGE_USAGE_SAMPLED_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+        }
+
+#ifdef VK_EXT_host_image_copy
+        if (m_dev_->is_support_host_image_copy()) {
+            if (m_dev_->checkHostImageCopyDstLayoutSupport(
+                    VK_IMAGE_LAYOUT_GENERAL)) {
+                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+            } else {
+                outputImage_->hostImaggeTransition(
+                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            }
+        } else
+#endif
+        {
+            auto *device = vd->getLogicalDevice();
+            VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
+            cmd.begin();
+            vkobj_->writeBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(vd->getComputeQueue());
+        }
+
+        return vkobj_;
+    }
+
     /**
      * @brief Converts a tensor into an RGBA format suitable for Vulkan image
      * processing.
@@ -189,7 +259,7 @@ template <typename T> class Tensor : public ITensor {
      * image formats and facilitates efficient GPU operations.
      */
     std::vector<T> *convertTensorToRGBA() {
-        auto img = vkobj_.lock();
+        auto img = vkobj_;
         // assert(obj->getResourceType() == ResourceType::VK_IMAGE);
         // auto img = std::dynamic_pointer_cast<VulkanImage>(obj);
         if (!img) {
@@ -247,7 +317,7 @@ template <typename T> class Tensor : public ITensor {
 
     void copyToGPU(const std::shared_ptr<VulkanDevice> &dev,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto img = vkobj_.lock();
+        auto img = vkobj_;
         VkDevice device = dev->getLogicalDevice();
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
@@ -325,7 +395,7 @@ template <typename T> class Tensor : public ITensor {
 
     void copyToCPU(const std::shared_ptr<VulkanDevice> &dev,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto img = vkobj_.lock();
+        auto img = vkobj_;
         VkDevice device = dev->getLogicalDevice();
 
         int batch = dims_[0];
@@ -358,18 +428,17 @@ template <typename T> class Tensor : public ITensor {
         delete ptr;
     }
 
-    std::shared_ptr<VulkanImage> make_vkimg(std::shared_ptr<VulkanDevice> &vd,
-                                            uint32_t flags) {
-        auto vkimg = std::make_shared<VulkanImage>(
+    void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
+        if (vkobj_) {
+            return;
+        }
+        vkobj_ = std::make_shared<VulkanImage>(
             vd,
             VkExtent3D{static_cast<uint32_t>(dims_[3] * UP_DIV(dims_[1], 4)),
                        static_cast<uint32_t>(dims_[2] * dims_[0]), 1},
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             (fp16_ ? VK_FORMAT_R16G16B16A16_SFLOAT
                    : VK_FORMAT_R32G32B32A32_SFLOAT));
-
-        vkobj_ = vkimg;
-        return vkimg;
     }
 
   private:
@@ -381,7 +450,7 @@ template <typename T> class Tensor : public ITensor {
     bool fp16_;
 
     // std::weak_ptr<VulkanResource> vkobj_;
-    std::weak_ptr<VulkanImage> vkobj_;
+    std::shared_ptr<VulkanImage> vkobj_;
 };
 
 template <typename T>

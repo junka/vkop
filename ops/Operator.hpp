@@ -63,11 +63,12 @@ class Operator {
     virtual OpType get_type() { return type_; }
 
     virtual void
-    execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
-            std::vector<std::shared_ptr<core::ITensor>> outputs) = 0;
+    execute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+            const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
 
-    virtual void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                       std::vector<std::shared_ptr<core::ITensor>> outputs) = 0;
+    virtual void
+    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+          const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
 
   protected:
     VkPhysicalDevice m_phydev_;

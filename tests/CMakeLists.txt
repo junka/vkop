@@ -42,6 +42,7 @@ foreach(TEST ${TESTS})
 endforeach()
 
 file(COPY ../model/add_model.bin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
+file(COPY ../model/add_conv_model.bin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
 
 target_compile_definitions(ModelTest PRIVATE
     TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"

@@ -30,53 +30,18 @@ class BinaryFactory : public Operator {
         if (output->size() == 0) {
             output->resize(input_shape);
         }
-        VkDevice device = m_dev_->getLogicalDevice();
-        int exflags = 0;
-        if (m_dev_->is_support_host_image_copy()) {
-#ifdef VK_EXT_host_image_copy
-            exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
-#endif
-        }
 
-        outputImage_ = output->make_vkimg(
-            m_dev_, VK_IMAGE_USAGE_STORAGE_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+        auto inputa_image = input_a->as_input_image(m_dev_, m_cmdpool_);
+        auto inputb_image = input_b->as_input_image(m_dev_, m_cmdpool_);
+        auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        auto inputa_image = input_a->make_vkimg(
-            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
-        auto inputb_image = input_b->make_vkimg(
-            m_dev_, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
-#ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            if (m_dev_->checkHostImageCopyDstLayoutSupport(
-                    VK_IMAGE_LAYOUT_GENERAL)) {
-                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
-            } else {
-                outputImage_->hostImaggeTransition(
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            }
-            inputa_image->hostImaggeTransition(
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-            inputb_image->hostImaggeTransition(
-                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-        } else
-#endif
-        {
-            VulkanCommandBuffer cmd(device, m_cmdpool_->getCommandPool());
-            cmd.begin();
-            outputImage_->writeBarrier(cmd.get());
-            inputa_image->readBarrier(cmd.get());
-            inputb_image->readBarrier(cmd.get());
-            cmd.end();
-            cmd.submit(m_dev_->getComputeQueue());
-        }
         inputImages_ = {inputa_image, inputb_image};
+        outputImage_ = output_image;
     }
 
-    void apply(std::vector<std::shared_ptr<core::ITensor>> inputs,
-               std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+    void
+    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         if (inputs[0]->dtype() == typeid(float)) {
             prepare<float>(inputs, outputs);
         } else if (inputs[0]->dtype() == typeid(uint16_t)) {
@@ -86,8 +51,9 @@ class BinaryFactory : public Operator {
         }
     }
 
-    void execute(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) override {
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         if (inputs[0]->dtype() == typeid(float)) {
             auto input_a = core::as_tensor<float>(inputs[0]);

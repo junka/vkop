@@ -121,7 +121,6 @@ std::vector<MaskInfo> postProcessNMS(
 
         // detections.push_back({x1, y1, x2, y2, score, Category::category});
     }
-    printf("done\n");
     return detections;
 }
 
@@ -226,6 +225,7 @@ int main(int argc, char *argv[]) {
         std::vector<std::shared_ptr<ITensor>> outputs;
         std::unordered_set<std::shared_ptr<ITensor>> output_tensor_set;
         std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
+        std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
         std::vector<std::unique_ptr<vkop::ops::Operator>> ops_all;
         std::vector<std::vector<std::shared_ptr<ITensor>>> inputs_all;
@@ -234,6 +234,7 @@ int main(int argc, char *argv[]) {
             auto t = std::make_shared<Tensor<float>>(i.dims);
             inputs.push_back(t);
             tensor_map[i.name] = t;
+            tensor_name_map[t] = i.name;
         }
 
         for (const auto& o: model.outputs) {
@@ -242,6 +243,8 @@ int main(int argc, char *argv[]) {
             outputs.push_back(t);
             output_tensor_set.insert(t);
             tensor_map[o.name] = t;
+            tensor_name_map[t] = o.name;
+            std::cout << "create output tensor " << o.name << std::endl;
         }
 
         for (const auto& n: model.nodes) {
@@ -253,12 +256,26 @@ int main(int argc, char *argv[]) {
             std::vector<std::shared_ptr<ITensor>> node_inputs;
             std::vector<std::shared_ptr<ITensor>> node_outputs;
 
+            for (const auto& out_shape : n.outputs) {
+                if (tensor_map.find(out_shape.name) != tensor_map.end()) {
+                    printf("find output tensor %s for op %s\n", out_shape.name.c_str(), n.op_type.c_str());
+                    tensor_map[out_shape.name]->toGPU();
+                    node_outputs.push_back(tensor_map[out_shape.name]);
+                } else {
+                    printf("make tensor on GPU %s\n", out_shape.name.c_str());
+                    auto t = std::make_shared<Tensor<float>>(out_shape.dims);
+                    t->toGPU();
+                    tensor_map[out_shape.name] = t;
+                    tensor_name_map[t] = out_shape.name;
+                    node_outputs.push_back(t);
+                }
+            }
             for (const auto& in_shape : n.inputs) {
                 if (tensor_map.find(in_shape.name) != tensor_map.end()) {
                     node_inputs.push_back(tensor_map[in_shape.name]);
-                    // std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << std::endl;
+                    std::cout << "find input tensor " << in_shape.name << " for op " << n.op_type << " on " << (tensor_map[in_shape.name]->is_on_GPU()? "GPU" : "CPU")<< std::endl;
                 } else {
-                    // std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
+                    std::cout << "create empty tensor " << in_shape.name << " for op " << n.op_type << std::endl;
                     if (in_shape.dims.empty()) {
                         node_inputs.push_back(nullptr);
                         continue;
@@ -275,6 +292,7 @@ int main(int argc, char *argv[]) {
                                 t->data()[i] = static_cast<float>(init.dataii[i]);
                             }
                             tensor_map[in_shape.name] = t;
+                            tensor_name_map[t] = in_shape.name;
                             node_inputs.push_back(t);
                             // std::cout << "load int64 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
                         } else if (init.dtype == "int32") {
@@ -283,29 +301,20 @@ int main(int argc, char *argv[]) {
                                 t->data()[i] = static_cast<float>(init.dataii[i]);
                             }
                             tensor_map[in_shape.name] = t;
+                            tensor_name_map[t] = in_shape.name;
                             node_inputs.push_back(t);
                             // std::cout << "load int32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
                         } else if (init.dtype == "float32") {
                             auto t = std::make_shared<Tensor<float>>(in_shape.dims);
                             std::memcpy(t->data(), init.dataf.data(), t->num_elements() * sizeof(float));
                             tensor_map[in_shape.name] = t;
+                            tensor_name_map[t] = in_shape.name;
                             node_inputs.push_back(t);
                             // std::cout << "load float32 initializer " << in_shape.name << " for op " << n.op_type << std::endl;
                         } else {
                             throw std::runtime_error("Only float32 initializer is supported for now " + init.dtype);
                         }
                     }
-                }
-            }
-
-            for (const auto& out_shape : n.outputs) {
-                if (tensor_map.find(out_shape.name) != tensor_map.end()) {
-                    node_outputs.push_back(tensor_map[out_shape.name]);
-                } else {
-                    auto t = std::make_shared<Tensor<float>>(out_shape.dims);
-                    t->toGPU();
-                    tensor_map[out_shape.name] = t;
-                    node_outputs.push_back(t);
                 }
             }
 
@@ -336,32 +345,25 @@ int main(int argc, char *argv[]) {
                     continue;
                 }
                 if (p->is_on_GPU()) {
-                    printf("already on GPU\n");
+                    printf("tensor %s already on GPU\n", tensor_name_map[p].c_str());
                 } else {
-                    printf("on CPU\n");
+                    printf("tensor %s on CPU\n", tensor_name_map[p].c_str());
                     auto t = vkop::core::as_tensor<float>(p);
-                    // t->printTensorShape();
                     t->copyToGPU(dev, cmdpool);
                 }
             }
-            // ops_all[i]->copyTensorToImages<float>(inputs_all[i]);
             ops_all[i]->execute(inputs_all[i], outputs_all[i]);
-            for (auto & j : outputs_all[i]) {
-                if (output_tensor_set.find(j) != output_tensor_set.end()) {
-                    auto t = vkop::core::as_tensor<float>(j);
-                    // ops_all[i]->copyImageToTensor(t);
-                    t->copyToCPU(dev, cmdpool);
-                }
-            }
         }
-        
-        auto hm = vkop::core::as_tensor<float>(outputs[0]);
-        auto reg = vkop::core::as_tensor<float>(outputs[1]);
-        auto dim = vkop::core::as_tensor<float>(outputs[2]);
-        auto cls = vkop::core::as_tensor<float>(outputs[3]);
-        auto hm_nms = vkop::core::as_tensor<float>(outputs[4]);
-        printf("%f, %f, %f, %f, %f\n", (*hm)[0], (*reg)[0], (*dim)[0], (*cls)[0], (*hm_nms)[0]);
-        
+        for (auto &p : outputs) {
+            auto t = vkop::core::as_tensor<float>(p);
+            t->copyToCPU(dev, cmdpool);
+        }
+        auto hm = vkop::core::as_tensor<float>(tensor_map["hm"]);
+        auto reg = vkop::core::as_tensor<float>(tensor_map["reg"]);
+        auto dim = vkop::core::as_tensor<float>(tensor_map["dim"]);
+        auto cls = vkop::core::as_tensor<float>(tensor_map["cls"]);
+        auto hm_nms = vkop::core::as_tensor<float>(tensor_map["hm_nms"]);
+
         postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
             t->getTensorShape()[2], t->getTensorShape()[3]);
         auto end = std::chrono::steady_clock::now();

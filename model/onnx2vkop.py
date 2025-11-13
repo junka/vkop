@@ -236,6 +236,7 @@ def parse_onnx_model(onnx_path):
             dim.dim_value if dim.HasField("dim_value") else 1
             for dim in tensor_type.shape.dim
         ]
+        print("Graph input:", inp.name, "of shape:", shape_dims)
         vk_model.inputs.append({'name': inp.name, 'shape': shape_dims})
 
     # Outputs with shapes
@@ -245,10 +246,8 @@ def parse_onnx_model(onnx_path):
             dim.dim_value if dim.HasField("dim_value") else 1
             for dim in tensor_type.shape.dim
         ]
+        print("Graph output:", out.name, "of shape:", shape_dims)
         vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
-
-    for node in graph.input:
-        print("Graph input:", node.name)
 
     # Nodes with attributes and shapes of inputs/outputs
     for node in graph.node:
@@ -347,6 +346,7 @@ def parse_onnx_model(onnx_path):
                         break
             if output_tensor is None:
                 print(f"Warning: Output tensor {output_name} not found in graph.")
+                outputs_with_shape.append({'name': output_name, 'shape':[]})
                 continue
             tensor_type = output_tensor.type.tensor_type
             shape_dims = [
