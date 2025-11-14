@@ -21,6 +21,9 @@ set(TESTS
     MaxPoolTest
     LayerNormTest
     ResizeTest
+    PReluTest
+    SigmoidTest
+    SoftplusTest
     ModelTest
 )
 

@@ -37,6 +37,9 @@ enum class OpType {
     SQUEEZE,
     COL2IM,
     IM2COL,
+    PRELU,
+    SIGMOID,
+    SOFTPLUS,
 };
 
 inline std::string convert_openum_to_string(const OpType &type) {
@@ -97,6 +100,12 @@ inline std::string convert_openum_to_string(const OpType &type) {
         return "Col2Im";
     case OpType::IM2COL:
         return "Im2Col";
+    case OpType::PRELU:
+        return "PRelu";
+    case OpType::SIGMOID:
+        return "Sigmoid";
+    case OpType::SOFTPLUS:
+        return "Softplus";
     default:
         return "Unknown";
     }
@@ -145,6 +154,26 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::FLOOR;
     if (name == "Resize")
         return vkop::ops::OpType::RESIZE;
+    if (name == "PRelu")
+        return vkop::ops::OpType::PRELU;
+    if (name == "Flatten")
+        return vkop::ops::OpType::FLATTEN;
+    if (name == "Concat")
+        return vkop::ops::OpType::CONCAT;
+    if (name == "Slice")
+        return vkop::ops::OpType::SLICE;
+    if (name == "Unsqueeze")
+        return vkop::ops::OpType::UNSQUEEZE;
+    if (name == "Squeeze")
+        return vkop::ops::OpType::SQUEEZE;
+    if (name == "Col2Im")
+        return vkop::ops::OpType::COL2IM;
+    if (name == "Im2Col")
+        return vkop::ops::OpType::IM2COL;
+    if (name == "Sigmoid")
+        return vkop::ops::OpType::SIGMOID;
+    if (name == "Softplus")
+        return vkop::ops::OpType::SOFTPLUS;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }
