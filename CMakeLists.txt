@@ -103,7 +103,7 @@ else()
     # add_dependencies(vkopmain lint-code)
 endif()
 
-option(USE_VALIDATION_LAYERS "Enable validation layers" ON)
+option(USE_VALIDATION_LAYERS "Enable validation layers" OFF)
 option(USE_MEASURE_TIME "Enable measuring time" OFF)
 option(USE_VMA "Enable usage of Vulkan Memory Allocator" OFF)
 
@@ -116,6 +116,37 @@ endif()
 if(USE_VMA)
     target_compile_definitions(vkop PRIVATE USE_VMA)
 endif()
+
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+if(ENABLE_ASAN)
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 4.8)
+            message(FATAL_ERROR "GCC >= 4.8 required for AddressSanitizer")
+        endif()
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+        if(CMAKE_CXX_COMPILER_VERSION VERSION_LESS 3.1)
+            message(FATAL_ERROR "Clang >= 3.1 required for AddressSanitizer")
+        endif()
+    else()
+        message(WARNING "AddressSanitizer not supported for this compiler")
+    endif()
+
+    target_compile_options(vkop PUBLIC
+        -fsanitize=address
+        -fno-omit-frame-pointer
+        -g
+    )
+
+    target_link_options(vkop PUBLIC
+        -fsanitize=address
+    )
+
+    set(ENV{ASAN_OPTIONS} "detect_leaks=1")
+
+    message(STATUS "AddressSanitizer enabled for target: your_target_name")
+endif()
+
 
 enable_testing()
 

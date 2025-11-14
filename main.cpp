@@ -220,8 +220,9 @@ int main(int argc, char *argv[]) {
         auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
         resize_YUV(frame, image_h, image_w, t);
 
-        t->copyToGPU(dev, cmdpool);
-        rt->Run();
+        for (int i = 0; i < 300; i ++) {
+            rt->Run();
+        }
         rt->ReadResult();
         auto hm = vkop::core::as_tensor<float>(rt->GetOutput("hm"));
         auto reg = vkop::core::as_tensor<float>(rt->GetOutput("reg"));
@@ -236,6 +237,5 @@ int main(int argc, char *argv[]) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;
     }
-    // sleep(20000);
     return EXIT_SUCCESS;
 }

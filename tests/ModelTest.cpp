@@ -147,8 +147,6 @@ int main() {
 
     ModelTest test;
     test.initTestData(t1, t2);
-    t1->copyToGPU(dev, cmdpool);
-    t2->copyToGPU(dev, cmdpool);
     rt->Run();
     rt->ReadResult();
 

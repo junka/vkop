@@ -77,9 +77,7 @@ public:
                     auto t = core::as_tensor<T>(input);
                     t->copyToGPU(dev, cmdpool);
                 }
-                // op->copyTensorToImages<T>(inputs);
                 op->execute(inputs, outputs);
-                // op->copyImageToTensor<T>(output);
                 output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
                 auto oshape = output->getTensorShape();
@@ -148,9 +146,7 @@ public:
                     auto t = core::as_tensor<T>(input);
                     t->copyToGPU(dev, cmdpool);
                 }
-                // op->copyTensorToImages<T>(inputs);
                 op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
-                // op->copyImageToTensor<T>(output);
                 output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {

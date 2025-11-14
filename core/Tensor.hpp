@@ -319,6 +319,11 @@ template <typename T> class Tensor : public ITensor {
                    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto img = vkobj_;
         VkDevice device = dev->getLogicalDevice();
+        if (is_on_GPU()) {
+            return;
+        }
+        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
+        cmd.begin();
 #ifdef VK_EXT_host_image_copy
         if (m_dev_->is_support_host_image_copy()) {
             if (dims_.size() < 3 || is_on_GPU()) {
@@ -331,20 +336,14 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            VulkanCommandBuffer cmdstg(device, cmdpool->getCommandPool());
-            cmdstg.begin();
             if (dims_.size() < 3 || is_on_GPU()) {
                 return;
             }
             auto ptr = convertTensorToRGBA();
-            img->stagingBufferCopyToImage(cmdstg.get(), ptr->data());
+            img->stagingBufferCopyToImage(cmd.get(), ptr->data());
             toGPU();
             delete ptr;
-            cmdstg.end();
-            cmdstg.submit(dev->getComputeQueue());
         }
-        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
-        cmd.begin();
         img->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(dev->getComputeQueue());
@@ -415,11 +414,9 @@ template <typename T> class Tensor : public ITensor {
         {
             VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
             cmd.begin();
-            VulkanCommandBuffer cmdstg1(device, cmdpool->getCommandPool());
-            cmdstg1.begin();
-            img->stagingBufferCopyToHost(cmdstg1.get());
-            cmdstg1.end();
-            cmdstg1.submit(dev->getComputeQueue());
+            img->stagingBufferCopyToHost(cmd.get());
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
             img->readStaingBuffer(ptr->data());
         }
 
