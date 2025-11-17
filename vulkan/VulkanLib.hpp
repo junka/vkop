@@ -86,7 +86,11 @@ namespace vkop {
     PFN(vkGetDeviceProcAddr)                                                   \
     PFN(vkBindImageMemory2)                                                    \
     PFN(vkInvalidateMappedMemoryRanges)                                        \
-    PFN(vkFlushMappedMemoryRanges)
+    PFN(vkFlushMappedMemoryRanges)                                             \
+    PFN(vkDeviceWaitIdle)                                                      \
+    PFN(vkWaitForFences)                                                       \
+    PFN(vkDestroyFence)                                                        \
+    PFN(vkCreateFence)
 
 class VulkanLib {
   public:

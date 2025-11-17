@@ -220,7 +220,7 @@ int main(int argc, char *argv[]) {
         auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
         resize_YUV(frame, image_h, image_w, t);
 
-        for (int i = 0; i < 300; i ++) {
+        for (int i = 0; i < 1; i ++) {
             rt->Run();
         }
         rt->ReadResult();

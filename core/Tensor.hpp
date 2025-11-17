@@ -174,7 +174,7 @@ template <typename T> class Tensor : public ITensor {
         }
 
 #ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
+        if (vd->is_support_host_image_copy()) {
             vkobj_->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
@@ -206,12 +206,12 @@ template <typename T> class Tensor : public ITensor {
         }
 
 #ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
-            if (m_dev_->checkHostImageCopyDstLayoutSupport(
+        if (vd->is_support_host_image_copy()) {
+            if (vd->checkHostImageCopyDstLayoutSupport(
                     VK_IMAGE_LAYOUT_GENERAL)) {
-                outputImage_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+                vkobj_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             } else {
-                outputImage_->hostImaggeTransition(
+                vkobj_->hostImaggeTransition(
                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
         } else
@@ -260,8 +260,6 @@ template <typename T> class Tensor : public ITensor {
      */
     std::vector<T> *convertTensorToRGBA() {
         auto img = vkobj_;
-        // assert(obj->getResourceType() == ResourceType::VK_IMAGE);
-        // auto img = std::dynamic_pointer_cast<VulkanImage>(obj);
         if (!img) {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
@@ -325,7 +323,7 @@ template <typename T> class Tensor : public ITensor {
         VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
         cmd.begin();
 #ifdef VK_EXT_host_image_copy
-        if (m_dev_->is_support_host_image_copy()) {
+        if (dev->is_support_host_image_copy()) {
             if (dims_.size() < 3 || is_on_GPU()) {
                 return;
             }
@@ -407,7 +405,7 @@ template <typename T> class Tensor : public ITensor {
         auto ptr = new std::vector<T>((realheight * realwidth * 4));
 
 #ifdef VK_EXT_host_image_copy
-        if (m_dev->is_support_host_image_copy()) {
+        if (dev->is_support_host_image_copy()) {
             img->hostImageCopyToHost(ptr->data());
         } else
 #endif
@@ -446,7 +444,6 @@ template <typename T> class Tensor : public ITensor {
 
     bool fp16_;
 
-    // std::weak_ptr<VulkanResource> vkobj_;
     std::shared_ptr<VulkanImage> vkobj_;
 };
 

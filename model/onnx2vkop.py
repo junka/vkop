@@ -7,6 +7,7 @@ import onnx
 import numpy as np
 from onnx import numpy_helper
 import onnxoptimizer as optimizer
+from onnxsim import simplify
 from collections import defaultdict, deque
 
 
@@ -135,7 +136,7 @@ def optimize_onnx_model(onnx_model):
     passes = [
         "eliminate_deadend",  # Remove unused nodes
         "eliminate_identity",  # Remove identity nodes
-        "eliminate_shape_op",  # Remove shape nodes
+        # "eliminate_shape_op",  # Remove shape nodes
         "eliminate_nop_dropout",  # Remove no-op dropout
         "eliminate_nop_monotone_argmax",  # Remove no-op argmax
         "eliminate_nop_pad",  # Remove no-op padding
@@ -147,7 +148,30 @@ def optimize_onnx_model(onnx_model):
         "fuse_add_bias_into_conv",  # Fuse add bias into convolution
         "fuse_bn_into_conv",  # Fuse batch normalization into convolution
     ]
-    optimized_model = optimizer.optimize(onnx_model, passes)
+    guess_input = onnx_model.graph.input
+    input_shapes = {}
+    for inp in guess_input:
+        name = inp.name
+        tensor_type = inp.type.tensor_type
+        dim = tensor_type.shape.dim
+        if len(dim) != 4:
+            assert shape_dims.size() == 4, "Input shape must be 4D"
+        fixed_shape = []
+        for d in dim:
+            if d.HasField("dim_value"):
+                fixed_shape.append(d.dim_value)
+            elif d.HasField("dim_param"):
+                # 动态维度（如 "N", "batch"）→ 固定为 1
+                fixed_shape.append(1)
+            else:
+                # 未知维度（理论上不应出现），保守设为 1
+                fixed_shape.append(1)
+        print(f"Guess input: {name} of shape: {fixed_shape}")
+        input_shapes[name] = fixed_shape
+    optimized_model, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
+    assert check, "Simplified ONNX model could not be validated"
+    optimized_model = optimizer.optimize(optimized_model, passes)
+
     return optimized_model
 
 
@@ -214,6 +238,8 @@ def parse_onnx_model(onnx_path):
     # Optimize the ONNX model
     print("Optimizing ONNX model...")
     model = optimize_onnx_model(model)
+    # save optimized model
+    onnx.save(model, "optimized_" + os.path.basename(onnx_path))
 
     vk_model = VkModel()
     graph = model.graph

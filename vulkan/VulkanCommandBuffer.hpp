@@ -3,6 +3,7 @@
 #define SRC_VULKANCOMMANDBUFFER_HPP_
 
 #include "vulkan/VulkanPipeline.hpp"
+#include "vulkan/vulkan_core.h"
 #include <vulkan/vulkan.hpp>
 
 namespace vkop {

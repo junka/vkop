@@ -40,7 +40,8 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
+        # COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
+        COMMAND /home/disk1/junjie/armgpu/glslang/install/bin/glslangValidator -V --target-env vulkan1.3 ${SHADER} -o ${SPIRV_FILE}
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
@@ -73,7 +74,7 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 add_subdirectory(model)
 
 add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain -Wl,--whole-archive vkop -Wl,--no-whole-archive vload)
+target_link_libraries(vkopmain -Wl,--whole-archive vkop -Wl,--no-whole-archive vload -lpthread)
 
 
 find_program(CLANG_FORMAT "clang-format")

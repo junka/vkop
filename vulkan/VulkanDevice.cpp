@@ -129,11 +129,11 @@ bool VulkanDevice::createLogicalDevice() {
     devicefloat16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;
 #if VK_KHR_shader_integer_dot_product
-    VkPhysicalDeviceShaderIntegerDotProductFeatures integerDotProductFeatures =
-        {};
-    integerDotProductFeatures.sType =
+    VkPhysicalDeviceShaderIntegerDotProductFeatures
+        integer_dot_product_features = {};
+    integer_dot_product_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
-    devicefloat16_int8_features.pNext = &integerDotProductFeatures;
+    devicefloat16_int8_features.pNext = &integer_dot_product_features;
 #endif
 #if VK_KHR_buffer_device_address
     VkPhysicalDeviceBufferDeviceAddressFeatures buffer_device_address_features =
@@ -190,10 +190,10 @@ bool VulkanDevice::createLogicalDevice() {
 
 #ifdef VK_KHR_shader_integer_dot_product
     VkPhysicalDeviceShaderIntegerDotProductFeatures
-        shaderIntegerDotProductFeatures = {};
-    shaderIntegerDotProductFeatures.sType =
+        shader_integer_dot_product_features = {};
+    shader_integer_dot_product_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR;
-    shaderIntegerDotProductFeatures.shaderIntegerDotProduct = VK_TRUE;
+    shader_integer_dot_product_features.shaderIntegerDotProduct = VK_TRUE;
 #elif defined VK_VERSION_1_3
     VkPhysicalDeviceVulkan13Features features13 = {};
     features13.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES;
@@ -201,14 +201,14 @@ bool VulkanDevice::createLogicalDevice() {
 #endif
 
 #if VK_EXT_host_image_copy
-    VkPhysicalDeviceHostImageCopyFeatures hostImageCopyFeatures = {};
-    hostImageCopyFeatures.sType =
+    VkPhysicalDeviceHostImageCopyFeatures host_image_copy_features = {};
+    host_image_copy_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
     if (checkDeviceExtensionFeature(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
-        hostImageCopyFeatures.hostImageCopy = VK_TRUE;
+        host_image_copy_features.hostImageCopy = VK_TRUE;
         enabledExtensions_.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
         enabledFeatures_.push_back(
-            reinterpret_cast<uintptr_t>(&hostImageCopyFeatures));
+            reinterpret_cast<uintptr_t>(&host_image_copy_features));
         m_support_host_image_copy_ = true;
     }
 #endif
@@ -226,7 +226,7 @@ bool VulkanDevice::createLogicalDevice() {
             enabledExtensions_.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
             if (deviceProperties_.vendorID != 4318) {
                 // tested on Nvidia A2000, it supports 16bit storage feature but
-                // did not need to enable it enable it will cause validation
+                // did not need to enable it. enable will cause validation
                 // error VK_ERROR_FEATURE_NOT_PRESENT
                 enabledFeatures_.push_back(
                     reinterpret_cast<uintptr_t>(&storage16bit_features));
@@ -255,13 +255,13 @@ bool VulkanDevice::createLogicalDevice() {
         }
     }
 #ifdef VK_KHR_shader_integer_dot_product
-    if (integerDotProductFeatures.shaderIntegerDotProduct) {
+    if (integer_dot_product_features.shaderIntegerDotProduct) {
         if (checkDeviceExtensionFeature(
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
             enabledExtensions_.push_back(
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
-            enabledFeatures_.push_back(
-                reinterpret_cast<uintptr_t>(&shaderIntegerDotProductFeatures));
+            enabledFeatures_.push_back(reinterpret_cast<uintptr_t>(
+                &shader_integer_dot_product_features));
         }
     }
 #endif
@@ -320,7 +320,7 @@ bool VulkanDevice::createLogicalDevice() {
             VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     }
 #endif
-#if VK_EXT_image_robustness
+#ifdef VK_EXT_image_robustness
     VkPhysicalDeviceImageRobustnessFeatures imagerobustfeature;
     imagerobustfeature.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
@@ -389,6 +389,52 @@ bool VulkanDevice::createLogicalDevice() {
             VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
     }
 #endif
+
+#if defined VK_KHR_cooperative_matrix || defined VK_NV_cooperative_matrix
+#if defined VK_KHR_cooperative_matrix
+    if (checkDeviceExtensionFeature(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    } else {
+#endif
+        if (checkDeviceExtensionFeature(
+                VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            enabledExtensions_.push_back(
+                VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME);
+            uint32_t nv_cooperativematrix_cnt = 0;
+            auto vkGetPhysicalDeviceCooperativeMatrixPropertiesNV =
+                reinterpret_cast<
+                    PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesNV>(
+                    vkGetInstanceProcAddr(
+                        VulkanInstance::getVulkanInstance().getInstance(),
+                        "vkGetPhysicalDeviceCooperativeMatrixPropertiesNV"));
+            if (vkGetPhysicalDeviceCooperativeMatrixPropertiesNV) {
+                vkGetPhysicalDeviceCooperativeMatrixPropertiesNV(
+                    physicalDevice_, &nv_cooperativematrix_cnt, nullptr);
+                std::vector<VkCooperativeMatrixPropertiesNV> cmprops(
+                    nv_cooperativematrix_cnt);
+                for (auto &p : cmprops) {
+                    p.sType =
+                        VK_STRUCTURE_TYPE_COOPERATIVE_MATRIX_PROPERTIES_NV;
+                }
+                vkGetPhysicalDeviceCooperativeMatrixPropertiesNV(
+                    physicalDevice_, &nv_cooperativematrix_cnt, cmprops.data());
+                const char *type_str[] = {"F16", "F32", "F64", "S8",
+                                          "S16", "S32", "S64", "U8",
+                                          "U16", "U32", "U64"};
+                for (auto &p : cmprops) {
+                    std::cout << "MSize " << p.MSize << " NSize " << p.NSize
+                              << " KSize " << p.KSize << " A type "
+                              << type_str[p.AType] << " B type "
+                              << type_str[p.BType] << " C type "
+                              << type_str[p.CType] << " D type "
+                              << type_str[p.DType] << std::endl;
+                }
+            }
+        }
+#if defined VK_KHR_cooperative_matrix
+    }
+#endif
+#endif
     struct GeneralFeature {
         VkStructureType sType;
         void *pNext;
@@ -423,8 +469,9 @@ bool VulkanDevice::createLogicalDevice() {
         static_cast<uint32_t>(enabledExtensions_.size());
     create_info.ppEnabledExtensionNames = enabledExtensions_.data();
     create_info.pNext = p_first;
-    // std::cout << "enabled extensions count " << enabledExtensions.size() <<
-    // std::endl; for (auto e: enabledExtensions) {
+    // std::cout << "enabled extensions count " << enabledExtensions_.size()
+    //           << std::endl;
+    // for (auto &e : enabledExtensions_) {
     //     std::cout << "enabled extension: " << e << std::endl;
     // }
 

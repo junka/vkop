@@ -3,7 +3,7 @@
 #define SRC_VULKANRESOURCE_HPP_
 
 #include "vulkan/VulkanDevice.hpp"
-
+#include <memory>
 #include <variant>
 
 namespace vkop {
