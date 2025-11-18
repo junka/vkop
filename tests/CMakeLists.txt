@@ -25,6 +25,8 @@ set(TESTS
     SigmoidTest
     SoftplusTest
     ModelTest
+    MatMulTest
+    GemmTest
 )
 
 find_package(PythonLibs REQUIRED)

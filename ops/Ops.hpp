@@ -40,6 +40,7 @@ enum class OpType {
     PRELU,
     SIGMOID,
     SOFTPLUS,
+    GEMM,
 };
 
 inline std::string convert_openum_to_string(const OpType &type) {
@@ -106,6 +107,8 @@ inline std::string convert_openum_to_string(const OpType &type) {
         return "Sigmoid";
     case OpType::SOFTPLUS:
         return "Softplus";
+    case OpType::GEMM:
+        return "Gemm";
     default:
         return "Unknown";
     }
@@ -174,6 +177,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::SIGMOID;
     if (name == "Softplus")
         return vkop::ops::OpType::SOFTPLUS;
+    if (name == "Gemm")
+        return vkop::ops::OpType::GEMM;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

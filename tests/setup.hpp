@@ -71,7 +71,7 @@ public:
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
-                    if (!input || input->num_dims() < 3) {
+                    if (!input || input->num_dims() < 2) {
                         continue;
                     }
                     auto t = core::as_tensor<T>(input);
@@ -81,18 +81,30 @@ public:
                 output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
                 auto oshape = output->getTensorShape();
-                for (int i = 0; i < oshape[0]; i++) {
-                    printf("[\n");
-                    for (int j = 0; j < oshape[1]; j++) {
+                if (oshape.size() == 4) {
+                    for (int i = 0; i < oshape[0]; i++) {
                         printf("[\n");
-                        for (int k = 0; k < oshape[2]; k++) {
-                            printf("[");
-                            for (int l = 0; l < oshape[3]; l++) {
-                                int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
-                                    k * oshape[3] + l;
-                                printf("%.4f, ", out_ptr[idx]);
+                        for (int j = 0; j < oshape[1]; j++) {
+                            printf("[\n");
+                            for (int k = 0; k < oshape[2]; k++) {
+                                printf("[");
+                                for (int l = 0; l < oshape[3]; l++) {
+                                    int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
+                                        k * oshape[3] + l;
+                                    printf("%.4f, ", out_ptr[idx]);
+                                }
+                                printf("]\n");
                             }
                             printf("]\n");
+                        }
+                        printf("]\n");
+                    }
+                } else if (oshape.size() == 2) {
+                    for (int i = 0; i < oshape[0]; i++) {
+                        printf("[");
+                        for (int j = 0; j < oshape[1]; j++) {
+                            int idx = i * oshape[1] + j;
+                            printf("%.4f, ", out_ptr[idx]);
                         }
                         printf("]\n");
                     }
@@ -140,7 +152,7 @@ public:
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
-                    if (!input || input->num_dims() < 3) {
+                    if (!input || input->num_dims() < 2) {
                         continue;
                     }
                     auto t = core::as_tensor<T>(input);
