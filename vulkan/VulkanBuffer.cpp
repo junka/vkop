@@ -70,6 +70,11 @@ void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     if (ret != VK_SUCCESS) {
         throw std::runtime_error("Failed to create buffer!");
     }
+    if (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    } else if (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    }
 }
 
 std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>

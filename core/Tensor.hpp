@@ -7,6 +7,7 @@
 #include <memory>
 #include <vector>
 
+#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
@@ -154,13 +155,29 @@ template <typename T> class Tensor : public ITensor {
     int size() { return size_; }
     int num_elements() { return size_ / ele_size_; }
 
-    // void *map() { return nullptr; }
-    // void unmap() { (void)vkobj_; }
-
+    std::shared_ptr<VulkanBuffer>
+    as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
+        if (!vkobj_) {
+            vkobj_ = std::make_shared<VulkanBuffer>(
+                vd, size_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+    }
+    std::shared_ptr<VulkanBuffer>
+    as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
+        if (!vkobj_) {
+            vkobj_ = std::make_shared<VulkanBuffer>(
+                vd, size_, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        }
+        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+    }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    std::shared_ptr<VulkanCommandPool> &cmdpool) {
-
         if (!vkobj_) {
             int exflags = 0;
             if (vd->is_support_host_image_copy()) {
@@ -172,22 +189,22 @@ template <typename T> class Tensor : public ITensor {
                                VK_IMAGE_USAGE_STORAGE_BIT |
                                VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
         }
-
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
-            vkobj_->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            img->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         } else
 #endif
         {
             auto *device = vd->getLogicalDevice();
             VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
             cmd.begin();
-            vkobj_->readBarrier(cmd.get());
+            img->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(vd->getComputeQueue());
         }
 
-        return vkobj_;
+        return img;
     }
 
     std::shared_ptr<VulkanImage>
@@ -204,15 +221,14 @@ template <typename T> class Tensor : public ITensor {
                                VK_IMAGE_USAGE_SAMPLED_BIT |
                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
         }
-
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
             if (vd->checkHostImageCopyDstLayoutSupport(
                     VK_IMAGE_LAYOUT_GENERAL)) {
-                vkobj_->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
+                img->hostImaggeTransition(VK_IMAGE_LAYOUT_GENERAL);
             } else {
-                vkobj_->hostImaggeTransition(
-                    VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+                img->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
             }
         } else
 #endif
@@ -220,12 +236,12 @@ template <typename T> class Tensor : public ITensor {
             auto *device = vd->getLogicalDevice();
             VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
             cmd.begin();
-            vkobj_->writeBarrier(cmd.get());
+            img->writeBarrier(cmd.get());
             cmd.end();
             cmd.submit(vd->getComputeQueue());
         }
 
-        return vkobj_;
+        return img;
     }
 
     /**
@@ -259,7 +275,7 @@ template <typename T> class Tensor : public ITensor {
      * image formats and facilitates efficient GPU operations.
      */
     std::vector<T> *convertTensorToRGBA() {
-        auto img = vkobj_;
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
@@ -312,39 +328,19 @@ template <typename T> class Tensor : public ITensor {
         }
         return ptr;
     }
-
     void copyToGPU(const std::shared_ptr<VulkanDevice> &dev,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto img = vkobj_;
-        VkDevice device = dev->getLogicalDevice();
         if (is_on_GPU()) {
             return;
         }
-        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
-        cmd.begin();
-#ifdef VK_EXT_host_image_copy
-        if (dev->is_support_host_image_copy()) {
-            if (dims_.size() < 3 || is_on_GPU()) {
-                return;
-            }
-            auto ptr = convertTensorToRGBA();
-            img->hostImageCopyToDevice(ptr->data());
+        if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
+            copyToGPUImage(dev, cmdpool);
+        } else {
+            auto vkbuf = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+            auto *buffer = static_cast<T *>(vkbuf->getMappedMemory());
+            memcpy(buffer, data_.data(), size_);
             toGPU();
-            delete ptr;
-        } else
-#endif
-        {
-            if (dims_.size() < 3 || is_on_GPU()) {
-                return;
-            }
-            auto ptr = convertTensorToRGBA();
-            img->stagingBufferCopyToImage(cmd.get(), ptr->data());
-            toGPU();
-            delete ptr;
         }
-        img->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(dev->getComputeQueue());
     }
 
     void convertRGBAToTensor(T *ptr) {
@@ -392,7 +388,8 @@ template <typename T> class Tensor : public ITensor {
 
     void copyToCPU(const std::shared_ptr<VulkanDevice> &dev,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto img = vkobj_;
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        ;
         VkDevice device = dev->getLogicalDevice();
 
         int batch = dims_[0];
@@ -423,6 +420,13 @@ template <typename T> class Tensor : public ITensor {
         delete ptr;
     }
 
+  private:
+    std::vector<T> data_;
+    int ele_size_;
+    int size_;
+    bool fp16_;
+    std::shared_ptr<VulkanResource> vkobj_;
+
     void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         if (vkobj_) {
             return;
@@ -435,16 +439,37 @@ template <typename T> class Tensor : public ITensor {
             (fp16_ ? VK_FORMAT_R16G16B16A16_SFLOAT
                    : VK_FORMAT_R32G32B32A32_SFLOAT));
     }
+    void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
+                        const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        VkDevice device = dev->getLogicalDevice();
 
-  private:
-    std::vector<T> data_;
-
-    int ele_size_;
-    int size_;
-
-    bool fp16_;
-
-    std::shared_ptr<VulkanImage> vkobj_;
+        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
+        cmd.begin();
+#ifdef VK_EXT_host_image_copy
+        if (dev->is_support_host_image_copy()) {
+            if (dims_.size() < 3 || is_on_GPU()) {
+                return;
+            }
+            auto ptr = convertTensorToRGBA();
+            img->hostImageCopyToDevice(ptr->data());
+            toGPU();
+            delete ptr;
+        } else
+#endif
+        {
+            if (dims_.size() < 3 || is_on_GPU()) {
+                return;
+            }
+            auto ptr = convertTensorToRGBA();
+            img->stagingBufferCopyToImage(cmd.get(), ptr->data());
+            toGPU();
+            delete ptr;
+        }
+        img->readBarrier(cmd.get());
+        cmd.end();
+        cmd.submit(dev->getComputeQueue());
+    }
 };
 
 template <typename T>

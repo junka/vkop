@@ -31,7 +31,7 @@ layout(set=0, binding=1) uniform sampler2D uInput;
 
 layout(set=0, binding=2) uniform sampler2D uKernel;
 
-layout(set=0, binding=3) readonly buffer tensorBuffer {
+layout(set=0, binding=3) readonly buffer biasBuffer {
     float attr[]; // bias[C_out]
 } uBias;
 
@@ -43,6 +43,7 @@ layout(set=0, binding=4) uniform constBuffer {
     ivec2 padding;       // paddingW, paddingH
     ivec2 dilation;      // dilationW, dilationH
     int groups;
+    int bias;
     int relu;
 } uConstant;
 
@@ -178,13 +179,15 @@ void main() {
     }
 
     // Add bias
-    vec4 bias = vec4(0.0);
-    for (int comp = 0; comp < 4; ++comp) {
-        if (valid_oc[comp]) {
-            bias[comp] = uBias.attr[oc_vec[comp]];
+    if (uConstant.bias == 1) {
+        vec4 bias = vec4(0.0);
+        for (int comp = 0; comp < 4; ++comp) {
+            if (valid_oc[comp]) {
+                bias[comp] = uBias.attr[oc_vec[comp]];
+            }
         }
+        acc += bias;
     }
-    acc += bias;
     if (uConstant.relu == 1) {
         acc = max(acc, vec4(0.0));
     }

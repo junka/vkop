@@ -66,10 +66,8 @@ class LayerNorm : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        tensorBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, weight->size() * 2, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        weightBuffer_ = weight->as_storage_buffer(m_dev_);
+        biasBuffer_ = bias->as_storage_buffer(m_dev_);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
             m_dev_, sizeof(layernorm::GpuLayerNormParam),
@@ -77,8 +75,13 @@ class LayerNorm : public Operator {
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        inputImages_ = {input_image};
-        outputImage_ = output_image;
+        types_ = {output_image->getDescriptorType(),
+                  input_image->getDescriptorType(),
+                  weightBuffer_->getDescriptorType(),
+                  biasBuffer_->getDescriptorType(),
+                  paramBuffer_->getDescriptorType()};
+        objs_ = {output_image, input_image, weightBuffer_, biasBuffer_,
+                 paramBuffer_};
     }
 
     void
@@ -128,23 +131,9 @@ class LayerNorm : public Operator {
                 para->normalizedShape[i] = normalized_shape_[i];
                 para->innerSize *= normalized_shape_[i];
             }
+            weight->copyToGPU(m_dev_, m_cmdpool_);
+            bias->copyToGPU(m_dev_, m_cmdpool_);
 
-            auto *var_buffer =
-                static_cast<float *>(tensorBuffer_->getMappedMemory());
-            for (int i = 0; i < weight->num_elements(); i++) {
-                if (inputs.size() > 1) {
-                    *(var_buffer + 2 * i) = weight->data()[i];
-                } else {
-                    *(var_buffer + 2 * i) = 1.0F;
-                }
-                if (inputs.size() > 2) {
-                    *(var_buffer + 2 * i + 1) = bias->data()[i];
-                } else {
-                    *(var_buffer + 2 * i + 1) = 0.0F;
-                }
-            }
-
-            // do copy before submit
             if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
                 submit(layernorm_spv, layernorm_spv_len,
                        batch * UP_DIV(depth, 4), out_height);
@@ -160,44 +149,9 @@ class LayerNorm : public Operator {
   private:
     float eps_ = 1e-5;
     std::vector<int> normalized_shape_;
-    std::shared_ptr<VulkanBuffer> tensorBuffer_;
+    std::shared_ptr<VulkanBuffer> weightBuffer_;
+    std::shared_ptr<VulkanBuffer> biasBuffer_;
     std::shared_ptr<VulkanBuffer> paramBuffer_;
-
-    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
-                int out_height) override {
-        std::vector<VkDescriptorType> types = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputImages_[0], tensorBuffer_, paramBuffer_};
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types, objs,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
-
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
-#ifdef USE_MEASURE_TIME
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-#endif
-        cmd2.begin();
-        cmd2.bind(pipeline);
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(cmd2.get());
-#endif
-        cmd2.dispatch(out_width, out_height);
-#ifdef USE_MEASURE_TIME
-        query_pool.end(cmd2.get());
-#endif
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   m_dev_->getTimestampPeriod());
-#endif
-    }
 };
 
 } // namespace ops

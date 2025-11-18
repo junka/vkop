@@ -87,6 +87,8 @@ class VulkanResource {
 #endif
     }
 
+    VkDescriptorType getDescriptorType() const { return m_desc_type_; }
+
     VulkanResource() = delete;
     VulkanResource(const VulkanResource &buff) = delete;
     VulkanResource(const VulkanResource &&buff) = delete;
@@ -95,6 +97,7 @@ class VulkanResource {
 
   protected:
     std::shared_ptr<VulkanDevice> m_vdev_;
+    VkDescriptorType m_desc_type_;
 
   private:
 #ifndef USE_VMA

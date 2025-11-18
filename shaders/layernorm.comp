@@ -4,11 +4,14 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set=0, binding = 0) writeonly uniform image2D outputImage;
 layout(set=0, binding = 1) uniform sampler2D inputImage;
-layout(set=0, binding = 2) readonly buffer tensorBuffer {
-    vec2 attr[]; // weight, bias
-} uScaleBias;
+layout(set=0, binding = 2) readonly buffer weightBuffer {
+    float attr[];
+} uWeight;
+layout(set=0, binding = 3) readonly buffer biasBuffer {
+    float attr[];
+} uBias;
 
-layout(set=0, binding = 3) readonly uniform layerNormBuffer {
+layout(set=0, binding = 4) readonly uniform layerNormBuffer {
 	ivec4 outShape; // 输出图像的NCHW
     ivec4 normalizedShape; // 归一化的形状
     float eps; // default 1e-5
@@ -92,8 +95,8 @@ void norm_for_w () {
         vec4 norm = (pixel - shared_mean) * shared_inv_std;
 
         // Apply weight & bias
-        vec4 weights = vec4(uScaleBias.attr[w].x);
-        vec4 biases = vec4(uScaleBias.attr[w].y);
+        vec4 weights = vec4(uWeight.attr[w]);
+        vec4 biases = vec4(uBias.attr[w]);
 
         vec4 output_pixel = norm * weights + biases;
         imageStore(outputImage, coord, output_pixel);
@@ -178,8 +181,8 @@ void norm_for_hw() {
         vec4 norm = (pixel - shared_mean) * shared_inv_std;
 
         // Apply weight & bias
-        vec4 weight = vec4(uScaleBias.attr[hw].x);
-        vec4 bias = vec4(uScaleBias.attr[hw].y);
+        vec4 weight = vec4(uWeight.attr[hw]);
+        vec4 bias = vec4(uBias.attr[hw]);
 
         vec4 outputPixel = norm * weight + bias;
         imageStore(outputImage, coord, outputPixel);

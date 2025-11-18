@@ -35,8 +35,10 @@ class BinaryFactory : public Operator {
         auto inputb_image = input_b->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        inputImages_ = {inputa_image, inputb_image};
-        outputImage_ = output_image;
+        types_ = {output_image->getDescriptorType(),
+                  inputa_image->getDescriptorType(),
+                  inputb_image->getDescriptorType()};
+        objs_ = {output_image, inputa_image, inputb_image};
     }
 
     void
@@ -54,41 +56,26 @@ class BinaryFactory : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-
+        std::vector<int> input_shape;
         if (inputs[0]->dtype() == typeid(float)) {
             auto input_a = core::as_tensor<float>(inputs[0]);
             auto output = core::as_tensor<float>(outputs[0]);
-            auto input_b = core::as_tensor<float>(inputs[1]);
-
-            auto input_shape = input_a->getTensorShape();
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int out_height = input_shape[2];
-            int out_width = input_shape[3];
-
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
-            submit(spv_, spv_len_, realwidth, realheight);
+            input_shape = input_a->getTensorShape();
         } else if (inputs[0]->dtype() == typeid(uint16_t)) {
             auto input_a = core::as_tensor<uint16_t>(inputs[0]);
             auto output = core::as_tensor<uint16_t>(outputs[0]);
-            auto input_b = core::as_tensor<uint16_t>(inputs[1]);
-
-            auto input_shape = input_a->getTensorShape();
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int out_height = input_shape[2];
-            int out_width = input_shape[3];
-
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
-            if (output->size() == 0) {
-                output->resize(input_a->getTensorShape());
-            }
-            submit(spv_, spv_len_, realwidth, realheight);
+            input_shape = input_a->getTensorShape();
         } else {
             LOG_ERROR("Unsupported data type");
         }
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        int out_height = input_shape[2];
+        int out_width = input_shape[3];
+
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
+        submit(spv_, spv_len_, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
 
   protected:
@@ -100,41 +87,6 @@ class BinaryFactory : public Operator {
   private:
     unsigned char *spv_;
     unsigned int spv_len_;
-
-    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
-                int out_height) override {
-        std::vector<VkDescriptorType> types = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputImages_[0], inputImages_[1]};
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types, objs,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
-
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
-#ifdef USE_MEASURE_TIME
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-#endif
-        cmd2.begin();
-        cmd2.bind(pipeline);
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(cmd2.get());
-#endif
-        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
-#ifdef USE_MEASURE_TIME
-        query_pool.end(cmd2.get());
-#endif
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   m_dev_->getTimestampPeriod());
-#endif
-    }
 };
 
 } // namespace ops

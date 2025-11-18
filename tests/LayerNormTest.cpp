@@ -117,10 +117,6 @@ private:
         shapes.push_back(input_shape_);
         shapes.push_back(normalized_shape_);
         shapes.push_back(normalized_shape_);
-        // input = std::make_shared<Tensor<float>>(input_shape_);
-
-        // auto *input_ptr = input->data();
-        // expectedOutput.resize(input->num_elements());
 
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("layer_norm", shapes, param);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);

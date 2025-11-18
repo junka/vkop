@@ -33,8 +33,9 @@ class UnaryFactory : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        inputImages_ = {input_image};
-        outputImage_ = output_image;
+        types_ = {output_image->getDescriptorType(),
+                  input_image->getDescriptorType()};
+        objs_ = {output_image, input_image};
     }
 
     void
@@ -65,7 +66,8 @@ class UnaryFactory : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            submit(spv_, spv_len_, realwidth, realheight);
+            submit(spv_, spv_len_, UP_DIV(realwidth, 16),
+                   UP_DIV(realheight, 16));
         }
     }
 
@@ -78,40 +80,6 @@ class UnaryFactory : public Operator {
   private:
     unsigned char *spv_;
     unsigned int spv_len_;
-
-    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
-                int out_height) override {
-        std::vector<VkDescriptorType> types = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {outputImage_,
-                                                             inputImages_[0]};
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types, objs,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
-
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
-#ifdef USE_MEASURE_TIME
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-#endif
-        cmd2.begin();
-        cmd2.bind(pipeline);
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(cmd2.get());
-#endif
-        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
-#ifdef USE_MEASURE_TIME
-        query_pool.end(cmd2.get());
-#endif
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   m_dev_->getTimestampPeriod());
-#endif
-    }
 };
 
 } // namespace ops

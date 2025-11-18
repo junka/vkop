@@ -2,6 +2,7 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
+#include <cassert>
 #include <cstddef>
 
 namespace vkop {
@@ -373,6 +374,12 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
 
     m_layout_ = newLayout;
     m_access_ = dstAccessMask;
+
+    if (m_layout_ == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    } else if (m_layout_ == VK_IMAGE_LAYOUT_GENERAL) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
 }
 
 void VulkanImage::transferBarrier(VkCommandBuffer commandBuffer,
@@ -532,6 +539,12 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 #else
     (void)newLayout;
 #endif
+    if (m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    } else if (m_layout_ == VK_IMAGE_LAYOUT_GENERAL ||
+               m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    }
 }
 
 void VulkanImage::hostImageCopyToDevice(void *ptr) {

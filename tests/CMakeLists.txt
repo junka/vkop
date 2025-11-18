@@ -37,7 +37,7 @@ endif()
 
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cpp)
-    target_link_libraries(${TEST} -Wl,--whole-archive vkop vload -Wl,--no-whole-archive)
+    target_link_libraries(${TEST} -Wl,--whole-archive vkop vload -Wl,--no-whole-archive -lpthread)
     if (PYTHONLIBS_FOUND)
         target_link_libraries(${TEST} ${PYTHON_LIBRARIES})
     endif()

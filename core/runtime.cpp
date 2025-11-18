@@ -115,7 +115,17 @@ void Runtime::LoadModel() {
     }
 
     for (auto &init : initializers_) {
-        if (!init.second || init.second->num_dims() < 4) {
+        if (!init.second) {
+            continue;
+        }
+        // fprintf(stderr, "init %s\n", init.first.c_str());
+        if (init.second->num_dims() == 2 || init.second->num_dims() == 1) {
+            auto t = vkop::core::as_tensor<float>(init.second);
+            if (!t || (t->num_dims() == 1 && t->num_elements() <= 4)) {
+                continue;
+            }
+            t->as_storage_buffer(m_dev_);
+            t->copyToGPU(m_dev_, m_cmdpool_);
             continue;
         }
         auto t = vkop::core::as_tensor<float>(init.second);
@@ -156,8 +166,9 @@ void Runtime::Run() {
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < node_ops_.size(); ++i) {
         // printf("ops %s input tensors %ld\n",
-        // vkop::ops::convert_openum_to_string(ops_all[i]->get_type()).c_str(),
-        // inputs_all[i].size());
+        //        vkop::ops::convert_openum_to_string(node_ops_[i]->get_type())
+        //            .c_str(),
+        //        node_input_tensors_[i].size());
         node_ops_[i]->apply(node_input_tensors_[i], node_output_tensors_[i]);
         node_ops_[i]->execute(node_input_tensors_[i], node_output_tensors_[i]);
     }

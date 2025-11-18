@@ -41,6 +41,7 @@ struct GPUConv2dParam {
     ivec2 padding;
     ivec2 dilation;
     int groups;
+    int bias;
     int relu;
 };
 
@@ -135,6 +136,8 @@ class Conv2d : public Operator {
         auto input = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
         auto weight = core::as_tensor<T>(inputs[1]);
+        auto bias =
+            (inputs.size() > 2) ? core::as_tensor<float>(inputs[2]) : nullptr;
 
         auto input_shape = input->getTensorShape();
         auto weight_shape = weight->getTensorShape();
@@ -152,7 +155,6 @@ class Conv2d : public Operator {
                          dilations_[1] * (weight_shape[3] - 1) - 1) /
                             strides_[1] +
                         1;
-        int out_channel = weight_shape[0];
         if (output->size() == 0) {
             output->resize(out_batch, out_depth, out_height, out_width);
         }
@@ -162,10 +164,12 @@ class Conv2d : public Operator {
 
         auto weight_image = weight->as_input_image(m_dev_, m_cmdpool_);
 
-        biasBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, out_channel * sizeof(T), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        auto bias_buffer =
+            bias ? bias->as_storage_buffer(m_dev_)
+                 : std::make_shared<VulkanBuffer>(
+                       m_dev_, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         paramBuffer_ = std::make_shared<VulkanBuffer>(
             m_dev_, sizeof(conv2d::GPUConv2dParam),
@@ -173,8 +177,14 @@ class Conv2d : public Operator {
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        inputImages_ = {input_image, weight_image};
-        outputImage_ = output_image;
+        types_ = {output_image->getDescriptorType(),
+                  input_image->getDescriptorType(),
+                  weight_image->getDescriptorType(),
+                  bias ? bias_buffer->getDescriptorType()
+                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  paramBuffer_->getDescriptorType()};
+        objs_ = {output_image, input_image, weight_image, bias_buffer,
+                 paramBuffer_};
     }
 
     void
@@ -244,22 +254,14 @@ class Conv2d : public Operator {
             para->dilation[1] = dilations_[1];
 
             para->groups = groups_;
+            para->bias = bias ? 1 : 0;
             paramBuffer_->unmapMemory();
 
-            auto *bias_ptr =
-                static_cast<float *>(biasBuffer_->getMappedMemory());
-            if (bias != nullptr) {
-                for (int i = 0; i < bias->num_elements(); i++) {
-                    *(bias_ptr + i) = bias->data()[i];
-                }
-            } else {
-                for (int i = 0; i < out_depth; i++) {
-                    *(bias_ptr + i) = static_cast<float>(0);
-                }
-            }
-            biasBuffer_->unmapMemory();
+            if (bias)
+                bias->copyToGPU(m_dev_, m_cmdpool_);
 
-            submit(conv2d_spv, conv2d_spv_len, realwidth, realheight);
+            submit(conv2d_spv, conv2d_spv_len, UP_DIV(realwidth, 16),
+                   UP_DIV(realheight, 16));
         } else {
             LOG_ERROR("Unsupported data type");
         }
@@ -276,44 +278,6 @@ class Conv2d : public Operator {
 
     std::shared_ptr<VulkanBuffer> paramBuffer_;
     std::shared_ptr<VulkanBuffer> biasBuffer_;
-
-    void submit(const unsigned char *spv, unsigned int spv_len, int out_width,
-                int out_height) override {
-        std::vector<VkDescriptorType> types = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-            VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER};
-        std::vector<std::shared_ptr<VulkanResource>> objs = {
-            outputImage_, inputImages_[0], inputImages_[1], biasBuffer_,
-            paramBuffer_};
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types, objs,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
-
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
-#ifdef USE_MEASURE_TIME
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-#endif
-        cmd2.begin();
-        cmd2.bind(pipeline);
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(cmd2.get());
-#endif
-        cmd2.dispatch(UP_DIV(out_width, 16), UP_DIV(out_height, 16));
-#ifdef USE_MEASURE_TIME
-        query_pool.end(cmd2.get());
-#endif
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   m_dev_->getTimestampPeriod());
-#endif
-    }
 };
 
 } // namespace ops
