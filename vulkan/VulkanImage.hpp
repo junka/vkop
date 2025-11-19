@@ -4,15 +4,13 @@
 
 #include "vulkan/vulkan.hpp"
 
-#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <variant>
 
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanResource.hpp"
-
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#include "vulkan/VulkanStagingBufferPool.hpp"
 
 namespace vkop {
 
@@ -48,8 +46,10 @@ class VulkanImage : public VulkanResource {
 
     void writeBarrier(VkCommandBuffer commandBuffer);
 
-    void copyImageToBuffer(VkCommandBuffer commandBuffer, VulkanBuffer &buffer);
-    void copyBufferToImage(VkCommandBuffer commandBuffer, VulkanBuffer &buffer);
+    void copyImageToBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                           VkDeviceSize offset);
+    void copyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer buffer,
+                           VkDeviceSize offset);
 
     /*
      * For host image copy image layout transition
@@ -59,10 +59,10 @@ class VulkanImage : public VulkanResource {
     void hostImageCopyToDevice(void *ptr);
     void hostImageCopyToHost(void *ptr);
 
-    void stagingBufferCopyToImage(VkCommandBuffer commandBuffer,
-                                  const void *ptr);
-    void stagingBufferCopyToHost(VkCommandBuffer commandBuffer);
-    void readStaingBuffer(void *ptr);
+    int getImageSize() const {
+        return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
+               m_dim_.depth;
+    }
 
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
@@ -91,14 +91,7 @@ class VulkanImage : public VulkanResource {
     int m_chansize_;
     int m_chans_;
 
-    std::unique_ptr<VulkanBuffer> m_stagingBuffer_;
-
     void calcImageSize();
-    int getImageSize() const {
-        return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
-               m_dim_.depth;
-    }
-
     int getImageWidth() const { return m_dim_.width; }
     int getImageHeight() const { return m_dim_.height; }
     int getImageDepth() const { return m_dim_.depth; }
@@ -110,8 +103,6 @@ class VulkanImage : public VulkanResource {
     void createSampler();
 
     void destroyImage();
-
-    void createStagingBuffer(bool writeonly);
 };
 } // namespace vkop
 #endif // SRC_VULKANIMAGE_HPP_

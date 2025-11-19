@@ -33,7 +33,7 @@ class Col2im : public Operator {
         auto input = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
 
-        auto input_shape = input->getTensorShape();
+        auto input_shape = input->getShape();
 
         if (output->size() == 0) {
             output->resize(input_shape);
@@ -72,7 +72,7 @@ class Col2im : public Operator {
         if (inputs[0]->dtype() == typeid(float)) {
             auto input = core::as_tensor<float>(inputs[0]);
             auto output = core::as_tensor<float>(outputs[0]);
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
 
             if (input_shape.size() != 4) {
                 throw std::invalid_argument("Input must have 4 dimensions.");

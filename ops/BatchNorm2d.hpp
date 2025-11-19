@@ -63,10 +63,10 @@ class BatchNorm2d : public Operator {
         auto bias =
             (inputs.size() > 4) ? core::as_tensor<T>(inputs[4]) : nullptr;
 
-        auto input_shape = input->getTensorShape();
+        auto input_shape = input->getShape();
 
         if (output->size() == 0) {
-            output->resize(input->getTensorShape());
+            output->resize(input->getShape());
         }
 
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
@@ -114,7 +114,7 @@ class BatchNorm2d : public Operator {
             auto bias = (inputs.size() > 4) ? core::as_tensor<float>(inputs[4])
                                             : nullptr;
 
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
             int batch = input_shape[0];
             int depth = input_shape[1];
             int out_height = input_shape[2];
@@ -131,6 +131,7 @@ class BatchNorm2d : public Operator {
             para->outShape[1] = depth;
             para->outShape[2] = out_height;
             para->outShape[3] = out_width;
+            paramBuffer_->unmapMemory();
 
             auto *var_buffer =
                 static_cast<float *>(tensorBuffer_->getMappedMemory());
@@ -148,6 +149,7 @@ class BatchNorm2d : public Operator {
                     *(var_buffer + 4 * i + 3) = 0.0F;
                 }
             }
+            tensorBuffer_->unmapMemory();
 
             submit(batchnorm2d_spv, batchnorm2d_spv_len, UP_DIV(realwidth, 16),
                    UP_DIV(realheight, 16));

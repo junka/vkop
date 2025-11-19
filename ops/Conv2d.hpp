@@ -139,8 +139,8 @@ class Conv2d : public Operator {
         auto bias =
             (inputs.size() > 2) ? core::as_tensor<float>(inputs[2]) : nullptr;
 
-        auto input_shape = input->getTensorShape();
-        auto weight_shape = weight->getTensorShape();
+        auto input_shape = input->getShape();
+        auto weight_shape = weight->getShape();
 
         int batch = input_shape[0];
         int in_height = input_shape[2];
@@ -208,8 +208,8 @@ class Conv2d : public Operator {
             auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
                                             : nullptr;
 
-            auto input_shape = input->getTensorShape();
-            auto weight_shape = weight->getTensorShape();
+            auto input_shape = input->getShape();
+            auto weight_shape = weight->getShape();
 
             int batch = input_shape[0];
             int depth = input_shape[1];

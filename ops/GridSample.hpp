@@ -89,8 +89,8 @@ class GridSample : public Operator {
         auto output = core::as_tensor<T>(outputs[0]);
         auto grid = core::as_tensor<T>(inputs[1]);
 
-        auto input_shape = input->getTensorShape();
-        auto grid_shape = grid->getTensorShape();
+        auto input_shape = input->getShape();
+        auto grid_shape = grid->getShape();
 
         int batch = input_shape[0];
         int depth = input_shape[1];
@@ -139,8 +139,8 @@ class GridSample : public Operator {
             auto output = core::as_tensor<float>(outputs[0]);
             auto grid = core::as_tensor<float>(inputs[1]);
 
-            auto input_shape = input->getTensorShape();
-            auto grid_shape = grid->getTensorShape();
+            auto input_shape = input->getShape();
+            auto grid_shape = grid->getShape();
 
             if (input_shape.size() != 4 || grid_shape.size() != 4) {
                 throw std::invalid_argument(

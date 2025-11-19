@@ -10,7 +10,7 @@ namespace vkop {
 class VulkanCommandBuffer {
   public:
     VulkanCommandBuffer(VkDevice device, VkCommandPool commandPool,
-                        int count = 1);
+                        VkSemaphore semaphore = VK_NULL_HANDLE, int count = 1);
     ~VulkanCommandBuffer();
 
     // Allocate command buffers
@@ -28,6 +28,8 @@ class VulkanCommandBuffer {
 
     // Submit the command buffer to a queue
     int submit(VkQueue queue, VkFence fence = VK_NULL_HANDLE);
+    // Submit the command buffer to a queue with timeline semaphore
+    int submit(VkQueue queue, uint64_t submitValue);
 
     // Reset the command buffer
     void reset(int idx = 0);
@@ -40,7 +42,7 @@ class VulkanCommandBuffer {
   private:
     VkDevice m_device_;
     VkCommandPool m_commandPool_;
-    // VkCommandBuffer m_commandBuffer;
+    VkSemaphore m_semaphore_;
     std::vector<VkCommandBuffer> m_commandBuffers_;
     int m_avail_ = 0;
 };

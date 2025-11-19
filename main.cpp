@@ -123,8 +123,8 @@ std::vector<MaskInfo> postProcessNMS(
 }
 
 void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
-    int in_h = t->getTensorShape()[2];
-    int in_w = t->getTensorShape()[3];
+    int in_h = t->getShape()[2];
+    int in_w = t->getShape()[3];
 
     float* data_ptr = t->data();
 
@@ -191,8 +191,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     printf("using %s\n",dev->getDeviceName().c_str());
-    auto *device = dev->getLogicalDevice();
-    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
+    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image.yuv>" << std::endl;
@@ -220,7 +219,7 @@ int main(int argc, char *argv[]) {
         auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
         resize_YUV(frame, image_h, image_w, t);
 
-        for (int i = 0; i < 1; i ++) {
+        for (int i = 0; i < 100; i ++) {
             rt->Run();
         }
         rt->ReadResult();
@@ -231,8 +230,8 @@ int main(int argc, char *argv[]) {
         auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
         assert(hm != nullptr);
 
-        postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getTensorShape()[2], hm_nms->getTensorShape()[3], image_h, image_w,
-            t->getTensorShape()[2], t->getTensorShape()[3]);
+        postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getShape()[2], hm_nms->getShape()[3], image_h, image_w,
+            t->getShape()[2], t->getShape()[3]);
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;

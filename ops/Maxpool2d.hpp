@@ -120,7 +120,7 @@ class Maxpool2d : public Operator {
         auto input = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
 
-        auto input_shape = input->getTensorShape();
+        auto input_shape = input->getShape();
         int batch = input_shape[0];
         int depth = input_shape[1];
 
@@ -187,7 +187,7 @@ class Maxpool2d : public Operator {
         if (inputs[0]->dtype() == typeid(float)) {
             auto input = core::as_tensor<float>(inputs[0]);
             auto output = core::as_tensor<float>(outputs[0]);
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
 
             if (input_shape.size() != 4) {
                 throw std::invalid_argument("Input must have 4 dimensions.");

@@ -142,15 +142,31 @@ bool VulkanDevice::createLogicalDevice() {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
     buffer_device_address_features.pNext = &devicefloat16_int8_features;
 #endif
-
+#if VK_KHR_timeline_semaphore
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_features{};
+    timeline_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+#if VK_KHR_buffer_device_address
+    timeline_features.pNext = &buffer_device_address_features;
+#else
+    timeline_features.pNext = &devicefloat16_int8_features;
+#endif
+#endif
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-#if VK_KHR_buffer_device_address
+#if VK_KHR_timeline_semaphore
+    features2.pNext = &timeline_features;
+#elif VK_KHR_buffer_device_address
     features2.pNext = &buffer_device_address_features;
 #else
     features2.pNext = &devicefloat16_int8_features;
 #endif
+
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
+
+    if (timeline_features.timelineSemaphore != VK_TRUE) {
+        throw std::runtime_error("Timeline semaphores not supported!");
+    }
 
     VkPhysicalDeviceFeatures features = {};
     features.robustBufferAccess = VK_TRUE;
@@ -389,7 +405,14 @@ bool VulkanDevice::createLogicalDevice() {
             VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
     }
 #endif
-
+#ifdef VK_KHR_timeline_semaphore
+    VkPhysicalDeviceTimelineSemaphoreFeatures timeline_sem_features{};
+    timeline_sem_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
+    timeline_sem_features.timelineSemaphore = VK_TRUE;
+    enabledFeatures_.push_back(
+        reinterpret_cast<uintptr_t>(&timeline_sem_features));
+#endif
 #if defined VK_KHR_cooperative_matrix || defined VK_NV_cooperative_matrix
 #if defined VK_KHR_cooperative_matrix
     if (checkDeviceExtensionFeature(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {

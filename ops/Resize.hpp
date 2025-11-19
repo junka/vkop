@@ -131,7 +131,7 @@ class Resize : public Operator {
         auto output = core::as_tensor<T>(outputs[0]);
         auto sizes = core::as_tensor<int64_t>(inputs[3]);
 
-        auto input_shape = input->getTensorShape();
+        auto input_shape = input->getShape();
         if (input_shape.size() != 4) {
             throw std::invalid_argument("Input must have 4 dimensions.");
         }
@@ -207,7 +207,7 @@ class Resize : public Operator {
             auto scales = core::as_tensor<float>(inputs[2]);
             auto sizes = core::as_tensor<int64_t>(inputs[3]);
 
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
 
             int batch = input_shape[0];
             int depth = input_shape[1];

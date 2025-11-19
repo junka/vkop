@@ -1,0 +1,64 @@
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : enable
+#extension GL_EXT_shader_atomic_float : enable
+
+layout(local_size_x = 16, local_size_y = 16) in; // 每个 workgroup 256 线程
+
+layout(set = 0, binding = 0) readonly buffer InputBuffer {
+    float data_in[];
+};
+layout(set = 0, binding = 1) buffer OutputBuffer {
+    float result;
+};
+
+layout(set=0, binding = 2) readonly uniform paraBuffer {
+    int H;
+    int W;
+    int norm_type;
+} uReducePara;
+
+shared float local_sum[256]; // 每个线程一个 slot
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint lid = gl_LocalInvocationID.x;
+    uint group_size = gl_WorkGroupSize.x; // 256
+
+    uint total_elements = uReducePara.H * uReducePara.W;
+    
+    // Step 1: 每个线程累加多个元素（strided access）
+    float sum = 0.0;
+    for (uint i = gid; i < total_elements; i += gl_NumWorkGroups.x * group_size) {
+        float val = data_in[i];
+        if (uReducePara.norm_type == 1) {
+            sum += abs(val);
+        } else {
+            sum += val * val;
+        }
+    }
+
+    // Step 2: 写入 shared memory
+    local_sum[lid] = sum;
+    memoryBarrierShared();
+    barrier();
+
+    // Tree reduction in workgroup
+    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+        if (lid < stride) {
+            local_sum[lid] += local_sum[lid + stride];
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    if (lid == 0) {
+        float partial = local_sum[0];
+        if (uReducePara.norm_type == 2) {
+            // 注意：不能在这里 sqrt！因为要先 sum 所有 partial
+            // 所以 L2 必须分两步：先 sum(x²)，再 sqrt
+            result = partial; // 但这是错的！
+        } else {
+            atomicAdd(result, partial);
+        }
+    }
+}

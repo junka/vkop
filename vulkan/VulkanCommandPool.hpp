@@ -6,23 +6,40 @@
 #include <vulkan/vulkan.hpp>
 
 #include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanStagingBufferPool.hpp"
 
 namespace vkop {
 class VulkanCommandPool {
   public:
-    VulkanCommandPool(VkDevice device, uint32_t queueFamilyIndex);
+    explicit VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev);
     ~VulkanCommandPool();
 
     void reset(VkCommandPoolResetFlags flags = 0);
 
     VkCommandPool getCommandPool() const { return m_commandPool_; }
 
+    uint64_t getCompletedTimelineValue();
+
+    uint64_t getNextSubmitValue() { return ++m_timelineValue_; }
+    VkSemaphore getSemaphore() const { return m_semaphore_; }
+
+    std::shared_ptr<VulkanStagingBufferPool> getStagingBufferPool() const {
+        return stagingbuffer_pool_;
+    }
+
   private:
-    VkDevice m_device_;
+    // VkDevice m_device_;
+    std::shared_ptr<VulkanDevice> m_vdev_;
     VkCommandPool m_commandPool_ = VK_NULL_HANDLE;
     std::vector<VulkanCommandBuffer> buffers_;
+    VkSemaphore m_semaphore_;
+    uint64_t m_timelineValue_ = 0;
+    std::shared_ptr<VulkanStagingBufferPool> stagingbuffer_pool_;
 
     void createCommandPool(uint32_t queueFamilyIndex);
+
+    void createTimelineSemaphore();
 };
 
 } // namespace vkop

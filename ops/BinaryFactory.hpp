@@ -26,7 +26,7 @@ class BinaryFactory : public Operator {
         auto input_a = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
         auto input_b = core::as_tensor<T>(inputs[1]);
-        auto input_shape = input_a->getTensorShape();
+        auto input_shape = input_a->getShape();
         if (output->size() == 0) {
             output->resize(input_shape);
         }
@@ -60,11 +60,11 @@ class BinaryFactory : public Operator {
         if (inputs[0]->dtype() == typeid(float)) {
             auto input_a = core::as_tensor<float>(inputs[0]);
             auto output = core::as_tensor<float>(outputs[0]);
-            input_shape = input_a->getTensorShape();
+            input_shape = input_a->getShape();
         } else if (inputs[0]->dtype() == typeid(uint16_t)) {
             auto input_a = core::as_tensor<uint16_t>(inputs[0]);
             auto output = core::as_tensor<uint16_t>(outputs[0]);
-            input_shape = input_a->getTensorShape();
+            input_shape = input_a->getShape();
         } else {
             LOG_ERROR("Unsupported data type");
         }

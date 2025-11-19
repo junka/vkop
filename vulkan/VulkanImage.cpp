@@ -3,7 +3,6 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <cassert>
-#include <cstddef>
 
 namespace vkop {
 
@@ -50,11 +49,6 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
 #endif
     createImageView();
     createSampler();
-    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
-        createStagingBuffer(false);
-    } else {
-        createStagingBuffer(true);
-    }
 }
 
 void VulkanImage::calcImageSize() {
@@ -216,20 +210,6 @@ void VulkanImage::calcImageSize() {
 
 VulkanImage::~VulkanImage() { destroyImage(); }
 
-void VulkanImage::createStagingBuffer(bool writeonly) {
-    auto size = getImageSize();
-    if (writeonly) {
-        m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_vdev_, size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    } else {
-        m_stagingBuffer_ = std::make_unique<VulkanBuffer>(
-            m_vdev_, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
-    }
-}
 void VulkanImage::createImage() {
     m_imagetype_ = VK_IMAGE_TYPE_3D;
     if (m_dim_.depth == 1) {
@@ -419,7 +399,7 @@ void VulkanImage::writeBarrier(VkCommandBuffer commandBuffer) {
 }
 
 void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
-                                    VulkanBuffer &buffer) {
+                                    VkBuffer buffer, VkDeviceSize offset) {
     VkImageLayout old_layout = m_layout_;
     VkAccessFlags old_access = m_access_;
     // Ensure the image is in a readable layout
@@ -433,7 +413,7 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
 #endif
 
     VkBufferImageCopy region = {};
-    region.bufferOffset = 0;
+    region.bufferOffset = offset;
     region.bufferRowLength = 0;   // Tightly packed
     region.bufferImageHeight = 0; // Tightly packed
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -444,15 +424,14 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
     region.imageExtent = m_dim_;
 
     assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
-    vkCmdCopyImageToBuffer(commandBuffer, img, m_layout_, buffer.getBuffer(), 1,
-                           &region);
+    vkCmdCopyImageToBuffer(commandBuffer, img, m_layout_, buffer, 1, &region);
 
     // Optionally transition the image back to its original layout
     transferBarrier(commandBuffer, old_layout, old_access);
 }
 
 void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
-                                    VulkanBuffer &buffer) {
+                                    VkBuffer buffer, VkDeviceSize offset) {
     VkImageLayout old_layout = m_layout_;
     VkAccessFlags old_access = m_access_;
     // Ensure the image is in a readable layout
@@ -465,7 +444,7 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     VkImage img = m_image_;
 #endif
     VkBufferImageCopy region = {};
-    region.bufferOffset = 0;
+    region.bufferOffset = offset;
     region.bufferRowLength = 0;
     region.bufferImageHeight = 0;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -475,35 +454,10 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim_;
     assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
-    vkCmdCopyBufferToImage(commandBuffer, buffer.getBuffer(), img, m_layout_, 1,
-                           &region);
+    vkCmdCopyBufferToImage(commandBuffer, buffer, img, m_layout_, 1, &region);
 
     // Optionally transition the image back to its original layout
     transferBarrier(commandBuffer, old_layout, old_access);
-}
-
-void VulkanImage::stagingBufferCopyToImage(VkCommandBuffer commandBuffer,
-                                           const void *ptr) {
-    auto *dst = m_stagingBuffer_->getMappedMemory();
-    auto imagesize = getImageSize();
-    const auto *src = static_cast<const float *>(ptr);
-    assert(dst != nullptr);
-    std::memcpy(dst, src, imagesize);
-    m_stagingBuffer_->unmapMemory();
-
-    copyBufferToImage(commandBuffer, *m_stagingBuffer_);
-}
-
-void VulkanImage::stagingBufferCopyToHost(VkCommandBuffer commandBuffer) {
-    copyImageToBuffer(commandBuffer, *m_stagingBuffer_);
-}
-
-void VulkanImage::readStaingBuffer(void *ptr) {
-    auto imagesize = getImageSize();
-    void *src = m_stagingBuffer_->getMappedMemory();
-    auto *dst = static_cast<float *>(ptr);
-    memcpy(dst, src, imagesize);
-    m_stagingBuffer_->unmapMemory();
 }
 
 void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {

@@ -135,8 +135,7 @@ int main() {
     }
 
     LOG_INFO("%s",dev->getDeviceName().c_str());
-    auto *device = dev->getLogicalDevice();
-    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
+    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
     std::string binary_file_path = TEST_DATA_PATH"/add_conv_model.bin";
 
     auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
@@ -155,15 +154,15 @@ int main() {
     auto weight = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight"));
 
     std::vector<float> ref_output_data;
-    int batch = t1->getTensorShape()[0];
-    int ic = t1->getTensorShape()[1];
-    int ih = t1->getTensorShape()[2];
-    int iw = t1->getTensorShape()[3];
-    int oc = result->getTensorShape()[1];
+    int batch = t1->getShape()[0];
+    int ic = t1->getShape()[1];
+    int ih = t1->getShape()[2];
+    int iw = t1->getShape()[3];
+    int oc = result->getShape()[1];
     int pad_h = 1;
     int pad_w = 1;
-    int kh = weight->getTensorShape()[2];
-    int kw = weight->getTensorShape()[3];
+    int kh = weight->getShape()[2];
+    int kw = weight->getShape()[3];
     int stride_h = 1;
     int stride_w = 1;
     int dilation_h = 1;

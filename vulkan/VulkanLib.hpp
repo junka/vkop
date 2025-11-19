@@ -90,7 +90,11 @@ namespace vkop {
     PFN(vkDeviceWaitIdle)                                                      \
     PFN(vkWaitForFences)                                                       \
     PFN(vkDestroyFence)                                                        \
-    PFN(vkCreateFence)
+    PFN(vkCreateFence)                                                         \
+    PFN(vkCreateSemaphore)                                                     \
+    PFN(vkGetSemaphoreCounterValue)                                            \
+    PFN(vkDestroySemaphore)                                                    \
+    PFN(vkCmdFillBuffer)
 
 class VulkanLib {
   public:

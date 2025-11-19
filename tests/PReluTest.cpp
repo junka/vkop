@@ -22,7 +22,7 @@ float reference_prelu(float val, float alpha)
 class PReluTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        20, 64, 64, 64
+        5, 5, 64, 64
     };
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;

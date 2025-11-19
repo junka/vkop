@@ -3,6 +3,7 @@
 #define OPS_OPS_HPP_
 
 #include <string>
+#include <vector>
 
 namespace vkop {
 namespace ops {
@@ -41,77 +42,23 @@ enum class OpType {
     SIGMOID,
     SOFTPLUS,
     GEMM,
+    REDUCE,
+    TOTAL_NUM
 };
 
 inline std::string convert_openum_to_string(const OpType &type) {
-    switch (type) {
-    case OpType::ADD:
-        return "Add";
-    case OpType::SUB:
-        return "Sub";
-    case OpType::MUL:
-        return "Mul";
-    case OpType::DIV:
-        return "Div";
-    case OpType::ATAN:
-        return "Atan";
-    case OpType::ERF:
-        return "Erf";
-    case OpType::POW:
-        return "Pow";
-    case OpType::BATCHNORM:
-        return "BatchNorm";
-    case OpType::LAYERNORM:
-        return "LayerNorm";
-    case OpType::RELU:
-        return "Relu";
-    case OpType::SOFTMAX:
-        return "Softmax";
-    case OpType::TANH:
-        return "Tanh";
-    case OpType::MATMUL:
-        return "MatMul";
-    case OpType::CONV2D:
-        return "Conv2d";
-    case OpType::MAXPOOL2D:
-        return "MaxPool2d";
-    case OpType::AVGPOOL2D:
-        return "AvgPool2d";
-    case OpType::UPSAMPLE2D:
-        return "Upsample2d";
-    case OpType::GRIDSAMPLE:
-        return "GridSample";
-    case OpType::CONSTANT:
-        return "Constant";
-    case OpType::FLOOR:
-        return "Floor";
-    case OpType::FLATTEN:
-        return "Flatten";
-    case OpType::RESIZE:
-        return "Resize";
-    case OpType::CONCAT:
-        return "Concat";
-    case OpType::SLICE:
-        return "Slice";
-    case OpType::UNSQUEEZE:
-        return "Unsqueeze";
-    case OpType::SQUEEZE:
-        return "Squeeze";
-    case OpType::COL2IM:
-        return "Col2Im";
-    case OpType::IM2COL:
-        return "Im2Col";
-    case OpType::PRELU:
-        return "PRelu";
-    case OpType::SIGMOID:
-        return "Sigmoid";
-    case OpType::SOFTPLUS:
-        return "Softplus";
-    case OpType::GEMM:
-        return "Gemm";
-    default:
-        return "Unknown";
-    }
+    std::vector<std::string> names = {
+        "Unknown",   "Add",       "Sub",        "Mul",        "Div",
+        "Atan",      "Erf",       "Pow",        "BatchNorm",  "LayerNorm",
+        "Relu",      "Softmax",   "Tanh",       "MatMul",     "Conv2d",
+        "MaxPool2d", "AvgPool2d", "Upsample2d", "GridSample", "Constant",
+        "Floor",     "Flatten",   "Resize",     "Concat",     "Slice",
+        "Unsqueeze", "Squeeze",   "Col2Im",     "Im2Col",     "PRelu",
+        "Sigmoid",   "Softplus",  "Gemm",       "Reduce",
+    };
+    if (type >= OpType::TOTAL_NUM)
+        return names[0];
+    return names[static_cast<int>(type)];
 }
 
 inline OpType convert_opstring_to_enum(const std::string &name) {
@@ -179,6 +126,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::SOFTPLUS;
     if (name == "Gemm")
         return vkop::ops::OpType::GEMM;
+    if (name == "Reduce")
+        return vkop::ops::OpType::REDUCE;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

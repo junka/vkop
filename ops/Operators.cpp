@@ -20,6 +20,7 @@
 #include "GridSample.hpp"
 #include "Matmul.hpp"
 #include "Maxpool2d.hpp"
+#include "Reduce.hpp"
 #include "Resize.hpp"
 #include "Softmax.hpp"
 
@@ -53,6 +54,7 @@ REGISTER_OPERATOR(OpType::RESIZE, Resize);
 REGISTER_OPERATOR(OpType::SOFTMAX, Softmax);
 REGISTER_OPERATOR(OpType::MATMUL, MatMul);
 REGISTER_OPERATOR(OpType::GEMM, Gemm);
+REGISTER_OPERATOR(OpType::REDUCE, Reduce);
 
 } // namespace ops
 } // namespace vkop

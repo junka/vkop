@@ -27,7 +27,7 @@ class UnaryFactory : public Operator {
         auto input = core::as_tensor<T>(inputs[0]);
         auto output = core::as_tensor<T>(outputs[0]);
         if (output->size() == 0) {
-            output->resize(input->getTensorShape());
+            output->resize(input->getShape());
         }
 
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
@@ -57,7 +57,7 @@ class UnaryFactory : public Operator {
             auto input = core::as_tensor<float>(inputs[0]);
             auto output = core::as_tensor<float>(outputs[0]);
 
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
             int batch = input_shape[0];
             int depth = input_shape[1];
             int out_height = input_shape[2];

@@ -36,8 +36,8 @@ class MatMul : public Operator {
         auto inputa = core::as_tensor<T>(inputs[0]);
         auto inputb = core::as_tensor<T>(inputs[1]);
         auto output = core::as_tensor<T>(outputs[0]);
-        int m = inputa->getTensorShape()[0];
-        int n = inputb->getTensorShape()[1];
+        int m = inputa->getShape()[0];
+        int n = inputb->getShape()[1];
         if (output->size() == 0) {
             output->resize(std::vector<int>{m, n});
         }
@@ -77,8 +77,8 @@ class MatMul : public Operator {
             auto inputa = core::as_tensor<float>(inputs[0]);
             auto inputb = core::as_tensor<float>(inputs[1]);
             auto output = core::as_tensor<float>(outputs[0]);
-            int m = inputa->getTensorShape()[0];
-            int n = inputb->getTensorShape()[1];
+            int m = inputa->getShape()[0];
+            int n = inputb->getShape()[1];
 
             inputa->copyToGPU(m_dev_, m_cmdpool_);
             inputb->copyToGPU(m_dev_, m_cmdpool_);
@@ -87,7 +87,7 @@ class MatMul : public Operator {
                 paramBuffer_->getMappedMemory());
             para->M = m;
             para->N = n;
-            para->K = inputa->getTensorShape()[1];
+            para->K = inputa->getShape()[1];
             paramBuffer_->unmapMemory();
 
             submit(matmul_spv, matmul_spv_len, UP_DIV(n, 16), UP_DIV(m, 16));

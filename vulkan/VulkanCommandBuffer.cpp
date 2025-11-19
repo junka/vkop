@@ -7,8 +7,9 @@ namespace vkop {
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 VulkanCommandBuffer::VulkanCommandBuffer(VkDevice device,
-                                         VkCommandPool commandPool, int count)
-    : m_device_(device), m_commandPool_(commandPool) {
+                                         VkCommandPool commandPool,
+                                         VkSemaphore semaphore, int count)
+    : m_device_(device), m_commandPool_(commandPool), m_semaphore_(semaphore) {
     allocate(count);
 }
 
@@ -89,6 +90,28 @@ int VulkanCommandBuffer::submit(VkQueue queue, VkFence fence) {
     submit_info.pCommandBuffers = m_commandBuffers_.data();
 
     if (vkQueueSubmit(queue, 1, &submit_info, fence) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to submit command buffer!");
+    }
+    return vkQueueWaitIdle(queue);
+}
+
+int VulkanCommandBuffer::submit(VkQueue queue, uint64_t submitValue) {
+
+    VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
+    timeline_submit_info.sType =
+        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+    timeline_submit_info.signalSemaphoreValueCount = 1;
+    timeline_submit_info.pSignalSemaphoreValues = &submitValue;
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.pNext = &timeline_submit_info;
+    submit_info.signalSemaphoreCount = 1;
+    submit_info.pSignalSemaphores = &m_semaphore_;
+    submit_info.commandBufferCount = m_commandBuffers_.size();
+    submit_info.pCommandBuffers = m_commandBuffers_.data();
+
+    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
     return vkQueueWaitIdle(queue);

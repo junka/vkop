@@ -61,13 +61,13 @@ class Gemm : public Operator {
         auto output = core::as_tensor<T>(outputs[0]);
         auto inputc =
             inputs.size() > 2 ? core::as_tensor<T>(inputs[2]) : nullptr;
-        int m = inputa->getTensorShape()[0];
-        int n = inputb->getTensorShape()[1];
+        int m = inputa->getShape()[0];
+        int n = inputb->getShape()[1];
         if (transA_) {
-            m = inputa->getTensorShape()[1];
+            m = inputa->getShape()[1];
         }
         if (transB_) {
-            n = inputb->getTensorShape()[0];
+            n = inputb->getShape()[0];
         }
         if (output->size() == 0) {
             output->resize(std::vector<int>{m, n});
@@ -118,21 +118,21 @@ class Gemm : public Operator {
             auto inputc =
                 inputs.size() > 2 ? core::as_tensor<float>(inputs[2]) : nullptr;
             auto output = core::as_tensor<float>(outputs[0]);
-            int m = inputa->getTensorShape()[0];
-            int n = inputb->getTensorShape()[1];
-            int k = inputa->getTensorShape()[1];
+            int m = inputa->getShape()[0];
+            int n = inputb->getShape()[1];
+            int k = inputa->getShape()[1];
             if (transA_) {
-                m = inputa->getTensorShape()[1];
-                k = inputa->getTensorShape()[0];
+                m = inputa->getShape()[1];
+                k = inputa->getShape()[0];
             }
             if (transB_) {
-                n = inputb->getTensorShape()[0];
-                k = inputb->getTensorShape()[1];
+                n = inputb->getShape()[0];
+                k = inputb->getShape()[1];
             }
 
             inputa->copyToGPU(m_dev_, m_cmdpool_);
             inputb->copyToGPU(m_dev_, m_cmdpool_);
-            inputc->printTensorShape();
+            inputc->printShape();
             if (inputc) {
                 inputc->copyToGPU(m_dev_, m_cmdpool_);
             }

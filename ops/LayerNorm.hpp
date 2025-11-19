@@ -58,9 +58,9 @@ class LayerNorm : public Operator {
         auto bias =
             (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
-        auto input_shape = input->getTensorShape();
+        auto input_shape = input->getShape();
         if (output->size() == 0) {
-            output->resize(input->getTensorShape());
+            output->resize(input->getShape());
         }
 
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
@@ -109,7 +109,7 @@ class LayerNorm : public Operator {
             auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
                                             : nullptr;
 
-            auto input_shape = input->getTensorShape();
+            auto input_shape = input->getShape();
             int batch = input_shape[0];
             int depth = input_shape[1];
             int out_height = input_shape[2];
@@ -131,6 +131,7 @@ class LayerNorm : public Operator {
                 para->normalizedShape[i] = normalized_shape_[i];
                 para->innerSize *= normalized_shape_[i];
             }
+            paramBuffer_->unmapMemory();
             weight->copyToGPU(m_dev_, m_cmdpool_);
             bias->copyToGPU(m_dev_, m_cmdpool_);
 

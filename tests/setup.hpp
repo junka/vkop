@@ -52,8 +52,7 @@ public:
                     continue;
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
-                auto *device = dev->getLogicalDevice();
-                auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
+                auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
 
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
@@ -68,6 +67,7 @@ public:
                 }
 
                 auto output = std::make_shared<Tensor<T>>();
+                output->toGPU();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
@@ -80,7 +80,7 @@ public:
                 op->execute(inputs, outputs);
                 output->copyToCPU(dev, cmdpool);
                 auto *out_ptr = output->data();
-                auto oshape = output->getTensorShape();
+                auto oshape = output->getShape();
                 if (oshape.size() == 4) {
                     for (int i = 0; i < oshape[0]; i++) {
                         printf("[\n");
@@ -138,8 +138,7 @@ public:
                     continue;
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
-                auto *device = dev->getLogicalDevice();
-                auto cmdpool = std::make_shared<VulkanCommandPool>(device, dev->getComputeQueueFamilyIndex());
+                auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
 
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
@@ -149,6 +148,7 @@ public:
                 op->set_runtime_device(dev, cmdpool);
 
                 auto output = std::make_shared<Tensor<T>>();
+                output->toGPU();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
