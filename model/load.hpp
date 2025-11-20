@@ -47,9 +47,9 @@ public:
     std::unordered_map<std::string, Initializer> initializers;
 
     explicit VkModel(const std::string& filePath);
-    static void dump_model(const VkModel& model) {
+    void dump_model() {
         std::cout << "Inputs:" << std::endl;
-        for (const auto& input : model.inputs) {
+        for (const auto& input : this->inputs) {
             std::cout << "  Name: " << input.name << ", Shape: [";
             for (size_t i = 0; i < input.dims.size(); ++i) {
                 std::cout << input.dims[i] << (i + 1 < input.dims.size() ? ", " : "");
@@ -58,7 +58,7 @@ public:
         }
 
         std::cout << "Outputs:" << std::endl;
-        for (const auto& output : model.outputs) {
+        for (const auto& output : this->outputs) {
             std::cout << "  Name: " << output.name << ", Shape: [";
             for (size_t i = 0; i < output.dims.size(); ++i) {
                 std::cout << output.dims[i] << (i + 1 < output.dims.size() ? ", " : "");
@@ -67,7 +67,7 @@ public:
         }
 
         std::cout << "Nodes:" << std::endl;
-        for (const auto& node : model.nodes) {
+        for (const auto& node : this->nodes) {
             std::cout << "  OpType: " << node.op_type;
             std::cout << "  Name: " << node.name;
             if (!node.attributes.empty()) {
@@ -98,7 +98,7 @@ public:
         }
 
         std::cout << "Initializers:" << std::endl;
-        for (const auto& [name, initializer] : model.initializers) {
+        for (const auto& [name, initializer] : this->initializers) {
             std::cout << name << ", [";
             for (size_t i = 0; i < initializer.dims.size(); ++i) {
                 std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");

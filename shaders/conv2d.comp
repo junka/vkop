@@ -23,6 +23,8 @@
 
 #define FLOAT4 vec4
 
+#include "activation.comp"
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set=0, binding=0) writeonly uniform image2D uOutput;
@@ -44,7 +46,7 @@ layout(set=0, binding=4) uniform constBuffer {
     ivec2 dilation;      // dilationW, dilationH
     int groups;
     int bias;
-    int relu;
+    int activation;
 } uConstant;
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
@@ -188,9 +190,7 @@ void main() {
         }
         acc += bias;
     }
-    if (uConstant.relu == 1) {
-        acc = max(acc, vec4(0.0));
-    }
+    acc = activation(acc, uConstant.activation);
 
     imageStore(uOutput, gid, acc);
 }

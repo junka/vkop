@@ -24,25 +24,23 @@ namespace ops {
 namespace conv2d {
 
 enum class PaddingMode { ZEROS, REFLECT, REPLICATE, CIRCULAR };
+enum class ActivationMode { NONE, RELU, SIGMOID, TANH, HARDSWISH, MISH };
 
 using ivec4 = int[4];
 using ivec2 = int[2];
 
 struct GPUConv2dParam {
-
-    // ivec4 outImgSize;
     ivec4 inputSize;
     ivec4 outputSize;
-    // ivec4 offset;  //batchOffset, hOffset, outputHeight, other
-
     ivec4 kernel_shape;
 
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
+
     int groups;
     int bias;
-    int relu;
+    int activation;
 };
 
 } // namespace conv2d
@@ -127,6 +125,26 @@ class Conv2d : public Operator {
             }
         } else {
             strides_ = {1, 1};
+        }
+
+        if (attributes.find("activation") != attributes.end()) {
+            std::string activation = attributes.at("activation");
+            if (activation == "Relu") {
+                activation_ = conv2d::ActivationMode::RELU;
+            } else if (activation == "Sigmoid") {
+                activation_ = conv2d::ActivationMode::SIGMOID;
+            } else if (activation == "Tanh") {
+                activation_ = conv2d::ActivationMode::TANH;
+            } else if (activation == "HardSwish") {
+                activation_ = conv2d::ActivationMode::HARDSWISH;
+            } else if (activation == "Mish") {
+                activation_ = conv2d::ActivationMode::MISH;
+            } else {
+                throw std::invalid_argument("Unsupported activation: " +
+                                            activation);
+            }
+        } else {
+            activation_ = conv2d::ActivationMode::NONE;
         }
     }
 
@@ -255,6 +273,7 @@ class Conv2d : public Operator {
 
             para->groups = groups_;
             para->bias = bias ? 1 : 0;
+            para->activation = static_cast<int>(activation_);
             paramBuffer_->unmapMemory();
 
             if (bias)
@@ -273,6 +292,7 @@ class Conv2d : public Operator {
     std::vector<int> pads_;
     std::vector<int> dilations_;
     int groups_;
+    conv2d::ActivationMode activation_;
 
     // conv2d::PaddingMode padding_mode_;
 

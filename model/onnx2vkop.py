@@ -232,6 +232,45 @@ def is_topologically_sortable(graph):
     return True
 
 
+def fuse_conv_activation(vk_model):
+    """Fuse Conv + Activation (ReLU, Sigmoid, etc.) into Conv node."""
+    fused_nodes = []
+    skip_next = set()
+
+    # 支持的无参激活函数（ONNX op_type）
+    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish"}
+
+    for i, node in enumerate(vk_model.nodes):
+        if i in skip_next:
+            continue
+
+        # 检查当前节点是否为 Conv
+        if node['op_type'] == 'Conv':
+            # 检查下一个节点是否存在且是激活函数
+            if i + 1 < len(vk_model.nodes):
+                next_node = vk_model.nodes[i + 1]
+                if (next_node['op_type'] in ACTIVATIONS and
+                    len(node['outputs']) == 1 and
+                    len(next_node['inputs']) == 1 and
+                    node['outputs'][0]['name'] == next_node['inputs'][0]['name']):
+
+                    # 融合：将激活函数名加入 Conv 的 attributes
+                    fused_node = node.copy()
+                    fused_node['attributes'] = node['attributes'].copy()
+                    fused_node['attributes']['activation'] = next_node['op_type']
+                    # 输出改为激活后的输出
+                    fused_node['outputs'] = next_node['outputs']
+
+                    fused_nodes.append(fused_node)
+                    skip_next.add(i + 1)  # 跳过激活节点
+                    continue
+
+        # 未融合，直接保留
+        fused_nodes.append(node)
+
+    vk_model.nodes = fused_nodes
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -396,6 +435,7 @@ def parse_onnx_model(onnx_path):
         name = initializer.name
         vk_model.initializers[name] = initializer
 
+    fuse_conv_activation(vk_model)
     return vk_model
 
 

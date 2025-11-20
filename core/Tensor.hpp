@@ -51,57 +51,47 @@ template <typename T> class Tensor : public ITensor {
     // nchw
     Tensor(int n, int c, int h, int w) {
         dims_ = std::vector<int>{n, c, h, w};
-        ele_size_ = sizeof(T);
-        fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n * c * h * w;
+        size_ = sizeof(T) * n * c * h * w;
         data_.resize(n * c * h * w);
     }
 
     // nchw in vector
     explicit Tensor(const std::vector<int> &dims) {
         dims_ = dims;
-        ele_size_ = sizeof(T);
-        fp16_ = (sizeof(T) == 2);
-        size_ = dims_.size() ? ele_size_ : 0;
+        size_ = dims_.size() ? sizeof(T) : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
-        data_.resize(size_ / ele_size_);
+        data_.resize(size_ / sizeof(T));
     }
 
     // nchw in vector
     explicit Tensor(const std::vector<uint32_t> &dims) {
         dims_ = std::vector<int>(dims.begin(), dims.end());
-        ele_size_ = sizeof(T);
-        fp16_ = (sizeof(T) == 2);
-        size_ = dims_.size() ? ele_size_ : 0;
+        size_ = dims_.size() ? sizeof(T) : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
-        data_.resize(size_ / ele_size_);
+        data_.resize(size_ / sizeof(T));
     }
 
     const std::type_info &dtype() const override { return typeid(T); }
 
     void resize(int n, int c, int h, int w) {
         dims_ = std::vector<int>{n, c, h, w};
-        ele_size_ = sizeof(T);
-        fp16_ = (sizeof(T) == 2);
-        size_ = ele_size_ * n * c * h * w;
+        size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
             data_.resize(n * c * h * w);
     }
 
     void resize(const std::vector<int> &dims) {
         dims_ = dims;
-        ele_size_ = sizeof(T);
-        fp16_ = (sizeof(T) == 2);
-        size_ = dims_.size() ? ele_size_ : 0;
+        size_ = dims_.size() ? sizeof(T) : 0;
         for (auto d : dims_) {
             size_ *= d;
         }
         if (!is_on_GPU())
-            data_.resize(size_ / ele_size_);
+            data_.resize(size_ / sizeof(T));
     }
 
     void printShape() const {
@@ -155,7 +145,7 @@ template <typename T> class Tensor : public ITensor {
     T *data() { return data_.data(); }
 
     int size() { return size_; }
-    int num_elements() { return size_ / ele_size_; }
+    int num_elements() { return size_ / sizeof(T); }
 
     std::shared_ptr<VulkanBuffer>
     as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
@@ -283,9 +273,7 @@ template <typename T> class Tensor : public ITensor {
 
   private:
     std::vector<T> data_;
-    int ele_size_;
     int size_;
-    bool fp16_;
     std::shared_ptr<VulkanResource> vkobj_;
 
     void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
@@ -297,8 +285,8 @@ template <typename T> class Tensor : public ITensor {
             VkExtent3D{static_cast<uint32_t>(dims_[3] * UP_DIV(dims_[1], 4)),
                        static_cast<uint32_t>(dims_[2] * dims_[0]), 1},
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            (fp16_ ? VK_FORMAT_R16G16B16A16_SFLOAT
-                   : VK_FORMAT_R32G32B32A32_SFLOAT));
+            ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
+                              : VK_FORMAT_R32G32B32A32_SFLOAT));
     }
     void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
                         const std::shared_ptr<VulkanCommandPool> &cmdpool) {
@@ -316,7 +304,8 @@ template <typename T> class Tensor : public ITensor {
             if (dims_.size() < 3 || is_on_GPU()) {
                 return;
             }
-            auto ptr = convertTensorToRGBA();
+            std::vector<T> ptr(img->getImageSize());
+            convertTensorToRGBA(ptr.data());
             img->hostImageCopyToDevice(ptr.data());
             cmd.begin();
             img->readBarrier(cmd.get());
@@ -325,7 +314,6 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            auto ptr = convertTensorToRGBA();
             auto imagesize = img->getImageSize();
             auto stpool = cmdpool->getStagingBufferPool();
             uint64_t completed_timeline_value =
@@ -337,7 +325,7 @@ template <typename T> class Tensor : public ITensor {
                 printf("stpool alloc failed\n");
                 return;
             }
-            std::memcpy(b->ptr, ptr.data(), imagesize);
+            convertTensorToRGBA(static_cast<T *>(b->ptr));
 
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
@@ -409,8 +397,8 @@ template <typename T> class Tensor : public ITensor {
      * handles cases where the depth of the tensor is less than 4 by padding the
      * remaining channels with zeros.
      *
-     * @tparam T The data type of the tensor elements.
-     * @return A vector containing the converted RGBA data.
+     * @tparam T The data type of the tensor elements. Size of it make be equal
+     *  to getImageSize()
      *
      * @details
      * - The function first ensures that the resource type is a Vulkan image.
@@ -428,7 +416,7 @@ template <typename T> class Tensor : public ITensor {
      * processing pipelines. The conversion ensures compatibility with Vulkan's
      * image formats and facilitates efficient GPU operations.
      */
-    std::vector<T> convertTensorToRGBA() {
+    void convertTensorToRGBA(T *ptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             throw std::runtime_error(
@@ -445,17 +433,13 @@ template <typename T> class Tensor : public ITensor {
         int stride_n = width * height * depth;
         int realdepth = UP_DIV(depth, 4);
         int realwidth = width * realdepth;
-        int realheight = height * batch;
 
-        std::vector<T> rgba(realheight * realwidth * img->getImageChannelNum() *
-                            img->getImageChannelSize());
         uint32_t row_pitch =
             realwidth * img->getImageChannelNum() * img->getImageChannelSize();
-        T *dst = rgba.data();
+        T *dst = ptr;
         for (int b = 0; b < batch; b++) {
-            T *batchstart =
-                reinterpret_cast<T *>(reinterpret_cast<uint8_t *>(rgba.data()) +
-                                      b * height * row_pitch);
+            T *batchstart = reinterpret_cast<T *>(
+                reinterpret_cast<uint8_t *>(ptr) + b * height * row_pitch);
             for (int c = 0; c < realdepth; c++) {
                 dst = batchstart + c * 4 * width;
                 for (int h = 0; h < height; h++) {
@@ -479,7 +463,6 @@ template <typename T> class Tensor : public ITensor {
                 }
             }
         }
-        return rgba;
     }
 
     void convertRGBAToTensor(T *ptr) {
