@@ -30,12 +30,12 @@ T getPosition(T x_norm, int range, bool alignCorners) {
 // padding zero
 // 获取坐标对应的值, 如果超过范围, 补零
 template <typename T>
-T sample(int y, int x, const T *buffer, int height, int width) {
+T sample(int y, int x, const std::shared_ptr<Tensor<T>> &input, int offset, int height, int width) {
     if (y < 0 || y >= height || x < 0 || x >= width) {
         return 0.0F;
     }
 
-    return buffer[y * width + x];
+    return (*input)[offset + y * width + x];
 }
 
 // 双线性插值算法,
@@ -45,7 +45,7 @@ T sample(int y, int x, const T *buffer, int height, int width) {
 * 计算出权重,
 */
 template <typename T>
-T interpolate(T h, T w, const T *buffer, int height, int width) {
+T interpolate(T h, T w, const std::shared_ptr<Tensor<T>> &buffer, int offset, int height, int width) {
     // mode == GridSampleMode_BILINEAR
     int w0_h = ::floor(h);
     int w0_w = ::floor(w);
@@ -53,13 +53,13 @@ T interpolate(T h, T w, const T *buffer, int height, int width) {
     int w1_w = ::ceil(w);
 
     // 左下角
-    T i00 = sample(w0_h, w0_w, buffer, height, width);
+    T i00 = sample(w0_h, w0_w, buffer, offset, height, width);
     // 右下角
-    T i01 = sample(w0_h, w1_w, buffer, height, width);
+    T i01 = sample(w0_h, w1_w, buffer, offset, height, width);
     // 左上角
-    T i10 = sample(w1_h, w0_w, buffer, height, width);
+    T i10 = sample(w1_h, w0_w, buffer, offset, height, width);
     // 右上角
-    T i11 = sample(w1_h, w1_w, buffer, height, width);
+    T i11 = sample(w1_h, w1_w, buffer, offset, height, width);
 
     // 权重, 左边界归一化
     T fx2 = w - w0_w;
@@ -79,7 +79,7 @@ T interpolate(T h, T w, const T *buffer, int height, int width) {
 }
 
 template <typename T>
-void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &output,
+void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::shared_ptr<Tensor<T>> &grid, std::vector<T> &output,
                         int batch, int inHeight, int inWidth, int outHeight, int outWidth, int depth,
                         bool alignCorners) {
     output.resize(batch * outHeight * outWidth * depth);
@@ -90,24 +90,24 @@ void reference_grid_sample(const T *inputPtr, const T *gridPtr, std::vector<T> &
     // grid 的hw 和output是一致的
     // input不参与循环hw, 在每个NC的循环中, 直接整个图以HW尺寸输入,保证grid操作单个channel
     for (auto b = 0; b < batch; ++b) {
-        const T *b_input_ptr = inputPtr + b * inHeight * inWidth * depth;
-        const T *b_grid_ptr = gridPtr + b * outHeight * outWidth * 2;
-        T *b_output_ptr = output_ptr + b * outHeight * outWidth * depth;
+        int b_input_offset = b * inHeight * inWidth * depth;
+        int b_grid_offset = b * outHeight * outWidth * 2;
+        int b_output_offset = b * outHeight * outWidth * depth;
 
         for (auto c = 0; c < depth; ++c) {
-            auto *c_input_ptr = b_input_ptr + c * inHeight * inWidth;
-            auto *c_output_ptr = b_output_ptr + c * outHeight * outWidth;
+            auto c_input_offset = b_input_offset + c * inHeight * inWidth;
+            auto c_output_offset = b_output_offset + c * outHeight * outWidth;
 
             for (auto h = 0; h < outHeight; ++h) {
-                auto * h_grid_ptr = b_grid_ptr + h * outWidth * 2;
-                auto * h_output_ptr = c_output_ptr + h * outWidth;
+                auto h_grid_offset = b_grid_offset + h * outWidth * 2;
+                auto h_output_offset = c_output_offset + h * outWidth;
 
                 for (auto w = 0; w < outWidth; ++w) {
                     // 首先反归一化得到坐标
-                    auto x = getPosition(h_grid_ptr[2 * w + 0], inWidth, alignCorners);
-                    auto y = getPosition(h_grid_ptr[2 * w + 1], inHeight, alignCorners);
+                    auto x = getPosition((*grid)[h_grid_offset + 2 * w + 0], inWidth, alignCorners);
+                    auto y = getPosition((*grid)[h_grid_offset + 2 * w + 1], inHeight, alignCorners);
                     // 然后插值,得到的值输出
-                    h_output_ptr[w] = interpolate(y, x, c_input_ptr, inHeight, inWidth);
+                    output_ptr[h_output_offset+w] = interpolate(y, x, input, c_input_offset, inHeight, inWidth);
                 }
             }
         }
@@ -139,9 +139,8 @@ private:
 
         input = std::make_shared<Tensor<float>>(batch, depth, in_height, in_width);
         grid = std::make_shared<Tensor<float>>(batch, out_height, out_width, 2);
-
-        auto *input_ptr = input->data();
-        auto *grid_ptr = grid->data();
+        input->reserveOnCPU();
+        grid->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -149,20 +148,20 @@ private:
         std::normal_distribution<> input_dist{0.0F, 1.0F};
         std::normal_distribution<> grid_dist{0.0F, 3.0F / out_width};
         for (int i = 0; i < input->num_elements(); i++) {
-            input_ptr[i] = input_dist(gen);
+            (*input)[i] = input_dist(gen);
         }
         for (int b = 0; b < batch; b++) {
             for (int h = 0; h < out_height; h++) {
                 for (int w = 0; w < out_width; w++) {
                     float offset_h = grid_dist(gen);
                     float offset_w = grid_dist(gen);
-                    grid_ptr[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
-                    grid_ptr[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
+                    (*grid)[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
+                    (*grid)[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
                 }
             }
         }
         std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_grid_sample<float>(input_ptr, grid_ptr, expectedOutput, batch, in_height, in_width, out_height, out_width, depth, false);
+        reference_grid_sample<float>(input, grid, expectedOutput, batch, in_height, in_width, out_height, out_width, depth, false);
         std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         LOG_INFO("reference grid sample time: %f s", duration.count());

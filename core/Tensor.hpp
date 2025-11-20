@@ -2,17 +2,17 @@
 #ifndef CORE_TENSOR_HPP_
 #define CORE_TENSOR_HPP_
 
-#include <cstdint>
-#include <iostream>
-#include <memory>
-#include <vector>
-
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanResource.hpp"
+
+#include <cstdint>
+#include <iostream>
+#include <memory>
+#include <vector>
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
@@ -52,7 +52,6 @@ template <typename T> class Tensor : public ITensor {
     Tensor(int n, int c, int h, int w) {
         dims_ = std::vector<int>{n, c, h, w};
         size_ = sizeof(T) * n * c * h * w;
-        data_.resize(n * c * h * w);
     }
 
     // nchw in vector
@@ -62,7 +61,6 @@ template <typename T> class Tensor : public ITensor {
         for (auto d : dims_) {
             size_ *= d;
         }
-        data_.resize(size_ / sizeof(T));
     }
 
     // nchw in vector
@@ -72,7 +70,6 @@ template <typename T> class Tensor : public ITensor {
         for (auto d : dims_) {
             size_ *= d;
         }
-        data_.resize(size_ / sizeof(T));
     }
 
     const std::type_info &dtype() const override { return typeid(T); }
@@ -92,14 +89,6 @@ template <typename T> class Tensor : public ITensor {
         }
         if (!is_on_GPU())
             data_.resize(size_ / sizeof(T));
-    }
-
-    void printShape() const {
-        std::cout << "Tensor dim " << dims_.size() << ", shape: [";
-        for (auto d : dims_) {
-            std::cout << d << " ";
-        }
-        std::cout << "], size " << size_ << std::endl;
     }
 
     /**
@@ -141,8 +130,6 @@ template <typename T> class Tensor : public ITensor {
     }
 
     std::vector<int> getShape() { return dims_; }
-
-    T *data() { return data_.data(); }
 
     int size() { return size_; }
     int num_elements() { return size_ / sizeof(T); }
@@ -236,21 +223,28 @@ template <typename T> class Tensor : public ITensor {
         return img;
     }
     void copyToGPU(const std::shared_ptr<VulkanDevice> &dev,
-                   const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+                   const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                   T *data = nullptr) {
         if (is_on_GPU()) {
             return;
         }
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
-            copyToGPUImage(dev, cmdpool);
+            copyToGPUImage(dev, cmdpool, data);
         } else {
             auto vkbuf = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
             auto *buffer = static_cast<T *>(vkbuf->getMappedMemory());
-            memcpy(buffer, data_.data(), size_);
+            if (data)
+                memcpy(buffer, data, size_);
+            else {
+                memcpy(buffer, data_.data(), size_);
+            }
             toGPU();
             vkbuf->unmapMemory();
         }
-        data_.clear();
-        data_.shrink_to_fit();
+        if (!data) {
+            data_.clear();
+            data_.shrink_to_fit();
+        }
     }
 
     void copyToCPU(const std::shared_ptr<VulkanDevice> &dev,
@@ -271,6 +265,21 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
+    void fillToCPU(std::vector<T> &data) {
+        data_.resize(num_elements());
+        memcpy(data_.data(), data.data(), size_);
+        toCPU();
+    }
+
+    void reserveOnCPU() {
+        if (is_on_GPU()) {
+            printf("Should not call reserveOnCPU when Tensor is on GPU");
+            return;
+        }
+        data_.resize(num_elements());
+        toCPU();
+    }
+
   private:
     std::vector<T> data_;
     int size_;
@@ -289,7 +298,8 @@ template <typename T> class Tensor : public ITensor {
                               : VK_FORMAT_R32G32B32A32_SFLOAT));
     }
     void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
-                        const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+                        const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                        T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         VkDevice device = dev->getLogicalDevice();
 
@@ -305,7 +315,7 @@ template <typename T> class Tensor : public ITensor {
                 return;
             }
             std::vector<T> ptr(img->getImageSize());
-            convertTensorToRGBA(ptr.data());
+            convertTensorToRGBA(ptr.data(), src);
             img->hostImageCopyToDevice(ptr.data());
             cmd.begin();
             img->readBarrier(cmd.get());
@@ -325,7 +335,7 @@ template <typename T> class Tensor : public ITensor {
                 printf("stpool alloc failed\n");
                 return;
             }
-            convertTensorToRGBA(static_cast<T *>(b->ptr));
+            convertTensorToRGBA(static_cast<T *>(b->ptr), src);
 
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
@@ -416,7 +426,7 @@ template <typename T> class Tensor : public ITensor {
      * processing pipelines. The conversion ensures compatibility with Vulkan's
      * image formats and facilitates efficient GPU operations.
      */
-    void convertTensorToRGBA(T *ptr) {
+    void convertTensorToRGBA(T *ptr, T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             throw std::runtime_error(
@@ -447,16 +457,21 @@ template <typename T> class Tensor : public ITensor {
                         int offset = b * stride_n + 4 * c * stride_c +
                                      h * stride_h + w * stride_w;
 
-                        dst[w * 4 + 0] = data_[offset];
+                        dst[w * 4 + 0] = src ? src[offset] : data_[offset];
                         dst[w * 4 + 1] = (4 * c + 1 < depth)
-                                             ? data_[stride_c + offset]
+                                             ? (src ? src[stride_c + offset]
+                                                    : data_[stride_c + offset])
                                              : 0.0F;
-                        dst[w * 4 + 2] = (4 * c + 2 < depth)
-                                             ? data_[2 * stride_c + offset]
-                                             : 0.0F;
-                        dst[w * 4 + 3] = (4 * c + 3 < depth)
-                                             ? data_[3 * stride_c + offset]
-                                             : 0.0F;
+                        dst[w * 4 + 2] =
+                            (4 * c + 2 < depth)
+                                ? (src ? src[2 * stride_c + offset]
+                                       : data_[2 * stride_c + offset])
+                                : 0.0F;
+                        dst[w * 4 + 3] =
+                            (4 * c + 3 < depth)
+                                ? (src ? src[3 * stride_c + offset]
+                                       : data_[3 * stride_c + offset])
+                                : 0.0F;
                     }
                     dst = reinterpret_cast<T *>(
                         reinterpret_cast<uint8_t *>(dst) + row_pitch);

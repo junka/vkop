@@ -41,24 +41,30 @@ void Runtime::LoadModel() {
         auto t = std::make_shared<Tensor<float>>(init.dims);
         if (init.dtype == "int64") {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
-            for (int i = 0; i < t->num_elements(); ++i) {
-                t->data()[i] = static_cast<float>(init.dataii[i]);
-            }
+            t->fillToCPU(init.dataii);
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
             auto t = std::make_shared<Tensor<int>>(init.dims);
-            for (int i = 0; i < t->num_elements(); ++i) {
-                t->data()[i] = static_cast<float>(init.dataii[i]);
-            }
+            t->fillToCPU(init.datai);
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
             auto t = std::make_shared<Tensor<float>>(init.dims);
-            std::memcpy(t->data(), init.dataf.data(),
-                        t->num_elements() * sizeof(float));
+            if (t->num_dims() == 2 || t->num_dims() == 1) {
+                if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                    t->fillToCPU(init.dataf);
+                } else {
+                    t->as_storage_buffer(m_dev_);
+                    t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+                }
+            } else {
+                t->as_input_image(m_dev_, m_cmdpool_);
+                t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+            }
+
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
@@ -81,7 +87,7 @@ void Runtime::LoadModel() {
 
         for (const auto &out_shape : n.outputs) {
             if (tensor_map.find(out_shape.name) != tensor_map.end()) {
-                tensor_map[out_shape.name]->toGPU();
+                assert(tensor_map[out_shape.name]->is_on_GPU());
                 node_outputs.push_back(tensor_map[out_shape.name]);
             } else {
                 auto t = std::make_shared<Tensor<float>>(out_shape.dims);
@@ -112,25 +118,6 @@ void Runtime::LoadModel() {
         node_ops_.push_back(std::move(op));
         node_input_tensors_.push_back(std::move(node_inputs));
         node_output_tensors_.push_back(std::move(node_outputs));
-    }
-
-    for (auto &init : initializers_) {
-        if (!init.second) {
-            continue;
-        }
-        // fprintf(stderr, "init %s\n", init.first.c_str());
-        if (init.second->num_dims() == 2 || init.second->num_dims() == 1) {
-            auto t = vkop::core::as_tensor<float>(init.second);
-            if (!t || (t->num_dims() == 1 && t->num_elements() <= 4)) {
-                continue;
-            }
-            t->as_storage_buffer(m_dev_);
-            t->copyToGPU(m_dev_, m_cmdpool_);
-            continue;
-        }
-        auto t = vkop::core::as_tensor<float>(init.second);
-        t->as_input_image(m_dev_, m_cmdpool_);
-        t->copyToGPU(m_dev_, m_cmdpool_);
     }
 }
 

@@ -28,8 +28,8 @@ private:
         };
 
         input = std::make_shared<Tensor<float>>(t);
+        input->reserveOnCPU();
 
-        auto *input_ptr = input->data();
         expectedOutput.resize(input->num_elements());
         
         std::random_device rd{};
@@ -37,8 +37,8 @@ private:
         gen.seed(1024);
         std::normal_distribution<> input_dist{0.0F, 1.0F};
         for (int i = 0; i < input->num_elements(); i++) {
-            input_ptr[i] = input_dist(gen);
-            expectedOutput[i] = (input_ptr[i] > 0) ? 1.0F / (1.0F + exp(-input_ptr[i])) : exp(input_ptr[i]) / (1.0F + exp(input_ptr[i]));
+            (*input)[i] = input_dist(gen);
+            expectedOutput[i] = ((*input)[i] > 0) ? 1.0F / (1.0F + exp(-(*input)[i])) : exp((*input)[i]) / (1.0F + exp((*input)[i]));
         }
     }
 };

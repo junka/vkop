@@ -79,7 +79,6 @@ public:
                 }
                 op->execute(inputs, outputs);
                 output->copyToCPU(dev, cmdpool);
-                auto *out_ptr = output->data();
                 auto oshape = output->getShape();
                 if (oshape.size() == 4) {
                     for (int i = 0; i < oshape[0]; i++) {
@@ -91,7 +90,7 @@ public:
                                 for (int l = 0; l < oshape[3]; l++) {
                                     int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
                                         k * oshape[3] + l;
-                                    printf("%.4f, ", out_ptr[idx]);
+                                    printf("%.4f, ", (*output)[idx]);
                                 }
                                 printf("]\n");
                             }
@@ -104,16 +103,16 @@ public:
                         printf("[");
                         for (int j = 0; j < oshape[1]; j++) {
                             int idx = i * oshape[1] + j;
-                            printf("%.4f, ", out_ptr[idx]);
+                            printf("%.4f, ", (*output)[idx]);
                         }
                         printf("]\n");
                     }
                     printf("]\n");
                 }
                 for (int i = 0; i < output->num_elements(); i++) {
-                    std::cout << i<< ": " << out_ptr[i] << " vs " <<expectedOutput[i] << std::endl;
-                    if (std::fabs(out_ptr[i] - expectedOutput[i]) > 1e-4) {
-                        LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
+                    std::cout << i<< ": " << (*output)[i] << " vs " <<expectedOutput[i] << std::endl;
+                    if (std::fabs((*output)[i] - expectedOutput[i]) > 1e-4) {
+                        LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], expectedOutput[i]);
                         return false;
                     }
                 }
@@ -160,16 +159,15 @@ public:
                 }
                 op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
                 output->copyToCPU(dev, cmdpool);
-                auto *out_ptr = output->data();
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {
-                        if (std::fabs(float16_to_float32(out_ptr[i]) - float16_to_float32(expectedOutput[i])) > 0.01) {
-                            LOG_ERROR("Test Fail at1 (%d): %f, %f", i, float16_to_float32(out_ptr[i]), float16_to_float32(expectedOutput[i]));
+                        if (std::fabs(float16_to_float32((*output)[i]) - float16_to_float32(expectedOutput[i])) > 0.01) {
+                            LOG_ERROR("Test Fail at1 (%d): %f, %f", i, float16_to_float32((*output)[i]), float16_to_float32(expectedOutput[i]));
                             return false;
                         }
                     } else {
-                        if (std::fabs(out_ptr[i] - expectedOutput[i]) > 1e-3) {
-                            LOG_ERROR("Test Fail at (%d): %f, %f", i, out_ptr[i], expectedOutput[i]);
+                        if (std::fabs((*output)[i] - expectedOutput[i]) > 1e-3) {
+                            LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], expectedOutput[i]);
                             return false;
                         }
                     }

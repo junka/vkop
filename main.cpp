@@ -44,9 +44,9 @@ using MaskInfo = struct MaskInfo {
 static float score_threshold[2] = {0.35F, 0.5F};
 
 std::vector<MaskInfo> postProcessNMS(
-    const float* hm_data, const float* hm_nms_data,
-    const float* reg_data, const float* dim_data,
-    const float* cls_data, int H, int W, int image_h, int image_w,
+    const std::shared_ptr<class vkop::core::Tensor<float> >& hm_data, const std::shared_ptr<class vkop::core::Tensor<float> >& hm_nms_data,
+    const std::shared_ptr<class vkop::core::Tensor<float> >& reg_data, const std::shared_ptr<class vkop::core::Tensor<float> >& dim_data,
+    const std::shared_ptr<class vkop::core::Tensor<float> >& cls_data, int H, int W, int image_h, int image_w,
     int tensor_h, int tensor_w
 ) {
     auto sigmoid = [](float x) -> float {
@@ -60,21 +60,21 @@ std::vector<MaskInfo> postProcessNMS(
     }
     std::partial_sort(indices.begin(), indices.begin() + 64, indices.end(),
         [hm_nms_data](const int& i1, const int& i2) {
-            return hm_nms_data[i1] > hm_nms_data[i2];
+            return (*hm_nms_data)[i1] > (*hm_nms_data)[i2];
         });
 
     std::vector<MaskInfo> detections;
     for (int i = 0; i < 64; i++) {
         int idx = indices.at(i);
 
-        if (std::fabs(hm_data[idx] - hm_nms_data[idx]) > 1e-6F) {
+        if (std::fabs((*hm_data)[idx] - (*hm_nms_data)[idx]) > 1e-6F) {
             continue;
         }
 
-        float score = sigmoid(hm_nms_data[idx]);
+        float score = sigmoid((*hm_nms_data)[idx]);
         int category = 0;
-        const float cls_value1 = cls_data[idx];
-        const float cls_value2 = cls_data[num_points + idx];
+        const float cls_value1 = (*cls_data)[idx];
+        const float cls_value2 = (*cls_data)[num_points + idx];
         if (cls_value1 > cls_value2) {
             category = 0;
         } else {
@@ -87,14 +87,14 @@ std::vector<MaskInfo> postProcessNMS(
 
         int y = idx / W;
         int x = idx % W;
-        float xo = sigmoid(reg_data[idx]) + x;
-        float yo = sigmoid(reg_data[num_points + idx]) + y;
+        float xo = sigmoid((*reg_data)[idx]) + x;
+        float yo = sigmoid((*reg_data)[num_points + idx]) + y;
         // std::cout << "point at index " << idx << " has (x, y): (" << xo << ", " << yo << ")" << std::endl;
         xo *= (tensor_w / W);
         yo *= (tensor_h / H);
 
-        float wo = std::exp(dim_data[idx]) * tensor_w / W;
-        float ho = std::exp(dim_data[num_points + idx]) * tensor_h / H;
+        float wo = std::exp((*dim_data)[idx]) * tensor_w / W;
+        float ho = std::exp((*dim_data)[num_points + idx]) * tensor_h / H;
 
         // std::cout << "index " << idx << " score " << score <<" Raw bbox (center x, center y, width, height): (" << xo << ", " << yo << ", " << wo << ", " << ho << ")" << std::endl;
         xo = xo * W / tensor_w;
@@ -122,11 +122,9 @@ std::vector<MaskInfo> postProcessNMS(
     return detections;
 }
 
-void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
+std::vector<float> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
     int in_h = t->getShape()[2];
     int in_w = t->getShape()[3];
-
-    float* data_ptr = t->data();
 
     float x_ratio = float(image_w - 1) / (in_w - 1);
     float y_ratio = float(image_h - 1) / (in_h - 1);
@@ -135,9 +133,10 @@ void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::s
     const uint8_t* u_src = raw_image.data() + image_w * image_h;
     const uint8_t* v_src = raw_image.data() + 2 * image_w * image_h;
 
-    float* y_dst = data_ptr;
-    float* u_dst = data_ptr + in_w * in_h;
-    float* v_dst = data_ptr + 2 * in_w * in_h;
+    int u_offset = in_w * in_h;
+    int v_offset = 2 * in_w * in_h;
+
+    std::vector<float> resized_image(in_w * in_h * 3);
 
     for (int dy = 0; dy < in_h; ++dy) {
         for (int dx = 0; dx < in_w; ++dx) {
@@ -166,11 +165,12 @@ void resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::s
             };
 
             int dst_idx = dy * in_w + dx;
-            y_dst[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
-            u_dst[dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
-            v_dst[dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
         }
     }
+    return resized_image;
 }
 
 int main(int argc, char *argv[]) {
@@ -191,6 +191,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     printf("using %s\n",dev->getDeviceName().c_str());
+    printf("sizeof Tensor<float>: %ld\n", sizeof(Tensor<float>));
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     if (argc < 3) {
@@ -217,9 +218,12 @@ int main(int argc, char *argv[]) {
         rt->LoadModel();
 
         auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
-        resize_YUV(frame, image_h, image_w, t);
+        auto data = resize_YUV(frame, image_h, image_w, t);
+        frame.clear();
+        frame.shrink_to_fit();
+        t->copyToGPU(dev, cmdpool, data.data());
 
-        for (int i = 0; i < 100; i ++) {
+        for (int i = 0; i < 10000; i ++) {
             rt->Run();
         }
         rt->ReadResult();
@@ -230,7 +234,7 @@ int main(int argc, char *argv[]) {
         auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
         assert(hm != nullptr);
 
-        postProcessNMS(hm->data(), hm_nms->data(), reg->data(), dim->data(), cls->data(), hm_nms->getShape()[2], hm_nms->getShape()[3], image_h, image_w,
+        postProcessNMS(hm, hm_nms, reg, dim, cls, hm_nms->getShape()[2], hm_nms->getShape()[3], image_h, image_w,
             t->getShape()[2], t->getShape()[3]);
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;

@@ -128,17 +128,11 @@ private:
         }
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
-        for (int i = 0; i < input->num_elements(); i++) {
-            input->at(i) = torch_input[i];
-        }
+        input->fillToCPU(torch_input);
         mean = std::make_shared<Tensor<float>>(num_feature);
-        for (int i = 0; i < mean->num_elements(); i++) {
-            mean->at(i) = torch_mean[i];
-        }
+        mean->fillToCPU(torch_mean);
         var = std::make_shared<Tensor<float>>(num_feature);
-        for (int i = 0; i < var->num_elements(); i++) {
-            var->at(i) = torch_var[i];
-        }
+        var->fillToCPU(torch_var);
         expectedOutput = torch_output;
     }
 };

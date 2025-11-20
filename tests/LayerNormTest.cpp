@@ -57,24 +57,22 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
     }
 
     // Step 2: 对每个 outer block 执行归一化
-    const float* input_data = input->data(); // 假设 Tensor 存储为 .data()
-
     for (int outer_idx = 0; outer_idx < outer_size; ++outer_idx) {
         // 指向当前归一化块起始位置
-        const float* in_block  = input_data + outer_idx * inner_size;
+        const int in_block_offset = outer_idx * inner_size;
         float*       out_block = output.data() + outer_idx * inner_size;
 
         // Step 2.1: 计算均值
         float sum = 0.0F;
         for (int i = 0; i < inner_size; ++i) {
-            sum += in_block[i];
+            sum += (*input)[in_block_offset+i];
         }
         float mean = sum / inner_size;
 
         // Step 2.2: 计算方差
         float var = 0.0F;
         for (int i = 0; i < inner_size; ++i) {
-            float diff = in_block[i] - mean;
+            float diff = (*input)[in_block_offset+i] - mean;
             var += diff * diff;
         }
         var /= inner_size;
@@ -82,9 +80,9 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
 
         // Step 2.3: 归一化 + 仿射变换
         for (int i = 0; i < inner_size; ++i) {
-            float normalized_val = (in_block[i] - mean) * inv_std;
-            if (has_weight) normalized_val *= weight->data()[i];
-            if (has_bias)   normalized_val += bias->data()[i];
+            float normalized_val = ((*input)[in_block_offset+i] - mean) * inv_std;
+            if (has_weight) normalized_val *= (*weight)[i];
+            if (has_bias)   normalized_val += (*bias)[i];
             out_block[i] = normalized_val;
         }
     }
@@ -181,17 +179,11 @@ private:
         }
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
-        for (int i = 0; i < input->num_elements(); i++) {
-            input->at(i) = torch_input[i];
-        }
+        input->fillToCPU(torch_input);
         weight = std::make_shared<Tensor<float>>(normalized_shape_);
-        for (int i = 0; i < weight->num_elements(); i++) {
-            weight->at(i) = torch_weight[i];
-        }
+        weight->fillToCPU(torch_weight);
         bias = std::make_shared<Tensor<float>>(normalized_shape_);
-        for (int i = 0; i < bias->num_elements(); i++) {
-            bias->at(i) = torch_bias[i];
-        }
+        bias->fillToCPU(torch_bias);
         expectedOutput = torch_output;
     }
 };

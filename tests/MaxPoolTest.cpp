@@ -16,7 +16,7 @@ using vkop::tests::TestCase;
 using vkop::ops::Maxpool2d;
 
 namespace {
-    void maxpool2d_reference(const float *input, float *output, std::vector<int> shape,
+    void maxpool2d_reference(const std::shared_ptr<Tensor<float>>& input, float *output, std::vector<int> shape,
                        int kernel_size, int stride_size, int pad_size) {
         int batch = shape[0];
         int channels = shape[1];
@@ -46,7 +46,7 @@ namespace {
                                 int iw = ow * stride_width + pw - pad_width;
                                 if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
                                     int input_idx = ((b * channels + c) * height + ih) * width + iw;
-                                    max_val = std::max(max_val, input[input_idx]);
+                                    max_val = std::max(max_val, (*input)[input_idx]);
                                 }
                             }
                         }
@@ -83,8 +83,7 @@ private:
     void initTestdata() {
         std::vector<int> t = {1, 4, 8, 8};
         input = std::make_shared<Tensor<float>>(t);
-
-        auto *input_ptr = input->data();
+        input->reserveOnCPU();
         expectedOutput.resize(input->num_elements());
 
         std::random_device rd{};
@@ -92,10 +91,10 @@ private:
         gen.seed(1024);
         std::normal_distribution<> input_dist{-3.0F, 6.0F};
         for (int i = 0; i < input->num_elements(); i++) {
-            input_ptr[i] = input_dist(gen);
+            (*input)[i] = input_dist(gen);
         }
 
-        maxpool2d_reference(input_ptr, expectedOutput.data(), t, kernel_size_, stride_, pad_);
+        maxpool2d_reference(input, expectedOutput.data(), t, kernel_size_, stride_, pad_);
     }
 };
 }

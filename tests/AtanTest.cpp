@@ -28,17 +28,16 @@ private:
         };
 
         input = std::make_shared<Tensor<float>>(t);
-
-        auto *input_ptr = input->data();
         expectedOutput.resize(input->num_elements());
+        input->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
         std::normal_distribution<> input_dist{0.0F, 1.0F};
         for (int i = 0; i < input->num_elements(); i++) {
-            input_ptr[i] = input_dist(gen);
-            expectedOutput[i] = std::atan(input_ptr[i]);
+            (*input)[i] = input_dist(gen);
+            expectedOutput[i] = std::atan((*input)[i]);
         }
     }
 };

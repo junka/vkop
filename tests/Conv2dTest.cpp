@@ -49,8 +49,8 @@ namespace {
  * @param group 分组卷积的组数。`ic` 和 `oc` 必须能被 `group` 整除。
  */
 template<typename T>
-void reference_conv2d(const T* input, const T* weight,
-    const T* bias, std::vector<T>& output, int batch, int ic, int oc,
+void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared_ptr<Tensor<T>>& weight,
+    const std::shared_ptr<Tensor<T>>& bias, std::vector<T>& output, int batch, int ic, int oc,
     int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
     int dilation_h, int dilation_w, int group) {
     // 计算输出张量的高度和宽度
@@ -94,12 +94,12 @@ void reference_conv2d(const T* input, const T* weight,
 
                                 // 检查索引是否在输入张量范围内
                                 if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
-                                    x_value = input[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                    x_value = (*input)[(((b * ic + sz) * ih + iy) * iw + ix)];
                                 }
 
                                 // 获取卷积核的值
                                 // float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
-                                float y_value = weight[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+                                float y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
 
 
                                 // 累加卷积结果
@@ -111,7 +111,7 @@ void reference_conv2d(const T* input, const T* weight,
                     // 将卷积结果加上偏置并存储到输出张量
                     // 计算输出张量的偏移量
                     auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
-                    output.at(dest_offset) = sum + bias[oz];
+                    output.at(dest_offset) = sum + (*bias)[oz];
                 }
             }
         }
@@ -236,19 +236,13 @@ private:
         }
 #endif
         input_data_ = std::make_shared<Tensor<float>>(input_shape_);
-        for (int i = 0; i < input_data_->num_elements(); i++) {
-            input_data_->at(i) = torch_input[i];
-        }
+        input_data_->fillToCPU(torch_input);
         output_data_ = torch_output;
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
-        for (int i = 0; i < weight_data_->num_elements(); i++) {
-            weight_data_->at(i) = torch_weight[i];
-        }
+        weight_data_->fillToCPU(torch_weight);
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-        for (int i = 0; i < bias_data_->num_elements(); i++) {
-            bias_data_->at(i) = torch_bias[i];
-        }
-        
+        bias_data_->fillToCPU(torch_bias);
+
 #if USE_CPP_REFER
 
         int batch = input_shape_[0];
@@ -265,7 +259,7 @@ private:
         int dilation_h = dilation_;
         int dilation_w = dilation_;
         std::vector<float> ref_output_data;
-        reference_conv2d(input_data_->data(), weight_data_->data(), bias_data_->data(),
+        reference_conv2d(input_data_, weight_data_, bias_data_,
                  ref_output_data, batch, ic, oc,
                  ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w,
                  dilation_h, dilation_w, group_);

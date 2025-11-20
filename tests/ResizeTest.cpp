@@ -40,7 +40,7 @@ float cubic_kernel(float x, float a = -0.75F) {
 template<typename T>
 // CPU resize for 4D NCHW float tensor
 std::vector<T> reference_resize(
-    const T* input,
+    const std::shared_ptr<Tensor<T>>& input,
     int batch, int channels, int in_h, int in_w,
     int out_h, int out_w,
     const std::string& mode = "bilinear",
@@ -65,7 +65,7 @@ std::vector<T> reference_resize(
         // if (y < 0 || y >= in_h || x < 0 || x >= in_w) return 0.0f;
         y = clamp(y, 0, in_h - 1);
         x = clamp(x, 0, in_w - 1);
-        return input[((n * channels + c) * in_h + y) * in_w + x];
+        return (*input)[((n * channels + c) * in_h + y) * in_w + x];
     };
     for (int n = 0; n < batch; ++n) {
         for (int c = 0; c < channels; ++c) {
@@ -209,12 +209,10 @@ private:
             printf("\n");
         }
         input_data_ = std::make_shared<Tensor<float>>(input_shape_);
-        for (int i = 0; i < input_data_->num_elements(); i++) {
-            input_data_->at(i) = torch_input[i];
-        }
+        input_data_->fillToCPU(torch_input);
         output_data_ = torch_output;
 #if USE_CPP_REFER
-        auto ret = reference_resize(input_data_->data(), input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3],
+        auto ret = reference_resize(input_data_, input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3],
                     resize_[0], resize_[1], mode_, align_corners_, cubic_coeff_a_);
         printf("\n===Reference Output==============\n");
         for (int i = 0; i < output_shape[0]; i++) {

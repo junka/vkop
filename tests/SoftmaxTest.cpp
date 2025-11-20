@@ -176,9 +176,7 @@ private:
         }
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
-        for (int i = 0; i < input->num_elements(); i++) {
-            input->at(i) = torch_input[i];
-        }
+        input->fillToCPU(torch_input);
         expectedOutput = torch_output;
 
     }

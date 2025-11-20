@@ -132,7 +132,6 @@ class Gemm : public Operator {
 
             inputa->copyToGPU(m_dev_, m_cmdpool_);
             inputb->copyToGPU(m_dev_, m_cmdpool_);
-            inputc->printShape();
             if (inputc) {
                 inputc->copyToGPU(m_dev_, m_cmdpool_);
             }

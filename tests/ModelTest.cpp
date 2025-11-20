@@ -27,9 +27,10 @@ public:
 
     ModelTest() = default;
     void initTestData(const std::shared_ptr<Tensor<float>>& ta, const std::shared_ptr<Tensor<float>>& tb) {
-        auto *inputa_ptr = ta->data();
-        auto *inputb_ptr = tb->data();
+;
         expectedOutput.resize(ta->num_elements());
+        ta->reserveOnCPU();
+        tb->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -39,14 +40,14 @@ public:
         for (int i = 0; i < ta->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            inputa_ptr[i] = a;
-            inputb_ptr[i] = b;
+            (*ta)[i] = a;
+            (*tb)[i] = b;
             expectedOutput[i] = a+b;
         }
     }
     template<typename T>
-    void reference_conv2d(const T* input, const T* weight,
-        const T* bias, std::vector<T>& output, int batch, int ic, int oc,
+    void reference_conv2d(const T* input, const std::shared_ptr<Tensor<T>>& weight,
+        const std::shared_ptr<Tensor<T>>& bias, std::vector<T>& output, int batch, int ic, int oc,
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
         int dilation_h, int dilation_w, int group) {
         // 计算输出张量的高度和宽度
@@ -95,7 +96,7 @@ public:
 
                                     // 获取卷积核的值
                                     // float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
-                                    float y_value = weight[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+                                    float y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
 
 
                                     // 累加卷积结果
@@ -107,7 +108,7 @@ public:
                         // 将卷积结果加上偏置并存储到输出张量
                         // 计算输出张量的偏移量
                         auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
-                        output.at(dest_offset) = sum + bias[oz];
+                        output.at(dest_offset) = sum + (*bias)[oz];
                     }
                 }
             }
@@ -152,6 +153,8 @@ int main() {
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
     auto weight = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight"));
+    bias->copyToCPU(dev, cmdpool);
+    weight->copyToCPU(dev, cmdpool);
 
     std::vector<float> ref_output_data;
     int batch = t1->getShape()[0];
@@ -168,10 +171,10 @@ int main() {
     int dilation_h = 1;
     int dilation_w = 1;
     int group = 1;
-    test.reference_conv2d<float>(test.expectedOutput.data(), weight->data(), bias->data(), ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
+    test.reference_conv2d<float>(test.expectedOutput.data(), weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
     for (int i = 0; i < result->num_elements(); ++i) {
-        if (std::fabs(result->data()[i] - ref_output_data[i]) > 1e-5) {
-            printf("Failed at %d, %.3f vs %.3f\n", i, result->data()[i], ref_output_data[i]);
+        if (std::fabs(result->at(i) - ref_output_data[i]) > 1e-5) {
+            printf("Failed at %d, %.3f vs %.3f\n", i, result->at(i), ref_output_data[i]);
             return 1;
         }
     }

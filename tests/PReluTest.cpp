@@ -36,9 +36,9 @@ private:
     {
         inputa = std::make_shared<Tensor<float>>(input_shape_);
         inputb = std::make_shared<Tensor<float>>(input_shape_);
+        inputa->reserveOnCPU();
+        inputb->reserveOnCPU();
 
-        auto *inputa_ptr = inputa->data();
-        auto *inputb_ptr = inputb->data();
         expectedOutput.resize(inputa->num_elements());
         
         std::random_device rd{};
@@ -49,8 +49,8 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            inputa_ptr[i] = a;
-            inputb_ptr[i] = b;
+            (*inputa)[i] = a;
+            (*inputb)[i] = b;
             expectedOutput[i] = reference_prelu(a, b);
         }
     }

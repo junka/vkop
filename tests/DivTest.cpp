@@ -29,9 +29,9 @@ private:
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);
+        inputa->reserveOnCPU();
+        inputb->reserveOnCPU();
 
-        auto *inputa_ptr = inputa->data();
-        auto *inputb_ptr = inputb->data();
         expectedOutput.resize(inputa->num_elements());
         
         std::random_device rd{};
@@ -40,11 +40,11 @@ private:
         std::normal_distribution<> inputa_dist{0.2F, 3.0F};
         std::normal_distribution<> inputb_dist{1.0F, 4.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            inputa_ptr[i] = inputa_dist(gen);
-            inputb_ptr[i] = inputa_dist(gen);
-            expectedOutput[i] = inputa_ptr[i] / inputb_ptr[i];
-            std::cout << "i " << i << ": "<< std::setprecision(15) << inputa_ptr[i];
-            std::cout << ", " << std::setprecision(15) <<  inputb_ptr[i];
+            (*inputa)[i] = inputa_dist(gen);
+            (*inputb)[i] = inputa_dist(gen);
+            expectedOutput[i] = (*inputa)[i] / (*inputb)[i];
+            std::cout << "i " << i << ": "<< std::setprecision(15) << (*inputa)[i];
+            std::cout << ", " << std::setprecision(15) <<  (*inputb)[i];
             std::cout << " -> " << std::setprecision(15) << expectedOutput[i] << "\n";
         }
     }

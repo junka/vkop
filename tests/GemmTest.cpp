@@ -13,7 +13,7 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Gemm;
-void reference_gemm(const float *inputa, const float *inputb, const float *inputc, float *output,
+void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, const std::shared_ptr<Tensor<float>> &inputc, float *output,
         int M, int N, int K, float alpha, float beta, bool transA, bool transB, bool has_bias) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -24,18 +24,18 @@ void reference_gemm(const float *inputa, const float *inputb, const float *input
 
                 if (transA) {
                     // inputa is stored as [K][M], so A^T[i][k] = inputa[k][i]
-                    a_val = inputa[k * M + i];
+                    a_val = (*inputa)[k * M + i];
                 } else {
                     // inputa is stored as [M][K]
-                    a_val = inputa[i * K + k];
+                    a_val = (*inputa)[i * K + k];
                 }
 
                 if (transB) {
                     // inputb is stored as [N][K], so B^T[k][j] = inputb[j][k]
-                    b_val = inputb[j * K + k];
+                    b_val = (*inputb)[j * K + k];
                 } else {
                     // inputb is stored as [K][N]
-                    b_val = inputb[k * N + j];
+                    b_val = (*inputb)[k * N + j];
                 }
 
                 sum += a_val * b_val;
@@ -43,7 +43,7 @@ void reference_gemm(const float *inputa, const float *inputb, const float *input
 
             sum *= alpha;
             if (has_bias && inputc != nullptr) {
-                sum += beta * inputc[i * N + j];
+                sum += beta * (*inputc)[i * N + j];
             }
 
             output[i * N + j] = sum;
@@ -87,31 +87,30 @@ private:
         int n = transB ? t2[0] : t2[1];
         int k = ka;
         inputc = std::make_shared<Tensor<float>>(std::vector<int>{m, n});
-
-        auto *inputa_ptr = inputa->data();
-        auto *inputb_ptr = inputb->data();
-        auto *inputc_ptr = inputc->data();
         expectedOutput.resize(t1[0] * t2[1]);
+        inputa->reserveOnCPU();
+        inputb->reserveOnCPU();
+        inputc->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
         std::normal_distribution<> input_dist{-3.0F, 6.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            inputa_ptr[i] = input_dist(gen);
+            (*inputa)[i] = input_dist(gen);
         }
         for (int i = 0; i < inputb->num_elements(); i++) {
-            inputb_ptr[i] = input_dist(gen);
+            (*inputb)[i] = input_dist(gen);
         }
         for (int i = 0; i < inputc->num_elements(); ++i) {
-            inputc_ptr[i] = input_dist(gen);
+            (*inputc)[i] = input_dist(gen);
         }
         printf("M %d, N %d, K %d\n", m, n, k);
         printf("==============================================================\n");
         printf("Input A:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < k; j++) {
-                printf("%f ", inputa_ptr[i * k + j]);
+                printf("%f ", (*inputa)[i * k + j]);
             }
             printf("\n");
         }
@@ -119,7 +118,7 @@ private:
         printf("Input B:\n");
         for (int i = 0; i < k; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", inputb_ptr[i * n + j]);
+                printf("%f ", (*inputb)[i * n + j]);
             }
             printf("\n");
         }
@@ -127,12 +126,12 @@ private:
         printf("Input C:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", inputc_ptr[i * n + j]);
+                printf("%f ", (*inputc)[i * n + j]);
             }
             printf("\n");
         }
 
-        reference_gemm(inputa_ptr, inputb_ptr, inputc_ptr, expectedOutput.data(), m, n, k, alpha, beta, transA, transB, true);
+        reference_gemm(inputa, inputb, inputc, expectedOutput.data(), m, n, k, alpha, beta, transA, transB, true);
         printf("\n");
         printf("Output:\n");
         for (int i = 0; i < m; i++) {

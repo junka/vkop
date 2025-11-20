@@ -12,12 +12,12 @@
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
-void reference_matmul(const float *inputa, const float *inputb, float *output, int M, int N, int K) {
+void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, float *output, int M, int N, int K) {
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             float sum = 0.0F;
             for (int k = 0; k < K; k++) {
-                sum += inputa[i * K + k] * inputb[k * N + j];
+                sum += (*inputa)[i * K + k] * (*inputb)[k * N + j];
             }
             output[i * N + j] = sum;
         }
@@ -42,9 +42,9 @@ private:
         std::vector<int> t2 = {8, 6};
         inputa = std::make_shared<Tensor<float>>(t1);
         inputb = std::make_shared<Tensor<float>>(t2);
+        inputa->reserveOnCPU();
+        inputb->reserveOnCPU();
 
-        auto *inputa_ptr = inputa->data();
-        auto *inputb_ptr = inputb->data();
         expectedOutput.resize(t1[0] * t2[1]);
 
         std::random_device rd{};
@@ -52,10 +52,10 @@ private:
         gen.seed(1024);
         std::normal_distribution<> input_dist{-3.0F, 6.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            inputa_ptr[i] = input_dist(gen);
+            (*inputa)[i] = input_dist(gen);
         }
         for (int i = 0; i < inputb->num_elements(); i++) {
-            inputb_ptr[i] = input_dist(gen);
+            (*inputb)[i] = input_dist(gen);
         }
 
         printf("M %d, N %d, K %d\n", t1[0], t2[1], t1[1]);
@@ -63,7 +63,7 @@ private:
         printf("Input A:\n");
         for (int i = 0; i < t1[0]; i++) {
             for (int j = 0; j < t1[1]; j++) {
-                printf("%f ", inputa_ptr[i * t1[1] + j]);
+                printf("%f ", (*inputa)[i * t1[1] + j]);
             }
             printf("\n");
         }
@@ -71,12 +71,12 @@ private:
         printf("Input B:\n");
         for (int i = 0; i < t2[0]; i++) {
             for (int j = 0; j < t2[1]; j++) {
-                printf("%f ", inputb_ptr[i * t2[1] + j]);
+                printf("%f ", (*inputb)[i * t2[1] + j]);
             }
             printf("\n");
         }
 
-        reference_matmul(inputa_ptr, inputb_ptr, expectedOutput.data(), t1[0], t2[1], t1[1]);
+        reference_matmul(inputa, inputb, expectedOutput.data(), t1[0], t2[1], t1[1]);
         printf("\n");
         printf("Output:\n");
         for (int i = 0; i < t1[0]; i++) {

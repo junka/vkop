@@ -136,15 +136,15 @@ class BatchNorm2d : public Operator {
             auto *var_buffer =
                 static_cast<float *>(tensorBuffer_->getMappedMemory());
             for (int i = 0; i < running_mean->num_elements(); i++) {
-                *(var_buffer + 4 * i) = running_mean->data()[i];
-                *(var_buffer + 4 * i + 1) = running_var->data()[i];
+                *(var_buffer + 4 * i) = (*running_mean)[i];
+                *(var_buffer + 4 * i + 1) = (*running_var)[i];
                 if (inputs.size() > 3) {
-                    *(var_buffer + 4 * i + 2) = weight->data()[i];
+                    *(var_buffer + 4 * i + 2) = (*weight)[i];
                 } else {
                     *(var_buffer + 4 * i + 2) = 1.0F;
                 }
                 if (inputs.size() > 4) {
-                    *(var_buffer + 4 * i + 3) = bias->data()[i];
+                    *(var_buffer + 4 * i + 3) = (*bias)[i];
                 } else {
                     *(var_buffer + 4 * i + 3) = 0.0F;
                 }
