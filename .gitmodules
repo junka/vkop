@@ -1,3 +1,0 @@
-[submodule "onnx-mlir"]
-	path = onnx-mlir
-	url = https://github.com/onnx/onnx-mlir.git

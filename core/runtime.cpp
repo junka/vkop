@@ -22,6 +22,7 @@ void Runtime::LoadModel() {
 
     for (const auto &i : model.inputs) {
         auto t = std::make_shared<Tensor<float>>(i.dims);
+        t->set_ref_cnt_forever();
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
         tensor_name_map[t] = i.name;
@@ -30,6 +31,7 @@ void Runtime::LoadModel() {
 
     for (const auto &o : model.outputs) {
         auto t = std::make_shared<Tensor<float>>(o.dims);
+        t->set_ref_cnt_forever();
         t->toGPU();
         outputs_[o.name] = t;
         tensor_map[o.name] = t;
@@ -38,21 +40,23 @@ void Runtime::LoadModel() {
 
     for (const auto &itr : model.initializers) {
         auto init = itr.second;
-        auto t = std::make_shared<Tensor<float>>(init.dims);
         if (init.dtype == "int64") {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
+            t->set_ref_cnt_forever();
             t->fillToCPU(init.dataii);
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
             auto t = std::make_shared<Tensor<int>>(init.dims);
+            t->set_ref_cnt_forever();
             t->fillToCPU(init.datai);
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
             auto t = std::make_shared<Tensor<float>>(init.dims);
+            t->set_ref_cnt_forever();
             if (t->num_dims() == 2 || t->num_dims() == 1) {
                 if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
                     t->fillToCPU(init.dataf);
@@ -64,7 +68,6 @@ void Runtime::LoadModel() {
                 t->as_input_image(m_dev_, m_cmdpool_);
                 t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
             }
-
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
@@ -99,9 +102,16 @@ void Runtime::LoadModel() {
         }
         for (const auto &in_shape : n.inputs) {
             if (tensor_map.find(in_shape.name) != tensor_map.end()) {
+                auto t = tensor_map[in_shape.name];
+                if (t->ref_cnt() != std::numeric_limits<int>::max()) {
+                    t->ref_inc();
+                }
                 node_inputs.push_back(tensor_map[in_shape.name]);
             } else if (in_shape.dims.empty()) {
                 node_inputs.push_back(nullptr);
+            } else {
+                printf("we should not reach here\n");
+                assert(false);
             }
         }
 
@@ -158,6 +168,12 @@ void Runtime::Run() {
         //        node_input_tensors_[i].size());
         node_ops_[i]->apply(node_input_tensors_[i], node_output_tensors_[i]);
         node_ops_[i]->execute(node_input_tensors_[i], node_output_tensors_[i]);
+        for (auto &it : node_input_tensors_[i]) {
+            auto t = vkop::core::as_tensor<float>(it);
+            if (t && t->ref_cnt() == 1) {
+                t->resize(0);
+            }
+        }
     }
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;

@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <vector>
 
@@ -37,10 +38,14 @@ class ITensor {
     bool is_on_GPU() const { return converted_; }
     void toGPU() { converted_ = true; }
     void toCPU() { converted_ = false; }
+    void ref_inc() { ref_cnt_++; }
+    int ref_cnt() const { return ref_cnt_; }
+    void set_ref_cnt_forever() { ref_cnt_ = std::numeric_limits<int>::max(); }
 
   protected:
     std::vector<int> dims_;
     bool converted_ = false;
+    int ref_cnt_ = 0;
 };
 
 template <typename T> class Tensor : public ITensor {
@@ -89,6 +94,21 @@ template <typename T> class Tensor : public ITensor {
         }
         if (!is_on_GPU())
             data_.resize(size_ / sizeof(T));
+    }
+
+    // one ptr save in operater, so it is at least 2
+    void resize(int len) {
+        if (len == 0) {
+            if (is_on_GPU()) {
+                vkobj_.reset();
+                vkobj_ = nullptr;
+            } else {
+                data_.clear();
+                data_.shrink_to_fit();
+            }
+            size_ = 0;
+            dims_.clear();
+        }
     }
 
     /**

@@ -73,6 +73,8 @@ class Operator {
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     OpType type_;
 
+    // we should release objs_ here, since for some intermediate tensor, we will
+    // release them in the end of the execution.
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
 
@@ -106,6 +108,8 @@ class Operator {
         LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
                                    m_dev_->getTimestampPeriod());
 #endif
+        objs_.clear();
+        objs_.shrink_to_fit();
     }
 };
 
