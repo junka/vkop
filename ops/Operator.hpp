@@ -76,10 +76,10 @@ class Operator {
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
 
-    virtual void submit(const unsigned char *spv, unsigned int spv_len,
-                        int out_width, int out_height) {
+    virtual void submit(void *ptr, size_t pc_size, const unsigned char *spv,
+                        unsigned int spv_len, int out_width, int out_height) {
         VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types_, objs_,
+        VulkanPipeline pipeline(device, types_, objs_, pc_size,
                                 reinterpret_cast<const uint32_t *>(spv),
                                 spv_len);
 
@@ -92,6 +92,9 @@ class Operator {
 #ifdef USE_MEASURE_TIME
         query_pool.begin(cmd2.get());
 #endif
+        if (ptr && pc_size) {
+            cmd2.push_constants(pipeline, pc_size, ptr);
+        }
         cmd2.dispatch(out_width, out_height);
 #ifdef USE_MEASURE_TIME
         query_pool.end(cmd2.get());

@@ -14,7 +14,7 @@ layout(set=0, binding=0) writeonly uniform image2D uOutput;
 layout(set=0, binding=1) uniform sampler2D uInput;
 layout(set=0, binding=2) uniform sampler2D uGrid;
 
-layout(set=0, binding=3) uniform gridSampleBuffer{
+layout(push_constant) uniform gridSampleBuffer{
 	ivec4 outImgSize;  // 输出图像的大小，HWNC
 	ivec2 inShape;     // 输入图像的宽度和高度
 	ivec2 outShape;    // 输出图像的宽度和高度

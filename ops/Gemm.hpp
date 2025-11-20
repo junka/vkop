@@ -20,7 +20,8 @@ extern unsigned int gemm_spv_len;
 namespace vkop {
 namespace ops {
 
-struct GpuGemmParam {
+namespace gemm {
+struct alignas(16) GpuGemmParam {
     int M;
     int N;
     int K;
@@ -30,10 +31,11 @@ struct GpuGemmParam {
     float alpha;
     float beta;
 };
+} // namespace gemm
 
 class Gemm : public Operator {
   public:
-    Gemm() : Operator(OpType::GEMM){};
+    Gemm() : Operator(OpType::GEMM) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -79,22 +81,14 @@ class Gemm : public Operator {
             inputc ? inputc->as_storage_buffer(m_dev_)
                    : std::make_shared<VulkanBuffer>(
                          m_dev_, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                         VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         auto output_buffer = output->as_storage_buffer(m_dev_);
-
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(GpuGemmParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         types_ = {output_buffer->getDescriptorType(),
                   inputa_buffer->getDescriptorType(),
                   inputb_buffer->getDescriptorType(),
-                  inputc_buffer->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_buffer, inputa_buffer, inputb_buffer, inputc_buffer,
-                 paramBuffer_};
+                  inputc_buffer->getDescriptorType()};
+        objs_ = {output_buffer, inputa_buffer, inputb_buffer, inputc_buffer};
     }
 
     void
@@ -136,27 +130,22 @@ class Gemm : public Operator {
                 inputc->copyToGPU(m_dev_, m_cmdpool_);
             }
 
-            auto *para = static_cast<struct GpuGemmParam *>(
-                paramBuffer_->getMappedMemory());
-            para->M = m;
-            para->N = n;
-            para->K = k;
-            para->alpha = alpha_;
-            para->beta = beta_;
-            para->transA = transA_;
-            para->transB = transB_;
-            para->has_bias = (inputs.size() > 2 ? 1 : 0);
-            paramBuffer_->unmapMemory();
-            printf("Gemm: %d %d %d %f %f %d %d %d\n", para->M, para->N, para->K,
-                   para->alpha, para->beta, para->transA ? 1 : 0,
-                   para->transB ? 1 : 0, para->has_bias);
+            gemm::GpuGemmParam para;
+            para.M = m;
+            para.N = n;
+            para.K = k;
+            para.alpha = alpha_;
+            para.beta = beta_;
+            para.transA = transA_;
+            para.transB = transB_;
+            para.has_bias = (inputs.size() > 2 ? 1 : 0);
 
-            submit(gemm_spv, gemm_spv_len, UP_DIV(n, 16), UP_DIV(m, 16));
+            submit(&para, sizeof(gemm::GpuGemmParam), gemm_spv, gemm_spv_len,
+                   UP_DIV(n, 16), UP_DIV(m, 16));
         }
     }
 
   private:
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
     float alpha_ = 1.0F;
     float beta_ = 1.0F;
     int transA_ = 0;

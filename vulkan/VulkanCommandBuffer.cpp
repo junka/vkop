@@ -123,6 +123,13 @@ void VulkanCommandBuffer::reset(int idx) {
     }
 }
 
+void VulkanCommandBuffer::push_constants(VulkanPipeline &pipeline,
+                                         uint32_t size, const void *ptr) {
+    vkCmdPushConstants(m_commandBuffers_[m_avail_],
+                       pipeline.getPipelineLayout(),
+                       VK_SHADER_STAGE_COMPUTE_BIT, 0, size, ptr);
+}
+
 void VulkanCommandBuffer::dispatch(int w, int h, int z) {
     vkCmdDispatch(m_commandBuffers_[m_avail_], w, h, z);
 }

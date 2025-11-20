@@ -19,7 +19,7 @@ extern unsigned int reduce_spv_len;
 
 namespace vkop {
 namespace ops {
-
+namespace resize {
 enum class ReduceType {
     L1 = 0,
     L2,
@@ -40,7 +40,7 @@ struct GpuReduceParam {
     int keepdims;
     int noop_with_empty_axes;
 };
-
+} // namespace resize
 class Reduce : public Operator {
   public:
     Reduce() : Operator(OpType::REDUCE) {}
@@ -74,15 +74,10 @@ class Reduce : public Operator {
 
         auto input_buffer = input->as_storage_buffer(m_dev_);
         auto output_buffer = output->as_storage_buffer(m_dev_);
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(GpuReduceParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
         types_ = {output_buffer->getDescriptorType(),
-                  input_buffer->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_buffer, input_buffer, paramBuffer_};
+                  input_buffer->getDescriptorType()};
+        objs_ = {output_buffer, input_buffer};
     }
 
     void
@@ -108,20 +103,19 @@ class Reduce : public Operator {
             int h = input_shape[0];
             int w = input_shape[1];
 
-            auto *para = static_cast<struct GpuReduceParam *>(
-                paramBuffer_->getMappedMemory());
-            para->H = h;
-            para->W = w;
-            para->norm_type = norm_type_;
-            para->keepdims = keepdims_;
-            para->noop_with_empty_axes = noop_with_empty_axes_;
-            paramBuffer_->unmapMemory();
-            submit(reduce_spv, reduce_spv_len, UP_DIV(h, 16), UP_DIV(w, 16));
+            resize::GpuReduceParam para;
+            para.H = h;
+            para.W = w;
+            para.norm_type = norm_type_;
+            para.keepdims = keepdims_;
+            para.noop_with_empty_axes = noop_with_empty_axes_;
+
+            submit(&para, sizeof(resize::GpuReduceParam), reduce_spv,
+                   reduce_spv_len, UP_DIV(h, 16), UP_DIV(w, 16));
         }
     }
 
   private:
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
     int norm_type_ = 0;
     std::vector<int> axis_;
     // Keep the reduced dimension or not, default 1 means keep reduced

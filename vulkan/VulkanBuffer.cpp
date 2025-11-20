@@ -3,6 +3,7 @@
 #include "VulkanLib.hpp"
 #include "VulkanResource.hpp"
 #include <stdexcept>
+#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
@@ -90,12 +91,16 @@ VulkanBuffer::getDescriptorInfo() const {
     return buffer_info;
 }
 
-void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer) {
+void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
+                                    VkAccessFlags dstAccessMask,
+                                    VkPipelineStageFlags src_stage,
+                                    VkPipelineStageFlags dst_stage,
+                                    VkDeviceSize offset) {
     VkBufferMemoryBarrier barrier;
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.pNext = nullptr;
-    barrier.srcAccessMask = VK_ACCESS_HOST_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.srcAccessMask = m_access_;
+    barrier.dstAccessMask = dstAccessMask;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
 #ifndef USE_VMA
@@ -103,37 +108,94 @@ void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer) {
 #else
     barrier.buffer = m_vma_buffer_.buffer;
 #endif
-    barrier.offset = 0;
+    barrier.offset = offset;
     barrier.size = m_size_;
 
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_HOST_BIT;
-    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    m_access_ = dstAccessMask;
 
     vkCmdPipelineBarrier(commandBuffer, src_stage, dst_stage, 0, 0, nullptr, 1,
                          &barrier, 0, nullptr);
+}
+
+void VulkanBuffer::transferBarrier(VkCommandBuffer commandBuffer,
+                                   VkAccessFlags dstAccessMask) {
+    VkPipelineStageFlags source_stage =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkPipelineStageFlags destination_stage =
+        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
+    transitionBuffer(commandBuffer, dstAccessMask, source_stage,
+                     destination_stage, 0);
+}
+
+void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer) {
+    transitionBuffer(commandBuffer, VK_ACCESS_TRANSFER_READ_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                     0);
 }
 
 void VulkanBuffer::transferWriteBarrier(VkCommandBuffer commandBuffer) {
-    VkBufferMemoryBarrier barrier;
-    barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
-    barrier.pNext = nullptr;
-    barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-#ifndef USE_VMA
-    barrier.buffer = m_buffer_;
-#else
-    barrier.buffer = m_vma_buffer_.buffer;
-#endif
-    barrier.offset = 0;
-    barrier.size = m_size_;
-
-    VkPipelineStageFlags src_stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
-    VkPipelineStageFlags dst_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-
-    vkCmdPipelineBarrier(commandBuffer, src_stage, dst_stage, 0, 0, nullptr, 1,
-                         &barrier, 0, nullptr);
+    transitionBuffer(commandBuffer, VK_ACCESS_TRANSFER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0);
 }
 
+void VulkanBuffer::readBarrier(VkCommandBuffer commandBuffer) {
+    transitionBuffer(commandBuffer, VK_ACCESS_SHADER_READ_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0);
+}
+
+void VulkanBuffer::writeBarrier(VkCommandBuffer commandBuffer) {
+    transitionBuffer(commandBuffer, VK_ACCESS_SHADER_WRITE_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0);
+}
+
+void VulkanBuffer::copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
+                                           VkBuffer dstbuffer,
+                                           VkDeviceSize dstoffset) {
+    VkAccessFlags old_access = m_access_;
+    if (m_access_ != VK_ACCESS_TRANSFER_READ_BIT) {
+        transferReadBarrier(commandBuffer);
+    }
+#ifndef USE_VMA
+    VkBuffer buffer = m_buffer_;
+#else
+    VkBuffer buffer = m_vma_buffer_.buffer;
+#endif
+
+    VkBufferCopy copy_region = {};
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = dstoffset;
+    copy_region.size = m_size_;
+
+    vkCmdCopyBuffer(commandBuffer, buffer, dstbuffer, 1, &copy_region);
+
+    transferBarrier(commandBuffer, old_access);
+}
+
+void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
+                                           VkBuffer srcbuffer,
+                                           VkDeviceSize srcoffset) {
+    VkAccessFlags old_access = m_access_;
+    if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
+        transferWriteBarrier(commandBuffer);
+    }
+#ifndef USE_VMA
+    VkBuffer buffer = m_buffer_;
+#else
+    VkBuffer buffer = m_vma_buffer_.buffer;
+#endif
+
+    VkBufferCopy copy_region = {};
+    copy_region.srcOffset = srcoffset;
+    copy_region.dstOffset = 0;
+    copy_region.size = m_size_;
+
+    vkCmdCopyBuffer(commandBuffer, srcbuffer, buffer, 1, &copy_region);
+
+    transferBarrier(commandBuffer, old_access);
+}
 } // namespace vkop

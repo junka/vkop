@@ -5,7 +5,7 @@ layout(set=0, binding=0) writeonly uniform image2D uOutput;
 layout(set=0, binding=1) uniform sampler2D uInput;
 
 
-layout(set = 0, binding = 2) uniform resizeBuffer{
+layout(push_constant) uniform resizeBuffer{
     ivec4 inImgSize;
     ivec4 inShape;      // N, C, H_in, W_in
     ivec4 outShape;     // N, C, H_out, W_out

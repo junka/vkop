@@ -21,7 +21,7 @@ class VulkanDevice {
     VkPhysicalDevice getPhysicalDevice() const { return physicalDevice_; }
     VkQueue getComputeQueue() const { return computeQueue_; }
 
-    std::string getDeviceName() const { return deviceProperties_.deviceName; }
+    std::string getDeviceName() const { return deviceName_; }
 
     int getComputeQueueFamilyIndex() const { return computeQueueFamilyIndex_; }
 
@@ -48,12 +48,12 @@ class VulkanDevice {
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice logicalDevice_ = VK_NULL_HANDLE;
     VkQueue computeQueue_ = VK_NULL_HANDLE;
-    // Queue family index
-    int computeQueueFamilyIndex_ = -1;
 
-    std::vector<VkExtensionProperties> ext_properties_;
-    VkPhysicalDeviceProperties deviceProperties_;
+    int computeQueueFamilyIndex_ = -1;
     float timestampPeriod_;
+
+    bool m_support_host_image_copy_ = false;
+    bool m_support_buffer_device_address_ = false;
 
     std::vector<VkImageLayout> copySrcLayout_;
     std::vector<VkImageLayout> copyDstLayout_;
@@ -61,10 +61,17 @@ class VulkanDevice {
     std::vector<uintptr_t> enabledFeatures_;
     std::vector<const char *> enabledExtensions_;
 
-    // Helper functions
-    void getProperties();
+    std::vector<VkExtensionProperties> ext_properties_;
+    std::string deviceName_;
 
-    bool createLogicalDevice();
+#ifdef USE_VMA
+    std::unique_ptr<vkop::VMA> m_vma_;
+#endif
+    // Helper functions
+    VkPhysicalDeviceProperties getProperties();
+
+    bool
+    createLogicalDevice(const VkPhysicalDeviceProperties &deviceProperties);
 
     // Device suitability checks
     bool isDeviceSuitable();
@@ -72,12 +79,6 @@ class VulkanDevice {
     int findComputeQueueFamily();
 
     bool checkDeviceExtensionFeature(const char *name) const;
-
-    bool m_support_host_image_copy_ = false;
-    bool m_support_buffer_device_address_ = false;
-#ifdef USE_VMA
-    std::unique_ptr<vkop::VMA> m_vma_;
-#endif
 };
 
 } // namespace vkop

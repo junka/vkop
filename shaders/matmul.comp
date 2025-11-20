@@ -13,7 +13,7 @@ layout(set=0, binding = 2) readonly buffer BufferB {
     float data[];
 } bufferB;
 
-layout(set=0, binding = 3) readonly uniform paraBuffer {
+layout(push_constant) readonly uniform paraBuffer {
     int M; // 行数
     int N; // 列数
     int K; // 共同维度

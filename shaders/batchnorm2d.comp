@@ -10,7 +10,7 @@ layout(set=0, binding = 2) readonly buffer tensorBuffer {
     vec4 attr[]; // mean, variance, scale, bias
 } uMeanVarScaleBias;
 
-layout(set=0, binding=3) readonly uniform batchNormBuffer {
+layout(push_constant) readonly uniform batchNormBuffer {
 	ivec4 outShape; // 输出图像的NCHW
     float eps; // default 1e-5
     float momentum; // default 0.1

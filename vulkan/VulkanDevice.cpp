@@ -9,8 +9,8 @@
 
 namespace vkop {
 
-VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice)
-    : physicalDevice_(physicalDevice) {
+VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
+    physicalDevice_ = physicalDevice;
     if (physicalDevice == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan physical device handle.");
     }
@@ -37,7 +37,7 @@ VulkanDevice::~VulkanDevice() {
     }
 }
 
-void VulkanDevice::getProperties() {
+VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     uint32_t p_property_count = 0;
     vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr,
                                          &p_property_count, nullptr);
@@ -78,14 +78,15 @@ void VulkanDevice::getProperties() {
     properties2.pNext = &subgroup_properties;
 
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
-    this->deviceProperties_ = properties2.properties;
-    this->timestampPeriod_ = deviceProperties_.limits.timestampPeriod;
-    LOG_INFO("GPU %s", deviceProperties_.deviceName);
+    this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
+    this->deviceName_ = properties2.properties.deviceName;
+    LOG_INFO("GPU %s", this->deviceName_.c_str());
+    return properties2.properties;
 }
 
 void VulkanDevice::create() {
-    getProperties();
-    if (!createLogicalDevice()) {
+    auto props = getProperties();
+    if (!createLogicalDevice(props)) {
         LOG_ERROR("Failed to create logical device!");
         return;
     }
@@ -115,7 +116,8 @@ int VulkanDevice::findComputeQueueFamily() {
     return -1;
 }
 
-bool VulkanDevice::createLogicalDevice() {
+bool VulkanDevice::createLogicalDevice(
+    const VkPhysicalDeviceProperties &deviceProperties) {
     computeQueueFamilyIndex_ = findComputeQueueFamily();
     if (computeQueueFamilyIndex_ == -1) {
         LOG_ERROR("Failed to find a suitable compute queue family!");
@@ -240,7 +242,7 @@ bool VulkanDevice::createLogicalDevice() {
         float16_int8_features.shaderFloat16 = VK_TRUE;
         if (checkDeviceExtensionFeature(VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
             enabledExtensions_.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
-            if (deviceProperties_.vendorID != 4318) {
+            if (deviceProperties.vendorID != 4318) {
                 // tested on Nvidia A2000, it supports 16bit storage feature but
                 // did not need to enable it. enable will cause validation
                 // error VK_ERROR_FEATURE_NOT_PRESENT
@@ -249,7 +251,7 @@ bool VulkanDevice::createLogicalDevice() {
             }
         }
 #if VK_AMD_gpu_shader_half_float
-        if (deviceProperties_.vendorID == 4098) {
+        if (deviceProperties.vendorID == 4098) {
             // for AMD card, do we really need this ? over
             // VK_KHR_shader_float16_int8
             if (checkDeviceExtensionFeature(
@@ -412,6 +414,11 @@ bool VulkanDevice::createLogicalDevice() {
     timeline_sem_features.timelineSemaphore = VK_TRUE;
     enabledFeatures_.push_back(
         reinterpret_cast<uintptr_t>(&timeline_sem_features));
+#endif
+#ifdef VK_KHR_performance_query
+    if (checkDeviceExtensionFeature(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
+        enabledExtensions_.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+    }
 #endif
 #if defined VK_KHR_cooperative_matrix || defined VK_NV_cooperative_matrix
 #if defined VK_KHR_cooperative_matrix

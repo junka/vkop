@@ -26,7 +26,7 @@ using ivec4 = int[4];
 // torch.nn.functional.batch_norm(input, running_mean, running_var, weight=None,
 //                                bias=None, training=False, momentum=0.1,
 //                                eps=1e-05)
-struct GpuBatchNormParam {
+struct alignas(16) GpuBatchNormParam {
     ivec4 outShape;
     float eps;      // default 1e-5
     float momentum; // default 0.1
@@ -71,24 +71,16 @@ class BatchNorm2d : public Operator {
 
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
-
         tensorBuffer_ = std::make_shared<VulkanBuffer>(
             m_dev_, running_mean->size() * 4,
             VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
             VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                 VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(batchnorm::GpuBatchNormParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
                   input_image->getDescriptorType(),
-                  tensorBuffer_->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, tensorBuffer_, paramBuffer_};
+                  tensorBuffer_->getDescriptorType()};
+        objs_ = {output_image, input_image, tensorBuffer_};
     }
 
     void
@@ -123,15 +115,13 @@ class BatchNorm2d : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<batchnorm::GpuBatchNormParam *>(
-                paramBuffer_->getMappedMemory());
-            para->eps = eps_;
-            para->momentum = momentum_;
-            para->outShape[0] = batch;
-            para->outShape[1] = depth;
-            para->outShape[2] = out_height;
-            para->outShape[3] = out_width;
-            paramBuffer_->unmapMemory();
+            batchnorm::GpuBatchNormParam para;
+            para.eps = eps_;
+            para.momentum = momentum_;
+            para.outShape[0] = batch;
+            para.outShape[1] = depth;
+            para.outShape[2] = out_height;
+            para.outShape[3] = out_width;
 
             auto *var_buffer =
                 static_cast<float *>(tensorBuffer_->getMappedMemory());
@@ -151,7 +141,8 @@ class BatchNorm2d : public Operator {
             }
             tensorBuffer_->unmapMemory();
 
-            submit(batchnorm2d_spv, batchnorm2d_spv_len, UP_DIV(realwidth, 16),
+            submit(&para, sizeof(batchnorm::GpuBatchNormParam), batchnorm2d_spv,
+                   batchnorm2d_spv_len, UP_DIV(realwidth, 16),
                    UP_DIV(realheight, 16));
         }
     }
@@ -162,7 +153,6 @@ class BatchNorm2d : public Operator {
     float eps_ = 1e-5;
 
     std::shared_ptr<VulkanBuffer> tensorBuffer_;
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

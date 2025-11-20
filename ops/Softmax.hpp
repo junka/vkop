@@ -56,16 +56,9 @@ class Softmax : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(softmax::GpuSoftMaxParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, paramBuffer_};
+                  input_image->getDescriptorType()};
+        objs_ = {output_image, input_image};
     }
 
     void
@@ -96,40 +89,38 @@ class Softmax : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<softmax::GpuSoftMaxParam *>(
-                paramBuffer_->getMappedMemory());
+            softmax::GpuSoftMaxParam para;
+            ;
             // vkimage params
-            para->outImgSize[0] = realwidth;
-            para->outImgSize[1] = realheight;
-            para->outImgSize[2] = 1;
-            para->outImgSize[3] = 0;
-            para->outShape[0] = batch;
-            para->outShape[1] = out_height;
-            para->outShape[2] = out_width;
-            para->outShape[3] = depth;
-            para->axis = axis_;
-            paramBuffer_->unmapMemory();
+            para.outImgSize[0] = realwidth;
+            para.outImgSize[1] = realheight;
+            para.outImgSize[2] = 1;
+            para.outImgSize[3] = 0;
+            para.outShape[0] = batch;
+            para.outShape[1] = out_height;
+            para.outShape[2] = out_width;
+            para.outShape[3] = depth;
+            para.axis = axis_;
 
             if (axis_ == 0) {
-                submit(softmax_spv, softmax_spv_len, out_width,
+                submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
+                       softmax_spv_len, out_width,
                        out_height * UP_DIV(depth, 4));
             } else if (axis_ == 1) {
-                submit(softmax_spv, softmax_spv_len, out_width,
-                       out_height * batch);
+                submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
+                       softmax_spv_len, out_width, out_height * batch);
             } else if (axis_ == 2) {
-                submit(softmax_spv, softmax_spv_len, out_width,
-                       UP_DIV(depth, 4) * batch);
+                submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
+                       softmax_spv_len, out_width, UP_DIV(depth, 4) * batch);
             } else if (axis_ == 3) {
-                submit(softmax_spv, softmax_spv_len, out_height,
-                       UP_DIV(depth, 4) * batch);
+                submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
+                       softmax_spv_len, out_height, UP_DIV(depth, 4) * batch);
             }
         }
     }
 
   private:
     int axis_;
-
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

@@ -222,8 +222,10 @@ int main(int argc, char *argv[]) {
         frame.clear();
         frame.shrink_to_fit();
         t->copyToGPU(dev, cmdpool, data.data());
+        data.clear();
+        data.shrink_to_fit();
 
-        for (int i = 0; i < 10000; i ++) {
+        for (int i = 0; i < 100; i ++) {
             rt->Run();
         }
         rt->ReadResult();

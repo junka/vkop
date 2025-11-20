@@ -26,7 +26,7 @@ using ivec4 = int[4];
 // torch.nn.functional.layer_norm(input, normalized_shape, weight=None,
 // bias=None, eps=1e-05)
 
-struct GpuLayerNormParam {
+struct alignas(16) GpuLayerNormParam {
     ivec4 outShape;
     ivec4 normalizedShape;
     float eps; // default 1e-5
@@ -66,22 +66,14 @@ class LayerNorm : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        weightBuffer_ = weight->as_storage_buffer(m_dev_);
-        biasBuffer_ = bias->as_storage_buffer(m_dev_);
-
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(layernorm::GpuLayerNormParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        auto weight_buffer = weight->as_storage_buffer(m_dev_);
+        auto bias_buffer = bias->as_storage_buffer(m_dev_);
 
         types_ = {output_image->getDescriptorType(),
                   input_image->getDescriptorType(),
-                  weightBuffer_->getDescriptorType(),
-                  biasBuffer_->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, weightBuffer_, biasBuffer_,
-                 paramBuffer_};
+                  weight_buffer->getDescriptorType(),
+                  bias_buffer->getDescriptorType()};
+        objs_ = {output_image, input_image, weight_buffer, bias_buffer};
     }
 
     void
@@ -118,31 +110,32 @@ class LayerNorm : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<layernorm::GpuLayerNormParam *>(
-                paramBuffer_->getMappedMemory());
-            para->eps = eps_;
-            para->outShape[0] = batch;
-            para->outShape[1] = depth;
-            para->outShape[2] = out_height;
-            para->outShape[3] = out_width;
-            para->normalizedDim = normalized_shape_.size();
-            para->innerSize = 1;
+            layernorm::GpuLayerNormParam para;
+            para.eps = eps_;
+            para.outShape[0] = batch;
+            para.outShape[1] = depth;
+            para.outShape[2] = out_height;
+            para.outShape[3] = out_width;
+            para.normalizedDim = normalized_shape_.size();
+            para.innerSize = 1;
             for (size_t i = 0; i < normalized_shape_.size(); i++) {
-                para->normalizedShape[i] = normalized_shape_[i];
-                para->innerSize *= normalized_shape_[i];
+                para.normalizedShape[i] = normalized_shape_[i];
+                para.innerSize *= normalized_shape_[i];
             }
-            paramBuffer_->unmapMemory();
             weight->copyToGPU(m_dev_, m_cmdpool_);
             bias->copyToGPU(m_dev_, m_cmdpool_);
 
             if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
-                submit(layernorm_spv, layernorm_spv_len,
+                submit(&para, sizeof(layernorm::GpuLayerNormParam),
+                       layernorm_spv, layernorm_spv_len,
                        batch * UP_DIV(depth, 4), out_height);
             } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
-                submit(layernorm_spv, layernorm_spv_len, batch,
+                submit(&para, sizeof(layernorm::GpuLayerNormParam),
+                       layernorm_spv, layernorm_spv_len, batch,
                        UP_DIV(depth, 4));
             } else { // 归一化所有维度 CHW
-                submit(layernorm_spv, layernorm_spv_len, realwidth, realheight);
+                submit(&para, sizeof(layernorm::GpuLayerNormParam),
+                       layernorm_spv, layernorm_spv_len, realwidth, realheight);
             }
         }
     }
@@ -150,9 +143,6 @@ class LayerNorm : public Operator {
   private:
     float eps_ = 1e-5;
     std::vector<int> normalized_shape_;
-    std::shared_ptr<VulkanBuffer> weightBuffer_;
-    std::shared_ptr<VulkanBuffer> biasBuffer_;
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

@@ -138,9 +138,11 @@ template <typename T> class Tensor : public ITensor {
     as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (!vkobj_) {
             vkobj_ = std::make_shared<VulkanBuffer>(
-                vd, size_, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                vd, size_,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         }
         return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
     }
@@ -148,9 +150,10 @@ template <typename T> class Tensor : public ITensor {
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (!vkobj_) {
             vkobj_ = std::make_shared<VulkanBuffer>(
-                vd, size_, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                vd, size_,
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         }
         return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
     }
@@ -231,15 +234,7 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyToGPUImage(dev, cmdpool, data);
         } else {
-            auto vkbuf = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-            auto *buffer = static_cast<T *>(vkbuf->getMappedMemory());
-            if (data)
-                memcpy(buffer, data, size_);
-            else {
-                memcpy(buffer, data_.data(), size_);
-            }
-            toGPU();
-            vkbuf->unmapMemory();
+            copyToGPUBuffer(dev, cmdpool, data);
         }
         if (!data) {
             data_.clear();
@@ -257,11 +252,7 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyImageToCPU(dev, cmdpool);
         } else {
-            auto vkbuf = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-            auto *buffer = static_cast<T *>(vkbuf->getMappedMemory());
-            memcpy(data_.data(), buffer, size_);
-            toCPU();
-            vkbuf->unmapMemory();
+            copyBufferToCPU(dev, cmdpool);
         }
     }
 
@@ -296,6 +287,40 @@ template <typename T> class Tensor : public ITensor {
             flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
             ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
                               : VK_FORMAT_R32G32B32A32_SFLOAT));
+    }
+
+    void copyToGPUBuffer(const std::shared_ptr<VulkanDevice> &dev,
+                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                         T *src = nullptr) {
+        auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        VkDevice device = dev->getLogicalDevice();
+
+        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
+                                cmdpool->getSemaphore());
+        auto stpool = cmdpool->getStagingBufferPool();
+        uint64_t completed_timeline_value =
+            cmdpool->getCompletedTimelineValue();
+        stpool->reclaimCompleted(completed_timeline_value);
+        auto *buff = stpool->getBuffer();
+        auto b = stpool->allocate(size_);
+        if (!b) {
+            printf("stpool alloc failed\n");
+            return;
+        }
+        if (src)
+            memcpy(b->ptr, src, size_);
+        else {
+            memcpy(b->ptr, data_.data(), size_);
+        }
+
+        cmd.begin();
+        buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset);
+        buffer->readBarrier(cmd.get());
+        cmd.end();
+        uint64_t submit_value = cmdpool->getNextSubmitValue();
+        cmd.submit(dev->getComputeQueue(), submit_value);
+        stpool->markSubmit(submit_value);
+        toGPU();
     }
     void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
@@ -346,6 +371,34 @@ template <typename T> class Tensor : public ITensor {
             stpool->markSubmit(submit_value);
         }
         toGPU();
+    }
+    void copyBufferToCPU(const std::shared_ptr<VulkanDevice> &dev,
+                         const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+
+        VkDevice device = dev->getLogicalDevice();
+        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
+                                cmdpool->getSemaphore());
+
+        auto stpool = cmdpool->getStagingBufferPool();
+        uint64_t completed_timeline_value =
+            cmdpool->getCompletedTimelineValue();
+        stpool->reclaimCompleted(completed_timeline_value);
+        auto *buff = stpool->getBuffer();
+        auto b = stpool->allocate(size_);
+        if (!b) {
+            printf("stpool alloc failed\n");
+            return;
+        }
+
+        cmd.begin();
+        buffer->copyBufferToStageBuffer(cmd.get(), buff, b->offset);
+        cmd.end();
+        uint64_t submit_value = cmdpool->getNextSubmitValue();
+        cmd.submit(dev->getComputeQueue(), submit_value);
+        stpool->markSubmit(submit_value);
+        std::memcpy(data_.data(), b->ptr, size_);
+        toCPU();
     }
     void copyImageToCPU(const std::shared_ptr<VulkanDevice> &dev,
                         const std::shared_ptr<VulkanCommandPool> &cmdpool) {

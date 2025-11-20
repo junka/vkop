@@ -20,12 +20,13 @@ extern unsigned int matmul_spv_len;
 namespace vkop {
 namespace ops {
 
-struct GpuMatMulParam {
+namespace matmul {
+struct alignas(16) GpuMatMulParam {
     int M;
     int N;
     int K;
 };
-
+} // namespace matmul
 class MatMul : public Operator {
   public:
     MatMul() : Operator(OpType::MATMUL){};
@@ -46,16 +47,10 @@ class MatMul : public Operator {
         auto inputb_buffer = inputb->as_storage_buffer(m_dev_);
         auto output_buffer = output->as_storage_buffer(m_dev_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(GpuMatMulParam), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_buffer->getDescriptorType(),
                   inputa_buffer->getDescriptorType(),
-                  inputb_buffer->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_buffer, inputa_buffer, inputb_buffer, paramBuffer_};
+                  inputb_buffer->getDescriptorType()};
+        objs_ = {output_buffer, inputa_buffer, inputb_buffer};
     }
 
     void
@@ -83,19 +78,17 @@ class MatMul : public Operator {
             inputa->copyToGPU(m_dev_, m_cmdpool_);
             inputb->copyToGPU(m_dev_, m_cmdpool_);
 
-            auto *para = static_cast<struct GpuMatMulParam *>(
-                paramBuffer_->getMappedMemory());
-            para->M = m;
-            para->N = n;
-            para->K = inputa->getShape()[1];
-            paramBuffer_->unmapMemory();
+            matmul::GpuMatMulParam para;
+            para.M = m;
+            para.N = n;
+            para.K = inputa->getShape()[1];
 
-            submit(matmul_spv, matmul_spv_len, UP_DIV(n, 16), UP_DIV(m, 16));
+            submit(&para, sizeof(matmul::GpuMatMulParam), matmul_spv,
+                   matmul_spv_len, UP_DIV(n, 16), UP_DIV(m, 16));
         }
     }
 
   private:
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

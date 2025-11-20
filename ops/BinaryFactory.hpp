@@ -75,7 +75,8 @@ class BinaryFactory : public Operator {
 
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
-        submit(spv_, spv_len_, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+        submit(nullptr, 0, spv_, spv_len_, UP_DIV(realwidth, 16),
+               UP_DIV(realheight, 16));
     }
 
   protected:

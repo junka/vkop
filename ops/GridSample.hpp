@@ -30,7 +30,7 @@ enum class PaddingMode { ZEROS, BORDER, REFLECTION };
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct GpuGridSampleParam {
+struct alignas(16) GpuGridSampleParam {
     ivec4 outImgSize;
     ivec2 inShape;
     ivec2 outShape;
@@ -106,17 +106,10 @@ class GridSample : public Operator {
 
         auto weight_image = grid->as_input_image(m_dev_, m_cmdpool_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(gridsample::GpuGridSampleParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
                   input_image->getDescriptorType(),
-                  weight_image->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, weight_image, paramBuffer_};
+                  weight_image->getDescriptorType()};
+        objs_ = {output_image, input_image, weight_image};
     }
 
     void
@@ -156,24 +149,22 @@ class GridSample : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<gridsample::GpuGridSampleParam *>(
-                paramBuffer_->getMappedMemory());
-            // vkimage params
-            para->outImgSize[0] = realwidth;
-            para->outImgSize[1] = realheight;
-            para->outImgSize[2] = 1;
-            para->outImgSize[3] = 0;
+            gridsample::GpuGridSampleParam para;
+            para.outImgSize[0] = realwidth;
+            para.outImgSize[1] = realheight;
+            para.outImgSize[2] = 1;
+            para.outImgSize[3] = 0;
             // original params
-            para->inShape[0] = in_width;
-            para->inShape[1] = in_height;
-            para->outShape[0] = out_width;
-            para->outShape[1] = out_height;
-            para->align_corners = align_corners_;
-            para->padding_mode = static_cast<int>(padding_mode_);
-            para->interpolation_mode = static_cast<int>(interpolation_mode_);
-            paramBuffer_->unmapMemory();
+            para.inShape[0] = in_width;
+            para.inShape[1] = in_height;
+            para.outShape[0] = out_width;
+            para.outShape[1] = out_height;
+            para.align_corners = align_corners_;
+            para.padding_mode = static_cast<int>(padding_mode_);
+            para.interpolation_mode = static_cast<int>(interpolation_mode_);
 
-            submit(grid_sample_spv, grid_sample_spv_len, UP_DIV(out_width, 16),
+            submit(&para, sizeof(gridsample::GpuGridSampleParam),
+                   grid_sample_spv, grid_sample_spv_len, UP_DIV(out_width, 16),
                    UP_DIV(out_height, 16));
         }
     }
@@ -182,7 +173,6 @@ class GridSample : public Operator {
     gridsample::InterpolationMode interpolation_mode_;
     gridsample::PaddingMode padding_mode_;
     bool align_corners_;
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

@@ -182,27 +182,19 @@ class Conv2d : public Operator {
 
         auto weight_image = weight->as_input_image(m_dev_, m_cmdpool_);
 
-        auto bias_buffer =
-            bias ? bias->as_storage_buffer(m_dev_)
-                 : std::make_shared<VulkanBuffer>(
-                       m_dev_, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(conv2d::GPUConv2dParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        auto dummy =
+            std::make_shared<VulkanBuffer>(m_dev_, 4,
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
 
         types_ = {output_image->getDescriptorType(),
                   input_image->getDescriptorType(),
                   weight_image->getDescriptorType(),
                   bias ? bias_buffer->getDescriptorType()
-                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, weight_image, bias_buffer,
-                 paramBuffer_};
+                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_ = {output_image, input_image, weight_image, bias_buffer};
     }
 
     void
@@ -247,39 +239,38 @@ class Conv2d : public Operator {
             int realwidth = out_width * UP_DIV(out_depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<conv2d::GPUConv2dParam *>(
-                paramBuffer_->getMappedMemory());
+            conv2d::GPUConv2dParam para;
             // vkimage params
-            para->inputSize[0] = in_width;
-            para->inputSize[1] = in_height;
-            para->inputSize[2] = depth;
-            para->inputSize[3] = batch;
-            para->outputSize[0] = out_width;
-            para->outputSize[1] = out_height;
-            para->outputSize[2] = out_depth;
-            para->outputSize[3] = out_batch;
+            para.inputSize[0] = in_width;
+            para.inputSize[1] = in_height;
+            para.inputSize[2] = depth;
+            para.inputSize[3] = batch;
+            para.outputSize[0] = out_width;
+            para.outputSize[1] = out_height;
+            para.outputSize[2] = out_depth;
+            para.outputSize[3] = out_batch;
             // original params
 
-            para->kernel_shape[0] = weight_shape[3];
-            para->kernel_shape[1] = weight_shape[2];
-            para->kernel_shape[2] = weight_shape[1];
-            para->kernel_shape[3] = weight_shape[0];
-            para->stride[0] = strides_[0];
-            para->stride[1] = strides_[1];
-            para->padding[0] = pads_[0];
-            para->padding[1] = pads_[1];
-            para->dilation[0] = dilations_[0];
-            para->dilation[1] = dilations_[1];
+            para.kernel_shape[0] = weight_shape[3];
+            para.kernel_shape[1] = weight_shape[2];
+            para.kernel_shape[2] = weight_shape[1];
+            para.kernel_shape[3] = weight_shape[0];
+            para.stride[0] = strides_[0];
+            para.stride[1] = strides_[1];
+            para.padding[0] = pads_[0];
+            para.padding[1] = pads_[1];
+            para.dilation[0] = dilations_[0];
+            para.dilation[1] = dilations_[1];
 
-            para->groups = groups_;
-            para->bias = bias ? 1 : 0;
-            para->activation = static_cast<int>(activation_);
-            paramBuffer_->unmapMemory();
+            para.groups = groups_;
+            para.bias = bias ? 1 : 0;
+            para.activation = static_cast<int>(activation_);
 
             if (bias)
                 bias->copyToGPU(m_dev_, m_cmdpool_);
 
-            submit(conv2d_spv, conv2d_spv_len, UP_DIV(realwidth, 16),
+            submit(&para, sizeof(struct conv2d::GPUConv2dParam), conv2d_spv,
+                   conv2d_spv_len, UP_DIV(realwidth, 16),
                    UP_DIV(realheight, 16));
         } else {
             LOG_ERROR("Unsupported data type");
@@ -294,9 +285,6 @@ class Conv2d : public Operator {
     int groups_;
     conv2d::ActivationMode activation_;
 
-    // conv2d::PaddingMode padding_mode_;
-
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
     std::shared_ptr<VulkanBuffer> biasBuffer_;
 };
 

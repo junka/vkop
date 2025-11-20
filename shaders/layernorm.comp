@@ -11,7 +11,7 @@ layout(set=0, binding = 3) readonly buffer biasBuffer {
     float attr[];
 } uBias;
 
-layout(set=0, binding = 4) readonly uniform layerNormBuffer {
+layout(push_constant) readonly uniform layerNormBuffer {
 	ivec4 outShape; // 输出图像的NCHW
     ivec4 normalizedShape; // 归一化的形状
     float eps; // default 1e-5

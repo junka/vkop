@@ -37,7 +37,7 @@ layout(set=0, binding=3) readonly buffer biasBuffer {
     float attr[]; // bias[C_out]
 } uBias;
 
-layout(set=0, binding=4) uniform constBuffer {
+layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // W, H, C_in, N
     ivec4 outputSize;    // W, H, C_out, N
     ivec4 kernelSize;    // kW, kH, C_out, C_in

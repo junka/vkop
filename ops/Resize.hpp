@@ -173,16 +173,9 @@ class Resize : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(resize::GpuResizeParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, paramBuffer_};
+                  input_image->getDescriptorType()};
+        objs_ = {output_image, input_image};
     }
 
     void
@@ -245,31 +238,28 @@ class Resize : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<resize::GpuResizeParam *>(
-                paramBuffer_->getMappedMemory());
-            // vkimage params
-            para->outImgSize[0] = realwidth;
-            para->outImgSize[1] = realheight;
-            para->outImgSize[2] = 1;
-            para->outImgSize[3] = 0;
-            para->inShape[0] = input_shape[0];
-            para->inShape[1] = input_shape[1];
-            para->inShape[2] = input_shape[2];
-            para->inShape[3] = input_shape[3];
-            para->outShape[0] = batch;
-            para->outShape[1] = depth;
-            para->outShape[2] = out_height;
-            para->outShape[3] = out_width;
-            para->mode = mode_;
-            para->nearest_mode = nearest_mode_;
-            para->antialias = antialias_;
-            para->coordinate_transformation_mode =
+            resize::GpuResizeParam para;
+            para.outImgSize[0] = realwidth;
+            para.outImgSize[1] = realheight;
+            para.outImgSize[2] = 1;
+            para.outImgSize[3] = 0;
+            para.inShape[0] = input_shape[0];
+            para.inShape[1] = input_shape[1];
+            para.inShape[2] = input_shape[2];
+            para.inShape[3] = input_shape[3];
+            para.outShape[0] = batch;
+            para.outShape[1] = depth;
+            para.outShape[2] = out_height;
+            para.outShape[3] = out_width;
+            para.mode = mode_;
+            para.nearest_mode = nearest_mode_;
+            para.antialias = antialias_;
+            para.coordinate_transformation_mode =
                 coordinate_transformation_mode_;
-            para->cubic_coeff_a = cubic_coeff_a_;
+            para.cubic_coeff_a = cubic_coeff_a_;
 
-            paramBuffer_->unmapMemory();
-
-            submit(resize_spv, resize_spv_len, realwidth, realheight);
+            submit(&para, sizeof(resize::GpuResizeParam), resize_spv,
+                   resize_spv_len, realwidth, realheight);
         }
     }
 
@@ -285,8 +275,6 @@ class Resize : public Operator {
     int nearest_mode_ = 0;
     std::vector<int> size_;
     std::vector<float> scale_factor_;
-
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

@@ -28,6 +28,8 @@ file(GLOB_RECURSE ALL_SOURCE_FILES vulkan/*.cpp vulkan/*.hpp ops/*.cpp core/*.cp
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
 set(SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(GLOB SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
+# Exclude common files from SHADER_FILES
+list(FILTER SHADER_FILES EXCLUDE REGEX "activation\\.comp$")
 
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
@@ -111,10 +113,10 @@ if(USE_VALIDATION_LAYERS)
     target_compile_definitions(vkop PRIVATE USE_VALIDATION_LAYERS)
 endif()
 if(USE_MEASURE_TIME)
-    target_compile_definitions(vkop PRIVATE USE_MEASURE_TIME)
+    target_compile_definitions(vkop PUBLIC USE_MEASURE_TIME)
 endif()
 if(USE_VMA)
-    target_compile_definitions(vkop PRIVATE USE_VMA)
+    target_compile_definitions(vkop PUBLIC USE_VMA)
 endif()
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)

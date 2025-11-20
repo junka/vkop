@@ -14,7 +14,7 @@ namespace maxpool2d {
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct GpuMaxpoolParam {
+struct alignas(16) GpuMaxpoolParam {
     ivec4 inputSize;
     ivec4 outputSize;
     ivec2 pad;
@@ -157,16 +157,9 @@ class Maxpool2d : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(maxpool2d::GpuMaxpoolParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, paramBuffer_};
+                  input_image->getDescriptorType()};
+        objs_ = {output_image, input_image};
     }
 
     void
@@ -224,27 +217,26 @@ class Maxpool2d : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<maxpool2d::GpuMaxpoolParam *>(
-                paramBuffer_->getMappedMemory());
-            // vkimage params
-            para->inputSize[0] = input_shape[3];
-            para->inputSize[1] = input_shape[2];
-            para->inputSize[2] = UP_DIV(depth, 4);
-            para->inputSize[3] = batch;
-            para->outputSize[0] = out_width;
-            para->outputSize[1] = out_height;
-            para->outputSize[2] = UP_DIV(depth, 4);
-            para->outputSize[3] = batch;
+            maxpool2d::GpuMaxpoolParam para;
 
-            para->pad[0] = pads_[0];
-            para->pad[1] = pads_[1];
-            para->kernelSize[0] = kernel_shape_[0];
-            para->kernelSize[1] = kernel_shape_[1];
-            para->stride[0] = strides_[0];
-            para->stride[1] = strides_[1];
+            para.inputSize[0] = input_shape[3];
+            para.inputSize[1] = input_shape[2];
+            para.inputSize[2] = UP_DIV(depth, 4);
+            para.inputSize[3] = batch;
+            para.outputSize[0] = out_width;
+            para.outputSize[1] = out_height;
+            para.outputSize[2] = UP_DIV(depth, 4);
+            para.outputSize[3] = batch;
 
-            paramBuffer_->unmapMemory();
-            submit(maxpool2d_spv, maxpool2d_spv_len, UP_DIV(realwidth, 16),
+            para.pad[0] = pads_[0];
+            para.pad[1] = pads_[1];
+            para.kernelSize[0] = kernel_shape_[0];
+            para.kernelSize[1] = kernel_shape_[1];
+            para.stride[0] = strides_[0];
+            para.stride[1] = strides_[1];
+
+            submit(&para, sizeof(maxpool2d::GpuMaxpoolParam), maxpool2d_spv,
+                   maxpool2d_spv_len, UP_DIV(realwidth, 16),
                    UP_DIV(realheight, 16));
         }
     }
@@ -257,8 +249,6 @@ class Maxpool2d : public Operator {
 
     int storage_order_;
     int ceil_mode_;
-
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

@@ -12,7 +12,8 @@ class VulkanPipeline {
   public:
     VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,
                    std::vector<std::shared_ptr<VulkanResource>> objs,
-                   const uint32_t *spirv, int codesize);
+                   size_t pushconstant_size, const uint32_t *spirv,
+                   int codesize);
     ~VulkanPipeline();
 
     VkPipeline getComputePipeline() const { return m_pipeline_; }
@@ -23,6 +24,7 @@ class VulkanPipeline {
     VkDevice m_device_;
     std::vector<VkDescriptorType> m_types_;
     std::vector<std::shared_ptr<VulkanResource>> m_objs_;
+    size_t m_pushconstant_size_ = 0;
 
     VkDescriptorSetLayout m_descriptorSetLayout_ = VK_NULL_HANDLE;
     VkPipeline m_pipeline_ = VK_NULL_HANDLE;

@@ -24,8 +24,18 @@ class VulkanBuffer : public VulkanResource {
     std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
     getDescriptorInfo() const override;
 
+    void transferBarrier(VkCommandBuffer commandBuffer,
+                         VkAccessFlags dstAccessMask);
     void transferWriteBarrier(VkCommandBuffer commandBuffer);
     void transferReadBarrier(VkCommandBuffer commandBuffer);
+    void readBarrier(VkCommandBuffer commandBuffer);
+    void writeBarrier(VkCommandBuffer commandBuffer);
+
+    void copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
+                                 VkBuffer dstbuffer, VkDeviceSize dstoffset);
+
+    void copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
+                                 VkBuffer srcbuffer, VkDeviceSize srcoffset);
 
 #ifdef USE_VMA
     void *getMappedMemory() override {
@@ -41,7 +51,12 @@ class VulkanBuffer : public VulkanResource {
 
 #endif
     VkDeviceSize m_size_;
+    VkAccessFlags m_access_ = 0;
 
+    void transitionBuffer(VkCommandBuffer commandBuffer,
+                          VkAccessFlags dstAccessMask,
+                          VkPipelineStageFlags src_stage,
+                          VkPipelineStageFlags dst_stage, VkDeviceSize offset);
     void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
 };
 } // namespace vkop

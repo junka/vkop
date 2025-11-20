@@ -14,7 +14,7 @@ namespace col2im {
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct GpuCol2ImParam {
+struct alignas(16) GpuCol2ImParam {
     ivec4 outImgSize;
     ivec4 outShape;
     int groupSize;
@@ -42,16 +42,9 @@ class Col2im : public Operator {
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
         auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        paramBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, sizeof(col2im::GpuCol2ImParam),
-            VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
         types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  paramBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, paramBuffer_};
+                  input_image->getDescriptorType()};
+        objs_ = {output_image, input_image};
     }
 
     void
@@ -85,28 +78,25 @@ class Col2im : public Operator {
             int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
-            auto *para = static_cast<col2im::GpuCol2ImParam *>(
-                paramBuffer_->getMappedMemory());
+            col2im::GpuCol2ImParam para;
             // vkimage params
-            para->outImgSize[0] = realwidth;
-            para->outImgSize[1] = realheight;
-            para->outImgSize[2] = 1;
-            para->outImgSize[3] = 0;
-            para->outShape[0] = batch;
-            para->outShape[1] = out_height;
-            para->outShape[2] = out_width;
-            para->outShape[3] = depth;
+            para.outImgSize[0] = realwidth;
+            para.outImgSize[1] = realheight;
+            para.outImgSize[2] = 1;
+            para.outImgSize[3] = 0;
+            para.outShape[0] = batch;
+            para.outShape[1] = out_height;
+            para.outShape[2] = out_width;
+            para.outShape[3] = depth;
 
-            paramBuffer_->unmapMemory();
-
-            submit(col2im_spv, col2im_spv_len, out_width, out_height);
+            submit(&para, sizeof(col2im::GpuCol2ImParam), col2im_spv,
+                   col2im_spv_len, out_width, out_height);
         } else {
             LOG_ERROR("Unsupported data type");
         }
     }
 
   private:
-    std::shared_ptr<VulkanBuffer> paramBuffer_;
 };
 
 } // namespace ops

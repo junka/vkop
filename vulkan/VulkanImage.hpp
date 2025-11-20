@@ -31,12 +31,6 @@ class VulkanImage : public VulkanResource {
     std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
     getDescriptorInfo() const override;
 
-    void transitionImageLayout(VkCommandBuffer commandBuffer,
-                               VkImageLayout newLayout,
-                               VkAccessFlags dstAccessMask,
-                               VkPipelineStageFlags sourceStage,
-                               VkPipelineStageFlags destinationStage);
-
     void transferBarrier(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
                          VkAccessFlags dstAccessMask);
     void transferReadBarrier(VkCommandBuffer commandBuffer);
@@ -103,6 +97,12 @@ class VulkanImage : public VulkanResource {
     void createSampler();
 
     void destroyImage();
+
+    void transitionImageLayout(VkCommandBuffer commandBuffer,
+                               VkImageLayout newLayout,
+                               VkAccessFlags dstAccessMask,
+                               VkPipelineStageFlags sourceStage,
+                               VkPipelineStageFlags destinationStage);
 };
 } // namespace vkop
 #endif // SRC_VULKANIMAGE_HPP_

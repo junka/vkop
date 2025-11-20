@@ -94,7 +94,8 @@ namespace vkop {
     PFN(vkCreateSemaphore)                                                     \
     PFN(vkGetSemaphoreCounterValue)                                            \
     PFN(vkDestroySemaphore)                                                    \
-    PFN(vkCmdFillBuffer)
+    PFN(vkCmdFillBuffer)                                                       \
+    PFN(vkCmdPushConstants)
 
 class VulkanLib {
   public:

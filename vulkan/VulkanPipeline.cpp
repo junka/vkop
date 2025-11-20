@@ -13,9 +13,10 @@
 namespace vkop {
 VulkanPipeline::VulkanPipeline(
     VkDevice device, std::vector<VkDescriptorType> types,
-    std::vector<std::shared_ptr<VulkanResource>> objs, const uint32_t *spirv,
-    int codesize)
-    : m_device_(device), m_types_(std::move(types)), m_objs_(std::move(objs)) {
+    std::vector<std::shared_ptr<VulkanResource>> objs, size_t pushconstant_size,
+    const uint32_t *spirv, int codesize)
+    : m_device_(device), m_types_(std::move(types)), m_objs_(std::move(objs)),
+      m_pushconstant_size_(pushconstant_size) {
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout();
     createPipelineLayout();
@@ -57,12 +58,20 @@ void VulkanPipeline::createDescriptorSetLayout() {
 }
 
 void VulkanPipeline::createPipelineLayout() {
+    VkPushConstantRange push_constant_range{};
+    push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    push_constant_range.offset = 0;
+    push_constant_range.size = m_pushconstant_size_;
+
     VkPipelineLayoutCreateInfo pipeline_layout_create_info = {};
     pipeline_layout_create_info.sType =
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
     pipeline_layout_create_info.setLayoutCount = 1;
     pipeline_layout_create_info.pSetLayouts = &m_descriptorSetLayout_;
-
+    if (m_pushconstant_size_ > 0) {
+        pipeline_layout_create_info.pushConstantRangeCount = 1;
+        pipeline_layout_create_info.pPushConstantRanges = &push_constant_range;
+    }
     if (vkCreatePipelineLayout(m_device_, &pipeline_layout_create_info, nullptr,
                                &m_pipelineLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create pipeline layout!");
