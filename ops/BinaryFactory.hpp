@@ -24,21 +24,33 @@ class BinaryFactory : public Operator {
     void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) {
         auto input_a = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
         auto input_b = core::as_tensor<T>(inputs[1]);
         auto input_shape = input_a->getShape();
-        if (output->size() == 0) {
-            output->resize(input_shape);
+        types_.clear();
+        if (outputs[0]->dtype() == typeid(float)) {
+            auto output = core::as_tensor<float>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(input_shape);
+            }
+            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        } else {
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(input_shape);
+            }
+            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
         }
-
         auto inputa_image = input_a->as_input_image(m_dev_, m_cmdpool_);
         auto inputb_image = input_b->as_input_image(m_dev_, m_cmdpool_);
-        auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
 
-        types_ = {output_image->getDescriptorType(),
-                  inputa_image->getDescriptorType(),
-                  inputb_image->getDescriptorType()};
-        objs_ = {output_image, inputa_image, inputb_image};
+        types_.emplace_back(inputa_image->getDescriptorType());
+        types_.emplace_back(inputb_image->getDescriptorType());
+        objs_.emplace_back(inputa_image);
+        objs_.emplace_back(inputb_image);
     }
 
     void
@@ -57,13 +69,12 @@ class BinaryFactory : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         std::vector<int> input_shape;
+        (void)outputs;
         if (inputs[0]->dtype() == typeid(float)) {
             auto input_a = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
             input_shape = input_a->getShape();
         } else if (inputs[0]->dtype() == typeid(uint16_t)) {
             auto input_a = core::as_tensor<uint16_t>(inputs[0]);
-            auto output = core::as_tensor<uint16_t>(outputs[0]);
             input_shape = input_a->getShape();
         } else {
             LOG_ERROR("Unsupported data type");

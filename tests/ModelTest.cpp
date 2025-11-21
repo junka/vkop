@@ -7,6 +7,7 @@
 #include "ops/Ops.hpp"
 #include "core/runtime.hpp"
 
+#include <bits/stdint-uintn.h>
 #include <cstdio>
 #include <unordered_set>
 #include <random>
@@ -17,21 +18,24 @@
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
+using vkop::core::ITensor;
 using vkop::core::Tensor;
 using vkop::core::Runtime;
 
 namespace {
+
+
+template<typename T>
 class ModelTest {
 public:
-    std::vector<float> expectedOutput;
+    std::vector<T> expectedOutput;
 
     ModelTest() = default;
-    void initTestData(const std::shared_ptr<Tensor<float>>& ta, const std::shared_ptr<Tensor<float>>& tb) {
-;
+    void initTestData(const std::shared_ptr<Tensor<T>>& ta, const std::shared_ptr<Tensor<T>>& tb) {
         expectedOutput.resize(ta->num_elements());
         ta->reserveOnCPU();
         tb->reserveOnCPU();
-        
+
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
@@ -40,12 +44,18 @@ public:
         for (int i = 0; i < ta->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            (*ta)[i] = a;
-            (*tb)[i] = b;
-            expectedOutput[i] = a+b;
+            if (typeid(T) == typeid(uint16_t)) {
+                (*ta)[i] = ITensor::fp32_to_fp16(a);
+                (*tb)[i] = ITensor::fp32_to_fp16(b);
+                expectedOutput[i] = ITensor::fp32_to_fp16(a+b);
+            } else {
+                (*ta)[i] = a;
+                (*tb)[i] = b;
+                expectedOutput[i] = a+b;
+            }
         }
     }
-    template<typename T>
+
     void reference_conv2d(const T* input, const std::shared_ptr<Tensor<T>>& weight,
         const std::shared_ptr<Tensor<T>>& bias, std::vector<T>& output, int batch, int ic, int oc,
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
@@ -91,13 +101,20 @@ public:
 
                                     // 检查索引是否在输入张量范围内
                                     if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
-                                        x_value = input[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                        if (typeid(T) == typeid(float)) {
+                                            x_value = input[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                        } else if (typeid(T) == typeid(uint16_t)) {
+                                            x_value = vkop::core::ITensor::fp16_to_fp32(input[(((b * ic + sz) * ih + iy) * iw + ix)]);
+                                        }
                                     }
 
                                     // 获取卷积核的值
-                                    // float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
-                                    float y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
-
+                                    float y_value = 0.F;
+                                    if (typeid(T) == typeid(float)) {
+                                        y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+                                    } else {
+                                        y_value = vkop::core::ITensor::fp16_to_fp32((*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx]);
+                                    }
 
                                     // 累加卷积结果
                                     sum += x_value * y_value;
@@ -108,7 +125,11 @@ public:
                         // 将卷积结果加上偏置并存储到输出张量
                         // 计算输出张量的偏移量
                         auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
-                        output.at(dest_offset) = sum + (*bias)[oz];
+                        if (typeid(T) == typeid(float)) {
+                            output.at(dest_offset) = sum + (*bias)[oz];
+                        } else if (typeid(T) == typeid(uint16_t)) {
+                            output.at(dest_offset) = sum + vkop::core::ITensor::fp16_to_fp32((*bias)[oz]);
+                        }
                     }
                 }
             }
@@ -138,25 +159,38 @@ int main() {
     LOG_INFO("%s",dev->getDeviceName().c_str());
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
     std::string binary_file_path = TEST_DATA_PATH"/add_conv_model.bin";
+    // This model has two inputs and one output,
+    // one add and one conv2d operator
 
     auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
     rt->LoadModel();
-
+#ifdef FP16
+    auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
+    auto t2 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x2"));
+    ModelTest<uint16_t> test;
+#else
     auto t1 = vkop::core::as_tensor<float>(rt->GetInput("input_x1"));
     auto t2 = vkop::core::as_tensor<float>(rt->GetInput("input_x2"));
 
-    ModelTest test;
+    ModelTest<float> test;
+#endif
     test.initTestData(t1, t2);
     rt->Run();
     rt->ReadResult();
-
+#ifdef FP16
+    auto bias = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.bias"));
+    auto weight = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.weight"));
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
+    std::vector<uint16_t> ref_output_data;
+#else
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
     auto weight = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight"));
+    auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
+    std::vector<float> ref_output_data;
+#endif
     bias->copyToCPU(dev, cmdpool);
     weight->copyToCPU(dev, cmdpool);
 
-    std::vector<float> ref_output_data;
     int batch = t1->getShape()[0];
     int ic = t1->getShape()[1];
     int ih = t1->getShape()[2];
@@ -171,12 +205,20 @@ int main() {
     int dilation_h = 1;
     int dilation_w = 1;
     int group = 1;
-    test.reference_conv2d<float>(test.expectedOutput.data(), weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
+    test.reference_conv2d(test.expectedOutput.data(), weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
     for (int i = 0; i < result->num_elements(); ++i) {
+        #ifdef FP16
+        if (std::fabs(vkop::core::ITensor::fp16_to_fp32(result->at(i)) - vkop::core::ITensor::fp16_to_fp32(ref_output_data[i])) > 1e-5) {
+            printf("Failed at %d, %.3f vs %.3f\n", i, vkop::core::ITensor::fp16_to_fp32(result->at(i)), vkop::core::ITensor::fp16_to_fp32((ref_output_data[i])));
+            return 1;
+        }
+
+        #else
         if (std::fabs(result->at(i) - ref_output_data[i]) > 1e-5) {
             printf("Failed at %d, %.3f vs %.3f\n", i, result->at(i), ref_output_data[i]);
             return 1;
         }
+        #endif
     }
     return 0;
 }

@@ -238,7 +238,7 @@ def fuse_conv_activation(vk_model):
     skip_next = set()
 
     # 支持的无参激活函数（ONNX op_type）
-    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish"}
+    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
 
     for i, node in enumerate(vk_model.nodes):
         if i in skip_next:

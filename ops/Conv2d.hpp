@@ -24,7 +24,7 @@ namespace ops {
 namespace conv2d {
 
 enum class PaddingMode { ZEROS, REFLECT, REPLICATE, CIRCULAR };
-enum class ActivationMode { NONE, RELU, SIGMOID, TANH, HARDSWISH, MISH };
+enum class ActivationMode { NONE, RELU, SIGMOID, TANH, HARDSWISH, MISH, RELU6 };
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -139,6 +139,8 @@ class Conv2d : public Operator {
                 activation_ = conv2d::ActivationMode::HARDSWISH;
             } else if (activation == "Mish") {
                 activation_ = conv2d::ActivationMode::MISH;
+            } else if (activation == "Relu6") {
+                activation_ = conv2d::ActivationMode::RELU6;
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
@@ -152,13 +154,27 @@ class Conv2d : public Operator {
     void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
                  std::vector<std::shared_ptr<core::ITensor>> outputs) {
         auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        auto weight = core::as_tensor<T>(inputs[1]);
-        auto bias =
-            (inputs.size() > 2) ? core::as_tensor<float>(inputs[2]) : nullptr;
+        std::vector<int> weight_shape;
+        auto dummy =
+            std::make_shared<VulkanBuffer>(m_dev_, 4,
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        types_.clear();
 
+        if (inputs[1]->dtype() == typeid(float)) {
+            auto weight = core::as_tensor<float>(inputs[1]);
+            auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
+                                            : nullptr;
+            weight_shape = weight->getShape();
+        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
+            auto weight = core::as_tensor<uint16_t>(inputs[1]);
+            auto bias = (inputs.size() > 2)
+                            ? core::as_tensor<uint16_t>(inputs[2])
+                            : nullptr;
+            weight_shape = weight->getShape();
+        }
         auto input_shape = input->getShape();
-        auto weight_shape = weight->getShape();
 
         int batch = input_shape[0];
         int in_height = input_shape[2];
@@ -173,28 +189,55 @@ class Conv2d : public Operator {
                          dilations_[1] * (weight_shape[3] - 1) - 1) /
                             strides_[1] +
                         1;
-        if (output->size() == 0) {
-            output->resize(out_batch, out_depth, out_height, out_width);
+
+        if (outputs[0]->dtype() == typeid(float)) {
+            auto output = core::as_tensor<float>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(out_batch, out_depth, out_height, out_width);
+            }
+
+            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        } else if (outputs[0]->dtype() == typeid(uint16_t)) {
+            auto output = core::as_tensor<uint16_t>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(out_batch, out_depth, out_height, out_width);
+            }
+            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
         }
 
         auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
-        auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+        types_.emplace_back(input_image->getDescriptorType());
+        objs_.emplace_back(input_image);
+        if (inputs[1]->dtype() == typeid(float)) {
+            auto weight = core::as_tensor<float>(inputs[1]);
+            auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
+                                            : nullptr;
 
-        auto weight_image = weight->as_input_image(m_dev_, m_cmdpool_);
+            auto weight_image = weight->as_input_image(m_dev_, m_cmdpool_);
+            auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
+            types_.emplace_back(weight_image->getDescriptorType());
+            types_.emplace_back(bias ? bias_buffer->getDescriptorType()
+                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            objs_.emplace_back(weight_image);
+            objs_.emplace_back(bias_buffer);
+        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
+            auto weight = core::as_tensor<uint16_t>(inputs[1]);
+            auto bias = (inputs.size() > 2)
+                            ? core::as_tensor<uint16_t>(inputs[2])
+                            : nullptr;
 
-        auto dummy =
-            std::make_shared<VulkanBuffer>(m_dev_, 4,
-                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  weight_image->getDescriptorType(),
-                  bias ? bias_buffer->getDescriptorType()
-                       : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-        objs_ = {output_image, input_image, weight_image, bias_buffer};
+            auto weight_image = weight->as_input_image(m_dev_, m_cmdpool_);
+            auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
+            types_.emplace_back(weight_image->getDescriptorType());
+            types_.emplace_back(bias ? bias_buffer->getDescriptorType()
+                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            objs_.emplace_back(weight_image);
+            objs_.emplace_back(bias_buffer);
+        }
     }
 
     void
@@ -202,6 +245,8 @@ class Conv2d : public Operator {
           const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         if (inputs[0]->dtype() == typeid(float)) {
             prepare<float>(inputs, outputs);
+        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
+            prepare<uint16_t>(inputs, outputs);
         } else {
             LOG_ERROR("unsupported");
         }
@@ -210,71 +255,88 @@ class Conv2d : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-
+        std::vector<int> input_shape;
+        std::vector<int> weight_shape;
         if (inputs[0]->dtype() == typeid(float)) {
             auto input = core::as_tensor<float>(inputs[0]);
+            input_shape = input->getShape();
+
+        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
+            auto input = core::as_tensor<uint16_t>(inputs[0]);
+            input_shape = input->getShape();
+        }
+
+        if (inputs[1]->dtype() == typeid(float)) {
             auto output = core::as_tensor<float>(outputs[0]);
             auto weight = core::as_tensor<float>(inputs[1]);
             auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
                                             : nullptr;
-
-            auto input_shape = input->getShape();
-            auto weight_shape = weight->getShape();
-
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int in_height = input_shape[2];
-            int in_width = input_shape[3];
-
-            int out_batch = batch;
-            int out_depth = weight_shape[0];
-            int out_height = (in_height + 2 * pads_[0] -
-                              dilations_[0] * (weight_shape[2] - 1) - 1) /
-                                 strides_[0] +
-                             1;
-            int out_width = (in_width + 2 * pads_[1] -
-                             dilations_[1] * (weight_shape[3] - 1) - 1) /
-                                strides_[1] +
-                            1;
-            int realwidth = out_width * UP_DIV(out_depth, 4);
-            int realheight = out_height * batch;
-
-            conv2d::GPUConv2dParam para;
-            // vkimage params
-            para.inputSize[0] = in_width;
-            para.inputSize[1] = in_height;
-            para.inputSize[2] = depth;
-            para.inputSize[3] = batch;
-            para.outputSize[0] = out_width;
-            para.outputSize[1] = out_height;
-            para.outputSize[2] = out_depth;
-            para.outputSize[3] = out_batch;
-            // original params
-
-            para.kernel_shape[0] = weight_shape[3];
-            para.kernel_shape[1] = weight_shape[2];
-            para.kernel_shape[2] = weight_shape[1];
-            para.kernel_shape[3] = weight_shape[0];
-            para.stride[0] = strides_[0];
-            para.stride[1] = strides_[1];
-            para.padding[0] = pads_[0];
-            para.padding[1] = pads_[1];
-            para.dilation[0] = dilations_[0];
-            para.dilation[1] = dilations_[1];
-
-            para.groups = groups_;
-            para.bias = bias ? 1 : 0;
-            para.activation = static_cast<int>(activation_);
+            weight_shape = weight->getShape();
 
             if (bias)
                 bias->copyToGPU(m_dev_, m_cmdpool_);
 
-            submit(&para, sizeof(struct conv2d::GPUConv2dParam), conv2d_spv,
-                   conv2d_spv_len, UP_DIV(realwidth, 16),
-                   UP_DIV(realheight, 16));
+        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
+            auto output = core::as_tensor<uint16_t>(outputs[0]);
+            auto weight = core::as_tensor<uint16_t>(inputs[1]);
+            auto bias = (inputs.size() > 2)
+                            ? core::as_tensor<uint16_t>(inputs[2])
+                            : nullptr;
+            weight_shape = weight->getShape();
+
+            if (bias)
+                bias->copyToGPU(m_dev_, m_cmdpool_);
         } else {
             LOG_ERROR("Unsupported data type");
         }
+
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        int in_height = input_shape[2];
+        int in_width = input_shape[3];
+
+        int out_batch = batch;
+        int out_depth = weight_shape[0];
+        int out_height = (in_height + 2 * pads_[0] -
+                          dilations_[0] * (weight_shape[2] - 1) - 1) /
+                             strides_[0] +
+                         1;
+        int out_width = (in_width + 2 * pads_[1] -
+                         dilations_[1] * (weight_shape[3] - 1) - 1) /
+                            strides_[1] +
+                        1;
+        int realwidth = out_width * UP_DIV(out_depth, 4);
+        int realheight = out_height * batch;
+
+        conv2d::GPUConv2dParam para;
+        // vkimage params
+        para.inputSize[0] = in_width;
+        para.inputSize[1] = in_height;
+        para.inputSize[2] = depth;
+        para.inputSize[3] = batch;
+        para.outputSize[0] = out_width;
+        para.outputSize[1] = out_height;
+        para.outputSize[2] = out_depth;
+        para.outputSize[3] = out_batch;
+        // original params
+
+        para.kernel_shape[0] = weight_shape[3];
+        para.kernel_shape[1] = weight_shape[2];
+        para.kernel_shape[2] = weight_shape[1];
+        para.kernel_shape[3] = weight_shape[0];
+        para.stride[0] = strides_[0];
+        para.stride[1] = strides_[1];
+        para.padding[0] = pads_[0];
+        para.padding[1] = pads_[1];
+        para.dilation[0] = dilations_[0];
+        para.dilation[1] = dilations_[1];
+
+        para.groups = groups_;
+        para.bias = ((inputs.size() > 2)) ? 1 : 0;
+        para.activation = static_cast<int>(activation_);
+
+        submit(&para, sizeof(struct conv2d::GPUConv2dParam), conv2d_spv,
+               conv2d_spv_len, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
 
   private:

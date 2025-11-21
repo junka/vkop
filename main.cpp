@@ -122,7 +122,8 @@ std::vector<MaskInfo> postProcessNMS(
     return detections;
 }
 
-std::vector<float> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<float>> &t) {
+template<typename T>
+std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<T>> &t) {
     int in_h = t->getShape()[2];
     int in_w = t->getShape()[3];
 
@@ -136,7 +137,7 @@ std::vector<float> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int i
     int u_offset = in_w * in_h;
     int v_offset = 2 * in_w * in_h;
 
-    std::vector<float> resized_image(in_w * in_h * 3);
+    std::vector<T> resized_image(in_w * in_h * 3);
 
     for (int dy = 0; dy < in_h; ++dy) {
         for (int dx = 0; dx < in_w; ++dx) {
@@ -217,13 +218,30 @@ int main(int argc, char *argv[]) {
         auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
         rt->LoadModel();
 
-        auto t = vkop::core::as_tensor<float>(rt->GetInput("input.1"));
-        auto data = resize_YUV(frame, image_h, image_w, t);
-        frame.clear();
-        frame.shrink_to_fit();
-        t->copyToGPU(dev, cmdpool, data.data());
-        data.clear();
-        data.shrink_to_fit();
+        auto input = rt->GetInput("input.1");
+        int tensor_h;
+        int tensor_w;
+        if (input->dtype() == typeid(float)) {
+            auto t = vkop::core::as_tensor<float>(input);
+            tensor_h = t->getShape()[2];
+            tensor_w = t->getShape()[3];
+            auto data = resize_YUV(frame, image_h, image_w, t);
+            frame.clear();
+            frame.shrink_to_fit();
+            t->copyToGPU(dev, cmdpool, data.data());
+            data.clear();
+            data.shrink_to_fit();
+        } else if (input->dtype() == typeid(uint16_t)){
+            auto t = vkop::core::as_tensor<uint16_t>(input);
+            tensor_h = t->getShape()[2];
+            tensor_w = t->getShape()[3];
+            auto data = resize_YUV(frame, image_h, image_w, t);
+            frame.clear();
+            frame.shrink_to_fit();
+            t->copyToGPU(dev, cmdpool, data.data());
+            data.clear();
+            data.shrink_to_fit();
+        }
 
         for (int i = 0; i < 100; i ++) {
             rt->Run();
@@ -236,8 +254,8 @@ int main(int argc, char *argv[]) {
         auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
         assert(hm != nullptr);
 
-        postProcessNMS(hm, hm_nms, reg, dim, cls, hm_nms->getShape()[2], hm_nms->getShape()[3], image_h, image_w,
-            t->getShape()[2], t->getShape()[3]);
+        postProcessNMS(hm, hm_nms, reg, dim, cls, hm_nms->getShape()[2], hm_nms->getShape()[3],
+            image_h, image_w, tensor_h, tensor_w);
     } catch (const std::exception& ex) {
         std::cerr << "Error: " << ex.what() << std::endl;
         return 1;

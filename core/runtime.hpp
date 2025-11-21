@@ -12,6 +12,7 @@ namespace core {
 
 class Runtime {
   private:
+    int precision_ = 0; // 0: fp32, 1: fp16
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     // Model file path
@@ -56,6 +57,9 @@ class Runtime {
     void Run();
 
     void ReadResult();
+
+    void SetPrecision(int val) { precision_ = val; }
+    int GetPrecision() const { return precision_; }
 };
 
 } // namespace core

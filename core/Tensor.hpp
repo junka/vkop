@@ -27,13 +27,6 @@ class ITensor {
     virtual ~ITensor() = default;
     virtual const std::type_info &dtype() const = 0;
 
-    template <typename T> Tensor<T> *as() const {
-        if (dtype() == typeid(T)) {
-            return static_cast<Tensor<T> *>(this);
-        }
-        return nullptr;
-    }
-
     int num_dims() { return dims_.size(); };
     bool is_on_GPU() const { return converted_; }
     void toGPU() { converted_ = true; }
@@ -41,6 +34,63 @@ class ITensor {
     void ref_inc() { ref_cnt_++; }
     int ref_cnt() const { return ref_cnt_; }
     void set_ref_cnt_forever() { ref_cnt_ = std::numeric_limits<int>::max(); }
+
+    static float fp16_to_fp32(uint16_t h) {
+        uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
+        uint32_t exponent = (h & 0x7C00) >> 10;
+        uint32_t mantissa = h & 0x03FF;
+
+        if (exponent == 0) {
+            if (mantissa == 0) {
+                // ±0
+                uint32_t r = sign;
+                float f;
+                std::memcpy(&f, &r, sizeof(f));
+                return f;
+            }
+            // Subnormal
+            while ((mantissa & 0x0400) == 0) {
+                mantissa <<= 1;
+                exponent--;
+            }
+            exponent++;
+            mantissa &= 0x03FF;
+
+        } else if (exponent == 31) {
+            // Inf or NaN
+            uint32_t r = sign | 0x7F800000 | (mantissa << 13);
+            float f;
+            std::memcpy(&f, &r, sizeof(f));
+            return f;
+        }
+
+        uint32_t r = sign | ((exponent + 127 - 15) << 23) | (mantissa << 13);
+        float f;
+        std::memcpy(&f, &r, sizeof(f));
+        return f;
+    }
+    static uint16_t fp32_to_fp16(float f) {
+        uint32_t x;
+        std::memcpy(&x, &f, sizeof(f));
+
+        uint16_t sign = (x >> 16) & 0x8000;
+        int16_t exponent = ((x >> 23) & 0xFF) - 127 + 15; // adjust bias
+        uint32_t mantissa = x & 0x007FFFFF;
+
+        if (exponent <= 0) {
+            // Zero or subnormal
+            if (exponent < -10)
+                return sign;
+            mantissa = (mantissa | 0x00800000) >> (1 - exponent);
+            return sign | (mantissa + 0x00001000) >> 13;
+        }
+        if (exponent >= 31) {
+            // Infinity or NaN
+            return sign | 0x7C00;
+        }
+        // Normal number
+        return sign | (exponent << 10) | (mantissa >> 13);
+    }
 
   protected:
     std::vector<int> dims_;
@@ -280,6 +330,22 @@ template <typename T> class Tensor : public ITensor {
         data_.resize(num_elements());
         memcpy(data_.data(), data.data(), size_);
         toCPU();
+    }
+
+    // implicity fp convertor
+    void fillFP32ToCPU(std::vector<float> &data) {
+        if (typeid(T) == typeid(uint16_t)) {
+            data_.resize(num_elements());
+            for (int i = 0; i < num_elements(); i++) {
+                data_[i] = fp32_to_fp16(data[i]);
+            }
+        } else if (typeid(T) == typeid(float)) {
+            data_.resize(num_elements());
+            memcpy(data_.data(), data.data(), size_);
+            toCPU();
+        } else {
+            throw std::runtime_error("not convertedto fp16");
+        }
     }
 
     void reserveOnCPU() {

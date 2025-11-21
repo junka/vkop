@@ -14,7 +14,7 @@ if(CCACHE)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE})
 endif(CCACHE)
 
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O2 -g -Wall -Wextra -Werror -fno-omit-frame-pointer")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer")
 
 find_package(Vulkan REQUIRED)
 include_directories(${Vulkan_INCLUDE_DIRS})
@@ -34,6 +34,10 @@ list(FILTER SHADER_FILES EXCLUDE REGEX "activation\\.comp$")
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
 
+option(USE_FP16 "Enable usage of FP16" OFF)
+if(USE_FP16)
+    set(SHADER_FLAGS "-DFP16")
+endif()
 # Compile shaders to SPIR-V and convert to header
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
@@ -42,7 +46,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE}
+        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g -o ${SPIRV_FILE} ${SHADER_FLAGS}
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
@@ -117,6 +121,9 @@ if(USE_MEASURE_TIME)
 endif()
 if(USE_VMA)
     target_compile_definitions(vkop PUBLIC USE_VMA)
+endif()
+if(USE_FP16)
+    target_compile_definitions(vkop PUBLIC FP16)
 endif()
 
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)

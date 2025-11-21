@@ -27,6 +27,7 @@ set(TESTS
     ModelTest
     MatMulTest
     GemmTest
+    ReduceTest
 )
 
 find_package(PythonLibs REQUIRED)
@@ -39,6 +40,9 @@ endif()
 
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cpp)
+    if (USE_FP16)
+        target_compile_definitions(${TEST} PUBLIC FP16)
+    endif()
     target_link_libraries(${TEST} -Wl,--whole-archive vkop vload -Wl,--no-whole-archive -lpthread)
     if (PYTHONLIBS_FOUND)
         target_link_libraries(${TEST} ${PYTHON_LIBRARIES})

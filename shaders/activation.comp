@@ -1,6 +1,14 @@
 #ifndef ACTIVATION_COMP
 #define ACTIVATION_COMP
 
+#ifdef FP16
+#define FLOAT float16_t
+#define FLOAT4 f16vec4
+#else
+#define FLOAT float
+#define FLOAT4 vec4
+#endif
+
 // 激活函数类型枚举（需与 C++ 一致）
 #define ACTIVATION_NONE      0
 #define ACTIVATION_RELU      1
@@ -8,36 +16,41 @@
 #define ACTIVATION_TANH      3
 #define ACTIVATION_HSWISH    4
 #define ACTIVATION_MISH      5
+#define ACTIVATION_RELU6     6
 
-float activation(float x, int act_type) {
+FLOAT activation(FLOAT x, int act_type) {
     switch (act_type) {
         case ACTIVATION_RELU:
-            return max(0.0, x);
+            return FLOAT(max(FLOAT(0.0), x));
         case ACTIVATION_SIGMOID:
-            return 1.0 / (1.0 + exp(-x));
+            return FLOAT(FLOAT(1.0) / (FLOAT(1.0) + FLOAT(exp(-x))));
         case ACTIVATION_TANH:
-            return tanh(x);
+            return FLOAT(tanh(x));
         case ACTIVATION_HSWISH:
-            return x * clamp(x + 3.0, 0.0, 6.0) / 6.0;
+            return FLOAT(x * clamp(x + 3.0, 0.0, 6.0) / 6.0);
         case ACTIVATION_MISH:
-            return x * tanh(log(1.0 + exp(x)));
+            return FLOAT(x * tanh(log(1.0 + exp(x))));
+        case ACTIVATION_RELU6:
+            return FLOAT(clamp(x, FLOAT(0.0), FLOAT(6.0)));
         default:
             return x;
     }
 }
 
-vec4 activation(vec4 x, int act_type) {
+FLOAT4 activation(FLOAT4 x, int act_type) {
     switch (act_type) {
         case ACTIVATION_RELU:
-            return max(vec4(0.0), x);
+            return FLOAT4(max(FLOAT4(0.0), x));
         case ACTIVATION_SIGMOID:
-            return vec4(1.0) / (1.0 + exp(-x));
+            return FLOAT4(FLOAT4(1.0) / (1.0 + exp(-x)));
         case ACTIVATION_TANH:
-            return tanh(x);
+            return FLOAT4(tanh(x));
         case ACTIVATION_HSWISH:
-            return x * clamp(x + vec4(3.0), vec4(0.0), vec4(6.0)) / vec4(6.0);
+            return FLOAT4(x * clamp(x + FLOAT4(3.0), FLOAT4(0.0), FLOAT4(6.0)) / FLOAT4(6.0));
         case ACTIVATION_MISH:
-            return x * tanh(log(vec4(1.0) + exp(x)));
+            return FLOAT4(x * tanh(log(FLOAT4(1.0) + exp(x))));
+        case ACTIVATION_RELU6:
+            return FLOAT4(clamp(x, FLOAT4(0.0), FLOAT4(6.0)));
         default:
             return x;
     }

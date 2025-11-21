@@ -50,7 +50,7 @@ namespace {
  */
 template<typename T>
 void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared_ptr<Tensor<T>>& weight,
-    const std::shared_ptr<Tensor<T>>& bias, std::vector<T>& output, int batch, int ic, int oc,
+    const std::shared_ptr<Tensor<T>>& bias, std::vector<float>& output, int batch, int ic, int oc,
     int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
     int dilation_h, int dilation_w, int group) {
     // 计算输出张量的高度和宽度
@@ -94,14 +94,20 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 
                                 // 检查索引是否在输入张量范围内
                                 if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
-                                    x_value = (*input)[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                    if (typeid(T) == typeid(float)) {
+                                        x_value = (*input)[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                    } else if (typeid(T) == typeid(uint16_t)) {
+                                        x_value = vkop::core::ITensor::fp16_to_fp32((*input)[(((b * ic + sz) * ih + iy) * iw + ix)]);
+                                    }
                                 }
 
                                 // 获取卷积核的值
-                                // float y_value = weight[(((g_id * oc_group + oz % oc_group) * ic_group + sz % ic_group) * kh + ky) * kw + kx];
-                                float y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
-
-
+                                float y_value = 0.F;
+                                if (typeid(T) == typeid(float)) {
+                                    y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+                                } else if (typeid(T) == typeid(uint16_t)) {
+                                    y_value = vkop::core::ITensor::fp16_to_fp32((*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx]);
+                                }
                                 // 累加卷积结果
                                 sum += x_value * y_value;
                             }
@@ -111,7 +117,11 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
                     // 将卷积结果加上偏置并存储到输出张量
                     // 计算输出张量的偏移量
                     auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
-                    output.at(dest_offset) = sum + (*bias)[oz];
+                    if (typeid(T) == typeid(float)) {
+                        output.at(dest_offset) = sum + (*bias)[oz];
+                    } else if (typeid(T) == typeid(uint16_t)) {
+                        output.at(dest_offset) = sum + vkop::core::ITensor::fp16_to_fp32((*bias)[oz]);
+                    }
                 }
             }
         }
@@ -235,13 +245,23 @@ private:
             printf("%.4f, ", torch_bias[i]);
         }
 #endif
-        input_data_ = std::make_shared<Tensor<float>>(input_shape_);
-        input_data_->fillToCPU(torch_input);
-        output_data_ = torch_output;
+        input_data_ = std::make_shared<Tensor<T>>(input_shape_);
+        input_data_->fillFP32ToCPU(torch_input);
+        output_data_.resize(torch_output.size());
+        if (typeid(T) == typeid(float)) {
+            for (size_t i = 0; i < torch_output.size(); i++) {
+                output_data_[i] = torch_output[i];
+            }
+        } else {
+            for (size_t i = 0; i < torch_output.size(); i++) {
+                output_data_[i] = vkop::core::ITensor::fp32_to_fp16(torch_output[i]);
+            }
+        }
+        
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
-        weight_data_->fillToCPU(torch_weight);
+        weight_data_->fillFP32ToCPU(torch_weight);
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-        bias_data_->fillToCPU(torch_bias);
+        bias_data_->fillFP32ToCPU(torch_bias);
 
 #if USE_CPP_REFER
 
@@ -291,8 +311,11 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
+#ifdef FP16
+    Conv2dTest<uint16_t> ct;
+#else
     Conv2dTest<float> ct;
-
+#endif
     if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());

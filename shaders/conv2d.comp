@@ -18,10 +18,17 @@
 //      W_out = floor((W_in + 2*padding[1] - dilation[1]*(kW-1) - 1)/strides[1] + 1
 
 #version 440 core
-#extension GL_AMD_gpu_shader_half_float: enable
-// #define FLOAT4 f16vec4
 
+#ifdef FP16
+#extension GL_AMD_gpu_shader_half_float: enable
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#define FLOAT float16_t
+#define FLOAT4 f16vec4
+#else
+#define FLOAT float
 #define FLOAT4 vec4
+#endif
 
 #include "activation.comp"
 
@@ -34,7 +41,7 @@ layout(set=0, binding=1) uniform sampler2D uInput;
 layout(set=0, binding=2) uniform sampler2D uKernel;
 
 layout(set=0, binding=3) readonly buffer biasBuffer {
-    float attr[]; // bias[C_out]
+    FLOAT attr[]; // bias[C_out]
 } uBias;
 
 layout(push_constant) uniform constBuffer {
@@ -115,7 +122,7 @@ void main() {
 
                     // Read input (scalar per ic)
                     ivec2 inputCoord = ivec2(ix + ic4 * W_in, batch * H_in + iy);
-                    float input_val = texelFetch(uInput, inputCoord, 0)[ic_comp];
+                    FLOAT4 input_val = FLOAT4(texelFetch(uInput, inputCoord, 0)[ic_comp]);
 
                     // Read 4 weights at once: [w0, w1, w2, w3] for oc_vec
                     // weight layout: x = kx + ic4 * K_W, y = oc * K_H + ky
@@ -124,13 +131,13 @@ void main() {
                     ivec2 kernelCoord2 = ivec2(kx + ic4 * K_W, oc_vec.z * K_H + ky);
                     ivec2 kernelCoord3 = ivec2(kx + ic4 * K_W, oc_vec.w * K_H + ky);
 
-                    vec4 w0 = texelFetch(uKernel, kernelCoord0, 0);
-                    vec4 w1 = texelFetch(uKernel, kernelCoord1, 0);
-                    vec4 w2 = texelFetch(uKernel, kernelCoord2, 0);
-                    vec4 w3 = texelFetch(uKernel, kernelCoord3, 0);
+                    FLOAT4 w0 = FLOAT4(texelFetch(uKernel, kernelCoord0, 0));
+                    FLOAT4 w1 = FLOAT4(texelFetch(uKernel, kernelCoord1, 0));
+                    FLOAT4 w2 = FLOAT4(texelFetch(uKernel, kernelCoord2, 0));
+                    FLOAT4 w3 = FLOAT4(texelFetch(uKernel, kernelCoord3, 0));
 
                     // Extract the ic_comp-th component from each
-                    vec4 weights = vec4(
+                    FLOAT4 weights = FLOAT4(
                         w0[ic_comp],
                         w1[ic_comp],
                         w2[ic_comp],
@@ -150,7 +157,7 @@ void main() {
             int ic_start = g * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
 
-            float sum = 0.0;
+            FLOAT sum = FLOAT(0.0);
             for (int ic = ic_start; ic < ic_end; ++ic) {
                 int ic4 = ic / 4;
                 int ic_comp = ic % 4;
@@ -166,11 +173,11 @@ void main() {
                         if (ix < 0 || ix >= W_in) continue;
 
                         ivec2 inputCoord = ivec2(ix + ic4 * W_in, batch * H_in + iy);
-                        float input_val = texelFetch(uInput, inputCoord, 0)[ic_comp];
+                        FLOAT input_val = FLOAT4(texelFetch(uInput, inputCoord, 0))[ic_comp];
 
                         int kernel_x = kx + (ic - ic_start) /4 * K_W;
                         int kernel_y = ky + oc * K_H;
-                        float weight = texelFetch(uKernel, ivec2(kernel_x, kernel_y), 0)[(ic - ic_start) % 4];
+                        FLOAT weight = FLOAT4(texelFetch(uKernel, ivec2(kernel_x, kernel_y), 0))[(ic - ic_start) % 4];
 
                         sum += input_val * weight;
                     }
@@ -182,7 +189,7 @@ void main() {
 
     // Add bias
     if (uConstant.bias == 1) {
-        vec4 bias = vec4(0.0);
+        FLOAT4 bias = FLOAT4(0.0);
         for (int comp = 0; comp < 4; ++comp) {
             if (valid_oc[comp]) {
                 bias[comp] = uBias.attr[oc_vec[comp]];

@@ -7,6 +7,7 @@
 
 namespace vkop {
 namespace core {
+
 Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
                  std::shared_ptr<VulkanCommandPool> cmdpool,
                  const std::string &model_path, const std::string &cache_dir)
@@ -20,13 +21,39 @@ void Runtime::LoadModel() {
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
     std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
+    std::unordered_map<std::string, std::string> inputs_for_node_type;
+
+    // preprocess inputs, make sure we know node types for inputs
+    // we can then use type to tell whether we can use fp16 as option
+    for (const auto &n : model.nodes) {
+        for (const auto &in_shape : n.inputs) {
+            inputs_for_node_type[in_shape.name] = n.op_type;
+        }
+    }
+
     for (const auto &i : model.inputs) {
-        auto t = std::make_shared<Tensor<float>>(i.dims);
-        t->set_ref_cnt_forever();
-        inputs_[i.name] = t;
-        tensor_map[i.name] = t;
-        tensor_name_map[t] = i.name;
-        t->as_input_image(m_dev_, m_cmdpool_);
+
+#ifdef FP16
+        if (inputs_for_node_type.find(i.name) != inputs_for_node_type.end() &&
+            (inputs_for_node_type[i.name] == "Conv" ||
+             inputs_for_node_type[i.name] == "Add")) {
+            auto t = std::make_shared<Tensor<uint16_t>>(i.dims);
+            t->set_ref_cnt_forever();
+            inputs_[i.name] = t;
+            tensor_map[i.name] = t;
+            tensor_name_map[t] = i.name;
+            t->as_input_image(m_dev_, m_cmdpool_);
+        } else {
+#endif
+            auto t = std::make_shared<Tensor<float>>(i.dims);
+            t->set_ref_cnt_forever();
+            inputs_[i.name] = t;
+            tensor_map[i.name] = t;
+            tensor_name_map[t] = i.name;
+            t->as_input_image(m_dev_, m_cmdpool_);
+#ifdef FP16
+        }
+#endif
     }
 
     for (const auto &o : model.outputs) {
@@ -55,22 +82,57 @@ void Runtime::LoadModel() {
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
-            auto t = std::make_shared<Tensor<float>>(init.dims);
-            t->set_ref_cnt_forever();
-            if (t->num_dims() == 2 || t->num_dims() == 1) {
-                if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
-                    t->fillToCPU(init.dataf);
+#ifdef FP16
+            if (inputs_for_node_type.find(init.name) !=
+                    inputs_for_node_type.end() &&
+                (inputs_for_node_type[init.name] == "Conv" ||
+                 inputs_for_node_type[init.name] == "Add")) {
+                auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
+                t->set_ref_cnt_forever();
+                if (t->num_dims() == 2 || t->num_dims() == 1) {
+                    if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                        t->fillFP32ToCPU(init.dataf);
+                    } else {
+                        t->as_storage_buffer(m_dev_);
+                        std::vector<uint16_t> t_datah(t->num_elements());
+                        for (int i = 0; i < t->num_elements(); i++) {
+                            t_datah[i] = ITensor::fp32_to_fp16(init.dataf[i]);
+                        }
+
+                        t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
+                    }
                 } else {
-                    t->as_storage_buffer(m_dev_);
+                    t->as_input_image(m_dev_, m_cmdpool_);
+                    std::vector<uint16_t> t_datah(t->num_elements());
+                    for (int i = 0; i < t->num_elements(); i++) {
+                        t_datah[i] = ITensor::fp32_to_fp16(init.dataf[i]);
+                    }
+                    t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
+                }
+                tensor_map[init.name] = t;
+                tensor_name_map[t] = init.name;
+                initializers_[init.name] = t;
+            } else {
+#endif
+                auto t = std::make_shared<Tensor<float>>(init.dims);
+                t->set_ref_cnt_forever();
+                if (t->num_dims() == 2 || t->num_dims() == 1) {
+                    if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                        t->fillToCPU(init.dataf);
+                    } else {
+                        t->as_storage_buffer(m_dev_);
+                        t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+                    }
+                } else {
+                    t->as_input_image(m_dev_, m_cmdpool_);
                     t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
                 }
-            } else {
-                t->as_input_image(m_dev_, m_cmdpool_);
-                t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+                tensor_map[init.name] = t;
+                tensor_name_map[t] = init.name;
+                initializers_[init.name] = t;
+#ifdef FP16
             }
-            tensor_map[init.name] = t;
-            tensor_name_map[t] = init.name;
-            initializers_[init.name] = t;
+#endif
         } else {
             throw std::runtime_error(
                 "Only float32/int32 initializer is supported for now " +
@@ -80,8 +142,7 @@ void Runtime::LoadModel() {
 
     for (const auto &n : model.nodes) {
         auto t = vkop::ops::convert_opstring_to_enum(n.op_type);
-        if (t == vkop::ops::OpType::CONSTANT ||
-            t == vkop::ops::OpType::UNKNOWN) {
+        if (t == vkop::ops::OpType::UNKNOWN) {
             // make it as input for next ops
             continue;
         }
@@ -157,8 +218,13 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
 
 void Runtime::Run() {
     for (auto &p : inputs_) {
-        auto t = vkop::core::as_tensor<float>(p.second);
-        t->copyToGPU(m_dev_, m_cmdpool_);
+        if (p.second->dtype() == typeid(float)) {
+            auto t = vkop::core::as_tensor<float>(p.second);
+            t->copyToGPU(m_dev_, m_cmdpool_);
+        } else if (p.second->dtype() == typeid(uint16_t)) {
+            auto t = vkop::core::as_tensor<uint16_t>(p.second);
+            t->copyToGPU(m_dev_, m_cmdpool_);
+        }
     }
     auto start = std::chrono::steady_clock::now();
     for (size_t i = 0; i < node_ops_.size(); ++i) {
