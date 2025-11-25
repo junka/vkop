@@ -150,47 +150,20 @@ class Conv2d : public Operator {
         }
     }
 
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        std::vector<int> input_shape = inputs[0]->getShape();
+        std::vector<int> weight_shape = inputs[1]->getShape();
 
-        std::vector<int> input_shape;
-
-        auto preprocess_input = [&](auto type_tag) {
-            using TT = decltype(type_tag);
-            auto input = core::as_tensor<TT>(inputs[0]);
-            input_shape = input->getShape();
-        };
-
-        if (inputs[0]->dtype() == typeid(float)) {
-            preprocess_input(float{});
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            preprocess_input(uint16_t{});
-        }
-
-        std::vector<int> weight_shape;
         auto dummy =
             std::make_shared<VulkanBuffer>(m_dev_, 4,
                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                                                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        types_.clear();
-
-        auto preprocess_weight_and_bias = [&](auto type_tag) {
-            using TT = decltype(type_tag);
-            auto weight = core::as_tensor<TT>(inputs[1]);
-            auto bias =
-                (inputs.size() > 2) ? core::as_tensor<TT>(inputs[2]) : nullptr;
-            weight_shape = weight->getShape();
-        };
-
-        if (inputs[1]->dtype() == typeid(float)) {
-            preprocess_weight_and_bias(float{});
-        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
-            preprocess_weight_and_bias(uint16_t{});
-        }
 
         int batch = input_shape[0];
+        int depth = input_shape[1];
         int in_height = input_shape[2];
         int in_width = input_shape[3];
         int out_batch = batch;
@@ -204,8 +177,8 @@ class Conv2d : public Operator {
                             strides_[1] +
                         1;
         auto process_output = [&](auto type_tag) {
-            using TT = decltype(type_tag);
-            auto output = core::as_tensor<TT>(outputs[0]);
+            using T = decltype(type_tag);
+            auto output = core::as_tensor<T>(outputs[0]);
             if (output->size() == 0) {
                 output->resize(out_batch, out_depth, out_height, out_width);
             }
@@ -214,31 +187,23 @@ class Conv2d : public Operator {
             types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         };
-        if (outputs[0]->dtype() == typeid(float)) {
-            process_output(float{});
-        } else if (outputs[0]->dtype() == typeid(uint16_t)) {
-            process_output(uint16_t{});
-        }
+        dispatch_by_dtype(outputs[0]->dtype(), process_output);
 
         auto process_input = [&](auto type_tag) {
-            using TT = decltype(type_tag);
-            auto input = core::as_tensor<TT>(inputs[0]);
+            using T = decltype(type_tag);
+            auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
             types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         };
 
-        if (inputs[0]->dtype() == typeid(float)) {
-            process_input(float{});
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            process_input(uint16_t{});
-        }
+        dispatch_by_dtype(inputs[0]->dtype(), process_input);
 
         auto process_weight_and_bias = [&](auto type_tag) {
-            using TT = decltype(type_tag);
-            auto weight = core::as_tensor<TT>(inputs[1]);
+            using T = decltype(type_tag);
+            auto weight = core::as_tensor<T>(inputs[1]);
             auto bias =
-                (inputs.size() > 2) ? core::as_tensor<TT>(inputs[2]) : nullptr;
+                (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
             auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
@@ -248,44 +213,19 @@ class Conv2d : public Operator {
             objs_.emplace_back(weight_image);
             objs_.emplace_back(bias_buffer);
         };
-        if (inputs[1]->dtype() == typeid(float)) {
-            process_weight_and_bias(float{});
-        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
-            process_weight_and_bias(uint16_t{});
-        }
-    }
-
-    void execute(
-        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        std::vector<int> input_shape;
-        std::vector<int> weight_shape;
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            input_shape = input->getShape();
-
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            auto input = core::as_tensor<uint16_t>(inputs[0]);
-            input_shape = input->getShape();
-        }
+        dispatch_by_dtype(inputs[1]->dtype(), process_weight_and_bias);
 
         if (inputs[1]->dtype() == typeid(float)) {
-            auto output = core::as_tensor<float>(outputs[0]);
-            auto weight = core::as_tensor<float>(inputs[1]);
             auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
                                             : nullptr;
-            weight_shape = weight->getShape();
 
             if (bias)
                 bias->copyToGPU(m_dev_, m_cmdpool_);
 
         } else if (inputs[1]->dtype() == typeid(uint16_t)) {
-            auto output = core::as_tensor<uint16_t>(outputs[0]);
-            auto weight = core::as_tensor<uint16_t>(inputs[1]);
             auto bias = (inputs.size() > 2)
                             ? core::as_tensor<uint16_t>(inputs[2])
                             : nullptr;
-            weight_shape = weight->getShape();
 
             if (bias)
                 bias->copyToGPU(m_dev_, m_cmdpool_);
@@ -293,21 +233,6 @@ class Conv2d : public Operator {
             LOG_ERROR("Unsupported data type");
         }
 
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int in_height = input_shape[2];
-        int in_width = input_shape[3];
-
-        int out_batch = batch;
-        int out_depth = weight_shape[0];
-        int out_height = (in_height + 2 * pads_[0] -
-                          dilations_[0] * (weight_shape[2] - 1) - 1) /
-                             strides_[0] +
-                         1;
-        int out_width = (in_width + 2 * pads_[1] -
-                         dilations_[1] * (weight_shape[3] - 1) - 1) /
-                            strides_[1] +
-                        1;
         int realwidth = out_width * UP_DIV(out_depth, 4);
         int realheight = out_height * batch;
 

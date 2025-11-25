@@ -21,54 +21,39 @@ class UnaryFactory : public Operator {
   public:
     explicit UnaryFactory(OpType type) : Operator(type){};
 
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        if (output->size() == 0) {
-            output->resize(input->getShape());
-        }
-
-        auto input_image = input->as_input_image(m_dev_, m_cmd_);
-        auto output_image = output->as_output_image(m_dev_, m_cmd_);
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType()};
-        objs_ = {output_image, input_image};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
-
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(inputs[0]->getShape());
+            }
+            auto output_image = output->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto input = core::as_tensor<T>(inputs[0]);
+            auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
-            auto input_shape = input->getShape();
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int out_height = input_shape[2];
-            int out_width = input_shape[3];
+            types_.emplace_back(input_image->getDescriptorType());
+            objs_.emplace_back(input_image);
+        });
 
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
+        auto input_shape = inputs[0]->getShape();
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        int out_height = input_shape[2];
+        int out_width = input_shape[3];
 
-            submit(nullptr, 0, spv_, spv_len_, UP_DIV(realwidth, 16),
-                   UP_DIV(realheight, 16));
-        }
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
+
+        submit(nullptr, 0, spv_, spv_len_, UP_DIV(realwidth, 16),
+               UP_DIV(realheight, 16));
     }
 
   protected:

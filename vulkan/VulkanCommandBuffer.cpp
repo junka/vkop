@@ -89,11 +89,9 @@ int VulkanCommandBuffer::submit(VkQueue queue, VkFence fence) {
     submit_info.commandBufferCount = m_avail_;
     submit_info.pCommandBuffers = m_commandBuffers_.data();
     wait(fence);
-
     if (vkResetFences(m_device_, 1, &fence) != VK_SUCCESS) {
         throw std::runtime_error("Failed to reset fence!");
     }
-    assert(queue != nullptr);
     if (vkQueueSubmit(queue, 1, &submit_info, fence) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }

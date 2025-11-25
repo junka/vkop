@@ -258,7 +258,6 @@ void Runtime::Run() {
         //        vkop::ops::convert_openum_to_string(node_ops_[i]->get_type())
         //            .c_str(),
         //        node_input_tensors_[i].size());
-        node_ops_[i]->apply(node_input_tensors_[i], node_output_tensors_[i]);
         node_ops_[i]->execute(node_input_tensors_[i], node_output_tensors_[i]);
         for (auto &it : node_input_tensors_[i]) {
             auto t = vkop::core::as_tensor<float>(it);

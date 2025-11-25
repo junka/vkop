@@ -82,91 +82,65 @@ class GridSample : public Operator {
         }
     }
 
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        auto grid = core::as_tensor<T>(inputs[1]);
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
-        auto input_shape = input->getShape();
-        auto grid_shape = grid->getShape();
+        auto input_shape = inputs[0]->getShape();
+        auto grid_shape = inputs[1]->getShape();
+        if (input_shape.size() != 4 || grid_shape.size() != 4) {
+            throw std::invalid_argument(
+                "Input and grid must have 4 dimensions.");
+        }
 
         int batch = input_shape[0];
         int depth = input_shape[1];
         int out_height = grid_shape[1];
         int out_width = grid_shape[2];
 
-        if (output->size() == 0) {
-            output->resize(batch, depth, out_height, out_width);
-        }
-
-        auto input_image = input->as_input_image(m_dev_, m_cmd_);
-        auto output_image = output->as_output_image(m_dev_, m_cmd_);
-
-        auto weight_image = grid->as_input_image(m_dev_, m_cmd_);
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  weight_image->getDescriptorType()};
-        objs_ = {output_image, input_image, weight_image};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
-
-    void execute(
-        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
-            auto grid = core::as_tensor<float>(inputs[1]);
-
-            auto input_shape = input->getShape();
-            auto grid_shape = grid->getShape();
-
-            if (input_shape.size() != 4 || grid_shape.size() != 4) {
-                throw std::invalid_argument(
-                    "Input and grid must have 4 dimensions.");
+        int in_height = input_shape[2];
+        int in_width = input_shape[3];
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto outputptr = core::as_tensor<T>(outputs[0]);
+            if (outputptr->size() == 0) {
+                outputptr->resize(batch, depth, out_height, out_width);
             }
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int in_height = input_shape[2];
-            int in_width = input_shape[3];
-            int out_height = grid_shape[1];
-            int out_width = grid_shape[2];
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
 
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
-
-            gridsample::GpuGridSampleParam para;
-            para.outImgSize[0] = realwidth;
-            para.outImgSize[1] = realheight;
-            para.outImgSize[2] = 1;
-            para.outImgSize[3] = 0;
-            // original params
-            para.inShape[0] = in_width;
-            para.inShape[1] = in_height;
-            para.outShape[0] = out_width;
-            para.outShape[1] = out_height;
-            para.align_corners = align_corners_;
-            para.padding_mode = static_cast<int>(padding_mode_);
-            para.interpolation_mode = static_cast<int>(interpolation_mode_);
-
-            submit(&para, sizeof(gridsample::GpuGridSampleParam),
-                   grid_sample_spv, grid_sample_spv_len, UP_DIV(out_width, 16),
-                   UP_DIV(out_height, 16));
+        for (const auto &input : inputs) {
+            dispatch_by_dtype(input->dtype(), [&](auto t) {
+                using T = decltype(t);
+                auto inputptr = core::as_tensor<T>(input);
+                auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+                types_.emplace_back(input_image->getDescriptorType());
+                objs_.emplace_back(input_image);
+            });
         }
+
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
+
+        gridsample::GpuGridSampleParam para;
+        para.outImgSize[0] = realwidth;
+        para.outImgSize[1] = realheight;
+        para.outImgSize[2] = 1;
+        para.outImgSize[3] = 0;
+        // original params
+        para.inShape[0] = in_width;
+        para.inShape[1] = in_height;
+        para.outShape[0] = out_width;
+        para.outShape[1] = out_height;
+        para.align_corners = align_corners_;
+        para.padding_mode = static_cast<int>(padding_mode_);
+        para.interpolation_mode = static_cast<int>(interpolation_mode_);
+
+        submit(&para, sizeof(gridsample::GpuGridSampleParam), grid_sample_spv,
+               grid_sample_spv_len, UP_DIV(out_width, 16),
+               UP_DIV(out_height, 16));
     }
 
   private:

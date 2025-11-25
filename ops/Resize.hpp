@@ -124,14 +124,13 @@ class Resize : public Operator {
             size_ = parse_attr_list(attributes.at("size"));
         }
     }
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
+
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto sizes = core::as_tensor<int64_t>(inputs[3]);
 
-        auto input_shape = input->getShape();
+        auto input_shape = inputs[0]->getShape();
         if (input_shape.size() != 4) {
             throw std::invalid_argument("Input must have 4 dimensions.");
         }
@@ -165,102 +164,50 @@ class Resize : public Operator {
             out_height = input_shape[2] * scale;
             out_width = input_shape[3] * scale;
         }
-
-        if (output->size() == 0) {
-            output->resize(batch, depth, out_height, out_width);
-        }
-
-        auto input_image = input->as_input_image(m_dev_, m_cmd_);
-        auto output_image = output->as_output_image(m_dev_, m_cmd_);
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType()};
-        objs_ = {output_image, input_image};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
-
-    void execute(
-        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
-            auto roi = core::as_tensor<float>(inputs[1]);
-            auto scales = core::as_tensor<float>(inputs[2]);
-            auto sizes = core::as_tensor<int64_t>(inputs[3]);
-
-            auto input_shape = input->getShape();
-
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int out_height = input_shape[2];
-            int out_width = input_shape[3];
-
-            if (size_.size() == 4) {
-                size_[0] = size_[2];
-                size_[1] = size_[3];
-                size_.resize(2);
-            } else if (size_.empty()) {
-                size_.resize(2);
-                size_[0] =
-                    static_cast<int>((*sizes)[static_cast<std::size_t>(2)]);
-                size_[1] =
-                    static_cast<int>((*sizes)[static_cast<std::size_t>(3)]);
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto outputptr = core::as_tensor<T>(outputs[0]);
+            if (outputptr->size() == 0) {
+                outputptr->resize(batch, depth, out_height, out_width);
             }
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto inputptr = core::as_tensor<T>(inputs[0]);
+            auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+            types_.emplace_back(input_image->getDescriptorType());
+            objs_.emplace_back(input_image);
+        });
+        auto roi = core::as_tensor<float>(inputs[1]);
+        auto scales = core::as_tensor<float>(inputs[2]);
 
-            assert(axes_[0] == 2 && axes_[1] == 3);
-            assert(axes_.size() == size_.size());
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
 
-            if (keep_aspect_ratio_policy_ == 0) {
-                out_height = size_[0];
-                out_width = size_[1];
-            } else {
-                float h_scale = size_[0] / static_cast<float>(input_shape[2]);
-                float w_scale = size_[1] / static_cast<float>(input_shape[3]);
-                auto scale = keep_aspect_ratio_policy_ == 1
-                                 ? std::min(h_scale, w_scale)
-                                 : std::max(h_scale, w_scale);
-                out_height = input_shape[2] * scale;
-                out_width = input_shape[3] * scale;
-            }
+        resize::GpuResizeParam para;
+        para.outImgSize[0] = realwidth;
+        para.outImgSize[1] = realheight;
+        para.outImgSize[2] = 1;
+        para.outImgSize[3] = 0;
+        para.inShape[0] = input_shape[0];
+        para.inShape[1] = input_shape[1];
+        para.inShape[2] = input_shape[2];
+        para.inShape[3] = input_shape[3];
+        para.outShape[0] = batch;
+        para.outShape[1] = depth;
+        para.outShape[2] = out_height;
+        para.outShape[3] = out_width;
+        para.mode = mode_;
+        para.nearest_mode = nearest_mode_;
+        para.antialias = antialias_;
+        para.coordinate_transformation_mode = coordinate_transformation_mode_;
+        para.cubic_coeff_a = cubic_coeff_a_;
 
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
-
-            resize::GpuResizeParam para;
-            para.outImgSize[0] = realwidth;
-            para.outImgSize[1] = realheight;
-            para.outImgSize[2] = 1;
-            para.outImgSize[3] = 0;
-            para.inShape[0] = input_shape[0];
-            para.inShape[1] = input_shape[1];
-            para.inShape[2] = input_shape[2];
-            para.inShape[3] = input_shape[3];
-            para.outShape[0] = batch;
-            para.outShape[1] = depth;
-            para.outShape[2] = out_height;
-            para.outShape[3] = out_width;
-            para.mode = mode_;
-            para.nearest_mode = nearest_mode_;
-            para.antialias = antialias_;
-            para.coordinate_transformation_mode =
-                coordinate_transformation_mode_;
-            para.cubic_coeff_a = cubic_coeff_a_;
-
-            submit(&para, sizeof(resize::GpuResizeParam), resize_spv,
-                   resize_spv_len, realwidth, realheight);
-        }
+        submit(&para, sizeof(resize::GpuResizeParam), resize_spv,
+               resize_spv_len, realwidth, realheight);
     }
 
   private:

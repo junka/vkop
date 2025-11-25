@@ -69,12 +69,18 @@ public:
                 auto output = std::make_shared<Tensor<T>>();
                 output->toGPU();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
-                op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
                     if (!input || input->num_dims() < 2) {
                         continue;
                     }
+                    if (input->num_dims() == 2) {
+                        auto t = core::as_tensor<T>(input);
+                        t->as_storage_buffer(dev);
+                        t->copyToGPU(dev, cmdpool);
+                        continue;
+                    }
                     auto t = core::as_tensor<T>(input);
+                    t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
                 op->execute(inputs, outputs);
@@ -157,15 +163,21 @@ public:
                 auto output = std::make_shared<Tensor<T>>();
                 output->toGPU();
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
-                op->apply(inputs, outputs);
                 for (const auto &input : inputs) {
                     if (!input || input->num_dims() < 2) {
                         continue;
                     }
+                    if (input->num_dims() == 2) {
+                        auto t = core::as_tensor<T>(input);
+                        t->as_storage_buffer(dev);
+                        t->copyToGPU(dev, cmdpool);
+                        continue;
+                    }
                     auto t = core::as_tensor<T>(input);
+                    t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
-                op->execute(inputs, std::vector<std::shared_ptr<core::ITensor>> {output});
+                op->execute(inputs, outputs);
                 output->copyToCPU(dev, cmdpool);
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {

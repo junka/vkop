@@ -50,53 +50,31 @@ class BatchNorm2d : public Operator {
         }
     }
 
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        auto running_mean = core::as_tensor<T>(inputs[1]);
-        auto running_var = core::as_tensor<T>(inputs[2]);
-
-        auto weight =
-            (inputs.size() > 3) ? core::as_tensor<T>(inputs[3]) : nullptr;
-        auto bias =
-            (inputs.size() > 4) ? core::as_tensor<T>(inputs[4]) : nullptr;
-
-        auto input_shape = input->getShape();
-
-        if (output->size() == 0) {
-            output->resize(input->getShape());
-        }
-
-        auto input_image = input->as_input_image(m_dev_, m_cmd_);
-        auto output_image = output->as_output_image(m_dev_, m_cmd_);
-        tensorBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, running_mean->size() * 4,
-            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType(),
-                  tensorBuffer_->getDescriptorType()};
-        objs_ = {output_image, input_image, tensorBuffer_};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        }
-    }
-
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto input_shape = inputs[0]->getShape();
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto outputptr = core::as_tensor<T>(outputs[0]);
+            if (outputptr->size() == 0) {
+                outputptr->resize(input_shape);
+            }
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
+
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto inputptr = core::as_tensor<T>(inputs[0]);
+            auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+            types_.emplace_back(input_image->getDescriptorType());
+            objs_.emplace_back(input_image);
+        });
+
         if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
             auto running_mean = core::as_tensor<float>(inputs[1]);
             auto running_var = core::as_tensor<float>(inputs[2]);
 
@@ -106,7 +84,6 @@ class BatchNorm2d : public Operator {
             auto bias = (inputs.size() > 4) ? core::as_tensor<float>(inputs[4])
                                             : nullptr;
 
-            auto input_shape = input->getShape();
             int batch = input_shape[0];
             int depth = input_shape[1];
             int out_height = input_shape[2];
@@ -122,6 +99,15 @@ class BatchNorm2d : public Operator {
             para.outShape[1] = depth;
             para.outShape[2] = out_height;
             para.outShape[3] = out_width;
+
+            tensorBuffer_ = std::make_shared<VulkanBuffer>(
+                m_dev_, running_mean->size() * 4,
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+
+            types_.emplace_back(tensorBuffer_->getDescriptorType());
+            objs_.push_back(tensorBuffer_);
 
             auto *var_buffer =
                 static_cast<float *>(tensorBuffer_->getMappedMemory());

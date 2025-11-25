@@ -243,7 +243,7 @@ int main(int argc, char *argv[]) {
             data.shrink_to_fit();
         }
 
-        for (int i = 0; i < 10000; i ++) {
+        for (int i = 0; i < 1000; i ++) {
             rt->Run();
         }
         rt->ReadResult();

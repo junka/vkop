@@ -34,6 +34,7 @@ class ITensor {
     void ref_inc() { ref_cnt_++; }
     int ref_cnt() const { return ref_cnt_; }
     void set_ref_cnt_forever() { ref_cnt_ = std::numeric_limits<int>::max(); }
+    std::vector<int> getShape() { return dims_; }
 
     static float fp16_to_fp32(uint16_t h) {
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
@@ -93,6 +94,7 @@ class ITensor {
     }
 
   protected:
+    int size_;
     int ref_cnt_ = 0;
     bool converted_ = false;
     std::vector<int> dims_;
@@ -197,8 +199,6 @@ template <typename T> class Tensor : public ITensor {
         }
         return data_[index];
     }
-
-    std::vector<int> getShape() { return dims_; }
 
     int size() { return size_; }
     int num_elements() { return size_ / sizeof(T); }
@@ -374,7 +374,6 @@ template <typename T> class Tensor : public ITensor {
     }
 
   private:
-    int size_;
     std::shared_ptr<VulkanResource> vkobj_;
     std::vector<T> data_;
 
@@ -521,18 +520,21 @@ template <typename T> class Tensor : public ITensor {
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
-        std::vector<T> rgba((realheight * realwidth * 4));
+        auto imagesize = img->getImageSize();
+        assert(realheight * realwidth * 4 * sizeof(T) ==
+               static_cast<size_t>(imagesize));
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
+            std::vector<T> rgba((realheight * realwidth * 4));
             img->hostImageCopyToHost(rgba.data());
+            convertRGBAToTensor(rgba.data());
         } else
 #endif
         {
             VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
                                     cmdpool->getSemaphore());
 
-            auto imagesize = img->getImageSize();
             auto stpool = cmdpool->getStagingBufferPool();
             uint64_t completed_timeline_value =
                 cmdpool->getCompletedTimelineValue();
@@ -551,10 +553,9 @@ template <typename T> class Tensor : public ITensor {
             cmd.submit(dev->getComputeQueue(), submit_value);
             stpool->markSubmit(submit_value);
             cmd.wait(submit_value);
-            std::memcpy(rgba.data(), b->ptr, imagesize);
+            convertRGBAToTensor(static_cast<T *>(b->ptr));
         }
 
-        convertRGBAToTensor(rgba.data());
         toCPU();
     }
 

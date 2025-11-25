@@ -114,131 +114,72 @@ class Maxpool2d : public Operator {
             strides_ = kernel_shape_;
         }
     }
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-
-        auto input_shape = input->getShape();
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-
-        int out_height;
-        int out_width;
-        if (ceil_mode_) {
-            out_height =
-                (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
-                 2 * pads_[0] + strides_[0] - 1) /
-                    strides_[0] +
-                1;
-            out_width =
-                (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
-                 2 * pads_[1] + strides_[1] - 1) /
-                    strides_[1] +
-                1;
-        } else {
-            out_height =
-                (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
-                 2 * pads_[0] - 1) /
-                    strides_[0] +
-                1;
-            out_width =
-                (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
-                 2 * pads_[1] - 1) /
-                    strides_[1] +
-                1;
-        }
-
-        if (output->size() == 0) {
-            output->resize(batch, depth, out_height, out_width);
-        }
-
-        auto input_image = input->as_input_image(m_dev_, m_cmd_);
-        auto output_image = output->as_output_image(m_dev_, m_cmd_);
-
-        types_ = {output_image->getDescriptorType(),
-                  input_image->getDescriptorType()};
-        objs_ = {output_image, input_image};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
-            auto input_shape = input->getShape();
+        auto input_shape = inputs[0]->getShape();
 
-            if (input_shape.size() != 4) {
-                throw std::invalid_argument("Input must have 4 dimensions.");
-            }
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-
-            int out_height;
-            int out_width;
-            if (ceil_mode_) {
-                out_height =
-                    (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
-                     2 * pads_[0] + strides_[0] - 1) /
-                        strides_[0] +
-                    1;
-                out_width =
-                    (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
-                     2 * pads_[1] + strides_[1] - 1) /
-                        strides_[1] +
-                    1;
-            } else {
-                out_height =
-                    (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
-                     2 * pads_[0] - 1) /
-                        strides_[0] +
-                    1;
-                out_width =
-                    (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
-                     2 * pads_[1] - 1) /
-                        strides_[1] +
-                    1;
-            }
-
-            int realwidth = out_width * UP_DIV(depth, 4);
-            int realheight = out_height * batch;
-
-            maxpool2d::GpuMaxpoolParam para;
-
-            para.inputSize[0] = input_shape[3];
-            para.inputSize[1] = input_shape[2];
-            para.inputSize[2] = UP_DIV(depth, 4);
-            para.inputSize[3] = batch;
-            para.outputSize[0] = out_width;
-            para.outputSize[1] = out_height;
-            para.outputSize[2] = UP_DIV(depth, 4);
-            para.outputSize[3] = batch;
-
-            para.pad[0] = pads_[0];
-            para.pad[1] = pads_[1];
-            para.kernelSize[0] = kernel_shape_[0];
-            para.kernelSize[1] = kernel_shape_[1];
-            para.stride[0] = strides_[0];
-            para.stride[1] = strides_[1];
-
-            submit(&para, sizeof(maxpool2d::GpuMaxpoolParam), maxpool2d_spv,
-                   maxpool2d_spv_len, UP_DIV(realwidth, 16),
-                   UP_DIV(realheight, 16));
+        if (input_shape.size() != 4) {
+            throw std::invalid_argument("Input must have 4 dimensions.");
         }
+
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+
+        int out_height =
+            (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
+             2 * pads_[0] + (ceil_mode_ ? strides_[0] : 0) - 1) /
+                strides_[0] +
+            1;
+        int out_width =
+            (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
+             2 * pads_[1] + (ceil_mode_ ? strides_[1] : 0) - 1) /
+                strides_[1] +
+            1;
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(batch, depth, out_height, out_width);
+            }
+            auto output_image = output->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto input = core::as_tensor<T>(inputs[0]);
+            auto input_image = input->as_input_image(m_dev_, m_cmd_);
+
+            types_.emplace_back(input_image->getDescriptorType());
+            objs_.emplace_back(input_image);
+        });
+        int realwidth = out_width * UP_DIV(depth, 4);
+        int realheight = out_height * batch;
+
+        maxpool2d::GpuMaxpoolParam para;
+
+        para.inputSize[0] = input_shape[3];
+        para.inputSize[1] = input_shape[2];
+        para.inputSize[2] = UP_DIV(depth, 4);
+        para.inputSize[3] = batch;
+        para.outputSize[0] = out_width;
+        para.outputSize[1] = out_height;
+        para.outputSize[2] = UP_DIV(depth, 4);
+        para.outputSize[3] = batch;
+
+        para.pad[0] = pads_[0];
+        para.pad[1] = pads_[1];
+        para.kernelSize[0] = kernel_shape_[0];
+        para.kernelSize[1] = kernel_shape_[1];
+        para.stride[0] = strides_[0];
+        para.stride[1] = strides_[1];
+
+        submit(&para, sizeof(maxpool2d::GpuMaxpoolParam), maxpool2d_spv,
+               maxpool2d_spv_len, UP_DIV(realwidth, 16),
+               UP_DIV(realheight, 16));
     }
 
   private:

@@ -65,54 +65,42 @@ class Reduce : public Operator {
     }
     template <typename T>
     void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input = core::as_tensor<T>(inputs[0]);
-        auto output = core::as_tensor<T>(outputs[0]);
-        if (output->size() == 0) {
-            output->resize(input->getShape());
-        }
-
-        auto input_buffer = input->as_storage_buffer(m_dev_);
-        auto output_buffer = output->as_storage_buffer(m_dev_);
-
-        types_ = {output_buffer->getDescriptorType(),
-                  input_buffer->getDescriptorType()};
-        objs_ = {output_buffer, input_buffer};
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
+                 std::vector<std::shared_ptr<core::ITensor>> outputs) {}
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input = core::as_tensor<float>(inputs[0]);
-            auto output = core::as_tensor<float>(outputs[0]);
+        auto input_shape = inputs[0]->getShape();
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto outputptr = core::as_tensor<T>(outputs[0]);
+            if (outputptr->size() == 0) {
+                outputptr->resize(input_shape);
+            }
+            auto output_buffer = outputptr->as_storage_buffer(m_dev_);
+            types_.emplace_back(output_buffer->getDescriptorType());
+            objs_.emplace_back(output_buffer);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto inputptr = core::as_tensor<T>(inputs[0]);
+            auto input_buffer = inputptr->as_storage_buffer(m_dev_);
+            types_.emplace_back(input_buffer->getDescriptorType());
+            objs_.emplace_back(input_buffer);
+        });
 
-            auto input_shape = input->getShape();
-            int h = input_shape[0];
-            int w = input_shape[1];
+        int h = input_shape[0];
+        int w = input_shape[1];
 
-            resize::GpuReduceParam para;
-            para.H = h;
-            para.W = w;
-            para.norm_type = norm_type_;
-            para.keepdims = keepdims_;
-            para.noop_with_empty_axes = noop_with_empty_axes_;
+        resize::GpuReduceParam para;
+        para.H = h;
+        para.W = w;
+        para.norm_type = norm_type_;
+        para.keepdims = keepdims_;
+        para.noop_with_empty_axes = noop_with_empty_axes_;
 
-            submit(&para, sizeof(resize::GpuReduceParam), reduce_spv,
-                   reduce_spv_len, UP_DIV(h, 16), UP_DIV(w, 16));
-        }
+        submit(&para, sizeof(resize::GpuReduceParam), reduce_spv,
+               reduce_spv_len, UP_DIV(h, 16), UP_DIV(w, 16));
     }
 
   private:

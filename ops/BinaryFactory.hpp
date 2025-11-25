@@ -20,64 +20,29 @@ class BinaryFactory : public Operator {
   public:
     explicit BinaryFactory(OpType type) : Operator(type) {}
 
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {
-        auto input_a = core::as_tensor<T>(inputs[0]);
-        auto input_b = core::as_tensor<T>(inputs[1]);
-        auto input_shape = input_a->getShape();
-        types_.clear();
-        if (outputs[0]->dtype() == typeid(float)) {
-            auto output = core::as_tensor<float>(outputs[0]);
-            if (output->size() == 0) {
-                output->resize(input_shape);
-            }
-            auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
-            objs_.emplace_back(output_image);
-        } else {
-            auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
-                output->resize(input_shape);
-            }
-            auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
-            objs_.emplace_back(output_image);
-        }
-        auto inputa_image = input_a->as_input_image(m_dev_, m_cmd_);
-        auto inputb_image = input_b->as_input_image(m_dev_, m_cmd_);
-
-        types_.emplace_back(inputa_image->getDescriptorType());
-        types_.emplace_back(inputb_image->getDescriptorType());
-        objs_.emplace_back(inputa_image);
-        objs_.emplace_back(inputb_image);
-    }
-
-    void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (inputs[0]->dtype() == typeid(float)) {
-            prepare<float>(inputs, outputs);
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            prepare<uint16_t>(inputs, outputs);
-        } else {
-            LOG_ERROR("Unsupported data type");
-        }
-    }
-
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        std::vector<int> input_shape;
-        (void)outputs;
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto input_a = core::as_tensor<float>(inputs[0]);
-            input_shape = input_a->getShape();
-        } else if (inputs[0]->dtype() == typeid(uint16_t)) {
-            auto input_a = core::as_tensor<uint16_t>(inputs[0]);
-            input_shape = input_a->getShape();
-        } else {
-            LOG_ERROR("Unsupported data type");
+        std::vector<int> input_shape = inputs[0]->getShape();
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto outputptr = core::as_tensor<T>(outputs[0]);
+            if (outputptr->size() == 0) {
+                outputptr->resize(input_shape);
+            }
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            types_.emplace_back(output_image->getDescriptorType());
+            objs_.emplace_back(output_image);
+        });
+
+        for (const auto &input : inputs) {
+            dispatch_by_dtype(input->dtype(), [&](auto t) {
+                using T = decltype(t);
+                auto inputptr = core::as_tensor<T>(input);
+                auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+                types_.emplace_back(input_image->getDescriptorType());
+                objs_.emplace_back(input_image);
+            });
         }
         int batch = input_shape[0];
         int depth = input_shape[1];

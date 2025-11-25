@@ -67,10 +67,6 @@ class Operator {
     execute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
             const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
 
-    virtual void
-    apply(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-          const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
-
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
@@ -81,6 +77,31 @@ class Operator {
     // release them in the end of the execution.
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
+
+    using SupportedTypes = std::tuple<float, uint16_t>;
+    template <typename Func>
+    void dispatch_by_dtype(const std::type_info &dtype, Func &&func) {
+        bool dispatched = false;
+
+        std::apply(
+            [&](auto... types) {
+                (([&] {
+                     using T = decltype(types);
+                     if (dtype == typeid(T)) {
+                         func.template operator()<T>(T{});
+                         dispatched = true;
+                     }
+                 }()),
+                 ...);
+            },
+            SupportedTypes{});
+
+        if (!dispatched) {
+            throw std::runtime_error(
+                "Unsupported dtype: " + std::string(dtype.name()) +
+                ". Supported: float, uint16_t (fp16)");
+        }
+    }
 
     virtual void submit(void *ptr, size_t pc_size, const unsigned char *spv,
                         unsigned int spv_len, int out_width, int out_height) {
@@ -114,6 +135,7 @@ class Operator {
 #endif
         objs_.clear();
         objs_.shrink_to_fit();
+        types_.clear();
     }
 };
 
