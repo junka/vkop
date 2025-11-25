@@ -32,7 +32,7 @@ class BinaryFactory : public Operator {
             if (output->size() == 0) {
                 output->resize(input_shape);
             }
-            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            auto output_image = output->as_output_image(m_dev_, m_cmd_);
             types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         } else {
@@ -40,12 +40,12 @@ class BinaryFactory : public Operator {
             if (output->size() == 0) {
                 output->resize(input_shape);
             }
-            auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+            auto output_image = output->as_output_image(m_dev_, m_cmd_);
             types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         }
-        auto inputa_image = input_a->as_input_image(m_dev_, m_cmdpool_);
-        auto inputb_image = input_b->as_input_image(m_dev_, m_cmdpool_);
+        auto inputa_image = input_a->as_input_image(m_dev_, m_cmd_);
+        auto inputb_image = input_b->as_input_image(m_dev_, m_cmd_);
 
         types_.emplace_back(inputa_image->getDescriptorType());
         types_.emplace_back(inputb_image->getDescriptorType());

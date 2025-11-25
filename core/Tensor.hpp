@@ -93,9 +93,9 @@ class ITensor {
     }
 
   protected:
-    std::vector<int> dims_;
-    bool converted_ = false;
     int ref_cnt_ = 0;
+    bool converted_ = false;
+    std::vector<int> dims_;
 };
 
 template <typename T> class Tensor : public ITensor {
@@ -146,7 +146,6 @@ template <typename T> class Tensor : public ITensor {
             data_.resize(size_ / sizeof(T));
     }
 
-    // one ptr save in operater, so it is at least 2
     void resize(int len) {
         if (len == 0) {
             if (is_on_GPU()) {
@@ -229,7 +228,7 @@ template <typename T> class Tensor : public ITensor {
     }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
-                   std::shared_ptr<VulkanCommandPool> &cmdpool) {
+                   std::shared_ptr<VulkanCommandBuffer> cmd) {
         if (!vkobj_) {
             int exflags = 0;
             if (vd->is_support_host_image_copy()) {
@@ -248,12 +247,11 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            auto *device = vd->getLogicalDevice();
-            VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
-            cmd.begin();
-            img->readBarrier(cmd.get());
-            cmd.end();
-            cmd.submit(vd->getComputeQueue());
+            if (cmd) {
+                cmd->begin();
+                img->readBarrier(cmd->get());
+                cmd->end();
+            }
         }
 
         return img;
@@ -261,7 +259,7 @@ template <typename T> class Tensor : public ITensor {
 
     std::shared_ptr<VulkanImage>
     as_output_image(std::shared_ptr<VulkanDevice> &vd,
-                    std::shared_ptr<VulkanCommandPool> &cmdpool) {
+                    std::shared_ptr<VulkanCommandBuffer> cmd) {
         if (!vkobj_) {
             int exflags = 0;
             if (vd->is_support_host_image_copy()) {
@@ -285,12 +283,11 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            auto *device = vd->getLogicalDevice();
-            VulkanCommandBuffer cmd(device, cmdpool->getCommandPool());
-            cmd.begin();
-            img->writeBarrier(cmd.get());
-            cmd.end();
-            cmd.submit(vd->getComputeQueue());
+            if (cmd) {
+                cmd->begin();
+                img->writeBarrier(cmd->get());
+                cmd->end();
+            }
         }
 
         return img;
@@ -331,6 +328,11 @@ template <typename T> class Tensor : public ITensor {
         memcpy(data_.data(), data.data(), size_);
         toCPU();
     }
+    void fillToCPU(T *data) {
+        data_.resize(num_elements());
+        memcpy(data_.data(), data, size_);
+        toCPU();
+    }
 
     // implicity fp convertor
     void fillFP32ToCPU(std::vector<float> &data) {
@@ -347,6 +349,20 @@ template <typename T> class Tensor : public ITensor {
             throw std::runtime_error("not convertedto fp16");
         }
     }
+    void fillFP32ToCPU(float *data) {
+        if (typeid(T) == typeid(uint16_t)) {
+            data_.resize(num_elements());
+            for (int i = 0; i < num_elements(); i++) {
+                data_[i] = fp32_to_fp16(data[i]);
+            }
+        } else if (typeid(T) == typeid(float)) {
+            data_.resize(num_elements());
+            memcpy(data_.data(), data, size_);
+            toCPU();
+        } else {
+            throw std::runtime_error("not convertedto fp16");
+        }
+    }
 
     void reserveOnCPU() {
         if (is_on_GPU()) {
@@ -358,21 +374,24 @@ template <typename T> class Tensor : public ITensor {
     }
 
   private:
-    std::vector<T> data_;
     int size_;
     std::shared_ptr<VulkanResource> vkobj_;
+    std::vector<T> data_;
 
     void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         if (vkobj_) {
             return;
         }
+        VkFormat format =
+            ((sizeof(T) == 1)
+                 ? VK_FORMAT_R8G8B8A8_UINT
+                 : ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
+                                     : VK_FORMAT_R32G32B32A32_SFLOAT));
         vkobj_ = std::make_shared<VulkanImage>(
             vd,
             VkExtent3D{static_cast<uint32_t>(dims_[3] * UP_DIV(dims_[1], 4)),
                        static_cast<uint32_t>(dims_[2] * dims_[0]), 1},
-            flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
-            ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
-                              : VK_FORMAT_R32G32B32A32_SFLOAT));
+            flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, format);
     }
 
     void copyToGPUBuffer(const std::shared_ptr<VulkanDevice> &dev,
@@ -406,6 +425,7 @@ template <typename T> class Tensor : public ITensor {
         uint64_t submit_value = cmdpool->getNextSubmitValue();
         cmd.submit(dev->getComputeQueue(), submit_value);
         stpool->markSubmit(submit_value);
+        cmd.wait(submit_value);
         toGPU();
     }
     void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
@@ -431,7 +451,7 @@ template <typename T> class Tensor : public ITensor {
             cmd.begin();
             img->readBarrier(cmd.get());
             cmd.end();
-            cmd.submit(dev->getComputeQueue());
+            cmd.submit(dev->getComputeQueue(), cmdpool->getFence());
         } else
 #endif
         {
@@ -455,6 +475,7 @@ template <typename T> class Tensor : public ITensor {
             uint64_t submit_value = cmdpool->getNextSubmitValue();
             cmd.submit(dev->getComputeQueue(), submit_value);
             stpool->markSubmit(submit_value);
+            cmd.wait(submit_value);
         }
         toGPU();
     }
@@ -483,6 +504,7 @@ template <typename T> class Tensor : public ITensor {
         uint64_t submit_value = cmdpool->getNextSubmitValue();
         cmd.submit(dev->getComputeQueue(), submit_value);
         stpool->markSubmit(submit_value);
+        cmd.wait(submit_value);
         std::memcpy(data_.data(), b->ptr, size_);
         toCPU();
     }
@@ -528,6 +550,7 @@ template <typename T> class Tensor : public ITensor {
             uint64_t submit_value = cmdpool->getNextSubmitValue();
             cmd.submit(dev->getComputeQueue(), submit_value);
             stpool->markSubmit(submit_value);
+            cmd.wait(submit_value);
             std::memcpy(rgba.data(), b->ptr, imagesize);
         }
 

@@ -13,6 +13,7 @@ class VulkanCommandBuffer {
                         VkSemaphore semaphore = VK_NULL_HANDLE, int count = 1);
     ~VulkanCommandBuffer();
 
+    VulkanCommandBuffer() = delete;
     // Allocate command buffers
     void allocate(int count);
 
@@ -27,12 +28,16 @@ class VulkanCommandBuffer {
     void bind(VulkanPipeline &pipeline);
 
     // Submit the command buffer to a queue
-    int submit(VkQueue queue, VkFence fence = VK_NULL_HANDLE);
+    int submit(VkQueue queue, VkFence fence);
     // Submit the command buffer to a queue with timeline semaphore
     int submit(VkQueue queue, uint64_t submitValue);
 
     // Reset the command buffer
-    void reset(int idx = 0);
+    void reset(int idx);
+    void reset();
+
+    int wait(VkFence fence);
+    int wait(uint64_t waitValue);
 
     // Get the Vulkan command buffer handle
     VkCommandBuffer get() const { return m_commandBuffers_[m_avail_]; }

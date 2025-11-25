@@ -86,13 +86,18 @@ void VulkanCommandBuffer::end(int idx) {
 int VulkanCommandBuffer::submit(VkQueue queue, VkFence fence) {
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = m_commandBuffers_.size();
+    submit_info.commandBufferCount = m_avail_;
     submit_info.pCommandBuffers = m_commandBuffers_.data();
+    wait(fence);
 
+    if (vkResetFences(m_device_, 1, &fence) != VK_SUCCESS) {
+        throw std::runtime_error("Failed to reset fence!");
+    }
+    assert(queue != nullptr);
     if (vkQueueSubmit(queue, 1, &submit_info, fence) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
-    return vkQueueWaitIdle(queue);
+    return 0;
 }
 
 int VulkanCommandBuffer::submit(VkQueue queue, uint64_t submitValue) {
@@ -114,7 +119,25 @@ int VulkanCommandBuffer::submit(VkQueue queue, uint64_t submitValue) {
     if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
-    return vkQueueWaitIdle(queue);
+    return 0;
+}
+
+int VulkanCommandBuffer::wait(VkFence fence) {
+    return vkWaitForFences(m_device_, 1, &fence, VK_TRUE, UINT64_MAX);
+}
+int VulkanCommandBuffer::wait(uint64_t waitValue) {
+    // uint64_t currentValue;
+    // vkGetSemaphoreCounterValue(m_device_, m_semaphore_, &currentValue);
+    // if (currentValue >= waitValue) {
+    //     // Work is complete
+    // }
+
+    VkSemaphoreWaitInfo wait_info{};
+    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+    wait_info.semaphoreCount = 1;
+    wait_info.pSemaphores = &m_semaphore_;
+    wait_info.pValues = &waitValue;
+    return vkWaitSemaphores(m_device_, &wait_info, UINT64_MAX);
 }
 
 void VulkanCommandBuffer::reset(int idx) {
@@ -123,6 +146,12 @@ void VulkanCommandBuffer::reset(int idx) {
     }
 }
 
+void VulkanCommandBuffer::reset() {
+    for (int i = 0; i < m_avail_; i++) {
+        reset(i);
+    }
+    m_avail_ = 0;
+}
 void VulkanCommandBuffer::push_constants(VulkanPipeline &pipeline,
                                          uint32_t size, const void *ptr) {
     vkCmdPushConstants(m_commandBuffers_[m_avail_],

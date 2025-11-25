@@ -27,7 +27,6 @@ namespace vkop {
     PFN(vkBeginCommandBuffer)                                                  \
     PFN(vkEndCommandBuffer)                                                    \
     PFN(vkQueueSubmit)                                                         \
-    PFN(vkQueueWaitIdle)                                                       \
     PFN(vkCreateBuffer)                                                        \
     PFN(vkCreateQueryPool)                                                     \
     PFN(vkCreateDescriptorPool)                                                \
@@ -95,7 +94,9 @@ namespace vkop {
     PFN(vkGetSemaphoreCounterValue)                                            \
     PFN(vkDestroySemaphore)                                                    \
     PFN(vkCmdFillBuffer)                                                       \
-    PFN(vkCmdPushConstants)
+    PFN(vkCmdPushConstants)                                                    \
+    PFN(vkWaitSemaphores)                                                      \
+    PFN(vkResetFences)
 
 class VulkanLib {
   public:

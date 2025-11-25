@@ -219,8 +219,8 @@ int main(int argc, char *argv[]) {
         rt->LoadModel();
 
         auto input = rt->GetInput("input.1");
-        int tensor_h;
-        int tensor_w;
+        int tensor_h = 0;
+        int tensor_w = 0;
         if (input->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(input);
             tensor_h = t->getShape()[2];
@@ -243,7 +243,7 @@ int main(int argc, char *argv[]) {
             data.shrink_to_fit();
         }
 
-        for (int i = 0; i < 100; i ++) {
+        for (int i = 0; i < 10000; i ++) {
             rt->Run();
         }
         rt->ReadResult();

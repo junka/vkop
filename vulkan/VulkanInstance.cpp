@@ -9,7 +9,7 @@ namespace vkop {
 
 VulkanInstance::VulkanInstance() {
     createInstance("vkop", VK_MAKE_VERSION(1, 0, 0));
-
+#ifdef USE_DEBUG_LAYERS
 #if VK_EXT_debug_utils
     CreateDebugUtilsMessenger();
 #endif
@@ -17,6 +17,7 @@ VulkanInstance::VulkanInstance() {
     if (callback_.utils == nullptr) {
         CreateDebugReportCallback();
     }
+#endif
 #endif
     enumPhysicalDevices();
 }
@@ -54,6 +55,7 @@ void VulkanInstance::createInstance(const std::string &app_name,
     create_info.enabledExtensionCount =
         static_cast<uint32_t>(extensions_.size());
     create_info.ppEnabledExtensionNames = extensions_.data();
+#ifdef USE_VALIDATION_LAYERS
     // Validation layers
     if (checkValidationLayerSupport()) {
         create_info.enabledLayerCount =
@@ -62,7 +64,7 @@ void VulkanInstance::createInstance(const std::string &app_name,
     } else {
         create_info.enabledLayerCount = 0;
     }
-
+#endif
     // Create Vulkan instance
     if (vkCreateInstance(&create_info, nullptr, &m_instance_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan instance.");
@@ -70,6 +72,8 @@ void VulkanInstance::createInstance(const std::string &app_name,
 }
 
 void VulkanInstance::destroyInstance() {
+#ifdef USE_DEBUG_LAYERS
+
 #if VK_EXT_debug_utils
     if ((callback_.utils != nullptr) && !extensions_.empty() &&
         (std::string(extensions_[0]) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
@@ -95,7 +99,7 @@ void VulkanInstance::destroyInstance() {
                                             nullptr);
     }
 #endif
-
+#endif
     if (m_instance_ != VK_NULL_HANDLE) {
         vkDestroyInstance(m_instance_, nullptr);
         m_instance_ = VK_NULL_HANDLE;
@@ -152,8 +156,8 @@ void VulkanInstance::getRequiredExtensions() const {
 #endif
 }
 
-bool VulkanInstance::checkValidationLayerSupport() const {
 #ifdef USE_VALIDATION_LAYERS
+bool VulkanInstance::checkValidationLayerSupport() const {
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
 
@@ -173,9 +177,11 @@ bool VulkanInstance::checkValidationLayerSupport() const {
             }
         }
     }
-#endif
     return false;
 }
+#endif
+
+#ifdef USE_DEBUG_LAYERS
 #ifdef VK_EXT_debug_utils
 VkDebugUtilsMessengerEXT VulkanInstance::CreateDebugUtilsMessenger() {
     VkResult error;
@@ -240,7 +246,7 @@ VkDebugReportCallbackEXT VulkanInstance::CreateDebugReportCallback() {
     return callback;
 }
 #endif
-
+#endif
 void VulkanInstance::enumPhysicalDevices() {
     uint32_t count;
     VkResult error = vkEnumeratePhysicalDevices(m_instance_, &count, nullptr);

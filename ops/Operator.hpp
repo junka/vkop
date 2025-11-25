@@ -34,6 +34,9 @@ class Operator {
                        std::shared_ptr<VulkanCommandPool> cmdpool) {
         m_dev_ = std::move(dev);
         m_cmdpool_ = std::move(cmdpool);
+        m_cmd_ = std::make_shared<VulkanCommandBuffer>(
+            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr,
+            4);
     }
 
     virtual void setAttribute(
@@ -71,6 +74,7 @@ class Operator {
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
+    std::shared_ptr<VulkanCommandBuffer> m_cmd_;
     OpType type_;
 
     // we should release objs_ here, since for some intermediate tensor, we will
@@ -85,24 +89,24 @@ class Operator {
                                 reinterpret_cast<const uint32_t *>(spv),
                                 spv_len);
 
-        VulkanCommandBuffer cmd2(device, m_cmdpool_->getCommandPool());
+        m_cmd_->reset();
 #ifdef USE_MEASURE_TIME
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
 #endif
-        cmd2.begin();
-        cmd2.bind(pipeline);
+        m_cmd_->begin();
+        m_cmd_->bind(pipeline);
 #ifdef USE_MEASURE_TIME
-        query_pool.begin(cmd2.get());
+        query_pool.begin(m_cmd_->get());
 #endif
         if (ptr && pc_size) {
-            cmd2.push_constants(pipeline, pc_size, ptr);
+            m_cmd_->push_constants(pipeline, pc_size, ptr);
         }
-        cmd2.dispatch(out_width, out_height);
+        m_cmd_->dispatch(out_width, out_height);
 #ifdef USE_MEASURE_TIME
-        query_pool.end(cmd2.get());
+        query_pool.end(m_cmd_->get());
 #endif
-        cmd2.end();
-        cmd2.submit(m_dev_->getComputeQueue());
+        m_cmd_->end();
+        m_cmd_->submit(m_dev_->getComputeQueue(), m_cmdpool_->getFence());
 #ifdef USE_MEASURE_TIME
         auto r = query_pool.getResults();
         LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *

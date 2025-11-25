@@ -63,8 +63,8 @@ class LayerNorm : public Operator {
             output->resize(input->getShape());
         }
 
-        auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
-        auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+        auto input_image = input->as_input_image(m_dev_, m_cmd_);
+        auto output_image = output->as_output_image(m_dev_, m_cmd_);
 
         auto weight_buffer = weight->as_storage_buffer(m_dev_);
         auto bias_buffer = bias->as_storage_buffer(m_dev_);

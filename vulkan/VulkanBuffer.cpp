@@ -59,9 +59,8 @@ void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     buffer_info.size = size;
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    buffer_info.queueFamilyIndexCount = 1;
-    uint32_t qidx = m_vdev_->getComputeQueueFamilyIndex();
-    buffer_info.pQueueFamilyIndices = &qidx;
+    buffer_info.queueFamilyIndexCount = 0;
+    buffer_info.pQueueFamilyIndices = nullptr;
 #ifdef USE_VMA
     auto ret = m_vdev_->getVMA()->createBuffer(&buffer_info, &m_vma_buffer_);
 #else

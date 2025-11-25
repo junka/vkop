@@ -229,9 +229,8 @@ void VulkanImage::createImage() {
     image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     image_create_info.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-    image_create_info.queueFamilyIndexCount = 1;
-    uint32_t qidx = m_vdev_->getComputeQueueFamilyIndex();
-    image_create_info.pQueueFamilyIndices = &qidx;
+    image_create_info.queueFamilyIndexCount = 0;
+    image_create_info.pQueueFamilyIndices = nullptr;
 #ifdef USE_VMA
     auto ret =
         m_vdev_->getVMA()->createImage(&image_create_info, &m_vma_image_);

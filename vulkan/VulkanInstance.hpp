@@ -36,8 +36,6 @@ class VulkanInstance {
 
     // Check if a specific extension is supported
     bool isExtensionSupported(const char *extensionName) const;
-    // Check if validation layers are supported
-    bool checkValidationLayerSupport() const;
     // Check for required extensions
     void getRequiredExtensions() const;
 
@@ -46,7 +44,7 @@ class VulkanInstance {
     void enumInstanceExtensions();
 
     void getToolinfo(VkPhysicalDevice physicalDevice);
-
+#ifdef USE_DEBUG_LAYERS
 #if VK_EXT_debug_utils
     static VKAPI_ATTR VkBool32 VKAPI_CALL debugUtilsCallback(
         VkDebugUtilsMessageSeverityFlagBitsEXT messageSeverity,
@@ -87,9 +85,6 @@ class VulkanInstance {
 #if VK_EXT_debug_utils
     VkDebugUtilsMessengerEXT CreateDebugUtilsMessenger();
 #endif
-    VkInstance m_instance_ = VK_NULL_HANDLE;
-    mutable std::vector<const char *> validation_layers_;
-    mutable std::vector<const char *> extensions_;
     union {
 #if VK_EXT_debug_utils
         VkDebugUtilsMessengerEXT utils;
@@ -98,6 +93,16 @@ class VulkanInstance {
         VkDebugReportCallbackEXT report;
 #endif
     } callback_;
+
+#endif
+
+    VkInstance m_instance_ = VK_NULL_HANDLE;
+#ifdef USE_VALIDATION_LAYERS
+    mutable std::vector<const char *> validation_layers_;
+    // Check if validation layers are supported
+    bool checkValidationLayerSupport() const;
+#endif
+    mutable std::vector<const char *> extensions_;
 
     std::vector<VkExtensionProperties> available_extensions_;
 

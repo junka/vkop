@@ -34,9 +34,6 @@ struct Initializer {
     std::string name;
     std::string dtype;
     std::vector<uint32_t> dims;
-    std::vector<float> dataf;
-    std::vector<int32_t> datai;
-    std::vector<int64_t> dataii;
 };
 
 class VkModel {
@@ -45,6 +42,8 @@ public:
     std::vector<Shape> outputs;
     std::vector<Node> nodes;
     std::unordered_map<std::string, Initializer> initializers;
+    std::unordered_map<std::string, size_t> initializer_offsets;
+    std::vector<uint8_t> initializer_memory;
 
     explicit VkModel(const std::string& filePath);
     void dump_model() {

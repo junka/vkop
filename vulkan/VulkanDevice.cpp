@@ -17,10 +17,14 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     if (logicalDevice_ != VK_NULL_HANDLE) {
         throw std::runtime_error("Logical device already created.");
     }
-    if (computeQueue_ != VK_NULL_HANDLE) {
+    if (!computeQueues_.empty()) {
         throw std::runtime_error("Compute queue already created.");
     }
-    create();
+    auto props = getProperties();
+    if (!createLogicalDevice(props)) {
+        LOG_ERROR("Failed to create logical device!");
+        return;
+    }
     checkDeviceUnifiedMemoryAccess();
 #ifdef USE_VMA
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
@@ -38,16 +42,6 @@ VulkanDevice::~VulkanDevice() {
 }
 
 VkPhysicalDeviceProperties VulkanDevice::getProperties() {
-    uint32_t p_property_count = 0;
-    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr,
-                                         &p_property_count, nullptr);
-    ext_properties_.resize(p_property_count);
-    vkEnumerateDeviceExtensionProperties(
-        physicalDevice_, nullptr, &p_property_count, ext_properties_.data());
-    // for (auto ext : this->ext_properties_) {
-    //     LOG_INFO("device extension %s", ext.extensionName);
-    // }
-
     VkPhysicalDeviceProperties2 properties2 = {};
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
 
@@ -84,45 +78,58 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     return properties2.properties;
 }
 
-void VulkanDevice::create() {
-    auto props = getProperties();
-    if (!createLogicalDevice(props)) {
-        LOG_ERROR("Failed to create logical device!");
-        return;
-    }
-}
-
-bool VulkanDevice::isDeviceSuitable() {
-    int queue_family_index = findComputeQueueFamily();
-    return queue_family_index != -1;
-}
-
-int VulkanDevice::findComputeQueueFamily() {
+uint32_t VulkanDevice::findComputeQueueFamily() {
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_,
                                              &queue_family_count, nullptr);
-
     std::vector<VkQueueFamilyProperties> queue_families(queue_family_count);
     vkGetPhysicalDeviceQueueFamilyProperties(
         physicalDevice_, &queue_family_count, queue_families.data());
 
+    const VkQueueFlags required = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    const VkQueueFlags forbidden = VK_QUEUE_GRAPHICS_BIT;
+    // graphics as fallback
+    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> fallback;
     for (uint32_t i = 0; i < queue_families.size(); i++) {
-        if (queue_families[i].queueFlags &
-            (VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT)) {
-            return i;
+        if ((queue_families[i].queueFlags & (required)) != (required)) {
+            continue;
+        }
+
+        std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
+            i, queue_families[i].queueCount, queue_families[i].queueFlags};
+        if (!(queue_families[i].queueFlags & forbidden)) {
+            computeQueueIdxs_.emplace_back(t);
+        } else {
+            fallback.emplace_back(t);
         }
     }
+    if (computeQueueIdxs_.empty() && !fallback.empty()) {
+        computeQueueIdxs_ = fallback;
+    }
 
-    return -1;
+    return computeQueueIdxs_.size();
 }
 
 bool VulkanDevice::createLogicalDevice(
     const VkPhysicalDeviceProperties &deviceProperties) {
-    computeQueueFamilyIndex_ = findComputeQueueFamily();
-    if (computeQueueFamilyIndex_ == -1) {
+    auto num_queue = findComputeQueueFamily();
+    if (num_queue == 0) {
         LOG_ERROR("Failed to find a suitable compute queue family!");
         return false;
     }
+    std::vector<uintptr_t> enabled_features;
+    std::vector<const char *> enabled_extensions;
+    std::vector<VkExtensionProperties> ext_properties;
+
+    uint32_t p_property_count = 0;
+    vkEnumerateDeviceExtensionProperties(physicalDevice_, nullptr,
+                                         &p_property_count, nullptr);
+    ext_properties.resize(p_property_count);
+    vkEnumerateDeviceExtensionProperties(
+        physicalDevice_, nullptr, &p_property_count, ext_properties.data());
+    // for (auto ext : ext_properties) {
+    //     LOG_INFO("device extension %s", ext.extensionName);
+    // }
 
     VkPhysicalDeviceFeatures device_features = {};
     vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
@@ -224,29 +231,31 @@ bool VulkanDevice::createLogicalDevice(
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
     if (checkDeviceExtensionFeature(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
         host_image_copy_features.hostImageCopy = VK_TRUE;
-        enabledExtensions_.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
-        enabledFeatures_.push_back(
+        enabled_extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+        enabled_features.push_back(
             reinterpret_cast<uintptr_t>(&host_image_copy_features));
         m_support_host_image_copy_ = true;
     }
 #endif
     if (devicefloat16_int8_features.shaderInt8) {
         float16_int8_features.shaderInt8 = VK_TRUE;
-        if (checkDeviceExtensionFeature(VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
-            enabledExtensions_.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
-            enabledFeatures_.push_back(
+        if (checkDeviceExtensionFeature(ext_properties,
+                                        VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
+            enabled_extensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+            enabled_features.push_back(
                 reinterpret_cast<uintptr_t>(&storage8bit_features));
         }
     }
     if (devicefloat16_int8_features.shaderFloat16) {
         float16_int8_features.shaderFloat16 = VK_TRUE;
-        if (checkDeviceExtensionFeature(VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
-            enabledExtensions_.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+        if (checkDeviceExtensionFeature(ext_properties,
+                                        VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
+            enabled_extensions.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
             if (deviceProperties.vendorID != 4318) {
                 // tested on Nvidia A2000, it supports 16bit storage feature but
                 // did not need to enable it. enable will cause validation
                 // error VK_ERROR_FEATURE_NOT_PRESENT
-                enabledFeatures_.push_back(
+                enabled_features.push_back(
                     reinterpret_cast<uintptr_t>(&storage16bit_features));
             }
         }
@@ -255,8 +264,9 @@ bool VulkanDevice::createLogicalDevice(
             // for AMD card, do we really need this ? over
             // VK_KHR_shader_float16_int8
             if (checkDeviceExtensionFeature(
+                    ext_properties,
                     VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME)) {
-                enabledExtensions_.push_back(
+                enabled_extensions.push_back(
                     VK_AMD_GPU_SHADER_HALF_FLOAT_EXTENSION_NAME);
             }
         }
@@ -265,27 +275,29 @@ bool VulkanDevice::createLogicalDevice(
     if (devicefloat16_int8_features.shaderFloat16 ||
         devicefloat16_int8_features.shaderInt8) {
         if (checkDeviceExtensionFeature(
-                VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
-            enabledFeatures_.push_back(
+                ext_properties, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
+            enabled_features.push_back(
                 reinterpret_cast<uintptr_t>(&float16_int8_features));
-            enabledExtensions_.push_back(
+            enabled_extensions.push_back(
                 VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
         }
     }
 #ifdef VK_KHR_shader_integer_dot_product
     if (integer_dot_product_features.shaderIntegerDotProduct) {
         if (checkDeviceExtensionFeature(
+                ext_properties,
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
-            enabledExtensions_.push_back(
+            enabled_extensions.push_back(
                 VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
-            enabledFeatures_.push_back(reinterpret_cast<uintptr_t>(
+            enabled_features.push_back(reinterpret_cast<uintptr_t>(
                 &shader_integer_dot_product_features));
         }
     }
 #endif
 #if VK_KHR_bind_memory2
-    if (checkDeviceExtensionFeature(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_BIND_MEMORY_2_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_shader_non_semantic_info
@@ -294,47 +306,50 @@ bool VulkanDevice::createLogicalDevice(
     "VK_KHR_shader_non_semantic_info"
 #endif
     if (checkDeviceExtensionFeature(
-            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_get_physical_device_properties2
     if (checkDeviceExtensionFeature(
+            ext_properties,
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+        enabled_extensions.push_back(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_get_memory_requirements2
     if (checkDeviceExtensionFeature(
-            VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
     }
 #endif
 
 #if VK_KHR_format_feature_flags2
     if (checkDeviceExtensionFeature(
-            VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_copy_commands2
-    if (checkDeviceExtensionFeature(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
     }
 #endif
 #if VK_EXT_tooling_info
-    if (checkDeviceExtensionFeature(VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
     }
 #endif
 #if VK_EXT_subgroup_size_control
     if (checkDeviceExtensionFeature(
-            VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
     }
 #endif
@@ -342,39 +357,44 @@ bool VulkanDevice::createLogicalDevice(
     VkPhysicalDeviceImageRobustnessFeatures imagerobustfeature;
     imagerobustfeature.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
-    if (checkDeviceExtensionFeature(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
         imagerobustfeature.robustImageAccess = VK_TRUE;
-        enabledFeatures_.push_back(
+        enabled_features.push_back(
             reinterpret_cast<uintptr_t>(&imagerobustfeature));
-        enabledExtensions_.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+        enabled_extensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_external_memory_fd
-    if (checkDeviceExtensionFeature(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
     }
 #endif
     // follow up extensions are for vma allocator
 #if VK_KHR_dedicated_allocation
     if (checkDeviceExtensionFeature(
-            VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_maintenance4
-    if (checkDeviceExtensionFeature(VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_maintenance5
-    if (checkDeviceExtensionFeature(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
     }
 #endif
 #if VK_EXT_memory_budget
-    if (checkDeviceExtensionFeature(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_buffer_device_address
@@ -386,24 +406,25 @@ bool VulkanDevice::createLogicalDevice(
         VK_TRUE;
 
     if (checkDeviceExtensionFeature(
-            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) &&
+            ext_properties, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) &&
         buffer_device_address_features.bufferDeviceAddress) {
-        enabledExtensions_.push_back(
+        enabled_extensions.push_back(
             VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
         m_support_buffer_device_address_ = true;
-        enabledFeatures_.push_back(reinterpret_cast<uintptr_t>(
+        enabled_features.push_back(reinterpret_cast<uintptr_t>(
             &physical_device_buffer_device_address_features));
     }
 #endif
 #if VK_EXT_memory_priority
-    if (checkDeviceExtensionFeature(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
     }
 #endif
 #if VK_AMD_device_coherent_memory
     if (checkDeviceExtensionFeature(
-            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(
+            ext_properties, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
+        enabled_extensions.push_back(
             VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
     }
 #endif
@@ -412,23 +433,25 @@ bool VulkanDevice::createLogicalDevice(
     timeline_sem_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES;
     timeline_sem_features.timelineSemaphore = VK_TRUE;
-    enabledFeatures_.push_back(
+    enabled_features.push_back(
         reinterpret_cast<uintptr_t>(&timeline_sem_features));
 #endif
 #ifdef VK_KHR_performance_query
-    if (checkDeviceExtensionFeature(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
     }
 #endif
 #if defined VK_KHR_cooperative_matrix || defined VK_NV_cooperative_matrix
 #if defined VK_KHR_cooperative_matrix
-    if (checkDeviceExtensionFeature(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
-        enabledExtensions_.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+        enabled_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
     } else {
 #endif
         if (checkDeviceExtensionFeature(
-                VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
-            enabledExtensions_.push_back(
+                ext_properties, VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
+            enabled_extensions.push_back(
                 VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME);
             uint32_t nv_cooperativematrix_cnt = 0;
             auto vkGetPhysicalDeviceCooperativeMatrixPropertiesNV =
@@ -470,23 +493,29 @@ bool VulkanDevice::createLogicalDevice(
         void *pNext;
     };
     void *p_first = nullptr;
-    if (!enabledFeatures_.empty()) {
-        p_first = reinterpret_cast<void *>(enabledFeatures_[0]);
+    if (!enabled_features.empty()) {
+        p_first = reinterpret_cast<void *>(enabled_features[0]);
         auto *ptr = reinterpret_cast<struct GeneralFeature *>(p_first);
-        for (size_t i = 1; i < enabledFeatures_.size(); i++) {
+        for (size_t i = 1; i < enabled_features.size(); i++) {
             auto *feat =
-                reinterpret_cast<struct GeneralFeature *>(enabledFeatures_[i]);
+                reinterpret_cast<struct GeneralFeature *>(enabled_features[i]);
             ptr->pNext = feat;
             ptr = feat;
         }
     }
 
-    float queue_priority = 1.0F;
+    auto [qidx, queue_count, queueflags] = computeQueueIdxs_[0];
+    if (queue_count >= 4) {
+        // reserve half of the queues for graphics
+        queue_count /= 2;
+    }
+    std::vector<float> queue_priority(queue_count, 1.0F);
     VkDeviceQueueCreateInfo queue_create_info = {};
     queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_create_info.queueFamilyIndex = computeQueueFamilyIndex_;
-    queue_create_info.queueCount = 1;
-    queue_create_info.pQueuePriorities = &queue_priority;
+    queue_create_info.queueFamilyIndex = qidx;
+    // multiqueue for pipeline parallelism
+    queue_create_info.queueCount = queue_count;
+    queue_create_info.pQueuePriorities = queue_priority.data();
 
     VkDeviceCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
@@ -496,12 +525,12 @@ bool VulkanDevice::createLogicalDevice(
     create_info.ppEnabledLayerNames = nullptr;
     create_info.pEnabledFeatures = &features;
     create_info.enabledExtensionCount =
-        static_cast<uint32_t>(enabledExtensions_.size());
-    create_info.ppEnabledExtensionNames = enabledExtensions_.data();
+        static_cast<uint32_t>(enabled_extensions.size());
+    create_info.ppEnabledExtensionNames = enabled_extensions.data();
     create_info.pNext = p_first;
-    // std::cout << "enabled extensions count " << enabledExtensions_.size()
+    // std::cout << "enabled extensions count " << enabled_extensions.size()
     //           << std::endl;
-    // for (auto &e : enabledExtensions_) {
+    // for (auto &e : enabled_extensions) {
     //     std::cout << "enabled extension: " << e << std::endl;
     // }
 
@@ -510,14 +539,18 @@ bool VulkanDevice::createLogicalDevice(
         LOG_ERROR("Failed to create logical device!");
         return false;
     }
-
-    vkGetDeviceQueue(logicalDevice_, computeQueueFamilyIndex_, 0,
-                     &computeQueue_);
+    for (uint32_t i = 0; i < queue_count; i++) {
+        VkQueue queue;
+        vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
+        computeQueues_.push_back(queue);
+    }
     return true;
 }
 
-bool VulkanDevice::checkDeviceExtensionFeature(const char *name) const {
-    for (auto ext : this->ext_properties_) {
+bool VulkanDevice::checkDeviceExtensionFeature(
+    const std::vector<VkExtensionProperties> &ext_properties,
+    const char *name) const {
+    for (auto ext : ext_properties) {
         if (std::string(ext.extensionName) == name) {
             return true;
         }

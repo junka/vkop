@@ -1,5 +1,6 @@
 // junka @ 2025
 #include <chrono>
+#include <numeric>
 
 #include "core/runtime.hpp"
 #include "model/load.hpp"
@@ -30,10 +31,9 @@ void Runtime::LoadModel() {
             inputs_for_node_type[in_shape.name] = n.op_type;
         }
     }
-
     for (const auto &i : model.inputs) {
-
 #ifdef FP16
+        // not really needed, TODO: make it more flexible
         if (inputs_for_node_type.find(i.name) != inputs_for_node_type.end() &&
             (inputs_for_node_type[i.name] == "Conv" ||
              inputs_for_node_type[i.name] == "Add")) {
@@ -42,7 +42,7 @@ void Runtime::LoadModel() {
             inputs_[i.name] = t;
             tensor_map[i.name] = t;
             tensor_name_map[t] = i.name;
-            t->as_input_image(m_dev_, m_cmdpool_);
+            t->as_input_image(m_dev_, nullptr);
         } else {
 #endif
             auto t = std::make_shared<Tensor<float>>(i.dims);
@@ -50,7 +50,7 @@ void Runtime::LoadModel() {
             inputs_[i.name] = t;
             tensor_map[i.name] = t;
             tensor_name_map[t] = i.name;
-            t->as_input_image(m_dev_, m_cmdpool_);
+            t->as_input_image(m_dev_, nullptr);
 #ifdef FP16
         }
 #endif
@@ -67,17 +67,19 @@ void Runtime::LoadModel() {
 
     for (const auto &itr : model.initializers) {
         auto init = itr.second;
+        size_t offset = model.initializer_offsets[init.name];
+        uint8_t *src_ptr = model.initializer_memory.data() + offset;
         if (init.dtype == "int64") {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
             t->set_ref_cnt_forever();
-            t->fillToCPU(init.dataii);
+            t->fillToCPU(reinterpret_cast<int64_t *>(src_ptr));
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
             auto t = std::make_shared<Tensor<int>>(init.dims);
             t->set_ref_cnt_forever();
-            t->fillToCPU(init.datai);
+            t->fillToCPU(reinterpret_cast<int32_t *>(src_ptr));
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
@@ -87,25 +89,28 @@ void Runtime::LoadModel() {
                     inputs_for_node_type.end() &&
                 (inputs_for_node_type[init.name] == "Conv" ||
                  inputs_for_node_type[init.name] == "Add")) {
+                // printf("save as fp16 %s\n", init.name.c_str());
                 auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
                 t->set_ref_cnt_forever();
                 if (t->num_dims() == 2 || t->num_dims() == 1) {
                     if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
-                        t->fillFP32ToCPU(init.dataf);
+                        t->fillFP32ToCPU(reinterpret_cast<float *>(src_ptr));
                     } else {
                         t->as_storage_buffer(m_dev_);
                         std::vector<uint16_t> t_datah(t->num_elements());
                         for (int i = 0; i < t->num_elements(); i++) {
-                            t_datah[i] = ITensor::fp32_to_fp16(init.dataf[i]);
+                            t_datah[i] = ITensor::fp32_to_fp16(
+                                reinterpret_cast<float *>(src_ptr)[i]);
                         }
 
                         t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
                     }
                 } else {
-                    t->as_input_image(m_dev_, m_cmdpool_);
+                    t->as_input_image(m_dev_, nullptr);
                     std::vector<uint16_t> t_datah(t->num_elements());
                     for (int i = 0; i < t->num_elements(); i++) {
-                        t_datah[i] = ITensor::fp32_to_fp16(init.dataf[i]);
+                        t_datah[i] = ITensor::fp32_to_fp16(
+                            reinterpret_cast<float *>(src_ptr)[i]);
                     }
                     t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
                 }
@@ -118,14 +123,16 @@ void Runtime::LoadModel() {
                 t->set_ref_cnt_forever();
                 if (t->num_dims() == 2 || t->num_dims() == 1) {
                     if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
-                        t->fillToCPU(init.dataf);
+                        t->fillToCPU(reinterpret_cast<float *>(src_ptr));
                     } else {
                         t->as_storage_buffer(m_dev_);
-                        t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+                        t->copyToGPU(m_dev_, m_cmdpool_,
+                                     reinterpret_cast<float *>(src_ptr));
                     }
                 } else {
-                    t->as_input_image(m_dev_, m_cmdpool_);
-                    t->copyToGPU(m_dev_, m_cmdpool_, init.dataf.data());
+                    t->as_input_image(m_dev_, nullptr);
+                    t->copyToGPU(m_dev_, m_cmdpool_,
+                                 reinterpret_cast<float *>(src_ptr));
                 }
                 tensor_map[init.name] = t;
                 tensor_name_map[t] = init.name;
@@ -133,9 +140,28 @@ void Runtime::LoadModel() {
 #ifdef FP16
             }
 #endif
+        } else if (init.dtype == "float16") {
+            auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
+            t->set_ref_cnt_forever();
+            if (t->num_dims() == 2 || t->num_dims() == 1) {
+                if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                    t->fillToCPU(reinterpret_cast<uint16_t *>(src_ptr));
+                } else {
+                    t->as_storage_buffer(m_dev_);
+                    t->copyToGPU(m_dev_, m_cmdpool_,
+                                 reinterpret_cast<uint16_t *>(src_ptr));
+                }
+            } else {
+                t->as_input_image(m_dev_, nullptr);
+                t->copyToGPU(m_dev_, m_cmdpool_,
+                             reinterpret_cast<uint16_t *>(src_ptr));
+            }
+            tensor_map[init.name] = t;
+            tensor_name_map[t] = init.name;
+            initializers_[init.name] = t;
         } else {
             throw std::runtime_error(
-                "Only float32/int32 initializer is supported for now " +
+                "Only float32/int32/fp16 initializer is supported for now " +
                 init.dtype);
         }
     }
@@ -237,7 +263,7 @@ void Runtime::Run() {
         for (auto &it : node_input_tensors_[i]) {
             auto t = vkop::core::as_tensor<float>(it);
             if (t && t->ref_cnt() == 1) {
-                t->resize(0);
+                // t->resize(0);
             }
         }
     }

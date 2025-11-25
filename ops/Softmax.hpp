@@ -53,8 +53,8 @@ class Softmax : public Operator {
             output->resize(input_shape);
         }
 
-        auto input_image = input->as_input_image(m_dev_, m_cmdpool_);
-        auto output_image = output->as_output_image(m_dev_, m_cmdpool_);
+        auto input_image = input->as_input_image(m_dev_, m_cmd_);
+        auto output_image = output->as_output_image(m_dev_, m_cmd_);
 
         types_ = {output_image->getDescriptorType(),
                   input_image->getDescriptorType()};

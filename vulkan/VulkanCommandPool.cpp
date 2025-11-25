@@ -10,6 +10,7 @@ VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
     uint32_t queue_family_index = m_vdev_->getComputeQueueFamilyIndex();
     createCommandPool(queue_family_index);
     createTimelineSemaphore();
+    createFence();
     stagingbuffer_pool_ = std::make_shared<VulkanStagingBufferPool>(m_vdev_);
 }
 
@@ -22,6 +23,10 @@ VulkanCommandPool::~VulkanCommandPool() {
     if (m_semaphore_ != VK_NULL_HANDLE) {
         vkDestroySemaphore(m_vdev_->getLogicalDevice(), m_semaphore_, nullptr);
         m_semaphore_ = VK_NULL_HANDLE;
+    }
+    if (m_fence_ != VK_NULL_HANDLE) {
+        vkDestroyFence(m_vdev_->getLogicalDevice(), m_fence_, nullptr);
+        m_fence_ = VK_NULL_HANDLE;
     }
 }
 
@@ -50,6 +55,15 @@ void VulkanCommandPool::createTimelineSemaphore() {
     if (vkCreateSemaphore(m_vdev_->getLogicalDevice(), &sem_info, nullptr,
                           &m_semaphore_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create timeline semaphore");
+    }
+}
+
+void VulkanCommandPool::createFence() {
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
+    if (vkCreateFence(m_vdev_->getLogicalDevice(), &fence_info, nullptr,
+                      &m_fence_) != VK_SUCCESS) {
     }
 }
 
