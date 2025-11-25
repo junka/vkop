@@ -11,7 +11,6 @@ namespace vkop {
 class VulkanPipeline {
   public:
     VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,
-                   std::vector<std::shared_ptr<VulkanResource>> objs,
                    size_t pushconstant_size, const uint32_t *spirv,
                    int codesize);
     ~VulkanPipeline();
@@ -19,11 +18,12 @@ class VulkanPipeline {
     VkPipeline getComputePipeline() const { return m_pipeline_; }
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout_; }
     VkDescriptorSet getDescriptorSet() const { return m_descriptorSet_; }
+    void
+    updateDescriptorSets(std::vector<std::shared_ptr<VulkanResource>> m_objs);
 
   private:
     VkDevice m_device_;
     std::vector<VkDescriptorType> m_types_;
-    std::vector<std::shared_ptr<VulkanResource>> m_objs_;
     size_t m_pushconstant_size_ = 0;
 
     VkDescriptorSetLayout m_descriptorSetLayout_ = VK_NULL_HANDLE;
@@ -44,8 +44,7 @@ class VulkanPipeline {
 
     void createDescriptorPool();
     void allocDescriptorSets();
-    void updateDescriptorSets();
-    void createDescriptorUpdataTemplate();
+    // void createDescriptorUpdataTemplate();
 
     std::vector<VkDescriptorSetLayoutBinding> allocDescriptorSetLaoutBindings();
     void cleanup();

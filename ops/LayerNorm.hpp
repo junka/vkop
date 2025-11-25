@@ -37,7 +37,14 @@ struct alignas(16) GpuLayerNormParam {
 
 class LayerNorm : public Operator {
   public:
-    LayerNorm() : Operator(OpType::LAYERNORM) {}
+    LayerNorm()
+        : Operator(OpType::LAYERNORM, layernorm_spv, layernorm_spv_len,
+                   sizeof(layernorm::GpuLayerNormParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("eps") != attributes.end()) {
@@ -60,7 +67,7 @@ class LayerNorm : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -68,7 +75,7 @@ class LayerNorm : public Operator {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-            types_.emplace_back(input_image->getDescriptorType());
+            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
         for (size_t i = 1; i <= 2; ++i) {
@@ -77,7 +84,7 @@ class LayerNorm : public Operator {
                 auto tensor = core::as_tensor<T>(inputs[i]);
                 auto buffer = tensor->as_storage_buffer(m_dev_);
                 tensor->copyToGPU(m_dev_, m_cmdpool_);
-                types_.emplace_back(buffer->getDescriptorType());
+                // types_.emplace_back(buffer->getDescriptorType());
                 objs_.emplace_back(buffer);
             });
         }
@@ -103,14 +110,11 @@ class LayerNorm : public Operator {
         }
 
         if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
-            submit(&para, sizeof(layernorm::GpuLayerNormParam), layernorm_spv,
-                   layernorm_spv_len, batch * UP_DIV(depth, 4), out_height);
+            submit(&para, batch * UP_DIV(depth, 4), out_height);
         } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
-            submit(&para, sizeof(layernorm::GpuLayerNormParam), layernorm_spv,
-                   layernorm_spv_len, batch, UP_DIV(depth, 4));
+            submit(&para, batch, UP_DIV(depth, 4));
         } else { // 归一化所有维度 CHW
-            submit(&para, sizeof(layernorm::GpuLayerNormParam), layernorm_spv,
-                   layernorm_spv_len, realwidth, realheight);
+            submit(&para, realwidth, realheight);
         }
     }
 

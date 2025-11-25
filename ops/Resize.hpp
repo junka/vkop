@@ -29,7 +29,12 @@ struct GpuResizeParam {
 
 class Resize : public Operator {
   public:
-    Resize() : Operator(OpType::RESIZE){};
+    Resize()
+        : Operator(OpType::RESIZE, resize_spv, resize_spv_len,
+                   sizeof(resize::GpuResizeParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -171,14 +176,14 @@ class Resize : public Operator {
                 outputptr->resize(batch, depth, out_height, out_width);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-            types_.emplace_back(input_image->getDescriptorType());
+            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
         auto roi = core::as_tensor<float>(inputs[1]);
@@ -206,8 +211,7 @@ class Resize : public Operator {
         para.coordinate_transformation_mode = coordinate_transformation_mode_;
         para.cubic_coeff_a = cubic_coeff_a_;
 
-        submit(&para, sizeof(resize::GpuResizeParam), resize_spv,
-               resize_spv_len, realwidth, realheight);
+        submit(&para, realwidth, realheight);
     }
 
   private:

@@ -18,7 +18,13 @@ namespace ops {
 
 class BinaryFactory : public Operator {
   public:
-    explicit BinaryFactory(OpType type) : Operator(type) {}
+    explicit BinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
+        : Operator(type, spv, spv_len, 0) {
+
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+    }
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -31,7 +37,7 @@ class BinaryFactory : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -40,7 +46,7 @@ class BinaryFactory : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                types_.emplace_back(input_image->getDescriptorType());
+                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }
@@ -51,19 +57,8 @@ class BinaryFactory : public Operator {
 
         int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
-        submit(nullptr, 0, spv_, spv_len_, UP_DIV(realwidth, 16),
-               UP_DIV(realheight, 16));
+        submit(nullptr, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
-
-  protected:
-    void set_vulkan_spv(unsigned char *spv, unsigned int spv_len) {
-        spv_ = spv;
-        spv_len_ = spv_len;
-    }
-
-  private:
-    unsigned char *spv_;
-    unsigned int spv_len_;
 };
 
 } // namespace ops

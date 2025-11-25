@@ -12,9 +12,8 @@ namespace ops {
 
 class Softplus : public UnaryFactory {
   public:
-    Softplus() : UnaryFactory(OpType::SOFTPLUS) {
-        set_vulkan_spv(softplus_spv, softplus_spv_len);
-    }
+    Softplus()
+        : UnaryFactory(OpType::SOFTPLUS, softplus_spv, softplus_spv_len) {}
 };
 
 } // namespace ops

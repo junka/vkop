@@ -12,7 +12,7 @@ namespace ops {
 
 class Pow : public BinaryFactory {
   public:
-    Pow() : BinaryFactory(OpType::POW) { set_vulkan_spv(pow_spv, pow_spv_len); }
+    Pow() : BinaryFactory(OpType::POW, pow_spv, pow_spv_len) {}
 };
 
 } // namespace ops

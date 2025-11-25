@@ -12,7 +12,7 @@ namespace ops {
 
 class Sub : public BinaryFactory {
   public:
-    Sub() : BinaryFactory(OpType::SUB) { set_vulkan_spv(sub_spv, sub_spv_len); }
+    Sub() : BinaryFactory(OpType::SUB, sub_spv, sub_spv_len) {}
 };
 
 } // namespace ops

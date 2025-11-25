@@ -19,7 +19,9 @@ namespace ops {
 
 class Operator {
   public:
-    explicit Operator(OpType type) : type_(type) {}
+    explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
+                      size_t pc_size = 0)
+        : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len) {}
     virtual ~Operator() {
         m_cmdpool_ = nullptr;
         m_dev_ = nullptr;
@@ -37,6 +39,13 @@ class Operator {
         m_cmd_ = std::make_shared<VulkanCommandBuffer>(
             m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr,
             4);
+        create_pipeline();
+    }
+    virtual void create_pipeline() {
+        VkDevice device = m_dev_->getLogicalDevice();
+        pipeline_ = std::make_shared<VulkanPipeline>(
+            device, types_, pc_size_, reinterpret_cast<const uint32_t *>(spv_),
+            spv_len_);
     }
 
     virtual void setAttribute(
@@ -71,7 +80,11 @@ class Operator {
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     std::shared_ptr<VulkanCommandBuffer> m_cmd_;
+    std::shared_ptr<VulkanPipeline> pipeline_;
     OpType type_;
+    size_t pc_size_ = 0;
+    uint8_t *spv_;
+    uint32_t spv_len_;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.
@@ -103,24 +116,22 @@ class Operator {
         }
     }
 
-    virtual void submit(void *ptr, size_t pc_size, const unsigned char *spv,
-                        unsigned int spv_len, int out_width, int out_height) {
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanPipeline pipeline(device, types_, objs_, pc_size,
-                                reinterpret_cast<const uint32_t *>(spv),
-                                spv_len);
+    virtual void submit(void *ptr, int out_width, int out_height) {
+
+        pipeline_->updateDescriptorSets(objs_);
 
         m_cmd_->reset();
 #ifdef USE_MEASURE_TIME
+        VkDevice device = m_dev_->getLogicalDevice();
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
 #endif
         m_cmd_->begin();
-        m_cmd_->bind(pipeline);
+        m_cmd_->bind(*pipeline_);
 #ifdef USE_MEASURE_TIME
         query_pool.begin(m_cmd_->get());
 #endif
-        if (ptr && pc_size) {
-            m_cmd_->push_constants(pipeline, pc_size, ptr);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
         }
         m_cmd_->dispatch(out_width, out_height);
 #ifdef USE_MEASURE_TIME
@@ -135,7 +146,6 @@ class Operator {
 #endif
         objs_.clear();
         objs_.shrink_to_fit();
-        types_.clear();
     }
 };
 

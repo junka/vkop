@@ -47,7 +47,14 @@ struct GPUConv2dParam {
 
 class Conv2d : public Operator {
   public:
-    Conv2d() : Operator(OpType::CONV2D) {}
+    Conv2d()
+        : Operator(OpType::CONV2D, conv2d_spv, conv2d_spv_len,
+                   sizeof(conv2d::GPUConv2dParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -184,7 +191,7 @@ class Conv2d : public Operator {
             }
 
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         };
         dispatch_by_dtype(outputs[0]->dtype(), process_output);
@@ -193,7 +200,7 @@ class Conv2d : public Operator {
             using T = decltype(type_tag);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
-            types_.emplace_back(input_image->getDescriptorType());
+            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         };
 
@@ -207,9 +214,9 @@ class Conv2d : public Operator {
 
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
             auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
-            types_.emplace_back(weight_image->getDescriptorType());
-            types_.emplace_back(bias ? bias_buffer->getDescriptorType()
-                                     : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            // types_.emplace_back(weight_image->getDescriptorType());
+            // types_.emplace_back(bias ? bias_buffer->getDescriptorType()
+            //  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
             objs_.emplace_back(weight_image);
             objs_.emplace_back(bias_buffer);
         };
@@ -262,8 +269,7 @@ class Conv2d : public Operator {
         para.bias = ((inputs.size() > 2)) ? 1 : 0;
         para.activation = static_cast<int>(activation_);
 
-        submit(&para, sizeof(struct conv2d::GPUConv2dParam), conv2d_spv,
-               conv2d_spv_len, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+        submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
 
   private:

@@ -11,11 +11,11 @@
 #include "vulkan/VulkanShader.hpp"
 
 namespace vkop {
-VulkanPipeline::VulkanPipeline(
-    VkDevice device, std::vector<VkDescriptorType> types,
-    std::vector<std::shared_ptr<VulkanResource>> objs, size_t pushconstant_size,
-    const uint32_t *spirv, int codesize)
-    : m_device_(device), m_types_(std::move(types)), m_objs_(std::move(objs)),
+VulkanPipeline::VulkanPipeline(VkDevice device,
+                               std::vector<VkDescriptorType> types,
+                               size_t pushconstant_size, const uint32_t *spirv,
+                               int codesize)
+    : m_device_(device), m_types_(std::move(types)),
       m_pushconstant_size_(pushconstant_size) {
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout();
@@ -27,7 +27,7 @@ VulkanPipeline::VulkanPipeline(
     createDescriptorPool();
     allocDescriptorSets();
 
-    updateDescriptorSets();
+    // updateDescriptorSets();
 }
 
 VulkanPipeline::~VulkanPipeline() { cleanup(); }
@@ -146,40 +146,41 @@ void VulkanPipeline::allocDescriptorSets() {
     }
 }
 
-void VulkanPipeline::createDescriptorUpdataTemplate() {
-    std::vector<VkDescriptorUpdateTemplateEntry> entries(m_types_.size());
-    for (size_t i = 0; i < m_types_.size(); i++) {
-        entries[i].dstBinding = static_cast<uint32_t>(i);
-        entries[i].dstArrayElement = 0;
-        entries[i].descriptorCount = 1;
-        entries[i].descriptorType = m_types_[i];
-        entries[i].offset = sizeof(VkDescriptorSetLayoutBinding) * i;
-        if (m_objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
-            entries[i].stride = sizeof(VkDescriptorBufferInfo);
-        } else {
-            entries[i].stride = sizeof(VkDescriptorImageInfo);
-        }
-    }
+// void VulkanPipeline::createDescriptorUpdataTemplate() {
+//     std::vector<VkDescriptorUpdateTemplateEntry> entries(m_types_.size());
+//     for (size_t i = 0; i < m_types_.size(); i++) {
+//         entries[i].dstBinding = static_cast<uint32_t>(i);
+//         entries[i].dstArrayElement = 0;
+//         entries[i].descriptorCount = 1;
+//         entries[i].descriptorType = m_types_[i];
+//         entries[i].offset = sizeof(VkDescriptorSetLayoutBinding) * i;
+//         if (m_objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
+//             entries[i].stride = sizeof(VkDescriptorBufferInfo);
+//         } else {
+//             entries[i].stride = sizeof(VkDescriptorImageInfo);
+//         }
+//     }
 
-    VkDescriptorUpdateTemplateCreateInfo tempcreateinfo = {};
-    tempcreateinfo.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
-    tempcreateinfo.templateType =
-        VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
-    tempcreateinfo.descriptorSetLayout = m_descriptorSetLayout_;
-    tempcreateinfo.pipelineLayout = m_pipelineLayout_;
-    tempcreateinfo.pipelineBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
-    tempcreateinfo.descriptorUpdateEntryCount =
-        static_cast<uint32_t>(m_types_.size());
-    tempcreateinfo.pDescriptorUpdateEntries = entries.data();
-    tempcreateinfo.set = 0;
+//     VkDescriptorUpdateTemplateCreateInfo tempcreateinfo = {};
+//     tempcreateinfo.sType =
+//         VK_STRUCTURE_TYPE_DESCRIPTOR_UPDATE_TEMPLATE_CREATE_INFO;
+//     tempcreateinfo.templateType =
+//         VK_DESCRIPTOR_UPDATE_TEMPLATE_TYPE_DESCRIPTOR_SET;
+//     tempcreateinfo.descriptorSetLayout = m_descriptorSetLayout_;
+//     tempcreateinfo.pipelineLayout = m_pipelineLayout_;
+//     tempcreateinfo.pipelineBindPoint = VK_PIPELINE_BIND_POINT_COMPUTE;
+//     tempcreateinfo.descriptorUpdateEntryCount =
+//         static_cast<uint32_t>(m_types_.size());
+//     tempcreateinfo.pDescriptorUpdateEntries = entries.data();
+//     tempcreateinfo.set = 0;
 
-    VkDescriptorUpdateTemplate temp;
-    vkCreateDescriptorUpdateTemplate(m_device_, &tempcreateinfo, nullptr,
-                                     &temp);
-}
+//     VkDescriptorUpdateTemplate temp;
+//     vkCreateDescriptorUpdateTemplate(m_device_, &tempcreateinfo, nullptr,
+//                                      &temp);
+// }
 
-void VulkanPipeline::updateDescriptorSets() {
+void VulkanPipeline::updateDescriptorSets(
+    std::vector<std::shared_ptr<VulkanResource>> m_objs) {
     std::vector<VkWriteDescriptorSet> write_descriptor_sets(m_types_.size());
     std::vector<VkDescriptorBufferInfo> buffer_infos;
     std::vector<VkDescriptorImageInfo> image_infos;
@@ -187,12 +188,12 @@ void VulkanPipeline::updateDescriptorSets() {
     int n_buf = 0;
 
     for (size_t i = 0; i < m_types_.size(); i++) {
-        if (m_objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
-            buffer_infos.push_back(std::get<VkDescriptorBufferInfo>(
-                m_objs_[i]->getDescriptorInfo()));
+        if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
+            buffer_infos.emplace_back(std::get<VkDescriptorBufferInfo>(
+                m_objs[i]->getDescriptorInfo()));
         } else {
-            image_infos.push_back(std::get<VkDescriptorImageInfo>(
-                m_objs_[i]->getDescriptorInfo()));
+            image_infos.emplace_back(std::get<VkDescriptorImageInfo>(
+                m_objs[i]->getDescriptorInfo()));
         }
     }
 
@@ -204,7 +205,7 @@ void VulkanPipeline::updateDescriptorSets() {
         write_descriptor_set.dstArrayElement = 0;
         write_descriptor_set.descriptorCount = 1;
         write_descriptor_set.descriptorType = m_types_[i];
-        if (m_objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
+        if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
             write_descriptor_set.pBufferInfo = &buffer_infos[n_buf++];
         } else {
             write_descriptor_set.pImageInfo = &image_infos[n_img++];

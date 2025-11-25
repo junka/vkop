@@ -29,7 +29,13 @@ struct alignas(16) GpuMatMulParam {
 } // namespace matmul
 class MatMul : public Operator {
   public:
-    MatMul() : Operator(OpType::MATMUL){};
+    MatMul()
+        : Operator(OpType::MATMUL, matmul_spv, matmul_spv_len,
+                   sizeof(matmul::GpuMatMulParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    };
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -44,7 +50,7 @@ class MatMul : public Operator {
                 outputptr->resize(std::vector<int>{m, n});
             }
             auto output_image = outputptr->as_storage_buffer(m_dev_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         for (const auto &input : inputs) {
@@ -53,7 +59,7 @@ class MatMul : public Operator {
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_buffer = inputptr->as_storage_buffer(m_dev_);
                 inputptr->copyToGPU(m_dev_, m_cmdpool_);
-                types_.emplace_back(input_buffer->getDescriptorType());
+                // types_.emplace_back(input_buffer->getDescriptorType());
                 objs_.emplace_back(input_buffer);
             });
         }
@@ -62,8 +68,7 @@ class MatMul : public Operator {
         para.N = n;
         para.K = k;
 
-        submit(&para, sizeof(matmul::GpuMatMulParam), matmul_spv,
-               matmul_spv_len, UP_DIV(n, 16), UP_DIV(m, 16));
+        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16));
     }
 
   private:

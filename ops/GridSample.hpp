@@ -42,7 +42,13 @@ struct alignas(16) GpuGridSampleParam {
 
 class GridSample : public Operator {
   public:
-    GridSample() : Operator(OpType::GRIDSAMPLE) {}
+    GridSample()
+        : Operator(OpType::GRIDSAMPLE, grid_sample_spv, grid_sample_spv_len,
+                   sizeof(gridsample::GpuGridSampleParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -107,7 +113,7 @@ class GridSample : public Operator {
                 outputptr->resize(batch, depth, out_height, out_width);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -116,7 +122,7 @@ class GridSample : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                types_.emplace_back(input_image->getDescriptorType());
+                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }
@@ -138,9 +144,7 @@ class GridSample : public Operator {
         para.padding_mode = static_cast<int>(padding_mode_);
         para.interpolation_mode = static_cast<int>(interpolation_mode_);
 
-        submit(&para, sizeof(gridsample::GpuGridSampleParam), grid_sample_spv,
-               grid_sample_spv_len, UP_DIV(out_width, 16),
-               UP_DIV(out_height, 16));
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16));
     }
 
   private:

@@ -12,7 +12,7 @@ namespace ops {
 
 class Mul : public BinaryFactory {
   public:
-    Mul() : BinaryFactory(OpType::MUL) { set_vulkan_spv(mul_spv, mul_spv_len); }
+    Mul() : BinaryFactory(OpType::MUL, mul_spv, mul_spv_len) {}
 };
 
 } // namespace ops

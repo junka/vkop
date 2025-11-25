@@ -13,9 +13,7 @@ namespace ops {
 
 class PRelu : public BinaryFactory {
   public:
-    PRelu() : BinaryFactory(OpType::PRELU) {
-        set_vulkan_spv(prelu_spv, prelu_spv_len);
-    }
+    PRelu() : BinaryFactory(OpType::PRELU, prelu_spv, prelu_spv_len) {}
 };
 
 } // namespace ops

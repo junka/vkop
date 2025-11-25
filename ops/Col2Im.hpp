@@ -2,7 +2,7 @@
 #ifndef OPS_COL2IM_HPP_
 #define OPS_COL2IM_HPP_
 
-#include "UnaryFactory.hpp"
+#include "Operator.hpp"
 
 extern unsigned char col2im_spv[];
 extern unsigned int col2im_spv_len;
@@ -25,7 +25,12 @@ struct alignas(16) GpuCol2ImParam {
 
 class Col2im : public Operator {
   public:
-    Col2im() : Operator(OpType::COL2IM) {}
+    Col2im()
+        : Operator(OpType::COL2IM, col2im_spv, col2im_spv_len,
+                   sizeof(col2im::GpuCol2ImParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+    }
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -43,7 +48,7 @@ class Col2im : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -52,7 +57,7 @@ class Col2im : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                types_.emplace_back(input_image->getDescriptorType());
+                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }
@@ -76,8 +81,7 @@ class Col2im : public Operator {
         para.outShape[2] = out_width;
         para.outShape[3] = depth;
 
-        submit(&para, sizeof(col2im::GpuCol2ImParam), col2im_spv,
-               col2im_spv_len, out_width, out_height);
+        submit(&para, out_width, out_height);
     }
 
   private:

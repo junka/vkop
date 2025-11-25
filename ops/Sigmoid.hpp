@@ -12,9 +12,7 @@ namespace ops {
 
 class Sigmoid : public UnaryFactory {
   public:
-    Sigmoid() : UnaryFactory(OpType::SIGMOID) {
-        set_vulkan_spv(sigmoid_spv, sigmoid_spv_len);
-    }
+    Sigmoid() : UnaryFactory(OpType::SIGMOID, sigmoid_spv, sigmoid_spv_len) {}
 };
 
 } // namespace ops

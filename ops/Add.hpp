@@ -13,7 +13,7 @@ namespace ops {
 
 class Add : public BinaryFactory {
   public:
-    Add() : BinaryFactory(OpType::ADD) { set_vulkan_spv(add_spv, add_spv_len); }
+    Add() : BinaryFactory(OpType::ADD, add_spv, add_spv_len) {}
 };
 
 } // namespace ops

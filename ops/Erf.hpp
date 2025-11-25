@@ -13,7 +13,7 @@ namespace ops {
 
 class Erf : public UnaryFactory {
   public:
-    Erf() : UnaryFactory(OpType::ERF) { set_vulkan_spv(erf_spv, erf_spv_len); }
+    Erf() : UnaryFactory(OpType::ERF, erf_spv, erf_spv_len) {}
 };
 
 } // namespace ops

@@ -35,7 +35,14 @@ struct alignas(16) GpuGemmParam {
 
 class Gemm : public Operator {
   public:
-    Gemm() : Operator(OpType::GEMM) {}
+    Gemm()
+        : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
+                   sizeof(gemm::GpuGemmParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -77,7 +84,7 @@ class Gemm : public Operator {
                 outputptr->resize(std::vector<int>{m, n});
             }
             auto output_buffer = outputptr->as_storage_buffer(m_dev_);
-            types_.emplace_back(output_buffer->getDescriptorType());
+            // types_.emplace_back(output_buffer->getDescriptorType());
             objs_.emplace_back(output_buffer);
         });
         for (const auto &input : inputs) {
@@ -86,7 +93,7 @@ class Gemm : public Operator {
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_buffer = inputptr->as_storage_buffer(m_dev_);
                 inputptr->copyToGPU(m_dev_, m_cmdpool_);
-                types_.emplace_back(input_buffer->getDescriptorType());
+                // types_.emplace_back(input_buffer->getDescriptorType());
                 objs_.emplace_back(input_buffer);
             });
         }
@@ -94,7 +101,7 @@ class Gemm : public Operator {
             auto inputc_buffer = std::make_shared<VulkanBuffer>(
                 m_dev_, 4, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-            types_.emplace_back(inputc_buffer->getDescriptorType());
+            // types_.emplace_back(inputc_buffer->getDescriptorType());
             objs_.emplace_back(inputc_buffer);
         }
         gemm::GpuGemmParam para;
@@ -107,8 +114,7 @@ class Gemm : public Operator {
         para.transB = transB_;
         para.has_bias = (inputs.size() > 2 ? 1 : 0);
 
-        submit(&para, sizeof(gemm::GpuGemmParam), gemm_spv, gemm_spv_len,
-               UP_DIV(n, 16), UP_DIV(m, 16));
+        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16));
     }
 
   private:

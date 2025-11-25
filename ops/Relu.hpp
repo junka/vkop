@@ -13,9 +13,7 @@ namespace ops {
 
 class Relu : public UnaryFactory {
   public:
-    Relu() : UnaryFactory(OpType::RELU) {
-        set_vulkan_spv(relu_spv, relu_spv_len);
-    }
+    Relu() : UnaryFactory(OpType::RELU, relu_spv, relu_spv_len) {}
 };
 
 } // namespace ops

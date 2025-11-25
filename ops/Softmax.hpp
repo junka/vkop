@@ -2,7 +2,7 @@
 #ifndef OPS_SOFTMAX_HPP_
 #define OPS_SOFTMAX_HPP_
 
-#include "UnaryFactory.hpp"
+#include "Operator.hpp"
 
 extern unsigned char softmax_spv[];
 extern unsigned int softmax_spv_len;
@@ -24,7 +24,12 @@ struct GpuSoftMaxParam {
 
 class Softmax : public Operator {
   public:
-    Softmax() : Operator(OpType::SOFTMAX) {}
+    Softmax()
+        : Operator(OpType::SOFTMAX, softmax_spv, softmax_spv_len,
+                   sizeof(softmax::GpuSoftMaxParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -52,7 +57,7 @@ class Softmax : public Operator {
                 output->resize(inputs[0]->getShape());
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            types_.emplace_back(output_image->getDescriptorType());
+            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
@@ -60,7 +65,7 @@ class Softmax : public Operator {
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
-            types_.emplace_back(input_image->getDescriptorType());
+            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
 
@@ -86,17 +91,13 @@ class Softmax : public Operator {
         para.axis = axis_;
 
         if (axis_ == 0) {
-            submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
-                   softmax_spv_len, out_width, out_height * UP_DIV(depth, 4));
+            submit(&para, out_width, out_height * UP_DIV(depth, 4));
         } else if (axis_ == 1) {
-            submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
-                   softmax_spv_len, out_width, out_height * batch);
+            submit(&para, out_width, out_height * batch);
         } else if (axis_ == 2) {
-            submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
-                   softmax_spv_len, out_width, UP_DIV(depth, 4) * batch);
+            submit(&para, out_width, UP_DIV(depth, 4) * batch);
         } else if (axis_ == 3) {
-            submit(&para, sizeof(softmax::GpuSoftMaxParam), softmax_spv,
-                   softmax_spv_len, out_height, UP_DIV(depth, 4) * batch);
+            submit(&para, out_height, UP_DIV(depth, 4) * batch);
         }
     }
 

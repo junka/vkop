@@ -41,9 +41,15 @@ struct GpuReduceParam {
     int noop_with_empty_axes;
 };
 } // namespace resize
+
 class Reduce : public Operator {
   public:
-    Reduce() : Operator(OpType::REDUCE) {}
+    Reduce()
+        : Operator(OpType::REDUCE, reduce_spv, reduce_spv_len,
+                   sizeof(resize::GpuReduceParam)) {
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -63,9 +69,6 @@ class Reduce : public Operator {
                 std::stoi(attributes.at("noop_with_empty_axes"));
         }
     }
-    template <typename T>
-    void prepare(std::vector<std::shared_ptr<core::ITensor>> inputs,
-                 std::vector<std::shared_ptr<core::ITensor>> outputs) {}
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -78,14 +81,14 @@ class Reduce : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_buffer = outputptr->as_storage_buffer(m_dev_);
-            types_.emplace_back(output_buffer->getDescriptorType());
+            // types_.emplace_back(output_buffer->getDescriptorType());
             objs_.emplace_back(output_buffer);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-            types_.emplace_back(input_buffer->getDescriptorType());
+            // types_.emplace_back(input_buffer->getDescriptorType());
             objs_.emplace_back(input_buffer);
         });
 
@@ -99,8 +102,7 @@ class Reduce : public Operator {
         para.keepdims = keepdims_;
         para.noop_with_empty_axes = noop_with_empty_axes_;
 
-        submit(&para, sizeof(resize::GpuReduceParam), reduce_spv,
-               reduce_spv_len, UP_DIV(h, 16), UP_DIV(w, 16));
+        submit(&para, UP_DIV(h, 16), UP_DIV(w, 16));
     }
 
   private:
