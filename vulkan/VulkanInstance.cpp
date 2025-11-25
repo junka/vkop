@@ -32,11 +32,13 @@ void VulkanInstance::createInstance(const std::string &app_name,
 
     uint32_t version = VK_API_VERSION_1_0;
     vkEnumerateInstanceVersion(&version);
+    printf("Vulkan API version: %d.%d.%d\n", VK_VERSION_MAJOR(version),
+           VK_VERSION_MINOR(version), VK_VERSION_PATCH(version));
     // Application info
     VkApplicationInfo app_info{};
     app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
     app_info.pEngineName = "vkop";
-    app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
+    app_info.engineVersion = VK_MAKE_VERSION(1, 1, 0);
     app_info.apiVersion = version;
     app_info.pApplicationName = app_name.c_str();
     app_info.applicationVersion = app_version;
@@ -47,20 +49,22 @@ void VulkanInstance::createInstance(const std::string &app_name,
     create_info.pApplicationInfo = &app_info;
 
     // Extensions
-    enumInstanceExtensions();
-    getRequiredExtensions();
+
+    std::vector<const char *> extensions;
+    getRequiredExtensions(extensions);
 #if VK_KHR_portability_enumeration
     create_info.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
 #endif
     create_info.enabledExtensionCount =
-        static_cast<uint32_t>(extensions_.size());
-    create_info.ppEnabledExtensionNames = extensions_.data();
+        static_cast<uint32_t>(extensions.size());
+    create_info.ppEnabledExtensionNames = extensions.data();
 #ifdef USE_VALIDATION_LAYERS
     // Validation layers
-    if (checkValidationLayerSupport()) {
+    std::vector<const char *> validation_layers;
+    if (checkValidationLayerSupport(validation_layers)) {
         create_info.enabledLayerCount =
-            static_cast<uint32_t>(validation_layers_.size());
-        create_info.ppEnabledLayerNames = validation_layers_.data();
+            static_cast<uint32_t>(validation_layers.size());
+        create_info.ppEnabledLayerNames = validation_layers.data();
     } else {
         create_info.enabledLayerCount = 0;
     }
@@ -73,10 +77,8 @@ void VulkanInstance::createInstance(const std::string &app_name,
 
 void VulkanInstance::destroyInstance() {
 #ifdef USE_DEBUG_LAYERS
-
 #if VK_EXT_debug_utils
-    if ((callback_.utils != nullptr) && !extensions_.empty() &&
-        (std::string(extensions_[0]) == VK_EXT_DEBUG_UTILS_EXTENSION_NAME)) {
+    if ((callback_.utils != nullptr)) {
         auto vkDestroyDebugUtilsMessengerEXT =
             reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(
                 vkGetInstanceProcAddr(m_instance_,
@@ -87,8 +89,7 @@ void VulkanInstance::destroyInstance() {
     }
 #endif
 #if VK_EXT_debug_report
-    if ((callback_.report != nullptr) && !extensions_.empty() &&
-        (std::string(extensions_[0]) == VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
+    if ((callback_.report != nullptr)) {
         auto vkDestroyDebugReportCallbackEXT =
             reinterpret_cast<PFN_vkDestroyDebugReportCallbackEXT>(
                 vkGetInstanceProcAddr(m_instance_,
@@ -108,56 +109,60 @@ void VulkanInstance::destroyInstance() {
 
 VkInstance VulkanInstance::getInstance() const { return m_instance_; }
 
-bool VulkanInstance::isExtensionSupported(const char *extensionName) const {
-    for (const auto &extension : available_extensions_) {
-        if (strcmp(extension.extensionName, extensionName) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-void VulkanInstance::enumInstanceExtensions() {
+void VulkanInstance::getRequiredExtensions(
+    std::vector<const char *> &extensions) {
     uint32_t extension_count = 0;
+
+    std::vector<VkExtensionProperties> available_extensions;
     vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
 
-    available_extensions_.resize(extension_count);
+    available_extensions.resize(extension_count);
     vkEnumerateInstanceExtensionProperties(nullptr, &extension_count,
-                                           available_extensions_.data());
-}
-void VulkanInstance::getRequiredExtensions() const {
+                                           available_extensions.data());
+    auto isExtensionSupported =
+        [&available_extensions](const char *extensionName) -> bool {
+        for (const auto &extension : available_extensions) {
+            if (strcmp(extension.extensionName, extensionName) == 0) {
+                return true;
+            }
+        }
+        return false;
+    };
     // Add instance extensions
+#ifdef USE_DEBUG_LAYERS
 #if VK_EXT_debug_utils
     if (isExtensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
-        extensions_.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
 #if VK_EXT_debug_report
-    if (extensions_.empty() &&
+    if (extensions.empty() &&
         isExtensionSupported(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
-        extensions_.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
     }
+#endif
 #endif
 #if VK_KHR_get_physical_device_properties2
     if (isExtensionSupported(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
-        extensions_.push_back(
+        extensions.push_back(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_portability_enumeration
     if (isExtensionSupported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
-        extensions_.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
+        extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_EXT_debug_marker
     if (isExtensionSupported(VK_EXT_DEBUG_MARKER_EXTENSION_NAME)) {
-        extensions_.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
+        extensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
     }
 #endif
 }
 
 #ifdef USE_VALIDATION_LAYERS
-bool VulkanInstance::checkValidationLayerSupport() const {
+bool VulkanInstance::checkValidationLayerSupport(
+    std::vector<const char *> &validation_layers) {
     uint32_t layer_count;
     vkEnumerateInstanceLayerProperties(&layer_count, nullptr);
 
@@ -172,7 +177,7 @@ bool VulkanInstance::checkValidationLayerSupport() const {
         for (const auto *layer_name : valid) {
             if (strcmp(layer.layerName, layer_name) == 0) {
                 LOG_INFO("validation layer found %s", layer.layerName);
-                validation_layers_.push_back(layer_name);
+                validation_layers.push_back(layer_name);
                 return true;
             }
         }
@@ -260,6 +265,9 @@ void VulkanInstance::enumPhysicalDevices() {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
     LOG_INFO("Found %d physical devices.", count);
+    for (uint32_t i = 0; i < count; i++) {
+        printf("Physical device %d: %p\n", i, m_physical_devices_[i]);
+    }
 }
 
 #ifdef VK_EXT_tooling_info

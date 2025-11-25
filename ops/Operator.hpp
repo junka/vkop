@@ -37,8 +37,7 @@ class Operator {
         m_dev_ = std::move(dev);
         m_cmdpool_ = std::move(cmdpool);
         m_cmd_ = std::make_shared<VulkanCommandBuffer>(
-            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr,
-            4);
+            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr);
         create_pipeline();
     }
     virtual void create_pipeline() {
@@ -72,9 +71,12 @@ class Operator {
 
     virtual OpType get_type() { return type_; }
 
-    virtual void
-    execute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-            const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
+    void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                   const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        m_cmd_->reset();
+        m_cmd_->begin();
+        execute(inputs, outputs);
+    }
 
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
@@ -119,13 +121,10 @@ class Operator {
     virtual void submit(void *ptr, int out_width, int out_height) {
 
         pipeline_->updateDescriptorSets(objs_);
-
-        m_cmd_->reset();
 #ifdef USE_MEASURE_TIME
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
 #endif
-        m_cmd_->begin();
         m_cmd_->bind(*pipeline_);
 #ifdef USE_MEASURE_TIME
         query_pool.begin(m_cmd_->get());
@@ -144,9 +143,15 @@ class Operator {
         LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
                                    m_dev_->getTimestampPeriod());
 #endif
+
         objs_.clear();
         objs_.shrink_to_fit();
     }
+
+  private:
+    virtual void
+    execute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+            const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;
 };
 
 } // namespace ops

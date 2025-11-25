@@ -456,7 +456,14 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     vkCmdCopyBufferToImage(commandBuffer, buffer, img, m_layout_, 1, &region);
 
     // Optionally transition the image back to its original layout
-    transferBarrier(commandBuffer, old_layout, old_access);
+    if (VK_IMAGE_LAYOUT_UNDEFINED != old_layout &&
+        VK_IMAGE_LAYOUT_PREINITIALIZED != old_layout) {
+        transferBarrier(commandBuffer, old_layout, old_access);
+    } else {
+        // not initilized, so make it as readable
+        transferBarrier(commandBuffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_SHADER_READ_BIT);
+    }
 }
 
 void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {

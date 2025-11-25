@@ -88,6 +88,7 @@ class GridSample : public Operator {
         }
     }
 
+  private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {

@@ -96,7 +96,8 @@ namespace vkop {
     PFN(vkCmdFillBuffer)                                                       \
     PFN(vkCmdPushConstants)                                                    \
     PFN(vkWaitSemaphores)                                                      \
-    PFN(vkResetFences)
+    PFN(vkResetFences)                                                         \
+    PFN(vkCmdExecuteCommands)
 
 class VulkanLib {
   public:

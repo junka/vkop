@@ -83,7 +83,7 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
-                op->execute(inputs, outputs);
+                op->onExecute(inputs, outputs);
                 output->copyToCPU(dev, cmdpool);
                 auto oshape = output->getShape();
                 // if (oshape.size() == 4) {
@@ -177,7 +177,7 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
-                op->execute(inputs, outputs);
+                op->onExecute(inputs, outputs);
                 output->copyToCPU(dev, cmdpool);
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {

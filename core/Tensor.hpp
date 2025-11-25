@@ -9,10 +9,12 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanResource.hpp"
 
+#include <chrono>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <thread>
 #include <vector>
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
@@ -228,7 +230,7 @@ template <typename T> class Tensor : public ITensor {
     }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
-                   std::shared_ptr<VulkanCommandBuffer> cmd) {
+                   const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
             int exflags = 0;
             if (vd->is_support_host_image_copy()) {
@@ -248,9 +250,9 @@ template <typename T> class Tensor : public ITensor {
 #endif
         {
             if (cmd) {
-                cmd->begin();
+                // cmd->begin();
                 img->readBarrier(cmd->get());
-                cmd->end();
+                // cmd->end();
             }
         }
 
@@ -259,7 +261,7 @@ template <typename T> class Tensor : public ITensor {
 
     std::shared_ptr<VulkanImage>
     as_output_image(std::shared_ptr<VulkanDevice> &vd,
-                    std::shared_ptr<VulkanCommandBuffer> cmd) {
+                    const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
             int exflags = 0;
             if (vd->is_support_host_image_copy()) {
@@ -284,9 +286,9 @@ template <typename T> class Tensor : public ITensor {
 #endif
         {
             if (cmd) {
-                cmd->begin();
+                // cmd->begin();
                 img->writeBarrier(cmd->get());
-                cmd->end();
+                // cmd->end();
             }
         }
 

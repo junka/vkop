@@ -37,6 +37,7 @@ class MatMul : public Operator {
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
     };
 
+  private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {

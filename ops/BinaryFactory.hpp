@@ -26,6 +26,7 @@ class BinaryFactory : public Operator {
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
     }
 
+  private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -37,7 +38,6 @@ class BinaryFactory : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -46,7 +46,6 @@ class BinaryFactory : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }

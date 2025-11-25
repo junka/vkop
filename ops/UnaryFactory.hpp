@@ -25,6 +25,7 @@ class UnaryFactory : public Operator {
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
     };
 
+  private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
