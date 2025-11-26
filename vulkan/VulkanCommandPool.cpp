@@ -10,7 +10,6 @@ VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
     uint32_t queue_family_index = m_vdev_->getComputeQueueFamilyIndex();
     createCommandPool(queue_family_index);
     createTimelineSemaphore();
-    createFence();
     stagingbuffer_pool_ = std::make_shared<VulkanStagingBufferPool>(m_vdev_);
 }
 
@@ -23,10 +22,6 @@ VulkanCommandPool::~VulkanCommandPool() {
     if (m_semaphore_ != VK_NULL_HANDLE) {
         vkDestroySemaphore(m_vdev_->getLogicalDevice(), m_semaphore_, nullptr);
         m_semaphore_ = VK_NULL_HANDLE;
-    }
-    if (m_fence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(m_vdev_->getLogicalDevice(), m_fence_, nullptr);
-        m_fence_ = VK_NULL_HANDLE;
     }
 }
 
@@ -58,23 +53,17 @@ void VulkanCommandPool::createTimelineSemaphore() {
     }
 }
 
-void VulkanCommandPool::createFence() {
-    VkFenceCreateInfo fence_info{};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    fence_info.flags = VK_FENCE_CREATE_SIGNALED_BIT;
-    if (vkCreateFence(m_vdev_->getLogicalDevice(), &fence_info, nullptr,
-                      &m_fence_) != VK_SUCCESS) {
-    }
-}
-
 uint64_t VulkanCommandPool::getCompletedTimelineValue() {
-    uint64_t completed_value = 0;
-    if (VK_SUCCESS != vkGetSemaphoreCounterValue(m_vdev_->getLogicalDevice(),
-                                                 m_semaphore_,
-                                                 &completed_value)) {
-        throw std::runtime_error("Failed to get semaphore counter value");
+    if (m_vdev_->is_support_timeline_semaphore()) {
+        uint64_t completed_value = 0;
+        if (VK_SUCCESS !=
+            vkGetSemaphoreCounterValue(m_vdev_->getLogicalDevice(),
+                                       m_semaphore_, &completed_value)) {
+            throw std::runtime_error("Failed to get semaphore counter value");
+        }
+        return completed_value;
     }
-    return completed_value;
+    return m_timelineValue_.load();
 }
 
 void VulkanCommandPool::reset(VkCommandPoolResetFlags flags) {

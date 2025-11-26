@@ -36,8 +36,7 @@ class Operator {
                        std::shared_ptr<VulkanCommandPool> cmdpool) {
         m_dev_ = std::move(dev);
         m_cmdpool_ = std::move(cmdpool);
-        m_cmd_ = std::make_shared<VulkanCommandBuffer>(
-            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr);
+        m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
         create_pipeline();
     }
     virtual void create_pipeline() {
@@ -73,7 +72,8 @@ class Operator {
 
     void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
                    const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
-        m_cmd_->reset();
+
+        m_cmd_->wait();
         m_cmd_->begin();
         execute(inputs, outputs);
     }
@@ -87,6 +87,7 @@ class Operator {
     size_t pc_size_ = 0;
     uint8_t *spv_;
     uint32_t spv_len_;
+    uint64_t last_submit_value_ = 0;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.
@@ -137,7 +138,7 @@ class Operator {
         query_pool.end(m_cmd_->get());
 #endif
         m_cmd_->end();
-        m_cmd_->submit(m_dev_->getComputeQueue(), m_cmdpool_->getFence());
+        m_cmd_->submit(m_dev_->getComputeQueue());
 #ifdef USE_MEASURE_TIME
         auto r = query_pool.getResults();
         LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *

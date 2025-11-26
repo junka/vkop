@@ -6,7 +6,7 @@ namespace vkop {
 #define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
 namespace {
 constexpr int kStagingBufferSize =
-    1024 * 1024 * 8; // 8M,  big than 1024 * 1024 * 3 for one image
+    1024 * 1024 * 8; // 8M,  greater than 1024 * 1024 * 3 for one image
 }
 
 VulkanStagingBufferPool::VulkanStagingBufferPool(
@@ -24,6 +24,10 @@ VulkanStagingBufferPool::VulkanStagingBufferPool(
     }
     mapped_memory_ = m_buffer_->getMappedMemory();
     m_poolSize_ = kStagingBufferSize;
+}
+
+VulkanStagingBufferPool::~VulkanStagingBufferPool() {
+    m_buffer_->unmapMemory();
 }
 
 std::optional<StagingAllocation>

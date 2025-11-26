@@ -22,7 +22,7 @@ class VulkanStagingBufferPool {
   public:
     explicit VulkanStagingBufferPool(std::shared_ptr<VulkanDevice> &vdev);
 
-    ~VulkanStagingBufferPool() = default;
+    ~VulkanStagingBufferPool();
 
     std::optional<StagingAllocation> allocate(size_t size,
                                               size_t alignment = 256);
@@ -39,7 +39,7 @@ class VulkanStagingBufferPool {
     void *mapped_memory_ = nullptr;
 
     struct SubmittedRange {
-        uint64_t timelineValue;
+        uint64_t timelineValue; // reuse as submit id with fence
         VkDeviceSize endPos;
     };
 

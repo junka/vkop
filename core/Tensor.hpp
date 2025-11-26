@@ -250,9 +250,7 @@ template <typename T> class Tensor : public ITensor {
 #endif
         {
             if (cmd) {
-                // cmd->begin();
                 img->readBarrier(cmd->get());
-                // cmd->end();
             }
         }
 
@@ -286,9 +284,7 @@ template <typename T> class Tensor : public ITensor {
 #endif
         {
             if (cmd) {
-                // cmd->begin();
                 img->writeBarrier(cmd->get());
-                // cmd->end();
             }
         }
 
@@ -399,14 +395,12 @@ template <typename T> class Tensor : public ITensor {
                          const std::shared_ptr<VulkanCommandPool> &cmdpool,
                          T *src = nullptr) {
         auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-        VkDevice device = dev->getLogicalDevice();
+        // VkDevice device = dev->getLogicalDevice();
 
-        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
-                                cmdpool->getSemaphore());
+        VulkanCommandBuffer cmd(dev, cmdpool, false);
         auto stpool = cmdpool->getStagingBufferPool();
-        uint64_t completed_timeline_value =
-            cmdpool->getCompletedTimelineValue();
-        stpool->reclaimCompleted(completed_timeline_value);
+        uint64_t completed = cmdpool->getCompletedTimelineValue();
+        stpool->reclaimCompleted(completed);
         auto *buff = stpool->getBuffer();
         auto b = stpool->allocate(size_);
         if (!b) {
@@ -423,23 +417,21 @@ template <typename T> class Tensor : public ITensor {
         buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset);
         buffer->readBarrier(cmd.get());
         cmd.end();
-        uint64_t submit_value = cmdpool->getNextSubmitValue();
-        cmd.submit(dev->getComputeQueue(), submit_value);
+        auto submit_value = cmd.submit(dev->getComputeQueue());
+        cmd.wait();
         stpool->markSubmit(submit_value);
-        cmd.wait(submit_value);
         toGPU();
     }
     void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
                         T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        VkDevice device = dev->getLogicalDevice();
+        // VkDevice device = dev->getLogicalDevice();
 
         if (dims_.size() < 3) {
             return;
         }
-        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
-                                cmdpool->getSemaphore());
+        VulkanCommandBuffer cmd(dev, cmdpool, false);
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
@@ -458,9 +450,8 @@ template <typename T> class Tensor : public ITensor {
         {
             auto imagesize = img->getImageSize();
             auto stpool = cmdpool->getStagingBufferPool();
-            uint64_t completed_timeline_value =
-                cmdpool->getCompletedTimelineValue();
-            stpool->reclaimCompleted(completed_timeline_value);
+            uint64_t completed = cmdpool->getCompletedTimelineValue();
+            stpool->reclaimCompleted(completed);
             auto *buff = stpool->getBuffer();
             auto b = stpool->allocate(imagesize);
             if (!b) {
@@ -473,10 +464,9 @@ template <typename T> class Tensor : public ITensor {
             img->copyBufferToImage(cmd.get(), buff, b->offset);
             img->readBarrier(cmd.get());
             cmd.end();
-            uint64_t submit_value = cmdpool->getNextSubmitValue();
-            cmd.submit(dev->getComputeQueue(), submit_value);
+            auto submit_value = cmd.submit(dev->getComputeQueue());
+            cmd.wait();
             stpool->markSubmit(submit_value);
-            cmd.wait(submit_value);
         }
         toGPU();
     }
@@ -484,14 +474,12 @@ template <typename T> class Tensor : public ITensor {
                          const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
 
-        VkDevice device = dev->getLogicalDevice();
-        VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
-                                cmdpool->getSemaphore());
+        // VkDevice device = dev->getLogicalDevice();
+        VulkanCommandBuffer cmd(dev, cmdpool, false);
 
         auto stpool = cmdpool->getStagingBufferPool();
-        uint64_t completed_timeline_value =
-            cmdpool->getCompletedTimelineValue();
-        stpool->reclaimCompleted(completed_timeline_value);
+        uint64_t completed = cmdpool->getCompletedTimelineValue();
+        stpool->reclaimCompleted(completed);
         auto *buff = stpool->getBuffer();
         auto b = stpool->allocate(size_);
         if (!b) {
@@ -502,10 +490,9 @@ template <typename T> class Tensor : public ITensor {
         cmd.begin();
         buffer->copyBufferToStageBuffer(cmd.get(), buff, b->offset);
         cmd.end();
-        uint64_t submit_value = cmdpool->getNextSubmitValue();
-        cmd.submit(dev->getComputeQueue(), submit_value);
+        auto submit_value = cmd.submit(dev->getComputeQueue());
+        cmd.wait();
         stpool->markSubmit(submit_value);
-        cmd.wait(submit_value);
         std::memcpy(data_.data(), b->ptr, size_);
         toCPU();
     }
@@ -513,7 +500,7 @@ template <typename T> class Tensor : public ITensor {
                         const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 
-        VkDevice device = dev->getLogicalDevice();
+        // VkDevice device = dev->getLogicalDevice();
 
         int batch = dims_[0];
         int depth = dims_[1];
@@ -534,13 +521,11 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            VulkanCommandBuffer cmd(device, cmdpool->getCommandPool(),
-                                    cmdpool->getSemaphore());
+            VulkanCommandBuffer cmd(dev, cmdpool, false);
 
             auto stpool = cmdpool->getStagingBufferPool();
-            uint64_t completed_timeline_value =
-                cmdpool->getCompletedTimelineValue();
-            stpool->reclaimCompleted(completed_timeline_value);
+            uint64_t completed = cmdpool->getCompletedTimelineValue();
+            stpool->reclaimCompleted(completed);
             auto *buff = stpool->getBuffer();
             auto b = stpool->allocate(imagesize);
             if (!b) {
@@ -551,10 +536,9 @@ template <typename T> class Tensor : public ITensor {
             cmd.begin();
             img->copyImageToBuffer(cmd.get(), buff, b->offset);
             cmd.end();
-            uint64_t submit_value = cmdpool->getNextSubmitValue();
-            cmd.submit(dev->getComputeQueue(), submit_value);
+            auto submit_value = cmd.submit(dev->getComputeQueue());
+            cmd.wait();
             stpool->markSubmit(submit_value);
-            cmd.wait(submit_value);
             convertRGBAToTensor(static_cast<T *>(b->ptr));
         }
 

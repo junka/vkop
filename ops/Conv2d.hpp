@@ -271,11 +271,7 @@ class Conv2d : public Operator {
     void
     set_runtime_device(std::shared_ptr<VulkanDevice> dev,
                        std::shared_ptr<VulkanCommandPool> cmdpool) override {
-        m_dev_ = std::move(dev);
-        m_cmdpool_ = std::move(cmdpool);
-        m_cmd_ = std::make_shared<VulkanCommandBuffer>(
-            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr);
-        create_pipeline();
+        Operator::set_runtime_device(dev, cmdpool);
         dummyBuffer_ =
             std::make_shared<VulkanBuffer>(m_dev_, 4,
                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |

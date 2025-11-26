@@ -53,6 +53,9 @@ class VulkanDevice {
     bool is_support_buffer_device_address() const {
         return m_support_buffer_device_address_;
     }
+    bool is_support_timeline_semaphore() const {
+        return m_support_timeline_semaphore_;
+    }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -66,6 +69,7 @@ class VulkanDevice {
 
     bool m_support_host_image_copy_ = false;
     bool m_support_buffer_device_address_ = false;
+    bool m_support_timeline_semaphore_ = false;
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
 

@@ -173,8 +173,9 @@ bool VulkanDevice::createLogicalDevice(
 
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
 
-    if (timeline_features.timelineSemaphore != VK_TRUE) {
-        throw std::runtime_error("Timeline semaphores not supported!");
+    if (timeline_features.timelineSemaphore == VK_TRUE) {
+        m_support_timeline_semaphore_ = true;
+        LOG_INFO("Timeline semaphores supported");
     }
 
     VkPhysicalDeviceFeatures features = {};

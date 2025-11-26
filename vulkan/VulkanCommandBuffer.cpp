@@ -6,11 +6,21 @@ namespace vkop {
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
-VulkanCommandBuffer::VulkanCommandBuffer(VkDevice device,
-                                         VkCommandPool commandPool,
-                                         VkSemaphore semaphore)
-    : m_device_(device), m_commandPool_(commandPool), m_semaphore_(semaphore) {
+VulkanCommandBuffer::VulkanCommandBuffer(
+    const std::shared_ptr<VulkanDevice> &device,
+    const std::shared_ptr<VulkanCommandPool> &cmdpool, bool signaled)
+    : m_device_(device), m_cmdpool_(cmdpool) {
     allocate();
+    m_usefence_ =
+#ifndef VK_KHR_timeline_semaphore
+        true;
+#else
+        !m_device_->is_support_timeline_semaphore();
+#endif
+
+    if (m_usefence_) {
+        createFence(signaled);
+    }
 }
 
 void VulkanCommandBuffer::bind(VulkanPipeline &pipeline) {
@@ -23,37 +33,33 @@ void VulkanCommandBuffer::bind(VulkanPipeline &pipeline) {
 }
 
 VulkanCommandBuffer::~VulkanCommandBuffer() {
+    if (m_fence_ != VK_NULL_HANDLE) {
+        vkDestroyFence(m_device_->getLogicalDevice(), m_fence_, nullptr);
+        m_fence_ = VK_NULL_HANDLE;
+    }
     if (m_commandBuffer_) {
-        vkFreeCommandBuffers(m_device_, m_commandPool_, 1, &m_commandBuffer_);
+        vkFreeCommandBuffers(m_device_->getLogicalDevice(),
+                             m_cmdpool_->getCommandPool(), 1,
+                             &m_commandBuffer_);
     }
     if (m_primaryBuffer_) {
-        vkFreeCommandBuffers(m_device_, m_commandPool_, 1, &m_primaryBuffer_);
+        vkFreeCommandBuffers(m_device_->getLogicalDevice(),
+                             m_cmdpool_->getCommandPool(), 1,
+                             &m_primaryBuffer_);
     }
 }
 
 void VulkanCommandBuffer::allocate() {
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = m_commandPool_;
+    alloc_info.commandPool = m_cmdpool_->getCommandPool();
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount = 1;
 
-    if (vkAllocateCommandBuffers(m_device_, &alloc_info, &m_commandBuffer_) !=
-        VK_SUCCESS) {
+    if (vkAllocateCommandBuffers(m_device_->getLogicalDevice(), &alloc_info,
+                                 &m_commandBuffer_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate command buffer!");
     }
-
-    // VkCommandBufferAllocateInfo alloc_pri_info{};
-    // alloc_pri_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    // alloc_pri_info.commandPool = m_commandPool_;
-    // alloc_pri_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    // alloc_pri_info.commandBufferCount = 1;
-
-    // if (vkAllocateCommandBuffers(m_device_, &alloc_pri_info,
-    //                              &m_primaryBuffer_) != VK_SUCCESS) {
-    //     throw std::runtime_error("Failed to allocate primary command
-    //     buffer!");
-    // }
 }
 
 void VulkanCommandBuffer::begin() {
@@ -70,59 +76,70 @@ void VulkanCommandBuffer::end() {
     if (vkEndCommandBuffer(m_commandBuffer_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to record command buffer!");
     }
-    m_avail_++;
 }
 
-int VulkanCommandBuffer::submit(VkQueue queue, VkFence fence) {
+int VulkanCommandBuffer::submit(VkQueue queue) {
+    if (!m_usefence_) {
+        m_timelineValue_ = m_cmdpool_->getNextSubmitValue();
+        VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
+        timeline_submit_info.sType =
+            VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+        timeline_submit_info.signalSemaphoreValueCount = 1;
+        timeline_submit_info.pSignalSemaphoreValues = &m_timelineValue_;
+
+        auto *semaphore = m_cmdpool_->getSemaphore();
+        VkSubmitInfo submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.pNext = &timeline_submit_info;
+        submit_info.signalSemaphoreCount = 1;
+        submit_info.pSignalSemaphores = &semaphore;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &m_commandBuffer_;
+
+        if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("Failed to submit sem command buffer!");
+        }
+        return m_timelineValue_;
+    }
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &m_commandBuffer_;
-    wait(fence);
-    if (vkResetFences(m_device_, 1, &fence) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to reset fence!");
-    }
-    if (vkQueueSubmit(queue, 1, &submit_info, fence) != VK_SUCCESS) {
+
+    if (vkQueueSubmit(queue, 1, &submit_info, m_fence_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
-    return 0;
+
+    return m_cmdpool_->getCompletedTimelineValue();
 }
 
-int VulkanCommandBuffer::submit(VkQueue queue, uint64_t submitValue) {
-
-    VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
-    timeline_submit_info.sType =
-        VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-    timeline_submit_info.signalSemaphoreValueCount = 1;
-    timeline_submit_info.pSignalSemaphoreValues = &submitValue;
-
-    VkSubmitInfo submit_info{};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.pNext = &timeline_submit_info;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &m_semaphore_;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &m_commandBuffer_;
-
-    if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to submit command buffer!");
+int VulkanCommandBuffer::wait() {
+    if (!m_usefence_) {
+        uint64_t cur_time;
+        auto *semaphore = m_cmdpool_->getSemaphore();
+        vkGetSemaphoreCounterValue(m_device_->getLogicalDevice(), semaphore,
+                                   &cur_time);
+        if (cur_time > m_timelineValue_) {
+            return 0;
+        }
+        VkSemaphoreWaitInfo wait_info{};
+        wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+        wait_info.semaphoreCount = 1;
+        wait_info.pSemaphores = &semaphore;
+        wait_info.pValues = &m_timelineValue_;
+        if (VK_SUCCESS != vkWaitSemaphores(m_device_->getLogicalDevice(),
+                                           &wait_info, UINT64_MAX)) {
+            throw std::runtime_error("Failed to wait for semaphore!");
+        }
+    } else {
+        vkWaitForFences(m_device_->getLogicalDevice(), 1, &m_fence_, VK_TRUE,
+                        UINT64_MAX);
+        if (vkResetFences(m_device_->getLogicalDevice(), 1, &m_fence_) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("Failed to reset fence!");
+        }
     }
-    return 0;
-}
-
-int VulkanCommandBuffer::wait(VkFence fence) {
-    return vkWaitForFences(m_device_, 1, &fence, VK_TRUE, UINT64_MAX);
-}
-int VulkanCommandBuffer::wait(uint64_t waitValue) {
-    VkSemaphoreWaitInfo wait_info{};
-    wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
-    wait_info.semaphoreCount = 1;
-    wait_info.pSemaphores = &m_semaphore_;
-    wait_info.pValues = &waitValue;
-    if (VK_SUCCESS != vkWaitSemaphores(m_device_, &wait_info, UINT64_MAX)) {
-        throw std::runtime_error("Failed to wait for semaphore!");
-    }
-
     return 0;
 }
 
@@ -142,7 +159,7 @@ void VulkanCommandBuffer::dispatch(int w, int h, int z) {
     vkCmdDispatch(m_commandBuffer_, w, h, z);
 }
 
-void VulkanCommandBuffer::exec(VkQueue queue, VkFence fence) {
+void VulkanCommandBuffer::exec(VkQueue queue) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -154,16 +171,28 @@ void VulkanCommandBuffer::exec(VkQueue queue, VkFence fence) {
     if (vkEndCommandBuffer(m_primaryBuffer_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to record primary command buffer!");
     }
-    VkSubmitInfo submit_info{};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &m_primaryBuffer_;
-    wait(fence);
-    if (vkResetFences(m_device_, 1, &fence) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to reset fence!");
+    if (m_usefence_) {
+        VkSubmitInfo submit_info{};
+        submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+        submit_info.commandBufferCount = 1;
+        submit_info.pCommandBuffers = &m_primaryBuffer_;
+        wait();
+        if (vkResetFences(m_device_->getLogicalDevice(), 1, &m_fence_) !=
+            VK_SUCCESS) {
+            throw std::runtime_error("Failed to reset fence!");
+        }
+        if (vkQueueSubmit(queue, 1, &submit_info, m_fence_) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to submit command buffer!");
+        }
     }
-    if (vkQueueSubmit(queue, 1, &submit_info, fence) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to submit command buffer!");
+}
+
+void VulkanCommandBuffer::createFence(bool signaled) {
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    fence_info.flags = (signaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0);
+    if (vkCreateFence(m_device_->getLogicalDevice(), &fence_info, nullptr,
+                      &m_fence_) != VK_SUCCESS) {
     }
 }
 
