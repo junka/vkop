@@ -397,6 +397,14 @@ void VulkanImage::writeBarrier(VkCommandBuffer commandBuffer) {
                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
+void VulkanImage::readwriteBarrier(VkCommandBuffer commandBuffer) {
+    transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_ACCESS_SHADER_WRITE_BIT |
+                              VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+}
+
 void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
                                     VkBuffer buffer, VkDeviceSize offset) {
     VkImageLayout old_layout = m_layout_;

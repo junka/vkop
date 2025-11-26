@@ -193,7 +193,7 @@ void Runtime::LoadModel() {
         for (const auto &in_shape : n.inputs) {
             if (tensor_map.find(in_shape.name) != tensor_map.end()) {
                 auto t = tensor_map[in_shape.name];
-                if (t->ref_cnt() != std::numeric_limits<int>::max()) {
+                if (t->ref_cnt() != std::numeric_limits<uint16_t>::max()) {
                     t->ref_inc();
                 }
                 node_inputs.push_back(tensor_map[in_shape.name]);

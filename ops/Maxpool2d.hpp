@@ -29,8 +29,14 @@ class Maxpool2d : public Operator {
     Maxpool2d()
         : Operator(OpType::MAXPOOL2D, maxpool2d_spv, maxpool2d_spv_len,
                    sizeof(maxpool2d::GpuMaxpoolParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
+        kernel_shape_.reserve(2);
+        dilations_.reserve(2);
+        strides_.reserve(2);
+        pads_.reserve(2);
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -151,7 +157,6 @@ class Maxpool2d : public Operator {
                 output->resize(batch, depth, out_height, out_width);
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
@@ -159,7 +164,6 @@ class Maxpool2d : public Operator {
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
         int realwidth = out_width * UP_DIV(depth, 4);

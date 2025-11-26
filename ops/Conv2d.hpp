@@ -51,10 +51,17 @@ class Conv2d : public Operator {
     Conv2d()
         : Operator(OpType::CONV2D, conv2d_spv, conv2d_spv_len,
                    sizeof(conv2d::GPUConv2dParam)) {
+        n_imgs_ = 3;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
+        kernel_shape_.reserve(2);
+        dilations_.reserve(2);
+        strides_.reserve(2);
+        pads_.reserve(2);
+        activation_ = conv2d::ActivationMode::NONE;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>

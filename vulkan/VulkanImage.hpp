@@ -39,6 +39,7 @@ class VulkanImage : public VulkanResource {
     void readBarrier(VkCommandBuffer commandBuffer);
 
     void writeBarrier(VkCommandBuffer commandBuffer);
+    void readwriteBarrier(VkCommandBuffer commandBuffer);
 
     void copyImageToBuffer(VkCommandBuffer commandBuffer, VkBuffer buffer,
                            VkDeviceSize offset);

@@ -28,8 +28,10 @@ class Col2im : public Operator {
     Col2im()
         : Operator(OpType::COL2IM, col2im_spv, col2im_spv_len,
                    sizeof(col2im::GpuCol2ImParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
     }
 
   private:
@@ -49,7 +51,6 @@ class Col2im : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -58,7 +59,6 @@ class Col2im : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }

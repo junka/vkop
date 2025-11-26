@@ -26,8 +26,6 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
 
     createDescriptorPool();
     allocDescriptorSets();
-
-    // updateDescriptorSets();
 }
 
 VulkanPipeline::~VulkanPipeline() { cleanup(); }
@@ -180,23 +178,16 @@ void VulkanPipeline::allocDescriptorSets() {
 // }
 
 void VulkanPipeline::updateDescriptorSets(
-    std::vector<std::shared_ptr<VulkanResource>> m_objs) {
+    const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img) {
     std::vector<VkWriteDescriptorSet> write_descriptor_sets(m_types_.size());
     std::vector<VkDescriptorBufferInfo> buffer_infos;
     std::vector<VkDescriptorImageInfo> image_infos;
-    int n_img = 0;
-    int n_buf = 0;
-
-    for (size_t i = 0; i < m_types_.size(); i++) {
-        if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
-            buffer_infos.emplace_back(std::get<VkDescriptorBufferInfo>(
-                m_objs[i]->getDescriptorInfo()));
-        } else {
-            image_infos.emplace_back(std::get<VkDescriptorImageInfo>(
-                m_objs[i]->getDescriptorInfo()));
-        }
+    if (n_img > 0) {
+        image_infos.reserve(n_img);
     }
-
+    if (m_types_.size() - n_img > 0) {
+        buffer_infos.reserve(m_types_.size() - n_img);
+    }
     for (size_t i = 0; i < m_types_.size(); i++) {
         VkWriteDescriptorSet &write_descriptor_set = write_descriptor_sets[i];
         write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
@@ -206,9 +197,15 @@ void VulkanPipeline::updateDescriptorSets(
         write_descriptor_set.descriptorCount = 1;
         write_descriptor_set.descriptorType = m_types_[i];
         if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
-            write_descriptor_set.pBufferInfo = &buffer_infos[n_buf++];
+            buffer_infos.emplace_back(std::get<VkDescriptorBufferInfo>(
+                m_objs[i]->getDescriptorInfo()));
+            write_descriptor_set.pBufferInfo =
+                &buffer_infos[buffer_infos.size() - 1];
         } else {
-            write_descriptor_set.pImageInfo = &image_infos[n_img++];
+            image_infos.emplace_back(std::get<VkDescriptorImageInfo>(
+                m_objs[i]->getDescriptorInfo()));
+            write_descriptor_set.pImageInfo =
+                &image_infos[image_infos.size() - 1];
         }
     }
     vkUpdateDescriptorSets(m_device_,

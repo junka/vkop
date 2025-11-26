@@ -32,9 +32,11 @@ class MatMul : public Operator {
     MatMul()
         : Operator(OpType::MATMUL, matmul_spv, matmul_spv_len,
                    sizeof(matmul::GpuMatMulParam)) {
+        n_imgs_ = 0;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
     };
 
   private:
@@ -50,9 +52,8 @@ class MatMul : public Operator {
             if (outputptr->size() == 0) {
                 outputptr->resize(std::vector<int>{m, n});
             }
-            auto output_image = outputptr->as_storage_buffer(m_dev_);
-            // types_.emplace_back(output_image->getDescriptorType());
-            objs_.emplace_back(output_image);
+            auto output_buffer = outputptr->as_storage_buffer(m_dev_);
+            objs_.emplace_back(output_buffer);
         });
         for (const auto &input : inputs) {
             dispatch_by_dtype(input->dtype(), [&](auto t) {
@@ -60,7 +61,6 @@ class MatMul : public Operator {
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_buffer = inputptr->as_storage_buffer(m_dev_);
                 inputptr->copyToGPU(m_dev_, m_cmdpool_);
-                // types_.emplace_back(input_buffer->getDescriptorType());
                 objs_.emplace_back(input_buffer);
             });
         }

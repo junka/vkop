@@ -38,10 +38,12 @@ class Gemm : public Operator {
     Gemm()
         : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
                    sizeof(gemm::GpuGemmParam)) {
+        n_imgs_ = 0;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>

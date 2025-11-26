@@ -32,8 +32,10 @@ class Resize : public Operator {
     Resize()
         : Operator(OpType::RESIZE, resize_spv, resize_spv_len,
                    sizeof(resize::GpuResizeParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -177,14 +179,12 @@ class Resize : public Operator {
                 outputptr->resize(batch, depth, out_height, out_width);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
         auto roi = core::as_tensor<float>(inputs[1]);

@@ -20,10 +20,11 @@ class BinaryFactory : public Operator {
   public:
     explicit BinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
         : Operator(type, spv, spv_len, 0) {
-
+        n_imgs_ = 3;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
     }
 
   private:
@@ -41,10 +42,10 @@ class BinaryFactory : public Operator {
             objs_.emplace_back(output_image);
         });
 
-        for (const auto &input : inputs) {
-            dispatch_by_dtype(input->dtype(), [&](auto t) {
+        for (size_t i = 0; i <= 1; ++i) {
+            dispatch_by_dtype(inputs[i]->dtype(), [&](auto t) {
                 using T = decltype(t);
-                auto inputptr = core::as_tensor<T>(input);
+                auto inputptr = core::as_tensor<T>(inputs[i]);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
                 objs_.emplace_back(input_image);
             });

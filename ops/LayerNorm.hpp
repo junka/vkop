@@ -40,10 +40,12 @@ class LayerNorm : public Operator {
     LayerNorm()
         : Operator(OpType::LAYERNORM, layernorm_spv, layernorm_spv_len,
                    sizeof(layernorm::GpuLayerNormParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -68,7 +70,6 @@ class LayerNorm : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -76,7 +77,6 @@ class LayerNorm : public Operator {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
         for (size_t i = 1; i <= 2; ++i) {
@@ -85,7 +85,6 @@ class LayerNorm : public Operator {
                 auto tensor = core::as_tensor<T>(inputs[i]);
                 auto buffer = tensor->as_storage_buffer(m_dev_);
                 tensor->copyToGPU(m_dev_, m_cmdpool_);
-                // types_.emplace_back(buffer->getDescriptorType());
                 objs_.emplace_back(buffer);
             });
         }

@@ -51,20 +51,27 @@ class Operator {
     virtual void setAttribute(
         const std::unordered_map<std::string, std::string> &attributes) {
         if (!attributes.empty()) {
-            for (const auto &attr : attributes) {
-                std::cout << "Warning: Unused attribute " << attr.first
-                          << " in operator." << std::endl;
-            }
+            // for (const auto &attr : attributes) {
+            //     std::cout << "Warning: Unused attribute " << attr.first
+            //               << " in operator." << std::endl;
+            // }
         }
     }
     virtual inline std::vector<int> parse_attr_list(const std::string &str) {
         std::vector<int> result;
         if (str.front() == '[' && str.back() == ']') {
             std::string content = str.substr(1, str.size() - 2);
+            size_t comma_count = 0;
+            for (char c : content) {
+                if (c == ',')
+                    ++comma_count;
+            }
+            size_t estimated_size = comma_count + 1;
+            result.reserve(estimated_size);
             std::stringstream ss(content);
             std::string item;
             while (std::getline(ss, item, ',')) {
-                result.push_back(std::stoi(item));
+                result.emplace_back(std::stoi(item));
             }
         }
         return result;
@@ -89,7 +96,7 @@ class Operator {
     size_t pc_size_ = 0;
     uint8_t *spv_;
     uint32_t spv_len_;
-    uint64_t last_submit_value_ = 0;
+    int n_imgs_ = 0;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.
@@ -123,7 +130,7 @@ class Operator {
 
     virtual void submit(void *ptr, int out_width, int out_height) {
 
-        pipeline_->updateDescriptorSets(objs_);
+        pipeline_->updateDescriptorSets(objs_, n_imgs_);
 #ifdef USE_MEASURE_TIME
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
@@ -148,7 +155,6 @@ class Operator {
 #endif
 
         objs_.clear();
-        objs_.shrink_to_fit();
     }
 
   private:

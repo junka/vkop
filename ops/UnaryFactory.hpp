@@ -21,8 +21,10 @@ class UnaryFactory : public Operator {
   public:
     explicit UnaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
         : Operator(type, spv, spv_len, 0) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(2);
     };
 
   private:
@@ -36,15 +38,12 @@ class UnaryFactory : public Operator {
                 output->resize(inputs[0]->getShape());
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
-
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
 

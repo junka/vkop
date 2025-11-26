@@ -18,8 +18,8 @@ class VulkanPipeline {
     VkPipeline getComputePipeline() const { return m_pipeline_; }
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout_; }
     VkDescriptorSet getDescriptorSet() const { return m_descriptorSet_; }
-    void
-    updateDescriptorSets(std::vector<std::shared_ptr<VulkanResource>> m_objs);
+    void updateDescriptorSets(
+        const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img);
 
   private:
     VkDevice m_device_;

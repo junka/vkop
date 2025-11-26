@@ -45,9 +45,11 @@ class GridSample : public Operator {
     GridSample()
         : Operator(OpType::GRIDSAMPLE, grid_sample_spv, grid_sample_spv_len,
                    sizeof(gridsample::GpuGridSampleParam)) {
+        n_imgs_ = 3;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -114,16 +116,14 @@ class GridSample : public Operator {
                 outputptr->resize(batch, depth, out_height, out_width);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
-        for (const auto &input : inputs) {
-            dispatch_by_dtype(input->dtype(), [&](auto t) {
+        for (size_t i = 0; i <= 1; ++i) {
+            dispatch_by_dtype(inputs[i]->dtype(), [&](auto t) {
                 using T = decltype(t);
-                auto inputptr = core::as_tensor<T>(input);
+                auto inputptr = core::as_tensor<T>(inputs[i]);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-                // types_.emplace_back(input_image->getDescriptorType());
                 objs_.emplace_back(input_image);
             });
         }

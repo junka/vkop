@@ -38,9 +38,11 @@ class BatchNorm2d : public Operator {
     BatchNorm2d()
         : Operator(OpType::BATCHNORM, batchnorm2d_spv, batchnorm2d_spv_len,
                    sizeof(batchnorm::GpuBatchNormParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -69,7 +71,6 @@ class BatchNorm2d : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
 
@@ -77,7 +78,6 @@ class BatchNorm2d : public Operator {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
 
@@ -113,8 +113,7 @@ class BatchNorm2d : public Operator {
                 VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
                     VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
-            // types_.emplace_back(tensorBuffer_->getDescriptorType());
-            objs_.push_back(tensorBuffer_);
+            objs_.emplace_back(tensorBuffer_);
 
             auto *var_buffer =
                 static_cast<float *>(tensorBuffer_->getMappedMemory());

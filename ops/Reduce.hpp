@@ -47,8 +47,10 @@ class Reduce : public Operator {
     Reduce()
         : Operator(OpType::REDUCE, reduce_spv, reduce_spv_len,
                    sizeof(resize::GpuReduceParam)) {
+        n_imgs_ = 0;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        objs_.reserve(types_.size());
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -82,14 +84,12 @@ class Reduce : public Operator {
                 outputptr->resize(input_shape);
             }
             auto output_buffer = outputptr->as_storage_buffer(m_dev_);
-            // types_.emplace_back(output_buffer->getDescriptorType());
             objs_.emplace_back(output_buffer);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
             auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-            // types_.emplace_back(input_buffer->getDescriptorType());
             objs_.emplace_back(input_buffer);
         });
 

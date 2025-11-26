@@ -26,17 +26,37 @@ template <typename T> class Tensor;
 
 class ITensor {
   public:
-    virtual ~ITensor() = default;
     virtual const std::type_info &dtype() const = 0;
 
-    int num_dims() { return dims_.size(); };
+    int num_dims() {
+        int count = 4;
+        while (count > 0 && dims_[count - 1] == 0) {
+            count--;
+        }
+        return count;
+    }
+
+    int size() const { return size_; }
     bool is_on_GPU() const { return converted_; }
     void toGPU() { converted_ = true; }
     void toCPU() { converted_ = false; }
     void ref_inc() { ref_cnt_++; }
     int ref_cnt() const { return ref_cnt_; }
-    void set_ref_cnt_forever() { ref_cnt_ = std::numeric_limits<int>::max(); }
-    std::vector<int> getShape() { return dims_; }
+    void set_ref_cnt_forever() {
+        ref_cnt_ = std::numeric_limits<uint16_t>::max();
+    }
+    std::vector<int> getShape() {
+        if (dims_[3]) {
+            return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
+        }
+        if (dims_[2]) {
+            return std::vector<int>{dims_[0], dims_[1], dims_[2]};
+        }
+        if (dims_[1]) {
+            return std::vector<int>{dims_[0], dims_[1]};
+        }
+        return std::vector<int>{dims_[0]};
+    }
 
     static float fp16_to_fp32(uint16_t h) {
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
@@ -96,10 +116,10 @@ class ITensor {
     }
 
   protected:
-    int size_;
-    int ref_cnt_ = 0;
+    int dims_[4];
+    int size_ = 0;
+    uint16_t ref_cnt_ = 0;
     bool converted_ = false;
-    std::vector<int> dims_;
 };
 
 template <typename T> class Tensor : public ITensor {
@@ -109,42 +129,44 @@ template <typename T> class Tensor : public ITensor {
 
     // nchw
     Tensor(int n, int c, int h, int w) {
-        dims_ = std::vector<int>{n, c, h, w};
+        dims_[0] = n;
+        dims_[1] = c;
+        dims_[2] = h;
+        dims_[3] = w;
         size_ = sizeof(T) * n * c * h * w;
     }
 
     // nchw in vector
-    explicit Tensor(const std::vector<int> &dims) {
-        dims_ = dims;
-        size_ = dims_.size() ? sizeof(T) : 0;
-        for (auto d : dims_) {
+    template <typename U> explicit Tensor(const std::vector<U> &dims) {
+        memset(dims_, 0, sizeof(dims_));
+        size_ = dims.empty() ? 0 : sizeof(T);
+        int i = 0;
+        for (auto d : dims) {
             size_ *= d;
+            dims_[i++] = static_cast<int>(d);
         }
-    }
-
-    // nchw in vector
-    explicit Tensor(const std::vector<uint32_t> &dims) {
-        dims_ = std::vector<int>(dims.begin(), dims.end());
-        size_ = dims_.size() ? sizeof(T) : 0;
-        for (auto d : dims_) {
-            size_ *= d;
-        }
+        printf("dims: size %ld, %d\n", dims.size(), size_);
     }
 
     const std::type_info &dtype() const override { return typeid(T); }
 
     void resize(int n, int c, int h, int w) {
-        dims_ = std::vector<int>{n, c, h, w};
+        dims_[0] = n;
+        dims_[1] = c;
+        dims_[2] = h;
+        dims_[3] = w;
         size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
             data_.resize(n * c * h * w);
     }
 
-    void resize(const std::vector<int> &dims) {
-        dims_ = dims;
-        size_ = dims_.size() ? sizeof(T) : 0;
-        for (auto d : dims_) {
+    template <typename U> void resize(const std::vector<U> &dims) {
+        memset(dims_, 0, sizeof(dims_));
+        size_ = dims.empty() ? 0 : sizeof(T);
+        int i = 0;
+        for (auto d : dims) {
             size_ *= d;
+            dims_[i++] = static_cast<int>(d);
         }
         if (!is_on_GPU())
             data_.resize(size_ / sizeof(T));
@@ -160,7 +182,7 @@ template <typename T> class Tensor : public ITensor {
                 data_.shrink_to_fit();
             }
             size_ = 0;
-            dims_.clear();
+            memset(dims_, 0, sizeof(dims_));
         }
     }
 
@@ -201,8 +223,6 @@ template <typename T> class Tensor : public ITensor {
         }
         return data_[index];
     }
-
-    int size() { return size_; }
     int num_elements() { return size_ / sizeof(T); }
 
     std::shared_ptr<VulkanBuffer>
@@ -395,7 +415,6 @@ template <typename T> class Tensor : public ITensor {
                          const std::shared_ptr<VulkanCommandPool> &cmdpool,
                          T *src = nullptr) {
         auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-        // VkDevice device = dev->getLogicalDevice();
 
         VulkanCommandBuffer cmd(dev, cmdpool, false);
         auto stpool = cmdpool->getStagingBufferPool();
@@ -426,18 +445,14 @@ template <typename T> class Tensor : public ITensor {
                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
                         T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        // VkDevice device = dev->getLogicalDevice();
-
-        if (dims_.size() < 3) {
+        if (num_dims() < 3) {
             return;
         }
+
         VulkanCommandBuffer cmd(dev, cmdpool, false);
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
-            if (dims_.size() < 3 || is_on_GPU()) {
-                return;
-            }
             std::vector<T> ptr(img->getImageSize());
             convertTensorToRGBA(ptr.data(), src);
             img->hostImageCopyToDevice(ptr.data());

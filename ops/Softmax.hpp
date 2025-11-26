@@ -27,8 +27,10 @@ class Softmax : public Operator {
     Softmax()
         : Operator(OpType::SOFTMAX, softmax_spv, softmax_spv_len,
                    sizeof(softmax::GpuSoftMaxParam)) {
+        n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        objs_.reserve(types_.size());
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -58,7 +60,6 @@ class Softmax : public Operator {
                 output->resize(inputs[0]->getShape());
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
@@ -66,7 +67,6 @@ class Softmax : public Operator {
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         });
 
@@ -79,7 +79,6 @@ class Softmax : public Operator {
         int realheight = out_height * batch;
 
         softmax::GpuSoftMaxParam para;
-        ;
         // vkimage params
         para.outImgSize[0] = realwidth;
         para.outImgSize[1] = realheight;
