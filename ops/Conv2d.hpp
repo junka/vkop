@@ -59,28 +59,9 @@ class Conv2d : public Operator {
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        if (attributes.find("auto_pad") != attributes.end()) {
-            std::string auto_pad = attributes.at("auto_pad");
-            if (auto_pad == "VALID") {
-                pads_ = {0, 0};
-            } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
-                // SAME would let out_h = ceil(in_h/stride_h)
-                // so padding_h = ((out_h-1)*stride_h + (kernel_h-1)*dilations_h
-                // + 1 - in_h)/2 here we just set padding to kernel_size/2, and
-                // only support stride=1,dilation=1 case
-                if (strides_[0] != 1 || strides_[1] != 1 ||
-                    dilations_[0] != 1 || dilations_[1] != 1) {
-                    throw std::invalid_argument("Only support stride=1 and "
-                                                "dilation=1 for SAME auto_pad");
-                }
-                pads_ = {kernel_shape_[0] / 2, kernel_shape_[1] / 2};
-            } else if (auto_pad == "NOTSET") {
-                // do nothing
-            } else {
-                throw std::invalid_argument("Unsupported auto_pad: " +
-                                            auto_pad);
-            }
-        }
+        // for (const auto &item : attributes) {
+        //     printf("%s: %s\n", item.first.c_str(), item.second.c_str());
+        // }
         if (attributes.find("dilations") != attributes.end()) {
             std::string dila_str = attributes.at("dilations");
             if (dila_str.find(',') != std::string::npos) {
@@ -99,8 +80,8 @@ class Conv2d : public Operator {
             groups_ = 1;
         }
 
-        if (attributes.find("kernel_shape") != attributes.end()) {
-            std::string kernel_str = attributes.at("kernel_shape");
+        if (attributes.find("kernel_shape_") != attributes.end()) {
+            std::string kernel_str = attributes.at("kernel_shape_");
             if (kernel_str.find(',') != std::string::npos) {
                 kernel_shape_ = parse_attr_list(kernel_str);
             } else {
@@ -108,7 +89,7 @@ class Conv2d : public Operator {
                 kernel_shape_ = {k, k};
             }
         } else {
-            // should be inferred from weight shape
+            kernel_shape_ = {0, 0};
         }
 
         if (attributes.find("pads") != attributes.end()) {
@@ -133,6 +114,28 @@ class Conv2d : public Operator {
             }
         } else {
             strides_ = {1, 1};
+        }
+        if (attributes.find("auto_pad") != attributes.end()) {
+            std::string auto_pad = attributes.at("auto_pad");
+            if (auto_pad == "VALID") {
+                pads_ = {0, 0};
+            } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+                // SAME would let out_h = ceil(in_h/stride_h)
+                // so padding_h = ((out_h-1)*stride_h + (kernel_h-1)*dilations_h
+                // + 1 - in_h)/2 here we just set padding to kernel_size/2, and
+                // only support stride=1,dilation=1 case
+                if (strides_[0] != 1 || strides_[1] != 1 ||
+                    dilations_[0] != 1 || dilations_[1] != 1) {
+                    throw std::invalid_argument("Only support stride=1 and "
+                                                "dilation=1 for SAME auto_pad");
+                }
+                pads_ = {kernel_shape_[0] / 2, kernel_shape_[1] / 2};
+            } else if (auto_pad == "NOTSET") {
+                // do nothing
+            } else {
+                throw std::invalid_argument("Unsupported auto_pad: " +
+                                            auto_pad);
+            }
         }
 
         if (attributes.find("activation") != attributes.end()) {
@@ -171,14 +174,18 @@ class Conv2d : public Operator {
         int in_width = input_shape[3];
         int out_batch = batch;
         int out_depth = weight_shape[0];
-        int out_height = (in_height + 2 * pads_[0] -
-                          dilations_[0] * (weight_shape[2] - 1) - 1) /
-                             strides_[0] +
-                         1;
-        int out_width = (in_width + 2 * pads_[1] -
-                         dilations_[1] * (weight_shape[3] - 1) - 1) /
-                            strides_[1] +
-                        1;
+        int kernel_h =
+            kernel_shape_[0] == 0 ? weight_shape[2] : kernel_shape_[0];
+        int kernel_w =
+            kernel_shape_[1] == 0 ? weight_shape[3] : kernel_shape_[1];
+        int out_height =
+            (in_height + 2 * pads_[0] - dilations_[0] * (kernel_h - 1) - 1) /
+                strides_[0] +
+            1;
+        int out_width =
+            (in_width + 2 * pads_[1] - dilations_[1] * (kernel_w - 1) - 1) /
+                strides_[1] +
+            1;
         auto process_output = [&](auto type_tag) {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -187,7 +194,6 @@ class Conv2d : public Operator {
             }
 
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            // types_.emplace_back(output_image->getDescriptorType());
             objs_.emplace_back(output_image);
         };
         dispatch_by_dtype(outputs[0]->dtype(), process_output);
@@ -196,7 +202,6 @@ class Conv2d : public Operator {
             using T = decltype(type_tag);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
-            // types_.emplace_back(input_image->getDescriptorType());
             objs_.emplace_back(input_image);
         };
 
@@ -211,9 +216,6 @@ class Conv2d : public Operator {
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
             auto bias_buffer =
                 bias ? bias->as_storage_buffer(m_dev_) : dummyBuffer_;
-            // types_.emplace_back(weight_image->getDescriptorType());
-            // types_.emplace_back(bias ? bias_buffer->getDescriptorType()
-            //  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
             objs_.emplace_back(weight_image);
             objs_.emplace_back(bias_buffer);
         };
@@ -269,9 +271,10 @@ class Conv2d : public Operator {
         submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
     void
-    set_runtime_device(std::shared_ptr<VulkanDevice> dev,
-                       std::shared_ptr<VulkanCommandPool> cmdpool) override {
-        Operator::set_runtime_device(dev, cmdpool);
+    set_runtime_device(std::shared_ptr<VulkanDevice> &dev,
+                       std::shared_ptr<VulkanCommandPool> &cmdpool,
+                       std::shared_ptr<VulkanCommandBuffer> &cmd) override {
+        Operator::set_runtime_device(dev, cmdpool, cmd);
         dummyBuffer_ =
             std::make_shared<VulkanBuffer>(m_dev_, 4,
                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |

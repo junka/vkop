@@ -15,6 +15,7 @@ class Runtime {
     int precision_ = 0; // 0: fp32, 1: fp16
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
+    std::shared_ptr<VulkanCommandBuffer> m_cmd_;
     // Model file path
     std::string model_path_;
 
@@ -29,6 +30,7 @@ class Runtime {
 
     // Tensor pointers for each node's inputs and outputs
     std::vector<std::unique_ptr<vkop::ops::Operator>> node_ops_;
+    std::vector<std::unordered_map<std::string, std::string>> node_attrs_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_input_tensors_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_output_tensors_;
 

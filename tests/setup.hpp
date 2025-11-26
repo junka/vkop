@@ -53,13 +53,14 @@ public:
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
+                auto cmd = std::make_shared<VulkanCommandBuffer>(dev, cmdpool);
 
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(dev, cmdpool);
+                op->set_runtime_device(dev, cmdpool, cmd);
 
                 // Apply the attribute function callback if provided
                 if (attribute_func) {
@@ -83,7 +84,11 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
+                cmd->wait();
+                cmd->begin();
                 op->onExecute(inputs, outputs);
+                cmd->end();
+                cmd->submit(dev->getComputeQueue());
                 output->copyToCPU(dev, cmdpool);
                 auto oshape = output->getShape();
                 // if (oshape.size() == 4) {
@@ -152,13 +157,13 @@ public:
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-
+                auto cmd = std::make_shared<VulkanCommandBuffer>(dev, cmdpool);
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(dev, cmdpool);
+                op->set_runtime_device(dev, cmdpool, cmd);
 
                 auto output = std::make_shared<Tensor<T>>();
                 output->toGPU();
@@ -177,7 +182,11 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
+                cmd->wait();
+                cmd->begin();
                 op->onExecute(inputs, outputs);
+                cmd->end();
+                cmd->submit(dev->getComputeQueue());
                 output->copyToCPU(dev, cmdpool);
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {

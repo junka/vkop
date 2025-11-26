@@ -34,7 +34,7 @@ class VulkanCommandPool {
     std::shared_ptr<VulkanDevice> m_vdev_;
     VkCommandPool m_commandPool_ = VK_NULL_HANDLE;
     VkSemaphore m_semaphore_ = VK_NULL_HANDLE;
-    std::atomic<uint64_t> m_timelineValue_{0};
+    std::atomic<uint64_t> m_timelineValue_{1};
     std::shared_ptr<VulkanStagingBufferPool> stagingbuffer_pool_;
 
     void createCommandPool(uint32_t queueFamilyIndex);

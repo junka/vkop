@@ -5,6 +5,7 @@
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
 
 namespace vkop {
 namespace core {
@@ -13,7 +14,9 @@ Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
                  std::shared_ptr<VulkanCommandPool> cmdpool,
                  const std::string &model_path, const std::string &cache_dir)
     : m_dev_(std::move(dev)), m_cmdpool_(std::move(cmdpool)),
-      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {}
+      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {
+    m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
+}
 
 void Runtime::LoadCache() {}
 
@@ -208,11 +211,10 @@ void Runtime::LoadModel() {
             return;
         }
 
-        op->set_runtime_device(m_dev_, m_cmdpool_);
-        if (!n.attributes.empty()) {
-            op->setAttribute(n.attributes);
-        }
+        op->set_runtime_device(m_dev_, m_cmdpool_, m_cmd_);
+
         node_ops_.push_back(std::move(op));
+        node_attrs_.push_back(n.attributes);
         node_input_tensors_.push_back(std::move(node_inputs));
         node_output_tensors_.push_back(std::move(node_outputs));
     }
@@ -253,11 +255,15 @@ void Runtime::Run() {
         }
     }
     auto start = std::chrono::steady_clock::now();
+    m_cmd_->wait();
+    m_cmd_->begin();
     for (size_t i = 0; i < node_ops_.size(); ++i) {
         // printf("ops %s input tensors %ld\n",
         //        vkop::ops::convert_openum_to_string(node_ops_[i]->get_type())
         //            .c_str(),
         //        node_input_tensors_[i].size());
+
+        node_ops_[i]->setAttribute(node_attrs_[i]);
         node_ops_[i]->onExecute(node_input_tensors_[i],
                                 node_output_tensors_[i]);
         for (auto &it : node_input_tensors_[i]) {
@@ -267,6 +273,8 @@ void Runtime::Run() {
             }
         }
     }
+    m_cmd_->end();
+    m_cmd_->submit(m_dev_->getComputeQueue());
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "inference time:" << elapsed.count() << " s" << std::endl;

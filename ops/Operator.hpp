@@ -5,6 +5,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -31,12 +32,13 @@ class Operator {
     Operator(Operator &&) = delete;
     Operator &operator=(Operator &&) = delete;
 
-    virtual void
-    set_runtime_device(std::shared_ptr<VulkanDevice> dev,
-                       std::shared_ptr<VulkanCommandPool> cmdpool) {
-        m_dev_ = std::move(dev);
-        m_cmdpool_ = std::move(cmdpool);
-        m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
+    virtual void set_runtime_device(std::shared_ptr<VulkanDevice> &dev,
+                                    std::shared_ptr<VulkanCommandPool> &cmdpool,
+                                    std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        m_dev_ = dev;
+        m_cmdpool_ = cmdpool;
+        // m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
+        m_cmd_ = cmd;
         create_pipeline();
     }
     virtual void create_pipeline() {
@@ -73,8 +75,8 @@ class Operator {
     void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
                    const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
 
-        m_cmd_->wait();
-        m_cmd_->begin();
+        // m_cmd_->wait();
+        // m_cmd_->begin();
         execute(inputs, outputs);
     }
 
@@ -137,8 +139,8 @@ class Operator {
 #ifdef USE_MEASURE_TIME
         query_pool.end(m_cmd_->get());
 #endif
-        m_cmd_->end();
-        m_cmd_->submit(m_dev_->getComputeQueue());
+        // m_cmd_->end();
+        // m_cmd_->submit(m_dev_->getComputeQueue());
 #ifdef USE_MEASURE_TIME
         auto r = query_pool.getResults();
         LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
