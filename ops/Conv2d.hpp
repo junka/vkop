@@ -2,6 +2,7 @@
 #ifndef OPS_OCONV2D_HPP_
 #define OPS_OCONV2D_HPP_
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -164,12 +165,6 @@ class Conv2d : public Operator {
         std::vector<int> input_shape = inputs[0]->getShape();
         std::vector<int> weight_shape = inputs[1]->getShape();
 
-        auto dummy =
-            std::make_shared<VulkanBuffer>(m_dev_, 4,
-                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
         int batch = input_shape[0];
         int depth = input_shape[1];
         int in_height = input_shape[2];
@@ -214,7 +209,8 @@ class Conv2d : public Operator {
                 (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
 
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
-            auto bias_buffer = bias ? bias->as_storage_buffer(m_dev_) : dummy;
+            auto bias_buffer =
+                bias ? bias->as_storage_buffer(m_dev_) : dummyBuffer_;
             // types_.emplace_back(weight_image->getDescriptorType());
             // types_.emplace_back(bias ? bias_buffer->getDescriptorType()
             //  : VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
@@ -272,6 +268,20 @@ class Conv2d : public Operator {
 
         submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
     }
+    void
+    set_runtime_device(std::shared_ptr<VulkanDevice> dev,
+                       std::shared_ptr<VulkanCommandPool> cmdpool) override {
+        m_dev_ = std::move(dev);
+        m_cmdpool_ = std::move(cmdpool);
+        m_cmd_ = std::make_shared<VulkanCommandBuffer>(
+            m_dev_->getLogicalDevice(), m_cmdpool_->getCommandPool(), nullptr);
+        create_pipeline();
+        dummyBuffer_ =
+            std::make_shared<VulkanBuffer>(m_dev_, 4,
+                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
 
   private:
     std::vector<int> kernel_shape_;
@@ -280,8 +290,7 @@ class Conv2d : public Operator {
     std::vector<int> dilations_;
     int groups_;
     conv2d::ActivationMode activation_;
-
-    std::shared_ptr<VulkanBuffer> biasBuffer_;
+    std::shared_ptr<VulkanBuffer> dummyBuffer_;
 };
 
 } // namespace ops
