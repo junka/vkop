@@ -8,17 +8,22 @@
 #include "vulkan/VulkanResource.hpp"
 
 namespace vkop {
+constexpr int kInflight = 8;
 class VulkanPipeline {
   public:
-    VulkanPipeline(VkDevice device, const std::vector<VkDescriptorType> &types,
+    VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,
                    size_t pushconstant_size, const uint32_t *spirv,
                    int codesize);
     ~VulkanPipeline();
 
     VkPipeline getComputePipeline() const { return m_pipeline_; }
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout_; }
-    VkDescriptorSet getDescriptorSet() const { return m_descriptorSet_; }
+
+    VkDescriptorSet allocDescriptorSets();
+    void freeDescriptorSets(VkDescriptorSet ds);
+
     void updateDescriptorSets(
+        VkDescriptorSet ds,
         const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img);
 
   private:
@@ -30,7 +35,6 @@ class VulkanPipeline {
     VkPipeline m_pipeline_ = VK_NULL_HANDLE;
     VkPipelineLayout m_pipelineLayout_ = VK_NULL_HANDLE;
 
-    VkDescriptorSet m_descriptorSet_ = VK_NULL_HANDLE;
     VkDescriptorPool m_descriptorPool_ = VK_NULL_HANDLE;
 
     void createPipelineLayout();
@@ -43,7 +47,6 @@ class VulkanPipeline {
                                VkShaderModule shaderModule);
 
     void createDescriptorPool();
-    void allocDescriptorSets();
     // void createDescriptorUpdataTemplate();
 
     std::vector<VkDescriptorSetLayoutBinding> allocDescriptorSetLaoutBindings();

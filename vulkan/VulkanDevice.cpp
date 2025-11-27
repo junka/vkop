@@ -510,6 +510,7 @@ bool VulkanDevice::createLogicalDevice(
         // reserve half of the queues for graphics
         queue_count /= 2;
     }
+    LOG_INFO("queue count %d", queue_count);
     std::vector<float> queue_priority(queue_count, 1.0F);
     VkDeviceQueueCreateInfo queue_create_info = {};
     queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;

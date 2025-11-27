@@ -113,11 +113,10 @@ class Gemm : public Operator {
 
         submit(&para, UP_DIV(n, 16), UP_DIV(m, 16));
     }
-    void
-    set_runtime_device(std::shared_ptr<VulkanDevice> &dev,
-                       std::shared_ptr<VulkanCommandPool> &cmdpool,
-                       std::shared_ptr<VulkanCommandBuffer> &cmd) override {
-        Operator::set_runtime_device(dev, cmdpool, cmd);
+    void set_runtime_device(
+        const std::shared_ptr<VulkanDevice> &dev,
+        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
+        Operator::set_runtime_device(dev, cmdpool);
 
         dummyBuffer_ =
             std::make_shared<VulkanBuffer>(m_dev_, 4,

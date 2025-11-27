@@ -60,7 +60,7 @@ public:
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(dev, cmdpool, cmd);
+                op->set_runtime_device(dev, cmdpool);
 
                 // Apply the attribute function callback if provided
                 if (attribute_func) {
@@ -86,7 +86,7 @@ public:
                 }
                 cmd->wait();
                 cmd->begin();
-                op->onExecute(inputs, outputs);
+                op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
                 output->copyToCPU(dev, cmdpool);
@@ -163,7 +163,7 @@ public:
                     LOG_ERROR("Fail to create operator");
                     return false;
                 }
-                op->set_runtime_device(dev, cmdpool, cmd);
+                op->set_runtime_device(dev, cmdpool);
 
                 auto output = std::make_shared<Tensor<T>>();
                 output->toGPU();
@@ -184,7 +184,7 @@ public:
                 }
                 cmd->wait();
                 cmd->begin();
-                op->onExecute(inputs, outputs);
+                op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
                 output->copyToCPU(dev, cmdpool);

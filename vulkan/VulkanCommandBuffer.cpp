@@ -1,5 +1,6 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanCommandBuffer.hpp"
+
 #include "vulkan/VulkanLib.hpp"
 
 namespace vkop {
@@ -7,9 +8,9 @@ namespace vkop {
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 VulkanCommandBuffer::VulkanCommandBuffer(
-    const std::shared_ptr<VulkanDevice> &device,
-    const std::shared_ptr<VulkanCommandPool> &cmdpool, bool signaled)
-    : m_device_(device), m_cmdpool_(cmdpool) {
+    std::shared_ptr<VulkanDevice> device,
+    std::shared_ptr<VulkanCommandPool> cmdpool, bool signaled)
+    : m_device_(std::move(device)), m_cmdpool_(std::move(cmdpool)) {
     allocate();
     m_usefence_ =
 #ifndef VK_KHR_timeline_semaphore
@@ -23,10 +24,10 @@ VulkanCommandBuffer::VulkanCommandBuffer(
     }
 }
 
-void VulkanCommandBuffer::bind(VulkanPipeline &pipeline) {
+void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
+                               VkDescriptorSet descriptor_set) {
     vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline.getComputePipeline());
-    VkDescriptorSet descriptor_set = pipeline.getDescriptorSet();
     vkCmdBindDescriptorSets(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline.getPipelineLayout(), 0, 1, &descriptor_set,
                             0, nullptr);
@@ -95,9 +96,9 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
         submit_info.pSignalSemaphores = &semaphore;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &m_commandBuffer_;
-
-        if (vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE) !=
-            VK_SUCCESS) {
+        auto ret = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+        if (ret != VK_SUCCESS) {
+            printf("ret %d\n", ret);
             throw std::runtime_error("Failed to submit sem command buffer!");
         }
         return m_timelineValue_;
@@ -106,8 +107,8 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &m_commandBuffer_;
-
-    if (vkQueueSubmit(queue, 1, &submit_info, m_fence_) != VK_SUCCESS) {
+    auto ret = vkQueueSubmit(queue, 1, &submit_info, m_fence_);
+    if (ret != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
 
@@ -181,7 +182,8 @@ void VulkanCommandBuffer::exec(VkQueue queue) {
             VK_SUCCESS) {
             throw std::runtime_error("Failed to reset fence!");
         }
-        if (vkQueueSubmit(queue, 1, &submit_info, m_fence_) != VK_SUCCESS) {
+        auto ret = vkQueueSubmit(queue, 1, &submit_info, m_fence_);
+        if (ret != VK_SUCCESS) {
             throw std::runtime_error("Failed to submit command buffer!");
         }
     }

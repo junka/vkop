@@ -1,10 +1,8 @@
 // Copyright 2025 @junka
 #include "VulkanLib.hpp"
 
-#include <cstddef>
 #include <map>
 #include <stdexcept>
-#include <sys/syslog.h>
 #include <vector>
 
 #include "vulkan/VulkanPipeline.hpp"
@@ -12,10 +10,10 @@
 
 namespace vkop {
 VulkanPipeline::VulkanPipeline(VkDevice device,
-                               const std::vector<VkDescriptorType> &types,
+                               std::vector<VkDescriptorType> types,
                                size_t pushconstant_size, const uint32_t *spirv,
                                int codesize)
-    : m_device_(device), m_types_(types),
+    : m_device_(device), m_types_(std::move(types)),
       m_pushconstant_size_(pushconstant_size) {
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout();
@@ -25,7 +23,6 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
     // could destroy shader here
 
     createDescriptorPool();
-    allocDescriptorSets();
 }
 
 VulkanPipeline::~VulkanPipeline() { cleanup(); }
@@ -98,7 +95,7 @@ void VulkanPipeline::createDescriptorPool() {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descriptor_pool_create_info.flags =
         VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    descriptor_pool_create_info.maxSets = 1;
+    descriptor_pool_create_info.maxSets = kInflight;
     descriptor_pool_create_info.poolSizeCount = pool_sizes.size();
     descriptor_pool_create_info.pPoolSizes = pool_sizes.data();
     if (vkCreateDescriptorPool(m_device_, &descriptor_pool_create_info, nullptr,
@@ -130,7 +127,8 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     }
 }
 
-void VulkanPipeline::allocDescriptorSets() {
+VkDescriptorSet VulkanPipeline::allocDescriptorSets() {
+    VkDescriptorSet descriptor_set;
     VkDescriptorSetAllocateInfo descriptor_set_allocate_info = {};
     descriptor_set_allocate_info.sType =
         VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -138,9 +136,18 @@ void VulkanPipeline::allocDescriptorSets() {
     descriptor_set_allocate_info.descriptorSetCount = 1;
     descriptor_set_allocate_info.pSetLayouts = &m_descriptorSetLayout_;
 
-    if (vkAllocateDescriptorSets(m_device_, &descriptor_set_allocate_info,
-                                 &m_descriptorSet_) != VK_SUCCESS) {
+    auto ret = vkAllocateDescriptorSets(
+        m_device_, &descriptor_set_allocate_info, &descriptor_set);
+    if (ret != VK_SUCCESS) {
+        printf("allocate descriptor set fail %d\n", ret);
         throw std::runtime_error("Failed to allocate descriptor set!");
+    }
+    return descriptor_set;
+}
+
+void VulkanPipeline::freeDescriptorSets(VkDescriptorSet ds) {
+    if (ds != VK_NULL_HANDLE) {
+        vkFreeDescriptorSets(m_device_, m_descriptorPool_, 1, &ds);
     }
 }
 
@@ -178,6 +185,7 @@ void VulkanPipeline::allocDescriptorSets() {
 // }
 
 void VulkanPipeline::updateDescriptorSets(
+    VkDescriptorSet ds,
     const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img) {
     std::vector<VkWriteDescriptorSet> write_descriptor_sets(m_types_.size());
     std::vector<VkDescriptorBufferInfo> buffer_infos;
@@ -191,7 +199,7 @@ void VulkanPipeline::updateDescriptorSets(
     for (size_t i = 0; i < m_types_.size(); i++) {
         VkWriteDescriptorSet &write_descriptor_set = write_descriptor_sets[i];
         write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write_descriptor_set.dstSet = m_descriptorSet_;
+        write_descriptor_set.dstSet = ds;
         write_descriptor_set.dstBinding = static_cast<uint32_t>(i);
         write_descriptor_set.dstArrayElement = 0;
         write_descriptor_set.descriptorCount = 1;
@@ -214,11 +222,6 @@ void VulkanPipeline::updateDescriptorSets(
 }
 
 void VulkanPipeline::cleanup() {
-    if (m_descriptorSet_ != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(m_device_, m_descriptorPool_, 1,
-                             &m_descriptorSet_);
-        m_descriptorSet_ = VK_NULL_HANDLE;
-    }
     if (m_descriptorPool_ != VK_NULL_HANDLE) {
         vkDestroyDescriptorPool(m_device_, m_descriptorPool_, nullptr);
         m_descriptorPool_ = VK_NULL_HANDLE;

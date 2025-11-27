@@ -5,7 +5,6 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
-#include <utility>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -17,13 +16,16 @@
 
 namespace vkop {
 namespace ops {
-
 class Operator {
   public:
     explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
                       size_t pc_size = 0)
         : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len) {}
     virtual ~Operator() {
+        for (auto &m_d : m_ds_) {
+            if (m_d)
+                pipeline_->freeDescriptorSets(m_d);
+        }
         m_cmdpool_ = nullptr;
         m_dev_ = nullptr;
     };
@@ -32,20 +34,17 @@ class Operator {
     Operator(Operator &&) = delete;
     Operator &operator=(Operator &&) = delete;
 
-    virtual void set_runtime_device(std::shared_ptr<VulkanDevice> &dev,
-                                    std::shared_ptr<VulkanCommandPool> &cmdpool,
-                                    std::shared_ptr<VulkanCommandBuffer> &cmd) {
+    virtual void
+    set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
+                       const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
-        // m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
-        m_cmd_ = cmd;
-        create_pipeline();
-    }
-    virtual void create_pipeline() {
-        VkDevice device = m_dev_->getLogicalDevice();
         pipeline_ = std::make_shared<VulkanPipeline>(
-            device, types_, pc_size_, reinterpret_cast<const uint32_t *>(spv_),
-            spv_len_);
+            m_dev_->getLogicalDevice(), types_, pc_size_,
+            reinterpret_cast<const uint32_t *>(spv_), spv_len_);
+        for (auto &ds : m_ds_) {
+            ds = pipeline_->allocDescriptorSets();
+        }
     }
 
     virtual void setAttribute(
@@ -71,7 +70,15 @@ class Operator {
             std::stringstream ss(content);
             std::string item;
             while (std::getline(ss, item, ',')) {
-                result.emplace_back(std::stoi(item));
+                try {
+                    result.emplace_back(std::stoi(item));
+                } catch (const std::invalid_argument &e) {
+                    throw std::runtime_error(
+                        "Invalid number in attribute list: " + item);
+                } catch (const std::out_of_range &e) {
+                    throw std::runtime_error(
+                        "Number out of range in attribute list: " + item);
+                }
             }
         }
         return result;
@@ -80,10 +87,10 @@ class Operator {
     virtual OpType get_type() { return type_; }
 
     void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-                   const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
-
-        // m_cmd_->wait();
-        // m_cmd_->begin();
+                   const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                   std::shared_ptr<VulkanCommandBuffer> cmd, int id) {
+        m_cmd_ = std::move(cmd);
+        m_id_ = id;
         execute(inputs, outputs);
     }
 
@@ -92,6 +99,8 @@ class Operator {
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     std::shared_ptr<VulkanCommandBuffer> m_cmd_;
     std::shared_ptr<VulkanPipeline> pipeline_;
+    VkDescriptorSet m_ds_[vkop::kInflight] = {nullptr};
+    int m_id_;
     OpType type_;
     size_t pc_size_ = 0;
     uint8_t *spv_;
@@ -129,13 +138,15 @@ class Operator {
     }
 
     virtual void submit(void *ptr, int out_width, int out_height) {
-
-        pipeline_->updateDescriptorSets(objs_, n_imgs_);
+        if (!m_ds_[m_id_]) {
+            m_ds_[m_id_] = pipeline_->allocDescriptorSets();
+        }
+        pipeline_->updateDescriptorSets(m_ds_[m_id_], objs_, n_imgs_);
 #ifdef USE_MEASURE_TIME
         VkDevice device = m_dev_->getLogicalDevice();
         VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
 #endif
-        m_cmd_->bind(*pipeline_);
+        m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
 #ifdef USE_MEASURE_TIME
         query_pool.begin(m_cmd_->get());
 #endif

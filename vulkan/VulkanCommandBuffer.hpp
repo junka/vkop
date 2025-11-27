@@ -11,8 +11,8 @@
 namespace vkop {
 class VulkanCommandBuffer {
   public:
-    VulkanCommandBuffer(const std::shared_ptr<VulkanDevice> &device,
-                        const std::shared_ptr<VulkanCommandPool> &cmdpool,
+    VulkanCommandBuffer(std::shared_ptr<VulkanDevice> device,
+                        std::shared_ptr<VulkanCommandPool> cmdpool,
                         bool signaled = true);
     ~VulkanCommandBuffer();
 
@@ -24,7 +24,7 @@ class VulkanCommandBuffer {
     // End recording commands
     void end();
 
-    void bind(VulkanPipeline &pipeline);
+    void bind(VulkanPipeline &pipeline, VkDescriptorSet descriptor_set);
 
     // Submit the command buffer to a queue
     int submit(VkQueue queue);

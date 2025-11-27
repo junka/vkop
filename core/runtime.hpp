@@ -13,9 +13,9 @@ namespace core {
 class Runtime {
   private:
     int precision_ = 0; // 0: fp32, 1: fp16
+    std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
-    std::shared_ptr<VulkanCommandBuffer> m_cmd_;
     // Model file path
     std::string model_path_;
 
@@ -36,10 +36,9 @@ class Runtime {
 
   public:
     // Constructor
-    explicit Runtime(const std::shared_ptr<VulkanDevice> &dev,
-                     const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                     const std::string &model_path,
-                     const std::string &cache_dir = "");
+    explicit Runtime(std::shared_ptr<VulkanDevice> dev,
+                     std::shared_ptr<VulkanCommandPool> cmdpool,
+                     std::string model_path, std::string cache_dir = "");
     ~Runtime() = default;
 
     // Load cache if available

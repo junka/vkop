@@ -1,6 +1,7 @@
 // junka @ 2025
 #include <chrono>
 #include <numeric>
+#include <utility>
 
 #include "core/runtime.hpp"
 #include "model/load.hpp"
@@ -10,13 +11,11 @@
 namespace vkop {
 namespace core {
 
-Runtime::Runtime(const std::shared_ptr<VulkanDevice> &dev,
-                 const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                 const std::string &model_path, const std::string &cache_dir)
-    : m_dev_(dev), m_cmdpool_(cmdpool), model_path_(std::move(model_path)),
-      cache_dir_(std::move(cache_dir)) {
-    m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
-}
+Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
+                 std::shared_ptr<VulkanCommandPool> cmdpool,
+                 std::string model_path, std::string cache_dir)
+    : m_dev_(std::move(dev)), m_cmdpool_(std::move(cmdpool)),
+      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {}
 
 void Runtime::LoadCache() {}
 
@@ -211,7 +210,7 @@ void Runtime::LoadModel() {
             return;
         }
 
-        op->set_runtime_device(m_dev_, m_cmdpool_, m_cmd_);
+        op->set_runtime_device(m_dev_, m_cmdpool_);
         op->setAttribute(n.attributes);
 
         node_ops_.push_back(std::move(op));
@@ -246,6 +245,10 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
 }
 
 void Runtime::Run() {
+    static int id = 0;
+    if (m_cmds_[id] == nullptr) {
+        m_cmds_[id] = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
+    }
     for (auto &p : inputs_) {
         if (p.second->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(p.second);
@@ -256,16 +259,21 @@ void Runtime::Run() {
         }
     }
     auto start = std::chrono::steady_clock::now();
-    m_cmd_->wait();
-    m_cmd_->begin();
+    m_cmds_[id]->wait();
+    m_cmds_[id]->begin();
+#ifdef USE_MEASURE_TIME
+    VkDevice device = m_dev_->getLogicalDevice();
+    VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
+    query_pool.begin(m_cmds_[id]->get());
+#endif
     for (size_t i = 0; i < node_ops_.size(); ++i) {
         // printf("ops %s input tensors %ld\n",
         //        vkop::ops::convert_openum_to_string(node_ops_[i]->get_type())
         //            .c_str(),
         //        node_input_tensors_[i].size());
 
-        node_ops_[i]->onExecute(node_input_tensors_[i],
-                                node_output_tensors_[i]);
+        node_ops_[i]->onExecute(node_input_tensors_[i], node_output_tensors_[i],
+                                m_cmds_[id], id);
         for (auto &it : node_input_tensors_[i]) {
             auto t = vkop::core::as_tensor<float>(it);
             if (t && t->ref_cnt() == 1) {
@@ -273,11 +281,21 @@ void Runtime::Run() {
             }
         }
     }
-    m_cmd_->end();
-    m_cmd_->submit(m_dev_->getComputeQueue());
+#ifdef USE_MEASURE_TIME
+    query_pool.end(m_cmds_[id]->get());
+#endif
+    m_cmds_[id]->end();
+    m_cmds_[id]->submit(m_dev_->getComputeQueue());
+#ifdef USE_MEASURE_TIME
+    auto r = query_pool.getResults();
+    LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
+                               m_dev_->getTimestampPeriod());
+#endif
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
+    id++;
+    id %= vkop::kInflight;
 }
 
 void Runtime::ReadResult() {
