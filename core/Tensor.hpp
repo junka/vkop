@@ -145,7 +145,6 @@ template <typename T> class Tensor : public ITensor {
             size_ *= d;
             dims_[i++] = static_cast<int>(d);
         }
-        printf("dims: size %ld, %d\n", dims.size(), size_);
     }
 
     const std::type_info &dtype() const override { return typeid(T); }

@@ -36,8 +36,8 @@ class Runtime {
 
   public:
     // Constructor
-    explicit Runtime(std::shared_ptr<VulkanDevice> dev,
-                     std::shared_ptr<VulkanCommandPool> cmdpool,
+    explicit Runtime(const std::shared_ptr<VulkanDevice> &dev,
+                     const std::shared_ptr<VulkanCommandPool> &cmdpool,
                      const std::string &model_path,
                      const std::string &cache_dir = "");
     ~Runtime() = default;

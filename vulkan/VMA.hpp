@@ -10,9 +10,11 @@
 struct VmaAllocation_T;
 struct VmaAllocator_T;
 struct VmaAllocationInfo;
+struct VmaPool_T;
 
 using VmaAllocator = struct VmaAllocator_T *;
 using VmaAllocation = struct VmaAllocation_T *;
+using VmaPool = struct VmaPool_T *;
 
 namespace vkop {
 
@@ -22,12 +24,12 @@ class VMA {
     struct VmaBuffer {
         VkBuffer buffer;
         VmaAllocation allocation;
-        VmaAllocationInfo *info;
+        VmaAllocator allocator;
     };
     struct VmaImage {
         VkImage image;
         VmaAllocation allocation;
-        VmaAllocationInfo *info;
+        VmaAllocator allocator;
     };
 
     VMA(VkPhysicalDevice physicalDevice, VkDevice device);
@@ -47,7 +49,6 @@ class VMA {
     void destroyImage(struct VmaImage *img);
 
     static void *getMappedMemory(struct VmaBuffer *buf);
-    static void *getMappedMemory(struct VmaImage *img);
 
     VMA() = delete;
     VMA(const VMA &) = delete;
@@ -57,6 +58,10 @@ class VMA {
 
   private:
     VmaAllocator allocator_;
+    VmaPool device_pool_ = VK_NULL_HANDLE;
+    VmaPool staging_pool_ = VK_NULL_HANDLE;
+
+    void createPools();
 };
 
 } // namespace vkop

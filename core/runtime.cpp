@@ -10,11 +10,11 @@
 namespace vkop {
 namespace core {
 
-Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
-                 std::shared_ptr<VulkanCommandPool> cmdpool,
+Runtime::Runtime(const std::shared_ptr<VulkanDevice> &dev,
+                 const std::shared_ptr<VulkanCommandPool> &cmdpool,
                  const std::string &model_path, const std::string &cache_dir)
-    : m_dev_(std::move(dev)), m_cmdpool_(std::move(cmdpool)),
-      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {
+    : m_dev_(dev), m_cmdpool_(cmdpool), model_path_(std::move(model_path)),
+      cache_dir_(std::move(cache_dir)) {
     m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
 }
 

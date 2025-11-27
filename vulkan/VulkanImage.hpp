@@ -62,12 +62,6 @@ class VulkanImage : public VulkanResource {
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
 
-#ifdef USE_VMA
-    void *getMappedMemory() override {
-        return VMA::getMappedMemory(&m_vma_image_);
-    };
-#endif
-
   private:
     VkExtent3D m_dim_;
     VkFormat m_format_;

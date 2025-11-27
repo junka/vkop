@@ -112,7 +112,7 @@ endif()
 option(USE_VALIDATION_LAYERS "Enable validation layers" OFF)
 option(USE_DEBUG_LAYERS "Enable debug layers" OFF)
 option(USE_MEASURE_TIME "Enable measuring time" OFF)
-option(USE_VMA "Enable usage of Vulkan Memory Allocator" OFF)
+option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
 
 if(USE_VALIDATION_LAYERS)
     target_compile_definitions(vkop PRIVATE USE_VALIDATION_LAYERS)

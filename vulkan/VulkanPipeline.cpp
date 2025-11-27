@@ -12,10 +12,10 @@
 
 namespace vkop {
 VulkanPipeline::VulkanPipeline(VkDevice device,
-                               std::vector<VkDescriptorType> types,
+                               const std::vector<VkDescriptorType> &types,
                                size_t pushconstant_size, const uint32_t *spirv,
                                int codesize)
-    : m_device_(device), m_types_(std::move(types)),
+    : m_device_(device), m_types_(types),
       m_pushconstant_size_(pushconstant_size) {
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout();

@@ -10,7 +10,7 @@
 namespace vkop {
 class VulkanPipeline {
   public:
-    VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,
+    VulkanPipeline(VkDevice device, const std::vector<VkDescriptorType> &types,
                    size_t pushconstant_size, const uint32_t *spirv,
                    int codesize);
     ~VulkanPipeline();

@@ -48,7 +48,6 @@ class VulkanBuffer : public VulkanResource {
     VkBuffer m_buffer_ = VK_NULL_HANDLE;
 #else
     VMA::VmaBuffer m_vma_buffer_;
-
 #endif
     VkDeviceSize m_size_;
     VkAccessFlags m_access_ = 0;
