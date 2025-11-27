@@ -212,6 +212,7 @@ void Runtime::LoadModel() {
         }
 
         op->set_runtime_device(m_dev_, m_cmdpool_, m_cmd_);
+        op->setAttribute(n.attributes);
 
         node_ops_.push_back(std::move(op));
         node_attrs_.push_back(n.attributes);
@@ -263,7 +264,6 @@ void Runtime::Run() {
         //            .c_str(),
         //        node_input_tensors_[i].size());
 
-        node_ops_[i]->setAttribute(node_attrs_[i]);
         node_ops_[i]->onExecute(node_input_tensors_[i],
                                 node_output_tensors_[i]);
         for (auto &it : node_input_tensors_[i]) {
