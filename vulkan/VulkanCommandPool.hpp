@@ -17,7 +17,9 @@ class VulkanCommandPool {
 
     void reset(VkCommandPoolResetFlags flags = 0);
 
-    VkCommandPool getCommandPool() const { return m_commandPool_; }
+    VkCommandPool getCommandPool(int idx = 0) const {
+        return m_commandPool_[idx % m_commandPool_.size()];
+    }
 
     uint64_t getCompletedTimelineValue();
 
@@ -32,7 +34,7 @@ class VulkanCommandPool {
 
   private:
     std::shared_ptr<VulkanDevice> m_vdev_;
-    VkCommandPool m_commandPool_ = VK_NULL_HANDLE;
+    std::vector<VkCommandPool> m_commandPool_;
     VkSemaphore m_semaphore_ = VK_NULL_HANDLE;
     std::atomic<uint64_t> m_timelineValue_{1};
     std::shared_ptr<VulkanStagingBufferPool> stagingbuffer_pool_;

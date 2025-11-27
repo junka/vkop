@@ -2,11 +2,50 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
+#include <bits/stdint-uintn.h>
 #include <vector>
 
 #include "vulkan/VMA.hpp"
 
 namespace vkop {
+class VulkanQueue {
+  public:
+    VulkanQueue(VkDevice dev, uint32_t familyIdx, VkQueue queue)
+        : logicalDevice_(dev), familyIdx_(familyIdx), queue_(queue) {
+        createSemaphore();
+    }
+    ~VulkanQueue() { destroySemaphore(); }
+
+    VkQueue getQueue() const { return queue_; }
+    VkSemaphore getSemaphore() const { return m_semaphore_; }
+    uint32_t getFamilyIdx() const { return familyIdx_; }
+
+  private:
+    VkDevice logicalDevice_ = VK_NULL_HANDLE;
+    uint32_t familyIdx_;
+    VkQueue queue_ = VK_NULL_HANDLE;
+    VkSemaphore m_semaphore_ = VK_NULL_HANDLE;
+
+    void createSemaphore() {
+        VkSemaphoreTypeCreateInfo timeline_info{};
+        timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+        timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+        timeline_info.initialValue = 0;
+
+        VkSemaphoreCreateInfo sem_info{};
+        sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+        sem_info.pNext = &timeline_info;
+        if (vkCreateSemaphore(logicalDevice_, &sem_info, nullptr,
+                              &m_semaphore_) != VK_SUCCESS) {
+            throw std::runtime_error("Failed to create timeline semaphore");
+        }
+    }
+    void destroySemaphore() {
+        if (m_semaphore_) {
+            vkDestroySemaphore(logicalDevice_, m_semaphore_, nullptr);
+        }
+    }
+};
 
 class VulkanDevice {
 
@@ -30,14 +69,19 @@ class VulkanDevice {
     // Getters
     VkDevice getLogicalDevice() const { return logicalDevice_; }
     VkPhysicalDevice getPhysicalDevice() const { return physicalDevice_; }
-    VkQueue getComputeQueue(uint32_t idx = 0) const {
-        return computeQueues_[idx % computeQueues_.size()];
+    std::shared_ptr<VulkanQueue> getComputeQueue(uint32_t idx = 0) const {
+        int offset = idx / 2;
+        int cat = idx % 2;
+        cat = cat * 4;
+        cat += offset;
+        return computeQueues_[(cat) % computeQueues_.size()];
     }
 
     std::string getDeviceName() const { return deviceName_; }
 
-    int getComputeQueueFamilyIndex() const {
-        return std::get<0>(computeQueueIdxs_[0]);
+    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
+    getComputeQueueFamilyIndex() const {
+        return computeQueueIdxs_;
     }
 
     float getTimestampPeriod() const { return timestampPeriod_; }
@@ -65,7 +109,7 @@ class VulkanDevice {
   private:
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice logicalDevice_ = VK_NULL_HANDLE;
-    std::vector<VkQueue> computeQueues_;
+    std::vector<std::shared_ptr<VulkanQueue>> computeQueues_;
 
     bool m_support_host_image_copy_ = false;
     bool m_support_buffer_device_address_ = false;

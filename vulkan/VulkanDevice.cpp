@@ -32,6 +32,9 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
 }
 
 VulkanDevice::~VulkanDevice() {
+    for (auto &queue : computeQueues_) {
+        queue.reset();
+    }
 #ifdef USE_VMA
     m_vma_.reset();
 #endif
@@ -86,25 +89,20 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
     vkGetPhysicalDeviceQueueFamilyProperties(
         physicalDevice_, &queue_family_count, queue_families.data());
 
-    const VkQueueFlags required = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
-    const VkQueueFlags forbidden = VK_QUEUE_GRAPHICS_BIT;
-    // graphics as fallback
-    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> fallback;
-    for (uint32_t i = 0; i < queue_families.size(); i++) {
-        if ((queue_families[i].queueFlags & (required)) != (required)) {
-            continue;
-        }
+    const VkQueueFlags first = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    const VkQueueFlags second =
+        VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
 
-        std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
-            i, queue_families[i].queueCount, queue_families[i].queueFlags};
-        if (!(queue_families[i].queueFlags & forbidden)) {
+    for (uint32_t i = 0; i < queue_families.size(); i++) {
+        if ((queue_families[i].queueFlags & (first)) == (first)) {
+            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
+                i, queue_families[i].queueCount, queue_families[i].queueFlags};
             computeQueueIdxs_.emplace_back(t);
-        } else {
-            fallback.emplace_back(t);
+        } else if ((queue_families[i].queueFlags & (second)) == (second)) {
+            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
+                i, queue_families[i].queueCount, queue_families[i].queueFlags};
+            computeQueueIdxs_.emplace_back(t);
         }
-    }
-    if (computeQueueIdxs_.empty() && !fallback.empty()) {
-        computeQueueIdxs_ = fallback;
     }
 
     return computeQueueIdxs_.size();
@@ -504,25 +502,29 @@ bool VulkanDevice::createLogicalDevice(
             ptr = feat;
         }
     }
+    std::vector<VkDeviceQueueCreateInfo> queue_create_info(
+        computeQueueIdxs_.size());
 
-    auto [qidx, queue_count, queueflags] = computeQueueIdxs_[0];
-    if (queue_count >= 4) {
-        // reserve half of the queues for graphics
-        queue_count /= 2;
+    std::vector<std::vector<float>> queue_priority(computeQueueIdxs_.size());
+    for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
+        auto [qidx, queue_count, queueflags] = computeQueueIdxs_[i];
+        LOG_INFO("queue count %d", queue_count);
+        if (queue_count >= 4) {
+            // reserve queues from one familiy
+            queue_count = 4;
+        }
+        queue_priority[i].resize(queue_count);
+        std::fill(queue_priority[i].begin(), queue_priority[i].end(), 1.0F);
+        queue_create_info[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
+        queue_create_info[i].queueFamilyIndex = qidx;
+        // multiqueue for pipeline parallelism
+        queue_create_info[i].queueCount = queue_count;
+        queue_create_info[i].pQueuePriorities = queue_priority[i].data();
     }
-    LOG_INFO("queue count %d", queue_count);
-    std::vector<float> queue_priority(queue_count, 1.0F);
-    VkDeviceQueueCreateInfo queue_create_info = {};
-    queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
-    queue_create_info.queueFamilyIndex = qidx;
-    // multiqueue for pipeline parallelism
-    queue_create_info.queueCount = queue_count;
-    queue_create_info.pQueuePriorities = queue_priority.data();
-
     VkDeviceCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    create_info.queueCreateInfoCount = 1;
-    create_info.pQueueCreateInfos = &queue_create_info;
+    create_info.queueCreateInfoCount = queue_create_info.size();
+    create_info.pQueueCreateInfos = queue_create_info.data();
     create_info.enabledLayerCount = 0;
     create_info.ppEnabledLayerNames = nullptr;
     create_info.pEnabledFeatures = &features;
@@ -541,10 +543,17 @@ bool VulkanDevice::createLogicalDevice(
         LOG_ERROR("Failed to create logical device!");
         return false;
     }
-    for (uint32_t i = 0; i < queue_count; i++) {
-        VkQueue queue;
-        vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
-        computeQueues_.push_back(queue);
+
+    for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {
+        if (queue_count >= 4) {
+            queue_count = 4;
+        }
+        for (uint32_t i = 0; i < queue_count; i++) {
+            VkQueue queue;
+            vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
+            computeQueues_.emplace_back(
+                std::make_shared<VulkanQueue>(logicalDevice_, qidx, queue));
+        }
     }
     return true;
 }

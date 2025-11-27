@@ -84,7 +84,7 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
-                cmd->wait();
+                cmd->wait(dev->getComputeQueue());
                 cmd->begin();
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
@@ -182,7 +182,7 @@ public:
                     t->as_input_image(dev, nullptr);
                     t->copyToGPU(dev, cmdpool);
                 }
-                cmd->wait();
+                cmd->wait(dev->getComputeQueue());
                 cmd->begin();
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();

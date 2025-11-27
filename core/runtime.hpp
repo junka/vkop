@@ -39,7 +39,7 @@ class Runtime {
     explicit Runtime(std::shared_ptr<VulkanDevice> dev,
                      std::shared_ptr<VulkanCommandPool> cmdpool,
                      std::string model_path, std::string cache_dir = "");
-    ~Runtime() = default;
+    ~Runtime();
 
     // Load cache if available
     void LoadCache();

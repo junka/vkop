@@ -9,8 +9,8 @@ namespace vkop {
 
 VulkanCommandBuffer::VulkanCommandBuffer(
     std::shared_ptr<VulkanDevice> device,
-    std::shared_ptr<VulkanCommandPool> cmdpool, bool signaled)
-    : m_device_(std::move(device)), m_cmdpool_(std::move(cmdpool)) {
+    std::shared_ptr<VulkanCommandPool> cmdpool, bool signaled, int id)
+    : id_(id), m_device_(std::move(device)), m_cmdpool_(std::move(cmdpool)) {
     allocate();
     m_usefence_ =
 #ifndef VK_KHR_timeline_semaphore
@@ -40,12 +40,12 @@ VulkanCommandBuffer::~VulkanCommandBuffer() {
     }
     if (m_commandBuffer_) {
         vkFreeCommandBuffers(m_device_->getLogicalDevice(),
-                             m_cmdpool_->getCommandPool(), 1,
+                             m_cmdpool_->getCommandPool(id_), 1,
                              &m_commandBuffer_);
     }
     if (m_primaryBuffer_) {
         vkFreeCommandBuffers(m_device_->getLogicalDevice(),
-                             m_cmdpool_->getCommandPool(), 1,
+                             m_cmdpool_->getCommandPool(id_), 1,
                              &m_primaryBuffer_);
     }
 }
@@ -53,7 +53,7 @@ VulkanCommandBuffer::~VulkanCommandBuffer() {
 void VulkanCommandBuffer::allocate() {
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    alloc_info.commandPool = m_cmdpool_->getCommandPool();
+    alloc_info.commandPool = m_cmdpool_->getCommandPool(id_);
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount = 1;
 
@@ -79,7 +79,7 @@ void VulkanCommandBuffer::end() {
     }
 }
 
-int VulkanCommandBuffer::submit(VkQueue queue) {
+int VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
     if (!m_usefence_) {
         m_timelineValue_ = m_cmdpool_->getNextSubmitValue();
         VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
@@ -88,7 +88,7 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
         timeline_submit_info.signalSemaphoreValueCount = 1;
         timeline_submit_info.pSignalSemaphoreValues = &m_timelineValue_;
 
-        auto *semaphore = m_cmdpool_->getSemaphore();
+        auto *semaphore = queue->getSemaphore();
         VkSubmitInfo submit_info{};
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.pNext = &timeline_submit_info;
@@ -96,7 +96,8 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
         submit_info.pSignalSemaphores = &semaphore;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &m_commandBuffer_;
-        auto ret = vkQueueSubmit(queue, 1, &submit_info, VK_NULL_HANDLE);
+        auto ret =
+            vkQueueSubmit(queue->getQueue(), 1, &submit_info, VK_NULL_HANDLE);
         if (ret != VK_SUCCESS) {
             printf("ret %d\n", ret);
             throw std::runtime_error("Failed to submit sem command buffer!");
@@ -107,7 +108,7 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &m_commandBuffer_;
-    auto ret = vkQueueSubmit(queue, 1, &submit_info, m_fence_);
+    auto ret = vkQueueSubmit(queue->getQueue(), 1, &submit_info, m_fence_);
     if (ret != VK_SUCCESS) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
@@ -115,10 +116,10 @@ int VulkanCommandBuffer::submit(VkQueue queue) {
     return m_cmdpool_->getCompletedTimelineValue();
 }
 
-int VulkanCommandBuffer::wait() {
+int VulkanCommandBuffer::wait(const std::shared_ptr<VulkanQueue> &queue) {
     if (!m_usefence_) {
         uint64_t cur_time;
-        auto *semaphore = m_cmdpool_->getSemaphore();
+        auto *semaphore = queue->getSemaphore();
         vkGetSemaphoreCounterValue(m_device_->getLogicalDevice(), semaphore,
                                    &cur_time);
         if (cur_time > m_timelineValue_) {
@@ -160,7 +161,7 @@ void VulkanCommandBuffer::dispatch(int w, int h, int z) {
     vkCmdDispatch(m_commandBuffer_, w, h, z);
 }
 
-void VulkanCommandBuffer::exec(VkQueue queue) {
+void VulkanCommandBuffer::exec(const std::shared_ptr<VulkanQueue> &queue) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -177,12 +178,12 @@ void VulkanCommandBuffer::exec(VkQueue queue) {
         submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &m_primaryBuffer_;
-        wait();
+        wait(queue);
         if (vkResetFences(m_device_->getLogicalDevice(), 1, &m_fence_) !=
             VK_SUCCESS) {
             throw std::runtime_error("Failed to reset fence!");
         }
-        auto ret = vkQueueSubmit(queue, 1, &submit_info, m_fence_);
+        auto ret = vkQueueSubmit(queue->getQueue(), 1, &submit_info, m_fence_);
         if (ret != VK_SUCCESS) {
             throw std::runtime_error("Failed to submit command buffer!");
         }

@@ -7,17 +7,18 @@ namespace vkop {
 
 VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
     : m_vdev_(vdev) {
-    uint32_t queue_family_index = m_vdev_->getComputeQueueFamilyIndex();
-    createCommandPool(queue_family_index);
+    for (auto [qfidx, qcnt, qflags] : vdev->getComputeQueueFamilyIndex()) {
+        createCommandPool(qfidx);
+    }
     createTimelineSemaphore();
     stagingbuffer_pool_ = std::make_shared<VulkanStagingBufferPool>(m_vdev_);
 }
 
 VulkanCommandPool::~VulkanCommandPool() {
-    if (m_commandPool_ != VK_NULL_HANDLE) {
-        vkDestroyCommandPool(m_vdev_->getLogicalDevice(), m_commandPool_,
-                             nullptr);
-        m_commandPool_ = VK_NULL_HANDLE;
+    for (auto *cmdpool : m_commandPool_) {
+        if (cmdpool != VK_NULL_HANDLE) {
+            vkDestroyCommandPool(m_vdev_->getLogicalDevice(), cmdpool, nullptr);
+        }
     }
     if (m_semaphore_ != VK_NULL_HANDLE) {
         vkDestroySemaphore(m_vdev_->getLogicalDevice(), m_semaphore_, nullptr);
@@ -31,11 +32,12 @@ void VulkanCommandPool::createCommandPool(uint32_t queueFamilyIndex) {
     pool_info.queueFamilyIndex = queueFamilyIndex;
     pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
                       VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-
+    VkCommandPool cmdpool;
     if (vkCreateCommandPool(m_vdev_->getLogicalDevice(), &pool_info, nullptr,
-                            &m_commandPool_) != VK_SUCCESS) {
+                            &cmdpool) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create command pool");
     }
+    m_commandPool_.emplace_back(cmdpool);
 }
 
 void VulkanCommandPool::createTimelineSemaphore() {
@@ -67,9 +69,13 @@ uint64_t VulkanCommandPool::getCompletedTimelineValue() {
 }
 
 void VulkanCommandPool::reset(VkCommandPoolResetFlags flags) {
-    if (vkResetCommandPool(m_vdev_->getLogicalDevice(), m_commandPool_,
-                           flags) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to reset command pool");
+    for (auto *cmdpool : m_commandPool_) {
+        if (cmdpool != VK_NULL_HANDLE) {
+            if (vkResetCommandPool(m_vdev_->getLogicalDevice(), cmdpool,
+                                   flags) != VK_SUCCESS) {
+                throw std::runtime_error("Failed to reset command pool");
+            }
+        }
     }
 }
 

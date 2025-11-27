@@ -7,6 +7,7 @@
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanPipeline.hpp"
 
 namespace vkop {
 namespace core {
@@ -15,7 +16,19 @@ Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
                  std::shared_ptr<VulkanCommandPool> cmdpool,
                  std::string model_path, std::string cache_dir)
     : m_dev_(std::move(dev)), m_cmdpool_(std::move(cmdpool)),
-      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {}
+      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {
+    for (int id = 0; id < vkop::kInflight; id++) {
+        m_cmds_[id] =
+            std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_, true, id);
+    }
+}
+
+Runtime::~Runtime() {
+    for (int id = 0; id < vkop::kInflight; id++) {
+        m_cmds_[id]->wait(m_dev_->getComputeQueue(id));
+        m_cmds_[id].reset();
+    }
+}
 
 void Runtime::LoadCache() {}
 
@@ -246,9 +259,6 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
 
 void Runtime::Run() {
     static int id = 0;
-    if (m_cmds_[id] == nullptr) {
-        m_cmds_[id] = std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_);
-    }
     for (auto &p : inputs_) {
         if (p.second->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(p.second);
@@ -259,7 +269,7 @@ void Runtime::Run() {
         }
     }
     auto start = std::chrono::steady_clock::now();
-    m_cmds_[id]->wait();
+    m_cmds_[id]->wait(m_dev_->getComputeQueue(id));
     m_cmds_[id]->begin();
 #ifdef USE_MEASURE_TIME
     VkDevice device = m_dev_->getLogicalDevice();
@@ -285,7 +295,7 @@ void Runtime::Run() {
     query_pool.end(m_cmds_[id]->get());
 #endif
     m_cmds_[id]->end();
-    m_cmds_[id]->submit(m_dev_->getComputeQueue());
+    m_cmds_[id]->submit(m_dev_->getComputeQueue(id));
 #ifdef USE_MEASURE_TIME
     auto r = query_pool.getResults();
     LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *

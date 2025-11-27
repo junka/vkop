@@ -13,7 +13,7 @@ class VulkanCommandBuffer {
   public:
     VulkanCommandBuffer(std::shared_ptr<VulkanDevice> device,
                         std::shared_ptr<VulkanCommandPool> cmdpool,
-                        bool signaled = true);
+                        bool signaled = true, int id = 0);
     ~VulkanCommandBuffer();
 
     VulkanCommandBuffer() = delete;
@@ -27,12 +27,12 @@ class VulkanCommandBuffer {
     void bind(VulkanPipeline &pipeline, VkDescriptorSet descriptor_set);
 
     // Submit the command buffer to a queue
-    int submit(VkQueue queue);
+    int submit(const std::shared_ptr<VulkanQueue> &queue);
 
     // Reset the command buffer
     void reset();
 
-    int wait();
+    int wait(const std::shared_ptr<VulkanQueue> &queue);
 
     // Get the Vulkan command buffer handle
     VkCommandBuffer get() const { return m_commandBuffer_; }
@@ -41,9 +41,10 @@ class VulkanCommandBuffer {
                         const void *ptr);
     void dispatch(int w = 1, int h = 1, int z = 1);
 
-    void exec(VkQueue queue);
+    void exec(const std::shared_ptr<VulkanQueue> &queue);
 
   private:
+    int id_ = 0;
     std::shared_ptr<VulkanDevice> m_device_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     bool m_usefence_ = true;

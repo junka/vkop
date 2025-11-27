@@ -436,7 +436,7 @@ template <typename T> class Tensor : public ITensor {
         buffer->readBarrier(cmd.get());
         cmd.end();
         auto submit_value = cmd.submit(dev->getComputeQueue());
-        cmd.wait();
+        cmd.wait(dev->getComputeQueue());
         stpool->markSubmit(submit_value);
         toGPU();
     }
@@ -479,7 +479,7 @@ template <typename T> class Tensor : public ITensor {
             img->readBarrier(cmd.get());
             cmd.end();
             auto submit_value = cmd.submit(dev->getComputeQueue());
-            cmd.wait();
+            cmd.wait(dev->getComputeQueue());
             stpool->markSubmit(submit_value);
         }
         toGPU();
@@ -505,7 +505,7 @@ template <typename T> class Tensor : public ITensor {
         buffer->copyBufferToStageBuffer(cmd.get(), buff, b->offset);
         cmd.end();
         auto submit_value = cmd.submit(dev->getComputeQueue());
-        cmd.wait();
+        cmd.wait(dev->getComputeQueue());
         stpool->markSubmit(submit_value);
         std::memcpy(data_.data(), b->ptr, size_);
         toCPU();
@@ -551,7 +551,7 @@ template <typename T> class Tensor : public ITensor {
             img->copyImageToBuffer(cmd.get(), buff, b->offset);
             cmd.end();
             auto submit_value = cmd.submit(dev->getComputeQueue());
-            cmd.wait();
+            cmd.wait(dev->getComputeQueue());
             stpool->markSubmit(submit_value);
             convertRGBAToTensor(static_cast<T *>(b->ptr));
         }
