@@ -228,7 +228,8 @@ bool VulkanDevice::createLogicalDevice(
     VkPhysicalDeviceHostImageCopyFeatures host_image_copy_features = {};
     host_image_copy_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
-    if (checkDeviceExtensionFeature(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
         host_image_copy_features.hostImageCopy = VK_TRUE;
         enabled_extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
         enabled_features.push_back(
@@ -509,9 +510,9 @@ bool VulkanDevice::createLogicalDevice(
     for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
         auto [qidx, queue_count, queueflags] = computeQueueIdxs_[i];
         LOG_INFO("queue count %d", queue_count);
-        if (queue_count >= 4) {
+        if (queue_count >= kInflight / 2) {
             // reserve queues from one familiy
-            queue_count = 4;
+            queue_count = kInflight / 2;
         }
         queue_priority[i].resize(queue_count);
         std::fill(queue_priority[i].begin(), queue_priority[i].end(), 1.0F);
@@ -545,8 +546,8 @@ bool VulkanDevice::createLogicalDevice(
     }
 
     for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {
-        if (queue_count >= 4) {
-            queue_count = 4;
+        if (queue_count >= kInflight / 2) {
+            queue_count = kInflight / 2;
         }
         for (uint32_t i = 0; i < queue_count; i++) {
             VkQueue queue;

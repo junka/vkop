@@ -49,7 +49,7 @@ void VMA::createPools() {
     img_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
     img_info.extent = {256, 256, 1};
     img_info.mipLevels = 1;
-    img_info.arrayLayers = 1;
+    img_info.arrayLayers = 64;
     img_info.samples = VK_SAMPLE_COUNT_1_BIT;
     img_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     img_info.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |

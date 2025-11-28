@@ -7,10 +7,11 @@
 namespace vkop {
 
 VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
-                         VkImageUsageFlags usage,
-                         VkMemoryPropertyFlags requireProperties,
-                         VkFormat format, int ext_fd)
-    : VulkanResource(vdev), m_dim_(dim), m_format_(format), m_usage_(usage) {
+                         uint32_t layers, VkImageUsageFlags usage,
+                         VkFormat format,
+                         VkMemoryPropertyFlags requireProperties, int ext_fd)
+    : VulkanResource(vdev), m_dim_(dim), m_layers_(layers), m_format_(format),
+      m_usage_(usage) {
     if (m_format_ == VK_FORMAT_UNDEFINED) {
         throw std::runtime_error("Invalid Vulkan image format.");
     }
@@ -222,7 +223,7 @@ void VulkanImage::createImage() {
     image_create_info.format = m_format_;
     image_create_info.extent = m_dim_;
     image_create_info.mipLevels = 1;
-    image_create_info.arrayLayers = 1;
+    image_create_info.arrayLayers = m_layers_;
     image_create_info.samples = VK_SAMPLE_COUNT_1_BIT;
     image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_create_info.usage = m_usage_;
@@ -265,18 +266,18 @@ void VulkanImage::createImageView() {
 #else
     info.image = m_image_;
 #endif
-    info.viewType = VK_IMAGE_VIEW_TYPE_1D;
+    info.viewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
     if (m_imagetype_ == VK_IMAGE_TYPE_3D) {
-        info.viewType = VK_IMAGE_VIEW_TYPE_3D;
+        info.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
     } else if (m_imagetype_ == VK_IMAGE_TYPE_2D) {
-        info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
     }
     info.format = m_format_;
     info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     info.subresourceRange.baseMipLevel = 0;
     info.subresourceRange.levelCount = 1;
     info.subresourceRange.baseArrayLayer = 0;
-    info.subresourceRange.layerCount = 1;
+    info.subresourceRange.layerCount = m_layers_;
 
     if (vkCreateImageView(m_vdev_->getLogicalDevice(), &info, nullptr,
                           &m_imageView_) != VK_SUCCESS) {
@@ -331,7 +332,7 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
     subrange.baseMipLevel = 0;
     subrange.baseArrayLayer = 0;
     subrange.levelCount = 1;
-    subrange.layerCount = 1;
+    subrange.layerCount = m_layers_;
 
     VkImageMemoryBarrier barrier{};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -426,7 +427,7 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
     region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
+    region.imageSubresource.layerCount = m_layers_;
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim_;
 
@@ -457,7 +458,7 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
     region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
+    region.imageSubresource.layerCount = m_layers_;
     region.imageOffset = {0, 0, 0};
     region.imageExtent = m_dim_;
     assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -482,7 +483,7 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     subrange.baseMipLevel = 0;
     subrange.baseArrayLayer = 0;
     subrange.levelCount = 1;
-    subrange.layerCount = 1;
+    subrange.layerCount = m_layers_;
 #ifdef USE_VMA
     VkImage img = m_vma_image_.image;
 #else
@@ -523,7 +524,7 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
     region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
+    region.imageSubresource.layerCount = m_layers_;
     region.imageExtent = m_dim_;
     region.pHostPointer = ptr;
 #ifdef USE_VMA
@@ -556,7 +557,7 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
     region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
+    region.imageSubresource.layerCount = m_layers_;
     region.imageExtent = m_dim_;
     region.pHostPointer = ptr;
     region.memoryRowLength = 0;

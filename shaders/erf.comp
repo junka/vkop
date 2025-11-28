@@ -4,13 +4,12 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // Binding points for input and output textures
 
-layout(binding = 0) writeonly uniform image2D uOutput;
-layout(binding = 1) uniform sampler2D uInput;
-
+layout(binding = 0) writeonly uniform image2DArray uOutput;
+layout(binding = 1) uniform sampler2DArray uInput;
 
 // d erf(x) = 2 / sqrt(pi) * exp(- x^2) * dx
 // erf 近似函数
-float compute_erf(float x) {
+vec4 compute_erf(vec4 x) {
     // Constants from Abramowitz and Stegun approximation
     float a1 =  0.254829592;
     float a2 = -0.284496736;
@@ -19,25 +18,22 @@ float compute_erf(float x) {
     float a5 =  1.061405429;
     float p  =  0.3275911;
 
-    int sign = (x < 0.0) ? -1 : 1;
+    vec4 sign = sign(x);
     x = abs(x);
 
-    float t = 1.0 / (1.0 + p * x);
-    float y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    vec4 t = 1.0 / (1.0 + p * x);
+    vec4 y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp(-x * x);
 
     return sign * y;
 }
 
 void main() {
-    ivec2 texCoord = ivec2(gl_GlobalInvocationID);
+    ivec3 texCoord = ivec3(gl_GlobalInvocationID);
 
     // Fetch data from RGBA texture memory and perform element-wise addition
     vec4 pixel = texelFetch(uInput, texCoord, 0);
-    float r = compute_erf(pixel.r);
-    float g = compute_erf(pixel.g);
-    float b = compute_erf(pixel.b);
-    float a = compute_erf(pixel.a);
+    vec4 result = compute_erf(pixel);
 
     // Write the result to the output RGBA texture
-    imageStore(uOutput, texCoord, vec4(r, g, b, a));
+    imageStore(uOutput, texCoord, result);
 }

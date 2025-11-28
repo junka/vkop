@@ -8,15 +8,15 @@ namespace vkop {
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 VulkanCommandBuffer::VulkanCommandBuffer(
-    std::shared_ptr<VulkanDevice> device,
     std::shared_ptr<VulkanCommandPool> cmdpool, bool signaled, int id)
-    : id_(id), m_device_(std::move(device)), m_cmdpool_(std::move(cmdpool)) {
+    : id_(id), m_cmdpool_(std::move(cmdpool)) {
     allocate();
+    std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
     m_usefence_ =
 #ifndef VK_KHR_timeline_semaphore
         true;
 #else
-        !m_device_->is_support_timeline_semaphore();
+        !device->is_support_timeline_semaphore();
 #endif
 
     if (m_usefence_) {
@@ -34,17 +34,18 @@ void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
 }
 
 VulkanCommandBuffer::~VulkanCommandBuffer() {
+    std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
     if (m_fence_ != VK_NULL_HANDLE) {
-        vkDestroyFence(m_device_->getLogicalDevice(), m_fence_, nullptr);
+        vkDestroyFence(device->getLogicalDevice(), m_fence_, nullptr);
         m_fence_ = VK_NULL_HANDLE;
     }
     if (m_commandBuffer_) {
-        vkFreeCommandBuffers(m_device_->getLogicalDevice(),
+        vkFreeCommandBuffers(device->getLogicalDevice(),
                              m_cmdpool_->getCommandPool(id_), 1,
                              &m_commandBuffer_);
     }
     if (m_primaryBuffer_) {
-        vkFreeCommandBuffers(m_device_->getLogicalDevice(),
+        vkFreeCommandBuffers(device->getLogicalDevice(),
                              m_cmdpool_->getCommandPool(id_), 1,
                              &m_primaryBuffer_);
     }
@@ -57,7 +58,8 @@ void VulkanCommandBuffer::allocate() {
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount = 1;
 
-    if (vkAllocateCommandBuffers(m_device_->getLogicalDevice(), &alloc_info,
+    std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
+    if (vkAllocateCommandBuffers(device->getLogicalDevice(), &alloc_info,
                                  &m_commandBuffer_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to allocate command buffer!");
     }
@@ -117,10 +119,11 @@ int VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
 }
 
 int VulkanCommandBuffer::wait(const std::shared_ptr<VulkanQueue> &queue) {
+    std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
     if (!m_usefence_) {
         uint64_t cur_time;
         auto *semaphore = queue->getSemaphore();
-        vkGetSemaphoreCounterValue(m_device_->getLogicalDevice(), semaphore,
+        vkGetSemaphoreCounterValue(device->getLogicalDevice(), semaphore,
                                    &cur_time);
         if (cur_time > m_timelineValue_) {
             return 0;
@@ -130,14 +133,14 @@ int VulkanCommandBuffer::wait(const std::shared_ptr<VulkanQueue> &queue) {
         wait_info.semaphoreCount = 1;
         wait_info.pSemaphores = &semaphore;
         wait_info.pValues = &m_timelineValue_;
-        if (VK_SUCCESS != vkWaitSemaphores(m_device_->getLogicalDevice(),
+        if (VK_SUCCESS != vkWaitSemaphores(device->getLogicalDevice(),
                                            &wait_info, UINT64_MAX)) {
             throw std::runtime_error("Failed to wait for semaphore!");
         }
     } else {
-        vkWaitForFences(m_device_->getLogicalDevice(), 1, &m_fence_, VK_TRUE,
+        vkWaitForFences(device->getLogicalDevice(), 1, &m_fence_, VK_TRUE,
                         UINT64_MAX);
-        if (vkResetFences(m_device_->getLogicalDevice(), 1, &m_fence_) !=
+        if (vkResetFences(device->getLogicalDevice(), 1, &m_fence_) !=
             VK_SUCCESS) {
             throw std::runtime_error("Failed to reset fence!");
         }
@@ -179,7 +182,8 @@ void VulkanCommandBuffer::exec(const std::shared_ptr<VulkanQueue> &queue) {
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &m_primaryBuffer_;
         wait(queue);
-        if (vkResetFences(m_device_->getLogicalDevice(), 1, &m_fence_) !=
+        std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
+        if (vkResetFences(device->getLogicalDevice(), 1, &m_fence_) !=
             VK_SUCCESS) {
             throw std::runtime_error("Failed to reset fence!");
         }
@@ -194,7 +198,8 @@ void VulkanCommandBuffer::createFence(bool signaled) {
     VkFenceCreateInfo fence_info{};
     fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
     fence_info.flags = (signaled ? VK_FENCE_CREATE_SIGNALED_BIT : 0);
-    if (vkCreateFence(m_device_->getLogicalDevice(), &fence_info, nullptr,
+    std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
+    if (vkCreateFence(device->getLogicalDevice(), &fence_info, nullptr,
                       &m_fence_) != VK_SUCCESS) {
     }
 }

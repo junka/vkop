@@ -116,7 +116,7 @@ class VulkanLib {
     VK_FUNCTION_LIST
 #undef PFN
   private:
-    void *lib_;
+    void *lib_ = nullptr;
 };
 
 // this file should be included in all vulkanXX.cpp files

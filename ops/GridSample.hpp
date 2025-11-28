@@ -7,43 +7,34 @@
 
 #include "Operator.hpp"
 
-#include "core/Tensor.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
-#include "include/logger.hpp"
-
-extern unsigned char grid_sample_spv[];
-extern unsigned int grid_sample_spv_len;
+extern unsigned char gridsample_spv[];
+extern unsigned int gridsample_spv_len;
 
 namespace vkop {
 namespace ops {
 
 namespace gridsample {
-enum class InterpolationMode { BILINEAR, NEAREST };
+enum class InterpolationMode { BILINEAR = 0, NEAREST = 1 };
 
-enum class PaddingMode { ZEROS, BORDER, REFLECTION };
+enum class PaddingMode { ZEROS = 0, BORDER = 1, REFLECTION = 2 };
 
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct alignas(16) GpuGridSampleParam {
+struct alignas(32) GpuGridSampleParam {
     ivec4 outImgSize;
     ivec2 inShape;
     ivec2 outShape;
-    bool align_corners;
     int padding_mode;
     int interpolation_mode;
+    int align_corners;
 };
 } // namespace gridsample
 
 class GridSample : public Operator {
   public:
     GridSample()
-        : Operator(OpType::GRIDSAMPLE, grid_sample_spv, grid_sample_spv_len,
+        : Operator(OpType::GRIDSAMPLE, gridsample_spv, gridsample_spv_len,
                    sizeof(gridsample::GpuGridSampleParam)) {
         n_imgs_ = 3;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
@@ -65,7 +56,6 @@ class GridSample : public Operator {
             } else if (mode == "nearest") {
                 interpolation_mode_ = gridsample::InterpolationMode::NEAREST;
             } else {
-                LOG_ERROR("Unsupported interpolation_mode: " + mode);
                 throw std::invalid_argument("Unsupported interpolation_mode: " +
                                             mode);
             }
@@ -81,7 +71,6 @@ class GridSample : public Operator {
             } else if (mode == "reflection") {
                 padding_mode_ = gridsample::PaddingMode::REFLECTION;
             } else {
-                LOG_ERROR("Unsupported padding_mode: " + mode);
                 throw std::invalid_argument("Unsupported padding_mode: " +
                                             mode);
             }
@@ -128,30 +117,29 @@ class GridSample : public Operator {
             });
         }
 
-        int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
         gridsample::GpuGridSampleParam para;
-        para.outImgSize[0] = realwidth;
+        para.outImgSize[0] = out_width;
         para.outImgSize[1] = realheight;
-        para.outImgSize[2] = 1;
+        para.outImgSize[2] = UP_DIV(depth, 4);
         para.outImgSize[3] = 0;
-        // original params
         para.inShape[0] = in_width;
         para.inShape[1] = in_height;
         para.outShape[0] = out_width;
         para.outShape[1] = out_height;
-        para.align_corners = align_corners_;
         para.padding_mode = static_cast<int>(padding_mode_);
         para.interpolation_mode = static_cast<int>(interpolation_mode_);
+        para.align_corners = align_corners_ ? 1 : 0;
 
-        submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16));
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+               UP_DIV(depth, 4));
     }
 
-  private:
-    gridsample::InterpolationMode interpolation_mode_;
-    gridsample::PaddingMode padding_mode_;
-    bool align_corners_;
+    gridsample::InterpolationMode interpolation_mode_ =
+        gridsample::InterpolationMode::BILINEAR;
+    gridsample::PaddingMode padding_mode_ = gridsample::PaddingMode::ZEROS;
+    bool align_corners_ = false;
 };
 
 } // namespace ops

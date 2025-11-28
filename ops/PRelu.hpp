@@ -3,7 +3,6 @@
 #define OPS_PRELU_HPP_
 
 #include "BinaryFactory.hpp"
-#include "ops/Ops.hpp"
 
 extern unsigned char prelu_spv[];
 extern unsigned int prelu_spv_len;

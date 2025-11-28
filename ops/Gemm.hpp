@@ -4,16 +4,6 @@
 
 #include "Operator.hpp"
 
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanCommandPool.hpp"
-#include "vulkan/VulkanDevice.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
 extern unsigned char gemm_spv[];
 extern unsigned int gemm_spv_len;
 
@@ -94,7 +84,7 @@ class Gemm : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-                inputptr->copyToGPU(m_dev_, m_cmdpool_);
+                inputptr->copyToGPU(m_cmdpool_);
                 objs_.emplace_back(input_buffer);
             });
         }
@@ -111,7 +101,7 @@ class Gemm : public Operator {
         para.transB = transB_;
         para.has_bias = (inputs.size() > 2 ? 1 : 0);
 
-        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16));
+        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
     }
     void set_runtime_device(
         const std::shared_ptr<VulkanDevice> &dev,

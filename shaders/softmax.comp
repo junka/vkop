@@ -1,336 +1,264 @@
 #version 450 core
-
 #extension GL_EXT_scalar_block_layout : enable
+#extension GL_EXT_shader_explicit_arithmetic_types : enable
 
-// Compute shader for Softmax operation using image2D
-// 规约操作需要在workgroup内实现，所有考虑共享内存方案的话
-// 至少需要两次规约，一次求max，一次求sum
-// 之后调用softmax 函数求值是非规约的
-// grid stride loop, 每个线程处理一段数据，而不是一个数据
-// 即使没有规约，只要数据量大于线程总数，stride loop 就是一个高效、标准的做法
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+layout(binding = 0) writeonly uniform image2DArray OutputImage;
+layout(binding = 1) uniform sampler2DArray InputImage;
 
-layout(set=0, binding = 0) writeonly uniform image2D OutputImage;
-layout(set=0, binding = 1) uniform sampler2D InputImage;
-
-layout(push_constant) readonly uniform constBuffer {
-    ivec4 outImgSize;  // 输出图像的大小，realWidth, realHeight, 1, 0
-    ivec4 outShape;    // tensor [N, H, W, C]
-    int axis;          // Axis for Softmax
+layout(push_constant) uniform constBuffer {
+    ivec4 outImgSize;  // [W, N*H, C4, _]
+    ivec4 outShape;    // [N, C, H, W]  ← NCHW
+    int axis;
 } uConst;
 
 shared vec4 sharedMax[256];
 shared vec4 sharedSum[256];
 
-// dispatch(W, H * C4)
+// Helper: reduce vec4 to scalar
+float reduceMax(vec4 v) { return max(max(v.x, v.y), max(v.z, v.w)); }
+float reduceSum(vec4 v) { return v.x + v.y + v.z + v.w; }
+
+// Axis 0: softmax over N (batch)
 void softmax_axis0() {
     uint lid = gl_LocalInvocationIndex;
     int N = uConst.outShape.x;
-    int H = uConst.outShape.y;
-    int W = uConst.outShape.z;
-    int C = uConst.outShape.w;
+    int C = uConst.outShape.y;
+    int H = uConst.outShape.z;
+    int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
+    // Each workgroup handles: (c_group, h, w)
     int w = int(gl_WorkGroupID.x);
-    if (w >= W) return;  // 边界检查
-
-    int idx = int(gl_WorkGroupID.y);
-    if (idx >= H * C4) return;
+    int idx = int(gl_WorkGroupID.y); // = h * C4 + c_group
+    if (w >= W || idx >= H * C4) return;
 
     int h = idx / C4;
     int c_group = idx % C4;
 
-    vec4 threadMax = vec4(-1e38);
-    // 规约 N 维度：对这个 (c,h,w)，遍历所有 n
+    vec4 threadMax = vec4(-1e38f);
     for (int n = int(lid); n < N; n += 256) {
-        int y_coord = n * H + h;          // NC4HW4 的 y
-        int x_coord = w * C4 + c_group;   // x 由 w 和 c_group 决定
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadMax = max(threadMax, packed);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadMax = max(threadMax, v);
     }
     sharedMax[lid] = threadMax;
     barrier();
 
-    // Step 2: Reduce Max across local size 256
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + stride]);  // vec4-wise
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
         barrier();
     }
     vec4 max_val = sharedMax[0];
-    // float max_value = max(max(max_val.x, max_val.y), max(max_val.z, max_val.w));
 
-    // --- Step 3: 计算 sum_exp = Σ exp(val - max_val) ---
-    vec4 threadSum = vec4(0.0);
-    sharedSum[lid] = vec4(0.0);
+    vec4 threadSum = vec4(0.0f);
     for (int n = int(lid); n < N; n += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadSum += exp(packed - max_val);  // SIMD: 同时计算 4 个通道的 exp 累加
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadSum += exp(v - max_val);
     }
     sharedSum[lid] = threadSum;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (int(lid) < stride) {
-            sharedSum[lid] += sharedSum[lid + stride];
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
         barrier();
     }
     vec4 sum_exp = sharedSum[0];
-    // float sum_value = sum_exp.x + sum_exp.y + sum_exp.z + sum_exp.w;
 
     for (int n = int(lid); n < N; n += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        vec4 softmax_val = exp(packed - max_val) / sum_exp;
-        imageStore(OutputImage, ivec2(x_coord, y_coord), softmax_val);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        vec4 outval = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(w, y, c_group), outval);
     }
 }
 
-
-//dispatch(W, H * N)
+// Axis 1: softmax over C (channel) ← MOST COMMON
 void softmax_axis1() {
     uint lid = gl_LocalInvocationIndex;
-
     int N = uConst.outShape.x;
-    int H = uConst.outShape.y;
-    int W = uConst.outShape.z;
-    int C = uConst.outShape.w;
+    int C = uConst.outShape.y;
+    int H = uConst.outShape.z;
+    int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
+    // Each workgroup handles: (n, h, w)
     int w = int(gl_WorkGroupID.x);
-    if (w >= W) return;
-    int idx = int(gl_WorkGroupID.y);
+    int idx = int(gl_WorkGroupID.y); // = n * H + h
+    if (w >= W || idx >= N * H) return;
+
     int n = idx / H;
     int h = idx % H;
 
-    sharedMax[lid] = vec4(-1e38);
-    vec4 threadMax = vec4(-1e38);
+    float threadMax = -1e38f;
     for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        // int x_coord = w * C4 + c_group;
-        int x_coord = c_group * W + w;
-        int y_coord = n * H + h;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadMax = max(threadMax, packed);
+        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, c_group), 0);
+        threadMax = max(threadMax, reduceMax(v));
     }
-    sharedMax[lid] = threadMax;
+    sharedMax[lid].x = threadMax;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (int(lid) < stride) {
-            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + stride]);
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedMax[lid].x = max(sharedMax[lid].x, sharedMax[lid + s].x);
         barrier();
     }
-    vec4 max_val = sharedMax[0];
-    float max_value = max(max(max_val.x, max_val.z), max(max_val.y, max_val.w));
+    float max_val = sharedMax[0].x;
 
-    vec4 threadSum = vec4(0.0);
+    float threadSum = 0.0f;
     for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        int y_coord = n * H + h;
-        // int x_coord = w * C4 + c_group;
-        int x_coord = c_group * W + w;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        vec4 exp_val = exp(packed - vec4(max_value));
-        if (c_group == C4 - 1) {
-            int c_last = C % 4;
-            if (c_last == 0) c_last = 4;
-            bvec4 valid = lessThan(ivec4(0,1,2,3), ivec4(c_last));
-            exp_val = exp_val * vec4(valid);
+        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, c_group), 0);
+        vec4 exp_v = exp(v - vec4(max_val));
+        // Mask padding channels in last group
+        if (c_group == C4 - 1 && C % 4 != 0) {
+            int rem = C % 4;
+            bvec4 mask = lessThan(ivec4(0,1,2,3), ivec4(rem));
+            exp_v *= vec4(mask);
         }
-        threadSum += exp_val;
+        threadSum += reduceSum(exp_v);
     }
-    sharedSum[lid] = threadSum;
+    sharedSum[lid].x = threadSum;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (int(lid) < stride) {
-            sharedSum[lid] += sharedSum[lid + stride];
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedSum[lid].x += sharedSum[lid + s].x;
         barrier();
     }
-
-    vec4 sum_exp = sharedSum[0];
-    float sum_value = dot(sum_exp, vec4(1.0));
+    float sum_exp = sharedSum[0].x;
 
     for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        int y_coord = n * H + h;
-        // int x_coord = w * C4 + c_group;
-        int x_coord = c_group * W + w;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        vec4 softmax_val = exp(packed - vec4(max_value)) / vec4(sum_value);
-        imageStore(OutputImage, ivec2(x_coord, y_coord), softmax_val);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        vec4 outval = exp(v - vec4(max_val)) / vec4(sum_exp);
+        if (c_group == C4 - 1 && C % 4 != 0) {
+            int rem = C % 4;
+            bvec4 mask = lessThan(ivec4(0,1,2,3), ivec4(rem));
+            outval *= vec4(mask);
+        }
+        imageStore(OutputImage, ivec3(w, y, c_group), outval);
     }
 }
 
-// dispatch(W, C4 * N)
+// Axis 2: softmax over H (height)
 void softmax_axis2() {
     uint lid = gl_LocalInvocationIndex;
-
     int N = uConst.outShape.x;
-    int H = uConst.outShape.y;
-    int W = uConst.outShape.z;
-    int C = uConst.outShape.w;
+    int C = uConst.outShape.y;
+    int H = uConst.outShape.z;
+    int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
+    // Each workgroup handles: (n, c_group, w)
     int w = int(gl_WorkGroupID.x);
-    if (w >= W) return;
-    int idx = int(gl_WorkGroupID.y);
-    if (idx >= C4 * N) return;
+    int idx = int(gl_WorkGroupID.y); // = n * C4 + c_group
+    if (w >= W || idx >= N * C4) return;
 
     int n = idx / C4;
     int c_group = idx % C4;
 
-    vec4 threadMax = vec4(-1e38);
+    vec4 threadMax = vec4(-1e38f);
     for (int h = int(lid); h < H; h += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadMax = max(threadMax, packed);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadMax = max(threadMax, v);
     }
     sharedMax[lid] = threadMax;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + stride]);
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
         barrier();
     }
     vec4 max_val = sharedMax[0];
 
-    vec4 threadSum = vec4(0.0);
+    vec4 threadSum = vec4(0.0f);
     for (int h = int(lid); h < H; h += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadSum += exp(packed - max_val);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadSum += exp(v - max_val);
     }
     sharedSum[lid] = threadSum;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (int(lid) < stride) {
-            sharedSum[lid] += sharedSum[lid + stride];
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
         barrier();
     }
     vec4 sum_exp = sharedSum[0];
 
-     for (int h = int(lid); h < H; h += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        vec4 softmax_val = exp(packed - max_val) / sum_exp;
-
-        //边界处理：最后一个 c_group 且 C % 4 != 0
-        // if (c_group == C4 - 1 && C % 4 != 0) {
-        //     int c_last = C % 4;
-        //     if (c_last == 0) c_last = 4;  // 能被4整除
-        //     bvec4 valid = lessThan(ivec4(0,1,2,3), ivec4(c_last));
-        //     softmax_val *= vec4(valid);
-        // }
-
-        imageStore(OutputImage, ivec2(x_coord, y_coord), softmax_val);
+    for (int h = int(lid); h < H; h += 256) {
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        vec4 outval = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(w, y, c_group), outval);
     }
 }
 
-// dispatch(H, C4 * N)
+// Axis 3: softmax over W (width)
 void softmax_axis3() {
     uint lid = gl_LocalInvocationIndex;
-
     int N = uConst.outShape.x;
-    int H = uConst.outShape.y;
-    int W = uConst.outShape.z;
-    int C = uConst.outShape.w;
+    int C = uConst.outShape.y;
+    int H = uConst.outShape.z;
+    int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
+    // Each workgroup handles: (n, c_group, h)
     int h = int(gl_WorkGroupID.x);
-    if (h >= H) return;
-    int idx = int(gl_WorkGroupID.y);
-    if (idx >= C4 * N) return;
+    int idx = int(gl_WorkGroupID.y); // = n * C4 + c_group
+    if (h >= H || idx >= N * C4) return;
+
     int n = idx / C4;
     int c_group = idx % C4;
 
-    vec4 threadMax = vec4(-1e38);
-    // 规约 W 维度：对 (n,c,h)，遍历所有 w
+    vec4 threadMax = vec4(-1e38f);
     for (int w = int(lid); w < W; w += 256) {
-        int x_coord = w * C4 + c_group;
-        int y_coord = n * H + h;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadMax = max(threadMax, packed);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadMax = max(threadMax, v);
     }
     sharedMax[lid] = threadMax;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + stride]);
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
         barrier();
     }
     vec4 max_val = sharedMax[0];
 
-    vec4 threadSum = vec4(0.0);
+    vec4 threadSum = vec4(0.0f);
     for (int w = int(lid); w < W; w += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        threadSum += exp(packed - max_val);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        threadSum += exp(v - max_val);
     }
     sharedSum[lid] = threadSum;
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (int(lid) < stride) {
-            sharedSum[lid] += sharedSum[lid + stride];
-        }
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
         barrier();
     }
     vec4 sum_exp = sharedSum[0];
 
     for (int w = int(lid); w < W; w += 256) {
-        int y_coord = n * H + h;
-        int x_coord = w * C4 + c_group;
-        vec4 packed = texelFetch(InputImage, ivec2(x_coord, y_coord), 0);
-        vec4 softmax_val = exp(packed - max_val) / sum_exp;
-        imageStore(OutputImage, ivec2(x_coord, y_coord), softmax_val);
+        int y = n * H + h;
+        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
+        vec4 outval = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(w, y, c_group), outval);
     }
 }
 
+// Dispatch rules (CPU side):
+// axis=0 (N): dispatch(W, H*C4)
+// axis=1 (C): dispatch(W, N*H)
+// axis=2 (H): dispatch(W, N*C4)
+// axis=3 (W): dispatch(H, N*C4)
 
-// softmax f(x) = exp(x) / sum(exp(x))
 void main() {
-    ivec3 pos = ivec3(gl_GlobalInvocationID);
-    ivec3 outputImgSize = uConst.outImgSize.xyz;
-    ivec4 outputShape = uConst.outShape;
-
-    int N = outputShape.x;
-    int H = outputShape.y;
-    int W = outputShape.z;
-    int C = outputShape.w;
-
-    int c = pos.x / W;       // 确定属于第几个channel group
-    int w = pos.x % W;       // 确定在原width维度的位置
-    int n = pos.y / H;       // 确定batch index
-    int h = pos.y % H;       // 确定height index
-
-    // 对于每个vec4内的具体channel位置
-    int local_channel_idx = pos.x % 4;
-    int global_channel_idx = c * 4 + local_channel_idx;
-
-    if (uConst.axis == 0) {
-        softmax_axis0();
-    } else if (uConst.axis == 1) {
-        softmax_axis1();
-    } else if (uConst.axis == 2) {
-        softmax_axis2();
-    } else if (uConst.axis == 3) {
-        softmax_axis3();
-    }
+    if (uConst.axis == 0) softmax_axis0();
+    else if (uConst.axis == 1) softmax_axis1();
+    else if (uConst.axis == 2) softmax_axis2();
+    else if (uConst.axis == 3) softmax_axis3();
 }

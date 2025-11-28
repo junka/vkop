@@ -212,7 +212,7 @@ class Resize : public Operator {
         para.coordinate_transformation_mode = coordinate_transformation_mode_;
         para.cubic_coeff_a = cubic_coeff_a_;
 
-        submit(&para, realwidth, realheight);
+        submit(&para, out_width, realheight, UP_DIV(depth, 4));
     }
 
   private:

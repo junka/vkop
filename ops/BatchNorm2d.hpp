@@ -4,14 +4,6 @@
 
 #include "Operator.hpp"
 
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
 #include <memory>
 
 extern unsigned char batchnorm2d_spv[];
@@ -96,7 +88,6 @@ class BatchNorm2d : public Operator {
             int out_height = input_shape[2];
             int out_width = input_shape[3];
 
-            int realwidth = out_width * UP_DIV(depth, 4);
             int realheight = out_height * batch;
 
             batchnorm::GpuBatchNormParam para;
@@ -133,7 +124,8 @@ class BatchNorm2d : public Operator {
             }
             tensorBuffer_->unmapMemory();
 
-            submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+            submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+                   UP_DIV(depth, 4));
         }
     }
 

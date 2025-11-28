@@ -1,42 +1,71 @@
 #version 440 core
 layout(std430) buffer;
-layout(set=0, binding=0) writeonly uniform image2D uOutput;
-layout(set=0, binding=1) uniform sampler2D uInput;
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding=1) uniform sampler2DArray uInput;
 
 
 layout(push_constant) uniform constBuffer {
-    ivec4 inputSize;
-    ivec4 outputSize;
-    ivec2 pad;
-    ivec2 kernelSize;
-    ivec2 stride;
+    ivec4 inputSize;      // [W_in, H_in, C, N]
+    ivec4 outputSize;     // [W_out, H_out, C, N]
+    ivec2 pad;            // [pad_w, pad_h]
+    ivec2 kernelSize;     // [k_w, k_h]
+    ivec2 stride;         // [s_w, s_h]
 } uConstant;
 
 layout (local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 void main()
 {
-    ivec3 pos = ivec3(gl_GlobalInvocationID);
-    ivec3 outputSize = uConstant.outputSize.xyz;
-    ivec2 spos = pos.xy*uConstant.stride-uConstant.pad;
-    int batch = pos.z / uConstant.outputSize.z;
-    int depth = pos.z % uConstant.outputSize.z;
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    int out_w = gid.x;
+    int out_y_batch = gid.y;   // = batch * H_out + h_out
+    int c4 = gid.z;            // layer index = channel group
 
-    if (all(lessThan(ivec4(pos.x, pos.y, depth, batch), uConstant.outputSize)))
-    {
-        ivec2 inputSizeXY = uConstant.inputSize.xy;
-        vec4 color = vec4(-100000.0);
-        ivec2 sfxy = max(ivec2(0), -spos);
-        ivec2 efxy = min(uConstant.kernelSize, inputSizeXY-spos);
+    int W_out = uConstant.outputSize.x;
+    int H_out = uConstant.outputSize.y;
+    int C = uConstant.outputSize.z;
+    int N = uConstant.outputSize.w;
+    int C4 = (C + 3) / 4;
 
-        for (int fy=sfxy.y; fy<efxy.y; ++fy)
-        {
-            for (int fx=sfxy.x; fx<efxy.x; ++fx)
-            {
-                ivec2 spos_ = spos + ivec2(fx, fy);
-                color = max(texelFetch(uInput, ivec2(spos_.x + depth * uConstant.inputSize.x, spos_.y + batch * uConstant.inputSize.y), 0), color);
-            }
-        }
-        imageStore(uOutput, ivec2(pos.x + depth * uConstant.outputSize.x, pos.y + batch * uConstant.outputSize.y), color);
+    // Bounds check
+    if (out_w >= W_out || out_y_batch >= N * H_out || c4 >= C4) {
+        return;
     }
+
+    int batch = out_y_batch / H_out;
+    int out_h = out_y_batch % H_out;
+
+    // Compute starting input position (with padding)
+    ivec2 out_pos = ivec2(out_w, out_h);
+    ivec2 start_input = out_pos * uConstant.stride - uConstant.pad;
+
+    // Input dimensions
+    int W_in = uConstant.inputSize.x;
+    int H_in = uConstant.inputSize.y;
+
+    // Initialize with very small value
+    vec4 max_val = vec4(-100000.0);
+
+    // Kernel bounds with clipping
+    ivec2 k_start = max(ivec2(0), -start_input);
+    ivec2 k_end = min(uConstant.kernelSize, ivec2(W_in, H_in) - start_input);
+
+    // Slide kernel
+    for (int ky = k_start.y; ky < k_end.y; ++ky) {
+        for (int kx = k_start.x; kx < k_end.x; ++kx) {
+            ivec2 in_pixel = start_input + ivec2(kx, ky); // (w_in, h_in)
+
+            // Full input y coordinate including batch
+            int in_y_full = batch * H_in + in_pixel.y;
+            ivec2 input_coord = ivec2(in_pixel.x, in_y_full);
+
+            // Sample from the same layer (c4)
+            vec4 val = texelFetch(uInput, ivec3(input_coord, c4), 0);
+            max_val = max(max_val, val);
+        }
+    }
+
+    // Output y coordinate
+    int out_y_full = batch * H_out + out_h;
+    imageStore(uOutput, ivec3(out_w, out_y_full, c4), max_val);
 }

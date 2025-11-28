@@ -75,7 +75,7 @@ class Softmax : public Operator {
         int out_height = input_shape[2];
         int out_width = input_shape[3];
 
-        int realwidth = out_width * UP_DIV(depth, 4);
+        int realwidth = out_width;
         int realheight = out_height * batch;
 
         softmax::GpuSoftMaxParam para;
@@ -91,13 +91,13 @@ class Softmax : public Operator {
         para.axis = axis_;
 
         if (axis_ == 0) {
-            submit(&para, out_width, out_height * UP_DIV(depth, 4));
+            submit(&para, out_width, out_height, UP_DIV(depth, 4));
         } else if (axis_ == 1) {
-            submit(&para, out_width, out_height * batch);
+            submit(&para, out_width, out_height, batch);
         } else if (axis_ == 2) {
-            submit(&para, out_width, UP_DIV(depth, 4) * batch);
+            submit(&para, out_width, batch, UP_DIV(depth, 4));
         } else if (axis_ == 3) {
-            submit(&para, out_height, UP_DIV(depth, 4) * batch);
+            submit(&para, out_height, batch, UP_DIV(depth, 4));
         }
     }
 

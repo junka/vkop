@@ -81,7 +81,7 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t = {1, 4, 8, 8};
+        std::vector<int> t = {3, 9, 8, 8};
         input = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
         expectedOutput.resize(input->num_elements());

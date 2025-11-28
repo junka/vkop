@@ -45,6 +45,8 @@ class ITensor {
     void set_ref_cnt_forever() {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
+    void set_pack_dim(int dim) { pack_dim_ = dim; }
+    uint8_t get_pack_dim() const { return pack_dim_; }
     std::vector<int> getShape() {
         if (dims_[3]) {
             return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
@@ -119,31 +121,43 @@ class ITensor {
     int dims_[4];
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
+    uint8_t pack_dim_ = 1;
     bool converted_ = false;
 };
 
 template <typename T> class Tensor : public ITensor {
   public:
     // empty
-    Tensor() = default;
+    Tensor(bool is_on_GPU = false) {
+        if (is_on_GPU) {
+            toGPU();
+        }
+    }
 
     // nchw
-    Tensor(int n, int c, int h, int w) {
+    Tensor(int n, int c, int h, int w, bool is_on_GPU = false) {
         dims_[0] = n;
         dims_[1] = c;
         dims_[2] = h;
         dims_[3] = w;
         size_ = sizeof(T) * n * c * h * w;
+        if (is_on_GPU) {
+            toGPU();
+        }
     }
 
     // nchw in vector
-    template <typename U> explicit Tensor(const std::vector<U> &dims) {
+    template <typename U>
+    explicit Tensor(const std::vector<U> &dims, bool is_on_GPU = false) {
         memset(dims_, 0, sizeof(dims_));
         size_ = dims.empty() ? 0 : sizeof(T);
         int i = 0;
         for (auto d : dims) {
             size_ *= d;
             dims_[i++] = static_cast<int>(d);
+        }
+        if (is_on_GPU) {
+            toGPU();
         }
     }
 
@@ -309,16 +323,65 @@ template <typename T> class Tensor : public ITensor {
 
         return img;
     }
-    void copyToGPU(const std::shared_ptr<VulkanDevice> &dev,
-                   const std::shared_ptr<VulkanCommandPool> &cmdpool,
+    void copyToGPUImage(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                        T *src = nullptr) {
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        if (num_dims() < 3) {
+            return;
+        }
+        auto dev = cmdpool->getVulkanDevice();
+        VulkanCommandBuffer cmd(cmdpool, false);
+
+#ifdef VK_EXT_host_image_copy
+        if (dev->is_support_host_image_copy()) {
+            std::vector<T> ptr(img->getImageSize());
+            if (pack_dim_ == 1) {
+                convertTensorToRGBA(ptr.data(), src);
+            } else if (pack_dim_ == 0) {
+                convertTensorToRGBA_N4(ptr.data(), src);
+            }
+            img->hostImageCopyToDevice(ptr.data());
+            cmd.begin();
+            img->readBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
+        } else
+#endif
+        {
+            auto imagesize = img->getImageSize();
+            auto stpool = cmdpool->getStagingBufferPool();
+            uint64_t completed = cmdpool->getCompletedTimelineValue();
+            stpool->reclaimCompleted(completed);
+            auto *buff = stpool->getBuffer();
+            auto b = stpool->allocate(imagesize);
+            if (!b) {
+                printf("stpool alloc failed\n");
+                return;
+            }
+            if (pack_dim_ == 1) {
+                convertTensorToRGBA(static_cast<T *>(b->ptr), src);
+            } else if (pack_dim_ == 0) {
+                convertTensorToRGBA_N4(static_cast<T *>(b->ptr), src);
+            }
+            cmd.begin();
+            img->copyBufferToImage(cmd.get(), buff, b->offset);
+            img->readBarrier(cmd.get());
+            cmd.end();
+            auto submit_value = cmd.submit(dev->getComputeQueue());
+            cmd.wait(dev->getComputeQueue());
+            stpool->markSubmit(submit_value);
+        }
+        toGPU();
+    }
+    void copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    T *data = nullptr) {
         if (is_on_GPU()) {
             return;
         }
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
-            copyToGPUImage(dev, cmdpool, data);
+            copyToGPUImage(cmdpool, data);
         } else {
-            copyToGPUBuffer(dev, cmdpool, data);
+            copyToGPUBuffer(cmdpool, data);
         }
         if (!data) {
             data_.clear();
@@ -326,17 +389,16 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    void copyToCPU(const std::shared_ptr<VulkanDevice> &dev,
-                   const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+    void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         if (!is_on_GPU()) {
             printf("not on GPU\n");
             return;
         }
         data_.resize(num_elements());
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
-            copyImageToCPU(dev, cmdpool);
+            copyImageToCPU(cmdpool);
         } else {
-            copyBufferToCPU(dev, cmdpool);
+            copyBufferToCPU(cmdpool);
         }
     }
 
@@ -403,19 +465,24 @@ template <typename T> class Tensor : public ITensor {
                  ? VK_FORMAT_R8G8B8A8_UINT
                  : ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
                                      : VK_FORMAT_R32G32B32A32_SFLOAT));
-        vkobj_ = std::make_shared<VulkanImage>(
-            vd,
-            VkExtent3D{static_cast<uint32_t>(dims_[3] * UP_DIV(dims_[1], 4)),
-                       static_cast<uint32_t>(dims_[2] * dims_[0]), 1},
-            flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, format);
+
+        uint32_t realwidth = dims_[3];
+        uint32_t realheight = dims_[2] * dims_[0];
+        if (pack_dim_ == 0) {
+            realwidth = dims_[3] * dims_[1];
+            realheight = dims_[2] * UP_DIV(dims_[0], 4);
+        }
+        auto vkdim = VkExtent3D{realwidth, realheight, 1};
+        vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, UP_DIV(dims_[1], 4),
+                                               flags, format);
     }
 
-    void copyToGPUBuffer(const std::shared_ptr<VulkanDevice> &dev,
-                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
+    void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                          T *src = nullptr) {
         auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
 
-        VulkanCommandBuffer cmd(dev, cmdpool, false);
+        auto dev = cmdpool->getVulkanDevice();
+        VulkanCommandBuffer cmd(cmdpool, false);
         auto stpool = cmdpool->getStagingBufferPool();
         uint64_t completed = cmdpool->getCompletedTimelineValue();
         stpool->reclaimCompleted(completed);
@@ -440,56 +507,12 @@ template <typename T> class Tensor : public ITensor {
         stpool->markSubmit(submit_value);
         toGPU();
     }
-    void copyToGPUImage(const std::shared_ptr<VulkanDevice> &dev,
-                        const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                        T *src = nullptr) {
-        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        if (num_dims() < 3) {
-            return;
-        }
 
-        VulkanCommandBuffer cmd(dev, cmdpool, false);
-
-#ifdef VK_EXT_host_image_copy
-        if (dev->is_support_host_image_copy()) {
-            std::vector<T> ptr(img->getImageSize());
-            convertTensorToRGBA(ptr.data(), src);
-            img->hostImageCopyToDevice(ptr.data());
-            cmd.begin();
-            img->readBarrier(cmd.get());
-            cmd.end();
-            cmd.submit(dev->getComputeQueue(), cmdpool->getFence());
-        } else
-#endif
-        {
-            auto imagesize = img->getImageSize();
-            auto stpool = cmdpool->getStagingBufferPool();
-            uint64_t completed = cmdpool->getCompletedTimelineValue();
-            stpool->reclaimCompleted(completed);
-            auto *buff = stpool->getBuffer();
-            auto b = stpool->allocate(imagesize);
-            if (!b) {
-                printf("stpool alloc failed\n");
-                return;
-            }
-            convertTensorToRGBA(static_cast<T *>(b->ptr), src);
-
-            cmd.begin();
-            img->copyBufferToImage(cmd.get(), buff, b->offset);
-            img->readBarrier(cmd.get());
-            cmd.end();
-            auto submit_value = cmd.submit(dev->getComputeQueue());
-            cmd.wait(dev->getComputeQueue());
-            stpool->markSubmit(submit_value);
-        }
-        toGPU();
-    }
-    void copyBufferToCPU(const std::shared_ptr<VulkanDevice> &dev,
-                         const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+    void copyBufferToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
 
-        // VkDevice device = dev->getLogicalDevice();
-        VulkanCommandBuffer cmd(dev, cmdpool, false);
+        auto dev = cmdpool->getVulkanDevice();
+        VulkanCommandBuffer cmd(cmdpool, false);
 
         auto stpool = cmdpool->getStagingBufferPool();
         uint64_t completed = cmdpool->getCompletedTimelineValue();
@@ -510,38 +533,30 @@ template <typename T> class Tensor : public ITensor {
         std::memcpy(data_.data(), b->ptr, size_);
         toCPU();
     }
-    void copyImageToCPU(const std::shared_ptr<VulkanDevice> &dev,
-                        const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+    void copyImageToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 
-        // VkDevice device = dev->getLogicalDevice();
-
-        int batch = dims_[0];
-        int depth = dims_[1];
-        int out_height = dims_[2];
-        int out_width = dims_[3];
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
-
-        auto imagesize = img->getImageSize();
-        assert(realheight * realwidth * 4 * sizeof(T) ==
-               static_cast<size_t>(imagesize));
+        auto dev = cmdpool->getVulkanDevice();
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
-            std::vector<T> rgba((realheight * realwidth * 4));
+            std::vector<T> rgba((img->getImageSize() / sizeof(T)));
             img->hostImageCopyToHost(rgba.data());
-            convertRGBAToTensor(rgba.data());
+            if (pack_dim_ == 0) {
+                convertN4CHWToTensor(rgba.data());
+            } else {
+                convertRGBAToTensor(rgba.data());
+            }
         } else
 #endif
         {
-            VulkanCommandBuffer cmd(dev, cmdpool, false);
+            VulkanCommandBuffer cmd(cmdpool, false);
 
             auto stpool = cmdpool->getStagingBufferPool();
             uint64_t completed = cmdpool->getCompletedTimelineValue();
             stpool->reclaimCompleted(completed);
             auto *buff = stpool->getBuffer();
-            auto b = stpool->allocate(imagesize);
+            auto b = stpool->allocate(img->getImageSize());
             if (!b) {
                 printf("stpool alloc failed\n");
                 return;
@@ -553,7 +568,11 @@ template <typename T> class Tensor : public ITensor {
             auto submit_value = cmd.submit(dev->getComputeQueue());
             cmd.wait(dev->getComputeQueue());
             stpool->markSubmit(submit_value);
-            convertRGBAToTensor(static_cast<T *>(b->ptr));
+            if (pack_dim_ == 0) {
+                convertN4CHWToTensor(static_cast<T *>(b->ptr));
+            } else {
+                convertRGBAToTensor(static_cast<T *>(b->ptr));
+            }
         }
 
         toCPU();
@@ -588,6 +607,7 @@ template <typename T> class Tensor : public ITensor {
      * @note This function is designed for tensors used in Vulkan-based GPU
      * processing pipelines. The conversion ensures compatibility with Vulkan's
      * image formats and facilitates efficient GPU operations.
+     * CPU packing for NCHW -> (W, H*N, arrayLayers=C4)
      */
     void convertTensorToRGBA(T *ptr, T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
@@ -595,92 +615,159 @@ template <typename T> class Tensor : public ITensor {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
         }
-        auto batch = dims_[0];
-        auto depth = dims_[1];
-        auto height = dims_[2];
-        auto width = dims_[3];
+        auto N = dims_[0];
+        auto C = dims_[1];
+        auto H = dims_[2];
+        auto W = dims_[3];
 
-        int stride_w = 1;
-        int stride_h = width;
-        int stride_c = width * height;
-        int stride_n = width * height * depth;
-        int realdepth = UP_DIV(depth, 4);
-        int realwidth = width * realdepth;
+        int C4 = UP_DIV(C, 4);
+        const T *input = src ? src : data_.data();
 
-        uint32_t row_pitch =
-            realwidth * img->getImageChannelNum() * img->getImageChannelSize();
-        T *dst = ptr;
-        for (int b = 0; b < batch; b++) {
-            T *batchstart = reinterpret_cast<T *>(
-                reinterpret_cast<uint8_t *>(ptr) + b * height * row_pitch);
-            for (int c = 0; c < realdepth; c++) {
-                dst = batchstart + c * 4 * width;
-                for (int h = 0; h < height; h++) {
-                    for (int w = 0; w < width; w++) {
-                        int offset = b * stride_n + 4 * c * stride_c +
-                                     h * stride_h + w * stride_w;
+        uint32_t row_pitch = W * 4 * sizeof(T);
+        uint32_t layer_stride = N * H * row_pitch;
 
-                        dst[w * 4 + 0] = src ? src[offset] : data_[offset];
-                        dst[w * 4 + 1] = (4 * c + 1 < depth)
-                                             ? (src ? src[stride_c + offset]
-                                                    : data_[stride_c + offset])
-                                             : 0.0F;
-                        dst[w * 4 + 2] =
-                            (4 * c + 2 < depth)
-                                ? (src ? src[2 * stride_c + offset]
-                                       : data_[2 * stride_c + offset])
-                                : 0.0F;
-                        dst[w * 4 + 3] =
-                            (4 * c + 3 < depth)
-                                ? (src ? src[3 * stride_c + offset]
-                                       : data_[3 * stride_c + offset])
-                                : 0.0F;
+        for (int c4 = 0; c4 < C4; c4++) {
+            for (int n = 0; n < N; n++) {
+                for (int h = 0; h < H; h++) {
+                    for (int w = 0; w < W; w++) {
+                        T *dst = reinterpret_cast<T *>(
+                            reinterpret_cast<uint8_t *>(ptr) +
+                            c4 * layer_stride + (n * H + h) * row_pitch +
+                            w * 4 * sizeof(T));
+                        for (int k = 0; k < 4; k++) {
+                            int c = c4 * 4 + k;
+                            if (c < C) {
+                                int offset =
+                                    n * (C * H * W) + c * (H * W) + h * W + w;
+                                dst[k] = input[offset];
+                            } else {
+                                dst[k] = T(0);
+                            }
+                        }
                     }
-                    dst = reinterpret_cast<T *>(
-                        reinterpret_cast<uint8_t *>(dst) + row_pitch);
+                }
+            }
+        }
+    }
+
+    void convertTensorToRGBA_N4(T *ptr, T *src = nullptr) {
+        assert(1 == 0 && "Not implemented yet");
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        if (!img) {
+            throw std::runtime_error(
+                "Failed to cast VulkanResource to VulkanImage");
+        }
+
+        const int C_out = dims_[0];
+        const int C_in = dims_[1];
+        const int kH = dims_[2];
+        const int kW = dims_[3];
+        const int C_out4 = UP_DIV(C_out, 4);
+
+        const T *input = src ? src : data_.data();
+
+        const int width = kW * C_in; // ← 将 C_in 和 kW 合并到 width
+        // const int height = kH * C_out4; // ← kH 和 C_out4 放在 height
+
+        const uint32_t rowPitchBytes = width * 4 * img->getImageChannelSize();
+        assert(img->getImageChannelNum() == 4 && "Weight image must be RGBA");
+
+        for (int oc4 = 0; oc4 < C_out4; ++oc4) {
+            for (int kh = 0; kh < kH; ++kh) {
+                for (int ic = 0; ic < C_in; ++ic) {
+                    for (int kw = 0; kw < kW; ++kw) {
+                        int x = ic * kW + kw;  // within [0, width)
+                        int y = oc4 * kH + kh; // within [0, height)
+
+                        T *dstPixel = reinterpret_cast<T *>(
+                            reinterpret_cast<uint8_t *>(ptr) +
+                            y * rowPitchBytes + x * 4 * sizeof(T));
+
+                        for (int k = 0; k < 4; ++k) {
+                            int oc = oc4 * 4 + k;
+                            if (oc < C_out) {
+                                int srcOffset = oc * (C_in * kH * kW) +
+                                                ic * (kH * kW) + kh * kW + kw;
+                                dstPixel[k] = input[srcOffset];
+                            } else {
+                                dstPixel[k] = T(0);
+                            }
+                        }
+                    }
                 }
             }
         }
     }
 
     void convertRGBAToTensor(T *ptr) {
+        auto N = dims_[0];
+        auto C = dims_[1];
+        auto H = dims_[2];
+        auto W = dims_[3];
+
+        int C4 = UP_DIV(C, 4);
+
+        uint32_t row_pitch = W * 4 * sizeof(T);
+        uint32_t layer_stride = H * N * row_pitch;
+        T *src = nullptr;
+        for (int c4 = 0; c4 < C4; ++c4) {
+            for (int n = 0; n < N; n++) {
+                for (int h = 0; h < H; h++) {
+                    for (int w = 0; w < W; w++) {
+                        src = reinterpret_cast<T *>(
+                            reinterpret_cast<uint8_t *>(ptr) +
+                            c4 * layer_stride + (n * H + h) * row_pitch +
+                            w * 4 * sizeof(T));
+
+                        for (int k = 0; k < 4; k++) {
+                            int c = c4 * 4 + k;
+                            if (c < C) {
+                                size_t offset =
+                                    n * C * H * W + c * H * W + h * W + w;
+                                data_[offset] = src[k];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    void convertN4CHWToTensor(T *ptr) {
         auto batch = dims_[0];
         auto depth = dims_[1];
         auto height = dims_[2];
         auto width = dims_[3];
 
-        int stride_w = 1;
-        int stride_h = width;
         int stride_c = width * height;
         int stride_n = width * height * depth;
 
-        int realdepth = UP_DIV(depth, 4);
-        int realwidth = width * UP_DIV(depth, 4);
-
+        int N4 = UP_DIV(batch, 4);
+        int realwidth = width * depth;
         uint32_t row_pitch = realwidth * 4 * sizeof(T);
+
         T *dst;
-        for (int b = 0; b < batch; b++) {
-            T *batchstart = reinterpret_cast<T *>(
-                reinterpret_cast<uint8_t *>(ptr) + b * height * row_pitch);
-            for (int c = 0; c < realdepth; c++) {
-                dst = batchstart + c * width * 4;
-                for (int h = 0; h < height; h++) {
-                    for (int w = 0; w < width; w++) {
-                        int offset = b * stride_n + 4 * c * stride_c +
-                                     h * stride_h + w * stride_w;
-                        data_[offset] = dst[w * 4 + 0];
-                        if (4 * c + 1 < depth) {
-                            data_[stride_c + offset] = dst[w * 4 + 1];
-                        }
-                        if (4 * c + 2 < depth) {
-                            data_[stride_c * 2 + offset] = dst[w * 4 + 2];
-                        }
-                        if (4 * c + 3 < depth) {
-                            data_[stride_c * 3 + offset] = dst[w * 4 + 3];
+        for (int n4 = 0; n4 < N4; ++n4) {
+            for (int c = 0; c < depth; ++c) {
+                for (int h = 0; h < height; ++h) {
+                    dst =
+                        reinterpret_cast<T *>(reinterpret_cast<uint8_t *>(ptr) +
+                                              (n4 * height + h) * row_pitch) +
+                        c * width * 4;
+
+                    for (int w = 0; w < width; ++w) {
+                        // Base offset in NCHW: [4*n4][c][h][w]
+                        int base_offset =
+                            4 * n4 * stride_n + c * stride_c + h * width + w;
+
+                        for (int k = 0; k < 4; ++k) {
+                            int n = 4 * n4 + k;
+                            if (n >= batch)
+                                break;
+
+                            data_[k * stride_n + base_offset] = dst[w * 4 + k];
                         }
                     }
-                    dst = reinterpret_cast<T *>(
-                        reinterpret_cast<uint8_t *>(dst) + row_pitch);
                 }
             }
         }

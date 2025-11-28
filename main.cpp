@@ -2,18 +2,12 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
-#include "model/load.hpp"
-#include "ops/OperatorFactory.hpp"
-#include "ops/Ops.hpp"
 #include "core/runtime.hpp"
 
 #include <algorithm>
 #include <cstdint>
 #include <memory>
-#include <random>
-#include <chrono>
 #include <cmath>
-#include <unordered_set>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -50,7 +44,7 @@ std::vector<MaskInfo> postProcessNMS(
     int tensor_h, int tensor_w
 ) {
     auto sigmoid = [](float x) -> float {
-        return 1.0f / (1.0f + std::exp(-x));
+        return 1.0F / (1.0F + std::exp(-x));
     };
     const int num_points = H * W;
 
@@ -127,8 +121,8 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
     int in_h = t->getShape()[2];
     int in_w = t->getShape()[3];
 
-    float x_ratio = float(image_w - 1) / (in_w - 1);
-    float y_ratio = float(image_h - 1) / (in_h - 1);
+    float x_ratio = static_cast<float>(image_w - 1) / (in_w - 1);
+    float y_ratio = static_cast<float>(image_h - 1) / (in_h - 1);
 
     const uint8_t* y_src = raw_image.data();
     const uint8_t* u_src = raw_image.data() + image_w * image_h;
@@ -192,7 +186,7 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
     printf("using %s\n",dev->getDeviceName().c_str());
-    printf("sizeof Tensor<float>: %ld\n", sizeof(Tensor<float>));
+    printf("sizeof Tensor<float>: %zu\n", sizeof(Tensor<float>));
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     if (argc < 3) {
@@ -215,7 +209,7 @@ int main(int argc, char *argv[]) {
         int image_h = 1080;
         int image_w = 1920;
 
-        auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
+        auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
         rt->LoadModel();
 
         auto input = rt->GetInput("input.1");
@@ -228,7 +222,7 @@ int main(int argc, char *argv[]) {
             auto data = resize_YUV(frame, image_h, image_w, t);
             frame.clear();
             frame.shrink_to_fit();
-            t->copyToGPU(dev, cmdpool, data.data());
+            t->copyToGPU(cmdpool, data.data());
             data.clear();
             data.shrink_to_fit();
         } else if (input->dtype() == typeid(uint16_t)){
@@ -238,7 +232,7 @@ int main(int argc, char *argv[]) {
             auto data = resize_YUV(frame, image_h, image_w, t);
             frame.clear();
             frame.shrink_to_fit();
-            t->copyToGPU(dev, cmdpool, data.data());
+            t->copyToGPU(cmdpool, data.data());
             data.clear();
             data.shrink_to_fit();
         }

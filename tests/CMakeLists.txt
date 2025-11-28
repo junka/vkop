@@ -30,12 +30,31 @@ set(TESTS
     ReduceTest
 )
 
-find_package(PythonLibs REQUIRED)
-if (PYTHONLIBS_FOUND)
-    include_directories(${PYTHON_INCLUDE_DIRS})
-    message(STATUS "Found PythonLibs: ${PYTHONLIBS_VERSION_STRING} at ${PYTHONLIBS_INCLUDE_DIRS}")
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
+if(Python3_FOUND AND Python3_NumPy_FOUND)
+    # Python3_INCLUDE_DIRS 可能不会直接由 FindPython3 提供，而是通过 Python3_EXECUTABLE 来获取路径
+    # 下面是一个示例如何获取正确的包含路径，实际情况可能会有所不同
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
+                    OUTPUT_VARIABLE PYTHON3_INCLUDE_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+    
+    # 获取 NumPy 的 include 目录
+    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy; print(numpy.get_include())"
+                    OUTPUT_VARIABLE NUMPY_INCLUDE_DIR
+                    OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+    include_directories(${PYTHON3_INCLUDE_DIR})
+    include_directories(${NUMPY_INCLUDE_DIR})
+
+    message(STATUS "Found Python3: ${Python3_VERSION} at ${PYTHON3_INCLUDE_DIR}")
+    message(STATUS "Found NumPy at ${NUMPY_INCLUDE_DIR}")
 else()
-    message(FATAL_ERROR "Could not find PythonLibs")
+    if(NOT Python3_FOUND)
+        message(FATAL_ERROR "Could not find Python3")
+    endif()
+    if(NOT Python3_NumPy_FOUND)
+        message(FATAL_ERROR "Could not find NumPy for Python3")
+    endif()
 endif()
 
 foreach(TEST ${TESTS})
@@ -44,8 +63,8 @@ foreach(TEST ${TESTS})
         target_compile_definitions(${TEST} PUBLIC FP16)
     endif()
     target_link_libraries(${TEST} -Wl,--whole-archive vkop vload -Wl,--no-whole-archive -lpthread)
-    if (PYTHONLIBS_FOUND)
-        target_link_libraries(${TEST} ${PYTHON_LIBRARIES})
+    if (Python3_FOUND)
+        target_link_libraries(${TEST} Python3::Python)
     endif()
     add_test(NAME ${TEST} COMMAND ${TEST})
 endforeach()

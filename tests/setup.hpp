@@ -53,7 +53,7 @@ public:
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-                auto cmd = std::make_shared<VulkanCommandBuffer>(dev, cmdpool);
+                auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
 
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
@@ -67,8 +67,7 @@ public:
                     attribute_func(op);
                 }
 
-                auto output = std::make_shared<Tensor<T>>();
-                output->toGPU();
+                auto output = std::make_shared<Tensor<T>>(true);
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 for (const auto &input : inputs) {
                     if (!input || input->num_dims() < 2) {
@@ -77,49 +76,49 @@ public:
                     if (input->num_dims() == 2) {
                         auto t = core::as_tensor<T>(input);
                         t->as_storage_buffer(dev);
-                        t->copyToGPU(dev, cmdpool);
+                        t->copyToGPU(cmdpool);
                         continue;
                     }
                     auto t = core::as_tensor<T>(input);
                     t->as_input_image(dev, nullptr);
-                    t->copyToGPU(dev, cmdpool);
+                    t->copyToGPU(cmdpool);
                 }
                 cmd->wait(dev->getComputeQueue());
                 cmd->begin();
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
-                output->copyToCPU(dev, cmdpool);
+                output->copyToCPU(cmdpool);
                 auto oshape = output->getShape();
-                // if (oshape.size() == 4) {
-                //     for (int i = 0; i < oshape[0]; i++) {
-                //         printf("[\n");
-                //         for (int j = 0; j < oshape[1]; j++) {
-                //             printf("[\n");
-                //             for (int k = 0; k < oshape[2]; k++) {
-                //                 printf("[");
-                //                 for (int l = 0; l < oshape[3]; l++) {
-                //                     int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
-                //                         k * oshape[3] + l;
-                //                     printf("%.4f, ", (*output)[idx]);
-                //                 }
-                //                 printf("]\n");
-                //             }
-                //             printf("]\n");
-                //         }
-                //         printf("]\n");
-                //     }
-                // } else if (oshape.size() == 2) {
-                //     for (int i = 0; i < oshape[0]; i++) {
-                //         printf("[");
-                //         for (int j = 0; j < oshape[1]; j++) {
-                //             int idx = i * oshape[1] + j;
-                //             printf("%.4f, ", (*output)[idx]);
-                //         }
-                //         printf("]\n");
-                //     }
-                //     printf("]\n");
-                // }
+                if (oshape.size() == 4) {
+                    for (int i = 0; i < oshape[0]; i++) {
+                        printf("[\n");
+                        for (int j = 0; j < oshape[1]; j++) {
+                            printf("[\n");
+                            for (int k = 0; k < oshape[2]; k++) {
+                                printf("[");
+                                for (int l = 0; l < oshape[3]; l++) {
+                                    int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
+                                        k * oshape[3] + l;
+                                    printf("%.4f, ", (*output)[idx]);
+                                }
+                                printf("]\n");
+                            }
+                            printf("]\n");
+                        }
+                        printf("]\n");
+                    }
+                } else if (oshape.size() == 2) {
+                    for (int i = 0; i < oshape[0]; i++) {
+                        printf("[");
+                        for (int j = 0; j < oshape[1]; j++) {
+                            int idx = i * oshape[1] + j;
+                            printf("%.4f, ", (*output)[idx]);
+                        }
+                        printf("]\n");
+                    }
+                    printf("]\n");
+                }
                 for (int i = 0; i < output->num_elements(); i++) {
                     if (sizeof(T) == 2) {
                         std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32(expectedOutput[i]) << std::endl;
@@ -157,7 +156,7 @@ public:
                 }
                 LOG_INFO("%s",dev->getDeviceName().c_str());
                 auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-                auto cmd = std::make_shared<VulkanCommandBuffer>(dev, cmdpool);
+                auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
                 auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
                 if (!op) {
                     LOG_ERROR("Fail to create operator");
@@ -165,8 +164,7 @@ public:
                 }
                 op->set_runtime_device(dev, cmdpool);
 
-                auto output = std::make_shared<Tensor<T>>();
-                output->toGPU();
+                auto output = std::make_shared<Tensor<T>>(true);
                 auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
                 for (const auto &input : inputs) {
                     if (!input || input->num_dims() < 2) {
@@ -175,20 +173,51 @@ public:
                     if (input->num_dims() == 2) {
                         auto t = core::as_tensor<T>(input);
                         t->as_storage_buffer(dev);
-                        t->copyToGPU(dev, cmdpool);
+                        t->copyToGPU(cmdpool);
                         continue;
                     }
                     auto t = core::as_tensor<T>(input);
                     t->as_input_image(dev, nullptr);
-                    t->copyToGPU(dev, cmdpool);
+                    t->copyToGPU(cmdpool);
                 }
                 cmd->wait(dev->getComputeQueue());
                 cmd->begin();
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
-                output->copyToCPU(dev, cmdpool);
+                output->copyToCPU(cmdpool);
+                auto oshape = output->getShape();
+                if (oshape.size() == 4) {
+                    for (int i = 0; i < oshape[0]; i++) {
+                        printf("[\n");
+                        for (int j = 0; j < oshape[1]; j++) {
+                            printf("[\n");
+                            for (int k = 0; k < oshape[2]; k++) {
+                                printf("[");
+                                for (int l = 0; l < oshape[3]; l++) {
+                                    int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
+                                        k * oshape[3] + l;
+                                    printf("%.4f, ", (*output)[idx]);
+                                }
+                                printf("]\n");
+                            }
+                            printf("]\n");
+                        }
+                        printf("]\n");
+                    }
+                } else if (oshape.size() == 2) {
+                    for (int i = 0; i < oshape[0]; i++) {
+                        printf("[");
+                        for (int j = 0; j < oshape[1]; j++) {
+                            int idx = i * oshape[1] + j;
+                            printf("%.4f, ", (*output)[idx]);
+                        }
+                        printf("]\n");
+                    }
+                    printf("]\n");
+                }
                 for (int i = 0; i < output->num_elements(); i++) {
+                    printf("%d %f vs %f\n", i, (*output)[i], expectedOutput[i]);
                     if (sizeof(T) == 2) {
                         if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32(expectedOutput[i])) > 0.01) {
                             LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32(expectedOutput[i]));

@@ -1,6 +1,5 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanLib.hpp"
-#include <dlfcn.h>
 
 #include "include/logger.hpp"
 
@@ -19,9 +18,17 @@ VulkanLib::VulkanLib() {
     lib_ = dlopen("libvulkan.so.1", RTLD_LAZY | RTLD_LOCAL);
     if (!lib_)
         lib_ = dlopen("libvulkan.so", RTLD_LAZY | RTLD_LOCAL);
+#elif defined(_WIN32) || defined(__MSYS__)
+    lib_ = dlopen("vulkan-1", RTLD_LAZY | RTLD_LOCAL);
+    if (!lib_) {
+        lib_ =
+            dlopen("/c/Windows/System32/vulkan-1.dll", RTLD_LAZY | RTLD_LOCAL);
+    }
+#else
+#error "Unsupported platform"
 #endif
     if (!lib_) {
-        LOG_ERROR("Failed to load vulkan library , %s", dlerror());
+        LOG_ERROR("Failed to load vulkan library");
         return;
     }
 

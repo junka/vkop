@@ -166,18 +166,17 @@ class Maxpool2d : public Operator {
 
             objs_.emplace_back(input_image);
         });
-        int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
         maxpool2d::GpuMaxpoolParam para;
 
         para.inputSize[0] = input_shape[3];
         para.inputSize[1] = input_shape[2];
-        para.inputSize[2] = UP_DIV(depth, 4);
+        para.inputSize[2] = depth;
         para.inputSize[3] = batch;
         para.outputSize[0] = out_width;
         para.outputSize[1] = out_height;
-        para.outputSize[2] = UP_DIV(depth, 4);
+        para.outputSize[2] = depth;
         para.outputSize[3] = batch;
 
         para.pad[0] = pads_[0];
@@ -187,7 +186,8 @@ class Maxpool2d : public Operator {
         para.stride[0] = strides_[0];
         para.stride[1] = strides_[1];
 
-        submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+               UP_DIV(depth, 4));
     }
 
   private:

@@ -9,8 +9,6 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Ops.hpp"
-#include "vulkan/VulkanCommandPool.hpp"
-#include "vulkan/VulkanDevice.hpp"
 
 #define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
@@ -137,34 +135,17 @@ class Operator {
         }
     }
 
-    virtual void submit(void *ptr, int out_width, int out_height) {
+    virtual void submit(void *ptr, int out_width, int out_height,
+                        int out_layers) {
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }
         pipeline_->updateDescriptorSets(m_ds_[m_id_], objs_, n_imgs_);
-#ifdef USE_MEASURE_TIME
-        VkDevice device = m_dev_->getLogicalDevice();
-        VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
-#endif
         m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(m_cmd_->get());
-#endif
         if (ptr) {
             m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
         }
-        m_cmd_->dispatch(out_width, out_height);
-#ifdef USE_MEASURE_TIME
-        query_pool.end(m_cmd_->get());
-#endif
-        // m_cmd_->end();
-        // m_cmd_->submit(m_dev_->getComputeQueue());
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   m_dev_->getTimestampPeriod());
-#endif
-
+        m_cmd_->dispatch(out_width, out_height, out_layers);
         objs_.clear();
     }
 

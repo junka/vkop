@@ -4,14 +4,6 @@
 
 #include "Operator.hpp"
 
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
 #include <memory>
 
 extern unsigned char layernorm_spv[];
@@ -84,7 +76,7 @@ class LayerNorm : public Operator {
                 using T = decltype(t);
                 auto tensor = core::as_tensor<T>(inputs[i]);
                 auto buffer = tensor->as_storage_buffer(m_dev_);
-                tensor->copyToGPU(m_dev_, m_cmdpool_);
+                tensor->copyToGPU(m_cmdpool_);
                 objs_.emplace_back(buffer);
             });
         }
@@ -110,11 +102,11 @@ class LayerNorm : public Operator {
         }
 
         if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
-            submit(&para, batch * UP_DIV(depth, 4), out_height);
+            submit(&para, batch * UP_DIV(depth, 4), out_height, 1);
         } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
-            submit(&para, batch, UP_DIV(depth, 4));
+            submit(&para, batch, UP_DIV(depth, 4), 1);
         } else { // 归一化所有维度 CHW
-            submit(&para, realwidth, realheight);
+            submit(&para, realwidth, realheight, 1);
         }
     }
 

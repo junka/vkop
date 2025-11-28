@@ -4,16 +4,6 @@
 
 #include "Operator.hpp"
 
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanCommandPool.hpp"
-#include "vulkan/VulkanDevice.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-
 extern unsigned char reduce_spv[];
 extern unsigned int reduce_spv_len;
 
@@ -103,7 +93,7 @@ class Reduce : public Operator {
         para.keepdims = keepdims_;
         para.noop_with_empty_axes = noop_with_empty_axes_;
 
-        submit(&para, UP_DIV(h, 16), UP_DIV(w, 16));
+        submit(&para, UP_DIV(h, 16), UP_DIV(w, 16), 1);
     }
 
   private:

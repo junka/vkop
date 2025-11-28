@@ -16,8 +16,7 @@
 //  output shape: (N, C_out, H_out, W_out)
 //      H_out = floor((H_in + 2*padding[0] - dilation[0]*(kH-1) - 1)/strides[0] + 1
 //      W_out = floor((W_in + 2*padding[1] - dilation[1]*(kW-1) - 1)/strides[1] + 1
-
-#version 440 core
+#version 450 core
 
 #ifdef FP16
 #extension GL_AMD_gpu_shader_half_float: enable
@@ -34,170 +33,129 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set=0, binding=0) writeonly uniform image2D uOutput;
-
-layout(set=0, binding=1) uniform sampler2D uInput;
-
-layout(set=0, binding=2) uniform sampler2D uKernel;
-
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*H_out, C4_out]
+layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
+layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, C4_in]
 layout(set=0, binding=3) readonly buffer biasBuffer {
     FLOAT attr[]; // bias[C_out]
 } uBias;
 
 layout(push_constant) uniform constBuffer {
-    ivec4 inputSize;     // W, H, C_in, N
-    ivec4 outputSize;    // W, H, C_out, N
-    ivec4 kernelSize;    // kW, kH, C_out, C_in
-    ivec2 stride;        // strideW, strideH
-    ivec2 padding;       // paddingW, paddingH
-    ivec2 dilation;      // dilationW, dilationH
+    ivec4 inputSize;     // [W_in, H_in, C_in, N]
+    ivec4 outputSize;    // [W_out, H_out, C_out, N]
+    ivec4 kernelSize;    // [K_W, K_H, unused, unused]
+    ivec4 imageSize;     // [realW=W_out, realH=N*H_out, C4_out, 1]
+    ivec2 stride;
+    ivec2 padding;
+    ivec2 dilation;
     int groups;
     int bias;
     int activation;
 } uConstant;
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
-
-// dispatch(UP_DIV(realW, 16), UP_DIV(realH, 16))
 void main() {
-    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    int W_out = uConstant.outputSize.x;
+    int realH = uConstant.imageSize.y;
+    int C4_out = uConstant.imageSize.z;
 
-    int outW = uConstant.outputSize.x;
-    int outH = uConstant.outputSize.y;
+    if (gid.x >= W_out || gid.y >= realH || gid.z >= C4_out) return;
+
+    int H_out = uConstant.outputSize.y;
     int C_out = uConstant.outputSize.z;
     int N = uConstant.outputSize.w;
-    int C4_out = (C_out + 3) / 4;
 
-    int realWidth = outW * C4_out;
-    int realHeight = outH * N;
-
-    if (gid.x >= realWidth || gid.y >= realHeight) return;
-
+    int W_in = uConstant.inputSize.x;
+    int H_in = uConstant.inputSize.y;
     int C_in = uConstant.inputSize.z;
     int G = uConstant.groups;
-    int C_out_per_group = C_out / G;
-    int C_in_per_group = C_in / G;
 
-    int out_w = gid.x % outW;
-    int c4_out_idx = gid.x / outW;
-    int out_h = gid.y % outH;
-    int batch = gid.y / outH;
+    // Decode spatial and channel
+    int w = gid.x;
+    int c4 = gid.z;
+    int n = gid.y / H_out;
+    int h = gid.y % H_out;
 
-    int oc_start = c4_out_idx * 4;
-    ivec4 oc_vec = ivec4(oc_start, oc_start + 1, oc_start + 2, oc_start + 3);
-
-    // 检查是否越界
+    // Output channel start
+    int oc_start = c4 * 4;
+    ivec4 oc_vec = oc_start + ivec4(0, 1, 2, 3);
     bvec4 valid_oc = lessThan(oc_vec, ivec4(C_out));
-    // if (!any(valid_oc)) return;
 
-    // 检查 4 个 oc 是否属于同一个 group
-    ivec4 g_vec = oc_vec / C_out_per_group;
-    bool same_group = (g_vec.x == g_vec.y) && (g_vec.x == g_vec.z) && (g_vec.x == g_vec.w);
+    // Compute input start position (with padding)
+    ivec2 out_pos = ivec2(w, h);
+    ivec2 s0 = out_pos * uConstant.stride - uConstant.padding;
 
     FLOAT4 acc = FLOAT4(0.0);
 
     int K_W = uConstant.kernelSize.x;
     int K_H = uConstant.kernelSize.y;
-    int H_in = uConstant.inputSize.y;
-    int W_in = uConstant.inputSize.x;
-    ivec2 s0 = ivec2(out_w, out_h) * uConstant.stride - uConstant.padding;
+    int C_out_per_group = C_out / G;
+    int C_in_per_group = C_in / G;
 
-    if (same_group && all(valid_oc)) {
-        // 4 个 oc 同组，可向量化
-        int g = g_vec.x;
+    // For each output channel in this vec4
+    for (int comp = 0; comp < 4; ++comp) {
+        if (!valid_oc[comp]) continue;
+
+        int oc = oc_vec[comp];
+        int g = oc / C_out_per_group; // which group?
+
+        // Input channel range for this group
         int ic_start = g * C_in_per_group;
         int ic_end = ic_start + C_in_per_group;
 
-        for (int ic = ic_start; ic < ic_end; ++ic) {
-            int ic4 = ic / 4;
-            int ic_comp = ic % 4;
+        FLOAT sum = FLOAT(0.0);
 
-            for (int ky = 0; ky < K_H; ++ky) {
-                int iy = s0.y + ky * uConstant.dilation.y;
-                if (iy < 0 || iy >= H_in) continue;
+        // Slide kernel
+        for (int ky = 0; ky < K_H; ++ky) {
+            int iy = s0.y + ky * uConstant.dilation.y;
+            if (iy < 0 || iy >= H_in) continue;
 
-                for (int kx = 0; kx < K_W; ++kx) {
-                    int ix = s0.x + kx * uConstant.dilation.x;
-                    if (ix < 0 || ix >= W_in) continue;
+            for (int kx = 0; kx < K_W; ++kx) {
+                int ix = s0.x + kx * uConstant.dilation.x;
+                if (ix < 0 || ix >= W_in) continue;
 
-                    // Read input (scalar per ic)
-                    ivec2 inputCoord = ivec2(ix + ic4 * W_in, batch * H_in + iy);
-                    FLOAT4 input_val = FLOAT4(texelFetch(uInput, inputCoord, 0)[ic_comp]);
+                // Iterate over input channels in this group
+                for (int ic = ic_start; ic < ic_end; ++ic) {
+                    int ic4 = ic / 4;
+                    int ic_comp = ic % 4;
 
-                    // Read 4 weights at once: [w0, w1, w2, w3] for oc_vec
-                    // weight layout: x = kx + ic4 * K_W, y = oc * K_H + ky
-                    ivec2 kernelCoord0 = ivec2(kx + ic4 * K_W, oc_vec.x * K_H + ky);
-                    ivec2 kernelCoord1 = ivec2(kx + ic4 * K_W, oc_vec.y * K_H + ky);
-                    ivec2 kernelCoord2 = ivec2(kx + ic4 * K_W, oc_vec.z * K_H + ky);
-                    ivec2 kernelCoord3 = ivec2(kx + ic4 * K_W, oc_vec.w * K_H + ky);
+                    // Fetch input pixel
+                    int in_y = n * H_in + iy;
+                    FLOAT4 input_val = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, ic4), 0));
+                    FLOAT x = input_val[ic_comp];
 
-                    FLOAT4 w0 = FLOAT4(texelFetch(uKernel, kernelCoord0, 0));
-                    FLOAT4 w1 = FLOAT4(texelFetch(uKernel, kernelCoord1, 0));
-                    FLOAT4 w2 = FLOAT4(texelFetch(uKernel, kernelCoord2, 0));
-                    FLOAT4 w3 = FLOAT4(texelFetch(uKernel, kernelCoord3, 0));
+                    // Compute kernel coordinate
+                    int local_ic = ic - ic_start; // local within group
+                    int local_ic4 = local_ic / 4;
+                    int local_ic_comp = local_ic % 4;
 
-                    // Extract the ic_comp-th component from each
-                    FLOAT4 weights = FLOAT4(
-                        w0[ic_comp],
-                        w1[ic_comp],
-                        w2[ic_comp],
-                        w3[ic_comp]
-                    );
+                    int kx_k = kx;
+                    int ky_k = ky + oc * K_H;
+                    FLOAT4 weight_vec = texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0);
+                    FLOAT w = weight_vec[local_ic_comp];
 
-                    acc += input_val * weights;
+                    sum += x * w;
                 }
             }
         }
-    } else {
-        for (int comp = 0; comp < 4; ++comp) {
-            if (!valid_oc[comp]) continue;
-
-            int oc = oc_vec[comp];
-            int g = oc / C_out_per_group;
-            int ic_start = g * C_in_per_group;
-            int ic_end = ic_start + C_in_per_group;
-
-            FLOAT sum = FLOAT(0.0);
-            for (int ic = ic_start; ic < ic_end; ++ic) {
-                int ic4 = ic / 4;
-                int ic_comp = ic % 4;
-
-                for (int ky = 0; ky < K_H; ++ky) {
-                    int iy = s0.y + ky * uConstant.dilation.y;
-                    // int iy = fma(ky, uConstant.dilation.y, s0.y);
-                    if (iy < 0 || iy >= H_in) continue;
-
-                    for (int kx = 0; kx < K_W; ++kx) {
-                        int ix = s0.x + kx * uConstant.dilation.x;
-                        // int ix = fma(kx, uConstant.dilation.x, s0.x);
-                        if (ix < 0 || ix >= W_in) continue;
-
-                        ivec2 inputCoord = ivec2(ix + ic4 * W_in, batch * H_in + iy);
-                        FLOAT input_val = FLOAT4(texelFetch(uInput, inputCoord, 0))[ic_comp];
-
-                        int kernel_x = kx + (ic - ic_start) /4 * K_W;
-                        int kernel_y = ky + oc * K_H;
-                        FLOAT weight = FLOAT4(texelFetch(uKernel, ivec2(kernel_x, kernel_y), 0))[(ic - ic_start) % 4];
-
-                        sum += input_val * weight;
-                    }
-                }
-            }
-            acc[comp] = sum;
-        }
+        acc[comp] = sum;
     }
 
     // Add bias
     if (uConstant.bias == 1) {
-        FLOAT4 bias = FLOAT4(0.0);
-        for (int comp = 0; comp < 4; ++comp) {
-            if (valid_oc[comp]) {
-                bias[comp] = uBias.attr[oc_vec[comp]];
+        FLOAT4 bias_val = FLOAT4(0.0);
+        for (int i = 0; i < 4; ++i) {
+            if (valid_oc[i]) {
+                bias_val[i] = uBias.attr[oc_vec[i]];
             }
         }
-        acc += bias;
+        acc += bias_val;
     }
+
+    // Activation
     acc = activation(acc, uConstant.activation);
 
-    imageStore(uOutput, gid, acc);
+    // Store output
+    int out_y = n * H_out + h;
+    imageStore(uOutput, ivec3(w, out_y, c4), acc);
 }

@@ -3,7 +3,6 @@
 #define OPS_ADD_HPP_
 
 #include "BinaryFactory.hpp"
-#include "ops/Ops.hpp"
 
 extern unsigned char add_spv[];
 extern unsigned int add_spv_len;

@@ -82,7 +82,8 @@ class Col2im : public Operator {
         para.outShape[2] = out_width;
         para.outShape[3] = depth;
 
-        submit(&para, out_width, out_height);
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
+               UP_DIV(depth, 4));
     }
 
   private:

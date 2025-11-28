@@ -1,73 +1,71 @@
-#version 450
+#version 450 core
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set=0, binding = 0) writeonly uniform image2D outputImage;
-layout(set=0, binding = 1) uniform sampler2D inputImage;
+layout(set=0, binding = 0) writeonly uniform image2DArray outputImage; // [W, N*H, C4]
+layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*H, C4]
 
-// variable length buffer to hold mean, variance, scale, bias in SSBO
+// SSBO: length = C (number of channels)
+// Each element: vec4(mean, variance, scale, bias) for ONE channel
 layout(set=0, binding = 2) readonly buffer tensorBuffer {
-    vec4 attr[]; // mean, variance, scale, bias
+    vec4 attr[]; // size = C
 } uMeanVarScaleBias;
 
 layout(push_constant) readonly uniform batchNormBuffer {
-	ivec4 outShape; // 输出图像的NCHW
-    float eps; // default 1e-5
-    float momentum; // default 0.1
+    ivec4 outShape; // [N, C, H, W] — note: PyTorch uses NCHW
+    float eps;
+    float momentum; // unused in inference
 } uBatchNormParam;
 
-// https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.batch_norm.html
 void main() {
-    ivec2 gid = ivec2(gl_GlobalInvocationID);
-
-    int N = uBatchNormParam.outShape.x;
-    int C = uBatchNormParam.outShape.y;
-    int H = uBatchNormParam.outShape.z;
+    // Global ID
+    ivec3 gid3 = ivec3(gl_GlobalInvocationID);
     int W = uBatchNormParam.outShape.w;
+    int H = uBatchNormParam.outShape.z;
+    int C = uBatchNormParam.outShape.y;
+    int N = uBatchNormParam.outShape.x;
     int C4 = (C + 3) / 4;
-    if (gid.x >= W * C4 || gid.y >= H * N) {
+
+    int w = gid3.x;
+    int nh = gid3.y; // = n * H + h
+    int c4 = gid3.z;
+
+    // Bounds check
+    if (w >= W || nh >= N * H || c4 >= C4) {
         return;
     }
-    const float epsilon = uBatchNormParam.eps;
 
-    int n = gid.y / H;
-    int h = gid.y % H;
-    int w = gid.x % W;
-    int c4 = gid.x / W;
+    // Decode batch and height
+    int n = nh / H;
+    int h = nh % H;
 
-    vec4 inputPixel = texelFetch(inputImage, gid, 0);
+    // Fetch input pixel (RGBA = 4 channels)
+    vec4 inputPixel = texelFetch(inputImage, ivec3(w, nh, c4), 0);
 
-    vec4 mean4 = vec4(
-        uMeanVarScaleBias.attr[c4*4 + 0].x,
-        uMeanVarScaleBias.attr[c4*4 + 1].x,
-        uMeanVarScaleBias.attr[c4*4 + 2].x,
-        uMeanVarScaleBias.attr[c4*4 + 3].x
-    );
+    // Load per-channel parameters
+    vec4 mean4, var4, scale4, bias4;
+    for (int i = 0; i < 4; ++i) {
+        int c = c4 * 4 + i;
+        if (c < C) {
+            vec4 params = uMeanVarScaleBias.attr[c]; // [mean, var, scale, bias]
+            mean4[i] = params.x;
+            var4[i]  = params.y;
+            scale4[i] = params.z;
+            bias4[i] = params.w;
+        } else {
+            // Pad with identity transform for unused channels
+            mean4[i] = 0.0;
+            var4[i]  = 1.0;
+            scale4[i] = 1.0;
+            bias4[i] = 0.0;
+        }
+    }
 
-    vec4 var4 = vec4(
-        uMeanVarScaleBias.attr[c4*4 + 0].y,
-        uMeanVarScaleBias.attr[c4*4 + 1].y,
-        uMeanVarScaleBias.attr[c4*4 + 2].y,
-        uMeanVarScaleBias.attr[c4*4 + 3].y
-    );
-
-    vec4 scale4 = vec4(
-        uMeanVarScaleBias.attr[c4*4 + 0].z,
-        uMeanVarScaleBias.attr[c4*4 + 1].z,
-        uMeanVarScaleBias.attr[c4*4 + 2].z,
-        uMeanVarScaleBias.attr[c4*4 + 3].z
-    );
-
-    vec4 bias4 = vec4(
-        uMeanVarScaleBias.attr[c4*4 + 0].w,
-        uMeanVarScaleBias.attr[c4*4 + 1].w,
-        uMeanVarScaleBias.attr[c4*4 + 2].w,
-        uMeanVarScaleBias.attr[c4*4 + 3].w
-    );
-
-    vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));  // 1/sqrt(var + eps)
+    // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
+    vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));
     vec4 normalized = (inputPixel - mean4) * inv_std;
     vec4 outputPixel = scale4 * normalized + bias4;
 
-    imageStore(outputImage, gid, outputPixel);
+    // Store result
+    imageStore(outputImage, ivec3(w, nh, c4), outputPixel);
 }

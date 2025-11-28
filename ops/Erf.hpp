@@ -3,7 +3,6 @@
 #define OPS_ERF_HPP_
 
 #include "UnaryFactory.hpp"
-#include "ops/Ops.hpp"
 
 extern unsigned char erf_spv[];
 extern unsigned int erf_spv_len;

@@ -5,17 +5,8 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <utility>
 
 #include "Operator.hpp"
-
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
 
 extern unsigned char conv2d_spv[];
 extern unsigned int conv2d_spv_len;
@@ -34,7 +25,7 @@ struct GPUConv2dParam {
     ivec4 inputSize;
     ivec4 outputSize;
     ivec4 kernel_shape;
-
+    ivec4 imageSize;
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
@@ -57,10 +48,6 @@ class Conv2d : public Operator {
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
         objs_.reserve(types_.size());
-        kernel_shape_.reserve(2);
-        dilations_.reserve(2);
-        strides_.reserve(2);
-        pads_.reserve(2);
         activation_ = conv2d::ActivationMode::NONE;
     }
 
@@ -77,14 +64,10 @@ class Conv2d : public Operator {
                 int d = std::stoi(dila_str);
                 dilations_ = {d, d};
             }
-        } else {
-            dilations_ = {1, 1};
         }
 
         if (attributes.find("group") != attributes.end()) {
             groups_ = std::stoi(attributes.at("group"));
-        } else {
-            groups_ = 1;
         }
 
         if (attributes.find("kernel_shape_") != attributes.end()) {
@@ -95,8 +78,6 @@ class Conv2d : public Operator {
                 int k = std::stoi(kernel_str);
                 kernel_shape_ = {k, k};
             }
-        } else {
-            kernel_shape_ = {0, 0};
         }
 
         if (attributes.find("pads") != attributes.end()) {
@@ -107,8 +88,6 @@ class Conv2d : public Operator {
                 int p = std::stoi(pad_str);
                 pads_ = {p, p};
             }
-        } else {
-            pads_ = {0, 0};
         }
 
         if (attributes.find("strides") != attributes.end()) {
@@ -119,8 +98,6 @@ class Conv2d : public Operator {
                 int s = std::stoi(stride_str);
                 strides_ = {s, s};
             }
-        } else {
-            strides_ = {1, 1};
         }
         if (attributes.find("auto_pad") != attributes.end()) {
             std::string auto_pad = attributes.at("auto_pad");
@@ -163,8 +140,6 @@ class Conv2d : public Operator {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
             }
-        } else {
-            activation_ = conv2d::ActivationMode::NONE;
         }
     }
 
@@ -233,7 +208,7 @@ class Conv2d : public Operator {
                                             : nullptr;
 
             if (bias)
-                bias->copyToGPU(m_dev_, m_cmdpool_);
+                bias->copyToGPU(m_cmdpool_);
 
         } else if (inputs[1]->dtype() == typeid(uint16_t)) {
             auto bias = (inputs.size() > 2)
@@ -241,12 +216,8 @@ class Conv2d : public Operator {
                             : nullptr;
 
             if (bias)
-                bias->copyToGPU(m_dev_, m_cmdpool_);
-        } else {
-            LOG_ERROR("Unsupported data type");
+                bias->copyToGPU(m_cmdpool_);
         }
-
-        int realwidth = out_width * UP_DIV(out_depth, 4);
         int realheight = out_height * batch;
 
         conv2d::GPUConv2dParam para;
@@ -259,11 +230,14 @@ class Conv2d : public Operator {
         para.outputSize[1] = out_height;
         para.outputSize[2] = out_depth;
         para.outputSize[3] = out_batch;
-        // original params
         para.kernel_shape[0] = weight_shape[3];
         para.kernel_shape[1] = weight_shape[2];
         para.kernel_shape[2] = weight_shape[1];
         para.kernel_shape[3] = weight_shape[0];
+        para.imageSize[0] = out_width;
+        para.imageSize[1] = realheight;
+        para.imageSize[2] = UP_DIV(out_depth, 4);
+        para.imageSize[3] = 1;
         para.stride[0] = strides_[0];
         para.stride[1] = strides_[1];
         para.padding[0] = pads_[0];
@@ -275,7 +249,8 @@ class Conv2d : public Operator {
         para.bias = ((inputs.size() > 2)) ? 1 : 0;
         para.activation = static_cast<int>(activation_);
 
-        submit(&para, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+               UP_DIV(out_depth, 4));
     }
     void set_runtime_device(
         const std::shared_ptr<VulkanDevice> &dev,
@@ -289,12 +264,12 @@ class Conv2d : public Operator {
     }
 
   private:
-    std::vector<int> kernel_shape_;
-    std::vector<int> strides_;
-    std::vector<int> pads_;
-    std::vector<int> dilations_;
-    int groups_;
-    conv2d::ActivationMode activation_;
+    std::vector<int> kernel_shape_ = {0, 0};
+    std::vector<int> strides_ = {1, 1};
+    std::vector<int> pads_ = {0, 0};
+    std::vector<int> dilations_ = {1, 1};
+    int groups_ = 1;
+    conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 };
 

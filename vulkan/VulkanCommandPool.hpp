@@ -17,6 +17,7 @@ class VulkanCommandPool {
 
     void reset(VkCommandPoolResetFlags flags = 0);
 
+    std::shared_ptr<VulkanDevice> getVulkanDevice() const { return m_vdev_; }
     VkCommandPool getCommandPool(int idx = 0) const {
         return m_commandPool_[idx % m_commandPool_.size()];
     }

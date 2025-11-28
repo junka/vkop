@@ -2,12 +2,13 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
-#include <bits/stdint-uintn.h>
-#include <vector>
+#include <memory>
 
 #include "vulkan/VMA.hpp"
 
 namespace vkop {
+
+constexpr int kInflight = 2;
 class VulkanQueue {
   public:
     VulkanQueue(VkDevice dev, uint32_t familyIdx, VkQueue queue)
@@ -72,7 +73,7 @@ class VulkanDevice {
     std::shared_ptr<VulkanQueue> getComputeQueue(uint32_t idx = 0) const {
         int offset = idx / 2;
         int cat = idx % 2;
-        cat = cat * 4;
+        cat = cat * kInflight / 2;
         cat += offset;
         return computeQueues_[(cat) % computeQueues_.size()];
     }

@@ -8,7 +8,6 @@
 #include "vulkan/VulkanResource.hpp"
 
 namespace vkop {
-constexpr int kInflight = 2;
 class VulkanPipeline {
   public:
     VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,

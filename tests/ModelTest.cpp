@@ -7,7 +7,6 @@
 #include "ops/Ops.hpp"
 #include "core/runtime.hpp"
 
-#include <bits/stdint-uintn.h>
 #include <cstdio>
 #include <unordered_set>
 #include <random>
@@ -162,7 +161,7 @@ int main() {
     // This model has two inputs and one output,
     // one add and one conv2d operator
 
-    auto rt = std::make_shared<Runtime>(dev, cmdpool, binary_file_path);
+    auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 #ifdef FP16
     auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
@@ -188,8 +187,8 @@ int main() {
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     std::vector<float> ref_output_data;
 #endif
-    bias->copyToCPU(dev, cmdpool);
-    weight->copyToCPU(dev, cmdpool);
+    bias->copyToCPU(cmdpool);
+    weight->copyToCPU(cmdpool);
 
     int batch = t1->getShape()[0];
     int ic = t1->getShape()[1];

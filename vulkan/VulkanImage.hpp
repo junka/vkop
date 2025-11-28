@@ -18,9 +18,9 @@ namespace vkop {
 class VulkanImage : public VulkanResource {
   public:
     VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
-                VkImageUsageFlags usage,
-                VkMemoryPropertyFlags requireProperties,
+                uint32_t layers, VkImageUsageFlags usage,
                 VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT,
+                VkMemoryPropertyFlags req = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
                 int ext_fd = -1);
     ~VulkanImage() override;
 
@@ -56,7 +56,7 @@ class VulkanImage : public VulkanResource {
 
     int getImageSize() const {
         return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
-               m_dim_.depth;
+               m_dim_.depth * m_layers_;
     }
 
     int getImageChannelSize() const { return m_chansize_; }
@@ -64,6 +64,7 @@ class VulkanImage : public VulkanResource {
 
   private:
     VkExtent3D m_dim_;
+    uint32_t m_layers_;
     VkFormat m_format_;
     VkImageUsageFlags m_usage_;
     VkImageType m_imagetype_;
@@ -83,7 +84,7 @@ class VulkanImage : public VulkanResource {
     void calcImageSize();
     int getImageWidth() const { return m_dim_.width; }
     int getImageHeight() const { return m_dim_.height; }
-    int getImageDepth() const { return m_dim_.depth; }
+    int getImageLayers() const { return m_layers_; }
 
     void createImage();
 

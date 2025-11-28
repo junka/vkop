@@ -1,31 +1,32 @@
 // junka @ 2025
 #include <chrono>
 #include <numeric>
-#include <utility>
 
 #include "core/runtime.hpp"
+#include "include/logger.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanPipeline.hpp"
+#include "vulkan/VulkanQueryPool.hpp"
 
 namespace vkop {
 namespace core {
 
-Runtime::Runtime(std::shared_ptr<VulkanDevice> dev,
-                 std::shared_ptr<VulkanCommandPool> cmdpool,
+Runtime::Runtime(std::shared_ptr<VulkanCommandPool> cmdpool,
                  std::string model_path, std::string cache_dir)
-    : m_dev_(std::move(dev)), m_cmdpool_(std::move(cmdpool)),
-      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {
+    : m_cmdpool_(std::move(cmdpool)), model_path_(std::move(model_path)),
+      cache_dir_(std::move(cache_dir)) {
     for (int id = 0; id < vkop::kInflight; id++) {
         m_cmds_[id] =
-            std::make_shared<VulkanCommandBuffer>(m_dev_, m_cmdpool_, true, id);
+            std::make_shared<VulkanCommandBuffer>(m_cmdpool_, true, id);
     }
 }
 
 Runtime::~Runtime() {
+    auto dev = m_cmdpool_->getVulkanDevice();
     for (int id = 0; id < vkop::kInflight; id++) {
-        m_cmds_[id]->wait(m_dev_->getComputeQueue(id));
+        m_cmds_[id]->wait(dev->getComputeQueue(id));
         m_cmds_[id].reset();
     }
 }
@@ -38,7 +39,7 @@ void Runtime::LoadModel() {
     std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
-
+    auto dev = m_cmdpool_->getVulkanDevice();
     // preprocess inputs, make sure we know node types for inputs
     // we can then use type to tell whether we can use fp16 as option
     for (const auto &n : model.nodes) {
@@ -57,7 +58,7 @@ void Runtime::LoadModel() {
             inputs_[i.name] = t;
             tensor_map[i.name] = t;
             tensor_name_map[t] = i.name;
-            t->as_input_image(m_dev_, nullptr);
+            t->as_input_image(dev, nullptr);
         } else {
 #endif
             auto t = std::make_shared<Tensor<float>>(i.dims);
@@ -65,16 +66,15 @@ void Runtime::LoadModel() {
             inputs_[i.name] = t;
             tensor_map[i.name] = t;
             tensor_name_map[t] = i.name;
-            t->as_input_image(m_dev_, nullptr);
+            t->as_input_image(dev, nullptr);
 #ifdef FP16
         }
 #endif
     }
 
     for (const auto &o : model.outputs) {
-        auto t = std::make_shared<Tensor<float>>(o.dims);
+        auto t = std::make_shared<Tensor<float>>(o.dims, true);
         t->set_ref_cnt_forever();
-        t->toGPU();
         outputs_[o.name] = t;
         tensor_map[o.name] = t;
         tensor_name_map[t] = o.name;
@@ -111,23 +111,23 @@ void Runtime::LoadModel() {
                     if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
                         t->fillFP32ToCPU(reinterpret_cast<float *>(src_ptr));
                     } else {
-                        t->as_storage_buffer(m_dev_);
+                        t->as_storage_buffer(dev);
                         std::vector<uint16_t> t_datah(t->num_elements());
                         for (int i = 0; i < t->num_elements(); i++) {
                             t_datah[i] = ITensor::fp32_to_fp16(
                                 reinterpret_cast<float *>(src_ptr)[i]);
                         }
 
-                        t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
+                        t->copyToGPU(m_cmdpool_, t_datah.data());
                     }
                 } else {
-                    t->as_input_image(m_dev_, nullptr);
+                    t->as_input_image(dev, nullptr);
                     std::vector<uint16_t> t_datah(t->num_elements());
                     for (int i = 0; i < t->num_elements(); i++) {
                         t_datah[i] = ITensor::fp32_to_fp16(
                             reinterpret_cast<float *>(src_ptr)[i]);
                     }
-                    t->copyToGPU(m_dev_, m_cmdpool_, t_datah.data());
+                    t->copyToGPU(m_cmdpool_, t_datah.data());
                 }
                 tensor_map[init.name] = t;
                 tensor_name_map[t] = init.name;
@@ -136,18 +136,29 @@ void Runtime::LoadModel() {
 #endif
                 auto t = std::make_shared<Tensor<float>>(init.dims);
                 t->set_ref_cnt_forever();
-                if (t->num_dims() == 2 || t->num_dims() == 1) {
-                    if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
-                        t->fillToCPU(reinterpret_cast<float *>(src_ptr));
+                if (inputs_for_node_type.find(init.name) !=
+                        inputs_for_node_type.end() &&
+                    (inputs_for_node_type[init.name] == "Conv") &&
+                    (t->num_dims() == 4)) {
+                    // weights, packed as N4CHW
+                    // t->set_pack_dim(0);
+                    t->as_input_image(dev, nullptr);
+                    t->copyToGPU(m_cmdpool_,
+                                 reinterpret_cast<float *>(src_ptr));
+                } else {
+                    if (t->num_dims() == 2 || t->num_dims() == 1) {
+                        if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                            t->fillToCPU(reinterpret_cast<float *>(src_ptr));
+                        } else {
+                            t->as_storage_buffer(dev);
+                            t->copyToGPU(m_cmdpool_,
+                                         reinterpret_cast<float *>(src_ptr));
+                        }
                     } else {
-                        t->as_storage_buffer(m_dev_);
-                        t->copyToGPU(m_dev_, m_cmdpool_,
+                        t->as_input_image(dev, nullptr);
+                        t->copyToGPU(m_cmdpool_,
                                      reinterpret_cast<float *>(src_ptr));
                     }
-                } else {
-                    t->as_input_image(m_dev_, nullptr);
-                    t->copyToGPU(m_dev_, m_cmdpool_,
-                                 reinterpret_cast<float *>(src_ptr));
                 }
                 tensor_map[init.name] = t;
                 tensor_name_map[t] = init.name;
@@ -162,14 +173,13 @@ void Runtime::LoadModel() {
                 if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
                     t->fillToCPU(reinterpret_cast<uint16_t *>(src_ptr));
                 } else {
-                    t->as_storage_buffer(m_dev_);
-                    t->copyToGPU(m_dev_, m_cmdpool_,
+                    t->as_storage_buffer(dev);
+                    t->copyToGPU(m_cmdpool_,
                                  reinterpret_cast<uint16_t *>(src_ptr));
                 }
             } else {
-                t->as_input_image(m_dev_, nullptr);
-                t->copyToGPU(m_dev_, m_cmdpool_,
-                             reinterpret_cast<uint16_t *>(src_ptr));
+                t->as_input_image(dev, nullptr);
+                t->copyToGPU(m_cmdpool_, reinterpret_cast<uint16_t *>(src_ptr));
             }
             tensor_map[init.name] = t;
             tensor_name_map[t] = init.name;
@@ -195,8 +205,7 @@ void Runtime::LoadModel() {
                 assert(tensor_map[out_shape.name]->is_on_GPU());
                 node_outputs.push_back(tensor_map[out_shape.name]);
             } else {
-                auto t = std::make_shared<Tensor<float>>(out_shape.dims);
-                t->toGPU();
+                auto t = std::make_shared<Tensor<float>>(out_shape.dims, true);
                 tensor_map[out_shape.name] = t;
                 tensor_name_map[t] = out_shape.name;
                 node_outputs.push_back(t);
@@ -223,7 +232,7 @@ void Runtime::LoadModel() {
             return;
         }
 
-        op->set_runtime_device(m_dev_, m_cmdpool_);
+        op->set_runtime_device(dev, m_cmdpool_);
         op->setAttribute(n.attributes);
 
         node_ops_.push_back(std::move(op));
@@ -258,22 +267,23 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
 }
 
 void Runtime::Run() {
+    auto dev = m_cmdpool_->getVulkanDevice();
     static int id = 0;
     for (auto &p : inputs_) {
         if (p.second->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(p.second);
-            t->copyToGPU(m_dev_, m_cmdpool_);
+            t->copyToGPU(m_cmdpool_);
         } else if (p.second->dtype() == typeid(uint16_t)) {
             auto t = vkop::core::as_tensor<uint16_t>(p.second);
-            t->copyToGPU(m_dev_, m_cmdpool_);
+            t->copyToGPU(m_cmdpool_);
         }
     }
     auto start = std::chrono::steady_clock::now();
-    m_cmds_[id]->wait(m_dev_->getComputeQueue(id));
+    m_cmds_[id]->wait(dev->getComputeQueue(id));
     m_cmds_[id]->begin();
 #ifdef USE_MEASURE_TIME
-    VkDevice device = m_dev_->getLogicalDevice();
-    VulkanQueryPool query_pool(device, 2, VK_QUERY_TYPE_TIMESTAMP);
+    VulkanQueryPool query_pool(dev->getLogicalDevice(), 2,
+                               VK_QUERY_TYPE_TIMESTAMP);
     query_pool.begin(m_cmds_[id]->get());
 #endif
     for (size_t i = 0; i < node_ops_.size(); ++i) {
@@ -295,11 +305,11 @@ void Runtime::Run() {
     query_pool.end(m_cmds_[id]->get());
 #endif
     m_cmds_[id]->end();
-    m_cmds_[id]->submit(m_dev_->getComputeQueue(id));
+    m_cmds_[id]->submit(dev->getComputeQueue(id));
 #ifdef USE_MEASURE_TIME
     auto r = query_pool.getResults();
     LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                               m_dev_->getTimestampPeriod());
+                               dev->getTimestampPeriod());
 #endif
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
@@ -311,7 +321,7 @@ void Runtime::Run() {
 void Runtime::ReadResult() {
     for (auto &p : outputs_) {
         auto t = vkop::core::as_tensor<float>(p.second);
-        t->copyToCPU(m_dev_, m_cmdpool_);
+        t->copyToCPU(m_cmdpool_);
     }
 }
 

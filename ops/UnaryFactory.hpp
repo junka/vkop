@@ -2,17 +2,7 @@
 #ifndef OPS_UNARY_FACTORY_HPP_
 #define OPS_UNARY_FACTORY_HPP_
 
-#include "Operator.hpp"
-
-#include "core/Tensor.hpp"
-#include "include/logger.hpp"
-#include "vulkan/VulkanBuffer.hpp"
-#include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanCommandPool.hpp"
-#include "vulkan/VulkanDevice.hpp"
-#include "vulkan/VulkanImage.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
+#include "ops/Operator.hpp"
 
 namespace vkop {
 namespace ops {
@@ -53,10 +43,10 @@ class UnaryFactory : public Operator {
         int out_height = input_shape[2];
         int out_width = input_shape[3];
 
-        int realwidth = out_width * UP_DIV(depth, 4);
         int realheight = out_height * batch;
 
-        submit(nullptr, UP_DIV(realwidth, 16), UP_DIV(realheight, 16));
+        submit(nullptr, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+               UP_DIV(depth, 4));
     }
 };
 

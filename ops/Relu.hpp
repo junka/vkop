@@ -3,7 +3,6 @@
 #define OPS_RELU_HPP_
 
 #include "UnaryFactory.hpp"
-#include "ops/Ops.hpp"
 
 extern unsigned char relu_spv[];
 extern unsigned int relu_spv_len;

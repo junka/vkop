@@ -5,7 +5,6 @@
 #include "include/logger.hpp"
 #include "include/renderdoc_app.h"
 #include <dlfcn.h>
-#include <stdexcept>
 #include <vulkan/vulkan.hpp>
 
 namespace vkop {

@@ -1,8 +1,7 @@
 #version 450 core
-layout(std430) buffer;
 
-layout(set=0, binding=0) writeonly uniform image2D uOutput;
-layout(set=0, binding=1) uniform sampler2D uInput;
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding=1) uniform sampler2DArray uInput;
 
 
 layout(push_constant) uniform resizeBuffer{
@@ -85,15 +84,15 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
 }
 
 // 双线性采样
-vec4 sample_bilinear(sampler2D tex, vec2 uv, int in_w, int in_h) {
-    uv = clamp(uv, vec2(0.0), vec2(float(in_w) - 1e-5, float(in_h) - 1e-5));
+vec4 sample_bilinear(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_total) {
+    uv = clamp(uv, vec2(0.0), vec2(float(in_w) - 1e-5, float(in_h_total) - 1e-5));
     ivec2 iuv = ivec2(uv);
     vec2 f = fract(uv);
 
-    vec4 tl = texelFetch(tex, ivec2(iuv.x, iuv.y), 0);
-    vec4 tr = texelFetch(tex, ivec2(min(iuv.x + 1, in_w - 1), iuv.y), 0);
-    vec4 bl = texelFetch(tex, ivec2(iuv.x, min(iuv.y + 1, in_h - 1)), 0);
-    vec4 br = texelFetch(tex, ivec2(min(iuv.x + 1, in_w - 1), min(iuv.y + 1, in_h - 1)), 0);
+    vec4 tl = texelFetch(tex, ivec3(iuv.x, iuv.y, layer), 0);
+    vec4 tr = texelFetch(tex, ivec3(min(iuv.x + 1, in_w - 1), iuv.y, layer), 0);
+    vec4 bl = texelFetch(tex, ivec3(iuv.x, min(iuv.y + 1, in_h_total - 1), layer), 0);
+    vec4 br = texelFetch(tex, ivec3(min(iuv.x + 1, in_w - 1), min(iuv.y + 1, in_h_total - 1), layer), 0);
 
     vec4 top = mix(tl, tr, f.x);
     vec4 bot = mix(bl, br, f.x);
@@ -102,49 +101,53 @@ vec4 sample_bilinear(sampler2D tex, vec2 uv, int in_w, int in_h) {
 
 void main()
 {
-    int gx = int(gl_GlobalInvocationID.x);
-    int gy = int(gl_GlobalInvocationID.y);
-    // input output layout is NC4HW4
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    int out_w = gid.x;
+    int out_h_batch = gid.y;   // = n * H_out + h
+    int c4 = gid.z;            // layer index = channel group
+
     int N = uResizeParam.outShape.x;
     int C = uResizeParam.outShape.y;
     int H_out = uResizeParam.outShape.z;
     int W_out = uResizeParam.outShape.w;
-    int C4 = (C+3)/4;
+    int C4 = (C + 3) / 4;
 
-    // Output layout: width = W_out * C4, height = H_out * N
-    int out_c4 = gx / W_out;
-    int out_w  = gx % W_out;
-    int out_n  = gy / H_out;
-    int out_h  = gy % H_out;
-
-    if (out_c4 >= C4 || out_n >= N) {
+    // Bounds check
+    if (out_w >= W_out || out_h_batch >= N * H_out || c4 >= C4) {
         return;
     }
 
-    
-    // Input dimensions
+    int out_n = out_h_batch / H_out;
+    int out_h = out_h_batch % H_out;
+
+    // Input shape
     int H_in = uResizeParam.inShape.z;
     int W_in = uResizeParam.inShape.w;
 
-    // Calculate input coordinates
-    vec2 in_uv = transform_coordinate(float(out_h), float(out_w), float(H_in), float(W_in), uResizeParam.coordinate_transformation_mode);
+    // Transform output (h,w) → input (h_in, w_in)
+    vec2 in_uv = transform_coordinate(
+        float(out_h), float(out_w),
+        float(H_in), float(W_in),
+        uResizeParam.coordinate_transformation_mode
+    );
 
-    // Adjust for batch and channel groups
-    float in_y_batch = float(out_n * H_in) + in_uv.y;
-    float in_x_channel = float(out_c4 * 4); // Start channel within the group
+    // Compute full input y coordinate including batch
+    float in_y_full = float(out_n * H_in) + in_uv.y;
+    vec2 input_coord = vec2(in_uv.x, in_y_full);
 
-    // Sample using bilinear interpolation
     vec4 value;
-    if (uResizeParam.mode == 1) { // linear, bilinear
-        float input_x = in_uv.x + float(out_c4 * W_in);
-        float input_y = float(out_n * H_in) + in_uv.y;
-        value = sample_bilinear(uInput, vec2(input_x, input_y), W_in, N * H_in);
+    if (uResizeParam.mode == 1) { // bilinear
+        value = sample_bilinear(uInput, input_coord, c4, W_in, N * H_in);
+    } else {
+        // Nearest neighbor
+        ivec2 in_pixel = ivec2(round(input_coord));
+        in_pixel.x = clamp(in_pixel.x, 0, W_in - 1);
+        in_pixel.y = clamp(in_pixel.y, 0, N * H_in - 1);
+        value = texelFetch(uInput, ivec3(in_pixel, c4), 0);
     }
-    // Write to the output image
-    // Assuming we want to write all 4 channels from the sampled value
-    // If only one channel is needed, adjust accordingly
-    int out_x = out_c4 * W_out + out_w;
-    int out_y = out_n * H_out + out_h;
-    imageStore(uOutput, ivec2(out_x, out_y), value);
+
+    // Output coordinate: same layout as input
+    int out_y_full = out_n * H_out + out_h;
+    imageStore(uOutput, ivec3(out_w, out_y_full, c4), value);
 }
 

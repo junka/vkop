@@ -11,8 +11,7 @@
 namespace vkop {
 class VulkanCommandBuffer {
   public:
-    VulkanCommandBuffer(std::shared_ptr<VulkanDevice> device,
-                        std::shared_ptr<VulkanCommandPool> cmdpool,
+    VulkanCommandBuffer(std::shared_ptr<VulkanCommandPool> cmdpool,
                         bool signaled = true, int id = 0);
     ~VulkanCommandBuffer();
 
@@ -45,7 +44,6 @@ class VulkanCommandBuffer {
 
   private:
     int id_ = 0;
-    std::shared_ptr<VulkanDevice> m_device_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     bool m_usefence_ = true;
     uint64_t m_timelineValue_ = 0;

@@ -2,12 +2,12 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0) writeonly uniform image2D uOutput;
-layout(set = 0, binding = 1) uniform sampler2D uInput;
+layout(set = 0, binding = 0) writeonly uniform image2DArray uOutput;
+layout(set = 0, binding = 1) uniform sampler2DArray uInput;
 
 // softplus f(x) = ln(exp(x) + 1)
 void main() {
-    ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
     vec4 inputValue = texelFetch(uInput, coord, 0);
     vec4 outputValue = log(exp(inputValue) + vec4(1.0));
     imageStore(uOutput, coord, outputValue);
