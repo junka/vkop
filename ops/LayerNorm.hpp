@@ -85,9 +85,6 @@ class LayerNorm : public Operator {
         int out_height = input_shape[2];
         int out_width = input_shape[3];
 
-        int realwidth = out_width * UP_DIV(depth, 4);
-        int realheight = out_height * batch;
-
         layernorm::GpuLayerNormParam para;
         para.eps = eps_;
         para.outShape[0] = batch;
@@ -101,12 +98,12 @@ class LayerNorm : public Operator {
             para.innerSize *= normalized_shape_[i];
         }
 
-        if (normalized_shape_.size() == 1) { // 归一化最后一个维度 W
-            submit(&para, batch * UP_DIV(depth, 4), out_height, 1);
+        if (normalized_shape_.size() == 1) { // norm W
+            submit(&para, batch, out_height, UP_DIV(depth, 4));
         } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
-            submit(&para, batch, UP_DIV(depth, 4), 1);
+            submit(&para, batch, 1, UP_DIV(depth, 4));
         } else { // 归一化所有维度 CHW
-            submit(&para, realwidth, realheight, 1);
+            submit(&para, batch, 1, 1);
         }
     }
 

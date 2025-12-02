@@ -2,8 +2,8 @@
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set=0, binding = 0) writeonly uniform image2D outputImage;
-layout(set=0, binding = 1) uniform sampler2D inputImage;
+layout(set=0, binding = 0) writeonly uniform image2DArray outputImage;
+layout(set=0, binding = 1) uniform sampler2DArray inputImage;
 layout(set=0, binding = 2) readonly buffer weightBuffer {
     float attr[];
 } uWeight;
@@ -27,50 +27,47 @@ shared vec4 shared_inv_std;
 
 // torch.nn.functional.layer_norm(input, normalized_shape, weight=None, bias=None, eps=1e-05)
 
-// dispatch (N * C4, H), 归一化最后一个维度 W
-void norm_for_w () {
+// dispatch (N, H, C4), 归一化最后一个维度 W
+void norm_for_w() {
     uint lx = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
-    uint lid = ly * 16 + lx;  // local thread ID [0, 255]
+    uint lid = ly * 16 + lx;  // [0, 255]
+
     int N = uLayerhNormParam.outShape.x;
     int C = uLayerhNormParam.outShape.y;
     int H = uLayerhNormParam.outShape.z;
     int W = uLayerhNormParam.outShape.w;
-    int D = uLayerhNormParam.innerSize;
+    int D = uLayerhNormParam.innerSize; // = W
     int C4 = (C + 3) / 4;
 
-    const float epsilon = uLayerhNormParam.eps;
+    uint n   = gl_WorkGroupID.x;
+    uint h   = gl_WorkGroupID.y;
+    uint c4  = gl_GlobalInvocationID.z;  // ← Z = c4!
 
-    int h = int(gl_WorkGroupID.y);
-    int idx = int(gl_WorkGroupID.x);
-    int n = idx / C4;
-    int c4 = idx % C4;
-    int y = n * H + h;
+    if (n >= N || h >= H || c4 >= C4) return;
 
-    sum[lid] = vec4(0.0f);
-    sum_sq[lid] = vec4(0.0f);
+    uint y_coord = n * H + h;
 
-    vec4 local_sum = vec4(0.0f);
-    vec4 local_sum_sq = vec4(0.0f);
+    // --- Reduction over W ---
+    vec4 local_sum = vec4(0.0);
+    vec4 local_sum_sq = vec4(0.0);
 
-    // stride loop to accumulate sum and sum_sq
     for (int w = int(lid); w < W; w += 256) {
-        // int row_offset = n * (C4 * H) + c4 * H + h;
-        int x = w + c4 * W;
-        ivec2 coord = ivec2(x, y);
-        vec4 pixel = texelFetch(inputImage, coord, 0);
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y_coord, c4), 0);
         local_sum += pixel;
         local_sum_sq += pixel * pixel;
     }
+
     sum[lid] = local_sum;
     sum_sq[lid] = local_sum_sq;
     memoryBarrierShared();
     barrier();
 
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            sum[lid] += sum[lid + stride];
-            sum_sq[lid] += sum_sq[lid + stride];
+    // Parallel reduction
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sum[lid] += sum[lid + s];
+            sum_sq[lid] += sum_sq[lid + s];
         }
         memoryBarrierShared();
         barrier();
@@ -81,61 +78,54 @@ void norm_for_w () {
         vec4 var = sum_sq[0] / float(W) - mean * mean;
         var = max(var, 0.0);
         shared_mean = mean;
-        shared_inv_std = inversesqrt(var + epsilon);
+        shared_inv_std = inversesqrt(var + uLayerhNormParam.eps);
     }
     barrier();
 
-    // Read input again and write output
+    // --- Write back ---
     for (int w = int(lid); w < W; w += 256) {
-        // int row_offset = n * (C4 * H) + c4 * H + h;
-        int x = w + c4 * W;
-        ivec2 coord = ivec2(x, y);
-        vec4 pixel = texelFetch(inputImage, coord, 0);
-
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y_coord, c4), 0);
         vec4 norm = (pixel - shared_mean) * shared_inv_std;
 
-        // Apply weight & bias
-        vec4 weights = vec4(uWeight.attr[w]);
-        vec4 biases = vec4(uBias.attr[w]);
+        // weight/bias indexed by w (since normalized_shape = [W])
+        float wgt = uWeight.attr[w];
+        float b   = uBias.attr[w];
+        vec4 data = norm * wgt + b;
 
-        vec4 output_pixel = norm * weights + biases;
-        imageStore(outputImage, coord, output_pixel);
+        imageStore(outputImage, ivec3(w, y_coord, c4), data);
     }
 }
 
-// dispatch (N, C4), 归一化最后两个维度 HW
+// dispatch (N, 1, C4), 归一化最后两个维度 HW
 void norm_for_hw() {
-    int n = int(gl_WorkGroupID.x);
-    int c4 = int(gl_WorkGroupID.y);
-
     uint lx = gl_LocalInvocationID.x;
     uint ly = gl_LocalInvocationID.y;
-    uint lid = ly * 16 + lx;  // local thread ID [0, 255]
+    uint lid = ly * 16 + lx;  // [0, 255]
 
     int N = uLayerhNormParam.outShape.x;
     int C = uLayerhNormParam.outShape.y;
     int H = uLayerhNormParam.outShape.z;
     int W = uLayerhNormParam.outShape.w;
-    int D = uLayerhNormParam.innerSize;  // 应为 H * W
-    float epsilon = uLayerhNormParam.eps;
+    int D = H * W;
+    float eps = uLayerhNormParam.eps;
     int C4 = (C + 3) / 4;
 
-    if (n >=N || c4 >= C4) return;
+    uint n  = gl_WorkGroupID.x;
+    uint c4 = gl_GlobalInvocationID.z;
 
+    if (n >= N || c4 >= C4) return;
 
-    vec4 local_sum = vec4(0.0f);
-    vec4 local_sum_sq = vec4(0.0f);
+    uint y_base = n * H;  // base y for this batch
+
+    // --- Step 1: Reduce over all (h, w) ---
+    vec4 local_sum = vec4(0.0);
+    vec4 local_sum_sq = vec4(0.0);
 
     for (int hw = int(lid); hw < D; hw += 256) {
         int h = hw / W;
         int w = hw % W;
-
-        int y_coord = n * H + h;
-        int x_coord = c4 * W + w;
-        ivec2 coord = ivec2(x_coord, y_coord);
-
-        vec4 pixel = texelFetch(inputImage, coord, 0);
-
+        uint y = y_base + h;
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y, c4), 0);
         local_sum += pixel;
         local_sum_sq += pixel * pixel;
     }
@@ -145,51 +135,143 @@ void norm_for_hw() {
     memoryBarrierShared();
     barrier();
 
-    // 并行规约求和
-    for (int stride = 128; stride > 0; stride >>= 1) {
-        if (lid < stride) {
-            sum[lid] += sum[lid + stride];
-            sum_sq[lid] += sum_sq[lid + stride];
+    // --- Step 2: Parallel reduction ---
+    for (int s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            sum[lid] += sum[lid + s];
+            sum_sq[lid] += sum_sq[lid + s];
         }
         memoryBarrierShared();
         barrier();
     }
 
-    // lid == 0 的线程计算 mean 和 inv_std
-    vec4 mean, inv_std;
+    // --- Step 3: Compute stats ---
     if (lid == 0) {
-        mean = sum[0] / float(D);
+        vec4 mean = sum[0] / float(D);
         vec4 var = sum_sq[0] / float(D) - mean * mean;
         var = max(var, 0.0);
-        inv_std = inversesqrt(var + epsilon);
         shared_mean = mean;
-        shared_inv_std = inv_std;
+        shared_inv_std = inversesqrt(var + eps);
     }
     barrier();
 
-    // ===== 第二步：读取输入，归一化，写入输出 =====
+    // --- Step 4: Write output ---
     for (int hw = int(lid); hw < D; hw += 256) {
         int h = hw / W;
         int w = hw % W;
+        uint y = y_base + h;
 
-        int y_coord = n * H + h;
-        int x_coord = c4 * W + w;
-        ivec2 coord = ivec2(x_coord, y_coord);
-
-        vec4 pixel = texelFetch(inputImage, coord, 0);
-
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y, c4), 0);
         vec4 norm = (pixel - shared_mean) * shared_inv_std;
 
-        // Apply weight & bias
-        vec4 weight = vec4(uWeight.attr[hw]);
-        vec4 bias = vec4(uBias.attr[hw]);
+        // Weight & bias indexed by hw (since normalized_shape = [H, W])
+        float weight_val = uWeight.attr[hw];
+        float bias_val   = uBias.attr[hw];
+        vec4 data = norm * weight_val + bias_val;
 
-        vec4 outputPixel = norm * weight + bias;
-        imageStore(outputImage, coord, outputPixel);
+        imageStore(outputImage, ivec3(w, y, c4), data);
     }
 }
 
+// dispatch (N, 1, 1)
 void norm_for_chw () {
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint lid = ly * 16 + lx;  // [0, 255]
+
+    int N = uLayerhNormParam.outShape.x;
+    int C = uLayerhNormParam.outShape.y;
+    int H = uLayerhNormParam.outShape.z;
+    int W = uLayerhNormParam.outShape.w;
+    int D = C * H * W;  // uLayerhNormParam.innerSize
+    float eps = uLayerhNormParam.eps;
+    int C4 = (C + 3) / 4;
+
+    uint n = gl_WorkGroupID.x;
+    if (n >= N) return;
+
+    uint y_base = n * H;
+
+    // === Stage 1: Each thread computes scalar partial sum ===
+    float local_sum = 0.0;
+    float local_sum_sq = 0.0;
+
+    for (int idx = int(lid); idx < D; idx += 256) {
+        int temp = idx;
+        int w = temp % W;              temp /= W;
+        int h = temp % H;              temp /= H;
+        int c = temp;
+
+        int z = c / 4;
+        int comp = c % 4;
+
+        uint y = y_base + h;
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y, z), 0);
+        float value = pixel[comp];
+
+        local_sum += value;
+        local_sum_sq += value * value;
+    }
+
+    // Store in shared memory (use first component of vec4)
+    sum[lid].x = local_sum;
+    sum_sq[lid].x = local_sum_sq;
+    memoryBarrierShared();
+    barrier();
+
+    // === Stage 2: Scalar tree reduction ===
+    for (int stride = 128; stride > 0; stride >>= 1) {
+        if (lid < stride) {
+            sum[lid].x += sum[lid + stride].x;
+            sum_sq[lid].x += sum_sq[lid + stride].x;
+        }
+        memoryBarrierShared();
+        barrier();
+    }
+
+    // === Stage 3: Compute mean and inv_std (scalar) ===
+    float global_mean, global_inv_std;
+    if (lid == 0) {
+        global_mean = sum[0].x / float(D);
+        float global_var = sum_sq[0].x / float(D) - global_mean * global_mean;
+        global_var = max(global_var, 0.0);
+        global_inv_std = inversesqrt(global_var + eps);
+
+        // Broadcast via shared memory
+        shared_mean.x = global_mean;
+        shared_inv_std.x = global_inv_std;
+    }
+    barrier();
+
+    global_mean = shared_mean.x;
+    global_inv_std = shared_inv_std.x;
+
+    // === Stage 4: Write normalized output ===
+    for (int idx = int(lid); idx < D; idx += 256) {
+        int temp = idx;
+        int w = temp % W;              temp /= W;
+        int h = temp % H;              temp /= H;
+        int c = temp;
+
+        int z = c / 4;
+        int comp = c % 4;
+
+        uint y = y_base + h;
+        vec4 pixel = texelFetch(inputImage, ivec3(w, y, z), 0);
+        float value = pixel[comp];
+
+        float norm_val = (value - global_mean) * global_inv_std;
+
+        // Apply weight & bias: indexed by (c, h, w)
+        int weight_idx = c * H * W + h * W + w;
+        float weight_val = uWeight.attr[weight_idx];
+        float bias_val   = uBias.attr[weight_idx];
+
+        // Write back
+        vec4 out_pixel = pixel;
+        out_pixel[comp] = norm_val * weight_val + bias_val;
+        imageStore(outputImage, ivec3(w, y, z), out_pixel);
+    }
 }
 
 void main() {
@@ -200,6 +282,5 @@ void main() {
         norm_for_hw();
     } else {
         norm_for_chw();
-        imageStore(outputImage, ivec2(0, 0), vec4(3.0f));
     }
 }

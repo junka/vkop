@@ -94,7 +94,7 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
 class LayerNormTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 5, 4, 4
+        2, 5, 4, 4
     };
     std::vector<int> normalized_shape_ = {4, 4};
     const std::unordered_map<std::string, std::string> param = {

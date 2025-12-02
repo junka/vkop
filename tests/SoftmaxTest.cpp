@@ -114,10 +114,10 @@ void softmax_nd(const float* input, float* output,
 
 class SoftmaxTest : public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 5, 4, 4};
+    std::vector<int> input_shape_ = {12, 15, 8, 8};
     std::shared_ptr<Tensor<float>> input;
     std::vector<float> expectedOutput;
-    int axis_ = 0;
+    int axis_ = 1;
     const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
 
     SoftmaxTest():TestCase("Softmax") {

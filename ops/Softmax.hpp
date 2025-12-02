@@ -85,19 +85,22 @@ class Softmax : public Operator {
         para.outImgSize[2] = 1;
         para.outImgSize[3] = 0;
         para.outShape[0] = batch;
-        para.outShape[1] = out_height;
-        para.outShape[2] = out_width;
-        para.outShape[3] = depth;
+        para.outShape[1] = depth;
+        para.outShape[2] = out_height;
+        para.outShape[3] = out_width;
         para.axis = axis_;
 
         if (axis_ == 0) {
-            submit(&para, out_width, realheight, UP_DIV(depth, 4));
+            submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
+                   UP_DIV(depth, 4));
         } else if (axis_ == 1) {
-            submit(&para, out_width, realheight, batch);
+            submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16), batch);
         } else if (axis_ == 2) {
-            submit(&para, out_width, batch, UP_DIV(depth, 4));
+            submit(&para, UP_DIV(out_width, 16), UP_DIV(batch, 16),
+                   UP_DIV(depth, 4));
         } else if (axis_ == 3) {
-            submit(&para, out_height, batch, UP_DIV(depth, 4));
+            submit(&para, UP_DIV(out_height, 16), UP_DIV(batch, 16),
+                   UP_DIV(depth, 4));
         }
     }
 

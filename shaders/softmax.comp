@@ -22,231 +22,180 @@ float reduceSum(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 // Axis 0: softmax over N (batch)
 void softmax_axis0() {
-    uint lid = gl_LocalInvocationIndex;
+    uint x = gl_GlobalInvocationID.x;  // w
+    uint y = gl_GlobalInvocationID.y;  // h
+    uint z = gl_GlobalInvocationID.z;  // layer index (c_base / 4)
     int N = uConst.outShape.x;
     int C = uConst.outShape.y;
     int H = uConst.outShape.z;
     int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
-    // Each workgroup handles: (c_group, h, w)
-    int w = int(gl_WorkGroupID.x);
-    int idx = int(gl_WorkGroupID.y); // = h * C4 + c_group
-    if (w >= W || idx >= H * C4) return;
+    if (x >= W || y >= H || z >= C4) return;
 
-    int h = idx / C4;
-    int c_group = idx % C4;
+    uint h = y;
+    uint c_base = z * 4;
 
-    vec4 threadMax = vec4(-1e38f);
-    for (int n = int(lid); n < N; n += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadMax = max(threadMax, v);
+    // Initialize max value and sum of exp values
+    vec4 max_val = vec4(-1e9);
+    vec4 sum_exp = vec4(0.0);
+
+    // Step 1: Find the maximum value over height (h)
+    for (uint n = 0; n < N; ++n) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + h, z), 0);
+        max_val = max(max_val, v);
     }
-    sharedMax[lid] = threadMax;
-    barrier();
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
-        barrier();
+    // Step 2: Compute the sum of exp(values - max_val)
+    for (uint n = 0; n < N; ++n) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + y, z), 0);
+        vec4 exp_v = exp(v - max_val);
+        sum_exp += exp_v;
     }
-    vec4 max_val = sharedMax[0];
 
-    vec4 threadSum = vec4(0.0f);
-    for (int n = int(lid); n < N; n += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadSum += exp(v - max_val);
-    }
-    sharedSum[lid] = threadSum;
-    barrier();
-
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
-        barrier();
-    }
-    vec4 sum_exp = sharedSum[0];
-
-    for (int n = int(lid); n < N; n += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        vec4 outval = exp(v - max_val) / sum_exp;
-        imageStore(OutputImage, ivec3(w, y, c_group), outval);
+    // Step 3: Normalize and store the result back to the output image
+    for (uint n = 0; n < N; ++n) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + y, z), 0);
+        vec4 softmax_v = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(x, n * H + y, z), softmax_v);
     }
 }
 
 // Axis 1: softmax over C (channel) ← MOST COMMON
 void softmax_axis1() {
-    uint lid = gl_LocalInvocationIndex;
+    uint w = gl_GlobalInvocationID.x;  // w
+    uint h = gl_GlobalInvocationID.y;  // h
+    uint n = gl_GlobalInvocationID.z;  // n
     int N = uConst.outShape.x;
     int C = uConst.outShape.y;
     int H = uConst.outShape.z;
     int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
-    // Each workgroup handles: (n, h, w)
-    int w = int(gl_WorkGroupID.x);
-    int idx = int(gl_WorkGroupID.y); // = n * H + h
-    if (w >= W || idx >= N * H) return;
+    if (w >= W || h >= H || n >= N) return;
 
-    int n = idx / H;
-    int h = idx % H;
+     uint y = n * H + h;
 
-    float threadMax = -1e38f;
-    for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, c_group), 0);
-        threadMax = max(threadMax, reduceMax(v));
-    }
-    sharedMax[lid].x = threadMax;
-    barrier();
+    // Initialize max value and sum of exp values
+    float max_val = -1e9;
+    float sum_exp = 0.0;
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedMax[lid].x = max(sharedMax[lid].x, sharedMax[lid + s].x);
-        barrier();
-    }
-    float max_val = sharedMax[0].x;
-
-    float threadSum = 0.0f;
-    for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, c_group), 0);
-        vec4 exp_v = exp(v - vec4(max_val));
-        // Mask padding channels in last group
-        if (c_group == C4 - 1 && C % 4 != 0) {
-            int rem = C % 4;
-            bvec4 mask = lessThan(ivec4(0,1,2,3), ivec4(rem));
-            exp_v *= vec4(mask);
+     for (int z = 0; z < C4; ++z) {
+        vec4 v = texelFetch(InputImage, ivec3(w, y, z), 0);
+        for (int comp = 0; comp < 4; ++comp) {
+            uint c = z * 4 + comp;
+            if (c < C) {
+                max_val = max(max_val, v[comp]);
+            }
         }
-        threadSum += reduceSum(exp_v);
     }
-    sharedSum[lid].x = threadSum;
-    barrier();
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedSum[lid].x += sharedSum[lid + s].x;
-        barrier();
-    }
-    float sum_exp = sharedSum[0].x;
-
-    for (int c_group = int(lid); c_group < C4; c_group += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        vec4 outval = exp(v - vec4(max_val)) / vec4(sum_exp);
-        if (c_group == C4 - 1 && C % 4 != 0) {
-            int rem = C % 4;
-            bvec4 mask = lessThan(ivec4(0,1,2,3), ivec4(rem));
-            outval *= vec4(mask);
+    // Step 2: Compute the sum of exp(values - max_val)
+    for (int z = 0; z < C4; ++z) {
+        vec4 v = texelFetch(InputImage, ivec3(w, y, z), 0);
+        for (int comp = 0; comp < 4; ++comp) {
+            uint c = z * 4 + comp;
+            if (c < C) {
+                sum_exp += exp(v[comp] - max_val);
+            }
         }
-        imageStore(OutputImage, ivec3(w, y, c_group), outval);
+    }
+
+    // Step 3: Normalize and store the result back to the output image
+    for (int z = 0; z < C4; ++z) {
+        vec4 v = texelFetch(InputImage, ivec3(w, y, z), 0);
+        vec4 out_v = vec4(0.0);
+        for (int comp = 0; comp < 4; ++comp) {
+            uint c = z * 4 + comp;
+            if (c < C) {
+                out_v[comp] = exp(v[comp] - max_val) / sum_exp;
+            }
+        }
+        imageStore(OutputImage, ivec3(w, y, z), out_v);
     }
 }
 
+
 // Axis 2: softmax over H (height)
 void softmax_axis2() {
-    uint lid = gl_LocalInvocationIndex;
+    uint x = gl_GlobalInvocationID.x;  // w
+    uint y = gl_GlobalInvocationID.y;  // n
+    uint z = gl_GlobalInvocationID.z;  // layer index (c_base / 4)
     int N = uConst.outShape.x;
     int C = uConst.outShape.y;
     int H = uConst.outShape.z;
     int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
-    // Each workgroup handles: (n, c_group, w)
-    int w = int(gl_WorkGroupID.x);
-    int idx = int(gl_WorkGroupID.y); // = n * C4 + c_group
-    if (w >= W || idx >= N * C4) return;
+    if (x >= W || y >= N || z >= C4) return;
 
-    int n = idx / C4;
-    int c_group = idx % C4;
+    uint n = y;
+    uint c_base = z * 4;
 
-    vec4 threadMax = vec4(-1e38f);
-    for (int h = int(lid); h < H; h += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadMax = max(threadMax, v);
+    // Initialize max value and sum of exp values
+    vec4 max_val = vec4(-1e9);
+    vec4 sum_exp = vec4(0.0);
+
+    // Step 1: Find the maximum value over height (h)
+    for (uint h = 0; h < H; ++h) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + h, z), 0);
+        max_val = max(max_val, v);
     }
-    sharedMax[lid] = threadMax;
-    barrier();
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
-        barrier();
+    // Step 2: Compute the sum of exp(values - max_val)
+    for (uint h = 0; h < H; ++h) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + h, z), 0);
+        vec4 exp_v = exp(v - max_val);
+        sum_exp += exp_v;
     }
-    vec4 max_val = sharedMax[0];
 
-    vec4 threadSum = vec4(0.0f);
-    for (int h = int(lid); h < H; h += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadSum += exp(v - max_val);
-    }
-    sharedSum[lid] = threadSum;
-    barrier();
-
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
-        barrier();
-    }
-    vec4 sum_exp = sharedSum[0];
-
-    for (int h = int(lid); h < H; h += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        vec4 outval = exp(v - max_val) / sum_exp;
-        imageStore(OutputImage, ivec3(w, y, c_group), outval);
+    // Step 3: Normalize and store the result back to the output image
+    for (uint h = 0; h < H; ++h) {
+        vec4 v = texelFetch(InputImage, ivec3(x, n * H + h, z), 0);
+        vec4 softmax_v = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(x, n * H + h, z), softmax_v);
     }
 }
 
 // Axis 3: softmax over W (width)
 void softmax_axis3() {
-    uint lid = gl_LocalInvocationIndex;
+    uint x = gl_GlobalInvocationID.x;  // h
+    uint y = gl_GlobalInvocationID.y;  // n
+    uint z = gl_GlobalInvocationID.z;  // layer index (c_base / 4)
     int N = uConst.outShape.x;
     int C = uConst.outShape.y;
     int H = uConst.outShape.z;
     int W = uConst.outShape.w;
     int C4 = (C + 3) / 4;
 
-    // Each workgroup handles: (n, c_group, h)
-    int h = int(gl_WorkGroupID.x);
-    int idx = int(gl_WorkGroupID.y); // = n * C4 + c_group
-    if (h >= H || idx >= N * C4) return;
+    if (x >= H || y >= N || z >= C4) return;
 
-    int n = idx / C4;
-    int c_group = idx % C4;
+    uint n = y;
+    uint h = x;
+    uint c_base = z * 4;
 
-    vec4 threadMax = vec4(-1e38f);
-    for (int w = int(lid); w < W; w += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadMax = max(threadMax, v);
+    // Initialize max value and sum of exp values
+    vec4 max_val = vec4(-1e9);
+    vec4 sum_exp = vec4(0.0);
+
+    // Step 1: Find the maximum value over height (h)
+    for (uint w = 0; w < W; ++w) {
+        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, z), 0);
+        max_val = max(max_val, v);
     }
-    sharedMax[lid] = threadMax;
-    barrier();
 
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedMax[lid] = max(sharedMax[lid], sharedMax[lid + s]);
-        barrier();
+    // Step 2: Compute the sum of exp(values - max_val)
+    for (uint w = 0; w < W; ++w) {
+        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, z), 0);
+        vec4 exp_v = exp(v - max_val);
+        sum_exp += exp_v;
     }
-    vec4 max_val = sharedMax[0];
 
-    vec4 threadSum = vec4(0.0f);
-    for (int w = int(lid); w < W; w += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        threadSum += exp(v - max_val);
-    }
-    sharedSum[lid] = threadSum;
-    barrier();
-
-    for (int s = 128; s > 0; s >>= 1) {
-        if (lid < s) sharedSum[lid] += sharedSum[lid + s];
-        barrier();
-    }
-    vec4 sum_exp = sharedSum[0];
-
-    for (int w = int(lid); w < W; w += 256) {
-        int y = n * H + h;
-        vec4 v = texelFetch(InputImage, ivec3(w, y, c_group), 0);
-        vec4 outval = exp(v - max_val) / sum_exp;
-        imageStore(OutputImage, ivec3(w, y, c_group), outval);
+    // Step 3: Normalize and store the result back to the output image
+    for (uint w = 0; w < W; ++w) {
+        vec4 v = texelFetch(InputImage, ivec3(w, n * H + h, z), 0);
+        vec4 softmax_v = exp(v - max_val) / sum_exp;
+        imageStore(OutputImage, ivec3(w, n * H + h, z), softmax_v);
     }
 }
 
