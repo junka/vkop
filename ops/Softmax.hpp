@@ -91,9 +91,9 @@ class Softmax : public Operator {
         para.axis = axis_;
 
         if (axis_ == 0) {
-            submit(&para, out_width, out_height, UP_DIV(depth, 4));
+            submit(&para, out_width, realheight, UP_DIV(depth, 4));
         } else if (axis_ == 1) {
-            submit(&para, out_width, out_height, batch);
+            submit(&para, out_width, realheight, batch);
         } else if (axis_ == 2) {
             submit(&para, out_width, batch, UP_DIV(depth, 4));
         } else if (axis_ == 3) {

@@ -18,6 +18,9 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     if (m_usage_ == 0) {
         throw std::runtime_error("Invalid Vulkan image usage.");
     }
+    if (m_layers_ == 0 || m_layers_ > vdev->getMaxImageArrayLayers()) {
+        throw std::runtime_error("Invalid Vulkan image layers.");
+    }
     calcImageSize();
     createImage();
 #ifndef USE_VMA
@@ -228,7 +231,7 @@ void VulkanImage::createImage() {
     image_create_info.tiling = VK_IMAGE_TILING_OPTIMAL;
     image_create_info.usage = m_usage_;
     image_create_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    image_create_info.flags = VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+    image_create_info.flags = 0;
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_create_info.queueFamilyIndexCount = 0;
     image_create_info.pQueueFamilyIndices = nullptr;
@@ -323,7 +326,7 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
                                         VkAccessFlags dstAccessMask,
                                         VkPipelineStageFlags sourceStage,
                                         VkPipelineStageFlags destinationStage) {
-    if (m_layout_ == newLayout) {
+    if (m_layout_ == newLayout && m_access_ == dstAccessMask) {
         return;
     }
 
@@ -355,9 +358,9 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
     m_layout_ = newLayout;
     m_access_ = dstAccessMask;
 
-    if (m_layout_ == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL) {
+    if (m_access_ == VK_ACCESS_SHADER_READ_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    } else if (m_layout_ == VK_IMAGE_LAYOUT_GENERAL) {
+    } else if (m_access_ == VK_ACCESS_SHADER_WRITE_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
 }
@@ -385,10 +388,10 @@ void VulkanImage::transferWriteBarrier(VkCommandBuffer commandBuffer) {
                           VK_PIPELINE_STAGE_TRANSFER_BIT);
 }
 void VulkanImage::readBarrier(VkCommandBuffer commandBuffer) {
-    transitionImageLayout(
-        commandBuffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-        VK_ACCESS_SHADER_READ_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    transitionImageLayout(commandBuffer, VK_IMAGE_LAYOUT_GENERAL,
+                          VK_ACCESS_SHADER_READ_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
 }
 
 void VulkanImage::writeBarrier(VkCommandBuffer commandBuffer) {
@@ -475,8 +478,8 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     }
 }
 
-void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 #ifdef VK_EXT_host_image_copy
+void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     VkResult ret;
     VkImageSubresourceRange subrange = {};
     subrange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -505,19 +508,14 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
         assert(ret == VK_SUCCESS);
         m_layout_ = newLayout;
     }
-#else
-    (void)newLayout;
-#endif
-    if (m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    if (m_access_ == VK_ACCESS_SHADER_READ_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    } else if (m_layout_ == VK_IMAGE_LAYOUT_GENERAL ||
-               m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+    } else if (m_access_ == VK_ACCESS_SHADER_WRITE_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     }
 }
 
 void VulkanImage::hostImageCopyToDevice(void *ptr) {
-#ifdef VK_EXT_host_image_copy
     VkResult ret;
     VkMemoryToImageCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
@@ -545,13 +543,9 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
         ret = vkCopyMemoryToImageEXT(m_vdev_->getLogicalDevice(), &copyinfo);
         assert(ret == VK_SUCCESS);
     }
-#else
-    (void)(ptr);
-#endif
 }
 
 void VulkanImage::hostImageCopyToHost(void *ptr) {
-#ifdef VK_EXT_host_image_copy
     VkImageToMemoryCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -578,9 +572,7 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
                               "vkCopyImageToMemoryEXT"));
     if (vkCopyImageToMemoryEXT)
         vkCopyImageToMemoryEXT(m_vdev_->getLogicalDevice(), &copyinfo);
-#else
-    (void)(ptr);
-#endif
 }
+#endif
 
 } // namespace vkop

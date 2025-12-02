@@ -50,10 +50,11 @@ class VulkanImage : public VulkanResource {
      * For host image copy image layout transition
      * This is done on host
      */
+#ifdef VK_EXT_host_image_copy
     void hostImaggeTransition(VkImageLayout newLayout);
     void hostImageCopyToDevice(void *ptr);
     void hostImageCopyToHost(void *ptr);
-
+#endif
     int getImageSize() const {
         return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
                m_dim_.depth * m_layers_;

@@ -45,8 +45,6 @@ class ITensor {
     void set_ref_cnt_forever() {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
-    void set_pack_dim(int dim) { pack_dim_ = dim; }
-    uint8_t get_pack_dim() const { return pack_dim_; }
     std::vector<int> getShape() {
         if (dims_[3]) {
             return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
@@ -121,7 +119,6 @@ class ITensor {
     int dims_[4];
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
-    uint8_t pack_dim_ = 1;
     bool converted_ = false;
 };
 
@@ -335,11 +332,7 @@ template <typename T> class Tensor : public ITensor {
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
             std::vector<T> ptr(img->getImageSize());
-            if (pack_dim_ == 1) {
-                convertTensorToRGBA(ptr.data(), src);
-            } else if (pack_dim_ == 0) {
-                convertTensorToRGBA_N4(ptr.data(), src);
-            }
+            convertTensorToRGBA(ptr.data(), src);
             img->hostImageCopyToDevice(ptr.data());
             cmd.begin();
             img->readBarrier(cmd.get());
@@ -358,11 +351,7 @@ template <typename T> class Tensor : public ITensor {
                 printf("stpool alloc failed\n");
                 return;
             }
-            if (pack_dim_ == 1) {
-                convertTensorToRGBA(static_cast<T *>(b->ptr), src);
-            } else if (pack_dim_ == 0) {
-                convertTensorToRGBA_N4(static_cast<T *>(b->ptr), src);
-            }
+            convertTensorToRGBA(static_cast<T *>(b->ptr), src);
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
             img->readBarrier(cmd.get());
@@ -468,10 +457,7 @@ template <typename T> class Tensor : public ITensor {
 
         uint32_t realwidth = dims_[3];
         uint32_t realheight = dims_[2] * dims_[0];
-        if (pack_dim_ == 0) {
-            realwidth = dims_[3] * dims_[1];
-            realheight = dims_[2] * UP_DIV(dims_[0], 4);
-        }
+
         auto vkdim = VkExtent3D{realwidth, realheight, 1};
         vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, UP_DIV(dims_[1], 4),
                                                flags, format);
@@ -542,11 +528,7 @@ template <typename T> class Tensor : public ITensor {
         if (dev->is_support_host_image_copy()) {
             std::vector<T> rgba((img->getImageSize() / sizeof(T)));
             img->hostImageCopyToHost(rgba.data());
-            if (pack_dim_ == 0) {
-                convertN4CHWToTensor(rgba.data());
-            } else {
-                convertRGBAToTensor(rgba.data());
-            }
+            convertRGBAToTensor(rgba.data());
         } else
 #endif
         {
@@ -568,11 +550,7 @@ template <typename T> class Tensor : public ITensor {
             auto submit_value = cmd.submit(dev->getComputeQueue());
             cmd.wait(dev->getComputeQueue());
             stpool->markSubmit(submit_value);
-            if (pack_dim_ == 0) {
-                convertN4CHWToTensor(static_cast<T *>(b->ptr));
-            } else {
-                convertRGBAToTensor(static_cast<T *>(b->ptr));
-            }
+            convertRGBAToTensor(static_cast<T *>(b->ptr));
         }
 
         toCPU();
@@ -650,55 +628,6 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    void convertTensorToRGBA_N4(T *ptr, T *src = nullptr) {
-        assert(1 == 0 && "Not implemented yet");
-        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        if (!img) {
-            throw std::runtime_error(
-                "Failed to cast VulkanResource to VulkanImage");
-        }
-
-        const int C_out = dims_[0];
-        const int C_in = dims_[1];
-        const int kH = dims_[2];
-        const int kW = dims_[3];
-        const int C_out4 = UP_DIV(C_out, 4);
-
-        const T *input = src ? src : data_.data();
-
-        const int width = kW * C_in; // ← 将 C_in 和 kW 合并到 width
-        // const int height = kH * C_out4; // ← kH 和 C_out4 放在 height
-
-        const uint32_t rowPitchBytes = width * 4 * img->getImageChannelSize();
-        assert(img->getImageChannelNum() == 4 && "Weight image must be RGBA");
-
-        for (int oc4 = 0; oc4 < C_out4; ++oc4) {
-            for (int kh = 0; kh < kH; ++kh) {
-                for (int ic = 0; ic < C_in; ++ic) {
-                    for (int kw = 0; kw < kW; ++kw) {
-                        int x = ic * kW + kw;  // within [0, width)
-                        int y = oc4 * kH + kh; // within [0, height)
-
-                        T *dstPixel = reinterpret_cast<T *>(
-                            reinterpret_cast<uint8_t *>(ptr) +
-                            y * rowPitchBytes + x * 4 * sizeof(T));
-
-                        for (int k = 0; k < 4; ++k) {
-                            int oc = oc4 * 4 + k;
-                            if (oc < C_out) {
-                                int srcOffset = oc * (C_in * kH * kW) +
-                                                ic * (kH * kW) + kh * kW + kw;
-                                dstPixel[k] = input[srcOffset];
-                            } else {
-                                dstPixel[k] = T(0);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     void convertRGBAToTensor(T *ptr) {
         auto N = dims_[0];
         auto C = dims_[1];
@@ -726,46 +655,6 @@ template <typename T> class Tensor : public ITensor {
                                     n * C * H * W + c * H * W + h * W + w;
                                 data_[offset] = src[k];
                             }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    void convertN4CHWToTensor(T *ptr) {
-        auto batch = dims_[0];
-        auto depth = dims_[1];
-        auto height = dims_[2];
-        auto width = dims_[3];
-
-        int stride_c = width * height;
-        int stride_n = width * height * depth;
-
-        int N4 = UP_DIV(batch, 4);
-        int realwidth = width * depth;
-        uint32_t row_pitch = realwidth * 4 * sizeof(T);
-
-        T *dst;
-        for (int n4 = 0; n4 < N4; ++n4) {
-            for (int c = 0; c < depth; ++c) {
-                for (int h = 0; h < height; ++h) {
-                    dst =
-                        reinterpret_cast<T *>(reinterpret_cast<uint8_t *>(ptr) +
-                                              (n4 * height + h) * row_pitch) +
-                        c * width * 4;
-
-                    for (int w = 0; w < width; ++w) {
-                        // Base offset in NCHW: [4*n4][c][h][w]
-                        int base_offset =
-                            4 * n4 * stride_n + c * stride_c + h * width + w;
-
-                        for (int k = 0; k < 4; ++k) {
-                            int n = 4 * n4 + k;
-                            if (n >= batch)
-                                break;
-
-                            data_[k * stride_n + base_offset] = dst[w * 4 + k];
                         }
                     }
                 }

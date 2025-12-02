@@ -58,12 +58,12 @@ void VMA::createPools() {
     img_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VmaAllocationCreateInfo alloc_info = {};
-    alloc_info.usage = VMA_MEMORY_USAGE_GPU_ONLY;
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     vmaFindMemoryTypeIndexForImageInfo(allocator_, &img_info, &alloc_info,
                                        &mem_type_idx);
     printf("Device pool memory type index: %d\n", mem_type_idx);
     VmaPoolCreateInfo device_pool_info = {};
-    device_pool_info.memoryTypeIndex = 0;
+    device_pool_info.memoryTypeIndex = mem_type_idx;
     device_pool_info.blockSize = 16 * 1024 * 1024; // 16MB per block
     device_pool_info.minBlockCount = 1;
     device_pool_info.maxBlockCount = 32; // up to 16 * n
@@ -77,7 +77,7 @@ void VMA::createPools() {
                      VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                      VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    alloc_info.usage = VMA_MEMORY_USAGE_GPU_TO_CPU;
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
     vmaFindMemoryTypeIndexForBufferInfo(allocator_, &buf_info, &alloc_info,
                                         &mem_type_idx);
     printf("staing pool memory type index: %d\n", mem_type_idx);

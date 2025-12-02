@@ -76,6 +76,8 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
 
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
+    this->maxImageArrayLayers_ =
+        properties2.properties.limits.maxImageArrayLayers;
     this->deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", this->deviceName_.c_str());
     return properties2.properties;
@@ -98,7 +100,8 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
             std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
                 i, queue_families[i].queueCount, queue_families[i].queueFlags};
             computeQueueIdxs_.emplace_back(t);
-        } else if ((queue_families[i].queueFlags & (second)) == (second)) {
+        } else if (kInflight > 1 &&
+                   (queue_families[i].queueFlags & (second)) == (second)) {
             std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
                 i, queue_families[i].queueCount, queue_families[i].queueFlags};
             computeQueueIdxs_.emplace_back(t);
@@ -510,9 +513,9 @@ bool VulkanDevice::createLogicalDevice(
     for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
         auto [qidx, queue_count, queueflags] = computeQueueIdxs_[i];
         LOG_INFO("queue count %d", queue_count);
-        if (queue_count >= kInflight / 2) {
+        if (queue_count >= (kInflight + 1) / 2) {
             // reserve queues from one familiy
-            queue_count = kInflight / 2;
+            queue_count = (kInflight + 1) / 2;
         }
         queue_priority[i].resize(queue_count);
         std::fill(queue_priority[i].begin(), queue_priority[i].end(), 1.0F);
@@ -546,8 +549,8 @@ bool VulkanDevice::createLogicalDevice(
     }
 
     for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {
-        if (queue_count >= kInflight / 2) {
-            queue_count = kInflight / 2;
+        if (queue_count >= (kInflight + 1) / 2) {
+            queue_count = (kInflight + 1) / 2;
         }
         for (uint32_t i = 0; i < queue_count; i++) {
             VkQueue queue;

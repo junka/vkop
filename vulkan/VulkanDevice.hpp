@@ -2,13 +2,15 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
+#include <bits/stdint-uintn.h>
 #include <memory>
+#include <sys/types.h>
 
 #include "vulkan/VMA.hpp"
 
 namespace vkop {
 
-constexpr int kInflight = 2;
+constexpr int kInflight = 1;
 class VulkanQueue {
   public:
     VulkanQueue(VkDevice dev, uint32_t familyIdx, VkQueue queue)
@@ -86,6 +88,7 @@ class VulkanDevice {
     }
 
     float getTimestampPeriod() const { return timestampPeriod_; }
+    uint32_t getMaxImageArrayLayers() const { return maxImageArrayLayers_; }
 
     bool checkHostImageCopyDstLayoutSupport(VkImageLayout layout) {
         return std::any_of(copyDstLayout_.begin(), copyDstLayout_.end(),
@@ -119,6 +122,7 @@ class VulkanDevice {
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
 
     float timestampPeriod_;
+    uint32_t maxImageArrayLayers_;
 
     std::vector<VkImageLayout> copySrcLayout_;
     std::vector<VkImageLayout> copyDstLayout_;

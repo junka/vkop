@@ -136,29 +136,18 @@ void Runtime::LoadModel() {
 #endif
                 auto t = std::make_shared<Tensor<float>>(init.dims);
                 t->set_ref_cnt_forever();
-                if (inputs_for_node_type.find(init.name) !=
-                        inputs_for_node_type.end() &&
-                    (inputs_for_node_type[init.name] == "Conv") &&
-                    (t->num_dims() == 4)) {
-                    // weights, packed as N4CHW
-                    // t->set_pack_dim(0);
-                    t->as_input_image(dev, nullptr);
-                    t->copyToGPU(m_cmdpool_,
-                                 reinterpret_cast<float *>(src_ptr));
-                } else {
-                    if (t->num_dims() == 2 || t->num_dims() == 1) {
-                        if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
-                            t->fillToCPU(reinterpret_cast<float *>(src_ptr));
-                        } else {
-                            t->as_storage_buffer(dev);
-                            t->copyToGPU(m_cmdpool_,
-                                         reinterpret_cast<float *>(src_ptr));
-                        }
+                if (t->num_dims() == 2 || t->num_dims() == 1) {
+                    if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                        t->fillToCPU(reinterpret_cast<float *>(src_ptr));
                     } else {
-                        t->as_input_image(dev, nullptr);
+                        t->as_storage_buffer(dev);
                         t->copyToGPU(m_cmdpool_,
                                      reinterpret_cast<float *>(src_ptr));
                     }
+                } else {
+                    t->as_input_image(dev, nullptr);
+                    t->copyToGPU(m_cmdpool_,
+                                 reinterpret_cast<float *>(src_ptr));
                 }
                 tensor_map[init.name] = t;
                 tensor_name_map[t] = init.name;

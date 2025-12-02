@@ -259,7 +259,6 @@ private:
         }
         
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
-        // weight_data_->set_pack_dim(0);
         weight_data_->fillFP32ToCPU(torch_weight);
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
         bias_data_->fillFP32ToCPU(torch_bias);

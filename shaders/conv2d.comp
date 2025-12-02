@@ -21,7 +21,6 @@
 #ifdef FP16
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
-#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #define FLOAT float16_t
 #define FLOAT4 f16vec4
 #else
@@ -92,20 +91,19 @@ void main() {
     int C_out_per_group = C_out / G;
     int C_in_per_group = C_in / G;
 
-    // For each output channel in this vec4
-    for (int comp = 0; comp < 4; ++comp) {
-        if (!valid_oc[comp]) continue;
+    bool use_vec4 = (C_in_per_group % 4 == 0);
+    int num_vec4 = (C_in_per_group + 3) / 4; // total layers in kernel
+    bool full_vec4_valid = all(valid_oc);
+    int g0 = oc_vec[0] / C_out_per_group;
+    bool same_group = (g0 == (oc_vec[3] / C_out_per_group));
+    bool can_vectorize_oc = full_vec4_valid && same_group;
 
-        int oc = oc_vec[comp];
-        int g = oc / C_out_per_group; // which group?
-
-        // Input channel range for this group
-        int ic_start = g * C_in_per_group;
+    if (can_vectorize_oc) {
+        int ic_start = g0 * C_in_per_group;
         int ic_end = ic_start + C_in_per_group;
 
-        FLOAT sum = FLOAT(0.0);
+        FLOAT4 acc_local = FLOAT4(0.0);
 
-        // Slide kernel
         for (int ky = 0; ky < K_H; ++ky) {
             int iy = s0.y + ky * uConstant.dilation.y;
             if (iy < 0 || iy >= H_in) continue;
@@ -114,31 +112,116 @@ void main() {
                 int ix = s0.x + kx * uConstant.dilation.x;
                 if (ix < 0 || ix >= W_in) continue;
 
-                // Iterate over input channels in this group
-                for (int ic = ic_start; ic < ic_end; ++ic) {
-                    int ic4 = ic / 4;
-                    int ic_comp = ic % 4;
+                if (use_vec4) {
+                    // Vec4 over input channels AND output channels
+                    for (int v = 0; v < num_vec4; ++v) {
+                        int global_ic0 = ic_start + v * 4;
+                        int input_layer = global_ic0 / 4;
+                        int in_y = n * H_in + iy;
+                        FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
 
-                    // Fetch input pixel
-                    int in_y = n * H_in + iy;
-                    FLOAT4 input_val = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, ic4), 0));
-                    FLOAT x = input_val[ic_comp];
+                        // Fetch 4 weights for 4 output channels at once!
+                        // Each oc has its own row in kernel texture
+                        FLOAT4 w0 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, v), 0);
+                        FLOAT4 w1 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, v), 0);
+                        FLOAT4 w2 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, v), 0);
+                        FLOAT4 w3 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, v), 0);
 
-                    // Compute kernel coordinate
-                    int local_ic = ic - ic_start; // local within group
-                    int local_ic4 = local_ic / 4;
-                    int local_ic_comp = local_ic % 4;
+                        // Broadcast x_vec and multiply per-output-channel weights
+                        acc_local.x += dot(x_vec, w0);
+                        acc_local.y += dot(x_vec, w1);
+                        acc_local.z += dot(x_vec, w2);
+                        acc_local.w += dot(x_vec, w3);
+                    }
+                } else {
+                    // Scalar input channels, but vectorized over output
+                    for (int ic = ic_start; ic < ic_end; ++ic) {
+                        int input_layer = ic / 4;
+                        int input_comp = ic % 4;
+                        int in_y = n * H_in + iy;
+                        FLOAT x = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp];
 
-                    int kx_k = kx;
-                    int ky_k = ky + oc * K_H;
-                    FLOAT4 weight_vec = texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0);
-                    FLOAT w = weight_vec[local_ic_comp];
+                        int local_ic = ic - ic_start;
+                        int kernel_layer = local_ic / 4;
+                        int kernel_comp = local_ic % 4;
 
-                    sum += x * w;
+                        FLOAT4 w_vec;
+                        w_vec.x = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, kernel_layer), 0)[kernel_comp];
+                        w_vec.y = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, kernel_layer), 0)[kernel_comp];
+                        w_vec.z = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, kernel_layer), 0)[kernel_comp];
+                        w_vec.w = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, kernel_layer), 0)[kernel_comp];
+
+                        acc_local += x * w_vec;
+                    }
                 }
             }
         }
-        acc[comp] = sum;
+        acc = acc_local;
+
+    } else {
+        // For each output channel in this vec4
+        for (int comp = 0; comp < 4; ++comp) {
+            if (!valid_oc[comp]) continue;
+
+            int oc = oc_vec[comp];
+            int g = oc / C_out_per_group; // which group?
+
+            // Input channel range for this group
+            int ic_start = g * C_in_per_group;
+            int ic_end = ic_start + C_in_per_group;
+
+            FLOAT sum = FLOAT(0.0);
+
+            // Slide kernel
+            for (int ky = 0; ky < K_H; ++ky) {
+                int iy = s0.y + ky * uConstant.dilation.y;
+                if (iy < 0 || iy >= H_in) continue;
+
+                for (int kx = 0; kx < K_W; ++kx) {
+                    int ix = s0.x + kx * uConstant.dilation.x;
+                    if (ix < 0 || ix >= W_in) continue;
+
+                    if (use_vec4) {
+                        FLOAT4 sum4 = FLOAT4(0.0);
+                        for (int v = 0; v < num_vec4; ++v) {
+                            // Global input layer for channels [ic_start + v*4, ...)
+                            int global_ic0 = ic_start + v * 4;
+                            int input_layer = global_ic0 / 4; // safe because aligned
+
+                            int in_y = n * H_in + iy;
+                            FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
+                            FLOAT4 w_vec = texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0);
+                            sum4 += x_vec * w_vec;
+                        }
+                        sum += sum4.x + sum4.y + sum4.z + sum4.w;
+                    } else {
+                        // Iterate over input channels in this group
+                        for (int ic = ic_start; ic < ic_end; ++ic) {
+                            int ic4 = ic / 4;
+                            int ic_comp = ic % 4;
+
+                            // Fetch input pixel
+                            int in_y = n * H_in + iy;
+                            FLOAT4 input_val = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, ic4), 0));
+                            FLOAT x = input_val[ic_comp];
+
+                            // Compute kernel coordinate
+                            int local_ic = ic - ic_start; // local within group
+                            int local_ic4 = local_ic / 4;
+                            int local_ic_comp = local_ic % 4;
+
+                            int kx_k = kx;
+                            int ky_k = ky + oc * K_H;
+                            FLOAT4 weight_vec = texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0);
+                            FLOAT w = weight_vec[local_ic_comp];
+
+                            sum += x * w;
+                        }
+                    }
+                }
+            }
+            acc[comp] = sum;
+        }
     }
 
     // Add bias
