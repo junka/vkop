@@ -2,7 +2,6 @@
 #define VKOP_TESTS_HPP_
 
 #include <cmath>
-#include <cstring>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -15,8 +14,6 @@
 #include "ops/Ops.hpp"
 
 #include "Python.h"
-#define NPY_NO_DEPRECATED_API NPY_1_7_API_VERSION
-#include "numpy/arrayobject.h"
 
 namespace vkop {
 namespace tests {
@@ -243,25 +240,17 @@ public:
         // Initialize Python environment and load necessary libraries
         Py_Initialize();
         try {
-            // Import numpy and torch modules
-            PyObject* numpy_name = PyUnicode_DecodeFSDefault("numpy");
-            PyObject* numpy_module = PyImport_Import(numpy_name);
-            Py_DECREF(numpy_name);
-
             PyObject* torch_name = PyUnicode_DecodeFSDefault("torch");
             PyObject* torch_module = PyImport_Import(torch_name);
             Py_DECREF(torch_name);
 
-            if (!numpy_module || !torch_module) {
+            if (!torch_module) {
                 PyErr_Print();
-                fprintf(stderr, "Failed to load numpy or torch module.\n");
+                fprintf(stderr, "Failed to load torch module.\n");
                 return nullptr;
             }
 
-            import_array();
-
             // Store the modules for later use
-            Py_XINCREF(numpy_module);
             Py_XINCREF(torch_module);
 
             printf("Python environment initialized. Numpy and Torch loaded successfully.\n");
@@ -335,47 +324,6 @@ public:
         return pytorch_attrs;
     }
 
-    // 工具函数：按指定维度打印 NumPy 数组（支持任意形状，按行展开）
-    static void print_numpy_array(PyObject* numpy_array, const std::string& name, const std::vector<int>& shape) {
-        if (!numpy_array || !PyArray_Check((PyArrayObject*)numpy_array)) {
-            printf("%s is not a valid numpy array\n", name.c_str());
-            return;
-        }
-
-        auto* data = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(numpy_array)));
-        printf("=== %s (shape: [", name.c_str());
-        for (size_t i = 0; i < shape.size(); ++i) {
-            printf("%d", shape[i]);
-            if (i != shape.size() - 1) printf(", ");
-        }
-        printf("]) ===\n");
-
-        // 使用递归方式按维度分组打印
-        std::function<void(float*, int, int, const std::vector<int>&, int)> print_recursive =
-            [&](float* ptr, int depth, int flat_idx, const std::vector<int>& dims, int leading_spaces) {
-                if (depth == static_cast<int>(dims.size())) {
-                    printf("%.4f ", ptr[flat_idx]);
-                    return;
-                }
-
-                int stride = 1;
-                for (size_t i = depth + 1; i < dims.size(); ++i) {
-                    stride *= dims[i];
-                }
-
-                printf("[");
-                for (int i = 0; i < dims[depth]; ++i) {
-                    // 前导空格表示维度层级
-                    for (int s = 0; s < depth * 2; ++s) printf(" ");
-                    print_recursive(ptr, depth + 1, flat_idx + i * stride, dims, leading_spaces + 2);
-                }
-                printf("]\n");
-            };
-
-        print_recursive(data, 0, 0, shape, 0);
-        printf("\n");
-    }
-
     static std::tuple<std::vector<std::vector<float>>, std::vector<int>>
     execute_torch_operator(const std::string& op_name,
                         const std::vector<std::vector<int>>& shapes,
@@ -409,41 +357,20 @@ public:
             return {ret, output_shape};
         }
 
-        // 所有 PyObject 指针初始化为 nullptr，便于安全清理
-        PyObject* numpy_module = nullptr;
         PyObject* torch_module = nullptr;
         PyObject* functional_module = nullptr;
-        PyObject* numpy_random = nullptr;
-        PyObject* numpy_rand_func = nullptr;
-        PyObject* shape_tuple = nullptr;
-        PyObject* weight_tuple = nullptr;
-        PyObject* bias_tuple = nullptr;
-        PyObject* numpy_input = nullptr;
-        PyObject* numpy_weight = nullptr;
-        PyObject* numpy_bias = nullptr;
         PyObject* torch_input = nullptr;
         PyObject* torch_weight = nullptr;
         PyObject* torch_bias = nullptr;
         PyObject* op_func = nullptr;
         PyObject* kwargs = nullptr;
         PyObject* torch_output = nullptr;
-        PyObject* numpy_output = nullptr;
-        PyObject* numpy_output_shape = nullptr;
-        PyObject* numpy_flat = nullptr;
-        PyObject* numpy_input_flat = nullptr;
-        PyObject* nomarlized_shape = nullptr;
+        PyObject* norm_shape = nullptr;
 
         auto attrs = onnx_to_pytorch_attrs(attributes);
 
         try {
-            // === 1. Import numpy ===
-            numpy_module = PyImport_ImportModule("numpy");
-            if (!numpy_module) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to import numpy");
-            }
-
-            // === 2. Import torch and torch.nn.functional ===
+            // === 1. Import torch and torch.nn.functional ===
             torch_module = PyImport_ImportModule("torch");
             if (!torch_module) {
                 PyErr_Print();
@@ -456,81 +383,48 @@ public:
                 throw std::runtime_error("Failed to import torch.nn.functional");
             }
 
-            // === 3. Create shape tuples ===
-            auto create_shape_tuple = [] (std::vector<int> shapes) ->PyObject * {
-                PyObject * shape_tuple = PyTuple_New(shapes.size());
-                for (size_t i = 0; i < shapes.size(); ++i) {
-                    PyObject* item = PyLong_FromLong(shapes[i]);
-                    PyTuple_SetItem(shape_tuple, i, item);
+            // === 2. Create random tensors ===
+            auto create_random_tensor = [&torch_module](const std::vector<int>& shape) -> PyObject* {
+                PyObject* shape_list = PyList_New(shape.size());
+                for (size_t i = 0; i < shape.size(); ++i) {
+                    PyList_SetItem(shape_list, i, PyLong_FromLong(shape[i]));
                 }
-                return shape_tuple;
-            };
- 
-            shape_tuple = create_shape_tuple(input_shape);
+                PyObject* rand_func = PyObject_GetAttrString(torch_module, "rand");
+                PyObject* tensor = PyObject_CallFunctionObjArgs(rand_func, shape_list, nullptr);
+                Py_DECREF(shape_list);
+                Py_DECREF(rand_func);
+                if (!tensor) {
+                    throw std::runtime_error("Failed to create random tensor");
+                }
+                return tensor;
+            }
+
+            torch_input = create_random_tensor(input_shape);
+            Py_INCREF(torch_input);
             if (has_weight) {
-                weight_tuple = create_shape_tuple(weight_shape);
+                torch_weight = create_random_tensor(weight_shape);
+                Py_INCREF(torch_weight);
             }
 
             if (has_bias) {
-                bias_tuple = create_shape_tuple(bias_shape);
+                torch_bias = create_random_tensor(bias_shape);
+                Py_INCREF(torch_bias);
             }
 
-            numpy_random = PyObject_GetAttrString(numpy_module, "random");
-            if (!numpy_random) throw std::runtime_error("Failed to get numpy.random");
-
-            numpy_rand_func = PyObject_GetAttrString(numpy_random, "rand");
-            if (!numpy_rand_func) throw std::runtime_error("Failed to get numpy.random.rand");
-
-            auto numpy_rand_as_float = [&numpy_module, &numpy_rand_func] (PyObject* tuple) {
-                auto *input = PyObject_CallObject(numpy_rand_func, tuple);
-                if (!input) throw std::runtime_error("Failed to generate random input");
-                input = PyObject_CallMethod(input, "astype", "(O)", PyObject_GetAttrString(numpy_module, "float32"));
-                return input;
-            };
-            numpy_input = numpy_rand_as_float(shape_tuple);
-
-            if (has_weight) {
-                numpy_weight = numpy_rand_as_float(weight_tuple);
-            }
-
-            if (has_bias) {
-                numpy_bias = numpy_rand_as_float(bias_tuple);
-            }
-
-            PyObject* torch_from_numpy = PyObject_GetAttrString(torch_module, "from_numpy");
-            if (!torch_from_numpy) throw std::runtime_error("Failed to get torch.from_numpy");
-
-            torch_input = PyObject_CallFunctionObjArgs(torch_from_numpy, numpy_input, nullptr);
-            if (!torch_input) throw std::runtime_error("Failed to convert input to torch tensor");
-            Py_DECREF(torch_from_numpy);
-
-            if (has_weight) {
-                torch_from_numpy = PyObject_GetAttrString(torch_module, "from_numpy");
-                torch_weight = PyObject_CallFunctionObjArgs(torch_from_numpy, numpy_weight, nullptr);
-                if (!torch_weight) throw std::runtime_error("Failed to convert weight to torch tensor");
-                Py_DECREF(torch_from_numpy);
-            }
-
-            if (has_bias) {
-                torch_from_numpy = PyObject_GetAttrString(torch_module, "from_numpy");
-                torch_bias = PyObject_CallFunctionObjArgs(torch_from_numpy, numpy_bias, nullptr);
-                if (!torch_bias) throw std::runtime_error("Failed to convert bias to torch tensor");
-                Py_DECREF(torch_from_numpy);
-            }
+            // === 3. Get operator function ===
             op_func = PyObject_GetAttrString(functional_module, op_name.c_str());
             if (!op_func) {
                 PyErr_Print();
                 throw std::runtime_error("Failed to find operator: " + op_name);
             }
 
-            // === 7. Build kwargs dictionary ===
+            // === 4. Build kwargs dictionary ===
             kwargs = PyDict_New();
             for (const auto& attr : attrs) {
                 const std::string& key = attr.first;
                 const std::string& val_str = attr.second;
                 PyObject* value = nullptr;
 
-                printf("Parsing attribute: %s = %s\n", key.c_str(), val_str.c_str());
                 if (key == "inplace" || key == "bias" || key == "align_corners" || key == "antialias") {
                     value = (val_str == "True" || val_str == "true") ? Py_True : Py_False;
                     Py_INCREF(value);
@@ -552,7 +446,11 @@ public:
                     }
                     printf("Setting normalized_shape: %d\n", normalized_shape[0]);
                     has_laynernorm = true;
-                    nomarlized_shape = create_shape_tuple(normalized_shape);
+                    PyObject* shape_tuple = PyTuple_New(normalized_shape.size());
+                    for (size_t i = 0; i < normalized_shape.size(); ++i) {
+                        PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(normalized_shape[i]));
+                    }
+                    norm_shape = shape_tuple;
                     continue;
                 } else if (key == "size" || key == "scale_factor") {
                     std::vector<int> resize_shape;
@@ -564,9 +462,12 @@ public:
                             resize_shape.push_back(std::stoi(item));
                         }
                     }
-                    value = create_shape_tuple(resize_shape);
+                    PyObject* shape_tuple = PyTuple_New(resize_shape.size());
+                    for (size_t i = 0; i < resize_shape.size(); ++i) {
+                        PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(resize_shape[i]));
+                    }
+                    value = shape_tuple;
                 } else {
-                    // Try int first, then float, then string
                     try {
                         value = PyLong_FromLong(std::stol(val_str));
                     } catch (...) {
@@ -578,75 +479,79 @@ public:
                     }
                 }
                 PyDict_SetItemString(kwargs, key.c_str(), value);
-                Py_XDECREF(value); // PyDict_SetItemString does NOT steal, so we must DECREF
+                Py_XDECREF(value);
             }
 
-            // === 8. Prepare positional arguments dynamically ===
+            // === 5. Prepare positional arguments dynamically ===
             std::vector<PyObject*> arg_list;
             arg_list.push_back(torch_input);
-            if (has_laynernorm) arg_list.push_back(nomarlized_shape);
+            if (has_laynernorm) arg_list.push_back(norm_shape);
             if (has_weight) arg_list.push_back(torch_weight);
             if (has_bias) arg_list.push_back(torch_bias);
 
             PyObject* args = PyTuple_New(arg_list.size());
             for (size_t i = 0; i < arg_list.size(); ++i) {
-                PyTuple_SetItem(args, i, arg_list[i]); // Steals reference
+                PyTuple_SetItem(args, i, arg_list[i]);
             }
 
-            // === 9. Call the operator: op_func(*args, **kwargs) ===
+            // === 6. Call the operator ===
             torch_output = PyObject_Call(op_func, args, kwargs);
             Py_DECREF(args);
             if (!torch_output) {
                 PyErr_Print();
                 throw std::runtime_error("Failed to execute operator: " + op_name);
             }
-            printf("Operator %s executed successfully.\n", op_name.c_str());
-
-            // === 10. Convert output to numpy for data extraction ===
-            // Ensure it's on CPU and convert to numpy
-            PyObject* cpu_output = PyObject_CallMethod(torch_output, "cpu", nullptr);
-            if (!cpu_output) {
-                PyErr_Print();
-                cpu_output = torch_output;
-                Py_INCREF(cpu_output);
-            }
-
-            numpy_output = PyObject_CallMethod(cpu_output, "numpy", nullptr);
-            Py_DECREF(cpu_output);
-            if (!numpy_output) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to convert output tensor to numpy array");
-            }
-
-            numpy_output_shape = PyObject_GetAttrString(numpy_output, "shape");
-            if (numpy_output_shape && PyTuple_Check(numpy_output_shape)) {
-                Py_ssize_t ndim = PyTuple_Size(numpy_output_shape);
+            // === 7. Extract output data ===
+            PyObject* torch_output_shape = PyObject_GetAttrString(torch_output, "shape");
+            if (torch_output_shape && PyTuple_Check(torch_output_shape)) {
+                Py_ssize_t ndim = PyTuple_Size(torch_output_shape);
                 for (Py_ssize_t i = 0; i < ndim; ++i) {
-                    output_shape.push_back(PyLong_AsLong(PyTuple_GetItem(numpy_output_shape, i)));
+                    output_shape.push_back(PyLong_AsLong(PyTuple_GetItem(torch_output_shape, i)));
                 }
             } else {
                 throw std::runtime_error("Failed to get output shape");
             }
-            // print_numpy_array(numpy_input, "NumPy Input", input_shape);
-            // print_numpy_array(numpy_output, "NumPy Output", output_shape);
-
-            auto flatten_values = [] (PyObject * values) -> std::vector<float> {
-                std::vector<float> output;
-                auto *flat = PyObject_CallMethod(values, "flatten", nullptr);
-                if (!flat || !PyArray_Check((PyArrayObject*)flat)) {
-                    throw std::runtime_error("Failed to flatten output array");
+            printf("Output shape: [%d, %d, %d, %d]\n",output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+            auto flatten_values = [](PyObject* tensor) -> std::vector<float> {
+                PyObject* detached = PyObject_CallMethod(tensor, "detach", nullptr);
+                if (!detached) {
+                    PyErr_Print();
+                    detached = tensor;
+                    Py_INCREF(detached);
                 }
-                auto* out_data = static_cast<float*>(PyArray_DATA(reinterpret_cast<PyArrayObject*>(flat)));
-                npy_intp num_out = PyArray_SIZE((PyArrayObject*)flat);
-                output.resize(num_out);
-                std::copy(out_data, out_data + num_out, output.begin());
-                return output;
-            };
+                PyObject* cpu_tensor = PyObject_CallMethod(detached, "cpu", nullptr);
+                if (!cpu_tensor) {
+                    PyErr_Print();
+                    throw std::runtime_error("cpu() failed");
+                }
+                PyObject* contiguous = PyObject_CallMethod(cpu_tensor, "contiguous", nullptr);
+                Py_DECREF(cpu_tensor);
+                if (!contiguous) {
+                    PyErr_Print();
+                    throw std::runtime_error("contiguous() failed");
+                }
+                PyObject* numel_obj = PyObject_CallMethod(contiguous, "numel", nullptr);
+                int64_t numel = PyLong_AsLong(numel_obj);
+                Py_DECREF(numel_obj);
+                PyObject* ptr_obj = PyObject_CallMethod(contiguous, "data_ptr", nullptr);
+                uint64_t ptr_val = PyLong_AsLongLong(ptr_obj);
+                Py_DECREF(ptr_obj);
 
-            ret.emplace_back(flatten_values(numpy_output));
-            ret.emplace_back(flatten_values(numpy_input));
-            if (has_weight) ret.emplace_back(flatten_values(numpy_weight));
-            if (has_bias) ret.emplace_back(flatten_values(numpy_bias));
+                auto* data_ptr = reinterpret_cast<float*>(ptr_val);
+                std::vector<float> result(data_ptr, data_ptr + numel);
+                Py_DECREF(contiguous);
+                printf("\n===Torch Data===\n");
+                for (auto val : result) {
+                    printf("%f ", val);
+                }
+
+                return result;
+            }
+
+            ret.emplace_back(flatten_values(torch_output));
+            ret.emplace_back(flatten_values(torch_input));
+            if (has_weight) ret.emplace_back(flatten_values(torch_weight));
+            if (has_bias) ret.emplace_back(flatten_values(torch_bias));
 
         } catch (const std::exception& e) {
             fprintf(stderr, "C++ Exception: %s\n", e.what());
@@ -654,30 +559,15 @@ public:
             fprintf(stderr, "Unknown exception in execute_torch_operator\n");
         }
 
-        // === Cleanup: Safe DECREF ===
-    #define SAFE_DECREF(obj) do { if (obj) { Py_DECREF(obj); (obj) = nullptr; } } while(0)
-        SAFE_DECREF(numpy_module);
-        SAFE_DECREF(torch_module);
-        SAFE_DECREF(functional_module);
-        SAFE_DECREF(numpy_random);
-        SAFE_DECREF(numpy_rand_func);
-        SAFE_DECREF(shape_tuple);
-        SAFE_DECREF(weight_tuple);
-        SAFE_DECREF(bias_tuple);
-        SAFE_DECREF(numpy_input);
-        SAFE_DECREF(numpy_weight);
-        SAFE_DECREF(numpy_bias);
-        SAFE_DECREF(torch_input);
-        SAFE_DECREF(torch_weight);
-        SAFE_DECREF(torch_bias);
-        SAFE_DECREF(op_func);
-        SAFE_DECREF(kwargs);
-        SAFE_DECREF(torch_output);
-        SAFE_DECREF(numpy_output);
-        SAFE_DECREF(numpy_output_shape);
-        SAFE_DECREF(numpy_flat);
-        SAFE_DECREF(numpy_input_flat);
-    #undef SAFE_DECREF
+        // === Cleanup ===
+        Py_XDECREF(torch_module);
+        Py_XDECREF(functional_module);
+        Py_XDECREF(torch_input);
+        Py_XDECREF(torch_weight);
+        Py_XDECREF(torch_bias);
+        Py_XDECREF(op_func);
+        Py_XDECREF(kwargs);
+        Py_XDECREF(torch_output);
 
         return {ret, output_shape};
     }

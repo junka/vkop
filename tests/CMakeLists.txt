@@ -30,31 +30,34 @@ set(TESTS
     ReduceTest
 )
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development NumPy)
-if(Python3_FOUND AND Python3_NumPy_FOUND)
-    # Python3_INCLUDE_DIRS 可能不会直接由 FindPython3 提供，而是通过 Python3_EXECUTABLE 来获取路径
-    # 下面是一个示例如何获取正确的包含路径，实际情况可能会有所不同
+# 查找 Python（Interpreter + Development）
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+
+# 获取 Python include（兼容老版本 CMake）
+if (DEFINED Python3_INCLUDE_DIRS)
+    include_directories(${Python3_INCLUDE_DIRS})
+else()
     execute_process(COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
                     OUTPUT_VARIABLE PYTHON3_INCLUDE_DIR
                     OUTPUT_STRIP_TRAILING_WHITESPACE)
-    
-    # 获取 NumPy 的 include 目录
-    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy; print(numpy.get_include())"
-                    OUTPUT_VARIABLE NUMPY_INCLUDE_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-
     include_directories(${PYTHON3_INCLUDE_DIR})
-    include_directories(${NUMPY_INCLUDE_DIR})
+endif()
 
-    message(STATUS "Found Python3: ${Python3_VERSION} at ${PYTHON3_INCLUDE_DIR}")
-    message(STATUS "Found NumPy at ${NUMPY_INCLUDE_DIR}")
+# 验证 Python 是否能 import torch，并打印其路径
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import importlib,sys; spec=importlib.util.find_spec('torch'); print('FOUND' if spec else 'MISSING'); print(spec.origin if spec else '')"
+    OUTPUT_VARIABLE PYTORCH_CHECK
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+string(REPLACE "\n" ";" PYTORCH_LINES "${PYTORCH_CHECK}")
+list(GET PYTORCH_LINES 0 PYTORCH_FOUND)
+if (NOT PYTORCH_FOUND STREQUAL "FOUND")
+    message(FATAL_ERROR "Python interpreter (${Python3_EXECUTABLE}) cannot import 'torch'. Install PyTorch in that Python environment or use a different Python.")
 else()
-    if(NOT Python3_FOUND)
-        message(FATAL_ERROR "Could not find Python3")
-    endif()
-    if(NOT Python3_NumPy_FOUND)
-        message(FATAL_ERROR "Could not find NumPy for Python3")
-    endif()
+    list(GET PYTORCH_LINES 1 PYTORCH_ORIGIN)
+    message(STATUS "Python 'torch' found at: ${PYTORCH_ORIGIN}")
 endif()
 
 foreach(TEST ${TESTS})
