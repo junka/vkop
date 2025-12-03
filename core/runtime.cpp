@@ -136,6 +136,11 @@ void Runtime::LoadModel() {
 #endif
                 auto t = std::make_shared<Tensor<float>>(init.dims);
                 t->set_ref_cnt_forever();
+                if (inputs_for_node_type.find(init.name) !=
+                        inputs_for_node_type.end() &&
+                    (inputs_for_node_type[init.name] == "Conv")) {
+                    t->set_transpose();
+                }
                 if (t->num_dims() == 2 || t->num_dims() == 1) {
                     if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
                         t->fillToCPU(reinterpret_cast<float *>(src_ptr));

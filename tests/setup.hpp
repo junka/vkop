@@ -511,7 +511,6 @@ public:
             } else {
                 throw std::runtime_error("Failed to get output shape");
             }
-            printf("Output shape: [%d, %d, %d, %d]\n",output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
             auto flatten_values = [](PyObject* tensor) -> std::vector<float> {
                 PyObject* detached = PyObject_CallMethod(tensor, "detach", nullptr);
                 if (!detached) {
@@ -540,10 +539,6 @@ public:
                 auto* data_ptr = reinterpret_cast<float*>(ptr_val);
                 std::vector<float> result(data_ptr, data_ptr + numel);
                 Py_DECREF(contiguous);
-                printf("\n===Torch Data===\n");
-                for (auto val : result) {
-                    printf("%f ", val);
-                }
 
                 return result;
             }

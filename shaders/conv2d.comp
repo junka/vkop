@@ -34,7 +34,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*H_out, C4_out]
 layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
-layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, C4_in]
+layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
 layout(set=0, binding=3) readonly buffer biasBuffer {
     FLOAT attr[]; // bias[C_out]
 } uBias;
@@ -49,6 +49,7 @@ layout(push_constant) uniform constBuffer {
     ivec2 dilation;
     int groups;
     int bias;
+    int transpose;       // weight transpose Cin, Cout
     int activation;
 } uConstant;
 
@@ -90,89 +91,103 @@ void main() {
     int K_H = uConstant.kernelSize.y;
     int C_out_per_group = C_out / G;
     int C_in_per_group = C_in / G;
-
-    bool use_vec4 = (C_in_per_group % 4 == 0);
-    int num_vec4 = (C_in_per_group + 3) / 4; // total layers in kernel
     bool full_vec4_valid = all(valid_oc);
     int g0 = oc_vec[0] / C_out_per_group;
     bool same_group = (g0 == (oc_vec[3] / C_out_per_group));
     bool can_vectorize_oc = full_vec4_valid && same_group;
+    bool use_vec4 = (C_in_per_group % 4 == 0);
+    int num_vec4 = (C_in_per_group + 3) / 4;
 
-    if (can_vectorize_oc) {
-        int ic_start = g0 * C_in_per_group;
-        int ic_end = ic_start + C_in_per_group;
+    if (uConstant.transpose == 1) {
+        if (can_vectorize_oc) {
+            int ic_start = g0 * C_in_per_group;
+            int ic_end = ic_start + C_in_per_group;
+            FLOAT4 acc_local = FLOAT4(0.0);
 
-        FLOAT4 acc_local = FLOAT4(0.0);
+            for (int ky = 0; ky < K_H; ++ky) {
+                int iy = s0.y + ky * uConstant.dilation.y;
+                if (iy < 0 || iy >= H_in) continue;
 
-        for (int ky = 0; ky < K_H; ++ky) {
-            int iy = s0.y + ky * uConstant.dilation.y;
-            if (iy < 0 || iy >= H_in) continue;
+                for (int kx = 0; kx < K_W; ++kx) {
+                    int ix = s0.x + kx * uConstant.dilation.x;
+                    if (ix < 0 || ix >= W_in) continue;
+                    if (use_vec4) {
+                        for (int v = 0; v < num_vec4; ++v) {
+                            int global_ic0 = ic_start + v * 4;
+                            int input_layer = global_ic0 / 4;
+                            int in_y = n * H_in + iy;
 
-            for (int kx = 0; kx < K_W; ++kx) {
-                int ix = s0.x + kx * uConstant.dilation.x;
-                if (ix < 0 || ix >= W_in) continue;
+                            FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
 
-                if (use_vec4) {
-                    // Vec4 over input channels AND output channels
-                    for (int v = 0; v < num_vec4; ++v) {
-                        int global_ic0 = ic_start + v * 4;
-                        int input_layer = global_ic0 / 4;
-                        int in_y = n * H_in + iy;
-                        FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
+                            int local_ic = global_ic0 - ic_start;
+                            // Each output channel has its own row in Y, same layer c4
+                            FLOAT4 w0 = texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0);
+                            FLOAT4 w1 = texelFetch(uKernel, ivec3(kx, ky + (local_ic + 1) * K_H, c4), 0);
+                            FLOAT4 w2 = texelFetch(uKernel, ivec3(kx, ky + (local_ic + 2) * K_H, c4), 0);
+                            FLOAT4 w3 = texelFetch(uKernel, ivec3(kx, ky + (local_ic + 3) * K_H, c4), 0);
 
-                        // Fetch 4 weights for 4 output channels at once!
-                        // Each oc has its own row in kernel texture
-                        FLOAT4 w0 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, v), 0);
-                        FLOAT4 w1 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, v), 0);
-                        FLOAT4 w2 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, v), 0);
-                        FLOAT4 w3 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, v), 0);
+                            acc_local.x += dot(x_vec, w0);
+                            acc_local.y += dot(x_vec, w1);
+                            acc_local.z += dot(x_vec, w2);
+                            acc_local.w += dot(x_vec, w3);
+                        }
+                    } else {
+                        for (int ic = ic_start; ic < ic_end; ++ic) {
+                            int input_layer = ic / 4;
+                            int input_comp = ic % 4;
+                            int in_y = n * H_in + iy;
+                            FLOAT x = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp];
 
-                        // Broadcast x_vec and multiply per-output-channel weights
-                        acc_local.x += dot(x_vec, w0);
-                        acc_local.y += dot(x_vec, w1);
-                        acc_local.z += dot(x_vec, w2);
-                        acc_local.w += dot(x_vec, w3);
-                    }
-                } else {
-                    // Scalar input channels, but vectorized over output
-                    for (int ic = ic_start; ic < ic_end; ++ic) {
-                        int input_layer = ic / 4;
-                        int input_comp = ic % 4;
-                        int in_y = n * H_in + iy;
-                        FLOAT x = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp];
+                            int local_ic = ic - ic_start;
 
-                        int local_ic = ic - ic_start;
-                        int kernel_layer = local_ic / 4;
-                        int kernel_comp = local_ic % 4;
+                            FLOAT4 w_vec = texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0);
 
-                        FLOAT4 w_vec;
-                        w_vec.x = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, kernel_layer), 0)[kernel_comp];
-                        w_vec.y = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, kernel_layer), 0)[kernel_comp];
-                        w_vec.z = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, kernel_layer), 0)[kernel_comp];
-                        w_vec.w = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, kernel_layer), 0)[kernel_comp];
-
-                        acc_local += x * w_vec;
+                            acc_local += x * w_vec;
+                        }
                     }
                 }
             }
+            acc = acc_local;
+        } else {
+            for (int comp = 0; comp < 4; ++comp) {
+                if (!valid_oc[comp]) continue;
+                int oc = oc_vec[comp];
+                int g = oc / C_out_per_group;
+                int ic_start = g * C_in_per_group;
+                int ic_end = ic_start + C_in_per_group;
+                FLOAT sum = FLOAT(0.0);
+
+                for (int ky = 0; ky < K_H; ++ky) {
+                    int iy = s0.y + ky * uConstant.dilation.y;
+                    if (iy < 0 || iy >= H_in) continue;
+                    for (int kx = 0; kx < K_W; ++kx) {
+                        int ix = s0.x + kx * uConstant.dilation.x;
+                        if (ix < 0 || ix >= W_in) continue;
+
+                        for (int ci = ic_start; ci < ic_end; ++ci) {
+                            int in_y = n * H_in + iy;
+                            int global_ci4 = ci / 4;
+                            int global_ci_comp = ci % 4;
+                            FLOAT x = texelFetch(uInput, ivec3(ix, in_y, global_ci4), 0)[global_ci_comp];
+
+                            int local_ci = ci - ic_start;
+                            int kernel_comp = oc % 4;
+                            FLOAT w = texelFetch(uKernel, ivec3(kx, ky + local_ci * K_H, c4), 0)[kernel_comp];
+
+                            sum += x * w;
+                        }
+                    }
+                }
+                acc[comp] = sum;
+            }
         }
-        acc = acc_local;
-
     } else {
-        // For each output channel in this vec4
-        for (int comp = 0; comp < 4; ++comp) {
-            if (!valid_oc[comp]) continue;
-
-            int oc = oc_vec[comp];
-            int g = oc / C_out_per_group; // which group?
-
-            // Input channel range for this group
-            int ic_start = g * C_in_per_group;
+        if (can_vectorize_oc) {
+            int ic_start = g0 * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
 
-            FLOAT sum = FLOAT(0.0);
+            FLOAT4 acc_local = FLOAT4(0.0);
 
-            // Slide kernel
             for (int ky = 0; ky < K_H; ++ky) {
                 int iy = s0.y + ky * uConstant.dilation.y;
                 if (iy < 0 || iy >= H_in) continue;
@@ -182,45 +197,113 @@ void main() {
                     if (ix < 0 || ix >= W_in) continue;
 
                     if (use_vec4) {
-                        FLOAT4 sum4 = FLOAT4(0.0);
+                        // Vec4 over input channels AND output channels
                         for (int v = 0; v < num_vec4; ++v) {
-                            // Global input layer for channels [ic_start + v*4, ...)
                             int global_ic0 = ic_start + v * 4;
-                            int input_layer = global_ic0 / 4; // safe because aligned
-
+                            int input_layer = global_ic0 / 4;
                             int in_y = n * H_in + iy;
                             FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
-                            FLOAT4 w_vec = texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0);
-                            sum4 += x_vec * w_vec;
+
+                            // Fetch 4 weights for 4 output channels at once!
+                            // Each oc has its own row in kernel texture
+                            FLOAT4 w0 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, v), 0);
+                            FLOAT4 w1 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, v), 0);
+                            FLOAT4 w2 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, v), 0);
+                            FLOAT4 w3 = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, v), 0);
+
+                            // Broadcast x_vec and multiply per-output-channel weights
+                            acc_local.x += dot(x_vec, w0);
+                            acc_local.y += dot(x_vec, w1);
+                            acc_local.z += dot(x_vec, w2);
+                            acc_local.w += dot(x_vec, w3);
                         }
-                        sum += sum4.x + sum4.y + sum4.z + sum4.w;
                     } else {
-                        // Iterate over input channels in this group
+                        // Scalar input channels, but vectorized over output
                         for (int ic = ic_start; ic < ic_end; ++ic) {
-                            int ic4 = ic / 4;
-                            int ic_comp = ic % 4;
-
-                            // Fetch input pixel
+                            int input_layer = ic / 4;
+                            int input_comp = ic % 4;
                             int in_y = n * H_in + iy;
-                            FLOAT4 input_val = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, ic4), 0));
-                            FLOAT x = input_val[ic_comp];
+                            FLOAT x = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp];
 
-                            // Compute kernel coordinate
-                            int local_ic = ic - ic_start; // local within group
-                            int local_ic4 = local_ic / 4;
-                            int local_ic_comp = local_ic % 4;
+                            int local_ic = ic - ic_start;
+                            int kernel_layer = local_ic / 4;
+                            int kernel_comp = local_ic % 4;
 
-                            int kx_k = kx;
-                            int ky_k = ky + oc * K_H;
-                            FLOAT4 weight_vec = texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0);
-                            FLOAT w = weight_vec[local_ic_comp];
+                            FLOAT4 w_vec;
+                            w_vec.x = texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, kernel_layer), 0)[kernel_comp];
+                            w_vec.y = texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, kernel_layer), 0)[kernel_comp];
+                            w_vec.z = texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, kernel_layer), 0)[kernel_comp];
+                            w_vec.w = texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, kernel_layer), 0)[kernel_comp];
 
-                            sum += x * w;
+                            acc_local += x * w_vec;
                         }
                     }
                 }
             }
-            acc[comp] = sum;
+            acc = acc_local;
+
+        } else {
+            // For each output channel in this vec4
+            for (int comp = 0; comp < 4; ++comp) {
+                if (!valid_oc[comp]) continue;
+
+                int oc = oc_vec[comp];
+                int g = oc / C_out_per_group; // which group?
+
+                // Input channel range for this group
+                int ic_start = g * C_in_per_group;
+                int ic_end = ic_start + C_in_per_group;
+
+                FLOAT sum = FLOAT(0.0);
+
+                for (int ky = 0; ky < K_H; ++ky) {
+                    int iy = s0.y + ky * uConstant.dilation.y;
+                    if (iy < 0 || iy >= H_in) continue;
+
+                    for (int kx = 0; kx < K_W; ++kx) {
+                        int ix = s0.x + kx * uConstant.dilation.x;
+                        if (ix < 0 || ix >= W_in) continue;
+
+                        if (use_vec4) {
+                            FLOAT4 sum4 = FLOAT4(0.0);
+                            for (int v = 0; v < num_vec4; ++v) {
+                                // Global input layer for channels [ic_start + v*4, ...)
+                                int global_ic0 = ic_start + v * 4;
+                                int input_layer = global_ic0 / 4; // safe because aligned
+
+                                int in_y = n * H_in + iy;
+                                FLOAT4 x_vec = texelFetch(uInput, ivec3(ix, in_y, input_layer), 0);
+                                FLOAT4 w_vec = texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0);
+                                sum4 += x_vec * w_vec;
+                            }
+                            sum += dot(sum4, vec4(1.0));
+                        } else {
+                            // Iterate over input channels in this group
+                            for (int ic = ic_start; ic < ic_end; ++ic) {
+                                int ic4 = ic / 4;
+                                int ic_comp = ic % 4;
+
+                                // Fetch input pixel
+                                int in_y = n * H_in + iy;
+                                FLOAT input_val = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, ic4), 0))[ic_comp];
+
+                                // Compute kernel coordinate
+                                int local_ic = ic - ic_start; // local within group
+                                int local_ic4 = local_ic / 4;
+                                int local_ic_comp = local_ic % 4;
+
+                                int kx_k = kx;
+                                int ky_k = ky + oc * K_H;
+                                FLOAT4 weight_vec = texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0);
+                                FLOAT w = weight_vec[local_ic_comp];
+
+                                sum += input_val * w;
+                            }
+                        }
+                    }
+                }
+                acc[comp] = sum;
+            }
         }
     }
 

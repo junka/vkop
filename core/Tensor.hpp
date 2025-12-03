@@ -45,6 +45,7 @@ class ITensor {
     void set_ref_cnt_forever() {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
+    void set_transpose() { transpose_ = true; }
     std::vector<int> getShape() {
         if (dims_[3]) {
             return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
@@ -119,6 +120,7 @@ class ITensor {
     int dims_[4];
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
+    bool transpose_ = false;
     bool converted_ = false;
 };
 
@@ -449,18 +451,21 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_) {
             return;
         }
-        VkFormat format =
-            ((sizeof(T) == 1)
-                 ? VK_FORMAT_R8G8B8A8_UINT
-                 : ((sizeof(T) == 2) ? VK_FORMAT_R16G16B16A16_SFLOAT
-                                     : VK_FORMAT_R32G32B32A32_SFLOAT));
+        VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        if (sizeof(T) == 1) {
+            format = VK_FORMAT_R8G8B8A8_UINT;
+        } else if (sizeof(T) == 2) {
+            format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        }
+        auto batch = transpose_ ? dims_[1] : dims_[0];
+        auto chan = transpose_ ? dims_[0] : dims_[1];
+        auto height = dims_[2];
+        uint32_t width = dims_[3];
+        uint32_t realheight = height * batch;
+        auto chan4 = UP_DIV(chan, 4);
 
-        uint32_t realwidth = dims_[3];
-        uint32_t realheight = dims_[2] * dims_[0];
-
-        auto vkdim = VkExtent3D{realwidth, realheight, 1};
-        vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, UP_DIV(dims_[1], 4),
-                                               flags, format);
+        auto vkdim = VkExtent3D{width, realheight, 1};
+        vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, chan4, flags, format);
     }
 
     void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
@@ -593,30 +598,36 @@ template <typename T> class Tensor : public ITensor {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
         }
-        auto N = dims_[0];
-        auto C = dims_[1];
-        auto H = dims_[2];
-        auto W = dims_[3];
+        auto batch = transpose_ ? dims_[1] : dims_[0];
+        auto chan = transpose_ ? dims_[0] : dims_[1];
+        auto height = dims_[2];
+        auto width = dims_[3];
+        int chan4 = UP_DIV(chan, 4);
 
-        int C4 = UP_DIV(C, 4);
         const T *input = src ? src : data_.data();
 
-        uint32_t row_pitch = W * 4 * sizeof(T);
-        uint32_t layer_stride = N * H * row_pitch;
+        uint32_t row_pitch = width * 4 * sizeof(T);
+        uint32_t layer_stride = batch * height * row_pitch;
 
-        for (int c4 = 0; c4 < C4; c4++) {
-            for (int n = 0; n < N; n++) {
-                for (int h = 0; h < H; h++) {
-                    for (int w = 0; w < W; w++) {
+        for (int c4 = 0; c4 < chan4; c4++) {
+            for (int n = 0; n < batch; n++) {
+                for (int h = 0; h < height; h++) {
+                    for (int w = 0; w < width; w++) {
                         T *dst = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
-                            c4 * layer_stride + (n * H + h) * row_pitch +
+                            c4 * layer_stride + (n * height + h) * row_pitch +
                             w * 4 * sizeof(T));
                         for (int k = 0; k < 4; k++) {
                             int c = c4 * 4 + k;
-                            if (c < C) {
+                            if (c < chan) {
                                 int offset =
-                                    n * (C * H * W) + c * (H * W) + h * W + w;
+                                    (transpose_
+                                         ? (c * batch * height * width +
+                                            n * height * width + h * width + w)
+                                         : (n * chan * height * width +
+                                            c * height * width + h * width +
+                                            w));
+
                                 dst[k] = input[offset];
                             } else {
                                 dst[k] = T(0);
@@ -629,30 +640,36 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void convertRGBAToTensor(T *ptr) {
-        auto N = dims_[0];
-        auto C = dims_[1];
-        auto H = dims_[2];
-        auto W = dims_[3];
+        auto batch = transpose_ ? dims_[1] : dims_[0];
+        auto chan = transpose_ ? dims_[0] : dims_[1];
+        auto height = dims_[2];
+        auto width = dims_[3];
 
-        int C4 = UP_DIV(C, 4);
+        int chan4 = UP_DIV(chan, 4);
 
-        uint32_t row_pitch = W * 4 * sizeof(T);
-        uint32_t layer_stride = H * N * row_pitch;
+        uint32_t row_pitch = width * 4 * sizeof(T);
+        uint32_t layer_stride = height * batch * row_pitch;
         T *src = nullptr;
-        for (int c4 = 0; c4 < C4; ++c4) {
-            for (int n = 0; n < N; n++) {
-                for (int h = 0; h < H; h++) {
-                    for (int w = 0; w < W; w++) {
+        for (int c4 = 0; c4 < chan4; ++c4) {
+            for (int n = 0; n < batch; n++) {
+                for (int h = 0; h < height; h++) {
+                    for (int w = 0; w < width; w++) {
                         src = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
-                            c4 * layer_stride + (n * H + h) * row_pitch +
+                            c4 * layer_stride + (n * height + h) * row_pitch +
                             w * 4 * sizeof(T));
 
                         for (int k = 0; k < 4; k++) {
                             int c = c4 * 4 + k;
-                            if (c < C) {
-                                size_t offset =
-                                    n * C * H * W + c * H * W + h * W + w;
+                            if (c < chan) {
+                                size_t offset;
+                                if (transpose_) {
+                                    offset = c * batch * height * width +
+                                             n * height * width + h * width + w;
+                                } else {
+                                    offset = n * chan * height * width +
+                                             c * height * width + h * width + w;
+                                }
                                 data_[offset] = src[k];
                             }
                         }

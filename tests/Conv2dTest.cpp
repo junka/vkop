@@ -135,13 +135,13 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {6, 8, 4, 4}; // b, ic, ih, iw
-    int kernel_size_ = 2;
+    std::vector<int> input_shape_ = {16, 16, 2, 2}; // b, ic, ih, iw
+    int kernel_size_ = 1;
     int stride_ = 1;
     int pad_ = 0;
-    int group_ = 2;
+    int group_ = 1;
     int dilation_ = 1;
-    int feature_size_ = 8; // oc
+    int feature_size_ = 2; // oc
 
     std::unordered_map<std::string, std::string> attributes = {
         {"strides", std::to_string(stride_)},
@@ -259,6 +259,7 @@ private:
         }
         
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
+        weight_data_->set_transpose();
         weight_data_->fillFP32ToCPU(torch_weight);
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
         bias_data_->fillFP32ToCPU(torch_bias);
