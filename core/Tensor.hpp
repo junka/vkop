@@ -46,6 +46,8 @@ class ITensor {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
     void set_transpose() { transpose_ = true; }
+    bool get_transpose() const { return transpose_; }
+    bool get_pack() const { return pack_; }
     std::vector<int> getShape() {
         if (dims_[3]) {
             return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
@@ -121,13 +123,14 @@ class ITensor {
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
     bool transpose_ = false;
+    bool pack_ = false;
     bool converted_ = false;
 };
 
 template <typename T> class Tensor : public ITensor {
   public:
     // empty
-    Tensor(bool is_on_GPU = false) {
+    explicit Tensor(bool is_on_GPU = false) {
         if (is_on_GPU) {
             toGPU();
         }
@@ -264,15 +267,14 @@ template <typename T> class Tensor : public ITensor {
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
-            int exflags = 0;
-            if (vd->is_support_host_image_copy()) {
-#ifdef VK_EXT_host_image_copy
-                exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
-#endif
+            if (dims_[2] == 1 && dims_[3] == 1) {
+                // for weight kernel 1x1
+                pack_ = true;
+                transpose_ = false;
             }
             make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT |
                                VK_IMAGE_USAGE_STORAGE_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_DST_BIT | exflags);
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         }
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
@@ -293,15 +295,9 @@ template <typename T> class Tensor : public ITensor {
     as_output_image(std::shared_ptr<VulkanDevice> &vd,
                     const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
-            int exflags = 0;
-            if (vd->is_support_host_image_copy()) {
-#ifdef VK_EXT_host_image_copy
-                exflags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
-#endif
-            }
             make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT |
                                VK_IMAGE_USAGE_SAMPLED_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | exflags);
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         }
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
@@ -459,10 +455,23 @@ template <typename T> class Tensor : public ITensor {
         }
         auto batch = transpose_ ? dims_[1] : dims_[0];
         auto chan = transpose_ ? dims_[0] : dims_[1];
-        auto height = dims_[2];
+        uint32_t height = dims_[2];
         uint32_t width = dims_[3];
         uint32_t realheight = height * batch;
         auto chan4 = UP_DIV(chan, 4);
+        if (pack_) {
+            // one layer image, now for 1x1 kernel,
+            // for NCHW, realW,realH (W * C4, N*H) and now (C4, N)
+            // (Cout, Cin_per_group, kH, kW) now (Cin_per_group4, Cout)
+            // after transpose it is (Cout4, Cin_per_group)
+            width = width * chan4;
+            chan4 = 1;
+        }
+        if (vd->is_support_host_image_copy()) {
+#ifdef VK_EXT_host_image_copy
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+#endif
+        }
 
         auto vkdim = VkExtent3D{width, realheight, 1};
         vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, chan4, flags, format);
@@ -613,10 +622,16 @@ template <typename T> class Tensor : public ITensor {
             for (int n = 0; n < batch; n++) {
                 for (int h = 0; h < height; h++) {
                     for (int w = 0; w < width; w++) {
+                        int dst_bytes_offset =
+                            (pack_ ? ((n * height + h) * (width * chan4) +
+                                      (w + c4 * width)) *
+                                         4 * sizeof(T)
+                                   : c4 * layer_stride +
+                                         (n * height + h) * row_pitch +
+                                         w * 4 * sizeof(T));
                         T *dst = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
-                            c4 * layer_stride + (n * height + h) * row_pitch +
-                            w * 4 * sizeof(T));
+                            dst_bytes_offset);
                         for (int k = 0; k < 4; k++) {
                             int c = c4 * 4 + k;
                             if (c < chan) {
@@ -654,10 +669,16 @@ template <typename T> class Tensor : public ITensor {
             for (int n = 0; n < batch; n++) {
                 for (int h = 0; h < height; h++) {
                     for (int w = 0; w < width; w++) {
+                        int src_bytes_offset =
+                            (pack_ ? ((n * height + h) * (width * chan4) +
+                                      (w + c4 * width)) *
+                                         4 * sizeof(T)
+                                   : c4 * layer_stride +
+                                         (n * height + h) * row_pitch +
+                                         w * 4 * sizeof(T));
                         src = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
-                            c4 * layer_stride + (n * height + h) * row_pitch +
-                            w * 4 * sizeof(T));
+                            src_bytes_offset);
 
                         for (int k = 0; k < 4; k++) {
                             int c = c4 * 4 + k;

@@ -33,6 +33,7 @@ struct GPUConv2dParam {
     int groups;
     int bias;
     int transpose;
+    int pack;
     int activation;
 };
 
@@ -248,7 +249,8 @@ class Conv2d : public Operator {
 
         para.groups = groups_;
         para.bias = ((inputs.size() > 2)) ? 1 : 0;
-        para.transpose = transpose_;
+        para.transpose = inputs[1]->get_transpose() ? 1 : 0;
+        para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
 
         submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
