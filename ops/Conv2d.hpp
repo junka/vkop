@@ -16,7 +16,16 @@ namespace ops {
 namespace conv2d {
 
 enum class PaddingMode { ZEROS, REFLECT, REPLICATE, CIRCULAR };
-enum class ActivationMode { NONE, RELU, SIGMOID, TANH, HARDSWISH, MISH, RELU6 };
+enum class ActivationMode {
+    NONE,
+    RELU,
+    SIGMOID,
+    TANH,
+    HARDSWISH,
+    MISH,
+    RELU6,
+    GATE_SIGMOID,
+};
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -138,6 +147,8 @@ class Conv2d : public Operator {
                 activation_ = conv2d::ActivationMode::MISH;
             } else if (activation == "Relu6") {
                 activation_ = conv2d::ActivationMode::RELU6;
+            } else if (activation == "GateSigmoid") {
+                activation_ = conv2d::ActivationMode::GATE_SIGMOID;
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
@@ -276,7 +287,7 @@ class Conv2d : public Operator {
     int transpose_ = 1;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
-};
+}; // namespace ops
 
 } // namespace ops
 } // namespace vkop

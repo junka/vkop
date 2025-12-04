@@ -288,6 +288,38 @@ void VulkanImage::createImageView() {
     }
 }
 
+void VulkanImage::splitImageView(std::vector<int64_t> &layers) {
+    splitImageView_.resize(layers.size());
+    int sum_layers = 0;
+    for (size_t i = 0; i < layers.size(); i++) {
+        VkImageViewCreateInfo info = {};
+        info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+#ifdef USE_VMA
+        info.image = m_vma_image_.image;
+#else
+        info.image = m_image_;
+#endif
+        info.viewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
+        if (m_imagetype_ == VK_IMAGE_TYPE_3D) {
+            info.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
+        } else if (m_imagetype_ == VK_IMAGE_TYPE_2D) {
+            info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        }
+        info.format = m_format_;
+        info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        info.subresourceRange.baseMipLevel = 0;
+        info.subresourceRange.levelCount = 1;
+        info.subresourceRange.baseArrayLayer = sum_layers;
+        info.subresourceRange.layerCount = layers[i];
+        sum_layers += layers[i];
+
+        if (vkCreateImageView(m_vdev_->getLogicalDevice(), &info, nullptr,
+                              &splitImageView_[i]) != VK_SUCCESS) {
+            throw std::runtime_error("failed to split image view!");
+        }
+    }
+}
+
 void VulkanImage::createSampler() {
     VkFilter filter = VK_FILTER_NEAREST;
     VkSamplerAddressMode mode = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;

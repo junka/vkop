@@ -54,7 +54,7 @@ layout(push_constant) uniform constBuffer {
     int activation;
 } uConstant;
 
-void conv1x1() { 
+void conv1x1() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
     int W_out = uConstant.outputSize.x;
     int realH = uConstant.imageSize.y;
@@ -565,7 +565,7 @@ void grouped_conv2d() {
 
 void main() {
     if (uConstant.pack == 1) {
-        conv1x1(); 
+        conv1x1();
     } else {
         grouped_conv2d();
     }

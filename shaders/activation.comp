@@ -17,6 +17,7 @@
 #define ACTIVATION_HSWISH    4
 #define ACTIVATION_MISH      5
 #define ACTIVATION_RELU6     6
+#define ACTIVATION_GATE_SIGMOID 7
 
 FLOAT activation(FLOAT x, int act_type) {
     switch (act_type) {
@@ -32,6 +33,8 @@ FLOAT activation(FLOAT x, int act_type) {
             return FLOAT(x * tanh(log(1.0 + exp(x))));
         case ACTIVATION_RELU6:
             return FLOAT(clamp(x, FLOAT(0.0), FLOAT(6.0)));
+        case ACTIVATION_GATE_SIGMOID:
+            return FLOAT(x * sigmoid(x));
         default:
             return x;
     }

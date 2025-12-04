@@ -9,6 +9,7 @@ from onnx import numpy_helper
 import onnxoptimizer as optimizer
 from onnxsim import simplify
 from collections import defaultdict, deque
+from typing import List, Dict, Set, Tuple, Optional
 
 
 class VkModel:
@@ -232,13 +233,163 @@ def is_topologically_sortable(graph):
     return True
 
 
+def build_graph_index(nodes):
+    # tensor_name -> producing node
+    producer = {}
+    # tensor_name -> list of (consumer_node, input_index)
+    consumers = defaultdict(list)
+
+    for node in nodes:
+        for out in node['outputs']:
+            producer[out['name']] = node
+        for idx, inp in enumerate(node['inputs']):
+            consumers[inp['name']].append((node, idx))
+    
+    return producer, consumers
+
+
+def fuse_gated_conv(vk_model):
+    producer, consumers = build_graph_index(vk_model.nodes)
+
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    # 记录要删除的节点
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}   
+
+    for node in nodes:
+        if node['op_type'] != 'Mul':
+            continue
+
+        inputs = node['inputs']
+        if len(inputs) != 2:
+            continue
+
+        inp0, inp1 = inputs[0]['name'], inputs[1]['name']
+
+        # 尝试两种组合: inp0 是 conv, inp1 是 sigmoid(conv)
+        candidates = [
+            (inp0, inp1),
+            (inp1, inp0)
+        ]
+
+        for conv_out, sig_out in candidates:
+            if conv_out not in producer or sig_out not in producer:
+                continue
+
+            conv_node = producer[conv_out]
+            sig_node = producer[sig_out]
+
+            if conv_node['op_type'] != 'Conv':
+                continue
+            if sig_node['op_type'] != 'Sigmoid':
+                continue
+            if len(sig_node['inputs']) != 1:
+                continue
+            if sig_node['inputs'][0]['name'] != conv_out:
+                continue
+
+            # 检查 conv_out 是否只被这两个节点使用（避免副作用）
+            conv_consumers = consumers[conv_out]
+            if len(conv_consumers) != 2:
+                continue
+            consumer_names = {c[0]['op_type'] for c in conv_consumers}
+            if not (consumer_names == {'Sigmoid', 'Mul'}):
+                continue
+            
+            fused = conv_node.copy()
+            fused['attributes'] = dict(conv_node.get('attributes', {}))
+            fused['attributes']['activation'] = 'GateSigmoid'  # 自定义标记
+            fused['outputs'] = node['outputs']  # 输出为 Mul 的输出
+
+            first_idx = conv_node['_orig_idx']
+            replacements[first_idx] = fused
+            to_remove.add(conv_node['_orig_idx'])
+            to_remove.add(sig_node['_orig_idx'])
+            to_remove.add(node['_orig_idx'])
+            matched = True
+            break
+
+        if matched:
+            continue  # 避免重复处理
+
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # 如果这是融合子图的第一个节点，就放 fused node
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+            # 否则跳过（不添加）
+        else:
+            # 未被融合的节点，直接保留
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        node.pop('_orig_idx', None)
+
+    print("Fusing gated convs...", len(to_remove))
+    vk_model.nodes = new_nodes
+
+def fuse_conv_simple_activation(vk_model):
+    producer, consumers = build_graph_index(vk_model.nodes)
+    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
+    
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}
+
+    for node in nodes:
+        if node['op_type'] == 'Conv' and len(node['outputs']) == 1:
+            out_name = node['outputs'][0]['name']
+            outs = consumers.get(out_name, [])
+            if len(outs) == 1:
+                next_node, _ = outs[0]
+                if (next_node['op_type'] in ACTIVATIONS and
+                    len(next_node['inputs']) == 1 and
+                    next_node['inputs'][0]['name'] == out_name):
+
+                    fused = node.copy()
+                    # fused['attributes'] = node['attributes'].copy()
+                    fused['attributes'] = dict(node.get('attributes', {}))
+                    fused['attributes']['activation'] = next_node['op_type']
+                    fused['outputs'] = next_node['outputs']
+
+                    first_idx = node['_orig_idx']
+                    replacements[first_idx] = fused
+
+                    to_remove.add(first_idx)
+                    to_remove.add(next_node['_orig_idx'])
+                    continue
+
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # 如果这是融合子图的第一个节点，就放 fused node
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+            # 否则跳过（不添加）
+        else:
+            # 未被融合的节点，直接保留
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        node.pop('_orig_idx', None)
+
+    vk_model.nodes = new_nodes
+
+
 def fuse_conv_activation(vk_model):
     """Fuse Conv + Activation (ReLU, Sigmoid, etc.) into Conv node."""
     fused_nodes = []
     skip_next = set()
 
     # 支持的无参激活函数（ONNX op_type）
-    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
+    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6", "GateSigmoid"}
 
     for i, node in enumerate(vk_model.nodes):
         if i in skip_next:
@@ -435,7 +586,9 @@ def parse_onnx_model(onnx_path):
         name = initializer.name
         vk_model.initializers[name] = initializer
 
-    fuse_conv_activation(vk_model)
+    fuse_gated_conv(vk_model)
+    fuse_conv_simple_activation(vk_model)
+
     return vk_model
 
 

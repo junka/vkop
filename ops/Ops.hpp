@@ -43,6 +43,7 @@ enum class OpType {
     SOFTPLUS,
     GEMM,
     REDUCE,
+    SPLIT,
     TOTAL_NUM
 };
 
@@ -54,7 +55,7 @@ inline std::string convert_openum_to_string(const OpType &type) {
         "MaxPool2d", "AvgPool2d", "Upsample2d", "GridSample", "Constant",
         "Floor",     "Flatten",   "Resize",     "Concat",     "Slice",
         "Unsqueeze", "Squeeze",   "Col2Im",     "Im2Col",     "PRelu",
-        "Sigmoid",   "Softplus",  "Gemm",       "Reduce",
+        "Sigmoid",   "Softplus",  "Gemm",       "Reduce",     "Split",
     };
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -128,6 +129,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::GEMM;
     if (name == "Reduce")
         return vkop::ops::OpType::REDUCE;
+    if (name == "Split")
+        return vkop::ops::OpType::SPLIT;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

@@ -63,6 +63,8 @@ class VulkanImage : public VulkanResource {
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
 
+    void splitImageView(std::vector<int64_t> &layers);
+
   private:
     VkExtent3D m_dim_;
     uint32_t m_layers_;
@@ -78,6 +80,7 @@ class VulkanImage : public VulkanResource {
 #endif
     VkImageView m_imageView_;
     VkSampler m_sampler_;
+    std::vector<VkImageView> splitImageView_;
 
     int m_chansize_;
     int m_chans_;
