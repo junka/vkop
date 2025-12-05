@@ -136,6 +136,15 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
+    Tensor(int n) {
+        dims_[0] = n;
+        dims_[1] = 0;
+        dims_[2] = 0;
+        dims_[3] = 0;
+        size_ = n * sizeof(T);
+        data_.resize(n);
+    }
+
     // nchw
     Tensor(int n, int c, int h, int w, bool is_on_GPU = false) {
         dims_[0] = n;

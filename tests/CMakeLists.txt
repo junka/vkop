@@ -28,6 +28,7 @@ set(TESTS
     MatMulTest
     GemmTest
     ReduceTest
+    ReshapeTest
 )
 
 # 查找 Python（Interpreter + Development）

@@ -1,0 +1,60 @@
+#version 450 core
+
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding=1) uniform sampler2DArray uInput;
+
+layout(push_constant) uniform reshapeBuffer {
+    ivec4 inImgSize;    // W_in, H_in * Nin, Cin4, _
+    ivec4 outImgSize;   // W_out, H_out * Nout, Cout4, _
+    ivec4 inShape;      // Nin, Cin, H_in, W_in
+    ivec4 outShape;     // Nout, Cout, H_out, W_out
+} uReshapePara;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+void main()
+{
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    // Output dimensions
+    int W_out = uReshapePara.outShape.w;
+    int H_out = uReshapePara.outShape.z;
+    int Cout = uReshapePara.outShape.y;
+    int Nout = uReshapePara.outShape.x;
+
+    // Input dimensions
+    int W_in = uReshapePara.inShape.w;
+    int H_in = uReshapePara.inShape.z;
+    int Cin = uReshapePara.inShape.y;
+    int Nin = uReshapePara.inShape.x;
+
+    // Global ID for output
+    int out_n = gid.y / H_out; // Batch index
+    int out_c4 = gid.z; // Channel group index (Cout4)
+    int out_y = gid.y % H_out; // Y-coordinate in output
+    int out_x = gid.x; // X-coordinate in output
+
+    if (out_n >= Nout || out_c4 >= (Cout + 3) / 4 || out_y >= H_out || out_x >= W_out) {
+        return; // Out of bounds
+    }
+
+    // Compute the corresponding input index
+    int out_c = out_c4 * 4; // Expand channel group
+    int out_idx = ((out_n * Cout + out_c) * H_out + out_y) * W_out + out_x;
+
+    int in_n = out_idx / (Cin * H_in * W_in);
+    int in_rem = out_idx % (Cin * H_in * W_in);
+    int in_c = in_rem / (H_in * W_in);
+    int in_rem2 = in_rem % (H_in * W_in);
+    int in_y = in_rem2 / W_in;
+    int in_x = in_rem2 % W_in;
+
+    int in_c4 = in_c / 4;
+    int in_c4_rem = in_c % 4;
+
+    // Fetch the input value
+    vec4 value = texelFetch(uInput, ivec3(in_x, in_y, in_c4), 0);
+
+    // Write to the output
+    imageStore(uOutput, gid, value);
+}
