@@ -1,0 +1,72 @@
+#version 450 core
+
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding=1) uniform sampler2DArray uInput;
+
+layout(push_constant) uniform transBuffer {
+    ivec4 inImgSize;    // W_in, H_in * Nin, Cin4, _
+    ivec4 outImgSize;   // W_out, H_out * Nout, Cout4, _
+    ivec4 inShape;      // Nin, Cin, H_in, W_in
+    ivec4 outShape;     // Nout, Cout, H_out, W_out
+    ivec4 perms;
+    ivec4 reverse_perms;
+} uTransPara;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+void main()
+{
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int W_out = uTransPara.outShape.w;
+    int H_out = uTransPara.outShape.z;
+    int Cout = uTransPara.outShape.y;
+    int Nout = uTransPara.outShape.x;
+
+    int W_in = uTransPara.inShape.w;
+    int H_in = uTransPara.inShape.z;
+    int Cin = uTransPara.inShape.y;
+    int Nin = uTransPara.inShape.x;
+
+    int out_n = gid.y / H_out;
+    int out_c4 = gid.z;
+    int out_w = gid.x;
+    int out_h = gid.y % H_out;
+    int out_c = out_c4 * 4;
+
+    if (out_n >= Nout || out_c4 >= (Cout + 3) / 4 || out_h >= H_out || out_w >= W_out) {
+        return;
+    }
+
+    vec4 output_value;
+    for (int i = 0; i < 4; ++i) {
+        int c_local = gid.z * 4 + i; // actual output channel
+
+        if (c_local >= Cout) {
+            output_value[i] = 0.0;
+            continue;
+        }
+
+        // Build full output coordinate for this channel
+        ivec4 out_idx = ivec4(out_n, c_local, out_h, out_w); // [N, C, H, W]
+
+        // Map to input coordinates
+        int in_n = out_idx[uTransPara.reverse_perms[0]];
+        int in_c = out_idx[uTransPara.reverse_perms[1]];
+        int in_h = out_idx[uTransPara.reverse_perms[2]];
+        int in_w = out_idx[uTransPara.reverse_perms[3]];
+
+        if (in_n >= Nin || in_c >= Cin || in_h >= H_in || in_w >= W_in) {
+            output_value[i] = 0.0;
+            continue;
+        }
+
+        int in_layer = in_c / 4;
+        int in_y = in_n * H_in + in_h;
+        vec4 input_vec = texelFetch(uInput, ivec3(in_w, in_y, in_layer), 0);
+        output_value[i] = input_vec[in_c % 4];
+    }
+
+
+    imageStore(uOutput, gid, output_value);
+}

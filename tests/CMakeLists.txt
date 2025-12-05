@@ -29,6 +29,7 @@ set(TESTS
     GemmTest
     ReduceTest
     ReshapeTest
+    TransposeTest
     SliceTest
 )
 

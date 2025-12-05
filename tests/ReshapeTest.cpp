@@ -30,7 +30,8 @@ private:
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->reserveOnCPU();
         shape = std::make_shared<Tensor<int64_t>>(4);
-        expectedOutput.resize(input->num_elements());std::random_device rd{};
+        expectedOutput.resize(input->num_elements());
+        std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
         std::normal_distribution<> input_dist{-1.0F, 1.0F};

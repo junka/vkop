@@ -24,11 +24,6 @@ void main()
     int Cout = uSlicePara.outShape.y;
     int Nout = uSlicePara.outShape.x;
 
-    int W_in = uSlicePara.inShape.w;
-    int H_in = uSlicePara.inShape.z;
-    int Cin = uSlicePara.inShape.y;
-    int Nin = uSlicePara.inShape.x;
-
     int out_n = gid.y / H_out; // Batch index
     int out_c4 = gid.z; // Channel group index (Cout4)
     int out_y = gid.y % H_out; // Y-coordinate in output
