@@ -1,0 +1,64 @@
+#version 450 core
+
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding=1) uniform sampler2DArray uInput;
+
+layout(push_constant) uniform sliceBuffer {
+    ivec4 inImgSize;    // W_in, H_in * Nin, Cin4, _
+    ivec4 outImgSize;   // W_out, H_out * Nout, Cout4, _
+    ivec4 inShape;      // Nin, Cin, H_in, W_in
+    ivec4 outShape;     // Nout, Cout, H_out, W_out
+    ivec4 start;        // Start indices for slicing
+    ivec4 end;          // End indices for slicing
+    ivec4 step;         // Step sizes for slicing
+} uSlicePara;
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+void main()
+{
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int W_out = uSlicePara.outShape.w;
+    int H_out = uSlicePara.outShape.z;
+    int Cout = uSlicePara.outShape.y;
+    int Nout = uSlicePara.outShape.x;
+
+    int W_in = uSlicePara.inShape.w;
+    int H_in = uSlicePara.inShape.z;
+    int Cin = uSlicePara.inShape.y;
+    int Nin = uSlicePara.inShape.x;
+
+    int out_n = gid.y / H_out; // Batch index
+    int out_c4 = gid.z; // Channel group index (Cout4)
+    int out_y = gid.y % H_out; // Y-coordinate in output
+    int out_x = gid.x; // X-coordinate in output
+
+    if (out_n >= Nout || out_c4 >= (Cout + 3) / 4 || out_y >= H_out || out_x >= W_out) {
+        return;
+    }
+
+    int out_c = out_c4 * 4;
+    int in_n = uSlicePara.start.x + out_n * uSlicePara.step.x;
+    int in_c = uSlicePara.start.y + out_c * uSlicePara.step.y;
+    int in_y = uSlicePara.start.z + out_y * uSlicePara.step.z;
+    int in_x = uSlicePara.start.w + out_x * uSlicePara.step.w;
+
+    if (in_n >= uSlicePara.end.x || in_c >= uSlicePara.end.y ||
+        in_y >= uSlicePara.end.z || in_x >= uSlicePara.end.w) {
+        return;
+    }
+
+    int in_c4 = in_c / 4;
+    int in_c4_rem = in_c % 4;
+
+    vec4 value = texelFetch(uInput, ivec3(in_x, in_y, in_c4), 0);
+
+    for (int i = 0; i < 4; ++i) {
+        if (in_c + i >= uSlicePara.end.y) {
+            value[i] = 0.0;
+        }
+    }
+
+    imageStore(uOutput, gid, value);
+}

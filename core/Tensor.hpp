@@ -28,13 +28,7 @@ class ITensor {
   public:
     virtual const std::type_info &dtype() const = 0;
 
-    int num_dims() {
-        int count = 4;
-        while (count > 0 && dims_[count - 1] == 0) {
-            count--;
-        }
-        return count;
-    }
+    uint8_t num_dims() const { return n_dims_; }
 
     int size() const { return size_; }
     bool is_on_GPU() const { return converted_; }
@@ -122,6 +116,7 @@ class ITensor {
     int dims_[4];
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
+    uint8_t n_dims_ = 0;
     bool transpose_ = false;
     bool pack_ = false;
     bool converted_ = false;
@@ -136,8 +131,18 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    Tensor(int n) {
-        dims_[0] = n;
+    template <typename U, typename = typename std::enable_if<
+                              std::is_same<U, int>::value ||
+                              std::is_same<U, uint32_t>::value ||
+                              std::is_same<U, int64_t>::value ||
+                              std::is_same<U, uint64_t>::value ||
+                              std::is_same<U, int16_t>::value ||
+                              std::is_same<U, uint16_t>::value ||
+                              std::is_same<U, int8_t>::value ||
+                              std::is_same<U, uint8_t>::value>::type>
+    explicit Tensor(U n) {
+        n_dims_ = 1;
+        dims_[0] = static_cast<T>(n);
         dims_[1] = 0;
         dims_[2] = 0;
         dims_[3] = 0;
@@ -151,6 +156,8 @@ template <typename T> class Tensor : public ITensor {
         dims_[1] = c;
         dims_[2] = h;
         dims_[3] = w;
+        n_dims_ = ((dims_[0] != 0) + (dims_[1] != 0) + (dims_[2] != 0) +
+                   (dims_[3] != 0));
         size_ = sizeof(T) * n * c * h * w;
         if (is_on_GPU) {
             toGPU();
@@ -163,6 +170,7 @@ template <typename T> class Tensor : public ITensor {
         memset(dims_, 0, sizeof(dims_));
         size_ = dims.empty() ? 0 : sizeof(T);
         int i = 0;
+        n_dims_ = static_cast<uint8_t>(dims.size());
         for (auto d : dims) {
             size_ *= d;
             dims_[i++] = static_cast<int>(d);
@@ -179,6 +187,8 @@ template <typename T> class Tensor : public ITensor {
         dims_[1] = c;
         dims_[2] = h;
         dims_[3] = w;
+        n_dims_ =
+            (dims_[3] != 0) ? 4 : (dims_[2] != 0) ? 3 : (dims_[1] != 0) ? 2 : 1;
         size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
             data_.resize(n * c * h * w);
@@ -186,6 +196,7 @@ template <typename T> class Tensor : public ITensor {
 
     template <typename U> void resize(const std::vector<U> &dims) {
         memset(dims_, 0, sizeof(dims_));
+        n_dims_ = static_cast<uint8_t>(dims.size());
         size_ = dims.empty() ? 0 : sizeof(T);
         int i = 0;
         for (auto d : dims) {
@@ -207,6 +218,12 @@ template <typename T> class Tensor : public ITensor {
             }
             size_ = 0;
             memset(dims_, 0, sizeof(dims_));
+        } else {
+            n_dims_ = 1;
+            size_ = sizeof(T) * len;
+            dims_[0] = len;
+            if (!is_on_GPU())
+                data_.resize(len);
         }
     }
 
@@ -248,6 +265,8 @@ template <typename T> class Tensor : public ITensor {
         return data_[index];
     }
     int num_elements() { return size_ / sizeof(T); }
+
+    std::vector<T> data() { return data_; }
 
     std::shared_ptr<VulkanBuffer>
     as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
@@ -398,12 +417,12 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    void fillToCPU(std::vector<T> &data) {
+    void fillToCPU(const std::vector<T> &data) {
         data_.resize(num_elements());
         memcpy(data_.data(), data.data(), size_);
         toCPU();
     }
-    void fillToCPU(T *data) {
+    void fillToCPU(const T *data) {
         data_.resize(num_elements());
         memcpy(data_.data(), data, size_);
         toCPU();

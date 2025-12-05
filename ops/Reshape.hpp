@@ -44,7 +44,7 @@ class Reshape : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-
+        auto inshape = inputs[0]->getShape();
         auto shape = core::as_tensor<int64_t>(inputs[1]);
         assert(shape->num_dims() == 1);
         int n = shape->num_elements();
@@ -53,14 +53,18 @@ class Reshape : public Operator {
         dim[3] = (*shape)[n - 1];
         dim[2] = (*shape)[n - 2];
         dim[1] = (*shape)[n - 3];
+        auto total = inshape[0] * inshape[1] * inshape[2] * inshape[3];
         if (n == 3) {
             dim[0] = 1;
         } else if (n == 4) {
             dim[0] = (*shape)[0];
         }
+        if (dim[3] == -1) {
+            dim[3] = total / dim[2] / dim[1] / dim[0];
+        }
         for (int i = 0; i < 4; i++) {
             if (!allowzero_) {
-                dim[i] = inputs[0]->getShape()[i];
+                dim[i] = inshape[i];
             }
         }
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
@@ -79,7 +83,6 @@ class Reshape : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        auto inshape = inputs[0]->getShape();
         auto outshape = outputs[0]->getShape();
         reshape::GpuReshapeParam param;
         param.inImgSize[0] = inshape[3];

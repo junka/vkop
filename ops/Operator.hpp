@@ -16,6 +16,7 @@ namespace vkop {
 namespace ops {
 class Operator {
   public:
+    explicit Operator(OpType type) : type_(type) {}
     explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
                       size_t pc_size = 0)
         : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len) {}
@@ -110,7 +111,7 @@ class Operator {
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
 
-    using SupportedTypes = std::tuple<float, uint16_t>;
+    using SupportedTypes = std::tuple<float, uint16_t, int, int64_t>;
     template <typename Func>
     void dispatch_by_dtype(const std::type_info &dtype, Func &&func) {
         bool dispatched = false;
@@ -129,9 +130,8 @@ class Operator {
             SupportedTypes{});
 
         if (!dispatched) {
-            throw std::runtime_error(
-                "Unsupported dtype: " + std::string(dtype.name()) +
-                ". Supported: float, uint16_t (fp16)");
+            throw std::runtime_error("Unsupported dtype: " +
+                                     std::string(dtype.name()));
         }
     }
 

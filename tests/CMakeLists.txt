@@ -29,6 +29,7 @@ set(TESTS
     GemmTest
     ReduceTest
     ReshapeTest
+    SliceTest
 )
 
 # 查找 Python（Interpreter + Development）

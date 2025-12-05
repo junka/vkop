@@ -25,6 +25,7 @@
 #include "Softmax.hpp"
 
 #include "Reshape.hpp"
+#include "Slice.hpp"
 
 #include "OperatorFactory.hpp"
 #include "Ops.hpp"
@@ -59,6 +60,7 @@ REGISTER_OPERATOR(OpType::GEMM, Gemm);
 REGISTER_OPERATOR(OpType::REDUCE, Reduce);
 
 REGISTER_OPERATOR(OpType::RESHAPE, Reshape);
+REGISTER_OPERATOR(OpType::SLICE, Slice);
 
 } // namespace ops
 } // namespace vkop
