@@ -1,0 +1,80 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform image2DArray uOutput;
+layout(set = 0, binding = 1) uniform sampler2DArray uInput;
+
+layout(push_constant) uniform concatBuffer {
+    ivec4 inShape;      // Nin, Cin, H_in, W_in
+    ivec4 outShape;     // Nout, Cout, H_out, W_out
+    ivec4 offset;       // Noff, Coff, H_off, W_off
+                        // for axis = 2, only H_off valid
+    int axis;
+} uConcatPara;
+
+void concat_for_h() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    int N = uConcatPara.inShape.x;
+    int C = uConcatPara.inShape.y;
+    int H = uConcatPara.inShape.z;
+    int W = uConcatPara.inShape.w;
+    int Hout = uConcatPara.outShape.z;
+    int w = gid.x;
+    int c4 = gid.z;
+    int n = gid.y / H;
+    int h = gid.y % H;
+    if (w >= W || c4 >= C / 4 || n >= N || h >= H) {
+        return;
+    }
+    vec4 pixel = texelFetch(uInput, gid, 0);
+    h += uConcatPara.offset.z;
+    int y = n * Hout + h;
+
+    imageStore(uOutput, ivec3(w, y, c4), pixel);
+}
+
+void concat_for_c() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    int N = uConcatPara.inShape.x;
+    int C_in = uConcatPara.inShape.y;
+    int H = uConcatPara.inShape.z;
+    int W = uConcatPara.inShape.w;
+    int Hout = uConcatPara.outShape.z;
+    int c4 = gid.z;
+    int c_base = c4 * 4;
+    int offset = uConcatPara.offset.y;
+
+    vec4 pixel = texelFetch(uInput, gid, 0);
+
+    for (int comp = 0; comp < 4; ++comp) {
+        int input_channel = c_base + comp;
+
+        if (input_channel >= C_in) {
+            break;
+        }
+
+        int output_channel = offset + input_channel;
+
+        int out_layer = output_channel / 4;
+        int out_comp  = output_channel % 4;
+
+        ivec3 out_coord = ivec3(gid.x, gid.y, out_layer);
+
+        // 写入对应 component
+        // 使用 imageLoad + imageStore 更安全（避免覆盖其他 comp）
+        vec4 current = imageLoad(uOutput, out_coord);
+        current[out_comp] = pixel[comp];
+
+        imageStore(uOutput, out_coord, current);
+    }
+}
+
+// concat for axis = 2, and axis=1 when layers % 4 != 0
+void main() {
+    if (uConcatPara.axis == 2) {
+        concat_for_h();
+    } else if (uConcatPara.axis == 1) {
+        concat_for_c();
+    }
+}

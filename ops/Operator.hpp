@@ -38,11 +38,13 @@ class Operator {
                        const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
-        pipeline_ = std::make_shared<VulkanPipeline>(
-            m_dev_->getLogicalDevice(), types_, pc_size_,
-            reinterpret_cast<const uint32_t *>(spv_), spv_len_);
-        for (auto &ds : m_ds_) {
-            ds = pipeline_->allocDescriptorSets();
+        if (spv_len_ > 0 && spv_) {
+            pipeline_ = std::make_shared<VulkanPipeline>(
+                m_dev_->getLogicalDevice(), types_, pc_size_,
+                reinterpret_cast<const uint32_t *>(spv_), spv_len_);
+            for (auto &ds : m_ds_) {
+                ds = pipeline_->allocDescriptorSets();
+            }
         }
     }
 
@@ -90,6 +92,7 @@ class Operator {
                    std::shared_ptr<VulkanCommandBuffer> cmd, int id) {
         m_cmd_ = std::move(cmd);
         m_id_ = id;
+        objs_.clear();
         execute(inputs, outputs);
     }
 
@@ -102,8 +105,8 @@ class Operator {
     int m_id_;
     OpType type_;
     size_t pc_size_ = 0;
-    uint8_t *spv_;
-    uint32_t spv_len_;
+    uint8_t *spv_ = nullptr;
+    uint32_t spv_len_ = 0;
     int n_imgs_ = 0;
 
     // we should release objs_ here, since for some intermediate tensor, we will
@@ -146,7 +149,6 @@ class Operator {
             m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
         }
         m_cmd_->dispatch(out_width, out_height, out_layers);
-        objs_.clear();
     }
 
   private:

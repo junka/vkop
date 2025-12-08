@@ -31,12 +31,11 @@ set(TESTS
     ReshapeTest
     TransposeTest
     SliceTest
+    ConcatTest
 )
 
-# 查找 Python（Interpreter + Development）
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 
-# 获取 Python include（兼容老版本 CMake）
 if (DEFINED Python3_INCLUDE_DIRS)
     include_directories(${Python3_INCLUDE_DIRS})
 else()
@@ -46,7 +45,6 @@ else()
     include_directories(${PYTHON3_INCLUDE_DIR})
 endif()
 
-# 验证 Python 是否能 import torch，并打印其路径
 execute_process(
     COMMAND ${Python3_EXECUTABLE} -c "import importlib,sys; spec=importlib.util.find_spec('torch'); print('FOUND' if spec else 'MISSING'); print(spec.origin if spec else '')"
     OUTPUT_VARIABLE PYTORCH_CHECK

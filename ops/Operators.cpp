@@ -24,6 +24,7 @@
 #include "Resize.hpp"
 #include "Softmax.hpp"
 
+#include "Concat.hpp"
 #include "Reshape.hpp"
 #include "Slice.hpp"
 #include "Transpose.hpp"
@@ -63,6 +64,7 @@ REGISTER_OPERATOR(OpType::REDUCE, Reduce);
 REGISTER_OPERATOR(OpType::RESHAPE, Reshape);
 REGISTER_OPERATOR(OpType::SLICE, Slice);
 REGISTER_OPERATOR(OpType::TRANSPOSE, Transpose);
+REGISTER_OPERATOR(OpType::CONCAT, Concat);
 
 } // namespace ops
 } // namespace vkop

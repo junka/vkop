@@ -3,6 +3,7 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <cassert>
+#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 
@@ -262,13 +263,10 @@ void VulkanImage::destroyImage() {
 }
 
 void VulkanImage::createImageView() {
+    VkImage img = getImage();
     VkImageViewCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-#ifdef USE_VMA
-    info.image = m_vma_image_.image;
-#else
-    info.image = m_image_;
-#endif
+    info.image = img;
     info.viewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
     if (m_imagetype_ == VK_IMAGE_TYPE_3D) {
         info.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -291,14 +289,11 @@ void VulkanImage::createImageView() {
 void VulkanImage::splitImageView(std::vector<int64_t> &layers) {
     splitImageView_.resize(layers.size());
     int sum_layers = 0;
+    VkImage img = getImage();
     for (size_t i = 0; i < layers.size(); i++) {
         VkImageViewCreateInfo info = {};
         info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-#ifdef USE_VMA
-        info.image = m_vma_image_.image;
-#else
-        info.image = m_image_;
-#endif
+        info.image = img;
         info.viewType = VK_IMAGE_VIEW_TYPE_1D_ARRAY;
         if (m_imagetype_ == VK_IMAGE_TYPE_3D) {
             info.viewType = VK_IMAGE_VIEW_TYPE_CUBE_ARRAY;
@@ -362,6 +357,8 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
         return;
     }
 
+    VkImage img = getImage();
+
     VkImageSubresourceRange subrange = {};
     subrange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     subrange.baseMipLevel = 0;
@@ -375,11 +372,8 @@ void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,
     barrier.newLayout = newLayout;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-#ifdef USE_VMA
-    barrier.image = m_vma_image_.image;
-#else
-    barrier.image = m_image_;
-#endif
+
+    barrier.image = img;
     barrier.subresourceRange = subrange;
     barrier.srcAccessMask = m_access_;
     barrier.dstAccessMask = dstAccessMask;
@@ -449,11 +443,8 @@ void VulkanImage::copyImageToBuffer(VkCommandBuffer commandBuffer,
     if (m_layout_ != VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) {
         transferReadBarrier(commandBuffer);
     }
-#ifdef USE_VMA
-    VkImage img = m_vma_image_.image;
-#else
-    VkImage img = m_image_;
-#endif
+
+    VkImage img = getImage();
 
     VkBufferImageCopy region = {};
     region.bufferOffset = offset;
@@ -481,11 +472,8 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     if (m_layout_ != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
         transferWriteBarrier(commandBuffer);
     }
-#ifdef USE_VMA
-    VkImage img = m_vma_image_.image;
-#else
-    VkImage img = m_image_;
-#endif
+
+    VkImage img = getImage();
     VkBufferImageCopy region = {};
     region.bufferOffset = offset;
     region.bufferRowLength = 0;
@@ -510,6 +498,48 @@ void VulkanImage::copyBufferToImage(VkCommandBuffer commandBuffer,
     }
 }
 
+void VulkanImage::copyImageToImage(VkCommandBuffer commandBuffer,
+                                   const std::shared_ptr<VulkanImage> &src,
+                                   VkOffset3D dstOffset,
+                                   uint32_t dstBaseLayer) {
+    VkImageLayout old_layout = m_layout_;
+    VkAccessFlags old_access = m_access_;
+    // Ensure the image is in a readable layout
+    if (m_layout_ != VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL) {
+        transferWriteBarrier(commandBuffer);
+    }
+    VkImage img = getImage();
+
+    VkImageCopy region = {};
+    region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.srcSubresource.mipLevel = 0;
+    region.srcSubresource.baseArrayLayer = 0;
+    region.srcSubresource.layerCount = src->getImageLayers();
+    region.srcOffset = {0, 0, 0};
+    region.extent = {src->getImageWidth(), src->getImageHeight(), 1};
+
+    region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.dstSubresource.mipLevel = 0;
+    region.dstSubresource.baseArrayLayer = dstBaseLayer;
+    region.dstSubresource.layerCount = src->getImageLayers();
+    region.dstOffset = dstOffset;
+
+    assert(m_layout_ == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    vkCmdCopyImage(commandBuffer, src->getImage(),
+                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, img, m_layout_, 1,
+                   &region);
+
+    // Optionally transition the image back to its original layout
+    if (VK_IMAGE_LAYOUT_UNDEFINED != old_layout &&
+        VK_IMAGE_LAYOUT_PREINITIALIZED != old_layout) {
+        transferBarrier(commandBuffer, old_layout, old_access);
+    } else {
+        // not initilized, so make it as readable
+        transferBarrier(commandBuffer, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_ACCESS_SHADER_READ_BIT);
+    }
+}
+
 #ifdef VK_EXT_host_image_copy
 void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     VkResult ret;
@@ -519,11 +549,8 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     subrange.baseArrayLayer = 0;
     subrange.levelCount = 1;
     subrange.layerCount = m_layers_;
-#ifdef USE_VMA
-    VkImage img = m_vma_image_.image;
-#else
-    VkImage img = m_image_;
-#endif
+
+    VkImage img = getImage();
     VkHostImageLayoutTransitionInfo transinfo = {};
     transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
     transinfo.oldLayout = m_layout_;
@@ -557,11 +584,8 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     region.imageSubresource.layerCount = m_layers_;
     region.imageExtent = m_dim_;
     region.pHostPointer = ptr;
-#ifdef USE_VMA
-    VkImage img = m_vma_image_.image;
-#else
-    VkImage img = m_image_;
-#endif
+
+    VkImage img = getImage();
     VkCopyMemoryToImageInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
     copyinfo.dstImage = img;
@@ -588,11 +612,8 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     region.pHostPointer = ptr;
     region.memoryRowLength = 0;
     region.memoryImageHeight = 0;
-#ifdef USE_VMA
-    VkImage img = m_vma_image_.image;
-#else
-    VkImage img = m_image_;
-#endif
+
+    VkImage img = getImage();
     VkCopyImageToMemoryInfo copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
     copyinfo.srcImage = img;

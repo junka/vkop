@@ -367,6 +367,18 @@ public:
         PyObject* torch_output = nullptr;
         PyObject* norm_shape = nullptr;
 
+        auto cleanup = [&]() {
+            Py_XDECREF(torch_module);
+            Py_XDECREF(functional_module);
+            Py_XDECREF(torch_input);
+            Py_XDECREF(torch_weight);
+            Py_XDECREF(torch_bias);
+            Py_XDECREF(op_func);
+            Py_XDECREF(kwargs);
+            Py_XDECREF(torch_output);
+            Py_XDECREF(norm_shape);
+        };
+
         auto attrs = onnx_to_pytorch_attrs(attributes);
 
         try {
@@ -550,19 +562,13 @@ public:
 
         } catch (const std::exception& e) {
             fprintf(stderr, "C++ Exception: %s\n", e.what());
+            cleanup();
         } catch (...) {
+            cleanup();
             fprintf(stderr, "Unknown exception in execute_torch_operator\n");
         }
 
-        // === Cleanup ===
-        Py_XDECREF(torch_module);
-        Py_XDECREF(functional_module);
-        Py_XDECREF(torch_input);
-        Py_XDECREF(torch_weight);
-        Py_XDECREF(torch_bias);
-        Py_XDECREF(op_func);
-        Py_XDECREF(kwargs);
-        Py_XDECREF(torch_output);
+        cleanup();
 
         return {ret, output_shape};
     }

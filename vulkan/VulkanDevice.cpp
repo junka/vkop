@@ -173,12 +173,12 @@ bool VulkanDevice::createLogicalDevice(
 #endif
 
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
-
+#if VK_KHR_timeline_semaphore
     if (timeline_features.timelineSemaphore == VK_TRUE) {
         m_support_timeline_semaphore_ = true;
         LOG_INFO("Timeline semaphores supported");
     }
-
+#endif
     VkPhysicalDeviceFeatures features = {};
     features.robustBufferAccess = VK_TRUE;
     if (device_features.shaderInt64)

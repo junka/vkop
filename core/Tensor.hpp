@@ -302,7 +302,8 @@ template <typename T> class Tensor : public ITensor {
             }
             make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT |
                                VK_IMAGE_USAGE_STORAGE_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         }
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
@@ -325,7 +326,8 @@ template <typename T> class Tensor : public ITensor {
         if (!vkobj_) {
             make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT |
                                VK_IMAGE_USAGE_SAMPLED_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                               VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         }
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy

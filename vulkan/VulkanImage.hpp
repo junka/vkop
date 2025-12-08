@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <memory>
 #include <variant>
+#include <vulkan/vulkan_core.h>
 
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanResource.hpp"
@@ -45,7 +46,9 @@ class VulkanImage : public VulkanResource {
                            VkDeviceSize offset);
     void copyBufferToImage(VkCommandBuffer commandBuffer, VkBuffer buffer,
                            VkDeviceSize offset);
-
+    void copyImageToImage(VkCommandBuffer commandBuffer,
+                          const std::shared_ptr<VulkanImage> &srcimage,
+                          VkOffset3D dstOffset, uint32_t dstBaseLayer);
     /*
      * For host image copy image layout transition
      * This is done on host
@@ -55,10 +58,21 @@ class VulkanImage : public VulkanResource {
     void hostImageCopyToDevice(void *ptr);
     void hostImageCopyToHost(void *ptr);
 #endif
+    VkImage getImage() const {
+#ifndef USE_VMA
+        return m_image_;
+#else
+        return m_vma_image_.image;
+#endif
+    }
+
     int getImageSize() const {
         return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
                m_dim_.depth * m_layers_;
     }
+    uint32_t getImageWidth() const { return m_dim_.width; }
+    uint32_t getImageHeight() const { return m_dim_.height; }
+    uint32_t getImageLayers() const { return m_layers_; }
 
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
@@ -86,9 +100,6 @@ class VulkanImage : public VulkanResource {
     int m_chans_;
 
     void calcImageSize();
-    int getImageWidth() const { return m_dim_.width; }
-    int getImageHeight() const { return m_dim_.height; }
-    int getImageLayers() const { return m_layers_; }
 
     void createImage();
 

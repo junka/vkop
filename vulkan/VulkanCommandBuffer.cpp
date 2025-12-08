@@ -12,12 +12,7 @@ VulkanCommandBuffer::VulkanCommandBuffer(
     : id_(id), m_cmdpool_(std::move(cmdpool)) {
     allocate();
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
-    m_usefence_ =
-#ifndef VK_KHR_timeline_semaphore
-        true;
-#else
-        !device->is_support_timeline_semaphore();
-#endif
+    m_usefence_ = !device->is_support_timeline_semaphore();
 
     if (m_usefence_) {
         createFence(signaled);
@@ -59,9 +54,11 @@ void VulkanCommandBuffer::allocate() {
     alloc_info.commandBufferCount = 1;
 
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
-    if (vkAllocateCommandBuffers(device->getLogicalDevice(), &alloc_info,
-                                 &m_commandBuffer_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to allocate command buffer!");
+    auto ret = vkAllocateCommandBuffers(device->getLogicalDevice(), &alloc_info,
+                                        &m_commandBuffer_);
+    if (ret != VK_SUCCESS) {
+        printf("ret %d\n", ret);
+        throw std::runtime_error("Failed to allocate command buffer");
     }
 }
 
