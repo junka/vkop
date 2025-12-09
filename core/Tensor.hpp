@@ -54,6 +54,21 @@ class ITensor {
         }
         return std::vector<int>{dims_[0]};
     }
+    std::vector<int> getGPUShape() {
+        uint8_t ndim = num_dims();
+        assert(ndim >= 3);
+        int pre = ((ndim == 4) ? dims_[0] : 1);
+        auto batch = transpose_ ? dims_[ndim - 3] : pre;
+        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        auto height = dims_[ndim - 2];
+        auto width = dims_[ndim - 1];
+        int chan4 = UP_DIV(chan, 4);
+        return std::vector<int>{width, height * batch, chan4};
+    }
+    int get_batch() const { return (n_dims_ == 4) ? dims_[0] : 1; }
+    int get_channel() const { return (n_dims_ == 4) ? dims_[1] : dims_[0]; }
+    int get_height() const { return (n_dims_ == 4) ? dims_[2] : dims_[1]; }
+    int get_width() const { return (n_dims_ == 4) ? dims_[3] : dims_[2]; }
 
     static float fp16_to_fp32(uint16_t h) {
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
@@ -295,7 +310,7 @@ template <typename T> class Tensor : public ITensor {
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
-            if (dims_[2] == 1 && dims_[3] == 1) {
+            if (n_dims_ == 4 && dims_[2] == 1 && dims_[3] == 1) {
                 // for weight kernel 1x1
                 pack_ = true;
                 transpose_ = false;
@@ -483,18 +498,16 @@ template <typename T> class Tensor : public ITensor {
         } else if (sizeof(T) == 2) {
             format = VK_FORMAT_R16G16B16A16_SFLOAT;
         }
-        auto batch = transpose_ ? dims_[1] : dims_[0];
-        auto chan = transpose_ ? dims_[0] : dims_[1];
-        uint32_t height = dims_[2];
-        uint32_t width = dims_[3];
-        uint32_t realheight = height * batch;
-        auto chan4 = UP_DIV(chan, 4);
+        auto gpushape = getGPUShape();
+        uint32_t width = gpushape[0];
+        uint32_t height = gpushape[1];
+        uint32_t chan4 = gpushape[2];
         if (pack_) {
             // one layer image, now for 1x1 kernel,
             // for NCHW, realW,realH (W * C4, N*H) and now (C4, N)
             // (Cout, Cin_per_group, kH, kW) now (Cin_per_group4, Cout)
             // after transpose it is (Cout4, Cin_per_group)
-            width = width * chan4;
+            width = gpushape[0] * gpushape[2];
             chan4 = 1;
         }
         if (vd->is_support_host_image_copy()) {
@@ -503,7 +516,7 @@ template <typename T> class Tensor : public ITensor {
 #endif
         }
 
-        auto vkdim = VkExtent3D{width, realheight, 1};
+        auto vkdim = VkExtent3D{width, height, 1};
         vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, chan4, flags, format);
     }
 
@@ -637,10 +650,13 @@ template <typename T> class Tensor : public ITensor {
             throw std::runtime_error(
                 "Failed to cast VulkanResource to VulkanImage");
         }
-        auto batch = transpose_ ? dims_[1] : dims_[0];
-        auto chan = transpose_ ? dims_[0] : dims_[1];
-        auto height = dims_[2];
-        auto width = dims_[3];
+        uint8_t ndim = num_dims();
+        assert(ndim >= 3);
+        int pre = ((ndim == 4) ? dims_[0] : 1);
+        auto batch = transpose_ ? dims_[ndim - 3] : pre;
+        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        auto height = dims_[ndim - 2];
+        auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
 
         const T *input = src ? src : data_.data();
@@ -685,11 +701,13 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void convertRGBAToTensor(T *ptr) {
-        auto batch = transpose_ ? dims_[1] : dims_[0];
-        auto chan = transpose_ ? dims_[0] : dims_[1];
-        auto height = dims_[2];
-        auto width = dims_[3];
-
+        uint8_t ndim = num_dims();
+        assert(ndim >= 3);
+        int pre = ndim == 4 ? dims_[0] : 1;
+        auto batch = transpose_ ? dims_[ndim - 3] : pre;
+        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        auto height = dims_[ndim - 2];
+        auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
 
         uint32_t row_pitch = width * 4 * sizeof(T);

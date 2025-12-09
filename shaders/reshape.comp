@@ -12,49 +12,92 @@ layout(push_constant) uniform reshapeBuffer {
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+
 void main()
 {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
 
-    // Output dimensions
     int W_out = uReshapePara.outShape.w;
     int H_out = uReshapePara.outShape.z;
-    int Cout = uReshapePara.outShape.y;
-    int Nout = uReshapePara.outShape.x;
+    int Cout  = uReshapePara.outShape.y;
+    int Nout  = uReshapePara.outShape.x;
 
-    // Input dimensions
     int W_in = uReshapePara.inShape.w;
     int H_in = uReshapePara.inShape.z;
-    int Cin = uReshapePara.inShape.y;
-    int Nin = uReshapePara.inShape.x;
+    int Cin  = uReshapePara.inShape.y;
+    int Nin  = uReshapePara.inShape.x;
 
-    // Global ID for output
-    int out_n = gid.y / H_out; // Batch index
-    int out_c4 = gid.z; // Channel group index (Cout4)
-    int out_y = gid.y % H_out; // Y-coordinate in output
-    int out_x = gid.x; // X-coordinate in output
+    int out_c4 = gid.z;
+    int out_y = gid.y;
+    int out_x = gid.x;
 
-    if (out_n >= Nout || out_c4 >= (Cout + 3) / 4 || out_y >= H_out || out_x >= W_out) {
-        return; // Out of bounds
+    if (out_x >= W_out || out_c4 >= (Cout + 3) / 4) return;
+
+    int out_n = out_y / H_out;
+    int out_h = out_y % H_out;
+
+    if (out_n >= Nout || out_h >= H_out) return;
+
+    int out_c_base = out_c4 * 4;
+
+    uint total_in = uint(Nin) * uint(Cin) * uint(H_in) * uint(W_in);
+
+    // Recompute for base channel
+    uint linear_idx0 = uint(((out_n * Cout + out_c_base) * H_out + out_h) * W_out + out_x);
+
+    vec4 result = vec4(0.0);
+    bool valid[4];
+    vec4 fetched[4];
+
+    // We need to fetch up to 4 consecutive channels, but they may span different c4 groups!
+    // However, since we're at c_base = c4*4, the 4 channels are in the same c4 group.
+    // So we can fetch one texel and extract components.
+
+    // We must avoid reading OOB channels.
+    // fetch the input texel that contains out_c, out_c+1, etc.
+
+    // Simpler: since output c4 corresponds to 4 consecutive logical channels,
+    // and reshape preserves order, these 4 channels map to 4 consecutive input channels,
+    // which belong to either 1 or 2 input c4 groups.
+
+    // However, to keep it simple and efficient, assume that both input and output
+    // use the same packing (which they should in a reshape).
+
+    // So: the 4 output channels starting at out_c correspond to 4 input channels
+    // starting at some in_c_start, which is also aligned to c4 boundary? Not necessarily!
+
+    // This is complex. The robust way: fetch each channel individually, then pack.
+
+    // Given performance is secondary to correctness here, we do:
+
+    for (int i = 0; i < 4; ++i) {
+        int oc = out_c_base + i;
+        if (oc >= Cout) {
+            result[i] = 0.0;
+            continue;
+        }
+
+        uint li = uint(((out_n * Cout + oc) * H_out + out_h) * W_out + out_x);
+        if (li >= total_in) {
+            result[i] = 0.0;
+            continue;
+        }
+
+        uint in_n_i = li / (uint(Cin) * uint(H_in) * uint(W_in));
+        uint rem_i  = li % (uint(Cin) * uint(H_in) * uint(W_in));
+        uint in_c_i = rem_i / (uint(H_in) * uint(W_in));
+        rem_i = rem_i % (uint(H_in) * uint(W_in));
+        uint in_h_i = rem_i / uint(W_in);
+        uint in_w_i = rem_i % uint(W_in);
+
+        int img_x = int(in_w_i);
+        int img_y = int(in_n_i * H_in + in_h_i);
+        int img_z = int(in_c_i / 4);
+        int comp  = int(in_c_i % 4);
+
+        vec4 val = texelFetch(uInput, ivec3(img_x, img_y, img_z), 0);
+        result[i] = val[comp];
     }
 
-    // Compute the corresponding input index
-    int out_c = out_c4 * 4; // Expand channel group
-    int out_idx = ((out_n * Cout + out_c) * H_out + out_y) * W_out + out_x;
-
-    int in_n = out_idx / (Cin * H_in * W_in);
-    int in_rem = out_idx % (Cin * H_in * W_in);
-    int in_c = in_rem / (H_in * W_in);
-    int in_rem2 = in_rem % (H_in * W_in);
-    int in_y = in_rem2 / W_in;
-    int in_x = in_rem2 % W_in;
-
-    int in_c4 = in_c / 4;
-    int in_c4_rem = in_c % 4;
-
-    // Fetch the input value
-    vec4 value = texelFetch(uInput, ivec3(in_x, in_y, in_c4), 0);
-
-    // Write to the output
-    imageStore(uOutput, gid, value);
+    imageStore(uOutput, gid, result);
 }

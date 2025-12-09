@@ -50,6 +50,7 @@ class Concat : public Operator {
         if (axis_ < 0) {
             axis_ = rank + axis_;
         }
+        assert(rank >= 3);
         std::vector<int> out_shape = inputs[0]->getShape();
         for (size_t i = 1; i < inputs.size(); i++) {
             auto shape = inputs[i]->getShape();
@@ -62,7 +63,6 @@ class Concat : public Operator {
                 output->resize(out_shape);
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            auto sh = output->getShape();
             objs_.emplace_back(output_image);
         });
         auto output_image = std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
@@ -72,67 +72,83 @@ class Concat : public Operator {
                 using T = decltype(dummy);
                 auto input = core::as_tensor<T>(in);
                 auto input_image = input->as_input_image(m_dev_, m_cmd_);
-                auto input_shape = in->getShape();
-                if (axis_ == 1 && (offset % 4 == 0)) {
-                    int c = input_shape[1];
+                auto inGPUshape = input->getGPUShape();
+                if (axis_ + 4 - rank == 1 && (offset % 4 == 0)) {
                     // assume they can be divided by 4
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {0, 0, 0}, offset / 4);
-                    offset += c;
-                } else if (axis_ == 0) {
-                    int n = input_shape[0];
-                    int h = input_shape[2];
+                    offset += in->get_channel();
+                } else if (axis_ + 4 - rank == 0) {
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {0, offset, 0}, 0);
-                    offset += n * h;
-                } else if (axis_ == 3) {
-                    int w = input_shape[3];
+                    offset += inGPUshape[1];
+                } else if (axis_ + 4 - rank == 3) {
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {offset, 0, 0}, 0);
-                    offset += w;
-                } else if (axis_ == 2) {
+                    offset += inGPUshape[0];
+                } else if (axis_ + 4 - rank == 2) {
                     if (objs_.size() == 2) {
                         objs_.pop_back();
                     }
                     objs_.emplace_back(input_image);
-                    int h = input_shape[2];
                     concat::ConcatParam para = {};
-                    for (size_t j = 0; j < 4; j++) {
-                        para.inShape[j] = input_shape[j];
-                        para.outShape[j] = out_shape[j];
+                    auto input_shape = in->getShape();
+                    if (in->num_dims() == 4) {
+                        for (size_t j = 0; j < 4; j++) {
+                            para.inShape[j] = input_shape[j];
+                            para.outShape[j] = out_shape[j];
+                        }
+                    } else if (in->num_dims() == 3) {
+                        para.inShape[0] = 1;
+                        para.inShape[1] = input_shape[0];
+                        para.inShape[2] = input_shape[1];
+                        para.inShape[3] = input_shape[2];
+                        para.outShape[0] = 1;
+                        para.outShape[1] = out_shape[0];
+                        para.outShape[2] = out_shape[1];
+                        para.outShape[3] = out_shape[2];
                     }
                     para.offset[0] = 0;
                     para.offset[1] = 0;
                     para.offset[2] = offset;
                     para.offset[3] = 0;
-                    para.axis = axis_;
-                    offset += h;
-                    submit(&para, UP_DIV(input_shape[3], 16),
-                           UP_DIV(input_shape[0] * input_shape[2], 16),
-                           UP_DIV(input_shape[1], 4));
-                } else if (axis_ == 1) {
+                    para.axis = 2;
+                    offset += in->get_height();
+                    submit(&para, UP_DIV(inGPUshape[0], 16),
+                           UP_DIV(inGPUshape[1], 16), inGPUshape[2]);
+                } else if (axis_ + 4 - rank == 1) {
                     if (objs_.size() == 2) {
                         objs_.pop_back();
                     }
                     objs_.emplace_back(input_image);
-                    int c = input_shape[1];
+                    auto input_shape = in->getShape();
                     concat::ConcatParam para = {};
-                    for (size_t j = 0; j < 4; j++) {
-                        para.inShape[j] = input_shape[j];
-                        para.outShape[j] = out_shape[j];
+                    if (in->num_dims() == 4) {
+                        for (size_t j = 0; j < 4; j++) {
+                            para.inShape[j] = input_shape[j];
+                            para.outShape[j] = out_shape[j];
+                        }
+                    } else if (in->num_dims() == 3) {
+                        para.inShape[0] = 1;
+                        para.inShape[1] = input_shape[0];
+                        para.inShape[2] = input_shape[1];
+                        para.inShape[3] = input_shape[2];
+                        para.outShape[0] = 1;
+                        para.outShape[1] = out_shape[0];
+                        para.outShape[2] = out_shape[1];
+                        para.outShape[3] = out_shape[2];
                     }
                     para.offset[0] = 0;
                     para.offset[1] = offset;
                     para.offset[2] = 0;
                     para.offset[3] = 0;
-                    para.axis = axis_;
-                    offset += c;
-                    submit(&para, UP_DIV(input_shape[3], 16),
-                           UP_DIV(input_shape[0] * input_shape[2], 16),
-                           UP_DIV(input_shape[1], 4));
+                    para.axis = 1;
+                    offset += in->get_channel();
+                    submit(&para, UP_DIV(inGPUshape[0], 16),
+                           UP_DIV(inGPUshape[1], 16), inGPUshape[2]);
                 }
             });
         }

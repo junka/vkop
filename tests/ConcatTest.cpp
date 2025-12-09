@@ -14,9 +14,7 @@ using vkop::ops::Concat;
 namespace {
 void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
             std::vector<float> &output, int axis) {
-
     size_t num_inputs = inputs.size();
-
     std::vector<int> output_shape = inputs[0]->getShape();
     for (size_t i = 1; i < num_inputs; ++i) {
         output_shape[axis] += inputs[i]->getShape()[axis];
@@ -25,7 +23,7 @@ void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
     size_t output_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<>());
     output.resize(output_size);
 
-    int ndim = 4;
+    int ndim = inputs[0]->num_dims();
     std::vector<size_t> out_strides(ndim);
     out_strides[ndim - 1] = 1;
     for (int i = ndim - 2; i >= 0; --i) {
@@ -77,7 +75,7 @@ public:
     std::shared_ptr<Tensor<float>> input2;
     std::shared_ptr<Tensor<float>> input3;
     std::vector<float> expectedOutput;
-    int axis_ = 1;
+    int axis_ = 0;
 
     std::unordered_map<std::string, std::string> attributes = {
         {"axis", std::to_string(axis_)}
@@ -89,13 +87,13 @@ private:
     void initTestdata()
     {
         std::vector<int> t1 = {
-            2, 3, 2, 4
+            3, 2, 4
         };
         std::vector<int> t2 = {
-            2, 1, 2, 4
+            1, 2, 4
         };
         std::vector<int> t3 = {
-            2, 4, 2, 4
+            4, 2, 4
         };
 
 
@@ -107,7 +105,7 @@ private:
         input3->reserveOnCPU();
 
         std::vector<int> to = {
-            2, 8, 2, 4
+            8, 2, 4
         };
 
         std::random_device rd{};
@@ -124,6 +122,7 @@ private:
             (*input3)[i] = input_dist(gen);
         }
         concat({input1, input2, input3}, expectedOutput, axis_);
+#if 0
         printf("=====================\n");
         for (int n = 0; n < t1[0]; n++) {
             printf("[\n");
@@ -141,7 +140,8 @@ private:
                 printf("]\n");
             }
             printf("]\n");
-        }printf("=====================\n");
+        }
+        printf("=====================\n");
         for (int n = 0; n < t2[0]; n++) {
             printf("[\n");
             for (int c = 0; c < t2[1]; c++) {
@@ -195,6 +195,7 @@ private:
             }
             printf("]\n");
         }
+#endif
     }
 };
 }

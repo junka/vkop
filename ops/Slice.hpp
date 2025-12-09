@@ -42,13 +42,15 @@ class Slice : public Operator {
                          const std::vector<T> &starts,
                          const std::vector<T> &ends, const std::vector<T> &axes,
                          const std::vector<T> &steps) {
-        assert(input_shape.size() == 4);
-        const int dims = 4;
+        assert(input_shape.size() >= 3);
+        const int dims = input_shape.size();
         std::vector<std::vector<int>> ret;
 
         std::vector<T> norm_axes = axes;
         if (norm_axes.empty()) {
-            norm_axes = {0, 1, 2, 3};
+            for (int i = 0; i < dims; ++i) {
+                norm_axes.push_back(i);
+            }
         }
 
         for (auto &ax : norm_axes) {
@@ -133,6 +135,7 @@ class Slice : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         auto inshape = inputs[0]->getShape();
+        auto rank = inputs[0]->num_dims();
         std::vector<std::vector<int>> out_size;
 
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
@@ -145,14 +148,22 @@ class Slice : public Operator {
             if (inputs.size() > 3) {
                 axes = core::as_tensor<T>(inputs[3]);
             } else {
-                axes = std::make_shared<core::Tensor<T>>(4);
-                axes->fillToCPU(std::vector<T>{0, 1, 2, 3});
+                axes = std::make_shared<core::Tensor<T>>(rank);
+                std::vector<T> axes_data(rank);
+                for (int i = 0; i < rank; i++) {
+                    axes_data[i] = i;
+                }
+                axes->fillToCPU(axes_data);
             }
             if (inputs.size() > 4) {
                 steps = core::as_tensor<T>(inputs[4]);
             } else {
-                steps = std::make_shared<core::Tensor<T>>(4);
-                steps->fillToCPU(std::vector<T>{1, 1, 1, 1});
+                steps = std::make_shared<core::Tensor<T>>(rank);
+                std::vector<T> step_data(rank);
+                for (int i = 0; i < rank; i++) {
+                    step_data[i] = 1;
+                }
+                steps->fillToCPU(step_data);
             }
 
             out_size =
@@ -180,25 +191,41 @@ class Slice : public Operator {
         });
 
         auto outshape = outputs[0]->getShape();
+        auto outGPUshape = outputs[0]->getGPUShape();
+        auto inGPUshape = inputs[0]->getGPUShape();
         slice::GpuSliceParam param;
-        param.inImgSize[0] = inshape[3];
-        param.inImgSize[1] = inshape[2] * inshape[0];
-        param.inImgSize[2] = UP_DIV(inshape[1], 4);
+        param.inImgSize[0] = inGPUshape[0];
+        param.inImgSize[1] = inGPUshape[1];
+        param.inImgSize[2] = inGPUshape[2];
         param.inImgSize[3] = 1;
-        param.outImgSize[0] = outshape[3];
-        param.outImgSize[1] = outshape[2] * outshape[0];
-        param.outImgSize[2] = UP_DIV(outshape[1], 4);
+        param.outImgSize[0] = outGPUshape[0];
+        param.outImgSize[1] = outGPUshape[1];
+        param.outImgSize[2] = outGPUshape[2];
         param.outImgSize[3] = 1;
-        for (int i = 0; i < 4; i++) {
-            param.inShape[i] = inshape[i];
-            param.outShape[i] = out_size[0][i];
-            param.start[i] = out_size[1][i];
-            param.end[i] = out_size[2][i];
-            param.step[i] = out_size[3][i];
+        if (rank == 4) {
+            for (int i = 0; i < 4; i++) {
+                param.inShape[i] = inshape[i];
+                param.outShape[i] = out_size[0][i];
+                param.start[i] = out_size[1][i];
+                param.end[i] = out_size[2][i];
+                param.step[i] = out_size[3][i];
+            }
+        } else if (rank == 3) {
+            param.inShape[0] = 1;
+            param.outShape[0] = 1;
+            param.start[0] = 0;
+            param.end[0] = 1;
+            param.step[0] = 1;
+            for (int i = 0; i < 3; i++) {
+                param.inShape[i + 1] = inshape[i];
+                param.outShape[i + 1] = out_size[0][i];
+                param.start[i + 1] = out_size[1][i];
+                param.end[i + 1] = out_size[2][i];
+                param.step[i + 1] = out_size[3][i];
+            }
         }
-        submit(&param, UP_DIV(out_size[0][3], 16),
-               UP_DIV(out_size[0][2] * out_size[0][0], 16),
-               UP_DIV(out_size[0][1], 4));
+        submit(&param, UP_DIV(outGPUshape[0], 16), UP_DIV(outGPUshape[1], 16),
+               outGPUshape[2]);
     }
 };
 

@@ -105,12 +105,12 @@ std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
 class SliceTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 6, 4, 4
+        6, 4, 4
     };
     const std::vector<int64_t> starts = {0, 2};
-    const std::vector<int64_t> ends = {2, 4};
+    const std::vector<int64_t> ends = {2, 3};
     const std::vector<int64_t> steps = {1, 2};
-    const std::vector<int64_t> axes = {1, 3};
+    const std::vector<int64_t> axes = {0, 2};
 
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<int64_t>> starts_;

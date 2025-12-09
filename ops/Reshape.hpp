@@ -2,6 +2,8 @@
 #ifndef OPS_RESHAPE_HPP_
 #define OPS_RESHAPE_HPP_
 
+#include <numeric>
+
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
 
@@ -49,24 +51,44 @@ class Reshape : public Operator {
         assert(shape->num_dims() == 1);
         int n = shape->num_elements();
         assert(n >= 3);
-        std::vector<int> dim(4);
-        dim[3] = (*shape)[n - 1];
-        dim[2] = (*shape)[n - 2];
-        dim[1] = (*shape)[n - 3];
-        auto total = inshape[0] * inshape[1] * inshape[2] * inshape[3];
-        if (n == 3) {
-            dim[0] = 1;
-        } else if (n == 4) {
-            dim[0] = (*shape)[0];
+        std::vector<int> dim(n);
+        for (int i = 0; i < n; i++) {
+            dim[i] = (*shape)[i];
         }
-        if (dim[3] == -1) {
-            dim[3] = total / dim[2] / dim[1] / dim[0];
-        }
-        for (int i = 0; i < 4; i++) {
-            if (!allowzero_) {
+        auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
+                                     std::multiplies<int>());
+        for (int i = 0; i < n; i++) {
+            if (!allowzero_ && dim[i] == 0) {
                 dim[i] = inshape[i];
             }
         }
+        for (int i = 0; i < n; i++) {
+            if (dim[i] != 0 && dim[i] != -1)
+                total = total / dim[i];
+        }
+        for (int i = 0; i < n; i++) {
+            if (dim[i] == -1)
+                dim[i] = total;
+        }
+
+        bool noop = false;
+        if (inshape.size() == 4 && dim.size() == 3) {
+            if (inshape[0] == 1 && inshape[1] == dim[0] &&
+                inshape[2] == dim[1] && inshape[3] == dim[2]) {
+                noop = true;
+            }
+        } else if (inshape.size() == 3 && dim.size() == 4) {
+            if (dim[0] == 1 && dim[1] == inshape[0] && dim[2] == inshape[1] &&
+                dim[3] == inshape[2]) {
+                noop = true;
+            }
+        } else if (inshape.size() == 4 && dim.size() == 4) {
+            if (inshape[0] == dim[0] && inshape[1] == dim[1] &&
+                inshape[2] == dim[2] && inshape[3] == dim[3]) {
+                noop = true;
+            }
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -83,22 +105,52 @@ class Reshape : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        auto outshape = outputs[0]->getShape();
-        reshape::GpuReshapeParam param;
-        param.inImgSize[0] = inshape[3];
-        param.inImgSize[1] = inshape[2] * inshape[0];
-        param.inImgSize[2] = UP_DIV(inshape[1], 4);
-        param.inImgSize[3] = 1;
-        param.outImgSize[0] = outshape[3];
-        param.outImgSize[1] = outshape[2] * outshape[0];
-        param.outImgSize[2] = UP_DIV(outshape[1], 4);
-        param.outImgSize[3] = 1;
-        for (int i = 0; i < 4; i++) {
-            param.inShape[i] = inshape[i];
-            param.outShape[i] = dim[i];
+        if (noop) {
+            // copy directly, could be optimized by preprocess/compiler
+            auto output_image =
+                std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
+            auto input_image = std::dynamic_pointer_cast<VulkanImage>(objs_[1]);
+            input_image->transferReadBarrier(m_cmd_->get());
+            output_image->copyImageToImage(m_cmd_->get(), input_image,
+                                           {0, 0, 0}, 0);
+            return;
         }
-        submit(&param, UP_DIV(dim[3], 16), UP_DIV(dim[2] * dim[0], 16),
-               UP_DIV(dim[1], 4));
+
+        auto outGPUshape = outputs[0]->getGPUShape();
+        auto inGPUshape = inputs[0]->getGPUShape();
+        reshape::GpuReshapeParam param;
+        param.inImgSize[0] = inGPUshape[0];
+        param.inImgSize[1] = inGPUshape[1];
+        param.inImgSize[2] = inGPUshape[2];
+        param.inImgSize[3] = 1;
+        param.outImgSize[0] = outGPUshape[0];
+        param.outImgSize[1] = outGPUshape[1];
+        param.outImgSize[2] = outGPUshape[2];
+        param.outImgSize[3] = 1;
+        if (inshape.size() == 4) {
+            param.inShape[0] = inshape[0];
+            param.inShape[1] = inshape[1];
+            param.inShape[2] = inshape[2];
+            param.inShape[3] = inshape[3];
+        } else if (inshape.size() == 3) {
+            param.inShape[0] = 1;
+            param.inShape[1] = inshape[0];
+            param.inShape[2] = inshape[1];
+            param.inShape[3] = inshape[2];
+        }
+        if (n == 4) {
+            param.outShape[0] = dim[0];
+            param.outShape[1] = dim[1];
+            param.outShape[2] = dim[2];
+            param.outShape[3] = dim[3];
+        } else if (n == 3) {
+            param.outShape[0] = 1;
+            param.outShape[1] = dim[0];
+            param.outShape[2] = dim[1];
+            param.outShape[3] = dim[2];
+        }
+        submit(&param, UP_DIV(outGPUshape[0], 16), UP_DIV(outGPUshape[1], 16),
+               outGPUshape[2]);
     }
 
     int allowzero_ = 0;

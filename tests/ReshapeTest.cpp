@@ -12,7 +12,7 @@ namespace {
 class ReshapeTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 6, 4, 4
+        1, 8, 4, 4
     };
     const std::unordered_map<std::string, std::string> param = {
         {"allowzero ", "0"}
@@ -41,9 +41,27 @@ private:
             expectedOutput[i] = a;
         }
         (*shape)[0] = 1;
-        (*shape)[1] = 3;
+        (*shape)[1] = 4;
         (*shape)[2] = 8;
         (*shape)[3] = 4;
+        printf("=====================\n");
+        for (int n = 0; n < input_shape_[0]; n++) {
+            printf("[\n");
+            for (int c = 0; c < input_shape_[1]; c++) {
+                printf("[\n");
+                for (int h = 0; h < input_shape_[2]; h++) {
+                    printf("[");
+                    for (int w = 0; w < input_shape_[3]; w++) {
+                        int idx = n * input_shape_[1] * input_shape_[2] * input_shape_[3] + c * input_shape_[2] * input_shape_[3] +
+                                  h * input_shape_[3] + w;
+                        printf("%f ", (*input)[idx]);
+                    }
+                    printf("]\n");
+                }
+                printf("]\n");
+            }
+            printf("]\n");
+        }
     }
 };
 }
