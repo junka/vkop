@@ -11,7 +11,7 @@ using vkop::tests::TestCase;
 using vkop::ops::Slice;
 
 namespace {
-
+#if 1
 std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
     const std::vector<int64_t>& starts, const std::vector<int64_t>& ends,
     const std::vector<int64_t>& steps, const std::vector<int64_t>& axes) {
@@ -23,8 +23,7 @@ std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
     }
 
     auto output_shape = Slice::CalculateOutputShape<int64_t>(
-        input_shape,
-        starts, ends, axes, steps
+        input_shape, starts, ends, axes, steps
     );
     for (size_t i = 0; i < rank; ++i)
         printf("%d ", output_shape[0][i]);
@@ -101,6 +100,7 @@ std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
 
     return output;
 }
+#endif
 
 class SliceTest : public TestCase {
 public:
@@ -117,7 +117,7 @@ public:
     std::shared_ptr<Tensor<int64_t>> ends_;
     std::shared_ptr<Tensor<int64_t>> axes_;
     std::shared_ptr<Tensor<int64_t>> steps_;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     SliceTest():TestCase("Slice") {
         initTestdata();
@@ -144,7 +144,13 @@ private:
             auto a = input_dist(gen);
             (*input)[i] = a;
         }
-        expectedOutput = slice_cpu(input, starts, ends, steps, axes);
+        std::vector<std::vector<int>> output_shape = Slice::CalculateOutputShape<int64_t>(
+                input_shape_, starts, ends, axes, steps
+            );
+        std::vector<int> oshape = output_shape[0];
+        output = std::make_shared<Tensor<float>>(oshape);
+        auto result = slice_cpu(input, starts, ends, steps, axes);
+        output->fillToCPU(result);
     }
 };
 }
@@ -163,7 +169,7 @@ int main()
         slice_test.axes_,
         slice_test.steps_,
     };
-    if (!slice_test.run_test(inputs, slice_test.expectedOutput)) {
+    if (!slice_test.run_test<float>(inputs, {slice_test.output})) {
         return -1;
     }
     return 0;

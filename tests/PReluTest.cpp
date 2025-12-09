@@ -26,7 +26,7 @@ public:
     };
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     PReluTest():TestCase("PRelu") {
         initTestdata();
@@ -36,10 +36,11 @@ private:
     {
         inputa = std::make_shared<Tensor<float>>(input_shape_);
         inputb = std::make_shared<Tensor<float>>(input_shape_);
+        output = std::make_shared<Tensor<float>>(input_shape_);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
+        output->reserveOnCPU();
 
-        expectedOutput.resize(inputa->num_elements());
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -51,7 +52,7 @@ private:
             auto b = inputb_dist(gen);
             (*inputa)[i] = a;
             (*inputb)[i] = b;
-            expectedOutput[i] = reference_prelu(a, b);
+            (*output)[i] = reference_prelu(a, b);
         }
     }
 };
@@ -62,7 +63,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     PReluTest prelutest;
-    if (!prelutest.run_test({prelutest.inputa, prelutest.inputb}, prelutest.expectedOutput)) {
+    if (!prelutest.run_test<float>({prelutest.inputa, prelutest.inputb}, {prelutest.output})) {
         return -1;
     }
 

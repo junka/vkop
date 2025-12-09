@@ -103,7 +103,7 @@ public:
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> weight;
     std::shared_ptr<Tensor<float>> bias;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     LayerNormTest():TestCase("LayerNorm") {
         initTestdata();
@@ -184,7 +184,8 @@ private:
         weight->fillToCPU(torch_weight);
         bias = std::make_shared<Tensor<float>>(normalized_shape_);
         bias->fillToCPU(torch_bias);
-        expectedOutput = torch_output;
+        output = std::make_shared<Tensor<float>>(output_shape);
+        output->fillToCPU(torch_output);
     }
 };
 }
@@ -210,7 +211,7 @@ int main() {
                               j * lntest.input_shape_[2] * lntest.input_shape_[3] +
                               k * lntest.input_shape_[3] + l;
                     printf("%.4f, ", bout[idx]);
-                    if (fabs(bout[idx] - lntest.expectedOutput[idx]) > 1e-3) {
+                    if (fabs(bout[idx] - (*lntest.output)[idx]) > 1e-3) {
                         printf("  <--mismatch ");
                     }
                 }
@@ -222,7 +223,7 @@ int main() {
     }
 #endif
 
-    if (!lntest.run_test({lntest.input, lntest.weight, lntest.bias}, lntest.expectedOutput,
+    if (!lntest.run_test<float>({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
         [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *batchnorm_op = dynamic_cast<LayerNorm *>(op.get());
             if (!batchnorm_op) {

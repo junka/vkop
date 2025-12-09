@@ -16,7 +16,7 @@ using vkop::tests::TestCase;
 using vkop::ops::Maxpool2d;
 
 namespace {
-    void maxpool2d_reference(const std::shared_ptr<Tensor<float>>& input, float *output, std::vector<int> shape,
+    void maxpool2d_reference(const std::shared_ptr<Tensor<float>>& input, std::shared_ptr<Tensor<float>>& output, std::vector<int> shape,
                        int kernel_size, int stride_size, int pad_size) {
         int batch = shape[0];
         int channels = shape[1];
@@ -51,7 +51,7 @@ namespace {
                             }
                         }
                         int output_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
-                        output[output_idx] = max_val;
+                        (*output)[output_idx] = max_val;
                     }
                 }
             }
@@ -61,7 +61,7 @@ namespace {
 class MaxpoolTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
     int stride_ = 1;
     int kernel_size_ = 4;
     int pad_ = 1;
@@ -83,8 +83,9 @@ private:
     void initTestdata() {
         std::vector<int> t = {3, 9, 8, 8};
         input = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
-        expectedOutput.resize(input->num_elements());
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -94,7 +95,7 @@ private:
             (*input)[i] = input_dist(gen);
         }
 
-        maxpool2d_reference(input, expectedOutput.data(), t, kernel_size_, stride_, pad_);
+        maxpool2d_reference(input, output, t, kernel_size_, stride_, pad_);
     }
 };
 }
@@ -104,7 +105,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     MaxpoolTest maxtest;
-    if (!maxtest.run_test({maxtest.input}, maxtest.expectedOutput,
+    if (!maxtest.run_test<float>({maxtest.input}, {maxtest.output},
         [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
             if (!maxpool_op) {

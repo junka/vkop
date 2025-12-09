@@ -48,7 +48,7 @@ public:
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> mean;
     std::shared_ptr<Tensor<float>> var;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     BatchNorm2dTest():TestCase("BatchNorm") {
         initTestdata();
@@ -64,10 +64,7 @@ private:
         shapes.push_back(num_feature);
         shapes.push_back(num_feature);
         shapes.push_back(num_feature);
-        // input = std::make_shared<Tensor<float>>(input_shape_);
 
-        // auto *input_ptr = input->data();
-        // expectedOutput.resize(input->num_elements());
 
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("batch_norm", shapes, param);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
@@ -133,7 +130,8 @@ private:
         mean->fillToCPU(torch_mean);
         var = std::make_shared<Tensor<float>>(num_feature);
         var->fillToCPU(torch_var);
-        expectedOutput = torch_output;
+        output = std::make_shared<Tensor<float>>(output_shape);
+        output->fillToCPU(torch_output);
     }
 };
 }
@@ -163,7 +161,7 @@ int main() {
                               k * bntest.input_shape_[3] +
                               l;
                     printf("%.4f, ", bout[idx]);
-                    if (fabs(bout[idx] - bntest.expectedOutput[idx]) > 1e-3) {
+                    if (fabs(bout[idx] - (*bntest.output)[idx]) > 1e-3) {
                         printf("  <--mismatch ");
                     }
                 }
@@ -175,7 +173,7 @@ int main() {
     }
 #endif
 
-    if (!bntest.run_test({bntest.input, bntest.mean, bntest.var}, bntest.expectedOutput,
+    if (!bntest.run_test<float>({bntest.input, bntest.mean, bntest.var}, {bntest.output},
         [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *batchnorm_op = dynamic_cast<BatchNorm2d *>(op.get());
             if (!batchnorm_op) {

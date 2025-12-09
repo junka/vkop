@@ -12,14 +12,14 @@
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
-void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, float *output, int M, int N, int K) {
+void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, std::shared_ptr<Tensor<float>> &output, int M, int N, int K) {
     for (int i = 0; i < M; i++) {
         for (int j = 0; j < N; j++) {
             float sum = 0.0F;
             for (int k = 0; k < K; k++) {
                 sum += (*inputa)[i * K + k] * (*inputb)[k * N + j];
             }
-            output[i * N + j] = sum;
+            (*output)[i * N + j] = sum;
         }
     }
 }
@@ -30,7 +30,7 @@ class MatMulTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     MatMulTest() : TestCase("MatMul") {
         initTestdata();
@@ -42,10 +42,11 @@ private:
         std::vector<int> t2 = {8, 6};
         inputa = std::make_shared<Tensor<float>>(t1);
         inputb = std::make_shared<Tensor<float>>(t2);
+        std::vector<int> to = {t1[0], t2[1]};
+        output = std::make_shared<Tensor<float>>(to);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
-
-        expectedOutput.resize(t1[0] * t2[1]);
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -76,12 +77,12 @@ private:
             printf("\n");
         }
 
-        reference_matmul(inputa, inputb, expectedOutput.data(), t1[0], t2[1], t1[1]);
+        reference_matmul(inputa, inputb, output, t1[0], t2[1], t1[1]);
         printf("\n");
         printf("Output:\n");
         for (int i = 0; i < t1[0]; i++) {
             for (int j = 0; j < t2[1]; j++) {
-                printf("%f ", expectedOutput[i * t2[1] + j]);
+                printf("%f ", (*output)[i * t2[1] + j]);
             }
             printf("\n");
         }
@@ -95,7 +96,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     MatMulTest mmtest;
-    if (!mmtest.run_test({mmtest.inputa, mmtest.inputb}, mmtest.expectedOutput)) {
+    if (!mmtest.run_test<float>({mmtest.inputa, mmtest.inputb}, {mmtest.output})) {
         return -1;
     }
 

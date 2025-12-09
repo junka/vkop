@@ -21,7 +21,7 @@ public:
     };
     std::shared_ptr<Tensor<T>> inputa;
     std::shared_ptr<Tensor<T>> inputb;
-    std::vector<T> expectedOutput;
+    std::shared_ptr<Tensor<T>> output;
 
     AddTest():TestCase("Add") {
         initTestdata();
@@ -33,8 +33,9 @@ private:
         inputb = std::make_shared<Tensor<T>>(input_shape_);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
+        output = std::make_shared<Tensor<float>>(input_shape_);
+        output->reserveOnCPU();
 
-        expectedOutput.resize(inputa->num_elements());
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
@@ -46,11 +47,11 @@ private:
             if (typeid(T) == typeid(uint16_t)) {
                 (*inputa)[i] = ITensor::fp32_to_fp16(a);
                 (*inputb)[i] = ITensor::fp32_to_fp16(b);
-                expectedOutput[i] = ITensor::fp32_to_fp16(a+b);
+                (*output)[i] = ITensor::fp32_to_fp16(a+b);
             } else {
                 (*inputa)[i] = a;
                 (*inputb)[i] = b;
-                expectedOutput[i] = a+b;
+                (*output)[i] = a+b;
             }
         }
     }
@@ -65,7 +66,7 @@ int main() {
 #else
     AddTest<float> addtest;
 #endif
-    if (!addtest.run_test({addtest.inputa, addtest.inputb}, addtest.expectedOutput)) {
+    if (!addtest.run_test<float>({addtest.inputa, addtest.inputb}, {addtest.output})) {
         return -1;
     }
 

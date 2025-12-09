@@ -15,7 +15,7 @@ class SubTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     SubTest():TestCase("Sub") {
         initTestdata();
@@ -28,10 +28,10 @@ private:
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
-
-        expectedOutput.resize(inputa->num_elements());
+        output->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -41,7 +41,7 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             (*inputa)[i] = inputa_dist(gen);
             (*inputb)[i] = inputa_dist(gen);
-            expectedOutput[i] = (*inputa)[i] - (*inputb)[i];
+            (*output)[i] = (*inputa)[i] - (*inputb)[i];
         }
     }
 };
@@ -52,7 +52,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     SubTest subtest;
-    if (!subtest.run_test({subtest.inputa, subtest.inputb}, subtest.expectedOutput)) {
+    if (!subtest.run_test<float>({subtest.inputa, subtest.inputb}, {subtest.output})) {
         return -1;
     }
 

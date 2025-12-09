@@ -150,7 +150,7 @@ public:
     };
 
     std::shared_ptr<Tensor<T>> input_data_;
-    std::vector<T> output_data_;
+    std::shared_ptr<Tensor<T>> output_data_;
 
     ResizeTest(): TestCase("Resize") {
         initTestData();
@@ -210,7 +210,8 @@ private:
         }
         input_data_ = std::make_shared<Tensor<float>>(input_shape_);
         input_data_->fillToCPU(torch_input);
-        output_data_ = torch_output;
+        output_data_ = std::make_shared<Tensor<float>>(output_shape);
+        output_data_->fillToCPU(torch_output);
 #if USE_CPP_REFER
         auto ret = reference_resize(input_data_, input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3],
                     resize_[0], resize_[1], mode_, align_corners_, cubic_coeff_a_);
@@ -244,7 +245,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", true);
     ResizeTest<float> rt;
 
-    if (!rt.run_test({rt.input_data_, nullptr, nullptr, nullptr}, rt.output_data_,
+    if (!rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
         [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *resize_op = dynamic_cast<Resize *>(op.get());
         if (!resize_op) {

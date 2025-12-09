@@ -19,7 +19,7 @@ public:
     };
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<int64_t>> shape;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     ReshapeTest():TestCase("Reshape") {
         initTestdata();
@@ -30,7 +30,12 @@ private:
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->reserveOnCPU();
         shape = std::make_shared<Tensor<int64_t>>(4);
-        expectedOutput.resize(input->num_elements());
+        (*shape)[0] = 1;
+        (*shape)[1] = 4;
+        (*shape)[2] = 8;
+        (*shape)[3] = 4;
+        output = std::make_shared<Tensor<float>>(shape->data());
+        output->reserveOnCPU();
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
@@ -38,12 +43,8 @@ private:
         for (int i = 0; i < input->num_elements(); i++) {
             auto a = input_dist(gen);
             (*input)[i] = a;
-            expectedOutput[i] = a;
+            (*output)[i] = a;
         }
-        (*shape)[0] = 1;
-        (*shape)[1] = 4;
-        (*shape)[2] = 8;
-        (*shape)[3] = 4;
         printf("=====================\n");
         for (int n = 0; n < input_shape_[0]; n++) {
             printf("[\n");
@@ -73,7 +74,7 @@ int main()
     Logger::getInstance().enableFileOutput("log", false);
 
     ReshapeTest reshape_test;
-    if (!reshape_test.run_test({reshape_test.input, reshape_test.shape}, reshape_test.expectedOutput)) {
+    if (!reshape_test.run_test<float>({reshape_test.input, reshape_test.shape}, {reshape_test.output})) {
         return -1;
     }
     return 0;

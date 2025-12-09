@@ -13,16 +13,12 @@ using vkop::ops::Concat;
 
 namespace {
 void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
-            std::vector<float> &output, int axis) {
+            std::shared_ptr<Tensor<float>> &output, int axis) {
     size_t num_inputs = inputs.size();
     std::vector<int> output_shape = inputs[0]->getShape();
     for (size_t i = 1; i < num_inputs; ++i) {
         output_shape[axis] += inputs[i]->getShape()[axis];
     }
-
-    size_t output_size = std::accumulate(output_shape.begin(), output_shape.end(), 1, std::multiplies<>());
-    output.resize(output_size);
-
     int ndim = inputs[0]->num_dims();
     std::vector<size_t> out_strides(ndim);
     out_strides[ndim - 1] = 1;
@@ -52,7 +48,7 @@ void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
                 }
                 out_idx += coord * out_strides[d];
             }
-            output[out_idx] = input_ptr[idx];
+            (*output)[out_idx] = input_ptr[idx];
 
             int carry = 1;
             for (int d = ndim - 1; d >= 0 && carry; --d) {
@@ -74,7 +70,7 @@ public:
     std::shared_ptr<Tensor<float>> input1;
     std::shared_ptr<Tensor<float>> input2;
     std::shared_ptr<Tensor<float>> input3;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
     int axis_ = 0;
 
     std::unordered_map<std::string, std::string> attributes = {
@@ -107,6 +103,8 @@ private:
         std::vector<int> to = {
             8, 2, 4
         };
+        output = std::make_shared<Tensor<float>>(to);
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -121,7 +119,7 @@ private:
         for (int i = 0; i < input3->num_elements(); i++) {
             (*input3)[i] = input_dist(gen);
         }
-        concat({input1, input2, input3}, expectedOutput, axis_);
+        concat({input1, input2, input3}, {output}, axis_);
 #if 0
         printf("=====================\n");
         for (int n = 0; n < t1[0]; n++) {
@@ -187,7 +185,7 @@ private:
                     for (int w = 0; w < to[3]; w++) {
                         int idx = n * to[1] * to[2] * to[3] + c * to[2] * to[3] +
                                   h * to[3] + w;
-                        printf("%f ", expectedOutput[idx]);
+                        printf("%f ", (*output)[idx]);
                     }
                     printf("]\n");
                 }
@@ -205,7 +203,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     ConcatTest cctest;
-    if (!cctest.run_test({cctest.input1, cctest.input2, cctest.input3}, cctest.expectedOutput, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
+    if (!cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Concat *>(op.get());
         if (!conv_op) {
             LOG_ERROR("Failed to cast operator to Conv2d");

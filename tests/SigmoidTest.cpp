@@ -14,7 +14,7 @@ namespace {
 class SigmoidTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     SigmoidTest():TestCase("Sigmoid") {
         initTestdata();
@@ -27,9 +27,9 @@ private:
         };
 
         input = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
-
-        expectedOutput.resize(input->num_elements());
+        output->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -37,7 +37,7 @@ private:
         std::normal_distribution<> input_dist{0.0F, 1.0F};
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
-            expectedOutput[i] = ((*input)[i] > 0) ? 1.0F / (1.0F + exp(-(*input)[i])) : exp((*input)[i]) / (1.0F + exp((*input)[i]));
+            (*output)[i] = ((*input)[i] > 0) ? 1.0F / (1.0F + exp(-(*input)[i])) : exp((*input)[i]) / (1.0F + exp((*input)[i]));
         }
     }
 };
@@ -48,7 +48,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     SigmoidTest sigest;
-    if (!sigest.run_test({sigest.input}, sigest.expectedOutput)) {
+    if (!sigest.run_test<float>({sigest.input}, {sigest.output})) {
         return -1;
     }
 

@@ -21,7 +21,7 @@ namespace {
     }
 
     template <typename T>
-    void transpose(const std::shared_ptr<Tensor<T>>& input, std::vector<float>& output, const std::vector<int>& perm) {
+    void transpose(const std::shared_ptr<Tensor<T>>& input, std::shared_ptr<Tensor<T>>& output, const std::vector<int>& perm) {
         const auto& in_shape = input->getShape();
         auto out_shape = transpose_shape(in_shape, perm);
 
@@ -39,7 +39,7 @@ namespace {
                         int new_c = perm[1] == 0 ? n : (perm[1] == 1 ? c : (perm[1] == 2 ? h : w));
                         int new_h = perm[2] == 0 ? n : (perm[2] == 1 ? c : (perm[2] == 2 ? h : w));
                         int new_w = perm[3] == 0 ? n : (perm[3] == 1 ? c : (perm[3] == 2 ? h : w));
-                        output[new_n * out_C * out_H * out_W + new_c * out_H * out_W + new_h * out_W + new_w] = 
+                        (*output)[new_n * out_C * out_H * out_W + new_c * out_H * out_W + new_h * out_W + new_w] = 
                             input->at(n * in_C * in_H * in_W + c * in_H * in_W + h * in_W + w);
                     }
                 }
@@ -59,7 +59,7 @@ public:
         {"perm", "[0,2,3,1]"}
     };
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     TransposeTest():TestCase("Transpose") {
         initTestdata();
@@ -69,7 +69,10 @@ private:
     {
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->reserveOnCPU();
-        expectedOutput.resize(input->num_elements());
+        auto out_shape = transpose_shape(input_shape_, perm_);
+        output = std::make_shared<Tensor<float>>(out_shape);
+        output->reserveOnCPU();
+
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
@@ -96,9 +99,8 @@ private:
             }
             printf("]\n");
         }
-        transpose(input, expectedOutput, perm_);
+        transpose(input, output, perm_);
         const auto& in_shape = input->getShape();
-        auto out_shape = transpose_shape(in_shape, perm_);
 
         printf("Output:\n");
         for (int n = 0; n < out_shape[0]; n++) {
@@ -110,7 +112,7 @@ private:
                     for (int w = 0; w < out_shape[3]; w++) {
                         int idx = n * out_shape[1] * out_shape[2] * out_shape[3] +
                                   c * out_shape[2] * out_shape[3] + h * out_shape[3] + w;
-                        printf("%f ", expectedOutput[idx]);
+                        printf("%f ", (*output)[idx]);
                     }
                     printf("]\n");
                 }
@@ -129,7 +131,7 @@ int main()
     Logger::getInstance().enableFileOutput("log", false);
 
     TransposeTest trans_test;
-    if (!trans_test.run_test({trans_test.input}, trans_test.expectedOutput, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
+    if (!trans_test.run_test<float>({trans_test.input}, {trans_test.output}, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *tran_op = dynamic_cast<Transpose *>(op.get());
             if (!tran_op) {
                 LOG_ERROR("Failed to cast operator to Transpose");

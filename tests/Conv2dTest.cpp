@@ -154,8 +154,8 @@ public:
     std::shared_ptr<Tensor<T>> weight_data_;
     std::shared_ptr<Tensor<T>> bias_data_;
 
-    std::shared_ptr<Tensor<T>> input_data_;
-    std::vector<T> output_data_;
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> output;
 
     Conv2dTest(): TestCase("Conv2d") {
         initTestData();
@@ -245,16 +245,17 @@ private:
             printf("%.4f, ", torch_bias[i]);
         }
 #endif
-        input_data_ = std::make_shared<Tensor<T>>(input_shape_);
-        input_data_->fillFP32ToCPU(torch_input);
-        output_data_.resize(torch_output.size());
+        input = std::make_shared<Tensor<T>>(input_shape_);
+        input->fillFP32ToCPU(torch_input);
+        output = std::make_shared<Tensor<T>>(output_shape);
+        output->fillFP32ToCPU(torch_output);
         if (typeid(T) == typeid(float)) {
             for (size_t i = 0; i < torch_output.size(); i++) {
-                output_data_[i] = torch_output[i];
+                (*output)[i] = torch_output[i];
             }
         } else {
             for (size_t i = 0; i < torch_output.size(); i++) {
-                output_data_[i] = vkop::core::ITensor::fp32_to_fp16(torch_output[i]);
+                (*output)[i] = vkop::core::ITensor::fp32_to_fp16(torch_output[i]);
             }
         }
         
@@ -280,7 +281,7 @@ private:
         int dilation_h = dilation_;
         int dilation_w = dilation_;
         std::vector<float> ref_output_data;
-        reference_conv2d(input_data_, weight_data_, bias_data_,
+        reference_conv2d(input, weight_data_, bias_data_,
                  ref_output_data, batch, ic, oc,
                  ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w,
                  dilation_h, dilation_w, group_);
@@ -317,7 +318,7 @@ int main() {
 #else
     Conv2dTest<float> ct;
 #endif
-    if (!ct.run_test({ct.input_data_, ct.weight_data_, ct.bias_data_}, ct.output_data_,
+    if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());
         if (!conv_op) {
@@ -325,7 +326,6 @@ int main() {
             return;
         }
         conv_op->setAttribute(ct.attributes);
-
     })) {
         return -1;
     }

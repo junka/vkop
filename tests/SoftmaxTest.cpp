@@ -116,7 +116,7 @@ class SoftmaxTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {12, 15, 8, 8};
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
     int axis_ = 1;
     const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
 
@@ -133,6 +133,7 @@ private:
         auto torch_output = torch_tensors[0];
         auto torch_input = torch_tensors[1];
         std::vector<int> output_shape = std::get<1>(k);
+
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 #if 1
         printf("\n===Input==============\n");
@@ -177,8 +178,8 @@ private:
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->fillToCPU(torch_input);
-        expectedOutput = torch_output;
-
+        output = std::make_shared<Tensor<float>>(output_shape);
+        output->fillToCPU(torch_output);
     }
 };
 }
@@ -216,7 +217,7 @@ int main() {
     }
 #endif
 
-    if (!softtest.run_test({softtest.input}, softtest.expectedOutput, 
+    if (!softtest.run_test<float>({softtest.input}, {softtest.output}, 
         [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *softmax_op = dynamic_cast<Softmax *>(op.get());
             if (!softmax_op) {

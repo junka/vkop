@@ -16,7 +16,7 @@ class PowTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     PowTest():TestCase("Pow") {
         initTestdata();
@@ -29,10 +29,10 @@ private:
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
-
-        expectedOutput.resize(inputa->num_elements());
+        output->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -42,7 +42,7 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             (*inputa)[i] = inputa_dist(gen);
             (*inputb)[i] = inputa_dist(gen);
-            expectedOutput[i] = std::pow((*inputa)[i], (*inputb)[i]);
+            (*output)[i] = std::pow((*inputa)[i], (*inputb)[i]);
         }
     }
 };
@@ -53,7 +53,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     PowTest powtest;
-    if (!powtest.run_test({powtest.inputa, powtest.inputb}, powtest.expectedOutput)) {
+    if (!powtest.run_test<float>({powtest.inputa, powtest.inputb}, {powtest.output})) {
         return -1;
     }
 

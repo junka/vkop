@@ -13,7 +13,8 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Gemm;
-void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, const std::shared_ptr<Tensor<float>> &inputc, float *output,
+void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb,
+        const std::shared_ptr<Tensor<float>> &inputc, std::shared_ptr<Tensor<float>> &output,
         int M, int N, int K, float alpha, float beta, bool transA, bool transB, bool has_bias) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -46,7 +47,7 @@ void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::sha
                 sum += beta * (*inputc)[i * N + j];
             }
 
-            output[i * N + j] = sum;
+            (*output)[i * N + j] = sum;
         }
     }
 }
@@ -58,7 +59,7 @@ public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
     std::shared_ptr<Tensor<float>> inputc;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     float alpha = 0.9F;
     float beta = 0.1F;
@@ -87,10 +88,11 @@ private:
         int n = transB ? t2[0] : t2[1];
         int k = ka;
         inputc = std::make_shared<Tensor<float>>(std::vector<int>{m, n});
-        expectedOutput.resize(t1[0] * t2[1]);
+        output = std::make_shared<Tensor<float>>(std::vector<int>{t1[0], t2[1]});
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
         inputc->reserveOnCPU();
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -131,12 +133,12 @@ private:
             printf("\n");
         }
 
-        reference_gemm(inputa, inputb, inputc, expectedOutput.data(), m, n, k, alpha, beta, transA, transB, true);
+        reference_gemm(inputa, inputb, inputc, output, m, n, k, alpha, beta, transA, transB, true);
         printf("\n");
         printf("Output:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", expectedOutput[i * n + j]);
+                printf("%f ", (*output)[i * n + j]);
             }
             printf("\n");
         }
@@ -150,7 +152,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     GemmTest gmtest;
-    if (!gmtest.run_test({gmtest.inputa, gmtest.inputb, gmtest.inputc}, gmtest.expectedOutput,
+    if (!gmtest.run_test<float>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
         [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *gemm_op = dynamic_cast<Gemm *>(op.get());
             if (!gemm_op) {

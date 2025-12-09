@@ -96,7 +96,7 @@ double erf(double x) {
 class ErfTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     ErfTest():TestCase("Erf") {
         initTestdata();
@@ -109,8 +109,8 @@ private:
         };
         input = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
-
-        expectedOutput.resize(input->num_elements());
+        output = std::make_shared<Tensor<float>>(t);
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -118,7 +118,7 @@ private:
         std::normal_distribution<> input_dist{-3.0F, 6.0F};
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
-            expectedOutput[i] = erf((*input)[i]);
+            (*output)[i] = erf((*input)[i]);
         }
     }
 };
@@ -129,7 +129,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     ErfTest erftest;
-    if (!erftest.run_test({erftest.input}, erftest.expectedOutput)) {
+    if (!erftest.run_test<float>({erftest.input}, {erftest.output})) {
         return -1;
     }
 

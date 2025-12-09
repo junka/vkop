@@ -79,13 +79,9 @@ T interpolate(T h, T w, const std::shared_ptr<Tensor<T>> &buffer, int offset, in
 }
 
 template <typename T>
-void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::shared_ptr<Tensor<T>> &grid, std::vector<T> &output,
+void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::shared_ptr<Tensor<T>> &grid, std::shared_ptr<Tensor<T>> &output,
                         int batch, int inHeight, int inWidth, int outHeight, int outWidth, int depth,
                         bool alignCorners) {
-    output.resize(batch * outHeight * outWidth * depth);
-
-    T *output_ptr = output.data();
-
     // 按照 NCHW 的顺序, HW 以output 为目标,
     // grid 的hw 和output是一致的
     // input不参与循环hw, 在每个NC的循环中, 直接整个图以HW尺寸输入,保证grid操作单个channel
@@ -107,7 +103,7 @@ void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::s
                     auto x = getPosition((*grid)[h_grid_offset + 2 * w + 0], inWidth, alignCorners);
                     auto y = getPosition((*grid)[h_grid_offset + 2 * w + 1], inHeight, alignCorners);
                     // 然后插值,得到的值输出
-                    output_ptr[h_output_offset+w] = interpolate(y, x, input, c_input_offset, inHeight, inWidth);
+                    (*output)[h_output_offset+w] = interpolate(y, x, input, c_input_offset, inHeight, inWidth);
                 }
             }
         }
@@ -118,7 +114,7 @@ class GridSampleTest: public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> grid;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     GridSampleTest(): TestCase("GridSample") {
         initTestdata();
@@ -139,8 +135,10 @@ private:
 
         input = std::make_shared<Tensor<float>>(batch, depth, in_height, in_width);
         grid = std::make_shared<Tensor<float>>(batch, out_height, out_width, 2);
+        output = std::make_shared<Tensor<float>>(batch, depth, out_height, out_width);
         input->reserveOnCPU();
         grid->reserveOnCPU();
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -161,7 +159,7 @@ private:
             }
         }
         std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_grid_sample<float>(input, grid, expectedOutput, batch, in_height, in_width, out_height, out_width, depth, false);
+        reference_grid_sample<float>(input, grid, output, batch, in_height, in_width, out_height, out_width, depth, false);
         std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
         std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
         LOG_INFO("reference grid sample time: %f s", duration.count());
@@ -175,7 +173,7 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
     GridSampleTest gst;
-    if (!gst.run_test({gst.input, gst.grid}, gst.expectedOutput)) {
+    if (!gst.run_test<float>({gst.input, gst.grid}, {gst.output})) {
         return -1;
     }
     return EXIT_SUCCESS;

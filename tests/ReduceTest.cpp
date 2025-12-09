@@ -12,11 +12,11 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Reduce;
-
+// #define USE_CPP_REF
 namespace {
 #ifdef USE_CPP_REF
 void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
-    std::vector<float> &output,
+    std::shared_ptr<Tensor<float>> &output,
     const std::vector<int>& axes_input,
     bool keepdims = false,
     ReduceType reduce_type = ReduceType::SUM
@@ -184,7 +184,7 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
                     acc = static_cast<double>(max_val_for_logsumexp) + std::log(sum_exp);
         }
 
-        output.data[out_idx_flat] = static_cast<float>(acc);
+        (*output)[out_idx_flat] = static_cast<float>(acc);
     }
 
     return output;
@@ -193,7 +193,7 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
 class ReduceTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     ReduceTest():TestCase("Reduce") {
         initTestdata();
@@ -205,9 +205,9 @@ private:
             64, 64
         };
         input = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
-
-        expectedOutput.resize(input->num_elements());
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -216,9 +216,9 @@ private:
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
         }
-        // reference_reduce(input, expectedOutput, 0, 0);
+        // reference_reduce(input, output, 0, 0);
         for (int i = 0; i < input->num_elements(); i++) {
-            printf("%.4f " , expectedOutput[i]);
+            printf("%.4f " , (*output)[i]);
         }
     }
 };
@@ -229,7 +229,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     ReduceTest reducetest;
-    if (!reducetest.run_test({reducetest.input}, reducetest.expectedOutput)) {
+    if (!reducetest.run_test<float>({reducetest.input}, {reducetest.output})) {
         return -1;
     }
 

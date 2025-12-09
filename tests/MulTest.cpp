@@ -15,7 +15,7 @@ class MulTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> inputa;
     std::shared_ptr<Tensor<float>> inputb;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     MulTest():TestCase("Mul") {
         initTestdata();
@@ -28,10 +28,10 @@ private:
         };
         inputa = std::make_shared<Tensor<float>>(t);
         inputb = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(t);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
-
-        expectedOutput.resize(inputa->num_elements());
+        output->reserveOnCPU();
         
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -41,7 +41,7 @@ private:
         for (int i = 0; i < inputa->num_elements(); i++) {
             (*inputa)[i] = inputa_dist(gen);
             (*inputb)[i] = inputa_dist(gen);
-            expectedOutput[i] = (*inputa)[i] * (*inputb)[i];
+            (*output)[i] = (*inputa)[i] * (*inputb)[i];
         }
     }
 };
@@ -52,7 +52,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     MulTest multest;
-    if (!multest.run_test({multest.inputa, multest.inputb}, multest.expectedOutput)) {
+    if (!multest.run_test<float>({multest.inputa, multest.inputb}, {multest.output})) {
         return -1;
     }
 

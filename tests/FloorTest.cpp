@@ -16,7 +16,7 @@ namespace {
 class ReluTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
-    std::vector<float> expectedOutput;
+    std::shared_ptr<Tensor<float>> output;
 
     ReluTest():TestCase("Floor") {
         initTestdata();
@@ -29,7 +29,8 @@ private:
         };
         input = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();
-        expectedOutput.resize(input->num_elements());
+        output = std::make_shared<Tensor<float>>(t);
+        output->reserveOnCPU();
 
         std::random_device rd{};
         std::mt19937 gen{rd()};
@@ -37,7 +38,7 @@ private:
         std::normal_distribution<> input_dist{-4.0F, 6.0F};
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
-            expectedOutput[i] = std::floor((*input)[i]);
+            (*output)[i] = std::floor((*input)[i]);
         }
     }
 };
@@ -48,7 +49,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     ReluTest relutest;
-    if (!relutest.run_test({relutest.input}, relutest.expectedOutput)) {
+    if (!relutest.run_test<float>({relutest.input}, {relutest.output})) {
         return -1;
     }
 
