@@ -46,19 +46,19 @@ class Reduce : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("norm_type") != attributes.end()) {
-            norm_type_ = std::stoi(attributes.at("norm_type"));
+            norm_type_ = std::stol(attributes.at("norm_type"));
         }
         // opset ver 18 will move this to inputs
         if (attributes.find("axis") != attributes.end()) {
             axis_ = parse_attr_list(attributes.at("axis"));
         }
         if (attributes.find("keepdims") != attributes.end()) {
-            keepdims_ = std::stoi(attributes.at("keepdims"));
+            keepdims_ = std::stol(attributes.at("keepdims"));
         }
         // only exist for opset ver 18
         if (attributes.find("noop_with_empty_axes") != attributes.end()) {
             noop_with_empty_axes_ =
-                std::stoi(attributes.at("noop_with_empty_axes"));
+                std::stol(attributes.at("noop_with_empty_axes"));
         }
     }
 

@@ -74,7 +74,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         initializer.name = readString(ptr, end);
         initializer.dtype = readString(ptr, end);
         initializer.dims = readDims(ptr, end);
-        uint64_t data_size = readUint64(ptr, end);
+        int64_t data_size = readint64(ptr, end);
         ptr += data_size;
         // Align the offset
         size_t aligned_offset =
@@ -97,7 +97,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         auto name = readString(ptr, end);
         auto dtype = readString(ptr, end);
         auto dims = readDims(ptr, end);
-        uint64_t data_size = readUint64(ptr, end);
+        int64_t data_size = readint64(ptr, end);
 
         size_t offset = initializer_offsets[name];
         uint8_t *dest_ptr = initializer_memory.data() + offset;

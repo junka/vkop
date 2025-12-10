@@ -78,7 +78,8 @@ void VulkanCommandBuffer::end() {
     }
 }
 
-int VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
+uint64_t
+VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
     if (!m_usefence_) {
         m_timelineValue_ = m_cmdpool_->getNextSubmitValue();
         VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
@@ -112,7 +113,7 @@ int VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
         throw std::runtime_error("Failed to submit command buffer!");
     }
 
-    return m_cmdpool_->getCompletedTimelineValue();
+    return m_cmdpool_->getCompletedTimelineValue(queue);
 }
 
 int VulkanCommandBuffer::wait(const std::shared_ptr<VulkanQueue> &queue) {

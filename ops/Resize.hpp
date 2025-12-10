@@ -46,7 +46,7 @@ class Resize : public Operator {
             } else if (attributes.at("antialias") == "True") {
                 antialias_ = 1;
             } else {
-                antialias_ = std::stoi(attributes.at("antialias"));
+                antialias_ = std::stol(attributes.at("antialias"));
             }
         }
         if (attributes.find("axes") != attributes.end()) {
@@ -80,7 +80,7 @@ class Resize : public Operator {
         }
 
         if (attributes.find("exclude_outside") != attributes.end()) {
-            exclude_outside_ = std::stoi(attributes.at("exclude_outside"));
+            exclude_outside_ = std::stol(attributes.at("exclude_outside"));
         }
         if (attributes.find("extrapolation_value") != attributes.end()) {
             extrapolation_value_ =

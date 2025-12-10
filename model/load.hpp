@@ -116,11 +116,11 @@ private:
         return value;
     }
 
-    static uint64_t readUint64(const char*& ptr, const char* end) {
-        if (ptr + sizeof(uint64_t) > end) throw std::runtime_error("Unexpected end of file u64");
-        uint64_t value;
-        std::memcpy(&value, ptr, sizeof(uint64_t));
-        ptr += sizeof(uint64_t);
+    static int64_t readint64(const char*& ptr, const char* end) {
+        if (ptr + sizeof(int64_t) > end) throw std::runtime_error("Unexpected end of file i64");
+        int64_t value;
+        std::memcpy(&value, ptr, sizeof(int64_t));
+        ptr += sizeof(int64_t);
         return value;
     }
 
@@ -193,7 +193,7 @@ private:
             if (tag == 0) {
                 value = readString(ptr, end);
             } else if (tag == 1) {
-                value = std::to_string(readUint64(ptr, end));
+                value = std::to_string(readint64(ptr, end));
             } else if (tag == 2) {
                 value = std::to_string(readFloat64(ptr, end));
             } else if (tag == 3) {
@@ -220,7 +220,7 @@ private:
     static std::vector<uint8_t> readArray(const char*& ptr, const char* end) {
         std::string dtype = readString(ptr, end);
         std::vector<uint32_t> shape = readDims(ptr, end);
-        uint64_t size = readUint64(ptr, end);
+        int64_t size = readint64(ptr, end);
 
         if (ptr + size > end) throw std::runtime_error("Unexpected end of file array");
         std::vector<uint8_t> data(size);

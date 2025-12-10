@@ -72,7 +72,7 @@ class Operator {
             std::string item;
             while (std::getline(ss, item, ',')) {
                 try {
-                    result.emplace_back(std::stoi(item));
+                    result.emplace_back(std::stol(item));
                 } catch (const std::invalid_argument &e) {
                     throw std::runtime_error(
                         "Invalid number in attribute list: " + item);

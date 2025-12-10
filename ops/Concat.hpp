@@ -38,7 +38,7 @@ class Concat : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
-            axis_ = std::stoi(attributes.at("axis"));
+            axis_ = std::stol(attributes.at("axis"));
         }
     }
 

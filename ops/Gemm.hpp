@@ -47,10 +47,10 @@ class Gemm : public Operator {
             beta_ = beta;
         }
         if (attributes.find("transA") != attributes.end()) {
-            transA_ = std::stoi(attributes.at("transA"));
+            transA_ = std::stol(attributes.at("transA"));
         }
         if (attributes.find("transB") != attributes.end()) {
-            transB_ = std::stoi(attributes.at("transB"));
+            transB_ = std::stol(attributes.at("transB"));
         }
     }
 

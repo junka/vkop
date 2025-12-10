@@ -70,7 +70,7 @@ class Maxpool2d : public Operator {
             if (dila_str.find(',') != std::string::npos) {
                 dilations_ = parse_attr_list(dila_str);
             } else {
-                int d = std::stoi(dila_str);
+                int d = std::stol(dila_str);
                 dilations_ = {d, d};
             }
         } else {
@@ -78,7 +78,7 @@ class Maxpool2d : public Operator {
         }
 
         if (attributes.find("ceil_mode") != attributes.end()) {
-            ceil_mode_ = std::stoi(attributes.at("ceil_mode"));
+            ceil_mode_ = std::stol(attributes.at("ceil_mode"));
         } else {
             ceil_mode_ = 1;
         }
@@ -88,7 +88,7 @@ class Maxpool2d : public Operator {
             if (kernel_str.find(',') != std::string::npos) {
                 kernel_shape_ = parse_attr_list(kernel_str);
             } else {
-                int k = std::stoi(kernel_str);
+                int k = std::stol(kernel_str);
                 kernel_shape_ = {k, k};
             }
         } else {
@@ -101,14 +101,14 @@ class Maxpool2d : public Operator {
             if (pad_str.find(',') != std::string::npos) {
                 pads_ = parse_attr_list(pad_str);
             } else {
-                int p = std::stoi(pad_str);
+                int p = std::stol(pad_str);
                 pads_ = {p, p};
             }
         } else {
             pads_ = {0, 0};
         }
         if (attributes.find("storage_order") != attributes.end()) {
-            storage_order_ = std::stoi(attributes.at("storage_order"));
+            storage_order_ = std::stol(attributes.at("storage_order"));
         } else {
             storage_order_ = 1;
         }
@@ -117,7 +117,7 @@ class Maxpool2d : public Operator {
             if (stride_str.find(',') != std::string::npos) {
                 strides_ = parse_attr_list(stride_str);
             } else {
-                int s = std::stoi(stride_str);
+                int s = std::stol(stride_str);
                 strides_ = {s, s};
             }
         } else {

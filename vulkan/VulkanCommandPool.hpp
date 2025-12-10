@@ -22,12 +22,12 @@ class VulkanCommandPool {
         return m_commandPool_[idx % m_commandPool_.size()];
     }
 
-    uint64_t getCompletedTimelineValue();
+    uint64_t
+    getCompletedTimelineValue(const std::shared_ptr<VulkanQueue> &queue);
 
     uint64_t getNextSubmitValue() {
         return m_timelineValue_.fetch_add(1, std::memory_order_relaxed);
     }
-    VkSemaphore getSemaphore() const { return m_semaphore_; }
 
     std::shared_ptr<VulkanStagingBufferPool> getStagingBufferPool() const {
         return stagingbuffer_pool_;
@@ -36,13 +36,10 @@ class VulkanCommandPool {
   private:
     std::shared_ptr<VulkanDevice> m_vdev_;
     std::vector<VkCommandPool> m_commandPool_;
-    VkSemaphore m_semaphore_ = VK_NULL_HANDLE;
     std::atomic<uint64_t> m_timelineValue_{1};
     std::shared_ptr<VulkanStagingBufferPool> stagingbuffer_pool_;
 
     void createCommandPool(uint32_t queueFamilyIndex);
-
-    void createTimelineSemaphore();
 };
 
 } // namespace vkop

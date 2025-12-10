@@ -5,7 +5,7 @@ import sys
 import struct
 import onnx
 import numpy as np
-from onnx import numpy_helper
+from onnx import numpy_helper, shape_inference
 import onnxoptimizer as optimizer
 from onnxsim import simplify
 from collections import defaultdict, deque
@@ -172,6 +172,7 @@ def optimize_onnx_model(onnx_model):
     optimized_model, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
     assert check, "Simplified ONNX model could not be validated"
     optimized_model = optimizer.optimize(optimized_model, passes)
+    optimized_model = shape_inference.infer_shapes(optimized_model, strict_mode=True)
 
     return optimized_model
 
@@ -422,6 +423,37 @@ def fuse_conv_activation(vk_model):
     vk_model.nodes = fused_nodes
 
 
+def broadcast_shapes(shape_a, shape_b):
+    """Compute broadcasted shape per ONNX rules."""
+    if not shape_a and not shape_b:
+        return []
+    if not shape_a:
+        return shape_b
+    if not shape_b:
+        return shape_a
+
+    # Make copies and align from right
+    a, b = list(shape_a), list(shape_b)
+    len_a, len_b = len(a), len(b)
+    max_len = max(len_a, len_b)
+
+    # Left-pad with 1s
+    a = [1] * (max_len - len_a) + a
+    b = [1] * (max_len - len_b) + b
+
+    result = []
+    for da, db in zip(a, b):
+        if da == db:
+            result.append(da)
+        elif da == 1:
+            result.append(db)
+        elif db == 1:
+            result.append(da)
+        else:
+            raise ValueError(f"Shapes {shape_a} and {shape_b} are not broadcastable")
+    return result
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -444,6 +476,10 @@ def parse_onnx_model(onnx_path):
         print("Graph is not topologically sorted. Please sort it before proceeding.")
         return 
 
+    # Initializers (parameters)
+    for initializer in graph.initializer:
+        name = initializer.name
+        vk_model.initializers[name] = initializer
 
     # Inputs with shapes
     for inp in graph.input:
@@ -466,10 +502,34 @@ def parse_onnx_model(onnx_path):
         vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
 
     # Nodes with attributes and shapes of inputs/outputs
+    ELEMWISE_OPS = {"Add", "And", "Div", "Equal", "Greater", "Less", "Max", "Mean",
+         "Min", "Mul", "Or", "Pow", "Sub", "Sum", "Where", "Xor"}
     for node in graph.node:
         print("Processing node:", node.name, "of type:", node.op_type)
         attributes = {}
         for attr in node.attribute:
+            # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
+            # message AttributeProto
+            # enum AttributeType {
+            #     UNDEFINED = 0;
+            #     FLOAT = 1;
+            #     INT = 2;
+            #     STRING = 3;
+            #     TENSOR = 4;
+            #     GRAPH = 5;
+            #     SPARSE_TENSOR = 11;
+            #     TYPE_PROTO = 13;
+
+            #     FLOATS = 6;
+            #     INTS = 7;
+            #     STRINGS = 8;
+            #     TENSORS = 9;
+            #     GRAPHS = 10;
+            #     SPARSE_TENSORS = 12;
+            #     TYPE_PROTOS = 14;
+            # }
+
+            print("  Attribute:", attr.name, "of ", attr)
             if attr.type == onnx.AttributeProto.INT:
                 attributes[attr.name] = attr.i
             elif attr.type == onnx.AttributeProto.FLOAT:
@@ -546,6 +606,34 @@ def parse_onnx_model(onnx_path):
                 {'name': input_name, 'shape': shape_dims}
             )
 
+        if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
+            print("  Elemwise operation with multiple inputs. Broadcasting shapes...")
+            for i in range(len(inputs_with_shape)):
+                if inputs_with_shape[i]['name'] == node.input[0]:
+                    id0 = i
+                if inputs_with_shape[i]['name'] == node.input[1]:
+                    id1 = i
+            if len(inputs_with_shape[id0]['shape']) != len(inputs_with_shape[id1]['shape']):
+                shape = broadcast_shapes(inputs_with_shape[id0]['shape'], inputs_with_shape[id1]['shape'])
+                if len(inputs_with_shape[id0]['shape']) == 0:
+                    inputs_with_shape[id0]['shape'] = shape
+                    for initializer in graph.initializer:
+                        if initializer.name == inputs_with_shape[id0]['name']:
+                            orig_init = vk_model.initializers[initializer.name]
+                            scalar_val = numpy_helper.to_array(orig_init).item()
+                            expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                            new_init = numpy_helper.from_array(expanded_data, name=new_name)
+                            vk_model.initializers[initializer.name] = new_init
+                if len(inputs_with_shape[id1]['shape']) == 0:
+                    inputs_with_shape[id1]['shape'] = shape
+                    for initializer in graph.initializer:
+                        if initializer.name == inputs_with_shape[id1]['name']:
+                            orig_init = vk_model.initializers[initializer.name]
+                            scalar_val = numpy_helper.to_array(orig_init).item()
+                            expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                            new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
+                            vk_model.initializers[initializer.name] = new_init
+    
         outputs_with_shape = []
         for output_name in node.output:
             print("  Output:", output_name)
@@ -581,10 +669,6 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
-    # Initializers (parameters)
-    for initializer in graph.initializer:
-        name = initializer.name
-        vk_model.initializers[name] = initializer
 
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)

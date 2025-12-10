@@ -72,13 +72,13 @@ class Conv2d : public Operator {
             if (dila_str.find(',') != std::string::npos) {
                 dilations_ = parse_attr_list(dila_str);
             } else {
-                int d = std::stoi(dila_str);
+                int d = std::stol(dila_str);
                 dilations_ = {d, d};
             }
         }
 
         if (attributes.find("group") != attributes.end()) {
-            groups_ = std::stoi(attributes.at("group"));
+            groups_ = std::stol(attributes.at("group"));
         }
 
         if (attributes.find("kernel_shape_") != attributes.end()) {
@@ -86,7 +86,7 @@ class Conv2d : public Operator {
             if (kernel_str.find(',') != std::string::npos) {
                 kernel_shape_ = parse_attr_list(kernel_str);
             } else {
-                int k = std::stoi(kernel_str);
+                int k = std::stol(kernel_str);
                 kernel_shape_ = {k, k};
             }
         }
@@ -96,7 +96,7 @@ class Conv2d : public Operator {
             if (pad_str.find(',') != std::string::npos) {
                 pads_ = parse_attr_list(pad_str);
             } else {
-                int p = std::stoi(pad_str);
+                int p = std::stol(pad_str);
                 pads_ = {p, p};
             }
         }
@@ -106,7 +106,7 @@ class Conv2d : public Operator {
             if (stride_str.find(',') != std::string::npos) {
                 strides_ = parse_attr_list(stride_str);
             } else {
-                int s = std::stoi(stride_str);
+                int s = std::stol(stride_str);
                 strides_ = {s, s};
             }
         }

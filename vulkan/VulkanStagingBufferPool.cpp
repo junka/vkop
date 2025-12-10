@@ -6,7 +6,7 @@ namespace vkop {
 #define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
 namespace {
 constexpr int kStagingBufferSize =
-    1024 * 1024 * 8; // 8M,  greater than 1024 * 1024 * 3 for one image
+    1024 * 1024 * 16; // 16M,  greater than 1024 * 1024 * 3 for one image
 }
 
 VulkanStagingBufferPool::VulkanStagingBufferPool(
@@ -59,6 +59,7 @@ VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
     alloc.offset = physical_offset;
     alloc.size = size;
     m_writePos_ = next_write;
+    // printf("alloc size %ld, offset %ld\n", size, physical_offset);
     return alloc;
 }
 

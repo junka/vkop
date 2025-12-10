@@ -26,7 +26,7 @@ class VulkanCommandBuffer {
     void bind(VulkanPipeline &pipeline, VkDescriptorSet descriptor_set);
 
     // Submit the command buffer to a queue
-    int submit(const std::shared_ptr<VulkanQueue> &queue);
+    uint64_t submit(const std::shared_ptr<VulkanQueue> &queue);
 
     // Reset the command buffer
     void reset();

@@ -1,0 +1,146 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(set = 0, binding = 0, rgba32f) uniform image2DArray uOutput;
+layout(set = 0, binding = 1) uniform sampler2DArray uInput;
+
+layout(push_constant) uniform splitBuffer {
+    ivec4 inShape;      // [Nin, Cin, H_in, Win]
+    ivec4 outShape;     // [Nout, Cout, Hout, Wout]
+    int split;          // offset for axis in input
+    int axis;
+} uSplitPara;
+
+void split_for_h() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int N = uSplitPara.outShape.x;
+    int C = uSplitPara.outShape.y;
+    int H_out = uSplitPara.outShape.z;
+    int H_in = uSplitPara.inShape.z;
+    int W = uSplitPara.outShape.w;
+
+    int w = gid.x;
+    int c4 = gid.z;
+    int y = gid.y;
+
+    int n = y / H_out;
+    int h_out = y % H_out;
+
+    if (w >= W || c4 >= (C + 3) / 4 || n >= N || h_out >= H_out) {
+        return;
+    }
+
+    int h_in = h_out + uSplitPara.split;
+    vec4 pixel = texelFetch(uInput, ivec3(w, n * H_in + h_in, c4), 0);
+
+    imageStore(uOutput, gid, pixel);
+}
+
+void split_for_w() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int N = uSplitPara.outShape.x;
+    int C = uSplitPara.outShape.y;
+    int H = uSplitPara.outShape.z;
+    int W = uSplitPara.outShape.w;
+    int W_in = uSplitPara.inShape.w;
+
+    int w = gid.x;
+    int c4 = gid.z;
+    int y = gid.y;
+
+    int n = y / H;
+    int h_out = y % H;
+
+    if (w >= W || c4 >= (C + 3) / 4 || n >= N || h_out >= H) {
+        return;
+    }
+
+    int w_in = w + uSplitPara.split;
+    vec4 pixel = texelFetch(uInput, ivec3(w_in, y, c4), 0);
+
+    imageStore(uOutput, gid, pixel);
+}
+
+void split_for_n() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int N = uSplitPara.outShape.x;
+    int C = uSplitPara.outShape.y;
+    int H = uSplitPara.outShape.z;
+    int W = uSplitPara.outShape.w;
+    int N_in = uSplitPara.inShape.x;
+
+    int w = gid.x;
+    int c4 = gid.z;
+    int y = gid.y;
+
+    int n_out = y / H;
+    int h = y % H;
+
+    if (w >= W || c4 >= (C + 3) / 4 || n_out >= N || h >= H) {
+        return;
+    }
+
+    int n_in = n_out + uSplitPara.split;
+    int y_in = n_in * H + h;
+    vec4 pixel = texelFetch(uInput, ivec3(w, y_in, c4), 0);
+
+    imageStore(uOutput, gid, pixel);
+}
+
+void split_for_c() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+
+    int N = uSplitPara.outShape.x;
+    int C = uSplitPara.outShape.y;
+    int H = uSplitPara.outShape.z;
+    int W = uSplitPara.outShape.w;
+    int C_in = uSplitPara.inShape.y;
+
+    int w = gid.x;
+    int c4_out = gid.z;
+    int y = gid.y;
+
+    int n = y / H;
+    int h = y % H;
+
+    if (w >= W || c4_out >= (C + 3) / 4 || n >= N || h >= H) {
+        return;
+    }
+    int c_out_base = c4_out * 4;
+    vec4 pixel;
+    if (uSplitPara.split % 4 == 0) {
+        int c_in = c_out_base + uSplitPara.split;
+        int c4_in = c_in / 4;
+        pixel = texelFetch(uInput, ivec3(w, y, c4_in), 0);
+    } else {
+        pixel = imageLoad(uOutput, gid);
+        for (int c = 0; c < 4; c++) {
+            int c_out = c_out_base + c;
+            if (c_out >= C) {
+                break;
+            }
+            int c_in = c_out + uSplitPara.split;
+            int c4_in = c_in / 4;
+            int comp = c_in % 4;
+            pixel[c] = texelFetch(uInput, ivec3(w, y, c4_in), 0)[comp];
+        }
+    }
+
+    imageStore(uOutput, gid, pixel);
+}
+
+void main() {
+    if (uSplitPara.axis == 0) {
+        split_for_n();
+    } else if (uSplitPara.axis == 1) {
+        split_for_c();
+    } else if (uSplitPara.axis == 2) {
+        split_for_h();
+    } else if (uSplitPara.axis == 3) {
+        split_for_w();
+    }
+}

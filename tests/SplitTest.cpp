@@ -1,0 +1,173 @@
+#include <vector>
+#include <random>
+
+#include "setup.hpp"
+#include "core/Tensor.hpp"
+#include "include/logger.hpp"
+#include "ops/Split.hpp"
+
+using vkop::core::Tensor;
+using vkop::tests::TestCase;
+using vkop::ops::Split;
+
+namespace {
+
+void split_cpu(const std::shared_ptr<Tensor<float>>& input,
+               const std::vector<std::shared_ptr<Tensor<float>>>& outputs,
+               const std::vector<int64_t>& split_shape,
+               int axis) {
+    auto input_shape = input->getShape();
+    size_t rank = input_shape.size();
+
+    // 校验 axis
+    assert(axis >= 0 && static_cast<size_t>(axis) < rank);
+    // 校验 split_shape 长度与 outputs 一致
+    assert(outputs.size() == split_shape.size());
+
+    // 校验 split_shape 总和等于 input_shape[axis]
+    int64_t total_split = 0;
+    for (int64_t s : split_shape) {
+        total_split += s;
+    }
+    assert(total_split == input_shape[axis]);
+
+    size_t num_outputs = outputs.size();
+
+    // 计算 outer_size 和 inner_size
+    int64_t outer_size = 1;
+    for (int i = 0; i < axis; ++i) {
+        outer_size *= input_shape[i];
+    }
+
+    int64_t inner_size = 1;
+    for (size_t i = axis + 1; i < rank; ++i) {
+        inner_size *= input_shape[i];
+    }
+
+    int64_t input_axis_size = input_shape[axis];
+    int64_t offset = 0; // 在 axis 维度上的累积偏移
+
+    for (size_t i = 0; i < num_outputs; ++i) {
+        int64_t slice_size = split_shape[i]; // 当前输出在 axis 上的长度
+        auto output = outputs[i];
+
+        // 对每个 outer 块进行拷贝
+        for (int64_t outer = 0; outer < outer_size; ++outer) {
+             for (int64_t j = 0; j < slice_size; ++j) {
+                for (int64_t inner = 0; inner < inner_size; ++inner) {
+                    int64_t out_index = outer * (slice_size * inner_size) + j * inner_size + inner;
+                    int64_t in_index  = outer * (input_axis_size * inner_size) + (offset + j) * inner_size + inner;
+                    (*output)[out_index] = (*input)[in_index];
+                }
+            }
+        }
+
+        offset += slice_size;
+    }
+}
+class SplitTest : public TestCase {
+public:
+    std::vector<int> input_shape_ = {
+        8, 4, 8
+    };
+    int axis_ = 2;
+    std::unordered_map<std::string, std::string> attributes = {
+        {"axis", std::to_string(axis_)}
+    };
+
+    const std::vector<int64_t> split_shape = {2, 6};
+
+    std::shared_ptr<Tensor<float>> input;
+    std::shared_ptr<Tensor<int64_t>> split_;
+    std::vector<std::shared_ptr<Tensor<float>>> outputs;
+
+    SplitTest():TestCase("Split") {
+        initTestdata();
+    }
+private:
+    void initTestdata()
+    {
+        input = std::make_shared<Tensor<float>>(input_shape_);
+        input->reserveOnCPU();
+        split_ = std::make_shared<Tensor<int64_t>>(split_shape.size());
+        split_->fillToCPU(split_shape);
+
+        int num_outputs = split_shape.size();
+        std::vector<int> shapes;
+        for (int i = 0; i < num_outputs; i++) {
+            auto shape = input_shape_;
+            shape[axis_] = split_shape[i];
+            auto output = std::make_shared<Tensor<float>>(shape);
+            output->reserveOnCPU();
+            outputs.emplace_back(output);
+        }
+
+        std::random_device rd{};
+        std::mt19937 gen{rd()};
+        gen.seed(1024);
+        std::normal_distribution<> input_dist{-1.0F, 1.0F};
+        for (int i = 0; i < input->num_elements(); i++) {
+            auto a = input_dist(gen);
+            (*input)[i] = a;
+        }
+        split_cpu(input, outputs, split_shape, axis_);
+        auto inshape = input->getShape();
+        for (int i = 0; i < inshape[0]; i++) {
+            printf("[\n");
+            for (int j = 0; j < inshape[1]; j++) {
+                printf("[");
+                for (int k = 0; k < inshape[2]; k++) {
+                    int idx = i * inshape[1] * inshape[2] + j * inshape[2] + k;
+                    printf("%f, ", (*input)[idx]);
+                }
+                printf("]\n");
+            }
+            printf("]\n");
+        }
+        printf("=============================\n");
+        for (auto &output : outputs) {
+            auto shape = output->getShape();
+            for (int i = 0; i < shape[0]; i++) {
+                printf("[\n");
+                for (int j = 0; j < shape[1]; j++) {
+                    printf("[");
+                    for (int k = 0; k < shape[2]; k++) {
+                        int idx = i * shape[1] * shape[2] + j * shape[2] + k;
+                        printf("%f, ", (*output)[idx]);
+                    }
+                    printf("]\n");
+                }
+                printf("]\n");
+            }
+        }
+    }
+};
+}
+
+
+int main()
+{
+    Logger::getInstance().setLevel(LOG_INFO);
+    Logger::getInstance().enableFileOutput("log", false);
+
+    SplitTest split_test;
+    const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
+        split_test.input,
+        split_test.split_,
+    };
+    std::vector<std::shared_ptr<vkop::core::ITensor>> outputs;
+    for (auto &output : split_test.outputs) {
+        outputs.push_back(output);
+    };
+    if (!split_test.run_test<float>(inputs, outputs, [&split_test] (std::unique_ptr<vkop::ops::Operator> &op) {
+        auto *split_op = dynamic_cast<Split *>(op.get());
+        if (!split_op) {
+            LOG_ERROR("Failed to cast operator to Conv2d");
+            return;
+        }
+        split_op->setAttribute(split_test.attributes);
+    })) {
+        return -1;
+    }
+    return 0;
+}

@@ -10,7 +10,6 @@ VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
     for (auto [qfidx, qcnt, qflags] : vdev->getComputeQueueFamilyIndex()) {
         createCommandPool(qfidx);
     }
-    createTimelineSemaphore();
     stagingbuffer_pool_ = std::make_shared<VulkanStagingBufferPool>(m_vdev_);
 }
 
@@ -19,10 +18,6 @@ VulkanCommandPool::~VulkanCommandPool() {
         if (cmdpool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(m_vdev_->getLogicalDevice(), cmdpool, nullptr);
         }
-    }
-    if (m_semaphore_ != VK_NULL_HANDLE) {
-        vkDestroySemaphore(m_vdev_->getLogicalDevice(), m_semaphore_, nullptr);
-        m_semaphore_ = VK_NULL_HANDLE;
     }
 }
 
@@ -40,27 +35,13 @@ void VulkanCommandPool::createCommandPool(uint32_t queueFamilyIndex) {
     m_commandPool_.emplace_back(cmdpool);
 }
 
-void VulkanCommandPool::createTimelineSemaphore() {
-    VkSemaphoreTypeCreateInfo timeline_info{};
-    timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-    timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-    timeline_info.initialValue = 0;
-
-    VkSemaphoreCreateInfo sem_info{};
-    sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-    sem_info.pNext = &timeline_info;
-    if (vkCreateSemaphore(m_vdev_->getLogicalDevice(), &sem_info, nullptr,
-                          &m_semaphore_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create timeline semaphore");
-    }
-}
-
-uint64_t VulkanCommandPool::getCompletedTimelineValue() {
+uint64_t VulkanCommandPool::getCompletedTimelineValue(
+    const std::shared_ptr<VulkanQueue> &queue) {
     if (m_vdev_->is_support_timeline_semaphore()) {
         uint64_t completed_value = 0;
-        if (VK_SUCCESS !=
-            vkGetSemaphoreCounterValue(m_vdev_->getLogicalDevice(),
-                                       m_semaphore_, &completed_value)) {
+        if (VK_SUCCESS != vkGetSemaphoreCounterValue(
+                              m_vdev_->getLogicalDevice(),
+                              queue->getSemaphore(), &completed_value)) {
             throw std::runtime_error("Failed to get semaphore counter value");
         }
         return completed_value;

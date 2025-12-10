@@ -39,7 +39,7 @@ class Reshape : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("allowzero") != attributes.end()) {
-            allowzero_ = std::stoi(attributes.at("allowzero"));
+            allowzero_ = std::stol(attributes.at("allowzero"));
         }
     }
 
