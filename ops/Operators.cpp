@@ -27,6 +27,7 @@
 #include "Concat.hpp"
 #include "Reshape.hpp"
 #include "Slice.hpp"
+#include "Split.hpp"
 #include "Transpose.hpp"
 
 #include "OperatorFactory.hpp"
@@ -65,6 +66,7 @@ REGISTER_OPERATOR(OpType::RESHAPE, Reshape);
 REGISTER_OPERATOR(OpType::SLICE, Slice);
 REGISTER_OPERATOR(OpType::TRANSPOSE, Transpose);
 REGISTER_OPERATOR(OpType::CONCAT, Concat);
+REGISTER_OPERATOR(OpType::SPLIT, Split);
 
 } // namespace ops
 } // namespace vkop

@@ -217,7 +217,7 @@ int main() {
     }
 #endif
 
-    if (!softtest.run_test<float>({softtest.input}, {softtest.output}, 
+    if (!softtest.run_test<float>({softtest.input}, {softtest.output},
         [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *softmax_op = dynamic_cast<Softmax *>(op.get());
             if (!softmax_op) {

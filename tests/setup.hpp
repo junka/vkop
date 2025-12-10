@@ -63,9 +63,11 @@ public:
                 if (attribute_func) {
                     attribute_func(op);
                 }
-
-                auto output = std::make_shared<Tensor<T>>(true);
-                auto outputs = std::vector<std::shared_ptr<core::ITensor>> {output};
+                std::vector<std::shared_ptr<core::ITensor>> outputs;
+                for (size_t i = 0; i < expect_outputs.size(); i++) {
+                    auto output = std::make_shared<Tensor<T>>(true);
+                    outputs.push_back(output);
+                }
                 for (const auto &input : inputs) {
                     if (!input || input->num_dims() < 2) {
                         continue;
@@ -85,50 +87,54 @@ public:
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
-                output->copyToCPU(cmdpool);
-                auto oshape = output->getShape();
-                if (oshape.size() == 4) {
-                    for (int i = 0; i < oshape[0]; i++) {
-                        printf("[\n");
-                        for (int j = 0; j < oshape[1]; j++) {
+                for (size_t idx = 0; idx < outputs.size(); idx++) {
+                    auto output = core::as_tensor<T>(outputs[idx]);
+                    output->copyToCPU(cmdpool);
+                    auto oshape = output->getShape();
+                    printf("output shape: %ld\n", oshape.size());
+                    if (oshape.size() == 4) {
+                        for (int i = 0; i < oshape[0]; i++) {
                             printf("[\n");
-                            for (int k = 0; k < oshape[2]; k++) {
-                                printf("[");
-                                for (int l = 0; l < oshape[3]; l++) {
-                                    int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
-                                        k * oshape[3] + l;
-                                    printf("%.4f, ", (*output)[idx]);
+                            for (int j = 0; j < oshape[1]; j++) {
+                                printf("[\n");
+                                for (int k = 0; k < oshape[2]; k++) {
+                                    printf("[");
+                                    for (int l = 0; l < oshape[3]; l++) {
+                                        int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
+                                            k * oshape[3] + l;
+                                        printf("%.4f, ", (*output)[idx]);
+                                    }
+                                    printf("]\n");
                                 }
                                 printf("]\n");
                             }
                             printf("]\n");
                         }
-                        printf("]\n");
-                    }
-                } else if (oshape.size() == 2) {
-                    for (int i = 0; i < oshape[0]; i++) {
-                        printf("[");
-                        for (int j = 0; j < oshape[1]; j++) {
-                            int idx = i * oshape[1] + j;
-                            printf("%.4f, ", (*output)[idx]);
+                    } else if (oshape.size() == 2) {
+                        for (int i = 0; i < oshape[0]; i++) {
+                            printf("[");
+                            for (int j = 0; j < oshape[1]; j++) {
+                                int idx = i * oshape[1] + j;
+                                printf("%.4f, ", (*output)[idx]);
+                            }
+                            printf("]\n");
                         }
                         printf("]\n");
                     }
-                    printf("]\n");
-                }
-                auto expect = core::as_tensor<float>(expect_outputs[0]);
-                for (int i = 0; i < output->num_elements(); i++) {
-                    if (sizeof(T) == 2) {
-                        std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
-                        if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
-                            LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
-                            return false;
-                        }
-                    } else {
-                        std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                        if (std::fabs((*output)[i] - (*expect)[i]) > 1e-3) {
-                            LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
-                            return false;
+                    auto expect = core::as_tensor<float>(expect_outputs[idx]);
+                    for (int i = 0; i < output->num_elements(); i++) {
+                        if (sizeof(T) == 2) {
+                            std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
+                            if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
+                                LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
+                                return false;
+                            }
+                        } else {
+                            std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                            if (std::fabs((*output)[i] - (*expect)[i]) > 1e-3) {
+                                LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
+                                return false;
+                            }
                         }
                     }
                 }

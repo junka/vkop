@@ -32,6 +32,7 @@ set(TESTS
     TransposeTest
     SliceTest
     ConcatTest
+    SplitTest
 )
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
