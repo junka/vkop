@@ -12,14 +12,29 @@
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
-void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, std::shared_ptr<Tensor<float>> &output, int M, int N, int K) {
-    for (int i = 0; i < M; i++) {
-        for (int j = 0; j < N; j++) {
-            float sum = 0.0F;
-            for (int k = 0; k < K; k++) {
-                sum += (*inputa)[i * K + k] * (*inputb)[k * N + j];
+void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb, std::shared_ptr<Tensor<float>> &output) {
+    int M = inputa->get_height(); // A: [..., M, K]
+    int K = inputa->get_width();
+    int N = inputb->get_width();
+    auto batch = inputa->get_batch();
+    auto chan = inputa->get_channel();
+    printf("M: %d, K: %d, N: %d\n", M, K, N);
+
+    for (int b = 0; b < batch; b++) {
+        for (int c = 0; c < chan; c++) {
+            for (int i = 0; i < M; i++) {
+                for (int j = 0; j < N; j++) {
+                    float sum = 0.0F;
+                    size_t idxc = b * chan * M * N + c * M * N + i * N + j;
+                    for (int k = 0; k < K; k++) {
+                        // M * k, K * N
+                        size_t idxa = b * chan * M * K + c * M * K + i * K + k;
+                        size_t idxb = b * chan * K * N + c * K * N + k * N + j;
+                        sum += (*inputa)[idxa] * (*inputb)[idxb];
+                    }
+                    (*output)[idxc] = sum;
+                }
             }
-            (*output)[i * N + j] = sum;
         }
     }
 }
@@ -38,11 +53,13 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t1 = {4, 8};
-        std::vector<int> t2 = {8, 6};
+        std::vector<int> t1 = {3, 4, 1};
+        std::vector<int> t2 = {3, 1, 6};
         inputa = std::make_shared<Tensor<float>>(t1);
         inputb = std::make_shared<Tensor<float>>(t2);
-        std::vector<int> to = {t1[0], t2[1]};
+        size_t rank = t1.size();
+        std::vector<int> to = {3, t1[rank-2], t2[rank-1]};
+        int kk = t1[rank-1];
         output = std::make_shared<Tensor<float>>(to);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
@@ -59,32 +76,53 @@ private:
             (*inputb)[i] = input_dist(gen);
         }
 
-        printf("M %d, N %d, K %d\n", t1[0], t2[1], t1[1]);
+        printf("M %d, N %d, K %d\n", to[rank-2], to[rank-1], kk);
         printf("==============================================================\n");
         printf("Input A:\n");
-        for (int i = 0; i < t1[0]; i++) {
-            for (int j = 0; j < t1[1]; j++) {
-                printf("%f ", (*inputa)[i * t1[1] + j]);
+        auto shapea = inputa->getShape();
+        printf("%d %d %d %d\n", shapea[0], shapea[1], shapea[2], shapea[3]);
+        printf("[\n");
+        for (int i = 0; i < shapea[0]; i++) {
+            printf("[\n");
+            for (int j = 0; j < shapea[1]; j++) {
+                printf("[");
+                for (int k = 0; k < shapea[2]; k++) {
+                    printf("%.2f, ", (*inputa)[i * shapea[1] *shapea[2] + j * shapea[2] + k]);
+                }
+                printf("],\n");
             }
-            printf("\n");
+            printf("],\n");
         }
-        printf("\n");
+        printf("]\n");
         printf("Input B:\n");
-        for (int i = 0; i < t2[0]; i++) {
-            for (int j = 0; j < t2[1]; j++) {
-                printf("%f ", (*inputb)[i * t2[1] + j]);
+        auto shapeb = inputb->getShape();
+        printf("[\n");
+        for (int i = 0; i < shapeb[0]; i++) {
+            printf("[\n");
+            for (int j = 0; j < shapeb[1]; j++) {
+                printf("[");
+                for (int k = 0; k < shapeb[2]; k++) {
+                    printf("%.2f, ", (*inputb)[i * shapeb[1] *shapeb[2] + j * shapeb[2] + k]);
+                }
+                printf("],\n");
             }
-            printf("\n");
+            printf("],\n");
         }
-
-        reference_matmul(inputa, inputb, output, t1[0], t2[1], t1[1]);
+        printf("]\n");
+        reference_matmul(inputa, inputb, output);
         printf("\n");
         printf("Output:\n");
-        for (int i = 0; i < t1[0]; i++) {
-            for (int j = 0; j < t2[1]; j++) {
-                printf("%f ", (*output)[i * t2[1] + j]);
+        auto shapec = output->getShape();
+        for (int i = 0; i < shapec[0]; i++) {
+            printf("[\n");
+            for (int j = 0; j < shapec[1]; j++) {
+                printf("[");
+                for (int k = 0; k < shapec[2]; k++) {
+                    printf("%.2f ", (*output)[i * shapec[1] *shapec[2] + j * shapec[2] + k]);
+                }
+                printf("]\n");
             }
-            printf("\n");
+            printf("]\n");
         }
         printf("\n");
     }

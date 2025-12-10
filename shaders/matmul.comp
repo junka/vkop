@@ -1,37 +1,36 @@
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set=0, binding = 0) writeonly buffer BufferC {
-    float data[];
-} bufferC;
-
-layout(set=0, binding = 1) readonly buffer BufferA {
-    float data[];
-} bufferA;
-
-layout(set=0, binding = 2) readonly buffer BufferB {
-    float data[];
-} bufferB;
+layout(set=0, binding = 0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding = 1) uniform sampler2DArray uInputA;
+layout(set=0, binding = 2) uniform sampler2DArray uInputB;
 
 layout(push_constant) readonly uniform paraBuffer {
-    int M; // 行数
-    int N; // 列数
-    int K; // 共同维度
+    int M; // 行数, H for A, H for C
+    int N; // 列数, W for B, W for C
+    int K; // W for A and H for B
 } uMatMulParams;
 
 void main() {
-    uint j = gl_GlobalInvocationID.x; // column index in C
-    uint i = gl_GlobalInvocationID.y; // row index in C
+    ivec3 gid = ivec3(gl_GlobalInvocationID.xyz);
+    uint w = gid.x;
+    uint y = gid.y;
+    uint c4 = gid.z;
+    int M = uMatMulParams.M;
+    int K = uMatMulParams.K;
+    int N = uMatMulParams.N;
 
-    if (i >= uMatMulParams.M || j >= uMatMulParams.N) return;
+    uint n = y / M;
+    uint h = y % M;
 
-    float sum = 0.0;
+    vec4 sum = vec4(0.0);
+    // C(i, j) = sum(A(i, k) * B(k, j))
+    // here i is h, j is w
     for (int k = 0; k < uMatMulParams.K; ++k) {
-        uint aIndex = i * uMatMulParams.K + k;   // A[i][k]
-        uint bIndex = k * uMatMulParams.N + j;   // B[k][j]
-        sum += bufferA.data[aIndex] * bufferB.data[bIndex];
+        uint y_a = h + n * M;
+        uint y_b = k + n * K;
+        sum += texelFetch(uInputA, ivec3(k, y_a, c4), 0) * texelFetch(uInputB, ivec3(w, k, c4), 0);
     }
 
-    uint cIndex = i * uMatMulParams.N + j;       // C[i][j] in row-major
-    bufferC.data[cIndex] = sum;
+    imageStore(uOutput, gid, sum);
 }

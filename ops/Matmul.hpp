@@ -22,10 +22,10 @@ class MatMul : public Operator {
     MatMul()
         : Operator(OpType::MATMUL, matmul_spv, matmul_spv_len,
                    sizeof(matmul::GpuMatMulParam)) {
-        n_imgs_ = 0;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        n_imgs_ = 3;
+        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
         objs_.reserve(types_.size());
     };
 
@@ -33,25 +33,28 @@ class MatMul : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        int m = inputs[0]->getShape()[0];
-        int n = inputs[1]->getShape()[1];
-        int k = inputs[0]->getShape()[1];
+        int m = inputs[0]->get_height();
+        int n = inputs[1]->get_width();
+        int k = inputs[0]->get_width();
+        int rank = inputs[0]->num_dims();
+        auto shape = inputs[0]->getShape();
+        shape[rank - 1] = n;
+        shape[rank - 2] = m;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);
             if (outputptr->size() == 0) {
-                outputptr->resize(std::vector<int>{m, n});
+                outputptr->resize(shape);
             }
-            auto output_buffer = outputptr->as_storage_buffer(m_dev_);
-            objs_.emplace_back(output_buffer);
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            objs_.emplace_back(output_image);
         });
         for (const auto &input : inputs) {
             dispatch_by_dtype(input->dtype(), [&](auto t) {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
-                auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-                inputptr->copyToGPU(m_cmdpool_);
-                objs_.emplace_back(input_buffer);
+                auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+                objs_.emplace_back(input_image);
             });
         }
         matmul::GpuMatMulParam para;
