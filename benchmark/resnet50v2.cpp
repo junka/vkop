@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <memory>
 #include <cmath>
+#include <iomanip>
 
 #include <sys/types.h>
 #include <unistd.h>
@@ -70,6 +71,53 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
     return resized_image;
 }
 
+std::vector<std::string> load_labels(const std::string& label_path) {
+    std::vector<std::string> labels;
+    std::ifstream file(label_path);
+    std::string line;
+    
+    if (!file.is_open()) {
+        std::cerr << "Could not open label file: " << label_path << std::endl;
+        return labels;
+    }
+    
+    while (std::getline(file, line)) {
+        // Remove carriage return if present (Windows line endings)
+        if (!line.empty() && line.back() == '\r') {
+            line.pop_back();
+        }
+        labels.push_back(line);
+    }
+    
+    file.close();
+    return labels;
+}
+
+
+// Function to get top-K predictions
+std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float>& probs, int k) {
+    // Create index-value pairs
+    std::vector<std::pair<int, float>> indexed_probs;
+    for (size_t i = 0; i < probs.size(); ++i) {
+        indexed_probs.emplace_back(i, probs[i]);
+    }
+    
+    // Sort by probability in descending order
+    std::partial_sort(indexed_probs.begin(), 
+                      indexed_probs.begin() + std::min(k, static_cast<int>(indexed_probs.size())), 
+                      indexed_probs.end(),
+                      [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
+                          return a.second > b.second;
+                      });
+    
+    // Return top K results
+    if (indexed_probs.size() > static_cast<size_t>(k)) {
+        indexed_probs.resize(k);
+    }
+    
+    return indexed_probs;
+}
+
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
@@ -84,11 +132,13 @@ int main(int argc, char *argv[]) {
 
     if (argc < 3) {
         std::cerr << "download model from https://media.githubusercontent.com/media/onnx/models/refs/heads/main/validated/vision/classification/resnet/model/resnet50-v2-7.onnx?download=true" << std::endl;
-        std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image.yuv>" << std::endl;
+        std::cerr << "download class tag from https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt" << std::endl;
+        std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image.yuv> [labels.txt]" << std::endl;
         return 1;
     }
     std::string binary_file_path = argv[1];
     std::string image_file_path = argv[2];
+    std::string labels_file_path = (argc > 3) ? argv[3] : "imagenet_classes.txt";
     std::vector<uint8_t> frame;
 
     std::ifstream infile(image_file_path, std::ios::in | std::ios::binary);
@@ -120,5 +170,23 @@ int main(int argc, char *argv[]) {
     rt->ReadResult();
     auto cls = vkop::core::as_tensor<float>(rt->GetOutput("resnetv24_dense0_fwd"));
     
+    auto res = get_top_k_predictions(cls->data(), 5);
+    std::cout << "\nTop-5 Predictions:\n";
+    std::cout << std::fixed << std::setprecision(4);
+    
+    auto labels = load_labels(labels_file_path);
+
+    for (int i = 0; i < 5 && i < static_cast<int>(res.size()); ++i) {
+        int index = res[i].first;
+        float probability = res[i].second;
+        
+        std::string label = "Unknown";
+        if (index < static_cast<int>(labels.size())) {
+            label = labels[index];
+        }
+        
+        std::cout << (i + 1) << ": " << label << " (" << probability << ")\n";
+    }
+
     return EXIT_SUCCESS;
 }

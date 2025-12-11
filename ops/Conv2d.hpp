@@ -284,7 +284,6 @@ class Conv2d : public Operator {
     std::vector<int> pads_ = {0, 0};
     std::vector<int> dilations_ = {1, 1};
     int groups_ = 1;
-    int transpose_ = 1;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 }; // namespace ops

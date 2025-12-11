@@ -72,6 +72,15 @@ class Reshape : public Operator {
         }
 
         bool noop = false;
+        if (inshape.size() == dim.size()) {
+            noop = true;
+            for (size_t i = 0; i < inshape.size(); i++) {
+                if (inshape[i] != dim[i]) {
+                    noop = false;
+                    break;
+                }
+            }
+        }
         if (inshape.size() == 4 && dim.size() == 3) {
             if (inshape[0] == 1 && inshape[1] == dim[0] &&
                 inshape[2] == dim[1] && inshape[3] == dim[2]) {
@@ -82,9 +91,14 @@ class Reshape : public Operator {
                 dim[3] == inshape[2]) {
                 noop = true;
             }
-        } else if (inshape.size() == 4 && dim.size() == 4) {
-            if (inshape[0] == dim[0] && inshape[1] == dim[1] &&
-                inshape[2] == dim[2] && inshape[3] == dim[3]) {
+        } else if (inshape.size() == 4 && dim.size() == 2) {
+            if (inshape[0] == 1 && inshape[1] == 1 && inshape[2] == dim[0] &&
+                inshape[3] == dim[1]) {
+                noop = true;
+            }
+        } else if (inshape.size() == 2 && dim.size() == 4) {
+            if (dim[0] == 1 && dim[1] == 1 && inshape[0] == dim[2] &&
+                inshape[1] == dim[3]) {
                 noop = true;
             }
         }
@@ -95,24 +109,53 @@ class Reshape : public Operator {
             if (output->size() == 0) {
                 output->resize(dim);
             }
-            auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            objs_.emplace_back(output_image);
+            if (dim.size() <= 2) {
+                auto output_buff = output->as_storage_buffer(m_dev_);
+                objs_.emplace_back(output_buff);
+            } else {
+                auto output_image = output->as_output_image(m_dev_, m_cmd_);
+                objs_.emplace_back(output_image);
+            }
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            auto input_image = input->as_input_image(m_dev_, m_cmd_);
-            objs_.emplace_back(input_image);
+            if (inputs[0]->num_dims() <= 2) {
+                auto input_buff = input->as_storage_buffer(m_dev_);
+                objs_.emplace_back(input_buff);
+            } else {
+                auto input_image = input->as_input_image(m_dev_, m_cmd_);
+                objs_.emplace_back(input_image);
+            }
         });
 
         if (noop) {
             // copy directly, could be optimized by preprocess/compiler
-            auto output_image =
-                std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
+            if (inshape.size() < 3) {
+                auto output_buff =
+                    std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+                auto input_buff =
+                    std::dynamic_pointer_cast<VulkanBuffer>(objs_[1]);
+                input_buff->copyBufferToStageBuffer(
+                    m_cmd_->get(), output_buff->getBuffer(), 0);
+            } else {
+                auto output_image =
+                    std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
+                auto input_image =
+                    std::dynamic_pointer_cast<VulkanImage>(objs_[1]);
+                input_image->transferReadBarrier(m_cmd_->get());
+                output_image->copyImageToImage(m_cmd_->get(), input_image,
+                                               {0, 0, 0}, 0);
+            }
+            return;
+        }
+
+        if (dim.size() <= 2) {
+            auto output_buff =
+                std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
             auto input_image = std::dynamic_pointer_cast<VulkanImage>(objs_[1]);
-            input_image->transferReadBarrier(m_cmd_->get());
-            output_image->copyImageToImage(m_cmd_->get(), input_image,
-                                           {0, 0, 0}, 0);
+            input_image->copyImageToBuffer(m_cmd_->get(),
+                                           output_buff->getBuffer(), 0);
             return;
         }
 

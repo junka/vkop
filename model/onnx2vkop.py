@@ -388,45 +388,6 @@ def fuse_conv_simple_activation(vk_model):
     vk_model.nodes = new_nodes
 
 
-def fuse_conv_activation(vk_model):
-    """Fuse Conv + Activation (ReLU, Sigmoid, etc.) into Conv node."""
-    fused_nodes = []
-    skip_next = set()
-
-    # 支持的无参激活函数（ONNX op_type）
-    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6", "GateSigmoid"}
-
-    for i, node in enumerate(vk_model.nodes):
-        if i in skip_next:
-            continue
-
-        # 检查当前节点是否为 Conv
-        if node['op_type'] == 'Conv':
-            # 检查下一个节点是否存在且是激活函数
-            if i + 1 < len(vk_model.nodes):
-                next_node = vk_model.nodes[i + 1]
-                if (next_node['op_type'] in ACTIVATIONS and
-                    len(node['outputs']) == 1 and
-                    len(next_node['inputs']) == 1 and
-                    node['outputs'][0]['name'] == next_node['inputs'][0]['name']):
-
-                    # 融合：将激活函数名加入 Conv 的 attributes
-                    fused_node = node.copy()
-                    fused_node['attributes'] = node['attributes'].copy()
-                    fused_node['attributes']['activation'] = next_node['op_type']
-                    # 输出改为激活后的输出
-                    fused_node['outputs'] = next_node['outputs']
-
-                    fused_nodes.append(fused_node)
-                    skip_next.add(i + 1)  # 跳过激活节点
-                    continue
-
-        # 未融合，直接保留
-        fused_nodes.append(node)
-
-    vk_model.nodes = fused_nodes
-
-
 def broadcast_shapes(shape_a, shape_b):
     """Compute broadcasted shape per ONNX rules."""
     if not shape_a and not shape_b:
@@ -582,6 +543,94 @@ def merge_initializers(vk_model):
     print(f"Merged {len(bn_nodes)} BatchNormalization nodes, removed {len(merged_initializers)} initializers")
 
 
+def remove_redundant_reshape(vk_model):
+    """
+    Remove redundant reshape nodes where input and output shapes are the same.
+    Updates connections so that the reshape's input becomes the next node's input.
+    Also cleans up unused initializers.
+    """
+    nodes = vk_model.nodes
+    # Build mapping of output names to producing nodes
+    producer = {}
+    for node in nodes:
+        for out in node['outputs']:
+            producer[out['name']] = node
+    
+    # Track which nodes to remove
+    to_remove = set()
+    # Map from reshape output names to their input names
+    reshape_remap = {}
+    # Track initializers used by redundant reshapes
+    redundant_initializer_names = set()
+    
+    # First pass: identify redundant reshapes and build remapping
+    for idx, node in enumerate(nodes):
+        if node['op_type'] == 'Reshape':
+            # Check if input and output shapes are the same
+            if (len(node['inputs']) >= 1 and len(node['outputs']) >= 1 and
+                node['inputs'][0]['shape'] == node['outputs'][0]['shape']):
+                
+                # This is a redundant reshape node
+                input_name = node['inputs'][0]['name']
+                output_name = node['outputs'][0]['name']
+                
+                # Record the mapping for remapping
+                reshape_remap[output_name] = input_name
+                # Mark this reshape node for removal
+                to_remove.add(idx)
+                
+                # Collect initializers used by this reshape node (typically the shape tensor)
+                for inp in node['inputs'][1:]:  # Skip the first input (data), consider the shape input
+                    if inp['name'] in vk_model.initializers:
+                        redundant_initializer_names.add(inp['name'])
+                
+                print(f"Identified redundant Reshape node: {node['name']}")
+    
+    # Check if the collected initializers are used by any other nodes
+    # If not, they should be removed
+    initializers_to_remove = set()
+    if redundant_initializer_names:
+        # Build a set of all tensor names used by all nodes (except the ones we're removing)
+        used_tensors = set()
+        for idx, node in enumerate(nodes):
+            if idx not in to_remove:  # Skip nodes we're going to remove
+                for inp in node['inputs']:
+                    used_tensors.add(inp['name'])
+                for out in node['outputs']:
+                    used_tensors.add(out['name'])
+        
+        # Check if any of our redundant initializers are actually used elsewhere
+        for initializer_name in redundant_initializer_names:
+            if initializer_name not in used_tensors:
+                initializers_to_remove.add(initializer_name)
+    
+    # Second pass: update all nodes that reference the removed reshape outputs
+    for node in nodes:
+        if node['name'] in [nodes[i]['name'] for i in to_remove]:
+            continue  # Skip the nodes we're removing
+            
+        # Update inputs that reference removed reshape outputs
+        for inp in node['inputs']:
+            if inp['name'] in reshape_remap:
+                old_name = inp['name']
+                inp['name'] = reshape_remap[old_name]
+                # Also update the shape if needed (should be the same)
+                # Find the source node/input to get the correct shape
+                print(f"Remapped input {old_name} to {inp['name']} in node {node['name']}")
+    
+    # Remove the marked nodes
+    if to_remove:
+        vk_model.nodes = [node for idx, node in enumerate(nodes) if idx not in to_remove]
+        print(f"Removed {len(to_remove)} redundant reshape nodes")
+    
+    # Remove unused initializers
+    if initializers_to_remove:
+        for initializer_name in initializers_to_remove:
+            if initializer_name in vk_model.initializers:
+                del vk_model.initializers[initializer_name]
+        print(f"Removed {len(initializers_to_remove)} unused initializers: {initializers_to_remove}")
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -632,6 +681,7 @@ def parse_onnx_model(onnx_path):
         print("Graph output:", out.name, "of shape:", shape_dims)
         vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
 
+    modified_shapes = defaultdict(list)
     # Nodes with attributes and shapes of inputs/outputs
     ELEMWISE_OPS = {"Add", "And", "Div", "Equal", "Greater", "Less", "Max", "Mean",
          "Min", "Mul", "Or", "Pow", "Sub", "Sum", "Where", "Xor"}
@@ -674,6 +724,40 @@ def parse_onnx_model(onnx_path):
                 attributes[attr.name] = list(attr.floats)
             else:
                 print(f"Warning: Unsupported attribute type {attr.type} for attribute {attr.name}")
+
+        outputs_with_shape = []
+        for output_name in node.output:
+            print("  Output:", output_name)
+            # Find the output tensor to get its shape
+            output_tensor = None
+            for value_info in graph.value_info:
+                if value_info.name == output_name:
+                    output_tensor = value_info
+                    break
+            if output_tensor is None:
+                for out in graph.output:
+                    if out.name == output_name:
+                        output_tensor = out
+                        break
+            if output_tensor is None:
+                print(f"Warning: Output tensor {output_name} not found in graph.")
+                outputs_with_shape.append({'name': output_name, 'shape':[]})
+                continue
+            tensor_type = output_tensor.type.tensor_type
+            shape_dims = [
+                dim.dim_value if dim.HasField("dim_value") else 1
+                for dim in tensor_type.shape.dim
+            ]
+            #  GlobalAveragePool compression to 2d, so we can use storage instead of image
+            if node.op_type == "GlobalAveragePool" and len(shape_dims) >= 2:
+                original_shape = shape_dims[:]
+                shape_dims = [original_shape[0], original_shape[1]]
+                print(f"Modified GlobalAveragePool shape from {original_shape} to {shape_dims}")
+                modified_shapes[output_name] = shape_dims
+
+            outputs_with_shape.append(
+                {'name': output_name, 'shape': shape_dims}
+            )
 
         inputs_with_shape = []
         for input_name in node.input:
@@ -732,6 +816,9 @@ def parse_onnx_model(onnx_path):
                 dim.dim_value if dim.HasField("dim_value") else 1
                 for dim in tensor_type.shape.dim
             ]
+            if input_name in modified_shapes and len(modified_shapes[input_name]) > 0:
+                shape_dims = modified_shapes[input_name]
+                print(f"Modified shape of input {input_name} to {shape_dims}")
             inputs_with_shape.append(
                 {'name': input_name, 'shape': shape_dims}
             )
@@ -764,32 +851,7 @@ def parse_onnx_model(onnx_path):
                             new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
                             vk_model.initializers[initializer.name] = new_init
     
-        outputs_with_shape = []
-        for output_name in node.output:
-            print("  Output:", output_name)
-            # Find the output tensor to get its shape
-            output_tensor = None
-            for value_info in graph.value_info:
-                if value_info.name == output_name:
-                    output_tensor = value_info
-                    break
-            if output_tensor is None:
-                for out in graph.output:
-                    if out.name == output_name:
-                        output_tensor = out
-                        break
-            if output_tensor is None:
-                print(f"Warning: Output tensor {output_name} not found in graph.")
-                outputs_with_shape.append({'name': output_name, 'shape':[]})
-                continue
-            tensor_type = output_tensor.type.tensor_type
-            shape_dims = [
-                dim.dim_value if dim.HasField("dim_value") else 1
-                for dim in tensor_type.shape.dim
-            ]
-            outputs_with_shape.append(
-                {'name': output_name, 'shape': shape_dims}
-            )
+        
 
         vk_model.nodes.append({
             'op_type': node.op_type,
@@ -800,6 +862,7 @@ def parse_onnx_model(onnx_path):
         })
 
     merge_initializers(vk_model)
+    remove_redundant_reshape(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
 

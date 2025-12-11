@@ -41,6 +41,7 @@ class ITensor {
     }
     void set_transpose() { transpose_ = true; }
     bool get_transpose() const { return transpose_; }
+    void set_pack() { pack_ = true; }
     bool get_pack() const { return pack_; }
     std::vector<int> getShape() {
         if (dims_[3]) {
@@ -58,17 +59,24 @@ class ITensor {
         uint8_t ndim = num_dims();
         assert(ndim >= 3);
         int pre = ((ndim == 4) ? dims_[0] : 1);
-        auto batch = transpose_ ? dims_[ndim - 3] : pre;
-        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        int sec = ((ndim >= 3) ? dims_[ndim - 3] : 1);
+        auto batch = transpose_ ? sec : pre;
+        auto chan = transpose_ ? pre : sec;
         auto height = dims_[ndim - 2];
         auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
         return std::vector<int>{width, height * batch, chan4};
     }
     int get_batch() const { return (n_dims_ == 4) ? dims_[0] : 1; }
-    int get_channel() const { return (n_dims_ == 4) ? dims_[1] : dims_[0]; }
-    int get_height() const { return (n_dims_ == 4) ? dims_[2] : dims_[1]; }
-    int get_width() const { return (n_dims_ == 4) ? dims_[3] : dims_[2]; }
+    int get_channel() const {
+        return (n_dims_ == 4) ? dims_[1] : (n_dims_ == 3 ? dims_[0] : 1);
+    }
+    int get_height() const {
+        return (n_dims_ == 4) ? dims_[2] : (n_dims_ == 3 ? dims_[1] : dims_[0]);
+    }
+    int get_width() const {
+        return (n_dims_ == 4) ? dims_[3] : (n_dims_ == 3 ? dims_[2] : dims_[1]);
+    }
 
     static float fp16_to_fp32(uint16_t h) {
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
@@ -310,17 +318,17 @@ template <typename T> class Tensor : public ITensor {
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_) {
-            if (n_dims_ == 4 && dims_[2] == 1 && dims_[3] == 1) {
-                // for weight kernel 1x1
-                pack_ = true;
-                transpose_ = false;
-            }
             make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT |
                                VK_IMAGE_USAGE_STORAGE_BIT |
                                VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         }
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        if (!img) {
+            // Handle error case appropriately
+            throw std::runtime_error(
+                "Expected VulkanImage but got something else.");
+        }
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
             img->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
@@ -656,10 +664,11 @@ template <typename T> class Tensor : public ITensor {
                 "Failed to cast VulkanResource to VulkanImage");
         }
         uint8_t ndim = num_dims();
-        assert(ndim >= 3);
+        assert(ndim >= 2);
         int pre = ((ndim == 4) ? dims_[0] : 1);
-        auto batch = transpose_ ? dims_[ndim - 3] : pre;
-        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        int sec = ((ndim >= 3) ? dims_[ndim - 3] : 1);
+        auto batch = transpose_ ? sec : pre;
+        auto chan = transpose_ ? pre : sec;
         auto height = dims_[ndim - 2];
         auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
@@ -707,10 +716,11 @@ template <typename T> class Tensor : public ITensor {
 
     void convertRGBAToTensor(T *ptr) {
         uint8_t ndim = num_dims();
-        assert(ndim >= 3);
+        assert(ndim >= 2);
         int pre = ndim == 4 ? dims_[0] : 1;
-        auto batch = transpose_ ? dims_[ndim - 3] : pre;
-        auto chan = transpose_ ? pre : dims_[ndim - 3];
+        int sec = ((ndim >= 3) ? dims_[ndim - 3] : 1);
+        auto batch = transpose_ ? sec : pre;
+        auto chan = transpose_ ? pre : sec;
         auto height = dims_[ndim - 2];
         auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);

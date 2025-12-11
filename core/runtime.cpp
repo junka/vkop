@@ -35,6 +35,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
+    model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
     std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
@@ -140,9 +141,13 @@ void Runtime::LoadModel() {
                         inputs_for_node_type.end() &&
                     (inputs_for_node_type[init.name] == "Conv")) {
                     t->set_transpose();
+                    if (init.dims.size() == 4 && init.dims[2] == 1 &&
+                        init.dims[3] == 1) {
+                        t->set_pack();
+                    }
                 }
                 if (t->num_dims() == 2 || t->num_dims() == 1) {
-                    if ((t->num_dims() == 1 && t->num_elements() <= 4)) {
+                    if ((t->num_dims() == 1 && t->num_elements() <= 64)) {
                         t->fillToCPU(reinterpret_cast<float *>(src_ptr));
                     } else {
                         t->as_storage_buffer(dev);
