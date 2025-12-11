@@ -15,7 +15,7 @@ set(TESTS
     PowTest
     ErfTest
     ReluTest
-    BatchNorm2dTest
+    BatchNormTest
     SoftmaxTest
     FloorTest
     MaxPoolTest

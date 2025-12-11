@@ -73,60 +73,30 @@ class BatchNorm : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        if (inputs[0]->dtype() == typeid(float)) {
-            auto running_mean = core::as_tensor<float>(inputs[1]);
-            auto running_var = core::as_tensor<float>(inputs[2]);
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto t) {
+            using T = decltype(t);
+            auto para = core::as_tensor<T>(inputs[1]);
+            auto para_buffer = para->as_storage_buffer(m_dev_);
+            objs_.emplace_back(para_buffer);
+        });
 
-            auto weight = (inputs.size() > 3)
-                              ? core::as_tensor<float>(inputs[3])
-                              : nullptr;
-            auto bias = (inputs.size() > 4) ? core::as_tensor<float>(inputs[4])
-                                            : nullptr;
+        int batch = input_shape[0];
+        int depth = input_shape[1];
+        int out_height = input_shape[2];
+        int out_width = input_shape[3];
 
-            int batch = input_shape[0];
-            int depth = input_shape[1];
-            int out_height = input_shape[2];
-            int out_width = input_shape[3];
+        int realheight = out_height * batch;
 
-            int realheight = out_height * batch;
+        batchnorm::GpuBatchNormParam para;
+        para.eps = eps_;
+        para.momentum = momentum_;
+        para.outShape[0] = batch;
+        para.outShape[1] = depth;
+        para.outShape[2] = out_height;
+        para.outShape[3] = out_width;
 
-            batchnorm::GpuBatchNormParam para;
-            para.eps = eps_;
-            para.momentum = momentum_;
-            para.outShape[0] = batch;
-            para.outShape[1] = depth;
-            para.outShape[2] = out_height;
-            para.outShape[3] = out_width;
-
-            tensorBuffer_ = std::make_shared<VulkanBuffer>(
-                m_dev_, running_mean->size() * 4,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-
-            objs_.emplace_back(tensorBuffer_);
-
-            auto *var_buffer =
-                static_cast<float *>(tensorBuffer_->getMappedMemory());
-            for (int i = 0; i < running_mean->num_elements(); i++) {
-                *(var_buffer + 4 * i) = (*running_mean)[i];
-                *(var_buffer + 4 * i + 1) = (*running_var)[i];
-                if (inputs.size() > 3) {
-                    *(var_buffer + 4 * i + 2) = (*weight)[i];
-                } else {
-                    *(var_buffer + 4 * i + 2) = 1.0F;
-                }
-                if (inputs.size() > 4) {
-                    *(var_buffer + 4 * i + 3) = (*bias)[i];
-                } else {
-                    *(var_buffer + 4 * i + 3) = 0.0F;
-                }
-            }
-            tensorBuffer_->unmapMemory();
-
-            submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
-                   UP_DIV(depth, 4));
-        }
+        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+               UP_DIV(depth, 4));
     }
 
   private:

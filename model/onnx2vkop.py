@@ -149,9 +149,13 @@ def optimize_onnx_model(onnx_model):
         "fuse_add_bias_into_conv",  # Fuse add bias into convolution
         "fuse_bn_into_conv",  # Fuse batch normalization into convolution
     ]
-    guess_input = onnx_model.graph.input
+    initializer_names = {init.name for init in onnx_model.graph.initializer}
+    actual_inputs = [inp for inp in onnx_model.graph.input if inp.name not in initializer_names]
+    print("Actual model inputs:", [inp.name for inp in actual_inputs])
+    print("Parameters count:", len(initializer_names))
+
     input_shapes = {}
-    for inp in guess_input:
+    for inp in actual_inputs:
         name = inp.name
         tensor_type = inp.type.tensor_type
         dim = tensor_type.shape.dim
@@ -454,6 +458,130 @@ def broadcast_shapes(shape_a, shape_b):
     return result
 
 
+def merge_initializers(vk_model):
+    """
+    Merge batch normalization parameters into a single tensor [4, N]
+    where N is the number of channels.
+    
+    Layout:
+    Row 0: scale/weight (default: 1.0)
+    Row 1: bias (default: 0.0)
+    Row 2: mean (required)
+    Row 3: variance (required)
+    
+    This modifies the vk_model by:
+    1. Finding batch normalization nodes
+    2. Merging their 4 input parameters into one
+    3. Updating the nodes and initializers accordingly
+    """
+    
+    # Find all batch normalization nodes
+    bn_nodes = []
+    for i, node in enumerate(vk_model.nodes):
+        if node['op_type'] == 'BatchNormalization':
+            bn_nodes.append((i, node))
+    
+    # Keep track of which initializers have been merged
+    merged_initializers = set()
+    
+    for idx, node in bn_nodes:
+        # BatchNormalization typically has 5 inputs:
+        # input, scale, bias, mean, variance
+        if len(node['inputs']) < 5:
+            print(f"Warning: BatchNormalization node {node['name']} has less than 5 inputs")
+            continue
+            
+        # Get the names of the parameters
+        # input[0] is the actual input data
+        # inputs[1-4] are scale, bias, mean, variance respectively
+        input_data = node['inputs'][0]    # input data
+        scale_name = node['inputs'][1]['name']  # scale/weight
+        bias_name = node['inputs'][2]['name']   # bias
+        mean_name = node['inputs'][3]['name']   # mean
+        var_name = node['inputs'][4]['name']    # variance
+        
+        # Check if all required parameters exist
+        required_params = [mean_name, var_name]
+        for param_name in required_params:
+            if param_name not in vk_model.initializers:
+                print(f"Error: Required parameter {param_name} not found in initializers")
+                continue
+                
+        # Get the parameter arrays
+        try:
+            mean_array = numpy_helper.to_array(vk_model.initializers[mean_name])
+            var_array = numpy_helper.to_array(vk_model.initializers[var_name])
+            
+            # Validate that mean and variance have the same shape
+            if mean_array.shape != var_array.shape:
+                print(f"Error: Mean {mean_array.shape} and variance {var_array.shape} have different shapes")
+                continue
+                
+            # Handle optional parameters with defaults
+            if scale_name in vk_model.initializers:
+                scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
+            else:
+                scale_array = np.ones_like(mean_array, dtype=np.float32)
+                
+            if bias_name in vk_model.initializers:
+                bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
+            else:
+                bias_array = np.zeros_like(mean_array, dtype=np.float32)
+                
+            # Create merged tensor with shape [4, N]
+            # where N is the number of elements in each parameter
+            N = mean_array.size
+            merged_data = np.zeros((4, N), dtype=np.float32)
+            
+            # Reshape all arrays to 1D for consistent indexing
+            scale_flat = scale_array.flatten()
+            bias_flat = bias_array.flatten()
+            mean_flat = mean_array.flatten()
+            var_flat = var_array.flatten()
+            
+            # Fill the merged tensor
+            merged_data[0, :] = scale_flat    # scale/weight
+            merged_data[1, :] = bias_flat     # bias
+            merged_data[2, :] = mean_flat     # mean
+            merged_data[3, :] = var_flat      # variance
+            
+            # Create a new initializer name
+            merged_name = f"{node['name']}_bn_params"
+            
+            # Convert back to ONNX tensor
+            merged_tensor = numpy_helper.from_array(merged_data, merged_name)
+            
+            # Add the merged tensor to initializers
+            vk_model.initializers[merged_name] = merged_tensor
+            
+            # Update the node to use the merged parameter
+            # Change inputs from 5 to 2: [input, merged_params]
+            new_inputs = [
+                input_data,  # Original input data (index 0)
+                {'name': merged_name, 'shape': [4, N]}  # Merged parameters
+            ]
+            
+            node['inputs'] = new_inputs
+            
+            # Mark original initializers for removal
+            merged_initializers.update([scale_name, bias_name, mean_name, var_name])
+            
+            print(f"Merged BN parameters for node {node['name']}: "
+                  f"scale({scale_name}), bias({bias_name}), mean({mean_name}), var({var_name}) "
+                  f"-> merged({merged_name})")
+                  
+        except Exception as e:
+            print(f"Error processing BatchNormalization node {node['name']}: {e}")
+            continue
+    
+    # Remove the original individual initializers
+    for initializer_name in merged_initializers:
+        if initializer_name in vk_model.initializers:
+            del vk_model.initializers[initializer_name]
+    
+    print(f"Merged {len(bn_nodes)} BatchNormalization nodes, removed {len(merged_initializers)} initializers")
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -481,8 +609,11 @@ def parse_onnx_model(onnx_path):
         name = initializer.name
         vk_model.initializers[name] = initializer
 
+    initializer_names = {init.name for init in graph.initializer}
     # Inputs with shapes
     for inp in graph.input:
+        if inp.name in initializer_names:
+            continue
         tensor_type = inp.type.tensor_type
         shape_dims = [
             dim.dim_value if dim.HasField("dim_value") else 1
@@ -529,7 +660,6 @@ def parse_onnx_model(onnx_path):
             #     TYPE_PROTOS = 14;
             # }
 
-            print("  Attribute:", attr.name, "of ", attr)
             if attr.type == onnx.AttributeProto.INT:
                 attributes[attr.name] = attr.i
             elif attr.type == onnx.AttributeProto.FLOAT:
@@ -669,7 +799,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
-
+    merge_initializers(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
 

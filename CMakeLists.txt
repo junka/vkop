@@ -114,6 +114,7 @@ option(USE_DEBUG_LAYERS "Enable debug layers" OFF)
 option(USE_MEASURE_TIME "Enable measuring time" OFF)
 option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
 option(ENABLE_EXAMPLE "Enable example" ON)
+option(ENABLE_BENCHMARK "Enable benchmark" ON)
 
 if(USE_VALIDATION_LAYERS)
     target_compile_definitions(vkop PRIVATE USE_VALIDATION_LAYERS)
@@ -163,6 +164,10 @@ endif()
 
 if (ENABLE_EXAMPLE)
 add_subdirectory(example)
+endif ()
+
+if (ENABLE_BENCHMARK)
+add_subdirectory(benchmark)
 endif ()
 
 enable_testing()

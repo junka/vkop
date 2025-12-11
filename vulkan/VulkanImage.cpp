@@ -236,7 +236,6 @@ void VulkanImage::createImage() {
     image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     image_create_info.queueFamilyIndexCount = 0;
     image_create_info.pQueueFamilyIndices = nullptr;
-    printf("VKIMAGE %d %d %d\n", m_dim_.width, m_dim_.height, m_dim_.depth);
 #ifdef USE_VMA
     auto ret =
         m_vdev_->getVMA()->createImage(&image_create_info, &m_vma_image_);

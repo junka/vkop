@@ -46,9 +46,8 @@ public:
         {"momentum", "0.1"}, {"eps", "1e-5"}
     };
     std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> mean;
-    std::shared_ptr<Tensor<float>> var;
     std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<float>> para;
 
     BatchNormTest():TestCase("BatchNorm") {
         initTestdata();
@@ -126,12 +125,20 @@ private:
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->fillToCPU(torch_input);
-        mean = std::make_shared<Tensor<float>>(num_feature);
-        mean->fillToCPU(torch_mean);
-        var = std::make_shared<Tensor<float>>(num_feature);
-        var->fillToCPU(torch_var);
+        // mean = std::make_shared<Tensor<float>>(num_feature);
+        // mean->fillToCPU(torch_mean);
+        // var = std::make_shared<Tensor<float>>(num_feature);
+        // var->fillToCPU(torch_var);
         output = std::make_shared<Tensor<float>>(output_shape);
         output->fillToCPU(torch_output);
+        para = std::make_shared<Tensor<float>>(std::vector<int>{input_shape_[1], 4});
+        para->reserveOnCPU();
+        for (int i = 0; i < output_shape[1]; i++) {
+            (*para)[i * 4] = torch_mean[i];
+            (*para)[i * 4 + 1] = torch_var[i];
+            (*para)[i * 4 + 2] = 1.0F;
+            (*para)[i * 4 + 3] = 0.0F;
+        }
     }
 };
 }
@@ -173,7 +180,7 @@ int main() {
     }
 #endif
 
-    if (!bntest.run_test<float>({bntest.input, bntest.mean, bntest.var}, {bntest.output},
+    if (!bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
         [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
             if (!batchnorm_op) {

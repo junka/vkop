@@ -50,7 +50,7 @@ class Reshape : public Operator {
         auto shape = core::as_tensor<int64_t>(inputs[1]);
         assert(shape->num_dims() == 1);
         int n = shape->num_elements();
-        assert(n >= 3);
+
         std::vector<int> dim(n);
         for (int i = 0; i < n; i++) {
             dim[i] = (*shape)[i];
