@@ -6,8 +6,8 @@
 
 #include <memory>
 
-extern unsigned char batchnorm2d_spv[];
-extern unsigned int batchnorm2d_spv_len;
+extern unsigned char batchnorm_spv[];
+extern unsigned int batchnorm_spv_len;
 
 namespace vkop {
 namespace ops {
@@ -25,10 +25,10 @@ struct alignas(16) GpuBatchNormParam {
 };
 } // namespace batchnorm
 
-class BatchNorm2d : public Operator {
+class BatchNorm : public Operator {
   public:
-    BatchNorm2d()
-        : Operator(OpType::BATCHNORM, batchnorm2d_spv, batchnorm2d_spv_len,
+    BatchNorm()
+        : Operator(OpType::BATCHNORM, batchnorm_spv, batchnorm_spv_len,
                    sizeof(batchnorm::GpuBatchNormParam)) {
         n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,

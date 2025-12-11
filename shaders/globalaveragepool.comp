@@ -1,0 +1,38 @@
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set=0, binding = 0) writeonly buffer outputBuffer {
+    float data[];
+} Buffer;
+
+layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*H, C4]
+
+layout(push_constant) readonly uniform paraBuffer {
+    ivec4 inImageSize;
+    ivec4 inShape;
+} uParams;
+
+void main() {
+    ivec3 coord = ivec3(gl_GlobalInvocationID);
+    uint n = coord.x;
+    uint c4 = coord.z;
+    int N = uParams.inShape.x;
+    int C = uParams.inShape.y;
+    int H = uParams.inShape.z;
+    int W = uParams.inShape.w;
+    if (n >= N || c4 >= (C + 3) /4) return;
+    int numInputs = H * W;
+
+    vec4 sum = vec4(0.0);
+    for (int x = 0; x < W; x++) {
+        for (int y = 0; y < H; y++) {
+            uint total_h = n * H + y;
+            vec4 val = texelFetch(inputImage, ivec3(x, total_h, c4), 0);
+            sum += val;
+        }
+    }
+    for (int i = 0; i < 4; i++) {
+        Buffer.data[n * C + c4 * 4 + i]  = sum[i] / numInputs;
+    }
+}

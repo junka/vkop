@@ -13,10 +13,29 @@ layout(push_constant) uniform resizeBuffer{
     int antialias;
     int coordinate_transformation_mode;
     float cubic_coeff_a;
-}uResizeParam;
+} uResizeParam;
+
+#define HALF_PIXEL 0
+#define HALF_PIXEL_SYMMETRIC 1
+#define PYTORCH_HALF_PIXEL 2
+#define ALIGN_CORNERS 3
+#define ASYMMETRIC 4
+#define TF_CROP_AND_RESIZE 5
+
+#define NEAREST 0
+#define LINEAR 1
+#define CUBIC 2
+
+#define STRECH 0
+#define NOT_LARGER 1
+#define NOT_SMALLER 2
+
+#define ROUND_PREFER_FLOOR 0
+#define ROUND_PREFER_CEIL 1
+#define FLOOR 2
+#define CEIL 3
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
-
 
 
 vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int mode) {
@@ -29,7 +48,8 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
 
     float in_y, in_x;
 
-    if (mode == 0) { // half_pixel
+    if (mode == HALF_PIXEL) { // half_pixel
+        //x_original = (x_resized + 0.5) / scale - 0.5
         if (uResizeParam.outShape.z > 1) {
             in_y = (oh + 0.5) * ih / float(uResizeParam.outShape.z) - 0.5;
         } else {
@@ -40,14 +60,17 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
         } else {
             in_x = 0.5 * iw_m1;
         }
-    }
-    else if (mode == 1) { // half_pixel_symmetric
+    } else if (mode == HALF_PIXEL_SYMMETRIC) { // half_pixel_symmetric, since v19
+        // adjustment = output_width_int / output_width
+        // center = input_width / 2
+        // offset = center * (1 - adjustment)
+        // x_ori = offset + (x + 0.5) / scale - 0.5
         float scale_h = max(ih / float(uResizeParam.outShape.z), 1.0);
         float scale_w = max(iw / float(uResizeParam.outShape.w), 1.0);
         in_y = (oh + 0.5) * scale_h - 0.5;
         in_x = (ow + 0.5) * scale_w - 0.5;
-    }
-    else if (mode == 2) { // pytorch_half_pixel
+    } else if (mode == PYTORCH_HALF_PIXEL) { // pytorch_half_pixel
+        //x_original = length_resized > 1 ? (x_resized + 0.5) / scale - 0.5 : 0
         if (uResizeParam.outShape.z > 1) {
             in_y = (oh + 0.5) * ih / float(uResizeParam.outShape.z) - 0.5;
         } else {
@@ -59,7 +82,8 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
             in_x = 0.0;
         }
     }
-    else if (mode == 3) { // align_corners
+    else if (mode == ALIGN_CORNERS) { // align_corners
+        // x_original = x_resized * (length_original - 1) / (length_resized - 1)
         if (uResizeParam.outShape.z > 1) {
             in_y = oh * ih_m1 / (float(uResizeParam.outShape.z) - 1.0);
         } else {
@@ -70,12 +94,12 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
         } else {
             in_x = 0.0;
         }
-    }
-    else if (mode == 4) { // asymmetric
+    } else if (mode == ASYMMETRIC) { // asymmetric
+        // x_original = x_resized / scale
         in_y = oh * ih / float(uResizeParam.outShape.z);
         in_x = ow * iw / float(uResizeParam.outShape.w);
-    }
-    else { // mode == 5: tf_crop_and_resize (not supported here)
+    } else { // mode == 5: tf_crop_and_resize (not supported here)
+        // x_original = length_resized > 1 ? start_x * (length_original - 1) + x_resized * (end_x - start_x) * (length_original - 1) / (length_resized - 1) : 0.5 * (start_x + end_x) * (length_original - 1)
         in_y = 0.0;
         in_x = 0.0;
     }
@@ -97,6 +121,32 @@ vec4 sample_bilinear(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_
     vec4 top = mix(tl, tr, f.x);
     vec4 bot = mix(bl, br, f.x);
     return mix(top, bot, f.y);
+}
+
+vec4 sample_nearest(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_total)
+{
+    vec4 value;
+    ivec2 in_pixel;
+
+    if (uResizeParam.nearest_mode == ROUND_PREFER_FLOOR) {
+        // 0.5 -> 0: use floor(uv + 0.5 - eps)
+        const float eps = 1e-5;
+        in_pixel = ivec2(floor(uv + 0.5 - eps));
+    } 
+    else if (uResizeParam.nearest_mode == ROUND_PREFER_CEIL) {
+        // 0.5 -> 1: use floor(uv + 0.5)
+        in_pixel = ivec2(floor(uv + 0.5));
+    } 
+    else if (uResizeParam.nearest_mode == FLOOR) {
+        in_pixel = ivec2(floor(uv));
+    } 
+    else { // CEIL
+        in_pixel = ivec2(ceil(uv));
+    }
+
+    in_pixel.x = clamp(in_pixel.x, 0, in_w - 1);
+    in_pixel.y = clamp(in_pixel.y, 0, in_h_total - 1);
+    return value;
 }
 
 void main()
@@ -139,15 +189,9 @@ void main()
     if (uResizeParam.mode == 1) { // bilinear
         value = sample_bilinear(uInput, input_coord, c4, W_in, N * H_in);
     } else {
-        // Nearest neighbor
-        ivec2 in_pixel = ivec2(round(input_coord));
-        in_pixel.x = clamp(in_pixel.x, 0, W_in - 1);
-        in_pixel.y = clamp(in_pixel.y, 0, N * H_in - 1);
-        value = texelFetch(uInput, ivec3(in_pixel, c4), 0);
+        value = sample_nearest(uInput, input_coord, c4, W_in, N * H_in);
     }
 
-    // Output coordinate: same layout as input
-    int out_y_full = out_n * H_out + out_h;
-    imageStore(uOutput, ivec3(out_w, out_y_full, c4), value);
+    imageStore(uOutput, gid, value);
 }
 

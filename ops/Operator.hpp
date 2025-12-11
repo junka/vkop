@@ -51,10 +51,10 @@ class Operator {
     virtual void setAttribute(
         const std::unordered_map<std::string, std::string> &attributes) {
         if (!attributes.empty()) {
-            // for (const auto &attr : attributes) {
-            //     std::cout << "Warning: Unused attribute " << attr.first
-            //               << " in operator." << std::endl;
-            // }
+            for (const auto &attr : attributes) {
+                std::cout << "attribute " << attr.first << ": " << attr.second
+                          << " in operator." << std::endl;
+            }
         }
     }
     virtual inline std::vector<int> parse_attr_list(const std::string &str) {

@@ -6,11 +6,11 @@
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
-#include "ops/BatchNorm2d.hpp"
+#include "ops/BatchNorm.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
-using vkop::ops::BatchNorm2d;
+using vkop::ops::BatchNorm;
 #define USE_CPP_REFER 0
 namespace {
 #if USE_CPP_REFER
@@ -37,7 +37,7 @@ std::vector<float> batch_norm_2d(std::shared_ptr<Tensor<float>> &input, int batc
 }
 #endif
 
-class BatchNorm2dTest : public TestCase {
+class BatchNormTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
         1, 3, 4, 4
@@ -50,7 +50,7 @@ public:
     std::shared_ptr<Tensor<float>> var;
     std::shared_ptr<Tensor<float>> output;
 
-    BatchNorm2dTest():TestCase("BatchNorm") {
+    BatchNormTest():TestCase("BatchNorm") {
         initTestdata();
     }
 private:
@@ -140,7 +140,7 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
 
-    BatchNorm2dTest bntest;
+    BatchNormTest bntest;
 
 #if USE_CPP_REFER
     printf("\n===verify C++ refer ==========\n");
@@ -175,9 +175,9 @@ int main() {
 
     if (!bntest.run_test<float>({bntest.input, bntest.mean, bntest.var}, {bntest.output},
         [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *batchnorm_op = dynamic_cast<BatchNorm2d *>(op.get());
+            auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
             if (!batchnorm_op) {
-                LOG_ERROR("Failed to cast operator to BatchNorm2d");
+                LOG_ERROR("Failed to cast operator to BatchNorm");
                 return;
             }
             batchnorm_op->setAttribute(bntest.param);

@@ -131,22 +131,36 @@ std::vector<T> reference_resize(
 template<typename T>
 class ResizeTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 3, 8, 8};
-    std::vector<int> resize_ = {4, 4};
+    std::vector<int> input_shape_ = {1, 3, 4, 8};
+    std::vector<int> resize_ = {1, 3, 6, 4};
     bool align_corners_ = false;
     std::string mode_ = "bilinear";
     bool antialias_ = false;
     float cubic_coeff_a_ = -0.75; // pytorch fixed value
 
+    std::string buildSizeString(const std::vector<int>& sizes) {
+        std::string result = "[";
+        int rank = sizes.size();
+        for (size_t i = rank-2; i < sizes.size(); ++i) {
+            result += std::to_string(sizes[i]);
+            if (i < sizes.size() - 1) {
+                result += ", ";
+            }
+        }
+        result += "]";
+        return result;
+    }
     std::unordered_map<std::string, std::string> attributes = {
-        {"size", "["+std::to_string(resize_[0])+", "+std::to_string(resize_[1])+"]"},
+        {"size", buildSizeString(resize_)},
         // 用于上采样的算法: 'nearest'| 'linear'| 'bilinear'| 'bicubic'| 'trilinear'| 'area'| 'nearest-exact'
         // 对于2D 操作，仅考虑 nearest， bilinear, bicubic, area, nearest-exact
         {"mode", mode_},
         // align_corners works only for linear, bilinear, bicubic, trilinear
+        // {"coordinate_transformation_mode", "half_pixel"},
         {"align_corners", align_corners_ ? "True": "False"},
         // antialias works for 'bilinear', 'bicubic'
         {"antialias", antialias_ ? "True" : "False"},
+        // {"cubic_coeff_a", std::to_string(cubic_coeff_a_)},
     };
 
     std::shared_ptr<Tensor<T>> input_data_;
@@ -160,7 +174,7 @@ public:
 private:
     void initTestData() {
         std::vector<std::vector<int>> shapes;
-        shapes.push_back(input_shape_);
+        shapes.emplace_back(input_shape_);
 
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("interpolate", shapes, attributes);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);

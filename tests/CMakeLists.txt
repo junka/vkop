@@ -33,6 +33,7 @@ set(TESTS
     SliceTest
     ConcatTest
     SplitTest
+    GlobalAveragePoolTest
 )
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)

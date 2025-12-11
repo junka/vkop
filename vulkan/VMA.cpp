@@ -64,9 +64,9 @@ void VMA::createPools() {
     printf("Device pool memory type index: %d\n", mem_type_idx);
     VmaPoolCreateInfo device_pool_info = {};
     device_pool_info.memoryTypeIndex = mem_type_idx;
-    device_pool_info.blockSize = 16 * 1024 * 1024; // 16MB per block
+    device_pool_info.blockSize = 32 * 1024 * 1024; // 32MB per block
     device_pool_info.minBlockCount = 1;
-    device_pool_info.maxBlockCount = 32; // up to 16 * n
+    device_pool_info.maxBlockCount = 64; // up to 16 * n
     vmaCreatePool(allocator_, &device_pool_info, &device_pool_);
 
     // Staging pool (linear, for uploads/downloads)
@@ -101,7 +101,7 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
 
 VkResult VMA::createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img) {
     VmaAllocationCreateInfo alloc_info = {};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
     alloc_info.pool = device_pool_;
     img->allocator = allocator_;
     return vmaCreateImage(allocator_, imageInfo, &alloc_info, &img->image,

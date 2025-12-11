@@ -150,9 +150,7 @@ class Slice : public Operator {
             } else {
                 axes = std::make_shared<core::Tensor<T>>(rank);
                 std::vector<T> axes_data(rank);
-                for (int i = 0; i < rank; i++) {
-                    axes_data[i] = i;
-                }
+                std::iota(axes_data.begin(), axes_data.end(), 0);
                 axes->fillToCPU(axes_data);
             }
             if (inputs.size() > 4) {

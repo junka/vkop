@@ -1,5 +1,5 @@
 #include "Atan.hpp"
-#include "BatchNorm2d.hpp"
+#include "BatchNorm.hpp"
 #include "Erf.hpp"
 #include "Floor.hpp"
 #include "LayerNorm.hpp"
@@ -25,6 +25,7 @@
 #include "Softmax.hpp"
 
 #include "Concat.hpp"
+#include "GlobalAveragePool.hpp"
 #include "Reshape.hpp"
 #include "Slice.hpp"
 #include "Split.hpp"
@@ -39,7 +40,7 @@ namespace ops {
 REGISTER_OPERATOR(OpType::ATAN, Atan);
 REGISTER_OPERATOR(OpType::ERF, Erf);
 REGISTER_OPERATOR(OpType::RELU, Relu);
-REGISTER_OPERATOR(OpType::BATCHNORM, BatchNorm2d);
+REGISTER_OPERATOR(OpType::BATCHNORM, BatchNorm);
 REGISTER_OPERATOR(OpType::LAYERNORM, LayerNorm);
 REGISTER_OPERATOR(OpType::FLOOR, Floor);
 REGISTER_OPERATOR(OpType::SOFTPLUS, Softplus);
@@ -67,6 +68,8 @@ REGISTER_OPERATOR(OpType::SLICE, Slice);
 REGISTER_OPERATOR(OpType::TRANSPOSE, Transpose);
 REGISTER_OPERATOR(OpType::CONCAT, Concat);
 REGISTER_OPERATOR(OpType::SPLIT, Split);
+
+REGISTER_OPERATOR(OpType::GLOBALAVERAGEPOOL, GlobalAveragePool);
 
 } // namespace ops
 } // namespace vkop
