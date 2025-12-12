@@ -35,7 +35,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    model.dump_model();
+    // model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
     std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
@@ -313,7 +313,8 @@ void Runtime::Run() {
 #endif
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "inference time:" << elapsed.count() << " s" << std::endl;
+    std::cout << "inference time:" << elapsed.count() * 1000.0F << " ms"
+              << std::endl;
     id++;
     id %= vkop::kInflight;
 }

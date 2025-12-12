@@ -56,7 +56,8 @@ class VulkanBuffer : public VulkanResource {
                           VkAccessFlags dstAccessMask,
                           VkPipelineStageFlags src_stage,
                           VkPipelineStageFlags dst_stage, VkDeviceSize offset);
-    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage);
+    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                      bool device_local);
 };
 } // namespace vkop
 #endif // SRC_VULKANBUFFER_HPP_

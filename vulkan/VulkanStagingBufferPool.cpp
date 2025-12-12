@@ -6,7 +6,7 @@ namespace vkop {
 #define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
 namespace {
 constexpr int kStagingBufferSize =
-    1024 * 1024 * 16; // 16M,  greater than 1024 * 1024 * 3 for one image
+    1024 * 1024 * 16; // 32M,  greater than 1024 * 1024 * 3 for one image
 }
 
 VulkanStagingBufferPool::VulkanStagingBufferPool(
@@ -16,13 +16,13 @@ VulkanStagingBufferPool::VulkanStagingBufferPool(
         m_vdev_, kStagingBufferSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-            VK_MEMORY_PROPERTY_HOST_CACHED_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     if (!m_buffer_) {
         throw std::runtime_error("Failed to create staging buffer");
     }
     mapped_memory_ = m_buffer_->getMappedMemory();
+    assert(mapped_memory_ != nullptr);
     m_poolSize_ = kStagingBufferSize;
 }
 
@@ -32,24 +32,27 @@ VulkanStagingBufferPool::~VulkanStagingBufferPool() {
 
 std::optional<StagingAllocation>
 VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
-
     assert(size != 0);
 
-    // 对齐 writePos
     VkDeviceSize aligned_write = ALIGN_UP(m_writePos_, alignment);
     VkDeviceSize next_write = aligned_write + size;
 
-    // 检查是否撞上 readPos（考虑 wrap-around）
-    // 逻辑：可用空间 = (m_readPos + m_poolSize) - m_writePos （在环形空间中）
-    // 但简化处理：如果 pending 提交太多，等 GPU 完成
-    // printf("writePos %lu, readPos %lu, poolSize %lu, aligned_write %lu, size
-    // "
-    //        "%lu, next_write %lu\n",
-    //        m_writePos_, m_readPos_, m_poolSize_, aligned_write, size,
-    //        next_write);
-    if (next_write - m_readPos_ > m_poolSize_) {
-        // 池满，无法分配
-        return std::nullopt;
+    // Check if allocation would go beyond buffer end
+    if (next_write > m_poolSize_) {
+        // Try wrapping to the beginning if there's space
+        VkDeviceSize wrapped_start = ALIGN_UP(0, alignment);
+        VkDeviceSize wrapped_end = wrapped_start + size;
+
+        // Only wrap if:
+        // 1. It fits at the beginning
+        // 2. It doesn't overlap with existing unread data
+        if (wrapped_end <= m_readPos_ || m_readPos_ == m_writePos_) {
+            aligned_write = wrapped_start;
+            next_write = wrapped_end;
+        } else {
+            // Cannot wrap due to overlapping with unread data
+            return std::nullopt;
+        }
     }
 
     VkDeviceSize physical_offset = aligned_write % m_poolSize_;

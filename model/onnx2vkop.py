@@ -581,8 +581,8 @@ def merge_initializers(vk_model):
             # Create merged tensor with shape [4, N]
             # where N is the number of elements in each parameter
             N = mean_array.size
-            padN = ((N+3)//4) * 4
-            merged_data = np.zeros((4, padN), dtype=np.float32)
+            padded_N = ((N+3)//4) * 4
+            merged_data = np.zeros((4, padded_N), dtype=np.float32)
 
             # Reshape all arrays to 1D for consistent indexing
             scale_flat = scale_array.flatten()

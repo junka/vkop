@@ -36,8 +36,8 @@ class VMA {
     ~VMA();
 
     // Allocate a Vulkan buffer with memory
-    VkResult createBuffer(VkBufferCreateInfo *bufferInfo,
-                          struct VmaBuffer *buf);
+    VkResult createBuffer(VkBufferCreateInfo *bufferInfo, struct VmaBuffer *buf,
+                          bool local);
 
     // Allocate a Vulkan image with memory
     VkResult createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img);
@@ -59,6 +59,7 @@ class VMA {
   private:
     VmaAllocator allocator_;
     VmaPool device_pool_ = VK_NULL_HANDLE;
+    VmaPool storage_pool_ = VK_NULL_HANDLE;
     VmaPool staging_pool_ = VK_NULL_HANDLE;
 
     void createPools();

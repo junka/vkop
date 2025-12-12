@@ -10,7 +10,9 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
                            VkDeviceSize size, VkBufferUsageFlags usage,
                            VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(vdev), m_size_(size) {
-    createBuffer(size, usage);
+    createBuffer(
+        size, usage,
+        ((requireProperties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0));
 #ifndef USE_VMA
 #ifdef VK_KHR_get_memory_requirements2
     VkMemoryRequirements2 mem_requirements2 = {};
@@ -31,7 +33,6 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
     vkBindBufferMemory(m_vdev_->getLogicalDevice(), m_buffer_, getMemory(), 0);
 #else
     (void)ext_fd;
-    (void)requireProperties;
 #endif
 }
 
@@ -53,7 +54,8 @@ VkBuffer VulkanBuffer::getBuffer() const {
 #endif
 }
 
-void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
+void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
+                                bool device_local) {
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = size;
@@ -62,7 +64,8 @@ void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage) {
     buffer_info.queueFamilyIndexCount = 0;
     buffer_info.pQueueFamilyIndices = nullptr;
 #ifdef USE_VMA
-    auto ret = m_vdev_->getVMA()->createBuffer(&buffer_info, &m_vma_buffer_);
+    auto ret = m_vdev_->getVMA()->createBuffer(&buffer_info, &m_vma_buffer_,
+                                               device_local);
 #else
     auto ret = vkCreateBuffer(m_vdev_->getLogicalDevice(), &buffer_info,
                               nullptr, &m_buffer_);

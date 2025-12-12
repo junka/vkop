@@ -37,6 +37,7 @@ VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
 
 VMA::~VMA() {
     vmaDestroyPool(allocator_, device_pool_);
+    vmaDestroyPool(allocator_, storage_pool_);
     vmaDestroyPool(allocator_, staging_pool_);
     vmaDestroyAllocator(allocator_);
 }
@@ -59,41 +60,78 @@ void VMA::createPools() {
 
     VmaAllocationCreateInfo alloc_info = {};
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
     vmaFindMemoryTypeIndexForImageInfo(allocator_, &img_info, &alloc_info,
                                        &mem_type_idx);
     printf("Device pool memory type index: %d\n", mem_type_idx);
     VmaPoolCreateInfo device_pool_info = {};
     device_pool_info.memoryTypeIndex = mem_type_idx;
-    device_pool_info.blockSize = 32 * 1024 * 1024; // 32MB per block
+    device_pool_info.blockSize = 16 * 1024 * 1024; // 16MB per block
     device_pool_info.minBlockCount = 1;
-    device_pool_info.maxBlockCount = 64; // up to 16 * n
+    device_pool_info.maxBlockCount = 32; // up to 16 * n
     vmaCreatePool(allocator_, &device_pool_info, &device_pool_);
+
+    VkBufferCreateInfo devbuf_info{};
+    memset(&alloc_info, 0, sizeof(alloc_info));
+    devbuf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    devbuf_info.size = 4096;
+    devbuf_info.usage = VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
+                        VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    devbuf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    alloc_info.flags = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT;
+    vmaFindMemoryTypeIndexForBufferInfo(allocator_, &devbuf_info, &alloc_info,
+                                        &mem_type_idx);
+    printf("device local pool memory type index: %d\n", mem_type_idx);
+    VmaPoolCreateInfo devicelocal_pool_info = {};
+    devicelocal_pool_info.memoryTypeIndex = mem_type_idx;
+    devicelocal_pool_info.flags = VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT;
+    devicelocal_pool_info.blockSize = 16 * 1024 * 1024;
+    devicelocal_pool_info.minBlockCount = 1;
+    devicelocal_pool_info.maxBlockCount = 16;
+    vmaCreatePool(allocator_, &devicelocal_pool_info, &storage_pool_);
 
     // Staging pool (linear, for uploads/downloads)
     VkBufferCreateInfo buf_info{};
+    memset(&alloc_info, 0, sizeof(alloc_info));
     buf_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buf_info.size = 4096;
-    buf_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                     VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    buf_info.usage =
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
     buf_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    alloc_info.flags =
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+        VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+        VMA_ALLOCATION_CREATE_MAPPED_BIT;
     vmaFindMemoryTypeIndexForBufferInfo(allocator_, &buf_info, &alloc_info,
                                         &mem_type_idx);
     printf("staing pool memory type index: %d\n", mem_type_idx);
     VmaPoolCreateInfo staging_pool_info = {};
     staging_pool_info.memoryTypeIndex = mem_type_idx;
     staging_pool_info.flags = VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT;
-    staging_pool_info.blockSize = 4 * 1024 * 1024;
+    staging_pool_info.blockSize = 16 * 1024 * 1024;
+    staging_pool_info.minBlockCount = 1;
+    staging_pool_info.maxBlockCount = 1;
     vmaCreatePool(allocator_, &staging_pool_info, &staging_pool_);
 }
 
 VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
-                           struct VmaBuffer *buf) {
+                           struct VmaBuffer *buf, bool local) {
     VmaAllocationCreateInfo alloc_info = {};
-    alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-    alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-                       VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    if (local) {
+        alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+        alloc_info.pool = storage_pool_;
+    } else {
+        alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
+        alloc_info.flags =
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
+            VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
+            VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        alloc_info.pool = staging_pool_;
+    }
     buf->allocator = allocator_;
     return vmaCreateBuffer(allocator_, bufferInfo, &alloc_info, &buf->buffer,
                            &buf->allocation, nullptr);
