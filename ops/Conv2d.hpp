@@ -30,7 +30,7 @@ enum class ActivationMode {
 using ivec4 = int[4];
 using ivec2 = int[2];
 
-struct GPUConv2dParam {
+struct alignas(16) GPUConv2dParam {
     ivec4 inputSize;
     ivec4 outputSize;
     ivec4 kernel_shape;
@@ -44,6 +44,9 @@ struct GPUConv2dParam {
     int transpose;
     int pack;
     int activation;
+
+    int fuse_bn;
+    float eps;
 };
 
 } // namespace conv2d
@@ -58,6 +61,7 @@ class Conv2d : public Operator {
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        //   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}; // batchnorm
         objs_.reserve(types_.size());
         activation_ = conv2d::ActivationMode::NONE;
     }
@@ -131,6 +135,10 @@ class Conv2d : public Operator {
                 throw std::invalid_argument("Unsupported auto_pad: " +
                                             auto_pad);
             }
+        }
+
+        if (attributes.find("eps") != attributes.end()) {
+            eps_ = std::stof(attributes.at("eps"));
         }
 
         if (attributes.find("activation") != attributes.end()) {
@@ -213,26 +221,24 @@ class Conv2d : public Operator {
                 bias ? bias->as_storage_buffer(m_dev_) : dummyBuffer_;
             objs_.emplace_back(weight_image);
             objs_.emplace_back(bias_buffer);
+
+            if (bias)
+                bias->copyToGPU(m_cmdpool_);
         };
         dispatch_by_dtype(inputs[1]->dtype(), process_weight_and_bias);
 
-        if (inputs[1]->dtype() == typeid(float)) {
-            auto bias = (inputs.size() > 2) ? core::as_tensor<float>(inputs[2])
-                                            : nullptr;
-
-            if (bias)
-                bias->copyToGPU(m_cmdpool_);
-
-        } else if (inputs[1]->dtype() == typeid(uint16_t)) {
-            auto bias = (inputs.size() > 2)
-                            ? core::as_tensor<uint16_t>(inputs[2])
-                            : nullptr;
-
-            if (bias)
-                bias->copyToGPU(m_cmdpool_);
+        if (inputs.size() > 2) {
+            dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
+                using T = decltype(type_tag);
+                auto para = core::as_tensor<T>(inputs[2]);
+                auto para_buffer = para->as_storage_buffer(m_dev_);
+                objs_.emplace_back(para_buffer);
+                if (types_.size() < 5)
+                    types_.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            });
         }
-        int realheight = out_height * batch;
 
+        auto out_gpu_shape = outputs[0]->getGPUShape();
         conv2d::GPUConv2dParam para;
         // vkimage params
         para.inputSize[0] = in_width;
@@ -247,9 +253,9 @@ class Conv2d : public Operator {
         para.kernel_shape[1] = weight_shape[2];
         para.kernel_shape[2] = weight_shape[1];
         para.kernel_shape[3] = weight_shape[0];
-        para.imageSize[0] = out_width;
-        para.imageSize[1] = realheight;
-        para.imageSize[2] = UP_DIV(out_depth, 4);
+        para.imageSize[0] = out_gpu_shape[0];
+        para.imageSize[1] = out_gpu_shape[1];
+        para.imageSize[2] = out_gpu_shape[2];
         para.imageSize[3] = 1;
         para.stride[0] = strides_[0];
         para.stride[1] = strides_[1];
@@ -264,8 +270,11 @@ class Conv2d : public Operator {
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
 
-        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
-               UP_DIV(out_depth, 4));
+        para.fuse_bn = 0;
+        para.eps = eps_;
+
+        submit(&para, UP_DIV(out_gpu_shape[0], 16),
+               UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
     void set_runtime_device(
         const std::shared_ptr<VulkanDevice> &dev,
@@ -284,6 +293,7 @@ class Conv2d : public Operator {
     std::vector<int> pads_ = {0, 0};
     std::vector<int> dilations_ = {1, 1};
     int groups_ = 1;
+    float eps_ = 1e-5;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 }; // namespace ops

@@ -52,7 +52,39 @@ layout(push_constant) uniform constBuffer {
     int transpose;       // weight transpose Cin, Cout
     int pack;            // pack 1x1 weight to single layer image
     int activation;
+    int bn_fuse;
+    float eps;
+    float momentum;
 } uConstant;
+
+vec4 batch_norm(vec4 value, int c4)
+{
+    vec4 mean4, var4, scale4, bias4;
+    int C_out = uConstant.outputSize.z;
+    for (int i = 0; i < 4; ++i) {
+        int c = c4 * 4 + i;
+        if (c < C_out) {
+            // vec4 params = uMeanVarScaleBias.attr[c]; // [mean, var, scale, bias]
+            vec4 params;
+            mean4[i] = params.x;
+            var4[i]  = params.y;
+            scale4[i] = params.z;
+            bias4[i] = params.w;
+        } else {
+            // Pad with identity transform for unused channels
+            mean4[i] = 0.0;
+            var4[i]  = 1.0;
+            scale4[i] = 1.0;
+            bias4[i] = 0.0;
+        }
+    }
+
+    // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
+    vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));
+    vec4 normalized = (value - mean4) * inv_std;
+    return scale4 * normalized + bias4;
+}
+
 
 void conv1x1() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
@@ -284,6 +316,10 @@ void conv1x1() {
             }
         }
         acc += bias_val;
+    }
+    if (uConstant.bn_fuse != 0) {
+        // Load per-channel parameters
+        acc = batch_norm(acc, c4);
     }
 
     acc = activation(acc, uConstant.activation);
@@ -556,6 +592,12 @@ void grouped_conv2d() {
         }
         acc += bias_val;
     }
+
+    if (uConstant.bn_fuse != 0) {
+        // Load per-channel parameters
+        acc = batch_norm(acc, c4);
+    }
+
 
     acc = activation(acc, uConstant.activation);
 

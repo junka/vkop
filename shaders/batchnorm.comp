@@ -1,5 +1,6 @@
 #version 450 core
 
+#include "activation.comp"
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set=0, binding = 0) writeonly uniform image2DArray outputImage; // [W, N*H, C4]
@@ -7,7 +8,7 @@ layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*
 // layout(set=0, binding = 1) uniform sampler2DArray paraImage; // merge paras to channesl
 
 // SSBO: length = C (number of channels)
-// Each element: vec4(mean, variance, scale, bias) for ONE channel
+// Each element: vec4(scale, bias, mean, variance) for ONE channel
 layout(set=0, binding = 2) readonly buffer tensorBuffer {
     vec4 attr[]; // size = C
 } uMeanVarScaleBias;
@@ -15,7 +16,7 @@ layout(set=0, binding = 2) readonly buffer tensorBuffer {
 layout(push_constant) readonly uniform batchNormBuffer {
     ivec4 outShape; // [N, C, H, W] — note: PyTorch uses NCHW
     float eps;
-    float momentum; // unused in inference
+    int activation;
 } uBatchNormParam;
 
 void main() {
@@ -42,30 +43,19 @@ void main() {
     // Fetch input pixel (RGBA = 4 channels)
     vec4 inputPixel = texelFetch(inputImage, ivec3(w, nh, c4), 0);
 
-    // Load per-channel parameters
-    vec4 mean4, var4, scale4, bias4;
-    for (int i = 0; i < 4; ++i) {
-        int c = c4 * 4 + i;
-        if (c < C) {
-            vec4 params = uMeanVarScaleBias.attr[c]; // [mean, var, scale, bias]
-            mean4[i] = params.x;
-            var4[i]  = params.y;
-            scale4[i] = params.z;
-            bias4[i] = params.w;
-        } else {
-            // Pad with identity transform for unused channels
-            mean4[i] = 0.0;
-            var4[i]  = 1.0;
-            scale4[i] = 1.0;
-            bias4[i] = 0.0;
-        }
-    }
+    // Load per-channel parameters, padding done in previous step
+    // vec4 mean4, var4, scale4, bias4;
+    vec4 scale4 = uMeanVarScaleBias.attr[c4 * 4];
+    vec4 bias4 = uMeanVarScaleBias.attr[c4 * 4 + 1];
+    vec4 mean4 = uMeanVarScaleBias.attr[c4 * 4 + 2];
+    vec4 var4 = uMeanVarScaleBias.attr[c4 * 4 + 3];
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));
     vec4 normalized = (inputPixel - mean4) * inv_std;
-    vec4 outputPixel = scale4 * normalized + bias4;
-
+    vec4 pixel = scale4 * normalized + bias4;
+    
+    pixel = activation(pixel, uBatchNormParam.activation);
     // Store result
-    imageStore(outputImage, ivec3(w, nh, c4), outputPixel);
+    imageStore(outputImage, ivec3(w, nh, c4), pixel);
 }

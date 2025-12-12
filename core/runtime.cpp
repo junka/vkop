@@ -48,6 +48,7 @@ void Runtime::LoadModel() {
             inputs_for_node_type[in_shape.name] = n.op_type;
         }
     }
+    printf("Total nodes %zu\n", model.nodes.size());
     for (const auto &i : model.inputs) {
 #ifdef FP16
         // not really needed, TODO: make it more flexible

@@ -337,6 +337,95 @@ def fuse_gated_conv(vk_model):
     print("Fusing gated convs...", len(to_remove))
     vk_model.nodes = new_nodes
 
+
+def fuse_conv_bn_relu(vk_model):
+    """
+    Fuse Conv + BatchNormalization + ReLU patterns into a single Conv node.
+    This optimization reduces the number of operations and can improve performance.
+    """
+    producer, consumers = build_graph_index(vk_model.nodes)
+    
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    # 记录要删除的节点
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}
+
+    for node in nodes:
+        # 只处理Conv节点
+        if node['op_type'] != 'Conv':
+            continue
+
+        conv_out = node['outputs'][0]['name']
+        
+        # 检查Conv的输出是否被单一节点消费
+        conv_consumers = consumers.get(conv_out, [])
+        if len(conv_consumers) != 1:
+            continue
+            
+        bn_node, _ = conv_consumers[0]
+        # 检查消费者是否为BatchNormalization
+        if bn_node['op_type'] != 'BatchNormalization':
+            continue
+            
+        bn_out = bn_node['outputs'][0]['name']
+        # 检查BN的输出是否被单一节点消费
+        bn_consumers = consumers.get(bn_out, [])
+        if len(bn_consumers) != 1:
+            continue
+            
+        relu_node, _ = bn_consumers[0]
+        # 检查消费者是否为ReLU
+        if relu_node['op_type'] != 'Relu':
+            continue
+
+        # 创建融合后的节点
+        fused = node.copy()
+        fused['attributes'] = dict(node.get('attributes', {}))
+        
+         # 复制BN节点的所有属性，这些属性包含了合并后的BN参数信息
+        if 'attributes' in bn_node:
+            for key, value in bn_node['attributes'].items():
+                fused['attributes'][key] = value
+
+        # 将BN和ReLU的信息合并到Conv中
+        fused['attributes']['fused_bn'] = 1
+        fused['attributes']['activation'] = 'Relu'
+        fused['outputs'] = relu_node['outputs']  # 输出为 Relu 的输出
+
+        if len(bn_node['inputs']) >= 2:
+            # 添加BN的参数输入到融合后的节点
+            # 第一个是来自Conv的输入，第二个是合并后的BN参数
+            bn_params_input = bn_node['inputs'][1]  # 合并后的BN参数
+            fused['inputs'] = node['inputs'] + [bn_params_input]
+
+        first_idx = node['_orig_idx']
+        replacements[first_idx] = fused
+        
+        # 标记要删除的节点
+        to_remove.add(node['_orig_idx'])
+        to_remove.add(bn_node['_orig_idx'])
+        to_remove.add(relu_node['_orig_idx'])
+
+    # 构建新的节点列表
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # 如果这是融合子图的第一个节点，就放 fused node
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+        else:
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        node.pop('_orig_idx', None)
+
+    print("Fusing Conv+BN+ReLU patterns...", len(to_remove))
+    vk_model.nodes = new_nodes
+
+
 def fuse_conv_simple_activation(vk_model):
     producer, consumers = build_graph_index(vk_model.nodes)
     ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
@@ -349,7 +438,7 @@ def fuse_conv_simple_activation(vk_model):
     replacements: Dict[int, Dict] = {}
 
     for node in nodes:
-        if node['op_type'] == 'Conv' and len(node['outputs']) == 1:
+        if node['op_type'] in ['Conv', 'BatchNormalization'] and len(node['outputs']) == 1:
             out_name = node['outputs'][0]['name']
             outs = consumers.get(out_name, [])
             if len(outs) == 1:
@@ -423,35 +512,35 @@ def merge_initializers(vk_model):
     """
     Merge batch normalization parameters into a single tensor [4, N]
     where N is the number of channels.
-    
+
     Layout:
     Row 0: scale/weight (default: 1.0)
     Row 1: bias (default: 0.0)
     Row 2: mean (required)
     Row 3: variance (required)
-    
+
     This modifies the vk_model by:
     1. Finding batch normalization nodes
     2. Merging their 4 input parameters into one
     3. Updating the nodes and initializers accordingly
     """
-    
+
     # Find all batch normalization nodes
     bn_nodes = []
     for i, node in enumerate(vk_model.nodes):
         if node['op_type'] == 'BatchNormalization':
             bn_nodes.append((i, node))
-    
+
     # Keep track of which initializers have been merged
     merged_initializers = set()
-    
+
     for idx, node in bn_nodes:
         # BatchNormalization typically has 5 inputs:
         # input, scale, bias, mean, variance
         if len(node['inputs']) < 5:
             print(f"Warning: BatchNormalization node {node['name']} has less than 5 inputs")
             continue
-            
+
         # Get the names of the parameters
         # input[0] is the actual input data
         # inputs[1-4] are scale, bias, mean, variance respectively
@@ -460,58 +549,65 @@ def merge_initializers(vk_model):
         bias_name = node['inputs'][2]['name']   # bias
         mean_name = node['inputs'][3]['name']   # mean
         var_name = node['inputs'][4]['name']    # variance
-        
+
         # Check if all required parameters exist
         required_params = [mean_name, var_name]
         for param_name in required_params:
             if param_name not in vk_model.initializers:
                 print(f"Error: Required parameter {param_name} not found in initializers")
                 continue
-                
+
         # Get the parameter arrays
         try:
             mean_array = numpy_helper.to_array(vk_model.initializers[mean_name])
             var_array = numpy_helper.to_array(vk_model.initializers[var_name])
-            
+
             # Validate that mean and variance have the same shape
             if mean_array.shape != var_array.shape:
                 print(f"Error: Mean {mean_array.shape} and variance {var_array.shape} have different shapes")
                 continue
-                
+
             # Handle optional parameters with defaults
             if scale_name in vk_model.initializers:
                 scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
             else:
                 scale_array = np.ones_like(mean_array, dtype=np.float32)
-                
+
             if bias_name in vk_model.initializers:
                 bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
             else:
                 bias_array = np.zeros_like(mean_array, dtype=np.float32)
-                
+
             # Create merged tensor with shape [4, N]
             # where N is the number of elements in each parameter
             N = mean_array.size
-            merged_data = np.zeros((4, N), dtype=np.float32)
-            
+            padN = ((N+3)//4) * 4
+            merged_data = np.zeros((4, padN), dtype=np.float32)
+
             # Reshape all arrays to 1D for consistent indexing
             scale_flat = scale_array.flatten()
             bias_flat = bias_array.flatten()
             mean_flat = mean_array.flatten()
             var_flat = var_array.flatten()
-            
+            if scale_flat.size < padded_N:
+                scale_flat = np.pad(scale_flat, (0, padded_N - scale_flat.size), constant_values=1.0)
+                bias_flat = np.pad(bias_flat, (0, padded_N - bias_flat.size), constant_values=0.0)
+                mean_flat = np.pad(mean_flat, (0, padded_N - mean_flat.size), constant_values=0.0)
+                var_flat = np.pad(var_flat, (0, padded_N - var_flat.size), constant_values=1.0)
+
             # Fill the merged tensor
-            merged_data[0, :] = scale_flat    # scale/weight
-            merged_data[1, :] = bias_flat     # bias
-            merged_data[2, :] = mean_flat     # mean
-            merged_data[3, :] = var_flat      # variance
-            
+            for i in range(padded_N // 4):
+                base_idx = i * 4
+                merged_data[0, base_idx:base_idx+4] = scale_flat[base_idx:base_idx+4]  # scale
+                merged_data[1, base_idx:base_idx+4] = bias_flat[base_idx:base_idx+4]   # bias
+                merged_data[2, base_idx:base_idx+4] = mean_flat[base_idx:base_idx+4]   # mean
+                merged_data[3, base_idx:base_idx+4] = var_flat[base_idx:base_idx+4]    # variance            
             # Create a new initializer name
             merged_name = f"{node['name']}_bn_params"
-            
+
             # Convert back to ONNX tensor
             merged_tensor = numpy_helper.from_array(merged_data, merged_name)
-            
+
             # Add the merged tensor to initializers
             vk_model.initializers[merged_name] = merged_tensor
             
@@ -521,25 +617,25 @@ def merge_initializers(vk_model):
                 input_data,  # Original input data (index 0)
                 {'name': merged_name, 'shape': [4, N]}  # Merged parameters
             ]
-            
+
             node['inputs'] = new_inputs
-            
+
             # Mark original initializers for removal
             merged_initializers.update([scale_name, bias_name, mean_name, var_name])
-            
+
             print(f"Merged BN parameters for node {node['name']}: "
                   f"scale({scale_name}), bias({bias_name}), mean({mean_name}), var({var_name}) "
                   f"-> merged({merged_name})")
-                  
+
         except Exception as e:
             print(f"Error processing BatchNormalization node {node['name']}: {e}")
             continue
-    
+
     # Remove the original individual initializers
     for initializer_name in merged_initializers:
         if initializer_name in vk_model.initializers:
             del vk_model.initializers[initializer_name]
-    
+
     print(f"Merged {len(bn_nodes)} BatchNormalization nodes, removed {len(merged_initializers)} initializers")
 
 
@@ -555,37 +651,37 @@ def remove_redundant_reshape(vk_model):
     for node in nodes:
         for out in node['outputs']:
             producer[out['name']] = node
-    
+
     # Track which nodes to remove
     to_remove = set()
     # Map from reshape output names to their input names
     reshape_remap = {}
     # Track initializers used by redundant reshapes
     redundant_initializer_names = set()
-    
+
     # First pass: identify redundant reshapes and build remapping
     for idx, node in enumerate(nodes):
         if node['op_type'] == 'Reshape':
             # Check if input and output shapes are the same
             if (len(node['inputs']) >= 1 and len(node['outputs']) >= 1 and
                 node['inputs'][0]['shape'] == node['outputs'][0]['shape']):
-                
+
                 # This is a redundant reshape node
                 input_name = node['inputs'][0]['name']
                 output_name = node['outputs'][0]['name']
-                
+
                 # Record the mapping for remapping
                 reshape_remap[output_name] = input_name
                 # Mark this reshape node for removal
                 to_remove.add(idx)
-                
+
                 # Collect initializers used by this reshape node (typically the shape tensor)
                 for inp in node['inputs'][1:]:  # Skip the first input (data), consider the shape input
                     if inp['name'] in vk_model.initializers:
                         redundant_initializer_names.add(inp['name'])
-                
+
                 print(f"Identified redundant Reshape node: {node['name']}")
-    
+
     # Check if the collected initializers are used by any other nodes
     # If not, they should be removed
     initializers_to_remove = set()
@@ -598,17 +694,17 @@ def remove_redundant_reshape(vk_model):
                     used_tensors.add(inp['name'])
                 for out in node['outputs']:
                     used_tensors.add(out['name'])
-        
+
         # Check if any of our redundant initializers are actually used elsewhere
         for initializer_name in redundant_initializer_names:
             if initializer_name not in used_tensors:
                 initializers_to_remove.add(initializer_name)
-    
+
     # Second pass: update all nodes that reference the removed reshape outputs
     for node in nodes:
         if node['name'] in [nodes[i]['name'] for i in to_remove]:
             continue  # Skip the nodes we're removing
-            
+
         # Update inputs that reference removed reshape outputs
         for inp in node['inputs']:
             if inp['name'] in reshape_remap:
@@ -617,12 +713,12 @@ def remove_redundant_reshape(vk_model):
                 # Also update the shape if needed (should be the same)
                 # Find the source node/input to get the correct shape
                 print(f"Remapped input {old_name} to {inp['name']} in node {node['name']}")
-    
+
     # Remove the marked nodes
     if to_remove:
         vk_model.nodes = [node for idx, node in enumerate(nodes) if idx not in to_remove]
         print(f"Removed {len(to_remove)} redundant reshape nodes")
-    
+
     # Remove unused initializers
     if initializers_to_remove:
         for initializer_name in initializers_to_remove:
@@ -863,6 +959,7 @@ def parse_onnx_model(onnx_path):
 
     merge_initializers(vk_model)
     remove_redundant_reshape(vk_model)
+    fuse_conv_bn_relu(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
 

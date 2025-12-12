@@ -164,7 +164,7 @@ int main(int argc, char *argv[]) {
     data.clear();
     data.shrink_to_fit();
 
-    for (int i = 0; i < 1000; i ++) {
+    for (int i = 0; i < 100; i ++) {
         rt->Run();
     }
     rt->ReadResult();

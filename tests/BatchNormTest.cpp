@@ -43,7 +43,7 @@ public:
         1, 3, 4, 4
     };
     const std::unordered_map<std::string, std::string> param = {
-        {"momentum", "0.1"}, {"eps", "1e-5"}
+        {"eps", "1e-5"}
     };
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
@@ -125,19 +125,23 @@ private:
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->fillToCPU(torch_input);
-        // mean = std::make_shared<Tensor<float>>(num_feature);
-        // mean->fillToCPU(torch_mean);
-        // var = std::make_shared<Tensor<float>>(num_feature);
-        // var->fillToCPU(torch_var);
         output = std::make_shared<Tensor<float>>(output_shape);
         output->fillToCPU(torch_output);
-        para = std::make_shared<Tensor<float>>(std::vector<int>{input_shape_[1], 4});
+        para = std::make_shared<Tensor<float>>(std::vector<int>{UP_DIV(input_shape_[1], 4) *4, 4});
         para->reserveOnCPU();
-        for (int i = 0; i < output_shape[1]; i++) {
-            (*para)[i * 4] = torch_mean[i];
-            (*para)[i * 4 + 1] = torch_var[i];
-            (*para)[i * 4 + 2] = 1.0F;
-            (*para)[i * 4 + 3] = 0.0F;
+        // fill every element as vec4
+        int c = input->get_channel();
+        int c4 = UP_DIV(c, 4);
+        for (int i = 0; i < c4; i++) {      
+            for (int j = 0; j < 4; j++) {
+                if (i * 4 + j >= c) {
+                    break;
+                }
+                (*para)[i * 4 +j] = 1.0F;
+                (*para)[(i + 1) * 4+j] = 0.0F;
+                (*para)[(i + 2) * 4+j] = torch_mean[i*4+j];
+                (*para)[(i + 3) * 4+j] = torch_var[i*4+j];
+            }
         }
     }
 };

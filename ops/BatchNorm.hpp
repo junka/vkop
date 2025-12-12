@@ -3,6 +3,7 @@
 #define OPS_BATCHNORM2D_HPP_
 
 #include "Operator.hpp"
+#include "ops/Conv2d.hpp"
 
 #include <memory>
 
@@ -20,8 +21,8 @@ using ivec4 = int[4];
 //                                eps=1e-05)
 struct alignas(16) GpuBatchNormParam {
     ivec4 outShape;
-    float eps;      // default 1e-5
-    float momentum; // default 0.1
+    float eps; // default 1e-5
+    int activation;
 };
 } // namespace batchnorm
 
@@ -38,15 +39,31 @@ class BatchNorm : public Operator {
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        attributes.find("training") != attributes.end()
-            ? training_ = (attributes.at("align_corners") == "1" ||
-                           attributes.at("align_corners") == "true")
-            : training_ = false;
+        // skip training, training_mode, spatial, since we don't need them
         if (attributes.find("eps") != attributes.end()) {
             eps_ = std::stof(attributes.at("eps"));
         }
-        if (attributes.find("momentum") != attributes.end()) {
-            momentum_ = std::stof(attributes.at("momentum"));
+
+        if (attributes.find("activation") != attributes.end()) {
+            std::string activation = attributes.at("activation");
+            if (activation == "Relu") {
+                activation_ = conv2d::ActivationMode::RELU;
+            } else if (activation == "Sigmoid") {
+                activation_ = conv2d::ActivationMode::SIGMOID;
+            } else if (activation == "Tanh") {
+                activation_ = conv2d::ActivationMode::TANH;
+            } else if (activation == "HardSwish") {
+                activation_ = conv2d::ActivationMode::HARDSWISH;
+            } else if (activation == "Mish") {
+                activation_ = conv2d::ActivationMode::MISH;
+            } else if (activation == "Relu6") {
+                activation_ = conv2d::ActivationMode::RELU6;
+            } else if (activation == "GateSigmoid") {
+                activation_ = conv2d::ActivationMode::GATE_SIGMOID;
+            } else {
+                throw std::invalid_argument("Unsupported activation: " +
+                                            activation);
+            }
         }
     }
 
@@ -89,7 +106,7 @@ class BatchNorm : public Operator {
 
         batchnorm::GpuBatchNormParam para;
         para.eps = eps_;
-        para.momentum = momentum_;
+        para.activation = static_cast<int>(activation_);
         para.outShape[0] = batch;
         para.outShape[1] = depth;
         para.outShape[2] = out_height;
@@ -100,9 +117,8 @@ class BatchNorm : public Operator {
     }
 
   private:
-    bool training_ = false;
-    float momentum_ = 0.1;
     float eps_ = 1e-5;
+    conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 
     std::shared_ptr<VulkanBuffer> tensorBuffer_;
 };
