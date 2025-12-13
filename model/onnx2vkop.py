@@ -571,18 +571,18 @@ def merge_initializers(vk_model):
             if scale_name in vk_model.initializers:
                 scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
             else:
-                scale_array = np.ones_like(mean_array, dtype=np.float32)
+                scale_array = np.ones_like(mean_array, dtype=mean_array.dtype)
 
             if bias_name in vk_model.initializers:
                 bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
             else:
-                bias_array = np.zeros_like(mean_array, dtype=np.float32)
+                bias_array = np.zeros_like(mean_array, dtype=mean_array.dtype)
 
             # Create merged tensor with shape [4, N]
             # where N is the number of elements in each parameter
             N = mean_array.size
             padded_N = ((N+3)//4) * 4
-            merged_data = np.zeros((4, padded_N), dtype=np.float32)
+            merged_data = np.zeros((4, padded_N), dtype=mean_array.dtype)
 
             # Reshape all arrays to 1D for consistent indexing
             scale_flat = scale_array.flatten()
@@ -727,6 +727,123 @@ def remove_redundant_reshape(vk_model):
         print(f"Removed {len(initializers_to_remove)} unused initializers: {initializers_to_remove}")
 
 
+def quantize_to_fp16_selective(vk_model):
+    """
+    Selectively quantize model weights to FP16 based on operator type and parameter sensitivity.
+
+    This function converts only appropriate FP32 initializers to FP16, considering:
+    1. Which operator uses the initializer
+    2. What role the initializer plays (weights vs. batch norm parameters)
+    3. Sensitivity of different parameter types to quantization
+
+    Generally safe to convert:
+    - Convolution weights
+    - Gemm/Linear weights
+    - Recurrent weights
+
+    Usually NOT safe to convert:
+    - BatchNorm parameters (scale, bias, mean, var)
+    - Small embedding tables
+    """
+    print("Selectively quantizing model to FP16...")
+
+    converted_count = 0
+    skipped_count = 0
+
+    # Build mapping from initializer names to their consumers
+    initializer_consumers = defaultdict(list)
+    for node in vk_model.nodes:
+        for inp in node['inputs']:
+            initializer_consumers[inp['name']].append(node)
+
+    # Data types that should remain unchanged
+    preserve_types = {
+        onnx.TensorProto.UINT8,
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.UINT16,
+        onnx.TensorProto.INT16,
+        onnx.TensorProto.INT32,
+        onnx.TensorProto.INT64,
+        onnx.TensorProto.UINT32,
+        onnx.TensorProto.UINT64,
+        onnx.TensorProto.BOOL
+    }
+
+    # Operators whose weights are usually safe to quantize
+    safe_weight_operators = {
+        'Conv', 'Gemm', 'MatMul', 'ConvTranspose',
+        'LSTM', 'GRU', 'RNN'
+    }
+
+    # Parameters that are usually sensitive to FP16 quantization
+    sensitive_parameters = {
+        'BatchNormalization'
+    }
+
+    for name, initializer in vk_model.initializers.items():
+        # Skip non-FP32 tensors
+        if initializer.data_type != onnx.TensorProto.FLOAT:
+            if initializer.data_type in preserve_types:
+                print(f"Preserving {onnx.TensorProto.DataType.Name(initializer.data_type)} tensor '{name}'")
+            elif initializer.data_type == onnx.TensorProto.FLOAT16:
+                print(f"Skipping already FP16 tensor '{name}'")
+            else:
+                data_type_name = onnx.TensorProto.DataType.Name(initializer.data_type) if initializer.data_type <= 16 else "UNKNOWN"
+                print(f"Preserving {data_type_name} tensor '{name}' (type: {initializer.data_type})")
+            skipped_count += 1
+            continue
+
+        # Check who consumes this initializer
+        consumers = initializer_consumers.get(name, [])
+        consumer_ops = {node['op_type'] for node in consumers}
+
+        # Determine if this initializer should be quantized
+        should_quantize = False
+        reason = ""
+
+        if any(op in safe_weight_operators for op in consumer_ops):
+            # This initializer is consumed by operators known to be safe for FP16
+            should_quantize = True
+            reason = f"consumed by safe operators {consumer_ops}"
+        elif not consumers:
+            # Orphaned initializer - better to preserve
+            should_quantize = False
+            reason = "no consumers"
+        elif any(op in sensitive_parameters for op in consumer_ops):
+            # Consumed by sensitive operators like BatchNormalization
+            should_quantize = False
+            reason = f"consumed by sensitive operators {consumer_ops}"
+        else:
+            # Default behavior - check size (small tensors might be sensitive)
+            arr = numpy_helper.to_array(initializer)
+            if arr.size > 100:  # Arbitrary threshold - larger tensors are usually weights
+                should_quantize = True
+                reason = f"large tensor ({arr.size} elements)"
+            else:
+                should_quantize = False
+                reason = f"small tensor ({arr.size} elements)"
+        
+        if should_quantize:
+            # Convert to numpy array
+            arr = numpy_helper.to_array(initializer)
+
+            # Convert to FP16
+            arr_fp16 = arr.astype(np.float16)
+
+            # Convert back to ONNX tensor with FP16 data type
+            fp16_initializer = numpy_helper.from_array(arr_fp16, name)
+
+            # Update the initializer in the model
+            vk_model.initializers[name] = fp16_initializer
+            print(f"Converted FP32 tensor '{name}' to FP16 ({reason})")
+            converted_count += 1
+        else:
+            print(f"Preserving FP32 tensor '{name}' ({reason})")
+            skipped_count += 1
+
+    print(f"Converted {converted_count} FP32 tensors to FP16")
+    print(f"Preserved {skipped_count} tensors")
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -737,6 +854,7 @@ def parse_onnx_model(onnx_path):
     onnx.save(model, "optimized_" + os.path.basename(onnx_path))
 
     vk_model = VkModel()
+
     graph = model.graph
     try:
         onnx.checker.check_model(model, full_check=True)
@@ -957,6 +1075,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
+    # quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)
     remove_redundant_reshape(vk_model)
     fuse_conv_bn_relu(vk_model)

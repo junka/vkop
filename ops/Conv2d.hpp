@@ -60,17 +60,14 @@ class Conv2d : public Operator {
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
-        //   VK_DESCRIPTOR_TYPE_STORAGE_BUFFER}; // batchnorm
         objs_.reserve(types_.size());
         activation_ = conv2d::ActivationMode::NONE;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        // for (const auto &item : attributes) {
-        //     printf("%s: %s\n", item.first.c_str(), item.second.c_str());
-        // }
         if (attributes.find("dilations") != attributes.end()) {
             std::string dila_str = attributes.at("dilations");
             if (dila_str.find(',') != std::string::npos) {
@@ -136,7 +133,9 @@ class Conv2d : public Operator {
                                             auto_pad);
             }
         }
-
+        if (attributes.find("fused_bn") != attributes.end()) {
+            fuse_bn_ = std::stol(attributes.at("fused_bn"));
+        }
         if (attributes.find("eps") != attributes.end()) {
             eps_ = std::stof(attributes.at("eps"));
         }
@@ -233,9 +232,10 @@ class Conv2d : public Operator {
                 auto para = core::as_tensor<T>(inputs[2]);
                 auto para_buffer = para->as_storage_buffer(m_dev_);
                 objs_.emplace_back(para_buffer);
-                if (types_.size() < 5)
-                    types_.emplace_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
             });
+        } else {
+            auto para_buffer = dummyBuffer_;
+            objs_.emplace_back(para_buffer);
         }
 
         auto out_gpu_shape = outputs[0]->getGPUShape();
@@ -270,7 +270,7 @@ class Conv2d : public Operator {
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
 
-        para.fuse_bn = 0;
+        para.fuse_bn = fuse_bn_;
         para.eps = eps_;
 
         submit(&para, UP_DIV(out_gpu_shape[0], 16),
@@ -294,6 +294,7 @@ class Conv2d : public Operator {
     std::vector<int> dilations_ = {1, 1};
     int groups_ = 1;
     float eps_ = 1e-5;
+    int fuse_bn_ = 0;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 }; // namespace ops

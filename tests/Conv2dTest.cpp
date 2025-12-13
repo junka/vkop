@@ -313,11 +313,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-#ifdef FP16
-    Conv2dTest<uint16_t> ct;
-#else
     Conv2dTest<float> ct;
-#endif
     if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());

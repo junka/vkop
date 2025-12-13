@@ -67,7 +67,7 @@ void VMA::createPools() {
     VmaPoolCreateInfo device_pool_info = {};
     device_pool_info.memoryTypeIndex = mem_type_idx;
     device_pool_info.blockSize = 16 * 1024 * 1024; // 16MB per block
-    device_pool_info.minBlockCount = 1;
+    device_pool_info.minBlockCount = 0;
     device_pool_info.maxBlockCount = 32; // up to 16 * n
     vmaCreatePool(allocator_, &device_pool_info, &device_pool_);
 
@@ -113,7 +113,7 @@ void VMA::createPools() {
     staging_pool_info.memoryTypeIndex = mem_type_idx;
     staging_pool_info.flags = VMA_POOL_CREATE_LINEAR_ALGORITHM_BIT;
     staging_pool_info.blockSize = 16 * 1024 * 1024;
-    staging_pool_info.minBlockCount = 1;
+    staging_pool_info.minBlockCount = 0;
     staging_pool_info.maxBlockCount = 1;
     vmaCreatePool(allocator_, &staging_pool_info, &staging_pool_);
 }

@@ -163,30 +163,18 @@ int main() {
 
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
-#ifdef FP16
-    auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
-    auto t2 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x2"));
-    ModelTest<uint16_t> test;
-#else
+
     auto t1 = vkop::core::as_tensor<float>(rt->GetInput("input_x1"));
     auto t2 = vkop::core::as_tensor<float>(rt->GetInput("input_x2"));
 
     ModelTest<float> test;
-#endif
     test.initTestData(t1, t2);
     rt->Run();
     rt->ReadResult();
-#ifdef FP16
-    auto bias = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.bias"));
-    auto weight = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.weight"));
-    auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
-    std::vector<uint16_t> ref_output_data;
-#else
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
     auto weight = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight"));
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     std::vector<float> ref_output_data;
-#endif
     bias->copyToCPU(cmdpool);
     weight->copyToCPU(cmdpool);
 
@@ -206,18 +194,10 @@ int main() {
     int group = 1;
     test.reference_conv2d(test.expectedOutput.data(), weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
     for (int i = 0; i < result->num_elements(); ++i) {
-        #ifdef FP16
-        if (std::fabs(vkop::core::ITensor::fp16_to_fp32(result->at(i)) - vkop::core::ITensor::fp16_to_fp32(ref_output_data[i])) > 1e-5) {
-            printf("Failed at %d, %.3f vs %.3f\n", i, vkop::core::ITensor::fp16_to_fp32(result->at(i)), vkop::core::ITensor::fp16_to_fp32((ref_output_data[i])));
-            return 1;
-        }
-
-        #else
         if (std::fabs(result->at(i) - ref_output_data[i]) > 1e-5) {
             printf("Failed at %d, %.3f vs %.3f\n", i, result->at(i), ref_output_data[i]);
             return 1;
         }
-        #endif
     }
     return 0;
 }

@@ -84,8 +84,8 @@ std::vector<MaskInfo> postProcessNMS(
         float xo = sigmoid((*reg_data)[idx]) + x;
         float yo = sigmoid((*reg_data)[num_points + idx]) + y;
         // std::cout << "point at index " << idx << " has (x, y): (" << xo << ", " << yo << ")" << std::endl;
-        xo *= (tensor_w / W);
-        yo *= (tensor_h / H);
+        xo *= (static_cast<float>(tensor_w) / W);
+        yo *= (static_cast<float>(tensor_h) / H);
 
         float wo = std::exp((*dim_data)[idx]) * tensor_w / W;
         float ho = std::exp((*dim_data)[num_points + idx]) * tensor_h / H;
@@ -215,6 +215,10 @@ int main(int argc, char *argv[]) {
         auto input = rt->GetInput("input.1");
         int tensor_h = 0;
         int tensor_w = 0;
+        if (!input) {
+            printf("Input tensor not found\n");
+            return -1;
+        }
         if (input->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(input);
             tensor_h = t->getShape()[2];

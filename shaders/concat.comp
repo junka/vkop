@@ -1,8 +1,9 @@
 #version 450
+#extension GL_EXT_shader_image_load_formatted : enable
 
 layout(local_size_x = 16, local_size_y = 16) in;
 
-layout(set = 0, binding = 0, rgba32f) uniform image2DArray uOutput;
+layout(set = 0, binding = 0) uniform image2DArray uOutput;
 layout(set = 0, binding = 1) uniform sampler2DArray uInput;
 
 layout(push_constant) uniform concatBuffer {

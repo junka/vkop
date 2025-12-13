@@ -382,7 +382,7 @@ template <typename T> class Tensor : public ITensor {
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
-            std::vector<T> ptr(img->getImageSize());
+            std::vector<T> ptr(img->getImageSize() / sizeof(T));
             convertTensorToRGBA(ptr.data(), src);
             img->hostImageCopyToDevice(ptr.data());
             cmd.begin();

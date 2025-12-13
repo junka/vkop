@@ -33,7 +33,7 @@ private:
         inputb = std::make_shared<Tensor<T>>(input_shape_);
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
-        output = std::make_shared<Tensor<float>>(input_shape_);
+        output = std::make_shared<Tensor<T>>(input_shape_);
         output->reserveOnCPU();
 
         std::random_device rd{};
@@ -61,12 +61,8 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
-#ifdef FP16
     AddTest<uint16_t> addtest;
-#else
-    AddTest<float> addtest;
-#endif
-    if (!addtest.run_test<float>({addtest.inputa, addtest.inputb}, {addtest.output})) {
+    if (!addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output})) {
         return -1;
     }
 

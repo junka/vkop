@@ -36,8 +36,12 @@ layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*
 layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
 layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
 layout(set=0, binding=3) readonly buffer biasBuffer {
-    FLOAT attr[]; // bias[C_out]
+    FLOAT attr[]; // C4
 } uBias;
+
+layout(set=0, binding=4) readonly buffer bnBuffer {
+    vec4 attr[]; // size = C_out
+} uBnPara;
 
 layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // [W_in, H_in, C_in, N]
@@ -52,32 +56,16 @@ layout(push_constant) uniform constBuffer {
     int transpose;       // weight transpose Cin, Cout
     int pack;            // pack 1x1 weight to single layer image
     int activation;
-    int bn_fuse;
+    int fuse_bn;
     float eps;
-    float momentum;
 } uConstant;
 
 vec4 batch_norm(vec4 value, int c4)
-{
-    vec4 mean4, var4, scale4, bias4;
-    int C_out = uConstant.outputSize.z;
-    for (int i = 0; i < 4; ++i) {
-        int c = c4 * 4 + i;
-        if (c < C_out) {
-            // vec4 params = uMeanVarScaleBias.attr[c]; // [mean, var, scale, bias]
-            vec4 params;
-            mean4[i] = params.x;
-            var4[i]  = params.y;
-            scale4[i] = params.z;
-            bias4[i] = params.w;
-        } else {
-            // Pad with identity transform for unused channels
-            mean4[i] = 0.0;
-            var4[i]  = 1.0;
-            scale4[i] = 1.0;
-            bias4[i] = 0.0;
-        }
-    }
+{   
+    vec4 scale4 = uBnPara.attr[c4 * 4];
+    vec4 bias4 = uBnPara.attr[c4 * 4 + 1];
+    vec4 mean4 = uBnPara.attr[c4 * 4 + 2];
+    vec4 var4 = uBnPara.attr[c4 * 4 + 3];
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));
@@ -85,6 +73,24 @@ vec4 batch_norm(vec4 value, int c4)
     return scale4 * normalized + bias4;
 }
 
+FLOAT4 add_bias(FLOAT4 value, int c4, bvec4 valid_oc) {
+    // FLOAT4 bias_value = uBias.attr[c4];
+    // for (int i = 0; i < 4; ++i) {
+    //     if (!valid_oc[i]) {
+    //         bias_value[i] = 0;
+    //     }
+    // }
+    // return value + bias_value;
+    int oc_start = c4 * 4;
+    ivec4 oc_vec = oc_start + ivec4(0, 1, 2, 3);
+    FLOAT4 bias_val = FLOAT4(0.0);
+    for (int i = 0; i < 4; ++i) {
+        if (valid_oc[i]) {
+            bias_val[i] = uBias.attr[oc_vec[i]];
+        }
+    }
+    return value + bias_val;
+}
 
 void conv1x1() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
@@ -309,15 +315,9 @@ void conv1x1() {
     }
 
     if (uConstant.bias == 1) {
-        FLOAT4 bias_val = FLOAT4(0.0);
-        for (int i = 0; i < 4; ++i) {
-            if (valid_oc[i]) {
-                bias_val[i] = uBias.attr[oc_vec[i]];
-            }
-        }
-        acc += bias_val;
+        acc = add_bias(acc, c4, valid_oc);
     }
-    if (uConstant.bn_fuse != 0) {
+    if (uConstant.fuse_bn != 0) {
         // Load per-channel parameters
         acc = batch_norm(acc, c4);
     }
@@ -584,16 +584,10 @@ void grouped_conv2d() {
 
     // Add bias
     if (uConstant.bias == 1) {
-        FLOAT4 bias_val = FLOAT4(0.0);
-        for (int i = 0; i < 4; ++i) {
-            if (valid_oc[i]) {
-                bias_val[i] = uBias.attr[oc_vec[i]];
-            }
-        }
-        acc += bias_val;
+        acc = add_bias(acc, c4, valid_oc);
     }
 
-    if (uConstant.bn_fuse != 0) {
+    if (uConstant.fuse_bn != 0) {
         // Load per-channel parameters
         acc = batch_norm(acc, c4);
     }

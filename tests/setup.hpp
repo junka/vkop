@@ -92,6 +92,7 @@ public:
                     output->copyToCPU(cmdpool);
                     auto oshape = output->getShape();
                     printf("output shape: %ld\n", oshape.size());
+                    #if 0
                     if (oshape.size() == 4) {
                         for (int i = 0; i < oshape[0]; i++) {
                             printf("[\n");
@@ -121,7 +122,8 @@ public:
                         }
                         printf("]\n");
                     }
-                    auto expect = core::as_tensor<float>(expect_outputs[idx]);
+                    #endif
+                    auto expect = core::as_tensor<T>(expect_outputs[idx]);
                     for (int i = 0; i < output->num_elements(); i++) {
                         if (sizeof(T) == 2) {
                             std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
