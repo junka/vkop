@@ -249,7 +249,7 @@ def build_graph_index(nodes):
             producer[out['name']] = node
         for idx, inp in enumerate(node['inputs']):
             consumers[inp['name']].append((node, idx))
-    
+
     return producer, consumers
 
 

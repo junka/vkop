@@ -35,7 +35,9 @@ class ITensor {
     void toGPU() { converted_ = true; }
     void toCPU() { converted_ = false; }
     void ref_inc() { ref_cnt_++; }
+    void ref_dec() { ref_cnt_--; }
     int ref_cnt() const { return ref_cnt_; }
+    void set_ref_cnt(uint16_t cnt) { ref_cnt_ = cnt; }
     void set_ref_cnt_forever() {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }

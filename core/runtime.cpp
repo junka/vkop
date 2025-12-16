@@ -1,6 +1,8 @@
 // junka @ 2025
 #include <chrono>
+#include <limits>
 #include <numeric>
+#include <queue>
 
 #include "core/runtime.hpp"
 #include "include/logger.hpp"
@@ -37,15 +39,20 @@ void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
     // model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
-    std::unordered_map<std::shared_ptr<ITensor>, std::string> tensor_name_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
+    std::unordered_map<std::string, std::queue<std::shared_ptr<ITensor>>>
+        outshape_tensor_map;
+
+    std::unordered_map<std::string, int> consumers;
+
     auto dev = m_cmdpool_->getVulkanDevice();
     // preprocess inputs, make sure we know node types for inputs
     // we can then use type to tell whether we can use fp16 as option
     for (const auto &n : model.nodes) {
         for (const auto &in_shape : n.inputs) {
             inputs_for_node_type[in_shape.name] = n.op_type;
+            consumers[in_shape.name] += 1;
         }
     }
     printf("Total nodes %zu\n", model.nodes.size());
@@ -54,7 +61,6 @@ void Runtime::LoadModel() {
         t->set_ref_cnt_forever();
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
-        tensor_name_map[t] = i.name;
         t->as_input_image(dev, nullptr);
     }
 
@@ -63,7 +69,6 @@ void Runtime::LoadModel() {
         t->set_ref_cnt_forever();
         outputs_[o.name] = t;
         tensor_map[o.name] = t;
-        tensor_name_map[t] = o.name;
     }
 
     auto handle_floating_point_tensor = [&](const load::Initializer &init,
@@ -87,7 +92,6 @@ void Runtime::LoadModel() {
             tensor->copyToGPU(m_cmdpool_, src_ptr);
         }
         tensor_map[init.name] = tensor;
-        tensor_name_map[tensor] = init.name;
         initializers_[init.name] = tensor;
     };
 
@@ -100,14 +104,12 @@ void Runtime::LoadModel() {
             t->set_ref_cnt_forever();
             t->fillToCPU(reinterpret_cast<int64_t *>(src_ptr));
             tensor_map[init.name] = t;
-            tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
             auto t = std::make_shared<Tensor<int>>(init.dims);
             t->set_ref_cnt_forever();
             t->fillToCPU(reinterpret_cast<int32_t *>(src_ptr));
             tensor_map[init.name] = t;
-            tensor_name_map[t] = init.name;
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
             auto t = std::make_shared<Tensor<float>>(init.dims);
@@ -133,22 +135,11 @@ void Runtime::LoadModel() {
         std::vector<std::shared_ptr<ITensor>> node_inputs;
         std::vector<std::shared_ptr<ITensor>> node_outputs;
 
-        for (const auto &out_shape : n.outputs) {
-            if (tensor_map.find(out_shape.name) != tensor_map.end()) {
-                assert(tensor_map[out_shape.name]->is_on_GPU());
-                node_outputs.push_back(tensor_map[out_shape.name]);
-            } else {
-                auto t = std::make_shared<Tensor<float>>(out_shape.dims, true);
-                tensor_map[out_shape.name] = t;
-                tensor_name_map[t] = out_shape.name;
-                node_outputs.push_back(t);
-            }
-        }
         for (const auto &in_shape : n.inputs) {
             if (tensor_map.find(in_shape.name) != tensor_map.end()) {
                 auto t = tensor_map[in_shape.name];
                 if (t->ref_cnt() != std::numeric_limits<uint16_t>::max()) {
-                    t->ref_inc();
+                    t->ref_dec();
                 }
                 node_inputs.push_back(tensor_map[in_shape.name]);
             } else if (in_shape.dims.empty()) {
@@ -156,6 +147,44 @@ void Runtime::LoadModel() {
             } else {
                 printf("we should not reach here\n");
                 assert(false);
+            }
+        }
+
+        for (const auto &out_shape : n.outputs) {
+            if (tensor_map.find(out_shape.name) != tensor_map.end()) {
+                // model output, seperate tensors
+                assert(tensor_map[out_shape.name]->is_on_GPU());
+                node_outputs.push_back(tensor_map[out_shape.name]);
+            } else {
+                std::string key = "_";
+                for (const auto &dim : out_shape.dims) {
+                    key += std::to_string(dim) + "_";
+                }
+                auto q = outshape_tensor_map[key];
+                if (!q.empty()) {
+                    auto t = q.front();
+                    q.pop();
+                    t->set_ref_cnt(consumers[out_shape.name]);
+                    tensor_map[out_shape.name] = t;
+                    node_outputs.push_back(t);
+                } else {
+                    auto t =
+                        std::make_shared<Tensor<float>>(out_shape.dims, true);
+                    t->set_ref_cnt(consumers[out_shape.name]);
+                    tensor_map[out_shape.name] = t;
+                    node_outputs.push_back(t);
+                }
+            }
+        }
+        for (auto &t : node_inputs) {
+            if (t && t->ref_cnt() == 0) {
+                // recycle to outshape_tensor_map
+                std::string key = "_";
+                for (const auto &dim : t->getShape()) {
+                    key += std::to_string(dim) + "_";
+                }
+                auto q = outshape_tensor_map[key];
+                q.push(t);
             }
         }
 
