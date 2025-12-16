@@ -35,8 +35,7 @@ class LayerNorm : public Operator {
         n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -76,7 +75,6 @@ class LayerNorm : public Operator {
                 using T = decltype(t);
                 auto tensor = core::as_tensor<T>(inputs[i]);
                 auto buffer = tensor->as_storage_buffer(m_dev_);
-                tensor->copyToGPU(m_cmdpool_);
                 objs_.emplace_back(buffer);
             });
         }

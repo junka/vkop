@@ -5,15 +5,14 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set=0, binding = 0) writeonly uniform image2DArray outputImage; // [W, N*H, C4]
 layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*H, C4]
-// layout(set=0, binding = 1) uniform sampler2DArray paraImage; // merge paras to channesl
 
-// SSBO: length = C (number of channels)
-// Each element: vec4(scale, bias, mean, variance) for ONE channel
+// length = C (number of channels)
+// Each vec4 follows as scale..., bias..., mean..., variance...
 layout(set=0, binding = 2) readonly buffer tensorBuffer {
-    vec4 attr[]; // size = C
+    vec4 attr[];
 } uMeanVarScaleBias;
 
-layout(push_constant) readonly uniform batchNormBuffer {
+layout(push_constant) uniform batchNormBuffer {
     ivec4 outShape; // [N, C, H, W] — note: PyTorch uses NCHW
     float eps;
     int activation;
@@ -44,11 +43,15 @@ void main() {
     vec4 inputPixel = texelFetch(inputImage, ivec3(w, nh, c4), 0);
 
     // Load per-channel parameters, padding done in previous step
-    // vec4 mean4, var4, scale4, bias4;
     vec4 scale4 = uMeanVarScaleBias.attr[c4 * 4];
     vec4 bias4 = uMeanVarScaleBias.attr[c4 * 4 + 1];
     vec4 mean4 = uMeanVarScaleBias.attr[c4 * 4 + 2];
     vec4 var4 = uMeanVarScaleBias.attr[c4 * 4 + 3];
+
+    // vec4 scale4 = texelFetch(uMeanVarScaleBias, c4 * 4);
+    // vec4 bias4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 1);
+    // vec4 mean4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 2);
+    // vec4 var4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 3);
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));

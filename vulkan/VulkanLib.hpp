@@ -28,6 +28,8 @@ namespace vkop {
     PFN(vkEndCommandBuffer)                                                    \
     PFN(vkQueueSubmit)                                                         \
     PFN(vkCreateBuffer)                                                        \
+    PFN(vkCreateBufferView)                                                    \
+    PFN(vkDestroyBufferView)                                                   \
     PFN(vkCreateQueryPool)                                                     \
     PFN(vkCreateDescriptorPool)                                                \
     PFN(vkAllocateDescriptorSets)                                              \
@@ -61,6 +63,7 @@ namespace vkop {
     PFN(vkFreeCommandBuffers)                                                  \
     PFN(vkGetPhysicalDeviceFeatures)                                           \
     PFN(vkGetPhysicalDeviceFeatures2)                                          \
+    PFN(vkGetPhysicalDeviceFormatProperties)                                   \
     PFN(vkBindBufferMemory2)                                                   \
     PFN(vkCreateImage)                                                         \
     PFN(vkGetImageMemoryRequirements)                                          \

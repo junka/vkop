@@ -14,10 +14,11 @@ class VulkanBuffer : public VulkanResource {
   public:
     VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, VkDeviceSize size,
                  VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
-                 int ext_fd = -1);
+                 VkFormat format = VK_FORMAT_UNDEFINED, int ext_fd = -1);
     ~VulkanBuffer() override;
 
     VkBuffer getBuffer() const;
+    VkBufferView getBufferView() const { return m_buffer_view_; };
     ResourceType getResourceType() const override {
         return ResourceType::VK_BUFFER;
     }
@@ -51,13 +52,15 @@ class VulkanBuffer : public VulkanResource {
 #endif
     VkDeviceSize m_size_;
     VkAccessFlags m_access_ = 0;
+    // VkFormat m_format_;
+    VkBufferView m_buffer_view_ = VK_NULL_HANDLE;
 
     void transitionBuffer(VkCommandBuffer commandBuffer,
                           VkAccessFlags dstAccessMask,
                           VkPipelineStageFlags src_stage,
                           VkPipelineStageFlags dst_stage, VkDeviceSize offset);
-    void createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                      bool device_local);
+    void createBuffer(VkBufferUsageFlags usage, bool device_local);
+    void createBufferView(VkFormat format);
 };
 } // namespace vkop
 #endif // SRC_VULKANBUFFER_HPP_

@@ -16,7 +16,7 @@ using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Conv2d;
 
-#define USE_CPP_REFER 1
+#define USE_CPP_REFER 0
 
 namespace {
 #if USE_CPP_REFER
@@ -81,10 +81,8 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
             for (int oy = 0; oy < oh; ++oy) {
                 for (int ox = 0; ox < ow; ++ox) {
                     float sum = 0;
-                    
                     // 遍历输入通道和卷积核
                     for (int sz = g_id * ic_group; sz < (g_id + 1) * ic_group; ++sz) {
-
                         for (int ky = 0; ky < kh; ++ky) {
                             for (int kx = 0; kx < kw; ++kx) {
                                 // 计算输入张量的索引
@@ -135,13 +133,13 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 4, 2, 2}; // b, ic, ih, iw
+    std::vector<int> input_shape_ = {1, 5, 2, 2}; // b, ic, ih, iw
     int kernel_size_ = 2;
     int stride_ = 1;
     int pad_ = 0;
     int group_ = 1;
     int dilation_ = 1;
-    int feature_size_ = 8; // oc
+    int feature_size_ = 7; // oc
 
     std::unordered_map<std::string, std::string> attributes = {
         {"strides", std::to_string(stride_)},
@@ -173,12 +171,9 @@ private:
         auto torch_output = torch_tensors[0];
         auto torch_input = torch_tensors[1];
         auto torch_weight = torch_tensors[2];
-        auto torch_bias = torch_tensors[3];
         std::vector<int> output_shape = std::get<1>(k);
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-
-#if USE_CPP_REFER
 
         printf("\n===Input==============\n");
         for (int i = 0; i < input_shape_[0]; i++) {
@@ -240,11 +235,21 @@ private:
             }
             printf("]\n");
         }
-        printf("\n============bias ===========\n");
-        for (int i = 0; i < feature_size_; i ++) {
-            printf("%.4f, ", torch_bias[i]);
+        
+        if (torch_tensors.size() > 3) {
+            auto torch_bias = torch_tensors[3];
+            printf("\n============bias ===========\n");
+            for (int i = 0; i < feature_size_; i ++) {
+                printf("%.4f, ", torch_bias[i]);
+            }
+            printf("\n");
         }
-#endif
+        if (torch_tensors.size() > 3) {
+            auto torch_bias = torch_tensors[3];
+            bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
+            bias_data_->fillFP32ToCPU(torch_bias);
+            printf("bias size %d\n", bias_data_->size());
+        }
         input = std::make_shared<Tensor<T>>(input_shape_);
         input->fillFP32ToCPU(torch_input);
         output = std::make_shared<Tensor<T>>(output_shape);
@@ -258,12 +263,10 @@ private:
                 (*output)[i] = vkop::core::ITensor::fp32_to_fp16(torch_output[i]);
             }
         }
-        
+
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
         weight_data_->set_transpose();
         weight_data_->fillFP32ToCPU(torch_weight);
-        bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-        bias_data_->fillFP32ToCPU(torch_bias);
 
 #if USE_CPP_REFER
 
@@ -313,8 +316,8 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    Conv2dTest<float> ct;
-    if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
+    Conv2dTest<uint16_t> ct;
+    if (!ct.run_test<uint16_t>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());
         if (!conv_op) {

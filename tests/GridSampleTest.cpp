@@ -4,7 +4,6 @@
 #include <random>
 #include <chrono>
 #include <cmath>
-#include <sys/types.h>
 
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"

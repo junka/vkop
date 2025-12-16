@@ -24,7 +24,7 @@ class GlobalAveragePool : public Operator {
                    globalaveragepool_spv_len,
                    sizeof(globalaveragepool::GpuGAPParam)) {
         n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+        types_ = {DESCRIPTOR_TYPE_STORAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
         objs_.reserve(types_.size());
     }

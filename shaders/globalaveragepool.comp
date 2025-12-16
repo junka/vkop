@@ -2,21 +2,22 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+// layout(set=0, binding = 0) writeonly uniform imageBuffer outputBuffer;
 layout(set=0, binding = 0) writeonly buffer outputBuffer {
-    float data[];
-} Buffer;
+    vec4 data[];
+} uBuffer;
 
 layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*H, C4]
 
-layout(push_constant) readonly uniform paraBuffer {
+layout(push_constant) uniform paraBuffer {
     ivec4 inImageSize;
     ivec4 inShape;
 } uParams;
 
 void main() {
     ivec3 coord = ivec3(gl_GlobalInvocationID);
-    uint n = coord.x;
-    uint c4 = coord.z;
+    int n = coord.x;
+    int c4 = coord.z;
     int N = uParams.inShape.x;
     int C = uParams.inShape.y;
     int H = uParams.inShape.z;
@@ -32,7 +33,8 @@ void main() {
             sum += val;
         }
     }
-    for (int i = 0; i < 4; i++) {
-        Buffer.data[n * C + c4 * 4 + i]  = sum[i] / numInputs;
-    }
+
+    uBuffer.data[n * C/4 + c4]  = sum / numInputs;
+    // imageStore(outputBuffer, n * C/4 + c4, sum/numInputs);
+
 }

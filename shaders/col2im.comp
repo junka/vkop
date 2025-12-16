@@ -4,7 +4,7 @@ layout(set=0, binding=0) uniform sampler2DArray uInput;    // [OH*OW*N, 1, C4]
 layout(set=0, binding=1) writeonly uniform image2DArray uOutput; // [W_out, N*H_out, C4]
 layout(set=0, binding=2) uniform sampler2DArray uBias;     // [1, 1, C4]
 
-layout(push_constant) readonly uniform constBuffer {
+layout(push_constant) uniform constBuffer {
     ivec4 outputSize;     // [W_out, H_out, C_out, N]
     // ... other fields (pad, stride etc.) may be unused in col2im
 } uConstant;

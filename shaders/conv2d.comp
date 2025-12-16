@@ -18,9 +18,9 @@
 //      W_out = floor((W_in + 2*padding[1] - dilation[1]*(kW-1) - 1)/strides[1] + 1
 #version 450 core
 
-#ifdef FP16
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
+#ifdef FP16
 #define FLOAT float16_t
 #define FLOAT4 f16vec4
 #else
@@ -36,11 +36,10 @@ layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*
 layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
 layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
 layout(set=0, binding=3) readonly buffer biasBuffer {
-    FLOAT attr[]; // C4
+    uvec4 attr[];
 } uBias;
-
 layout(set=0, binding=4) readonly buffer bnBuffer {
-    vec4 attr[]; // size = C_out
+    vec4 attr[];
 } uBnPara;
 
 layout(push_constant) uniform constBuffer {
@@ -58,10 +57,11 @@ layout(push_constant) uniform constBuffer {
     int activation;
     int fuse_bn;
     float eps;
+    int fp16;
 } uConstant;
 
 vec4 batch_norm(vec4 value, int c4)
-{   
+{
     vec4 scale4 = uBnPara.attr[c4 * 4];
     vec4 bias4 = uBnPara.attr[c4 * 4 + 1];
     vec4 mean4 = uBnPara.attr[c4 * 4 + 2];
@@ -73,23 +73,21 @@ vec4 batch_norm(vec4 value, int c4)
     return scale4 * normalized + bias4;
 }
 
-FLOAT4 add_bias(FLOAT4 value, int c4, bvec4 valid_oc) {
-    // FLOAT4 bias_value = uBias.attr[c4];
-    // for (int i = 0; i < 4; ++i) {
-    //     if (!valid_oc[i]) {
-    //         bias_value[i] = 0;
-    //     }
-    // }
-    // return value + bias_value;
-    int oc_start = c4 * 4;
-    ivec4 oc_vec = oc_start + ivec4(0, 1, 2, 3);
-    FLOAT4 bias_val = FLOAT4(0.0);
-    for (int i = 0; i < 4; ++i) {
-        if (valid_oc[i]) {
-            bias_val[i] = uBias.attr[oc_vec[i]];
-        }
+// support both fp16 and fp32 initializer
+vec4 add_bias(vec4 value, int c4, bvec4 valid_oc) {
+    vec4 bias_value = vec4(0.0);
+    if (uConstant.fp16 != 0) {
+        int gc4 = c4 / 2;
+        int comp = c4 % 2;
+        uvec4 packed_vec = uBias.attr[gc4];
+        bias_value.xy = (unpackHalf2x16(packed_vec[2*comp]));
+        bias_value.zw = (unpackHalf2x16(packed_vec[2*comp+1]));
+    } else {
+        bias_value = uintBitsToFloat(uBias.attr[c4]);
     }
-    return value + bias_val;
+    bias_value *= vec4(valid_oc);
+
+    return value + bias_value;
 }
 
 void conv1x1() {
@@ -314,7 +312,7 @@ void conv1x1() {
         }
     }
 
-    if (uConstant.bias == 1) {
+    if (uConstant.bias != 0) {
         acc = add_bias(acc, c4, valid_oc);
     }
     if (uConstant.fuse_bn != 0) {
@@ -583,7 +581,7 @@ void grouped_conv2d() {
     }
 
     // Add bias
-    if (uConstant.bias == 1) {
+    if (uConstant.bias != 0) {
         acc = add_bias(acc, c4, valid_oc);
     }
 
@@ -600,6 +598,7 @@ void grouped_conv2d() {
 
 
 void main() {
+
     if (uConstant.pack == 1) {
         conv1x1();
     } else {

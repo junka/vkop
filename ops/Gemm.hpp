@@ -29,10 +29,8 @@ class Gemm : public Operator {
         : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
                    sizeof(gemm::GpuGemmParam)) {
         n_imgs_ = 0;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
     }
 
@@ -84,11 +82,10 @@ class Gemm : public Operator {
                 using T = decltype(t);
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-                inputptr->copyToGPU(m_cmdpool_);
                 objs_.emplace_back(input_buffer);
             });
         }
-        if (inputs.size() <= 2) {
+        if (inputs.size() <= 3) {
             objs_.emplace_back(dummyBuffer_);
         }
         gemm::GpuGemmParam para;
@@ -108,11 +105,9 @@ class Gemm : public Operator {
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         Operator::set_runtime_device(dev, cmdpool);
 
-        dummyBuffer_ =
-            std::make_shared<VulkanBuffer>(m_dev_, 4,
-                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        dummyBuffer_ = std::make_shared<VulkanBuffer>(
+            m_dev_, 16, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
   private:

@@ -4,6 +4,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set=0, binding = 0) writeonly uniform image2DArray outputImage;
 layout(set=0, binding = 1) uniform sampler2DArray inputImage;
+
 layout(set=0, binding = 2) readonly buffer weightBuffer {
     float attr[];
 } uWeight;
@@ -11,7 +12,8 @@ layout(set=0, binding = 3) readonly buffer biasBuffer {
     float attr[];
 } uBias;
 
-layout(push_constant) readonly uniform layerNormBuffer {
+
+layout(push_constant) uniform layerNormBuffer {
 	ivec4 outShape; // 输出图像的NCHW
     ivec4 normalizedShape; // 归一化的形状
     float eps; // default 1e-5
@@ -198,8 +200,10 @@ void norm_for_chw () {
 
     for (int idx = int(lid); idx < D; idx += 256) {
         int temp = idx;
-        int w = temp % W;              temp /= W;
-        int h = temp % H;              temp /= H;
+        int w = temp % W;
+        temp /= W;
+        int h = temp % H;
+        temp /= H;
         int c = temp;
 
         int z = c / 4;

@@ -2,9 +2,7 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
-#include <bits/stdint-uintn.h>
 #include <memory>
-#include <sys/types.h>
 
 #include "vulkan/VMA.hpp"
 

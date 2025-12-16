@@ -293,36 +293,21 @@ template <typename T> class Tensor : public ITensor {
 
     std::shared_ptr<VulkanBuffer>
     as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
-        if (!vkobj_) {
-            vkobj_ = std::make_shared<VulkanBuffer>(
-                vd, size_,
-                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }
+        make_vkbuff(vd, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
     }
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
-        if (!vkobj_) {
-            vkobj_ = std::make_shared<VulkanBuffer>(
-                vd, size_,
-                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT |
-                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        }
+        make_vkbuff(vd, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
         return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
     }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd) {
-        if (!vkobj_) {
-            make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT |
-                               VK_IMAGE_USAGE_STORAGE_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
-        }
+        make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             // Handle error case appropriately
@@ -346,12 +331,9 @@ template <typename T> class Tensor : public ITensor {
     std::shared_ptr<VulkanImage>
     as_output_image(std::shared_ptr<VulkanDevice> &vd,
                     const std::shared_ptr<VulkanCommandBuffer> &cmd) {
-        if (!vkobj_) {
-            make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT |
-                               VK_IMAGE_USAGE_SAMPLED_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                               VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-        }
+        make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                           VK_IMAGE_USAGE_TRANSFER_DST_BIT);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
@@ -497,6 +479,15 @@ template <typename T> class Tensor : public ITensor {
     std::shared_ptr<VulkanResource> vkobj_;
     std::vector<T> data_;
 
+    void make_vkbuff(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
+        if (vkobj_) {
+            return;
+        }
+        // aligned to uvec4 elements, so any uvec4 type would work
+        auto aligned = 16 * UP_DIV(num_elements(), 16 / sizeof(T));
+        vkobj_ = std::make_shared<VulkanBuffer>(
+            vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
     void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         if (vkobj_) {
             return;

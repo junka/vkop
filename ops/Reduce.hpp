@@ -9,7 +9,7 @@ extern unsigned int reduce_spv_len;
 
 namespace vkop {
 namespace ops {
-namespace resize {
+namespace reduce {
 enum class ReduceType {
     L1 = 0,
     L2,
@@ -30,16 +30,15 @@ struct GpuReduceParam {
     int keepdims;
     int noop_with_empty_axes;
 };
-} // namespace resize
+} // namespace reduce
 
 class Reduce : public Operator {
   public:
     Reduce()
         : Operator(OpType::REDUCE, reduce_spv, reduce_spv_len,
-                   sizeof(resize::GpuReduceParam)) {
+                   sizeof(reduce::GpuReduceParam)) {
         n_imgs_ = 0;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+        types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
     }
 
@@ -86,7 +85,7 @@ class Reduce : public Operator {
         int h = input_shape[0];
         int w = input_shape[1];
 
-        resize::GpuReduceParam para;
+        reduce::GpuReduceParam para;
         para.H = h;
         para.W = w;
         para.norm_type = norm_type_;

@@ -80,12 +80,8 @@ void Runtime::LoadModel() {
         }
 
         if (tensor->num_dims() == 2 || tensor->num_dims() == 1) {
-            if (tensor->num_dims() == 1 && tensor->num_elements() <= 64) {
-                tensor->fillToCPU(src_ptr);
-            } else {
-                tensor->as_storage_buffer(dev);
-                tensor->copyToGPU(m_cmdpool_, src_ptr);
-            }
+            tensor->as_storage_buffer(dev);
+            tensor->copyToGPU(m_cmdpool_, src_ptr);
         } else {
             tensor->as_input_image(dev, nullptr);
             tensor->copyToGPU(m_cmdpool_, src_ptr);

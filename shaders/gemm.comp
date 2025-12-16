@@ -7,6 +7,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // B' = transpose(B) if transB else B
 // Compute Y = alpha * A' * B' + beta * C,
 
+// layout(set=0, binding = 0) writeonly uniform imageBuffer bufferY;
 layout(set=0, binding = 0) writeonly buffer BufferY {
     float data[];
 } bufferY;
@@ -23,7 +24,7 @@ layout(set=0, binding = 3) readonly buffer BufferC {
     float data[];
 } bufferC;
 
-layout(push_constant) readonly uniform paraBuffer {
+layout(push_constant) uniform paraBuffer {
     int M; // 行数
     int N; // 列数
     int K; // 共同维度
@@ -35,8 +36,8 @@ layout(push_constant) readonly uniform paraBuffer {
 } uParams;
 
 void main() {
-    uint j = gl_GlobalInvocationID.x; // column index in Y
-    uint i = gl_GlobalInvocationID.y; // row index in Y
+    int j = int(gl_GlobalInvocationID.x); // column index in Y
+    int i = int(gl_GlobalInvocationID.y); // row index in Y
 
     if (i >= uParams.M || j >= uParams.N) return;
 
@@ -46,34 +47,44 @@ void main() {
         float a_val;
         if (uParams.transA == 1) {
             // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
-            // index = k * M + i
-            a_val = bufferA.data[k * uParams.M + i];
+            int index = k * uParams.M + i;
+            // a_val = texelFetch(bufferA, index/4)[index%4];
+            a_val = bufferA.data[index];
         } else {
             // A is stored as M×K, A[i][k] = A_physical[i][k]
-            // index = i * K + k
-            a_val = bufferA.data[i * uParams.K + k];
+            int index = i * uParams.K + k;
+            a_val = bufferA.data[index];
+            // a_val = texelFetch(bufferA, index/4)[index%4];
         }
 
         // Load B[k][j] from bufferB, considering transB
         float b_val;
         if (uParams.transB == 1) {
             // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
-            // index = j * K + k
-            b_val = bufferB.data[j * uParams.K + k];
+            int index = j * uParams.K + k;
+            b_val = bufferB.data[index];
+            // b_val = texelFetch(bufferB, index/4)[index%4];
         } else {
             // B is stored as K×N, B[k][j] = B_physical[k][j]
-            // index = k * N + j
-            b_val = bufferB.data[k * uParams.N + j];
+            int index = k * uParams.N + j;
+            b_val = bufferB.data[index];
+            // b_val = texelFetch(bufferB, index/4)[index%4];
         }
 
         sum += a_val * b_val;
     }
 
-    uint yIndex = i * uParams.N + j;       // C[i][j] in row-major
+    int yIndex = i * uParams.N + j;       // C[i][j] in row-major
     sum *= uParams.alpha;
     if (uParams.has_bias == 1) {
         sum += bufferC.data[yIndex] * uParams.beta;
+        // sum += texelFetch(bufferC, yIndex/4)[yIndex%4] * uParams.beta;
     }
 
     bufferY.data[yIndex] = sum;
+    // vec4 sum4 = imageLoad(bufferY, yIndex/4);
+    // vec4 sum4 = vec4(0);
+    // texelFetch(bufferY, yIndex/4);
+    // sum4[yIndex%4] = sum;
+    // imageStore(bufferY, yIndex, sum4);
 }

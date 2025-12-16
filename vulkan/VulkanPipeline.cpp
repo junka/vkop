@@ -5,6 +5,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanShader.hpp"
 
@@ -207,8 +208,14 @@ void VulkanPipeline::updateDescriptorSets(
         if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
             buffer_infos.emplace_back(std::get<VkDescriptorBufferInfo>(
                 m_objs[i]->getDescriptorInfo()));
-            write_descriptor_set.pBufferInfo =
-                &buffer_infos[buffer_infos.size() - 1];
+            auto b = std::static_pointer_cast<VulkanBuffer>(m_objs[i]);
+            auto *view = b->getBufferView();
+            if (view != VK_NULL_HANDLE) {
+                write_descriptor_set.pTexelBufferView = &view;
+            } else {
+                write_descriptor_set.pBufferInfo =
+                    &buffer_infos[buffer_infos.size() - 1];
+            }
         } else {
             image_infos.emplace_back(std::get<VkDescriptorImageInfo>(
                 m_objs[i]->getDescriptorInfo()));

@@ -135,6 +135,14 @@ bool VulkanDevice::createLogicalDevice(
     VkPhysicalDeviceFeatures device_features = {};
     vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
 
+    VkFormatProperties fmprops;
+    vkGetPhysicalDeviceFormatProperties(
+        physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &fmprops);
+    assert(fmprops.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT);
+    vkGetPhysicalDeviceFormatProperties(
+        physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &fmprops);
+    assert(fmprops.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT);
+
     VkPhysicalDeviceShaderFloat16Int8Features devicefloat16_int8_features = {};
     devicefloat16_int8_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR;

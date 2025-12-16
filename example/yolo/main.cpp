@@ -9,7 +9,6 @@
 #include <memory>
 #include <cmath>
 
-#include <sys/types.h>
 #include <unistd.h>
 #include <vulkan/vulkan_core.h>
 

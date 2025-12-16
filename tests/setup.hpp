@@ -59,7 +59,6 @@ public:
                 }
                 op->set_runtime_device(dev, cmdpool);
 
-                // Apply the attribute function callback if provided
                 if (attribute_func) {
                     attribute_func(op);
                 }
@@ -69,17 +68,15 @@ public:
                     outputs.push_back(output);
                 }
                 for (const auto &input : inputs) {
-                    if (!input || input->num_dims() < 2) {
-                        continue;
-                    }
-                    if (input->num_dims() == 2) {
-                        auto t = core::as_tensor<T>(input);
-                        t->as_storage_buffer(dev);
-                        t->copyToGPU(cmdpool);
+                    if (!input || input->dtype() == typeid(int64_t)) {
                         continue;
                     }
                     auto t = core::as_tensor<T>(input);
-                    t->as_input_image(dev, nullptr);
+                    if (input->num_dims() == 2 || input->num_dims() == 1) {
+                        t->as_storage_buffer(dev);
+                    } else {
+                        t->as_input_image(dev, nullptr);
+                    }
                     t->copyToGPU(cmdpool);
                 }
                 cmd->wait(dev->getComputeQueue());
@@ -92,7 +89,7 @@ public:
                     output->copyToCPU(cmdpool);
                     auto oshape = output->getShape();
                     printf("output shape: %ld\n", oshape.size());
-                    #if 0
+                    #if 1
                     if (oshape.size() == 4) {
                         for (int i = 0; i < oshape[0]; i++) {
                             printf("[\n");
@@ -103,7 +100,11 @@ public:
                                     for (int l = 0; l < oshape[3]; l++) {
                                         int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
                                             k * oshape[3] + l;
-                                        printf("%.4f, ", (*output)[idx]);
+                                        if (sizeof(T) == 2) {
+                                            std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
+                                        } else {
+                                            std::cout <<  (*output)[idx] << ",";
+                                        }
                                     }
                                     printf("]\n");
                                 }
@@ -116,7 +117,11 @@ public:
                             printf("[");
                             for (int j = 0; j < oshape[1]; j++) {
                                 int idx = i * oshape[1] + j;
-                                printf("%.4f, ", (*output)[idx]);
+                                if (sizeof(T) == 2) {
+                                    std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
+                                } else {
+                                    std::cout << (*output)[idx] << ", ";
+                                }
                             }
                             printf("]\n");
                         }

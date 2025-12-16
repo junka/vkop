@@ -6,6 +6,11 @@
 #include <memory>
 #include <variant>
 
+#define STORAGE VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+#define UNIFORM VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+#define DESCRIPTOR_TYPE_STORAGE VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+#define DESCRIPTOR_TYPE_UNIFORM VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+
 namespace vkop {
 // Enum to represent the type of resource
 enum class ResourceType { VK_IMAGE, VK_BUFFER };

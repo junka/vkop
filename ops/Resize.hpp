@@ -78,7 +78,7 @@ class Resize : public Operator {
 
             static const std::unordered_map<
                 std::string, resize::CoordinateTransformationMode>
-                tmode_map = {
+                kTmodeMap = {
                     {"half_pixel",
                      resize::CoordinateTransformationMode::HALF_PIXEL},
                     {"half_pixel_symmetric",
@@ -93,8 +93,8 @@ class Resize : public Operator {
                     {"tf_crop_and_resize",
                      resize::CoordinateTransformationMode::TF_CROP_AND_RESIZE}};
             auto it =
-                tmode_map.find(attrs.at("coordinate_transformation_mode"));
-            if (it != tmode_map.end()) {
+                kTmodeMap.find(attrs.at("coordinate_transformation_mode"));
+            if (it != kTmodeMap.end()) {
                 coordinate_transformation_mode_ = static_cast<int>(it->second);
             }
         }

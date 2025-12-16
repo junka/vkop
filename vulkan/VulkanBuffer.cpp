@@ -8,11 +8,11 @@
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
                            VkDeviceSize size, VkBufferUsageFlags usage,
-                           VkMemoryPropertyFlags requireProperties, int ext_fd)
+                           VkMemoryPropertyFlags requireProperties,
+                           VkFormat format, int ext_fd)
     : VulkanResource(vdev), m_size_(size) {
-    createBuffer(
-        size, usage,
-        ((requireProperties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0));
+    createBuffer(usage, ((requireProperties &
+                          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0));
 #ifndef USE_VMA
 #ifdef VK_KHR_get_memory_requirements2
     VkMemoryRequirements2 mem_requirements2 = {};
@@ -34,9 +34,16 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
 #else
     (void)ext_fd;
 #endif
+    if (format != VK_FORMAT_UNDEFINED) {
+        createBufferView(format);
+    }
 }
 
 VulkanBuffer::~VulkanBuffer() {
+    if (m_buffer_view_ != VK_NULL_HANDLE) {
+        vkDestroyBufferView(m_vdev_->getLogicalDevice(), m_buffer_view_,
+                            nullptr);
+    }
 #ifndef USE_VMA
     if (m_buffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_vdev_->getLogicalDevice(), m_buffer_, nullptr);
@@ -54,11 +61,10 @@ VkBuffer VulkanBuffer::getBuffer() const {
 #endif
 }
 
-void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
-                                bool device_local) {
+void VulkanBuffer::createBuffer(VkBufferUsageFlags usage, bool device_local) {
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-    buffer_info.size = size;
+    buffer_info.size = m_size_;
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     buffer_info.queueFamilyIndexCount = 0;
@@ -77,17 +83,36 @@ void VulkanBuffer::createBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
         m_desc_type_ = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     } else if (usage & VK_BUFFER_USAGE_STORAGE_BUFFER_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    } else if (usage & VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER;
+    } else if (usage & VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT) {
+        m_desc_type_ = VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER;
     }
+}
+
+void VulkanBuffer::createBufferView(VkFormat format) {
+    VkBuffer buff = getBuffer();
+    VkBufferViewCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
+    buffer_info.flags = 0;
+    buffer_info.buffer = buff;
+    buffer_info.format = format;
+    buffer_info.range = m_size_;
+    buffer_info.offset = 0;
+
+    auto ret = vkCreateBufferView(m_vdev_->getLogicalDevice(), &buffer_info,
+                                  nullptr, &m_buffer_view_);
+    if (ret != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create buffer view");
+    }
+    printf("Create buffer view %p\n", m_buffer_view_);
 }
 
 std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
 VulkanBuffer::getDescriptorInfo() const {
+    VkBuffer buff = getBuffer();
     VkDescriptorBufferInfo buffer_info{};
-#ifndef USE_VMA
-    buffer_info.buffer = m_buffer_;
-#else
-    buffer_info.buffer = m_vma_buffer_.buffer;
-#endif
+    buffer_info.buffer = buff;
     buffer_info.offset = 0;
     buffer_info.range = m_size_;
     return buffer_info;
@@ -98,6 +123,7 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
                                     VkPipelineStageFlags src_stage,
                                     VkPipelineStageFlags dst_stage,
                                     VkDeviceSize offset) {
+    VkBuffer buff = getBuffer();
     VkBufferMemoryBarrier barrier;
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
     barrier.pNext = nullptr;
@@ -105,11 +131,7 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
     barrier.dstAccessMask = dstAccessMask;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-#ifndef USE_VMA
-    barrier.buffer = m_buffer_;
-#else
-    barrier.buffer = m_vma_buffer_.buffer;
-#endif
+    barrier.buffer = buff;
     barrier.offset = offset;
     barrier.size = m_size_;
 
@@ -162,11 +184,7 @@ void VulkanBuffer::copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
     if (m_access_ != VK_ACCESS_TRANSFER_READ_BIT) {
         transferReadBarrier(commandBuffer);
     }
-#ifndef USE_VMA
-    VkBuffer buffer = m_buffer_;
-#else
-    VkBuffer buffer = m_vma_buffer_.buffer;
-#endif
+    VkBuffer buffer = getBuffer();
 
     VkBufferCopy copy_region = {};
     copy_region.srcOffset = 0;
@@ -185,11 +203,7 @@ void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
     if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
         transferWriteBarrier(commandBuffer);
     }
-#ifndef USE_VMA
-    VkBuffer buffer = m_buffer_;
-#else
-    VkBuffer buffer = m_vma_buffer_.buffer;
-#endif
+    VkBuffer buffer = getBuffer();
 
     VkBufferCopy copy_region = {};
     copy_region.srcOffset = srcoffset;

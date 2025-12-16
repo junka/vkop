@@ -1075,7 +1075,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
-    # quantize_to_fp16_selective(vk_model)
+    quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)
     remove_redundant_reshape(vk_model)
     fuse_conv_bn_relu(vk_model)
@@ -1091,7 +1091,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     onnx_model_path = sys.argv[1]
-    output_bin_path = os.path.splitext(onnx_model_path)[0] + ".bin"
+    output_bin_path = os.path.splitext(onnx_model_path)[0] + ".vkopbin"
 
     print("Parsing ONNX model...")
     onnxmodel = parse_onnx_model(onnx_model_path)
@@ -1100,3 +1100,5 @@ if __name__ == "__main__":
     onnxmodel.save_to_binary(output_bin_path)
 
     print("Model saved to:", output_bin_path)
+    file_size = os.path.getsize(output_bin_path)
+    print(f"File size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")

@@ -47,6 +47,8 @@ struct alignas(16) GPUConv2dParam {
 
     int fuse_bn;
     float eps;
+
+    int fp16; // only for conv para
 };
 
 } // namespace conv2d
@@ -60,8 +62,7 @@ class Conv2d : public Operator {
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
         activation_ = conv2d::ActivationMode::NONE;
     }
@@ -188,7 +189,7 @@ class Conv2d : public Operator {
             (in_width + 2 * pads_[1] - dilations_[1] * (kernel_w - 1) - 1) /
                 strides_[1] +
             1;
-        auto process_output = [&](auto type_tag) {
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->size() == 0) {
@@ -197,50 +198,47 @@ class Conv2d : public Operator {
 
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
             objs_.emplace_back(output_image);
-        };
-        dispatch_by_dtype(outputs[0]->dtype(), process_output);
+        });
 
-        auto process_input = [&](auto type_tag) {
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
             objs_.emplace_back(input_image);
-        };
-
-        dispatch_by_dtype(inputs[0]->dtype(), process_input);
-
-        auto process_weight_and_bias = [&](auto type_tag) {
+        });
+        bool fp16 = false;
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto weight = core::as_tensor<T>(inputs[1]);
-            auto bias =
-                (inputs.size() > 2) ? core::as_tensor<T>(inputs[2]) : nullptr;
-
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
-            auto bias_buffer =
-                bias ? bias->as_storage_buffer(m_dev_) : dummyBuffer_;
             objs_.emplace_back(weight_image);
-            objs_.emplace_back(bias_buffer);
-
-            if (bias)
-                bias->copyToGPU(m_cmdpool_);
-        };
-        dispatch_by_dtype(inputs[1]->dtype(), process_weight_and_bias);
-
+            if (typeid(T) == typeid(uint16_t)) {
+                fp16 = true;
+            }
+        });
         if (inputs.size() > 2) {
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
-                auto para = core::as_tensor<T>(inputs[2]);
+                auto bias = core::as_tensor<T>(inputs[2]);
+                auto bias_buffer = bias->as_storage_buffer(m_dev_);
+                objs_.emplace_back(bias_buffer);
+            });
+        } else {
+            objs_.emplace_back(dummyBuffer_);
+        }
+        if (inputs.size() > 3) {
+            dispatch_by_dtype(inputs[3]->dtype(), [&](auto type_tag) {
+                using T = decltype(type_tag);
+                auto para = core::as_tensor<T>(inputs[3]);
                 auto para_buffer = para->as_storage_buffer(m_dev_);
                 objs_.emplace_back(para_buffer);
             });
         } else {
-            auto para_buffer = dummyBuffer_;
-            objs_.emplace_back(para_buffer);
+            objs_.emplace_back(dummyBuffer_);
         }
 
         auto out_gpu_shape = outputs[0]->getGPUShape();
         conv2d::GPUConv2dParam para;
-        // vkimage params
         para.inputSize[0] = in_width;
         para.inputSize[1] = in_height;
         para.inputSize[2] = depth;
@@ -269,6 +267,7 @@ class Conv2d : public Operator {
         para.transpose = inputs[1]->get_transpose() ? 1 : 0;
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
+        para.fp16 = fp16 ? 1 : 0;
 
         para.fuse_bn = fuse_bn_;
         para.eps = eps_;
@@ -280,11 +279,9 @@ class Conv2d : public Operator {
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         Operator::set_runtime_device(dev, cmdpool);
-        dummyBuffer_ =
-            std::make_shared<VulkanBuffer>(m_dev_, 4,
-                                           VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
-                                               VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        dummyBuffer_ = std::make_shared<VulkanBuffer>(
+            m_dev_, 16, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
   private:

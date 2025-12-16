@@ -34,7 +34,7 @@ class BatchNorm : public Operator {
         n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_STORAGE_BUFFER};
+                  DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -119,8 +119,6 @@ class BatchNorm : public Operator {
   private:
     float eps_ = 1e-5;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
-
-    std::shared_ptr<VulkanBuffer> tensorBuffer_;
 };
 
 } // namespace ops
