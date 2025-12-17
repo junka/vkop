@@ -105,7 +105,6 @@ void VulkanBuffer::createBufferView(VkFormat format) {
     if (ret != VK_SUCCESS) {
         throw std::runtime_error("Failed to create buffer view");
     }
-    printf("Create buffer view %p\n", m_buffer_view_);
 }
 
 std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>

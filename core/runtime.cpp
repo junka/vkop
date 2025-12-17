@@ -1,16 +1,12 @@
 // junka @ 2025
 #include <chrono>
 #include <limits>
-#include <numeric>
 #include <queue>
 
 #include "core/runtime.hpp"
-#include "include/logger.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
-#include "vulkan/VulkanPipeline.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
 
 namespace vkop {
 namespace core {
@@ -57,11 +53,12 @@ void Runtime::LoadModel() {
     }
     printf("Total nodes %zu\n", model.nodes.size());
     for (const auto &i : model.inputs) {
+        // this is enough for input image
         auto t = std::make_shared<Tensor<float>>(i.dims);
         t->set_ref_cnt_forever();
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
-        t->as_input_image(dev, nullptr);
+        t->as_input_image(dev, nullptr, true);
     }
 
     for (const auto &o : model.outputs) {
@@ -228,18 +225,18 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
     return it->second;
 }
 
-void Runtime::Run() {
+double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     static int id = 0;
-    for (auto &p : inputs_) {
-        if (p.second->dtype() == typeid(float)) {
-            auto t = vkop::core::as_tensor<float>(p.second);
-            t->copyToGPU(m_cmdpool_);
-        } else if (p.second->dtype() == typeid(uint16_t)) {
-            auto t = vkop::core::as_tensor<uint16_t>(p.second);
-            t->copyToGPU(m_cmdpool_);
-        }
-    }
+    // for (auto &p : inputs_) {
+    //     if (p.second->dtype() == typeid(float)) {
+    //         auto t = vkop::core::as_tensor<float>(p.second);
+    //         t->copyToGPU(m_cmdpool_);
+    //     } else if (p.second->dtype() == typeid(uint16_t)) {
+    //         auto t = vkop::core::as_tensor<uint16_t>(p.second);
+    //         t->copyToGPU(m_cmdpool_);
+    //     }
+    // }
     auto start = std::chrono::steady_clock::now();
     m_cmds_[id]->wait(dev->getComputeQueue(id));
     m_cmds_[id]->begin();
@@ -249,19 +246,8 @@ void Runtime::Run() {
     query_pool.begin(m_cmds_[id]->get());
 #endif
     for (size_t i = 0; i < node_ops_.size(); ++i) {
-        // printf("ops %s input tensors %ld\n",
-        //        vkop::ops::convert_openum_to_string(node_ops_[i]->get_type())
-        //            .c_str(),
-        //        node_input_tensors_[i].size());
-
         node_ops_[i]->onExecute(node_input_tensors_[i], node_output_tensors_[i],
                                 m_cmds_[id], id);
-        for (auto &it : node_input_tensors_[i]) {
-            auto t = vkop::core::as_tensor<float>(it);
-            if (t && t->ref_cnt() == 1) {
-                // t->resize(0);
-            }
-        }
     }
 #ifdef USE_MEASURE_TIME
     query_pool.end(m_cmds_[id]->get());
@@ -275,10 +261,9 @@ void Runtime::Run() {
 #endif
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "inference time:" << elapsed.count() * 1000.0F << " ms"
-              << std::endl;
     id++;
     id %= vkop::kInflight;
+    return elapsed.count() * 1000.0F;
 }
 
 void Runtime::ReadResult() {

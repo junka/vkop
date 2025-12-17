@@ -53,7 +53,7 @@ class Runtime {
     // Get initializer tensor by name, for test only
     std::shared_ptr<ITensor> GetInitializer(const std::string &name);
 
-    void Run();
+    double Run();
 
     void ReadResult();
 

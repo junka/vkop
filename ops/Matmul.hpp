@@ -64,8 +64,6 @@ class MatMul : public Operator {
 
         submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
     }
-
-  private:
 };
 
 } // namespace ops

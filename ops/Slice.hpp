@@ -4,6 +4,7 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include <numeric>
 
 extern unsigned char slice_spv[];
 extern unsigned int slice_spv_len;

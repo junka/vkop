@@ -34,7 +34,8 @@ using MaskInfo = struct MaskInfo {
     Category category;
 };
 
-static float score_threshold[2] = {0.35F, 0.5F};
+namespace {
+float score_threshold[2] = {0.35F, 0.5F};
 
 std::vector<MaskInfo> postProcessNMS(
     const std::shared_ptr<class vkop::core::Tensor<float> >& hm_data, const std::shared_ptr<class vkop::core::Tensor<float> >& hm_nms_data,
@@ -115,8 +116,9 @@ std::vector<MaskInfo> postProcessNMS(
     return detections;
 }
 
+
 template<typename T>
-std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image_w, std::shared_ptr<Tensor<T>> &t) {
+std::vector<T> resize_yuv444_unorm(const std::vector<uint8_t> &raw_image, int image_h, int image_w, std::shared_ptr<Tensor<T>> &t) {
     int in_h = t->getShape()[2];
     int in_w = t->getShape()[3];
 
@@ -124,8 +126,8 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
     float y_ratio = static_cast<float>(image_h - 1) / (in_h - 1);
 
     const uint8_t* y_src = raw_image.data();
-    const uint8_t* u_src = raw_image.data() + image_w * image_h;
-    const uint8_t* v_src = raw_image.data() + 2 * image_w * image_h;
+    const uint8_t* u_src = raw_image.data() + (image_w * image_h);
+    const uint8_t* v_src = raw_image.data() + (2 * image_w * image_h);
 
     int u_offset = in_w * in_h;
     int v_offset = 2 * in_w * in_h;
@@ -146,26 +148,49 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
 
             // 对 Y, U, V 分量分别进行双线性插值
             auto interpolate = [](const uint8_t* plane, int w, int x1, int y1, int x2, int y2, float dx, float dy) {
-                uint8_t p11 = plane[y1 * w + x1];
-                uint8_t p12 = plane[y1 * w + x2];
-                uint8_t p21 = plane[y2 * w + x1];
-                uint8_t p22 = plane[y2 * w + x2];
+                uint8_t p11 = plane[(y1 * w) + x1];
+                uint8_t p12 = plane[(y1 * w) + x2];
+                uint8_t p21 = plane[(y2 * w) + x1];
+                uint8_t p22 = plane[(y2 * w) + x2];
                 return static_cast<uint8_t>(
-                    p11 * (1 - dx) * (1 - dy) +
-                    p12 * dx * (1 - dy) +
-                    p21 * (1 - dx) * dy +
-                    p22 * dx * dy
+                    (p11 * (1 - dx) * (1 - dy)) +
+                    (p12 * dx * (1 - dy)) +
+                    (p21 * (1 - dx) * dy) +
+                    (p22 * dx * dy)
                 );
             };
 
-            int dst_idx = dy * in_w + dx;
-            resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
-            resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
-            resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
+            int dst_idx = (dy * in_w) + dx;
+            float scale = 1;
+            if (sizeof(T) == 2) {
+                scale = 257;
+            } else if (sizeof(T) == 4) {
+                scale = 1.0F/255.0F;
+            }
+            resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
+            resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
+            resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
         }
     }
     return resized_image;
 }
+template<typename T>
+void processTensorInput(const std::shared_ptr<vkop::core::ITensor>& input, 
+                    std::vector<uint8_t>& frame, 
+                    int image_h, int image_w,
+                    int& tensor_h, int& tensor_w,
+                    const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool) {
+    auto t = vkop::core::as_tensor<T>(input);
+    tensor_h = t->getShape()[2];
+    tensor_w = t->getShape()[3];
+    auto data = resize_yuv444_unorm(frame, image_h, image_w, t);
+    frame.clear();
+    frame.shrink_to_fit();
+    t->copyToGPU(cmdpool, data.data());
+    data.clear();
+}
+}
+
 
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
@@ -218,31 +243,26 @@ int main(int argc, char *argv[]) {
             printf("Input tensor not found\n");
             return -1;
         }
-        if (input->dtype() == typeid(float)) {
-            auto t = vkop::core::as_tensor<float>(input);
-            tensor_h = t->getShape()[2];
-            tensor_w = t->getShape()[3];
-            auto data = resize_YUV(frame, image_h, image_w, t);
-            frame.clear();
-            frame.shrink_to_fit();
-            t->copyToGPU(cmdpool, data.data());
-            data.clear();
-            data.shrink_to_fit();
-        } else if (input->dtype() == typeid(uint16_t)){
-            auto t = vkop::core::as_tensor<uint16_t>(input);
-            tensor_h = t->getShape()[2];
-            tensor_w = t->getShape()[3];
-            auto data = resize_YUV(frame, image_h, image_w, t);
-            frame.clear();
-            frame.shrink_to_fit();
-            t->copyToGPU(cmdpool, data.data());
-            data.clear();
-            data.shrink_to_fit();
-        }
 
-        for (int i = 0; i < 100; i ++) {
-            rt->Run();
+        if (input->dtype() == typeid(uint8_t)) {
+            processTensorInput<uint8_t>(input, frame, image_h, image_w, tensor_h, tensor_w, cmdpool);
+        } else if (input->dtype() == typeid(uint16_t)) {
+            processTensorInput<uint16_t>(input, frame, image_h, image_w, tensor_h, tensor_w, cmdpool);
+        } else if (input->dtype() == typeid(float)) {
+            processTensorInput<float>(input, frame, image_h, image_w, tensor_h, tensor_w, cmdpool);
+        } else {
+            printf("Unsupported input tensor data type\n");
+            return -1;
         }
+        double tot_lat = 0.0F;
+        int count = 100;
+        for (int i = 0; i < count; i ++) {
+            auto lat = rt->Run();
+            tot_lat += lat;
+            std::cout << "inference time:" << lat << " ms" << std::endl;
+        }
+        std::cout << "avg time:" << tot_lat/count << " ms" << std::endl;
+
         rt->ReadResult();
         auto hm = vkop::core::as_tensor<float>(rt->GetOutput("hm"));
         auto reg = vkop::core::as_tensor<float>(rt->GetOutput("reg"));

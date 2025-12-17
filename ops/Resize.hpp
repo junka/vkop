@@ -113,14 +113,14 @@ class Resize : public Operator {
 
             static const std::unordered_map<std::string,
                                             resize::KeepAspectRatioPolicy>
-                policy_map = {
+                kPolicyMap = {
                     {"stretch", resize::KeepAspectRatioPolicy::STRETCH},
                     {"not_larger", resize::KeepAspectRatioPolicy::NOT_LARGER},
                     {"not_smaller",
                      resize::KeepAspectRatioPolicy::NOT_SMALLER}};
             const auto &policy_str = attrs.at("keep_aspect_ratio_policy");
-            auto it = policy_map.find(policy_str);
-            if (it != policy_map.end()) {
+            auto it = kPolicyMap.find(policy_str);
+            if (it != kPolicyMap.end()) {
                 keep_aspect_ratio_policy_ = static_cast<int>(it->second);
             }
         }
@@ -184,7 +184,7 @@ class Resize : public Operator {
                 roi_.resize(rank * 2);
                 for (int i = 0; i < rank; i++) {
                     roi_[i * 2] = (*roi)[i * 2];
-                    roi_[i * 2 + 1] = (*roi)[i * 2 + 1];
+                    roi_[(i * 2) + 1] = (*roi)[(i * 2) + 1];
                 }
             });
         }
@@ -208,12 +208,13 @@ class Resize : public Operator {
         if (sizes && !scales) {
             scales_.resize(rank);
             for (int i = 0; i < rank; i++) {
-                scales_[i] = (float)sizes_[i] / (float)input_shape[i];
+                scales_[i] = static_cast<float>(sizes_[i]) /
+                             static_cast<float>(input_shape[i]);
             }
         } else if (!sizes && scales) {
             sizes_.resize(rank);
             for (int i = 0; i < rank; i++) {
-                sizes_[i] = (int)(input_shape[i] * scales_[i]);
+                sizes_[i] = static_cast<int>(input_shape[i] * scales_[i]);
             }
         }
 
@@ -221,9 +222,9 @@ class Resize : public Operator {
             axes_ = std::vector<int>(rank);
             std::iota(axes_.begin(), axes_.end(), 0);
         } else {
-            for (size_t i = 0; i < axes_.size(); i++) {
-                if (axes_[i] < 0) {
-                    axes_[i] += rank;
+            for (int &axe : axes_) {
+                if (axe < 0) {
+                    axe += rank;
                 }
             }
         }

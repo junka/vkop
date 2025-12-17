@@ -16,7 +16,28 @@ endif(CCACHE)
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer")
 
-find_package(Vulkan REQUIRED)
+if(DEFINED ENV{VULKAN_SDK})
+    set(VULKAN_SDK_PATH $ENV{VULKAN_SDK})
+    message(STATUS "VULKAN_SDK env var found: ${VULKAN_SDK_PATH}")
+    set(CMAKE_PREFIX_PATH ${VULKAN_SDK_PATH} ${CMAKE_PREFIX_PATH})
+    # Use the VULKAN_SDK path to find Vulkan
+    find_package(Vulkan QUIET PATHS ${VULKAN_SDK_PATH} NO_DEFAULT_PATH)
+    if(NOT Vulkan_FOUND)
+        message(STATUS "Vulkan config not found, using manual setup")
+        if(EXISTS ${VULKAN_SDK_PATH}/include/vulkan/vulkan.h)
+            set(Vulkan_INCLUDE_DIRS ${VULKAN_SDK_PATH}/include)
+            set(Vulkan_LIBRARIES ${VULKAN_SDK_PATH}/lib/libvulkan.so)
+            set(Vulkan_FOUND TRUE)
+
+            link_directories(${VULKAN_SDK_PATH}/lib)
+        else()
+            message(FATAL_ERROR "Cannot find Vulkan headers or libraries in ${VULKAN_SDK_PATH}")
+        endif()
+    endif()
+else()
+    # Fall back to system default paths
+    find_package(Vulkan REQUIRED)
+endif()
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
 
@@ -115,6 +136,7 @@ option(USE_MEASURE_TIME "Enable measuring time" OFF)
 option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
 option(ENABLE_EXAMPLE "Enable example" ON)
 option(ENABLE_BENCHMARK "Enable benchmark" ON)
+option(ENABLE_TESTS "Enable testing" ON)
 
 if(USE_VALIDATION_LAYERS)
     target_compile_definitions(vkop PRIVATE USE_VALIDATION_LAYERS)
@@ -170,6 +192,7 @@ if (ENABLE_BENCHMARK)
 add_subdirectory(benchmark)
 endif ()
 
+if (ENABLE_TESTS)
 enable_testing()
-
 add_subdirectory(tests)
+endif()

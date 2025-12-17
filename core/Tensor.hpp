@@ -9,15 +9,12 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanResource.hpp"
 
-#include <chrono>
 #include <cstdint>
-#include <iostream>
 #include <limits>
 #include <memory>
-#include <thread>
 #include <vector>
 
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
 namespace vkop {
 namespace core {
@@ -212,8 +209,10 @@ template <typename T> class Tensor : public ITensor {
         dims_[1] = c;
         dims_[2] = h;
         dims_[3] = w;
-        n_dims_ =
-            (dims_[3] != 0) ? 4 : (dims_[2] != 0) ? 3 : (dims_[1] != 0) ? 2 : 1;
+        n_dims_ = (dims_[3] != 0)   ? 4
+                  : (dims_[2] != 0) ? 3
+                  : (dims_[1] != 0) ? 2
+                                    : 1;
         size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
             data_.resize(n * c * h * w);
@@ -306,10 +305,13 @@ template <typename T> class Tensor : public ITensor {
     }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
-                   const std::shared_ptr<VulkanCommandBuffer> &cmd) {
-        make_vkimg(vd, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                           VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+                   const std::shared_ptr<VulkanCommandBuffer> &cmd,
+                   bool unorm = false) {
+        make_vkimg(vd,
+                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                   unorm);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             // Handle error case appropriately
@@ -355,6 +357,52 @@ template <typename T> class Tensor : public ITensor {
 
         return img;
     }
+    // copy RGBA directly
+    void fillToGPUImage(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                        T *src = nullptr) {
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        if (num_dims() < 3) {
+            return;
+        }
+        auto dev = cmdpool->getVulkanDevice();
+        VulkanCommandBuffer cmd(cmdpool, false);
+
+#ifdef VK_EXT_host_image_copy
+        if (dev->is_support_host_image_copy()) {
+            std::vector<T> ptr(img->getImageSize() / sizeof(T));
+            memcpy(ptr.data(), src, img->getImageSize());
+            img->hostImageCopyToDevice(ptr.data());
+            cmd.begin();
+            img->readBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
+        } else
+#endif
+        {
+            auto imagesize = img->getImageSize();
+            auto stpool = cmdpool->getStagingBufferPool();
+            uint64_t completed =
+                cmdpool->getCompletedTimelineValue(dev->getComputeQueue());
+            stpool->reclaimCompleted(completed);
+            auto *buff = stpool->getBuffer();
+            auto b = stpool->allocate(imagesize);
+            if (!b) {
+                printf("copyToGPUImage stpool alloc failed %d\n", imagesize);
+                return;
+            }
+            // convertTensorToRGBA(static_cast<T *>(b->ptr), src);
+            memcpy(static_cast<T *>(b->ptr), src, imagesize);
+            cmd.begin();
+            img->copyBufferToImage(cmd.get(), buff, b->offset);
+            img->readBarrier(cmd.get());
+            cmd.end();
+            auto submit_value = cmd.submit(dev->getComputeQueue());
+            cmd.wait(dev->getComputeQueue());
+            stpool->markSubmit(submit_value);
+        }
+        toGPU();
+    }
+
     void copyToGPUImage(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                         T *src = nullptr) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
@@ -490,15 +538,18 @@ template <typename T> class Tensor : public ITensor {
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
-    void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
+    void make_vkimg(std::shared_ptr<VulkanDevice> &vd, uint32_t flags,
+                    bool unorm = false) {
         if (vkobj_) {
             return;
         }
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
         if (sizeof(T) == 1) {
-            format = VK_FORMAT_R8G8B8A8_UINT;
+            format =
+                (unorm ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_UINT);
         } else if (sizeof(T) == 2) {
-            format = VK_FORMAT_R16G16B16A16_SFLOAT;
+            format = (unorm ? VK_FORMAT_R16G16B16A16_UNORM
+                            : VK_FORMAT_R16G16B16A16_SFLOAT);
         }
         auto gpushape = getGPUShape();
         uint32_t width = gpushape[0];
@@ -679,21 +730,22 @@ template <typename T> class Tensor : public ITensor {
                             (pack_ ? ((n * height + h) * (width * chan4) +
                                       (w + c4 * width)) *
                                          4 * sizeof(T)
-                                   : c4 * layer_stride +
-                                         (n * height + h) * row_pitch +
-                                         w * 4 * sizeof(T));
+                                   : (c4 * layer_stride) +
+                                         ((n * height + h) * row_pitch) +
+                                         (w * 4 * sizeof(T)));
                         T *dst = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
                             dst_bytes_offset);
                         for (int k = 0; k < 4; k++) {
-                            int c = c4 * 4 + k;
+                            int c = (c4 * 4) + k;
                             if (c < chan) {
                                 int offset =
                                     (transpose_
-                                         ? (c * batch * height * width +
-                                            n * height * width + h * width + w)
-                                         : (n * chan * height * width +
-                                            c * height * width + h * width +
+                                         ? ((c * batch * height * width) +
+                                            (n * height * width) + (h * width) +
+                                            w)
+                                         : ((n * chan * height * width) +
+                                            (c * height * width) + (h * width) +
                                             w));
 
                                 dst[k] = input[offset];
@@ -729,15 +781,15 @@ template <typename T> class Tensor : public ITensor {
                             (pack_ ? ((n * height + h) * (width * chan4) +
                                       (w + c4 * width)) *
                                          4 * sizeof(T)
-                                   : c4 * layer_stride +
-                                         (n * height + h) * row_pitch +
-                                         w * 4 * sizeof(T));
+                                   : (c4 * layer_stride) +
+                                         ((n * height + h) * row_pitch) +
+                                         (w * 4 * sizeof(T)));
                         src = reinterpret_cast<T *>(
                             reinterpret_cast<uint8_t *>(ptr) +
                             src_bytes_offset);
 
                         for (int k = 0; k < 4; k++) {
-                            int c = c4 * 4 + k;
+                            int c = (c4 * 4) + k;
                             if (c < chan) {
                                 size_t offset;
                                 if (transpose_) {

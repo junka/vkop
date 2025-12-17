@@ -119,7 +119,7 @@ void VulkanInstance::getRequiredExtensions(
     available_extensions.resize(extension_count);
     vkEnumerateInstanceExtensionProperties(nullptr, &extension_count,
                                            available_extensions.data());
-    auto isExtensionSupported =
+    auto is_ext_supported =
         [&available_extensions](const char *extensionName) -> bool {
         for (const auto &extension : available_extensions) {
             if (strcmp(extension.extensionName, extensionName) == 0) {
@@ -131,30 +131,30 @@ void VulkanInstance::getRequiredExtensions(
     // Add instance extensions
 #ifdef USE_DEBUG_LAYERS
 #if VK_EXT_debug_utils
-    if (isExtensionSupported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
+    if (is_ext_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
 #if VK_EXT_debug_report
     if (extensions.empty() &&
-        isExtensionSupported(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
+        is_ext_supported(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {
         extensions.push_back(VK_EXT_DEBUG_REPORT_EXTENSION_NAME);
     }
 #endif
 #endif
 #if VK_KHR_get_physical_device_properties2
-    if (isExtensionSupported(
+    if (is_ext_supported(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
         extensions.push_back(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     }
 #endif
 #if VK_KHR_portability_enumeration
-    if (isExtensionSupported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
+    if (is_ext_supported(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {
         extensions.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
     }
 #endif
 #ifdef VK_EXT_debug_marker
-    if (isExtensionSupported(VK_EXT_DEBUG_MARKER_EXTENSION_NAME)) {
+    if (is_ext_supported(VK_EXT_DEBUG_MARKER_EXTENSION_NAME)) {
         extensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
     }
 #endif

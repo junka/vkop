@@ -27,8 +27,8 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
     float y_ratio = static_cast<float>(image_h - 1) / (in_h - 1);
 
     const uint8_t* y_src = raw_image.data();
-    const uint8_t* u_src = raw_image.data() + image_w * image_h;
-    const uint8_t* v_src = raw_image.data() + 2 * image_w * image_h;
+    const uint8_t* u_src = raw_image.data() + (image_w * image_h);
+    const uint8_t* v_src = raw_image.data() + (2 * image_w * image_h);
 
     int u_offset = in_w * in_h;
     int v_offset = 2 * in_w * in_h;
@@ -49,19 +49,19 @@ std::vector<T> resize_YUV(std::vector<uint8_t> raw_image, int image_h, int image
 
             // 对 Y, U, V 分量分别进行双线性插值
             auto interpolate = [](const uint8_t* plane, int w, int x1, int y1, int x2, int y2, float dx, float dy) {
-                uint8_t p11 = plane[y1 * w + x1];
-                uint8_t p12 = plane[y1 * w + x2];
-                uint8_t p21 = plane[y2 * w + x1];
-                uint8_t p22 = plane[y2 * w + x2];
+                uint8_t p11 = plane[(y1 * w) + x1];
+                uint8_t p12 = plane[(y1 * w) + x2];
+                uint8_t p21 = plane[(y2 * w) + x1];
+                uint8_t p22 = plane[(y2 * w) + x2];
                 return static_cast<uint8_t>(
-                    p11 * (1 - dx) * (1 - dy) +
-                    p12 * dx * (1 - dy) +
-                    p21 * (1 - dx) * dy +
-                    p22 * dx * dy
+                    (p11 * (1 - dx) * (1 - dy)) +
+                    (p12 * dx * (1 - dy)) +
+                    (p21 * (1 - dx) * dy) +
+                    (p22 * dx * dy)
                 );
             };
 
-            int dst_idx = dy * in_w + dx;
+            int dst_idx = (dy * in_w) + dx;
             resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
             resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;
             resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) / 255.0F;

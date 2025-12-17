@@ -85,8 +85,6 @@ class Col2im : public Operator {
         submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
                UP_DIV(depth, 4));
     }
-
-  private:
 };
 
 } // namespace ops

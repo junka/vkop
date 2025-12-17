@@ -1082,6 +1082,17 @@ def parse_onnx_model(onnx_path):
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
 
+
+    op_stats = {}
+    for node in vk_model.nodes:
+        op_type = node['op_type']
+        op_stats[op_type] = op_stats.get(op_type, 0) + 1
+
+    print("\nOperator Statistics:")
+    print("idx\ttype\t\tnum")
+    for idx, (op_type, count) in enumerate(op_stats.items(), 1):
+        print(f"{idx}\t{op_type}\t\t{count}")
+
     return vk_model
 
 
@@ -1102,3 +1113,4 @@ if __name__ == "__main__":
     print("Model saved to:", output_bin_path)
     file_size = os.path.getsize(output_bin_path)
     print(f"File size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
+

@@ -48,10 +48,11 @@ else()
 endif()
 
 execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import importlib,sys; spec=importlib.util.find_spec('torch'); print('FOUND' if spec else 'MISSING'); print(spec.origin if spec else '')"
+    COMMAND ${Python3_EXECUTABLE} -c "import torch; print('FOUND'); print(torch.__file__)"
     OUTPUT_VARIABLE PYTORCH_CHECK
     OUTPUT_STRIP_TRAILING_WHITESPACE
     ERROR_QUIET
+    RESULT_VARIABLE TORCH_IMPORT_RESULT
 )
 
 string(REPLACE "\n" ";" PYTORCH_LINES "${PYTORCH_CHECK}")

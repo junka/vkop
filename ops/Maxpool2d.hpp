@@ -140,14 +140,14 @@ class Maxpool2d : public Operator {
         int depth = input_shape[1];
 
         int out_height =
-            (input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
-             2 * pads_[0] + (ceil_mode_ ? strides_[0] : 0) - 1) /
-                strides_[0] +
+            ((input_shape[2] - dilations_[0] * (kernel_shape_[0] - 1) +
+              2 * pads_[0] + (ceil_mode_ ? strides_[0] : 0) - 1) /
+             strides_[0]) +
             1;
         int out_width =
-            (input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
-             2 * pads_[1] + (ceil_mode_ ? strides_[1] : 0) - 1) /
-                strides_[1] +
+            ((input_shape[3] - dilations_[1] * (kernel_shape_[1] - 1) +
+              2 * pads_[1] + (ceil_mode_ ? strides_[1] : 0) - 1) /
+             strides_[1]) +
             1;
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {

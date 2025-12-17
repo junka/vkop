@@ -2,6 +2,7 @@
 #include "vulkan/VulkanQueryPool.hpp"
 #include "vulkan/VulkanLib.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 
@@ -9,9 +10,8 @@ namespace vkop {
 VulkanQueryPool::VulkanQueryPool(VkDevice device, uint32_t queryCount,
                                  VkQueryType queryType)
     : m_device_(device), m_queryCount_(queryCount) {
-    if (m_queryCount_ < 2) {
-        m_queryCount_ = 2;
-    }
+    m_queryCount_ = std::max<uint32_t>(m_queryCount_, 2);
+
     VkQueryPoolCreateInfo query_pool_info{};
     query_pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
     query_pool_info.queryType =

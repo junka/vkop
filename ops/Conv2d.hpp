@@ -182,12 +182,12 @@ class Conv2d : public Operator {
         int kernel_w =
             kernel_shape_[1] == 0 ? weight_shape[3] : kernel_shape_[1];
         int out_height =
-            (in_height + 2 * pads_[0] - dilations_[0] * (kernel_h - 1) - 1) /
-                strides_[0] +
+            ((in_height + 2 * pads_[0] - dilations_[0] * (kernel_h - 1) - 1) /
+             strides_[0]) +
             1;
         int out_width =
-            (in_width + 2 * pads_[1] - dilations_[1] * (kernel_w - 1) - 1) /
-                strides_[1] +
+            ((in_width + 2 * pads_[1] - dilations_[1] * (kernel_w - 1) - 1) /
+             strides_[1]) +
             1;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);

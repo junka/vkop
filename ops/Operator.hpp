@@ -2,6 +2,7 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <iostream>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -10,7 +11,7 @@
 #include "core/Tensor.hpp"
 #include "ops/Ops.hpp"
 
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
 namespace vkop {
 namespace ops {
@@ -57,7 +58,7 @@ class Operator {
             }
         }
     }
-    virtual inline std::vector<int> parse_attr_list(const std::string &str) {
+    virtual std::vector<int> parse_attr_list(const std::string &str) {
         std::vector<int> result;
         if (str.front() == '[' && str.back() == ']') {
             std::string content = str.substr(1, str.size() - 2);
@@ -114,7 +115,7 @@ class Operator {
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
 
-    using SupportedTypes = std::tuple<float, uint16_t, int, int64_t>;
+    using SupportedTypes = std::tuple<float, uint16_t, int, int64_t, uint8_t>;
     template <typename Func>
     void dispatch_by_dtype(const std::type_info &dtype, Func &&func) {
         bool dispatched = false;

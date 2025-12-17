@@ -3,7 +3,7 @@
 #include "ops/Operator.hpp"
 
 namespace vkop {
-#define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
+#define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
 namespace {
 constexpr int kStagingBufferSize =
     1024 * 1024 * 16; // 32M,  greater than 1024 * 1024 * 3 for one image

@@ -10,6 +10,15 @@ vkop 是一个基于 Vulkan 的实现的AI推理引擎，旨在利用GPU计算�
 ```bash
 sudo apt install spirv-tools
 ```
+对于模型转换
+```
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+pip install onnx onnx-simplifier onnxsim onnxruntime
+```
+对于测试依赖torch
+```
+pip install torch
+```
 
 #### 2. 环境设置
 设置 Vulkan ICD 加载器，以 NVIDIA 为例：
