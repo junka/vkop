@@ -32,7 +32,10 @@ source path/to/VulkanSDK/setup-env.sh
 ```
 
 #### 3. 编译项目
-(此处需要补充具体的编译步骤)
+
+```
+cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+```
 
 #### 4. 运行程序
 (此处需要补充具体的运行方法)

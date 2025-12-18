@@ -12,10 +12,8 @@
 #include <cstdint>
 #include <memory>
 #include <cmath>
+#include <string>
 #include <iomanip>
-
-#include <unistd.h>
-#include <vulkan/vulkan_core.h>
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
@@ -52,15 +50,12 @@ std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float
     std::vector<float> softmax_probs = probs;
 
     float max_val = *std::max_element(softmax_probs.begin(), softmax_probs.end());
-    printf("max val %f\n", max_val);
-    // Compute exp(x - max) for numerical stability
     float sum = 0.0f;
     for (auto& val : softmax_probs) {
         val = std::exp(val - max_val);
         sum += val;
     }
     
-    // Normalize to get probabilities
     for (auto& val : softmax_probs) {
         val /= sum;
     }
@@ -80,60 +75,10 @@ std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float
     if (indexed_probs.size() > static_cast<size_t>(k)) {
         indexed_probs.resize(k);
     }
-    
-    for (const auto& pair : indexed_probs) {
-        printf("%d: %.4f\n", pair.first, pair.second);
-    }
 
     return indexed_probs;
 }
-template<typename T>
-std::vector<T> resize_rgb_unorm(const uint8_t *raw_image, int image_h, int image_w, int in_h, int in_w) {
-    float x_ratio = static_cast<float>(image_w - 1) / (in_w - 1);
-    float y_ratio = static_cast<float>(image_h - 1) / (in_h - 1);
 
-    std::vector<T> resized_image(in_h * in_w * 3);
-
-    for (int dy = 0; dy < in_h; ++dy) {
-        for (int dx = 0; dx < in_w; ++dx) {
-            float src_x = dx * x_ratio;
-            float src_y = dy * y_ratio;
-            int x1 = static_cast<int>(src_x);
-            int y1 = static_cast<int>(src_y);
-            int x2 = std::min(x1 + 1, image_w - 1);
-            int y2 = std::min(y1 + 1, image_h - 1);
-
-            float dx_ratio = src_x - x1;
-            float dy_ratio = src_y - y1;
-
-            // 对每个颜色通道分别进行双线性插值
-            for (int c = 0; c < 3; c++) {
-                auto interpolate = [](const uint8_t* image_data, int width, int x1, int y1, int x2, int y2, float dx, float dy, int channel) {
-                    uint8_t p11 = image_data[(y1 * width + x1) * 3 + channel];
-                    uint8_t p12 = image_data[(y1 * width + x2) * 3 + channel];
-                    uint8_t p21 = image_data[(y2 * width + x1) * 3 + channel];
-                    uint8_t p22 = image_data[(y2 * width + x2) * 3 + channel];
-                    return static_cast<uint8_t>(
-                        (p11 * (1 - dx) * (1 - dy)) +
-                        (p12 * dx * (1 - dy)) +
-                        (p21 * (1 - dx) * dy) +
-                        (p22 * dx * dy)
-                    );
-                };
-
-                int dst_idx = (dy * in_w + dx) * 3 + c;
-                float scale = 1.0f;
-                // if (std::is_same_v<T, uint16_t>) {
-                //     scale = 257.0f;
-                // } else if (std::is_same_v<T, float>) {
-                //     scale = 1.0f/255.0f;
-                // }
-                resized_image[dst_idx] = interpolate(raw_image, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio, c) * scale;
-            }
-        }
-    }
-    return resized_image;
-}
 }
 
 int main(int argc, char *argv[]) {
@@ -149,7 +94,8 @@ int main(int argc, char *argv[]) {
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     if (argc < 3) {
-        std::cerr << "download model from https://media.githubusercontent.com/media/onnx/models/refs/heads/main/validated/vision/classification/resnet/model/resnet50-v2-7.onnx?download=true" << std::endl;
+        std::cerr << "download resnet model from https://github.com/onnx/models/tree/main/validated/vision/classification/resnet/model" << std::endl;
+        std::cerr << "convert onnx to vkopbin using onnx2vkop.py from directory model" << std::endl;
         std::cerr << "download class tag from https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt" << std::endl;
         std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image> [labels.txt]" << std::endl;
         return 1;
@@ -165,47 +111,22 @@ int main(int argc, char *argv[]) {
     int image_w;
     int channels;
     auto *raw = stbi_load(image_file_path.c_str(), &image_w, &image_h, &channels, 3);
-    // printf("%d, %d, %d\n", image_h, image_w, channels);
-    // size_t data_size = image_w * image_h * channels;
-    // for (int i = 0; i < image_w; i++) {
-    //     printf("%d, ", raw[(image_h -1) * image_w * 3 + i * 3 + 2]);
-    // }
 
-    auto input = rt->GetInput("data");
+    auto input = rt->GetInput(); // data
     auto t = vkop::core::as_tensor<float>(input);
     int resize_h = t->getShape()[2];
     int resize_w = t->getShape()[3];
     uint8_t *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
     stbir_resize_uint8_linear(raw, image_w, image_h, 0, resized, resize_w, resize_h, 0, STBIR_RGB);
 
-    // auto resized = resize_rgb_unorm<float>(raw, image_h, image_w, resize_h, resize_w);
     stbi_image_free(raw);
-    // for (int i = 0; i < resize_w; i++) {
-    //     printf("%d, ", resized[(resize_h -1) * resize_w * 3 + i * 3 + 2]);
-    // }
-    // printf("\n");
     std::vector<float> normalized_data(resize_h * resize_w * 4);
     for (int c = 0; c < 3; c++) {
         for (int i = 0; i < resize_h * resize_w; i++) {
-            normalized_data[i * 4  + c] = ((static_cast<float>(resized[i * 3 + c])/255.0F) - mean[c]) / stdvar[c];
+            normalized_data[(i * 4)  + c] = ((static_cast<float>(resized[i * 3 + c])/255.0F) - mean[c]) / stdvar[c];
         }
     }
-    // for (int h = 0; h < resize_h; h++) {
-    //     for (int w = 0; w < resize_w; w++) {
-    //         for (int c = 0; c < 3; c++) {
-    //             int rgb_idx = (h * resize_w * 3) + (w * 3) + c;         // RGB格式索引
-    //             int chw_idx = (c * resize_h * resize_w) + (h * resize_w) + w;  // CHW格式索引
-    //             normalized_data[chw_idx] = ((static_cast<float>(resized[rgb_idx])/255.0F) - mean[c]) / stdvar[c];
-    //         }
-    //     }
-    // }
     free(resized);
-    // 打印blue分量最后一行
-    // for (int i = 0; i < resize_w; i++) {
-    //     printf("%.4f, ", normalized_data[(resize_h -1) * resize_w * 4 + i * 4 + 2]);
-    // }
-    // printf("\n");
-
 
     // 1, 3, h, w, RGBA copy directly
     t->fillToGPUImage(cmdpool, normalized_data.data());
@@ -214,7 +135,7 @@ int main(int argc, char *argv[]) {
     normalized_data.shrink_to_fit();
 
     double tot_lat = 0.0F;
-    int count = 10;
+    int count = 100;
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();
         tot_lat += lat;
@@ -222,17 +143,15 @@ int main(int argc, char *argv[]) {
     }
     std::cout << "avg time:" << tot_lat/count << " ms" << std::endl;
     rt->ReadResult();
-    auto cls = vkop::core::as_tensor<float>(rt->GetOutput("resnetv24_dense0_fwd"));
-    // for (auto& val : cls->data()) {
-    //     std::cout<< val << " ";
-    // }
-    auto res = get_top_k_predictions(cls->data(), 10);
-    std::cout << "\nTop-10 Predictions:\n";
+    auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
+
+    auto res = get_top_k_predictions(cls->data(), 5);
+    std::cout << "\nTop-5 Predictions:\n";
     std::cout << std::fixed << std::setprecision(4);
     
     auto labels = load_labels(labels_file_path);
 
-    for (int i = 0; i < 10 && i < static_cast<int>(res.size()); ++i) {
+    for (int i = 0; i < 5 && i < static_cast<int>(res.size()); ++i) {
         int index = res[i].first;
         float probability = res[i].second;
         

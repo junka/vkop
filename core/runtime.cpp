@@ -33,7 +33,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    model.dump_model();
+    // model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
@@ -202,6 +202,13 @@ void Runtime::LoadModel() {
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) {
+    if (name.empty() && inputs_.size() > 1) {
+        throw std::runtime_error(
+            "Input name is empty but there are multiple inputs");
+    }
+    if (name.empty() && inputs_.size() == 1) {
+        return inputs_.begin()->second;
+    }
     auto it = inputs_.find(name);
     if (it == inputs_.end()) {
         return nullptr;
@@ -210,6 +217,13 @@ std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) {
 }
 
 std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) {
+    if (name.empty() && inputs_.size() > 1) {
+        throw std::runtime_error(
+            "Output name is empty but there are multiple outputs");
+    }
+    if (name.empty() && outputs_.size() == 1) {
+        return outputs_.begin()->second;
+    }
     auto it = outputs_.find(name);
     if (it == outputs_.end()) {
         return nullptr;

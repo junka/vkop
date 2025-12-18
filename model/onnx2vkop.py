@@ -647,6 +647,75 @@ def merge_initializers(vk_model):
     print(f"Merged {len(bn_nodes)} BatchNormalization nodes, removed {len(merged_initializers)} initializers")
 
 
+def convert_flat_to_reshape(vk_model):
+    """
+    Convert Flat nodes to Reshape nodes with explicit shapes.
+    
+    Flatten operation flattens the input tensor into a 2D tensor, keeping dimensions
+    up to axis-1 and flattening the rest into the second dimension.
+    """
+    nodes = vk_model.nodes
+    new_nodes = []
+    
+    for node in nodes:
+        if node['op_type'] == 'Flatten':
+            # Get input shape
+            if len(node['inputs']) > 0 and len(node['inputs'][0]['shape']) > 0:
+                input_shape = node['inputs'][0]['shape']
+                print(f"Flatten node {node['name']} input shape: {input_shape}")
+                
+                # Get axis attribute (default is 1 according to ONNX spec)
+                axis = node['attributes'].get('axis', 1)
+                
+                # Calculate output shape for flatten:
+                # First part: product of dimensions from 0 to axis-1
+                # Second part: product of dimensions from axis to end
+                if axis == 0:
+                    first_part = 1
+                else:
+                    first_part = 1
+                    for i in range(axis):
+                        first_part *= input_shape[i]
+                
+                second_part = 1
+                for i in range(axis, len(input_shape)):
+                    second_part *= input_shape[i]
+                
+                output_shape = [first_part, second_part]
+                
+                # Create new reshape node
+                reshape_node = {
+                    'op_type': 'Reshape',
+                    'name': node['name'],
+                    'attributes': {},
+                    'inputs': node['inputs'][:],  # Copy original inputs
+                    'outputs': node['outputs'][:]  # Copy original outputs
+                }
+                
+                # Add shape tensor as second input
+                shape_tensor_name = node['name'] + '_shape'
+                shape_tensor = np.array(output_shape, dtype=np.int64)
+                shape_initializer = numpy_helper.from_array(shape_tensor, shape_tensor_name)
+                vk_model.initializers[shape_tensor_name] = shape_initializer
+                
+                # Add the shape tensor as the second input to reshape
+                reshape_node['inputs'].append({
+                    'name': shape_tensor_name,
+                    'shape': list(shape_tensor.shape)
+                })
+                
+                new_nodes.append(reshape_node)
+                print(f"Converted Flatten node '{node['name']}' to Reshape with shape {output_shape} (axis={axis})")
+            else:
+                # If we can't determine the shape, keep the original node
+                new_nodes.append(node)
+                print(f"Warning: Could not convert Flatten node '{node['name']}' - missing shape info")
+        else:
+            new_nodes.append(node)
+    
+    vk_model.nodes = new_nodes
+
+
 def remove_redundant_reshape(vk_model):
     """
     Remove redundant reshape nodes where input and output shapes are the same.
