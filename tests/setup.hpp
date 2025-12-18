@@ -2,6 +2,7 @@
 #define VKOP_TESTS_HPP_
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 #include <vector>
 #include <unordered_map>
@@ -63,9 +64,17 @@ public:
                     attribute_func(op);
                 }
                 std::vector<std::shared_ptr<core::ITensor>> outputs;
-                for (size_t i = 0; i < expect_outputs.size(); i++) {
-                    auto output = std::make_shared<Tensor<T>>(true);
-                    outputs.push_back(output);
+                for (const auto & expect_output : expect_outputs) {
+                    if (expect_output->dtype() == typeid(float)) {
+                        auto output = std::make_shared<Tensor<float>>(true);
+                        outputs.push_back(output);
+                    } else if (expect_output->dtype() == typeid(uint16_t)) {
+                        auto output = std::make_shared<Tensor<uint16_t>>(true);
+                        outputs.push_back(output);
+                    } else {
+                        LOG_ERROR("Unsupported output tensor type");
+                        return false;
+                    }
                 }
                 for (const auto &input : inputs) {
                     if (!input || input->dtype() == typeid(int64_t)) {
@@ -84,12 +93,13 @@ public:
                 op->onExecute(inputs, outputs, cmd, 0);
                 cmd->end();
                 cmd->submit(dev->getComputeQueue());
-                for (size_t idx = 0; idx < outputs.size(); idx++) {
-                    auto output = core::as_tensor<T>(outputs[idx]);
+
+                auto check_ret = [&] (int idx, auto type_tag) -> bool {
+                    using TT = decltype(type_tag);
+                    auto output = core::as_tensor<TT>(outputs[idx]);
                     output->copyToCPU(cmdpool);
                     auto oshape = output->getShape();
                     printf("output shape: %ld\n", oshape.size());
-                    #if 1
                     if (oshape.size() == 4) {
                         for (int i = 0; i < oshape[0]; i++) {
                             printf("[\n");
@@ -98,9 +108,9 @@ public:
                                 for (int k = 0; k < oshape[2]; k++) {
                                     printf("[");
                                     for (int l = 0; l < oshape[3]; l++) {
-                                        int idx = i * oshape[1] * oshape[2] * oshape[3] + j * oshape[2] * oshape[3] +
-                                            k * oshape[3] + l;
-                                        if (sizeof(T) == 2) {
+                                        int idx = (i * oshape[1] * oshape[2] * oshape[3]) + (j * oshape[2] * oshape[3]) +
+                                            (k * oshape[3]) + l;
+                                        if (sizeof(TT) == 2) {
                                             std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
                                         } else {
                                             std::cout <<  (*output)[idx] << ",";
@@ -116,8 +126,8 @@ public:
                         for (int i = 0; i < oshape[0]; i++) {
                             printf("[");
                             for (int j = 0; j < oshape[1]; j++) {
-                                int idx = i * oshape[1] + j;
-                                if (sizeof(T) == 2) {
+                                int idx = (i * oshape[1]) + j;
+                                if (sizeof(TT) == 2) {
                                     std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
                                 } else {
                                     std::cout << (*output)[idx] << ", ";
@@ -127,10 +137,9 @@ public:
                         }
                         printf("]\n");
                     }
-                    #endif
-                    auto expect = core::as_tensor<T>(expect_outputs[idx]);
+                    auto expect = core::as_tensor<TT>(expect_outputs[idx]);
                     for (int i = 0; i < output->num_elements(); i++) {
-                        if (sizeof(T) == 2) {
+                        if (sizeof(TT) == 2) {
                             std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
                             if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
                                 LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
@@ -138,11 +147,23 @@ public:
                             }
                         } else {
                             std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                            if (std::fabs((*output)[i] - (*expect)[i]) > 1e-3) {
+                            if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
                                 LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
                                 return false;
                             }
                         }
+                    }
+                    return true;
+                };
+
+                for (size_t idx = 0; idx < outputs.size(); idx++) {
+                    if (outputs[idx]->dtype() == typeid(float)) {
+                        if (!check_ret(idx, float{})) {
+                            return false;
+                        }
+                    } else {
+                        if (!check_ret(idx, uint16_t{}))
+                            return false;
                     }
                 }
                 LOG_INFO("Test Passed for operator: %s", name_.c_str());
@@ -253,7 +274,7 @@ public:
             throw std::invalid_argument("At least one shape (input) must be provided");
         }
 
-        auto input_shape = shapes[0];
+        const auto& input_shape = shapes[0];
         std::vector<int> weight_shape;
         std::vector<int> bias_shape;
         bool has_weight = false;

@@ -60,7 +60,7 @@ layout(push_constant) uniform constBuffer {
     int fp16;
 } uConstant;
 
-vec4 batch_norm(vec4 value, int c4)
+vec4 batch_norm(vec4 value, int c4, bvec4 valid_oc)
 {
     vec4 scale4 = uBnPara.attr[c4 * 4];
     vec4 bias4 = uBnPara.attr[c4 * 4 + 1];
@@ -70,7 +70,8 @@ vec4 batch_norm(vec4 value, int c4)
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));
     vec4 normalized = (value - mean4) * inv_std;
-    return scale4 * normalized + bias4;
+    vec4 ret = scale4 * normalized + bias4;
+    return ret * vec4(valid_oc);
 }
 
 // support both fp16 and fp32 initializer
@@ -317,7 +318,7 @@ void conv1x1() {
     }
     if (uConstant.fuse_bn != 0) {
         // Load per-channel parameters
-        acc = batch_norm(acc, c4);
+        acc = batch_norm(acc, c4, valid_oc);
     }
 
     acc = activation(acc, uConstant.activation);
@@ -587,7 +588,7 @@ void grouped_conv2d() {
 
     if (uConstant.fuse_bn != 0) {
         // Load per-channel parameters
-        acc = batch_norm(acc, c4);
+        acc = batch_norm(acc, c4, valid_oc);
     }
 
 

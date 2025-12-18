@@ -40,7 +40,7 @@ std::vector<float> batch_norm_2d(std::shared_ptr<Tensor<float>> &input, int batc
 class BatchNormTest : public TestCase {
 public:
     std::vector<int> input_shape_ = {
-        1, 3, 4, 4
+        1, 5, 2, 2
     };
     const std::unordered_map<std::string, std::string> param = {
         {"eps", "1e-5"}
@@ -56,8 +56,7 @@ private:
     void initTestdata()
     {
         std::vector<std::vector<int>> shapes;
-        std::vector<int> num_feature(1);
-        num_feature[0] = input_shape_[1];
+        std::vector<int> num_feature(1, input_shape_[1]);
         shapes.push_back(input_shape_);
         shapes.push_back(num_feature);
         shapes.push_back(num_feature);
@@ -68,10 +67,10 @@ private:
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("batch_norm", shapes, param);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
         std::vector<int> output_shape = std::get<1>(k);
-        auto torch_output = torch_tensors[0];
-        auto torch_input = torch_tensors[1];
-        auto torch_mean = torch_tensors[2];
-        auto torch_var = torch_tensors[3];
+        const auto& torch_output = torch_tensors[0];
+        const auto& torch_input = torch_tensors[1];
+        const auto& torch_mean = torch_tensors[2];
+        const auto& torch_var = torch_tensors[3];
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 #if 1
@@ -91,9 +90,9 @@ private:
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
+                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                (j * output_shape[2] * output_shape[3]) +
+                                (k * output_shape[3]) +
                                 l;
                         printf("%.4f, ", torch_input[idx]);
                     }
@@ -110,9 +109,9 @@ private:
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
+                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                (j * output_shape[2] * output_shape[3]) +
+                                (k * output_shape[3]) +
                                 l;
                         printf("%.4f, ", torch_output[idx]);
                     }
@@ -127,20 +126,20 @@ private:
         input->fillToCPU(torch_input);
         output = std::make_shared<Tensor<float>>(output_shape);
         output->fillToCPU(torch_output);
-        para = std::make_shared<Tensor<float>>(std::vector<int>{UP_DIV(input_shape_[1], 4) *4, 4});
+        para = std::make_shared<Tensor<float>>(std::vector<int>{UP_DIV(input_shape_[1], 4) * 16});
         para->reserveOnCPU();
         // fill every element as vec4
         int c = input->get_channel();
         int c4 = UP_DIV(c, 4);
-        for (int i = 0; i < c4; i++) {      
+        for (int i = 0; i < c4; i++) {
             for (int j = 0; j < 4; j++) {
                 if (i * 4 + j >= c) {
                     break;
                 }
-                (*para)[i * 4 +j] = 1.0F;
-                (*para)[(i + 1) * 4+j] = 0.0F;
-                (*para)[(i + 2) * 4+j] = torch_mean[i*4+j];
-                (*para)[(i + 3) * 4+j] = torch_var[i*4+j];
+                (*para)[(i * 16) + j] = 1.0F;
+                (*para)[(i * 16) + 4 + j] = 0.0F;
+                (*para)[(i * 16) + 8 + j] = torch_mean[(i * 4) + j];
+                (*para)[(i * 16) + 12 + j] = torch_var[(i * 4) + j];
             }
         }
     }

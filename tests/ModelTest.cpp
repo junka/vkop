@@ -60,8 +60,8 @@ public:
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
         int dilation_h, int dilation_w, int group) {
         // 计算输出张量的高度和宽度
-        int oh = (ih + 2 * pad_h - (kh - 1) * dilation_h - 1) / stride_h + 1;
-        int ow = (iw + 2 * pad_w - (kw - 1) * dilation_w - 1) / stride_w + 1;
+        int oh = ((ih + 2 * pad_h - (kh - 1) * dilation_h - 1) / stride_h) + 1;
+        int ow = ((iw + 2 * pad_w - (kw - 1) * dilation_w - 1) / stride_w) + 1;
 
         // 确保输出通道数和输入通道数可以被组数整除
         assert(oc % group == 0 && ic % group == 0);
@@ -94,25 +94,25 @@ public:
                             for (int ky = 0; ky < kh; ++ky) {
                                 for (int kx = 0; kx < kw; ++kx) {
                                     // 计算输入张量的索引
-                                    int ix = ox * stride_w + kx * dilation_w - pad_w;
-                                    int iy = oy * stride_h + ky * dilation_h - pad_h;
+                                    int ix = (ox * stride_w) + (kx * dilation_w) - pad_w;
+                                    int iy = (oy * stride_h) + (ky * dilation_h) - pad_h;
                                     float x_value = 0.0F;
 
                                     // 检查索引是否在输入张量范围内
                                     if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
                                         if (typeid(T) == typeid(float)) {
-                                            x_value = input[(((b * ic + sz) * ih + iy) * iw + ix)];
+                                            x_value = input[((((b * ic + sz) * ih + iy) * iw) + ix)];
                                         } else if (typeid(T) == typeid(uint16_t)) {
-                                            x_value = vkop::core::ITensor::fp16_to_fp32(input[(((b * ic + sz) * ih + iy) * iw + ix)]);
+                                            x_value = vkop::core::ITensor::fp16_to_fp32(input[((((b * ic + sz) * ih + iy) * iw) + ix)]);
                                         }
                                     }
 
                                     // 获取卷积核的值
                                     float y_value = 0.F;
                                     if (typeid(T) == typeid(float)) {
-                                        y_value = (*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx];
+                                        y_value = (*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx];
                                     } else {
-                                        y_value = vkop::core::ITensor::fp16_to_fp32((*weight)[(((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw + kx]);
+                                        y_value = vkop::core::ITensor::fp16_to_fp32((*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx]);
                                     }
 
                                     // 累加卷积结果
@@ -123,7 +123,7 @@ public:
 
                         // 将卷积结果加上偏置并存储到输出张量
                         // 计算输出张量的偏移量
-                        auto dest_offset = ((b * oc + oz) * oh + oy) * ow + ox;
+                        auto dest_offset = (((b * oc + oz) * oh + oy) * ow) + ox;
                         if (typeid(T) == typeid(float)) {
                             output.at(dest_offset) = sum + (*bias)[oz];
                         } else if (typeid(T) == typeid(uint16_t)) {
@@ -140,19 +140,11 @@ public:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    std::shared_ptr<VulkanDevice> dev;
-    try {
-        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        for (auto *pdev : phydevs) {
-            auto vdev = std::make_shared<VulkanDevice>(pdev);
-            if (vdev->getDeviceName().find("llvmpipe") != std::string::npos) {
-                continue;
-            }
-            dev = vdev;
-        }
-    } catch (const std::exception &e) {
-        LOG_ERROR("%s", e.what());
-        return EXIT_FAILURE;
+    auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
+        printf("no valid vulkan device\n");
+        return -1;
     }
 
     LOG_INFO("%s",dev->getDeviceName().c_str());
@@ -169,6 +161,8 @@ int main() {
 
     ModelTest<float> test;
     test.initTestData(t1, t2);
+    t1->copyToGPU(cmdpool);
+    t2->copyToGPU(cmdpool);
     rt->Run();
     rt->ReadResult();
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));

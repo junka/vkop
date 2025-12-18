@@ -29,11 +29,11 @@ namespace {
         int pad_height = pad_size;
         int pad_width = pad_size;
 
-        int padded_height = height + 2 * pad_height;
-        int padded_width = width + 2 * pad_width;
+        int padded_height = height + (2 * pad_height);
+        int padded_width = width + (2 * pad_width);
 
-        int out_height = (padded_height - kernel_h) / stride_height + 1;
-        int out_width = (padded_width - kernel_w) / stride_width + 1;
+        int out_height = ((padded_height - kernel_h) / stride_height) + 1;
+        int out_width = ((padded_width - kernel_w) / stride_width) + 1;
 
         for (int b = 0; b < batch; ++b) {
             for (int c = 0; c < channels; ++c) {
@@ -42,15 +42,15 @@ namespace {
                         float max_val = -std::numeric_limits<float>::infinity();
                         for (int ph = 0; ph < kernel_h; ++ph) {
                             for (int pw = 0; pw < kernel_w; ++pw) {
-                                int ih = oh * stride_height + ph - pad_height;
-                                int iw = ow * stride_width + pw - pad_width;
+                                int ih = (oh * stride_height) + ph - pad_height;
+                                int iw = (ow * stride_width) + pw - pad_width;
                                 if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
-                                    int input_idx = ((b * channels + c) * height + ih) * width + iw;
+                                    int input_idx = (((b * channels + c) * height + ih) * width) + iw;
                                     max_val = std::max(max_val, (*input)[input_idx]);
                                 }
                             }
                         }
-                        int output_idx = ((b * channels + c) * out_height + oh) * out_width + ow;
+                        int output_idx = (((b * channels + c) * out_height + oh) * out_width) + ow;
                         (*output)[output_idx] = max_val;
                     }
                 }
@@ -62,8 +62,8 @@ class MaxpoolTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
-    int stride_ = 1;
-    int kernel_size_ = 4;
+    int stride_ = 2;
+    int kernel_size_ = 3;
     int pad_ = 1;
 
     std::unordered_map<std::string, std::string> attributes = {
@@ -81,7 +81,7 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t = {3, 9, 8, 8};
+        std::vector<int> t = {1, 64, 112, 112};
         input = std::make_shared<Tensor<float>>(t);
         output = std::make_shared<Tensor<float>>(t);
         input->reserveOnCPU();

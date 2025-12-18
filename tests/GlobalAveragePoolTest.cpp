@@ -1,8 +1,6 @@
-#include <cstdint>
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -21,11 +19,11 @@ void global_average_pool(const std::shared_ptr<Tensor<float>>& input,
     int num_elements = input->num_elements() / n / c;
     for (int i = 0; i < n; i++) {
         for (int j = 0; j < c; j++) {
-            float sum = 0.0f;
+            float sum = 0.0F;
             for (int k = 0; k < num_elements; k++) {
-                sum += (*input)[i * c * num_elements + j * num_elements + k];
+                sum += (*input)[(i * c * num_elements) + (j * num_elements) + k];
             }
-            (*output)[i * c + j] = sum / num_elements;
+            (*output)[(i * c) + j] = sum / num_elements;
         }
     }
 
@@ -60,7 +58,7 @@ private:
         global_average_pool(input, output);
         for (int i = 0; i < input->getShape()[0]; i++) {
             for (int j = 0; j < input->getShape()[1]; j++) {
-                printf("%.4f " , (*output)[i * input->getShape()[1] + j]);
+                printf("%.4f " , (*output)[(i * input->getShape()[1]) + j]);
             }
             printf("\n");
         }

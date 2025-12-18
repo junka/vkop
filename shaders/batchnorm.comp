@@ -13,7 +13,7 @@ layout(set=0, binding = 2) readonly buffer tensorBuffer {
 } uMeanVarScaleBias;
 
 layout(push_constant) uniform batchNormBuffer {
-    ivec4 outShape; // [N, C, H, W] — note: PyTorch uses NCHW
+    ivec4 outShape; // [N, C, H, W]
     float eps;
     int activation;
 } uBatchNormParam;
@@ -40,7 +40,7 @@ void main() {
     int h = nh % H;
 
     // Fetch input pixel (RGBA = 4 channels)
-    vec4 inputPixel = texelFetch(inputImage, ivec3(w, nh, c4), 0);
+    vec4 inputPixel = texelFetch(inputImage, gid3, 0);
 
     // Load per-channel parameters, padding done in previous step
     vec4 scale4 = uMeanVarScaleBias.attr[c4 * 4];
@@ -48,17 +48,16 @@ void main() {
     vec4 mean4 = uMeanVarScaleBias.attr[c4 * 4 + 2];
     vec4 var4 = uMeanVarScaleBias.attr[c4 * 4 + 3];
 
-    // vec4 scale4 = texelFetch(uMeanVarScaleBias, c4 * 4);
-    // vec4 bias4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 1);
-    // vec4 mean4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 2);
-    // vec4 var4 = texelFetch(uMeanVarScaleBias, c4 * 4 + 3);
-
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));
     vec4 normalized = (inputPixel - mean4) * inv_std;
     vec4 pixel = scale4 * normalized + bias4;
-    
+
+    for (int i = 0; i < 4; i++) {
+        if (c4 * 4 + i >= C)
+            pixel[i] = 0.0;
+    }
     pixel = activation(pixel, uBatchNormParam.activation);
     // Store result
-    imageStore(outputImage, ivec3(w, nh, c4), pixel);
+    imageStore(outputImage, gid3, pixel);
 }

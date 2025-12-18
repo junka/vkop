@@ -20,6 +20,7 @@ struct alignas(16) GpuGemmParam {
     int transB;
     float alpha;
     float beta;
+    int fp16;
 };
 } // namespace gemm
 
@@ -97,6 +98,7 @@ class Gemm : public Operator {
         para.transA = transA_;
         para.transB = transB_;
         para.has_bias = (inputs.size() > 2 ? 1 : 0);
+        para.fp16 = (inputs[1]->dtype() == typeid(uint16_t) ? 1 : 0);
 
         submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
     }

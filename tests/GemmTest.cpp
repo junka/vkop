@@ -13,8 +13,12 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Gemm;
-void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::shared_ptr<Tensor<float>> &inputb,
-        const std::shared_ptr<Tensor<float>> &inputc, std::shared_ptr<Tensor<float>> &output,
+using vkop::core::ITensor;
+
+namespace {
+template <typename T>
+void reference_gemm(const std::shared_ptr<Tensor<T>> &inputa, const std::shared_ptr<Tensor<T>> &inputb,
+        const std::shared_ptr<Tensor<T>> &inputc, std::shared_ptr<Tensor<float>> &output,
         int M, int N, int K, float alpha, float beta, bool transA, bool transB, bool has_bias) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -25,18 +29,34 @@ void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::sha
 
                 if (transA) {
                     // inputa is stored as [K][M], so A^T[i][k] = inputa[k][i]
-                    a_val = (*inputa)[k * M + i];
+                    if (typeid(T) == typeid(uint16_t)) {
+                        a_val = ITensor::fp16_to_fp32((*inputa)[(k * M) + i]);
+                    } else {
+                        a_val = (*inputa)[(k * M) + i];
+                    }
                 } else {
                     // inputa is stored as [M][K]
-                    a_val = (*inputa)[i * K + k];
+                    if (typeid(T) == typeid(uint16_t)) {
+                        a_val = ITensor::fp16_to_fp32((*inputa)[(i * K) + k]);
+                    } else {
+                        a_val = (*inputa)[(i * K) + k];
+                    }
                 }
 
                 if (transB) {
                     // inputb is stored as [N][K], so B^T[k][j] = inputb[j][k]
-                    b_val = (*inputb)[j * K + k];
+                    if (typeid(T) == typeid(uint16_t)) {
+                        b_val = ITensor::fp16_to_fp32((*inputb)[(j * K) + k]);
+                    } else {
+                        b_val = (*inputb)[(j * K) + k];
+                    }
                 } else {
                     // inputb is stored as [K][N]
-                    b_val = (*inputb)[k * N + j];
+                    if (typeid(T) == typeid(uint16_t)) {
+                        b_val = ITensor::fp16_to_fp32((*inputb)[(k * N) + j]);
+                    } else {
+                        b_val = (*inputb)[(k * N) + j];
+                    }
                 }
 
                 sum += a_val * b_val;
@@ -44,31 +64,33 @@ void reference_gemm(const std::shared_ptr<Tensor<float>> &inputa, const std::sha
 
             sum *= alpha;
             if (has_bias && inputc != nullptr) {
-                sum += beta * (*inputc)[i * N + j];
+                if (typeid(T) == typeid(uint16_t)) {
+                    sum += beta * ITensor::fp16_to_fp32((*inputc)[(i * N) + j]);
+                } else {
+                   sum += beta * (*inputc)[(i * N) + j];
+                }
             }
-
-            (*output)[i * N + j] = sum;
+            (*output)[(i * N) + j] = sum;
         }
     }
 }
 
-namespace {
-
+template <typename T>
 class GemmTest : public TestCase {
 public:
-    std::shared_ptr<Tensor<float>> inputa;
-    std::shared_ptr<Tensor<float>> inputb;
-    std::shared_ptr<Tensor<float>> inputc;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<T>> inputb;
+    std::shared_ptr<Tensor<T>> inputc;
     std::shared_ptr<Tensor<float>> output;
 
-    float alpha = 0.9F;
-    float beta = 0.1F;
+    float alpha = 1.0F;
+    float beta = 1.0F;
     bool transA = false;
-    bool transB = false;
+    bool transB = true;
 
     std::unordered_map<std::string, std::string> attr = {
-        {"alpha", "0.9"},
-        {"beta", "0.1"},
+        {"alpha", "1"},
+        {"beta", "1"},
         {"transA", transA ? "1" : "0"},
         {"transB", transB ? "1" : "0"},
     };
@@ -78,16 +100,16 @@ public:
 
 private:
     void initTestdata() {
-        std::vector<int> t1 = {4, 8};
-        std::vector<int> t2 = {8, 6};
-        inputa = std::make_shared<Tensor<float>>(t1);
-        inputb = std::make_shared<Tensor<float>>(t2);
+        std::vector<int> t1 = {1, 2048};
+        std::vector<int> t2 = {1000, 2048};
+        inputa = std::make_shared<Tensor<T>>(t1);
+        inputb = std::make_shared<Tensor<T>>(t2);
         int m = transA ? t1[1] : t1[0];
         int ka = transA ? t1[0] : t1[1];
         // int kb = transB ? t2[1] : t2[0];
         int n = transB ? t2[0] : t2[1];
         int k = ka;
-        inputc = std::make_shared<Tensor<float>>(std::vector<int>{m, n});
+        inputc = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
         output = std::make_shared<Tensor<float>>(std::vector<int>{t1[0], t2[1]});
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
@@ -97,22 +119,38 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> input_dist{-3.0F, 6.0F};
+        std::normal_distribution<> input_dist{-3.0F, 2.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            (*inputa)[i] = input_dist(gen);
+            if (typeid(T) == typeid(uint16_t)) {
+                (*inputa)[i] = ITensor::fp32_to_fp16(input_dist(gen));
+            } else {
+                (*inputa)[i] = input_dist(gen);
+            }
         }
         for (int i = 0; i < inputb->num_elements(); i++) {
-            (*inputb)[i] = input_dist(gen);
+            if (typeid(T) == typeid(uint16_t)) {
+                (*inputb)[i] = ITensor::fp32_to_fp16(input_dist(gen));
+            } else {
+                (*inputb)[i] = input_dist(gen);
+            }
         }
         for (int i = 0; i < inputc->num_elements(); ++i) {
-            (*inputc)[i] = input_dist(gen);
+            if (typeid(T) == typeid(uint16_t)) {
+                (*inputc)[i] = ITensor::fp32_to_fp16(input_dist(gen));
+            } else {
+                (*inputc)[i] = input_dist(gen);
+            }
         }
         printf("M %d, N %d, K %d\n", m, n, k);
         printf("==============================================================\n");
         printf("Input A:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < k; j++) {
-                printf("%f ", (*inputa)[i * k + j]);
+                if (typeid(T) == typeid(uint16_t)) {
+                    std::cout << ITensor::fp16_to_fp32((*inputa)[(i * k) + j]) << " ";
+                } else {
+                    std::cout << (*inputa)[(i * k) + j] << " ";
+                }
             }
             printf("\n");
         }
@@ -120,7 +158,11 @@ private:
         printf("Input B:\n");
         for (int i = 0; i < k; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", (*inputb)[i * n + j]);
+                if (typeid(T) == typeid(uint16_t)) {
+                    std::cout << ITensor::fp16_to_fp32((*inputb)[(i * n) + j]) << " ";
+                } else {
+                    std::cout << (*inputb)[(i * n) + j] << " ";
+                }
             }
             printf("\n");
         }
@@ -128,7 +170,11 @@ private:
         printf("Input C:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", (*inputc)[i * n + j]);
+                if (typeid(T) == typeid(uint16_t)) {
+                    std::cout << ITensor::fp16_to_fp32((*inputc)[(i * n) + j]) << " ";
+                } else {
+                    std::cout << (*inputc)[(i * n) + j] << " ";
+                }
             }
             printf("\n");
         }
@@ -138,7 +184,7 @@ private:
         printf("Output:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < n; j++) {
-                printf("%f ", (*output)[i * n + j]);
+                std::cout << (*output)[(i * n) + j] << " ";
             }
             printf("\n");
         }
@@ -150,9 +196,21 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    GemmTest<float> gmtest1;
+    if (!gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
+        [&gmtest1](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *gemm_op = dynamic_cast<Gemm *>(op.get());
+            if (!gemm_op) {
+                LOG_ERROR("Failed to cast operator to Gemm");
+                return;
+            }
+            gemm_op->setAttribute(gmtest1.attr);
+        })) {
+        return -1;
+    }
 
-    GemmTest gmtest;
-    if (!gmtest.run_test<float>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
+    GemmTest<uint16_t> gmtest;
+    if (!gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
         [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *gemm_op = dynamic_cast<Gemm *>(op.get());
             if (!gemm_op) {

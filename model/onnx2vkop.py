@@ -359,17 +359,17 @@ def fuse_conv_bn_relu(vk_model):
             continue
 
         conv_out = node['outputs'][0]['name']
-        
+
         # 检查Conv的输出是否被单一节点消费
         conv_consumers = consumers.get(conv_out, [])
         if len(conv_consumers) != 1:
             continue
-            
+
         bn_node, _ = conv_consumers[0]
         # 检查消费者是否为BatchNormalization
         if bn_node['op_type'] != 'BatchNormalization':
             continue
-            
+
         bn_out = bn_node['outputs'][0]['name']
         # 检查BN的输出是否被单一节点消费
         bn_consumers = consumers.get(bn_out, [])
@@ -429,7 +429,7 @@ def fuse_conv_bn_relu(vk_model):
 def fuse_conv_simple_activation(vk_model):
     producer, consumers = build_graph_index(vk_model.nodes)
     ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
-    
+
     nodes = vk_model.nodes
     for idx, node in enumerate(nodes):
         node['_orig_idx'] = idx
@@ -578,11 +578,10 @@ def merge_initializers(vk_model):
             else:
                 bias_array = np.zeros_like(mean_array, dtype=mean_array.dtype)
 
-            # Create merged tensor with shape [4, N]
             # where N is the number of elements in each parameter
             N = mean_array.size
             padded_N = ((N+3)//4) * 4
-            merged_data = np.zeros((4, padded_N), dtype=mean_array.dtype)
+            merged_data = np.zeros((4 * padded_N), dtype=mean_array.dtype)
 
             # Reshape all arrays to 1D for consistent indexing
             scale_flat = scale_array.flatten()
@@ -598,10 +597,19 @@ def merge_initializers(vk_model):
             # Fill the merged tensor
             for i in range(padded_N // 4):
                 base_idx = i * 4
-                merged_data[0, base_idx:base_idx+4] = scale_flat[base_idx:base_idx+4]  # scale
-                merged_data[1, base_idx:base_idx+4] = bias_flat[base_idx:base_idx+4]   # bias
-                merged_data[2, base_idx:base_idx+4] = mean_flat[base_idx:base_idx+4]   # mean
-                merged_data[3, base_idx:base_idx+4] = var_flat[base_idx:base_idx+4]    # variance            
+                # Reorganize data to match C++ implementation (interleaved format)
+                # Each group of 16 elements contains 4 vec4: scale, bias, mean, variance
+                for j in range(4):
+                    if base_idx + j < N:
+                        merged_data[i * 16 + j] = scale_flat[base_idx + j]           # scale
+                        merged_data[i * 16 + 4 + j] = bias_flat[base_idx + j]        # bias
+                        merged_data[i * 16 + 8 + j] = mean_flat[base_idx + j]        # mean
+                        merged_data[i * 16 + 12 + j] = var_flat[base_idx + j]        # variance
+                    else:
+                        merged_data[i * 16 + j] = 1.0                               # scale default
+                        merged_data[i * 16 + 4 + j] = 0.0                           # bias default
+                        merged_data[i * 16 + 8 + j] = 0.0                           # mean default
+                        merged_data[i * 16 + 12 + j] = 1.0                          # variance default
             # Create a new initializer name
             merged_name = f"{node['name']}_bn_params"
 
@@ -615,7 +623,7 @@ def merge_initializers(vk_model):
             # Change inputs from 5 to 2: [input, merged_params]
             new_inputs = [
                 input_data,  # Original input data (index 0)
-                {'name': merged_name, 'shape': [4, N]}  # Merged parameters
+                {'name': merged_name, 'shape': [4 * padded_N]}  # Merged parameters
             ]
 
             node['inputs'] = new_inputs
@@ -623,7 +631,7 @@ def merge_initializers(vk_model):
             # Mark original initializers for removal
             merged_initializers.update([scale_name, bias_name, mean_name, var_name])
 
-            print(f"Merged BN parameters for node {node['name']}: "
+            print(f"Merged batchnorm for {node['name']}: "
                   f"scale({scale_name}), bias({bias_name}), mean({mean_name}), var({var_name}) "
                   f"-> merged({merged_name})")
 
@@ -1064,8 +1072,6 @@ def parse_onnx_model(onnx_path):
                             expanded_data = np.full(shape, scalar_val, dtype=np.float32)
                             new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
                             vk_model.initializers[initializer.name] = new_init
-    
-        
 
         vk_model.nodes.append({
             'op_type': node.op_type,
@@ -1075,8 +1081,9 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
-    quantize_to_fp16_selective(vk_model)
+    # quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)
+    convert_flat_to_reshape(vk_model)
     remove_redundant_reshape(vk_model)
     fuse_conv_bn_relu(vk_model)
     fuse_gated_conv(vk_model)

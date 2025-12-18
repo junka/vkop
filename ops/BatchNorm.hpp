@@ -97,23 +97,17 @@ class BatchNorm : public Operator {
             objs_.emplace_back(para_buffer);
         });
 
-        int batch = input_shape[0];
-        int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
-
-        int realheight = out_height * batch;
-
+        auto gpu_shape = outputs[0]->getGPUShape();
         batchnorm::GpuBatchNormParam para;
         para.eps = eps_;
         para.activation = static_cast<int>(activation_);
-        para.outShape[0] = batch;
-        para.outShape[1] = depth;
-        para.outShape[2] = out_height;
-        para.outShape[3] = out_width;
+        para.outShape[0] = input_shape[0];
+        para.outShape[1] = input_shape[1];
+        para.outShape[2] = input_shape[2];
+        para.outShape[3] = input_shape[3];
 
-        submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
-               UP_DIV(depth, 4));
+        submit(&para, UP_DIV(gpu_shape[0], 16), UP_DIV(gpu_shape[1], 16),
+               gpu_shape[2]);
     }
 
   private:

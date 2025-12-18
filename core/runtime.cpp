@@ -33,7 +33,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    // model.dump_model();
+    model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;

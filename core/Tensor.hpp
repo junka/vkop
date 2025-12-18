@@ -10,6 +10,7 @@
 #include "vulkan/VulkanResource.hpp"
 
 #include <cstdint>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <vector>
