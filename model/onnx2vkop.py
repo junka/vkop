@@ -428,7 +428,7 @@ def fuse_conv_bn_relu(vk_model):
 
 def fuse_conv_simple_activation(vk_model):
     producer, consumers = build_graph_index(vk_model.nodes)
-    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish", "Relu6"}
+    ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish"}
 
     nodes = vk_model.nodes
     for idx, node in enumerate(nodes):
@@ -443,12 +443,41 @@ def fuse_conv_simple_activation(vk_model):
             outs = consumers.get(out_name, [])
             if len(outs) == 1:
                 next_node, _ = outs[0]
-                if (next_node['op_type'] in ACTIVATIONS and
+                if next_node['op_type'] == 'Clip':
+                    if len(next_node['inputs']) > 1:
+                        min_input_name = next_node['inputs'][1]['name']
+                        max_input_name = next_node['inputs'][2]['name']
+
+                        if min_input_name in vk_model.initializers:
+                            min_array = numpy_helper.to_array(vk_model.initializers[min_input_name])
+                            if min_array.size == 1:
+                                min_val = float(min_array.item())
+                            del vk_model.initializers[min_input_name]
+                                
+                        if max_input_name in vk_model.initializers:
+                            max_array = numpy_helper.to_array(vk_model.initializers[max_input_name])
+                            if max_array.size == 1:
+                                max_val = float(max_array.item())
+                            del vk_model.initializers[max_input_name]
+                    elif 'min' in next_node['attributes'] or 'max' in next_node['attributes']:
+                        min_val = next_node['attributes'].get('min', -1.0)
+                        max_val = next_node['attributes'].get('max', 1.0)
+                    if min_val == 0.0 and max_val == 6.0:
+                        fused = node.copy()
+                        fused['attributes'] = dict(node.get('attributes', {}))
+                        fused['attributes']['activation'] = 'Relu6'
+                        fused['outputs'] = next_node['outputs']
+
+                        first_idx = node['_orig_idx']
+                        replacements[first_idx] = fused
+
+                        to_remove.add(first_idx)
+                        to_remove.add(next_node['_orig_idx'])
+                elif (next_node['op_type'] in ACTIVATIONS and
                     len(next_node['inputs']) == 1 and
                     next_node['inputs'][0]['name'] == out_name):
 
                     fused = node.copy()
-                    # fused['attributes'] = node['attributes'].copy()
                     fused['attributes'] = dict(node.get('attributes', {}))
                     fused['attributes']['activation'] = next_node['op_type']
                     fused['outputs'] = next_node['outputs']

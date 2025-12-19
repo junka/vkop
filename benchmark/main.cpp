@@ -118,7 +118,7 @@ int main(int argc, char *argv[]) {
     auto t = vkop::core::as_tensor<float>(input);
     int resize_h = t->getShape()[2];
     int resize_w = t->getShape()[3];
-    uint8_t *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
+    auto *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
     stbir_resize_uint8_linear(raw, image_w, image_h, 0, resized, resize_w, resize_h, 0, STBIR_RGB);
 
     stbi_image_free(raw);

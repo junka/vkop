@@ -1,4 +1,4 @@
 
 
-add_executable(vkresnet resnet.cpp)
-target_link_libraries(vkresnet -Wl,--whole-archive vkop -Wl,--no-whole-archive vload -lpthread)
+add_executable(vkbench main.cpp)
+target_link_libraries(vkbench -Wl,--whole-archive vkop -Wl,--no-whole-archive vload -lpthread)
