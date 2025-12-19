@@ -899,7 +899,7 @@ def quantize_to_fp16_selective(vk_model):
             else:
                 should_quantize = False
                 reason = f"small tensor ({arr.size} elements)"
-        
+
         if should_quantize:
             # Convert to numpy array
             arr = numpy_helper.to_array(initializer)
@@ -913,6 +913,7 @@ def quantize_to_fp16_selective(vk_model):
             # Update the initializer in the model
             vk_model.initializers[name] = fp16_initializer
             print(f"Converted FP32 tensor '{name}' to FP16 ({reason})")
+            print(f"New shape: {fp16_initializer.dims}")
             converted_count += 1
         else:
             print(f"Preserving FP32 tensor '{name}' ({reason})")
@@ -1150,7 +1151,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
-    # quantize_to_fp16_selective(vk_model)
+    quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)
     convert_flat_to_reshape(vk_model)
     remove_redundant_reshape(vk_model)

@@ -63,7 +63,9 @@ std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float
     std::vector<std::pair<int, float>> indexed_probs;
     indexed_probs.reserve(softmax_probs.size());
     for (size_t i = 0; i < softmax_probs.size(); ++i) {
-        indexed_probs.emplace_back(i, softmax_probs[i]);
+        if (softmax_probs[i] > 0.1F) {
+            indexed_probs.emplace_back(i, softmax_probs[i]);
+        }
     }
 
     std::sort(indexed_probs.begin(),
@@ -130,12 +132,11 @@ int main(int argc, char *argv[]) {
 
     // 1, 3, h, w, RGBA copy directly
     t->copyToGPUImage(cmdpool, normalized_data.data(), true);
-    // t->copyToGPU(cmdpool, normalized_data.data());
     normalized_data.clear();
     normalized_data.shrink_to_fit();
 
     double tot_lat = 0.0F;
-    int count = 100;
+    int count = 1000;
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();
         tot_lat += lat;
@@ -144,12 +145,9 @@ int main(int argc, char *argv[]) {
     std::cout << "avg time:" << tot_lat / count << " ms" << std::endl;
     rt->ReadResult();
     auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
-    printf("size %d \n", cls->num_elements());
-    for (int i = 0; i < cls->num_elements(); i++) {
-        printf("%.4f ", cls->data()[i]);
-    }
+
     auto res = get_top_k_predictions(cls->data(), 5);
-    std::cout << "\nTop-5 Predictions:\n";
+    std::cout << "\nPredictions:\n";
     std::cout << std::fixed << std::setprecision(4);
     
     auto labels = load_labels(labels_file_path);

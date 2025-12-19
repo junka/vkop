@@ -33,7 +33,9 @@ layout(push_constant) uniform paraBuffer {
     int transB;
     float alpha;
     float beta;
-    int fp16;
+    int fp16a;
+    int fp16b;
+    int fp16c;
 } uParams;
 
 void main() {
@@ -54,7 +56,7 @@ void main() {
             // A is stored as M×K, A[i][k] = A_physical[i][k]
             index = i * uParams.K + k;
         }
-        if (uParams.fp16 == 1) {
+        if (uParams.fp16a == 1) {
             a_val = unpackHalf2x16(bufferA.data[index/2])[index%2];
         } else {
             a_val = uintBitsToFloat(bufferA.data[index]);
@@ -69,7 +71,7 @@ void main() {
             // B is stored as K×N, B[k][j] = B_physical[k][j]
             index = k * uParams.N + j;
         }
-        if (uParams.fp16 == 1) {
+        if (uParams.fp16b == 1) {
             b_val = unpackHalf2x16(bufferB.data[index/2])[index%2];
         } else {
             b_val = uintBitsToFloat(bufferB.data[index]);
@@ -81,7 +83,7 @@ void main() {
     sum *= uParams.alpha;
     float c_val;
     if (uParams.has_bias == 1) {
-        if (uParams.fp16 == 1) {
+        if (uParams.fp16c == 1) {
             c_val = unpackHalf2x16(bufferC.data[yIndex/2])[yIndex%2];
         } else {
             c_val = uintBitsToFloat(bufferC.data[yIndex]);

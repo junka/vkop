@@ -4,6 +4,7 @@
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
 
+#include <cstdint>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -23,10 +24,10 @@ namespace {
 template<typename T>
 class ModelTest {
 public:
-    std::vector<T> expectedOutput;
+    std::vector<float> expectedOutput;
 
     ModelTest() = default;
-    void initTestData(const std::shared_ptr<Tensor<T>>& ta, const std::shared_ptr<Tensor<T>>& tb) {
+    void initTestData(const std::shared_ptr<Tensor<float>>& ta, const std::shared_ptr<Tensor<float>>& tb) {
         expectedOutput.resize(ta->num_elements());
         ta->reserveOnCPU();
         tb->reserveOnCPU();
@@ -39,20 +40,14 @@ public:
         for (int i = 0; i < ta->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            if (typeid(T) == typeid(uint16_t)) {
-                (*ta)[i] = ITensor::fp32_to_fp16(a);
-                (*tb)[i] = ITensor::fp32_to_fp16(b);
-                expectedOutput[i] = ITensor::fp32_to_fp16(a+b);
-            } else {
-                (*ta)[i] = a;
-                (*tb)[i] = b;
-                expectedOutput[i] = a+b;
-            }
+            (*ta)[i] = a;
+            (*tb)[i] = b;
+            expectedOutput[i] = a+b;
         }
     }
 
-    void reference_conv2d(const T* input, const std::shared_ptr<Tensor<T>>& weight,
-        const std::shared_ptr<Tensor<T>>& bias, std::vector<T>& output, int batch, int ic, int oc,
+    void reference_conv2d(const float* input, const std::shared_ptr<Tensor<T>>& weight,
+        const std::shared_ptr<Tensor<T>>& bias, std::vector<float>& output, int batch, int ic, int oc,
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
         int dilation_h, int dilation_w, int group) {
         // 计算输出张量的高度和宽度
@@ -96,11 +91,11 @@ public:
 
                                     // 检查索引是否在输入张量范围内
                                     if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
-                                        if (typeid(T) == typeid(float)) {
+                                        // if (typeid(T) == typeid(float)) {
                                             x_value = input[((((b * ic + sz) * ih + iy) * iw) + ix)];
-                                        } else if (typeid(T) == typeid(uint16_t)) {
-                                            x_value = vkop::core::ITensor::fp16_to_fp32(input[((((b * ic + sz) * ih + iy) * iw) + ix)]);
-                                        }
+                                        // } else if (typeid(T) == typeid(uint16_t)) {
+                                        //     x_value = vkop::core::ITensor::fp16_to_fp32(input[((((b * ic + sz) * ih + iy) * iw) + ix)]);
+                                        // }
                                     }
 
                                     // 获取卷积核的值
@@ -145,7 +140,7 @@ int main() {
 
     LOG_INFO("%s",dev->getDeviceName().c_str());
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
-    std::string binary_file_path = TEST_DATA_PATH"/add_conv_model.bin";
+    std::string binary_file_path = TEST_DATA_PATH"/add_conv_model.vkopbin";
     // This model has two inputs and one output,
     // one add and one conv2d operator
 
@@ -155,14 +150,14 @@ int main() {
     auto t1 = vkop::core::as_tensor<float>(rt->GetInput("input_x1"));
     auto t2 = vkop::core::as_tensor<float>(rt->GetInput("input_x2"));
 
-    ModelTest<float> test;
+    ModelTest<uint16_t> test;
     test.initTestData(t1, t2);
     t1->copyToGPU(cmdpool);
     t2->copyToGPU(cmdpool);
     rt->Run();
     rt->ReadResult();
-    auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
-    auto weight = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight"));
+    auto bias = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.bias"));
+    auto weight = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.weight"));
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     std::vector<float> ref_output_data;
     bias->copyToCPU(cmdpool);

@@ -5,9 +5,12 @@ measure 1000 rounds avgerage
 
 | GPU | Model | Operators |Precision | latency (ms) |
 | --- | ----- | --------- | -------- | ----------- |
-| A2000| resnet18 | 39 | fp32 | 9.37 |
+| A2000| resnet18 | 41 | fp32 | 9.37 |
+| A2000| resnet18 | 41 | fp16 | 8.67 |
 | A2000| resnet34 | 73 | fp32 | 17.10 |
+| A2000| resnet34 | 73 | fp16 | 14.25 |
 | A2000| resnet50 | 90 | fp32 | 20.67 |
+| A2000| resnet50 | 90 | fp16 | 17.49 |
 
 
 
