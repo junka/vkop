@@ -12,7 +12,6 @@ namespace ops {
 namespace globalaveragepool {
 using ivec4 = int[4];
 struct alignas(16) GpuGAPParam {
-    ivec4 inImageSize;
     ivec4 inShape; // NCHW
 };
 } // namespace globalaveragepool
@@ -56,11 +55,6 @@ class GlobalAveragePool : public Operator {
         });
 
         globalaveragepool::GpuGAPParam para;
-        auto inGPUshape = inputs[0]->getGPUShape();
-        para.inImageSize[0] = inGPUshape[0];
-        para.inImageSize[1] = inGPUshape[1];
-        para.inImageSize[2] = inGPUshape[2];
-        para.inImageSize[3] = 1;
         para.inShape[0] = inputs[0]->get_batch();
         para.inShape[1] = inputs[0]->get_channel();
         para.inShape[2] = inputs[0]->get_height();

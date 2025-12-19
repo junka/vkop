@@ -1,14 +1,11 @@
-#include <cstdint>
 #include <string>
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
-#include "ops/Matmul.hpp"
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
@@ -25,11 +22,11 @@ void reference_matmul(const std::shared_ptr<Tensor<float>> &inputa, const std::s
             for (int i = 0; i < M; i++) {
                 for (int j = 0; j < N; j++) {
                     float sum = 0.0F;
-                    size_t idxc = b * chan * M * N + c * M * N + i * N + j;
+                    size_t idxc = (b * chan * M * N) + (c * M * N) + (i * N) + j;
                     for (int k = 0; k < K; k++) {
                         // M * k, K * N
-                        size_t idxa = b * chan * M * K + c * M * K + i * K + k;
-                        size_t idxb = b * chan * K * N + c * K * N + k * N + j;
+                        size_t idxa = (b * chan * M * K) + (c * M * K) + (i * K) + k;
+                        size_t idxb = (b * chan * K * N) + (c * K * N) + (k * N) + j;
                         sum += (*inputa)[idxa] * (*inputb)[idxb];
                     }
                     (*output)[idxc] = sum;
@@ -87,7 +84,7 @@ private:
             for (int j = 0; j < shapea[1]; j++) {
                 printf("[");
                 for (int k = 0; k < shapea[2]; k++) {
-                    printf("%.2f, ", (*inputa)[i * shapea[1] *shapea[2] + j * shapea[2] + k]);
+                    printf("%.2f, ", (*inputa)[(i * shapea[1] *shapea[2]) + (j * shapea[2]) + k]);
                 }
                 printf("],\n");
             }
@@ -102,7 +99,7 @@ private:
             for (int j = 0; j < shapeb[1]; j++) {
                 printf("[");
                 for (int k = 0; k < shapeb[2]; k++) {
-                    printf("%.2f, ", (*inputb)[i * shapeb[1] *shapeb[2] + j * shapeb[2] + k]);
+                    printf("%.2f, ", (*inputb)[(i * shapeb[1] *shapeb[2]) + (j * shapeb[2]) + k]);
                 }
                 printf("],\n");
             }
@@ -118,7 +115,7 @@ private:
             for (int j = 0; j < shapec[1]; j++) {
                 printf("[");
                 for (int k = 0; k < shapec[2]; k++) {
-                    printf("%.2f ", (*output)[i * shapec[1] *shapec[2] + j * shapec[2] + k]);
+                    printf("%.2f ", (*output)[(i * shapec[1] *shapec[2]) + (j * shapec[2]) + k]);
                 }
                 printf("]\n");
             }

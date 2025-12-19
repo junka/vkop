@@ -46,7 +46,6 @@ layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // [W_in, H_in, C_in, N]
     ivec4 outputSize;    // [W_out, H_out, C_out, N]
     ivec4 kernelSize;    // [K_W, K_H, unused, unused]
-    ivec4 imageSize;     // [realW=W_out, realH=N*H_out, C4_out, 1]
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
@@ -93,9 +92,10 @@ vec4 add_bias(vec4 value, int c4, bvec4 valid_oc) {
 
 void conv1x1() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
-    int W_out = uConstant.outputSize.x;
-    int realH = uConstant.imageSize.y;
-    int C4_out = uConstant.imageSize.z;
+    ivec3 imgsz = imageSize(uOutput);
+    int W_out = imgsz.x;
+    int realH = imgsz.y;
+    int C4_out = imgsz.z;
 
     if (gid.x >= W_out || gid.y >= realH || gid.z >= C4_out) return;
 
@@ -121,7 +121,7 @@ void conv1x1() {
 
     // Early out if input pos is invalid (should not happen for valid 1x1)
     if (ix < 0 || ix >= W_in || iy < 0 || iy >= H_in) {
-        imageStore(uOutput, ivec3(w, n * H_out + h, c4), FLOAT4(0.0));
+        imageStore(uOutput, gid, FLOAT4(0.0));
         return;
     }
 
@@ -317,7 +317,6 @@ void conv1x1() {
         acc = add_bias(acc, c4, valid_oc);
     }
     if (uConstant.fuse_bn != 0) {
-        // Load per-channel parameters
         acc = batch_norm(acc, c4, valid_oc);
     }
 
@@ -329,9 +328,10 @@ void conv1x1() {
 
 void grouped_conv2d() {
     ivec3 gid = ivec3(gl_GlobalInvocationID);
-    int W_out = uConstant.outputSize.x;
-    int realH = uConstant.imageSize.y;
-    int C4_out = uConstant.imageSize.z;
+    ivec3 imgsz = imageSize(uOutput);
+    int W_out = imgsz.x;
+    int realH = imgsz.y;
+    int C4_out = imgsz.z;
 
     if (gid.x >= W_out || gid.y >= realH || gid.z >= C4_out) return;
 
@@ -581,16 +581,13 @@ void grouped_conv2d() {
         }
     }
 
-    // Add bias
     if (uConstant.bias != 0) {
         acc = add_bias(acc, c4, valid_oc);
     }
 
     if (uConstant.fuse_bn != 0) {
-        // Load per-channel parameters
         acc = batch_norm(acc, c4, valid_oc);
     }
-
 
     acc = activation(acc, uConstant.activation);
 

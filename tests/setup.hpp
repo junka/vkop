@@ -42,136 +42,131 @@ public:
         const std::vector<std::shared_ptr<core::ITensor>> &expect_outputs,
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
     {
-        try {
-            auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-            for (auto *pdev : phydevs) {
-                auto dev = std::make_shared<VulkanDevice>(pdev);
-                if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
-                    continue;
-                }
-                LOG_INFO("%s",dev->getDeviceName().c_str());
-                auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-                auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
+        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+        auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+        if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
+            return false;
+        }
+        LOG_INFO("%s",dev->getDeviceName().c_str());
+        auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
+        auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
 
-                auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
-                if (!op) {
-                    LOG_ERROR("Fail to create operator");
-                    return false;
-                }
-                op->set_runtime_device(dev, cmdpool);
+        auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
+        if (!op) {
+            LOG_ERROR("Fail to create operator");
+            return false;
+        }
+        op->set_runtime_device(dev, cmdpool);
 
-                if (attribute_func) {
-                    attribute_func(op);
-                }
-                std::vector<std::shared_ptr<core::ITensor>> outputs;
-                for (const auto & expect_output : expect_outputs) {
-                    if (expect_output->dtype() == typeid(float)) {
-                        auto output = std::make_shared<Tensor<float>>(true);
-                        outputs.push_back(output);
-                    } else if (expect_output->dtype() == typeid(uint16_t)) {
-                        auto output = std::make_shared<Tensor<uint16_t>>(true);
-                        outputs.push_back(output);
-                    } else {
-                        LOG_ERROR("Unsupported output tensor type");
-                        return false;
-                    }
-                }
-                for (const auto &input : inputs) {
-                    if (!input || input->dtype() == typeid(int64_t)) {
-                        continue;
-                    }
-                    auto t = core::as_tensor<T>(input);
-                    if (input->num_dims() == 2 || input->num_dims() == 1) {
-                        t->as_storage_buffer(dev);
-                    } else {
-                        t->as_input_image(dev, nullptr);
-                    }
-                    t->copyToGPU(cmdpool);
-                }
-                cmd->wait(dev->getComputeQueue());
-                cmd->begin();
-                op->onExecute(inputs, outputs, cmd, 0);
-                cmd->end();
-                cmd->submit(dev->getComputeQueue());
+        if (attribute_func) {
+            attribute_func(op);
+        }
+        std::vector<std::shared_ptr<core::ITensor>> outputs;
+        for (const auto & expect_output : expect_outputs) {
+            if (expect_output->dtype() == typeid(float)) {
+                auto output = std::make_shared<Tensor<float>>(true);
+                outputs.push_back(output);
+            } else if (expect_output->dtype() == typeid(uint16_t)) {
+                auto output = std::make_shared<Tensor<uint16_t>>(true);
+                outputs.push_back(output);
+            } else {
+                LOG_ERROR("Unsupported output tensor type");
+                return false;
+            }
+        }
+        for (const auto &input : inputs) {
+            if (!input || input->dtype() == typeid(int64_t)) {
+                continue;
+            }
+            auto t = core::as_tensor<T>(input);
+            if (input->num_dims() == 2 || input->num_dims() == 1) {
+                t->as_storage_buffer(dev);
+            } else {
+                t->as_input_image(dev, nullptr);
+            }
+            t->copyToGPU(cmdpool);
+        }
+        cmd->wait(dev->getComputeQueue());
+        cmd->begin();
+        op->onExecute(inputs, outputs, cmd, 0);
+        cmd->end();
+        cmd->submit(dev->getComputeQueue());
 
-                auto check_ret = [&] (int idx, auto type_tag) -> bool {
-                    using TT = decltype(type_tag);
-                    auto output = core::as_tensor<TT>(outputs[idx]);
-                    output->copyToCPU(cmdpool);
-                    auto oshape = output->getShape();
-                    printf("output shape: %ld\n", oshape.size());
-                    if (oshape.size() == 4) {
-                        for (int i = 0; i < oshape[0]; i++) {
-                            printf("[\n");
-                            for (int j = 0; j < oshape[1]; j++) {
-                                printf("[\n");
-                                for (int k = 0; k < oshape[2]; k++) {
-                                    printf("[");
-                                    for (int l = 0; l < oshape[3]; l++) {
-                                        int idx = (i * oshape[1] * oshape[2] * oshape[3]) + (j * oshape[2] * oshape[3]) +
-                                            (k * oshape[3]) + l;
-                                        if (sizeof(TT) == 2) {
-                                            std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
-                                        } else {
-                                            std::cout <<  (*output)[idx] << ",";
-                                        }
-                                    }
-                                    printf("]\n");
-                                }
-                                printf("]\n");
-                            }
-                            printf("]\n");
-                        }
-                    } else if (oshape.size() == 2) {
-                        for (int i = 0; i < oshape[0]; i++) {
+        auto check_ret = [&] (int idx, auto type_tag) -> bool {
+            using TT = decltype(type_tag);
+            auto output = core::as_tensor<TT>(outputs[idx]);
+            output->copyToCPU(cmdpool);
+            auto oshape = output->getShape();
+            printf("output shape: %ld\n", oshape.size());
+            if (oshape.size() == 4) {
+                for (int i = 0; i < oshape[0]; i++) {
+                    printf("[\n");
+                    for (int j = 0; j < oshape[1]; j++) {
+                        printf("[\n");
+                        for (int k = 0; k < oshape[2]; k++) {
                             printf("[");
-                            for (int j = 0; j < oshape[1]; j++) {
-                                int idx = (i * oshape[1]) + j;
+                            for (int l = 0; l < oshape[3]; l++) {
+                                int idx = (i * oshape[1] * oshape[2] * oshape[3]) + (j * oshape[2] * oshape[3]) +
+                                    (k * oshape[3]) + l;
                                 if (sizeof(TT) == 2) {
-                                    std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
+                                    std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
                                 } else {
-                                    std::cout << (*output)[idx] << ", ";
+                                    std::cout <<  (*output)[idx] << ",";
                                 }
                             }
                             printf("]\n");
                         }
                         printf("]\n");
                     }
-                    auto expect = core::as_tensor<TT>(expect_outputs[idx]);
-                    for (int i = 0; i < output->num_elements(); i++) {
+                    printf("]\n");
+                }
+            } else if (oshape.size() == 2) {
+                for (int i = 0; i < oshape[0]; i++) {
+                    printf("[");
+                    for (int j = 0; j < oshape[1]; j++) {
+                        int idx = (i * oshape[1]) + j;
                         if (sizeof(TT) == 2) {
-                            std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
-                            if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
-                                LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
-                                return false;
-                            }
+                            std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
                         } else {
-                            std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                            if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
-                                LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
-                                return false;
-                            }
+                            std::cout << (*output)[idx] << ", ";
                         }
                     }
-                    return true;
-                };
-
-                for (size_t idx = 0; idx < outputs.size(); idx++) {
-                    if (outputs[idx]->dtype() == typeid(float)) {
-                        if (!check_ret(idx, float{})) {
-                            return false;
-                        }
-                    } else {
-                        if (!check_ret(idx, uint16_t{}))
-                            return false;
+                    printf("]\n");
+                }
+                printf("]\n");
+            }
+            auto expect = core::as_tensor<TT>(expect_outputs[idx]);
+            for (int i = 0; i < output->num_elements(); i++) {
+                if (sizeof(TT) == 2) {
+                    std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
+                    if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
+                        LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
+                        return false;
+                    }
+                } else {
+                    std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                    if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
+                        LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
+                        return false;
                     }
                 }
-                LOG_INFO("Test Passed for operator: %s", name_.c_str());
             }
-        } catch (const std::exception &e) {
-            LOG_ERROR("%s\n", e.what());
-            return false;
+            return true;
+        };
+
+        for (size_t idx = 0; idx < outputs.size(); idx++) {
+            if (outputs[idx]->dtype() == typeid(float)) {
+                if (!check_ret(idx, float{})) {
+                    return false;
+                }
+            } else {
+                if (!check_ret(idx, uint16_t{}))
+                    return false;
+            }
         }
+        LOG_INFO("Test Passed for operator: %s", name_.c_str());
+
+
         return true;
     }
 

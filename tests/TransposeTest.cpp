@@ -39,8 +39,8 @@ namespace {
                         int new_c = perm[1] == 0 ? n : (perm[1] == 1 ? c : (perm[1] == 2 ? h : w));
                         int new_h = perm[2] == 0 ? n : (perm[2] == 1 ? c : (perm[2] == 2 ? h : w));
                         int new_w = perm[3] == 0 ? n : (perm[3] == 1 ? c : (perm[3] == 2 ? h : w));
-                        (*output)[new_n * out_C * out_H * out_W + new_c * out_H * out_W + new_h * out_W + new_w] =
-                            input->at(n * in_C * in_H * in_W + c * in_H * in_W + h * in_W + w);
+                        (*output)[(new_n * out_C * out_H * out_W) + (new_c * out_H * out_W) + (new_h * out_W) + new_w] =
+                            input->at((n * in_C * in_H * in_W) + (c * in_H * in_W) + (h * in_W) + w);
                     }
                 }
             }
@@ -89,8 +89,8 @@ private:
                 for (int k = 0; k < input_shape_[2]; k++) {
                     printf("[");
                     for (int l = 0; l < input_shape_[3]; l++) {
-                        int idx = i * input_shape_[1] * input_shape_[2] * input_shape_[3] + j * input_shape_[2] * input_shape_[3] +
-                            k * input_shape_[3] + l;
+                        int idx = (i * input_shape_[1] * input_shape_[2] * input_shape_[3]) + (j * input_shape_[2] * input_shape_[3]) +
+                            (k * input_shape_[3]) + l;
                         printf("%.4f, ", (*input)[idx]);
                     }
                     printf("]\n");
@@ -110,8 +110,8 @@ private:
                 for (int h = 0; h < out_shape[2]; h++) {
                     printf("[");
                     for (int w = 0; w < out_shape[3]; w++) {
-                        int idx = n * out_shape[1] * out_shape[2] * out_shape[3] +
-                                  c * out_shape[2] * out_shape[3] + h * out_shape[3] + w;
+                        int idx = (n * out_shape[1] * out_shape[2] * out_shape[3]) +
+                                  (c * out_shape[2] * out_shape[3]) + (h * out_shape[3]) + w;
                         printf("%f ", (*output)[idx]);
                     }
                     printf("]\n");

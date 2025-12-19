@@ -2,7 +2,6 @@
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -12,14 +11,14 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Reduce;
-// #define USE_CPP_REF
+#define USE_CPP_REF
 namespace {
 #ifdef USE_CPP_REF
 void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
     std::shared_ptr<Tensor<float>> &output,
     const std::vector<int>& axes_input,
     bool keepdims = false,
-    ReduceType reduce_type = ReduceType::SUM
+    vkop::ops::reduce::ReduceType reduce_type = vkop::ops::reduce::ReduceType::SUM
 ) {
 
     const int ndim = static_cast<int>(input->num_dims());
@@ -216,7 +215,7 @@ private:
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
         }
-        // reference_reduce(input, output, 0, 0);
+        reference_reduce(input, output, 0, 0);
         for (int i = 0; i < input->num_elements(); i++) {
             printf("%.4f " , (*output)[i]);
         }

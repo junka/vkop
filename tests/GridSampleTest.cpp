@@ -1,5 +1,3 @@
-
-#include <cstdint>
 #include <memory>
 #include <random>
 #include <chrono>
@@ -34,7 +32,7 @@ T sample(int y, int x, const std::shared_ptr<Tensor<T>> &input, int offset, int 
         return 0.0F;
     }
 
-    return (*input)[offset + y * width + x];
+    return (*input)[offset + (y * width) + x];
 }
 
 // 双线性插值算法,
@@ -70,8 +68,8 @@ T interpolate(T h, T w, const std::shared_ptr<Tensor<T>> &buffer, int offset, in
     T fy1 = 1.0F - fy2;
 
     // 插值. 水平方向
-    T i0 = ((i00) * fx1 + (i01) * fx2);
-    T i1 = ((i10) * fx1 + (i11) * fx2);
+    T i0 = (((i00) * fx1) + ((i01) * fx2));
+    T i1 = (((i10) * fx1) + ((i11) * fx2));
 
     // 插值, 竖直方向
     return ((i0 * fy1) + (i1 * fy2));
@@ -90,17 +88,17 @@ void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::s
         int b_output_offset = b * outHeight * outWidth * depth;
 
         for (auto c = 0; c < depth; ++c) {
-            auto c_input_offset = b_input_offset + c * inHeight * inWidth;
-            auto c_output_offset = b_output_offset + c * outHeight * outWidth;
+            auto c_input_offset = b_input_offset + (c * inHeight * inWidth);
+            auto c_output_offset = b_output_offset + (c * outHeight * outWidth);
 
             for (auto h = 0; h < outHeight; ++h) {
-                auto h_grid_offset = b_grid_offset + h * outWidth * 2;
-                auto h_output_offset = c_output_offset + h * outWidth;
+                auto h_grid_offset = b_grid_offset + (h * outWidth * 2);
+                auto h_output_offset = c_output_offset + (h * outWidth);
 
                 for (auto w = 0; w < outWidth; ++w) {
                     // 首先反归一化得到坐标
-                    auto x = getPosition((*grid)[h_grid_offset + 2 * w + 0], inWidth, alignCorners);
-                    auto y = getPosition((*grid)[h_grid_offset + 2 * w + 1], inHeight, alignCorners);
+                    auto x = getPosition((*grid)[h_grid_offset + (2 * w) + 0], inWidth, alignCorners);
+                    auto y = getPosition((*grid)[h_grid_offset + (2 * w) + 1], inHeight, alignCorners);
                     // 然后插值,得到的值输出
                     (*output)[h_output_offset+w] = interpolate(y, x, input, c_input_offset, inHeight, inWidth);
                 }
@@ -152,8 +150,8 @@ private:
                 for (int w = 0; w < out_width; w++) {
                     float offset_h = grid_dist(gen);
                     float offset_w = grid_dist(gen);
-                    (*grid)[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
-                    (*grid)[b * out_height * out_width * 2 + h * out_width * 2 + w * 2 + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
+                    (*grid)[(b * out_height * out_width * 2) + (h * out_width * 2) + (w * 2) + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
+                    (*grid)[(b * out_height * out_width * 2) + (h * out_width * 2) + (w * 2) + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
                 }
             }
         }

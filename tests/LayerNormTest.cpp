@@ -1,7 +1,5 @@
-#include <cstdint>
 #include <memory>
 #include <vector>
-#include <random>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -60,7 +58,7 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
     for (int outer_idx = 0; outer_idx < outer_size; ++outer_idx) {
         // 指向当前归一化块起始位置
         const int in_block_offset = outer_idx * inner_size;
-        float*       out_block = output.data() + outer_idx * inner_size;
+        float*       out_block = output.data() + (outer_idx * inner_size);
 
         // Step 2.1: 计算均值
         float sum = 0.0F;
@@ -119,10 +117,10 @@ private:
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("layer_norm", shapes, param);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
         std::vector<int> output_shape = std::get<1>(k);
-        auto torch_output = torch_tensors[0];
-        auto torch_input = torch_tensors[1];
-        auto torch_weight = torch_tensors[2];
-        auto torch_bias = torch_tensors[3];
+        const auto& torch_output = torch_tensors[0];
+        const auto& torch_input = torch_tensors[1];
+        const auto& torch_weight = torch_tensors[2];
+        const auto& torch_bias = torch_tensors[3];
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 #if 1
@@ -146,9 +144,9 @@ private:
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
+                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                (j * output_shape[2] * output_shape[3]) +
+                                (k * output_shape[3]) +
                                 l;
                         printf("%.4f, ", torch_input[idx]);
                     }
@@ -165,9 +163,9 @@ private:
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
+                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                (j * output_shape[2] * output_shape[3]) +
+                                (k * output_shape[3]) +
                                 l;
                         printf("%.4f, ", torch_output[idx]);
                     }
@@ -207,9 +205,9 @@ int main() {
             for (int k = 0; k < lntest.input_shape_[2]; k++) {
                 printf("[");
                 for (int l = 0; l < lntest.input_shape_[3]; l++) {
-                    int idx = i * lntest.input_shape_[1] * lntest.input_shape_[2] * lntest.input_shape_[3] +
-                              j * lntest.input_shape_[2] * lntest.input_shape_[3] +
-                              k * lntest.input_shape_[3] + l;
+                    int idx = (i * lntest.input_shape_[1] * lntest.input_shape_[2] * lntest.input_shape_[3]) +
+                              (j * lntest.input_shape_[2] * lntest.input_shape_[3]) +
+                              (k * lntest.input_shape_[3]) + l;
                     printf("%.4f, ", bout[idx]);
                     if (fabs(bout[idx] - (*lntest.output)[idx]) > 1e-3) {
                         printf("  <--mismatch ");

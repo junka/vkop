@@ -3,7 +3,6 @@
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"

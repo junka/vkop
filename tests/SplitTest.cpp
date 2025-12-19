@@ -49,14 +49,14 @@ void split_cpu(const std::shared_ptr<Tensor<float>>& input,
 
     for (size_t i = 0; i < num_outputs; ++i) {
         int64_t slice_size = split_shape[i]; // 当前输出在 axis 上的长度
-        auto output = outputs[i];
+        const auto& output = outputs[i];
 
         // 对每个 outer 块进行拷贝
         for (int64_t outer = 0; outer < outer_size; ++outer) {
              for (int64_t j = 0; j < slice_size; ++j) {
                 for (int64_t inner = 0; inner < inner_size; ++inner) {
-                    int64_t out_index = outer * (slice_size * inner_size) + j * inner_size + inner;
-                    int64_t in_index  = outer * (input_axis_size * inner_size) + (offset + j) * inner_size + inner;
+                    int64_t out_index = (outer * (slice_size * inner_size)) + (j * inner_size) + inner;
+                    int64_t in_index  = (outer * (input_axis_size * inner_size)) + ((offset + j) * inner_size) + inner;
                     (*output)[out_index] = (*input)[in_index];
                 }
             }
@@ -117,7 +117,7 @@ private:
             for (int j = 0; j < inshape[1]; j++) {
                 printf("[");
                 for (int k = 0; k < inshape[2]; k++) {
-                    int idx = i * inshape[1] * inshape[2] + j * inshape[2] + k;
+                    int idx = (i * inshape[1] * inshape[2]) + (j * inshape[2]) + k;
                     printf("%f, ", (*input)[idx]);
                 }
                 printf("]\n");
@@ -132,7 +132,7 @@ private:
                 for (int j = 0; j < shape[1]; j++) {
                     printf("[");
                     for (int k = 0; k < shape[2]; k++) {
-                        int idx = i * shape[1] * shape[2] + j * shape[2] + k;
+                        int idx = (i * shape[1] * shape[2]) + (j * shape[2]) + k;
                         printf("%f, ", (*output)[idx]);
                     }
                     printf("]\n");
@@ -156,6 +156,7 @@ int main()
         split_test.split_,
     };
     std::vector<std::shared_ptr<vkop::core::ITensor>> outputs;
+    outputs.reserve(split_test.outputs.size());
     for (auto &output : split_test.outputs) {
         outputs.push_back(output);
     };

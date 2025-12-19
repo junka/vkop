@@ -81,7 +81,7 @@ void Runtime::LoadModel() {
             }
         }
 
-        if (tensor->num_dims() == 2 || tensor->num_dims() == 1) {
+        if (tensor->num_dims() <= 2) {
             tensor->as_storage_buffer(dev);
             tensor->copyToGPU(m_cmdpool_, src_ptr);
         } else {

@@ -358,54 +358,8 @@ template <typename T> class Tensor : public ITensor {
 
         return img;
     }
-    // copy RGBA directly
-    void fillToGPUImage(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                        T *src = nullptr) {
-        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        if (num_dims() < 3) {
-            return;
-        }
-        auto dev = cmdpool->getVulkanDevice();
-        VulkanCommandBuffer cmd(cmdpool, false);
-
-#ifdef VK_EXT_host_image_copy
-        if (dev->is_support_host_image_copy()) {
-            std::vector<T> ptr(img->getImageSize() / sizeof(T));
-            memcpy(ptr.data(), src, img->getImageSize());
-            img->hostImageCopyToDevice(ptr.data());
-            cmd.begin();
-            img->readBarrier(cmd.get());
-            cmd.end();
-            cmd.submit(dev->getComputeQueue());
-        } else
-#endif
-        {
-            auto imagesize = img->getImageSize();
-            auto stpool = cmdpool->getStagingBufferPool();
-            uint64_t completed =
-                cmdpool->getCompletedTimelineValue(dev->getComputeQueue());
-            stpool->reclaimCompleted(completed);
-            auto *buff = stpool->getBuffer();
-            auto b = stpool->allocate(imagesize);
-            if (!b) {
-                printf("copyToGPUImage stpool alloc failed %d\n", imagesize);
-                return;
-            }
-            // convertTensorToRGBA(static_cast<T *>(b->ptr), src);
-            memcpy(static_cast<T *>(b->ptr), src, imagesize);
-            cmd.begin();
-            img->copyBufferToImage(cmd.get(), buff, b->offset);
-            img->readBarrier(cmd.get());
-            cmd.end();
-            auto submit_value = cmd.submit(dev->getComputeQueue());
-            cmd.wait(dev->getComputeQueue());
-            stpool->markSubmit(submit_value);
-        }
-        toGPU();
-    }
-
     void copyToGPUImage(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                        T *src = nullptr) {
+                        T *src = nullptr, bool rgba = false) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (num_dims() < 3) {
             return;
@@ -416,7 +370,11 @@ template <typename T> class Tensor : public ITensor {
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
             std::vector<T> ptr(img->getImageSize() / sizeof(T));
-            convertTensorToRGBA(ptr.data(), src);
+            if (!rgba) {
+                convertTensorToRGBA(ptr.data(), src);
+            } else {
+                memcpy(ptr.data(), src, img->getImageSize());
+            }
             img->hostImageCopyToDevice(ptr.data());
             cmd.begin();
             img->readBarrier(cmd.get());
@@ -436,7 +394,11 @@ template <typename T> class Tensor : public ITensor {
                 printf("copyToGPUImage stpool alloc failed %d\n", imagesize);
                 return;
             }
-            convertTensorToRGBA(static_cast<T *>(b->ptr), src);
+            if (!rgba) {
+                convertTensorToRGBA(static_cast<T *>(b->ptr), src);
+            } else {
+                memcpy(static_cast<T *>(b->ptr), src, imagesize);
+            }
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
             img->readBarrier(cmd.get());

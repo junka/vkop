@@ -1,9 +1,7 @@
-#include <cstdint>
 #include <memory>
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -16,7 +14,7 @@ namespace {
 
 float reference_prelu(float val, float alpha)
 {
-    return std::fmax(val, 0.0F) + std::fmin(val, 0.0F) * alpha;
+    return std::fmax(val, 0.0F) + (std::fmin(val, 0.0F) * alpha);
 }
 
 class PReluTest : public TestCase {

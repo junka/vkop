@@ -2,13 +2,9 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
-#include "model/load.hpp"
-#include "ops/OperatorFactory.hpp"
-#include "ops/Ops.hpp"
 #include "core/runtime.hpp"
 
 #include <cstdio>
-#include <unordered_set>
 #include <random>
 #include <vector>
 #include <cmath>

@@ -1,10 +1,8 @@
-#include <cstdint>
 #include <string>
 #include <unordered_map>
 #include <vector>
 #include <random>
 #include <cmath>
-#include <stack>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"

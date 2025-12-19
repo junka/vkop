@@ -129,7 +129,7 @@ int main(int argc, char *argv[]) {
     free(resized);
 
     // 1, 3, h, w, RGBA copy directly
-    t->fillToGPUImage(cmdpool, normalized_data.data());
+    t->copyToGPUImage(cmdpool, normalized_data.data(), true);
     // t->copyToGPU(cmdpool, normalized_data.data());
     normalized_data.clear();
     normalized_data.shrink_to_fit();
@@ -141,10 +141,13 @@ int main(int argc, char *argv[]) {
         tot_lat += lat;
         std::cout << "inference time:" << lat << " ms" << std::endl;
     }
-    std::cout << "avg time:" << tot_lat/count << " ms" << std::endl;
+    std::cout << "avg time:" << tot_lat / count << " ms" << std::endl;
     rt->ReadResult();
     auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
-
+    printf("size %d \n", cls->num_elements());
+    for (int i = 0; i < cls->num_elements(); i++) {
+        printf("%.4f ", cls->data()[i]);
+    }
     auto res = get_top_k_predictions(cls->data(), 5);
     std::cout << "\nTop-5 Predictions:\n";
     std::cout << std::fixed << std::setprecision(4);

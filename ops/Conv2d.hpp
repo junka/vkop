@@ -12,7 +12,6 @@ extern unsigned char conv2d_spv[];
 extern unsigned int conv2d_spv_len;
 namespace vkop {
 namespace ops {
-
 namespace conv2d {
 
 enum class PaddingMode { ZEROS, REFLECT, REPLICATE, CIRCULAR };
@@ -34,7 +33,6 @@ struct alignas(16) GPUConv2dParam {
     ivec4 inputSize;
     ivec4 outputSize;
     ivec4 kernel_shape;
-    ivec4 imageSize;
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
@@ -216,7 +214,8 @@ class Conv2d : public Operator {
                 fp16 = true;
             }
         });
-        if (inputs.size() > 2) {
+        if (inputs.size() > 2 && !fuse_bn_) {
+            // it is bias, will not exist when batch norm follows conv
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto bias = core::as_tensor<T>(inputs[2]);
@@ -226,10 +225,10 @@ class Conv2d : public Operator {
         } else {
             objs_.emplace_back(dummyBuffer_);
         }
-        if (inputs.size() > 3) {
-            dispatch_by_dtype(inputs[3]->dtype(), [&](auto type_tag) {
+        if (inputs.size() > 2 && fuse_bn_) {
+            dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
-                auto para = core::as_tensor<T>(inputs[3]);
+                auto para = core::as_tensor<T>(inputs[2]);
                 auto para_buffer = para->as_storage_buffer(m_dev_);
                 objs_.emplace_back(para_buffer);
             });
@@ -251,10 +250,6 @@ class Conv2d : public Operator {
         para.kernel_shape[1] = weight_shape[2];
         para.kernel_shape[2] = weight_shape[1];
         para.kernel_shape[3] = weight_shape[0];
-        para.imageSize[0] = out_gpu_shape[0];
-        para.imageSize[1] = out_gpu_shape[1];
-        para.imageSize[2] = out_gpu_shape[2];
-        para.imageSize[3] = 1;
         para.stride[0] = strides_[0];
         para.stride[1] = strides_[1];
         para.padding[0] = pads_[0];

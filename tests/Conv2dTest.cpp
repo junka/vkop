@@ -1,11 +1,9 @@
 
 #include <cstdint>
 #include <memory>
-#include <random>
 #include <string>
 #include <vector>
 #include <cassert>
-#include <chrono>
 
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
@@ -133,7 +131,7 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 5, 2, 2}; // b, ic, ih, iw
+    std::vector<int> input_shape_ = {1, 5, 24, 24}; // b, ic, ih, iw
     int kernel_size_ = 2;
     int stride_ = 1;
     int pad_ = 0;
@@ -183,10 +181,9 @@ private:
                 for (int k = 0; k < input_shape_[2]; k++) {
                     printf("[");
                     for (int l = 0; l < input_shape_[3]; l++) {
-                        int idx = i * input_shape_[1] * input_shape_[2] * input_shape_[3] +
-                                j * input_shape_[2] * input_shape_[3] +
-                                k * input_shape_[3] +
-                                l;
+                        int idx = (i * input_shape_[1] * input_shape_[2] * input_shape_[3]) +
+                                (j * input_shape_[2] * input_shape_[3]) +
+                                (k * input_shape_[3]) + l;
                         printf("%.4f, ", torch_input[idx]);
                     }
                     printf("],\n");
@@ -204,9 +201,9 @@ private:
                 for (int k = 0; k < output_shape[2]; k++) {
                     printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] + l;
+                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                (j * output_shape[2] * output_shape[3]) +
+                                (k * output_shape[3]) + l;
                         printf("%.4f, ", torch_output[idx]);
                     }
                     printf("]\n");
@@ -224,9 +221,9 @@ private:
                 for (int k = 0; k < kernel_size_; k++) {
                     printf("[");
                     for (int l = 0; l < kernel_size_; l++) {
-                        int idx = i * input_shape_[1] / group_ * kernel_size_ * kernel_size_ +
-                                j * kernel_size_ * kernel_size_ +
-                                k * kernel_size_ + l;
+                        int idx = (i * input_shape_[1] / group_ * kernel_size_ * kernel_size_) +
+                                (j * kernel_size_ * kernel_size_) +
+                                (k * kernel_size_) + l;
                         printf("%.4f, ", torch_weight[idx]);
                     }
                     printf("]\n");
@@ -237,7 +234,7 @@ private:
         }
         
         if (torch_tensors.size() > 3) {
-            auto torch_bias = torch_tensors[3];
+            const auto& torch_bias = torch_tensors[3];
             printf("\n============bias ===========\n");
             for (int i = 0; i < feature_size_; i ++) {
                 printf("%.4f, ", torch_bias[i]);
