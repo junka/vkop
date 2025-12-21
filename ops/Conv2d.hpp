@@ -70,7 +70,7 @@ class Conv2d : public Operator {
         if (attributes.find("dilations") != attributes.end()) {
             std::string dila_str = attributes.at("dilations");
             if (dila_str.find(',') != std::string::npos) {
-                dilations_ = parse_attr_list(dila_str);
+                dilations_ = parse_attr_list<int>(dila_str);
             } else {
                 int d = std::stol(dila_str);
                 dilations_ = {d, d};
@@ -84,7 +84,7 @@ class Conv2d : public Operator {
         if (attributes.find("kernel_shape_") != attributes.end()) {
             std::string kernel_str = attributes.at("kernel_shape_");
             if (kernel_str.find(',') != std::string::npos) {
-                kernel_shape_ = parse_attr_list(kernel_str);
+                kernel_shape_ = parse_attr_list<int>(kernel_str);
             } else {
                 int k = std::stol(kernel_str);
                 kernel_shape_ = {k, k};
@@ -94,7 +94,7 @@ class Conv2d : public Operator {
         if (attributes.find("pads") != attributes.end()) {
             std::string pad_str = attributes.at("pads");
             if (pad_str.find(',') != std::string::npos) {
-                pads_ = parse_attr_list(pad_str);
+                pads_ = parse_attr_list<int>(pad_str);
             } else {
                 int p = std::stol(pad_str);
                 pads_ = {p, p};
@@ -104,7 +104,7 @@ class Conv2d : public Operator {
         if (attributes.find("strides") != attributes.end()) {
             std::string stride_str = attributes.at("strides");
             if (stride_str.find(',') != std::string::npos) {
-                strides_ = parse_attr_list(stride_str);
+                strides_ = parse_attr_list<int>(stride_str);
             } else {
                 int s = std::stol(stride_str);
                 strides_ = {s, s};

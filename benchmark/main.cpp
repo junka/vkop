@@ -1,15 +1,12 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+
 #include "include/logger.hpp"
-#define STB_IMAGE_IMPLEMENTATION
-#include "include/stb_image.h"
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "include/stb_image_resize2.h"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "core/function.hpp"
 
 #include <algorithm>
-#include <cstdint>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -21,8 +18,6 @@ using vkop::VulkanDevice;
 using vkop::core::Runtime;
 
 namespace {
-const float mean[] = {0.485f, 0.456f, 0.406f};
-const float stdvar[] = {0.229f, 0.224f, 0.225f};
 std::vector<std::string> load_labels(const std::string& label_path) {
     std::vector<std::string> labels;
     std::ifstream file(label_path);
@@ -50,7 +45,7 @@ std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float
     std::vector<float> softmax_probs = probs;
 
     float max_val = *std::max_element(softmax_probs.begin(), softmax_probs.end());
-    float sum = 0.0f;
+    float sum = 0.0F;
     for (auto& val : softmax_probs) {
         val = std::exp(val - max_val);
         sum += val;
@@ -109,31 +104,7 @@ int main(int argc, char *argv[]) {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 
-    int image_h;
-    int image_w;
-    int channels;
-    auto *raw = stbi_load(image_file_path.c_str(), &image_w, &image_h, &channels, 3);
-
-    auto input = rt->GetInput(); // data
-    auto t = vkop::core::as_tensor<float>(input);
-    int resize_h = t->getShape()[2];
-    int resize_w = t->getShape()[3];
-    auto *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
-    stbir_resize_uint8_linear(raw, image_w, image_h, 0, resized, resize_w, resize_h, 0, STBIR_RGB);
-
-    stbi_image_free(raw);
-    std::vector<float> normalized_data(resize_h * resize_w * 4);
-    for (int c = 0; c < 3; c++) {
-        for (int i = 0; i < resize_h * resize_w; i++) {
-            normalized_data[(i * 4)  + c] = ((static_cast<float>(resized[i * 3 + c])/255.0F) - mean[c]) / stdvar[c];
-        }
-    }
-    free(resized);
-
-    // 1, 3, h, w, RGBA copy directly
-    t->copyToGPUImage(cmdpool, normalized_data.data(), true);
-    normalized_data.clear();
-    normalized_data.shrink_to_fit();
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
 
     double tot_lat = 0.0F;
     int count = 1000;

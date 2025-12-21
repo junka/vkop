@@ -3,11 +3,7 @@
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
-
-#define STB_IMAGE_IMPLEMENTATION
-#include "include/stb_image.h"
-#define STB_IMAGE_RESIZE_IMPLEMENTATION
-#include "include/stb_image_resize2.h"
+#include "core/function.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -20,7 +16,6 @@ using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
 using vkop::core::Runtime;
-
 
 
 int main(int argc, char *argv[]) {
@@ -49,35 +44,16 @@ int main(int argc, char *argv[]) {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 
-    int image_h;
-    int image_w;
-    int channels;
-    auto *raw = stbi_load(image_file_path.c_str(), &image_w, &image_h, &channels, 3);
-
     printf("model Loaded done\n");
-    auto input = rt->GetInput(); // 1, 3, 640, 640
-    auto t = vkop::core::as_tensor<float>(input);
 
-    int resize_h = t->getShape()[2];
-    int resize_w = t->getShape()[3];
-    auto *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
-    stbir_resize_uint8_linear(raw, image_w, image_h, 0, resized, resize_w, resize_h, 0, STBIR_RGB);
-    stbi_image_free(raw);
-    std::vector<float> normalized_data(resize_h * resize_w * 4);
-    for (int c = 0; c < 3; c++) {
-        for (int i = 0; i < resize_h * resize_w; i++) {
-            normalized_data[(i * 4)  + c] = ((static_cast<float>(resized[i * 3 + c])/255.0F));
-        }
-    }
-    t->copyToGPUImage(cmdpool, normalized_data.data(), true);
-    normalized_data.clear();
-    normalized_data.shrink_to_fit();
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
+
 
     for (int i = 0; i < 1000; i ++) {
         rt->Run();
     }
     rt->ReadResult();
-    auto out = vkop::core::as_tensor<float>(rt->GetOutput("output0"));
+    auto out = vkop::core::as_tensor<float>(rt->GetOutput());
 
 
     return EXIT_SUCCESS;

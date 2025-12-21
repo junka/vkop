@@ -39,7 +39,7 @@ layout(set=0, binding=3) readonly buffer biasBuffer {
     uvec4 attr[];
 } uBias;
 layout(set=0, binding=4) readonly buffer bnBuffer {
-    vec4 attr[];
+    mat4 attr[];
 } uBnPara;
 
 layout(push_constant) uniform constBuffer {
@@ -61,10 +61,10 @@ layout(push_constant) uniform constBuffer {
 
 vec4 batch_norm(vec4 value, int c4, bvec4 valid_oc)
 {
-    vec4 scale4 = uBnPara.attr[c4 * 4];
-    vec4 bias4 = uBnPara.attr[c4 * 4 + 1];
-    vec4 mean4 = uBnPara.attr[c4 * 4 + 2];
-    vec4 var4 = uBnPara.attr[c4 * 4 + 3];
+    vec4 scale4 = uBnPara.attr[c4][0];
+    vec4 bias4 = uBnPara.attr[c4][1];
+    vec4 mean4 = uBnPara.attr[c4][2];
+    vec4 var4 = uBnPara.attr[c4][3];
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));

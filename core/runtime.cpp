@@ -33,7 +33,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    // model.dump_model();
+    model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
@@ -142,7 +142,7 @@ void Runtime::LoadModel() {
             } else if (in_shape.dims.empty()) {
                 node_inputs.push_back(nullptr);
             } else {
-                printf("we should not reach here\n");
+                printf("we should not reach here %s\n", in_shape.name.c_str());
                 assert(false);
             }
         }

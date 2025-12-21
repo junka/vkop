@@ -53,8 +53,8 @@ private:
                 for (int h = 0; h < input_shape_[2]; h++) {
                     printf("[");
                     for (int w = 0; w < input_shape_[3]; w++) {
-                        int idx = n * input_shape_[1] * input_shape_[2] * input_shape_[3] + c * input_shape_[2] * input_shape_[3] +
-                                  h * input_shape_[3] + w;
+                        int idx = (n * input_shape_[1] * input_shape_[2] * input_shape_[3]) + (c * input_shape_[2] * input_shape_[3]) +
+                                  (h * input_shape_[3]) + w;
                         printf("%f ", (*input)[idx]);
                     }
                     printf("]\n");

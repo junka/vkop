@@ -45,7 +45,7 @@ class LayerNorm : public Operator {
         }
         if (attributes.find("normalized_shape") != attributes.end()) {
             std::string norm_shape_str = attributes.at("normalized_shape");
-            normalized_shape_ = parse_attr_list(norm_shape_str);
+            normalized_shape_ = parse_attr_list<int>(norm_shape_str);
         }
     }
 

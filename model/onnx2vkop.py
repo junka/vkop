@@ -42,6 +42,8 @@ class VkModel:
                 self._write_string(f, node['op_type'])
                 self._write_string(f, node['name'])
                 self._write_dict(f, node['attributes'])  # Attributes
+                if node['op_type'] == 'Resize':
+                    print("Resize node inputs:", len(node['inputs']))
                 self._write_list_with_shapes(f, node['inputs'])
                 self._write_list_with_shapes(f, node['outputs'])
 
@@ -71,7 +73,7 @@ class VkModel:
             if isinstance(item, int):
                 f.write(struct.pack('I', item))  # For dimensions
             elif isinstance(item, float):
-                f.write(struct.pack('d', item))  # For float attributes
+                f.write(struct.pack('f', item))  # For float attributes
             else:
                 VkModel._write_string(f, item)  # For names
 
@@ -88,7 +90,7 @@ class VkModel:
                 f.write(struct.pack('q', value))
             elif isinstance(value, float):
                 f.write(b'\x02')  # Tag for float
-                f.write(struct.pack('d', value))
+                f.write(struct.pack('f', value))
             elif isinstance(value, list):
                 if all(isinstance(v, int) for v in value):
                     f.write(b'\x03')  # Tag for list of ints
@@ -679,23 +681,23 @@ def merge_initializers(vk_model):
 def convert_flat_to_reshape(vk_model):
     """
     Convert Flat nodes to Reshape nodes with explicit shapes.
-    
+
     Flatten operation flattens the input tensor into a 2D tensor, keeping dimensions
     up to axis-1 and flattening the rest into the second dimension.
     """
     nodes = vk_model.nodes
     new_nodes = []
-    
+
     for node in nodes:
         if node['op_type'] == 'Flatten':
             # Get input shape
             if len(node['inputs']) > 0 and len(node['inputs'][0]['shape']) > 0:
                 input_shape = node['inputs'][0]['shape']
                 print(f"Flatten node {node['name']} input shape: {input_shape}")
-                
+
                 # Get axis attribute (default is 1 according to ONNX spec)
                 axis = node['attributes'].get('axis', 1)
-                
+
                 # Calculate output shape for flatten:
                 # First part: product of dimensions from 0 to axis-1
                 # Second part: product of dimensions from axis to end
@@ -705,13 +707,13 @@ def convert_flat_to_reshape(vk_model):
                     first_part = 1
                     for i in range(axis):
                         first_part *= input_shape[i]
-                
+
                 second_part = 1
                 for i in range(axis, len(input_shape)):
                     second_part *= input_shape[i]
-                
+
                 output_shape = [first_part, second_part]
-                
+
                 # Create new reshape node
                 reshape_node = {
                     'op_type': 'Reshape',
@@ -720,19 +722,19 @@ def convert_flat_to_reshape(vk_model):
                     'inputs': node['inputs'][:],  # Copy original inputs
                     'outputs': node['outputs'][:]  # Copy original outputs
                 }
-                
+
                 # Add shape tensor as second input
                 shape_tensor_name = node['name'] + '_shape'
                 shape_tensor = np.array(output_shape, dtype=np.int64)
                 shape_initializer = numpy_helper.from_array(shape_tensor, shape_tensor_name)
                 vk_model.initializers[shape_tensor_name] = shape_initializer
-                
+
                 # Add the shape tensor as the second input to reshape
                 reshape_node['inputs'].append({
                     'name': shape_tensor_name,
                     'shape': list(shape_tensor.shape)
                 })
-                
+
                 new_nodes.append(reshape_node)
                 print(f"Converted Flatten node '{node['name']}' to Reshape with shape {output_shape} (axis={axis})")
             else:
@@ -741,7 +743,7 @@ def convert_flat_to_reshape(vk_model):
                 print(f"Warning: Could not convert Flatten node '{node['name']}' - missing shape info")
         else:
             new_nodes.append(node)
-    
+
     vk_model.nodes = new_nodes
 
 
@@ -950,6 +952,67 @@ def quantize_to_fp16_selective(vk_model):
 
     print(f"Converted {converted_count} FP32 tensors to FP16")
     print(f"Preserved {skipped_count} tensors")
+
+
+def move_input_tensor_to_attr(vk_model):
+    """
+    将一些算子input中包含的仅rank长度的tensor转换为attribute。
+    比如resize算子中的scales、sizes, pad算子中的pads等, 这些都是小型一维张量，
+    对于这类tensor可以直接转为attribute, 同时将node inputs中对应tensor置为空,
+    对应的initializer也删除.
+    """
+    initializers_to_remove = set()
+
+    SPECIAL_OPS = {
+        'Resize': [(2, 'scales'), (3, 'sizes')],  # inputs[2]=scales, inputs[3]=sizes
+        'Pad': [(1, 'pads')],  # inputs[1]=pads
+        # 'Slice': [(1, 'starts'), (2, 'ends'), (3, 'axes'), (4, 'steps')],  # 多个参数
+    }
+
+    for node in vk_model.nodes:
+        op_type = node['op_type']
+        if op_type not in SPECIAL_OPS:
+            continue
+
+        target_inputs = SPECIAL_OPS[op_type]
+
+        for idx, attr_name in target_inputs:
+            if idx >= len(node['inputs']):
+                continue
+
+            input_tensor = node['inputs'][idx]
+            tensor_name = input_tensor['name']
+            print("Checking input tensor: ", tensor_name)
+
+            if not tensor_name or tensor_name not in vk_model.initializers:
+                continue
+
+            initializer = vk_model.initializers[tensor_name]
+
+            # 检查是否为一维数组且长度较短（通常是rank长度，一般不超过8）
+            if len(initializer.dims) == 1 and 0 < initializer.dims[0] <= 8:
+                tensor_data = numpy_helper.to_array(initializer)
+
+                if 'attributes' not in node:
+                    node['attributes'] = {}
+
+                if tensor_data.dtype in [np.float32, np.float64]:
+                    node['attributes'][attr_name] = tensor_data.tolist()
+                elif tensor_data.dtype in [np.int32, np.int64]:
+                    node['attributes'][attr_name] = tensor_data.tolist()
+                else:
+                    node['attributes'][attr_name] = tensor_data.tolist()
+
+                del node['inputs'][idx]
+
+                initializers_to_remove.add(tensor_name)
+        print(node)
+
+    for initializer_name in initializers_to_remove:
+        if initializer_name in vk_model.initializers:
+            del vk_model.initializers[initializer_name]
+
+    print(f"Converted {len(initializers_to_remove)} tensor inputs to attributes")
 
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
@@ -1180,6 +1243,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
+    move_input_tensor_to_attr(vk_model)
     quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)
     convert_flat_to_reshape(vk_model)

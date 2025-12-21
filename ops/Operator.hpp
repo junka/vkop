@@ -58,8 +58,9 @@ class Operator {
             }
         }
     }
-    virtual std::vector<int> parse_attr_list(const std::string &str) {
-        std::vector<int> result;
+    template <typename T>
+    std::vector<T> parse_attr_list(const std::string &str) {
+        std::vector<T> result;
         if (str.front() == '[' && str.back() == ']') {
             std::string content = str.substr(1, str.size() - 2);
             size_t comma_count = 0;
@@ -73,7 +74,11 @@ class Operator {
             std::string item;
             while (std::getline(ss, item, ',')) {
                 try {
-                    result.emplace_back(std::stol(item));
+                    if (std::is_same<T, float>::value) {
+                        result.emplace_back(std::stof(item));
+                    } else {
+                        result.emplace_back(std::stol(item));
+                    }
                 } catch (const std::invalid_argument &e) {
                     throw std::runtime_error(
                         "Invalid number in attribute list: " + item);

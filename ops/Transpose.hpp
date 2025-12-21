@@ -37,7 +37,7 @@ class Transpose : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("perm") != attributes.end()) {
-            perm_ = parse_attr_list(attributes.at("perm"));
+            perm_ = parse_attr_list<int>(attributes.at("perm"));
         }
     }
 
@@ -72,8 +72,6 @@ class Transpose : public Operator {
         for (size_t i = 0; i < 4; ++i) {
             reverse_perms[perm_[i]] = i;
         }
-        printf("%d %d %d %d\n", reverse_perms[0], reverse_perms[1],
-               reverse_perms[2], reverse_perms[3]);
 
         transpose::GpuTransposeParam param;
         param.inImgSize[0] = inshape[3];

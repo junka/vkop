@@ -49,7 +49,7 @@ class Reduce : public Operator {
         }
         // opset ver 18 will move this to inputs
         if (attributes.find("axis") != attributes.end()) {
-            axis_ = parse_attr_list(attributes.at("axis"));
+            axis_ = parse_attr_list<int>(attributes.at("axis"));
         }
         if (attributes.find("keepdims") != attributes.end()) {
             keepdims_ = std::stol(attributes.at("keepdims"));

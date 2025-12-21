@@ -2,6 +2,7 @@
 #ifndef MODEL_LOAD_HPP_
 #define MODEL_LOAD_HPP_
 
+#include <cassert>
 #include <stdexcept>
 #include <vector>
 #include <string>
@@ -176,6 +177,7 @@ private:
     static std::vector<Shape> readListWithShapes(const char*& ptr, const char* end) {
         uint32_t count = readUint32(ptr, end);
         std::vector<Shape> shapes(count);
+        assert(count > 0);
         for (uint32_t i = 0; i < count; ++i) {
             shapes[i].name = readString(ptr, end);
             shapes[i].dims = readDims(ptr, end);
@@ -195,7 +197,7 @@ private:
             } else if (tag == 1) {
                 value = std::to_string(readint64(ptr, end));
             } else if (tag == 2) {
-                value = std::to_string(readFloat64(ptr, end));
+                value = std::to_string(readFloat32(ptr, end));
             } else if (tag == 3) {
                 auto l = readList<uint32_t>(ptr, end);
                 value = "[" + std::to_string(l[0]);

@@ -1,7 +1,10 @@
 // Copyright 2025 @junka
 #ifndef OPS_RESIZE_HPP_
 #define OPS_RESIZE_HPP_
-#include "UnaryFactory.hpp"
+
+#include "core/Tensor.hpp"
+#include "ops/Operator.hpp"
+
 #include <climits>
 #include <cmath>
 #include <numeric>
@@ -17,7 +20,6 @@ using ivec4 = int[4];
 using ivec2 = int[2];
 
 struct GpuResizeParam {
-    ivec4 outImgSize;
     ivec4 inShape;
     ivec4 outShape; // N C H W
     int mode;
@@ -72,7 +74,7 @@ class Resize : public Operator {
             }
         }
         if (attrs.find("axes") != attrs.end()) {
-            axes_ = parse_attr_list(attrs.at("axes"));
+            axes_ = parse_attr_list<int>(attrs.at("axes"));
         }
         if (attrs.find("coordinate_transformation_mode") != attrs.end()) {
 
@@ -148,10 +150,18 @@ class Resize : public Operator {
                 nearest_mode_ = static_cast<int>(itr->second);
             }
         }
-        // only for torch test, it should be the fourth input
         if (attrs.find("size") != attrs.end()) {
-            sizes_ = parse_attr_list(attrs.at("size"));
+            sizes_ = parse_attr_list<int>(attrs.at("size"));
             // need to prefix with sptial
+        }
+        // move inputs to attr by compiler
+        if (attrs.find("scales") != attrs.end()) {
+            scales_ = parse_attr_list<float>(attrs.at("scales"));
+            scale_valid_ = true;
+        }
+        if (attrs.find("sizes") != attrs.end()) {
+            sizes_ = parse_attr_list<int>(attrs.at("sizes"));
+            size_valid_ = true;
         }
     }
 
@@ -194,6 +204,7 @@ class Resize : public Operator {
             for (int i = 0; i < sizes->num_elements(); i++) {
                 sizes_[i] = (*sizes)[i];
             }
+            size_valid_ = true;
         }
         if (inputs.size() > 2 && inputs[2]) {
             scales = core::as_tensor<float>(inputs[2]);
@@ -201,17 +212,18 @@ class Resize : public Operator {
             for (int i = 0; i < scales->num_elements(); i++) {
                 scales_[i] = (*scales)[i];
             }
+            scale_valid_ = true;
         }
-        if (sizes && scales) {
+        if (scale_valid_ && size_valid_) {
             throw std::runtime_error("Resize: both sizes and scales are set");
         }
-        if (sizes && !scales) {
+        if (!scale_valid_ && size_valid_) {
             scales_.resize(rank);
             for (int i = 0; i < rank; i++) {
                 scales_[i] = static_cast<float>(sizes_[i]) /
                              static_cast<float>(input_shape[i]);
             }
-        } else if (!sizes && scales) {
+        } else if (!size_valid_ && scale_valid_) {
             sizes_.resize(rank);
             for (int i = 0; i < rank; i++) {
                 sizes_[i] = static_cast<int>(input_shape[i] * scales_[i]);
@@ -230,7 +242,7 @@ class Resize : public Operator {
         }
 
         std::vector<int> out_shape = input_shape;
-        if (!scales) {
+        if (!scale_valid_) {
             // keep_aspect_ratio_policy valid when scales is null
             if (keep_aspect_ratio_policy_ ==
                 static_cast<int>(resize::KeepAspectRatioPolicy::STRETCH)) {
@@ -260,7 +272,7 @@ class Resize : public Operator {
                         std::round(scale * input_shape[axes_[i]]);
                 }
             }
-        } else if (!sizes && !roi_.empty() &&
+        } else if (!size_valid_ && !roi_.empty() &&
                    coordinate_transformation_mode_ ==
                        static_cast<int>(resize::CoordinateTransformationMode::
                                             TF_CROP_AND_RESIZE)) {
@@ -269,7 +281,7 @@ class Resize : public Operator {
                 out_shape[i] = std::floor(
                     input_shape[i] * (roi_[rank + i] - roi_[i]) * scales_[i]);
             }
-        } else if (!sizes) {
+        } else if (!size_valid_) {
             for (int i = 0; i < rank; i++) {
                 out_shape[i] = std::floor(input_shape[i] * scales_[i]);
             }
@@ -291,12 +303,8 @@ class Resize : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        auto outGPUshape = outputs[0]->getGPUShape();
+        auto out_gpu_shape = outputs[0]->getGPUShape();
         resize::GpuResizeParam para;
-        para.outImgSize[0] = outGPUshape[0];
-        para.outImgSize[1] = outGPUshape[1];
-        para.outImgSize[2] = outGPUshape[2];
-        para.outImgSize[3] = 0;
         para.inShape[0] = inputs[0]->get_batch();
         para.inShape[1] = inputs[0]->get_channel();
         para.inShape[2] = inputs[0]->get_height();
@@ -311,8 +319,8 @@ class Resize : public Operator {
         para.coordinate_transformation_mode = coordinate_transformation_mode_;
         para.cubic_coeff_a = cubic_coeff_a_;
 
-        submit(&para, UP_DIV(outGPUshape[0], 16), UP_DIV(outGPUshape[1], 16),
-               outGPUshape[2]);
+        submit(&para, UP_DIV(out_gpu_shape[0], 16),
+               UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 
   private:
@@ -326,6 +334,8 @@ class Resize : public Operator {
     int mode_ = 0;
     int nearest_mode_ = 0;
     std::vector<int> sizes_;
+    bool size_valid_ = false;
+    bool scale_valid_ = false;
     std::vector<float> scales_;
     std::vector<float> roi_;
 };

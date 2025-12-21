@@ -9,7 +9,7 @@ layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*
 // length = C (number of channels)
 // Each vec4 follows as scale..., bias..., mean..., variance...
 layout(set=0, binding = 2) readonly buffer tensorBuffer {
-    vec4 attr[];
+    mat4 attr[];
 } uMeanVarScaleBias;
 
 layout(push_constant) uniform batchNormBuffer {
@@ -43,10 +43,10 @@ void main() {
     vec4 inputPixel = texelFetch(inputImage, gid3, 0);
 
     // Load per-channel parameters, padding done in previous step
-    vec4 scale4 = uMeanVarScaleBias.attr[c4 * 4];
-    vec4 bias4 = uMeanVarScaleBias.attr[c4 * 4 + 1];
-    vec4 mean4 = uMeanVarScaleBias.attr[c4 * 4 + 2];
-    vec4 var4 = uMeanVarScaleBias.attr[c4 * 4 + 3];
+    vec4 scale4 = uMeanVarScaleBias.attr[c4][0];
+    vec4 bias4 = uMeanVarScaleBias.attr[c4][1];
+    vec4 mean4 = uMeanVarScaleBias.attr[c4][2];
+    vec4 var4 = uMeanVarScaleBias.attr[c4][3];
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uBatchNormParam.eps));
