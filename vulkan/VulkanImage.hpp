@@ -2,17 +2,12 @@
 #ifndef SRC_VULKANIMAGE_HPP_
 #define SRC_VULKANIMAGE_HPP_
 
-#include "vulkan/vulkan.hpp"
-
 #include <cstdint>
 #include <memory>
 #include <variant>
 #include <vulkan/vulkan_core.h>
 
-#include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanResource.hpp"
-#include "vulkan/VulkanStagingBufferPool.hpp"
-
 namespace vkop {
 
 // VulkanImage class inheriting from VulkanResource

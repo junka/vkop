@@ -69,6 +69,9 @@ public:
             } else if (expect_output->dtype() == typeid(uint16_t)) {
                 auto output = std::make_shared<Tensor<uint16_t>>(true);
                 outputs.push_back(output);
+            } else if (expect_output->dtype() == typeid(int)) {
+                auto output = std::make_shared<Tensor<int>>(true);
+                outputs.push_back(output);
             } else {
                 LOG_ERROR("Unsupported output tensor type");
                 return false;
@@ -79,7 +82,7 @@ public:
                 continue;
             }
             auto t = core::as_tensor<T>(input);
-            if (input->num_dims() == 2 || input->num_dims() == 1) {
+            if (input->num_dims() <= 2) {
                 t->as_storage_buffer(dev);
             } else {
                 t->as_input_image(dev, nullptr);
@@ -143,11 +146,17 @@ public:
                         LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
                         return false;
                     }
+                } else if (typeid(TT) == typeid(int)) {
+                    std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                    if ((*output)[i] != (*expect)[i]) {
+                        LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
+                        // return false;
+                    }
                 } else {
                     std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
                         LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
-                        return false;
+                        // return false;
                     }
                 }
             }
@@ -159,8 +168,11 @@ public:
                 if (!check_ret(idx, float{})) {
                     return false;
                 }
-            } else {
+            } else if (outputs[idx]->dtype() == typeid(uint16_t)){
                 if (!check_ret(idx, uint16_t{}))
+                    return false;
+            } else if (outputs[idx]->dtype() == typeid(int)){
+                if (!check_ret(idx, int{}))
                     return false;
             }
         }

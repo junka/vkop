@@ -42,7 +42,7 @@ class OperatorFactory {
 } // namespace vkop
 
 #define REGISTER_OPERATOR(type, name)                                          \
-    bool register_##name##_dummy = []() {                                      \
+    static bool register_##name##_dummy = []() {                               \
         OperatorFactory::get_instance().register_operator(                     \
             type, []() { return std::make_unique<name>(); });                  \
         return true;                                                           \

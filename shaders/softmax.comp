@@ -16,10 +16,6 @@ layout(push_constant) uniform constBuffer {
 shared vec4 sharedMax[256];
 shared vec4 sharedSum[256];
 
-// Helper: reduce vec4 to scalar
-float reduceMax(vec4 v) { return max(max(v.x, v.y), max(v.z, v.w)); }
-float reduceSum(vec4 v) { return v.x + v.y + v.z + v.w; }
-
 // Axis 0: softmax over N (batch)
 void softmax_axis0() {
     uint x = gl_GlobalInvocationID.x;  // w

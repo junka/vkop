@@ -34,6 +34,7 @@ set(TESTS
     ConcatTest
     SplitTest
     GlobalAveragePoolTest
+    TopkTest
 )
 
 find_package(Python3 REQUIRED COMPONENTS Interpreter Development)

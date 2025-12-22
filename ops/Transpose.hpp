@@ -14,8 +14,6 @@ namespace transpose {
 using ivec4 = int[4];
 using ivec2 = int[2];
 struct GpuTransposeParam {
-    ivec4 inImgSize;
-    ivec4 outImgSize;
     ivec4 inShape;
     ivec4 outShape;
     ivec4 perms;
@@ -74,14 +72,6 @@ class Transpose : public Operator {
         }
 
         transpose::GpuTransposeParam param;
-        param.inImgSize[0] = inshape[3];
-        param.inImgSize[1] = inshape[2] * inshape[0];
-        param.inImgSize[2] = UP_DIV(inshape[1], 4);
-        param.inImgSize[3] = 1;
-        param.outImgSize[0] = outshape[3];
-        param.outImgSize[1] = outshape[2] * outshape[0];
-        param.outImgSize[2] = UP_DIV(outshape[1], 4);
-        param.outImgSize[3] = 1;
         for (int i = 0; i < 4; i++) {
             param.inShape[i] = inshape[i];
             param.outShape[i] = outshape[i];

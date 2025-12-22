@@ -29,6 +29,7 @@
 #include "Reshape.hpp"
 #include "Slice.hpp"
 #include "Split.hpp"
+#include "Topk.hpp"
 #include "Transpose.hpp"
 
 #include "OperatorFactory.hpp"
@@ -70,6 +71,7 @@ REGISTER_OPERATOR(OpType::CONCAT, Concat);
 REGISTER_OPERATOR(OpType::SPLIT, Split);
 
 REGISTER_OPERATOR(OpType::GLOBALAVERAGEPOOL, GlobalAveragePool);
+REGISTER_OPERATOR(OpType::TOPK, Topk);
 
 } // namespace ops
 } // namespace vkop
