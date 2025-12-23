@@ -1,0 +1,76 @@
+#version 450 core
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
+layout(set=0, binding = 1) uniform sampler2DArray uInput;          // [W, N*H, C4]
+
+layout(push_constant) uniform paraBuffer {
+    ivec4 inShape;      // [N, C, H, W]
+    ivec4 outShape;     // [N, C, H_out, W_out]
+    ivec4 pads;         // [pad_beginH, pad_beginW, pad_endH, pad_endW]
+    ivec2 kernel_shape; // [kernel_H, kernel_W]
+    ivec2 strides;      // [stride_H, stride_W]
+    int count_include_pad;
+} uParams;
+
+
+void main() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    uint wo = gl_GlobalInvocationID.x;          // output width index
+    uint no_ho = gl_GlobalInvocationID.y;       // = n * H_out + ho
+    uint layer = gl_GlobalInvocationID.z;       // = c_base / 4
+
+    uint N = uint(uParams.inShape.x);
+    uint H_in = uint(uParams.inShape.z);
+    uint W_in = uint(uParams.inShape.w);
+    uint C_out = uint(uParams.outShape.y);
+    uint H_out = uint(uParams.outShape.z);
+    uint W_out = uint(uParams.outShape.w);
+
+    int C4 = (int(C_out) + 3) / 4;
+
+    if (wo >= W_out || no_ho >= uint(N * H_out) || layer >= C4) {
+        return;
+    }
+
+    uint n = no_ho / H_out;
+    uint ho = no_ho % H_out;
+
+    int ih_start = int(ho) * uParams.strides.x - uParams.pads.x; // H dim
+    int iw_start = int(wo) * uParams.strides.y - uParams.pads.y; // W dim
+
+    vec4 sum = vec4(0.0);
+    int valid_count = 0;
+    int total_count = 0;
+
+    for (int kh = 0; kh < uParams.kernel_shape.x; ++kh) {
+        for (int kw = 0; kw < uParams.kernel_shape.y; ++kw) {
+            int ih = ih_start + kh;
+            int iw = iw_start + kw;
+            total_count++;
+
+            if (ih >= 0 && ih < H_in &&
+                iw >= 0 && iw < W_in) {
+
+                ivec3 coord = ivec3(iw, ih + int(n * H_in), int(layer));
+                vec4 val = texelFetch(uInput, coord, 0);
+                sum += val;
+                valid_count++;
+            }
+            // else: padding → treat as 0 (so do nothing)
+        }
+    }
+
+    // Compute average
+    vec4 avg = vec4(0.0);
+    if (uParams.count_include_pad != 0) {
+        // Include padding in denominator
+        avg = (total_count > 0) ? sum / float(total_count) : vec4(0.0);
+    } else {
+        // Exclude padding
+        avg = (valid_count > 0) ? sum / float(valid_count) : vec4(0.0);
+    }
+
+    imageStore(uOutput, gid, vec4(avg));
+}

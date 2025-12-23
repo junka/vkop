@@ -9,6 +9,8 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
+*.onnx
+*.vkopbin
 
 # Ignore compiled object files
 *.o
