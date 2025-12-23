@@ -25,10 +25,6 @@ struct Node {
     std::unordered_map<std::string, std::string> attributes;
     std::vector<Shape> inputs;
     std::vector<Shape> outputs;
-    std::vector<uint32_t> input_indices;   // indices of input tensors
-    std::vector<uint32_t> output_indices;  // indices of output tensors
-    uint32_t dependency_count;             // number of dependencies (inputs not yet computed)
-    std::vector<uint32_t> dependents;      // nodes that depend on this node's outputs
 };
 
 struct Initializer {

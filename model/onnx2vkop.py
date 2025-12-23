@@ -282,6 +282,7 @@ def fuse_gated_conv(vk_model):
             (inp1, inp0)
         ]
 
+        matched = False
         for conv_out, sig_out in candidates:
             if conv_out not in producer or sig_out not in producer:
                 continue
@@ -1014,6 +1015,82 @@ def move_input_tensor_to_attr(vk_model):
 
     print(f"Converted {len(initializers_to_remove)} tensor inputs to attributes")
 
+def unsqueeze_initializers(vk_model):
+    """Optimize unsqueeze operations on initializers by pre-computing the result"""
+    print("Unsqueezing initializers...")
+
+    nodes_to_remove = []
+    initializers_to_add = []
+    initializers_to_remove = []
+
+    # 遍历所有节点查找Unsqueeze操作
+    for node in vk_model.nodes:
+        if node['op_type'] == 'Unsqueeze':
+            # 检查输入是否为initializer
+            input_name = node.input[0]
+            initializer = None
+
+            # 查找对应的initializer
+            for init in vk_model.initializers:
+                if init.name == input_name:
+                    initializer = init
+                    break
+
+            if initializer is not None:
+                axes = None
+                for attr in node['attribute']:
+                    if attr['name'] == 'axes':
+                        axes = list(attr.ints)
+                        break
+
+                if axes is None and len(node.input) > 1:
+                    axes_input_name = node.input[1]
+                    for init in vk_model.initializer:
+                        if init.name == axes_input_name:
+                            if init.data_type == 7:  # INT64
+                                axes = list(init.int64_data)
+                            elif init.data_type == 6:  # INT32
+                                axes = list(init.int32_data)
+                            break
+
+                if axes is not None:
+                    original_shape = list(initializer.dims)
+                    new_shape = original_shape[:]
+                    axes_sorted = sorted([int(axis) if axis >= 0 else axis + len(original_shape) + 1 for axis in axes], reverse=True)
+
+                    for axis in axes_sorted:
+                        actual_axis = axis if axis >= 0 else axis + len(new_shape) + 1
+                        new_shape.insert(actual_axis, 1)
+
+                    import copy
+                    new_initializer = copy.deepcopy(initializer)
+                    new_initializer.name = node.output[0]
+                    new_initializer.dims[:] = new_shape
+
+                    initializers_to_add.append(new_initializer)
+                    initializers_to_remove.append(initializer.name)
+                    nodes_to_remove.append(node)
+
+                    print(f"Pre-computed unsqueeze for initializer '{input_name}' with axes {axes}")
+
+    for node in nodes_to_remove:
+        vk_model.nodes.remove(node)
+
+    for init_name in initializers_to_remove:
+        for i, init in enumerate(vk_model.initializers):
+            if init.name == init_name:
+                vk_model.initializers.remove(init)
+                break
+
+    for init in initializers_to_add:
+        vk_model.initializers.append(init)
+
+    if nodes_to_remove:
+        print(f"Removed {len(nodes_to_remove)} unsqueeze nodes that operated on initializers")
+
+    return vk_model
+
+
 def parse_onnx_model(onnx_path):
     model = onnx.load(onnx_path)
 
@@ -1243,6 +1320,7 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
+    # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
     move_input_tensor_to_attr(vk_model)
     quantize_to_fp16_selective(vk_model)
     merge_initializers(vk_model)

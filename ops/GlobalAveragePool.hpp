@@ -2,7 +2,7 @@
 #ifndef OPS_GLOBALAVERAGEPOOL_HPP_
 #define OPS_GLOBALAVERAGEPOOL_HPP_
 
-#include "UnaryFactory.hpp"
+#include "ops/Operator.hpp"
 
 extern unsigned char globalaveragepool_spv[];
 extern unsigned int globalaveragepool_spv_len;
@@ -22,7 +22,7 @@ class GlobalAveragePool : public Operator {
         : Operator(OpType::GLOBALAVERAGEPOOL, globalaveragepool_spv,
                    globalaveragepool_spv_len,
                    sizeof(globalaveragepool::GpuGAPParam)) {
-        n_imgs_ = 2;
+        n_imgs_ = 1;
         types_ = {DESCRIPTOR_TYPE_STORAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
         objs_.reserve(types_.size());

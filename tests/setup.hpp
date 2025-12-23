@@ -100,7 +100,6 @@ public:
             auto output = core::as_tensor<TT>(outputs[idx]);
             output->copyToCPU(cmdpool);
             auto oshape = output->getShape();
-            printf("output shape: %ld\n", oshape.size());
             if (oshape.size() == 4) {
                 for (int i = 0; i < oshape[0]; i++) {
                     printf("[\n");
@@ -150,13 +149,13 @@ public:
                     std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if ((*output)[i] != (*expect)[i]) {
                         LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
-                        // return false;
+                        return false;
                     }
                 } else {
                     std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
                         LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
-                        // return false;
+                        return false;
                     }
                 }
             }
@@ -215,60 +214,6 @@ public:
             fprintf(stderr, "An exception occurred while finalizing Python environment.\n");
         }
     }
-    static std::unordered_map<std::string, std::string> onnx_to_pytorch_attrs(
-        const std::unordered_map<std::string, std::string>& onnx_attrs
-    ) {
-        std::unordered_map<std::string, std::string> pytorch_attrs;
-
-        for (const auto& attr : onnx_attrs) {
-            const std::string& name = attr.first;
-            const std::string& value = attr.second;
-
-            if (name == "kernel_shape") {
-                // ONNX: "3,3" → PyTorch: kernel_size="3,3"
-                // pytorch_attrs["kernel_size"] = value;
-            }
-            else if (name == "strides") {
-                pytorch_attrs["stride"] = value;
-            }
-            else if (name == "dilations") {
-                pytorch_attrs["dilation"] = value;
-            }
-            else if (name == "group") {
-                pytorch_attrs["groups"] = value;
-            }
-            else if (name == "auto_pad") {
-                if (value == "SAME_UPPER" || value == "SAME_LOWER") {
-                    pytorch_attrs["padding"] = "same";  // PyTorch 支持 'same'
-                }
-                // "VALID" → padding=0，但通常 ONNX 用 pads=0
-            }
-            else if (name == "pads") {
-                // ONNX: "1,1,1,1" → [x1,y1,x2,y2]
-                // PyTorch: 通常用对称 padding (x,y)
-                std::vector<int> pads;
-                std::stringstream ss(value);
-                std::string item;
-                while (std::getline(ss, item, ',')) {
-                    pads.push_back(std::stoi(item));
-                }
-
-                if (pads.size() == 4) {
-                    int px = (pads[0] + pads[2]) / 2;  // 平均左右
-                    int py = (pads[1] + pads[3]) / 2;  // 平均上下
-                    pytorch_attrs["padding"] = std::to_string(px) + "," + std::to_string(py);
-                } else if (pads.size() == 2) {
-                    pytorch_attrs["padding"] = value;  // 直接用
-                }
-            }
-            // 其他通用属性
-            else {
-                pytorch_attrs[name] = value;
-            }
-        }
-
-        return pytorch_attrs;
-    }
 
     static std::tuple<std::vector<std::vector<float>>, std::vector<int>>
     execute_torch_operator(const std::string& op_name,
@@ -325,7 +270,9 @@ public:
             Py_XDECREF(norm_shape);
         };
 
-        auto attrs = onnx_to_pytorch_attrs(attributes);
+        for (const auto& a: attributes) {
+            printf("%s: %s\n", a.first.c_str(), a.second.c_str());
+        }
 
         try {
             // === 1. Import torch and torch.nn.functional ===
@@ -378,9 +325,10 @@ public:
 
             // === 4. Build kwargs dictionary ===
             kwargs = PyDict_New();
-            for (const auto& attr : attrs) {
-                const std::string& key = attr.first;
+            for (const auto& attr : attributes) {
+                std::string key = attr.first;
                 const std::string& val_str = attr.second;
+                printf("%s: %s\n", key.c_str(), val_str.c_str());
                 PyObject* value = nullptr;
 
                 if (key == "inplace" || key == "bias" || key == "align_corners" || key == "antialias") {
@@ -390,6 +338,28 @@ public:
                     value = PyFloat_FromDouble(std::stod(val_str));
                 } else if (key == "padding" && (val_str == "same" || val_str == "valid")) {
                     value = PyUnicode_FromString(val_str.c_str());
+                } else if (key == "pads") {
+                    std::vector<int> pads;
+                    std::string item;
+                    std::string content;
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        content = val_str.substr(1, val_str.size() - 2);
+                    } else {
+                        content = val_str;
+                    }
+                    std::stringstream ss(content);
+                    while (std::getline(ss, item, ',')) {
+                        pads.push_back(std::stoi(item));
+                    }
+                    if (pads.size() > 2) {
+                        pads = {pads[pads.size()-2], pads[pads.size()-1]};
+                    }
+                    PyObject* padding_tuple = PyTuple_New(pads.size());
+                    for (size_t i = 0; i < pads.size(); i++) {
+                        PyTuple_SetItem(padding_tuple, i, PyLong_FromLong(pads[i]));
+                    }
+                    value = padding_tuple;
+                    key = "padding";
                 } else if (key == "momentum" || key == "eps") {
                     value = PyFloat_FromDouble(std::stof(val_str));
                 } else if (key == "normalized_shape") {
@@ -425,6 +395,65 @@ public:
                         PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(resize_shape[i]));
                     }
                     value = shape_tuple;
+                } else if (key == "group") {
+                    key = "groups";
+                    value = PyLong_FromLong(std::stol(val_str));
+                } else if (key == "kernel_shape") {
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        std::vector<int> kernel_shape;
+                        std::string content = val_str.substr(1, val_str.size() - 2);
+                        std::stringstream ss(content);
+                        std::string item;
+                        while (std::getline(ss, item, ',')) {
+                            kernel_shape.push_back(std::stoi(item));
+                        }
+                        PyObject* shape_tuple = PyTuple_New(kernel_shape.size());
+                        for (size_t i = 0; i < kernel_shape.size(); ++i) {
+                            PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(kernel_shape[i]));
+                        }
+                        value = shape_tuple;
+                    } else {
+                        value = PyLong_FromLong(std::stol(val_str));
+                    }
+                    key = "kernel_size";
+                } else if (key == "strides") {
+                    key = "stride";
+                    std::vector<int> stride;
+                    std::string item;
+                    std::string content;
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        content = val_str.substr(1, val_str.size() - 2);
+                    } else {
+                        content = val_str;
+                    }
+                    std::stringstream ss(content);
+                    while (std::getline(ss, item, ',')) {
+                        stride.push_back(std::stoi(item));
+                    }
+                    PyObject* tuple = PyTuple_New(stride.size());
+                    for (size_t i = 0; i < stride.size(); i++) {
+                        PyTuple_SetItem(tuple, i, PyLong_FromLong(stride[i]));
+                    }
+                    value = tuple;
+                } else if (key == "dilations") {
+                    key = "dilation";
+                    std::vector<int> stride;
+                    std::string item;
+                    std::string content;
+                    if (val_str.front() == '[' && val_str.back() == ']') {
+                        content = val_str.substr(1, val_str.size() - 2);
+                    } else {
+                        content = val_str;
+                    }
+                    std::stringstream ss(content);
+                    while (std::getline(ss, item, ',')) {
+                        stride.push_back(std::stoi(item));
+                    }
+                    PyObject* tuple = PyTuple_New(stride.size());
+                    for (size_t i = 0; i < stride.size(); i++) {
+                        PyTuple_SetItem(tuple, i, PyLong_FromLong(stride[i]));
+                    }
+                    value = tuple;
                 } else {
                     try {
                         value = PyLong_FromLong(std::stol(val_str));
@@ -436,7 +465,11 @@ public:
                         }
                     }
                 }
-                PyDict_SetItemString(kwargs, key.c_str(), value);
+                if (op_name == "conv2d" && key == "kernel_size") {
+                } else if (op_name == "avg_pool2d" && key == "auto_pad") {
+                } else {
+                    PyDict_SetItemString(kwargs, key.c_str(), value);
+                }
                 Py_XDECREF(value);
             }
 
@@ -451,7 +484,27 @@ public:
             for (size_t i = 0; i < arg_list.size(); ++i) {
                 PyTuple_SetItem(args, i, arg_list[i]);
             }
-
+            PyObject* args_str = PyObject_Str(args);
+            if (args_str != nullptr) {
+                const char* args_cstr = PyUnicode_AsUTF8(args_str);
+                if (args_cstr != nullptr) {
+                    printf("args: %s\n", args_cstr);
+                }
+                Py_DECREF(args_str);
+            }
+            
+            if (kwargs != nullptr) {
+                PyObject* kwargs_str = PyObject_Str(kwargs);
+                if (kwargs_str != nullptr) {
+                    const char* kwargs_cstr = PyUnicode_AsUTF8(kwargs_str);
+                    if (kwargs_cstr != nullptr) {
+                        printf("kwargs: %s\n", kwargs_cstr);
+                    }
+                    Py_DECREF(kwargs_str);
+                }
+            } else {
+                printf("kwargs: NULL\n");
+            }
             // === 6. Call the operator ===
             torch_output = PyObject_Call(op_func, args, kwargs);
             Py_DECREF(args);

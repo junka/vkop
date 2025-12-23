@@ -81,8 +81,8 @@ class Conv2d : public Operator {
             groups_ = std::stol(attributes.at("group"));
         }
 
-        if (attributes.find("kernel_shape_") != attributes.end()) {
-            std::string kernel_str = attributes.at("kernel_shape_");
+        if (attributes.find("kernel_shape") != attributes.end()) {
+            std::string kernel_str = attributes.at("kernel_shape");
             if (kernel_str.find(',') != std::string::npos) {
                 kernel_shape_ = parse_attr_list<int>(kernel_str);
             } else {

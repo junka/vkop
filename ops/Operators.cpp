@@ -24,6 +24,7 @@
 #include "Resize.hpp"
 #include "Softmax.hpp"
 
+#include "AveragePool.hpp"
 #include "Concat.hpp"
 #include "GlobalAveragePool.hpp"
 #include "Reshape.hpp"
@@ -71,6 +72,7 @@ REGISTER_OPERATOR(OpType::CONCAT, Concat);
 REGISTER_OPERATOR(OpType::SPLIT, Split);
 
 REGISTER_OPERATOR(OpType::GLOBALAVERAGEPOOL, GlobalAveragePool);
+REGISTER_OPERATOR(OpType::AVERAGEPOOL, AveragePool);
 REGISTER_OPERATOR(OpType::TOPK, Topk);
 
 } // namespace ops

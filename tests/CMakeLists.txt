@@ -34,6 +34,7 @@ set(TESTS
     ConcatTest
     SplitTest
     GlobalAveragePoolTest
+    AveragePoolTest
     TopkTest
 )
 

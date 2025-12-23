@@ -47,31 +47,32 @@ enum class OpType {
     RESHAPE,
     TRANSPOSE,
     GLOBALAVERAGEPOOL,
+    AVERAGEPOOL,
     TOPK,
     TOTAL_NUM
 };
 
 inline std::string convert_openum_to_string(const OpType &type) {
-    std::vector<std::string> names = {"Unknown",    "Add",
-                                      "Sub",        "Mul",
-                                      "Div",        "Atan",
-                                      "Erf",        "Pow",
-                                      "BatchNorm",  "LayerNorm",
-                                      "Relu",       "Softmax",
-                                      "Tanh",       "MatMul",
-                                      "Conv2d",     "MaxPool2d",
-                                      "AvgPool2d",  "Upsample2d",
-                                      "GridSample", "Constant",
-                                      "Floor",      "Flatten",
-                                      "Resize",     "Concat",
-                                      "Slice",      "Unsqueeze",
-                                      "Squeeze",    "Col2Im",
-                                      "Im2Col",     "PRelu",
-                                      "Sigmoid",    "Softplus",
-                                      "Gemm",       "Reduce",
-                                      "Split",      "Reshape",
-                                      "Transpose",  "GlobalAveragePool",
-                                      "TopK"};
+    std::vector<std::string> names = {"Unknown",     "Add",
+                                      "Sub",         "Mul",
+                                      "Div",         "Atan",
+                                      "Erf",         "Pow",
+                                      "BatchNorm",   "LayerNorm",
+                                      "Relu",        "Softmax",
+                                      "Tanh",        "MatMul",
+                                      "Conv2d",      "MaxPool2d",
+                                      "AvgPool2d",   "Upsample2d",
+                                      "GridSample",  "Constant",
+                                      "Floor",       "Flatten",
+                                      "Resize",      "Concat",
+                                      "Slice",       "Unsqueeze",
+                                      "Squeeze",     "Col2Im",
+                                      "Im2Col",      "PRelu",
+                                      "Sigmoid",     "Softplus",
+                                      "Gemm",        "Reduce",
+                                      "Split",       "Reshape",
+                                      "Transpose",   "GlobalAveragePool",
+                                      "AveragePool", "TopK"};
     if (type >= OpType::TOTAL_NUM)
         return names[0];
     return names[static_cast<int>(type)];
@@ -152,6 +153,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::TRANSPOSE;
     if (name == "GlobalAveragePool")
         return vkop::ops::OpType::GLOBALAVERAGEPOOL;
+    if (name == "AveragePool")
+        return vkop::ops::OpType::AVERAGEPOOL;
     if (name == "TopK")
         return vkop::ops::OpType::TOPK;
     printf("Unknown op type: %s\n", name.c_str());
