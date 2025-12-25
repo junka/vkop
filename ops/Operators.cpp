@@ -38,7 +38,7 @@
 
 namespace vkop {
 namespace ops {
-
+namespace {
 REGISTER_OPERATOR(OpType::ATAN, Atan);
 REGISTER_OPERATOR(OpType::ERF, Erf);
 REGISTER_OPERATOR(OpType::RELU, Relu);
@@ -75,5 +75,6 @@ REGISTER_OPERATOR(OpType::GLOBALAVERAGEPOOL, GlobalAveragePool);
 REGISTER_OPERATOR(OpType::AVERAGEPOOL, AveragePool);
 REGISTER_OPERATOR(OpType::TOPK, Topk);
 
+} // namespace
 } // namespace ops
 } // namespace vkop

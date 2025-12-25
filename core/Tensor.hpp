@@ -552,9 +552,9 @@ template <typename T> class Tensor : public ITensor {
             printf("copyToGPUBuffer stpool alloc failed %d\n", size_);
             return;
         }
-        if (src)
+        if (src) {
             memcpy(b->ptr, src, size_);
-        else {
+        } else {
             memcpy(b->ptr, data_.data(), size_);
         }
 

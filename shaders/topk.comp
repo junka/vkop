@@ -1,5 +1,5 @@
 #version 450 core
-precision highp float;
+#extension GL_EXT_subgroup_uniform_control_flow: require
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -9,7 +9,10 @@ layout(set=0, binding = 0) buffer indiceBuffer {
 layout(set=0, binding = 1) buffer valueBuffer {
     float data[];
 } uValue;
-layout(set=0, binding = 2) readonly buffer inputBuffer {
+layout(set=0, binding = 2) readonly buffer indexBuffer {
+    uint data[];
+} uIndex;
+layout(set=0, binding = 3) readonly buffer inputBuffer {
     float data[];
 } uInput;
 
@@ -20,30 +23,30 @@ layout(push_constant) uniform parameter {
     int axis;
     int largest;
     int sorted;
-    int softmax;
 } uParam;
 
 shared float sharedData[256];
 shared uint sharedIndices[256];
+
+#define SWAP_FLOAT(a, b)  { float _t = (a); (a) = (b); (b) = _t;}
+#define SWAP_UINT(a, b)  { uint _t = (a); (a) = (b); (b) = _t; }
 
 void bitonicSort(int count) {
     int powerOfTwo = 1;
     while (powerOfTwo < count && powerOfTwo < 256) {
         powerOfTwo <<= 1;
     }
+    uint lid = gl_LocalInvocationID.x;
 
     for (int size = 2; size <= powerOfTwo; size <<= 1) {
         for (int stride = size >> 1; stride > 0; stride >>= 1) {
-            uint lid = gl_LocalInvocationID.x;
-            if (int(lid) < count) {
+            if (int(lid) < powerOfTwo) {
                 uint pos = lid ^ uint(stride);
-
-                bool direction = (lid & uint(size)) == 0u;
-                if (uParam.largest != 0) {
-                    direction = !direction;
-                }
-
-                if (pos > lid && int(pos) < count) {
+                if (pos > lid) {
+                    bool direction = (lid & uint(size)) == 0u;
+                    if (uParam.largest != 0) {
+                        direction = !direction;
+                    }
                     bool shouldSwap = false;
                     if (direction) {
                         shouldSwap = sharedData[lid] > sharedData[pos];
@@ -52,13 +55,8 @@ void bitonicSort(int count) {
                     }
 
                     if (shouldSwap) {
-                        float t_val = sharedData[lid];
-                        sharedData[lid] = sharedData[pos];
-                        sharedData[pos] = t_val;
-
-                        uint t_idx = sharedIndices[lid];
-                        sharedIndices[lid] = sharedIndices[pos];
-                        sharedIndices[pos] = t_idx;
+                        SWAP_FLOAT(sharedData[lid], sharedData[pos]);
+                        SWAP_UINT(sharedIndices[lid], sharedIndices[pos]);
                     }
                 }
             }
@@ -67,142 +65,63 @@ void bitonicSort(int count) {
     }
 }
 
-shared float tempData[256];
-shared uint tempIndices[256];
-void mergeWithResults(float newValue, uint newIndex) {
-    // 将当前结果加载到临时数组
-    uint lid = gl_LocalInvocationID.x;
-    if (int(lid) < uParam.k) {
-        tempData[lid] = uValue.data[lid];
-        tempIndices[lid] = uIndice.data[lid];
-    } else {
-        // 填充边界值
-        tempData[lid] = (uParam.largest != 0) ? -1e30 : 1e30;
-        tempIndices[lid] = 0u;
-    }
-    barrier();
-
-    if (lid == 0) {
-        // 找到合适的插入位置
-        int insertPos = uParam.k;
-        for (int i = 0; i < uParam.k; i++) {
-            if (uParam.largest != 0) {
-                // 降序排列
-                if (newValue > tempData[i]) {
-                    insertPos = i;
-                    break;
-                }
-            } else {
-                // 升序排列
-                if (newValue < tempData[i]) {
-                    insertPos = i;
-                    break;
-                }
-            }
-        }
-        
-        // 如果需要插入，则移动元素并插入新值
-        if (insertPos < uParam.k) {
-            // 向后移动元素
-            for (int i = uParam.k - 1; i > insertPos; i--) {
-                tempData[i] = tempData[i-1];
-                tempIndices[i] = tempIndices[i-1];
-            }
-            // 插入新元素
-            tempData[insertPos] = newValue;
-            tempIndices[insertPos] = newIndex;
-        }
-    }
-    barrier();
-    
-    // 将结果写回
-    if (int(lid) < uParam.k) {
-        uValue.data[lid] = tempData[lid];
-        uIndice.data[lid] = tempIndices[lid];
-    }
-}
-
 void main() {
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
-    uvec3 workGroupID = gl_WorkGroupID;
-    int localIndex = int(gl_LocalInvocationID.x);
+    int lid = int(gl_LocalInvocationID.x);
 
-    if (uParam.axis == 1 && (y >= uParam.outShape.x || int(x) >= uParam.inShape.y)) {
-        return;
-    } else if (uParam.axis == 0 && x >= uParam.outShape.x) {
+    if (uParam.axis == 1 && y >= uParam.inShape.x) {
         return;
     }
-
-    uint group_id = gl_WorkGroupID.x;
-    uint start = group_id * 256u;
-    uint end = min(start + 256u, uint(uParam.inShape.x));
-    int localCount = int(end - start);
-
-    int dataSize;
-    int idx;
-
-    switch(uParam.axis) {
-        case 0:
-            dataSize = uParam.inShape.x;
-            idx = int(x);
-            break;
-        case 1:
-            dataSize = uParam.inShape.y;
-            idx = int(y) * uParam.inShape.y + int(x);
-            break;
-        default:
-            dataSize = uParam.inShape.x;
-            idx = int(x);
-            break;
-    }
-
-    if (idx < dataSize) {
-        sharedData[localIndex] = uInput.data[idx];
-        sharedIndices[localIndex] = idx;
-    } else {
-        sharedData[localIndex] =  (uParam.largest != 0) ? -1e30 : 1e30; // For padding
-        sharedIndices[localIndex] = 0;
-    }
-    barrier();
-
-    // Local Top-K sort using bitonic sort
-    bitonicSort(localCount);
 
     if (uParam.axis == 0) {
+        int N = uParam.inShape.x;
+        uint group_id = gl_WorkGroupID.x;
+        uint start = group_id * 256u;
+        uint end = min(start + 256u, uint(N));
+        int localCount = int(end - start);
 
-        if (group_id == 0 && localIndex < uParam.k) {
-            uValue.data[localIndex] = sharedData[localIndex];
-            uIndice.data[localIndex] = sharedIndices[localIndex];
+        if (x < N) {
+            sharedData[lid] = uInput.data[x];
+            sharedIndices[lid] = uIndex.data[x];
+        } else {
+            sharedData[lid] = ((uParam.largest != 0) ? -3.4e38 : 3.4e38);
+            sharedIndices[lid] = -1;
         }
-        if (dataSize > 256) {
-            // 后续工作组与已有的结果进行比较和替换
-            if (group_id > 0 && localIndex < uParam.k) {
-                float newValue = sharedData[localIndex];
-                uint newIndex = sharedIndices[localIndex];
-                mergeWithResults(newValue, newIndex);
-            }
-            barrier();
+        barrier();
 
-            // 最后对结果再次排序确保正确顺序
-            if (group_id == 0 && localIndex < uParam.k) {
-                sharedData[localIndex] = uValue.data[localIndex];
-                sharedIndices[localIndex] = uIndice.data[localIndex];
-            }
-            barrier();
+        bitonicSort(localCount);
 
-            if (group_id == 0 && localIndex < uParam.k) {
-                bitonicSort(uParam.k);
-                uValue.data[localIndex] = sharedData[localIndex];
-                uIndice.data[localIndex] = sharedIndices[localIndex];
-            }
+        if (lid < uParam.k && lid < localCount) {
+            uint outOffset = group_id * uParam.k;
+            uValue.data[outOffset + lid] = sharedData[lid];
+            uIndice.data[outOffset + lid] = sharedIndices[lid];
         }
-    } else {
-        // 二维情况，每个y值独立处理一行
-        if (localIndex < uParam.k) {
-            int outIdx = int(y) * uParam.k + localIndex;
-            uValue.data[outIdx] = sharedData[localIndex];
-            uIndice.data[outIdx] = sharedIndices[localIndex];
+    } else if (uParam.axis == 1) {
+        int rows = uParam.inShape.x;
+        int cols = uParam.inShape.y;
+
+        uint group_id = gl_WorkGroupID.x;
+        uint start = group_id * 256u;
+        uint end = min(start + 256u, uint(cols));
+        int localCount = int(end - start);
+
+        if (x < cols) {
+            sharedData[lid] = uInput.data[y * cols + x];
+            sharedIndices[lid] = uIndex.data[y * cols + x];
+        } else {
+            sharedData[lid] = ((uParam.largest != 0) ? -3.4e38 : 3.4e38);
+            sharedIndices[lid] = -1;
+        }
+        barrier();
+
+        bitonicSort(localCount);
+
+        uint num_wgx = (rows + gl_WorkGroupSize.x - 1)/gl_WorkGroupSize.x;
+        if (lid < uParam.k && lid < localCount) {
+            uint outOffset = (y * num_wgx + group_id) * uParam.k;
+            uValue.data[outOffset + lid] = sharedData[lid];
+            uIndice.data[outOffset + lid] = sharedIndices[lid];
         }
     }
 }
