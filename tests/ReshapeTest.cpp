@@ -30,6 +30,7 @@ private:
         input = std::make_shared<Tensor<float>>(input_shape_);
         input->reserveOnCPU();
         shape = std::make_shared<Tensor<int64_t>>(4);
+        shape->reserveOnCPU();
         (*shape)[0] = 1;
         (*shape)[1] = 4;
         (*shape)[2] = 8;

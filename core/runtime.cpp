@@ -287,5 +287,21 @@ void Runtime::ReadResult() {
     }
 }
 
+void Runtime::RegisterPostProcess(
+    ops::OpType &ops, std::unordered_map<std::string, std::string> &attributes,
+    std::vector<std::shared_ptr<ITensor>> &inputs,
+    std::vector<std::shared_ptr<ITensor>> &outputs) {
+
+    auto dev = m_cmdpool_->getVulkanDevice();
+
+    auto op = ops::OperatorFactory::get_instance().create(ops);
+    op->set_runtime_device(dev, m_cmdpool_);
+    op->setAttribute(attributes);
+    node_ops_.push_back(std::move(op));
+    node_attrs_.push_back(attributes);
+    node_input_tensors_.push_back(std::move(inputs));
+    node_output_tensors_.push_back(std::move(outputs));
+}
+
 } // namespace core
 } // namespace vkop

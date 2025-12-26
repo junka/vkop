@@ -58,7 +58,7 @@ private:
     void initTestdata()
     {
         std::vector<int> t = {
-            2, 100
+            3,2000
         };
         auto out_shape = t;
         input = std::make_shared<Tensor<float>>(t);
@@ -77,9 +77,6 @@ private:
         for (int i = 0; i < input->num_elements(); i++) {
             (*input)[i] = input_dist(gen);
         }
-        for (int i = 0; i < input->num_elements(); i++) {
-            printf("input %f\n", (*input)[i]);
-        }
         std::vector<std::vector<float>> probs;
         int rows = t[0];
         if (axis == 0) {
@@ -95,12 +92,10 @@ private:
         std::vector<std::vector<std::pair<int, float>>> ret;    
         ret = get_top_k_predictions(probs, k);
 
-        printf("output: %ld\n", ret.size());
         for (size_t c = 0; c < ret.size(); c++) {
             for (size_t i = 0; i < ret[c].size(); i++) {
                 (*output)[(c*k) + i] = ret[c][i].second;
                 (*indexs)[(c*k) + i] = ret[c][i].first;
-                // printf("index: %d, value: %f\n", ret[c][i].first, ret[c][i].second);
             }
         }
     }
@@ -112,7 +107,7 @@ int main() {
     Logger::getInstance().enableFileOutput("log", false);
 
     TopkTest toptest;
-    if (!toptest.run_test<float>({toptest.input}, {toptest.indexs, toptest.output},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
+    if (!toptest.run_test<float>({toptest.input}, {toptest.output, toptest.indexs},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *topk_op = dynamic_cast<Topk *>(op.get());
         if (!topk_op) {
             LOG_ERROR("Failed to cast operator to Topk");

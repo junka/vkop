@@ -20,7 +20,6 @@ using ivec4 = int[4];
 using ivec2 = int[2];
 struct alignas(16) GpuTopkParam {
     ivec4 inShape;
-    ivec4 outShape;
     int k;
     int axis;
     int largest;
@@ -72,6 +71,7 @@ class Topk : public Operator {
         }
         return passes;
     }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -96,21 +96,22 @@ class Topk : public Operator {
                 }
             }
         }
-        if (axis == 0) {
-            indice.resize(inshape[axis]);
-            for (int i = 0; i < inshape[axis]; i++) {
-                indice[i] = i;
-            }
-        } else {
-            indice.resize(inshape[axis] * inshape[0]);
-            for (int i = 0; i < inshape[0]; i++) {
-                for (int j = 0; j < inshape[axis]; j++) {
-                    indice[(i * inshape[axis]) + j] = (i * inshape[axis]) + j;
-                }
-            }
-        }
+
         auto outshape = inshape;
         outshape[axis] = k_;
+
+        auto outputvalue = core::as_tensor<float>(outputs[0]);
+        if (outputvalue->size() == 0) {
+            outputvalue->resize(outshape);
+        }
+        auto output_value = outputvalue->as_storage_buffer(m_dev_);
+
+        auto outputindex = core::as_tensor<int>(outputs[1]);
+        if (outputindex->size() == 0) {
+            outputindex->resize(outshape);
+        }
+        auto output_index = outputindex->as_storage_buffer(m_dev_);
+
         int data_size = inshape[axis];
         int round = compute_passes(data_size, k_);
         topk::GpuTopkParam param;
@@ -120,7 +121,6 @@ class Topk : public Operator {
         param.sorted = sorted_;
         for (int i = 0; i < rank; i++) {
             param.inShape[i] = inshape[i];
-            param.outShape[i] = outshape[i];
         }
 
         outshape[axis] = k_ * UP_DIV(data_size, 256);
@@ -136,18 +136,6 @@ class Topk : public Operator {
 
         tempindex2->copyToGPU(m_cmdpool_, indice.data());
 
-        auto outputindex = core::as_tensor<int>(outputs[0]);
-        if (outputindex->size() == 0) {
-            outputindex->resize(outshape);
-        }
-        auto output_index = outputindex->as_storage_buffer(m_dev_);
-
-        auto outputvalue = core::as_tensor<float>(outputs[1]);
-        if (outputvalue->size() == 0) {
-            outputvalue->resize(outshape);
-        }
-        auto output_value = outputvalue->as_storage_buffer(m_dev_);
-
         auto input = core::as_tensor<float>(inputs[0]);
         auto input_buffer = input->as_storage_buffer(m_dev_);
 
@@ -162,26 +150,29 @@ class Topk : public Operator {
         output_value_cur = tmpvalue1;
 
         int width = inshape[axis];
-
+        objs_.emplace_back(output_index_cur);
+        objs_.emplace_back(output_value_cur);
+        objs_.emplace_back(input_index_cur);
+        objs_.emplace_back(input_value_cur);
         for (int i = 0; i < round; i++) {
-            objs_.clear();
-
+            // output
             if (i == round - 1) {
-                objs_.emplace_back(output_index);
-                objs_.emplace_back(output_value);
+                objs_[0] = (output_index);
+                objs_[1] = (output_value);
             } else {
-                objs_.emplace_back(output_index_cur);
-                objs_.emplace_back(output_value_cur);
+                objs_[0] = (output_index_cur);
+                objs_[1] = (output_value_cur);
             }
-            objs_.emplace_back(input_index_cur);
-            objs_.emplace_back(input_value_cur);
+            objs_[2] = (input_index_cur);
+            objs_[3] = (input_value_cur);
+            param.inShape[axis] = width;
+            printf("width %d\n", width);
             int dispatch_width = UP_DIV(width, 256);
             if (axis == 0) {
                 submit(&param, dispatch_width, 1, 1);
             } else {
                 submit(&param, dispatch_width, inshape[0], 1);
             }
-            width = k_ * width;
 
             if (i == 0) {
                 input_value_cur = tmpvalue2;
@@ -191,6 +182,10 @@ class Topk : public Operator {
                 std::swap(input_value_cur, output_value_cur);
 
                 width = k_ * dispatch_width;
+                auto o1 = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+                auto o2 = std::dynamic_pointer_cast<VulkanBuffer>(objs_[1]);
+                o1->readBarrier(m_cmd_->get());
+                o2->readBarrier(m_cmd_->get());
             }
         }
     }

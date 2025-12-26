@@ -140,19 +140,19 @@ public:
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
                 if (sizeof(TT) == 2) {
-                    std::cout << i<< ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
+                    std::cout << i << ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
                     if (std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
                         LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
                         return false;
                     }
                 } else if (typeid(TT) == typeid(int)) {
-                    std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                    std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if ((*output)[i] != (*expect)[i]) {
                         LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
                         return false;
                     }
                 } else {
-                    std::cout << i<< ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                    std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
                         LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
                         return false;

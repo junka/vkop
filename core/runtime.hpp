@@ -12,7 +12,6 @@ namespace core {
 
 class Runtime {
   private:
-    int precision_ = 0; // 0: fp32, 1: fp16
     std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     // Model file path
@@ -57,8 +56,11 @@ class Runtime {
 
     void ReadResult();
 
-    void SetPrecision(int val) { precision_ = val; }
-    int GetPrecision() const { return precision_; }
+    void RegisterPostProcess(
+        ops::OpType &ops,
+        std::unordered_map<std::string, std::string> &attributes,
+        std::vector<std::shared_ptr<ITensor>> &inputs,
+        std::vector<std::shared_ptr<ITensor>> &outputs);
 };
 
 } // namespace core

@@ -170,8 +170,6 @@ template <typename T> class Tensor : public ITensor {
         dims_[2] = 0;
         dims_[3] = 0;
         size_ = n * sizeof(T);
-        if (!is_on_GPU())
-            reserveOnCPU();
     }
 
     // nchw
