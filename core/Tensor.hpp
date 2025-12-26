@@ -170,7 +170,8 @@ template <typename T> class Tensor : public ITensor {
         dims_[2] = 0;
         dims_[3] = 0;
         size_ = n * sizeof(T);
-        data_.resize(n);
+        if (!is_on_GPU())
+            reserveOnCPU();
     }
 
     // nchw
@@ -216,7 +217,7 @@ template <typename T> class Tensor : public ITensor {
                                     : 1;
         size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
-            data_.resize(n * c * h * w);
+            reserveOnCPU();
     }
 
     template <typename U> void resize(const std::vector<U> &dims) {
@@ -229,7 +230,7 @@ template <typename T> class Tensor : public ITensor {
             dims_[i++] = static_cast<int>(d);
         }
         if (!is_on_GPU())
-            data_.resize(size_ / sizeof(T));
+            reserveOnCPU();
     }
 
     void resize(int len) {
@@ -238,8 +239,8 @@ template <typename T> class Tensor : public ITensor {
                 vkobj_.reset();
                 vkobj_ = nullptr;
             } else {
-                data_.clear();
-                data_.shrink_to_fit();
+                data_->clear();
+                data_->shrink_to_fit();
             }
             size_ = 0;
             memset(dims_, 0, sizeof(dims_));
@@ -248,7 +249,7 @@ template <typename T> class Tensor : public ITensor {
             size_ = sizeof(T) * len;
             dims_[0] = len;
             if (!is_on_GPU())
-                data_.resize(len);
+                reserveOnCPU();
         }
     }
 
@@ -272,26 +273,26 @@ template <typename T> class Tensor : public ITensor {
      */
     Tensor &operator=(const Tensor &&) = delete;
 
-    T &operator[](std::size_t index) { return data_[index]; }
+    T &operator[](std::size_t index) { return (*data_)[index]; }
 
-    const T &operator[](std::size_t index) const { return data_[index]; }
+    const T &operator[](std::size_t index) const { return (*data_)[index]; }
 
     T &at(std::size_t index) {
-        if (index >= data_.size()) {
+        if (index >= data_->size()) {
             throw std::out_of_range("Index out of range");
         }
-        return data_[index];
+        return (*data_)[index];
     }
 
     const T &at(std::size_t index) const {
-        if (index >= data_.size()) {
+        if (index >= data_->size()) {
             throw std::out_of_range("Index out of range");
         }
-        return data_[index];
+        return (*data_)[index];
     }
     int num_elements() { return size_ / sizeof(T); }
 
-    std::vector<T> data() { return data_; }
+    std::vector<T> data() { return *data_; }
 
     std::shared_ptr<VulkanBuffer>
     as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
@@ -420,8 +421,8 @@ template <typename T> class Tensor : public ITensor {
             copyToGPUBuffer(cmdpool, data);
         }
         if (!data) {
-            data_.clear();
-            data_.shrink_to_fit();
+            data_->clear();
+            data_->shrink_to_fit();
         }
     }
 
@@ -430,7 +431,7 @@ template <typename T> class Tensor : public ITensor {
             printf("not on GPU\n");
             return;
         }
-        data_.resize(num_elements());
+        reserveOnCPU();
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyImageToCPU(cmdpool);
         } else {
@@ -439,26 +440,27 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void fillToCPU(const std::vector<T> &data) {
-        data_.resize(num_elements());
-        memcpy(data_.data(), data.data(), size_);
+        reserveOnCPU();
+        memcpy(data_->data(), data.data(), size_);
         toCPU();
     }
     void fillToCPU(const T *data) {
-        data_.resize(num_elements());
-        memcpy(data_.data(), data, size_);
+        reserveOnCPU();
+        memcpy(data_->data(), data, size_);
         toCPU();
     }
 
     // implicity fp convertor
     void fillFP32ToCPU(std::vector<float> &data) {
         if (typeid(T) == typeid(uint16_t)) {
-            data_.resize(num_elements());
+            reserveOnCPU();
             for (int i = 0; i < num_elements(); i++) {
-                data_[i] = fp32_to_fp16(data[i]);
+                (*data_)[i] = fp32_to_fp16(data[i]);
             }
+            toCPU();
         } else if (typeid(T) == typeid(float)) {
-            data_.resize(num_elements());
-            memcpy(data_.data(), data.data(), size_);
+            reserveOnCPU();
+            memcpy(data_->data(), data.data(), size_);
             toCPU();
         } else {
             throw std::runtime_error("not convertedto fp16");
@@ -466,13 +468,13 @@ template <typename T> class Tensor : public ITensor {
     }
     void fillFP32ToCPU(float *data) {
         if (typeid(T) == typeid(uint16_t)) {
-            data_.resize(num_elements());
+            reserveOnCPU();
             for (int i = 0; i < num_elements(); i++) {
-                data_[i] = fp32_to_fp16(data[i]);
+                (*data_)[i] = fp32_to_fp16(data[i]);
             }
         } else if (typeid(T) == typeid(float)) {
-            data_.resize(num_elements());
-            memcpy(data_.data(), data, size_);
+            reserveOnCPU();
+            memcpy(data_->data(), data, size_);
             toCPU();
         } else {
             throw std::runtime_error("not convertedto fp16");
@@ -480,17 +482,15 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void reserveOnCPU() {
-        if (is_on_GPU()) {
-            printf("Should not call reserveOnCPU when Tensor is on GPU");
-            return;
+        if (!data_) {
+            data_ = std::make_unique<std::vector<T>>(num_elements());
         }
-        data_.resize(num_elements());
         toCPU();
     }
 
   private:
     std::shared_ptr<VulkanResource> vkobj_;
-    std::vector<T> data_;
+    std::unique_ptr<std::vector<T>> data_;
 
     void make_vkbuff(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         if (vkobj_) {
@@ -555,7 +555,7 @@ template <typename T> class Tensor : public ITensor {
         if (src) {
             memcpy(b->ptr, src, size_);
         } else {
-            memcpy(b->ptr, data_.data(), size_);
+            memcpy(b->ptr, data_->data(), size_);
         }
 
         cmd.begin();
@@ -591,7 +591,7 @@ template <typename T> class Tensor : public ITensor {
         auto submit_value = cmd.submit(dev->getComputeQueue());
         cmd.wait(dev->getComputeQueue());
         stpool->markSubmit(submit_value);
-        std::memcpy(data_.data(), b->ptr, size_);
+        std::memcpy(data_->data(), b->ptr, size_);
         toCPU();
     }
     void copyImageToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
@@ -680,7 +680,7 @@ template <typename T> class Tensor : public ITensor {
         auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
 
-        const T *input = src ? src : data_.data();
+        const T *input = src ? src : data_->data();
 
         uint32_t row_pitch = width * 4 * sizeof(T);
         uint32_t layer_stride = batch * height * row_pitch;
@@ -762,7 +762,7 @@ template <typename T> class Tensor : public ITensor {
                                     offset = n * chan * height * width +
                                              c * height * width + h * width + w;
                                 }
-                                data_[offset] = src[k];
+                                (*data_)[offset] = src[k];
                             }
                         }
                     }
