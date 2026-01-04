@@ -11,8 +11,6 @@ namespace vkop {
 namespace ops {
 
 namespace transpose {
-using ivec4 = int[4];
-using ivec2 = int[2];
 struct GpuTransposeParam {
     ivec4 inShape;
     ivec4 outShape;

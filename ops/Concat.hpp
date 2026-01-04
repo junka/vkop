@@ -12,7 +12,6 @@ namespace ops {
 
 namespace concat {
 
-using ivec4 = int[4];
 struct ConcatParam {
     ivec4 inShape;
     ivec4 outShape;
@@ -154,7 +153,6 @@ class Concat : public Operator {
         }
     }
 
-  private:
     int axis_ = 1;
 };
 

@@ -16,9 +16,6 @@ namespace vkop {
 namespace ops {
 namespace resize {
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct GpuResizeParam {
     ivec4 inShape;
     ivec4 outShape; // N C H W
@@ -323,7 +320,6 @@ class Resize : public Operator {
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 
-  private:
     int antialias_ = 0;
     std::vector<int> axes_;
     int coordinate_transformation_mode_ = 0;

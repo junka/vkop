@@ -10,14 +10,11 @@
 
 extern unsigned char topk_spv[];
 extern unsigned int topk_spv_len;
-extern unsigned char topk2_spv[];
-extern unsigned int topk2_spv_len;
+
 namespace vkop {
 namespace ops {
 
 namespace topk {
-using ivec4 = int[4];
-using ivec2 = int[2];
 struct alignas(16) GpuTopkParam {
     ivec4 inShape;
     int k;
@@ -132,12 +129,12 @@ class Topk : public Operator {
         auto tmpvalue1 = tempvalue1->as_storage_buffer(m_dev_);
         auto tmpvalue2 = tempvalue2->as_storage_buffer(m_dev_);
         auto tmpindex1 = tempindex1->as_storage_buffer(m_dev_);
-        auto tmpindex2 = tempindex2->as_storage_buffer(m_dev_);
+        auto tmpindex2 = tempindex2->as_storage_buffer(m_dev_, m_cmd_);
 
         tempindex2->copyToGPU(m_cmdpool_, indice.data());
 
         auto input = core::as_tensor<float>(inputs[0]);
-        auto input_buffer = input->as_storage_buffer(m_dev_);
+        auto input_buffer = input->as_storage_buffer(m_dev_, m_cmd_);
 
         std::shared_ptr<VulkanResource> output_index_cur;
         std::shared_ptr<VulkanResource> output_value_cur;
@@ -166,7 +163,6 @@ class Topk : public Operator {
             objs_[2] = (input_index_cur);
             objs_[3] = (input_value_cur);
             param.inShape[axis] = width;
-            printf("width %d\n", width);
             int dispatch_width = UP_DIV(width, 256);
             if (axis == 0) {
                 submit(&param, dispatch_width, 1, 1);

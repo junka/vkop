@@ -6,16 +6,14 @@
 
 extern unsigned char softmax_spv[];
 extern unsigned int softmax_spv_len;
+extern unsigned char softmax2_spv[];
+extern unsigned int softmax2_spv_len;
 
 namespace vkop {
 namespace ops {
 namespace softmax {
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct GpuSoftMaxParam {
-    ivec4 outImgSize;
     ivec4 outShape;
     int axis; // 0: N, 1: C, 2: H, 3: W
 };
@@ -24,12 +22,21 @@ struct GpuSoftMaxParam {
 
 class Softmax : public Operator {
   public:
-    Softmax()
-        : Operator(OpType::SOFTMAX, softmax_spv, softmax_spv_len,
+    Softmax(const Softmax &) = delete;
+    Softmax &operator=(const Softmax &) = delete;
+    Softmax(Softmax &&) = delete;
+    Softmax &operator=(Softmax &&) = delete;
+    explicit Softmax(bool use_ssbo = false)
+        : Operator(OpType::SOFTMAX, use_ssbo ? softmax2_spv : softmax_spv,
+                   use_ssbo ? softmax2_spv_len : softmax_spv_len,
                    sizeof(softmax::GpuSoftMaxParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        n_imgs_ = use_ssbo ? 0 : 2;
+        if (use_ssbo) {
+            types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
+        } else {
+            types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
+        }
         objs_.reserve(types_.size());
     }
 
@@ -48,24 +55,32 @@ class Softmax : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         auto input_shape = inputs[0]->getShape();
-        if (input_shape.size() != 4) {
-            throw std::invalid_argument("Input must have 4 dimensions.");
-        }
+        int rank = inputs[0]->num_dims();
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->size() == 0) {
                 output->resize(inputs[0]->getShape());
             }
-            auto output_image = output->as_output_image(m_dev_, m_cmd_);
-            objs_.emplace_back(output_image);
+            if (types_[0] == DESCRIPTOR_TYPE_STORAGE) {
+                auto output_buffer = output->as_storage_buffer(m_dev_);
+                objs_.emplace_back(output_buffer);
+            } else {
+                auto output_image = output->as_output_image(m_dev_, m_cmd_);
+                objs_.emplace_back(output_image);
+            }
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            auto input_image = input->as_input_image(m_dev_, m_cmd_);
-
-            objs_.emplace_back(input_image);
+            if (types_[1] == DESCRIPTOR_TYPE_STORAGE) {
+                auto input_buffer = input->as_storage_buffer(m_dev_);
+                objs_.emplace_back(input_buffer);
+            } else {
+                auto input_image = input->as_input_image(m_dev_, m_cmd_);
+                objs_.emplace_back(input_image);
+            }
         });
 
         int batch = input_shape[0];
@@ -73,36 +88,47 @@ class Softmax : public Operator {
         int out_height = input_shape[2];
         int out_width = input_shape[3];
 
-        int realwidth = out_width;
         int realheight = out_height * batch;
 
         softmax::GpuSoftMaxParam para;
         // vkimage params
-        para.outImgSize[0] = realwidth;
-        para.outImgSize[1] = realheight;
-        para.outImgSize[2] = 1;
-        para.outImgSize[3] = 0;
         para.outShape[0] = batch;
         para.outShape[1] = depth;
         para.outShape[2] = out_height;
         para.outShape[3] = out_width;
+        if (axis_ < 0) {
+            axis_ = rank + axis_;
+        }
         para.axis = axis_;
 
-        if (axis_ == 0) {
-            submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
-                   UP_DIV(depth, 4));
-        } else if (axis_ == 1) {
-            submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16), batch);
-        } else if (axis_ == 2) {
-            submit(&para, UP_DIV(out_width, 16), UP_DIV(batch, 16),
-                   UP_DIV(depth, 4));
-        } else if (axis_ == 3) {
-            submit(&para, UP_DIV(out_height, 16), UP_DIV(batch, 16),
-                   UP_DIV(depth, 4));
+        if (types_[0] == DESCRIPTOR_TYPE_STORAGE) {
+            if (rank == 1) {
+                para.outShape[0] = 1;
+                para.outShape[1] = batch;
+                para.axis = 1;
+            }
+            if (para.axis == 1) {
+                submit(&para, para.outShape[0], 1, 1);
+            } else {
+                submit(&para, para.outShape[1], 1, 1);
+            }
+        } else {
+            if (axis_ == 0) {
+                submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
+                       UP_DIV(depth, 4));
+            } else if (axis_ == 1) {
+                submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+                       batch);
+            } else if (axis_ == 2) {
+                submit(&para, UP_DIV(out_width, 16), UP_DIV(batch, 16),
+                       UP_DIV(depth, 4));
+            } else if (axis_ == 3) {
+                submit(&para, UP_DIV(out_height, 16), UP_DIV(batch, 16),
+                       UP_DIV(depth, 4));
+            }
         }
     }
 
-  private:
     int axis_;
 };
 

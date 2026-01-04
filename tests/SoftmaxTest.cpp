@@ -111,10 +111,10 @@ void softmax_nd(const float* input, float* output,
 
 class SoftmaxTest : public TestCase {
 public:
-    std::vector<int> input_shape_ = {12, 15, 8, 8};
+    std::vector<int> input_shape_ = {4,1000};
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
-    int axis_ = 1;
+    int axis_ = 0;
     const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
 
     SoftmaxTest():TestCase("Softmax") {
@@ -127,50 +127,85 @@ private:
 
         std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("softmax", shapes, dim);
         std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
-        auto torch_output = torch_tensors[0];
-        auto torch_input = torch_tensors[1];
+        const auto& torch_output = torch_tensors[0];
+        const auto& torch_input = torch_tensors[1];
         std::vector<int> output_shape = std::get<1>(k);
 
-        printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+        printf("torch output size: [");
+        for (auto &s: output_shape) {
+            printf("%d, ", s);
+        }
+        printf("]\n");
 #if 1
         printf("\n===Input==============\n");
-        for (int i = 0; i < output_shape[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < output_shape[1]; j++) {
+        if (output_shape.size() == 4) {
+            for (int i = 0; i < output_shape[0]; i++) {
                 printf("[\n");
-                for (int k = 0; k < output_shape[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
-                                l;
-                        printf("%.4f, ", torch_input[idx]);
+                for (int j = 0; j < output_shape[1]; j++) {
+                    printf("[\n");
+                    for (int k = 0; k < output_shape[2]; k++) {
+                        printf("[");
+                        for (int l = 0; l < output_shape[3]; l++) {
+                            int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                    (j * output_shape[2] * output_shape[3]) +
+                                    (k * output_shape[3]) +
+                                    l;
+                            printf("%.4f, ", torch_input[idx]);
+                        }
+                        printf("],\n");
                     }
                     printf("],\n");
                 }
-                printf("],\n");
+                printf("]\n");
             }
-            printf("]\n");
+        } else if (output_shape.size() == 2) {
+            for (int i = 0; i < output_shape[0]; i++) {
+                printf("[");
+                for (int j = 0; j < output_shape[1]; j++) {
+                    int idx = (i * output_shape[1]) + j;
+                    printf("%.4f, ", torch_input[idx]);
+                }
+                printf("]\n");
+            }
+        } else if (output_shape.size() == 1) {
+            for (int i = 0; i < output_shape[0]; i++) {
+                printf("%.4f, ", torch_input[i]);
+            }
         }
 
         printf("\n===Output==============\n");
-        for (int i = 0; i < output_shape[0]; i++) {
-            for (int j = 0; j < output_shape[1]; j++) {
-                for (int k = 0; k < output_shape[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                                j * output_shape[2] * output_shape[3] +
-                                k * output_shape[3] +
-                                l;
-                        printf("%.4f, ", torch_output[idx]);
+        
+        if (output_shape.size() == 4) {
+            for (int i = 0; i < output_shape[0]; i++) {
+                for (int j = 0; j < output_shape[1]; j++) {
+                    for (int k = 0; k < output_shape[2]; k++) {
+                        printf("[");
+                        for (int l = 0; l < output_shape[3]; l++) {
+                            int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
+                                    (j * output_shape[2] * output_shape[3]) +
+                                    (k * output_shape[3]) +
+                                    l;
+                            printf("%.4f, ", torch_output[idx]);
+                        }
+                        printf("]\n");
                     }
-                    printf("]\n");
+                    printf("\n");
                 }
                 printf("\n");
             }
-            printf("\n");
+        } else if (output_shape.size() == 2) {
+            for (int i = 0; i < output_shape[0]; i++) {
+                printf("[");
+                for (int j = 0; j < output_shape[1]; j++) {
+                    int idx = (i * output_shape[1]) + j;
+                    printf("%.4f, ", torch_output[idx]);
+                }
+                printf("]\n");
+            }
+        } else if (output_shape.size() == 1) {
+            for (int i = 0; i < output_shape[0]; i++) {
+                printf("%.4f, ", torch_output[i]);
+            }
         }
 #endif
         input = std::make_shared<Tensor<float>>(input_shape_);

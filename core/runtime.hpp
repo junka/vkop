@@ -57,10 +57,10 @@ class Runtime {
     void ReadResult();
 
     void RegisterPostProcess(
-        ops::OpType &ops,
-        std::unordered_map<std::string, std::string> &attributes,
-        std::vector<std::shared_ptr<ITensor>> &inputs,
-        std::vector<std::shared_ptr<ITensor>> &outputs);
+        ops::OpType ops,
+        const std::unordered_map<std::string, std::string> &attributes,
+        const std::vector<std::shared_ptr<ITensor>> &inputs,
+        const std::vector<std::shared_ptr<ITensor>> &outputs);
 };
 
 } // namespace core

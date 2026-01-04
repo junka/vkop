@@ -18,9 +18,6 @@ enum class InterpolationMode { BILINEAR = 0, NEAREST = 1 };
 
 enum class PaddingMode { ZEROS = 0, BORDER = 1, REFLECTION = 2 };
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct alignas(32) GpuGridSampleParam {
     ivec4 outImgSize;
     ivec2 inShape;

@@ -80,6 +80,11 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         properties2.properties.limits.maxImageArrayLayers;
     this->deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", this->deviceName_.c_str());
+    if (subgroup_properties.supportedOperations &
+        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) {
+        LOG_INFO("Device support subgroup arithmetic");
+        LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
+    }
     return properties2.properties;
 }
 

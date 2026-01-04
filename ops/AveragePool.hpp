@@ -10,8 +10,6 @@ extern unsigned int averagepool_spv_len;
 namespace vkop {
 namespace ops {
 namespace averagepool {
-using ivec4 = int[4];
-using ivec2 = int[2];
 struct alignas(16) GpuAveragePoolParam {
     ivec4 inShape; // NCHW
     ivec4 outShape;

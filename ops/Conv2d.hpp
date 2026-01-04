@@ -26,9 +26,6 @@ enum class ActivationMode {
     GATE_SIGMOID,
 };
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct alignas(16) GPUConv2dParam {
     ivec4 inputSize;
     ivec4 outputSize;
@@ -279,7 +276,6 @@ class Conv2d : public Operator {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
-  private:
     std::vector<int> kernel_shape_ = {0, 0};
     std::vector<int> strides_ = {1, 1};
     std::vector<int> pads_ = {0, 0};

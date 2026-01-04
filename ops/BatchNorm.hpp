@@ -14,8 +14,6 @@ namespace vkop {
 namespace ops {
 namespace batchnorm {
 
-using ivec4 = int[4];
-
 // torch.nn.functional.batch_norm(input, running_mean, running_var, weight=None,
 //                                bias=None, training=False, momentum=0.1,
 //                                eps=1e-05)
@@ -110,7 +108,6 @@ class BatchNorm : public Operator {
                gpu_shape[2]);
     }
 
-  private:
     float eps_ = 1e-5;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 };

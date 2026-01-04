@@ -11,9 +11,6 @@ namespace vkop {
 namespace ops {
 namespace nms {
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct alignas(16) GpuNMSParam {
     ivec4 inputSize;
     ivec4 outputSize;

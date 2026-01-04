@@ -8,13 +8,9 @@ layout(binding = 0) writeonly uniform image2DArray OutputImage;
 layout(binding = 1) uniform sampler2DArray InputImage;
 
 layout(push_constant) uniform constBuffer {
-    ivec4 outImgSize;  // [W, N*H, C4, _]
-    ivec4 outShape;    // [N, C, H, W]  ← NCHW
+    ivec4 outShape;    // [N, C, H, W]
     int axis;
 } uConst;
-
-shared vec4 sharedMax[256];
-shared vec4 sharedSum[256];
 
 // Axis 0: softmax over N (batch)
 void softmax_axis0() {

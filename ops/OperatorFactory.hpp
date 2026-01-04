@@ -2,50 +2,118 @@
 #ifndef OPS_OPERATOR_FACTORY_HPP_
 #define OPS_OPERATOR_FACTORY_HPP_
 
-#include <functional>
-#include <string>
-#include <unordered_map>
-
+#include "Atan.hpp"
+#include "BatchNorm.hpp"
+#include "Erf.hpp"
+#include "Floor.hpp"
+#include "LayerNorm.hpp"
+#include "Relu.hpp"
+#include "Sigmoid.hpp"
+#include "Softplus.hpp"
 #include "ops/Operator.hpp"
+
+#include "Add.hpp"
+#include "Div.hpp"
+#include "Mul.hpp"
+#include "PRelu.hpp"
+#include "Pow.hpp"
+#include "Sub.hpp"
+
+#include "Col2Im.hpp"
+#include "Conv2d.hpp"
+#include "Gemm.hpp"
+#include "GridSample.hpp"
+#include "Matmul.hpp"
+#include "Maxpool2d.hpp"
+#include "Reduce.hpp"
+#include "Resize.hpp"
+#include "Softmax.hpp"
+
+#include "AveragePool.hpp"
+#include "Concat.hpp"
+#include "GlobalAveragePool.hpp"
+#include "Reshape.hpp"
+#include "Slice.hpp"
+#include "Split.hpp"
+#include "Topk.hpp"
+#include "Transpose.hpp"
 
 namespace vkop {
 
 namespace ops {
 
-using Creator = std::function<std::unique_ptr<Operator>()>;
+static inline std::unique_ptr<Operator>
+create_from_type(OpType type, bool use_ssbo = false) {
+    switch (type) {
+    case OpType::ADD:
+        return std::make_unique<Add>();
+    case OpType::ATAN:
+        return std::make_unique<Atan>();
+    case OpType::AVERAGEPOOL:
+        return std::make_unique<AveragePool>();
+    case OpType::BATCHNORM:
+        return std::make_unique<BatchNorm>();
+    case OpType::COL2IM:
+        return std::make_unique<Col2Im>();
+    case OpType::CONCAT:
+        return std::make_unique<Concat>();
+    case OpType::CONV2D:
+        return std::make_unique<Conv2d>();
+    case OpType::DIV:
+        return std::make_unique<Div>();
+    case OpType::ERF:
+        return std::make_unique<Erf>();
+    case OpType::FLOOR:
+        return std::make_unique<Floor>();
+    case OpType::GEMM:
+        return std::make_unique<Gemm>();
+    case OpType::GLOBALAVERAGEPOOL:
+        return std::make_unique<GlobalAveragePool>();
+    case OpType::GRIDSAMPLE:
+        return std::make_unique<GridSample>();
+    case OpType::LAYERNORM:
+        return std::make_unique<LayerNorm>();
+    case OpType::MATMUL:
+        return std::make_unique<MatMul>();
+    case OpType::MAXPOOL2D:
+        return std::make_unique<Maxpool2d>();
+    case OpType::MUL:
+        return std::make_unique<Mul>();
+    case OpType::POW:
+        return std::make_unique<Pow>();
+    case OpType::PRELU:
+        return std::make_unique<PRelu>();
+    case OpType::REDUCE:
+        return std::make_unique<Reduce>();
+    case OpType::RELU:
+        return std::make_unique<Relu>();
+    case OpType::RESHAPE:
+        return std::make_unique<Reshape>();
+    case OpType::RESIZE:
+        return std::make_unique<Resize>();
+    case OpType::SIGMOID:
+        return std::make_unique<Sigmoid>();
+    case OpType::SLICE:
+        return std::make_unique<Slice>();
+    case OpType::SOFTPLUS:
+        return std::make_unique<Softplus>();
+    case OpType::SPLIT:
+        return std::make_unique<Split>();
+    case OpType::SUB:
+        return std::make_unique<Sub>();
+    case OpType::TOPK:
+        return std::make_unique<Topk>();
+    case OpType::TRANSPOSE:
+        return std::make_unique<Transpose>();
+    case OpType::SOFTMAX:
+        return std::make_unique<Softmax>(use_ssbo);
 
-class OperatorFactory {
-  public:
-    static OperatorFactory &get_instance() {
-        static OperatorFactory instance;
-        return instance;
+    default:
+        return nullptr;
     }
-
-    void register_operator(OpType type, Creator creator) {
-        creators_[type] = std::move(creator);
-    }
-
-    std::unique_ptr<Operator> create(OpType type) const {
-        auto it = creators_.find(type);
-        if (it != creators_.end()) {
-            return it->second();
-        }
-        throw std::runtime_error("Unknown operator: " +
-                                 std::to_string(static_cast<int>(type)));
-    }
-
-  private:
-    std::unordered_map<OpType, Creator> creators_;
-};
+}
 
 } // namespace ops
 } // namespace vkop
-
-#define REGISTER_OPERATOR(type, name)                                          \
-    static bool register_##name##_dummy = []() {                               \
-        OperatorFactory::get_instance().register_operator(                     \
-            type, []() { return std::make_unique<name>(); });                  \
-        return true;                                                           \
-    }();
 
 #endif /* OPS_OPERATOR_FACTORY_HPP_ */

@@ -1,10 +1,13 @@
 // Copyright 2025 @junka
 #include "function.hpp"
 #include "core/runtime.hpp"
+
+extern "C" {
 #define STB_IMAGE_IMPLEMENTATION
 #include "include/stb_image.h"
 #define STB_IMAGE_RESIZE_IMPLEMENTATION
 #include "include/stb_image_resize2.h"
+}
 
 namespace vkop {
 namespace core {
@@ -12,8 +15,6 @@ namespace {
 const float kMean[] = {0.485F, 0.456F, 0.406F};
 const float kStdvar[] = {0.229F, 0.224F, 0.225F};
 } // namespace
-
-Function::Function() = default;
 
 void Function::preprocess_jpg(const char *input_file,
                               const std::shared_ptr<VulkanCommandPool> &cmdpool,

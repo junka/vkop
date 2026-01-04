@@ -2,7 +2,7 @@
 #ifndef OPS_MAXPOOL2D_HPP_
 #define OPS_MAXPOOL2D_HPP_
 
-#include "UnaryFactory.hpp"
+#include "ops/Operator.hpp"
 
 extern unsigned char maxpool2d_spv[];
 extern unsigned int maxpool2d_spv_len;
@@ -10,9 +10,6 @@ extern unsigned int maxpool2d_spv_len;
 namespace vkop {
 namespace ops {
 namespace maxpool2d {
-
-using ivec4 = int[4];
-using ivec2 = int[2];
 
 struct alignas(16) GpuMaxpoolParam {
     ivec4 inputSize;
@@ -190,7 +187,6 @@ class Maxpool2d : public Operator {
                UP_DIV(depth, 4));
     }
 
-  private:
     std::vector<int> kernel_shape_;
     std::vector<int> strides_;
     std::vector<int> pads_;

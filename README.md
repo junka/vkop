@@ -6,9 +6,12 @@ vkop 是一个基于 Vulkan 的实现的AI推理引擎，旨在利用GPU计算�
 ### 如何使用
 
 #### 1. 依赖安装
-首先需要安装项目的依赖项：
+首先需要安装项目的依赖项shaderc或者vulkan sdk:
 ```bash
-sudo apt install spirv-tools
+wget https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.gz
+tar xvf vulkan-sdk.tar.gz
+source path/to/VulkanSDK/setup-env.sh
+export PATH=$VULKAN_SDK/x86_64_bin:$PATH
 ```
 对于模型转换
 ```
@@ -51,18 +54,16 @@ vkop is an AI inference engine based on Vulkan, designed to provide high-perform
 #### 1. Dependency Installation
 First, install the required dependencies:
 ```bash
-sudo apt install spirv-tools
+wget https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.gz
+tar xvf vulkan-sdk.tar.gz
+source path/to/VulkanSDK/setup-env.sh
+export PATH=$VULKAN_SDK/x86_64_bin:$PATH
 ```
 
 #### 2. Environment Setup
 Set up the Vulkan ICD loader, using NVIDIA as an example:
 ```bash
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
-```
-
-Ensure you're using the correct Vulkan version:
-```bash
-source path/to/VulkanSDK/setup-env.sh
 ```
 
 #### 3. Compilation

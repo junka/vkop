@@ -124,8 +124,8 @@ void Runtime::LoadModel() {
     }
 
     for (const auto &n : model.nodes) {
-        auto t = vkop::ops::convert_opstring_to_enum(n.op_type);
-        if (t == vkop::ops::OpType::UNKNOWN) {
+        auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
+        if (type == vkop::ops::OpType::UNKNOWN) {
             // make it as input for next ops
             continue;
         }
@@ -184,8 +184,9 @@ void Runtime::LoadModel() {
                 q.push(t);
             }
         }
-
-        auto op = ops::OperatorFactory::get_instance().create(t);
+        printf("create op %s, %d\n", n.op_type.c_str(),
+               node_inputs[0]->num_dims());
+        auto op = ops::create_from_type(type);
         if (!op) {
             std::cout << "Fail to create operator" << std::endl;
             return;
@@ -288,13 +289,16 @@ void Runtime::ReadResult() {
 }
 
 void Runtime::RegisterPostProcess(
-    ops::OpType &ops, std::unordered_map<std::string, std::string> &attributes,
-    std::vector<std::shared_ptr<ITensor>> &inputs,
-    std::vector<std::shared_ptr<ITensor>> &outputs) {
+    ops::OpType ops,
+    const std::unordered_map<std::string, std::string> &attributes,
+    const std::vector<std::shared_ptr<ITensor>> &inputs,
+    const std::vector<std::shared_ptr<ITensor>> &outputs) {
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
-    auto op = ops::OperatorFactory::get_instance().create(ops);
+    printf("post create op %s, %d\n", convert_optype_to_string(ops).c_str(),
+           outputs[0]->num_dims());
+    auto op = ops::create_from_type(ops, outputs[0]->num_dims() <= 2);
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
     node_ops_.push_back(std::move(op));

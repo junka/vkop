@@ -11,9 +11,6 @@ namespace vkop {
 namespace ops {
 namespace col2im {
 
-using ivec4 = int[4];
-using ivec2 = int[2];
-
 struct alignas(16) GpuCol2ImParam {
     ivec4 outImgSize;
     ivec4 outShape;
@@ -23,15 +20,58 @@ struct alignas(16) GpuCol2ImParam {
 
 } // namespace col2im
 
-class Col2im : public Operator {
+class Col2Im : public Operator {
   public:
-    Col2im()
+    Col2Im()
         : Operator(OpType::COL2IM, col2im_spv, col2im_spv_len,
                    sizeof(col2im::GpuCol2ImParam)) {
         n_imgs_ = 2;
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
         objs_.reserve(types_.size());
+    }
+
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("dilations") != attributes.end()) {
+            std::string dila_str = attributes.at("dilations");
+            if (dila_str.find(',') != std::string::npos) {
+                dilations_ = parse_attr_list<int>(dila_str);
+            } else {
+                int d = std::stol(dila_str);
+                dilations_ = {d, d};
+            }
+        }
+        if (attributes.find("pads") != attributes.end()) {
+            std::string pads_str = attributes.at("pads");
+            if (pads_str.find(',') != std::string::npos) {
+                pads_ = parse_attr_list<int>(pads_str);
+            } else {
+                int d = std::stol(pads_str);
+                pads_ = {d, d};
+            }
+        }
+        if (attributes.find("strides") != attributes.end()) {
+            std::string strides_str = attributes.at("strides");
+            if (strides_str.find(',') != std::string::npos) {
+                strides_ = parse_attr_list<int>(strides_str);
+            } else {
+                int d = std::stol(strides_str);
+                strides_ = {d, d};
+            }
+        }
+        if (attributes.find("image_shape") != attributes.end()) {
+            std::string shape_str = attributes.at("image_shape");
+            if (shape_str.find(',') != std::string::npos) {
+                image_shape_ = parse_attr_list<int>(shape_str);
+            }
+        }
+        if (attributes.find("block_shape") != attributes.end()) {
+            std::string block_str = attributes.at("block_shape");
+            if (block_str.find(',') != std::string::npos) {
+                block_shape_ = parse_attr_list<int>(block_str);
+            }
+        }
     }
 
   private:
@@ -85,6 +125,12 @@ class Col2im : public Operator {
         submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
                UP_DIV(depth, 4));
     }
+
+    std::vector<int> dilations_;
+    std::vector<int> strides_;
+    std::vector<int> pads_;
+    std::vector<int> image_shape_;
+    std::vector<int> block_shape_;
 };
 
 } // namespace ops

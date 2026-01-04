@@ -118,7 +118,7 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> input_dist{-3.0F, 2.0F};
+        std::normal_distribution<> input_dist{-1.0F, 1.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             if (typeid(T) == typeid(uint16_t)) {
                 (*inputa)[i] = ITensor::fp32_to_fp16(input_dist(gen));

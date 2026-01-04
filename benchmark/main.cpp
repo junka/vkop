@@ -1,3 +1,4 @@
+#include "ops/Ops.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 
@@ -6,7 +7,6 @@
 #include "core/runtime.hpp"
 #include "core/function.hpp"
 
-#include <algorithm>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -14,7 +14,6 @@
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
-// using vkop::core::Tensor;
 using vkop::core::Runtime;
 
 namespace {
@@ -41,40 +40,40 @@ std::vector<std::string> load_labels(const std::string& label_path) {
 }
 
 // Function to get top-K predictions
-std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float>& probs, int k) {
-    std::vector<float> softmax_probs = probs;
+// std::vector<std::pair<int, float>> get_top_k_predictions(const std::vector<float>& probs, int k) {
+//     std::vector<float> softmax_probs = probs;
 
-    float max_val = *std::max_element(softmax_probs.begin(), softmax_probs.end());
-    float sum = 0.0F;
-    for (auto& val : softmax_probs) {
-        val = std::exp(val - max_val);
-        sum += val;
-    }
+//     float max_val = *std::max_element(softmax_probs.begin(), softmax_probs.end());
+//     float sum = 0.0F;
+//     for (auto& val : softmax_probs) {
+//         val = std::exp(val - max_val);
+//         sum += val;
+//     }
     
-    for (auto& val : softmax_probs) {
-        val /= sum;
-    }
+//     for (auto& val : softmax_probs) {
+//         val /= sum;
+//     }
 
-    std::vector<std::pair<int, float>> indexed_probs;
-    indexed_probs.reserve(softmax_probs.size());
-    for (size_t i = 0; i < softmax_probs.size(); ++i) {
-        if (softmax_probs[i] > 0.1F) {
-            indexed_probs.emplace_back(i, softmax_probs[i]);
-        }
-    }
+//     std::vector<std::pair<int, float>> indexed_probs;
+//     indexed_probs.reserve(softmax_probs.size());
+//     for (size_t i = 0; i < softmax_probs.size(); ++i) {
+//         if (softmax_probs[i] > 0.1F) {
+//             indexed_probs.emplace_back(i, softmax_probs[i]);
+//         }
+//     }
 
-    std::sort(indexed_probs.begin(),
-              indexed_probs.end(),
-              [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
-                  return a.second > b.second;
-              });
+//     std::sort(indexed_probs.begin(),
+//               indexed_probs.end(),
+//               [](const std::pair<int, float>& a, const std::pair<int, float>& b) {
+//                   return a.second > b.second;
+//               });
 
-    if (indexed_probs.size() > static_cast<size_t>(k)) {
-        indexed_probs.resize(k);
-    }
+//     if (indexed_probs.size() > static_cast<size_t>(k)) {
+//         indexed_probs.resize(k);
+//     }
 
-    return indexed_probs;
-}
+//     return indexed_probs;
+// }
 
 }
 
@@ -106,33 +105,44 @@ int main(int argc, char *argv[]) {
 
     vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
 
+    auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
+    auto shape = cls->getShape();
+    auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
+    printf("shape num %d\n", sf->num_dims());
+    rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
+
+    auto indexs = std::make_shared<vkop::core::Tensor<int>>(shape, true);
+    auto values = std::make_shared<vkop::core::Tensor<float>>(shape, true);
+    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
     double tot_lat = 0.0F;
-    int count = 1000;
+    int count = 1;
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();
         tot_lat += lat;
         std::cout << "inference time:" << lat << " ms" << std::endl;
     }
     std::cout << "avg time:" << tot_lat / count << " ms" << std::endl;
-    rt->ReadResult();
-    auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
+    // rt->ReadResult();
+    indexs->copyToCPU(cmdpool);
+    values->copyToCPU(cmdpool);
 
-    auto res = get_top_k_predictions(cls->data(), 5);
+    // auto res = get_top_k_predictions(cls->data(), 5);
+    auto d = cls->data();
     std::cout << "\nPredictions:\n";
     std::cout << std::fixed << std::setprecision(4);
     
     auto labels = load_labels(labels_file_path);
 
-    for (int i = 0; i < 5 && i < static_cast<int>(res.size()); ++i) {
-        int index = res[i].first;
-        float probability = res[i].second;
-        
+    for (int i = 0; i < 10; ++i) {
+        int index = (*indexs)[i];
+        float value = (*values)[i];
+
         std::string label = "Unknown";
         if (index < static_cast<int>(labels.size())) {
             label = labels[index];
         }
         
-        std::cout << (i + 1) << ": " << label << " (" << probability << ")\n";
+        std::cout << (i + 1) << ": " << label << " (" << value << ")\n";
     }
 
     return EXIT_SUCCESS;

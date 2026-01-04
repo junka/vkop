@@ -19,7 +19,9 @@ download models from [onnx repo](https://github.com/onnx/models/tree/main/valida
 | A2000| resnet101 | 175 | fp16 | 26.44 |
 | A2000| resnet152 | 260 | fp32 | 46.99 |
 | A2000| resnet152 | 260 | fp16 | 37.42 |
-
+| T2000| resnet18 | 41 | fp16 | 17.04 |
+| T2000| resnet34 | 73 | fp16 | 30.03 |
+| T2000| resnet50 | 90 | fp16 | 35.30 |
 
 ## 模型转换
 ```

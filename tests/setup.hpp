@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 #include "core/Tensor.hpp"
 #include "vulkan/VulkanDevice.hpp"
@@ -44,14 +45,12 @@ public:
     {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
-        if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
-            return false;
-        }
+
         LOG_INFO("%s",dev->getDeviceName().c_str());
         auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
         auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
 
-        auto op = ops::OperatorFactory::get_instance().create(vkop::ops::convert_opstring_to_enum(name_));
+        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2);
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
@@ -136,6 +135,16 @@ public:
                     printf("]\n");
                 }
                 printf("]\n");
+            } else if (oshape.size() == 1) {
+                printf("[");
+                for (int idx = 0; idx < oshape[0]; idx++) {
+                    if (sizeof(TT) == 2) {
+                        std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
+                    } else {
+                        std::cout << (*output)[idx] << ", ";
+                    }
+                }
+                printf("]\n");
             }
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
@@ -153,7 +162,7 @@ public:
                     }
                 } else {
                     std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                    if (std::fabs((*output)[i] - (*expect)[i]) > 0.02) {
+                    if (std::fabs((*output)[i] - (*expect)[i]) > 0.002) {
                         LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
                         return false;
                     }

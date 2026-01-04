@@ -13,8 +13,6 @@ namespace vkop {
 namespace ops {
 namespace layernorm {
 
-using ivec4 = int[4];
-
 // torch.nn.functional.layer_norm(input, normalized_shape, weight=None,
 // bias=None, eps=1e-05)
 
@@ -105,7 +103,6 @@ class LayerNorm : public Operator {
         }
     }
 
-  private:
     float eps_ = 1e-5;
     std::vector<int> normalized_shape_;
 };

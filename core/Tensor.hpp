@@ -17,6 +17,9 @@
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
+using ivec4 = int[4];
+using ivec2 = int[2];
+
 namespace vkop {
 namespace core {
 
@@ -69,13 +72,31 @@ class ITensor {
     }
     int get_batch() const { return (n_dims_ == 4) ? dims_[0] : 1; }
     int get_channel() const {
-        return (n_dims_ == 4) ? dims_[1] : (n_dims_ == 3 ? dims_[0] : 1);
+        if (n_dims_ == 4) {
+            return dims_[1];
+        }
+        if (n_dims_ == 3) {
+            return dims_[0];
+        }
+        return 1;
     }
     int get_height() const {
-        return (n_dims_ == 4) ? dims_[2] : (n_dims_ == 3 ? dims_[1] : dims_[0]);
+        if (n_dims_ == 4) {
+            return dims_[2];
+        }
+        if (n_dims_ == 3) {
+            return dims_[1];
+        }
+        return dims_[0];
     }
     int get_width() const {
-        return (n_dims_ == 4) ? dims_[3] : (n_dims_ == 3 ? dims_[2] : dims_[1]);
+        if (n_dims_ == 4) {
+            return dims_[3];
+        }
+        if (n_dims_ == 3) {
+            return dims_[2];
+        }
+        return dims_[1];
     }
 
     static float fp16_to_fp32(uint16_t h) {
@@ -136,7 +157,7 @@ class ITensor {
     }
 
   protected:
-    int dims_[4];
+    ivec4 dims_;
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
     uint8_t n_dims_ = 0;
@@ -209,10 +230,16 @@ template <typename T> class Tensor : public ITensor {
         dims_[1] = c;
         dims_[2] = h;
         dims_[3] = w;
-        n_dims_ = (dims_[3] != 0)   ? 4
-                  : (dims_[2] != 0) ? 3
-                  : (dims_[1] != 0) ? 2
-                                    : 1;
+        n_dims_ = 0;
+        if (dims_[3] != 0) {
+            n_dims_ = 4;
+        } else if (dims_[2] != 0) {
+            n_dims_ = 3;
+        } else if (dims_[1] != 0) {
+            n_dims_ = 2;
+        } else {
+            n_dims_ = 1;
+        }
         size_ = sizeof(T) * n * c * h * w;
         if (!is_on_GPU())
             reserveOnCPU();
@@ -292,11 +319,19 @@ template <typename T> class Tensor : public ITensor {
 
     std::vector<T> data() { return *data_; }
 
-    std::shared_ptr<VulkanBuffer>
-    as_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
+    std::shared_ptr<VulkanBuffer> as_storage_buffer(
+        std::shared_ptr<VulkanDevice> &vd,
+        const std::shared_ptr<VulkanCommandBuffer> &cmd = nullptr) {
         make_vkbuff(vd, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+
+        {
+            if (cmd) {
+                buff->readBarrier(cmd->get());
+            }
+        }
+        return buff;
     }
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {

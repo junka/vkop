@@ -10,7 +10,7 @@ extern unsigned int split_spv_len;
 namespace vkop {
 namespace ops {
 namespace split {
-using ivec4 = int[4];
+
 struct GpuSplitParam {
     ivec4 inShape;
     ivec4 outShape;

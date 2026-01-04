@@ -1,0 +1,176 @@
+#version 450 core
+#extension GL_EXT_subgroup_uniform_control_flow: require
+#extension GL_KHR_shader_subgroup_arithmetic: enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_shader_subgroup_ballot : enable
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// single workgroup
+
+layout(set=0, binding = 0) buffer valueBuffer {
+    float data[];
+} uValue;
+
+layout(set=0, binding = 1) buffer inputBuffer {
+    float data[];
+} uInput;
+
+layout(push_constant) uniform constBuffer {
+    ivec4 inShape; // N, C, H, W
+    int axis;
+} uConst;
+
+shared float sharedMax[16];   // 存每个 subgroup 的局部 max
+shared float sharedSum[16];   // 存每个 subgroup 的局部 sumExp（未调整）
+
+
+void main() {
+    uint localId = gl_LocalInvocationID.x;
+    uint groupId = gl_WorkGroupID.x;
+
+    uint subgroupSize = gl_SubgroupSize;
+    uint laneId = gl_SubgroupInvocationID;
+
+    // 计算本 workgroup 中 subgroup 的总数（向上取整）
+    uint numSubgroups = (gl_WorkGroupSize.x + subgroupSize - 1u) / subgroupSize;
+
+    int N = uConst.inShape.x;
+    int C = uConst.inShape.y;
+
+    // 辅助函数：判断当前线程是否是其所在 subgroup 的 leader lane 0
+    bool isSubgroupLeader = (laneId == 0u);
+
+    // ==============================
+    // Softmax along C (axis=1)
+    // ==============================
+    if (uConst.axis == 1) {
+        if (int(groupId) >= N) return;
+
+        // Step 1: 局部 max
+        float localMax = -1e9f;
+        for (int c = int(localId); c < C; c += int(gl_WorkGroupSize.x)) {
+            int idx = int(groupId) * C + c;
+            localMax = max(localMax, uInput.data[idx]);
+        }
+
+        // Step 2: subgroup 内归约 max
+        float sgMax = subgroupMax(localMax);
+
+        // Step 3: 每个 subgroup 的 leader 写入 shared memory
+        // 如何知道当前线程属于第几个 subgroup
+        // subgroupIndex = localId / subgroupSize
+        uint subgroupIndex = localId / subgroupSize;
+        if (isSubgroupLeader) {
+            sharedMax[subgroupIndex] = sgMax;
+        }
+        groupMemoryBarrier();
+        barrier();
+
+        // Step 4: 第一个 subgroup（subgroupIndex == 0）计算全局 max
+        float globalMax = -1e9f;
+        if (subgroupIndex == 0u) {
+            for (uint i = 0u; i < numSubgroups; ++i) {
+                globalMax = max(globalMax, sharedMax[i]);
+            }
+            sharedMax[0] = globalMax; // 存到 shared[0]
+        }
+        groupMemoryBarrier(); barrier();
+        globalMax = sharedMax[0];
+
+        // Step 5: 重新计算 exp(x - globalMax) 并求和
+        float localSum = 0.0f;
+        for (int c = int(localId); c < C; c += int(gl_WorkGroupSize.x)) {
+            int idx = int(groupId) * C + c;
+            float x = uInput.data[idx];
+            float diff = x - globalMax;
+            localSum += exp(diff);
+        }
+
+        float sgSum = subgroupAdd(localSum);
+        if (isSubgroupLeader) {
+            sharedSum[subgroupIndex] = sgSum;
+        }
+        groupMemoryBarrier(); barrier();
+
+        // Step 6: subgroup 0 计算全局 sum
+        float globalSum = 0.0f;
+        if (subgroupIndex == 0u) {
+            for (uint i = 0u; i < numSubgroups; ++i) {
+                globalSum += sharedSum[i];
+            }
+            sharedSum[0] = globalSum;
+        }
+        groupMemoryBarrier(); barrier();
+        globalSum = sharedSum[0];
+
+        // Step 7: 写回
+        for (int c = int(localId); c < C; c += int(gl_WorkGroupSize.x)) {
+            int idx = int(groupId) * C + c;
+            float x = uInput.data[idx];
+            float diff = x - globalMax;
+            uValue.data[idx] = exp(diff) / globalSum;
+        }
+    }
+    // ==============================
+    // Softmax along N (axis=0)
+    // ==============================
+    else if (uConst.axis == 0) {
+        if (int(groupId) >= C) return;
+
+        int col = int(groupId);
+        float localMax = -1e9f;
+        for (int n = int(localId); n < N; n += int(gl_WorkGroupSize.x)) {
+            int idx = n * C + col;
+            localMax = max(localMax, uInput.data[idx]);
+        }
+
+        float sgMax = subgroupMax(localMax);
+        uint subgroupIndex = localId / subgroupSize;
+        if (isSubgroupLeader) {
+            sharedMax[subgroupIndex] = sgMax;
+        }
+        groupMemoryBarrier(); barrier();
+
+        float globalMax = -1e9f;
+        if (subgroupIndex == 0u) {
+            for (uint i = 0u; i < numSubgroups; ++i) {
+                globalMax = max(globalMax, sharedMax[i]);
+            }
+            sharedMax[0] = globalMax;
+        }
+        groupMemoryBarrier(); barrier();
+        globalMax = sharedMax[0];
+
+        float localSum = 0.0f;
+        for (int n = int(localId); n < N; n += int(gl_WorkGroupSize.x)) {
+            int idx = n * C + col;
+            float x = uInput.data[idx];
+            float diff = x - globalMax;
+            localSum += exp(diff);
+        }
+
+        float sgSum = subgroupAdd(localSum);
+        if (isSubgroupLeader) {
+            sharedSum[subgroupIndex] = sgSum;
+        }
+        groupMemoryBarrier(); barrier();
+
+        float globalSum = 0.0f;
+        if (subgroupIndex == 0u) {
+            for (uint i = 0u; i < numSubgroups; ++i) {
+                globalSum += sharedSum[i];
+            }
+            sharedSum[0] = globalSum;
+        }
+        groupMemoryBarrier(); barrier();
+        globalSum = sharedSum[0];
+
+        for (int n = int(localId); n < N; n += int(gl_WorkGroupSize.x)) {
+            int idx = n * C + col;
+            float x = uInput.data[idx];
+            float diff = x - globalMax;
+            uValue.data[idx] = exp(diff) / globalSum;
+        }
+    }
+}

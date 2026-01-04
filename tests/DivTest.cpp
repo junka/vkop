@@ -36,8 +36,8 @@ private:
         std::random_device rd{};
         std::mt19937 gen{rd()};
         gen.seed(1024);
-        std::normal_distribution<> inputa_dist{0.2F, 3.0F};
-        std::normal_distribution<> inputb_dist{2.0F, 4.0F};
+        std::normal_distribution<> inputa_dist{2.F, 1.6F};
+        std::normal_distribution<> inputb_dist{1.0F, 1.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             (*inputa)[i] = inputa_dist(gen);
             (*inputb)[i] = inputa_dist(gen);

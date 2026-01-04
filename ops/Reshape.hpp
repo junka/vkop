@@ -13,8 +13,6 @@ namespace vkop {
 namespace ops {
 
 namespace reshape {
-using ivec4 = int[4];
-using ivec2 = int[2];
 struct GpuReshapeParam {
     ivec4 inImgSize;
     ivec4 outImgSize;
@@ -56,7 +54,7 @@ class Reshape : public Operator {
             dim[i] = (*shape)[i];
         }
         auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
-                                     std::multiplies<int>());
+                                     std::multiplies<>());
         for (int i = 0; i < n; i++) {
             if (!allowzero_ && dim[i] == 0) {
                 dim[i] = inshape[i];
@@ -159,16 +157,16 @@ class Reshape : public Operator {
             return;
         }
 
-        auto outGPUshape = outputs[0]->getGPUShape();
-        auto inGPUshape = inputs[0]->getGPUShape();
+        auto out_gpu_shape = outputs[0]->getGPUShape();
+        auto in_gpu_shape = inputs[0]->getGPUShape();
         reshape::GpuReshapeParam param;
-        param.inImgSize[0] = inGPUshape[0];
-        param.inImgSize[1] = inGPUshape[1];
-        param.inImgSize[2] = inGPUshape[2];
+        param.inImgSize[0] = in_gpu_shape[0];
+        param.inImgSize[1] = in_gpu_shape[1];
+        param.inImgSize[2] = in_gpu_shape[2];
         param.inImgSize[3] = 1;
-        param.outImgSize[0] = outGPUshape[0];
-        param.outImgSize[1] = outGPUshape[1];
-        param.outImgSize[2] = outGPUshape[2];
+        param.outImgSize[0] = out_gpu_shape[0];
+        param.outImgSize[1] = out_gpu_shape[1];
+        param.outImgSize[2] = out_gpu_shape[2];
         param.outImgSize[3] = 1;
         if (inshape.size() == 4) {
             param.inShape[0] = inshape[0];
@@ -192,8 +190,8 @@ class Reshape : public Operator {
             param.outShape[2] = dim[1];
             param.outShape[3] = dim[2];
         }
-        submit(&param, UP_DIV(outGPUshape[0], 16), UP_DIV(outGPUshape[1], 16),
-               outGPUshape[2]);
+        submit(&param, UP_DIV(out_gpu_shape[0], 16),
+               UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 
     int allowzero_ = 0;
