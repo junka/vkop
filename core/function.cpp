@@ -49,5 +49,40 @@ void Function::preprocess_jpg(const char *input_file,
     normalized_data.shrink_to_fit();
 }
 
+std::vector<std::pair<int, float>>
+Function::get_top_k_predictions(const std::vector<float> &probs, int k) {
+    std::vector<float> softmax_probs = probs;
+
+    float max_val =
+        *std::max_element(softmax_probs.begin(), softmax_probs.end());
+    float sum = 0.0F;
+    for (auto &val : softmax_probs) {
+        val = std::exp(val - max_val);
+        sum += val;
+    }
+
+    for (auto &val : softmax_probs) {
+        val /= sum;
+    }
+
+    std::vector<std::pair<int, float>> indexed_probs;
+    indexed_probs.reserve(softmax_probs.size());
+    for (size_t i = 0; i < softmax_probs.size(); ++i) {
+        indexed_probs.emplace_back(i, softmax_probs[i]);
+    }
+
+    std::sort(
+        indexed_probs.begin(), indexed_probs.end(),
+        [](const std::pair<int, float> &a, const std::pair<int, float> &b) {
+            return a.second > b.second;
+        });
+
+    if (indexed_probs.size() > static_cast<size_t>(k)) {
+        indexed_probs.resize(k);
+    }
+
+    return indexed_probs;
+}
+
 } // namespace core
 } // namespace vkop

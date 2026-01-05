@@ -36,8 +36,8 @@ class Function {
                    const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    const std::shared_ptr<core::ITensor> &input);
 
-  private:
-    // int forward();
+    static std::vector<std::pair<int, float>>
+    get_top_k_predictions(const std::vector<float> &probs, int k);
 };
 
 } // namespace core

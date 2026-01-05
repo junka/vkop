@@ -12,6 +12,7 @@ namespace core {
 
 class Runtime {
   private:
+    int id_ = 0;
     std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     // Model file path
@@ -23,6 +24,7 @@ class Runtime {
     // Input and output tensors mapping by name
     std::unordered_map<std::string, std::shared_ptr<ITensor>> inputs_;
     std::unordered_map<std::string, std::shared_ptr<ITensor>> outputs_;
+    std::unordered_map<std::string, std::shared_ptr<ITensor>> real_outputs_;
     // Initializer tensors
     std::unordered_map<std::string, std::shared_ptr<ITensor>> initializers_;
 

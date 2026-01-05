@@ -4,9 +4,12 @@
 #include <queue>
 
 #include "core/runtime.hpp"
+#include "include/logger.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
+#include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanQueryPool.hpp"
 
 namespace vkop {
 namespace core {
@@ -33,7 +36,7 @@ void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    model.dump_model();
+    // model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
@@ -66,6 +69,7 @@ void Runtime::LoadModel() {
         t->set_ref_cnt_forever();
         outputs_[o.name] = t;
         tensor_map[o.name] = t;
+        real_outputs_[o.name] = t;
     }
 
     auto handle_floating_point_tensor = [&](const load::Initializer &init,
@@ -184,8 +188,6 @@ void Runtime::LoadModel() {
                 q.push(t);
             }
         }
-        printf("create op %s, %d\n", n.op_type.c_str(),
-               node_inputs[0]->num_dims());
         auto op = ops::create_from_type(type);
         if (!op) {
             std::cout << "Fail to create operator" << std::endl;
@@ -242,33 +244,23 @@ std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
 
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
-    static int id = 0;
-    // for (auto &p : inputs_) {
-    //     if (p.second->dtype() == typeid(float)) {
-    //         auto t = vkop::core::as_tensor<float>(p.second);
-    //         t->copyToGPU(m_cmdpool_);
-    //     } else if (p.second->dtype() == typeid(uint16_t)) {
-    //         auto t = vkop::core::as_tensor<uint16_t>(p.second);
-    //         t->copyToGPU(m_cmdpool_);
-    //     }
-    // }
     auto start = std::chrono::steady_clock::now();
-    m_cmds_[id]->wait(dev->getComputeQueue(id));
-    m_cmds_[id]->begin();
+    m_cmds_[id_]->wait(dev->getComputeQueue(id_));
+    m_cmds_[id_]->begin();
 #ifdef USE_MEASURE_TIME
     VulkanQueryPool query_pool(dev->getLogicalDevice(), 2,
                                VK_QUERY_TYPE_TIMESTAMP);
-    query_pool.begin(m_cmds_[id]->get());
+    query_pool.begin(m_cmds_[id_]->get());
 #endif
     for (size_t i = 0; i < node_ops_.size(); ++i) {
         node_ops_[i]->onExecute(node_input_tensors_[i], node_output_tensors_[i],
-                                m_cmds_[id], id);
+                                m_cmds_[id_], id_);
     }
 #ifdef USE_MEASURE_TIME
-    query_pool.end(m_cmds_[id]->get());
+    query_pool.end(m_cmds_[id_]->get());
 #endif
-    m_cmds_[id]->end();
-    m_cmds_[id]->submit(dev->getComputeQueue(id));
+    m_cmds_[id_]->end();
+    m_cmds_[id_]->submit(dev->getComputeQueue(id_));
 #ifdef USE_MEASURE_TIME
     auto r = query_pool.getResults();
     LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
@@ -276,15 +268,26 @@ double Runtime::Run() {
 #endif
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    id++;
-    id %= vkop::kInflight;
+    id_++;
+    id_ %= vkop::kInflight;
     return elapsed.count() * 1000.0F;
 }
 
 void Runtime::ReadResult() {
-    for (auto &p : outputs_) {
-        auto t = vkop::core::as_tensor<float>(p.second);
-        t->copyToCPU(m_cmdpool_);
+    auto dev = m_cmdpool_->getVulkanDevice();
+    for (int i = 0; i < vkop::kInflight; ++i) {
+        m_cmds_[i]->wait(dev->getComputeQueue(i));
+    }
+    for (auto &p : real_outputs_) {
+        if (p.second->dtype() == typeid(float)) {
+            auto t = vkop::core::as_tensor<float>(p.second);
+            t->copyToCPU(m_cmdpool_);
+        } else if (p.second->dtype() == typeid(int)) {
+            auto t = vkop::core::as_tensor<int>(p.second);
+            t->copyToCPU(m_cmdpool_);
+        } else {
+            assert(false);
+        }
     }
 }
 
@@ -296,8 +299,6 @@ void Runtime::RegisterPostProcess(
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
-    printf("post create op %s, %d\n", convert_optype_to_string(ops).c_str(),
-           outputs[0]->num_dims());
     auto op = ops::create_from_type(ops, outputs[0]->num_dims() <= 2);
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
@@ -305,6 +306,11 @@ void Runtime::RegisterPostProcess(
     node_attrs_.push_back(attributes);
     node_input_tensors_.push_back(std::move(inputs));
     node_output_tensors_.push_back(std::move(outputs));
+    real_outputs_.clear();
+    for (size_t i = 0; i < outputs.size(); ++i) {
+        real_outputs_["post_" + convert_optype_to_string(ops) +
+                      std::to_string(i)] = outputs[i];
+    }
 }
 
 } // namespace core

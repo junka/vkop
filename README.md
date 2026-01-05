@@ -1,7 +1,7 @@
 
 ### 项目介绍
 
-vkop 是一个基于 Vulkan 的实现的AI推理引擎，旨在利用GPU计算功能。
+vkop 是一个基于 Vulkan 的实现的AI推理引擎，简化运行时逻辑。
 
 ### 如何使用
 
@@ -41,7 +41,10 @@ cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALID
 ```
 
 #### 4. 运行程序
-(此处需要补充具体的运行方法)
+```
+./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
+```
+支持将postproc 手动注册到gpu 处理，比如softmax，topk减少内存带宽
 
 ---
 

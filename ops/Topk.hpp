@@ -120,6 +120,7 @@ class Topk : public Operator {
             param.inShape[i] = inshape[i];
         }
 
+        // FIXME, temp tensor should be reserved and release outside of this op
         outshape[axis] = k_ * UP_DIV(data_size, 256);
         auto tempvalue1 = std::make_shared<core::Tensor<float>>(outshape);
         auto tempvalue2 = std::make_shared<core::Tensor<float>>(outshape);
