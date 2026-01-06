@@ -289,9 +289,6 @@ class Conv2d : public Operator {
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
         para.accuracy = accuracy;
-        // printf("transpose: %d, pack %d, accuracy %d: [%d, %d, %d, %d]\n",
-        //        para.transpose, para.pack, para.accuracy, weight_shape[0],
-        //        weight_shape[1], weight_shape[2], weight_shape[3]);
 
         para.fuse_bn = fuse_bn_;
         para.eps = eps_;

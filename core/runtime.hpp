@@ -46,13 +46,13 @@ class Runtime {
     void LoadModel();
 
     // Get input tensor by name
-    std::shared_ptr<ITensor> GetInput(const std::string &name = "");
+    std::shared_ptr<ITensor> GetInput(const std::string &name = "") const;
 
     // Get output tensor by name
-    std::shared_ptr<ITensor> GetOutput(const std::string &name = "");
+    std::shared_ptr<ITensor> GetOutput(const std::string &name = "") const;
 
     // Get initializer tensor by name, for test only
-    std::shared_ptr<ITensor> GetInitializer(const std::string &name);
+    std::shared_ptr<ITensor> GetInitializer(const std::string &name) const;
 
     double Run();
 

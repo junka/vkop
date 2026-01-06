@@ -4,13 +4,14 @@
 #include <queue>
 
 #include "core/runtime.hpp"
-#include "include/logger.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"
+#ifdef USE_MEASURE_TIME
+#include "include/logger.hpp"
 #include "vulkan/VulkanQueryPool.hpp"
-
+#endif
 namespace vkop {
 namespace core {
 
@@ -55,7 +56,7 @@ void Runtime::LoadModel() {
         t->set_ref_cnt_forever();
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
-        t->as_input_image(dev, nullptr, false);
+        t->as_input_image(dev, nullptr);
     }
 
     for (const auto &o : model.outputs) {
@@ -202,7 +203,7 @@ void Runtime::LoadModel() {
     }
 }
 
-std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) {
+std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
     if (name.empty() && inputs_.size() > 1) {
         throw std::runtime_error(
             "Input name is empty but there are multiple inputs");
@@ -217,7 +218,7 @@ std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) {
     return it->second;
 }
 
-std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) {
+std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) const {
     if (name.empty() && inputs_.size() > 1) {
         throw std::runtime_error(
             "Output name is empty but there are multiple outputs");
@@ -232,7 +233,8 @@ std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) {
     return it->second;
 }
 
-std::shared_ptr<ITensor> Runtime::GetInitializer(const std::string &name) {
+std::shared_ptr<ITensor>
+Runtime::GetInitializer(const std::string &name) const {
     auto it = initializers_.find(name);
     if (it == initializers_.end()) {
         return nullptr;

@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <memory>
 #include <random>
 #include <vector>
 #include <cmath>
@@ -27,7 +28,7 @@ public:
     std::vector<float> expectedOutput;
 
     ModelTest() = default;
-    void initTestData(const std::shared_ptr<Tensor<float>>& ta, const std::shared_ptr<Tensor<float>>& tb) {
+    void initTestData(const std::shared_ptr<Tensor<T>>& ta, const std::shared_ptr<Tensor<T>>& tb) {
         expectedOutput.resize(ta->num_elements());
         ta->reserveOnCPU();
         tb->reserveOnCPU();
@@ -40,14 +41,19 @@ public:
         for (int i = 0; i < ta->num_elements(); i++) {
             auto a = inputa_dist(gen);
             auto b = inputb_dist(gen);
-            (*ta)[i] = a;
-            (*tb)[i] = b;
+            if (typeid(T) == typeid(uint16_t)) {
+                (*ta)[i] = ITensor::fp32_to_fp16(a);
+                (*tb)[i] = ITensor::fp32_to_fp16(b);
+            } else if (typeid(T) == typeid(float)) {
+                (*ta)[i] = a;
+                (*tb)[i] = b;
+            }
             expectedOutput[i] = a+b;
         }
     }
 
-    void reference_conv2d(const float* input, const std::shared_ptr<Tensor<T>>& weight,
-        const std::shared_ptr<Tensor<T>>& bias, std::vector<float>& output, int batch, int ic, int oc,
+    void reference_conv2d(const float* input, const std::shared_ptr<Tensor<float>>& weight,
+        const std::shared_ptr<Tensor<float>>& bias, std::vector<float>& output, int batch, int ic, int oc,
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
         int dilation_h, int dilation_w, int group) {
         // 计算输出张量的高度和宽度
@@ -91,20 +97,12 @@ public:
 
                                     // 检查索引是否在输入张量范围内
                                     if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
-                                        // if (typeid(T) == typeid(float)) {
-                                            x_value = input[((((b * ic + sz) * ih + iy) * iw) + ix)];
-                                        // } else if (typeid(T) == typeid(uint16_t)) {
-                                        //     x_value = vkop::core::ITensor::fp16_to_fp32(input[((((b * ic + sz) * ih + iy) * iw) + ix)]);
-                                        // }
+                                        x_value = input[((((b * ic + sz) * ih + iy) * iw) + ix)];
                                     }
 
                                     // 获取卷积核的值
                                     float y_value = 0.F;
-                                    if (typeid(T) == typeid(float)) {
-                                        y_value = (*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx];
-                                    } else {
-                                        y_value = vkop::core::ITensor::fp16_to_fp32((*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx]);
-                                    }
+                                    y_value = (*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx];
 
                                     // 累加卷积结果
                                     sum += x_value * y_value;
@@ -115,11 +113,7 @@ public:
                         // 将卷积结果加上偏置并存储到输出张量
                         // 计算输出张量的偏移量
                         auto dest_offset = (((b * oc + oz) * oh + oy) * ow) + ox;
-                        if (typeid(T) == typeid(float)) {
-                            output.at(dest_offset) = sum + (*bias)[oz];
-                        } else if (typeid(T) == typeid(uint16_t)) {
-                            output.at(dest_offset) = sum + vkop::core::ITensor::fp16_to_fp32((*bias)[oz]);
-                        }
+                        output.at(dest_offset) = sum + (*bias)[oz];
                     }
                 }
             }
@@ -147,8 +141,8 @@ int main() {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 
-    auto t1 = vkop::core::as_tensor<float>(rt->GetInput("input_x1"));
-    auto t2 = vkop::core::as_tensor<float>(rt->GetInput("input_x2"));
+    auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
+    auto t2 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x2"));
 
     ModelTest<uint16_t> test;
     test.initTestData(t1, t2);
@@ -156,13 +150,50 @@ int main() {
     t2->copyToGPU(cmdpool);
     rt->Run();
     rt->ReadResult();
-    auto bias = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.bias"));
-    auto weight = vkop::core::as_tensor<uint16_t>(rt->GetInitializer("conv.weight"));
+    auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
+    auto weight = vkop::core::as_tensor<int8_t>(rt->GetInitializer("conv.weight"));
+    auto scale = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight_scale"));
     auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
     std::vector<float> ref_output_data;
     bias->copyToCPU(cmdpool);
     weight->copyToCPU(cmdpool);
-
+    scale->copyToCPU(cmdpool);
+    auto ori_weight = std::make_shared<Tensor<float>>(weight->getShape());
+    ori_weight->reserveOnCPU();
+    auto weight_shape = weight->getShape();
+    for (int i = 0; i < weight_shape[0]; ++i) {
+        for (int j = 0; j < weight_shape[1] * weight_shape[2] * weight_shape[3]; ++j) {
+            ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j) = 
+                static_cast<float>(weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j)) * scale->at(i);
+        }
+    }
+#if 0
+    printf("Scale is:\n");
+    for (int i = 0 ; i < weight_shape[0]; ++i) {
+        printf("%f, ", scale->at(i));
+    }
+    printf("\n");
+    for (int i = 0; i < weight_shape[0]; ++i) {
+        printf("[");
+        for (int j = 0; j < weight_shape[1]; ++j) {
+            printf("[");
+            for (int k = 0; k < weight_shape[2]; ++k) {
+                printf("[");
+                for (int l = 0; l < weight_shape[3]; ++l) {
+                    printf("%d, ", weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + (j * weight_shape[2] * weight_shape[3]) + (k * weight_shape[3]) + l));
+                }
+                printf("]");
+            }
+            printf("]\n");
+        }
+        printf("]\n");
+    }
+    printf("bias is:\n");
+    for (int i = 0; i < bias->getShape()[0]; ++i) {
+        printf("%f, ", bias->at(i));
+    }
+    printf("\n");
+#endif
     int batch = t1->getShape()[0];
     int ic = t1->getShape()[1];
     int ih = t1->getShape()[2];
@@ -177,9 +208,10 @@ int main() {
     int dilation_h = 1;
     int dilation_w = 1;
     int group = 1;
-    test.reference_conv2d(test.expectedOutput.data(), weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
+    test.reference_conv2d(test.expectedOutput.data(), ori_weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
     for (int i = 0; i < result->num_elements(); ++i) {
-        if (std::fabs(result->at(i) - ref_output_data[i]) > 1e-5) {
+        // std::cout << result->at(i) << "," << ref_output_data[i] << std::endl;
+        if (std::isnan(result->at(i)) || std::fabs(result->at(i) - ref_output_data[i]) > 1e-2) {
             printf("Failed at %d, %.3f vs %.3f\n", i, result->at(i), ref_output_data[i]);
             return 1;
         }
