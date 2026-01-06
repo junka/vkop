@@ -10,6 +10,7 @@ import onnxoptimizer as optimizer
 from onnxsim import simplify
 from collections import defaultdict, deque
 from typing import List, Dict, Set, Tuple, Optional
+import argparse
 
 
 class VkModel:
@@ -909,6 +910,7 @@ def quantize_to_fp16_selective(vk_model):
         should_quantize = False
         reason = ""
 
+        arr = numpy_helper.to_array(initializer)
         if any(op in safe_weight_operators for op in consumer_ops):
             # This initializer is consumed by operators known to be safe for FP16
             should_quantize = True
@@ -923,14 +925,26 @@ def quantize_to_fp16_selective(vk_model):
             reason = f"consumed by sensitive operators {consumer_ops}"
         else:
             # Default behavior - check size (small tensors might be sensitive)
-            arr = numpy_helper.to_array(initializer)
-            if arr.size > 100:  # Arbitrary threshold - larger tensors are usually weights
-                should_quantize = True
-                reason = f"large tensor ({arr.size} elements)"
-            else:
-                should_quantize = False
-                reason = f"small tensor ({arr.size} elements)"
-
+            should_quantize = False
+            reason = f"small tensor ({arr.size} elements)"
+        # if len(arr.shape) == 1:  # Common bias tensor characteristics
+        #     # Check if it's connected to a bias input in operations like Conv, Gemm, etc.
+        #     is_bias = False
+        #     for node in consumers:
+        #         op_type = node['op_type']
+        #         if op_type in ['Conv', 'ConvTranspose']:
+        #             # Check if this tensor is the bias input (usually the 3rd input for Conv, 2nd for Gemm)
+        #             for idx, inp in enumerate(node['inputs']):
+        #                 if inp['name'] == name:
+        #                     # For Conv: 0=inputs, 1=weights, 2=bias
+        #                     if (op_type == 'Conv' and idx == 2) or \
+        #                        (op_type == 'ConvTranspose' and idx == 2):
+        #                         is_bias = True
+        #                         break
+        #     if is_bias:
+        #         print(f"Preserving bias tensor '{name}' as FP32")
+        #         skipped_count += 1
+        #         should_quantize = False
         if should_quantize:
             # Convert to numpy array
             arr = numpy_helper.to_array(initializer)
@@ -947,11 +961,308 @@ def quantize_to_fp16_selective(vk_model):
             print(f"New shape: {fp16_initializer.dims}")
             converted_count += 1
         else:
-            print(f"Preserving FP32 tensor '{name}' ({reason})")
             skipped_count += 1
 
     print(f"Converted {converted_count} FP32 tensors to FP16")
     print(f"Preserved {skipped_count} tensors")
+
+def quantize_to_int8_weight_only(vk_model):
+    """
+    Quantize model weights to INT8 using weight-only quantization.
+    This function converts appropriate FP32 initializers to INT8, preserving scale information.
+
+    For each tensor that is quantized:
+    - The original FP32 weights are quantized to INT8
+    - A scale tensor is created and stored as a separate initializer
+    - The scale is calculated per-channel or per-tensor depending on tensor size
+
+    Generally safe to convert:
+    - Convolution weights
+    - Gemm/Linear weights
+    - Recurrent weights
+    """
+    print("Applying weight-only INT8 quantization...")
+
+    converted_count = 0
+    skipped_count = 0
+
+    # Build mapping from initializer names to their consumers
+    initializer_consumers = defaultdict(list)
+    for node in vk_model.nodes:
+        for inp in node['inputs']:
+            initializer_consumers[inp['name']].append(node)
+
+    # Data types that should remain unchanged
+    preserve_types = {
+        onnx.TensorProto.UINT8,
+        onnx.TensorProto.INT8,
+        onnx.TensorProto.UINT16,
+        onnx.TensorProto.INT16,
+        onnx.TensorProto.INT32,
+        onnx.TensorProto.INT64,
+        onnx.TensorProto.UINT32,
+        onnx.TensorProto.UINT64,
+        onnx.TensorProto.BOOL
+    }
+
+    # Operators whose weights are usually safe to quantize to INT8
+    safe_weight_operators = {
+        'Conv', 'MatMul', 'ConvTranspose',
+        'LSTM', 'GRU', 'RNN'
+    }
+
+    # Parameters that are usually sensitive to INT8 quantization
+    sensitive_parameters = {
+        'BatchNormalization', 'LayerNormalization', 'GroupNormalization'
+    }
+
+    # Get a list of keys to iterate over, to avoid modifying the dict during iteration
+    initializers_keys = list(vk_model.initializers.keys())
+    
+    for name in initializers_keys:
+        initializer = vk_model.initializers[name]
+        
+        # Skip non-FP32 tensors
+        if initializer.data_type != onnx.TensorProto.FLOAT:
+            if initializer.data_type in preserve_types:
+                print(f"Preserving {onnx.TensorProto.DataType.Name(initializer.data_type)} tensor '{name}'")
+            elif initializer.data_type == onnx.TensorProto.FLOAT16:
+                print(f"Skipping already FP16 tensor '{name}'")
+            else:
+                data_type_name = onnx.TensorProto.DataType.Name(initializer.data_type) if initializer.data_type <= 16 else "UNKNOWN"
+                print(f"Preserving {data_type_name} tensor '{name}' (type: {initializer.data_type})")
+            skipped_count += 1
+            continue
+
+        # Check who consumes this initializer
+        consumers = initializer_consumers.get(name, [])
+        consumer_ops = {node['op_type'] for node in consumers}
+
+        # Determine if this initializer should be quantized
+        should_quantize = False
+        reason = ""
+
+        if any(op in safe_weight_operators for op in consumer_ops):
+            # This initializer is consumed by operators known to be safe for INT8 quantization
+            should_quantize = True
+            reason = f"consumed by safe operators {consumer_ops}"
+        elif not consumers:
+            # Orphaned initializer - better to preserve
+            should_quantize = False
+            reason = "no consumers"
+        elif any(op in sensitive_parameters for op in consumer_ops):
+            # Consumed by sensitive operators like BatchNormalization
+            should_quantize = False
+            reason = f"consumed by sensitive operators {consumer_ops}"
+        else:
+            # Default behavior - check size (small tensors might be sensitive)
+            should_quantize = False
+        # Additional check: skip bias tensors
+        # Bias tensors are typically 1D and have small sizes
+        arr = numpy_helper.to_array(initializer)
+        if len(arr.shape) == 1:  # Common bias tensor characteristics
+            # Check if it's connected to a bias input in operations like Conv, Gemm, etc.
+            is_bias = False
+            for node in consumers:
+                op_type = node['op_type']
+                if op_type in ['Conv', 'ConvTranspose']:
+                    # Check if this tensor is the bias input (usually the 3rd input for Conv, 2nd for Gemm)
+                    for idx, inp in enumerate(node['inputs']):
+                        if inp['name'] == name:
+                            # For Conv: 0=inputs, 1=weights, 2=bias
+                            if (op_type == 'Conv' and idx == 2) or \
+                               (op_type == 'ConvTranspose' and idx == 2):
+                                is_bias = True
+                                break
+            if is_bias:
+                print(f"Preserving bias tensor '{name}' as FP32")
+                skipped_count += 1
+                should_quantize = False
+        if should_quantize:
+            # Convert to numpy array
+            arr = numpy_helper.to_array(initializer)
+            original_fp32 = arr.copy()
+
+            # Determine quantization axis based on operator type and tensor shape
+            axis = None
+            if len(arr.shape) >= 2:
+                # For multi-dimensional weights, use operator-specific quantization axis
+                for op in consumer_ops:
+                    if op == 'Conv':
+                        # Conv weights: [C_out, C_in, K, K] - quantize per output channel
+                        # Reduce along (C_in, K, K) dimensions -> axis=(1, 2, 3)
+                        if len(arr.shape) == 4:
+                            axis = (1, 2, 3)
+                        elif len(arr.shape) == 3:
+                            axis = (1, 2)
+                        else:
+                            axis = 0
+                        break
+                    elif op == 'ConvTranspose':
+                        # ConvTranspose weights: [C_in, C_out, K, K] - quantize per output channel
+                        # Reduce along (C_in, K, K) dimensions -> axis=(0, 2, 3)
+                        if len(arr.shape) == 4:
+                            axis = (0, 2, 3)
+                        else:
+                            # For other shapes, default to axis=1
+                            axis = 1
+                        break
+                    elif op == 'Gemm':
+                        # Gemm weights: [out, in] - quantize per output dimension
+                        # Reduce along in dimension -> axis=1
+                        if len(arr.shape) == 2:
+                            axis = 1
+                        else:
+                            # For other shapes, default to axis=0
+                            axis = 0
+                        break
+                    elif op == 'MatMul':
+                        # MatMul weights: typically [in, out] - quantize per output dimension
+                        # Reduce along in dimension -> axis=0
+                        if len(arr.shape) == 2:
+                            axis = 0
+                        else:
+                            # For other shapes, default to axis=1
+                            axis = 1
+                        break
+                    elif op in ['LSTM', 'GRU']:
+                        # LSTM/GRU weights: [D, 4H, I] or [D, 4H, H] - quantize per output dimension
+                        # Reduce along I or H dimension -> axis=2
+                        if len(arr.shape) == 3:
+                            axis = 2
+                        else:
+                            # For other shapes, default to axis=0
+                            axis = 0
+                        break
+                    else:
+                        # Default to axis=0 for other operators
+                        axis = 0
+            else:
+                # For 1D or smaller tensors, use per-tensor quantization
+                axis = None
+
+            # Perform INT8 quantization
+            if axis is not None:
+                # Calculate scale per specified axis
+                amax = np.amax(np.abs(arr), axis=axis, keepdims=True)
+                scale_keepdims  = amax / 127.0  # INT8 range is [-128, 127]
+
+                # Avoid division by zero
+                scale_keepdims = np.where(scale_keepdims == 0, 1.0, scale_keepdims)
+
+                arr_int8 = np.round(arr / scale_keepdims).astype(np.int8)
+
+                 # For most operators (except LSTM/GRU), create 1D scale for storage
+                if not any(op in ['LSTM', 'GRU'] for op in consumer_ops):
+                    # Calculate scale per axis but flatten to 1D for storage
+                    amax_1d = np.amax(np.abs(arr), axis=axis, keepdims=False)  # Flatten scale
+                    scale = amax_1d / 127.0
+
+                    # Avoid division by zero
+                    scale = np.where(scale == 0, 1.0, scale)
+
+                    # For different operator types, ensure correct shape
+                    if 'Conv' in consumer_ops and len(arr.shape) == 4:
+                        # Conv: [C_out, C_in, K, K], axis=(1,2,3) -> scale should be [C_out]
+                        scale = scale.reshape(arr.shape[0])
+                    elif 'ConvTranspose' in consumer_ops and len(arr.shape) == 4:
+                        # ConvTranspose: [C_in, C_out, K, K], axis=(0,2,3) -> scale should be [C_out]
+                        scale = scale.reshape(arr.shape[1])
+                    elif 'Gemm' in consumer_ops and len(arr.shape) == 2:
+                        # Gemm: [out, in], axis=1 -> scale should be [out]
+                        scale = scale.reshape(arr.shape[0])
+                    elif 'MatMul' in consumer_ops and len(arr.shape) == 2:
+                        # MatMul: [in, out], axis=0 -> scale should be [out]
+                        scale = scale.reshape(arr.shape[1])
+                    else:
+                        # For other cases, flatten to 1D
+                        scale = scale.flatten()
+                else:
+                    # For LSTM/GRU, keep the reduced scale but not the original shape
+                    scale = amax_1d / 127.0
+                    scale = np.where(scale == 0, 1.0, scale)
+            else:
+                # For 1D or smaller tensors, use per-tensor quantization
+                amax = np.amax(np.abs(arr))
+                scale_keepdims = amax / 127.0 if amax != 0 else 1.0
+                scale = scale_keepdims  # For per-tensor, scale is scalar
+                arr_int8 = np.round(arr / scale_keepdims).astype(np.int8)
+
+            # === 反量化：INT8 -> FP32 ===
+            if axis is not None:
+                # Broadcast scale back to original shape for dequantization
+                scale_broadcast = np.expand_dims(scale, axis=axis) if np.ndim(scale) > 0 else scale
+                dequantized = arr_int8.astype(np.float32) * scale_broadcast
+            else:
+                dequantized = arr_int8.astype(np.float32) * scale
+            # === 计算误差指标 ===
+            diff = dequantized - original_fp32
+            mse = np.mean(diff ** 2)
+            mae = np.mean(np.abs(diff))
+            max_abs_error = np.max(np.abs(diff))
+            # Relative error (avoid division by zero)
+            rel_error = np.abs(diff) / (np.abs(original_fp32) + 1e-8)
+            mean_rel_error = np.mean(rel_error)
+            max_rel_error = np.max(rel_error)
+            print(f"Quantized '{name}':")
+            print(f"  Shape: {original_fp32.shape}")
+            print(f"  Scale shape: {scale.shape if hasattr(scale, 'shape') else 'scalar'}")
+            print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
+            print(f"  Max Abs Error: {max_abs_error:.6e}")
+            print(f"  Mean Rel Error: {mean_rel_error:.2%}, Max Rel Error: {max_rel_error:.2%}")
+
+            # Create INT8 initializer for quantized weights
+            int8_initializer = numpy_helper.from_array(arr_int8.astype(np.int8), name)
+            int8_initializer.data_type = onnx.TensorProto.INT8
+
+            # Create scale initializer
+            scale_name = f"{name}_scale"
+            scale_initializer = numpy_helper.from_array(scale, scale_name)
+            scale_initializer.data_type = onnx.TensorProto.FLOAT
+
+            # Update the model: replace original with INT8 weights and add scale
+            vk_model.initializers[name] = int8_initializer
+
+            # Determine if scale should be stored as attribute or as input
+            # If scale is a scalar or small array, store as attribute; otherwise, store as input
+            scale_size = scale.size if hasattr(scale, 'size') else 1
+            scale_is_scalar = np.isscalar(scale) or scale_size == 1
+
+            if scale_is_scalar:
+                # For scalar scales, store as attribute
+                for node in consumers:
+                    if 'attributes' not in node:
+                        node['attributes'] = {}
+
+                    # Add scale as attribute to the node
+                    scale_value = float(scale) if hasattr(scale, 'item') else float(scale)
+                    node['attributes']['int8scale'] = scale_value
+            else:
+                # For array scales, create initializer and add as input
+                node['attributes']['int8scale'] = 'valid'
+                scale_name = f"{name}_scale"
+                scale_initializer = numpy_helper.from_array(scale, scale_name)
+                scale_initializer.data_type = onnx.TensorProto.FLOAT
+                vk_model.initializers[scale_name] = scale_initializer
+
+                # Add scale as input to the nodes that consume the original initializer
+                for node in consumers:
+                    # Add scale tensor as an additional input
+                    scale_input = {
+                        'name': scale_name,
+                        'shape': list(scale.shape) if hasattr(scale, 'shape') else []
+                    }
+                    node['inputs'].append(scale_input)
+
+            print(f"Converted FP32 tensor '{name}' to INT8 with scale tensor '{scale_name}' ({reason})")
+            print(f"Original shape: {initializer.dims}, scale shape: {scale_initializer.dims}")
+            converted_count += 1
+        else:
+            skipped_count += 1
+
+    print(f"Converted {converted_count} FP32 tensors to INT8 with scale information")
+    print(f"Preserved {skipped_count} tensors")
+    print(f"Total initializers after quantization: {len(vk_model.initializers)}")
 
 
 def move_input_tensor_to_attr(vk_model):
@@ -1319,16 +1630,40 @@ def parse_onnx_model(onnx_path):
             'outputs': outputs_with_shape
         })
 
+    return vk_model
+
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python onnx2vkop.py <onnx_model_path>")
+        sys.exit(1)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-q","--quant", help="Override input_model")
+    parser.add_argument("-i","--input", required=True, help="input_model file")
+    args = parser.parse_args()
+    if args.quant is not None:
+        if args.quant not in ["fp16", "int8"]:
+            print("Invalid quantization type. Please specify 'fp16' or 'int8'.")
+            sys.exit(1)
+
+    onnx_model_path = args.input
+    output_bin_path = os.path.splitext(onnx_model_path)[0] + ".vkopbin"
+
+    print("Parsing ONNX model...")
+    vk_model = parse_onnx_model(onnx_model_path)
+
     # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
     move_input_tensor_to_attr(vk_model)
-    quantize_to_fp16_selective(vk_model)
+    if args.quant == "fp16":
+        quantize_to_fp16_selective(vk_model)
+    elif args.quant == "int8":
+        quantize_to_int8_weight_only(vk_model)
     merge_initializers(vk_model)
     convert_flat_to_reshape(vk_model)
     remove_redundant_reshape(vk_model)
     fuse_conv_bn_relu(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
-
 
     op_stats = {}
     for node in vk_model.nodes:
@@ -1340,22 +1675,8 @@ def parse_onnx_model(onnx_path):
     for idx, (op_type, count) in enumerate(op_stats.items(), 1):
         print(f"{idx}\t{op_type}\t\t{count}")
 
-    return vk_model
-
-
-if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python onnx2vkop.py <onnx_model_path>")
-        sys.exit(1)
-
-    onnx_model_path = sys.argv[1]
-    output_bin_path = os.path.splitext(onnx_model_path)[0] + ".vkopbin"
-
-    print("Parsing ONNX model...")
-    onnxmodel = parse_onnx_model(onnx_model_path)
-
     print("Saving to binary format...")
-    onnxmodel.save_to_binary(output_bin_path)
+    vk_model.save_to_binary(output_bin_path)
 
     print("Model saved to:", output_bin_path)
     file_size = os.path.getsize(output_bin_path)

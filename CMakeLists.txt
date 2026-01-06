@@ -13,8 +13,19 @@ if(CCACHE)
     set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE ${CCACHE})
     set_property(GLOBAL PROPERTY RULE_LAUNCH_LINK ${CCACHE})
 endif(CCACHE)
-
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(FP16_CXX_FLAGS "-mf16c")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(FP16_CXX_FLAGS "-mfp16-format=ieee")
+    # 可选：指定微架构（如果已知）
+    # set(FP16_CXX_FLAGS "-march=armv8.2-a+fp16")
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM")
+    # AArch32: 仅存储支持
+    set(FP16_CXX_FLAGS "-mfp16-format=ieee")
+else()
+    message(WARNING "FP16 not supported on this architecture")
+endif()
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
 
 if(DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK_PATH $ENV{VULKAN_SDK})

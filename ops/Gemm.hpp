@@ -53,6 +53,12 @@ class Gemm : public Operator {
         if (attributes.find("transB") != attributes.end()) {
             transB_ = std::stol(attributes.at("transB"));
         }
+        if (attributes.find("int8scale") != attributes.end()) {
+            if (attributes.at("int8scale") == "valid") {
+            } else {
+                int8scale_ = std::stof(attributes.at("int8scale"));
+            }
+        }
     }
 
   private:
@@ -99,11 +105,30 @@ class Gemm : public Operator {
         para.beta = beta_;
         para.transA = transA_;
         para.transB = transB_;
-        para.fp16a = (inputs[0]->dtype() == typeid(uint16_t) ? 1 : 0);
-        para.fp16b = (inputs[1]->dtype() == typeid(uint16_t) ? 1 : 0);
+        if (inputs[0]->dtype() == typeid(uint16_t)) {
+            para.fp16a = 1;
+        } else if (inputs[0]->dtype() == typeid(uint8_t)) {
+            para.fp16a = 2;
+        } else {
+            para.fp16a = 0;
+        }
+        if (inputs[1]->dtype() == typeid(uint16_t)) {
+            para.fp16b = 1;
+        } else if (inputs[1]->dtype() == typeid(uint8_t)) {
+            para.fp16b = 2;
+        } else {
+            para.fp16b = 0;
+        }
+
         if (inputs.size() > 2) {
             para.has_bias = 1;
-            para.fp16c = (inputs[2]->dtype() == typeid(uint16_t) ? 1 : 0);
+            if (inputs[2]->dtype() == typeid(uint16_t)) {
+                para.fp16c = 1;
+            } else if (inputs[2]->dtype() == typeid(uint8_t)) {
+                para.fp16c = 2;
+            } else {
+                para.fp16c = 0;
+            }
         }
 
         submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
@@ -118,11 +143,11 @@ class Gemm : public Operator {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
-  private:
     float alpha_ = 1.0F;
     float beta_ = 1.0F;
     int transA_ = 0;
     int transB_ = 0;
+    float int8scale_ = 1.0F;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 };
 

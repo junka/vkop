@@ -43,7 +43,7 @@ struct alignas(16) GPUConv2dParam {
     int fuse_bn;
     float eps;
 
-    int fp16; // only for conv para
+    int accuracy; // only for conv para, 0 : fp32, 1 : fp16, 2: int8
 };
 
 } // namespace conv2d
@@ -57,7 +57,9 @@ class Conv2d : public Operator {
         types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                   VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
+                  DESCRIPTOR_TYPE_STORAGE,
+                  DESCRIPTOR_TYPE_STORAGE,
+                  DESCRIPTOR_TYPE_STORAGE};
         objs_.reserve(types_.size());
         activation_ = conv2d::ActivationMode::NONE;
     }
@@ -157,6 +159,13 @@ class Conv2d : public Operator {
                                             activation);
             }
         }
+        if (attributes.find("int8scale") != attributes.end()) {
+            if (attributes.at("int8scale") == "valid") {
+
+            } else {
+                int8scale_ = std::stof(attributes.at("int8scale"));
+            }
+        }
     }
 
   private:
@@ -201,31 +210,51 @@ class Conv2d : public Operator {
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
             objs_.emplace_back(input_image);
         });
-        bool fp16 = false;
+        int accuracy = 0;
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto weight = core::as_tensor<T>(inputs[1]);
             auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
             objs_.emplace_back(weight_image);
             if (typeid(T) == typeid(uint16_t)) {
-                fp16 = true;
+                accuracy = 1;
+            } else if (typeid(T) == typeid(int8_t)) {
+                accuracy = 2;
             }
         });
-        if (inputs.size() > 2 && !fuse_bn_) {
-            // it is bias, will not exist when batch norm follows conv
+        size_t scale_index = 2;
+        if ((inputs.size() == 3 && !fuse_bn_ && accuracy != 2) ||
+            (inputs.size() == 4 && !fuse_bn_ && accuracy == 2)) {
+            // No fuse, no scale
+            // No fuse, scale
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto bias = core::as_tensor<T>(inputs[2]);
                 auto bias_buffer = bias->as_storage_buffer(m_dev_);
                 objs_.emplace_back(bias_buffer);
             });
+            scale_index++;
         } else {
             objs_.emplace_back(dummyBuffer_);
         }
-        if (inputs.size() > 2 && fuse_bn_) {
-            dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
+
+        if (accuracy == 2) {
+            // has bias it is 3; no bias it is 2;
+            dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
-                auto para = core::as_tensor<T>(inputs[2]);
+                auto scale = core::as_tensor<T>(inputs[scale_index]);
+                auto scale_buffer = scale->as_storage_buffer(m_dev_);
+                objs_.emplace_back(scale_buffer);
+            });
+        } else {
+            objs_.emplace_back(dummyBuffer_);
+        }
+
+        if (fuse_bn_) {
+            auto index = inputs.size() - 1;
+            dispatch_by_dtype(inputs[index]->dtype(), [&](auto type_tag) {
+                using T = decltype(type_tag);
+                auto para = core::as_tensor<T>(inputs[index]);
                 auto para_buffer = para->as_storage_buffer(m_dev_);
                 objs_.emplace_back(para_buffer);
             });
@@ -259,11 +288,13 @@ class Conv2d : public Operator {
         para.transpose = inputs[1]->get_transpose() ? 1 : 0;
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
-        para.fp16 = fp16 ? 1 : 0;
+        para.accuracy = accuracy;
+        // printf("transpose: %d, pack %d, accuracy %d: [%d, %d, %d, %d]\n",
+        //        para.transpose, para.pack, para.accuracy, weight_shape[0],
+        //        weight_shape[1], weight_shape[2], weight_shape[3]);
 
         para.fuse_bn = fuse_bn_;
         para.eps = eps_;
-
         submit(&para, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
@@ -283,6 +314,7 @@ class Conv2d : public Operator {
     int groups_ = 1;
     float eps_ = 1e-5;
     int fuse_bn_ = 0;
+    float int8scale_ = 1.0F;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
     std::shared_ptr<VulkanBuffer> dummyBuffer_;
 }; // namespace ops

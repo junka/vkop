@@ -36,7 +36,7 @@ class Runtime {
 
   public:
     // Constructor
-    explicit Runtime(std::shared_ptr<VulkanCommandPool> cmdpool,
+    explicit Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                      std::string model_path, std::string cache_dir = "");
     ~Runtime();
 

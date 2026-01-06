@@ -124,8 +124,10 @@ int VulkanCommandBuffer::wait(const std::shared_ptr<VulkanQueue> &queue) {
         vkGetSemaphoreCounterValue(device->getLogicalDevice(), semaphore,
                                    &cur_time);
         if (cur_time > m_timelineValue_) {
+            // printf("already wait done\n");
             return 0;
         }
+        // printf("wait for timeline %ld\n", m_timelineValue_);
         VkSemaphoreWaitInfo wait_info{};
         wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
         wait_info.semaphoreCount = 1;

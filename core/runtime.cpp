@@ -14,7 +14,7 @@
 namespace vkop {
 namespace core {
 
-Runtime::Runtime(std::shared_ptr<VulkanCommandPool> cmdpool,
+Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                  std::string model_path, std::string cache_dir)
     : m_cmdpool_(std::move(cmdpool)), model_path_(std::move(model_path)),
       cache_dir_(std::move(cache_dir)) {
@@ -24,19 +24,13 @@ Runtime::Runtime(std::shared_ptr<VulkanCommandPool> cmdpool,
     }
 }
 
-Runtime::~Runtime() {
-    auto dev = m_cmdpool_->getVulkanDevice();
-    for (int id = 0; id < vkop::kInflight; id++) {
-        m_cmds_[id]->wait(dev->getComputeQueue(id));
-        m_cmds_[id].reset();
-    }
-}
+Runtime::~Runtime() = default;
 
 void Runtime::LoadCache() {}
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
-    // model.dump_model();
+    model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
@@ -57,11 +51,11 @@ void Runtime::LoadModel() {
     printf("Total nodes %zu\n", model.nodes.size());
     for (const auto &i : model.inputs) {
         // this is enough for input image
-        auto t = std::make_shared<Tensor<float>>(i.dims);
+        auto t = std::make_shared<Tensor<uint16_t>>(i.dims);
         t->set_ref_cnt_forever();
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
-        t->as_input_image(dev, nullptr, true);
+        t->as_input_image(dev, nullptr, false);
     }
 
     for (const auto &o : model.outputs) {
@@ -120,10 +114,14 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
             handle_floating_point_tensor(
                 init, reinterpret_cast<uint16_t *>(src_ptr), t);
+        } else if (init.dtype == "int8") {
+            auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+            handle_floating_point_tensor(
+                init, reinterpret_cast<int8_t *>(src_ptr), t);
         } else {
-            throw std::runtime_error(
-                "Only float32/int32/fp16 initializer is supported for now " +
-                init.dtype);
+            throw std::runtime_error("Only float32/int32/fp16/int8 initializer "
+                                     "is supported for now " +
+                                     init.dtype);
         }
     }
 

@@ -83,14 +83,13 @@ std::vector<MaskInfo> postProcessNMS(
         int x = idx % W;
         float xo = sigmoid((*reg_data)[idx]) + x;
         float yo = sigmoid((*reg_data)[num_points + idx]) + y;
-        // std::cout << "point at index " << idx << " has (x, y): (" << xo << ", " << yo << ")" << std::endl;
+
         xo *= (static_cast<float>(tensor_w) / W);
         yo *= (static_cast<float>(tensor_h) / H);
 
         float wo = std::exp((*dim_data)[idx]) * tensor_w / W;
         float ho = std::exp((*dim_data)[num_points + idx]) * tensor_h / H;
 
-        // std::cout << "index " << idx << " score " << score <<" Raw bbox (center x, center y, width, height): (" << xo << ", " << yo << ", " << wo << ", " << ho << ")" << std::endl;
         xo = xo * W / tensor_w;
         wo = wo * W / tensor_w;
         yo = yo * H / tensor_h;

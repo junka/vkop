@@ -118,7 +118,7 @@ class Operator {
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
 
-    using SupportedTypes = std::tuple<float, uint16_t, int, int64_t, uint8_t>;
+    using SupportedTypes = std::tuple<float, uint16_t, int, int64_t, int8_t>;
     template <typename Func>
     void dispatch_by_dtype(const std::type_info &dtype, Func &&func) {
         bool dispatched = false;

@@ -24,29 +24,42 @@ void Function::preprocess_jpg(const char *input_file,
     int channels;
     auto *raw = stbi_load(input_file, &image_w, &image_h, &channels, 3);
 
-    auto t = vkop::core::as_tensor<float>(input);
-    int resize_h = t->getShape()[2];
-    int resize_w = t->getShape()[3];
+    int resize_h = input->getShape()[2];
+    int resize_w = input->getShape()[3];
     auto *resized = static_cast<uint8_t *>(malloc(resize_h * resize_w * 3));
     stbir_resize_uint8_linear(raw, image_w, image_h, 0, resized, resize_w,
                               resize_h, 0, STBIR_RGB);
 
     stbi_image_free(raw);
-    std::vector<float> normalized_data(resize_h * resize_w * 4);
-    for (int c = 0; c < 3; c++) {
-        for (int i = 0; i < resize_h * resize_w; i++) {
-            normalized_data[(i * 4) + c] =
-                ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
-                 kMean[c]) /
-                kStdvar[c];
-        }
-    }
-    free(resized);
 
     // 1, 3, h, w, RGBA copy directly
-    t->copyToGPUImage(cmdpool, normalized_data.data(), true);
-    normalized_data.clear();
-    normalized_data.shrink_to_fit();
+    if (input->dtype() == typeid(float)) {
+        std::vector<float> normalized_data(resize_h * resize_w * 4);
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < resize_h * resize_w; i++) {
+                normalized_data[(i * 4) + c] =
+                    ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
+                     kMean[c]) /
+                    kStdvar[c];
+            }
+        }
+        auto t = vkop::core::as_tensor<float>(input);
+        t->copyToGPUImage(cmdpool, normalized_data.data(), true);
+    } else if (input->dtype() == typeid(uint16_t)) {
+        std::vector<uint16_t> normalized_data(resize_h * resize_w * 4);
+        for (int c = 0; c < 3; c++) {
+            for (int i = 0; i < resize_h * resize_w; i++) {
+                normalized_data[(i * 4) + c] =
+                    vkop::core::ITensor::fp32_to_fp16(
+                        ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
+                         kMean[c]) /
+                        kStdvar[c]);
+            }
+        }
+        auto t = vkop::core::as_tensor<uint16_t>(input);
+        t->copyToGPUImage(cmdpool, normalized_data.data(), true);
+    }
+    free(resized);
 }
 
 std::vector<std::pair<int, float>>

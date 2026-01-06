@@ -14,6 +14,11 @@
 #include <limits>
 #include <memory>
 #include <vector>
+#if defined(__ARM_NEON) || defined(__aarch64__)
+#include <arm_neon.h>
+#elif defined(__x86_64__) || defined(__amd64)
+#include <immintrin.h>
+#endif
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
@@ -100,6 +105,11 @@ class ITensor {
     }
 
     static float fp16_to_fp32(uint16_t h) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        return vcvth_f32_f16(h);
+#elif defined(__x86_64__) || defined(__amd64)
+        return _cvtsh_ss(h);
+#else
         uint32_t sign = (static_cast<uint32_t>(h) & 0x8000) << 16;
         uint32_t exponent = (h & 0x7C00) >> 10;
         uint32_t mantissa = h & 0x03FF;
@@ -132,8 +142,14 @@ class ITensor {
         float f;
         std::memcpy(&f, &r, sizeof(f));
         return f;
+#endif
     }
     static uint16_t fp32_to_fp16(float f) {
+#if defined(__ARM_NEON) || defined(__aarch64__)
+        return vcvt_f16_f32(f);
+#elif defined(__x86_64__) || defined(__amd64)
+        return _cvtss_sh(f, 0);
+#else
         uint32_t x;
         std::memcpy(&x, &f, sizeof(f));
 
@@ -154,6 +170,7 @@ class ITensor {
         }
         // Normal number
         return sign | (exponent << 10) | (mantissa >> 13);
+#endif
     }
 
   protected:
@@ -542,7 +559,7 @@ template <typename T> class Tensor : public ITensor {
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
         if (sizeof(T) == 1) {
             format =
-                (unorm ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_UINT);
+                (unorm ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SNORM);
         } else if (sizeof(T) == 2) {
             format = (unorm ? VK_FORMAT_R16G16B16A16_UNORM
                             : VK_FORMAT_R16G16B16A16_SFLOAT);

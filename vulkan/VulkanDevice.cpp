@@ -143,10 +143,25 @@ bool VulkanDevice::createLogicalDevice(
     VkFormatProperties fmprops;
     vkGetPhysicalDeviceFormatProperties(
         physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &fmprops);
-    assert(fmprops.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT);
+    assert(fmprops.bufferFeatures &
+           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
     vkGetPhysicalDeviceFormatProperties(
         physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &fmprops);
-    assert(fmprops.bufferFeatures & VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT);
+    assert(fmprops.bufferFeatures &
+           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
+    // we would like SSCALE but not supported by most device, use SNORM instead
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_,
+                                        VK_FORMAT_R8G8B8A8_SNORM, &fmprops);
+    assert(fmprops.bufferFeatures &
+           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_,
+                                        VK_FORMAT_R8G8B8A8_UNORM, &fmprops);
+    assert(fmprops.bufferFeatures &
+           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
 
     VkPhysicalDeviceShaderFloat16Int8Features devicefloat16_int8_features = {};
     devicefloat16_int8_features.sType =

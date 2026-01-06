@@ -188,14 +188,21 @@ void VulkanPipeline::freeDescriptorSets(VkDescriptorSet ds) {
 void VulkanPipeline::updateDescriptorSets(
     VkDescriptorSet ds,
     const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img) {
-    std::vector<VkWriteDescriptorSet> write_descriptor_sets(m_types_.size());
-    std::vector<VkDescriptorBufferInfo> buffer_infos;
-    std::vector<VkDescriptorImageInfo> image_infos;
+    static std::vector<VkWriteDescriptorSet> write_descriptor_sets;
+    static std::vector<VkDescriptorBufferInfo> buffer_infos;
+    static std::vector<VkDescriptorImageInfo> image_infos;
+
+    write_descriptor_sets.clear();
+    buffer_infos.clear();
+    image_infos.clear();
+
+    write_descriptor_sets.resize(m_types_.size());
+    image_infos.resize(n_img);
     if (n_img > 0) {
-        image_infos.reserve(n_img);
+        image_infos.resize(n_img);
     }
     if (m_types_.size() - n_img > 0) {
-        buffer_infos.reserve(m_types_.size() - n_img);
+        buffer_infos.resize(m_types_.size() - n_img);
     }
     for (size_t i = 0; i < m_types_.size(); i++) {
         VkWriteDescriptorSet &write_descriptor_set = write_descriptor_sets[i];
