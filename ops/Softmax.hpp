@@ -27,18 +27,18 @@ class Softmax : public Operator {
     Softmax(Softmax &&) = delete;
     Softmax &operator=(Softmax &&) = delete;
     explicit Softmax(bool use_ssbo = false)
-        : Operator(OpType::SOFTMAX, use_ssbo ? softmax2_spv : softmax_spv,
-                   use_ssbo ? softmax2_spv_len : softmax_spv_len,
-                   sizeof(softmax::GpuSoftMaxParam)) {
-        n_imgs_ = use_ssbo ? 0 : 2;
-        if (use_ssbo) {
-            types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-        } else {
-            types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+        : Operator(
+              OpType::SOFTMAX, use_ssbo ? softmax2_spv : softmax_spv,
+              use_ssbo ? softmax2_spv_len : softmax_spv_len, ([use_ssbo]() {
+                  if (use_ssbo) {
+                      return std::vector<VkDescriptorType>{
+                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
+                  }
+                  return std::vector<VkDescriptorType>{
+                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        }
-        objs_.reserve(types_.size());
-    }
+              })(),
+              sizeof(softmax::GpuSoftMaxParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

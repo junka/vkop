@@ -29,13 +29,11 @@ class LayerNorm : public Operator {
   public:
     LayerNorm()
         : Operator(OpType::LAYERNORM, layernorm_spv, layernorm_spv_len,
-                   sizeof(layernorm::GpuLayerNormParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                   sizeof(layernorm::GpuLayerNormParam)) {}
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("eps") != attributes.end()) {

@@ -52,15 +52,12 @@ class Conv2d : public Operator {
   public:
     Conv2d()
         : Operator(OpType::CONV2D, conv2d_spv, conv2d_spv_len,
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
                    sizeof(conv2d::GPUConv2dParam)) {
-        n_imgs_ = 3;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE};
-        objs_.reserve(types_.size());
         activation_ = conv2d::ActivationMode::NONE;
     }
 

@@ -21,9 +21,7 @@ class VulkanPipeline {
     VkDescriptorSet allocDescriptorSets();
     void freeDescriptorSets(VkDescriptorSet ds);
 
-    void updateDescriptorSets(
-        VkDescriptorSet ds,
-        const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img);
+    void updateDescriptorSets(const std::vector<VkWriteDescriptorSet> &writes);
 
   private:
     VkDevice m_device_;

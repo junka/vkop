@@ -25,12 +25,9 @@ class Nms : public Operator {
   public:
     Nms()
         : Operator(OpType::MAXPOOL2D, nms_spv, nms_spv_len,
-                   sizeof(nms::GpuNMSParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(nms::GpuNMSParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

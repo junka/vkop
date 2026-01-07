@@ -51,12 +51,9 @@ class Resize : public Operator {
   public:
     Resize()
         : Operator(OpType::RESIZE, resize_spv, resize_spv_len,
-                   sizeof(resize::GpuResizeParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(resize::GpuResizeParam)) {}
 
     void setAttribute(
         const std::unordered_map<std::string, std::string> &attrs) override {

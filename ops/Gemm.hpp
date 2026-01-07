@@ -30,12 +30,9 @@ class Gemm : public Operator {
   public:
     Gemm()
         : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
-                   sizeof(gemm::GpuGemmParam)) {
-        n_imgs_ = 0;
-        types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-        objs_.reserve(types_.size());
-    }
+                   {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                   sizeof(gemm::GpuGemmParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

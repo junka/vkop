@@ -36,11 +36,8 @@ class Reduce : public Operator {
   public:
     Reduce()
         : Operator(OpType::REDUCE, reduce_spv, reduce_spv_len,
-                   sizeof(reduce::GpuReduceParam)) {
-        n_imgs_ = 0;
-        types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-        objs_.reserve(types_.size());
-    }
+                   {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                   sizeof(reduce::GpuReduceParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

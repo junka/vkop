@@ -106,6 +106,57 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         ptr += data_size;
     }
 
+    if (this->initializers.find("unified_metadata") != this->initializers.end()) {
+        size_t meta_offset = initializer_offsets["unified_metadata"];
+        auto names_offset = this->initializer_offsets["unified_names"];
+        auto tensors_offset = this->initializer_offsets["unified_tensors"];
+        auto dims = this->initializers["unified_metadata"].dims;
+        int num_metas = dims[0]/8;
+        uint8_t *meta_ptr = initializer_memory.data() + meta_offset;
+        uint8_t *name_ptr = initializer_memory.data() + names_offset;
+        std::vector<struct UnifiedMetadata> metas(num_metas);
+        std::memcpy(metas.data(), meta_ptr, sizeof(struct UnifiedMetadata) * num_metas);
+        size_t name_idx_offset = 0;
+        std::string datatyep_map[] = {
+            "none",
+            "float32",
+            "uint8",
+            "int8",
+            "uint16",
+            "int16",
+            "int32",
+            "int64",
+            "string",
+            "bool",
+            "float16",
+            "float64",
+            "uint32",
+            "uint64",
+            "complex64",
+            "complex128",
+            "bfloat16"
+        };
+        for (int i = 0; i < num_metas; ++i) {
+            auto &meta = metas[i];
+            Initializer initializer;
+            initializer.name = std::string(name_ptr + name_idx_offset, name_ptr + name_idx_offset + meta.name_len);
+            initializer.dtype = datatyep_map[meta.dtype];
+            for (unsigned int dim : meta.dims) {
+                if (dim == 0) {
+                    break;
+                }
+                initializer.dims.push_back(dim);
+            }
+            initializer_offsets[initializer.name] = tensors_offset + meta.offset;
+            this->initializers[initializer.name] = std::move(initializer);
+            name_idx_offset += meta.name_len;
+        }
+        this->initializers.erase("unified_metadata");
+        this->initializers.erase("unified_names");
+        this->initializers.erase("unified_tensors");
+
+    }
+
     // Unmap the file
     munmap(const_cast<char*>(static_cast<const char*>(mapped_data)), file_size);
 }

@@ -163,7 +163,7 @@ int main() {
     auto weight_shape = weight->getShape();
     for (int i = 0; i < weight_shape[0]; ++i) {
         for (int j = 0; j < weight_shape[1] * weight_shape[2] * weight_shape[3]; ++j) {
-            ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j) = 
+            ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j) =
                 static_cast<float>(weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j)) * scale->at(i);
         }
     }

@@ -186,53 +186,9 @@ void VulkanPipeline::freeDescriptorSets(VkDescriptorSet ds) {
 // }
 
 void VulkanPipeline::updateDescriptorSets(
-    VkDescriptorSet ds,
-    const std::vector<std::shared_ptr<VulkanResource>> &m_objs, int n_img) {
-    static std::vector<VkWriteDescriptorSet> write_descriptor_sets;
-    static std::vector<VkDescriptorBufferInfo> buffer_infos;
-    static std::vector<VkDescriptorImageInfo> image_infos;
-
-    write_descriptor_sets.clear();
-    buffer_infos.clear();
-    image_infos.clear();
-
-    write_descriptor_sets.resize(m_types_.size());
-    image_infos.resize(n_img);
-    if (n_img > 0) {
-        image_infos.resize(n_img);
-    }
-    if (m_types_.size() - n_img > 0) {
-        buffer_infos.resize(m_types_.size() - n_img);
-    }
-    for (size_t i = 0; i < m_types_.size(); i++) {
-        VkWriteDescriptorSet &write_descriptor_set = write_descriptor_sets[i];
-        write_descriptor_set.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        write_descriptor_set.dstSet = ds;
-        write_descriptor_set.dstBinding = static_cast<uint32_t>(i);
-        write_descriptor_set.dstArrayElement = 0;
-        write_descriptor_set.descriptorCount = 1;
-        write_descriptor_set.descriptorType = m_types_[i];
-        if (m_objs[i]->getResourceType() == ResourceType::VK_BUFFER) {
-            buffer_infos.emplace_back(std::get<VkDescriptorBufferInfo>(
-                m_objs[i]->getDescriptorInfo()));
-            auto b = std::static_pointer_cast<VulkanBuffer>(m_objs[i]);
-            auto *view = b->getBufferView();
-            if (view != VK_NULL_HANDLE) {
-                write_descriptor_set.pTexelBufferView = &view;
-            } else {
-                write_descriptor_set.pBufferInfo =
-                    &buffer_infos[buffer_infos.size() - 1];
-            }
-        } else {
-            image_infos.emplace_back(std::get<VkDescriptorImageInfo>(
-                m_objs[i]->getDescriptorInfo()));
-            write_descriptor_set.pImageInfo =
-                &image_infos[image_infos.size() - 1];
-        }
-    }
-    vkUpdateDescriptorSets(m_device_,
-                           static_cast<uint32_t>(write_descriptor_sets.size()),
-                           write_descriptor_sets.data(), 0, nullptr);
+    const std::vector<VkWriteDescriptorSet> &writes) {
+    vkUpdateDescriptorSets(m_device_, static_cast<uint32_t>(writes.size()),
+                           writes.data(), 0, nullptr);
 }
 
 void VulkanPipeline::cleanup() {

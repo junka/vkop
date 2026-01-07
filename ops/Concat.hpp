@@ -25,13 +25,12 @@ class Concat : public Operator {
   public:
     explicit Concat()
         : Operator(OpType::CONCAT, concat_spv, concat_spv_len,
+                   {
+                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   },
                    sizeof(concat::ConcatParam)) {
-        n_imgs_ = 2;
-        types_ = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        };
-        objs_.reserve(types_.size());
+        update_after_bind_ = true;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>

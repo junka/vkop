@@ -43,8 +43,6 @@ class VkModel:
                 self._write_string(f, node['op_type'])
                 self._write_string(f, node['name'])
                 self._write_dict(f, node['attributes'])  # Attributes
-                if node['op_type'] == 'Resize':
-                    print("Resize node inputs:", len(node['inputs']))
                 self._write_list_with_shapes(f, node['inputs'])
                 self._write_list_with_shapes(f, node['outputs'])
 
@@ -131,7 +129,6 @@ class VkModel:
         data = arr.tobytes()
         f.write(struct.pack('Q', len(data)))
         f.write(data)
-
 
 def optimize_onnx_model(onnx_model):
     """
@@ -1401,245 +1398,361 @@ def unsqueeze_initializers(vk_model):
     return vk_model
 
 
-def parse_onnx_model(onnx_path):
-    model = onnx.load(onnx_path)
+class ModelConverter:
+    """Main class for converting ONNX models to VKOP format."""
+    @staticmethod
+    def parse_onnx_model(onnx_path):
+        model = onnx.load(onnx_path)
 
-    # Optimize the ONNX model
-    print("Optimizing ONNX model...")
-    model = optimize_onnx_model(model)
-    # save optimized model
-    onnx.save(model, "optimized_" + os.path.basename(onnx_path))
+        # Optimize the ONNX model
+        print("Optimizing ONNX model...")
+        model = optimize_onnx_model(model)
+        # save optimized model
+        onnx.save(model, "optimized_" + os.path.basename(onnx_path))
 
-    vk_model = VkModel()
+        vk_model = VkModel()
 
-    graph = model.graph
-    try:
-        onnx.checker.check_model(model, full_check=True)
-        print("ONNX model passed full validation.")
-    except onnx.checker.ValidationError as e:
-        print(f"ONNX model full validation failed: {e}")
+        graph = model.graph
+        try:
+            onnx.checker.check_model(model, full_check=True)
+            print("ONNX model passed full validation.")
+        except onnx.checker.ValidationError as e:
+            print(f"ONNX model full validation failed: {e}")
 
-    # check if graph is topologically sorted
-    if is_topologically_sortable(graph) == False:
-        print("Graph is not topologically sorted. Please sort it before proceeding.")
-        return 
+        # check if graph is topologically sorted
+        if is_topologically_sortable(graph) == False:
+            print("Graph is not topologically sorted. Please sort it before proceeding.")
+            return 
 
-    # Initializers (parameters)
-    for initializer in graph.initializer:
-        name = initializer.name
-        vk_model.initializers[name] = initializer
+        # Initializers (parameters)
+        for initializer in graph.initializer:
+            name = initializer.name
+            vk_model.initializers[name] = initializer
 
-    initializer_names = {init.name for init in graph.initializer}
-    # Inputs with shapes
-    for inp in graph.input:
-        if inp.name in initializer_names:
-            continue
-        tensor_type = inp.type.tensor_type
-        shape_dims = [
-            dim.dim_value if dim.HasField("dim_value") else 1
-            for dim in tensor_type.shape.dim
-        ]
-        print("Graph input:", inp.name, "of shape:", shape_dims)
-        vk_model.inputs.append({'name': inp.name, 'shape': shape_dims})
-
-    # Outputs with shapes
-    for out in graph.output:
-        tensor_type = out.type.tensor_type
-        shape_dims = [
-            dim.dim_value if dim.HasField("dim_value") else 1
-            for dim in tensor_type.shape.dim
-        ]
-        print("Graph output:", out.name, "of shape:", shape_dims)
-        vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
-
-    modified_shapes = defaultdict(list)
-    # Nodes with attributes and shapes of inputs/outputs
-    ELEMWISE_OPS = {"Add", "And", "Div", "Equal", "Greater", "Less", "Max", "Mean",
-         "Min", "Mul", "Or", "Pow", "Sub", "Sum", "Where", "Xor"}
-    for node in graph.node:
-        print("Processing node:", node.name, "of type:", node.op_type)
-        attributes = {}
-        for attr in node.attribute:
-            # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
-            # message AttributeProto
-            # enum AttributeType {
-            #     UNDEFINED = 0;
-            #     FLOAT = 1;
-            #     INT = 2;
-            #     STRING = 3;
-            #     TENSOR = 4;
-            #     GRAPH = 5;
-            #     SPARSE_TENSOR = 11;
-            #     TYPE_PROTO = 13;
-
-            #     FLOATS = 6;
-            #     INTS = 7;
-            #     STRINGS = 8;
-            #     TENSORS = 9;
-            #     GRAPHS = 10;
-            #     SPARSE_TENSORS = 12;
-            #     TYPE_PROTOS = 14;
-            # }
-
-            if attr.type == onnx.AttributeProto.INT:
-                attributes[attr.name] = attr.i
-            elif attr.type == onnx.AttributeProto.FLOAT:
-                attributes[attr.name] = attr.f
-            elif attr.type == onnx.AttributeProto.STRING:
-                attributes[attr.name] = attr.s.decode('utf-8')
-            elif attr.type == onnx.AttributeProto.TENSOR:
-                attributes[attr.name] = numpy_helper.to_array(attr.t)
-            elif attr.type == onnx.AttributeProto.INTS:
-                attributes[attr.name] = list(attr.ints)
-            elif attr.type == onnx.AttributeProto.FLOATS:
-                attributes[attr.name] = list(attr.floats)
-            else:
-                print(f"Warning: Unsupported attribute type {attr.type} for attribute {attr.name}")
-
-        outputs_with_shape = []
-        for output_name in node.output:
-            print("  Output:", output_name)
-            # Find the output tensor to get its shape
-            output_tensor = None
-            for value_info in graph.value_info:
-                if value_info.name == output_name:
-                    output_tensor = value_info
-                    break
-            if output_tensor is None:
-                for out in graph.output:
-                    if out.name == output_name:
-                        output_tensor = out
-                        break
-            if output_tensor is None:
-                print(f"Warning: Output tensor {output_name} not found in graph.")
-                outputs_with_shape.append({'name': output_name, 'shape':[]})
+        initializer_names = {init.name for init in graph.initializer}
+        # Inputs with shapes
+        for inp in graph.input:
+            if inp.name in initializer_names:
                 continue
-            tensor_type = output_tensor.type.tensor_type
+            tensor_type = inp.type.tensor_type
             shape_dims = [
                 dim.dim_value if dim.HasField("dim_value") else 1
                 for dim in tensor_type.shape.dim
             ]
-            #  GlobalAveragePool compression to 2d, so we can use storage instead of image
-            if node.op_type == "GlobalAveragePool" and len(shape_dims) >= 2:
-                original_shape = shape_dims[:]
-                shape_dims = [original_shape[0], original_shape[1]]
-                print(f"Modified GlobalAveragePool shape from {original_shape} to {shape_dims}")
-                modified_shapes[output_name] = shape_dims
+            print("Graph input:", inp.name, "of shape:", shape_dims)
+            vk_model.inputs.append({'name': inp.name, 'shape': shape_dims})
 
-            outputs_with_shape.append(
-                {'name': output_name, 'shape': shape_dims}
-            )
+        # Outputs with shapes
+        for out in graph.output:
+            tensor_type = out.type.tensor_type
+            shape_dims = [
+                dim.dim_value if dim.HasField("dim_value") else 1
+                for dim in tensor_type.shape.dim
+            ]
+            print("Graph output:", out.name, "of shape:", shape_dims)
+            vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
 
-        inputs_with_shape = []
-        for input_name in node.input:
-            print("  Input:", input_name)
-            # Find the input tensor to get its shape
-            input_tensor = None
-            for value_info in graph.value_info:
-                if value_info.name == input_name:
-                    input_tensor = value_info
-                    break
-            if input_tensor is None:
-                for inp in graph.input:
-                    if inp.name == input_name:
-                        input_tensor = inp
-                        break
-            if input_tensor is None:
-                for out in graph.output:
-                    if out.name == input_name:
-                        input_tensor = out
-                        break
-            if input_tensor is None:
-                for initializer in graph.initializer:
-                    if initializer.name == input_name:
-                        data_type_map = {
-                            1: onnx.TensorProto.FLOAT,
-                            2: onnx.TensorProto.UINT8,
-                            3: onnx.TensorProto.INT8,
-                            4: onnx.TensorProto.UINT16,
-                            5: onnx.TensorProto.INT16,
-                            6: onnx.TensorProto.INT32,
-                            7: onnx.TensorProto.INT64,
-                            8: onnx.TensorProto.STRING,
-                            9: onnx.TensorProto.BOOL,
-                            10: onnx.TensorProto.FLOAT16,
-                            11: onnx.TensorProto.DOUBLE,
-                            12: onnx.TensorProto.UINT32,
-                            13: onnx.TensorProto.UINT64,
-                            14: onnx.TensorProto.COMPLEX64,
-                            15: onnx.TensorProto.COMPLEX128,
-                            16: onnx.TensorProto.BFLOAT16
-                        }
-                        data_type = data_type_map.get(initializer.data_type, onnx.TensorProto.UNDEFINED)
-                        input_tensor = onnx.helper.make_tensor_value_info(
-                            initializer.name, data_type, initializer.dims
-                        )
-                        break
+        modified_shapes = defaultdict(list)
+        # Nodes with attributes and shapes of inputs/outputs
+        ELEMWISE_OPS = {"Add", "And", "Div", "Equal", "Greater", "Less", "Max", "Mean",
+            "Min", "Mul", "Or", "Pow", "Sub", "Sum", "Where", "Xor"}
+        for node in graph.node:
+            print("Processing node:", node.name, "of type:", node.op_type)
+            attributes = {}
+            for attr in node.attribute:
+                # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
+                # message AttributeProto
+                # enum AttributeType {
+                #     UNDEFINED = 0;
+                #     FLOAT = 1;
+                #     INT = 2;
+                #     STRING = 3;
+                #     TENSOR = 4;
+                #     GRAPH = 5;
+                #     SPARSE_TENSOR = 11;
+                #     TYPE_PROTO = 13;
 
-            if input_tensor is None:
-                print(f"Warning: Input tensor \"{input_name}\" not found in graph.")
-                inputs_with_shape.append(
-                    {'name': input_name, 'shape': []}
+                #     FLOATS = 6;
+                #     INTS = 7;
+                #     STRINGS = 8;
+                #     TENSORS = 9;
+                #     GRAPHS = 10;
+                #     SPARSE_TENSORS = 12;
+                #     TYPE_PROTOS = 14;
+                # }
+
+                if attr.type == onnx.AttributeProto.INT:
+                    attributes[attr.name] = attr.i
+                elif attr.type == onnx.AttributeProto.FLOAT:
+                    attributes[attr.name] = attr.f
+                elif attr.type == onnx.AttributeProto.STRING:
+                    attributes[attr.name] = attr.s.decode('utf-8')
+                elif attr.type == onnx.AttributeProto.TENSOR:
+                    attributes[attr.name] = numpy_helper.to_array(attr.t)
+                elif attr.type == onnx.AttributeProto.INTS:
+                    attributes[attr.name] = list(attr.ints)
+                elif attr.type == onnx.AttributeProto.FLOATS:
+                    attributes[attr.name] = list(attr.floats)
+                else:
+                    print(f"Warning: Unsupported attribute type {attr.type} for attribute {attr.name}")
+
+            outputs_with_shape = []
+            for output_name in node.output:
+                print("  Output:", output_name)
+                # Find the output tensor to get its shape
+                output_tensor = None
+                for value_info in graph.value_info:
+                    if value_info.name == output_name:
+                        output_tensor = value_info
+                        break
+                if output_tensor is None:
+                    for out in graph.output:
+                        if out.name == output_name:
+                            output_tensor = out
+                            break
+                if output_tensor is None:
+                    print(f"Warning: Output tensor {output_name} not found in graph.")
+                    outputs_with_shape.append({'name': output_name, 'shape':[]})
+                    continue
+                tensor_type = output_tensor.type.tensor_type
+                shape_dims = [
+                    dim.dim_value if dim.HasField("dim_value") else 1
+                    for dim in tensor_type.shape.dim
+                ]
+                #  GlobalAveragePool compression to 2d, so we can use storage instead of image
+                if node.op_type == "GlobalAveragePool" and len(shape_dims) >= 2:
+                    original_shape = shape_dims[:]
+                    shape_dims = [original_shape[0], original_shape[1]]
+                    print(f"Modified GlobalAveragePool shape from {original_shape} to {shape_dims}")
+                    modified_shapes[output_name] = shape_dims
+
+                outputs_with_shape.append(
+                    {'name': output_name, 'shape': shape_dims}
                 )
-                continue
-            tensor_type = input_tensor.type.tensor_type
-            shape_dims = [
-                dim.dim_value if dim.HasField("dim_value") else 1
-                for dim in tensor_type.shape.dim
-            ]
-            if input_name in modified_shapes and len(modified_shapes[input_name]) > 0:
-                shape_dims = modified_shapes[input_name]
-                print(f"Modified shape of input {input_name} to {shape_dims}")
-            inputs_with_shape.append(
-                {'name': input_name, 'shape': shape_dims}
-            )
 
-        if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
-            print("  Elemwise operation with multiple inputs. Broadcasting shapes...")
-            for i in range(len(inputs_with_shape)):
-                if inputs_with_shape[i]['name'] == node.input[0]:
-                    id0 = i
-                if inputs_with_shape[i]['name'] == node.input[1]:
-                    id1 = i
-            if len(inputs_with_shape[id0]['shape']) != len(inputs_with_shape[id1]['shape']):
-                shape = broadcast_shapes(inputs_with_shape[id0]['shape'], inputs_with_shape[id1]['shape'])
-                if len(inputs_with_shape[id0]['shape']) == 0:
-                    inputs_with_shape[id0]['shape'] = shape
+            inputs_with_shape = []
+            for input_name in node.input:
+                print("  Input:", input_name)
+                # Find the input tensor to get its shape
+                input_tensor = None
+                for value_info in graph.value_info:
+                    if value_info.name == input_name:
+                        input_tensor = value_info
+                        break
+                if input_tensor is None:
+                    for inp in graph.input:
+                        if inp.name == input_name:
+                            input_tensor = inp
+                            break
+                if input_tensor is None:
+                    for out in graph.output:
+                        if out.name == input_name:
+                            input_tensor = out
+                            break
+                if input_tensor is None:
                     for initializer in graph.initializer:
-                        if initializer.name == inputs_with_shape[id0]['name']:
-                            orig_init = vk_model.initializers[initializer.name]
-                            scalar_val = numpy_helper.to_array(orig_init).item()
-                            expanded_data = np.full(shape, scalar_val, dtype=np.float32)
-                            new_init = numpy_helper.from_array(expanded_data, name=new_name)
-                            vk_model.initializers[initializer.name] = new_init
-                if len(inputs_with_shape[id1]['shape']) == 0:
-                    inputs_with_shape[id1]['shape'] = shape
-                    for initializer in graph.initializer:
-                        if initializer.name == inputs_with_shape[id1]['name']:
-                            orig_init = vk_model.initializers[initializer.name]
-                            scalar_val = numpy_helper.to_array(orig_init).item()
-                            expanded_data = np.full(shape, scalar_val, dtype=np.float32)
-                            new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
-                            vk_model.initializers[initializer.name] = new_init
+                        if initializer.name == input_name:
+                            data_type_map = {
+                                1: onnx.TensorProto.FLOAT,
+                                2: onnx.TensorProto.UINT8,
+                                3: onnx.TensorProto.INT8,
+                                4: onnx.TensorProto.UINT16,
+                                5: onnx.TensorProto.INT16,
+                                6: onnx.TensorProto.INT32,
+                                7: onnx.TensorProto.INT64,
+                                8: onnx.TensorProto.STRING,
+                                9: onnx.TensorProto.BOOL,
+                                10: onnx.TensorProto.FLOAT16,
+                                11: onnx.TensorProto.DOUBLE,
+                                12: onnx.TensorProto.UINT32,
+                                13: onnx.TensorProto.UINT64,
+                                14: onnx.TensorProto.COMPLEX64,
+                                15: onnx.TensorProto.COMPLEX128,
+                                16: onnx.TensorProto.BFLOAT16
+                            }
+                            data_type = data_type_map.get(initializer.data_type, onnx.TensorProto.UNDEFINED)
+                            input_tensor = onnx.helper.make_tensor_value_info(
+                                initializer.name, data_type, initializer.dims
+                            )
+                            break
 
-        vk_model.nodes.append({
-            'op_type': node.op_type,
-            'name': node.name,
-            'attributes': attributes,
-            'inputs': inputs_with_shape,
-            'outputs': outputs_with_shape
+                if input_tensor is None:
+                    print(f"Warning: Input tensor \"{input_name}\" not found in graph.")
+                    inputs_with_shape.append(
+                        {'name': input_name, 'shape': []}
+                    )
+                    continue
+                tensor_type = input_tensor.type.tensor_type
+                shape_dims = [
+                    dim.dim_value if dim.HasField("dim_value") else 1
+                    for dim in tensor_type.shape.dim
+                ]
+                if input_name in modified_shapes and len(modified_shapes[input_name]) > 0:
+                    shape_dims = modified_shapes[input_name]
+                    print(f"Modified shape of input {input_name} to {shape_dims}")
+                inputs_with_shape.append(
+                    {'name': input_name, 'shape': shape_dims}
+                )
+
+            if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
+                print("  Elemwise operation with multiple inputs. Broadcasting shapes...")
+                for i in range(len(inputs_with_shape)):
+                    if inputs_with_shape[i]['name'] == node.input[0]:
+                        id0 = i
+                    if inputs_with_shape[i]['name'] == node.input[1]:
+                        id1 = i
+                if len(inputs_with_shape[id0]['shape']) != len(inputs_with_shape[id1]['shape']):
+                    shape = broadcast_shapes(inputs_with_shape[id0]['shape'], inputs_with_shape[id1]['shape'])
+                    if len(inputs_with_shape[id0]['shape']) == 0:
+                        inputs_with_shape[id0]['shape'] = shape
+                        for initializer in graph.initializer:
+                            if initializer.name == inputs_with_shape[id0]['name']:
+                                orig_init = vk_model.initializers[initializer.name]
+                                scalar_val = numpy_helper.to_array(orig_init).item()
+                                expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                                new_init = numpy_helper.from_array(expanded_data, name=new_name)
+                                vk_model.initializers[initializer.name] = new_init
+                    if len(inputs_with_shape[id1]['shape']) == 0:
+                        inputs_with_shape[id1]['shape'] = shape
+                        for initializer in graph.initializer:
+                            if initializer.name == inputs_with_shape[id1]['name']:
+                                orig_init = vk_model.initializers[initializer.name]
+                                scalar_val = numpy_helper.to_array(orig_init).item()
+                                expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                                new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
+                                vk_model.initializers[initializer.name] = new_init
+
+            vk_model.nodes.append({
+                'op_type': node.op_type,
+                'name': node.name,
+                'attributes': attributes,
+                'inputs': inputs_with_shape,
+                'outputs': outputs_with_shape
+            })
+
+        return vk_model
+
+
+def unified_initializers(vk_model):
+    """
+    Consolidate 1D and 2D tensors from initializers into a large memory block with 16-byte padding.
+    This function:
+    1. Identifies 1D and 2D tensors in initializers
+    2. Concatenates them into a single memory block with 16-byte alignment
+    3. Keeps track of shapes and offsets for each tensor
+    """
+    print("Consolidating 1D and 2D initializers...")
+
+    # Identify 1D and 2D tensors
+    tensors_to_consolidate = []
+    tensor_info = []  # Store tensor name, shape, data, and offset
+
+    for name, initializer in vk_model.initializers.items():
+        dims = list(initializer.dims)
+        if len(dims) in [1, 2]:  # Only 1D or 2D tensors
+            tensor_data = numpy_helper.to_array(initializer)
+            tensors_to_consolidate.append((name, dims, initializer.data_type, tensor_data))
+
+    if not tensors_to_consolidate:
+        print("No 1D or 2D tensors found to consolidate.")
+        return
+
+    print(f"Found {len(tensors_to_consolidate)} 1D and 2D tensors to consolidate.")
+
+    # Calculate total size with 16-byte padding
+    current_offset = 0
+    unified_data = b""
+
+    for name, shape, datatype, data in tensors_to_consolidate:
+        # Get the size in bytes for this tensor
+        element_size = data.itemsize
+        tensor_size_bytes = data.nbytes
+
+        # Calculate padding to align to 16-byte boundary
+        padding_needed = (16 - (current_offset % 16)) % 16
+        if padding_needed > 0:
+            unified_data += b"\x00" * padding_needed
+            current_offset += padding_needed
+
+        # Record tensor info with offset
+        tensor_info.append({
+            'name': name,
+            'shape': shape,
+            'offset': current_offset,
+            'size_bytes': tensor_size_bytes,
+            'type' : datatype
         })
+        print(f"Tensor {name} shape: {shape}, size: {tensor_size_bytes} bytes, offset: {current_offset}")
 
-    return vk_model
+        # Add the tensor data
+        tensor_bytes = data.tobytes()
+        unified_data += tensor_bytes
+        current_offset += tensor_size_bytes
+
+    # Create a new unified initializer
+    unified_name = "unified_tensors"
+    unified_initializer = numpy_helper.from_array(
+        np.frombuffer(unified_data, dtype=np.uint8), 
+        unified_name
+    )
+    unified_initializer.data_type = onnx.TensorProto.UINT8
+
+    # Update the model: remove old tensors and add unified one
+    for name, _, _, _ in tensors_to_consolidate:
+        del vk_model.initializers[name]
+
+    vk_model.initializers[unified_name] = unified_initializer
+
+    # Store metadata about the consolidation in model attributes
+    # We'll create a metadata tensor with shape and offset information
+    metadata_list = []
+    for idx, info in enumerate(tensor_info):
+        # Add name length, offset, and size_bytes as integers
+        name_length = len(info['name'])
+        
+        # Add to metadata list
+        metadata_list.append(info['type'])
+        metadata_list.append(name_length)
+        metadata_list.append(info['offset'])
+        metadata_list.append(info['size_bytes'])
+
+        # Add shape dimensions, padding to 4 dimensions with 1s
+        shape_dims = [1] * (2 - len(info['shape'])) + info['shape']
+        pad_dims = [0] * 2
+        metadata_list.extend(shape_dims)
+        metadata_list.extend(pad_dims)
+    
+    metadata_array = np.array(metadata_list, dtype=np.int32)
+    metadata_initializer = numpy_helper.from_array(metadata_array, "unified_metadata")
+    vk_model.initializers["unified_metadata"] = metadata_initializer
+
+    all_names_bytes = b""
+    for info in tensor_info:
+        name_bytes = info['name'].encode('utf-8')
+        all_names_bytes += name_bytes
+    
+    names_array = np.frombuffer(all_names_bytes, dtype=np.uint8)
+    names_initializer = numpy_helper.from_array(names_array, "unified_names")
+    vk_model.initializers["unified_names"] = names_initializer
+
+    print(f"Consolidated {len(tensors_to_consolidate)} tensors into a single tensor of size {len(unified_data)} bytes")
+    print(f"Added metadata tensor with shape information for {len(tensor_info)} tensors")
+
+    return {
+        'tensor_info': tensor_info,
+        'total_size': len(unified_data),
+        'metadata_size': len(metadata_list)
+    }
 
 
-if __name__ == "__main__":
+def main():
     if len(sys.argv) < 2:
         print("Usage: python onnx2vkop.py <onnx_model_path>")
         sys.exit(1)
     parser = argparse.ArgumentParser()
     parser.add_argument("-q","--quant", help="Override input_model")
     parser.add_argument("-i","--input", required=True, help="input_model file")
+    parser.add_argument("-u","--unify", action='store_true', help="convert initializers to a single memory block")
     args = parser.parse_args()
     if args.quant is not None:
         if args.quant not in ["fp16", "int8"]:
@@ -1650,7 +1763,7 @@ if __name__ == "__main__":
     output_bin_path = os.path.splitext(onnx_model_path)[0] + ".vkopbin"
 
     print("Parsing ONNX model...")
-    vk_model = parse_onnx_model(onnx_model_path)
+    vk_model = ModelConverter.parse_onnx_model(onnx_model_path)
 
     # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
     move_input_tensor_to_attr(vk_model)
@@ -1664,6 +1777,8 @@ if __name__ == "__main__":
     fuse_conv_bn_relu(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
+    if args.unify is True:
+        unified_initializers(vk_model)
 
     op_stats = {}
     for node in vk_model.nodes:
@@ -1682,3 +1797,6 @@ if __name__ == "__main__":
     file_size = os.path.getsize(output_bin_path)
     print(f"File size: {file_size:,} bytes ({file_size / (1024*1024):.2f} MB)")
 
+
+if __name__ == "__main__":
+    main()

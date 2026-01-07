@@ -26,13 +26,11 @@ class BinaryFactory : public Operator {
   public:
     explicit BinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
         : Operator(type, spv, spv_len,
-                   (type == OpType::ADD) ? sizeof(binary::GPUBinParam) : 0) {
-        n_imgs_ = 3;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   (type == OpType::ADD) ? sizeof(binary::GPUBinParam) : 0) {}
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.count("activation") != 0) {

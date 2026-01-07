@@ -15,10 +15,17 @@ namespace vkop {
 namespace ops {
 class Operator {
   public:
-    explicit Operator(OpType type) : type_(type) {}
     explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
+                      const std::vector<VkDescriptorType> &types,
                       size_t pc_size = 0)
-        : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len) {}
+        : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len),
+          types_(std::move(types)) {
+        assert(pc_size_ <= 128);
+
+        objs_.reserve(types_.size());
+        writes_.resize(types_.size());
+    }
+
     virtual ~Operator() {
         for (auto &m_d : m_ds_) {
             if (m_d)
@@ -106,12 +113,15 @@ class Operator {
     std::shared_ptr<VulkanCommandBuffer> m_cmd_;
     std::shared_ptr<VulkanPipeline> pipeline_;
     VkDescriptorSet m_ds_[vkop::kInflight] = {nullptr};
+    std::vector<VkWriteDescriptorSet> writes_;
+    std::vector<VkDescriptorBufferInfo> buffer_infos_;
+    std::vector<VkDescriptorImageInfo> image_infos_;
     int m_id_;
     OpType type_;
     size_t pc_size_ = 0;
     uint8_t *spv_ = nullptr;
     uint32_t spv_len_ = 0;
-    int n_imgs_ = 0;
+    bool update_after_bind_ = false;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.
@@ -147,7 +157,9 @@ class Operator {
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }
-        pipeline_->updateDescriptorSets(m_ds_[m_id_], objs_, n_imgs_);
+        fillWriteDescriptorSets();
+        pipeline_->updateDescriptorSets(writes_);
+
         m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
         if (ptr) {
             m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
@@ -156,6 +168,30 @@ class Operator {
     }
 
   private:
+    virtual void fillWriteDescriptorSets() {
+        for (size_t i = 0; i < types_.size(); i++) {
+            writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes_[i].dstSet = m_ds_[m_id_];
+            writes_[i].dstBinding = static_cast<uint32_t>(i);
+            writes_[i].dstArrayElement = 0;
+            writes_[i].descriptorCount = 1;
+            writes_[i].descriptorType = types_[i];
+            if (objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
+                auto b = std::static_pointer_cast<VulkanBuffer>(objs_[i]);
+                auto *view = b->getBufferView();
+                if (view != VK_NULL_HANDLE) {
+                    writes_[i].pTexelBufferView = &view;
+                } else {
+                    writes_[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
+                        objs_[i]->getDescriptorInfo());
+                }
+            } else {
+                writes_[i].pImageInfo = std::get<VkDescriptorImageInfo *>(
+                    objs_[i]->getDescriptorInfo());
+            }
+        }
+    }
+
     virtual void
     execute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
             const std::vector<std::shared_ptr<core::ITensor>> &outputs) = 0;

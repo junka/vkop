@@ -29,11 +29,10 @@ class Topk : public Operator {
   public:
     explicit Topk()
         : Operator(OpType::TOPK, topk_spv, topk_spv_len,
+                   {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(topk::GpuTopkParam)) {
-        n_imgs_ = 0;
-        types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-        objs_.reserve(4);
+        update_after_bind_ = true;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>

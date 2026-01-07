@@ -22,8 +22,8 @@ class VulkanBuffer : public VulkanResource {
     ResourceType getResourceType() const override {
         return ResourceType::VK_BUFFER;
     }
-    std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
-    getDescriptorInfo() const override;
+    std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+    getDescriptorInfo() override;
 
     void transferBarrier(VkCommandBuffer commandBuffer,
                          VkAccessFlags dstAccessMask);
@@ -54,6 +54,7 @@ class VulkanBuffer : public VulkanResource {
     VkAccessFlags m_access_ = 0;
     // VkFormat m_format_;
     VkBufferView m_buffer_view_ = VK_NULL_HANDLE;
+    VkDescriptorBufferInfo buffer_info_;
 
     void transitionBuffer(VkCommandBuffer commandBuffer,
                           VkAccessFlags dstAccessMask,

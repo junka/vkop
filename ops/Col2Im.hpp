@@ -24,12 +24,9 @@ class Col2Im : public Operator {
   public:
     Col2Im()
         : Operator(OpType::COL2IM, col2im_spv, col2im_spv_len,
-                   sizeof(col2im::GpuCol2ImParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(col2im::GpuCol2ImParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

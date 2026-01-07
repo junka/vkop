@@ -23,13 +23,12 @@ class Split : public Operator {
   public:
     explicit Split()
         : Operator(OpType::SPLIT, split_spv, split_spv_len,
+                   {
+                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                   },
                    sizeof(split::GpuSplitParam)) {
-        n_imgs_ = 2;
-        types_ = {
-            VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-            VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-        };
-        objs_.reserve(types_.size());
+        update_after_bind_ = true;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>

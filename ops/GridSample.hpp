@@ -32,13 +32,10 @@ class GridSample : public Operator {
   public:
     GridSample()
         : Operator(OpType::GRIDSAMPLE, gridsample_spv, gridsample_spv_len,
-                   sizeof(gridsample::GpuGridSampleParam)) {
-        n_imgs_ = 3;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(gridsample::GpuGridSampleParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

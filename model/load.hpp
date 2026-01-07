@@ -33,6 +33,16 @@ struct Initializer {
     std::vector<uint32_t> dims;
 };
 
+
+struct UnifiedMetadata {
+    int dtype;
+    int name_len;
+    int offset;
+    int size;
+    int dims[4];
+};
+
+
 class VkModel {
 public:
     std::vector<Shape> inputs;
@@ -104,6 +114,8 @@ public:
     }
 private:
     void loadFromBinary(const std::string& filePath);
+
+    void readUnifiedTensors();
 
     static uint32_t readUint32(const char*& ptr, const char* end) {
         if (ptr + sizeof(uint32_t) > end) throw std::runtime_error("Unexpected end of file u32");

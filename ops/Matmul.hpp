@@ -21,13 +21,10 @@ class MatMul : public Operator {
   public:
     MatMul()
         : Operator(OpType::MATMUL, matmul_spv, matmul_spv_len,
-                   sizeof(matmul::GpuMatMulParam)) {
-        n_imgs_ = 3;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    };
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(matmul::GpuMatMulParam)) {};
 
   private:
     void execute(

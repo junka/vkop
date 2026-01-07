@@ -32,8 +32,8 @@ class VulkanResource {
     virtual ResourceType getResourceType() const = 0;
 
     // Method to get descriptor info
-    virtual std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
-    getDescriptorInfo() const = 0;
+    virtual std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+    getDescriptorInfo() = 0;
 
 #ifndef USE_VMA
     static int32_t

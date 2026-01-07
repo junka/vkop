@@ -24,12 +24,10 @@ class AveragePool : public Operator {
   public:
     AveragePool()
         : Operator(OpType::AVERAGEPOOL, averagepool_spv, averagepool_spv_len,
-                   sizeof(averagepool::GpuAveragePoolParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(averagepool::GpuAveragePoolParam)) {}
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("ceil_mode") != attributes.end()) {

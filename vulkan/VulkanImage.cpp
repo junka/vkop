@@ -285,6 +285,7 @@ void VulkanImage::createImageView() {
                           &m_imageView_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create image view!");
     }
+    image_info_.imageView = m_imageView_;
 }
 
 void VulkanImage::splitImageView(std::vector<int64_t> &layers) {
@@ -338,15 +339,13 @@ void VulkanImage::createSampler() {
                         &m_sampler_) != VK_SUCCESS) {
         throw std::runtime_error("failed to create texture sampler!");
     }
+    image_info_.sampler = m_sampler_;
 }
 
-std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
-VulkanImage::getDescriptorInfo() const {
-    VkDescriptorImageInfo image_info{};
-    image_info.imageLayout = m_layout_;
-    image_info.imageView = m_imageView_;
-    image_info.sampler = m_sampler_;
-    return image_info;
+std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+VulkanImage::getDescriptorInfo() {
+    image_info_.imageLayout = m_layout_;
+    return &image_info_;
 }
 
 void VulkanImage::transitionImageLayout(VkCommandBuffer commandBuffer,

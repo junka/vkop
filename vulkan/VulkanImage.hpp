@@ -24,8 +24,8 @@ class VulkanImage : public VulkanResource {
         return ResourceType::VK_IMAGE;
     }
 
-    std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
-    getDescriptorInfo() const override;
+    std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+    getDescriptorInfo() override;
 
     void transferBarrier(VkCommandBuffer commandBuffer, VkImageLayout newLayout,
                          VkAccessFlags dstAccessMask);
@@ -89,6 +89,7 @@ class VulkanImage : public VulkanResource {
 #endif
     VkImageView m_imageView_;
     VkSampler m_sampler_;
+    VkDescriptorImageInfo image_info_;
     std::vector<VkImageView> splitImageView_;
 
     int m_chansize_;

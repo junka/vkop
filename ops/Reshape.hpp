@@ -26,12 +26,9 @@ class Reshape : public Operator {
   public:
     explicit Reshape()
         : Operator(OpType::RESHAPE, reshape_spv, reshape_spv_len,
-                   sizeof(reshape::GpuReshapeParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(2);
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(reshape::GpuReshapeParam)) {}
 
   private:
     void setAttribute(const std::unordered_map<std::string, std::string>

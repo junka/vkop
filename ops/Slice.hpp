@@ -28,12 +28,9 @@ class Slice : public Operator {
   public:
     explicit Slice()
         : Operator(OpType::SLICE, slice_spv, slice_spv_len,
-                   sizeof(slice::GpuSliceParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(2);
-    }
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(slice::GpuSliceParam)) {}
 
     template <typename T>
     static std::vector<std::vector<int>>

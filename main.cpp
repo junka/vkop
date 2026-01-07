@@ -117,7 +117,7 @@ std::vector<MaskInfo> postProcessNMS(
 
 
 template<typename T>
-std::vector<T> resize_yuv444_unorm(const std::vector<uint8_t> &raw_image, int image_h, int image_w, std::shared_ptr<Tensor<T>> &t) {
+std::vector<T> resize_yuv444(const std::vector<uint8_t> &raw_image, int image_h, int image_w, std::shared_ptr<Tensor<T>> &t) {
     int in_h = t->getShape()[2];
     int in_w = t->getShape()[3];
 
@@ -160,15 +160,16 @@ std::vector<T> resize_yuv444_unorm(const std::vector<uint8_t> &raw_image, int im
             };
 
             int dst_idx = (dy * in_w) + dx;
-            float scale = 1;
+            float scale = 1.0F/255.0F;
             if (sizeof(T) == 2) {
-                scale = 257;
+                resized_image[dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
+                resized_image[u_offset+dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
+                resized_image[v_offset+dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
             } else if (sizeof(T) == 4) {
-                scale = 1.0F/255.0F;
+                resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
+                resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
+                resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
             }
-            resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
-            resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
-            resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
         }
     }
     return resized_image;
@@ -182,7 +183,7 @@ void processTensorInput(const std::shared_ptr<vkop::core::ITensor>& input,
     auto t = vkop::core::as_tensor<T>(input);
     tensor_h = t->getShape()[2];
     tensor_w = t->getShape()[3];
-    auto data = resize_yuv444_unorm(frame, image_h, image_w, t);
+    auto data = resize_yuv444(frame, image_h, image_w, t);
     frame.clear();
     frame.shrink_to_fit();
     t->copyToGPU(cmdpool, data.data());

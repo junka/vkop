@@ -25,11 +25,9 @@ class Maxpool2d : public Operator {
   public:
     Maxpool2d()
         : Operator(OpType::MAXPOOL2D, maxpool2d_spv, maxpool2d_spv_len,
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(maxpool2d::GpuMaxpoolParam)) {
-        n_imgs_ = 2;
-        types_ = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                  VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-        objs_.reserve(types_.size());
         kernel_shape_.reserve(2);
         dilations_.reserve(2);
         strides_.reserve(2);

@@ -107,14 +107,13 @@ void VulkanBuffer::createBufferView(VkFormat format) {
     }
 }
 
-std::variant<VkDescriptorImageInfo, VkDescriptorBufferInfo>
-VulkanBuffer::getDescriptorInfo() const {
+std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+VulkanBuffer::getDescriptorInfo() {
     VkBuffer buff = getBuffer();
-    VkDescriptorBufferInfo buffer_info{};
-    buffer_info.buffer = buff;
-    buffer_info.offset = 0;
-    buffer_info.range = m_size_;
-    return buffer_info;
+    buffer_info_.buffer = buff;
+    buffer_info_.offset = 0;
+    buffer_info_.range = m_size_;
+    return &buffer_info_;
 }
 
 void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
