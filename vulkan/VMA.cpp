@@ -32,13 +32,13 @@ VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
     if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create VMA allocator");
     }
-    createPools();
+    // createPools();
 }
 
 VMA::~VMA() {
-    vmaDestroyPool(allocator_, device_pool_);
-    vmaDestroyPool(allocator_, storage_pool_);
-    vmaDestroyPool(allocator_, staging_pool_);
+    // vmaDestroyPool(allocator_, device_pool_);
+    // vmaDestroyPool(allocator_, storage_pool_);
+    // vmaDestroyPool(allocator_, staging_pool_);
     vmaDestroyAllocator(allocator_);
 }
 
@@ -66,9 +66,9 @@ void VMA::createPools() {
     printf("Device pool memory type index: %d\n", mem_type_idx);
     VmaPoolCreateInfo device_pool_info = {};
     device_pool_info.memoryTypeIndex = mem_type_idx;
-    device_pool_info.blockSize = 16 * 1024 * 1024; // 16MB per block
+    device_pool_info.blockSize = 32 * 1024 * 1024; // 16MB per block
     device_pool_info.minBlockCount = 0;
-    device_pool_info.maxBlockCount = 32; // up to 16 * n
+    device_pool_info.maxBlockCount = 128; // up to 16 * n
     vmaCreatePool(allocator_, &device_pool_info, &device_pool_);
 
     VkBufferCreateInfo devbuf_info{};
@@ -123,14 +123,14 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
     VmaAllocationCreateInfo alloc_info = {};
     if (local) {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-        alloc_info.pool = storage_pool_;
+        // alloc_info.pool = storage_pool_;
     } else {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
         alloc_info.flags =
             VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
             VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
             VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        alloc_info.pool = staging_pool_;
+        // alloc_info.pool = staging_pool_;
     }
     buf->allocator = allocator_;
     return vmaCreateBuffer(allocator_, bufferInfo, &alloc_info, &buf->buffer,
@@ -140,7 +140,7 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
 VkResult VMA::createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img) {
     VmaAllocationCreateInfo alloc_info = {};
     alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
-    alloc_info.pool = device_pool_;
+    // alloc_info.pool = device_pool_;
     img->allocator = allocator_;
     return vmaCreateImage(allocator_, imageInfo, &alloc_info, &img->image,
                           &img->allocation, nullptr);

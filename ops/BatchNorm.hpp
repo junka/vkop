@@ -30,7 +30,7 @@ class BatchNorm : public Operator {
         : Operator(OpType::BATCHNORM, batchnorm_spv, batchnorm_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_UNIFORM},
                    sizeof(batchnorm::GpuBatchNormParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -89,7 +89,7 @@ class BatchNorm : public Operator {
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto para = core::as_tensor<T>(inputs[1]);
-            auto para_buffer = para->as_storage_buffer(m_dev_);
+            auto para_buffer = para->as_uniform_buffer(m_dev_);
             objs_.emplace_back(para_buffer);
         });
 

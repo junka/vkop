@@ -7,13 +7,13 @@
 #include <variant>
 
 #define STORAGE VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
-#define UNIFORM VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+#define UNIFORM VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT
 #define DESCRIPTOR_TYPE_STORAGE VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
-#define DESCRIPTOR_TYPE_UNIFORM VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER
+#define DESCRIPTOR_TYPE_UNIFORM VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER
 
 namespace vkop {
 // Enum to represent the type of resource
-enum class ResourceType { VK_IMAGE, VK_BUFFER };
+enum class ResourceType { VK_IMAGE, VK_BUFFER, VK_BUFFER_VIEW };
 
 // Abstract base class for Vulkan resources
 class VulkanResource {
@@ -32,7 +32,8 @@ class VulkanResource {
     virtual ResourceType getResourceType() const = 0;
 
     // Method to get descriptor info
-    virtual std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+    virtual std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *,
+                         VkBufferView *>
     getDescriptorInfo() = 0;
 
 #ifndef USE_VMA

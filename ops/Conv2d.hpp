@@ -55,8 +55,8 @@ class Conv2d : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_UNIFORM, DESCRIPTOR_TYPE_UNIFORM,
+                    DESCRIPTOR_TYPE_UNIFORM},
                    sizeof(conv2d::GPUConv2dParam)) {
         activation_ = conv2d::ActivationMode::NONE;
     }
@@ -227,12 +227,12 @@ class Conv2d : public Operator {
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto bias = core::as_tensor<T>(inputs[2]);
-                auto bias_buffer = bias->as_storage_buffer(m_dev_);
+                auto bias_buffer = bias->as_uniform_buffer(m_dev_);
                 objs_.emplace_back(bias_buffer);
             });
             scale_index++;
         } else {
-            objs_.emplace_back(dummyBuffer_);
+            objs_.emplace_back(dummy_bufferview_);
         }
 
         if (accuracy == 2) {
@@ -240,11 +240,11 @@ class Conv2d : public Operator {
             dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto scale = core::as_tensor<T>(inputs[scale_index]);
-                auto scale_buffer = scale->as_storage_buffer(m_dev_);
+                auto scale_buffer = scale->as_uniform_buffer(m_dev_);
                 objs_.emplace_back(scale_buffer);
             });
         } else {
-            objs_.emplace_back(dummyBuffer_);
+            objs_.emplace_back(dummy_bufferview_);
         }
 
         if (fuse_bn_) {
@@ -252,11 +252,11 @@ class Conv2d : public Operator {
             dispatch_by_dtype(inputs[index]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto para = core::as_tensor<T>(inputs[index]);
-                auto para_buffer = para->as_storage_buffer(m_dev_);
+                auto para_buffer = para->as_uniform_buffer(m_dev_);
                 objs_.emplace_back(para_buffer);
             });
         } else {
-            objs_.emplace_back(dummyBuffer_);
+            objs_.emplace_back(dummy_bufferview_);
         }
 
         auto out_gpu_shape = outputs[0]->getGPUShape();
@@ -296,9 +296,6 @@ class Conv2d : public Operator {
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         Operator::set_runtime_device(dev, cmdpool);
-        dummyBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, 16, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
     std::vector<int> kernel_shape_ = {0, 0};
@@ -310,7 +307,6 @@ class Conv2d : public Operator {
     int fuse_bn_ = 0;
     float int8scale_ = 1.0F;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
-    std::shared_ptr<VulkanBuffer> dummyBuffer_;
 }; // namespace ops
 
 } // namespace ops

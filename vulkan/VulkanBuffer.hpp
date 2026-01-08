@@ -14,29 +14,43 @@ class VulkanBuffer : public VulkanResource {
   public:
     VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, VkDeviceSize size,
                  VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
-                 VkFormat format = VK_FORMAT_UNDEFINED, int ext_fd = -1);
+                 int ext_fd = -1);
     ~VulkanBuffer() override;
 
     VkBuffer getBuffer() const;
-    VkBufferView getBufferView() const { return m_buffer_view_; };
     ResourceType getResourceType() const override {
         return ResourceType::VK_BUFFER;
     }
-    std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+    std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *,
+                 VkBufferView *>
     getDescriptorInfo() override;
 
+    VkDeviceSize getSize() const { return m_size_; }
+
     void transferBarrier(VkCommandBuffer commandBuffer,
-                         VkAccessFlags dstAccessMask);
-    void transferWriteBarrier(VkCommandBuffer commandBuffer);
-    void transferReadBarrier(VkCommandBuffer commandBuffer);
-    void readBarrier(VkCommandBuffer commandBuffer);
-    void writeBarrier(VkCommandBuffer commandBuffer);
+                         VkAccessFlags dstAccessMask,
+                         VkDeviceSize size = VK_WHOLE_SIZE,
+                         VkDeviceSize offset = 0);
+    void transferWriteBarrier(VkCommandBuffer commandBuffer,
+                              VkDeviceSize size = VK_WHOLE_SIZE,
+                              VkDeviceSize offset = 0);
+    void transferReadBarrier(VkCommandBuffer commandBuffer,
+                             VkDeviceSize size = VK_WHOLE_SIZE,
+                             VkDeviceSize offset = 0);
+    void readBarrier(VkCommandBuffer commandBuffer,
+                     VkDeviceSize size = VK_WHOLE_SIZE,
+                     VkDeviceSize offset = 0);
+    void writeBarrier(VkCommandBuffer commandBuffer,
+                      VkDeviceSize size = VK_WHOLE_SIZE,
+                      VkDeviceSize offset = 0);
 
     void copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
-                                 VkBuffer dstbuffer, VkDeviceSize dstoffset);
+                                 VkBuffer dstbuffer, VkDeviceSize dstoffset,
+                                 VkDeviceSize size, VkDeviceSize offset = 0);
 
     void copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
-                                 VkBuffer srcbuffer, VkDeviceSize srcoffset);
+                                 VkBuffer srcbuffer, VkDeviceSize srcoffset,
+                                 VkDeviceSize size, VkDeviceSize offset = 0);
 
 #ifdef USE_VMA
     void *getMappedMemory() override {
@@ -52,16 +66,17 @@ class VulkanBuffer : public VulkanResource {
 #endif
     VkDeviceSize m_size_;
     VkAccessFlags m_access_ = 0;
-    // VkFormat m_format_;
-    VkBufferView m_buffer_view_ = VK_NULL_HANDLE;
+
     VkDescriptorBufferInfo buffer_info_;
 
     void transitionBuffer(VkCommandBuffer commandBuffer,
                           VkAccessFlags dstAccessMask,
                           VkPipelineStageFlags src_stage,
-                          VkPipelineStageFlags dst_stage, VkDeviceSize offset);
+                          VkPipelineStageFlags dst_stage,
+                          VkDeviceSize size = VK_WHOLE_SIZE,
+                          VkDeviceSize offset = 0);
     void createBuffer(VkBufferUsageFlags usage, bool device_local);
-    void createBufferView(VkFormat format);
+    void createBufferView(VkFormat format, VkDeviceSize offset);
 };
 } // namespace vkop
 #endif // SRC_VULKANBUFFER_HPP_

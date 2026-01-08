@@ -8,8 +8,7 @@
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
                            VkDeviceSize size, VkBufferUsageFlags usage,
-                           VkMemoryPropertyFlags requireProperties,
-                           VkFormat format, int ext_fd)
+                           VkMemoryPropertyFlags requireProperties, int ext_fd)
     : VulkanResource(vdev), m_size_(size) {
     createBuffer(usage, ((requireProperties &
                           VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0));
@@ -34,16 +33,9 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
 #else
     (void)ext_fd;
 #endif
-    if (format != VK_FORMAT_UNDEFINED) {
-        createBufferView(format);
-    }
 }
 
 VulkanBuffer::~VulkanBuffer() {
-    if (m_buffer_view_ != VK_NULL_HANDLE) {
-        vkDestroyBufferView(m_vdev_->getLogicalDevice(), m_buffer_view_,
-                            nullptr);
-    }
 #ifndef USE_VMA
     if (m_buffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_vdev_->getLogicalDevice(), m_buffer_, nullptr);
@@ -90,24 +82,7 @@ void VulkanBuffer::createBuffer(VkBufferUsageFlags usage, bool device_local) {
     }
 }
 
-void VulkanBuffer::createBufferView(VkFormat format) {
-    VkBuffer buff = getBuffer();
-    VkBufferViewCreateInfo buffer_info{};
-    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_VIEW_CREATE_INFO;
-    buffer_info.flags = 0;
-    buffer_info.buffer = buff;
-    buffer_info.format = format;
-    buffer_info.range = m_size_;
-    buffer_info.offset = 0;
-
-    auto ret = vkCreateBufferView(m_vdev_->getLogicalDevice(), &buffer_info,
-                                  nullptr, &m_buffer_view_);
-    if (ret != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create buffer view");
-    }
-}
-
-std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *, VkBufferView *>
 VulkanBuffer::getDescriptorInfo() {
     VkBuffer buff = getBuffer();
     buffer_info_.buffer = buff;
@@ -120,7 +95,7 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
                                     VkAccessFlags dstAccessMask,
                                     VkPipelineStageFlags src_stage,
                                     VkPipelineStageFlags dst_stage,
-                                    VkDeviceSize offset) {
+                                    VkDeviceSize size, VkDeviceSize offset) {
     VkBuffer buff = getBuffer();
     VkBufferMemoryBarrier barrier;
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -131,7 +106,7 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.buffer = buff;
     barrier.offset = offset;
-    barrier.size = m_size_;
+    barrier.size = size;
 
     m_access_ = dstAccessMask;
 
@@ -140,76 +115,86 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
 }
 
 void VulkanBuffer::transferBarrier(VkCommandBuffer commandBuffer,
-                                   VkAccessFlags dstAccessMask) {
+                                   VkAccessFlags dstAccessMask,
+                                   VkDeviceSize size, VkDeviceSize offset) {
     VkPipelineStageFlags source_stage =
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags destination_stage =
         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT;
     transitionBuffer(commandBuffer, dstAccessMask, source_stage,
-                     destination_stage, 0);
+                     destination_stage, size, offset);
 }
 
-void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer) {
+void VulkanBuffer::transferReadBarrier(VkCommandBuffer commandBuffer,
+                                       VkDeviceSize size, VkDeviceSize offset) {
     transitionBuffer(commandBuffer, VK_ACCESS_TRANSFER_READ_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
                          VK_PIPELINE_STAGE_TRANSFER_BIT,
-                     0);
+                     size, offset);
 }
 
-void VulkanBuffer::transferWriteBarrier(VkCommandBuffer commandBuffer) {
+void VulkanBuffer::transferWriteBarrier(VkCommandBuffer commandBuffer,
+                                        VkDeviceSize size,
+                                        VkDeviceSize offset) {
     transitionBuffer(commandBuffer, VK_ACCESS_TRANSFER_WRITE_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_PIPELINE_STAGE_TRANSFER_BIT, 0);
+                     VK_PIPELINE_STAGE_TRANSFER_BIT, size, offset);
 }
 
-void VulkanBuffer::readBarrier(VkCommandBuffer commandBuffer) {
+void VulkanBuffer::readBarrier(VkCommandBuffer commandBuffer, VkDeviceSize size,
+                               VkDeviceSize offset) {
     transitionBuffer(commandBuffer, VK_ACCESS_SHADER_READ_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0);
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, size, offset);
 }
 
-void VulkanBuffer::writeBarrier(VkCommandBuffer commandBuffer) {
+void VulkanBuffer::writeBarrier(VkCommandBuffer commandBuffer,
+                                VkDeviceSize size, VkDeviceSize offset) {
     transitionBuffer(commandBuffer, VK_ACCESS_SHADER_WRITE_BIT,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0);
+                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, size, offset);
 }
 
 void VulkanBuffer::copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
                                            VkBuffer dstbuffer,
-                                           VkDeviceSize dstoffset) {
+                                           VkDeviceSize dstoffset,
+                                           VkDeviceSize size,
+                                           VkDeviceSize offset) {
     VkAccessFlags old_access = m_access_;
     if (m_access_ != VK_ACCESS_TRANSFER_READ_BIT) {
-        transferReadBarrier(commandBuffer);
+        transferReadBarrier(commandBuffer, size, offset);
     }
     VkBuffer buffer = getBuffer();
 
     VkBufferCopy copy_region = {};
-    copy_region.srcOffset = 0;
+    copy_region.srcOffset = offset;
     copy_region.dstOffset = dstoffset;
-    copy_region.size = m_size_;
+    copy_region.size = size;
 
     vkCmdCopyBuffer(commandBuffer, buffer, dstbuffer, 1, &copy_region);
 
-    transferBarrier(commandBuffer, old_access);
+    transferBarrier(commandBuffer, old_access, size, offset);
 }
 
 void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
                                            VkBuffer srcbuffer,
-                                           VkDeviceSize srcoffset) {
+                                           VkDeviceSize srcoffset,
+                                           VkDeviceSize size,
+                                           VkDeviceSize offset) {
     VkAccessFlags old_access = m_access_;
     if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
-        transferWriteBarrier(commandBuffer);
+        transferWriteBarrier(commandBuffer, size, offset);
     }
     VkBuffer buffer = getBuffer();
 
     VkBufferCopy copy_region = {};
     copy_region.srcOffset = srcoffset;
-    copy_region.dstOffset = 0;
-    copy_region.size = m_size_;
+    copy_region.dstOffset = offset;
+    copy_region.size = size;
 
     vkCmdCopyBuffer(commandBuffer, srcbuffer, buffer, 1, &copy_region);
 
-    transferBarrier(commandBuffer, old_access);
+    transferBarrier(commandBuffer, old_access, size, offset);
 }
 } // namespace vkop

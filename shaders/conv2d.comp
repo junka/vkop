@@ -19,17 +19,9 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*H_out, C4_out]
 layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
 layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
-layout(set=0, binding=3) readonly buffer biasBuffer {
-    uvec4 attr[];
-} uBias;
-
-layout(set=0, binding=4) readonly buffer scaleBuffer {
-    float attr[];
-} uScalePara;
-
-layout(set=0, binding=5) readonly buffer bnBuffer {
-    mat4 attr[];
-} uBnPara;
+layout(set=0, binding=3) uniform textureBuffer uBias;
+layout(set=0, binding=4) uniform textureBuffer uScalePara;
+layout(set=0, binding=5) uniform textureBuffer uBnPara;
 
 layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // [W_in, H_in, C_in, N]
@@ -50,10 +42,10 @@ layout(push_constant) uniform constBuffer {
 
 FLOAT4 batch_norm(FLOAT4 value, int c4, bvec4 valid_oc)
 {
-    vec4 scale4 = uBnPara.attr[c4][0];
-    vec4 bias4 = uBnPara.attr[c4][1];
-    vec4 mean4 = uBnPara.attr[c4][2];
-    vec4 var4 = uBnPara.attr[c4][3];
+    vec4 scale4 = texelFetch(uBnPara, c4 * 4);
+    vec4 bias4 = texelFetch(uBnPara, c4 * 4 + 1);
+    vec4 mean4 = texelFetch(uBnPara, c4 * 4 + 2);
+    vec4 var4 = texelFetch(uBnPara, c4 * 4 + 3);
 
     // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
     vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));
@@ -64,18 +56,8 @@ FLOAT4 batch_norm(FLOAT4 value, int c4, bvec4 valid_oc)
 
 // support both accuracy and fp32 initializer
 FLOAT4 add_bias(FLOAT4 value, int c4, bvec4 valid_oc) {
-    FLOAT4 bias_value = FLOAT4(0.0);
-    if (uConstant.accuracy == 1) {
-        int gc4 = c4 / 2;
-        int comp = c4 % 2;
-        uvec4 packed_vec = uBias.attr[gc4];
-        bias_value.xy = FLOAT2(unpackHalf2x16(packed_vec[2*comp]));
-        bias_value.zw = FLOAT2(unpackHalf2x16(packed_vec[2*comp+1]));
-    } else {
-        bias_value = FLOAT4(uintBitsToFloat(uBias.attr[c4]));
-    }
+    FLOAT4 bias_value = FLOAT4(texelFetch(uBias, c4));
     bias_value *= FLOAT4(valid_oc);
-
     return value + bias_value;
 }
 
@@ -150,22 +132,22 @@ void conv1x1() {
 
                     // Kernel: stored as [ic4, oc], layer=0
                     // Fetch weight for each of the 4 output channels
-                    // ic4, oc [0, 1, 2, 3}
+                    // ic4, oc [0, 1, 2, 3]
                     FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[0], 0), 0));
                     if (uConstant.accuracy == 2) {
-                        w0 *= FLOAT(uScalePara.attr[oc_vec[0]] * 127.0);
+                        w0 *= FLOAT(texelFetch(uScalePara, c4)[0] * 127.0);
                     }
                     FLOAT4 w1 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[1], 0), 0));
                     if (uConstant.accuracy == 2) {
-                        w1 *= FLOAT(uScalePara.attr[oc_vec[1]] * 127.0);
+                        w1 *= FLOAT(texelFetch(uScalePara, c4)[1] * 127.0);
                     }
                     FLOAT4 w2 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[2], 0), 0));
                     if (uConstant.accuracy == 2) {
-                        w2 *= FLOAT(uScalePara.attr[oc_vec[2]] * 127.0);
+                        w2 *= FLOAT(texelFetch(uScalePara, c4)[2] * 127.0);
                     }
                     FLOAT4 w3 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[3], 0), 0));
                     if (uConstant.accuracy == 2) {
-                        w3 *= FLOAT(uScalePara.attr[oc_vec[3]] * 127.0);
+                        w3 *= FLOAT(texelFetch(uScalePara, c4)[3] * 127.0);
                     }
 
                     acc_local.x += dot(x_vec, w0);
@@ -188,19 +170,19 @@ void conv1x1() {
                     FLOAT4 w_vec;
                     w_vec.x = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc_vec[0], 0), 0)[kernel_comp]);
                     if (uConstant.accuracy == 2) {
-                        w_vec.x *= FLOAT(uScalePara.attr[oc_vec[0]] * 127.0);
+                        w_vec.x *= FLOAT(texelFetch(uScalePara, c4)[0] * 127.0);
                     }
                     w_vec.y = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc_vec[1], 0), 0)[kernel_comp]);
                     if (uConstant.accuracy == 2) {
-                        w_vec.y *= FLOAT(uScalePara.attr[oc_vec[1]] * 127.0);
+                        w_vec.y *= FLOAT(texelFetch(uScalePara, c4)[1] * 127.0);
                     }
                     w_vec.z = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc_vec[2], 0), 0)[kernel_comp]);
                     if (uConstant.accuracy == 2) {
-                        w_vec.z *= FLOAT(uScalePara.attr[oc_vec[2]] * 127.0);
+                        w_vec.z *= FLOAT(texelFetch(uScalePara, c4)[2] * 127.0);
                     }
                     w_vec.w = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc_vec[3], 0), 0)[kernel_comp]);
                     if (uConstant.accuracy == 2) {
-                        w_vec.w *= FLOAT(uScalePara.attr[oc_vec[3]] * 127.0);
+                        w_vec.w *= FLOAT(texelFetch(uScalePara, c4)[3] * 127.0);
                     }
                     acc_local += x * w_vec;
                 }
@@ -223,7 +205,7 @@ void conv1x1() {
                         FLOAT4 x_vec = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0));
                         FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(v, oc, 0), 0));
                         if (uConstant.accuracy == 2) {
-                            w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
+                            w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
                         sum += dot(x_vec, w_vec);
                     }
@@ -239,7 +221,7 @@ void conv1x1() {
 
                         FLOAT w = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc, 0), 0)[kernel_comp]);
                         if (uConstant.accuracy == 2) {
-                            w *= FLOAT(uScalePara.attr[oc] * 127.0);
+                            w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
                         sum += x * w;
                     }
@@ -265,12 +247,7 @@ void conv1x1() {
                     // Fetch weight for each of the 4 output channels
                     int local_ic = global_ic - ic_start;
                     FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0));   // oc4, ic
-                    FLOAT4 scale_vec = FLOAT4(
-                        uScalePara.attr[oc_vec[0]],
-                        uScalePara.attr[oc_vec[1]],
-                        uScalePara.attr[oc_vec[2]],
-                        uScalePara.attr[oc_vec[3]]
-                    );
+                    FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                     if (uConstant.accuracy == 2) {
                         w0 *= scale_vec * FLOAT(127.0);
                     }
@@ -304,10 +281,8 @@ void conv1x1() {
                     // Fetch weight for each of the 4 output channels
                     FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0)); // oc4, ic
                     if (uConstant.accuracy == 2) {
-                        w_vec.x *= FLOAT(uScalePara.attr[oc_vec[0]] * 127.0);
-                        w_vec.y *= FLOAT(uScalePara.attr[oc_vec[1]] * 127.0);
-                        w_vec.z *= FLOAT(uScalePara.attr[oc_vec[2]] * 127.0);
-                        w_vec.w *= FLOAT(uScalePara.attr[oc_vec[3]] * 127.0);
+                        vec4 scale_vec = texelFetch(uScalePara, c4) * float(127.0);
+                        w_vec *= scale_vec;
                     }
                     acc_local += x * w_vec;
                 }
@@ -332,20 +307,12 @@ void conv1x1() {
                         FLOAT4 w_vec;
                         int local_ic = global_ic - ic_start;
                         w_vec.x = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0)[comp]);
-                        if (uConstant.accuracy == 2) {
-                            w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
-                        }
                         w_vec.y = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic + 1, 0), 0)[comp]);
-                        if (uConstant.accuracy == 2) {
-                            w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
-                        }
                         w_vec.z = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic + 2, 0), 0)[comp]);
-                        if (uConstant.accuracy == 2) {
-                            w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
-                        }
                         w_vec.w = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic + 3, 0), 0)[comp]);
                         if (uConstant.accuracy == 2) {
-                            w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
+                            float scale = texelFetch(uScalePara, c4)[comp] * 127.0;
+                            w_vec *= scale;
                         }
                         sum += dot(x_vec, w_vec);
                     }
@@ -359,7 +326,7 @@ void conv1x1() {
                         int local_ic = ic - ic_start;
                         FLOAT w = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0)[comp]);
                         if (uConstant.accuracy == 2) {
-                            w *= FLOAT(uScalePara.attr[oc] * 127.0);
+                            w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
                         sum += x * w;
                     }
@@ -452,12 +419,7 @@ void grouped_conv2d() {
                             int local_ic = global_ic0 - ic_start;
                             // Each output channel has its own row in Y, same layer c4
                             FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0));
-                            FLOAT4 scale_vec = FLOAT4(
-                                uScalePara.attr[oc_vec[0]],
-                                uScalePara.attr[oc_vec[1]],
-                                uScalePara.attr[oc_vec[2]],
-                                uScalePara.attr[oc_vec[3]]
-                            );
+                            FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                             if (uConstant.accuracy == 2) {
                                 w0 *= scale_vec * FLOAT(127.0);
                             }
@@ -490,12 +452,7 @@ void grouped_conv2d() {
 
                             FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0));
                             if (uConstant.accuracy == 2) {
-                                FLOAT4 scale_vec = FLOAT4(
-                                    uScalePara.attr[oc_vec[0]],
-                                    uScalePara.attr[oc_vec[1]],
-                                    uScalePara.attr[oc_vec[2]],
-                                    uScalePara.attr[oc_vec[3]]
-                                );
+                                FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                                 w_vec *= scale_vec * FLOAT(127.0);
                             }
 
@@ -531,7 +488,7 @@ void grouped_conv2d() {
                             int kernel_comp = oc % 4;
                             FLOAT w = FLOAT(texelFetch(uKernel, ivec3(kx, ky + local_ci * K_H, c4), 0)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
-                                w *= FLOAT(uScalePara.attr[oc] * 127.0);
+                                w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                             }
 
                             sum += x * w;
@@ -568,19 +525,19 @@ void grouped_conv2d() {
                             // Each oc has its own row in kernel texture
                             FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, v), 0));
                             if (uConstant.accuracy == 2) {
-                                w0 *= FLOAT(uScalePara.attr[oc_vec[0]] * 127.0);
+                                w0 *= FLOAT(texelFetch(uScalePara, c4)[0] * 127.0);
                             }
                             FLOAT4 w1 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, v), 0));
                             if (uConstant.accuracy == 2) {
-                                w1 *= FLOAT(uScalePara.attr[oc_vec[1]] * 127.0);
+                                w1 *= FLOAT(texelFetch(uScalePara, c4)[1] * 127.0);
                             }
                             FLOAT4 w2 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, v), 0));
                             if (uConstant.accuracy == 2) {
-                                w2 *= FLOAT(uScalePara.attr[oc_vec[2]] * 127.0);
+                                w2 *= FLOAT(texelFetch(uScalePara, c4)[2] * 127.0);
                             }
                             FLOAT4 w3 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, v), 0));
                             if (uConstant.accuracy == 2) {
-                                w3 *= FLOAT(uScalePara.attr[oc_vec[3]] * 127.0);
+                                w3 *= FLOAT(texelFetch(uScalePara, c4)[3]* 127.0);
                             }
 
                             // Broadcast x_vec and multiply per-output-channel weights
@@ -604,19 +561,19 @@ void grouped_conv2d() {
                             FLOAT4 w_vec;
                             w_vec.x = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, kernel_layer), 0)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
-                                w_vec.x *= FLOAT(uScalePara.attr[oc_vec[0]] * 127.0);
+                                w_vec.x *= FLOAT(texelFetch(uScalePara, c4)[0] * 127.0);
                             }
                             w_vec.y = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, kernel_layer), 0)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
-                                w_vec.y *= FLOAT(uScalePara.attr[oc_vec[1]] * 127.0);
+                                w_vec.y *= FLOAT(texelFetch(uScalePara, c4)[1] * 127.0);
                             }
                             w_vec.z = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, kernel_layer), 0)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
-                                w_vec.z *= FLOAT(uScalePara.attr[oc_vec[2]] * 127.0);
+                                w_vec.z *= FLOAT(texelFetch(uScalePara, c4)[2] * 127.0);
                             }
                             w_vec.w = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, kernel_layer), 0)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
-                                w_vec.w *= FLOAT(uScalePara.attr[oc_vec[3]] * 127.0);
+                                w_vec.w *= FLOAT(texelFetch(uScalePara, c4)[3] * 127.0);
                             }
                             acc_local += x * w_vec;
                         }
@@ -658,7 +615,7 @@ void grouped_conv2d() {
                                 FLOAT4 x_vec = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0));
                                 FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0));
                                 if (uConstant.accuracy == 2) {
-                                    w_vec *= FLOAT(uScalePara.attr[oc] * 127.0);
+                                    w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                                 }
                                 sum4 += x_vec * w_vec;
                             }
@@ -683,7 +640,7 @@ void grouped_conv2d() {
                                 FLOAT4 weight_vec = FLOAT4(texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0));
                                 FLOAT w = weight_vec[local_ic_comp];
                                 if (uConstant.accuracy == 2) {
-                                    w *= FLOAT(uScalePara.attr[oc] * 127.0);
+                                    w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                                 }
 
                                 sum += input_val * w;

@@ -12,7 +12,11 @@
 #include "include/logger.hpp"
 #include "vulkan/VulkanQueryPool.hpp"
 #endif
+
 namespace vkop {
+std::shared_ptr<VulkanBuffer> ops::Operator::dummy_buffer_ = nullptr;
+std::shared_ptr<VulkanBufferView> ops::Operator::dummy_bufferview_ = nullptr;
+std::atomic<int> ops::Operator::instance_count_{0};
 namespace core {
 
 Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
@@ -81,7 +85,12 @@ void Runtime::LoadModel() {
         }
 
         if (tensor->num_dims() <= 2) {
-            tensor->as_storage_buffer(dev);
+            if (inputs_for_node_type[init.name] == "Conv" ||
+                inputs_for_node_type[init.name] == "BatchNormalization") {
+                tensor->as_uniform_buffer(dev);
+            } else {
+                tensor->as_storage_buffer(dev);
+            }
             tensor->copyToGPU(m_cmdpool_, src_ptr);
         } else {
             tensor->as_input_image(dev, nullptr);
@@ -90,6 +99,17 @@ void Runtime::LoadModel() {
         tensor_map[init.name] = tensor;
         initializers_[init.name] = tensor;
     };
+
+    if (model.initializers.find("unified_tensor") != model.initializers.end()) {
+        auto unified = model.initializers["unified_tensor"];
+        size_t offset = model.initializer_offsets["unified_tensor"];
+        uint8_t *src_ptr = model.initializer_memory.data() + offset;
+        auto t = std::make_shared<Tensor<float>>(unified.dims);
+        t->set_ref_cnt_forever();
+        handle_floating_point_tensor(unified,
+                                     reinterpret_cast<float *>(src_ptr), t);
+        model.initializers.erase("unified_tensor");
+    }
 
     for (const auto &itr : model.initializers) {
         auto init = itr.second;

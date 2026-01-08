@@ -2,6 +2,7 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <cstddef>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -13,6 +14,7 @@
 
 namespace vkop {
 namespace ops {
+
 class Operator {
   public:
     explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
@@ -21,6 +23,7 @@ class Operator {
         : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len),
           types_(std::move(types)) {
         assert(pc_size_ <= 128);
+        ++instance_count_;
 
         objs_.reserve(types_.size());
         writes_.resize(types_.size());
@@ -30,6 +33,11 @@ class Operator {
         for (auto &m_d : m_ds_) {
             if (m_d)
                 pipeline_->freeDescriptorSets(m_d);
+        }
+        --instance_count_;
+        if (instance_count_ == 0 && dummy_buffer_) {
+            dummy_bufferview_.reset(); // Release the shared buffer
+            dummy_buffer_.reset();     // Release the shared buffer
         }
         m_cmdpool_ = nullptr;
         m_dev_ = nullptr;
@@ -51,6 +59,13 @@ class Operator {
             for (auto &ds : m_ds_) {
                 ds = pipeline_->allocDescriptorSets();
             }
+        }
+        if (!dummy_buffer_) {
+            dummy_buffer_ = std::make_shared<VulkanBuffer>(
+                m_dev_, 16, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            dummy_bufferview_ = std::make_shared<VulkanBufferView>(
+                m_dev_, dummy_buffer_, VK_FORMAT_R32G32B32A32_SFLOAT, 16, 0);
         }
     }
 
@@ -107,6 +122,10 @@ class Operator {
         execute(inputs, outputs);
     }
 
+    static std::shared_ptr<VulkanBuffer> dummy_buffer_;
+    static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
+    static std::atomic<int> instance_count_;
+
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
@@ -152,8 +171,7 @@ class Operator {
         }
     }
 
-    virtual void submit(void *ptr, int out_width, int out_height,
-                        int out_layers) {
+    virtual void submit(void *ptr, int width, int height, int layers) {
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }
@@ -164,7 +182,7 @@ class Operator {
         if (ptr) {
             m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
         }
-        m_cmd_->dispatch(out_width, out_height, out_layers);
+        m_cmd_->dispatch(width, height, layers);
     }
 
   private:
@@ -176,18 +194,21 @@ class Operator {
             writes_[i].dstArrayElement = 0;
             writes_[i].descriptorCount = 1;
             writes_[i].descriptorType = types_[i];
-            if (objs_[i]->getResourceType() == ResourceType::VK_BUFFER) {
-                auto b = std::static_pointer_cast<VulkanBuffer>(objs_[i]);
-                auto *view = b->getBufferView();
-                if (view != VK_NULL_HANDLE) {
-                    writes_[i].pTexelBufferView = &view;
-                } else {
-                    writes_[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
-                        objs_[i]->getDescriptorInfo());
-                }
-            } else {
+            switch (objs_[i]->getResourceType()) {
+            case ResourceType::VK_BUFFER_VIEW:
+                writes_[i].pTexelBufferView =
+                    std::get<VkBufferView *>(objs_[i]->getDescriptorInfo());
+                break;
+            case ResourceType::VK_BUFFER:
+                writes_[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
+                    objs_[i]->getDescriptorInfo());
+                break;
+            case ResourceType::VK_IMAGE:
                 writes_[i].pImageInfo = std::get<VkDescriptorImageInfo *>(
                     objs_[i]->getDescriptorInfo());
+                break;
+            default:
+                break;
             }
         }
     }

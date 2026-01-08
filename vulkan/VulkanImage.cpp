@@ -342,7 +342,7 @@ void VulkanImage::createSampler() {
     image_info_.sampler = m_sampler_;
 }
 
-std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *>
+std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *, VkBufferView *>
 VulkanImage::getDescriptorInfo() {
     image_info_.imageLayout = m_layout_;
     return &image_info_;

@@ -198,9 +198,11 @@ int main(int argc, char *argv[]) {
     std::shared_ptr<VulkanDevice> dev;
     try {
         auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+        printf("Found %ld physical devices\n", phydevs.size());
         for (auto *pdev : phydevs) {
             auto vdev = std::make_shared<VulkanDevice>(pdev);
             if (vdev->getDeviceName().find("llvmpipe") != std::string::npos) {
+                vdev.reset();
                 continue;
             }
             dev = vdev;
@@ -255,7 +257,7 @@ int main(int argc, char *argv[]) {
             return -1;
         }
         double tot_lat = 0.0F;
-        int count = 100;
+        int count = 10;
         for (int i = 0; i < count; i ++) {
             auto lat = rt->Run();
             tot_lat += lat;

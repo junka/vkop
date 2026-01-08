@@ -3,6 +3,7 @@
 #define CORE_TENSOR_HPP_
 
 #include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanBufferView.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
@@ -350,10 +351,26 @@ template <typename T> class Tensor : public ITensor {
         }
         return buff;
     }
-    std::shared_ptr<VulkanBuffer>
+    std::shared_ptr<VulkanBufferView>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
-        make_vkbuff(vd, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        if (vkobj_) {
+            auto buff = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            return buff;
+        }
+        auto aligned = 16 * UP_DIV(num_elements(), 16 / sizeof(T));
+        auto vkbuffer = std::make_shared<VulkanBuffer>(
+            vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        if (sizeof(T) == 1) {
+            format = VK_FORMAT_R8G8B8A8_SNORM;
+        } else if (sizeof(T) == 2) {
+            format = VK_FORMAT_R16G16B16A16_SFLOAT;
+        }
+        auto view = std::make_shared<VulkanBufferView>(vd, vkbuffer, format,
+                                                       aligned, 0);
+        vkobj_ = view;
+        return view;
     }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
@@ -546,7 +563,7 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_) {
             return;
         }
-        // aligned to uvec4 elements, so any uvec4 type would work
+        // aligned to vec4 elements, so any vec4 type would work
         auto aligned = 16 * UP_DIV(num_elements(), 16 / sizeof(T));
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -588,7 +605,6 @@ template <typename T> class Tensor : public ITensor {
 
     void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                          T *src = nullptr) {
-        auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
 
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool, false);
@@ -607,9 +623,16 @@ template <typename T> class Tensor : public ITensor {
         } else {
             memcpy(b->ptr, data_->data(), size_);
         }
+        std::shared_ptr<VulkanBuffer> buffer;
+        if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
+            buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        } else {
+            auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            buffer = view->getBuffer();
+        }
 
         cmd.begin();
-        buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset);
+        buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset, size_);
         buffer->readBarrier(cmd.get());
         cmd.end();
         auto submit_value = cmd.submit(dev->getComputeQueue());
@@ -619,7 +642,6 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyBufferToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
 
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool, false);
@@ -634,9 +656,16 @@ template <typename T> class Tensor : public ITensor {
             printf("copyBufferToCPU stpool alloc failed %d\n", size_);
             return;
         }
+        std::shared_ptr<VulkanBuffer> buffer;
+        if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
+            buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        } else {
+            auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            buffer = view->getBuffer();
+        }
 
         cmd.begin();
-        buffer->copyBufferToStageBuffer(cmd.get(), buff, b->offset);
+        buffer->copyBufferToStageBuffer(cmd.get(), buff, b->offset, size_, 0);
         cmd.end();
         auto submit_value = cmd.submit(dev->getComputeQueue());
         cmd.wait(dev->getComputeQueue());

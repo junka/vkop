@@ -1643,6 +1643,11 @@ def unified_initializers(vk_model):
     """
     print("Consolidating 1D and 2D initializers...")
 
+    initializer_consumers = defaultdict(list)
+    for node in vk_model.nodes:
+        for inp in node['inputs']:
+            initializer_consumers[inp['name']].append(node)
+
     # Identify 1D and 2D tensors
     tensors_to_consolidate = []
     tensor_info = []  # Store tensor name, shape, data, and offset
@@ -1650,8 +1655,15 @@ def unified_initializers(vk_model):
     for name, initializer in vk_model.initializers.items():
         dims = list(initializer.dims)
         if len(dims) in [1, 2]:  # Only 1D or 2D tensors
-            tensor_data = numpy_helper.to_array(initializer)
-            tensors_to_consolidate.append((name, dims, initializer.data_type, tensor_data))
+            consumers = initializer_consumers.get(name, [])
+            consumer_ops = {node['op_type'] for node in consumers}
+            
+            # Only process if it's consumed by Conv or BatchNormalization
+            if any(op in ['Conv', 'BatchNormalization'] for op in consumer_ops):
+                tensor_data = numpy_helper.to_array(initializer)
+                tensors_to_consolidate.append((name, dims, initializer.data_type, tensor_data))
+            else:
+                print(f"Skipping tensor {name} as it's not consumed by Conv or BatchNormalization")
 
     if not tensors_to_consolidate:
         print("No 1D or 2D tensors found to consolidate.")
@@ -1692,10 +1704,10 @@ def unified_initializers(vk_model):
     # Create a new unified initializer
     unified_name = "unified_tensors"
     unified_initializer = numpy_helper.from_array(
-        np.frombuffer(unified_data, dtype=np.uint8), 
+        np.frombuffer(unified_data, dtype=np.float32), 
         unified_name
     )
-    unified_initializer.data_type = onnx.TensorProto.UINT8
+    unified_initializer.data_type = onnx.TensorProto.FLOAT
 
     # Update the model: remove old tensors and add unified one
     for name, _, _, _ in tensors_to_consolidate:
@@ -1709,7 +1721,7 @@ def unified_initializers(vk_model):
     for idx, info in enumerate(tensor_info):
         # Add name length, offset, and size_bytes as integers
         name_length = len(info['name'])
-        
+
         # Add to metadata list
         metadata_list.append(info['type'])
         metadata_list.append(name_length)
@@ -1721,7 +1733,7 @@ def unified_initializers(vk_model):
         pad_dims = [0] * 2
         metadata_list.extend(shape_dims)
         metadata_list.extend(pad_dims)
-    
+
     metadata_array = np.array(metadata_list, dtype=np.int32)
     metadata_initializer = numpy_helper.from_array(metadata_array, "unified_metadata")
     vk_model.initializers["unified_metadata"] = metadata_initializer
@@ -1730,7 +1742,7 @@ def unified_initializers(vk_model):
     for info in tensor_info:
         name_bytes = info['name'].encode('utf-8')
         all_names_bytes += name_bytes
-    
+
     names_array = np.frombuffer(all_names_bytes, dtype=np.uint8)
     names_initializer = numpy_helper.from_array(names_array, "unified_names")
     vk_model.initializers["unified_names"] = names_initializer
