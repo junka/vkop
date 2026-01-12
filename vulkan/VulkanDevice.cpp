@@ -625,4 +625,6 @@ bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
     return is_unified_memory;
 }
 
+void VulkanDevice::wait_all_done() { vkDeviceWaitIdle(logicalDevice_); }
+
 } // namespace vkop

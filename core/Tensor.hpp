@@ -357,7 +357,7 @@ template <typename T> class Tensor : public ITensor {
             auto buff = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
             return buff;
         }
-        auto aligned = 16 * UP_DIV(num_elements(), 16 / sizeof(T));
+        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         auto vkbuffer = std::make_shared<VulkanBuffer>(
             vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -563,8 +563,7 @@ template <typename T> class Tensor : public ITensor {
         if (vkobj_) {
             return;
         }
-        // aligned to vec4 elements, so any vec4 type would work
-        auto aligned = 16 * UP_DIV(num_elements(), 16 / sizeof(T));
+        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
@@ -631,8 +630,9 @@ template <typename T> class Tensor : public ITensor {
             buffer = view->getBuffer();
         }
 
+        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         cmd.begin();
-        buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset, size_);
+        buffer->copyStageBufferToBuffer(cmd.get(), buff, b->offset, aligned, 0);
         buffer->readBarrier(cmd.get());
         cmd.end();
         auto submit_value = cmd.submit(dev->getComputeQueue());

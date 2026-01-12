@@ -93,6 +93,7 @@ class VulkanDevice {
                            [layout](VkImageLayout i) { return i == layout; });
         return false;
     }
+    void wait_all_done();
     bool is_support_host_image_copy() const {
         return m_support_host_image_copy_;
     }

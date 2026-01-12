@@ -130,7 +130,7 @@ class VkModel:
         f.write(struct.pack('Q', len(data)))
         f.write(data)
 
-def optimize_onnx_model(onnx_model):
+def optimize_onnx_model(onnx_model, batch_size = 1):
     """
     Optimize the ONNX model using ONNX's built-in optimizer.
     """
@@ -166,8 +166,8 @@ def optimize_onnx_model(onnx_model):
             if d.HasField("dim_value"):
                 fixed_shape.append(d.dim_value)
             elif d.HasField("dim_param"):
-                # 动态维度（如 "N", "batch"）→ 固定为 1
-                fixed_shape.append(1)
+                # 动态维度（如 "N", "batch"） 固定为 1
+                fixed_shape.append(batch_size)
             else:
                 # 未知维度（理论上不应出现），保守设为 1
                 fixed_shape.append(1)
@@ -195,7 +195,7 @@ def is_topologically_sortable(graph):
                 raise ValueError(f"Tensor '{out}' is produced by multiple nodes!")
             produced_by[out] = idx  # 记录生产者索引
 
-    # 初始可用张量：inputs + initializers
+    # 初始可用张量: inputs + initializers
     initial_tensors = {inp.name for inp in graph.input}
     initial_tensors.update(init.name for init in graph.initializer)
 
@@ -1185,7 +1185,7 @@ def quantize_to_int8_weight_only(vk_model):
                 scale = scale_keepdims  # For per-tensor, scale is scalar
                 arr_int8 = np.round(arr / scale_keepdims).astype(np.int8)
 
-            # === 反量化：INT8 -> FP32 ===
+            # === 反量化: INT8 -> FP32 ===
             if axis is not None:
                 # Broadcast scale back to original shape for dequantization
                 scale_broadcast = np.expand_dims(scale, axis=axis) if np.ndim(scale) > 0 else scale
@@ -1401,12 +1401,12 @@ def unsqueeze_initializers(vk_model):
 class ModelConverter:
     """Main class for converting ONNX models to VKOP format."""
     @staticmethod
-    def parse_onnx_model(onnx_path):
+    def parse_onnx_model(onnx_path, batch_size):
         model = onnx.load(onnx_path)
 
         # Optimize the ONNX model
         print("Optimizing ONNX model...")
-        model = optimize_onnx_model(model)
+        model = optimize_onnx_model(model, batch_size)
         # save optimized model
         onnx.save(model, "optimized_" + os.path.basename(onnx_path))
 
@@ -1657,7 +1657,7 @@ def unified_initializers(vk_model):
         if len(dims) in [1, 2]:  # Only 1D or 2D tensors
             consumers = initializer_consumers.get(name, [])
             consumer_ops = {node['op_type'] for node in consumers}
-            
+
             # Only process if it's consumed by Conv or BatchNormalization
             if any(op in ['Conv', 'BatchNormalization'] for op in consumer_ops):
                 tensor_data = numpy_helper.to_array(initializer)
@@ -1765,17 +1765,21 @@ def main():
     parser.add_argument("-q","--quant", help="Override input_model")
     parser.add_argument("-i","--input", required=True, help="input_model file")
     parser.add_argument("-u","--unify", action='store_true', help="convert initializers to a single memory block")
+    parser.add_argument("-b","--batch", help="batch size for inference")
     args = parser.parse_args()
     if args.quant is not None:
         if args.quant not in ["fp16", "int8"]:
             print("Invalid quantization type. Please specify 'fp16' or 'int8'.")
             sys.exit(1)
 
-    onnx_model_path = args.input
-    output_bin_path = os.path.splitext(onnx_model_path)[0] + ".vkopbin"
+    output_bin_path = os.path.splitext(args.input)[0] + ".vkopbin"
 
     print("Parsing ONNX model...")
-    vk_model = ModelConverter.parse_onnx_model(onnx_model_path)
+    if args.batch is not None:
+        batch_size = int(args.batch)
+    else:
+        batch_size = 1
+    vk_model = ModelConverter.parse_onnx_model(args.input, batch_size)
 
     # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
     move_input_tensor_to_attr(vk_model)

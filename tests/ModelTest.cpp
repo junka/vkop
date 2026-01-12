@@ -48,7 +48,7 @@ public:
                 (*ta)[i] = a;
                 (*tb)[i] = b;
             }
-            expectedOutput[i] = a+b;
+            expectedOutput[i] = a + b;
         }
     }
 
@@ -168,6 +168,22 @@ int main() {
         }
     }
 #if 0
+    printf("input : [%d, %d, %d, %d]\n", t1->get_batch(), t1->get_channel(), t1->get_height(), t1->get_width());
+    for (int i = 0; i < t1->get_batch(); ++i) {
+        printf("[\n");
+        for (int j = 0; j < t1->get_channel(); ++j) {
+            printf("[\n");
+            for (int k = 0; k < t1->get_height(); ++k) {
+                printf("[");
+                for (int l = 0; l < t1->get_width(); ++l) {
+                    printf("%f, ", test.expectedOutput[(((i * t1->get_channel() + j) * t1->get_height() + k) * t1->get_width()) + l]);
+                }
+                printf("]\n");
+            }
+            printf("]\n");
+        }
+        printf("]\n");
+    }
     printf("Scale is:\n");
     for (int i = 0 ; i < weight_shape[0]; ++i) {
         printf("%f, ", scale->at(i));
@@ -180,9 +196,9 @@ int main() {
             for (int k = 0; k < weight_shape[2]; ++k) {
                 printf("[");
                 for (int l = 0; l < weight_shape[3]; ++l) {
-                    printf("%d, ", weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + (j * weight_shape[2] * weight_shape[3]) + (k * weight_shape[3]) + l));
+                    printf("%f, ", ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + (j * weight_shape[2] * weight_shape[3]) + (k * weight_shape[3]) + l));
                 }
-                printf("]");
+                printf("]\n");
             }
             printf("]\n");
         }
@@ -207,12 +223,31 @@ int main() {
     int stride_w = 1;
     int dilation_h = 1;
     int dilation_w = 1;
-    int group = 1;
+    int group = 16;
     test.reference_conv2d(test.expectedOutput.data(), ori_weight, bias, ref_output_data, batch, ic, oc, ih, iw, pad_h, pad_w, kh, kw, stride_h, stride_w, dilation_h, dilation_w, group);
+#if 0
+    auto output_shape = result->getShape();
+    printf("Reference output : [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
+    for (int i = 0; i < output_shape[0]; ++i) {
+        printf("[\n");
+        for (int j = 0; j < output_shape[1]; ++j) {
+            printf("[\n");
+            for (int k = 0; k < output_shape[2]; ++k) {
+                printf("[");
+                for (int l = 0; l < output_shape[3]; ++l) {
+                    printf("%f, ", ref_output_data[(((i * output_shape[1] + j) * output_shape[2] + k) * output_shape[3]) + l]);
+                }
+                printf("]\n");
+            }
+            printf("]\n");
+        }
+        printf("]\n");
+    }
+    printf("num_elements: %d\n", result->num_elements());
+#endif
     for (int i = 0; i < result->num_elements(); ++i) {
-        // std::cout << result->at(i) << "," << ref_output_data[i] << std::endl;
         if (std::isnan(result->at(i)) || std::fabs(result->at(i) - ref_output_data[i]) > 1e-2) {
-            printf("Failed at %d, %.3f vs %.3f\n", i, result->at(i), ref_output_data[i]);
+            printf("Failed at %d, %.5f vs %.5f\n", i, result->at(i), ref_output_data[i]);
             return 1;
         }
     }

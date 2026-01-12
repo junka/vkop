@@ -295,9 +295,8 @@ double Runtime::Run() {
 
 void Runtime::ReadResult() {
     auto dev = m_cmdpool_->getVulkanDevice();
-    for (int i = 0; i < vkop::kInflight; ++i) {
-        m_cmds_[i]->wait(dev->getComputeQueue(i));
-    }
+    dev->wait_all_done();
+
     for (auto &p : real_outputs_) {
         if (p.second->dtype() == typeid(float)) {
             auto t = vkop::core::as_tensor<float>(p.second);

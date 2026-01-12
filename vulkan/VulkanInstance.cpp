@@ -48,8 +48,6 @@ void VulkanInstance::createInstance(const std::string &app_name,
     create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
     create_info.pApplicationInfo = &app_info;
 
-    // Extensions
-
     std::vector<const char *> extensions;
     getRequiredExtensions(extensions);
 #if VK_KHR_portability_enumeration
@@ -112,11 +110,9 @@ VkInstance VulkanInstance::getInstance() const { return m_instance_; }
 void VulkanInstance::getRequiredExtensions(
     std::vector<const char *> &extensions) {
     uint32_t extension_count = 0;
-
-    std::vector<VkExtensionProperties> available_extensions;
     vkEnumerateInstanceExtensionProperties(nullptr, &extension_count, nullptr);
 
-    available_extensions.resize(extension_count);
+    std::vector<VkExtensionProperties> available_extensions(extension_count);
     vkEnumerateInstanceExtensionProperties(nullptr, &extension_count,
                                            available_extensions.data());
     auto is_ext_supported =

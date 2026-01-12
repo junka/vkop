@@ -133,7 +133,7 @@ class Reshape : public Operator {
                     std::dynamic_pointer_cast<VulkanBuffer>(objs_[1]);
                 input_buff->copyBufferToStageBuffer(m_cmd_->get(),
                                                     output_buff->getBuffer(), 0,
-                                                    output_buff->getSize());
+                                                    output_buff->getSize(), 0);
             } else {
                 auto output_image =
                     std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
