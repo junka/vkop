@@ -21,7 +21,6 @@ layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H
 layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
 layout(set=0, binding=3) uniform textureBuffer uBias;
 layout(set=0, binding=4) uniform textureBuffer uScalePara;
-layout(set=0, binding=5) uniform textureBuffer uBnPara;
 
 layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // [W_in, H_in, C_in, N]
@@ -35,24 +34,9 @@ layout(push_constant) uniform constBuffer {
     int transpose;       // weight transpose Cin, Cout
     int pack;            // pack 1x1 weight to single layer image
     int activation;
-    int fuse_bn;
-    float eps;
+
     int accuracy;
 } uConstant;
-
-FLOAT4 batch_norm(FLOAT4 value, int c4, bvec4 valid_oc)
-{
-    vec4 scale4 = texelFetch(uBnPara, c4 * 4);
-    vec4 bias4 = texelFetch(uBnPara, c4 * 4 + 1);
-    vec4 mean4 = texelFetch(uBnPara, c4 * 4 + 2);
-    vec4 var4 = texelFetch(uBnPara, c4 * 4 + 3);
-
-    // BatchNorm formula: y = scale * (x - mean) / sqrt(var + eps) + bias
-    vec4 inv_std = inversesqrt(var4 + vec4(uConstant.eps));
-    vec4 normalized = (value - mean4) * inv_std;
-    vec4 ret = scale4 * normalized + bias4;
-    return FLOAT4(ret * vec4(valid_oc));
-}
 
 // support both accuracy and fp32 initializer
 FLOAT4 add_bias(FLOAT4 value, int c4, bvec4 valid_oc) {
@@ -319,9 +303,6 @@ void conv1x1() {
 
     if (uConstant.bias != 0) {
         acc = add_bias(acc, c4, valid_oc);
-    }
-    if (uConstant.fuse_bn != 0) {
-        acc = batch_norm(acc, c4, valid_oc);
     }
 
     acc = activation(acc, uConstant.activation);
@@ -617,10 +598,6 @@ void grouped_conv2d() {
 
     if (uConstant.bias != 0) {
         acc = add_bias(acc, c4, valid_oc);
-    }
-
-    if (uConstant.fuse_bn != 0) {
-        acc = batch_norm(acc, c4, valid_oc);
     }
 
     acc = activation(acc, uConstant.activation);

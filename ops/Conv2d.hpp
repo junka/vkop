@@ -40,9 +40,6 @@ struct alignas(16) GPUConv2dParam {
     int pack;
     int activation;
 
-    int fuse_bn;
-    float eps;
-
     int accuracy; // only for conv para, 0 : fp32, 1 : fp16, 2: int8
 };
 
@@ -55,8 +52,7 @@ class Conv2d : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
-                    DESCRIPTOR_TYPE_UNIFORM, DESCRIPTOR_TYPE_UNIFORM,
-                    DESCRIPTOR_TYPE_UNIFORM},
+                    DESCRIPTOR_TYPE_UNIFORM, DESCRIPTOR_TYPE_UNIFORM},
                    sizeof(conv2d::GPUConv2dParam)) {
         activation_ = conv2d::ActivationMode::NONE;
     }
@@ -128,12 +124,6 @@ class Conv2d : public Operator {
                                             auto_pad);
             }
         }
-        if (attributes.find("fused_bn") != attributes.end()) {
-            fuse_bn_ = std::stol(attributes.at("fused_bn"));
-        }
-        if (attributes.find("eps") != attributes.end()) {
-            eps_ = std::stof(attributes.at("eps"));
-        }
 
         if (attributes.find("activation") != attributes.end()) {
             std::string activation = attributes.at("activation");
@@ -154,13 +144,6 @@ class Conv2d : public Operator {
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
-            }
-        }
-        if (attributes.find("int8scale") != attributes.end()) {
-            if (attributes.at("int8scale") == "valid") {
-
-            } else {
-                int8scale_ = std::stof(attributes.at("int8scale"));
             }
         }
     }
@@ -220,10 +203,8 @@ class Conv2d : public Operator {
             }
         });
         size_t scale_index = 2;
-        if ((inputs.size() == 3 && !fuse_bn_ && accuracy != 2) ||
-            (inputs.size() == 4 && !fuse_bn_ && accuracy == 2)) {
-            // No fuse, no scale
-            // No fuse, scale
+        if ((inputs.size() == 3 && accuracy != 2) ||
+            (inputs.size() == 4 && accuracy == 2)) {
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto bias = core::as_tensor<T>(inputs[2]);
@@ -242,18 +223,6 @@ class Conv2d : public Operator {
                 auto scale = core::as_tensor<T>(inputs[scale_index]);
                 auto scale_buffer = scale->as_uniform_buffer(m_dev_);
                 objs_.emplace_back(scale_buffer);
-            });
-        } else {
-            objs_.emplace_back(dummy_bufferview_);
-        }
-
-        if (fuse_bn_) {
-            auto index = inputs.size() - 1;
-            dispatch_by_dtype(inputs[index]->dtype(), [&](auto type_tag) {
-                using T = decltype(type_tag);
-                auto para = core::as_tensor<T>(inputs[index]);
-                auto para_buffer = para->as_uniform_buffer(m_dev_);
-                objs_.emplace_back(para_buffer);
             });
         } else {
             objs_.emplace_back(dummy_bufferview_);
@@ -287,8 +256,6 @@ class Conv2d : public Operator {
         para.activation = static_cast<int>(activation_);
         para.accuracy = accuracy;
 
-        para.fuse_bn = fuse_bn_;
-        para.eps = eps_;
         submit(&para, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
@@ -303,9 +270,7 @@ class Conv2d : public Operator {
     std::vector<int> pads_ = {0, 0};
     std::vector<int> dilations_ = {1, 1};
     int groups_ = 1;
-    float eps_ = 1e-5;
-    int fuse_bn_ = 0;
-    float int8scale_ = 1.0F;
+
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 }; // namespace ops
 

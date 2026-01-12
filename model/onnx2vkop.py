@@ -376,35 +376,98 @@ def fuse_conv_bn_relu(vk_model):
         bn_consumers = consumers.get(bn_out, [])
         if len(bn_consumers) != 1:
             continue
-            
+
         relu_node, _ = bn_consumers[0]
         # 检查消费者是否为ReLU
         if relu_node['op_type'] != 'Relu':
             continue
 
-        # 创建融合后的节点
+        if len(bn_node['inputs']) < 5:
+            print(f"Warning: BatchNormalization node {bn_node['name']} has less than 5 inputs, skipping fusion")
+            continue
+
+        # inputs[1-4] are scale, bias, mean, variance respectively
+        scale_name = bn_node['inputs'][1]['name']  # scale/weight
+        bias_name = bn_node['inputs'][2]['name']   # bias
+        mean_name = bn_node['inputs'][3]['name']   # mean
+        var_name = bn_node['inputs'][4]['name']    # variance
+
+        # 检查参数是否存在
+        if not all(name in vk_model.initializers for name in [scale_name, bias_name, mean_name, var_name]):
+            print(f"Warning: Missing parameters for BatchNormalization node {bn_node['name']}, skipping fusion")
+            continue
+
+        # 获取参数数组
+        scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
+        bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
+        mean_array = numpy_helper.to_array(vk_model.initializers[mean_name])
+        var_array = numpy_helper.to_array(vk_model.initializers[var_name])
+
+        # 获取eps值，默认为1e-5
+        eps = float(bn_node['attributes'].get('epsilon', 1e-5))
+
+        # 检查是否有Conv的bias
+        has_conv_bias = len(node['inputs']) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
+
+        # 加载卷积权重
+        conv_weight_name = node['inputs'][1]['name']
+        if conv_weight_name not in vk_model.initializers:
+            print(f"Warning: Conv weight {conv_weight_name} not found, skipping fusion")
+            continue
+
+        conv_weight = numpy_helper.to_array(vk_model.initializers[conv_weight_name])
+
+        # 获取卷积偏置（如果存在）
+        if has_conv_bias:
+            conv_bias_name = node['inputs'][2]['name']
+            if conv_bias_name not in vk_model.initializers:
+                print(f"Warning: Conv bias {conv_bias_name} not found, skipping fusion")
+                continue
+            conv_bias = numpy_helper.to_array(vk_model.initializers[conv_bias_name])
+        else:
+            # 如果没有原始偏置，则创建零偏置
+            conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
+
+        # 执行参数融合
+        # 计算: gamma / sqrt(var + eps)
+        inv_std = scale_array / np.sqrt(var_array + eps)
+
+        # 新权重 = 旧权重 * (gamma / sqrt(var + eps))
+        # 对于卷积，我们需要正确处理维度
+        fused_weight = conv_weight * inv_std.reshape(-1, 1, 1, 1)  # reshape to match conv weight shape
+
+        # 新偏置 = (旧偏置 - mean) * (gamma / sqrt(var + eps)) + beta
+        fused_bias = (conv_bias - mean_array) * inv_std + bias_array
+
+        # 更新vk_model.initializers中的权重和偏置
+        fused_weight_name = f"{conv_weight_name}_fused"
+        fused_bias_name = f"{conv_bias_name}_fused" if has_conv_bias else f"{node['name']}_fused_bias"
+
+        # 转换回ONNX tensor格式
+        fused_weight_tensor = numpy_helper.from_array(fused_weight, fused_weight_name)
+        fused_bias_tensor = numpy_helper.from_array(fused_bias, fused_bias_name)
+
+        # 添加到initializers
+        vk_model.initializers[fused_weight_name] = fused_weight_tensor
+        vk_model.initializers[fused_bias_name] = fused_bias_tensor
+
         fused = node.copy()
         fused['attributes'] = dict(node.get('attributes', {}))
-        
-         # 复制BN节点的所有属性，这些属性包含了合并后的BN参数信息
-        if 'attributes' in bn_node:
-            for key, value in bn_node['attributes'].items():
-                fused['attributes'][key] = value
 
-        # 将BN和ReLU的信息合并到Conv中
-        fused['attributes']['fused_bn'] = 1
+        # 将ReLU的信息合并到Conv中
         fused['attributes']['activation'] = 'Relu'
         fused['outputs'] = relu_node['outputs']  # 输出为 Relu 的输出
 
-        if len(bn_node['inputs']) >= 2:
-            # 添加BN的参数输入到融合后的节点
-            # 第一个是来自Conv的输入，第二个是合并后的BN参数
-            bn_params_input = bn_node['inputs'][1]  # 合并后的BN参数
-            fused['inputs'] = node['inputs'] + [bn_params_input]
+        # 更新输入：保持数据输入，更新权重输入，更新偏置输入
+        fused['inputs'] = [
+            node['inputs'][0],  # 输入数据
+            {'name': fused_weight_name, 'shape': list(fused_weight.shape)},  # 新的权重
+            {'name': fused_bias_name, 'shape': list(fused_bias.shape)}  # 新的偏置
+        ]
 
         first_idx = node['_orig_idx']
         replacements[first_idx] = fused
-        
+
         # 标记要删除的节点
         to_remove.add(node['_orig_idx'])
         to_remove.add(bn_node['_orig_idx'])
@@ -425,6 +488,7 @@ def fuse_conv_bn_relu(vk_model):
 
     print("Fusing Conv+BN+ReLU patterns...", len(to_remove))
     vk_model.nodes = new_nodes
+
 
 def fuse_conv_simple_activation(vk_model):
     producer, consumers = build_graph_index(vk_model.nodes)
