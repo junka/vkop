@@ -12,7 +12,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <iostream>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -497,18 +496,6 @@ template <typename T> class Tensor : public ITensor {
             } else {
                 memcpy(static_cast<T *>(b->ptr), src, imagesize);
             }
-            printf("shape to GPU image:\n");
-            for (int i = 0; i < num_dims(); i++) {
-                printf("%d ", dims_[i]);
-            }
-            printf("\nfirst 64 elements:\n");
-            for (size_t i = 0; i < 64; i++) {
-                if (i > 0 && i % 8 == 0) {
-                    printf("\n");
-                }
-                std::cout << static_cast<T *>(b->ptr)[i] << ", ";
-            }
-            printf("\n");
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
             img->readBarrier(cmd.get());

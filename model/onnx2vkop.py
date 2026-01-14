@@ -1850,7 +1850,6 @@ def convert_initializers_nchw_to_rgba(vk_model):
             consumers = initializer_consumers.get(name, [])
             consumer_ops = {node['op_type'] for node in consumers}
             transpose = 'Conv' in consumer_ops
-            print(f"Converting initializer {name} of shape {dims}, transpose={transpose}")
 
             if len(dims) == 4:
                 orig_n, orig_c, h, w = dims
@@ -1883,7 +1882,7 @@ def convert_initializers_nchw_to_rgba(vk_model):
                         for w_idx in range(w):  # width index
                             if pack:
                                 # ((n*H + h) * (W * C4) + (w + c4 * W)) * 4
-                                base_linear = (n_idx * h + h_idx) * (w * c4) + (w_idx + c4_idx * w) * 4
+                                base_linear = ((n_idx * h + h_idx) * (w * c4) + (w_idx + c4_idx * w)) * 4
                             else:
                                 # c4 * layer_stride + (n*H + h) * row_pitch + w * 4
                                 base_linear = c4_idx * layer_stride + (n_idx * h + h_idx) * row_pitch + w_idx * 4
@@ -1901,7 +1900,6 @@ def convert_initializers_nchw_to_rgba(vk_model):
 
                                 rgba_flat[base_linear + k] = src_val
 
-            # print(rgba_flat[:64])
             new_initializer = numpy_helper.from_array(rgba_flat, name)
             new_initializer.data_type = initializer.data_type
             vk_model.initializers[name] = new_initializer
