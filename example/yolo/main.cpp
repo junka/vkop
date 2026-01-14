@@ -48,13 +48,25 @@ int main(int argc, char *argv[]) {
 
     vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
 
-
-    for (int i = 0; i < 1000; i ++) {
+    int count = 1;
+    for (int i = 0; i < count; i ++) {
         rt->Run();
     }
     rt->ReadResult();
     auto out = vkop::core::as_tensor<float>(rt->GetOutput());
-
+    auto shape = out->getShape();
+    printf("output shape: [%d, %d, %d]\n", shape[0], shape[1], shape[2]);
+    // for (int j = 0; j < shape[2]; j ++) {
+    //     auto x = out->data()[j];
+    //     auto y = out->data()[(1 * shape[2]) + j];
+    //     auto w = out->data()[(2 * shape[2]) + j];
+    //     auto h = out->data()[(3 * shape[2]) + j];
+    //     printf("(%0.2f, %0.2f, %0.2f, %0.2f): ", x - w, y - h, x + w, y + h);
+    //     for (int i = 4; i < shape[1]; i ++) {
+    //         printf("%0.2f ", out->data()[(i * shape[2]) + j]);
+    //     }
+    //     printf("\n");
+    // }
 
     return EXIT_SUCCESS;
 }

@@ -23,7 +23,7 @@ enum class ActivationMode {
     HARDSWISH,
     MISH,
     RELU6,
-    GATE_SIGMOID,
+    SWISH,
 };
 
 struct alignas(16) GPUConv2dParam {
@@ -139,8 +139,8 @@ class Conv2d : public Operator {
                 activation_ = conv2d::ActivationMode::MISH;
             } else if (activation == "Relu6") {
                 activation_ = conv2d::ActivationMode::RELU6;
-            } else if (activation == "GateSigmoid") {
-                activation_ = conv2d::ActivationMode::GATE_SIGMOID;
+            } else if (activation == "Swish") {
+                activation_ = conv2d::ActivationMode::SWISH;
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);

@@ -67,18 +67,22 @@ int main(int argc, char *argv[]) {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 
-    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), true);
 
     auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
     auto shape = cls->getShape();
-    auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
-    rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
-
     auto indexs = std::make_shared<vkop::core::Tensor<int>>(shape, true);
     auto values = std::make_shared<vkop::core::Tensor<float>>(shape, true);
-    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
+
+    if (binary_file_path.find("inception") != std::string::npos) {
+        rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {cls}, {values, indexs});
+    } else {
+        auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
+        rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
+        rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
+    }
     double tot_lat = 0.0F;
-    int count = 1000;
+    int count = 10;
     printf("run inference %d times...\n", count);
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();

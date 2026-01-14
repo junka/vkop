@@ -124,7 +124,7 @@ class VkModel:
         VkModel._write_string(f, data_type)
         VkModel._write_list(f, list(arr.dims))
         total_elements = np.prod(arr.dims)
-        print("Array shape:", arr.dims, "Data type:", data_type, "Total elements:", total_elements)
+        print("Array ",  arr.name, "shape:", arr.dims, "Data type:", data_type, "Total elements:", total_elements)
         arr = np.ascontiguousarray(numpy_helper.to_array(arr))
         data = arr.tobytes()
         f.write(struct.pack('Q', len(data)))
@@ -260,7 +260,6 @@ def fuse_gated_conv(vk_model):
     for idx, node in enumerate(nodes):
         node['_orig_idx'] = idx
 
-    # 记录要删除的节点
     to_remove: Set[int] = set()
     replacements: Dict[int, Dict] = {}   
 
@@ -297,7 +296,6 @@ def fuse_gated_conv(vk_model):
             if sig_node['inputs'][0]['name'] != conv_out:
                 continue
 
-            # 检查 conv_out 是否只被这两个节点使用（避免副作用）
             conv_consumers = consumers[conv_out]
             if len(conv_consumers) != 2:
                 continue
@@ -307,7 +305,7 @@ def fuse_gated_conv(vk_model):
             
             fused = conv_node.copy()
             fused['attributes'] = dict(conv_node.get('attributes', {}))
-            fused['attributes']['activation'] = 'GateSigmoid'  # 自定义标记
+            fused['attributes']['activation'] = 'Swish'
             fused['outputs'] = node['outputs']  # 输出为 Mul 的输出
 
             first_idx = conv_node['_orig_idx']
@@ -319,7 +317,7 @@ def fuse_gated_conv(vk_model):
             break
 
         if matched:
-            continue  # 避免重复处理
+            continue
 
     new_nodes = []
     for idx, node in enumerate(nodes):
@@ -327,7 +325,6 @@ def fuse_gated_conv(vk_model):
             # 如果这是融合子图的第一个节点，就放 fused node
             if idx in replacements:
                 new_nodes.append(replacements[idx])
-            # 否则跳过（不添加）
         else:
             # 未被融合的节点，直接保留
             new_nodes.append(node)
@@ -335,7 +332,6 @@ def fuse_gated_conv(vk_model):
     for node in new_nodes:
         node.pop('_orig_idx', None)
 
-    print("Fusing gated convs...", len(to_remove))
     vk_model.nodes = new_nodes
 
 
@@ -1297,10 +1293,8 @@ def quantize_to_int8_weight_only(vk_model):
 
                     # Add scale as attribute to the node
                     scale_value = float(scale) if hasattr(scale, 'item') else float(scale)
-                    node['attributes']['int8scale'] = scale_value
             else:
                 # For array scales, create initializer and add as input
-                node['attributes']['int8scale'] = 'valid'
                 scale_name = f"{name}_scale"
                 scale_initializer = numpy_helper.from_array(scale, scale_name)
                 scale_initializer.data_type = onnx.TensorProto.FLOAT
@@ -1659,7 +1653,6 @@ class ModelConverter:
                 )
 
             if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
-                print("  Elemwise operation with multiple inputs. Broadcasting shapes...")
                 for i in range(len(inputs_with_shape)):
                     if inputs_with_shape[i]['name'] == node.input[0]:
                         id0 = i
@@ -1667,22 +1660,31 @@ class ModelConverter:
                         id1 = i
                 if len(inputs_with_shape[id0]['shape']) != len(inputs_with_shape[id1]['shape']):
                     shape = broadcast_shapes(inputs_with_shape[id0]['shape'], inputs_with_shape[id1]['shape'])
-                    if len(inputs_with_shape[id0]['shape']) == 0:
+                    print("  Elemwise operation with multiple inputs. Broadcasting shapes...", shape)
+                    if len(inputs_with_shape[id0]['shape']) != len(shape):
                         inputs_with_shape[id0]['shape'] = shape
                         for initializer in graph.initializer:
                             if initializer.name == inputs_with_shape[id0]['name']:
                                 orig_init = vk_model.initializers[initializer.name]
-                                scalar_val = numpy_helper.to_array(orig_init).item()
-                                expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                                orig_array = numpy_helper.to_array(orig_init)
+                                if orig_array.size == 1:
+                                    scalar_val = orig_array.item()
+                                    expanded_data = np.full(shape, scalar_val, dtype=orig_array.dtype)
+                                else:
+                                    expanded_data = np.broadcast_to(orig_array, shape).copy()
                                 new_init = numpy_helper.from_array(expanded_data, name=new_name)
                                 vk_model.initializers[initializer.name] = new_init
-                    if len(inputs_with_shape[id1]['shape']) == 0:
+                    if len(inputs_with_shape[id1]['shape']) != len(shape):
                         inputs_with_shape[id1]['shape'] = shape
                         for initializer in graph.initializer:
                             if initializer.name == inputs_with_shape[id1]['name']:
                                 orig_init = vk_model.initializers[initializer.name]
-                                scalar_val = numpy_helper.to_array(orig_init).item()
-                                expanded_data = np.full(shape, scalar_val, dtype=np.float32)
+                                orig_array = numpy_helper.to_array(orig_init)
+                                if orig_array.size == 1:
+                                    scalar_val = orig_array.item()
+                                    expanded_data = np.full(shape, scalar_val, dtype=orig_array.dtype)
+                                else:
+                                    expanded_data = np.broadcast_to(orig_array, shape).copy()
                                 new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
                                 vk_model.initializers[initializer.name] = new_init
 
@@ -1821,6 +1823,127 @@ def unified_initializers(vk_model):
     }
 
 
+def convert_initializers_nchw_to_rgba(vk_model):
+    """
+    Convert 3D and 4D tensors in initializers from NCHW format to RGBA format
+    following the same logic as the C++ convertTensorToRGBA function in Tensor.hpp
+    First, reshape all tensors to NCHW 4D format, then convert to RGBA.
+    Also preserve original shape information in metadata using RGBAConversion struct format.
+    """
+    print("Converting 3D and 4D initializers from NCHW to RGBA format...")
+
+    initializer_consumers = defaultdict(list)
+    for node in vk_model.nodes:
+        for inp in node['inputs']:
+            initializer_consumers[inp['name']].append(node)
+
+    converted_count = 0
+    shape_metadata = []  # Store original shapes info in RGBAConversion format
+
+    for name, initializer in vk_model.initializers.items():
+        dims = list(initializer.dims)
+
+        # Only process 3D and 4D tensors
+        if len(dims) in [3, 4]:
+            tensor_data = numpy_helper.to_array(initializer)
+
+            consumers = initializer_consumers.get(name, [])
+            consumer_ops = {node['op_type'] for node in consumers}
+            transpose = 'Conv' in consumer_ops
+            print(f"Converting initializer {name} of shape {dims}, transpose={transpose}")
+
+            if len(dims) == 4:
+                orig_n, orig_c, h, w = dims
+            else:  # 3D: [C, H, W] → treat as [1, C, H, W]
+                orig_c, h, w = dims
+                orig_n = 1
+                tensor_data = tensor_data.reshape(orig_n, orig_c, h, w)
+
+            # Determine logical batch and channel based on transpose
+            if transpose:
+                batch = orig_c      # logical batch = C
+                channel = orig_n    # logical channel = N
+            else:
+                batch = orig_n      # logical batch = N
+                channel = orig_c    # logical channel = C
+
+            c4 = (channel + 3) // 4  # UP_DIV equivalent for channels
+            pack = (h == 1 and w == 1)
+
+            total_elements = w * h * batch * c4 * 4
+            rgba_flat = np.zeros(total_elements, dtype=tensor_data.dtype)
+
+            row_pitch = w * 4
+            layer_stride = batch * h * w * 4
+
+            # Perform the conversion following the C++ logic
+            for c4_idx in range(c4):  # channel group index
+                for n_idx in range(batch):  # batch index
+                    for h_idx in range(h):  # height index
+                        for w_idx in range(w):  # width index
+                            if pack:
+                                # ((n*H + h) * (W * C4) + (w + c4 * W)) * 4
+                                base_linear = (n_idx * h + h_idx) * (w * c4) + (w_idx + c4_idx * w) * 4
+                            else:
+                                # c4 * layer_stride + (n*H + h) * row_pitch + w * 4
+                                base_linear = c4_idx * layer_stride + (n_idx * h + h_idx) * row_pitch + w_idx * 4
+
+                            # Now fill RGBA channels (k=0..3)
+                            for k in range(4):
+                                ch = c4_idx * 4 + k
+                                if ch < channel:
+                                    if transpose:
+                                        src_val = tensor_data[ch, n_idx, h_idx, w_idx]
+                                    else:
+                                        src_val = tensor_data[n_idx, ch, h_idx, w_idx]
+                                else:
+                                     src_val = 0
+
+                                rgba_flat[base_linear + k] = src_val
+
+            # print(rgba_flat[:64])
+            new_initializer = numpy_helper.from_array(rgba_flat, name)
+            new_initializer.data_type = initializer.data_type
+            vk_model.initializers[name] = new_initializer
+
+            dtype = initializer.data_type  # ONNX data type
+            name_len = len(name)
+            offset = 0
+            size = rgba_flat.size
+            padded_dims = [1] * (4 - len(dims)) + dims
+
+            shape_metadata.append([dtype, name_len, offset, size] + padded_dims)
+
+            converted_count += 1
+            print(f"Converted {name} from shape {dims} to RGBA format with shape {rgba_flat.shape}")
+
+    # Store shape metadata as a new initializer using RGBAConversion format
+    if shape_metadata:
+        # Flatten the metadata list
+        flattened_metadata = []
+        name_list = []
+        for entry in shape_metadata:
+            flattened_metadata.extend(entry)
+
+        for name, shape in vk_model.initializers.items():
+            name_bytes = name.encode('utf-8')
+            name_list.append(name_bytes)
+
+        # Create metadata array
+        metadata_array = np.array(flattened_metadata, dtype=np.int32)
+        metadata_initializer = numpy_helper.from_array(metadata_array, "rgba_conversion_metadata")
+        vk_model.initializers["rgba_conversion_metadata"] = metadata_initializer
+
+        all_names_bytes = b"".join(name_list)
+        names_array = np.frombuffer(all_names_bytes, dtype=np.uint8)
+        names_initializer = numpy_helper.from_array(names_array, "rgba_conversion_names")
+        vk_model.initializers["rgba_conversion_names"] = names_initializer
+
+    print(f"Converted {converted_count} initializers from NCHW to RGBA format")
+    print(f"Preserved original shape information in metadata using RGBAConversion format")
+    return converted_count
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python onnx2vkop.py <onnx_model_path>")
@@ -1830,6 +1953,7 @@ def main():
     parser.add_argument("-i","--input", required=True, help="input_model file")
     parser.add_argument("-u","--unify", action='store_true', help="convert initializers to a single memory block")
     parser.add_argument("-b","--batch", help="batch size for inference")
+    parser.add_argument("-r","--rgba", action='store_true', help="nchw to rgba conversion for initializers")
     args = parser.parse_args()
     if args.quant is not None:
         if args.quant not in ["fp16", "int8"]:
@@ -1857,6 +1981,8 @@ def main():
     fuse_conv_bn_relu(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
+    if args.rgba is True:
+        convert_initializers_nchw_to_rgba(vk_model)
     if args.unify is True:
         unified_initializers(vk_model)
 

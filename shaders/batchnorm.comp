@@ -10,12 +10,9 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 layout(set=0, binding = 0) writeonly uniform image2DArray outputImage; // [W, N*H, C4]
 layout(set=0, binding = 1) uniform sampler2DArray inputImage;          // [W, N*H, C4]
 
-// length = C (number of channels)
 // Each vec4 follows as scale..., bias..., mean..., variance...
 layout(set=0, binding = 2) uniform textureBuffer uMeanVarScaleBias;
-// {
-//     mat4 attr[];
-// } uMeanVarScaleBias;
+
 
 layout(push_constant) uniform batchNormBuffer {
     ivec4 outShape; // [N, C, H, W]

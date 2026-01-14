@@ -42,6 +42,14 @@ struct UnifiedMetadata {
     int dims[4];
 };
 
+struct RGBAConversion {
+    int dtype;
+    int name_len;
+    int offset;
+    int size;
+    int dims[4];
+};
+
 
 class VkModel {
 public:
@@ -49,6 +57,7 @@ public:
     std::vector<Shape> outputs;
     std::vector<Node> nodes;
     std::unordered_map<std::string, Initializer> initializers;
+    bool rgba = false;
     std::unordered_map<std::string, size_t> initializer_offsets;
     std::vector<uint8_t> initializer_memory;
 

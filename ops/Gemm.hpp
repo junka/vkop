@@ -50,12 +50,6 @@ class Gemm : public Operator {
         if (attributes.find("transB") != attributes.end()) {
             transB_ = std::stol(attributes.at("transB"));
         }
-        if (attributes.find("int8scale") != attributes.end()) {
-            if (attributes.at("int8scale") == "valid") {
-            } else {
-                int8scale_ = std::stof(attributes.at("int8scale"));
-            }
-        }
     }
 
   private:
@@ -92,7 +86,7 @@ class Gemm : public Operator {
             });
         }
         if (inputs.size() <= 3) {
-            objs_.emplace_back(dummyBuffer_);
+            objs_.emplace_back(dummy_buffer_);
         }
         gemm::GpuGemmParam para;
         para.M = m;
@@ -134,18 +128,12 @@ class Gemm : public Operator {
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         Operator::set_runtime_device(dev, cmdpool);
-
-        dummyBuffer_ = std::make_shared<VulkanBuffer>(
-            m_dev_, 16, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
 
     float alpha_ = 1.0F;
     float beta_ = 1.0F;
     int transA_ = 0;
     int transB_ = 0;
-    float int8scale_ = 1.0F;
-    std::shared_ptr<VulkanBuffer> dummyBuffer_;
 };
 
 } // namespace ops

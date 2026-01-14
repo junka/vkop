@@ -93,8 +93,8 @@ void Runtime::LoadModel() {
             }
             tensor->copyToGPU(m_cmdpool_, src_ptr);
         } else {
-            tensor->as_input_image(dev, nullptr);
-            tensor->copyToGPU(m_cmdpool_, src_ptr);
+            tensor->as_uniform_image(dev, nullptr);
+            tensor->copyToGPUImage(m_cmdpool_, src_ptr, model.rgba);
         }
         tensor_map[init.name] = tensor;
         initializers_[init.name] = tensor;
@@ -147,6 +147,7 @@ void Runtime::LoadModel() {
     }
 
     for (const auto &n : model.nodes) {
+        bool use_ssbo = false;
         auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
         if (type == vkop::ops::OpType::UNKNOWN) {
             // make it as input for next ops
@@ -207,7 +208,12 @@ void Runtime::LoadModel() {
                 q.push(t);
             }
         }
-        auto op = ops::create_from_type(type);
+        if (type == vkop::ops::OpType::SOFTMAX) {
+            if (node_outputs[0]->num_dims() <= 2) {
+                use_ssbo = true;
+            }
+        }
+        auto op = ops::create_from_type(type, use_ssbo);
         if (!op) {
             std::cout << "Fail to create operator" << std::endl;
             return;

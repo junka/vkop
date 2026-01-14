@@ -55,7 +55,7 @@ class BatchNorm : public Operator {
             } else if (activation == "Relu6") {
                 activation_ = conv2d::ActivationMode::RELU6;
             } else if (activation == "GateSigmoid") {
-                activation_ = conv2d::ActivationMode::GATE_SIGMOID;
+                activation_ = conv2d::ActivationMode::SWISH;
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);

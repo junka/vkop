@@ -154,7 +154,52 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         this->initializers.erase("unified_metadata");
         this->initializers.erase("unified_names");
         // this->initializers.erase("unified_tensors");
+    }
 
+    if (this->initializers.find("rgba_conversion_metadata") != this->initializers.end()) {
+        printf("Found RGBA conversion metadata, restoring original shapes...\n");
+        size_t meta_offset = initializer_offsets["rgba_conversion_metadata"];
+        auto names_offset = this->initializer_offsets["rgba_conversion_names"];
+        auto dims = this->initializers["rgba_conversion_metadata"].dims;
+        int num_metas = dims[0]/8;
+        printf("Number of RGBA conversion metas: %d\n", dims[0]);
+        uint8_t *meta_ptr = initializer_memory.data() + meta_offset;
+        uint8_t *name_ptr = initializer_memory.data() + names_offset;
+        std::vector<struct RGBAConversion> metas(num_metas);
+        std::memcpy(metas.data(), meta_ptr, sizeof(struct RGBAConversion) * num_metas);
+        size_t name_idx_offset = 0;
+        std::string datatyep_map[] = {
+            "none",
+            "float32",
+            "uint8",
+            "int8",
+            "uint16",
+            "int16",
+            "int32",
+            "int64",
+            "string",
+            "bool",
+            "float16",
+            "float64",
+            "uint32",
+            "uint64",
+            "complex64",
+            "complex128",
+            "bfloat16"
+        };
+        for (int i = 0; i < num_metas; ++i) {
+            auto &meta = metas[i];
+            auto name = std::string(name_ptr + name_idx_offset, name_ptr + name_idx_offset + meta.name_len);
+            auto dtype = datatyep_map[meta.dtype];
+            this->initializers[name].dims.resize(4);
+            for (int i = 0; i < 4; ++i) {
+                this->initializers[name].dims[i] = meta.dims[i];
+            }
+            name_idx_offset += meta.name_len;
+        }
+        this->initializers.erase("rgba_conversion_metadata");
+        this->initializers.erase("rgba_conversion_names");
+        rgba = true;
     }
 
     // Unmap the file

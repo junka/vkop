@@ -34,7 +34,8 @@ class Function {
     static void
     preprocess_jpg(const char *input_file,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                   const std::shared_ptr<core::ITensor> &input);
+                   const std::shared_ptr<core::ITensor> &input,
+                   bool imagenet = false);
 
     static std::vector<std::pair<int, float>>
     get_top_k_predictions(const std::vector<float> &probs, int k);

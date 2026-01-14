@@ -16,9 +16,18 @@ const float kMean[] = {0.485F, 0.456F, 0.406F};
 const float kStdvar[] = {0.229F, 0.224F, 0.225F};
 } // namespace
 
+/*
+ * imagenet = true:
+ * 像素值缩放到 [0,1] + Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
+ * 0.225]) ResNet, ResNeXt, DenseNet, EfficientNet, MobileNet, Vit, Swin
+ * Transformer, ConvNeXt, RegNet, Inception
+ * imagenet = false:
+ * 像素值归一化：img = img / 255.0, 不需要mean std 标准化
+ */
 void Function::preprocess_jpg(const char *input_file,
                               const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                              const std::shared_ptr<core::ITensor> &input) {
+                              const std::shared_ptr<core::ITensor> &input,
+                              bool imagenet) {
     int image_h;
     int image_w;
     int channels;
@@ -37,10 +46,15 @@ void Function::preprocess_jpg(const char *input_file,
         std::vector<float> normalized_data(resize_h * resize_w * 4);
         for (int c = 0; c < 3; c++) {
             for (int i = 0; i < resize_h * resize_w; i++) {
-                normalized_data[(i * 4) + c] =
-                    ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
-                     kMean[c]) /
-                    kStdvar[c];
+                if (imagenet) {
+                    normalized_data[(i * 4) + c] =
+                        ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
+                         kMean[c]) /
+                        kStdvar[c];
+                } else {
+                    normalized_data[(i * 4) + c] =
+                        (static_cast<float>(resized[(i * 3) + c]) / 255.0F);
+                }
             }
         }
         auto t = vkop::core::as_tensor<float>(input);
@@ -49,11 +63,18 @@ void Function::preprocess_jpg(const char *input_file,
         std::vector<uint16_t> normalized_data(resize_h * resize_w * 4);
         for (int c = 0; c < 3; c++) {
             for (int i = 0; i < resize_h * resize_w; i++) {
-                normalized_data[(i * 4) + c] =
-                    vkop::core::ITensor::fp32_to_fp16(
-                        ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
-                         kMean[c]) /
-                        kStdvar[c]);
+                if (imagenet) {
+                    normalized_data[(i * 4) + c] =
+                        vkop::core::ITensor::fp32_to_fp16(
+                            ((static_cast<float>(resized[(i * 3) + c]) /
+                              255.0F) -
+                             kMean[c]) /
+                            kStdvar[c]);
+                } else {
+                    normalized_data[(i * 4) + c] =
+                        vkop::core::ITensor::fp32_to_fp16((
+                            static_cast<float>(resized[(i * 3) + c]) / 255.0F));
+                }
             }
         }
         auto t = vkop::core::as_tensor<uint16_t>(input);

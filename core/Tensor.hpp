@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -372,6 +373,35 @@ template <typename T> class Tensor : public ITensor {
         vkobj_ = view;
         return view;
     }
+
+    std::shared_ptr<VulkanImage>
+    as_uniform_image(std::shared_ptr<VulkanDevice> &vd,
+                     const std::shared_ptr<VulkanCommandBuffer> &cmd,
+                     bool unorm = false) {
+        make_vkimg(vd,
+                   VK_IMAGE_USAGE_SAMPLED_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                   unorm);
+        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        if (!img) {
+            // Handle error case appropriately
+            throw std::runtime_error(
+                "Expected VulkanImage but got something else.");
+        }
+#ifdef VK_EXT_host_image_copy
+        if (vd->is_support_host_image_copy()) {
+            img->hostImaggeTransition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+        } else
+#endif
+        {
+            if (cmd) {
+                img->readBarrier(cmd->get());
+            }
+        }
+
+        return img;
+    }
     std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd,
@@ -389,7 +419,7 @@ template <typename T> class Tensor : public ITensor {
         }
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
-            img->hostImaggeTransition(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            img->hostImaggeTransition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
         } else
 #endif
         {
@@ -467,6 +497,18 @@ template <typename T> class Tensor : public ITensor {
             } else {
                 memcpy(static_cast<T *>(b->ptr), src, imagesize);
             }
+            printf("shape to GPU image:\n");
+            for (int i = 0; i < num_dims(); i++) {
+                printf("%d ", dims_[i]);
+            }
+            printf("\nfirst 64 elements:\n");
+            for (size_t i = 0; i < 64; i++) {
+                if (i > 0 && i % 8 == 0) {
+                    printf("\n");
+                }
+                std::cout << static_cast<T *>(b->ptr)[i] << ", ";
+            }
+            printf("\n");
             cmd.begin();
             img->copyBufferToImage(cmd.get(), buff, b->offset);
             img->readBarrier(cmd.get());
@@ -761,23 +803,21 @@ template <typename T> class Tensor : public ITensor {
 
         const T *input = src ? src : data_->data();
 
-        uint32_t row_pitch = width * 4 * sizeof(T);
+        uint32_t row_pitch = width * 4;
         uint32_t layer_stride = batch * height * row_pitch;
 
         for (int c4 = 0; c4 < chan4; c4++) {
             for (int n = 0; n < batch; n++) {
                 for (int h = 0; h < height; h++) {
                     for (int w = 0; w < width; w++) {
-                        int dst_bytes_offset =
+                        int dst_idx_offset =
                             (pack_ ? ((n * height + h) * (width * chan4) +
                                       (w + c4 * width)) *
-                                         4 * sizeof(T)
+                                         4
                                    : (c4 * layer_stride) +
                                          ((n * height + h) * row_pitch) +
-                                         (w * 4 * sizeof(T)));
-                        T *dst = reinterpret_cast<T *>(
-                            reinterpret_cast<uint8_t *>(ptr) +
-                            dst_bytes_offset);
+                                         (w * 4));
+                        T *dst = (ptr + dst_idx_offset);
                         for (int k = 0; k < 4; k++) {
                             int c = (c4 * 4) + k;
                             if (c < chan) {
