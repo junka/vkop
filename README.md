@@ -1,7 +1,7 @@
 
 ### 项目介绍
 
-vkop 是一个基于 Vulkan 的实现的AI推理引擎，简化运行时逻辑。
+vkop 是一个基于 Vulkan 实现的迷你AI推理引擎, 运行时逻辑不足千行.
 
 ### 如何使用
 
@@ -40,6 +40,29 @@ source path/to/VulkanSDK/setup-env.sh
 cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
 ```
 
+#### 4. 模型转换
+```bash
+python3.13 tools/onnx2vkop.py -i resnet18-v2-7.onnx
+```
+
+- 支持量化：fp16, int8 对称量化
+- 支持指定batch size
+- 支持针对3d,4d nchw to rgba转换到模型
+- 支持tensor合并，以便节约内存
+```
+usage: onnx2vkop.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
+
+options:
+  -h, --help         show this help message and exit
+  -q, --quant QUANT  Override input_model
+  -i, --input INPUT  input_model file
+  -u, --unify        convert initializers to a single memory block
+  -b, --batch BATCH  batch size for inference
+  -r, --rgba         nchw to rgba conversion for initializers
+
+```
+
+
 #### 4. 运行程序
 ```
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
@@ -50,17 +73,26 @@ cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALID
 
 ### Project Introduction
 
-vkop is an AI inference engine based on Vulkan, designed to provide high-performance computing capabilities.
+vkop is a mini AI inference engine based on Vulkan, with runtime logic under 1000 lines of code.
 
 ### How to Use
 
 #### 1. Dependency Installation
-First, install the required dependencies:
+First, install the required dependencies, such as shaderc or Vulkan SDK:
 ```bash
 wget https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.gz
 tar xvf vulkan-sdk.tar.gz
 source path/to/VulkanSDK/setup-env.sh
 export PATH=$VULKAN_SDK/x86_64_bin:$PATH
+```
+For model conversion:
+```bash
+export CMAKE_POLICY_VERSION_MINIMUM=3.5
+pip install onnx onnx-simplifier onnxsim onnxruntime
+```
+For testing dependencies:
+```bash
+pip install torch
 ```
 
 #### 2. Environment Setup
@@ -69,8 +101,41 @@ Set up the Vulkan ICD loader, using NVIDIA as an example:
 export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
 ```
 
-#### 3. Compilation
-(Specific compilation steps need to be added here)
+Ensure the correct Vulkan version is used:
+```bash
+source path/to/VulkanSDK/setup-env.sh
+```
 
-#### 4. Running the Program
-(Specific execution instructions need to be added here)
+#### 3. Compilation
+```bash
+cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+```
+
+#### 4. Model Conversion
+```bash
+python3.13 tools/onnx2vkop.py -i resnet18-v2-7.onnx
+```
+
+- Supports quantization: fp16, int8 symmetric quantization
+- Supports specifying batch size
+- Supports 3D/4D NCHW to RGBA model conversion
+- Supports tensor merging to save memory
+```
+usage: onnx2vkop.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
+
+options:
+    -h, --help         show this help message and exit
+    -q, --quant QUANT  Override input_model
+    -i, --input INPUT  input_model file
+    -u, --unify        convert initializers to a single memory block
+    -b, --batch BATCH  batch size for inference
+    -r, --rgba         nchw to rgba conversion for initializers
+
+```
+
+#### 5. Running the Program
+```bash
+./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
+```
+Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory bandwidth.
+

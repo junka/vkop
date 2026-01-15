@@ -335,10 +335,11 @@ def fuse_gated_conv(vk_model):
     vk_model.nodes = new_nodes
 
 
-def fuse_conv_bn_relu(vk_model):
+def fuse_conv_bn(vk_model):
     """
-    Fuse Conv + BatchNormalization + ReLU patterns into a single Conv node.
+    Fuse Conv + BatchNormalization patterns into a single Conv node.
     This optimization reduces the number of operations and can improve performance.
+    Works for both Conv+BN and Conv+BN+ReLU patterns.
     """
     producer, consumers = build_graph_index(vk_model.nodes)
     
@@ -346,66 +347,49 @@ def fuse_conv_bn_relu(vk_model):
     for idx, node in enumerate(nodes):
         node['_orig_idx'] = idx
 
-    # 记录要删除的节点
     to_remove: Set[int] = set()
     replacements: Dict[int, Dict] = {}
 
     for node in nodes:
-        # 只处理Conv节点
         if node['op_type'] != 'Conv':
             continue
 
         conv_out = node['outputs'][0]['name']
 
-        # 检查Conv的输出是否被单一节点消费
         conv_consumers = consumers.get(conv_out, [])
         if len(conv_consumers) != 1:
             continue
 
         bn_node, _ = conv_consumers[0]
-        # 检查消费者是否为BatchNormalization
         if bn_node['op_type'] != 'BatchNormalization':
             continue
 
-        bn_out = bn_node['outputs'][0]['name']
-        # 检查BN的输出是否被单一节点消费
-        bn_consumers = consumers.get(bn_out, [])
-        if len(bn_consumers) != 1:
+        # inputs[1] are merged scale, bias, mean, variance respectively
+        tensor_name = bn_node['inputs'][1]['name']
+        if tensor_name not in vk_model.initializers:
+            print(f"Warning: BatchNormalization parameters {tensor_name} not found, skipping fusion")
             continue
 
-        relu_node, _ = bn_consumers[0]
-        # 检查消费者是否为ReLU
-        if relu_node['op_type'] != 'Relu':
-            continue
+        tensor_array = numpy_helper.to_array(vk_model.initializers[tensor_name])
+        total_elements = len(tensor_array)
+        padded_N = total_elements // 4
 
-        if len(bn_node['inputs']) < 5:
-            print(f"Warning: BatchNormalization node {bn_node['name']} has less than 5 inputs, skipping fusion")
-            continue
+        scale_array = np.zeros(padded_N, dtype=np.float32)
+        bias_array = np.zeros(padded_N, dtype=np.float32)
+        mean_array = np.zeros(padded_N, dtype=np.float32)
+        var_array = np.zeros(padded_N, dtype=np.float32)
+        for i in range(padded_N // 4):
+            base_idx = i * 16
+            for j in range(4):
+                scale_array[i * 4 + j] = tensor_array[base_idx + j]           # scale
+                bias_array[i * 4 + j] = tensor_array[base_idx + 4 + j]        # bias
+                mean_array[i * 4 + j] = tensor_array[base_idx + 8 + j]        # mean
+                var_array[i * 4 + j] = tensor_array[base_idx + 12 + j]
 
-        # inputs[1-4] are scale, bias, mean, variance respectively
-        scale_name = bn_node['inputs'][1]['name']  # scale/weight
-        bias_name = bn_node['inputs'][2]['name']   # bias
-        mean_name = bn_node['inputs'][3]['name']   # mean
-        var_name = bn_node['inputs'][4]['name']    # variance
-
-        # 检查参数是否存在
-        if not all(name in vk_model.initializers for name in [scale_name, bias_name, mean_name, var_name]):
-            print(f"Warning: Missing parameters for BatchNormalization node {bn_node['name']}, skipping fusion")
-            continue
-
-        # 获取参数数组
-        scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
-        bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
-        mean_array = numpy_helper.to_array(vk_model.initializers[mean_name])
-        var_array = numpy_helper.to_array(vk_model.initializers[var_name])
-
-        # 获取eps值，默认为1e-5
         eps = float(bn_node['attributes'].get('epsilon', 1e-5))
 
-        # 检查是否有Conv的bias
         has_conv_bias = len(node['inputs']) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
 
-        # 加载卷积权重
         conv_weight_name = node['inputs'][1]['name']
         if conv_weight_name not in vk_model.initializers:
             print(f"Warning: Conv weight {conv_weight_name} not found, skipping fusion")
@@ -413,7 +397,6 @@ def fuse_conv_bn_relu(vk_model):
 
         conv_weight = numpy_helper.to_array(vk_model.initializers[conv_weight_name])
 
-        # 获取卷积偏置（如果存在）
         if has_conv_bias:
             conv_bias_name = node['inputs'][2]['name']
             if conv_bias_name not in vk_model.initializers:
@@ -421,7 +404,6 @@ def fuse_conv_bn_relu(vk_model):
                 continue
             conv_bias = numpy_helper.to_array(vk_model.initializers[conv_bias_name])
         else:
-            # 如果没有原始偏置，则创建零偏置
             conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
 
         # 执行参数融合
@@ -435,45 +417,40 @@ def fuse_conv_bn_relu(vk_model):
         # 新偏置 = (旧偏置 - mean) * (gamma / sqrt(var + eps)) + beta
         fused_bias = (conv_bias - mean_array) * inv_std + bias_array
 
-        # 更新vk_model.initializers中的权重和偏置
-        fused_weight_name = f"{conv_weight_name}_fused"
-        fused_bias_name = f"{conv_bias_name}_fused" if has_conv_bias else f"{node['name']}_fused_bias"
+        # 直接更新vk_model.initializers中的权重和偏置
+        # 更新权重为融合后的权重
+        fused_weight_tensor = numpy_helper.from_array(fused_weight, conv_weight_name)
+        vk_model.initializers[conv_weight_name] = fused_weight_tensor
 
-        # 转换回ONNX tensor格式
-        fused_weight_tensor = numpy_helper.from_array(fused_weight, fused_weight_name)
-        fused_bias_tensor = numpy_helper.from_array(fused_bias, fused_bias_name)
+        # 为偏置创建名称（如果原来没有bias，现在添加）
+        if has_conv_bias:
+            conv_bias_name = node['inputs'][2]['name']
+        else:
+            conv_bias_name = f"{node['name']}_fused_bias"
 
-        # 添加到initializers
-        vk_model.initializers[fused_weight_name] = fused_weight_tensor
-        vk_model.initializers[fused_bias_name] = fused_bias_tensor
+        fused_bias_tensor = numpy_helper.from_array(fused_bias, conv_bias_name)
+        vk_model.initializers[conv_bias_name] = fused_bias_tensor
 
         fused = node.copy()
         fused['attributes'] = dict(node.get('attributes', {}))
 
-        # 将ReLU的信息合并到Conv中
-        fused['attributes']['activation'] = 'Relu'
-        fused['outputs'] = relu_node['outputs']  # 输出为 Relu 的输出
+        fused['outputs'] = bn_node['outputs']
 
-        # 更新输入：保持数据输入，更新权重输入，更新偏置输入
         fused['inputs'] = [
             node['inputs'][0],  # 输入数据
-            {'name': fused_weight_name, 'shape': list(fused_weight.shape)},  # 新的权重
-            {'name': fused_bias_name, 'shape': list(fused_bias.shape)}  # 新的偏置
+            node['inputs'][1],  # 权重（名称不变，但数值已更新）
+            {'name': conv_bias_name, 'shape': list(fused_bias.shape)}
         ]
 
         first_idx = node['_orig_idx']
         replacements[first_idx] = fused
 
-        # 标记要删除的节点
         to_remove.add(node['_orig_idx'])
         to_remove.add(bn_node['_orig_idx'])
-        to_remove.add(relu_node['_orig_idx'])
 
-    # 构建新的节点列表
     new_nodes = []
     for idx, node in enumerate(nodes):
         if idx in to_remove:
-            # 如果这是融合子图的第一个节点，就放 fused node
             if idx in replacements:
                 new_nodes.append(replacements[idx])
         else:
@@ -482,7 +459,7 @@ def fuse_conv_bn_relu(vk_model):
     for node in new_nodes:
         node.pop('_orig_idx', None)
 
-    print("Fusing Conv+BN+ReLU patterns...", len(to_remove))
+    print("Fusing Conv+BN patterns...", len(to_remove))
     vk_model.nodes = new_nodes
 
 
@@ -1838,7 +1815,8 @@ def convert_initializers_nchw_to_rgba(vk_model):
             initializer_consumers[inp['name']].append(node)
 
     converted_count = 0
-    shape_metadata = []  # Store original shapes info in RGBAConversion format
+    shape_metadata = []
+    name_list = []
 
     for name, initializer in vk_model.initializers.items():
         dims = list(initializer.dims)
@@ -1911,6 +1889,8 @@ def convert_initializers_nchw_to_rgba(vk_model):
             padded_dims = [1] * (4 - len(dims)) + dims
 
             shape_metadata.append([dtype, name_len, offset, size] + padded_dims)
+            name_bytes = name.encode('utf-8')
+            name_list.append(name_bytes)
 
             converted_count += 1
             print(f"Converted {name} from shape {dims} to RGBA format with shape {rgba_flat.shape}")
@@ -1919,13 +1899,9 @@ def convert_initializers_nchw_to_rgba(vk_model):
     if shape_metadata:
         # Flatten the metadata list
         flattened_metadata = []
-        name_list = []
+
         for entry in shape_metadata:
             flattened_metadata.extend(entry)
-
-        for name, shape in vk_model.initializers.items():
-            name_bytes = name.encode('utf-8')
-            name_list.append(name_bytes)
 
         # Create metadata array
         metadata_array = np.array(flattened_metadata, dtype=np.int32)
@@ -1969,16 +1945,16 @@ def main():
 
     # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
     move_input_tensor_to_attr(vk_model)
+    merge_initializers(vk_model)
+    convert_flat_to_reshape(vk_model)
+    remove_redundant_reshape(vk_model)
+    fuse_conv_bn(vk_model)
+    fuse_gated_conv(vk_model)
+    fuse_conv_simple_activation(vk_model)
     if args.quant == "fp16":
         quantize_to_fp16_selective(vk_model)
     elif args.quant == "int8":
         quantize_to_int8_weight_only(vk_model)
-    merge_initializers(vk_model)
-    convert_flat_to_reshape(vk_model)
-    remove_redundant_reshape(vk_model)
-    fuse_conv_bn_relu(vk_model)
-    fuse_gated_conv(vk_model)
-    fuse_conv_simple_activation(vk_model)
     if args.rgba is True:
         convert_initializers_nchw_to_rgba(vk_model)
     if args.unify is True:

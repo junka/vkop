@@ -153,7 +153,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         }
         this->initializers.erase("unified_metadata");
         this->initializers.erase("unified_names");
-        // this->initializers.erase("unified_tensors");
+        this->initializers.erase("unified_tensors");
     }
 
     if (this->initializers.find("rgba_conversion_metadata") != this->initializers.end()) {

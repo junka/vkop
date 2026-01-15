@@ -25,7 +25,7 @@ layout(set=0, binding=4) uniform textureBuffer uScalePara;
 layout(push_constant) uniform constBuffer {
     ivec4 inputSize;     // [W_in, H_in, C_in, N]
     ivec4 outputSize;    // [W_out, H_out, C_out, N]
-    ivec4 kernelSize;    // [K_W, K_H, unused, unused]
+    ivec2 kernelSize;    // [K_W, K_H, unused, unused]
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;

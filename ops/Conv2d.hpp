@@ -29,7 +29,7 @@ enum class ActivationMode {
 struct alignas(16) GPUConv2dParam {
     ivec4 inputSize;
     ivec4 outputSize;
-    ivec4 kernel_shape;
+    ivec2 kernel_shape;
     ivec2 stride;
     ivec2 padding;
     ivec2 dilation;
@@ -240,8 +240,6 @@ class Conv2d : public Operator {
         para.outputSize[3] = out_batch;
         para.kernel_shape[0] = weight_shape[3];
         para.kernel_shape[1] = weight_shape[2];
-        para.kernel_shape[2] = weight_shape[1];
-        para.kernel_shape[3] = weight_shape[0];
         para.stride[0] = strides_[0];
         para.stride[1] = strides_[1];
         para.padding[0] = pads_[0];
