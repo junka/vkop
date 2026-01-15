@@ -1723,7 +1723,8 @@ def unified_initializers(vk_model):
         element_size = data.itemsize
         tensor_size_bytes = data.nbytes
 
-        # Calculate padding to align to 16-byte boundary
+        # Calculate padding to align to 16-byte boundary,
+        # Min TexelBuffer Alignment requirement, usually 16 bytes
         padding_needed = (16 - (current_offset % 16)) % 16
         if padding_needed > 0:
             unified_data += b"\x00" * padding_needed
@@ -1955,10 +1956,10 @@ def main():
         quantize_to_fp16_selective(vk_model)
     elif args.quant == "int8":
         quantize_to_int8_weight_only(vk_model)
-    if args.rgba is True:
-        convert_initializers_nchw_to_rgba(vk_model)
     if args.unify is True:
         unified_initializers(vk_model)
+    if args.rgba is True:
+        convert_initializers_nchw_to_rgba(vk_model)
 
     op_stats = {}
     for node in vk_model.nodes:

@@ -351,24 +351,47 @@ template <typename T> class Tensor : public ITensor {
         }
         return buff;
     }
-    std::shared_ptr<VulkanBufferView>
+
+    std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (vkobj_) {
-            auto buff = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
             return buff;
         }
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         auto vkbuffer = std::make_shared<VulkanBuffer>(
             vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        vkobj_ = vkbuffer;
+        return vkbuffer;
+    }
+
+    std::shared_ptr<VulkanBufferView>
+    as_uniform_bufferview(std::shared_ptr<VulkanDevice> &vd,
+                          const std::shared_ptr<VulkanBuffer> &buffer = nullptr,
+                          size_t offset = 0) {
+        if (vkobj_) {
+            auto buff = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            return buff;
+        }
+
+        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
         if (sizeof(T) == 1) {
             format = VK_FORMAT_R8G8B8A8_SNORM;
         } else if (sizeof(T) == 2) {
             format = VK_FORMAT_R16G16B16A16_SFLOAT;
         }
-        auto view = std::make_shared<VulkanBufferView>(vd, vkbuffer, format,
-                                                       aligned, 0);
+        std::shared_ptr<VulkanBuffer> vbuffer;
+        if (!buffer) {
+            vbuffer = std::make_shared<VulkanBuffer>(
+                vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        } else {
+            vbuffer = buffer;
+        }
+        auto view = std::make_shared<VulkanBufferView>(vd, vbuffer, format,
+                                                       size_, offset);
         vkobj_ = view;
         return view;
     }

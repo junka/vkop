@@ -208,7 +208,7 @@ class Conv2d : public Operator {
             dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto bias = core::as_tensor<T>(inputs[2]);
-                auto bias_buffer = bias->as_uniform_buffer(m_dev_);
+                auto bias_buffer = bias->as_uniform_bufferview(m_dev_);
                 objs_.emplace_back(bias_buffer);
             });
             scale_index++;
@@ -221,7 +221,7 @@ class Conv2d : public Operator {
             dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto type_tag) {
                 using T = decltype(type_tag);
                 auto scale = core::as_tensor<T>(inputs[scale_index]);
-                auto scale_buffer = scale->as_uniform_buffer(m_dev_);
+                auto scale_buffer = scale->as_uniform_bufferview(m_dev_);
                 objs_.emplace_back(scale_buffer);
             });
         } else {

@@ -58,6 +58,7 @@ public:
     std::vector<Node> nodes;
     std::unordered_map<std::string, Initializer> initializers;
     bool rgba = false;
+    bool unified = false;
     std::unordered_map<std::string, size_t> initializer_offsets;
     std::vector<uint8_t> initializer_memory;
 

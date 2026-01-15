@@ -80,6 +80,9 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         properties2.properties.limits.maxImageArrayLayers;
     this->deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", this->deviceName_.c_str());
+    LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
+    LOG_INFO("Min TexelBuffer Alignment %llu",
+             properties2.properties.limits.minTexelBufferOffsetAlignment);
     if (subgroup_properties.supportedOperations &
         VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) {
         LOG_INFO("Device support subgroup arithmetic");

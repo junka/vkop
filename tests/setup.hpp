@@ -83,7 +83,7 @@ public:
             auto t = core::as_tensor<T>(input);
             if (input->num_dims() <= 2) {
                 if (vkop::ops::OpType::CONV2D == op->get_type() || vkop::ops::OpType::BATCHNORM == op->get_type()) {
-                    t->as_uniform_buffer(dev);
+                    t->as_uniform_bufferview(dev);
                 } else {
                     t->as_storage_buffer(dev);
                 }

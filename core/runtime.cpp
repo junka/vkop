@@ -87,7 +87,7 @@ void Runtime::LoadModel() {
         if (tensor->num_dims() <= 2) {
             if (inputs_for_node_type[init.name] == "Conv" ||
                 inputs_for_node_type[init.name] == "BatchNormalization") {
-                tensor->as_uniform_buffer(dev);
+                tensor->as_uniform_bufferview(dev);
             } else {
                 tensor->as_storage_buffer(dev);
             }
@@ -100,15 +100,83 @@ void Runtime::LoadModel() {
         initializers_[init.name] = tensor;
     };
 
-    if (model.initializers.find("unified_tensor") != model.initializers.end()) {
-        auto unified = model.initializers["unified_tensor"];
-        size_t offset = model.initializer_offsets["unified_tensor"];
+    auto handle_unified_tensors = [&](const load::Initializer &init,
+                                      auto *src_ptr, auto &tensor, auto &meta,
+                                      auto &buffer) {
+        tensor->set_ref_cnt_forever();
+        if (inputs_for_node_type.find(init.name) !=
+                inputs_for_node_type.end() &&
+            inputs_for_node_type[init.name] == "Conv") {
+            tensor->set_transpose();
+            if (init.dims.size() == 4 && init.dims[2] == 1 &&
+                init.dims[3] == 1) {
+                tensor->set_pack();
+            }
+        }
+
+        if (tensor->num_dims() <= 2) {
+            tensor->as_uniform_bufferview(dev, buffer, meta.offset);
+        } else {
+            tensor->as_uniform_image(dev, nullptr);
+            tensor->copyToGPUImage(m_cmdpool_, src_ptr, model.rgba);
+        }
+        tensor_map[init.name] = tensor;
+        initializers_[init.name] = tensor;
+    };
+
+    if (model.unified && model.initializers.find("unified_tensors") !=
+                             model.initializers.end()) {
+        size_t meta_offset = model.initializer_offsets["unified_metadata"];
+        auto names_offset = model.initializer_offsets["unified_names"];
+        auto dims = model.initializers["unified_metadata"].dims;
+
+        int num_metas = dims[0] / 8;
+        uint8_t *meta_ptr = model.initializer_memory.data() + meta_offset;
+        uint8_t *name_ptr = model.initializer_memory.data() + names_offset;
+        std::vector<load::UnifiedMetadata> metas(num_metas);
+        std::memcpy(metas.data(), meta_ptr,
+                    sizeof(load::UnifiedMetadata) * num_metas);
+
+        auto unified = model.initializers["unified_tensors"];
+        size_t offset = model.initializer_offsets["unified_tensors"];
         uint8_t *src_ptr = model.initializer_memory.data() + offset;
-        auto t = std::make_shared<Tensor<float>>(unified.dims);
-        t->set_ref_cnt_forever();
-        handle_floating_point_tensor(unified,
-                                     reinterpret_cast<float *>(src_ptr), t);
-        model.initializers.erase("unified_tensor");
+        auto unified_tensor = std::make_shared<Tensor<float>>(unified.dims);
+        unified_tensor->set_ref_cnt_forever();
+        auto buffer = unified_tensor->as_uniform_buffer(dev);
+        unified_tensor->copyToGPU(m_cmdpool_,
+                                  reinterpret_cast<float *>(src_ptr));
+
+        size_t name_idx_offset = 0;
+        for (int i = 0; i < num_metas; ++i) {
+            auto &meta = metas[i];
+            auto name = std::string(name_ptr + name_idx_offset,
+                                    name_ptr + name_idx_offset + meta.name_len);
+            name_idx_offset += meta.name_len;
+            auto init = model.initializers[name];
+            if (init.dtype == "float32") {
+                auto t = std::make_shared<Tensor<float>>(init.dims);
+                handle_unified_tensors(init, reinterpret_cast<float *>(src_ptr),
+                                       t, meta, buffer);
+            } else if (init.dtype == "float16") {
+                auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
+                handle_unified_tensors(init,
+                                       reinterpret_cast<uint16_t *>(src_ptr), t,
+                                       meta, buffer);
+            } else if (init.dtype == "int8") {
+                auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+                handle_unified_tensors(
+                    init, reinterpret_cast<int8_t *>(src_ptr), t, meta, buffer);
+            } else {
+                throw std::runtime_error("Unsupported data type: " +
+                                         init.dtype);
+            }
+
+            model.initializers.erase(name);
+        }
+
+        model.initializers.erase("unified_tensors");
+        model.initializers.erase("unified_metadata");
+        model.initializers.erase("unified_names");
     }
 
     for (const auto &itr : model.initializers) {

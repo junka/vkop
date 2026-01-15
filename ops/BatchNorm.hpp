@@ -89,7 +89,7 @@ class BatchNorm : public Operator {
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto para = core::as_tensor<T>(inputs[1]);
-            auto para_buffer = para->as_uniform_buffer(m_dev_);
+            auto para_buffer = para->as_uniform_bufferview(m_dev_);
             objs_.emplace_back(para_buffer);
         });
 
