@@ -18,6 +18,11 @@ export PATH=$VULKAN_SDK/x86_64_bin:$PATH
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 pip install onnx onnx-simplifier onnxsim onnxruntime
 ```
+对于压测模型下载
+```
+pip install torchvision
+```
+
 对于测试依赖torch
 ```
 pip install torch
@@ -42,12 +47,12 @@ cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALID
 
 #### 4. 模型转换
 ```bash
-python3.13 tools/onnx2vkop.py -i resnet18-v2-7.onnx
+python3 model/onnx2vkop.py -i resnet18-v2-7.onnx
 ```
 
 - 支持量化：fp16, int8 对称量化
 - 支持指定batch size
-- 支持针对3d,4d nchw to rgba转换到模型
+- 支持针对3D,4D NCHW to RGBA转换到模型
 - 支持tensor合并，以便节约内存
 ```
 usage: onnx2vkop.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
@@ -90,6 +95,11 @@ For model conversion:
 export CMAKE_POLICY_VERSION_MINIMUM=3.5
 pip install onnx onnx-simplifier onnxsim onnxruntime
 ```
+For benchmarking models:
+```
+pip install torchvision
+```
+
 For testing dependencies:
 ```bash
 pip install torch

@@ -12,8 +12,10 @@ extern "C" {
 namespace vkop {
 namespace core {
 namespace {
-const float kMean[] = {0.485F, 0.456F, 0.406F};
-const float kStdvar[] = {0.229F, 0.224F, 0.225F};
+const float kImagenetMean[] = {0.485F, 0.456F, 0.406F};
+const float kImagenetStdvar[] = {0.229F, 0.224F, 0.225F};
+const float kClipMean[] = {0.48145466F, 0.4578275F, 0.40821073F};
+const float kClipStdvar[] = {0.26862954F, 0.26130258F, 0.27577711F};
 } // namespace
 
 /*
@@ -27,7 +29,7 @@ const float kStdvar[] = {0.229F, 0.224F, 0.225F};
 void Function::preprocess_jpg(const char *input_file,
                               const std::shared_ptr<VulkanCommandPool> &cmdpool,
                               const std::shared_ptr<core::ITensor> &input,
-                              bool imagenet) {
+                              NormMethod method) {
     int image_h;
     int image_w;
     int channels;
@@ -41,20 +43,26 @@ void Function::preprocess_jpg(const char *input_file,
 
     stbi_image_free(raw);
 
+    auto normalize = [&method](float val, int c) -> float {
+        switch (method) {
+        case NormMethod::IMAGENET:
+            return (val / 255.0F - kImagenetMean[c]) / kImagenetStdvar[c];
+        case NormMethod::INCEPTION:
+            return (val / 127.5F) - 1.0F;
+        case NormMethod::CLIP:
+            return (val / 255.0F - kClipMean[c]) / kClipStdvar[c];
+        default:
+            return val / 255.0F;
+        }
+    };
+
     // 1, 3, h, w, RGBA copy directly
     if (input->dtype() == typeid(float)) {
         std::vector<float> normalized_data(resize_h * resize_w * 4);
         for (int c = 0; c < 3; c++) {
             for (int i = 0; i < resize_h * resize_w; i++) {
-                if (imagenet) {
-                    normalized_data[(i * 4) + c] =
-                        ((static_cast<float>(resized[(i * 3) + c]) / 255.0F) -
-                         kMean[c]) /
-                        kStdvar[c];
-                } else {
-                    normalized_data[(i * 4) + c] =
-                        (static_cast<float>(resized[(i * 3) + c]) / 255.0F);
-                }
+                normalized_data[(i * 4) + c] =
+                    normalize(static_cast<float>(resized[(i * 3) + c]), c);
             }
         }
         auto t = vkop::core::as_tensor<float>(input);
@@ -63,18 +71,9 @@ void Function::preprocess_jpg(const char *input_file,
         std::vector<uint16_t> normalized_data(resize_h * resize_w * 4);
         for (int c = 0; c < 3; c++) {
             for (int i = 0; i < resize_h * resize_w; i++) {
-                if (imagenet) {
-                    normalized_data[(i * 4) + c] =
-                        vkop::core::ITensor::fp32_to_fp16(
-                            ((static_cast<float>(resized[(i * 3) + c]) /
-                              255.0F) -
-                             kMean[c]) /
-                            kStdvar[c]);
-                } else {
-                    normalized_data[(i * 4) + c] =
-                        vkop::core::ITensor::fp32_to_fp16((
-                            static_cast<float>(resized[(i * 3) + c]) / 255.0F));
-                }
+                normalized_data[(i * 4) + c] =
+                    vkop::core::ITensor::fp32_to_fp16(
+                        normalize(static_cast<float>(resized[(i * 3) + c]), c));
             }
         }
         auto t = vkop::core::as_tensor<uint16_t>(input);

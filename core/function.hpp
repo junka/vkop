@@ -6,6 +6,13 @@
 namespace vkop {
 namespace core {
 
+enum class NormMethod {
+    IMAGENET,
+    INCEPTION,
+    CLIP,
+    DEFAULT,
+};
+
 class Function {
   public:
     Function();
@@ -35,7 +42,7 @@ class Function {
     preprocess_jpg(const char *input_file,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    const std::shared_ptr<core::ITensor> &input,
-                   bool imagenet = false);
+                   NormMethod method = NormMethod::DEFAULT);
 
     static std::vector<std::pair<int, float>>
     get_top_k_predictions(const std::vector<float> &probs, int k);

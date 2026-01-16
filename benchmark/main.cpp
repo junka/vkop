@@ -54,8 +54,8 @@ int main(int argc, char *argv[]) {
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     if (argc < 3) {
-        std::cerr << "download resnet model from https://github.com/onnx/models/tree/main/validated/vision/classification/resnet/model" << std::endl;
-        std::cerr << "convert onnx to vkopbin using onnx2vkop.py from directory model" << std::endl;
+        std::cerr << "down models using model/download_models.py for benchmark" << std::endl;
+        std::cerr << "convert onnx to vkopbin using model/onnx2vkop.py" << std::endl;
         std::cerr << "download class tag from https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt" << std::endl;
         std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image> [labels.txt]" << std::endl;
         return 1;
@@ -67,20 +67,20 @@ int main(int argc, char *argv[]) {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
 
-    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), true);
-
+    vkop::core::NormMethod method = vkop::core::NormMethod::IMAGENET;
+    if (binary_file_path.find("inception") != std::string::npos) {
+        method = vkop::core::NormMethod::INCEPTION;
+    }
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), method);
     auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
     auto shape = cls->getShape();
     auto indexs = std::make_shared<vkop::core::Tensor<int>>(shape, true);
     auto values = std::make_shared<vkop::core::Tensor<float>>(shape, true);
 
-    if (binary_file_path.find("inception") != std::string::npos) {
-        rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {cls}, {values, indexs});
-    } else {
-        auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
-        rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
-        rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
-    }
+    auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
+    rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
+    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
+
     double tot_lat = 0.0F;
     int count = 1000;
     printf("run inference %d times...\n", count);

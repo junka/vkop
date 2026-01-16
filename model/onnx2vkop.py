@@ -406,6 +406,7 @@ def fuse_conv_bn(vk_model):
         else:
             conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
 
+        print("Fusing Conv node", node['name'], "with BN node", bn_node['name'])
         # 执行参数融合
         # 计算: gamma / sqrt(var + eps)
         inv_std = scale_array / np.sqrt(var_array + eps)
@@ -1491,6 +1492,11 @@ class ModelConverter:
         # Nodes with attributes and shapes of inputs/outputs
         ELEMWISE_OPS = {"Add", "And", "Div", "Equal", "Greater", "Less", "Max", "Mean",
             "Min", "Mul", "Or", "Pow", "Sub", "Sum", "Where", "Xor"}
+
+        for i, node in enumerate(graph.node):
+            if not node.name:
+                # 使用 op_type + index 生成唯一名，避免冲突
+                node.name = f"{node.op_type}_{i}"
         for node in graph.node:
             print("Processing node:", node.name, "of type:", node.op_type)
             attributes = {}
@@ -1919,6 +1925,288 @@ def convert_initializers_nchw_to_rgba(vk_model):
     return converted_count
 
 
+def replace_globalaveragepool_conv_with_gemm(vk_model):
+    """
+    Replace Conv that follows GlobalAveragePool with GEMM when conditions are met.
+    This optimization works when:
+    1. GlobalAveragePool output shape is [N, C, 1, 1] (after GAP)
+    2. Conv has kernel size 1x1 and stride 1x1
+    3. Conv has no padding or padding that maintains the 1x1 output
+    4. The operations can be equivalently represented as a matrix multiplication
+    """
+    print("Replacing Conv after GlobalAveragePool with GEMM...")
+
+    producer, consumers = build_graph_index(vk_model.nodes)
+
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}
+
+    for node in nodes:
+        # Check if it's a Conv node
+        if node['op_type'] != 'Conv':
+            continue
+
+        conv_input_name = node['inputs'][0]['name']
+
+        # Find the producer of this Conv's input
+        if conv_input_name not in producer:
+            continue
+
+        gap_node = producer[conv_input_name]
+        # Check if the producer is a GlobalAveragePool
+        if gap_node['op_type'] != 'GlobalAveragePool':
+            continue
+
+        # Check if Conv has kernel size 1x1 (typical for 1x1 convolutions after GAP)
+        kernel_shape = node['attributes'].get('kernel_shape', [1, 1])
+        strides = node['attributes'].get('strides', [1, 1])
+        pads = node['attributes'].get('pads', [0, 0, 0, 0])  # [pad_top, pad_left, pad_bottom, pad_right]
+
+        # Only proceed if kernel is 1x1 and stride is 1x1 (common case after GAP)
+        if kernel_shape == [1, 1] and strides == [1, 1]:
+            # Verify that padding doesn't change the 1x1 nature of the operation
+            if pads == [0, 0, 0, 0] or (pads[0] == pads[2] and pads[1] == pads[3] and pads[0] <= 1 and pads[1] <= 1):
+                print(f"Found Conv '{node['name']}' after GlobalAveragePool '{gap_node['name']}' with 1x1 kernel, replacing with GEMM")
+
+                weight_input = node['inputs'][1]
+                weight_name = weight_input['name']
+
+                if weight_name in vk_model.initializers:
+                    # Get the original weight tensor
+                    weight_tensor = vk_model.initializers[weight_name]
+                    original_shape = list(weight_tensor.dims)
+
+                    # For 1x1 conv, weight shape is [out_channels, in_channels, 1, 1]
+                    # For GEMM, we need [out_channels, in_channels]
+                    if len(original_shape) == 4 and original_shape[2] == 1 and original_shape[3] == 1:
+                        new_shape = [original_shape[0], original_shape[1]]  # [out_channels, in_channels]
+
+                        # Get the weight data and reshape it
+                        weight_data = numpy_helper.to_array(weight_tensor)
+                        reshaped_weight = weight_data.reshape(new_shape)
+
+                        # Create a new initializer with the reshaped data
+                        new_weight_tensor = numpy_helper.from_array(reshaped_weight, weight_name)
+                        new_weight_tensor.data_type = weight_tensor.data_type
+
+                        # Update the initializer
+                        vk_model.initializers[weight_name] = new_weight_tensor
+                        print(f"Reshaped weight '{weight_name}' from {original_shape} to {new_shape}")
+
+                # Create GEMM node
+                gemm_node = {
+                    'op_type': 'Gemm',
+                    'name': f"Gemm_after_GAP_{node['name']}",
+                    'attributes': {
+                        'alpha': 1.0,
+                        'beta': 1.0,
+                        'transA': 0,  # Don't transpose A
+                        'transB': 0   # Don't transpose B
+                    },
+                    'inputs': [
+                        gap_node['outputs'][0],  # Output from GlobalAveragePool (becomes matrix A in GEMM)
+                        {
+                            'name': weight_input['name'],
+                            'shape': weight_input['shape'][:2]
+                        }  # Conv weights (becomes matrix B in GEMM)
+                    ],
+                    'outputs': []
+                }
+
+                # If Conv has bias, add it as the third input to GEMM
+                if len(node['inputs']) > 2:
+                    gemm_node['inputs'].append(node['inputs'][2])  # Conv bias
+
+                for output in node['outputs']:
+                    # Original shape from Conv
+                    orig_shape = output['shape']
+
+                    # If the shape ends with [1, 1] (H, W), remove them to keep only [N, C]
+                    new_shape = orig_shape[:]
+                    if len(new_shape) >= 2 and new_shape[-2:] == [1, 1]:
+                        new_shape = new_shape[:-2]  # Remove the last two dimensions (H, W)
+
+                    gemm_node['outputs'].append({
+                        'name': output['name'],
+                        'shape': new_shape
+                    })
+
+                    # Also update the model's outputs if this output is in the global outputs
+                    for model_output in vk_model.outputs:
+                        if model_output['name'] == output['name']:
+                            model_output['shape'] = new_shape
+                            print(f"Updated model output '{output['name']}' shape to {new_shape}")
+
+                # Find the index of the Conv node to replace it
+                conv_idx = node['_orig_idx']
+
+                # Mark the Conv node for removal
+                to_remove.add(conv_idx)
+
+                # Add the new GEMM node
+                replacements[conv_idx] = gemm_node
+
+    # Build new nodes list
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # Replace the Conv node with GEMM
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+        else:
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        if '_orig_idx' in node:
+            del node['_orig_idx']
+
+    replaced_count = len([idx for idx in to_remove if idx in replacements])
+    print(f"Replaced {replaced_count} Conv nodes after GlobalAveragePool with GEMM nodes")
+    vk_model.nodes = new_nodes
+    return vk_model
+
+
+def replace_reducemean_reshape_with_globalaveragepool(vk_model):
+    """
+    Replace ReduceMean + Reshape pattern with GlobalAveragePool when conditions are met.
+    This optimization works when:
+    1. ReduceMean operates on HW dimensions (axes=[2, 3] or [-2, -1] for NCHW format)
+    2. Reshape removes the trailing 1x1 dimensions (resulting from ReduceMean)
+    3. The operations can be equivalently represented as a GlobalAveragePool
+    
+    This is functionally equivalent to GlobalAveragePool for NCHW format.
+    Handles both opset13 (axes in attributes) and opset18+ (axes in inputs) formats.
+    """
+    print("Replacing ReduceMean + Reshape with GlobalAveragePool...")
+    
+    producer, consumers = build_graph_index(vk_model.nodes)
+    
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}
+
+    for node in nodes:
+        # Check if it's a ReduceMean node
+        if node['op_type'] != 'ReduceMean':
+            continue
+
+        reducemean_output_name = node['outputs'][0]['name']
+
+        # Check if ReduceMean output is consumed by a single Reshape node
+        reducemean_consumers = consumers.get(reducemean_output_name, [])
+        if len(reducemean_consumers) != 1:
+            continue
+
+        reshape_node, _ = reducemean_consumers[0]
+        # Check if consumer is a Reshape node
+        if reshape_node['op_type'] != 'Reshape':
+            continue
+
+        # Get axes - could be in attributes (opset13) or inputs (opset18+)
+        axes = []
+        keepdims = node['attributes'].get('keepdims', 1)  # Default is 1 in ONNX
+        noop_with_empty_axes = node['attributes'].get('noop_with_empty_axes', 0)  # Default is 0 in ONNX
+        
+        # Check if axes is in attributes (opset13 style)
+        if 'axes' in node['attributes']:
+            axes = node['attributes']['axes']
+        else:
+            # Check if axes is in inputs (opset18+ style)
+            # Axes would be the second input (after the data input)
+            if len(node['inputs']) > 1:
+                axes_input_name = node['inputs'][1]['name']
+                if axes_input_name in vk_model.initializers:
+                    axes_tensor = vk_model.initializers[axes_input_name]
+                    axes_array = numpy_helper.to_array(axes_tensor)
+                    axes = axes_array.tolist() if hasattr(axes_array, 'tolist') else list(axes_array)
+        
+        # Handle empty axes condition based on noop_with_empty_axes
+        if len(axes) == 0 and noop_with_empty_axes == 1:
+            # If noop_with_empty_axes is true and axes is empty, this performs no reduction
+            continue
+        elif len(axes) == 0 and noop_with_empty_axes == 0:
+            # If noop_with_empty_axes is false and axes is empty, this reduces all axes
+            continue  # This case is not relevant for our optimization
+        
+        # Normalize negative axes to positive (for 4D tensors, -1 becomes 3, -2 becomes 2)
+        normalized_axes = []
+        for ax in axes:
+            if ax < 0:
+                # Determine tensor rank from input shape to normalize axes properly
+                input_shape = node['inputs'][0]['shape']
+                normalized_axes.append(len(input_shape) + ax)
+            else:
+                normalized_axes.append(ax)
+        
+        # For NCHW format, axes [2, 3] or [-2, -1] correspond to H and W dimensions
+        if sorted(normalized_axes) == [2, 3] and keepdims == 1:
+            # Check if the reshape removes the 1x1 dimensions (i.e., changes [..., 1, 1] to [...])
+            input_shape = node['inputs'][0]['shape']  # Original input shape before ReduceMean
+            output_after_reduce = node['outputs'][0]['shape']  # Shape after ReduceMean
+            output_after_reshape = reshape_node['outputs'][0]['shape']  # Shape after Reshape
+            
+            # After ReduceMean with keepdims=1, the shape should be [N, C, 1, 1]
+            # After Reshape, it should remove these trailing 1x1 dimensions to [N, C]
+            if (len(output_after_reduce) == 4 and 
+                output_after_reduce[2] == 1 and output_after_reduce[3] == 1 and
+                len(output_after_reshape) == len(input_shape) - 2 and  # Removed 2 dimensions
+                output_after_reshape[:2] == output_after_reduce[:2]):  # First two dims (N, C) match
+                
+                print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) followed by Reshape '{reshape_node['name']}', replacing with GlobalAveragePool")
+
+                # Create GlobalAveragePool node
+                globalavgpool_node = {
+                    'op_type': 'GlobalAveragePool',
+                    'name': f"GlobalAveragePool_from_{node['name']}_to_{reshape_node['name']}",
+                    'attributes': {},
+                    'inputs': [
+                        node['inputs'][0]  # Original input to ReduceMean
+                    ],
+                    'outputs': [{
+                        'name': reshape_node['outputs'][0]['name'],  # Output from Reshape
+                        'shape': output_after_reshape  # Final shape after reshape
+                    }]
+                }
+
+                # Find the index of the ReduceMean node to replace the sequence
+                reducemean_idx = node['_orig_idx']
+                reshape_idx = reshape_node['_orig_idx']
+                
+                # Mark both nodes for removal
+                to_remove.add(reducemean_idx)
+                to_remove.add(reshape_idx)
+                
+                # Add the new GlobalAveragePool node in place of the first removed node
+                replacements[reducemean_idx] = globalavgpool_node
+
+    # Build new nodes list
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # If this is the first node in the sequence, add the replacement
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+            # Otherwise skip (second node in sequence)
+        else:
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        if '_orig_idx' in node:
+            del node['_orig_idx']
+
+    replaced_count = len([idx for idx in to_remove if idx in replacements])
+    print(f"Replaced {replaced_count} ReduceMean+Reshape sequences with GlobalAveragePool nodes")
+    vk_model.nodes = new_nodes
+    return vk_model
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python onnx2vkop.py <onnx_model_path>")
@@ -1952,6 +2240,8 @@ def main():
     fuse_conv_bn(vk_model)
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
+    replace_reducemean_reshape_with_globalaveragepool(vk_model)
+    replace_globalaveragepool_conv_with_gemm(vk_model)
     if args.quant == "fp16":
         quantize_to_fp16_selective(vk_model)
     elif args.quant == "int8":
