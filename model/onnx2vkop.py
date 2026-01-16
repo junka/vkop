@@ -476,7 +476,7 @@ def fuse_conv_simple_activation(vk_model):
     replacements: Dict[int, Dict] = {}
 
     for node in nodes:
-        if node['op_type'] in ['Conv', 'BatchNormalization', 'Add'] and len(node['outputs']) == 1:
+        if node['op_type'] in ['Conv', 'BatchNormalization', 'Add', 'Gemm'] and len(node['outputs']) == 1:
             out_name = node['outputs'][0]['name']
             outs = consumers.get(out_name, [])
             if len(outs) == 1:

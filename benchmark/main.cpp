@@ -21,12 +21,12 @@ std::vector<std::string> load_labels(const std::string& label_path) {
     std::vector<std::string> labels;
     std::ifstream file(label_path);
     std::string line;
-    
+
     if (!file.is_open()) {
         std::cerr << "Could not open label file: " << label_path << std::endl;
         return labels;
     }
-    
+
     while (std::getline(file, line)) {
         // Remove carriage return if present (Windows line endings)
         if (!line.empty() && line.back() == '\r') {
@@ -34,7 +34,7 @@ std::vector<std::string> load_labels(const std::string& label_path) {
         }
         labels.push_back(line);
     }
-    
+
     file.close();
     return labels;
 }
@@ -82,7 +82,7 @@ int main(int argc, char *argv[]) {
     rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
 
     double tot_lat = 0.0F;
-    int count = 1000;
+    int count = 10;
     printf("run inference %d times...\n", count);
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();
@@ -94,7 +94,7 @@ int main(int argc, char *argv[]) {
 
     std::cout << "\nPredictions:\n";
     std::cout << std::fixed << std::setprecision(4);
-    
+
     auto labels = load_labels(labels_file_path);
 
     for (int i = 0; i < 10; ++i) {
@@ -105,7 +105,7 @@ int main(int argc, char *argv[]) {
         if (index < static_cast<int>(labels.size())) {
             label = labels[index];
         }
-        
+
         std::cout << (i + 1) << ": " << label << " (" << value << ")\n";
     }
 

@@ -7,7 +7,20 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // B' = transpose(B) if transB else B
 // Compute Y = alpha * A' * B' + beta * C,
 
-// layout(set=0, binding = 0) writeonly uniform imageBuffer bufferY;
+#ifdef FP16
+#extension GL_AMD_gpu_shader_half_float: enable
+#extension GL_EXT_shader_16bit_storage : enable
+#define FLOAT float16_t
+#define FLOAT4 f16vec4
+#define FLOAT2 f16vec2
+#else
+#define FLOAT float
+#define FLOAT4 vec4
+#define FLOAT2 vec2
+#endif
+
+#include "activation.comp"
+
 layout(set=0, binding = 0) writeonly buffer BufferY {
     uint data[];
 } bufferY;
@@ -36,6 +49,7 @@ layout(push_constant) uniform paraBuffer {
     int fp16a;
     int fp16b;
     int fp16c;
+    int activation;
 } uParams;
 
 void main() {
@@ -98,11 +112,6 @@ void main() {
     // } else {
     //     bufferY.data[yIndex] = floatBitsToUint(sum);
     // }
+    sum = activation(sum, uParams.activation);
     bufferY.data[yIndex] = floatBitsToUint(sum);
-    // bufferY.data[yIndex] = bufferA.data[yIndex];
-    // vec4 sum4 = imageLoad(bufferY, yIndex/4);
-    // vec4 sum4 = vec4(0);
-    // texelFetch(bufferY, yIndex/4);
-    // sum4[yIndex%4] = sum;
-    // imageStore(bufferY, yIndex, sum4);
 }

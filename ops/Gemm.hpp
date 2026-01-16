@@ -3,6 +3,7 @@
 #define OPS_GEMM_HPP_
 
 #include "Operator.hpp"
+#include "ops/Conv2d.hpp"
 
 extern unsigned char gemm_spv[];
 extern unsigned int gemm_spv_len;
@@ -23,6 +24,7 @@ struct alignas(16) GpuGemmParam {
     int fp16a;
     int fp16b;
     int fp16c;
+    int activation;
 };
 } // namespace gemm
 
@@ -49,6 +51,28 @@ class Gemm : public Operator {
         }
         if (attributes.find("transB") != attributes.end()) {
             transB_ = std::stol(attributes.at("transB"));
+        }
+
+        if (attributes.find("activation") != attributes.end()) {
+            std::string activation = attributes.at("activation");
+            if (activation == "Relu") {
+                activation_ = conv2d::ActivationMode::RELU;
+            } else if (activation == "Sigmoid") {
+                activation_ = conv2d::ActivationMode::SIGMOID;
+            } else if (activation == "Tanh") {
+                activation_ = conv2d::ActivationMode::TANH;
+            } else if (activation == "HardSwish") {
+                activation_ = conv2d::ActivationMode::HARDSWISH;
+            } else if (activation == "Mish") {
+                activation_ = conv2d::ActivationMode::MISH;
+            } else if (activation == "Relu6") {
+                activation_ = conv2d::ActivationMode::RELU6;
+            } else if (activation == "Swish") {
+                activation_ = conv2d::ActivationMode::SWISH;
+            } else {
+                throw std::invalid_argument("Unsupported activation: " +
+                                            activation);
+            }
         }
     }
 
@@ -110,6 +134,7 @@ class Gemm : public Operator {
         } else {
             para.fp16b = 0;
         }
+        para.activation = static_cast<int>(activation_);
 
         if (inputs.size() > 2) {
             para.has_bias = 1;
@@ -134,6 +159,7 @@ class Gemm : public Operator {
     float beta_ = 1.0F;
     int transA_ = 0;
     int transB_ = 0;
+    conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 };
 
 } // namespace ops
