@@ -4,9 +4,10 @@
 
 #include "Operator.hpp"
 
+extern "C" {
 extern unsigned char matmul_spv[];
 extern unsigned int matmul_spv_len;
-
+};
 namespace vkop {
 namespace ops {
 

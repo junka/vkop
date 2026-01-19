@@ -4,8 +4,10 @@
 
 #include "UnaryFactory.hpp"
 
+extern "C" {
 extern unsigned char nms_spv[];
 extern unsigned int nms_spv_len;
+};
 
 namespace vkop {
 namespace ops {
@@ -86,7 +88,6 @@ class Nms : public Operator {
                UP_DIV(depth, 4));
     }
 
-  private:
     int center_point_box_ = 0;
 };
 

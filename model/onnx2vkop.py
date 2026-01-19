@@ -2075,16 +2075,18 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
     Replace ReduceMean + Reshape pattern with GlobalAveragePool when conditions are met.
     This optimization works when:
     1. ReduceMean operates on HW dimensions (axes=[2, 3] or [-2, -1] for NCHW format)
-    2. Reshape removes the trailing 1x1 dimensions (resulting from ReduceMean)
+    2. Either:
+       - Reshape removes the trailing 1x1 dimensions (when keepdims=1), OR
+       - No reshape needed because keepdims=0 produces desired output shape
     3. The operations can be equivalently represented as a GlobalAveragePool
     
     This is functionally equivalent to GlobalAveragePool for NCHW format.
     Handles both opset13 (axes in attributes) and opset18+ (axes in inputs) formats.
     """
     print("Replacing ReduceMean + Reshape with GlobalAveragePool...")
-    
+
     producer, consumers = build_graph_index(vk_model.nodes)
-    
+
     nodes = vk_model.nodes
     for idx, node in enumerate(nodes):
         node['_orig_idx'] = idx
@@ -2099,21 +2101,11 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
 
         reducemean_output_name = node['outputs'][0]['name']
 
-        # Check if ReduceMean output is consumed by a single Reshape node
-        reducemean_consumers = consumers.get(reducemean_output_name, [])
-        if len(reducemean_consumers) != 1:
-            continue
-
-        reshape_node, _ = reducemean_consumers[0]
-        # Check if consumer is a Reshape node
-        if reshape_node['op_type'] != 'Reshape':
-            continue
-
         # Get axes - could be in attributes (opset13) or inputs (opset18+)
         axes = []
         keepdims = node['attributes'].get('keepdims', 1)  # Default is 1 in ONNX
         noop_with_empty_axes = node['attributes'].get('noop_with_empty_axes', 0)  # Default is 0 in ONNX
-        
+
         # Check if axes is in attributes (opset13 style)
         if 'axes' in node['attributes']:
             axes = node['attributes']['axes']
@@ -2126,7 +2118,7 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
                     axes_tensor = vk_model.initializers[axes_input_name]
                     axes_array = numpy_helper.to_array(axes_tensor)
                     axes = axes_array.tolist() if hasattr(axes_array, 'tolist') else list(axes_array)
-        
+
         # Handle empty axes condition based on noop_with_empty_axes
         if len(axes) == 0 and noop_with_empty_axes == 1:
             # If noop_with_empty_axes is true and axes is empty, this performs no reduction
@@ -2134,7 +2126,7 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
         elif len(axes) == 0 and noop_with_empty_axes == 0:
             # If noop_with_empty_axes is false and axes is empty, this reduces all axes
             continue  # This case is not relevant for our optimization
-        
+
         # Normalize negative axes to positive (for 4D tensors, -1 becomes 3, -2 becomes 2)
         normalized_axes = []
         for ax in axes:
@@ -2146,46 +2138,86 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
                 normalized_axes.append(ax)
         
         # For NCHW format, axes [2, 3] or [-2, -1] correspond to H and W dimensions
-        if sorted(normalized_axes) == [2, 3] and keepdims == 1:
+        if sorted(normalized_axes) == [2, 3]:
             # Check if the reshape removes the 1x1 dimensions (i.e., changes [..., 1, 1] to [...])
             input_shape = node['inputs'][0]['shape']  # Original input shape before ReduceMean
             output_after_reduce = node['outputs'][0]['shape']  # Shape after ReduceMean
-            output_after_reshape = reshape_node['outputs'][0]['shape']  # Shape after Reshape
-            
-            # After ReduceMean with keepdims=1, the shape should be [N, C, 1, 1]
-            # After Reshape, it should remove these trailing 1x1 dimensions to [N, C]
-            if (len(output_after_reduce) == 4 and 
-                output_after_reduce[2] == 1 and output_after_reduce[3] == 1 and
-                len(output_after_reshape) == len(input_shape) - 2 and  # Removed 2 dimensions
-                output_after_reshape[:2] == output_after_reduce[:2]):  # First two dims (N, C) match
-                
-                print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) followed by Reshape '{reshape_node['name']}', replacing with GlobalAveragePool")
 
-                # Create GlobalAveragePool node
-                globalavgpool_node = {
-                    'op_type': 'GlobalAveragePool',
-                    'name': f"GlobalAveragePool_from_{node['name']}_to_{reshape_node['name']}",
-                    'attributes': {},
-                    'inputs': [
-                        node['inputs'][0]  # Original input to ReduceMean
-                    ],
-                    'outputs': [{
-                        'name': reshape_node['outputs'][0]['name'],  # Output from Reshape
-                        'shape': output_after_reshape  # Final shape after reshape
-                    }]
-                }
+            if keepdims == 1:
+                reducemean_consumers = consumers.get(reducemean_output_name, [])
+                if len(reducemean_consumers) != 1:
+                    continue
+                reshape_node, _ = reducemean_consumers[0]
+                # Check if consumer is a Reshape node
+                if reshape_node['op_type'] != 'Reshape':
+                    continue
 
-                # Find the index of the ReduceMean node to replace the sequence
-                reducemean_idx = node['_orig_idx']
-                reshape_idx = reshape_node['_orig_idx']
-                
-                # Mark both nodes for removal
-                to_remove.add(reducemean_idx)
-                to_remove.add(reshape_idx)
-                
-                # Add the new GlobalAveragePool node in place of the first removed node
-                replacements[reducemean_idx] = globalavgpool_node
+                output_after_reshape = reshape_node['outputs'][0]['shape']
 
+                # After ReduceMean with keepdims=1, the shape should be [N, C, 1, 1]
+                # After Reshape, it should remove these trailing 1x1 dimensions to [N, C]
+                if (len(output_after_reduce) == 4 and 
+                    output_after_reduce[2] == 1 and output_after_reduce[3] == 1 and
+                    len(output_after_reshape) == len(input_shape) - 2 and  # Removed 2 dimensions
+                    output_after_reshape[:2] == output_after_reduce[:2]):  # First two dims (N, C) match
+
+                    print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) followed by Reshape '{reshape_node['name']}', replacing with GlobalAveragePool")
+
+                    # Create GlobalAveragePool node
+                    globalavgpool_node = {
+                        'op_type': 'GlobalAveragePool',
+                        'name': f"GlobalAveragePool_from_{node['name']}_to_{reshape_node['name']}",
+                        'attributes': {},
+                        'inputs': [
+                            node['inputs'][0]  # Original input to ReduceMean
+                        ],
+                        'outputs': [{
+                            'name': reshape_node['outputs'][0]['name'],  # Output from Reshape
+                            'shape': output_after_reshape  # Final shape after reshape
+                        }]
+                    }
+
+                    # Find the index of the ReduceMean node to replace the sequence
+                    reducemean_idx = node['_orig_idx']
+                    reshape_idx = reshape_node['_orig_idx']
+
+                    # Mark both nodes for removal
+                    to_remove.add(reducemean_idx)
+                    to_remove.add(reshape_idx)
+
+                    # Add the new GlobalAveragePool node in place of the first removed node
+                    replacements[reducemean_idx] = globalavgpool_node
+            elif keepdims == 0:
+                # Check if the output shape after ReduceMean is what we expect for GlobalAveragePool
+                # Input shape is [N, C, H, W], expected output is [N, C] (with keepdims=0)
+                if (len(input_shape) == 4 and
+                    len(output_after_reduce) == 2 and
+                    input_shape[0] == output_after_reduce[0] and  # Batch dimension matches
+                    input_shape[1] == output_after_reduce[1]):   # Channel dimension matches
+
+                    print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) and keepdims=0, replacing with GlobalAveragePool")
+
+                    # Create GlobalAveragePool node
+                    globalavgpool_node = {
+                        'op_type': 'GlobalAveragePool',
+                        'name': f"GlobalAveragePool_from_{node['name']}_keepdims0",
+                        'attributes': {},
+                        'inputs': [
+                            node['inputs'][0]  # Original input to ReduceMean
+                        ],
+                        'outputs': [
+                            node['outputs'][0]  # Same output as the ReduceMean node
+                        ]
+                    }
+
+                    # Find the index of the ReduceMean node to replace
+                    reducemean_idx = node['_orig_idx']
+
+                    # Mark the ReduceMean node for removal
+                    to_remove.add(reducemean_idx)
+
+                    # Add the new GlobalAveragePool node in place of the ReduceMean
+                    replacements[reducemean_idx] = globalavgpool_node
     # Build new nodes list
     new_nodes = []
     for idx, node in enumerate(nodes):

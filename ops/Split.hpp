@@ -4,8 +4,10 @@
 
 #include "ops/Operator.hpp"
 
+extern "C" {
 extern unsigned char split_spv[];
 extern unsigned int split_spv_len;
+};
 
 namespace vkop {
 namespace ops {

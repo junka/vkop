@@ -7,8 +7,10 @@
 
 #include <memory>
 
+extern "C" {
 extern unsigned char batchnorm_spv[];
 extern unsigned int batchnorm_spv_len;
+};
 
 namespace vkop {
 namespace ops {

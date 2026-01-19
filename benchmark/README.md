@@ -16,6 +16,8 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
 
 | GPU | Model | Operators |Precision | latency (ms) |
 | --- | ----- | --------- | -------- | ----------- |
+| A2000| alexnet | 13 | fp32 | 6.91 |
+| A2000| alexnet | 13 | fp16 | 6.01 |
 | A2000| densenet121 | 246 | fp32 | 25.45 |
 | A2000| densenet121 | 246 | fp16 | 22.26 |
 | A2000| densenet161 | 326 | fp32 | 55.83 |
@@ -36,6 +38,12 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
 | A2000| resnet101 | 140 | fp16 | 26.66 |
 | A2000| resnet152 | 208 | fp32 | 47.04 |
 | A2000| resnet152 | 208 | fp16 | 37.79 |
+| A2000| shufflenet_v2_x1_0 | 136 | fp32 | 4.24 |
+| A2000| shufflenet_v2_x1_0 | 136 | fp16 | 3.89 |
+| A2000| squeezenet1_0 | 38 | fp32 | 4.82 |
+| A2000| squeezenet1_0 | 38 | fp16 | 3.96 |
+| A2000| vgg16 | 38 | fp32 | 57.85 |
+| A2000| vgg16 | 23 | fp16 | 46.56 |
 | T2000| resnet18 | 41 | fp16 | 17.04 |
 | T2000| resnet34 | 73 | fp16 | 30.03 |
 | T2000| resnet50 | 90 | fp16 | 35.30 |

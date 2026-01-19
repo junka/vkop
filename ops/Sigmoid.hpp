@@ -4,8 +4,10 @@
 
 #include "UnaryFactory.hpp"
 
+extern "C" {
 extern unsigned char sigmoid_spv[];
 extern unsigned int sigmoid_spv_len;
+};
 
 namespace vkop {
 namespace ops {

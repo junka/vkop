@@ -7,8 +7,11 @@
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
 
+extern "C" {
 extern unsigned char reshape_spv[];
 extern unsigned int reshape_spv_len;
+};
+
 namespace vkop {
 namespace ops {
 

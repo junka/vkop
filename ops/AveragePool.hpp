@@ -4,8 +4,10 @@
 
 #include "ops/Operator.hpp"
 
+extern "C" {
 extern unsigned char averagepool_spv[];
 extern unsigned int averagepool_spv_len;
+};
 
 namespace vkop {
 namespace ops {

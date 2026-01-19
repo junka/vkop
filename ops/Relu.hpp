@@ -4,8 +4,10 @@
 
 #include "UnaryFactory.hpp"
 
+extern "C" {
 extern unsigned char relu_spv[];
 extern unsigned int relu_spv_len;
+};
 
 namespace vkop {
 namespace ops {

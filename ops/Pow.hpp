@@ -4,8 +4,10 @@
 
 #include "BinaryFactory.hpp"
 
+extern "C" {
 extern unsigned char pow_spv[];
 extern unsigned int pow_spv_len;
+};
 
 namespace vkop {
 namespace ops {

@@ -82,7 +82,7 @@ int main(int argc, char *argv[]) {
     rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
 
     double tot_lat = 0.0F;
-    int count = 10;
+    int count = 100;
     printf("run inference %d times...\n", count);
     for (int i = 0; i < count; i ++) {
         auto lat = rt->Run();

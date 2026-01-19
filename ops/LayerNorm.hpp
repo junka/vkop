@@ -6,8 +6,10 @@
 
 #include <memory>
 
+extern "C" {
 extern unsigned char layernorm_spv[];
 extern unsigned int layernorm_spv_len;
+};
 
 namespace vkop {
 namespace ops {

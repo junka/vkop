@@ -4,8 +4,10 @@
 
 #include "UnaryFactory.hpp"
 
+extern "C" {
 extern unsigned char floor_spv[];
 extern unsigned int floor_spv_len;
+};
 
 namespace vkop {
 namespace ops {

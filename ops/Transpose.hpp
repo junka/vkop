@@ -4,9 +4,10 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-
+extern "C" {
 extern unsigned char transpose_spv[];
 extern unsigned int transpose_spv_len;
+};
 namespace vkop {
 namespace ops {
 

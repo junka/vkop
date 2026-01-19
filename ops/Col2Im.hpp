@@ -4,8 +4,10 @@
 
 #include "Operator.hpp"
 
+extern "C" {
 extern unsigned char col2im_spv[];
 extern unsigned int col2im_spv_len;
+};
 
 namespace vkop {
 namespace ops {

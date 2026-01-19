@@ -6,8 +6,11 @@
 #include "ops/Operator.hpp"
 #include <numeric>
 
+extern "C" {
 extern unsigned char slice_spv[];
 extern unsigned int slice_spv_len;
+};
+
 namespace vkop {
 namespace ops {
 

@@ -4,10 +4,12 @@
 
 #include "Operator.hpp"
 
+extern "C" {
 extern unsigned char softmax_spv[];
 extern unsigned int softmax_spv_len;
 extern unsigned char softmax2_spv[];
 extern unsigned int softmax2_spv_len;
+};
 
 namespace vkop {
 namespace ops {

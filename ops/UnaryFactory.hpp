@@ -35,9 +35,9 @@ class UnaryFactory : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        auto outGPUshape = inputs[0]->getGPUShape();
-        submit(nullptr, UP_DIV(outGPUshape[0], 16), UP_DIV(outGPUshape[1], 16),
-               outGPUshape[2]);
+        auto out_gpu_shape = inputs[0]->getGPUShape();
+        submit(nullptr, UP_DIV(out_gpu_shape[0], 16),
+               UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 };
 

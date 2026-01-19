@@ -9,8 +9,10 @@
 #include <cmath>
 #include <numeric>
 
+extern "C" {
 extern unsigned char resize_spv[];
 extern unsigned int resize_spv_len;
+};
 
 namespace vkop {
 namespace ops {

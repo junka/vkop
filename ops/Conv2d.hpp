@@ -8,8 +8,11 @@
 
 #include "Operator.hpp"
 
+extern "C" {
 extern unsigned char conv2d_spv[];
 extern unsigned int conv2d_spv_len;
+};
+
 namespace vkop {
 namespace ops {
 namespace conv2d {

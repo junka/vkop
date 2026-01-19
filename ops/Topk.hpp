@@ -8,8 +8,10 @@
 #include <memory>
 #include <vector>
 
+extern "C" {
 extern unsigned char topk_spv[];
 extern unsigned int topk_spv_len;
+};
 
 namespace vkop {
 namespace ops {
@@ -21,6 +23,7 @@ struct alignas(16) GpuTopkParam {
     int axis;
     int largest;
     int sorted;
+    int init;
 };
 
 } // namespace topk
@@ -78,21 +81,6 @@ class Topk : public Operator {
         assert(axis <= 2 && axis >= 0);
         assert(k_ < 256);
 
-        std::vector<int> indice;
-        if (axis == 0) {
-            indice.resize(inshape[axis]);
-            for (int i = 0; i < inshape[axis]; i++) {
-                indice[i] = i;
-            }
-        } else {
-            indice.resize(inshape[axis] * inshape[0]);
-            for (int i = 0; i < inshape[0]; i++) {
-                for (int j = 0; j < inshape[axis]; j++) {
-                    indice[(i * inshape[axis]) + j] = (i * inshape[axis]) + j;
-                }
-            }
-        }
-
         auto outshape = inshape;
         outshape[axis] = k_;
 
@@ -124,14 +112,12 @@ class Topk : public Operator {
         auto tempvalue1 = std::make_shared<core::Tensor<float>>(outshape);
         auto tempvalue2 = std::make_shared<core::Tensor<float>>(outshape);
         auto tempindex1 = std::make_shared<core::Tensor<int>>(outshape);
-        auto tempindex2 = std::make_shared<core::Tensor<int>>(inshape);
+        auto tempindex2 = std::make_shared<core::Tensor<int>>(inshape, true);
 
         auto tmpvalue1 = tempvalue1->as_storage_buffer(m_dev_);
         auto tmpvalue2 = tempvalue2->as_storage_buffer(m_dev_);
         auto tmpindex1 = tempindex1->as_storage_buffer(m_dev_);
         auto tmpindex2 = tempindex2->as_storage_buffer(m_dev_, m_cmd_);
-
-        tempindex2->copyToGPU(m_cmdpool_, indice.data());
 
         auto input = core::as_tensor<float>(inputs[0]);
         auto input_buffer = input->as_storage_buffer(m_dev_, m_cmd_);
@@ -163,6 +149,11 @@ class Topk : public Operator {
             objs_[2] = (input_index_cur);
             objs_[3] = (input_value_cur);
             param.inShape[axis] = width;
+            if (i > 0) {
+                param.init = 1;
+            } else {
+                param.init = 0;
+            }
             int dispatch_width = UP_DIV(width, 256);
             if (axis == 0) {
                 submit(&param, dispatch_width, 1, 1);
