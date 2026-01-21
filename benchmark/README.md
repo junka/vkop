@@ -24,6 +24,8 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
 | A2000| densenet161 | 326 | fp16 | 46.75 |
 | A2000| densenet201 | 406 | fp32 | 50.69 |
 | A2000| densenet201 | 406 | fp16 | 45.92 |
+| A2000| efficientnet_b0 | 124 | fp32 | 12.12 |
+| A2000| efficientnet_b0 | 124 | fp16 | 11.94 |
 | A2000| inceptionv3 | 120 | fp32 | 27.49 |
 | A2000| inceptionv3 | 120 | fp16 | 25.27 |
 | A2000| mobilenetv2 | 64 | fp32 | 3.60 |

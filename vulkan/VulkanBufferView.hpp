@@ -24,6 +24,8 @@ class VulkanBufferView : public VulkanResource {
 
     std::shared_ptr<VulkanBuffer> getBuffer() const { return m_vkbuf_; };
 
+    VkDeviceSize getOffset() const { return m_offset_; };
+
   private:
     std::shared_ptr<VulkanBuffer> m_vkbuf_;
     VkDeviceSize m_size_;

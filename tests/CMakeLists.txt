@@ -27,7 +27,7 @@ set(TESTS
     ModelTest
     MatMulTest
     GemmTest
-    # ReduceTest
+    ReduceTest
     ReshapeTest
     TransposeTest
     SliceTest

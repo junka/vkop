@@ -2239,6 +2239,124 @@ def replace_reducemean_reshape_with_globalaveragepool(vk_model):
     return vk_model
 
 
+def unify_reduce_operators(vk_model):
+    """Unify all reduceXX operators into a single reduce operator with the specific operation stored in attributes."""
+    producer, consumers = build_graph_index(vk_model.nodes)
+
+    nodes = vk_model.nodes
+    for idx, node in enumerate(nodes):
+        node['_orig_idx'] = idx
+
+    to_remove: Set[int] = set()
+    replacements: Dict[int, Dict] = {}
+
+    # Define mapping from ONNX reduce operations to internal representation
+    reduce_ops_map = {
+        'ReduceSum': 'sum',
+        'ReduceMean': 'mean',
+        'ReduceMax': 'max',
+        'ReduceMin': 'min',
+        'ReduceProd': 'prod',
+        'ReduceSumSquare': 'sum_square',
+        'ReduceL1': 'l1_norm',
+        'ReduceL2': 'l2_norm',
+        'ReduceLogSum': 'log_sum',
+        'ReduceLogSumExp': 'log_sum_exp'
+    }
+
+    for node in nodes:
+        op_type = node['op_type']
+        
+        # Check if this is a reduce operation
+        if op_type not in reduce_ops_map:
+            continue
+
+        # Extract axes - could be in attributes (opset13) or inputs (opset18+)
+        axes = []
+        noop_with_empty_axes = node['attributes'].get('noop_with_empty_axes', 0)  # Default is 0 in ONNX
+        
+        # Check if axes is in attributes (opset13 style)
+        if 'axes' in node['attributes']:
+            axes = node['attributes']['axes']
+        else:
+            # Check if axes is in inputs (opset18+ style)
+            # Axes would be the second input (after the data input)
+            if len(node['inputs']) > 1:
+                axes_input_name = node['inputs'][1]['name']
+                if axes_input_name in vk_model.initializers:
+                    axes_tensor = vk_model.initializers[axes_input_name]
+                    axes_array = numpy_helper.to_array(axes_tensor)
+                    axes = axes_array.tolist() if hasattr(axes_array, 'tolist') else list(axes_array)
+        print(f"Unifying {op_type} '{node['name']}' with axes {axes} and noop_with_empty_axes={noop_with_empty_axes}")
+        # Handle empty axes according to ONNX specification
+        if len(axes) == 0:
+            if noop_with_empty_axes == 1:
+                # If noop_with_empty_axes is true and axes is empty, this performs no reduction
+                # We keep the original node as it is a no-op
+                original_idx = node['_orig_idx']
+                to_remove.add(node['_orig_idx'])
+                continue
+            elif noop_with_empty_axes == 0:
+                # If noop_with_empty_axes is false and axes is empty, this reduces all axes
+                # Get input shape to determine all axes
+                input_shape = node['inputs'][0]['shape']
+                axes = list(range(len(input_shape)))  # Reduce over all dimensions
+        
+        # Normalize negative axes to positive
+        input_shape = node['inputs'][0]['shape']
+        normalized_axes = []
+        for ax in axes:
+            if ax < 0:
+                normalized_axes.append(len(input_shape) + ax)
+            else:
+                normalized_axes.append(ax)
+
+        # Create unified reduce node
+        reduce_node = {
+            'op_type': 'Reduce',
+            'name': node['name'],
+            'attributes': {
+                'reduce_op': reduce_ops_map[op_type],
+                'axes': normalized_axes,
+                'keepdims': node['attributes'].get('keepdims', 1),
+            },
+            'inputs': [
+                node['inputs'][0]  # Data input remains the same
+            ],
+            'outputs': node['outputs'][:]  # Copy outputs
+        }
+
+        # Remove axes from inputs if it was there (opset18+)
+        # Keep only the data input
+        if len(node['inputs']) > 1:
+            # Remove the axes input, keeping only the data input
+            reduce_node['inputs'] = [node['inputs'][0]]
+
+        # Mark original node for removal and add replacement
+        original_idx = node['_orig_idx']
+        to_remove.add(original_idx)
+        replacements[original_idx] = reduce_node
+
+    # Build new nodes list
+    new_nodes = []
+    for idx, node in enumerate(nodes):
+        if idx in to_remove:
+            # If this is a node to be replaced, add the replacement
+            if idx in replacements:
+                new_nodes.append(replacements[idx])
+        else:
+            new_nodes.append(node)
+
+    for node in new_nodes:
+        if '_orig_idx' in node:
+            del node['_orig_idx']
+
+    replaced_count = len([idx for idx in to_remove if idx in replacements])
+    print(f"Unified {replaced_count} reduceXX operations into Reduce nodes")
+    vk_model.nodes = new_nodes
+    return vk_model
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python onnx2vkop.py <onnx_model_path>")
@@ -2273,6 +2391,7 @@ def main():
     fuse_gated_conv(vk_model)
     fuse_conv_simple_activation(vk_model)
     replace_reducemean_reshape_with_globalaveragepool(vk_model)
+    unify_reduce_operators(vk_model)
     replace_globalaveragepool_conv_with_gemm(vk_model)
     if args.quant == "fp16":
         quantize_to_fp16_selective(vk_model)

@@ -1,64 +1,367 @@
 #version 450
-#extension GL_KHR_shader_subgroup_arithmetic : enable
-#extension GL_EXT_shader_atomic_float : enable
+#extension GL_EXT_shader_atomic_float : require
 
-layout(local_size_x = 16, local_size_y = 16) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-layout(set = 0, binding = 0) readonly buffer InputBuffer {
-    float data_in[];
-};
-layout(set = 0, binding = 1) buffer OutputBuffer {
-    float result;
-};
 
-layout(set=0, binding = 2) readonly uniform paraBuffer {
-    int H;
-    int W;
-    int norm_type;
-} uReducePara;
+layout(set = 0, binding = 0) writeonly uniform image2DArray uOutput;
+layout(set = 0, binding = 1) uniform sampler2DArray uInput;
 
-shared float local_sum[256]; // 每个线程一个 slot
+// Reduce op codes
+#define REDUCE_L1        0
+#define REDUCE_L2        1
+#define REDUCE_LOGSUM    2
+#define REDUCE_LOGSUMEXP 3
+#define REDUCE_MAX       4
+#define REDUCE_MEAN      5
+#define REDUCE_MIN       6
+#define REDUCE_PROD      7
+#define REDUCE_SUM       8
+#define REDUCE_SUMSQUARE 9
 
-void main() {
-    uint gid = gl_GlobalInvocationID.x;
-    uint lid = gl_LocalInvocationID.x;
-    uint group_size = gl_WorkGroupSize.x; // 256
+layout(push_constant) uniform Params {
+    ivec4 inShape;     // [N, C, H, W] — logical input shape
+    int reduce_op;
+    int axes_mask;     // bit0=N(0), bit1=C(1), bit2=H(2), bit3=W(3)
+                       // e.g., reduce H,W → (1<<2)|(1<<3) = 12
+} pc;
 
-    uint total_elements = uReducePara.H * uReducePara.W;
-    
-    // Step 1: 每个线程累加多个元素（strided access）
-    float sum = 0.0;
-    for (uint i = gid; i < total_elements; i += gl_NumWorkGroups.x * group_size) {
-        float val = data_in[i];
-        if (uReducePara.norm_type == 1) {
-            sum += abs(val);
-        } else {
-            sum += val * val;
-        }
-    }
+shared float sdata[256];
 
-    // Step 2: 写入 shared memory
-    local_sum[lid] = sum;
-    memoryBarrierShared();
+// ---------- Helper: read logical channel c from RGBA-packed input ----------
+float read_logical_channel(int n, int c, int h, int w) {
+    if (c >= pc.inShape.y) return 0.0; // safety
+
+    int layer_idx = c / 4;
+    int comp_idx  = c % 4;
+
+    float x = float(w) + 0.5;
+    float y = float(n * pc.inShape.z + h) + 0.5; // y = n*H + h
+
+    vec4 rgba = textureLod(uInput, vec3(x, y, float(layer_idx)), 0.0);
+
+    // Select component
+    if (comp_idx == 0) return rgba.r;
+    if (comp_idx == 1) return rgba.g;
+    if (comp_idx == 2) return rgba.b;
+    return rgba.a;
+}
+
+// ---------- Reduction Utilities ----------
+float init_acc_one(int op) {
+    if (op == REDUCE_MAX) return -1e30;
+    if (op == REDUCE_MIN) return  1e30;
+    if (op == REDUCE_PROD) return 1.0;
+    return float(0.0);
+}
+
+vec4 init_acc_vec(int op) {
+    if (op == REDUCE_MAX) return vec4(-1e30);
+    if (op == REDUCE_MIN) return  vec4(1e30);
+    if (op == REDUCE_PROD) return vec4(1.0);
+    return vec4(0.0);
+}
+
+float transform_val(float v, int op) {
+    if (op == REDUCE_L1) return abs(v);
+    if (op == REDUCE_L2 || op == REDUCE_SUMSQUARE) return v * v;
+    if (op == REDUCE_LOGSUMEXP) return exp(v);
+    return v;
+}
+
+vec4 transform_val(vec4 v, int op) {
+    if (op == REDUCE_L1) return abs(v);
+    if (op == REDUCE_L2 || op == REDUCE_SUMSQUARE) return v * v;
+    if (op == REDUCE_LOGSUMEXP) return exp(v);
+    return v;
+}
+
+float combine_vals(float a, float b, int op) {
+    if (op == REDUCE_MAX) return max(a, b);
+    if (op == REDUCE_MIN) return min(a, b);
+    if (op == REDUCE_PROD) return a * b;
+    return a + b;
+}
+
+vec4 combine_vals(vec4 a, vec4 b, int op) {
+    if (op == REDUCE_MAX) return max(a, b);
+    if (op == REDUCE_MIN) return min(a, b);
+    if (op == REDUCE_PROD) return a * b;
+    return a + b;
+}
+
+void tree_reduce_in_shared(int op, uint lid) {
     barrier();
-
-    // Tree reduction in workgroup
-    for (uint stride = group_size / 2; stride > 0; stride /= 2) {
+    for (uint stride = 128; stride > 0; stride >>= 1) {
         if (lid < stride) {
-            local_sum[lid] += local_sum[lid + stride];
+            sdata[lid] = combine_vals(sdata[lid], sdata[lid + stride], op);
         }
-        memoryBarrierShared();
         barrier();
     }
+}
 
-    if (lid == 0) {
-        float partial = local_sum[0];
-        if (uReducePara.norm_type == 2) {
-            // 注意：不能在这里 sqrt！因为要先 sum 所有 partial
-            // 所以 L2 必须分两步：先 sum(x²)，再 sqrt
-            result = partial; // 但这是错的！
-        } else {
-            atomicAdd(result, partial);
+// ---------- Case 1: Reduce H and W (axes_mask = 12 = 0b1100) ----------
+// Output shape: [N, C, 1, 1] → stored as image2DArray(1, N, C4)
+void reduce_spatial_hw() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int n = gid.y;
+    int c4 = gid.z;
+    int N = imgsz.y;
+    int C4 = imgsz.z;
+    if (n >= N || c4 >= C4) return;
+
+    uint total_elements = uint(pc.inShape.z * pc.inShape.w);
+    vec4 acc = init_acc_vec(pc.reduce_op);
+
+    for (uint h = 0; h < pc.inShape.z ; h ++) {
+        for (int w = 0; w < pc.inShape.w; ++w) {
+            vec4 v = texelFetch(uInput, ivec3(w, n * pc.inShape.z + h, c4), 0);
+            acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
         }
+    }
+
+    vec4 result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    }
+    
+    // Write the four components separately to the output
+    ivec4 oc_vec = int(c4) * 4 + ivec4(0, 1, 2, 3);
+    bvec4 valid_oc = lessThan(oc_vec, ivec4(pc.inShape.y));
+    result *= vec4(valid_oc);
+    imageStore(uOutput, gid, result);
+}
+
+// ---------- Case 2: Reduce N and C (axes_mask = 3 = 0b0011) ----------
+// Output shape: [1, 1, H, W] → stored as image2DArray(W, H, 1)
+void reduce_batch_channel() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int w = gid.x;
+    int h = gid.y;
+    int H = imgsz.y;
+    if (h >= H || w >= imgsz.x) return;
+
+    uint total_elements = uint(pc.inShape.x * pc.inShape.y);
+    float acc = init_acc_one(pc.reduce_op);
+
+    for (int n = 0; n < pc.inShape.x; ++n) {
+        for (int c4 = 0; c4 < (pc.inShape.y + 3)/4; ++c4) {
+            vec4 v = texelFetch(uInput, ivec3(w, n * H + h, c4), 0);
+            for (int c = 0; c < 4; ++c) {
+                if (c4 * 4 + c >= pc.inShape.y) break;
+                acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+            }
+        }
+    }
+    float result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    }
+
+    imageStore(uOutput, gid, vec4(result, 0, 0, 0));
+}
+
+// ---------- Case 3: Reduce only N (axes_mask = 1 = 0b0001) ----------
+// Output shape: [1, C, H, W] → stored as image2DArray(W, H, C)
+void reduce_batch_only() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int w = gid.x;
+    int c4 = gid.z;
+    int W = imgsz.x;
+    int H = pc.inShape.z;
+    int C4 = imgsz.z;
+    int h = gid.y % H;
+    if (w >= W || c4 >= C4) return;
+
+    uint total_elements = uint(pc.inShape.x);
+    vec4 acc = init_acc_vec(pc.reduce_op);
+
+    for (int b = 0; b < pc.inShape.x; ++b) {
+        vec4 v = texelFetch(uInput, ivec3(w, b * H + h, c4), 0);
+        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+    }
+
+    vec4 result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    }
+    
+    // Write the four components separately to the output
+    ivec4 oc_vec = int(c4) * 4 + ivec4(0, 1, 2, 3);
+    bvec4 valid_oc = lessThan(oc_vec, ivec4(pc.inShape.y));
+    result *= vec4(valid_oc);
+    imageStore(uOutput, gid, result);
+}
+
+// ---------- Case 4: Reduce only C (axes_mask = 2 = 0b0010) ----------
+// Output shape: [N, 1, H, W] → stored as image2DArray(W, H, N)
+void reduce_channel_only() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int w = gid.x;
+    int nh = gid.y;
+    int NH = imgsz.y;
+    int H = pc.inShape.z;
+    int C4 = imgsz.z;
+    int n = nh / H;
+    if (nh >= NH || w >= imgsz.x) return;
+
+    uint total_elements = uint(pc.inShape.y);
+    float acc = init_acc_one(pc.reduce_op);
+
+    for (int c4 = 0; c4 < (pc.inShape.y + 3)/4; ++c4) {
+        vec4 v = texelFetch(uInput, ivec3(w, nh, c4), 0);
+        for (int c = 0; c < 4; ++c) {
+            if (c4 * 4 + c >= pc.inShape.y) break;
+            acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+        }
+    }
+
+    float result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    }
+
+    imageStore(uOutput, gid, vec4(result, 0, 0, 0));
+}
+// ---------- Case 5: Reduce only W (axes_mask = 8 = 0b1000) ----------
+// Output shape: [N, C, H, 1] → stored as image2DArray(1, N*H, C4)
+void reduce_width_only() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int nh = gid.y;
+    int c4 = gid.z;
+    int NH = imgsz.y;
+    int H = pc.inShape.z;
+    int C4 = imgsz.z;
+    int n = nh / H;
+    int h = nh % H;
+    if (nh >= NH || c4 >= C4) return;
+
+    uint total_elements = uint(pc.inShape.w);
+    vec4 acc = init_acc_vec(pc.reduce_op);
+
+    for (int w = 0; w < pc.inShape.w; ++w) {
+        vec4 v = texelFetch(uInput, ivec3(w, nh, c4), 0);
+        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+    }
+
+    vec4 result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    }
+    
+    // Write the four components separately to the output
+    ivec4 oc_vec = int(c4) * 4 + ivec4(0, 1, 2, 3);
+    bvec4 valid_oc = lessThan(oc_vec, ivec4(pc.inShape.y));
+    result *= vec4(valid_oc);
+    imageStore(uOutput, gid, result);
+}
+
+// ---------- Case 6: Reduce only H (axes_mask = 4 = 0b0100) ----------
+// Output shape: [N, C, 1, W] → stored as image2DArray(W, N, C)
+void reduce_height_only() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID);
+    ivec3 imgsz = imageSize(uOutput);
+    int w = gid.x;
+    int nh = gid.y;
+    int c4 = gid.z;
+    int NH = imgsz.y;
+    int H = pc.inShape.z;
+    int C4 = imgsz.z;
+    int n = nh / H;
+    if (nh >= NH || c4 >= C4) return;
+
+    uint total_elements = uint(pc.inShape.z);
+    vec4 acc = init_acc_vec(pc.reduce_op);
+
+    for (int h = 0; h < pc.inShape.z; ++h) {
+        vec4 v = texelFetch(uInput, ivec3(w, n * pc.inShape.z + h, c4), 0);
+        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+    }
+
+    vec4 result = acc;
+    if (pc.reduce_op == REDUCE_MEAN) {
+        result /= float(total_elements);
+    } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(result + 1e-12);
+    } else if (pc.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(result, 1e-12));
+    } else if (pc.reduce_op == REDUCE_L2) {
+        result = sqrt(result);
+    }
+    
+    // Write the four components separately to the output
+    ivec4 oc_vec = int(c4) * 4 + ivec4(0, 1, 2, 3);
+    bvec4 valid_oc = lessThan(oc_vec, ivec4(pc.inShape.y));
+    result *= vec4(valid_oc);
+    imageStore(uOutput, gid, result);
+}
+
+// ---------- Main Entry ----------
+void main() {
+    switch (pc.axes_mask) {
+        case 12: // 0b1100 → reduce H(2), W(3)
+            reduce_spatial_hw();
+            break;
+        case 3:  // 0b0011 → reduce N(0), C(1)
+            reduce_batch_channel();
+            break;
+        case 1:  // 0b0001 → reduce N(0)
+            reduce_batch_only();
+            break;
+        case 2:  // 0b0010 → reduce C(1)
+            reduce_channel_only();
+            break;
+        case 4: // 0b0100 → reduce H(3)
+            reduce_height_only();
+            break;
+        case 8: // 0b1000 → reduce W(2)
+            reduce_width_only();
+            break;
+        default:
+            // Optional: extend for other masks (e.g., reduce H only → mask=4)
+            // For now, write zero to valid output pixels
+            if (gl_LocalInvocationIndex == 0) {
+                ivec3 coord = ivec3(gl_GlobalInvocationID.xyz);
+                ivec3 outSize = imageSize(uOutput);
+                if (all(greaterThanEqual(coord, ivec3(0))) && all(lessThan(coord, outSize))) {
+                    imageStore(uOutput, coord, vec4(0.0));
+                }
+            }
+            break;
     }
 }

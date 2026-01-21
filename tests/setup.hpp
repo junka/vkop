@@ -153,21 +153,53 @@ public:
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
                 if (sizeof(TT) == 2) {
-                    std::cout << i << ": " << core::ITensor::fp16_to_fp32((*output)[i]) << " vs " << core::ITensor::fp16_to_fp32((*expect)[i]) << std::endl;
-                    if (std::isnan((*output)[i]) && std::fabs(core::ITensor::fp16_to_fp32((*output)[i]) - core::ITensor::fp16_to_fp32((*expect)[i])) > 0.02) {
-                        LOG_ERROR("Test Fail at1 (%d): %f, %f", i, core::ITensor::fp16_to_fp32((*output)[i]), core::ITensor::fp16_to_fp32((*expect)[i]));
+                    float out_val = core::ITensor::fp16_to_fp32((*output)[i]);
+                    float exp_val = core::ITensor::fp16_to_fp32((*expect)[i]);
+                    // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
+                    if (std::isnan(out_val)) {
+                        LOG_ERROR("Test Fail at1 (%d): Output is NaN, expected %f", i, exp_val);
+                        return false;
+                    }
+
+                    float abs_exp = std::abs(exp_val);
+                    float threshold = (abs_exp > 1.0F) ? (abs_exp * 0.02F) : 0.02F;
+
+                    if (std::abs(out_val - exp_val) > threshold) {
+                        LOG_ERROR("Test Fail at1 (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
                         return false;
                     }
                 } else if (typeid(TT) == typeid(int)) {
                     std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                    if (std::isnan((*output)[i]) && (*output)[i] != (*expect)[i]) {
+                    if (std::isnan((*output)[i]) || (*output)[i] != (*expect)[i]) {
                         LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
                         return false;
                     }
                 } else {
-                    std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                    if (std::isnan((*output)[i]) && std::fabs((*output)[i] - (*expect)[i]) > 0.002) {
-                        LOG_ERROR("Test Fail at (%d): %f, %f", i, (*output)[i], (*expect)[i]);
+                    float out_val = (*output)[i];
+                    float exp_val = (*expect)[i];
+                    std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
+
+                    if (std::isnan(out_val)) {
+                        LOG_ERROR("Test Fail (%d): Output is NaN, expected %f", i, exp_val);
+                        return false;
+                    }
+
+                    // Adaptive tolerance based on magnitude of expected value
+                    float abs_exp = std::abs(exp_val);
+                    float threshold;
+                    if (abs_exp > 1.0F) {
+                        // For larger values, use relative error (e.g., 1% of expected value)
+                        threshold = abs_exp * 0.01F;  // 1% relative error
+                    } else if (abs_exp > 0.001F) {
+                        // For medium values, use mixed relative/absolute error
+                        threshold = std::max(0.001F, abs_exp * 0.02F);
+                    } else {
+                        // For very small values, use absolute error
+                        threshold = 0.002F;
+                    }
+                    
+                    if (std::abs(out_val - exp_val) > threshold) {
+                        LOG_ERROR("Test Fail (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
                         return false;
                     }
                 }

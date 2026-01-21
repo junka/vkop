@@ -39,8 +39,14 @@ private:
         std::normal_distribution<> inputa_dist{1.0F, 0.5F};
         std::normal_distribution<> inputb_dist{0.0F, 1.5F};
         for (int i = 0; i < inputa->num_elements(); i++) {
-            (*inputa)[i] = inputa_dist(gen);
-            (*inputb)[i] = inputa_dist(gen);
+            float inputa_val = inputa_dist(gen);
+            inputa_val = std::abs(inputa_val);
+            inputa_val = std::max(0.1F, std::min(10.0F, inputa_val));
+            float inputb_val = inputb_dist(gen);
+            inputb_val = std::max(-10.0F, std::min(10.0F, inputb_val));
+
+            (*inputa)[i] = inputa_val;
+            (*inputb)[i] = inputb_val;
             (*output)[i] = std::pow((*inputa)[i], (*inputb)[i]);
         }
     }

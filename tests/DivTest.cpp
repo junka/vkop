@@ -40,7 +40,13 @@ private:
         std::normal_distribution<> inputb_dist{1.0F, 1.0F};
         for (int i = 0; i < inputa->num_elements(); i++) {
             (*inputa)[i] = inputa_dist(gen);
-            (*inputb)[i] = inputa_dist(gen);
+            // Generate inputb value but ensure it's not too close to zero to avoid division issues
+            float inputb_val = inputb_dist(gen);
+            // Ensure inputb is bounded away from zero (e.g., minimum absolute value of 0.1)
+            if (std::abs(inputb_val) < 0.1F) {
+                inputb_val = (inputb_val >= 0) ? 0.1F : -0.1F;
+            }
+            (*inputb)[i] = inputb_val;
             (*output)[i] = (*inputa)[i] / (*inputb)[i];
             std::cout << "i " << i << ": "<< std::setprecision(15) << (*inputa)[i];
             std::cout << ", " << std::setprecision(15) <<  (*inputb)[i];

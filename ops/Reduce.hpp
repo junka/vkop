@@ -24,11 +24,9 @@ enum class ReduceType {
 };
 
 struct GpuReduceParam {
-    int H;
-    int W;
-    int norm_type;
-    int keepdims;
-    int noop_with_empty_axes;
+    ivec4 shape;
+    int reduce_op;
+    int axes_mask;
 };
 } // namespace reduce
 
@@ -36,26 +34,76 @@ class Reduce : public Operator {
   public:
     Reduce()
         : Operator(OpType::REDUCE, reduce_spv, reduce_spv_len,
-                   {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(reduce::GpuReduceParam)) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        if (attributes.find("norm_type") != attributes.end()) {
-            norm_type_ = std::stol(attributes.at("norm_type"));
+        if (attributes.find("reduce_op") != attributes.end()) {
+            auto op = attributes.at("reduce_op");
+            if (op == "l1_norm") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::L1);
+            } else if (op == "l2_norm") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::L2);
+            } else if (op == "log_sum") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::LOGSUM);
+            } else if (op == "log_sum_exp") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::LOGSUMEXP);
+            } else if (op == "max") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::MAX);
+            } else if (op == "mean") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::MEAN);
+            } else if (op == "min") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::MIN);
+            } else if (op == "prod") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::PROD);
+            } else if (op == "sum") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::SUM);
+            } else if (op == "sum_square") {
+                reduce_op_ = static_cast<int>(reduce::ReduceType::SUMSQUARE);
+            }
         }
         // opset ver 18 will move this to inputs
-        if (attributes.find("axis") != attributes.end()) {
-            axis_ = parse_attr_list<int>(attributes.at("axis"));
+        if (attributes.find("axes") != attributes.end()) {
+            axes_ = parse_attr_list<int>(attributes.at("axes"));
         }
         if (attributes.find("keepdims") != attributes.end()) {
             keepdims_ = std::stol(attributes.at("keepdims"));
         }
-        // only exist for opset ver 18
-        if (attributes.find("noop_with_empty_axes") != attributes.end()) {
-            noop_with_empty_axes_ =
-                std::stol(attributes.at("noop_with_empty_axes"));
+        // for opset over 18, when axes is empty, reduction will be performed
+        // over all dimensions, if Ture then, reduction will be performed over
+        // empty axes. noop_with_empty_axes processed in compiler
+    }
+    static std::vector<int>
+    calculateOutputShape(const std::vector<int> &input_shape,
+                         const std::vector<int> &axes_input, bool keepdims) {
+        // Normalize axes (handle negative indices)
+        std::vector<int> normalized_axes = axes_input;
+        for (int &ax : normalized_axes) {
+            if (ax < 0)
+                ax += static_cast<int>(input_shape.size());
         }
+
+        std::vector<bool> is_reduced(input_shape.size(), false);
+        for (int ax : normalized_axes) {
+            if (ax >= 0 && ax < static_cast<int>(input_shape.size())) {
+                is_reduced[ax] = true;
+            }
+        }
+
+        std::vector<int> output_shape;
+        for (size_t i = 0; i < input_shape.size(); ++i) {
+            if (is_reduced[i]) {
+                if (keepdims) {
+                    output_shape.push_back(1);
+                }
+            } else {
+                output_shape.push_back(input_shape[i]);
+            }
+        }
+
+        return output_shape;
     }
 
   private:
@@ -63,43 +111,46 @@ class Reduce : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto input_shape = inputs[0]->getShape();
+        int rank = input_shape.size();
+
+        auto output_shape =
+            calculateOutputShape(input_shape, axes_, keepdims_ == 1);
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);
             if (outputptr->size() == 0) {
-                outputptr->resize(input_shape);
+                outputptr->resize(output_shape);
             }
-            auto output_buffer = outputptr->as_storage_buffer(m_dev_);
-            objs_.emplace_back(output_buffer);
+            auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
+            objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto inputptr = core::as_tensor<T>(inputs[0]);
-            auto input_buffer = inputptr->as_storage_buffer(m_dev_);
-            objs_.emplace_back(input_buffer);
+            auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
+            objs_.emplace_back(input_image);
         });
 
-        int h = input_shape[0];
-        int w = input_shape[1];
-
         reduce::GpuReduceParam para;
-        para.H = h;
-        para.W = w;
-        para.norm_type = norm_type_;
-        para.keepdims = keepdims_;
-        para.noop_with_empty_axes = noop_with_empty_axes_;
-
-        submit(&para, UP_DIV(h, 16), UP_DIV(w, 16), 1);
+        for (size_t i = 0; i < input_shape.size(); i++) {
+            para.shape[i] = input_shape[i];
+        }
+        para.reduce_op = reduce_op_;
+        para.axes_mask = 0;
+        for (auto &a : axes_) {
+            int ax = (a < 0) ? static_cast<int>(a + rank) : static_cast<int>(a);
+            if (ax >= 0 && ax < rank) {
+                para.axes_mask |= (1 << ax);
+            }
+        }
+        auto out_gpu_shape = outputs[0]->getGPUShape();
+        submit(&para, UP_DIV(out_gpu_shape[0], 16),
+               UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 
-  private:
-    int norm_type_ = 0;
-    std::vector<int> axis_;
-    // Keep the reduced dimension or not, default 1 means keep reduced
-    // dimension.
+    int reduce_op_ = 0;
+    std::vector<int> axes_;
     int keepdims_ = 1;
-    // Defines behavior when axes is not provided or is empty.
-    int noop_with_empty_axes_ = 0;
 };
 
 } // namespace ops

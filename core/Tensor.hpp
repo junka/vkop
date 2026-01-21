@@ -391,7 +391,7 @@ template <typename T> class Tensor : public ITensor {
             vbuffer = buffer;
         }
         auto view = std::make_shared<VulkanBufferView>(vd, vbuffer, format,
-                                                       size_, offset);
+                                                       aligned, offset);
         vkobj_ = view;
         return view;
     }
@@ -655,28 +655,31 @@ template <typename T> class Tensor : public ITensor {
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool, false);
         auto stpool = cmdpool->getStagingBufferPool();
-        auto b = stpool->allocate(size_);
+        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
+        auto b = stpool->allocate(aligned);
         if (!b) {
             printf("copyToGPUBuffer stpool alloc failed %d\n", size_);
             return;
         }
+        memset(b->ptr, 0, aligned);
         if (src) {
             memcpy(b->ptr, src, size_);
         } else {
             memcpy(b->ptr, data_->data(), size_);
         }
         std::shared_ptr<VulkanBuffer> buffer;
+        size_t offset = 0;
         if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
             buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         } else {
             auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
             buffer = view->getBuffer();
+            offset = view->getOffset();
         }
 
-        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         cmd.begin();
         buffer->copyStageBufferToBuffer(cmd.get(), b->buffer, b->offset,
-                                        aligned, 0);
+                                        aligned, offset);
         buffer->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(dev->getComputeQueue());
@@ -696,16 +699,18 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         std::shared_ptr<VulkanBuffer> buffer;
+        size_t offset = 0;
         if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
             buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         } else {
             auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
             buffer = view->getBuffer();
+            offset = view->getOffset();
         }
 
         cmd.begin();
         buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset, size_,
-                                        0);
+                                        offset);
         cmd.end();
         cmd.submit(dev->getComputeQueue());
         cmd.wait(dev->getComputeQueue());

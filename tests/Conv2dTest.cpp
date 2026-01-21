@@ -127,17 +127,16 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 
 }  // namespace
 
-
 template<typename T>
 class Conv2dTest: public TestCase {
 public:
-    std::vector<int> input_shape_ = {1, 5, 24, 24}; // b, ic, ih, iw
+    std::vector<int> input_shape_ = {1, 10, 7, 7}; // b, ic, ih, iw
     int kernel_size_ = 2;
     int stride_ = 1;
     int pad_ = 0;
-    int group_ = 1;
+    int group_ = 5;
     int dilation_ = 1;
-    int feature_size_ = 7; // oc
+    int feature_size_ = 5; // oc
 
     std::unordered_map<std::string, std::string> attributes = {
         {"strides", std::to_string(stride_)},
@@ -313,8 +312,21 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    Conv2dTest<uint16_t> ct;
-    if (!ct.run_test<uint16_t>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
+    Conv2dTest<uint16_t> ct16;
+    if (!ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
+        [&ct16](std::unique_ptr<vkop::ops::Operator> &op) {
+        auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+        if (!conv_op) {
+            LOG_ERROR("Failed to cast operator to Conv2d");
+            return;
+        }
+        conv_op->setAttribute(ct16.attributes);
+    })) {
+        return -1;
+    }
+
+    Conv2dTest<float> ct;
+    if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
         [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *conv_op = dynamic_cast<Conv2d *>(op.get());
         if (!conv_op) {
