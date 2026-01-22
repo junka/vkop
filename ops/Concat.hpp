@@ -3,12 +3,10 @@
 #define OPS_CONCAT_HPP_
 
 #include "ops/Operator.hpp"
-
 extern "C" {
 extern unsigned char concat_spv[];
 extern unsigned int concat_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

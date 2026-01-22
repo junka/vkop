@@ -15,11 +15,9 @@ namespace {
 
 std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector<int> input_shape, std::vector<int> nshape,
                               std::shared_ptr<Tensor<float>>& weight, std::shared_ptr<Tensor<float>>& bias, float epsilon) {
-   // 输入张量总大小
     size_t total_size = input->num_elements();
     std::vector<float> output(total_size);
 
-    // 检查 nshape 是否是 input_shape 的后缀
     int rank = input_shape.size();
     int norm_rank = nshape.size();
 
@@ -33,20 +31,16 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
         }
     }
 
-    // 计算归一化区域的元素数量
     int inner_size = 1;
     for (int s : nshape) {
         inner_size *= s;
     }
 
-    // 外层维度的数量（有多少个独立的归一化操作）
     int outer_size = total_size / inner_size;
 
-    // 如果没有提供 weight/bias，默认为 1 和 0
     bool has_weight = (inner_size == weight->num_elements());
     bool has_bias = (inner_size == bias->num_elements());
 
-    // 用于调试
     if (weight->num_elements() != inner_size) {
         throw std::invalid_argument("weight size must match product of normalized_shape");
     }
@@ -54,20 +48,16 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
         throw std::invalid_argument("bias size must match product of normalized_shape");
     }
 
-    // Step 2: 对每个 outer block 执行归一化
     for (int outer_idx = 0; outer_idx < outer_size; ++outer_idx) {
-        // 指向当前归一化块起始位置
         const int in_block_offset = outer_idx * inner_size;
         float*       out_block = output.data() + (outer_idx * inner_size);
 
-        // Step 2.1: 计算均值
         float sum = 0.0F;
         for (int i = 0; i < inner_size; ++i) {
             sum += (*input)[in_block_offset+i];
         }
         float mean = sum / inner_size;
 
-        // Step 2.2: 计算方差
         float var = 0.0F;
         for (int i = 0; i < inner_size; ++i) {
             float diff = (*input)[in_block_offset+i] - mean;
@@ -76,7 +66,6 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
         var /= inner_size;
         float inv_std = 1.0F / std::sqrt(var + epsilon);
 
-        // Step 2.3: 归一化 + 仿射变换
         for (int i = 0; i < inner_size; ++i) {
             float normalized_val = ((*input)[in_block_offset+i] - mean) * inv_std;
             if (has_weight) normalized_val *= (*weight)[i];

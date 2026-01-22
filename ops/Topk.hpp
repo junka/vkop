@@ -11,8 +11,7 @@
 extern "C" {
 extern unsigned char topk_spv[];
 extern unsigned int topk_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 
@@ -177,7 +176,7 @@ class Topk : public Operator {
         }
     }
 
-    int64_t k_ = 1;
+    int k_ = 1;
     int axis_ = -1;
     int largest_ = 1;
     int sorted_ = 1;

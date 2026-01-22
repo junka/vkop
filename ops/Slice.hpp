@@ -5,12 +5,10 @@
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
 #include <numeric>
-
 extern "C" {
 extern unsigned char slice_spv[];
 extern unsigned int slice_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 
@@ -42,13 +40,13 @@ class Slice : public Operator {
                          const std::vector<T> &ends, const std::vector<T> &axes,
                          const std::vector<T> &steps) {
         assert(input_shape.size() >= 3);
-        const int dims = input_shape.size();
+        const int dims = static_cast<int>(input_shape.size());
         std::vector<std::vector<int>> ret;
 
         std::vector<T> norm_axes = axes;
         if (norm_axes.empty()) {
             for (int i = 0; i < dims; ++i) {
-                norm_axes.push_back(i);
+                norm_axes.push_back(static_cast<T>(i));
             }
         }
 
@@ -61,7 +59,7 @@ class Slice : public Operator {
         }
         if (starts.size() != norm_axes.size() ||
             ends.size() != norm_axes.size()) {
-            printf("%ld %ld %ld\n", norm_axes.size(), starts.size(),
+            printf("%zd %zd %zd\n", norm_axes.size(), starts.size(),
                    ends.size());
             throw std::invalid_argument("starts/ends length must match axes");
         }
@@ -76,12 +74,12 @@ class Slice : public Operator {
         }
 
         for (size_t i = 0; i < norm_axes.size(); ++i) {
-            T axis = norm_axes[i];
-            T dim_size = input_shape[axis];
+            auto axis = norm_axes[i];
+            auto dim_size = input_shape[axis];
 
-            T start = starts[i];
-            T end = ends[i];
-            T step = (steps.size() > i) ? steps[i] : 1;
+            int start = static_cast<int>(starts[i]);
+            int end = static_cast<int>(ends[i]);
+            int step = (steps.size() > i) ? static_cast<int>(steps[i]) : 1;
 
             if (step == 0)
                 step = 1;
@@ -91,8 +89,8 @@ class Slice : public Operator {
             if (end < 0)
                 end += dim_size;
 
-            start = std::max(T(0), std::min(start, dim_size));
-            end = std::max(T(0), std::min(end, dim_size));
+            start = std::max(0, std::min(start, dim_size));
+            end = std::max(0, std::min(end, dim_size));
 
             full_starts[axis] = start;
             full_ends[axis] = end;
@@ -101,9 +99,9 @@ class Slice : public Operator {
 
         std::vector<int> output_shape(dims);
         for (int i = 0; i < dims; ++i) {
-            T start = full_starts[i];
-            T end = full_ends[i];
-            T step = full_steps[i];
+            auto start = full_starts[i];
+            auto end = full_ends[i];
+            auto step = full_steps[i];
 
             if (step > 0) {
                 if (start >= end) {

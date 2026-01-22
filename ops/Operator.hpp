@@ -180,7 +180,8 @@ class Operator {
 
         m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
         if (ptr) {
-            m_cmd_->push_constants(*pipeline_, pc_size_, ptr);
+            m_cmd_->push_constants(*pipeline_, static_cast<uint32_t>(pc_size_),
+                                   ptr);
         }
         m_cmd_->dispatch(width, height, layers);
     }

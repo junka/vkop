@@ -4,12 +4,10 @@
 
 #include "Operator.hpp"
 #include "ops/Conv2d.hpp"
-
 extern "C" {
 extern unsigned char gemm_spv[];
 extern unsigned int gemm_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

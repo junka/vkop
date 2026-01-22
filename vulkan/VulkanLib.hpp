@@ -111,7 +111,7 @@ class VulkanLib {
 
     VulkanLib();
     ~VulkanLib();
-
+    void *get_proc_address(const char *name);
     VulkanLib(const VulkanLib &) = delete;
     VulkanLib &operator=(const VulkanLib &) = delete;
 

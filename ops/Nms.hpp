@@ -3,12 +3,10 @@
 #define OPS_NMS_HPP_
 
 #include "UnaryFactory.hpp"
-
 extern "C" {
 extern unsigned char nms_spv[];
 extern unsigned int nms_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace nms {

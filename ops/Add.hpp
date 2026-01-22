@@ -3,12 +3,10 @@
 #define OPS_ADD_HPP_
 
 #include "BinaryFactory.hpp"
-
 extern "C" {
 extern unsigned char add_spv[];
 extern unsigned int add_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

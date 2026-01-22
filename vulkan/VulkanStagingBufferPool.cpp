@@ -5,7 +5,7 @@
 #include "include/logger.hpp"
 
 namespace vkop {
-#define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
+#define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
 
 namespace {
 constexpr int kInitialStagingBufferSize = 1024 * 1024 * 16; // 16MB initial

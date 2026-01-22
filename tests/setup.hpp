@@ -113,7 +113,7 @@ public:
                             for (int l = 0; l < oshape[3]; l++) {
                                 int idx = (i * oshape[1] * oshape[2] * oshape[3]) + (j * oshape[2] * oshape[3]) +
                                     (k * oshape[3]) + l;
-                                if (sizeof(TT) == 2) {
+                                if constexpr (std::is_same_v<TT, uint16_t>) {
                                     std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
                                 } else {
                                     std::cout <<  (*output)[idx] << ",";
@@ -130,7 +130,7 @@ public:
                     printf("[");
                     for (int j = 0; j < oshape[1]; j++) {
                         int idx = (i * oshape[1]) + j;
-                        if (sizeof(TT) == 2) {
+                        if constexpr (std::is_same_v<TT, uint16_t>) {
                             std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
                         } else {
                             std::cout << (*output)[idx] << ", ";
@@ -142,7 +142,7 @@ public:
             } else if (oshape.size() == 1) {
                 printf("[");
                 for (int idx = 0; idx < oshape[0]; idx++) {
-                    if (sizeof(TT) == 2) {
+                    if constexpr (std::is_same_v<TT, uint16_t>) {
                         std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
                     } else {
                         std::cout << (*output)[idx] << ", ";
@@ -152,7 +152,7 @@ public:
             }
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
-                if (sizeof(TT) == 2) {
+                if constexpr (std::is_same_v<TT, uint16_t>) {
                     float out_val = core::ITensor::fp16_to_fp32((*output)[i]);
                     float exp_val = core::ITensor::fp16_to_fp32((*expect)[i]);
                     // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;

@@ -3,12 +3,10 @@
 #define OPS_SPLIT_HPP_
 
 #include "ops/Operator.hpp"
-
 extern "C" {
 extern unsigned char split_spv[];
 extern unsigned int split_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace split {
@@ -52,7 +50,7 @@ class Split : public Operator {
             axis_ += rank;
         }
         if (num_outputs_ == 0) {
-            num_outputs_ = outputs.size();
+            num_outputs_ = static_cast<int>(outputs.size());
         }
         int tosplit = inputs[0]->getShape()[axis_];
         std::vector<std::shared_ptr<VulkanResource>> output_images;
@@ -74,7 +72,7 @@ class Split : public Operator {
                 using T = decltype(dummy);
                 auto output = core::as_tensor<T>(outputs[i]);
                 auto shape = inputs[0]->getShape();
-                shape[axis_] = split_vec[i];
+                shape[axis_] = static_cast<int>(split_vec[i]);
                 if (output->size() == 0) {
                     output->resize(shape);
                 }

@@ -5,7 +5,7 @@
 
 namespace vkop {
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 VulkanCommandBuffer::VulkanCommandBuffer(
     std::shared_ptr<VulkanCommandPool> cmdpool, bool signaled, int id)

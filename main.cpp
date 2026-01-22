@@ -9,7 +9,6 @@
 #include <memory>
 #include <cmath>
 
-#include <unistd.h>
 #include <vulkan/vulkan_core.h>
 
 using vkop::VulkanInstance;
@@ -102,12 +101,12 @@ std::vector<MaskInfo> postProcessNMS(
         float y1 = (yo - ho * 0.5F) * scale_y * image_h / tensor_h;
         float x2 = (xo + wo * 0.5F) * scale_x * image_w / tensor_w;
         float y2 = (yo + ho * 0.5F) * scale_y * image_h / tensor_h;
-        x1 = std::max(0, static_cast<int>(x1));
-        y1 = std::max(0, static_cast<int>(y1));
-        x2 = std::min(static_cast<int>(x2), image_w - 1);
-        y2 = std::min(static_cast<int>(y2), image_h - 1);
+        int xi1 = std::max(0, static_cast<int>(x1));
+        int yi1 = std::max(0, static_cast<int>(y1));
+        int xi2 = std::min(static_cast<int>(x2), image_w - 1);
+        int yi2 = std::min(static_cast<int>(y2), image_h - 1);
 
-        std::cout << "Detected plate at: (" << x1 << ", " << y1 << ") to (" << x2 << ", " << y2 << ") with score: " << score
+        std::cout << "Detected plate at: (" << xi1 << ", " << yi1 << ") to (" << xi2 << ", " << yi2 << ") with score: " << score
                   << " and category: " << category << std::endl;
 
         // detections.push_back({x1, y1, x2, y2, score, Category::category});
@@ -145,7 +144,6 @@ std::vector<T> resize_yuv444(const std::vector<uint8_t> &raw_image, int image_h,
             float dx_ratio = src_x - x1;
             float dy_ratio = src_y - y1;
 
-            // 对 Y, U, V 分量分别进行双线性插值
             auto interpolate = [](const uint8_t* plane, int w, int x1, int y1, int x2, int y2, float dx, float dy) {
                 uint8_t p11 = plane[(y1 * w) + x1];
                 uint8_t p12 = plane[(y1 * w) + x2];

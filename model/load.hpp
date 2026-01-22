@@ -219,15 +219,15 @@ private:
             } else if (tag == 3) {
                 auto l = readList<uint32_t>(ptr, end);
                 value = "[" + std::to_string(l[0]);
-                for (size_t i = 1; i < l.size(); ++i) {
-                    value += ", " + std::to_string(l[i]);
+                for (auto c: l) {
+                    value += ", " + std::to_string(c);
                 }
                 value += "]";
             } else if (tag == 4) {
                 auto l = readList<float>(ptr, end);
                 value = "[" + std::to_string(l[0]);
-                for (size_t i = 1; i < l.size(); ++i) {
-                    value += ", " + std::to_string(l[i]);
+                for (auto c: l) {
+                    value += ", " + std::to_string(c);
                 }
                 value += "]";
             } else {

@@ -108,15 +108,17 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
             std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
                 i, queue_families[i].queueCount, queue_families[i].queueFlags};
             computeQueueIdxs_.emplace_back(t);
-        } else if (kInflight > 1 &&
-                   (queue_families[i].queueFlags & (second)) == (second)) {
-            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
-                i, queue_families[i].queueCount, queue_families[i].queueFlags};
-            computeQueueIdxs_.emplace_back(t);
+        } else if constexpr (kInflight > 1) {
+            if ((queue_families[i].queueFlags & (second)) == (second)) {
+                std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
+                    i, queue_families[i].queueCount,
+                    queue_families[i].queueFlags};
+                computeQueueIdxs_.emplace_back(t);
+            }
         }
     }
 
-    return computeQueueIdxs_.size();
+    return static_cast<uint32_t>(computeQueueIdxs_.size());
 }
 
 bool VulkanDevice::createLogicalDevice(

@@ -3,10 +3,10 @@
 #define OPS_REDUCE_HPP_
 
 #include "Operator.hpp"
-
+extern "C" {
 extern unsigned char reduce_spv[];
 extern unsigned int reduce_spv_len;
-
+}
 namespace vkop {
 namespace ops {
 namespace reduce {
@@ -111,7 +111,7 @@ class Reduce : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto input_shape = inputs[0]->getShape();
-        int rank = input_shape.size();
+        int rank = static_cast<int>(input_shape.size());
 
         auto output_shape =
             calculateOutputShape(input_shape, axes_, keepdims_ == 1);

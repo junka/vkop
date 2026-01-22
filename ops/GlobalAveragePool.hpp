@@ -3,12 +3,10 @@
 #define OPS_GLOBALAVERAGEPOOL_HPP_
 
 #include "ops/Operator.hpp"
-
 extern "C" {
 extern unsigned char globalaveragepool_spv[];
 extern unsigned int globalaveragepool_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace globalaveragepool {

@@ -3,12 +3,10 @@
 #define OPS_MAXPOOL2D_HPP_
 
 #include "ops/Operator.hpp"
-
 extern "C" {
 extern unsigned char maxpool2d_spv[];
 extern unsigned int maxpool2d_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace maxpool2d {

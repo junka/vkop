@@ -6,12 +6,10 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-
 extern "C" {
 extern unsigned char reshape_spv[];
 extern unsigned int reshape_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 
@@ -51,7 +49,7 @@ class Reshape : public Operator {
 
         std::vector<int> dim(n);
         for (int i = 0; i < n; i++) {
-            dim[i] = (*shape)[i];
+            dim[i] = static_cast<int>((*shape)[i]);
         }
         auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
                                      std::multiplies<>());

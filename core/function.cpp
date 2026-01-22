@@ -20,11 +20,11 @@ const float kClipStdvar[] = {0.26862954F, 0.26130258F, 0.27577711F};
 
 /*
  * imagenet = true:
- * 像素值缩放到 [0,1] + Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
+ * normlize to [0,1] + Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224,
  * 0.225]) ResNet, ResNeXt, DenseNet, EfficientNet, MobileNet, Vit, Swin
  * Transformer, ConvNeXt, RegNet, Inception
  * imagenet = false:
- * 像素值归一化：img = img / 255.0, 不需要mean std 标准化
+ * normlize: img = img / 255.0
  */
 void Function::preprocess_jpg(const char *input_file,
                               const std::shared_ptr<VulkanCommandPool> &cmdpool,

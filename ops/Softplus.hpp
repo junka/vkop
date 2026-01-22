@@ -3,12 +3,10 @@
 #define OPS_SOFTPLUS_HPP_
 
 #include "UnaryFactory.hpp"
-
 extern "C" {
 extern unsigned char softplus_spv[];
 extern unsigned int softplus_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

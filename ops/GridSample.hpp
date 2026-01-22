@@ -2,16 +2,13 @@
 #ifndef OPS_GRIDSAMPLE_HPP_
 #define OPS_GRIDSAMPLE_HPP_
 
-#include <unistd.h>
 #include <vector>
 
 #include "Operator.hpp"
-
 extern "C" {
 extern unsigned char gridsample_spv[];
 extern unsigned int gridsample_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

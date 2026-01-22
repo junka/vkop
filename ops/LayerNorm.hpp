@@ -5,12 +5,10 @@
 #include "Operator.hpp"
 
 #include <memory>
-
 extern "C" {
 extern unsigned char layernorm_spv[];
 extern unsigned int layernorm_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace layernorm {
@@ -87,18 +85,18 @@ class LayerNorm : public Operator {
         para.outShape[1] = depth;
         para.outShape[2] = out_height;
         para.outShape[3] = out_width;
-        para.normalizedDim = normalized_shape_.size();
+        para.normalizedDim = static_cast<int>(normalized_shape_.size());
         para.innerSize = 1;
         for (size_t i = 0; i < normalized_shape_.size(); i++) {
             para.normalizedShape[i] = normalized_shape_[i];
             para.innerSize *= normalized_shape_[i];
         }
 
-        if (normalized_shape_.size() == 1) { // norm W
+        if (normalized_shape_.size() == 1) {
             submit(&para, batch, out_height, UP_DIV(depth, 4));
-        } else if (normalized_shape_.size() == 2) { // 归一化最后两个维度 HW
+        } else if (normalized_shape_.size() == 2) {
             submit(&para, batch, 1, UP_DIV(depth, 4));
-        } else { // 归一化所有维度 CHW
+        } else {
             submit(&para, batch, 1, 1);
         }
     }

@@ -3,12 +3,10 @@
 #define OPS_ATAN_HPP_
 
 #include "UnaryFactory.hpp"
-
 extern "C" {
 extern unsigned char atan_spv[];
 extern unsigned int atan_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

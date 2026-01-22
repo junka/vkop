@@ -3,12 +3,10 @@
 #define OPS_PRELU_HPP_
 
 #include "BinaryFactory.hpp"
-
 extern "C" {
 extern unsigned char prelu_spv[];
 extern unsigned int prelu_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

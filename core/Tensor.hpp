@@ -21,7 +21,7 @@
 #include <immintrin.h>
 #endif
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -163,7 +163,7 @@ class ITensor {
             if (exponent < -10)
                 return sign;
             mantissa = (mantissa | 0x00800000) >> (1 - exponent);
-            return sign | (mantissa + 0x00001000) >> 13;
+            return static_cast<uint16_t>(sign | (mantissa + 0x00001000) >> 13);
         }
         if (exponent >= 31) {
             // Infinity or NaN
@@ -204,7 +204,7 @@ template <typename T> class Tensor : public ITensor {
                               std::is_same<U, uint8_t>::value>::type>
     explicit Tensor(U n) {
         n_dims_ = 1;
-        dims_[0] = static_cast<T>(n);
+        dims_[0] = static_cast<int>(n);
         dims_[1] = 0;
         dims_[2] = 0;
         dims_[3] = 0;
@@ -377,9 +377,9 @@ template <typename T> class Tensor : public ITensor {
 
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        if (sizeof(T) == 1) {
+        if constexpr (std::is_same_v<T, int8_t>) {
             format = VK_FORMAT_R8G8B8A8_SNORM;
-        } else if (sizeof(T) == 2) {
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
             format = VK_FORMAT_R16G16B16A16_SFLOAT;
         }
         std::shared_ptr<VulkanBuffer> vbuffer;
@@ -621,10 +621,10 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         VkFormat format = VK_FORMAT_R32G32B32A32_SFLOAT;
-        if (sizeof(T) == 1) {
+        if constexpr (std::is_same_v<T, int8_t>) {
             format =
                 (unorm ? VK_FORMAT_R8G8B8A8_UNORM : VK_FORMAT_R8G8B8A8_SNORM);
-        } else if (sizeof(T) == 2) {
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
             format = (unorm ? VK_FORMAT_R16G16B16A16_UNORM
                             : VK_FORMAT_R16G16B16A16_SFLOAT);
         }

@@ -3,12 +3,10 @@
 #define OPS_MUL_HPP_
 
 #include "BinaryFactory.hpp"
-
 extern "C" {
 extern unsigned char mul_spv[];
 extern unsigned int mul_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

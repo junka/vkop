@@ -7,9 +7,7 @@
 
 #include <cstdint>
 #include <memory>
-#include <cmath>
 
-#include <unistd.h>
 #include <vulkan/vulkan_core.h>
 
 using vkop::VulkanInstance;

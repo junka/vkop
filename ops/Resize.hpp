@@ -8,12 +8,10 @@
 #include <climits>
 #include <cmath>
 #include <numeric>
-
 extern "C" {
 extern unsigned char resize_spv[];
 extern unsigned int resize_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace resize {
@@ -172,7 +170,7 @@ class Resize : public Operator {
         int rank = inputs[0]->num_dims();
         if (!sizes_.empty() && static_cast<int>(sizes_.size()) < rank) {
             // only for torch test case
-            int off = rank - sizes_.size();
+            int off = rank - static_cast<int>(sizes_.size());
             sizes_.resize(rank);
             for (int i = rank - 1; i >= off; i--) {
                 sizes_[i] = sizes_[i - off];
@@ -189,8 +187,8 @@ class Resize : public Operator {
                 auto roi = core::as_tensor<T>(inputs[1]);
                 roi_.resize(rank * 2);
                 for (int i = 0; i < rank; i++) {
-                    roi_[i * 2] = (*roi)[i * 2];
-                    roi_[(i * 2) + 1] = (*roi)[(i * 2) + 1];
+                    roi_[i * 2] = static_cast<float>((*roi)[i * 2]);
+                    roi_[(i * 2) + 1] = static_cast<float>((*roi)[(i * 2) + 1]);
                 }
             });
         }
@@ -198,7 +196,7 @@ class Resize : public Operator {
             sizes = core::as_tensor<int64_t>(inputs[3]);
             sizes_.resize(rank);
             for (int i = 0; i < sizes->num_elements(); i++) {
-                sizes_[i] = (*sizes)[i];
+                sizes_[i] = static_cast<int>((*sizes)[i]);
             }
             size_valid_ = true;
         }
@@ -253,8 +251,8 @@ class Resize : public Operator {
                     scale = std::min(scale, sizes_[i] / input_shape[axes_[i]]);
                 }
                 for (int i = 0; i < rank; i++) {
-                    out_shape[axes_[i]] =
-                        std::round(scale * input_shape[axes_[i]]);
+                    out_shape[axes_[i]] = static_cast<int>(
+                        std::round(scale * input_shape[axes_[i]]));
                 }
             } else if (keep_aspect_ratio_policy_ ==
                        static_cast<int>(
@@ -264,8 +262,8 @@ class Resize : public Operator {
                     scale = std::max(scale, sizes_[i] / input_shape[axes_[i]]);
                 }
                 for (int i = 0; i < rank; i++) {
-                    out_shape[axes_[i]] =
-                        std::round(scale * input_shape[axes_[i]]);
+                    out_shape[axes_[i]] = static_cast<int>(
+                        std::round(scale * input_shape[axes_[i]]));
                 }
             }
         } else if (!size_valid_ && !roi_.empty() &&
@@ -274,12 +272,13 @@ class Resize : public Operator {
                                             TF_CROP_AND_RESIZE)) {
             // valid when input sizes null
             for (int i = 0; i < rank; i++) {
-                out_shape[i] = std::floor(
-                    input_shape[i] * (roi_[rank + i] - roi_[i]) * scales_[i]);
+                out_shape[i] = static_cast<int>(std::floor(
+                    input_shape[i] * (roi_[rank + i] - roi_[i]) * scales_[i]));
             }
         } else if (!size_valid_) {
             for (int i = 0; i < rank; i++) {
-                out_shape[i] = std::floor(input_shape[i] * scales_[i]);
+                out_shape[i] =
+                    static_cast<int>(std::floor(input_shape[i] * scales_[i]));
             }
         }
 

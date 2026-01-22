@@ -17,15 +17,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(FP16_CXX_FLAGS "-mf16c")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(FP16_CXX_FLAGS "-mfp16-format=ieee")
-    # 可选：指定微架构（如果已知）
     # set(FP16_CXX_FLAGS "-march=armv8.2-a+fp16")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM")
-    # AArch32: 仅存储支持
     set(FP16_CXX_FLAGS "-mfp16-format=ieee")
 else()
     message(WARNING "FP16 not supported on this architecture")
 endif()
+if(MSVC)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast")
+else()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
+endif()
 
 if(DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK_PATH $ENV{VULKAN_SDK})
@@ -82,14 +84,69 @@ foreach(SHADER ${SHADER_FILES})
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
+if(WIN32)
+set(PY_SCRIPT_CONTENT
+"import sys
+import os
 
+def main():
+    if len(sys.argv) != 4:
+        print('Usage: spv_to_c.py <input.spv> <output.h> <symbol_name>')
+        sys.exit(1)
+    input_spv = sys.argv[1]
+    output_h  = sys.argv[2]
+    sym_name  = sys.argv[3] + '_spv'
+
+    with open(input_spv, 'rb') as f:
+        data = f.read()
+
+    hex_lines = []
+    for i in range(0, len(data), 16):
+        chunk = data[i:i+16]
+        line = ', '.join(f'0x{b:02x}' for b in chunk)
+        hex_lines.append(line)
+    hex_str = ',\\n'.join(hex_lines)
+
+    content = f'''// Auto-generated from {os.path.basename(input_spv)}
+unsigned char {sym_name}[] = {{
+{hex_str}
+}};
+unsigned int {sym_name}_len = {len(data)};
+'''
+
+    with open(output_h, 'w') as f:
+        f.write(content)
+
+if __name__ == '__main__':
+    main()
+")
+
+
+set(PY_SCRIPT_FILE "${CMAKE_BINARY_DIR}/spv_to_c.py")
+file(WRITE "${PY_SCRIPT_FILE}" "${PY_SCRIPT_CONTENT}")
+
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(
+    OUTPUT ${SPIRV_SOURCE_FILE}
+    COMMAND ${Python3_EXECUTABLE} 
+        ${PY_SCRIPT_FILE}
+        ${SPIRV_FILE}
+        ${SPIRV_SOURCE_FILE}
+        ${SHADER_NAME}
+    DEPENDS 
+        ${SPIRV_FILE}
+        ${PY_SCRIPT_FILE}
+    COMMENT "Embedding SPIR-V shader ${SHADER_NAME} into C header"
+)
+else()
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE}
         COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-zA-Z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${SPIRV_SOURCE_FILE}
         DEPENDS ${SPIRV_FILE}
         COMMENT "Converting ${SPIRV_FILE} to header file"
     )
-
+endif()
+    set_source_files_properties(${SPIRV_SOURCE_FILE} PROPERTIES LANGUAGE C)
     list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE})
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE})
 endforeach()
@@ -97,6 +154,7 @@ endforeach()
 
 # Add executable
 add_library(vkop ${SRC_FILES})
+message(${SRC_FILES})
 
 # Ensure whole-archive is used when linking vkop
 
@@ -111,7 +169,7 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 add_subdirectory(model)
 
 add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain -Wl,--whole-archive vkop -Wl,--no-whole-archive vload -lpthread)
+target_link_libraries(vkopmain vkop vload -lpthread)
 
 
 find_program(CLANG_FORMAT "clang-format")

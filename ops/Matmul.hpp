@@ -3,11 +3,10 @@
 #define OPS_MATMUL_HPP_
 
 #include "Operator.hpp"
-
 extern "C" {
 extern unsigned char matmul_spv[];
 extern unsigned int matmul_spv_len;
-};
+}
 namespace vkop {
 namespace ops {
 
@@ -25,7 +24,7 @@ class MatMul : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(matmul::GpuMatMulParam)) {};
+                   sizeof(matmul::GpuMatMulParam)){};
 
   private:
     void execute(

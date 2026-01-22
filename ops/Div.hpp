@@ -3,12 +3,10 @@
 #define OPS_DIV_HPP_
 
 #include "BinaryFactory.hpp"
-
 extern "C" {
 extern unsigned char div_spv[];
 extern unsigned int div_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 

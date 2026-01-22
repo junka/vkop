@@ -3,12 +3,10 @@
 #define OPS_COL2IM_HPP_
 
 #include "Operator.hpp"
-
 extern "C" {
 extern unsigned char col2im_spv[];
 extern unsigned int col2im_spv_len;
-};
-
+}
 namespace vkop {
 namespace ops {
 namespace col2im {

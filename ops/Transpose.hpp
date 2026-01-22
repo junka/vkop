@@ -7,7 +7,7 @@
 extern "C" {
 extern unsigned char transpose_spv[];
 extern unsigned int transpose_spv_len;
-};
+}
 namespace vkop {
 namespace ops {
 
@@ -63,7 +63,7 @@ class Transpose : public Operator {
         });
 
         std::vector<int> reverse_perms(4);
-        for (size_t i = 0; i < 4; ++i) {
+        for (int i = 0; i < 4; ++i) {
             reverse_perms[perm_[i]] = i;
         }
 

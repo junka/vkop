@@ -3,11 +3,15 @@
 #include <cstdint>
 #include <cstring>
 
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <unistd.h>
-
+#ifdef _WIN32
+    #include <windows.h>
+    #include <io.h>
+#else
+    #include <sys/mman.h>
+    #include <sys/stat.h>
+    #include <fcntl.h>
+    #include <unistd.h>
+#endif
 #include "load.hpp"
 
 namespace vkop {
@@ -17,35 +21,88 @@ VkModel::VkModel(const std::string& filePath) {
     loadFromBinary(filePath);
 }
 
+struct FileMapping {
+    void* data = nullptr;
+    size_t size = 0;
+
+#ifdef _WIN32
+    HANDLE hFile = INVALID_HANDLE_VALUE;
+    HANDLE hMapping = nullptr;
+#else
+    int fd = -1;
+#endif
+
+    ~FileMapping() {
+#ifdef _WIN32
+        if (data) UnmapViewOfFile(data);
+        if (hMapping != nullptr) CloseHandle(hMapping);
+        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
+#else
+        if (data && data != MAP_FAILED) {
+            munmap(data, size);
+        }
+        if (fd >= 0) close(fd);
+#endif
+    }
+
+    bool map_file(const std::string& path) {
+#ifdef _WIN32
+        hFile = CreateFileA(path.c_str(),
+                            GENERIC_READ,
+                            FILE_SHARE_READ,
+                            nullptr,
+                            OPEN_EXISTING,
+                            FILE_ATTRIBUTE_NORMAL,
+                            nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return false;
+        }
+
+        LARGE_INTEGER li;
+        if (!GetFileSizeEx(hFile, &li) || li.QuadPart > SIZE_MAX) {
+            return false;
+        }
+        size = static_cast<size_t>(li.QuadPart);
+
+        if (size == 0) {
+            data = nullptr;
+            return true;
+        }
+
+        hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (!hMapping) {
+            return false;
+        }
+
+        data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, size);
+        return data != nullptr;
+#else
+        fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) return false;
+
+        struct stat st;
+        if (fstat(fd, &st) < 0) return false;
+        size = static_cast<size_t>(st.st_size);
+
+        if (size == 0) {
+            data = nullptr;
+            return true;
+        }
+
+        data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+        return data != MAP_FAILED;
+#endif
+    }
+};
+
 void VkModel::loadFromBinary(const std::string& filePath) {
-
-    // Open the file
-    int fd = open(filePath.c_str(), O_RDONLY);
-    if (fd < 0) {
-        throw std::runtime_error("Failed to open file: " + filePath);
+    FileMapping mapping;
+    if (!mapping.map_file(filePath)) {
+        throw std::runtime_error("Failed to map file: " + filePath);
     }
 
-    // Get the file size
-    struct stat st;
-    if (fstat(fd, &st) < 0) {
-        close(fd);
-        throw std::runtime_error("Failed to get file size: " + filePath);
-    }
-
-    size_t file_size = st.st_size;
-
-    // Memory map the file
-    void* mapped_data = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE, fd, 0);
-    if (mapped_data == MAP_FAILED) {
-        close(fd);
-        throw std::runtime_error("Failed to mmap file: " + filePath);
-    }
-
-    close(fd);
-
-    // Parse the binary data
-    const char* ptr = static_cast<const char*>(mapped_data);
-    const char* end = ptr + file_size;
+    const char* ptr = static_cast<const char*>(mapping.data);
+    const char* end = ptr + mapping.size;
 
     this->inputs = readListWithShapes(ptr, end);
     this->outputs = readListWithShapes(ptr, end);
@@ -199,9 +256,6 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         this->initializers.erase("rgba_conversion_names");
         rgba = true;
     }
-
-    // Unmap the file
-    munmap(const_cast<char*>(static_cast<const char*>(mapped_data)), file_size);
 }
 
 
