@@ -5,8 +5,6 @@
 #include <cstdint>
 #include <string>
 #include <vector>
-#include <unordered_map>
-#include <functional>
 
 #include "core/Tensor.hpp"
 #include "vulkan/VulkanDevice.hpp"
@@ -15,7 +13,7 @@
 #include "ops/OperatorFactory.hpp"
 #include "ops/Ops.hpp"
 
-#include "Python.h"
+#include <torch/torch.h>
 
 namespace vkop {
 namespace tests {
@@ -28,15 +26,88 @@ private:
 public:
     TestCase() = delete;
     explicit TestCase(std::string name): name_(std::move(name)) {
-        initialize_pyenv();
     }
-    ~TestCase() {
-        finalize_pyenv();
-    }
+    ~TestCase() = default;
     TestCase(const TestCase &test) = delete;
     TestCase(const TestCase &&test) = delete;
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
+
+    template <typename TT>
+    static void print_tensor(const std::shared_ptr<core::ITensor> &tensor) {
+        printf("=====================\n");
+        auto t = core::as_tensor<TT>(tensor);
+        auto shape = tensor->getShape();
+        if (shape.size() == 4) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [\n");
+                for (int j = 0; j < shape[1]; j++) {
+                    printf("    [\n");
+                    for (int k = 0; k < shape[2]; k++) {
+                        printf("      [");
+                        for (int l = 0; l < shape[3]; l++) {
+                            int idx = (i * shape[1] * shape[2] * shape[3]) + (j * shape[2] * shape[3]) +
+                                (k * shape[3]) + l;
+                            if constexpr (std::is_same_v<TT, uint16_t>) {
+                                std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ", ";
+                            } else {
+                                std::cout << (*t)[idx] << ",";
+                            }
+                        }
+                        printf("],\n");
+                    }
+                    printf("    ],\n");
+                }
+                printf("  ],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 3) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [\n");
+                for (int j = 0; j < shape[1]; j++) {
+                    printf("    [");
+                    for (int k = 0; k < shape[2]; k++) {
+                        int idx = (i * shape[1] * shape[2]) + (j * shape[2]) + k;
+                        if constexpr (std::is_same_v<TT, uint16_t>) {
+                            std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ", ";
+                        } else {
+                            std::cout << (*t)[idx] << ",";
+                        }
+                    }
+                    printf("],\n");
+                }
+                printf("  ],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 2) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [");
+                for (int j = 0; j < shape[1]; j++) {
+                    int idx = (i * shape[1]) + j;
+                    if constexpr (std::is_same_v<TT, uint16_t>) {
+                        std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ",";
+                    } else {
+                        std::cout << (*t)[idx] << ", ";
+                    }
+                }
+                printf("],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 1) {
+            printf("[");
+            for (int idx = 0; idx < shape[0]; idx++) {
+                if constexpr (std::is_same_v<TT, uint16_t>) {
+                    std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ",";
+                } else {
+                    std::cout << (*t)[idx] << ", ";
+                }
+            }
+            printf("]\n");
+        }
+    }
 
     template <typename T>
     bool run_test(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -103,53 +174,7 @@ public:
             auto output = core::as_tensor<TT>(outputs[idx]);
             output->copyToCPU(cmdpool);
             auto oshape = output->getShape();
-            if (oshape.size() == 4) {
-                for (int i = 0; i < oshape[0]; i++) {
-                    printf("[\n");
-                    for (int j = 0; j < oshape[1]; j++) {
-                        printf("[\n");
-                        for (int k = 0; k < oshape[2]; k++) {
-                            printf("[");
-                            for (int l = 0; l < oshape[3]; l++) {
-                                int idx = (i * oshape[1] * oshape[2] * oshape[3]) + (j * oshape[2] * oshape[3]) +
-                                    (k * oshape[3]) + l;
-                                if constexpr (std::is_same_v<TT, uint16_t>) {
-                                    std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ", ";
-                                } else {
-                                    std::cout <<  (*output)[idx] << ",";
-                                }
-                            }
-                            printf("]\n");
-                        }
-                        printf("]\n");
-                    }
-                    printf("]\n");
-                }
-            } else if (oshape.size() == 2) {
-                for (int i = 0; i < oshape[0]; i++) {
-                    printf("[");
-                    for (int j = 0; j < oshape[1]; j++) {
-                        int idx = (i * oshape[1]) + j;
-                        if constexpr (std::is_same_v<TT, uint16_t>) {
-                            std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
-                        } else {
-                            std::cout << (*output)[idx] << ", ";
-                        }
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            } else if (oshape.size() == 1) {
-                printf("[");
-                for (int idx = 0; idx < oshape[0]; idx++) {
-                    if constexpr (std::is_same_v<TT, uint16_t>) {
-                        std::cout << core::ITensor::fp16_to_fp32((*output)[idx]) << ",";
-                    } else {
-                        std::cout << (*output)[idx] << ", ";
-                    }
-                }
-                printf("]\n");
-            }
+            print_tensor<TT>(output);
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
                 if constexpr (std::is_same_v<TT, uint16_t>) {
@@ -221,400 +246,7 @@ public:
             }
         }
         LOG_INFO("Test Passed for operator: %s", name_.c_str());
-
-
         return true;
-    }
-
-    static void* initialize_pyenv() {
-        // Initialize Python environment and load necessary libraries
-        Py_Initialize();
-        try {
-            PyObject* torch_name = PyUnicode_DecodeFSDefault("torch");
-            PyObject* torch_module = PyImport_Import(torch_name);
-            Py_DECREF(torch_name);
-
-            if (!torch_module) {
-                PyErr_Print();
-                fprintf(stderr, "Failed to load torch module.\n");
-                return nullptr;
-            }
-
-            // Store the modules for later use
-            Py_XINCREF(torch_module);
-
-            printf("Python environment initialized. Numpy and Torch loaded successfully.\n");
-        } catch (...) {
-            fprintf(stderr, "An exception occurred while initializing Python environment.\n");
-        }
-        return nullptr;
-    }
-
-    static void finalize_pyenv() {
-        // Finalize Python environment
-        try {
-            Py_Finalize();
-            printf("Python environment finalized.\n");
-        } catch (...) {
-            fprintf(stderr, "An exception occurred while finalizing Python environment.\n");
-        }
-    }
-
-    static std::tuple<std::vector<std::vector<float>>, std::vector<int>>
-    execute_torch_operator(const std::string& op_name,
-                        const std::vector<std::vector<int>>& shapes,
-                        const std::unordered_map<std::string, std::string>& attributes) {
-        std::vector<std::vector<float>> ret;
-        std::vector<int> output_shape;
-
-        if (shapes.empty()) {
-            throw std::invalid_argument("At least one shape (input) must be provided");
-        }
-
-        const auto& input_shape = shapes[0];
-        std::vector<int> weight_shape;
-        std::vector<int> bias_shape;
-        bool has_weight = false;
-        bool has_bias = false;
-        bool has_laynernorm = false;
-
-        if (shapes.size() > 1) {
-            weight_shape = shapes[1];
-            has_weight = true;
-        }
-        if (shapes.size() > 2) {
-            bias_shape = shapes[2];
-            has_bias = true;
-        }
-
-        // 检查 Python 是否初始化
-        if (!Py_IsInitialized()) {
-            PyErr_SetString(PyExc_RuntimeError, "Python not initialized");
-            return {ret, output_shape};
-        }
-
-        PyObject* torch_module = nullptr;
-        PyObject* functional_module = nullptr;
-        PyObject* torch_input = nullptr;
-        PyObject* torch_weight = nullptr;
-        PyObject* torch_bias = nullptr;
-        PyObject* op_func = nullptr;
-        PyObject* kwargs = nullptr;
-        PyObject* torch_output = nullptr;
-        PyObject* norm_shape = nullptr;
-
-        auto cleanup = [&]() {
-            Py_XDECREF(torch_module);
-            Py_XDECREF(functional_module);
-            Py_XDECREF(torch_input);
-            Py_XDECREF(torch_weight);
-            Py_XDECREF(torch_bias);
-            Py_XDECREF(op_func);
-            Py_XDECREF(kwargs);
-            Py_XDECREF(torch_output);
-            Py_XDECREF(norm_shape);
-        };
-
-        for (const auto& a: attributes) {
-            printf("%s: %s\n", a.first.c_str(), a.second.c_str());
-        }
-
-        try {
-            // === 1. Import torch and torch.nn.functional ===
-            torch_module = PyImport_ImportModule("torch");
-            if (!torch_module) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to import torch");
-            }
-
-            functional_module = PyImport_ImportModule("torch.nn.functional");
-            if (!functional_module) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to import torch.nn.functional");
-            }
-
-            // === 2. Create random tensors ===
-            auto create_random_tensor = [&torch_module](const std::vector<int>& shape) -> PyObject* {
-                PyObject* shape_list = PyList_New(shape.size());
-                for (size_t i = 0; i < shape.size(); ++i) {
-                    PyList_SetItem(shape_list, i, PyLong_FromLong(shape[i]));
-                }
-                PyObject* rand_func = PyObject_GetAttrString(torch_module, "rand");
-                PyObject* tensor = PyObject_CallFunctionObjArgs(rand_func, shape_list, nullptr);
-                Py_DECREF(shape_list);
-                Py_DECREF(rand_func);
-                if (!tensor) {
-                    throw std::runtime_error("Failed to create random tensor");
-                }
-                return tensor;
-            }
-
-            torch_input = create_random_tensor(input_shape);
-            Py_INCREF(torch_input);
-            if (has_weight) {
-                torch_weight = create_random_tensor(weight_shape);
-                Py_INCREF(torch_weight);
-            }
-
-            if (has_bias) {
-                torch_bias = create_random_tensor(bias_shape);
-                Py_INCREF(torch_bias);
-            }
-
-            // === 3. Get operator function ===
-            op_func = PyObject_GetAttrString(functional_module, op_name.c_str());
-            if (!op_func) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to find operator: " + op_name);
-            }
-
-            // === 4. Build kwargs dictionary ===
-            kwargs = PyDict_New();
-            for (const auto& attr : attributes) {
-                std::string key = attr.first;
-                const std::string& val_str = attr.second;
-                printf("%s: %s\n", key.c_str(), val_str.c_str());
-                PyObject* value = nullptr;
-
-                if (key == "inplace" || key == "bias" || key == "align_corners" || key == "antialias") {
-                    value = (val_str == "True" || val_str == "true") ? Py_True : Py_False;
-                    Py_INCREF(value);
-                } else if (key == "alpha" || key == "p" || key == "value") {
-                    value = PyFloat_FromDouble(std::stod(val_str));
-                } else if (key == "padding" && (val_str == "same" || val_str == "valid")) {
-                    value = PyUnicode_FromString(val_str.c_str());
-                } else if (key == "pads") {
-                    std::vector<int> pads;
-                    std::string item;
-                    std::string content;
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        content = val_str.substr(1, val_str.size() - 2);
-                    } else {
-                        content = val_str;
-                    }
-                    std::stringstream ss(content);
-                    while (std::getline(ss, item, ',')) {
-                        pads.push_back(std::stoi(item));
-                    }
-                    if (pads.size() > 2) {
-                        pads = {pads[pads.size()-2], pads[pads.size()-1]};
-                    }
-                    PyObject* padding_tuple = PyTuple_New(pads.size());
-                    for (size_t i = 0; i < pads.size(); i++) {
-                        PyTuple_SetItem(padding_tuple, i, PyLong_FromLong(pads[i]));
-                    }
-                    value = padding_tuple;
-                    key = "padding";
-                } else if (key == "momentum" || key == "eps") {
-                    value = PyFloat_FromDouble(std::stof(val_str));
-                } else if (key == "normalized_shape") {
-                    std::vector<int> normalized_shape;
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        std::string content = val_str.substr(1, val_str.size() - 2);
-                        std::stringstream ss(content);
-                        std::string item;
-                        while (std::getline(ss, item, ',')) {
-                            normalized_shape.push_back(std::stoi(item));
-                        }
-                    }
-                    printf("Setting normalized_shape: %d\n", normalized_shape[0]);
-                    has_laynernorm = true;
-                    PyObject* shape_tuple = PyTuple_New(normalized_shape.size());
-                    for (size_t i = 0; i < normalized_shape.size(); ++i) {
-                        PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(normalized_shape[i]));
-                    }
-                    norm_shape = shape_tuple;
-                    continue;
-                } else if (key == "size" || key == "scale_factor") {
-                    std::vector<int> resize_shape;
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        std::string content = val_str.substr(1, val_str.size() - 2);
-                        std::stringstream ss(content);
-                        std::string item;
-                        while (std::getline(ss, item, ',')) {
-                            resize_shape.push_back(std::stoi(item));
-                        }
-                    }
-                    PyObject* shape_tuple = PyTuple_New(resize_shape.size());
-                    for (size_t i = 0; i < resize_shape.size(); ++i) {
-                        PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(resize_shape[i]));
-                    }
-                    value = shape_tuple;
-                } else if (key == "group") {
-                    key = "groups";
-                    value = PyLong_FromLong(std::stol(val_str));
-                } else if (key == "kernel_shape") {
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        std::vector<int> kernel_shape;
-                        std::string content = val_str.substr(1, val_str.size() - 2);
-                        std::stringstream ss(content);
-                        std::string item;
-                        while (std::getline(ss, item, ',')) {
-                            kernel_shape.push_back(std::stoi(item));
-                        }
-                        PyObject* shape_tuple = PyTuple_New(kernel_shape.size());
-                        for (size_t i = 0; i < kernel_shape.size(); ++i) {
-                            PyTuple_SetItem(shape_tuple, i, PyLong_FromLong(kernel_shape[i]));
-                        }
-                        value = shape_tuple;
-                    } else {
-                        value = PyLong_FromLong(std::stol(val_str));
-                    }
-                    key = "kernel_size";
-                } else if (key == "strides") {
-                    key = "stride";
-                    std::vector<int> stride;
-                    std::string item;
-                    std::string content;
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        content = val_str.substr(1, val_str.size() - 2);
-                    } else {
-                        content = val_str;
-                    }
-                    std::stringstream ss(content);
-                    while (std::getline(ss, item, ',')) {
-                        stride.push_back(std::stoi(item));
-                    }
-                    PyObject* tuple = PyTuple_New(stride.size());
-                    for (size_t i = 0; i < stride.size(); i++) {
-                        PyTuple_SetItem(tuple, i, PyLong_FromLong(stride[i]));
-                    }
-                    value = tuple;
-                } else if (key == "dilations") {
-                    key = "dilation";
-                    std::vector<int> stride;
-                    std::string item;
-                    std::string content;
-                    if (val_str.front() == '[' && val_str.back() == ']') {
-                        content = val_str.substr(1, val_str.size() - 2);
-                    } else {
-                        content = val_str;
-                    }
-                    std::stringstream ss(content);
-                    while (std::getline(ss, item, ',')) {
-                        stride.push_back(std::stoi(item));
-                    }
-                    PyObject* tuple = PyTuple_New(stride.size());
-                    for (size_t i = 0; i < stride.size(); i++) {
-                        PyTuple_SetItem(tuple, i, PyLong_FromLong(stride[i]));
-                    }
-                    value = tuple;
-                } else {
-                    try {
-                        value = PyLong_FromLong(std::stol(val_str));
-                    } catch (...) {
-                        try {
-                            value = PyFloat_FromDouble(std::stod(val_str));
-                        } catch (...) {
-                            value = PyUnicode_FromString(val_str.c_str());
-                        }
-                    }
-                }
-                if (op_name == "conv2d" && key == "kernel_size") {
-                } else if (op_name == "avg_pool2d" && key == "auto_pad") {
-                } else {
-                    PyDict_SetItemString(kwargs, key.c_str(), value);
-                }
-                Py_XDECREF(value);
-            }
-
-            // === 5. Prepare positional arguments dynamically ===
-            std::vector<PyObject*> arg_list;
-            arg_list.push_back(torch_input);
-            if (has_laynernorm) arg_list.push_back(norm_shape);
-            if (has_weight) arg_list.push_back(torch_weight);
-            if (has_bias) arg_list.push_back(torch_bias);
-
-            PyObject* args = PyTuple_New(arg_list.size());
-            for (size_t i = 0; i < arg_list.size(); ++i) {
-                PyTuple_SetItem(args, i, arg_list[i]);
-            }
-            PyObject* args_str = PyObject_Str(args);
-            if (args_str != nullptr) {
-                const char* args_cstr = PyUnicode_AsUTF8(args_str);
-                if (args_cstr != nullptr) {
-                    printf("args: %s\n", args_cstr);
-                }
-                Py_DECREF(args_str);
-            }
-            
-            if (kwargs != nullptr) {
-                PyObject* kwargs_str = PyObject_Str(kwargs);
-                if (kwargs_str != nullptr) {
-                    const char* kwargs_cstr = PyUnicode_AsUTF8(kwargs_str);
-                    if (kwargs_cstr != nullptr) {
-                        printf("kwargs: %s\n", kwargs_cstr);
-                    }
-                    Py_DECREF(kwargs_str);
-                }
-            } else {
-                printf("kwargs: NULL\n");
-            }
-            // === 6. Call the operator ===
-            torch_output = PyObject_Call(op_func, args, kwargs);
-            Py_DECREF(args);
-            if (!torch_output) {
-                PyErr_Print();
-                throw std::runtime_error("Failed to execute operator: " + op_name);
-            }
-            // === 7. Extract output data ===
-            PyObject* torch_output_shape = PyObject_GetAttrString(torch_output, "shape");
-            if (torch_output_shape && PyTuple_Check(torch_output_shape)) {
-                Py_ssize_t ndim = PyTuple_Size(torch_output_shape);
-                for (Py_ssize_t i = 0; i < ndim; ++i) {
-                    output_shape.push_back(PyLong_AsLong(PyTuple_GetItem(torch_output_shape, i)));
-                }
-            } else {
-                throw std::runtime_error("Failed to get output shape");
-            }
-            auto flatten_values = [](PyObject* tensor) -> std::vector<float> {
-                PyObject* detached = PyObject_CallMethod(tensor, "detach", nullptr);
-                if (!detached) {
-                    PyErr_Print();
-                    detached = tensor;
-                    Py_INCREF(detached);
-                }
-                PyObject* cpu_tensor = PyObject_CallMethod(detached, "cpu", nullptr);
-                if (!cpu_tensor) {
-                    PyErr_Print();
-                    throw std::runtime_error("cpu() failed");
-                }
-                PyObject* contiguous = PyObject_CallMethod(cpu_tensor, "contiguous", nullptr);
-                Py_DECREF(cpu_tensor);
-                if (!contiguous) {
-                    PyErr_Print();
-                    throw std::runtime_error("contiguous() failed");
-                }
-                PyObject* numel_obj = PyObject_CallMethod(contiguous, "numel", nullptr);
-                int64_t numel = PyLong_AsLong(numel_obj);
-                Py_DECREF(numel_obj);
-                PyObject* ptr_obj = PyObject_CallMethod(contiguous, "data_ptr", nullptr);
-                uint64_t ptr_val = PyLong_AsLongLong(ptr_obj);
-                Py_DECREF(ptr_obj);
-
-                auto* data_ptr = reinterpret_cast<float*>(ptr_val);
-                std::vector<float> result(data_ptr, data_ptr + numel);
-                Py_DECREF(contiguous);
-
-                return result;
-            }
-
-            ret.emplace_back(flatten_values(torch_output));
-            ret.emplace_back(flatten_values(torch_input));
-            if (has_weight) ret.emplace_back(flatten_values(torch_weight));
-            if (has_bias) ret.emplace_back(flatten_values(torch_bias));
-
-        } catch (const std::exception& e) {
-            fprintf(stderr, "C++ Exception: %s\n", e.what());
-            cleanup();
-        } catch (...) {
-            cleanup();
-            fprintf(stderr, "Unknown exception in execute_torch_operator\n");
-        }
-
-        cleanup();
-
-        return {ret, output_shape};
     }
 };
 

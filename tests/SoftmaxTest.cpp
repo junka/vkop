@@ -16,7 +16,7 @@ using vkop::ops::Softmax;
 namespace {
 
 
-    
+
 /* 在实现 Softmax 函数时，寻找最大值用于数值稳定性是一个常见的技巧，
     目的是避免在计算指数时出现数值溢出或精度问题。
     Softmax 的公式在实际计算中, 如果 x_i 的值很大(例如接近 100 或更高), exp(x_i) 会导致数值溢出,
@@ -125,93 +125,105 @@ private:
         std::vector<std::vector<int>> shapes;
         shapes.push_back(input_shape_);
 
-        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("softmax", shapes, dim);
-        std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
-        const auto& torch_output = torch_tensors[0];
-        const auto& torch_input = torch_tensors[1];
-        std::vector<int> output_shape = std::get<1>(k);
+        torch::manual_seed(42);
+        torch::Tensor torch_input;
+        if (input_shape_.size() == 2) {
+            torch_input = torch::randn({input_shape_[0], input_shape_[1]});
+        } else if (input_shape_.size() == 1) {
+            torch_input = torch::randn({input_shape_[0]});
+        } else {
+            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+        }
+
+        int axis = 0;
+        if (dim.count("axis") > 0) {
+            axis = std::stoi(dim.at("axis"));
+        } else if (dim.count("dim") > 0) {
+            axis = std::stoi(dim.at("dim"));
+        }
+
+        if (axis < 0) {
+            axis += torch_input.dim();
+        }
+        auto torch_output = torch::softmax(torch_input, axis);
+
+        std::vector<int> output_shape = {};
+        output_shape.reserve(torch_output.dim());
+        for (int i = 0; i < torch_output.dim(); i++) {
+            output_shape.push_back(torch_output.size(i));
+        }
 
         printf("torch output size: [");
         for (auto &s: output_shape) {
             printf("%d, ", s);
         }
         printf("]\n");
-#if 1
+
         printf("\n===Input==============\n");
-        if (output_shape.size() == 4) {
-            for (int i = 0; i < output_shape[0]; i++) {
-                printf("[\n");
-                for (int j = 0; j < output_shape[1]; j++) {
-                    printf("[\n");
-                    for (int k = 0; k < output_shape[2]; k++) {
-                        printf("[");
-                        for (int l = 0; l < output_shape[3]; l++) {
-                            int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
-                                    (j * output_shape[2] * output_shape[3]) +
-                                    (k * output_shape[3]) +
-                                    l;
-                            printf("%.4f, ", torch_input[idx]);
-                        }
-                        printf("],\n");
-                    }
-                    printf("],\n");
-                }
-                printf("]\n");
-            }
-        } else if (output_shape.size() == 2) {
-            for (int i = 0; i < output_shape[0]; i++) {
-                printf("[");
-                for (int j = 0; j < output_shape[1]; j++) {
-                    int idx = (i * output_shape[1]) + j;
-                    printf("%.4f, ", torch_input[idx]);
-                }
-                printf("]\n");
-            }
-        } else if (output_shape.size() == 1) {
-            for (int i = 0; i < output_shape[0]; i++) {
-                printf("%.4f, ", torch_input[i]);
-            }
-        }
+        std::cout << torch_input << std::endl;
 
         printf("\n===Output==============\n");
-        
+        std::cout << torch_output << std::endl;
+
+        input = std::make_shared<Tensor<float>>(input_shape_);
+        auto input_cpu = torch_input.cpu().contiguous();
+        std::vector<float> input_vector;
+        input_vector.reserve(input_cpu.numel());
+        if (input_shape_.size() == 4) {
+            auto input_accessor = input_cpu.accessor<float, 4>();
+            for (int i = 0; i < input_shape_[0]; i++) {
+                for (int j = 0; j < input_shape_[1]; j++) {
+                    for (int k = 0; k < input_shape_[2]; k++) {
+                        for (int l = 0; l < input_shape_[3]; l++) {
+                            input_vector.push_back(input_accessor[i][j][k][l]);
+                        }
+                    }
+                }
+            }
+        } else if (input_shape_.size() == 2) {
+            auto input_accessor = input_cpu.accessor<float, 2>();
+            for (int i = 0; i < input_shape_[0]; i++) {
+                for (int j = 0; j < input_shape_[1]; j++) {
+                    input_vector.push_back(input_accessor[i][j]);
+                }
+            }
+        } else if (input_shape_.size() == 1) {
+            auto input_accessor = input_cpu.accessor<float, 1>();
+            for (int i = 0; i < input_shape_[0]; i++) {
+                input_vector.push_back(input_accessor[i]);
+            }
+        }
+        input->fillToCPU(input_vector);
+
+        output = std::make_shared<Tensor<float>>(output_shape);
+        auto output_cpu = torch_output.cpu().contiguous();
+        std::vector<float> output_vector;
+        output_vector.reserve(output_cpu.numel());
         if (output_shape.size() == 4) {
+            auto output_accessor = output_cpu.accessor<float, 4>();
             for (int i = 0; i < output_shape[0]; i++) {
                 for (int j = 0; j < output_shape[1]; j++) {
                     for (int k = 0; k < output_shape[2]; k++) {
-                        printf("[");
                         for (int l = 0; l < output_shape[3]; l++) {
-                            int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
-                                    (j * output_shape[2] * output_shape[3]) +
-                                    (k * output_shape[3]) +
-                                    l;
-                            printf("%.4f, ", torch_output[idx]);
+                            output_vector.push_back(output_accessor[i][j][k][l]);
                         }
-                        printf("]\n");
                     }
-                    printf("\n");
                 }
-                printf("\n");
             }
         } else if (output_shape.size() == 2) {
+            auto output_accessor = output_cpu.accessor<float, 2>();
             for (int i = 0; i < output_shape[0]; i++) {
-                printf("[");
                 for (int j = 0; j < output_shape[1]; j++) {
-                    int idx = (i * output_shape[1]) + j;
-                    printf("%.4f, ", torch_output[idx]);
+                    output_vector.push_back(output_accessor[i][j]);
                 }
-                printf("]\n");
             }
         } else if (output_shape.size() == 1) {
+            auto output_accessor = output_cpu.accessor<float, 1>();
             for (int i = 0; i < output_shape[0]; i++) {
-                printf("%.4f, ", torch_output[i]);
+                output_vector.push_back(output_accessor[i]);
             }
         }
-#endif
-        input = std::make_shared<Tensor<float>>(input_shape_);
-        input->fillToCPU(torch_input);
-        output = std::make_shared<Tensor<float>>(output_shape);
-        output->fillToCPU(torch_output);
+        output->fillToCPU(output_vector);
     }
 };
 }

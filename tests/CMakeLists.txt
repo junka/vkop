@@ -38,43 +38,81 @@ set(TESTS
     TopkTest
 )
 
-find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+set(LIBTORCH_VERSION "2.10.0")
+# Determine the appropriate libtorch URL based on the operating system
+if(WIN32)
+    set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-win-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip")
+elseif(APPLE)
+    set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-shared-with-deps-${LIBTORCH_VERSION}.zip")
+else() # Linux
+    set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip")
+endif()
+message(STATUS "Using LibTorch from: ${LIBTORCH_URL}")
+set(LIBTORCH_ROOT ${CMAKE_BINARY_DIR}/libtorch)
+set(LIBTORCH_DOWNLOAD_DIR ${CMAKE_BINARY_DIR}/downloads)
 
-if (DEFINED Python3_INCLUDE_DIRS)
-    include_directories(${Python3_INCLUDE_DIRS})
-else()
-    execute_process(COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_path('include'))"
-                    OUTPUT_VARIABLE PYTHON3_INCLUDE_DIR
-                    OUTPUT_STRIP_TRAILING_WHITESPACE)
-    include_directories(${PYTHON3_INCLUDE_DIR})
+# Check if libtorch is already downloaded
+if(NOT EXISTS "${LIBTORCH_ROOT}")
+    message(STATUS "Downloading libtorch...")
+    
+    # Create download directory
+    file(MAKE_DIRECTORY ${LIBTORCH_DOWNLOAD_DIR})
+
+    # Download the libtorch archive
+    set(LIBTORCH_ZIP_PATH "${LIBTORCH_DOWNLOAD_DIR}/libtorch.zip")
+    file(DOWNLOAD ${LIBTORCH_URL} ${LIBTORCH_ZIP_PATH} STATUS DOWNLOAD_STATUS)
+
+    list(GET DOWNLOAD_STATUS 0 DOWNLOAD_STATUS_CODE)
+    if(NOT DOWNLOAD_STATUS_CODE EQUAL 0)
+        list(GET DOWNLOAD_STATUS 1 ERROR_MESSAGE)
+        message(FATAL_ERROR "Failed to download libtorch: ${ERROR_MESSAGE}")
+    endif()
+
+    # Extract the archive
+    execute_process(
+        COMMAND ${CMAKE_COMMAND} -E tar xzf ${LIBTORCH_ZIP_PATH}
+        WORKING_DIRECTORY ${CMAKE_BINARY_DIR}
+    )
 endif()
 
-execute_process(
-    COMMAND ${Python3_EXECUTABLE} -c "import torch; print('FOUND'); print(torch.__file__)"
-    OUTPUT_VARIABLE PYTORCH_CHECK
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-    RESULT_VARIABLE TORCH_IMPORT_RESULT
+# Use the downloaded libtorch
+set(TORCH_LIB_DIR "${LIBTORCH_ROOT}/lib")
+set(TORCH_INCLUDE_DIR "${LIBTORCH_ROOT}/include")
+set(TORCH_API_INCLUDE_DIR "${LIBTORCH_ROOT}/include/torch/csrc/api/include")
+
+find_library(TORCH_LIBRARY
+    NAMES torch
+    PATHS ${TORCH_LIB_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
+)
+find_library(TORCH_CPU_LIBRARY
+    NAMES torch_cpu
+    PATHS ${TORCH_LIB_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
 )
 
-string(REPLACE "\n" ";" PYTORCH_LINES "${PYTORCH_CHECK}")
-list(GET PYTORCH_LINES 0 PYTORCH_FOUND)
-if (NOT PYTORCH_FOUND STREQUAL "FOUND")
-    message(FATAL_ERROR "Python interpreter (${Python3_EXECUTABLE}) cannot import 'torch'. Install PyTorch in that Python environment or use a different Python.")
-else()
-    list(GET PYTORCH_LINES 1 PYTORCH_ORIGIN)
-    message(STATUS "Python 'torch' found at: ${PYTORCH_ORIGIN}")
-endif()
-
+find_library(C10_LIBRARY
+    NAMES c10
+    PATHS ${TORCH_LIB_DIR}
+    NO_DEFAULT_PATH
+    REQUIRED
+)
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cpp)
     if (USE_FP16)
         target_compile_definitions(${TEST} PUBLIC FP16)
     endif()
-    target_link_libraries(${TEST} vkop vload -lpthread)
-    if (Python3_FOUND)
-        target_link_libraries(${TEST} Python3::Python)
-    endif()
+    target_compile_options(${TEST} PRIVATE
+        -Wno-unused-parameter
+        -Wno-unused-variable
+        -Wno-unused-function
+    )
+    target_link_libraries(${TEST} PRIVATE vkop vload ${TORCH_LIBRARY}
+        ${TORCH_CPU_LIBRARY}
+        ${C10_LIBRARY})
+    target_include_directories(${TEST} PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
     add_test(NAME ${TEST} COMMAND ${TEST})
 endforeach()
 

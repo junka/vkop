@@ -78,50 +78,13 @@ private:
         printf("Input A:\n");
         auto shapea = inputa->getShape();
         printf("%d %d %d %d\n", shapea[0], shapea[1], shapea[2], shapea[3]);
-        printf("[\n");
-        for (int i = 0; i < shapea[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < shapea[1]; j++) {
-                printf("[");
-                for (int k = 0; k < shapea[2]; k++) {
-                    printf("%.2f, ", (*inputa)[(i * shapea[1] *shapea[2]) + (j * shapea[2]) + k]);
-                }
-                printf("],\n");
-            }
-            printf("],\n");
-        }
-        printf("]\n");
+        print_tensor<float>(inputa);
         printf("Input B:\n");
         auto shapeb = inputb->getShape();
-        printf("[\n");
-        for (int i = 0; i < shapeb[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < shapeb[1]; j++) {
-                printf("[");
-                for (int k = 0; k < shapeb[2]; k++) {
-                    printf("%.2f, ", (*inputb)[(i * shapeb[1] *shapeb[2]) + (j * shapeb[2]) + k]);
-                }
-                printf("],\n");
-            }
-            printf("],\n");
-        }
-        printf("]\n");
+        print_tensor<float>(inputb);
         reference_matmul(inputa, inputb, output);
-        printf("\n");
         printf("Output:\n");
-        auto shapec = output->getShape();
-        for (int i = 0; i < shapec[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < shapec[1]; j++) {
-                printf("[");
-                for (int k = 0; k < shapec[2]; k++) {
-                    printf("%.2f ", (*output)[(i * shapec[1] *shapec[2]) + (j * shapec[2]) + k]);
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("\n");
+        print_tensor<float>(output);
     }
 };
 }

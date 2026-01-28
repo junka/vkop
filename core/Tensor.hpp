@@ -21,7 +21,7 @@
 #include <immintrin.h>
 #endif
 
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -107,7 +107,15 @@ class ITensor {
 
     static float fp16_to_fp32(uint16_t h) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
-        return vcvth_f32_f16(h);
+        float f;
+        __asm__ volatile("uxth   %w[h], %w[h]     \n\t"
+                         "fmov   h0, %w[h]        \n\t"
+                         "fcvt   s0, h0           \n\t"
+                         "fmov   %s[f], s0        \n\t"
+                         : [f] "=w"(f)
+                         : [h] "r"(h)
+                         : "h0", "s0");
+        return f;
 #elif defined(__x86_64__) || defined(__amd64)
         return _cvtsh_ss(h);
 #else
@@ -147,7 +155,14 @@ class ITensor {
     }
     static uint16_t fp32_to_fp16(float f) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
-        return vcvt_f16_f32(f);
+        uint16_t r;
+        __asm__ volatile(
+            "fcvt h0, s0\n\t"  // FP32 (s0) -> FP16 (h0)
+            "fmov %w0, h0\n\t" // h0 -> 32-bit reg, then truncate to 16-bit
+            : "=r"(r)
+            : "w"(f)
+            :);
+        return r;
 #elif defined(__x86_64__) || defined(__amd64)
         return _cvtss_sh(f, 0);
 #else
@@ -358,11 +373,8 @@ template <typename T> class Tensor : public ITensor {
             auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
             return buff;
         }
-        auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
-        auto vkbuffer = std::make_shared<VulkanBuffer>(
-            vd, aligned, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        vkobj_ = vkbuffer;
+        make_vkbuff(vd, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto vkbuffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         return vkbuffer;
     }
 
@@ -397,42 +409,16 @@ template <typename T> class Tensor : public ITensor {
     }
 
     std::shared_ptr<VulkanImage>
-    as_uniform_image(std::shared_ptr<VulkanDevice> &vd,
-                     const std::shared_ptr<VulkanCommandBuffer> &cmd,
-                     bool unorm = false) {
-        make_vkimg(vd,
-                   VK_IMAGE_USAGE_SAMPLED_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                   unorm);
-        auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        if (!img) {
-            // Handle error case appropriately
-            throw std::runtime_error(
-                "Expected VulkanImage but got something else.");
-        }
-#ifdef VK_EXT_host_image_copy
-        if (vd->is_support_host_image_copy()) {
-            img->hostImaggeTransition(VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-        } else
-#endif
-        {
-            if (cmd) {
-                img->readBarrier(cmd->get());
-            }
-        }
-
-        return img;
-    }
-    std::shared_ptr<VulkanImage>
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd,
-                   bool unorm = false) {
-        make_vkimg(vd,
-                   VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                       VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-                   unorm);
+                   bool unorm = false, bool readonly = false) {
+        auto flags =
+            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        if (!readonly) {
+            flags |=
+                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        }
+        make_vkimg(vd, flags, unorm);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         if (!img) {
             // Handle error case appropriately
@@ -552,6 +538,31 @@ template <typename T> class Tensor : public ITensor {
         } else {
             copyBufferToCPU(cmdpool);
         }
+    }
+
+    // For debug use only
+    std::shared_ptr<Tensor<T>>
+    cloneToCPUTensor(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        auto tensor = std::make_shared<Tensor<T>>(dims_);
+        auto dev = cmdpool->getVulkanDevice();
+        auto dst_img = tensor->as_output_image(dev, nullptr);
+        auto src_img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
+        VulkanCommandBuffer cmd(cmdpool, false);
+        if (!is_on_GPU()) {
+            printf("not on GPU\n");
+            return nullptr;
+        }
+        cmd.begin();
+        if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
+            dst_img->copyImageToImage(cmd.get(), src_img, {0, 0, 0}, 0);
+        } else {
+            // copyBufferToCPU(cmdpool);
+        }
+        cmd.end();
+        cmd.submit(dev->getComputeQueue());
+        cmd.wait(dev->getComputeQueue());
+        tensor->copyToCPU(cmdpool);
+        return std::move(tensor);
     }
 
     void fillToCPU(const std::vector<T> &data) {

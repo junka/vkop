@@ -1,3 +1,5 @@
+#include <cmath>
+#include <iostream>
 #include <memory>
 #include <vector>
 
@@ -98,81 +100,85 @@ public:
 private:
     void initTestdata()
     {
-        std::vector<std::vector<int>> shapes;
-        shapes.push_back(input_shape_);
-        shapes.push_back(normalized_shape_);
-        shapes.push_back(normalized_shape_);
+        torch::manual_seed(42);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+        auto torch_weight = torch::randn({normalized_shape_[0], normalized_shape_[1]});
+        auto torch_bias = torch::randn({normalized_shape_[0], normalized_shape_[1]});
 
-        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("layer_norm", shapes, param);
-        std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
-        std::vector<int> output_shape = std::get<1>(k);
-        const auto& torch_output = torch_tensors[0];
-        const auto& torch_input = torch_tensors[1];
-        const auto& torch_weight = torch_tensors[2];
-        const auto& torch_bias = torch_tensors[3];
+        auto torch_output = torch::layer_norm(torch_input, torch::IntArrayRef({normalized_shape_[0], normalized_shape_[1]}), torch_weight, torch_bias, 1e-5);
+
+        std::vector<int> output_shape = {};
+        output_shape.reserve(torch_output.dim());
+        for (int i = 0; i < torch_output.dim(); i++) {
+            output_shape.push_back(torch_output.size(i));
+        }
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-#if 1
-        int size = 1;
-        for (int s : normalized_shape_) {
-            size *= s;
-        }
         printf("=======weight ============\n");
-        for (int i = 0; i < size; i++) {
-            printf("%.4f, ", torch_weight[i]);
-        }
+        std::cout << torch_weight << std::endl;
         printf("\n=======bias ============\n");
-        for (int i = 0; i < size; i++) {
-            printf("%.4f, ", torch_bias[i]);
-        }
+        std::cout << torch_bias << std::endl;
         printf("\n===Input==============\n");
-        for (int i = 0; i < output_shape[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < output_shape[1]; j++) {
-                printf("[\n");
-                for (int k = 0; k < output_shape[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
-                                (j * output_shape[2] * output_shape[3]) +
-                                (k * output_shape[3]) +
-                                l;
-                        printf("%.4f, ", torch_input[idx]);
-                    }
-                    printf("],\n");
-                }
-                printf("],\n");
-            }
-            printf("]\n");
-        }
+        std::cout << torch_input << std::endl;
 
         printf("\n===Output==============\n");
+        std::cout << torch_output << std::endl;
+
+        input = std::make_shared<Tensor<float>>(input_shape_);
+        auto input_cpu = torch_input.cpu().contiguous();
+        std::vector<float> input_vector;
+        input_vector.reserve(input_cpu.numel());
+        auto input_accessor = input_cpu.accessor<float, 4>();
+        for (int i = 0; i < input_shape_[0]; i++) {
+            for (int j = 0; j < input_shape_[1]; j++) {
+                for (int k = 0; k < input_shape_[2]; k++) {
+                    for (int l = 0; l < input_shape_[3]; l++) {
+                        input_vector.push_back(input_accessor[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        input->fillToCPU(input_vector);
+
+        weight = std::make_shared<Tensor<float>>(normalized_shape_);
+        auto weight_cpu = torch_weight.cpu().contiguous();
+        std::vector<float> weight_vector;
+        weight_vector.reserve(weight_cpu.numel());
+        auto weight_accessor = weight_cpu.accessor<float, 2>(); // 修复：使用2维accessor
+        for (int i = 0; i < weight_cpu.size(0); i++) {
+            for (int j = 0; j < weight_cpu.size(1); j++) {
+                weight_vector.push_back(weight_accessor[i][j]);
+            }
+        }
+        weight->fillToCPU(weight_vector);
+
+        bias = std::make_shared<Tensor<float>>(normalized_shape_);
+        auto bias_cpu = torch_bias.cpu().contiguous();
+        std::vector<float> bias_vector;
+        bias_vector.reserve(bias_cpu.numel());
+        auto bias_accessor = bias_cpu.accessor<float, 2>(); // 修复：使用2维accessor
+        for (int i = 0; i < bias_cpu.size(0); i++) {
+            for (int j = 0; j < bias_cpu.size(1); j++) {
+                bias_vector.push_back(bias_accessor[i][j]);
+            }
+        }
+        bias->fillToCPU(bias_vector);
+
+        output = std::make_shared<Tensor<float>>(output_shape);
+        auto output_cpu = torch_output.cpu().contiguous();
+        std::vector<float> output_vector;
+        output_vector.reserve(output_cpu.numel());
+        auto output_accessor = output_cpu.accessor<float, 4>();
         for (int i = 0; i < output_shape[0]; i++) {
             for (int j = 0; j < output_shape[1]; j++) {
                 for (int k = 0; k < output_shape[2]; k++) {
-                    printf("[");
                     for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
-                                (j * output_shape[2] * output_shape[3]) +
-                                (k * output_shape[3]) +
-                                l;
-                        printf("%.4f, ", torch_output[idx]);
+                        output_vector.push_back(output_accessor[i][j][k][l]);
                     }
-                    printf("]\n");
                 }
-                printf("\n");
             }
-            printf("\n");
         }
-#endif
-        input = std::make_shared<Tensor<float>>(input_shape_);
-        input->fillToCPU(torch_input);
-        weight = std::make_shared<Tensor<float>>(normalized_shape_);
-        weight->fillToCPU(torch_weight);
-        bias = std::make_shared<Tensor<float>>(normalized_shape_);
-        bias->fillToCPU(torch_bias);
-        output = std::make_shared<Tensor<float>>(output_shape);
-        output->fillToCPU(torch_output);
+        output->fillToCPU(output_vector);
     }
 };
 }
@@ -198,7 +204,7 @@ int main() {
                               (j * lntest.input_shape_[2] * lntest.input_shape_[3]) +
                               (k * lntest.input_shape_[3]) + l;
                     printf("%.4f, ", bout[idx]);
-                    if (fabs(bout[idx] - (*lntest.output)[idx]) > 1e-3) {
+                    if (std::fabs(bout[idx] - (*lntest.output)[idx]) > 1e-3) {
                         printf("  <--mismatch ");
                     }
                 }

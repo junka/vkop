@@ -111,34 +111,10 @@ private:
             (*input)[i] = a;
         }
         split_cpu(input, outputs, split_shape, axis_);
-        auto inshape = input->getShape();
-        for (int i = 0; i < inshape[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < inshape[1]; j++) {
-                printf("[");
-                for (int k = 0; k < inshape[2]; k++) {
-                    int idx = (i * inshape[1] * inshape[2]) + (j * inshape[2]) + k;
-                    printf("%f, ", (*input)[idx]);
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
+        print_tensor<float>(input);
         printf("=============================\n");
         for (auto &output : outputs) {
-            auto shape = output->getShape();
-            for (int i = 0; i < shape[0]; i++) {
-                printf("[\n");
-                for (int j = 0; j < shape[1]; j++) {
-                    printf("[");
-                    for (int k = 0; k < shape[2]; k++) {
-                        int idx = (i * shape[1] * shape[2]) + (j * shape[2]) + k;
-                        printf("%f, ", (*output)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
+            print_tensor<float>(output);
         }
     }
 };

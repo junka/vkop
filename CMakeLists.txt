@@ -16,8 +16,7 @@ endif(CCACHE)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(FP16_CXX_FLAGS "-mf16c")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
-    set(FP16_CXX_FLAGS "-mfp16-format=ieee")
-    # set(FP16_CXX_FLAGS "-march=armv8.2-a+fp16")
+    set(FP16_CXX_FLAGS "-march=armv8.2-a+fp16")
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM")
     set(FP16_CXX_FLAGS "-mfp16-format=ieee")
 else()
@@ -39,7 +38,6 @@ if(DEFINED ENV{VULKAN_SDK})
         message(STATUS "Vulkan config not found, using manual setup")
         if(EXISTS ${VULKAN_SDK_PATH}/include/vulkan/vulkan.h)
             set(Vulkan_INCLUDE_DIRS ${VULKAN_SDK_PATH}/include)
-            set(Vulkan_LIBRARIES ${VULKAN_SDK_PATH}/lib/libvulkan.so)
             set(Vulkan_FOUND TRUE)
 
             link_directories(${VULKAN_SDK_PATH}/lib)
@@ -48,8 +46,17 @@ if(DEFINED ENV{VULKAN_SDK})
         endif()
     endif()
 else()
-    # Fall back to system default paths
-    find_package(Vulkan REQUIRED)
+    if(DEFINED Vulkan_INCLUDE_DIRS)
+        message(STATUS "Using custom Vulkan include directory: ${Vulkan_INCLUDE_DIRS}")
+        set(Vulkan_FOUND TRUE)
+        # Verify that the provided include path is valid
+        if(NOT EXISTS ${Vulkan_INCLUDE_DIRS}/vulkan/vulkan.h)
+            message(FATAL_ERROR "Vulkan header not found at ${Vulkan_INCLUDE_DIRS}/vulkan/vulkan.h")
+        endif()
+    else()
+        # Fall back to system default paths
+        find_package(Vulkan REQUIRED)
+    endif()
 endif()
 include_directories(${Vulkan_INCLUDE_DIRS})
 include_directories(${CMAKE_SOURCE_DIR})
@@ -57,6 +64,31 @@ include_directories(${CMAKE_SOURCE_DIR})
 # Source files
 file(GLOB_RECURSE SRC_FILES vulkan/*.cpp ops/*.cpp core/*.cpp)
 file(GLOB_RECURSE ALL_SOURCE_FILES vulkan/*.cpp vulkan/*.hpp ops/*.cpp core/*.cpp ops/*.hpp core/*.hpp)
+
+if(DEFINED GLSLC_EXECUTABLE)
+    if(EXISTS ${GLSLC_EXECUTABLE})
+        message(STATUS "Using custom glslc executable: ${GLSLC_EXECUTABLE}")
+    else()
+        message(FATAL_ERROR "Custom glslc executable not found at: ${GLSLC_EXECUTABLE}")
+    endif()
+else()
+    find_program(GLSLC_EXECUTABLE NAMES glslc PATHS ENV VULKAN_SDK PATH_SUFFIXES bin)
+    if(NOT GLSLC_EXECUTABLE)
+        # Try common installation paths
+        find_program(GLSLC_EXECUTABLE NAMES glslc HINTS
+            /usr/bin
+            /usr/local/bin
+            $ENV{VULKAN_SDK}/bin
+            /opt/vulkan-sdk/bin
+        )
+    endif()
+endif()
+
+if(NOT GLSLC_EXECUTABLE)
+    message(FATAL_ERROR "glslc not found. Install Vulkan SDK or specify GLSLC_EXECUTABLE")
+endif()
+
+message(STATUS "Found glslc: ${GLSLC_EXECUTABLE}")
 
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
@@ -80,7 +112,7 @@ foreach(SHADER ${SHADER_FILES})
 
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND glslc -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${SHADER_FLAGS}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${SHADER_FLAGS}
         DEPENDS ${SHADER}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
@@ -169,7 +201,7 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 add_subdirectory(model)
 
 add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain vkop vload -lpthread)
+target_link_libraries(vkopmain vkop vload)
 
 
 find_program(CLANG_FORMAT "clang-format")

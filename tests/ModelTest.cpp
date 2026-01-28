@@ -12,6 +12,7 @@
 #include <cmath>
 
 #include <vulkan/vulkan_core.h>
+#include "setup.hpp"
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
@@ -167,7 +168,7 @@ int main() {
                 static_cast<float>(weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + j)) * scale->at(i);
         }
     }
-#if 0
+#if 1
     printf("input : [%d, %d, %d, %d]\n", t1->get_batch(), t1->get_channel(), t1->get_height(), t1->get_width());
     for (int i = 0; i < t1->get_batch(); ++i) {
         printf("[\n");
@@ -189,21 +190,7 @@ int main() {
         printf("%f, ", scale->at(i));
     }
     printf("\n");
-    for (int i = 0; i < weight_shape[0]; ++i) {
-        printf("[");
-        for (int j = 0; j < weight_shape[1]; ++j) {
-            printf("[");
-            for (int k = 0; k < weight_shape[2]; ++k) {
-                printf("[");
-                for (int l = 0; l < weight_shape[3]; ++l) {
-                    printf("%f, ", ori_weight->at((i * weight_shape[1] * weight_shape[2] * weight_shape[3]) + (j * weight_shape[2] * weight_shape[3]) + (k * weight_shape[3]) + l));
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("]\n");
-    }
+    vkop::tests::TestCase::print_tensor<float>(ori_weight);
     printf("bias is:\n");
     for (int i = 0; i < bias->getShape()[0]; ++i) {
         printf("%f, ", bias->at(i));

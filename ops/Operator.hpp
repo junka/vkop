@@ -141,6 +141,7 @@ class Operator {
     uint8_t *spv_ = nullptr;
     uint32_t spv_len_ = 0;
     bool update_after_bind_ = false;
+    bool trace_ = true;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

@@ -158,111 +158,120 @@ public:
 
 private:
     void initTestData() {
-        std::vector<std::vector<int>> shapes;
-        shapes.push_back(input_shape_);
-        shapes.push_back(std::vector<int>{feature_size_, input_shape_[1]/group_, kernel_size_, kernel_size_});
-        shapes.push_back(std::vector<int>{feature_size_});
 
-        std::tuple<std::vector<std::vector<float>>, std::vector<int>> k = TestCase::execute_torch_operator("conv2d", shapes, attributes);
-        std::vector<std::vector<float>> torch_tensors = std::get<0>(k);
-        auto torch_output = torch_tensors[0];
-        auto torch_input = torch_tensors[1];
-        auto torch_weight = torch_tensors[2];
-        std::vector<int> output_shape = std::get<1>(k);
+        torch::manual_seed(42);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+        auto torch_weight = torch::randn({feature_size_, input_shape_[1]/group_, kernel_size_, kernel_size_});
+        auto torch_bias = torch::randn({feature_size_});
+        auto torch_output = torch::conv2d(torch_input, torch_weight, torch_bias, torch::IntArrayRef({stride_, stride_}),
+            torch::IntArrayRef({pad_, pad_}),
+            torch::IntArrayRef({dilation_, dilation_}),
+            group_);
+        auto output_flat = torch_output.flatten();
+
+        std::vector<int> output_shape = {};
+        output_shape.reserve(torch_output.dim());
+        for (int i = 0; i < torch_output.dim(); i++) {
+            output_shape.push_back(torch_output.size(i));
+        }
 
         printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
 
         printf("\n===Input==============\n");
-        for (int i = 0; i < input_shape_[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < input_shape_[1]; j++) {
-                printf("[\n");
-                for (int k = 0; k < input_shape_[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < input_shape_[3]; l++) {
-                        int idx = (i * input_shape_[1] * input_shape_[2] * input_shape_[3]) +
-                                (j * input_shape_[2] * input_shape_[3]) +
-                                (k * input_shape_[3]) + l;
-                        printf("%.4f, ", torch_input[idx]);
-                    }
-                    printf("],\n");
-                }
-                printf("],\n");
-            }
-            printf("]\n");
-        }
+        std::cout << torch_input << std::endl;
 
         printf("\n===Output==============\n");
-        for (int i = 0; i < output_shape[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < output_shape[1]; j++) {
-                printf("[\n");
-                for (int k = 0; k < output_shape[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        int idx = (i * output_shape[1] * output_shape[2] * output_shape[3]) +
-                                (j * output_shape[2] * output_shape[3]) +
-                                (k * output_shape[3]) + l;
-                        printf("%.4f, ", torch_output[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("\n");
-            }
-            printf("\n");
-        }
+        std::cout << torch_output << std::endl;
 
         printf("========weight ==[%d, %d, %d, %d]============\n", feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_);
-        for (int i = 0; i < feature_size_; i++) {
-            printf("[\n");
-            for (int j = 0; j < input_shape_[1] / group_; j++) {
-                printf("[\n");
-                for (int k = 0; k < kernel_size_; k++) {
-                    printf("[");
-                    for (int l = 0; l < kernel_size_; l++) {
-                        int idx = (i * input_shape_[1] / group_ * kernel_size_ * kernel_size_) +
-                                (j * kernel_size_ * kernel_size_) +
-                                (k * kernel_size_) + l;
-                        printf("%.4f, ", torch_weight[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        
-        if (torch_tensors.size() > 3) {
-            const auto& torch_bias = torch_tensors[3];
-            printf("\n============bias ===========\n");
-            for (int i = 0; i < feature_size_; i ++) {
-                printf("%.4f, ", torch_bias[i]);
-            }
-            printf("\n");
-        }
-        if (torch_tensors.size() > 3) {
-            auto torch_bias = torch_tensors[3];
-            bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-            bias_data_->fillFP32ToCPU(torch_bias);
-            printf("bias size %d\n", bias_data_->size());
-        }
+        std::cout << torch_weight << std::endl;
+
+        printf("\n============bias ===========\n");
+        std::cout << torch_bias << std::endl;
+        bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
+        auto bias_cpu = torch_bias.cpu().contiguous().flatten();
+        printf("bias size %d\n", bias_data_->size());
+        std::vector<float> bias_vector(bias_cpu.data_ptr<float>(), bias_cpu.data_ptr<float>() + feature_size_);
+        bias_data_->fillFP32ToCPU(bias_vector);
+
         input = std::make_shared<Tensor<T>>(input_shape_);
-        input->fillFP32ToCPU(torch_input);
+        auto input_cpu = torch_input.cpu().contiguous();
+        std::vector<float> input_vector;
+        input_vector.reserve(input_cpu.numel());
+        auto input_accessor = input_cpu.accessor<float, 4>();
+        for (int i = 0; i < input_shape_[0]; i++) {
+            for (int j = 0; j < input_shape_[1]; j++) {
+                for (int k = 0; k < input_shape_[2]; k++) {
+                    for (int l = 0; l < input_shape_[3]; l++) {
+                        input_vector.push_back(input_accessor[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        input->fillFP32ToCPU(input_vector);
         output = std::make_shared<Tensor<T>>(output_shape);
-        output->fillFP32ToCPU(torch_output);
+        auto output_cpu = torch_output.cpu().contiguous();
+        std::vector<float> output_vector;
+        output_vector.reserve(output_cpu.numel());
+        if (output_shape.size() == 4) {
+            auto output_accessor = output_cpu.accessor<float, 4>();
+            for (int i = 0; i < output_shape[0]; i++) {
+                for (int j = 0; j < output_shape[1]; j++) {
+                    for (int k = 0; k < output_shape[2]; k++) {
+                        for (int l = 0; l < output_shape[3]; l++) {
+                            output_vector.push_back(output_accessor[i][j][k][l]);
+                        }
+                    }
+                }
+            }
+        } else if (output_shape.size() == 3) {
+            auto output_accessor = output_cpu.accessor<float, 3>();
+            for (int i = 0; i < output_shape[0]; i++) {
+                for (int j = 0; j < output_shape[1]; j++) {
+                    for (int k = 0; k < output_shape[2]; k++) {
+                        output_vector.push_back(output_accessor[i][j][k]);
+                    }
+                }
+            }
+        } else if (output_shape.size() == 2) {
+            auto output_accessor = output_cpu.accessor<float, 2>();
+            for (int i = 0; i < output_shape[0]; i++) {
+                for (int j = 0; j < output_shape[1]; j++) {
+                    output_vector.push_back(output_accessor[i][j]);
+                }
+            }
+        } else if (output_shape.size() == 1) {
+            auto output_accessor = output_cpu.accessor<float, 1>();
+            for (int i = 0; i < output_shape[0]; i++) {
+                output_vector.push_back(output_accessor[i]);
+            }
+        }
+        output->fillFP32ToCPU(output_vector);
         if (typeid(T) == typeid(float)) {
-            for (size_t i = 0; i < torch_output.size(); i++) {
-                (*output)[i] = torch_output[i];
+            for (size_t i = 0; i < output_vector.size(); i++) {
+                (*output)[i] = output_vector[i];
             }
         } else {
-            for (size_t i = 0; i < torch_output.size(); i++) {
-                (*output)[i] = vkop::core::ITensor::fp32_to_fp16(torch_output[i]);
+            for (size_t i = 0; i < output_vector.size(); i++) {
+                (*output)[i] = vkop::core::ITensor::fp32_to_fp16(output_vector[i]);
             }
         }
-
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
         weight_data_->set_transpose();
-        weight_data_->fillFP32ToCPU(torch_weight);
+        auto weight_cpu = torch_weight.cpu().contiguous();
+        std::vector<float> weight_vector;
+        weight_vector.reserve(weight_cpu.numel());
+        auto weight_accessor = weight_cpu.accessor<float, 4>();
+        for (int i = 0; i < feature_size_; i++) {
+            for (int j = 0; j < input_shape_[1] / group_; j++) {
+                for (int k = 0; k < kernel_size_; k++) {
+                    for (int l = 0; l < kernel_size_; l++) {
+                        weight_vector.push_back(weight_accessor[i][j][k][l]);
+                    }
+                }
+            }
+        }
+        weight_data_->fillFP32ToCPU(weight_vector);
 
 #if USE_CPP_REFER
 

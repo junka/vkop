@@ -17,7 +17,7 @@ VulkanBufferView::VulkanBufferView(std::shared_ptr<VulkanDevice> &vdev,
     buffer_info.buffer = m_vkbuf_->getBuffer();
     buffer_info.format = format;
     buffer_info.range = m_size_;
-    buffer_info.offset = offset;
+    buffer_info.offset = m_offset_;
 
     auto ret = vkCreateBufferView(m_vdev_->getLogicalDevice(), &buffer_info,
                                   nullptr, &m_buffer_view_);
@@ -27,7 +27,6 @@ VulkanBufferView::VulkanBufferView(std::shared_ptr<VulkanDevice> &vdev,
 }
 
 VulkanBufferView::~VulkanBufferView() {
-
     vkDestroyBufferView(m_vdev_->getLogicalDevice(), m_buffer_view_, nullptr);
 }
 

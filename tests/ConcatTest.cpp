@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 #include <random>
 
@@ -120,80 +121,10 @@ private:
             (*input3)[i] = input_dist(gen);
         }
         concat({input1, input2, input3}, {output}, axis_);
-#if 0
-        printf("=====================\n");
-        for (int n = 0; n < t1[0]; n++) {
-            printf("[\n");
-            for (int c = 0; c < t1[1]; c++) {
-                printf("[\n");
-                for (int h = 0; h < t1[2]; h++) {
-                    printf("[");
-                    for (int w = 0; w < t1[3]; w++) {
-                        int idx = n * t1[1] * t1[2] * t1[3] + c * t1[2] * t1[3] +
-                                  h * t1[3] + w;
-                        printf("%f ", (*input1)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("=====================\n");
-        for (int n = 0; n < t2[0]; n++) {
-            printf("[\n");
-            for (int c = 0; c < t2[1]; c++) {
-                printf("[\n");
-                for (int h = 0; h < t2[2]; h++) {
-                    printf("[");
-                    for (int w = 0; w < t2[3]; w++) {
-                        int idx = n * t2[1] * t2[2] * t2[3] + c * t2[2] * t2[3] +
-                                  h * t2[3] + w;
-                        printf("%f ", (*input2)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("=====================\n");
-        for (int n = 0; n < t3[0]; n++) {
-            printf("[\n");
-            for (int c = 0; c < t3[1]; c++) {
-                printf("[\n");
-                for (int h = 0; h < t3[2]; h++) {
-                    printf("[");
-                    for (int w = 0; w < t3[3]; w++) {
-                        int idx = n * t3[1] * t3[2] * t3[3] + c * t3[2] * t3[3] +
-                                  h * t3[3] + w;
-                        printf("%f ", (*input3)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-        printf("=====================\n");
-        for (int n = 0; n < to[0]; n++) {
-            printf("[\n");
-            for (int c = 0; c < to[1]; c++) {
-                printf("[\n");
-                for (int h = 0; h < to[2]; h++) {
-                    printf("[");
-                    for (int w = 0; w < to[3]; w++) {
-                        int idx = n * to[1] * to[2] * to[3] + c * to[2] * to[3] +
-                                  h * to[3] + w;
-                        printf("%f ", (*output)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
-#endif
+        print_tensor<float>(input1);
+        print_tensor<float>(input2);
+        print_tensor<float>(input3);
+        print_tensor<float>(output);
     }
 };
 }
@@ -204,12 +135,12 @@ int main() {
 
     ConcatTest cctest;
     if (!cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *conv_op = dynamic_cast<Concat *>(op.get());
-        if (!conv_op) {
-            LOG_ERROR("Failed to cast operator to Conv2d");
+        auto *concat_op = dynamic_cast<Concat *>(op.get());
+        if (!concat_op) {
+            LOG_ERROR("Failed to cast operator to Concat");
             return;
         }
-        conv_op->setAttribute(cctest.attributes);
+        concat_op->setAttribute(cctest.attributes);
     })) {
         return -1;
     }

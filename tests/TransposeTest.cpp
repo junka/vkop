@@ -82,44 +82,12 @@ private:
             (*input)[i] = a;
         }
         printf("Input:\n");
-        for (int i = 0; i < input_shape_[0]; i++) {
-            printf("[\n");
-            for (int j = 0; j < input_shape_[1]; j++) {
-                printf("[\n");
-                for (int k = 0; k < input_shape_[2]; k++) {
-                    printf("[");
-                    for (int l = 0; l < input_shape_[3]; l++) {
-                        int idx = (i * input_shape_[1] * input_shape_[2] * input_shape_[3]) + (j * input_shape_[2] * input_shape_[3]) +
-                            (k * input_shape_[3]) + l;
-                        printf("%.4f, ", (*input)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
+        print_tensor<float>(input);
         transpose(input, output, perm_);
         const auto& in_shape = input->getShape();
 
         printf("Output:\n");
-        for (int n = 0; n < out_shape[0]; n++) {
-            printf("[\n");
-            for (int c = 0; c < out_shape[1]; c++) {
-                printf("[\n");
-                for (int h = 0; h < out_shape[2]; h++) {
-                    printf("[");
-                    for (int w = 0; w < out_shape[3]; w++) {
-                        int idx = (n * out_shape[1] * out_shape[2] * out_shape[3]) +
-                                  (c * out_shape[2] * out_shape[3]) + (h * out_shape[3]) + w;
-                        printf("%f ", (*output)[idx]);
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
-            printf("]\n");
-        }
+        print_tensor<float>(output);
     }
 };
 }

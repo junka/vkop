@@ -93,7 +93,7 @@ void Runtime::LoadModel() {
             }
             tensor->copyToGPU(m_cmdpool_, src_ptr);
         } else {
-            tensor->as_uniform_image(dev, nullptr);
+            tensor->as_input_image(dev, nullptr, false, true);
             tensor->copyToGPUImage(m_cmdpool_, src_ptr, model.rgba);
         }
         tensor_map[init.name] = tensor;
@@ -117,7 +117,7 @@ void Runtime::LoadModel() {
         if (tensor->num_dims() <= 2) {
             tensor->as_uniform_bufferview(dev, buffer, meta.offset);
         } else {
-            tensor->as_uniform_image(dev, nullptr);
+            tensor->as_input_image(dev, nullptr, false, true);
             tensor->copyToGPUImage(m_cmdpool_, src_ptr, model.rgba);
         }
         tensor_map[init.name] = tensor;

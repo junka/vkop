@@ -195,7 +195,8 @@ class Conv2d : public Operator {
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto weight = core::as_tensor<T>(inputs[1]);
-            auto weight_image = weight->as_input_image(m_dev_, m_cmd_);
+            auto weight_image =
+                weight->as_input_image(m_dev_, m_cmd_, false, true);
             objs_.emplace_back(weight_image);
             if (typeid(T) == typeid(uint16_t)) {
                 accuracy = 1;
