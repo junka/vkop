@@ -13,22 +13,20 @@ namespace {
 
 class AtanTest : public TestCase {
 public:
+    std::vector<int> input_shape_;
+
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
 
-    AtanTest():TestCase("Atan") {
+    explicit AtanTest(std::vector<int> input_shape):TestCase("Atan"), input_shape_(std::move(input_shape)) {
         initTestdata();
     }
 private:
     void initTestdata()
     {
-        std::vector<int> t = {
-            1, 6, 64, 64
-        };
-
-        input = std::make_shared<Tensor<float>>(t);
+        input = std::make_shared<Tensor<float>>(input_shape_);
         input->reserveOnCPU();
-        output = std::make_shared<Tensor<float>>(t);
+        output = std::make_shared<Tensor<float>>(input_shape_);
         output->reserveOnCPU();
         
         std::random_device rd{};
@@ -46,11 +44,17 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
 
-    AtanTest atantest;
-    if (!atantest.run_test<float>({atantest.input}, {atantest.output})) {
-        return -1;
+    for (const auto& t : test_cases) {
+        AtanTest atantest(t);
+        if (!atantest.run_test<float>({atantest.input}, {atantest.output})) {
+            return -1;
+        }
     }
-
     return 0;
 }

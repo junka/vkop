@@ -1,4 +1,5 @@
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "setup.hpp"
@@ -37,9 +38,7 @@ std::vector<float> batch_norm_2d(std::shared_ptr<Tensor<float>> &input, int batc
 
 class BatchNormTest : public TestCase {
 public:
-    std::vector<int> input_shape_ = {
-        1, 5, 2, 2
-    };
+    std::vector<int> input_shape_;
     const std::unordered_map<std::string, std::string> param = {
         {"eps", "1e-5"}
     };
@@ -47,7 +46,7 @@ public:
     std::shared_ptr<Tensor<float>> output;
     std::shared_ptr<Tensor<float>> para;
 
-    BatchNormTest():TestCase("BatchNorm") {
+    explicit BatchNormTest(std::vector<int> input_shape):TestCase("BatchNorm"), input_shape_(std::move(input_shape)) {
         initTestdata();
     }
 private:
@@ -162,49 +161,57 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
 
-    BatchNormTest bntest;
+    std::vector<std::vector<int>> test_configs = {
+        {1, 3, 32, 32},
+        {2, 8, 28, 28},
+        {4, 16, 16, 16},
+    };
+    for (auto config : test_configs) {
+        LOG_INFO("======test config: [%d, %d, %d, %d]\n", config[0], config[1], config[2], config[3]);
+        BatchNormTest bntest(config);
 
 #if USE_CPP_REFER
-    printf("\n===verify C++ refer ==========\n");
-    std::vector<float> torch_weight(bntest.input_shape_[1], 1.0F);
-    std::vector<float> torch_bias(bntest.input_shape_[1], 0.0F);
-    auto bout = batch_norm_2d(bntest.input, bntest.input_shape_[0], bntest.input_shape_[1],
-                bntest.input_shape_[2], bntest.input_shape_[3], torch_weight, torch_bias,
-                bntest.mean, bntest.var, 1e-5);
-    for (int i = 0; i < bntest.input_shape_[0]; i++) {
-        printf("[\n");
-        for (int j = 0; j < bntest.input_shape_[1]; j++) {
+        printf("\n===verify C++ refer ==========\n");
+        std::vector<float> torch_weight(bntest.input_shape_[1], 1.0F);
+        std::vector<float> torch_bias(bntest.input_shape_[1], 0.0F);
+        auto bout = batch_norm_2d(bntest.input, bntest.input_shape_[0], bntest.input_shape_[1],
+                    bntest.input_shape_[2], bntest.input_shape_[3], torch_weight, torch_bias,
+                    bntest.mean, bntest.var, 1e-5);
+        for (int i = 0; i < bntest.input_shape_[0]; i++) {
             printf("[\n");
-            for (int k = 0; k < bntest.input_shape_[2]; k++) {
-                printf("[");
-                for (int l = 0; l < bntest.input_shape_[3]; l++) {
-                    int idx = i * bntest.input_shape_[1] * bntest.input_shape_[2] * bntest.input_shape_[3] +
-                              j * bntest.input_shape_[2] * bntest.input_shape_[3] +
-                              k * bntest.input_shape_[3] +
-                              l;
-                    printf("%.4f, ", bout[idx]);
-                    if (fabs(bout[idx] - (*bntest.output)[idx]) > 1e-3) {
-                        printf("  <--mismatch ");
+            for (int j = 0; j < bntest.input_shape_[1]; j++) {
+                printf("[\n");
+                for (int k = 0; k < bntest.input_shape_[2]; k++) {
+                    printf("[");
+                    for (int l = 0; l < bntest.input_shape_[3]; l++) {
+                        int idx = i * bntest.input_shape_[1] * bntest.input_shape_[2] * bntest.input_shape_[3] +
+                                j * bntest.input_shape_[2] * bntest.input_shape_[3] +
+                                k * bntest.input_shape_[3] +
+                                l;
+                        printf("%.4f, ", bout[idx]);
+                        if (fabs(bout[idx] - (*bntest.output)[idx]) > 1e-3) {
+                            printf("  <--mismatch ");
+                        }
                     }
+                    printf("],\n");
                 }
                 printf("],\n");
             }
-            printf("],\n");
+            printf("]\n");
         }
-        printf("]\n");
-    }
 #endif
 
-    if (!bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
-        [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
-            if (!batchnorm_op) {
-                LOG_ERROR("Failed to cast operator to BatchNorm");
-                return;
-            }
-            batchnorm_op->setAttribute(bntest.param);
-        })) {
-        return -1;
+        if (!bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
+            [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
+                if (!batchnorm_op) {
+                    LOG_ERROR("Failed to cast operator to BatchNorm");
+                    return;
+                }
+                batchnorm_op->setAttribute(bntest.param);
+            })) {
+            return -1;
+        }
     }
 
     return 0;

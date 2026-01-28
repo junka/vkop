@@ -121,10 +121,10 @@ private:
             (*input3)[i] = input_dist(gen);
         }
         concat({input1, input2, input3}, {output}, axis_);
-        print_tensor<float>(input1);
-        print_tensor<float>(input2);
-        print_tensor<float>(input3);
-        print_tensor<float>(output);
+        input1->print_tensor();
+        input2->print_tensor();
+        input3->print_tensor();
+        output->print_tensor();
     }
 };
 }

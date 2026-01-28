@@ -82,12 +82,12 @@ private:
             (*input)[i] = a;
         }
         printf("Input:\n");
-        print_tensor<float>(input);
+        input->print_tensor();
         transpose(input, output, perm_);
         const auto& in_shape = input->getShape();
 
         printf("Output:\n");
-        print_tensor<float>(output);
+        output->print_tensor();
     }
 };
 }

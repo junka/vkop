@@ -111,10 +111,10 @@ private:
             (*input)[i] = a;
         }
         split_cpu(input, outputs, split_shape, axis_);
-        print_tensor<float>(input);
+        input->print_tensor();
         printf("=============================\n");
         for (auto &output : outputs) {
-            print_tensor<float>(output);
+            output->print_tensor();
         }
     }
 };

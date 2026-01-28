@@ -2,6 +2,7 @@
 #include <random>
 #include <chrono>
 #include <cmath>
+#include <utility>
 
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
@@ -113,23 +114,21 @@ public:
     std::shared_ptr<Tensor<float>> grid;
     std::shared_ptr<Tensor<float>> output;
 
-    GridSampleTest(): TestCase("GridSample") {
+    GridSampleTest(std::vector<int> input_shape, std::vector<int> output_shape): 
+        TestCase("GridSample"), input_shape_(std::move(input_shape)), output_shape_(std::move(output_shape)) {
         initTestdata();
     }
 private:
+    std::vector<int> input_shape_;
+    std::vector<int> output_shape_;
     void initTestdata()
     {
-        std::vector<int> t = {
-            // 1, 3, 4, 4, 4, 4
-            2, 5, 4, 4, 4, 4
-        };
-        auto batch = t[0];
-        auto depth = t[1];
-        auto in_height = t[2];
-        auto in_width = t[3];
-        auto out_height = t[4];
-        auto out_width = t[5];
-
+        int batch = input_shape_[0];
+        int depth = input_shape_[1];
+        int in_height = input_shape_[2];
+        int in_width = input_shape_[3];
+        int out_height = output_shape_[2];
+        int out_width = output_shape_[3];
         input = std::make_shared<Tensor<float>>(batch, depth, in_height, in_width);
         grid = std::make_shared<Tensor<float>>(batch, out_height, out_width, 2);
         output = std::make_shared<Tensor<float>>(batch, depth, out_height, out_width);
@@ -169,9 +168,19 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
-    GridSampleTest gst;
-    if (!gst.run_test<float>({gst.input, gst.grid}, {gst.output})) {
-        return -1;
+    
+    std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
+        {{1, 3, 4, 4}, {1, 3, 4, 4}},
+        {{2, 5, 4, 4}, {2, 5, 4, 4}}
+    };
+    for (const auto& t : test_cases) { 
+        auto [input_shape, output_shape] = t;
+        GridSampleTest gst(input_shape, output_shape);
+        if (!gst.run_test<float>({gst.input, gst.grid}, {gst.output})) {
+            return -1;
+        }
+
     }
-    return EXIT_SUCCESS;
+
+    return 0;
 }

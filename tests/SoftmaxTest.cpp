@@ -111,13 +111,14 @@ void softmax_nd(const float* input, float* output,
 
 class SoftmaxTest : public TestCase {
 public:
-    std::vector<int> input_shape_ = {4,1000};
+    std::vector<int> input_shape_;
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
     int axis_ = 0;
-    const std::unordered_map<std::string, std::string> dim = {{"dim", std::to_string(axis_)}};
+    std::unordered_map<std::string, std::string> dim;
 
-    SoftmaxTest():TestCase("Softmax") {
+    SoftmaxTest(const std::vector<int>& input_shape, int axis):TestCase("Softmax"), input_shape_(input_shape), axis_(axis) {
+        dim = {{"dim", std::to_string(axis_)}};
         initTestData();
     }
 private:
@@ -232,45 +233,55 @@ int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
 
-    SoftmaxTest softtest;
-
+    std::vector<std::tuple<std::vector<int>, int>> test_cases = {
+        {{1, 10, 7, 7}, 1},
+        {{1, 6, 8, 8}, 3},
+        {{2, 4, 10, 10}, 2},
+        {{1, 8, 6, 6}, 2},
+        {{1, 16, 5, 5}, 1},
+        {{4, 1000}, 1},
+    };
+    for (auto &test_case: test_cases) {
+        auto [input_shape, axis] = test_case;
+        SoftmaxTest softtest(input_shape, axis);
 #if USE_CPP_REFER
-    printf("\n===verify C++ refer ==========\n");
-    softmax_nd(torch_input.data(), torch_output.data(),
-                softtest.input_shape_[0], softtest.input_shape_[1],
-                softtest.input_shape_[2], softtest.input_shape_[3],
-                softtest.axis_);
-    for (int i = 0; i < output_shape[0]; i++) {
-        printf("[\n");
-        for (int j = 0; j < output_shape[1]; j++) {
+        printf("\n===verify C++ refer ==========\n");
+        softmax_nd(torch_input.data(), torch_output.data(),
+                    softtest.input_shape_[0], softtest.input_shape_[1],
+                    softtest.input_shape_[2], softtest.input_shape_[3],
+                    softtest.axis_);
+        for (int i = 0; i < output_shape[0]; i++) {
             printf("[\n");
-            for (int k = 0; k < output_shape[2]; k++) {
-                printf("[");
-                for (int l = 0; l < output_shape[3]; l++) {
-                    int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
-                              j * output_shape[2] * output_shape[3] +
-                              k * output_shape[3] +
-                              l;
-                    printf("%.4f, ", torch_output[idx]);
+            for (int j = 0; j < output_shape[1]; j++) {
+                printf("[\n");
+                for (int k = 0; k < output_shape[2]; k++) {
+                    printf("[");
+                    for (int l = 0; l < output_shape[3]; l++) {
+                        int idx = i * output_shape[1] * output_shape[2] * output_shape[3] +
+                                j * output_shape[2] * output_shape[3] +
+                                k * output_shape[3] +
+                                l;
+                        printf("%.4f, ", torch_output[idx]);
+                    }
+                    printf("],\n");
                 }
                 printf("],\n");
             }
-            printf("],\n");
+            printf("]\n");
         }
-        printf("]\n");
-    }
 #endif
 
-    if (!softtest.run_test<float>({softtest.input}, {softtest.output},
-        [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *softmax_op = dynamic_cast<Softmax *>(op.get());
-            if (!softmax_op) {
-                LOG_ERROR("Failed to cast operator to Softmax");
-                return;
-            }
-            softmax_op->setAttribute(softtest.dim);
-        })) {
-        return -1;
+        if (!softtest.run_test<float>({softtest.input}, {softtest.output},
+            [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *softmax_op = dynamic_cast<Softmax *>(op.get());
+                if (!softmax_op) {
+                    LOG_ERROR("Failed to cast operator to Softmax");
+                    return;
+                }
+                softmax_op->setAttribute(softtest.dim);
+            })) {
+            return -1;
+        }
     }
 
     return 0;

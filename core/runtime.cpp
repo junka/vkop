@@ -289,6 +289,7 @@ void Runtime::LoadModel() {
 
         op->set_runtime_device(dev, m_cmdpool_);
         op->setAttribute(n.attributes);
+        op->set_name(n.name);
 
         node_ops_.push_back(std::move(op));
         node_attrs_.push_back(n.attributes);
@@ -403,6 +404,15 @@ void Runtime::RegisterPostProcess(
     for (size_t i = 0; i < outputs.size(); ++i) {
         real_outputs_["post_" + convert_optype_to_string(ops) +
                       std::to_string(i)] = outputs[i];
+    }
+}
+
+void Runtime::TraceNode(const std::string &name) {
+    for (auto &op : node_ops_) {
+        if (op->get_name() == name) {
+            op->enable_trace();
+            break;
+        }
     }
 }
 

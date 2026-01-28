@@ -175,7 +175,7 @@ class AveragePool : public Operator {
     std::vector<int> pads_ = {0, 0, 0, 0};
     std::vector<int> dilations_ = {1, 1};
     int ceil_mode_ = 0;
-    int count_include_pad_ = 0;
+    int count_include_pad_ = 1;
     int auto_pad_ = 0; // notset
 };
 

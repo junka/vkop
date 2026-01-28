@@ -33,82 +33,6 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
-    template <typename TT>
-    static void print_tensor(const std::shared_ptr<core::ITensor> &tensor) {
-        printf("=====================\n");
-        auto t = core::as_tensor<TT>(tensor);
-        auto shape = tensor->getShape();
-        if (shape.size() == 4) {
-            printf("[\n");
-            for (int i = 0; i < shape[0]; i++) {
-                printf("  [\n");
-                for (int j = 0; j < shape[1]; j++) {
-                    printf("    [\n");
-                    for (int k = 0; k < shape[2]; k++) {
-                        printf("      [");
-                        for (int l = 0; l < shape[3]; l++) {
-                            int idx = (i * shape[1] * shape[2] * shape[3]) + (j * shape[2] * shape[3]) +
-                                (k * shape[3]) + l;
-                            if constexpr (std::is_same_v<TT, uint16_t>) {
-                                std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ", ";
-                            } else {
-                                std::cout << (*t)[idx] << ",";
-                            }
-                        }
-                        printf("],\n");
-                    }
-                    printf("    ],\n");
-                }
-                printf("  ],\n");
-            }
-            printf("]\n");
-        } else if (shape.size() == 3) {
-            printf("[\n");
-            for (int i = 0; i < shape[0]; i++) {
-                printf("  [\n");
-                for (int j = 0; j < shape[1]; j++) {
-                    printf("    [");
-                    for (int k = 0; k < shape[2]; k++) {
-                        int idx = (i * shape[1] * shape[2]) + (j * shape[2]) + k;
-                        if constexpr (std::is_same_v<TT, uint16_t>) {
-                            std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ", ";
-                        } else {
-                            std::cout << (*t)[idx] << ",";
-                        }
-                    }
-                    printf("],\n");
-                }
-                printf("  ],\n");
-            }
-            printf("]\n");
-        } else if (shape.size() == 2) {
-            printf("[\n");
-            for (int i = 0; i < shape[0]; i++) {
-                printf("  [");
-                for (int j = 0; j < shape[1]; j++) {
-                    int idx = (i * shape[1]) + j;
-                    if constexpr (std::is_same_v<TT, uint16_t>) {
-                        std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ",";
-                    } else {
-                        std::cout << (*t)[idx] << ", ";
-                    }
-                }
-                printf("],\n");
-            }
-            printf("]\n");
-        } else if (shape.size() == 1) {
-            printf("[");
-            for (int idx = 0; idx < shape[0]; idx++) {
-                if constexpr (std::is_same_v<TT, uint16_t>) {
-                    std::cout << core::ITensor::fp16_to_fp32((*t)[idx]) << ",";
-                } else {
-                    std::cout << (*t)[idx] << ", ";
-                }
-            }
-            printf("]\n");
-        }
-    }
-
     template <typename T>
     bool run_test(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &expect_outputs,
@@ -174,7 +98,7 @@ public:
             auto output = core::as_tensor<TT>(outputs[idx]);
             output->copyToCPU(cmdpool);
             auto oshape = output->getShape();
-            print_tensor<TT>(output);
+            output->print_tensor();
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             for (int i = 0; i < output->num_elements(); i++) {
                 if constexpr (std::is_same_v<TT, uint16_t>) {
@@ -194,7 +118,7 @@ public:
                         return false;
                     }
                 } else if (typeid(TT) == typeid(int)) {
-                    std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
+                    // std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
                     if (std::isnan((*output)[i]) || (*output)[i] != (*expect)[i]) {
                         LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
                         return false;
@@ -202,7 +126,7 @@ public:
                 } else {
                     float out_val = (*output)[i];
                     float exp_val = (*expect)[i];
-                    std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
+                    // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
 
                     if (std::isnan(out_val)) {
                         LOG_ERROR("Test Fail (%d): Output is NaN, expected %f", i, exp_val);

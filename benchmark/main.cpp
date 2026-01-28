@@ -66,6 +66,8 @@ int main(int argc, char *argv[]) {
 
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
+    /* example for debug one node */
+    // rt->TraceNode("node_Conv_285");
 
     vkop::core::NormMethod method = vkop::core::NormMethod::IMAGENET;
     if (binary_file_path.find("inception") != std::string::npos) {

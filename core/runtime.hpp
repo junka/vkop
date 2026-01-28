@@ -2,6 +2,7 @@
 
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -53,6 +54,9 @@ class Runtime {
 
     // Get initializer tensor by name, for test only
     std::shared_ptr<ITensor> GetInitializer(const std::string &name) const;
+
+    // should be called before loading model
+    void TraceNode(const std::string &name);
 
     double Run();
 

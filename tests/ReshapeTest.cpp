@@ -47,7 +47,7 @@ private:
             (*output)[i] = a;
         }
         printf("=====================\n");
-        print_tensor<float>(input);
+        input->print_tensor();
     }
 };
 }

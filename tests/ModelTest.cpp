@@ -190,7 +190,7 @@ int main() {
         printf("%f, ", scale->at(i));
     }
     printf("\n");
-    vkop::tests::TestCase::print_tensor<float>(ori_weight);
+    ori_weight->print_tensor();
     printf("bias is:\n");
     for (int i = 0; i < bias->getShape()[0]; ++i) {
         printf("%f, ", bias->at(i));

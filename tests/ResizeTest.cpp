@@ -1,5 +1,6 @@
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 #include <cassert>
 
@@ -21,7 +22,7 @@ public:
     bool align_corners_ = false;
     std::string mode_ = "bilinear";
     bool antialias_ = false;
-    float cubic_coeff_a_ = -0.75; // pytorch fixed value
+    float cubic_coeff_a_ = -0.75;
 
     std::string buildSizeString(const std::vector<int>& sizes) {
         std::string result = "[";
@@ -35,26 +36,24 @@ public:
         result += "]";
         return result;
     }
-    std::unordered_map<std::string, std::string> attributes = {
-        {"size", buildSizeString(resize_)},
-        // 用于上采样的算法: 'nearest'| 'linear'| 'bilinear'| 'bicubic'| 'trilinear'| 'area'| 'nearest-exact'
-        // 对于2D 操作，仅考虑 nearest， bilinear, bicubic, area, nearest-exact
-        {"mode", mode_},
-        // align_corners works only for linear, bilinear, bicubic, trilinear
-        // {"coordinate_transformation_mode", "half_pixel"},
-        {"align_corners", align_corners_ ? "True": "False"},
-        // antialias works for 'bilinear', 'bicubic'
-        {"antialias", antialias_ ? "True" : "False"},
-        // {"cubic_coeff_a", std::to_string(cubic_coeff_a_)},
-    };
+    std::unordered_map<std::string, std::string> attributes;
 
     std::shared_ptr<Tensor<T>> input_data_;
     std::shared_ptr<Tensor<T>> output_data_;
 
-    ResizeTest(): TestCase("Resize") {
+    ResizeTest(const std::vector<int>& input_shape, const std::vector<int>& resize, 
+               bool align_corners, std::string mode, bool antialias, float cubic_coeff_a = -0.75)
+        : TestCase("Resize"), input_shape_(input_shape), resize_(resize), align_corners_(align_corners), 
+          mode_(std::move(mode)), antialias_(antialias), cubic_coeff_a_(cubic_coeff_a) {
+        
+        attributes = {
+            {"size", buildSizeString(resize_)},
+            {"mode", mode_},
+            {"align_corners", align_corners_ ? "True": "False"},
+            {"antialias", antialias_ ? "True" : "False"},
+        };
         initTestData();
     }
-
 
 private:
     void initTestData() {
@@ -132,7 +131,6 @@ private:
             output_shape.push_back(torch_output.size(i));
         }
 
-        printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
         printf("\n===Input==============\n");
         std::cout << torch_input << std::endl;
         printf("\n===Output==============\n");
@@ -176,19 +174,34 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    ResizeTest<float> rt;
 
-    if (!rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
-        [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *resize_op = dynamic_cast<Resize *>(op.get());
-        if (!resize_op) {
-            LOG_ERROR("Failed to cast operator to Resize");
-            return;
+    std::vector<std::tuple<std::vector<int>, std::vector<int>, bool, std::string, bool>> test_cases = {
+        {{1, 2, 4, 4}, {1, 2, 2, 2}, false, "bilinear", false},
+        {{1, 3, 8, 8}, {1, 3, 4, 4}, false, "nearest", false},
+        {{1, 4, 5, 5}, {1, 4, 10, 10}, false, "nearest", false},
+        // {{1, 2, 3, 3}, {1, 2, 6, 6}, true, "bilinear", true},
+        // {{2, 1, 6, 6}, {2, 1, 12, 12}, true, "bilinear", false},
+    };
+    for (const auto& test_case : test_cases) {
+        auto [input_shape, resize, align_corners, mode, antialias] = test_case;
+        LOG_INFO("Running test case: input=%d,%d,%d,%d, resize=%d,%d,%d,%d, mode=%s, align_corners=%s, antialias=%s",
+               input_shape[0], input_shape[1], input_shape[2], input_shape[3],
+               resize[0], resize[1], resize[2], resize[3], mode.c_str(), 
+               align_corners ? "true" : "false", antialias ? "true" : "false");
+        ResizeTest<float> rt(input_shape, resize, align_corners, mode, antialias);
+
+        if (!rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
+            [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *resize_op = dynamic_cast<Resize *>(op.get());
+            if (!resize_op) {
+                LOG_ERROR("Failed to cast operator to Resize");
+                return;
+            }
+            resize_op->setAttribute(rt.attributes);
+
+        })) {
+            return -1;
         }
-        resize_op->setAttribute(rt.attributes);
-
-    })) {
-        return -1;
     }
     
     return 0;

@@ -138,13 +138,7 @@ public:
     int dilation_ = 1;
     int feature_size_ = 5; // oc
 
-    std::unordered_map<std::string, std::string> attributes = {
-        {"strides", std::to_string(stride_)},
-        {"pads", std::to_string(pad_)},
-        {"dilations", std::to_string(dilation_)},
-        {"group", std::to_string(group_)},
-        {"kernel_shape", std::to_string(kernel_size_)}
-    };
+    std::unordered_map<std::string, std::string> attributes;
 
     std::shared_ptr<Tensor<T>> weight_data_;
     std::shared_ptr<Tensor<T>> bias_data_;
@@ -152,7 +146,18 @@ public:
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<T>> output;
 
-    Conv2dTest(): TestCase("Conv2d") {
+    Conv2dTest(const std::vector<int>& input_shape, int kernel_size, int stride, 
+               int pad, int group, int dilation, int feature_size)
+        : TestCase("Conv2d"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), 
+          pad_(pad), group_(group), dilation_(dilation), feature_size_(feature_size) {
+          
+        attributes = {
+            {"strides", std::to_string(stride_)},
+            {"pads", std::to_string(pad_)},
+            {"dilations", std::to_string(dilation_)},
+            {"group", std::to_string(group_)},
+            {"kernel_shape", std::to_string(kernel_size_)}
+        };
         initTestData();
     }
 
@@ -321,32 +326,55 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    Conv2dTest<uint16_t> ct16;
-    if (!ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
-        [&ct16](std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *conv_op = dynamic_cast<Conv2d *>(op.get());
-        if (!conv_op) {
-            LOG_ERROR("Failed to cast operator to Conv2d");
-            return;
-        }
-        conv_op->setAttribute(ct16.attributes);
-    })) {
-        return -1;
-    }
 
-    Conv2dTest<float> ct;
-    if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
-        [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *conv_op = dynamic_cast<Conv2d *>(op.get());
-        if (!conv_op) {
-            LOG_ERROR("Failed to cast operator to Conv2d");
-            return;
-        }
-        conv_op->setAttribute(ct.attributes);
-    })) {
-        return -1;
-    }
+    std::vector<std::tuple<std::vector<int>, int, int, int, int, int, int>> test_cases = {
+        {{1, 10, 7, 7}, 2, 1, 0, 5, 1, 5},    // Group convolution
+        {{1, 6, 8, 8}, 3, 1, 1, 2, 1, 4},     // With padding
+        {{2, 4, 10, 10}, 3, 2, 1, 1, 1, 8},   // Batch size > 1
+        {{1, 8, 6, 6}, 2, 1, 0, 4, 2, 4},     // Dilated convolution
+        {{1, 16, 5, 5}, 1, 1, 0, 1, 1, 32},   // 1x1 convolution
 
+        {{1, 1, 224, 224}, 3, 1, 1, 1, 1, 32}, // Large input typical in CNNs
+        {{4, 3, 32, 32}, 3, 1, 1, 1, 1, 16},   // Larger batch size
+        {{1, 32, 8, 8}, 3, 1, 2, 1, 1, 64},    // Larger padding (pad > kernel/2)
+        {{1, 12, 15, 15}, 5, 2, 2, 3, 1, 24},  // Larger kernel with stride
+        {{1, 16, 7, 7}, 7, 1, 0, 1, 1, 32},    // Kernel size equals input size
+        {{1, 4, 5, 5}, 3, 2, 1, 4, 1, 8},      // Stride > 1 with groups
+        {{1, 8, 8, 8}, 3, 1, 1, 2, 2, 16},     // Dilation > 2 with groups
+        {{1, 1, 3, 3}, 3, 1, 1, 1, 1, 1},      // Minimal case
+    };
+    for (const auto& test_case : test_cases) {
+        auto [input_shape, kernel_size, stride, pad, group, dilation, feature_size] = test_case;
+        printf("Running test case: input=%d,%d,%d,%d, kernel=%d, stride=%d, pad=%d, group=%d, dilation=%d, feature_size=%d\n",
+               input_shape[0], input_shape[1], input_shape[2], input_shape[3],
+               kernel_size, stride, pad, group, dilation, feature_size);
+        
+        Conv2dTest<uint16_t> ct16(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
+        if (!ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
+            [&ct16](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+            if (!conv_op) {
+                LOG_ERROR("Failed to cast operator to Conv2d");
+                return;
+            }
+            conv_op->setAttribute(ct16.attributes);
+        })) {
+            return -1;
+        }
+
+        Conv2dTest<float> ct(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
+        if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
+            [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+            if (!conv_op) {
+                LOG_ERROR("Failed to cast operator to Conv2d");
+                return;
+            }
+            conv_op->setAttribute(ct.attributes);
+        })) {
+            return -1;
+        }
+    }
 
     return 0;
 }

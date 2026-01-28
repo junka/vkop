@@ -120,7 +120,24 @@ class Operator {
         m_id_ = id;
         objs_.clear();
         execute(inputs, outputs);
+        if (trace_) {
+            m_cmd_->wait(m_dev_->getComputeQueue());
+            printf("%s: %s\n", convert_optype_to_string(type_).c_str(),
+                   name_.c_str());
+            dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto output = core::as_tensor<T>(outputs[0]);
+                output->copyToCPU(m_cmdpool_);
+                output->print_tensor();
+                output->toGPU();
+            });
+        }
     }
+    void enable_trace() { trace_ = true; }
+    void disable_trace() { trace_ = false; }
+
+    void set_name(const std::string &name) { name_ = name; }
+    std::string get_name() const { return name_; }
 
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
@@ -141,7 +158,8 @@ class Operator {
     uint8_t *spv_ = nullptr;
     uint32_t spv_len_ = 0;
     bool update_after_bind_ = false;
-    bool trace_ = true;
+    bool trace_ = false;
+    std::string name_;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

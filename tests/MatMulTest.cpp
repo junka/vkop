@@ -78,13 +78,13 @@ private:
         printf("Input A:\n");
         auto shapea = inputa->getShape();
         printf("%d %d %d %d\n", shapea[0], shapea[1], shapea[2], shapea[3]);
-        print_tensor<float>(inputa);
+        inputa->print_tensor();
         printf("Input B:\n");
         auto shapeb = inputb->getShape();
-        print_tensor<float>(inputb);
+        inputb->print_tensor();
         reference_matmul(inputa, inputb, output);
         printf("Output:\n");
-        print_tensor<float>(output);
+        output->print_tensor();
     }
 };
 }

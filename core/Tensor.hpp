@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -197,6 +198,7 @@ class ITensor {
     bool transpose_ = false;
     bool pack_ = false;
     bool converted_ = false;
+    // 64bytes here
 };
 
 template <typename T> class Tensor : public ITensor {
@@ -540,31 +542,6 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    // For debug use only
-    std::shared_ptr<Tensor<T>>
-    cloneToCPUTensor(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        auto tensor = std::make_shared<Tensor<T>>(dims_);
-        auto dev = cmdpool->getVulkanDevice();
-        auto dst_img = tensor->as_output_image(dev, nullptr);
-        auto src_img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
-        VulkanCommandBuffer cmd(cmdpool, false);
-        if (!is_on_GPU()) {
-            printf("not on GPU\n");
-            return nullptr;
-        }
-        cmd.begin();
-        if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
-            dst_img->copyImageToImage(cmd.get(), src_img, {0, 0, 0}, 0);
-        } else {
-            // copyBufferToCPU(cmdpool);
-        }
-        cmd.end();
-        cmd.submit(dev->getComputeQueue());
-        cmd.wait(dev->getComputeQueue());
-        tensor->copyToCPU(cmdpool);
-        return std::move(tensor);
-    }
-
     void fillToCPU(const std::vector<T> &data) {
         reserveOnCPU();
         memcpy(data_->data(), data.data(), size_);
@@ -612,6 +589,88 @@ template <typename T> class Tensor : public ITensor {
             data_ = std::make_unique<std::vector<T>>(num_elements());
         }
         toCPU();
+    }
+
+    void print_tensor() {
+        printf("=====================\n");
+        auto shape = getShape();
+        if (shape.size() == 4) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [\n");
+                for (int j = 0; j < shape[1]; j++) {
+                    printf("    [\n");
+                    for (int k = 0; k < shape[2]; k++) {
+                        printf("      [");
+                        for (int l = 0; l < shape[3]; l++) {
+                            int idx = (i * shape[1] * shape[2] * shape[3]) +
+                                      (j * shape[2] * shape[3]) +
+                                      (k * shape[3]) + l;
+                            if constexpr (std::is_same_v<T, uint16_t>) {
+                                std::cout
+                                    << core::ITensor::fp16_to_fp32((*this)[idx])
+                                    << ", ";
+                            } else {
+                                std::cout << (*this)[idx] << ",";
+                            }
+                        }
+                        printf("],\n");
+                    }
+                    printf("    ],\n");
+                }
+                printf("  ],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 3) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [\n");
+                for (int j = 0; j < shape[1]; j++) {
+                    printf("    [");
+                    for (int k = 0; k < shape[2]; k++) {
+                        int idx =
+                            (i * shape[1] * shape[2]) + (j * shape[2]) + k;
+                        if constexpr (std::is_same_v<T, uint16_t>) {
+                            std::cout
+                                << core::ITensor::fp16_to_fp32((*this)[idx])
+                                << ", ";
+                        } else {
+                            std::cout << (*this)[idx] << ",";
+                        }
+                    }
+                    printf("],\n");
+                }
+                printf("  ],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 2) {
+            printf("[\n");
+            for (int i = 0; i < shape[0]; i++) {
+                printf("  [");
+                for (int j = 0; j < shape[1]; j++) {
+                    int idx = (i * shape[1]) + j;
+                    if constexpr (std::is_same_v<T, uint16_t>) {
+                        std::cout << core::ITensor::fp16_to_fp32((*this)[idx])
+                                  << ",";
+                    } else {
+                        std::cout << (*this)[idx] << ", ";
+                    }
+                }
+                printf("],\n");
+            }
+            printf("]\n");
+        } else if (shape.size() == 1) {
+            printf("[");
+            for (int idx = 0; idx < shape[0]; idx++) {
+                if constexpr (std::is_same_v<T, uint16_t>) {
+                    std::cout << core::ITensor::fp16_to_fp32((*this)[idx])
+                              << ",";
+                } else {
+                    std::cout << (*this)[idx] << ", ";
+                }
+            }
+            printf("]\n");
+        }
     }
 
   private:

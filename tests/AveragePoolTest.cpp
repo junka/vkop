@@ -12,71 +12,36 @@ using vkop::ops::AveragePool;
 namespace {
 class AveragePoolTest : public TestCase {
 public:
+    std::vector<int> input_shape_;
+    std::vector<int> kernel_shape_;
+    std::vector<int> strides_;
+    std::vector<int> pads_;
+    bool count_include_pad_;
+
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
-    std::unordered_map<std::string, std::string> attributes = {
-        {"auto_pad", "NOTSET"},
-        {"pads", "[0,0,0,0]"},
-        {"strides", "[2,4]"},
-        {"kernel_shape", "[4,8]"}
-    };
+    std::unordered_map<std::string, std::string> attributes;
 
-    AveragePoolTest():TestCase("AveragePool") {
+    AveragePoolTest(std::vector<int> input_shape, std::vector<int> kernel_shape, std::vector<int> strides, std::vector<int> pads, bool count_include_pad):
+        TestCase("AveragePool"), input_shape_(std::move(input_shape)), kernel_shape_(std::move(kernel_shape)),
+        strides_(std::move(strides)), pads_(std::move(pads)) {
+        attributes = {
+            {"auto_pad", "NOTSET"},
+            {"pads", "[" + std::to_string(pads_[0]) + "," + std::to_string(pads_[1]) + "," + std::to_string(pads_[2]) + "," + std::to_string(pads_[3]) + "]"},
+            {"strides", "[" + std::to_string(strides_[0]) + "," + std::to_string(strides_[1]) + "]"},
+            {"kernel_shape", "[" + std::to_string(kernel_shape_[0]) + "," + std::to_string(kernel_shape_[1]) + "]"},
+            {"count_include_pad", std::to_string(count_include_pad_? 1 : 0)},
+        };
         initTestdata();
     }
 private:
     void initTestdata()
     {
-        std::vector<int> input_shape = {
-            1, 3, 8, 8
-        };
         torch::manual_seed(42);
-        auto torch_input = torch::randn({input_shape[0], input_shape[1], input_shape[2], input_shape[3]});
-
-        std::vector<int64_t> kernel_sizes;
-        std::string kernel_shape_str = attributes.count("kernel_shape") ? attributes.at("kernel_shape") : "[2,2]";
-        if (kernel_shape_str[0] == '[' && kernel_shape_str.back() == ']') {
-            std::string content = kernel_shape_str.substr(1, kernel_shape_str.length() - 2);
-            std::stringstream ss(content);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                kernel_sizes.push_back(std::stoll(item));
-            }
-        } else {
-            int64_t val = std::stoll(kernel_shape_str);
-            kernel_sizes = {val, val};
-        }
-
-        std::vector<int64_t> strides;
-        std::string strides_str = attributes.count("strides") ? attributes.at("strides") : "[1,1]";
-        if (strides_str[0] == '[' && strides_str.back() == ']') {
-            std::string content = strides_str.substr(1, strides_str.length() - 2);
-            std::stringstream ss(content);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                strides.push_back(std::stoll(item));
-            }
-        } else {
-            int64_t val = std::stoll(strides_str);
-            strides = {val, val};
-        }
-
-        std::vector<int64_t> paddings;
-        std::string pads_str = attributes.count("pads") ? attributes.at("pads") : "[0,0]";
-        if (pads_str[0] == '[' && pads_str.back() == ']') {
-            std::string content = pads_str.substr(1, pads_str.length() - 2);
-            std::stringstream ss(content);
-            std::string item;
-            while (std::getline(ss, item, ',')) {
-                paddings.push_back(std::stoll(item));
-            }
-        } else {
-            int64_t val = std::stoll(pads_str);
-            paddings = {val, val};
-        }
-        if (paddings.size() > 2) {
-            paddings = {paddings[0],paddings[1]};
-        }
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+        std::vector<int64_t> kernel_sizes = {kernel_shape_[0], kernel_shape_[1]};
+        std::vector<int64_t> strides = {strides_[0], strides_[1]};
+        std::vector<int64_t> paddings = {pads_[0], pads_[2]};
 
         bool ceil_mode = attributes.count("ceil_mode") ? (std::stoi(attributes.at("ceil_mode")) != 0) : false;
         bool count_include_pad = attributes.count("count_include_pad") ? (std::stoi(attributes.at("count_include_pad")) != 0) : true;
@@ -95,15 +60,15 @@ private:
             output_shape.push_back(torch_output.size(i));
         }
 
-        input = std::make_shared<Tensor<float>>(input_shape);
+        input = std::make_shared<Tensor<float>>(input_shape_);
         auto input_cpu = torch_input.cpu().contiguous();
         std::vector<float> input_vector;
         input_vector.reserve(input_cpu.numel());
         auto input_accessor = input_cpu.accessor<float, 4>();
-        for (int i = 0; i < input_shape[0]; i++) {
-            for (int j = 0; j < input_shape[1]; j++) {
-                for (int k = 0; k < input_shape[2]; k++) {
-                    for (int l = 0; l < input_shape[3]; l++) {
+        for (int i = 0; i < input_shape_[0]; i++) {
+            for (int j = 0; j < input_shape_[1]; j++) {
+                for (int k = 0; k < input_shape_[2]; k++) {
+                    for (int l = 0; l < input_shape_[3]; l++) {
                         input_vector.push_back(input_accessor[i][j][k][l]);
                     }
                 }
@@ -140,19 +105,30 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
-
-    AveragePoolTest aptest;
-    if (!aptest.run_test<float>({aptest.input}, {aptest.output},
-        [&aptest](std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *ap_op = dynamic_cast<AveragePool *>(op.get());
-        if (!ap_op) {
-            LOG_ERROR("Failed to cast operator to Conv2d");
-            return;
+    std::vector<std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, std::vector<int>, bool>> test_configs = {
+        {{1, 3, 32, 32}, {4, 8}, {2, 4}, {0, 0, 0, 0}, true},
+        {{1, 3, 32, 32}, {4, 8}, {2, 4}, {1, 1, 1, 1}, false},
+        {{1, 8, 28, 28}, {5, 5}, {1, 1}, {2, 2, 2, 2}, true},
+    };
+    for (const auto& config : test_configs) {
+        auto [input_shape, kernel_shape, strides, pads, count_include_pad] = config;
+        LOG_INFO("Testing AveragePool with input shape: [ %d, %d, %d, %d ], kernel shape: [ %d, %d ], strides: [ %d, %d ], pads: [ %d, %d, %d, %d ], count_include_pad: %s",
+            input_shape[0], input_shape[1], input_shape[2], input_shape[3],
+            kernel_shape[0], kernel_shape[1],
+            strides[0], strides[1], pads[0], pads[1], pads[2], pads[3],
+            count_include_pad ? "true" : "false");
+        AveragePoolTest aptest(input_shape, kernel_shape, strides, pads, count_include_pad);
+        if (!aptest.run_test<float>({aptest.input}, {aptest.output},
+            [&aptest](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *ap_op = dynamic_cast<AveragePool *>(op.get());
+            if (!ap_op) {
+                LOG_ERROR("Failed to cast operator to AveragePool");
+                return;
+            }
+            ap_op->setAttribute(aptest.attributes);
+        })) {
+            return -1;
         }
-        ap_op->setAttribute(aptest.attributes);
-    })) {
-        return -1;
     }
-
     return 0;
 }

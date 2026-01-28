@@ -106,25 +106,40 @@ vec2 transform_coordinate(float out_h, float out_w, float in_h, float in_w, int 
     return vec2(in_x, in_y);
 }
 
-// 双线性采样
 vec4 sample_bilinear(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_total) {
-    uv = clamp(uv, vec2(0.0), vec2(float(in_w) - 1e-5, float(in_h_total) - 1e-5));
-    ivec2 iuv = ivec2(uv);
-    vec2 f = fract(uv);
+    vec2 coord = uv;
+    coord = clamp(coord, vec2(0.0), vec2(float(in_w - 1), float(in_h_total - 1)));
 
-    vec4 tl = texelFetch(tex, ivec3(iuv.x, iuv.y, layer), 0);
-    vec4 tr = texelFetch(tex, ivec3(min(iuv.x + 1, in_w - 1), iuv.y, layer), 0);
-    vec4 bl = texelFetch(tex, ivec3(iuv.x, min(iuv.y + 1, in_h_total - 1), layer), 0);
-    vec4 br = texelFetch(tex, ivec3(min(iuv.x + 1, in_w - 1), min(iuv.y + 1, in_h_total - 1), layer), 0);
+    vec2 point = coord;
+    ivec2 p00 = ivec2(floor(point));
+    ivec2 p11 = p00 + ivec2(1, 1);
 
-    vec4 top = mix(tl, tr, f.x);
-    vec4 bot = mix(bl, br, f.x);
-    return mix(top, bot, f.y);
+    vec2 weight = fract(point);
+
+    ivec2 p01 = ivec2(p00.x, p11.y);
+    ivec2 p10 = ivec2(p11.x, p00.y);
+
+    if (p11.x >= in_w) {
+        p11.x = p00.x = p01.x = p10.x = in_w - 1;
+        weight.x = 0.0;
+    }
+    if (p11.y >= in_h_total) {
+        p11.y = p00.y = p01.y = p10.y = in_h_total - 1;
+        weight.y = 0.0;
+    }
+    
+    vec4 s00 = texelFetch(tex, ivec3(p00, layer), 0);
+    vec4 s10 = texelFetch(tex, ivec3(p10, layer), 0);
+    vec4 s01 = texelFetch(tex, ivec3(p01, layer), 0);
+    vec4 s11 = texelFetch(tex, ivec3(p11, layer), 0);
+
+    vec4 top = mix(s00, s10, weight.x);
+    vec4 bot = mix(s01, s11, weight.x);
+    return mix(top, bot, weight.y);
 }
 
 vec4 sample_nearest(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_total)
 {
-    vec4 value;
     ivec2 in_pixel;
 
     if (uResizeParam.nearest_mode == ROUND_PREFER_FLOOR) {
@@ -145,7 +160,7 @@ vec4 sample_nearest(sampler2DArray tex, vec2 uv, int layer, int in_w, int in_h_t
 
     in_pixel.x = clamp(in_pixel.x, 0, in_w - 1);
     in_pixel.y = clamp(in_pixel.y, 0, in_h_total - 1);
-    return value;
+    return texelFetch(tex, ivec3(in_pixel.x, in_pixel.y, layer), 0);
 }
 
 void main()

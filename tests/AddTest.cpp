@@ -16,14 +16,12 @@ namespace {
 template<typename T>
 class AddTest : public TestCase {
 public:
-    std::vector<int> input_shape_ = {
-        10, 5, 64, 64
-    };
+    std::vector<int> input_shape_;
     std::shared_ptr<Tensor<T>> inputa;
     std::shared_ptr<Tensor<T>> inputb;
     std::shared_ptr<Tensor<T>> output;
 
-    AddTest():TestCase("Add") {
+    explicit AddTest(std::vector<int> input_shape):TestCase("Add"), input_shape_(std::move(input_shape)) {
         initTestdata();
     }
 private:
@@ -61,9 +59,17 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
-    AddTest<uint16_t> addtest;
-    if (!addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output})) {
-        return -1;
+    std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
+
+    for (const auto& t : test_cases) {
+        AddTest<uint16_t> addtest(t);
+        if (!addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output})) {
+            return -1;
+        }
     }
 
     return 0;
