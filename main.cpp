@@ -9,8 +9,6 @@
 #include <memory>
 #include <cmath>
 
-#include <vulkan/vulkan_core.h>
-
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;
@@ -63,7 +61,6 @@ std::vector<MaskInfo> postProcessNMS(
         if (std::fabs((*hm_data)[idx] - (*hm_nms_data)[idx]) > 1e-6F) {
             continue;
         }
-
         float score = sigmoid((*hm_nms_data)[idx]);
         int category = 0;
         const float cls_value1 = (*cls_data)[idx];
@@ -235,6 +232,7 @@ int main(int argc, char *argv[]) {
 
         auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
         rt->LoadModel();
+        // rt->TraceNode("/head/task_heads.0/heatmap/heatmap.1/heatmap.1.0/Conv");
 
         auto input = rt->GetInput("input.1");
         int tensor_h = 0;
@@ -255,7 +253,7 @@ int main(int argc, char *argv[]) {
             return -1;
         }
         double tot_lat = 0.0F;
-        int count = 10;
+        int count = 2;
         for (int i = 0; i < count; i ++) {
             auto lat = rt->Run();
             tot_lat += lat;
@@ -270,7 +268,6 @@ int main(int argc, char *argv[]) {
         auto cls = vkop::core::as_tensor<float>(rt->GetOutput("cls"));
         auto hm_nms = vkop::core::as_tensor<float>(rt->GetOutput("hm_nms"));
         assert(hm != nullptr);
-
         postProcessNMS(hm, hm_nms, reg, dim, cls, hm_nms->getShape()[2], hm_nms->getShape()[3],
             image_h, image_w, tensor_h, tensor_w);
     } catch (const std::exception& ex) {

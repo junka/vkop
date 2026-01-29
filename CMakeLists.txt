@@ -186,9 +186,6 @@ endforeach()
 
 # Add executable
 add_library(vkop ${SRC_FILES})
-message(${SRC_FILES})
-
-# Ensure whole-archive is used when linking vkop
 
 # Add generated headers to the target
 add_custom_target(compile_shaders DEPENDS ${SPIRV_HEADERS})

@@ -1270,7 +1270,8 @@ def quantize_to_int8_weight_only(vk_model):
                         node['attributes'] = {}
 
                     # Add scale as attribute to the node
-                    scale_value = float(scale) if hasattr(scale, 'item') else float(scale)
+                    scale_value = float(scale.item()) if hasattr(scale, 'item') else float(scale)
+                    node['attributes']["scale"] = scale_value
             else:
                 # For array scales, create initializer and add as input
                 scale_name = f"{name}_scale"

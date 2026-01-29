@@ -1,7 +1,7 @@
 
 ### 项目介绍
 
-vkop 是一个基于 Vulkan 实现的迷你AI推理引擎, 运行时逻辑不足千行.
+vkop 是一个基于 Vulkan 实现的迷你AI推理引擎, 仅在GPU上运行.
 
 ### 如何使用
 
@@ -23,10 +23,7 @@ pip install onnx onnx-simplifier onnxsim onnxruntime
 pip install torchvision
 ```
 
-对于测试依赖torch
-```
-pip install torch
-```
+对于测试依赖libtorch, cmake过程自动下载解压
 
 #### 2. 环境设置
 设置 Vulkan ICD 加载器，以 NVIDIA 为例：
@@ -100,10 +97,7 @@ For benchmarking models:
 pip install torchvision
 ```
 
-For testing dependencies:
-```bash
-pip install torch
-```
+For testing dependencies, libtorch is downloaded and extracted automatically during the cmake process.
 
 #### 2. Environment Setup
 Set up the Vulkan ICD loader, using NVIDIA as an example:
