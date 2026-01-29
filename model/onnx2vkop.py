@@ -1263,30 +1263,19 @@ def quantize_to_int8_weight_only(vk_model):
             scale_size = scale.size if hasattr(scale, 'size') else 1
             scale_is_scalar = np.isscalar(scale) or scale_size == 1
 
-            if scale_is_scalar:
-                # For scalar scales, store as attribute
-                for node in consumers:
-                    if 'attributes' not in node:
-                        node['attributes'] = {}
+            scale_name = f"{name}_scale"
+            scale_initializer = numpy_helper.from_array(scale, scale_name)
+            scale_initializer.data_type = onnx.TensorProto.FLOAT
+            vk_model.initializers[scale_name] = scale_initializer
 
-                    # Add scale as attribute to the node
-                    scale_value = float(scale.item()) if hasattr(scale, 'item') else float(scale)
-                    node['attributes']["scale"] = scale_value
-            else:
-                # For array scales, create initializer and add as input
-                scale_name = f"{name}_scale"
-                scale_initializer = numpy_helper.from_array(scale, scale_name)
-                scale_initializer.data_type = onnx.TensorProto.FLOAT
-                vk_model.initializers[scale_name] = scale_initializer
-
-                # Add scale as input to the nodes that consume the original initializer
-                for node in consumers:
-                    # Add scale tensor as an additional input
-                    scale_input = {
-                        'name': scale_name,
-                        'shape': list(scale.shape) if hasattr(scale, 'shape') else []
-                    }
-                    node['inputs'].append(scale_input)
+            # Add scale as input to the nodes that consume the original initializer
+            for node in consumers:
+                # Add scale tensor as an additional input
+                scale_input = {
+                    'name': scale_name,
+                    'shape': list(scale.shape) if hasattr(scale, 'shape') else []
+                }
+                node['inputs'].append(scale_input)
 
             print(f"Converted FP32 tensor '{name}' to INT8 with scale tensor '{scale_name}' ({reason})")
             print(f"Original shape: {initializer.dims}, scale shape: {scale_initializer.dims}")

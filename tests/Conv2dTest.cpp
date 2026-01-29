@@ -333,6 +333,7 @@ int main() {
         {{2, 4, 10, 10}, 3, 2, 1, 1, 1, 8},   // Batch size > 1
         {{1, 8, 6, 6}, 2, 1, 0, 4, 2, 4},     // Dilated convolution
         {{1, 16, 5, 5}, 1, 1, 0, 1, 1, 32},   // 1x1 convolution
+        {{1, 16, 5, 5}, 1, 1, 0, 16, 1, 32},   // 1x1 group convolution
 
         {{1, 1, 224, 224}, 3, 1, 1, 1, 1, 32}, // Large input typical in CNNs
         {{4, 3, 32, 32}, 3, 1, 1, 1, 1, 16},   // Larger batch size

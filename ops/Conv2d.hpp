@@ -42,7 +42,6 @@ struct alignas(16) GPUConv2dParam {
     int activation;
 
     int accuracy; // only for conv para, 0 : fp32, 1 : fp16, 2: int8
-    float scale;
 };
 
 } // namespace conv2d
@@ -147,10 +146,6 @@ class Conv2d : public Operator {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
             }
-        }
-
-        if (attributes.find("scale") != attributes.end()) {
-            scale_ = std::stof(attributes.at("scale"));
         }
     }
 
@@ -260,10 +255,6 @@ class Conv2d : public Operator {
         para.pack = inputs[1]->get_pack() ? 1 : 0;
         para.activation = static_cast<int>(activation_);
         para.accuracy = accuracy;
-        if (scale_ != 1.0F) {
-            para.accuracy = 3;
-        }
-        para.scale = scale_;
 
         submit(&para, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
@@ -279,7 +270,6 @@ class Conv2d : public Operator {
     std::vector<int> pads_ = {0, 0};
     std::vector<int> dilations_ = {1, 1};
     int groups_ = 1;
-    float scale_ = 1.0F;
 
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
 }; // namespace ops

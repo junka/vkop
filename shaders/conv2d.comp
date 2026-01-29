@@ -36,7 +36,6 @@ layout(push_constant) uniform constBuffer {
     int activation;
 
     int accuracy;
-    float scale;
 } uConstant;
 
 // support both accuracy and fp32 initializer
@@ -128,11 +127,6 @@ void conv1x1() {
                         w1 *= FLOAT(scale_vec[1]);
                         w2 *= FLOAT(scale_vec[2]);
                         w3 *= FLOAT(scale_vec[3]);
-                    } else if (uConstant.accuracy == 3) {
-                        w0 *= uConstant.scale * 127.0;
-                        w1 *= uConstant.scale * 127.0;
-                        w2 *= uConstant.scale * 127.0;
-                        w3 *= uConstant.scale * 127.0;
                     }
 
                     acc_local.x += dot(x_vec, w0);
@@ -160,8 +154,6 @@ void conv1x1() {
                     if (uConstant.accuracy == 2) {
                         FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                         w_vec *= scale_vec * 127.0;
-                    } else if (uConstant.accuracy == 3) {
-                        w_vec *= uConstant.scale * 127.0;
                     }
                     acc_local += x * w_vec;
                 }
@@ -185,8 +177,6 @@ void conv1x1() {
                         FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(v, oc, 0), 0));
                         if (uConstant.accuracy == 2) {
                             w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                        } else if (uConstant.accuracy == 3) {
-                            w_vec *= uConstant.scale * 127.0;
                         }
                         sum += dot(x_vec, w_vec);
                     }
@@ -203,8 +193,6 @@ void conv1x1() {
                         FLOAT w = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc, 0), 0)[kernel_comp]);
                         if (uConstant.accuracy == 2) {
                             w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                        } else if (uConstant.accuracy == 3) {
-                            w *= uConstant.scale * 127.0;
                         }
                         sum += x * w;
                     }
@@ -239,11 +227,6 @@ void conv1x1() {
                         w1 *= scale_vec;
                         w2 *= scale_vec;
                         w3 *= scale_vec;
-                    } else if (uConstant.accuracy == 3) {
-                        w0 *= uConstant.scale * 127.0;
-                        w1 *= uConstant.scale * 127.0;
-                        w2 *= uConstant.scale * 127.0;
-                        w3 *= uConstant.scale * 127.0;
                     }
 
                     acc_local += x_vec.x * w0;
@@ -265,8 +248,6 @@ void conv1x1() {
                     if (uConstant.accuracy == 2) {
                         vec4 scale_vec = texelFetch(uScalePara, c4) * float(127.0);
                         w_vec *= scale_vec;
-                    } else if (uConstant.accuracy == 3) {
-                        w_vec *= uConstant.scale * 127.0;
                     }
                     acc_local += x * w_vec;
                 }
@@ -297,8 +278,6 @@ void conv1x1() {
                         if (uConstant.accuracy == 2) {
                             FLOAT scale = FLOAT(texelFetch(uScalePara, c4)[comp]) * 127.0;
                             w_vec *= scale;
-                        } else if (uConstant.accuracy == 3) {
-                            w_vec *= uConstant.scale * 127.0;
                         }
                         sum += dot(x_vec, w_vec);
                     }
@@ -313,8 +292,6 @@ void conv1x1() {
                         FLOAT w = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0)[comp]);
                         if (uConstant.accuracy == 2) {
                             w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                        } else if (uConstant.accuracy == 3) {
-                            w *= uConstant.scale * 127.0;
                         }
                         sum += x * w;
                     }
@@ -413,11 +390,6 @@ void grouped_conv2d() {
                                 w1 *= scale_vec;
                                 w2 *= scale_vec;
                                 w3 *= scale_vec;
-                            } else if (uConstant.accuracy == 3) {
-                                w0 *= uConstant.scale * 127.0;
-                                w1 *= uConstant.scale * 127.0;
-                                w2 *= uConstant.scale * 127.0;
-                                w3 *= uConstant.scale * 127.0;
                             }
 
                             acc_local += x_vec.x * w0;
@@ -438,8 +410,6 @@ void grouped_conv2d() {
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                                 w_vec *= scale_vec * FLOAT(127.0);
-                            } else if (uConstant.accuracy == 3) {
-                                w_vec *= uConstant.scale * 127.0;
                             }
 
                             acc_local += x * w_vec;
@@ -474,8 +444,6 @@ void grouped_conv2d() {
                             FLOAT w = FLOAT(texelFetch(uKernel, ivec3(kx, ky + local_ci * K_H, c4), 0)[comp]);
                             if (uConstant.accuracy == 2) {
                                 w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                            } else if (uConstant.accuracy == 3) {
-                                w *= uConstant.scale * 127.0;
                             }
 
                             sum += x * w;
@@ -521,11 +489,6 @@ void grouped_conv2d() {
                                 w1 *= scale_vec[1];
                                 w2 *= scale_vec[2];
                                 w3 *= scale_vec[3];
-                            } else if (uConstant.accuracy == 3) {
-                                w0 *= uConstant.scale * 127.0;
-                                w1 *= uConstant.scale * 127.0;
-                                w2 *= uConstant.scale * 127.0;
-                                w3 *= uConstant.scale * 127.0;
                             }
 
                             // Broadcast x_vec and multiply per-output-channel weights
@@ -554,8 +517,6 @@ void grouped_conv2d() {
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4) * 127.0);
                                 w_vec *= scale_vec;
-                            } else if (uConstant.accuracy == 3) {
-                                w_vec *= uConstant.scale * 127.0;
                             }
                             acc_local += x * w_vec;
                         }
@@ -598,8 +559,6 @@ void grouped_conv2d() {
                                 FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0));
                                 if (uConstant.accuracy == 2) {
                                     w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                                } else if (uConstant.accuracy == 3) {
-                                    w_vec *= uConstant.scale * 127.0;
                                 }
                                 sum4 += x_vec * w_vec;
                             }
@@ -625,8 +584,6 @@ void grouped_conv2d() {
                                 FLOAT w = weight_vec[local_ic_comp];
                                 if (uConstant.accuracy == 2) {
                                     w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
-                                } else if (uConstant.accuracy == 3) {
-                                    w *= uConstant.scale * 127.0;
                                 }
 
                                 sum += input_val * w;

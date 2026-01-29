@@ -197,10 +197,6 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 
 add_subdirectory(model)
 
-add_executable(vkopmain main.cpp)
-target_link_libraries(vkopmain vkop vload)
-
-
 find_program(CLANG_FORMAT "clang-format")
 if(NOT CLANG_FORMAT)
   message(WARNING "clang-format not found, formatting step will be skipped.")
@@ -212,7 +208,7 @@ else()
     COMMENT "Formatting all C++ source and header files..."
   )
 
-  add_dependencies(vkopmain format-code)
+  add_dependencies(vkop format-code)
 endif()
 
 find_program(CPPLINT "cpplint")
@@ -225,7 +221,7 @@ else()
         WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
         COMMENT "Running cpplint on all C++ source and header files..."
     )
-    # add_dependencies(vkopmain lint-code)
+    # add_dependencies(vkop lint-code)
 endif()
 
 option(USE_VALIDATION_LAYERS "Enable validation layers" OFF)
