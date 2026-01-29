@@ -39,7 +39,11 @@ source path/to/VulkanSDK/setup-env.sh
 #### 3. 编译项目
 
 ```
-cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+```
+如果是交叉编译，需要设置交叉编译环境变量，借鉴参考toolchain.cmake
+```
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 ```
 
 #### 4. 模型转换
@@ -69,7 +73,7 @@ options:
 ```
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
-支持将postproc 手动注册到gpu 处理，比如softmax，topk减少内存带宽
+支持将postproc 手动注册到gpu 处理，比如softmax，topk减少CPU与GPU间的内存吞吐
 
 ---
 
@@ -112,7 +116,11 @@ source path/to/VulkanSDK/setup-env.sh
 
 #### 3. Compilation
 ```bash
-cmake .. -DENABLE_TESTS=ON -DPython3_EXECUTABLE=.venv/bin/python3.13 -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=OFF -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+```
+If you are cross-compiling, set up the cross-compilation environment variables, based on toolchain.cmake:
+```
+cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 ```
 
 #### 4. Model Conversion
@@ -141,5 +149,5 @@ options:
 ```bash
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
-Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory bandwidth.
+Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU.
 

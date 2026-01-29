@@ -12,6 +12,10 @@ convert models to vkopbin
 ```
 python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
 ```
+quantize model
+```
+python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx -q int8
+```
 
 
 | GPU | Model | Operators |Precision | latency (ms) |
@@ -49,6 +53,7 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
 | T2000| resnet18 | 41 | fp16 | 17.04 |
 | T2000| resnet34 | 73 | fp16 | 30.03 |
 | T2000| resnet50 | 90 | fp16 | 35.30 |
+| Tegra Orin| resnet18 | 41 | int8 | 10.93 |
 
 ## 模型转换
 ```
