@@ -1,6 +1,7 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanLib.hpp"
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <vector>
@@ -48,33 +49,45 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     VkPhysicalDeviceProperties2 properties2 = {};
     properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
 
+    VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
+    subgroup_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+    subgroup_properties.pNext = nullptr;
+
+#ifdef VK_NV_cuda_kernel_launch
+    VkPhysicalDeviceCudaKernelLaunchPropertiesNV cuda_properties = {};
+    cuda_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_PROPERTIES_NV;
+    cuda_properties.pNext = &subgroup_properties;
+    properties2.pNext = &cuda_properties;
+#else
+    properties2.pNext = &subgroup_properties;
+#endif
+
 #ifdef VK_EXT_host_image_copy
     VkPhysicalDeviceHostImageCopyProperties hostimagecopyproperty = {};
     hostimagecopyproperty.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES;
-    hostimagecopyproperty.pNext = nullptr;
 
-    properties2.pNext = &hostimagecopyproperty;
-
-    vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
-    this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
-    this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
-    hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
-    hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
-#endif
-
-    VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
-    subgroup_properties.sType =
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-#ifdef VK_EXT_host_image_copy
-    subgroup_properties.pNext = &hostimagecopyproperty;
+#ifdef VK_NV_cuda_kernel_launch
+    cuda_properties.pNext = &hostimagecopyproperty;
+    hostimagecopyproperty.pNext = &subgroup_properties;
 #else
-    subgroup_properties.pNext = nullptr;
+    subgroup_properties.pNext = &hostimagecopyproperty;
+    hostimagecopyproperty.pNext = nullptr;
+#endif
 #endif
 
-    properties2.pNext = &subgroup_properties;
-
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+
+#ifdef VK_EXT_host_image_copy
+    if (hostimagecopyproperty.copySrcLayoutCount > 0) {
+        this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
+        this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
+        hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
+        hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
+    }
+#endif
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
     this->maxImageArrayLayers_ =
         properties2.properties.limits.maxImageArrayLayers;
@@ -88,6 +101,13 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         LOG_INFO("Device support subgroup arithmetic");
         LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
     }
+
+#ifdef VK_NV_cuda_kernel_launch
+    LOG_INFO("CUDA kernel launch compute capability %u.%u",
+             cuda_properties.computeCapabilityMajor,
+             cuda_properties.computeCapabilityMinor);
+#endif
+
     return properties2.properties;
 }
 
@@ -195,9 +215,17 @@ bool VulkanDevice::createLogicalDevice(
     timeline_features.pNext = &devicefloat16_int8_features;
 #endif
 #endif
+#if VK_NV_cuda_kernel_launch
+    VkPhysicalDeviceCudaKernelLaunchFeaturesNV cuda_features{};
+    cuda_features.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV;
+    cuda_features.pNext = &timeline_features;
+#endif
     VkPhysicalDeviceFeatures2 features2 = {};
     features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-#if VK_KHR_timeline_semaphore
+#if VK_NV_cuda_kernel_launch
+    features2.pNext = &cuda_features;
+#elif VK_KHR_timeline_semaphore
     features2.pNext = &timeline_features;
 #elif VK_KHR_buffer_device_address
     features2.pNext = &buffer_device_address_features;
@@ -206,6 +234,12 @@ bool VulkanDevice::createLogicalDevice(
 #endif
 
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &features2);
+#if VK_NV_cuda_kernel_launch
+    if (cuda_features.cudaKernelLaunchFeatures) {
+        m_support_cuda_kernel_launch_ = true;
+        LOG_INFO("CUDA kernel launch supported");
+    }
+#endif
 #if VK_KHR_timeline_semaphore
     if (timeline_features.timelineSemaphore == VK_TRUE) {
         m_support_timeline_semaphore_ = true;
@@ -265,9 +299,9 @@ bool VulkanDevice::createLogicalDevice(
     host_image_copy_features.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT;
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME)) {
+                                    vk::EXTHostImageCopyExtensionName)) {
         host_image_copy_features.hostImageCopy = VK_TRUE;
-        enabled_extensions.push_back(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+        enabled_extensions.push_back(vk::EXTHostImageCopyExtensionName);
         enabled_features.push_back(
             reinterpret_cast<uintptr_t>(&host_image_copy_features));
         m_support_host_image_copy_ = true;
@@ -276,8 +310,8 @@ bool VulkanDevice::createLogicalDevice(
     if (devicefloat16_int8_features.shaderInt8) {
         float16_int8_features.shaderInt8 = VK_TRUE;
         if (checkDeviceExtensionFeature(ext_properties,
-                                        VK_KHR_8BIT_STORAGE_EXTENSION_NAME)) {
-            enabled_extensions.push_back(VK_KHR_8BIT_STORAGE_EXTENSION_NAME);
+                                        vk::KHR8BitStorageExtensionName)) {
+            enabled_extensions.push_back(vk::KHR8BitStorageExtensionName);
             enabled_features.push_back(
                 reinterpret_cast<uintptr_t>(&storage8bit_features));
         }
@@ -285,8 +319,8 @@ bool VulkanDevice::createLogicalDevice(
     if (devicefloat16_int8_features.shaderFloat16) {
         float16_int8_features.shaderFloat16 = VK_TRUE;
         if (checkDeviceExtensionFeature(ext_properties,
-                                        VK_KHR_16BIT_STORAGE_EXTENSION_NAME)) {
-            enabled_extensions.push_back(VK_KHR_16BIT_STORAGE_EXTENSION_NAME);
+                                        vk::KHR16BitStorageExtensionName)) {
+            enabled_extensions.push_back(vk::KHR16BitStorageExtensionName);
             if (deviceProperties.vendorID != 4318) {
                 // tested on Nvidia A2000, it supports 16bit storage feature but
                 // did not need to enable it. enable will cause validation
@@ -311,20 +345,18 @@ bool VulkanDevice::createLogicalDevice(
     if (devicefloat16_int8_features.shaderFloat16 ||
         devicefloat16_int8_features.shaderInt8) {
         if (checkDeviceExtensionFeature(
-                ext_properties, VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME)) {
+                ext_properties, vk::KHRShaderFloat16Int8ExtensionName)) {
             enabled_features.push_back(
                 reinterpret_cast<uintptr_t>(&float16_int8_features));
-            enabled_extensions.push_back(
-                VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME);
+            enabled_extensions.push_back(vk::KHRShaderFloat16Int8ExtensionName);
         }
     }
 #ifdef VK_KHR_shader_integer_dot_product
     if (integer_dot_product_features.shaderIntegerDotProduct) {
         if (checkDeviceExtensionFeature(
-                ext_properties,
-                VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME)) {
+                ext_properties, vk::KHRShaderIntegerDotProductExtensionName)) {
             enabled_extensions.push_back(
-                VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME);
+                vk::KHRShaderIntegerDotProductExtensionName);
             enabled_features.push_back(reinterpret_cast<uintptr_t>(
                 &shader_integer_dot_product_features));
         }
@@ -332,8 +364,8 @@ bool VulkanDevice::createLogicalDevice(
 #endif
 #if VK_KHR_bind_memory2
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_BIND_MEMORY_2_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_BIND_MEMORY_2_EXTENSION_NAME);
+                                    vk::KHRBindMemory2ExtensionName)) {
+        enabled_extensions.push_back(vk::KHRBindMemory2ExtensionName);
     }
 #endif
 #if VK_KHR_shader_non_semantic_info
@@ -342,51 +374,47 @@ bool VulkanDevice::createLogicalDevice(
     "VK_KHR_shader_non_semantic_info"
 #endif
     if (checkDeviceExtensionFeature(
-            ext_properties, VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME)) {
-        enabled_extensions.push_back(
-            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+            ext_properties, vk::KHRShaderNonSemanticInfoExtensionName)) {
+        enabled_extensions.push_back(vk::KHRShaderNonSemanticInfoExtensionName);
     }
 #endif
 #if VK_KHR_get_physical_device_properties2
     if (checkDeviceExtensionFeature(
-            ext_properties,
-            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
+            ext_properties, vk::KHRGetPhysicalDeviceProperties2ExtensionName)) {
         enabled_extensions.push_back(
-            VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
+            vk::KHRGetPhysicalDeviceProperties2ExtensionName);
     }
 #endif
 #if VK_KHR_get_memory_requirements2
     if (checkDeviceExtensionFeature(
-            ext_properties, VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME)) {
+            ext_properties, vk::KHRGetMemoryRequirements2ExtensionName)) {
         enabled_extensions.push_back(
-            VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
+            vk::KHRGetMemoryRequirements2ExtensionName);
     }
 #endif
 
 #if VK_KHR_format_feature_flags2
-    if (checkDeviceExtensionFeature(
-            ext_properties, VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME)) {
-        enabled_extensions.push_back(
-            VK_KHR_FORMAT_FEATURE_FLAGS_2_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::KHRFormatFeatureFlags2ExtensionName)) {
+        enabled_extensions.push_back(vk::KHRFormatFeatureFlags2ExtensionName);
     }
 #endif
 #if VK_KHR_copy_commands2
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_COPY_COMMANDS_2_EXTENSION_NAME);
+                                    vk::KHRCopyCommands2ExtensionName)) {
+        enabled_extensions.push_back(vk::KHRCopyCommands2ExtensionName);
     }
 #endif
 #if VK_EXT_tooling_info
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_EXT_TOOLING_INFO_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+                                    vk::EXTToolingInfoExtensionName)) {
+        enabled_extensions.push_back(vk::EXTToolingInfoExtensionName);
     }
 #endif
 #if VK_EXT_subgroup_size_control
-    if (checkDeviceExtensionFeature(
-            ext_properties, VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME)) {
-        enabled_extensions.push_back(
-            VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::EXTSubgroupSizeControlExtensionName)) {
+        enabled_extensions.push_back(vk::EXTSubgroupSizeControlExtensionName);
     }
 #endif
 #ifdef VK_EXT_image_robustness
@@ -394,43 +422,42 @@ bool VulkanDevice::createLogicalDevice(
     imagerobustfeature.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES;
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME)) {
+                                    vk::EXTImageRobustnessExtensionName)) {
         imagerobustfeature.robustImageAccess = VK_TRUE;
         enabled_features.push_back(
             reinterpret_cast<uintptr_t>(&imagerobustfeature));
-        enabled_extensions.push_back(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME);
+        enabled_extensions.push_back(vk::EXTImageRobustnessExtensionName);
     }
 #endif
 #if VK_KHR_external_memory_fd
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+                                    vk::KHRExternalMemoryFdExtensionName)) {
+        enabled_extensions.push_back(vk::KHRExternalMemoryFdExtensionName);
     }
 #endif
     // follow up extensions are for vma allocator
 #if VK_KHR_dedicated_allocation
-    if (checkDeviceExtensionFeature(
-            ext_properties, VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME)) {
-        enabled_extensions.push_back(
-            VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::KHRDedicatedAllocationExtensionName)) {
+        enabled_extensions.push_back(vk::KHRDedicatedAllocationExtensionName);
     }
 #endif
 #if VK_KHR_maintenance4
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_MAINTENANCE_4_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_MAINTENANCE_4_EXTENSION_NAME);
+                                    vk::KHRMaintenance4ExtensionName)) {
+        enabled_extensions.push_back(vk::KHRMaintenance4ExtensionName);
     }
 #endif
 #if VK_KHR_maintenance5
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_MAINTENANCE_5_EXTENSION_NAME);
+                                    vk::KHRMaintenance5ExtensionName)) {
+        enabled_extensions.push_back(vk::KHRMaintenance5ExtensionName);
     }
 #endif
 #if VK_EXT_memory_budget
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_EXT_MEMORY_BUDGET_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+                                    vk::EXTMemoryBudgetExtensionName)) {
+        enabled_extensions.push_back(vk::EXTMemoryBudgetExtensionName);
     }
 #endif
 #if VK_KHR_buffer_device_address
@@ -441,11 +468,10 @@ bool VulkanDevice::createLogicalDevice(
     physical_device_buffer_device_address_features.bufferDeviceAddress =
         VK_TRUE;
 
-    if (checkDeviceExtensionFeature(
-            ext_properties, VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) &&
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::KHRBufferDeviceAddressExtensionName) &&
         buffer_device_address_features.bufferDeviceAddress) {
-        enabled_extensions.push_back(
-            VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME);
+        enabled_extensions.push_back(vk::KHRBufferDeviceAddressExtensionName);
         m_support_buffer_device_address_ = true;
         enabled_features.push_back(reinterpret_cast<uintptr_t>(
             &physical_device_buffer_device_address_features));
@@ -453,15 +479,14 @@ bool VulkanDevice::createLogicalDevice(
 #endif
 #if VK_EXT_memory_priority
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+                                    vk::EXTMemoryPriorityExtensionName)) {
+        enabled_extensions.push_back(vk::EXTMemoryPriorityExtensionName);
     }
 #endif
 #if VK_AMD_device_coherent_memory
-    if (checkDeviceExtensionFeature(
-            ext_properties, VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME)) {
-        enabled_extensions.push_back(
-            VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME);
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::AMDDeviceCoherentMemoryExtensionName)) {
+        enabled_extensions.push_back(vk::AMDDeviceCoherentMemoryExtensionName);
     }
 #endif
 #ifdef VK_KHR_timeline_semaphore
@@ -474,21 +499,20 @@ bool VulkanDevice::createLogicalDevice(
 #endif
 #ifdef VK_KHR_performance_query
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME);
+                                    vk::KHRPerformanceQueryExtensionName)) {
+        enabled_extensions.push_back(vk::KHRPerformanceQueryExtensionName);
     }
 #endif
 #if defined VK_KHR_cooperative_matrix || defined VK_NV_cooperative_matrix
 #if defined VK_KHR_cooperative_matrix
     if (checkDeviceExtensionFeature(ext_properties,
-                                    VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
-        enabled_extensions.push_back(VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME);
+                                    vk::KHRCooperativeMatrixExtensionName)) {
+        enabled_extensions.push_back(vk::KHRCooperativeMatrixExtensionName);
     } else {
 #endif
-        if (checkDeviceExtensionFeature(
-                ext_properties, VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME)) {
-            enabled_extensions.push_back(
-                VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME);
+        if (checkDeviceExtensionFeature(ext_properties,
+                                        vk::NVCooperativeMatrixExtensionName)) {
+            enabled_extensions.push_back(vk::NVCooperativeMatrixExtensionName);
             uint32_t nv_cooperativematrix_cnt = 0;
             auto vkGetPhysicalDeviceCooperativeMatrixPropertiesNV =
                 reinterpret_cast<
@@ -524,6 +548,12 @@ bool VulkanDevice::createLogicalDevice(
     }
 #endif
 #endif
+#ifdef VK_NV_cuda_kernel_launch
+    if (checkDeviceExtensionFeature(ext_properties,
+                                    vk::NVCudaKernelLaunchExtensionName)) {
+        enabled_extensions.push_back(vk::NVCudaKernelLaunchExtensionName);
+    }
+#endif
     struct GeneralFeature {
         VkStructureType sType;
         void *pNext;
@@ -546,10 +576,10 @@ bool VulkanDevice::createLogicalDevice(
     for (size_t i = 0; i < computeQueueIdxs_.size(); i++) {
         auto [qidx, queue_count, queueflags] = computeQueueIdxs_[i];
         LOG_INFO("queue count %d", queue_count);
-        if (queue_count >= (kInflight + 1) / 2) {
-            // reserve queues from one familiy
-            queue_count = (kInflight + 1) / 2;
-        }
+        queue_count = std::min<
+            std::tuple_element<1, class std::tuple<unsigned int, unsigned int,
+                                                   unsigned int>>::type>(
+            queue_count, (kInflight + 1) / 2);
         queue_priority[i].resize(queue_count);
         std::fill(queue_priority[i].begin(), queue_priority[i].end(), 1.0F);
         queue_create_info[i].sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -582,9 +612,10 @@ bool VulkanDevice::createLogicalDevice(
     }
 
     for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {
-        if (queue_count >= (kInflight + 1) / 2) {
-            queue_count = (kInflight + 1) / 2;
-        }
+        queue_count = std::min<
+            std::tuple_element<1, class std::tuple<unsigned int, unsigned int,
+                                                   unsigned int>>::type>(
+            queue_count, (kInflight + 1) / 2);
         for (uint32_t i = 0; i < queue_count; i++) {
             VkQueue queue;
             vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
@@ -597,7 +628,7 @@ bool VulkanDevice::createLogicalDevice(
 
 bool VulkanDevice::checkDeviceExtensionFeature(
     const std::vector<VkExtensionProperties> &ext_properties,
-    const char *name) const {
+    const char *name) {
     for (auto ext : ext_properties) {
         if (std::string(ext.extensionName) == name) {
             return true;

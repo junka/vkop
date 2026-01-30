@@ -9,8 +9,6 @@
 #include <cstdint>
 #include <memory>
 
-#include <vulkan/vulkan_core.h>
-
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Tensor;

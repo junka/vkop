@@ -3,7 +3,6 @@
 #include "VulkanLib.hpp"
 #include "VulkanResource.hpp"
 #include <stdexcept>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,

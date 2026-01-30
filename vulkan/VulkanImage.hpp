@@ -5,7 +5,6 @@
 #include <cstdint>
 #include <memory>
 #include <variant>
-#include <vulkan/vulkan_core.h>
 
 #include "vulkan/VulkanResource.hpp"
 namespace vkop {

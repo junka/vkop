@@ -59,9 +59,8 @@ class VulkanDevice {
 
     uint32_t findComputeQueueFamily();
 
-    bool checkDeviceExtensionFeature(
-        const std::vector<VkExtensionProperties> &properties,
-        const char *name) const;
+    static bool checkDeviceExtensionFeature(
+        const std::vector<VkExtensionProperties> &properties, const char *name);
 
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);
@@ -103,6 +102,9 @@ class VulkanDevice {
     bool is_support_timeline_semaphore() const {
         return m_support_timeline_semaphore_;
     }
+    bool is_support_cuda_kernel_launch() const {
+        return m_support_cuda_kernel_launch_;
+    }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -117,6 +119,7 @@ class VulkanDevice {
     bool m_support_host_image_copy_ = false;
     bool m_support_buffer_device_address_ = false;
     bool m_support_timeline_semaphore_ = false;
+    bool m_support_cuda_kernel_launch_ = false;
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
 

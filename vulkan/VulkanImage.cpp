@@ -3,7 +3,6 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <cassert>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 

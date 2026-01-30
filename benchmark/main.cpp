@@ -1,6 +1,7 @@
 #include "ops/Ops.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
+#include "vulkan/VulkanCudaLaunch.hpp"
 
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"

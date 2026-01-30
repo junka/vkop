@@ -11,7 +11,6 @@
 #include <vector>
 #include <cmath>
 
-#include <vulkan/vulkan_core.h>
 #include "setup.hpp"
 
 using vkop::VulkanInstance;

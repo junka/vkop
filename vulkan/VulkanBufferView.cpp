@@ -2,7 +2,6 @@
 #include "VulkanBufferView.hpp"
 #include "VulkanLib.hpp"
 #include <stdexcept>
-#include <vulkan/vulkan_core.h>
 
 namespace vkop {
 

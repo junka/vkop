@@ -4,7 +4,6 @@
 
 #include <variant>
 #include <vulkan/vulkan.hpp>
-#include <vulkan/vulkan_core.h>
 
 #include "vulkan/VulkanResource.hpp"
 

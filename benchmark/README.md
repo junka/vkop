@@ -53,7 +53,10 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx -q int8
 | T2000| resnet18 | 41 | fp16 | 17.04 |
 | T2000| resnet34 | 73 | fp16 | 30.03 |
 | T2000| resnet50 | 90 | fp16 | 35.30 |
+| Tegra Orin| resnet18 | 41 | fp32 | 14.76 |
+| Tegra Orin| resnet18 | 41 | fp16 | 11.38 |
 | Tegra Orin| resnet18 | 41 | int8 | 10.93 |
+| Tegra Orin| resnet50 | 72 | fp16 | 26.61 |
 
 ## 模型转换
 ```
