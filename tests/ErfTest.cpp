@@ -1,5 +1,6 @@
 #include <vector>
 #include <random>
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <stack>
 
@@ -16,18 +17,17 @@ double integrand(double t) {
     return exp(-t * t);
 }
 
-// 自适应辛普森积分法
 double adaptive_simpsons(
-    double (*f)(double),   // 被积函数
-    double a,              // 积分下限
-    double b,              // 积分上限
-    double eps,            // 容许误差
-    double max_recursion,  // 最大递归深度
-    double s,              // 初始积分值
-    double fa,             // f(a)
-    double fb,             // f(b)
-    double fc,             // f((a+b)/2)
-    int depth              // 当前递归深度
+    double (*f)(double),
+    double a,
+    double b,
+    double eps,
+    double max_recursion,
+    double s,
+    double fa,
+    double fb,
+    double fc,
+    int depth
 ) {
     struct Interval {
         double a, b, fa, fb, fc, s;
@@ -66,7 +66,6 @@ double adaptive_simpsons(
     return total;
 }
 
-// 初始调用接口
 double integrate(double (*f)(double), double a, double b, double eps, double max_recursion) {
     double c = (a + b) / 2;
     double fa = f(a);
@@ -77,10 +76,9 @@ double integrate(double (*f)(double), double a, double b, double eps, double max
     return adaptive_simpsons(f, a, b, eps, max_recursion, s, fa, fb, fc, 0);
 }
 
-// erf(x) 基于数值积分实现
 double erf(double x) {
-    const double eps = 1e-8;       // 控制积分误差
-    const double max_recursion = 20; // 控制递归深度
+    const double eps = 1e-8;
+    const double max_recursion = 20;
 
     if (x == 0.0) {
         return 0.0;

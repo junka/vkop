@@ -100,7 +100,8 @@ namespace vkop {
     PFN(vkCmdPushConstants)                                                    \
     PFN(vkWaitSemaphores)                                                      \
     PFN(vkResetFences)                                                         \
-    PFN(vkCmdExecuteCommands)
+    PFN(vkCmdExecuteCommands)                                                  \
+    PFN(vkGetPhysicalDeviceImageFormatProperties)
 
 class VulkanLib {
   public:

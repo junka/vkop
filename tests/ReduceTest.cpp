@@ -24,7 +24,6 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
     const int ndim = static_cast<int>(input->num_dims());
     assert(ndim >= 2 && ndim <= 4); // 2D~4D
 
-    // 规范化 axes（支持负索引）
     std::vector<int> axes = axes_input;
     for (int& ax : axes) {
         if (ax < 0) ax += ndim;
@@ -36,9 +35,8 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
     std::vector<bool> is_reduced(ndim, false);
     for (int ax : axes) is_reduced[ax] = true;
 
-    // 构建输出 shape
     std::vector<int64_t> out_shape;
-    int64_t reduced_size = 1; // 被规约维度的总元素数（用于 MEAN）
+    int64_t reduced_size = 1;
     for (int i = 0; i < ndim; ++i) {
         if (is_reduced[i]) {
             reduced_size *= input->getShape()[i];
@@ -69,7 +67,6 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
 
     // For each output position, calculate the corresponding input positions to reduce
     for (size_t out_idx_flat = 0; out_idx_flat < out_numel; ++out_idx_flat) {
-        // 将 flat 输出索引转为多维坐标
         std::vector<int64_t> out_coord(out_shape.size());
         size_t tmp = out_idx_flat;
         for (int i = static_cast<int>(out_shape.size()) - 1; i >= 0; --i) {
@@ -77,7 +74,6 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
             tmp /= out_shape[i];
         }
 
-        // 构建输入 base 坐标，将输出坐标映射到输入的非规约维度
         std::vector<int64_t> in_coord(ndim, 0);
         int out_dim_idx = 0;
         for (int i = 0; i < ndim; ++i) {
@@ -92,23 +88,21 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
             }
         }
 
-        // 初始化 accumulator
+        // accumulator
         double acc = 0.0;
         bool first = true;
         float max_val_for_logsumexp = -std::numeric_limits<float>::infinity();
 
-        // Step 1: 遍历所有被规约维度的所有可能值
+        // Step 1
         std::function<void(int, std::vector<int64_t>&)> iterate_reduced_dims = 
         [&](int dim, std::vector<int64_t>& current_coord) {
             if (dim == ndim) {
-                // 计算输入线性偏移
                 size_t in_offset = 0;
                 for (int d = 0; d < ndim; ++d) {
                     in_offset += current_coord[d] * in_strides[d];
                 }
                 float val = input->data()[in_offset];
 
-                // 根据 reduce_type 累加
                 switch (reduce_type) {
                     case vkop::ops::reduce::ReduceType::L1:
                         acc += std::abs(val);
@@ -146,13 +140,11 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
             }
 
             if (is_reduced[dim]) {
-                // 遍历这个被规约维度的所有可能值
                 for (int64_t k = 0; k < input->getShape()[dim]; ++k) {
                     current_coord[dim] = k;
                     iterate_reduced_dims(dim + 1, current_coord);
                 }
             } else {
-                // 这个维度不是规约维度，保持其在输出坐标中的值
                 iterate_reduced_dims(dim + 1, current_coord);
             }
         };
@@ -160,7 +152,7 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
         // Start iteration with initial coordinate
         iterate_reduced_dims(0, in_coord);
 
-        // Step 2: 后处理（如 sqrt, mean, logsumexp 等）
+        // Step 2: sqrt, mean, logsumexp 
         if (reduce_type == vkop::ops::reduce::ReduceType::L2) {
             acc = std::sqrt(acc);
         } else if (reduce_type == vkop::ops::reduce::ReduceType::MEAN) {
@@ -168,7 +160,7 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
         } else if (reduce_type == vkop::ops::reduce::ReduceType::LOGSUM) {
             acc = std::log(std::max(acc, 1e-12));  // Take log of sum
         } else if (reduce_type == vkop::ops::reduce::ReduceType::LOGSUMEXP) {
-            // 数值稳定版：log(sum(exp(x))) = m + log(sum(exp(x - m)))
+            // log(sum(exp(x))) = m + log(sum(exp(x - m)))
             double sum_exp = 0.0;
             std::vector<int64_t> temp_coord = in_coord; // Create temporary coordinate vector for re-computation
             

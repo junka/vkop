@@ -16,52 +16,45 @@ using vkop::ops::Softmax;
 namespace {
 
 
+    
+/* When implementing the Softmax function, subtracting the maximum value for numerical stability is a common technique.
+The purpose is to avoid numerical overflow or precision issues when computing exponentials.
+In practice, if the input values x_i are large (e.g., close to 100 or higher), computing 
+exp(x_i) can cause numerical overflow because the exponential function grows extremely rapidly. Conversely, if 
+x_i is very small, exp(x_i) may underflow to zero, leading to loss of precision.
 
-/* 在实现 Softmax 函数时，寻找最大值用于数值稳定性是一个常见的技巧，
-    目的是避免在计算指数时出现数值溢出或精度问题。
-    Softmax 的公式在实际计算中, 如果 x_i 的值很大(例如接近 100 或更高), exp(x_i) 会导致数值溢出,
-    因为指数函数增长非常快. 同样如果 x_i 的值很小, exp(x_i) 可能会接近 0, 导致精度损失.
-
-    最大值的作用
-    通过减去输入向量中的最大值 max_val, 公式变为:
+ y subtracting the maximum value max_val from the input vector, the Softmax formula becomes:
         softmax(x_i) = exp(x_i - max_val) / sum_j exp(x_j - max_val)
 
-    这样做不会改变 Softmax 的结果, 因为减去一个常数不会影响相对比例, 但可以显著提高数值稳定性:
-
-    防止溢出: x_i - max_val 的值会变小, 避免了 exp(x_i) 计算时的溢出.
-    提高精度: 减去最大值后, 输入值的范围更接近 0, 减少了浮点数计算中的精度损失.
+ This transformation does not change the Softmax output, as subtracting a constant from all elements preserves their relative proportions. However, it significantly improves numerical stability:
+    Prevents overflow: : x_i - max_val  the exponentiated values remain bounded (at most 1), avoiding overflow 
+    Improves precision:Shifting the inputs so their maximum is zero centers the values closer to zero, reducing floating-point rounding errors and mitigating underflow for smaller components.
 */
 #if USE_CPP_REFER
 void softmax_nd(const float* input, float* output,
                  int N, int C, int H, int W, int axis) {
     int dims[4] = {N, C, H, W};
 
-    // 验证 axis
     if (axis < 0 || axis >= 4) {
         std::cerr << "Invalid axis: must be in [0, 1, 2, 3]" << std::endl;
         return;
     }
 
-    // 计算 total_groups 和 group_size
     int group_size = dims[axis];
     int total_elements = N * C * H * W;
     int total_groups = total_elements / group_size;
 
-    // 预计算 strides（NCHW 格式）
     int strides[4];
     strides[3] = 1;           // W
     strides[2] = W;           // H
     strides[1] = H * W;       // C
     strides[0] = C * H * W;   // N
 
-    // 遍历每一个 group（即每个非 axis 维度的组合）
     for (int g = 0; g < total_groups; ++g) {
-        // 分解 group index -> (n, c, h, w)，跳过 axis 维度
         int indices[4] = {0};
         int temp = g;
         int skip_dim = axis;
 
-        // 从后往前分解非 axis 维度的索引
         for (int d = 3; d >= 0; --d) {
             if (d == skip_dim) continue;
             int dim_size = dims[d];
@@ -69,15 +62,13 @@ void softmax_nd(const float* input, float* output,
             temp /= dim_size;
         }
 
-        // 找到当前 group 中沿 axis 维度的所有值
         std::vector<float> vals(group_size);
-        std::vector<int>  idxs(group_size); // 存储实际 flat 索引
+        std::vector<int>  idxs(group_size);
 
         for (int i = 0; i < group_size; ++i) {
-            // 设置 axis 维度为 i
             indices[skip_dim] = i;
 
-            // 计算 flat index: n*strides[0] + c*strides[1] + h*strides[2] + w*strides[3]
+            // flat index: n*strides[0] + c*strides[1] + h*strides[2] + w*strides[3]
             int flat_idx = 0;
             for (int d = 0; d < 4; ++d) {
                 flat_idx += indices[d] * strides[d];
@@ -86,14 +77,12 @@ void softmax_nd(const float* input, float* output,
             vals[i] = input[flat_idx];
         }
 
-        // Step 1: 找最大值用于数值稳定
         float max_val = -INFINITY;
         for (int i = 0; i < group_size; ++i) {
             if (vals[i] > max_val)
                 max_val = vals[i];
         }
 
-        // Step 2: 计算 exp(x_i - max_val) 和 sum
         float sum_exp = 0.0F;
         std::vector<float> exp_vals(group_size);
         for (int i = 0; i < group_size; ++i) {
@@ -101,7 +90,6 @@ void softmax_nd(const float* input, float* output,
             sum_exp += exp_vals[i];
         }
 
-        // Step 3: 归一化并写入 output
         for (int i = 0; i < group_size; ++i) {
             output[idxs[i]] = exp_vals[i] / sum_exp;
         }

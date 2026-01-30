@@ -56,62 +56,48 @@ public:
         const std::shared_ptr<Tensor<float>>& bias, std::vector<float>& output, int batch, int ic, int oc,
         int ih, int iw, int pad_h, int pad_w, int kh, int kw, int stride_h, int stride_w,
         int dilation_h, int dilation_w, int group) {
-        // 计算输出张量的高度和宽度
         int oh = ((ih + 2 * pad_h - (kh - 1) * dilation_h - 1) / stride_h) + 1;
         int ow = ((iw + 2 * pad_w - (kw - 1) * dilation_w - 1) / stride_w) + 1;
 
-        // 确保输出通道数和输入通道数可以被组数整除
         assert(oc % group == 0 && ic % group == 0);
 
-        // 如果输出尺寸无效（例如非正值），清空输出并返回
         if (oh <= 0 || ow <= 0) {
             output.clear();
             return;
         }
 
-        // 初始化输出张量的大小
-        output.resize(static_cast<size_t>(batch) * oh * ow * oc); // Ensure proper resizing
+        output.resize(static_cast<size_t>(batch) * oh * ow * oc);
 
-        // 每组的输出通道数和输入通道数
         int oc_group = oc / group;
         int ic_group = ic / group;
 
-        // 遍历批量、输出通道、高度和宽度，nchw
         for (int b = 0; b < batch; ++b) {
             for (int oz = 0; oz < oc; ++oz) {
-                int g_id = oz / oc_group; // 计算当前通道所属的组
+                int g_id = oz / oc_group;
 
                 for (int oy = 0; oy < oh; ++oy) {
                     for (int ox = 0; ox < ow; ++ox) {
                         float sum = 0;
-                        
-                        // 遍历输入通道和卷积核
                         for (int sz = g_id * ic_group; sz < (g_id + 1) * ic_group; ++sz) {
 
                             for (int ky = 0; ky < kh; ++ky) {
                                 for (int kx = 0; kx < kw; ++kx) {
-                                    // 计算输入张量的索引
                                     int ix = (ox * stride_w) + (kx * dilation_w) - pad_w;
                                     int iy = (oy * stride_h) + (ky * dilation_h) - pad_h;
                                     float x_value = 0.0F;
 
-                                    // 检查索引是否在输入张量范围内
                                     if (ix >= 0 && ix < iw && iy >= 0 && iy < ih) {
                                         x_value = input[((((b * ic + sz) * ih + iy) * iw) + ix)];
                                     }
 
-                                    // 获取卷积核的值
                                     float y_value = 0.F;
                                     y_value = (*weight)[((((oz * ic_group) + (sz % ic_group)) * kh + ky) * kw) + kx];
 
-                                    // 累加卷积结果
                                     sum += x_value * y_value;
                                 }
                             }
                         }
 
-                        // 将卷积结果加上偏置并存储到输出张量
-                        // 计算输出张量的偏移量
                         auto dest_offset = (((b * oc + oz) * oh + oy) * ow) + ox;
                         output.at(dest_offset) = sum + (*bias)[oz];
                     }

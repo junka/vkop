@@ -78,9 +78,8 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
 #endif
 #endif
 
+#if VK_EXT_host_image_copy
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
-
-#ifdef VK_EXT_host_image_copy
     if (hostimagecopyproperty.copySrcLayoutCount > 0) {
         this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
         this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
@@ -88,6 +87,7 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
     }
 #endif
+    vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
     this->maxImageArrayLayers_ =
         properties2.properties.limits.maxImageArrayLayers;
@@ -101,8 +101,17 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         LOG_INFO("Device support subgroup arithmetic");
         LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
     }
-
-#ifdef VK_NV_cuda_kernel_launch
+#if VK_EXT_host_image_copy
+    for (uint32_t i = 0; i < hostimagecopyproperty.copySrcLayoutCount; i++) {
+        LOG_INFO("HostImageCopy support src layout %d",
+                 hostimagecopyproperty.pCopySrcLayouts[i]);
+    }
+    for (uint32_t i = 0; i < hostimagecopyproperty.copyDstLayoutCount; i++) {
+        LOG_INFO("HostImageCopy support dst layout %d",
+                 hostimagecopyproperty.pCopyDstLayouts[i]);
+    }
+#endif
+#if VK_NV_cuda_kernel_launch
     LOG_INFO("CUDA kernel launch compute capability %u.%u",
              cuda_properties.computeCapabilityMajor,
              cuda_properties.computeCapabilityMinor);
@@ -141,6 +150,66 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
     return static_cast<uint32_t>(computeQueueIdxs_.size());
 }
 
+void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
+
+    VkImageType imageType = VK_IMAGE_TYPE_2D;
+    VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
+    VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+        VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    VkImageCreateFlags flags = 0;
+
+    VkFormatProperties formatProps;
+    vkGetPhysicalDeviceFormatProperties(physicalDevice_, format, &formatProps);
+
+    const VkFormatFeatureFlags *requiredFeaturesPtr = nullptr;
+    if (tiling == VK_IMAGE_TILING_OPTIMAL) {
+        requiredFeaturesPtr = &formatProps.optimalTilingFeatures;
+    } else if (tiling == VK_IMAGE_TILING_LINEAR) {
+        requiredFeaturesPtr = &formatProps.linearTilingFeatures;
+    } else {
+        assert(false && "Unsupported tiling mode");
+        return;
+    }
+
+    VkFormatFeatureFlags requiredFeatures = 0;
+    if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
+        requiredFeatures |= VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT;
+    }
+    if (usage & VK_IMAGE_USAGE_STORAGE_BIT) {
+        requiredFeatures |= VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT;
+    }
+    if (usage & VK_IMAGE_USAGE_TRANSFER_SRC_BIT) {
+        requiredFeatures |= VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    }
+    if (usage & VK_IMAGE_USAGE_TRANSFER_DST_BIT) {
+        requiredFeatures |= VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+    }
+
+    assert((*requiredFeaturesPtr & requiredFeatures) == requiredFeatures &&
+           "Format does not support required tiling features");
+
+    VkImageFormatProperties props;
+    VkResult result = vkGetPhysicalDeviceImageFormatProperties(
+        physicalDevice_, format, imageType, tiling, usage, flags, &props);
+
+    if (result == VK_SUCCESS) {
+        LOG_INFO("format %d is supported", format);
+    }
+    assert(result == VK_SUCCESS &&
+           "vkGetPhysicalDeviceImageFormatProperties failed: "
+           "requested image configuration is not supported!");
+    if (m_support_host_image_copy_) {
+        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+    }
+    result = vkGetPhysicalDeviceImageFormatProperties(
+        physicalDevice_, format, imageType, tiling, usage, flags, &props);
+    if (result == VK_SUCCESS) {
+        LOG_INFO("format %d is supported for host image copy", format);
+    } else {
+        LOG_INFO("format %d is not supported for host image copy", format);
+    }
+}
 bool VulkanDevice::createLogicalDevice(
     const VkPhysicalDeviceProperties &deviceProperties) {
     auto num_queue = findComputeQueueFamily();
@@ -158,9 +227,9 @@ bool VulkanDevice::createLogicalDevice(
     ext_properties.resize(p_property_count);
     vkEnumerateDeviceExtensionProperties(
         physicalDevice_, nullptr, &p_property_count, ext_properties.data());
-    // for (auto ext : ext_properties) {
-    //     LOG_INFO("device extension %s", ext.extensionName);
-    // }
+    for (auto ext : ext_properties) {
+        LOG_INFO("device extension %s", ext.extensionName);
+    }
 
     VkPhysicalDeviceFeatures device_features = {};
     vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
@@ -255,6 +324,8 @@ bool VulkanDevice::createLogicalDevice(
     if (device_features.shaderInt16)
         features.shaderInt16 = VK_TRUE;
     features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    features.shaderStorageImageExtendedFormats =
+        (VK_TRUE & device_features.shaderStorageImageExtendedFormats);
 
     VkPhysicalDeviceFloat16Int8FeaturesKHR float16_int8_features = {};
     float16_int8_features.sType =
@@ -304,9 +375,14 @@ bool VulkanDevice::createLogicalDevice(
         enabled_extensions.push_back(vk::EXTHostImageCopyExtensionName);
         enabled_features.push_back(
             reinterpret_cast<uintptr_t>(&host_image_copy_features));
-        m_support_host_image_copy_ = true;
+        m_support_host_image_copy_ = false;
     }
 #endif
+    assertImageConfigurationSupported(VK_FORMAT_R32G32B32A32_SFLOAT);
+    assertImageConfigurationSupported(VK_FORMAT_R16G16B16A16_SFLOAT);
+    assertImageConfigurationSupported(VK_FORMAT_R8G8B8A8_SNORM);
+    assertImageConfigurationSupported(VK_FORMAT_R8G8B8A8_UNORM);
+
     if (devicefloat16_int8_features.shaderInt8) {
         float16_int8_features.shaderInt8 = VK_TRUE;
         if (checkDeviceExtensionFeature(ext_properties,
@@ -590,7 +666,8 @@ bool VulkanDevice::createLogicalDevice(
     }
     VkDeviceCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    create_info.queueCreateInfoCount = queue_create_info.size();
+    create_info.queueCreateInfoCount =
+        static_cast<uint32_t>(queue_create_info.size());
     create_info.pQueueCreateInfos = queue_create_info.data();
     create_info.enabledLayerCount = 0;
     create_info.ppEnabledLayerNames = nullptr;

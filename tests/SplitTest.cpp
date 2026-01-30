@@ -19,12 +19,9 @@ void split_cpu(const std::shared_ptr<Tensor<float>>& input,
     auto input_shape = input->getShape();
     size_t rank = input_shape.size();
 
-    // 校验 axis
     assert(axis >= 0 && static_cast<size_t>(axis) < rank);
-    // 校验 split_shape 长度与 outputs 一致
     assert(outputs.size() == split_shape.size());
 
-    // 校验 split_shape 总和等于 input_shape[axis]
     int64_t total_split = 0;
     for (int64_t s : split_shape) {
         total_split += s;
@@ -33,7 +30,6 @@ void split_cpu(const std::shared_ptr<Tensor<float>>& input,
 
     size_t num_outputs = outputs.size();
 
-    // 计算 outer_size 和 inner_size
     int64_t outer_size = 1;
     for (int i = 0; i < axis; ++i) {
         outer_size *= input_shape[i];
@@ -45,13 +41,12 @@ void split_cpu(const std::shared_ptr<Tensor<float>>& input,
     }
 
     int64_t input_axis_size = input_shape[axis];
-    int64_t offset = 0; // 在 axis 维度上的累积偏移
+    int64_t offset = 0;
 
     for (size_t i = 0; i < num_outputs; ++i) {
-        int64_t slice_size = split_shape[i]; // 当前输出在 axis 上的长度
+        int64_t slice_size = split_shape[i];
         const auto& output = outputs[i];
 
-        // 对每个 outer 块进行拷贝
         for (int64_t outer = 0; outer < outer_size; ++outer) {
              for (int64_t j = 0; j < slice_size; ++j) {
                 for (int64_t inner = 0; inner < inner_size; ++inner) {

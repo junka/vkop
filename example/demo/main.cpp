@@ -156,11 +156,11 @@ std::vector<T> resize_yuv444(const std::vector<uint8_t> &raw_image, int image_h,
 
             int dst_idx = (dy * in_w) + dx;
             float scale = 1.0F/255.0F;
-            if (sizeof(T) == 2) {
+            if constexpr (std::is_same_v<T, uint16_t>) {
                 resized_image[dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
                 resized_image[u_offset+dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
                 resized_image[v_offset+dst_idx] = vkop::core::ITensor::fp32_to_fp16(interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale);
-            } else if (sizeof(T) == 4) {
+            } else if constexpr (std::is_same_v<T, float>) {
                 resized_image[dst_idx] = interpolate(y_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
                 resized_image[u_offset+dst_idx] = interpolate(u_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;
                 resized_image[v_offset+dst_idx] = interpolate(v_src, image_w, x1, y1, x2, y2, dx_ratio, dy_ratio) * scale;

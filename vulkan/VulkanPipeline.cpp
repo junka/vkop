@@ -57,7 +57,7 @@ void VulkanPipeline::createPipelineLayout() {
     VkPushConstantRange push_constant_range{};
     push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
     push_constant_range.offset = 0;
-    push_constant_range.size = m_pushconstant_size_;
+    push_constant_range.size = static_cast<uint32_t>(m_pushconstant_size_);
 
     VkPipelineLayoutCreateInfo pipeline_layout_create_info = {};
     pipeline_layout_create_info.sType =
@@ -97,7 +97,8 @@ void VulkanPipeline::createDescriptorPool() {
     descriptor_pool_create_info.flags =
         VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
     descriptor_pool_create_info.maxSets = kInflight;
-    descriptor_pool_create_info.poolSizeCount = pool_sizes.size();
+    descriptor_pool_create_info.poolSizeCount =
+        static_cast<uint32_t>(pool_sizes.size());
     descriptor_pool_create_info.pPoolSizes = pool_sizes.data();
     if (vkCreateDescriptorPool(m_device_, &descriptor_pool_create_info, nullptr,
                                &m_descriptorPool_) != VK_SUCCESS) {

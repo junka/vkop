@@ -99,20 +99,34 @@ find_library(C10_LIBRARY
     NO_DEFAULT_PATH
     REQUIRED
 )
+file(GLOB TORCH_DLLS "${TORCH_LIB_DIR}/*.dll")
 foreach(TEST ${TESTS})
     add_executable(${TEST} ${TEST}.cpp)
     if (USE_FP16)
         target_compile_definitions(${TEST} PUBLIC FP16)
     endif()
-    target_compile_options(${TEST} PRIVATE
-        -Wno-unused-parameter
-        -Wno-unused-variable
-        -Wno-unused-function
-    )
+    if(MSVC)
+        target_compile_options(${TEST} PRIVATE /wd4100)
+    else()
+        target_compile_options(${TEST} PRIVATE
+            -Wno-unused-parameter
+            -Wno-unused-variable
+            -Wno-unused-function
+        )
+    endif()
     target_link_libraries(${TEST} PRIVATE vkop vload ${TORCH_LIBRARY}
         ${TORCH_CPU_LIBRARY}
         ${C10_LIBRARY})
     target_include_directories(${TEST} PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
+
+    if (MSVC)
+        add_custom_command(TARGET ${TEST} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                ${TORCH_DLLS}
+                $<TARGET_FILE_DIR:${TEST}>
+            COMMENT "Copying LibTorch DLLs to output directory"
+        )
+    endif()
     add_test(NAME ${TEST} COMMAND ${TEST})
 endforeach()
 

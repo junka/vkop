@@ -61,6 +61,7 @@ class VulkanDevice {
 
     static bool checkDeviceExtensionFeature(
         const std::vector<VkExtensionProperties> &properties, const char *name);
+    void VulkanDevice::assertImageConfigurationSupported(VkFormat format);
 
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);

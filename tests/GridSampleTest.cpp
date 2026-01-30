@@ -12,11 +12,10 @@ using vkop::core::Tensor;
 using vkop::tests::TestCase;
 
 namespace {
-// 反归一化处理坐标
 /*
-* x_norm 范围在 [-1.0, 1.0], 那么首先 +1 后范围在 [0, 2]
-* 那么乘以 range  后范围在 [0, 2*range - 1]
-* 再除以 2 后范围在 [0, range - 0.5]
+* x_norm ranges [-1.0, 1.0], make it +1 to [0, 2]
+* then it rangs [0, 2*range - 1] after multiply range 
+* div 2 to [0, range - 0.5]
 */
 template <typename T>
 T getPosition(T x_norm, int range, bool alignCorners) {
@@ -26,7 +25,6 @@ T getPosition(T x_norm, int range, bool alignCorners) {
 }
 
 // padding zero
-// 获取坐标对应的值, 如果超过范围, 补零
 template <typename T>
 T sample(int y, int x, const std::shared_ptr<Tensor<T>> &input, int offset, int height, int width) {
     if (y < 0 || y >= height || x < 0 || x >= width) {
@@ -36,12 +34,6 @@ T sample(int y, int x, const std::shared_ptr<Tensor<T>> &input, int offset, int 
     return (*input)[offset + (y * width) + x];
 }
 
-// 双线性插值算法,
-/*
-* 首先计算出上下左右四个点的坐标, 对浮点取整,floor下值,ceil上值
-* 然后sample取值, 计算出四个点的值
-* 计算出权重,
-*/
 template <typename T>
 T interpolate(T h, T w, const std::shared_ptr<Tensor<T>> &buffer, int offset, int height, int width) {
     // mode == GridSampleMode_BILINEAR
@@ -50,29 +42,23 @@ T interpolate(T h, T w, const std::shared_ptr<Tensor<T>> &buffer, int offset, in
     int w1_h = ::ceil(h);
     int w1_w = ::ceil(w);
 
-    // 左下角
+    // left down
     T i00 = sample(w0_h, w0_w, buffer, offset, height, width);
-    // 右下角
+    // right down
     T i01 = sample(w0_h, w1_w, buffer, offset, height, width);
-    // 左上角
+    // left top
     T i10 = sample(w1_h, w0_w, buffer, offset, height, width);
-    // 右上角
+    // right top
     T i11 = sample(w1_h, w1_w, buffer, offset, height, width);
 
-    // 权重, 左边界归一化
     T fx2 = w - w0_w;
-    // 右边界归一化
     T fx1 = 1.0F - fx2;
-    // 上边界归一化
     T fy2 = h - w0_h;
-    // 下边界归一化
     T fy1 = 1.0F - fy2;
 
-    // 插值. 水平方向
     T i0 = (((i00) * fx1) + ((i01) * fx2));
     T i1 = (((i10) * fx1) + ((i11) * fx2));
 
-    // 插值, 竖直方向
     return ((i0 * fy1) + (i1 * fy2));
 }
 
@@ -80,9 +66,6 @@ template <typename T>
 void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::shared_ptr<Tensor<T>> &grid, std::shared_ptr<Tensor<T>> &output,
                         int batch, int inHeight, int inWidth, int outHeight, int outWidth, int depth,
                         bool alignCorners) {
-    // 按照 NCHW 的顺序, HW 以output 为目标,
-    // grid 的hw 和output是一致的
-    // input不参与循环hw, 在每个NC的循环中, 直接整个图以HW尺寸输入,保证grid操作单个channel
     for (auto b = 0; b < batch; ++b) {
         int b_input_offset = b * inHeight * inWidth * depth;
         int b_grid_offset = b * outHeight * outWidth * 2;
@@ -97,10 +80,8 @@ void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::s
                 auto h_output_offset = c_output_offset + (h * outWidth);
 
                 for (auto w = 0; w < outWidth; ++w) {
-                    // 首先反归一化得到坐标
                     auto x = getPosition((*grid)[h_grid_offset + (2 * w) + 0], inWidth, alignCorners);
                     auto y = getPosition((*grid)[h_grid_offset + (2 * w) + 1], inHeight, alignCorners);
-                    // 然后插值,得到的值输出
                     (*output)[h_output_offset+w] = interpolate(y, x, input, c_input_offset, inHeight, inWidth);
                 }
             }

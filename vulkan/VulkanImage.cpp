@@ -3,6 +3,7 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <cassert>
+#include <cstdio>
 
 namespace vkop {
 
@@ -243,7 +244,7 @@ void VulkanImage::createImage() {
                              nullptr, &m_image_);
 #endif
     if (ret != VK_SUCCESS) {
-        printf("fail create for image size %d\n", getImageSize());
+        printf("fail create for image size %d, ret %d\n", getImageSize(), ret);
         throw std::runtime_error("Failed to CreateImage " +
                                  std::to_string(ret));
     }
@@ -287,7 +288,7 @@ void VulkanImage::createImageView() {
     image_info_.imageView = m_imageView_;
 }
 
-void VulkanImage::splitImageView(std::vector<int64_t> &layers) {
+void VulkanImage::splitImageView(std::vector<int> &layers) {
     splitImageView_.resize(layers.size());
     int sum_layers = 0;
     VkImage img = getImage();
@@ -574,7 +575,6 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 }
 
 void VulkanImage::hostImageCopyToDevice(void *ptr) {
-    VkResult ret;
     VkMemoryToImageCopy region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
@@ -595,8 +595,13 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
         vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
                               "vkCopyMemoryToImageEXT"));
     if (vkCopyMemoryToImageEXT) {
-        ret = vkCopyMemoryToImageEXT(m_vdev_->getLogicalDevice(), &copyinfo);
-        assert(ret == VK_SUCCESS);
+        auto ret =
+            vkCopyMemoryToImageEXT(m_vdev_->getLogicalDevice(), &copyinfo);
+        if (ret != VK_SUCCESS) {
+            printf("Fail to do vkCopyMemoryToImageEXT %d\n", ret);
+            throw std::runtime_error("Fail to do vkCopyMemoryToImageEXT " +
+                                     std::to_string(ret));
+        }
     }
 }
 
@@ -622,8 +627,14 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     auto vkCopyImageToMemoryEXT = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(
         vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
                               "vkCopyImageToMemoryEXT"));
-    if (vkCopyImageToMemoryEXT)
-        vkCopyImageToMemoryEXT(m_vdev_->getLogicalDevice(), &copyinfo);
+    if (vkCopyImageToMemoryEXT) {
+        auto ret =
+            vkCopyImageToMemoryEXT(m_vdev_->getLogicalDevice(), &copyinfo);
+        if (ret != VK_SUCCESS) {
+            throw std::runtime_error("Fail to do vkCopyImageToMemoryEXT " +
+                                     std::to_string(ret));
+        }
+    }
 }
 #endif
 
