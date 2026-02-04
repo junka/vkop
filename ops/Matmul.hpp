@@ -24,7 +24,7 @@ class MatMul : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(matmul::GpuMatMulParam)){};
+                   sizeof(matmul::GpuMatMulParam)) {};
 
   private:
     void execute(

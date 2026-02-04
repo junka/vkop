@@ -254,7 +254,6 @@ void VulkanInstance::enumPhysicalDevices() {
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
-    printf("enum phy devices %d\n", count);
     m_physical_devices_.resize(count);
     error = vkEnumeratePhysicalDevices(m_instance_, &count,
                                        m_physical_devices_.data());

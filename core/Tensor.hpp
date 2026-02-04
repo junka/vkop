@@ -22,7 +22,7 @@
 #include <immintrin.h>
 #endif
 
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];

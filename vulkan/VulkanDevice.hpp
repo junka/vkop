@@ -2,7 +2,9 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
+#include <functional>
 #include <memory>
+#include <set>
 
 #include "vulkan/VMA.hpp"
 
@@ -48,6 +50,24 @@ class VulkanQueue {
     }
 };
 
+struct FeatureDescriptor {
+    VkStructureType sType = {};
+    const char *extensionName = nullptr;
+    uint32_t corePromotedVersion = 0;
+
+    std::function<std::unique_ptr<VkBaseOutStructure>()> makeQueryStruct;
+
+    std::function<std::unique_ptr<VkBaseOutStructure>(void *queried)>
+        makeEnableStruct;
+};
+struct QueryChainResult {
+    VkPhysicalDeviceFeatures2 features2{};
+    std::vector<std::unique_ptr<VkBaseOutStructure>> ownedStructs;
+};
+struct EnableResult {
+    std::vector<std::unique_ptr<VkBaseOutStructure>> enableChain;
+    std::vector<const char *> enabledExtensions;
+};
 class VulkanDevice {
 
   private:
@@ -61,7 +81,29 @@ class VulkanDevice {
 
     static bool checkDeviceExtensionFeature(
         const std::vector<VkExtensionProperties> &properties, const char *name);
-    void VulkanDevice::assertImageConfigurationSupported(VkFormat format);
+
+    void assertImageConfigurationSupported(VkFormat format);
+
+    std::vector<VkDeviceQueueCreateInfo>
+    setupQueueCreateInfo(std::vector<std::vector<float>> &queue_priority);
+
+    template <typename T, VkStructureType ST> T makeFeatureStruct() {
+        T f{};
+        f.sType = ST;
+        return f;
+    }
+    static QueryChainResult
+    buildFeatureQueryChain(const std::vector<FeatureDescriptor> &descs);
+
+    static EnableResult
+    buildFeatureEnableChain(const std::vector<FeatureDescriptor> &descs,
+                            const VkPhysicalDeviceFeatures2 &queryFeatures2);
+
+    void checkImageFormatSupport();
+
+    std::vector<FeatureDescriptor>
+    createFeatureDescriptors(const VkPhysicalDeviceProperties &deviceProperties,
+                             const std::set<std::string> &supportedExtensions);
 
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);
