@@ -8,6 +8,7 @@
 #include <string>
 #include <cstdint>
 #include <unordered_map>
+#include <unordered_set>
 #include <cstring>
 #include <iostream>
 
@@ -25,6 +26,8 @@ struct Node {
     std::unordered_map<std::string, std::string> attributes;
     std::vector<Shape> inputs;
     std::vector<Shape> outputs;
+    std::unordered_set<std::string> dependencies;
+    std::unordered_set<std::string> dependents;
 };
 
 struct Initializer {
@@ -61,8 +64,16 @@ public:
     bool unified = false;
     std::unordered_map<std::string, size_t> initializer_offsets;
     std::vector<uint8_t> initializer_memory;
+    std::vector<std::vector<std::string>> concurrent_execution_levels;
 
     explicit VkModel(const std::string& filePath);
+
+    // std::vector<std::string> getTopologicalOrder() const;
+    
+    const std::vector<std::vector<std::string>>& getConcurrentExecutionLevels() const {
+        return concurrent_execution_levels;
+    }
+
     void dump_model() {
         std::cout << "Inputs:" << std::endl;
         for (const auto& input : this->inputs) {
@@ -110,6 +121,21 @@ public:
                 }
                 std::cout << "]" << std::endl;
             }
+            if (!node.dependencies.empty()) {
+                std::cout << "  Dependencies: {";
+                for (const auto& dep : node.dependencies) {
+                    std::cout << dep << ", ";
+                }
+                std::cout << "}" << std::endl;
+            }
+            
+            if (!node.dependents.empty()) {
+                std::cout << "  Dependents: {";
+                for (const auto& dep : node.dependents) {
+                    std::cout << dep << ", ";
+                }
+                std::cout << "}" << std::endl;
+            }
             std::cout << std::endl;
         }
 
@@ -120,6 +146,18 @@ public:
                 std::cout << initializer.dims[i] << (i + 1 < initializer.dims.size() ? ", " : "");
             }
             std::cout << "], DType: " << initializer.dtype << std::endl;
+        }
+
+        std::cout << "Concurrent Execution Levels:" << std::endl;
+        for (size_t level_idx = 0; level_idx < concurrent_execution_levels.size(); ++level_idx) {
+            std::cout << "  Level " << level_idx << ": {";
+            for (size_t i = 0; i < concurrent_execution_levels[level_idx].size(); ++i) {
+                std::cout << concurrent_execution_levels[level_idx][i];
+                if (i + 1 < concurrent_execution_levels[level_idx].size()) {
+                    std::cout << ", ";
+                }
+            }
+            std::cout << "}" << std::endl;
         }
     }
 private:

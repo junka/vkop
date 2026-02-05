@@ -107,7 +107,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
     this->inputs = readListWithShapes(ptr, end);
     this->outputs = readListWithShapes(ptr, end);
 
-    // Read nodes
+    // Read nodes with DAG info
     uint32_t num_nodes = readUint32(ptr, end);
     for (uint32_t i = 0; i < num_nodes; ++i) {
         Node node;
@@ -116,6 +116,18 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         node.attributes = readDict(ptr, end);
         node.inputs = readListWithShapes(ptr, end);
         node.outputs = readListWithShapes(ptr, end);
+        // Read dependencies
+        uint32_t num_dependencies = readUint32(ptr, end);
+        for (uint32_t j = 0; j < num_dependencies; ++j) {
+            std::string dep_name = readString(ptr, end);
+            node.dependencies.insert(dep_name);
+        }
+        // Read dependents
+        uint32_t num_dependents = readUint32(ptr, end);
+        for (uint32_t j = 0; j < num_dependents; ++j) {
+            std::string dep_name = readString(ptr, end);
+            node.dependents.insert(dep_name);
+        }
         this->nodes.push_back(std::move(node));
     }
 
@@ -162,6 +174,20 @@ void VkModel::loadFromBinary(const std::string& filePath) {
         std::memcpy(dest_ptr, ptr, data_size);
         ptr += data_size;
     }
+    // Read concurrent execution levels
+    uint32_t num_levels = readUint32(ptr, end);
+    std::vector<std::vector<std::string>> concurrent_levels(num_levels);
+    for (uint32_t i = 0; i < num_levels; ++i) {
+        uint32_t level_size = readUint32(ptr, end);
+        concurrent_levels[i].reserve(level_size);
+        for (uint32_t j = 0; j < level_size; ++j) {
+            std::string node_name = readString(ptr, end);
+            concurrent_levels[i].push_back(node_name);
+        }
+    }
+
+    // Store concurrent levels information
+    this->concurrent_execution_levels = std::move(concurrent_levels);
 
     if (this->initializers.find("unified_metadata") != this->initializers.end()) {
         size_t meta_offset = initializer_offsets["unified_metadata"];

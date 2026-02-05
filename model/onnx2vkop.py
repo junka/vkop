@@ -13,23 +13,95 @@ from typing import List, Dict, Set, Tuple, Optional
 import argparse
 
 
-class VkModel:
-    def __init__(self):
-        """
-        Initializes the class with the following attributes:
+class Node:
+    def __init__(self, op_type, name, attributes, inputs, outputs):
+        self.op_type = op_type
+        self.name = name
+        self.attributes = attributes
+        self.inputs = inputs  # List of input node names
+        self.outputs = outputs  # List of output node names
+        self.dependencies = set()  # Node names this node depends on
+        self.dependents = set()  # Node names that depend on this node
 
-        Attributes:
-            inputs (list): A list to store the input nodes of the graph.
-            outputs (list): A list to store the output nodes of the graph.
-            nodes (list): A list to store all the nodes in the graph.
-            initializers (dict): A dictionary to store the initial values of the graph's parameters.
-        """
-        self.inputs = []
-        self.outputs = []
-        self.nodes = []
-        self.initializers = {}
+
+class DAGBasedModel:
+    def __init__(self):
+        self.nodes = {}  # Map from node name to Node object
+        self.inputs = []  # Input nodes
+        self.outputs = []  # Output nodes
+        self.initializers = {}  # Initializers (name -> numpy array)
+
+    def add_node(self, node):
+        self.nodes[node.name] = node
+
+    def build_dependencies(self):
+        """Build dependency relationships between nodes."""
+        for node in self.nodes.values():
+            node.dependencies.clear()
+            node.dependents.clear()
+
+        # Build tensor -> producer mapping
+        tensor_producer = {}
+        for node in self.nodes.values():
+            for output_name in node.outputs:
+                tensor_producer[output_name['name']] = node.name
+
+        # Build dependencies
+        for node in self.nodes.values():
+            for input_name in node.inputs:
+                producer_name = tensor_producer.get(input_name['name'])
+                if producer_name and producer_name != node.name:
+                    producer_node = self.nodes[producer_name]
+                    node.dependencies.add(producer_name)
+                    producer_node.dependents.add(node.name)
+
+    def topological_sort(self):
+        """Perform topological sort to determine execution order."""
+        in_degree = {name: len(node.dependencies) for name, node in self.nodes.items()}
+        queue = deque([name for name, degree in in_degree.items() if degree == 0])
+        sorted_nodes = []
+
+        while queue:
+            current = queue.popleft()
+            sorted_nodes.append(current)
+            for dependent_name in self.nodes[current].dependents:
+                in_degree[dependent_name] -= 1
+                if in_degree[dependent_name] == 0:
+                    queue.append(dependent_name)
+
+        if len(sorted_nodes) != len(self.nodes):
+            raise ValueError("Cycle detected in computation graph!")
+
+        return [self.nodes[name] for name in sorted_nodes]
+
+    def find_concurrent_nodes(self):
+        """Find nodes that can be executed in parallel."""
+        levels = []
+        in_degree = {name: len(node.dependencies) for name, node in self.nodes.items()}
+
+        queue = deque([name for name, degree in in_degree.items() if degree == 0])
+
+        while queue:
+            current_level = []
+            level_size = len(queue)
+
+            for _ in range(level_size):
+                node_name = queue.popleft()
+                current_level.append(node_name)
+
+                # Update in-degrees of dependents
+                for dependent_name in self.nodes[node_name].dependents:
+                    in_degree[dependent_name] -= 1
+                    if in_degree[dependent_name] == 0:
+                        queue.append(dependent_name)
+
+            if current_level:
+                levels.append(current_level)
+        
+        return levels
 
     def save_to_binary(self, file_path):
+        """Save model to binary file with DAG information."""
         with open(file_path, 'wb') as f:
             # Save inputs with shapes
             self._write_list_with_shapes(f, self.inputs)
@@ -39,18 +111,35 @@ class VkModel:
 
             # Save nodes including attributes and input/output shapes
             f.write(struct.pack('I', len(self.nodes)))
-            for node in self.nodes:
-                self._write_string(f, node['op_type'])
-                self._write_string(f, node['name'])
-                self._write_dict(f, node['attributes'])  # Attributes
-                self._write_list_with_shapes(f, node['inputs'])
-                self._write_list_with_shapes(f, node['outputs'])
+            for node_name, node in self.nodes.items():
+                self._write_string(f, node.op_type)
+                self._write_string(f, node.name)
+                self._write_dict(f, node.attributes)  # Attributes
+                self._write_list_with_shapes(f, node.inputs)
+                self._write_list_with_shapes(f, node.outputs)
+
+                # Write dependencies and dependents for DAG structure
+                f.write(struct.pack('I', len(node.dependencies)))
+                for dep_name in node.dependencies:
+                    self._write_string(f, dep_name)
+
+                f.write(struct.pack('I', len(node.dependents)))
+                for dep_name in node.dependents:
+                    self._write_string(f, dep_name)
 
             # Save initializers (name -> numpy array)
             f.write(struct.pack('I', len(self.initializers)))
             for name, arr in self.initializers.items():
                 self._write_string(f, name)
                 self._write_array(f, arr)
+
+            # Save concurrent execution levels
+            concurrent_levels = self.find_concurrent_nodes()
+            f.write(struct.pack('I', len(concurrent_levels)))
+            for level in concurrent_levels:
+                f.write(struct.pack('I', len(level)))
+                for node_name in level:
+                    self._write_string(f, node_name)
 
     @staticmethod
     def _write_string(f, s):
@@ -62,8 +151,11 @@ class VkModel:
     def _write_list_with_shapes(f, lst):
         f.write(struct.pack('I', len(lst)))
         for item in lst:
-            VkModel._write_string(f, item['name'])
-            VkModel._write_list(f, item['shape'])
+            if isinstance(item, dict) and 'name' in item and 'shape' in item:
+                DAGBasedModel._write_string(f, item['name'])
+                DAGBasedModel._write_list(f, item['shape'])
+            else:
+                DAGBasedModel._write_string(f, str(item))
 
     @staticmethod
     def _write_list(f, lst):
@@ -74,16 +166,16 @@ class VkModel:
             elif isinstance(item, float):
                 f.write(struct.pack('f', item))  # For float attributes
             else:
-                VkModel._write_string(f, item)  # For names
+                DAGBasedModel._write_string(f, str(item))  # For names
 
     @staticmethod
     def _write_dict(f, d):
         f.write(struct.pack('I', len(d)))
         for key, value in d.items():
-            VkModel._write_string(f, key)
+            DAGBasedModel._write_string(f, key)
             if isinstance(value, str):
                 f.write(b'\x00')  # Tag for string
-                VkModel._write_string(f, value)
+                DAGBasedModel._write_string(f, value)
             elif isinstance(value, int):
                 f.write(b'\x01')  # Tag for int
                 f.write(struct.pack('q', value))
@@ -93,12 +185,15 @@ class VkModel:
             elif isinstance(value, list):
                 if all(isinstance(v, int) for v in value):
                     f.write(b'\x03')  # Tag for list of ints
-                    VkModel._write_list(f, value)
+                    DAGBasedModel._write_list(f, value)
                 elif all(isinstance(v, float) for v in value):
                     f.write(b'\x04')  # Tag for list of floats
-                    VkModel._write_list(f, value)
+                    DAGBasedModel._write_list(f, value)
                 else:
                     raise ValueError(f"Unsupported list type in attribute: {key}")
+            elif isinstance(value, np.ndarray):
+                f.write(b'\x05')  # Tag for numpy array
+                DAGBasedModel._write_array(f, numpy_helper.from_array(value, key))
 
     @staticmethod
     def _write_array(f, arr):
@@ -121,12 +216,12 @@ class VkModel:
             16: "bfloat16"
         }
         data_type = data_type_map.get(arr.data_type, onnx.TensorProto.UNDEFINED)
-        VkModel._write_string(f, data_type)
-        VkModel._write_list(f, list(arr.dims))
+        DAGBasedModel._write_string(f, str(data_type))
+        DAGBasedModel._write_list(f, list(arr.dims))
         total_elements = np.prod(arr.dims)
         print("Array ",  arr.name, "shape:", arr.dims, "Data type:", data_type, "Total elements:", total_elements)
-        arr = np.ascontiguousarray(numpy_helper.to_array(arr))
-        data = arr.tobytes()
+        arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
+        data = arr_np.tobytes()
         f.write(struct.pack('Q', len(data)))
         f.write(data)
 
@@ -160,7 +255,7 @@ def optimize_onnx_model(onnx_model, batch_size = 1):
         tensor_type = inp.type.tensor_type
         dim = tensor_type.shape.dim
         if len(dim) != 4:
-            assert shape_dims.size() == 4, "Input shape must be 4D"
+            assert len(dim) == 4, "Input shape must be 4D"
         fixed_shape = []
         for d in dim:
             if d.HasField("dim_value"):
@@ -237,41 +332,54 @@ def is_topologically_sortable(graph):
         raise ValueError("Graph has a cycle or unresolved dependencies!")
     return True
 
-
-def build_graph_index(nodes):
-    # tensor_name -> producing node
+def get_producer_consumer_from_dag(dag_model):
+    """
+    从已构建的DAG中提取producer和consumer映射 避免重复计算
+    """
+    # tensor_name -> producing node dictionary
     producer = {}
-    # tensor_name -> list of (consumer_node, input_index)
+    # tensor_name -> list of (consumer_node_dict, input_index)
     consumers = defaultdict(list)
-
-    for node in nodes:
-        for out in node['outputs']:
-            producer[out['name']] = node
-        for idx, inp in enumerate(node['inputs']):
-            consumers[inp['name']].append((node, idx))
-
+    
+    # 构建tensor到producer的映射
+    for node in dag_model.nodes.values():
+        node_dict = {
+            'op_type': node.op_type,
+            'name': node.name,
+            'attributes': node.attributes,
+            'inputs': node.inputs,
+            'outputs': node.outputs
+        }
+        for output in node.outputs:
+            producer[output['name']] = node_dict
+    
+    # 构建tensor到consumers的映射
+    for node in dag_model.nodes.values():
+        node_dict = {
+            'op_type': node.op_type,
+            'name': node.name,
+            'attributes': node.attributes,
+            'inputs': node.inputs,
+            'outputs': node.outputs
+        }
+        for idx, input_tensor in enumerate(node.inputs):
+            consumers[input_tensor['name']].append((node_dict, idx))
+    
     return producer, consumers
 
 
-def fuse_gated_conv(vk_model):
-    producer, consumers = build_graph_index(vk_model.nodes)
+def fuse_gated_conv(dag_model):
+    producer, consumers = get_producer_consumer_from_dag(dag_model)
+    nodes_dict = {node.name: node for node in dag_model.nodes.values()}
 
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
-
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}   
-
-    for node in nodes:
-        if node['op_type'] != 'Mul':
+    for node in list(dag_model.nodes.values()):  # 使用list()避免迭代时修改
+        if node.op_type != 'Mul':
             continue
 
-        inputs = node['inputs']
-        if len(inputs) != 2:
+        if len(node.inputs) != 2:
             continue
 
-        inp0, inp1 = inputs[0]['name'], inputs[1]['name']
+        inp0, inp1 = node.inputs[0]['name'], node.inputs[1]['name']
 
         # 尝试两种组合: inp0 是 conv, inp1 是 sigmoid(conv)
         candidates = [
@@ -284,16 +392,16 @@ def fuse_gated_conv(vk_model):
             if conv_out not in producer or sig_out not in producer:
                 continue
 
-            conv_node = producer[conv_out]
-            sig_node = producer[sig_out]
+            conv_node_dict = producer[conv_out]
+            sig_node_dict = producer[sig_out]
 
-            if conv_node['op_type'] != 'Conv':
+            if conv_node_dict['op_type'] != 'Conv':
                 continue
-            if sig_node['op_type'] != 'Sigmoid':
+            if sig_node_dict['op_type'] != 'Sigmoid':
                 continue
-            if len(sig_node['inputs']) != 1:
+            if len(sig_node_dict['inputs']) != 1:
                 continue
-            if sig_node['inputs'][0]['name'] != conv_out:
+            if sig_node_dict['inputs'][0]['name'] != conv_out:
                 continue
 
             conv_consumers = consumers[conv_out]
@@ -302,75 +410,68 @@ def fuse_gated_conv(vk_model):
             consumer_names = {c[0]['op_type'] for c in conv_consumers}
             if not (consumer_names == {'Sigmoid', 'Mul'}):
                 continue
-            
-            fused = conv_node.copy()
-            fused['attributes'] = dict(conv_node.get('attributes', {}))
-            fused['attributes']['activation'] = 'Swish'
-            fused['outputs'] = node['outputs']  # 输出为 Mul 的输出
 
-            first_idx = conv_node['_orig_idx']
-            replacements[first_idx] = fused
-            to_remove.add(conv_node['_orig_idx'])
-            to_remove.add(sig_node['_orig_idx'])
-            to_remove.add(node['_orig_idx'])
-            matched = True
-            break
+            # 查找对应的Node对象
+            conv_node_obj = nodes_dict.get(conv_node_dict['name'])
+            sig_node_obj = nodes_dict.get(sig_node_dict['name'])
+            mul_node_obj = nodes_dict.get(node.name)
+
+            if conv_node_obj and sig_node_obj and mul_node_obj:
+                # 创建融合节点
+                fused = Node(
+                    op_type=conv_node_obj.op_type,
+                    name=conv_node_obj.name,
+                    attributes=dict(conv_node_obj.attributes),
+                    inputs=conv_node_obj.inputs,
+                    outputs=mul_node_obj.outputs
+                )
+                fused.attributes['activation'] = 'Swish'
+
+                # 从dag_model中移除原节点
+                del dag_model.nodes[conv_node_obj.name]
+                del dag_model.nodes[sig_node_obj.name]
+                del dag_model.nodes[mul_node_obj.name]
+
+                # 添加融合节点
+                dag_model.nodes[fused.name] = fused
+                matched = True
+                break
 
         if matched:
             continue
 
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            # 如果这是融合子图的第一个节点，就放 fused node
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-        else:
-            # 未被融合的节点，直接保留
-            new_nodes.append(node)
 
-    for node in new_nodes:
-        node.pop('_orig_idx', None)
-
-    vk_model.nodes = new_nodes
-
-
-def fuse_conv_bn(vk_model):
+def fuse_conv_bn(dag_model):
     """
     Fuse Conv + BatchNormalization patterns into a single Conv node.
     This optimization reduces the number of operations and can improve performance.
     Works for both Conv+BN and Conv+BN+ReLU patterns.
     """
-    producer, consumers = build_graph_index(vk_model.nodes)
-    
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
+    producer, consumers = get_producer_consumer_from_dag(dag_model)
 
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}
+    nodes_dict = {node.name: node for node in dag_model.nodes.values()}
 
-    for node in nodes:
-        if node['op_type'] != 'Conv':
+    for node in list(dag_model.nodes.values()):
+        if node.op_type != 'Conv':
             continue
 
-        conv_out = node['outputs'][0]['name']
+        conv_out = node.outputs[0]['name']
 
         conv_consumers = consumers.get(conv_out, [])
         if len(conv_consumers) != 1:
             continue
 
-        bn_node, _ = conv_consumers[0]
-        if bn_node['op_type'] != 'BatchNormalization':
+        bn_node_dict, _ = conv_consumers[0]
+        if bn_node_dict['op_type'] != 'BatchNormalization':
             continue
 
         # inputs[1] are merged scale, bias, mean, variance respectively
-        tensor_name = bn_node['inputs'][1]['name']
-        if tensor_name not in vk_model.initializers:
+        tensor_name = bn_node_dict['inputs'][1]['name']
+        if tensor_name not in dag_model.initializers:
             print(f"Warning: BatchNormalization parameters {tensor_name} not found, skipping fusion")
             continue
 
-        tensor_array = numpy_helper.to_array(vk_model.initializers[tensor_name])
+        tensor_array = numpy_helper.to_array(dag_model.initializers[tensor_name])
         total_elements = len(tensor_array)
         padded_N = total_elements // 4
 
@@ -386,27 +487,27 @@ def fuse_conv_bn(vk_model):
                 mean_array[i * 4 + j] = tensor_array[base_idx + 8 + j]        # mean
                 var_array[i * 4 + j] = tensor_array[base_idx + 12 + j]
 
-        eps = float(bn_node['attributes'].get('epsilon', 1e-5))
+        eps = float(bn_node_dict['attributes'].get('epsilon', 1e-5))
 
-        has_conv_bias = len(node['inputs']) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
+        has_conv_bias = len(node.inputs) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
 
-        conv_weight_name = node['inputs'][1]['name']
-        if conv_weight_name not in vk_model.initializers:
+        conv_weight_name = node.inputs[1]['name']
+        if conv_weight_name not in dag_model.initializers:
             print(f"Warning: Conv weight {conv_weight_name} not found, skipping fusion")
             continue
 
-        conv_weight = numpy_helper.to_array(vk_model.initializers[conv_weight_name])
+        conv_weight = numpy_helper.to_array(dag_model.initializers[conv_weight_name])
 
         if has_conv_bias:
-            conv_bias_name = node['inputs'][2]['name']
-            if conv_bias_name not in vk_model.initializers:
+            conv_bias_name = node.inputs[2]['name']
+            if conv_bias_name not in dag_model.initializers:
                 print(f"Warning: Conv bias {conv_bias_name} not found, skipping fusion")
                 continue
-            conv_bias = numpy_helper.to_array(vk_model.initializers[conv_bias_name])
+            conv_bias = numpy_helper.to_array(dag_model.initializers[conv_bias_name])
         else:
             conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
 
-        print("Fusing Conv node", node['name'], "with BN node", bn_node['name'])
+        print("Fusing Conv node", node.name, "with BN node", bn_node_dict['name'])
         # 执行参数融合
         # 计算: gamma / sqrt(var + eps)
         inv_std = scale_array / np.sqrt(var_array + eps)
@@ -418,130 +519,101 @@ def fuse_conv_bn(vk_model):
         # 新偏置 = (旧偏置 - mean) * (gamma / sqrt(var + eps)) + beta
         fused_bias = (conv_bias - mean_array) * inv_std + bias_array
 
-        # 直接更新vk_model.initializers中的权重和偏置
+        # 直接更新dag_model.initializers中的权重和偏置
         # 更新权重为融合后的权重
         fused_weight_tensor = numpy_helper.from_array(fused_weight, conv_weight_name)
-        vk_model.initializers[conv_weight_name] = fused_weight_tensor
+        dag_model.initializers[conv_weight_name] = fused_weight_tensor
 
         # 为偏置创建名称（如果原来没有bias，现在添加）
         if has_conv_bias:
-            conv_bias_name = node['inputs'][2]['name']
+            conv_bias_name = node.inputs[2]['name']
         else:
-            conv_bias_name = f"{node['name']}_fused_bias"
+            conv_bias_name = f"{node.name}_fused_bias"
 
         fused_bias_tensor = numpy_helper.from_array(fused_bias, conv_bias_name)
-        vk_model.initializers[conv_bias_name] = fused_bias_tensor
+        dag_model.initializers[conv_bias_name] = fused_bias_tensor
 
-        fused = node.copy()
-        fused['attributes'] = dict(node.get('attributes', {}))
+        fused = Node(
+            op_type=node.op_type,
+            name=node.name,
+            attributes=dict(node.attributes),
+            inputs=[
+                node.inputs[0],  # 输入数据
+                node.inputs[1],  # 权重（名称不变，但数值已更新）
+                {'name': conv_bias_name, 'shape': list(fused_bias.shape)}
+            ],
+            outputs=bn_node_dict['outputs']
+        )
 
-        fused['outputs'] = bn_node['outputs']
+        # 替换节点
+        del dag_model.nodes[node.name]
+        del dag_model.nodes[bn_node_dict['name']]
+        dag_model.nodes[fused.name] = fused
 
-        fused['inputs'] = [
-            node['inputs'][0],  # 输入数据
-            node['inputs'][1],  # 权重（名称不变，但数值已更新）
-            {'name': conv_bias_name, 'shape': list(fused_bias.shape)}
-        ]
-
-        first_idx = node['_orig_idx']
-        replacements[first_idx] = fused
-
-        to_remove.add(node['_orig_idx'])
-        to_remove.add(bn_node['_orig_idx'])
-
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-        else:
-            new_nodes.append(node)
-
-    for node in new_nodes:
-        node.pop('_orig_idx', None)
-
-    print("Fusing Conv+BN patterns...", len(to_remove))
-    vk_model.nodes = new_nodes
+    print("Fusing Conv+BN patterns...")
 
 
-def fuse_conv_simple_activation(vk_model):
-    producer, consumers = build_graph_index(vk_model.nodes)
+def fuse_conv_simple_activation(dag_model):
+    producer, consumers = get_producer_consumer_from_dag(dag_model)
     ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish"}
 
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
+    nodes_dict = {node.name: node for node in dag_model.nodes.values()}
 
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}
-
-    for node in nodes:
-        if node['op_type'] in ['Conv', 'BatchNormalization', 'Add', 'Gemm'] and len(node['outputs']) == 1:
-            out_name = node['outputs'][0]['name']
+    for node in list(dag_model.nodes.values()):
+        if node.op_type in ['Conv', 'BatchNormalization', 'Add', 'Gemm'] and len(node.outputs) == 1:
+            out_name = node.outputs[0]['name']
             outs = consumers.get(out_name, [])
             if len(outs) == 1:
-                next_node, _ = outs[0]
-                if next_node['op_type'] == 'Clip':
-                    if len(next_node['inputs']) > 1:
-                        min_input_name = next_node['inputs'][1]['name']
-                        max_input_name = next_node['inputs'][2]['name']
+                next_node_dict, _ = outs[0]
+                if next_node_dict['op_type'] == 'Clip':
+                    if len(next_node_dict['inputs']) > 1:
+                        min_input_name = next_node_dict['inputs'][1]['name']
+                        max_input_name = next_node_dict['inputs'][2]['name']
 
-                        if min_input_name in vk_model.initializers:
-                            min_array = numpy_helper.to_array(vk_model.initializers[min_input_name])
+                        if min_input_name in dag_model.initializers:
+                            min_array = numpy_helper.to_array(dag_model.initializers[min_input_name])
                             if min_array.size == 1:
                                 min_val = float(min_array.item())
-                            del vk_model.initializers[min_input_name]
-                                
-                        if max_input_name in vk_model.initializers:
-                            max_array = numpy_helper.to_array(vk_model.initializers[max_input_name])
+                            del dag_model.initializers[min_input_name]
+
+                        if max_input_name in dag_model.initializers:
+                            max_array = numpy_helper.to_array(dag_model.initializers[max_input_name])
                             if max_array.size == 1:
                                 max_val = float(max_array.item())
-                            del vk_model.initializers[max_input_name]
-                    elif 'min' in next_node['attributes'] or 'max' in next_node['attributes']:
-                        min_val = next_node['attributes'].get('min', -1.0)
-                        max_val = next_node['attributes'].get('max', 1.0)
+                            del dag_model.initializers[max_input_name]
+                    elif 'min' in next_node_dict['attributes'] or 'max' in next_node_dict['attributes']:
+                        min_val = next_node_dict['attributes'].get('min', -1.0)
+                        max_val = next_node_dict['attributes'].get('max', 1.0)
                     if min_val == 0.0 and max_val == 6.0:
-                        fused = node.copy()
-                        fused['attributes'] = dict(node.get('attributes', {}))
-                        fused['attributes']['activation'] = 'Relu6'
-                        fused['outputs'] = next_node['outputs']
+                        fused = Node(
+                            op_type=node.op_type,
+                            name=node.name,
+                            attributes=dict(node.attributes),
+                            inputs=node.inputs,
+                            outputs=next_node_dict['outputs']
+                        )
+                        fused.attributes['activation'] = 'Relu6'
 
-                        first_idx = node['_orig_idx']
-                        replacements[first_idx] = fused
+                        del dag_model.nodes[node.name]
+                        del dag_model.nodes[next_node_dict['name']]
+                        dag_model.nodes[fused.name] = fused
+                elif (next_node_dict['op_type'] in ACTIVATIONS and
+                    len(next_node_dict['inputs']) == 1 and
+                    next_node_dict['inputs'][0]['name'] == out_name):
 
-                        to_remove.add(first_idx)
-                        to_remove.add(next_node['_orig_idx'])
-                elif (next_node['op_type'] in ACTIVATIONS and
-                    len(next_node['inputs']) == 1 and
-                    next_node['inputs'][0]['name'] == out_name):
+                    fused = Node(
+                        op_type=node.op_type,
+                        name=node.name,
+                        attributes=dict(node.attributes),
+                        inputs=node.inputs,
+                        outputs=next_node_dict['outputs']
+                    )
+                    fused.attributes['activation'] = next_node_dict['op_type']
 
-                    fused = node.copy()
-                    fused['attributes'] = dict(node.get('attributes', {}))
-                    fused['attributes']['activation'] = next_node['op_type']
-                    fused['outputs'] = next_node['outputs']
-
-                    first_idx = node['_orig_idx']
-                    replacements[first_idx] = fused
-
-                    to_remove.add(first_idx)
-                    to_remove.add(next_node['_orig_idx'])
+                    del dag_model.nodes[node.name]
+                    del dag_model.nodes[next_node_dict['name']]
+                    dag_model.nodes[fused.name] = fused
                     continue
-
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            # 如果这是融合子图的第一个节点，就放 fused node
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-            # 否则跳过（不添加）
-        else:
-            # 未被融合的节点，直接保留
-            new_nodes.append(node)
-
-    for node in new_nodes:
-        node.pop('_orig_idx', None)
-
-    vk_model.nodes = new_nodes
 
 
 def broadcast_shapes(shape_a, shape_b):
@@ -575,7 +647,7 @@ def broadcast_shapes(shape_a, shape_b):
     return result
 
 
-def merge_initializers(vk_model):
+def merge_initializers(dag_model):
     """
     Merge batch normalization parameters into a single tensor [4, N]
     where N is the number of channels.
@@ -586,7 +658,7 @@ def merge_initializers(vk_model):
     Row 2: mean (required)
     Row 3: variance (required)
 
-    This modifies the vk_model by:
+    This modifies the dag_model by:
     1. Finding batch normalization nodes
     2. Merging their 4 input parameters into one
     3. Updating the nodes and initializers accordingly
@@ -594,40 +666,40 @@ def merge_initializers(vk_model):
 
     # Find all batch normalization nodes
     bn_nodes = []
-    for i, node in enumerate(vk_model.nodes):
-        if node['op_type'] == 'BatchNormalization':
-            bn_nodes.append((i, node))
+    for node_name, node in dag_model.nodes.items():
+        if node.op_type == 'BatchNormalization':
+            bn_nodes.append((node_name, node))
 
     # Keep track of which initializers have been merged
     merged_initializers = set()
 
-    for idx, node in bn_nodes:
+    for node_name, node in bn_nodes:
         # BatchNormalization typically has 5 inputs:
         # input, scale, bias, mean, variance
-        if len(node['inputs']) < 5:
-            print(f"Warning: BatchNormalization node {node['name']} has less than 5 inputs")
+        if len(node.inputs) < 5:
+            print(f"Warning: BatchNormalization node {node.name} has less than 5 inputs")
             continue
 
         # Get the names of the parameters
         # input[0] is the actual input data
         # inputs[1-4] are scale, bias, mean, variance respectively
-        input_data = node['inputs'][0]    # input data
-        scale_name = node['inputs'][1]['name']  # scale/weight
-        bias_name = node['inputs'][2]['name']   # bias
-        mean_name = node['inputs'][3]['name']   # mean
-        var_name = node['inputs'][4]['name']    # variance
+        input_data = node.inputs[0]    # input data
+        scale_name = node.inputs[1]['name']  # scale/weight
+        bias_name = node.inputs[2]['name']   # bias
+        mean_name = node.inputs[3]['name']   # mean
+        var_name = node.inputs[4]['name']    # variance
 
         # Check if all required parameters exist
         required_params = [mean_name, var_name]
         for param_name in required_params:
-            if param_name not in vk_model.initializers:
+            if param_name not in dag_model.initializers:
                 print(f"Error: Required parameter {param_name} not found in initializers")
                 continue
 
         # Get the parameter arrays
         try:
-            mean_array = numpy_helper.to_array(vk_model.initializers[mean_name])
-            var_array = numpy_helper.to_array(vk_model.initializers[var_name])
+            mean_array = numpy_helper.to_array(dag_model.initializers[mean_name])
+            var_array = numpy_helper.to_array(dag_model.initializers[var_name])
 
             # Validate that mean and variance have the same shape
             if mean_array.shape != var_array.shape:
@@ -635,13 +707,13 @@ def merge_initializers(vk_model):
                 continue
 
             # Handle optional parameters with defaults
-            if scale_name in vk_model.initializers:
-                scale_array = numpy_helper.to_array(vk_model.initializers[scale_name])
+            if scale_name in dag_model.initializers:
+                scale_array = numpy_helper.to_array(dag_model.initializers[scale_name])
             else:
                 scale_array = np.ones_like(mean_array, dtype=mean_array.dtype)
 
-            if bias_name in vk_model.initializers:
-                bias_array = numpy_helper.to_array(vk_model.initializers[bias_name])
+            if bias_name in dag_model.initializers:
+                bias_array = numpy_helper.to_array(dag_model.initializers[bias_name])
             else:
                 bias_array = np.zeros_like(mean_array, dtype=mean_array.dtype)
 
@@ -678,13 +750,13 @@ def merge_initializers(vk_model):
                         merged_data[i * 16 + 8 + j] = 0.0                           # mean default
                         merged_data[i * 16 + 12 + j] = 1.0                          # variance default
             # Create a new initializer name
-            merged_name = f"{node['name']}_bn_params"
+            merged_name = f"{node.name}_bn_params"
 
             # Convert back to ONNX tensor
             merged_tensor = numpy_helper.from_array(merged_data, merged_name)
 
             # Add the merged tensor to initializers
-            vk_model.initializers[merged_name] = merged_tensor
+            dag_model.initializers[merged_name] = merged_tensor
             
             # Update the node to use the merged parameter
             # Change inputs from 5 to 2: [input, merged_params]
@@ -693,46 +765,45 @@ def merge_initializers(vk_model):
                 {'name': merged_name, 'shape': [4 * padded_N]}  # Merged parameters
             ]
 
-            node['inputs'] = new_inputs
+            node.inputs = new_inputs
 
             # Mark original initializers for removal
             merged_initializers.update([scale_name, bias_name, mean_name, var_name])
 
-            print(f"Merged batchnorm for {node['name']}: "
+            print(f"Merged batchnorm for {node.name}: "
                   f"scale({scale_name}), bias({bias_name}), mean({mean_name}), var({var_name}) "
                   f"-> merged({merged_name})")
 
         except Exception as e:
-            print(f"Error processing BatchNormalization node {node['name']}: {e}")
+            print(f"Error processing BatchNormalization node {node.name}: {e}")
             continue
 
     # Remove the original individual initializers
     for initializer_name in merged_initializers:
-        if initializer_name in vk_model.initializers:
-            del vk_model.initializers[initializer_name]
+        if initializer_name in dag_model.initializers:
+            del dag_model.initializers[initializer_name]
 
     print(f"Merged {len(bn_nodes)} BatchNormalization nodes, removed {len(merged_initializers)} initializers")
 
 
-def convert_flat_to_reshape(vk_model):
+def convert_flat_to_reshape(dag_model):
     """
     Convert Flat nodes to Reshape nodes with explicit shapes.
 
     Flatten operation flattens the input tensor into a 2D tensor, keeping dimensions
     up to axis-1 and flattening the rest into the second dimension.
     """
-    nodes = vk_model.nodes
-    new_nodes = []
+    nodes_to_update = []
 
-    for node in nodes:
-        if node['op_type'] == 'Flatten':
+    for node_name, node in dag_model.nodes.items():
+        if node.op_type == 'Flatten':
             # Get input shape
-            if len(node['inputs']) > 0 and len(node['inputs'][0]['shape']) > 0:
-                input_shape = node['inputs'][0]['shape']
-                print(f"Flatten node {node['name']} input shape: {input_shape}")
+            if len(node.inputs) > 0 and len(node.inputs[0]['shape']) > 0:
+                input_shape = node.inputs[0]['shape']
+                print(f"Flatten node {node.name} input shape: {input_shape}")
 
                 # Get axis attribute (default is 1 according to ONNX spec)
-                axis = node['attributes'].get('axis', 1)
+                axis = node.attributes.get('axis', 1)
 
                 # Calculate output shape for flatten:
                 # First part: product of dimensions from 0 to axis-1
@@ -751,80 +822,79 @@ def convert_flat_to_reshape(vk_model):
                 output_shape = [first_part, second_part]
 
                 # Create new reshape node
-                reshape_node = {
-                    'op_type': 'Reshape',
-                    'name': node['name'],
-                    'attributes': {},
-                    'inputs': node['inputs'][:],  # Copy original inputs
-                    'outputs': node['outputs'][:]  # Copy original outputs
-                }
+                reshape_node = Node(
+                    op_type='Reshape',
+                    name=node.name,
+                    attributes={},
+                    inputs=node.inputs[:],  # Copy original inputs
+                    outputs=node.outputs[:]  # Copy original outputs
+                )
 
                 # Add shape tensor as second input
-                shape_tensor_name = node['name'] + '_shape'
+                shape_tensor_name = node.name + '_shape'
                 shape_tensor = np.array(output_shape, dtype=np.int64)
                 shape_initializer = numpy_helper.from_array(shape_tensor, shape_tensor_name)
-                vk_model.initializers[shape_tensor_name] = shape_initializer
+                dag_model.initializers[shape_tensor_name] = shape_initializer
 
                 # Add the shape tensor as the second input to reshape
-                reshape_node['inputs'].append({
+                reshape_node.inputs.append({
                     'name': shape_tensor_name,
                     'shape': list(shape_tensor.shape)
                 })
 
-                new_nodes.append(reshape_node)
-                print(f"Converted Flatten node '{node['name']}' to Reshape with shape {output_shape} (axis={axis})")
+                nodes_to_update.append((node_name, reshape_node))
+                print(f"Converted Flatten node '{node.name}' to Reshape with shape {output_shape} (axis={axis})")
             else:
                 # If we can't determine the shape, keep the original node
-                new_nodes.append(node)
-                print(f"Warning: Could not convert Flatten node '{node['name']}' - missing shape info")
-        else:
-            new_nodes.append(node)
+                print(f"Warning: Could not convert Flatten node '{node.name}' - missing shape info")
 
-    vk_model.nodes = new_nodes
+    # Apply updates
+    for old_name, new_node in nodes_to_update:
+        del dag_model.nodes[old_name]
+        dag_model.nodes[new_node.name] = new_node
 
 
-def remove_redundant_reshape(vk_model):
+def remove_redundant_reshape(dag_model):
     """
     Remove redundant reshape nodes where input and output shapes are the same.
     Updates connections so that the reshape's input becomes the next node's input.
     Also cleans up unused initializers.
     """
-    nodes = vk_model.nodes
     # Build mapping of output names to producing nodes
     producer = {}
-    for node in nodes:
-        for out in node['outputs']:
+    for node in dag_model.nodes.values():
+        for out in node.outputs:
             producer[out['name']] = node
 
     # Track which nodes to remove
-    to_remove = set()
+    to_remove = []
     # Map from reshape output names to their input names
     reshape_remap = {}
     # Track initializers used by redundant reshapes
     redundant_initializer_names = set()
 
     # First pass: identify redundant reshapes and build remapping
-    for idx, node in enumerate(nodes):
-        if node['op_type'] == 'Reshape':
+    for node_name, node in dag_model.nodes.items():
+        if node.op_type == 'Reshape':
             # Check if input and output shapes are the same
-            if (len(node['inputs']) >= 1 and len(node['outputs']) >= 1 and
-                node['inputs'][0]['shape'] == node['outputs'][0]['shape']):
+            if (len(node.inputs) >= 1 and len(node.outputs) >= 1 and
+                node.inputs[0]['shape'] == node.outputs[0]['shape']):
 
                 # This is a redundant reshape node
-                input_name = node['inputs'][0]['name']
-                output_name = node['outputs'][0]['name']
+                input_name = node.inputs[0]['name']
+                output_name = node.outputs[0]['name']
 
                 # Record the mapping for remapping
                 reshape_remap[output_name] = input_name
                 # Mark this reshape node for removal
-                to_remove.add(idx)
+                to_remove.append(node_name)
 
                 # Collect initializers used by this reshape node (typically the shape tensor)
-                for inp in node['inputs'][1:]:  # Skip the first input (data), consider the shape input
-                    if inp['name'] in vk_model.initializers:
+                for inp in node.inputs[1:]:  # Skip the first input (data), consider the shape input
+                    if inp['name'] in dag_model.initializers:
                         redundant_initializer_names.add(inp['name'])
 
-                print(f"Identified redundant Reshape node: {node['name']}")
+                print(f"Identified redundant Reshape node: {node.name}")
 
     # Check if the collected initializers are used by any other nodes
     # If not, they should be removed
@@ -832,11 +902,11 @@ def remove_redundant_reshape(vk_model):
     if redundant_initializer_names:
         # Build a set of all tensor names used by all nodes (except the ones we're removing)
         used_tensors = set()
-        for idx, node in enumerate(nodes):
-            if idx not in to_remove:  # Skip nodes we're going to remove
-                for inp in node['inputs']:
+        for node_name, node in dag_model.nodes.items():
+            if node_name not in to_remove:  # Skip nodes we're going to remove
+                for inp in node.inputs:
                     used_tensors.add(inp['name'])
-                for out in node['outputs']:
+                for out in node.outputs:
                     used_tensors.add(out['name'])
 
         # Check if any of our redundant initializers are actually used elsewhere
@@ -845,33 +915,35 @@ def remove_redundant_reshape(vk_model):
                 initializers_to_remove.add(initializer_name)
 
     # Second pass: update all nodes that reference the removed reshape outputs
-    for node in nodes:
-        if node['name'] in [nodes[i]['name'] for i in to_remove]:
+    for node in dag_model.nodes.values():
+        if node.name in to_remove:
             continue  # Skip the nodes we're removing
 
         # Update inputs that reference removed reshape outputs
-        for inp in node['inputs']:
+        for inp in node.inputs:
             if inp['name'] in reshape_remap:
                 old_name = inp['name']
                 inp['name'] = reshape_remap[old_name]
                 # Also update the shape if needed (should be the same)
                 # Find the source node/input to get the correct shape
-                print(f"Remapped input {old_name} to {inp['name']} in node {node['name']}")
+                print(f"Remapped input {old_name} to {inp['name']} in node {node.name}")
 
     # Remove the marked nodes
     if to_remove:
-        vk_model.nodes = [node for idx, node in enumerate(nodes) if idx not in to_remove]
+        for node_name in to_remove:
+            if node_name in dag_model.nodes:
+                del dag_model.nodes[node_name]
         print(f"Removed {len(to_remove)} redundant reshape nodes")
 
     # Remove unused initializers
     if initializers_to_remove:
         for initializer_name in initializers_to_remove:
-            if initializer_name in vk_model.initializers:
-                del vk_model.initializers[initializer_name]
+            if initializer_name in dag_model.initializers:
+                del dag_model.initializers[initializer_name]
         print(f"Removed {len(initializers_to_remove)} unused initializers: {initializers_to_remove}")
 
 
-def quantize_to_fp16_selective(vk_model):
+def quantize_to_fp16_selective(dag_model):
     """
     Selectively quantize model weights to FP16 based on operator type and parameter sensitivity.
 
@@ -896,8 +968,8 @@ def quantize_to_fp16_selective(vk_model):
 
     # Build mapping from initializer names to their consumers
     initializer_consumers = defaultdict(list)
-    for node in vk_model.nodes:
-        for inp in node['inputs']:
+    for node in dag_model.nodes.values():
+        for inp in node.inputs:
             initializer_consumers[inp['name']].append(node)
 
     # Data types that should remain unchanged
@@ -924,7 +996,7 @@ def quantize_to_fp16_selective(vk_model):
         'BatchNormalization'
     }
 
-    for name, initializer in vk_model.initializers.items():
+    for name, initializer in dag_model.initializers.items():
         # Skip non-FP32 tensors
         if initializer.data_type != onnx.TensorProto.FLOAT:
             if initializer.data_type in preserve_types:
@@ -939,7 +1011,7 @@ def quantize_to_fp16_selective(vk_model):
 
         # Check who consumes this initializer
         consumers = initializer_consumers.get(name, [])
-        consumer_ops = {node['op_type'] for node in consumers}
+        consumer_ops = {node.op_type for node in consumers}
 
         # Determine if this initializer should be quantized
         should_quantize = False
@@ -962,24 +1034,7 @@ def quantize_to_fp16_selective(vk_model):
             # Default behavior - check size (small tensors might be sensitive)
             should_quantize = False
             reason = f"small tensor ({arr.size} elements)"
-        # if len(arr.shape) == 1:  # Common bias tensor characteristics
-        #     # Check if it's connected to a bias input in operations like Conv, Gemm, etc.
-        #     is_bias = False
-        #     for node in consumers:
-        #         op_type = node['op_type']
-        #         if op_type in ['Conv', 'ConvTranspose']:
-        #             # Check if this tensor is the bias input (usually the 3rd input for Conv, 2nd for Gemm)
-        #             for idx, inp in enumerate(node['inputs']):
-        #                 if inp['name'] == name:
-        #                     # For Conv: 0=inputs, 1=weights, 2=bias
-        #                     if (op_type == 'Conv' and idx == 2) or \
-        #                        (op_type == 'ConvTranspose' and idx == 2):
-        #                         is_bias = True
-        #                         break
-        #     if is_bias:
-        #         print(f"Preserving bias tensor '{name}' as FP32")
-        #         skipped_count += 1
-        #         should_quantize = False
+
         if should_quantize:
             # Convert to numpy array
             arr = numpy_helper.to_array(initializer)
@@ -991,7 +1046,7 @@ def quantize_to_fp16_selective(vk_model):
             fp16_initializer = numpy_helper.from_array(arr_fp16, name)
 
             # Update the initializer in the model
-            vk_model.initializers[name] = fp16_initializer
+            dag_model.initializers[name] = fp16_initializer
             print(f"Converted FP32 tensor '{name}' to FP16 ({reason})")
             print(f"New shape: {fp16_initializer.dims}")
             converted_count += 1
@@ -1001,7 +1056,8 @@ def quantize_to_fp16_selective(vk_model):
     print(f"Converted {converted_count} FP32 tensors to FP16")
     print(f"Preserved {skipped_count} tensors")
 
-def quantize_to_int8_weight_only(vk_model):
+
+def quantize_to_int8_weight_only(dag_model):
     """
     Quantize model weights to INT8 using weight-only quantization.
     This function converts appropriate FP32 initializers to INT8, preserving scale information.
@@ -1023,8 +1079,8 @@ def quantize_to_int8_weight_only(vk_model):
 
     # Build mapping from initializer names to their consumers
     initializer_consumers = defaultdict(list)
-    for node in vk_model.nodes:
-        for inp in node['inputs']:
+    for node in dag_model.nodes.values():
+        for inp in node.inputs:
             initializer_consumers[inp['name']].append(node)
 
     # Data types that should remain unchanged
@@ -1052,11 +1108,11 @@ def quantize_to_int8_weight_only(vk_model):
     }
 
     # Get a list of keys to iterate over, to avoid modifying the dict during iteration
-    initializers_keys = list(vk_model.initializers.keys())
-    
+    initializers_keys = list(dag_model.initializers.keys())
+
     for name in initializers_keys:
-        initializer = vk_model.initializers[name]
-        
+        initializer = dag_model.initializers[name]
+
         # Skip non-FP32 tensors
         if initializer.data_type != onnx.TensorProto.FLOAT:
             if initializer.data_type in preserve_types:
@@ -1071,7 +1127,7 @@ def quantize_to_int8_weight_only(vk_model):
 
         # Check who consumes this initializer
         consumers = initializer_consumers.get(name, [])
-        consumer_ops = {node['op_type'] for node in consumers}
+        consumer_ops = {node.op_type for node in consumers}
 
         # Determine if this initializer should be quantized
         should_quantize = False
@@ -1099,10 +1155,10 @@ def quantize_to_int8_weight_only(vk_model):
             # Check if it's connected to a bias input in operations like Conv, Gemm, etc.
             is_bias = False
             for node in consumers:
-                op_type = node['op_type']
+                op_type = node.op_type
                 if op_type in ['Conv', 'ConvTranspose']:
                     # Check if this tensor is the bias input (usually the 3rd input for Conv, 2nd for Gemm)
-                    for idx, inp in enumerate(node['inputs']):
+                    for idx, inp in enumerate(node.inputs):
                         if inp['name'] == name:
                             # For Conv: 0=inputs, 1=weights, 2=bias
                             if (op_type == 'Conv' and idx == 2) or \
@@ -1122,8 +1178,9 @@ def quantize_to_int8_weight_only(vk_model):
             axis = None
             if len(arr.shape) >= 2:
                 # For multi-dimensional weights, use operator-specific quantization axis
-                for op in consumer_ops:
-                    if op == 'Conv':
+                for node in consumers:
+                    op_type = node.op_type
+                    if op_type == 'Conv':
                         # Conv weights: [C_out, C_in, K, K] - quantize per output channel
                         # Reduce along (C_in, K, K) dimensions -> axis=(1, 2, 3)
                         if len(arr.shape) == 4:
@@ -1133,7 +1190,7 @@ def quantize_to_int8_weight_only(vk_model):
                         else:
                             axis = 0
                         break
-                    elif op == 'ConvTranspose':
+                    elif op_type == 'ConvTranspose':
                         # ConvTranspose weights: [C_in, C_out, K, K] - quantize per output channel
                         # Reduce along (C_in, K, K) dimensions -> axis=(0, 2, 3)
                         if len(arr.shape) == 4:
@@ -1142,7 +1199,7 @@ def quantize_to_int8_weight_only(vk_model):
                             # For other shapes, default to axis=1
                             axis = 1
                         break
-                    elif op == 'Gemm':
+                    elif op_type == 'Gemm':
                         # Gemm weights: [out, in] - quantize per output dimension
                         # Reduce along in dimension -> axis=1
                         if len(arr.shape) == 2:
@@ -1151,7 +1208,7 @@ def quantize_to_int8_weight_only(vk_model):
                             # For other shapes, default to axis=0
                             axis = 0
                         break
-                    elif op == 'MatMul':
+                    elif op_type == 'MatMul':
                         # MatMul weights: typically [in, out] - quantize per output dimension
                         # Reduce along in dimension -> axis=0
                         if len(arr.shape) == 2:
@@ -1160,7 +1217,7 @@ def quantize_to_int8_weight_only(vk_model):
                             # For other shapes, default to axis=1
                             axis = 1
                         break
-                    elif op in ['LSTM', 'GRU']:
+                    elif op_type in ['LSTM', 'GRU']:
                         # LSTM/GRU weights: [D, 4H, I] or [D, 4H, H] - quantize per output dimension
                         # Reduce along I or H dimension -> axis=2
                         if len(arr.shape) == 3:
@@ -1256,7 +1313,7 @@ def quantize_to_int8_weight_only(vk_model):
             scale_initializer.data_type = onnx.TensorProto.FLOAT
 
             # Update the model: replace original with INT8 weights and add scale
-            vk_model.initializers[name] = int8_initializer
+            dag_model.initializers[name] = int8_initializer
 
             # Determine if scale should be stored as attribute or as input
             # If scale is a scalar or small array, store as attribute; otherwise, store as input
@@ -1266,7 +1323,7 @@ def quantize_to_int8_weight_only(vk_model):
             scale_name = f"{name}_scale"
             scale_initializer = numpy_helper.from_array(scale, scale_name)
             scale_initializer.data_type = onnx.TensorProto.FLOAT
-            vk_model.initializers[scale_name] = scale_initializer
+            dag_model.initializers[scale_name] = scale_initializer
 
             # Add scale as input to the nodes that consume the original initializer
             for node in consumers:
@@ -1275,7 +1332,7 @@ def quantize_to_int8_weight_only(vk_model):
                     'name': scale_name,
                     'shape': list(scale.shape) if hasattr(scale, 'shape') else []
                 }
-                node['inputs'].append(scale_input)
+                node.inputs.append(scale_input)
 
             print(f"Converted FP32 tensor '{name}' to INT8 with scale tensor '{scale_name}' ({reason})")
             print(f"Original shape: {initializer.dims}, scale shape: {scale_initializer.dims}")
@@ -1285,10 +1342,10 @@ def quantize_to_int8_weight_only(vk_model):
 
     print(f"Converted {converted_count} FP32 tensors to INT8 with scale information")
     print(f"Preserved {skipped_count} tensors")
-    print(f"Total initializers after quantization: {len(vk_model.initializers)}")
+    print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
 
-def move_input_tensor_to_attr(vk_model):
+def move_input_tensor_to_attr(dag_model):
     """
     将一些算子input中包含的仅rank长度的tensor转换为attribute。
     比如resize算子中的scales、sizes, pad算子中的pads等, 这些都是小型一维张量，
@@ -1303,129 +1360,54 @@ def move_input_tensor_to_attr(vk_model):
         # 'Slice': [(1, 'starts'), (2, 'ends'), (3, 'axes'), (4, 'steps')],  # 多个参数
     }
 
-    for node in vk_model.nodes:
-        op_type = node['op_type']
+    for node in dag_model.nodes.values():
+        op_type = node.op_type
         if op_type not in SPECIAL_OPS:
             continue
 
         target_inputs = SPECIAL_OPS[op_type]
 
         for idx, attr_name in target_inputs:
-            if idx >= len(node['inputs']):
+            if idx >= len(node.inputs):
                 continue
 
-            input_tensor = node['inputs'][idx]
+            input_tensor = node.inputs[idx]
             tensor_name = input_tensor['name']
             print("Checking input tensor: ", tensor_name)
 
-            if not tensor_name or tensor_name not in vk_model.initializers:
+            if not tensor_name or tensor_name not in dag_model.initializers:
                 continue
 
-            initializer = vk_model.initializers[tensor_name]
+            initializer = dag_model.initializers[tensor_name]
 
             # 检查是否为一维数组且长度较短（通常是rank长度，一般不超过8）
             if len(initializer.dims) == 1 and 0 < initializer.dims[0] <= 8:
                 tensor_data = numpy_helper.to_array(initializer)
 
-                if 'attributes' not in node:
-                    node['attributes'] = {}
+                if not hasattr(node, 'attributes') or node.attributes is None:
+                    node.attributes = {}
 
                 if tensor_data.dtype in [np.float32, np.float64]:
-                    node['attributes'][attr_name] = tensor_data.tolist()
+                    node.attributes[attr_name] = tensor_data.tolist()
                 elif tensor_data.dtype in [np.int32, np.int64]:
-                    node['attributes'][attr_name] = tensor_data.tolist()
+                    node.attributes[attr_name] = tensor_data.tolist()
                 else:
-                    node['attributes'][attr_name] = tensor_data.tolist()
+                    node.attributes[attr_name] = tensor_data.tolist()
 
-                del node['inputs'][idx]
+                del node.inputs[idx]
 
                 initializers_to_remove.add(tensor_name)
         print(node)
 
     for initializer_name in initializers_to_remove:
-        if initializer_name in vk_model.initializers:
-            del vk_model.initializers[initializer_name]
+        if initializer_name in dag_model.initializers:
+            del dag_model.initializers[initializer_name]
 
     print(f"Converted {len(initializers_to_remove)} tensor inputs to attributes")
 
-def unsqueeze_initializers(vk_model):
-    """Optimize unsqueeze operations on initializers by pre-computing the result"""
-    print("Unsqueezing initializers...")
-
-    nodes_to_remove = []
-    initializers_to_add = []
-    initializers_to_remove = []
-
-    # 遍历所有节点查找Unsqueeze操作
-    for node in vk_model.nodes:
-        if node['op_type'] == 'Unsqueeze':
-            # 检查输入是否为initializer
-            input_name = node.input[0]
-            initializer = None
-
-            # 查找对应的initializer
-            for init in vk_model.initializers:
-                if init.name == input_name:
-                    initializer = init
-                    break
-
-            if initializer is not None:
-                axes = None
-                for attr in node['attribute']:
-                    if attr['name'] == 'axes':
-                        axes = list(attr.ints)
-                        break
-
-                if axes is None and len(node.input) > 1:
-                    axes_input_name = node.input[1]
-                    for init in vk_model.initializer:
-                        if init.name == axes_input_name:
-                            if init.data_type == 7:  # INT64
-                                axes = list(init.int64_data)
-                            elif init.data_type == 6:  # INT32
-                                axes = list(init.int32_data)
-                            break
-
-                if axes is not None:
-                    original_shape = list(initializer.dims)
-                    new_shape = original_shape[:]
-                    axes_sorted = sorted([int(axis) if axis >= 0 else axis + len(original_shape) + 1 for axis in axes], reverse=True)
-
-                    for axis in axes_sorted:
-                        actual_axis = axis if axis >= 0 else axis + len(new_shape) + 1
-                        new_shape.insert(actual_axis, 1)
-
-                    import copy
-                    new_initializer = copy.deepcopy(initializer)
-                    new_initializer.name = node.output[0]
-                    new_initializer.dims[:] = new_shape
-
-                    initializers_to_add.append(new_initializer)
-                    initializers_to_remove.append(initializer.name)
-                    nodes_to_remove.append(node)
-
-                    print(f"Pre-computed unsqueeze for initializer '{input_name}' with axes {axes}")
-
-    for node in nodes_to_remove:
-        vk_model.nodes.remove(node)
-
-    for init_name in initializers_to_remove:
-        for i, init in enumerate(vk_model.initializers):
-            if init.name == init_name:
-                vk_model.initializers.remove(init)
-                break
-
-    for init in initializers_to_add:
-        vk_model.initializers.append(init)
-
-    if nodes_to_remove:
-        print(f"Removed {len(nodes_to_remove)} unsqueeze nodes that operated on initializers")
-
-    return vk_model
-
 
 class ModelConverter:
-    """Main class for converting ONNX models to VKOP format."""
+    """Main class for converting ONNX models to DAG-based format."""
     @staticmethod
     def parse_onnx_model(onnx_path, batch_size):
         model = onnx.load(onnx_path)
@@ -1436,7 +1418,7 @@ class ModelConverter:
         # save optimized model
         onnx.save(model, "optimized_" + os.path.basename(onnx_path))
 
-        vk_model = VkModel()
+        dag_model = DAGBasedModel()
 
         graph = model.graph
         try:
@@ -1453,7 +1435,7 @@ class ModelConverter:
         # Initializers (parameters)
         for initializer in graph.initializer:
             name = initializer.name
-            vk_model.initializers[name] = initializer
+            dag_model.initializers[name] = initializer
 
         initializer_names = {init.name for init in graph.initializer}
         # Inputs with shapes
@@ -1466,7 +1448,7 @@ class ModelConverter:
                 for dim in tensor_type.shape.dim
             ]
             print("Graph input:", inp.name, "of shape:", shape_dims)
-            vk_model.inputs.append({'name': inp.name, 'shape': shape_dims})
+            dag_model.inputs.append({'name': inp.name, 'shape': shape_dims})
 
         # Outputs with shapes
         for out in graph.output:
@@ -1476,7 +1458,7 @@ class ModelConverter:
                 for dim in tensor_type.shape.dim
             ]
             print("Graph output:", out.name, "of shape:", shape_dims)
-            vk_model.outputs.append({'name': out.name, 'shape': shape_dims})
+            dag_model.outputs.append({'name': out.name, 'shape': shape_dims})
 
         modified_shapes = defaultdict(list)
         # Nodes with attributes and shapes of inputs/outputs
@@ -1638,7 +1620,7 @@ class ModelConverter:
                         inputs_with_shape[id0]['shape'] = shape
                         for initializer in graph.initializer:
                             if initializer.name == inputs_with_shape[id0]['name']:
-                                orig_init = vk_model.initializers[initializer.name]
+                                orig_init = dag_model.initializers[initializer.name]
                                 orig_array = numpy_helper.to_array(orig_init)
                                 if orig_array.size == 1:
                                     scalar_val = orig_array.item()
@@ -1646,12 +1628,12 @@ class ModelConverter:
                                 else:
                                     expanded_data = np.broadcast_to(orig_array, shape).copy()
                                 new_init = numpy_helper.from_array(expanded_data, name=new_name)
-                                vk_model.initializers[initializer.name] = new_init
+                                dag_model.initializers[initializer.name] = new_init
                     if len(inputs_with_shape[id1]['shape']) != len(shape):
                         inputs_with_shape[id1]['shape'] = shape
                         for initializer in graph.initializer:
                             if initializer.name == inputs_with_shape[id1]['name']:
-                                orig_init = vk_model.initializers[initializer.name]
+                                orig_init = dag_model.initializers[initializer.name]
                                 orig_array = numpy_helper.to_array(orig_init)
                                 if orig_array.size == 1:
                                     scalar_val = orig_array.item()
@@ -1659,692 +1641,21 @@ class ModelConverter:
                                 else:
                                     expanded_data = np.broadcast_to(orig_array, shape).copy()
                                 new_init = numpy_helper.from_array(expanded_data, name=initializer.name)
-                                vk_model.initializers[initializer.name] = new_init
-
-            vk_model.nodes.append({
-                'op_type': node.op_type,
-                'name': node.name,
-                'attributes': attributes,
-                'inputs': inputs_with_shape,
-                'outputs': outputs_with_shape
-            })
-
-        return vk_model
-
-
-def unified_initializers(vk_model):
-    """
-    Consolidate 1D and 2D tensors from initializers into a large memory block with 16-byte padding.
-    This function:
-    1. Identifies 1D and 2D tensors in initializers
-    2. Concatenates them into a single memory block with 16-byte alignment
-    3. Keeps track of shapes and offsets for each tensor
-    """
-    print("Consolidating 1D and 2D initializers...")
-
-    initializer_consumers = defaultdict(list)
-    for node in vk_model.nodes:
-        for inp in node['inputs']:
-            initializer_consumers[inp['name']].append(node)
-
-    # Identify 1D and 2D tensors
-    tensors_to_consolidate = []
-    tensor_info = []  # Store tensor name, shape, data, and offset
-
-    for name, initializer in vk_model.initializers.items():
-        dims = list(initializer.dims)
-        if len(dims) in [1, 2]:  # Only 1D or 2D tensors
-            consumers = initializer_consumers.get(name, [])
-            consumer_ops = {node['op_type'] for node in consumers}
-
-            # Only process if it's consumed by Conv or BatchNormalization
-            if any(op in ['Conv', 'BatchNormalization'] for op in consumer_ops):
-                tensor_data = numpy_helper.to_array(initializer)
-                tensors_to_consolidate.append((name, dims, initializer.data_type, tensor_data))
-            else:
-                print(f"Skipping tensor {name} as it's not consumed by Conv or BatchNormalization")
-
-    if not tensors_to_consolidate:
-        print("No 1D or 2D tensors found to consolidate.")
-        return
-
-    print(f"Found {len(tensors_to_consolidate)} 1D and 2D tensors to consolidate.")
-
-    # Calculate total size with 16-byte padding
-    current_offset = 0
-    unified_data = b""
-
-    for name, shape, datatype, data in tensors_to_consolidate:
-        # Get the size in bytes for this tensor
-        element_size = data.itemsize
-        tensor_size_bytes = data.nbytes
-
-        # Calculate padding to align to 16-byte boundary,
-        # Min TexelBuffer Alignment requirement, usually 16 bytes
-        padding_needed = (16 - (current_offset % 16)) % 16
-        if padding_needed > 0:
-            unified_data += b"\x00" * padding_needed
-            current_offset += padding_needed
-
-        # Record tensor info with offset
-        tensor_info.append({
-            'name': name,
-            'shape': shape,
-            'offset': current_offset,
-            'size_bytes': tensor_size_bytes,
-            'type' : datatype
-        })
-        print(f"Tensor {name} shape: {shape}, size: {tensor_size_bytes} bytes, offset: {current_offset}")
-
-        # Add the tensor data
-        tensor_bytes = data.tobytes()
-        unified_data += tensor_bytes
-        current_offset += tensor_size_bytes
-
-    # Create a new unified initializer
-    unified_name = "unified_tensors"
-    unified_initializer = numpy_helper.from_array(
-        np.frombuffer(unified_data, dtype=np.float32), 
-        unified_name
-    )
-    unified_initializer.data_type = onnx.TensorProto.FLOAT
-
-    # Update the model: remove old tensors and add unified one
-    for name, _, _, _ in tensors_to_consolidate:
-        del vk_model.initializers[name]
-
-    vk_model.initializers[unified_name] = unified_initializer
-
-    # Store metadata about the consolidation in model attributes
-    # We'll create a metadata tensor with shape and offset information
-    metadata_list = []
-    for idx, info in enumerate(tensor_info):
-        # Add name length, offset, and size_bytes as integers
-        name_length = len(info['name'])
-
-        # Add to metadata list
-        metadata_list.append(info['type'])
-        metadata_list.append(name_length)
-        metadata_list.append(info['offset'])
-        metadata_list.append(info['size_bytes'])
-
-        # Add shape dimensions, padding to 4 dimensions with 1s
-        shape_dims = [1] * (2 - len(info['shape'])) + info['shape']
-        pad_dims = [0] * 2
-        metadata_list.extend(shape_dims)
-        metadata_list.extend(pad_dims)
-
-    metadata_array = np.array(metadata_list, dtype=np.int32)
-    metadata_initializer = numpy_helper.from_array(metadata_array, "unified_metadata")
-    vk_model.initializers["unified_metadata"] = metadata_initializer
-
-    all_names_bytes = b""
-    for info in tensor_info:
-        name_bytes = info['name'].encode('utf-8')
-        all_names_bytes += name_bytes
-
-    names_array = np.frombuffer(all_names_bytes, dtype=np.uint8)
-    names_initializer = numpy_helper.from_array(names_array, "unified_names")
-    vk_model.initializers["unified_names"] = names_initializer
-
-    print(f"Consolidated {len(tensors_to_consolidate)} tensors into a single tensor of size {len(unified_data)} bytes")
-    print(f"Added metadata tensor with shape information for {len(tensor_info)} tensors")
-
-    return {
-        'tensor_info': tensor_info,
-        'total_size': len(unified_data),
-        'metadata_size': len(metadata_list)
-    }
-
-
-def convert_initializers_nchw_to_rgba(vk_model):
-    """
-    Convert 3D and 4D tensors in initializers from NCHW format to RGBA format
-    following the same logic as the C++ convertTensorToRGBA function in Tensor.hpp
-    First, reshape all tensors to NCHW 4D format, then convert to RGBA.
-    Also preserve original shape information in metadata using RGBAConversion struct format.
-    """
-    print("Converting 3D and 4D initializers from NCHW to RGBA format...")
-
-    initializer_consumers = defaultdict(list)
-    for node in vk_model.nodes:
-        for inp in node['inputs']:
-            initializer_consumers[inp['name']].append(node)
-
-    converted_count = 0
-    shape_metadata = []
-    name_list = []
-
-    for name, initializer in vk_model.initializers.items():
-        dims = list(initializer.dims)
-
-        # Only process 3D and 4D tensors
-        if len(dims) in [3, 4]:
-            tensor_data = numpy_helper.to_array(initializer)
-
-            consumers = initializer_consumers.get(name, [])
-            consumer_ops = {node['op_type'] for node in consumers}
-            transpose = 'Conv' in consumer_ops
-
-            if len(dims) == 4:
-                orig_n, orig_c, h, w = dims
-            else:  # 3D: [C, H, W] → treat as [1, C, H, W]
-                orig_c, h, w = dims
-                orig_n = 1
-                tensor_data = tensor_data.reshape(orig_n, orig_c, h, w)
-
-            # Determine logical batch and channel based on transpose
-            if transpose:
-                batch = orig_c      # logical batch = C
-                channel = orig_n    # logical channel = N
-            else:
-                batch = orig_n      # logical batch = N
-                channel = orig_c    # logical channel = C
-
-            c4 = (channel + 3) // 4  # UP_DIV equivalent for channels
-            pack = (h == 1 and w == 1)
-
-            total_elements = w * h * batch * c4 * 4
-            rgba_flat = np.zeros(total_elements, dtype=tensor_data.dtype)
-
-            row_pitch = w * 4
-            layer_stride = batch * h * w * 4
-
-            # Perform the conversion following the C++ logic
-            for c4_idx in range(c4):  # channel group index
-                for n_idx in range(batch):  # batch index
-                    for h_idx in range(h):  # height index
-                        for w_idx in range(w):  # width index
-                            if pack:
-                                # ((n*H + h) * (W * C4) + (w + c4 * W)) * 4
-                                base_linear = ((n_idx * h + h_idx) * (w * c4) + (w_idx + c4_idx * w)) * 4
-                            else:
-                                # c4 * layer_stride + (n*H + h) * row_pitch + w * 4
-                                base_linear = c4_idx * layer_stride + (n_idx * h + h_idx) * row_pitch + w_idx * 4
-
-                            # Now fill RGBA channels (k=0..3)
-                            for k in range(4):
-                                ch = c4_idx * 4 + k
-                                if ch < channel:
-                                    if transpose:
-                                        src_val = tensor_data[ch, n_idx, h_idx, w_idx]
-                                    else:
-                                        src_val = tensor_data[n_idx, ch, h_idx, w_idx]
-                                else:
-                                     src_val = 0
-
-                                rgba_flat[base_linear + k] = src_val
-
-            new_initializer = numpy_helper.from_array(rgba_flat, name)
-            new_initializer.data_type = initializer.data_type
-            vk_model.initializers[name] = new_initializer
-
-            dtype = initializer.data_type  # ONNX data type
-            name_len = len(name)
-            offset = 0
-            size = rgba_flat.size
-            padded_dims = [1] * (4 - len(dims)) + dims
-
-            shape_metadata.append([dtype, name_len, offset, size] + padded_dims)
-            name_bytes = name.encode('utf-8')
-            name_list.append(name_bytes)
-
-            converted_count += 1
-            print(f"Converted {name} from shape {dims} to RGBA format with shape {rgba_flat.shape}")
-
-    # Store shape metadata as a new initializer using RGBAConversion format
-    if shape_metadata:
-        # Flatten the metadata list
-        flattened_metadata = []
-
-        for entry in shape_metadata:
-            flattened_metadata.extend(entry)
-
-        # Create metadata array
-        metadata_array = np.array(flattened_metadata, dtype=np.int32)
-        metadata_initializer = numpy_helper.from_array(metadata_array, "rgba_conversion_metadata")
-        vk_model.initializers["rgba_conversion_metadata"] = metadata_initializer
-
-        all_names_bytes = b"".join(name_list)
-        names_array = np.frombuffer(all_names_bytes, dtype=np.uint8)
-        names_initializer = numpy_helper.from_array(names_array, "rgba_conversion_names")
-        vk_model.initializers["rgba_conversion_names"] = names_initializer
-
-    print(f"Converted {converted_count} initializers from NCHW to RGBA format")
-    print(f"Preserved original shape information in metadata using RGBAConversion format")
-    return converted_count
-
-
-def replace_globalaveragepool_conv_with_gemm(vk_model):
-    """
-    Replace Conv that follows GlobalAveragePool with GEMM when conditions are met.
-    This optimization works when:
-    1. GlobalAveragePool output shape is [N, C, 1, 1] (after GAP)
-    2. Conv has kernel size 1x1 and stride 1x1
-    3. Conv has no padding or padding that maintains the 1x1 output
-    4. The operations can be equivalently represented as a matrix multiplication
-    """
-    print("Replacing Conv after GlobalAveragePool with GEMM...")
-
-    producer, consumers = build_graph_index(vk_model.nodes)
-
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
-
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}
-
-    for node in nodes:
-        # Check if it's a Conv node
-        if node['op_type'] != 'Conv':
-            continue
-
-        conv_input_name = node['inputs'][0]['name']
-
-        # Find the producer of this Conv's input
-        if conv_input_name not in producer:
-            continue
-
-        gap_node = producer[conv_input_name]
-        # Check if the producer is a GlobalAveragePool
-        if gap_node['op_type'] != 'GlobalAveragePool':
-            continue
-
-        # Check if Conv has kernel size 1x1 (typical for 1x1 convolutions after GAP)
-        kernel_shape = node['attributes'].get('kernel_shape', [1, 1])
-        strides = node['attributes'].get('strides', [1, 1])
-        pads = node['attributes'].get('pads', [0, 0, 0, 0])  # [pad_top, pad_left, pad_bottom, pad_right]
-
-        # Only proceed if kernel is 1x1 and stride is 1x1 (common case after GAP)
-        if kernel_shape == [1, 1] and strides == [1, 1]:
-            # Verify that padding doesn't change the 1x1 nature of the operation
-            if pads == [0, 0, 0, 0] or (pads[0] == pads[2] and pads[1] == pads[3] and pads[0] <= 1 and pads[1] <= 1):
-                print(f"Found Conv '{node['name']}' after GlobalAveragePool '{gap_node['name']}' with 1x1 kernel, replacing with GEMM")
-
-                weight_input = node['inputs'][1]
-                weight_name = weight_input['name']
-
-                if weight_name in vk_model.initializers:
-                    # Get the original weight tensor
-                    weight_tensor = vk_model.initializers[weight_name]
-                    original_shape = list(weight_tensor.dims)
-
-                    # For 1x1 conv, weight shape is [out_channels, in_channels, 1, 1]
-                    # For GEMM, we need [out_channels, in_channels]
-                    if len(original_shape) == 4 and original_shape[2] == 1 and original_shape[3] == 1:
-                        new_shape = [original_shape[0], original_shape[1]]  # [out_channels, in_channels]
-
-                        # Get the weight data and reshape it
-                        weight_data = numpy_helper.to_array(weight_tensor)
-                        reshaped_weight = weight_data.reshape(new_shape)
-
-                        # Create a new initializer with the reshaped data
-                        new_weight_tensor = numpy_helper.from_array(reshaped_weight, weight_name)
-                        new_weight_tensor.data_type = weight_tensor.data_type
-
-                        # Update the initializer
-                        vk_model.initializers[weight_name] = new_weight_tensor
-                        print(f"Reshaped weight '{weight_name}' from {original_shape} to {new_shape}")
-
-                # Create GEMM node
-                gemm_node = {
-                    'op_type': 'Gemm',
-                    'name': f"Gemm_after_GAP_{node['name']}",
-                    'attributes': {
-                        'alpha': 1.0,
-                        'beta': 1.0,
-                        'transA': 0,  # Don't transpose A
-                        'transB': 0   # Don't transpose B
-                    },
-                    'inputs': [
-                        gap_node['outputs'][0],  # Output from GlobalAveragePool (becomes matrix A in GEMM)
-                        {
-                            'name': weight_input['name'],
-                            'shape': weight_input['shape'][:2]
-                        }  # Conv weights (becomes matrix B in GEMM)
-                    ],
-                    'outputs': []
-                }
-
-                # If Conv has bias, add it as the third input to GEMM
-                if len(node['inputs']) > 2:
-                    gemm_node['inputs'].append(node['inputs'][2])  # Conv bias
-
-                for output in node['outputs']:
-                    # Original shape from Conv
-                    orig_shape = output['shape']
-
-                    # If the shape ends with [1, 1] (H, W), remove them to keep only [N, C]
-                    new_shape = orig_shape[:]
-                    if len(new_shape) >= 2 and new_shape[-2:] == [1, 1]:
-                        new_shape = new_shape[:-2]  # Remove the last two dimensions (H, W)
-
-                    gemm_node['outputs'].append({
-                        'name': output['name'],
-                        'shape': new_shape
-                    })
-
-                    # Also update the model's outputs if this output is in the global outputs
-                    for model_output in vk_model.outputs:
-                        if model_output['name'] == output['name']:
-                            model_output['shape'] = new_shape
-                            print(f"Updated model output '{output['name']}' shape to {new_shape}")
-
-                # Find the index of the Conv node to replace it
-                conv_idx = node['_orig_idx']
-
-                # Mark the Conv node for removal
-                to_remove.add(conv_idx)
-
-                # Add the new GEMM node
-                replacements[conv_idx] = gemm_node
-
-    # Build new nodes list
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            # Replace the Conv node with GEMM
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-        else:
-            new_nodes.append(node)
-
-    for node in new_nodes:
-        if '_orig_idx' in node:
-            del node['_orig_idx']
-
-    replaced_count = len([idx for idx in to_remove if idx in replacements])
-    print(f"Replaced {replaced_count} Conv nodes after GlobalAveragePool with GEMM nodes")
-    vk_model.nodes = new_nodes
-    return vk_model
-
-
-def replace_reducemean_reshape_with_globalaveragepool(vk_model):
-    """
-    Replace ReduceMean + Reshape pattern with GlobalAveragePool when conditions are met.
-    This optimization works when:
-    1. ReduceMean operates on HW dimensions (axes=[2, 3] or [-2, -1] for NCHW format)
-    2. Either:
-       - Reshape removes the trailing 1x1 dimensions (when keepdims=1), OR
-       - No reshape needed because keepdims=0 produces desired output shape
-    3. The operations can be equivalently represented as a GlobalAveragePool
-    
-    This is functionally equivalent to GlobalAveragePool for NCHW format.
-    Handles both opset13 (axes in attributes) and opset18+ (axes in inputs) formats.
-    """
-    print("Replacing ReduceMean + Reshape with GlobalAveragePool...")
-
-    producer, consumers = build_graph_index(vk_model.nodes)
-
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
-
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}
-
-    for node in nodes:
-        # Check if it's a ReduceMean node
-        if node['op_type'] != 'ReduceMean':
-            continue
-
-        reducemean_output_name = node['outputs'][0]['name']
-
-        # Get axes - could be in attributes (opset13) or inputs (opset18+)
-        axes = []
-        keepdims = node['attributes'].get('keepdims', 1)  # Default is 1 in ONNX
-        noop_with_empty_axes = node['attributes'].get('noop_with_empty_axes', 0)  # Default is 0 in ONNX
-
-        # Check if axes is in attributes (opset13 style)
-        if 'axes' in node['attributes']:
-            axes = node['attributes']['axes']
-        else:
-            # Check if axes is in inputs (opset18+ style)
-            # Axes would be the second input (after the data input)
-            if len(node['inputs']) > 1:
-                axes_input_name = node['inputs'][1]['name']
-                if axes_input_name in vk_model.initializers:
-                    axes_tensor = vk_model.initializers[axes_input_name]
-                    axes_array = numpy_helper.to_array(axes_tensor)
-                    axes = axes_array.tolist() if hasattr(axes_array, 'tolist') else list(axes_array)
-
-        # Handle empty axes condition based on noop_with_empty_axes
-        if len(axes) == 0 and noop_with_empty_axes == 1:
-            # If noop_with_empty_axes is true and axes is empty, this performs no reduction
-            continue
-        elif len(axes) == 0 and noop_with_empty_axes == 0:
-            # If noop_with_empty_axes is false and axes is empty, this reduces all axes
-            continue  # This case is not relevant for our optimization
-
-        # Normalize negative axes to positive (for 4D tensors, -1 becomes 3, -2 becomes 2)
-        normalized_axes = []
-        for ax in axes:
-            if ax < 0:
-                # Determine tensor rank from input shape to normalize axes properly
-                input_shape = node['inputs'][0]['shape']
-                normalized_axes.append(len(input_shape) + ax)
-            else:
-                normalized_axes.append(ax)
-        
-        # For NCHW format, axes [2, 3] or [-2, -1] correspond to H and W dimensions
-        if sorted(normalized_axes) == [2, 3]:
-            # Check if the reshape removes the 1x1 dimensions (i.e., changes [..., 1, 1] to [...])
-            input_shape = node['inputs'][0]['shape']  # Original input shape before ReduceMean
-            output_after_reduce = node['outputs'][0]['shape']  # Shape after ReduceMean
-
-            if keepdims == 1:
-                reducemean_consumers = consumers.get(reducemean_output_name, [])
-                if len(reducemean_consumers) != 1:
-                    continue
-                reshape_node, _ = reducemean_consumers[0]
-                # Check if consumer is a Reshape node
-                if reshape_node['op_type'] != 'Reshape':
-                    continue
-
-                output_after_reshape = reshape_node['outputs'][0]['shape']
-
-                # After ReduceMean with keepdims=1, the shape should be [N, C, 1, 1]
-                # After Reshape, it should remove these trailing 1x1 dimensions to [N, C]
-                if (len(output_after_reduce) == 4 and 
-                    output_after_reduce[2] == 1 and output_after_reduce[3] == 1 and
-                    len(output_after_reshape) == len(input_shape) - 2 and  # Removed 2 dimensions
-                    output_after_reshape[:2] == output_after_reduce[:2]):  # First two dims (N, C) match
-
-                    print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) followed by Reshape '{reshape_node['name']}', replacing with GlobalAveragePool")
-
-                    # Create GlobalAveragePool node
-                    globalavgpool_node = {
-                        'op_type': 'GlobalAveragePool',
-                        'name': f"GlobalAveragePool_from_{node['name']}_to_{reshape_node['name']}",
-                        'attributes': {},
-                        'inputs': [
-                            node['inputs'][0]  # Original input to ReduceMean
-                        ],
-                        'outputs': [{
-                            'name': reshape_node['outputs'][0]['name'],  # Output from Reshape
-                            'shape': output_after_reshape  # Final shape after reshape
-                        }]
-                    }
-
-                    # Find the index of the ReduceMean node to replace the sequence
-                    reducemean_idx = node['_orig_idx']
-                    reshape_idx = reshape_node['_orig_idx']
-
-                    # Mark both nodes for removal
-                    to_remove.add(reducemean_idx)
-                    to_remove.add(reshape_idx)
-
-                    # Add the new GlobalAveragePool node in place of the first removed node
-                    replacements[reducemean_idx] = globalavgpool_node
-            elif keepdims == 0:
-                # Check if the output shape after ReduceMean is what we expect for GlobalAveragePool
-                # Input shape is [N, C, H, W], expected output is [N, C] (with keepdims=0)
-                if (len(input_shape) == 4 and
-                    len(output_after_reduce) == 2 and
-                    input_shape[0] == output_after_reduce[0] and  # Batch dimension matches
-                    input_shape[1] == output_after_reduce[1]):   # Channel dimension matches
-
-                    print(f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) and keepdims=0, replacing with GlobalAveragePool")
-
-                    # Create GlobalAveragePool node
-                    globalavgpool_node = {
-                        'op_type': 'GlobalAveragePool',
-                        'name': f"GlobalAveragePool_from_{node['name']}_keepdims0",
-                        'attributes': {},
-                        'inputs': [
-                            node['inputs'][0]  # Original input to ReduceMean
-                        ],
-                        'outputs': [
-                            node['outputs'][0]  # Same output as the ReduceMean node
-                        ]
-                    }
-
-                    # Find the index of the ReduceMean node to replace
-                    reducemean_idx = node['_orig_idx']
-
-                    # Mark the ReduceMean node for removal
-                    to_remove.add(reducemean_idx)
-
-                    # Add the new GlobalAveragePool node in place of the ReduceMean
-                    replacements[reducemean_idx] = globalavgpool_node
-    # Build new nodes list
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            # If this is the first node in the sequence, add the replacement
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-            # Otherwise skip (second node in sequence)
-        else:
-            new_nodes.append(node)
-
-    for node in new_nodes:
-        if '_orig_idx' in node:
-            del node['_orig_idx']
-
-    replaced_count = len([idx for idx in to_remove if idx in replacements])
-    print(f"Replaced {replaced_count} ReduceMean+Reshape sequences with GlobalAveragePool nodes")
-    vk_model.nodes = new_nodes
-    return vk_model
-
-
-def unify_reduce_operators(vk_model):
-    """Unify all reduceXX operators into a single reduce operator with the specific operation stored in attributes."""
-    producer, consumers = build_graph_index(vk_model.nodes)
-
-    nodes = vk_model.nodes
-    for idx, node in enumerate(nodes):
-        node['_orig_idx'] = idx
-
-    to_remove: Set[int] = set()
-    replacements: Dict[int, Dict] = {}
-
-    # Define mapping from ONNX reduce operations to internal representation
-    reduce_ops_map = {
-        'ReduceSum': 'sum',
-        'ReduceMean': 'mean',
-        'ReduceMax': 'max',
-        'ReduceMin': 'min',
-        'ReduceProd': 'prod',
-        'ReduceSumSquare': 'sum_square',
-        'ReduceL1': 'l1_norm',
-        'ReduceL2': 'l2_norm',
-        'ReduceLogSum': 'log_sum',
-        'ReduceLogSumExp': 'log_sum_exp'
-    }
-
-    for node in nodes:
-        op_type = node['op_type']
-        
-        # Check if this is a reduce operation
-        if op_type not in reduce_ops_map:
-            continue
-
-        # Extract axes - could be in attributes (opset13) or inputs (opset18+)
-        axes = []
-        noop_with_empty_axes = node['attributes'].get('noop_with_empty_axes', 0)  # Default is 0 in ONNX
-        
-        # Check if axes is in attributes (opset13 style)
-        if 'axes' in node['attributes']:
-            axes = node['attributes']['axes']
-        else:
-            # Check if axes is in inputs (opset18+ style)
-            # Axes would be the second input (after the data input)
-            if len(node['inputs']) > 1:
-                axes_input_name = node['inputs'][1]['name']
-                if axes_input_name in vk_model.initializers:
-                    axes_tensor = vk_model.initializers[axes_input_name]
-                    axes_array = numpy_helper.to_array(axes_tensor)
-                    axes = axes_array.tolist() if hasattr(axes_array, 'tolist') else list(axes_array)
-        print(f"Unifying {op_type} '{node['name']}' with axes {axes} and noop_with_empty_axes={noop_with_empty_axes}")
-        # Handle empty axes according to ONNX specification
-        if len(axes) == 0:
-            if noop_with_empty_axes == 1:
-                # If noop_with_empty_axes is true and axes is empty, this performs no reduction
-                # We keep the original node as it is a no-op
-                original_idx = node['_orig_idx']
-                to_remove.add(node['_orig_idx'])
-                continue
-            elif noop_with_empty_axes == 0:
-                # If noop_with_empty_axes is false and axes is empty, this reduces all axes
-                # Get input shape to determine all axes
-                input_shape = node['inputs'][0]['shape']
-                axes = list(range(len(input_shape)))  # Reduce over all dimensions
-        
-        # Normalize negative axes to positive
-        input_shape = node['inputs'][0]['shape']
-        normalized_axes = []
-        for ax in axes:
-            if ax < 0:
-                normalized_axes.append(len(input_shape) + ax)
-            else:
-                normalized_axes.append(ax)
-
-        # Create unified reduce node
-        reduce_node = {
-            'op_type': 'Reduce',
-            'name': node['name'],
-            'attributes': {
-                'reduce_op': reduce_ops_map[op_type],
-                'axes': normalized_axes,
-                'keepdims': node['attributes'].get('keepdims', 1),
-            },
-            'inputs': [
-                node['inputs'][0]  # Data input remains the same
-            ],
-            'outputs': node['outputs'][:]  # Copy outputs
-        }
-
-        # Remove axes from inputs if it was there (opset18+)
-        # Keep only the data input
-        if len(node['inputs']) > 1:
-            # Remove the axes input, keeping only the data input
-            reduce_node['inputs'] = [node['inputs'][0]]
-
-        # Mark original node for removal and add replacement
-        original_idx = node['_orig_idx']
-        to_remove.add(original_idx)
-        replacements[original_idx] = reduce_node
-
-    # Build new nodes list
-    new_nodes = []
-    for idx, node in enumerate(nodes):
-        if idx in to_remove:
-            # If this is a node to be replaced, add the replacement
-            if idx in replacements:
-                new_nodes.append(replacements[idx])
-        else:
-            new_nodes.append(node)
-
-    for node in new_nodes:
-        if '_orig_idx' in node:
-            del node['_orig_idx']
-
-    replaced_count = len([idx for idx in to_remove if idx in replacements])
-    print(f"Unified {replaced_count} reduceXX operations into Reduce nodes")
-    vk_model.nodes = new_nodes
-    return vk_model
+                                dag_model.initializers[initializer.name] = new_init
+
+            new_node = Node(
+                op_type=node.op_type,
+                name=node.name,
+                attributes=attributes,
+                inputs=inputs_with_shape,
+                outputs=outputs_with_shape
+            )
+            dag_model.add_node(new_node)
+
+        # Build the DAG structure after adding all nodes
+        dag_model.build_dependencies()
+
+        return dag_model
 
 
 def main():
@@ -2370,31 +1681,35 @@ def main():
         batch_size = int(args.batch)
     else:
         batch_size = 1
-    vk_model = ModelConverter.parse_onnx_model(args.input, batch_size)
+    dag_model = ModelConverter.parse_onnx_model(args.input, batch_size)
 
-    # unsqueeze_initializers(vk_model) # 不是必要，前序sim等fuse实现了
-    move_input_tensor_to_attr(vk_model)
-    merge_initializers(vk_model)
-    convert_flat_to_reshape(vk_model)
-    remove_redundant_reshape(vk_model)
-    fuse_conv_bn(vk_model)
-    fuse_gated_conv(vk_model)
-    fuse_conv_simple_activation(vk_model)
-    replace_reducemean_reshape_with_globalaveragepool(vk_model)
-    unify_reduce_operators(vk_model)
-    replace_globalaveragepool_conv_with_gemm(vk_model)
+    # Apply optimizations
+    move_input_tensor_to_attr(dag_model)
+    merge_initializers(dag_model)
+    convert_flat_to_reshape(dag_model)
+    remove_redundant_reshape(dag_model)
+    fuse_conv_bn(dag_model)
+    fuse_gated_conv(dag_model)
+    fuse_conv_simple_activation(dag_model)
+    
+    # Rebuild DAG after optimizations
+    dag_model.build_dependencies()
+    
     if args.quant == "fp16":
-        quantize_to_fp16_selective(vk_model)
+        quantize_to_fp16_selective(dag_model)
     elif args.quant == "int8":
-        quantize_to_int8_weight_only(vk_model)
-    if args.unify is True:
-        unified_initializers(vk_model)
-    if args.rgba is True:
-        convert_initializers_nchw_to_rgba(vk_model)
+        quantize_to_int8_weight_only(dag_model)
 
+    # Print concurrent execution levels
+    concurrent_levels = dag_model.find_concurrent_nodes()
+    print("\nConcurrent Execution Levels:")
+    for level_idx, level in enumerate(concurrent_levels):
+        print(f"Level {level_idx}: {level}")
+    
+    # Print operator statistics
     op_stats = {}
-    for node in vk_model.nodes:
-        op_type = node['op_type']
+    for node in dag_model.nodes.values():
+        op_type = node.op_type
         op_stats[op_type] = op_stats.get(op_type, 0) + 1
 
     print("\nOperator Statistics:")
@@ -2403,7 +1718,7 @@ def main():
         print(f"{idx}\t{op_type}\t\t{count}")
 
     print("Saving to binary format...")
-    vk_model.save_to_binary(output_bin_path)
+    dag_model.save_to_binary(output_bin_path)
 
     print("Model saved to:", output_bin_path)
     file_size = os.path.getsize(output_bin_path)

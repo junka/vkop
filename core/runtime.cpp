@@ -214,88 +214,111 @@ void Runtime::LoadModel() {
         }
     }
 
+    std::unordered_map<std::string, const load::Node *> node_name_map;
     for (const auto &n : model.nodes) {
-        bool use_ssbo = false;
-        auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
-        if (type == vkop::ops::OpType::UNKNOWN) {
-            // make it as input for next ops
-            continue;
-        }
-        std::vector<std::shared_ptr<ITensor>> node_inputs;
-        std::vector<std::shared_ptr<ITensor>> node_outputs;
-
-        for (const auto &in_shape : n.inputs) {
-            if (tensor_map.find(in_shape.name) != tensor_map.end()) {
-                auto t = tensor_map[in_shape.name];
-                if (t->ref_cnt() != std::numeric_limits<uint16_t>::max()) {
-                    t->ref_dec();
-                }
-                node_inputs.push_back(tensor_map[in_shape.name]);
-            } else if (in_shape.dims.empty()) {
-                node_inputs.push_back(nullptr);
-            } else {
-                printf("we should not reach here %s\n", in_shape.name.c_str());
-                assert(false);
-            }
-        }
-
-        for (const auto &out_shape : n.outputs) {
-            if (tensor_map.find(out_shape.name) != tensor_map.end()) {
-                // model output, seperate tensors
-                assert(tensor_map[out_shape.name]->is_on_GPU());
-                node_outputs.push_back(tensor_map[out_shape.name]);
-            } else {
-                std::string key = "_";
-                for (const auto &dim : out_shape.dims) {
-                    key += std::to_string(dim) + "_";
-                }
-                auto q = outshape_tensor_map[key];
-                if (!q.empty()) {
-                    auto t = q.front();
-                    q.pop();
-                    t->set_ref_cnt(consumers[out_shape.name]);
-                    tensor_map[out_shape.name] = t;
-                    node_outputs.push_back(t);
-                } else {
-                    auto t =
-                        std::make_shared<Tensor<float>>(out_shape.dims, true);
-                    t->set_ref_cnt(consumers[out_shape.name]);
-                    tensor_map[out_shape.name] = t;
-                    node_outputs.push_back(t);
-                }
-            }
-        }
-        for (auto &t : node_inputs) {
-            if (t && t->ref_cnt() == 0) {
-                // recycle to outshape_tensor_map
-                std::string key = "_";
-                for (const auto &dim : t->getShape()) {
-                    key += std::to_string(dim) + "_";
-                }
-                auto q = outshape_tensor_map[key];
-                q.push(t);
-            }
-        }
-        if (type == vkop::ops::OpType::SOFTMAX) {
-            if (node_outputs[0]->num_dims() <= 2) {
-                use_ssbo = true;
-            }
-        }
-        auto op = ops::create_from_type(type, use_ssbo);
-        if (!op) {
-            std::cout << "Fail to create operator" << std::endl;
-            return;
-        }
-
-        op->set_runtime_device(dev, m_cmdpool_);
-        op->setAttribute(n.attributes);
-        op->set_name(n.name);
-
-        node_ops_.push_back(std::move(op));
-        node_attrs_.push_back(n.attributes);
-        node_input_tensors_.push_back(std::move(node_inputs));
-        node_output_tensors_.push_back(std::move(node_outputs));
+        node_name_map[n.name] = &n;
     }
+
+    const auto &concurrent_levels = model.getConcurrentExecutionLevels();
+    printf("Building execution plan with %zu concurrent levels\n",
+           concurrent_levels.size());
+
+    for (size_t level_idx = 0; level_idx < concurrent_levels.size();
+         ++level_idx) {
+        const auto &level_nodes = concurrent_levels[level_idx];
+        printf("Level %zu: %zu nodes\n", level_idx, level_nodes.size());
+        for (const auto &node_name : level_nodes) {
+            auto node_it = node_name_map.find(node_name);
+            if (node_it == node_name_map.end()) {
+                printf("Warning: Node %s not found in model\n",
+                       node_name.c_str());
+                continue;
+            }
+            const auto &n = *(node_it->second);
+            bool use_ssbo = false;
+            auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
+            if (type == vkop::ops::OpType::UNKNOWN) {
+                // make it as input for next ops
+                continue;
+            }
+            std::vector<std::shared_ptr<ITensor>> node_inputs;
+            std::vector<std::shared_ptr<ITensor>> node_outputs;
+
+            for (const auto &in_shape : n.inputs) {
+                if (tensor_map.find(in_shape.name) != tensor_map.end()) {
+                    auto t = tensor_map[in_shape.name];
+                    if (t->ref_cnt() != std::numeric_limits<uint16_t>::max()) {
+                        t->ref_dec();
+                    }
+                    node_inputs.push_back(tensor_map[in_shape.name]);
+                } else if (in_shape.dims.empty()) {
+                    node_inputs.push_back(nullptr);
+                } else {
+                    printf("we should not reach here %s\n",
+                           in_shape.name.c_str());
+                    assert(false);
+                }
+            }
+
+            for (const auto &out_shape : n.outputs) {
+                if (tensor_map.find(out_shape.name) != tensor_map.end()) {
+                    // model output, seperate tensors
+                    assert(tensor_map[out_shape.name]->is_on_GPU());
+                    node_outputs.push_back(tensor_map[out_shape.name]);
+                } else {
+                    std::string key = "_";
+                    for (const auto &dim : out_shape.dims) {
+                        key += std::to_string(dim) + "_";
+                    }
+                    auto q = outshape_tensor_map[key];
+                    if (!q.empty()) {
+                        auto t = q.front();
+                        q.pop();
+                        t->set_ref_cnt(consumers[out_shape.name]);
+                        tensor_map[out_shape.name] = t;
+                        node_outputs.push_back(t);
+                    } else {
+                        auto t = std::make_shared<Tensor<float>>(out_shape.dims,
+                                                                 true);
+                        t->set_ref_cnt(consumers[out_shape.name]);
+                        tensor_map[out_shape.name] = t;
+                        node_outputs.push_back(t);
+                    }
+                }
+            }
+            for (auto &t : node_inputs) {
+                if (t && t->ref_cnt() == 0) {
+                    // recycle to outshape_tensor_map
+                    std::string key = "_";
+                    for (const auto &dim : t->getShape()) {
+                        key += std::to_string(dim) + "_";
+                    }
+                    auto q = outshape_tensor_map[key];
+                    q.push(t);
+                }
+            }
+            if (type == vkop::ops::OpType::SOFTMAX) {
+                if (node_outputs[0]->num_dims() <= 2) {
+                    use_ssbo = true;
+                }
+            }
+            auto op = ops::create_from_type(type, use_ssbo);
+            if (!op) {
+                std::cout << "Fail to create operator" << std::endl;
+                return;
+            }
+
+            op->set_runtime_device(dev, m_cmdpool_);
+            op->setAttribute(n.attributes);
+            op->set_name(n.name);
+
+            node_ops_.push_back(std::move(op));
+            node_attrs_.push_back(n.attributes);
+            node_input_tensors_.push_back(std::move(node_inputs));
+            node_output_tensors_.push_back(std::move(node_outputs));
+        }
+    }
+    printf("Execution plan built with %zu operations\n", node_ops_.size());
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
