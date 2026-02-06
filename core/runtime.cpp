@@ -223,10 +223,15 @@ void Runtime::LoadModel() {
     printf("Building execution plan with %zu concurrent levels\n",
            concurrent_levels.size());
 
+    level_node_indices_.resize(concurrent_levels.size());
+    size_t global_node_index = 0;
+
     for (size_t level_idx = 0; level_idx < concurrent_levels.size();
          ++level_idx) {
         const auto &level_nodes = concurrent_levels[level_idx];
         printf("Level %zu: %zu nodes\n", level_idx, level_nodes.size());
+        level_node_indices_[level_idx].reserve(level_nodes.size());
+
         for (const auto &node_name : level_nodes) {
             auto node_it = node_name_map.find(node_name);
             if (node_it == node_name_map.end()) {
@@ -312,6 +317,7 @@ void Runtime::LoadModel() {
             op->setAttribute(n.attributes);
             op->set_name(n.name);
 
+            level_node_indices_[level_idx].push_back(global_node_index++);
             node_ops_.push_back(std::move(op));
             node_attrs_.push_back(n.attributes);
             node_input_tensors_.push_back(std::move(node_inputs));
@@ -363,31 +369,45 @@ Runtime::GetInitializer(const std::string &name) const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
-    m_cmds_[id_]->wait(dev->getComputeQueue(id_));
-    m_cmds_[id_]->begin();
 #ifdef USE_MEASURE_TIME
     VulkanQueryPool query_pool(dev->getLogicalDevice(), 2,
                                VK_QUERY_TYPE_TIMESTAMP);
-    query_pool.begin(m_cmds_[id_]->get());
 #endif
-    for (size_t i = 0; i < node_ops_.size(); ++i) {
-        node_ops_[i]->onExecute(node_input_tensors_[i], node_output_tensors_[i],
-                                m_cmds_[id_], id_);
+
+    for (int ci = 0; ci < vkop::kInflight; ci++) {
+        m_cmds_[ci]->wait(dev->getComputeQueue(ci));
+        m_cmds_[ci]->begin();
+#ifdef USE_MEASURE_TIME
+        query_pool.begin(m_cmds_[ci]->get());
+#endif
     }
+
+    for (const auto &level_nodes : level_node_indices_) {
+        int id = 0;
+        for (auto node_idx : level_nodes) {
+            // printf("exec node %ld on %d\n", node_idx, id_);
+            node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
+                                           node_output_tensors_[node_idx],
+                                           m_cmds_[id], id);
+            id++;
+            id %= vkop::kInflight;
+        }
+    }
+
+    for (int ci = 0; ci < vkop::kInflight; ci++) {
 #ifdef USE_MEASURE_TIME
-    query_pool.end(m_cmds_[id_]->get());
+        query_pool.end(m_cmds_[ci]->get());
 #endif
-    m_cmds_[id_]->end();
-    m_cmds_[id_]->submit(dev->getComputeQueue(id_));
+        m_cmds_[ci]->end();
+        m_cmds_[ci]->submit(dev->getComputeQueue(ci));
 #ifdef USE_MEASURE_TIME
-    auto r = query_pool.getResults();
-    LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                               dev->getTimestampPeriod());
+        auto r = query_pool.getResults();
+        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
+                                   dev->getTimestampPeriod());
 #endif
+    }
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    id_++;
-    id_ %= vkop::kInflight;
     return elapsed.count() * 1000.0F;
 }
 
@@ -423,6 +443,9 @@ void Runtime::RegisterPostProcess(
     node_attrs_.push_back(attributes);
     node_input_tensors_.push_back(std::move(inputs));
     node_output_tensors_.push_back(std::move(outputs));
+    size_t new_level_idx = level_node_indices_.size();
+    level_node_indices_.resize(new_level_idx + 1);
+    level_node_indices_[new_level_idx].push_back(node_ops_.size() - 1);
     real_outputs_.clear();
     for (size_t i = 0; i < outputs.size(); ++i) {
         real_outputs_["post_" + convert_optype_to_string(ops) +

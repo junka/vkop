@@ -96,6 +96,9 @@ VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
         submit_info.pSignalSemaphores = &semaphore;
         submit_info.commandBufferCount = 1;
         submit_info.pCommandBuffers = &m_commandBuffer_;
+        submit_info.waitSemaphoreCount = 0;
+        submit_info.pWaitSemaphores = nullptr;
+        submit_info.pWaitDstStageMask = nullptr;
         auto ret =
             vkQueueSubmit(queue->getQueue(), 1, &submit_info, VK_NULL_HANDLE);
         if (ret != VK_SUCCESS) {

@@ -2,7 +2,6 @@
 
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 #include "core/Tensor.hpp"
@@ -13,9 +12,11 @@ namespace core {
 
 class Runtime {
   private:
-    int id_ = 0;
     std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
+
+    std::vector<std::vector<size_t>> level_node_indices_;
+
     // Model file path
     std::string model_path_;
 

@@ -8,6 +8,7 @@ namespace vkop {
 VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
     : m_vdev_(vdev) {
     for (auto [qfidx, qcnt, qflags] : vdev->getComputeQueueFamilyIndex()) {
+        printf("create command pool for queue family index %d\n", qfidx);
         createCommandPool(qfidx);
     }
     stagingbuffer_pool_ = std::make_shared<VulkanStagingBufferPool>(m_vdev_);
