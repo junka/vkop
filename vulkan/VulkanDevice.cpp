@@ -954,9 +954,22 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
     for (size_t i = 0; i < descs.size(); ++i) {
+        const std::unordered_map<int, std::string> desc_names = {
+            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
+             "VULKAN_1_1_FEATURES"},
+            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+             "VULKAN_1_2_FEATURES"},
+            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+             "VULKAN_1_3_FEATURES"},
+            {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
+             "VULKAN_1_4_FEATURES"},
+        };
         const auto &desc = descs[i];
-        printf("Descriptor %zu: sType=%d, extensionName=%s, coreVersion=%u\n",
-               i, desc.sType,
+        printf("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u\n",
+               i,
+               desc_names.find(desc.sType) != desc_names.end()
+                   ? desc_names.find(desc.sType)->second.c_str()
+                   : std::to_string(desc.sType).c_str(),
                desc.extensionName ? desc.extensionName : "nullptr",
                desc.corePromotedVersion);
     }
@@ -1042,7 +1055,7 @@ bool VulkanDevice::createLogicalDevice(
             VkQueue queue;
             vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
             computeQueues_.emplace_back(
-                std::make_shared<VulkanQueue>(logicalDevice_, qidx, queue));
+                std::make_shared<VulkanQueue>(qidx, queue));
         }
     }
     return true;

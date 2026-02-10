@@ -29,25 +29,13 @@ void VulkanCommandPool::createCommandPool(uint32_t queueFamilyIndex) {
     pool_info.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
                       VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VkCommandPool cmdpool;
-    if (vkCreateCommandPool(m_vdev_->getLogicalDevice(), &pool_info, nullptr,
-                            &cmdpool) != VK_SUCCESS) {
+    auto ret = vkCreateCommandPool(m_vdev_->getLogicalDevice(), &pool_info,
+                                   nullptr, &cmdpool);
+    if (ret != VK_SUCCESS) {
+        printf("Failed to create command pool %d\n", ret);
         throw std::runtime_error("Failed to create command pool");
     }
     m_commandPool_.emplace_back(cmdpool);
-}
-
-uint64_t VulkanCommandPool::getCompletedTimelineValue(
-    const std::shared_ptr<VulkanQueue> &queue) {
-    if (m_vdev_->is_support_timeline_semaphore()) {
-        uint64_t completed_value = 0;
-        if (VK_SUCCESS != vkGetSemaphoreCounterValue(
-                              m_vdev_->getLogicalDevice(),
-                              queue->getSemaphore(), &completed_value)) {
-            throw std::runtime_error("Failed to get semaphore counter value");
-        }
-        return completed_value;
-    }
-    return m_timelineValue_.load();
 }
 
 void VulkanCommandPool::reset(VkCommandPoolResetFlags flags) {

@@ -113,15 +113,22 @@ class Operator {
 
     virtual OpType get_type() { return type_; }
 
+    std::shared_ptr<VulkanCommandBuffer> get_record() { return m_cmd_; }
+
     void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
                    const std::vector<std::shared_ptr<core::ITensor>> &outputs,
-                   std::shared_ptr<VulkanCommandBuffer> cmd, int id) {
-        m_cmd_ = std::move(cmd);
+                   int id) {
+        if (!m_cmd_) {
+            m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
+        }
         m_id_ = id;
         objs_.clear();
+        m_cmd_->begin();
         execute(inputs, outputs);
+        m_cmd_->end();
+
         if (trace_) {
-            m_cmd_->wait(m_dev_->getComputeQueue());
+            m_cmd_->wait();
             printf("%s: %s\n", convert_optype_to_string(type_).c_str(),
                    name_.c_str());
             dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
@@ -146,7 +153,7 @@ class Operator {
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
-    std::shared_ptr<VulkanCommandBuffer> m_cmd_;
+    std::shared_ptr<VulkanCommandBuffer> m_cmd_ = nullptr;
     std::shared_ptr<VulkanPipeline> pipeline_;
     VkDescriptorSet m_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> writes_;

@@ -22,9 +22,6 @@ class VulkanCommandPool {
         return m_commandPool_[idx % m_commandPool_.size()];
     }
 
-    uint64_t
-    getCompletedTimelineValue(const std::shared_ptr<VulkanQueue> &queue);
-
     uint64_t getNextSubmitValue() {
         return m_timelineValue_.fetch_add(1, std::memory_order_relaxed);
     }

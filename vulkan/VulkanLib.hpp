@@ -90,10 +90,8 @@ namespace vkop {
     PFN(vkInvalidateMappedMemoryRanges)                                        \
     PFN(vkFlushMappedMemoryRanges)                                             \
     PFN(vkDeviceWaitIdle)                                                      \
-    PFN(vkWaitForFences)                                                       \
-    PFN(vkDestroyFence)                                                        \
-    PFN(vkCreateFence)                                                         \
     PFN(vkCreateSemaphore)                                                     \
+    PFN(vkSignalSemaphore)                                                     \
     PFN(vkGetSemaphoreCounterValue)                                            \
     PFN(vkDestroySemaphore)                                                    \
     PFN(vkCmdFillBuffer)                                                       \

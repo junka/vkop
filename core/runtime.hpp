@@ -12,7 +12,7 @@ namespace core {
 
 class Runtime {
   private:
-    std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
+    // std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     std::vector<std::vector<size_t>> level_node_indices_;
@@ -32,6 +32,7 @@ class Runtime {
 
     // Tensor pointers for each node's inputs and outputs
     std::vector<std::unique_ptr<vkop::ops::Operator>> node_ops_;
+    std::vector<std::vector<int>> node_dependency_indices_;
     std::vector<std::unordered_map<std::string, std::string>> node_attrs_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_input_tensors_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_output_tensors_;

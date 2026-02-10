@@ -43,7 +43,6 @@ public:
 
         LOG_INFO("%s",dev->getDeviceName().c_str());
         auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-        auto cmd = std::make_shared<VulkanCommandBuffer>(cmdpool);
 
         auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2);
         if (!op) {
@@ -87,11 +86,13 @@ public:
             }
             t->copyToGPU(cmdpool);
         }
-        cmd->wait(dev->getComputeQueue());
-        cmd->begin();
-        op->onExecute(inputs, outputs, cmd, 0);
-        cmd->end();
-        cmd->submit(dev->getComputeQueue());
+        op->onExecute(inputs, outputs, 0);
+        auto cmd = op->get_record();
+        std::vector<VkSubmitInfo> info;
+        info.push_back(cmd->buildSubmitInfo());
+        VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+        cmd->wait();
+        dev->wait_all_done();
 
         auto check_ret = [&] (int idx, auto type_tag) -> bool {
             using TT = decltype(type_tag);

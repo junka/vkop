@@ -10,15 +10,13 @@ namespace vkop {
 class VulkanQueryPool {
   public:
     VulkanQueryPool(VkDevice device, uint32_t queryCount,
-                    VkQueryType queryType);
+                    VkQueryType queryType = VK_QUERY_TYPE_TIMESTAMP);
 
     ~VulkanQueryPool();
 
     VulkanQueryPool(const VulkanQueryPool &) = delete;
     VulkanQueryPool &operator=(const VulkanQueryPool &) = delete;
     VulkanQueryPool &operator=(VulkanQueryPool &&other) = delete;
-
-    VkQueryPool get() const { return m_queryPool_; }
 
     uint64_t getOneResult(int index);
 

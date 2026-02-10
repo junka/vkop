@@ -360,11 +360,8 @@ template <typename T> class Tensor : public ITensor {
         make_vkbuff(vd, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-
-        {
-            if (cmd) {
-                buff->readBarrier(cmd->get());
-            }
+        if (cmd) {
+            buff->readBarrier(cmd->get());
         }
         return buff;
     }
@@ -473,7 +470,7 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         auto dev = cmdpool->getVulkanDevice();
-        VulkanCommandBuffer cmd(cmdpool, false);
+        VulkanCommandBuffer cmd(cmdpool);
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
@@ -508,7 +505,7 @@ template <typename T> class Tensor : public ITensor {
             img->readBarrier(cmd.get());
             cmd.end();
             cmd.submit(dev->getComputeQueue());
-            cmd.wait(dev->getComputeQueue());
+            cmd.wait();
             stpool->reset();
         }
         toGPU();
@@ -723,7 +720,7 @@ template <typename T> class Tensor : public ITensor {
     void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                          T *src = nullptr) {
         auto dev = cmdpool->getVulkanDevice();
-        VulkanCommandBuffer cmd(cmdpool, false);
+        VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         auto b = stpool->allocate(aligned);
@@ -753,7 +750,7 @@ template <typename T> class Tensor : public ITensor {
         buffer->readBarrier(cmd.get());
         cmd.end();
         cmd.submit(dev->getComputeQueue());
-        cmd.wait(dev->getComputeQueue());
+        cmd.wait();
         stpool->reset();
         toGPU();
     }
@@ -761,7 +758,7 @@ template <typename T> class Tensor : public ITensor {
     void copyBufferToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
 
         auto dev = cmdpool->getVulkanDevice();
-        VulkanCommandBuffer cmd(cmdpool, false);
+        VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
         auto b = stpool->allocate(size_);
         if (!b) {
@@ -783,7 +780,7 @@ template <typename T> class Tensor : public ITensor {
                                         offset);
         cmd.end();
         cmd.submit(dev->getComputeQueue());
-        cmd.wait(dev->getComputeQueue());
+        cmd.wait();
         std::memcpy(data_->data(), b->ptr, size_);
         stpool->reset();
         toCPU();
@@ -800,7 +797,7 @@ template <typename T> class Tensor : public ITensor {
         } else
 #endif
         {
-            VulkanCommandBuffer cmd(cmdpool, false);
+            VulkanCommandBuffer cmd(cmdpool);
 
             auto stpool = cmdpool->getStagingBufferPool();
             auto b = stpool->allocate(img->getImageSize());
@@ -814,7 +811,7 @@ template <typename T> class Tensor : public ITensor {
             img->copyImageToBuffer(cmd.get(), b->buffer, b->offset);
             cmd.end();
             cmd.submit(dev->getComputeQueue());
-            cmd.wait(dev->getComputeQueue());
+            cmd.wait();
             convertRGBAToTensor(static_cast<T *>(b->ptr));
             stpool->reset();
         }

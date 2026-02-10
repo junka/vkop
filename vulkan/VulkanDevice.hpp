@@ -10,44 +10,19 @@
 
 namespace vkop {
 
-constexpr int kInflight = 2;
+constexpr int kInflight = 4;
 class VulkanQueue {
   public:
-    VulkanQueue(VkDevice dev, uint32_t familyIdx, VkQueue queue)
-        : logicalDevice_(dev), familyIdx_(familyIdx), queue_(queue) {
-        createSemaphore();
-    }
-    ~VulkanQueue() { destroySemaphore(); }
+    VulkanQueue(uint32_t familyIdx, VkQueue queue)
+        : familyIdx_(familyIdx), queue_(queue) {}
+    ~VulkanQueue() = default;
 
     VkQueue getQueue() const { return queue_; }
-    VkSemaphore getSemaphore() const { return m_semaphore_; }
     uint32_t getFamilyIdx() const { return familyIdx_; }
 
   private:
-    VkDevice logicalDevice_ = VK_NULL_HANDLE;
     uint32_t familyIdx_;
     VkQueue queue_ = VK_NULL_HANDLE;
-    VkSemaphore m_semaphore_ = VK_NULL_HANDLE;
-
-    void createSemaphore() {
-        VkSemaphoreTypeCreateInfo timeline_info{};
-        timeline_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-        timeline_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-        timeline_info.initialValue = 0;
-
-        VkSemaphoreCreateInfo sem_info{};
-        sem_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-        sem_info.pNext = &timeline_info;
-        if (vkCreateSemaphore(logicalDevice_, &sem_info, nullptr,
-                              &m_semaphore_) != VK_SUCCESS) {
-            throw std::runtime_error("Failed to create timeline semaphore");
-        }
-    }
-    void destroySemaphore() {
-        if (m_semaphore_) {
-            vkDestroySemaphore(logicalDevice_, m_semaphore_, nullptr);
-        }
-    }
 };
 
 struct FeatureDescriptor {

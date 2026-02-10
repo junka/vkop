@@ -1,5 +1,6 @@
 // junka @ 2025
 #include <chrono>
+#include <cstdint>
 #include <limits>
 #include <queue>
 
@@ -8,6 +9,7 @@
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"
+#include "vulkan/vulkan_core.h"
 #ifdef USE_MEASURE_TIME
 #include "include/logger.hpp"
 #include "vulkan/VulkanQueryPool.hpp"
@@ -22,12 +24,7 @@ namespace core {
 Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                  std::string model_path, std::string cache_dir)
     : m_cmdpool_(std::move(cmdpool)), model_path_(std::move(model_path)),
-      cache_dir_(std::move(cache_dir)) {
-    for (int id = 0; id < vkop::kInflight; id++) {
-        m_cmds_[id] =
-            std::make_shared<VulkanCommandBuffer>(m_cmdpool_, true, id);
-    }
-}
+      cache_dir_(std::move(cache_dir)) {}
 
 Runtime::~Runtime() = default;
 
@@ -225,6 +222,11 @@ void Runtime::LoadModel() {
 
     level_node_indices_.resize(concurrent_levels.size());
     size_t global_node_index = 0;
+    size_t total_nodes = 0;
+    for (const auto &level_nodes : concurrent_levels) {
+        total_nodes += level_nodes.size();
+    }
+    node_dependency_indices_.resize(total_nodes);
 
     for (size_t level_idx = 0; level_idx < concurrent_levels.size();
          ++level_idx) {
@@ -246,6 +248,20 @@ void Runtime::LoadModel() {
                 // make it as input for next ops
                 continue;
             }
+
+            std::vector<int> current_node_dependencies;
+            for (const auto &depend_name : n.dependencies) {
+                for (int prev_idx = node_ops_.size() - 1; prev_idx >= 0;
+                     --prev_idx) {
+                    if (node_ops_[prev_idx]->get_name() == depend_name) {
+                        current_node_dependencies.push_back(prev_idx);
+                        break;
+                    }
+                }
+            }
+            node_dependency_indices_[global_node_index] =
+                std::move(current_node_dependencies);
+
             std::vector<std::shared_ptr<ITensor>> node_inputs;
             std::vector<std::shared_ptr<ITensor>> node_outputs;
 
@@ -369,43 +385,52 @@ Runtime::GetInitializer(const std::string &name) const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
-#ifdef USE_MEASURE_TIME
-    VulkanQueryPool query_pool(dev->getLogicalDevice(), 2,
-                               VK_QUERY_TYPE_TIMESTAMP);
-#endif
 
-    for (int ci = 0; ci < vkop::kInflight; ci++) {
-        m_cmds_[ci]->wait(dev->getComputeQueue(ci));
-        m_cmds_[ci]->begin();
-#ifdef USE_MEASURE_TIME
-        query_pool.begin(m_cmds_[ci]->get());
-#endif
-    }
+    std::vector<std::vector<VkSubmitInfo>> submit_infos(vkop::kInflight);
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> last_commands(
+        vkop::kInflight);
 
-    for (const auto &level_nodes : level_node_indices_) {
+    size_t last_level_index = level_node_indices_.size() - 1;
+    for (size_t level_idx = 0; level_idx < level_node_indices_.size();
+         level_idx++) {
+        const auto &level_nodes = level_node_indices_[level_idx];
         int id = 0;
         for (auto node_idx : level_nodes) {
-            // printf("exec node %ld on %d\n", node_idx, id_);
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
-                                           node_output_tensors_[node_idx],
-                                           m_cmds_[id], id);
+                                           node_output_tensors_[node_idx], id);
+            auto cmd = node_ops_[node_idx]->get_record();
+            auto depends = node_dependency_indices_[node_idx];
+            for (auto &dep : depends) {
+                cmd->addWait(node_ops_[dep]->get_record()->getSignalSemaphore(),
+                             node_ops_[dep]->get_record()->getSignalValue());
+            }
+
+            submit_infos[id].push_back(cmd->buildSubmitInfo());
+            if (level_idx == last_level_index) {
+                last_commands[id] = cmd;
+            }
             id++;
             id %= vkop::kInflight;
         }
     }
+    for (int ci = 0; ci < vkop::kInflight; ci++) {
+        if (!submit_infos[ci].empty())
+            VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
+                                        submit_infos[ci]);
+    }
 
     for (int ci = 0; ci < vkop::kInflight; ci++) {
-#ifdef USE_MEASURE_TIME
-        query_pool.end(m_cmds_[ci]->get());
-#endif
-        m_cmds_[ci]->end();
-        m_cmds_[ci]->submit(dev->getComputeQueue(ci));
-#ifdef USE_MEASURE_TIME
-        auto r = query_pool.getResults();
-        LOG_INFO("Time: %f s", static_cast<double>(r[1] - r[0]) * (1e-9) *
-                                   dev->getTimestampPeriod());
-#endif
+        if (last_commands[ci]) {
+            last_commands[ci]->wait();
+        }
     }
+    for (const auto &level_nodes : level_node_indices_) {
+        for (auto node_idx : level_nodes) {
+            auto cmd = node_ops_[node_idx]->get_record();
+            cmd->clearWaits();
+        }
+    }
+
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     return elapsed.count() * 1000.0F;
@@ -439,10 +464,24 @@ void Runtime::RegisterPostProcess(
     auto op = ops::create_from_type(ops, outputs[0]->num_dims() <= 2);
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
+
+    size_t current_op_idx = node_ops_.size();
     node_ops_.push_back(std::move(op));
     node_attrs_.push_back(attributes);
     node_input_tensors_.push_back(std::move(inputs));
     node_output_tensors_.push_back(std::move(outputs));
+
+    std::vector<int> post_process_dependencies;
+    if (!level_node_indices_.empty()) {
+        const auto &last_level_indices = level_node_indices_.back();
+        post_process_dependencies.insert(post_process_dependencies.end(),
+                                         last_level_indices.begin(),
+                                         last_level_indices.end());
+    }
+    node_dependency_indices_.resize(current_op_idx + 1);
+    node_dependency_indices_[current_op_idx] =
+        std::move(post_process_dependencies);
+
     size_t new_level_idx = level_node_indices_.size();
     level_node_indices_.resize(new_level_idx + 1);
     level_node_indices_[new_level_idx].push_back(node_ops_.size() - 1);
