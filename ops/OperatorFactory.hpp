@@ -43,7 +43,7 @@ namespace vkop {
 namespace ops {
 
 static inline std::unique_ptr<Operator>
-create_from_type(OpType type, bool use_ssbo = false) {
+create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0) {
     switch (type) {
     case OpType::ADD:
         return std::make_unique<Add>();
@@ -102,7 +102,7 @@ create_from_type(OpType type, bool use_ssbo = false) {
     case OpType::SUB:
         return std::make_unique<Sub>();
     case OpType::TOPK:
-        return std::make_unique<Topk>();
+        return std::make_unique<Topk>(fp16);
     case OpType::TRANSPOSE:
         return std::make_unique<Transpose>();
     case OpType::SOFTMAX:

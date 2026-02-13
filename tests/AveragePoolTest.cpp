@@ -61,36 +61,10 @@ private:
         }
 
         input = std::make_shared<Tensor<float>>(input_shape_);
-        auto input_cpu = torch_input.cpu().contiguous();
-        std::vector<float> input_vector;
-        input_vector.reserve(input_cpu.numel());
-        auto input_accessor = input_cpu.accessor<float, 4>();
-        for (int i = 0; i < input_shape_[0]; i++) {
-            for (int j = 0; j < input_shape_[1]; j++) {
-                for (int k = 0; k < input_shape_[2]; k++) {
-                    for (int l = 0; l < input_shape_[3]; l++) {
-                        input_vector.push_back(input_accessor[i][j][k][l]);
-                    }
-                }
-            }
-        }
-        input->fillFP32ToCPU(input_vector);
+        fillTensorFromTorch(input, torch_input);
 
         output = std::make_shared<Tensor<float>>(output_shape);
-        auto output_cpu = torch_output.cpu().contiguous();
-        std::vector<float> output_vector;
-        output_vector.reserve(output_cpu.numel());
-        auto output_accessor = output_cpu.accessor<float, 4>();
-        for (int i = 0; i < output_shape[0]; i++) {
-            for (int j = 0; j < output_shape[1]; j++) {
-                for (int k = 0; k < output_shape[2]; k++) {
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        output_vector.push_back(output_accessor[i][j][k][l]);
-                    }
-                }
-            }
-        }
-        output->fillFP32ToCPU(output_vector);
+        fillTensorFromTorch(output, torch_output);
 
         printf("\n===Input==============\n");
         std::cout << torch_input << std::endl;
@@ -105,6 +79,8 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
+
     std::vector<std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, std::vector<int>, bool>> test_configs = {
         {{1, 3, 32, 32}, {4, 8}, {2, 4}, {0, 0, 0, 0}, true},
         {{1, 3, 32, 32}, {4, 8}, {2, 4}, {1, 1, 1, 1}, false},
@@ -130,5 +106,6 @@ int main() {
             return -1;
         }
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

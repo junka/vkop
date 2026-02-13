@@ -59,11 +59,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     PReluTest prelutest;
     if (!prelutest.run_test<float>({prelutest.inputa, prelutest.inputb}, {prelutest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

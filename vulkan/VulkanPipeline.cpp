@@ -123,9 +123,11 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     pipeline_info.stage = shader_stage_create_info;
     pipeline_info.layout = pipelineLayout;
 
-    if (vkCreateComputePipelines(m_device_, VK_NULL_HANDLE, 1, &pipeline_info,
-                                 nullptr, &m_pipeline_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create compute pipeline!");
+    auto ret = vkCreateComputePipelines(m_device_, VK_NULL_HANDLE, 1,
+                                        &pipeline_info, nullptr, &m_pipeline_);
+    if (ret != VK_SUCCESS) {
+        throw std::runtime_error("Failed to create compute pipeline!" +
+                                 std::to_string(ret));
     }
 }
 

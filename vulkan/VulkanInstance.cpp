@@ -57,12 +57,26 @@ void VulkanInstance::createInstance(const std::string &app_name,
         static_cast<uint32_t>(extensions.size());
     create_info.ppEnabledExtensionNames = extensions.data();
 #ifdef USE_VALIDATION_LAYERS
+#if VK_EXT_validation_features
+    std::vector<VkValidationFeatureEnableEXT> validation_feature_enables = {
+        VK_VALIDATION_FEATURE_ENABLE_DEBUG_PRINTF_EXT};
+
+    VkValidationFeaturesEXT validation_features{};
+    validation_features.sType = VK_STRUCTURE_TYPE_VALIDATION_FEATURES_EXT;
+    validation_features.enabledValidationFeatureCount =
+        static_cast<uint32_t>(validation_feature_enables.size());
+    validation_features.pEnabledValidationFeatures =
+        validation_feature_enables.data();
+#endif
     // Validation layers
     std::vector<const char *> validation_layers;
     if (checkValidationLayerSupport(validation_layers)) {
         create_info.enabledLayerCount =
             static_cast<uint32_t>(validation_layers.size());
         create_info.ppEnabledLayerNames = validation_layers.data();
+#if VK_EXT_validation_features
+        create_info.pNext = &validation_features;
+#endif
     } else {
         create_info.enabledLayerCount = 0;
     }
@@ -137,6 +151,13 @@ void VulkanInstance::getRequiredExtensions(
     }
 #endif
 #endif
+#ifdef USE_VALIDATION_LAYERS
+#if VK_EXT_validation_features
+    if (is_ext_supported(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME)) {
+        extensions.push_back(VK_EXT_VALIDATION_FEATURES_EXTENSION_NAME);
+    }
+#endif
+#endif
 #if VK_KHR_get_physical_device_properties2
     if (is_ext_supported(
             VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME)) {
@@ -194,7 +215,8 @@ VkDebugUtilsMessengerEXT VulkanInstance::CreateDebugUtilsMessenger() {
     callback_create_info.flags = 0;
     callback_create_info.messageSeverity =
         VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT |
-        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT |
+        VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
     callback_create_info.messageType =
         VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT |
         VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT |
@@ -227,6 +249,7 @@ VkDebugReportCallbackEXT VulkanInstance::CreateDebugReportCallback() {
     callback_create_info.pNext = nullptr;
     callback_create_info.flags = VK_DEBUG_REPORT_ERROR_BIT_EXT |
                                  VK_DEBUG_REPORT_WARNING_BIT_EXT |
+                                 VK_DEBUG_REPORT_INFORMATION_BIT_EXT |
                                  VK_DEBUG_REPORT_PERFORMANCE_WARNING_BIT_EXT;
     callback_create_info.pfnCallback = &debugReportCallback;
     callback_create_info.pUserData = nullptr;

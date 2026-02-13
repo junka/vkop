@@ -64,6 +64,8 @@ void VulkanBuffer::createBuffer(VkBufferUsageFlags usage, bool device_local) {
     auto ret = m_vdev_->getVMA()->createBuffer(&buffer_info, &m_vma_buffer_,
                                                device_local);
 #else
+    if (device_local) {
+    }
     auto ret = vkCreateBuffer(m_vdev_->getLogicalDevice(), &buffer_info,
                               nullptr, &m_buffer_);
 #endif

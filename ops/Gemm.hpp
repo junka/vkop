@@ -24,6 +24,7 @@ struct alignas(16) GpuGemmParam {
     int fp16a;
     int fp16b;
     int fp16c;
+    int fp16o;
     int activation;
 };
 } // namespace gemm
@@ -34,41 +35,55 @@ class Gemm : public Operator {
         : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                   sizeof(gemm::GpuGemmParam)) {}
+                   sizeof(gemm::GpuGemmParam)) {
+
+        para_.alpha = 1.0F;
+        para_.beta = 1.0F;
+        para_.transA = 0;
+        para_.transB = 0;
+        para_.activation = static_cast<int>(conv2d::ActivationMode::NONE);
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("alpha") != attributes.end()) {
             auto alpha = std::stof(attributes.at("alpha"));
-            alpha_ = alpha;
+            para_.alpha = alpha;
         }
         if (attributes.find("beta") != attributes.end()) {
             auto beta = std::stof(attributes.at("beta"));
-            beta_ = beta;
+            para_.beta = beta;
         }
         if (attributes.find("transA") != attributes.end()) {
-            transA_ = std::stol(attributes.at("transA"));
+            para_.transA = std::stol(attributes.at("transA"));
         }
         if (attributes.find("transB") != attributes.end()) {
-            transB_ = std::stol(attributes.at("transB"));
+            para_.transB = std::stol(attributes.at("transB"));
         }
 
         if (attributes.find("activation") != attributes.end()) {
             std::string activation = attributes.at("activation");
             if (activation == "Relu") {
-                activation_ = conv2d::ActivationMode::RELU;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::RELU);
             } else if (activation == "Sigmoid") {
-                activation_ = conv2d::ActivationMode::SIGMOID;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::SIGMOID);
             } else if (activation == "Tanh") {
-                activation_ = conv2d::ActivationMode::TANH;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::TANH);
             } else if (activation == "HardSwish") {
-                activation_ = conv2d::ActivationMode::HARDSWISH;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::HARDSWISH);
             } else if (activation == "Mish") {
-                activation_ = conv2d::ActivationMode::MISH;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::MISH);
             } else if (activation == "Relu6") {
-                activation_ = conv2d::ActivationMode::RELU6;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::RELU6);
             } else if (activation == "Swish") {
-                activation_ = conv2d::ActivationMode::SWISH;
+                para_.activation =
+                    static_cast<int>(conv2d::ActivationMode::SWISH);
             } else {
                 throw std::invalid_argument("Unsupported activation: " +
                                             activation);
@@ -83,11 +98,11 @@ class Gemm : public Operator {
         int m = inputs[0]->getShape()[0];
         int n = inputs[1]->getShape()[1];
         int k = inputs[0]->getShape()[1];
-        if (transA_) {
+        if (para_.transA) {
             m = inputs[0]->getShape()[1];
             k = inputs[0]->getShape()[0];
         }
-        if (transB_) {
+        if (para_.transB) {
             n = inputs[1]->getShape()[0];
             k = inputs[1]->getShape()[1];
         }
@@ -112,54 +127,50 @@ class Gemm : public Operator {
         if (inputs.size() <= 3) {
             objs_.emplace_back(dummy_buffer_);
         }
-        gemm::GpuGemmParam para;
-        para.M = m;
-        para.N = n;
-        para.K = k;
-        para.alpha = alpha_;
-        para.beta = beta_;
-        para.transA = transA_;
-        para.transB = transB_;
+        para_.M = m;
+        para_.N = n;
+        para_.K = k;
         if (inputs[0]->dtype() == typeid(uint16_t)) {
-            para.fp16a = 1;
+            para_.fp16a = 1;
         } else if (inputs[0]->dtype() == typeid(uint8_t)) {
-            para.fp16a = 2;
+            para_.fp16a = 2;
         } else {
-            para.fp16a = 0;
+            para_.fp16a = 0;
         }
         if (inputs[1]->dtype() == typeid(uint16_t)) {
-            para.fp16b = 1;
+            para_.fp16b = 1;
         } else if (inputs[1]->dtype() == typeid(uint8_t)) {
-            para.fp16b = 2;
+            para_.fp16b = 2;
         } else {
-            para.fp16b = 0;
+            para_.fp16b = 0;
         }
-        para.activation = static_cast<int>(activation_);
 
         if (inputs.size() > 2) {
-            para.has_bias = 1;
+            para_.has_bias = 1;
             if (inputs[2]->dtype() == typeid(uint16_t)) {
-                para.fp16c = 1;
+                para_.fp16c = 1;
             } else if (inputs[2]->dtype() == typeid(uint8_t)) {
-                para.fp16c = 2;
+                para_.fp16c = 2;
             } else {
-                para.fp16c = 0;
+                para_.fp16c = 0;
             }
         }
+        if (outputs[0]->dtype() == typeid(uint16_t)) {
+            para_.fp16o = 1;
+        } else if (inputs[1]->dtype() == typeid(uint8_t)) {
+            para_.fp16o = 2;
+        } else {
+            para_.fp16o = 0;
+        }
 
-        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
-    }
-    void set_runtime_device(
-        const std::shared_ptr<VulkanDevice> &dev,
-        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
-        Operator::set_runtime_device(dev, cmdpool);
+        if (para_.fp16o == 1) {
+            submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), 1);
+        } else {
+            submit(&para_, UP_DIV(n, 16), UP_DIV(m, 16), 1);
+        }
     }
 
-    float alpha_ = 1.0F;
-    float beta_ = 1.0F;
-    int transA_ = 0;
-    int transB_ = 0;
-    conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
+    gemm::GpuGemmParam para_;
 };
 
 } // namespace ops

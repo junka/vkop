@@ -13,7 +13,7 @@ namespace vkop {
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     physicalDevice_ = physicalDevice;
-    if (physicalDevice == VK_NULL_HANDLE) {
+    if (physicalDevice_ == VK_NULL_HANDLE) {
         throw std::runtime_error("Invalid Vulkan physical device handle.");
     }
     if (logicalDevice_ != VK_NULL_HANDLE) {
@@ -87,9 +87,11 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
         hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
         hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
+        vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
     }
-#endif
+#else
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+#endif
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
     this->maxImageArrayLayers_ =
         properties2.properties.limits.maxImageArrayLayers;

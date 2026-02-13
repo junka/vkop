@@ -132,6 +132,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     ConcatTest cctest;
     if (!cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
@@ -145,5 +146,6 @@ int main() {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

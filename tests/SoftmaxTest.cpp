@@ -148,71 +148,17 @@ private:
         }
         printf("]\n");
 
-        printf("\n===Input==============\n");
-        std::cout << torch_input << std::endl;
+        // printf("\n===Input==============\n");
+        // std::cout << torch_input << std::endl;
 
-        printf("\n===Output==============\n");
-        std::cout << torch_output << std::endl;
+        // printf("\n===Output==============\n");
+        // std::cout << torch_output << std::endl;
 
         input = std::make_shared<Tensor<float>>(input_shape_);
-        auto input_cpu = torch_input.cpu().contiguous();
-        std::vector<float> input_vector;
-        input_vector.reserve(input_cpu.numel());
-        if (input_shape_.size() == 4) {
-            auto input_accessor = input_cpu.accessor<float, 4>();
-            for (int i = 0; i < input_shape_[0]; i++) {
-                for (int j = 0; j < input_shape_[1]; j++) {
-                    for (int k = 0; k < input_shape_[2]; k++) {
-                        for (int l = 0; l < input_shape_[3]; l++) {
-                            input_vector.push_back(input_accessor[i][j][k][l]);
-                        }
-                    }
-                }
-            }
-        } else if (input_shape_.size() == 2) {
-            auto input_accessor = input_cpu.accessor<float, 2>();
-            for (int i = 0; i < input_shape_[0]; i++) {
-                for (int j = 0; j < input_shape_[1]; j++) {
-                    input_vector.push_back(input_accessor[i][j]);
-                }
-            }
-        } else if (input_shape_.size() == 1) {
-            auto input_accessor = input_cpu.accessor<float, 1>();
-            for (int i = 0; i < input_shape_[0]; i++) {
-                input_vector.push_back(input_accessor[i]);
-            }
-        }
-        input->fillToCPU(input_vector);
+        fillTensorFromTorch(input, torch_input);
 
         output = std::make_shared<Tensor<float>>(output_shape);
-        auto output_cpu = torch_output.cpu().contiguous();
-        std::vector<float> output_vector;
-        output_vector.reserve(output_cpu.numel());
-        if (output_shape.size() == 4) {
-            auto output_accessor = output_cpu.accessor<float, 4>();
-            for (int i = 0; i < output_shape[0]; i++) {
-                for (int j = 0; j < output_shape[1]; j++) {
-                    for (int k = 0; k < output_shape[2]; k++) {
-                        for (int l = 0; l < output_shape[3]; l++) {
-                            output_vector.push_back(output_accessor[i][j][k][l]);
-                        }
-                    }
-                }
-            }
-        } else if (output_shape.size() == 2) {
-            auto output_accessor = output_cpu.accessor<float, 2>();
-            for (int i = 0; i < output_shape[0]; i++) {
-                for (int j = 0; j < output_shape[1]; j++) {
-                    output_vector.push_back(output_accessor[i][j]);
-                }
-            }
-        } else if (output_shape.size() == 1) {
-            auto output_accessor = output_cpu.accessor<float, 1>();
-            for (int i = 0; i < output_shape[0]; i++) {
-                output_vector.push_back(output_accessor[i]);
-            }
-        }
-        output->fillToCPU(output_vector);
+        fillTensorFromTorch(output, torch_output);
     }
 };
 }
@@ -220,6 +166,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     std::vector<std::tuple<std::vector<int>, int>> test_cases = {
         {{1, 10, 7, 7}, 1},
@@ -272,5 +219,6 @@ int main() {
         }
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

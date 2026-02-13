@@ -171,7 +171,7 @@ void postProcess(const std::shared_ptr<class vkop::core::Tensor<float> >& out)
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+    const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
     auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
     if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
         printf("Please set env VK_ICD_FILENAMES for a valid GPU\n");

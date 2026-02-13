@@ -45,11 +45,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     ReluTest relutest;
     if (!relutest.run_test<float>({relutest.input}, {relutest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

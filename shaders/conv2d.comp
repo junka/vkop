@@ -122,7 +122,7 @@ void conv1x1() {
                     FLOAT4 w2 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[2], 0), 0));
                     FLOAT4 w3 = FLOAT4(texelFetch(uKernel, ivec3(v, oc_vec[3], 0), 0));
                     if (uConstant.accuracy == 2) {
-                        FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4)) * 127.0;
+                        FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4)) * FLOAT(127.0);
                         w0 *= FLOAT(scale_vec[0]);
                         w1 *= FLOAT(scale_vec[1]);
                         w2 *= FLOAT(scale_vec[2]);
@@ -153,7 +153,7 @@ void conv1x1() {
                     w_vec.w = FLOAT(texelFetch(uKernel, ivec3(kernel_layer, oc_vec[3], 0), 0)[kernel_comp]);
                     if (uConstant.accuracy == 2) {
                         FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
-                        w_vec *= scale_vec * 127.0;
+                        w_vec *= scale_vec * FLOAT(127.0);
                     }
                     acc_local += x * w_vec;
                 }
@@ -246,7 +246,7 @@ void conv1x1() {
                     // Fetch weight for each of the 4 output channels
                     FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(c4, local_ic, 0), 0)); // oc4, ic
                     if (uConstant.accuracy == 2) {
-                        vec4 scale_vec = texelFetch(uScalePara, c4) * float(127.0);
+                        FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4)) * FLOAT(127.0);
                         w_vec *= scale_vec;
                     }
                     acc_local += x * w_vec;
@@ -276,7 +276,7 @@ void conv1x1() {
                         w_vec.z = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic + 2, 0), 0)[comp]);
                         w_vec.w = FLOAT(texelFetch(uKernel, ivec3(c4, local_ic + 3, 0), 0)[comp]);
                         if (uConstant.accuracy == 2) {
-                            FLOAT scale = FLOAT(texelFetch(uScalePara, c4)[comp]) * 127.0;
+                            FLOAT scale = FLOAT(texelFetch(uScalePara, c4)[comp]) * FLOAT(127.0);
                             w_vec *= scale;
                         }
                         sum += dot(x_vec, w_vec);

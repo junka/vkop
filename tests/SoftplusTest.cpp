@@ -46,11 +46,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     SoftplusTest sptest;
     if (!sptest.run_test<float>({sptest.input}, {sptest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

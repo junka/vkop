@@ -57,10 +57,12 @@ int main()
 {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     ReshapeTest reshape_test;
     if (!reshape_test.run_test<float>({reshape_test.input, reshape_test.shape}, {reshape_test.output})) {
         return -1;
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

@@ -49,11 +49,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     SubTest subtest;
     if (!subtest.run_test<float>({subtest.inputa, subtest.inputb}, {subtest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

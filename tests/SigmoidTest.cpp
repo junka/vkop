@@ -45,11 +45,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     SigmoidTest sigest;
     if (!sigest.run_test<float>({sigest.input}, {sigest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

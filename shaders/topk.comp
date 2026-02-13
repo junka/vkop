@@ -1,19 +1,28 @@
 #version 450 core
 #extension GL_EXT_subgroup_uniform_control_flow: require
+#ifdef FP16
+#extension GL_AMD_gpu_shader_half_float: enable
+#extension GL_EXT_shader_16bit_storage : enable
+#define FLOAT4 f16vec4
+#define FLOAT float16_t
+#else
+#define FLOAT4 vec4
+#define FLOAT float
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
-layout(set=0, binding = 0) buffer indiceBuffer {
+layout(set=0, binding = 0) writeonly buffer indiceBuffer {
     uint data[];
 } uIndice;
-layout(set=0, binding = 1) buffer valueBuffer {
-    float data[];
+layout(set=0, binding = 1) writeonly buffer valueBuffer {
+    uint data[];
 } uValue;
 layout(set=0, binding = 2) readonly buffer indexBuffer {
     uint data[];
 } uIndex;
 layout(set=0, binding = 3) readonly buffer inputBuffer {
-    float data[];
+    uint data[];
 } uInput;
 
 layout(push_constant) uniform parameter {
@@ -23,17 +32,18 @@ layout(push_constant) uniform parameter {
     int largest;
     int sorted;
     int init;
+    int fp16;
 } uParam;
 
-shared float sharedData[256];
-shared uint sharedIndices[256];
+shared FLOAT sharedData[512];
+shared uint sharedIndices[512];
 
-#define SWAP_FLOAT(a, b)  { float _t = (a); (a) = (b); (b) = _t;}
+#define SWAP_FLOAT(a, b)  { FLOAT _t = (a); (a) = (b); (b) = _t;}
 #define SWAP_UINT(a, b)  { uint _t = (a); (a) = (b); (b) = _t; }
 
-void bitonicSort(int count) {
+void bitonicSort32(int count) {
     int powerOfTwo = 1;
-    while (powerOfTwo < count && powerOfTwo < 256) {
+    while (powerOfTwo < count && powerOfTwo < 512) {
         powerOfTwo <<= 1;
     }
     uint lid = gl_LocalInvocationID.x;
@@ -65,7 +75,39 @@ void bitonicSort(int count) {
     }
 }
 
-void main() {
+
+void bitonicSort16(int count) {
+    int powerOfTwo = 1;
+    while (powerOfTwo < count && powerOfTwo < 512) {
+        powerOfTwo <<= 1;
+    }
+    uint lid = gl_LocalInvocationID.x;
+
+    for (int size = 2; size <= powerOfTwo; size <<= 1) {
+        for (int stride = size >> 1; stride > 0; stride >>= 1) {
+            for (int e = 0; e < 2; ++e) {
+                int i = int(lid) * 2 + e;
+                if (i >= powerOfTwo) continue;
+
+                int j = i ^ stride;
+                if (j > i && j < powerOfTwo) {
+                    bool dir = ((i & size) == 0);
+                    if (uParam.largest != 0) dir = !dir;
+
+                    bool shouldSwap = dir ? (sharedData[i] > sharedData[j])
+                                          : (sharedData[i] < sharedData[j]);
+                    if (shouldSwap) {
+                        SWAP_FLOAT(sharedData[i], sharedData[j]);
+                        SWAP_UINT(sharedIndices[i], sharedIndices[j]);
+                    }
+                }
+            }
+            barrier();
+        }
+    }
+}
+
+void topk32() {
     uint x = gl_GlobalInvocationID.x;
     uint y = gl_GlobalInvocationID.y;
     int lid = int(gl_LocalInvocationID.x);
@@ -81,23 +123,23 @@ void main() {
         int localCount = min(int(N - start), 256);
 
         if (x < N) {
-            sharedData[lid] = uInput.data[x];
+            sharedData[lid] = uintBitsToFloat(uInput.data[x]);    
             if (uParam.init == 0) {
                 sharedIndices[lid] = x;
             } else {
                 sharedIndices[lid] = uIndex.data[x];
             }
         } else {
-            sharedData[lid] = ((uParam.largest != 0) ? -3.4e38 : 3.4e38);
+            sharedData[lid] = ((uParam.largest != 0) ? FLOAT(-3.4e38) : FLOAT(3.4e38));
             sharedIndices[lid] = -1;
         }
         barrier();
 
-        bitonicSort(localCount);
+        bitonicSort32(localCount);
 
         if (lid < uParam.k && lid < localCount) {
             uint outOffset = group_id * uParam.k;
-            uValue.data[outOffset + lid] = sharedData[lid];
+            uValue.data[outOffset + lid] = floatBitsToUint(sharedData[lid]);
             uIndice.data[outOffset + lid] = sharedIndices[lid];
         }
     } else if (uParam.axis == 1) {
@@ -109,25 +151,121 @@ void main() {
         int localCount = min(int(cols - start), 256);
 
         if (x < cols) {
-            sharedData[lid] = uInput.data[y * cols + x];
+            sharedData[lid] = uintBitsToFloat(uInput.data[y * cols + x]);
             if (uParam.init == 0) {
-                sharedIndices[lid] = y * cols + x;
+                sharedIndices[lid] = x;
             } else {
                 sharedIndices[lid] = uIndex.data[y * cols + x];
             }
         } else {
-            sharedData[lid] = ((uParam.largest != 0) ? -3.4e38 : 3.4e38);
+            sharedData[lid] = ((uParam.largest != 0) ? FLOAT(-3.4e38) : FLOAT(3.4e38));
             sharedIndices[lid] = -1;
         }
         barrier();
 
-        bitonicSort(localCount);
+        bitonicSort32(localCount);
 
         uint num_wgx = (cols + 255)/256;
         if (lid < uParam.k && lid < localCount) {
             uint outOffset = (y * num_wgx + group_id) * uParam.k;
-            uValue.data[outOffset + lid] = sharedData[lid];
+            uValue.data[outOffset + lid] = floatBitsToUint(sharedData[lid]);
             uIndice.data[outOffset + lid] = sharedIndices[lid];
         }
+    }
+}
+
+void topk16()
+{
+    uint y = gl_GlobalInvocationID.y;
+    int lid = int(gl_LocalInvocationID.x); // 0~255
+    uint group_id = gl_WorkGroupID.x;
+
+    if (uParam.axis == 1 && y >= uParam.inShape.x) {
+        return;
+    }
+
+    int total_len = (uParam.axis == 0) ? uParam.inShape.x : uParam.inShape.y;
+    int start_offset = int(group_id * 512);   // 512 elements per WG
+    int local_count = min(total_len - start_offset, 512);
+
+    int elem0 = start_offset + lid * 2;
+    int elem1 = elem0 + 1;
+
+    vec2 packed_input = vec2(0.0);
+    uint word_idx = uint(elem0) / 2u;
+
+    if (elem0 < total_len) {
+        uint linear_word_idx;
+        if (uParam.axis == 0) {
+            linear_word_idx = word_idx; // word_idx = elem0/2
+        } else {
+            int packed_cols = (total_len + 1) / 2;
+            linear_word_idx = y * uint(packed_cols) + word_idx;
+        }
+        packed_input = unpackHalf2x16(uInput.data[linear_word_idx]);
+    }
+
+    // Element 0
+    if (elem0 < total_len) {
+        sharedData[lid * 2] = packed_input.x;
+        if (uParam.init == 0) {
+            sharedIndices[lid * 2] = uint(elem0);
+        } else {
+            uint logical_idx0 = (uParam.axis == 0) ? uint(elem0) : (y * uint(total_len) + uint(elem0));
+            sharedIndices[lid * 2] = uIndex.data[logical_idx0];
+        }
+    } else {
+        sharedData[lid * 2] = (uParam.largest != 0) ? FLOAT(-65504.0) : FLOAT(65504.0);
+        sharedIndices[lid * 2] = uint(-1);
+    }
+
+    // Element 1
+    if (elem1 < total_len) {
+        sharedData[lid * 2 + 1] = packed_input.y;
+        if (uParam.init == 0) {
+            sharedIndices[lid * 2 + 1] = uint(elem1);
+        } else {
+            uint logical_idx1 = (uParam.axis == 0) ? uint(elem1) : (y * uint(total_len) + uint(elem1));
+            sharedIndices[lid * 2 + 1] = uIndex.data[logical_idx1];
+        }
+    } else {
+        sharedData[lid * 2 + 1] = (uParam.largest != 0) ? FLOAT(-65504.0) : FLOAT(65504.0);
+        sharedIndices[lid * 2 + 1] = uint(-1);
+    }
+
+    barrier();
+
+    bitonicSort16(local_count);
+
+    // --- Write back ---
+    uint num_wgx = (uint(total_len) + 511u) / 512u;
+    uint out_base = (uParam.axis == 0)
+        ? (group_id * uParam.k)
+        : ((y * num_wgx + group_id) * uParam.k);
+
+    int pair_id = lid;
+    int idx0 = pair_id * 2;
+    int idx1 = idx0 + 1;
+
+    if (idx0 < uParam.k || idx1 < uParam.k) {
+        FLOAT v0 = (idx0 < local_count && idx0 < uParam.k) ? sharedData[idx0] : FLOAT(0.0);
+        FLOAT v1 = (idx1 < local_count && idx1 < uParam.k) ? sharedData[idx1] : FLOAT(0.0);
+        uValue.data[out_base / 2u + pair_id] = packHalf2x16(vec2(v0, v1));
+
+        if (idx0 < uParam.k && idx0 < local_count) {
+            uIndice.data[out_base + idx0] = sharedIndices[idx0];
+        }
+        if (idx1 < uParam.k && idx1 < local_count) {
+            uIndice.data[out_base + idx1] = sharedIndices[idx1];
+        }
+    }
+}
+
+
+void main() {
+    if (uParam.fp16 == 0) {
+        topk32();
+    } else if (uParam.fp16 == 1) {
+        topk16();
     }
 }

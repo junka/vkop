@@ -26,7 +26,7 @@ class VulkanInstance {
     }
 
     void destroyInstance();
-    std::vector<VkPhysicalDevice> getPhysicalDevices() {
+    const std::vector<VkPhysicalDevice> &getPhysicalDevices() const {
         return m_physical_devices_;
     }
 
@@ -51,10 +51,17 @@ class VulkanInstance {
         (void)messageTypes;
         (void)pUserData;
         if (messageSeverity & VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT) {
-            fprintf(stderr, "%s [%d]: %s\n", pCallbackData->pMessageIdName,
+            fprintf(stderr, "Validation Error: %s [%d]: %s\n",
+                    pCallbackData->pMessageIdName,
+                    pCallbackData->messageIdNumber, pCallbackData->pMessage);
+        } else if (messageSeverity &
+                   VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT) {
+            fprintf(stdout, "Validation Warning: %s [%d]: %s\n",
+                    pCallbackData->pMessageIdName,
                     pCallbackData->messageIdNumber, pCallbackData->pMessage);
         } else {
-            fprintf(stdout, "%s [%d]: %s\n", pCallbackData->pMessageIdName,
+            fprintf(stdout, "Validation Info: %s [%d]: %s\n",
+                    pCallbackData->pMessageIdName,
                     pCallbackData->messageIdNumber, pCallbackData->pMessage);
         }
         return VK_FALSE;

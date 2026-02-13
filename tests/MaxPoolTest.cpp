@@ -14,7 +14,8 @@ using vkop::tests::TestCase;
 using vkop::ops::Maxpool2d;
 
 namespace {
-    void maxpool2d_reference(const std::shared_ptr<Tensor<float>>& input, std::shared_ptr<Tensor<float>>& output, std::vector<int> shape,
+    template<typename T>
+    void maxpool2d_reference(const std::shared_ptr<Tensor<T>>& input, std::shared_ptr<Tensor<T>>& output, std::vector<int> shape,
                        int kernel_size, int stride_size, int pad_size) {
         int batch = shape[0];
         int channels = shape[1];
@@ -44,44 +45,54 @@ namespace {
                                 int iw = (ow * stride_width) + pw - pad_width;
                                 if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
                                     int input_idx = (((b * channels + c) * height + ih) * width) + iw;
-                                    max_val = std::max(max_val, (*input)[input_idx]);
+                                    if constexpr(std::is_same_v<T, float>) {
+                                        max_val = std::max(max_val, (*input)[input_idx]);
+                                    } else {
+                                        max_val = std::max(max_val, Tensor<T>::fp16_to_fp32((*input)[input_idx]));
+                                    }
                                 }
                             }
                         }
                         int output_idx = (((b * channels + c) * out_height + oh) * out_width) + ow;
-                        (*output)[output_idx] = max_val;
+                        if constexpr(std::is_same_v<T, float>) {
+                            (*output)[output_idx] = max_val;
+                        } else {
+                            (*output)[output_idx] = Tensor<T>::fp32_to_fp16(max_val);
+                        }
                     }
                 }
             }
         }
     }
 
+template<typename T>
 class MaxpoolTest : public TestCase {
 public:
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> output;
-    int stride_ = 2;
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> output;
+    std::vector<int> input_shape_;
     int kernel_size_ = 3;
+    int stride_ = 2;
     int pad_ = 1;
 
-    std::unordered_map<std::string, std::string> attributes = {
-        {"kernel_shape", std::to_string(kernel_size_)},
-        {"strides", std::to_string(stride_)},
-        {"pads", std::to_string(pad_)},
-        {"dilations", "1"},
-        {"ceil_mode", "0"},
-        {"storage_order", "1"}
-    };
+    std::unordered_map<std::string, std::string> attributes;
 
-    MaxpoolTest() : TestCase("MaxPool") {
+    MaxpoolTest(const std::vector<int>& input_shape, int kernel_size, int stride, int pad) : TestCase("MaxPool"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), pad_(pad) {
+        attributes = {
+            {"kernel_shape", std::to_string(kernel_size_)},
+            {"strides", std::to_string(stride_)},
+            {"pads", std::to_string(pad_)},
+            {"dilations", "1"},
+            {"ceil_mode", "0"},
+            {"storage_order", "1"}
+        };
         initTestdata();
     }
 
 private:
     void initTestdata() {
-        std::vector<int> t = {1, 64, 112, 112};
-        input = std::make_shared<Tensor<float>>(t);
-        output = std::make_shared<Tensor<float>>(t);
+        input = std::make_shared<Tensor<T>>(input_shape_);
+        output = std::make_shared<Tensor<T>>(input_shape_);
         input->reserveOnCPU();
         output->reserveOnCPU();
 
@@ -93,27 +104,61 @@ private:
             (*input)[i] = input_dist(gen);
         }
 
-        maxpool2d_reference(input, output, t, kernel_size_, stride_, pad_);
+        maxpool2d_reference(input, output, input_shape_, kernel_size_, stride_, pad_);
     }
 };
 }
 
+
+
+
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
-    MaxpoolTest maxtest;
-    if (!maxtest.run_test<float>({maxtest.input}, {maxtest.output},
-        [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
-            if (!maxpool_op) {
-                LOG_ERROR("Failed to cast operator to Maxpool2d");
-                return;
-            }
-            maxpool_op->setAttribute(maxtest.attributes);
-        })) {
-        return -1;
+    std::vector<std::tuple<std::vector<int>, int, int, int>> test_cases = {
+        {{1, 3, 224, 224}, 3, 2, 1},
+        {{1, 3, 16, 16}, 1, 2, 1},
+    };
+
+    for (const auto &test_case : test_cases) {
+        auto [input_shape, kernel_size, stride, pad] = test_case;
+        LOG_INFO("Testing Maxpool2d with input shape: [%d, %d, %d, %d], kernel_size: %d, stride: %d, pad: %d",
+                input_shape[0], input_shape[1], input_shape[2], input_shape[3], kernel_size, stride, pad);
+        LOG_INFO("Running test for fp32 ...");
+        MaxpoolTest<float> maxtest(input_shape, kernel_size, stride, pad);
+        if (!maxtest.run_test<float>({maxtest.input}, {maxtest.output},
+            [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
+                if (!maxpool_op) {
+                    LOG_ERROR("Failed to cast operator to Maxpool2d");
+                    return;
+                }
+                maxpool_op->setAttribute(maxtest.attributes);
+            })) {
+            return -1;
+        }
+
+        LOG_INFO("Running test for fp16 ...");
+        MaxpoolTest<uint16_t> maxtest2(input_shape, kernel_size, stride, pad);
+        if (!maxtest.run_test<uint16_t>({maxtest2.input}, {maxtest2.output},
+            [&maxtest2](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
+                if (!maxpool_op) {
+                    LOG_ERROR("Failed to cast operator to Maxpool2d");
+                    return;
+                }
+                maxpool_op->setAttribute(maxtest2.attributes);
+            })) {
+            return -1;
+        }
+
+        
+
     }
+
+    vkop::tests::TestEnv::cleanup();
 
     return 0;
 }

@@ -12,6 +12,7 @@ namespace ops {
 namespace globalaveragepool {
 struct alignas(16) GpuGAPParam {
     ivec4 inShape; // NCHW
+    int accuracy;
 };
 } // namespace globalaveragepool
 
@@ -42,19 +43,24 @@ class GlobalAveragePool : public Operator {
             auto output_buffer = output->as_storage_buffer(m_dev_);
             objs_.emplace_back(output_buffer);
         });
+
+        int accuracy = 0;
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
             objs_.emplace_back(input_image);
+            if (typeid(T) == typeid(uint16_t)) {
+                accuracy = 1;
+            } else if (typeid(T) == typeid(int8_t)) {
+                accuracy = 2;
+            }
         });
 
         globalaveragepool::GpuGAPParam para;
-        para.inShape[0] = inputs[0]->get_batch();
-        para.inShape[1] = inputs[0]->get_channel();
-        para.inShape[2] = inputs[0]->get_height();
-        para.inShape[3] = inputs[0]->get_width();
+        inputs[0]->get_shape(para.inShape);
+        para.accuracy = accuracy;
         submit(&para, UP_DIV(batch, 16), 1, UP_DIV(depth, 4));
     }
 };

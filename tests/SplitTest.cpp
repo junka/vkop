@@ -120,6 +120,7 @@ int main()
 {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     SplitTest split_test;
     const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
@@ -141,5 +142,6 @@ int main()
     })) {
         return -1;
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

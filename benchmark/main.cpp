@@ -65,7 +65,8 @@ int main(int argc, char *argv[]) {
     std::string image_file_path = argv[2];
     std::string labels_file_path = (argc > 3) ? argv[3] : "imagenet_classes.txt";
 
-    auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
+    int precision = 0;
+    auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path, precision);
     rt->LoadModel();
     /* example for debug one node */
     // rt->TraceNode("node_Conv_285");
@@ -75,14 +76,35 @@ int main(int argc, char *argv[]) {
         method = vkop::core::NormMethod::INCEPTION;
     }
     vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), method);
-    auto cls = vkop::core::as_tensor<float>(rt->GetOutput());
-    auto shape = cls->getShape();
-    auto indexs = std::make_shared<vkop::core::Tensor<int>>(shape, true);
-    auto values = std::make_shared<vkop::core::Tensor<float>>(shape, true);
+    std::vector<int> shape;
 
-    auto sf = std::make_shared<vkop::core::Tensor<float>>(shape, true);
-    rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
-    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
+    std::shared_ptr<vkop::core::Tensor<int>> indexs;
+    std::shared_ptr<vkop::core::Tensor<float>> values_float;
+    std::shared_ptr<vkop::core::Tensor<uint16_t>> values_half;
+    auto register_pipeline = [&shape, &rt, &indexs, &values_float, &values_half](auto tensor_type) {
+        using T = decltype(tensor_type);
+        auto cls = vkop::core::as_tensor<T>(rt->GetOutput());
+        shape = cls->getShape();
+        auto sf = std::make_shared<vkop::core::Tensor<T>>(shape, true);
+        rt->RegisterPostProcess(vkop::ops::OpType::SOFTMAX, {{"axis", "-1"}}, {cls}, {sf});
+
+        indexs = std::make_shared<vkop::core::Tensor<int>>(shape, true);
+        auto values = std::make_shared<vkop::core::Tensor<T>>(shape, true);
+        rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "10"}}, {sf}, {values, indexs});
+
+        if constexpr (std::is_same_v<T, float>) {
+            values_float = values;
+        } else {
+            values_half = values;
+        }
+    };
+
+    if (precision == 1) {
+        register_pipeline(uint16_t{});
+    } else {
+        register_pipeline(float{});
+    }
+
 
     double tot_lat = 0.0F;
     int count = 100;
@@ -102,7 +124,9 @@ int main(int argc, char *argv[]) {
 
     for (int i = 0; i < 10; ++i) {
         int index = (*indexs)[i];
-        float value = (*values)[i];
+        float value = (precision == 1) ?
+            static_cast<float>((*values_half)[i]) :
+            (*values_float)[i];
 
         std::string label = "Unknown";
         if (index < static_cast<int>(labels.size())) {

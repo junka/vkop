@@ -93,10 +93,12 @@ private:
 }
 
 
+
 int main()
 {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     TransposeTest trans_test;
     if (!trans_test.run_test<float>({trans_test.input}, {trans_test.output}, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
@@ -109,5 +111,6 @@ int main()
         })) {
         return -1;
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

@@ -2,6 +2,7 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <cassert>
 #include <cstddef>
 #include <iostream>
 #include <sstream>
@@ -19,11 +20,11 @@ class Operator {
   public:
     explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
                       const std::vector<VkDescriptorType> &types,
-                      size_t pc_size = 0)
+                      size_t pc_size = 0, int fp16 = 0)
         : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len),
-          types_(std::move(types)) {
+          types_(std::move(types)), fp16_(fp16) {
         assert(pc_size_ <= 128);
-        ++instance_count_;
+        instance_count_.fetch_add(1);
 
         objs_.reserve(types_.size());
         writes_.resize(types_.size());
@@ -34,10 +35,13 @@ class Operator {
             if (m_d)
                 pipeline_->freeDescriptorSets(m_d);
         }
-        --instance_count_;
-        if (instance_count_ == 0 && dummy_buffer_) {
-            dummy_bufferview_.reset(); // Release the shared buffer
-            dummy_buffer_.reset();     // Release the shared buffer
+        auto cnt = instance_count_.fetch_sub(1);
+        if (cnt == 1 && dummy_buffer_ != nullptr &&
+            dummy_bufferview_ != nullptr) {
+            dummy_bufferview_.reset();
+            dummy_buffer_.reset();
+            dummy_buffer_ = nullptr;
+            dummy_bufferview_ = nullptr;
         }
         m_cmdpool_ = nullptr;
         m_dev_ = nullptr;
@@ -53,7 +57,7 @@ class Operator {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         if (spv_len_ > 0 && spv_) {
-            pipeline_ = std::make_shared<VulkanPipeline>(
+            pipeline_ = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(), types_, pc_size_,
                 reinterpret_cast<const uint32_t *>(spv_), spv_len_);
             for (auto &ds : m_ds_) {
@@ -64,8 +68,10 @@ class Operator {
             dummy_buffer_ = std::make_shared<VulkanBuffer>(
                 m_dev_, 16, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            assert(dummy_buffer_);
             dummy_bufferview_ = std::make_shared<VulkanBufferView>(
                 m_dev_, dummy_buffer_, VK_FORMAT_R32G32B32A32_SFLOAT, 16, 0);
+            assert(dummy_bufferview_);
         }
     }
 
@@ -154,7 +160,8 @@ class Operator {
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     std::shared_ptr<VulkanCommandBuffer> m_cmd_ = nullptr;
-    std::shared_ptr<VulkanPipeline> pipeline_;
+
+    std::unique_ptr<VulkanPipeline> pipeline_;
     VkDescriptorSet m_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> writes_;
     std::vector<VkDescriptorBufferInfo> buffer_infos_;
@@ -172,6 +179,7 @@ class Operator {
     // release them in the end of the execution.
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
+    int fp16_ = 0; // 0: fp32, 1: fp16
 
     using SupportedTypes = std::tuple<float, uint16_t, int, int64_t, int8_t>;
     template <typename Func>

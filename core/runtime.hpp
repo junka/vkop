@@ -12,7 +12,11 @@ namespace core {
 
 class Runtime {
   private:
-    // std::shared_ptr<VulkanCommandBuffer> m_cmds_[vkop::kInflight];
+#ifdef FP16
+    int precision_ = 1;
+#else
+    int precision_ = 0; // 0: fp32, 1: fp16
+#endif
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     std::vector<std::vector<size_t>> level_node_indices_;
@@ -39,8 +43,11 @@ class Runtime {
 
   public:
     // Constructor
-    explicit Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                     std::string model_path, std::string cache_dir = "");
+    Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+            std::string model_path, int precision, std::string cache_dir = "");
+    Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+            std::string model_path, std::string cache_dir = "");
+
     ~Runtime();
 
     // Load cache if available
@@ -63,6 +70,10 @@ class Runtime {
     double Run();
 
     void ReadResult();
+
+    void setPrecision(int precision) { precision_ = precision; }
+
+    int getPrecision() const { return precision_; }
 
     void RegisterPostProcess(
         ops::OpType ops,

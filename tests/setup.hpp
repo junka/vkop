@@ -3,10 +3,13 @@
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "core/Tensor.hpp"
+#include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "include/logger.hpp"
@@ -20,12 +23,56 @@ namespace tests {
 
 using vkop::core::Tensor;
 
+class TestEnv {
+private:
+    static std::shared_ptr<VulkanDevice> dev_;
+    static std::shared_ptr<VulkanCommandPool> cmdpool_;
+    static bool initialized_;
+
+public:
+    static void initialize() {
+        if (initialized_) return;
+
+        const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+        dev_ = std::make_shared<VulkanDevice>(phydevs[0]);
+        LOG_INFO("Initialized Vulkan device: %s", dev_->getDeviceName().c_str());
+        cmdpool_ = std::make_shared<VulkanCommandPool>(dev_);
+        initialized_ = true;
+    }
+
+    static void cleanup() {
+        if (!initialized_) return;
+        cmdpool_.reset();
+        dev_.reset();
+        initialized_ = false;
+    }
+
+    static std::shared_ptr<VulkanDevice> get_device() {
+        return dev_;
+    }
+
+    static std::shared_ptr<VulkanCommandPool> get_command_pool() {
+        return cmdpool_;
+    }
+
+    static bool is_initialized() {
+        return initialized_;
+    }
+};
+
 class TestCase {
 private:
     std::string name_;
+    std::shared_ptr<VulkanDevice> dev_;
+    std::shared_ptr<VulkanCommandPool> cmdpool_;
 public:
     TestCase() = delete;
     explicit TestCase(std::string name): name_(std::move(name)) {
+        if (!TestEnv::is_initialized()) {
+            TestEnv::initialize();
+        }
+        dev_ = TestEnv::get_device();
+        cmdpool_ = TestEnv::get_command_pool();
     }
     ~TestCase() = default;
     TestCase(const TestCase &test) = delete;
@@ -33,23 +80,41 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
+
+    template<typename T>
+    void fillTensorFromTorch(std::shared_ptr<Tensor<T>>& tensor, 
+                             const torch::Tensor& torch_tensor) {
+        auto cpu_tensor = torch_tensor.cpu().contiguous().flatten();
+        std::vector<T> data_vector;
+        data_vector.reserve(cpu_tensor.numel());
+        if constexpr (std::is_same_v<float, T> || std::is_same_v<int, T> ) {
+            auto accessor = cpu_tensor.accessor<T, 1>();
+            for (int64_t i = 0; i < cpu_tensor.numel(); i++) {
+                data_vector.push_back(accessor[i]);
+            }
+        } else if constexpr (std::is_same_v<uint16_t, T>) {
+            auto *data_ptr = cpu_tensor.data_ptr<at::Half>();
+            const auto *uint16_ptr = reinterpret_cast<const uint16_t*>(data_ptr);
+            
+            for (int64_t i = 0; i < cpu_tensor.numel(); i++) {
+                data_vector.push_back(uint16_ptr[i]);
+            }
+        }
+        tensor->fillToCPU(data_vector);
+    }
+
     template <typename T>
     bool run_test(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &expect_outputs,
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
     {
-        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
-        auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
 
-        LOG_INFO("%s",dev->getDeviceName().c_str());
-        auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
-
-        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2);
+        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0);
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
         }
-        op->set_runtime_device(dev, cmdpool);
+        op->set_runtime_device(dev_, cmdpool_);
 
         if (attribute_func) {
             attribute_func(op);
@@ -75,29 +140,30 @@ public:
                 continue;
             }
             auto t = core::as_tensor<T>(input);
+            assert(t);
             if (input->num_dims() <= 2) {
                 if (vkop::ops::OpType::CONV2D == op->get_type() || vkop::ops::OpType::BATCHNORM == op->get_type()) {
-                    t->as_uniform_bufferview(dev);
+                    t->as_uniform_bufferview(dev_);
                 } else {
-                    t->as_storage_buffer(dev);
+                    t->as_storage_buffer(dev_);
                 }
             } else {
-                t->as_input_image(dev, nullptr);
+                t->as_input_image(dev_, nullptr);
             }
-            t->copyToGPU(cmdpool);
+            t->copyToGPU(cmdpool_);
         }
         op->onExecute(inputs, outputs, 0);
         auto cmd = op->get_record();
         std::vector<VkSubmitInfo> info;
         info.push_back(cmd->buildSubmitInfo());
-        VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+        VulkanCommandBuffer::submit(dev_->getComputeQueue(), info);
         cmd->wait();
-        dev->wait_all_done();
+        dev_->wait_all_done();
 
         auto check_ret = [&] (int idx, auto type_tag) -> bool {
             using TT = decltype(type_tag);
             auto output = core::as_tensor<TT>(outputs[idx]);
-            output->copyToCPU(cmdpool);
+            output->copyToCPU(cmdpool_);
             auto oshape = output->getShape();
             output->print_tensor();
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
@@ -170,7 +236,7 @@ public:
                     return false;
             }
         }
-        LOG_INFO("Test Passed for operator: %s", name_.c_str());
++        LOG_INFO("Test Passed for operator: %s, type %s", name_.c_str(), typeid(T).name());
         return true;
     }
 };

@@ -149,6 +149,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
     
     std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
         {{1, 3, 4, 4}, {1, 3, 4, 4}},
@@ -163,5 +164,6 @@ int main() {
 
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

@@ -259,11 +259,6 @@ class Conv2d : public Operator {
         submit(&para, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
-    void set_runtime_device(
-        const std::shared_ptr<VulkanDevice> &dev,
-        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
-        Operator::set_runtime_device(dev, cmdpool);
-    }
 
     std::vector<int> kernel_shape_ = {0, 0};
     std::vector<int> strides_ = {1, 1};

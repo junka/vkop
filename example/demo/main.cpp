@@ -192,7 +192,7 @@ int main(int argc, char *argv[]) {
     Logger::getInstance().enableFileOutput("log", true);
     std::shared_ptr<VulkanDevice> dev;
     try {
-        auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+        const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         printf("Found %ld physical devices\n", phydevs.size());
         for (auto *pdev : phydevs) {
             auto vdev = std::make_shared<VulkanDevice>(pdev);

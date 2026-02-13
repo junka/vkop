@@ -106,6 +106,13 @@ class ITensor {
         return dims_[1];
     }
 
+    void get_shape(ivec4 &shape) const {
+        shape[0] = get_batch();
+        shape[1] = get_channel();
+        shape[2] = get_height();
+        shape[3] = get_width();
+    }
+
     static float fp16_to_fp32(uint16_t h) {
 #if defined(__ARM_NEON) || defined(__aarch64__)
         float f;
@@ -255,6 +262,12 @@ template <typename T> class Tensor : public ITensor {
         }
         if (is_on_GPU) {
             toGPU();
+        }
+    }
+
+    ~Tensor() {
+        if (vkobj_) {
+            vkobj_.reset();
         }
     }
 

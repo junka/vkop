@@ -7,17 +7,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // B' = transpose(B) if transB else B
 // Compute Y = alpha * A' * B' + beta * C,
 
-#ifdef FP16
-#extension GL_AMD_gpu_shader_half_float: enable
-#extension GL_EXT_shader_16bit_storage : enable
-#define FLOAT float16_t
-#define FLOAT4 f16vec4
-#define FLOAT2 f16vec2
-#else
+
 #define FLOAT float
-#define FLOAT4 vec4
 #define FLOAT2 vec2
-#endif
+#define FLOAT4 vec4
 
 #include "activation.comp"
 
@@ -49,16 +42,207 @@ layout(push_constant) uniform paraBuffer {
     int fp16a;
     int fp16b;
     int fp16c;
+    int fp16o;
     int activation;
 } uParams;
 
-void main() {
+
+void gemm32()
+{
     int j = int(gl_GlobalInvocationID.x); // column index in Y
     int i = int(gl_GlobalInvocationID.y); // row index in Y
 
     if (i >= uParams.M || j >= uParams.N) return;
 
     float sum = 0.0;
+    for (int k = 0; k < uParams.K; ++k) {
+        // Load A[i][k] from bufferA, considering transA
+        float a_val;
+        int index;
+        if (uParams.transA == 1) {
+            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
+            index = k * uParams.M + i;
+        } else {
+            // A is stored as M×K, A[i][k] = A_physical[i][k]
+            index = i * uParams.K + k;
+        }
+        a_val = uintBitsToFloat(bufferA.data[index]);
+
+        // Load B[k][j] from bufferB, considering transB
+        float b_val;
+        if (uParams.transB == 1) {
+            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
+            index = j * uParams.K + k;
+        } else {
+            // B is stored as K×N, B[k][j] = B_physical[k][j]
+            index = k * uParams.N + j;
+        }
+        b_val = uintBitsToFloat(bufferB.data[index]);
+        sum += a_val * b_val;
+    }
+
+    int yIndex = i * uParams.N + j;       // C[i][j] in row-major
+    sum *= uParams.alpha;
+    float c_val;
+    if (uParams.has_bias == 1) {
+        c_val = uintBitsToFloat(bufferC.data[yIndex]);
+        sum += c_val * uParams.beta;
+    }
+
+    sum = activation(sum, uParams.activation);
+    bufferY.data[yIndex] = floatBitsToUint(sum);
+}
+
+
+void gemm16() {
+    int j = int(gl_GlobalInvocationID.x); // column index in Y
+    int i = int(gl_GlobalInvocationID.y); // row index in Y
+
+    if (i >= uParams.M || j >= (uParams.N + 1)/2) return;
+
+    vec2 sum = vec2(0.0);
+    for (int k = 0; k < uParams.K; ++k) {
+        // Load A[i][k] from bufferA, considering transA
+        vec2 a_val;
+        int index;
+        if (uParams.transA == 1) {
+            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
+            index = k * uParams.M + i;
+        } else {
+            // A is stored as M×K, A[i][k] = A_physical[i][k]
+            index = i * uParams.K + k;
+        }
+        a_val = vec2(unpackHalf2x16(bufferA.data[index/2])[index%2]);
+
+        // Load B[k][j] from bufferB, considering transB
+        vec2 b_val;
+        if (uParams.transB == 1) {
+            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
+            index = j * 2 * uParams.K + k;
+            b_val.x = unpackHalf2x16(bufferB.data[index/2])[index%2];
+            if (j * 2 + 1 < uParams.N) {
+                index = (j * 2  + 1) * uParams.K + k;
+                b_val.y = unpackHalf2x16(bufferB.data[index/2])[index%2];
+            } else {
+                b_val.y = 0.0;
+            }
+        } else {
+            // B is stored as K×N, B[k][j] = B_physical[k][j]
+            index = k * uParams.N + j * 2;
+            b_val = unpackHalf2x16(bufferB.data[index/2]);
+        }
+        sum += a_val * b_val;
+    }
+
+    int yIndex = i * uParams.N + j * 2;       // C[i][j] in row-major
+    sum *= uParams.alpha;
+    vec2 c_val;
+    if (uParams.has_bias == 1) {
+        c_val = unpackHalf2x16(bufferC.data[yIndex/2]);
+        sum += c_val * uParams.beta;
+    }
+
+    sum = activation(sum, uParams.activation);
+
+    bufferY.data[yIndex/2] = packHalf2x16(sum);
+}
+
+void gemmMixed16() {
+    int j = int(gl_GlobalInvocationID.x); // column index in Y
+    int i = int(gl_GlobalInvocationID.y); // row index in Y
+
+    if (i >= uParams.M || j >= (uParams.N + 1)/2) return;
+
+    vec2 sum = vec2(0.0);
+
+    for (int k = 0; k < uParams.K; ++k) {
+        // Load A[i][k] from bufferA, considering transA
+        float a_val;
+        int index;
+        if (uParams.transA == 1) {
+            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
+            index = k * uParams.M + i;
+        } else {
+            // A is stored as M×K, A[i][k] = A_physical[i][k]
+            index = i * uParams.K + k;
+        }
+        if (uParams.fp16a == 1) {
+            a_val = unpackHalf2x16(bufferA.data[index/2])[index%2];
+        } else {
+            a_val = uintBitsToFloat(bufferA.data[index]);
+        }
+
+        // Load B[k][j] from bufferB, considering transB
+        float b_val0;
+        float b_val1 = 0;
+        if (uParams.transB == 1) {
+            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
+            index = j * 2 * uParams.K + k;
+            if (uParams.fp16b == 1) {
+                b_val0 = unpackHalf2x16(bufferB.data[index/2])[index%2];
+                if (j * 2 + 1 < uParams.N) {
+                    index = (j * 2  + 1) * uParams.K + k;
+                    b_val1 = unpackHalf2x16(bufferB.data[index/2])[index%2];
+                }
+            } else {
+                b_val0 = uintBitsToFloat(bufferB.data[index]);
+                if (j * 2 + 1 < uParams.N) {
+                    index = (j * 2  + 1) * uParams.K + k;
+                    b_val1 = uintBitsToFloat(bufferB.data[index]);
+                }
+            }
+        } else {
+            // B is stored as K×N, B[k][j] = B_physical[k][j]
+            index = k * uParams.N + j * 2;
+            if (uParams.fp16b == 1) {
+                vec2 b_val = unpackHalf2x16(bufferB.data[index/2]);
+                b_val0 = b_val.x;
+                b_val1 = b_val.y;
+            } else {
+                b_val0 = uintBitsToFloat(bufferB.data[index]);
+                if (j * 2 + 1 < uParams.N) {
+                    b_val1 = uintBitsToFloat(bufferB.data[index + 1]);
+                }
+            }
+        }
+        sum.x += a_val * b_val0;
+        sum.y += a_val * b_val1;
+    }
+
+    int yIndex = i * uParams.N + j * 2;       // C[i][j] in row-major
+    sum *= uParams.alpha;
+    float c_val0;
+    float c_val1 = 0;
+    if (uParams.has_bias == 1) {
+        if (uParams.fp16c == 1) {
+            vec2 c_val = unpackHalf2x16(bufferC.data[yIndex/2]);
+            c_val0 = c_val.x;
+            if (j * 2 + 1 < uParams.N) {
+                c_val1 = c_val.y;
+            }
+        } else {
+            c_val0 = uintBitsToFloat(bufferC.data[yIndex]);
+            if (j * 2 + 1 < uParams.N) {
+                c_val1 = uintBitsToFloat(bufferC.data[yIndex + 1]);
+            }
+        }
+        sum.x += c_val0 * uParams.beta;
+        sum.y += c_val1 * uParams.beta;
+    }
+
+    sum = activation(sum, uParams.activation);
+
+    bufferY.data[yIndex/2] = packHalf2x16(sum);
+}
+
+void gemmMixed32() {
+    int j = int(gl_GlobalInvocationID.x); // column index in Y
+    int i = int(gl_GlobalInvocationID.y); // row index in Y
+
+    if (i >= uParams.M || j >= uParams.N) return;
+
+    float sum = 0.0;
+
     for (int k = 0; k < uParams.K; ++k) {
         // Load A[i][k] from bufferA, considering transA
         float a_val;
@@ -105,13 +289,18 @@ void main() {
         sum += c_val * uParams.beta;
     }
 
-    // if (uParams.fp16 == 1) {
-    //     vec2 y_val = unpackHalf2x16(bufferY.data[yIndex/2]);
-    //     y_val[yIndex%2] = sum;
-    //     bufferY.data[yIndex/2] = packHalf2x16(y_val);
-    // } else {
-    //     bufferY.data[yIndex] = floatBitsToUint(sum);
-    // }
     sum = activation(sum, uParams.activation);
     bufferY.data[yIndex] = floatBitsToUint(sum);
+}
+
+void main() {
+    if (uParams.fp16o == 0 && uParams.fp16a == 0 && uParams.fp16b == 0 && uParams.fp16c == 0) {
+        gemm32();
+    } else if (uParams.fp16o == 1 && uParams.fp16a == 1 && uParams.fp16b == 1 && uParams.fp16c == 1) {
+        gemm16();
+    } else if (uParams.fp16o == 1) {
+        gemmMixed16();
+    } else if (uParams.fp16o == 0) {
+        gemmMixed32();
+    }
 }

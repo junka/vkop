@@ -9,17 +9,17 @@
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"
-#include "vulkan/vulkan_core.h"
-#ifdef USE_MEASURE_TIME
-#include "include/logger.hpp"
-#include "vulkan/VulkanQueryPool.hpp"
-#endif
 
 namespace vkop {
 std::shared_ptr<VulkanBuffer> ops::Operator::dummy_buffer_ = nullptr;
 std::shared_ptr<VulkanBufferView> ops::Operator::dummy_bufferview_ = nullptr;
 std::atomic<int> ops::Operator::instance_count_{0};
 namespace core {
+
+Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                 std::string model_path, int precision, std::string cache_dir)
+    : precision_(precision), m_cmdpool_(std::move(cmdpool)),
+      model_path_(std::move(model_path)), cache_dir_(std::move(cache_dir)) {}
 
 Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                  std::string model_path, std::string cache_dir)
@@ -61,11 +61,19 @@ void Runtime::LoadModel() {
     }
 
     for (const auto &o : model.outputs) {
-        auto t = std::make_shared<Tensor<float>>(o.dims, true);
-        t->set_ref_cnt_forever();
-        outputs_[o.name] = t;
-        tensor_map[o.name] = t;
-        real_outputs_[o.name] = t;
+        if (precision_ == 1) {
+            auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
+        } else {
+            auto t = std::make_shared<Tensor<float>>(o.dims, true);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
+        }
     }
 
     auto handle_floating_point_tensor = [&](const load::Initializer &init,
@@ -299,11 +307,19 @@ void Runtime::LoadModel() {
                         tensor_map[out_shape.name] = t;
                         node_outputs.push_back(t);
                     } else {
-                        auto t = std::make_shared<Tensor<float>>(out_shape.dims,
-                                                                 true);
-                        t->set_ref_cnt(consumers[out_shape.name]);
-                        tensor_map[out_shape.name] = t;
-                        node_outputs.push_back(t);
+                        if (precision_ == 1) {
+                            auto t = std::make_shared<Tensor<uint16_t>>(
+                                out_shape.dims, true);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
+                        } else {
+                            auto t = std::make_shared<Tensor<float>>(
+                                out_shape.dims, true);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
+                        }
                     }
                 }
             }
@@ -323,15 +339,15 @@ void Runtime::LoadModel() {
                     use_ssbo = true;
                 }
             }
-            auto op = ops::create_from_type(type, use_ssbo);
+            auto op = ops::create_from_type(type, use_ssbo, precision_);
             if (!op) {
                 std::cout << "Fail to create operator" << std::endl;
                 return;
             }
 
+            op->set_name(n.name);
             op->set_runtime_device(dev, m_cmdpool_);
             op->setAttribute(n.attributes);
-            op->set_name(n.name);
 
             level_node_indices_[level_idx].push_back(global_node_index++);
             node_ops_.push_back(std::move(op));
@@ -447,6 +463,9 @@ void Runtime::ReadResult() {
         } else if (p.second->dtype() == typeid(int)) {
             auto t = vkop::core::as_tensor<int>(p.second);
             t->copyToCPU(m_cmdpool_);
+        } else if (p.second->dtype() == typeid(uint16_t)) {
+            auto t = vkop::core::as_tensor<uint16_t>(p.second);
+            t->copyToCPU(m_cmdpool_);
         } else {
             assert(false);
         }
@@ -462,6 +481,7 @@ void Runtime::RegisterPostProcess(
     auto dev = m_cmdpool_->getVulkanDevice();
 
     auto op = ops::create_from_type(ops, outputs[0]->num_dims() <= 2);
+    op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
 

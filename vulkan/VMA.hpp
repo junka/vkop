@@ -50,6 +50,8 @@ class VMA {
 
     static void *getMappedMemory(struct VmaBuffer *buf);
 
+    void getStats();
+
     VMA() = delete;
     VMA(const VMA &) = delete;
     VMA(const VMA &&) = delete;

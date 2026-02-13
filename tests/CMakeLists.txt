@@ -101,7 +101,7 @@ find_library(C10_LIBRARY
 )
 file(GLOB TORCH_DLLS "${TORCH_LIB_DIR}/*.dll")
 foreach(TEST ${TESTS})
-    add_executable(${TEST} ${TEST}.cpp)
+    add_executable(${TEST} ${TEST}.cpp setup.cpp)
     if (USE_FP16)
         target_compile_definitions(${TEST} PUBLIC FP16)
     endif()
@@ -132,6 +132,8 @@ endforeach()
 
 file(COPY ../model/add_conv_model.vkopbin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
 
+if("ModelTest" IN_LIST TESTS)
 target_compile_definitions(ModelTest PRIVATE
     TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
 )
+endif()

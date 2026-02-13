@@ -92,11 +92,13 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     MatMulTest mmtest;
     if (!mmtest.run_test<float>({mmtest.inputa, mmtest.inputb}, {mmtest.output})) {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

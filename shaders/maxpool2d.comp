@@ -1,5 +1,17 @@
 #version 440 core
 
+#ifdef FP16
+#extension GL_AMD_gpu_shader_half_float: enable
+#extension GL_EXT_shader_16bit_storage : enable
+#define FLOAT float16_t
+#define FLOAT4 f16vec4
+#define FLOAT2 f16vec2
+#else
+#define FLOAT float
+#define FLOAT4 vec4
+#define FLOAT2 vec2
+#endif
+
 layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
 layout(set=0, binding=1) uniform sampler2DArray uInput;
 
@@ -44,7 +56,7 @@ void main()
     int H_in = uConstant.inputSize.y;
 
     // Initialize with very small value
-    vec4 max_val = vec4(-100000.0);
+    FLOAT4 max_val = FLOAT4(-100000.0);
 
     // Kernel bounds with clipping
     ivec2 k_start = max(ivec2(0), -start_input);
@@ -60,8 +72,8 @@ void main()
             ivec2 input_coord = ivec2(in_pixel.x, in_y_full);
 
             // Sample from the same layer (c4)
-            vec4 val = texelFetch(uInput, ivec3(input_coord, c4), 0);
-            max_val = max(max_val, val);
+            FLOAT4 val = FLOAT4(texelFetch(uInput, ivec3(input_coord, c4), 0));
+            max_val = FLOAT4(max(max_val, val));
         }
     }
 

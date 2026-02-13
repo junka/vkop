@@ -22,6 +22,12 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     if (m_layers_ == 0 || m_layers_ > vdev->getMaxImageArrayLayers()) {
         throw std::runtime_error("Invalid Vulkan image layers.");
     }
+    if (dim.width > 32768 || dim.height > 32768) {
+        throw std::runtime_error("too large Vulkan image size.");
+    }
+    if (m_layers_ > 2048) {
+        throw std::runtime_error("too many Vulkan image layers.");
+    }
     calcImageSize();
     createImage();
 #ifndef USE_VMA
@@ -35,6 +41,8 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
                                   &mem_requirements2);
     VkMemoryRequirements memory_requirements =
         mem_requirements2.memoryRequirements;
+    printf("mem req %lu, align %lu\n", memory_requirements.size,
+           memory_requirements.alignment);
 #else
     VkMemoryRequirements memoryRequirements;
     vkGetImageMemoryRequirements(m_device, m_image, &memoryRequirements);
@@ -52,7 +60,7 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     (void)ext_fd;
     (void)requireProperties;
 #endif
-    createImageView();
+    createImageView(0, m_layers_);
     createSampler();
 }
 
@@ -220,6 +228,8 @@ void VulkanImage::createImage() {
     if (m_dim_.depth == 1) {
         m_imagetype_ = VK_IMAGE_TYPE_2D;
     }
+    printf("create image size %d %d %d layers %d, size %d vs \n", m_dim_.width,
+           m_dim_.height, m_dim_.depth, m_layers_, getImageSize());
 
     VkImageCreateInfo image_create_info = {};
     image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -263,7 +273,7 @@ void VulkanImage::destroyImage() {
 #endif
 }
 
-void VulkanImage::createImageView() {
+void VulkanImage::createImageView(uint32_t base_layer, uint32_t layer_count) {
     VkImage img = getImage();
     VkImageViewCreateInfo info = {};
     info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
@@ -278,8 +288,8 @@ void VulkanImage::createImageView() {
     info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     info.subresourceRange.baseMipLevel = 0;
     info.subresourceRange.levelCount = 1;
-    info.subresourceRange.baseArrayLayer = 0;
-    info.subresourceRange.layerCount = m_layers_;
+    info.subresourceRange.baseArrayLayer = base_layer;
+    info.subresourceRange.layerCount = layer_count;
 
     if (vkCreateImageView(m_vdev_->getLogicalDevice(), &info, nullptr,
                           &m_imageView_) != VK_SUCCESS) {

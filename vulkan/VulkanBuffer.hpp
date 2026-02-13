@@ -51,11 +51,21 @@ class VulkanBuffer : public VulkanResource {
                                  VkBuffer srcbuffer, VkDeviceSize srcoffset,
                                  VkDeviceSize size, VkDeviceSize offset = 0);
 
+    void *getMappedMemory() {
 #ifdef USE_VMA
-    void *getMappedMemory() override {
         return VMA::getMappedMemory(&m_vma_buffer_);
-    };
+
+#else
+        void *data = nullptr;
+        vkMapMemory(m_vdev_->getLogicalDevice(), getMemory(), getOffset(),
+                    VK_WHOLE_SIZE, 0, &data);
+        return data;
 #endif
+    };
+
+    void unmapMemory() {
+        vkUnmapMemory(m_vdev_->getLogicalDevice(), getMemory());
+    }
 
   private:
 #ifndef USE_VMA

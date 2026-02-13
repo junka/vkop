@@ -17,7 +17,7 @@ using vkop::core::ITensor;
 namespace {
 template <typename T>
 void reference_gemm(const std::shared_ptr<Tensor<T>> &inputa, const std::shared_ptr<Tensor<T>> &inputb,
-        const std::shared_ptr<Tensor<T>> &inputc, std::shared_ptr<Tensor<float>> &output,
+        const std::shared_ptr<Tensor<T>> &inputc, std::shared_ptr<Tensor<T>> &output,
         int M, int N, int K, float alpha, float beta, bool transA, bool transB, bool has_bias) {
     for (int i = 0; i < M; ++i) {
         for (int j = 0; j < N; ++j) {
@@ -69,7 +69,11 @@ void reference_gemm(const std::shared_ptr<Tensor<T>> &inputa, const std::shared_
                    sum += beta * (*inputc)[(i * N) + j];
                 }
             }
-            (*output)[(i * N) + j] = sum;
+            if constexpr (std::is_same_v<T, float>) {
+                (*output)[(i * N) + j] = sum;
+            } else if constexpr (std::is_same_v<T, uint16_t>) {
+                (*output)[(i * N) + j] = ITensor::fp32_to_fp16(sum);
+            }
         }
     }
 }
@@ -80,27 +84,30 @@ public:
     std::shared_ptr<Tensor<T>> inputa;
     std::shared_ptr<Tensor<T>> inputb;
     std::shared_ptr<Tensor<T>> inputc;
-    std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<T>> output;
 
+    std::vector<int> t1;
+    std::vector<int> t2;
     float alpha = 1.0F;
     float beta = 1.0F;
-    bool transA = false;
-    bool transB = true;
+    bool transA;
+    bool transB;
 
-    std::unordered_map<std::string, std::string> attr = {
-        {"alpha", "1"},
-        {"beta", "1"},
-        {"transA", transA ? "1" : "0"},
-        {"transB", transB ? "1" : "0"},
-    };
-    GemmTest() : TestCase("Gemm") {
+    std::unordered_map<std::string, std::string> attr;
+
+    GemmTest(const std::vector<int> &inshapeA, const std::vector<int> &inshapeB, float alpha, float beta, bool transA, bool transB) : TestCase("Gemm"),
+     t1(inshapeA), t2(inshapeB), alpha(alpha), beta(beta), transA(transA), transB(transB) {
+        attr = {
+            {"alpha", "1"},
+            {"beta", "1"},
+            {"transA", transA ? "1" : "0"},
+            {"transB", transB ? "1" : "0"},
+        };
         initTestdata();
     }
 
 private:
     void initTestdata() {
-        std::vector<int> t1 = {1, 2048};
-        std::vector<int> t2 = {1000, 2048};
         inputa = std::make_shared<Tensor<T>>(t1);
         inputb = std::make_shared<Tensor<T>>(t2);
         int m = transA ? t1[1] : t1[0];
@@ -109,7 +116,7 @@ private:
         int n = transB ? t2[0] : t2[1];
         int k = ka;
         inputc = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
-        output = std::make_shared<Tensor<float>>(std::vector<int>{t1[0], t2[1]});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{t1[0], t2[1]});
         inputa->reserveOnCPU();
         inputb->reserveOnCPU();
         inputc->reserveOnCPU();
@@ -183,7 +190,11 @@ private:
         printf("Output:\n");
         for (int i = 0; i < m; i++) {
             for (int j = 0; j < n; j++) {
-                std::cout << (*output)[(i * n) + j] << " ";
+                if (typeid(T) == typeid(uint16_t)) {
+                    std::cout << ITensor::fp16_to_fp32((*output)[(i * n) + j]) << " ";
+                } else {
+                    std::cout << (*output)[(i * n) + j] << " ";
+                }
             }
             printf("\n");
         }
@@ -194,32 +205,46 @@ private:
 
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    GemmTest<float> gmtest1;
-    if (!gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
-        [&gmtest1](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *gemm_op = dynamic_cast<Gemm *>(op.get());
-            if (!gemm_op) {
-                LOG_ERROR("Failed to cast operator to Gemm");
-                return;
-            }
-            gemm_op->setAttribute(gmtest1.attr);
-        })) {
-        return -1;
+    Logger::getInstance().enableFileOutput("log", true);
+    vkop::tests::TestEnv::initialize();
+
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>, float, float, bool, bool>> testcases = {
+        {{1, 20}, {20, 16}, 1.0F, 1.0F, false, false},
+        {{1, 2048}, {1000, 2048}, 1.0F, 1.0F, false, true},
+    };
+
+    for (const auto &testcase : testcases) {
+        auto [inshapeA, inshapeB, alpha, beta, transA, transB] = testcase;
+
+        LOG_INFO("Testing [%d, %d], [%d, %d], %f, %f, %d, %d", inshapeA[0], inshapeA[1], inshapeB[0], inshapeB[1], alpha, beta, transA, transB);
+        LOG_INFO("Testing FP32");
+        GemmTest<float> gmtest1(inshapeA, inshapeB, alpha, beta, transA, transB);
+        if (!gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
+            [&gmtest1](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *gemm_op = dynamic_cast<Gemm *>(op.get());
+                if (!gemm_op) {
+                    LOG_ERROR("Failed to cast operator to Gemm");
+                    return;
+                }
+                gemm_op->setAttribute(gmtest1.attr);
+            })) {
+            return -1;
+        }
+        LOG_INFO("Testing FP16");
+        GemmTest<uint16_t> gmtest(inshapeA, inshapeB, alpha, beta, transA, transB);
+        if (!gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
+            [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *gemm_op = dynamic_cast<Gemm *>(op.get());
+                if (!gemm_op) {
+                    LOG_ERROR("Failed to cast operator to Gemm");
+                    return;
+                }
+                gemm_op->setAttribute(gmtest.attr);
+            })) {
+            return -1;
+        }
     }
 
-    GemmTest<uint16_t> gmtest;
-    if (!gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
-        [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *gemm_op = dynamic_cast<Gemm *>(op.get());
-            if (!gemm_op) {
-                LOG_ERROR("Failed to cast operator to Gemm");
-                return;
-            }
-            gemm_op->setAttribute(gmtest.attr);
-        })) {
-        return -1;
-    }
-
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

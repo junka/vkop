@@ -99,7 +99,7 @@ class VulkanImage : public VulkanResource {
 
     void createImage();
 
-    void createImageView();
+    void createImageView(uint32_t base_layer, uint32_t layer_count);
 
     void createSampler();
 

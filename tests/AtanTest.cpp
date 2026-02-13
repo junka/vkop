@@ -44,6 +44,8 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
+
     std::vector<std::vector<int>> test_cases = {
         {10, 5, 64, 64},
         {1, 3, 128, 128},
@@ -56,5 +58,6 @@ int main() {
             return -1;
         }
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

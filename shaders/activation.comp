@@ -52,4 +52,25 @@ FLOAT4 activation(FLOAT4 x, int act_type) {
     }
 }
 
+FLOAT2 activation(FLOAT2 x, int act_type) {
+    switch (act_type) {
+        case ACTIVATION_RELU:
+            return max(FLOAT2(0.0), x);
+        case ACTIVATION_SIGMOID:
+            return FLOAT2(1.0) / (FLOAT2(1.0) + exp(-x));
+        case ACTIVATION_TANH:
+            return tanh(x);
+        case ACTIVATION_HSWISH:
+            return x * clamp(x + FLOAT2(3.0), FLOAT2(0.0), FLOAT2(6.0)) / FLOAT2(6.0);
+        case ACTIVATION_MISH:
+            return x * tanh(log(FLOAT2(1.0) + exp(x)));
+        case ACTIVATION_RELU6:
+            return clamp(x, FLOAT2(0.0), FLOAT2(6.0));
+        case ACTIVATION_SWISH:
+            return x * (FLOAT2(1.0)/(FLOAT2(1.0) + exp(-x)));
+        default:
+            return x;
+    }
+}
+
 #endif

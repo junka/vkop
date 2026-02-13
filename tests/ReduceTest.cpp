@@ -354,6 +354,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
     
     ReduceTest reducetest;
     for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
@@ -371,5 +372,6 @@ int main() {
         }
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

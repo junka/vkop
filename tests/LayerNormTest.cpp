@@ -125,60 +125,16 @@ private:
         std::cout << torch_output << std::endl;
 
         input = std::make_shared<Tensor<float>>(input_shape_);
-        auto input_cpu = torch_input.cpu().contiguous();
-        std::vector<float> input_vector;
-        input_vector.reserve(input_cpu.numel());
-        auto input_accessor = input_cpu.accessor<float, 4>();
-        for (int i = 0; i < input_shape_[0]; i++) {
-            for (int j = 0; j < input_shape_[1]; j++) {
-                for (int k = 0; k < input_shape_[2]; k++) {
-                    for (int l = 0; l < input_shape_[3]; l++) {
-                        input_vector.push_back(input_accessor[i][j][k][l]);
-                    }
-                }
-            }
-        }
-        input->fillToCPU(input_vector);
+        fillTensorFromTorch(input, torch_input);
 
         weight = std::make_shared<Tensor<float>>(normalized_shape_);
-        auto weight_cpu = torch_weight.cpu().contiguous();
-        std::vector<float> weight_vector;
-        weight_vector.reserve(weight_cpu.numel());
-        auto weight_accessor = weight_cpu.accessor<float, 2>(); // 修复：使用2维accessor
-        for (int i = 0; i < weight_cpu.size(0); i++) {
-            for (int j = 0; j < weight_cpu.size(1); j++) {
-                weight_vector.push_back(weight_accessor[i][j]);
-            }
-        }
-        weight->fillToCPU(weight_vector);
+        fillTensorFromTorch(weight, torch_weight);
 
         bias = std::make_shared<Tensor<float>>(normalized_shape_);
-        auto bias_cpu = torch_bias.cpu().contiguous();
-        std::vector<float> bias_vector;
-        bias_vector.reserve(bias_cpu.numel());
-        auto bias_accessor = bias_cpu.accessor<float, 2>(); // 修复：使用2维accessor
-        for (int i = 0; i < bias_cpu.size(0); i++) {
-            for (int j = 0; j < bias_cpu.size(1); j++) {
-                bias_vector.push_back(bias_accessor[i][j]);
-            }
-        }
-        bias->fillToCPU(bias_vector);
+        fillTensorFromTorch(bias, torch_bias);
 
         output = std::make_shared<Tensor<float>>(output_shape);
-        auto output_cpu = torch_output.cpu().contiguous();
-        std::vector<float> output_vector;
-        output_vector.reserve(output_cpu.numel());
-        auto output_accessor = output_cpu.accessor<float, 4>();
-        for (int i = 0; i < output_shape[0]; i++) {
-            for (int j = 0; j < output_shape[1]; j++) {
-                for (int k = 0; k < output_shape[2]; k++) {
-                    for (int l = 0; l < output_shape[3]; l++) {
-                        output_vector.push_back(output_accessor[i][j][k][l]);
-                    }
-                }
-            }
-        }
-        output->fillToCPU(output_vector);
+        fillTensorFromTorch(output, torch_output);
     }
 };
 }
@@ -186,6 +142,7 @@ private:
 int main() {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     LayerNormTest lntest;
 
@@ -228,5 +185,6 @@ int main() {
         return -1;
     }
 
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }

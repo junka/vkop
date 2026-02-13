@@ -300,14 +300,8 @@ class Resize : public Operator {
 
         auto out_gpu_shape = outputs[0]->getGPUShape();
         resize::GpuResizeParam para;
-        para.inShape[0] = inputs[0]->get_batch();
-        para.inShape[1] = inputs[0]->get_channel();
-        para.inShape[2] = inputs[0]->get_height();
-        para.inShape[3] = inputs[0]->get_width();
-        para.outShape[0] = outputs[0]->get_batch();
-        para.outShape[1] = outputs[0]->get_channel();
-        para.outShape[2] = outputs[0]->get_height();
-        para.outShape[3] = outputs[0]->get_width();
+        inputs[0]->get_shape(para.inShape);
+        outputs[0]->get_shape(para.outShape);
         para.mode = mode_;
         para.nearest_mode = nearest_mode_;
         para.antialias = antialias_;

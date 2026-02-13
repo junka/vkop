@@ -23,7 +23,7 @@ class VulkanResource {
 
     virtual ~VulkanResource() {
 #ifndef USE_VMA
-        if (m_memory_)
+        if (m_memory_ != VK_NULL_HANDLE)
             vkFreeMemory(m_vdev_->getLogicalDevice(), m_memory_, nullptr);
 #endif
     }
@@ -77,21 +77,9 @@ class VulkanResource {
     }
 
     VkDeviceMemory getMemory() const { return m_memory_; }
+    uint64_t getOffset() const { return offset_; }
 
 #endif
-    virtual void *getMappedMemory() {
-        void *data = nullptr;
-#ifndef USE_VMA
-        vkMapMemory(m_vdev_->getLogicalDevice(), m_memory_, offset_,
-                    VK_WHOLE_SIZE, 0, &data);
-#endif
-        return data;
-    }
-    void unmapMemory() {
-#ifndef USE_VMA
-        vkUnmapMemory(m_vdev_->getLogicalDevice(), m_memory_);
-#endif
-    }
 
     VkDescriptorType getDescriptorType() const { return m_desc_type_; }
 
@@ -107,7 +95,7 @@ class VulkanResource {
 
   private:
 #ifndef USE_VMA
-    VkDeviceMemory m_memory_;
+    VkDeviceMemory m_memory_ = VK_NULL_HANDLE;
     uint64_t offset_ = 0;
 #endif
 };

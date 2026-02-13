@@ -2,7 +2,6 @@
 #ifndef SRC_VULKANPIPELINE_HPP_
 #define SRC_VULKANPIPELINE_HPP_
 
-#include <memory>
 #include <vector>
 
 #include "vulkan/VulkanResource.hpp"

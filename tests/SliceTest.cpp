@@ -160,6 +160,7 @@ int main()
 {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", false);
+    vkop::tests::TestEnv::initialize();
 
     SliceTest slice_test;
     const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
@@ -172,5 +173,6 @@ int main()
     if (!slice_test.run_test<float>(inputs, {slice_test.output})) {
         return -1;
     }
+    vkop::tests::TestEnv::cleanup();
     return 0;
 }
