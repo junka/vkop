@@ -11,8 +11,6 @@
 #include <vector>
 #include <cmath>
 
-#include "setup.hpp"
-
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::ITensor;

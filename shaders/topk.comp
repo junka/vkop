@@ -75,22 +75,20 @@ void bitonicSort32(int count) {
     }
 }
 
-
 void bitonicSort16(int count) {
-    int powerOfTwo = 1;
-    while (powerOfTwo < count && powerOfTwo < 512) {
-        powerOfTwo <<= 1;
-    }
+    const int N = 512;
     uint lid = gl_LocalInvocationID.x;
 
-    for (int size = 2; size <= powerOfTwo; size <<= 1) {
+    for (int size = 2; size <= N; size <<= 1) {
         for (int stride = size >> 1; stride > 0; stride >>= 1) {
             for (int e = 0; e < 2; ++e) {
                 int i = int(lid) * 2 + e;
-                if (i >= powerOfTwo) continue;
-
+                if (i >= N) continue;
                 int j = i ^ stride;
-                if (j > i && j < powerOfTwo) {
+                if (j >= N) continue;
+
+                // Only let the smaller index decide to avoid conflict
+                if (i < j) {
                     bool dir = ((i & size) == 0);
                     if (uParam.largest != 0) dir = !dir;
 

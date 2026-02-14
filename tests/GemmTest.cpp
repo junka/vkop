@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <gtest/gtest.h>
 #include <string>
 #include <vector>
 #include <random>
@@ -203,10 +204,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", true);
-    vkop::tests::TestEnv::initialize();
+TEST(GemmTest, GemmComprehensiveTest) {
 
     const std::vector<std::tuple<std::vector<int>, std::vector<int>, float, float, bool, bool>> testcases = {
         {{1, 20}, {20, 16}, 1.0F, 1.0F, false, false},
@@ -219,7 +217,7 @@ int main() {
         LOG_INFO("Testing [%d, %d], [%d, %d], %f, %f, %d, %d", inshapeA[0], inshapeA[1], inshapeB[0], inshapeB[1], alpha, beta, transA, transB);
         LOG_INFO("Testing FP32");
         GemmTest<float> gmtest1(inshapeA, inshapeB, alpha, beta, transA, transB);
-        if (!gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
+        EXPECT_TRUE(gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
             [&gmtest1](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *gemm_op = dynamic_cast<Gemm *>(op.get());
                 if (!gemm_op) {
@@ -227,12 +225,10 @@ int main() {
                     return;
                 }
                 gemm_op->setAttribute(gmtest1.attr);
-            })) {
-            return -1;
-        }
+            }));
         LOG_INFO("Testing FP16");
         GemmTest<uint16_t> gmtest(inshapeA, inshapeB, alpha, beta, transA, transB);
-        if (!gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
+        EXPECT_TRUE(gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
             [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *gemm_op = dynamic_cast<Gemm *>(op.get());
                 if (!gemm_op) {
@@ -240,11 +236,6 @@ int main() {
                     return;
                 }
                 gemm_op->setAttribute(gmtest.attr);
-            })) {
-            return -1;
-        }
+            }));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

@@ -56,16 +56,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(DivTest, DivComprehensiveTest) {
 
     DivTest divtest;
-    if (!divtest.run_test<float>({divtest.inputa, divtest.inputb}, {divtest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE (divtest.run_test<float>({divtest.inputa, divtest.inputb}, {divtest.output}));
 }

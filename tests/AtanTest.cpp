@@ -41,10 +41,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(AtanTest, AtanComprehensiveTest) {
 
     std::vector<std::vector<int>> test_cases = {
         {10, 5, 64, 64},
@@ -54,10 +51,6 @@ int main() {
 
     for (const auto& t : test_cases) {
         AtanTest atantest(t);
-        if (!atantest.run_test<float>({atantest.input}, {atantest.output})) {
-            return -1;
-        }
+        EXPECT_TRUE (atantest.run_test<float>({atantest.input}, {atantest.output}));
     }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

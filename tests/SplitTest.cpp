@@ -115,13 +115,7 @@ private:
 };
 }
 
-
-int main()
-{
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
-
+TEST(SplitTest, SplitComprehensiveTest) {
     SplitTest split_test;
     const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
         split_test.input,
@@ -132,16 +126,12 @@ int main()
     for (auto &output : split_test.outputs) {
         outputs.push_back(output);
     };
-    if (!split_test.run_test<float>(inputs, outputs, [&split_test] (std::unique_ptr<vkop::ops::Operator> &op) {
+    EXPECT_TRUE(split_test.run_test<float>(inputs, outputs, [&split_test] (std::unique_ptr<vkop::ops::Operator> &op) {
         auto *split_op = dynamic_cast<Split *>(op.get());
         if (!split_op) {
             LOG_ERROR("Failed to cast operator to Conv2d");
             return;
         }
         split_op->setAttribute(split_test.attributes);
-    })) {
-        return -1;
-    }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    }));
 }

@@ -1,41 +1,59 @@
 
+include(FetchContent)
+include(GoogleTest)
+
+FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG release-1.12.1
+)
+
+FetchContent_GetProperties(googletest)
+if(NOT googletest_POPULATED)
+    FetchContent_Populate(googletest)
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+
+    add_subdirectory(${googletest_SOURCE_DIR} ${googletest_BINARY_DIR})
+endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
 include_directories(${CMAKE_SOURCE_DIR}/ops)
 include_directories(${CMAKE_SOURCE_DIR}/model)
 
-set(TESTS
-    GridSampleTest
-    Conv2dTest
-    AddTest
-    AtanTest
-    SubTest
-    MulTest
-    DivTest
-    PowTest
-    ErfTest
-    ReluTest
-    BatchNormTest
-    SoftmaxTest
-    FloorTest
-    MaxPoolTest
-    LayerNormTest
-    ResizeTest
-    PReluTest
-    SigmoidTest
-    SoftplusTest
-    ModelTest
-    MatMulTest
-    GemmTest
-    ReduceTest
-    ReshapeTest
-    TransposeTest
-    SliceTest
-    ConcatTest
-    SplitTest
-    GlobalAveragePoolTest
-    AveragePoolTest
-    TopkTest
+set(TEST_SOURCES
+    setup.cpp
+    GridSampleTest.cpp
+    Conv2dTest.cpp
+    AddTest.cpp
+    AtanTest.cpp
+    SubTest.cpp
+    MulTest.cpp
+    DivTest.cpp
+    PowTest.cpp
+    ErfTest.cpp
+    ReluTest.cpp
+    BatchNormTest.cpp
+    SoftmaxTest.cpp
+    FloorTest.cpp
+    MaxPoolTest.cpp
+    LayerNormTest.cpp
+    ResizeTest.cpp
+    PReluTest.cpp
+    SigmoidTest.cpp
+    SoftplusTest.cpp
+    MatMulTest.cpp
+    GemmTest.cpp
+    ReduceTest.cpp
+    ReshapeTest.cpp
+    TransposeTest.cpp
+    SliceTest.cpp
+    ConcatTest.cpp
+    SplitTest.cpp
+    GlobalAveragePoolTest.cpp
+    AveragePoolTest.cpp
+    TopkTest.cpp
 )
 
 set(LIBTORCH_VERSION "2.10.0")
@@ -100,40 +118,47 @@ find_library(C10_LIBRARY
     REQUIRED
 )
 file(GLOB TORCH_DLLS "${TORCH_LIB_DIR}/*.dll")
-foreach(TEST ${TESTS})
-    add_executable(${TEST} ${TEST}.cpp setup.cpp)
-    if (USE_FP16)
-        target_compile_definitions(${TEST} PUBLIC FP16)
-    endif()
-    if(MSVC)
-        target_compile_options(${TEST} PRIVATE /wd4100)
-    else()
-        target_compile_options(${TEST} PRIVATE
-            -Wno-unused-parameter
-            -Wno-unused-variable
-            -Wno-unused-function
-        )
-    endif()
-    target_link_libraries(${TEST} PRIVATE vkop vload ${TORCH_LIBRARY}
-        ${TORCH_CPU_LIBRARY}
-        ${C10_LIBRARY})
-    target_include_directories(${TEST} PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
 
-    if (MSVC)
-        add_custom_command(TARGET ${TEST} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                ${TORCH_DLLS}
-                $<TARGET_FILE_DIR:${TEST}>
-            COMMENT "Copying LibTorch DLLs to output directory"
-        )
-    endif()
-    add_test(NAME ${TEST} COMMAND ${TEST})
-endforeach()
+add_executable(all_tests ${TEST_SOURCES})
+if (USE_FP16)
+    target_compile_definitions(all_tests PUBLIC FP16)
+endif()
+if(MSVC)
+    target_compile_options(all_tests PRIVATE /wd4100)
+else()
+    target_compile_options(all_tests PRIVATE
+        -Wno-unused-parameter
+        -Wno-unused-variable
+        -Wno-unused-function
+    )
+endif()
+target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
+    ${TORCH_CPU_LIBRARY}
+    ${C10_LIBRARY}
+    gtest gtest_main)
+target_include_directories(all_tests PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR} 
+        ${googletest_SOURCE_DIR}/googletest/include)
+
+if (MSVC)
+    add_custom_command(TARGET all_tests POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            ${TORCH_DLLS}
+            $<TARGET_FILE_DIR:all_tests>
+        COMMENT "Copying LibTorch DLLs to output directory"
+    )
+endif()
+
+gtest_discover_tests(all_tests
+    WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+    PROPERTIES 
+        TIMEOUT 300
+)
 
 file(COPY ../model/add_conv_model.vkopbin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
 
-if("ModelTest" IN_LIST TESTS)
+add_executable(ModelTest ModelTest.cpp)
+target_link_libraries(ModelTest PRIVATE vkop vload)
 target_compile_definitions(ModelTest PRIVATE
     TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
 )
-endif()
+add_test(ModelTest ModelTest)

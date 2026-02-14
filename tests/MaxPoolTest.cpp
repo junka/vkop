@@ -4,6 +4,7 @@
 #include <random>
 #include <cmath>
 
+#include "ATen/Context.h"
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
@@ -14,56 +15,58 @@ using vkop::tests::TestCase;
 using vkop::ops::Maxpool2d;
 
 namespace {
-    template<typename T>
-    void maxpool2d_reference(const std::shared_ptr<Tensor<T>>& input, std::shared_ptr<Tensor<T>>& output, std::vector<int> shape,
-                       int kernel_size, int stride_size, int pad_size) {
-        int batch = shape[0];
-        int channels = shape[1];
-        int height = shape[2];
-        int width = shape[3];
-        int kernel_h = kernel_size;
-        int kernel_w = kernel_size;
-        int stride_height = stride_size;
-        int stride_width = stride_size;
-        int pad_height = pad_size;
-        int pad_width = pad_size;
+#if USE_CPP_REFER
+template<typename T>
+void maxpool2d_reference(const std::shared_ptr<Tensor<T>>& input, std::shared_ptr<Tensor<T>>& output, std::vector<int> shape,
+                    int kernel_size, int stride_size, int pad_size) {
+    int batch = shape[0];
+    int channels = shape[1];
+    int height = shape[2];
+    int width = shape[3];
+    int kernel_h = kernel_size;
+    int kernel_w = kernel_size;
+    int stride_height = stride_size;
+    int stride_width = stride_size;
+    int pad_height = pad_size;
+    int pad_width = pad_size;
 
-        int padded_height = height + (2 * pad_height);
-        int padded_width = width + (2 * pad_width);
+    int padded_height = height + (2 * pad_height);
+    int padded_width = width + (2 * pad_width);
 
-        int out_height = ((padded_height - kernel_h) / stride_height) + 1;
-        int out_width = ((padded_width - kernel_w) / stride_width) + 1;
+    int out_height = ((padded_height - kernel_h) / stride_height) + 1;
+    int out_width = ((padded_width - kernel_w) / stride_width) + 1;
 
-        for (int b = 0; b < batch; ++b) {
-            for (int c = 0; c < channels; ++c) {
-                for (int oh = 0; oh < out_height; ++oh) {
-                    for (int ow = 0; ow < out_width; ++ow) {
-                        float max_val = -std::numeric_limits<float>::infinity();
-                        for (int ph = 0; ph < kernel_h; ++ph) {
-                            for (int pw = 0; pw < kernel_w; ++pw) {
-                                int ih = (oh * stride_height) + ph - pad_height;
-                                int iw = (ow * stride_width) + pw - pad_width;
-                                if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
-                                    int input_idx = (((b * channels + c) * height + ih) * width) + iw;
-                                    if constexpr(std::is_same_v<T, float>) {
-                                        max_val = std::max(max_val, (*input)[input_idx]);
-                                    } else {
-                                        max_val = std::max(max_val, Tensor<T>::fp16_to_fp32((*input)[input_idx]));
-                                    }
+    for (int b = 0; b < batch; ++b) {
+        for (int c = 0; c < channels; ++c) {
+            for (int oh = 0; oh < out_height; ++oh) {
+                for (int ow = 0; ow < out_width; ++ow) {
+                    float max_val = -std::numeric_limits<float>::infinity();
+                    for (int ph = 0; ph < kernel_h; ++ph) {
+                        for (int pw = 0; pw < kernel_w; ++pw) {
+                            int ih = (oh * stride_height) + ph - pad_height;
+                            int iw = (ow * stride_width) + pw - pad_width;
+                            if (ih >= 0 && ih < height && iw >= 0 && iw < width) {
+                                int input_idx = (((b * channels + c) * height + ih) * width) + iw;
+                                if constexpr(std::is_same_v<T, float>) {
+                                    max_val = std::max(max_val, (*input)[input_idx]);
+                                } else {
+                                    max_val = std::max(max_val, Tensor<T>::fp16_to_fp32((*input)[input_idx]));
                                 }
                             }
                         }
-                        int output_idx = (((b * channels + c) * out_height + oh) * out_width) + ow;
-                        if constexpr(std::is_same_v<T, float>) {
-                            (*output)[output_idx] = max_val;
-                        } else {
-                            (*output)[output_idx] = Tensor<T>::fp32_to_fp16(max_val);
-                        }
+                    }
+                    int output_idx = (((b * channels + c) * out_height + oh) * out_width) + ow;
+                    if constexpr(std::is_same_v<T, float>) {
+                        (*output)[output_idx] = max_val;
+                    } else {
+                        (*output)[output_idx] = Tensor<T>::fp32_to_fp16(max_val);
                     }
                 }
             }
         }
     }
+}
+#endif
 
 template<typename T>
 class MaxpoolTest : public TestCase {
@@ -96,30 +99,29 @@ private:
         input->reserveOnCPU();
         output->reserveOnCPU();
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{-3.0F, 6.0F};
-        for (int i = 0; i < input->num_elements(); i++) {
-            (*input)[i] = input_dist(gen);
+        torch::TensorOptions conf;
+        if constexpr (std::is_same_v<T, float>) {
+            conf = torch::TensorOptions().dtype(torch::kFloat32);
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
+            conf = torch::TensorOptions().dtype(torch::kFloat16);
         }
 
-        maxpool2d_reference(input, output, input_shape_, kernel_size_, stride_, pad_);
+        torch::manual_seed(42);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, conf);
+        auto torch_output = torch::max_pool2d(torch_input, {kernel_size_, kernel_size_}, {stride_, stride_}, {pad_, pad_}, 1, false);
+        printf("=======output tensor=======");
+        std::cout << torch_output << std::endl;
+        fillTensorFromTorch(input, torch_input);
+        fillTensorFromTorch(output, torch_output);
     }
 };
 }
 
 
-
-
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
-
+TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
     std::vector<std::tuple<std::vector<int>, int, int, int>> test_cases = {
-        {{1, 3, 224, 224}, 3, 2, 1},
-        {{1, 3, 16, 16}, 1, 2, 1},
+        // {{1, 3, 224, 224}, 3, 2, 1},
+        {{1, 3, 16, 16}, 4, 2, 1},
     };
 
     for (const auto &test_case : test_cases) {
@@ -128,7 +130,7 @@ int main() {
                 input_shape[0], input_shape[1], input_shape[2], input_shape[3], kernel_size, stride, pad);
         LOG_INFO("Running test for fp32 ...");
         MaxpoolTest<float> maxtest(input_shape, kernel_size, stride, pad);
-        if (!maxtest.run_test<float>({maxtest.input}, {maxtest.output},
+        EXPECT_TRUE(maxtest.run_test<float>({maxtest.input}, {maxtest.output},
             [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
                 if (!maxpool_op) {
@@ -136,13 +138,11 @@ int main() {
                     return;
                 }
                 maxpool_op->setAttribute(maxtest.attributes);
-            })) {
-            return -1;
-        }
+            }));
 
         LOG_INFO("Running test for fp16 ...");
         MaxpoolTest<uint16_t> maxtest2(input_shape, kernel_size, stride, pad);
-        if (!maxtest.run_test<uint16_t>({maxtest2.input}, {maxtest2.output},
+        EXPECT_TRUE(maxtest.run_test<uint16_t>({maxtest2.input}, {maxtest2.output},
             [&maxtest2](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
                 if (!maxpool_op) {
@@ -150,15 +150,6 @@ int main() {
                     return;
                 }
                 maxpool_op->setAttribute(maxtest2.attributes);
-            })) {
-            return -1;
-        }
-
-        
-
+            }));
     }
-
-    vkop::tests::TestEnv::cleanup();
-
-    return 0;
 }

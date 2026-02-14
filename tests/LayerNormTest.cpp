@@ -139,10 +139,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(LayerNormTest, LayerNormComprehensiveTest) {
 
     LayerNormTest lntest;
 
@@ -173,18 +170,14 @@ int main() {
     }
 #endif
 
-    if (!lntest.run_test<float>({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
+    EXPECT_TRUE(lntest.run_test<float>({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
         [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *batchnorm_op = dynamic_cast<LayerNorm *>(op.get());
-            if (!batchnorm_op) {
-                LOG_ERROR("Failed to cast operator to LayerNorm");
-                return;
-            }
-            batchnorm_op->setAttribute(lntest.param);
-        })) {
-        return -1;
-    }
+        auto *batchnorm_op = dynamic_cast<LayerNorm *>(op.get());
+        if (!batchnorm_op) {
+            LOG_ERROR("Failed to cast operator to LayerNorm");
+            return;
+        }
+        batchnorm_op->setAttribute(lntest.param);
+    }));
 
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

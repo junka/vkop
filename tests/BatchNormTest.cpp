@@ -131,10 +131,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(BatchNormTest, BatchNormComprehensiveTest) {
 
     std::vector<std::vector<int>> test_configs = {
         {1, 3, 32, 32},
@@ -176,19 +173,15 @@ int main() {
         }
 #endif
 
-        if (!bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
-            [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
-                auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
-                if (!batchnorm_op) {
-                    LOG_ERROR("Failed to cast operator to BatchNorm");
-                    return;
-                }
-                batchnorm_op->setAttribute(bntest.param);
-            })) {
-            return -1;
-        }
+    EXPECT_TRUE (bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
+        [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
+            if (!batchnorm_op) {
+                LOG_ERROR("Failed to cast operator to BatchNorm");
+                return;
+            }
+            batchnorm_op->setAttribute(bntest.param);
+        }));
     }
 
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

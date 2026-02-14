@@ -155,13 +155,7 @@ private:
 };
 }
 
-
-int main()
-{
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
-
+TEST(SliceTest, SliceComprehensiveTest) {
     SliceTest slice_test;
     const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
         slice_test.input,
@@ -170,9 +164,5 @@ int main()
         slice_test.axes_,
         slice_test.steps_,
     };
-    if (!slice_test.run_test<float>(inputs, {slice_test.output})) {
-        return -1;
-    }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(slice_test.run_test<float>(inputs, {slice_test.output}));
 }

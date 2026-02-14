@@ -129,23 +129,15 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(ConcatTest, ConcatComprehensiveTest) {
 
     ConcatTest cctest;
-    if (!cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
+    EXPECT_TRUE (cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
         auto *concat_op = dynamic_cast<Concat *>(op.get());
         if (!concat_op) {
             LOG_ERROR("Failed to cast operator to Concat");
             return;
         }
         concat_op->setAttribute(cctest.attributes);
-    })) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    }));
 }

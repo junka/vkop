@@ -52,17 +52,8 @@ private:
 };
 }
 
-
-int main()
-{
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(ReshapeTest, ReshapeComprehensiveTest) {
 
     ReshapeTest reshape_test;
-    if (!reshape_test.run_test<float>({reshape_test.input, reshape_test.shape}, {reshape_test.output})) {
-        return -1;
-    }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(reshape_test.run_test<float>({reshape_test.input, reshape_test.shape}, {reshape_test.output}));
 }

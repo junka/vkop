@@ -294,6 +294,9 @@ template <typename T> class Tensor : public ITensor {
     }
 
     template <typename U> void resize(const std::vector<U> &dims) {
+        int old_dims[4] = {dims_[0], dims_[1], dims_[2], dims_[3]};
+        uint8_t old_n_dims = n_dims_;
+
         memset(dims_, 0, sizeof(dims_));
         n_dims_ = static_cast<uint8_t>(dims.size());
         size_ = dims.empty() ? 0 : sizeof(T);
@@ -302,11 +305,19 @@ template <typename T> class Tensor : public ITensor {
             size_ *= d;
             dims_[i++] = static_cast<int>(d);
         }
-        if (!is_on_GPU())
-            reserveOnCPU();
+        if (!is_on_GPU()) {
+            if (!data_) {
+                reserveOnCPU();
+            } else {
+                resize_tensor(old_n_dims, old_dims);
+            }
+        }
     }
 
     void resize(int len) {
+        int old_dims[4] = {dims_[0], dims_[1], dims_[2], dims_[3]};
+        uint8_t old_n_dims = n_dims_;
+
         if (len == 0) {
             if (is_on_GPU()) {
                 vkobj_.reset();
@@ -321,8 +332,11 @@ template <typename T> class Tensor : public ITensor {
             n_dims_ = 1;
             size_ = sizeof(T) * len;
             dims_[0] = len;
-            if (!is_on_GPU())
+            if (!data_) {
                 reserveOnCPU();
+            } else {
+                resize_tensor(old_n_dims, old_dims);
+            }
         }
     }
 
@@ -966,6 +980,61 @@ template <typename T> class Tensor : public ITensor {
                 }
             }
         }
+    }
+
+    void resize_tensor(uint8_t old_n_dims, int old_dims[4]) {
+        auto new_data = std::make_unique<std::vector<T>>(num_elements());
+        if (old_n_dims == n_dims_ && old_n_dims > 0) {
+            if (n_dims_ == 1) {
+                std::memcpy(new_data->data(), data_->data(),
+                            std::min(old_dims[0], dims_[0]) * sizeof(T));
+            } else if (n_dims_ == 2) {
+                int rows = std::min(old_dims[0], dims_[0]);
+                int cols = std::min(old_dims[1], dims_[1]);
+                for (int i = 0; i < rows; i++) {
+                    std::memcpy(&(*new_data)[i * dims_[1]],
+                                &(*data_)[i * old_dims[1]], cols * sizeof(T));
+                }
+            } else if (n_dims_ == 3) {
+                int d0 = std::min(old_dims[0], dims_[0]);
+                int d1 = std::min(old_dims[1], dims_[1]);
+                int d2 = std::min(old_dims[2], dims_[2]);
+                for (int i = 0; i < d0; i++) {
+                    for (int j = 0; j < d1; j++) {
+                        std::memcpy(&(*new_data)[(i * dims_[1] * dims_[2]) +
+                                                 (j * dims_[2])],
+                                    &(*data_)[(i * old_dims[1] * old_dims[2]) +
+                                              (j * old_dims[2])],
+                                    d2 * sizeof(T));
+                    }
+                }
+            } else if (n_dims_ == 4) {
+                int d0 = std::min(old_dims[0], dims_[0]);
+                int d1 = std::min(old_dims[1], dims_[1]);
+                int d2 = std::min(old_dims[2], dims_[2]);
+                int d3 = std::min(old_dims[3], dims_[3]);
+                for (int i = 0; i < d0; i++) {
+                    for (int j = 0; j < d1; j++) {
+                        for (int k = 0; k < d2; k++) {
+                            std::memcpy(
+                                &(*new_data)[(i * dims_[1] * dims_[2] *
+                                              dims_[3]) +
+                                             (j * dims_[2] * dims_[3]) +
+                                             (k * dims_[3])],
+                                &(*data_)[(i * old_dims[1] * old_dims[2] *
+                                           old_dims[3]) +
+                                          (j * old_dims[2] * old_dims[3]) +
+                                          (k * old_dims[3])],
+                                d3 * sizeof(T));
+                        }
+                    }
+                }
+            }
+        } else {
+            memcpy(new_data->data(), data_->data(), size_);
+        }
+        data_.reset();
+        data_ = std::move(new_data);
     }
 };
 

@@ -76,10 +76,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(AveragePoolTest, AveragePoolComprehensiveTest) {
 
     std::vector<std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, std::vector<int>, bool>> test_configs = {
         {{1, 3, 32, 32}, {4, 8}, {2, 4}, {0, 0, 0, 0}, true},
@@ -94,7 +91,7 @@ int main() {
             strides[0], strides[1], pads[0], pads[1], pads[2], pads[3],
             count_include_pad ? "true" : "false");
         AveragePoolTest aptest(input_shape, kernel_shape, strides, pads, count_include_pad);
-        if (!aptest.run_test<float>({aptest.input}, {aptest.output},
+        EXPECT_TRUE (aptest.run_test<float>({aptest.input}, {aptest.output},
             [&aptest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *ap_op = dynamic_cast<AveragePool *>(op.get());
             if (!ap_op) {
@@ -102,10 +99,6 @@ int main() {
                 return;
             }
             ap_op->setAttribute(aptest.attributes);
-        })) {
-            return -1;
-        }
+        }));
     }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

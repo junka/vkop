@@ -144,11 +144,7 @@ private:
     }
 };
 
-
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(ResizeTest, ResizeComprehensiveTest) {
 
     std::vector<std::tuple<std::vector<int>, std::vector<int>, bool, std::string, bool>> test_cases = {
         {{1, 2, 4, 4}, {1, 2, 2, 2}, false, "bilinear", false},
@@ -165,7 +161,7 @@ int main() {
                align_corners ? "true" : "false", antialias ? "true" : "false");
         ResizeTest<float> rt(input_shape, resize, align_corners, mode, antialias);
 
-        if (!rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
+        EXPECT_TRUE(rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
             [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *resize_op = dynamic_cast<Resize *>(op.get());
             if (!resize_op) {
@@ -174,10 +170,6 @@ int main() {
             }
             resize_op->setAttribute(rt.attributes);
 
-        })) {
-            return -1;
-        }
+        }));
     }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

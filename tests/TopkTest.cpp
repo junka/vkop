@@ -74,7 +74,7 @@ private:
         } else if constexpr (std::is_same_v<T, uint16_t>) {
             conf = torch::TensorOptions().dtype(torch::kFloat16);
         }
-        torch::manual_seed(42);
+        torch::manual_seed(56);
         auto torch_input = torch::randn({t[0], t[1]}, conf);
         auto torch_topk = torch::topk(torch_input, k, axis, true, true);
         auto [value, indices64] = torch_topk;
@@ -94,10 +94,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(TopkTest, TopkComprehensiveTest) {
 
     const std::vector<std::tuple<std::vector<int>, int, int>> test_cases = {
         {{1, 200}, 7, -1},
@@ -113,31 +110,24 @@ int main() {
                  t[0], t[1], k, axis);
         LOG_INFO("Testing fp32");
         TopkTest<float> toptest(t, k, axis);
-        if (!toptest.run_test<float>({toptest.input}, {toptest.output, toptest.indexs},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
+        EXPECT_TRUE (toptest.run_test<float>({toptest.input}, {toptest.output, toptest.indexs},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *topk_op = dynamic_cast<Topk *>(op.get());
             if (!topk_op) {
                 LOG_ERROR("Failed to cast operator to Topk");
                 return;
             }
             topk_op->setAttribute(toptest.attrs);
-        })) {
-            return -1;
-        }
+        }));
 
         LOG_INFO("Testing fp16");
         TopkTest<uint16_t> toptest1(t, k, axis);
-        if (!toptest1.run_test<uint16_t>({toptest1.input}, {toptest1.output, toptest1.indexs},[&toptest1](std::unique_ptr<vkop::ops::Operator> &op) {
+        EXPECT_TRUE(toptest1.run_test<uint16_t>({toptest1.input}, {toptest1.output, toptest1.indexs},[&toptest1](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *topk_op = dynamic_cast<Topk *>(op.get());
             if (!topk_op) {
                 LOG_ERROR("Failed to cast operator to Topk");
                 return;
             }
             topk_op->setAttribute(toptest1.attrs);
-        })) {
-            return -1;
-        }
-
+        }));
     }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

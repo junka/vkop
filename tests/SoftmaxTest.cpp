@@ -163,10 +163,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
 
     std::vector<std::tuple<std::vector<int>, int>> test_cases = {
         {{1, 10, 7, 7}, 1},
@@ -206,7 +203,7 @@ int main() {
         }
 #endif
 
-        if (!softtest.run_test<float>({softtest.input}, {softtest.output},
+        EXPECT_TRUE(softtest.run_test<float>({softtest.input}, {softtest.output},
             [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *softmax_op = dynamic_cast<Softmax *>(op.get());
                 if (!softmax_op) {
@@ -214,11 +211,6 @@ int main() {
                     return;
                 }
                 softmax_op->setAttribute(softtest.dim);
-            })) {
-            return -1;
-        }
+            }));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

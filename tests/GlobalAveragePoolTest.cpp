@@ -72,10 +72,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
 
     const std::vector<std::tuple<std::vector<int>>> testcases = {
         {{1, 3, 360, 512}},
@@ -88,18 +85,11 @@ int main() {
         LOG_INFO("Testing fp32");
 
         GlobalAveragePoolTest<float> gaptest(shape);
-        if (!gaptest.run_test<float>({gaptest.input}, {gaptest.output})) {
-            return -1;
-        }
+        EXPECT_TRUE(gaptest.run_test<float>({gaptest.input}, {gaptest.output}));
 
         LOG_INFO("Testing fp16");
 
         GlobalAveragePoolTest<uint16_t> gaptest2(shape);
-        if (!gaptest2.run_test<uint16_t>({gaptest2.input}, {gaptest2.output})) {
-            return -1;
-        }
+        EXPECT_TRUE(gaptest2.run_test<uint16_t>({gaptest2.input}, {gaptest2.output}));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

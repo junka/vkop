@@ -145,11 +145,7 @@ private:
 
 }
 
-
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(GridSampleTest, GridSampleComprehensiveTest) {
     
     std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
         {{1, 3, 4, 4}, {1, 3, 4, 4}},
@@ -158,12 +154,6 @@ int main() {
     for (const auto& t : test_cases) { 
         auto [input_shape, output_shape] = t;
         GridSampleTest gst(input_shape, output_shape);
-        if (!gst.run_test<float>({gst.input, gst.grid}, {gst.output})) {
-            return -1;
-        }
-
+        EXPECT_TRUE(gst.run_test<float>({gst.input, gst.grid}, {gst.output}));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

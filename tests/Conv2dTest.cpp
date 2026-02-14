@@ -255,11 +255,7 @@ private:
     }
 };
 
-
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(Conv2dTest, Conv2dComprehensiveTest) {
 
     std::vector<std::tuple<std::vector<int>, int, int, int, int, int, int>> test_cases = {
         {{1, 10, 7, 7}, 2, 1, 0, 5, 1, 5},    // Group convolution
@@ -285,7 +281,7 @@ int main() {
                kernel_size, stride, pad, group, dilation, feature_size);
         
         Conv2dTest<uint16_t> ct16(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
-        if (!ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
+        EXPECT_TRUE(ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
             [&ct16](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *conv_op = dynamic_cast<Conv2d *>(op.get());
             if (!conv_op) {
@@ -293,12 +289,10 @@ int main() {
                 return;
             }
             conv_op->setAttribute(ct16.attributes);
-        })) {
-            return -1;
-        }
+        }));
 
         Conv2dTest<float> ct(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
-        if (!ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
+        EXPECT_TRUE(ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
             [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *conv_op = dynamic_cast<Conv2d *>(op.get());
             if (!conv_op) {
@@ -306,11 +300,6 @@ int main() {
                 return;
             }
             conv_op->setAttribute(ct.attributes);
-        })) {
-            return -1;
-        }
+        }));
     }
-    vkop::tests::TestEnv::cleanup();
-
-    return 0;
 }

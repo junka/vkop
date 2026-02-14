@@ -46,16 +46,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(MulTest, MulComprehensiveTest) {
 
     MulTest multest;
-    if (!multest.run_test<float>({multest.inputa, multest.inputb}, {multest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(multest.run_test<float>({multest.inputa, multest.inputb}, {multest.output}));
 }

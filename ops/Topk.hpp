@@ -101,6 +101,9 @@ class Topk : public Operator {
         int axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
         assert(axis <= 2 && axis >= 0);
         assert(para_.k < 256);
+        if (fp16_ == 1 && para_.k % 2 != 0) {
+            para_.k = UP_DIV(para_.k, 2) * 2;
+        }
 
         auto outshape = inshape;
         outshape[axis] = para_.k;
@@ -219,7 +222,6 @@ class Topk : public Operator {
     std::shared_ptr<core::ITensor> tempvalue2_;
     std::unique_ptr<core::Tensor<int>> tempindex1_;
     std::unique_ptr<core::Tensor<int>> tempindex2_;
-    std::vector<int> outshape_;
 };
 
 } // namespace ops

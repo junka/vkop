@@ -16,6 +16,7 @@
 #include "ops/OperatorFactory.hpp"
 #include "ops/Ops.hpp"
 
+#include <gtest/gtest.h>
 #include <torch/torch.h>
 
 namespace vkop {
@@ -23,7 +24,7 @@ namespace tests {
 
 using vkop::core::Tensor;
 
-class TestEnv {
+class TestEnv : public testing::Environment {
 private:
     static std::shared_ptr<VulkanDevice> dev_;
     static std::shared_ptr<VulkanCommandPool> cmdpool_;
@@ -32,6 +33,9 @@ private:
 public:
     static void initialize() {
         if (initialized_) return;
+
+        Logger::getInstance().setLevel(LOG_INFO);
+        Logger::getInstance().enableFileOutput("log", false);
 
         const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         dev_ = std::make_shared<VulkanDevice>(phydevs[0]);
@@ -45,6 +49,14 @@ public:
         cmdpool_.reset();
         dev_.reset();
         initialized_ = false;
+    }
+
+    void SetUp() override {
+        initialize();
+    }
+
+    void TearDown() override {
+        cleanup();
     }
 
     static std::shared_ptr<VulkanDevice> get_device() {
@@ -167,11 +179,18 @@ public:
             auto oshape = output->getShape();
             output->print_tensor();
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
+            if (vkop::ops::convert_opstring_to_enum(name_) == vkop::ops::OpType::TOPK) {
+                output->resize(expect->getShape());
+            }
             for (int i = 0; i < output->num_elements(); i++) {
                 if constexpr (std::is_same_v<TT, uint16_t>) {
                     float out_val = core::ITensor::fp16_to_fp32((*output)[i]);
                     float exp_val = core::ITensor::fp16_to_fp32((*expect)[i]);
                     // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
+                    if (std::isnan(exp_val)) {
+                        LOG_ERROR("Test Fail: Expected value is NaN at index %d", i);
+                        return false;
+                    }
                     if (std::isnan(out_val)) {
                         LOG_ERROR("Test Fail at1 (%d): Output is NaN, expected %f", i, exp_val);
                         return false;

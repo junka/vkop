@@ -351,15 +351,12 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(ReduceTest, ReduceComprehensiveTest) {
     
     ReduceTest reducetest;
     for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
         reducetest.initTestdata(reduceop);
-        if (!reducetest.run_test<float>({reducetest.input}, {reducetest.output},
+        EXPECT_TRUE(reducetest.run_test<float>({reducetest.input}, {reducetest.output},
             [&reducetest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *reduce_op = dynamic_cast<Reduce *>(op.get());
             if (!reduce_op) {
@@ -367,11 +364,6 @@ int main() {
                 return;
             }
             reduce_op->setAttribute(reducetest.attributes);
-        })) {
-            return -1;
-        }
+        }));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

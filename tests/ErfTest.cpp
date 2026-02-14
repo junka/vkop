@@ -121,16 +121,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(ErfTest, ErfComprehensiveTest) {
 
     ErfTest erftest;
-    if (!erftest.run_test<float>({erftest.input}, {erftest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(erftest.run_test<float>({erftest.input}, {erftest.output}));
 }

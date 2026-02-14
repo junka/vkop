@@ -92,25 +92,15 @@ private:
 };
 }
 
-
-
-int main()
-{
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(TransposeTest, TransposeComprehensiveTest) {
 
     TransposeTest trans_test;
-    if (!trans_test.run_test<float>({trans_test.input}, {trans_test.output}, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
+    EXPECT_TRUE(trans_test.run_test<float>({trans_test.input}, {trans_test.output}, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *tran_op = dynamic_cast<Transpose *>(op.get());
             if (!tran_op) {
                 LOG_ERROR("Failed to cast operator to Transpose");
                 return;
             }
             tran_op->setAttribute(trans_test.param);
-        })) {
-        return -1;
-    }
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+        }));
 }

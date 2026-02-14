@@ -56,10 +56,7 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(AddTest, AddComprehensiveTest) {
 
     std::vector<std::vector<int>> test_cases = {
         {10, 5, 64, 64},
@@ -69,11 +66,6 @@ int main() {
 
     for (const auto& t : test_cases) {
         AddTest<uint16_t> addtest(t);
-        if (!addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output})) {
-            return -1;
-        }
+        EXPECT_TRUE (addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output}));
     }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
 }

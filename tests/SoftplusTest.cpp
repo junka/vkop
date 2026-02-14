@@ -43,16 +43,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(SoftplusTest, SoftplusComprehensiveTest) {
 
     SoftplusTest sptest;
-    if (!sptest.run_test<float>({sptest.input}, {sptest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(sptest.run_test<float>({sptest.input}, {sptest.output}));
 }

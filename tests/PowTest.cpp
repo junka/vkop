@@ -53,16 +53,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(PowTest, PowComprehensiveTest) {
 
     PowTest powtest;
-    if (!powtest.run_test<float>({powtest.inputa, powtest.inputb}, {powtest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    EXPECT_TRUE(powtest.run_test<float>({powtest.inputa, powtest.inputb}, {powtest.output}));
 }

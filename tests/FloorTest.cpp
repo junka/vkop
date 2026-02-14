@@ -11,12 +11,12 @@ using vkop::tests::TestCase;
 
 namespace {
 
-class ReluTest : public TestCase {
+class FloorTest : public TestCase {
 public:
     std::shared_ptr<Tensor<float>> input;
     std::shared_ptr<Tensor<float>> output;
 
-    ReluTest():TestCase("Floor") {
+    FloorTest():TestCase("Floor") {
         initTestdata();
     }
 private:
@@ -42,16 +42,8 @@ private:
 };
 }
 
-int main() {
-    Logger::getInstance().setLevel(LOG_INFO);
-    Logger::getInstance().enableFileOutput("log", false);
-    vkop::tests::TestEnv::initialize();
+TEST(FloorTest, FloorComprehensiveTest) {
 
-    ReluTest relutest;
-    if (!relutest.run_test<float>({relutest.input}, {relutest.output})) {
-        return -1;
-    }
-
-    vkop::tests::TestEnv::cleanup();
-    return 0;
+    FloorTest floortest;
+    EXPECT_TRUE(floortest.run_test<float>({floortest.input}, {floortest.output}));
 }
