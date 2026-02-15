@@ -101,6 +101,7 @@ std::vector<std::string> load_labels(const std::string& label_path) {
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
+    try {
     auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
     auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
     if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
@@ -274,6 +275,10 @@ int main(int argc, char *argv[]) {
         }
 
         std::cout << (i + 1) << ": " << label << " (" << value << ")\n";
+    }
+} catch (const std::exception &e) {
+        LOG_ERROR("%s", e.what());
+        return EXIT_FAILURE;
     }
 
     // CNN profiling summary.

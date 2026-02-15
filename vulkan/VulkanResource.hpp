@@ -50,6 +50,7 @@ class VulkanResource {
                 return static_cast<int32_t>(index);
             }
         }
+        assert(false && "Did not find a suitable memory type");
         return -1;
     }
     bool allocMemory(VkMemoryRequirements memoryRequirements,

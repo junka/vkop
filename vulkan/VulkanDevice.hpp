@@ -77,11 +77,14 @@ class VulkanDevice {
     std::vector<VkDeviceQueueCreateInfo>
     setupQueueCreateInfo(std::vector<std::vector<float>> &queue_priority);
 
-    template <typename T, VkStructureType ST> T makeFeatureStruct() {
+    template <typename T, VkStructureType ST>
+    static constexpr T makeFeatureStruct() {
         T f{};
         f.sType = ST;
+        f.pNext = nullptr;
         return f;
     }
+
     static QueryChainResult
     buildFeatureQueryChain(const std::vector<FeatureDescriptor> &descs);
 
@@ -145,7 +148,6 @@ class VulkanDevice {
     bool checkHostImageCopyDstLayoutSupport(VkImageLayout layout) {
         return std::any_of(copyDstLayout_.begin(), copyDstLayout_.end(),
                            [layout](VkImageLayout i) { return i == layout; });
-        return false;
     }
     void wait_all_done();
     bool is_support_host_image_copy() const {

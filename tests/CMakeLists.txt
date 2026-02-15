@@ -279,7 +279,9 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     GTest::gtest GTest::gtest_main)
 # Force-load the whole vkop static archive so the OperatorFactory's static
 # self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
-if(APPLE)
+if(MSVC)
+    target_link_options(all_tests PRIVATE /WHOLEARCHIVE:$<TARGET_FILE:vkop>)
+elseif(APPLE)
     target_link_options(all_tests PRIVATE -Wl,-force_load,$<TARGET_FILE:vkop>)
 else()
     target_link_options(all_tests PRIVATE
@@ -327,7 +329,7 @@ file(GLOB ONNX2VKOP_PY CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/model/pypi/onnx2vko
 add_custom_command(
     OUTPUT ${MODEL_VKOPBIN}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/model
-    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+    COMMAND ${Python3_EXECUTABLE} -X utf8 -m onnx2vkop.cli
             -i ${MODEL_ONNX}
             -o ${MODEL_VKOPBIN}
             -q int8
@@ -350,7 +352,7 @@ add_test(ModelTest ModelTest)
 add_custom_command(
     OUTPUT ${MODEL_VKOPBIN_UNIFIED}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/model
-    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+    COMMAND ${Python3_EXECUTABLE} -X utf8 -m onnx2vkop.cli
             -i ${MODEL_ONNX}
             -o ${MODEL_VKOPBIN_UNIFIED}
             -q int8
@@ -423,10 +425,10 @@ set(CONV_WL_VKOPBIN_FALLBACK ${CONV_WL_DIR}/conv_weight_layout_fallback.vkopbin)
 add_custom_command(
     OUTPUT ${CONV_WL_VKOPBIN} ${CONV_WL_VKOPBIN_FALLBACK}
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CONV_WL_DIR}
-    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+    COMMAND ${Python3_EXECUTABLE} -X utf8 -m onnx2vkop.cli
             -i ${CONV_WL_ONNX} -o ${CONV_WL_VKOPBIN}
             --master-archive ${VKOP_SHADER_ARCHIVE_FILE}
-    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+    COMMAND ${Python3_EXECUTABLE} -X utf8 -m onnx2vkop.cli
             -i ${CONV_WL_ONNX} -o ${CONV_WL_VKOPBIN_FALLBACK}
             --master-archive ${VKOP_SHADER_ARCHIVE_FILE}
             --no-fusions annotate_conv_weight_layout

@@ -125,7 +125,8 @@ namespace vkop {
     PFN(vkCmdBindIndexBuffer)                                                  \
     PFN(vkCreatePipelineCache)                                                 \
     PFN(vkDestroyPipelineCache)                                                \
-    PFN(vkGetPipelineCacheData)
+    PFN(vkGetPipelineCacheData)                                                \
+    PFN(vkGetPhysicalDeviceFormatProperties2)
 
 class VulkanLib {
   public:

@@ -5,7 +5,7 @@
 #include "include/logger.hpp"
 
 namespace vkop {
-#define ALIGN_UP(x, y) (((x) + ((y) - 1)) & ~((y) - 1))
+#define ALIGN_UP(x, y) (((x) + ((y)-1)) & ~((y)-1))
 
 namespace {
 constexpr int kInitialStagingBufferSize = 1024 * 1024 * 16; // 16MB initial
@@ -28,7 +28,7 @@ VulkanStagingBufferPool::VulkanStagingBufferPool(
 
 VulkanStagingBufferPool::~VulkanStagingBufferPool() {
     if (m_buffer_) {
-        m_buffer_->unmapMemory();
+        m_buffer_.reset();
     }
 }
 
@@ -75,16 +75,16 @@ bool VulkanStagingBufferPool::resizeBuffer(size_t newSize) {
 
         m_writePos_ = data_size;
         m_readPos_ = 0;
+        m_buffer_->unmapMemory();
+        new_buffer->unmapMemory();
     } else {
         m_writePos_ = 0;
         m_readPos_ = 0;
     }
 
     if (m_buffer_) {
-        m_buffer_->unmapMemory();
         m_buffer_.reset();
     }
-    new_buffer->unmapMemory();
 
     m_buffer_ = std::move(new_buffer);
     m_poolSize_ = newSize;
@@ -170,6 +170,7 @@ VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
             }
         }
     }
+    m_buffer_->unmapMemory();
 
     return std::nullopt;
 }

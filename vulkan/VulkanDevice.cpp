@@ -3,7 +3,9 @@
 #include "vulkan/VulkanLib.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <set>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include "include/logger.hpp"
@@ -218,7 +220,11 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         }
     }
 #endif
-#ifdef VK_EXT_host_image_copy
+#if VK_EXT_host_image_copy
+    LOG_INFO("HostImageCopy identicalMemoryTypeRequirements %s",
+             hostimagecopyproperty.identicalMemoryTypeRequirements == VK_TRUE
+                 ? "True"
+                 : "False");
     for (uint32_t i = 0; i < hostimagecopyproperty.copySrcLayoutCount; i++) {
         LOG_INFO("HostImageCopy support src layout %d",
                  hostimagecopyproperty.pCopySrcLayouts[i]);
@@ -257,6 +263,8 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
         physicalDevice_, &queue_family_count, queue_families.data());
 
     const VkQueueFlags first = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
+    const VkQueueFlags video = VK_QUEUE_VIDEO_DECODE_BIT_KHR |
+                               VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
     const VkQueueFlags second =
         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
 
@@ -282,7 +290,12 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
 }
 
 void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
-
+    const std::unordered_map<VkFormat, std::string> format_maps = {
+        {VK_FORMAT_R32G32B32A32_SFLOAT, "RGBA32_SFLOT"},
+        {VK_FORMAT_R16G16B16A16_SFLOAT, "RGBA16_SFLOAT"},
+        {VK_FORMAT_R8G8B8A8_UNORM, "RGBA8_UNORM"},
+        {VK_FORMAT_R8G8B8A8_SNORM, "RGBA8_SNORM"},
+    };
     VkImageType img_type = VK_IMAGE_TYPE_2D;
     VkImageTiling tiling = VK_IMAGE_TILING_OPTIMAL;
     VkImageUsageFlags usage =
@@ -327,7 +340,8 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
         physicalDevice_, format, img_type, tiling, usage, flags, &props);
 
     if (result == VK_SUCCESS) {
-        LOG_INFO("format %d is supported", format);
+        LOG_INFO("format %s supports %u layers", format_maps.at(format).c_str(),
+                 props.maxArrayLayers);
     }
     assert(result == VK_SUCCESS &&
            "vkGetPhysicalDeviceImageFormatProperties failed: "
@@ -338,9 +352,11 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
     result = vkGetPhysicalDeviceImageFormatProperties(
         physicalDevice_, format, img_type, tiling, usage, flags, &props);
     if (result == VK_SUCCESS) {
-        LOG_INFO("format %d is supported for host image copy", format);
+        LOG_INFO("format %s supports %u layers for hostImageCopy",
+                 format_maps.at(format).c_str(), props.maxArrayLayers);
     } else {
-        LOG_INFO("format %d is not supported for host image copy", format);
+        LOG_INFO("format %s not supports hostImageCopy",
+                 format_maps.at(format).c_str());
     }
 }
 
@@ -410,32 +426,66 @@ QueryChainResult VulkanDevice::buildFeatureQueryChain(
 }
 
 void VulkanDevice::checkImageFormatSupport() {
-    VkFormatProperties fmprops;
-    vkGetPhysicalDeviceFormatProperties(
-        physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &fmprops);
-    if (!(fmprops.optimalTilingFeatures &
-          (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-           VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))) {
-        throw std::runtime_error(
-            "Physical device does not support required image formats.");
-    }
-    vkGetPhysicalDeviceFormatProperties(
-        physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &fmprops);
-    assert(fmprops.bufferFeatures &
-           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
-    // we would like SSCALE but not supported by most device, use SNORM instead
-    vkGetPhysicalDeviceFormatProperties(physicalDevice_,
-                                        VK_FORMAT_R8G8B8A8_SNORM, &fmprops);
-    assert(fmprops.bufferFeatures &
-           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
-    vkGetPhysicalDeviceFormatProperties(physicalDevice_,
-                                        VK_FORMAT_R8G8B8A8_UNORM, &fmprops);
-    assert(fmprops.bufferFeatures &
-           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
+    VkFormatProperties3 formatProperties3{};
+    formatProperties3.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_3_KHR;
+    VkFormatProperties2 formatProperties2{};
+    formatProperties2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
+    formatProperties2.pNext = &formatProperties3;
 
+    VkFormatProperties fmprops;
+    vkGetPhysicalDeviceFormatProperties2(
+        physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &formatProperties2);
+    assert(formatProperties2.formatProperties.bufferFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
+    assert(formatProperties2.formatProperties.optimalTilingFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
+            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
+    assert(formatProperties3.optimalTilingFeatures &
+           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
+    vkGetPhysicalDeviceFormatProperties2(
+        physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &formatProperties2);
+    assert(formatProperties2.formatProperties.bufferFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
+    assert(formatProperties2.formatProperties.optimalTilingFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
+            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
+    assert(formatProperties3.optimalTilingFeatures &
+           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
+    // we would like SSCALE but not supported by most device, use SNORM instead
+    vkGetPhysicalDeviceFormatProperties2(
+        physicalDevice_, VK_FORMAT_R8G8B8A8_SNORM, &formatProperties2);
+    assert(formatProperties2.formatProperties.bufferFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
+    assert(formatProperties2.formatProperties.optimalTilingFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
+            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
+    assert(formatProperties3.optimalTilingFeatures &
+           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
+    vkGetPhysicalDeviceFormatProperties2(
+        physicalDevice_, VK_FORMAT_R8G8B8A8_UNORM, &formatProperties2);
+    assert(formatProperties2.formatProperties.bufferFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_TEXEL_BUFFER_BIT));
+    assert(formatProperties2.formatProperties.optimalTilingFeatures &
+           (VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_STORAGE_IMAGE_BIT |
+            VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT_KHR |
+            VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT_KHR |
+            VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT));
+    assert(formatProperties3.optimalTilingFeatures &
+           VK_FORMAT_FEATURE_2_HOST_IMAGE_TRANSFER_BIT_EXT);
     assertImageConfigurationSupported(VK_FORMAT_R32G32B32A32_SFLOAT);
     assertImageConfigurationSupported(VK_FORMAT_R16G16B16A16_SFLOAT);
     assertImageConfigurationSupported(VK_FORMAT_R8G8B8A8_SNORM);
@@ -667,7 +717,6 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan14Features *>(q);
-                printf("feat14 host image copy %d\n", feat->hostImageCopy);
                 if (!feat->hostImageCopy && !feat->maintenance5)
                     return nullptr;
                 auto e = std::make_unique<VkPhysicalDeviceVulkan14Features>();
@@ -1143,6 +1192,37 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
         });
     }
 #endif
+#ifdef VK_KHR_maintenance5
+    if (deviceProperties.apiVersion < VK_API_VERSION_1_4 &&
+        supportedExtensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) > 0) {
+        descs.push_back(FeatureDescriptor{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES,
+            .extensionName = VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
+            .corePromotedVersion = VK_API_VERSION_1_4,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q =
+                    std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceMaintenance5FeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat =
+                    static_cast<VkPhysicalDeviceMaintenance5FeaturesKHR *>(q);
+                if (!feat->maintenance5)
+                    return nullptr;
+                auto e =
+                    std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceMaintenance5FeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES>();
+                e->maintenance5 = feat->maintenance5;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+
     for (size_t i = 0; i < descs.size(); ++i) {
         const std::unordered_map<int, std::string> desc_names = {
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -1217,7 +1297,6 @@ bool VulkanDevice::createLogicalDevice(
     create_info.pQueueCreateInfos = queue_create_info.data();
     create_info.enabledLayerCount = 0;
     create_info.ppEnabledLayerNames = nullptr;
-    // create_info.pEnabledFeatures = &features;
     create_info.enabledExtensionCount =
         static_cast<uint32_t>(enable_result.enabledExtensions.size());
     create_info.ppEnabledExtensionNames =
@@ -1240,8 +1319,48 @@ bool VulkanDevice::createLogicalDevice(
     auto ret =
         vkCreateDevice(physicalDevice_, &create_info, nullptr, &logicalDevice_);
     if (ret != VK_SUCCESS) {
-        LOG_ERROR("Failed to create logical device %d!", ret);
+        LOG_ERROR("Failed to create logical device! ret=%d", ret);
         return false;
+    }
+
+    // Some drivers advertise host image copy yet report an empty memory-type
+    // mask for OPTIMAL-tiling images created with HOST_TRANSFER usage (seen on
+    // Windows with NVIDIA Pascal), which makes every such image unallocatable.
+    // Probe one representative configuration and fall back to staged copies.
+    if (m_support_host_image_copy_) {
+        VkImageCreateInfo probe_info = {};
+        probe_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        probe_info.imageType = VK_IMAGE_TYPE_2D;
+        probe_info.format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        probe_info.extent = {64, 640, 1};
+        probe_info.mipLevels = 1;
+        probe_info.arrayLayers = 2;
+        probe_info.samples = VK_SAMPLE_COUNT_1_BIT;
+        probe_info.tiling = VK_IMAGE_TILING_OPTIMAL;
+        probe_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
+                           VK_IMAGE_USAGE_STORAGE_BIT |
+                           VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+        probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        probe_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VkImage probe_image = VK_NULL_HANDLE;
+        VkResult probe_result =
+            vkCreateImage(logicalDevice_, &probe_info, nullptr, &probe_image);
+        bool host_copy_usable = false;
+        if (probe_result == VK_SUCCESS) {
+            VkImageMemoryRequirementsInfo2 req_info = {};
+            req_info.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2;
+            req_info.image = probe_image;
+            VkMemoryRequirements2 req = {};
+            req.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
+            vkGetImageMemoryRequirements2(logicalDevice_, &req_info, &req);
+            host_copy_usable = req.memoryRequirements.memoryTypeBits != 0;
+            vkDestroyImage(logicalDevice_, probe_image, nullptr);
+        }
+        if (!host_copy_usable) {
+            m_support_host_image_copy_ = false;
+            LOG_WARN("host image copy unusable for OPTIMAL images on this "
+                     "driver, falling back to staged copies");
+        }
     }
 
     for (auto [qidx, queue_count, queueflags] : computeQueueIdxs_) {

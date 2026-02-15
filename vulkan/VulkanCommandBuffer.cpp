@@ -7,7 +7,7 @@
 
 namespace vkop {
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 std::function<void(core::ITensor &)> VulkanCommandBuffer::pre_readback_hook =
     nullptr;

@@ -79,7 +79,13 @@ private:
         auto now = std::chrono::system_clock::now();
         auto time_now = std::chrono::system_clock::to_time_t(now);
         char time_str[25];
-        std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", std::localtime(&time_now));
+        std::tm time_local;
+#ifdef _WIN32
+        localtime_s(&time_local, &time_now);
+#else
+        localtime_r(&time_local, &time_now);
+#endif
+        std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &time_local);
 
         // Format the message
         size_t size;

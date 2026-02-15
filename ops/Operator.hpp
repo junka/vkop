@@ -186,10 +186,12 @@ class Operator {
                     }
                 } catch (const std::invalid_argument &e) {
                     throw std::runtime_error(
-                        "Invalid number in attribute list: " + item);
+                        "Invalid number in attribute list: " + item + " :" +
+                        e.what());
                 } catch (const std::out_of_range &e) {
                     throw std::runtime_error(
-                        "Number out of range in attribute list: " + item);
+                        "Number out of range in attribute list: " + item +
+                        " :" + e.what());
                 }
             }
         }

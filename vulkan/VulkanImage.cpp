@@ -278,8 +278,8 @@ void VulkanImage::createImage() {
                              nullptr, &m_image_);
 #endif
     if (ret != VK_SUCCESS) {
-        printf("fail create for image size %llu, ret %d\n",
-               (unsigned long long)getImageSize(), ret);
+        printf("fail create for image size %llu, usage 0x%x ret %d\n",
+               (unsigned long long)getImageSize(), m_usage_, ret);
         throw std::runtime_error("Failed to CreateImage " +
                                  std::to_string(ret));
     }

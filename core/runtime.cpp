@@ -271,7 +271,7 @@ void Runtime::LoadModel() {
         }
     }
 
-    model.dump_model();
+    // model.dump_model();
     // Take ownership of the kernel plan before anything can outlive `model`:
     // LoadModel's VkModel is a local and its FlatBuffer strings die with it,
     // while the ops built below live for the Runtime's whole lifetime. Empty
@@ -918,7 +918,7 @@ void Runtime::LoadModel() {
     for (size_t level_idx = 0; level_idx < concurrent_levels.size();
          ++level_idx) {
         const auto &level_nodes = concurrent_levels[level_idx];
-        printf("Level %zu: %zu nodes\n", level_idx, level_nodes.size());
+        // printf("Level %zu: %zu nodes\n", level_idx, level_nodes.size());
         level_node_indices_[level_idx].reserve(level_nodes.size());
 
         for (const auto &node_name : level_nodes) {
@@ -2014,12 +2014,14 @@ double Runtime::Run() {
                                 float ov = ITensor::fp16_to_fp32(op[i]);
                                 if (!std::isnan(ov) && !std::isinf(ov))
                                     continue;
+                                const float nan_val =
+                                    std::numeric_limits<float>::quiet_NaN();
                                 float av = (i < ane)
                                                ? ITensor::fp16_to_fp32(ap[i])
-                                               : 0.0f / 0.0f;
+                                               : nan_val;
                                 float bv = (bp && i < bne)
                                                ? ITensor::fp16_to_fp32(bp[i])
-                                               : 0.0f / 0.0f;
+                                               : nan_val;
                                 std::printf(" [%d: a=%.5g b=%.5g o=%04x]", i,
                                             av, bv, op[i]);
                                 shown++;

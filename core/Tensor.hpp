@@ -29,7 +29,7 @@
 #include <immintrin.h>
 #endif
 
-#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+#define UP_DIV(x, y) (((x) + (y)-1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -1101,11 +1101,18 @@ template <typename T> class Tensor : public ITensor {
     as_input_image(std::shared_ptr<VulkanDevice> &vd,
                    const std::shared_ptr<VulkanCommandBuffer> &cmd,
                    bool unorm = false, bool readonly = false) {
-        auto flags =
-            VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        uint32_t flags = VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (vd->is_support_host_image_copy()) {
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+        } else {
+            flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        }
         if (!readonly) {
-            flags |=
-                VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            flags |= VK_IMAGE_USAGE_STORAGE_BIT;
+
+            if (!vd->is_support_host_image_copy()) {
+                flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            }
         }
         make_vkimg(vd, flags, unorm);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
@@ -1131,9 +1138,15 @@ template <typename T> class Tensor : public ITensor {
     std::shared_ptr<VulkanImage>
     as_output_image(std::shared_ptr<VulkanDevice> &vd,
                     const std::shared_ptr<VulkanCommandBuffer> &cmd) {
-        make_vkimg(vd, VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
-                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
-                           VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+        auto flags = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+
+        if (vd->is_support_host_image_copy()) {
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+        } else {
+            flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+                     VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+        }
+        make_vkimg(vd, flags);
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
 #ifdef VK_EXT_host_image_copy
         if (vd->is_support_host_image_copy()) {
@@ -1541,6 +1554,7 @@ template <typename T> class Tensor : public ITensor {
         }
 
         auto vkdim = VkExtent3D{width, height, 1};
+        printf("img flags %x\n", flags);
         vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, chan4, flags, format);
     }
 

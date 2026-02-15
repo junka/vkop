@@ -93,7 +93,10 @@ if(APPLE AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
     endif()
 endif()
 if(MSVC)
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast")
+# /utf-8: sources are UTF-8 without a BOM; decoded as the GBK system codepage
+# a trailing multibyte comment byte can swallow the newline and shift the
+# parser, which surfaces as bogus "missing type specifier" errors.
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast /utf-8 /bigobj")
 else()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
 if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -461,6 +464,11 @@ add_dependencies(shader_archive compile_shaders)
 
 # Add executable
 add_library(vkop ${SRC_FILES})
+if(MSVC)
+    # The feature descriptors in VulkanDevice.cpp are built with designated
+    # initializers; MSVC only accepts those under /std:c++20.
+    target_compile_features(vkop PUBLIC cxx_std_20)
+endif()
 
 # Compiling the SPIR-V is not a dependency of the library (no shader bytes are
 # linked in), but the archive below consumes it, and shader_archive is ALL.
@@ -507,7 +515,7 @@ target_compile_definitions(vkop PRIVATE VULKAN_HPP_DISPATCH_LOADER_DYNAMIC=1)
 option(USE_VALIDATION_LAYERS "Enable validation layers" OFF)
 option(USE_DEBUG_LAYERS "Enable debug layers" OFF)
 option(USE_MEASURE_TIME "Enable measuring time" OFF)
-option(USE_VMA "Enable usage of Vulkan Memory Allocator" ON)
+option(USE_VMA "Enable usage of Vulkan Memory Allocator" OFF)
 option(ENABLE_EXAMPLE "Enable example" ON)
 option(ENABLE_BENCHMARK "Enable benchmark" ON)
 option(ENABLE_TESTS "Enable testing" ON)

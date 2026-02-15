@@ -16,7 +16,14 @@
 namespace vkop {
 
 class VulkanSurface {
-    enum class Type { UNKNOWN, WAYLAND, X11_XCB, X11_XLIB, WIN32, HEADLESS };
+    enum class Type {
+        UNKNOWN,
+        WAYLAND,
+        X11_XCB,
+        X11_XLIB,
+        WIN32_WIN,
+        HEADLESS
+    };
     static Type detectDisplayType() {
         const char *wayland_display = std::getenv("WAYLAND_DISPLAY");
         const char *display = std::getenv("DISPLAY");
@@ -62,7 +69,7 @@ class VulkanSurface {
         }
     }
 
-    bool isQueueFamilySurfaceSupported(uint32_t queueFamilyIndex) const {
+    bool isQueueFamilySurfaceSupported(uint32_t queueFamilyIndex) {
         VkBool32 supported = VK_FALSE;
         VkResult result = vkGetPhysicalDeviceSurfaceSupportKHR(
             physicalDevice_, queueFamilyIndex, surface_, &supported);
