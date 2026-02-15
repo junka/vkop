@@ -16,6 +16,7 @@ namespace softmax {
 struct GpuSoftMaxParam {
     ivec4 outShape;
     int axis; // 0: N, 1: C, 2: H, 3: W
+    int fp16;
 };
 
 } // namespace softmax
@@ -43,9 +44,9 @@ class Softmax : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
-            axis_ = std::stol(attributes.at("axis"));
+            para_.axis = std::stol(attributes.at("axis"));
         } else if (attributes.find("dim") != attributes.end()) {
-            axis_ = std::stol(attributes.at("dim"));
+            para_.axis = std::stol(attributes.at("dim"));
         }
     }
 
@@ -81,6 +82,11 @@ class Softmax : public Operator {
                 auto input_image = input->as_input_image(m_dev_, m_cmd_);
                 objs_.emplace_back(input_image);
             }
+            if (typeid(T) == typeid(float)) {
+                para_.fp16 = 0;
+            } else if (typeid(T) == typeid(uint16_t)) {
+                para_.fp16 = 1;
+            }
         });
 
         int batch = input_shape[0];
@@ -90,46 +96,44 @@ class Softmax : public Operator {
 
         int realheight = out_height * batch;
 
-        softmax::GpuSoftMaxParam para;
         // vkimage params
-        para.outShape[0] = batch;
-        para.outShape[1] = depth;
-        para.outShape[2] = out_height;
-        para.outShape[3] = out_width;
-        if (axis_ < 0) {
-            axis_ = rank + axis_;
+        para_.outShape[0] = batch;
+        para_.outShape[1] = depth;
+        para_.outShape[2] = out_height;
+        para_.outShape[3] = out_width;
+        if (para_.axis < 0) {
+            para_.axis = rank + para_.axis;
         }
-        para.axis = axis_;
 
         if (types_[0] == DESCRIPTOR_TYPE_STORAGE) {
             if (rank == 1) {
-                para.outShape[0] = 1;
-                para.outShape[1] = batch;
-                para.axis = 1;
+                para_.outShape[0] = 1;
+                para_.outShape[1] = batch;
+                para_.axis = 1;
             }
-            if (para.axis == 1) {
-                submit(&para, para.outShape[0], 1, 1);
+            if (para_.axis == 1) {
+                submit(&para_, para_.outShape[0], 1, 1);
             } else {
-                submit(&para, para.outShape[1], 1, 1);
+                submit(&para_, para_.outShape[1], 1, 1);
             }
         } else {
-            if (axis_ == 0) {
-                submit(&para, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
+            if (para_.axis == 0) {
+                submit(&para_, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
                        UP_DIV(depth, 4));
-            } else if (axis_ == 1) {
-                submit(&para, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+            } else if (para_.axis == 1) {
+                submit(&para_, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
                        batch);
-            } else if (axis_ == 2) {
-                submit(&para, UP_DIV(out_width, 16), UP_DIV(batch, 16),
+            } else if (para_.axis == 2) {
+                submit(&para_, UP_DIV(out_width, 16), UP_DIV(batch, 16),
                        UP_DIV(depth, 4));
-            } else if (axis_ == 3) {
-                submit(&para, UP_DIV(out_height, 16), UP_DIV(batch, 16),
+            } else if (para_.axis == 3) {
+                submit(&para_, UP_DIV(out_height, 16), UP_DIV(batch, 16),
                        UP_DIV(depth, 4));
             }
         }
     }
 
-    int axis_;
+    softmax::GpuSoftMaxParam para_;
 };
 
 } // namespace ops

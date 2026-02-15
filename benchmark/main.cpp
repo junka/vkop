@@ -8,6 +8,7 @@
 #include "core/runtime.hpp"
 #include "core/function.hpp"
 
+#include <cstdint>
 #include <memory>
 #include <cmath>
 #include <string>
@@ -105,7 +106,6 @@ int main(int argc, char *argv[]) {
         register_pipeline(float{});
     }
 
-
     double tot_lat = 0.0F;
     int count = 100;
     printf("run inference %d times...\n", count);
@@ -118,14 +118,14 @@ int main(int argc, char *argv[]) {
     rt->ReadResult();
 
     std::cout << "\nPredictions:\n";
-    std::cout << std::fixed << std::setprecision(4);
+    std::cout << std::fixed << std::setprecision(3);
 
-    auto labels = load_labels(labels_file_path);
+    auto labels = load_labels(labels_file_path);    
 
     for (int i = 0; i < 10; ++i) {
         int index = (*indexs)[i];
         float value = (precision == 1) ?
-            static_cast<float>((*values_half)[i]) :
+            vkop::core::ITensor::fp16_to_fp32((*values_half)[i]) :
             (*values_float)[i];
 
         std::string label = "Unknown";

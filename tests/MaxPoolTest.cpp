@@ -1,10 +1,8 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
-#include <random>
 #include <cmath>
 
-#include "ATen/Context.h"
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
@@ -119,8 +117,8 @@ private:
 
 
 TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
-    std::vector<std::tuple<std::vector<int>, int, int, int>> test_cases = {
-        // {{1, 3, 224, 224}, 3, 2, 1},
+    const std::vector<std::tuple<std::vector<int>, int, int, int>> test_cases = {
+        {{1, 3, 224, 224}, 3, 2, 1},
         {{1, 3, 16, 16}, 4, 2, 1},
     };
 

@@ -101,6 +101,7 @@ TEST(TopkTest, TopkComprehensiveTest) {
         {{1, 400}, 8, -1},
         {{1, 600}, 7, -1},
         {{3, 2000}, 7, -1},
+        {{1, 2000}, 6, -1},
     };
 
     for (const auto &test_case : test_cases) {

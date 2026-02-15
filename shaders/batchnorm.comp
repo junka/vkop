@@ -2,6 +2,7 @@
 
 #define FLOAT4 vec4
 #define FLOAT float
+#define FLOAT2 vec2
 
 #include "activation.comp"
 

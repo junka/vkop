@@ -4,9 +4,11 @@
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
 #define FLOAT4 f16vec4
+#define FLOAT2 f16vec2
 #define FLOAT float16_t
 #else
 #define FLOAT4 vec4
+#define FLOAT2 vec2
 #define FLOAT float
 #endif
 
@@ -121,7 +123,7 @@ void topk32() {
         int localCount = min(int(N - start), 256);
 
         if (x < N) {
-            sharedData[lid] = uintBitsToFloat(uInput.data[x]);    
+            sharedData[lid] = FLOAT(uintBitsToFloat(uInput.data[x]));    
             if (uParam.init == 0) {
                 sharedIndices[lid] = x;
             } else {
@@ -149,7 +151,7 @@ void topk32() {
         int localCount = min(int(cols - start), 256);
 
         if (x < cols) {
-            sharedData[lid] = uintBitsToFloat(uInput.data[y * cols + x]);
+            sharedData[lid] = FLOAT(uintBitsToFloat(uInput.data[y * cols + x]));
             if (uParam.init == 0) {
                 sharedIndices[lid] = x;
             } else {
@@ -205,7 +207,7 @@ void topk16()
 
     // Element 0
     if (elem0 < total_len) {
-        sharedData[lid * 2] = packed_input.x;
+        sharedData[lid * 2] = FLOAT(packed_input.x);
         if (uParam.init == 0) {
             sharedIndices[lid * 2] = uint(elem0);
         } else {
@@ -219,7 +221,7 @@ void topk16()
 
     // Element 1
     if (elem1 < total_len) {
-        sharedData[lid * 2 + 1] = packed_input.y;
+        sharedData[lid * 2 + 1] = FLOAT(packed_input.y);
         if (uParam.init == 0) {
             sharedIndices[lid * 2 + 1] = uint(elem1);
         } else {

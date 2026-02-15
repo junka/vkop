@@ -480,7 +480,8 @@ void Runtime::RegisterPostProcess(
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
-    auto op = ops::create_from_type(ops, outputs[0]->num_dims() <= 2);
+    auto op =
+        ops::create_from_type(ops, outputs[0]->num_dims() <= 2, precision_);
     op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);

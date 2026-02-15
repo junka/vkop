@@ -97,11 +97,12 @@ void softmax_nd(const float* input, float* output,
 }
 #endif
 
+template <typename T>
 class SoftmaxTest : public TestCase {
 public:
     std::vector<int> input_shape_;
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> output;
     int axis_ = 0;
     std::unordered_map<std::string, std::string> dim;
 
@@ -114,14 +115,21 @@ private:
         std::vector<std::vector<int>> shapes;
         shapes.push_back(input_shape_);
 
+        torch::TensorOptions conf;
+        if constexpr (std::is_same_v<T, float>) {
+            conf = torch::TensorOptions().dtype(torch::kFloat32);
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
+            conf = torch::TensorOptions().dtype(torch::kFloat16);
+        }
+
         torch::manual_seed(42);
         torch::Tensor torch_input;
         if (input_shape_.size() == 2) {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1]});
+            torch_input = torch::randn({input_shape_[0], input_shape_[1]}, conf);
         } else if (input_shape_.size() == 1) {
-            torch_input = torch::randn({input_shape_[0]});
+            torch_input = torch::randn({input_shape_[0]}, conf);
         } else {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, conf);
         }
 
         int axis = 0;
@@ -147,35 +155,6 @@ private:
             printf("%d, ", s);
         }
         printf("]\n");
-
-        // printf("\n===Input==============\n");
-        // std::cout << torch_input << std::endl;
-
-        // printf("\n===Output==============\n");
-        // std::cout << torch_output << std::endl;
-
-        input = std::make_shared<Tensor<float>>(input_shape_);
-        fillTensorFromTorch(input, torch_input);
-
-        output = std::make_shared<Tensor<float>>(output_shape);
-        fillTensorFromTorch(output, torch_output);
-    }
-};
-}
-
-TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
-
-    std::vector<std::tuple<std::vector<int>, int>> test_cases = {
-        {{1, 10, 7, 7}, 1},
-        {{1, 6, 8, 8}, 3},
-        {{2, 4, 10, 10}, 2},
-        {{1, 8, 6, 6}, 2},
-        {{1, 16, 5, 5}, 1},
-        {{4, 1000}, 1},
-    };
-    for (auto &test_case: test_cases) {
-        auto [input_shape, axis] = test_case;
-        SoftmaxTest softtest(input_shape, axis);
 #if USE_CPP_REFER
         printf("\n===verify C++ refer ==========\n");
         softmax_nd(torch_input.data(), torch_output.data(),
@@ -203,6 +182,37 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
         }
 #endif
 
+        // printf("\n===Input==============\n");
+        // std::cout << torch_input << std::endl;
+
+        // printf("\n===Output==============\n");
+        // std::cout << torch_output << std::endl;
+
+        input = std::make_shared<Tensor<T>>(input_shape_);
+        fillTensorFromTorch(input, torch_input);
+
+        output = std::make_shared<Tensor<T>>(output_shape);
+        fillTensorFromTorch(output, torch_output);
+    }
+};
+}
+
+TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
+
+    const std::vector<std::tuple<std::vector<int>, int>> test_cases = {
+        {{1, 10, 7, 7}, 1},
+        {{1, 6, 8, 8}, 3},
+        {{2, 4, 10, 10}, 2},
+        {{1, 8, 6, 6}, 2},
+        {{1, 16, 5, 5}, 1},
+        {{4, 1000}, 1},
+    };
+    for (const auto &test_case: test_cases) {
+        auto [input_shape, axis] = test_case;
+
+        LOG_INFO("Testing FP32");
+        SoftmaxTest<float> softtest(input_shape, axis);
+
         EXPECT_TRUE(softtest.run_test<float>({softtest.input}, {softtest.output},
             [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *softmax_op = dynamic_cast<Softmax *>(op.get());
@@ -211,6 +221,18 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
                     return;
                 }
                 softmax_op->setAttribute(softtest.dim);
+            }));
+
+        LOG_INFO("Testing FP16");
+        SoftmaxTest<uint16_t> softtest2(input_shape, axis);
+        EXPECT_TRUE(softtest2.run_test<uint16_t>({softtest2.input}, {softtest2.output},
+            [&softtest2](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *softmax_op = dynamic_cast<Softmax *>(op.get());
+                if (!softmax_op) {
+                    LOG_ERROR("Failed to cast operator to Softmax");
+                    return;
+                }
+                softmax_op->setAttribute(softtest2.dim);
             }));
     }
 }

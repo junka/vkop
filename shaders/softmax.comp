@@ -22,6 +22,7 @@ layout(binding = 1) uniform sampler2DArray InputImage;
 layout(push_constant) uniform constBuffer {
     ivec4 outShape;    // [N, C, H, W]
     int axis;
+    int fp16;
 } uConst;
 
 // Axis 0: softmax over N (batch)

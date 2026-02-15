@@ -6,8 +6,12 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
 #define FLOAT4 f16vec4
+#define FLOAT2 f16vec2
+#define FLOAT float16_t
 #else
 #define FLOAT4 vec4
+#define FLOAT2 vec2
+#define FLOAT float
 #endif
 
 layout(set=0, binding = 0) writeonly buffer outputBuffer {
@@ -32,11 +36,11 @@ void main() {
     if (n >= N || c4 >= (C + 3) /4) return;
     int numInputs = H * W;
 
-    FLOAT4 sum = FLOAT4(0.0);
+    vec4 sum = vec4(0.0);
     for (int x = 0; x < W; x++) {
         for (int y = 0; y < H; y++) {
             uint total_h = n * H + y;
-            FLOAT4 val = FLOAT4(texelFetch(inputImage, ivec3(x, total_h, c4), 0));
+            vec4 val = (texelFetch(inputImage, ivec3(x, total_h, c4), 0));
             sum += val;
         }
     }

@@ -65,7 +65,10 @@ TEST(AddTest, AddComprehensiveTest) {
     };
 
     for (const auto& t : test_cases) {
-        AddTest<uint16_t> addtest(t);
+        AddTest<float> addtest(t);
         EXPECT_TRUE (addtest.run_test<uint16_t>({addtest.inputa, addtest.inputb}, {addtest.output}));
+    
+        AddTest<uint16_t> addtest1(t);
+        EXPECT_TRUE (addtest1.run_test<uint16_t>({addtest1.inputa, addtest1.inputb}, {addtest1.output}));
     }
 }

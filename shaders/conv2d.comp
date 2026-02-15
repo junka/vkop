@@ -7,10 +7,12 @@
 #define FLOAT4 f16vec4
 #define FLOAT2 f16vec2
 #else
+
 #define FLOAT float
 #define FLOAT4 vec4
 #define FLOAT2 vec2
 #endif
+
 
 #include "activation.comp"
 

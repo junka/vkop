@@ -122,7 +122,7 @@ int main() {
     // This model has two inputs and one output,
     // one add and one conv2d operator
 
-    auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
+    auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path, 0);
     rt->LoadModel();
 
     auto t1 = vkop::core::as_tensor<uint16_t>(rt->GetInput("input_x1"));
