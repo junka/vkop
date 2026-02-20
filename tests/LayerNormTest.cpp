@@ -80,7 +80,8 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
 }
 #endif
 
-class LayerNormTest : public TestCase {
+template <typename T>
+class LayerNormTest : public TestCase<T> {
 public:
     std::vector<int> input_shape_ = {
         2, 5, 4, 4
@@ -94,7 +95,7 @@ public:
     std::shared_ptr<Tensor<float>> bias;
     std::shared_ptr<Tensor<float>> output;
 
-    LayerNormTest():TestCase("LayerNorm") {
+    LayerNormTest():TestCase<T>("LayerNorm") {
         initTestdata();
     }
 private:
@@ -125,23 +126,23 @@ private:
         std::cout << torch_output << std::endl;
 
         input = std::make_shared<Tensor<float>>(input_shape_);
-        fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(input, torch_input);
 
         weight = std::make_shared<Tensor<float>>(normalized_shape_);
-        fillTensorFromTorch(weight, torch_weight);
+        this->fillTensorFromTorch(weight, torch_weight);
 
         bias = std::make_shared<Tensor<float>>(normalized_shape_);
-        fillTensorFromTorch(bias, torch_bias);
+        this->fillTensorFromTorch(bias, torch_bias);
 
         output = std::make_shared<Tensor<float>>(output_shape);
-        fillTensorFromTorch(output, torch_output);
+        this->fillTensorFromTorch(output, torch_output);
     }
 };
 }
 
 TEST(LayerNormTest, LayerNormComprehensiveTest) {
 
-    LayerNormTest lntest;
+    LayerNormTest<float> lntest;
 
 #if USE_CPP_REFER
     printf("\n===verify C++ refer ==========\n");
@@ -170,7 +171,7 @@ TEST(LayerNormTest, LayerNormComprehensiveTest) {
     }
 #endif
 
-    EXPECT_TRUE(lntest.run_test<float>({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
+    EXPECT_TRUE(lntest.run_test({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
         [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
         auto *batchnorm_op = dynamic_cast<LayerNorm *>(op.get());
         if (!batchnorm_op) {

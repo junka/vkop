@@ -129,7 +129,7 @@ void reference_conv2d(const std::shared_ptr<Tensor<T>>& input, const std::shared
 }  // namespace
 
 template<typename T>
-class Conv2dTest: public TestCase {
+class Conv2dTest: public TestCase<T> {
 public:
     std::vector<int> input_shape_ = {1, 10, 7, 7}; // b, ic, ih, iw
     int kernel_size_ = 2;
@@ -149,7 +149,7 @@ public:
 
     Conv2dTest(const std::vector<int>& input_shape, int kernel_size, int stride, 
                int pad, int group, int dilation, int feature_size)
-        : TestCase("Conv2d"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), 
+        : TestCase<T>("Conv2d"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), 
           pad_(pad), group_(group), dilation_(dilation), feature_size_(feature_size) {
           
         attributes = {
@@ -164,16 +164,10 @@ public:
 
 private:
     void initTestData() {
-        torch::TensorOptions conf;
-        if constexpr (std::is_same_v<T, float>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat32);
-        } else if constexpr (std::is_same_v<T, uint16_t>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat16);
-        }
         torch::manual_seed(42);
-        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, conf);
-        auto torch_weight = torch::randn({feature_size_, input_shape_[1]/group_, kernel_size_, kernel_size_}, conf);
-        auto torch_bias = torch::randn({feature_size_}, conf);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
+        auto torch_weight = torch::randn({feature_size_, input_shape_[1]/group_, kernel_size_, kernel_size_}, this->getTorchConf());
+        auto torch_bias = torch::randn({feature_size_}, this->getTorchConf());
         auto torch_output = torch::conv2d(torch_input, torch_weight, torch_bias, torch::IntArrayRef({stride_, stride_}),
             torch::IntArrayRef({pad_, pad_}),
             torch::IntArrayRef({dilation_, dilation_}),
@@ -200,16 +194,16 @@ private:
         printf("\n============bias ===========\n");
         std::cout << torch_bias << std::endl;
         bias_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_});
-        fillTensorFromTorch(bias_data_, torch_bias);
+        this->fillTensorFromTorch(bias_data_, torch_bias);
 
         input = std::make_shared<Tensor<T>>(input_shape_);
-        fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(input, torch_input);
         output = std::make_shared<Tensor<T>>(output_shape);
-        fillTensorFromTorch(output, torch_output);
+        this->fillTensorFromTorch(output, torch_output);
 
         weight_data_ = std::make_shared<Tensor<T>>(std::vector<int>{feature_size_, input_shape_[1] / group_, kernel_size_, kernel_size_});
         weight_data_->set_transpose();
-        fillTensorFromTorch(weight_data_, torch_weight);
+        this->fillTensorFromTorch(weight_data_, torch_weight);
 
 #if USE_CPP_REFER
 
@@ -281,7 +275,7 @@ TEST(Conv2dTest, Conv2dComprehensiveTest) {
                kernel_size, stride, pad, group, dilation, feature_size);
         
         Conv2dTest<uint16_t> ct16(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
-        EXPECT_TRUE(ct16.run_test<uint16_t>({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
+        EXPECT_TRUE(ct16.run_test({ct16.input, ct16.weight_data_, ct16.bias_data_}, {ct16.output},
             [&ct16](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *conv_op = dynamic_cast<Conv2d *>(op.get());
             if (!conv_op) {
@@ -292,7 +286,7 @@ TEST(Conv2dTest, Conv2dComprehensiveTest) {
         }));
 
         Conv2dTest<float> ct(input_shape, kernel_size, stride, pad, group, dilation, feature_size);
-        EXPECT_TRUE(ct.run_test<float>({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
+        EXPECT_TRUE(ct.run_test({ct.input, ct.weight_data_, ct.bias_data_}, {ct.output},
             [&ct](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *conv_op = dynamic_cast<Conv2d *>(op.get());
             if (!conv_op) {

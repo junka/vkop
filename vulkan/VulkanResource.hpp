@@ -41,6 +41,8 @@ class VulkanResource {
     findMemoryTypeFromProperties(uint32_t memoryTypeBits,
                                  VkPhysicalDeviceMemoryProperties properties,
                                  VkMemoryPropertyFlags requiredProperties) {
+        // printf("memoryTypeBits: %x vs %x\n", memoryTypeBits,
+        //        requiredProperties);
         for (uint32_t index = 0; index < properties.memoryTypeCount; ++index) {
             if (((memoryTypeBits & (1 << index))) &&
                 ((properties.memoryTypes[index].propertyFlags &

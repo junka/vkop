@@ -1,7 +1,5 @@
 #include <cstdint>
 #include <vector>
-#include <random>
-#include <cmath>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -193,11 +191,14 @@ void reference_reduce(const std::shared_ptr<Tensor<float>>& input,
 }
 
 #endif
-class ReduceTest : public TestCase {
+
+template<typename T>
+class ReduceTest : public TestCase<T> {
 public:
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> output;
-    std::vector<int> axes = {0,1};
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> output;
+    std::vector<int> t;
+    std::vector<int> axes;
 
     std::unordered_map<std::string, std::string> attributes = {
         {"axes", "[0,1]"},
@@ -205,165 +206,119 @@ public:
         {"keepdims", "1"}
     };
 
-    explicit ReduceTest():TestCase("Reduce") {
+    explicit ReduceTest(const std::vector<int> &shape, const std::vector<int> &axes):TestCase<T>("Reduce"), t(shape), axes(axes) {
     }
 
     void initTestdata(const std::string& reduce_op)
     {
         attributes["reduce_op"] = reduce_op;
-        std::vector<int> t = {
-            1, 3, 4,4
-        };
-        input = std::make_shared<Tensor<float>>(t);
+        input = std::make_shared<Tensor<T>>(t);
 
         std::vector<int> output_shape = Reduce::calculateOutputShape(input->getShape(), axes, attributes.at("keepdims") == "1");
-        output = std::make_shared<Tensor<float>>(output_shape);
-        input->reserveOnCPU();
-        output->reserveOnCPU();
+        output = std::make_shared<Tensor<T>>(output_shape);
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{-4.0F, 6.0F};
-        for (int i = 0; i < input->num_elements(); i++) {
-            (*input)[i] = input_dist(gen);
-        }
-        vkop::ops::reduce::ReduceType reduce_type = vkop::ops::reduce::ReduceType::SUM;
-        if (attributes.at("reduce_op") == "l1_norm") {
-            reduce_type = vkop::ops::reduce::ReduceType::L1;
-        } else if (attributes.at("reduce_op") == "l2_norm") {
-            reduce_type = vkop::ops::reduce::ReduceType::L2;
-        } else if (attributes.at("reduce_op") == "log_sum") {
-            reduce_type = vkop::ops::reduce::ReduceType::LOGSUM;
-        } else if (attributes.at("reduce_op") == "log_sum_exp") {
-            reduce_type = vkop::ops::reduce::ReduceType::LOGSUMEXP;
-        } else if (attributes.at("reduce_op") == "max") {
-            reduce_type = vkop::ops::reduce::ReduceType::MAX;
-        } else if (attributes.at("reduce_op") == "mean") {
-            reduce_type = vkop::ops::reduce::ReduceType::MEAN;
-        } else if (attributes.at("reduce_op") == "min") {
-            reduce_type = vkop::ops::reduce::ReduceType::MIN;
+        std::vector<int64_t> inshape(t.begin(), t.end());
+        std::vector<int64_t> axeshape(axes.begin(), axes.end());
+        torch::Tensor torch_input;
+        if (attributes.at("reduce_op") == "log_sum" || attributes.at("reduce_op") == "log_sum_exp") {
+            // For log operations, ensure positive values
+            torch_input = torch::rand(inshape, this->getTorchConf()) + 0.01;  // Small positive values
         } else if (attributes.at("reduce_op") == "prod") {
-            reduce_type = vkop::ops::reduce::ReduceType::PROD;
-        } else if (attributes.at("reduce_op") == "sum") {
-            reduce_type = vkop::ops::reduce::ReduceType::SUM;
-        } else if (attributes.at("reduce_op") == "sum_square") {
-            reduce_type = vkop::ops::reduce::ReduceType::SUMSQUARE;
-        }
-
-        reference_reduce(input, output, axes, attributes.at("keepdims") == "1", reduce_type);
-        printTensorWithShape(*input, input->getShape());
-        printTensorWithShape(*output, output->getShape());
-    }
-private:
-    static void printTensorWithShape(const Tensor<float>& tensor, const std::vector<int>& shape) {
-        if (shape.empty()) return;
-        
-        // For small tensors, print with full hierarchical structure
-        size_t total_elements = 1;
-        for (int dim : shape) {
-            total_elements *= dim;
-        }
-        
-        // Limit printing for large tensors
-        if (total_elements > 1000) {
-            printf("tensor shape: ");
-            for (size_t i = 0; i < shape.size(); ++i) {
-                printf("%d", shape[i]);
-                if (i < shape.size() - 1) printf("x");
-            }
-            printf(", total elements: %zu\n", total_elements);
-            printf("First 10 elements: ");
-            for (size_t i = 0; i < std::min(total_elements, static_cast<size_t>(10)); ++i) {
-                printf("%.4f ", tensor[i]);
-            }
-            printf("\n");
-            return;
-        }
-        
-        // For small tensors, print with hierarchical structure
-        printf("tensor shape: [");
-        for (int i : shape) {
-            printf("%d, ", i);
-        }
-        printf("]\n");
-        
-        if (shape.size() == 1) {
-            printf("[");
-            for (int i = 0; i < shape[0]; ++i) {
-                printf("%.4f", tensor[i]);
-                if (i < shape[0] - 1) printf(", ");
-            }
-            printf("]\n");
-        } else if (shape.size() == 2) {
-            for (int i = 0; i < shape[0]; ++i) {
-                printf("[");
-                for (int j = 0; j < shape[1]; ++j) {
-                    size_t idx = (i * shape[1]) + j;
-                    printf("%.4f", tensor[idx]);
-                    if (j < shape[1] - 1) printf(", ");
-                }
-                printf("]\n");
-            }
-        } else if (shape.size() == 3) {
-            for (int i = 0; i < shape[0]; ++i) {
-                printf("Channel %d:\n", i);
-                for (int j = 0; j < shape[1]; ++j) {
-                    printf("  [");
-                    for (int k = 0; k < shape[2]; ++k) {
-                        size_t idx = (i * shape[1] * shape[2]) + (j * shape[2]) + k;
-                        printf("%.4f", tensor[idx]);
-                        if (k < shape[2] - 1) printf(", ");
-                    }
-                    printf("]\n");
-                }
-            }
-        } else if (shape.size() == 4) {
-            for (int n = 0; n < shape[0]; ++n) {
-                printf("[");
-                for (int c = 0; c < shape[1]; ++c) {
-                    printf(" [");
-                    for (int h = 0; h < shape[2]; ++h) {
-                        printf("    [");
-                        for (int w = 0; w < shape[3]; ++w) {
-                            size_t idx = (n * shape[1] * shape[2] * shape[3]) + 
-                                         (c * shape[2] * shape[3]) + 
-                                         (h * shape[3]) + w;
-                            printf("%.4f", tensor[idx]);
-                            if (w < shape[3] - 1) printf(", ");
-                        }
-                        printf("]\n");
-                    }
-                    printf("]\n");
-                }
-                printf("]\n");
-            }
+            // For product operations, use smaller values to prevent overflow
+            torch_input = torch::rand(inshape, this->getTorchConf()) * 0.5 + 0.5;  // Values in [0.5, 1.0]
         } else {
-            // For tensors with more than 4 dimensions, just print flat
-            printf("[");
-            for (size_t i = 0; i < total_elements; ++i) {
-                printf("%.4f", tensor[i]);
-                if (i < total_elements - 1) printf(", ");
-            }
-            printf("]\n");
+            // For other operations, use normal distribution
+            torch_input = torch::randn(inshape, this->getTorchConf());
         }
+        this->fillTensorFromTorch(input, torch_input);
+
+        // vkop::ops::reduce::ReduceType reduce_type = vkop::ops::reduce::ReduceType::SUM;
+
+        torch::Tensor torch_output;
+        bool keepdims = (attributes.at("keepdims") == "1");
+        if (attributes.at("reduce_op") == "l1_norm") {
+            // reduce_type = vkop::ops::reduce::ReduceType::L1;
+            torch_output = torch::sum(torch::abs(torch_input), axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "l2_norm") {
+            // reduce_type = vkop::ops::reduce::ReduceType::L2;
+            torch_output = torch::sqrt(torch::sum(torch::square(torch_input), axeshape, keepdims));
+        } else if (attributes.at("reduce_op") == "log_sum") {
+            // reduce_type = vkop::ops::reduce::ReduceType::LOGSUM;
+            constexpr double kEps = 1e-12;
+            torch_output = torch::log(torch::sum(torch_input, axeshape, keepdims) + kEps);
+        } else if (attributes.at("reduce_op") == "log_sum_exp") {
+            // reduce_type = vkop::ops::reduce::ReduceType::LOGSUMEXP;
+            torch_output = torch::logsumexp(torch_input, axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "max") {
+            // reduce_type = vkop::ops::reduce::ReduceType::MAX;
+            torch_output = torch::amax(torch_input, axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "mean") {
+            // reduce_type = vkop::ops::reduce::ReduceType::MEAN;
+            torch_output = torch::mean(torch_input, axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "min") {
+            // reduce_type = vkop::ops::reduce::ReduceType::MIN;
+            torch_output = torch::amin(torch_input, axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "prod") {
+            // reduce_type = vkop::ops::reduce::ReduceType::PROD;
+            torch_output = torch_input.clone();
+            // Sort axes in descending order to avoid index shifting issues
+            std::vector<int64_t> sorted_axes = axeshape;
+            std::sort(sorted_axes.begin(), sorted_axes.end(), std::greater<int64_t>());
+            for (int64_t axis : sorted_axes) {
+                torch_output = torch::prod(torch_output, axis, keepdims);
+            }
+        } else if (attributes.at("reduce_op") == "sum") {
+            // reduce_type = vkop::ops::reduce::ReduceType::SUM;
+            torch_output = torch::sum(torch_input, axeshape, keepdims);
+        } else if (attributes.at("reduce_op") == "sum_square") {
+            // reduce_type = vkop::ops::reduce::ReduceType::SUMSQUARE;
+            torch_output = torch::sum(torch::square(torch_input), axeshape, keepdims);
+        }
+        this->fillTensorFromTorch(output, torch_output);
+#if 0
+        reference_reduce(input, output, axes, attributes.at("keepdims") == "1", reduce_type);
+#endif
+        input->print_tensor();
+        output->print_tensor();
     }
 };
 }
 
 TEST(ReduceTest, ReduceComprehensiveTest) {
-    
-    ReduceTest reducetest;
-    for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
-        reducetest.initTestdata(reduceop);
-        EXPECT_TRUE(reducetest.run_test<float>({reducetest.input}, {reducetest.output},
-            [&reducetest](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *reduce_op = dynamic_cast<Reduce *>(op.get());
-            if (!reduce_op) {
-                LOG_ERROR("Failed to cast operator to Reduce");
-                return;
-            }
-            reduce_op->setAttribute(reducetest.attributes);
-        }));
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
+        {{1,3, 4, 4}, {0, 1}},
+    };
+    for (const auto &test_case : test_cases) {
+        auto [t, axes] = test_case;
+        ReduceTest<float> reducetest(t, axes);
+        for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
+            reducetest.initTestdata(reduceop);
+            LOG_INFO("Testing fp32 reduce op: %s", reduceop);
+            EXPECT_TRUE(reducetest.run_test({reducetest.input}, {reducetest.output},
+                [&reducetest](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *reduce_op = dynamic_cast<Reduce *>(op.get());
+                if (!reduce_op) {
+                    LOG_ERROR("Failed to cast operator to Reduce");
+                    return;
+                }
+                reduce_op->setAttribute(reducetest.attributes);
+            }));
+        }
+
+        ReduceTest<uint16_t> reducetest1(t, axes);
+        for (const auto *reduceop: {"l1_norm", "l2_norm", "log_sum", "log_sum_exp", "max", "mean", "min", "prod", "sum", "sum_square"}) {
+            reducetest1.initTestdata(reduceop);
+            LOG_INFO("Testing fp16 reduce op: %s", reduceop);
+            EXPECT_TRUE(reducetest1.run_test({reducetest1.input}, {reducetest1.output},
+                [&reducetest1](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *reduce_op = dynamic_cast<Reduce *>(op.get());
+                if (!reduce_op) {
+                    LOG_ERROR("Failed to cast operator to Reduce");
+                    return;
+                }
+                reduce_op->setAttribute(reducetest1.attributes);
+            }));
+        }
+
     }
 }

@@ -1,63 +1,36 @@
-#include <memory>
 #include <vector>
-#include <random>
-#include <cmath>
 
-#include "setup.hpp"
-#include "core/Tensor.hpp"
+#include "BinaryTest.hpp"
 #include "include/logger.hpp"
 
-using vkop::core::Tensor;
-using vkop::tests::TestCase;
+using vkop::tests::BinaryTest;
 
 namespace {
+    
 
-float reference_prelu(float val, float alpha)
-{
-    return std::fmax(val, 0.0F) + (std::fmin(val, 0.0F) * alpha);
-}
-
-class PReluTest : public TestCase {
+template<typename T>
+class PReluTest : public BinaryTest<T> {
 public:
-    std::vector<int> input_shape_ = {
-        5, 5, 64, 64
-    };
-    std::shared_ptr<Tensor<float>> inputa;
-    std::shared_ptr<Tensor<float>> inputb;
-    std::shared_ptr<Tensor<float>> output;
-
-    PReluTest():TestCase("PRelu") {
-        initTestdata();
-    }
-private:
-    void initTestdata()
-    {
-        inputa = std::make_shared<Tensor<float>>(input_shape_);
-        inputb = std::make_shared<Tensor<float>>(input_shape_);
-        output = std::make_shared<Tensor<float>>(input_shape_);
-        inputa->reserveOnCPU();
-        inputb->reserveOnCPU();
-        output->reserveOnCPU();
-
-        
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> inputa_dist{-1.0F, 1.0F};
-        std::normal_distribution<> inputb_dist{1.0F, 2.0F};
-        for (int i = 0; i < inputa->num_elements(); i++) {
-            auto a = inputa_dist(gen);
-            auto b = inputb_dist(gen);
-            (*inputa)[i] = a;
-            (*inputb)[i] = b;
-            (*output)[i] = reference_prelu(a, b);
-        }
+    explicit PReluTest(std::vector<int> input_shape): BinaryTest<T>("PRelu", std::move(input_shape)) {
+        // auto torch_output = torch::prelu(this->torch_inputa,this->torch_inputb);
+        auto torch_output = torch::where(this->torch_inputa > 0, this->torch_inputa, this->torch_inputa * this->torch_inputb);
+        this->fillTensorFromTorch(this->output, torch_output);
     }
 };
 }
 
 TEST(PReluTest, PReluComprehensiveTest) {
+    const std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
+    for (const auto& t : test_cases) {
+        PReluTest<float> prelutest(t);
+        EXPECT_TRUE(prelutest.run_test());
 
-    PReluTest prelutest;
-    EXPECT_TRUE(prelutest.run_test<float>({prelutest.inputa, prelutest.inputb}, {prelutest.output}));
+        PReluTest<uint16_t> prelutest1(t);
+        EXPECT_TRUE(prelutest1.run_test());
+
+    }
 }

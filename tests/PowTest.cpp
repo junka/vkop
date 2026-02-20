@@ -1,60 +1,34 @@
 #include <vector>
-#include <random>
-#include <cmath>
 
-#include "setup.hpp"
-#include "core/Tensor.hpp"
+#include "BinaryTest.hpp"
 #include "include/logger.hpp"
 
-using vkop::core::Tensor;
-using vkop::tests::TestCase;
+using vkop::tests::BinaryTest;
 
 namespace {
+    
 
-class PowTest : public TestCase {
+template<typename T>
+class PowTest : public BinaryTest<T> {
 public:
-    std::shared_ptr<Tensor<float>> inputa;
-    std::shared_ptr<Tensor<float>> inputb;
-    std::shared_ptr<Tensor<float>> output;
-
-    PowTest():TestCase("Pow") {
-        initTestdata();
-    }
-private:
-    void initTestdata()
-    {
-        std::vector<int> t = {
-            1, 5, 64, 64
-        };
-        inputa = std::make_shared<Tensor<float>>(t);
-        inputb = std::make_shared<Tensor<float>>(t);
-        output = std::make_shared<Tensor<float>>(t);
-        inputa->reserveOnCPU();
-        inputb->reserveOnCPU();
-        output->reserveOnCPU();
-        
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> inputa_dist{1.0F, 0.5F};
-        std::normal_distribution<> inputb_dist{0.0F, 1.5F};
-        for (int i = 0; i < inputa->num_elements(); i++) {
-            float inputa_val = inputa_dist(gen);
-            inputa_val = std::abs(inputa_val);
-            inputa_val = std::max(0.1F, std::min(10.0F, inputa_val));
-            float inputb_val = inputb_dist(gen);
-            inputb_val = std::max(-10.0F, std::min(10.0F, inputb_val));
-
-            (*inputa)[i] = inputa_val;
-            (*inputb)[i] = inputb_val;
-            (*output)[i] = std::pow((*inputa)[i], (*inputb)[i]);
-        }
+    explicit PowTest(std::vector<int> input_shape): BinaryTest<T>("Pow", std::move(input_shape)) {
+        auto in = this->torch_inputa.abs() + 1e-6;
+        this->fillTensorFromTorch(this->inputa, in);
+        auto torch_output = torch::pow(in,this->torch_inputb);
+        this->fillTensorFromTorch(this->output, torch_output);
     }
 };
 }
 
 TEST(PowTest, PowComprehensiveTest) {
 
-    PowTest powtest;
-    EXPECT_TRUE(powtest.run_test<float>({powtest.inputa, powtest.inputb}, {powtest.output}));
+    const std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
+    for (const auto& t : test_cases) {
+        PowTest<float> powtest(t);
+        EXPECT_TRUE(powtest.run_test());
+    }
 }

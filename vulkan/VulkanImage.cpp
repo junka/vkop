@@ -41,8 +41,8 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
                                   &mem_requirements2);
     VkMemoryRequirements memory_requirements =
         mem_requirements2.memoryRequirements;
-    printf("mem req %lu, align %lu\n", memory_requirements.size,
-           memory_requirements.alignment);
+    // printf("mem req %lu, align %lu\n", memory_requirements.size,
+    //        memory_requirements.alignment);
 #else
     VkMemoryRequirements memoryRequirements;
     vkGetImageMemoryRequirements(m_device, m_image, &memoryRequirements);

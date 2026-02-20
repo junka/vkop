@@ -67,7 +67,7 @@ void maxpool2d_reference(const std::shared_ptr<Tensor<T>>& input, std::shared_pt
 #endif
 
 template<typename T>
-class MaxpoolTest : public TestCase {
+class MaxpoolTest : public TestCase<T> {
 public:
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<T>> output;
@@ -78,7 +78,7 @@ public:
 
     std::unordered_map<std::string, std::string> attributes;
 
-    MaxpoolTest(const std::vector<int>& input_shape, int kernel_size, int stride, int pad) : TestCase("MaxPool"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), pad_(pad) {
+    MaxpoolTest(const std::vector<int>& input_shape, int kernel_size, int stride, int pad) : TestCase<T>("MaxPool"), input_shape_(input_shape), kernel_size_(kernel_size), stride_(stride), pad_(pad) {
         attributes = {
             {"kernel_shape", std::to_string(kernel_size_)},
             {"strides", std::to_string(stride_)},
@@ -94,23 +94,14 @@ private:
     void initTestdata() {
         input = std::make_shared<Tensor<T>>(input_shape_);
         output = std::make_shared<Tensor<T>>(input_shape_);
-        input->reserveOnCPU();
-        output->reserveOnCPU();
-
-        torch::TensorOptions conf;
-        if constexpr (std::is_same_v<T, float>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat32);
-        } else if constexpr (std::is_same_v<T, uint16_t>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat16);
-        }
 
         torch::manual_seed(42);
-        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, conf);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
         auto torch_output = torch::max_pool2d(torch_input, {kernel_size_, kernel_size_}, {stride_, stride_}, {pad_, pad_}, 1, false);
         printf("=======output tensor=======");
         std::cout << torch_output << std::endl;
-        fillTensorFromTorch(input, torch_input);
-        fillTensorFromTorch(output, torch_output);
+        this->fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(output, torch_output);
     }
 };
 }
@@ -128,7 +119,7 @@ TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
                 input_shape[0], input_shape[1], input_shape[2], input_shape[3], kernel_size, stride, pad);
         LOG_INFO("Running test for fp32 ...");
         MaxpoolTest<float> maxtest(input_shape, kernel_size, stride, pad);
-        EXPECT_TRUE(maxtest.run_test<float>({maxtest.input}, {maxtest.output},
+        EXPECT_TRUE(maxtest.run_test({maxtest.input}, {maxtest.output},
             [&maxtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
                 if (!maxpool_op) {
@@ -140,7 +131,7 @@ TEST(MaxPoolTest, MaxPoolComprehensiveTest) {
 
         LOG_INFO("Running test for fp16 ...");
         MaxpoolTest<uint16_t> maxtest2(input_shape, kernel_size, stride, pad);
-        EXPECT_TRUE(maxtest.run_test<uint16_t>({maxtest2.input}, {maxtest2.output},
+        EXPECT_TRUE(maxtest2.run_test({maxtest2.input}, {maxtest2.output},
             [&maxtest2](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *maxpool_op = dynamic_cast<Maxpool2d *>(op.get());
                 if (!maxpool_op) {

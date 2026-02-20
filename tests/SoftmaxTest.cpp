@@ -98,7 +98,7 @@ void softmax_nd(const float* input, float* output,
 #endif
 
 template <typename T>
-class SoftmaxTest : public TestCase {
+class SoftmaxTest : public TestCase<T> {
 public:
     std::vector<int> input_shape_;
     std::shared_ptr<Tensor<T>> input;
@@ -106,7 +106,7 @@ public:
     int axis_ = 0;
     std::unordered_map<std::string, std::string> dim;
 
-    SoftmaxTest(const std::vector<int>& input_shape, int axis):TestCase("Softmax"), input_shape_(input_shape), axis_(axis) {
+    SoftmaxTest(const std::vector<int>& input_shape, int axis):TestCase<T>("Softmax"), input_shape_(input_shape), axis_(axis) {
         dim = {{"dim", std::to_string(axis_)}};
         initTestData();
     }
@@ -115,21 +115,14 @@ private:
         std::vector<std::vector<int>> shapes;
         shapes.push_back(input_shape_);
 
-        torch::TensorOptions conf;
-        if constexpr (std::is_same_v<T, float>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat32);
-        } else if constexpr (std::is_same_v<T, uint16_t>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat16);
-        }
-
         torch::manual_seed(42);
         torch::Tensor torch_input;
         if (input_shape_.size() == 2) {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1]}, conf);
+            torch_input = torch::randn({input_shape_[0], input_shape_[1]}, this->getTorchConf());
         } else if (input_shape_.size() == 1) {
-            torch_input = torch::randn({input_shape_[0]}, conf);
+            torch_input = torch::randn({input_shape_[0]}, this->getTorchConf());
         } else {
-            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, conf);
+            torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
         }
 
         int axis = 0;
@@ -189,10 +182,10 @@ private:
         // std::cout << torch_output << std::endl;
 
         input = std::make_shared<Tensor<T>>(input_shape_);
-        fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(input, torch_input);
 
         output = std::make_shared<Tensor<T>>(output_shape);
-        fillTensorFromTorch(output, torch_output);
+        this->fillTensorFromTorch(output, torch_output);
     }
 };
 }
@@ -213,7 +206,7 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
         LOG_INFO("Testing FP32");
         SoftmaxTest<float> softtest(input_shape, axis);
 
-        EXPECT_TRUE(softtest.run_test<float>({softtest.input}, {softtest.output},
+        EXPECT_TRUE(softtest.run_test({softtest.input}, {softtest.output},
             [&softtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *softmax_op = dynamic_cast<Softmax *>(op.get());
                 if (!softmax_op) {
@@ -225,7 +218,7 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
 
         LOG_INFO("Testing FP16");
         SoftmaxTest<uint16_t> softtest2(input_shape, axis);
-        EXPECT_TRUE(softtest2.run_test<uint16_t>({softtest2.input}, {softtest2.output},
+        EXPECT_TRUE(softtest2.run_test({softtest2.input}, {softtest2.output},
             [&softtest2](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *softmax_op = dynamic_cast<Softmax *>(op.get());
                 if (!softmax_op) {

@@ -15,7 +15,7 @@ using vkop::ops::Resize;
 
 
 template<typename T>
-class ResizeTest: public TestCase {
+class ResizeTest: public TestCase<T> {
 public:
     std::vector<int> input_shape_ = {1, 2, 4, 4};
     std::vector<int> resize_ = {1, 2, 2, 2};
@@ -43,7 +43,7 @@ public:
 
     ResizeTest(const std::vector<int>& input_shape, const std::vector<int>& resize, 
                bool align_corners, std::string mode, bool antialias, float cubic_coeff_a = -0.75)
-        : TestCase("Resize"), input_shape_(input_shape), resize_(resize), align_corners_(align_corners), 
+        : TestCase<T>("Resize"), input_shape_(input_shape), resize_(resize), align_corners_(align_corners), 
           mode_(std::move(mode)), antialias_(antialias), cubic_coeff_a_(cubic_coeff_a) {
         
         attributes = {
@@ -137,10 +137,10 @@ private:
         std::cout << torch_output << std::endl;
 
         input_data_ = std::make_shared<Tensor<float>>(input_shape_);
-        fillTensorFromTorch(input_data_, torch_input);
+        this->fillTensorFromTorch(input_data_, torch_input);
 
         output_data_ = std::make_shared<Tensor<float>>(output_shape);
-        fillTensorFromTorch(output_data_, torch_output);
+        this->fillTensorFromTorch(output_data_, torch_output);
     }
 };
 
@@ -161,7 +161,7 @@ TEST(ResizeTest, ResizeComprehensiveTest) {
                align_corners ? "true" : "false", antialias ? "true" : "false");
         ResizeTest<float> rt(input_shape, resize, align_corners, mode, antialias);
 
-        EXPECT_TRUE(rt.run_test<float>({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
+        EXPECT_TRUE(rt.run_test({rt.input_data_, nullptr, nullptr, nullptr}, {rt.output_data_},
             [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *resize_op = dynamic_cast<Resize *>(op.get());
             if (!resize_op) {

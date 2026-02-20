@@ -1,50 +1,32 @@
-#include <vector>
-#include <random>
-#include <cmath>
 
-#include "setup.hpp"
-#include "core/Tensor.hpp"
+#include <vector>
+
+#include "UnaryTest.hpp"
 #include "include/logger.hpp"
 
-using vkop::core::Tensor;
-using vkop::tests::TestCase;
+using vkop::tests::UnaryTest;
 
 namespace {
 
-class SoftplusTest : public TestCase {
+template <typename T>
+class SoftplusTest : public vkop::tests::UnaryTest<T> {
 public:
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> output;
-
-    SoftplusTest():TestCase("Softplus") {
-        initTestdata();
-    }
-private:
-    void initTestdata()
-    {
-        std::vector<int> t = {
-            1, 6, 64, 64
-        };
-
-        input = std::make_shared<Tensor<float>>(t);
-        output = std::make_shared<Tensor<float>>(t);
-        input->reserveOnCPU();
-        output->reserveOnCPU();
-
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{0.0F, 1.0F};
-        for (int i = 0; i < input->num_elements(); i++) {
-            (*input)[i] = input_dist(gen);
-            (*output)[i] = (std::log1p(std::exp((*input)[i])));
-        }
+    explicit SoftplusTest(const std::vector<int> &shape): vkop::tests::UnaryTest<T>("Softplus", shape) {
+        auto torch_output = torch::softplus(this->torch_input);
+        this->fillTensorFromTorch(this->output, torch_output);
     }
 };
 }
 
-TEST(SoftplusTest, SoftplusComprehensiveTest) {
 
-    SoftplusTest sptest;
-    EXPECT_TRUE(sptest.run_test<float>({sptest.input}, {sptest.output}));
+TEST(SoftplusTest, SoftplusComprehensiveTest) {
+    std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
+    for (const auto& t : test_cases) {
+        SoftplusTest<float> sptest(t);
+        EXPECT_TRUE(sptest.run_test());
+    }
 }

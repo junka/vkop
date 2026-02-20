@@ -1,9 +1,3 @@
-#include <memory>
-#include <random>
-#include <chrono>
-#include <cmath>
-#include <utility>
-
 #include "core/Tensor.hpp"
 #include "include/logger.hpp"
 #include "setup.hpp"
@@ -12,6 +6,7 @@ using vkop::core::Tensor;
 using vkop::tests::TestCase;
 
 namespace {
+#ifdef USE_CPP_REF
 /*
 * x_norm ranges [-1.0, 1.0], make it +1 to [0, 2]
 * then it rangs [0, 2*range - 1] after multiply range 
@@ -88,15 +83,17 @@ void reference_grid_sample(const std::shared_ptr<Tensor<T>> &input, const std::s
         }
     }
 }
+#endif
 
-class GridSampleTest: public TestCase {
+template <typename T>
+class GridSampleTest: public TestCase<T> {
 public:
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> grid;
-    std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> grid;
+    std::shared_ptr<Tensor<T>> output;
 
     GridSampleTest(std::vector<int> input_shape, std::vector<int> output_shape): 
-        TestCase("GridSample"), input_shape_(std::move(input_shape)), output_shape_(std::move(output_shape)) {
+        TestCase<T>("GridSample"), input_shape_(std::move(input_shape)), output_shape_(std::move(output_shape)) {
         initTestdata();
     }
 private:
@@ -110,36 +107,19 @@ private:
         int in_width = input_shape_[3];
         int out_height = output_shape_[2];
         int out_width = output_shape_[3];
-        input = std::make_shared<Tensor<float>>(batch, depth, in_height, in_width);
-        grid = std::make_shared<Tensor<float>>(batch, out_height, out_width, 2);
-        output = std::make_shared<Tensor<float>>(batch, depth, out_height, out_width);
-        input->reserveOnCPU();
-        grid->reserveOnCPU();
-        output->reserveOnCPU();
-
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{0.0F, 1.0F};
-        std::normal_distribution<> grid_dist{0.0F, 3.0F / out_width};
-        for (int i = 0; i < input->num_elements(); i++) {
-            (*input)[i] = input_dist(gen);
-        }
-        for (int b = 0; b < batch; b++) {
-            for (int h = 0; h < out_height; h++) {
-                for (int w = 0; w < out_width; w++) {
-                    float offset_h = grid_dist(gen);
-                    float offset_w = grid_dist(gen);
-                    (*grid)[(b * out_height * out_width * 2) + (h * out_width * 2) + (w * 2) + 0] = (2.0F * w / (out_width - 1) - 1.0F + offset_w);
-                    (*grid)[(b * out_height * out_width * 2) + (h * out_width * 2) + (w * 2) + 1] = (2.0F * h / (out_height - 1) - 1.0F + offset_h);
-                }
-            }
-        }
-        std::chrono::high_resolution_clock::time_point start = std::chrono::high_resolution_clock::now();
-        reference_grid_sample<float>(input, grid, output, batch, in_height, in_width, out_height, out_width, depth, false);
-        std::chrono::high_resolution_clock::time_point end = std::chrono::high_resolution_clock::now();
-        std::chrono::duration<double> duration = std::chrono::duration_cast<std::chrono::duration<double>>(end - start);
-        LOG_INFO("reference grid sample time: %f s", duration.count());
+        input = std::make_shared<Tensor<T>>(batch, depth, in_height, in_width);
+        grid = std::make_shared<Tensor<T>>(batch, out_height, out_width, 2);
+        output = std::make_shared<Tensor<T>>(batch, depth, out_height, out_width);
+        torch::manual_seed(42);
+        auto torch_input = torch::randn({batch, depth, in_height, in_width}, this->getTorchConf());
+        auto torch_grid = torch::randn({batch, out_height, out_width, 2}, this->getTorchConf());
+        auto torch_output = torch::grid_sampler_2d(torch_input, torch_grid, 0, 0, false);
+        this->fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(grid, torch_grid);
+        this->fillTensorFromTorch(output, torch_output);
+#if 0
+        reference_grid_sample<T>(input, grid, output, batch, in_height, in_width, out_height, out_width, depth, false);
+#endif
     }
 };
 
@@ -153,7 +133,13 @@ TEST(GridSampleTest, GridSampleComprehensiveTest) {
     };
     for (const auto& t : test_cases) { 
         auto [input_shape, output_shape] = t;
-        GridSampleTest gst(input_shape, output_shape);
-        EXPECT_TRUE(gst.run_test<float>({gst.input, gst.grid}, {gst.output}));
+
+        LOG_INFO("Testing gridsample fp32");
+        GridSampleTest<float> gst(input_shape, output_shape);
+        EXPECT_TRUE(gst.run_test({gst.input, gst.grid}, {gst.output}));
+
+        LOG_INFO("Testing gridsample fp16");
+        GridSampleTest<uint16_t> gst1(input_shape, output_shape);
+        EXPECT_TRUE(gst1.run_test({gst1.input, gst1.grid}, {gst1.output}));
     }
 }

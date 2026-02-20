@@ -1,5 +1,4 @@
 #include <vector>
-#include <random>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -11,7 +10,7 @@ using vkop::tests::TestCase;
 using vkop::ops::Slice;
 
 namespace {
-#if 1
+#if 0
 std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
     const std::vector<int64_t>& starts, const std::vector<int64_t>& ends,
     const std::vector<int64_t>& steps, const std::vector<int64_t>& axes) {
@@ -102,31 +101,29 @@ std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
 }
 #endif
 
-class SliceTest : public TestCase {
+template<typename T>
+class SliceTest : public TestCase<T> {
 public:
-    std::vector<int> input_shape_ = {
-        6, 4, 4
-    };
-    const std::vector<int64_t> starts = {0, 2};
-    const std::vector<int64_t> ends = {2, 3};
-    const std::vector<int64_t> steps = {1, 2};
-    const std::vector<int64_t> axes = {0, 2};
+    std::vector<int> input_shape_;
+    std::vector<int64_t> starts;
+    std::vector<int64_t> ends;
+    std::vector<int64_t> steps;
+    std::vector<int64_t> axes;
 
-    std::shared_ptr<Tensor<float>> input;
+    std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<int64_t>> starts_;
     std::shared_ptr<Tensor<int64_t>> ends_;
     std::shared_ptr<Tensor<int64_t>> axes_;
     std::shared_ptr<Tensor<int64_t>> steps_;
-    std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<T>> output;
 
-    SliceTest():TestCase("Slice") {
+    SliceTest(std::vector<int> &shape, std::vector<int64_t> &starts, std::vector<int64_t>& ends, std::vector<int64_t>& steps, std::vector<int64_t>& axes):TestCase<T>("Slice"), input_shape_(shape), starts(starts), ends(ends), steps(steps), axes(axes) {
         initTestdata();
     }
 private:
     void initTestdata()
     {
-        input = std::make_shared<Tensor<float>>(input_shape_);
-        input->reserveOnCPU();
+        input = std::make_shared<Tensor<T>>(input_shape_);
         starts_ = std::make_shared<Tensor<int64_t>>(starts.size());
         starts_->fillToCPU(starts);
         ends_ = std::make_shared<Tensor<int64_t>>(ends.size());
@@ -136,33 +133,71 @@ private:
         steps_ = std::make_shared<Tensor<int64_t>>(steps.size());
         steps_->fillToCPU(steps);
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{-1.0F, 1.0F};
-        for (int i = 0; i < input->num_elements(); i++) {
-            auto a = input_dist(gen);
-            (*input)[i] = a;
-        }
-        std::vector<std::vector<int>> output_shape = Slice::CalculateOutputShape<int64_t>(
-                input_shape_, starts, ends, axes, steps
-            );
-        std::vector<int> oshape = output_shape[0];
-        output = std::make_shared<Tensor<float>>(oshape);
+        std::vector<int64_t> inshape(input_shape_.begin(), input_shape_.end());
+        auto torch_input = torch::randn(inshape, this->getTorchConf());
+        
+        std::cout << "torch_input: " << torch_input << std::endl;
+        std::vector<std::vector<int>> ret = Slice::CalculateOutputShape<int64_t>(
+            input_shape_, starts, ends, axes, steps
+        );
+        auto oshape = ret[0];
+        auto ostart = ret[1];
+        auto oend = ret[2];
+        auto ostep = ret[3];
+
+        output = std::make_shared<Tensor<T>>(oshape);
+#if 0
         auto result = slice_cpu(input, starts, ends, steps, axes);
-        output->fillToCPU(result);
+#endif
+        int64_t ndim = input->num_dims();
+        std::vector<torch::indexing::TensorIndex> indices;
+        indices.reserve(ndim);
+        for (int64_t i = 0; i < ndim; ++i) {
+            indices.emplace_back(torch::indexing::Slice(
+                ostart[i],
+                oend[i],
+                ostep[i]
+            ));
+        }
+        auto torch_output = torch_input.index(indices);
+        std::cout << "torch_output: " << torch_output << std::endl;
+        this->fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(output, torch_output);
+        // output->print_tensor();
     }
 };
 }
 
 TEST(SliceTest, SliceComprehensiveTest) {
-    SliceTest slice_test;
-    const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
-        slice_test.input,
-        slice_test.starts_,
-        slice_test.ends_,
-        slice_test.axes_,
-        slice_test.steps_,
+    std::vector<std::tuple<std::vector<int>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>, std::vector<int64_t>>> test_cases = {
+        {{6, 4, 4}, {0, 2}, {2, 3}, {1, 2}, {0, 2}},
     };
-    EXPECT_TRUE(slice_test.run_test<float>(inputs, {slice_test.output}));
+    for (const auto& test_case : test_cases) {
+        auto [input_shape, starts, ends, steps, axes] = test_case;
+        for (size_t i = 0; i < starts.size(); ++i) {
+            LOG_INFO("range %d - %d, step %d, axes %d", starts[i], ends[i], steps[i], axes[i]);
+        }
+        LOG_INFO("Testing Slice fp32");
+        SliceTest<float> slice_test(input_shape, starts, ends, steps, axes);
+        const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
+            slice_test.input,
+            slice_test.starts_,
+            slice_test.ends_,
+            slice_test.axes_,
+            slice_test.steps_,
+        };
+        EXPECT_TRUE(slice_test.run_test(inputs, {slice_test.output}));
+
+
+        LOG_INFO("Testing Slice fp16");
+        SliceTest<uint16_t> slice_test1(input_shape, starts, ends, steps, axes);
+        const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs1 = {
+            slice_test1.input,
+            slice_test1.starts_,
+            slice_test1.ends_,
+            slice_test1.axes_,
+            slice_test1.steps_,
+        };
+        EXPECT_TRUE(slice_test1.run_test(inputs1, {slice_test1.output}));
+    }
 }

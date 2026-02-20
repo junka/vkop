@@ -31,7 +31,7 @@ set(TEST_SOURCES
     SubTest.cpp
     MulTest.cpp
     DivTest.cpp
-    PowTest.cpp
+    PowTest.Mcpp
     ErfTest.cpp
     ReluTest.cpp
     BatchNormTest.cpp

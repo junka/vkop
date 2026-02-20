@@ -204,7 +204,7 @@ int main(int argc, char *argv[]) {
     }
     rt->ReadResult();
     auto out = vkop::core::as_tensor<float>(rt->GetOutput());
-    out->print_tensor();
+    // out->print_tensor();
     postProcess(out);
 
     return EXIT_SUCCESS;

@@ -30,8 +30,6 @@ class Reshape : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(reshape::GpuReshapeParam)) {}
-
-  private:
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("allowzero") != attributes.end()) {
@@ -39,6 +37,7 @@ class Reshape : public Operator {
         }
     }
 
+  private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -50,6 +49,7 @@ class Reshape : public Operator {
         std::vector<int> dim(n);
         for (int i = 0; i < n; i++) {
             dim[i] = static_cast<int>((*shape)[i]);
+            printf("%d\n", dim[i]);
         }
         auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
                                      std::multiplies<>());

@@ -39,7 +39,7 @@ std::vector<std::vector<std::pair<int, float>>> get_top_k_predictions(const std:
 #endif
 
 template<typename T>
-class TopkTest : public TestCase {
+class TopkTest : public TestCase<T> {
 public:
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<int>> indexs;
@@ -49,7 +49,7 @@ public:
     int axis = -1;
     std::unordered_map<std::string, std::string> attrs;
 
-    TopkTest(const std::vector<int> &shape, const int k, const int axis):TestCase("TopK"),t (shape), k(k), axis(axis) {
+    TopkTest(const std::vector<int> &shape, const int k, const int axis):TestCase<T>("TopK"),t (shape), k(k), axis(axis) {
         attrs = {
             {"k", std::to_string(k)},
             {"axis", std::to_string(axis)},
@@ -68,14 +68,8 @@ private:
         indexs = std::make_shared<Tensor<int>>(out_shape);
         output = std::make_shared<Tensor<T>>(out_shape);
 
-        torch::TensorOptions conf;
-        if constexpr (std::is_same_v<T, float>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat32);
-        } else if constexpr (std::is_same_v<T, uint16_t>) {
-            conf = torch::TensorOptions().dtype(torch::kFloat16);
-        }
         torch::manual_seed(56);
-        auto torch_input = torch::randn({t[0], t[1]}, conf);
+        auto torch_input = torch::randn({t[0], t[1]}, this->getTorchConf());
         auto torch_topk = torch::topk(torch_input, k, axis, true, true);
         auto [value, indices64] = torch_topk;
         auto indices32 = indices64.to(torch::kInt);
@@ -87,9 +81,9 @@ private:
         printf("\n===topk index =======\n");
         std::cout << indices32 << std::endl;
 
-        fillTensorFromTorch(input, torch_input);
-        fillTensorFromTorch(output, value);
-        fillTensorFromTorch(indexs, indices32);
+        this->fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(output, value);
+        this->fillTensorFromTorch(indexs, indices32);
     }
 };
 }
@@ -111,7 +105,7 @@ TEST(TopkTest, TopkComprehensiveTest) {
                  t[0], t[1], k, axis);
         LOG_INFO("Testing fp32");
         TopkTest<float> toptest(t, k, axis);
-        EXPECT_TRUE (toptest.run_test<float>({toptest.input}, {toptest.output, toptest.indexs},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
+        EXPECT_TRUE (toptest.run_test({toptest.input}, {toptest.output, toptest.indexs},[&toptest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *topk_op = dynamic_cast<Topk *>(op.get());
             if (!topk_op) {
                 LOG_ERROR("Failed to cast operator to Topk");
@@ -122,7 +116,7 @@ TEST(TopkTest, TopkComprehensiveTest) {
 
         LOG_INFO("Testing fp16");
         TopkTest<uint16_t> toptest1(t, k, axis);
-        EXPECT_TRUE(toptest1.run_test<uint16_t>({toptest1.input}, {toptest1.output, toptest1.indexs},[&toptest1](std::unique_ptr<vkop::ops::Operator> &op) {
+        EXPECT_TRUE(toptest1.run_test({toptest1.input}, {toptest1.output, toptest1.indexs},[&toptest1](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *topk_op = dynamic_cast<Topk *>(op.get());
             if (!topk_op) {
                 LOG_ERROR("Failed to cast operator to Topk");

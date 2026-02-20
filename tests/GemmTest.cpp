@@ -1,9 +1,4 @@
-#include <cstdint>
-#include <gtest/gtest.h>
-#include <string>
 #include <vector>
-#include <random>
-#include <cmath>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -13,9 +8,9 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Gemm;
-using vkop::core::ITensor;
 
 namespace {
+#ifdef USE_CPP_REF
 template <typename T>
 void reference_gemm(const std::shared_ptr<Tensor<T>> &inputa, const std::shared_ptr<Tensor<T>> &inputb,
         const std::shared_ptr<Tensor<T>> &inputc, std::shared_ptr<Tensor<T>> &output,
@@ -78,9 +73,10 @@ void reference_gemm(const std::shared_ptr<Tensor<T>> &inputa, const std::shared_
         }
     }
 }
+#endif
 
 template <typename T>
-class GemmTest : public TestCase {
+class GemmTest : public TestCase<T> {
 public:
     std::shared_ptr<Tensor<T>> inputa;
     std::shared_ptr<Tensor<T>> inputb;
@@ -96,7 +92,7 @@ public:
 
     std::unordered_map<std::string, std::string> attr;
 
-    GemmTest(const std::vector<int> &inshapeA, const std::vector<int> &inshapeB, float alpha, float beta, bool transA, bool transB) : TestCase("Gemm"),
+    GemmTest(const std::vector<int> &inshapeA, const std::vector<int> &inshapeB, float alpha, float beta, bool transA, bool transB) : TestCase<T>("Gemm"),
      t1(inshapeA), t2(inshapeB), alpha(alpha), beta(beta), transA(transA), transB(transB) {
         attr = {
             {"alpha", "1"},
@@ -118,88 +114,36 @@ private:
         int k = ka;
         inputc = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
         output = std::make_shared<Tensor<T>>(std::vector<int>{t1[0], t2[1]});
-        inputa->reserveOnCPU();
-        inputb->reserveOnCPU();
-        inputc->reserveOnCPU();
-        output->reserveOnCPU();
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{-1.0F, 1.0F};
-        for (int i = 0; i < inputa->num_elements(); i++) {
-            if (typeid(T) == typeid(uint16_t)) {
-                (*inputa)[i] = ITensor::fp32_to_fp16(input_dist(gen));
-            } else {
-                (*inputa)[i] = input_dist(gen);
-            }
-        }
-        for (int i = 0; i < inputb->num_elements(); i++) {
-            if (typeid(T) == typeid(uint16_t)) {
-                (*inputb)[i] = ITensor::fp32_to_fp16(input_dist(gen));
-            } else {
-                (*inputb)[i] = input_dist(gen);
-            }
-        }
-        for (int i = 0; i < inputc->num_elements(); ++i) {
-            if (typeid(T) == typeid(uint16_t)) {
-                (*inputc)[i] = ITensor::fp32_to_fp16(input_dist(gen));
-            } else {
-                (*inputc)[i] = input_dist(gen);
-            }
-        }
+        torch::manual_seed(42);
+        std::vector<int64_t> t1shape(t1.begin(), t1.end());
+        std::vector<int64_t> t2shape(t2.begin(), t2.end());
+        auto torch_inputa = torch::randn(t1shape, this->getTorchConf());
+        auto torch_inputb = torch::randn(t2shape, this->getTorchConf());
+        auto torch_inputc = torch::randn({m, n}, this->getTorchConf());
+
+        this->fillTensorFromTorch(inputa, torch_inputa);
+        this->fillTensorFromTorch(inputb, torch_inputb);
+        this->fillTensorFromTorch(inputc, torch_inputc);
         printf("M %d, N %d, K %d\n", m, n, k);
         printf("==============================================================\n");
         printf("Input A:\n");
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < k; j++) {
-                if (typeid(T) == typeid(uint16_t)) {
-                    std::cout << ITensor::fp16_to_fp32((*inputa)[(i * k) + j]) << " ";
-                } else {
-                    std::cout << (*inputa)[(i * k) + j] << " ";
-                }
-            }
-            printf("\n");
-        }
-        printf("\n");
+        inputa->print_tensor();
         printf("Input B:\n");
-        for (int i = 0; i < k; i++) {
-            for (int j = 0; j < n; j++) {
-                if (typeid(T) == typeid(uint16_t)) {
-                    std::cout << ITensor::fp16_to_fp32((*inputb)[(i * n) + j]) << " ";
-                } else {
-                    std::cout << (*inputb)[(i * n) + j] << " ";
-                }
-            }
-            printf("\n");
-        }
-        printf("\n");
-        printf("Input C:\n");
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                if (typeid(T) == typeid(uint16_t)) {
-                    std::cout << ITensor::fp16_to_fp32((*inputc)[(i * n) + j]) << " ";
-                } else {
-                    std::cout << (*inputc)[(i * n) + j] << " ";
-                }
-            }
-            printf("\n");
-        }
+        inputb->print_tensor();
 
-        reference_gemm(inputa, inputb, inputc, output, m, n, k, alpha, beta, transA, transB, true);
-        printf("\n");
-        printf("Output:\n");
-        for (int i = 0; i < m; i++) {
-            for (int j = 0; j < n; j++) {
-                if (typeid(T) == typeid(uint16_t)) {
-                    std::cout << ITensor::fp16_to_fp32((*output)[(i * n) + j]) << " ";
-                } else {
-                    std::cout << (*output)[(i * n) + j] << " ";
-                }
-            }
-            printf("\n");
+        if (transA) torch_inputa = torch_inputa.t();
+        if (transB) torch_inputb = torch_inputb.t();
+
+        auto torch_ouptput = alpha * torch::matmul(torch_inputa, torch_inputb);
+
+        if (beta != 0.0F && torch_inputc.numel() > 0) {
+            torch_ouptput = torch_ouptput + beta * torch_inputc;
         }
-        printf("\n");
+        this->fillTensorFromTorch(output, torch_ouptput);
+        printf("output:\n");
+        output->print_tensor();
+
     }
 };
 }
@@ -217,7 +161,7 @@ TEST(GemmTest, GemmComprehensiveTest) {
         LOG_INFO("Testing [%d, %d], [%d, %d], %f, %f, %d, %d", inshapeA[0], inshapeA[1], inshapeB[0], inshapeB[1], alpha, beta, transA, transB);
         LOG_INFO("Testing FP32");
         GemmTest<float> gmtest1(inshapeA, inshapeB, alpha, beta, transA, transB);
-        EXPECT_TRUE(gmtest1.run_test<float>({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
+        EXPECT_TRUE(gmtest1.run_test({gmtest1.inputa, gmtest1.inputb, gmtest1.inputc}, {gmtest1.output},
             [&gmtest1](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *gemm_op = dynamic_cast<Gemm *>(op.get());
                 if (!gemm_op) {
@@ -228,7 +172,7 @@ TEST(GemmTest, GemmComprehensiveTest) {
             }));
         LOG_INFO("Testing FP16");
         GemmTest<uint16_t> gmtest(inshapeA, inshapeB, alpha, beta, transA, transB);
-        EXPECT_TRUE(gmtest.run_test<uint16_t>({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
+        EXPECT_TRUE(gmtest.run_test({gmtest.inputa, gmtest.inputb, gmtest.inputc}, {gmtest.output},
             [&gmtest](std::unique_ptr<vkop::ops::Operator> &op) {
                 auto *gemm_op = dynamic_cast<Gemm *>(op.get());
                 if (!gemm_op) {

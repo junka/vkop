@@ -36,7 +36,8 @@ std::vector<float> batch_norm_2d(std::shared_ptr<Tensor<float>> &input, int batc
 }
 #endif
 
-class BatchNormTest : public TestCase {
+template <typename T>
+class BatchNormTest : public TestCase<T> {
 public:
     std::vector<int> input_shape_;
     const std::unordered_map<std::string, std::string> param = {
@@ -46,7 +47,7 @@ public:
     std::shared_ptr<Tensor<float>> output;
     std::shared_ptr<Tensor<float>> para;
 
-    explicit BatchNormTest(std::vector<int> input_shape):TestCase("BatchNorm"), input_shape_(std::move(input_shape)) {
+    explicit BatchNormTest(std::vector<int> input_shape):TestCase<T>("BatchNorm"), input_shape_(std::move(input_shape)) {
         initTestdata();
     }
 private:
@@ -106,10 +107,10 @@ private:
         std::cout << torch_output << std::endl;
 
         input = std::make_shared<Tensor<float>>(input_shape_);
-        fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(input, torch_input);
 
         output = std::make_shared<Tensor<float>>(output_shape);
-        fillTensorFromTorch(output, torch_output);
+        this->fillTensorFromTorch(output, torch_output);
 
         para = std::make_shared<Tensor<float>>(std::vector<int>{UP_DIV(input_shape_[1], 4) * 16});
         para->reserveOnCPU();
@@ -140,7 +141,7 @@ TEST(BatchNormTest, BatchNormComprehensiveTest) {
     };
     for (auto config : test_configs) {
         LOG_INFO("======test config: [%d, %d, %d, %d]\n", config[0], config[1], config[2], config[3]);
-        BatchNormTest bntest(config);
+        BatchNormTest<float> bntest(config);
 
 #if USE_CPP_REFER
         printf("\n===verify C++ refer ==========\n");
@@ -173,7 +174,7 @@ TEST(BatchNormTest, BatchNormComprehensiveTest) {
         }
 #endif
 
-    EXPECT_TRUE (bntest.run_test<float>({bntest.input, bntest.para}, {bntest.output},
+    EXPECT_TRUE (bntest.run_test({bntest.input, bntest.para}, {bntest.output},
         [&bntest](std::unique_ptr<vkop::ops::Operator> &op) {
             auto *batchnorm_op = dynamic_cast<BatchNorm *>(op.get());
             if (!batchnorm_op) {

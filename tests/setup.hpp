@@ -72,19 +72,27 @@ public:
     }
 };
 
+
+template<typename T>
 class TestCase {
 private:
     std::string name_;
     std::shared_ptr<VulkanDevice> dev_;
     std::shared_ptr<VulkanCommandPool> cmdpool_;
+    torch::TensorOptions conf_;
 public:
     TestCase() = delete;
-    explicit TestCase(std::string name): name_(std::move(name)) {
+    explicit TestCase(const std::string& name): name_(std::move(name)) {
         if (!TestEnv::is_initialized()) {
             TestEnv::initialize();
         }
         dev_ = TestEnv::get_device();
         cmdpool_ = TestEnv::get_command_pool();
+        if constexpr (std::is_same_v<T, float>) {
+            conf_ = torch::TensorOptions().dtype(torch::kFloat32);
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
+            conf_ = torch::TensorOptions().dtype(torch::kFloat16);
+        }
     }
     ~TestCase() = default;
     TestCase(const TestCase &test) = delete;
@@ -92,19 +100,22 @@ public:
     TestCase &operator=(const TestCase &) = delete;
     TestCase &operator=(const TestCase &&) = delete;
 
+    virtual torch::TensorOptions getTorchConf() const {
+        return conf_;
+    }
 
-    template<typename T>
-    void fillTensorFromTorch(std::shared_ptr<Tensor<T>>& tensor, 
+    template<typename TT>
+    void fillTensorFromTorch(std::shared_ptr<Tensor<TT>>& tensor, 
                              const torch::Tensor& torch_tensor) {
         auto cpu_tensor = torch_tensor.cpu().contiguous().flatten();
-        std::vector<T> data_vector;
+        std::vector<TT> data_vector;
         data_vector.reserve(cpu_tensor.numel());
-        if constexpr (std::is_same_v<float, T> || std::is_same_v<int, T> ) {
-            auto accessor = cpu_tensor.accessor<T, 1>();
+        if constexpr (std::is_same_v<float, TT> || std::is_same_v<int, TT> ) {
+            auto accessor = cpu_tensor.accessor<TT, 1>();
             for (int64_t i = 0; i < cpu_tensor.numel(); i++) {
                 data_vector.push_back(accessor[i]);
             }
-        } else if constexpr (std::is_same_v<uint16_t, T>) {
+        } else if constexpr (std::is_same_v<uint16_t, TT>) {
             auto *data_ptr = cpu_tensor.data_ptr<at::Half>();
             const auto *uint16_ptr = reinterpret_cast<const uint16_t*>(data_ptr);
             
@@ -115,7 +126,6 @@ public:
         tensor->fillToCPU(data_vector);
     }
 
-    template <typename T>
     bool run_test(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &expect_outputs,
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)

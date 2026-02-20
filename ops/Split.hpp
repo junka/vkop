@@ -29,12 +29,13 @@ class Split : public Operator {
                    },
                    sizeof(split::GpuSplitParam)) {
         update_after_bind_ = true;
+        para_.split = 0;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
-            axis_ = std::stoi(attributes.at("axis"));
+            para_.axis = std::stoi(attributes.at("axis"));
         }
         if (attributes.find("num_outputs") != attributes.end()) {
             num_outputs_ = std::stoi(attributes.at("num_outputs"));
@@ -46,13 +47,13 @@ class Split : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         int rank = inputs[0]->num_dims();
-        if (axis_ < 0) {
-            axis_ += rank;
+        if (para_.axis < 0) {
+            para_.axis += rank;
         }
         if (num_outputs_ == 0) {
             num_outputs_ = static_cast<int>(outputs.size());
         }
-        int tosplit = inputs[0]->getShape()[axis_];
+        int tosplit = inputs[0]->getShape()[para_.axis];
         std::vector<std::shared_ptr<VulkanResource>> output_images;
         std::vector<int64_t> split_vec;
         if (inputs.size() > 1) {
@@ -72,7 +73,7 @@ class Split : public Operator {
                 using T = decltype(dummy);
                 auto output = core::as_tensor<T>(outputs[i]);
                 auto shape = inputs[0]->getShape();
-                shape[axis_] = static_cast<int>(split_vec[i]);
+                shape[para_.axis] = static_cast<int>(split_vec[i]);
                 if (output->size() == 0) {
                     output->resize(shape);
                 }
@@ -90,37 +91,26 @@ class Split : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        split::GpuSplitParam param;
-        param.axis = axis_ + 4 - rank;
-        if (rank == 4) {
-            for (int i = 0; i < 4; i++) {
-                param.inShape[i] = inputs[0]->getShape()[i];
-                param.outShape[i] = outputs[0]->getShape()[i];
-            }
-        } else if (rank == 3) {
-            param.inShape[0] = 1;
-            param.inShape[1] = inputs[0]->getShape()[0];
-            param.inShape[2] = inputs[0]->getShape()[1];
-            param.inShape[3] = inputs[0]->getShape()[2];
-            param.outShape[0] = 1;
-            param.outShape[1] = outputs[0]->getShape()[0];
-            param.outShape[2] = outputs[0]->getShape()[1];
-            param.outShape[3] = outputs[0]->getShape()[2];
+        para_.axis = para_.axis + 4 - rank;
+        if (rank == 4 || rank == 3) {
+            inputs[0]->get_shape(para_.inShape);
+            outputs[0]->get_shape(para_.outShape);
         }
-        param.split = 0;
+        para_.split = 0;
         for (int i = 0; i < num_outputs_; i++) {
-            param.outShape[param.axis] = outputs[i]->getShape()[axis_];
+            para_.outShape[para_.axis] =
+                outputs[i]->getShape()[para_.axis - 4 + rank];
 
             auto gpushape = outputs[i]->getGPUShape();
             objs_[0] = output_images[i];
-            submit(&param, UP_DIV(gpushape[0], 16), UP_DIV(gpushape[1], 16),
+            submit(&para_, UP_DIV(gpushape[0], 16), UP_DIV(gpushape[1], 16),
                    gpushape[2]);
-            param.split += outputs[i]->getShape()[axis_];
+            para_.split += outputs[i]->getShape()[para_.axis - 4 + rank];
         }
     }
 
-    int axis_ = 1;
     int num_outputs_ = 0;
+    split::GpuSplitParam para_;
 };
 
 } // namespace ops

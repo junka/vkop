@@ -14,8 +14,8 @@ namespace ops {
 
 namespace slice {
 struct GpuSliceParam {
-    ivec4 inImgSize;
-    ivec4 outImgSize;
+    // ivec4 inImgSize;
+    // ivec4 outImgSize;
     ivec4 inShape;
     ivec4 outShape;
     ivec4 start; // Start indices for slicing
@@ -189,14 +189,6 @@ class Slice : public Operator {
         auto out_gpu_shape = outputs[0]->getGPUShape();
         auto in_gpu_shape = inputs[0]->getGPUShape();
         slice::GpuSliceParam param;
-        param.inImgSize[0] = in_gpu_shape[0];
-        param.inImgSize[1] = in_gpu_shape[1];
-        param.inImgSize[2] = in_gpu_shape[2];
-        param.inImgSize[3] = 1;
-        param.outImgSize[0] = out_gpu_shape[0];
-        param.outImgSize[1] = out_gpu_shape[1];
-        param.outImgSize[2] = out_gpu_shape[2];
-        param.outImgSize[3] = 1;
         if (rank == 4) {
             for (int i = 0; i < 4; i++) {
                 param.inShape[i] = inshape[i];

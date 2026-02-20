@@ -39,13 +39,13 @@ void global_average_pool(const std::shared_ptr<Tensor<T>>& input,
 #endif
 
 template<typename T>
-class GlobalAveragePoolTest : public TestCase {
+class GlobalAveragePoolTest : public TestCase<T> {
 public:
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<T>> output;
     std::vector<int> shape_;
 
-    explicit GlobalAveragePoolTest(const std::vector<int> &t):TestCase("GlobalAveragePool"), shape_(t) {
+    explicit GlobalAveragePoolTest(const std::vector<int> &t):TestCase<T>("GlobalAveragePool"), shape_(t) {
         initTestdata();
     }
 private:
@@ -85,11 +85,11 @@ TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
         LOG_INFO("Testing fp32");
 
         GlobalAveragePoolTest<float> gaptest(shape);
-        EXPECT_TRUE(gaptest.run_test<float>({gaptest.input}, {gaptest.output}));
+        EXPECT_TRUE(gaptest.run_test({gaptest.input}, {gaptest.output}));
 
         LOG_INFO("Testing fp16");
 
         GlobalAveragePoolTest<uint16_t> gaptest2(shape);
-        EXPECT_TRUE(gaptest2.run_test<uint16_t>({gaptest2.input}, {gaptest2.output}));
+        EXPECT_TRUE(gaptest2.run_test({gaptest2.input}, {gaptest2.output}));
     }
 }

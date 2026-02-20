@@ -1,53 +1,32 @@
 #include <vector>
-#include <random>
 
-#include "setup.hpp"
-#include "core/Tensor.hpp"
+#include "BinaryTest.hpp"
 #include "include/logger.hpp"
 
-using vkop::core::Tensor;
-using vkop::tests::TestCase;
+using vkop::tests::BinaryTest;
 
 namespace {
+    
 
-class MulTest : public TestCase {
+template<typename T>
+class MulTest : public BinaryTest<T> {
 public:
-    std::shared_ptr<Tensor<float>> inputa;
-    std::shared_ptr<Tensor<float>> inputb;
-    std::shared_ptr<Tensor<float>> output;
-
-    MulTest():TestCase("Mul") {
-        initTestdata();
-    }
-private:
-    void initTestdata()
-    {
-        std::vector<int> t = {
-            1, 7, 64, 64
-        };
-        inputa = std::make_shared<Tensor<float>>(t);
-        inputb = std::make_shared<Tensor<float>>(t);
-        output = std::make_shared<Tensor<float>>(t);
-        inputa->reserveOnCPU();
-        inputb->reserveOnCPU();
-        output->reserveOnCPU();
-        
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> inputa_dist{0.0F, 1.0F};
-        std::normal_distribution<> inputb_dist{1.0F, 2.0F};
-        for (int i = 0; i < inputa->num_elements(); i++) {
-            (*inputa)[i] = inputa_dist(gen);
-            (*inputb)[i] = inputa_dist(gen);
-            (*output)[i] = (*inputa)[i] * (*inputb)[i];
-        }
+    explicit MulTest(std::vector<int> input_shape): BinaryTest<T>("Mul", std::move(input_shape)) {
+        auto torch_output = this->torch_inputa * this->torch_inputb;
+        this->fillTensorFromTorch(this->output, torch_output);
     }
 };
 }
 
 TEST(MulTest, MulComprehensiveTest) {
 
-    MulTest multest;
-    EXPECT_TRUE(multest.run_test<float>({multest.inputa, multest.inputb}, {multest.output}));
+    const std::vector<std::vector<int>> test_cases = {
+        {10, 5, 64, 64},
+        {1, 3, 128, 128},
+        {2, 4, 32, 32}
+    };
+    for (const auto& t : test_cases) {
+        MulTest<float> multest(t);
+        EXPECT_TRUE(multest.run_test());
+    }
 }

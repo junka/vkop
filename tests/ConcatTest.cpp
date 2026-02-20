@@ -1,7 +1,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <vector>
-#include <random>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -13,6 +12,7 @@ using vkop::tests::TestCase;
 using vkop::ops::Concat;
 
 namespace {
+#ifdef USE_CPP_REF
 void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
             std::shared_ptr<Tensor<float>> &output, int axis) {
     size_t num_inputs = inputs.size();
@@ -65,62 +65,54 @@ void concat(const std::vector<std::shared_ptr<Tensor<float>>> &inputs,
         current_offset += in_shape[axis];
     }
 }
-
-class ConcatTest : public TestCase {
+#endif
+template<typename T>
+class ConcatTest : public TestCase<T> {
 public:
     std::shared_ptr<Tensor<float>> input1;
     std::shared_ptr<Tensor<float>> input2;
     std::shared_ptr<Tensor<float>> input3;
     std::shared_ptr<Tensor<float>> output;
+    std::vector<int> t1;
+    std::vector<int> t2;
+    std::vector<int> t3;
     int axis_ = 0;
 
-    std::unordered_map<std::string, std::string> attributes = {
-        {"axis", std::to_string(axis_)}
-    };
-    ConcatTest():TestCase("Concat") {
+    std::unordered_map<std::string, std::string> attributes;
+    ConcatTest(const std::vector<int> &t1, const std::vector<int> &t2, const std::vector<int> &t3, int axis):TestCase<T>("Concat"), t1(t1), t2(t2), t3(t3), axis_(axis) {
+        attributes = {
+            {"axis", std::to_string(axis_)}
+        };
         initTestdata();
     }
 private:
     void initTestdata()
     {
-        std::vector<int> t1 = {
-            3, 2, 4
-        };
-        std::vector<int> t2 = {
-            1, 2, 4
-        };
-        std::vector<int> t3 = {
-            4, 2, 4
-        };
-
-
         input1 = std::make_shared<Tensor<float>>(t1);
-        input1->reserveOnCPU();
         input2 = std::make_shared<Tensor<float>>(t2);
-        input2->reserveOnCPU();
         input3 = std::make_shared<Tensor<float>>(t3);
-        input3->reserveOnCPU();
 
-        std::vector<int> to = {
-            8, 2, 4
-        };
+        std::vector<int64_t> t1shape(t1.begin(), t1.end());
+        std::vector<int64_t> t2shape(t2.begin(), t2.end());
+        std::vector<int64_t> t3shape(t3.begin(), t3.end());
+
+        std::vector<int> to = t1;  // Start with first input shape
+        to[axis_] = t1[axis_] + t2[axis_] + t3[axis_];
+
+        auto torch_input1 = torch::randn(t1shape, this->getTorchConf());
+        auto torch_input2 = torch::randn(t2shape, this->getTorchConf());
+        auto torch_input3 = torch::randn(t3shape, this->getTorchConf());
         output = std::make_shared<Tensor<float>>(to);
-        output->reserveOnCPU();
+        this->fillTensorFromTorch(input1, torch_input1);
+        this->fillTensorFromTorch(input2, torch_input2);
+        this->fillTensorFromTorch(input3, torch_input3);
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{0.0F, 1.0F};
-        for (int i = 0; i < input1->num_elements(); i++) {
-            (*input1)[i] = input_dist(gen);
-        }
-        for (int i = 0; i < input2->num_elements(); i++) {
-            (*input2)[i] = input_dist(gen);
-        }
-        for (int i = 0; i < input3->num_elements(); i++) {
-            (*input3)[i] = input_dist(gen);
-        }
+        auto torch_output = torch::cat({torch_input1, torch_input2, torch_input3}, axis_);
+        this->fillTensorFromTorch(output, torch_output);
+
+#if 0
         concat({input1, input2, input3}, {output}, axis_);
+#endif
         input1->print_tensor();
         input2->print_tensor();
         input3->print_tensor();
@@ -131,13 +123,20 @@ private:
 
 TEST(ConcatTest, ConcatComprehensiveTest) {
 
-    ConcatTest cctest;
-    EXPECT_TRUE (cctest.run_test<float>({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *concat_op = dynamic_cast<Concat *>(op.get());
-        if (!concat_op) {
-            LOG_ERROR("Failed to cast operator to Concat");
-            return;
-        }
-        concat_op->setAttribute(cctest.attributes);
-    }));
+    std::vector<std::tuple<std::vector<int>, std::vector<int>, std::vector<int>, int>> test_cases = {
+        {{3, 2, 4}, {1, 2, 4}, {4, 2, 4}, 0},
+    };
+    for (const auto &test_case : test_cases) {
+        auto [t1, t2, t3, axis] = test_case;
+        ConcatTest<float> cctest(t1, t2, t3, axis);
+        EXPECT_TRUE (cctest.run_test({cctest.input1, cctest.input2, cctest.input3}, {cctest.output}, [&cctest] (std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *concat_op = dynamic_cast<Concat *>(op.get());
+            if (!concat_op) {
+                LOG_ERROR("Failed to cast operator to Concat");
+                return;
+            }
+            concat_op->setAttribute(cctest.attributes);
+        }));
+    }
+
 }
