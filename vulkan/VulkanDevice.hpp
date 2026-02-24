@@ -10,7 +10,7 @@
 
 namespace vkop {
 
-constexpr int kInflight = 4;
+constexpr int kInflight = 1;
 class VulkanQueue {
   public:
     VulkanQueue(uint32_t familyIdx, VkQueue queue)

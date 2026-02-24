@@ -34,14 +34,30 @@ void main() {
     int H = uParams.inShape.z;
     int W = uParams.inShape.w;
     if (n >= N || c4 >= (C + 3) /4) return;
-    int numInputs = H * W;
+    int numInputs = 0;
+    numInputs = H;
+    if (W > 0) {
+        numInputs *= W;
+    }
 
     vec4 sum = vec4(0.0);
-    for (int x = 0; x < W; x++) {
+    if (W > 0) {
+        for (int x = 0; x < W; x++) {
+            for (int y = 0; y < H; y++) {
+                uint total_h = n * H + y;
+                vec4 val = (texelFetch(inputImage, ivec3(x, total_h, c4), 0));
+                sum += val;
+            }
+        }
+    } else {
+        // handle 3d input transform
+        // w, h, c4,-> H, C, N4
         for (int y = 0; y < H; y++) {
-            uint total_h = n * H + y;
-            vec4 val = (texelFetch(inputImage, ivec3(x, total_h, c4), 0));
-            sum += val;
+            for (int c = 0; c < 4; c ++) {
+                if (c4 * 4 + c >= C) continue;
+                float val = texelFetch(inputImage, ivec3(y, c4 * 4 + c, n/4), 0)[n%4];
+                sum[c] += val;
+            }
         }
     }
 

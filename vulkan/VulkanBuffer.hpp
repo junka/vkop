@@ -56,15 +56,22 @@ class VulkanBuffer : public VulkanResource {
         return VMA::getMappedMemory(&m_vma_buffer_);
 
 #else
-        void *data = nullptr;
-        vkMapMemory(m_vdev_->getLogicalDevice(), getMemory(), getOffset(),
-                    VK_WHOLE_SIZE, 0, &data);
-        return data;
+        if (data_)
+            return data_;
+        auto ret = vkMapMemory(m_vdev_->getLogicalDevice(), getMemory(),
+                               getOffset(), m_size_, 0, &data_);
+        if (ret != VK_SUCCESS) {
+            return nullptr;
+        }
+        return data_;
 #endif
     };
 
     void unmapMemory() {
-        vkUnmapMemory(m_vdev_->getLogicalDevice(), getMemory());
+        if (data_) {
+            vkUnmapMemory(m_vdev_->getLogicalDevice(), getMemory());
+            data_ = nullptr;
+        }
     }
 
   private:
@@ -75,6 +82,7 @@ class VulkanBuffer : public VulkanResource {
 #endif
     VkDeviceSize m_size_;
     VkAccessFlags m_access_ = 0;
+    void *data_ = nullptr;
 
     VkDescriptorBufferInfo buffer_info_;
 

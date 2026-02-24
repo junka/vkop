@@ -15,6 +15,7 @@ using vkop::core::Tensor;
 using vkop::core::Runtime;
 
 namespace{
+#if 0
 void postProcess(const std::shared_ptr<class vkop::core::Tensor<float> >& out)
 {
     auto shape = out->getShape();
@@ -167,6 +168,7 @@ void postProcess(const std::shared_ptr<class vkop::core::Tensor<float> >& out)
         }
     }
 }
+#endif
 } // namespace
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
@@ -193,19 +195,20 @@ int main(int argc, char *argv[]) {
 
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path);
     rt->LoadModel();
+    rt->TraceNode("/model.12/Concat");
 
     printf("model Loaded done\n");
 
-    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput());
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), true);
 
-    int count = 1;
+    int count = 2;
     for (int i = 0; i < count; i ++) {
         rt->Run();
     }
     rt->ReadResult();
     auto out = vkop::core::as_tensor<float>(rt->GetOutput());
     // out->print_tensor();
-    postProcess(out);
+    // postProcess(out);
 
     return EXIT_SUCCESS;
 }

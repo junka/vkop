@@ -30,6 +30,7 @@ class GlobalAveragePool : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto input_shape = inputs[0]->getShape();
+        assert(input_shape.size() > 2);
 
         int batch = input_shape[0];
         int depth = input_shape[1];
@@ -58,8 +59,10 @@ class GlobalAveragePool : public Operator {
             }
         });
 
-        globalaveragepool::GpuGAPParam para;
-        inputs[0]->get_shape(para.inShape);
+        globalaveragepool::GpuGAPParam para{};
+        for (size_t i = 0; i < input_shape.size(); i++) {
+            para.inShape[i] = input_shape[i];
+        }
         para.accuracy = accuracy;
         submit(&para, UP_DIV(batch, 16), 1, UP_DIV(depth, 4));
     }

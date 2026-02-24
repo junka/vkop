@@ -34,12 +34,15 @@ private:
         shape = std::make_shared<Tensor<int64_t>>(reshape_shape_.size());
         std::vector<int64_t> reshape(reshape_shape_.begin(), reshape_shape_.end());
         shape->fillToCPU(reshape);
-        output = std::make_shared<Tensor<T>>(reshape_shape_);
-
         std::vector<int64_t> inshape(input_shape_.begin(), input_shape_.end());
         auto torch_input = torch::randn(inshape, this->getTorchConf());
         std::cout << torch_input << std::endl;
         auto torch_output = torch::reshape(torch_input, reshape);
+        auto oshape = torch_output.sizes();
+        std::vector<int> out_shape(oshape.begin(), oshape.end());;
+        
+        output = std::make_shared<Tensor<T>>(out_shape);
+
         this->fillTensorFromTorch(input, torch_input);
         this->fillTensorFromTorch(output, torch_output);
         printf("=======input==============\n");
@@ -57,6 +60,7 @@ TEST(ReshapeTest, ReshapeComprehensiveTest) {
         {{1, 8, 4, 4}, {1, 4, 8, 4}, false},
         {{1, 8, 4, 4}, {1, 8, 16}, false},
         {{1, 2, 64, 400}, {1, 128, 20, 20}, false},
+        {{1, 4, 10, 10}, {1, 4, -1}, false},
     };
     for (const auto &test_case : test_cases) {
         auto [input_shape, reshape_shape, allowzero] = test_case;

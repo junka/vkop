@@ -267,6 +267,7 @@ TEST(Conv2dTest, Conv2dComprehensiveTest) {
         {{1, 4, 5, 5}, 3, 2, 1, 4, 1, 8},      // Stride > 1 with groups
         {{1, 8, 8, 8}, 3, 1, 1, 2, 2, 16},     // Dilation > 2 with groups
         {{1, 1, 3, 3}, 3, 1, 1, 1, 1, 1},      // Minimal case
+        {{1, 3, 640, 640}, 3, 2, 1, 1, 1, 16},
     };
     for (const auto& test_case : test_cases) {
         auto [input_shape, kernel_size, stride, pad, group, dilation, feature_size] = test_case;

@@ -543,9 +543,9 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
-            copyToGPUImage(cmdpool, data);
+            copyToGPUImage(cmdpool, data ? data : data_->data());
         } else {
-            copyToGPUBuffer(cmdpool, data);
+            copyToGPUBuffer(cmdpool, data ? data : data_->data());
         }
         if (!data) {
             data_->clear();
@@ -615,8 +615,9 @@ template <typename T> class Tensor : public ITensor {
         toCPU();
     }
 
-    void print_tensor() {
+    void print_tensor(int len = -1) {
         printf("=====================\n");
+        int cnt = 0;
         auto shape = getShape();
         if (shape.size() == 4) {
             printf("[\n");
@@ -636,6 +637,10 @@ template <typename T> class Tensor : public ITensor {
                                     << ", ";
                             } else {
                                 std::cout << (*this)[idx] << ",";
+                            }
+                            cnt++;
+                            if (len != -1 && cnt >= len) {
+                                return;
                             }
                         }
                         printf("],\n");
@@ -661,6 +666,10 @@ template <typename T> class Tensor : public ITensor {
                         } else {
                             std::cout << (*this)[idx] << ",";
                         }
+                        cnt++;
+                        if (len != -1 && cnt >= len) {
+                            return;
+                        }
                     }
                     printf("],\n");
                 }
@@ -679,6 +688,10 @@ template <typename T> class Tensor : public ITensor {
                     } else {
                         std::cout << (*this)[idx] << ", ";
                     }
+                    cnt++;
+                    if (len != -1 && cnt >= len) {
+                        return;
+                    }
                 }
                 printf("],\n");
             }
@@ -691,6 +704,10 @@ template <typename T> class Tensor : public ITensor {
                               << ",";
                 } else {
                     std::cout << (*this)[idx] << ", ";
+                }
+                cnt++;
+                if (len != -1 && cnt >= len) {
+                    return;
                 }
             }
             printf("]\n");

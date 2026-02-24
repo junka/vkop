@@ -76,7 +76,7 @@ int main(int argc, char *argv[]) {
     if (binary_file_path.find("inception") != std::string::npos) {
         method = vkop::core::NormMethod::INCEPTION;
     }
-    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), method);
+    vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), false, method);
     std::vector<int> shape;
 
     std::shared_ptr<vkop::core::Tensor<int>> indexs;

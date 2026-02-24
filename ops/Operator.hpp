@@ -135,14 +135,30 @@ class Operator {
 
         if (trace_) {
             m_cmd_->wait();
+            m_dev_->wait_all_done();
             printf("%s: %s\n", convert_optype_to_string(type_).c_str(),
                    name_.c_str());
+            int i = 0;
+            for (auto input : inputs) {
+                printf("input %d:\n", i);
+                dispatch_by_dtype(input->dtype(), [&](auto dummy) {
+                    using T = decltype(dummy);
+                    auto in = core::as_tensor<T>(input);
+                    in->copyToCPU(m_cmdpool_);
+                    in->print_tensor();
+                    in->toGPU();
+                    // in->copyToGPU(m_cmdpool_);
+                });
+                i++;
+            }
+            printf("output 0:\n");
             dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto output = core::as_tensor<T>(outputs[0]);
                 output->copyToCPU(m_cmdpool_);
                 output->print_tensor();
                 output->toGPU();
+                // output->copyToGPU(m_cmdpool_);
             });
         }
     }

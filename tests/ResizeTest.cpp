@@ -17,8 +17,8 @@ using vkop::ops::Resize;
 template<typename T>
 class ResizeTest: public TestCase<T> {
 public:
-    std::vector<int> input_shape_ = {1, 2, 4, 4};
-    std::vector<int> resize_ = {1, 2, 2, 2};
+    std::vector<int> input_shape_;
+    std::vector<int> resize_;
     bool align_corners_ = false;
     std::string mode_ = "bilinear";
     bool antialias_ = false;
@@ -49,8 +49,10 @@ public:
         attributes = {
             {"size", buildSizeString(resize_)},
             {"mode", mode_},
-            {"align_corners", align_corners_ ? "True": "False"},
+            {"coordinate_transformation_mode", align_corners_ ? "align_corners": "half_pixel"},
             {"antialias", antialias_ ? "True" : "False"},
+            {"cubic_coeff_a", std::to_string(cubic_coeff_a_)},
+            {"nearest_mode", "nearest"},
         };
         initTestData();
     }
@@ -58,7 +60,8 @@ public:
 private:
     void initTestData() {
         torch::manual_seed(42);
-        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
+        std::vector<int64_t> inshape(input_shape_.begin(), input_shape_.end());
+        auto torch_input = torch::randn(inshape, this->getTorchConf());
 
         std::vector<int64_t> sizes;
         bool has_size = false;
@@ -94,7 +97,6 @@ private:
             has_scale_factor = !scale_factors.empty();
         }
 
-        bool align_corners = attributes.count("align_corners") ? (attributes.at("align_corners") == "True" || attributes.at("align_corners") == "true") : false;
         std::string mode = attributes.count("mode") ? attributes.at("mode") : "nearest";
 
         std::optional<std::vector<int64_t>> opt_size = std::nullopt;
@@ -112,13 +114,13 @@ private:
             .scale_factor(opt_scale_factor);
 
         if (mode == "bilinear") {
-            options = options.mode(torch::kBilinear).align_corners(align_corners);
+            options = options.mode(torch::kBilinear).align_corners(align_corners_);
         } else if (mode == "bicubic") {
-            options = options.mode(torch::kBicubic).align_corners(align_corners);
+            options = options.mode(torch::kBicubic).align_corners(align_corners_);
         } else if (mode == "trilinear") {
-            options = options.mode(torch::kTrilinear).align_corners(align_corners);
+            options = options.mode(torch::kTrilinear).align_corners(align_corners_);
         } else if (mode == "linear") {
-            options = options.mode(torch::kLinear).align_corners(align_corners);
+            options = options.mode(torch::kLinear).align_corners(align_corners_);
         } else {
             options = options.mode(torch::kNearest);
         }
@@ -136,10 +138,10 @@ private:
         printf("\n===Output==============\n");
         std::cout << torch_output << std::endl;
 
-        input_data_ = std::make_shared<Tensor<float>>(input_shape_);
+        input_data_ = std::make_shared<Tensor<T>>(input_shape_);
         this->fillTensorFromTorch(input_data_, torch_input);
 
-        output_data_ = std::make_shared<Tensor<float>>(output_shape);
+        output_data_ = std::make_shared<Tensor<T>>(output_shape);
         this->fillTensorFromTorch(output_data_, torch_output);
     }
 };
@@ -169,6 +171,18 @@ TEST(ResizeTest, ResizeComprehensiveTest) {
                 return;
             }
             resize_op->setAttribute(rt.attributes);
+
+        }));
+
+        ResizeTest<uint16_t> rt1(input_shape, resize, align_corners, mode, antialias);
+        EXPECT_TRUE(rt1.run_test({rt1.input_data_, nullptr, nullptr, nullptr}, {rt1.output_data_},
+            [&rt1](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *resize_op = dynamic_cast<Resize *>(op.get());
+            if (!resize_op) {
+                LOG_ERROR("Failed to cast operator to Resize");
+                return;
+            }
+            resize_op->setAttribute(rt1.attributes);
 
         }));
     }

@@ -1,6 +1,4 @@
 #include <vector>
-#include <random>
-#include <cmath>
 
 #include "setup.hpp"
 #include "core/Tensor.hpp"
@@ -8,7 +6,7 @@
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
-#define USE_CPP_REF
+
 namespace {
 #ifdef USE_CPP_REF
 template<typename T>
@@ -53,21 +51,22 @@ private:
     {
         input = std::make_shared<Tensor<T>>(shape_);
         output = std::make_shared<Tensor<T>>(std::vector<int>{shape_[0], shape_[1]});
-        input->reserveOnCPU();
-        output->reserveOnCPU();
 
-        std::random_device rd{};
-        std::mt19937 gen{rd()};
-        gen.seed(1024);
-        std::normal_distribution<> input_dist{-1.0F, 6.0F};
-        for (int i = 0; i < input->num_elements(); i++) {
-            if constexpr (std::is_same_v<T, uint16_t>) {
-                (*input)[i] = vkop::core::ITensor::fp32_to_fp16(input_dist(gen));
-            } else if constexpr (std::is_same_v<T, float>) {
-                (*input)[i] = input_dist(gen);
-            }
+        std::vector<int64_t> inshape(shape_.begin(), shape_.end());
+        auto torch_input = torch::rand(inshape, this->getTorchConf());
+        std::vector<int64_t> dims;
+        auto ndim = torch_input.dim();
+        for (int64_t i = 2; i < ndim; ++i) {
+            dims.push_back(i);
         }
+        auto torch_output = torch::mean(torch_input, dims, true);
+        this->fillTensorFromTorch(input, torch_input);
+        this->fillTensorFromTorch(output, torch_output);
+        std::cout << torch_input << std::endl;
+        std::cout << torch_output << std::endl;
+#if 0
         global_average_pool(input, output);
+#endif
     }
 };
 }
@@ -77,11 +76,18 @@ TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
     const std::vector<std::tuple<std::vector<int>>> testcases = {
         {{1, 3, 360, 512}},
         {{1, 3, 4, 8}},
+        {{1, 4, 6, 1}},
+        {{1, 4, 6}},
     };
 
     for (const auto &t : testcases) {
         auto [shape] = t;
-        LOG_INFO("Testing globalAveragePool: [%d, %d, %d, %d]", shape[0], shape[1], shape[2], shape[3]);
+        std::string str = "[";
+        for (auto i : shape) {
+            str += std::to_string(i) + ", ";
+        }
+        str += "]";
+        LOG_INFO("Testing globalAveragePool: %s", str.c_str());
         LOG_INFO("Testing fp32");
 
         GlobalAveragePoolTest<float> gaptest(shape);

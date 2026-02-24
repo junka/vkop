@@ -28,5 +28,8 @@ TEST(SoftplusTest, SoftplusComprehensiveTest) {
     for (const auto& t : test_cases) {
         SoftplusTest<float> sptest(t);
         EXPECT_TRUE(sptest.run_test());
+
+        SoftplusTest<uint16_t> sptest1(t);
+        EXPECT_TRUE(sptest1.run_test());
     }
 }
