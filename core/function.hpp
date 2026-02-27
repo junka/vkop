@@ -38,7 +38,7 @@ class Function {
      */
     Function &operator=(const Function &&) = delete;
 
-    static void
+    static std::pair<int, int>
     preprocess_jpg(const char *input_file,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    const std::shared_ptr<core::ITensor> &input,

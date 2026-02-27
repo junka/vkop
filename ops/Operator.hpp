@@ -141,13 +141,15 @@ class Operator {
             int i = 0;
             for (auto input : inputs) {
                 printf("input %d:\n", i);
+                if (input->dtype() == typeid(int64_t)) {
+                    continue;
+                }
                 dispatch_by_dtype(input->dtype(), [&](auto dummy) {
                     using T = decltype(dummy);
                     auto in = core::as_tensor<T>(input);
                     in->copyToCPU(m_cmdpool_);
                     in->print_tensor();
                     in->toGPU();
-                    // in->copyToGPU(m_cmdpool_);
                 });
                 i++;
             }
@@ -158,7 +160,6 @@ class Operator {
                 output->copyToCPU(m_cmdpool_);
                 output->print_tensor();
                 output->toGPU();
-                // output->copyToGPU(m_cmdpool_);
             });
         }
     }

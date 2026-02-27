@@ -74,7 +74,6 @@ private:
         printf("==============================================================\n");
         printf("Input A:\n");
         auto shapea = inputa->getShape();
-        printf("%d %d %d %d\n", shapea[0], shapea[1], shapea[2], shapea[3]);
         inputa->print_tensor();
         printf("Input B:\n");
         auto shapeb = inputb->getShape();

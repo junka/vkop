@@ -49,7 +49,6 @@ class Reshape : public Operator {
         std::vector<int> dim(n);
         for (int i = 0; i < n; i++) {
             dim[i] = static_cast<int>((*shape)[i]);
-            printf("%d\n", dim[i]);
         }
         auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
                                      std::multiplies<>());

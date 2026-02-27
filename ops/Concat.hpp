@@ -66,6 +66,7 @@ class Concat : public Operator {
         auto output_image = std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
         int offset = 0;
         for (const auto &in : inputs) {
+            printf("concat %d: offset %d\n", axis_ + 4 - rank, offset);
             dispatch_by_dtype(in->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto input = core::as_tensor<T>(in);
@@ -76,16 +77,19 @@ class Concat : public Operator {
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {0, 0, 0}, offset / 4);
+                    input_image->readBarrier(m_cmd_->get());
                     offset += in->get_channel();
                 } else if (axis_ + 4 - rank == 0) {
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {0, offset, 0}, 0);
+                    input_image->readBarrier(m_cmd_->get());
                     offset += in_gpu_shape[1];
                 } else if (axis_ + 4 - rank == 3) {
                     input_image->transferReadBarrier(m_cmd_->get());
                     output_image->copyImageToImage(m_cmd_->get(), input_image,
                                                    {offset, 0, 0}, 0);
+                    input_image->readBarrier(m_cmd_->get());
                     offset += in_gpu_shape[0];
                 } else if (axis_ + 4 - rank == 2) {
                     if (objs_.size() == 2) {
@@ -94,21 +98,8 @@ class Concat : public Operator {
                     objs_.emplace_back(input_image);
                     concat::ConcatParam para = {};
                     auto input_shape = in->getShape();
-                    if (in->num_dims() == 4) {
-                        for (size_t j = 0; j < 4; j++) {
-                            para.inShape[j] = input_shape[j];
-                            para.outShape[j] = out_shape[j];
-                        }
-                    } else if (in->num_dims() == 3) {
-                        para.inShape[0] = 1;
-                        para.inShape[1] = input_shape[0];
-                        para.inShape[2] = input_shape[1];
-                        para.inShape[3] = input_shape[2];
-                        para.outShape[0] = 1;
-                        para.outShape[1] = out_shape[0];
-                        para.outShape[2] = out_shape[1];
-                        para.outShape[3] = out_shape[2];
-                    }
+                    in->get_shape(para.inShape);
+                    outputs[0]->get_shape(para.outShape);
                     para.offset[0] = 0;
                     para.offset[1] = 0;
                     para.offset[2] = offset;
@@ -124,21 +115,8 @@ class Concat : public Operator {
                     objs_.emplace_back(input_image);
                     auto input_shape = in->getShape();
                     concat::ConcatParam para = {};
-                    if (in->num_dims() == 4) {
-                        for (size_t j = 0; j < 4; j++) {
-                            para.inShape[j] = input_shape[j];
-                            para.outShape[j] = out_shape[j];
-                        }
-                    } else if (in->num_dims() == 3) {
-                        para.inShape[0] = 1;
-                        para.inShape[1] = input_shape[0];
-                        para.inShape[2] = input_shape[1];
-                        para.inShape[3] = input_shape[2];
-                        para.outShape[0] = 1;
-                        para.outShape[1] = out_shape[0];
-                        para.outShape[2] = out_shape[1];
-                        para.outShape[3] = out_shape[2];
-                    }
+                    in->get_shape(para.inShape);
+                    outputs[0]->get_shape(para.outShape);
                     para.offset[0] = 0;
                     para.offset[1] = offset;
                     para.offset[2] = 0;

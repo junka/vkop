@@ -67,8 +67,6 @@ public:
     std::vector<std::vector<std::string>> concurrent_execution_levels;
 
     explicit VkModel(const std::string& filePath);
-
-    // std::vector<std::string> getTopologicalOrder() const;
     
     const std::vector<std::vector<std::string>>& getConcurrentExecutionLevels() const {
         return concurrent_execution_levels;
@@ -257,15 +255,15 @@ private:
             } else if (tag == 3) {
                 auto l = readList<uint32_t>(ptr, end);
                 value = "[" + std::to_string(l[0]);
-                for (auto c: l) {
-                    value += ", " + std::to_string(c);
+                for (size_t j = 1; j < l.size(); ++j) {
+                    value += ", " + std::to_string(l[j]);
                 }
                 value += "]";
             } else if (tag == 4) {
                 auto l = readList<float>(ptr, end);
                 value = "[" + std::to_string(l[0]);
-                for (auto c: l) {
-                    value += ", " + std::to_string(c);
+                for (size_t j = 1; j < l.size(); ++j) {
+                    value += ", " + std::to_string(l[j]);
                 }
                 value += "]";
             } else {

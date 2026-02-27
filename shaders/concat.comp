@@ -25,7 +25,7 @@ void concat_for_h() {
     int c4 = gid.z;
     int n = gid.y / H;
     int h = gid.y % H;
-    if (w >= W || c4 >= C / 4 || n >= N || h >= H) {
+    if (w >= W || c4 >= ((C + 3) / 4) || n >= N || h >= H) {
         return;
     }
     vec4 pixel = texelFetch(uInput, gid, 0);

@@ -165,9 +165,9 @@ class Slice : public Operator {
                 CalculateOutputShape(inshape, starts->data(), ends->data(),
                                      axes->data(), steps->data());
 
-            for (auto i = 0; i < static_cast<int>(out_size[0].size()); i++) {
-                printf("outSize[%d] = %d\n", i, out_size[0][i]);
-            }
+            // for (auto i = 0; i < static_cast<int>(out_size[0].size()); i++) {
+            //     printf("outSize[%d] = %d\n", i, out_size[0][i]);
+            // }
         });
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);

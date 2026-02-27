@@ -1,5 +1,4 @@
 #version 450 core
-
 #ifdef FP16
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
@@ -310,7 +309,6 @@ void conv1x1() {
     acc = activation(acc, uConstant.activation);
 
     imageStore(uOutput, gid, acc);
-
 }
 
 void grouped_conv2d() {
@@ -320,7 +318,9 @@ void grouped_conv2d() {
     int realH = imgsz.y;
     int C4_out = imgsz.z;
 
-    if (gid.x >= W_out || gid.y >= realH || gid.z >= C4_out) return;
+    if (gid.x >= W_out || gid.y >= realH || gid.z >= C4_out) {
+        return;
+    }
 
     int H_out = uConstant.outputSize.y;
     int C_out = uConstant.outputSize.z;
@@ -609,7 +609,6 @@ void grouped_conv2d() {
 
 
 void main() {
-
     if (uConstant.pack == 1) {
         conv1x1();
     } else {

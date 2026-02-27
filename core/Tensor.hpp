@@ -616,7 +616,8 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void print_tensor(int len = -1) {
-        printf("=====================\n");
+        printf("======= %d [%d, %d, %d, %d]===========\n", n_dims_, dims_[0],
+               dims_[1], dims_[2], dims_[3]);
         int cnt = 0;
         auto shape = getShape();
         if (shape.size() == 4) {

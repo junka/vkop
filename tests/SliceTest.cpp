@@ -24,9 +24,6 @@ std::vector<float> slice_cpu(const std::shared_ptr<Tensor<float>>& input,
     auto output_shape = Slice::CalculateOutputShape<int64_t>(
         input_shape, starts, ends, axes, steps
     );
-    for (size_t i = 0; i < rank; ++i)
-        printf("%d ", output_shape[0][i]);
-    printf("\n");
 
     std::vector<int64_t> input_strides(rank, 1);
     for (int i = rank - 2; i >= 0; --i) {

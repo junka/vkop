@@ -27,17 +27,18 @@ constexpr uint8_t kLetterboxPadColor = 114;
  * imagenet = false:
  * normlize: img = img / 255.0
  */
-void Function::preprocess_jpg(const char *input_file,
-                              const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                              const std::shared_ptr<core::ITensor> &input,
-                              bool letterbox, NormMethod method) {
+std::pair<int, int>
+Function::preprocess_jpg(const char *input_file,
+                         const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                         const std::shared_ptr<core::ITensor> &input,
+                         bool letterbox, NormMethod method) {
     int image_h;
     int image_w;
     int channels;
     auto *raw = stbi_load(input_file, &image_w, &image_h, &channels, 3);
     if (!raw) {
         std::cerr << "Failed to load image: " << input_file << std::endl;
-        return;
+        return {};
     }
     int resize_h = input->getShape()[2];
     int resize_w = input->getShape()[3];
@@ -57,7 +58,7 @@ void Function::preprocess_jpg(const char *input_file,
         if (!scaled) {
             std::cerr << "Failed to allocate memory for scaled image"
                       << std::endl;
-            return;
+            return {};
         }
         // Resize with maintained aspect ratio
         stbir_resize_uint8_linear(raw, image_w, image_h, 0, scaled, new_w,
@@ -69,7 +70,7 @@ void Function::preprocess_jpg(const char *input_file,
         if (!processed_image) {
             std::cerr << "Failed to allocate memory for processed image"
                       << std::endl;
-            return;
+            return {};
         }
         // Fill with padding color
         memset(processed_image, kLetterboxPadColor, resize_h * resize_w * 3);
@@ -98,7 +99,7 @@ void Function::preprocess_jpg(const char *input_file,
         if (!processed_image) {
             std::cerr << "Failed to allocate memory for processed image"
                       << std::endl;
-            return;
+            return {};
         }
         stbir_resize_uint8_linear(raw, image_w, image_h, 0, processed_image,
                                   resize_w, resize_h, 0, STBIR_RGB);
@@ -143,6 +144,7 @@ void Function::preprocess_jpg(const char *input_file,
         t->copyToGPUImage(cmdpool, normalized_data.data(), true);
     }
     free(processed_image);
+    return {image_h, image_w};
 }
 
 std::vector<std::pair<int, float>>
