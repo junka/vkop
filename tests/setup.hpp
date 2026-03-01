@@ -152,6 +152,9 @@ public:
             } else if (expect_output->dtype() == typeid(int)) {
                 auto output = std::make_shared<Tensor<int>>(true);
                 outputs.push_back(output);
+            } else if (expect_output->dtype() == typeid(int64_t)) {
+                auto output = std::make_shared<Tensor<int64_t>>(true);
+                outputs.push_back(output);
             } else {
                 LOG_ERROR("Unsupported output tensor type");
                 return false;
@@ -263,6 +266,11 @@ public:
             } else if (outputs[idx]->dtype() == typeid(int)){
                 if (!check_ret(idx, int{}))
                     return false;
+            } else if (outputs[idx]->dtype() == typeid(int64_t)) {
+                if (!check_ret(idx, int64_t{}))
+                    return false;
+            } else {
+                return false;
             }
         }
 +        LOG_INFO("Test Passed for operator: %s, type %s", name_.c_str(), typeid(T).name());

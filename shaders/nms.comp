@@ -1,0 +1,203 @@
+#version 450
+
+#extension GL_EXT_scalar_block_layout : enable
+
+layout(local_size_x = 1024, local_size_y = 1, local_size_z = 1) in;
+
+// Output: [batch_index, class_index, box_index]
+// can not use ivec3 as alignment to ivec4
+layout(set = 0, binding = 0) writeonly buffer Output {
+    int output_data[];
+};
+
+// Boxes: [B][N][4] → total size = B * N * 4
+layout(set = 0, binding = 1) uniform sampler2DArray Boxes;
+
+// Scores: [B][C][N] → total size = B * C * N
+layout(set = 0, binding = 2) uniform sampler2DArray Scores;
+
+// Global atomic counter for output offset
+layout(set = 0, binding = 3) buffer AtomicCounter {
+    uint total_count;
+};
+
+layout(push_constant) uniform Params {
+    int B;                             // batch size
+    int C;                             // number of classes
+    int N;                             // number of boxes per image/class
+    int center_point_box;               // 0 = corner, 1 = center+wh
+    int max_output_boxes_per_class;     // e.g., 100
+    float iou_threshold;                // e.g., 0.5
+    float score_threshold;              // e.g., 0.25
+} pc;
+
+// === Shared memory (max 1024 candidates) ===
+const uint MAX_CANDIDATES = 1024u;
+
+shared vec4 sh_boxes[MAX_CANDIDATES];
+shared float sh_scores[MAX_CANDIDATES];
+shared int sh_indices[MAX_CANDIDATES];  // original box index in [0, N)
+shared bool sh_active[MAX_CANDIDATES];
+shared uint sh_selected[MAX_CANDIDATES];
+shared uint sh_selected_count;
+shared uint sh_actual_count;
+shared bool sh_current_is_best;
+shared uint sh_current_idx;
+
+vec4 to_corners(vec4 b) {
+    if (pc.center_point_box == 0) {
+        return b;
+    } else {
+        // Input: [x_center, y_center, width, height]
+        float xc = b.x, yc = b.y, w = b.z, h = b.w;
+        return vec4(xc - w * 0.5, yc - h * 0.5, xc + w * 0.5, yc + h * 0.5);
+    }
+}
+
+float compute_iou(vec4 a, vec4 b) {
+    float x1 = max(a.x, b.x);
+    float y1 = max(a.y, b.y);
+    float x2 = min(a.z, b.z);
+    float y2 = min(a.w, b.w);
+    if (x2 <= x1 || y2 <= y1) return 0.0;
+    float inter = (x2 - x1) * (y2 - y1);
+    float area_a = (a.z - a.x) * (a.w - a.y);
+    float area_b = (b.z - b.x) * (b.w - b.y);
+    float union_area = area_a + area_b - inter;
+    return (union_area > 0.0) ? (inter / union_area) : 0.0;
+}
+
+void main() {
+    // === Map workgroup to (batch, class) ===
+    const uint batch_class_id = gl_WorkGroupID.y; // because dispatch(1, B*C, 1)
+    const uint batch_id = batch_class_id / pc.C;
+    const uint class_id = batch_class_id % pc.C;
+
+    // Early exit if out of range
+    if (batch_id >= pc.B || class_id >= pc.C) return;
+
+    const uint gid = gl_LocalInvocationID.x; // 0 ~ 1023
+
+    // === PHASE 1: Thread 0 collects & sorts top-K candidates (K <= 1024) ===
+    if (gid == 0u) {
+        uint count = 0u;
+        // Collect all boxes with score > threshold (up to MAX_CANDIDATES)
+        for (uint i = 0u; i < pc.N && count < MAX_CANDIDATES; ++i) {
+            // uint score_idx = (batch_id * pc.C + class_id) * pc.N + i;
+            // [1, B, C, N] -> (N, C, B4)
+            float s = texelFetch(Scores, ivec3(i, class_id, batch_id/4), 0)[batch_id%4];
+            if (s > pc.score_threshold) {
+                vec4 raw_box;
+                // 1 B N 4
+                raw_box.x = texelFetch(Boxes, ivec3(0, i, batch_id/4), 0)[batch_id%4];
+                raw_box.y = texelFetch(Boxes, ivec3(1, i, batch_id/4), 0)[batch_id%4];
+                raw_box.z = texelFetch(Boxes, ivec3(2, i, batch_id/4), 0)[batch_id%4];
+                raw_box.w = texelFetch(Boxes, ivec3(3, i, batch_id/4), 0)[batch_id%4];
+
+                // vec4 raw_box = boxes[batch_id * pc.N + i];
+                sh_boxes[count] = to_corners(raw_box);
+                sh_scores[count] = s;
+                sh_indices[count] = int(i);
+                count++;
+            }
+        }
+
+        // Sort by score descending (selection sort, K <= 1024)
+        for (uint i = 0u; i < count; ++i) {
+            uint best_j = i;
+            for (uint j = i + 1u; j < count; ++j) {
+                if (sh_scores[j] > sh_scores[best_j]) {
+                    best_j = j;
+                }
+            }
+            if (best_j != i) {
+                float tmp_s = sh_scores[i];
+                sh_scores[i] = sh_scores[best_j];
+                sh_scores[best_j] = tmp_s;
+                vec4 tmp_b = sh_boxes[i];
+                sh_boxes[i] = sh_boxes[best_j];
+                sh_boxes[best_j] = tmp_b;
+                int tmp_idx = sh_indices[i];
+                sh_indices[i] = sh_indices[best_j];
+                sh_indices[best_j] = tmp_idx;
+            }
+        }
+
+        // Initialize active flags
+        for (uint i = 0u; i < count; ++i) {
+            sh_active[i] = true;
+        }
+        for (uint i = count; i < MAX_CANDIDATES; ++i) {
+            sh_active[i] = false;
+        }
+        sh_selected_count = 0u;
+    }
+
+    barrier();
+
+    // === PHASE 2: Sequential NMS on sorted list (no search needed!) ===
+    uint actual_count = 0u;
+    if (gid == 0u) {
+        // Count how many valid candidates we have
+        for (uint i = 0u; i < MAX_CANDIDATES; ++i) {
+            if (!sh_active[i]) break;
+            actual_count = i + 1u;
+        }
+    }
+    if (gid == 0u) sh_actual_count = actual_count;
+    barrier();
+
+    if (sh_actual_count == 0u) return;
+
+    uint max_out = (pc.max_output_boxes_per_class > 0) ?
+                   uint(min(pc.max_output_boxes_per_class, int(sh_actual_count))) :
+                   sh_actual_count;
+
+    // Since candidates are sorted by score descending,
+    // we just iterate in order and suppress overlapping ones.
+    for (uint i = 0u; i < sh_actual_count && sh_selected_count < max_out; ++i) {
+        bool current_is_best = false;
+        if (gid == 0u) {
+            if (sh_active[i]) {
+                current_is_best = true;
+                sh_selected[sh_selected_count] = i;
+                sh_selected_count++;
+            }
+        }
+
+        if (gid == 0u) {
+            sh_current_is_best = current_is_best;
+            sh_current_idx = i;
+        }
+        barrier();
+
+        if (!sh_current_is_best) continue;
+
+        // Suppress all subsequent boxes that overlap with box[i]
+        if (gid < sh_actual_count && gid > sh_current_idx) {
+            if (sh_active[gid]) {
+                if (compute_iou(sh_boxes[gid], sh_boxes[sh_current_idx]) > pc.iou_threshold) {
+                    sh_active[gid] = false;
+                }
+            }
+        }
+        barrier();
+    }
+
+    // === PHASE 3: Write results to global output buffer ===
+    if (gid == 0u && sh_selected_count > 0u) {
+        uint base_offset = atomicAdd(total_count, sh_selected_count);
+        for (uint i = 0u; i < sh_selected_count; ++i) {
+            output_data[(base_offset + i)*3] = int(batch_id);
+            output_data[(base_offset + i)*3+1] = int(class_id);
+            output_data[(base_offset + i)*3+2] = sh_indices[sh_selected[i]];
+        }
+    }
+    barrier();
+    if (gid == 0u && batch_class_id == 0u) {
+        uint base_offset = atomicAdd(total_count, 1u);
+        output_data[base_offset*3] = int(-1);
+        output_data[base_offset*3+1] = int(-1);
+        output_data[base_offset*3+2] = int(-1);
+    }
+}

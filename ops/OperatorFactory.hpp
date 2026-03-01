@@ -32,6 +32,7 @@
 #include "AveragePool.hpp"
 #include "Concat.hpp"
 #include "GlobalAveragePool.hpp"
+#include "Nms.hpp"
 #include "Reshape.hpp"
 #include "Slice.hpp"
 #include "Split.hpp"
@@ -107,7 +108,8 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0) {
         return std::make_unique<Transpose>();
     case OpType::SOFTMAX:
         return std::make_unique<Softmax>(use_ssbo);
-
+    case OpType::NMS:
+        return std::make_unique<Nms>();
     default:
         return nullptr;
     }

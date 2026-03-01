@@ -54,6 +54,7 @@ set(TEST_SOURCES
     GlobalAveragePoolTest.cpp
     AveragePoolTest.cpp
     TopkTest.cpp
+    NmsTest.cpp
 )
 
 set(LIBTORCH_VERSION "2.10.0")
