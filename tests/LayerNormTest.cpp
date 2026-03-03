@@ -11,7 +11,7 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::LayerNorm;
-#define USE_CPP_REFER 1
+
 namespace {
 #if USE_CPP_REFER
 
@@ -90,10 +90,10 @@ public:
     const std::unordered_map<std::string, std::string> param = {
         {"eps", "1e-5"}, {"normalized_shape", "[4, 4]"}
     };
-    std::shared_ptr<Tensor<float>> input;
-    std::shared_ptr<Tensor<float>> weight;
-    std::shared_ptr<Tensor<float>> bias;
-    std::shared_ptr<Tensor<float>> output;
+    std::shared_ptr<Tensor<T>> input;
+    std::shared_ptr<Tensor<T>> weight;
+    std::shared_ptr<Tensor<T>> bias;
+    std::shared_ptr<Tensor<T>> output;
 
     LayerNormTest():TestCase<T>("LayerNorm") {
         initTestdata();

@@ -1,0 +1,77 @@
+{
+  "name": "vkop-model-viewer",
+  "displayName": "VKOP Model Viewer",
+  "description": "Visualize VKOP binary model files with hierarchical layer display",
+  "version": "0.0.2",
+  "author": {
+    "name": "Wan Junjie",
+    "email": "wan.junjie@foxmail.com"
+  },
+  "publisher": "Wan Junjie",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/junka/vkop/tree/main/model/vscode"
+  },
+  "homepage": "https://github.com/junka/vkop/blob/main/model/vscode/README.md",
+  "bugs": {
+    "url": "https://github.com/junka/vkop/issues"
+  },
+  "keywords": [
+    "vkop",
+    "model viewer",
+    "neural network",
+    "deep learning",
+    "onnx",
+    "visualization",
+    "vulkan"
+  ],
+  "galleryBanner": {
+    "color": "#2196F3",
+    "theme": "dark"
+  },
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": [
+    "Machine Learning",
+    "Visualization",
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:vkop.viewModel"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vkop.viewModel",
+        "title": "View VKOP Model",
+        "icon": {
+          "light": "media/light/open-file.svg",
+          "dark": "media/dark/open-file.svg"
+        }
+      }
+    ],
+    "menus": {
+      "explorer/context": [
+        {
+          "command": "vkop.viewModel",
+          "when": "resourceExtname == .vkop || resourceExtname == .vkopbin",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "package": "vsce package",
+    "publish": "vsce publish"
+  },
+  "devDependencies": {
+    "@types/node": "^14.14.37",
+    "@types/vscode": "^1.60.0",
+    "typescript": "^4.3.2",
+    "@vscode/vsce": "^2.19.0"
+  }
+}
