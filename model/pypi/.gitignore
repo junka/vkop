@@ -1,0 +1,14 @@
+*.egg-info
+<exclude>
+*.pyc
+*.pyo
+*.so
+*.swp
+*.bak
+*.orig
+*.rej
+__pycache__/
+dist/
+build/
+*.egg
+*.egg-info/
