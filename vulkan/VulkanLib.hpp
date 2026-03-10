@@ -99,7 +99,24 @@ namespace vkop {
     PFN(vkWaitSemaphores)                                                      \
     PFN(vkResetFences)                                                         \
     PFN(vkCmdExecuteCommands)                                                  \
-    PFN(vkGetPhysicalDeviceImageFormatProperties)
+    PFN(vkGetPhysicalDeviceImageFormatProperties)                              \
+    PFN(vkGetPhysicalDeviceSurfaceFormatsKHR)                                  \
+    PFN(vkGetPhysicalDeviceSurfaceCapabilitiesKHR)                             \
+    PFN(vkGetPhysicalDeviceSurfacePresentModesKHR)                             \
+    PFN(vkCreateSwapchainKHR)                                                  \
+    PFN(vkDestroySwapchainKHR)                                                 \
+    PFN(vkGetSwapchainImagesKHR)                                               \
+    PFN(vkDestroySurfaceKHR)                                                   \
+    PFN(vkQueuePresentKHR)                                                     \
+    PFN(vkCmdEndRenderPass)                                                    \
+    PFN(vkCmdBeginRenderPass)                                                  \
+    PFN(vkCmdSetScissor)                                                       \
+    PFN(vkCreateRenderPass)                                                    \
+    PFN(vkDestroyRenderPass)                                                   \
+    PFN(vkCreateFramebuffer)                                                   \
+    PFN(vkDestroyFramebuffer)                                                  \
+    PFN(vkCmdSetViewport)                                                      \
+    PFN(vkAcquireNextImageKHR)
 
 class VulkanLib {
   public:

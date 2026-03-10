@@ -10,7 +10,7 @@
 
 namespace vkop {
 
-constexpr int kInflight = 1;
+constexpr int kInflight = 2;
 class VulkanQueue {
   public:
     VulkanQueue(uint32_t familyIdx, VkQueue queue)
@@ -102,6 +102,14 @@ class VulkanDevice {
         return computeQueueIdxs_;
     }
 
+    std::shared_ptr<VulkanQueue> getGraphicsQueues(uint32_t idx = 0) const {
+        int offset = idx / 2;
+        int cat = idx % 2;
+        cat = cat * kInflight / 2;
+        cat += offset;
+        return graphicsQueues_[(cat) % graphicsQueues_.size()];
+    }
+
     float getTimestampPeriod() const { return timestampPeriod_; }
     uint32_t getMaxImageArrayLayers() const { return maxImageArrayLayers_; }
 
@@ -133,6 +141,7 @@ class VulkanDevice {
     VkPhysicalDevice physicalDevice_ = VK_NULL_HANDLE;
     VkDevice logicalDevice_ = VK_NULL_HANDLE;
     std::vector<std::shared_ptr<VulkanQueue>> computeQueues_;
+    std::vector<std::shared_ptr<VulkanQueue>> graphicsQueues_;
 
     bool m_support_host_image_copy_ = false;
     bool m_support_buffer_device_address_ = false;
@@ -140,6 +149,8 @@ class VulkanDevice {
     bool m_support_cuda_kernel_launch_ = false;
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
+    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
+        graphicsQueueIdxs_;
 
     float timestampPeriod_;
     uint32_t maxImageArrayLayers_;

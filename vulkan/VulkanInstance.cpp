@@ -175,6 +175,41 @@ void VulkanInstance::getRequiredExtensions(
         extensions.push_back(VK_EXT_DEBUG_MARKER_EXTENSION_NAME);
     }
 #endif
+#ifdef VK_KHR_surface
+    if (is_ext_supported(VK_KHR_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_SURFACE_EXTENSION_NAME);
+    }
+#ifdef VK_KHR_win32_surface
+    if (is_ext_supported(VK_KHR_WIN32_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_WIN32_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_xlib_surface
+    if (is_ext_supported(VK_KHR_XLIB_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_XLIB_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_xcb_surface
+    if (is_ext_supported(VK_KHR_XCB_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_XCB_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_wayland_surface
+    if (is_ext_supported(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_KHR_android_surface
+    if (is_ext_supported(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_KHR_ANDROID_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#ifdef VK_EXT_headless_surface
+    if (is_ext_supported(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME)) {
+        extensions.push_back(VK_EXT_HEADLESS_SURFACE_EXTENSION_NAME);
+    }
+#endif
+#endif
 }
 
 #ifdef USE_VALIDATION_LAYERS

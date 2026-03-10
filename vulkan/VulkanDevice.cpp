@@ -137,17 +137,20 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
 
     for (uint32_t i = 0; i < queue_families.size(); i++) {
-        if ((queue_families[i].queueFlags & (first)) == (first)) {
+        if (kInflight > 1 &&
+            (queue_families[i].queueFlags & (second)) == (second)) {
             std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
                 i, queue_families[i].queueCount, queue_families[i].queueFlags};
             computeQueueIdxs_.emplace_back(t);
-        } else if constexpr (kInflight > 1) {
-            if ((queue_families[i].queueFlags & (second)) == (second)) {
-                std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
-                    i, queue_families[i].queueCount,
-                    queue_families[i].queueFlags};
-                computeQueueIdxs_.emplace_back(t);
-            }
+            graphicsQueueIdxs_.emplace_back(t);
+            LOG_INFO("Found graphics+compute queue family %d with %d queues", i,
+                     queue_families[i].queueCount);
+        } else if ((queue_families[i].queueFlags & (first)) == (first)) {
+            std::tuple<uint32_t, uint32_t, VkQueueFlags> t = {
+                i, queue_families[i].queueCount, queue_families[i].queueFlags};
+            computeQueueIdxs_.emplace_back(t);
+            LOG_INFO("Found compute queue family %d with %d queues", i,
+                     queue_families[i].queueCount);
         }
     }
 
@@ -955,6 +958,33 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             }});
     }
 #endif
+#ifdef VK_KHR_swapchain
+    if (supportedExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) > 0) {
+        descs.push_back(FeatureDescriptor{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+            .extensionName = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = []() -> std::unique_ptr<VkBaseOutStructure> {
+                auto q = std::make_unique<VkPhysicalDeviceFeatures2>();
+                q->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                q->pNext = nullptr;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+            },
+            .makeEnableStruct =
+                [](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+                auto *feat = static_cast<VkPhysicalDeviceFeatures2 *>(q);
+                if (!feat->features.geometryShader)
+                    return nullptr;
+                auto e = std::make_unique<VkPhysicalDeviceFeatures2>();
+                e->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+                e->pNext = nullptr;
+                e->features = feat->features;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+            }});
+    }
+#endif
     for (size_t i = 0; i < descs.size(); ++i) {
         const std::unordered_map<int, std::string> desc_names = {
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -1057,6 +1087,18 @@ bool VulkanDevice::createLogicalDevice(
             VkQueue queue;
             vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
             computeQueues_.emplace_back(
+                std::make_shared<VulkanQueue>(qidx, queue));
+        }
+    }
+    for (auto [qidx, queue_count, queueflags] : graphicsQueueIdxs_) {
+        queue_count = std::min<
+            std::tuple_element<1, class std::tuple<unsigned int, unsigned int,
+                                                   unsigned int>>::type>(
+            queue_count, (kInflight + 1) / 2);
+        for (uint32_t i = 0; i < queue_count; i++) {
+            VkQueue queue;
+            vkGetDeviceQueue(logicalDevice_, qidx, i, &queue);
+            graphicsQueues_.emplace_back(
                 std::make_shared<VulkanQueue>(qidx, queue));
         }
     }
