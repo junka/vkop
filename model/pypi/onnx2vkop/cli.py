@@ -5,7 +5,10 @@ import argparse
 import sys
 from pathlib import Path
 
-from .converter import ModelConverter
+try:
+    from .converter import ModelConverter
+except ImportError:
+    from converter import ModelConverter
 
 
 def parse_args():

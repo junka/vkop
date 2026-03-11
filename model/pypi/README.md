@@ -14,3 +14,13 @@ Convert and optimize ONNX models to VKOP (Vulkan Compute) format for efficient i
 
 ```bash
 pip install onnx2vkop
+
+pip install -e .
+```
+
+## Usage
+quantize with fp16
+
+```
+onnx2vkop -i model.onnx -q --fp16
+```

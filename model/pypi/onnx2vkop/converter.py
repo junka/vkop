@@ -7,8 +7,12 @@ import numpy as np
 import onnx
 from onnx import numpy_helper
 
-from .dag import DAGBasedModel, Node
-from .optimizer import FusionOptimizer, InitializerMerger, ONNXOptimizer, Quantizer
+try:
+    from .dag import DAGBasedModel, Node
+    from .optimizer import FusionOptimizer, InitializerMerger, ONNXOptimizer, Quantizer
+except ImportError:
+    from dag import DAGBasedModel, Node
+    from optimizer import FusionOptimizer, InitializerMerger, ONNXOptimizer, Quantizer
 
 
 class ModelConverter:
@@ -324,12 +328,7 @@ class ModelConverter:
         self.initializer_merger.merge_initializers(dag_model)
         self.initializer_merger.convert_flat_to_reshape(dag_model)
         self.initializer_merger.remove_redundant_reshape(dag_model)
-        self.fusion_optimizer.fuse_conv_bn(dag_model)
-        self.fusion_optimizer.fuse_gated_conv(dag_model)
-        self.fusion_optimizer.fuse_conv_simple_activation(dag_model)
-        self.fusion_optimizer.replace_reducemean_reshape_with_globalaveragepool(dag_model)
-        self.fusion_optimizer.unify_reduce_operators(dag_model)
-        self.fusion_optimizer.replace_globalaveragepool_conv_with_gemm(dag_model)
+        self.fusion_optimizer.optimize(dag_model)
 
         dag_model.build_dependencies()
 

@@ -58,13 +58,13 @@ Repository = "https://github.com/junka/vkop/model/pypi"
 Issues = "https://github.com/junka/vkop/issues"
 
 [project.scripts]
-onnx2vkop = "cli:main"
+onnx2vkop = "onnx2vkop.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "onnx2vkop"}
 
 [tool.setuptools.packages.find]
-where = ["src"]
+where = ["onnx2vkop"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt"]

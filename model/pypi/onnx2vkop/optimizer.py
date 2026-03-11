@@ -121,6 +121,41 @@ class FusionOptimizer:
     """Class for fusing operators in the model."""
 
     @staticmethod
+    def optimize(dag_model):
+        """
+        Perform multiple optimization passes to fuse patterns and simplify the model.
+        This method applies a sequence of passes iteratively until no further changes occur.
+        """
+        passes = [
+            FusionOptimizer.fuse_conv_bn,
+            FusionOptimizer.fuse_gated_conv,
+            FusionOptimizer.fuse_conv_simple_activation,
+            FusionOptimizer.replace_reducemean_reshape_with_globalaveragepool,
+            FusionOptimizer.unify_reduce_operators,
+            FusionOptimizer.replace_globalaveragepool_conv_with_gemm,
+        ]
+
+        print("Starting optimization passes...")
+        iteration = 0
+        while True:
+            iteration += 1
+            print(f"Optimization pass iteration {iteration}...")
+            changes = 0
+
+            for optimization_pass in passes:
+                print(f"Applying {optimization_pass.__name__}...")
+                before_nodes = len(dag_model.nodes)
+                optimization_pass(dag_model)
+                after_nodes = len(dag_model.nodes)
+                changes += before_nodes - after_nodes
+
+            if changes == 0:
+                print("No further changes detected. Optimization complete.")
+                break
+
+        return dag_model
+
+    @staticmethod
     def get_producer_consumer_from_dag(dag_model):
         """Extract producer and consumer mappings from DAG."""
         producer = {}
