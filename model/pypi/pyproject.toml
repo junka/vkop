@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "onnx2vkop"
-version = "0.1.0"
+version = "0.1.1"
 description = "ONNX to VKOP model converter and optimizer"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Wan Junjie", email = "wan.junjie@foxmail.com"}
 ]
 maintainers = [
-    {name = "Your Name", email = "your.email@example.com"}
+    {name = "Wan Junjie", email = "wan.junjie@foxmail.com"}
 ]
 keywords = [
     "onnx",
@@ -26,7 +26,6 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",
@@ -61,10 +60,7 @@ Issues = "https://github.com/junka/vkop/issues"
 onnx2vkop = "onnx2vkop.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "onnx2vkop"}
-
-[tool.setuptools.packages.find]
-where = ["onnx2vkop"]
+packages = ["onnx2vkop"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt"]

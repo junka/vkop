@@ -1,6 +1,8 @@
 """Model optimization utilities."""
 
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
+from typing import Callable, Dict, List
 
 import numpy as np
 import onnx
@@ -117,88 +119,423 @@ class ONNXOptimizer:
         return True
 
 
+@dataclass
+class OptimizationStats:
+    """Class for storing optimization statistics."""
+
+    nodes_before: int = 0
+    nodes_after: int = 0
+    initializers_before: int = 0
+    initializers_after: int = 0
+    rounds_executed: int = 0
+    patterns_fused: Dict[str, int] = field(default_factory=dict)
+    passes_applied: List[str] = field(default_factory=list)
+
+    def report(self):
+        print("=== Optimization Report ===")
+        print(
+            f"Node :{self.nodes_before} → {self.nodes_after} (reduce {self.nodes_before - self.nodes_after})"
+        )
+        if self.patterns_fused:
+            print("Fused Pattern:")
+            for pattern, count in self.patterns_fused.items():
+                print(f"  - {pattern}: {count}")
+
+
+class OptimizationPass:
+    def __init__(self, name: str, priority: int = 0):
+        self.name = name
+        self.priority = priority
+
+    def apply(self, dag_model) -> bool:
+        raise NotImplementedError("Subclass must implement this method")
+
+    def __repr__(self):
+        return f"OptimizationPass({self.name}, priority={self.priority})"
+
+
+class PatternBasedFusionPass(OptimizationPass):
+    def __init__(self, name: str, pattern_matcher: Callable, folder: Callable, priority: int = 0):
+        super().__init__(name, priority)
+        self.pattern_matcher = pattern_matcher
+        self.folder = folder
+
+    def apply(self, dag_model) -> bool:
+        changed = False
+        matches = self.pattern_matcher(dag_model)
+
+        for match in matches:
+            if self.folder(dag_model, match):
+                changed = True
+
+        return changed
+
+
+class MultiRoundOptimizer:
+    def __init__(self, max_rounds: int = 10):
+        self.passes: List[OptimizationPass] = []
+        self.max_rounds = max_rounds
+        self.stats = OptimizationStats()
+
+    def register_pass(self, pass_instance: OptimizationPass):
+        self.passes.append(pass_instance)
+        self.passes.sort(key=lambda p: p.priority, reverse=True)
+
+    def optimize(self, dag_model, verbose: bool = True) -> OptimizationStats:
+        self.stats = OptimizationStats()
+        self.stats.nodes_before = len(dag_model.nodes)
+        self.stats.initializers_before = len(dag_model.initializers)
+
+        if verbose:
+            print(f"Multi round optimize, Initial Nodes: {self.stats.nodes_before}")
+            print(f"Register {len(self.passes)} optimizer pass")
+
+        for round_idx in range(self.max_rounds):
+            round_changed = False
+
+            if verbose:
+                print(f"\n=== {round_idx + 1} round Optimization ===")
+
+            for opt_pass in self.passes:
+                try:
+                    changed = opt_pass.apply(dag_model)
+                    if changed:
+                        round_changed = True
+                        self.stats.passes_applied.append(opt_pass.name)
+
+                        if verbose:
+                            current_nodes = len(dag_model.nodes)
+                            status = "✓" if changed else "○"
+                            print(f"  {status} {opt_pass.name} match (Current Nodes: {current_nodes})")
+
+                except Exception as e:
+                    if verbose:
+                        print(f"  ✗ {opt_pass.name} Fail: {str(e)}")
+                    import traceback
+
+                    traceback.print_exc()
+                    continue
+
+            if not round_changed:
+                if verbose:
+                    print(f"\nOptimization done, total {round_idx + 1} rounds")
+                break
+
+        self.stats.nodes_after = len(dag_model.nodes)
+        self.stats.initializers_after = len(dag_model.initializers)
+
+        if verbose:
+            self.stats.report()
+
+        return self.stats
+
+
 class FusionOptimizer:
     """Class for fusing operators in the model."""
 
     @staticmethod
-    def optimize(dag_model):
-        """
-        Perform multiple optimization passes to fuse patterns and simplify the model.
-        This method applies a sequence of passes iteratively until no further changes occur.
-        """
-        passes = [
-            FusionOptimizer.fuse_conv_bn,
-            FusionOptimizer.fuse_gated_conv,
-            FusionOptimizer.fuse_conv_simple_activation,
-            FusionOptimizer.replace_reducemean_reshape_with_globalaveragepool,
-            FusionOptimizer.unify_reduce_operators,
-            FusionOptimizer.replace_globalaveragepool_conv_with_gemm,
-        ]
+    def create_default_optimizer(max_rounds: int = 10) -> MultiRoundOptimizer:
+        optimizer = MultiRoundOptimizer(max_rounds=max_rounds)
 
-        print("Starting optimization passes...")
-        iteration = 0
-        while True:
-            iteration += 1
-            print(f"Optimization pass iteration {iteration}...")
-            changes = 0
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "eliminate_identity",
+                FusionOptimizer.match_identity,
+                FusionOptimizer.fold_identity,
+                priority=100,
+            )
+        )
 
-            for optimization_pass in passes:
-                print(f"Applying {optimization_pass.__name__}...")
-                before_nodes = len(dag_model.nodes)
-                optimization_pass(dag_model)
-                after_nodes = len(dag_model.nodes)
-                changes += before_nodes - after_nodes
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "remove_redundant_reshape",
+                FusionOptimizer.match_redundant_reshape,
+                FusionOptimizer.fold_redundant_reshape,
+                priority=100,
+            )
+        )
 
-            if changes == 0:
-                print("No further changes detected. Optimization complete.")
-                break
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_conv_bn",
+                FusionOptimizer.match_conv_bn,
+                FusionOptimizer.fold_conv_bn,
+                priority=90,
+            )
+        )
 
-        return dag_model
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_add_bias_into_conv",
+                FusionOptimizer.match_add_bias,
+                FusionOptimizer.fold_add_bias,
+                priority=88,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_gated_conv",
+                FusionOptimizer.match_gated_conv,
+                FusionOptimizer.fold_gated_conv,
+                priority=90,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_conv_activation",
+                FusionOptimizer.match_conv_activation,
+                FusionOptimizer.fold_conv_activation,
+                priority=85,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "replace_reducemean_reshape_with_globalaveragepool",
+                FusionOptimizer.match_reducemean_reshape,
+                FusionOptimizer.fold_reducemean_reshape,
+                priority=75,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "unify_reduce_operators",
+                FusionOptimizer.match_reduce_ops,
+                FusionOptimizer.fold_reduce_ops,
+                priority=75,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "replace_globalaveragepool_conv_with_gemm",
+                FusionOptimizer.match_gap_conv,
+                FusionOptimizer.fold_gap_conv,
+                priority=75,
+            )
+        )
+
+        return optimizer
 
     @staticmethod
+    def optimize(dag_model, max_rounds: int = 10):
+        optimizer = FusionOptimizer.create_default_optimizer(max_rounds)
+        optimizer.optimize(dag_model, verbose=True)
+        return dag_model
+
     def get_producer_consumer_from_dag(dag_model):
         """Extract producer and consumer mappings from DAG."""
         producer = {}
         consumers = defaultdict(list)
 
         for node in dag_model.nodes.values():
-            node_dict = {
-                "op_type": node.op_type,
-                "name": node.name,
-                "attributes": node.attributes,
-                "inputs": node.inputs,
-                "outputs": node.outputs,
-            }
             for output in node.outputs:
-                producer[output["name"]] = node_dict
+                producer[output["name"]] = node
 
         for node in dag_model.nodes.values():
-            node_dict = {
-                "op_type": node.op_type,
-                "name": node.name,
-                "attributes": node.attributes,
-                "inputs": node.inputs,
-                "outputs": node.outputs,
-            }
             for idx, input_tensor in enumerate(node.inputs):
-                consumers[input_tensor["name"]].append((node_dict, idx))
+                consumers[input_tensor["name"]].append((node, idx))
 
         return producer, consumers
 
     @staticmethod
-    def fuse_gated_conv(dag_model):
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
-        nodes_dict = {node.name: node for node in dag_model.nodes.values()}
+    def match_identity(dag_model):
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type == "Identity" and len(node.inputs) == 1 and len(node.outputs) == 1:
+                matches.append({"node": node})
+        return matches
 
-        for node in list(dag_model.nodes.values()):
-            if node.op_type != "Mul":
+    @staticmethod
+    def fold_identity(dag_model, match) -> bool:
+        node = match["node"]
+        input_name = node.inputs[0]["name"]
+        output_name = node.outputs[0]["name"]
+
+        for other_node in dag_model.nodes.values():
+            if other_node.name == node.name:
+                continue
+            for inp in other_node.inputs:
+                if inp["name"] == output_name:
+                    inp["name"] = input_name
+
+        del dag_model.nodes[node.name]
+        return True
+
+    @staticmethod
+    def match_redundant_reshape(dag_model):
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type == "Reshape":
+                if (
+                    len(node.inputs) >= 1
+                    and len(node.outputs) >= 1
+                    and node.inputs[0]["shape"] == node.outputs[0]["shape"]
+                ):
+                    matches.append({"node": node})
+        return matches
+
+    @staticmethod
+    def fold_redundant_reshape(dag_model, match) -> bool:
+        node = match["node"]
+        input_name = node.inputs[0]["name"]
+        output_name = node.outputs[0]["name"]
+
+        for other_node in dag_model.nodes.values():
+            if other_node.name == node.name:
+                continue
+            for inp in other_node.inputs:
+                if inp["name"] == output_name:
+                    inp["name"] = input_name
+
+        to_remove_initializers = []
+        for inp in node.inputs[1:]:
+            if inp["name"] in dag_model.initializers:
+                to_remove_initializers.append(inp["name"])
+
+        del dag_model.nodes[node.name]
+        for init_name in to_remove_initializers:
+            del dag_model.initializers[init_name]
+
+        return True
+
+    @staticmethod
+    def match_conv_bn(dag_model):
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        for node in dag_model.nodes.values():
+            if node.op_type != "Conv":
                 continue
 
-            if len(node.inputs) != 2:
+            conv_out = node.outputs[0]["name"]
+            conv_consumers = consumers.get(conv_out, [])
+
+            if len(conv_consumers) != 1:
+                continue
+
+            bn_node, _ = conv_consumers[0]
+            if bn_node.op_type != "BatchNormalization":
+                continue
+
+            matches.append(
+                {
+                    "conv_node": node,
+                    "bn_node": bn_node,
+                }
+            )
+
+        return matches
+
+    @staticmethod
+    def fold_conv_bn(dag_model, match) -> bool:
+        node = match["conv_node"]
+        bn_node = match["bn_node"]
+
+        # inputs[1] are merged scale, bias, mean, variance respectively
+        tensor_name = bn_node.inputs[1]["name"]
+        if tensor_name not in dag_model.initializers:
+            print(
+                f"Warning: BatchNormalization parameters {tensor_name} not found, skipping fusion"
+            )
+            return False
+
+        tensor_array = numpy_helper.to_array(dag_model.initializers[tensor_name])
+        total_elements = len(tensor_array)
+        padded_N = total_elements // 4
+
+        scale_array = np.zeros(padded_N, dtype=np.float32)
+        bias_array = np.zeros(padded_N, dtype=np.float32)
+        mean_array = np.zeros(padded_N, dtype=np.float32)
+        var_array = np.zeros(padded_N, dtype=np.float32)
+        for i in range(padded_N // 4):
+            base_idx = i * 16
+            for j in range(4):
+                scale_array[i * 4 + j] = tensor_array[base_idx + j]  # scale
+                bias_array[i * 4 + j] = tensor_array[base_idx + 4 + j]  # bias
+                mean_array[i * 4 + j] = tensor_array[base_idx + 8 + j]  # mean
+                var_array[i * 4 + j] = tensor_array[base_idx + 12 + j]
+
+        eps = float(bn_node.attributes.get("epsilon", 1e-5))
+
+        has_conv_bias = len(node.inputs) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
+
+        conv_weight_name = node.inputs[1]["name"]
+        if conv_weight_name not in dag_model.initializers:
+            print(f"Warning: Conv weight {conv_weight_name} not found, skipping fusion")
+            return False
+
+        conv_weight = numpy_helper.to_array(dag_model.initializers[conv_weight_name])
+
+        if has_conv_bias:
+            conv_bias_name = node.inputs[2]["name"]
+            if conv_bias_name not in dag_model.initializers:
+                print(f"Warning: Conv bias {conv_bias_name} not found, skipping fusion")
+                return False
+            conv_bias = numpy_helper.to_array(dag_model.initializers[conv_bias_name])
+        else:
+            conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
+
+        print("Fusing Conv node", node.name, "with BN node", bn_node.name)
+        # 执行参数融合
+        # 计算: gamma / sqrt(var + eps)
+        inv_std = scale_array / np.sqrt(var_array + eps)
+
+        # 新权重 = 旧权重 * (gamma / sqrt(var + eps))
+        # 对于卷积，我们需要正确处理维度
+        fused_weight = conv_weight * inv_std.reshape(
+            -1, 1, 1, 1
+        )  # reshape to match conv weight shape
+
+        # 新偏置 = (旧偏置 - mean) * (gamma / sqrt(var + eps)) + beta
+        fused_bias = (conv_bias - mean_array) * inv_std + bias_array
+
+        # 直接更新dag_model.initializers中的权重和偏置
+        # 更新权重为融合后的权重
+        fused_weight_tensor = numpy_helper.from_array(fused_weight, conv_weight_name)
+        dag_model.initializers[conv_weight_name] = fused_weight_tensor
+
+        # 为偏置创建名称（如果原来没有bias，现在添加）
+        if has_conv_bias:
+            conv_bias_name = node.inputs[2]["name"]
+        else:
+            conv_bias_name = f"{node.name}_fused_bias"
+
+        fused_bias_tensor = numpy_helper.from_array(fused_bias, conv_bias_name)
+        dag_model.initializers[conv_bias_name] = fused_bias_tensor
+
+        fused = Node(
+            op_type=node.op_type,
+            name=node.name,
+            attributes=dict(node.attributes),
+            inputs=[
+                node.inputs[0],  # 输入数据
+                node.inputs[1],  # 权重（名称不变，但数值已更新）
+                {"name": conv_bias_name, "shape": list(fused_bias.shape)},
+            ],
+            outputs=bn_node.outputs,
+        )
+
+        del dag_model.nodes[node.name]
+        del dag_model.nodes[bn_node.name]
+        dag_model.nodes[fused.name] = fused
+
+        print("Fusing Conv+BN patterns...")
+        return True
+
+    @staticmethod
+    def match_gated_conv(dag_model):
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        for node in dag_model.nodes.values():
+            if node.op_type != "Mul" or len(node.inputs) != 2:
                 continue
 
             inp0, inp1 = node.inputs[0]["name"], node.inputs[1]["name"]
-
             candidates = [(inp0, inp1), (inp1, inp0)]
 
             matched = False
@@ -206,497 +543,281 @@ class FusionOptimizer:
                 if conv_out not in producer or sig_out not in producer:
                     continue
 
-                conv_node_dict = producer[conv_out]
-                sig_node_dict = producer[sig_out]
+                conv_node = producer[conv_out]
+                sig_node = producer[sig_out]
 
-                if conv_node_dict["op_type"] != "Conv":
+                if conv_node.op_type != "Conv" or sig_node.op_type != "Sigmoid":
                     continue
-                if sig_node_dict["op_type"] != "Sigmoid":
+
+                if len(sig_node.inputs) != 1:
                     continue
-                if len(sig_node_dict["inputs"]) != 1:
-                    continue
-                if sig_node_dict["inputs"][0]["name"] != conv_out:
+
+                if sig_node.inputs[0]["name"] != conv_out:
                     continue
 
                 conv_consumers = consumers[conv_out]
                 if len(conv_consumers) != 2:
                     continue
-                consumer_names = {c[0]["op_type"] for c in conv_consumers}
-                if not (consumer_names == {"Sigmoid", "Mul"}):
+
+                consumer_names = {c[0].op_type for c in conv_consumers}
+                if consumer_names != {"Sigmoid", "Mul"}:
                     continue
 
-                conv_node_obj = nodes_dict.get(conv_node_dict["name"])
-                sig_node_obj = nodes_dict.get(sig_node_dict["name"])
-                mul_node_obj = nodes_dict.get(node.name)
-
-                if conv_node_obj and sig_node_obj and mul_node_obj:
-                    fused = Node(
-                        op_type=conv_node_obj.op_type,
-                        name=conv_node_obj.name,
-                        attributes=dict(conv_node_obj.attributes),
-                        inputs=conv_node_obj.inputs,
-                        outputs=mul_node_obj.outputs,
-                    )
-                    fused.attributes["activation"] = "Swish"
-
-                    del dag_model.nodes[conv_node_obj.name]
-                    del dag_model.nodes[sig_node_obj.name]
-                    del dag_model.nodes[mul_node_obj.name]
-
-                    dag_model.nodes[fused.name] = fused
-                    matched = True
-                    break
+                matches.append(
+                    {
+                        "conv_node": conv_node,
+                        "sig_node": sig_node,
+                        "mul_node": node,
+                    }
+                )
+                matched = True
+                break
 
             if matched:
                 continue
 
-    @staticmethod
-    def fuse_conv_bn(dag_model):
-        """
-        Fuse Conv + BatchNormalization patterns into a single Conv node.
-        This optimization reduces the number of operations and can improve performance.
-        Works for both Conv+BN and Conv+BN+ReLU patterns.
-        """
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
-
-        # nodes_dict = {node.name: node for node in dag_model.nodes.values()}
-
-        for node in list(dag_model.nodes.values()):
-            if node.op_type != "Conv":
-                continue
-
-            conv_out = node.outputs[0]["name"]
-
-            conv_consumers = consumers.get(conv_out, [])
-            if len(conv_consumers) != 1:
-                continue
-
-            bn_node_dict, _ = conv_consumers[0]
-            if bn_node_dict["op_type"] != "BatchNormalization":
-                continue
-
-            # inputs[1] are merged scale, bias, mean, variance respectively
-            tensor_name = bn_node_dict["inputs"][1]["name"]
-            if tensor_name not in dag_model.initializers:
-                print(
-                    f"Warning: BatchNormalization parameters {tensor_name} not found, skipping fusion"
-                )
-                continue
-
-            tensor_array = numpy_helper.to_array(dag_model.initializers[tensor_name])
-            total_elements = len(tensor_array)
-            padded_N = total_elements // 4
-
-            scale_array = np.zeros(padded_N, dtype=np.float32)
-            bias_array = np.zeros(padded_N, dtype=np.float32)
-            mean_array = np.zeros(padded_N, dtype=np.float32)
-            var_array = np.zeros(padded_N, dtype=np.float32)
-            for i in range(padded_N // 4):
-                base_idx = i * 16
-                for j in range(4):
-                    scale_array[i * 4 + j] = tensor_array[base_idx + j]  # scale
-                    bias_array[i * 4 + j] = tensor_array[base_idx + 4 + j]  # bias
-                    mean_array[i * 4 + j] = tensor_array[base_idx + 8 + j]  # mean
-                    var_array[i * 4 + j] = tensor_array[base_idx + 12 + j]
-
-            eps = float(bn_node_dict["attributes"].get("epsilon", 1e-5))
-
-            has_conv_bias = len(node.inputs) > 2  # 输入0是data, 输入1是weights, 输入2是bias(如果有)
-
-            conv_weight_name = node.inputs[1]["name"]
-            if conv_weight_name not in dag_model.initializers:
-                print(f"Warning: Conv weight {conv_weight_name} not found, skipping fusion")
-                continue
-
-            conv_weight = numpy_helper.to_array(dag_model.initializers[conv_weight_name])
-
-            if has_conv_bias:
-                conv_bias_name = node.inputs[2]["name"]
-                if conv_bias_name not in dag_model.initializers:
-                    print(f"Warning: Conv bias {conv_bias_name} not found, skipping fusion")
-                    continue
-                conv_bias = numpy_helper.to_array(dag_model.initializers[conv_bias_name])
-            else:
-                conv_bias = np.zeros(scale_array.shape, dtype=scale_array.dtype)
-
-            print("Fusing Conv node", node.name, "with BN node", bn_node_dict["name"])
-            # 执行参数融合
-            # 计算: gamma / sqrt(var + eps)
-            inv_std = scale_array / np.sqrt(var_array + eps)
-
-            # 新权重 = 旧权重 * (gamma / sqrt(var + eps))
-            # 对于卷积，我们需要正确处理维度
-            fused_weight = conv_weight * inv_std.reshape(
-                -1, 1, 1, 1
-            )  # reshape to match conv weight shape
-
-            # 新偏置 = (旧偏置 - mean) * (gamma / sqrt(var + eps)) + beta
-            fused_bias = (conv_bias - mean_array) * inv_std + bias_array
-
-            # 直接更新dag_model.initializers中的权重和偏置
-            # 更新权重为融合后的权重
-            fused_weight_tensor = numpy_helper.from_array(fused_weight, conv_weight_name)
-            dag_model.initializers[conv_weight_name] = fused_weight_tensor
-
-            # 为偏置创建名称（如果原来没有bias，现在添加）
-            if has_conv_bias:
-                conv_bias_name = node.inputs[2]["name"]
-            else:
-                conv_bias_name = f"{node.name}_fused_bias"
-
-            fused_bias_tensor = numpy_helper.from_array(fused_bias, conv_bias_name)
-            dag_model.initializers[conv_bias_name] = fused_bias_tensor
-
-            fused = Node(
-                op_type=node.op_type,
-                name=node.name,
-                attributes=dict(node.attributes),
-                inputs=[
-                    node.inputs[0],  # 输入数据
-                    node.inputs[1],  # 权重（名称不变，但数值已更新）
-                    {"name": conv_bias_name, "shape": list(fused_bias.shape)},
-                ],
-                outputs=bn_node_dict["outputs"],
-            )
-
-            # 替换节点
-            del dag_model.nodes[node.name]
-            del dag_model.nodes[bn_node_dict["name"]]
-            dag_model.nodes[fused.name] = fused
-
-        print("Fusing Conv+BN patterns...")
+        return matches
 
     @staticmethod
-    def fuse_conv_simple_activation(dag_model):
+    def fold_gated_conv(dag_model, match) -> bool:
+        conv_node = match["conv_node"]
+        sig_node = match["sig_node"]
+        mul_node = match["mul_node"]
+
+        fused = Node(
+            op_type=conv_node.op_type,
+            name=conv_node.name,
+            attributes=dict(conv_node.attributes),
+            inputs=conv_node.inputs,
+            outputs=mul_node.outputs,
+        )
+        fused.attributes["activation"] = "Swish"
+
+        del dag_model.nodes[conv_node.name]
+        del dag_model.nodes[sig_node.name]
+        del dag_model.nodes[mul_node.name]
+        dag_model.nodes[fused.name] = fused
+
+        return True
+
+    @staticmethod
+    def match_conv_activation(dag_model):
+        matches = []
         producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
         ACTIVATIONS = {"Relu", "Sigmoid", "Tanh", "HardSwish", "Mish"}
 
-        # nodes_dict = {node.name: node for node in dag_model.nodes.values()}
-
-        for node in list(dag_model.nodes.values()):
-            if (
-                node.op_type in ["Conv", "BatchNormalization", "Add", "Gemm"]
-                and len(node.outputs) == 1
-            ):
-                out_name = node.outputs[0]["name"]
-                outs = consumers.get(out_name, [])
-                if len(outs) == 1:
-                    next_node_dict, _ = outs[0]
-                    if next_node_dict["op_type"] == "Clip":
-                        if len(next_node_dict["inputs"]) > 1:
-                            min_input_name = next_node_dict["inputs"][1]["name"]
-                            max_input_name = next_node_dict["inputs"][2]["name"]
-
-                            if min_input_name in dag_model.initializers:
-                                min_array = numpy_helper.to_array(
-                                    dag_model.initializers[min_input_name]
-                                )
-                                if min_array.size == 1:
-                                    min_val = float(min_array.item())
-                                del dag_model.initializers[min_input_name]
-
-                            if max_input_name in dag_model.initializers:
-                                max_array = numpy_helper.to_array(
-                                    dag_model.initializers[max_input_name]
-                                )
-                                if max_array.size == 1:
-                                    max_val = float(max_array.item())
-                                del dag_model.initializers[max_input_name]
-                        elif (
-                            "min" in next_node_dict["attributes"]
-                            or "max" in next_node_dict["attributes"]
-                        ):
-                            min_val = next_node_dict["attributes"].get("min", -1.0)
-                            max_val = next_node_dict["attributes"].get("max", 1.0)
-                        if min_val == 0.0 and max_val == 6.0:
-                            fused = Node(
-                                op_type=node.op_type,
-                                name=node.name,
-                                attributes=dict(node.attributes),
-                                inputs=node.inputs,
-                                outputs=next_node_dict["outputs"],
-                            )
-                            fused.attributes["activation"] = "Relu6"
-
-                            del dag_model.nodes[node.name]
-                            del dag_model.nodes[next_node_dict["name"]]
-                            dag_model.nodes[fused.name] = fused
-                    elif (
-                        next_node_dict["op_type"] in ACTIVATIONS
-                        and len(next_node_dict["inputs"]) == 1
-                        and next_node_dict["inputs"][0]["name"] == out_name
-                    ):
-
-                        fused = Node(
-                            op_type=node.op_type,
-                            name=node.name,
-                            attributes=dict(node.attributes),
-                            inputs=node.inputs,
-                            outputs=next_node_dict["outputs"],
-                        )
-                        fused.attributes["activation"] = next_node_dict["op_type"]
-
-                        del dag_model.nodes[node.name]
-                        del dag_model.nodes[next_node_dict["name"]]
-                        dag_model.nodes[fused.name] = fused
-                        continue
-
-    @staticmethod
-    def replace_globalaveragepool_conv_with_gemm(vk_model):
-        """
-        Replace Conv that follows GlobalAveragePool with GEMM when conditions are met.
-        This optimization works when:
-        1. GlobalAveragePool output shape is [N, C, 1, 1] (after GAP)
-        2. Conv has kernel size 1x1 and stride 1x1
-        3. Conv has no padding or padding that maintains the 1x1 output
-        4. The operations can be equivalently represented as a matrix multiplication
-        """
-        print("Replacing Conv after GlobalAveragePool with GEMM...")
-
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(vk_model)
-
-        # Convert DAG nodes to a list format temporarily for processing
-        nodes_list = []
-        for name, node_obj in vk_model.nodes.items():
-            node_dict = {
-                "op_type": node_obj.op_type,
-                "name": node_obj.name,
-                "attributes": node_obj.attributes,
-                "inputs": node_obj.inputs,
-                "outputs": node_obj.outputs,
-            }
-            nodes_list.append(node_dict)
-
-        # Add temporary index to each node dict
-        for idx, node in enumerate(nodes_list):
-            node["_orig_idx"] = idx
-
-        to_remove = set()
-        replacements = {}
-
-        for node in nodes_list:
-            # Check if it's a Conv node
-            if node["op_type"] != "Conv":
+        for node in dag_model.nodes.values():
+            if node.op_type not in ["Conv", "BatchNormalization", "Add", "Gemm"]:
                 continue
 
-            conv_input_name = node["inputs"][0]["name"]
+            if len(node.outputs) != 1:
+                continue
 
-            # Find the producer of this Conv's input
+            out_name = node.outputs[0]["name"]
+            outs = consumers.get(out_name, [])
+
+            if len(outs) != 1:
+                continue
+
+            next_node, _ = outs[0]
+
+            if next_node.op_type not in ACTIVATIONS:
+                continue
+
+            if len(next_node.inputs) != 1:
+                continue
+
+            if next_node.inputs[0]["name"] != out_name:
+                continue
+
+            matches.append(
+                {
+                    "base_node": node,
+                    "activation_node": next_node,
+                }
+            )
+
+        return matches
+
+    @staticmethod
+    def fold_conv_activation(dag_model, match) -> bool:
+        base_node = match["base_node"]
+        activation_node = match["activation_node"]
+
+        fused = Node(
+            op_type=base_node.op_type,
+            name=base_node.name,
+            attributes=dict(base_node.attributes),
+            inputs=base_node.inputs,
+            outputs=activation_node.outputs,
+        )
+        fused.attributes["activation"] = activation_node.op_type
+
+        del dag_model.nodes[base_node.name]
+        del dag_model.nodes[activation_node.name]
+        dag_model.nodes[fused.name] = fused
+
+        return True
+
+    @staticmethod
+    def match_gap_conv(dag_model):
+        """
+        Match Conv that follows GlobalAveragePool for GEMM replacement.
+
+        Conditions:
+        1. GlobalAveragePool output shape is [N, C, 1, 1]
+        2. Conv has kernel size 1x1 and stride 1x1
+        3. Conv has no padding or padding that maintains the 1x1 output
+        """
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        for node in dag_model.nodes.values():
+            if node.op_type != "Conv":
+                continue
+
+            conv_input_name = node.inputs[0]["name"]
+
             if conv_input_name not in producer:
                 continue
 
             gap_node = producer[conv_input_name]
-            # Check if the producer is a GlobalAveragePool
-            if gap_node["op_type"] != "GlobalAveragePool":
+
+            if gap_node.op_type != "GlobalAveragePool":
                 continue
 
-            # Check if Conv has kernel size 1x1 (typical for 1x1 convolutions after GAP)
-            kernel_shape = node["attributes"].get("kernel_shape", [1, 1])
-            strides = node["attributes"].get("strides", [1, 1])
-            pads = node["attributes"].get(
-                "pads", [0, 0, 0, 0]
-            )  # [pad_top, pad_left, pad_bottom, pad_right]
+            kernel_shape = node.attributes.get("kernel_shape", [1, 1])
+            strides = node.attributes.get("strides", [1, 1])
+            pads = node.attributes.get("pads", [0, 0, 0, 0])
 
-            # Only proceed if kernel is 1x1 and stride is 1x1 (common case after GAP)
             if kernel_shape == [1, 1] and strides == [1, 1]:
-                # Verify that padding doesn't change the 1x1 nature of the operation
                 if pads == [0, 0, 0, 0] or (
                     pads[0] == pads[2] and pads[1] == pads[3] and pads[0] <= 1 and pads[1] <= 1
                 ):
-                    print(
-                        f"Found Conv '{node['name']}' after GlobalAveragePool '{gap_node['name']}' with 1x1 kernel, replacing with GEMM"
-                    )
+                    weight_name = node.inputs[1]["name"]
+                    weight_tensor = None
 
-                    weight_input = node["inputs"][1]
-                    weight_name = weight_input["name"]
-
-                    if weight_name in vk_model.initializers:
-                        # Get the original weight tensor
-                        weight_tensor = vk_model.initializers[weight_name]
+                    if weight_name in dag_model.initializers:
+                        weight_tensor = dag_model.initializers[weight_name]
                         original_shape = list(weight_tensor.dims)
 
-                        # For 1x1 conv, weight shape is [out_channels, in_channels, 1, 1]
-                        # For GEMM, we need [out_channels, in_channels]
-                        if (
+                        if not (
                             len(original_shape) == 4
                             and original_shape[2] == 1
                             and original_shape[3] == 1
                         ):
-                            new_shape = [
-                                original_shape[0],
-                                original_shape[1],
-                            ]  # [out_channels, in_channels]
+                            continue
 
-                            # Get the weight data and reshape it
-                            weight_data = numpy_helper.to_array(weight_tensor)
-                            reshaped_weight = weight_data.reshape(new_shape)
+                    matches.append(
+                        {
+                            "gap_node": gap_node,
+                            "conv_node": node,
+                            "weight_tensor": weight_tensor,
+                        }
+                    )
 
-                            # Create a new initializer with the reshaped data
-                            new_weight_tensor = numpy_helper.from_array(
-                                reshaped_weight, weight_name
-                            )
-                            new_weight_tensor.data_type = weight_tensor.data_type
-
-                            # Update the initializer
-                            vk_model.initializers[weight_name] = new_weight_tensor
-                            print(
-                                f"Reshaped weight '{weight_name}' from {original_shape} to {new_shape}"
-                            )
-
-                    # Create GEMM node
-                    gemm_node = {
-                        "op_type": "Gemm",
-                        "name": f"Gemm_after_GAP_{node['name']}",
-                        "attributes": {
-                            "alpha": 1.0,
-                            "beta": 1.0,
-                            "transA": 0,  # Don't transpose A
-                            "transB": 0,  # Don't transpose B
-                        },
-                        "inputs": [
-                            gap_node["outputs"][
-                                0
-                            ],  # Output from GlobalAveragePool (becomes matrix A in GEMM)
-                            {
-                                "name": weight_input["name"],
-                                "shape": (
-                                    [original_shape[0], original_shape[1]]
-                                    if "original_shape" in locals()
-                                    else weight_input["shape"][:2]
-                                ),
-                            },  # Conv weights (becomes matrix B in GEMM)
-                        ],
-                        "outputs": [],
-                    }
-
-                    # If Conv has bias, add it as the third input to GEMM
-                    if len(node["inputs"]) > 2:
-                        gemm_node["inputs"].append(node["inputs"][2])  # Conv bias
-
-                    for output in node["outputs"]:
-                        # Original shape from Conv
-                        orig_shape = output["shape"]
-
-                        # If the shape ends with [1, 1] (H, W), remove them to keep only [N, C]
-                        new_shape = orig_shape[:]
-                        if len(new_shape) >= 2 and new_shape[-2:] == [1, 1]:
-                            new_shape = new_shape[:-2]  # Remove the last two dimensions (H, W)
-
-                        gemm_node["outputs"].append({"name": output["name"], "shape": new_shape})
-
-                        # Also update the model's outputs if this output is in the global outputs
-                        if hasattr(vk_model, "outputs"):
-                            for model_output in vk_model.outputs:
-                                if model_output["name"] == output["name"]:
-                                    model_output["shape"] = new_shape
-                                    print(
-                                        f"Updated model output '{output['name']}' shape to {new_shape}"
-                                    )
-
-                    # Find the index of the Conv node to replace it
-                    conv_idx = node["_orig_idx"]
-
-                    # Mark the Conv node for removal
-                    to_remove.add(conv_idx)
-
-                    # Add the new GEMM node
-                    replacements[conv_idx] = gemm_node
-
-        # Build new nodes list
-        new_nodes_list = []
-        for idx, node in enumerate(nodes_list):
-            if idx in to_remove:
-                # Replace the Conv node with GEMM
-                if idx in replacements:
-                    new_nodes_list.append(replacements[idx])
-            else:
-                new_nodes_list.append(node)
-
-        for node in new_nodes_list:
-            if "_orig_idx" in node:
-                del node["_orig_idx"]
-
-        replaced_count = len([idx for idx in to_remove if idx in replacements])
-        print(f"Replaced {replaced_count} Conv nodes after GlobalAveragePool with GEMM nodes")
-
-        # Convert back to DAGBasedModel format
-        updated_nodes = {}
-        for node in new_nodes_list:
-            new_node_obj = Node(
-                op_type=node["op_type"],
-                name=node["name"],
-                attributes=node["attributes"],
-                inputs=node["inputs"],
-                outputs=node["outputs"],
-            )
-            updated_nodes[node["name"]] = new_node_obj
-        vk_model.nodes = updated_nodes
-
-        return vk_model
+        return matches
 
     @staticmethod
-    def replace_reducemean_reshape_with_globalaveragepool(vk_model):
+    def fold_gap_conv(dag_model, match) -> bool:
+        """Fold matched GAP + Conv pattern into GEMM."""
+        gap_node = match["gap_node"]
+        conv_node = match["conv_node"]
+        weight_tensor = match["weight_tensor"]
+
+        weight_name = conv_node.inputs[1]["name"]
+
+        if weight_tensor and weight_name in dag_model.initializers:
+            original_shape = list(weight_tensor.dims)
+            new_shape = [original_shape[0], original_shape[1]]
+
+            weight_data = numpy_helper.to_array(weight_tensor)
+            reshaped_weight = weight_data.reshape(new_shape)
+
+            new_weight_tensor = numpy_helper.from_array(reshaped_weight, weight_name)
+            new_weight_tensor.data_type = weight_tensor.data_type
+
+            dag_model.initializers[weight_name] = new_weight_tensor
+
+        gemm_attributes = {
+            "alpha": 1.0,
+            "beta": 1.0,
+            "transA": 0,
+            "transB": 0,
+        }
+
+        gemm_inputs = [
+            gap_node.outputs[0],
+            {
+                "name": weight_name,
+                "shape": (
+                    [original_shape[0], original_shape[1]]
+                    if weight_tensor
+                    else conv_node.inputs[1]["shape"][:2]
+                ),
+            },
+        ]
+
+        if len(conv_node.inputs) > 2:
+            gemm_inputs.append(conv_node.inputs[2])
+
+        gemm_outputs = []
+        for output in conv_node.outputs:
+            orig_shape = output["shape"]
+            new_shape = orig_shape[:]
+            if len(new_shape) >= 2 and new_shape[-2:] == [1, 1]:
+                new_shape = new_shape[:-2]
+
+            gemm_outputs.append({"name": output["name"], "shape": new_shape})
+
+            if hasattr(dag_model, "outputs"):
+                for model_output in dag_model.outputs:
+                    if model_output["name"] == output["name"]:
+                        model_output["shape"] = new_shape
+
+        gemm_node = Node(
+            op_type="Gemm",
+            name=f"Gemm_after_GAP_{conv_node.name}",
+            attributes=gemm_attributes,
+            inputs=gemm_inputs,
+            outputs=gemm_outputs,
+        )
+
+        del dag_model.nodes[conv_node.name]
+        dag_model.nodes[gemm_node.name] = gemm_node
+
+        print(f"Replaced Conv '{conv_node.name}' after GlobalAveragePool with GEMM")
+        return True
+
+    @staticmethod
+    def match_reducemean_reshape(dag_model):
         """
-        Replace ReduceMean + Reshape pattern with GlobalAveragePool when conditions are met.
-        This optimization works when:
-        1. ReduceMean operates on HW dimensions (axes=[2, 3] or [-2, -1] for NCHW format)
+        Match ReduceMean + Reshape pattern for GlobalAveragePool replacement.
+
+        Conditions:
+        1. ReduceMean operates on HW dimensions (axes=[2, 3] or [-2, -1])
         2. Either:
-        - Reshape removes the trailing 1x1 dimensions (when keepdims=1), OR
-        - No reshape needed because keepdims=0 produces desired output shape
-        3. The operations can be equivalently represented as a GlobalAveragePool
-
-        This is functionally equivalent to GlobalAveragePool for NCHW format.
-        Handles both opset13 (axes in attributes) and opset18+ (axes in inputs) formats.
+           - Reshape removes trailing 1x1 dimensions (keepdims=1), OR
+           - No reshape needed (keepdims=0 produces desired output shape)
         """
-        print("Replacing ReduceMean + Reshape with GlobalAveragePool...")
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
 
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(vk_model)
-
-        # Convert DAG nodes to a list format temporarily for processing
-        nodes_list = []
-        node_name_to_idx = {}
-        for idx, (name, node_obj) in enumerate(vk_model.nodes.items()):
-            node_dict = {
-                "op_type": node_obj.op_type,
-                "name": node_obj.name,
-                "attributes": node_obj.attributes,
-                "inputs": node_obj.inputs,
-                "outputs": node_obj.outputs,
-            }
-            nodes_list.append(node_dict)
-            node_name_to_idx[name] = idx
-
-        # Add temporary index to each node dict
-        for idx, node in enumerate(nodes_list):
-            node["_orig_idx"] = idx
-
-        to_remove = set()
-        replacements = {}
-
-        for node in nodes_list:
-            # Check if it's a ReduceMean node
-            if node["op_type"] != "ReduceMean":
+        for node in dag_model.nodes.values():
+            if node.op_type != "ReduceMean":
                 continue
 
-            reducemean_output_name = node["outputs"][0]["name"]
-
-            # Get axes - could be in attributes (opset13) or inputs (opset18+)
             axes = []
-            keepdims = node["attributes"].get("keepdims", 1)  # Default is 1 in ONNX
-            noop_with_empty_axes = node["attributes"].get(
-                "noop_with_empty_axes", 0
-            )  # Default is 0 in ONNX
+            keepdims = node.attributes.get("keepdims", 1)
+            noop_with_empty_axes = node.attributes.get("noop_with_empty_axes", 0)
 
-            # Check if axes is in attributes (opset13 style)
-            if "axes" in node["attributes"]:
-                axes = node["attributes"]["axes"]
+            if "axes" in node.attributes:
+                axes = node.attributes["axes"]
             else:
-                # Check if axes is in inputs (opset18+ style)
-                # Axes would be the second input (after the data input)
-                if len(node["inputs"]) > 1:
-                    axes_input_name = node["inputs"][1]["name"]
-                    if axes_input_name in vk_model.initializers:
-                        axes_tensor = vk_model.initializers[axes_input_name]
+                if len(node.inputs) > 1:
+                    axes_input_name = node.inputs[1]["name"]
+                    if axes_input_name in dag_model.initializers:
+                        axes_tensor = dag_model.initializers[axes_input_name]
                         axes_array = numpy_helper.to_array(axes_tensor)
                         axes = (
                             axes_array.tolist()
@@ -704,181 +825,116 @@ class FusionOptimizer:
                             else list(axes_array)
                         )
 
-            # Handle empty axes condition based on noop_with_empty_axes
             if len(axes) == 0 and noop_with_empty_axes == 1:
-                # If noop_with_empty_axes is true and axes is empty, this performs no reduction
                 continue
             elif len(axes) == 0 and noop_with_empty_axes == 0:
-                # If noop_with_empty_axes is false and axes is empty, this reduces all axes
-                continue  # This case is not relevant for our optimization
+                continue
 
-            # Normalize negative axes to positive (for 4D tensors, -1 becomes 3, -2 becomes 2)
+            input_shape = node.inputs[0]["shape"]
             normalized_axes = []
             for ax in axes:
                 if ax < 0:
-                    # Determine tensor rank from input shape to normalize axes properly
-                    input_shape = node["inputs"][0]["shape"]
                     normalized_axes.append(len(input_shape) + ax)
                 else:
                     normalized_axes.append(ax)
 
-            # For NCHW format, axes [2, 3] or [-2, -1] correspond to H and W dimensions
-            if sorted(normalized_axes) == [2, 3]:
-                # Check if the reshape removes the 1x1 dimensions (i.e., changes [..., 1, 1] to [...])
-                input_shape = node["inputs"][0]["shape"]  # Original input shape before ReduceMean
-                output_after_reduce = node["outputs"][0]["shape"]  # Shape after ReduceMean
+            if sorted(normalized_axes) != [2, 3]:
+                continue
 
-                if keepdims == 1:
-                    reducemean_consumers = consumers.get(reducemean_output_name, [])
-                    if len(reducemean_consumers) != 1:
-                        continue
-                    reshape_node_dict, _ = reducemean_consumers[0]
-                    # Check if consumer is a Reshape node
-                    if reshape_node_dict["op_type"] != "Reshape":
-                        continue
+            output_after_reduce = node.outputs[0]["shape"]
 
-                    output_after_reshape = reshape_node_dict["outputs"][0]["shape"]
+            if keepdims == 1:
+                reducemean_output_name = node.outputs[0]["name"]
+                reducemean_consumers = consumers.get(reducemean_output_name, [])
 
-                    # After ReduceMean with keepdims=1, the shape should be [N, C, 1, 1]
-                    # After Reshape, it should remove these trailing 1x1 dimensions to [N, C]
-                    if (
-                        len(output_after_reduce) == 4
-                        and output_after_reduce[2] == 1
-                        and output_after_reduce[3] == 1
-                        and len(output_after_reshape)
-                        == len(input_shape) - 2  # Removed 2 dimensions
-                        and output_after_reshape[:2] == output_after_reduce[:2]
-                    ):  # First two dims (N, C) match
+                if len(reducemean_consumers) != 1:
+                    continue
 
-                        print(
-                            f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) followed by Reshape '{reshape_node_dict['name']}', replacing with GlobalAveragePool"
-                        )
+                reshape_node, _ = reducemean_consumers[0]
 
-                        # Find the index of the reshape node
-                        reshape_idx = None
-                        for i, n in enumerate(nodes_list):
-                            if n["name"] == reshape_node_dict["name"]:
-                                reshape_idx = n["_orig_idx"]
-                                break
+                if reshape_node.op_type != "Reshape":
+                    continue
 
-                        if reshape_idx is not None:
-                            # Create GlobalAveragePool node
-                            globalavgpool_node = {
-                                "op_type": "GlobalAveragePool",
-                                "name": f"GlobalAveragePool_from_{node['name']}_to_{reshape_node_dict['name']}",
-                                "attributes": {},
-                                "inputs": [node["inputs"][0]],  # Original input to ReduceMean
-                                "outputs": [
-                                    {
-                                        "name": reshape_node_dict["outputs"][0][
-                                            "name"
-                                        ],  # Output from Reshape
-                                        "shape": output_after_reshape,  # Final shape after reshape
-                                    }
-                                ],
-                            }
+                reshape_node = dag_model.nodes.get(reshape_node.name)
+                if not reshape_node:
+                    continue
 
-                            # Find the index of the ReduceMean node to replace the sequence
-                            reducemean_idx = node["_orig_idx"]
+                output_after_reshape = reshape_node.outputs[0]["shape"]
 
-                            # Mark both nodes for removal
-                            to_remove.add(reducemean_idx)
-                            to_remove.add(reshape_idx)
-
-                            # Add the new GlobalAveragePool node in place of the first removed node
-                            replacements[reducemean_idx] = globalavgpool_node
-                elif keepdims == 0:
-                    # Check if the output shape after ReduceMean is what we expect for GlobalAveragePool
-                    # Input shape is [N, C, H, W], expected output is [N, C] (with keepdims=0)
-                    if (
-                        len(input_shape) == 4
-                        and len(output_after_reduce) == 2
-                        and input_shape[0] == output_after_reduce[0]  # Batch dimension matches
-                        and input_shape[1] == output_after_reduce[1]
-                    ):  # Channel dimension matches
-
-                        print(
-                            f"Found ReduceMean '{node['name']}' with axes {axes} (normalized to {normalized_axes}) and keepdims=0, replacing with GlobalAveragePool"
-                        )
-
-                        # Create GlobalAveragePool node
-                        globalavgpool_node = {
-                            "op_type": "GlobalAveragePool",
-                            "name": f"GlobalAveragePool_from_{node['name']}_keepdims0",
-                            "attributes": {},
-                            "inputs": [node["inputs"][0]],  # Original input to ReduceMean
-                            "outputs": [node["outputs"][0]],  # Same output as the ReduceMean node
+                if (
+                    len(output_after_reduce) == 4
+                    and output_after_reduce[2] == 1
+                    and output_after_reduce[3] == 1
+                    and len(output_after_reshape) == len(input_shape) - 2
+                    and output_after_reshape[:2] == output_after_reduce[:2]
+                ):
+                    matches.append(
+                        {
+                            "reducemean_node": node,
+                            "reshape_node": reshape_node,
+                            "case": "keepdims_1",
                         }
+                    )
 
-                        # Find the index of the ReduceMean node to replace
-                        reducemean_idx = node["_orig_idx"]
+            elif keepdims == 0:
+                if (
+                    len(input_shape) == 4
+                    and len(output_after_reduce) == 2
+                    and input_shape[0] == output_after_reduce[0]
+                    and input_shape[1] == output_after_reduce[1]
+                ):
+                    matches.append(
+                        {
+                            "reducemean_node": node,
+                            "reshape_node": None,
+                            "case": "keepdims_0",
+                        }
+                    )
 
-                        # Mark the ReduceMean node for removal
-                        to_remove.add(reducemean_idx)
-
-                        # Add the new GlobalAveragePool node in place of the ReduceMean
-                        replacements[reducemean_idx] = globalavgpool_node
-
-        # Build new nodes list
-        new_nodes_list = []
-        for idx, node in enumerate(nodes_list):
-            if idx in to_remove:
-                # If this is the first node in the sequence, add the replacement
-                if idx in replacements:
-                    new_nodes_list.append(replacements[idx])
-                # Otherwise skip (second node in sequence)
-            else:
-                new_nodes_list.append(node)
-
-        for node in new_nodes_list:
-            if "_orig_idx" in node:
-                del node["_orig_idx"]
-
-        replaced_count = len([idx for idx in to_remove if idx in replacements])
-        print(
-            f"Replaced {replaced_count} ReduceMean+Reshape sequences with GlobalAveragePool nodes"
-        )
-
-        # Convert back to DAGBasedModel format
-        updated_nodes = {}
-        for node in new_nodes_list:
-            new_node_obj = Node(
-                op_type=node["op_type"],
-                name=node["name"],
-                attributes=node["attributes"],
-                inputs=node["inputs"],
-                outputs=node["outputs"],
-            )
-            updated_nodes[node["name"]] = new_node_obj
-        vk_model.nodes = updated_nodes
-
-        return vk_model
+        return matches
 
     @staticmethod
-    def unify_reduce_operators(vk_model):
-        """Unify all reduceXX operators into a single reduce operator with the specific operation stored in attributes."""
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(vk_model)
+    def fold_reducemean_reshape(dag_model, match) -> bool:
+        """Fold matched ReduceMean + Reshape pattern into GlobalAveragePool."""
+        reducemean_node = match["reducemean_node"]
+        reshape_node = match["reshape_node"]
+        case = match["case"]
 
-        # Convert DAG nodes to a list format temporarily for processing
-        nodes_list = []
-        for name, node_obj in vk_model.nodes.items():
-            node_dict = {
-                "op_type": node_obj.op_type,
-                "name": node_obj.name,
-                "attributes": node_obj.attributes,
-                "inputs": node_obj.inputs,
-                "outputs": node_obj.outputs,
-            }
-            nodes_list.append(node_dict)
+        globalavgpool_node = Node(
+            op_type="GlobalAveragePool",
+            name=f"GlobalAveragePool_from_{reducemean_node.name}"
+            + (f"_to_{reshape_node.name}" if reshape_node else "_keepdims0"),
+            attributes={},
+            inputs=[reducemean_node.inputs[0]],
+            outputs=[],
+        )
 
-        # Add temporary index to each node dict
-        for idx, node in enumerate(nodes_list):
-            node["_orig_idx"] = idx
+        if case == "keepdims_1" and reshape_node:
+            globalavgpool_node.outputs = [
+                {
+                    "name": reshape_node.outputs[0]["name"],
+                    "shape": reshape_node.outputs[0]["shape"],
+                }
+            ]
+            del dag_model.nodes[reshape_node.name]
+        elif case == "keepdims_0":
+            globalavgpool_node.outputs = [reducemean_node.outputs[0]]
 
-        to_remove = set()
-        replacements = {}
+        del dag_model.nodes[reducemean_node.name]
+        dag_model.nodes[globalavgpool_node.name] = globalavgpool_node
 
-        # Define mapping from ONNX reduce operations to internal representation
+        print(
+            f"Replaced ReduceMean '{reducemean_node.name}'"
+            + (f" and Reshape '{reshape_node.name}'" if reshape_node else "")
+            + " with GlobalAveragePool"
+        )
+        return True
+
+    @staticmethod
+    def match_reduce_ops(dag_model):
+        """Match all reduceXX operators for unification."""
+        matches = []
+
         reduce_ops_map = {
             "ReduceSum": "sum",
             "ReduceMean": "mean",
@@ -892,29 +948,22 @@ class FusionOptimizer:
             "ReduceLogSumExp": "log_sum_exp",
         }
 
-        for node in nodes_list:
-            op_type = node["op_type"]
+        for node in dag_model.nodes.values():
+            op_type = node.op_type
 
-            # Check if this is a reduce operation
             if op_type not in reduce_ops_map:
                 continue
 
-            # Extract axes - could be in attributes (opset13) or inputs (opset18+)
             axes = []
-            noop_with_empty_axes = node["attributes"].get(
-                "noop_with_empty_axes", 0
-            )  # Default is 0 in ONNX
+            noop_with_empty_axes = node.attributes.get("noop_with_empty_axes", 0)
 
-            # Check if axes is in attributes (opset13 style)
-            if "axes" in node["attributes"]:
-                axes = node["attributes"]["axes"]
+            if "axes" in node.attributes:
+                axes = node.attributes["axes"]
             else:
-                # Check if axes is in inputs (opset18+ style)
-                # Axes would be the second input (after the data input)
-                if len(node["inputs"]) > 1:
-                    axes_input_name = node["inputs"][1]["name"]
-                    if axes_input_name in vk_model.initializers:
-                        axes_tensor = vk_model.initializers[axes_input_name]
+                if len(node.inputs) > 1:
+                    axes_input_name = node.inputs[1]["name"]
+                    if axes_input_name in dag_model.initializers:
+                        axes_tensor = dag_model.initializers[axes_input_name]
                         axes_array = numpy_helper.to_array(axes_tensor)
                         axes = (
                             axes_array.tolist()
@@ -922,24 +971,14 @@ class FusionOptimizer:
                             else list(axes_array)
                         )
 
-            print(
-                f"Unifying {op_type} '{node['name']}' with axes {axes} and noop_with_empty_axes={noop_with_empty_axes}"
-            )
-
-            # Handle empty axes according to ONNX specification
             if len(axes) == 0:
                 if noop_with_empty_axes == 1:
-                    # If noop_with_empty_axes is true and axes is empty, this performs no reduction
-                    # Skip this node instead of removing it unnecessarily
                     continue
                 elif noop_with_empty_axes == 0:
-                    # If noop_with_empty_axes is false and axes is empty, this reduces all axes
-                    # Get input shape to determine all axes
-                    input_shape = node["inputs"][0]["shape"]
-                    axes = list(range(len(input_shape)))  # Reduce over all dimensions
+                    input_shape = node.inputs[0]["shape"]
+                    axes = list(range(len(input_shape)))
 
-            # Normalize negative axes to positive
-            input_shape = node["inputs"][0]["shape"]
+            input_shape = node.inputs[0]["shape"]
             normalized_axes = []
             for ax in axes:
                 if ax < 0:
@@ -947,61 +986,139 @@ class FusionOptimizer:
                 else:
                     normalized_axes.append(ax)
 
-            # Create unified reduce node
-            reduce_node = {
-                "op_type": "Reduce",
-                "name": node["name"],
-                "attributes": {
+            matches.append(
+                {
+                    "node": node,
                     "reduce_op": reduce_ops_map[op_type],
-                    "axes": normalized_axes,
-                    "keepdims": node["attributes"].get("keepdims", 1),
-                },
-                "inputs": [node["inputs"][0]],  # Data input remains the same
-                "outputs": node["outputs"][:],  # Copy outputs
-            }
-
-            # Remove axes from inputs if it was there (opset18+)
-            # Keep only the data input
-            if len(node["inputs"]) > 1:
-                # Remove the axes input, keeping only the data input
-                reduce_node["inputs"] = [node["inputs"][0]]
-
-            # Mark original node for removal and add replacement
-            original_idx = node["_orig_idx"]
-            to_remove.add(original_idx)
-            replacements[original_idx] = reduce_node
-
-        # Build new nodes list
-        new_nodes_list = []
-        for idx, node in enumerate(nodes_list):
-            if idx in to_remove:
-                # If this is a node to be replaced, add the replacement
-                if idx in replacements:
-                    new_nodes_list.append(replacements[idx])
-            else:
-                new_nodes_list.append(node)
-
-        for node in new_nodes_list:
-            if "_orig_idx" in node:
-                del node["_orig_idx"]
-
-        replaced_count = len([idx for idx in to_remove if idx in replacements])
-        print(f"Unified {replaced_count} reduceXX operations into Reduce nodes")
-
-        # Convert back to DAGBasedModel format
-        updated_nodes = {}
-        for node in new_nodes_list:
-            new_node_obj = Node(
-                op_type=node["op_type"],
-                name=node["name"],
-                attributes=node["attributes"],
-                inputs=node["inputs"],
-                outputs=node["outputs"],
+                    "normalized_axes": normalized_axes,
+                }
             )
-            updated_nodes[node["name"]] = new_node_obj
-        vk_model.nodes = updated_nodes
 
-        return vk_model
+        return matches
+
+    @staticmethod
+    def fold_reduce_ops(dag_model, match) -> bool:
+        """Fold matched reduce operator into unified Reduce node."""
+        node = match["node"]
+        reduce_op = match["reduce_op"]
+        normalized_axes = match["normalized_axes"]
+
+        reduce_attributes = {
+            "reduce_op": reduce_op,
+            "axes": normalized_axes,
+            "keepdims": node.attributes.get("keepdims", 1),
+        }
+
+        reduce_inputs = [node.inputs[0]]
+
+        reduce_node = Node(
+            op_type="Reduce",
+            name=node.name,
+            attributes=reduce_attributes,
+            inputs=reduce_inputs,
+            outputs=node.outputs[:],
+        )
+
+        del dag_model.nodes[node.name]
+        dag_model.nodes[reduce_node.name] = reduce_node
+
+        print(f"Unified {node.op_type} '{node.name}' into Reduce node")
+        return True
+
+    @staticmethod
+    def match_add_bias(dag_model):
+        """
+        Match Conv + Add pattern where Add adds bias to Conv output.
+
+        Conditions:
+        1. Conv has no bias (only 2 inputs: data and weights)
+        2. Add's second input is a 1D constant tensor (bias)
+        3. Add has only one consumer or the Conv output is only used by Add
+        """
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        for node in dag_model.nodes.values():
+            if node.op_type != "Conv":
+                continue
+
+            if len(node.inputs) != 2:
+                continue
+
+            conv_out_name = node.outputs[0]["name"]
+            conv_consumers = consumers.get(conv_out_name, [])
+
+            if len(conv_consumers) != 1:
+                continue
+
+            add_node, _ = conv_consumers[0]
+
+            if add_node.op_type != "Add":
+                continue
+
+            if len(add_node.inputs) != 2:
+                continue
+
+            bias_input = None
+            for inp in add_node.inputs:
+                if inp["name"] != conv_out_name:
+                    bias_input = inp
+                    break
+
+            if not bias_input:
+                continue
+
+            bias_name = bias_input["name"]
+            if bias_name not in dag_model.initializers:
+                continue
+
+            bias_tensor = dag_model.initializers[bias_name]
+            bias_array = numpy_helper.to_array(bias_tensor)
+
+            if len(bias_array.shape) != 1:
+                continue
+
+            matches.append(
+                {
+                    "conv_node": node,
+                    "add_node": add_node,
+                    "bias_name": bias_name,
+                    "bias_array": bias_array,
+                }
+            )
+
+        return matches
+
+    @staticmethod
+    def fold_add_bias(dag_model, match) -> bool:
+        """Fold Conv + Add(bias) into Conv with bias."""
+        conv_node = match["conv_node"]
+        add_node = match["add_node"]
+        # bias_name = match["bias_name"]
+        bias_array = match["bias_array"]
+
+        new_bias_name = f"{conv_node.name}_bias"
+        bias_tensor = numpy_helper.from_array(bias_array, new_bias_name)
+        dag_model.initializers[new_bias_name] = bias_tensor
+
+        fused = Node(
+            op_type=conv_node.op_type,
+            name=conv_node.name,
+            attributes=dict(conv_node.attributes),
+            inputs=[
+                conv_node.inputs[0],
+                conv_node.inputs[1],
+                {"name": new_bias_name, "shape": list(bias_array.shape)},
+            ],
+            outputs=add_node.outputs,
+        )
+
+        del dag_model.nodes[conv_node.name]
+        del dag_model.nodes[add_node.name]
+        dag_model.nodes[fused.name] = fused
+
+        print(f"Fused Conv '{conv_node.name}' + Add bias into Conv with bias")
+        return True
 
 
 class InitializerMerger:
