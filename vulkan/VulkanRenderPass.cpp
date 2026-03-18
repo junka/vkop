@@ -1,4 +1,5 @@
 #include "vulkan/VulkanRenderPass.hpp"
+#include "vulkan/vulkan_core.h"
 
 namespace vkop {
 VulkanRenderPass::VulkanRenderPass(VkDevice device, VkFormat format)
@@ -72,21 +73,21 @@ void VulkanRenderPass::begin(VkCommandBuffer commandBuffer,
     vkCmdBeginRenderPass(commandBuffer, &renderpass_begininfo,
                          VK_SUBPASS_CONTENTS_INLINE);
 
-    // VkViewport viewport = {};
-    // viewport.x = 0.0F;
-    // viewport.y = 0.0F;
-    // viewport.width = static_cast<float>(width);
-    // viewport.height = static_cast<float>(height);
-    // viewport.minDepth = 0.0F;
-    // viewport.maxDepth = 1.0F;
-    // vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
+    VkViewport viewport = {};
+    viewport.x = 0.0F;
+    viewport.y = 0.0F;
+    viewport.width = static_cast<float>(width);
+    viewport.height = static_cast<float>(height);
+    viewport.minDepth = 0.0F;
+    viewport.maxDepth = 1.0F;
+    vkCmdSetViewport(commandBuffer, 0, 1, &viewport);
 
-    // VkRect2D scissor = {};
-    // scissor.offset.x = 0;
-    // scissor.offset.y = 0;
-    // scissor.extent.width = width;
-    // scissor.extent.height = height;
-    // vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
+    VkRect2D scissor = {};
+    scissor.offset.x = 0;
+    scissor.offset.y = 0;
+    scissor.extent.width = width;
+    scissor.extent.height = height;
+    vkCmdSetScissor(commandBuffer, 0, 1, &scissor);
 }
 
 void VulkanRenderPass::end(VkCommandBuffer commandBuffer) {

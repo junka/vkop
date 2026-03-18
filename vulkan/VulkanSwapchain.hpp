@@ -9,8 +9,9 @@ namespace vkop {
 
 class VulkanSwapchain {
   public:
-    VulkanSwapchain(std::shared_ptr<VulkanDevice> &vdev, VkSurfaceKHR surface);
-    ~VulkanSwapchain() = default;
+    VulkanSwapchain(std::shared_ptr<VulkanDevice> &vdev, VkSurfaceKHR surface,
+                    VkExtent2D extent);
+    ~VulkanSwapchain();
 
     VkSwapchainKHR getSwapchain() const { return swapchain_; }
     std::vector<VkImage> getImages() const { return images_; }
@@ -19,6 +20,8 @@ class VulkanSwapchain {
 
     VkSurfaceFormatKHR getSurfaceFormat() const { return surface_format_; }
 
+    VkExtent2D getExtent() const { return extent_; }
+
   private:
     std::shared_ptr<VulkanDevice> vdev_;
     VkSwapchainKHR swapchain_ = VK_NULL_HANDLE;
@@ -26,6 +29,7 @@ class VulkanSwapchain {
     VkSurfaceFormatKHR surface_format_;
     std::vector<VkImage> images_;
     std::vector<VkImageView> image_views_;
+    VkExtent2D extent_;
 
     void createSwapImages();
 };

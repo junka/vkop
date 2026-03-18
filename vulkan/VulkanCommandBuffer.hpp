@@ -3,6 +3,7 @@
 #define SRC_VULKANCOMMANDBUFFER_HPP_
 
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanSemaphore.hpp"
 #include "vulkan/vulkan_core.h"
@@ -27,6 +28,9 @@ class VulkanCommandBuffer {
     void end();
 
     void bind(VulkanPipeline &pipeline, VkDescriptorSet descriptor_set);
+    void bindGraphics(VulkanGraphicsPipeline &pipeline,
+                      VkDescriptorSet descriptor_set, VkBuffer vertex_buffer,
+                      VkBuffer indexbuffer);
 
     // Submit the command buffer to a queue
     uint64_t submit(const std::shared_ptr<VulkanQueue> &queue);

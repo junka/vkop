@@ -116,7 +116,11 @@ namespace vkop {
     PFN(vkCreateFramebuffer)                                                   \
     PFN(vkDestroyFramebuffer)                                                  \
     PFN(vkCmdSetViewport)                                                      \
-    PFN(vkAcquireNextImageKHR)
+    PFN(vkAcquireNextImageKHR)                                                 \
+    PFN(vkCreateGraphicsPipelines)                                             \
+    PFN(vkCmdDraw)                                                             \
+    PFN(vkCmdBindVertexBuffers)                                                \
+    PFN(vkCmdBindIndexBuffer)
 
 class VulkanLib {
   public:

@@ -101,6 +101,10 @@ class VulkanDevice {
     getComputeQueueFamilyIndex() const {
         return computeQueueIdxs_;
     }
+    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
+    getGraphicsQueueFamilyIndex() const {
+        return graphicsQueueIdxs_;
+    }
 
     std::shared_ptr<VulkanQueue> getGraphicsQueues(uint32_t idx = 0) const {
         int offset = idx / 2;

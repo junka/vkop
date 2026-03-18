@@ -24,8 +24,28 @@ VulkanCommandBuffer::VulkanCommandBuffer(
 void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
                                VkDescriptorSet descriptor_set) {
     vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                      pipeline.getComputePipeline());
+                      pipeline.getPipeline());
     vkCmdBindDescriptorSets(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                            pipeline.getPipelineLayout(), 0, 1, &descriptor_set,
+                            0, nullptr);
+}
+
+void VulkanCommandBuffer::bindGraphics(VulkanGraphicsPipeline &pipeline,
+                                       VkDescriptorSet descriptor_set,
+                                       VkBuffer vertex_buffer,
+                                       VkBuffer indexbuffer) {
+    vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                      pipeline.getPipeline());
+    if (vertex_buffer) {
+        VkBuffer vertex_buffers[] = {vertex_buffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(m_commandBuffer_, 0, 1, vertex_buffers, offsets);
+    }
+    if (indexbuffer) {
+        vkCmdBindIndexBuffer(m_commandBuffer_, indexbuffer, 0,
+                             VK_INDEX_TYPE_UINT32);
+    }
+    vkCmdBindDescriptorSets(m_commandBuffer_, VK_PIPELINE_BIND_POINT_GRAPHICS,
                             pipeline.getPipelineLayout(), 0, 1, &descriptor_set,
                             0, nullptr);
 }

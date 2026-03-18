@@ -7,16 +7,33 @@
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanRenderPass.hpp"
+#include "vulkan/VulkanGraphicsPipeline.hpp"
 
 #include "include/logger.hpp"
+#include "vulkan/vulkan_core.h"
 #include <thread>
+#include <csignal>
+
 
 #ifdef USE_GLFW
 #include <GLFW/glfw3.h>
 #endif
 
+extern "C" {
+#define STB_IMAGE_IMPLEMENTATION
+#include "include/stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "include/stb_image_resize2.h"
+}
+
+
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
+
+extern unsigned char image_spv[];
+extern unsigned int image_spv_len;
+extern unsigned char quad_spv[];
+extern unsigned int quad_spv_len;
 
 namespace {
 #ifdef USE_GLFW
@@ -43,14 +60,14 @@ bool checkDisplayServer() {
     return true;
 }
 
-bool init_window(GLFWwindow** out_window) {
+bool init_window(GLFWwindow** out_window, int width, int height) {
     if (!checkDisplayServer()) {
         return false;
     }
     glfwInit();
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     glfwWindowHint(GLFW_RESIZABLE, GLFW_FALSE);
-    GLFWwindow* window = glfwCreateWindow(800, 600, "Vulkan", nullptr, nullptr);
+    GLFWwindow* window = glfwCreateWindow(width, height, "Vulkan", nullptr, nullptr);
     if (!window) {
         LOG_ERROR("Failed to create GLFW window");
 
@@ -75,18 +92,77 @@ bool init_window(GLFWwindow** out_window) {
     std::cout << "GLFW window created successfully" << std::endl;
     return true;
 }
+
+void cleanup(GLFWwindow* window) {
+    glfwDestroyWindow(window);
+
+    glfwTerminate();
+}
+
 #endif
 
 
-void draw_circle() {
-    
+std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> dev, const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool, std::string &filepath) {
+    int texture_width;
+    int texture_height;
+    int texture_channels;
+
+    auto *pixels = stbi_load(filepath.c_str(), &texture_width, &texture_height, &texture_channels, STBI_rgb_alpha);
+    auto image_size = texture_width * texture_height * 4;
+
+    VkExtent3D dim = {static_cast<uint32_t>(texture_width), static_cast<uint32_t>(texture_height), 1};
+
+    auto texture = std::make_shared<vkop::VulkanImage>(
+        dev,
+        dim,
+        1,
+        VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_FORMAT_R8G8B8A8_UNORM
+    );
+
+    vkop::VulkanCommandBuffer cmd(cmdpool);
+
+    auto stpool = cmdpool->getStagingBufferPool();
+    auto b = stpool->allocate(image_size);
+    if (!b) {
+        return nullptr;
+    }
+    memcpy(b->ptr, pixels, image_size);
+
+    cmd.begin();
+    texture->copyBufferToImage(cmd.get(), b->buffer, b->offset);
+    texture->readBarrier(cmd.get());
+    cmd.end();
+    cmd.submit(dev->getComputeQueue());
+    cmd.wait();
+
+    stbi_image_free(pixels);
+
+    return texture;
 }
 
 
-}
+GLFWwindow* window = nullptr;
+// void signalHandler(int sig) {
+//     (void)sig;
+// #ifdef USE_GLFW
+//     if (window) {
+//         glfwSetWindowShouldClose(window, true);
+//         cleanup(window);
+//     }
+// #endif
+// }
 
+} // namespace
 
-int main() {
+int main(int argc, const char *argv[]) {
+    if (argc < 2) {
+        printf("Usage: %s <image_path>\n", argv[0]);
+        return -1;
+    }
+    // std::signal(SIGINT, signalHandler);
+    std::string image_path = argv[1];
+
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
     const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -95,13 +171,16 @@ int main() {
         printf("Please set env VK_ICD_FILENAMES for a valid GPU\n");
         return -1;
     }
-    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
+    auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev, false);
 
     printf("using %s\n",dev->getDeviceName().c_str());
     
+    auto texture = createTexture(dev, cmdpool, image_path);
+
+    uint32_t width = texture->getImageWidth();
+    uint32_t height = texture->getImageHeight();
 #ifdef USE_GLFW
-    GLFWwindow* window = nullptr;
-    if (!init_window(&window)) {
+    if (!init_window(&window, width, height)) {
         std::cerr << "\nRunning in headless mode (no window)" << std::endl;
         std::cerr << "To enable window support:" << std::endl;
         std::cerr << "1. Ensure you have a display server running (X11 or Wayland)" << std::endl;
@@ -136,12 +215,14 @@ int main() {
         throw std::runtime_error("Failed to create window surface");
     }
 
-    uint32_t width = 800;
-    uint32_t height = 600;
     VkExtent3D dim = {width, height, 1};
+
+    glfwGetFramebufferSize(window, reinterpret_cast<int*>(&width), reinterpret_cast<int*>(&height));
+    printf("frame buffer size: %d, %d\n", width, height);
+
     vkop::VulkanSurface vks(VulkanInstance::getVulkanInstance().getInstance(),
                                 dev->getPhysicalDevice(), surface);
-    vkop::VulkanSwapchain swapchain(dev, vks.getSurface());
+    vkop::VulkanSwapchain swapchain(dev, vks.getSurface(), VkExtent2D{width, height});
 
     auto images = swapchain.getImages();
     auto image_views = swapchain.getImageViews();
@@ -149,8 +230,6 @@ int main() {
     VkDevice device = dev->getLogicalDevice();
 
     auto graphics_queue = dev->getGraphicsQueues();
-
-    glfwGetFramebufferSize(window, reinterpret_cast<int*>(&width), reinterpret_cast<int*>(&height));
 
     VkFormat format = swapchain.getSurfaceFormat().format;
 
@@ -161,6 +240,30 @@ int main() {
         framebuffers.push_back(std::make_shared<vkop::VulkanFrameBuffer>(dev, render_pass, image_view, dim.width, dim.height));
     }
 
+    std::vector<VkDescriptorType> types = {
+        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER
+    };
+    auto pipeline = std::make_shared<vkop::VulkanGraphicsPipeline>(device, render_pass.getRenderPass(), types, swapchain.getExtent(), reinterpret_cast<const uint32_t *>(quad_spv), quad_spv_len, reinterpret_cast<const uint32_t *>(image_spv), image_spv_len);
+
+    auto* ds = pipeline->allocDescriptorSets();
+
+    auto image_info = texture->getDescriptorInfo();
+    auto* img_info_ptr = std::get<VkDescriptorImageInfo*>(image_info);
+
+    VkWriteDescriptorSet write = {};
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = ds;
+    write.dstBinding = 0;
+    write.dstArrayElement = 0;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    write.descriptorCount = 1;
+    write.pImageInfo = img_info_ptr;
+
+    pipeline->updateDescriptorSets({write});
+
+    auto image_semaphore = std::make_unique<vkop::VulkanSemaphore>(dev->getLogicalDevice());
+    auto render_complete = std::make_unique<vkop::VulkanSemaphore>(dev->getLogicalDevice());
+
     printf("Starting render loop...\n");
 
     while (!glfwWindowShouldClose(window)) {
@@ -168,11 +271,11 @@ int main() {
 
         uint32_t image_index = 0;
         VkResult acquire_ret = vkop::vkAcquireNextImageKHR(
-            device, 
+            device,
             swapchain.getSwapchain(), 
-            UINT64_MAX, 
-            VK_NULL_HANDLE, 
-            VK_NULL_HANDLE, 
+            1000000000,
+            image_semaphore->getSemaphore(),
+            VK_NULL_HANDLE,
             &image_index
         );
 
@@ -184,25 +287,33 @@ int main() {
             throw std::runtime_error("Failed to acquire swap chain image!");
         }
 
-
         vkop::VulkanCommandBuffer cmd(cmdpool);
         cmd.begin();
 
         render_pass.begin(cmd.get(), framebuffers[image_index]->getFrameBuffer(), width, height);
 
-        draw_circle();
+        cmd.bindGraphics(*pipeline, ds, nullptr, nullptr);
 
+        vkop::vkCmdDraw(cmd.get(), 3, 1, 0, 0);
         render_pass.end(cmd.get());
-        
+
         cmd.end();
-        cmd.submit(dev->getComputeQueue());
+        cmd.addWait(image_semaphore->getSemaphore(), 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        auto subinfo = cmd.buildSubmitInfo();
+        std::vector<VkSubmitInfo> submit_infos;
+        submit_infos.push_back(subinfo);
+        cmd.submit(dev->getGraphicsQueues(), submit_infos);
         cmd.wait();
 
+        // dev->wait_all_done();
+
+        // last present the display
+        auto* sem = cmd.getSignalSemaphore();
         VkPresentInfoKHR present_info = {};
         auto *swapch = swapchain.getSwapchain();
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
-        present_info.waitSemaphoreCount = 0;
-        present_info.pWaitSemaphores = nullptr;
+        present_info.waitSemaphoreCount = 1;
+        present_info.pWaitSemaphores = &sem;
         present_info.swapchainCount = 1;
         present_info.pSwapchains = &swapch;
         present_info.pImageIndices = &image_index;
@@ -218,8 +329,8 @@ int main() {
         }
     }
 
-    
-    std::this_thread::sleep_for(std::chrono::seconds(5));
+    cleanup(window);
+    std::this_thread::sleep_for(std::chrono::seconds(1));
 
 #else
     std::cout << "GLFW not enabled, running in headless mode" << std::endl;

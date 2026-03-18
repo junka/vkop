@@ -12,7 +12,8 @@
 namespace vkop {
 class VulkanCommandPool {
   public:
-    explicit VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev);
+    explicit VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev,
+                               bool compute = true);
     ~VulkanCommandPool();
 
     void reset(VkCommandPoolResetFlags flags = 0);

@@ -5,9 +5,16 @@
 
 namespace vkop {
 
-VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev)
+VulkanCommandPool::VulkanCommandPool(std::shared_ptr<VulkanDevice> &vdev,
+                                     bool compute)
     : m_vdev_(vdev) {
-    for (auto [qfidx, qcnt, qflags] : vdev->getComputeQueueFamilyIndex()) {
+    std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> indexes;
+    if (compute) {
+        indexes = vdev->getComputeQueueFamilyIndex();
+    } else {
+        indexes = vdev->getGraphicsQueueFamilyIndex();
+    }
+    for (auto [qfidx, qcnt, qflags] : indexes) {
         printf("create command pool for queue family index %d\n", qfidx);
         createCommandPool(qfidx);
     }

@@ -14,7 +14,7 @@ class VulkanPipeline {
                    int codesize);
     ~VulkanPipeline();
 
-    VkPipeline getComputePipeline() const { return m_pipeline_; }
+    VkPipeline getPipeline() const { return m_pipeline_; }
     VkPipelineLayout getPipelineLayout() const { return m_pipelineLayout_; }
 
     VkDescriptorSet allocDescriptorSets();
