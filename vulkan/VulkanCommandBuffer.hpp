@@ -46,11 +46,24 @@ class VulkanCommandBuffer {
         m_waitsems_.clear();
         m_waitstages_.clear();
         m_waitvalues_.clear();
+        m_sigsems_.clear();
+        m_sigvalues_.clear();
     }
     void
     addWait(VkSemaphore sem, uint64_t value,
             VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
         m_waitsems_.emplace_back(sem);
+        if (m_support_timeline_) {
+            m_waitvalues_.emplace_back(value);
+        }
+        m_waitstages_.emplace_back(stage);
+    }
+
+    void
+    addWait(VkSemaphore sem, uint64_t value, VkSemaphore sigsem,
+            VkPipelineStageFlags stage = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT) {
+        m_waitsems_.emplace_back(sem);
+        m_sigsems_.emplace_back(sigsem);
         if (m_support_timeline_) {
             m_waitvalues_.emplace_back(value);
         }
@@ -68,7 +81,9 @@ class VulkanCommandBuffer {
 
     void exec(const std::shared_ptr<VulkanQueue> &queue);
 
-    VkSemaphore getSignalSemaphore() const { return m_signalsem_value_; }
+    VkSemaphore getSignalSemaphore() const {
+        return m_signalsem_->getSemaphore();
+    }
     uint64_t getSignalValue() const { return m_signalValue_; }
 
   private:
@@ -81,9 +96,10 @@ class VulkanCommandBuffer {
     VkCommandBuffer m_commandBuffer_ = VK_NULL_HANDLE;
 
     std::unique_ptr<VulkanSemaphore> m_signalsem_ = nullptr;
-    VkSemaphore m_signalsem_value_ = VK_NULL_HANDLE;
     std::vector<VkSemaphore> m_waitsems_;
+    std::vector<VkSemaphore> m_sigsems_;
     std::vector<uint64_t> m_waitvalues_;
+    std::vector<uint64_t> m_sigvalues_;
     std::vector<VkPipelineStageFlags> m_waitstages_;
     VkTimelineSemaphoreSubmitInfo m_timeline_submit_info_ = {};
 

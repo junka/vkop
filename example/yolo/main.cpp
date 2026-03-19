@@ -231,11 +231,15 @@ int main(int argc, char *argv[]) {
     rt->ReadResult();
     if (precision == 0) {
         auto out = vkop::core::as_tensor<float>(rt->GetOutput());
-        out->print_tensor();
+        if (tracenodename.size() > 0) {
+            out->print_tensor();
+        }
         postProcess(out, image_h, image_w);
     } else if (precision == 1) {
         auto out = vkop::core::as_tensor<uint16_t>(rt->GetOutput());
-        out->print_tensor();
+        if (tracenodename.size() > 0) {
+            out->print_tensor();
+        }
         postProcess(out, image_h, image_w);
     }
     

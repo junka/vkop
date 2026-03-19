@@ -18,7 +18,6 @@ VulkanCommandBuffer::VulkanCommandBuffer(
 
     m_signalsem_ = std::make_unique<VulkanSemaphore>(
         device->getLogicalDevice(), device->is_support_timeline_semaphore());
-    m_signalsem_value_ = m_signalsem_->getSemaphore();
 }
 
 void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
@@ -105,31 +104,7 @@ VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
         m_signalValue_ = 0;
     }
 
-    VkSubmitInfo submit_info{};
-    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &m_signalsem_value_;
-    submit_info.commandBufferCount = 1;
-    submit_info.pCommandBuffers = &m_commandBuffer_;
-
-    submit_info.waitSemaphoreCount = static_cast<uint32_t>(m_waitsems_.size());
-    submit_info.pWaitSemaphores =
-        m_waitsems_.empty() ? nullptr : m_waitsems_.data();
-    submit_info.pWaitDstStageMask =
-        m_waitstages_.empty() ? nullptr : m_waitstages_.data();
-    VkTimelineSemaphoreSubmitInfo timeline_submit_info{};
-    if (m_support_timeline_) {
-        timeline_submit_info.sType =
-            VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
-        timeline_submit_info.waitSemaphoreValueCount =
-            static_cast<uint32_t>(m_waitvalues_.size());
-        timeline_submit_info.pWaitSemaphoreValues =
-            m_waitvalues_.empty() ? nullptr : m_waitvalues_.data();
-        timeline_submit_info.signalSemaphoreValueCount = 1;
-        timeline_submit_info.pSignalSemaphoreValues = &m_signalValue_;
-
-        submit_info.pNext = &timeline_submit_info;
-    }
+    auto submit_info = buildSubmitInfo();
 
     auto ret =
         vkQueueSubmit(queue->getQueue(), 1, &submit_info, VK_NULL_HANDLE);
@@ -155,9 +130,12 @@ void VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue,
 VkSubmitInfo VulkanCommandBuffer::buildSubmitInfo() {
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-    // signal 1 sem, or 0 if same queue
-    submit_info.signalSemaphoreCount = 1;
-    submit_info.pSignalSemaphores = &m_signalsem_value_;
+
+    auto *signalsem_value = m_signalsem_->getSemaphore();
+    m_sigsems_.push_back(signalsem_value);
+    submit_info.signalSemaphoreCount = static_cast<uint32_t>(m_sigsems_.size());
+    submit_info.pSignalSemaphores = m_sigsems_.data();
+
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &m_commandBuffer_;
 
@@ -176,8 +154,10 @@ VkSubmitInfo VulkanCommandBuffer::buildSubmitInfo() {
             static_cast<uint32_t>(m_waitvalues_.size());
         m_timeline_submit_info_.pWaitSemaphoreValues =
             m_waitvalues_.empty() ? nullptr : m_waitvalues_.data();
-        m_timeline_submit_info_.signalSemaphoreValueCount = 1;
-        m_timeline_submit_info_.pSignalSemaphoreValues = &m_signalValue_;
+        m_timeline_submit_info_.signalSemaphoreValueCount =
+            static_cast<uint32_t>(m_sigsems_.size());
+        m_sigvalues_.resize(m_sigsems_.size(), m_signalValue_);
+        m_timeline_submit_info_.pSignalSemaphoreValues = m_sigvalues_.data();
         submit_info.pNext = &m_timeline_submit_info_;
     }
 
@@ -187,14 +167,19 @@ VkSubmitInfo VulkanCommandBuffer::buildSubmitInfo() {
 int VulkanCommandBuffer::wait() {
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
 
+    m_waitsems_.pop_back();
+    // this structure can not accept binary semaphore
+
+    auto *signalsem = m_signalsem_->getSemaphore();
     VkSemaphoreWaitInfo wait_info{};
     wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
     wait_info.semaphoreCount = 1;
-    wait_info.pSemaphores = &m_signalsem_value_;
+    wait_info.pSemaphores = &signalsem;
+
     if (m_support_timeline_) {
         uint64_t cur_time;
-        vkGetSemaphoreCounterValue(device->getLogicalDevice(),
-                                   m_signalsem_value_, &cur_time);
+        vkGetSemaphoreCounterValue(device->getLogicalDevice(), signalsem,
+                                   &cur_time);
         if (cur_time > m_signalValue_) {
             return 0;
         }

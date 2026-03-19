@@ -11,8 +11,9 @@
 
 #include "include/logger.hpp"
 #include "vulkan/vulkan_core.h"
-#include <thread>
+#include <cstdio>
 #include <csignal>
+#include <thread>
 
 
 #ifdef USE_GLFW
@@ -94,12 +95,72 @@ bool init_window(GLFWwindow** out_window, int width, int height) {
 }
 
 void cleanup(GLFWwindow* window) {
-    glfwDestroyWindow(window);
-
+    if (window) {
+        glfwSetWindowShouldClose(window, GLFW_TRUE);
+        glfwPollEvents();
+        glfwDestroyWindow(window);
+    }
     glfwTerminate();
 }
 
 #endif
+
+
+void drawBoundingBox(unsigned char* pixels, int width, int height, int channels,
+                     int x1, int y1, int x2, int y2,
+                     unsigned char r = 255, unsigned char g = 0, unsigned char b = 0, int thickness = 2) {
+    // 确保坐标在有效范围内
+    x1 = std::max(0, std::min(x1, width - 1));
+    y1 = std::max(0, std::min(y1, height - 1));
+    x2 = std::max(0, std::min(x2, width - 1));
+    y2 = std::max(0, std::min(y2, height - 1));
+
+    if (x2 <= x1 || y2 <= y1) return;
+
+    // 绘制上边线
+    for (int y = y1; y < std::min(y1 + thickness, y2); y++) {
+        for (int x = x1; x < std::min(x2, width); x++) {
+            int pixel_idx = (y * width + x) * channels;
+            pixels[pixel_idx] = r;           // R
+            if (channels > 1) pixels[pixel_idx + 1] = g; // G
+            if (channels > 2) pixels[pixel_idx + 2] = b; // B
+            if (channels > 3) pixels[pixel_idx + 3] = 255; // A
+        }
+    }
+
+    // 绘制下边线
+    for (int y = std::max(y2 - thickness, y1); y < y2; y++) {
+        for (int x = x1; x < x2; x++) {
+            int pixel_idx = (y * width + x) * channels;
+            pixels[pixel_idx] = r;           // R
+            if (channels > 1) pixels[pixel_idx + 1] = g; // G
+            if (channels > 2) pixels[pixel_idx + 2] = b; // B
+            if (channels > 3) pixels[pixel_idx + 3] = 255; // A
+        }
+    }
+
+    // 绘制左边线
+    for (int y = y1 + thickness; y < y2 - thickness; y++) {
+        for (int x = x1; x < std::min(x1 + thickness, x2); x++) {
+            int pixel_idx = (y * width + x) * channels;
+            pixels[pixel_idx] = r;           // R
+            if (channels > 1) pixels[pixel_idx + 1] = g; // G
+            if (channels > 2) pixels[pixel_idx + 2] = b; // B
+            if (channels > 3) pixels[pixel_idx + 3] = 255; // A
+        }
+    }
+
+    // 绘制右边线
+    for (int y = y1 + thickness; y < y2 - thickness; y++) {
+        for (int x = std::max(x2 - thickness, x1); x < x2; x++) {
+            int pixel_idx = (y * width + x) * channels;
+            pixels[pixel_idx] = r;           // R
+            if (channels > 1) pixels[pixel_idx + 1] = g; // G
+            if (channels > 2) pixels[pixel_idx + 2] = b; // B
+            if (channels > 3) pixels[pixel_idx + 3] = 255; // A
+        }
+    }
+}
 
 
 std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> dev, const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool, std::string &filepath) {
@@ -108,6 +169,10 @@ std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> d
     int texture_channels;
 
     auto *pixels = stbi_load(filepath.c_str(), &texture_width, &texture_height, &texture_channels, STBI_rgb_alpha);
+    if (!pixels) {
+        LOG_ERROR("Failed to load texture");
+        return nullptr;
+    }
     auto image_size = texture_width * texture_height * 4;
 
     VkExtent3D dim = {static_cast<uint32_t>(texture_width), static_cast<uint32_t>(texture_height), 1};
@@ -127,13 +192,16 @@ std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> d
     if (!b) {
         return nullptr;
     }
+
+    drawBoundingBox(pixels, texture_width, texture_height, 4, 0, 0, 100, 100);
+
     memcpy(b->ptr, pixels, image_size);
 
     cmd.begin();
     texture->copyBufferToImage(cmd.get(), b->buffer, b->offset);
     texture->readBarrier(cmd.get());
     cmd.end();
-    cmd.submit(dev->getComputeQueue());
+    cmd.submit(dev->getGraphicsQueues());
     cmd.wait();
 
     stbi_image_free(pixels);
@@ -141,17 +209,12 @@ std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> d
     return texture;
 }
 
-
+std::atomic<bool> should_exit(false);
 GLFWwindow* window = nullptr;
-// void signalHandler(int sig) {
-//     (void)sig;
-// #ifdef USE_GLFW
-//     if (window) {
-//         glfwSetWindowShouldClose(window, true);
-//         cleanup(window);
-//     }
-// #endif
-// }
+void signalHandler(int sig) {
+    (void)sig;
+    should_exit = true;
+}
 
 } // namespace
 
@@ -160,7 +223,7 @@ int main(int argc, const char *argv[]) {
         printf("Usage: %s <image_path>\n", argv[0]);
         return -1;
     }
-    // std::signal(SIGINT, signalHandler);
+    std::signal(SIGINT, signalHandler);
     std::string image_path = argv[1];
 
     Logger::getInstance().setLevel(LOG_INFO);
@@ -262,12 +325,14 @@ int main(int argc, const char *argv[]) {
     pipeline->updateDescriptorSets({write});
 
     auto image_semaphore = std::make_unique<vkop::VulkanSemaphore>(dev->getLogicalDevice());
-    auto render_complete = std::make_unique<vkop::VulkanSemaphore>(dev->getLogicalDevice());
+    auto complete_semaphore = std::make_unique<vkop::VulkanSemaphore>(dev->getLogicalDevice());
 
     printf("Starting render loop...\n");
 
-    while (!glfwWindowShouldClose(window)) {
+    while (!should_exit && !glfwWindowShouldClose(window)) {
         glfwPollEvents();
+
+        if (should_exit) break;
 
         uint32_t image_index = 0;
         VkResult acquire_ret = vkop::vkAcquireNextImageKHR(
@@ -298,28 +363,25 @@ int main(int argc, const char *argv[]) {
         render_pass.end(cmd.get());
 
         cmd.end();
-        cmd.addWait(image_semaphore->getSemaphore(), 0, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
+        auto* needsigalsem = complete_semaphore->getSemaphore();
+        cmd.addWait(image_semaphore->getSemaphore(), 0, needsigalsem, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT);
         auto subinfo = cmd.buildSubmitInfo();
         std::vector<VkSubmitInfo> submit_infos;
         submit_infos.push_back(subinfo);
-        cmd.submit(dev->getGraphicsQueues(), submit_infos);
-        cmd.wait();
-
-        // dev->wait_all_done();
+        vkop::VulkanCommandBuffer::submit(dev->getGraphicsQueues(), submit_infos);
 
         // last present the display
-        auto* sem = cmd.getSignalSemaphore();
         VkPresentInfoKHR present_info = {};
         auto *swapch = swapchain.getSwapchain();
         present_info.sType = VK_STRUCTURE_TYPE_PRESENT_INFO_KHR;
         present_info.waitSemaphoreCount = 1;
-        present_info.pWaitSemaphores = &sem;
+        present_info.pWaitSemaphores = &needsigalsem;
         present_info.swapchainCount = 1;
         present_info.pSwapchains = &swapch;
         present_info.pImageIndices = &image_index;
         
         VkResult ret = vkop::vkQueuePresentKHR(graphics_queue->getQueue(), &present_info);
-        
+        cmd.wait();
         if (ret == VK_ERROR_OUT_OF_DATE_KHR || ret == VK_SUBOPTIMAL_KHR) {
             glfwGetFramebufferSize(window, reinterpret_cast<int*>(&width), reinterpret_cast<int*>(&height));
             continue;
@@ -327,11 +389,13 @@ int main(int argc, const char *argv[]) {
         if (ret != VK_SUCCESS) {
             throw std::runtime_error("Failed to present swap chain image!");
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    cleanup(window);
-    std::this_thread::sleep_for(std::chrono::seconds(1));
+    dev->wait_all_done();
+    printf("Exiting...\n");
 
+    cleanup(window);
 #else
     std::cout << "GLFW not enabled, running in headless mode" << std::endl;
 #endif

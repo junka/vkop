@@ -430,9 +430,10 @@ double Runtime::Run() {
         }
     }
     for (int ci = 0; ci < vkop::kInflight; ci++) {
-        if (!submit_infos[ci].empty())
+        if (!submit_infos[ci].empty()) {
             VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
                                         submit_infos[ci]);
+        }
     }
 
     for (int ci = 0; ci < vkop::kInflight; ci++) {
@@ -444,6 +445,7 @@ double Runtime::Run() {
         for (auto node_idx : level_nodes) {
             auto cmd = node_ops_[node_idx]->get_record();
             cmd->clearWaits();
+            cmd->reset();
         }
     }
 

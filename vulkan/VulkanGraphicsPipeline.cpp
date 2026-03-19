@@ -8,7 +8,6 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanShader.hpp"
-#include "vulkan/vulkan_core.h"
 
 namespace vkop {
 
@@ -17,29 +16,20 @@ VulkanGraphicsPipeline::VulkanGraphicsPipeline(
     std::vector<VkDescriptorType> types, VkExtent2D extent,
     const uint32_t *vert_spv, unsigned int vert_spv_len,
     const uint32_t *frag_spv, unsigned int frag_spv_len)
-    : m_device_(device), m_types_(std::move(types)), m_extent_(extent) {
+    : VulkanBasePipeline(device, std::move(types)), m_extent_(extent) {
 
-    createPipeline(render_pass, vert_spv, vert_spv_len, frag_spv, frag_spv_len);
+    createDescriptorSetLayout(VK_SHADER_STAGE_FRAGMENT_BIT);
+    createPipelineLayout(VK_SHADER_STAGE_ALL);
     createDescriptorPool();
+    createGraphicsPipeline(render_pass, vert_spv, vert_spv_len, frag_spv,
+                           frag_spv_len);
 }
 
-VulkanGraphicsPipeline::~VulkanGraphicsPipeline() {
-    if (m_pipeline_ != VK_NULL_HANDLE) {
-        vkDestroyPipeline(m_device_, m_pipeline_, nullptr);
-        m_pipeline_ = VK_NULL_HANDLE;
-    }
-
-    if (m_pipelineLayout_ != VK_NULL_HANDLE) {
-        vkDestroyPipelineLayout(m_device_, m_pipelineLayout_, nullptr);
-        m_pipelineLayout_ = VK_NULL_HANDLE;
-    }
-}
-
-void VulkanGraphicsPipeline::createPipeline(VkRenderPass render_pass,
-                                            const uint32_t *vert_spv,
-                                            unsigned int vert_spv_len,
-                                            const uint32_t *frag_spv,
-                                            unsigned int frag_spv_len) {
+void VulkanGraphicsPipeline::createGraphicsPipeline(VkRenderPass render_pass,
+                                                    const uint32_t *vert_spv,
+                                                    unsigned int vert_spv_len,
+                                                    const uint32_t *frag_spv,
+                                                    unsigned int frag_spv_len) {
     // Create shader modules
     VulkanShader vert_shader(m_device_, vert_spv,
                              static_cast<int>(vert_spv_len));
@@ -163,21 +153,6 @@ void VulkanGraphicsPipeline::createPipeline(VkRenderPass render_pass,
         static_cast<uint32_t>(dynamic_states.size());
     dynamic_state.pDynamicStates = dynamic_states.data();
 
-    // Pipeline layout (no descriptor sets or push constants for now)
-    createDescriptorSetLayout(VK_SHADER_STAGE_FRAGMENT_BIT);
-
-    VkPipelineLayoutCreateInfo pipeline_layout_info{};
-    pipeline_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_info.setLayoutCount = 1;
-    pipeline_layout_info.pSetLayouts = &m_descriptorSetLayout_;
-    pipeline_layout_info.pushConstantRangeCount = 0;
-    pipeline_layout_info.pPushConstantRanges = nullptr;
-
-    if (vkCreatePipelineLayout(m_device_, &pipeline_layout_info, nullptr,
-                               &m_pipelineLayout_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create pipeline layout!");
-    }
-
     // Graphics pipeline
     VkGraphicsPipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO;
@@ -204,95 +179,6 @@ void VulkanGraphicsPipeline::createPipeline(VkRenderPass render_pass,
             "Failed to create graphics pipeline! Error code: " +
             std::to_string(result));
     }
-}
-
-void VulkanGraphicsPipeline::createDescriptorSetLayout(
-    VkShaderStageFlags flags) {
-    auto bindings = allocDescriptorSetLaoutBindings(flags);
-    VkDescriptorSetLayoutCreateInfo layout_info{};
-    layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
-    layout_info.pBindings = bindings.data();
-
-    if (vkCreateDescriptorSetLayout(m_device_, &layout_info, nullptr,
-                                    &m_descriptorSetLayout_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create descriptor set layout!");
-    }
-}
-
-std::vector<VkDescriptorSetLayoutBinding>
-VulkanGraphicsPipeline::allocDescriptorSetLaoutBindings(
-    VkShaderStageFlags flags) {
-    std::vector<VkDescriptorSetLayoutBinding> bindings(m_types_.size());
-    for (int i = 0; i < static_cast<int>(m_types_.size()); i++) {
-        bindings[i].binding = i;
-        bindings[i].descriptorType = m_types_[i];
-        bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = flags;
-    }
-    return bindings;
-}
-
-void VulkanGraphicsPipeline::createDescriptorPool() {
-    std::map<VkDescriptorType, int> type_counts;
-    for (auto t : m_types_) {
-        if (type_counts.find(t) == type_counts.end()) {
-            type_counts[t] = 1;
-        } else {
-            type_counts[t]++;
-        }
-    }
-    std::vector<VkDescriptorPoolSize> pool_sizes;
-    for (auto &t : type_counts) {
-        VkDescriptorPoolSize ps;
-        ps.type = t.first;
-        ps.descriptorCount = t.second;
-        pool_sizes.push_back(ps);
-    }
-
-    VkDescriptorPoolCreateInfo descriptor_pool_create_info = {};
-    descriptor_pool_create_info.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
-    descriptor_pool_create_info.flags =
-        VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    descriptor_pool_create_info.maxSets = kInflight;
-    descriptor_pool_create_info.poolSizeCount =
-        static_cast<uint32_t>(pool_sizes.size());
-    descriptor_pool_create_info.pPoolSizes = pool_sizes.data();
-    if (vkCreateDescriptorPool(m_device_, &descriptor_pool_create_info, nullptr,
-                               &m_descriptorPool_) != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create descriptor pool!");
-    }
-}
-
-VkDescriptorSet VulkanGraphicsPipeline::allocDescriptorSets() {
-    VkDescriptorSet descriptor_set;
-    VkDescriptorSetAllocateInfo descriptor_set_allocate_info = {};
-    descriptor_set_allocate_info.sType =
-        VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
-    descriptor_set_allocate_info.descriptorPool = m_descriptorPool_;
-    descriptor_set_allocate_info.descriptorSetCount = 1;
-    descriptor_set_allocate_info.pSetLayouts = &m_descriptorSetLayout_;
-
-    auto ret = vkAllocateDescriptorSets(
-        m_device_, &descriptor_set_allocate_info, &descriptor_set);
-    if (ret != VK_SUCCESS) {
-        printf("allocate descriptor set fail %d\n", ret);
-        throw std::runtime_error("Failed to allocate descriptor set!");
-    }
-    return descriptor_set;
-}
-
-void VulkanGraphicsPipeline::freeDescriptorSets(VkDescriptorSet ds) {
-    if (ds != VK_NULL_HANDLE) {
-        vkFreeDescriptorSets(m_device_, m_descriptorPool_, 1, &ds);
-    }
-}
-
-void VulkanGraphicsPipeline::updateDescriptorSets(
-    const std::vector<VkWriteDescriptorSet> &writes) {
-    vkUpdateDescriptorSets(m_device_, static_cast<uint32_t>(writes.size()),
-                           writes.data(), 0, nullptr);
 }
 
 } // namespace vkop
