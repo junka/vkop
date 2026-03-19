@@ -2,12 +2,12 @@
   "name": "vkop-model-viewer",
   "displayName": "VKOP Model Viewer",
   "description": "Visualize VKOP binary model files with hierarchical layer display",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "author": {
     "name": "Wan Junjie",
     "email": "wan.junjie@foxmail.com"
   },
-  "publisher": "Wan Junjie",
+  "publisher": "junka",
   "license": "MIT",
   "repository": {
     "type": "git",

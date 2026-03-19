@@ -365,15 +365,15 @@ async function parseVkopFile(filePath) {
             initializerOffsets[name] = alignedOffset;
             totalMemorySize = alignedOffset + dataSize;
 
-            let data;
-            data = buffer.slice(offset, offset + dataSize);
+            // let data;
+            // data = buffer.slice(offset, offset + dataSize);
             
             initializers[name] = {
                 dtype: dtype,
                 dims: dims,
                 data_size: dataSize,
                 offset: alignedOffset,
-                data: data
+                // data: data
             };
             offset += dataSize;
         }
