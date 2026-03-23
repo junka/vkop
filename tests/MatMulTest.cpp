@@ -53,10 +53,11 @@ public:
 
 private:
     void initTestdata() {
+        int batch = t1[0];
         inputa = std::make_shared<Tensor<T>>(t1);
         inputb = std::make_shared<Tensor<T>>(t2);
         size_t rank = t1.size();
-        std::vector<int> to = {3, t1[rank-2], t2[rank-1]};
+        std::vector<int> to = {batch, t1[rank-2], t2[rank-1]};
         int kk = t1[rank-1];
         output = std::make_shared<Tensor<T>>(to);
         std::vector<int64_t> t1shape(t1.begin(), t1.end());
@@ -89,7 +90,11 @@ private:
 
 TEST(MatMulTest, MatMulComprehensiveTest) {
     const std::vector<std::tuple<std::vector<int>, std::vector<int>>> test_cases = {
-        {{3, 4, 1}, {3, 1, 6}},
+        {{5, 4, 1}, {5, 1, 6}},
+        {{3, 4, 5}, {3, 5, 6}},
+        {{3, 8, 16}, {3, 16, 32}},
+         {{3, 15, 15}, {3, 15, 15}},
+         {{3, 16, 16}, {3, 16, 16}},
     };
     for (const auto &test_case : test_cases) {
         auto [t1, t2] = test_case;

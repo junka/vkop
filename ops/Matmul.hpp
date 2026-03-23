@@ -6,6 +6,8 @@
 extern "C" {
 extern unsigned char matmul_spv[];
 extern unsigned int matmul_spv_len;
+extern unsigned char matmul_nv_spv[];
+extern unsigned int matmul_nv_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -15,12 +17,19 @@ struct alignas(16) GpuMatMulParam {
     int M;
     int N;
     int K;
+    int C;
 };
 } // namespace matmul
 class MatMul : public Operator {
   public:
-    MatMul()
-        : Operator(OpType::MATMUL, matmul_spv, matmul_spv_len,
+    MatMul(const MatMul &) = delete;
+    MatMul &operator=(const MatMul &) = delete;
+    MatMul(MatMul &&) = delete;
+    MatMul &operator=(MatMul &&) = delete;
+
+    explicit MatMul(bool use_tensorcore = false)
+        : Operator(OpType::MATMUL, use_tensorcore ? matmul_nv_spv : matmul_spv,
+                   use_tensorcore ? matmul_nv_spv_len : matmul_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
@@ -30,6 +39,7 @@ class MatMul : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        int chan = inputs[0]->get_channel();
         int m = inputs[0]->get_height();
         int n = inputs[1]->get_width();
         int k = inputs[0]->get_width();
@@ -58,8 +68,9 @@ class MatMul : public Operator {
         para.M = m;
         para.N = n;
         para.K = k;
+        para.C = chan;
 
-        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), 1);
+        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
     }
 };
 

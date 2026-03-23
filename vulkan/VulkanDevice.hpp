@@ -135,6 +135,7 @@ class VulkanDevice {
     bool is_support_cuda_kernel_launch() const {
         return m_support_cuda_kernel_launch_;
     }
+    bool is_support_nv_tensor_core() const { return m_support_nv_tensor_core_; }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -151,6 +152,7 @@ class VulkanDevice {
     bool m_support_buffer_device_address_ = false;
     bool m_support_timeline_semaphore_ = false;
     bool m_support_cuda_kernel_launch_ = false;
+    bool m_support_nv_tensor_core_ = false;
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>

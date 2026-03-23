@@ -9,7 +9,7 @@ namespace vkop {
 
 class VulkanBasePipeline {
   public:
-    ~VulkanBasePipeline();
+    virtual ~VulkanBasePipeline();
 
   protected:
     VulkanBasePipeline(VkDevice device, std::vector<VkDescriptorType> types);

@@ -881,6 +881,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
                 e->cooperativeMatrix = feat->cooperativeMatrix;
+                m_support_nv_tensor_core_ = feat->cooperativeMatrix;
                 return std::unique_ptr<VkBaseOutStructure>(
                     reinterpret_cast<VkBaseOutStructure *>(e.release()));
             }});
@@ -916,6 +917,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceCooperativeMatrixFeaturesNV,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV>();
                 e->cooperativeMatrix = feat->cooperativeMatrix;
+                m_support_nv_tensor_core_ = feat->cooperativeMatrix;
                 return std::unique_ptr<VkBaseOutStructure>(
                     reinterpret_cast<VkBaseOutStructure *>(e.release()));
             }});

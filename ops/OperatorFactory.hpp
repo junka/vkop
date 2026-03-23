@@ -44,7 +44,8 @@ namespace vkop {
 namespace ops {
 
 static inline std::unique_ptr<Operator>
-create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0) {
+create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
+                 bool use_tensorcore = false) {
     switch (type) {
     case OpType::ADD:
         return std::make_unique<Add>();
@@ -75,7 +76,7 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0) {
     case OpType::LAYERNORM:
         return std::make_unique<LayerNorm>();
     case OpType::MATMUL:
-        return std::make_unique<MatMul>();
+        return std::make_unique<MatMul>(use_tensorcore);
     case OpType::MAXPOOL2D:
         return std::make_unique<Maxpool2d>();
     case OpType::MUL:

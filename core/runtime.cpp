@@ -339,7 +339,8 @@ void Runtime::LoadModel() {
                     use_ssbo = true;
                 }
             }
-            auto op = ops::create_from_type(type, use_ssbo, precision_);
+            auto op = ops::create_from_type(type, use_ssbo, precision_,
+                                            dev->is_support_nv_tensor_core());
             if (!op) {
                 std::cout << "Fail to create operator" << std::endl;
                 return;
@@ -483,7 +484,8 @@ void Runtime::RegisterPostProcess(
     auto dev = m_cmdpool_->getVulkanDevice();
 
     auto op =
-        ops::create_from_type(ops, outputs[0]->num_dims() <= 2, precision_);
+        ops::create_from_type(ops, outputs[0]->num_dims() <= 2, precision_,
+                              dev->is_support_nv_tensor_core());
     op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);

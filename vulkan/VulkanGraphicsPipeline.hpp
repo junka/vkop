@@ -13,7 +13,6 @@ class VulkanGraphicsPipeline : public VulkanBasePipeline {
                            VkExtent2D extent, const uint32_t *vert_spv,
                            unsigned int vert_spv_len, const uint32_t *frag_spv,
                            unsigned int frag_spv_len);
-    ~VulkanGraphicsPipeline() = default;
 
   private:
     VkExtent2D m_extent_;

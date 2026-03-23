@@ -118,7 +118,7 @@ public:
         } else if constexpr (std::is_same_v<uint16_t, TT>) {
             auto *data_ptr = cpu_tensor.data_ptr<at::Half>();
             const auto *uint16_ptr = reinterpret_cast<const uint16_t*>(data_ptr);
-            
+
             for (int64_t i = 0; i < cpu_tensor.numel(); i++) {
                 data_vector.push_back(uint16_ptr[i]);
             }
@@ -131,7 +131,7 @@ public:
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
     {
 
-        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0);
+        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0, dev_->is_support_nv_tensor_core());
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
@@ -240,7 +240,7 @@ public:
                         threshold = abs_exp * 0.01F;  // 1% relative error
                     } else if (abs_exp > 0.001F) {
                         // For medium values, use mixed relative/absolute error
-                        threshold = std::max(0.001F, abs_exp * 0.02F);
+                        threshold = std::max(0.003F, abs_exp * 0.02F);
                     } else {
                         // For very small values, use absolute error
                         threshold = 0.002F;

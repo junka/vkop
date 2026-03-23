@@ -1,0 +1,185 @@
+/*
+
+https://github.com/KhronosGroup/GLSL/blob/main/extensions/nv/GLSL_NV_cooperative_matrix.txt
+
+Section 8.X, Cooperative Matrix Functions
+
+
+fcoopmatNV<PRECISION_BITS, gl_ScopeSubgroup, ROWS, COLS> variable;
+// fcoopmatNV<16, gl_ScopeSubgroup, 16, 8> mat2; //  fp16, subgroup, 16 rows, 8 columns
+
+
+void coopMatLoadNV(out fcoopmatNV m,
+                   volatile coherent float16_t[] buf, // ssbo or shared memory array variable
+                   uint element, // starting index into buf to load from
+                   uint stride, // element stride for one column or row
+                   bool colMajor) // compile-time constant
+Load a cooperative matrix from buf. colMajor indicates
+whether the values loaded from memory are arranged in column-major or
+row-major order. It must be a constant expression, with false
+indicating row major and true indicating column major.
+
+If colMajor is false, then elements (row,*) of the result are taken in
+order from contiguous locations starting at buf[element + row*stride].
+If colMajor is true, then elements (*,col) of the result are taken in
+order from contiguous locations starting at buf[element + col*stride].
+
+
+
+fcoopmatNV coopMatMulAddNV(fcoopmatNV A, fcoopmatNV B, fcoopmatNV C)
+
+
+void coopMatStoreNV(fcoopmatNV m, volatile coherent out float[] buf, uint element, uint stride, bool colMajor);
+
+
+*/
+
+#version 450 core
+
+#extension GL_NV_cooperative_matrix : enable
+#extension GL_NV_shader_subgroup_partitioned : enable
+#extension GL_KHR_memory_scope_semantics: enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16: enable
+
+#ifdef FP16
+#extension GL_AMD_gpu_shader_half_float: enable
+#extension GL_EXT_shader_16bit_storage : enable
+#define FLOAT float16_t
+#define FLOAT4 f16vec4
+#define FLOAT2 f16vec2
+#else
+#define FLOAT float
+#define FLOAT4 vec4
+#define FLOAT2 vec2
+#endif
+
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+layout(binding = 0) writeonly uniform image2DArray uOutput;
+layout(binding = 1) uniform sampler2DArray uInputA;
+layout(binding = 2) uniform sampler2DArray uInputB;
+
+
+
+const int M_BLOCK = 16;
+const int N_BLOCK = 16;
+const int K_BLOCK = 16;
+
+// Cooperative matrix: [M=16, N=16, K=16]
+fcoopmatNV<16, gl_ScopeSubgroup, M_BLOCK, K_BLOCK> matA[4];
+fcoopmatNV<16, gl_ScopeSubgroup, K_BLOCK, N_BLOCK> matB[4];
+fcoopmatNV<32, gl_ScopeSubgroup, M_BLOCK, N_BLOCK> matC[4];
+
+layout(push_constant) uniform PushConsts {
+    int M; // rows of A
+    int N; // cols of B
+    int K; // common dim
+    int C;
+} uMatMulParams;
+
+shared float16_t shA[4][M_BLOCK * K_BLOCK];
+shared float16_t shB[4][K_BLOCK * N_BLOCK];
+shared float shC[4][M_BLOCK * N_BLOCK];
+
+void main() {
+    ivec3 gid = ivec3(gl_GlobalInvocationID.xyz);
+    int w = gid.x;
+    int y = gid.y;
+    int c4 = gid.z;
+
+    int M = uMatMulParams.M;
+    int K = uMatMulParams.K;
+    int N = uMatMulParams.N;
+    int C = uMatMulParams.C;
+
+    // 为了简化，我们直接基于 gid 计算当前线程在块内的局部坐标
+    int local_x = int(gl_LocalInvocationID.x); // 0..15 (对应 N 或 K)
+    int local_y = int(gl_LocalInvocationID.y); // 0..15 (对应 M 或 K)
+    
+    int y_base = int(gl_WorkGroupID.y) * M_BLOCK;
+    int x_base = int(gl_WorkGroupID.x) * N_BLOCK;
+
+    for(int b = 0; b < 4; b++) {
+        matC[b] = fcoopmatNV<32, gl_ScopeSubgroup, M_BLOCK, N_BLOCK>(0.0);
+    }
+
+    int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
+
+    for (int t = 0; t < k_tiles; t++) {
+        int k_base = t * K_BLOCK;
+
+        int h_global = y_base + local_y; 
+        int k_global_a = k_base + local_x;
+        
+
+        if (h_global < M && k_global_a < K) { 
+             vec4 val = texelFetch(uInputA, ivec3(k_global_a, h_global, c4), 0);
+             shA[0][local_y * K_BLOCK + local_x] = float16_t(val.x);
+             shA[1][local_y * K_BLOCK + local_x] = (c4 * 4 + 1 < C) ? float16_t(val.y) : float16_t(0.0);
+             shA[2][local_y * K_BLOCK + local_x] = (c4 * 4 + 2 < C) ?float16_t(val.z) : float16_t(0.0);
+             shA[3][local_y * K_BLOCK + local_x] = (c4 * 4 + 3 < C) ?float16_t(val.w) : float16_t(0.0);
+        } else {
+             shA[0][local_y * K_BLOCK + local_x] = float16_t(0.0);
+             shA[1][local_y * K_BLOCK + local_x] = float16_t(0.0);
+             shA[2][local_y * K_BLOCK + local_x] = float16_t(0.0);
+             shA[3][local_y * K_BLOCK + local_x] = float16_t(0.0);
+        }
+
+        uint k_global_b = k_base + local_y;
+        uint w_global = x_base + local_x;
+
+        if (k_global_b < K && w_global < N) {
+            vec4 val = texelFetch(uInputB, ivec3(w_global, k_global_b, c4), 0);
+            shB[0][local_y * N_BLOCK + local_x] = float16_t(val.x);
+            shB[1][local_y * N_BLOCK + local_x] = (c4 * 4 + 1 < C) ? float16_t(val.y) : float16_t(0.0);
+            shB[2][local_y * N_BLOCK + local_x] = (c4 * 4 + 2 < C) ? float16_t(val.z) : float16_t(0.0);
+            shB[3][local_y * N_BLOCK + local_x] = (c4 * 4 + 3 < C) ? float16_t(val.w) : float16_t(0.0);
+        } else {
+            shB[0][local_y * N_BLOCK + local_x] = float16_t(0.0);
+            shB[1][local_y * N_BLOCK + local_x] = float16_t(0.0);
+            shB[2][local_y * N_BLOCK + local_x] = float16_t(0.0);
+            shB[3][local_y * N_BLOCK + local_x] = float16_t(0.0);
+        }
+
+        barrier();
+
+        coopMatLoadNV(matA[0], shA[0], 0, K_BLOCK, false);
+        coopMatLoadNV(matA[1], shA[1], 0, K_BLOCK, false);
+        coopMatLoadNV(matA[2], shA[2], 0, K_BLOCK, false);
+        coopMatLoadNV(matA[3], shA[3], 0, K_BLOCK, false);
+
+        coopMatLoadNV(matB[0], shB[0], 0, N_BLOCK, false);
+        coopMatLoadNV(matB[1], shB[1], 0, N_BLOCK, false);
+        coopMatLoadNV(matB[2], shB[2], 0, N_BLOCK, false);
+        coopMatLoadNV(matB[3], shB[3], 0, N_BLOCK, false);
+
+        // C = A * B + C
+        matC[0] = coopMatMulAddNV(matA[0], matB[0], matC[0]);
+        matC[1] = coopMatMulAddNV(matA[1], matB[1], matC[1]);
+        matC[2] = coopMatMulAddNV(matA[2], matB[2], matC[2]);
+        matC[3] = coopMatMulAddNV(matA[3], matB[3], matC[3]);
+        barrier();
+    }
+
+    // --- Step 4: CoopMat Register -> Shared Memory -> Image ---    
+    coopMatStoreNV(matC[0], shC[0], 0, N_BLOCK, false);
+    coopMatStoreNV(matC[1], shC[1], 0, N_BLOCK, false);
+    coopMatStoreNV(matC[2], shC[2], 0, N_BLOCK, false);
+    coopMatStoreNV(matC[3], shC[3], 0, N_BLOCK, false);
+
+    barrier();
+
+    // 每个线程将结果写入 image2DArray
+    uint out_h_global = y_base + local_y;
+    uint out_w_global = x_base + local_x;
+
+    // 边界检查
+    if (out_h_global < M && out_w_global < N) {
+        vec4 result;
+        result.x = float(shC[0][local_y * N_BLOCK + local_x]);
+        result.y = float(shC[1][local_y * N_BLOCK + local_x]);
+        result.z = float(shC[2][local_y * N_BLOCK + local_x]);
+        result.w = float(shC[3][local_y * N_BLOCK + local_x]);
+        imageStore(uOutput, ivec3(out_w_global, out_h_global, c4), vec4(result));
+    }
+}
