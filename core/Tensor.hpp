@@ -754,7 +754,7 @@ template <typename T> class Tensor : public ITensor {
         }
         if (vd->is_support_host_image_copy()) {
 #ifdef VK_EXT_host_image_copy
-            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
 #endif
         }
 

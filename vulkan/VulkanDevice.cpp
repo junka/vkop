@@ -67,9 +67,9 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
 #endif
 
 #ifdef VK_EXT_host_image_copy
-    VkPhysicalDeviceHostImageCopyProperties hostimagecopyproperty = {};
+    VkPhysicalDeviceHostImageCopyPropertiesEXT hostimagecopyproperty = {};
     hostimagecopyproperty.sType =
-        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES;
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
 
 #ifdef VK_NV_cuda_kernel_launch
     cuda_properties.pNext = &hostimagecopyproperty;
@@ -207,7 +207,7 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
            "vkGetPhysicalDeviceImageFormatProperties failed: "
            "requested image configuration is not supported!");
     if (m_support_host_image_copy_) {
-        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
     }
     result = vkGetPhysicalDeviceImageFormatProperties(
         physicalDevice_, format, img_type, tiling, usage, flags, &props);
@@ -566,6 +566,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_EXT_host_image_copy
+
+#ifndef VK_VERSION_1_4
+#define VK_API_VERSION_1_4 VK_MAKE_API_VERSION(0, 1, 4, 0)
+#endif
     if (deviceProperties.apiVersion < VK_API_VERSION_1_4 &&
         supportedExtensions.count(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) > 0) {
         descs.push_back(FeatureDescriptor{
@@ -574,10 +578,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .extensionName = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
             .corePromotedVersion = 0,
             .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
-                auto q =
-                    std::make_unique<VkPhysicalDeviceHostImageCopyFeatures>();
+                auto q = std::make_unique<
+                    VkPhysicalDeviceHostImageCopyFeaturesEXT>();
                 *q = makeFeatureStruct<
-                    VkPhysicalDeviceHostImageCopyFeatures,
+                    VkPhysicalDeviceHostImageCopyFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
                 return std::unique_ptr<VkBaseOutStructure>(
                     reinterpret_cast<VkBaseOutStructure *>(q.release()));
@@ -585,13 +589,13 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .makeEnableStruct =
                 [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
                 auto *feat =
-                    static_cast<VkPhysicalDeviceHostImageCopyFeatures *>(q);
+                    static_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT *>(q);
                 if (!feat->hostImageCopy)
                     return nullptr;
-                auto e =
-                    std::make_unique<VkPhysicalDeviceHostImageCopyFeatures>();
+                auto e = std::make_unique<
+                    VkPhysicalDeviceHostImageCopyFeaturesEXT>();
                 *e = makeFeatureStruct<
-                    VkPhysicalDeviceHostImageCopyFeatures,
+                    VkPhysicalDeviceHostImageCopyFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
                 e->hostImageCopy = feat->hostImageCopy;
                 m_support_host_image_copy_ = feat->hostImageCopy;
@@ -995,8 +999,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
              "VULKAN_1_2_FEATURES"},
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
              "VULKAN_1_3_FEATURES"},
+#ifdef VK_VERSION_1_4
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
              "VULKAN_1_4_FEATURES"},
+#endif
         };
         const auto &desc = descs[i];
         printf("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u\n",

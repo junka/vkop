@@ -72,7 +72,7 @@ if(DEFINED GLSLC_EXECUTABLE)
         message(FATAL_ERROR "Custom glslc executable not found at: ${GLSLC_EXECUTABLE}")
     endif()
 else()
-    find_program(GLSLC_EXECUTABLE NAMES glslc PATHS ENV VULKAN_SDK PATH_SUFFIXES bin)
+    find_program(GLSLC_EXECUTABLE NAMES glslc PATHS ENV VULKAN_SDK PATH_SUFFIXES bin)    
     if(NOT GLSLC_EXECUTABLE)
         # Try common installation paths
         find_program(GLSLC_EXECUTABLE NAMES glslc HINTS

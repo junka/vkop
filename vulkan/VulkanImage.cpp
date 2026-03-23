@@ -561,8 +561,8 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     subrange.layerCount = m_layers_;
 
     VkImage img = getImage();
-    VkHostImageLayoutTransitionInfo transinfo = {};
-    transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO;
+    VkHostImageLayoutTransitionInfoEXT transinfo = {};
+    transinfo.sType = VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT;
     transinfo.oldLayout = m_layout_;
     transinfo.newLayout = newLayout;
     transinfo.image = img;
@@ -585,7 +585,7 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
 }
 
 void VulkanImage::hostImageCopyToDevice(void *ptr) {
-    VkMemoryToImageCopy region = {};
+    VkMemoryToImageCopyEXT region = {};
     region.sType = VK_STRUCTURE_TYPE_MEMORY_TO_IMAGE_COPY_EXT;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
@@ -595,7 +595,7 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     region.pHostPointer = ptr;
 
     VkImage img = getImage();
-    VkCopyMemoryToImageInfo copyinfo = {};
+    VkCopyMemoryToImageInfoEXT copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_MEMORY_TO_IMAGE_INFO_EXT;
     copyinfo.dstImage = img;
     copyinfo.dstImageLayout = m_layout_;
@@ -616,7 +616,7 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
 }
 
 void VulkanImage::hostImageCopyToHost(void *ptr) {
-    VkImageToMemoryCopy region = {};
+    VkImageToMemoryCopyEXT region = {};
     region.sType = VK_STRUCTURE_TYPE_IMAGE_TO_MEMORY_COPY_EXT;
     region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     region.imageSubresource.mipLevel = 0;
@@ -628,7 +628,7 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     region.memoryImageHeight = 0;
 
     VkImage img = getImage();
-    VkCopyImageToMemoryInfo copyinfo = {};
+    VkCopyImageToMemoryInfoEXT copyinfo = {};
     copyinfo.sType = VK_STRUCTURE_TYPE_COPY_IMAGE_TO_MEMORY_INFO_EXT;
     copyinfo.srcImage = img;
     copyinfo.srcImageLayout = m_layout_;

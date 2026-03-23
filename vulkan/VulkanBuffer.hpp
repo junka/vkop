@@ -68,10 +68,14 @@ class VulkanBuffer : public VulkanResource {
     };
 
     void unmapMemory() {
+        // VMA_ALLOCATION_CREATE_MAPPED_BIT already keeps the memory mapped, so
+        // we don't need to unmap it.
+#ifndef USE_VMA
         if (data_) {
             vkUnmapMemory(m_vdev_->getLogicalDevice(), getMemory());
             data_ = nullptr;
         }
+#endif
     }
 
   private:
