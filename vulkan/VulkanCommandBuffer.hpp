@@ -6,7 +6,6 @@
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanSemaphore.hpp"
-#include "vulkan/vulkan_core.h"
 
 #include <memory>
 #include <vulkan/vulkan.hpp>

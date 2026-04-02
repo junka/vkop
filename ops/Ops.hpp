@@ -42,6 +42,7 @@ enum class OpType {
     TOPK,
     TRANSPOSE,
     NMS,
+    GATHER,
     TOTAL_NUM
 };
 
@@ -80,7 +81,8 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "TopK",              // TOPK = 30
         "Transpose",         // TRANSPOSE = 31
         "Nms",               // NMS = 32
-        ""};                 // TOTAL_NUM = 33 (should not be accessed)
+        "Gather",            // GATHER = 33
+        ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
     return names[static_cast<int>(type)];
@@ -152,6 +154,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::TRANSPOSE;
     if (name == "Nms")
         return vkop::ops::OpType::NMS;
+    if (name == "Gather")
+        return vkop::ops::OpType::GATHER;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

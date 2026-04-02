@@ -42,7 +42,7 @@ class ONNXOptimizer:
             name = inp.name
             tensor_type = inp.type.tensor_type
             dim = tensor_type.shape.dim
-            assert len(dim) == 4, "Input shape must be 4D"
+            # assert len(dim) == 4, "Input shape must be 4D"
             fixed_shape = []
             for d in dim:
                 if d.HasField("dim_value"):
@@ -248,6 +248,24 @@ class FusionOptimizer:
 
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "fuse_unsqueeze",
+                FusionOptimizer.match_unsqueeze,
+                FusionOptimizer.fold_unsqueeze,
+                priority=100,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_squeeze",
+                FusionOptimizer.match_squeeze,
+                FusionOptimizer.fold_squeeze,
+                priority=100,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "remove_redundant_reshape",
                 FusionOptimizer.match_redundant_reshape,
                 FusionOptimizer.fold_redundant_reshape,
@@ -351,6 +369,64 @@ class FusionOptimizer:
 
     @staticmethod
     def fold_identity(dag_model, match) -> bool:
+        node = match["node"]
+        input_name = node.inputs[0]["name"]
+        output_name = node.outputs[0]["name"]
+
+        for other_node in dag_model.nodes.values():
+            if other_node.name == node.name:
+                continue
+            for inp in other_node.inputs:
+                if inp["name"] == output_name:
+                    inp["name"] = input_name
+
+        del dag_model.nodes[node.name]
+        return True
+
+    @staticmethod
+    def match_unsqueeze(dag_model):
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type == "Unsqueeze":
+                if (
+                    len(node.inputs) >= 1
+                    and len(node.outputs) >= 1
+                    and node.inputs[0]["shape"] == node.outputs[0]["shape"]
+                ):
+                    matches.append({"node": node})
+        return matches
+
+    @staticmethod
+    def fold_unsqueeze(dag_model, match) -> bool:
+        node = match["node"]
+        input_name = node.inputs[0]["name"]
+        output_name = node.outputs[0]["name"]
+
+        for other_node in dag_model.nodes.values():
+            if other_node.name == node.name:
+                continue
+            for inp in other_node.inputs:
+                if inp["name"] == output_name:
+                    inp["name"] = input_name
+
+        del dag_model.nodes[node.name]
+        return True
+
+    @staticmethod
+    def match_squeeze(dag_model):
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type == "Squeeze":
+                if (
+                    len(node.inputs) >= 1
+                    and len(node.outputs) >= 1
+                    and node.inputs[0]["shape"] == node.outputs[0]["shape"]
+                ):
+                    matches.append({"node": node})
+        return matches
+
+    @staticmethod
+    def fold_squeeze(dag_model, match) -> bool:
         node = match["node"]
         input_name = node.inputs[0]["name"]
         output_name = node.outputs[0]["name"]

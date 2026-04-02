@@ -39,6 +39,7 @@
 #include "Topk.hpp"
 #include "Transpose.hpp"
 
+#include "Gather.hpp"
 namespace vkop {
 
 namespace ops {
@@ -111,6 +112,8 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
         return std::make_unique<Softmax>(use_ssbo);
     case OpType::NMS:
         return std::make_unique<Nms>();
+    case OpType::GATHER:
+        return std::make_unique<Gather>();
     default:
         return nullptr;
     }

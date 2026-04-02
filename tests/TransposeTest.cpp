@@ -11,7 +11,7 @@ using vkop::ops::Transpose;
 
 namespace {
 
-    
+
 #ifdef USE_CPP_REF
 std::vector<int> transpose_shape(const std::vector<int>& shape, const std::vector<int>& perm) {
     std::vector<int> new_shape(perm.size());

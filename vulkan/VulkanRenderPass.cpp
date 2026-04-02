@@ -1,5 +1,4 @@
 #include "vulkan/VulkanRenderPass.hpp"
-#include "vulkan/vulkan_core.h"
 
 namespace vkop {
 VulkanRenderPass::VulkanRenderPass(VkDevice device, VkFormat format)

@@ -10,7 +10,6 @@
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 
 #include "include/logger.hpp"
-#include "vulkan/vulkan_core.h"
 #include <cstdio>
 #include <csignal>
 #include <thread>

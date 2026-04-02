@@ -2,7 +2,6 @@
 #include "VulkanSwapchain.hpp"
 #include "include/logger.hpp"
 #include "vulkan/VulkanDevice.hpp"
-#include "vulkan/vulkan_core.h"
 #include <limits>
 
 namespace vkop {

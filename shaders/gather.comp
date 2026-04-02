@@ -1,0 +1,163 @@
+#version 450 core
+
+layout(set=0, binding=0) writeonly buffer outputBuffer { float data[]; } uOutput;
+layout(set=0, binding=1) readonly buffer inputBuffer { float data[]; } uInput;
+layout(set=0, binding=2) readonly buffer indexBuffer { int data[]; } uIndex;
+
+layout(push_constant) uniform gatherBuffer {
+    ivec4 inShape;
+    ivec4 indicesShape;
+    ivec4 outShape;
+    int axis;
+    int idims;
+    int odims;
+    int nindex; // 必须是 indices 的维度数 (rank)，不是元素总数！
+} uGatherPara;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+int getTotalSize(ivec4 shape, int dims) {
+    int size = 1;
+    for (int i = 0; i < dims; i++) {
+        if (i == 0) size *= shape.x;
+        else if (i == 1) size *= shape.y;
+        else if (i == 2) size *= shape.z;
+        else if (i == 3) size *= shape.w;
+    }
+    return size;
+}
+
+int ndToLinear(ivec4 coords, ivec4 shape, int dims) {
+    int linear = 0;
+    int stride = 1;
+    for (int i = dims - 1; i >= 0; i--) {
+        int dim_val = 0;
+        if (i == 0) dim_val = coords.x;
+        else if (i == 1) dim_val = coords.y;
+        else if (i == 2) dim_val = coords.z;
+        else if (i == 3) dim_val = coords.w;
+
+        linear += dim_val * stride;
+
+        if (i == 0) stride *= shape.x;
+        else if (i == 1) stride *= shape.y;
+        else if (i == 2) stride *= shape.z;
+        else if (i == 3) stride *= shape.w;
+    }
+    return linear;
+}
+
+void main()
+{
+    int total_output_size = getTotalSize(uGatherPara.outShape, uGatherPara.odims);
+    int global_id = int(gl_GlobalInvocationID.x);
+
+    if (global_id >= total_output_size) return;
+
+    // 1. 1D ID -> ND Coord (Row-Major)
+    ivec4 out_coord = ivec4(0);
+    int remaining = global_id;
+
+    // 从最后一位维度开始计算
+    for (int i = uGatherPara.odims - 1; i >= 0; i--) {
+        int dim_size = 0;
+        if (i == 0) dim_size = uGatherPara.outShape.x;
+        else if (i == 1) dim_size = uGatherPara.outShape.y;
+        else if (i == 2) dim_size = uGatherPara.outShape.z;
+        else if (i == 3) dim_size = uGatherPara.outShape.w;
+
+        if (dim_size > 0) {
+            out_coord[i] = remaining % dim_size;
+            remaining /= dim_size;
+        }
+    }
+
+    // 2. 提取 Indices 坐标
+    // ONNX: Output = [Data_prefix, Indices_shape, Data_suffix]
+    // 所以 Indices 坐标对应 Output 坐标的 [axis, axis + nindex) 这一段
+    ivec4 indices_coord = ivec4(0);
+
+    for (int i = 0; i < uGatherPara.nindex; i++) {
+        int source_dim = uGatherPara.axis + i;
+        int val = 0;
+
+        // 从 out_coord 中取值
+        if (source_dim == 0) val = out_coord.x;
+        else if (source_dim == 1) val = out_coord.y;
+        else if (source_dim == 2) val = out_coord.z;
+        else if (source_dim == 3) val = out_coord.w;
+
+        // 放入 indices_coord
+        if (i == 0) indices_coord.x = val;
+        else if (i == 1) indices_coord.y = val;
+        else if (i == 2) indices_coord.z = val;
+        else if (i == 3) indices_coord.w = val;
+    }
+
+    // 3. 获取索引值
+    int indices_linear_idx = ndToLinear(indices_coord, uGatherPara.indicesShape, uGatherPara.nindex);
+
+    // 边界检查
+    int total_indices_size = getTotalSize(uGatherPara.indicesShape, uGatherPara.nindex);
+    if (indices_linear_idx >= total_indices_size || indices_linear_idx < 0) return;
+
+    int gather_idx = uIndex.data[indices_linear_idx];
+
+    // 4. 处理负索引
+    int axis_size = 0;
+    if (uGatherPara.axis == 0) axis_size = uGatherPara.inShape.x;
+    else if (uGatherPara.axis == 1) axis_size = uGatherPara.inShape.y;
+    else if (uGatherPara.axis == 2) axis_size = uGatherPara.inShape.z;
+    else if (uGatherPara.axis == 3) axis_size = uGatherPara.inShape.w;
+
+    if (gather_idx < 0) gather_idx += axis_size;
+
+    // 5. 构建输入坐标
+    ivec4 in_coord = ivec4(0);
+
+    // 复制 axis 之前的维度
+    for (int i = 0; i < uGatherPara.axis; i++) {
+        int val = 0;
+        if (i == 0) val = out_coord.x;
+        else if (i == 1) val = out_coord.y;
+        else if (i == 2) val = out_coord.z;
+        else if (i == 3) val = out_coord.w;
+
+        if (i == 0) in_coord.x = val;
+        else if (i == 1) in_coord.y = val;
+        else if (i == 2) in_coord.z = val;
+        else if (i == 3) in_coord.w = val;
+    }
+
+    // 设置 axis 维度的值
+    if (uGatherPara.axis == 0) in_coord.x = gather_idx;
+    else if (uGatherPara.axis == 1) in_coord.y = gather_idx;
+    else if (uGatherPara.axis == 2) in_coord.z = gather_idx;
+    else if (uGatherPara.axis == 3) in_coord.w = gather_idx;
+
+    // 复制 axis 之后的维度
+    // 输出中，axis 之后的数据从 axis + nindex 开始
+    // 输入中，axis 之后的数据从 axis + 1 开始
+    int out_src_dim = uGatherPara.axis + uGatherPara.nindex;
+    for (int i = uGatherPara.axis + 1; i < uGatherPara.idims; i++) {
+        int val = 0;
+        if (out_src_dim == 0) val = out_coord.x;
+        else if (out_src_dim == 1) val = out_coord.y;
+        else if (out_src_dim == 2) val = out_coord.z;
+        else if (out_src_dim == 3) val = out_coord.w;
+
+        if (i == 0) in_coord.x = val;
+        else if (i == 1) in_coord.y = val;
+        else if (i == 2) in_coord.z = val;
+        else if (i == 3) in_coord.w = val;
+
+        out_src_dim++;
+    }
+
+    // 6. 计算输入索引并写入
+    int input_linear_idx = ndToLinear(in_coord, uGatherPara.inShape, uGatherPara.idims);
+
+    if (input_linear_idx >= 0 && input_linear_idx < uInput.data.length()) {
+        uOutput.data[global_id] = uInput.data[input_linear_idx];
+    }
+}

@@ -7,7 +7,6 @@
 #include <vector>
 
 #include "include/logger.hpp"
-#include "vulkan/vulkan_core.h"
 
 namespace vkop {
 
@@ -1005,13 +1004,13 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
         };
         const auto &desc = descs[i];
-        printf("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u\n",
-               i,
-               desc_names.find(desc.sType) != desc_names.end()
-                   ? desc_names.find(desc.sType)->second.c_str()
-                   : std::to_string(desc.sType).c_str(),
-               desc.extensionName ? desc.extensionName : "nullptr",
-               desc.corePromotedVersion);
+        LOG_INFO("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u",
+                 i,
+                 desc_names.find(desc.sType) != desc_names.end()
+                     ? desc_names.find(desc.sType)->second.c_str()
+                     : std::to_string(desc.sType).c_str(),
+                 desc.extensionName ? desc.extensionName : "nullptr",
+                 desc.corePromotedVersion);
     }
 
     return descs;
@@ -1074,10 +1073,10 @@ bool VulkanDevice::createLogicalDevice(
         pnext = it->get();
     }
     create_info.pNext = pnext;
-    std::cout << "enabled extensions count "
-              << enable_result.enabledExtensions.size() << std::endl;
+    LOG_INFO("enabled extensions count %d",
+             enable_result.enabledExtensions.size());
     for (auto &e : enable_result.enabledExtensions) {
-        std::cout << "enabled extension: " << e << std::endl;
+        LOG_INFO("enabled extension: %s", e);
     }
 
     if (vkCreateDevice(physicalDevice_, &create_info, nullptr,

@@ -164,6 +164,19 @@ public:
             if (!input || input->dtype() == typeid(int64_t)) {
                 continue;
             }
+            if (input->dtype() == typeid(int) && op->get_type() == vkop::ops::OpType::GATHER) {
+                // for gather input index
+                auto t = core::as_tensor<int>(input);
+                t->as_storage_buffer(dev_);
+                t->copyToGPU(cmdpool_);
+                continue;
+            }
+            if (op->get_type() == vkop::ops::OpType::GATHER) {
+                auto t = core::as_tensor<T>(input);
+                t->as_storage_buffer(dev_);
+                t->copyToGPU(cmdpool_);
+                continue;
+            }
             auto t = core::as_tensor<T>(input);
             assert(t);
             if (input->num_dims() <= 2) {
