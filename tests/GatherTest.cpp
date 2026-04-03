@@ -110,7 +110,7 @@ TEST(GatherTest, GatherComprehensiveTest) {
 
 
         LOG_INFO("Testing Gather fp16");
-        GatherTest<float> gather_test1(input_shape, axis, indices_shape, indices_data);
+        GatherTest<uint16_t> gather_test1(input_shape, axis, indices_shape, indices_data);
         const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs1 = {
             gather_test1.input,
             gather_test1.indices

@@ -40,6 +40,7 @@
 #include "Transpose.hpp"
 
 #include "Gather.hpp"
+#include "Range.hpp"
 namespace vkop {
 
 namespace ops {
@@ -114,6 +115,8 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
         return std::make_unique<Nms>();
     case OpType::GATHER:
         return std::make_unique<Gather>();
+    case OpType::RANGE:
+        return std::make_unique<Range>();
     default:
         return nullptr;
     }

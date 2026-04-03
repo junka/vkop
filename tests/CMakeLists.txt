@@ -56,6 +56,7 @@ set(TEST_SOURCES
     TopkTest.cpp
     NmsTest.cpp
     GatherTest.cpp
+    RangeTest.cpp
 )
 
 set(LIBTORCH_VERSION "2.10.0")

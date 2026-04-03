@@ -1,0 +1,47 @@
+#version 450 core
+
+layout(set=0, binding=0) writeonly buffer outputBuffer {
+    uint data[];
+} uOutput;
+
+layout(set=0, binding=1) readonly buffer startBuffer {
+    int data[];
+} uStart;
+
+layout(set=0, binding=2) readonly buffer limitBuffer {
+    int data[];
+} uLimit;
+
+layout(set=0, binding=3) readonly buffer deltaBuffer {
+    int data[];
+} uDelta;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(push_constant) uniform paraBuffer {
+    bool fp16;
+} uParam;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    float start = float(uStart.data[0]);
+    float limit = float(uLimit.data[0]);
+    float delta = float(uDelta.data[0]);
+    int total_size = int(ceil((limit - start) / delta));
+
+    if (index >= total_size) {
+        return;
+    }
+    if (uParam.fp16) {
+        vec2 value;
+        if (index % 2 == 0) {
+            value.x = start + index * delta;
+            if (index + 1 < total_size) {
+                value.y = start + float(index + 1) * delta;
+            }
+            uOutput.data[index/2] = packHalf2x16(value);
+        }
+    } else {
+        uOutput.data[index] = floatBitsToUint(start + index * delta);
+    }
+}

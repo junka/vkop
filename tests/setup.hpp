@@ -145,15 +145,19 @@ public:
         for (const auto & expect_output : expect_outputs) {
             if (expect_output->dtype() == typeid(float)) {
                 auto output = std::make_shared<Tensor<float>>(true);
+                output->resize(expect_output->getShape());
                 outputs.push_back(output);
             } else if (expect_output->dtype() == typeid(uint16_t)) {
                 auto output = std::make_shared<Tensor<uint16_t>>(true);
+                output->resize(expect_output->getShape());
                 outputs.push_back(output);
             } else if (expect_output->dtype() == typeid(int)) {
                 auto output = std::make_shared<Tensor<int>>(true);
+                output->resize(expect_output->getShape());
                 outputs.push_back(output);
             } else if (expect_output->dtype() == typeid(int64_t)) {
                 auto output = std::make_shared<Tensor<int64_t>>(true);
+                output->resize(expect_output->getShape());
                 outputs.push_back(output);
             } else {
                 LOG_ERROR("Unsupported output tensor type");
@@ -164,8 +168,7 @@ public:
             if (!input || input->dtype() == typeid(int64_t)) {
                 continue;
             }
-            if (input->dtype() == typeid(int) && op->get_type() == vkop::ops::OpType::GATHER) {
-                // for gather input index
+            if (input->dtype() == typeid(int)) {
                 auto t = core::as_tensor<int>(input);
                 t->as_storage_buffer(dev_);
                 t->copyToGPU(cmdpool_);
