@@ -174,7 +174,7 @@ public:
                 t->copyToGPU(cmdpool_);
                 continue;
             }
-            if (op->get_type() == vkop::ops::OpType::GATHER) {
+            if (op->get_type() == vkop::ops::OpType::GATHER || op->get_type() == vkop::ops::OpType::EXPAND) {
                 auto t = core::as_tensor<T>(input);
                 t->as_storage_buffer(dev_);
                 t->copyToGPU(cmdpool_);

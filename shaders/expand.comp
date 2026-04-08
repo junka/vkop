@@ -1,0 +1,197 @@
+#version 450 core
+
+// Output buffer - contains expanded tensor
+layout(set=0, binding=0) writeonly buffer outputBuffer {
+    uint data[];
+} uOutput;
+
+// Input buffer - contains original tensor to be expanded
+layout(set=0, binding=1) readonly buffer inputBuffer {
+    uint data[];
+} uInput;
+
+// Shape buffer - contains output shape information
+layout(set=0, binding=2) readonly buffer shapeBuffer {
+    int data[];
+} uShape;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Push constant containing input shape information and shape length
+layout(push_constant) uniform paraBuffer {
+    ivec4 input_shape;  // Shape of the input tensor (pad unused dimensions with 0)
+    uint shape_length;  // Number of valid dimensions in shape buffer
+    int fp16;
+} uParam;
+
+void main() {
+    uint global_id = gl_GlobalInvocationID.x;
+    
+    int out_d0 = (0 < uParam.shape_length) ? uShape.data[0] : 1;
+    int out_d1 = (1 < uParam.shape_length) ? uShape.data[1] : 1;
+    int out_d2 = (2 < uParam.shape_length) ? uShape.data[2] : 1;
+    int out_d3 = (3 < uParam.shape_length) ? uShape.data[3] : 1;
+    
+    // Calculate position in output tensor using row-major order
+    // For 4D tensor: index = idx0*out_d1*out_d2*out_d3 + idx1*out_d2*out_d3 + idx2*out_d3 + idx3
+    int temp = int(global_id);
+    int out_idx3, out_idx2, out_idx1, out_idx0;
+    
+    if (uParam.shape_length == 4) {
+        out_idx3 = temp % out_d3;  // Last dimension (fastest changing)
+        temp /= out_d3;
+        out_idx2 = temp % out_d2;
+        temp /= out_d2;
+        out_idx1 = temp % out_d1;
+        temp /= out_d1;
+        out_idx0 = temp;
+    } else if (uParam.shape_length == 3) {
+        out_idx2 = temp % out_d2;  // Last dimension for 3D (fastest changing)
+        temp /= out_d2;
+        out_idx1 = temp % out_d1;  // Middle dimension
+        temp /= out_d1;
+        out_idx0 = temp;           // First dimension (slowest changing)
+    } else if (uParam.shape_length == 2) {
+        out_idx1 = temp % out_d1;  // Last dimension for 2D (fastest changing)
+        temp /= out_d1;
+        out_idx0 = temp;           // First dimension
+    } else { // shape_length == 1
+        out_idx0 = temp;
+        out_idx1 = 0;
+        out_idx2 = 0;
+        out_idx3 = 0;
+    }
+    // Calculate total size based on actual shape length
+    int total_size;
+    if (uParam.shape_length == 1) {
+        total_size = out_d0;
+    } else if (uParam.shape_length == 2) {
+        total_size = out_d0 * out_d1;
+    } else if (uParam.shape_length == 3) {
+        total_size = out_d0 * out_d1 * out_d2;
+    } else { // uParam.shape_length == 4
+        total_size = out_d0 * out_d1 * out_d2 * out_d3;
+    }
+    
+    if (global_id >= total_size) {
+        return;
+    }
+
+    // Get input tensor dimensions from push constant
+    int in_d0 = (uParam.input_shape.x > 0) ? uParam.input_shape.x : 1;
+    int in_d1 = (uParam.input_shape.y > 0) ? uParam.input_shape.y : 1;
+    int in_d2 = (uParam.input_shape.z > 0) ? uParam.input_shape.z : 1;
+    int in_d3 = (uParam.input_shape.w > 0) ? uParam.input_shape.w : 1;
+
+    // Apply broadcasting rules: map output indices to input indices
+    // If input dim is 1, it can be broadcasted to any size in output
+    int in_idx0 = (in_d0 == 1) ? 0 : out_idx0;
+    int in_idx1 = (in_d1 == 1) ? 0 : out_idx1;
+    int in_idx2 = (in_d2 == 1) ? 0 : out_idx2;
+    int in_idx3 = (in_d3 == 1) ? 0 : out_idx3;
+
+    // Calculate linear index in input tensor using row-major order
+    int input_linear_idx;
+    if (uParam.shape_length <= 1) {
+        input_linear_idx = in_idx0;
+    } else if (uParam.shape_length <= 2) {
+        input_linear_idx = in_idx0 * in_d1 + in_idx1;
+    } else if (uParam.shape_length <= 3) {
+        input_linear_idx = in_idx0 * in_d1 * in_d2 + in_idx1 * in_d2 + in_idx2;
+    } else {
+        input_linear_idx = in_idx0 * in_d1 * in_d2 * in_d3 + in_idx1 * in_d2 * in_d3 + in_idx2 * in_d3 + in_idx3;
+    }
+
+    // Bounds checking to prevent invalid memory access
+    if (out_idx0 < out_d0 && out_idx1 < out_d1 && out_idx2 < out_d2 && out_idx3 < out_d3 &&
+        in_idx0 < in_d0 && in_idx1 < in_d1 && in_idx2 < in_d2 && in_idx3 < in_d3) {
+        
+        if (uParam.fp16 == 1) {
+            // For fp16, we need to handle the packed format
+            // Each uint contains two fp16 values
+            uint input_elem_idx = uint(input_linear_idx);
+            uint input_uint_idx = input_elem_idx / 2;  // Which uint in input buffer
+            uint input_sub_idx = input_elem_idx % 2;   // Which of the two fp16 values (0 or 1)
+            
+            // Get the fp16 value from input
+            uint input_packed = uInput.data[input_uint_idx];
+            vec2 input_fp16_values = unpackHalf2x16(input_packed);
+            float input_value = (input_sub_idx == 0) ? input_fp16_values.x : input_fp16_values.y;
+            
+            // Now determine where to place this value in output
+            uint output_elem_idx = global_id;
+            uint output_uint_idx = output_elem_idx / 2;  // Which uint in output buffer
+            uint output_sub_idx = output_elem_idx % 2;   // Which position in the pair (0 or 1)
+            
+            // If this is the first element of a pair (even index), try to get the second element too
+            if (output_sub_idx == 0) {
+                float val1 = input_value;
+                
+                // Check if there's a next element to pair with
+                if (global_id + 1 < uint(total_size)) {
+                    // Calculate the corresponding input for the next output element
+                    int temp_next = int(global_id + 1);
+                    int out_idx3_next, out_idx2_next, out_idx1_next, out_idx0_next;
+                    
+                    if (uParam.shape_length == 4) {
+                        out_idx3_next = temp_next % out_d3;
+                        temp_next /= out_d3;
+                        out_idx2_next = temp_next % out_d2;
+                        temp_next /= out_d2;
+                        out_idx1_next = temp_next % out_d1;
+                        temp_next /= out_d1;
+                        out_idx0_next = temp_next;
+                    } else if (uParam.shape_length == 3) {
+                        out_idx2_next = temp_next % out_d2;
+                        temp_next /= out_d2;
+                        out_idx1_next = temp_next % out_d1;
+                        temp_next /= out_d1;
+                        out_idx0_next = temp_next;
+                    } else if (uParam.shape_length == 2) {
+                        out_idx1_next = temp_next % out_d1;
+                        temp_next /= out_d1;
+                        out_idx0_next = temp_next;
+                    } else { // shape_length == 1
+                        out_idx0_next = temp_next;
+                        out_idx1_next = 0;
+                        out_idx2_next = 0;
+                        out_idx3_next = 0;
+                    }
+                    
+                    int in_idx0_next = (in_d0 == 1) ? 0 : out_idx0_next;
+                    int in_idx1_next = (in_d1 == 1) ? 0 : out_idx1_next;
+                    int in_idx2_next = (in_d2 == 1) ? 0 : out_idx2_next;
+                    int in_idx3_next = (in_d3 == 1) ? 0 : out_idx3_next;
+                    
+                    int input_linear_idx_next;
+                    if (uParam.shape_length <= 1) {
+                        input_linear_idx_next = in_idx0_next;
+                    } else if (uParam.shape_length <= 2) {
+                        input_linear_idx_next = in_idx0_next * in_d1 + in_idx1_next;
+                    } else if (uParam.shape_length <= 3) {
+                        input_linear_idx_next = in_idx0_next * in_d1 * in_d2 + in_idx1_next * in_d2 + in_idx2_next;
+                    } else {
+                        input_linear_idx_next = in_idx0_next * in_d1 * in_d2 * in_d3 + in_idx1_next * in_d2 * in_d3 + in_idx2_next * in_d3 + in_idx3_next;
+                    }
+                    
+                    uint input_elem_idx_next = uint(input_linear_idx_next);
+                    uint input_uint_idx_next = input_elem_idx_next / 2;
+                    uint input_sub_idx_next = input_elem_idx_next % 2;
+                    
+                    uint input_packed_next = uInput.data[input_uint_idx_next];
+                    vec2 input_fp16_values_next = unpackHalf2x16(input_packed_next);
+                    float val2 = (input_sub_idx_next == 0) ? input_fp16_values_next.x : input_fp16_values_next.y;
+                    
+                    // Pack both values and write to output
+                    uOutput.data[output_uint_idx] = packHalf2x16(vec2(val1, val2));
+                } else {
+                    // Last element, just duplicate it
+                    uOutput.data[output_uint_idx] = packHalf2x16(vec2(val1, val1));
+                }
+            }
+            // Odd indices are handled by the preceding even index threads
+        } else {
+            uOutput.data[global_id] = uInput.data[input_linear_idx];
+        }
+    }
+}
