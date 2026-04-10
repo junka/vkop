@@ -43,6 +43,10 @@
 #include "Gather.hpp"
 #include "Range.hpp"
 
+#include "Cos.hpp"
+#include "Sin.hpp"
+#include "Sqrt.hpp"
+
 namespace vkop {
 
 namespace ops {

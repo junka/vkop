@@ -395,15 +395,14 @@ class FusionOptimizer:
     @staticmethod
     def match_redundant_cast(dag_model):
         matches = []
-        
+
         # 匹配单个冗余Cast（输入输出类型相同）
         for node in dag_model.nodes.values():
             if node.op_type == "Cast":
                 # 检查当前节点的输入类型是否与输出类型相同
                 input_name = node.inputs[0]["name"]
                 input_dtype = None
-                
-                # 查找输入的实际类型
+
                 for other_node in dag_model.nodes.values():
                     for out in other_node.outputs:
                         if out["name"] == input_name:
@@ -411,50 +410,14 @@ class FusionOptimizer:
                             break
                     if input_dtype:
                         break
-                
-                output_dtype = node.attrs.get("to")
-                
+                output_dtype = node.attributes.get("to")
+
                 if input_dtype and input_dtype == output_dtype:
                     matches.append({"node": node, "type": "redundant_single"})
                     continue
-        
-        # 匹配连续的Cast链（如Cast A->B->A模式）
-        for node in dag_model.nodes.values():
-            if node.op_type == "Cast":
-                output_name = node.outputs[0]["name"]
-                
-                # 查找下一个连接的Cast节点
-                next_cast_nodes = []
-                for other_node in dag_model.nodes.values():
-                    if other_node.op_type == "Cast":
-                        for inp in other_node.inputs:
-                            if inp["name"] == output_name:
-                                next_cast_nodes.append(other_node)
-                
-                # 检查是否存在Cast A->B->A模式
-                for next_node in next_cast_nodes:
-                    input_name = node.inputs[0]["name"]
-                    
-                    # 获取初始输入类型
-                    input_dtype = None
-                    for other_node in dag_model.nodes.values():
-                        for out in other_node.outputs:
-                            if out["name"] == input_name:
-                                input_dtype = out.get("dtype")
-                                break
-                        if input_dtype:
-                            break
-                    
-                    # 检查next_node是否将类型转换回原始输入类型
-                    next_output_dtype = next_node.attrs.get("to")
-                    if input_dtype and next_output_dtype == input_dtype:
-                        matches.append({
-                            "first_node": node, 
-                            "second_node": next_node, 
-                            "type": "redundant_chain"
-                        })
 
-        # 匹配连续的相同类型Cast（如 A -> B -> B 模式）
+        # 匹配连续的Cast，找到可以直接删除的Cast（因为后续Cast会覆盖它的效果）
+        # 构建Cast链，找到可以被跳过的Cast节点
         for node in dag_model.nodes.values():
             if node.op_type == "Cast":
                 output_name = node.outputs[0]["name"]
@@ -464,17 +427,69 @@ class FusionOptimizer:
                     if other_node.op_type == "Cast":
                         for inp in other_node.inputs:
                             if inp["name"] == output_name:
-                                # 检查两个Cast操作的输出类型是否相同
-                                first_output_dtype = node.attrs.get("to")
-                                second_output_dtype = other_node.attrs.get("to")
+                                # 检查other_node的to类型是否与node的输入类型相同
+                                # 如果是这样，那么node是多余的，因为other_node直接将node的输入类型转换为目标类型
+                                first_input_name = node.inputs[0]["name"]
+                                first_input_dtype = None
                                 
-                                if first_output_dtype == second_output_dtype:
-                                    # 发现连续的相同类型Cast，第二个Cast是冗余的
+                                # 查找第一个Cast的输入类型
+                                for lookup_node in dag_model.nodes.values():
+                                    for out in lookup_node.outputs:
+                                        if out["name"] == first_input_name:
+                                            first_input_dtype = out.get("dtype")
+                                            break
+                                    if first_input_dtype:
+                                        break
+                                
+                                second_output_dtype = other_node.attributes.get("to")
+                                
+                                # 如果第一个Cast的输入类型与第二个Cast的输出类型相同，则第一个Cast是冗余的
+                                if first_input_dtype and first_input_dtype == second_output_dtype:
                                     matches.append({
-                                        "redundant_node": other_node,
-                                        "preceding_node": node,
-                                        "type": "redundant_duplicate_cast"
+                                        "redundant_node": node,  # 第一个Cast是冗余的
+                                        "following_node": other_node,
+                                        "type": "redundant_cast_then_cast"
                                     })
+
+        # 找到直接将数据转换为其自身类型的Cast（后续Cast覆盖前面的）
+        all_cast_nodes = [node for node in dag_model.nodes.values() if node.op_type == "Cast"]
+        
+        # 遍历所有Cast节点，检查是否有后续Cast覆盖了它的转换
+        for cast_node in all_cast_nodes:
+            # 找到所有从这个Cast输出出来的路径
+            output_name = cast_node.outputs[0]["name"]
+            
+            # 找到所有使用此输出的Cast节点
+            connected_cast_nodes = []
+            for node in all_cast_nodes:
+                for inp in node.inputs:
+                    if inp["name"] == output_name:
+                        connected_cast_nodes.append(node)
+            
+            # 检查连接的Cast节点
+            for connected_node in connected_cast_nodes:
+                # 获取cast_node的输入类型
+                input_name = cast_node.inputs[0]["name"]
+                input_dtype = None
+                for lookup_node in dag_model.nodes.values():
+                    for out in lookup_node.outputs:
+                        if out["name"] == input_name:
+                            input_dtype = out.get("dtype")
+                            break
+                    if input_dtype:
+                        break
+                
+                # 获取connected_node的目标类型
+                target_dtype = connected_node.attributes.get("to")
+                
+                # 如果cast_node的输入类型与connected_node的目标类型相同，则cast_node是冗余的
+                if input_dtype and input_dtype == target_dtype:
+                    matches.append({
+                        "redundant_node": cast_node,
+                        "following_node": connected_node,
+                        "type": "redundant_cast_then_cast"
+                    })
+
         return matches
 
     @staticmethod

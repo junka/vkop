@@ -45,6 +45,9 @@ enum class OpType {
     GATHER,
     RANGE,
     EXPAND,
+    SQRT,
+    SIN,
+    COS,
     TOTAL_NUM
 };
 
@@ -86,6 +89,9 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Gather",            // GATHER = 33
         "Range",             // RANGE = 34
         "Expand",            // EXPAND = 35
+        "Sqrt",              // SQRT = 36
+        "Sin",               // SIN = 37
+        "Cos",               // COS = 38
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -164,6 +170,12 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::RANGE;
     if (name == "Expand")
         return vkop::ops::OpType::EXPAND;
+    if (name == "Sqrt")
+        return vkop::ops::OpType::SQRT;
+    if (name == "Sin")
+        return vkop::ops::OpType::SIN;
+    if (name == "Cos")
+        return vkop::ops::OpType::COS;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }
