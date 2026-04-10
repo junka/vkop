@@ -248,6 +248,15 @@ class FusionOptimizer:
 
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "eliminate_redundant_cast",
+                FusionOptimizer.match_redundant_cast,
+                FusionOptimizer.fold_redundant_cast,
+                priority=100,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "fuse_unsqueeze",
                 FusionOptimizer.match_unsqueeze,
                 FusionOptimizer.fold_unsqueeze,
@@ -382,6 +391,141 @@ class FusionOptimizer:
 
         del dag_model.nodes[node.name]
         return True
+
+    @staticmethod
+    def match_redundant_cast(dag_model):
+        matches = []
+        
+        # 匹配单个冗余Cast（输入输出类型相同）
+        for node in dag_model.nodes.values():
+            if node.op_type == "Cast":
+                # 检查当前节点的输入类型是否与输出类型相同
+                input_name = node.inputs[0]["name"]
+                input_dtype = None
+                
+                # 查找输入的实际类型
+                for other_node in dag_model.nodes.values():
+                    for out in other_node.outputs:
+                        if out["name"] == input_name:
+                            input_dtype = out.get("dtype")
+                            break
+                    if input_dtype:
+                        break
+                
+                output_dtype = node.attrs.get("to")
+                
+                if input_dtype and input_dtype == output_dtype:
+                    matches.append({"node": node, "type": "redundant_single"})
+                    continue
+        
+        # 匹配连续的Cast链（如Cast A->B->A模式）
+        for node in dag_model.nodes.values():
+            if node.op_type == "Cast":
+                output_name = node.outputs[0]["name"]
+                
+                # 查找下一个连接的Cast节点
+                next_cast_nodes = []
+                for other_node in dag_model.nodes.values():
+                    if other_node.op_type == "Cast":
+                        for inp in other_node.inputs:
+                            if inp["name"] == output_name:
+                                next_cast_nodes.append(other_node)
+                
+                # 检查是否存在Cast A->B->A模式
+                for next_node in next_cast_nodes:
+                    input_name = node.inputs[0]["name"]
+                    
+                    # 获取初始输入类型
+                    input_dtype = None
+                    for other_node in dag_model.nodes.values():
+                        for out in other_node.outputs:
+                            if out["name"] == input_name:
+                                input_dtype = out.get("dtype")
+                                break
+                        if input_dtype:
+                            break
+                    
+                    # 检查next_node是否将类型转换回原始输入类型
+                    next_output_dtype = next_node.attrs.get("to")
+                    if input_dtype and next_output_dtype == input_dtype:
+                        matches.append({
+                            "first_node": node, 
+                            "second_node": next_node, 
+                            "type": "redundant_chain"
+                        })
+
+        # 匹配连续的相同类型Cast（如 A -> B -> B 模式）
+        for node in dag_model.nodes.values():
+            if node.op_type == "Cast":
+                output_name = node.outputs[0]["name"]
+                
+                # 查找下一个连接的Cast节点
+                for other_node in dag_model.nodes.values():
+                    if other_node.op_type == "Cast":
+                        for inp in other_node.inputs:
+                            if inp["name"] == output_name:
+                                # 检查两个Cast操作的输出类型是否相同
+                                first_output_dtype = node.attrs.get("to")
+                                second_output_dtype = other_node.attrs.get("to")
+                                
+                                if first_output_dtype == second_output_dtype:
+                                    # 发现连续的相同类型Cast，第二个Cast是冗余的
+                                    matches.append({
+                                        "redundant_node": other_node,
+                                        "preceding_node": node,
+                                        "type": "redundant_duplicate_cast"
+                                    })
+        return matches
+
+    @staticmethod
+    def fold_redundant_cast(dag_model, match) -> bool:
+        match_type = match["type"]
+        
+        if match_type == "redundant_single":
+            node = match["node"]
+            input_name = node.inputs[0]["name"]
+            output_name = node.outputs[0]["name"]
+            
+            # 将后续节点的输入从output_name重定向到input_name
+            for other_node in dag_model.nodes.values():
+                for inp in other_node.inputs:
+                    if inp["name"] == output_name:
+                        inp["name"] = input_name
+
+            # 删除此冗余节点
+            to_remove_initializers = []
+            for inp in node.inputs[1:]:
+                if inp["name"] in dag_model.initializers:
+                    to_remove_initializers.append(inp["name"])
+
+            del dag_model.nodes[node.name]
+            for init_name in to_remove_initializers:
+                if init_name in dag_model.initializers:
+                    del dag_model.initializers[init_name]
+            
+            return True
+            
+        elif match_type == "redundant_chain":
+            first_node = match["first_node"]
+            second_node = match["second_node"]
+            
+            initial_input_name = first_node.inputs[0]["name"]
+            final_output_name = second_node.outputs[0]["name"]
+            
+            # 将使用最终输出的节点重定向到初始输入
+            for other_node in dag_model.nodes.values():
+                for inp in other_node.inputs:
+                    if inp["name"] == final_output_name:
+                        inp["name"] = initial_input_name
+
+            # 删除两个冗余的Cast节点
+            del dag_model.nodes[first_node.name]
+            del dag_model.nodes[second_node.name]
+            
+            return True
+        
+        return False
+
 
     @staticmethod
     def match_unsqueeze(dag_model):

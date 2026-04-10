@@ -16,12 +16,16 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 #endif
 
 #include "activation.comp"
+#include "broadcast.comp"
 
 layout(binding = 0) writeonly uniform image2DArray uOutput;
 layout(binding = 1) uniform sampler2DArray inputA;
 layout(binding = 2) uniform sampler2DArray inputB;
 
 layout(push_constant) uniform constBuffer {
+    ivec4 shapeA; // nchw
+    ivec4 shapeB; // nchw
+    int broadcast;
     int activation;
     int scalar;
 } uConstant;
@@ -30,8 +34,13 @@ void main() {
     ivec3 texCoord = ivec3(gl_GlobalInvocationID);
 
     // Fetch data from RGBA texture memory and perform element-wise addition
-    FLOAT4 a = FLOAT4(texelFetch(inputA, texCoord, 0));
-    FLOAT4 b = FLOAT4(texelFetch(inputB, texCoord, 0));
+    FLOAT4 a, b;
+    if (uConstant.broadcast == 0) {
+        a = FLOAT4(texelFetch(inputA, texCoord, 0));
+        b = FLOAT4(texelFetch(inputB, texCoord, 0));
+    } else {
+        fetchWithBroadcast(inputA, inputB, uConstant.shapeA, uConstant.shapeB, texCoord, a, b);
+    }
     FLOAT4 sum = a + b;
     sum = activation(sum, uConstant.activation);
     // Write the result to the output RGBA texture

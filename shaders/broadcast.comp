@@ -1,0 +1,74 @@
+#ifndef BROADCAST_COMP
+#define BROADCAST_COMP
+#extension GL_AMD_gpu_shader_half_float: enable
+
+bool areTextureArraysSameSize(sampler2DArray inputA, sampler2DArray inputB) {
+    ivec3 sizeA = textureSize(inputA, 0);
+    ivec3 sizeB = textureSize(inputB, 0);
+    return sizeA.x == sizeB.x && sizeA.y == sizeB.y && sizeA.z == sizeB.z;
+}
+
+// NCHW -> W, N * H, C4
+ivec3 getBroadcastCoord(ivec3 originalCoord, ivec4 shape) {
+    return ivec3(
+        shape.w == 1 ? 0 : originalCoord.x,
+        shape.x * shape.z == 1 ? 0 : originalCoord.y,
+        shape.y <= 4 ? 0 : originalCoord.z
+    );
+}
+
+vec4 broadcastChannels(vec4 data, int chan4, int total_chan) {
+    int channels_in_current_layer = min(4, total_chan - chan4 * 4);
+    if (channels_in_current_layer == 4) {
+        return data;
+    }
+    if (channels_in_current_layer == 1) {
+        return vec4(data.x);
+    } else if (channels_in_current_layer == 2) {
+        return vec4(data.x, data.y, data.x, data.x);
+    } else if (channels_in_current_layer == 3) {
+        return vec4(data.x, data.y, data.z, data.x);
+    }
+    return data;
+}
+
+f16vec4 broadcastChannels(f16vec4 data, int chan4, int total_chan) {
+    int channels_in_current_layer = min(4, total_chan - chan4 * 4);
+    if (channels_in_current_layer == 4) {
+        return data;
+    }
+
+    if (channels_in_current_layer == 1) {
+        return f16vec4(data.x);
+    } else if (channels_in_current_layer == 2) {
+        return f16vec4(data.x, data.y, data.x, data.x);
+    } else if (channels_in_current_layer == 3) {
+        return f16vec4(data.x, data.y, data.z, data.x);
+    }
+    return data;
+}
+
+void fetchWithBroadcast(sampler2DArray inputA, sampler2DArray inputB, ivec4 shapeA, ivec4 shapeB, ivec3 texCoord, out vec4 valueA, out vec4 valueB) {
+    ivec3 sampleCoordA = getBroadcastCoord(texCoord, shapeA);
+    ivec3 sampleCoordB = getBroadcastCoord(texCoord, shapeB);
+    valueA = texelFetch(inputA, sampleCoordA, 0);
+    valueB = texelFetch(inputB, sampleCoordB, 0);
+
+    valueA = broadcastChannels(valueA, sampleCoordA.z, shapeA.y);
+    valueB = broadcastChannels(valueB, sampleCoordB.z, shapeB.y);
+}
+
+
+void fetchWithBroadcast(sampler2DArray inputA, sampler2DArray inputB, ivec4 shapeA, ivec4 shapeB, ivec3 texCoord, 
+    out f16vec4 valueA, out f16vec4 valueB) {
+
+    ivec3 sampleCoordA = getBroadcastCoord(texCoord, shapeA);
+    ivec3 sampleCoordB = getBroadcastCoord(texCoord, shapeB);
+    valueA = f16vec4(texelFetch(inputA, sampleCoordA, 0));
+    valueB = f16vec4(texelFetch(inputB, sampleCoordB, 0));
+
+    valueA = broadcastChannels(valueA, sampleCoordA.z, shapeA.y);
+    valueB = broadcastChannels(valueB, sampleCoordB.z, shapeB.y);
+}
+
+#endif // BROADCAST_COMP

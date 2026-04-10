@@ -231,53 +231,53 @@ class ModelConverter:
                     print(f"Modified shape of input {input_name} to {shape_dims}")
                 inputs_with_shape.append({"name": input_name, "shape": shape_dims})
 
-            if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
-                for i in range(len(inputs_with_shape)):
-                    if inputs_with_shape[i]["name"] == node.input[0]:
-                        id0 = i
-                    if inputs_with_shape[i]["name"] == node.input[1]:
-                        id1 = i
-                if len(inputs_with_shape[id0]["shape"]) != len(inputs_with_shape[id1]["shape"]):
-                    shape = self.broadcast_shapes(
-                        inputs_with_shape[id0]["shape"], inputs_with_shape[id1]["shape"]
-                    )
-                    print(
-                        "  Elemwise operation with multiple inputs. Broadcasting shapes...", shape
-                    )
-                    if len(inputs_with_shape[id0]["shape"]) != len(shape):
-                        inputs_with_shape[id0]["shape"] = shape
-                        for initializer in graph.initializer:
-                            if initializer.name == inputs_with_shape[id0]["name"]:
-                                orig_init = dag_model.initializers[initializer.name]
-                                orig_array = numpy_helper.to_array(orig_init)
-                                if orig_array.size == 1:
-                                    scalar_val = orig_array.item()
-                                    expanded_data = np.full(
-                                        shape, scalar_val, dtype=orig_array.dtype
-                                    )
-                                else:
-                                    expanded_data = np.broadcast_to(orig_array, shape).copy()
-                                new_init = numpy_helper.from_array(
-                                    expanded_data, name=initializer.name
-                                )
-                                dag_model.initializers[initializer.name] = new_init
-                    if len(inputs_with_shape[id1]["shape"]) != len(shape):
-                        inputs_with_shape[id1]["shape"] = shape
-                        for initializer in graph.initializer:
-                            if initializer.name == inputs_with_shape[id1]["name"]:
-                                orig_init = dag_model.initializers[initializer.name]
-                                orig_array = numpy_helper.to_array(orig_init)
-                                if orig_array.size == 1:
-                                    scalar_val = orig_array.item()
-                                    expanded_data = np.full(
-                                        shape, scalar_val, dtype=orig_array.dtype
-                                    )
-                                else:
-                                    expanded_data = np.broadcast_to(orig_array, shape).copy()
-                                new_init = numpy_helper.from_array(
-                                    expanded_data, name=initializer.name
-                                )
-                                dag_model.initializers[initializer.name] = new_init
+            # if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
+            #     for i in range(len(inputs_with_shape)):
+            #         if inputs_with_shape[i]["name"] == node.input[0]:
+            #             id0 = i
+            #         if inputs_with_shape[i]["name"] == node.input[1]:
+            #             id1 = i
+            #     if len(inputs_with_shape[id0]["shape"]) != len(inputs_with_shape[id1]["shape"]):
+            #         shape = self.broadcast_shapes(
+            #             inputs_with_shape[id0]["shape"], inputs_with_shape[id1]["shape"]
+            #         )
+            #         print(
+            #             "  Elemwise operation with multiple inputs. Broadcasting shapes...", shape
+            #         )
+            #         if len(inputs_with_shape[id0]["shape"]) != len(shape):
+            #             inputs_with_shape[id0]["shape"] = shape
+            #             for initializer in graph.initializer:
+            #                 if initializer.name == inputs_with_shape[id0]["name"]:
+            #                     orig_init = dag_model.initializers[initializer.name]
+            #                     orig_array = numpy_helper.to_array(orig_init)
+            #                     if orig_array.size == 1:
+            #                         scalar_val = orig_array.item()
+            #                         expanded_data = np.full(
+            #                             shape, scalar_val, dtype=orig_array.dtype
+            #                         )
+            #                     else:
+            #                         expanded_data = np.broadcast_to(orig_array, shape).copy()
+            #                     new_init = numpy_helper.from_array(
+            #                         expanded_data, name=initializer.name
+            #                     )
+            #                     dag_model.initializers[initializer.name] = new_init
+            #         if len(inputs_with_shape[id1]["shape"]) != len(shape):
+            #             inputs_with_shape[id1]["shape"] = shape
+            #             for initializer in graph.initializer:
+            #                 if initializer.name == inputs_with_shape[id1]["name"]:
+            #                     orig_init = dag_model.initializers[initializer.name]
+            #                     orig_array = numpy_helper.to_array(orig_init)
+            #                     if orig_array.size == 1:
+            #                         scalar_val = orig_array.item()
+            #                         expanded_data = np.full(
+            #                             shape, scalar_val, dtype=orig_array.dtype
+            #                         )
+            #                     else:
+            #                         expanded_data = np.broadcast_to(orig_array, shape).copy()
+            #                     new_init = numpy_helper.from_array(
+            #                         expanded_data, name=initializer.name
+            #                     )
+            #                     dag_model.initializers[initializer.name] = new_init
 
             new_node = Node(
                 op_type=node.op_type,

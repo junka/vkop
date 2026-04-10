@@ -3,11 +3,19 @@ precision highp float;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-// Binding points for input and output textures
+#include "broadcast.comp"
 
 layout(binding = 0) writeonly uniform image2DArray uOutput;
 layout(binding = 1) uniform sampler2DArray inputA;
 layout(binding = 2) uniform sampler2DArray inputB;
+
+layout(push_constant) uniform constBuffer {
+    ivec4 shapeA;
+    ivec4 shapeB;
+    int broadcast;
+    int activation;
+    int scalar;
+} uConstant;
 
 // https://forums.developer.nvidia.com/t/accuracy-of-fp-division/7762
 // GPU 使用倒数实现除法，精度低于CPU大约 2 ULP
@@ -15,8 +23,13 @@ void main() {
     ivec3 texCoord = ivec3(gl_GlobalInvocationID);
 
     // Fetch data from RGBA texture memory and perform element-wise addition
-    vec4 a = texelFetch(inputA, texCoord, 0);
-    vec4 b = texelFetch(inputB, texCoord, 0);
+    vec4 a, b;
+    if (uConstant.broadcast == 0) {
+        a = texelFetch(inputA, texCoord, 0);
+        b = texelFetch(inputB, texCoord, 0);
+    } else {
+        fetchWithBroadcast(inputA, inputB, uConstant.shapeA, uConstant.shapeB, texCoord, a, b);
+    }
     vec4 ret = a/b;
 
     // Write the result to the output RGBA texture

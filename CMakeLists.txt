@@ -96,6 +96,7 @@ set(SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
 file(GLOB SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
 # Exclude common files from SHADER_FILES
 list(FILTER SHADER_FILES EXCLUDE REGEX "activation\\.comp$")
+list(FILTER SHADER_FILES EXCLUDE REGEX "broadcast\\.comp$")
 
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
