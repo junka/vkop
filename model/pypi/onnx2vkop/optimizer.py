@@ -206,7 +206,9 @@ class MultiRoundOptimizer:
                         if verbose:
                             current_nodes = len(dag_model.nodes)
                             status = "✓" if changed else "○"
-                            print(f"  {status} {opt_pass.name} match (Current Nodes: {current_nodes})")
+                            print(
+                                f"  {status} {opt_pass.name} match (Current Nodes: {current_nodes})"
+                            )
 
                 except Exception as e:
                     if verbose:
@@ -345,6 +347,24 @@ class FusionOptimizer:
             )
         )
 
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_isnan_where_softmax",
+                FusionOptimizer.match_isnan_where_softmax,
+                FusionOptimizer.fold_isnan_where_softmax,
+                priority=75,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_into_attention",
+                FusionOptimizer.match_attention,
+                FusionOptimizer.fold_attention,
+                priority=75,
+            )
+        )
+
         return optimizer
 
     @staticmethod
@@ -421,7 +441,7 @@ class FusionOptimizer:
         for node in dag_model.nodes.values():
             if node.op_type == "Cast":
                 output_name = node.outputs[0]["name"]
-                
+
                 # 查找下一个连接的Cast节点
                 for other_node in dag_model.nodes.values():
                     if other_node.op_type == "Cast":
@@ -431,7 +451,7 @@ class FusionOptimizer:
                                 # 如果是这样，那么node是多余的，因为other_node直接将node的输入类型转换为目标类型
                                 first_input_name = node.inputs[0]["name"]
                                 first_input_dtype = None
-                                
+
                                 # 查找第一个Cast的输入类型
                                 for lookup_node in dag_model.nodes.values():
                                     for out in lookup_node.outputs:
@@ -440,32 +460,34 @@ class FusionOptimizer:
                                             break
                                     if first_input_dtype:
                                         break
-                                
+
                                 second_output_dtype = other_node.attributes.get("to")
-                                
+
                                 # 如果第一个Cast的输入类型与第二个Cast的输出类型相同，则第一个Cast是冗余的
                                 if first_input_dtype and first_input_dtype == second_output_dtype:
-                                    matches.append({
-                                        "redundant_node": node,  # 第一个Cast是冗余的
-                                        "following_node": other_node,
-                                        "type": "redundant_cast_then_cast"
-                                    })
+                                    matches.append(
+                                        {
+                                            "redundant_node": node,  # 第一个Cast是冗余的
+                                            "following_node": other_node,
+                                            "type": "redundant_cast_then_cast",
+                                        }
+                                    )
 
         # 找到直接将数据转换为其自身类型的Cast（后续Cast覆盖前面的）
         all_cast_nodes = [node for node in dag_model.nodes.values() if node.op_type == "Cast"]
-        
+
         # 遍历所有Cast节点，检查是否有后续Cast覆盖了它的转换
         for cast_node in all_cast_nodes:
             # 找到所有从这个Cast输出出来的路径
             output_name = cast_node.outputs[0]["name"]
-            
+
             # 找到所有使用此输出的Cast节点
             connected_cast_nodes = []
             for node in all_cast_nodes:
                 for inp in node.inputs:
                     if inp["name"] == output_name:
                         connected_cast_nodes.append(node)
-            
+
             # 检查连接的Cast节点
             for connected_node in connected_cast_nodes:
                 # 获取cast_node的输入类型
@@ -478,29 +500,31 @@ class FusionOptimizer:
                             break
                     if input_dtype:
                         break
-                
+
                 # 获取connected_node的目标类型
                 target_dtype = connected_node.attributes.get("to")
-                
+
                 # 如果cast_node的输入类型与connected_node的目标类型相同，则cast_node是冗余的
                 if input_dtype and input_dtype == target_dtype:
-                    matches.append({
-                        "redundant_node": cast_node,
-                        "following_node": connected_node,
-                        "type": "redundant_cast_then_cast"
-                    })
+                    matches.append(
+                        {
+                            "redundant_node": cast_node,
+                            "following_node": connected_node,
+                            "type": "redundant_cast_then_cast",
+                        }
+                    )
 
         return matches
 
     @staticmethod
     def fold_redundant_cast(dag_model, match) -> bool:
         match_type = match["type"]
-        
+
         if match_type == "redundant_single":
             node = match["node"]
             input_name = node.inputs[0]["name"]
             output_name = node.outputs[0]["name"]
-            
+
             # 将后续节点的输入从output_name重定向到input_name
             for other_node in dag_model.nodes.values():
                 for inp in other_node.inputs:
@@ -517,16 +541,16 @@ class FusionOptimizer:
             for init_name in to_remove_initializers:
                 if init_name in dag_model.initializers:
                     del dag_model.initializers[init_name]
-            
+
             return True
-            
+
         elif match_type == "redundant_chain":
             first_node = match["first_node"]
             second_node = match["second_node"]
-            
+
             initial_input_name = first_node.inputs[0]["name"]
             final_output_name = second_node.outputs[0]["name"]
-            
+
             # 将使用最终输出的节点重定向到初始输入
             for other_node in dag_model.nodes.values():
                 for inp in other_node.inputs:
@@ -536,11 +560,10 @@ class FusionOptimizer:
             # 删除两个冗余的Cast节点
             del dag_model.nodes[first_node.name]
             del dag_model.nodes[second_node.name]
-            
-            return True
-        
-        return False
 
+            return True
+
+        return False
 
     @staticmethod
     def match_unsqueeze(dag_model):
@@ -1353,6 +1376,396 @@ class FusionOptimizer:
         dag_model.nodes[fused.name] = fused
 
         print(f"Fused Conv '{conv_node.name}' + Add bias into Conv with bias")
+        return True
+
+    @staticmethod
+    def match_isnan_where_softmax(dag_model):
+        """
+        Match pattern where IsNaN + Where is used to create a mask for Softmax.
+
+        The pattern to match:
+            softmax
+            |     |
+        IsNaN     |
+            |     |
+            Where
+            |
+        """
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        # 遍历所有Softmax节点
+        for softmax_node in dag_model.nodes.values():
+            if softmax_node.op_type != "Softmax":
+                continue
+
+            # 检查Softmax的输出是否同时连接到IsNaN和另一个节点
+            softmax_output_name = softmax_node.outputs[0]["name"]
+
+            isnan_node = None
+            where_node = None
+
+            # 查找连接到Softmax输出的IsNaN节点
+            for node in dag_model.nodes.values():
+                if node.op_type == "IsNaN":
+                    for inp in node.inputs:
+                        if inp["name"] == softmax_output_name:
+                            isnan_node = node
+                            break
+                elif node.op_type == "Where":
+                    # 检查Where是否有IsNaN的输出作为其中一个输入
+                    isnan_output_found = False
+                    softmax_direct_input = False
+                    for inp in node.inputs:
+                        if inp["name"] == softmax_output_name:
+                            softmax_direct_input = True
+                        elif isnan_node and inp["name"] == isnan_node.outputs[0]["name"]:
+                            isnan_output_found = True
+
+                    if isnan_output_found and softmax_direct_input:
+                        where_node = node
+                        break
+
+            # 如果找到了完整的模式
+            if isnan_node and where_node:
+                # 验证Where节点有三个输入：condition, X, Y
+                if len(where_node.inputs) == 3:
+                    # 找到三个输入：条件、X值、Y值
+                    condition_input = None
+                    x_input = None
+                    y_input = None
+
+                    for i, inp in enumerate(where_node.inputs):
+                        if inp["name"] == isnan_node.outputs[0]["name"]:
+                            condition_input = inp
+                        elif inp["name"] == softmax_output_name:
+                            if x_input is None:
+                                x_input = inp
+                            else:
+                                y_input = inp
+                        else:
+                            if x_input is None:
+                                x_input = inp
+                            elif y_input is None:
+                                y_input = inp
+
+                    # 确保找到了所有输入
+                    if condition_input and x_input and y_input:
+                        matches.append(
+                            {
+                                "softmax_node": softmax_node,
+                                "isnan_node": isnan_node,
+                                "where_node": where_node,
+                                "condition_input": condition_input,
+                                "x_input": x_input,
+                                "y_input": y_input,
+                            }
+                        )
+        return matches
+
+    @staticmethod
+    def fold_isnan_where_softmax(dag_model, match) -> bool:
+        """
+        Fold the IsNaN + Where pattern after Softmax into a modified Softmax operator.
+        """
+        softmax_node = match["softmax_node"]
+        isnan_node = match["isnan_node"]
+        where_node = match["where_node"]
+
+        # 检查Where的Y输入是否是常量（通常是0）
+        y_input = match["y_input"]
+        replacement_value = 0.0
+
+        if y_input["name"] in dag_model.initializers:
+            # 如果Y输入是初始化器（常量），获取其值
+            initializer = dag_model.initializers[y_input["name"]]
+            tensor_array = numpy_helper.to_array(initializer)
+            replacement_value = tensor_array.item() if tensor_array.size == 1 else 0.0
+
+        # 获取Softmax的属性
+        softmax_attrs = dict(softmax_node.attributes)
+        softmax_attrs["nan_optimization"] = True
+        softmax_attrs["nan_replacement_value"] = float(replacement_value)
+
+        # 创建融合后的Softmax节点
+        fused_softmax_node = Node(
+            op_type="Softmax",
+            name=f"{softmax_node.name}_nan_handled",
+            attributes=softmax_attrs,
+            inputs=softmax_node.inputs[:],  # 使用原始Softmax的输入
+            outputs=where_node.outputs[:],  # 输出使用Where的输出
+        )
+
+        # 删除旧的节点
+        nodes_to_delete = [isnan_node, where_node]
+        for node in nodes_to_delete:
+            if node.name in dag_model.nodes:
+                del dag_model.nodes[node.name]
+
+        # 替换Softmax节点
+        if softmax_node.name in dag_model.nodes:
+            del dag_model.nodes[softmax_node.name]
+
+        # 添加融合后的节点
+        dag_model.nodes[fused_softmax_node.name] = fused_softmax_node
+
+        print(
+            f"Fused Softmax + IsNaN + Where pattern into enhanced Softmax: {fused_softmax_node.name}"
+        )
+        return True
+
+    @staticmethod
+    def match_attention(dag_model):
+        """
+        Match attention patterns for potential fusion.
+
+        The pattern to match:
+            Q          K             V
+            |          |             |
+        Q*sqrt(scale) K*sqrt(scale)  |
+            |          |             |
+            |       Transpose        |
+            |          |             |
+            ---MatMul---             |
+                |                    |
+        att_mask---Add               |
+                |                    |
+        softcap (if provided)        |
+                |                    |
+            Softmax                  |
+                |                    |
+                -----MatMul----------
+                        |
+                        Y
+        """
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        # 首先寻找Softmax节点，这是Attention模式的关键特征之一
+        for softmax_node in dag_model.nodes.values():
+            if softmax_node.op_type != "Softmax":
+                continue
+
+            # Softmax的输出应该连接到一个MatMul
+            softmax_output_name = softmax_node.outputs[0]["name"]
+            matmul_candidates = []
+
+            for node in dag_model.nodes.values():
+                if node.op_type == "MatMul":
+                    for inp in node.inputs:
+                        if inp["name"] == softmax_output_name:
+                            matmul_candidates.append(node)
+
+            if not matmul_candidates:
+                continue
+
+            for matmul_v_node in matmul_candidates:
+                # 现在向上追溯以找到完整的Attention模式
+
+                # 1. 检查softmax的输入是否来自Add节点（用于添加attention mask）
+                softmax_input_name = softmax_node.inputs[0]["name"]
+                add_node = None
+                att_mask_input = None
+
+                for node in dag_model.nodes.values():
+                    if node.op_type == "Add":
+                        for inp in node.inputs:
+                            if inp["name"] == softmax_input_name:
+                                # 检查这个输入是否是来自matmul_qk的结果
+                                add_node = node
+                                # 找到另一个输入作为att_mask
+                                for other_inp in node.inputs:
+                                    if other_inp["name"] != softmax_input_name:
+                                        att_mask_input = other_inp
+                                break
+                        if add_node:
+                            break
+
+                # 或者softmax直接连接到matmul_qk的输出
+                matmul_qk_node = None
+                if add_node:
+                    # 如果有Add节点，检查Add的输入是否来自MatMul(Q*K^T)
+                    add_input_name = None
+                    for inp in add_node.inputs:
+                        if inp["name"] != att_mask_input["name"] if att_mask_input else True:
+                            input_producer = producer.get(inp["name"])
+                            if input_producer and input_producer.op_type == "MatMul":
+                                matmul_qk_node = input_producer
+                                break
+                else:
+                    # 检查softmax输入是否直接来自MatMul
+                    input_producer = producer.get(softmax_input_name)
+                    if input_producer and input_producer.op_type == "MatMul":
+                        matmul_qk_node = input_producer
+
+                if not matmul_qk_node:
+                    continue
+
+                # 2. 检查matmul_qk的两个输入
+                q_input_name = None
+                k_input_name = None
+                for inp in matmul_qk_node.inputs:
+                    input_producer = producer.get(inp["name"])
+                    if input_producer:
+                        # 检查输入是否是来自Transpose(K)或直接来自Q的scaled版本
+                        if input_producer.op_type == "Transpose":
+                            # 检查Transpose的输入是否是K经过scale处理的
+                            transpose_input_producer = producer.get(
+                                input_producer.inputs[0]["name"]
+                            )
+                            if transpose_input_producer:
+                                k_input_name = input_producer.inputs[0]["name"]
+                        else:
+                            # 这可能是Q经过scale处理的输出
+                            q_input_name = inp["name"]
+
+                if not q_input_name or not k_input_name:
+                    continue
+
+                # 3. 找到原始的Q、K、V节点
+                q_node = producer.get(q_input_name)
+                k_node = producer.get(k_input_name)
+
+                # 检查Q和K是否经过了scaling操作 (Q*sqrt(scale) 和 K*sqrt(scale))
+                original_q = None
+                original_k = None
+
+                if q_node and q_node.op_type in ["Mul", "Div"]:
+                    # 检查是否是乘以或除以scale
+                    for inp in q_node.inputs:
+                        if inp["name"] != q_input_name:  # 找到scale输入
+                            # 检查这个输入是否是常量
+                            if inp["name"] in dag_model.initializers:
+                                original_q = producer.get(
+                                    q_node.inputs[0]["name"]
+                                    if q_node.inputs[0]["name"] != inp["name"]
+                                    else q_node.inputs[1]["name"]
+                                )
+                                break
+
+                if k_node and k_node.op_type in ["Mul", "Div"]:
+                    for inp in k_node.inputs:
+                        if inp["name"] != k_input_name:
+                            if inp["name"] in dag_model.initializers:
+                                original_k = producer.get(
+                                    k_node.inputs[0]["name"]
+                                    if k_node.inputs[0]["name"] != inp["name"]
+                                    else k_node.inputs[1]["name"]
+                                )
+                                break
+
+                if not original_q or not original_k:
+                    continue
+
+                # 4. 检查V是否直接连接到第二个MatMul
+                v_input_name = None
+                for inp in matmul_v_node.inputs:
+                    if inp["name"] != softmax_output_name:  # 找到V的输入
+                        v_input_name = inp["name"]
+
+                if not v_input_name:
+                    continue
+
+                original_v = producer.get(v_input_name)
+
+                if original_v:
+                    # 验证找到了完整的Attention模式
+                    match = {
+                        "q_node": original_q,
+                        "k_node": original_k,
+                        "v_node": original_v,
+                        "q_scaled": q_node,
+                        "k_scaled": k_node,
+                        "transpose_k": producer.get(k_input_name),  # K转置节点
+                        "matmul_qk": matmul_qk_node,
+                        "add_node": add_node,
+                        "softmax_node": softmax_node,
+                        "matmul_v": matmul_v_node,
+                        "att_mask": att_mask_input,
+                    }
+
+                    matches.append(match)
+
+        return matches
+
+    @staticmethod
+    def fold_attention(dag_model, match) -> bool:
+        """
+        Fold the matched attention pattern into a single Attention operator.
+        """
+        q_node = match["q_node"]
+        k_node = match["k_node"]
+        v_node = match["v_node"]
+        q_scaled = match["q_scaled"]
+        k_scaled = match["k_scaled"]
+        transpose_k = match["transpose_k"]
+        matmul_qk = match["matmul_qk"]
+        add_node = match["add_node"]
+        softmax_node = match["softmax_node"]
+        matmul_v = match["matmul_v"]
+        att_mask = match["att_mask"]
+
+        # 提取scale值
+        scale_val = 1.0  # 默认值
+        if q_scaled and q_scaled.op_type in ["Mul", "Div"]:
+            for inp in q_scaled.inputs:
+                if inp["name"] in dag_model.initializers:
+                    scale_tensor = dag_model.initializers[inp["name"]]
+                    scale_array = numpy_helper.to_array(scale_tensor)
+                    if q_scaled.op_type == "Div":
+                        scale_val = 1.0 / scale_array.item()  # 如果是除法，需要倒置
+                    else:
+                        scale_val = scale_array.item()  # 如果是乘法，直接使用
+                    break
+
+        # 构建新的Attention节点
+        attention_inputs = [
+            q_node.outputs[0],  # Q
+            k_node.outputs[0],  # K
+            v_node.outputs[0],  # V
+        ]
+
+        # 如果有attention mask，添加到输入
+        if att_mask:
+            attention_inputs.append(att_mask)
+
+        # 设置Attention算子的属性
+        attention_attrs = {}
+        if scale_val != 1.0:
+            attention_attrs["scale"] = scale_val
+
+        # 确定unified_layout和其他属性（根据输入张量的形状推断）
+        # 这里需要根据具体的Q/K/V形状来推断
+        q_shape = q_node.outputs[0]["shape"]
+        k_shape = k_node.outputs[0]["shape"]
+
+        # 根据形状推断num_heads等参数
+        # 通常形状为 [batch_size, seq_len, hidden_size] 或 [batch_size, num_heads, seq_len, head_dim]
+        if len(q_shape) == 4:  # [batch, num_heads, seq_len, head_dim]
+            num_heads = q_shape[1]
+            attention_attrs["num_heads"] = num_heads
+
+        attention_node = Node(
+            op_type="Attention",
+            name=f"Attention_fused_{q_node.name}_{k_node.name}_{v_node.name}",
+            attributes=attention_attrs,
+            inputs=attention_inputs,
+            outputs=matmul_v.outputs[:],  # 使用原来的最终输出
+        )
+
+        # 删除旧的节点
+        nodes_to_delete = [q_scaled, k_scaled, transpose_k, matmul_qk, softmax_node, matmul_v]
+        if add_node:
+            nodes_to_delete.append(add_node)
+
+        for node in nodes_to_delete:
+            if node and node.name in dag_model.nodes:
+                del dag_model.nodes[node.name]
+
+        # 添加新的Attention节点
+        dag_model.nodes[attention_node.name] = attention_node
+
+        print(f"Fused Attention pattern with Q:{q_node.name}, K:{k_node.name}, V:{v_node.name}")
         return True
 
 

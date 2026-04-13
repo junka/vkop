@@ -20,10 +20,12 @@ layout(push_constant) uniform constBuffer {
     ivec4 inShape; // N, C, H, W
     int axis;
     int fp16;
+    int nanwhere;
+    float nanvalue;
 } uConst;
 
 shared float sharedMax[16];   // 存每个 subgroup 的局部 max
-shared float sharedSum[16];   // 存每个 subgroup 的局部 sumExp（未调整）
+shared float sharedSum[16];   // 存每个 subgroup 的局部 sumExp
 
 
 void softmax32() {
@@ -171,7 +173,13 @@ void softmax32() {
             int idx = n * C + col;
             float x = uintBitsToFloat(uInput.data[idx]);
             float diff = x - globalMax;
-            uValue.data[idx] = floatBitsToUint(exp(diff) / globalSum);
+            float softmax_x = exp(diff) / globalSum;
+            if (uConst.nanwhere == 1) {
+                if (isnan(softmax_x)) {
+                    softmax_x = uConst.nanvalue;
+                }
+            }
+            uValue.data[idx] = floatBitsToUint(softmax_x);
         }
     }
 }
@@ -340,6 +348,14 @@ void softmax16() {
             float diff_y = unpack.y - globalMax;
             float softmax_x = exp(diff_x) / globalSum;
             float softmax_y = exp(diff_y) / globalSum;
+            if (uConst.nanwhere == 1) {
+                if (isnan(softmax_x)) {
+                    softmax_x = uConst.nanvalue;
+                }
+                if (isnan(softmax_y)) {
+                    softmax_y = uConst.nanvalue;
+                }
+            }
 
             uValue.data[idx] = packHalf2x16(vec2(softmax_x, softmax_y));
         }

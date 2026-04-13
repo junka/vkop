@@ -44,8 +44,10 @@
 #include "Range.hpp"
 
 #include "Cos.hpp"
+#include "Neg.hpp"
 #include "Sin.hpp"
 #include "Sqrt.hpp"
+#include "Where.hpp"
 
 namespace vkop {
 
@@ -125,6 +127,16 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
         return std::make_unique<Range>();
     case OpType::EXPAND:
         return std::make_unique<Expand>();
+    case OpType::SIN:
+        return std::make_unique<Sin>();
+    case OpType::COS:
+        return std::make_unique<Cos>();
+    case OpType::NEG:
+        return std::make_unique<Neg>();
+    case OpType::SQRT:
+        return std::make_unique<Sqrt>();
+    case OpType::WHERE:
+        return std::make_unique<Where>();
     default:
         return nullptr;
     }

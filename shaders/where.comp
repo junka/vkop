@@ -1,0 +1,28 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1) in;
+
+layout(set=0, binding = 0) writeonly buffer BufferOut {
+    uint data[];
+} bufferOut;
+
+layout(set=0, binding = 1) readonly buffer conditionBuffer {
+    bool data[];
+} condition;
+
+layout(set=0, binding = 2) readonly buffer BufferX{
+    uint data[];
+} bufferX;
+
+layout(set=0, binding = 3) readonly buffer BufferY {
+    uint data[];
+} bufferY;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (condition.data[index]) {
+        bufferOut.data[index] = bufferX.data[index];
+    } else {
+        bufferOut.data[index] = bufferY.data[index];
+    }
+}

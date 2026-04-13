@@ -17,6 +17,8 @@ struct GpuSoftMaxParam {
     ivec4 outShape;
     int axis; // 0: N, 1: C, 2: H, 3: W
     int fp16;
+    int nanwhere;
+    float nanvalue;
 };
 
 } // namespace softmax
@@ -47,6 +49,11 @@ class Softmax : public Operator {
             para_.axis = std::stol(attributes.at("axis"));
         } else if (attributes.find("dim") != attributes.end()) {
             para_.axis = std::stol(attributes.at("dim"));
+        } else if (attributes.find("nan_optimization") != attributes.end()) {
+            para_.nanwhere = 1;
+        } else if (attributes.find("nan_replacement_value") !=
+                   attributes.end()) {
+            para_.nanvalue = std::stof(attributes.at("nan_replacement_value"));
         }
     }
 

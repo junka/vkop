@@ -23,6 +23,8 @@ layout(push_constant) uniform constBuffer {
     ivec4 outShape;    // [N, C, H, W]
     int axis;
     int fp16;
+    int nanwhere;
+    float nanvalue;
 } uConst;
 
 // Axis 0: softmax over N (batch)
