@@ -60,7 +60,7 @@ class ModelConverter:
             shape_dims = [
                 dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim
             ]
-            print("Graph input:", inp.name, "of shape:", shape_dims)
+            print("Graph input:", inp.name, "of shape:", shape_dims, "tensor type:", tensor_type.elem_type)
             dag_model.inputs.append({"name": inp.name, "shape": shape_dims})
 
         # Add outputs

@@ -20,6 +20,7 @@ class ONNXOptimizer:
     def optimize_model(onnx_model, batch_size: int = 1):
         """Optimize the ONNX model using ONNX's built-in optimizer."""
         passes = [
+            "eliminate_nop_cast",
             "eliminate_deadend",
             "eliminate_identity",
             "eliminate_nop_dropout",
@@ -423,16 +424,43 @@ class FusionOptimizer:
                 input_name = node.inputs[0]["name"]
                 input_dtype = None
 
-                for other_node in dag_model.nodes.values():
-                    for out in other_node.outputs:
-                        if out["name"] == input_name:
-                            input_dtype = out.get("dtype")
+                if input_name in dag_model.initializers:
+                    init = dag_model.initializers[input_name]
+                    input_dtype = init.dtype
+                else:
+                    for other_node in dag_model.nodes.values():
+                        for out in other_node.outputs:
+                            if out["name"] == input_name:
+                                input_dtype = out.get("dtype")
+                                break
+                        if input_dtype:
                             break
-                    if input_dtype:
-                        break
                 output_dtype = node.attributes.get("to")
 
                 if input_dtype and input_dtype == output_dtype:
+                    matches.append({"node": node, "type": "redundant_single"})
+                    continue
+
+                # FIXME: 临时处理，因为onnx2vkop的Cast输入类型为None时，to为1(float32)
+                data_type_map = {
+                    1: "FLOAT",
+                    2: "UINT8",
+                    3: "INT8",
+                    4: "UINT16",
+                    5: "INT16",
+                    6: "INT32",
+                    7: "INT64",
+                    8: "STRING",
+                    9: "BOOL",
+                    10: "FLOAT16",
+                    11: "DOUBLE",
+                    12: "UINT32",
+                    13: "UINT64",
+                    14: "COMPLEX64",
+                    15: "COMPLEX128",
+                    16: "BFLOAT16",
+                }
+                if input_dtype is None and output_dtype == 1:
                     matches.append({"node": node, "type": "redundant_single"})
                     continue
 
@@ -513,7 +541,7 @@ class FusionOptimizer:
                             "type": "redundant_cast_then_cast",
                         }
                     )
-
+        print(f"Matched redundant casts: {len(matches)}")
         return matches
 
     @staticmethod
@@ -1399,35 +1427,36 @@ class FusionOptimizer:
             if softmax_node.op_type != "Softmax":
                 continue
 
-            # 检查Softmax的输出是否同时连接到IsNaN和另一个节点
+            # 检查Softmax的输出是否同时连接到IsNaN和Where节点
             softmax_output_name = softmax_node.outputs[0]["name"]
-
+            
+            # 获取使用这个输出的所有消费者节点
+            softmax_consumers = consumers.get(softmax_output_name, [])
+            
+            # 分离IsNaN和Where节点
             isnan_node = None
             where_node = None
-
-            # 查找连接到Softmax输出的IsNaN节点
-            for node in dag_model.nodes.values():
-                if node.op_type == "IsNaN":
-                    for inp in node.inputs:
-                        if inp["name"] == softmax_output_name:
-                            isnan_node = node
-                            break
-                elif node.op_type == "Where":
-                    # 检查Where是否有IsNaN的输出作为其中一个输入
-                    isnan_output_found = False
-                    softmax_direct_input = False
-                    for inp in node.inputs:
-                        if inp["name"] == softmax_output_name:
-                            softmax_direct_input = True
-                        elif isnan_node and inp["name"] == isnan_node.outputs[0]["name"]:
-                            isnan_output_found = True
-
-                    if isnan_output_found and softmax_direct_input:
-                        where_node = node
-                        break
-
-            # 如果找到了完整的模式
+            
+            for consumer_node, _ in softmax_consumers:
+                if consumer_node.op_type == "IsNaN":
+                    isnan_node = consumer_node
+                elif consumer_node.op_type == "Where":
+                    where_node = consumer_node
+            
+            # 如果同时找到了IsNaN和Where节点
             if isnan_node and where_node:
+                # 检查IsNaN的输出是否也连接到Where节点
+                isnan_output_name = isnan_node.outputs[0]["name"]
+                isnan_consumers = consumers.get(isnan_output_name, [])
+                
+                # 检查Where节点是否消费了IsNaN的输出
+                isnan_output_used_by_where = any(
+                    consumer_node == where_node for consumer_node, _ in isnan_consumers
+                )
+                
+                if not isnan_output_used_by_where:
+                    continue
+                    
                 # 验证Where节点有三个输入：condition, X, Y
                 if len(where_node.inputs) == 3:
                     # 找到三个输入：条件、X值、Y值
@@ -1436,14 +1465,14 @@ class FusionOptimizer:
                     y_input = None
 
                     for i, inp in enumerate(where_node.inputs):
-                        if inp["name"] == isnan_node.outputs[0]["name"]:
+                        if inp["name"] == isnan_output_name:  # IsNaN的输出
                             condition_input = inp
-                        elif inp["name"] == softmax_output_name:
+                        elif inp["name"] == softmax_output_name:  # Softmax的输出
                             if x_input is None:
                                 x_input = inp
                             else:
                                 y_input = inp
-                        else:
+                        else:  # 其他输入（通常是常量）
                             if x_input is None:
                                 x_input = inp
                             elif y_input is None:
@@ -1522,7 +1551,7 @@ class FusionOptimizer:
         The pattern to match:
             Q          K             V
             |          |             |
-        Q*sqrt(scale) K*sqrt(scale)  |
+        MUL(scale)    MUL(scale)     |
             |          |             |
             |       Transpose        |
             |          |             |
@@ -1530,7 +1559,6 @@ class FusionOptimizer:
                 |                    |
         att_mask---Add               |
                 |                    |
-        softcap (if provided)        |
                 |                    |
             Softmax                  |
                 |                    |
@@ -1546,122 +1574,191 @@ class FusionOptimizer:
             if softmax_node.op_type != "Softmax":
                 continue
 
-            # Softmax的输出应该连接到一个MatMul
-            softmax_output_name = softmax_node.outputs[0]["name"]
-            matmul_candidates = []
+            softmax_input_name = softmax_node.inputs[0]["name"]
+            input_producer = producer.get(softmax_input_name)
 
-            for node in dag_model.nodes.values():
-                if node.op_type == "MatMul":
-                    for inp in node.inputs:
-                        if inp["name"] == softmax_output_name:
-                            matmul_candidates.append(node)
+            add_node = None
+            att_mask_input = None
+            matmul_qk_node = None
 
-            if not matmul_candidates:
-                continue
+            if input_producer and input_producer.op_type == "Add":
+                add_node = input_producer
+                # Add节点应该有两个输入：一个来自matmul_qk，一个来自att_mask
+                for inp in add_node.inputs:
+                    inp_producer = producer.get(inp["name"])
+                    if inp_producer and inp_producer.op_type == "MatMul":
+                        matmul_qk_node = inp_producer
+                    elif inp["name"] != softmax_input_name:  # 另一个输入是att_mask
+                        att_mask_input = inp
 
-            for matmul_v_node in matmul_candidates:
-                # 现在向上追溯以找到完整的Attention模式
-
-                # 1. 检查softmax的输入是否来自Add节点（用于添加attention mask）
-                softmax_input_name = softmax_node.inputs[0]["name"]
-                add_node = None
-                att_mask_input = None
-
-                for node in dag_model.nodes.values():
-                    if node.op_type == "Add":
-                        for inp in node.inputs:
-                            if inp["name"] == softmax_input_name:
-                                # 检查这个输入是否是来自matmul_qk的结果
-                                add_node = node
-                                # 找到另一个输入作为att_mask
-                                for other_inp in node.inputs:
-                                    if other_inp["name"] != softmax_input_name:
-                                        att_mask_input = other_inp
-                                break
-                        if add_node:
-                            break
-
-                # 或者softmax直接连接到matmul_qk的输出
-                matmul_qk_node = None
-                if add_node:
-                    # 如果有Add节点，检查Add的输入是否来自MatMul(Q*K^T)
-                    add_input_name = None
-                    for inp in add_node.inputs:
-                        if inp["name"] != att_mask_input["name"] if att_mask_input else True:
-                            input_producer = producer.get(inp["name"])
-                            if input_producer and input_producer.op_type == "MatMul":
-                                matmul_qk_node = input_producer
-                                break
-                else:
-                    # 检查softmax输入是否直接来自MatMul
-                    input_producer = producer.get(softmax_input_name)
-                    if input_producer and input_producer.op_type == "MatMul":
-                        matmul_qk_node = input_producer
-
+                # 如果Add节点没有MatMul输入，则不是我们要找的模式
                 if not matmul_qk_node:
                     continue
+            elif input_producer and input_producer.op_type == "MatMul":
+                # 没有Add节点，直接就是MatMul -> Softmax
+                matmul_qk_node = input_producer
+            else:
+                # 既不是Add也不是MatMul，不符合模式
+                continue
 
-                # 2. 检查matmul_qk的两个输入
-                q_input_name = None
-                k_input_name = None
-                for inp in matmul_qk_node.inputs:
-                    input_producer = producer.get(inp["name"])
-                    if input_producer:
-                        # 检查输入是否是来自Transpose(K)或直接来自Q的scaled版本
-                        if input_producer.op_type == "Transpose":
-                            # 检查Transpose的输入是否是K经过scale处理的
-                            transpose_input_producer = producer.get(
-                                input_producer.inputs[0]["name"]
-                            )
-                            if transpose_input_producer:
-                                k_input_name = input_producer.inputs[0]["name"]
+            if not matmul_qk_node:
+                continue
+
+            print(f"Found Softmax node '{softmax_node.name}' with preceding MatMul '{matmul_qk_node.name}' and Add '{add_node.name if add_node else 'None'}'")
+
+            input_paths = []
+            for inp in matmul_qk_node.inputs:
+                inp_name = inp["name"]
+                inp_producer = producer.get(inp_name)
+                
+                path_info = {
+                    "input_name": inp_name,
+                    "producer": inp_producer,
+                    "is_scale_only": False,      # 只有scale操作 (Mul/Div)
+                    "is_transpose_only": False,  # 只有transpose操作
+                    "has_scale_and_transpose": False,  # 同时有scale和transpose操作（顺序无关）
+                    "original_node": None
+                }
+                
+                if inp_producer:
+                    if inp_producer.op_type == "Transpose":
+                        # 检查Transpose的输入是否有scale操作 (Transpose -> Scale)
+                        transpose_input_name = inp_producer.inputs[0]["name"]
+                        transpose_input_producer = producer.get(transpose_input_name)
+                        
+                        if transpose_input_producer and transpose_input_producer.op_type in ["Mul", "Div"]:
+                            # Transpose <- Scale: 有scale和transpose操作
+                            path_info["has_scale_and_transpose"] = True
+                            # 查找原始节点
+                            for scale_inp in transpose_input_producer.inputs:
+                                if scale_inp["name"] != transpose_input_name and scale_inp["name"] in dag_model.initializers:
+                                    path_info["original_node"] = producer.get(
+                                        transpose_input_producer.inputs[0]["name"]
+                                        if transpose_input_producer.inputs[0]["name"] != scale_inp["name"]
+                                        else transpose_input_producer.inputs[1]["name"]
+                                    )
+                                    break
+                            if path_info["original_node"] is None:
+                                path_info["original_node"] = transpose_input_producer
                         else:
-                            # 这可能是Q经过scale处理的输出
-                            q_input_name = inp["name"]
-
-                if not q_input_name or not k_input_name:
-                    continue
-
-                # 3. 找到原始的Q、K、V节点
-                q_node = producer.get(q_input_name)
-                k_node = producer.get(k_input_name)
-
-                # 检查Q和K是否经过了scaling操作 (Q*sqrt(scale) 和 K*sqrt(scale))
-                original_q = None
-                original_k = None
-
-                if q_node and q_node.op_type in ["Mul", "Div"]:
-                    # 检查是否是乘以或除以scale
-                    for inp in q_node.inputs:
-                        if inp["name"] != q_input_name:  # 找到scale输入
-                            # 检查这个输入是否是常量
-                            if inp["name"] in dag_model.initializers:
-                                original_q = producer.get(
-                                    q_node.inputs[0]["name"]
-                                    if q_node.inputs[0]["name"] != inp["name"]
-                                    else q_node.inputs[1]["name"]
-                                )
+                            # Transpose only
+                            path_info["is_transpose_only"] = True
+                            path_info["original_node"] = transpose_input_producer
+                            
+                    elif inp_producer.op_type in ["Mul", "Div"]:
+                        # 检查是否有initializer作为scale因子
+                        has_initializer_scale = False
+                        for scale_inp in inp_producer.inputs:
+                            if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
+                                has_initializer_scale = True
                                 break
+                        
+                        if has_initializer_scale:
+                            # 检查Scale的输入是否有Transpose (Scale <- Transpose)
+                            scale_input_name = None
+                            for scale_inp in inp_producer.inputs:
+                                if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
+                                    continue  # 这是scale值，不是数据输入
+                                else:
+                                    scale_input_name = scale_inp["name"]
+                                    break
+                            
+                            if scale_input_name:
+                                scale_input_producer = producer.get(scale_input_name)
+                                if scale_input_producer and scale_input_producer.op_type == "Transpose":
+                                    # Scale <- Transpose: 有scale和transpose操作（顺序相反）
+                                    path_info["has_scale_and_transpose"] = True
+                                    # 获取Transpose的输入作为原始节点
+                                    transpose_input_name = scale_input_producer.inputs[0]["name"]
+                                    path_info["original_node"] = producer.get(transpose_input_name)
+                                else:
+                                    # Scale only
+                                    path_info["is_scale_only"] = True
+                                    # 查找原始节点
+                                    for scale_inp in inp_producer.inputs:
+                                        if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
+                                            path_info["original_node"] = producer.get(
+                                                inp_producer.inputs[0]["name"]
+                                                if inp_producer.inputs[0]["name"] != scale_inp["name"]
+                                                else inp_producer.inputs[1]["name"]
+                                            )
+                                            break
+                        else:
+                            # Scale without initializer: 可能是其他类型的scale
+                            path_info["original_node"] = inp_producer
+                    else:
+                        # 其他类型：可能是原始的Q或K
+                        path_info["original_node"] = inp_producer
+                
+                input_paths.append(path_info)
 
-                if k_node and k_node.op_type in ["Mul", "Div"]:
-                    for inp in k_node.inputs:
-                        if inp["name"] != k_input_name:
-                            if inp["name"] in dag_model.initializers:
-                                original_k = producer.get(
-                                    k_node.inputs[0]["name"]
-                                    if k_node.inputs[0]["name"] != inp["name"]
-                                    else k_node.inputs[1]["name"]
-                                )
-                                break
+            # 需要找到一个scale-only路径和一个scale+transpose或transpose-only路径
+            scale_only_path = None
+            scale_transpose_path = None
+            
+            for path in input_paths:
+                if path["is_scale_only"] and path["original_node"]:
+                    scale_only_path = path
+                elif (path["has_scale_and_transpose"]) and path["original_node"]:
+                    scale_transpose_path = path
 
-                if not original_q or not original_k:
-                    continue
+            if not scale_only_path or not scale_transpose_path:
+                continue
 
-                # 4. 检查V是否直接连接到第二个MatMul
+            # 3. 现在我们有了Q和K路径，继续检查
+            q_path = scale_only_path
+            k_path = scale_transpose_path
+
+            original_q = q_path["original_node"]
+            original_k = k_path["original_node"]
+            q_scaled = q_path["producer"] if q_path["is_scale_only"] else None
+            k_scaled = None
+            transpose_k = None
+
+            # 确定k_scaled和transpose_k
+            if k_path["producer"] and k_path["producer"].op_type in ["Mul", "Div"]:
+                # Scale -> Transpose case
+                k_scaled = k_path["producer"]
+                # 找到transpose节点
+                temp_producer = k_path["producer"]
+                for inp in temp_producer.inputs:
+                    if inp["name"] != k_path["input_name"] and inp["name"] in dag_model.initializers:
+                        continue  # 这是scale值
+                    else:
+                        temp_input_name = inp["name"]
+                        temp_input_producer = producer.get(temp_input_name)
+                        if temp_input_producer and temp_input_producer.op_type == "Transpose":
+                            transpose_k = temp_input_producer
+                            break
+            elif k_path["producer"] and k_path["producer"].op_type == "Transpose":
+                # Transpose -> Scale case
+                transpose_k = k_path["producer"]
+                # 找到scale节点
+                temp_input_name = k_path["producer"].inputs[0]["name"]
+                temp_input_producer = producer.get(temp_input_name)
+                if temp_input_producer and temp_input_producer.op_type in ["Mul", "Div"]:
+                    k_scaled = temp_input_producer
+
+            # Softmax的输出应该连接到一个MatMul（用于与V相乘）
+            softmax_output_name = softmax_node.outputs[0]["name"]
+            matmul_v_candidates = []
+            
+            # 使用consumer映射来查找使用softmax输出的MatMul节点
+            for consumer_node, _ in consumers.get(softmax_output_name, []):
+                if consumer_node.op_type == "MatMul":
+                    matmul_v_candidates.append(consumer_node)
+
+            if not matmul_v_candidates:
+                continue
+
+            # 4. 检查V是否直接连接到第二个MatMul
+            matched = False
+            for matmul_v_node in matmul_v_candidates:
                 v_input_name = None
                 for inp in matmul_v_node.inputs:
                     if inp["name"] != softmax_output_name:  # 找到V的输入
                         v_input_name = inp["name"]
+                        break
 
                 if not v_input_name:
                     continue
@@ -1674,9 +1771,9 @@ class FusionOptimizer:
                         "q_node": original_q,
                         "k_node": original_k,
                         "v_node": original_v,
-                        "q_scaled": q_node,
-                        "k_scaled": k_node,
-                        "transpose_k": producer.get(k_input_name),  # K转置节点
+                        "q_scaled": q_scaled,
+                        "k_scaled": k_scaled,
+                        "transpose_k": transpose_k,
                         "matmul_qk": matmul_qk_node,
                         "add_node": add_node,
                         "softmax_node": softmax_node,
@@ -1685,7 +1782,9 @@ class FusionOptimizer:
                     }
 
                     matches.append(match)
-
+                    matched = True
+                    break  # 找到一个匹配即可
+        print(f"Found {len(matches)} attention patterns for potential fusion")
         return matches
 
     @staticmethod
