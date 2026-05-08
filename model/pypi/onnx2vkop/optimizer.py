@@ -8,7 +8,7 @@ import numpy as np
 import onnx
 import onnxoptimizer as optimizer
 from onnx import numpy_helper, shape_inference
-from onnxsim import simplify
+# from onnxsim import simplify
 
 from .dag import Node
 
@@ -54,9 +54,9 @@ class ONNXOptimizer:
                     fixed_shape.append(1)
             input_shapes[name] = fixed_shape
 
-        optimized_model, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
-        assert check, "Simplified ONNX model could not be validated"
-        optimized_model = optimizer.optimize(optimized_model, passes)
+        # optimized_model, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
+        # assert check, "Simplified ONNX model could not be validated"
+        optimized_model = optimizer.optimize(onnx_model, passes)
         optimized_model = shape_inference.infer_shapes(optimized_model, strict_mode=True)
 
         return optimized_model

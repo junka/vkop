@@ -337,6 +337,8 @@ void Runtime::LoadModel() {
             if (type == vkop::ops::OpType::SOFTMAX) {
                 if (node_outputs[0]->num_dims() <= 2) {
                     use_ssbo = true;
+                    std::cout << "Use SSBO for softmax op with output dims "
+                              << node_outputs[0]->num_dims() << std::endl;
                 }
             }
             auto op = ops::create_from_type(type, use_ssbo, precision_,

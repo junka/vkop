@@ -219,7 +219,8 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
 
 EnableResult VulkanDevice::buildFeatureEnableChain(
     const std::vector<FeatureDescriptor> &descs,
-    const VkPhysicalDeviceFeatures2 &queryFeatures2) {
+    const VkPhysicalDeviceFeatures2 &queryFeatures2,
+    const std::set<std::string> &supportedExtensions) {
     // Map sType → queried struct pointer
     std::unordered_map<VkStructureType, void *> queried_map;
     for (const void *p = queryFeatures2.pNext; p;) {
@@ -247,15 +248,16 @@ EnableResult VulkanDevice::buildFeatureEnableChain(
 
 // Enable extensions without feature structrues
 #ifdef VK_EXT_tooling_info
-    result.enabledExtensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+    if (supportedExtensions.count(VK_EXT_TOOLING_INFO_EXTENSION_NAME) > 0) {
+        result.enabledExtensions.push_back(VK_EXT_TOOLING_INFO_EXTENSION_NAME);
+    }
 #endif
 #ifdef VK_KHR_shader_non_semantic_info
-    result.enabledExtensions.push_back(
-        VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
-#endif
-#ifdef VK_KHR_external_memory_fd
-    result.enabledExtensions.push_back(
-        VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+    if (supportedExtensions.count(
+            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME) > 0) {
+        result.enabledExtensions.push_back(
+            VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
+    }
 #endif
     return result;
 }
@@ -990,6 +992,40 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             }});
     }
 #endif
+#ifdef VK_KHR_external_memory_fd
+    if (supportedExtensions.count(VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME)) {
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
+            .extensionName = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = []() -> std::unique_ptr<VkBaseOutStructure> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT>();
+                q->sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+                q->pNext = nullptr;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+            },
+            .makeEnableStruct =
+                [](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT *>(q);
+                if (!feat->minImportedHostPointerAlignment)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceExternalMemoryHostPropertiesEXT>();
+                e->sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+                e->pNext = nullptr;
+                e->minImportedHostPointerAlignment =
+                    feat->minImportedHostPointerAlignment;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+            }});
+    }
+#endif
     for (size_t i = 0; i < descs.size(); ++i) {
         const std::unordered_map<int, std::string> desc_names = {
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -1045,8 +1081,8 @@ bool VulkanDevice::createLogicalDevice(
 
     auto query_result = buildFeatureQueryChain(feature_descs);
     vkGetPhysicalDeviceFeatures2(physicalDevice_, &query_result.features2);
-    auto enable_result =
-        buildFeatureEnableChain(feature_descs, query_result.features2);
+    auto enable_result = buildFeatureEnableChain(
+        feature_descs, query_result.features2, supported_extensions);
     LOG_INFO("timeline semaphore %s supported",
              (m_support_timeline_semaphore_ ? "is" : "not"));
     LOG_INFO("host image copy %s supported",
@@ -1079,9 +1115,10 @@ bool VulkanDevice::createLogicalDevice(
         LOG_INFO("enabled extension: %s", e);
     }
 
-    if (vkCreateDevice(physicalDevice_, &create_info, nullptr,
-                       &logicalDevice_) != VK_SUCCESS) {
-        LOG_ERROR("Failed to create logical device!");
+    auto ret =
+        vkCreateDevice(physicalDevice_, &create_info, nullptr, &logicalDevice_);
+    if (ret != VK_SUCCESS) {
+        LOG_ERROR("Failed to create logical device %d!", ret);
         return false;
     }
 

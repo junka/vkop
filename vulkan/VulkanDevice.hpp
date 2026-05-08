@@ -72,7 +72,8 @@ class VulkanDevice {
 
     static EnableResult
     buildFeatureEnableChain(const std::vector<FeatureDescriptor> &descs,
-                            const VkPhysicalDeviceFeatures2 &queryFeatures2);
+                            const VkPhysicalDeviceFeatures2 &queryFeatures2,
+                            const std::set<std::string> &supportedExtensions);
 
     void checkImageFormatSupport();
 

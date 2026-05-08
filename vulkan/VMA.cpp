@@ -168,13 +168,13 @@ void VMA::getStats() {
     vmaBuildStatsString(allocator_, &stats_string, 1U);
     printf("%s\n", stats_string);
     for (auto &budget : budgets) {
-        printf("heap currently has %u allocations taking %lu B,\n",
+        printf("heap currently has %u allocations taking %llu B,\n",
                budget.statistics.allocationCount,
                budget.statistics.allocationBytes);
-        printf(
-            "allocated out of %u Vulkan device memory blocks taking %lu B,\n",
-            budget.statistics.blockCount, budget.statistics.blockBytes);
-        printf("Vulkan reports total usage %lu B with budget %lu B.\n",
+        printf("allocated out of %u Vulkan device memory blocks taking %llu "
+               "B,\n",
+               budget.statistics.blockCount, budget.statistics.blockBytes);
+        printf("Vulkan reports total usage %llu B with budget %llu B.\n",
                budget.usage, budget.budget);
     }
 }

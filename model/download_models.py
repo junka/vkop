@@ -59,10 +59,10 @@ def export_model(name, model_fn, weights, input_size):
             export_params=True,
             opset_version=18,
             do_constant_folding=True,
-            external_data=False,
+            # external_data=False,
             input_names=["input"],
             output_names=["output"],
-            dynamic_shapes={"x": {0: batch}},
+            # dynamic_shapes={"x": {0: batch}},
         )
         print(f"{name} exported successfully!")
     except Exception as e:

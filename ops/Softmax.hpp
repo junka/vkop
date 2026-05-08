@@ -98,8 +98,8 @@ class Softmax : public Operator {
 
         int batch = input_shape[0];
         int depth = input_shape[1];
-        int out_height = input_shape[2];
-        int out_width = input_shape[3];
+        int out_height = input_shape.size() > 2 ? input_shape[2] : 1;
+        int out_width = input_shape.size() > 3 ? input_shape[3] : 1;
 
         int realheight = out_height * batch;
 

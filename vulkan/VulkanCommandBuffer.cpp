@@ -167,7 +167,9 @@ VkSubmitInfo VulkanCommandBuffer::buildSubmitInfo() {
 int VulkanCommandBuffer::wait() {
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
 
-    m_waitsems_.pop_back();
+    if (!m_waitsems_.empty())
+        m_waitsems_.pop_back();
+
     // this structure can not accept binary semaphore
 
     auto *signalsem = m_signalsem_->getSemaphore();

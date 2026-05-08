@@ -16,7 +16,7 @@ namespace ops {
 namespace expand {
 struct GpuExpandParam {
     ivec4 inshape;
-    uint shape_length;
+    uint32_t shape_length;
     int fp16;
 };
 } // namespace expand
@@ -82,7 +82,7 @@ class Expand : public Operator {
                 param_.inshape[out_shape.size() - i - 1] = 1;
             }
         }
-        param_.shape_length = static_cast<uint>(out_shape.size());
+        param_.shape_length = static_cast<uint32_t>(out_shape.size());
         submit(&param_, UP_DIV(total_size, 256), 1, 1);
     }
 
