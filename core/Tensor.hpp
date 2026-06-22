@@ -825,8 +825,8 @@ template <typename T> class Tensor : public ITensor {
         int logical_cols = dims_[1];
         int rows = dims_[0];
         if (need_compact) {
-            copy_bytes = static_cast<size_t>(rows) *
-                         (logical_cols + row_pad) * sizeof(T);
+            copy_bytes = static_cast<size_t>(rows) * (logical_cols + row_pad) *
+                         sizeof(T);
         }
 
         auto b = stpool->allocate(copy_bytes);

@@ -320,20 +320,25 @@ void VulkanInstance::enumPhysicalDevices() {
     // Prefer real GPUs over software rasterizers (llvmpipe).
     // Move discrete/integrated GPUs to the front so phydevs[0] is usable.
     std::stable_sort(devices.begin(), devices.end(),
-        [](VkPhysicalDevice a, VkPhysicalDevice b) {
-            auto rank = [](VkPhysicalDevice dev) -> int {
-                VkPhysicalDeviceProperties props;
-                vkGetPhysicalDeviceProperties(dev, &props);
-                switch (props.deviceType) {
-                case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 0;
-                case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:  return 1;
-                case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:     return 2;
-                case VK_PHYSICAL_DEVICE_TYPE_CPU:             return 3; // llvmpipe
-                default:                                      return 4;
-                }
-            };
-            return rank(a) < rank(b);
-        });
+                     [](VkPhysicalDevice a, VkPhysicalDevice b) {
+                         auto rank = [](VkPhysicalDevice dev) -> int {
+                             VkPhysicalDeviceProperties props;
+                             vkGetPhysicalDeviceProperties(dev, &props);
+                             switch (props.deviceType) {
+                             case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+                                 return 0;
+                             case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+                                 return 1;
+                             case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+                                 return 2;
+                             case VK_PHYSICAL_DEVICE_TYPE_CPU:
+                                 return 3; // llvmpipe
+                             default:
+                                 return 4;
+                             }
+                         };
+                         return rank(a) < rank(b);
+                     });
     m_physical_devices_ = std::move(devices);
 }
 

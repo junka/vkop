@@ -158,7 +158,8 @@ void VulkanBuffer::writeBarrier(VkCommandBuffer commandBuffer,
 }
 
 // void VulkanBuffer::shaderWriteBarrier(VkCommandBuffer commandBuffer,
-//                                       VkDeviceSize size, VkDeviceSize offset) {
+//                                       VkDeviceSize size, VkDeviceSize offset)
+//                                       {
 //     VkBuffer buff = getBuffer();
 //     VkBufferMemoryBarrier barrier;
 //     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;

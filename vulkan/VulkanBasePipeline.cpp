@@ -34,7 +34,8 @@ VulkanBasePipeline::~VulkanBasePipeline() {
     }
 }
 
-void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags, bool update_after_bind) {
+void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags,
+                                                   bool update_after_bind) {
     auto bindings = allocDescriptorSetLayoutBindings(flags);
 
     // Per-binding flags: all bindings get UPDATE_AFTER_BIND if enabled
@@ -46,7 +47,8 @@ void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags, boo
         }
         bindingFlagsInfo.sType =
             VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
-        bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+        bindingFlagsInfo.bindingCount =
+            static_cast<uint32_t>(bindingFlags.size());
         bindingFlagsInfo.pBindingFlags = bindingFlags.data();
     }
 

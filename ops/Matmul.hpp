@@ -37,14 +37,24 @@ class MatMul : public Operator {
     MatMul &operator=(MatMul &&) = delete;
 
     explicit MatMul(int use_tensorcore = 0)
-        : Operator(OpType::MATMUL, use_tensorcore == 2 ? matmul_nv_spv : (use_tensorcore == 1 ? matmul_coop_spv : matmul_spv),
-                   use_tensorcore == 2 ? matmul_nv_spv_len : (use_tensorcore == 1 ? matmul_coop_spv_len: matmul_spv_len),
+        : Operator(OpType::MATMUL,
+                   use_tensorcore == 2
+                       ? matmul_nv_spv
+                       : (use_tensorcore == 1 ? matmul_coop_spv : matmul_spv),
+                   use_tensorcore == 2
+                       ? matmul_nv_spv_len
+                       : (use_tensorcore == 1 ? matmul_coop_spv_len
+                                              : matmul_spv_len),
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(matmul::GpuMatMulParam)) {
-            method_ = use_tensorcore == 2 ? matmul::Method::NV_TENSORCORE : (use_tensorcore == 1 ? matmul::Method::VK_COOPERATE_MATRIX : matmul::Method::BASIC_ARITHMETIC);
-        };
+        method_ =
+            use_tensorcore == 2
+                ? matmul::Method::NV_TENSORCORE
+                : (use_tensorcore == 1 ? matmul::Method::VK_COOPERATE_MATRIX
+                                       : matmul::Method::BASIC_ARITHMETIC);
+    };
 
   private:
     void execute(
@@ -85,7 +95,8 @@ class MatMul : public Operator {
             // workgroup output footprint = 16 (M) x 32 (N).
             submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
         } else if (method_ == matmul::Method::NV_TENSORCORE) {
-            // nv kernel: same 16x16 workgroup / 8 subgroups / 16x32 footprint as coop.
+            // nv kernel: same 16x16 workgroup / 8 subgroups / 16x32 footprint
+            // as coop.
             submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
         } else {
             submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));

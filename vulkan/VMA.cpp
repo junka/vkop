@@ -1,5 +1,6 @@
 // Copyright 2025 @junka
 #include <cstdint>
+#include <iostream>
 #ifdef USE_VMA
 
 #pragma GCC diagnostic push
@@ -174,14 +175,14 @@ void VMA::getStats() {
     vmaBuildStatsString(allocator_, &stats_string, 1U);
     printf("%s\n", stats_string);
     for (auto &budget : budgets) {
-        printf("heap currently has %u allocations taking %lu B,\n",
-               budget.statistics.allocationCount,
-               budget.statistics.allocationBytes);
-        printf("allocated out of %u Vulkan device memory blocks taking %lu "
-               "B,\n",
-               budget.statistics.blockCount, budget.statistics.blockBytes);
-        printf("Vulkan reports total usage %lu B with budget %lu B.\n",
-               budget.usage, budget.budget);
+        std::cout << "heap currently has " << budget.statistics.allocationCount
+                  << " allocations taking " << budget.statistics.allocationBytes
+                  << " B," << std::endl;
+        std::cout << "allocated out of " << budget.statistics.blockCount
+                  << " Vulkan device memory blocks taking "
+                  << budget.statistics.blockBytes << " B," << std::endl;
+        std::cout << "Vulkan reports total usage " << budget.usage
+                  << " B with budget " << budget.budget << " B." << std::endl;
     }
 }
 

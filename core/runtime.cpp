@@ -446,7 +446,8 @@ double Runtime::Run() {
         // begin until the first completes. If a node in submit_infos[0] waits
         // on a semaphore signaled by a node in submit_infos[1], this creates
         // a deadlock (C waits B, but B can't start until C finishes).
-        // A single submit lets the GPU schedule based on semaphore dependencies.
+        // A single submit lets the GPU schedule based on semaphore
+        // dependencies.
         if (!submit_infos[0].empty()) {
             VulkanCommandBuffer::submit(dev->getComputeQueue(0),
                                         submit_infos[0]);

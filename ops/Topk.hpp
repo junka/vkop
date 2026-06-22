@@ -219,7 +219,8 @@ class Topk : public Operator {
             if (axis == 0) {
                 submit_per_ds(pass_ds[i], &para_, dispatch_width, 1, 1);
             } else {
-                submit_per_ds(pass_ds[i], &para_, dispatch_width, inshape[0], 1);
+                submit_per_ds(pass_ds[i], &para_, dispatch_width, inshape[0],
+                              1);
             }
 
             if (i == 0) {

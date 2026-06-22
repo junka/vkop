@@ -121,12 +121,14 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     if (coopmat_properties.cooperativeMatrixSupportedStages != 0) {
         uint32_t propCount = 0;
         auto vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
-            reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
-                vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
+            reinterpret_cast<
+                PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                vkGetInstanceProcAddr(
+                    VulkanInstance::getVulkanInstance().getInstance(),
                     "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
         if (vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
-                vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice_,
-                                                            &propCount, nullptr);
+            vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+                physicalDevice_, &propCount, nullptr);
             if (propCount > 0) {
                 this->coopmatProps_.resize(propCount);
                 vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
@@ -135,9 +137,9 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
             for (uint32_t i = 0; i < propCount; i++) {
                 const auto &p = this->coopmatProps_[i];
                 LOG_INFO("CoopMat [%u]: %ux%ux%u AType=%d BType=%d CType=%d "
-                        "ResultType=%d scope=%d",
-                        i, p.MSize, p.NSize, p.KSize, p.AType, p.BType, p.CType,
-                        p.ResultType, p.scope);
+                         "ResultType=%d scope=%d",
+                         i, p.MSize, p.NSize, p.KSize, p.AType, p.BType,
+                         p.CType, p.ResultType, p.scope);
             }
         }
     }
@@ -1076,7 +1078,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
         supportedExtensions.count(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
         descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
             .extensionName = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_2,
             .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {

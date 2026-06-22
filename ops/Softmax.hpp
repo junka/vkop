@@ -53,8 +53,7 @@ class Softmax : public Operator {
         if (attributes.find("nan_optimization") != attributes.end()) {
             para_.nanwhere = 1;
         }
-        if (attributes.find("nan_replacement_value") !=
-                   attributes.end()) {
+        if (attributes.find("nan_replacement_value") != attributes.end()) {
             para_.nanvalue = std::stof(attributes.at("nan_replacement_value"));
         }
     }

@@ -66,7 +66,8 @@ class Concat : public Operator {
         auto output_image = std::dynamic_pointer_cast<VulkanImage>(objs_[0]);
         int offset = 0;
         int submit_count = 0;
-        // Count how many submit() calls we'll make to pre-allocate descriptor sets
+        // Count how many submit() calls we'll make to pre-allocate descriptor
+        // sets
         for (const auto &in : inputs) {
             auto gpu_axis = axis_ + 4 - rank;
             if (gpu_axis == 2 || (gpu_axis == 1 && offset % 4 != 0)) {
@@ -75,7 +76,8 @@ class Concat : public Operator {
             // For other axes we use copyImageToImage, no submit
             offset += in->get_channel(); // approximate, just for counting
         }
-        std::vector<VkDescriptorSet> pass_ds(submit_count > 0 ? submit_count : 1);
+        std::vector<VkDescriptorSet> pass_ds(submit_count > 0 ? submit_count
+                                                              : 1);
         for (int i = 0; i < static_cast<int>(pass_ds.size()); i++) {
             pass_ds[i] = allocPassDescriptorSet();
         }
@@ -122,8 +124,9 @@ class Concat : public Operator {
                     para.offset[3] = 0;
                     para.axis = 2;
                     offset += in->get_height();
-                    submit_per_ds(pass_ds[ds_idx++], &para, UP_DIV(in_gpu_shape[0], 16),
-                           UP_DIV(in_gpu_shape[1], 16), in_gpu_shape[2]);
+                    submit_per_ds(pass_ds[ds_idx++], &para,
+                                  UP_DIV(in_gpu_shape[0], 16),
+                                  UP_DIV(in_gpu_shape[1], 16), in_gpu_shape[2]);
                 } else if (axis_ + 4 - rank == 1) {
                     if (objs_.size() == 2) {
                         objs_.pop_back();
@@ -139,8 +142,9 @@ class Concat : public Operator {
                     para.offset[3] = 0;
                     para.axis = 1;
                     offset += in->get_channel();
-                    submit_per_ds(pass_ds[ds_idx++], &para, UP_DIV(in_gpu_shape[0], 16),
-                           UP_DIV(in_gpu_shape[1], 16), in_gpu_shape[2]);
+                    submit_per_ds(pass_ds[ds_idx++], &para,
+                                  UP_DIV(in_gpu_shape[0], 16),
+                                  UP_DIV(in_gpu_shape[1], 16), in_gpu_shape[2]);
                 }
             });
         }

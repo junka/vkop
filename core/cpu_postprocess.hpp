@@ -25,7 +25,7 @@ namespace cpu {
  * @return       Softmax output, same shape as input
  */
 inline std::vector<float> softmax(const std::vector<float> &input,
-                                   const std::vector<int> &shape, int axis) {
+                                  const std::vector<int> &shape, int axis) {
     if (shape.empty()) {
         return input;
     }
@@ -126,15 +126,13 @@ topk(const std::vector<float> &input, const std::vector<int> &shape, int k,
         // Partial sort: select top-k
         if (largest) {
             std::partial_sort(
-                row_indices.begin(), row_indices.begin() + k,
-                row_indices.end(),
+                row_indices.begin(), row_indices.begin() + k, row_indices.end(),
                 [&input, r, last_dim](int a, int b) {
                     return input[r * last_dim + a] > input[r * last_dim + b];
                 });
         } else {
             std::partial_sort(
-                row_indices.begin(), row_indices.begin() + k,
-                row_indices.end(),
+                row_indices.begin(), row_indices.begin() + k, row_indices.end(),
                 [&input, r, last_dim](int a, int b) {
                     return input[r * last_dim + a] < input[r * last_dim + b];
                 });

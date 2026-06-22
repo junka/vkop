@@ -138,9 +138,7 @@ class VulkanDevice {
     bool is_support_cuda_kernel_launch() const {
         return m_support_cuda_kernel_launch_;
     }
-    bool is_support_nv_tensor_core() const {
-        return m_support_nv_tensor_core_;
-    }
+    bool is_support_nv_tensor_core() const { return m_support_nv_tensor_core_; }
     bool is_support_cooperate_matrix() const {
         return m_support_cooperate_matrix_;
     }

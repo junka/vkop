@@ -74,7 +74,15 @@ set(LIBTORCH_VERSION "2.10.0")
 if(WIN32)
     set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-win-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip")
 elseif(APPLE)
-    set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-shared-with-deps-${LIBTORCH_VERSION}.zip")
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+        message(STATUS "Detected macOS ARM64 architecture")
+        set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-arm64-${LIBTORCH_VERSION}.zip")
+    elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        message(STATUS "Detected macOS x86_64 architecture")
+        set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-macos-x86_64-2.2.2.zip")
+    else()
+        message(FATAL_ERROR "Unsupported macOS architecture: ${CMAKE_SYSTEM_PROCESSOR}")
+    endif()
 else() # Linux
     set(LIBTORCH_URL "https://download.pytorch.org/libtorch/cpu/libtorch-shared-with-deps-${LIBTORCH_VERSION}%2Bcpu.zip")
 endif()
@@ -154,6 +162,8 @@ else()
     add_executable(all_tests ${TEST_SOURCES})
 endif()
 
+target_compile_definitions(all_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
+
 if (USE_FP16)
     target_compile_definitions(all_tests PUBLIC FP16)
 endif()
@@ -164,6 +174,7 @@ else()
         -Wno-unused-parameter
         -Wno-unused-variable
         -Wno-unused-function
+        -Wno-dangling-reference
     )
 endif()
 target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
