@@ -94,6 +94,7 @@ private:
         std::vector<torch::Tensor> torch_inputs;
 
         output_shape = shapes[0];
+        output_shape[axis_] = 0;
         for (auto &shape : shapes) {
             auto input = std::make_shared<Tensor<T>>(shape);
             std::vector<int64_t> inshape(shape.begin(), shape.end());

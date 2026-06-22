@@ -93,8 +93,8 @@ TEST(MatMulTest, MatMulComprehensiveTest) {
         {{5, 4, 1}, {5, 1, 6}},
         {{3, 4, 5}, {3, 5, 6}},
         {{3, 8, 16}, {3, 16, 32}},
-         {{3, 15, 15}, {3, 15, 15}},
-         {{3, 16, 16}, {3, 16, 16}},
+        {{3, 15, 15}, {3, 15, 15}},
+        {{3, 16, 16}, {3, 16, 16}},
     };
     for (const auto &test_case : test_cases) {
         auto [t1, t2] = test_case;

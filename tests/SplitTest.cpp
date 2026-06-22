@@ -122,7 +122,7 @@ TEST(SplitTest, SplitComprehensiveTest) {
         {{8, 4, 8}, 2, {2, 6}},
         {{8, 4, 8}, 1, {1, 3}},
         {{1, 2, 8, 8}, 2, {5, 3}},
-        {{1, 144, 8400}, 2, {80, 64}},
+        {{1, 144, 8400}, 1, {80, 64}},
     };
 
     for (const auto &test_case : test_cases) {

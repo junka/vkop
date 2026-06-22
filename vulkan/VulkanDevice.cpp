@@ -53,44 +53,53 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     VkPhysicalDeviceSubgroupProperties subgroup_properties = {};
     subgroup_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
-    subgroup_properties.pNext = nullptr;
+
+    // Build the pNext chain by linking each extension struct to the current
+    // head, then making it the new head. Order is irrelevant for property
+    // queries — the driver walks the chain by sType.
+    VkBaseOutStructure *head =
+        reinterpret_cast<VkBaseOutStructure *>(&subgroup_properties);
+
+#ifdef VK_KHR_cooperative_matrix
+    VkPhysicalDeviceCooperativeMatrixPropertiesKHR coopmat_properties = {};
+    coopmat_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_PROPERTIES_KHR;
+    coopmat_properties.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&coopmat_properties);
+#endif
 
 #ifdef VK_NV_cuda_kernel_launch
     VkPhysicalDeviceCudaKernelLaunchPropertiesNV cuda_properties = {};
     cuda_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_PROPERTIES_NV;
-    cuda_properties.pNext = &subgroup_properties;
-    properties2.pNext = &cuda_properties;
-#else
-    properties2.pNext = &subgroup_properties;
+    cuda_properties.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&cuda_properties);
 #endif
 
 #ifdef VK_EXT_host_image_copy
     VkPhysicalDeviceHostImageCopyPropertiesEXT hostimagecopyproperty = {};
     hostimagecopyproperty.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_PROPERTIES_EXT;
-
-#ifdef VK_NV_cuda_kernel_launch
-    cuda_properties.pNext = &hostimagecopyproperty;
-    hostimagecopyproperty.pNext = &subgroup_properties;
-#else
-    subgroup_properties.pNext = &hostimagecopyproperty;
-    hostimagecopyproperty.pNext = nullptr;
-#endif
+    hostimagecopyproperty.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&hostimagecopyproperty);
 #endif
 
-#if VK_EXT_host_image_copy
+    properties2.pNext = head;
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
-    if (hostimagecopyproperty.copySrcLayoutCount > 0) {
+
+#ifdef VK_EXT_host_image_copy
+    // Layout arrays are queried in two passes: the driver reports counts
+    // first, then we provide buffers and re-query to populate them.
+    if (hostimagecopyproperty.copySrcLayoutCount > 0 ||
+        hostimagecopyproperty.copyDstLayoutCount > 0) {
         this->copySrcLayout_.resize(hostimagecopyproperty.copySrcLayoutCount);
         this->copyDstLayout_.resize(hostimagecopyproperty.copyDstLayoutCount);
         hostimagecopyproperty.pCopySrcLayouts = this->copySrcLayout_.data();
         hostimagecopyproperty.pCopyDstLayouts = this->copyDstLayout_.data();
         vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
     }
-#else
-    vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
 #endif
+
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
     this->maxImageArrayLayers_ =
         properties2.properties.limits.maxImageArrayLayers;
@@ -104,7 +113,36 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         LOG_INFO("Device support subgroup arithmetic");
         LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
     }
-#if VK_EXT_host_image_copy
+#ifdef VK_KHR_cooperative_matrix
+    LOG_INFO("Cooperative matrix supported stages 0x%x",
+             coopmat_properties.cooperativeMatrixSupportedStages);
+
+    // Enumerate every (M, N, K, type, scope) combination the device supports.
+    if (coopmat_properties.cooperativeMatrixSupportedStages != 0) {
+        uint32_t propCount = 0;
+        auto vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
+            reinterpret_cast<PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR>(
+                vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
+                    "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR"));
+        if (vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR) {
+                vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(physicalDevice_,
+                                                            &propCount, nullptr);
+            if (propCount > 0) {
+                this->coopmatProps_.resize(propCount);
+                vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR(
+                    physicalDevice_, &propCount, this->coopmatProps_.data());
+            }
+            for (uint32_t i = 0; i < propCount; i++) {
+                const auto &p = this->coopmatProps_[i];
+                LOG_INFO("CoopMat [%u]: %ux%ux%u AType=%d BType=%d CType=%d "
+                        "ResultType=%d scope=%d",
+                        i, p.MSize, p.NSize, p.KSize, p.AType, p.BType, p.CType,
+                        p.ResultType, p.scope);
+            }
+        }
+    }
+#endif
+#ifdef VK_EXT_host_image_copy
     for (uint32_t i = 0; i < hostimagecopyproperty.copySrcLayoutCount; i++) {
         LOG_INFO("HostImageCopy support src layout %d",
                  hostimagecopyproperty.pCopySrcLayouts[i]);
@@ -114,7 +152,7 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
                  hostimagecopyproperty.pCopyDstLayouts[i]);
     }
 #endif
-#if VK_NV_cuda_kernel_launch
+#ifdef VK_NV_cuda_kernel_launch
     LOG_INFO("CUDA kernel launch compute capability %u.%u",
              cuda_properties.computeCapabilityMajor,
              cuda_properties.computeCapabilityMinor);
@@ -285,9 +323,12 @@ void VulkanDevice::checkImageFormatSupport() {
     VkFormatProperties fmprops;
     vkGetPhysicalDeviceFormatProperties(
         physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &fmprops);
-    assert(fmprops.bufferFeatures &
-           (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
-            VK_FORMAT_FEATURE_STORAGE_TEXEL_BUFFER_BIT));
+    if (!(fmprops.optimalTilingFeatures &
+          (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+           VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT))) {
+        throw std::runtime_error(
+            "Physical device does not support required image formats.");
+    }
     vkGetPhysicalDeviceFormatProperties(
         physicalDevice_, VK_FORMAT_R16G16B16A16_SFLOAT, &fmprops);
     assert(fmprops.bufferFeatures &
@@ -368,7 +409,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan12Features *>(q);
                 if (!feat->shaderFloat16 && !feat->shaderInt8 &&
-                    !feat->timelineSemaphore && !feat->bufferDeviceAddress) {
+                    !feat->timelineSemaphore && !feat->bufferDeviceAddress &&
+                    !feat->descriptorBindingStorageBufferUpdateAfterBind) {
                     return nullptr;
                 }
                 auto e = std::make_unique<VkPhysicalDeviceVulkan12Features>();
@@ -380,7 +422,11 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->shaderInt8 = feat->shaderInt8;
                 e->timelineSemaphore = feat->timelineSemaphore;
                 e->bufferDeviceAddress = feat->bufferDeviceAddress;
+                e->descriptorBindingStorageBufferUpdateAfterBind =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
                 m_support_timeline_semaphore_ = feat->timelineSemaphore;
+                m_support_descriptor_update_after_bind_ =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
                 return std::unique_ptr<VkBaseOutStructure>(
                     reinterpret_cast<VkBaseOutStructure *>(e.release()));
             }});
@@ -886,7 +932,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
                 e->cooperativeMatrix = feat->cooperativeMatrix;
-                m_support_nv_tensor_core_ = feat->cooperativeMatrix;
+                m_support_cooperate_matrix_ = feat->cooperativeMatrix;
                 return std::unique_ptr<VkBaseOutStructure>(
                     reinterpret_cast<VkBaseOutStructure *>(e.release()));
             }});
@@ -1026,6 +1072,43 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             }});
     }
 #endif
+#ifdef VK_EXT_descriptor_indexing
+    if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
+        supportedExtensions.count(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+        descs.push_back(FeatureDescriptor{
+            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
+            .extensionName = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
+            .corePromotedVersion = VK_API_VERSION_1_2,
+            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
+                q->sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+                q->pNext = nullptr;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+            },
+            .makeEnableStruct =
+                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT *>(q);
+                if (!feat->descriptorBindingStorageBufferUpdateAfterBind)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
+                e->sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
+                e->pNext = nullptr;
+                e->descriptorBindingStorageBufferUpdateAfterBind =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
+                m_support_descriptor_update_after_bind_ =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
+                return std::unique_ptr<VkBaseOutStructure>(
+                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+            },
+        });
+    }
+#endif
     for (size_t i = 0; i < descs.size(); ++i) {
         const std::unordered_map<int, std::string> desc_names = {
             {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -1087,6 +1170,8 @@ bool VulkanDevice::createLogicalDevice(
              (m_support_timeline_semaphore_ ? "is" : "not"));
     LOG_INFO("host image copy %s supported",
              (m_support_host_image_copy_ ? "is" : "not"));
+    LOG_INFO("update after bind %s supported",
+             (m_support_descriptor_update_after_bind_ ? "is" : "not"));
 
     std::vector<std::vector<float>> queue_priority(computeQueueIdxs_.size());
     auto queue_create_info = setupQueueCreateInfo(queue_priority);

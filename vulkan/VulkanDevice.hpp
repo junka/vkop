@@ -88,6 +88,8 @@ class VulkanDevice {
     // Getters
     VkDevice getLogicalDevice() const { return logicalDevice_; }
     VkPhysicalDevice getPhysicalDevice() const { return physicalDevice_; }
+    size_t getNumComputeQueues() const { return computeQueues_.size(); }
+
     std::shared_ptr<VulkanQueue> getComputeQueue(uint32_t idx = 0) const {
         int offset = idx / 2;
         int cat = idx % 2;
@@ -136,7 +138,21 @@ class VulkanDevice {
     bool is_support_cuda_kernel_launch() const {
         return m_support_cuda_kernel_launch_;
     }
-    bool is_support_nv_tensor_core() const { return m_support_nv_tensor_core_; }
+    bool is_support_nv_tensor_core() const {
+        return m_support_nv_tensor_core_;
+    }
+    bool is_support_cooperate_matrix() const {
+        return m_support_cooperate_matrix_;
+    }
+#ifdef VK_KHR_cooperative_matrix
+    const std::vector<VkCooperativeMatrixPropertiesKHR> &
+    getCooperativeMatrixProperties() const {
+        return coopmatProps_;
+    }
+#endif
+    bool is_support_descriptor_update_after_bind() const {
+        return m_support_descriptor_update_after_bind_;
+    }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -154,6 +170,8 @@ class VulkanDevice {
     bool m_support_timeline_semaphore_ = false;
     bool m_support_cuda_kernel_launch_ = false;
     bool m_support_nv_tensor_core_ = false;
+    bool m_support_cooperate_matrix_ = false;
+    bool m_support_descriptor_update_after_bind_ = false;
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>
@@ -164,6 +182,10 @@ class VulkanDevice {
 
     std::vector<VkImageLayout> copySrcLayout_;
     std::vector<VkImageLayout> copyDstLayout_;
+
+#ifdef VK_KHR_cooperative_matrix
+    std::vector<VkCooperativeMatrixPropertiesKHR> coopmatProps_;
+#endif
 
     std::string deviceName_;
 

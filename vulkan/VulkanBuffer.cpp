@@ -157,6 +157,27 @@ void VulkanBuffer::writeBarrier(VkCommandBuffer commandBuffer,
                      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, size, offset);
 }
 
+// void VulkanBuffer::shaderWriteBarrier(VkCommandBuffer commandBuffer,
+//                                       VkDeviceSize size, VkDeviceSize offset) {
+//     VkBuffer buff = getBuffer();
+//     VkBufferMemoryBarrier barrier;
+//     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+//     barrier.pNext = nullptr;
+//     barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+//     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+//     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+//     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+//     barrier.buffer = buff;
+//     barrier.offset = offset;
+//     barrier.size = size;
+
+//     m_access_ = VK_ACCESS_SHADER_READ_BIT;
+
+//     vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+//                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr,
+//                          1, &barrier, 0, nullptr);
+// }
+
 void VulkanBuffer::copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
                                            VkBuffer dstbuffer,
                                            VkDeviceSize dstoffset,

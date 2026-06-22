@@ -57,9 +57,11 @@ class Operator {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         if (spv_len_ > 0 && spv_) {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
             pipeline_ = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(), types_, pc_size_,
-                reinterpret_cast<const uint32_t *>(spv_), spv_len_);
+                reinterpret_cast<const uint32_t *>(spv_), spv_len_, use_uab);
             for (auto &ds : m_ds_) {
                 ds = pipeline_->allocDescriptorSets();
             }
@@ -226,7 +228,7 @@ class Operator {
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }
-        fillWriteDescriptorSets();
+        fillWriteDescriptorSets(m_ds_[m_id_]);
         pipeline_->updateDescriptorSets(writes_);
 
         m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
@@ -237,11 +239,39 @@ class Operator {
         m_cmd_->dispatch(width, height, layers);
     }
 
+    // Submit with a dedicated descriptor set for multi-pass operators.
+    // Each pass must use its own descriptor set because vkUpdateDescriptorSets
+    // modifies the set immediately — all dispatches referencing the same set
+    // see the LAST update's bindings, causing earlier passes to read wrong
+    // buffers on some drivers (e.g. Intel ANV).
+    void submit_per_ds(VkDescriptorSet ds, void *ptr, int width, int height,
+                       int layers) {
+        fillWriteDescriptorSets(ds);
+        pipeline_->updateDescriptorSets(writes_);
+
+        m_cmd_->bind(*pipeline_, ds);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_, static_cast<uint32_t>(pc_size_),
+                                   ptr);
+        }
+        m_cmd_->dispatch(width, height, layers);
+    }
+
+    // Allocate a fresh descriptor set from the pipeline's pool.
+    VkDescriptorSet allocPassDescriptorSet() {
+        return pipeline_->allocDescriptorSets();
+    }
+
+    // Return a per-pass descriptor set to the pool.
+    void freePassDescriptorSet(VkDescriptorSet ds) {
+        pipeline_->freeDescriptorSets(ds);
+    }
+
   private:
-    virtual void fillWriteDescriptorSets() {
+    virtual void fillWriteDescriptorSets(VkDescriptorSet ds) {
         for (size_t i = 0; i < types_.size(); i++) {
             writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            writes_[i].dstSet = m_ds_[m_id_];
+            writes_[i].dstSet = ds;
             writes_[i].dstBinding = static_cast<uint32_t>(i);
             writes_[i].dstArrayElement = 0;
             writes_[i].descriptorCount = 1;

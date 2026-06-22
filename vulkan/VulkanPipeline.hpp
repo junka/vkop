@@ -11,7 +11,7 @@ class VulkanPipeline : public VulkanBasePipeline {
   public:
     VulkanPipeline(VkDevice device, std::vector<VkDescriptorType> types,
                    size_t pushconstant_size, const uint32_t *spirv,
-                   int codesize);
+                   int codesize, bool update_after_bind);
 
   private:
     size_t m_pushconstant_size_;

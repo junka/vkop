@@ -36,7 +36,7 @@ class Maxpool2d : public Operator {
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
-        if (attributes.find("auto_pad ") != attributes.end()) {
+        if (attributes.find("auto_pad") != attributes.end()) {
             std::string auto_pad = attributes.at("auto_pad");
             if (auto_pad == "VALID") {
             } else if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {

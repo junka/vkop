@@ -405,6 +405,8 @@ double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
 
+    bool single_queue = dev->getNumComputeQueues() <= 1;
+
     std::vector<std::vector<VkSubmitInfo>> submit_infos(vkop::kInflight);
     std::vector<std::shared_ptr<VulkanCommandBuffer>> last_commands(
         vkop::kInflight);
@@ -424,18 +426,37 @@ double Runtime::Run() {
                              node_ops_[dep]->get_record()->getSignalValue());
             }
 
-            submit_infos[id].push_back(cmd->buildSubmitInfo());
+            if (single_queue) {
+                submit_infos[0].push_back(cmd->buildSubmitInfo());
+            } else {
+                submit_infos[id].push_back(cmd->buildSubmitInfo());
+            }
             if (level_idx == last_level_index) {
-                last_commands[id] = cmd;
+                last_commands[single_queue ? 0 : id] = cmd;
             }
             id++;
             id %= vkop::kInflight;
         }
     }
-    for (int ci = 0; ci < vkop::kInflight; ci++) {
-        if (!submit_infos[ci].empty()) {
-            VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
-                                        submit_infos[ci]);
+
+    if (single_queue) {
+        // Submit all command buffers in a single vkQueueSubmit call.
+        // On single-queue GPUs, splitting into multiple vkQueueSubmit calls
+        // creates implicit ordering between submits: the second submit won't
+        // begin until the first completes. If a node in submit_infos[0] waits
+        // on a semaphore signaled by a node in submit_infos[1], this creates
+        // a deadlock (C waits B, but B can't start until C finishes).
+        // A single submit lets the GPU schedule based on semaphore dependencies.
+        if (!submit_infos[0].empty()) {
+            VulkanCommandBuffer::submit(dev->getComputeQueue(0),
+                                        submit_infos[0]);
+        }
+    } else {
+        for (int ci = 0; ci < vkop::kInflight; ci++) {
+            if (!submit_infos[ci].empty()) {
+                VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
+                                            submit_infos[ci]);
+            }
         }
     }
 

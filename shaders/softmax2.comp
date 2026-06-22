@@ -112,7 +112,11 @@ void softmax32() {
             int idx = int(groupId) * C + c;
             float x = uintBitsToFloat(uInput.data[idx]);
             float diff = x - globalMax;
-            uValue.data[idx] = floatBitsToUint(exp(diff) / globalSum);
+            float softmax_x = exp(diff) / globalSum;
+            if (isnan(softmax_x)) {
+                softmax_x = uConst.nanvalue;
+            }
+            uValue.data[idx] = floatBitsToUint(softmax_x);
         }
     }
     // ==============================

@@ -38,6 +38,8 @@ public:
         Logger::getInstance().enableFileOutput("log", false);
 
         const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
+        // enumPhysicalDevices() already sorts real GPUs before llvmpipe,
+        // so phydevs[0] is always the best available device.
         dev_ = std::make_shared<VulkanDevice>(phydevs[0]);
         LOG_INFO("Initialized Vulkan device: %s", dev_->getDeviceName().c_str());
         cmdpool_ = std::make_shared<VulkanCommandPool>(dev_);
@@ -131,7 +133,7 @@ public:
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
     {
 
-        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0, dev_->is_support_nv_tensor_core());
+        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0, dev_->is_support_nv_tensor_core() ? 2 : dev_->is_support_cooperate_matrix() ? 1: 0);
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
@@ -289,7 +291,7 @@ public:
                 return false;
             }
         }
-+        LOG_INFO("Test Passed for operator: %s, type %s", name_.c_str(), typeid(T).name());
+        LOG_INFO("Test Passed for operator: %s, type %s", name_.c_str(), typeid(T).name());
         return true;
     }
 };

@@ -3,6 +3,7 @@
 /bin/
 /obj/
 /out/
+/model/onnx_models/
 
 # Ignore CMake generated files
 CMakeFiles/

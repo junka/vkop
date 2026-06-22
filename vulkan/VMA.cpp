@@ -2,10 +2,16 @@
 #include <cstdint>
 #ifdef USE_VMA
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wunused-variable"
+
 #define VMA_IMPLEMENTATION
 #define VMA_STATIC_VULKAN_FUNCTIONS 0
 #define VMA_DYNAMIC_VULKAN_FUNCTIONS 1
 #include "vulkan/vk_mem_alloc.h"
+
+#pragma GCC diagnostic pop
 
 #include "vulkan/VMA.hpp"
 
@@ -168,13 +174,13 @@ void VMA::getStats() {
     vmaBuildStatsString(allocator_, &stats_string, 1U);
     printf("%s\n", stats_string);
     for (auto &budget : budgets) {
-        printf("heap currently has %u allocations taking %llu B,\n",
+        printf("heap currently has %u allocations taking %lu B,\n",
                budget.statistics.allocationCount,
                budget.statistics.allocationBytes);
-        printf("allocated out of %u Vulkan device memory blocks taking %llu "
+        printf("allocated out of %u Vulkan device memory blocks taking %lu "
                "B,\n",
                budget.statistics.blockCount, budget.statistics.blockBytes);
-        printf("Vulkan reports total usage %llu B with budget %llu B.\n",
+        printf("Vulkan reports total usage %lu B with budget %lu B.\n",
                budget.usage, budget.budget);
     }
 }

@@ -1,19 +1,18 @@
 /*
 
-https://github.com/KhronosGroup/GLSL/blob/main/extensions/nv/GLSL_NV_cooperative_matrix.txt
-
-Section 8.X, Cooperative Matrix Functions
+https://github.com/KhronosGroup/GLSL/tree/main/extensions/khr/GLSL_KHR_cooperative_matrix.txt
 
 
-fcoopmatNV<PRECISION_BITS, gl_ScopeSubgroup, ROWS, COLS> variable;
-// fcoopmatNV<16, gl_ScopeSubgroup, 16, 8> mat2; //  fp16, subgroup, 16 rows, 8 columns
+coopmat<PRECISION_BITS, gl_ScopeSubgroup, ROWS, COLS> variable;
+// fcoopmat<16, gl_ScopeSubgroup, 16, 8> mat2; //  fp16, subgroup, 16 rows, 8 columns
 
 
-void coopMatLoadNV(out fcoopmatNV m,
-                   volatile coherent float16_t[] buf, // ssbo or shared memory array variable
-                   uint element, // starting index into buf to load from
-                   uint stride, // element stride for one column or row
-                   bool colMajor) // compile-time constant
+void coopMatLoad(out coopmat m,
+                volatile coherent int8_t[] buf,
+                uint element,
+                uint stride,
+                int matrixLayout);
+
 Load a cooperative matrix from buf. colMajor indicates
 whether the values loaded from memory are arranged in column-major or
 row-major order. It must be a constant expression, with false
@@ -26,37 +25,26 @@ order from contiguous locations starting at buf[element + col*stride].
 
 
 
-fcoopmatNV coopMatMulAddNV(fcoopmatNV A, fcoopmatNV B, fcoopmatNV C)
+fcoopmat coopMatMulAdd(fcoopmat A, fcoopmat B, fcoopmat C)
 
 
-void coopMatStoreNV(fcoopmatNV m, volatile coherent out float[] buf, uint element, uint stride, bool colMajor);
 
+void coopMatStore(coopmat m, volatile coherent out int8_t[] buf, uint element, uint stride, int matrixLayout);
 
 */
 
 #version 450 core
 
-#extension GL_NV_cooperative_matrix : enable
+#extension GL_KHR_cooperative_matrix : enable
 #extension GL_KHR_shader_subgroup_basic : enable
-#extension GL_NV_shader_subgroup_partitioned : enable
 #extension GL_KHR_memory_scope_semantics: enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16: enable
 
-#ifdef FP16
 #extension GL_AMD_gpu_shader_half_float: enable
 #extension GL_EXT_shader_16bit_storage : enable
-#define FLOAT float16_t
-#define FLOAT4 f16vec4
-#define FLOAT2 f16vec2
-#else
-#define FLOAT float
-#define FLOAT4 vec4
-#define FLOAT2 vec2
-#endif
-
 
 // 16x16 workgroup = 256 threads = 8 subgroups (assumes subgroupSize = 32).
-// Each subgroup owns one 8x8 fcoopmatNV tile (8x8x16, fp16 -> fp32).
+// Each subgroup owns one 8x8 coopmat tile (CoopMat[0]: 8x8x16, fp16 -> fp32).
 // Subgroup grid: 2 (M) x 4 (N)  =>  workgroup output footprint = 16 (M) x 32 (N).
 // A[16x16] shared across the 4 N-subgroups; B[16x32] shared across the 2 M-subgroups,
 // so each K-tile's image fetch feeds 8 MMA ops.
@@ -65,6 +53,7 @@ layout(binding = 0) writeonly uniform image2DArray uOutput;
 layout(binding = 1) uniform sampler2DArray uInputA;
 layout(binding = 2) uniform sampler2DArray uInputB;
 
+//For intel ARL, this is the only combination that works for fp16/bf16
 const int M_BLOCK = 8;
 const int N_BLOCK = 8;
 const int K_BLOCK = 16;
@@ -74,9 +63,9 @@ const int BM = 16;   // = 2 * M_BLOCK
 const int BN = 32;   // = 4 * N_BLOCK
 
 // Cooperative matrix: [M=8, N=8, K=16]
-fcoopmatNV<16, gl_ScopeSubgroup, M_BLOCK, K_BLOCK> matA[4];
-fcoopmatNV<16, gl_ScopeSubgroup, K_BLOCK, N_BLOCK> matB[4];
-fcoopmatNV<32, gl_ScopeSubgroup, M_BLOCK, N_BLOCK> matC[4];
+coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matA[4];
+coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matB[4];
+coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator> matC[4];
 
 layout(push_constant) uniform PushConsts {
     int M; // rows of A
@@ -105,7 +94,7 @@ void main() {
     int C = uMatMulParams.C;
 
     for (int b = 0; b < 4; b++) {
-        matC[b] = fcoopmatNV<32, gl_ScopeSubgroup, M_BLOCK, N_BLOCK>(0.0);
+        matC[b] = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>(0.0);
     }
 
     int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
@@ -140,30 +129,30 @@ void main() {
 
         // Each subgroup loads its own 8x16 / 16x8 slice from the shared A/B tiles.
         // shA is [16x16] row-major; sgy selects rows [sgy*8 .. +7] => offset = sgy*M_BLOCK*K_BLOCK, stride = K_BLOCK.
-        coopMatLoadNV(matA[0], shA[0], sgy * M_BLOCK * K_BLOCK, K_BLOCK, false);
-        coopMatLoadNV(matA[1], shA[1], sgy * M_BLOCK * K_BLOCK, K_BLOCK, false);
-        coopMatLoadNV(matA[2], shA[2], sgy * M_BLOCK * K_BLOCK, K_BLOCK, false);
-        coopMatLoadNV(matA[3], shA[3], sgy * M_BLOCK * K_BLOCK, K_BLOCK, false);
+        coopMatLoad(matA[0], shA[0], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA[1], shA[1], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA[2], shA[2], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matA[3], shA[3], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
         // shB is [16x32] row-major; sgx selects cols [sgx*8 .. +7] => offset = sgx*N_BLOCK, stride = BN.
-        coopMatLoadNV(matB[0], shB[0], sgx * N_BLOCK, BN, false);
-        coopMatLoadNV(matB[1], shB[1], sgx * N_BLOCK, BN, false);
-        coopMatLoadNV(matB[2], shB[2], sgx * N_BLOCK, BN, false);
-        coopMatLoadNV(matB[3], shB[3], sgx * N_BLOCK, BN, false);
+        coopMatLoad(matB[0], shB[0], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB[1], shB[1], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB[2], shB[2], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB[3], shB[3], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
 
         // C = A * B + C
-        matC[0] = coopMatMulAddNV(matA[0], matB[0], matC[0]);
-        matC[1] = coopMatMulAddNV(matA[1], matB[1], matC[1]);
-        matC[2] = coopMatMulAddNV(matA[2], matB[2], matC[2]);
-        matC[3] = coopMatMulAddNV(matA[3], matB[3], matC[3]);
+        matC[0] = coopMatMulAdd(matA[0], matB[0], matC[0]);
+        matC[1] = coopMatMulAdd(matA[1], matB[1], matC[1]);
+        matC[2] = coopMatMulAdd(matA[2], matB[2], matC[2]);
+        matC[3] = coopMatMulAdd(matA[3], matB[3], matC[3]);
         barrier();
     }
 
     // --- Step 4: CoopMat Register -> Shared Memory -> Image ---
     // Each subgroup stores into its own shC partition (no write races).
-    coopMatStoreNV(matC[0], shC[0][sg], 0, N_BLOCK, false);
-    coopMatStoreNV(matC[1], shC[1][sg], 0, N_BLOCK, false);
-    coopMatStoreNV(matC[2], shC[2][sg], 0, N_BLOCK, false);
-    coopMatStoreNV(matC[3], shC[3][sg], 0, N_BLOCK, false);
+    coopMatStore(matC[0], shC[0][sg], 0, N_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matC[1], shC[1][sg], 0, N_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matC[2], shC[2][sg], 0, N_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatStore(matC[3], shC[3][sg], 0, N_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
 
     barrier();
 

@@ -24,8 +24,8 @@ class VulkanBasePipeline {
     VkDescriptorPool m_descriptorPool_ = VK_NULL_HANDLE;
 
     // Common methods
-    void createDescriptorSetLayout(VkShaderStageFlags flags);
-    void createDescriptorPool();
+    void createDescriptorSetLayout(VkShaderStageFlags flags, bool update_after_bind = false);
+    void createDescriptorPool(bool update_after_bind = false);
     void createPipelineLayout(VkShaderStageFlags flags,
                               size_t pushconstant_size = 0);
 

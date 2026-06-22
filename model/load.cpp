@@ -157,7 +157,7 @@ void VkModel::loadFromBinary(const std::string& filePath) {
            total_memory_size);
 
     // Allocate a single large memory block
-    initializer_memory.reserve(total_memory_size);
+    initializer_memory.resize(total_memory_size, 0);
 
     // second pass to read initializers
     ptr = init_start;

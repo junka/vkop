@@ -61,7 +61,7 @@ public:
         if (!perm_.empty() && perm_.size() > 0) {
             std::string str = "[";
             for (int i = 0; i < static_cast<int>(perm_.size()); ++i) {
-                str += std::to_string(i);
+                str += std::to_string(perm_[i]);
                 if (i < static_cast<int>(perm_.size()) - 1) {
                     str += ",";
                 }

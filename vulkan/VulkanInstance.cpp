@@ -312,12 +312,29 @@ void VulkanInstance::enumPhysicalDevices() {
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
-    m_physical_devices_.resize(count);
-    error = vkEnumeratePhysicalDevices(m_instance_, &count,
-                                       m_physical_devices_.data());
+    std::vector<VkPhysicalDevice> devices(count);
+    error = vkEnumeratePhysicalDevices(m_instance_, &count, devices.data());
     if (error != VK_SUCCESS) {
         throw std::runtime_error("Failed to enumerate physical devices.");
     }
+    // Prefer real GPUs over software rasterizers (llvmpipe).
+    // Move discrete/integrated GPUs to the front so phydevs[0] is usable.
+    std::stable_sort(devices.begin(), devices.end(),
+        [](VkPhysicalDevice a, VkPhysicalDevice b) {
+            auto rank = [](VkPhysicalDevice dev) -> int {
+                VkPhysicalDeviceProperties props;
+                vkGetPhysicalDeviceProperties(dev, &props);
+                switch (props.deviceType) {
+                case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:   return 0;
+                case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:  return 1;
+                case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:     return 2;
+                case VK_PHYSICAL_DEVICE_TYPE_CPU:             return 3; // llvmpipe
+                default:                                      return 4;
+                }
+            };
+            return rank(a) < rank(b);
+        });
+    m_physical_devices_ = std::move(devices);
 }
 
 #ifdef VK_EXT_tooling_info

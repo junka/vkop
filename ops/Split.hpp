@@ -96,6 +96,12 @@ class Split : public Operator {
             inputs[0]->get_shape(para_.inShape);
             outputs[0]->get_shape(para_.outShape);
         }
+        // Each submit needs its own descriptor set to avoid cross-pass
+        // binding interference on drivers like Intel ANV.
+        std::vector<VkDescriptorSet> pass_ds(num_outputs_);
+        for (int i = 0; i < num_outputs_; i++) {
+            pass_ds[i] = allocPassDescriptorSet();
+        }
         para_.split = 0;
         for (int i = 0; i < num_outputs_; i++) {
             para_.outShape[para_.axis] =
@@ -103,9 +109,12 @@ class Split : public Operator {
 
             auto gpushape = outputs[i]->getGPUShape();
             objs_[0] = output_images[i];
-            submit(&para_, UP_DIV(gpushape[0], 16), UP_DIV(gpushape[1], 16),
+            submit_per_ds(pass_ds[i], &para_, UP_DIV(gpushape[0], 16), UP_DIV(gpushape[1], 16),
                    gpushape[2]);
             para_.split += outputs[i]->getShape()[para_.axis - 4 + rank];
+        }
+        for (int i = 0; i < num_outputs_; i++) {
+            freePassDescriptorSet(pass_ds[i]);
         }
     }
 

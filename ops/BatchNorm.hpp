@@ -36,7 +36,9 @@ class BatchNorm : public Operator {
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         // skip training, training_mode, spatial, since we don't need them
-        if (attributes.find("eps") != attributes.end()) {
+        if (attributes.find("epsilon") != attributes.end()) {
+            eps_ = std::stof(attributes.at("epsilon"));
+        } else if (attributes.find("eps") != attributes.end()) {
             eps_ = std::stof(attributes.at("eps"));
         }
 

@@ -2,20 +2,24 @@
 include(FetchContent)
 include(GoogleTest)
 
-FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG release-1.12.1
-)
+# Try to find gtest locally first, fall back to FetchContent
+find_package(GTest QUIET)
+if(NOT GTest_FOUND)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG release-1.12.1
+    )
 
-FetchContent_GetProperties(googletest)
-if(NOT googletest_POPULATED)
-    FetchContent_Populate(googletest)
-    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-    set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
-    set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+    FetchContent_GetProperties(googletest)
+    if(NOT googletest_POPULATED)
+        FetchContent_Populate(googletest)
+        set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+        set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+        set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 
-    add_subdirectory(${googletest_SOURCE_DIR} ${googletest_BINARY_DIR})
+        add_subdirectory(${googletest_SOURCE_DIR} ${googletest_BINARY_DIR})
+    endif()
 endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/src)
@@ -60,6 +64,11 @@ set(TEST_SOURCES
     ExpandTest.cpp
 )
 
+# Option: compile all tests into a single translation unit for faster builds.
+# This avoids re-parsing <torch/torch.h> in each test file (~7s per file).
+# When enabled, TEST_SOURCES is replaced by a single combined source.
+option(MERGE_TEST_SOURCES "Merge all test sources into one TU for faster compilation" ON)
+
 set(LIBTORCH_VERSION "2.10.0")
 # Determine the appropriate libtorch URL based on the operating system
 if(WIN32)
@@ -76,7 +85,7 @@ set(LIBTORCH_DOWNLOAD_DIR ${CMAKE_BINARY_DIR}/downloads)
 # Check if libtorch is already downloaded
 if(NOT EXISTS "${LIBTORCH_ROOT}")
     message(STATUS "Downloading libtorch...")
-    
+
     # Create download directory
     file(MAKE_DIRECTORY ${LIBTORCH_DOWNLOAD_DIR})
 
@@ -123,7 +132,28 @@ find_library(C10_LIBRARY
 )
 file(GLOB TORCH_DLLS "${TORCH_LIB_DIR}/*.dll")
 
-add_executable(all_tests ${TEST_SOURCES})
+if(MERGE_TEST_SOURCES)
+    # Generate a single combined source that includes all test files.
+    # This way <torch/torch.h> is parsed only once, cutting build time
+    # from ~7s * N_test_files down to ~7s * 1.
+    set(ALL_TESTS_COMBINED ${CMAKE_CURRENT_BINARY_DIR}/all_tests_combined.cpp)
+    file(WRITE ${ALL_TESTS_COMBINED}
+        "// Auto-generated - do not edit\n"
+        "// Merges all test sources into one translation unit for faster compilation.\n"
+    )
+    foreach(SRC ${TEST_SOURCES})
+        # Exclude setup.cpp since it contains main() and static definitions
+        if(NOT SRC STREQUAL "setup.cpp")
+            file(APPEND ${ALL_TESTS_COMBINED} "#include \"${CMAKE_CURRENT_SOURCE_DIR}/${SRC}\"\n")
+        endif()
+    endforeach()
+
+    add_executable(all_tests setup.cpp ${ALL_TESTS_COMBINED})
+    set_source_files_properties(${ALL_TESTS_COMBINED} PROPERTIES GENERATED TRUE)
+else()
+    add_executable(all_tests ${TEST_SOURCES})
+endif()
+
 if (USE_FP16)
     target_compile_definitions(all_tests PUBLIC FP16)
 endif()
@@ -139,9 +169,12 @@ endif()
 target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}
     ${C10_LIBRARY}
-    gtest gtest_main)
-target_include_directories(all_tests PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR} 
+    GTest::gtest GTest::gtest_main)
+if(NOT GTest_FOUND)
+    target_include_directories(all_tests PRIVATE
         ${googletest_SOURCE_DIR}/googletest/include)
+endif()
+target_include_directories(all_tests PRIVATE ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
 
 if (MSVC)
     add_custom_command(TARGET all_tests POST_BUILD
@@ -154,7 +187,7 @@ endif()
 
 gtest_discover_tests(all_tests
     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
-    PROPERTIES 
+    PROPERTIES
         TIMEOUT 300
 )
 

@@ -13,13 +13,13 @@ namespace vkop {
 VulkanPipeline::VulkanPipeline(VkDevice device,
                                std::vector<VkDescriptorType> types,
                                size_t pushconstant_size, const uint32_t *spirv,
-                               int codesize)
+                               int codesize, bool update_after_bind)
     : VulkanBasePipeline(device, std::move(types)),
       m_pushconstant_size_(pushconstant_size) {
     VulkanShader shader(device, spirv, codesize);
-    createDescriptorSetLayout(VK_SHADER_STAGE_COMPUTE_BIT);
+    createDescriptorSetLayout(VK_SHADER_STAGE_COMPUTE_BIT, update_after_bind);
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
-    createDescriptorPool();
+    createDescriptorPool(update_after_bind);
 
     createComputePipeline(m_pipelineLayout_, shader.getShaderModule());
     // could destroy shader here

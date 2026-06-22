@@ -101,9 +101,16 @@ class Topk : public Operator {
         int axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
         assert(axis <= 2 && axis >= 0);
         assert(para_.k < 256);
+        // fp16 packed writes (packHalf2x16) need an even out_base, so k is
+        // rounded up to even. The shader then lays out output rows with the
+        // bumped k as stride, while the output tensor keeps the original k.
+        // row_pad records the extra trailing element(s) per row so that
+        // copyToCPU can compact the rows back to the logical k.
+        int original_k = para_.k;
         if (fp16_ == 1 && para_.k % 2 != 0) {
             para_.k = UP_DIV(para_.k, 2) * 2;
         }
+        int row_pad = para_.k - original_k;
 
         auto outshape = inshape;
         outshape[axis] = para_.k;
@@ -176,6 +183,20 @@ class Topk : public Operator {
         objs_.emplace_back(output_value_cur);
         objs_.emplace_back(input_index_cur);
         objs_.emplace_back(input_value_cur);
+
+        // Each pass must use its own descriptor set. vkUpdateDescriptorSets
+        // modifies the set immediately, so all dispatches referencing the same
+        // set see the LAST update's bindings — earlier passes would read
+        // wrong buffers on drivers like Intel ANV.
+        if (round > 16) {
+            std::cerr << "too many rounds" << std::endl;
+            assert(0);
+        }
+        std::vector<VkDescriptorSet> pass_ds(round);
+        for (int i = 0; i < round; i++) {
+            pass_ds[i] = allocPassDescriptorSet();
+        }
+
         for (int i = 0; i < round; i++) {
             // output
             if (i == round - 1) {
@@ -196,9 +217,9 @@ class Topk : public Operator {
             int dispatch_width =
                 fp16_ ? UP_DIV(width, 512) : UP_DIV(width, 256);
             if (axis == 0) {
-                submit(&para_, dispatch_width, 1, 1);
+                submit_per_ds(pass_ds[i], &para_, dispatch_width, 1, 1);
             } else {
-                submit(&para_, dispatch_width, inshape[0], 1);
+                submit_per_ds(pass_ds[i], &para_, dispatch_width, inshape[0], 1);
             }
 
             if (i == 0) {
@@ -214,6 +235,21 @@ class Topk : public Operator {
                 o1->readBarrier(m_cmd_->get());
                 o2->readBarrier(m_cmd_->get());
             }
+        }
+
+        for (int i = 0; i < round; i++) {
+            freePassDescriptorSet(pass_ds[i]);
+        }
+
+        // Mark outputs whose GPU buffer carries per-row padding so the host
+        // readback compacts rows back to the logical k. The fp16 odd-k path
+        // bumps k to even, and the shader lays out output rows with the
+        // bumped k as the stride along the last dim. copyBufferToCPU's
+        // compact path assumes the padded dim is the last (cols) dim, so this
+        // only applies to axis==1 (2D, k along cols) — the tested layout.
+        if (row_pad > 0 && axis == 1) {
+            outputs[0]->set_gpu_row_pad(row_pad);
+            outputs[1]->set_gpu_row_pad(row_pad);
         }
     }
 

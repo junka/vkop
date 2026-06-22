@@ -53,6 +53,13 @@ class ITensor {
     bool get_transpose() const { return transpose_; }
     void set_pack() { pack_ = true; }
     bool get_pack() const { return pack_; }
+    // Per-row element count padded onto the GPU buffer's row stride beyond the
+    // logical cols. When >0, the GPU wrote the buffer with a packed row stride
+    // of (logical_cols + gpu_row_pad_) and copyBufferToCPU must compact it back
+    // to the contiguous logical layout. Used by Topk's fp16 path, where k is
+    // rounded up to even so packHalf2x16 writes have an even out_base.
+    void set_gpu_row_pad(int pad) { gpu_row_pad_ = pad; }
+    int get_gpu_row_pad() const { return gpu_row_pad_; }
     std::vector<int> getShape() {
         if (dims_[3]) {
             return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
@@ -206,6 +213,7 @@ class ITensor {
     bool pack_ = false;
     bool converted_ = false;
     // 64bytes here
+    int gpu_row_pad_ = 0;
 };
 
 template <typename T> class Tensor : public ITensor {
@@ -805,9 +813,26 @@ template <typename T> class Tensor : public ITensor {
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
-        auto b = stpool->allocate(size_);
+
+        // When the GPU buffer holds per-row padding (e.g. Topk fp16 odd-k,
+        // where k is rounded up to even so packed fp16 writes have an even
+        // out_base), the device wrote each row with stride
+        // (logical_cols + gpu_row_pad_). Copy the full padded footprint back
+        // and compact it into the contiguous logical layout on the host.
+        int row_pad = get_gpu_row_pad();
+        bool need_compact = (row_pad > 0);
+        size_t copy_bytes = size_;
+        int logical_cols = dims_[1];
+        int rows = dims_[0];
+        if (need_compact) {
+            copy_bytes = static_cast<size_t>(rows) *
+                         (logical_cols + row_pad) * sizeof(T);
+        }
+
+        auto b = stpool->allocate(copy_bytes);
         if (!b) {
-            printf("copyBufferToCPU stpool alloc failed %d\n", size_);
+            printf("copyBufferToCPU stpool alloc failed %d\n",
+                   static_cast<int>(copy_bytes));
             return;
         }
         std::shared_ptr<VulkanBuffer> buffer;
@@ -821,12 +846,27 @@ template <typename T> class Tensor : public ITensor {
         }
 
         cmd.begin();
-        buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset, size_,
-                                        offset);
+        buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset,
+                                        copy_bytes, offset);
         cmd.end();
         cmd.submit(dev->getComputeQueue());
         cmd.wait();
-        std::memcpy(data_->data(), b->ptr, size_);
+        if (need_compact) {
+            size_t packed_stride_bytes =
+                static_cast<size_t>(logical_cols + row_pad) * sizeof(T);
+            for (int r = 0; r < rows; r++) {
+                std::memcpy(data_->data() +
+                                static_cast<size_t>(r) * logical_cols,
+                            static_cast<char *>(b->ptr) +
+                                static_cast<size_t>(r) * packed_stride_bytes,
+                            static_cast<size_t>(logical_cols) * sizeof(T));
+            }
+            // Padding is consumed; drop the marker so subsequent copies use
+            // the plain contiguous path.
+            gpu_row_pad_ = 0;
+        } else {
+            std::memcpy(data_->data(), b->ptr, size_);
+        }
         stpool->reset();
         toCPU();
     }

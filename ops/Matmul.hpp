@@ -8,11 +8,20 @@ extern unsigned char matmul_spv[];
 extern unsigned int matmul_spv_len;
 extern unsigned char matmul_nv_spv[];
 extern unsigned int matmul_nv_spv_len;
+extern unsigned char matmul_coop_spv[];
+extern unsigned int matmul_coop_spv_len;
 }
 namespace vkop {
 namespace ops {
 
 namespace matmul {
+
+enum class Method {
+    BASIC_ARITHMETIC = 0,
+    VK_COOPERATE_MATRIX = 1,
+    NV_TENSORCORE = 2,
+};
+
 struct alignas(16) GpuMatMulParam {
     int M;
     int N;
@@ -27,13 +36,15 @@ class MatMul : public Operator {
     MatMul(MatMul &&) = delete;
     MatMul &operator=(MatMul &&) = delete;
 
-    explicit MatMul(bool use_tensorcore = false)
-        : Operator(OpType::MATMUL, use_tensorcore ? matmul_nv_spv : matmul_spv,
-                   use_tensorcore ? matmul_nv_spv_len : matmul_spv_len,
+    explicit MatMul(int use_tensorcore = 0)
+        : Operator(OpType::MATMUL, use_tensorcore == 2 ? matmul_nv_spv : (use_tensorcore == 1 ? matmul_coop_spv : matmul_spv),
+                   use_tensorcore == 2 ? matmul_nv_spv_len : (use_tensorcore == 1 ? matmul_coop_spv_len: matmul_spv_len),
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(matmul::GpuMatMulParam)) {};
+                   sizeof(matmul::GpuMatMulParam)) {
+            method_ = use_tensorcore == 2 ? matmul::Method::NV_TENSORCORE : (use_tensorcore == 1 ? matmul::Method::VK_COOPERATE_MATRIX : matmul::Method::BASIC_ARITHMETIC);
+        };
 
   private:
     void execute(
@@ -69,9 +80,19 @@ class MatMul : public Operator {
         para.N = n;
         para.K = k;
         para.C = chan;
-
-        submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
+        if (method_ == matmul::Method::VK_COOPERATE_MATRIX) {
+            // coop kernel: 16x16 workgroup, 8 subgroups (2 M x 4 N),
+            // workgroup output footprint = 16 (M) x 32 (N).
+            submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
+        } else if (method_ == matmul::Method::NV_TENSORCORE) {
+            // nv kernel: same 16x16 workgroup / 8 subgroups / 16x32 footprint as coop.
+            submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
+        } else {
+            submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
+        }
     }
+
+    matmul::Method method_ = matmul::Method::BASIC_ARITHMETIC;
 };
 
 } // namespace ops

@@ -34,13 +34,31 @@ VulkanBasePipeline::~VulkanBasePipeline() {
     }
 }
 
-void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags) {
+void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags, bool update_after_bind) {
     auto bindings = allocDescriptorSetLayoutBindings(flags);
+
+    // Per-binding flags: all bindings get UPDATE_AFTER_BIND if enabled
+    std::vector<VkDescriptorBindingFlags> bindingFlags(bindings.size(), 0);
+    VkDescriptorSetLayoutBindingFlagsCreateInfo bindingFlagsInfo = {};
+    if (update_after_bind) {
+        for (size_t i = 0; i < bindings.size(); i++) {
+            bindingFlags[i] = VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT;
+        }
+        bindingFlagsInfo.sType =
+            VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO;
+        bindingFlagsInfo.bindingCount = static_cast<uint32_t>(bindingFlags.size());
+        bindingFlagsInfo.pBindingFlags = bindingFlags.data();
+    }
+
     VkDescriptorSetLayoutCreateInfo layout_info{};
     layout_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
     layout_info.bindingCount = static_cast<uint32_t>(bindings.size());
     layout_info.pBindings = bindings.data();
-
+    if (update_after_bind) {
+        layout_info.pNext = &bindingFlagsInfo;
+        layout_info.flags =
+            VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT;
+    }
     if (vkCreateDescriptorSetLayout(m_device_, &layout_info, nullptr,
                                     &m_descriptorSetLayout_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create descriptor set layout!");
@@ -59,7 +77,7 @@ VulkanBasePipeline::allocDescriptorSetLayoutBindings(VkShaderStageFlags flags) {
     return bindings;
 }
 
-void VulkanBasePipeline::createDescriptorPool() {
+void VulkanBasePipeline::createDescriptorPool(bool update_after_bind) {
     std::map<VkDescriptorType, int> type_counts;
     for (auto t : m_types_) {
         if (type_counts.find(t) == type_counts.end()) {
@@ -72,7 +90,7 @@ void VulkanBasePipeline::createDescriptorPool() {
     for (auto &t : type_counts) {
         VkDescriptorPoolSize ps;
         ps.type = t.first;
-        ps.descriptorCount = t.second;
+        ps.descriptorCount = t.second * kInflight * 16;
         pool_sizes.push_back(ps);
     }
 
@@ -81,7 +99,11 @@ void VulkanBasePipeline::createDescriptorPool() {
         VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
     descriptor_pool_create_info.flags =
         VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
-    descriptor_pool_create_info.maxSets = kInflight;
+    if (update_after_bind) {
+        descriptor_pool_create_info.flags |=
+            VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
+    }
+    descriptor_pool_create_info.maxSets = kInflight * 16;
     descriptor_pool_create_info.poolSizeCount =
         static_cast<uint32_t>(pool_sizes.size());
     descriptor_pool_create_info.pPoolSizes = pool_sizes.data();

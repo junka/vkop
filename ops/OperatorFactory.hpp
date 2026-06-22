@@ -55,7 +55,7 @@ namespace ops {
 
 static inline std::unique_ptr<Operator>
 create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
-                 bool use_tensorcore = false) {
+                 int use_tensorcore = 0) {
     switch (type) {
     case OpType::ADD:
         return std::make_unique<Add>();
