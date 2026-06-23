@@ -83,6 +83,7 @@ layout(push_constant) uniform PushConsts {
     int N; // cols of B
     int K; // common dim
     int C;
+    int fp32;
 } uMatMulParams;
 
 shared float16_t shA[4][BM * K_BLOCK];           // 4 x 16x16, shared across N-subgroups

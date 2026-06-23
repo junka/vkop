@@ -84,6 +84,18 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     head = reinterpret_cast<VkBaseOutStructure *>(&hostimagecopyproperty);
 #endif
 
+#ifdef VK_EXT_subgroup_size_control
+    // Queried so the pipeline can request a fixed requiredSubgroupSize; the
+    // Intel ANV driver is free to pick any subgroupSize in [min,max] when it
+    // is not pinned, which breaks shaders that hard-assume a specific
+    // numSubgroups (e.g. softmax2.comp).
+    VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssc_properties = {};
+    ssc_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;
+    ssc_properties.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&ssc_properties);
+#endif
+
     properties2.pNext = head;
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
 
@@ -108,6 +120,12 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
     LOG_INFO("Min TexelBuffer Alignment %llu",
              properties2.properties.limits.minTexelBufferOffsetAlignment);
+#ifdef VK_EXT_subgroup_size_control
+    minSubgroupSize_ = ssc_properties.minSubgroupSize;
+    maxSubgroupSize_ = ssc_properties.maxSubgroupSize;
+    LOG_INFO("Subgroup size control min %u max %u",
+             ssc_properties.minSubgroupSize, ssc_properties.maxSubgroupSize);
+#endif
     if (subgroup_properties.supportedOperations &
         VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) {
         LOG_INFO("Device support subgroup arithmetic");

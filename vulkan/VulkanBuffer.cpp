@@ -220,4 +220,15 @@ void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
 
     transferBarrier(commandBuffer, old_access, size, offset);
 }
+
+void VulkanBuffer::fillBuffer(VkCommandBuffer commandBuffer, uint32_t value,
+                              VkDeviceSize size, VkDeviceSize offset) {
+    VkAccessFlags old_access = m_access_;
+    if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
+        transferWriteBarrier(commandBuffer, size, offset);
+    }
+    VkBuffer buffer = getBuffer();
+    vkCmdFillBuffer(commandBuffer, buffer, offset, size, value);
+    transferBarrier(commandBuffer, old_access, size, offset);
+}
 } // namespace vkop

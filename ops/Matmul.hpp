@@ -27,6 +27,7 @@ struct alignas(16) GpuMatMulParam {
     int N;
     int K;
     int C;
+    int fp32;
 };
 } // namespace matmul
 class MatMul : public Operator {
@@ -83,26 +84,31 @@ class MatMul : public Operator {
                 auto inputptr = core::as_tensor<T>(input);
                 auto input_image = inputptr->as_input_image(m_dev_, m_cmd_);
                 objs_.emplace_back(input_image);
+                if (typeid(uint16_t) == typeid(T)) {
+                    para_.fp32 = 0;
+                } else if (typeid(float) == typeid(T)) {
+                    para_.fp32 = 1;
+                }
             });
         }
-        matmul::GpuMatMulParam para;
-        para.M = m;
-        para.N = n;
-        para.K = k;
-        para.C = chan;
+        para_.M = m;
+        para_.N = n;
+        para_.K = k;
+        para_.C = chan;
         if (method_ == matmul::Method::VK_COOPERATE_MATRIX) {
             // coop kernel: 16x16 workgroup, 8 subgroups (2 M x 4 N),
             // workgroup output footprint = 16 (M) x 32 (N).
-            submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
+            submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
         } else if (method_ == matmul::Method::NV_TENSORCORE) {
             // nv kernel: same 16x16 workgroup / 8 subgroups / 16x32 footprint
             // as coop.
-            submit(&para, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
+            submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), UP_DIV(chan, 4));
         } else {
-            submit(&para, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
+            submit(&para_, UP_DIV(n, 16), UP_DIV(m, 16), UP_DIV(chan, 4));
         }
     }
 
+    matmul::GpuMatMulParam para_;
     matmul::Method method_ = matmul::Method::BASIC_ARITHMETIC;
 };
 

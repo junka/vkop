@@ -9,6 +9,8 @@
 extern "C" {
 extern unsigned char gather_spv[];
 extern unsigned int gather_spv_len;
+extern unsigned char gather_fp16_spv[];
+extern unsigned int gather_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -28,8 +30,12 @@ struct GpuGatherParam {
 
 class Gather : public Operator {
   public:
-    explicit Gather()
-        : Operator(OpType::GATHER, gather_spv, gather_spv_len,
+    // fp16 picks the fp16 storage-buffer SPIR-V variant (gather_fp16_spv),
+    // which uses float16_t elements instead of float. Two separate SPIR-V
+    // builds avoid a runtime branch in the shader.
+    explicit Gather(int fp16 = 0)
+        : Operator(OpType::GATHER, fp16 ? gather_fp16_spv : gather_spv,
+                   fp16 ? gather_fp16_spv_len : gather_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},

@@ -47,6 +47,12 @@ class VulkanBuffer : public VulkanResource {
                                  VkBuffer dstbuffer, VkDeviceSize dstoffset,
                                  VkDeviceSize size, VkDeviceSize offset = 0);
 
+    // Fill the whole buffer (or a [offset, offset+size) region) with a 4-byte
+    // pattern via vkCmdFillBuffer. Transitions to TRANSFER_WRITE before and
+    // back to the prior access afterwards. Requires TRANSFER_DST usage.
+    void fillBuffer(VkCommandBuffer commandBuffer, uint32_t value,
+                    VkDeviceSize size = VK_WHOLE_SIZE, VkDeviceSize offset = 0);
+
     void copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
                                  VkBuffer srcbuffer, VkDeviceSize srcoffset,
                                  VkDeviceSize size, VkDeviceSize offset = 0);

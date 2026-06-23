@@ -122,7 +122,7 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
     case OpType::NMS:
         return std::make_unique<Nms>();
     case OpType::GATHER:
-        return std::make_unique<Gather>();
+        return std::make_unique<Gather>(fp16);
     case OpType::RANGE:
         return std::make_unique<Range>();
     case OpType::EXPAND:

@@ -162,8 +162,6 @@ else()
     add_executable(all_tests ${TEST_SOURCES})
 endif()
 
-target_compile_definitions(all_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=0)
-
 if (USE_FP16)
     target_compile_definitions(all_tests PUBLIC FP16)
 endif()

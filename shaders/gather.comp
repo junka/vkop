@@ -1,7 +1,16 @@
 #version 450 core
 
-layout(set=0, binding=0) writeonly buffer outputBuffer { float data[]; } uOutput;
-layout(set=0, binding=1) readonly buffer inputBuffer { float data[]; } uInput;
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#define DTYPE float16_t
+#else
+#define DTYPE float
+#endif
+
+layout(set=0, binding=0) writeonly buffer outputBuffer { DTYPE data[]; } uOutput;
+layout(set=0, binding=1) readonly buffer inputBuffer { DTYPE data[]; } uInput;
 layout(set=0, binding=2) readonly buffer indexBuffer { int data[]; } uIndex;
 
 layout(push_constant) uniform gatherBuffer {
@@ -157,7 +166,7 @@ void main()
     // 6. 计算输入索引并写入
     int input_linear_idx = ndToLinear(in_coord, uGatherPara.inShape, uGatherPara.idims);
 
-    if (input_linear_idx >= 0 && input_linear_idx < uInput.data.length()) {
+    if (input_linear_idx >= 0) {
         uOutput.data[global_id] = uInput.data[input_linear_idx];
     }
 }

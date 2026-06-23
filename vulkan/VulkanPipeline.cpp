@@ -13,9 +13,11 @@ namespace vkop {
 VulkanPipeline::VulkanPipeline(VkDevice device,
                                std::vector<VkDescriptorType> types,
                                size_t pushconstant_size, const uint32_t *spirv,
-                               int codesize, bool update_after_bind)
+                               int codesize, bool update_after_bind,
+                               uint32_t required_subgroup_size)
     : VulkanBasePipeline(device, std::move(types)),
-      m_pushconstant_size_(pushconstant_size) {
+      m_pushconstant_size_(pushconstant_size),
+      required_subgroup_size_(required_subgroup_size) {
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout(VK_SHADER_STAGE_COMPUTE_BIT, update_after_bind);
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
@@ -36,6 +38,22 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     shader_stage_create_info.module = shaderModule;
     shader_stage_create_info.pName = "main";
     shader_stage_create_info.pSpecializationInfo = nullptr;
+
+    // Pin the compute shader's subgroup size when requested. Some shaders
+    // (e.g. softmax2.comp) hard-code numSubgroups = workgroup/subgroupSize and
+    // a cross-subgroup reduce that only subgroup 0 drives; if the driver picks
+    // a different subgroupSize than assumed, the global max/sum are computed
+    // from a subset of partials. Requiring a fixed size makes that assumption
+    // hold. Requires the VK_EXT_subgroup_size_control feature (1.3 core).
+    VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT ssc_info = {};
+    ssc_info.sType =
+        VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+    ssc_info.requiredSubgroupSize = required_subgroup_size_;
+    if (required_subgroup_size_ != 0) {
+        shader_stage_create_info.pNext = &ssc_info;
+        shader_stage_create_info.flags |=
+            VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+    }
 
     VkComputePipelineCreateInfo pipeline_info{};
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;

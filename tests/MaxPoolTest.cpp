@@ -93,8 +93,12 @@ public:
 private:
     void initTestdata() {
         input = std::make_shared<Tensor<T>>(input_shape_);
-        output = std::make_shared<Tensor<T>>(input_shape_);
 
+        int H = input_shape_[2], W = input_shape_[3];
+        int kh = kernel_size_, kw = kernel_size_, sh = stride_, sw = stride_, ph = pad_, pw = pad_;
+        int out_h = ((H - (kh - 1) + 2 * ph - 1) / sh) + 1;   // ceil_mode=0
+        int out_w = ((W - (kw - 1) + 2 * pw - 1) / sw) + 1;
+        output = std::make_shared<Tensor<T>>(std::vector<int>{input_shape_[0], input_shape_[1], out_h, out_w});
         torch::manual_seed(42);
         auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]}, this->getTorchConf());
         auto torch_output = torch::max_pool2d(torch_input, {kernel_size_, kernel_size_}, {stride_, stride_}, {pad_, pad_}, 1, false);

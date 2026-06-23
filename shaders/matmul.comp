@@ -10,6 +10,7 @@ layout(push_constant) uniform paraBuffer {
     int N; // 列数, W for B, W for C
     int K; // W for A and H for B
     int C;
+    int fp32;
 } uMatMulParams;
 
 void main() {

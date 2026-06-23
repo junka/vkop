@@ -30,6 +30,13 @@ class Operator {
         writes_.resize(types_.size());
     }
 
+    // Pin the compute pipeline's subgroup size. Set to the device's reported
+    // subgroup size before set_runtime_device() for shaders that hard-assume a
+    // fixed numSubgroups (e.g. softmax2.comp's cross-subgroup reduce).
+    void set_required_subgroup_size(uint32_t size) {
+        required_subgroup_size_ = size;
+    }
+
     virtual ~Operator() {
         for (auto &m_d : m_ds_) {
             if (m_d)
@@ -61,7 +68,8 @@ class Operator {
                            m_dev_->is_support_descriptor_update_after_bind();
             pipeline_ = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(), types_, pc_size_,
-                reinterpret_cast<const uint32_t *>(spv_), spv_len_, use_uab);
+                reinterpret_cast<const uint32_t *>(spv_), spv_len_, use_uab,
+                required_subgroup_size_);
             for (auto &ds : m_ds_) {
                 ds = pipeline_->allocDescriptorSets();
             }
@@ -193,6 +201,7 @@ class Operator {
     bool update_after_bind_ = false;
     bool trace_ = false;
     std::string name_;
+    uint32_t required_subgroup_size_ = 0;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

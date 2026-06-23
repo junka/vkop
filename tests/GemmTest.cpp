@@ -113,7 +113,7 @@ private:
         int n = transB ? t2[0] : t2[1];
         int k = ka;
         inputc = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
-        output = std::make_shared<Tensor<T>>(std::vector<int>{t1[0], t2[1]});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
 
         torch::manual_seed(42);
         std::vector<int64_t> t1shape(t1.begin(), t1.end());

@@ -193,11 +193,6 @@ void main() {
             output_data[(base_offset + i)*3+2] = sh_indices[sh_selected[i]];
         }
     }
-    barrier();
-    if (gid == 0u && batch_class_id == 0u) {
-        uint base_offset = atomicAdd(total_count, 1u);
-        output_data[base_offset*3] = int(-1);
-        output_data[base_offset*3+1] = int(-1);
-        output_data[base_offset*3+2] = int(-1);
-    }
+    // No sentinel row: the selected-box count is read back from total_count,
+    // so the host knows exactly how many output rows are valid.
 }

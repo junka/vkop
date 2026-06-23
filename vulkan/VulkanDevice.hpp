@@ -151,6 +151,15 @@ class VulkanDevice {
     bool is_support_descriptor_update_after_bind() const {
         return m_support_descriptor_update_after_bind_;
     }
+#ifdef VK_EXT_subgroup_size_control
+    // Range of subgroup sizes the driver will allow a compute pipeline to
+    // pin via requiredSubgroupSize. 0 when the extension/feature is absent.
+    uint32_t getMinSubgroupSize() const { return minSubgroupSize_; }
+    uint32_t getMaxSubgroupSize() const { return maxSubgroupSize_; }
+#else
+    uint32_t getMinSubgroupSize() const { return 0; }
+    uint32_t getMaxSubgroupSize() const { return 0; }
+#endif
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -170,6 +179,11 @@ class VulkanDevice {
     bool m_support_nv_tensor_core_ = false;
     bool m_support_cooperate_matrix_ = false;
     bool m_support_descriptor_update_after_bind_ = false;
+
+#ifdef VK_EXT_subgroup_size_control
+    uint32_t minSubgroupSize_ = 0;
+    uint32_t maxSubgroupSize_ = 0;
+#endif
 
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>> computeQueueIdxs_;
     std::vector<std::tuple<uint32_t, uint32_t, VkQueueFlags>>

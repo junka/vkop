@@ -79,6 +79,7 @@ template<typename T>
 class TestCase {
 private:
     std::string name_;
+protected:
     std::shared_ptr<VulkanDevice> dev_;
     std::shared_ptr<VulkanCommandPool> cmdpool_;
     torch::TensorOptions conf_;
@@ -107,7 +108,7 @@ public:
     }
 
     template<typename TT>
-    void fillTensorFromTorch(std::shared_ptr<Tensor<TT>>& tensor, 
+    void fillTensorFromTorch(std::shared_ptr<Tensor<TT>>& tensor,
                              const torch::Tensor& torch_tensor) {
         auto cpu_tensor = torch_tensor.cpu().contiguous().flatten();
         std::vector<TT> data_vector;
@@ -127,7 +128,87 @@ public:
         }
         tensor->fillToCPU(data_vector);
     }
+    virtual bool verify_output(const std::unique_ptr<ops::Operator> &op,
+                               int idx,
+                               const std::shared_ptr<core::ITensor> &output,
+                               const std::shared_ptr<core::ITensor> &expect) {
+        return verify_output_default(output, expect);
+    }
 
+  protected:
+    template <typename TT>
+    static bool verify_output_typed(
+        const std::shared_ptr<Tensor<TT>> &output,
+        const std::shared_ptr<Tensor<TT>> &expect) {
+        for (int i = 0; i < output->num_elements(); i++) {
+            if constexpr (std::is_same_v<TT, uint16_t>) {
+                float out_val = core::ITensor::fp16_to_fp32((*output)[i]);
+                float exp_val = core::ITensor::fp16_to_fp32((*expect)[i]);
+                if (std::isnan(exp_val)) {
+                    LOG_ERROR("Test Fail: Expected value is NaN at index %d", i);
+                    return false;
+                }
+                if (std::isnan(out_val)) {
+                    LOG_ERROR("Test Fail at1 (%d): Output is NaN, expected %f", i, exp_val);
+                    return false;
+                }
+                float abs_exp = std::abs(exp_val);
+                float threshold = (abs_exp > 1.0F) ? (abs_exp * 0.02F) : 0.02F;
+                if (std::abs(out_val - exp_val) > threshold) {
+                    LOG_ERROR("Test Fail at1 (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
+                    return false;
+                }
+            } else if constexpr (std::is_same_v<TT, int>) {
+                if (std::isnan((*output)[i]) || (*output)[i] != (*expect)[i]) {
+                    LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
+                    return false;
+                }
+            } else {
+                float out_val = (*output)[i];
+                float exp_val = (*expect)[i];
+                if (std::isnan(out_val)) {
+                    LOG_ERROR("Test Fail (%d): Output is NaN, expected %f", i, exp_val);
+                    return false;
+                }
+                float abs_exp = std::abs(exp_val);
+                float threshold;
+                if (abs_exp > 1.0F) {
+                    threshold = abs_exp * 0.01F;
+                } else if (abs_exp > 0.001F) {
+                    threshold = std::max(0.003F, abs_exp * 0.02F);
+                } else {
+                    threshold = 0.002F;
+                }
+                if (std::abs(out_val - exp_val) > threshold) {
+                    LOG_ERROR("Test Fail (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+  private:
+    // Dispatch the default typed comparison from a type-erased ITensor pair.
+    bool verify_output_default(const std::shared_ptr<core::ITensor> &output,
+                               const std::shared_ptr<core::ITensor> &expect) {
+        if (output->dtype() == typeid(float)) {
+            return verify_output_typed(core::as_tensor<float>(output),
+                                       core::as_tensor<float>(expect));
+        } else if (output->dtype() == typeid(uint16_t)) {
+            return verify_output_typed(core::as_tensor<uint16_t>(output),
+                                       core::as_tensor<uint16_t>(expect));
+        } else if (output->dtype() == typeid(int)) {
+            return verify_output_typed(core::as_tensor<int>(output),
+                                       core::as_tensor<int>(expect));
+        } else if (output->dtype() == typeid(int64_t)) {
+            return verify_output_typed(core::as_tensor<int64_t>(output),
+                                       core::as_tensor<int64_t>(expect));
+        }
+        return false;
+    }
+
+  public:
     bool run_test(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &expect_outputs,
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
@@ -137,6 +218,13 @@ public:
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
+        }
+        // Pin the subgroup size for shaders that hard-assume a fixed
+        // numSubgroups (softmax2's cross-subgroup reduce). Requires
+        // VK_EXT_subgroup_size_control; harmless when unsupported (0).
+        if (vkop::ops::convert_opstring_to_enum(name_) == vkop::ops::OpType::SOFTMAX &&
+            dev_->getMaxSubgroupSize() > 0) {
+            op->set_required_subgroup_size(32);
         }
         op->set_runtime_device(dev_, cmdpool_);
 
@@ -207,70 +295,12 @@ public:
             using TT = decltype(type_tag);
             auto output = core::as_tensor<TT>(outputs[idx]);
             output->copyToCPU(cmdpool_);
-            auto oshape = output->getShape();
             output->print_tensor();
             auto expect = core::as_tensor<TT>(expect_outputs[idx]);
             if (vkop::ops::convert_opstring_to_enum(name_) == vkop::ops::OpType::TOPK) {
                 output->resize(expect->getShape());
             }
-            for (int i = 0; i < output->num_elements(); i++) {
-                if constexpr (std::is_same_v<TT, uint16_t>) {
-                    float out_val = core::ITensor::fp16_to_fp32((*output)[i]);
-                    float exp_val = core::ITensor::fp16_to_fp32((*expect)[i]);
-                    // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
-                    if (std::isnan(exp_val)) {
-                        LOG_ERROR("Test Fail: Expected value is NaN at index %d", i);
-                        return false;
-                    }
-                    if (std::isnan(out_val)) {
-                        LOG_ERROR("Test Fail at1 (%d): Output is NaN, expected %f", i, exp_val);
-                        return false;
-                    }
-
-                    float abs_exp = std::abs(exp_val);
-                    float threshold = (abs_exp > 1.0F) ? (abs_exp * 0.02F) : 0.02F;
-
-                    if (std::abs(out_val - exp_val) > threshold) {
-                        LOG_ERROR("Test Fail at1 (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
-                        return false;
-                    }
-                } else if (typeid(TT) == typeid(int)) {
-                    // std::cout << i << ": " << (*output)[i] << " vs " << (*expect)[i] << std::endl;
-                    if (std::isnan((*output)[i]) || (*output)[i] != (*expect)[i]) {
-                        LOG_ERROR("Test Fail at2 (%d): %d, %d", i, (*output)[i], (*expect)[i]);
-                        return false;
-                    }
-                } else {
-                    float out_val = (*output)[i];
-                    float exp_val = (*expect)[i];
-                    // std::cout << i << ": " << out_val << " vs " << exp_val << std::endl;
-
-                    if (std::isnan(out_val)) {
-                        LOG_ERROR("Test Fail (%d): Output is NaN, expected %f", i, exp_val);
-                        return false;
-                    }
-
-                    // Adaptive tolerance based on magnitude of expected value
-                    float abs_exp = std::abs(exp_val);
-                    float threshold;
-                    if (abs_exp > 1.0F) {
-                        // For larger values, use relative error (e.g., 1% of expected value)
-                        threshold = abs_exp * 0.01F;  // 1% relative error
-                    } else if (abs_exp > 0.001F) {
-                        // For medium values, use mixed relative/absolute error
-                        threshold = std::max(0.003F, abs_exp * 0.02F);
-                    } else {
-                        // For very small values, use absolute error
-                        threshold = 0.002F;
-                    }
-                    
-                    if (std::abs(out_val - exp_val) > threshold) {
-                        LOG_ERROR("Test Fail (%d): %f vs %f (threshold: %f)", i, out_val, exp_val, threshold);
-                        return false;
-                    }
-                }
-            }
-            return true;
+            return verify_output(op, idx, outputs[idx], expect_outputs[idx]);
         };
 
         for (size_t idx = 0; idx < outputs.size(); idx++) {

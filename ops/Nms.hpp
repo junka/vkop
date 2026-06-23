@@ -102,8 +102,13 @@ class Nms : public Operator {
             objs_.emplace_back(input_image);
         });
 
-        // use dummy buffer as for output count
+        // binding 3: the selected-box counter the shader increments via
+        // atomicAdd(total_count, ...). Reuses the process-wide dummy_buffer_
+        // (only 4 bytes needed, well within its 16). Zeroed each run with
+        // vkCmdFillBuffer so the offset base is 0 regardless of prior runs.
+        dummy_buffer_->fillBuffer(m_cmd_->get(), 0u);
         objs_.emplace_back(dummy_buffer_);
+
         para_.num_batch = batch;
         para_.num_class = num_class;
         para_.num_spatial = num_boxes;
@@ -111,6 +116,15 @@ class Nms : public Operator {
         submit(&para_, 1, batch * num_class, 1);
     }
 
+    // The buffer holding the selected-box count written by the shader's
+    // atomicAdd(total_count, ...). Read back on the host to know how many
+    // output rows are valid (the output tensor is padded to max rows).
+  public:
+    std::shared_ptr<VulkanBuffer> get_count_buffer() const {
+        return dummy_buffer_;
+    }
+
+  private:
     nms::GpuNMSParam para_;
 };
 

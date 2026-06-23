@@ -184,6 +184,42 @@ endif()
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE})
 endforeach()
 
+# Some shaders keep separate fp32/fp16 SPIR-V builds (no runtime branch in the
+# shader; the operator picks the right one at construction). Each listed shader
+# gets an extra <name>_fp16.spv compiled with -DFP16 and embedded as
+# <name>_fp16_spv. The base (fp32) build above is unaffected.
+set(DUAL_FP16_SHADERS gather)
+foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
+    set(SPIRV_FILE_FP16 ${SPIRV_DIR}/${DUAL_NAME}_fp16.spv)
+    set(SPIRV_SOURCE_FILE_FP16 ${SPIRV_DIR}/${DUAL_NAME}_fp16.c)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_FP16}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${DUAL_NAME}.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_FP16} -DFP16
+        DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp
+        COMMENT "Compiling ${DUAL_NAME} (fp16) to SPIR-V"
+    )
+    if(WIN32)
+        add_custom_command(
+            OUTPUT ${SPIRV_SOURCE_FILE_FP16}
+            COMMAND ${_SPV_TO_C_CMD} ${SPIRV_FILE_FP16} ${SPIRV_SOURCE_FILE_FP16} ${DUAL_NAME}_fp16
+            DEPENDS ${SPIRV_FILE_FP16} ${PY_SCRIPT_FILE}
+            COMMENT "Embedding fp16 SPIR-V shader ${DUAL_NAME} into C header"
+        )
+    else()
+        add_custom_command(
+            OUTPUT ${SPIRV_SOURCE_FILE_FP16}
+            COMMAND xxd -i ${SPIRV_FILE_FP16} | sed "s/[_a-zA-Z0-9]*${DUAL_NAME}_fp16/${DUAL_NAME}_fp16/g" > ${SPIRV_SOURCE_FILE_FP16}
+            DEPENDS ${SPIRV_FILE_FP16}
+            COMMENT "Converting ${SPIRV_FILE_FP16} to header file"
+        )
+    endif()
+    set_source_files_properties(${SPIRV_SOURCE_FILE_FP16} PROPERTIES LANGUAGE C)
+    list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_FP16})
+    list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_FP16})
+endforeach()
+
 
 # Add executable
 add_library(vkop ${SRC_FILES})

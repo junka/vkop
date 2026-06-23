@@ -66,17 +66,30 @@ const int BN = 32;   // = 4 * N_BLOCK
 coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matA[4];
 coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matB[4];
 coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator> matC[4];
+// for use case: fp32 trucation will lose precision. split into two (hi + lo)
+// and C = (Ah + Al)(Bh + Bl) = (AhBh + AhBl + AlBh + AlBl). Four MMA passes.
+coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matAl[4];
+coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matBl[4];
 
 layout(push_constant) uniform PushConsts {
     int M; // rows of A
     int N; // cols of B
     int K; // common dim
     int C;
+    int fp32;
 } uMatMulParams;
 
 shared float16_t shA[4][BM * K_BLOCK];           // 4 x 16x16, shared across N-subgroups
 shared float16_t shB[4][K_BLOCK * BN];           // 4 x 16x32, shared across M-subgroups
 shared float     shC[4][8][M_BLOCK * N_BLOCK];   // 4 ch x 8 subgroups x 64, per-subgroup store (no races)
+
+shared float16_t shAl[4][BM * K_BLOCK];           // 4 x 16x16, shared across N-subgroups
+shared float16_t shBl[4][K_BLOCK * BN];           // 4 x 16x32, shared across M-subgroups
+
+void split_fp32(float x, out float16_t hi, out float16_t lo) {
+    hi = float16_t(x);
+    lo = float16_t(x - float(hi));
+}
 
 void main() {
     int  c4   = int(gl_WorkGroupID.z);
@@ -92,6 +105,7 @@ void main() {
     int K = uMatMulParams.K;
     int N = uMatMulParams.N;
     int C = uMatMulParams.C;
+    bool fp32 = uMatMulParams.fp32 != 0;
 
     for (int b = 0; b < 4; b++) {
         matC[b] = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>(0.0);
@@ -107,10 +121,21 @@ void main() {
             int row = int(tid) / K_BLOCK, col = int(tid) % K_BLOCK;
             int h = m0 + row, kk = k_base + col;
             vec4 val = (h < M && kk < K) ? texelFetch(uInputA, ivec3(kk, h, c4), 0) : vec4(0.0);
-            shA[0][tid] = float16_t(val.x);
-            shA[1][tid] = (c4 * 4 + 1 < C) ? float16_t(val.y) : float16_t(0.0);
-            shA[2][tid] = (c4 * 4 + 2 < C) ? float16_t(val.z) : float16_t(0.0);
-            shA[3][tid] = (c4 * 4 + 3 < C) ? float16_t(val.w) : float16_t(0.0);
+            float16_t a0h, a0l, a1h, a1l, a2h, a2l, a3h, a3l;
+            split_fp32((c4 * 4 + 0 < C) ? val.x : 0.0, a0h, a0l);
+            split_fp32((c4 * 4 + 1 < C) ? val.y : 0.0, a1h, a1l);
+            split_fp32((c4 * 4 + 2 < C) ? val.z : 0.0, a2h, a2l);
+            split_fp32((c4 * 4 + 3 < C) ? val.w : 0.0, a3h, a3l);
+            shA[0][tid] = a0h;
+            shA[1][tid] = a1h;
+            shA[2][tid] = a2h;
+            shA[3][tid] = a3h;
+            if (fp32) {
+                shAl[0][tid] = a0l;
+                shAl[1][tid] = a1l;
+                shAl[2][tid] = a2l;
+                shAl[3][tid] = a3l;
+            }
         }
 
         // 256 threads load B[16x32] (512 elems/ch => 2/thread)
@@ -119,10 +144,21 @@ void main() {
             int row = idx / BN, col = idx % BN;          // row=K, col=N
             int kk = k_base + row, w = n0 + col;
             vec4 val = (kk < K && w < N) ? texelFetch(uInputB, ivec3(w, kk, c4), 0) : vec4(0.0);
-            shB[0][idx] = float16_t(val.x);
-            shB[1][idx] = (c4 * 4 + 1 < C) ? float16_t(val.y) : float16_t(0.0);
-            shB[2][idx] = (c4 * 4 + 2 < C) ? float16_t(val.z) : float16_t(0.0);
-            shB[3][idx] = (c4 * 4 + 3 < C) ? float16_t(val.w) : float16_t(0.0);
+            float16_t b0h, b0l, b1h, b1l, b2h, b2l, b3h, b3l;
+            split_fp32((c4 * 4 + 0 < C) ? val.x : 0.0, b0h, b0l);
+            split_fp32((c4 * 4 + 1 < C) ? val.y : 0.0, b1h, b1l);
+            split_fp32((c4 * 4 + 2 < C) ? val.z : 0.0, b2h, b2l);
+            split_fp32((c4 * 4 + 3 < C) ? val.w : 0.0, b3h, b3l);
+            shB[0][idx] = b0h;
+            shB[1][idx] = b1h;
+            shB[2][idx] = b2h;
+            shB[3][idx] = b3h;
+            if (fp32) {
+                shBl[0][idx] = b0l;
+                shBl[1][idx] = b1l;
+                shBl[2][idx] = b2l;
+                shBl[3][idx] = b3l;
+            }
         }
 
         barrier();
@@ -144,6 +180,34 @@ void main() {
         matC[1] = coopMatMulAdd(matA[1], matB[1], matC[1]);
         matC[2] = coopMatMulAdd(matA[2], matB[2], matC[2]);
         matC[3] = coopMatMulAdd(matA[3], matB[3], matC[3]);
+
+        if (fp32) {
+            // lo slices
+            coopMatLoad(matAl[0], shAl[0], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matAl[1], shAl[1], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matAl[2], shAl[2], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matAl[3], shAl[3], sgy * M_BLOCK * K_BLOCK, K_BLOCK, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matBl[0], shBl[0], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matBl[1], shBl[1], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matBl[2], shBl[2], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+            coopMatLoad(matBl[3], shBl[3], sgx * N_BLOCK, BN, gl_CooperativeMatrixLayoutRowMajor);
+            // Ah * Bl  (matA still holds Ah)
+            matC[0] = coopMatMulAdd(matA[0], matBl[0], matC[0]);
+            matC[1] = coopMatMulAdd(matA[1], matBl[1], matC[1]);
+            matC[2] = coopMatMulAdd(matA[2], matBl[2], matC[2]);
+            matC[3] = coopMatMulAdd(matA[3], matBl[3], matC[3]);
+            // Al * Bh  (matB still holds Bh)
+            matC[0] = coopMatMulAdd(matAl[0], matB[0], matC[0]);
+            matC[1] = coopMatMulAdd(matAl[1], matB[1], matC[1]);
+            matC[2] = coopMatMulAdd(matAl[2], matB[2], matC[2]);
+            matC[3] = coopMatMulAdd(matAl[3], matB[3], matC[3]);
+            // Al * Bl  (O(eps^2) term; drop only if 3-pass is acceptable)
+            matC[0] = coopMatMulAdd(matAl[0], matBl[0], matC[0]);
+            matC[1] = coopMatMulAdd(matAl[1], matBl[1], matC[1]);
+            matC[2] = coopMatMulAdd(matAl[2], matBl[2], matC[2]);
+            matC[3] = coopMatMulAdd(matAl[3], matBl[3], matC[3]);
+        }
+
         barrier();
     }
 
