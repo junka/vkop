@@ -41,7 +41,10 @@ class Softmax : public Operator {
                       VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                       VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
               })(),
-              sizeof(softmax::GpuSoftMaxParam)) {}
+              sizeof(softmax::GpuSoftMaxParam)) {
+        // should be safe to fail to set subgroup size
+        required_subgroup_size_ = 32;
+    }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

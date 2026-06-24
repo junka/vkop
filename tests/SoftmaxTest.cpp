@@ -199,6 +199,7 @@ TEST(SoftmaxTest, SoftmaxComprehensiveTest) {
         {{1, 8, 6, 6}, 2},
         {{1, 16, 5, 5}, 1},
         {{4, 1000}, 1},
+        {{1, 1000}, 1},
     };
     for (const auto &test_case: test_cases) {
         auto [input_shape, axis] = test_case;

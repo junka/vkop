@@ -219,13 +219,7 @@ public:
             LOG_ERROR("Fail to create operator");
             return false;
         }
-        // Pin the subgroup size for shaders that hard-assume a fixed
-        // numSubgroups (softmax2's cross-subgroup reduce). Requires
-        // VK_EXT_subgroup_size_control; harmless when unsupported (0).
-        if (vkop::ops::convert_opstring_to_enum(name_) == vkop::ops::OpType::SOFTMAX &&
-            dev_->getMaxSubgroupSize() > 0) {
-            op->set_required_subgroup_size(32);
-        }
+
         op->set_runtime_device(dev_, cmdpool_);
 
         if (attribute_func) {

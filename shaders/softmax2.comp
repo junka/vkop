@@ -24,8 +24,8 @@ layout(push_constant) uniform constBuffer {
     float nanvalue;
 } uConst;
 
-shared float sharedMax[16];   // 存每个 subgroup 的局部 max
-shared float sharedSum[16];   // 存每个 subgroup 的局部 sumExp
+shared float sharedMax[32];   // 存每个 subgroup 的局部 max
+shared float sharedSum[32];   // 存每个 subgroup 的局部 sumExp
 
 
 void softmax32() {

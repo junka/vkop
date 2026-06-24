@@ -2,6 +2,14 @@
 #include "function.hpp"
 #include "core/runtime.hpp"
 
+#include <cstdint>
+#include <cstring>
+#include <fstream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
 extern "C" {
 #define STB_IMAGE_IMPLEMENTATION
 #include "include/stb_image.h"
@@ -101,8 +109,9 @@ Function::preprocess_jpg(const char *input_file,
                       << std::endl;
             return {};
         }
-        stbir_resize_uint8_linear(raw, image_w, image_h, 0, processed_image,
-                                  resize_w, resize_h, 0, STBIR_RGB);
+        stbir_resize(raw, image_w, image_h, 0, processed_image, resize_w,
+                     resize_h, 0, STBIR_RGB, STBIR_TYPE_UINT8, STBIR_EDGE_CLAMP,
+                     STBIR_FILTER_TRIANGLE);
     }
 
     stbi_image_free(raw);
@@ -180,6 +189,226 @@ Function::get_top_k_predictions(const std::vector<float> &probs, int k) {
     }
 
     return indexed_probs;
+}
+
+namespace {
+struct NpyArray {
+    std::vector<int64_t> shape;
+    std::vector<char> data; // little-endian
+    bool little_endian = true;
+    char dtype_kind = 'f'; // 'f' float
+    int dtype_size = 4;
+};
+
+inline char read_u1(std::istream &is) {
+    char c;
+    is.read(&c, 1);
+    return c;
+}
+
+inline std::string read_magic_string(std::istream &is) {
+    char magic[6];
+    is.read(magic, 6);
+    if (std::memcmp(magic, "\x93NUMPY", 6) != 0) {
+        throw std::runtime_error("not a npy file (bad magic)");
+    }
+    return std::string(magic, 6);
+}
+
+inline NpyArray parse_npy(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f.is_open()) {
+        throw std::runtime_error("cannot open npy: " + path);
+    }
+    read_magic_string(f);
+    // version: major, minor
+    int major = static_cast<unsigned char>(read_u1(f));
+    static_cast<void>(read_u1(f)); // minor version, ignored
+
+    // header len
+    size_t header_len = 0;
+    if (major == 1) {
+        uint16_t hlen = 0;
+        f.read(reinterpret_cast<char *>(&hlen), 2);
+        header_len = hlen;
+    } else if (major == 2) {
+        uint32_t hlen = 0;
+        f.read(reinterpret_cast<char *>(&hlen), 4);
+        header_len = hlen;
+    } else {
+        throw std::runtime_error("unsupported npy version");
+    }
+    std::string header(header_len, '\0');
+    f.read(&header[0], header_len);
+
+    // parse dict: {'descr': '<f4', 'fortran_order': False, 'shape':
+    // (1,3,224,224), }
+    NpyArray arr;
+    // descr：locate 'descr' key，strings as alue
+    // header shape: {'descr': '<f4', 'fortran_order': False, 'shape':
+    // (1,3,224,224), }
+    {
+        auto key = header.find("'descr'");
+        if (key == std::string::npos) {
+            throw std::runtime_error("npy header missing 'descr'");
+        }
+        auto vstart = header.find('\'', key + 7); // skip 'descr'
+        auto vend = header.find('\'', vstart + 1);
+        if (vstart == std::string::npos || vend == std::string::npos) {
+            throw std::runtime_error("npy header bad descr value");
+        }
+        std::string descr = header.substr(vstart + 1, vend - vstart - 1);
+        if (!descr.empty()) {
+            arr.little_endian = (descr[0] == '<' || descr[0] == '|');
+            arr.dtype_kind = descr[descr.size() - 2];
+            arr.dtype_size = descr[descr.size() - 1] - '0';
+        }
+    }
+    // shape
+    {
+        auto p1 = header.find('(');
+        auto p2 = header.find(')', p1);
+        if (p1 != std::string::npos && p2 != std::string::npos) {
+            std::string s = header.substr(p1 + 1, p2 - p1 - 1);
+            std::stringstream ss(s);
+            std::string tok;
+            while (std::getline(ss, tok, ',')) {
+                size_t b = tok.find_first_not_of(" ");
+                if (b == std::string::npos)
+                    continue;
+                tok = tok.substr(b);
+                if (tok.empty())
+                    continue;
+                arr.shape.push_back(std::stoll(tok));
+            }
+        }
+    }
+
+    std::vector<char> body((std::istreambuf_iterator<char>(f)),
+                           std::istreambuf_iterator<char>());
+    arr.data = std::move(body);
+    return arr;
+}
+} // namespace
+
+bool Function::preprocess_npy(const std::string &npy_path,
+                              const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                              const std::shared_ptr<core::ITensor> &input) {
+    NpyArray arr;
+    try {
+        arr = parse_npy(npy_path);
+    } catch (const std::exception &e) {
+        std::cerr << "preprocess_npy: " << e.what() << std::endl;
+        return false;
+    }
+    if (arr.dtype_kind != 'f' || (arr.dtype_size != 4 && arr.dtype_size != 2)) {
+        std::cerr << "preprocess_npy: only float32/float16 supported, got kind="
+                  << arr.dtype_kind << " size=" << arr.dtype_size << std::endl;
+        return false;
+    }
+    if (arr.shape.size() != 4) {
+        std::cerr << "preprocess_npy: expect NCHW 4D, got " << arr.shape.size()
+                  << "D shape=[";
+        for (size_t i = 0; i < arr.shape.size(); ++i)
+            std::cerr << arr.shape[i] << (i + 1 < arr.shape.size() ? "," : "");
+        std::cerr << "]" << std::endl;
+        return false;
+    }
+    const int64_t N = arr.shape[0];
+    const int64_t C = arr.shape[1];
+    const int64_t H = arr.shape[2];
+    const int64_t W = arr.shape[3];
+
+    auto in_shape = input->getShape();
+    if (in_shape.size() != 4 || in_shape[0] != N || in_shape[1] != C ||
+        in_shape[2] != H || in_shape[3] != W) {
+        std::cerr << "preprocess_npy: shape mismatch npy=[" << N << "," << C
+                  << "," << H << "," << W << "] input=[";
+        for (size_t i = 0; i < in_shape.size(); ++i) {
+            std::cerr << in_shape[i] << (i + 1 < in_shape.size() ? "," : "");
+        }
+        std::cerr << "]" << std::endl;
+        return false;
+    }
+
+    std::vector<float> fp32_data(static_cast<size_t>(N) * C * H * W);
+    const char *raw = arr.data.data();
+    if (arr.dtype_size == 4) {
+        std::memcpy(fp32_data.data(), raw, fp32_data.size() * sizeof(float));
+    } else {
+        // float16 -> float32
+        for (size_t i = 0; i < fp32_data.size(); ++i) {
+            uint16_t h;
+            std::memcpy(&h, raw + i * 2, 2);
+            fp32_data[i] = ITensor::fp16_to_fp32(h);
+        }
+    }
+
+    std::cout << "[preprocess_npy] " << npy_path << " [" << N << "," << C << ","
+              << H << "," << W << "] first 8 (NCHW c0): ";
+    for (int i = 0; i < 8 && i < static_cast<int>(fp32_data.size()); ++i) {
+        std::cout << fp32_data[i] << " ";
+    }
+    std::cout << std::endl;
+    const int chan4 = (C + 3) / 4;
+    if (input->dtype() == typeid(float)) {
+        std::vector<float> rgba(static_cast<size_t>(N) * H * W * chan4 * 4,
+                                0.0f);
+        for (int n = 0; n < N; ++n) {
+            for (int c4 = 0; c4 < chan4; ++c4) {
+                for (int h = 0; h < H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        for (int k = 0; k < 4; ++k) {
+                            int c = c4 * 4 + k;
+                            if (c < C) {
+                                size_t idx =
+                                    (((size_t)n * C + c) * H + h) * W + w;
+                                size_t layer_stride = (size_t)N * H * (W * 4);
+                                size_t row_pitch = (size_t)W * 4;
+                                size_t dst = (size_t)c4 * layer_stride +
+                                             ((size_t)n * H + h) * row_pitch +
+                                             (size_t)w * 4 + k;
+                                rgba[dst] = fp32_data[idx];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        auto t = as_tensor<float>(input);
+        t->copyToGPUImage(cmdpool, rgba.data(), true);
+    } else if (input->dtype() == typeid(uint16_t)) {
+        std::vector<uint16_t> rgba(static_cast<size_t>(N) * H * W * chan4 * 4,
+                                   0);
+        for (int n = 0; n < N; ++n) {
+            for (int c4 = 0; c4 < chan4; ++c4) {
+                for (int h = 0; h < H; ++h) {
+                    for (int w = 0; w < W; ++w) {
+                        for (int k = 0; k < 4; ++k) {
+                            int c = c4 * 4 + k;
+                            if (c < C) {
+                                size_t idx =
+                                    (((size_t)n * C + c) * H + h) * W + w;
+                                size_t layer_stride = (size_t)N * H * (W * 4);
+                                size_t row_pitch = (size_t)W * 4;
+                                size_t dst = (size_t)c4 * layer_stride +
+                                             ((size_t)n * H + h) * row_pitch +
+                                             (size_t)w * 4 + k;
+                                rgba[dst] =
+                                    ITensor::fp32_to_fp16(fp32_data[idx]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        auto t = as_tensor<uint16_t>(input);
+        t->copyToGPUImage(cmdpool, rgba.data(), true);
+    } else {
+        std::cerr << "preprocess_npy: unsupported input dtype" << std::endl;
+        return false;
+    }
+    return true;
 }
 
 } // namespace core

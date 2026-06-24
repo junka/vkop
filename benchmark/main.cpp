@@ -7,6 +7,7 @@
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
 #include "core/function.hpp"
+#include "core/cpu_postprocess.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -17,6 +18,7 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Runtime;
+#define USE_GPU_POSTPROCESS
 
 namespace {
 std::vector<std::string> load_labels(const std::string& label_path) {
@@ -57,7 +59,7 @@ int main(int argc, char *argv[]) {
 
     if (argc < 3) {
         std::cerr << "down models using model/download_models.py for benchmark" << std::endl;
-        std::cerr << "convert onnx to vkopbin using model/onnx2vkop.py" << std::endl;
+        std::cerr << "convert onnx to vkopbin using model/onnx2vkop" << std::endl;
         std::cerr << "download class tag from https://raw.githubusercontent.com/pytorch/hub/master/imagenet_classes.txt" << std::endl;
         std::cerr << "Usage: " << argv[0] << " <binary_file_path> <image> [labels.txt]" << std::endl;
         return 1;
@@ -70,12 +72,29 @@ int main(int argc, char *argv[]) {
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path, precision);
     rt->LoadModel();
     /* example for debug one node */
-    // rt->TraceNode("node_Conv_285");
+    // rt->TraceNode("node_Conv_291");
 
     vkop::core::NormMethod method = vkop::core::NormMethod::IMAGENET;
     if (binary_file_path.find("inception") != std::string::npos) {
         method = vkop::core::NormMethod::INCEPTION;
     }
+
+    bool input_loaded = false;
+    if (image_file_path.size() >= 4 &&
+        image_file_path.compare(image_file_path.size() - 4, 4, ".npy") == 0) {
+        input_loaded = vkop::core::Function::preprocess_npy(
+            image_file_path, cmdpool, rt->GetInput());
+        if (!input_loaded) {
+            std::cerr << "load npy input failed: " << image_file_path
+                      << std::endl;
+            return 1;
+        }
+        std::cout << "[main] using npy input: " << image_file_path << std::endl;
+    } else {
+        vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool,
+                                             rt->GetInput(), false, method);
+    }
+#ifdef USE_GPU_POSTPROCESS
     vkop::core::Function::preprocess_jpg(image_file_path.c_str(), cmdpool, rt->GetInput(), false, method);
     std::vector<int> shape;
 
@@ -105,6 +124,7 @@ int main(int argc, char *argv[]) {
     } else {
         register_pipeline(float{});
     }
+#endif
 
     double tot_lat = 0.0F;
     int count = 100;
@@ -115,18 +135,52 @@ int main(int argc, char *argv[]) {
         std::cout << "inference time:" << lat << " ms" << std::endl;
     }
     std::cout << "avg time:" << tot_lat / count << " ms" << std::endl;
-    rt->ReadResult();
 
+    rt->ReadResult();
+#ifndef USE_GPU_POSTPROCESS
+    auto out = rt->GetOutput();
+    auto out_shape = out->getShape();
+    std::vector<float> logits;
+    if (out->dtype() == typeid(float)) {
+        auto t = vkop::core::as_tensor<float>(out);
+        logits.resize(t->num_elements());
+        for (int i = 0; i < t->num_elements(); ++i) {
+            logits[i] = (*t)[i];
+        }
+    } else if (out->dtype() == typeid(uint16_t)) {
+        auto t = vkop::core::as_tensor<uint16_t>(out);
+        logits.resize(t->num_elements());
+        for (int i = 0; i < t->num_elements(); ++i) {
+            logits[i] = vkop::core::ITensor::fp16_to_fp32((*t)[i]);
+        }
+    } else {
+        std::cerr << "unsupported output dtype" << std::endl;
+        return 1;
+    }
+
+    // CPU softmax(axis=-1) + top10
+    auto probs = vkop::core::cpu::softmax(logits, out_shape, -1);
+    auto topk_result = vkop::core::cpu::topk(probs, out_shape, 10, true, true);
+    const auto &top_vals = topk_result.first;
+    const auto &top_idx = topk_result.second;
+#else
+    const auto &top_idx = *indexs;
+    auto &top_vals = *values_float;
+    if (precision == 1) {
+        auto top_vals_half = values_half;
+        for (int i = 0; i < top_vals_half->num_elements(); ++i) {
+            top_vals[i] = vkop::core::ITensor::fp16_to_fp32((*top_vals_half)[i]);
+        }
+    }
+#endif
     std::cout << "\nPredictions:\n";
     std::cout << std::fixed << std::setprecision(3);
 
-    auto labels = load_labels(labels_file_path);    
+    auto labels = load_labels(labels_file_path);
 
     for (int i = 0; i < 10; ++i) {
-        int index = (*indexs)[i];
-        float value = (precision == 1) ?
-            vkop::core::ITensor::fp16_to_fp32((*values_half)[i]) :
-            (*values_float)[i];
+        int index = top_idx[i];
+        float value = top_vals[i];
 
         std::string label = "Unknown";
         if (index < static_cast<int>(labels.size())) {

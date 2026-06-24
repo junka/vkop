@@ -4,6 +4,7 @@
 /obj/
 /out/
 /model/onnx_models/
+/.cache/
 
 # Ignore CMake generated files
 CMakeFiles/

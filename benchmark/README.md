@@ -50,14 +50,19 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx -q int8
 | A2000| squeezenet1_0 | 38 | fp16 | 3.96 |
 | A2000| vgg16 | 23 | fp32 | 57.85 |
 | A2000| vgg16 | 23 | fp16 | 46.56 |
-| T2000| resnet18 | 41 | fp16 | 17.04 |
+| T2000| resnet18 | 31 | fp16 | 17.04 |
 | T2000| resnet34 | 73 | fp16 | 30.03 |
 | T2000| resnet50 | 90 | fp16 | 35.30 |
-| Tegra Orin| resnet18 | 41 | fp32 | 14.76 |
-| Tegra Orin| resnet18 | 41 | fp16 | 11.38 |
-| Tegra Orin| resnet18 | 41 | int8 | 10.93 |
+| Tegra Orin| resnet18 | 31 | fp32 | 14.76 |
+| Tegra Orin| resnet18 | 31 | fp16 | 11.38 |
+| Tegra Orin| resnet18 | 31 | int8 | 10.93 |
 | Tegra Orin| resnet50 | 72 | fp16 | 26.61 |
 | Tegra Thor| resnet50 | 72 | fp32 | 20.89 |
+|Intel ARL| resnet18 | 31 | fp32 | 33.75 |
+|Intel ARL| resnet18 | 31 | fp16 | 28.59 |
+|Intel ARL| resnet34 | 55 | fp32 | 62.29|
+|Intel ARL| resnet34 | 55 | fp16 | 55.75|
+
 
 ## 模型转换
 ```
