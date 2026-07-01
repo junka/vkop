@@ -230,6 +230,9 @@ add_dependencies(vkop compile_shaders)
 
 # Include SPIR-V headers
 target_include_directories(vkop PRIVATE ${SPIRV_DIR})
+# FlatBuffers: generated schema header + vendored runtime headers live under
+# model/generated. SYSTEM so -Wall/-Wextra/-Werror skip third-party code.
+target_include_directories(vkop SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/model/generated)
 target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 
 add_subdirectory(model)

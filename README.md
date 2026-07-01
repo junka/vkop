@@ -48,15 +48,18 @@ cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 
 #### 4. 模型转换
 ```bash
-python3 model/onnx2vkop.py -i resnet18-v2-7.onnx
+python3 -m onnx2vkop.cli -i resnet18-v2-7.onnx
 ```
+
+模型文件使用 FlatBuffers 格式（file identifier `VKOP`，version 1）。旧版
+`struct.pack` 格式不再生成；已有的旧 `.vkopbin` 需用本命令重新转换。
 
 - 支持量化：fp16, int8 对称量化
 - 支持指定batch size
 - 支持针对3D,4D NCHW to RGBA转换到模型
 - 支持tensor合并，以便节约内存
 ```
-usage: onnx2vkop.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
+usage: cli.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
 
 options:
   -h, --help         show this help message and exit
@@ -125,15 +128,19 @@ cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 
 #### 4. Model Conversion
 ```bash
-python3.13 tools/onnx2vkop.py -i resnet18-v2-7.onnx
+python3 -m onnx2vkop.cli -i resnet18-v2-7.onnx
 ```
+
+Model files use the FlatBuffers format (file identifier `VKOP`, version 1). The
+legacy `struct.pack` format is no longer produced; existing old `.vkopbin`
+files must be reconverted with this command.
 
 - Supports quantization: fp16, int8 symmetric quantization
 - Supports specifying batch size
 - Supports 3D/4D NCHW to RGBA model conversion
 - Supports tensor merging to save memory
 ```
-usage: onnx2vkop.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
+usage: cli.py [-h] [-q QUANT] -i INPUT [-u] [-b BATCH] [-r]
 
 options:
     -h, --help         show this help message and exit

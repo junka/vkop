@@ -2661,3 +2661,154 @@ class Quantizer:
         print(f"Converted {converted_count} FP32 tensors to INT8 with scale information")
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
+
+
+class Unifier:
+    """Collapse eligible initializers into a single 64-byte-aligned sub-region
+    of the model's initializer blob, described by a UnifiedMeta side table.
+
+    The C++ runtime uploads this sub-region as one shared GPU uniform buffer
+    and sub-allocates a VulkanBufferView per tensor at ``meta.offset``. This
+    replaces the legacy ``unified_metadata`` / ``unified_names`` /
+    ``unified_tensors`` magic-initializer hack.
+
+    Eligible: float32 / float16 / int8 initializers consumed as <=2-D tensors
+    (weights, biases, BN params) — i.e. the ones the runtime uploads as uniform
+    buffer views. 4-D image weights stay in the regular blob path.
+    """
+
+    _DTYPE_TO_ONNX = {
+        "float32": 1,
+        "float16": 10,
+        "int8": 3,
+    }
+
+    @staticmethod
+    def _is_eligible(name, init, dag_model):
+        if init.data_type not in (1, 10, 3):
+            return False
+        if len(init.dims) > 2:
+            return False
+        return True
+
+    @staticmethod
+    def unify(dag_model: "DAGBasedModel"):
+        eligible = []
+        for name, init in list(dag_model.initializers.items()):
+            if Unifier._is_eligible(name, init, dag_model):
+                eligible.append(name)
+        if not eligible:
+            return 0
+
+        # Build the unified sub-region with 64-byte alignment, matching the
+        # blob layout the writer uses for the top-level initializer_blob.
+        ALIGN = 64
+        unified_bytes = bytearray()
+        metas = []
+        names_table = bytearray()
+        for name in eligible:
+            init = dag_model.initializers[name]
+            arr = np.ascontiguousarray(numpy_helper.to_array(init))
+            data = arr.tobytes()
+            data_size = len(data)
+            offset = (len(unified_bytes) + ALIGN - 1) & ~(ALIGN - 1)
+            if offset > len(unified_bytes):
+                unified_bytes.extend(b"\x00" * (offset - len(unified_bytes)))
+            unified_bytes.extend(data)
+
+            # Record name into the concatenated name table.
+            name_b = name.encode("utf-8")
+            name_len = len(name_b)
+            name_offset_in_names = len(names_table)
+            names_table.extend(name_b)
+
+            dims = list(init.dims) + [0, 0, 0, 0]
+            dims = dims[:4]
+            dtype_map = {1: 1, 10: 10, 3: 3}
+            metas.append(
+                {
+                    "dtype": dtype_map[init.data_type],
+                    "name_len": name_len,
+                    "name_offset": name_offset_in_names,
+                    # offset is relative to the unified sub-region; the writer
+                    # adds unified_blob_offset when emitting absolute offsets.
+                    "offset": offset,
+                    "size": data_size,
+                    "dims": dims,
+                    "_name": name,
+                }
+            )
+
+        dag_model.unified = True
+        dag_model.unified_meta = metas
+        dag_model.unified_names = names_table.decode("utf-8", errors="replace")
+        # The unified region bytes are carried separately; save_to_binary will
+        # append them to the main blob and set unified_blob_offset accordingly.
+        dag_model._unified_bytes = bytes(unified_bytes)
+
+        # Remove unified initializers from the top-level table — they are now
+        # sub-allocations of the unified region.
+        for name in eligible:
+            del dag_model.initializers[name]
+
+        print(f"Unified {len(eligible)} initializers into a {len(unified_bytes)}-byte region")
+        return len(eligible)
+
+
+class RGBAConverter:
+    """Convert eligible 4-D NCHW initializers to RGBA layout.
+
+    Records a RGBAConversionMeta side table (original dtype, dims, blob offset)
+    so the C++ loader can restore the logical NCHW dims for tensor allocation
+    while the on-disk bytes are already RGBA-packed. This replaces the legacy
+    ``rgba_conversion_metadata`` / ``rgba_conversion_names`` magic-initializer
+    hack.
+    """
+
+    @staticmethod
+    def convert(dag_model: "DAGBasedModel"):
+        count = 0
+        metas = []
+        names_table = bytearray()
+        for name, init in list(dag_model.initializers.items()):
+            if len(init.dims) != 4:
+                continue
+            if init.data_type not in (1, 10):
+                continue
+            arr = np.ascontiguousarray(numpy_helper.to_array(init))
+            n, c, h, w = init.dims
+            # Pack NCHW -> RGBA: requires C % 4 == 0 so channels group into
+            # RGBA quads. This mirrors the runtime's copyToGPUImage RGBA path.
+            if c % 4 != 0:
+                continue
+            rgba = arr.reshape(n, c // 4, 4, h, w)
+            rgba = np.transpose(rgba, (0, 1, 3, 4, 2))  # N, C/4, H, W, 4
+            rgba = np.ascontiguousarray(rgba).reshape(n, c // 4, h, w, 4)
+            new_arr = rgba
+            new_init = numpy_helper.from_array(new_arr, name)
+            new_init.data_type = init.data_type
+
+            name_b = name.encode("utf-8")
+            name_len = len(name_b)
+            names_table.extend(name_b)
+
+            dims = [int(d) for d in init.dims]
+            metas.append(
+                {
+                    "dtype": int(init.data_type),
+                    "name_len": name_len,
+                    "offset": 0,  # filled by writer from blob offset
+                    "size": int(new_arr.nbytes),
+                    "dims": (dims + [0, 0, 0, 0])[:4],
+                    "_name": name,
+                }
+            )
+            dag_model.initializers[name] = new_init
+            count += 1
+
+        if count:
+            dag_model.rgba = True
+            dag_model.rgba_meta = metas
+            dag_model.rgba_names = names_table.decode("utf-8", errors="replace")
+            print(f"RGBA-converted {count} initializers")
+        return count

@@ -218,6 +218,7 @@ class ITensor {
 
 template <typename T> class Tensor : public ITensor {
   public:
+    using value_type = T;
     // empty
     explicit Tensor(bool is_on_GPU = false) {
         if (is_on_GPU) {

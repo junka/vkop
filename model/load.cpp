@@ -3,15 +3,6 @@
 #include <cstdint>
 #include <cstring>
 
-#ifdef _WIN32
-    #include <windows.h>
-    #include <io.h>
-#else
-    #include <sys/mman.h>
-    #include <sys/stat.h>
-    #include <fcntl.h>
-    #include <unistd.h>
-#endif
 #include "load.hpp"
 
 namespace vkop {
@@ -21,268 +12,244 @@ VkModel::VkModel(const std::string& filePath) {
     loadFromBinary(filePath);
 }
 
-struct FileMapping {
-    void* data = nullptr;
-    size_t size = 0;
-
-#ifdef _WIN32
-    HANDLE hFile = INVALID_HANDLE_VALUE;
-    HANDLE hMapping = nullptr;
-#else
-    int fd = -1;
-#endif
-
-    ~FileMapping() {
-#ifdef _WIN32
-        if (data) UnmapViewOfFile(data);
-        if (hMapping != nullptr) CloseHandle(hMapping);
-        if (hFile != INVALID_HANDLE_VALUE) CloseHandle(hFile);
-#else
-        if (data && data != MAP_FAILED) {
-            munmap(data, size);
-        }
-        if (fd >= 0) close(fd);
-#endif
-    }
-
-    bool map_file(const std::string& path) {
-#ifdef _WIN32
-        hFile = CreateFileA(path.c_str(),
-                            GENERIC_READ,
-                            FILE_SHARE_READ,
-                            nullptr,
-                            OPEN_EXISTING,
-                            FILE_ATTRIBUTE_NORMAL,
-                            nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
-            return false;
-        }
-
-        LARGE_INTEGER li;
-        if (!GetFileSizeEx(hFile, &li) || li.QuadPart > SIZE_MAX) {
-            return false;
-        }
-        size = static_cast<size_t>(li.QuadPart);
-
-        if (size == 0) {
-            data = nullptr;
-            return true;
-        }
-
-        hMapping = CreateFileMappingA(hFile, nullptr, PAGE_READONLY, 0, 0, nullptr);
-        if (!hMapping) {
-            return false;
-        }
-
-        data = MapViewOfFile(hMapping, FILE_MAP_READ, 0, 0, size);
-        return data != nullptr;
-#else
-        fd = open(path.c_str(), O_RDONLY);
-        if (fd < 0) return false;
-
-        struct stat st;
-        if (fstat(fd, &st) < 0) return false;
-        size = static_cast<size_t>(st.st_size);
-
-        if (size == 0) {
-            data = nullptr;
-            return true;
-        }
-
-        data = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
-        return data != MAP_FAILED;
-#endif
-    }
-};
-
 void VkModel::loadFromBinary(const std::string& filePath) {
-    FileMapping mapping;
-    if (!mapping.map_file(filePath)) {
+    file_mapping_ = std::make_unique<FileMapping>();
+    if (!file_mapping_->map_file(filePath)) {
+        file_mapping_.reset();
         throw std::runtime_error("Failed to map file: " + filePath);
     }
 
-    const char* ptr = static_cast<const char*>(mapping.data);
-    const char* end = ptr + mapping.size;
-
-    this->inputs = readListWithShapes(ptr, end);
-    this->outputs = readListWithShapes(ptr, end);
-
-    // Read nodes with DAG info
-    uint32_t num_nodes = readUint32(ptr, end);
-    for (uint32_t i = 0; i < num_nodes; ++i) {
-        Node node;
-        node.op_type = readString(ptr, end);
-        node.name = readString(ptr, end);
-        node.attributes = readDict(ptr, end);
-        node.inputs = readListWithShapes(ptr, end);
-        node.outputs = readListWithShapes(ptr, end);
-        // Read dependencies
-        uint32_t num_dependencies = readUint32(ptr, end);
-        for (uint32_t j = 0; j < num_dependencies; ++j) {
-            std::string dep_name = readString(ptr, end);
-            node.dependencies.insert(dep_name);
-        }
-        // Read dependents
-        uint32_t num_dependents = readUint32(ptr, end);
-        for (uint32_t j = 0; j < num_dependents; ++j) {
-            std::string dep_name = readString(ptr, end);
-            node.dependents.insert(dep_name);
-        }
-        this->nodes.push_back(std::move(node));
+    const auto* ptr = static_cast<const uint8_t*>(file_mapping_->data);
+    size_t size = file_mapping_->size;
+    if (size == 0 || ptr == nullptr) {
+        throw std::runtime_error("Empty model file: " + filePath);
     }
 
-    // Calculate total memory size needed for all initializers
-    size_t total_memory_size = 0;
-    // Align to 64 bytes to avoid memory fragmentation
-    const size_t alignment = 64; 
+    // The FlatBuffers file identifier ("VKOP") is required. Old struct.pack
+    // files (no identifier) are rejected with a clear error so callers
+    // reconvert with the FlatBuffers writer.
+    if (!vkop::model::ModelBufferHasIdentifier(ptr)) {
+        file_mapping_.reset();
+        throw std::runtime_error(
+            "Unrecognized model file (no VKOP identifier). Reconvert with "
+            "`python3 -m onnx2vkop.cli -i <model>.onnx`: " + filePath);
+    }
+    loadFromFlatbuffer(ptr, size);
+}
 
-    uint32_t num_initializers = readUint32(ptr, end);
-    const char *init_start = ptr;
-    for (uint32_t i = 0; i < num_initializers; ++i) {
-        Initializer initializer;
-        initializer.name = readString(ptr, end);
-        initializer.dtype = readString(ptr, end);
-        initializer.dims = readDims(ptr, end);
-        int64_t data_size = readint64(ptr, end);
-        ptr += data_size;
-        // Align the offset
-        size_t aligned_offset =
-            (total_memory_size + alignment - 1) & ~(alignment - 1);
-        this->initializer_offsets[initializer.name] = aligned_offset;
-        total_memory_size = aligned_offset + data_size;
-        this->initializers[initializer.name] = std::move(initializer);
+// ---------------------------------------------------------------------------
+// FlatBuffers reader (zero-copy mmap view)
+// ---------------------------------------------------------------------------
+void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
+    ::flatbuffers::Verifier verifier(buf, size);
+    if (!vkop::model::VerifyModelBuffer(verifier)) {
+        throw std::runtime_error("Invalid VKOP model: FlatBuffers verification failed");
     }
 
-    printf("Total memory allocated for initializers: %zu bytes\n",
-           total_memory_size);
-
-    // Allocate a single large memory block
-    initializer_memory.resize(total_memory_size, 0);
-
-    // second pass to read initializers
-    ptr = init_start;
-    // Copy initializer data into the allocated memory
-    for (uint32_t i = 0; i < num_initializers; ++i) {
-        auto name = readString(ptr, end);
-        auto dtype = readString(ptr, end);
-        auto dims = readDims(ptr, end);
-        int64_t data_size = readint64(ptr, end);
-
-        size_t offset = initializer_offsets[name];
-        uint8_t *dest_ptr = initializer_memory.data() + offset;
-
-        std::memcpy(dest_ptr, ptr, data_size);
-        ptr += data_size;
-    }
-    // Read concurrent execution levels
-    uint32_t num_levels = readUint32(ptr, end);
-    std::vector<std::vector<std::string>> concurrent_levels(num_levels);
-    for (uint32_t i = 0; i < num_levels; ++i) {
-        uint32_t level_size = readUint32(ptr, end);
-        concurrent_levels[i].reserve(level_size);
-        for (uint32_t j = 0; j < level_size; ++j) {
-            std::string node_name = readString(ptr, end);
-            concurrent_levels[i].push_back(node_name);
-        }
+    const auto* model = vkop::model::GetModel(buf);
+    if (model->version() != 1) {
+        throw std::runtime_error(
+            "Unsupported VKOP model version: " + std::to_string(model->version()));
     }
 
-    // Store concurrent levels information
-    this->concurrent_execution_levels = std::move(concurrent_levels);
-
-    if (this->initializers.find("unified_metadata") != this->initializers.end()) {
-        size_t meta_offset = initializer_offsets["unified_metadata"];
-        auto names_offset = this->initializer_offsets["unified_names"];
-        auto tensors_offset = this->initializer_offsets["unified_tensors"];
-        auto dims = this->initializers["unified_metadata"].dims;
-        int num_metas = dims[0]/8;
-        uint8_t *meta_ptr = initializer_memory.data() + meta_offset;
-        uint8_t *name_ptr = initializer_memory.data() + names_offset;
-        std::vector<struct UnifiedMetadata> metas(num_metas);
-        std::memcpy(metas.data(), meta_ptr, sizeof(struct UnifiedMetadata) * num_metas);
-        size_t name_idx_offset = 0;
-        std::string datatyep_map[] = {
-            "none",
-            "float32",
-            "uint8",
-            "int8",
-            "uint16",
-            "int16",
-            "int32",
-            "int64",
-            "string",
-            "bool",
-            "float16",
-            "float64",
-            "uint32",
-            "uint64",
-            "complex64",
-            "complex128",
-            "bfloat16"
-        };
-        for (int i = 0; i < num_metas; ++i) {
-            auto &meta = metas[i];
-            Initializer initializer;
-            initializer.name = std::string(name_ptr + name_idx_offset, name_ptr + name_idx_offset + meta.name_len);
-            initializer.dtype = datatyep_map[meta.dtype];
-            for (unsigned int dim : meta.dims) {
-                if (dim == 0) {
-                    break;
+    // inputs / outputs
+    auto read_shapes = [](const ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ShapeRef>>* v) {
+        std::vector<Shape> out;
+        if (v) {
+            out.reserve(v->size());
+            for (uint32_t i = 0; i < v->size(); ++i) {
+                const auto* s = v->Get(i);
+                Shape shape;
+                shape.name = s->name() ? s->name()->str() : "";
+                if (s->dims()) {
+                    shape.dims.reserve(s->dims()->size());
+                    for (uint32_t d = 0; d < s->dims()->size(); ++d) {
+                        shape.dims.push_back(s->dims()->Get(d));
+                    }
                 }
-                initializer.dims.push_back(dim);
+                out.push_back(std::move(shape));
             }
-            initializer_offsets[initializer.name] = tensors_offset + meta.offset;
-            this->initializers[initializer.name] = std::move(initializer);
-            name_idx_offset += meta.name_len;
         }
-        unified = true;
+        return out;
+    };
+
+    this->inputs = read_shapes(model->inputs());
+    this->outputs = read_shapes(model->outputs());
+
+    // nodes
+    if (model->nodes()) {
+        this->nodes.reserve(model->nodes()->size());
+        for (uint32_t i = 0; i < model->nodes()->size(); ++i) {
+            const auto* n = model->nodes()->Get(i);
+            Node node;
+            node.op_type = n->op_type() ? n->op_type()->str() : "";
+            node.name = n->name() ? n->name()->str() : "";
+
+            if (n->attributes()) {
+                for (uint32_t a = 0; a < n->attributes()->size(); ++a) {
+                    const auto* attr = n->attributes()->Get(a);
+                    std::string key = attr->key() ? attr->key()->str() : "";
+                    node.attributes.emplace(std::move(key), attrValueToString(attr));
+                }
+            }
+
+            node.inputs = read_shapes(n->inputs());
+            node.outputs = read_shapes(n->outputs());
+
+            if (n->dependencies()) {
+                for (uint32_t d = 0; d < n->dependencies()->size(); ++d) {
+                    const auto* s = n->dependencies()->Get(d);
+                    if (s) node.dependencies.insert(s->str());
+                }
+            }
+            if (n->dependents()) {
+                for (uint32_t d = 0; d < n->dependents()->size(); ++d) {
+                    const auto* s = n->dependents()->Get(d);
+                    if (s) node.dependents.insert(s->str());
+                }
+            }
+            this->nodes.push_back(std::move(node));
+        }
     }
 
-    if (this->initializers.find("rgba_conversion_metadata") != this->initializers.end()) {
-        printf("Found RGBA conversion metadata, restoring original shapes...\n");
-        size_t meta_offset = initializer_offsets["rgba_conversion_metadata"];
-        auto names_offset = this->initializer_offsets["rgba_conversion_names"];
-        auto dims = this->initializers["rgba_conversion_metadata"].dims;
-        int num_metas = dims[0]/8;
-        printf("Number of RGBA conversion metas: %d\n", dims[0]);
-        uint8_t *meta_ptr = initializer_memory.data() + meta_offset;
-        uint8_t *name_ptr = initializer_memory.data() + names_offset;
-        std::vector<struct RGBAConversion> metas(num_metas);
-        std::memcpy(metas.data(), meta_ptr, sizeof(struct RGBAConversion) * num_metas);
-        size_t name_idx_offset = 0;
-        std::string datatyep_map[] = {
-            "none",
-            "float32",
-            "uint8",
-            "int8",
-            "uint16",
-            "int16",
-            "int32",
-            "int64",
-            "string",
-            "bool",
-            "float16",
-            "float64",
-            "uint32",
-            "uint64",
-            "complex64",
-            "complex128",
-            "bfloat16"
-        };
-        for (int i = 0; i < num_metas; ++i) {
-            auto &meta = metas[i];
-            auto name = std::string(name_ptr + name_idx_offset, name_ptr + name_idx_offset + meta.name_len);
-            auto dtype = datatyep_map[meta.dtype];
-            this->initializers[name].dims.resize(4);
-            for (int i = 0; i < 4; ++i) {
-                this->initializers[name].dims[i] = meta.dims[i];
+    // initializer blob — zero-copy view straight into the mmap'd FlatBuffer.
+    const auto* blob = model->initializer_blob();
+    if (blob) {
+        this->initializer_memory = blob->Data();
+        this->initializer_memory_size = blob->size();
+    } else {
+        this->initializer_memory = nullptr;
+        this->initializer_memory_size = 0;
+    }
+
+    // initializer entries — offsets come pre-computed from the Python writer.
+    if (model->initializers()) {
+        for (uint32_t i = 0; i < model->initializers()->size(); ++i) {
+            const auto* e = model->initializers()->Get(i);
+            Initializer init;
+            init.name = e->name() ? e->name()->str() : "";
+            init.dtype = e->dtype() ? e->dtype()->str() : "";
+            if (e->dims()) {
+                init.dims.reserve(e->dims()->size());
+                for (uint32_t d = 0; d < e->dims()->size(); ++d) {
+                    init.dims.push_back(e->dims()->Get(d));
+                }
             }
-            name_idx_offset += meta.name_len;
+            this->initializer_offsets[init.name] = static_cast<size_t>(e->offset());
+            this->initializers.emplace(init.name, std::move(init));
         }
-        this->initializers.erase("rgba_conversion_metadata");
-        this->initializers.erase("rgba_conversion_names");
-        rgba = true;
+    }
+
+    printf("Initializer blob: %zu bytes, %zu entries\n",
+           this->initializer_memory_size, this->initializers.size());
+
+    // unified-tensor sub-allocation metadata (replaces the
+    // unified_metadata/unified_names/unified_tensors magic-initializer hack).
+    this->unified = model->unified();
+    this->unified_blob_offset = static_cast<size_t>(model->unified_blob_offset());
+    if (model->unified_names()) {
+        this->unified_names = model->unified_names()->str();
+    }
+    if (model->unified_meta()) {
+        this->unified_meta.reserve(model->unified_meta()->size());
+        for (uint32_t i = 0; i < model->unified_meta()->size(); ++i) {
+            this->unified_meta.push_back(*model->unified_meta()->Get(i));
+        }
+    }
+
+    // RGBA conversion metadata — on load, rewrite the affected initializers'
+    // dims to the 4-D RGBA shape (mirrors the legacy load.cpp behaviour) so
+    // runtime's copyToGPUImage sees the right dimensions.
+    this->rgba = model->rgba();
+    if (model->rgba_names()) {
+        this->rgba_names = model->rgba_names()->str();
+    }
+    if (model->rgba_meta()) {
+        this->rgba_meta.reserve(model->rgba_meta()->size());
+        for (uint32_t i = 0; i < model->rgba_meta()->size(); ++i) {
+            this->rgba_meta.push_back(*model->rgba_meta()->Get(i));
+        }
+
+        size_t name_idx_offset = 0;
+        for (const auto& meta : this->rgba_meta) {
+            const char* base = this->rgba_names.data();
+            std::string name(base + name_idx_offset, base + name_idx_offset + meta.name_len());
+            auto it = this->initializers.find(name);
+            if (it != this->initializers.end()) {
+                it->second.dims.resize(4);
+                for (int i = 0; i < 4; ++i) {
+                    it->second.dims[i] = static_cast<uint32_t>(meta.dims()->Get(i));
+                }
+            }
+            name_idx_offset += meta.name_len();
+        }
+    }
+
+    // concurrent execution levels
+    if (model->concurrent_levels()) {
+        this->concurrent_execution_levels.reserve(model->concurrent_levels()->size());
+        for (uint32_t i = 0; i < model->concurrent_levels()->size(); ++i) {
+            const auto* lvl = model->concurrent_levels()->Get(i);
+            std::vector<std::string> level;
+            if (lvl && lvl->nodes()) {
+                level.reserve(lvl->nodes()->size());
+                for (uint32_t j = 0; j < lvl->nodes()->size(); ++j) {
+                    const auto* s = lvl->nodes()->Get(j);
+                    if (s) level.push_back(s->str());
+                }
+            }
+            this->concurrent_execution_levels.push_back(std::move(level));
+        }
     }
 }
+
+std::string VkModel::attrValueToString(const vkop::model::Attribute* attr) {
+    switch (attr->type()) {
+        case vkop::model::AttrType_String:
+            return attr->sval() ? attr->sval()->str() : "";
+        case vkop::model::AttrType_Int64:
+            return std::to_string(attr->ival());
+        case vkop::model::AttrType_Float32:
+            return std::to_string(attr->fval());
+        case vkop::model::AttrType_Bool:
+            return attr->bval() ? "1" : "0";
+        case vkop::model::AttrType_Ints: {
+            const auto* v = attr->ints();
+            if (!v || v->size() == 0) return "[]";
+            std::string value = "[" + std::to_string(v->Get(0));
+            for (uint32_t j = 1; j < v->size(); ++j) {
+                value += ", " + std::to_string(v->Get(j));
+            }
+            return value + "]";
+        }
+        case vkop::model::AttrType_Floats: {
+            const auto* v = attr->floats();
+            if (!v || v->size() == 0) return "[]";
+            std::string value = "[" + std::to_string(v->Get(0));
+            for (uint32_t j = 1; j < v->size(); ++j) {
+                value += ", " + std::to_string(v->Get(j));
+            }
+            return value + "]";
+        }
+        case vkop::model::AttrType_Tensor: {
+            const auto* t = attr->tval();
+            if (!t) return "";
+            std::string dtype = t->dtype() ? t->dtype()->str() : "";
+            std::string value = dtype + "[";
+            if (t->dims()) {
+                for (uint32_t j = 0; j < t->dims()->size(); ++j) {
+                    if (j) value += ", ";
+                    value += std::to_string(t->dims()->Get(j));
+                }
+            }
+            value += "]";
+            return value;
+        }
+        default:
+            throw std::runtime_error("Unknown attribute type tag");
+    }
+}
+
 
 
 } // namespace load

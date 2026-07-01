@@ -10,11 +10,11 @@ python3 model/download_models.py
 
 convert models to vkopbin
 ```
-python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx
+python3 -m onnx2vkop.cli -i onnx_models/xxxx.onnx
 ```
 quantize model
 ```
-python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx -q int8
+python3 -m onnx2vkop.cli -i onnx_models/xxxx.onnx -q int8
 ```
 
 
@@ -66,7 +66,7 @@ python3 model/onnx2vkop.py -i onnx_models/xxxx.onnx -q int8
 
 ## 模型转换
 ```
-python3 model/onnx2vkop.py <model.onnx>
+python3 -m onnx2vkop.cli <model.onnx>
 ```
 
 ## run benchmark

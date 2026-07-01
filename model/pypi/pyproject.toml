@@ -39,6 +39,7 @@ dependencies = [
     "onnx>=1.14.0",
     "numpy>=1.20.0",
     "onnxoptimizer>=0.3.0",
+    "flatbuffers>=2.0,<26",
 ]
 
 [project.optional-dependencies]
@@ -59,7 +60,7 @@ Issues = "https://github.com/junka/vkop/issues"
 onnx2vkop = "onnx2vkop.cli:main"
 
 [tool.setuptools]
-packages = ["onnx2vkop"]
+packages = ["onnx2vkop", "onnx2vkop.generated", "onnx2vkop.generated.vkop", "onnx2vkop.generated.vkop.model"]
 
 [tool.setuptools.package-data]
 "*" = ["*.md", "*.txt"]

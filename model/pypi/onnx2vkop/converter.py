@@ -9,10 +9,24 @@ from onnx import numpy_helper
 
 try:
     from .dag import DAGBasedModel, Node
-    from .optimizer import FusionOptimizer, InitializerMerger, ONNXOptimizer, Quantizer
+    from .optimizer import (
+        FusionOptimizer,
+        InitializerMerger,
+        ONNXOptimizer,
+        Quantizer,
+        RGBAConverter,
+        Unifier,
+    )
 except ImportError:
     from dag import DAGBasedModel, Node
-    from optimizer import FusionOptimizer, InitializerMerger, ONNXOptimizer, Quantizer
+    from optimizer import (
+        FusionOptimizer,
+        InitializerMerger,
+        ONNXOptimizer,
+        Quantizer,
+        RGBAConverter,
+        Unifier,
+    )
 
 
 class ModelConverter:
@@ -336,3 +350,9 @@ class ModelConverter:
             self.quantizer.quantize_to_fp16_selective(dag_model)
         elif args.quant == "int8":
             self.quantizer.quantize_to_int8_weight_only(dag_model)
+
+        if getattr(args, "rgba", False):
+            RGBAConverter.convert(dag_model)
+
+        if getattr(args, "unify", False):
+            Unifier.unify(dag_model)

@@ -1,0 +1,112 @@
+// vkop model binary format — FlatBuffers schema (single source of truth).
+//
+// Generated with flatc 25.12.19. Regenerate:
+//   flatc --cpp --gen-mutable --gen-object-api --reflect-names \
+//         -o model/generated model/vkop_model.fbs
+//   flatc --python -o model/pypi/onnx2vkop/generated model/vkop_model.fbs
+//
+// Layout notes:
+//  - All `offset` fields are absolute byte offsets into `Model.initializer_blob`,
+//    computed by the Python writer with 64-byte alignment. The C++ reader never
+//    computes offsets — it memmaps the file and points `initializer_memory`
+//    directly at the blob (zero-copy).
+//  - `UnifiedMeta` / `RGBAConversionMeta` are FlatBuffers structs (inline,
+//    fixed 32-byte layout: 8x int32) matching the legacy
+//    load::UnifiedMetadata / RGBAConversion C++ structs, so they can be read
+//    field-by-field via direct indexing (no memcpy into a temp vector).
+
+namespace vkop.model;
+
+file_identifier "VKOP";
+file_extension "vkopbin";
+
+enum AttrType : byte {
+  String = 0,
+  Int64 = 1,
+  Float32 = 2,
+  Ints = 3,
+  Floats = 4,
+  Tensor = 5,
+  Bool = 6,
+}
+
+struct UnifiedMeta {
+  dtype: int;
+  name_len: int;
+  offset: int;
+  size: int;
+  dims: [int: 4];
+}
+
+struct RGBAConversionMeta {
+  dtype: int;
+  name_len: int;
+  offset: int;
+  size: int;
+  dims: [int: 4];
+}
+
+table ShapeRef {
+  name: string;
+  dims: [uint];
+}
+
+table TensorData {
+  dtype: string;
+  dims: [uint];
+  data: [ubyte];
+}
+
+table Attribute {
+  key: string;
+  type: AttrType;
+  sval: string;
+  ival: long;
+  fval: float;
+  ints: [uint];
+  floats: [float];
+  bval: bool;
+  tval: TensorData;
+}
+
+table InitializerEntry {
+  name: string;
+  dtype: string;
+  dims: [uint];
+  offset: ulong;
+  size: ulong;
+}
+
+table Node {
+  op_type: string;
+  name: string;
+  attributes: [Attribute];
+  inputs: [ShapeRef];
+  outputs: [ShapeRef];
+  dependencies: [string];
+  dependents: [string];
+}
+
+table ConcurrentLevel {
+  nodes: [string];
+}
+
+table Model {
+  magic: uint = 0x504F4B56;
+  version: ubyte = 1;
+  inputs: [ShapeRef];
+  outputs: [ShapeRef];
+  nodes: [Node];
+  initializers: [InitializerEntry];
+  initializer_blob: [ubyte];
+  unified: bool = false;
+  rgba: bool = false;
+  unified_meta: [UnifiedMeta];
+  unified_names: string;
+  rgba_meta: [RGBAConversionMeta];
+  rgba_names: string;
+  unified_blob_offset: ulong;
+  concurrent_levels: [ConcurrentLevel];
+}
+
+root_type Model;

@@ -200,9 +200,27 @@ gtest_discover_tests(all_tests
         TIMEOUT 300
 )
 
-file(COPY ../model/add_conv_model.vkopbin DESTINATION ${CMAKE_CURRENT_BINARY_DIR}/model)
+# Regenerate the test fixture from the source ONNX via the current onnx2vkop
+# writer at build time, so the .vkopbin always tracks both ends of the format.
+# The .onnx is the tracked source of truth; the .vkopbin is a build artifact.
+# ModelTest requires the int8-quantized fixture (it reads conv.weight as int8
+# + conv.weight_scale as float), hence -q int8.
+set(MODEL_ONNX ${CMAKE_SOURCE_DIR}/model/add_conv_model.onnx)
+set(MODEL_VKOPBIN ${CMAKE_CURRENT_BINARY_DIR}/model/add_conv_model.vkopbin)
+find_package(Python3 COMPONENTS Interpreter REQUIRED)
+add_custom_command(
+    OUTPUT ${MODEL_VKOPBIN}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/model
+    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+            -i ${MODEL_ONNX}
+            -o ${MODEL_VKOPBIN}
+            -q int8
+    DEPENDS ${MODEL_ONNX}
+    COMMENT "Converting add_conv_model.onnx -> add_conv_model.vkopbin (int8)"
+    VERBATIM
+)
 
-add_executable(ModelTest ModelTest.cpp)
+add_executable(ModelTest ModelTest.cpp ${MODEL_VKOPBIN})
 target_link_libraries(ModelTest PRIVATE vkop vload)
 target_compile_definitions(ModelTest PRIVATE
     TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
