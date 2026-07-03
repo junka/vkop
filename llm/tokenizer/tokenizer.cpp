@@ -175,20 +175,39 @@ void Tokenizer::load(const std::string& bin_path) {
               });
 
     std::cout << "[Tokenizer] Load successful.\n";
+
+    // 编译 pre_tokenizer 的 GPT-2 正则。re2 不支持负向前瞻 (?!)，故去掉
+    // 原版的 \s+(?!\S) 子句，保留兜底 \s+。对常规输入切分与 HF 一致。
+    // 整体包一层捕获组，便于用 RE2::Match 逐段推进。
+    static const char* kPrePattern =
+        "("
+        "(?i:'s|'t|'re|'ve|'m|'ll|'d)"
+        "|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+"
+        "|\\p{N}"
+        "| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*"
+        "|\\s*[\\r\\n]+"
+        "|\\s+"
+        ")";
+    RE2::Options opts;
+    opts.set_log_errors(true);
+    pre_regex_ = std::make_unique<RE2>(kPrePattern, opts);
+    if (!pre_regex_->ok()) {
+        throw std::runtime_error("failed to compile pre_tokenizer regex: " +
+                                 pre_regex_->error());
+    }
 }
 
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
-    const auto& m = byte_unicode_map();
     std::vector<uint32_t> tokens;
     tokens.reserve(text.size());
 
-    // 先扫描输入，遇到特殊 token 字面量（如 <|im_start|>）直接吐对应 id，
-    // 该段不进 BBPE；其余子串按字节做 BBPE。这模仿 HF tokenizers 的行为：
-    // 特殊 token 在 pre-tokenizer 之前被切出，作为原子单元。
+    // 1. 特殊 token 字面量先切出（最长匹配，作为原子 id，不进 BPE）。
+    // 2. 其余部分用 pre_tokenizer 正则切成 spans，每段独立做字节→BBPE + BPE，
+    //    不跨段合并——这是和 HF 官方 tokenizer 对齐的关键。
     size_t i = 0;
     const size_t n = text.size();
     while (i < n) {
-        // 尝试在当前位置匹配最长特殊 token（special_tokens_ 已按长度降序）。
+        // 尝试在当前位置匹配最长特殊 token。
         bool matched = false;
         for (const auto& sp : special_tokens_) {
             const auto& s = sp.content;
@@ -201,22 +220,37 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
         }
         if (matched) continue;
 
-        // 普通路径：把这一字节映射成 BBPE token id，累积成一段后整体做 BPE。
-        // 这里按字节逐个推入，下面 bpe_merge 会把它们合并；为保证不同段
-        // 之间不会跨段合并，每个普通段单独 BPE 后再追加。
-        // 简化：逐字节推入同一段，依赖 merge 表不会跨特殊 token 边界合并
-        // （因为特殊 token 的 id 不在任何 merge 规则的 key 里）。
-        unsigned char c = static_cast<unsigned char>(text[i]);
-        auto it = token_to_id_.find(m.byte_to_str[c]);
-        if (it != token_to_id_.end()) {
-            tokens.push_back(it->second);
+        // 用正则从位置 i 开始找下一个 span。特殊 token 之外的文本都走这里。
+        re2::StringPiece input(text.data() + i, n - i);
+        re2::StringPiece sp_match;
+        if (!pre_regex_->Match(input, 0, input.size(), RE2::UNANCHORED, &sp_match, 1)) {
+            // 正则没匹配上（理论上 GPT-2 正则覆盖所有输入），退化为单字节。
+            encode_segment(std::string(text.data() + i, 1), tokens);
+            i += 1;
+            continue;
         }
-        ++i;
+        std::string seg(sp_match.data(), sp_match.size());
+        encode_segment(seg, tokens);
+        i += sp_match.size();
     }
 
-    // 执行 BPE 合并。
-    bpe_merge(tokens);
     return tokens;
+}
+
+void Tokenizer::encode_segment(const std::string& seg, std::vector<uint32_t>& out) const {
+    const auto& m = byte_unicode_map();
+    // 把这段的每个字节映射成 BBPE token id，单独做 BPE 后再追加到 out。
+    // 关键：每段独立 BPE，不跨 pre-tokenizer 边界合并——这是和 HF 对齐的核心。
+    std::vector<uint32_t> seg_tokens;
+    seg_tokens.reserve(seg.size());
+    for (unsigned char c : seg) {
+        auto it = token_to_id_.find(m.byte_to_str[c]);
+        if (it != token_to_id_.end()) {
+            seg_tokens.push_back(it->second);
+        }
+    }
+    bpe_merge(seg_tokens);
+    out.insert(out.end(), seg_tokens.begin(), seg_tokens.end());
 }
 
 void Tokenizer::bpe_merge(std::vector<uint32_t>& tokens) const {

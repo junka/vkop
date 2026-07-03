@@ -1,10 +1,13 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 #include <unordered_map>
 #include <stdexcept>
+
+#include <re2/re2.h>
 
 namespace qwen {
 
@@ -40,6 +43,9 @@ private:
     // BBPE 核心合并逻辑
     void bpe_merge(std::vector<uint32_t>& tokens) const;
 
+    // 把一段 pre-tokenizer 切出的 span（已是字节序列）做字节→BBPE id + BPE 合并。
+    void encode_segment(const std::string& seg, std::vector<uint32_t>& out) const;
+
     // mmap 相关成员
     void* mmap_data_ = nullptr;
     size_t mmap_size_ = 0;
@@ -55,6 +61,11 @@ private:
     // (left_id,right_id) -> BPE 优先级 rank（merge 在 bin 文件中的顺序）。
     // bpe_merge 每轮选 rank 最小的相邻 pair 合并，是标准 GPT-2 BPE 行为。
     std::unordered_map<std::pair<uint32_t, uint32_t>, uint32_t, PairHash> merge_rank_;
+
+    // pre_tokenizer 的 GPT-2 正则。Qwen3-VL 原版含 \s+(?!\S) 负向前瞻，re2 不支持，
+    // 故去掉该子句（保留兜底的 \s+）；对常规输入的切分结果与 HF 一致。
+    // 模式整体包一层捕获组，用 RE2::Match 逐段推进。
+    std::unique_ptr<RE2> pre_regex_;
 
     // 特殊 token（如 <|im_start|>）。encode 时先做最长字面量匹配，命中即输出
     // 单个 id，跳过该段；该段不再进 BBPE。按长度降序排列以保证最长匹配优先。
