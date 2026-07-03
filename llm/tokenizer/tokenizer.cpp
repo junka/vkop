@@ -197,21 +197,43 @@ void Tokenizer::load(const std::string& bin_path) {
     }
 }
 
+std::string Tokenizer::normalize_nfc(const std::string& text) const {
+    // NFC = 先分解（NFD）再组合，输出「最短」等价形式。Qwen3-VL 的 vocab
+    // 假设 NFC 输入，若直接喂 NFD（如 e + U+0301 而非 U+00E9），字节序列
+    // 不同，BBPE 会切出不一样的 token。utf8proc_NFC 是 utf8proc_map 的快捷：
+    // 输入 null-terminated UTF-8，输出 malloc 的新串，调用方负责 free。
+    if (text.empty()) return text;
+    utf8proc_uint8_t* dst = utf8proc_NFC(
+        reinterpret_cast<const utf8proc_uint8_t*>(text.data()));
+    if (!dst) {
+        // 非法 UTF-8 或内存不足：退回原串，不阻断分词。
+        return text;
+    }
+    std::string out(reinterpret_cast<const char*>(dst));
+    free(dst);
+    return out;
+}
+
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
+    // pipeline: Normalizer(NFC) → special token 切分 → pre_tokenizer(Regex)
+    //           → ByteLevel + BPE。NFC 在最前，保证字节序列规范化后再切分。
+    std::string normalized = normalize_nfc(text);
+    const std::string& input = normalized;
+
     std::vector<uint32_t> tokens;
-    tokens.reserve(text.size());
+    tokens.reserve(input.size());
 
     // 1. 特殊 token 字面量先切出（最长匹配，作为原子 id，不进 BPE）。
     // 2. 其余部分用 pre_tokenizer 正则切成 spans，每段独立做字节→BBPE + BPE，
     //    不跨段合并——这是和 HF 官方 tokenizer 对齐的关键。
     size_t i = 0;
-    const size_t n = text.size();
+    const size_t n = input.size();
     while (i < n) {
         // 尝试在当前位置匹配最长特殊 token。
         bool matched = false;
         for (const auto& sp : special_tokens_) {
             const auto& s = sp.content;
-            if (s.size() <= n - i && std::memcmp(text.data() + i, s.data(), s.size()) == 0) {
+            if (s.size() <= n - i && std::memcmp(input.data() + i, s.data(), s.size()) == 0) {
                 tokens.push_back(sp.id);
                 i += s.size();
                 matched = true;
@@ -221,11 +243,11 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
         if (matched) continue;
 
         // 用正则从位置 i 开始找下一个 span。特殊 token 之外的文本都走这里。
-        re2::StringPiece input(text.data() + i, n - i);
+        re2::StringPiece piece(input.data() + i, n - i);
         re2::StringPiece sp_match;
-        if (!pre_regex_->Match(input, 0, input.size(), RE2::UNANCHORED, &sp_match, 1)) {
+        if (!pre_regex_->Match(piece, 0, piece.size(), RE2::UNANCHORED, &sp_match, 1)) {
             // 正则没匹配上（理论上 GPT-2 正则覆盖所有输入），退化为单字节。
-            encode_segment(std::string(text.data() + i, 1), tokens);
+            encode_segment(std::string(input.data() + i, 1), tokens);
             i += 1;
             continue;
         }
@@ -234,7 +256,14 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
         i += sp_match.size();
     }
 
+    post_process(tokens);
     return tokens;
+}
+
+void Tokenizer::post_process(std::vector<uint32_t>& /*ids*/) const {
+    // Qwen3-VL 的 ByteLevel post_processor: add_prefix_space=false,
+    // trim_offsets=false, use_regex=false 
+    // means no-op
 }
 
 void Tokenizer::encode_segment(const std::string& seg, std::vector<uint32_t>& out) const {

@@ -148,35 +148,3 @@ GPT-2 把 256 个字节映射到可见 Unicode 码点，避免 vocab 里出现�
 `ByteUnicodeMap` 一次性建好双向表：`byte_to_str`（encode 用）、`cp_to_byte`
 （decode 用）。
 
----
-
-## 设计取舍
-
-- **为什么不用 FlatBuffers**：本格式是 3 段平铺定长数组，schema 稳定、立即
-  消费成哈希表、不需零拷贝随机访问。FlatBuffers 的强项（异构嵌套结构 +
-  schema 演进）这里用不上，反而徒增 codegen 基建。model 用 FlatBuffers 是
-  因为它复杂且需零拷贝；tokenizer 正相反。
-- **为什么用 re2 而非手写状态机**：正则含 `\p{L}`/`\p{N}` Unicode 属性类，
-  手写要维护 Unicode 类别表，corner case 多。re2 ~300KB 静态库、Google 维护、
-  支持属性类，正则直接照搬 tokenizer.json，最稳。
-- **负向前瞻的妥协**：re2 不支持 `(?!...)`。去掉 `\s+(?!\S)` 后对常规输入
-  无差异（已验证）；极端的纯尾部空白序列可能切法略不同，但 round-trip 仍成立。
-- **NFC 暂不做**：实际输入基本已是 NFC，引入 utf8proc 的收益不抵成本，留作
-  可选项。
-
----
-
-## 验证
-
-与 `transformers` 官方 tokenizer 逐 id 对比：
-
-| 输入 | 结果 |
-|---|---|
-| `Hello, Qwen3-VL! 你好，世界。` | ✅ 完全一致 |
-| `dog.` | ✅ |
-| `I'm here` | ✅ |
-| `<|im_start|>system\n` | ✅（特殊 token 作为单 id） |
-| `The quick brown fox jumps over the lazy dog.` | ✅ |
-
-运行 `tests/main.cpp` 做 round-trip（encode→decode==原文本）+ 性能压测
-（8000 字节约 7ms）。

@@ -8,6 +8,7 @@
 #include <stdexcept>
 
 #include <re2/re2.h>
+#include <utf8proc.h>
 
 namespace qwen {
 
@@ -45,6 +46,10 @@ private:
 
     // 把一段 pre-tokenizer 切出的 span（已是字节序列）做字节→BBPE id + BPE 合并。
     void encode_segment(const std::string& seg, std::vector<uint32_t>& out) const;
+
+    std::string normalize_nfc(const std::string& text) const;
+
+    void post_process(std::vector<uint32_t>& ids) const;
 
     // mmap 相关成员
     void* mmap_data_ = nullptr;
