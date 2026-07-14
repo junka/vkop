@@ -1,9 +1,12 @@
 import json
 import struct
 import os
+import re
 
-MODEL_DIR = "/Users/uqland/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct"
+MODEL_DIR = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 TOKENIZER_JSON = os.path.join(MODEL_DIR, "tokenizer.json")
+TOKENIZER_CONFIG_JSON = os.path.join(MODEL_DIR, "tokenizer_config.json")
+CHAT_TEMPLATE_JSON = os.path.join(MODEL_DIR, "chat_template.json")
 OUTPUT_BIN = "qwen3_vl.bin"
 
 def bytes_to_unicode():
@@ -17,6 +20,89 @@ def bytes_to_unicode():
             cs.append(2**8+n)
             n += 1
     return dict(zip(bs, [chr(c) for c in cs]))
+
+def extract_chat_template():
+    """用 HF tokenizer 的 apply_chat_template 探针提取角色 prefix/suffix、
+    内容占位格式、generation_prompt、default_system_prompt。
+
+    返回结构与 trt_edgellm 的 processed_chat_template.json 一致：
+      roles: {system/user/assistant: {prefix, suffix}}
+      content_types: {image/video: {format}}
+      generation_prompt, default_system_prompt
+    """
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+
+    SYS = "__SENTINEL_SYS_a7f3e2b1__"
+    USR = "__SENTINEL_USR_c9d4f6e8__"
+    AST = "<placeholder_assistant_text>"
+
+    sys_msg = {"role": "system", "content": SYS}
+    usr_msg = {"role": "user", "content": USR}
+    ast_msg = {"role": "assistant", "content": AST}
+
+    sys_fmt = tok.apply_chat_template([sys_msg], tokenize=False, add_generation_prompt=False)
+    sys_prefix = sys_fmt[:sys_fmt.find(SYS)]
+    sys_suffix = sys_fmt[sys_fmt.find(SYS) + len(SYS):]
+
+    usr_fmt = tok.apply_chat_template([sys_msg, usr_msg], tokenize=False, add_generation_prompt=False)
+    delta = usr_fmt[len(sys_fmt):]
+    usr_prefix = delta[:delta.find(USR)]
+    usr_suffix = delta[delta.find(USR) + len(USR):]
+
+    ast_fmt = tok.apply_chat_template([sys_msg, usr_msg, ast_msg], tokenize=False, add_generation_prompt=False)
+    delta2 = ast_fmt[len(usr_fmt):]
+    ast_prefix = delta2[:delta2.find(AST)]
+    ast_suffix = delta2[delta2.find(AST) + len(AST):]
+
+    gen_fmt = tok.apply_chat_template([sys_msg, usr_msg], tokenize=False, add_generation_prompt=True)
+    generation_prompt = gen_fmt[len(usr_fmt):]
+
+    # default_system_prompt：仅 user 消息时若模板自动注入系统块则提取其内容。
+    usr_only = tok.apply_chat_template([usr_msg], tokenize=False, add_generation_prompt=False)
+    default_system_prompt = ""
+    s_start = usr_only.find(sys_prefix)
+    if s_start != -1:
+        c_start = s_start + len(sys_prefix)
+        c_end = usr_only.find(sys_suffix, c_start)
+        if c_end != -1:
+            default_system_prompt = usr_only[c_start:c_end]
+            if default_system_prompt == SYS:
+                default_system_prompt = ""
+
+    # image/video 内容占位格式：对比「纯文本」与「带图/视频」的差分。
+    content_types = {}
+    base_text = "<placeholder_user_text>"
+    base_fmt = tok.apply_chat_template(
+        [sys_msg, {"role": "user", "content": [{"type": "text", "text": base_text}]}],
+        tokenize=False, add_generation_prompt=False)
+    for kind, ph in [("image", "<placeholder_image_path>"), ("video", "<placeholder_video_path>")]:
+        u = {"role": "user", "content": [{"type": "text", "text": base_text}, {"type": kind, kind: ph}]}
+        withc = tok.apply_chat_template([sys_msg, u], tokenize=False, add_generation_prompt=False)
+        tp = base_fmt.find(base_text) + len(base_text)
+        cp = withc.find(base_text) + len(base_text)
+        bsuf = base_fmt[tp:]
+        wsuf = withc[cp:]
+        if wsuf.endswith(bsuf) and bsuf:
+            pat = wsuf[:-len(bsuf)]
+        else:
+            pat = wsuf
+        pat = re.sub(rf"^{kind.capitalize()} \d+:\s*", "", pat)
+        if pat:
+            content_types[kind] = {"format": pat}
+
+    return {
+        "model_path": MODEL_DIR,
+        "roles": {
+            "system": {"prefix": sys_prefix, "suffix": sys_suffix},
+            "user": {"prefix": usr_prefix, "suffix": usr_suffix},
+            "assistant": {"prefix": ast_prefix, "suffix": ast_suffix},
+        },
+        "content_types": content_types,
+        "generation_prompt": generation_prompt,
+        "default_system_prompt": default_system_prompt,
+    }
+
 
 def convert_tokenizer():
     print(f"[*] Loading tokenizer from: {TOKENIZER_JSON}")
@@ -95,6 +181,42 @@ def convert_tokenizer():
             f.write(struct.pack("<H", len(token_bytes)))
             f.write(token_bytes)
             f.write(struct.pack("<I", token_id))
+
+        # --- 写入 ChatTemplate Section（可选，追加在文件末尾）---
+        # 用 HF apply_chat_template 探针提取 system/user/assistant 各角色的
+        # prefix/suffix、image/video 内容占位格式、generation_prompt、
+        # default_system_prompt，序列化为长度前缀字段，C++ load 顺序读取。
+        try:
+            chat_data = extract_chat_template()
+        except Exception as e:
+            print(f"[!] Warning: failed to extract chat template: {e}. Skipping ChatTemplate section.")
+            chat_data = None
+
+        if chat_data is not None:
+            # roles: u32 count + (u16 name + u16 prefix + u16 suffix) per role
+            roles = chat_data["roles"]
+            f.write(struct.pack("<I", len(roles)))
+            for name in ("system", "user", "assistant"):
+                if name not in roles:
+                    continue
+                for s in (name, roles[name]["prefix"], roles[name]["suffix"]):
+                    b = s.encode("utf-8")
+                    f.write(struct.pack("<H", len(b)))
+                    f.write(b)
+            # content_types: u32 count + (u16 type + u16 format) per type
+            cts = chat_data["content_types"]
+            f.write(struct.pack("<I", len(cts)))
+            for tname, tinfo in cts.items():
+                for s in (tname, tinfo["format"]):
+                    b = s.encode("utf-8")
+                    f.write(struct.pack("<H", len(b)))
+                    f.write(b)
+            # generation_prompt + default_system_prompt
+            for s in (chat_data["generation_prompt"], chat_data["default_system_prompt"]):
+                b = s.encode("utf-8")
+                f.write(struct.pack("<H", len(b)))
+                f.write(b)
+            print(f"[✓] Chat template embedded: {len(roles)} roles, {len(cts)} content types.")
 
     print(f"[✓] Successfully converted to: {OUTPUT_BIN}")
     if skip_count > 0:
