@@ -33,10 +33,10 @@ class Qwen3VLInference:
             model_path = os.path.expanduser(
                 "~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct"
             )
-        
+
         print(f"Loading model from: {model_path}")
         print(f"Device: {device}, Dtype: {dtype}")
-        
+
         # Check if model exists
         if not os.path.exists(model_path):
             raise FileNotFoundError(
@@ -44,32 +44,32 @@ class Qwen3VLInference:
                 "Please download it first using: "
                 "modelscope download --model Qwen/Qwen3-VL-2B-Instruct"
             )
-        
+
         # Load model - Qwen3VL uses specific class
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             model_path,
             torch_dtype=dtype,
             device_map=device
         )
-        
+
         # Load processor (handles tokenization and image processing)
         self.processor = AutoProcessor.from_pretrained(model_path)
-        
+
         self.device = next(self.model.parameters()).device
         print(f"✓ Model loaded successfully on {self.device}")
         print(f"✓ Model memory: {self.get_model_memory():.2f} GB")
-    
+
     def get_model_memory(self):
         """Get model memory usage in GB"""
         if torch.cuda.is_available():
             torch.cuda.synchronize()
             return torch.cuda.memory_allocated() / 1024**3
         return 0
-    
+
     def inference(self, messages, max_new_tokens=512, temperature=0.7):
         """
         Run inference on the model
-        
+
         Args:
             messages: List of message dicts with 'role' and 'content'
             max_new_tokens: Maximum tokens to generate
@@ -84,7 +84,7 @@ class Qwen3VLInference:
             tokenize=False,
             add_generation_prompt=True
         )
-        
+
         # Process vision info with video metadata support
         image_inputs, video_inputs, video_kwargs = process_vision_info(
             [messages],
@@ -92,13 +92,13 @@ class Qwen3VLInference:
             image_patch_size=16,
             return_video_metadata=True
         )
-        
+
         # Handle video metadata if present
         video_metadatas = None
         if video_inputs is not None:
             video_inputs, video_metadatas = zip(*video_inputs)
             video_inputs, video_metadatas = list(video_inputs), list(video_metadatas)
-        
+
         inputs = self.processor(
             text=[text],
             images=image_inputs,
@@ -109,7 +109,7 @@ class Qwen3VLInference:
             padding=True,
             return_tensors="pt"
         )
-        
+
         inputs = inputs.to(self.device)
         
         # Generate

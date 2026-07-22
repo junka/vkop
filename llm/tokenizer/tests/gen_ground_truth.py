@@ -2,9 +2,11 @@
 # 生成 HF tokenizers 的 encode() id 序列作为 ground truth，供 C++ 测试逐条对比。
 from tokenizers import Tokenizer
 import json
+import os
 
-TOK_JSON = "/home/gwm/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct/tokenizer.json"
-OUT = "tests/hf_ground_truth.json"
+TOK_JSON = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct/tokenizer.json")
+# 输出到脚本所在目录，便于从任意 cwd 运行。
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hf_ground_truth.json")
 
 cases = [
     "", "a", "A", " ", "  ", "   ", "\n", "\n\n", "\n\n\n", " \n", "\n ", "a\n", "a \n", "\n a",
