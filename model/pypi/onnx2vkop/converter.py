@@ -181,7 +181,12 @@ class ModelConverter:
                     print(f"Modified GlobalAveragePool shape from {original_shape} to {shape_dims}")
                     modified_shapes[output_name] = shape_dims
 
-                outputs_with_shape.append({"name": output_name, "shape": shape_dims})
+                # 记录输出 dtype（ONNX TensorProto elem_type int）。Cast 折叠 pass
+                # 需要它判断 Cast 输入/输出类型是否相同（避免靠 out.get("dtype") 拿到 None
+                # 误判，原 FIXME 的根源）。1=float32, 10=float16, 6=int32, 7=int64 等。
+                out_dtype = tensor_type.elem_type
+                outputs_with_shape.append(
+                    {"name": output_name, "shape": shape_dims, "dtype": out_dtype})
 
             inputs_with_shape = []
             for input_name in node.input:
@@ -243,7 +248,9 @@ class ModelConverter:
                 if input_name in modified_shapes and len(modified_shapes[input_name]) > 0:
                     shape_dims = modified_shapes[input_name]
                     print(f"Modified shape of input {input_name} to {shape_dims}")
-                inputs_with_shape.append({"name": input_name, "shape": shape_dims})
+                inputs_with_shape.append(
+                    {"name": input_name, "shape": shape_dims,
+                     "dtype": tensor_type.elem_type})
 
             # if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
             #     for i in range(len(inputs_with_shape)):

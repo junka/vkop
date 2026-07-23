@@ -47,6 +47,7 @@
 #include "Neg.hpp"
 #include "Sin.hpp"
 #include "Sqrt.hpp"
+#include "Tanh.hpp"
 #include "Where.hpp"
 
 namespace vkop {
@@ -137,6 +138,8 @@ create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
         return std::make_unique<Sqrt>();
     case OpType::WHERE:
         return std::make_unique<Where>();
+    case OpType::TANH:
+        return std::make_unique<Tanh>();
     default:
         return nullptr;
     }

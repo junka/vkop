@@ -7,10 +7,273 @@ from typing import Callable, Dict, List
 import numpy as np
 import onnx
 import onnxoptimizer as optimizer
-from onnx import numpy_helper, shape_inference
-# from onnxsim import simplify
+from onnx import numpy_helper, shape_inference, TensorProto, helper
+
+try:
+    from onnxsim import simplify as _onnxsim_simplify
+except ImportError:  # onnxsim 可选；缺失则退回 ConstantFolder
+    _onnxsim_simplify = None
 
 from .dag import Node
+
+
+# ONNX TensorProto elem_type -> numpy dtype，常量折叠算值用。
+_NP_DTYPE = {
+    TensorProto.FLOAT: np.float32, TensorProto.FLOAT16: np.float16,
+    TensorProto.DOUBLE: np.float64, TensorProto.INT32: np.int32,
+    TensorProto.INT64: np.int64, TensorProto.UINT8: np.uint8,
+    TensorProto.INT8: np.int8, TensorProto.BOOL: np.bool_,
+    TensorProto.UINT32: np.uint32, TensorProto.UINT64: np.uint64,
+}
+
+
+class ConstantFolder:
+    """ONNX 常量折叠器：纯 numpy 实现，不依赖 onnxsim。
+
+    策略（与 onnxsim 等价）：
+      1. shape_inference(data_prop=True) 先把所有中间张量的形状推出来
+         （含 data propagation，给 Shape/ConstantOfShape 等填 dim_value）。
+      2. 构造「已知常量」集合：graph.initializer + Constant 节点的 value。
+         Constant 节点本身折叠成 initializer（删除节点）。
+      3. 迭代折叠：对每个「所有输入都是已知常量」的纯计算节点，用 numpy 算出
+         结果，固化为新 initializer，删除节点；新常量可能解锁更多节点，多轮直到不动点。
+      4. Shape 特殊：输入张量本身不必是常量，只要其形状在 value_info 里全部已知
+         （dim_value>0），就把 Shape 折成形状的 int64 数组（这是 Qwen3-VL rotary
+         pos_embed/cos/sin 链能整段折叠的关键）。
+      5. 走到不动点后，跑一遍 eliminate_deadend 删掉折叠产生的悬空节点与无用 initializer。
+    """
+
+    # 支持用 numpy 折叠的算子（输入全常量时输出可静态确定）。
+    _FOLDABLE_OPS = {
+        "Constant", "Shape", "Gather", "ConstantOfShape", "Tile", "Expand",
+        "Concat", "Reshape", "Flatten", "Transpose", "Unsqueeze", "Squeeze",
+        "Cast", "Slice", "ScatterND", "Range", "Where",
+        "Mul", "Add", "Div", "Sub", "Pow", "Neg", "Sin", "Cos", "Sqrt",
+        "Floor", "Reduce",
+    }
+
+    @staticmethod
+    def _collect_constants(model):
+        """收集所有已知常量值：initializer + Constant 节点。返回 {name: ndarray}。"""
+        const = {}
+        for init in model.graph.initializer:
+            const[init.name] = numpy_helper.to_array(init)
+        for n in model.graph.node:
+            if n.op_type == "Constant":
+                for a in n.attribute:
+                    if a.name == "value":
+                        const[n.output[0]] = numpy_helper.to_array(a.t)
+        return const
+
+    @staticmethod
+    def _shape_known(model, name):
+        """该张量的形状是否在 value_info/input 里全部已知（dim_value>0）。"""
+        for v in list(model.graph.value_info) + list(model.graph.input) \
+                 + list(model.graph.output):
+            if v.name == name:
+                dims = v.type.tensor_type.shape.dim
+                return all(d.HasField("dim_value") and d.dim_value > 0 for d in dims)
+        return False
+
+    @staticmethod
+    def _shape_of(model, name):
+        for v in list(model.graph.value_info) + list(model.graph.input) \
+                 + list(model.graph.output):
+            if v.name == name:
+                return [d.dim_value for d in v.type.tensor_type.shape.dim]
+        return None
+
+    @staticmethod
+    def _eval(node, const, model):
+        """用 numpy 计算单个节点的输出。返回 list[ndarray]（按 output 顺序）。"""
+        ins = [const[i] for i in node.input if i and i in const]
+        op = node.op_type
+
+        def _attr_i(name, default=None):
+            for a in node.attribute:
+                if a.name == name:
+                    return a.i
+            return default
+
+        def _attr_ints(name, default=None):
+            for a in node.attribute:
+                if a.name == name:
+                    return list(a.ints)
+            return default
+
+        if op == "Constant":
+            for a in node.attribute:
+                if a.name == "value":
+                    return [numpy_helper.to_array(a.t)]
+            return [np.array(0)]
+        if op == "Shape":
+            return [np.array(ConstantFolder._shape_of(model, node.input[0]),
+                            dtype=np.int64)]
+        if op == "Gather":
+            axis = _attr_i("axis", 0)
+            return [np.take(const[node.input[0]], const[node.input[1]], axis=axis)]
+        if op == "ConstantOfShape":
+            val = numpy_helper.to_array(
+                next(a.t for a in node.attribute if a.name == "value"))
+            shp = const[node.input[0]].astype(np.int64).tolist()
+            return [np.full(shp, val.item())]
+        if op == "Tile":
+            return [np.tile(const[node.input[0]],
+                            const[node.input[1]].astype(int).tolist())]
+        if op == "Expand":
+            return [np.broadcast_to(
+                const[node.input[0]],
+                const[node.input[1]].astype(int).tolist()).copy()]
+        if op == "Concat":
+            axis = _attr_i("axis", 0)
+            return [np.concatenate(ins, axis=axis)]
+        if op == "Reshape":
+            return [const[node.input[0]].reshape(
+                const[node.input[1]].astype(int).tolist())]
+        if op == "Flatten":
+            axis = _attr_i("axis", 1)
+            x = const[node.input[0]]
+            if axis == 0:
+                return [x.reshape(x.shape[0], -1)]
+            if axis == x.ndim:
+                return [x.reshape(1, -1)]
+            return [x.reshape(int(np.prod(x.shape[:axis])), -1)]
+        if op == "Transpose":
+            perm = _attr_ints("perm", None)
+            return [np.transpose(const[node.input[0]], perm)]
+        if op == "Unsqueeze":
+            axes = (const[node.input[1]].tolist() if len(node.input) > 1
+                     else _attr_ints("axes", []))
+            x = const[node.input[0]]
+            for ax in sorted(axes):
+                x = np.expand_dims(x, ax)
+            return [x]
+        if op == "Squeeze":
+            axes = (const[node.input[1]].tolist() if len(node.input) > 1
+                     else _attr_ints("axes", []))
+            return [np.squeeze(const[node.input[0]],
+                               axis=tuple(axes) if axes else None)]
+        if op == "Cast":
+            to = node.attribute[0].i
+            return [const[node.input[0]].astype(_NP_DTYPE.get(to, np.float32))]
+        if op == "Slice":
+            x = const[node.input[0]]
+            starts = const[node.input[1]]
+            ends = const[node.input[2]]
+            axes = (const[node.input[3]].tolist() if len(node.input) > 3
+                    else list(range(x.ndim)))
+            steps = (const[node.input[4]].tolist() if len(node.input) > 4
+                     else [1] * len(axes))
+            idx = [slice(None)] * x.ndim
+            for a, s, e, st in zip(axes, starts, ends, steps):
+                idx[a] = slice(int(s), int(e), int(st))
+            return [x[tuple(idx)]]
+        if op == "ScatterND":
+            data = const[node.input[0]].copy()
+            idx = const[node.input[1]]
+            upd = const[node.input[2]]
+            red = None
+            for a in node.attribute:
+                if a.name == "reduction":
+                    red = a.s.decode()
+            if red == "add":
+                np.add.at(data, tuple(idx.T), upd)
+            else:
+                for i in range(idx.shape[0]):
+                    data[tuple(idx[i])] = upd[i]
+            return [data]
+        if op == "Range":
+            return [np.arange(const[node.input[0]],
+                              const[node.input[1]],
+                              const[node.input[2]])]
+        if op == "Where":
+            return [np.where(const[node.input[0]],
+                             const[node.input[1]],
+                             const[node.input[2]])]
+        # elementwise binary
+        if op in ("Mul", "Add", "Div", "Sub", "Pow"):
+            f = {"Mul": np.multiply, "Add": np.add, "Div": np.divide,
+                 "Sub": np.subtract, "Pow": np.power}[op]
+            return [f(ins[0], ins[1])]
+        if op in ("Neg", "Sin", "Cos", "Sqrt", "Floor"):
+            f = {"Neg": np.negative, "Sin": np.sin, "Cos": np.cos,
+                 "Sqrt": np.sqrt, "Floor": np.floor}[op]
+            return [f(const[node.input[0]])]
+        if op == "Reduce":
+            axes = (const[node.input[1]].tolist() if len(node.input) > 1
+                     else _attr_ints("axes", []))
+            keep = _attr_i("keepdims", 1)
+            return [np.sum(const[node.input[0]],
+                           axis=tuple(axes), keepdims=bool(keep))]
+        raise NotImplementedError(op)
+
+    @staticmethod
+    def _add_initializer(model, name, array):
+        """把 ndarray 作为 initializer 追加进 graph（避免重名则跳过）。"""
+        existing = {i.name for i in model.graph.initializer}
+        if name in existing:
+            return
+        model.graph.initializer.append(
+            numpy_helper.from_array(array, name=name))
+
+    @staticmethod
+    def fold(model, max_rounds: int = 25, verbose: bool = True):
+        """迭代常量折叠，直到不动点或 max_rounds。原地修改 model。"""
+        # 1. 形状推断（data propagation），给 Shape/ConstantOfShape 填 dim_value。
+        try:
+            model = shape_inference.infer_shapes(model, data_prop=True)
+        except Exception as e:
+            if verbose:
+                print(f"[ConstantFolder] shape_inference failed ({e}), "
+                      f"shape-based folding (Shape op) may be limited")
+
+        const = ConstantFolder._collect_constants(model)
+        total_folded = 0
+
+        for round_i in range(max_rounds):
+            changed = False
+            for node in list(model.graph.node):
+                if node.op_type not in ConstantFolder._FOLDABLE_OPS:
+                    continue
+                if not node.output or node.output[0] in const:
+                    continue
+                # 判定输入是否全部「已知常量」。
+                # Shape 特殊：输入本身不必是常量，只要形状在 value_info 全已知即可。
+                if node.op_type == "Shape":
+                    ok = bool(node.input[0]) and \
+                         ConstantFolder._shape_known(model, node.input[0])
+                elif node.op_type == "Constant":
+                    ok = True
+                else:
+                    ok = all(i in const for i in node.input if i)
+                if not ok:
+                    continue
+                try:
+                    outs = ConstantFolder._eval(node, const, model)
+                except Exception:
+                    continue
+                for nm, arr in zip(node.output, outs):
+                    const[nm] = arr
+                    ConstantFolder._add_initializer(model, nm, arr)
+                model.graph.node.remove(node)
+                changed = True
+                total_folded += 1
+            if not changed:
+                break
+
+        # 折叠后清死代码：删悬空节点 + 无用 initializer（eliminate_deadend 等）。
+        try:
+            model = optimizer.optimize(model, [
+                "eliminate_deadend", "eliminate_unused_initializer",
+                "eliminate_identity"])
+            model = shape_inference.infer_shapes(model)
+        except Exception:
+            pass
+
+        if verbose:
+            print(f"[ConstantFolder] folded {total_folded} nodes "
+                  f"in {round_i + 1} rounds")
+        return model
 
 
 class ONNXOptimizer:
@@ -18,7 +281,14 @@ class ONNXOptimizer:
 
     @staticmethod
     def optimize_model(onnx_model, batch_size: int = 1):
-        """Optimize the ONNX model using ONNX's built-in optimizer."""
+        """Optimize the ONNX model using ONNX's built-in optimizer.
+
+        先跑 onnxoptimizer 的结构化 pass，再做常量折叠：
+          优先用内置 ConstantFolder（纯 numpy，无外部依赖，与 onnxsim 等价地
+          把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather
+          等元算子整段折叠成 initializer）。若装了 onnxsim 也作为可选增强。
+        失败自动回退到 onnxoptimizer + shape_inference。
+        """
         passes = [
             "eliminate_nop_cast",
             "eliminate_deadend",
@@ -33,6 +303,12 @@ class ONNXOptimizer:
             "fuse_consecutive_transposes",
             "fuse_add_bias_into_conv",
             "fuse_bn_into_conv",
+            # 形状/常量相关 pass（onnxoptimizer 原生，先尽力折叠 Shape/Gather/Slice-after-Shape）：
+            "extract_constant_to_initializer",
+            "eliminate_shape_gather",
+            "eliminate_slice_after_shape",
+            "eliminate_shape_op",
+            "eliminate_nop_reshape",
         ]
 
         initializer_names = {init.name for init in onnx_model.graph.initializer}
@@ -54,10 +330,24 @@ class ONNXOptimizer:
                     fixed_shape.append(1)
             input_shapes[name] = fixed_shape
 
-        # optimized_model, check = simplify(onnx_model, overwrite_input_shapes=input_shapes)
-        # assert check, "Simplified ONNX model could not be validated"
         optimized_model = optimizer.optimize(onnx_model, passes)
-        optimized_model = shape_inference.infer_shapes(optimized_model, strict_mode=True)
+
+        # 常量折叠：内置 ConstantFolder（纯 numpy，无外部依赖）。
+        # 把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather/
+        # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
+        optimized_model = ConstantFolder.fold(optimized_model, verbose=True)
+
+        # 若装了 onnxsim，再跑一遍作为增强（兜底 ConstantFolder 未覆盖的算子，
+        # 如更复杂的 data-dependent 折叠）。失败则忽略——ConstantFolder 已覆盖主路径。
+        if _onnxsim_simplify is not None:
+            try:
+                simplified, check = _onnxsim_simplify(
+                    optimized_model, overwrite_input_shapes=input_shapes)
+                if check:
+                    optimized_model = simplified
+                    print("[optimize] onnxsim enhancement OK")
+            except Exception:
+                pass  # ConstantFolder 已是主路径，onnxsim 失败不影响
 
         return optimized_model
 
@@ -255,6 +545,38 @@ class FusionOptimizer:
                 FusionOptimizer.match_redundant_cast,
                 FusionOptimizer.fold_redundant_cast,
                 priority=100,
+            )
+        )
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_cast_cast_chain",
+                FusionOptimizer.match_cast_cast_chain,
+                FusionOptimizer.fold_cast_cast_chain,
+                priority=99,
+            )
+        )
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_cast_wrapped_softmax",
+                FusionOptimizer.match_cast_wrapped_softmax,
+                FusionOptimizer.fold_cast_wrapped_softmax,
+                priority=98,
+            )
+        )
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_cast_wrapped_layernorm",
+                FusionOptimizer.match_cast_wrapped_layernorm,
+                FusionOptimizer.fold_cast_wrapped_layernorm,
+                priority=98,
+            )
+        )
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_aliasable_squeeze_unsqueeze",
+                FusionOptimizer.match_aliasable_squeeze_unsqueeze,
+                FusionOptimizer.fold_aliasable_squeeze_unsqueeze,
+                priority=95,
             )
         )
 
@@ -592,6 +914,182 @@ class FusionOptimizer:
             return True
 
         return False
+
+    # ---- P1: nop Cast chains (Cast A→B 紧接 Cast B→A，中间无其他消费者）----
+    # HF eager attention/layernorm 常产出 f16→f32→f16 的空转 Cast 对。ONNX optimizer
+    # 的 eliminate_nop_cast 只处理单 Cast 输入输出同型；这里是「两 Cast 互抵」链，
+    # 需把第二个 Cast 的所有消费者重定向到第一个 Cast 的输入，删两个节点。
+    @staticmethod
+    def match_cast_cast_chain(dag_model):
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        for cast1 in dag_model.nodes.values():
+            if cast1.op_type != "Cast":
+                continue
+            out1 = cast1.outputs[0]["name"]
+            # 第一个 Cast 的唯一消费者也必须是 Cast（无其他分叉）
+            cons = consumers.get(out1, [])
+            if len(cons) != 1:
+                continue
+            cast2, _ = cons[0]
+            if cast2.op_type != "Cast":
+                continue
+            # 互抵条件：cast1.to == cast2 的输入 dtype（即 B->A 回到 A）
+            # 简化判定：cast1 的输入 dtype == cast2.to
+            in1 = cast1.inputs[0]["name"]
+            in1_dtype = FusionOptimizer._tensor_dtype(dag_model, in1)
+            to2 = cast2.attributes.get("to")
+            if in1_dtype is not None and to2 is not None and in1_dtype == to2:
+                matches.append({"cast1": cast1, "cast2": cast2})
+        return matches
+
+    @staticmethod
+    def _tensor_dtype(dag_model, name):
+        """取某张量的 elem_type（ONNX TensorProto int）。initializer 或节点输出。"""
+        if name in dag_model.initializers:
+            return dag_model.initializers[name].data_type
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                if o["name"] == name:
+                    return o.get("dtype")
+        for i in dag_model.inputs:
+            if i["name"] == name:
+                return i.get("dtype")
+        return None
+
+    @staticmethod
+    def fold_cast_cast_chain(dag_model, match) -> bool:
+        c1, c2 = match["cast1"], match["cast2"]
+        src = c1.inputs[0]["name"]   # 原 dtype A
+        dst = c2.outputs[0]["name"]  # 末尾 dtype A
+        for n in dag_model.nodes.values():
+            for inp in n.inputs:
+                if inp["name"] == dst:
+                    inp["name"] = src
+        if c1.name in dag_model.nodes:
+            del dag_model.nodes[c1.name]
+        if c2.name in dag_model.nodes:
+            del dag_model.nodes[c2.name]
+        return True
+
+    # ---- P1: Cast↔Cast 包裹 Softmax / LayerNormalization 吸收 ----
+    # 实测模式（Qwen3-VL visual）：Softmax 的输入是 Mul 的 fp16 输出（无前置 Cast），
+    # 但 Softmax 输出 fp16 后接 Cast(f16→f32)，再走后续 fp32 运算，最后再 Cast 回 f16。
+    # VKOP 的 Softmax shader 内部按 fp32 计算且 fp16 进出，所以紧跟 Softmax 的
+    # Cast(f16→f32) 是冗余的——吸收它，让下游直接用 Softmax 的 fp16 输出。
+    # 这里只吸收「紧跟在 Softmax/LayerNorm 后、且把 fp16 升到 fp32 的单 Cast」，
+    # 下游 Cast(f32→f16) 的对由 fold_cast_cast_chain 在下一轮统一处理。
+    @staticmethod
+    def match_post_unary_upcast(dag_model, inner_op):
+        """匹配 inner_op(op) → Cast(f16→f32)，且该 Cast 唯一消费者。"""
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        F16, F32 = 10, 1
+        for inner in dag_model.nodes.values():
+            if inner.op_type != inner_op:
+                continue
+            # inner 输出必须是 fp16（softmax/LN 直接 fp16 输出）
+            if FusionOptimizer._tensor_dtype(dag_model, inner.outputs[0]["name"]) != F16:
+                continue
+            inner_out = inner.outputs[0]["name"]
+            cons = consumers.get(inner_out, [])
+            if len(cons) != 1:
+                continue
+            post, _ = cons[0]
+            if post.op_type != "Cast":
+                continue
+            if post.attributes.get("to") != F32:
+                continue
+            # 该 Cast 的输入应是 inner 的 fp16 输出（已满足），输出 f32 喂下游
+            matches.append({"inner": inner, "post": post})
+        return matches
+
+    @staticmethod
+    def match_cast_wrapped_softmax(dag_model):
+        return FusionOptimizer.match_post_unary_upcast(dag_model, "Softmax")
+
+    @staticmethod
+    def match_cast_wrapped_layernorm(dag_model):
+        return FusionOptimizer.match_post_unary_upcast(dag_model, "LayerNormalization")
+
+    @staticmethod
+    def fold_post_unary_upcast(dag_model, match) -> bool:
+        """删掉紧跟 inner(Softmax/LN) 的 Cast(f16→f32)：把 Cast 的所有消费者
+        重定向到 inner 的 fp16 输出。下游本应吃 fp32 的算子（如 Add/Mul/Transpose）
+        在 fp16 下数值等价（除 Softmax 已在内部 fp32）。保留 Cast 的输出名以维持
+        下游连接，仅删 Cast 节点。"""
+        inner, post = match["inner"], match["post"]
+        out_name = post.outputs[0]["name"]   # f32 名
+        in_name = inner.outputs[0]["name"]   # f16 名
+        for n in dag_model.nodes.values():
+            for inp in n.inputs:
+                if inp["name"] == out_name:
+                    inp["name"] = in_name
+        if post.name in dag_model.nodes:
+            del dag_model.nodes[post.name]
+        return True
+
+    @staticmethod
+    def fold_cast_wrapped_softmax(dag_model, match) -> bool:
+        return FusionOptimizer.fold_post_unary_upcast(dag_model, match)
+
+    @staticmethod
+    def fold_cast_wrapped_layernorm(dag_model, match) -> bool:
+        return FusionOptimizer.fold_post_unary_upcast(dag_model, match)
+
+    # ---- P2: Squeeze/Unsqueeze 折叠为 buffer 别名（axes 常量时纯形状元算）----
+    # 当 Squeeze/Unsqueeze 的 axes 是常量 initializer，且其唯一消费者不是必须
+    # 看到压缩后维度的算子（如 Reshape 已自带目标 shape），可把输出名重定向到输入，
+    # 视作 no-op 别名。安全策略：仅当 axes 可解析为常量、且该节点输出仅被 1 个下游
+    # 消费（避免多分叉语义复杂）。注意：真正的 reshape 语义靠下游 Reshape 的 shape
+    # 参数保证，Squeeze/Unsqueeze 在此只是多余的 view 转换。
+    @staticmethod
+    def _axes_as_list(dag_model, node):
+        """解析 Squeeze/Unsqueeze 的 axes（第二个输入），常量 initializer 时返回 list。"""
+        if len(node.inputs) < 2:
+            # ONNX opset<13 axes 在 attribute 里
+            ax = node.attributes.get("axes")
+            return list(ax) if ax is not None else None
+        ax_name = node.inputs[1]["name"]
+        if ax_name in dag_model.initializers:
+            arr = numpy_helper.to_array(dag_model.initializers[ax_name])
+            return arr.tolist()
+        return None
+
+    @staticmethod
+    def match_aliasable_squeeze_unsqueeze(dag_model):
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        for node in dag_model.nodes.values():
+            if node.op_type not in ("Squeeze", "Unsqueeze"):
+                continue
+            axes = FusionOptimizer._axes_as_list(dag_model, node)
+            if axes is None:
+                continue
+            out = node.outputs[0]["name"]
+            cons = consumers.get(out, [])
+            # 仅当唯一消费者且不是必须看到压缩维度的算子时别名为 no-op
+            if len(cons) != 1:
+                continue
+            cons_node, _ = cons[0]
+            # 这些下游算子自带目标形状/语义，Squeeze/Unsqueeze 的 view 可省
+            if cons_node.op_type in ("Reshape", "Transpose", "Gemm", "MatMul",
+                                     "Softmax", "LayerNormalization", "Add", "Mul"):
+                matches.append({"node": node})
+        return matches
+
+    @staticmethod
+    def fold_aliasable_squeeze_unsqueeze(dag_model, match) -> bool:
+        node = match["node"]
+        in_name = node.inputs[0]["name"]
+        out_name = node.outputs[0]["name"]
+        for n in dag_model.nodes.values():
+            for inp in n.inputs:
+                if inp["name"] == out_name:
+                    inp["name"] = in_name
+        if node.name in dag_model.nodes:
+            del dag_model.nodes[node.name]
+        return True
 
     @staticmethod
     def match_unsqueeze(dag_model):

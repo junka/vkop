@@ -50,6 +50,7 @@ enum class OpType {
     COS,
     NEG,
     WHERE,
+    TANH,
     TOTAL_NUM
 };
 
@@ -96,6 +97,7 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Cos",               // COS = 38
         "Neg",               // NEG = 39
         "Where",             // WHERE = 40
+        "Tanh",              // TANH = 41
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -184,6 +186,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::NEG;
     if (name == "Where")
         return vkop::ops::OpType::WHERE;
+    if (name == "Tanh")
+        return vkop::ops::OpType::TANH;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

@@ -13,7 +13,7 @@ class UnaryFactory : public Operator {
         : Operator(type, spv, spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   0) {};
+                   0){};
 
   private:
     void execute(
