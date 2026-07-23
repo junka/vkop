@@ -62,6 +62,7 @@ set(TEST_SOURCES
     GatherTest.cpp
     RangeTest.cpp
     ExpandTest.cpp
+    TanhTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

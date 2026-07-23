@@ -1037,12 +1037,11 @@ class FusionOptimizer:
     def fold_cast_wrapped_layernorm(dag_model, match) -> bool:
         return FusionOptimizer.fold_post_unary_upcast(dag_model, match)
 
-    # ---- P2: Squeeze/Unsqueeze 折叠为 buffer 别名（axes 常量时纯形状元算）----
-    # 当 Squeeze/Unsqueeze 的 axes 是常量 initializer，且其唯一消费者不是必须
-    # 看到压缩后维度的算子（如 Reshape 已自带目标 shape），可把输出名重定向到输入，
-    # 视作 no-op 别名。安全策略：仅当 axes 可解析为常量、且该节点输出仅被 1 个下游
-    # 消费（避免多分叉语义复杂）。注意：真正的 reshape 语义靠下游 Reshape 的 shape
-    # 参数保证，Squeeze/Unsqueeze 在此只是多余的 view 转换。
+    # ---- P2: Squeeze/Unsqueeze 在转换期 fuse 掉（纯 view，不进 GPU）----
+    # Squeeze/Unsqueeze 是 view 算子：只改逻辑 shape，不搬数据。在 VKOP 的 4D
+    # image 抽象下硬实现会踩 dims_ 残留 / 2D 崩溃 / 空转 kernel 等坑，故应在
+    # onnx2vkop 阶段 fuse：把输出名别名到输入名，并把「压缩后 shape」传播给所有
+    # 下游消费者的输入 shape 字段，删节点。这样 Squeeze 不进 vkopbin、零 dispatch。
     @staticmethod
     def _axes_as_list(dag_model, node):
         """解析 Squeeze/Unsqueeze 的 axes（第二个输入），常量 initializer 时返回 list。"""
@@ -1057,36 +1056,74 @@ class FusionOptimizer:
         return None
 
     @staticmethod
+    def _compute_squeezed_shape(in_shape, axes):
+        """按 axes 移除 in_shape 中对应维（归一化负轴、排序去重）。"""
+        if not in_shape:
+            return in_shape
+        nd = len(in_shape)
+        norm = sorted({(a + nd if a < 0 else a) for a in axes})
+        return [in_shape[i] for i in range(nd) if i not in set(norm)]
+
+    @staticmethod
+    def _compute_unsqueezed_shape(in_shape, axes):
+        """按 axes 在 in_shape 插入大小为 1 的维（归一化负轴、排序）。"""
+        nd = len(in_shape)
+        norm = sorted({(a + nd if a < 0 else a) for a in axes})
+        out = []
+        ai = 0
+        for i in range(nd + len(norm)):
+            if i in set(norm):
+                out.append(1)
+            else:
+                out.append(in_shape[ai]); ai += 1
+        return out
+
+    @staticmethod
     def match_aliasable_squeeze_unsqueeze(dag_model):
+        """匹配所有 axes 可解析为常量的 Squeeze/Unsqueeze。
+
+        不再要求单消费者——fold 会把压缩后 shape 传播给全部下游输入，多分叉也安全。
+        唯一排除：输出直接是 graph output（别名会改 graph 输出名，破坏契约）。
+        """
         matches = []
-        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        graph_outputs = {o["name"] for o in dag_model.outputs}
         for node in dag_model.nodes.values():
             if node.op_type not in ("Squeeze", "Unsqueeze"):
                 continue
             axes = FusionOptimizer._axes_as_list(dag_model, node)
             if axes is None:
                 continue
-            out = node.outputs[0]["name"]
-            cons = consumers.get(out, [])
-            # 仅当唯一消费者且不是必须看到压缩维度的算子时别名为 no-op
-            if len(cons) != 1:
+            # 输出不能是 graph output（别名会改外部可见名）
+            if any(o["name"] in graph_outputs for o in node.outputs):
                 continue
-            cons_node, _ = cons[0]
-            # 这些下游算子自带目标形状/语义，Squeeze/Unsqueeze 的 view 可省
-            if cons_node.op_type in ("Reshape", "Transpose", "Gemm", "MatMul",
-                                     "Softmax", "LayerNormalization", "Add", "Mul"):
-                matches.append({"node": node})
+            matches.append({"node": node})
         return matches
 
     @staticmethod
     def fold_aliasable_squeeze_unsqueeze(dag_model, match) -> bool:
+        """别名 Squeeze/Unsqueeze 输出到输入，并把压缩/扩展后 shape 传播给所有
+        下游消费者的输入 shape 字段。删节点。"""
         node = match["node"]
         in_name = node.inputs[0]["name"]
         out_name = node.outputs[0]["name"]
+
+        # 算出 view 后的 shape，用于传播给下游。
+        in_shape = node.inputs[0].get("shape", [])
+        axes = FusionOptimizer._axes_as_list(dag_model, node)
+        if node.op_type == "Squeeze":
+            new_shape = FusionOptimizer._compute_squeezed_shape(in_shape, axes)
+        else:
+            new_shape = FusionOptimizer._compute_unsqueezed_shape(in_shape, axes)
+
+        # 别名：下游所有指向 out_name 的输入改指 in_name，并更新其 shape 为 view 后值。
         for n in dag_model.nodes.values():
             for inp in n.inputs:
                 if inp["name"] == out_name:
                     inp["name"] = in_name
+                    inp["shape"] = list(new_shape)
+
+        # 同步把 graph output 里若引用了 out_name 也改指（上面已排除 graph output，
+        # 但保险起见仍处理——理论上不会触发）。
         if node.name in dag_model.nodes:
             del dag_model.nodes[node.name]
         return True
