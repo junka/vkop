@@ -55,91 +55,96 @@ namespace vkop {
 namespace ops {
 
 static inline std::unique_ptr<Operator>
-create_from_type(OpType type, bool use_ssbo = false, int fp16 = 0,
-                 int use_tensorcore = 0) {
+create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
+                 bool backend_buffer = false) {
+    // The image/buffer choice now lives inside each op's PIMPL façade ctor
+    // (it picks the BufferImpl when backend_buffer is set and a buffer port
+    // exists, else the ImageImpl). This factory just constructs the façade
+    // with (fp16, backend_buffer) — or (use_tensorcore, backend_buffer) for
+    // MatMul.
     switch (type) {
     case OpType::ADD:
-        return std::make_unique<Add>();
+        return std::make_unique<Add>(fp16, backend_buffer);
     case OpType::ATAN:
-        return std::make_unique<Atan>();
+        return std::make_unique<Atan>(fp16, backend_buffer);
     case OpType::AVERAGEPOOL:
-        return std::make_unique<AveragePool>();
+        return std::make_unique<AveragePool>(fp16, backend_buffer);
     case OpType::BATCHNORM:
-        return std::make_unique<BatchNorm>();
+        return std::make_unique<BatchNorm>(fp16, backend_buffer);
     case OpType::COL2IM:
-        return std::make_unique<Col2Im>();
+        return std::make_unique<Col2Im>(fp16, backend_buffer);
     case OpType::CONCAT:
-        return std::make_unique<Concat>();
+        return std::make_unique<Concat>(fp16, backend_buffer);
     case OpType::CONV2D:
-        return std::make_unique<Conv2d>();
+        return std::make_unique<Conv2d>(fp16, backend_buffer);
     case OpType::DIV:
-        return std::make_unique<Div>();
+        return std::make_unique<Div>(fp16, backend_buffer);
     case OpType::ERF:
-        return std::make_unique<Erf>();
+        return std::make_unique<Erf>(fp16, backend_buffer);
     case OpType::FLOOR:
-        return std::make_unique<Floor>();
+        return std::make_unique<Floor>(fp16, backend_buffer);
     case OpType::GEMM:
-        return std::make_unique<Gemm>();
+        return std::make_unique<Gemm>(fp16, backend_buffer);
     case OpType::GLOBALAVERAGEPOOL:
-        return std::make_unique<GlobalAveragePool>();
+        return std::make_unique<GlobalAveragePool>(fp16, backend_buffer);
     case OpType::GRIDSAMPLE:
-        return std::make_unique<GridSample>();
+        return std::make_unique<GridSample>(fp16, backend_buffer);
     case OpType::LAYERNORM:
-        return std::make_unique<LayerNorm>();
+        return std::make_unique<LayerNorm>(fp16, backend_buffer);
     case OpType::MATMUL:
-        return std::make_unique<MatMul>(use_tensorcore);
+        return std::make_unique<MatMul>(use_tensorcore, backend_buffer);
     case OpType::MAXPOOL2D:
-        return std::make_unique<Maxpool2d>();
+        return std::make_unique<Maxpool2d>(fp16, backend_buffer);
     case OpType::MUL:
-        return std::make_unique<Mul>();
+        return std::make_unique<Mul>(fp16, backend_buffer);
     case OpType::POW:
-        return std::make_unique<Pow>();
+        return std::make_unique<Pow>(fp16, backend_buffer);
     case OpType::PRELU:
-        return std::make_unique<PRelu>();
+        return std::make_unique<PRelu>(fp16, backend_buffer);
     case OpType::REDUCE:
-        return std::make_unique<Reduce>();
+        return std::make_unique<Reduce>(fp16, backend_buffer);
     case OpType::RELU:
-        return std::make_unique<Relu>();
+        return std::make_unique<Relu>(fp16, backend_buffer);
     case OpType::RESHAPE:
-        return std::make_unique<Reshape>();
+        return std::make_unique<Reshape>(fp16, backend_buffer);
     case OpType::RESIZE:
-        return std::make_unique<Resize>();
+        return std::make_unique<Resize>(fp16, backend_buffer);
     case OpType::SIGMOID:
-        return std::make_unique<Sigmoid>();
+        return std::make_unique<Sigmoid>(fp16, backend_buffer);
     case OpType::SLICE:
-        return std::make_unique<Slice>();
+        return std::make_unique<Slice>(fp16, backend_buffer);
     case OpType::SOFTPLUS:
-        return std::make_unique<Softplus>();
+        return std::make_unique<Softplus>(fp16, backend_buffer);
     case OpType::SPLIT:
-        return std::make_unique<Split>();
+        return std::make_unique<Split>(fp16, backend_buffer);
     case OpType::SUB:
-        return std::make_unique<Sub>();
+        return std::make_unique<Sub>(fp16, backend_buffer);
     case OpType::TOPK:
-        return std::make_unique<Topk>(fp16);
+        return std::make_unique<Topk>(fp16, backend_buffer);
     case OpType::TRANSPOSE:
-        return std::make_unique<Transpose>();
+        return std::make_unique<Transpose>(fp16, backend_buffer);
     case OpType::SOFTMAX:
-        return std::make_unique<Softmax>(use_ssbo);
+        return std::make_unique<Softmax>(fp16, backend_buffer);
     case OpType::NMS:
-        return std::make_unique<Nms>();
+        return std::make_unique<Nms>(fp16, backend_buffer);
     case OpType::GATHER:
-        return std::make_unique<Gather>(fp16);
+        return std::make_unique<Gather>(fp16, backend_buffer);
     case OpType::RANGE:
-        return std::make_unique<Range>();
+        return std::make_unique<Range>(fp16, backend_buffer);
     case OpType::EXPAND:
-        return std::make_unique<Expand>();
+        return std::make_unique<Expand>(fp16, backend_buffer);
     case OpType::SIN:
-        return std::make_unique<Sin>();
+        return std::make_unique<Sin>(fp16, backend_buffer);
     case OpType::COS:
-        return std::make_unique<Cos>();
+        return std::make_unique<Cos>(fp16, backend_buffer);
     case OpType::NEG:
-        return std::make_unique<Neg>();
+        return std::make_unique<Neg>(fp16, backend_buffer);
     case OpType::SQRT:
-        return std::make_unique<Sqrt>();
+        return std::make_unique<Sqrt>(fp16, backend_buffer);
     case OpType::WHERE:
-        return std::make_unique<Where>();
+        return std::make_unique<Where>(fp16, backend_buffer);
     case OpType::TANH:
-        return std::make_unique<Tanh>();
+        return std::make_unique<Tanh>(fp16, backend_buffer);
     default:
         return nullptr;
     }

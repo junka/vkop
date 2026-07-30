@@ -3,16 +3,37 @@
 #define OPS_MUL_HPP_
 
 #include "BinaryFactory.hpp"
+#include "ops/BufferBinaryFactory.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char mul_spv[];
-extern unsigned int mul_spv_len;
+extern unsigned char image_mul_spv[];
+extern unsigned int image_mul_spv_len;
+extern unsigned char buffer_mul_spv[];
+extern unsigned int buffer_mul_spv_len;
 }
 namespace vkop {
 namespace ops {
 
-class Mul : public BinaryFactory {
+class MulImage : public BinaryFactory {
   public:
-    Mul() : BinaryFactory(OpType::MUL, mul_spv, mul_spv_len) {}
+    MulImage() : BinaryFactory(OpType::MUL, image_mul_spv, image_mul_spv_len) {}
+};
+
+class MulBuffer : public BufferBinaryFactory {
+  public:
+    explicit MulBuffer(int fp16)
+        : BufferBinaryFactory(OpType::MUL, buffer_mul_spv, buffer_mul_spv_len,
+                              fp16) {}
+};
+
+class Mul : public PimplFacade {
+  public:
+    Mul(int fp16, bool backend_buffer) : PimplFacade(OpType::MUL) {
+        impl_ =
+            backend_buffer
+                ? std::unique_ptr<Operator>(std::make_unique<MulBuffer>(fp16))
+                : std::make_unique<MulImage>();
+    }
 };
 
 } // namespace ops

@@ -4,21 +4,22 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char where_spv[];
-extern unsigned int where_spv_len;
+extern unsigned char image_where_spv[];
+extern unsigned int image_where_spv_len;
 }
 namespace vkop {
 namespace ops {
 namespace where {} // namespace where
 
-class Where : public Operator {
+class WhereImage : public Operator {
   public:
-    explicit Where()
-        : Operator(OpType::WHERE, where_spv, where_spv_len,
+    explicit WhereImage()
+        : Operator(OpType::WHERE, image_where_spv, image_where_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -59,6 +60,15 @@ class Where : public Operator {
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
         submit(nullptr, UP_DIV(total_size, 256), 1, 1);
+    }
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Where : public PimplFacade {
+  public:
+    Where(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::WHERE) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<WhereImage>();
     }
 };
 

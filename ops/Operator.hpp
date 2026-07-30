@@ -32,8 +32,8 @@ class Operator {
 
     // Pin the compute pipeline's subgroup size. Set to the device's reported
     // subgroup size before set_runtime_device() for shaders that hard-assume a
-    // fixed numSubgroups (e.g. softmax2.comp's cross-subgroup reduce).
-    void set_required_subgroup_size(uint32_t size) {
+    // fixed numSubgroups (e.g. softmax.comp's cross-subgroup reduce).
+    virtual void set_required_subgroup_size(uint32_t size) {
         required_subgroup_size_ = size;
     }
 
@@ -129,11 +129,15 @@ class Operator {
 
     virtual OpType get_type() { return type_; }
 
-    std::shared_ptr<VulkanCommandBuffer> get_record() { return m_cmd_; }
+    // These members are the public API the runtime/tests drive. They are
+    // virtual so a PIMPL façade op can forward each to its image/buffer
+    // impl (which owns the real pipeline/command-buffer state).
+    virtual std::shared_ptr<VulkanCommandBuffer> get_record() { return m_cmd_; }
 
-    void onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
-                   const std::vector<std::shared_ptr<core::ITensor>> &outputs,
-                   int id) {
+    virtual void
+    onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+              const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+              int id) {
         if (!m_cmd_) {
             m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
         }
@@ -173,11 +177,11 @@ class Operator {
             });
         }
     }
-    void enable_trace() { trace_ = true; }
-    void disable_trace() { trace_ = false; }
+    virtual void enable_trace() { trace_ = true; }
+    virtual void disable_trace() { trace_ = false; }
 
-    void set_name(const std::string &name) { name_ = name; }
-    std::string get_name() const { return name_; }
+    virtual void set_name(const std::string &name) { name_ = name; }
+    virtual std::string get_name() const { return name_; }
 
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;

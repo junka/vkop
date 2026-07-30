@@ -1,0 +1,123 @@
+#version 450 core
+
+// Reduce SSBO op (fp32). General axes-mask reduction (up to 8-D). One
+// workgroup reduces the input elements mapping to one output element.
+// Dispatch: (out_total, 1, 1). Each workgroup iterates the reduction
+// hyperrectangle (the axes with a bit set in uReduce.axes_mask), accumulating.
+//
+// uReduce.keepdims is a host concern: the output shape already reflects uReduce.keepdims,
+// so outDims[i]==1 on reduced axes and the workgroup iterates the full
+// inDims[i] there. On non-reduced axes outDims[i]==inDims[i].
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uReduce {
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    int axes_mask;
+    int reduce_op;
+    int keepdims;
+    int _pad0;
+    int _pad1;
+} uReduce;
+
+#define REDUCE_L1        0
+#define REDUCE_L2        1
+#define REDUCE_LOGSUM    2
+#define REDUCE_LOGSUMEXP 3
+#define REDUCE_MAX       4
+#define REDUCE_MEAN      5
+#define REDUCE_MIN       6
+#define REDUCE_PROD      7
+#define REDUCE_SUM       8
+#define REDUCE_SUMSQUARE 9
+
+float init_acc() {
+    if (uReduce.reduce_op == REDUCE_MAX) return -1e30f;
+    if (uReduce.reduce_op == REDUCE_MIN) return  1e30f;
+    if (uReduce.reduce_op == REDUCE_PROD) return 1.0f;
+    return 0.0f;
+}
+
+float transform_val(float v) {
+    if (uReduce.reduce_op == REDUCE_L1) return abs(v);
+    if (uReduce.reduce_op == REDUCE_L2 || uReduce.reduce_op == REDUCE_SUMSQUARE) return v * v;
+    if (uReduce.reduce_op == REDUCE_LOGSUMEXP) return exp(v);
+    return v;
+}
+
+float combine(float a, float b) {
+    if (uReduce.reduce_op == REDUCE_MAX) return max(a, b);
+    if (uReduce.reduce_op == REDUCE_MIN) return min(a, b);
+    if (uReduce.reduce_op == REDUCE_PROD) return a * b;
+    return a + b;
+}
+
+void main() {
+    int out_gid = int(gl_GlobalInvocationID.x);
+    int rank = uReduce.rank;
+
+    int out_total = 1;
+    for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];
+    if (out_gid >= out_total) return;
+
+    IArr8 out_coord = linear_to_nd8(out_gid, uReduce.outDims, rank);
+
+    // Collect reduced axes + their dims; build a mixed-radix counter.
+    int red_axes[8];
+    int red_dims[8];
+    int n_red = 0;
+    int n_iter = 1;
+    for (int i = 0; i < rank; ++i) {
+        if ((uReduce.axes_mask & (1 << i)) != 0) {
+            red_axes[n_red] = i;
+            red_dims[n_red] = uReduce.inDims.v[i];
+            n_iter *= uReduce.inDims.v[i];
+            ++n_red;
+        }
+    }
+    int total_elems = n_iter; // for MEAN
+
+    float acc = init_acc();
+    int counter[8];
+    for (int i = 0; i < n_red; ++i) counter[i] = 0;
+
+    for (int step = 0; step < n_iter; ++step) {
+        IArr8 in_coord;
+        for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
+        for (int r = 0; r < n_red; ++r) {
+            in_coord.v[red_axes[r]] = counter[r];
+        }
+        int in_linear = nd_to_linear8(in_coord, uReduce.inDims, rank);
+        float v = uintBitsToFloat(uInput.data[in_linear]);
+        acc = combine(acc, transform_val(v));
+
+        for (int r = n_red - 1; r >= 0; --r) {
+            counter[r] += 1;
+            if (counter[r] < red_dims[r]) break;
+            counter[r] = 0;
+        }
+    }
+
+    float result = acc;
+    if (uReduce.reduce_op == REDUCE_MEAN) {
+        result = (total_elems > 0) ? acc / float(total_elems) : 0.0f;
+    } else if (uReduce.reduce_op == REDUCE_LOGSUMEXP) {
+        result = log(acc + 1e-12f);
+    } else if (uReduce.reduce_op == REDUCE_L2) {
+        result = sqrt(acc);
+    } else if (uReduce.reduce_op == REDUCE_LOGSUM) {
+        result = log(max(acc, 1e-12f));
+    }
+    uOutput.data[out_gid] = floatBitsToUint(result);
+}

@@ -4,10 +4,11 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 
 extern "C" {
-extern unsigned char nms_spv[];
-extern unsigned int nms_spv_len;
+extern unsigned char image_nms_spv[];
+extern unsigned int image_nms_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -25,10 +26,10 @@ struct alignas(16) GpuNMSParam {
 
 } // namespace nms
 
-class Nms : public Operator {
+class NmsImage : public Operator {
   public:
-    Nms()
-        : Operator(OpType::NMS, nms_spv, nms_spv_len,
+    NmsImage()
+        : Operator(OpType::NMS, image_nms_spv, image_nms_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -126,6 +127,24 @@ class Nms : public Operator {
 
   private:
     nms::GpuNMSParam para_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Nms : public PimplFacade {
+  public:
+    Nms(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::NMS) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<NmsImage>();
+    }
+
+    // Forwarded to the image impl (used by the NMS test for count readback).
+    std::shared_ptr<VulkanBuffer> get_count_buffer() const {
+        auto *img = dynamic_cast<NmsImage *>(impl_.get());
+        if (img) {
+            return img->get_count_buffer();
+        }
+        return nullptr;
+    }
 };
 
 } // namespace ops

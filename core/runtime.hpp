@@ -17,6 +17,11 @@ class Runtime {
 #else
     int precision_ = 0; // 0: fp32, 1: fp16
 #endif
+    // When true, ops are built on the SSBO buffer backend (compact
+    // row-major tensors of arbitrary rank) instead of the image backend
+    // (NCHW->RGBA). Each op's PIMPL façade selects its BufferImpl when this
+    // is set (if a buffer port exists) or falls back to its ImageImpl.
+    bool backend_buffer_ = false;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     std::vector<std::vector<size_t>> level_node_indices_;
@@ -74,6 +79,10 @@ class Runtime {
     void setPrecision(int precision) { precision_ = precision; }
 
     int getPrecision() const { return precision_; }
+
+    // Select the buffer (SSBO) backend for subsequently-loaded operators.
+    void set_backend_buffer(bool b) { backend_buffer_ = b; }
+    bool get_backend_buffer() const { return backend_buffer_; }
 
     void RegisterPostProcess(
         ops::OpType ops,

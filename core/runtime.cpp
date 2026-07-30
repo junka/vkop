@@ -256,7 +256,6 @@ void Runtime::LoadModel() {
                 continue;
             }
             const auto &n = *(node_it->second);
-            bool use_ssbo = false;
             auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
             if (type == vkop::ops::OpType::UNKNOWN) {
                 // make it as input for next ops
@@ -341,14 +340,12 @@ void Runtime::LoadModel() {
                 }
             }
             if (type == vkop::ops::OpType::SOFTMAX) {
-                if (node_outputs[0]->num_dims() <= 2) {
-                    use_ssbo = true;
-                    std::cout << "Use SSBO for softmax op with output dims "
-                              << node_outputs[0]->num_dims() << std::endl;
-                }
+                // (Legacy 2-D SSBO auto-path removed — softmax now uses the
+                // buffer backend via backend_buffer_, set elsewhere.)
             }
-            auto op = ops::create_from_type(type, use_ssbo, precision_,
-                                            dev->is_support_nv_tensor_core());
+            auto op = ops::create_from_type(type, precision_,
+                                            dev->is_support_nv_tensor_core(),
+                                            backend_buffer_);
             if (!op) {
                 std::cout << "Fail to create operator" << std::endl;
                 return;
@@ -513,9 +510,8 @@ void Runtime::RegisterPostProcess(
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
-    auto op =
-        ops::create_from_type(ops, outputs[0]->num_dims() <= 2, precision_,
-                              dev->is_support_nv_tensor_core());
+    auto op = ops::create_from_type(
+        ops, precision_, dev->is_support_nv_tensor_core(), backend_buffer_);
     op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);

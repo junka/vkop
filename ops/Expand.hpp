@@ -4,12 +4,13 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char expand_spv[];
-extern unsigned int expand_spv_len;
+extern unsigned char image_expand_spv[];
+extern unsigned int image_expand_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -21,10 +22,10 @@ struct GpuExpandParam {
 };
 } // namespace expand
 
-class Expand : public Operator {
+class ExpandImage : public Operator {
   public:
-    explicit Expand()
-        : Operator(OpType::EXPAND, expand_spv, expand_spv_len,
+    explicit ExpandImage()
+        : Operator(OpType::EXPAND, image_expand_spv, image_expand_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
@@ -87,6 +88,15 @@ class Expand : public Operator {
     }
 
     expand::GpuExpandParam param_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Expand : public PimplFacade {
+  public:
+    Expand(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::EXPAND) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<ExpandImage>();
+    }
 };
 
 } // namespace ops

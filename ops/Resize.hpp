@@ -4,13 +4,14 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 
 #include <climits>
 #include <cmath>
 #include <numeric>
 extern "C" {
-extern unsigned char resize_spv[];
-extern unsigned int resize_spv_len;
+extern unsigned char image_resize_spv[];
+extern unsigned int image_resize_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -47,10 +48,10 @@ enum class KeepAspectRatioPolicy { STRETCH, NOT_LARGER, NOT_SMALLER };
 
 } // namespace resize
 
-class Resize : public Operator {
+class ResizeImage : public Operator {
   public:
-    Resize()
-        : Operator(OpType::RESIZE, resize_spv, resize_spv_len,
+    ResizeImage()
+        : Operator(OpType::RESIZE, image_resize_spv, image_resize_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(resize::GpuResizeParam)) {}
@@ -326,6 +327,15 @@ class Resize : public Operator {
     bool scale_valid_ = false;
     std::vector<float> scales_;
     std::vector<float> roi_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Resize : public PimplFacade {
+  public:
+    Resize(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::RESIZE) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<ResizeImage>();
+    }
 };
 
 } // namespace ops

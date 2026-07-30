@@ -1,0 +1,43 @@
+#version 450 core
+
+// Split SSBO op (fp32). Per-output submit (host binds the input + this
+// output and dispatches UP_DIV(out_total,256)). For each output element,
+// out_nd -> in_nd with in_nd[axis] += split offset, then copy.
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uSplit {
+    int axis;
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    int split;    // offset along axis in the input
+    int _pad0;
+    int _pad1;
+    int _pad2;
+} uSplit;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int rank = uSplit.rank;
+    int out_total = 1;
+    for (int i = 0; i < rank; ++i) out_total *= uSplit.outDims.v[i];
+    if (gid >= out_total) return;
+
+    IArr8 out_coord = linear_to_nd8(gid, uSplit.outDims, rank);
+    IArr8 in_coord;
+    for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
+    in_coord.v[uSplit.axis] += uSplit.split;
+
+    int in_linear = nd_to_linear8(in_coord, uSplit.inDims, rank);
+    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, in_linear)));
+}

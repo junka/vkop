@@ -4,9 +4,10 @@
 
 #include "Operator.hpp"
 #include "ops/Conv2d.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char gemm_spv[];
-extern unsigned int gemm_spv_len;
+extern unsigned char image_gemm_spv[];
+extern unsigned int image_gemm_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -29,10 +30,10 @@ struct alignas(16) GpuGemmParam {
 };
 } // namespace gemm
 
-class Gemm : public Operator {
+class GemmImage : public Operator {
   public:
-    Gemm()
-        : Operator(OpType::GEMM, gemm_spv, gemm_spv_len,
+    GemmImage()
+        : Operator(OpType::GEMM, image_gemm_spv, image_gemm_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(gemm::GpuGemmParam)) {
@@ -171,6 +172,15 @@ class Gemm : public Operator {
     }
 
     gemm::GpuGemmParam para_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Gemm : public PimplFacade {
+  public:
+    Gemm(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::GEMM) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<GemmImage>();
+    }
 };
 
 } // namespace ops

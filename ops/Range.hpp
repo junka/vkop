@@ -4,12 +4,13 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char range_spv[];
-extern unsigned int range_spv_len;
+extern unsigned char image_range_spv[];
+extern unsigned int image_range_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -19,10 +20,10 @@ struct GpuRangeParam {
 };
 } // namespace range
 
-class Range : public Operator {
+class RangeImage : public Operator {
   public:
-    explicit Range()
-        : Operator(OpType::RANGE, range_spv, range_spv_len,
+    explicit RangeImage()
+        : Operator(OpType::RANGE, image_range_spv, image_range_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -84,6 +85,15 @@ class Range : public Operator {
     }
 
     range::GpuRangeParam param_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Range : public PimplFacade {
+  public:
+    Range(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::RANGE) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<RangeImage>();
+    }
 };
 
 } // namespace ops

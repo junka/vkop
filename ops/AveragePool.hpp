@@ -3,9 +3,10 @@
 #define OPS_AVERAGEPOOL_HPP_
 
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char averagepool_spv[];
-extern unsigned int averagepool_spv_len;
+extern unsigned char image_averagepool_spv[];
+extern unsigned int image_averagepool_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -20,10 +21,11 @@ struct alignas(16) GpuAveragePoolParam {
 };
 } // namespace averagepool
 
-class AveragePool : public Operator {
+class AveragePoolImage : public Operator {
   public:
-    AveragePool()
-        : Operator(OpType::AVERAGEPOOL, averagepool_spv, averagepool_spv_len,
+    AveragePoolImage()
+        : Operator(OpType::AVERAGEPOOL, image_averagepool_spv,
+                   image_averagepool_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(averagepool::GpuAveragePoolParam)) {}
@@ -177,6 +179,16 @@ class AveragePool : public Operator {
     int ceil_mode_ = 0;
     int count_include_pad_ = 1;
     int auto_pad_ = 0; // notset
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class AveragePool : public PimplFacade {
+  public:
+    AveragePool(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::AVERAGEPOOL) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<AveragePoolImage>();
+    }
 };
 
 } // namespace ops

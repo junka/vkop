@@ -2,12 +2,13 @@
 #ifndef OPS_GRIDSAMPLE_HPP_
 #define OPS_GRIDSAMPLE_HPP_
 
+#include "ops/PimplFacade.hpp"
 #include <vector>
 
 #include "Operator.hpp"
 extern "C" {
-extern unsigned char gridsample_spv[];
-extern unsigned int gridsample_spv_len;
+extern unsigned char image_gridsample_spv[];
+extern unsigned int image_gridsample_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -27,10 +28,11 @@ struct alignas(32) GpuGridSampleParam {
 };
 } // namespace gridsample
 
-class GridSample : public Operator {
+class GridSampleImage : public Operator {
   public:
-    GridSample()
-        : Operator(OpType::GRIDSAMPLE, gridsample_spv, gridsample_spv_len,
+    GridSampleImage()
+        : Operator(OpType::GRIDSAMPLE, image_gridsample_spv,
+                   image_gridsample_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
@@ -133,6 +135,16 @@ class GridSample : public Operator {
         gridsample::InterpolationMode::BILINEAR;
     gridsample::PaddingMode padding_mode_ = gridsample::PaddingMode::ZEROS;
     bool align_corners_ = false;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class GridSample : public PimplFacade {
+  public:
+    GridSample(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::GRIDSAMPLE) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<GridSampleImage>();
+    }
 };
 
 } // namespace ops

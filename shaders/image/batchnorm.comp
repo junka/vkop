@@ -4,7 +4,7 @@
 #define FLOAT float
 #define FLOAT2 vec2
 
-#include "activation.comp"
+#include "../common/activation.comp"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 

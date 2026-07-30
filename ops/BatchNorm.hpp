@@ -4,11 +4,12 @@
 
 #include "Operator.hpp"
 #include "ops/Conv2d.hpp"
+#include "ops/PimplFacade.hpp"
 
 #include <memory>
 extern "C" {
-extern unsigned char batchnorm_spv[];
-extern unsigned int batchnorm_spv_len;
+extern unsigned char image_batchnorm_spv[];
+extern unsigned int image_batchnorm_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -24,10 +25,11 @@ struct alignas(16) GpuBatchNormParam {
 };
 } // namespace batchnorm
 
-class BatchNorm : public Operator {
+class BatchNormImage : public Operator {
   public:
-    BatchNorm()
-        : Operator(OpType::BATCHNORM, batchnorm_spv, batchnorm_spv_len,
+    BatchNormImage()
+        : Operator(OpType::BATCHNORM, image_batchnorm_spv,
+                   image_batchnorm_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     DESCRIPTOR_TYPE_UNIFORM},
@@ -110,6 +112,16 @@ class BatchNorm : public Operator {
 
     float eps_ = 1e-5;
     conv2d::ActivationMode activation_ = conv2d::ActivationMode::NONE;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class BatchNorm : public PimplFacade {
+  public:
+    BatchNorm(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::BATCHNORM) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<BatchNormImage>();
+    }
 };
 
 } // namespace ops

@@ -3,11 +3,15 @@
 #define OPS_LAYERNORM_HPP_
 
 #include "Operator.hpp"
+#include "ops/BufferBase.hpp"
+#include "ops/PimplFacade.hpp"
 
 #include <memory>
 extern "C" {
-extern unsigned char layernorm_spv[];
-extern unsigned int layernorm_spv_len;
+extern unsigned char image_layernorm_spv[];
+extern unsigned int image_layernorm_spv_len;
+extern unsigned char buffer_layernorm_spv[];
+extern unsigned int buffer_layernorm_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -25,10 +29,11 @@ struct alignas(16) GpuLayerNormParam {
 };
 } // namespace layernorm
 
-class LayerNorm : public Operator {
+class LayerNormImage : public Operator {
   public:
-    LayerNorm()
-        : Operator(OpType::LAYERNORM, layernorm_spv, layernorm_spv_len,
+    LayerNormImage()
+        : Operator(OpType::LAYERNORM, image_layernorm_spv,
+                   image_layernorm_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
@@ -103,6 +108,81 @@ class LayerNorm : public Operator {
 
     float eps_ = 1e-5;
     std::vector<int> normalized_shape_;
+};
+
+// Buffer (SSBO) LayerNorm. Normalizes over the trailing normalized_shape
+// (inner_size elements); weight & bias are SSBOs. fp32-only.
+class LayerNormBuffer : public BufferFactory {
+  public:
+    explicit LayerNormBuffer(int /*fp16*/)
+        : BufferFactory(OpType::LAYERNORM, buffer_layernorm_spv,
+                        buffer_layernorm_spv_len,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                         DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(LayerNormPC)) {}
+
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("eps") != attributes.end()) {
+            eps_ = std::stof(attributes.at("eps"));
+        }
+        if (attributes.find("normalized_shape") != attributes.end()) {
+            normalized_shape_ =
+                parse_attr_list<int>(attributes.at("normalized_shape"));
+        }
+    }
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto shape = inputs[0]->getShape();
+        int total = total_elems(shape);
+        int inner_size = 1;
+        for (int d : normalized_shape_) {
+            inner_size *= d;
+        }
+        int outer_size = total / inner_size;
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(shape);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+        for (size_t i = 1; i <= 2; ++i) {
+            dispatch_by_dtype(inputs[i]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                bind_ssbo<T>(inputs[i], /*is_output=*/false);
+            });
+        }
+
+        LayerNormPC pc{};
+        pc.eps = eps_;
+        pc.inner_size = inner_size;
+        pc.outer_size = outer_size;
+        submit(&pc, outer_size, 1, 1);
+    }
+
+    float eps_ = 1e-5f;
+    std::vector<int> normalized_shape_;
+};
+
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class LayerNorm : public PimplFacade {
+  public:
+    LayerNorm(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::LAYERNORM) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<LayerNormBuffer>(0))
+                               : std::make_unique<LayerNormImage>();
+    }
 };
 
 } // namespace ops

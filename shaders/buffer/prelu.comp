@@ -1,0 +1,79 @@
+#version 450 core
+
+// PReLU SSBO op: f(x) = max(0, x) + slope * min(0, x). Slope is broadcast
+// (right-aligned) against the input/output shape.
+//
+// fp16: one thread per uint word (two elements) — see unary.comp.
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Slope {
+    uint data[];
+} uSlope;
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;   // unused (input shape == output shape)
+    IArr8 in1Dims;   // slope shape (broadcast target)
+    int activation;   // unused (kept for layout parity with BinaryElemPC)
+    int broadcast;    // 1 if slope needs broadcasting
+    int total;
+    int _pad;
+} uPC;
+
+float load_in(int linear) {
+#ifdef FP16
+    return unpackHalf2x16(uInput.data[linear >> 1])[linear & 1];
+#else
+    return uintBitsToFloat(uInput.data[linear]);
+#endif
+}
+
+float load_slope(int linear) {
+    int s = (uPC.broadcast == 0)
+        ? linear
+        : broadcast_index(linear, uPC.outDims, uPC.in1Dims, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(uSlope.data[s >> 1])[s & 1];
+#else
+    return uintBitsToFloat(uSlope.data[s]);
+#endif
+}
+
+float prelu_f(float x, float s) {
+    return max(0.0, x) + s * min(0.0, x);
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = 2 * gid + 1;
+    float r0 = prelu_f(load_in(i0), load_slope(i0));
+    uint w = uint(gid);
+    vec2 p;
+    p.x = r0;
+    if (i1 < uPC.total) {
+        p.y = prelu_f(load_in(i1), load_slope(i1));
+    } else {
+        p.y = 0.0;
+    }
+    uOutput.data[w] = packHalf2x16(p);
+#else
+    if (gid >= uPC.total) return;
+    float x = load_in(gid);
+    float s = load_slope(gid);
+    uOutput.data[gid] = floatBitsToUint(prelu_f(x, s));
+#endif
+}

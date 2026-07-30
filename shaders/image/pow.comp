@@ -3,7 +3,7 @@ precision highp float;
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-#include "broadcast.comp"
+#include "../common/broadcast.comp"
 
 layout(binding = 0) writeonly uniform image2DArray uOutput;
 layout(binding = 1) uniform sampler2DArray inputA;

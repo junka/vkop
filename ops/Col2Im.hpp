@@ -3,9 +3,10 @@
 #define OPS_COL2IM_HPP_
 
 #include "Operator.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char col2im_spv[];
-extern unsigned int col2im_spv_len;
+extern unsigned char image_col2im_spv[];
+extern unsigned int image_col2im_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -20,10 +21,10 @@ struct alignas(16) GpuCol2ImParam {
 
 } // namespace col2im
 
-class Col2Im : public Operator {
+class Col2ImImage : public Operator {
   public:
-    Col2Im()
-        : Operator(OpType::COL2IM, col2im_spv, col2im_spv_len,
+    Col2ImImage()
+        : Operator(OpType::COL2IM, image_col2im_spv, image_col2im_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(col2im::GpuCol2ImParam)) {}
@@ -128,6 +129,15 @@ class Col2Im : public Operator {
     std::vector<int> pads_;
     std::vector<int> image_shape_;
     std::vector<int> block_shape_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Col2Im : public PimplFacade {
+  public:
+    Col2Im(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::COL2IM) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<Col2ImImage>();
+    }
 };
 
 } // namespace ops

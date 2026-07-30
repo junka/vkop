@@ -3,11 +3,15 @@
 #define OPS_SOFTMAX_HPP_
 
 #include "Operator.hpp"
+#include "ops/BufferBase.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char softmax_spv[];
-extern unsigned int softmax_spv_len;
-extern unsigned char softmax2_spv[];
-extern unsigned int softmax2_spv_len;
+extern unsigned char image_softmax_spv[];
+extern unsigned int image_softmax_spv_len;
+extern unsigned char buffer_softmax_spv[];
+extern unsigned int buffer_softmax_spv_len;
+extern unsigned char buffer_softmax_fp16_spv[];
+extern unsigned int buffer_softmax_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -23,25 +27,20 @@ struct GpuSoftMaxParam {
 
 } // namespace softmax
 
-class Softmax : public Operator {
+// Image (image2DArray NCHW->RGBA) implementation. The old softmax2_spv
+// (2-D SSBO auto-path) was folded into the buffer backend's BufferSoftmax
+// façade; the image path is image-only now.
+class SoftmaxImage : public Operator {
   public:
-    Softmax(const Softmax &) = delete;
-    Softmax &operator=(const Softmax &) = delete;
-    Softmax(Softmax &&) = delete;
-    Softmax &operator=(Softmax &&) = delete;
-    explicit Softmax(bool use_ssbo = false)
-        : Operator(
-              OpType::SOFTMAX, use_ssbo ? softmax2_spv : softmax_spv,
-              use_ssbo ? softmax2_spv_len : softmax_spv_len, ([use_ssbo]() {
-                  if (use_ssbo) {
-                      return std::vector<VkDescriptorType>{
-                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
-                  }
-                  return std::vector<VkDescriptorType>{
-                      VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                      VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER};
-              })(),
-              sizeof(softmax::GpuSoftMaxParam)) {
+    SoftmaxImage(const SoftmaxImage &) = delete;
+    SoftmaxImage &operator=(const SoftmaxImage &) = delete;
+    SoftmaxImage(SoftmaxImage &&) = delete;
+    SoftmaxImage &operator=(SoftmaxImage &&) = delete;
+    explicit SoftmaxImage()
+        : Operator(OpType::SOFTMAX, image_softmax_spv, image_softmax_spv_len,
+                   {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+                    VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
+                   sizeof(softmax::GpuSoftMaxParam)) {
         // should be safe to fail to set subgroup size
         required_subgroup_size_ = 32;
     }
@@ -75,24 +74,14 @@ class Softmax : public Operator {
             if (output->size() == 0) {
                 output->resize(inputs[0]->getShape());
             }
-            if (types_[0] == DESCRIPTOR_TYPE_STORAGE) {
-                auto output_buffer = output->as_storage_buffer(m_dev_);
-                objs_.emplace_back(output_buffer);
-            } else {
-                auto output_image = output->as_output_image(m_dev_, m_cmd_);
-                objs_.emplace_back(output_image);
-            }
+            auto output_image = output->as_output_image(m_dev_, m_cmd_);
+            objs_.emplace_back(output_image);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            if (types_[1] == DESCRIPTOR_TYPE_STORAGE) {
-                auto input_buffer = input->as_storage_buffer(m_dev_);
-                objs_.emplace_back(input_buffer);
-            } else {
-                auto input_image = input->as_input_image(m_dev_, m_cmd_);
-                objs_.emplace_back(input_image);
-            }
+            auto input_image = input->as_input_image(m_dev_, m_cmd_);
+            objs_.emplace_back(input_image);
             if (typeid(T) == typeid(float)) {
                 para_.fp16 = 0;
             } else if (typeid(T) == typeid(uint16_t)) {
@@ -116,35 +105,144 @@ class Softmax : public Operator {
             para_.axis = rank + para_.axis;
         }
 
-        if (types_[0] == DESCRIPTOR_TYPE_STORAGE) {
-            if (rank == 1) {
-                para_.outShape[0] = 1;
-                para_.outShape[1] = batch;
-                para_.axis = 1;
-            }
-            if (para_.axis == 1) {
-                submit(&para_, para_.outShape[0], 1, 1);
-            } else {
-                submit(&para_, para_.outShape[1], 1, 1);
-            }
-        } else {
-            if (para_.axis == 0) {
-                submit(&para_, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
-                       UP_DIV(depth, 4));
-            } else if (para_.axis == 1) {
-                submit(&para_, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
-                       batch);
-            } else if (para_.axis == 2) {
-                submit(&para_, UP_DIV(out_width, 16), UP_DIV(batch, 16),
-                       UP_DIV(depth, 4));
-            } else if (para_.axis == 3) {
-                submit(&para_, UP_DIV(out_height, 16), UP_DIV(batch, 16),
-                       UP_DIV(depth, 4));
-            }
+        if (para_.axis == 0) {
+            submit(&para_, UP_DIV(out_width, 16), UP_DIV(out_height, 16),
+                   UP_DIV(depth, 4));
+        } else if (para_.axis == 1) {
+            submit(&para_, UP_DIV(out_width, 16), UP_DIV(realheight, 16),
+                   batch);
+        } else if (para_.axis == 2) {
+            submit(&para_, UP_DIV(out_width, 16), UP_DIV(batch, 16),
+                   UP_DIV(depth, 4));
+        } else if (para_.axis == 3) {
+            submit(&para_, UP_DIV(out_height, 16), UP_DIV(batch, 16),
+                   UP_DIV(depth, 4));
         }
     }
 
     softmax::GpuSoftMaxParam para_;
+};
+
+// Buffer (SSBO) softmax. Reduces over an arbitrary axis (one workgroup per
+// non-axis slice, shared-mem tree reduce). Ships an fp16 dual build.
+//
+// fp32: single dispatch writes results directly to the output SSBO.
+// fp16: two dispatches — (1) reduce + write fp32 results to a scratch SSBO,
+// (2) a pack pass (axis_size==0 marker) packs fp32->packed-half2 into the
+// output, one thread per output word (no cross-workgroup word race, which
+// would otherwise occur when inner_size>1 scatters axis elements across
+// words shared between workgroups).
+class SoftmaxBuffer : public BufferFactory {
+  public:
+    explicit SoftmaxBuffer(int fp16)
+        : BufferFactory(OpType::SOFTMAX,
+                        fp16 ? buffer_softmax_fp16_spv : buffer_softmax_spv,
+                        fp16 ? buffer_softmax_fp16_spv_len
+                             : buffer_softmax_spv_len,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                         DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(SoftmaxPC), fp16) {}
+
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("axis") != attributes.end()) {
+            axis_ = std::stol(attributes.at("axis"));
+        } else if (attributes.find("dim") != attributes.end()) {
+            axis_ = std::stol(attributes.at("dim"));
+        }
+    }
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto shape = inputs[0]->getShape();
+        int rank = static_cast<int>(shape.size());
+        int ax = axis_;
+        if (ax < 0) {
+            ax += rank;
+        }
+        int axis_size = shape[ax];
+        int total = total_elems(shape);
+        // inner_size: product of dims after the axis (stride between
+        // consecutive axis elements of the same slice).
+        int inner_size = 1;
+        for (int i = ax + 1; i < rank; ++i) {
+            inner_size *= shape[i];
+        }
+        // outer_size: number of independent slices = total / axis_size
+        // (one per (outer, inner) position). The shader maps workgroup id
+        // back to (outer, inner) via outer = wg / inner_size,
+        // inner = wg % inner_size.
+        int outer_size = total / axis_size;
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(shape);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        // fp16 needs a scratch fp32 buffer (binding 2) for the decoupled
+        // reduce->pack write; binding 3 is unused by the shader but the
+        // descriptor set declares 4 storage bindings, so bind the dummy
+        // buffer there. fp32 leaves both binding 2/3 unused; bind dummy for
+        // each so the descriptor set is valid.
+        if (fp16_ != 0) {
+            scratch_ = std::make_shared<VulkanBuffer>(
+                m_dev_, static_cast<size_t>(total) * sizeof(float),
+                STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            objs_.emplace_back(scratch_);
+            objs_.emplace_back(dummy_buffer_);
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+            objs_.emplace_back(dummy_buffer_);
+        }
+
+        SoftmaxPC pc{};
+        pc.axis = ax;
+        pc.axis_size = axis_size;
+        pc.outer_size = outer_size;
+        pc.inner_size = inner_size;
+        submit(&pc, outer_size, 1, 1);
+
+        if (fp16_ != 0) {
+            // Memory barrier: the reduce dispatch wrote the scratch fp32
+            // buffer (SSBO writes); the pack dispatch reads it. Without a
+            // barrier the pack may see stale data.
+            scratch_->readBarrier(m_cmd_->get());
+            // Pack pass: axis_size==0 marks pack-only; outer_size carries
+            // the total element count; one thread per output WORD.
+            SoftmaxPC pack_pc{};
+            pack_pc.axis = 0;
+            pack_pc.axis_size = 0;
+            pack_pc.outer_size = total;
+            pack_pc.inner_size = 0;
+            submit(&pack_pc, UP_DIV(total, 512), 1, 1);
+        }
+    }
+
+    int axis_ = 1;
+    std::shared_ptr<VulkanBuffer> scratch_;
+};
+
+// PIMPL façade: buffer SSBO impl (SoftmaxBuffer) when backend_buffer is set,
+// else the image impl. The old use_ssbo 2-D auto-path is gone — buffer mode
+// is selected solely by backend_buffer.
+class Softmax : public PimplFacade {
+  public:
+    Softmax(int fp16, bool backend_buffer) : PimplFacade(OpType::SOFTMAX) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<SoftmaxBuffer>(fp16))
+                               : std::make_unique<SoftmaxImage>();
+    }
 };
 
 } // namespace ops

@@ -61,16 +61,12 @@ class ITensor {
     void set_gpu_row_pad(int pad) { gpu_row_pad_ = pad; }
     int get_gpu_row_pad() const { return gpu_row_pad_; }
     std::vector<int> getShape() {
-        if (dims_[3]) {
-            return std::vector<int>{dims_[0], dims_[1], dims_[2], dims_[3]};
+        std::vector<int> shape;
+        shape.reserve(n_dims_);
+        for (uint8_t i = 0; i < n_dims_; ++i) {
+            shape.push_back(dims_[i]);
         }
-        if (dims_[2]) {
-            return std::vector<int>{dims_[0], dims_[1], dims_[2]};
-        }
-        if (dims_[1]) {
-            return std::vector<int>{dims_[0], dims_[1]};
-        }
-        return std::vector<int>{dims_[0]};
+        return shape;
     }
     std::vector<int> getGPUShape() {
         uint8_t ndim = num_dims();
@@ -205,7 +201,10 @@ class ITensor {
     }
 
   protected:
-    ivec4 dims_;
+    // Logical tensor dims. The image path only ever uses the first 4 slots
+    // (image packing is NCHW/NCW/etc.); the SSBO buffer path may use up to
+    // 8 (push-constant dims[8] convention). 16 slots keep headroom.
+    int dims_[16] = {};
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
     uint8_t n_dims_ = 0;
@@ -236,11 +235,9 @@ template <typename T> class Tensor : public ITensor {
                               std::is_same<U, int8_t>::value ||
                               std::is_same<U, uint8_t>::value>::type>
     explicit Tensor(U n) {
+        memset(dims_, 0, sizeof(dims_));
         n_dims_ = 1;
         dims_[0] = static_cast<int>(n);
-        dims_[1] = 0;
-        dims_[2] = 0;
-        dims_[3] = 0;
         size_ = n * sizeof(T);
     }
 
@@ -283,6 +280,7 @@ template <typename T> class Tensor : public ITensor {
     const std::type_info &dtype() const override { return typeid(T); }
 
     void resize(int n, int c, int h, int w) {
+        memset(dims_, 0, sizeof(dims_));
         dims_[0] = n;
         dims_[1] = c;
         dims_[2] = h;
@@ -303,7 +301,8 @@ template <typename T> class Tensor : public ITensor {
     }
 
     template <typename U> void resize(const std::vector<U> &dims) {
-        int old_dims[4] = {dims_[0], dims_[1], dims_[2], dims_[3]};
+        int old_dims[16];
+        memcpy(old_dims, dims_, sizeof(dims_));
         uint8_t old_n_dims = n_dims_;
 
         memset(dims_, 0, sizeof(dims_));
@@ -324,7 +323,8 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void resize(int len) {
-        int old_dims[4] = {dims_[0], dims_[1], dims_[2], dims_[3]};
+        int old_dims[16];
+        memcpy(old_dims, dims_, sizeof(dims_));
         uint8_t old_n_dims = n_dims_;
 
         if (len == 0) {
@@ -338,6 +338,7 @@ template <typename T> class Tensor : public ITensor {
             size_ = 0;
             memset(dims_, 0, sizeof(dims_));
         } else {
+            memset(dims_, 0, sizeof(dims_));
             n_dims_ = 1;
             size_ = sizeof(T) * len;
             dims_[0] = len;
@@ -1041,7 +1042,7 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    void resize_tensor(uint8_t old_n_dims, int old_dims[4]) {
+    void resize_tensor(uint8_t old_n_dims, int old_dims[16]) {
         auto new_data = std::make_unique<std::vector<T>>(num_elements());
         if (old_n_dims == n_dims_ && old_n_dims > 0) {
             if (n_dims_ == 1) {

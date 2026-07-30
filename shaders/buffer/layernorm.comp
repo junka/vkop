@@ -1,0 +1,68 @@
+#version 450 core
+
+// LayerNorm SSBO op (fp32). Normalizes over the last `inner_size` elements
+// (the normalized shape is the trailing dims). One workgroup per outer slice.
+// Two-pass shared-memory tree reduce (no subgroup ops — those don't reduce
+// reliably on all drivers). Mirrors the image layernorm.comp reduce pattern.
+// Weight/bias are 1-D over the normalized shape (inner_size elements).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Weight {
+    float data[];
+} uWeight;
+layout(set = 0, binding = 3) readonly buffer Bias {
+    float data[];
+} uBias;
+
+layout(push_constant) uniform PC_uLN {
+    float eps;
+    int inner_size;   // number of elements normalized together
+    int outer_size;   // number of independent normalization slices
+} uLN;
+
+shared float s_sum[256];
+shared float s_sumsq[256];
+
+void main() {
+    uint wg = gl_WorkGroupID.x;          // = slice index
+    uint lid = gl_LocalInvocationID.x;
+    if (wg >= uint(uLN.outer_size)) return;
+
+    int base = int(wg) * uLN.inner_size;
+
+    // ---- pass 1: sum, sum_sq ----
+    float lsum = 0.0f, lsq = 0.0f;
+    for (int i = int(lid); i < uLN.inner_size; i += int(gl_WorkGroupSize.x)) {
+        float x = uintBitsToFloat(uInput.data[base + i]);
+        lsum += x;
+        lsq += x * x;
+    }
+    s_sum[lid] = lsum;
+    s_sumsq[lid] = lsq;
+    memoryBarrierShared(); barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_sum[lid] += s_sum[lid + s];
+            s_sumsq[lid] += s_sumsq[lid + s];
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float mean = s_sum[0] / float(uLN.inner_size);
+    float var = max(s_sumsq[0] / float(uLN.inner_size) - mean * mean, 0.0f);
+    float inv_std = inversesqrt(var + uLN.eps);
+
+    // ---- pass 2: write back ----
+    for (int i = int(lid); i < uLN.inner_size; i += int(gl_WorkGroupSize.x)) {
+        float x = uintBitsToFloat(uInput.data[base + i]);
+        float n = (x - mean) * inv_std;
+        uOutput.data[base + i] = floatBitsToUint(n * uWeight.data[i] + uBias.data[i]);
+    }
+}

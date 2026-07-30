@@ -3,6 +3,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -214,7 +215,22 @@ public:
         const std::function<void(std::unique_ptr<ops::Operator> &)> &attribute_func = nullptr)
     {
 
-        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), inputs[0]->num_dims() <= 2, typeid(T) == typeid(uint16_t) ? 1 : 0, dev_->is_support_nv_tensor_core() ? 2 : dev_->is_support_cooperate_matrix() ? 1: 0);
+        // VKOP_BUFFER_BACKEND=1 selects the SSBO buffer backend (compact
+        // row-major tensors of arbitrary rank) instead of the image path.
+        bool use_buffer = [] {
+            const char *env = std::getenv("VKOP_BUFFER_BACKEND");
+            return env && env[0] == '1';
+        }();
+        // Softmax over a 1-D/2-D tensor has no image (image2DArray needs
+        // >=3-D) representation, so it must use the buffer backend even when
+        // VKOP_BUFFER_BACKEND is unset.
+        if (vkop::ops::convert_opstring_to_enum(name_) ==
+                vkop::ops::OpType::SOFTMAX &&
+            inputs[0]->num_dims() <= 2) {
+            use_buffer = true;
+        }
+
+        auto op = ops::create_from_type(vkop::ops::convert_opstring_to_enum(name_), typeid(T) == typeid(uint16_t) ? 1 : 0, dev_->is_support_nv_tensor_core() ? 2 : dev_->is_support_cooperate_matrix() ? 1: 0, use_buffer);
         if (!op) {
             LOG_ERROR("Fail to create operator");
             return false;
@@ -258,7 +274,8 @@ public:
                 t->copyToGPU(cmdpool_);
                 continue;
             }
-            if (op->get_type() == vkop::ops::OpType::GATHER || op->get_type() == vkop::ops::OpType::EXPAND) {
+            if (use_buffer || op->get_type() == vkop::ops::OpType::GATHER || op->get_type() == vkop::ops::OpType::EXPAND) {
+                // Buffer backend: SSBOs support any rank, no RGBA conversion.
                 auto t = core::as_tensor<T>(input);
                 t->as_storage_buffer(dev_);
                 t->copyToGPU(cmdpool_);

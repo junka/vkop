@@ -3,19 +3,45 @@
 #define OPS_TANH_HPP_
 
 #include "UnaryFactory.hpp"
+#include "ops/BufferUnaryFactory.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char tanh_spv[];
-extern unsigned int tanh_spv_len;
+extern unsigned char image_tanh_spv[];
+extern unsigned int image_tanh_spv_len;
+extern unsigned char buffer_tanh_spv[];
+extern unsigned int buffer_tanh_spv_len;
+extern unsigned char buffer_tanh_fp16_spv[];
+extern unsigned int buffer_tanh_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
 
-// element-wise tanh。走 UnaryFactory（与 Erf/Sin/Cos/Neg 同路径），shader 用
-// GLSL 内建 tanh()。主要用于 Qwen3-VL 视觉 block 的 GELU-tanh 近似激活。
-
-class Tanh : public UnaryFactory {
+// Image (image2DArray NCHW->RGBA) implementation.
+class TanhImage : public UnaryFactory {
   public:
-    Tanh() : UnaryFactory(OpType::TANH, tanh_spv, tanh_spv_len) {}
+    TanhImage()
+        : UnaryFactory(OpType::TANH, image_tanh_spv, image_tanh_spv_len) {}
+};
+
+// Buffer (SSBO, compact row-major) implementation.
+class TanhBuffer : public BufferUnaryFactory {
+  public:
+    explicit TanhBuffer(int fp16)
+        : BufferUnaryFactory(
+              OpType::TANH, fp16 ? buffer_tanh_fp16_spv : buffer_tanh_spv,
+              fp16 ? buffer_tanh_fp16_spv_len : buffer_tanh_spv_len, fp16) {}
+};
+
+// PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,
+// else the image impl.
+class Tanh : public PimplFacade {
+  public:
+    Tanh(int fp16, bool backend_buffer) : PimplFacade(OpType::TANH) {
+        impl_ =
+            backend_buffer
+                ? std::unique_ptr<Operator>(std::make_unique<TanhBuffer>(fp16))
+                : std::make_unique<TanhImage>();
+    }
 };
 
 } // namespace ops

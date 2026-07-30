@@ -3,11 +3,16 @@
 #define OPS_SLICE_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
+#include "ops/SliceCalc.hpp"
 #include <numeric>
 extern "C" {
-extern unsigned char slice_spv[];
-extern unsigned int slice_spv_len;
+extern unsigned char image_slice_spv[];
+extern unsigned int image_slice_spv_len;
+extern unsigned char buffer_slice_spv[];
+extern unsigned int buffer_slice_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -25,10 +30,10 @@ struct GpuSliceParam {
 
 } // namespace slice
 
-class Slice : public Operator {
+class SliceImage : public Operator {
   public:
-    explicit Slice()
-        : Operator(OpType::SLICE, slice_spv, slice_spv_len,
+    explicit SliceImage()
+        : Operator(OpType::SLICE, image_slice_spv, image_slice_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(slice::GpuSliceParam)) {}
@@ -39,91 +44,8 @@ class Slice : public Operator {
                          const std::vector<T> &starts,
                          const std::vector<T> &ends, const std::vector<T> &axes,
                          const std::vector<T> &steps) {
-        assert(input_shape.size() >= 3);
-        const int dims = static_cast<int>(input_shape.size());
-        std::vector<std::vector<int>> ret;
-
-        std::vector<T> norm_axes = axes;
-        if (norm_axes.empty()) {
-            for (int i = 0; i < dims; ++i) {
-                norm_axes.push_back(static_cast<T>(i));
-            }
-        }
-
-        for (auto &ax : norm_axes) {
-            if (ax < 0)
-                ax += dims;
-            if (ax < 0 || ax >= dims) {
-                throw std::out_of_range("axis out of range");
-            }
-        }
-        if (starts.size() != norm_axes.size() ||
-            ends.size() != norm_axes.size()) {
-            printf("%zd %zd %zd\n", norm_axes.size(), starts.size(),
-                   ends.size());
-            throw std::invalid_argument("starts/ends length must match axes");
-        }
-
-        std::vector<int> full_starts(dims);
-        std::vector<int> full_ends(dims);
-        std::vector<int> full_steps(dims, 1);
-
-        for (int i = 0; i < dims; ++i) {
-            full_starts[i] = 0;
-            full_ends[i] = input_shape[i];
-        }
-
-        for (size_t i = 0; i < norm_axes.size(); ++i) {
-            auto axis = norm_axes[i];
-            auto dim_size = input_shape[axis];
-
-            int start = static_cast<int>(starts[i]);
-            int end = static_cast<int>(ends[i]);
-            int step = (steps.size() > i) ? static_cast<int>(steps[i]) : 1;
-
-            if (step == 0)
-                step = 1;
-
-            if (start < 0)
-                start += dim_size;
-            if (end < 0)
-                end += dim_size;
-
-            start = std::max(0, std::min(start, dim_size));
-            end = std::max(0, std::min(end, dim_size));
-
-            full_starts[axis] = start;
-            full_ends[axis] = end;
-            full_steps[axis] = step;
-        }
-
-        std::vector<int> output_shape(dims);
-        for (int i = 0; i < dims; ++i) {
-            auto start = full_starts[i];
-            auto end = full_ends[i];
-            auto step = full_steps[i];
-
-            if (step > 0) {
-                if (start >= end) {
-                    output_shape[i] = 0;
-                } else {
-                    output_shape[i] = (end - start + step - 1) / step;
-                }
-            } else {
-                if (start <= end) {
-                    output_shape[i] = 0;
-                } else {
-                    output_shape[i] = (start - end - step - 1) / (-step);
-                }
-            }
-            output_shape[i] = std::max(0, output_shape[i]);
-        }
-        ret.emplace_back(output_shape);
-        ret.emplace_back(full_starts);
-        ret.emplace_back(full_ends);
-        ret.emplace_back(full_steps);
-
-        return ret;
+        return slice_calc::calculate_output_shape<T>(input_shape, starts, ends,
+                                                     axes, steps);
     }
 
   private:
@@ -213,6 +135,78 @@ class Slice : public Operator {
         }
         submit(&param, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
+    }
+};
+// Slice buffer op (fp32). Inputs: data, starts, ends, [axes], [steps].
+class SliceBuffer : public BufferFactory {
+  public:
+    explicit SliceBuffer(int /*fp16*/)
+        : BufferFactory(OpType::SLICE, buffer_slice_spv, buffer_slice_spv_len,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(SlicePC)) {}
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto inshape = inputs[0]->getShape();
+        int rank = static_cast<int>(inshape.size());
+        std::vector<std::vector<int>> out_size =
+            slice_calc::calculate_output_shape<int64_t>(
+                inshape, core::as_tensor<int64_t>(inputs[1])->data(),
+                core::as_tensor<int64_t>(inputs[2])->data(),
+                inputs.size() > 3 ? core::as_tensor<int64_t>(inputs[3])->data()
+                                  : std::vector<int64_t>{},
+                inputs.size() > 4 ? core::as_tensor<int64_t>(inputs[4])->data()
+                                  : std::vector<int64_t>{});
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(out_size[0]);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        SlicePC pc{};
+        pc.rank = rank;
+        for (int i = 0; i < 6; ++i) {
+            pc.inDims[i] = (i < rank) ? inshape[i] : 1;
+            pc.outDims[i] = (i < rank) ? out_size[0][i] : 1;
+            pc.starts[i] = (i < rank) ? out_size[1][i] : 0;
+            pc.ends[i] = (i < rank) ? out_size[2][i] : 1;
+            pc.steps[i] = (i < rank) ? out_size[3][i] : 1;
+        }
+        int total = total_elems(out_size[0]);
+        submit(&pc, UP_DIV(total, 256), 1, 1);
+    }
+};
+
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Slice : public PimplFacade {
+  public:
+    Slice(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::SLICE) {
+        impl_ =
+            backend_buffer
+                ? std::unique_ptr<Operator>(std::make_unique<SliceBuffer>(0))
+                : std::make_unique<SliceImage>();
+    }
+
+    // ONNX slice output-shape helper (used by tests), delegating to the
+    // shared slice_calc free function.
+    template <typename T>
+    static std::vector<std::vector<int>>
+    CalculateOutputShape(const std::vector<int> &input_shape,
+                         const std::vector<T> &starts,
+                         const std::vector<T> &ends, const std::vector<T> &axes,
+                         const std::vector<T> &steps) {
+        return slice_calc::calculate_output_shape<T>(input_shape, starts, ends,
+                                                     axes, steps);
     }
 };
 

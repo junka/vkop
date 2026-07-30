@@ -1,0 +1,146 @@
+#version 450 core
+
+// Softmax SSBO op over an arbitrary axis. One workgroup reduces one
+// non-axis slice along the full axis_size. Shared-memory tree reduce.
+//
+// Built twice:
+//  - base (fp32): the reduce reads/writes uint words directly (one element
+//    per word). Single-pass: reduce then write back to the same SSBO.
+//  - -DFP16 (fp16): packed half2 storage. To avoid cross-workgroup races on
+//    shared words (axis elements scatter across words when inner_size > 1,
+//    so two workgroups can target the same word), the fp16 build runs a
+//    DECOUPLED write: the reduce writes fp32 softmax results to a scratch
+//    fp32 buffer (binding 3), and a SEPARATE contiguous pack pass (this same
+//    shader, dispatched with axis_size=0 as a "pack-only" marker) reads the
+//    scratch fp32 and writes packed half2 to the output — one thread per
+//    output WORD, so no two threads touch the same word.
+//
+// Host (BufferSoftmax) drives the fp16 path as two dispatches of this
+// shader:
+//   1. reduce dispatch (axis_size > 0): reduce + write fp32 to scratch.
+//   2. pack dispatch (axis_size == 0, total in outer_size): pack fp32->fp16.
+// For fp32 (base build), only dispatch 1 runs, writing directly to uOutput.
+
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+// fp16-only scratch: fp32 softmax results before packing (binding 2,
+// leaving binding 3 unused so the host's 4th binding slot can stay the
+// dummy buffer).
+layout(set = 0, binding = 2) buffer Scratch {
+    uint data[];
+} uScratch;
+
+layout(push_constant) uniform PC_uSoft {
+    int axis;       // reduction axis (unused in pack pass)
+    int axis_size;  // 0 => pack-only pass (fp16); >0 => reduce pass
+    int outer_size; // reduce: slice count; pack: total element count
+    int inner_size; // reduce: stride between axis elements
+} uSoft;
+
+shared float s_max[256];
+shared float s_sum[256];
+
+#ifdef FP16
+float load_elem(int idx) {
+    return unpackHalf2x16(uInput.data[idx >> 1])[idx & 1];
+}
+#else
+float load_elem(int idx) { return uintBitsToFloat(uInput.data[idx]); }
+#endif
+
+#ifdef FP16
+// ---- fp16 pack-only pass: one thread per output WORD (two elements). ----
+// Reads fp32 from scratch, writes packed half2 to uOutput. No cross-thread
+// word race because each word has exactly one writer.
+void pack_pass() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int nwords = (uSoft.outer_size + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = e0 + 1;
+    float v0 = uintBitsToFloat(uScratch.data[e0]);
+    float v1 = (e1 < uSoft.outer_size)
+        ? uintBitsToFloat(uScratch.data[e1])
+        : 0.0f;
+    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+}
+#endif
+
+void main() {
+#ifdef FP16
+    if (uSoft.axis_size == 0) {
+        pack_pass();
+        return;
+    }
+#endif
+
+    uint wg = gl_WorkGroupID.x;          // = slice index
+    uint lid = gl_LocalInvocationID.x;
+    if (wg >= uint(uSoft.outer_size)) return;
+
+    // linear layout is row-major over (outer, axis, inner):
+    //   linear = outer * (axis_size * inner_size) + a * inner_size + inner
+    int outer = int(wg) / uSoft.inner_size;
+    int inner = int(wg) % uSoft.inner_size;
+    int slice_base = outer * (uSoft.axis_size * uSoft.inner_size) + inner;
+
+    // ---- pass 1: max ----
+    float localMax = -1e30f;
+    for (int a = int(lid); a < uSoft.axis_size; a += int(gl_WorkGroupSize.x)) {
+        int idx = slice_base + a * uSoft.inner_size;
+        localMax = max(localMax, load_elem(idx));
+    }
+    s_max[lid] = localMax;
+    memoryBarrierShared(); barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_max[lid] = max(s_max[lid], s_max[lid + s]);
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float globalMax = s_max[0];
+
+    // ---- pass 2: sum of exp(x - globalMax) ----
+    float localSum = 0.0f;
+    for (int a = int(lid); a < uSoft.axis_size; a += int(gl_WorkGroupSize.x)) {
+        int idx = slice_base + a * uSoft.inner_size;
+        localSum += exp(load_elem(idx) - globalMax);
+    }
+    s_sum[lid] = localSum;
+    memoryBarrierShared(); barrier();
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_sum[lid] += s_sum[lid + s];
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float globalSum = s_sum[0];
+
+    // ---- write back ----
+    // fp32: write directly to uOutput (one element per word, no race).
+    // fp16: write fp32 softmax to the scratch buffer here; a separate
+    // pack pass (dispatch 2) packs it to half2.
+    for (int a = int(lid); a < uSoft.axis_size; a += int(gl_WorkGroupSize.x)) {
+        int idx = slice_base + a * uSoft.inner_size;
+        float x = load_elem(idx);
+        float r = exp(x - globalMax) / globalSum;
+#ifdef FP16
+        uScratch.data[idx] = floatBitsToUint(r);
+#else
+        uOutput.data[idx] = floatBitsToUint(r);
+#endif
+    }
+}

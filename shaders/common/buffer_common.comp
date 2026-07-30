@@ -1,0 +1,100 @@
+#ifndef BUFFER_COMMON_COMP
+#define BUFFER_COMMON_COMP
+
+// Shared infrastructure for shaders/buffer/*.comp SSBO operators.
+//
+// Buffer ops treat tensors as compact row-major contiguous data of arbitrary
+// rank (NCHW or higher/lower — dense in dim order), as opposed to the image
+// path's NCHW -> RGBA image2DArray packing. Shapes are passed via push
+// constants as `int rank; int dims[8];` (right-aligned: dims[8-rank .. 7]).
+//
+// Built twice: base build is fp32 (one element per uint word); -DFP16 build
+// is fp16 (two elements packed per uint word via packHalf2x16/unpackHalf2x16
+// — same convention as image/gemm.comp and image/gather.comp).
+//
+// fp16 load/store: element `idx` lives in uint word `idx/2`, lane `idx%2`.
+// Each thread owns ONE logical element and reads/writes its word via a
+// read-modify-write of the half2 pair. This is safe only when no two
+// threads target the same output word — i.e. one thread per output element
+// on a contiguous index range (elementwise/reshape). Reduction/structural
+// buffer shaders (softmax, layernorm, reduce, slice, concat, split,
+// transpose) are fp32-only because their gather/scatter patterns can race
+// on the shared half2 word.
+//
+// GLSL forbids bare arrays as function parameters, so dims/coords use a
+// struct (IArr8). Unsized buffer arrays cannot be passed by value, so
+// buf_load/buf_store are macros taking the SSBO member expression.
+
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#define DTYPE   float16_t
+#define DTYPE2  f16vec2
+#define DTYPE4  f16vec4
+#define FLOAT   float16_t
+#define FLOAT2  f16vec2
+#define FLOAT4  f16vec4
+#else
+#define DTYPE   float
+#define DTYPE2  vec2
+#define DTYPE4  vec4
+#define FLOAT   float
+#define FLOAT2  vec2
+#define FLOAT4  vec4
+#endif
+
+// 8-int struct used for dims/coords in push constants and local helpers.
+struct IArr8 { int v[8]; };
+
+#ifdef FP16
+// fp16: element idx is lane (idx&1) of the half2 in word (idx>>1).
+#define BUF_LOAD(data, idx) (unpackHalf2x16((data)[(idx) >> 1])[(idx) & 1])
+#define BUF_STORE(data, idx, v) do { \
+        uint _w = (idx) >> 1; \
+        vec2 _p = unpackHalf2x16((data)[_w]); \
+        _p[(idx) & 1] = float(v); \
+        (data)[_w] = packHalf2x16(_p); \
+    } while (false)
+#else
+#define BUF_LOAD(data, idx)  uintBitsToFloat((data)[(idx)])
+#define BUF_STORE(data, idx, v) (data)[(idx)] = floatBitsToUint(float(v))
+#endif
+
+// ---- nd <-> linear helpers (row-major, right-aligned dims.v[8-rank..7]) ----
+
+int nd_to_linear8(IArr8 coord, IArr8 dims, int rank) {
+    int linear = 0;
+    int stride = 1;
+    for (int i = rank - 1; i >= 0; --i) {
+        linear += coord.v[i] * stride;
+        stride *= dims.v[i];
+    }
+    return linear;
+}
+
+IArr8 linear_to_nd8(int linear, IArr8 dims, int rank) {
+    IArr8 coord;
+    for (int i = 0; i < 8; ++i) coord.v[i] = 0;
+    for (int i = rank - 1; i >= 0; --i) {
+        coord.v[i] = linear % dims.v[i];
+        linear /= dims.v[i];
+    }
+    return coord;
+}
+
+// ---- Broadcasting ----
+// Map an output linear index to an input linear index, applying ONNX-style
+// right-aligned broadcast: for each axis where the input dim is 1, the
+// input coordinate is forced to 0. Both shapes use the same rank (the
+// host right-aligns the input shape to the output rank).
+int broadcast_index(int out_linear, IArr8 out_dims, IArr8 in_dims, int rank) {
+    IArr8 oc = linear_to_nd8(out_linear, out_dims, rank);
+    IArr8 ic;
+    for (int i = 0; i < rank; ++i) {
+        ic.v[i] = (in_dims.v[i] == 1) ? 0 : oc.v[i];
+    }
+    return nd_to_linear8(ic, in_dims, rank);
+}
+
+#endif // BUFFER_COMMON_COMP

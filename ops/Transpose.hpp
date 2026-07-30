@@ -3,10 +3,14 @@
 #define OPS_TRANSPOSE_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char transpose_spv[];
-extern unsigned int transpose_spv_len;
+extern unsigned char image_transpose_spv[];
+extern unsigned int image_transpose_spv_len;
+extern unsigned char buffer_transpose_spv[];
+extern unsigned int buffer_transpose_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -21,10 +25,11 @@ struct GpuTransposeParam {
 
 } // namespace transpose
 
-class Transpose : public Operator {
+class TransposeImage : public Operator {
   public:
-    explicit Transpose()
-        : Operator(OpType::TRANSPOSE, transpose_spv, transpose_spv_len,
+    explicit TransposeImage()
+        : Operator(OpType::TRANSPOSE, image_transpose_spv,
+                   image_transpose_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(transpose::GpuTransposeParam)) {}
@@ -79,6 +84,70 @@ class Transpose : public Operator {
     }
 
     std::vector<int> perm_ = {3, 2, 1, 0};
+};
+// Transpose buffer op (fp32). Arbitrary perm up to 8-D.
+class TransposeBuffer : public BufferFactory {
+  public:
+    explicit TransposeBuffer(int /*fp16*/)
+        : BufferFactory(OpType::TRANSPOSE, buffer_transpose_spv,
+                        buffer_transpose_spv_len,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(TransposePC)) {}
+
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("perm") != attributes.end()) {
+            perm_ = parse_attr_list<int>(attributes.at("perm"));
+        }
+    }
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto inshape = inputs[0]->getShape();
+        int rank = static_cast<int>(inshape.size());
+        std::vector<int> outshape(rank);
+        for (int i = 0; i < rank; ++i) {
+            outshape[i] = inshape[perm_[i]];
+        }
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(outshape);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        TransposePC pc{};
+        pc.rank = rank;
+        fill_dims(pc.inDims, inshape);
+        fill_dims(pc.outDims, outshape);
+        for (int i = 0; i < 8; ++i) {
+            pc.perm[i] = (i < rank) ? perm_[i] : i;
+        }
+        int total = total_elems(outshape);
+        submit(&pc, UP_DIV(total, 256), 1, 1);
+    }
+
+    std::vector<int> perm_ = {3, 2, 1, 0};
+};
+
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Transpose : public PimplFacade {
+  public:
+    Transpose(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::TRANSPOSE) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<TransposeBuffer>(0))
+                               : std::make_unique<TransposeImage>();
+    }
 };
 
 } // namespace ops

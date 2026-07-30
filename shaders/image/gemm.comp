@@ -12,7 +12,7 @@ layout(local_size_x = 16, local_size_y = 16) in;
 #define FLOAT2 vec2
 #define FLOAT4 vec4
 
-#include "activation.comp"
+#include "../common/activation.comp"
 
 layout(set=0, binding = 0) writeonly buffer BufferY {
     uint data[];

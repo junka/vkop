@@ -3,9 +3,10 @@
 #define OPS_MAXPOOL2D_HPP_
 
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char maxpool2d_spv[];
-extern unsigned int maxpool2d_spv_len;
+extern unsigned char image_maxpool2d_spv[];
+extern unsigned int image_maxpool2d_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -21,10 +22,11 @@ struct alignas(16) GpuMaxpoolParam {
 
 } // namespace maxpool2d
 
-class Maxpool2d : public Operator {
+class Maxpool2dImage : public Operator {
   public:
-    Maxpool2d()
-        : Operator(OpType::MAXPOOL2D, maxpool2d_spv, maxpool2d_spv_len,
+    Maxpool2dImage()
+        : Operator(OpType::MAXPOOL2D, image_maxpool2d_spv,
+                   image_maxpool2d_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(maxpool2d::GpuMaxpoolParam)) {
@@ -192,6 +194,16 @@ class Maxpool2d : public Operator {
 
     int storage_order_;
     int ceil_mode_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Maxpool2d : public PimplFacade {
+  public:
+    Maxpool2d(int /*fp16*/, bool backend_buffer)
+        : PimplFacade(OpType::MAXPOOL2D) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<Maxpool2dImage>();
+    }
 };
 
 } // namespace ops

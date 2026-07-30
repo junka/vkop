@@ -2,13 +2,19 @@
 #ifndef OPS_RESHAPE_HPP_
 #define OPS_RESHAPE_HPP_
 
+#include "ops/BufferBase.hpp"
+#include "ops/PimplFacade.hpp"
 #include <numeric>
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
 extern "C" {
-extern unsigned char reshape_spv[];
-extern unsigned int reshape_spv_len;
+extern unsigned char image_reshape_spv[];
+extern unsigned int image_reshape_spv_len;
+extern unsigned char buffer_reshape_spv[];
+extern unsigned int buffer_reshape_spv_len;
+extern unsigned char buffer_reshape_fp16_spv[];
+extern unsigned int buffer_reshape_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -23,10 +29,10 @@ struct GpuReshapeParam {
 
 } // namespace reshape
 
-class Reshape : public Operator {
+class ReshapeImage : public Operator {
   public:
-    explicit Reshape()
-        : Operator(OpType::RESHAPE, reshape_spv, reshape_spv_len,
+    explicit ReshapeImage()
+        : Operator(OpType::RESHAPE, image_reshape_spv, image_reshape_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(reshape::GpuReshapeParam)) {}
@@ -193,6 +199,86 @@ class Reshape : public Operator {
     }
 
     int allowzero_ = 0;
+};
+
+// Buffer (SSBO, compact row-major) reshape. Data is flat row-major so a
+// reshape is a 1:1 copy of `total` contiguous scalars; the shape change is
+// metadata-only. fp16 packs two elements per uint word (one thread/word).
+class ReshapeBuffer : public BufferFactory {
+  public:
+    explicit ReshapeBuffer(int fp16)
+        : BufferFactory(OpType::RESHAPE,
+                        fp16 ? buffer_reshape_fp16_spv : buffer_reshape_spv,
+                        fp16 ? buffer_reshape_fp16_spv_len
+                             : buffer_reshape_spv_len,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(ReshapePC), fp16) {}
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto in_shape = inputs[0]->getShape();
+        auto shape = core::as_tensor<int64_t>(inputs[1]);
+        int n = shape->num_elements();
+        std::vector<int> dim(n);
+        for (int i = 0; i < n; ++i) {
+            dim[i] = static_cast<int>((*shape)[i]);
+        }
+        int total = total_elems(in_shape);
+        // resolve a 0 dim by copying from the input, and -1 from the remainder
+        for (int i = 0; i < n; ++i) {
+            if (dim[i] == 0 && i < static_cast<int>(in_shape.size())) {
+                dim[i] = in_shape[i];
+            }
+        }
+        int known = total;
+        for (int i = 0; i < n; ++i) {
+            if (dim[i] != 0 && dim[i] != -1) {
+                known /= dim[i];
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            if (dim[i] == -1) {
+                dim[i] = known;
+            }
+        }
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(dim);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        // The shape input (inputs[1]) is int64_t and lives on the CPU; the
+        // buffer shader only reads from inputs[0], so the shape tensor does
+        // not need an SSBO binding (the host already consumed it above).
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        ReshapePC pc{};
+        pc.rank_in = static_cast<int>(in_shape.size());
+        fill_dims(pc.inDims, in_shape);
+        pc.rank_out = static_cast<int>(dim.size());
+        fill_dims(pc.outDims, dim);
+        pc.total = total;
+        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+    }
+};
+
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Reshape : public PimplFacade {
+  public:
+    Reshape(int fp16, bool backend_buffer) : PimplFacade(OpType::RESHAPE) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<ReshapeBuffer>(fp16))
+                               : std::make_unique<ReshapeImage>();
+    }
 };
 
 } // namespace ops

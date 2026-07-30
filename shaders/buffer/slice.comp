@@ -1,0 +1,50 @@
+#version 450 core
+
+// Slice SSBO op (fp32). For each output element, map output nd-coords back
+// to input via starts[i] + out[i]*steps[i], bounds-checked, then copy.
+// 6-D cap (push-constant budget). fp32-only (gather pattern would race on
+// a shared half2 word).
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uSlice {
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    IArr8 starts;
+    IArr8 ends;
+    IArr8 steps;
+} uSlice;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int rank = uSlice.rank;
+    int total = 1;
+    for (int i = 0; i < rank; ++i) total *= uSlice.outDims.v[i];
+    if (gid >= total) return;
+
+    IArr8 out_coord = linear_to_nd8(gid, uSlice.outDims, rank);
+
+    IArr8 in_coord;
+    bool ok = true;
+    for (int i = 0; i < rank; ++i) {
+        int c = uSlice.starts.v[i] + out_coord.v[i] * uSlice.steps.v[i];
+        if (c < 0 || c >= uSlice.inDims.v[i]) { ok = false; break; }
+        in_coord.v[i] = c;
+    }
+    if (!ok) {
+        uOutput.data[gid] = 0u;
+        return;
+    }
+    int in_linear = nd_to_linear8(in_coord, uSlice.inDims, rank);
+    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, in_linear)));
+}

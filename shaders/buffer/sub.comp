@@ -1,0 +1,99 @@
+#version 450 core
+
+// Elementwise binary SSBO op: Sub, with ONNX right-aligned broadcasting +
+// optional post-fuse activation. One thread per output element (fp32) or
+// per uint word (fp16 packed half2). Self-contained (no op_code switch).
+
+// activation.comp expects FLOAT/FLOAT4/FLOAT2 to be pre-defined, so it
+// must come AFTER buffer_common.comp (which defines them for both builds).
+#include "../common/buffer_common.comp"
+#include "../common/activation.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InputA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InputB {
+    uint data[];
+} uInputB;
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    int activation;
+    int broadcast;
+    int total;
+    int _pad;
+} uPC;
+
+float bin_op(float a, float b) { return a - b; }
+
+float load_elem(int linear) {
+    if (uPC.broadcast == 0) {
+#ifdef FP16
+        return unpackHalf2x16(uInputA.data[linear >> 1])[linear & 1];
+#else
+        return uintBitsToFloat(uInputA.data[linear]);
+#endif
+    }
+    int ia = broadcast_index(linear, uPC.outDims, uPC.in0Dims, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(uInputA.data[ia >> 1])[ia & 1];
+#else
+    return uintBitsToFloat(uInputA.data[ia]);
+#endif
+}
+
+float load_elem_b(int linear) {
+    int ib = (uPC.broadcast == 0)
+        ? linear
+        : broadcast_index(linear, uPC.outDims, uPC.in1Dims, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(uInputB.data[ib >> 1])[ib & 1];
+#else
+    return uintBitsToFloat(uInputB.data[ib]);
+#endif
+}
+
+void store_elem(int linear, float v) {
+#ifdef FP16
+    uint w = uint(linear) >> 1;
+    vec2 p = unpackHalf2x16(uOutput.data[w]);
+    p[uint(linear) & 1u] = v;
+    uOutput.data[w] = packHalf2x16(p);
+#else
+    uOutput.data[linear] = floatBitsToUint(v);
+#endif
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = 2 * gid + 1;
+    float a0 = load_elem(i0);
+    float b0 = load_elem_b(i0);
+    float r0 = activation(FLOAT(bin_op(a0, b0)), uPC.activation);
+    store_elem(i0, r0);
+    if (i1 < uPC.total) {
+        float a1 = load_elem(i1);
+        float b1 = load_elem_b(i1);
+        float r1 = activation(FLOAT(bin_op(a1, b1)), uPC.activation);
+        store_elem(i1, r1);
+    }
+#else
+    if (gid >= uPC.total) return;
+    float a = load_elem(gid);
+    float b = load_elem_b(gid);
+    float r = activation(FLOAT(bin_op(a, b)), uPC.activation);
+    uOutput.data[gid] = floatBitsToUint(r);
+#endif
+}

@@ -1,0 +1,43 @@
+#version 450 core
+
+// Elementwise unary SSBO op: Neg. One thread per output element (fp32)
+// or per uint word (fp16 packed half2). Self-contained (no op_code switch).
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    int total;
+    int _pad;
+} uPC;
+
+float apply(float x) { return -x; }
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    vec2 p = unpackHalf2x16(uInput.data[gid]);
+    p.x = apply(p.x);
+    if (2 * gid + 1 < uPC.total) {
+        p.y = apply(p.y);
+    }
+    uOutput.data[gid] = packHalf2x16(p);
+#else
+    if (gid >= uPC.total) return;
+    uOutput.data[gid] =
+        floatBitsToUint(apply(uintBitsToFloat(uInput.data[gid])));
+#endif
+}

@@ -1,0 +1,41 @@
+#version 450 core
+
+// Transpose SSBO op (fp32). Arbitrary perm up to 8-D. For each output
+// element, out_nd -> in_nd via in_nd[perm[i]] = out_nd[i], then copy.
+// perm is a permutation of [0..rank-1].
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uTrans {
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    IArr8 perm;
+} uTrans;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int rank = uTrans.rank;
+    int out_total = 1;
+    for (int i = 0; i < rank; ++i) out_total *= uTrans.outDims.v[i];
+    if (gid >= out_total) return;
+
+    IArr8 out_coord = linear_to_nd8(gid, uTrans.outDims, rank);
+
+    IArr8 in_coord;
+    for (int i = 0; i < 8; ++i) in_coord.v[i] = 0;
+    for (int i = 0; i < rank; ++i) {
+        in_coord.v[uTrans.perm.v[i]] = out_coord.v[i];
+    }
+    int in_linear = nd_to_linear8(in_coord, uTrans.inDims, rank);
+    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, in_linear)));
+}

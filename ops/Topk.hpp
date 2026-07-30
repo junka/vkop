@@ -4,13 +4,14 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 #include <cassert>
 #include <memory>
 #include <vector>
 
 extern "C" {
-extern unsigned char topk_spv[];
-extern unsigned int topk_spv_len;
+extern unsigned char image_topk_spv[];
+extern unsigned int image_topk_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -28,10 +29,10 @@ struct alignas(16) GpuTopkParam {
 
 } // namespace topk
 
-class Topk : public Operator {
+class TopkImage : public Operator {
   public:
-    explicit Topk(int fp16 = 0)
-        : Operator(OpType::TOPK, topk_spv, topk_spv_len,
+    explicit TopkImage(int fp16 = 0)
+        : Operator(OpType::TOPK, image_topk_spv, image_topk_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(topk::GpuTopkParam), fp16) {
@@ -54,7 +55,7 @@ class Topk : public Operator {
         tempindex2_ = std::make_unique<core::Tensor<int>>(true);
     }
 
-    ~Topk() override {
+    ~TopkImage() override {
         tempvalue1_.reset();
         tempvalue2_.reset();
     };
@@ -259,6 +260,15 @@ class Topk : public Operator {
     std::shared_ptr<core::ITensor> tempvalue2_;
     std::unique_ptr<core::Tensor<int>> tempindex1_;
     std::unique_ptr<core::Tensor<int>> tempindex2_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Topk : public PimplFacade {
+  public:
+    Topk(int fp16, bool backend_buffer) : PimplFacade(OpType::TOPK) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<TopkImage>(fp16);
+    }
 };
 
 } // namespace ops

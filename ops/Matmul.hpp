@@ -3,13 +3,14 @@
 #define OPS_MATMUL_HPP_
 
 #include "Operator.hpp"
+#include "ops/PimplFacade.hpp"
 extern "C" {
-extern unsigned char matmul_spv[];
-extern unsigned int matmul_spv_len;
-extern unsigned char matmul_nv_spv[];
-extern unsigned int matmul_nv_spv_len;
-extern unsigned char matmul_coop_spv[];
-extern unsigned int matmul_coop_spv_len;
+extern unsigned char image_matmul_spv[];
+extern unsigned int image_matmul_spv_len;
+extern unsigned char image_matmul_nv_spv[];
+extern unsigned int image_matmul_nv_spv_len;
+extern unsigned char image_matmul_coop_spv[];
+extern unsigned int image_matmul_coop_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -30,22 +31,23 @@ struct alignas(16) GpuMatMulParam {
     int fp32;
 };
 } // namespace matmul
-class MatMul : public Operator {
+class MatMulImage : public Operator {
   public:
-    MatMul(const MatMul &) = delete;
-    MatMul &operator=(const MatMul &) = delete;
-    MatMul(MatMul &&) = delete;
-    MatMul &operator=(MatMul &&) = delete;
+    MatMulImage(const MatMulImage &) = delete;
+    MatMulImage &operator=(const MatMulImage &) = delete;
+    MatMulImage(MatMulImage &&) = delete;
+    MatMulImage &operator=(MatMulImage &&) = delete;
 
-    explicit MatMul(int use_tensorcore = 0)
+    explicit MatMulImage(int use_tensorcore = 0)
         : Operator(OpType::MATMUL,
                    use_tensorcore == 2
-                       ? matmul_nv_spv
-                       : (use_tensorcore == 1 ? matmul_coop_spv : matmul_spv),
+                       ? image_matmul_nv_spv
+                       : (use_tensorcore == 1 ? image_matmul_coop_spv
+                                              : image_matmul_spv),
                    use_tensorcore == 2
-                       ? matmul_nv_spv_len
-                       : (use_tensorcore == 1 ? matmul_coop_spv_len
-                                              : matmul_spv_len),
+                       ? image_matmul_nv_spv_len
+                       : (use_tensorcore == 1 ? image_matmul_coop_spv_len
+                                              : image_matmul_spv_len),
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
@@ -110,6 +112,16 @@ class MatMul : public Operator {
 
     matmul::GpuMatMulParam para_;
     matmul::Method method_ = matmul::Method::BASIC_ARITHMETIC;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class MatMul : public PimplFacade {
+  public:
+    MatMul(int use_tensorcore, bool backend_buffer)
+        : PimplFacade(OpType::MATMUL) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<MatMulImage>(use_tensorcore);
+    }
 };
 
 } // namespace ops

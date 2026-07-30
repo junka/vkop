@@ -40,7 +40,7 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     shader_stage_create_info.pSpecializationInfo = nullptr;
 
     // Pin the compute shader's subgroup size when requested. Some shaders
-    // (e.g. softmax2.comp) hard-code numSubgroups = workgroup/subgroupSize and
+    // (e.g. softmax.comp) hard-code numSubgroups = workgroup/subgroupSize and
     // a cross-subgroup reduce that only subgroup 0 drives; if the driver picks
     // a different subgroupSize than assumed, the global max/sum are computed
     // from a subset of partials. Requiring a fixed size makes that assumption

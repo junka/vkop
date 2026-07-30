@@ -88,7 +88,7 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     // Queried so the pipeline can request a fixed requiredSubgroupSize; the
     // Intel ANV driver is free to pick any subgroupSize in [min,max] when it
     // is not pinned, which breaks shaders that hard-assume a specific
-    // numSubgroups (e.g. softmax2.comp).
+    // numSubgroups (e.g. softmax.comp).
     VkPhysicalDeviceSubgroupSizeControlPropertiesEXT ssc_properties = {};
     ssc_properties.sType =
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES_EXT;

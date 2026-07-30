@@ -93,10 +93,10 @@ message(STATUS "Found glslc: ${GLSLC_EXECUTABLE}")
 # Shader compilation
 set(SHADER_DIR ${CMAKE_SOURCE_DIR}/shaders)
 set(SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
-file(GLOB SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
-# Exclude common files from SHADER_FILES
-list(FILTER SHADER_FILES EXCLUDE REGEX "activation\\.comp$")
-list(FILTER SHADER_FILES EXCLUDE REGEX "broadcast\\.comp$")
+file(GLOB_RECURSE SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
+# Exclude shared #include-only headers in shaders/common/ from standalone
+# compilation (they are pulled in by image/ and buffer/ shaders).
+list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
 
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
@@ -105,19 +105,11 @@ option(USE_FP16 "Enable usage of FP16" OFF)
 if(USE_FP16)
     set(SHADER_FLAGS "-DFP16")
 endif()
-# Compile shaders to SPIR-V and convert to header
-foreach(SHADER ${SHADER_FILES})
-    get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
-    set(SPIRV_FILE ${SPIRV_DIR}/${SHADER_NAME}.spv)
-    set(SPIRV_SOURCE_FILE ${SPIRV_DIR}/${SHADER_NAME}.c)
 
-    add_custom_command(
-        OUTPUT ${SPIRV_FILE}
-        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${SHADER_FLAGS}
-        DEPENDS ${SHADER}
-        COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
-    )
-if(WIN32)
+# spv_to_c.py: embeds a SPIR-V blob as `unsigned char <sym_name>_spv[]` +
+# `<sym_name>_spv_len`. Used on all platforms (replaces the xxd+sed path,
+# which derived the symbol from the xxd-of-filepath and could not disambiguate
+# two shaders with the same basename in different folders).
 set(PY_SCRIPT_CONTENT
 "import sys
 import os
@@ -153,45 +145,85 @@ unsigned int {sym_name}_len = {len(data)};
 if __name__ == '__main__':
     main()
 ")
-
-
 set(PY_SCRIPT_FILE "${CMAKE_BINARY_DIR}/spv_to_c.py")
 file(WRITE "${PY_SCRIPT_FILE}" "${PY_SCRIPT_CONTENT}")
-
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
-add_custom_command(
-    OUTPUT ${SPIRV_SOURCE_FILE}
-    COMMAND ${Python3_EXECUTABLE} 
-        ${PY_SCRIPT_FILE}
-        ${SPIRV_FILE}
-        ${SPIRV_SOURCE_FILE}
-        ${SHADER_NAME}
-    DEPENDS 
-        ${SPIRV_FILE}
-        ${PY_SCRIPT_FILE}
-    COMMENT "Embedding SPIR-V shader ${SHADER_NAME} into C header"
-)
-else()
+
+# Compile shaders to SPIR-V and embed as C headers. The embedded symbol is
+# folder-derived: shaders/image/relu.comp -> image_relu_spv,
+# shaders/buffer/unary.comp -> buffer_unary_spv. Both image and buffer
+# shaders get their folder as a prefix, so same-named shaders in different
+# folders never collide.
+foreach(SHADER ${SHADER_FILES})
+    get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
+    file(RELATIVE_PATH SHADER_REL ${SHADER_DIR} ${SHADER})
+    string(REPLACE "/" "_" SYM_BASE "${SHADER_REL}")
+    get_filename_component(SYM_BASE "${SYM_BASE}" NAME_WE)
+    # SPIRV and embed outputs are folder-prefixed so two same-named shaders
+    # in different folders (image/concat vs buffer/concat) don't collide.
+    set(SPIRV_FILE ${SPIRV_DIR}/${SYM_BASE}.spv)
+    set(SPIRV_SOURCE_FILE ${SPIRV_DIR}/${SYM_BASE}.c)
+
+    # Buffer shaders ship their own separate fp16 dual build (DUAL_FP16_SHADERS
+    # below), so the base build here is always the fp32 variant — do NOT pass
+    # -DFP16 to buffer shaders even when USE_FP16 is on (it would make the base
+    # build an fp16 variant, colliding with the op's fp32-vs-fp16 selection).
+    string(FIND "${SHADER_REL}" "buffer/" _is_buffer)
+    if(_is_buffer EQUAL 0)
+        set(_BUF_SHADER_FLAGS "")
+    else()
+        set(_BUF_SHADER_FLAGS "${SHADER_FLAGS}")
+    endif()
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${_BUF_SHADER_FLAGS}
+        DEPENDS ${SHADER}
+        COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
+    )
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE}
-        COMMAND xxd -i ${SPIRV_FILE} | sed "s/[_a-zA-Z0-9]*${SHADER_NAME}/${SHADER_NAME}/g" > ${SPIRV_SOURCE_FILE}
-        DEPENDS ${SPIRV_FILE}
-        COMMENT "Converting ${SPIRV_FILE} to header file"
+        COMMAND ${Python3_EXECUTABLE}
+            ${PY_SCRIPT_FILE}
+            ${SPIRV_FILE}
+            ${SPIRV_SOURCE_FILE}
+            ${SYM_BASE}
+        DEPENDS
+            ${SPIRV_FILE}
+            ${PY_SCRIPT_FILE}
+        COMMENT "Embedding SPIR-V shader ${SYM_BASE} into C header"
     )
-endif()
     set_source_files_properties(${SPIRV_SOURCE_FILE} PROPERTIES LANGUAGE C)
     list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE})
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE})
 endforeach()
 
-# Some shaders keep separate fp32/fp16 SPIR-V builds (no runtime branch in the
-# shader; the operator picks the right one at construction). Each listed shader
-# gets an extra <name>_fp16.spv compiled with -DFP16 and embedded as
-# <name>_fp16_spv. The base (fp32) build above is unaffected.
-set(DUAL_FP16_SHADERS gather)
+# Some shaders keep separate fp32/fp16 SPIR-V builds (no runtime branch in
+# the shader; the operator picks the right one at construction). Each entry is
+# a path relative to SHADER_DIR (e.g. image/gather, buffer/unary). The fp16
+# build is compiled with -DFP16 and embedded as <folder>_<name>_fp16_spv
+# (folder-derived, same as the base build).
+#
+# fp16 buffer storage packs two half values per uint word, so the fp16 path
+# must use a word-per-thread store pattern to avoid read-modify-write races.
+# Only the contiguous elementwise + reshape buffer shaders are fp16-ready in
+# this pass; structural (slice/concat/split/transpose) and reduction
+# (softmax/layernorm/reduce) buffer shaders ship fp32-only for now.
+set(DUAL_FP16_SHADERS
+    image/gather
+    buffer/sigmoid
+    buffer/tanh
+    buffer/atan
+    buffer/softplus
+    buffer/add
+    buffer/sub
+    buffer/prelu
+    buffer/reshape
+    buffer/softmax
+)
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
-    set(SPIRV_FILE_FP16 ${SPIRV_DIR}/${DUAL_NAME}_fp16.spv)
-    set(SPIRV_SOURCE_FILE_FP16 ${SPIRV_DIR}/${DUAL_NAME}_fp16.c)
+    string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")
+    set(SPIRV_FILE_FP16 ${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
+    set(SPIRV_SOURCE_FILE_FP16 ${SPIRV_DIR}/${DUAL_BASE}_fp16.c)
     add_custom_command(
         OUTPUT ${SPIRV_FILE_FP16}
         COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${DUAL_NAME}.comp
@@ -200,21 +232,18 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
         DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp
         COMMENT "Compiling ${DUAL_NAME} (fp16) to SPIR-V"
     )
-    if(WIN32)
-        add_custom_command(
-            OUTPUT ${SPIRV_SOURCE_FILE_FP16}
-            COMMAND ${_SPV_TO_C_CMD} ${SPIRV_FILE_FP16} ${SPIRV_SOURCE_FILE_FP16} ${DUAL_NAME}_fp16
-            DEPENDS ${SPIRV_FILE_FP16} ${PY_SCRIPT_FILE}
-            COMMENT "Embedding fp16 SPIR-V shader ${DUAL_NAME} into C header"
-        )
-    else()
-        add_custom_command(
-            OUTPUT ${SPIRV_SOURCE_FILE_FP16}
-            COMMAND xxd -i ${SPIRV_FILE_FP16} | sed "s/[_a-zA-Z0-9]*${DUAL_NAME}_fp16/${DUAL_NAME}_fp16/g" > ${SPIRV_SOURCE_FILE_FP16}
-            DEPENDS ${SPIRV_FILE_FP16}
-            COMMENT "Converting ${SPIRV_FILE_FP16} to header file"
-        )
-    endif()
+    add_custom_command(
+        OUTPUT ${SPIRV_SOURCE_FILE_FP16}
+        COMMAND ${Python3_EXECUTABLE}
+            ${PY_SCRIPT_FILE}
+            ${SPIRV_FILE_FP16}
+            ${SPIRV_SOURCE_FILE_FP16}
+            ${DUAL_BASE}_fp16
+        DEPENDS
+            ${SPIRV_FILE_FP16}
+            ${PY_SCRIPT_FILE}
+        COMMENT "Embedding fp16 SPIR-V shader ${DUAL_BASE}_fp16 into C header"
+    )
     set_source_files_properties(${SPIRV_SOURCE_FILE_FP16} PROPERTIES LANGUAGE C)
     list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_FP16})
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_FP16})

@@ -4,13 +4,14 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include "ops/PimplFacade.hpp"
 #include <numeric>
 
 extern "C" {
-extern unsigned char gather_spv[];
-extern unsigned int gather_spv_len;
-extern unsigned char gather_fp16_spv[];
-extern unsigned int gather_fp16_spv_len;
+extern unsigned char image_gather_spv[];
+extern unsigned int image_gather_spv_len;
+extern unsigned char image_gather_fp16_spv[];
+extern unsigned int image_gather_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -28,14 +29,15 @@ struct GpuGatherParam {
 
 } // namespace gather
 
-class Gather : public Operator {
+class GatherImage : public Operator {
   public:
-    // fp16 picks the fp16 storage-buffer SPIR-V variant (gather_fp16_spv),
-    // which uses float16_t elements instead of float. Two separate SPIR-V
-    // builds avoid a runtime branch in the shader.
-    explicit Gather(int fp16 = 0)
-        : Operator(OpType::GATHER, fp16 ? gather_fp16_spv : gather_spv,
-                   fp16 ? gather_fp16_spv_len : gather_spv_len,
+    // fp16 picks the fp16 storage-buffer SPIR-V variant
+    // (image_gather_fp16_spv), which uses float16_t elements instead of float.
+    // Two separate SPIR-V builds avoid a runtime branch in the shader.
+    explicit GatherImage(int fp16 = 0)
+        : Operator(OpType::GATHER,
+                   fp16 ? image_gather_fp16_spv : image_gather_spv,
+                   fp16 ? image_gather_fp16_spv_len : image_gather_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
@@ -141,6 +143,15 @@ class Gather : public Operator {
     }
 
     gather::GpuGatherParam param_;
+};
+// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
+class Gather : public PimplFacade {
+  public:
+    Gather(int fp16, bool backend_buffer) : PimplFacade(OpType::GATHER) {
+        (void)backend_buffer;
+        // buffer port not yet available; using image impl.
+        impl_ = std::make_unique<GatherImage>(fp16);
+    }
 };
 
 } // namespace ops

@@ -1,0 +1,47 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// Concat SSBO op (fp32). Per-input submit (host binds this input + the
+// output and dispatches UP_DIV(in_total,256)). For each input element,
+// map its nd-coords and copy to out_nd with out_nd[axis] += offset.
+//
+// Push constant shapes are flat int arrays (not a struct) — the image-path
+// shaders use the same convention and it avoids GLSL/struct-in-PC quirks.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uConcat {
+    int axis;
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    int offset;
+    int _pad0;
+    int _pad1;
+    int _pad2;
+} uConcat;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int rank = uConcat.rank;
+    int in_total = 1;
+    for (int i = 0; i < rank; ++i) in_total *= uConcat.inDims.v[i];
+    if (gid >= in_total) return;
+
+    IArr8 in_coord = linear_to_nd8(gid, uConcat.inDims, rank);
+    IArr8 out_coord;
+    for (int i = 0; i < 8; ++i) out_coord.v[i] = in_coord.v[i];
+    out_coord.v[uConcat.axis] += uConcat.offset;
+
+    int out_linear = nd_to_linear8(out_coord, uConcat.outDims, rank);
+    uOutput.data[out_linear] = floatBitsToUint(float(BUF_LOAD(uInput.data, gid)));
+}
