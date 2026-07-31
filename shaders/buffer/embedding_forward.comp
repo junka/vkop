@@ -1,0 +1,85 @@
+#version 450 core
+
+// Embedding forward lookup (SSBO, fp32). Port of cuEmbed's forward path.
+// One thread per output element: dispatch (ceil(batch,16), ceil(ew,16), 1).
+//
+// Modes (combine_mode push constant):
+//   0 = sum   : out[b, k] = sum_j embed[idx[b*hot+j], k] (* weight[j])
+//   1 = mean  : out[b, k] = sum / hotness
+//   2 = concat: out[(base+j), k] = embed[idx[base+j], k]  (no reduce, no weight)
+//
+// CSR (is_csr=1): base=offsets[b], hotness=offsets[b+1]-offsets[b].
+// Fixed (is_csr=0): base=b*num_hots, hotness=num_hots.
+// Weighted (is_weighted=1, sum/mean only): multiply each gathered row by
+// weights[base+j].
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Embed {
+    uint data[];
+} uEmbed;
+layout(set = 0, binding = 2) readonly buffer Idx {
+    int data[];
+} uIndices;
+layout(set = 0, binding = 3) readonly buffer Off {
+    int data[];
+} uOffsets;
+layout(set = 0, binding = 4) readonly buffer Wt {
+    uint data[];
+} uWeights;
+
+layout(push_constant) uniform PC {
+    int embed_width;
+    int batch_size;
+    int num_hots;      // fixed hotness; 0 if CSR
+    int combine_mode;  // 0=sum, 1=mean, 2=concat
+    int is_csr;        // 1=CSR, 0=fixed
+    int is_weighted;   // 1=weighted, 0=unweighted
+    int _pad0;
+    int _pad1;
+} uPC;
+
+void main() {
+    int b = int(gl_GlobalInvocationID.x);  // batch sample
+    int k = int(gl_GlobalInvocationID.y);  // embed dim
+    if (b >= uPC.batch_size || k >= uPC.embed_width)
+        return;
+
+    int base;
+    int hotness;
+    if (uPC.is_csr != 0) {
+        base = uOffsets.data[b];
+        hotness = uOffsets.data[b + 1] - base;
+    } else {
+        base = b * uPC.num_hots;
+        hotness = uPC.num_hots;
+    }
+
+    float sum = 0.0;
+    for (int j = 0; j < hotness; ++j) {
+        int row = uIndices.data[base + j];
+        float v = uintBitsToFloat(uEmbed.data[row * uPC.embed_width + k]);
+        if (uPC.combine_mode == 2) {
+            // concat: write each row to its slot (no reduce, no weight)
+            int out_idx = (base + j) * uPC.embed_width + k;
+            uOutput.data[out_idx] = floatBitsToUint(v);
+        } else {
+            if (uPC.is_weighted != 0) {
+                float w = uintBitsToFloat(uWeights.data[base + j]);
+                sum += v * w;
+            } else {
+                sum += v;
+            }
+        }
+    }
+
+    if (uPC.combine_mode == 0) {
+        uOutput.data[b * uPC.embed_width + k] = floatBitsToUint(sum);
+    } else if (uPC.combine_mode == 1) {
+        float r = (hotness > 0) ? sum / float(hotness) : 0.0;
+        uOutput.data[b * uPC.embed_width + k] = floatBitsToUint(r);
+    }
+}

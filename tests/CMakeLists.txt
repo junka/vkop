@@ -64,6 +64,7 @@ set(TEST_SOURCES
     ExpandTest.cpp
     TanhTest.cpp
     BufferBackendTest.cpp
+    EmbeddingForwardTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

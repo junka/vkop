@@ -44,6 +44,7 @@
 #include "Range.hpp"
 
 #include "Cos.hpp"
+#include "EmbeddingForward.hpp"
 #include "Neg.hpp"
 #include "Sin.hpp"
 #include "Sqrt.hpp"
@@ -79,6 +80,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Conv2d>(fp16, backend_buffer);
     case OpType::DIV:
         return std::make_unique<Div>(fp16, backend_buffer);
+    case OpType::EMBEDDING_FORWARD:
+        return std::make_unique<EmbeddingForward>(fp16, backend_buffer);
     case OpType::ERF:
         return std::make_unique<Erf>(fp16, backend_buffer);
     case OpType::FLOOR:
