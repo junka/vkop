@@ -22,6 +22,76 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm|ARM")
 else()
     message(WARNING "FP16 not supported on this architecture")
 endif()
+
+# ---- GCC + macOS libc++ ABI bridge -------------------------------------------
+# PyTorch's macOS wheels are built against Apple's libc++ (std::__1 namespace).
+# Homebrew GCC links against libstdc++ (std:: namespace), producing an ABI
+# mismatch when objects compiled with GCC are linked against libtorch.
+# Force GCC to use libc++ headers + libc++ runtime so all code shares the
+# same C++ ABI as libtorch.
+#
+# Additionally, GCC's standalone -mf16c flag requires a matching -march and
+# fails with "target specific option mismatch" when combined with the
+# libc++ bridge.  Replace it with -march=native which implicitly enables
+# FP16 on modern CPUs.
+# -----------------------------------------------------------------------------
+if(APPLE AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang"
+          AND NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    execute_process(
+        COMMAND ${CMAKE_CXX_COMPILER} -dumpfullversion -dumpversion
+        OUTPUT_VARIABLE GCC_VERSION
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    message(STATUS "GCC detected on macOS (version ${GCC_VERSION})")
+
+    if(GCC_VERSION VERSION_GREATER_EQUAL 15)
+        message(FATAL_ERROR
+            "GCC ${GCC_VERSION} + Apple libc++ is not supported because GCC 15 "
+            "rejects the built-in traits (__decay, __add_pointer, ...) that "
+            "modern Apple libc++ headers use in function signatures.\n"
+            "\n"
+            "Please choose one of these options:\n"
+            "  1. Install GCC 14:    `brew install gcc@14` and rebuild with\n"
+            "                        -DCMAKE_CXX_COMPILER=/usr/local/bin/g++-14\n"
+            "  2. Use Apple clang:   -DCMAKE_CXX_COMPILER=/usr/bin/clang++\n"
+            "  3. Use GCC 13 or older: -DCMAKE_CXX_COMPILER=/usr/local/bin/g++-13"
+        )
+    endif()
+
+    execute_process(
+        COMMAND xcrun --sdk macosx --show-sdk-path
+        OUTPUT_VARIABLE APPLE_SDK_ROOT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+    if(NOT APPLE_SDK_ROOT)
+        set(APPLE_SDK_ROOT "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
+    endif()
+
+    set(LIBCXX_INCLUDE_DIR       "${APPLE_SDK_ROOT}/usr/include/c++/v1")
+    set(LIBCXX_SYSTEM_INCLUDE_DIR "${APPLE_SDK_ROOT}/usr/include")
+    set(LIBCXX_LIB_DIR           "${APPLE_SDK_ROOT}/usr/lib")
+
+    message(STATUS "Bridging to Apple libc++ ABI (GCC ${GCC_VERSION})")
+    message(STATUS "  libc++ headers: ${LIBCXX_INCLUDE_DIR}")
+    message(STATUS "  libc++ lib dir: ${LIBCXX_LIB_DIR}")
+
+    # Use CMAKE_CXX_FLAGS (not add_compile_options) so these flags only
+    # apply to C++ files, not to C files (shaders/*.c).
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -nostdinc++ -isystem ${LIBCXX_INCLUDE_DIR} -isystem ${LIBCXX_SYSTEM_INCLUDE_DIR}")
+    add_link_options(
+        "SHELL:-nostdlib++"
+        "SHELL:-L${LIBCXX_LIB_DIR}"
+        "SHELL:-lc++"
+    )
+
+    # GCC's standalone -mf16c requires a matching -march.  Replace with
+    # -march=native which implicitly enables FP16 support on modern CPUs.
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+        set(FP16_CXX_FLAGS "-march=native")
+    endif()
+endif()
 if(MSVC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast")
 else()
