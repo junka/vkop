@@ -42,6 +42,14 @@ class VulkanBuffer : public VulkanResource {
     void writeBarrier(VkCommandBuffer commandBuffer,
                       VkDeviceSize size = VK_WHOLE_SIZE,
                       VkDeviceSize offset = 0);
+    // Proper shader-write -> shader-read barrier. Unlike
+    // writeBarrier+readBarrier (which rely on m_access_ tracking that doesn't
+    // capture shader writes), this explicitly sets srcAccess=SHADER_WRITE to
+    // flush prior compute-shader writes before a subsequent compute-shader
+    // read.
+    void shaderWriteBarrier(VkCommandBuffer commandBuffer,
+                            VkDeviceSize size = VK_WHOLE_SIZE,
+                            VkDeviceSize offset = 0);
 
     void copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
                                  VkBuffer dstbuffer, VkDeviceSize dstoffset,

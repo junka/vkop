@@ -176,9 +176,10 @@ class GemmImage : public Operator {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Gemm : public PimplFacade {
   public:
-    Gemm(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::GEMM) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
+    Gemm(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::GEMM) {
+        /* backend_buffer unused: already SSBO */
+        // Already an SSBO impl (descriptor + tensor + shader all use storage
+        // buffers); no image path exists for this op.
         impl_ = std::make_unique<GemmImage>();
     }
 };

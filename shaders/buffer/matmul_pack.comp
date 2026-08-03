@@ -1,0 +1,33 @@
+#version 450 core
+
+// MatMul SSBO pack pass (fp16 only). Reads fp32 results from scratch,
+// packs as half2, writes to output. One thread per output WORD.
+// Separate shader to avoid Intel ANV push-constant interference between
+// reduce and pack dispatches of the same pipeline.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 3) readonly buffer Scratch {
+    uint data[];
+} uScratch;
+
+layout(push_constant) uniform PC {
+    int total; // total output element count
+    int _pad0;
+    int _pad1;
+    int _pad2;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = e0 + 1;
+    float v0 = uintBitsToFloat(uScratch.data[e0]);
+    float v1 = (e1 < uPC.total) ? uintBitsToFloat(uScratch.data[e1]) : 0.0;
+    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+}

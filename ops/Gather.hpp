@@ -147,9 +147,10 @@ class GatherImage : public Operator {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Gather : public PimplFacade {
   public:
-    Gather(int fp16, bool backend_buffer) : PimplFacade(OpType::GATHER) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
+    Gather(int fp16, bool /*backend_buffer*/) : PimplFacade(OpType::GATHER) {
+        /* backend_buffer unused: already SSBO */
+        // Already an SSBO impl (descriptor + tensor + shader all use storage
+        // buffers); no image path exists for this op.
         impl_ = std::make_unique<GatherImage>(fp16);
     }
 };

@@ -95,7 +95,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::LAYERNORM:
         return std::make_unique<LayerNorm>(fp16, backend_buffer);
     case OpType::MATMUL:
-        return std::make_unique<MatMul>(use_tensorcore, backend_buffer);
+        return std::make_unique<MatMul>(use_tensorcore, fp16, backend_buffer);
     case OpType::MAXPOOL2D:
         return std::make_unique<Maxpool2d>(fp16, backend_buffer);
     case OpType::MUL:

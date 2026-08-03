@@ -289,6 +289,7 @@ set(DUAL_FP16_SHADERS
     buffer/prelu
     buffer/reshape
     buffer/softmax
+    buffer/matmul
 )
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")

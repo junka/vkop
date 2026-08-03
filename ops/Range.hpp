@@ -89,9 +89,10 @@ class RangeImage : public Operator {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Range : public PimplFacade {
   public:
-    Range(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::RANGE) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
+    Range(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::RANGE) {
+        /* backend_buffer unused: already SSBO */
+        // Already an SSBO impl (descriptor + tensor + shader all use storage
+        // buffers); no image path exists for this op.
         impl_ = std::make_unique<RangeImage>();
     }
 };

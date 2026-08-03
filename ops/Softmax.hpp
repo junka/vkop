@@ -211,21 +211,29 @@ class SoftmaxBuffer : public BufferFactory {
         pc.axis_size = axis_size;
         pc.outer_size = outer_size;
         pc.inner_size = inner_size;
-        submit(&pc, outer_size, 1, 1);
 
         if (fp16_ != 0) {
-            // Memory barrier: the reduce dispatch wrote the scratch fp32
-            // buffer (SSBO writes); the pack dispatch reads it. Without a
-            // barrier the pack may see stale data.
-            scratch_->readBarrier(m_cmd_->get());
+            // fp16 2-pass: use separate descriptor sets to avoid Intel ANV's
+            // immediate-descriptor-update interference between passes.
+            VkDescriptorSet reduce_ds = allocPassDescriptorSet();
+            submit_per_ds(reduce_ds, &pc, outer_size, 1, 1);
+
+            // Barrier: flush reduce's scratch writes for pack's reads.
+
             // Pack pass: axis_size==0 marks pack-only; outer_size carries
             // the total element count; one thread per output WORD.
+            scratch_->shaderWriteBarrier(m_cmd_->get());
             SoftmaxPC pack_pc{};
             pack_pc.axis = 0;
             pack_pc.axis_size = 0;
             pack_pc.outer_size = total;
             pack_pc.inner_size = 0;
-            submit(&pack_pc, UP_DIV(total, 512), 1, 1);
+            VkDescriptorSet pack_ds = allocPassDescriptorSet();
+            submit_per_ds(pack_ds, &pack_pc, UP_DIV(total, 512), 1, 1);
+            freePassDescriptorSet(reduce_ds);
+            freePassDescriptorSet(pack_ds);
+        } else {
+            submit(&pc, outer_size, 1, 1);
         }
     }
 

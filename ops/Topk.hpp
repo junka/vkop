@@ -264,9 +264,10 @@ class TopkImage : public Operator {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Topk : public PimplFacade {
   public:
-    Topk(int fp16, bool backend_buffer) : PimplFacade(OpType::TOPK) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
+    Topk(int fp16, bool /*backend_buffer*/) : PimplFacade(OpType::TOPK) {
+        /* backend_buffer unused: already SSBO */
+        // Already an SSBO impl (descriptor + tensor + shader all use storage
+        // buffers); no image path exists for this op.
         impl_ = std::make_unique<TopkImage>(fp16);
     }
 };

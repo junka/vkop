@@ -65,9 +65,10 @@ class WhereImage : public Operator {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Where : public PimplFacade {
   public:
-    Where(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::WHERE) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
+    Where(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::WHERE) {
+        /* backend_buffer unused: already SSBO */
+        // Already an SSBO impl (descriptor + tensor + shader all use storage
+        // buffers); no image path exists for this op.
         impl_ = std::make_unique<WhereImage>();
     }
 };
