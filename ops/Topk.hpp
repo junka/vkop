@@ -4,14 +4,13 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-#include "ops/PimplFacade.hpp"
 #include <cassert>
 #include <memory>
 #include <vector>
 
 extern "C" {
-extern unsigned char image_topk_spv[];
-extern unsigned int image_topk_spv_len;
+extern unsigned char buffer_topk_spv[];
+extern unsigned int buffer_topk_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -26,13 +25,14 @@ struct alignas(16) GpuTopkParam {
     int init;
     int fp16;
 };
-
 } // namespace topk
 
-class TopkImage : public Operator {
+// SSBO-only op: multi-pass bitonic TopK. Uses per-pass descriptor sets to
+// avoid Intel ANV descriptor-update interference.
+class Topk : public Operator {
   public:
-    explicit TopkImage(int fp16 = 0)
-        : Operator(OpType::TOPK, image_topk_spv, image_topk_spv_len,
+    explicit Topk(int fp16 = 0)
+        : Operator(OpType::TOPK, buffer_topk_spv, buffer_topk_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(topk::GpuTopkParam), fp16) {
@@ -55,7 +55,7 @@ class TopkImage : public Operator {
         tempindex2_ = std::make_unique<core::Tensor<int>>(true);
     }
 
-    ~TopkImage() override {
+    ~Topk() override {
         tempvalue1_.reset();
         tempvalue2_.reset();
     };
@@ -102,11 +102,6 @@ class TopkImage : public Operator {
         int axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
         assert(axis <= 2 && axis >= 0);
         assert(para_.k < 256);
-        // fp16 packed writes (packHalf2x16) need an even out_base, so k is
-        // rounded up to even. The shader then lays out output rows with the
-        // bumped k as stride, while the output tensor keeps the original k.
-        // row_pad records the extra trailing element(s) per row so that
-        // copyToCPU can compact the rows back to the logical k.
         int original_k = para_.k;
         if (fp16_ == 1 && para_.k % 2 != 0) {
             para_.k = UP_DIV(para_.k, 2) * 2;
@@ -185,10 +180,6 @@ class TopkImage : public Operator {
         objs_.emplace_back(input_index_cur);
         objs_.emplace_back(input_value_cur);
 
-        // Each pass must use its own descriptor set. vkUpdateDescriptorSets
-        // modifies the set immediately, so all dispatches referencing the same
-        // set see the LAST update's bindings — earlier passes would read
-        // wrong buffers on drivers like Intel ANV.
         if (round > 16) {
             std::cerr << "too many rounds" << std::endl;
             assert(0);
@@ -199,7 +190,6 @@ class TopkImage : public Operator {
         }
 
         for (int i = 0; i < round; i++) {
-            // output
             if (i == round - 1) {
                 objs_[0] = (output_index);
                 objs_[1] = (output_value);
@@ -243,12 +233,6 @@ class TopkImage : public Operator {
             freePassDescriptorSet(pass_ds[i]);
         }
 
-        // Mark outputs whose GPU buffer carries per-row padding so the host
-        // readback compacts rows back to the logical k. The fp16 odd-k path
-        // bumps k to even, and the shader lays out output rows with the
-        // bumped k as the stride along the last dim. copyBufferToCPU's
-        // compact path assumes the padded dim is the last (cols) dim, so this
-        // only applies to axis==1 (2D, k along cols) — the tested layout.
         if (row_pad > 0 && axis == 1) {
             outputs[0]->set_gpu_row_pad(row_pad);
             outputs[1]->set_gpu_row_pad(row_pad);
@@ -260,16 +244,6 @@ class TopkImage : public Operator {
     std::shared_ptr<core::ITensor> tempvalue2_;
     std::unique_ptr<core::Tensor<int>> tempindex1_;
     std::unique_ptr<core::Tensor<int>> tempindex2_;
-};
-// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
-class Topk : public PimplFacade {
-  public:
-    Topk(int fp16, bool /*backend_buffer*/) : PimplFacade(OpType::TOPK) {
-        /* backend_buffer unused: already SSBO */
-        // Already an SSBO impl (descriptor + tensor + shader all use storage
-        // buffers); no image path exists for this op.
-        impl_ = std::make_unique<TopkImage>(fp16);
-    }
 };
 
 } // namespace ops

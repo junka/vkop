@@ -4,22 +4,22 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char image_where_spv[];
-extern unsigned int image_where_spv_len;
+extern unsigned char buffer_where_spv[];
+extern unsigned int buffer_where_spv_len;
 }
 namespace vkop {
 namespace ops {
-namespace where {} // namespace where
 
-class WhereImage : public Operator {
+// SSBO-only op: no image path. Selects elements from X or Y based on a
+// boolean condition buffer.
+class Where : public Operator {
   public:
-    explicit WhereImage()
-        : Operator(OpType::WHERE, image_where_spv, image_where_spv_len,
+    explicit Where()
+        : Operator(OpType::WHERE, buffer_where_spv, buffer_where_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -33,7 +33,6 @@ class WhereImage : public Operator {
 
         std::vector<int> out_shape = outputs[0]->getShape();
         if (out_shape.empty()) {
-            // all tensor contains scalar value
             auto inshape = inputs[0]->getShape();
             out_shape = inshape;
         }
@@ -60,16 +59,6 @@ class WhereImage : public Operator {
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
         submit(nullptr, UP_DIV(total_size, 256), 1, 1);
-    }
-};
-// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
-class Where : public PimplFacade {
-  public:
-    Where(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::WHERE) {
-        /* backend_buffer unused: already SSBO */
-        // Already an SSBO impl (descriptor + tensor + shader all use storage
-        // buffers); no image path exists for this op.
-        impl_ = std::make_unique<WhereImage>();
     }
 };
 

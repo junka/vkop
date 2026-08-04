@@ -4,26 +4,27 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char image_range_spv[];
-extern unsigned int image_range_spv_len;
+extern unsigned char buffer_range_spv[];
+extern unsigned int buffer_range_spv_len;
 }
 namespace vkop {
 namespace ops {
+
 namespace range {
 struct GpuRangeParam {
     bool fp16;
 };
 } // namespace range
 
-class RangeImage : public Operator {
+// SSBO-only op: generates a 1-D sequence [start, start+delta, ...].
+class Range : public Operator {
   public:
-    explicit RangeImage()
-        : Operator(OpType::RANGE, image_range_spv, image_range_spv_len,
+    explicit Range()
+        : Operator(OpType::RANGE, buffer_range_spv, buffer_range_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -39,7 +40,6 @@ class RangeImage : public Operator {
 
         std::vector<int> out_shape = outputs[0]->getShape();
         if (out_shape.empty()) {
-            // all tensor contains scalar value
             dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto input0 = core::as_tensor<T>(inputs[0]);
@@ -85,16 +85,6 @@ class RangeImage : public Operator {
     }
 
     range::GpuRangeParam param_;
-};
-// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
-class Range : public PimplFacade {
-  public:
-    Range(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::RANGE) {
-        /* backend_buffer unused: already SSBO */
-        // Already an SSBO impl (descriptor + tensor + shader all use storage
-        // buffers); no image path exists for this op.
-        impl_ = std::make_unique<RangeImage>();
-    }
 };
 
 } // namespace ops

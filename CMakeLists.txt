@@ -269,7 +269,7 @@ endforeach()
 
 # Some shaders keep separate fp32/fp16 SPIR-V builds (no runtime branch in
 # the shader; the operator picks the right one at construction). Each entry is
-# a path relative to SHADER_DIR (e.g. image/gather, buffer/unary). The fp16
+# a path relative to SHADER_DIR (e.g. buffer/gather, buffer/unary). The fp16
 # build is compiled with -DFP16 and embedded as <folder>_<name>_fp16_spv
 # (folder-derived, same as the base build).
 #
@@ -279,7 +279,7 @@ endforeach()
 # this pass; structural (slice/concat/split/transpose) and reduction
 # (softmax/layernorm/reduce) buffer shaders ship fp32-only for now.
 set(DUAL_FP16_SHADERS
-    image/gather
+    buffer/gather
     buffer/sigmoid
     buffer/tanh
     buffer/atan

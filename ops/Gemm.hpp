@@ -2,12 +2,13 @@
 #ifndef OPS_GEMM_HPP_
 #define OPS_GEMM_HPP_
 
-#include "Operator.hpp"
 #include "ops/Conv2d.hpp"
-#include "ops/PimplFacade.hpp"
+#include "ops/Operator.hpp"
+#include <numeric>
+
 extern "C" {
-extern unsigned char image_gemm_spv[];
-extern unsigned int image_gemm_spv_len;
+extern unsigned char buffer_gemm_spv[];
+extern unsigned int buffer_gemm_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -30,14 +31,15 @@ struct alignas(16) GpuGemmParam {
 };
 } // namespace gemm
 
-class GemmImage : public Operator {
+// SSBO-only op: Y = alpha * A' * B' + beta * C with optional fused
+// activation. Supports per-tensor fp16/fp32 mixing.
+class Gemm : public Operator {
   public:
-    GemmImage()
-        : Operator(OpType::GEMM, image_gemm_spv, image_gemm_spv_len,
+    Gemm()
+        : Operator(OpType::GEMM, buffer_gemm_spv, buffer_gemm_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(gemm::GpuGemmParam)) {
-
         para_.alpha = 1.0F;
         para_.beta = 1.0F;
         para_.transA = 0;
@@ -172,16 +174,6 @@ class GemmImage : public Operator {
     }
 
     gemm::GpuGemmParam para_;
-};
-// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
-class Gemm : public PimplFacade {
-  public:
-    Gemm(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::GEMM) {
-        /* backend_buffer unused: already SSBO */
-        // Already an SSBO impl (descriptor + tensor + shader all use storage
-        // buffers); no image path exists for this op.
-        impl_ = std::make_unique<GemmImage>();
-    }
 };
 
 } // namespace ops

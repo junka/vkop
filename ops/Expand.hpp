@@ -4,16 +4,16 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-#include "ops/PimplFacade.hpp"
 #include <cmath>
 #include <numeric>
 
 extern "C" {
-extern unsigned char image_expand_spv[];
-extern unsigned int image_expand_spv_len;
+extern unsigned char buffer_expand_spv[];
+extern unsigned int buffer_expand_spv_len;
 }
 namespace vkop {
 namespace ops {
+
 namespace expand {
 struct GpuExpandParam {
     ivec4 inshape;
@@ -22,10 +22,11 @@ struct GpuExpandParam {
 };
 } // namespace expand
 
-class ExpandImage : public Operator {
+// SSBO-only op: broadcasts input to the given output shape.
+class Expand : public Operator {
   public:
-    explicit ExpandImage()
-        : Operator(OpType::EXPAND, image_expand_spv, image_expand_spv_len,
+    explicit Expand()
+        : Operator(OpType::EXPAND, buffer_expand_spv, buffer_expand_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
@@ -88,17 +89,6 @@ class ExpandImage : public Operator {
     }
 
     expand::GpuExpandParam param_;
-};
-// PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
-class Expand : public PimplFacade {
-  public:
-    Expand(int /*fp16*/, bool /*backend_buffer*/)
-        : PimplFacade(OpType::EXPAND) {
-        /* backend_buffer unused: already SSBO */
-        // Already an SSBO impl (descriptor + tensor + shader all use storage
-        // buffers); no image path exists for this op.
-        impl_ = std::make_unique<ExpandImage>();
-    }
 };
 
 } // namespace ops

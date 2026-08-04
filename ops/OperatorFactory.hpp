@@ -87,7 +87,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::FLOOR:
         return std::make_unique<Floor>(fp16, backend_buffer);
     case OpType::GEMM:
-        return std::make_unique<Gemm>(fp16, backend_buffer);
+        return std::make_unique<Gemm>();
     case OpType::GLOBALAVERAGEPOOL:
         return std::make_unique<GlobalAveragePool>(fp16, backend_buffer);
     case OpType::GRIDSAMPLE:
@@ -123,7 +123,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::SUB:
         return std::make_unique<Sub>(fp16, backend_buffer);
     case OpType::TOPK:
-        return std::make_unique<Topk>(fp16, backend_buffer);
+        return std::make_unique<Topk>(fp16);
     case OpType::TRANSPOSE:
         return std::make_unique<Transpose>(fp16, backend_buffer);
     case OpType::SOFTMAX:
@@ -131,11 +131,11 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::NMS:
         return std::make_unique<Nms>(fp16, backend_buffer);
     case OpType::GATHER:
-        return std::make_unique<Gather>(fp16, backend_buffer);
+        return std::make_unique<Gather>(fp16);
     case OpType::RANGE:
-        return std::make_unique<Range>(fp16, backend_buffer);
+        return std::make_unique<Range>();
     case OpType::EXPAND:
-        return std::make_unique<Expand>(fp16, backend_buffer);
+        return std::make_unique<Expand>();
     case OpType::SIN:
         return std::make_unique<Sin>(fp16, backend_buffer);
     case OpType::COS:
@@ -145,7 +145,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::SQRT:
         return std::make_unique<Sqrt>(fp16, backend_buffer);
     case OpType::WHERE:
-        return std::make_unique<Where>(fp16, backend_buffer);
+        return std::make_unique<Where>();
     case OpType::TANH:
         return std::make_unique<Tanh>(fp16, backend_buffer);
     default:
