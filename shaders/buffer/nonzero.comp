@@ -1,0 +1,50 @@
+#version 450 core
+
+// NonZero SSBO op: finds the linear indices of all non-zero elements in
+// the input, writes them to an output buffer. Output shape is dynamic
+// (depends on the number of non-zero elements), so the host must allocate
+// a max-size output buffer and read back the count.
+//
+// Two-pass approach (avoids atomics for the index count):
+//   Pass 1 (count): count non-zero elements, write count to a scratch
+//     uint (binding 2, offset 0).
+//   Pass 2 (write): use the count to compact indices into the output.
+// The host dispatches pass 1, reads back the count, then dispatches
+// pass 2 with the known count.
+//
+// BUT: for simplicity and since this is a rare op (1 use in the LLM graph),
+// we use a SINGLE-PASS approach with atomicAdd to build the output
+// compactly. Each thread checks its element; if non-zero, it atomically
+// increments a counter and writes its index to the output at that position.
+//
+// Input: 1-D flat buffer of uint (float data as uintBitsToFloat).
+// Output: uint indices, prefixed with the count at index 0.
+//   output[0] = count
+//   output[1..count] = linear indices of non-zero elements
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} uOutput;   // [0] = count, [1..count] = indices
+layout(set = 0, binding = 1) readonly buffer In {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC {
+    int total;  // total input elements
+    int _pad0;
+    int _pad1;
+    int _pad2;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) return;
+
+    float val = uintBitsToFloat(uInput.data[gid]);
+    if (val != 0.0) {
+        uint slot = atomicAdd(uOutput.data[0], 1);
+        uOutput.data[slot + 1] = uint(gid);
+    }
+}

@@ -52,6 +52,9 @@ enum class OpType {
     WHERE,
     TANH,
     EMBEDDING_FORWARD,
+    EQUAL,
+    NONZERO,
+    SCATTER_ELEMENTS,
     TOTAL_NUM
 };
 
@@ -100,6 +103,9 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Where",             // WHERE = 40
         "Tanh",              // TANH = 41
         "EmbeddingForward",  // EMBEDDING_FORWARD = 42
+        "Equal",             // EQUAL = 43
+        "NonZero",           // NONZERO = 44
+        "ScatterElements",   // SCATTER_ELEMENTS = 45
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -192,6 +198,12 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::TANH;
     if (name == "EmbeddingForward")
         return vkop::ops::OpType::EMBEDDING_FORWARD;
+    if (name == "Equal")
+        return vkop::ops::OpType::EQUAL;
+    if (name == "NonZero")
+        return vkop::ops::OpType::NONZERO;
+    if (name == "ScatterElements")
+        return vkop::ops::OpType::SCATTER_ELEMENTS;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

@@ -1,0 +1,58 @@
+#version 450 core
+
+// ScatterElements SSBO op (fp32). Scatters updates into data along axis=0.
+// Supports 'none' (overwrite) and 'add' (atomic CAS float add) reduction.
+//
+// For axis=0: data is [rows, cols], indices is [n_idx], updates is [n_idx, cols].
+// Each thread handles one (idx_slot, col) pair:
+//   data[indices[idx_slot] * cols + col] <op>= updates[idx_slot * cols + col]
+//
+// Dispatch: n_idx * cols threads.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Data {
+    uint data[];
+} uData;
+layout(set = 0, binding = 1) readonly buffer Indices {
+    int data[];
+} uIndices;
+layout(set = 0, binding = 2) readonly buffer Updates {
+    uint data[];
+} uUpdates;
+
+layout(push_constant) uniform PC {
+    int n_threads; // n_idx * cols
+    int cols;      // row width (data_shape[1] * data_shape[2] * ...)
+    int reduction; // 0 = none (overwrite), 1 = add
+    int _pad;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.n_threads) return;
+
+    int idx_slot = gid / uPC.cols;  // which index/update row
+    int col = gid % uPC.cols;       // which column within the row
+
+    int row = uIndices.data[idx_slot];
+    int target = row * uPC.cols + col;
+
+    float update = uintBitsToFloat(uUpdates.data[gid]);
+
+    if (uPC.reduction == 1) {
+        // CAS loop for float atomic add.
+        uint old = uData.data[target];
+        uint expected;
+        for (;;) {
+            expected = old;
+            float new_val = uintBitsToFloat(expected) + update;
+            uint new_bits = floatBitsToUint(new_val);
+            uint result = atomicCompSwap(uData.data[target], expected, new_bits);
+            if (result == expected) break;
+            old = result;
+        }
+    } else {
+        uData.data[target] = floatBitsToUint(update);
+    }
+}

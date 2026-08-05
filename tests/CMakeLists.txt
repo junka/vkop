@@ -70,6 +70,9 @@ set(TEST_SOURCES
     TanhTest.cpp
     BufferBackendTest.cpp
     EmbeddingForwardTest.cpp
+    EqualTest.cpp
+    NonZeroTest.cpp
+    ScatterElementsTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

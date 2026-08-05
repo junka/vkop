@@ -619,7 +619,7 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void reserveOnCPU() {
-        if (!data_) {
+        if (!data_ || data_->empty()) {
             data_ = std::make_unique<std::vector<T>>(num_elements());
         }
         toCPU();
