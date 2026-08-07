@@ -57,7 +57,13 @@ class ConstantFolder:
         """收集所有已知常量值：initializer + Constant 节点。返回 {name: ndarray}。"""
         const = {}
         for init in model.graph.initializer:
-            const[init.name] = numpy_helper.to_array(init)
+            try:
+                const[init.name] = numpy_helper.to_array(init)
+            except Exception:
+                # 大权重（>1MB）在 fold() 里剥离了 raw_data 以绕开 proto 2GB
+                # 上限，无法 to_array；它们只喂 MatMul/Softmax 等不可折叠算子，
+                # 跳过即可。
+                pass
         for n in model.graph.node:
             if n.op_type == "Constant":
                 for a in n.attribute:
@@ -213,12 +219,23 @@ class ConstantFolder:
         existing = {i.name for i in model.graph.initializer}
         if name in existing:
             return
+        if array.size * array.itemsize > (1 << 20):
+            # 折叠产物 >1MB 不固化为 initializer：对 >2GB 模型会触发 proto
+            # 序列化上限；直接给依赖它的下游算子当「已知常量」缓存即可。
+            return
         model.graph.initializer.append(
             numpy_helper.from_array(array, name=name))
 
     @staticmethod
     def fold(model, max_rounds: int = 25, verbose: bool = True):
         """迭代常量折叠，直到不动点或 max_rounds。原地修改 model。"""
+        # 1a. 剥离 initializer 的 raw_data：对大模型（>2GB proto 上限）shape
+        #     inference 内部会 SerializeToString 整个 model 而失败。形状推断只
+        #     需要形状/类型信息，权重字节无用，剥离后模型缩小到几 MB。
+        for init in model.graph.initializer:
+            if init.raw_data:
+                init.raw_data = b""
+
         # 1. 形状推断（data propagation），给 Shape/ConstantOfShape 填 dim_value。
         try:
             model = shape_inference.infer_shapes(model, data_prop=True)
@@ -262,13 +279,19 @@ class ConstantFolder:
                 break
 
         # 折叠后清死代码：删悬空节点 + 无用 initializer（eliminate_deadend 等）。
+        # 只在模型能通过 proto 序列化（小模型）时跑；大模型直接跳过。
         try:
-            model = optimizer.optimize(model, [
-                "eliminate_deadend", "eliminate_unused_initializer",
-                "eliminate_identity"])
-            model = shape_inference.infer_shapes(model)
+            model.SerializeToString()
         except Exception:
-            pass
+            pass  # >2GB 模型无法序列化，跳过 onnxoptimizer 死代码清除
+        else:
+            try:
+                model = optimizer.optimize(model, [
+                    "eliminate_deadend", "eliminate_unused_initializer",
+                    "eliminate_identity"])
+                model = shape_inference.infer_shapes(model)
+            except Exception:
+                pass
 
         if verbose:
             print(f"[ConstantFolder] folded {total_folded} nodes "
@@ -330,16 +353,36 @@ class ONNXOptimizer:
                     fixed_shape.append(1)
             input_shapes[name] = fixed_shape
 
-        optimized_model = optimizer.optimize(onnx_model, passes)
+        optimized_model = None
+        try:
+            optimized_model = optimizer.optimize(onnx_model, passes)
+        except Exception as e:
+            # Large models (>2GB serialized proto, e.g. llm.onnx) cannot pass
+            # through onnxoptimizer's C++ backend which serializes the model.
+            # Fall back to ConstantFolder-only (pure numpy, no serialization).
+            print(f"[optimize] onnxoptimizer skipped ({e}); using ConstantFolder only")
+            optimized_model = onnx_model
 
         # 常量折叠：内置 ConstantFolder（纯 numpy，无外部依赖）。
         # 把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather/
         # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
+        # fold() 内部会剥离 initializer 的 raw_data 以绕开 proto 2GB 上限，
+        # 这里在折叠后按名字把权重字节还原，保证返回的 model 权重完整可用。
+        raw_map = {init.name: init.raw_data for init in onnx_model.graph.initializer}
         optimized_model = ConstantFolder.fold(optimized_model, verbose=True)
+        for init in optimized_model.graph.initializer:
+            if init.name in raw_map and raw_map[init.name]:
+                init.raw_data = raw_map[init.name]
 
         # 若装了 onnxsim，再跑一遍作为增强（兜底 ConstantFolder 未覆盖的算子，
         # 如更复杂的 data-dependent 折叠）。失败则忽略——ConstantFolder 已覆盖主路径。
         if _onnxsim_simplify is not None:
+            # onnxsim 同样会在内部序列化整个 model（>2GB 直接崩），先剥离权重
+            # 字节（形状信息足够它做折叠），跑完再按名字还原。
+            stripped = {init.name: init.raw_data for init in optimized_model.graph.initializer}
+            for init in optimized_model.graph.initializer:
+                if init.raw_data:
+                    init.raw_data = b""
             try:
                 simplified, check = _onnxsim_simplify(
                     optimized_model, overwrite_input_shapes=input_shapes)
@@ -348,6 +391,9 @@ class ONNXOptimizer:
                     print("[optimize] onnxsim enhancement OK")
             except Exception:
                 pass  # ConstantFolder 已是主路径，onnxsim 失败不影响
+            for init in optimized_model.graph.initializer:
+                if init.name in stripped and stripped[init.name]:
+                    init.raw_data = stripped[init.name]
 
         return optimized_model
 
@@ -685,6 +731,15 @@ class FusionOptimizer:
                 FusionOptimizer.match_attention,
                 FusionOptimizer.fold_attention,
                 priority=75,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "prune_and_materialize",
+                FusionOptimizer.match_prune_and_materialize,
+                FusionOptimizer.fold_prune_and_materialize,
+                priority=0,
             )
         )
 
@@ -2401,6 +2456,20 @@ class FusionOptimizer:
 
         print(f"Fused Attention pattern with Q:{q_node.name}, K:{k_node.name}, V:{v_node.name}")
         return True
+
+    @staticmethod
+    def match_prune_and_materialize(dag_model):
+        """DCE + 常量物化的占位匹配器：单次执行（见 fold），返回单元素列表。"""
+        if getattr(dag_model, "_prune_materialize_done", False):
+            return []
+        return [{"node": None}]
+
+    @staticmethod
+    def fold_prune_and_materialize(dag_model, match) -> bool:
+        """把剪枝与物化委托给 DAG 自身；无脏活可做时返回 False（终止多轮循环）。"""
+        before = len(dag_model.nodes)
+        dag_model.prune_dead_and_materialize_constants()
+        return len(dag_model.nodes) != before
 
 
 class InitializerMerger:

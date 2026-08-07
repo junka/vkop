@@ -113,10 +113,29 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
     }
 
     // initializer blob — zero-copy view straight into the mmap'd FlatBuffer.
+    // For very large models the Python writer appends the blob as "external
+    // data" after the FlatBuffer and stores its start offset in the last 8
+    // bytes of the file (LE uint64); the FlatBuffer's own blob field is then
+    // empty. Detect that trailer and point initializer_memory at the external
+    // region instead.
+    const uint8_t* blob_mem = nullptr;
+    size_t blob_size = 0;
     const auto* blob = model->initializer_blob();
     if (blob) {
-        this->initializer_memory = blob->Data();
-        this->initializer_memory_size = blob->size();
+        blob_mem = blob->Data();
+        blob_size = blob->size();
+    }
+    if ((blob_mem == nullptr || blob_size == 0) && size >= 8) {
+        uint64_t external_offset = 0;
+        std::memcpy(&external_offset, buf + size - 8, sizeof(uint64_t));
+        if (external_offset > 0 && external_offset + 8 <= size) {
+            blob_mem = buf + external_offset;
+            blob_size = size - 8 - external_offset;
+        }
+    }
+    if (blob_mem) {
+        this->initializer_memory = blob_mem;
+        this->initializer_memory_size = blob_size;
     } else {
         this->initializer_memory = nullptr;
         this->initializer_memory_size = 0;
@@ -243,6 +262,11 @@ std::string VkModel::attrValueToString(const vkop::model::Attribute* attr) {
                 }
             }
             value += "]";
+            // 常量折叠把大/向量常量固化成 Tensor 属性；很多节点（如
+            // Constant -> Mul/Add 的 2048/6144 维 bias 向量）只需把这
+            // 段字节搬到 CPU 端临时张量即可，不必落到 initializer blob。
+            // 这里不保留 tensor 数据本身——当前 runtime 只消费标量字符串
+            // 属性；真正的 TensorData 由后续的 Constant-op 运行时处理。
             return value;
         }
         default:

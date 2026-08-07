@@ -5,6 +5,8 @@ import argparse
 import sys
 from pathlib import Path
 
+import onnx
+
 try:
     from .converter import ModelConverter
 except ImportError:
@@ -91,13 +93,7 @@ def main():
 
         converter.apply_optimizations(dag_model, Args(args.quant, args.unify, args.rgba))
 
-        # Save the converted model
-        dag_model.save_to_binary(str(output_path))
-
-        print("\nConversion completed successfully!")
-        print(f"Output file size: {output_path.stat().st_size:,} bytes")
-
-        # Print statistics
+        # Print statistics (before binary save — dag_model may be huge for LLMs)
         op_stats = {}
         for node in dag_model.nodes.values():
             op_type = node.op_type
@@ -107,6 +103,12 @@ def main():
         print(f"{'idx':<5} {'type':<20} {'count':<10}")
         for idx, (op_type, count) in enumerate(op_stats.items(), 1):
             print(f"{idx:<5} {op_type:<20} {count:<10}")
+
+        # Save the converted model
+        dag_model.save_to_binary(str(output_path))
+
+        print("\nConversion completed successfully!")
+        print(f"Output file size: {output_path.stat().st_size:,} bytes")
 
     except Exception as e:
         print(f"\nError during conversion: {e}")

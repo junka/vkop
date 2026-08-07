@@ -7,6 +7,14 @@ import numpy as np
 import flatbuffers
 from onnx import numpy_helper
 
+# FlatBuffers 的 Builder 最大 2GB（内部用 32-bit offset 寻址）。LLM 权重达
+# 数 GB 时无法把 initializer_blob 塞进 FlatBuffer 向量，改为把 blob 以「外部
+# 数据」形式追加在文件末尾：vkopbin = FlatBuffer(root) || external_blob，
+# 文件尾部固定 8 字节 LE uint64 记录 external_blob 的起始偏移（为 0 表示没有
+# external region，兼容旧文件）。C++ 加载器照常 mmap 整个文件后按该偏移定位
+# blob。schema 无需改动（外部区域对 FlatBuffer 完全透明）。
+_EXTERNAL_BLOB_MAGIC = 8  # 8 字节 offset 尾巴
+
 from .generated.vkop.model import (
     Attribute,
     ConcurrentLevel,
@@ -148,6 +156,85 @@ class DAGBasedModel:
 
         return levels
 
+    def prune_dead_and_materialize_constants(self):
+        """写盘前清理运行时图（幂等，重复调用安全）。
+
+        两件事：
+          1. 后向 liveness 剪枝：从 graph outputs 出发，把到不了输出端的节点
+             整棵删掉（大模型跳过 onnxoptimizer 死代码清除时的悬空 Constant，
+             以及 ConvertToDAG 阶段才暴露的 Identity 等）。
+          2. 物化活着的 Constant：凡带 value 张量属性的 Constant 节点，值整体
+             搬进 initializers（C++ 加载器原生支持 int64/int32/fp32/fp16/int8），
+             删节点。这样 runtime 端只需实现 Shape/Unsqueeze/Cast/Squeeze/
+             ScatterND，不必实现 Constant/Identity。标量统一 np.atleast_1d 升到
+             1 维——0 维初始器在 C++ 端 Tensor<T> 里 size_=0，数据会丢。
+
+        剪枝只删 PRUNEABLE 节点：Constant/Identity/Shape/Unsqueeze/Squeeze/Cast/
+        ScatterND 全是 runtime 不支持或不必要的元算子；真正有副作用的
+        （Conv/MatMul/输出）一律不碰，避免误删数据依赖。
+        """
+        if not getattr(self, "_prune_materialize_done", False):
+            self._prune_dead_and_materialize_constants_impl()
+            self._prune_materialize_done = True
+
+    def _prune_dead_and_materialize_constants_impl(self):
+        pruneable = {
+            "Constant", "Identity", "Shape", "Unsqueeze", "Squeeze",
+            "Cast", "ScatterND",
+        }
+        nodes = list(self.nodes.values())
+        tensor_producer = {}
+        for n in nodes:
+            for out in n.outputs:
+                tensor_producer[out["name"]] = n
+
+        # 1) 后向 liveness：graph outputs 及 initializer 名视为 live 种子。
+        seed = set()
+        seed.update(o["name"] for o in self.outputs)
+        seed.update(self.initializers.keys())
+        live_tensors = set()  # tensor name
+        live_nodes = set()    # node name
+        stack = list(seed)
+        while stack:
+            tname = stack.pop()
+            if tname in live_tensors:
+                continue
+            live_tensors.add(tname)
+            n = tensor_producer.get(tname)
+            if n is None or n.name in live_nodes:
+                continue
+            live_nodes.add(n.name)
+            for inp in n.inputs:
+                stack.append(inp["name"])
+
+        dead_nodes = []
+        live_constants = []
+        for n in nodes:
+            if n.name in live_nodes:
+                if n.op_type == "Constant":
+                    live_constants.append(n)
+                continue
+            if n.op_type in pruneable:
+                dead_nodes.append(n)
+
+        # 2) 物化活着的 Constant：值搬进 initializers，删节点。
+        for n in live_constants:
+            value = n.attributes.get("value")
+            if not isinstance(value, np.ndarray):
+                continue  # value_float/value_int 等标量属性：无数据可物化
+            name = n.outputs[0]["name"]
+            arr = np.atleast_1d(np.ascontiguousarray(value))
+            self.initializers[name] = numpy_helper.from_array(arr, name)
+            self.nodes.pop(n.name, None)
+
+        for n in dead_nodes:
+            self.nodes.pop(n.name, None)
+
+        if dead_nodes or live_constants:
+            print(f"[prune+materialize] removed {len(dead_nodes)} dead nodes, "
+                  f"materialized {len(live_constants)} Constant(s) as initializers")
+        self.build_dependencies()
+
     def save_to_binary(self, file_path: str):
         """Save model to a FlatBuffers binary file.
 
@@ -157,6 +244,9 @@ class DAGBasedModel:
         computes the offsets once; the C++ reader memmaps the file and points
         straight at the blob — zero-copy, no two-pass scan.
         """
+        # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
+        self.prune_dead_and_materialize_constants()
+
         builder = flatbuffers.Builder(1 << 16)
 
         # --- Build the 64-byte-aligned initializer blob + side table. ---
@@ -164,6 +254,22 @@ class DAGBasedModel:
         # regular initializers so its absolute base is unified_blob_offset;
         # UnifiedMeta offsets are relative to that base, kept relative here and
         # made absolute by the writer only for the on-disk side table.
+        # 大 blob（LLM 权重数 GB）塞不进 FlatBuffer（2GB 上限），走外部数据：
+        # blob 整体写到文件末尾，FlatBuffer 内不存字节。判断标准与 2GB 上限
+        # 留安全余量——超过 ~800MB 就外置。
+        external = False
+        try:
+            total_blob = 0
+            for _name, arr in self.initializers.items():
+                arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
+                total_blob += len(arr_np.tobytes())
+            if getattr(self, "_unified_bytes", b""):
+                total_blob += len(self._unified_bytes)
+            if total_blob > (800 << 20):
+                external = True
+        except Exception:
+            external = False
+
         blob = bytearray()
         init_entries = []  # (name_off, dtype_off, dims_off, offset, size)
         # name -> (blob_offset, size) for later offset resolution (rgba meta).
@@ -215,11 +321,17 @@ class DAGBasedModel:
             builder.PrependUOffsetTRelative(off)
         initializers_vec = builder.EndVector()
 
-        Model.StartInitializerBlobVector(builder, len(blob))
-        # FlatBuffers writes vectors back-to-front; emit bytes in reverse.
-        for b in reversed(blob):
-            builder.PrependByte(b)
-        blob_vec = builder.EndVector()
+        if external:
+            # 外部数据模式：blob 不写入 FlatBuffer 向量，直接以裸字节追加到
+            # 文件末尾（见 save_to_binary）。blob 字段留空（0 offset），
+            # 布局与加载器行为见 save_to_binary 注释。
+            blob_vec = 0
+        else:
+            Model.StartInitializerBlobVector(builder, len(blob))
+            # FlatBuffers writes vectors back-to-front; emit bytes in reverse.
+            for b in reversed(blob):
+                builder.PrependByte(b)
+            blob_vec = builder.EndVector()
 
         # --- inputs / outputs (ShapeRef vectors) ---
         def build_shape_vec(shapes):
@@ -426,4 +538,15 @@ class DAGBasedModel:
 
         with open(file_path, "wb") as f:
             f.write(builder.Output())
+            if external:
+                # 外部数据：blob（含 unified 区域）以 64 字节对齐追加在 FlatBuffer
+                # 之后；文件末尾 8 字节 LE uint64 记录 blob 起始偏移，以便 C++
+                # 加载器按此定位。FlatBuffer 的 blob 字段此时为空，加载器逻辑不变。
+                align = _BLOB_ALIGNMENT
+                pad = (align - (f.tell() % align)) % align
+                if pad:
+                    f.write(b"\x00" * pad)
+                blob_offset = f.tell()
+                f.write(bytes(blob))
+                f.write(blob_offset.to_bytes(_EXTERNAL_BLOB_MAGIC, "little"))
 
