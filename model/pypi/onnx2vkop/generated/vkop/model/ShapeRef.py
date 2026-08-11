@@ -62,8 +62,15 @@ class ShapeRef(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
         return o == 0
 
+    # ShapeRef
+    def Dtype(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(8))
+        if o != 0:
+            return self._tab.String(o + self._tab.Pos)
+        return None
+
 def ShapeRefStart(builder):
-    builder.StartObject(2)
+    builder.StartObject(3)
 
 def Start(builder):
     ShapeRefStart(builder)
@@ -85,6 +92,12 @@ def ShapeRefStartDimsVector(builder, numElems):
 
 def StartDimsVector(builder, numElems):
     return ShapeRefStartDimsVector(builder, numElems)
+
+def ShapeRefAddDtype(builder, dtype):
+    builder.PrependUOffsetTRelativeSlot(2, flatbuffers.number_types.UOffsetTFlags.py_type(dtype), 0)
+
+def AddDtype(builder, dtype):
+    ShapeRefAddDtype(builder, dtype)
 
 def ShapeRefEnd(builder):
     return builder.EndObject()

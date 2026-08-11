@@ -20,8 +20,13 @@ calculate_output_shape(const std::vector<int> &input_shape,
                        const std::vector<T> &starts, const std::vector<T> &ends,
                        const std::vector<T> &axes,
                        const std::vector<T> &steps) {
-    assert(input_shape.size() >= 3);
+    // No rank constraint: the buffer Slice path feeds 1-D int64 shape-meta
+    // tensors (the LLM's shape chain); the image path feeds >=3-D NCHW. The
+    // calc below is rank-generic, so the old `>= 3` image-only assert is gone.
     const int dims = static_cast<int>(input_shape.size());
+    if (dims == 0) {
+        throw std::invalid_argument("slice input_shape is empty");
+    }
     std::vector<std::vector<int>> ret;
 
     std::vector<T> norm_axes = axes;

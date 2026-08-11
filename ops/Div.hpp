@@ -10,6 +10,8 @@ extern unsigned char image_div_spv[];
 extern unsigned int image_div_spv_len;
 extern unsigned char buffer_div_spv[];
 extern unsigned int buffer_div_spv_len;
+extern unsigned char buffer_div_fp16_spv[];
+extern unsigned int buffer_div_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -22,8 +24,9 @@ class DivImage : public BinaryFactory {
 class DivBuffer : public BufferBinaryFactory {
   public:
     explicit DivBuffer(int fp16)
-        : BufferBinaryFactory(OpType::DIV, buffer_div_spv, buffer_div_spv_len,
-                              fp16) {}
+        : BufferBinaryFactory(
+              OpType::DIV, fp16 ? buffer_div_fp16_spv : buffer_div_spv,
+              fp16 ? buffer_div_fp16_spv_len : buffer_div_spv_len, fp16) {}
 };
 
 class Div : public PimplFacade {

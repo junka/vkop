@@ -11,6 +11,8 @@ extern unsigned char image_reduce_spv[];
 extern unsigned int image_reduce_spv_len;
 extern unsigned char buffer_reduce_spv[];
 extern unsigned int buffer_reduce_spv_len;
+extern unsigned char buffer_reduce_fp16_spv[];
+extern unsigned int buffer_reduce_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -138,14 +140,18 @@ class ReduceImage : public Operator {
     int keepdims_ = 1;
 };
 
-// Buffer (SSBO) reduce. General axes-mask reduction up to 8-D. fp32-only.
+// Buffer (SSBO) reduce. General axes-mask reduction up to 8-D. Has both an
+// fp32 build (one element per uint word) and an fp16 build (two elements
+// packed per uint word; one thread per output word computes both reductions
+// and writes a single packed half2 to avoid a read-modify-write race).
 class ReduceBuffer : public BufferFactory {
   public:
-    explicit ReduceBuffer(int /*fp16*/)
-        : BufferFactory(OpType::REDUCE, buffer_reduce_spv,
-                        buffer_reduce_spv_len,
-                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(ReducePC)) {}
+    explicit ReduceBuffer(int fp16)
+        : BufferFactory(
+              OpType::REDUCE, fp16 ? buffer_reduce_fp16_spv : buffer_reduce_spv,
+              fp16 ? buffer_reduce_fp16_spv_len : buffer_reduce_spv_len,
+              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+              sizeof(ReducePC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -230,7 +236,10 @@ class ReduceBuffer : public BufferFactory {
         pc.reduce_op = reduce_op_;
         pc.keepdims = keepdims_;
         int out_total = total_elems(out_shape);
-        submit(&pc, out_total, 1, 1);
+        // fp16 packs two output elements per uint word; dispatch one thread
+        // per output word. fp32 dispatches one thread per output element.
+        int nthreads = (fp16_ != 0) ? (out_total + 1) / 2 : out_total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
     }
 
     int reduce_op_ = static_cast<int>(reduce::ReduceType::SUM);
@@ -241,11 +250,10 @@ class ReduceBuffer : public BufferFactory {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Reduce : public PimplFacade {
   public:
-    Reduce(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::REDUCE) {
-        impl_ =
-            backend_buffer
-                ? std::unique_ptr<Operator>(std::make_unique<ReduceBuffer>(0))
-                : std::make_unique<ReduceImage>();
+    Reduce(int fp16, bool backend_buffer) : PimplFacade(OpType::REDUCE) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<ReduceBuffer>(fp16))
+                               : std::make_unique<ReduceImage>();
     }
 
     // ONNX reduce output-shape helper (used by tests). Mirrors the image

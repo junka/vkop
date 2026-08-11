@@ -218,21 +218,45 @@ class DAGBasedModel:
                 dead_nodes.append(n)
 
         # 2) 物化活着的 Constant：值搬进 initializers，删节点。
+        #    ONNX Constant 节点可能用任意一种属性携带值：
+        #      value (Tensor) / value_int / value_float / value_ints /
+        #      value_floats / sparse_value。converter 只把 Tensor 属性读成
+        #    ndarray；标量形式 (value_int=2 等) 是 INT/FLOAT/INTS 属性，被
+        #    读成 Python int/float/list。这里把所有形式统一物化成至少 1-D
+        #    的 ndarray initializer，否则 RMSNorm 的 Pow(x,2) 指数在运行时
+        #    绑定到一个空 SSBO，GPU 读到 0，pow(x,0)=1 污染整层。
+        materialized_count = 0
         for n in live_constants:
-            value = n.attributes.get("value")
-            if not isinstance(value, np.ndarray):
-                continue  # value_float/value_int 等标量属性：无数据可物化
             name = n.outputs[0]["name"]
-            arr = np.atleast_1d(np.ascontiguousarray(value))
+            value = n.attributes.get("value")
+            if isinstance(value, np.ndarray):
+                arr = np.atleast_1d(np.ascontiguousarray(value))
+            elif "value_float" in n.attributes:
+                arr = np.array([float(n.attributes["value_float"])],
+                               dtype=np.float32)
+            elif "value_floats" in n.attributes:
+                arr = np.array(n.attributes["value_floats"], dtype=np.float32)
+            elif "value_int" in n.attributes:
+                # ONNX value_int is int64; runtime stores int initializers as
+                # int32, so downcast here.
+                arr = np.array([int(n.attributes["value_int"])], dtype=np.int64)
+            elif "value_ints" in n.attributes:
+                arr = np.array(n.attributes["value_ints"], dtype=np.int64)
+            else:
+                # value_string / sparse_value / no value: nothing to materialize.
+                continue
+            arr = np.atleast_1d(np.ascontiguousarray(arr))
             self.initializers[name] = numpy_helper.from_array(arr, name)
             self.nodes.pop(n.name, None)
+            materialized_count += 1
 
         for n in dead_nodes:
             self.nodes.pop(n.name, None)
 
         if dead_nodes or live_constants:
             print(f"[prune+materialize] removed {len(dead_nodes)} dead nodes, "
-                  f"materialized {len(live_constants)} Constant(s) as initializers")
+                  f"materialized {materialized_count}/{len(live_constants)} "
+                  f"Constant(s) as initializers")
         self.build_dependencies()
 
     def save_to_binary(self, file_path: str):
@@ -334,19 +358,41 @@ class DAGBasedModel:
             blob_vec = builder.EndVector()
 
         # --- inputs / outputs (ShapeRef vectors) ---
+        # ONNX elem_type int -> canonical dtype name. Per-node shapes in the
+        # converter carry elem_type ints (the optimizer's cast-folding reads
+        # them as ints), while graph inputs/outputs already carry string names.
+        # The flatbuffer field is a string, so normalize both forms here.
+        _ELEM_TYPE_NAME = {
+            1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
+            6: "int32", 7: "int64", 8: "string", 9: "bool", 10: "float16",
+            11: "float64", 12: "uint32", 13: "uint64", 16: "bfloat16",
+        }
+
+        def _dtype_to_str(dtype):
+            if isinstance(dtype, str):
+                return dtype
+            if isinstance(dtype, (int, np.integer)):
+                return _ELEM_TYPE_NAME.get(int(dtype), "")
+            return ""
+
         def build_shape_vec(shapes):
             offs = []
             for item in shapes:
                 name = item["name"] if isinstance(item, dict) else str(item)
                 dims = item["shape"] if isinstance(item, dict) else []
+                dtype = item.get("dtype", "") if isinstance(item, dict) else ""
+                dtype = _dtype_to_str(dtype)
                 name_off = builder.CreateString(name)
                 ShapeRef.StartDimsVector(builder, len(dims))
                 for d in reversed(dims):
                     builder.PrependUint32(int(d))
                 dims_off = builder.EndVector()
+                dtype_off = builder.CreateString(dtype) if dtype else 0
                 ShapeRef.Start(builder)
                 ShapeRef.AddName(builder, name_off)
                 ShapeRef.AddDims(builder, dims_off)
+                if dtype_off:
+                    ShapeRef.AddDtype(builder, dtype_off)
                 offs.append(ShapeRef.End(builder))
             Model.StartInputsVector(builder, len(offs))  # any Start*Vector works
             for off in reversed(offs):

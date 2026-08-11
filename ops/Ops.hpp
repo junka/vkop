@@ -55,6 +55,9 @@ enum class OpType {
     EQUAL,
     NONZERO,
     SCATTER_ELEMENTS,
+    SHAPE,
+    CAST,
+    SCATTER_ND,
     TOTAL_NUM
 };
 
@@ -106,6 +109,9 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Equal",             // EQUAL = 43
         "NonZero",           // NONZERO = 44
         "ScatterElements",   // SCATTER_ELEMENTS = 45
+        "Shape",             // SHAPE = 46
+        "Cast",              // CAST = 47
+        "ScatterND",         // SCATTER_ND = 48
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -204,6 +210,12 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::NONZERO;
     if (name == "ScatterElements")
         return vkop::ops::OpType::SCATTER_ELEMENTS;
+    if (name == "Shape")
+        return vkop::ops::OpType::SHAPE;
+    if (name == "Cast")
+        return vkop::ops::OpType::CAST;
+    if (name == "ScatterND")
+        return vkop::ops::OpType::SCATTER_ND;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

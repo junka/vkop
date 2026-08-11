@@ -73,6 +73,9 @@ set(TEST_SOURCES
     EqualTest.cpp
     NonZeroTest.cpp
     ScatterElementsTest.cpp
+    ShapeTest.cpp
+    CastTest.cpp
+    ScatterNDTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

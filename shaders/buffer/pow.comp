@@ -32,7 +32,27 @@ layout(push_constant) uniform PC_uPC {
     int _pad;
 } uPC;
 
-float bin_op(float a, float b) { return pow(a, b); }
+float bin_op(float a, float b) {
+    // ONNX Pow semantics: a negative base raised to an *integer* exponent
+    // yields a real result (e.g. (-2)^2 = 4). GLSL pow is defined as
+    // exp(b*log(a)), which returns NaN for a<0 because log(negative) is
+    // undefined. The LLM's RMSNorm computes Pow(x, 2) over hidden states
+    // that are roughly half negative, so without this guard ~half the
+    // elements become NaN and poison every layer.
+    if (a < 0.0) {
+        float r = pow(-a, b);          // |a|^b, always real
+        float fl = floor(b);
+        if (abs(b - fl) < 1e-5) {
+            // b is integral: flip sign iff odd.
+            int ie = int(fl);
+            if ((ie & 1) != 0) r = -r;
+            return r;
+        }
+        // Non-integer exponent on a negative base: ONNX yields NaN too.
+        return pow(a, b);
+    }
+    return pow(a, b);
+}
 
 float load_elem(int linear) {
     if (uPC.broadcast == 0) {
@@ -79,16 +99,27 @@ void main() {
     if (gid >= nwords) return;
     int i0 = 2 * gid;
     int i1 = 2 * gid + 1;
+    // Compute BOTH elements before any write. The previous version did
+    // store_elem(i0) then load_elem(i1); when the runtime recycles the
+    // output tensor onto the same SSBO as input A (in-place), that first
+    // store corrupted the word's high half before i1 was read. Computing
+    // both up front and writing the packed half2 in a single store avoids
+    // the read-modify-write dependency entirely.
     float a0 = load_elem(i0);
     float b0 = load_elem_b(i0);
     float r0 = activation(FLOAT(bin_op(a0, b0)), uPC.activation);
-    store_elem(i0, r0);
+    vec2 out_pair;
+    out_pair[0] = r0;
     if (i1 < uPC.total) {
         float a1 = load_elem(i1);
         float b1 = load_elem_b(i1);
         float r1 = activation(FLOAT(bin_op(a1, b1)), uPC.activation);
-        store_elem(i1, r1);
+        out_pair[1] = r1;
+    } else {
+        // Total is odd: keep the existing high half untouched.
+        out_pair[1] = unpackHalf2x16(uOutput.data[gid])[1];
     }
+    uOutput.data[gid] = packHalf2x16(out_pair);
 #else
     if (gid >= uPC.total) return;
     float a = load_elem(gid);

@@ -31,6 +31,7 @@ namespace load {
 struct Shape {
     std::string name;
     std::vector<uint32_t> dims;
+    std::string dtype; // "" if the writer didn't record one
 };
 
 struct Node {

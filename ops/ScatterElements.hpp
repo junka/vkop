@@ -73,8 +73,26 @@ class ScatterElements : public BufferFactory {
         for (size_t i = 1; i < data_shape.size(); ++i) {
             cols *= data_shape[i];
         }
-        int n_idx = core::as_tensor<int>(inputs[1])->num_elements();
+        // indices is int64 in the model (bound as ivec2[] in the shader);
+        // read the element count on the correct dtype.
+        int n_idx = 0;
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            n_idx =
+                static_cast<int>(core::as_tensor<T>(inputs[1])->num_elements());
+        });
         int n_threads = n_idx * cols;
+
+        // Host-compute path for fp16 data/updates. The fp32 GPU shader can't
+        // be trivially reused for fp16 (the float atomic-add CAS loop and the
+        // uintBitsToFloat reads would corrupt fp16 bits), and a packed fp16
+        // shader would need a word-level CAS to avoid RMW races between
+        // adjacent columns. ScatterElements in the LLM is tiny (1x2048 per
+        // layer, 28 layers) so a host scatter + re-upload is correct and cheap.
+        if (outputs[0]->dtype() == typeid(uint16_t)) {
+            hostScatter<uint16_t>(inputs, outputs, data_shape, cols, n_idx);
+            return;
+        }
 
         // Bind: [0]=data/output (read-write), [1]=indices, [2]=updates
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
@@ -85,14 +103,117 @@ class ScatterElements : public BufferFactory {
             }
             bind_ssbo<T>(outputs[0], true);
         });
-        bind_ssbo<int>(inputs[1], false);   // indices (binding 1)
-        bind_ssbo<float>(inputs[2], false); // updates (binding 2)
+        // indices (binding 1): int64 data is byte-packed; bind as int64_t so
+        // the ivec2[] shader view reads the true stride.
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[1], false);
+        });
+        // updates (binding 2): may be fp16 or fp32 — bind on its own dtype so
+        // as_tensor<T> doesn't dynamic_cast to null.
+        dispatch_by_dtype(inputs[2]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[2], false);
+        });
 
         scatter::ScatterPC pc{};
         pc.n_threads = n_threads;
         pc.cols = cols;
         pc.reduction = reduction_;
         submit(&pc, UP_DIV(n_threads, 256), 1, 1);
+    }
+
+    // Host scatter for fp16 (uint16_t bits) data. Reads data + updates to the
+    // host, applies the scatter (overwrite or add) along axis=0, and uploads
+    // the result. indices is int64.
+    //
+    // Shape contract (ONNX ScatterElements, axis=0, the LLM's deepstack use):
+    //   data    [rows, cols]
+    //   indices [n_idx]          (1-D; one row index per update row)
+    //   updates [n_idx, cols]    (one full row per index)
+    // n_idx is taken from the indices tensor's element count. Because runtime
+    // tensor recycling can leave a stale shape on a reused output, we read the
+    // true count from the indices data itself after pulling it to the host.
+    template <typename T>
+    void hostScatter(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                     const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                     const std::vector<int> &data_shape, int cols,
+                     int /*n_idx*/) {
+        auto data = core::as_tensor<T>(inputs[0]);
+        auto updates = core::as_tensor<T>(inputs[2]);
+        if (!data->has_cpu_data()) {
+            data->copyToCPU(m_cmdpool_);
+        }
+        if (!updates->has_cpu_data()) {
+            updates->copyToCPU(m_cmdpool_);
+        }
+        auto indices = core::as_tensor<int64_t>(inputs[1]);
+        if (!indices->has_cpu_data()) {
+            indices->copyToCPU(m_cmdpool_);
+        }
+        // True index count from the host data (recycled shapes can lie).
+        int n_idx = static_cast<int>(indices->num_elements());
+        printf("[scatter] data_shape=[");
+        for (auto d : data_shape)
+            printf("%d,", d);
+        printf("] cols=%d indices_shape=[", cols);
+        for (auto d : inputs[1]->getShape())
+            printf("%d,", d);
+        printf("] n_idx=%d updates_shape=[", n_idx);
+        for (auto d : inputs[2]->getShape())
+            printf("%d,", d);
+        printf("] updates_ne=%d\n", (int)updates->num_elements());
+        fflush(stdout);
+
+        auto output = core::as_tensor<T>(outputs[0]);
+        if (output->size() == 0) {
+            output->resize(data_shape);
+        }
+        // If output is a distinct tensor from data, seed it with the data.
+        // (In-place scatter: output == data, already loaded.)
+        if (outputs[0].get() != inputs[0].get()) {
+            std::vector<T> seed(data->num_elements());
+            for (int i = 0; i < data->num_elements(); ++i) {
+                seed[i] = (*data)[i];
+            }
+            output->fillToCPU(seed);
+        }
+
+        int rows = (data_shape.empty()) ? 0 : data_shape[0];
+        int total = rows * cols;
+        std::vector<T> out(total);
+        for (int i = 0; i < total; ++i) {
+            out[i] = (*output)[i];
+        }
+        // ONNX ScatterElements (axis=0): indices and updates are broadcast to
+        // data's shape with the axis dimension removed. Each flat index `i`
+        // maps to a coordinate in that reduced shape; the axis-0 slot is then
+        // replaced by the gathered index value. For 2-D data [rows, cols],
+        // flat i -> coord [i/cols, i%cols] -> target [indices[i], i%cols]
+        // -> linear indices[i]*cols + (i%cols). n_idx is the flat count of
+        // indices (== flat count of updates).
+        for (int i = 0; i < n_idx; ++i) {
+            int row = static_cast<int>((*indices)[i]);
+            if (row < 0) {
+                row += rows;
+            }
+            int col = i % cols;
+            int target = row * cols + col;
+            if (reduction_ == 1) {
+                // fp16 add via fp32 rounding (matches the GPU fp32 path).
+                float a = core::ITensor::fp16_to_fp32(
+                    reinterpret_cast<const uint16_t &>(out[target]));
+                float b = core::ITensor::fp16_to_fp32(
+                    reinterpret_cast<const uint16_t &>((*updates)[i]));
+                uint16_t r = core::ITensor::fp32_to_fp16(a + b);
+                out[target] = reinterpret_cast<const T &>(r);
+            } else {
+                out[target] = (*updates)[i];
+            }
+        }
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        output->copyToGPU(m_cmdpool_, out.data());
     }
 
     int axis_ = 0;

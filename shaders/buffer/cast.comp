@@ -1,0 +1,48 @@
+#version 450 core
+
+// Cast SSBO op: fp32 <-> fp16 elementwise conversion.
+//
+// The two directions use different word layouts, so the dispatch size differs:
+//   mode 0 (fp32 -> fp16): one thread per OUTPUT word. Each thread reads two
+//         fp32 words and writes one half2 word via packHalf2x16. One thread per
+//         output word is required — a word-per-ELEMENT mapping would make two
+//         threads read-modify-write the same half2 word and race.
+//   mode 1 (fp16 -> fp32): one thread per INPUT word. Each thread reads one
+//         half2 word and writes two fp32 words. fp32 output words are 4-byte,
+//         so each thread owns disjoint output words (no packing race).
+//
+// Both buffers are bound as raw uint[]. `total` is the input element count;
+// the dispatch is (total+1)/2 threads in either direction. Odd totals need
+// the OOB guards below (the model's totals are all even).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer OutBuf { uint data[]; } uOut;
+layout(set = 0, binding = 1) readonly buffer InBuf { uint data[]; } uIn;
+
+layout(push_constant) uniform PC {
+    int mode;  // 0 = fp32->fp16, 1 = fp16->fp32
+    int total; // input element count
+    int _pad0;
+    int _pad1;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= (uPC.total + 1) / 2) return;
+
+    if (uPC.mode == 0) {
+        // fp32 -> fp16: gid is the output half2 word index.
+        int i0 = 2 * gid;
+        int i1 = 2 * gid + 1;
+        vec2 v = vec2(uintBitsToFloat(uIn.data[i0]),
+                      (i1 < uPC.total) ? uintBitsToFloat(uIn.data[i1]) : 0.0);
+        uOut.data[gid] = packHalf2x16(v);
+    } else {
+        // fp16 -> fp32: gid is the input half2 word index.
+        vec2 v = unpackHalf2x16(uIn.data[gid]);
+        uOut.data[2 * gid] = floatBitsToUint(v.x);
+        if (2 * gid + 1 < uPC.total)
+            uOut.data[2 * gid + 1] = floatBitsToUint(v.y);
+    }
+}

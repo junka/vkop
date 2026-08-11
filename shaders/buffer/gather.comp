@@ -11,7 +11,10 @@
 
 layout(set=0, binding=0) writeonly buffer outputBuffer { DTYPE data[]; } uOutput;
 layout(set=0, binding=1) readonly buffer inputBuffer { DTYPE data[]; } uInput;
-layout(set=0, binding=2) readonly buffer indexBuffer { int data[]; } uIndex;
+// int64 indices: each element is 8 bytes; bound as ivec2[] and only the low
+// 32 bits (.x) are read — correct for the model's small non-negative index
+// values (reading as int[] would stride by 4 bytes and misread every element).
+layout(set=0, binding=2) readonly buffer indexBuffer { ivec2 data[]; } uIndex;
 
 layout(push_constant) uniform gatherBuffer {
     ivec4 inShape;
@@ -110,7 +113,7 @@ void main()
     int total_indices_size = getTotalSize(uGatherPara.indicesShape, uGatherPara.nindex);
     if (indices_linear_idx >= total_indices_size || indices_linear_idx < 0) return;
 
-    int gather_idx = uIndex.data[indices_linear_idx];
+    int gather_idx = uIndex.data[indices_linear_idx].x;
 
     // 4. 处理负索引
     int axis_size = 0;

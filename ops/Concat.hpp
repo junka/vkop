@@ -192,6 +192,45 @@ class ConcatBuffer : public BufferFactory {
             out_shape[axis_] += s[axis_];
         }
 
+        // int64 concat runs on the CPU (part of the shape meta-chain). All
+        // inputs are CPU-resident during recording, so a direct 1:1 copy of
+        // each input's contiguous data into the output at the axis offset is
+        // equivalent to a strided GPU concat.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            int total = total_elems(out_shape);
+            std::vector<int64_t> out(total);
+            std::vector<int> out_stride(rank, 1);
+            for (int i = rank - 2; i >= 0; --i) {
+                out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
+            }
+            int offset = 0;
+            for (const auto &in : inputs) {
+                auto in_shape = in->getShape();
+                int in_total = total_elems(in_shape);
+                int in_stride = out_stride[axis_];
+                int block = (in_total == 0) ? 0 : in_total / in_shape[axis_];
+                auto src = core::as_tensor<int64_t>(in);
+                if (!src->has_cpu_data()) {
+                    src->copyToCPU(m_cmdpool_);
+                }
+                for (int b = 0; b < block; ++b) {
+                    // contiguous in_shape[axis_] elements per block
+                    int in_base = b * in_shape[axis_];
+                    int out_base = (offset + b * in_shape[axis_]) * in_stride;
+                    for (int e = 0; e < in_shape[axis_]; ++e) {
+                        out[out_base + e * in_stride] = (*src)[in_base + e];
+                    }
+                }
+                offset += in_shape[axis_];
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

@@ -112,6 +112,43 @@ class TransposeBuffer : public BufferFactory {
             outshape[i] = inshape[perm_[i]];
         }
 
+        // int64 transpose: CPU permute (the single instance feeds NonZero,
+        // part of the shape meta-chain).
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            int total = total_elems(outshape);
+            std::vector<int64_t> out(static_cast<size_t>(total));
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            // The input may be GPU-resident only (e.g. NonZero's output is
+            // computed by a shader, leaving data_ empty). Pull it back to the
+            // host before the CPU permute reads (*src)[i].
+            if (!src->has_cpu_data()) {
+                src->copyToCPU(m_cmdpool_);
+            }
+            std::vector<int> in_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                in_stride[d] = in_stride[d + 1] * inshape[d + 1];
+            }
+            std::vector<int> out_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                out_stride[d] = out_stride[d + 1] * outshape[d + 1];
+            }
+            for (int o = 0; o < total; ++o) {
+                int r = o;
+                int in_lin = 0;
+                for (int d = 0; d < rank; ++d) {
+                    int coord = (r / out_stride[d]) % outshape[d];
+                    in_lin += coord * in_stride[perm_[d]];
+                }
+                out[static_cast<size_t>(o)] = (*src)[in_lin];
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(outshape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

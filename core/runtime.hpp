@@ -35,6 +35,10 @@ class Runtime {
     // Input and output tensors mapping by name
     std::unordered_map<std::string, std::shared_ptr<ITensor>> inputs_;
     std::unordered_map<std::string, std::shared_ptr<ITensor>> outputs_;
+    // Persistent view of every named tensor (inputs, initializers, and every
+    // node output) for post-Run inspection by name (e.g. dumping intermediates
+    // to diagnose NaN propagation). Mirrors the local tensor_map in LoadModel.
+    std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map_;
     std::unordered_map<std::string, std::shared_ptr<ITensor>> real_outputs_;
     // Initializer tensors
     std::unordered_map<std::string, std::shared_ptr<ITensor>> initializers_;
@@ -63,8 +67,19 @@ class Runtime {
     // Get input tensor by name
     std::shared_ptr<ITensor> GetInput(const std::string &name = "") const;
 
+    // Resize a graph input to the caller's actual shape and recreate its SSBO
+    // at the new size. Used by the LLM driver: the model records symbolic
+    // dims (e.g. past_key_values kv_len=1) but the real prefill tensor has a
+    // concrete shape (kv_len=0). Must be called after LoadModel, before Run.
+    void ResizeInput(const std::string &name,
+                     const std::vector<uint32_t> &dims);
+
     // Get output tensor by name
     std::shared_ptr<ITensor> GetOutput(const std::string &name = "") const;
+
+    // Get any named tensor (input, initializer, or node output) by name.
+    // Returns nullptr if not found. For inspecting intermediates after Run.
+    std::shared_ptr<ITensor> GetTensor(const std::string &name) const;
 
     // Get initializer tensor by name, for test only
     std::shared_ptr<ITensor> GetInitializer(const std::string &name) const;

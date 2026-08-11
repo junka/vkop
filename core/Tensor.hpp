@@ -370,6 +370,21 @@ template <typename T> class Tensor : public ITensor {
      */
     Tensor &operator=(const Tensor &&) = delete;
 
+    // True if a real GPU buffer/image is attached. Distinct from is_on_GPU():
+    // int64 outputs are created off-GPU (converted_=false) but producer ops
+    // like NonZero bind an SSBO (vkobj_ set) without flipping converted_, so
+    // consumers must check has_gpu_buffer() to decide whether a readback is
+    // needed to populate data_ before (*this)[i].
+    bool has_gpu_buffer() const { return vkobj_ != nullptr; }
+    // True if CPU staging (data_) holds valid element data.
+    bool has_cpu_data() const { return data_ && !data_->empty(); }
+    // 0=none, 1=VK_BUFFER, 2=VK_IMAGE, 3=VK_BUFFER_VIEW (debug helper).
+    int resource_type() const {
+        if (!vkobj_)
+            return 0;
+        return static_cast<int>(vkobj_->getResourceType());
+    }
+
     T &operator[](std::size_t index) { return (*data_)[index]; }
 
     const T &operator[](std::size_t index) const { return (*data_)[index]; }
@@ -389,7 +404,13 @@ template <typename T> class Tensor : public ITensor {
     }
     int num_elements() { return size_ / sizeof(T); }
 
-    std::vector<T> data() { return *data_; }
+    // Return by reference (NOT by value). A by-value return made callers that
+    // did `tensor.data().data()` take a dangling pointer into an immediately
+    // destroyed temporary vector — the root cause of the bogus "all-NaN logits"
+    // readback in the LLM driver (it was reading freed heap memory, not
+    // logits).
+    std::vector<T> &data() { return *data_; }
+    const std::vector<T> &data() const { return *data_; }
 
     std::shared_ptr<VulkanBuffer> as_storage_buffer(
         std::shared_ptr<VulkanDevice> &vd,
@@ -401,6 +422,19 @@ template <typename T> class Tensor : public ITensor {
             buff->readBarrier(cmd->get());
         }
         return buff;
+    }
+
+    // Recreate the backing SSBO at the tensor's *current* dims/size, dropping
+    // any previously-allocated buffer. Used by the LLM driver to resize graph
+    // inputs (e.g. past_key_values with kv_len=0) after LoadModel already
+    // created a buffer sized to the model's recorded (symbolic) dims. Leaves
+    // the tensor off-GPU so the caller's copyToGPU() actually performs the
+    // upload (otherwise is_on_GPU() short-circuits it).
+    void recreate_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
+        vkobj_.reset();
+        converted_ = false;
+        make_vkbuff(vd, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                            VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
     }
 
     std::shared_ptr<VulkanBuffer>
@@ -549,6 +583,13 @@ template <typename T> class Tensor : public ITensor {
     }
     void copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    T *data = nullptr) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf("[cpygpu] enter is_on_GPU=%d has_vkobj=%d restype=%d "
+                   "cpudata=%d\n",
+                   (int)is_on_GPU(), (int)(vkobj_ != nullptr),
+                   (int)resource_type(), (int)has_cpu_data());
+            fflush(stdout);
+        }
         if (is_on_GPU()) {
             return;
         }
@@ -564,8 +605,15 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        if (!is_on_GPU()) {
-            printf("not on GPU\n");
+        // Read GPU->CPU whenever a real buffer exists, regardless of the
+        // converted_ flag (int64 outputs are created off-GPU but producer ops
+        // like NonZero bind an SSBO without flipping converted_, so is_on_GPU()
+        // would wrongly skip the readback and leave data_ empty).
+        if (!vkobj_) {
+            if (!is_on_GPU()) {
+                printf("not on GPU\n");
+            }
+            reserveOnCPU();
             return;
         }
         reserveOnCPU();
@@ -578,12 +626,19 @@ template <typename T> class Tensor : public ITensor {
 
     void fillToCPU(const std::vector<T> &data) {
         reserveOnCPU();
-        memcpy(data_->data(), data.data(), size_);
+        // size_ may be 0 (empty slice/shape result) and data.data() is then
+        // a null pointer; memcpy(nullptr,...,0) is UB and trips the optimized
+        // memmove. Guard the no-op case.
+        if (size_ > 0) {
+            memcpy(data_->data(), data.data(), size_);
+        }
         toCPU();
     }
     void fillToCPU(const T *data) {
         reserveOnCPU();
-        memcpy(data_->data(), data, size_);
+        if (size_ > 0) {
+            memcpy(data_->data(), data, size_);
+        }
         toCPU();
     }
 
@@ -734,6 +789,10 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
+        // Vulkan requires buffer size > 0; empty tensors (e.g. kv_len=0
+        // past_key_values) get a minimal dummy buffer so creation succeeds.
+        if (aligned == 0)
+            aligned = 16;
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
@@ -778,16 +837,33 @@ template <typename T> class Tensor : public ITensor {
         VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf("[gpuup] size_=%d aligned=%d ne=%d src=%d data=%d\n",
+                   (int)size_, (int)aligned, (int)num_elements(),
+                   (int)(src != nullptr), (int)(data_ && !data_->empty()));
+            fflush(stdout);
+        }
+        if (aligned == 0) {
+            // Empty tensor (0 elements): nothing to upload, and the staging
+            // pool asserts size != 0. The SSBO was already given a minimal
+            // dummy buffer in make_vkbuff, so just mark on-GPU and return.
+            toGPU();
+            return;
+        }
         auto b = stpool->allocate(aligned);
         if (!b) {
             printf("copyToGPUBuffer stpool alloc failed %d\n", size_);
             return;
         }
         memset(b->ptr, 0, aligned);
-        if (src) {
-            memcpy(b->ptr, src, size_);
-        } else {
-            memcpy(b->ptr, data_->data(), size_);
+        // size_ may be 0 (empty tensor); src/data_ may be null then, and
+        // memcpy(dst, nullptr, 0) is UB under the optimized memmove.
+        if (size_ > 0) {
+            if (src) {
+                memcpy(b->ptr, src, size_);
+            } else {
+                memcpy(b->ptr, data_->data(), size_);
+            }
         }
         std::shared_ptr<VulkanBuffer> buffer;
         size_t offset = 0;
@@ -814,9 +890,10 @@ template <typename T> class Tensor : public ITensor {
 
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool);
-        auto stpool = cmdpool->getStagingBufferPool();
-
-        // When the GPU buffer holds per-row padding (e.g. Topk fp16 odd-k,
+        auto stpool =
+            cmdpool
+                ->getStagingBufferPool(); // When the GPU buffer holds per-row
+                                          // padding (e.g. Topk fp16 odd-k,
         // where k is rounded up to even so packed fp16 writes have an even
         // out_base), the device wrote each row with stride
         // (logical_cols + gpu_row_pad_). Copy the full padded footprint back
@@ -831,11 +908,34 @@ template <typename T> class Tensor : public ITensor {
                          sizeof(T);
         }
 
+        // Empty tensor (0 elements, e.g. an int64 shape-meta slice result):
+        // nothing to copy back, and the staging pool asserts size != 0.
+        if (copy_bytes == 0) {
+            reserveOnCPU();
+            toCPU();
+            return;
+        }
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf(
+                "[cpudn] size_=%d copy_bytes=%d ne=%d restype=%d offset=%d\n",
+                (int)size_, (int)copy_bytes, (int)num_elements(),
+                (int)(vkobj_->getResourceType()), (int)0);
+            fflush(stdout);
+        }
+
         auto b = stpool->allocate(copy_bytes);
         if (!b) {
             printf("copyBufferToCPU stpool alloc failed %d\n",
                    static_cast<int>(copy_bytes));
             return;
+        }
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf("[cpudn2] boffset=%d bptr=%p mappedfirst=[", (int)b->offset,
+                   b->ptr);
+            for (int i = 0; i < 4 && i < (int)(copy_bytes / 2); ++i)
+                printf("%04x,", ((uint16_t *)b->ptr)[i]);
+            printf("]\n");
+            fflush(stdout);
         }
         std::shared_ptr<VulkanBuffer> buffer;
         size_t offset = 0;
@@ -853,6 +953,13 @@ template <typename T> class Tensor : public ITensor {
         cmd.end();
         cmd.submit(dev->getComputeQueue());
         cmd.wait();
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf("[cpudn3] after-copy bptrfirst=[");
+            for (int i = 0; i < 4 && i < (int)(copy_bytes / 2); ++i)
+                printf("%04x,", ((uint16_t *)b->ptr)[i]);
+            printf("]\n");
+            fflush(stdout);
+        }
         if (need_compact) {
             size_t packed_stride_bytes =
                 static_cast<size_t>(logical_cols + row_pad) * sizeof(T);
@@ -868,6 +975,15 @@ template <typename T> class Tensor : public ITensor {
             gpu_row_pad_ = 0;
         } else {
             std::memcpy(data_->data(), b->ptr, size_);
+        }
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            printf("[cpudn4] need_compact=%d row_pad=%d rows=%d cols=%d "
+                   "datafirst=[",
+                   (int)need_compact, (int)row_pad, rows, logical_cols);
+            for (int i = 0; i < 4 && i < (int)(size_ / 2); ++i)
+                printf("%04x,", ((uint16_t *)data_->data())[i]);
+            printf("]\n");
+            fflush(stdout);
         }
         stpool->reset();
         toCPU();

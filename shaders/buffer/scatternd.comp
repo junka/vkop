@@ -1,0 +1,68 @@
+#version 450 core
+#include "../common/buffer_common.comp"
+
+// ScatterND SSBO op (fp32). ONNX ScatterND: copies `data` into `output`,
+// then scatters `updates` into `output` at the positions indexed by
+// `indices`.
+//
+// Two passes, driven by uPC.mode in a single command buffer:
+//   mode 0: output[gid] = data[gid]            (threads = data_total)
+//   mode 1: output[idx(updates[uidx])] = updates[uidx]
+//                                             (threads = updates_total)
+//
+// indices is an int64 tensor [num_tuples, index_rank]; bound as ivec2[] and
+// only the low 32 bits (.x) are read — correct for the model's small
+// non-negative index values (an int64 element occupies bytes [i*8, i*8+8);
+// reading it as int[] would stride by 4 bytes and misread every element).
+//
+// ONNX semantics: updates has shape
+//   indices.shape[:-1] + data.shape[index_rank:]
+// with data dims starting at `index_rank` collapsed into `slice_size`
+// elements. Each updates element scatters to
+//   flat(data[idx[0], ..., idx[index_rank-1]]) + within.
+//
+// dataDims holds data_shape left-aligned (fill_dims convention: dims.v[0..]
+// are the true dims). uPC.data_rank is used only for bounds logic on the
+// host side; the shader only needs index_rank + slice_size.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer OutBuf { uint data[]; } uOut;
+layout(set = 0, binding = 1) readonly buffer DataBuf { uint data[]; } uData;
+layout(set = 0, binding = 2) readonly buffer IdxBuf { ivec2 data[]; } uIdx;
+layout(set = 0, binding = 3) readonly buffer UpdBuf { uint data[]; } uUpd;
+
+layout(push_constant) uniform PC {
+    int mode;          // 0 = copy data->out, 1 = scatter updates
+    int data_total;    // elements in data / output
+    int index_rank;    // indices.shape[-1]
+    int num_tuples;    // product(indices.shape[:-1])
+    int data_rank;     // rank of data
+    IArr8 dataDims;    // data shape, left-aligned
+    int slice_size;    // product(data.shape[index_rank:])
+    int updates_total; // elements in updates
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+
+    if (uPC.mode == 0) {
+        if (gid >= uPC.data_total) return;
+        uOut.data[gid] = uData.data[gid];
+        return;
+    }
+
+    // mode 1: scatter.
+    if (gid >= uPC.updates_total) return;
+    int uidx = gid;
+    int t = uidx / uPC.slice_size;   // which index tuple
+    int within = uidx % uPC.slice_size;
+
+    int base = 0;
+    for (int k = 0; k < uPC.index_rank; ++k) {
+        int v = uIdx.data[t * uPC.index_rank + k].x;
+        base = base * uPC.dataDims.v[k] + v;
+    }
+    int target = base * uPC.slice_size + within;
+    uOut.data[target] = uUpd.data[uidx];
+}

@@ -35,6 +35,9 @@ static void run_scatter(
         if (t->dtype() == typeid(int)) {
             vkop::core::as_tensor<int>(t)->as_storage_buffer(dev);
             vkop::core::as_tensor<int>(t)->copyToGPU(cmdpool);
+        } else if (t->dtype() == typeid(int64_t)) {
+            vkop::core::as_tensor<int64_t>(t)->as_storage_buffer(dev);
+            vkop::core::as_tensor<int64_t>(t)->copyToGPU(cmdpool);
         } else if (t->dtype() == typeid(float)) {
             vkop::core::as_tensor<float>(t)->as_storage_buffer(dev);
             vkop::core::as_tensor<float>(t)->copyToGPU(cmdpool);
@@ -76,10 +79,10 @@ TEST(ScatterElementsTest, Overwrite) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 3}), updates);
 
     auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
     auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
     fill_float(tout, data);
-    tidx->fillToCPU(std::vector<int>{0, 2, 1});
+    tidx->fillToCPU(std::vector<int64_t>{0, 2, 1});
     fill_float(tupd, updates);
 
     run_scatter("none", {tout, tidx, tupd}, {tout});
@@ -103,10 +106,10 @@ TEST(ScatterElementsTest, AddReduction) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 3}), updates, "add");
 
     auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
     auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
     fill_float(tout, data);
-    tidx->fillToCPU(std::vector<int>{0, 2, 0});
+    tidx->fillToCPU(std::vector<int64_t>{0, 2, 0});
     fill_float(tupd, updates);
 
     run_scatter("add", {tout, tidx, tupd}, {tout});

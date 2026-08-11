@@ -3,6 +3,7 @@
 #define OPS_GATHER_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <numeric>
 
@@ -77,6 +78,119 @@ class Gather : public Operator {
         return output_shape;
     }
 
+    // Host-compute an int64-data Gather along `axis`. All 352 int64-data
+    // gathers in the LLM have int64 indices produced by Shape/Concat (CPU
+    // ops during the synchronous recording pass), so both tensors are valid
+    // via as_tensor<int64_t>(). Mirrors gather.comp's indexing: for each
+    // output linear index, split it into [data dims, indices dims, data dims]
+    // around `axis`, read the gathered index value, and map to the input
+    // linear index.
+    void cpuComputeInt64(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        auto data_shape = inputs[0]->getShape();
+        auto idx_shape = inputs[1]->getShape();
+        int rank = static_cast<int>(data_shape.size());
+        int axis = param_.axis;
+        if (axis < 0) {
+            axis += rank;
+        }
+        auto out_shape =
+            calculateGatherOutputShape(data_shape, idx_shape, axis);
+        int total = total_elems(out_shape);
+        int nindex = static_cast<int>(idx_shape.size());
+        int axis_size = data_shape[axis];
+
+        auto data = core::as_tensor<int64_t>(inputs[0]);
+        auto indices = core::as_tensor<int64_t>(inputs[1]);
+        if (!data->has_cpu_data()) {
+            data->copyToCPU(m_cmdpool_);
+        }
+        if (!indices->has_cpu_data()) {
+            indices->copyToCPU(m_cmdpool_);
+        }
+        std::vector<int64_t> out(total);
+
+        // Row-major strides of the data and indices tensors.
+        std::vector<int> d_stride(rank, 1);
+        for (int i = rank - 2; i >= 0; --i) {
+            d_stride[i] = d_stride[i + 1] * data_shape[i + 1];
+        }
+        std::vector<int> i_stride(nindex, 1);
+        for (int i = nindex - 2; i >= 0; --i) {
+            i_stride[i] = i_stride[i + 1] * idx_shape[i + 1];
+        }
+        auto nd_to_linear = [](const std::vector<int> &coord,
+                               const std::vector<int> &stride) {
+            int idx = 0;
+            for (size_t d = 0; d < coord.size(); ++d) {
+                idx += coord[d] * stride[d];
+            }
+            return idx;
+        };
+
+        // Out dims and the input dimension each maps to, with the coordinate
+        // slot it reads from.
+        struct Slot {
+            int src_rank; // index into data (0) or indices (1) coordinate
+            int src_dim;  // dimension within that tensor
+            int dim;      // output dimension
+        };
+        std::vector<Slot> slots;
+        slots.reserve(out_shape.size());
+        for (int d = 0; d < axis; ++d) {
+            slots.push_back({0, d, d});
+        }
+        for (int d = 0; d < nindex; ++d) {
+            slots.push_back({1, d, axis + d});
+        }
+        for (int d = axis + 1; d < rank; ++d) {
+            slots.push_back({0, d, axis + nindex + (d - axis - 1)});
+        }
+
+        // For each output element, decompose its linear index into a full
+        // output coordinate, then read the gathered index at the indices
+        // sub-coordinate and build the data sub-coordinate.
+        std::vector<int> out_stride(out_shape.size());
+        if (!out_shape.empty()) {
+            out_stride.back() = 1;
+            for (int i = static_cast<int>(out_shape.size()) - 2; i >= 0; --i) {
+                out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
+            }
+        }
+        std::vector<int> data_coord(rank, 0);
+        std::vector<int> idx_coord(nindex, 0);
+        std::vector<int> out_coord(out_shape.size(), 0);
+        for (int o = 0; o < total; ++o) {
+            int r = o;
+            for (size_t d = 0; d < out_shape.size(); ++d) {
+                out_coord[d] = (r / out_stride[d]) % out_shape[d];
+            }
+            for (const auto &sl : slots) {
+                int v = out_coord[sl.dim];
+                if (sl.src_rank == 0) {
+                    data_coord[sl.src_dim] = v;
+                } else {
+                    idx_coord[sl.src_dim] = v;
+                }
+            }
+            int gather_idx = (*indices)[nd_to_linear(idx_coord, i_stride)];
+            if (gather_idx < 0) {
+                gather_idx += axis_size;
+            }
+            data_coord[axis] = static_cast<int>(gather_idx);
+            out[o] = (*data)[nd_to_linear(data_coord, d_stride)];
+        }
+
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        // Explicit src keeps the CPU copy alive for downstream as_tensor<>()
+        // readers (copyToGPU would clear data_ otherwise).
+        output->copyToGPU(m_cmdpool_, out.data());
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -89,6 +203,14 @@ class Gather : public Operator {
         }
         std::vector<int> out_shape =
             calculateGatherOutputShape(inshape, indshape, param_.axis);
+
+        // int64 data flows through a synchronous CPU path (see
+        // cpuComputeInt64); all 352 int64 gathers in the LLM are part of the
+        // shape/position meta-chain.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            cpuComputeInt64(inputs, outputs);
+            return;
+        }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);

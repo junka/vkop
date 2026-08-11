@@ -3,6 +3,7 @@
 #define OPS_RANGE_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <cmath>
 #include <numeric>
@@ -55,6 +56,39 @@ class Range : public Operator {
                     std::ceil((limit - start) / std::abs(delta)));
                 out_shape.push_back(inums);
             });
+        }
+
+        // int64 range runs on the CPU (all 6 instances are part of the shape
+        // meta-chain, e.g. position indices). Inputs are CPU-resident scalars
+        // during recording. int64 arithmetic: delta may be negative; count =
+        // max(0, ceil((limit-start)/delta)) with the div rounding away from
+        // zero per ONNX (delta and limit-start always share sign in practice).
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            auto start = core::as_tensor<int64_t>(inputs[0])->at(0);
+            auto limit = core::as_tensor<int64_t>(inputs[1])->at(0);
+            auto delta = core::as_tensor<int64_t>(inputs[2])->at(0);
+            int64_t range = limit - start;
+            int64_t inums = 0;
+            if (range == 0) {
+                inums = 0;
+            } else if (range > 0) {
+                inums = (delta > 0) ? (range + delta - 1) / delta : 0;
+            } else {
+                inums = (delta < 0) ? (range - delta - 1) / delta : 0;
+            }
+            out_shape = {static_cast<int>(inums)};
+            std::vector<int64_t> out(static_cast<size_t>(inums));
+            for (int64_t i = 0; i < inums; ++i) {
+                out[static_cast<size_t>(i)] = start + i * delta;
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            if (output->size() == 0) {
+                output->resize(out_shape);
+            }
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
         }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {

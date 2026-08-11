@@ -41,7 +41,13 @@ void VkModel::loadFromBinary(const std::string& filePath) {
 // FlatBuffers reader (zero-copy mmap view)
 // ---------------------------------------------------------------------------
 void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
-    ::flatbuffers::Verifier verifier(buf, size);
+    // Large models (the LLM vkopbin is 3.4GB) exceed FlatBuffers' default
+    // max_size (INT32_MAX ~ 2.1GB) and would trip the verifier's constructor
+    // assertion. Raise the cap to the actual buffer size so verification of
+    // multi-GB mmaps works.
+    ::flatbuffers::Verifier::Options vopts;
+    vopts.max_size = size + 1;
+    ::flatbuffers::Verifier verifier(buf, size, vopts);
     if (!vkop::model::VerifyModelBuffer(verifier)) {
         throw std::runtime_error("Invalid VKOP model: FlatBuffers verification failed");
     }
@@ -61,6 +67,7 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
                 const auto* s = v->Get(i);
                 Shape shape;
                 shape.name = s->name() ? s->name()->str() : "";
+                shape.dtype = s->dtype() ? s->dtype()->str() : "";
                 if (s->dims()) {
                     shape.dims.reserve(s->dims()->size());
                     for (uint32_t d = 0; d < s->dims()->size(); ++d) {

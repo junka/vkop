@@ -63,13 +63,12 @@ float combine(float a, float b) {
     return a + b;
 }
 
-void main() {
-    int out_gid = int(gl_GlobalInvocationID.x);
-    int rank = uReduce.rank;
-
+// Compute the reduction for one output element (linear index out_gid).
+// Returns the fp32 reduced value. Shared by the fp32 and fp16 main paths.
+float reduce_one(int out_gid, int rank) {
     int out_total = 1;
     for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];
-    if (out_gid >= out_total) return;
+    if (out_gid >= out_total) return 0.0f / 0.0f;
 
     IArr8 out_coord = linear_to_nd8(out_gid, uReduce.outDims, rank);
 
@@ -99,7 +98,12 @@ void main() {
             in_coord.v[red_axes[r]] = counter[r];
         }
         int in_linear = nd_to_linear8(in_coord, uReduce.inDims, rank);
+#ifdef FP16
+        // fp16: element in_linear lives in word in_linear/2, lane in_linear%2.
+        float v = BUF_LOAD(uInput.data, in_linear);
+#else
         float v = uintBitsToFloat(uInput.data[in_linear]);
+#endif
         acc = combine(acc, transform_val(v));
 
         for (int r = n_red - 1; r >= 0; --r) {
@@ -119,5 +123,32 @@ void main() {
     } else if (uReduce.reduce_op == REDUCE_LOGSUM) {
         result = log(max(acc, 1e-12f));
     }
-    uOutput.data[out_gid] = floatBitsToUint(result);
+    return result;
+}
+
+void main() {
+    int out_gid = int(gl_GlobalInvocationID.x);
+    int rank = uReduce.rank;
+#ifdef FP16
+    // fp16 packs two output elements per uint word; one thread per word,
+    // computing both reductions and writing a single packed half2 (avoids
+    // the read-modify-write race that two independent threads on the same
+    // word would cause).
+    int out_total = 1;
+    for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];
+    int nwords = (out_total + 1) / 2;
+    if (out_gid >= nwords) return;
+    int i0 = 2 * out_gid;
+    int i1 = 2 * out_gid + 1;
+    float r0 = reduce_one(i0, rank);
+    vec2 out_pair;
+    out_pair[0] = (i0 < out_total) ? r0 : 0.0;
+    out_pair[1] = (i1 < out_total) ? reduce_one(i1, rank) : unpackHalf2x16(uOutput.data[out_gid])[1];
+    uOutput.data[out_gid] = packHalf2x16(out_pair);
+#else
+    int out_total = 1;
+    for (int i = 0; i < rank; ++i) out_total *= uReduce.outDims.v[i];
+    if (out_gid >= out_total) return;
+    uOutput.data[out_gid] = floatBitsToUint(reduce_one(out_gid, rank));
+#endif
 }

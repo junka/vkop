@@ -1,6 +1,8 @@
 // junka @ 2025
 #include <chrono>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <queue>
 
@@ -50,13 +52,51 @@ void Runtime::LoadModel() {
         }
     }
     printf("Total nodes %zu\n", model.nodes.size());
+    // Inputs are dtype-aware now that ShapeRef carries dtype. For the buffer
+    // (SSBO) backend every input is a storage buffer; for the legacy image
+    // backend fp16 inputs stay as input images (matching the original
+    // behaviour that add_conv_model and the vision tests rely on).
     for (const auto &i : model.inputs) {
-        // this is enough for input image
-        auto t = std::make_shared<Tensor<uint16_t>>(i.dims);
-        t->set_ref_cnt_forever();
+        std::shared_ptr<ITensor> t;
+        if (backend_buffer_) {
+            if (i.dtype == "int64") {
+                auto typed = std::make_shared<Tensor<int64_t>>(i.dims);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+            } else if (i.dtype == "int32") {
+                auto typed = std::make_shared<Tensor<int>>(i.dims);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+            } else if (i.dtype == "bool" || i.dtype == "int8") {
+                // bool/int8 share the int8 storage representation; the LLM's
+                // image_pad_mask is bool but buffer ops consume it as bytes.
+                auto typed = std::make_shared<Tensor<int8_t>>(i.dims);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+            } else if (i.dtype == "float32") {
+                auto typed = std::make_shared<Tensor<float>>(i.dims);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+            } else {
+                // float16 / unknown -> fp16 (the historical default).
+                auto typed = std::make_shared<Tensor<uint16_t>>(i.dims);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+            }
+        } else {
+            // legacy image backend: fp16 inputs as images (original path).
+            auto t16 = std::make_shared<Tensor<uint16_t>>(i.dims);
+            t16->set_ref_cnt_forever();
+            t16->as_input_image(dev, nullptr);
+            t = t16;
+        }
         inputs_[i.name] = t;
         tensor_map[i.name] = t;
-        t->as_input_image(dev, nullptr);
     }
 
     for (const auto &o : model.outputs) {
@@ -92,7 +132,13 @@ void Runtime::LoadModel() {
             }
         }
 
-        if (tensor->num_dims() <= 2) {
+        if (backend_buffer_) {
+            // SSBO backend: every initializer is a storage buffer regardless of
+            // rank (row-major compact, no NCHW->RGBA image packing). This is
+            // the path the LLM (buffer-only ops) uses.
+            tensor->as_storage_buffer(dev);
+            tensor->copyToGPU(m_cmdpool_, src);
+        } else if (tensor->num_dims() <= 2) {
             if (inputs_for_node_type[init.name] == "Conv" ||
                 inputs_for_node_type[init.name] == "BatchNormalization") {
                 tensor->as_uniform_bufferview(dev);
@@ -200,12 +246,24 @@ void Runtime::LoadModel() {
             t->set_ref_cnt_forever();
             t->fillToCPU(const_cast<int64_t *>(
                 reinterpret_cast<const int64_t *>(src_ptr)));
+            // Upload to GPU as an SSBO. Explicit src keeps the CPU copy alive
+            // so downstream ops can read it via as_tensor<int64_t>() without a
+            // GPU->CPU round trip (int64 is only consumed by buffer-backend
+            // CPU-compute branches).
+            t->as_storage_buffer(dev);
+            t->copyToGPU(m_cmdpool_,
+                         const_cast<int64_t *>(
+                             reinterpret_cast<const int64_t *>(src_ptr)));
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
             auto t = std::make_shared<Tensor<int>>(init.dims);
             t->set_ref_cnt_forever();
             t->fillToCPU(
+                const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
+            t->as_storage_buffer(dev);
+            t->copyToGPU(
+                m_cmdpool_,
                 const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
@@ -300,10 +358,41 @@ void Runtime::LoadModel() {
                     assert(tensor_map[out_shape.name]->is_on_GPU());
                     node_outputs.push_back(tensor_map[out_shape.name]);
                 } else {
+                    // Infer the output tensor dtype. ShapeRef carries only
+                    // name+dims, so we derive it from op semantics and the
+                    // dtypes already present in tensor_map.
+                    std::string dtype_marker = "_";
+                    if (type == vkop::ops::OpType::SHAPE) {
+                        dtype_marker = "_i64_";
+                    } else if (type == vkop::ops::OpType::NONZERO) {
+                        dtype_marker = "_i64_";
+                    } else if (type == vkop::ops::OpType::CAST) {
+                        int to = 0;
+                        auto it = n.attributes.find("to");
+                        if (it != n.attributes.end()) {
+                            to = std::stoi(it->second);
+                        }
+                        if (to == 10) { // fp16
+                            dtype_marker = "_f16_";
+                        } else {
+                            dtype_marker = "_f32_";
+                        }
+                    } else if (!node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
+                               node_inputs[0]->dtype() == typeid(int64_t)) {
+                        // dtype follows the DATA input (int64 flows through
+                        // Div/Gather/Concat/Equal/Where/Mul/Neg/Add/Slice/
+                        // Reshape/Transpose/Expand)
+                        dtype_marker = "_i64_";
+                    } else {
+                        dtype_marker = precision_ == 1 ? "_f16_" : "_f32_";
+                    }
+
                     std::string key = "_";
                     for (const auto &dim : out_shape.dims) {
                         key += std::to_string(dim) + "_";
                     }
+                    key += dtype_marker;
                     auto q = outshape_tensor_map[key];
                     if (!q.empty()) {
                         auto t = q.front();
@@ -312,7 +401,18 @@ void Runtime::LoadModel() {
                         tensor_map[out_shape.name] = t;
                         node_outputs.push_back(t);
                     } else {
-                        if (precision_ == 1) {
+                        if (dtype_marker == "_i64_") {
+                            // int64 outputs are CPU-computed by the shape
+                            // meta-chain ops (Shape/Gather/Slice/...); they
+                            // upload to an SSBO themselves. Create off-GPU so
+                            // is_on_GPU() doesn't lie about a non-existent
+                            // buffer (which would make copyToCPU deref null).
+                            auto t = std::make_shared<Tensor<int64_t>>(
+                                out_shape.dims, false);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
+                        } else if (dtype_marker == "_f16_") {
                             auto t = std::make_shared<Tensor<uint16_t>>(
                                 out_shape.dims, true);
                             t->set_ref_cnt(consumers[out_shape.name]);
@@ -334,6 +434,18 @@ void Runtime::LoadModel() {
                     std::string key = "_";
                     for (const auto &dim : t->getShape()) {
                         key += std::to_string(dim) + "_";
+                    }
+                    key += "_";
+                    if (t->dtype() == typeid(int64_t)) {
+                        key += "i64_";
+                    } else if (t->dtype() == typeid(uint16_t)) {
+                        key += "f16_";
+                    } else if (t->dtype() == typeid(float)) {
+                        key += "f32_";
+                    } else if (t->dtype() == typeid(int)) {
+                        key += "i32_";
+                    } else {
+                        key += "other_";
                     }
                     auto q = outshape_tensor_map[key];
                     q.push(t);
@@ -363,6 +475,9 @@ void Runtime::LoadModel() {
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
+    // Persist a name->tensor view of every named tensor for post-Run
+    // inspection (driver dumps intermediates to diagnose NaN propagation).
+    tensor_map_ = tensor_map;
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
@@ -378,6 +493,32 @@ std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
         return nullptr;
     }
     return it->second;
+}
+
+void Runtime::ResizeInput(const std::string &name,
+                          const std::vector<uint32_t> &dims) {
+    auto it = inputs_.find(name);
+    if (it == inputs_.end()) {
+        throw std::runtime_error("ResizeInput: unknown input " + name);
+    }
+    auto dev = m_cmdpool_->getVulkanDevice();
+    auto &t = it->second;
+    if (t->dtype() == typeid(int64_t)) {
+        as_tensor<int64_t>(t)->resize(dims);
+        as_tensor<int64_t>(t)->recreate_storage_buffer(dev);
+    } else if (t->dtype() == typeid(int)) {
+        as_tensor<int>(t)->resize(dims);
+        as_tensor<int>(t)->recreate_storage_buffer(dev);
+    } else if (t->dtype() == typeid(int8_t)) {
+        as_tensor<int8_t>(t)->resize(dims);
+        as_tensor<int8_t>(t)->recreate_storage_buffer(dev);
+    } else if (t->dtype() == typeid(float)) {
+        as_tensor<float>(t)->resize(dims);
+        as_tensor<float>(t)->recreate_storage_buffer(dev);
+    } else {
+        as_tensor<uint16_t>(t)->resize(dims);
+        as_tensor<uint16_t>(t)->recreate_storage_buffer(dev);
+    }
 }
 
 std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) const {
@@ -404,11 +545,263 @@ Runtime::GetInitializer(const std::string &name) const {
     return it->second;
 }
 
+std::shared_ptr<ITensor> Runtime::GetTensor(const std::string &name) const {
+    auto it = tensor_map_.find(name);
+    if (it != tensor_map_.end()) {
+        return it->second;
+    }
+    auto ini = initializers_.find(name);
+    if (ini != initializers_.end()) {
+        return ini->second;
+    }
+    auto inp = inputs_.find(name);
+    if (inp != inputs_.end()) {
+        return inp->second;
+    }
+    return nullptr;
+}
+
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
 
     bool single_queue = dev->getNumComputeQueues() <= 1;
+
+    // Debug: VKOP_NAN_SCAN=1 synchronizes after every concurrent level and
+    // scans each node's output tensors for NaN/Inf, printing the first node
+    // (name + op idx + level) that produces a non-finite value. Slow (forces
+    // a full GPU stall per level) but pinpoints where NaN first appears.
+    const char *nan_scan_env = std::getenv("VKOP_NAN_SCAN");
+    bool nan_scan = nan_scan_env && nan_scan_env[0] == '1';
+
+    if (nan_scan) {
+        size_t last_level_index = level_node_indices_.size() - 1;
+        for (size_t level_idx = 0; level_idx < level_node_indices_.size();
+             level_idx++) {
+            const auto &level_nodes = level_node_indices_[level_idx];
+            int id = 0;
+            std::vector<std::shared_ptr<VulkanCommandBuffer>> cmds;
+            for (auto node_idx : level_nodes) {
+                node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
+                                               node_output_tensors_[node_idx],
+                                               id);
+                auto cmd = node_ops_[node_idx]->get_record();
+                for (auto &dep : node_dependency_indices_[node_idx]) {
+                    cmd->addWait(
+                        node_ops_[dep]->get_record()->getSignalSemaphore(),
+                        node_ops_[dep]->get_record()->getSignalValue());
+                }
+                cmds.push_back(cmd);
+                id++;
+                id %= vkop::kInflight;
+            }
+            // Submit + wait this level before proceeding so outputs are ready.
+            std::vector<VkSubmitInfo> sis;
+            for (auto &c : cmds)
+                sis.push_back(c->buildSubmitInfo());
+            if (!sis.empty()) {
+                VulkanCommandBuffer::submit(dev->getComputeQueue(0), sis);
+            }
+            for (auto &c : cmds)
+                c->wait();
+            for (auto &c : cmds) {
+                c->clearWaits();
+                c->reset();
+            }
+
+            // Scan outputs of every node in this level for NaN/Inf.
+            for (auto node_idx : level_nodes) {
+                const auto &outs = node_output_tensors_[node_idx];
+                for (size_t oi = 0; oi < outs.size(); ++oi) {
+                    auto &t = outs[oi];
+                    if (!t)
+                        continue;
+                    // Only float-bearing dtypes can hold NaN.
+                    bool is_fp16 = (t->dtype() == typeid(uint16_t));
+                    bool is_fp32 = (t->dtype() == typeid(float));
+                    if (!is_fp16 && !is_fp32)
+                        continue;
+                    int ne = t->size() / (is_fp16 ? 2 : 4);
+                    if (ne <= 0)
+                        continue;
+                    int nan_cnt = 0, inf_cnt = 0;
+                    if (is_fp16) {
+                        auto tg = as_tensor<uint16_t>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        const uint16_t *p = reinterpret_cast<const uint16_t *>(
+                            tg->data().data());
+                        for (int i = 0; i < ne; ++i) {
+                            float v = ITensor::fp16_to_fp32(p[i]);
+                            if (std::isnan(v))
+                                nan_cnt++;
+                            else if (std::isinf(v))
+                                inf_cnt++;
+                        }
+                    } else {
+                        auto tg = as_tensor<float>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        const float *p =
+                            reinterpret_cast<const float *>(tg->data().data());
+                        for (int i = 0; i < ne; ++i) {
+                            if (std::isnan(p[i]))
+                                nan_cnt++;
+                            else if (std::isinf(p[i]))
+                                inf_cnt++;
+                        }
+                    }
+                    if (nan_cnt > 0 || inf_cnt > 0) {
+                        std::printf(
+                            "[NANSCAN] FIRST NaN/Inf at level=%zu nodeidx=%zu "
+                            "name=%s out=%zu ne=%d nan=%d inf=%d\n",
+                            level_idx, node_idx,
+                            node_ops_[node_idx]->get_name().c_str(), oi, ne,
+                            nan_cnt, inf_cnt);
+                        // Dump input stats so we can tell whether the NaN came
+                        // from the op itself or was already in its inputs.
+                        const auto &ins = node_input_tensors_[node_idx];
+                        for (size_t ii = 0; ii < ins.size(); ++ii) {
+                            auto &it = ins[ii];
+                            if (!it) {
+                                std::printf("  in[%zu]=null\n", ii);
+                                continue;
+                            }
+                            bool ifp16 = (it->dtype() == typeid(uint16_t));
+                            bool ifp32 = (it->dtype() == typeid(float));
+                            if (!ifp16 && !ifp32) {
+                                std::printf("  in[%zu] ne=%d (non-fp)\n", ii,
+                                            it->size());
+                                continue;
+                            }
+                            int ine = it->size() / (ifp16 ? 2 : 4);
+                            if (ine <= 0) {
+                                std::printf("  in[%zu] ne=0\n", ii);
+                                continue;
+                            }
+                            int inan = 0, iinf = 0;
+                            float imn = 1e30f, imx = -1e30f;
+                            if (ifp16) {
+                                auto tg = as_tensor<uint16_t>(it);
+                                tg->copyToCPU(m_cmdpool_);
+                                const uint16_t *p =
+                                    reinterpret_cast<const uint16_t *>(
+                                        tg->data().data());
+                                for (int i = 0; i < ine; ++i) {
+                                    float v = ITensor::fp16_to_fp32(p[i]);
+                                    if (std::isnan(v))
+                                        inan++;
+                                    else if (std::isinf(v))
+                                        iinf++;
+                                    else {
+                                        if (v < imn)
+                                            imn = v;
+                                        if (v > imx)
+                                            imx = v;
+                                    }
+                                }
+                            } else {
+                                auto tg = as_tensor<float>(it);
+                                tg->copyToCPU(m_cmdpool_);
+                                const float *p =
+                                    reinterpret_cast<const float *>(
+                                        tg->data().data());
+                                for (int i = 0; i < ine; ++i) {
+                                    if (std::isnan(p[i]))
+                                        inan++;
+                                    else if (std::isinf(p[i]))
+                                        iinf++;
+                                    else {
+                                        if (p[i] < imn)
+                                            imn = p[i];
+                                        if (p[i] > imx)
+                                            imx = p[i];
+                                    }
+                                }
+                            }
+                            std::printf("  in[%zu] ne=%d nan=%d inf=%d "
+                                        "min=%.5g max=%.5g\n",
+                                        ii, ine, inan, iinf, imn, imx);
+                        }
+                        // Identify which upstream node produced each input by
+                        // pointer-matching against dependency outputs.
+                        for (size_t ii = 0; ii < ins.size(); ++ii) {
+                            auto &it = ins[ii];
+                            if (!it)
+                                continue;
+                            std::string prod = "<none>";
+                            for (auto dep :
+                                 node_dependency_indices_[node_idx]) {
+                                if (dep < 0 || dep >= (int)node_ops_.size())
+                                    continue;
+                                const auto &douts = node_output_tensors_[dep];
+                                for (size_t k = 0; k < douts.size(); ++k) {
+                                    if (douts[k].get() == it.get()) {
+                                        prod = node_ops_[dep]->get_name() +
+                                               "/out" + std::to_string(k);
+                                        break;
+                                    }
+                                }
+                                if (prod != "<none>")
+                                    break;
+                            }
+                            std::printf("  in[%zu] <- %s\n", ii, prod.c_str());
+                        }
+                        // Dump up to 16 output-NaN indices paired with the
+                        // corresponding input[0] and input[1] values, so we
+                        // can see exactly which (a,b) pairs go NaN.
+                        if (oi == 0 && !ins.empty() && ins[0] &&
+                            ins[0]->dtype() == typeid(uint16_t)) {
+                            auto a_tg = as_tensor<uint16_t>(ins[0]);
+                            a_tg->copyToCPU(m_cmdpool_);
+                            const uint16_t *ap =
+                                reinterpret_cast<const uint16_t *>(
+                                    a_tg->data().data());
+                            int ane = ins[0]->size() / 2;
+                            const uint16_t *bp = nullptr;
+                            int bne = 0;
+                            if (ins.size() > 1 && ins[1] &&
+                                ins[1]->dtype() == typeid(uint16_t)) {
+                                auto b_tg = as_tensor<uint16_t>(ins[1]);
+                                b_tg->copyToCPU(m_cmdpool_);
+                                bp = reinterpret_cast<const uint16_t *>(
+                                    b_tg->data().data());
+                                bne = ins[1]->size() / 2;
+                            }
+                            auto out_tg = as_tensor<uint16_t>(t);
+                            out_tg->copyToCPU(m_cmdpool_);
+                            const uint16_t *op =
+                                reinterpret_cast<const uint16_t *>(
+                                    out_tg->data().data());
+                            int shown = 0;
+                            std::printf("  nanidx (i: a -> out):");
+                            for (int i = 0; i < ne && shown < 16; ++i) {
+                                float ov = ITensor::fp16_to_fp32(op[i]);
+                                if (!std::isnan(ov) && !std::isinf(ov))
+                                    continue;
+                                float av = (i < ane)
+                                               ? ITensor::fp16_to_fp32(ap[i])
+                                               : 0.0f / 0.0f;
+                                float bv = (bp && i < bne)
+                                               ? ITensor::fp16_to_fp32(bp[i])
+                                               : 0.0f / 0.0f;
+                                std::printf(" [%d: a=%.5g b=%.5g o=%04x]", i,
+                                            av, bv, op[i]);
+                                shown++;
+                            }
+                            std::printf("\n");
+                        }
+                        std::fflush(stdout);
+                        (void)last_level_index;
+                        auto end = std::chrono::steady_clock::now();
+                        std::chrono::duration<double> e = end - start;
+                        return e.count() * 1000.0F;
+                    }
+                }
+            }
+        }
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        return elapsed.count() * 1000.0F;
+    }
 
     std::vector<std::vector<VkSubmitInfo>> submit_infos(vkop::kInflight);
     std::vector<std::shared_ptr<VulkanCommandBuffer>> last_commands(

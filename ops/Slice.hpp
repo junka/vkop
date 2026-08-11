@@ -160,6 +160,53 @@ class SliceBuffer : public BufferFactory {
                 inputs.size() > 4 ? core::as_tensor<int64_t>(inputs[4])->data()
                                   : std::vector<int64_t>{});
 
+        // int64 data: CPU slice (part of the shape meta-chain). Walk the
+        // output linearly; each output coordinate maps to an input coordinate
+        // via in_coord[d] = full_starts[d] + out_coord[d] * full_steps[d].
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            auto out_shape = out_size[0];
+            auto &full_starts = out_size[1];
+            auto &full_steps = out_size[3];
+            int total = total_elems(out_shape);
+            std::vector<int64_t> out(static_cast<size_t>(total));
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+
+            std::vector<int> in_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                in_stride[d] = in_stride[d + 1] * inshape[d + 1];
+            }
+            std::vector<int> out_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                out_stride[d] = out_stride[d + 1] * out_shape[d + 1];
+            }
+            std::vector<int> in_coord(rank, 0);
+            std::vector<int> out_coord(rank, 0);
+            for (int o = 0; o < total; ++o) {
+                int r = o;
+                for (int d = 0; d < rank; ++d) {
+                    out_coord[d] = (r / out_stride[d]) % out_shape[d];
+                }
+                int in_lin = 0;
+                for (int d = 0; d < rank; ++d) {
+                    in_coord[d] = full_starts[d] + out_coord[d] * full_steps[d];
+                    in_lin += in_coord[d] * in_stride[d];
+                }
+                out[static_cast<size_t>(o)] = (*src)[in_lin];
+            }
+
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            // Always resize to the computed out_shape so output->size() matches
+            // out.size()*sizeof(int64_t); the runtime may have pre-created the
+            // output with the model's symbolic dims (e.g. [1]), which would
+            // otherwise mismatch an empty slice result (total==0) and cause
+            // fillToCPU to overread `out`.
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

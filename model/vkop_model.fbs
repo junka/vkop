@@ -49,6 +49,7 @@ struct RGBAConversionMeta {
 table ShapeRef {
   name: string;
   dims: [uint];
+  dtype: string;
 }
 
 table TensorData {

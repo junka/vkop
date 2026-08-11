@@ -3,6 +3,7 @@
 #define OPS_EXPAND_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <cmath>
 #include <numeric>
@@ -42,15 +43,58 @@ class Expand : public Operator {
         std::vector<int> inshape = inputs[0]->getShape();
         std::vector<int> out_shape = outputs[0]->getShape();
         if (out_shape.size() == 0) {
-            auto input = core::as_tensor<int>(inputs[1]);
-            input->copyToCPU(m_cmdpool_);
-            auto num = input->size();
-            out_shape.resize(num);
-            for (int i = 0; i < num; ++i) {
-                out_shape[i] = static_cast<int>(input->data()[i]);
-            }
-            input->copyToGPU(m_cmdpool_);
+            dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto shape_input = core::as_tensor<T>(inputs[1]);
+                shape_input->copyToCPU(m_cmdpool_);
+                auto num = shape_input->size();
+                out_shape.resize(num);
+                for (int i = 0; i < num; ++i) {
+                    out_shape[i] = static_cast<int>(shape_input->data()[i]);
+                }
+                shape_input->copyToGPU(m_cmdpool_);
+            });
         }
+
+        // int64 data: CPU broadcast (part of the shape meta-chain). The target
+        // shape (inputs[1]) is the authoritative source — do NOT trust a
+        // recycled output's stale shape. inputs[1] is CPU-resident here.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            auto shape_input = core::as_tensor<int64_t>(inputs[1]);
+            if (!shape_input->has_cpu_data()) {
+                shape_input->copyToCPU(m_cmdpool_);
+            }
+            out_shape.resize(shape_input->num_elements());
+            for (int i = 0; i < shape_input->num_elements(); ++i) {
+                out_shape[i] = static_cast<int>((*shape_input)[i]);
+            }
+            int total = total_elems(out_shape);
+            std::vector<int64_t> out(total);
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            printf("[expandint64] src cpu=%d gpu=%d size=%d inshape=[",
+                   (int)src->has_cpu_data(), (int)src->has_gpu_buffer(),
+                   (int)src->num_elements());
+            for (auto d : inshape)
+                printf("%d,", d);
+            printf("] out_shape=[");
+            for (auto d : out_shape)
+                printf("%d,", d);
+            printf("] total=%d\n", total);
+            fflush(stdout);
+            if (!src->has_cpu_data()) {
+                src->copyToCPU(m_cmdpool_);
+            }
+            for (int i = 0; i < total; ++i) {
+                out[i] = (*src)[broadcast_index(inshape, out_shape, i)];
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -70,9 +114,12 @@ class Expand : public Operator {
             auto input_buffer = input->as_storage_buffer(m_dev_, m_cmd_);
             objs_.emplace_back(input_buffer);
         });
-        auto shapeinput = core::as_tensor<int>(inputs[1]);
-        auto input_buffer = shapeinput->as_storage_buffer(m_dev_, m_cmd_);
-        objs_.emplace_back(input_buffer);
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto shapeinput = core::as_tensor<T>(inputs[1]);
+            auto input_buffer = shapeinput->as_storage_buffer(m_dev_, m_cmd_);
+            objs_.emplace_back(input_buffer);
+        });
 
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());

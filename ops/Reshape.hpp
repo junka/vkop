@@ -244,6 +244,26 @@ class ReshapeBuffer : public BufferFactory {
             }
         }
 
+        // int64 data: a reshape is a metadata-only change, so the output is a
+        // 1:1 contiguous copy (part of the shape meta-chain). The shape input
+        // (inputs[1]) is already CPU-resident.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            std::vector<int64_t> out(static_cast<size_t>(total));
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            if (!src->has_cpu_data()) {
+                src->copyToCPU(m_cmdpool_);
+            }
+            for (int i = 0; i < total; ++i) {
+                out[static_cast<size_t>(i)] = (*src)[i];
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(dim);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

@@ -36,7 +36,15 @@ class BufferBinaryFactory : public BufferFactory {
             int idx2 = i - (max_dims - shape2.size());
             int dim1 = (idx1 >= 0) ? shape1[idx1] : 1;
             int dim2 = (idx2 >= 0) ? shape2[idx2] : 1;
-            if (dim1 == 1 || dim2 == 1) {
+            // ONNX broadcasting: a 0 dimension propagates (a size-0 input
+            // yields a size-0 output). Treat 0 like 1 for compatibility, but
+            // propagate the 0 into the result so total_elements() is 0 and the
+            // loop is skipped — without this, a size-0 input paired with a
+            // size-1 input produces a size-1 result and the per-element read
+            // goes out of bounds on the empty tensor.
+            if (dim1 == 0 || dim2 == 0) {
+                result[i] = 0;
+            } else if (dim1 == 1 || dim2 == 1) {
                 result[i] = std::max(dim1, dim2);
             } else if (dim1 == dim2) {
                 result[i] = dim1;
@@ -48,9 +56,94 @@ class BufferBinaryFactory : public BufferFactory {
     }
 
   private:
+    // Host-compute an int64 elementwise binary op with right-aligned
+    // broadcasting. All int64 producers (Shape/NonZero/Equal/Where/Gather/
+    // Concat/Range/Slice/Reshape/Transpose/Div/Mul/Add) are CPU ops during
+    // the synchronous recording pass, and int64 initializers are
+    // CPU-resident, so both inputs are valid via as_tensor<int64_t>().
+    // ONNX int64 ops have no half2/uint packing; the data is uploaded to the
+    // output SSBO for downstream GPU readers (no GPU op consumes int64 data
+    // itself, but the buffer must exist for uniform handling).
+    void cpuComputeInt64(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        auto shape_a = inputs[0]->getShape();
+        auto shape_b = inputs[1]->getShape();
+        auto out_shape = computeBroadcastShape(shape_a, shape_b);
+        int total = total_elems(out_shape);
+
+        auto a = core::as_tensor<int64_t>(inputs[0]);
+        auto b = core::as_tensor<int64_t>(inputs[1]);
+        // int64 inputs may be GPU-resident only (e.g. NonZero's shader-computed
+        // output leaves data_ empty). Pull them to the host before (*a)[i].
+        printf("[binint64] a cpu=%d gpu=%d size=%d shape=[",
+               (int)a->has_cpu_data(), (int)a->has_gpu_buffer(),
+               (int)a->num_elements());
+        for (auto d : shape_a)
+            printf("%d,", d);
+        printf("] b cpu=%d gpu=%d size=%d shape=[", (int)b->has_cpu_data(),
+               (int)b->has_gpu_buffer(), (int)b->num_elements());
+        for (auto d : shape_b)
+            printf("%d,", d);
+        printf("]\n");
+        fflush(stdout);
+        if (!a->has_cpu_data()) {
+            a->copyToCPU(m_cmdpool_);
+        }
+        if (!b->has_cpu_data()) {
+            b->copyToCPU(m_cmdpool_);
+        }
+
+        std::vector<int64_t> out(total);
+        for (int i = 0; i < total; ++i) {
+            int64_t av = (*a)[broadcast_index(shape_a, out_shape, i)];
+            int64_t bv = (*b)[broadcast_index(shape_b, out_shape, i)];
+            switch (type_) {
+            case OpType::ADD:
+                out[i] = av + bv;
+                break;
+            case OpType::SUB:
+                out[i] = av - bv;
+                break;
+            case OpType::MUL:
+                out[i] = av * bv;
+                break;
+            case OpType::DIV: // ONNX int64 Div is C-style truncation
+                out[i] = av / bv;
+                break;
+            case OpType::POW: { // never reached for int64 in the LLM, keep sane
+                int64_t r = 1;
+                for (int64_t e = 0; e < bv; ++e) {
+                    r *= av;
+                }
+                out[i] = r;
+                break;
+            }
+            default:
+                throw std::runtime_error("int64 binary op not supported");
+            }
+        }
+
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        // Explicit src keeps the CPU copy alive for downstream as_tensor<>()
+        // readers (copyToGPU would clear data_ otherwise).
+        output->copyToGPU(m_cmdpool_, out.data());
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // int64 data flows through a synchronous CPU path (see
+        // cpuComputeInt64). In the LLM every binary node's inputs are either
+        // all-int64 or all-float, so gating on the data input's dtype is safe.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            cpuComputeInt64(inputs, outputs);
+            return;
+        }
+
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
         auto out_shape = computeBroadcastShape(shape_a, shape_b);

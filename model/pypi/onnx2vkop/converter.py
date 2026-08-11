@@ -81,8 +81,13 @@ class ModelConverter:
             shape_dims = [
                 dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim
             ]
+            dtype_str = {
+                1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
+                6: "int32", 7: "int64", 9: "bool", 10: "float16",
+                11: "float64", 16: "bfloat16",
+            }.get(tensor_type.elem_type, "")
             print("Graph input:", inp.name, "of shape:", shape_dims, "tensor type:", tensor_type.elem_type)
-            dag_model.inputs.append({"name": inp.name, "shape": shape_dims})
+            dag_model.inputs.append({"name": inp.name, "shape": shape_dims, "dtype": dtype_str})
 
         # Add outputs
         for out in graph.output:
@@ -90,8 +95,13 @@ class ModelConverter:
             shape_dims = [
                 dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim
             ]
+            dtype_str = {
+                1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
+                6: "int32", 7: "int64", 9: "bool", 10: "float16",
+                11: "float64", 16: "bfloat16",
+            }.get(tensor_type.elem_type, "")
             print("Graph output:", out.name, "of shape:", shape_dims)
-            dag_model.outputs.append({"name": out.name, "shape": shape_dims})
+            dag_model.outputs.append({"name": out.name, "shape": shape_dims, "dtype": dtype_str})
 
         modified_shapes = defaultdict(list)
         ELEMWISE_OPS = {

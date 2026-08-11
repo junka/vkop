@@ -161,6 +161,30 @@ inline int total_elems(const std::vector<int> &shape) {
         std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>()));
 }
 
+// ONNX right-aligned broadcast: given the (lower-or-equal-rank) input shape
+// `in_shape` and the broadcast `out_shape`, map a linear output index `lin`
+// to the linear input index (broadcast dims / leading padding dims map to
+// element 0). Shared by the CPU int64 compute branches (binary ops, Equal,
+// Where, Expand). The backward pass computes both the coordinate
+// decomposition and the input's row-major stride in one sweep.
+inline int broadcast_index(const std::vector<int> &in_shape,
+                           const std::vector<int> &out_shape, int lin) {
+    int rank = static_cast<int>(out_shape.size());
+    int offset = rank - static_cast<int>(in_shape.size());
+    int s = 1;
+    int idx = 0;
+    for (int d = rank - 1; d >= 0; --d) {
+        int in_dim = (d >= offset) ? in_shape[d - offset] : 1;
+        int coord = lin % out_shape[d];
+        lin /= out_shape[d];
+        if (in_dim != 1) {
+            idx += coord * s;
+            s *= in_dim;
+        }
+    }
+    return idx;
+}
+
 // Buffer op base: holds the SSBO bind helper; the Operator base does the
 // descriptor/pipeline heavy lifting.
 class BufferFactory : public Operator {

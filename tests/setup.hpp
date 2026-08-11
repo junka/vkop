@@ -265,7 +265,18 @@ public:
             }
         }
         for (const auto &input : inputs) {
-            if (!input || input->dtype() == typeid(int64_t)) {
+            if (!input) {
+                continue;
+            }
+            if (input->dtype() == typeid(int64_t)) {
+                // int64 tensors are read by shaders as ivec2[] (8-byte
+                // stride) for Gather/ScatterND, but some ops (Reshape/Slice/
+                // Expand shape meta-chain) read them on the host. Pass an
+                // explicit src so copyToGPU keeps the CPU copy alive.
+                auto t = core::as_tensor<int64_t>(input);
+                auto keep = t->data();
+                t->as_storage_buffer(dev_);
+                t->copyToGPU(cmdpool_, keep.data());
                 continue;
             }
             if (input->dtype() == typeid(int)) {

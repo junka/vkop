@@ -15,7 +15,7 @@ layout(set = 0, binding = 0) buffer Data {
     uint data[];
 } uData;
 layout(set = 0, binding = 1) readonly buffer Indices {
-    int data[];
+    ivec2 data[];
 } uIndices;
 layout(set = 0, binding = 2) readonly buffer Updates {
     uint data[];
@@ -35,7 +35,8 @@ void main() {
     int idx_slot = gid / uPC.cols;  // which index/update row
     int col = gid % uPC.cols;       // which column within the row
 
-    int row = uIndices.data[idx_slot];
+    // int64 indices (bound as ivec2[], low 32 bits = value).
+    int row = uIndices.data[idx_slot].x;
     int target = row * uPC.cols + col;
 
     float update = uintBitsToFloat(uUpdates.data[gid]);

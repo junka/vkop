@@ -30,6 +30,33 @@ class Equal : public BufferBinaryFactory {
         auto out_shape = computeBroadcastShape(shape_a, shape_b);
         int total = total_elems(out_shape);
 
+        // int64 comparison runs on the CPU (Equal is a pure host op in the
+        // LLM's shape meta-chain). The runtime allocates the output as
+        // int64 when the inputs are int64, and Where's CPU branch reads the
+        // result as `cond != 0`, so emit actual int64 1/0.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            auto a = core::as_tensor<int64_t>(inputs[0]);
+            auto b = core::as_tensor<int64_t>(inputs[1]);
+            if (!a->has_cpu_data()) {
+                a->copyToCPU(m_cmdpool_);
+            }
+            if (!b->has_cpu_data()) {
+                b->copyToCPU(m_cmdpool_);
+            }
+            std::vector<int64_t> out(total);
+            for (int i = 0; i < total; ++i) {
+                int64_t av = (*a)[broadcast_index(shape_a, out_shape, i)];
+                int64_t bv = (*b)[broadcast_index(shape_b, out_shape, i)];
+                out[i] = (av == bv) ? 1 : 0;
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

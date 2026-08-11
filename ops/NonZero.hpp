@@ -50,7 +50,13 @@ class NonZero : public BufferFactory {
             }
             bind_ssbo<T>(outputs[0], true);
         });
-        bind_ssbo<float>(inputs[0], false);
+        // Input may be bool/int8/int64/float — bind on its actual dtype so
+        // as_tensor<T> yields a non-null Tensor<T> (hardcoding float would
+        // crash on the LLM's int8 image_pad_mask-derived input).
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], false);
+        });
 
         // Zero the counter at output[0].
         // Since output is bound as SSBO (not zeroed), we use a fillBuffer

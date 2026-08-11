@@ -3,6 +3,7 @@
 #define OPS_WHERE_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <cmath>
 #include <numeric>
@@ -35,6 +36,41 @@ class Where : public Operator {
         if (out_shape.empty()) {
             auto inshape = inputs[0]->getShape();
             out_shape = inshape;
+        }
+
+        // int64 Where runs on the CPU (all 66 instances are part of the
+        // shape meta-chain: cond = Equal int64, X = ConstantOfShape, Y =
+        // Concat int64). cond, X, and Y are broadcast against out_shape;
+        // cond nonzero selects X, else Y.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            auto cond = core::as_tensor<int64_t>(inputs[0]);
+            auto x = core::as_tensor<int64_t>(inputs[1]);
+            auto y = core::as_tensor<int64_t>(inputs[2]);
+            if (!cond->has_cpu_data()) {
+                cond->copyToCPU(m_cmdpool_);
+            }
+            if (!x->has_cpu_data()) {
+                x->copyToCPU(m_cmdpool_);
+            }
+            if (!y->has_cpu_data()) {
+                y->copyToCPU(m_cmdpool_);
+            }
+            int total = total_elems(out_shape);
+            std::vector<int64_t> out(total);
+            for (int i = 0; i < total; ++i) {
+                int64_t cv = (*cond)[broadcast_index(inputs[0]->getShape(),
+                                                     out_shape, i)];
+                out[i] = (cv != 0) ? (*x)[broadcast_index(inputs[1]->getShape(),
+                                                          out_shape, i)]
+                                   : (*y)[broadcast_index(inputs[2]->getShape(),
+                                                          out_shape, i)];
+            }
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
         }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {

@@ -247,6 +247,7 @@ struct ShapeRefT : public ::flatbuffers::NativeTable {
   typedef ShapeRef TableType;
   std::string name{};
   std::vector<uint32_t> dims{};
+  std::string dtype{};
 };
 
 struct ShapeRef FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
@@ -257,7 +258,8 @@ struct ShapeRef FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   }
   enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
     VT_NAME = 4,
-    VT_DIMS = 6
+    VT_DIMS = 6,
+    VT_DTYPE = 8
   };
   const ::flatbuffers::String *name() const {
     return GetPointer<const ::flatbuffers::String *>(VT_NAME);
@@ -271,6 +273,12 @@ struct ShapeRef FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   ::flatbuffers::Vector<uint32_t> *mutable_dims() {
     return GetPointer<::flatbuffers::Vector<uint32_t> *>(VT_DIMS);
   }
+  const ::flatbuffers::String *dtype() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_DTYPE);
+  }
+  ::flatbuffers::String *mutable_dtype() {
+    return GetPointer<::flatbuffers::String *>(VT_DTYPE);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -278,6 +286,8 @@ struct ShapeRef FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            verifier.VerifyString(name()) &&
            VerifyOffset(verifier, VT_DIMS) &&
            verifier.VerifyVector(dims()) &&
+           VerifyOffset(verifier, VT_DTYPE) &&
+           verifier.VerifyString(dtype()) &&
            verifier.EndTable();
   }
   ShapeRefT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -295,6 +305,9 @@ struct ShapeRefBuilder {
   void add_dims(::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> dims) {
     fbb_.AddOffset(ShapeRef::VT_DIMS, dims);
   }
+  void add_dtype(::flatbuffers::Offset<::flatbuffers::String> dtype) {
+    fbb_.AddOffset(ShapeRef::VT_DTYPE, dtype);
+  }
   explicit ShapeRefBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -309,8 +322,10 @@ struct ShapeRefBuilder {
 inline ::flatbuffers::Offset<ShapeRef> CreateShapeRef(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     ::flatbuffers::Offset<::flatbuffers::String> name = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> dims = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint32_t>> dims = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> dtype = 0) {
   ShapeRefBuilder builder_(_fbb);
+  builder_.add_dtype(dtype);
   builder_.add_dims(dims);
   builder_.add_name(name);
   return builder_.Finish();
@@ -319,13 +334,16 @@ inline ::flatbuffers::Offset<ShapeRef> CreateShapeRef(
 inline ::flatbuffers::Offset<ShapeRef> CreateShapeRefDirect(
     ::flatbuffers::FlatBufferBuilder &_fbb,
     const char *name = nullptr,
-    const std::vector<uint32_t> *dims = nullptr) {
+    const std::vector<uint32_t> *dims = nullptr,
+    const char *dtype = nullptr) {
   auto name__ = name ? _fbb.CreateString(name) : 0;
   auto dims__ = dims ? _fbb.CreateVector<uint32_t>(*dims) : 0;
+  auto dtype__ = dtype ? _fbb.CreateString(dtype) : 0;
   return vkop::model::CreateShapeRef(
       _fbb,
       name__,
-      dims__);
+      dims__,
+      dtype__);
 }
 
 ::flatbuffers::Offset<ShapeRef> CreateShapeRef(::flatbuffers::FlatBufferBuilder &_fbb, const ShapeRefT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -1367,6 +1385,7 @@ inline void ShapeRef::UnPackTo(ShapeRefT *_o, const ::flatbuffers::resolver_func
   (void)_resolver;
   { auto _e = name(); if (_e) _o->name = _e->str(); }
   { auto _e = dims(); if (_e) { _o->dims.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->dims[_i] = _e->Get(_i); } } else { _o->dims.resize(0); } }
+  { auto _e = dtype(); if (_e) _o->dtype = _e->str(); }
 }
 
 inline ::flatbuffers::Offset<ShapeRef> CreateShapeRef(::flatbuffers::FlatBufferBuilder &_fbb, const ShapeRefT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -1379,10 +1398,12 @@ inline ::flatbuffers::Offset<ShapeRef> ShapeRef::Pack(::flatbuffers::FlatBufferB
   struct _VectorArgs { ::flatbuffers::FlatBufferBuilder *__fbb; const ShapeRefT* __o; const ::flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
   auto _name = _o->name.empty() ? 0 : _fbb.CreateString(_o->name);
   auto _dims = _o->dims.size() ? _fbb.CreateVector(_o->dims) : 0;
+  auto _dtype = _o->dtype.empty() ? 0 : _fbb.CreateString(_o->dtype);
   return vkop::model::CreateShapeRef(
       _fbb,
       _name,
-      _dims);
+      _dims,
+      _dtype);
 }
 
 inline TensorDataT *TensorData::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
@@ -1811,14 +1832,16 @@ inline const ::flatbuffers::TypeTable *RGBAConversionMetaTypeTable() {
 inline const ::flatbuffers::TypeTable *ShapeRefTypeTable() {
   static const ::flatbuffers::TypeCode type_codes[] = {
     { ::flatbuffers::ET_STRING, 0, -1 },
-    { ::flatbuffers::ET_UINT, 1, -1 }
+    { ::flatbuffers::ET_UINT, 1, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 }
   };
   static const char * const names[] = {
     "name",
-    "dims"
+    "dims",
+    "dtype"
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 2, type_codes, nullptr, nullptr, nullptr, names
+    ::flatbuffers::ST_TABLE, 3, type_codes, nullptr, nullptr, nullptr, names
   };
   return &tt;
 }

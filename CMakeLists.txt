@@ -286,6 +286,11 @@ set(DUAL_FP16_SHADERS
     buffer/softplus
     buffer/add
     buffer/sub
+    buffer/mul
+    buffer/div
+    buffer/pow
+    buffer/sqrt
+    buffer/reduce
     buffer/prelu
     buffer/reshape
     buffer/softmax

@@ -50,9 +50,12 @@
 #include "Sqrt.hpp"
 #include "Tanh.hpp"
 #include "Where.hpp"
+#include "ops/Cast.hpp"
 #include "ops/Equal.hpp"
 #include "ops/NonZero.hpp"
 #include "ops/ScatterElements.hpp"
+#include "ops/ScatterND.hpp"
+#include "ops/Shape.hpp"
 
 namespace vkop {
 
@@ -157,6 +160,12 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<NonZero>();
     case OpType::SCATTER_ELEMENTS:
         return std::make_unique<ScatterElements>();
+    case OpType::SHAPE:
+        return std::make_unique<Shape>();
+    case OpType::CAST:
+        return std::make_unique<Cast>();
+    case OpType::SCATTER_ND:
+        return std::make_unique<ScatterND>();
     default:
         return nullptr;
     }

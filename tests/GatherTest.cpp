@@ -20,7 +20,7 @@ public:
     int axis;
 
     std::shared_ptr<Tensor<T>> input;
-    std::shared_ptr<Tensor<int>> indices;
+    std::shared_ptr<Tensor<int64_t>> indices;
     std::shared_ptr<Tensor<T>> output;
     std::unordered_map<std::string, std::string> attributes;
 
@@ -56,8 +56,10 @@ private:
     {
         input = std::make_shared<Tensor<T>>(input_shape_);
 
-        indices = std::make_shared<Tensor<int>>(indices_shape_);
-        indices->fillToCPU(indices_data_);
+        indices = std::make_shared<Tensor<int64_t>>(indices_shape_);
+        std::vector<int64_t> indices_data_i64(indices_data_.begin(),
+                                              indices_data_.end());
+        indices->fillToCPU(indices_data_i64);
         indices->print_tensor();
 
         std::vector<int64_t> inshape(input_shape_.begin(), input_shape_.end());

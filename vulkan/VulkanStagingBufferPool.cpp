@@ -9,8 +9,10 @@ namespace vkop {
 
 namespace {
 constexpr int kInitialStagingBufferSize = 1024 * 1024 * 16; // 16MB initial
-constexpr int kMaxStagingBufferSize = 1024 * 1024 * 512;    // 512MB max
-constexpr int kGrowthFactor = 2; // Double when needed
+// Large LLM weights (e.g. lm_head [151936,2048] fp16 = 594MB) are uploaded as
+// a single staging copy, so the cap must exceed the biggest initializer.
+constexpr int kMaxStagingBufferSize = 1024 * 1024 * 1024; // 1GB max
+constexpr int kGrowthFactor = 2;                          // Double when needed
 } // namespace
 
 VulkanStagingBufferPool::VulkanStagingBufferPool(

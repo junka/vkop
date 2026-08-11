@@ -10,6 +10,8 @@ extern unsigned char image_mul_spv[];
 extern unsigned int image_mul_spv_len;
 extern unsigned char buffer_mul_spv[];
 extern unsigned int buffer_mul_spv_len;
+extern unsigned char buffer_mul_fp16_spv[];
+extern unsigned int buffer_mul_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -22,8 +24,9 @@ class MulImage : public BinaryFactory {
 class MulBuffer : public BufferBinaryFactory {
   public:
     explicit MulBuffer(int fp16)
-        : BufferBinaryFactory(OpType::MUL, buffer_mul_spv, buffer_mul_spv_len,
-                              fp16) {}
+        : BufferBinaryFactory(
+              OpType::MUL, fp16 ? buffer_mul_fp16_spv : buffer_mul_spv,
+              fp16 ? buffer_mul_fp16_spv_len : buffer_mul_spv_len, fp16) {}
 };
 
 class Mul : public PimplFacade {

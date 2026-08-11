@@ -1009,7 +1009,7 @@ class FusionOptimizer:
                     return o.get("dtype")
         for i in dag_model.inputs:
             if i["name"] == name:
-                return i.get("dtype")
+                return i.get("dtype", i.get("elem_type"))
         return None
 
     @staticmethod
