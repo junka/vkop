@@ -10,6 +10,8 @@ extern unsigned char image_sin_spv[];
 extern unsigned int image_sin_spv_len;
 extern unsigned char buffer_sin_spv[];
 extern unsigned int buffer_sin_spv_len;
+extern unsigned char buffer_sin_fp16_spv[];
+extern unsigned int buffer_sin_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -24,8 +26,9 @@ class SinImage : public UnaryFactory {
 class SinBuffer : public BufferUnaryFactory {
   public:
     explicit SinBuffer(int fp16)
-        : BufferUnaryFactory(OpType::SIN, buffer_sin_spv, buffer_sin_spv_len,
-                             fp16) {}
+        : BufferUnaryFactory(
+              OpType::SIN, fp16 ? buffer_sin_fp16_spv : buffer_sin_spv,
+              fp16 ? buffer_sin_fp16_spv_len : buffer_sin_spv_len, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

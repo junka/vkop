@@ -384,6 +384,21 @@ void Runtime::LoadModel() {
                         // Div/Gather/Concat/Equal/Where/Mul/Neg/Add/Slice/
                         // Reshape/Transpose/Expand)
                         dtype_marker = "_i64_";
+                    } else if (!node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
+                               node_inputs[0]->dtype() == typeid(uint16_t)) {
+                        // fp16 data input -> fp16 output.
+                        dtype_marker = "_f16_";
+                    } else if (!node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
+                               node_inputs[0]->dtype() == typeid(float)) {
+                        // fp32 data input -> fp32 output. This matters for the
+                        // RMSNorm chain: the model wraps Pow/ReduceMean/Add/
+                        // Sqrt/Div in Cast(to=1)...Cast(to=10) so the squaring
+                        // runs in fp32 and |x|^2 for |x|~200 doesn't overflow
+                        // fp16's 65504 max. If we force fp16 here (precision_),
+                        // Pow(206,2) overflows to Inf and RMSNorm collapses.
+                        dtype_marker = "_f32_";
                     } else {
                         dtype_marker = precision_ == 1 ? "_f16_" : "_f32_";
                     }
@@ -455,7 +470,42 @@ void Runtime::LoadModel() {
                 // (Legacy 2-D SSBO auto-path removed — softmax now uses the
                 // buffer backend via backend_buffer_, set elsewhere.)
             }
-            auto op = ops::create_from_type(type, precision_,
+            // For elementwise / unary / reduce / activation ops the fp16 flag
+            // must track the DATA input's actual dtype, not the global
+            // precision_. The RMSNorm chain runs Pow/ReduceMean/Sqrt/Div in an
+            // fp32 domain (wrapped by Cast to=1 ... to=10) so x^2 for |x|~200
+            // doesn't overflow fp16. If we force fp16 shaders here, the fp32
+            // Cast output gets read as packed half2 garbage and Pow overflows.
+            int op_fp16 = precision_;
+            if (!node_inputs.empty() && node_inputs[0] != nullptr) {
+                switch (type) {
+                case vkop::ops::OpType::ADD:
+                case vkop::ops::OpType::SUB:
+                case vkop::ops::OpType::MUL:
+                case vkop::ops::OpType::DIV:
+                case vkop::ops::OpType::POW:
+                case vkop::ops::OpType::SQRT:
+                case vkop::ops::OpType::REDUCE:
+                case vkop::ops::OpType::SIGMOID:
+                case vkop::ops::OpType::TANH:
+                case vkop::ops::OpType::ATAN:
+                case vkop::ops::OpType::SOFTPLUS:
+                case vkop::ops::OpType::PRELU:
+                case vkop::ops::OpType::SOFTMAX:
+                case vkop::ops::OpType::SIN:
+                case vkop::ops::OpType::COS:
+                case vkop::ops::OpType::NEG:
+                case vkop::ops::OpType::ERF:
+                case vkop::ops::OpType::FLOOR:
+                case vkop::ops::OpType::RELU:
+                    op_fp16 =
+                        (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+                    break;
+                default:
+                    break;
+                }
+            }
+            auto op = ops::create_from_type(type, op_fp16,
                                             dev->is_support_nv_tensor_core(),
                                             backend_buffer_);
             if (!op) {

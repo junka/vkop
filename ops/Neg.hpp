@@ -10,6 +10,8 @@ extern unsigned char image_neg_spv[];
 extern unsigned int image_neg_spv_len;
 extern unsigned char buffer_neg_spv[];
 extern unsigned int buffer_neg_spv_len;
+extern unsigned char buffer_neg_fp16_spv[];
+extern unsigned int buffer_neg_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -24,8 +26,9 @@ class NegImage : public UnaryFactory {
 class NegBuffer : public BufferUnaryFactory {
   public:
     explicit NegBuffer(int fp16)
-        : BufferUnaryFactory(OpType::NEG, buffer_neg_spv, buffer_neg_spv_len,
-                             fp16) {}
+        : BufferUnaryFactory(
+              OpType::NEG, fp16 ? buffer_neg_fp16_spv : buffer_neg_spv,
+              fp16 ? buffer_neg_fp16_spv_len : buffer_neg_spv_len, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

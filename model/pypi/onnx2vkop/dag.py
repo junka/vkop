@@ -281,12 +281,27 @@ class DAGBasedModel:
         # 大 blob（LLM 权重数 GB）塞不进 FlatBuffer（2GB 上限），走外部数据：
         # blob 整体写到文件末尾，FlatBuffer 内不存字节。判断标准与 2GB 上限
         # 留安全余量——超过 ~800MB 就外置。
+        #
+        # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
+        # 权重，预扫描时把每个 initializer 解成 ndarray 再 tobytes 会瞬间分配
+        # 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
+        _DTYPE_BYTES = {
+            1: 4, 2: 1, 3: 1, 4: 2, 5: 2, 6: 4, 7: 8, 9: 1, 10: 2,
+            11: 8, 12: 4, 13: 8, 16: 2,
+        }
+
+        def _init_byte_len(arr) -> int:
+            nbytes = _DTYPE_BYTES.get(arr.data_type, 0)
+            n = 1
+            for d in arr.dims:
+                n *= int(d)
+            return n * nbytes
+
         external = False
         try:
             total_blob = 0
             for _name, arr in self.initializers.items():
-                arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
-                total_blob += len(arr_np.tobytes())
+                total_blob += _init_byte_len(arr)
             if getattr(self, "_unified_bytes", b""):
                 total_blob += len(self._unified_bytes)
             if total_blob > (800 << 20):
@@ -294,18 +309,28 @@ class DAGBasedModel:
         except Exception:
             external = False
 
-        blob = bytearray()
+        # external 模式：blob 直接流式写盘（见文件写入段），这里只建侧表 +
+        # 记录 (offset, byte_len)，绝不把整个 blob 累积进内存。非 external
+        # （小模型）仍走 bytearray 路径，blob 要塞进 FlatBuffer 向量。
+        blob = bytearray() if not external else None
+        cur_blob_len = 0  # running blob length (external: virtual offset)
         init_entries = []  # (name_off, dtype_off, dims_off, offset, size)
         # name -> (blob_offset, size) for later offset resolution (rgba meta).
         blob_offsets: Dict[str, tuple] = {}
+        # external-only: ordered (name, arr) list to replay at write time.
+        external_init_order = [] if external else None
         for name, arr in self.initializers.items():
-            arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
-            data = arr_np.tobytes()
-            data_size = len(data)
-            aligned_offset = (len(blob) + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
-            if aligned_offset > len(blob):
-                blob.extend(b"\x00" * (aligned_offset - len(blob)))
-            blob.extend(data)
+            data_size = _init_byte_len(arr)
+            aligned_offset = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
+            pad = aligned_offset - cur_blob_len
+            if external:
+                external_init_order.append((name, arr, aligned_offset, data_size, pad))
+            else:
+                if pad:
+                    blob.extend(b"\x00" * pad)
+                arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
+                blob.extend(arr_np.tobytes())
+            cur_blob_len = aligned_offset + data_size
             blob_offsets[name] = (aligned_offset, data_size)
 
             dtype_str = _DATA_TYPE_MAP.get(arr.data_type, "UNDEFINED")
@@ -330,10 +355,16 @@ class DAGBasedModel:
         unified_bytes = getattr(self, "_unified_bytes", b"")
         if unified_bytes:
             # Rewrite unified_meta offsets to be absolute into the full blob.
-            unified_base = (len(blob) + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
-            if unified_base > len(blob):
-                blob.extend(b"\x00" * (unified_base - len(blob)))
-            blob.extend(unified_bytes)
+            unified_base = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
+            unified_pad = unified_base - cur_blob_len
+            if external:
+                # deferred to stream write; just track length
+                cur_blob_len = unified_base + len(unified_bytes)
+            else:
+                if unified_pad:
+                    blob.extend(b"\x00" * unified_pad)
+                blob.extend(unified_bytes)
+                cur_blob_len = len(blob)
             self.unified_blob_offset = unified_base
             for m in self.unified_meta:
                 m["offset"] = m["offset"] + unified_base
@@ -588,11 +619,29 @@ class DAGBasedModel:
                 # 外部数据：blob（含 unified 区域）以 64 字节对齐追加在 FlatBuffer
                 # 之后；文件末尾 8 字节 LE uint64 记录 blob 起始偏移，以便 C++
                 # 加载器按此定位。FlatBuffer 的 blob 字段此时为空，加载器逻辑不变。
+                #
+                # 流式写：逐个 initializer to_array→tobytes→write，写完即释放。
+                # 旧实现把整个 blob（3.4GB）累积进一个 bytearray 再 bytes() 写，
+                # 峰值 ~2×blob 叠加 proto 原始副本导致 OOM。
                 align = _BLOB_ALIGNMENT
                 pad = (align - (f.tell() % align)) % align
                 if pad:
                     f.write(b"\x00" * pad)
                 blob_offset = f.tell()
-                f.write(bytes(blob))
+                written = 0
+                for _name, arr, aligned_offset, data_size, ipad in external_init_order:
+                    if ipad:
+                        f.write(b"\x00" * ipad)
+                    arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
+                    f.write(arr_np.tobytes())
+                    written = aligned_offset + data_size
+                # unified sub-region (if any)
+                unified_bytes = getattr(self, "_unified_bytes", b"")
+                if unified_bytes:
+                    unified_base = self.unified_blob_offset
+                    upad = unified_base - written
+                    if upad:
+                        f.write(b"\x00" * upad)
+                    f.write(unified_bytes)
                 f.write(blob_offset.to_bytes(_EXTERNAL_BLOB_MAGIC, "little"))
 

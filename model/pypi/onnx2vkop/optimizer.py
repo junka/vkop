@@ -2881,6 +2881,7 @@ class Quantizer:
 
         converted_count = 0
         skipped_count = 0
+        fp32_cast_outputs = set()  # lazily filled (see precision_tracking branch)
 
         # Build mapping from initializer names to their consumers
         initializer_consumers = defaultdict(list)
@@ -2903,6 +2904,20 @@ class Quantizer:
 
         # Operators whose weights are usually safe to quantize
         safe_weight_operators = {"Conv", "Gemm", "MatMul", "ConvTranspose", "LSTM", "GRU", "RNN"}
+
+        # Elementwise / reduce / activation ops whose float scalars/vectors
+        # MUST track the model precision: in an fp16 model the runtime binds
+        # these initializers straight to an fp16 SSBO shader (Pow/Add/Div/
+        # Mul/Sqrt/Reduce/...). If the initializer is left as float32, the
+        # fp16 shader reads the float32 bit pattern via unpackHalf2x16 and
+        # gets garbage (e.g. float32 2.0 == 0x40000000 -> low half 0x0000 ==
+        # 0.0), so Pow(x, 2) becomes Pow(x, 0) == 1 and RMSNorm collapses.
+        # These small float Constants have to be quantized with the model.
+        precision_tracking_operators = {
+            "Pow", "Add", "Sub", "Mul", "Div", "Sqrt", "Exp", "Log",
+            "ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin", "Softmax",
+            "LayerNormalization", "Sigmoid", "Tanh", "Gelu", "Erf",
+        }
 
         # Parameters that are usually sensitive to FP16 quantization
         sensitive_parameters = {"BatchNormalization"}
@@ -2949,6 +2964,36 @@ class Quantizer:
                 # Consumed by sensitive operators like BatchNormalization
                 should_quantize = False
                 reason = f"consumed by sensitive operators {consumer_ops}"
+            elif consumer_ops and consumer_ops.issubset(precision_tracking_operators):
+                # Small float scalar/vector feeding fp16-capable elementwise /
+                # reduce ops. In an fp16 model the runtime reads this via an
+                # fp16 SSBO shader, so the bit pattern must be float16 — see
+                # the long note on precision_tracking_operators above.
+                #
+                # EXCEPTION: if every consumer's sibling (data) input comes
+                # from a Cast(to=1) (fp32), the op runs in the fp32 domain
+                # (RMSNorm's Pow/ReduceMean/Sqrt/Div are wrapped in
+                # Cast-to-fp32 ... Cast-to-fp16 to avoid x^2 overflow). The
+                # runtime picks the shader by the data input's dtype, so the
+                # scalar must STAY fp32 there — a fp32 shader reading a fp16
+                # scalar SSBO re-introduces the unpackHalf2x16 garbage.
+                if not fp32_cast_outputs:
+                    for _n in dag_model.nodes.values():
+                        if _n.op_type == "Cast":
+                            _to = _n.attributes.get("to")
+                            if _to is not None and int(_to) == 1:
+                                for _o in _n.outputs:
+                                    fp32_cast_outputs.add(_o["name"])
+                all_fp32_domain = bool(consumers) and all(
+                    any(inp["name"] != name and inp["name"] in fp32_cast_outputs
+                        for inp in c.inputs)
+                    for c in consumers)
+                if all_fp32_domain:
+                    should_quantize = False
+                    reason = f"fp32-domain scalar for {consumer_ops} (sibling is Cast-to-fp32)"
+                else:
+                    should_quantize = True
+                    reason = f"precision-tracking scalar/vector for {consumer_ops}"
             else:
                 # Default behavior - check size (small tensors might be sensitive)
                 should_quantize = False

@@ -10,6 +10,8 @@ extern unsigned char image_cos_spv[];
 extern unsigned int image_cos_spv_len;
 extern unsigned char buffer_cos_spv[];
 extern unsigned int buffer_cos_spv_len;
+extern unsigned char buffer_cos_fp16_spv[];
+extern unsigned int buffer_cos_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -24,8 +26,9 @@ class CosImage : public UnaryFactory {
 class CosBuffer : public BufferUnaryFactory {
   public:
     explicit CosBuffer(int fp16)
-        : BufferUnaryFactory(OpType::COS, buffer_cos_spv, buffer_cos_spv_len,
-                             fp16) {}
+        : BufferUnaryFactory(
+              OpType::COS, fp16 ? buffer_cos_fp16_spv : buffer_cos_spv,
+              fp16 ? buffer_cos_fp16_spv_len : buffer_cos_spv_len, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,
