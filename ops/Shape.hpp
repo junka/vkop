@@ -4,6 +4,7 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
+#include <cstdlib>
 
 // CPU-only op: ONNX Shape. Outputs a 1-D int64 tensor holding the input's
 // dims. All 358 Shape nodes in llm.vkopbin read float/fp16 GPU-produced
@@ -24,6 +25,15 @@ class Shape : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto shape = inputs[0]->getShape();
         std::vector<int64_t> dims(shape.begin(), shape.end());
+        if (getenv("VKOP_SHAPEDBG")) {
+            printf("[SHAPEDBG] getShape=[");
+            for (int d : shape)
+                printf("%d,", d);
+            printf("] -> int64 dims=[");
+            for (int64_t d : dims)
+                printf("%lld,", (long long)d);
+            printf("]\n");
+        }
 
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(std::vector<int>{static_cast<int>(shape.size())});

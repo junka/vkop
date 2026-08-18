@@ -66,10 +66,12 @@ struct alignas(16) SlicePC {
     int ends[6];
     int steps[6];
 };
+static_assert(sizeof(SlicePC) <= 128, "SlicePC PC overflow");
 
 struct alignas(16) ConcatPC {
     int axis;
     int rank;
+    int inDims[8];
     int outDims[8];
     int offset;
     int _pad0;

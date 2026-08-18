@@ -222,6 +222,9 @@ class SliceBuffer : public BufferFactory {
 
         SlicePC pc{};
         pc.rank = rank;
+        // SlicePC uses int[6] (not the int[8]/IArr8 convention of the other
+        // buffer ops) so the push constant fits in 128 bytes — the shader's
+        // slice.comp matches with int[6] fields + 6-D nd<->linear helpers.
         for (int i = 0; i < 6; ++i) {
             pc.inDims[i] = (i < rank) ? inshape[i] : 1;
             pc.outDims[i] = (i < rank) ? out_size[0][i] : 1;

@@ -376,7 +376,12 @@ class ONNXOptimizer:
 
         # 若装了 onnxsim，再跑一遍作为增强（兜底 ConstantFolder 未覆盖的算子，
         # 如更复杂的 data-dependent 折叠）。失败则忽略——ConstantFolder 已覆盖主路径。
-        if _onnxsim_simplify is not None:
+        #
+        # 大模型（initializer 权重 >1GB）跳过 onnxsim：它对 LLM 这种动态 shape
+        # 模型几乎无收益，却要额外拷一份 stripped dict（数 GB）+ 内部序列化，
+        # 叠加 raw_map 的权重副本导致 OOM。ConstantFolder 已是主路径，跳过安全。
+        _total_init_bytes = sum(len(init.raw_data) for init in optimized_model.graph.initializer)
+        if _onnxsim_simplify is not None and _total_init_bytes < (1 << 30):
             # onnxsim 同样会在内部序列化整个 model（>2GB 直接崩），先剥离权重
             # 字节（形状信息足够它做折叠），跑完再按名字还原。
             stripped = {init.name: init.raw_data for init in optimized_model.graph.initializer}
@@ -394,6 +399,9 @@ class ONNXOptimizer:
             for init in optimized_model.graph.initializer:
                 if init.name in stripped and stripped[init.name]:
                     init.raw_data = stripped[init.name]
+        elif _onnxsim_simplify is not None:
+            print(f"[optimize] onnxsim skipped (large model, "
+                  f"{_total_init_bytes >> 20} MB initializers)")
 
         return optimized_model
 
@@ -794,52 +802,60 @@ class FusionOptimizer:
     def match_redundant_cast(dag_model):
         matches = []
 
+        # ONNX elem_type int <-> onnx2vkop graph-input dtype string. Cast's
+        # `to` attribute is the ONNX elem_type int (1=float32, 10=float16, ...),
+        # but dag_model.inputs carry a string dtype, so normalize both sides
+        # to the int code before comparing.
+        _DTYPE_STR_TO_INT = {
+            "float32": 1, "uint8": 2, "int8": 3, "uint16": 4, "int16": 5,
+            "int32": 6, "int64": 7, "bool": 9, "float16": 10, "float64": 11,
+            "bfloat16": 16,
+        }
+        # Map a graph-input/initializer/producer-output dtype (str OR int) to
+        # the ONNX elem_type int, or None if unknown.
+        def _dtype_to_int(d):
+            if d is None:
+                return None
+            if isinstance(d, int):
+                return d
+            if isinstance(d, str):
+                return _DTYPE_STR_TO_INT.get(d)
+            return None
+
+        # Build a name -> elem_type-int lookup covering graph inputs AND
+        # initializers AND node outputs, so a Cast whose input is a graph
+        # input (e.g. RMSNorm's Cast(to=1) fed by the fp16 `inputs_embeds`)
+        # resolves its input dtype instead of falling through to the old
+        # "None + to=1 => redundant" heuristic (which wrongly deleted the
+        # required fp16->fp32 upcast and collapsed the RMSNorm fp32 domain).
+        name_to_dtype = {}
+        for gi in getattr(dag_model, "inputs", []):
+            name_to_dtype[gi["name"]] = _dtype_to_int(gi.get("dtype"))
+        for init_name, init in getattr(dag_model, "initializers", {}).items():
+            name_to_dtype[init_name] = (
+                init.dtype if isinstance(getattr(init, "dtype", None), int)
+                else _dtype_to_int(getattr(init, "dtype", None))
+            )
+        for other_node in dag_model.nodes.values():
+            for out in other_node.outputs:
+                if "name" in out:
+                    name_to_dtype.setdefault(
+                        out["name"], _dtype_to_int(out.get("dtype")))
+
         # 匹配单个冗余Cast（输入输出类型相同）
         for node in dag_model.nodes.values():
             if node.op_type == "Cast":
-                # 检查当前节点的输入类型是否与输出类型相同
                 input_name = node.inputs[0]["name"]
-                input_dtype = None
-
-                if input_name in dag_model.initializers:
-                    init = dag_model.initializers[input_name]
-                    input_dtype = init.dtype
-                else:
-                    for other_node in dag_model.nodes.values():
-                        for out in other_node.outputs:
-                            if out["name"] == input_name:
-                                input_dtype = out.get("dtype")
-                                break
-                        if input_dtype:
-                            break
+                input_dtype = name_to_dtype.get(input_name)
                 output_dtype = node.attributes.get("to")
 
-                if input_dtype and input_dtype == output_dtype:
+                if input_dtype is not None and input_dtype == output_dtype:
                     matches.append({"node": node, "type": "redundant_single"})
                     continue
 
-                # FIXME: 临时处理，因为onnx2vkop的Cast输入类型为None时，to为1(float32)
-                data_type_map = {
-                    1: "FLOAT",
-                    2: "UINT8",
-                    3: "INT8",
-                    4: "UINT16",
-                    5: "INT16",
-                    6: "INT32",
-                    7: "INT64",
-                    8: "STRING",
-                    9: "BOOL",
-                    10: "FLOAT16",
-                    11: "DOUBLE",
-                    12: "UINT32",
-                    13: "UINT64",
-                    14: "COMPLEX64",
-                    15: "COMPLEX128",
-                    16: "BFLOAT16",
-                }
-                if input_dtype is None and output_dtype == 1:
-                    matches.append({"node": node, "type": "redundant_single"})
-                    continue
+                # input dtype genuinely unknown: do NOT assume to=1 is
+                # redundant. The old heuristic deleted required fp16->fp32
+                # upcasts (e.g. RMSNorm's leading Cast) and broke numerics.
 
         # 匹配连续的Cast，找到可以直接删除的Cast（因为后续Cast会覆盖它的效果）
         # 构建Cast链，找到可以被跳过的Cast节点
@@ -855,16 +871,11 @@ class FusionOptimizer:
                                 # 检查other_node的to类型是否与node的输入类型相同
                                 # 如果是这样，那么node是多余的，因为other_node直接将node的输入类型转换为目标类型
                                 first_input_name = node.inputs[0]["name"]
-                                first_input_dtype = None
-
-                                # 查找第一个Cast的输入类型
-                                for lookup_node in dag_model.nodes.values():
-                                    for out in lookup_node.outputs:
-                                        if out["name"] == first_input_name:
-                                            first_input_dtype = out.get("dtype")
-                                            break
-                                    if first_input_dtype:
-                                        break
+                                # 用共享的 name_to_dtype 表（覆盖 graph
+                                # inputs/initializers/node outputs），避免
+                                # graph-input-fed Cast 链查不到 dtype。
+                                first_input_dtype = name_to_dtype.get(
+                                    first_input_name)
 
                                 second_output_dtype = other_node.attributes.get("to")
 
@@ -895,16 +906,9 @@ class FusionOptimizer:
 
             # 检查连接的Cast节点
             for connected_node in connected_cast_nodes:
-                # 获取cast_node的输入类型
+                # 获取cast_node的输入类型（用共享查找表，覆盖 graph inputs）
                 input_name = cast_node.inputs[0]["name"]
-                input_dtype = None
-                for lookup_node in dag_model.nodes.values():
-                    for out in lookup_node.outputs:
-                        if out["name"] == input_name:
-                            input_dtype = out.get("dtype")
-                            break
-                    if input_dtype:
-                        break
+                input_dtype = name_to_dtype.get(input_name)
 
                 # 获取connected_node的目标类型
                 target_dtype = connected_node.attributes.get("to")
@@ -2889,6 +2893,60 @@ class Quantizer:
             for inp in node.inputs:
                 initializer_consumers[inp["name"]].append(node)
 
+        # fp32-domain tensor set: Cast(to=1) outputs propagate through the
+        # RMSNorm chain (Pow/ReduceMean/Add/Sqrt/Div/Mul) — every tensor fed
+        # by a fp32-domain producer along that chain is itself fp32-domain.
+        # A scalar Constant whose consumer's sibling data input is fp32-domain
+        # must STAY fp32 (the runtime picks the shader by the data input's
+        # dtype, so a fp32 op reading a fp16 scalar SSBO gets garbage).
+        _FP32_PROPAGATING = {
+            "Pow", "Add", "Sub", "Mul", "Div", "Sqrt", "Exp", "Log",
+            "ReduceMean", "ReduceSum", "ReduceMax", "ReduceMin",
+            # fusion's match_reduce_ops renames ReduceMean/ReduceSum/... to a
+            # unified "Reduce" op, so the propagated tensor's producer.op_type
+            # is "Reduce" by the time quantize runs. Include it or the RMSNorm
+            # chain breaks at ReduceMean and eps/one get mis-quantized to fp16.
+            "Reduce",
+            "Sigmoid", "Tanh", "Gelu", "Erf", "Neg", "Sin", "Cos",
+        }
+        tensor_producer = {}
+        for node in dag_model.nodes.values():
+            for o in node.outputs:
+                tensor_producer[o["name"]] = node
+        # Seed: Cast(to=1) outputs.
+        for node in dag_model.nodes.values():
+            if node.op_type == "Cast":
+                _to = node.attributes.get("to")
+                if _to is not None and int(_to) == 1:
+                    for o in node.outputs:
+                        fp32_cast_outputs.add(o["name"])
+        # Seed: Cos/Sin outputs. The rotary-emb cos/sin chain
+        # (inv_freq[fp32] -> Expand -> MatMul(positions) -> ... -> Cos/Sin ->
+        # Mul(scalar) -> Cast(to=10)) runs entirely in fp32, but unlike the
+        # RMSNorm chain it is NOT introduced by a Cast(to=1) — it starts from
+        # fp32 initializers/constants — so the fp32-domain propagation above
+        # never reaches it. Without this seed, the scalar multipliers
+        # (Constant 1.0 next to Cos/Sin) get quantized to fp16, and the fp32
+        # Mul reads the fp16 scalar SSBO as fp32 -> cos*1 == 0 -> RoPE zeros
+        # q,k -> attention output is all-zero everywhere.
+        for node in dag_model.nodes.values():
+            if node.op_type in ("Cos", "Sin"):
+                for o in node.outputs:
+                    fp32_cast_outputs.add(o["name"])
+        # Propagate to fixed point.
+        changed = True
+        while changed:
+            changed = False
+            for tname, producer in tensor_producer.items():
+                if tname in fp32_cast_outputs:
+                    continue
+                if producer.op_type not in _FP32_PROPAGATING:
+                    continue
+                if any(inp["name"] in fp32_cast_outputs for inp in producer.inputs):
+                    fp32_cast_outputs.add(tname)
+                    changed = True
+
+
         # Data types that should remain unchanged
         preserve_types = {
             onnx.TensorProto.UINT8,
@@ -2970,27 +3028,18 @@ class Quantizer:
                 # fp16 SSBO shader, so the bit pattern must be float16 — see
                 # the long note on precision_tracking_operators above.
                 #
-                # EXCEPTION: if every consumer's sibling (data) input comes
-                # from a Cast(to=1) (fp32), the op runs in the fp32 domain
-                # (RMSNorm's Pow/ReduceMean/Sqrt/Div are wrapped in
-                # Cast-to-fp32 ... Cast-to-fp16 to avoid x^2 overflow). The
-                # runtime picks the shader by the data input's dtype, so the
-                # scalar must STAY fp32 there — a fp32 shader reading a fp16
-                # scalar SSBO re-introduces the unpackHalf2x16 garbage.
-                if not fp32_cast_outputs:
-                    for _n in dag_model.nodes.values():
-                        if _n.op_type == "Cast":
-                            _to = _n.attributes.get("to")
-                            if _to is not None and int(_to) == 1:
-                                for _o in _n.outputs:
-                                    fp32_cast_outputs.add(_o["name"])
+                # EXCEPTION: if every consumer's sibling (data) input is in the
+                # fp32 domain (Cast-to=1 output propagated through the RMSNorm
+                # chain — see fp32_cast_outputs above), the op runs fp32 and the
+                # scalar must STAY fp32: a fp32 shader reading a fp16 scalar
+                # SSBO re-introduces the unpackHalf2x16 garbage.
                 all_fp32_domain = bool(consumers) and all(
                     any(inp["name"] != name and inp["name"] in fp32_cast_outputs
                         for inp in c.inputs)
                     for c in consumers)
                 if all_fp32_domain:
                     should_quantize = False
-                    reason = f"fp32-domain scalar for {consumer_ops} (sibling is Cast-to-fp32)"
+                    reason = f"fp32-domain scalar for {consumer_ops} (sibling is fp32-domain)"
                 else:
                     should_quantize = True
                     reason = f"precision-tracking scalar/vector for {consumer_ops}"

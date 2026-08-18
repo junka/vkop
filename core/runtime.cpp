@@ -3,8 +3,10 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <queue>
+#include <unordered_set>
 
 #include "core/runtime.hpp"
 #include "model/load.hpp"
@@ -335,8 +337,19 @@ void Runtime::LoadModel() {
 
             std::vector<std::shared_ptr<ITensor>> node_inputs;
             std::vector<std::shared_ptr<ITensor>> node_outputs;
+            std::vector<std::vector<int>> node_input_shapes;
 
             for (const auto &in_shape : n.inputs) {
+                // Capture the recorded logical shape for execute-time
+                // reshape_view (see node_input_shapes_ doc). int dims even
+                // though ShapeRef carries unsigned — reshape_view handles both.
+                std::vector<int> rec;
+                rec.reserve(in_shape.dims.size());
+                for (auto d : in_shape.dims) {
+                    rec.push_back(static_cast<int>(d));
+                }
+                node_input_shapes.push_back(std::move(rec));
+
                 if (tensor_map.find(in_shape.name) != tensor_map.end()) {
                     auto t = tensor_map[in_shape.name];
                     if (t->ref_cnt() != std::numeric_limits<uint16_t>::max()) {
@@ -522,6 +535,7 @@ void Runtime::LoadModel() {
             node_attrs_.push_back(n.attributes);
             node_input_tensors_.push_back(std::move(node_inputs));
             node_output_tensors_.push_back(std::move(node_outputs));
+            node_input_shapes_.push_back(std::move(node_input_shapes));
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
@@ -617,6 +631,21 @@ double Runtime::Run() {
 
     bool single_queue = dev->getNumComputeQueues() <= 1;
 
+    // Set of initializer tensor pointers, used by the execute-time
+    // reshape_view guard to distinguish a true scalar Constant (an
+    // initializer whose ONNX shape was () but whose vkopbin dims_=[1] due to
+    // dag.py's np.atleast_1d materialization) from a node-output tensor whose
+    // recorded shape is [] merely because the converter had no shape info.
+    // Only the former should be reshaped to rank-0: Gather uses the index
+    // tensor's rank to compute its output rank, so a scalar index must stay
+    // scalar (rank N-1 output). Reshaping a 1-element node output to scalar
+    // would crash int64 Concat (in_shape[axis_] on an empty shape).
+    std::unordered_set<core::ITensor *> init_ptrs;
+    init_ptrs.reserve(initializers_.size());
+    for (const auto &kv : initializers_) {
+        init_ptrs.insert(kv.second.get());
+    }
+
     // Debug: VKOP_NAN_SCAN=1 synchronizes after every concurrent level and
     // scans each node's output tensors for NaN/Inf, printing the first node
     // (name + op idx + level) that produces a non-finite value. Slow (forces
@@ -632,6 +661,43 @@ double Runtime::Run() {
             int id = 0;
             std::vector<std::shared_ptr<VulkanCommandBuffer>> cmds;
             for (auto node_idx : level_nodes) {
+                // Apply this consumer's recorded logical view to each input
+                // tensor right before recording. reshape_view is a pure
+                // metadata reset (guards on equal element count), so sharing
+                // one tensor across consumers with different views is safe:
+                // each onExecute sees exactly the shape recorded for IT, in
+                // execution order, with no last-writer-wins race.
+                const auto &shapes = node_input_shapes_[node_idx];
+                const auto &ins = node_input_tensors_[node_idx];
+                for (size_t k = 0; k < ins.size() && k < shapes.size(); ++k) {
+                    // An empty recorded shape means "scalar" (rank-0). The
+                    // converter's dag.py materializes every Constant as a
+                    // >=1-D initializer (np.atleast_1d), so an ONNX scalar
+                    // index like /rotary_emb/Constant_8 (value 0, shape ())
+                    // arrives with dims_=[1] even though the node's recorded
+                    // input shape is []. Passing [] here lets reshape_view
+                    // restore n_dims_=0 (ne_new=1 == ne_old=1 for the 1-elem
+                    // tensor), so Gather computes a rank-(N-1) output matching
+                    // ORT instead of inflating the rank by 1. The element-count
+                    // guard inside reshape_view rejects this for any genuinely
+                    // multi-element tensor, so a stray [] (unknown shape) is
+                    // safe.
+                    if (!ins[k]) {
+                        continue;
+                    }
+                    if (shapes[k].empty()) {
+                        // Scalar Constant: an initializer whose ONNX shape was
+                        // () but materialized as dims_=[1] by dag.py. Reshape
+                        // to rank-0 so Gather's index-rank→output-rank matches
+                        // ORT. Only initializers: a [] node output means
+                        // "unknown", and reshaping it would crash int64 Concat.
+                        if (init_ptrs.count(ins[k].get())) {
+                            ins[k]->reshape_view(shapes[k]);
+                        }
+                    } else {
+                        ins[k]->reshape_view(shapes[k]);
+                    }
+                }
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                                node_output_tensors_[node_idx],
                                                id);
@@ -853,60 +919,474 @@ double Runtime::Run() {
         return elapsed.count() * 1000.0F;
     }
 
-    std::vector<std::vector<VkSubmitInfo>> submit_infos(vkop::kInflight);
+    // Debug: VKOP_LEVEL_STAT=1 submits per-level (with a CPU wait after each
+    // level) and prints min/max/mean/nonzero-count for every node's first fp
+    // output, to bisect which level the numerics diverge at. Slow (full GPU
+    // stall per level). VKOP_LEVEL_STAT=Lo,Hi restricts output to levels in
+    // [Lo,Hi).
+    const char *lstat_env = std::getenv("VKOP_LEVEL_STAT");
+    bool level_stat = lstat_env && lstat_env[0] == '1';
+    size_t lstat_lo = 0, lstat_hi = SIZE_MAX;
+    if (lstat_env && std::strchr(lstat_env, ',')) {
+        size_t lo = 0, hi = 0;
+        if (std::sscanf(lstat_env, "%zu,%zu", &lo, &hi) == 2) {
+            lstat_lo = lo;
+            lstat_hi = hi;
+            level_stat = true;
+        }
+    }
+    if (level_stat) {
+        std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_cmds;
+        for (size_t level_idx = 0; level_idx < level_node_indices_.size();
+             level_idx++) {
+            const auto &level_nodes = level_node_indices_[level_idx];
+            std::vector<std::shared_ptr<VulkanCommandBuffer>> cur_cmds;
+            std::vector<VkSubmitInfo> sis;
+            int id = 0;
+            for (auto node_idx : level_nodes) {
+                const auto &shapes = node_input_shapes_[node_idx];
+                const auto &ins = node_input_tensors_[node_idx];
+                for (size_t k = 0; k < ins.size() && k < shapes.size(); ++k) {
+                    // An empty recorded shape means "scalar" (rank-0). The
+                    // converter's dag.py materializes every Constant as a
+                    // >=1-D initializer (np.atleast_1d), so an ONNX scalar
+                    // index like /rotary_emb/Constant_8 (value 0, shape ())
+                    // arrives with dims_=[1] even though the node's recorded
+                    // input shape is []. Passing [] here lets reshape_view
+                    // restore n_dims_=0 (ne_new=1 == ne_old=1 for the 1-elem
+                    // tensor), so Gather computes a rank-(N-1) output matching
+                    // ORT instead of inflating the rank by 1. The element-count
+                    // guard inside reshape_view rejects this for any genuinely
+                    // multi-element tensor, so a stray [] (unknown shape) is
+                    // safe.
+                    if (!ins[k]) {
+                        continue;
+                    }
+                    if (shapes[k].empty()) {
+                        // Scalar Constant: an initializer whose ONNX shape was
+                        // () but materialized as dims_=[1] by dag.py. Reshape
+                        // to rank-0 so Gather's index-rank→output-rank matches
+                        // ORT. Only initializers: a [] node output means
+                        // "unknown", and reshaping it would crash int64 Concat.
+                        if (init_ptrs.count(ins[k].get())) {
+                            ins[k]->reshape_view(shapes[k]);
+                        }
+                    } else {
+                        ins[k]->reshape_view(shapes[k]);
+                    }
+                }
+                node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
+                                               node_output_tensors_[node_idx],
+                                               id);
+                auto cmd = node_ops_[node_idx]->get_record();
+                for (auto &dep : node_dependency_indices_[node_idx]) {
+                    cmd->addWait(
+                        node_ops_[dep]->get_record()->getSignalSemaphore(),
+                        node_ops_[dep]->get_record()->getSignalValue());
+                }
+                for (const auto &pc : prev_cmds) {
+                    cmd->addWait(pc->getSignalSemaphore(),
+                                 pc->getSignalValue());
+                }
+                sis.push_back(cmd->buildSubmitInfo());
+                cur_cmds.push_back(cmd);
+                id++;
+                id %= vkop::kInflight;
+            }
+            if (!sis.empty()) {
+                VulkanCommandBuffer::submit(dev->getComputeQueue(0), sis);
+            }
+            for (auto &c : cur_cmds)
+                c->wait();
+            bool in_range = (level_idx >= lstat_lo && level_idx < lstat_hi);
+            // Helper: compute (min,max,mean,nan,inf,zero) for an fp tensor.
+            auto fp_stats = [&](const std::shared_ptr<ITensor> &tt, float &mn,
+                                float &mx, float &meanv, int &nan_cnt,
+                                int &inf_cnt, int &zero_cnt) -> int {
+                mn = 1e30f;
+                mx = -1e30f;
+                nan_cnt = inf_cnt = zero_cnt = 0;
+                double sum = 0;
+                bool f16 = (tt->dtype() == typeid(uint16_t));
+                bool f32 = (tt->dtype() == typeid(float));
+                if (!f16 && !f32)
+                    return 0;
+                int ne = tt->size() / (f16 ? 2 : 4);
+                if (ne <= 0)
+                    return 0;
+                if (f16) {
+                    auto tg = as_tensor<uint16_t>(tt);
+                    tg->copyToCPU(m_cmdpool_);
+                    const uint16_t *p =
+                        reinterpret_cast<const uint16_t *>(tg->data().data());
+                    for (int i = 0; i < ne; ++i) {
+                        float v = ITensor::fp16_to_fp32(p[i]);
+                        if (std::isnan(v)) {
+                            nan_cnt++;
+                            continue;
+                        }
+                        if (std::isinf(v)) {
+                            inf_cnt++;
+                            continue;
+                        }
+                        if (v == 0.f)
+                            zero_cnt++;
+                        sum += v;
+                        if (v < mn)
+                            mn = v;
+                        if (v > mx)
+                            mx = v;
+                    }
+                } else {
+                    auto tg = as_tensor<float>(tt);
+                    tg->copyToCPU(m_cmdpool_);
+                    const float *p =
+                        reinterpret_cast<const float *>(tg->data().data());
+                    for (int i = 0; i < ne; ++i) {
+                        float v = p[i];
+                        if (std::isnan(v)) {
+                            nan_cnt++;
+                            continue;
+                        }
+                        if (std::isinf(v)) {
+                            inf_cnt++;
+                            continue;
+                        }
+                        if (v == 0.f)
+                            zero_cnt++;
+                        sum += v;
+                        if (v < mn)
+                            mn = v;
+                        if (v > mx)
+                            mx = v;
+                    }
+                }
+                meanv = (ne - nan_cnt - inf_cnt) > 0
+                            ? (float)(sum / (ne - nan_cnt - inf_cnt))
+                            : 0.f;
+                return ne;
+            };
+            if (in_range) {
+                int ni = 0;
+                for (auto node_idx : level_nodes) {
+                    const auto &outs = node_output_tensors_[node_idx];
+                    auto &t = outs.empty() ? nullptr : outs[0];
+                    if (!t)
+                        continue;
+                    bool is_fp16 = (t->dtype() == typeid(uint16_t));
+                    bool is_fp32 = (t->dtype() == typeid(float));
+                    if (!is_fp16 && !is_fp32)
+                        continue;
+                    int ne = t->size() / (is_fp16 ? 2 : 4);
+                    if (ne <= 0)
+                        continue;
+                    int nan_cnt = 0, inf_cnt = 0, zero_cnt = 0;
+                    double sum = 0;
+                    float mn = 1e30f, mx = -1e30f;
+                    if (is_fp16) {
+                        auto tg = as_tensor<uint16_t>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        const uint16_t *p = reinterpret_cast<const uint16_t *>(
+                            tg->data().data());
+                        for (int i = 0; i < ne; ++i) {
+                            float v = ITensor::fp16_to_fp32(p[i]);
+                            if (std::isnan(v)) {
+                                nan_cnt++;
+                                continue;
+                            }
+                            if (std::isinf(v)) {
+                                inf_cnt++;
+                                continue;
+                            }
+                            if (v == 0.f)
+                                zero_cnt++;
+                            sum += v;
+                            if (v < mn)
+                                mn = v;
+                            if (v > mx)
+                                mx = v;
+                        }
+                    } else {
+                        auto tg = as_tensor<float>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        const float *p =
+                            reinterpret_cast<const float *>(tg->data().data());
+                        for (int i = 0; i < ne; ++i) {
+                            float v = p[i];
+                            if (std::isnan(v)) {
+                                nan_cnt++;
+                                continue;
+                            }
+                            if (std::isinf(v)) {
+                                inf_cnt++;
+                                continue;
+                            }
+                            if (v == 0.f)
+                                zero_cnt++;
+                            sum += v;
+                            if (v < mn)
+                                mn = v;
+                            if (v > mx)
+                                mx = v;
+                        }
+                    }
+                    float mean = (ne - nan_cnt - inf_cnt) > 0
+                                     ? (float)(sum / (ne - nan_cnt - inf_cnt))
+                                     : 0.f;
+                    std::printf(
+                        "[LSTAT] L=%zu n=%zu ni=%d name=%s ne=%d "
+                        "nan=%d inf=%d zero=%d min=%.5g max=%.5g mean=%.5g\n",
+                        level_idx, level_nodes.size(), ni,
+                        node_ops_[node_idx]->get_name().c_str(), ne, nan_cnt,
+                        inf_cnt, zero_cnt, mn, mx, mean);
+                    // Dump each fp input's min/max/mean so we can compare a
+                    // node's input against its producer's reported output
+                    // (catches tensor-recycle buffer aliasing: if an input's
+                    // stats here differ from when it was produced, the buffer
+                    // was overwritten between the two levels).
+                    {
+                        const auto &ins = node_input_tensors_[node_idx];
+                        for (size_t ii = 0; ii < ins.size(); ++ii) {
+                            auto &it = ins[ii];
+                            if (!it)
+                                continue;
+                            float imn, imx, imean;
+                            int inan, iinf, izero;
+                            int ine = fp_stats(it, imn, imx, imean, inan, iinf,
+                                               izero);
+                            if (ine <= 0)
+                                continue;
+                            std::printf("[LIN]  L=%zu %s in[%zu] ne=%d "
+                                        "min=%.5g max=%.5g mean=%.5g\n",
+                                        level_idx,
+                                        node_ops_[node_idx]->get_name().c_str(),
+                                        ii, ine, imn, imx, imean);
+                        }
+                    }
+                    // For input_layernorm (block 0) nodes, dump each fp
+                    // input's dtype + first values + output dtype, to trace
+                    // the fp32-domain RMSNorm chain.
+                    std::string nm = node_ops_[node_idx]->get_name();
+                    if (nm.find("input_layernorm/") != std::string::npos &&
+                        nm.find("input_layernorm_") == std::string::npos) {
+                        const auto &ins = node_input_tensors_[node_idx];
+                        for (size_t ii = 0; ii < ins.size(); ++ii) {
+                            auto &it = ins[ii];
+                            if (!it) {
+                                std::printf("[LTR] %s in[%zu]=null\n",
+                                            nm.c_str(), ii);
+                                continue;
+                            }
+                            bool ifp16 = (it->dtype() == typeid(uint16_t));
+                            bool ifp32 = (it->dtype() == typeid(float));
+                            if (!ifp16 && !ifp32) {
+                                std::printf("[LTR] %s in[%zu] dtype=other\n",
+                                            nm.c_str(), ii);
+                                continue;
+                            }
+                            int ine = it->size() / (ifp16 ? 2 : 4);
+                            std::printf(
+                                "[LTR] %s in[%zu] dtype=%s ne=%d: ", nm.c_str(),
+                                ii, ifp16 ? "f16" : "f32", ine);
+                            if (ifp16) {
+                                auto itg = as_tensor<uint16_t>(it);
+                                itg->copyToCPU(m_cmdpool_);
+                                for (int i = 0; i < 4 && i < ine; ++i)
+                                    std::printf(
+                                        "%.4g ",
+                                        ITensor::fp16_to_fp32(
+                                            reinterpret_cast<const uint16_t *>(
+                                                itg->data().data())[i]));
+                            } else {
+                                auto itg = as_tensor<float>(it);
+                                itg->copyToCPU(m_cmdpool_);
+                                for (int i = 0; i < 4 && i < ine; ++i)
+                                    std::printf("%.4g ",
+                                                reinterpret_cast<const float *>(
+                                                    itg->data().data())[i]);
+                            }
+                            std::printf("\n");
+                        }
+                        std::printf("[LTR] %s out dtype=%s\n", nm.c_str(),
+                                    is_fp16 ? "f16" : "f32");
+                    }
+                    // [ROT] trace the rotary_emb cos/sin chain + the RoPE
+                    // application Muls. Dumps output shape/size/dtype + first
+                    // values, and each input's shape/size/dtype + first values,
+                    // so we can see exactly where cos/sin go wrong.
+                    if (nm.find("rotary_emb/") != std::string::npos ||
+                        (nm.size() && nm[0] == '/' &&
+                         (nm == "/Mul" || nm == "/Mul_1" || nm == "/Mul_2" ||
+                          nm == "/Mul_3" || nm == "/Add" || nm == "/Add_1" ||
+                          nm == "/Concat_3" || nm == "/Concat_4"))) {
+                        auto dump_t = [&](const char *tag,
+                                          const std::shared_ptr<ITensor> &tt) {
+                            if (!tt) {
+                                std::printf("[ROT]   %s=null\n", tag);
+                                return;
+                            }
+                            bool f16 = (tt->dtype() == typeid(uint16_t));
+                            bool f32 = (tt->dtype() == typeid(float));
+                            auto sh = tt->getShape();
+                            std::printf("[ROT]   %s dtype=%s size=%d shape=[",
+                                        tag,
+                                        f16 ? "f16" : (f32 ? "f32" : "other"),
+                                        tt->size());
+                            for (size_t d = 0; d < sh.size(); ++d)
+                                std::printf("%d%s", sh[d],
+                                            d + 1 < sh.size() ? "," : "");
+                            std::printf("] vals=");
+                            if (f16) {
+                                auto tg = as_tensor<uint16_t>(tt);
+                                tg->copyToCPU(m_cmdpool_);
+                                int ne = (int)(tt->size() / 2);
+                                for (int i = 0; i < 8 && i < ne; ++i)
+                                    std::printf(
+                                        "%.4g ",
+                                        ITensor::fp16_to_fp32(
+                                            reinterpret_cast<const uint16_t *>(
+                                                tg->data().data())[i]));
+                            } else if (f32) {
+                                auto tg = as_tensor<float>(tt);
+                                tg->copyToCPU(m_cmdpool_);
+                                int ne = (int)(tt->size() / 4);
+                                for (int i = 0; i < 8 && i < ne; ++i)
+                                    std::printf("%.4g ",
+                                                reinterpret_cast<const float *>(
+                                                    tg->data().data())[i]);
+                            }
+                            std::printf("\n");
+                        };
+                        std::printf("[ROT] L=%d %s\n", (int)level_idx,
+                                    nm.c_str());
+                        const auto &rins = node_input_tensors_[node_idx];
+                        for (size_t ii = 0; ii < rins.size(); ++ii) {
+                            char buf[32];
+                            std::snprintf(buf, sizeof(buf), "in[%zu]", ii);
+                            dump_t(buf, rins[ii]);
+                        }
+                        dump_t("out", t);
+                    }
+                    ni++;
+                }
+            }
+            for (auto &c : cur_cmds) {
+                c->clearWaits();
+                c->reset();
+            }
+            prev_cmds = std::move(cur_cmds);
+        }
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        return elapsed.count() * 1000.0F;
+    }
+
     std::vector<std::shared_ptr<VulkanCommandBuffer>> last_commands(
         vkop::kInflight);
 
+    // Submission strategy. The graph is submitted ONE LEVEL AT A TIME: each
+    // level's command buffers go into their own vkQueueSubmit call, and every
+    // command in level N waits (via timeline semaphore) on the commands in
+    // level N-1 that produced its inputs (direct data deps) — plus, as an
+    // anti-aliasing barrier, on ALL of level N-1's commands.
+    //
+    // Why not one big vkQueueSubmit for the whole graph (the old strategy):
+    // outshape_tensor_map recycles a Tensor (and its backing VkBuffer) the
+    // moment its ref_cnt hits 0 during build — i.e. when its last TOPOLOGICAL
+    // consumer is processed. An unrelated producer C at a later level can then
+    // grab that recycled buffer as its output. C and the last reader B share
+    // the SAME VkBuffer but may have no data-dependency edge between them, so
+    // the GPU could schedule C's write while B still reads it. On this driver
+    // a single vkQueueSubmit carrying thousands of command buffers with
+    // timeline-semaphore waits also produced all-zero outputs (the waits were
+    // not honored correctly); splitting per-level restored correct results.
+    //
+    // No deadlock risk from multiple submits on a single queue: each level's
+    // commands only wait on EARLIER levels' signal semaphores (deps + the
+    // previous-level barrier), never on a later submit, so submits resolve in
+    // order. Intra-level parallelism is preserved within each submit.
+    //
+    // VKOP_LEVEL_SYNC=1 forces a CPU wait+reset after every level (NANSCAN-
+    // style, without the NaN scan) for debugging; the default (0/2) just waits
+    // for the final level at the end.
+    const char *lsync_env = std::getenv("VKOP_LEVEL_SYNC");
+    int level_sync = lsync_env ? std::atoi(lsync_env) : 0;
+    bool per_level_wait = (level_sync == 1);
+
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_level_cmds;
     size_t last_level_index = level_node_indices_.size() - 1;
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
          level_idx++) {
         const auto &level_nodes = level_node_indices_[level_idx];
+        std::vector<std::shared_ptr<VulkanCommandBuffer>> cur_level_cmds;
+        // Per-lane submit batches (multi-queue case); single-queue uses [0].
+        std::vector<std::vector<VkSubmitInfo>> sis(vkop::kInflight);
         int id = 0;
         for (auto node_idx : level_nodes) {
+            const auto &shapes = node_input_shapes_[node_idx];
+            const auto &ins = node_input_tensors_[node_idx];
+            for (size_t k = 0; k < ins.size() && k < shapes.size(); ++k) {
+                if (!ins[k]) {
+                    continue;
+                }
+                if (shapes[k].empty()) {
+                    // A recorded [] shape means "scalar Constant" only when
+                    // this tensor is an initializer (ONNX shape () materialized
+                    // as dims_=[1] by dag.py's np.atleast_1d). Reshape it back
+                    // to rank-0 so Gather's index-rank → output-rank matches
+                    // ORT. reshape_view's element-count guard
+                    // (ne_new=1==ne_old) makes this a no-op for any
+                    // multi-element tensor.
+                    if (init_ptrs.count(ins[k].get())) {
+                        ins[k]->reshape_view(shapes[k]);
+                    }
+                } else {
+                    ins[k]->reshape_view(shapes[k]);
+                }
+            }
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
             auto cmd = node_ops_[node_idx]->get_record();
-            auto depends = node_dependency_indices_[node_idx];
-            for (auto &dep : depends) {
+            for (auto &dep : node_dependency_indices_[node_idx]) {
                 cmd->addWait(node_ops_[dep]->get_record()->getSignalSemaphore(),
                              node_ops_[dep]->get_record()->getSignalValue());
             }
-
-            if (single_queue) {
-                submit_infos[0].push_back(cmd->buildSubmitInfo());
-            } else {
-                submit_infos[id].push_back(cmd->buildSubmitInfo());
+            // Anti-aliasing level barrier: wait on every previous-level
+            // command (direct data deps are a subset of this for true
+            // producers; redundant addWait on an already-waited semaphore is
+            // harmless).
+            for (const auto &pc : prev_level_cmds) {
+                cmd->addWait(pc->getSignalSemaphore(), pc->getSignalValue());
             }
+
+            int lane = single_queue ? 0 : id;
+            sis[lane].push_back(cmd->buildSubmitInfo());
+            cur_level_cmds.push_back(cmd);
             if (level_idx == last_level_index) {
                 last_commands[single_queue ? 0 : id] = cmd;
             }
             id++;
             id %= vkop::kInflight;
         }
-    }
-
-    if (single_queue) {
-        // Submit all command buffers in a single vkQueueSubmit call.
-        // On single-queue GPUs, splitting into multiple vkQueueSubmit calls
-        // creates implicit ordering between submits: the second submit won't
-        // begin until the first completes. If a node in submit_infos[0] waits
-        // on a semaphore signaled by a node in submit_infos[1], this creates
-        // a deadlock (C waits B, but B can't start until C finishes).
-        // A single submit lets the GPU schedule based on semaphore
-        // dependencies.
-        if (!submit_infos[0].empty()) {
-            VulkanCommandBuffer::submit(dev->getComputeQueue(0),
-                                        submit_infos[0]);
-        }
-    } else {
-        for (int ci = 0; ci < vkop::kInflight; ci++) {
-            if (!submit_infos[ci].empty()) {
-                VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
-                                            submit_infos[ci]);
+        // Submit this level's batches (one vkQueueSubmit per non-empty lane).
+        int nlanes = single_queue ? 1 : vkop::kInflight;
+        for (int ci = 0; ci < nlanes; ci++) {
+            if (!sis[ci].empty()) {
+                VulkanCommandBuffer::submit(dev->getComputeQueue(ci), sis[ci]);
             }
         }
+        if (per_level_wait) {
+            for (auto &c : cur_level_cmds)
+                c->wait();
+            for (auto &c : cur_level_cmds) {
+                c->clearWaits();
+                c->reset();
+            }
+        }
+        prev_level_cmds = std::move(cur_level_cmds);
     }
 
+    // Wait for the final level, then reset all command buffers.
     for (int ci = 0; ci < vkop::kInflight; ci++) {
         if (last_commands[ci]) {
             last_commands[ci]->wait();

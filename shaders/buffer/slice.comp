@@ -2,10 +2,16 @@
 
 // Slice SSBO op (fp32). For each output element, map output nd-coords back
 // to input via starts[i] + out[i]*steps[i], bounds-checked, then copy.
-// 6-D cap (push-constant budget). fp32-only (gather pattern would race on
-// a shared half2 word).
+// 6-D cap (push-constant budget: rank + 5×IArr6 = 124 bytes ≤ 128).
+// fp32-only (gather pattern would race on a shared half2 word).
+//
+// NB: this op uses IArr6/int[6] (NOT the IArr8/int[8] convention of the other
+// buffer ops) so the push constant fits in 128 bytes — 5 full 8-int dim
+// arrays (164 B) would overflow the 128 B PC budget. The nd<->linear math is
+// the 6-D analogue of buffer_common.comp's linear_to_nd8/nd_to_linear8
+// (row-major, left-aligned dims.v[0..rank-1]).
 
-#include "../common/buffer_common.comp"
+struct IArr6 { int v[6]; };
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -18,11 +24,11 @@ layout(set = 0, binding = 1) readonly buffer Input {
 
 layout(push_constant) uniform PC_uSlice {
     int rank;
-    IArr8 inDims;
-    IArr8 outDims;
-    IArr8 starts;
-    IArr8 ends;
-    IArr8 steps;
+    IArr6 inDims;
+    IArr6 outDims;
+    IArr6 starts;
+    IArr6 ends;
+    IArr6 steps;
 } uSlice;
 
 void main() {
@@ -32,9 +38,19 @@ void main() {
     for (int i = 0; i < rank; ++i) total *= uSlice.outDims.v[i];
     if (gid >= total) return;
 
-    IArr8 out_coord = linear_to_nd8(gid, uSlice.outDims, rank);
+    // Decompose gid into an output nd-coordinate (row-major, dims.v[0] outer).
+    int rem = gid;
+    IArr6 out_coord;
+    for (int i = 0; i < 6; ++i) out_coord.v[i] = 0;
+    for (int i = rank - 1; i >= 0; --i) {
+        out_coord.v[i] = rem % uSlice.outDims.v[i];
+        rem /= uSlice.outDims.v[i];
+    }
 
-    IArr8 in_coord;
+    // Map output coord → input coord via starts[i] + out[i]*steps[i], with a
+    // bounds check against inDims.v[i].
+    IArr6 in_coord;
+    for (int i = 0; i < 6; ++i) in_coord.v[i] = 0;
     bool ok = true;
     for (int i = 0; i < rank; ++i) {
         int c = uSlice.starts.v[i] + out_coord.v[i] * uSlice.steps.v[i];
@@ -45,6 +61,16 @@ void main() {
         uOutput.data[gid] = 0u;
         return;
     }
-    int in_linear = nd_to_linear8(in_coord, uSlice.inDims, rank);
-    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, in_linear)));
+
+    // Re-compose the input nd-coordinate into a row-major linear index.
+    int in_linear = 0;
+    int stride = 1;
+    for (int i = rank - 1; i >= 0; --i) {
+        in_linear += in_coord.v[i] * stride;
+        stride *= uSlice.inDims.v[i];
+    }
+    // uInput/uOutput are uint-word SSBOs holding fp32 bit patterns; copy the
+    // raw word (NOT float(uint) which would numerically reinterpret the bit
+    // pattern as an integer value and corrupt the data).
+    uOutput.data[gid] = uInput.data[in_linear];
 }

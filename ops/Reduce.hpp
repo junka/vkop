@@ -225,7 +225,19 @@ class ReduceBuffer : public BufferFactory {
         ReducePC pc{};
         pc.rank = rank;
         fill_dims(pc.inDims, in_shape);
-        fill_dims(pc.outDims, out_shape);
+        // Pass outDims at INPUT rank with reduced axes set to 1 (NOT the
+        // squeezed out_shape). The shader maps out_coord.v[i] -> input axis i
+        // (in_coord.v[i] = out_coord.v[i] on kept axes, 0 on reduced axes which
+        // the reduction counter then overwrites). With keepdims=0 the squeezed
+        // out_shape has lower rank, so left-aligning it would misalign the kept
+        // axes against the input and read the wrong input slab. Setting reduced
+        // dims to 1 keeps prod(outDims) == out_total (the dispatch count), so
+        // the dispatch and the per-thread out_total guard stay correct.
+        std::vector<int> out_dims_full(rank);
+        for (int i = 0; i < rank; ++i) {
+            out_dims_full[i] = is_red[i] ? 1 : in_shape[i];
+        }
+        fill_dims(pc.outDims, out_dims_full);
         int axes_mask = 0;
         for (int ax : axes_) {
             int a = (ax < 0) ? ax + rank : ax;

@@ -3,6 +3,7 @@
 #define OPS_BUFFER_BINARY_FACTORY_HPP_
 
 #include "ops/BufferBase.hpp"
+#include <string>
 
 // Shared base for elementwise binary buffer (SSBO) ops with ONNX
 // right-aligned broadcasting + optional post-fuse activation. Mirrors the
@@ -49,7 +50,14 @@ class BufferBinaryFactory : public BufferFactory {
             } else if (dim1 == dim2) {
                 result[i] = dim1;
             } else {
-                throw std::runtime_error("Shapes are not broadcast-compatible");
+                std::string sa, sb;
+                for (int d : shape1)
+                    sa += std::to_string(d) + ",";
+                for (int d : shape2)
+                    sb += std::to_string(d) + ",";
+                throw std::runtime_error(
+                    "Shapes are not broadcast-compatible: [" + sa + "] vs [" +
+                    sb + "]");
             }
         }
         return result;
@@ -76,17 +84,6 @@ class BufferBinaryFactory : public BufferFactory {
         auto b = core::as_tensor<int64_t>(inputs[1]);
         // int64 inputs may be GPU-resident only (e.g. NonZero's shader-computed
         // output leaves data_ empty). Pull them to the host before (*a)[i].
-        printf("[binint64] a cpu=%d gpu=%d size=%d shape=[",
-               (int)a->has_cpu_data(), (int)a->has_gpu_buffer(),
-               (int)a->num_elements());
-        for (auto d : shape_a)
-            printf("%d,", d);
-        printf("] b cpu=%d gpu=%d size=%d shape=[", (int)b->has_cpu_data(),
-               (int)b->has_gpu_buffer(), (int)b->num_elements());
-        for (auto d : shape_b)
-            printf("%d,", d);
-        printf("]\n");
-        fflush(stdout);
         if (!a->has_cpu_data()) {
             a->copyToCPU(m_cmdpool_);
         }

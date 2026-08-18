@@ -5,6 +5,7 @@
 #include "core/Tensor.hpp"
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
+#include <cstdlib>
 #include <numeric>
 
 extern "C" {
@@ -17,16 +18,22 @@ namespace vkop {
 namespace ops {
 
 namespace gather {
+// Push-constant layout mirrors shaders/buffer/gather.comp (std430). Shapes are
+// left-aligned 8-int arrays (fill_dims pads trailing slots with 1). The old
+// ivec4 layout capped data rank at 4; the IArr8 fields support up to 8-D —
+// needed for the 56 LLM KV-cache gathers on 5-D data [1,2,8,kv,128].
 struct GpuGatherParam {
-    ivec4 inShape;
-    ivec4 indicesShape;
-    ivec4 outShape;
+    int inShape[8];
+    int indicesShape[8];
+    int outShape[8];
     int axis;
     int idims;
     int odims;
     int nindex;
 };
 } // namespace gather
+static_assert(sizeof(gather::GpuGatherParam) <= 128,
+              "GpuGatherParam PC overflow");
 
 // SSBO-only op: ONNX Gather along an axis. fp16 picks the fp16 spv variant
 // (float16_t elements) via DUAL_FP16_SHADERS.
@@ -203,6 +210,18 @@ class Gather : public Operator {
         }
         std::vector<int> out_shape =
             calculateGatherOutputShape(inshape, indshape, param_.axis);
+        if (getenv("VKOP_GATHERDBG")) {
+            printf("[GATHERDBG] inshape=[");
+            for (int d : inshape)
+                printf("%d,", d);
+            printf("] indshape=[");
+            for (int d : indshape)
+                printf("%d,", d);
+            printf("] axis=%d out_shape=[", param_.axis);
+            for (int d : out_shape)
+                printf("%d,", d);
+            printf("]\n");
+        }
 
         // int64 data flows through a synchronous CPU path (see
         // cpuComputeInt64); all 352 int64 gathers in the LLM are part of the
@@ -215,9 +234,17 @@ class Gather : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
-                output->resize(out_shape);
-            }
+            // Always re-seat the output to the runtime out_shape. The output
+            // is pre-created at LoadModel from the converter's recorded shape
+            // (e.g. [1,8,1,128] for kv_len=1), but at runtime the data may be
+            // smaller (kv_len=0 → [1,8,0,128], empty). Without this re-resize
+            // the stale 1024-elem buffer is kept and downstream Concat sees a
+            // non-empty shape, producing a half-zero, mis-strided result.
+            // resize() is a no-op on element count when the shape already
+            // matches (same product → same size_); it only trims/grows the
+            // logical view. The backing SSBO is reused (as_storage_buffer
+            // returns the existing vkobj_ when present).
+            output->resize(out_shape);
             auto output_buffer = output->as_storage_buffer(m_dev_, m_cmd_);
             objs_.emplace_back(output_buffer);
         });
@@ -238,16 +265,12 @@ class Gather : public Operator {
 
         param_.idims = rank;
         param_.nindex = inputs[1]->getShape().size();
-        for (int i = 0; i < rank; ++i) {
-            param_.inShape[i] = inshape[i];
-        }
-        for (size_t i = 0; i < indshape.size(); ++i) {
-            param_.indicesShape[i] = indshape[i];
-        }
+        // Left-align each shape into an 8-int array (trailing slots = 1) to
+        // match gather.comp's IArr8 nd<->linear helpers.
+        fill_dims(param_.inShape, inshape);
+        fill_dims(param_.indicesShape, indshape);
+        fill_dims(param_.outShape, out_shape);
         param_.odims = out_shape.size();
-        for (size_t i = 0; i < out_shape.size(); ++i) {
-            param_.outShape[i] = out_shape[i];
-        }
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
         submit(&param_, UP_DIV(total_size, 256), 1, 1);

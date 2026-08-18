@@ -68,6 +68,49 @@ class ITensor {
         }
         return shape;
     }
+    // Pure-logical reshape: reset dims_/n_dims_ to `shape` WITHOUT touching the
+    // underlying storage (vkobj_ GPU buffer or CPU data_). Safe only when
+    // product(shape) == num_elements() — i.e. the new view has the same element
+    // count as the existing flat buffer, so every flat linear index still maps
+    // to the same physical element. This restores the *logical* shape that an
+    // optimizer fold (e.g. fold_aliasable_squeeze_unsqueeze) recorded in the
+    // vkopbin but that the producing op overwrote with its physical shape at
+    // runtime. Example: Unsqueeze at axis 2 of [1,8,1,128] is folded to a
+    // 5-D view [1,8,1,1,128] on the downstream consumer; the producing Concat
+    // leaves the tensor as 4-D, and the consumer (Expand) needs the 5-D view to
+    // right-align its broadcast correctly. The caller MUST verify element-count
+    // equivalence before calling.
+    template <typename U> void reshape_view(const std::vector<U> &shape) {
+        int ne_new = 1;
+        for (U d : shape) {
+            ne_new *= static_cast<int>(d);
+        }
+        int ne_old = 1;
+        for (uint8_t i = 0; i < n_dims_; ++i) {
+            ne_old *= dims_[i];
+        }
+        // Guard: only reshape if the element count is unchanged. A mismatch
+        // would silently desync the logical view from the physical buffer.
+        if (ne_new != ne_old) {
+            if (getenv("VKOP_RESHAPEDBG")) {
+                printf("[RESHAPEDBG] SKIP ne_new=%d ne_old=%d\n", ne_new,
+                       ne_old);
+            }
+            return;
+        }
+        memset(dims_, 0, sizeof(dims_));
+        n_dims_ = static_cast<uint8_t>(shape.size());
+        for (size_t i = 0; i < shape.size(); ++i) {
+            dims_[i] = static_cast<int>(shape[i]);
+        }
+        if (getenv("VKOP_RESHAPEDBG")) {
+            printf("[RESHAPEDBG] set n_dims=%d dims=[", n_dims_);
+            for (size_t i = 0; i < shape.size(); ++i)
+                printf("%d,", dims_[i]);
+            printf("] (was ne_old=%d)\n", ne_old);
+        }
+        // size_ unchanged (bytes = ne * sizeof(T), and ne is the same).
+    }
     std::vector<int> getGPUShape() {
         uint8_t ndim = num_dims();
         assert(ndim >= 3);
@@ -259,7 +302,15 @@ template <typename T> class Tensor : public ITensor {
     template <typename U>
     explicit Tensor(const std::vector<U> &dims, bool is_on_GPU = false) {
         memset(dims_, 0, sizeof(dims_));
-        size_ = dims.empty() ? 0 : sizeof(T);
+        // A rank-0 (scalar, empty dims) tensor holds exactly 1 element — same
+        // as ONNX (). Treating it as 0 bytes (the old behaviour) discarded the
+        // value, which is why dag.py historically np.atleast_1d'd every
+        // Constant. With a real 1-elem scalar representation, scalar Gather
+        // indices / Range start/limit can flow through the shape meta-chain
+        // (Gather→Cast→Range) without losing data. A genuinely empty tensor
+        // (a 0 in some dim, e.g. kv_len=0 past_key_values [1,2,8,0,128]) still
+        // gets size_=0 because the 0 dim multiplies through below.
+        size_ = sizeof(T);
         int i = 0;
         n_dims_ = static_cast<uint8_t>(dims.size());
         for (auto d : dims) {
@@ -307,7 +358,9 @@ template <typename T> class Tensor : public ITensor {
 
         memset(dims_, 0, sizeof(dims_));
         n_dims_ = static_cast<uint8_t>(dims.size());
-        size_ = dims.empty() ? 0 : sizeof(T);
+        // rank-0 (scalar) → 1 element (see Tensor ctor comment). A 0 in any
+        // dim still yields size_=0 via the multiply below.
+        size_ = sizeof(T);
         int i = 0;
         for (auto d : dims) {
             size_ *= d;
@@ -583,13 +636,6 @@ template <typename T> class Tensor : public ITensor {
     }
     void copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    T *data = nullptr) {
-        if constexpr (std::is_same_v<T, uint16_t>) {
-            printf("[cpygpu] enter is_on_GPU=%d has_vkobj=%d restype=%d "
-                   "cpudata=%d\n",
-                   (int)is_on_GPU(), (int)(vkobj_ != nullptr),
-                   (int)resource_type(), (int)has_cpu_data());
-            fflush(stdout);
-        }
         if (is_on_GPU()) {
             return;
         }
@@ -837,12 +883,6 @@ template <typename T> class Tensor : public ITensor {
         VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
-        if constexpr (std::is_same_v<T, uint16_t>) {
-            printf("[gpuup] size_=%d aligned=%d ne=%d src=%d data=%d\n",
-                   (int)size_, (int)aligned, (int)num_elements(),
-                   (int)(src != nullptr), (int)(data_ && !data_->empty()));
-            fflush(stdout);
-        }
         if (aligned == 0) {
             // Empty tensor (0 elements): nothing to upload, and the staging
             // pool asserts size != 0. The SSBO was already given a minimal
@@ -916,11 +956,7 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         if constexpr (std::is_same_v<T, uint16_t>) {
-            printf(
-                "[cpudn] size_=%d copy_bytes=%d ne=%d restype=%d offset=%d\n",
-                (int)size_, (int)copy_bytes, (int)num_elements(),
-                (int)(vkobj_->getResourceType()), (int)0);
-            fflush(stdout);
+            // temporarily silent during LLM numerics debug
         }
 
         auto b = stpool->allocate(copy_bytes);
@@ -930,12 +966,7 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         if constexpr (std::is_same_v<T, uint16_t>) {
-            printf("[cpudn2] boffset=%d bptr=%p mappedfirst=[", (int)b->offset,
-                   b->ptr);
-            for (int i = 0; i < 4 && i < (int)(copy_bytes / 2); ++i)
-                printf("%04x,", ((uint16_t *)b->ptr)[i]);
-            printf("]\n");
-            fflush(stdout);
+            // diagnostic print silenced during LLM numerics debug
         }
         std::shared_ptr<VulkanBuffer> buffer;
         size_t offset = 0;
@@ -954,11 +985,7 @@ template <typename T> class Tensor : public ITensor {
         cmd.submit(dev->getComputeQueue());
         cmd.wait();
         if constexpr (std::is_same_v<T, uint16_t>) {
-            printf("[cpudn3] after-copy bptrfirst=[");
-            for (int i = 0; i < 4 && i < (int)(copy_bytes / 2); ++i)
-                printf("%04x,", ((uint16_t *)b->ptr)[i]);
-            printf("]\n");
-            fflush(stdout);
+            // diagnostic print silenced during LLM numerics debug
         }
         if (need_compact) {
             size_t packed_stride_bytes =
@@ -977,13 +1004,7 @@ template <typename T> class Tensor : public ITensor {
             std::memcpy(data_->data(), b->ptr, size_);
         }
         if constexpr (std::is_same_v<T, uint16_t>) {
-            printf("[cpudn4] need_compact=%d row_pad=%d rows=%d cols=%d "
-                   "datafirst=[",
-                   (int)need_compact, (int)row_pad, rows, logical_cols);
-            for (int i = 0; i < 4 && i < (int)(size_ / 2); ++i)
-                printf("%04x,", ((uint16_t *)data_->data())[i]);
-            printf("]\n");
-            fflush(stdout);
+            // diagnostic print silenced during LLM numerics debug
         }
         stpool->reset();
         toCPU();

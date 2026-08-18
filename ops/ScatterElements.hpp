@@ -153,17 +153,6 @@ class ScatterElements : public BufferFactory {
         }
         // True index count from the host data (recycled shapes can lie).
         int n_idx = static_cast<int>(indices->num_elements());
-        printf("[scatter] data_shape=[");
-        for (auto d : data_shape)
-            printf("%d,", d);
-        printf("] cols=%d indices_shape=[", cols);
-        for (auto d : inputs[1]->getShape())
-            printf("%d,", d);
-        printf("] n_idx=%d updates_shape=[", n_idx);
-        for (auto d : inputs[2]->getShape())
-            printf("%d,", d);
-        printf("] updates_ne=%d\n", (int)updates->num_elements());
-        fflush(stdout);
 
         auto output = core::as_tensor<T>(outputs[0]);
         if (output->size() == 0) {

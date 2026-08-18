@@ -76,6 +76,7 @@ set(TEST_SOURCES
     ShapeTest.cpp
     CastTest.cpp
     ScatterNDTest.cpp
+    BufferRankTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

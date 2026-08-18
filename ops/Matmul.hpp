@@ -175,20 +175,31 @@ class MatMulBuffer : public BufferFactory {
         int rank_a = static_cast<int>(shape_a.size());
         int rank_b = static_cast<int>(shape_b.size());
 
-        int m, k, n, batch;
-        if (rank_a == 3) {
-            batch = shape_a[0];
-            m = shape_a[1];
-            k = shape_a[2];
-        } else {
-            batch = 1;
-            m = shape_a[0];
-            k = shape_a[1];
+        // ONNX MatMul: A is [..., M, K], B is [..., K, N]. The leading
+        // ("batch") dims are broadcast (right-aligned). We collapse all
+        // leading dims into a single batch count (their product, with the
+        // broadcast rule that a dim of 1 in either operand matches the other's
+        // value) so the reduce shader's flat [batch, M, K] / [batch, K, N]
+        // layout applies. The runtime guarantees both operands share the same
+        // leading-broadcast shape by the time MatMul runs (graph shape
+        // inference / the preceding Expand materializes it), so collapsing the
+        // products is exact.
+        if (rank_a < 2 || rank_b < 2) {
+            // Degenerate; nothing to do (should not happen for a valid model).
+            return;
         }
-        if (rank_b == 3) {
-            n = shape_b[2];
-        } else {
-            n = shape_b[1];
+        int m = shape_a[rank_a - 2];
+        int k = shape_a[rank_a - 1];
+        int n = shape_b[rank_b - 1];
+
+        int batch = 1;
+        int lead_a = rank_a - 2;
+        int lead_b = rank_b - 2;
+        int lead = std::max(lead_a, lead_b);
+        for (int i = 0; i < lead; ++i) {
+            int da = (i < lead_a) ? shape_a[lead_a - 1 - i] : 1;
+            int db = (i < lead_b) ? shape_b[lead_b - 1 - i] : 1;
+            batch *= std::max(da, db);
         }
 
         std::vector<int> out_shape;

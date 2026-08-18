@@ -6,33 +6,41 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include <cmath>
+#include <cstdlib>
 #include <numeric>
 
 extern "C" {
 extern unsigned char buffer_expand_spv[];
 extern unsigned int buffer_expand_spv_len;
+extern unsigned char buffer_expand_fp16_spv[];
+extern unsigned int buffer_expand_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
 
 namespace expand {
 struct GpuExpandParam {
-    ivec4 inshape;
-    uint32_t shape_length;
+    int rank;
     int fp16;
+    int inDims[8];
+    int outDims[8];
+    int _pad0;
+    int _pad1;
 };
 } // namespace expand
 
 // SSBO-only op: broadcasts input to the given output shape.
 class Expand : public Operator {
   public:
-    explicit Expand()
-        : Operator(OpType::EXPAND, buffer_expand_spv, buffer_expand_spv_len,
+    explicit Expand(int fp16 = 0)
+        : Operator(OpType::EXPAND,
+                   fp16 ? buffer_expand_fp16_spv : buffer_expand_spv,
+                   fp16 ? buffer_expand_fp16_spv_len : buffer_expand_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
-                   sizeof(expand::GpuExpandParam)) {
-        param_.fp16 = 0;
+                   sizeof(expand::GpuExpandParam), fp16) {
+        param_.fp16 = fp16 ? 1 : 0;
     }
 
   private:
@@ -71,16 +79,6 @@ class Expand : public Operator {
             int total = total_elems(out_shape);
             std::vector<int64_t> out(total);
             auto src = core::as_tensor<int64_t>(inputs[0]);
-            printf("[expandint64] src cpu=%d gpu=%d size=%d inshape=[",
-                   (int)src->has_cpu_data(), (int)src->has_gpu_buffer(),
-                   (int)src->num_elements());
-            for (auto d : inshape)
-                printf("%d,", d);
-            printf("] out_shape=[");
-            for (auto d : out_shape)
-                printf("%d,", d);
-            printf("] total=%d\n", total);
-            fflush(stdout);
             if (!src->has_cpu_data()) {
                 src->copyToCPU(m_cmdpool_);
             }
@@ -95,12 +93,55 @@ class Expand : public Operator {
             return;
         }
 
+        // ONNX Expand: the shape input (inputs[1]) is the *target* shape, but
+        // the real output shape is the element-wise max of the input shape and
+        // the target shape (right-aligned broadcasting): an input dim larger
+        // than the target dim is kept. E.g. input [1,1,64,1] expanded to target
+        // [3,1,1,1] yields output [3,1,64,1]. The host-computed out_shape (from
+        // graph shape inference) can be stale/wrong, so recompute it here from
+        // the authoritative target buffer + the input shape.
+        std::vector<int> target_shape;
+        {
+            auto sh = core::as_tensor<int64_t>(inputs[1]);
+            if (!sh->has_cpu_data())
+                sh->copyToCPU(m_cmdpool_);
+            target_shape.resize(sh->num_elements());
+            for (int i = 0; i < sh->num_elements(); ++i)
+                target_shape[i] = static_cast<int>((*sh)[i]);
+        }
+        if (getenv("VKOP_EXPDBG")) {
+            printf("[EXPDBG] inshape=[");
+            for (int d : inshape)
+                printf("%d,", d);
+            printf("] target=[");
+            for (int d : target_shape)
+                printf("%d,", d);
+            printf("]\n");
+        }
+        size_t maxd = std::max(inshape.size(), target_shape.size());
+        out_shape.assign(maxd, 1);
+        for (size_t i = 0; i < maxd; ++i) {
+            int id = (i < inshape.size()) ? inshape[inshape.size() - 1 - i] : 1;
+            int td = (i < target_shape.size())
+                         ? target_shape[target_shape.size() - 1 - i]
+                         : 1;
+            int v = std::max(id, td);
+            // ONNX: a 0 in the target propagates (size-0 output).
+            if (td == 0 || id == 0)
+                v = 0;
+            out_shape[maxd - 1 - i] = v;
+        }
+        if (getenv("VKOP_EXPDBG")) {
+            printf("[EXPDBG] computed out_shape=[");
+            for (int d : out_shape)
+                printf("%d,", d);
+            printf("] ne=%lld\n", (long long)total_elems(out_shape));
+        }
+        // Resize the output tensor to the correct broadcasted shape.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
-                output->resize(out_shape);
-            }
+            output->resize(out_shape);
             auto output_buffer = output->as_storage_buffer(m_dev_, m_cmd_);
             objs_.emplace_back(output_buffer);
             if (typeid(uint16_t) == typeid(T)) {
@@ -123,16 +164,21 @@ class Expand : public Operator {
 
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
-        for (size_t i = 0; i < out_shape.size(); ++i) {
-            if (static_cast<int>(inshape.size() - i - 1) >= 0) {
-                param_.inshape[out_shape.size() - i - 1] =
-                    inshape[inshape.size() - i - 1];
-            } else {
-                param_.inshape[out_shape.size() - i - 1] = 1;
-            }
-        }
-        param_.shape_length = static_cast<uint32_t>(out_shape.size());
-        submit(&param_, UP_DIV(total_size, 256), 1, 1);
+        // Fill input + output shapes into the push constant as left-aligned
+        // 8-int dim arrays (matches buffer_common.comp's fill_dims convention;
+        // the shader uses dims[0..rank-1]). Supports up to rank 8 — the LLM
+        // attention key/value Expand broadcasts a 5-D [1,8,1,1,128] ->
+        // [1,8,8,1, 128], which the old ivec4 path silently truncated. The
+        // shader reads output dims from the push constant — NOT from the
+        // (int64, possibly- mismatched) shape buffer — so broadcasting is
+        // computed on the host where the dtypes are known.
+        param_.rank = static_cast<int>(out_shape.size());
+        fill_dims(param_.outDims, out_shape);
+        fill_dims_broadcast(param_.inDims, inshape, param_.rank);
+        // fp16 packs two elements per uint word; dispatch one thread per word
+        // (the shader writes each word once — no read-modify-write race).
+        int nthreads = (fp16_ != 0) ? (total_size + 1) / 2 : total_size;
+        submit(&param_, UP_DIV(nthreads, 256), 1, 1);
     }
 
     expand::GpuExpandParam param_;

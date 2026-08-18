@@ -141,7 +141,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::RANGE:
         return std::make_unique<Range>();
     case OpType::EXPAND:
-        return std::make_unique<Expand>();
+        return std::make_unique<Expand>(fp16);
     case OpType::SIN:
         return std::make_unique<Sin>(fp16, backend_buffer);
     case OpType::COS:

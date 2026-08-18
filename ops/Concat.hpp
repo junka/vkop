@@ -5,6 +5,8 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
+#include <cstdlib>
+#include <string>
 extern "C" {
 extern unsigned char image_concat_spv[];
 extern unsigned int image_concat_spv_len;
@@ -213,12 +215,20 @@ class ConcatBuffer : public BufferFactory {
                 if (!src->has_cpu_data()) {
                     src->copyToCPU(m_cmdpool_);
                 }
+                // Guard against a shape-meta tensor whose recorded dims_ claim
+                // elements (in_total>0) but whose backing buffer is empty
+                // (num_elements()==0, e.g. a seq=0 slice whose logical view was
+                // reshaped to [1]). Reading (*src)[i] would deref an empty
+                // vector; skip the copy for this input (its slots stay 0).
+                int src_avail = src->num_elements();
                 for (int b = 0; b < block; ++b) {
                     // contiguous in_shape[axis_] elements per block
                     int in_base = b * in_shape[axis_];
                     int out_base = (offset + b * in_shape[axis_]) * in_stride;
                     for (int e = 0; e < in_shape[axis_]; ++e) {
-                        out[out_base + e * in_stride] = (*src)[in_base + e];
+                        if (in_base + e < src_avail) {
+                            out[out_base + e * in_stride] = (*src)[in_base + e];
+                        }
                     }
                 }
                 offset += in_shape[axis_];
@@ -226,6 +236,23 @@ class ConcatBuffer : public BufferFactory {
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(out_shape);
             output->fillToCPU(out);
+            if (getenv("VKOP_CONCATDBG")) {
+                printf("[CONCATDBG] int64 concat out_shape=[");
+                for (int d : out_shape)
+                    printf("%d,", d);
+                printf("] vals=[");
+                for (int i = 0; i < (int)out.size() && i < 8; ++i)
+                    printf("%lld,", (long long)out[i]);
+                printf("] in_shapes:");
+                for (auto &in : inputs) {
+                    auto s = in->getShape();
+                    printf("[");
+                    for (int d : s)
+                        printf("%d,", d);
+                    printf("]");
+                }
+                printf("\n");
+            }
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPU(m_cmdpool_, out.data());
             return;
@@ -251,6 +278,17 @@ class ConcatBuffer : public BufferFactory {
         int offset = 0;
         for (int i = 0; i < n_inputs; ++i) {
             int in_total = total_elems(inputs[i]->getShape());
+            if (getenv("VKOP_CONCATFPDBG")) {
+                auto s = inputs[i]->getShape();
+                printf("[CONCATFPDBG] in[%d] shape=[", i);
+                for (int d : s)
+                    printf("%d,", d);
+                printf("] in_total=%d axis=%d axisdim=%d offset=%d out_shape=[",
+                       in_total, axis_, s[axis_], offset);
+                for (int d : out_shape)
+                    printf("%d,", d);
+                printf("] ne=%lld\n", (long long)total_elems(out_shape));
+            }
             dispatch_by_dtype(inputs[i]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 // replace objs_[1] with this input's buffer
@@ -271,6 +309,7 @@ class ConcatBuffer : public BufferFactory {
             ConcatPC pc{};
             pc.axis = axis_;
             pc.rank = rank;
+            fill_dims(pc.inDims, inputs[i]->getShape());
             fill_dims(pc.outDims, out_shape);
             pc.offset = offset;
             submit_per_ds(pass_ds[i], &pc, UP_DIV(in_total, 256), 1, 1);

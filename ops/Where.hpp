@@ -5,6 +5,7 @@
 #include "core/Tensor.hpp"
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
+#include <algorithm>
 #include <cmath>
 #include <numeric>
 
@@ -33,6 +34,34 @@ class Where : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         std::vector<int> out_shape = outputs[0]->getShape();
+        // The graph's recorded output shape is often stale for the int64
+        // shape-meta chain (symbolic dims resolved to a max, not the runtime
+        // value). For int64 Where, recompute the broadcasted output shape from
+        // the authoritative inputs (cond/X/Y) — the CPU loop below needs the
+        // true shape to broadcast against.
+        if (inputs[0]->dtype() == typeid(int64_t)) {
+            std::vector<int> bcast;
+            for (const auto &in : inputs) {
+                auto s = in->getShape();
+                if (s.empty())
+                    continue;
+                if (bcast.empty()) {
+                    bcast = s;
+                } else {
+                    size_t m = std::max(bcast.size(), s.size());
+                    std::vector<int> nb(m, 1);
+                    for (size_t i = 0; i < m; ++i) {
+                        int a = (i < bcast.size()) ? bcast[bcast.size() - 1 - i]
+                                                   : 1;
+                        int b = (i < s.size()) ? s[s.size() - 1 - i] : 1;
+                        nb[m - 1 - i] = std::max(a, b);
+                    }
+                    bcast = nb;
+                }
+            }
+            if (!bcast.empty())
+                out_shape = bcast;
+        }
         if (out_shape.empty()) {
             auto inshape = inputs[0]->getShape();
             out_shape = inshape;

@@ -49,6 +49,15 @@ class Runtime {
     std::vector<std::unordered_map<std::string, std::string>> node_attrs_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_input_tensors_;
     std::vector<std::vector<std::shared_ptr<ITensor>>> node_output_tensors_;
+    // Per-node recorded input shapes (from the vkopbin ShapeRef dims). Applied
+    // as a pure-logical reshape_view at execute time so each consumer sees the
+    // view the converter recorded for IT (e.g. an Unsqueeze fold records a 5-D
+    // view [1,8,1,1,128] on the Expand consumer, but the producing Concat
+    // leaves the shared tensor 4-D [1,8,1,128]). Resolving at LoadModel time
+    // would race: multiple consumers sharing one tensor each reshape it, and
+    // the last writer wins — so we store the shapes and apply them right
+    // before onExecute in execution order.
+    std::vector<std::vector<std::vector<int>>> node_input_shapes_;
 
   public:
     // Constructor
