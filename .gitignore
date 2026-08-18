@@ -48,3 +48,21 @@ Makefile
 
 # Ignore Git-specific files
 *.orig
+
+# Ignore Claude Code session/agent state
+.claude/
+
+# Ignore ad-hoc testing scratch
+/Testing/
+
+# Python bytecode + build dirs
+__pycache__/
+*.pyc
+llm/tokenizer/build/
+
+# LLM model artifacts (multi-GB weights, converted binaries, runtime dumps) —
+# never commit; regenerate via onnx2vkop / dump_llm_inputs.py
+*.weights.bin
+*.onx
+llm/exporter/inputs_dump/
+llm/tokenizer/*.bin
