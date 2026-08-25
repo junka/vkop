@@ -1527,17 +1527,47 @@ void Runtime::RegisterPostProcess(
 
     auto dev = m_cmdpool_->getVulkanDevice();
 
+    // The image backend packs tensors as image2DArray (NCHW->RGBA) and needs
+    // >=3-D tensors (getGPUShape asserts ndim>=3). A post-process op like
+    // Softmax over a 2-D [batch, classes] logits output can't be represented
+    // as an image — force the buffer backend for it, mirroring setup.hpp's
+    // low-rank Softmax handling. The buffer Softmax handles any rank.
+    bool use_buffer = backend_buffer_;
+    if (!use_buffer && ops == vkop::ops::OpType::SOFTMAX) {
+        for (const auto &in : inputs) {
+            if (in && in->num_dims() < 3) {
+                use_buffer = true;
+                break;
+            }
+        }
+    }
     auto op = ops::create_from_type(
-        ops, precision_, dev->is_support_nv_tensor_core(), backend_buffer_);
+        ops, precision_, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
 
     size_t current_op_idx = node_ops_.size();
+    // Record each input's current (concrete) shape BEFORE moving inputs away,
+    // so Run()'s per-node node_input_shapes_[node_idx] lookup stays in sync
+    // with node_ops_ — the two vectors MUST stay parallel (Run indexes them by
+    // node_idx). The post-process inputs are already-concrete output tensors,
+    // so this just captures their live shape (reshape_view to the same shape
+    // is a no-op at execute time).
+    std::vector<std::vector<int>> post_input_shapes;
+    post_input_shapes.reserve(inputs.size());
+    for (const auto &in : inputs) {
+        if (in) {
+            post_input_shapes.push_back(in->getShape());
+        } else {
+            post_input_shapes.emplace_back();
+        }
+    }
     node_ops_.push_back(std::move(op));
     node_attrs_.push_back(attributes);
     node_input_tensors_.push_back(std::move(inputs));
     node_output_tensors_.push_back(std::move(outputs));
+    node_input_shapes_.push_back(std::move(post_input_shapes));
 
     std::vector<int> post_process_dependencies;
     if (!level_node_indices_.empty()) {
