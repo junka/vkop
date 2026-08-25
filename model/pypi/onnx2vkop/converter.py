@@ -79,7 +79,8 @@ class ModelConverter:
                 continue
             tensor_type = inp.type.tensor_type
             shape_dims = [
-                dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim
+                dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                else -1 for dim in tensor_type.shape.dim
             ]
             dtype_str = {
                 1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
@@ -93,7 +94,8 @@ class ModelConverter:
         for out in graph.output:
             tensor_type = out.type.tensor_type
             shape_dims = [
-                dim.dim_value if dim.HasField("dim_value") else 1 for dim in tensor_type.shape.dim
+                dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                else -1 for dim in tensor_type.shape.dim
             ]
             dtype_str = {
                 1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
@@ -188,13 +190,18 @@ class ModelConverter:
                     continue
                 tensor_type = output_tensor.type.tensor_type
                 shape_dims = [
-                    dim.dim_value if dim.HasField("dim_value") else 1
+                    dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                    else -1
                     for dim in tensor_type.shape.dim
                 ]
-                # 归一化：rank 大于 0 时把 0 维替换成 1（0 在 buffer/SSBO 里无意义），
-                # 与 initializer 的 (0,)/() 特判一致，避免下游 DAG 解析对 0 维报错。
-                if len(shape_dims) > 0:
-                    shape_dims = [d if d != 0 else 1 for d in shape_dims]
+                # Dynamic dims: a -1 here means the dim is symbolic (dim_param
+                # set, no concrete value) and its concrete value is only known
+                # at runtime (e.g. kv_len). Keep -1 as the "dynamic" sentinel —
+                # the runtime recomputes the actual shape from input data for
+                # dynamic-shape ops (Concat, Reshape, ...). A concrete 0 (no
+                # dim_param) means genuinely empty (e.g. kv_len=0 at round0
+                # prefill) and stays 0. Do NOT normalize -1->1: that would freeze
+                # growing dims (KV-cache kv_len) at 1 and break decode rounds.
                 #  GlobalAveragePool compression to 2d, so we can use storage instead of image
                 if node.op_type == "GlobalAveragePool" and len(shape_dims) >= 2:
                     original_shape = shape_dims[:]
@@ -263,11 +270,17 @@ class ModelConverter:
                     continue
                 tensor_type = input_tensor.type.tensor_type
                 shape_dims = [
-                    dim.dim_value if dim.HasField("dim_value") else 1
+                    dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                    else -1
                     for dim in tensor_type.shape.dim
                 ]
-                if len(shape_dims) > 0:
-                    shape_dims = [d if d != 0 else 1 for d in shape_dims]
+                # Dynamic dims: a -1 here means the dim is symbolic (dim_param)
+                # and its concrete value is only known at runtime (e.g. kv_len).
+                # Keep -1 as the "dynamic" sentinel — the runtime recomputes the
+                # actual shape from input data for dynamic-shape ops (Concat,
+                # Reshape, ...). A concrete 0 (no dim_param) means genuinely
+                # empty. Do NOT normalize -1->1: that would freeze growing dims
+                # (KV-cache kv_len) at 1 and break decode rounds.
                 if input_name in modified_shapes and len(modified_shapes[input_name]) > 0:
                     shape_dims = modified_shapes[input_name]
                     print(f"Modified shape of input {input_name} to {shape_dims}")

@@ -416,7 +416,7 @@ class DAGBasedModel:
                 name_off = builder.CreateString(name)
                 ShapeRef.StartDimsVector(builder, len(dims))
                 for d in reversed(dims):
-                    builder.PrependUint32(int(d))
+                    builder.PrependInt32(int(d))
                 dims_off = builder.EndVector()
                 dtype_off = builder.CreateString(dtype) if dtype else 0
                 ShapeRef.Start(builder)
@@ -592,7 +592,7 @@ class DAGBasedModel:
         # --- root Model table ---
         Model.Start(builder)
         Model.AddMagic(builder, 0x504F4B56)
-        Model.AddVersion(builder, 1)
+        Model.AddVersion(builder, 2)
         Model.AddInputs(builder, inputs_vec)
         Model.AddOutputs(builder, outputs_vec)
         Model.AddNodes(builder, nodes_vec)

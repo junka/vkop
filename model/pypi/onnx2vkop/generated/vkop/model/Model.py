@@ -40,7 +40,7 @@ class Model(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(6))
         if o != 0:
             return self._tab.Get(flatbuffers.number_types.Uint8Flags, o + self._tab.Pos)
-        return 1
+        return 2
 
     # Model
     def Inputs(self, j):
@@ -290,7 +290,7 @@ def AddMagic(builder, magic):
     ModelAddMagic(builder, magic)
 
 def ModelAddVersion(builder, version):
-    builder.PrependUint8Slot(1, version, 1)
+    builder.PrependUint8Slot(1, version, 2)
 
 def AddVersion(builder, version):
     ModelAddVersion(builder, version)

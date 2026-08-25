@@ -30,18 +30,53 @@ layout(push_constant) uniform PC_uConcat {
     int _pad2;
 } uConcat;
 
+// Map an input element index to the output element index (axis offset added).
+int concat_elem(int gid) {
+    IArr8 in_coord = linear_to_nd8(gid, uConcat.inDims, uConcat.rank);
+    IArr8 out_coord;
+    for (int i = 0; i < 8; ++i) out_coord.v[i] = in_coord.v[i];
+    out_coord.v[uConcat.axis] += uConcat.offset;
+    return nd_to_linear8(out_coord, uConcat.outDims, uConcat.rank);
+}
+
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int rank = uConcat.rank;
     int in_total = 1;
     for (int i = 0; i < rank; ++i) in_total *= uConcat.inDims.v[i];
+
+#ifdef FP16
+    // fp16 packs two halfs per uint word. One thread per input word: elements
+    // 2*gid (lo) and 2*gid+1 (hi). Each maps (non-contiguously under concat)
+    // to its own output element via concat_elem; the two results are packed
+    // into one output word written once — no read-modify-write race.
+    int nwords = (in_total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = 2 * gid + 1;
+    int o0 = concat_elem(e0);
+    float v0 = BUF_LOAD(uInput.data, e0);
+    if (e1 >= in_total) {
+        uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, 0.0));
+    } else {
+        float v1 = BUF_LOAD(uInput.data, e1);
+        int o1 = concat_elem(e1);
+        // e0 and e1 are contiguous input elements (word gid), but under concat
+        // their output positions o0,o1 are also contiguous (the axis offset is
+        // constant; only the axis coord differs by 1, and it lands in the same
+        // output word when the axis is the fastest-varying dim, or in adjacent
+        // words otherwise). Pack into o0's word when o0 and o1 share a word;
+        // otherwise store separately (each into its own word's low half).
+        if ((o0 >> 1) == (o1 >> 1)) {
+            uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, v1));
+        } else {
+            uOutput.data[o0 >> 1] = packHalf2x16(vec2(v0, 0.0));
+            uOutput.data[o1 >> 1] = packHalf2x16(vec2(v1, 0.0));
+        }
+    }
+#else
     if (gid >= in_total) return;
-
-    IArr8 in_coord = linear_to_nd8(gid, uConcat.inDims, rank);
-    IArr8 out_coord;
-    for (int i = 0; i < 8; ++i) out_coord.v[i] = in_coord.v[i];
-    out_coord.v[uConcat.axis] += uConcat.offset;
-
-    int out_linear = nd_to_linear8(out_coord, uConcat.outDims, rank);
+    int out_linear = concat_elem(gid);
     uOutput.data[out_linear] = floatBitsToUint(float(BUF_LOAD(uInput.data, gid)));
+#endif
 }

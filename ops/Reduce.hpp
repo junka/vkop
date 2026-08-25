@@ -105,7 +105,7 @@ class ReduceImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);
-            if (outputptr->size() == 0) {
+            if (outputptr->num_elements() != total_elems(output_shape)) {
                 outputptr->resize(output_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);
@@ -212,7 +212,7 @@ class ReduceBuffer : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);

@@ -94,7 +94,7 @@ class SliceImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_size[0])) {
                 output->resize(out_size[0]);
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
@@ -207,10 +207,58 @@ class SliceBuffer : public BufferFactory {
             return;
         }
 
+        // fp16 data: CPU slice. The fp32 GPU slice shader indexes the SSBO in
+        // uint words (1 word = 2 packed fp16), but inDims/outDims are in
+        // elements — so for fp16 the shader's linear index runs to 2× the
+        // word count and reads OOB. The rotary cos/sin Slice ([1,16,1,128]
+        // fp16 -> [1,16,1,64]) is the canonical case. Small + rare -> host
+        // slice is correct and cheap. Same coord-map math as the int64 path.
+        if (inputs[0]->dtype() == typeid(uint16_t)) {
+            auto out_shape = out_size[0];
+            auto &full_starts = out_size[1];
+            auto &full_steps = out_size[3];
+            int total = total_elems(out_shape);
+            std::vector<uint16_t> out(static_cast<size_t>(total));
+            auto src = core::as_tensor<uint16_t>(inputs[0]);
+            if (!src->has_cpu_data()) {
+                src->copyToCPU(m_cmdpool_);
+            }
+
+            std::vector<int> in_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                in_stride[d] = in_stride[d + 1] * inshape[d + 1];
+            }
+            std::vector<int> out_stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                out_stride[d] = out_stride[d + 1] * out_shape[d + 1];
+            }
+            std::vector<int> in_coord(rank, 0);
+            std::vector<int> out_coord(rank, 0);
+            for (int o = 0; o < total; ++o) {
+                int r = o;
+                for (int d = 0; d < rank; ++d) {
+                    out_coord[d] = (r / out_stride[d]) % out_shape[d];
+                }
+                int in_lin = 0;
+                for (int d = 0; d < rank; ++d) {
+                    in_coord[d] = full_starts[d] + out_coord[d] * full_steps[d];
+                    in_lin += in_coord[d] * in_stride[d];
+                }
+                out[static_cast<size_t>(o)] = (*src)[in_lin];
+            }
+
+            auto output = core::as_tensor<uint16_t>(outputs[0]);
+            output->resize(out_shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_size[0])) {
                 output->resize(out_size[0]);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);

@@ -90,6 +90,11 @@ class Runtime {
     // Returns nullptr if not found. For inspecting intermediates after Run.
     std::shared_ptr<ITensor> GetTensor(const std::string &name) const;
 
+    // List all named tensors (inputs, initializers, node outputs). For
+    // driver-side dump-all diagnostics comparing against ORT intermediates.
+    std::vector<std::pair<std::string, std::shared_ptr<ITensor>>>
+    ListTensors() const;
+
     // Get initializer tensor by name, for test only
     std::shared_ptr<ITensor> GetInitializer(const std::string &name) const;
 

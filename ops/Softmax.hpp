@@ -71,7 +71,7 @@ class SoftmaxImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(inputs[0]->getShape())) {
                 output->resize(inputs[0]->getShape());
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
@@ -179,7 +179,7 @@ class SoftmaxBuffer : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(shape)) {
                 output->resize(shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
@@ -195,8 +195,15 @@ class SoftmaxBuffer : public BufferFactory {
         // buffer there. fp32 leaves both binding 2/3 unused; bind dummy for
         // each so the descriptor set is valid.
         if (fp16_ != 0) {
+            // total may be 0 for a dynamic-shape output that resolved empty
+            // (a 0 dim). vkCreateBuffer rejects size 0; clamp to 16 bytes
+            // (the dispatch is 0 threads anyway). See Matmul.hpp.
+            size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
+            if (scratch_bytes == 0) {
+                scratch_bytes = 16;
+            }
             scratch_ = std::make_shared<VulkanBuffer>(
-                m_dev_, static_cast<size_t>(total) * sizeof(float),
+                m_dev_, scratch_bytes,
                 STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             objs_.emplace_back(scratch_);

@@ -4,6 +4,7 @@
 
 #include "Operator.hpp"
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 
 namespace vkop {
 namespace ops {
@@ -84,7 +85,12 @@ class BinaryFactory : public Operator {
             int dim1 = (idx1 >= 0) ? shape1[idx1] : 1;
             int dim2 = (idx2 >= 0) ? shape2[idx2] : 1;
 
-            if (dim1 == 1 || dim2 == 1) {
+            // 0 = empty tensor (e.g. kv_len=0 past_key_values at round0
+            // prefill): propagate the 0 so the result is empty and the
+            // per-element loop is skipped. See BufferBinaryFactory.
+            if (dim1 == 0 || dim2 == 0) {
+                result_shape[i] = 0;
+            } else if (dim1 == 1 || dim2 == 1) {
                 result_shape[i] = std::max(dim1, dim2);
             } else if (dim1 == dim2) {
                 result_shape[i] = dim1;
@@ -106,7 +112,7 @@ class BinaryFactory : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);
-            if (outputptr->size() == 0) {
+            if (outputptr->num_elements() != total_elems(output_shape)) {
                 outputptr->resize(output_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);

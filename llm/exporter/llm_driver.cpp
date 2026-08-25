@@ -139,11 +139,95 @@ void fill_input(const std::shared_ptr<Runtime>& rt, const std::string& name,
     }
 }
 
+// Upload one input tensor's CPU staging to its SSBO. Skip empty tensors
+// (kv_len=0 past_key_values): copyToGPUBuffer would assert on a 0-byte stage.
+void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                  const std::shared_ptr<ITensor>& t) {
+    if (t->size() == 0) return;
+    if (t->dtype() == typeid(int64_t)) as_tensor<int64_t>(t)->copyToGPU(cmdpool);
+    else if (t->dtype() == typeid(int)) as_tensor<int>(t)->copyToGPU(cmdpool);
+    else if (t->dtype() == typeid(int8_t)) as_tensor<int8_t>(t)->copyToGPU(cmdpool);
+    else if (t->dtype() == typeid(float)) as_tensor<float>(t)->copyToGPU(cmdpool);
+    else as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
+}
+
+// Fill + upload every input for one round from <round_dir>/input_names.txt.
+// Each round's KV-cache past_key_values_{i} grows (kv_len increments), so we
+// re-resize + recreate the SSBO + re-upload every round.
+void load_round_inputs(const std::shared_ptr<Runtime>& rt,
+                       const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                       const std::string& round_dir,
+                       std::vector<std::string>* input_names_out) {
+    std::ifstream nf(round_dir + "/input_names.txt");
+    if (!nf) throw std::runtime_error("no input_names.txt in " + round_dir);
+    std::vector<std::string> names;
+    std::string line;
+    while (std::getline(nf, line)) {
+        if (!line.empty()) names.push_back(line);
+    }
+    for (const auto& name : names) {
+        NpyArray arr = load_npy(round_dir + "/" + name + ".npy");
+        fill_input(rt, name, arr);
+        upload_input(cmdpool, rt->GetInput(name));
+    }
+    if (input_names_out) *input_names_out = names;
+}
+
+// Compare the runtime's 'logits' output against <round_dir>/reference_logits.npy.
+// Returns the vkop argmax (== ref argmax on success). Prints top8 + diffs.
+int compare_round(const std::shared_ptr<Runtime>& rt,
+                  const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                  const std::string& round_dir) {
+    NpyArray ref = load_npy(round_dir + "/reference_logits.npy");
+    auto logits = rt->GetOutput("logits");
+    if (!logits) throw std::runtime_error("no 'logits' output");
+    auto lg = as_tensor<uint16_t>(logits);
+    lg->copyToCPU(cmdpool);
+    const uint16_t* out_bits = reinterpret_cast<const uint16_t*>(lg->data().data());
+    size_t n = npy_elem_count(ref.shape);
+    if (size_t(lg->num_elements()) != n) {
+        std::fprintf(stderr, "[%s] logits size mismatch out=%d ref=%zu\n",
+                     round_dir.c_str(), lg->num_elements(), n);
+        return -1;
+    }
+    int argmax_out = -1, argmax_ref = -1;
+    float maxv_out = -1e30f, maxv_ref = -1e30f;
+    double sum_abs_diff = 0;
+    float max_abs_diff = 0;
+    std::vector<std::pair<float,int>> vk, rf;
+    vk.reserve(n); rf.reserve(n);
+    for (size_t i = 0; i < n; ++i) {
+        float fo = ITensor::fp16_to_fp32(out_bits[i]);
+        float fr = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[i]);
+        if (fo > maxv_out) { maxv_out = fo; argmax_out = int(i); }
+        if (fr > maxv_ref) { maxv_ref = fr; argmax_ref = int(i); }
+        float d = std::fabs(fo - fr);
+        sum_abs_diff += d;
+        if (d > max_abs_diff) max_abs_diff = d;
+        vk.push_back({fo, (int)i});
+        rf.push_back({fr, (int)i});
+    }
+    auto topp = [](std::vector<std::pair<float,int>> &v) {
+        std::partial_sort(v.begin(), v.begin()+std::min<size_t>(8,v.size()), v.end(),
+                          [](auto&a,auto&b){return a.first>b.first;});
+    };
+    topp(vk); topp(rf);
+    std::printf("  vkop top8: ");
+    for (int i=0;i<8;++i) std::printf("[%d %.4g] ", vk[i].second, vk[i].first);
+    std::printf("\n  ref  top8: ");
+    for (int i=0;i<8;++i) std::printf("[%d %.4g] ", rf[i].second, rf[i].first);
+    std::printf("\n  argmax: vkop=%d  ref=%d  max_abs_diff=%.4g  mean_abs_diff=%.4g  %s\n",
+                argmax_out, argmax_ref, max_abs_diff, sum_abs_diff / n,
+                (argmax_out == argmax_ref) ? "MATCH" : "DIFF");
+    return argmax_out;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: %s <model.vkopbin> <inputs_dump_dir>\n", argv[0]);
+        std::fprintf(stderr, "  inputs_dump_dir contains round0/ round1/ ... subdirs\n");
         return 1;
     }
     const std::string model_path = argv[1];
@@ -165,133 +249,163 @@ int main(int argc, char** argv) {
     rt->LoadModel();
     std::printf("=== LoadModel done ===\n");
 
-    // Read input name list (one per line, written by dump_llm_inputs.py).
-    std::ifstream nf(dump_dir + "/input_names.txt");
-    if (!nf) { std::fprintf(stderr, "no input_names.txt in %s\n", dump_dir.c_str()); return -1; }
-    std::vector<std::string> input_names;
-    std::string line;
-    while (std::getline(nf, line)) {
-        if (!line.empty()) input_names.push_back(line);
+    // Discover round directories (round0 = prefill, round1.. = decode steps).
+    std::vector<int> rounds;
+    for (int t = 0; ; ++t) {
+        std::string rd = dump_dir + "/round" + std::to_string(t);
+        std::ifstream f(rd + "/input_names.txt");
+        if (!f) break;
+        rounds.push_back(t);
     }
-    std::printf("Filling %zu inputs from %s\n", input_names.size(), dump_dir.c_str());
-    for (const auto& name : input_names) {
-        NpyArray arr = load_npy(dump_dir + "/" + name + ".npy");
-        try {
-            fill_input(rt, name, arr);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "fill_input(%s) failed: %s\n", name.c_str(), e.what());
+    if (rounds.empty()) {
+        // Back-compat: a flat dump (no round subdirs) → treat dump_dir as round0.
+        std::ifstream f(dump_dir + "/input_names.txt");
+        if (!f) {
+            std::fprintf(stderr, "no round subdirs and no input_names.txt in %s\n", dump_dir.c_str());
             return -1;
         }
-        // Upload CPU staging -> SSBO. copyToGPU with no src reads the tensor's
-        // own CPU staging (filled above) and clears it. Skip empty inputs
-        // (kv_len=0 past_key_values): copyToGPUBuffer would assert on a 0-byte
-        // staging alloc, and there's nothing to upload anyway.
-        auto t = rt->GetInput(name);
-        if (t->size() == 0) {
-            std::printf("  skip empty input %s\n", name.c_str());
-            continue;
-        }
-        if (t->dtype() == typeid(int64_t)) as_tensor<int64_t>(t)->copyToGPU(cmdpool);
-        else if (t->dtype() == typeid(int)) as_tensor<int>(t)->copyToGPU(cmdpool);
-        else if (t->dtype() == typeid(int8_t)) as_tensor<int8_t>(t)->copyToGPU(cmdpool);
-        else if (t->dtype() == typeid(float)) as_tensor<float>(t)->copyToGPU(cmdpool);
-        else as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
+        rounds.push_back(-1);  // sentinel: load from dump_dir directly
     }
+    std::printf("Found %zu round(s)\n", rounds.size());
 
-    std::printf("=== inputs uploaded ===\n");
-
-    std::printf("=== Run ===\n");
-    double ms = rt->Run();
-    std::printf("Run took %.2f ms\n", ms);
-    rt->ReadResult();
-
-    // Dump + NaN-check named intermediates (VKOP_DUMP_TENSORS=comma list).
-    if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
-        std::string s(d), name;
-        std::stringstream ss(s);
-        while (std::getline(ss, name, ',')) {
-            if (name.empty()) continue;
-            auto t = rt->GetTensor(name);
-            if (!t) { std::printf("[dump] %s: NOT FOUND\n", name.c_str()); continue; }
-            auto tg = as_tensor<uint16_t>(t);
-            tg->copyToCPU(cmdpool);
-            int ne = tg->num_elements();
-            int nan_cnt = 0, inf_cnt = 0, zero_cnt = 0;
-            float maxv = -1e30f, minv = 1e30f;
-            const uint16_t *p = reinterpret_cast<const uint16_t*>(tg->data().data());
-            for (int i = 0; i < ne; ++i) {
-                float v = ITensor::fp16_to_fp32(p[i]);
-                if (std::isnan(v)) nan_cnt++;
-                else if (std::isinf(v)) inf_cnt++;
-                if (v == 0.f) zero_cnt++;
-                if (!std::isnan(v) && !std::isinf(v)) {
-                    if (v > maxv) maxv = v;
-                    if (v < minv) minv = v;
+    int n_match = 0, n_round = 0;
+    for (int t : rounds) {
+        std::string rd = (t < 0) ? dump_dir : dump_dir + "/round" + std::to_string(t);
+        std::printf("\n=== round%d (%s) ===\n", n_round, rd.c_str());
+        try {
+            load_round_inputs(rt, cmdpool, rd, nullptr);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "load_round_inputs failed: %s\n", e.what());
+            return -1;
+        }
+        // Optional upload-verify: readback inputs_embeds + past_key_values_0
+        // and compare their first elements / norms against the npy source, to
+        // confirm round-to-round input updates actually landed on the SSBOs.
+        if (const char *v = std::getenv("VKOP_VERIFY_INPUTS")) {
+            auto verify = [&](const std::string& tname, bool is_fp16) {
+                auto t = rt->GetInput(tname);
+                if (!t) { std::printf("[vin] %s: NOT FOUND\n", tname.c_str()); return; }
+                NpyArray src = load_npy(rd + "/" + tname + ".npy");
+                if (is_fp16) {
+                    auto tg = as_tensor<uint16_t>(t);
+                    if (tg->has_gpu_buffer()) tg->copyToCPU(cmdpool);
+                    const uint16_t* p = reinterpret_cast<const uint16_t*>(tg->data().data());
+                    const uint16_t* s = reinterpret_cast<const uint16_t*>(src.data.data());
+                    int ne = std::min<int>(4, tg->num_elements());
+                    float maxd = 0;
+                    for (size_t i = 0; i < npy_elem_count(src.shape); ++i) {
+                        float d = std::fabs(ITensor::fp16_to_fp32(p[i]) - ITensor::fp16_to_fp32(s[i]));
+                        if (d > maxd) maxd = d;
+                    }
+                    std::printf("[vin] %s: ne=%d maxdiff_vs_npy=%.4g first=[", tname.c_str(),
+                                tg->num_elements(), maxd);
+                    for (int i = 0; i < ne; ++i) std::printf("%04x,", p[i]);
+                    std::printf("]\n");
                 }
-            }
-            std::printf("[dump] %s: ne=%d nan=%d inf=%d zero=%d min=%.4g max=%.4g first=[",
-                        name.c_str(), ne, nan_cnt, inf_cnt, zero_cnt, minv, maxv);
-            for (int i = 0; i < 4 && i < ne; ++i) std::printf("%04x,", p[i]);
-            std::printf("]\n"); fflush(stdout);
+            };
+            verify("inputs_embeds", true);
+            verify("past_key_values_0", true);
+            verify("attention_bias", true);
         }
+        double ms = rt->Run();
+        rt->ReadResult();
+        std::printf("Run took %.2f ms\n", ms);
+
+        // Optional named-intermediate dump (VKOP_DUMP_TENSORS=comma list, or
+        // "*" to dump every fp16 tensor). VKOP_DUMP_ROUND=<n> restricts to one
+        // round. Output matches dump_ort_intermediates.py for line-by-line diff.
+        if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
+            int dump_round = -1;
+            if (const char *r = std::getenv("VKOP_DUMP_ROUND")) dump_round = std::atoi(r);
+            if (dump_round < 0 || dump_round == n_round) {
+                std::string s(d);
+                // Build (name, tensor) list to dump.
+                std::vector<std::pair<std::string, std::shared_ptr<ITensor>>> items;
+                if (s == "*") {
+                    items = rt->ListTensors();
+                } else {
+                    std::stringstream ss(s);
+                    std::string nm;
+                    while (std::getline(ss, nm, ',')) {
+                        if (nm.empty()) continue;
+                        auto t = rt->GetTensor(nm);
+                        items.push_back({nm, t});
+                    }
+                }
+                for (auto &it : items) {
+                    const std::string &nm = it.first;
+                    auto &tns = it.second;
+                    if (!tns) { std::printf("[%s] NOT FOUND\n", nm.c_str()); continue; }
+                    if (tns->dtype() == typeid(int64_t)) {
+                        // int64 shape-meta dump (opt-in via VKOP_DUMP_INT64=1).
+                        if (!std::getenv("VKOP_DUMP_INT64") ||
+                            std::getenv("VKOP_DUMP_INT64")[0] != '1') continue;
+                        auto tg = as_tensor<int64_t>(tns);
+                        if (!tg->has_gpu_buffer()) { std::printf("[%s] no GPU buffer\n", nm.c_str()); continue; }
+                        tg->copyToCPU(cmdpool);
+                        const int64_t *p = tg->data().data();
+                        int ne = tg->num_elements();
+                        std::printf("[%s] ne=%d int64=[", nm.c_str(), ne);
+                        for (int i = 0; i < 16 && i < ne; ++i) std::printf("%lld,", (long long)p[i]);
+                        std::printf("]\n");
+                        continue;
+                    }
+                    if (tns->dtype() == typeid(float)) {
+                        // fp32 dump (opt-in via VKOP_DUMP_FP32=1).
+                        if (!std::getenv("VKOP_DUMP_FP32") ||
+                            std::getenv("VKOP_DUMP_FP32")[0] != '1') continue;
+                        auto tg = as_tensor<float>(tns);
+                        if (!tg->has_gpu_buffer()) { std::printf("[%s] no GPU buffer\n", nm.c_str()); continue; }
+                        tg->copyToCPU(cmdpool);
+                        const float *p = tg->data().data();
+                        int ne = tg->num_elements();
+                        int nan=0,inf=0,zero=0; float mn=1e30f,mx=-1e30f;
+                        for (int i=0;i<ne;++i){float v=p[i];
+                            if(std::isnan(v))nan++;else if(std::isinf(v))inf++;
+                            if(v==0.f)zero++;
+                            if(!std::isnan(v)&&!std::isinf(v)){if(v>mx)mx=v;if(v<mn)mn=v;}}
+                        std::printf("[%s] ne=%d nan=%d inf=%d zero=%d min=%.4g max=%.4g first=[",
+                                    nm.c_str(), ne, nan, inf, zero, mn, mx);
+                        for(int i=0;i<8&&i<ne;++i)std::printf("%.4g,",p[i]);
+                        std::printf("]\n");
+                        continue;
+                    }
+                    if (tns->dtype() != typeid(uint16_t)) continue;  // fp16 only, match ORT script
+                    auto tg = as_tensor<uint16_t>(tns);
+                    if (!tg->has_gpu_buffer()) { std::printf("[%s] no GPU buffer\n", nm.c_str()); continue; }
+                    tg->copyToCPU(cmdpool);
+                    const uint16_t *p = reinterpret_cast<const uint16_t*>(tg->data().data());
+                    int ne = tg->num_elements();
+                    int nan=0,inf=0,zero=0; float mn=1e30f,mx=-1e30f;
+                    for (int i=0;i<ne;++i){float v=ITensor::fp16_to_fp32(p[i]);
+                        if(std::isnan(v))nan++;else if(std::isinf(v))inf++;
+                        if(v==0.f)zero++;
+                        if(!std::isnan(v)&&!std::isinf(v)){if(v>mx)mx=v;if(v<mn)mn=v;}}
+                    std::printf("[%s] ne=%d nan=%d inf=%d zero=%d min=%.4g max=%.4g first=[",
+                                nm.c_str(), ne, nan, inf, zero, mn, mx);
+                    for(int i=0;i<4&&i<ne;++i)std::printf("%04x,",p[i]);
+                    std::printf("]\n");
+                }
+                fflush(stdout);
+            }
+        }
+
+        int argmax_out = compare_round(rt, cmdpool, rd);
+        if (argmax_out >= 0) {
+            // Re-fetch ref argmax for the match tally.
+            NpyArray ref = load_npy(rd + "/reference_logits.npy");
+            int argmax_ref = -1; float mv = -1e30f;
+            for (size_t i = 0; i < npy_elem_count(ref.shape); ++i) {
+                float fr = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[i]);
+                if (fr > mv) { mv = fr; argmax_ref = int(i); }
+            }
+            if (argmax_out == argmax_ref) ++n_match;
+        }
+        ++n_round;
+        fflush(stdout);
     }
 
-    // Compare logits against ONNX Runtime reference.
-    NpyArray ref = load_npy(dump_dir + "/reference_logits.npy");
-    auto logits = rt->GetOutput("logits");
-    if (!logits) { std::fprintf(stderr, "no 'logits' output\n"); return -1; }
-    auto lg = as_tensor<uint16_t>(logits);
-    lg->copyToCPU(cmdpool);
-    std::printf("logits gpu=%d cpu=%d ne=%d firstbits=[",
-                (int)lg->has_gpu_buffer(), (int)lg->has_cpu_data(),
-                (int)lg->num_elements());
-    for (int i = 0; i < 8 && i < lg->num_elements(); ++i) {
-        std::printf("%04x,", (unsigned)reinterpret_cast<const uint16_t*>(lg->data().data())[i]);
-    }
-    std::printf("]\n"); fflush(stdout);
-    // reference is fp16 -> uint16_t bits; convert to fp32 for argmax/diff.
-    size_t n = npy_elem_count(ref.shape);
-    std::printf("logits: out_n=%d ref_n=%zu\n", lg->num_elements(), n);
-    if (size_t(lg->num_elements()) != n) {
-        std::fprintf(stderr, "logits size mismatch\n");
-        return -1;
-    }
-    int argmax_out = -1, argmax_ref = -1;
-    float maxv_out = -1e30f, maxv_ref = -1e30f;
-    double sum_abs_diff = 0;
-    float max_abs_diff = 0;
-    // Top-5 buckets for vkop and ref logits.
-    std::vector<std::pair<float,int>> vk, rf;
-    vk.reserve(n); rf.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        float fo = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(lg->data().data())[i]);
-        float fr = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[i]);
-        if (fo > maxv_out) { maxv_out = fo; argmax_out = int(i); }
-        if (fr > maxv_ref) { maxv_ref = fr; argmax_ref = int(i); }
-        float d = std::fabs(fo - fr);
-        sum_abs_diff += d;
-        if (d > max_abs_diff) max_abs_diff = d;
-        vk.push_back({fo, (int)i});
-        rf.push_back({fr, (int)i});
-    }
-    auto topp = [](std::vector<std::pair<float,int>> &v) {
-        std::partial_sort(v.begin(), v.begin()+std::min<size_t>(8,v.size()), v.end(),
-                          [](auto&a,auto&b){return a.first>b.first;});
-    };
-    topp(vk); topp(rf);
-    std::printf("vkop top8: ");
-    for (int i=0;i<8;++i) std::printf("[%d %.4g] ", vk[i].second, vk[i].first);
-    std::printf("\nref  top8: ");
-    for (int i=0;i<8;++i) std::printf("[%d %.4g] ", rf[i].second, rf[i].first);
-    // value at ref argmax and vkop argmax in both
-    float vk_at_refarg = (argmax_ref>=0 && argmax_ref<(int)n)
-        ? ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(lg->data().data())[argmax_ref]) : 0.f;
-    float rf_at_vkarg = (argmax_out>=0 && argmax_out<(int)n)
-        ? ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[argmax_out]) : 0.f;
-    std::printf("\nvk@refarg(%d)=%.4g ref@vkarg(%d)=%.4g\n", argmax_ref, vk_at_refarg, argmax_out, rf_at_vkarg);
-    std::printf("argmax: vkop=%d  ref=%d\n", argmax_out, argmax_ref);
-    std::printf("max_abs_diff=%.4g  mean_abs_diff=%.4g\n", max_abs_diff, sum_abs_diff / n);
-    std::printf("=== %s ===\n", (argmax_out == argmax_ref) ? "MATCH" : "DIFF");
-    return (argmax_out == argmax_ref) ? 0 : 2;
+    std::printf("\n=== summary: %d/%d rounds MATCH ===\n", n_match, n_round);
+    return (n_match == n_round) ? 0 : 2;
 }
 

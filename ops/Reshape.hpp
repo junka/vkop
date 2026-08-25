@@ -4,6 +4,8 @@
 
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 
 #include "core/Tensor.hpp"
@@ -107,7 +109,7 @@ class ReshapeImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(dim)) {
                 output->resize(dim);
             }
             if (dim.size() <= 2) {
@@ -267,7 +269,7 @@ class ReshapeBuffer : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(dim)) {
                 output->resize(dim);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);

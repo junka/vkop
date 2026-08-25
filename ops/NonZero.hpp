@@ -2,6 +2,7 @@
 #ifndef OPS_NONZERO_HPP_
 #define OPS_NONZERO_HPP_
 
+#include "core/Tensor.hpp"
 #include "ops/BufferBase.hpp"
 #include <numeric>
 
@@ -22,9 +23,21 @@ struct alignas(16) NonZeroPC {
 };
 } // namespace nonzero
 
-// SSBO-only op: finds linear indices of all non-zero elements.
-// Output: uint buffer where [0] = count, [1..count] = indices.
-// The host must zero output[0] before dispatch and read back the count.
+// SSBO op: ONNX NonZero. Returns the indices of the non-zero elements of the
+// input, as an int64 tensor of shape [rank, num_nonzero] (column-major: the
+// k-th nonzero element's coordinates occupy out[:, k], i.e. out[r*count+k]
+// for axis r).
+//
+// Host-side implementation. The LLM's sole NonZero feeds a deep int64
+// shape-meta chain (Transpose[1,0] -> Expand -> ScatterElements) that
+// consumes the [rank, num_nonzero] layout directly; the old single-pass GPU
+// shader wrote a flat [count, idx...] buffer with shape [total+1], which
+// broke Transpose's perm=[1,0] (rank-1 input read OOB) and fed garbage
+// scatter indices. The input (image_pad_mask-derived) is tiny and bool/int8,
+// and the count is only known after scanning the data — so compute on the
+// host, set the exact [rank, count] shape, and upload. (All 6 decode rounds
+// have an all-False mask -> count=0 -> empty [1,0] output -> empty scatter,
+// which is the correct no-op.)
 class NonZero : public BufferFactory {
   public:
     explicit NonZero()
@@ -38,44 +51,58 @@ class NonZero : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto shape = inputs[0]->getShape();
+        int rank = static_cast<int>(shape.size());
+        if (rank == 0) {
+            rank = 1; // scalar input: treat as rank-1 [1]
+            shape = {1};
+        }
         int total = total_elems(shape);
-        // Output: [0]=count + max `total` indices. Worst case: all non-zero.
-        int out_size = total + 1;
 
-        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
-            using T = decltype(dummy);
-            auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
-                output->resize(std::vector<int>{out_size});
-            }
-            bind_ssbo<T>(outputs[0], true);
-        });
-        // Input may be bool/int8/int64/float — bind on its actual dtype so
-        // as_tensor<T> yields a non-null Tensor<T> (hardcoding float would
-        // crash on the LLM's int8 image_pad_mask-derived input).
+        // Pull the input to the host and collect the multi-dim coordinates of
+        // every non-zero element. bool/int8 share the int8_t storage repr in
+        // the runtime; float/int64 are also supported by dispatch_by_dtype.
+        std::vector<std::vector<int64_t>>
+            coords; // coords[k] = coord of k-th nz
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], false);
+            auto input = core::as_tensor<T>(inputs[0]);
+            if (!input->has_cpu_data()) {
+                input->copyToCPU(m_cmdpool_);
+            }
+            // Precompute per-axis strides (row-major) for coordinate decode.
+            std::vector<int64_t> stride(rank, 1);
+            for (int d = rank - 2; d >= 0; --d) {
+                stride[d] = stride[d + 1] * shape[d + 1];
+            }
+            for (int i = 0; i < total; ++i) {
+                if (static_cast<double>((*input)[i]) != 0.0) {
+                    std::vector<int64_t> c(rank);
+                    int rem = i;
+                    for (int d = 0; d < rank; ++d) {
+                        c[d] = rem / static_cast<int>(stride[d]);
+                        rem = rem % static_cast<int>(stride[d]);
+                    }
+                    coords.push_back(std::move(c));
+                }
+            }
         });
 
-        // Zero the counter at output[0].
-        // Since output is bound as SSBO (not zeroed), we use a fillBuffer
-        // via the command buffer before dispatch.
-        // Actually, the output tensor might be on GPU already. We need to
-        // zero the first 4 bytes. Use a staging copy or memset.
-        // Simplest: the host fills the output with zeros before copyToGPU.
-        // But the output is created on GPU (toGPU). So we use a dummy
-        // approach: dispatch a fillBuffer via the VulkanBuffer.
-        // Actually, the output's VulkanBuffer is in objs_[0]. We can
-        // dynamic_cast and fillBuffer.
-        auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
-        if (out_buf) {
-            out_buf->fillBuffer(m_cmd_->get(), 0u, 4);
+        int count = static_cast<int>(coords.size());
+        // ONNX NonZero output: [rank, count], column-major. For rank==1 this
+        // is just [1, count] == a flat [count] of linear indices in memory.
+        std::vector<int> out_shape = {rank, count};
+        std::vector<int64_t> out(static_cast<size_t>(rank) * count);
+        for (int k = 0; k < count; ++k) {
+            for (int r = 0; r < rank; ++r) {
+                out[static_cast<size_t>(r) * count + k] = coords[k][r];
+            }
         }
 
-        nonzero::NonZeroPC pc{};
-        pc.total = total;
-        submit(&pc, UP_DIV(total, 256), 1, 1);
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        output->copyToGPU(m_cmdpool_, out.data());
     }
 };
 

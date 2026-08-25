@@ -78,7 +78,7 @@ class SplitImage : public Operator {
                 auto output = core::as_tensor<T>(outputs[i]);
                 auto shape = inputs[0]->getShape();
                 shape[para_.axis] = static_cast<int>(split_vec[i]);
-                if (output->size() == 0) {
+                if (output->num_elements() != total_elems(shape)) {
                     output->resize(shape);
                 }
                 auto output_image = output->as_output_image(m_dev_, m_cmd_);
@@ -193,7 +193,7 @@ class SplitBuffer : public BufferFactory {
             dispatch_by_dtype(outputs[i]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto output = core::as_tensor<T>(outputs[i]);
-                if (output->size() == 0) {
+                if (output->num_elements() != total_elems(out_shape)) {
                     output->resize(out_shape);
                 }
                 auto ob = bind_ssbo<T>(outputs[i], /*is_output=*/true);

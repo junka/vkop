@@ -275,9 +275,8 @@ endforeach()
 #
 # fp16 buffer storage packs two half values per uint word, so the fp16 path
 # must use a word-per-thread store pattern to avoid read-modify-write races.
-# Only the contiguous elementwise + reshape buffer shaders are fp16-ready in
-# this pass; structural (slice/concat/split/transpose) and reduction
-# (softmax/layernorm/reduce) buffer shaders ship fp32-only for now.
+# Transpose is non-contiguous (permuted) so its fp16 path reads each output
+# element via the packed-half BUF_LOAD and packs two results per output word.
 set(DUAL_FP16_SHADERS
     buffer/gather
     buffer/sigmoid
@@ -294,6 +293,8 @@ set(DUAL_FP16_SHADERS
     buffer/prelu
     buffer/reshape
     buffer/expand
+    buffer/transpose
+    buffer/concat
     buffer/softmax
     buffer/matmul
     buffer/cos

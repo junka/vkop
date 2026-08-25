@@ -30,7 +30,7 @@ namespace load {
 
 struct Shape {
     std::string name;
-    std::vector<uint32_t> dims;
+    std::vector<int32_t> dims; // -1 = dynamic sentinel, 0 = empty (see schema)
     std::string dtype; // "" if the writer didn't record one
 };
 

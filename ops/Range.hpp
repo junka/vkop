@@ -40,7 +40,13 @@ class Range : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         std::vector<int> out_shape = outputs[0]->getShape();
-        if (out_shape.empty()) {
+        // Always recompute the range length from start/limit/delta — they are
+        // the authoritative source. The baked output shape may carry a 0
+        // "dynamic" sentinel (symbolic dim_param) which is not the real count;
+        // trusting it would leave the output at 0 elements and break
+        // downstream shape-meta consumers (Reshape/Add). The int64 path below
+        // also recomputes unconditionally.
+        {
             dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto input0 = core::as_tensor<T>(inputs[0]);
@@ -52,9 +58,24 @@ class Range : public Operator {
                 auto input2 = core::as_tensor<T>(inputs[2]);
                 input2->copyToCPU(m_cmdpool_);
                 auto delta = input2->at(0);
-                int inums = static_cast<int>(
-                    std::ceil((limit - start) / std::abs(delta)));
-                out_shape.push_back(inums);
+                // ONNX count = max(0, ceil((limit-start)/delta)) with the
+                // division rounding away from zero when
+                // sign(delta)==sign(range). The old
+                // `ceil((limit-start)/abs(delta))` gave a NEGATIVE count for a
+                // descending range (e.g. start=3,limit=-8,delta=-1
+                // -> -11), which then underflowed size_ and crashed buffer
+                // creation. Mirror the int64 path's sign-aware math.
+                double range =
+                    static_cast<double>(limit) - static_cast<double>(start);
+                int inums = 0;
+                if (range > 0 && delta > 0) {
+                    inums = static_cast<int>(
+                        std::ceil(range / static_cast<double>(delta)));
+                } else if (range < 0 && delta < 0) {
+                    inums = static_cast<int>(
+                        std::ceil(range / static_cast<double>(delta)));
+                }
+                out_shape = {inums};
             });
         }
 
@@ -82,7 +103,7 @@ class Range : public Operator {
                 out[static_cast<size_t>(i)] = start + i * delta;
             }
             auto output = core::as_tensor<int64_t>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             output->fillToCPU(out);
@@ -94,7 +115,7 @@ class Range : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             auto output_buffer = output->as_storage_buffer(m_dev_, m_cmd_);

@@ -2,6 +2,7 @@
 #include "VulkanBuffer.hpp"
 #include "VulkanLib.hpp"
 #include "VulkanResource.hpp"
+#include <cstdio>
 #include <stdexcept>
 
 namespace vkop {
@@ -70,6 +71,9 @@ void VulkanBuffer::createBuffer(VkBufferUsageFlags usage, bool device_local) {
                               nullptr, &m_buffer_);
 #endif
     if (ret != VK_SUCCESS) {
+        std::fprintf(stderr, "[VKBUF-FAIL] size=%zu usage=0x%x ret=%d\n",
+                     static_cast<size_t>(m_size_), static_cast<unsigned>(usage),
+                     static_cast<int>(ret));
         throw std::runtime_error("Failed to create buffer!");
     }
     if (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) {

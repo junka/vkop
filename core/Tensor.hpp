@@ -92,22 +92,12 @@ class ITensor {
         // Guard: only reshape if the element count is unchanged. A mismatch
         // would silently desync the logical view from the physical buffer.
         if (ne_new != ne_old) {
-            if (getenv("VKOP_RESHAPEDBG")) {
-                printf("[RESHAPEDBG] SKIP ne_new=%d ne_old=%d\n", ne_new,
-                       ne_old);
-            }
             return;
         }
         memset(dims_, 0, sizeof(dims_));
         n_dims_ = static_cast<uint8_t>(shape.size());
         for (size_t i = 0; i < shape.size(); ++i) {
             dims_[i] = static_cast<int>(shape[i]);
-        }
-        if (getenv("VKOP_RESHAPEDBG")) {
-            printf("[RESHAPEDBG] set n_dims=%d dims=[", n_dims_);
-            for (size_t i = 0; i < shape.size(); ++i)
-                printf("%d,", dims_[i]);
-            printf("] (was ne_old=%d)\n", ne_old);
         }
         // size_ unchanged (bytes = ne * sizeof(T), and ne is the same).
     }
@@ -367,7 +357,11 @@ template <typename T> class Tensor : public ITensor {
             dims_[i++] = static_cast<int>(d);
         }
         if (!is_on_GPU()) {
-            if (!data_) {
+            // data_ may exist but be empty: copyToGPU clears it after upload,
+            // and recreate_storage_buffer flips converted_=false without
+            // touching data_. In that state there's no old data to preserve,
+            // so reserve fresh CPU storage instead of memcpy'ing from empty.
+            if (!data_ || data_->empty()) {
                 reserveOnCPU();
             } else {
                 resize_tensor(old_n_dims, old_dims);
@@ -831,14 +825,24 @@ template <typename T> class Tensor : public ITensor {
     std::unique_ptr<std::vector<T>> data_;
 
     void make_vkbuff(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
-        if (vkobj_) {
-            return;
-        }
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         // Vulkan requires buffer size > 0; empty tensors (e.g. kv_len=0
         // past_key_values) get a minimal dummy buffer so creation succeeds.
         if (aligned == 0)
             aligned = 16;
+        // Reuse an existing buffer only if its size matches. A tensor whose
+        // backing was created for a smaller shape (e.g. the dummy 16-byte
+        // buffer allocated when kv_len=0) MUST be reallocated when the tensor
+        // is later resized to hold real data (kv_len>=1 decode rounds) —
+        // otherwise the shader writes past the end and downstream reads zero
+        // padding, silently corrupting the KV-cache.
+        if (vkobj_) {
+            auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+            if (buff && buff->getSize() == aligned) {
+                return;
+            }
+            vkobj_.reset();
+        }
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     }
@@ -1181,6 +1185,12 @@ template <typename T> class Tensor : public ITensor {
 
     void resize_tensor(uint8_t old_n_dims, int old_dims[16]) {
         auto new_data = std::make_unique<std::vector<T>>(num_elements());
+        // Defensive: if old data is shorter than old_dims implies (e.g. data_
+        // was partially cleared), there is nothing valid to copy — start fresh.
+        if (!data_ || data_->empty()) {
+            data_ = std::move(new_data);
+            return;
+        }
         if (old_n_dims == n_dims_ && old_n_dims > 0) {
             if (n_dims_ == 1) {
                 std::memcpy(new_data->data(), data_->data(),

@@ -48,7 +48,11 @@ struct RGBAConversionMeta {
 
 table ShapeRef {
   name: string;
-  dims: [uint];
+  // -1 = dynamic sentinel (symbolic dim_param the converter couldn't resolve;
+  // runtime substitutes the concrete value). 0 = genuinely empty (e.g.
+  // kv_len=0 at round0 prefill). Initializer/Attribute dims stay [uint] since
+  // they are always concrete.
+  dims: [int];
   dtype: string;
 }
 
@@ -94,7 +98,7 @@ table ConcurrentLevel {
 
 table Model {
   magic: uint = 0x504F4B56;
-  version: ubyte = 1;
+  version: ubyte = 2;
   inputs: [ShapeRef];
   outputs: [ShapeRef];
   nodes: [Node];

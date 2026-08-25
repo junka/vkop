@@ -65,4 +65,5 @@ llm/tokenizer/build/
 *.weights.bin
 *.onx
 llm/exporter/inputs_dump/
+llm/exporter/decode_dump/
 llm/tokenizer/*.bin

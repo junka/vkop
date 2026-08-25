@@ -72,12 +72,35 @@ class Expand : public Operator {
             if (!shape_input->has_cpu_data()) {
                 shape_input->copyToCPU(m_cmdpool_);
             }
-            out_shape.resize(shape_input->num_elements());
+            std::vector<int> target_shape(shape_input->num_elements());
             for (int i = 0; i < shape_input->num_elements(); ++i) {
-                out_shape[i] = static_cast<int>((*shape_input)[i]);
+                target_shape[i] = static_cast<int>((*shape_input)[i]);
+            }
+            // ONNX Expand output shape = right-aligned broadcast of input vs
+            // target: dim is the input dim when it is neither 1 nor -1 (a
+            // concrete value, including 0=empty), else the target dim. This
+            // matters for the NonZero->Transpose->Expand shape-meta chain:
+            // an empty source [0,1] expanded to target [1,2048] must yield
+            // [0,2048] (empty), NOT [1,2048] — otherwise we read OOB from the
+            // 0-element source and feed garbage downstream (Scatter indices).
+            size_t maxd = std::max(inshape.size(), target_shape.size());
+            out_shape.assign(maxd, 1);
+            for (size_t i = 0; i < maxd; ++i) {
+                int id =
+                    (i < inshape.size()) ? inshape[inshape.size() - 1 - i] : 1;
+                int td = (i < target_shape.size())
+                             ? target_shape[target_shape.size() - 1 - i]
+                             : 1;
+                int v = std::max(id, td);
+                if (td == 0 || id == 0) {
+                    v = 0; // either side concrete-empty -> empty
+                } else if (id == -1) {
+                    v = td; // input dynamic -> take concrete target
+                }
+                out_shape[maxd - 1 - i] = v;
             }
             int total = total_elems(out_shape);
-            std::vector<int64_t> out(total);
+            std::vector<int64_t> out(static_cast<size_t>(total));
             auto src = core::as_tensor<int64_t>(inputs[0]);
             if (!src->has_cpu_data()) {
                 src->copyToCPU(m_cmdpool_);
@@ -109,15 +132,6 @@ class Expand : public Operator {
             for (int i = 0; i < sh->num_elements(); ++i)
                 target_shape[i] = static_cast<int>((*sh)[i]);
         }
-        if (getenv("VKOP_EXPDBG")) {
-            printf("[EXPDBG] inshape=[");
-            for (int d : inshape)
-                printf("%d,", d);
-            printf("] target=[");
-            for (int d : target_shape)
-                printf("%d,", d);
-            printf("]\n");
-        }
         size_t maxd = std::max(inshape.size(), target_shape.size());
         out_shape.assign(maxd, 1);
         for (size_t i = 0; i < maxd; ++i) {
@@ -126,16 +140,19 @@ class Expand : public Operator {
                          ? target_shape[target_shape.size() - 1 - i]
                          : 1;
             int v = std::max(id, td);
-            // ONNX: a 0 in the target propagates (size-0 output).
-            if (td == 0 || id == 0)
-                v = 0;
+            // target_shape comes from a runtime int64 buffer (inputs[1]) so its
+            // 0s are genuine shape values (an empty target dim → empty output).
+            // id (the input's own shape) is a live dims_ value: under the -1
+            // sentinel scheme, 0 = concrete empty (propagate), -1 = dynamic
+            // (shouldn't reach here post-has_dyn, but guard anyway → take the
+            // concrete target). Only a real target 0 (td==0) or a
+            // concrete-empty input (id==0) propagates an empty dim.
+            if (td == 0 || id == 0) {
+                v = 0; // either side concrete-empty -> empty
+            } else if (id == -1) {
+                v = td; // input dynamic -> take concrete target
+            }
             out_shape[maxd - 1 - i] = v;
-        }
-        if (getenv("VKOP_EXPDBG")) {
-            printf("[EXPDBG] computed out_shape=[");
-            for (int d : out_shape)
-                printf("%d,", d);
-            printf("] ne=%lld\n", (long long)total_elems(out_shape));
         }
         // Resize the output tensor to the correct broadcasted shape.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {

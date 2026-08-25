@@ -53,9 +53,11 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
     }
 
     const auto* model = vkop::model::GetModel(buf);
-    if (model->version() != 1) {
+    if (model->version() != 2) {
         throw std::runtime_error(
-            "Unsupported VKOP model version: " + std::to_string(model->version()));
+            "Unsupported VKOP model version: " + std::to_string(model->version()) +
+            " (expected 2: -1 dynamic sentinel). Reconvert with "
+            "`python3 -m onnx2vkop.cli -i <model>.onnx`.");
     }
 
     // inputs / outputs

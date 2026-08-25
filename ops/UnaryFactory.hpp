@@ -2,6 +2,7 @@
 #ifndef OPS_UNARY_FACTORY_HPP_
 #define OPS_UNARY_FACTORY_HPP_
 
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 
 namespace vkop {
@@ -22,7 +23,7 @@ class UnaryFactory : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(inputs[0]->getShape())) {
                 output->resize(inputs[0]->getShape());
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);

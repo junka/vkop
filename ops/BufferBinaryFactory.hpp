@@ -37,12 +37,15 @@ class BufferBinaryFactory : public BufferFactory {
             int idx2 = i - (max_dims - shape2.size());
             int dim1 = (idx1 >= 0) ? shape1[idx1] : 1;
             int dim2 = (idx2 >= 0) ? shape2[idx2] : 1;
-            // ONNX broadcasting: a 0 dimension propagates (a size-0 input
-            // yields a size-0 output). Treat 0 like 1 for compatibility, but
-            // propagate the 0 into the result so total_elements() is 0 and the
-            // loop is skipped — without this, a size-0 input paired with a
-            // size-1 input produces a size-1 result and the per-element read
-            // goes out of bounds on the empty tensor.
+            // ONNX broadcasting: a 0 dimension means an empty tensor (e.g. the
+            // kv_len=0 past_key_values at round0 prefill). Propagate the 0 so
+            // the result is empty and the per-element loop is skipped — pairing
+            // a 0 with a 1 and taking max(0,1)=1 would instead read element 0
+            // of an empty tensor and crash. (Under the -1 sentinel scheme, 0
+            // unambiguously means empty for both data and shape-meta tensors;
+            // -1 = dynamic never reaches a live tensor's dims_ because the
+            // runtime's has_dyn check skips reshape_view on sentinel-bearing
+            // recorded shapes.)
             if (dim1 == 0 || dim2 == 0) {
                 result[i] = 0;
             } else if (dim1 == 1 || dim2 == 1) {
@@ -149,7 +152,7 @@ class BufferBinaryFactory : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);

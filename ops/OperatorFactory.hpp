@@ -56,6 +56,7 @@
 #include "ops/ScatterElements.hpp"
 #include "ops/ScatterND.hpp"
 #include "ops/Shape.hpp"
+#include "ops/SqueezeUnsqueeze.hpp"
 
 namespace vkop {
 
@@ -166,6 +167,10 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Cast>();
     case OpType::SCATTER_ND:
         return std::make_unique<ScatterND>();
+    case OpType::SQUEEZE:
+        return std::make_unique<SqueezeUnsqueeze>(/*unsqueeze=*/false);
+    case OpType::UNSQUEEZE:
+        return std::make_unique<SqueezeUnsqueeze>(/*unsqueeze=*/true);
     default:
         return nullptr;
     }

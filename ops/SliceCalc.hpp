@@ -61,8 +61,19 @@ calculate_output_shape(const std::vector<int> &input_shape,
         auto axis = norm_axes[i];
         auto dim_size = input_shape[axis];
 
-        int start = static_cast<int>(starts[i]);
-        int end = static_cast<int>(ends[i]);
+        // ONNX Slice clamps start/end to [-dim_size, dim_size] *before* the
+        // negative-wrap, and the end-of-axis sentinel is INT64_MAX (e.g.
+        // /Constant_28 = 9223372036854775807 in the LLM rotary Slice_3). Do the
+        // clamp in int64 (T) FIRST: casting INT64_MAX to int overflows to -1,
+        // and the subsequent `end += dim_size` would then yield dim_size-1
+        // (127 instead of 128) — a latent bug masked while shapes were baked
+        // to 1, now that dynamic dims flow the real dim_size.
+        int64_t s = starts[i];
+        int64_t e = ends[i];
+        s = std::max<int64_t>(-dim_size, std::min<int64_t>(s, dim_size));
+        e = std::max<int64_t>(-dim_size, std::min<int64_t>(e, dim_size));
+        int start = static_cast<int>(s);
+        int end = static_cast<int>(e);
         int step = (steps.size() > i) ? static_cast<int>(steps[i]) : 1;
 
         if (step == 0)

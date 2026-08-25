@@ -105,7 +105,7 @@ class Where : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             auto output_buffer = output->as_storage_buffer(m_dev_, m_cmd_);

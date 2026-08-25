@@ -6,11 +6,15 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
+#include <cstdio>
+#include <cstdlib>
 extern "C" {
 extern unsigned char image_transpose_spv[];
 extern unsigned int image_transpose_spv_len;
 extern unsigned char buffer_transpose_spv[];
 extern unsigned int buffer_transpose_spv_len;
+extern unsigned char buffer_transpose_fp16_spv[];
+extern unsigned int buffer_transpose_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -54,7 +58,7 @@ class TransposeImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(outshape)) {
                 output->resize(outshape);
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
@@ -85,14 +89,17 @@ class TransposeImage : public Operator {
 
     std::vector<int> perm_ = {3, 2, 1, 0};
 };
-// Transpose buffer op (fp32). Arbitrary perm up to 8-D.
+// Transpose buffer op. Arbitrary perm up to 8-D. fp16 path uses the
+// buffer_transpose_fp16_spv shader (word-per-thread, packed-half reads).
 class TransposeBuffer : public BufferFactory {
   public:
-    explicit TransposeBuffer(int /*fp16*/)
-        : BufferFactory(OpType::TRANSPOSE, buffer_transpose_spv,
-                        buffer_transpose_spv_len,
+    explicit TransposeBuffer(int fp16)
+        : BufferFactory(OpType::TRANSPOSE,
+                        fp16 ? buffer_transpose_fp16_spv : buffer_transpose_spv,
+                        fp16 ? buffer_transpose_fp16_spv_len
+                             : buffer_transpose_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(TransposePC)) {}
+                        sizeof(TransposePC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -152,7 +159,7 @@ class TransposeBuffer : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(outshape)) {
                 output->resize(outshape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
@@ -170,7 +177,10 @@ class TransposeBuffer : public BufferFactory {
             pc.perm[i] = (i < rank) ? perm_[i] : i;
         }
         int total = total_elems(outshape);
-        submit(&pc, UP_DIV(total, 256), 1, 1);
+        // fp16 packs two elements per uint word; dispatch one thread per output
+        // word (the fp16 shader writes each word once — no RMW race).
+        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
     }
 
     std::vector<int> perm_ = {3, 2, 1, 0};
@@ -179,10 +189,9 @@ class TransposeBuffer : public BufferFactory {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Transpose : public PimplFacade {
   public:
-    Transpose(int /*fp16*/, bool backend_buffer)
-        : PimplFacade(OpType::TRANSPOSE) {
+    Transpose(int fp16, bool backend_buffer) : PimplFacade(OpType::TRANSPOSE) {
         impl_ = backend_buffer ? std::unique_ptr<Operator>(
-                                     std::make_unique<TransposeBuffer>(0))
+                                     std::make_unique<TransposeBuffer>(fp16))
                                : std::make_unique<TransposeImage>();
     }
 };

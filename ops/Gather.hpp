@@ -210,18 +210,6 @@ class Gather : public Operator {
         }
         std::vector<int> out_shape =
             calculateGatherOutputShape(inshape, indshape, param_.axis);
-        if (getenv("VKOP_GATHERDBG")) {
-            printf("[GATHERDBG] inshape=[");
-            for (int d : inshape)
-                printf("%d,", d);
-            printf("] indshape=[");
-            for (int d : indshape)
-                printf("%d,", d);
-            printf("] axis=%d out_shape=[", param_.axis);
-            for (int d : out_shape)
-                printf("%d,", d);
-            printf("]\n");
-        }
 
         // int64 data flows through a synchronous CPU path (see
         // cpuComputeInt64); all 352 int64 gathers in the LLM are part of the

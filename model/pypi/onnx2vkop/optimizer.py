@@ -363,6 +363,19 @@ class ONNXOptimizer:
             print(f"[optimize] onnxoptimizer skipped ({e}); using ConstantFolder only")
             optimized_model = onnx_model
 
+        # onnxoptimizer's C++ backend serializes the model internally; for a
+        # >2GB model (weights loaded as external data → raw_data in memory) it
+        # does NOT raise but silently returns a degenerate graph with 0 nodes
+        # (only the "IR version too old" warning is printed). Detect that and
+        # fall back to the un-optimized model so ConstantFolder still sees the
+        # full graph. Without this guard the converter writes a 96-byte empty
+        # vkopbin and the runtime sees no graph inputs.
+        if optimized_model is not None and len(onnx_model.graph.node) > 0 and \
+                len(optimized_model.graph.node) == 0:
+            print("[optimize] onnxoptimizer returned an empty graph "
+                  "(model too large to serialize); using ConstantFolder only")
+            optimized_model = onnx_model
+
         # 常量折叠：内置 ConstantFolder（纯 numpy，无外部依赖）。
         # 把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather/
         # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
@@ -1125,12 +1138,18 @@ class FusionOptimizer:
 
     @staticmethod
     def _compute_unsqueezed_shape(in_shape, axes):
-        """按 axes 在 in_shape 插入大小为 1 的维（归一化负轴、排序）。"""
+        """按 axes 在 in_shape 插入大小为 1 的维（归一化负轴、排序）。
+
+        负轴按 ONNX 语义相对于 OUTPUT rank（len(in_shape)+len(axes)）归一化，
+        不是输入 rank。例如 Unsqueeze([1,1,20], axes=[-1]) -> output rank 4,
+        axis -1 -> 3 -> [1,1,20,1]（不是 [1,1,1,20]）。
+        """
         nd = len(in_shape)
-        norm = sorted({(a + nd if a < 0 else a) for a in axes})
+        out_rank = nd + len(axes)
+        norm = sorted({(a + out_rank if a < 0 else a) for a in axes})
         out = []
         ai = 0
-        for i in range(nd + len(norm)):
+        for i in range(out_rank):
             if i in set(norm):
                 out.append(1)
             else:
@@ -1139,10 +1158,17 @@ class FusionOptimizer:
 
     @staticmethod
     def match_aliasable_squeeze_unsqueeze(dag_model):
-        """匹配所有 axes 可解析为常量的 Squeeze/Unsqueeze。
+        """匹配所有 axes 可解析为常量、且输入 shape 完全 concrete 的 Squeeze/Unsqueeze。
 
         不再要求单消费者——fold 会把压缩后 shape 传播给全部下游输入，多分叉也安全。
         唯一排除：输出直接是 graph output（别名会改 graph 输出名，破坏契约）。
+
+        关键：输入 shape 必须完全 concrete（无 -1 dynamic sentinel）。fold 通过把
+        view 后的 shape 写进下游消费者的 recorded shape 字段来生效，但 runtime 的
+        has_dyn 守卫一旦看到 recorded shape 里有 -1 就会跳过 reshape_view，于是下游
+        读到的是输入的 live（view 前）shape —— rank 错位 → 广播错（rotary Expand
+        [1,8,1,128]→[1,8,2,1,128] 被算成 [1,8,8,1,128]）。动态输入必须保留节点，
+        让 runtime 的 Squeeze/Unsqueeze op 真正执行 view。
         """
         matches = []
         graph_outputs = {o["name"] for o in dag_model.outputs}
@@ -1154,6 +1180,10 @@ class FusionOptimizer:
                 continue
             # 输出不能是 graph output（别名会改外部可见名）
             if any(o["name"] in graph_outputs for o in node.outputs):
+                continue
+            # 输入 shape 必须完全 concrete：含 -1 dynamic sentinel 的不 fold
+            in_shape = node.inputs[0].get("shape", [])
+            if any(d == -1 for d in in_shape):
                 continue
             matches.append({"node": node})
         return matches

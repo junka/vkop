@@ -25,15 +25,6 @@ class Shape : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto shape = inputs[0]->getShape();
         std::vector<int64_t> dims(shape.begin(), shape.end());
-        if (getenv("VKOP_SHAPEDBG")) {
-            printf("[SHAPEDBG] getShape=[");
-            for (int d : shape)
-                printf("%d,", d);
-            printf("] -> int64 dims=[");
-            for (int64_t d : dims)
-                printf("%lld,", (long long)d);
-            printf("]\n");
-        }
 
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(std::vector<int>{static_cast<int>(shape.size())});

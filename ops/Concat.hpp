@@ -5,6 +5,7 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 extern "C" {
@@ -12,6 +13,8 @@ extern unsigned char image_concat_spv[];
 extern unsigned int image_concat_spv_len;
 extern unsigned char buffer_concat_spv[];
 extern unsigned int buffer_concat_spv_len;
+extern unsigned char buffer_concat_fp16_spv[];
+extern unsigned int buffer_concat_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -63,7 +66,7 @@ class ConcatImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             auto output_image = output->as_output_image(m_dev_, m_cmd_);
@@ -90,7 +93,6 @@ class ConcatImage : public Operator {
         offset = 0;
         int ds_idx = 0;
         for (const auto &in : inputs) {
-            printf("concat %d: offset %d\n", axis_ + 4 - rank, offset);
             dispatch_by_dtype(in->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto input = core::as_tensor<T>(in);
@@ -165,11 +167,12 @@ class ConcatImage : public Operator {
 // output, dispatch UP_DIV(in_total, 256).
 class ConcatBuffer : public BufferFactory {
   public:
-    explicit ConcatBuffer(int /*fp16*/)
-        : BufferFactory(OpType::CONCAT, buffer_concat_spv,
-                        buffer_concat_spv_len,
-                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(ConcatPC)) {
+    explicit ConcatBuffer(int fp16)
+        : BufferFactory(
+              OpType::CONCAT, fp16 ? buffer_concat_fp16_spv : buffer_concat_spv,
+              fp16 ? buffer_concat_fp16_spv_len : buffer_concat_spv_len,
+              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+              sizeof(ConcatPC), fp16) {
         update_after_bind_ = true;
     }
 
@@ -205,12 +208,21 @@ class ConcatBuffer : public BufferFactory {
             for (int i = rank - 2; i >= 0; --i) {
                 out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
             }
+            // Per-input strides (row-major). Used to decode each input's linear
+            // index into per-axis coordinates, then re-encode against the
+            // OUTPUT strides (with the axis offset added) — correct for ANY
+            // concat axis, including the last-axis case where inputs interleave
+            // ([...,1]+[...,1]+[...,1] -> [...,3]). The old in_stride-only math
+            // assumed axis was the last dim and overlapped inputs otherwise.
             int offset = 0;
             for (const auto &in : inputs) {
                 auto in_shape = in->getShape();
                 int in_total = total_elems(in_shape);
-                int in_stride = out_stride[axis_];
-                int block = (in_total == 0) ? 0 : in_total / in_shape[axis_];
+                int in_axis = in_shape[axis_];
+                std::vector<int> in_str(rank, 1);
+                for (int i = rank - 2; i >= 0; --i) {
+                    in_str[i] = in_str[i + 1] * in_shape[i + 1];
+                }
                 auto src = core::as_tensor<int64_t>(in);
                 if (!src->has_cpu_data()) {
                     src->copyToCPU(m_cmdpool_);
@@ -221,38 +233,26 @@ class ConcatBuffer : public BufferFactory {
                 // reshaped to [1]). Reading (*src)[i] would deref an empty
                 // vector; skip the copy for this input (its slots stay 0).
                 int src_avail = src->num_elements();
-                for (int b = 0; b < block; ++b) {
-                    // contiguous in_shape[axis_] elements per block
-                    int in_base = b * in_shape[axis_];
-                    int out_base = (offset + b * in_shape[axis_]) * in_stride;
-                    for (int e = 0; e < in_shape[axis_]; ++e) {
-                        if (in_base + e < src_avail) {
-                            out[out_base + e * in_stride] = (*src)[in_base + e];
-                        }
+                for (int li = 0; li < in_total; ++li) {
+                    if (li >= src_avail) {
+                        break;
                     }
+                    // Decode li -> per-axis coords, re-encode against output
+                    // strides with the concat offset added on axis_.
+                    int rem = li;
+                    int lo = offset * out_stride[axis_];
+                    for (int d = 0; d < rank; ++d) {
+                        int c = rem / in_str[d];
+                        rem = rem % in_str[d];
+                        lo += c * out_stride[d];
+                    }
+                    out[lo] = (*src)[li];
                 }
-                offset += in_shape[axis_];
+                offset += in_axis;
             }
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(out_shape);
             output->fillToCPU(out);
-            if (getenv("VKOP_CONCATDBG")) {
-                printf("[CONCATDBG] int64 concat out_shape=[");
-                for (int d : out_shape)
-                    printf("%d,", d);
-                printf("] vals=[");
-                for (int i = 0; i < (int)out.size() && i < 8; ++i)
-                    printf("%lld,", (long long)out[i]);
-                printf("] in_shapes:");
-                for (auto &in : inputs) {
-                    auto s = in->getShape();
-                    printf("[");
-                    for (int d : s)
-                        printf("%d,", d);
-                    printf("]");
-                }
-                printf("\n");
-            }
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPU(m_cmdpool_, out.data());
             return;
@@ -261,7 +261,7 @@ class ConcatBuffer : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
@@ -278,17 +278,6 @@ class ConcatBuffer : public BufferFactory {
         int offset = 0;
         for (int i = 0; i < n_inputs; ++i) {
             int in_total = total_elems(inputs[i]->getShape());
-            if (getenv("VKOP_CONCATFPDBG")) {
-                auto s = inputs[i]->getShape();
-                printf("[CONCATFPDBG] in[%d] shape=[", i);
-                for (int d : s)
-                    printf("%d,", d);
-                printf("] in_total=%d axis=%d axisdim=%d offset=%d out_shape=[",
-                       in_total, axis_, s[axis_], offset);
-                for (int d : out_shape)
-                    printf("%d,", d);
-                printf("] ne=%lld\n", (long long)total_elems(out_shape));
-            }
             dispatch_by_dtype(inputs[i]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 // replace objs_[1] with this input's buffer
@@ -312,7 +301,10 @@ class ConcatBuffer : public BufferFactory {
             fill_dims(pc.inDims, inputs[i]->getShape());
             fill_dims(pc.outDims, out_shape);
             pc.offset = offset;
-            submit_per_ds(pass_ds[i], &pc, UP_DIV(in_total, 256), 1, 1);
+            // fp16 packs two elements per uint word; dispatch one thread per
+            // input word (the fp16 shader writes each output word once).
+            int nthreads = (fp16_ != 0) ? (in_total + 1) / 2 : in_total;
+            submit_per_ds(pass_ds[i], &pc, UP_DIV(nthreads, 256), 1, 1);
             offset += static_cast<int>(inputs[i]->getShape()[axis_]);
         }
         for (int i = 0; i < n_inputs; ++i) {
@@ -326,11 +318,10 @@ class ConcatBuffer : public BufferFactory {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Concat : public PimplFacade {
   public:
-    Concat(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::CONCAT) {
-        impl_ =
-            backend_buffer
-                ? std::unique_ptr<Operator>(std::make_unique<ConcatBuffer>(0))
-                : std::make_unique<ConcatImage>();
+    Concat(int fp16, bool backend_buffer) : PimplFacade(OpType::CONCAT) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<ConcatBuffer>(fp16))
+                               : std::make_unique<ConcatImage>();
     }
 };
 

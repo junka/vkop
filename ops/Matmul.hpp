@@ -176,14 +176,20 @@ class MatMulBuffer : public BufferFactory {
         int rank_b = static_cast<int>(shape_b.size());
 
         // ONNX MatMul: A is [..., M, K], B is [..., K, N]. The leading
-        // ("batch") dims are broadcast (right-aligned). We collapse all
-        // leading dims into a single batch count (their product, with the
-        // broadcast rule that a dim of 1 in either operand matches the other's
-        // value) so the reduce shader's flat [batch, M, K] / [batch, K, N]
-        // layout applies. The runtime guarantees both operands share the same
+        // ("batch") dims are broadcast (right-aligned). The reduce shader works
+        // on a flat [batch, M, K] / [batch, K, N] layout where `batch` is the
+        // product of the leading broadcast dims, so we still compute that
+        // scalar product for the dispatch/total. BUT the output *shape* must
+        // preserve the un-collapsed leading dims: collapsing to {batch, m, n}
+        // loses the rank and breaks downstream shape-meta ops that carry a
+        // multi-D view (e.g. a Transpose with a 4-D perm reading a 3-D MatMul
+        // output does an OOB shape read -> 0 -> corrupts the whole
+        // rotary/attention chain). The output SSBO is still a flat batch*m*n
+        // buffer — only the reported logical shape (rank) carries the leading
+        // dims. The runtime guarantees both operands share the same
         // leading-broadcast shape by the time MatMul runs (graph shape
-        // inference / the preceding Expand materializes it), so collapsing the
-        // products is exact.
+        // inference / the preceding Expand materializes it), so the per-dim max
+        // is exact and product(batch) is exact.
         if (rank_a < 2 || rank_b < 2) {
             // Degenerate; nothing to do (should not happen for a valid model).
             return;
@@ -196,17 +202,26 @@ class MatMulBuffer : public BufferFactory {
         int lead_a = rank_a - 2;
         int lead_b = rank_b - 2;
         int lead = std::max(lead_a, lead_b);
+        // Leading broadcast dims in natural (left-to-right) order, taking the
+        // per-axis max (ONNX broadcast: a dim of 1 matches the other's value).
+        // Built left-to-right by indexing from the front of each operand's
+        // leading dims.
+        std::vector<int> lead_shape;
+        lead_shape.reserve(lead);
         for (int i = 0; i < lead; ++i) {
-            int da = (i < lead_a) ? shape_a[lead_a - 1 - i] : 1;
-            int db = (i < lead_b) ? shape_b[lead_b - 1 - i] : 1;
-            batch *= std::max(da, db);
+            int da = (i < lead_a) ? shape_a[i] : 1;
+            int db = (i < lead_b) ? shape_b[i] : 1;
+            int dmax = std::max(da, db);
+            batch *= dmax;
+            lead_shape.push_back(dmax);
         }
 
-        std::vector<int> out_shape;
-        if (batch > 1)
-            out_shape = {batch, m, n};
-        else
-            out_shape = {m, n};
+        std::vector<int> out_shape = lead_shape;
+        out_shape.push_back(m);
+        out_shape.push_back(n);
+        if (out_shape.empty()) {
+            out_shape = {m, n}; // degenerate guard
+        }
 
         int total = batch * m * n;
 
@@ -214,6 +229,19 @@ class MatMulBuffer : public BufferFactory {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->size() == 0) {
+                // Fresh/empty output (recorded shape had 0 sentinels): allocate
+                // at the concrete flat size.
+                output->resize(out_shape);
+            } else if (output->num_elements() == total) {
+                // Recycled buffer with the right element count but possibly the
+                // wrong rank (e.g. collapsed to {batch,m,n} on a prior round):
+                // metadata-only reshape — no GPU realloc. The reshape_view
+                // element-count guard is a backstop that silently skips on any
+                // mismatch.
+                output->reshape_view(out_shape);
+            } else {
+                // Element count changed (growing kv_len across decode rounds,
+                // etc.): reallocate.
                 output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
@@ -230,8 +258,16 @@ class MatMulBuffer : public BufferFactory {
         // fp16 needs a scratch fp32 buffer (binding 3) for the 2-pass
         // reduce->pack. fp32 binds dummy for the 4th slot.
         if (fp16_ != 0) {
+            // total may be 0 for a dynamic-shape output that resolved empty
+            // (a 0 dim). vkCreateBuffer rejects size 0 with
+            // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
+            // 16-byte dummy — the dispatch is 0 threads anyway.
+            size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
+            if (scratch_bytes == 0) {
+                scratch_bytes = 16;
+            }
             scratch_ = std::make_shared<VulkanBuffer>(
-                m_dev_, static_cast<size_t>(total) * sizeof(float),
+                m_dev_, scratch_bytes,
                 STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
             objs_.emplace_back(scratch_);

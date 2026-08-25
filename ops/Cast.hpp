@@ -48,10 +48,33 @@ class Cast : public BufferFactory {
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
 
+        // int64 -> fp32 cast (the rotary position-id Cast). int64 tensors are
+        // CPU-resident during recording (shape-meta domain), so cast on the
+        // host: read the int64 input, write fp32 values, resize + re-upload.
+        // The buffer_cast shader only handles fp32<->fp16, not int64.
+        if (inputs[0]->dtype() == typeid(int64_t) &&
+            outputs[0]->dtype() == typeid(float)) {
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            if (!src->has_cpu_data()) {
+                src->copyToCPU(m_cmdpool_);
+            }
+            int src_avail = src->num_elements();
+            std::vector<float> out(total);
+            for (int i = 0; i < total && i < src_avail; ++i) {
+                out[i] = static_cast<float>((*src)[i]);
+            }
+            auto output = core::as_tensor<float>(outputs[0]);
+            output->resize(shape);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->size() == 0) {
+            if (output->num_elements() != total_elems(shape)) {
                 output->resize(shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);

@@ -3,6 +3,7 @@
 #define OPS_COL2IM_HPP_
 
 #include "Operator.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 extern "C" {
 extern unsigned char image_col2im_spv[];
@@ -85,7 +86,7 @@ class Col2ImImage : public Operator {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);
-            if (outputptr->size() == 0) {
+            if (outputptr->num_elements() != total_elems(input_shape)) {
                 outputptr->resize(input_shape);
             }
             auto output_image = outputptr->as_output_image(m_dev_, m_cmd_);

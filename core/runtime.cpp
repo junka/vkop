@@ -59,40 +59,51 @@ void Runtime::LoadModel() {
     // backend fp16 inputs stay as input images (matching the original
     // behaviour that add_conv_model and the vision tests rely on).
     for (const auto &i : model.inputs) {
+        // Sanitize recorded dims: a -1 dynamic sentinel in dims_ would make
+        // size_ negative (size_ *= d) in the ctor, breaking the initial
+        // as_storage_buffer allocation. Replace -1 with a placeholder 1 — the
+        // real shape is supplied later by ResizeInput (the LLM driver calls
+        // rt->ResizeInput(name, arr.shape) before Run). 0 (genuinely empty)
+        // is kept.
+        std::vector<int32_t> in_dims;
+        in_dims.reserve(i.dims.size());
+        for (auto d : i.dims) {
+            in_dims.push_back(d < 0 ? 1 : d);
+        }
         std::shared_ptr<ITensor> t;
         if (backend_buffer_) {
             if (i.dtype == "int64") {
-                auto typed = std::make_shared<Tensor<int64_t>>(i.dims);
+                auto typed = std::make_shared<Tensor<int64_t>>(in_dims);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
             } else if (i.dtype == "int32") {
-                auto typed = std::make_shared<Tensor<int>>(i.dims);
+                auto typed = std::make_shared<Tensor<int>>(in_dims);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
             } else if (i.dtype == "bool" || i.dtype == "int8") {
                 // bool/int8 share the int8 storage representation; the LLM's
                 // image_pad_mask is bool but buffer ops consume it as bytes.
-                auto typed = std::make_shared<Tensor<int8_t>>(i.dims);
+                auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
             } else if (i.dtype == "float32") {
-                auto typed = std::make_shared<Tensor<float>>(i.dims);
+                auto typed = std::make_shared<Tensor<float>>(in_dims);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
             } else {
                 // float16 / unknown -> fp16 (the historical default).
-                auto typed = std::make_shared<Tensor<uint16_t>>(i.dims);
+                auto typed = std::make_shared<Tensor<uint16_t>>(in_dims);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
             }
         } else {
             // legacy image backend: fp16 inputs as images (original path).
-            auto t16 = std::make_shared<Tensor<uint16_t>>(i.dims);
+            auto t16 = std::make_shared<Tensor<uint16_t>>(in_dims);
             t16->set_ref_cnt_forever();
             t16->as_input_image(dev, nullptr);
             t = t16;
@@ -371,6 +382,19 @@ void Runtime::LoadModel() {
                     assert(tensor_map[out_shape.name]->is_on_GPU());
                     node_outputs.push_back(tensor_map[out_shape.name]);
                 } else {
+                    // Sanitize recorded dims for the initial Tensor allocation:
+                    // a -1 dynamic sentinel in dims_ would make size_ negative
+                    // (size_ *= d), breaking num_elements()/dispatch. Replace
+                    // -1 with a placeholder 1 — the producing op resize()s to
+                    // the concrete shape at execute time. 0 (genuinely empty)
+                    // is kept (yields size_=0 -> 16-byte dummy buffer). The
+                    // recorded shape (with -1) is still used below for the
+                    // outshape_tensor_map cache key and for node_input_shapes_.
+                    std::vector<int32_t> alloc_dims;
+                    alloc_dims.reserve(out_shape.dims.size());
+                    for (auto d : out_shape.dims) {
+                        alloc_dims.push_back(d < 0 ? 1 : d);
+                    }
                     // Infer the output tensor dtype. ShapeRef carries only
                     // name+dims, so we derive it from op semantics and the
                     // dtypes already present in tensor_map.
@@ -436,19 +460,19 @@ void Runtime::LoadModel() {
                             // is_on_GPU() doesn't lie about a non-existent
                             // buffer (which would make copyToCPU deref null).
                             auto t = std::make_shared<Tensor<int64_t>>(
-                                out_shape.dims, false);
+                                alloc_dims, false);
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
                         } else if (dtype_marker == "_f16_") {
                             auto t = std::make_shared<Tensor<uint16_t>>(
-                                out_shape.dims, true);
+                                alloc_dims, true);
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
                         } else {
-                            auto t = std::make_shared<Tensor<float>>(
-                                out_shape.dims, true);
+                            auto t = std::make_shared<Tensor<float>>(alloc_dims,
+                                                                     true);
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
@@ -511,6 +535,9 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::ERF:
                 case vkop::ops::OpType::FLOOR:
                 case vkop::ops::OpType::RELU:
+                case vkop::ops::OpType::MATMUL:
+                case vkop::ops::OpType::TRANSPOSE:
+                case vkop::ops::OpType::CONCAT:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;
@@ -625,6 +652,16 @@ std::shared_ptr<ITensor> Runtime::GetTensor(const std::string &name) const {
     return nullptr;
 }
 
+std::vector<std::pair<std::string, std::shared_ptr<ITensor>>>
+Runtime::ListTensors() const {
+    std::vector<std::pair<std::string, std::shared_ptr<ITensor>>> out;
+    out.reserve(tensor_map_.size());
+    for (const auto &kv : tensor_map_) {
+        out.push_back({kv.first, kv.second});
+    }
+    return out;
+}
+
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
@@ -686,16 +723,37 @@ double Runtime::Run() {
                         continue;
                     }
                     if (shapes[k].empty()) {
-                        // Scalar Constant: an initializer whose ONNX shape was
-                        // () but materialized as dims_=[1] by dag.py. Reshape
-                        // to rank-0 so Gather's index-rank→output-rank matches
-                        // ORT. Only initializers: a [] node output means
-                        // "unknown", and reshaping it would crash int64 Concat.
+                        // Scalar Constant: an ONNX scalar whose materialized
+                        // dims_=[1] should be rank-0 for Gather's
+                        // index-rank→output-rank to match ORT. Only for
+                        // initializers (a [] node output means "unknown").
                         if (init_ptrs.count(ins[k].get())) {
                             ins[k]->reshape_view(shapes[k]);
                         }
                     } else {
-                        ins[k]->reshape_view(shapes[k]);
+                        // Skip the recorded-view reset when the recorded shape
+                        // carries a -1 "dynamic" sentinel (symbolic dim_param
+                        // the converter couldn't resolve). The live tensor
+                        // already holds the concrete runtime shape — set by
+                        // ResizeInput for graph inputs or recomputed by the
+                        // producing op for intermediates. Applying the -1 here
+                        // would clobber a concrete batch/seq (e.g. past_key
+                        // values resized to [1,2,8,0,128]), and a -1 in dims_
+                        // would also make size_ negative, breaking
+                        // num_elements(). 0 now means genuinely empty
+                        // (kv_len=0) and IS applied. Static (-1-free) recorded
+                        // views still apply, so shared-tensor rank
+                        // reinterpretation ([4]↔[2,2]) works.
+                        bool has_dyn = false;
+                        for (int d : shapes[k]) {
+                            if (d == -1) {
+                                has_dyn = true;
+                                break;
+                            }
+                        }
+                        if (!has_dyn) {
+                            ins[k]->reshape_view(shapes[k]);
+                        }
                     }
                 }
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
@@ -963,16 +1021,37 @@ double Runtime::Run() {
                         continue;
                     }
                     if (shapes[k].empty()) {
-                        // Scalar Constant: an initializer whose ONNX shape was
-                        // () but materialized as dims_=[1] by dag.py. Reshape
-                        // to rank-0 so Gather's index-rank→output-rank matches
-                        // ORT. Only initializers: a [] node output means
-                        // "unknown", and reshaping it would crash int64 Concat.
+                        // Scalar Constant: an ONNX scalar whose materialized
+                        // dims_=[1] should be rank-0 for Gather's
+                        // index-rank→output-rank to match ORT. Only for
+                        // initializers (a [] node output means "unknown").
                         if (init_ptrs.count(ins[k].get())) {
                             ins[k]->reshape_view(shapes[k]);
                         }
                     } else {
-                        ins[k]->reshape_view(shapes[k]);
+                        // Skip the recorded-view reset when the recorded shape
+                        // carries a -1 "dynamic" sentinel (symbolic dim_param
+                        // the converter couldn't resolve). The live tensor
+                        // already holds the concrete runtime shape — set by
+                        // ResizeInput for graph inputs or recomputed by the
+                        // producing op for intermediates. Applying the -1 here
+                        // would clobber a concrete batch/seq (e.g. past_key
+                        // values resized to [1,2,8,0,128]), and a -1 in dims_
+                        // would also make size_ negative, breaking
+                        // num_elements(). 0 now means genuinely empty
+                        // (kv_len=0) and IS applied. Static (-1-free) recorded
+                        // views still apply, so shared-tensor rank
+                        // reinterpretation ([4]↔[2,2]) works.
+                        bool has_dyn = false;
+                        for (int d : shapes[k]) {
+                            if (d == -1) {
+                                has_dyn = true;
+                                break;
+                            }
+                        }
+                        if (!has_dyn) {
+                            ins[k]->reshape_view(shapes[k]);
+                        }
                     }
                 }
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
@@ -1341,7 +1420,21 @@ double Runtime::Run() {
                         ins[k]->reshape_view(shapes[k]);
                     }
                 } else {
-                    ins[k]->reshape_view(shapes[k]);
+                    // Skip recorded-view reset when the recorded shape carries
+                    // a -1 "dynamic" sentinel — the live tensor's concrete
+                    // runtime shape is authoritative (see the eager-record path
+                    // above for the full rationale). 0 = genuinely empty
+                    // (applied).
+                    bool has_dyn = false;
+                    for (int d : shapes[k]) {
+                        if (d == -1) {
+                            has_dyn = true;
+                            break;
+                        }
+                    }
+                    if (!has_dyn) {
+                        ins[k]->reshape_view(shapes[k]);
+                    }
                 }
             }
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
