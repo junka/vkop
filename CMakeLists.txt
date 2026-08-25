@@ -300,6 +300,7 @@ set(DUAL_FP16_SHADERS
     buffer/cos
     buffer/sin
     buffer/neg
+    buffer/conv2d
 )
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")

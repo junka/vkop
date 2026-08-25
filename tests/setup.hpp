@@ -285,6 +285,14 @@ public:
                 t->copyToGPU(cmdpool_);
                 continue;
             }
+            if (input->dtype() == typeid(int8_t)) {
+                // int8 weight-only quantized tensors (Conv2d weights) are
+                // uploaded as compact SSBOs; the shader unpacks 4 bytes/uint.
+                auto t = core::as_tensor<int8_t>(input);
+                t->as_storage_buffer(dev_);
+                t->copyToGPU(cmdpool_);
+                continue;
+            }
             if (use_buffer || op->get_type() == vkop::ops::OpType::GATHER || op->get_type() == vkop::ops::OpType::EXPAND) {
                 // Buffer backend: SSBOs support any rank, no RGBA conversion.
                 auto t = core::as_tensor<T>(input);

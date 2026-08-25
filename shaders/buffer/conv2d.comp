@@ -1,0 +1,143 @@
+#version 450 core
+
+// Conv2d SSBO (buffer backend). Naive direct convolution: one thread per
+// output element Y[n,oc,oh,ow]. Compact row-major NCHW (no RGBA packing).
+//
+// fp32: single pass. Each thread reads X/W via uintBitsToFloat, accumulates
+// in fp32, writes Y via floatBitsToUint.
+//
+// fp16: two-pass (mirrors buffer/matmul.comp). The reduce pass (THIS shader,
+// built with -DFP16) reads X/W via unpackHalf2x16, accumulates in fp32 for
+// precision, and writes the fp32 result to uScratch (one uint per output
+// element — no half2 word race). A SEPARATE pack pass (buffer/matmul_pack.comp,
+// reused) reads two adjacent fp32 scratch values and packs them as half2 into
+// uOutput. bias is added in the reduce pass (into the fp32 sum) so the pack
+// pass stays a pure repack.
+//
+// Bindings match MatMul (out=0, A=1, B=2, scratch=3) plus bias=4. The pack
+// pass reuses buffer_matmul_pack_spv which uses bindings 0 (out) and 3
+// (scratch); the extra bias binding is inert there.
+
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+#include "../common/buffer_common.comp"
+
+// Conv accumulates in fp32 (sum) and fuses activation in the fp32 domain too,
+// so force activation.comp's FLOAT macros to fp32 regardless of the fp16 build
+// (mirrors buffer/gemm.comp). BUF_LOAD returns float in both builds, so it is
+// unaffected by redefining FLOAT here.
+#undef FLOAT
+#undef FLOAT2
+#undef FLOAT4
+#define FLOAT  float
+#define FLOAT2 vec2
+#define FLOAT4 vec4
+#include "../common/activation.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InX {
+    uint data[];
+} uInputX;
+layout(set = 0, binding = 2) readonly buffer InW {
+    uint data[];
+} uInputW;
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+layout(set = 0, binding = 4) readonly buffer Bias {
+    uint data[];
+} uBias;
+// Per-output-channel dequant scale for int8 weight-only quantization
+// (binding 5). Inert when weight_int8 == 0. Optimizer stores
+// scale = amax/127 per output channel, so dequant is w = int8_val * scale
+// (NO extra *127 — that is the image path's convention, not the optimizer's).
+layout(set = 0, binding = 5) readonly buffer Scale {
+    uint data[];
+} uScale;
+
+layout(push_constant) uniform PC {
+    int N, IC, IH, IW;
+    int OC, OH, OW;
+    int KH, KW;
+    int stride_h, stride_w;
+    int pad_h, pad_w;
+    int dil_h, dil_w;
+    int groups;
+    int has_bias;
+    int fp32; // 1 = fp32 single-pass (write uOutput); 0 = fp16 reduce (write uScratch)
+    int activation; // ACTIVATION_* from activation.comp (0 = NONE)
+    int weight_int8; // 1 = weights are packed int8 bytes (dequant via uScale); 0 = fp32/fp16
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = uPC.N * uPC.OC * uPC.OH * uPC.OW;
+    if (gid >= total) return;
+
+    // Decode gid -> (n, oc, oh, ow) under row-major [N, OC, OH, OW].
+    int ow = gid % uPC.OW;
+    int oh = (gid / uPC.OW) % uPC.OH;
+    int oc = (gid / (uPC.OW * uPC.OH)) % uPC.OC;
+    int n = gid / (uPC.OW * uPC.OH * uPC.OC);
+
+    int ocg = uPC.OC / uPC.groups; // output channels per group
+    int icg = uPC.IC / uPC.groups; // input channels per group
+    int g = oc / ocg;
+    int ic_base = g * icg;
+    // Weight is [OC, icg, KH, KW] row-major.
+    int w_base = oc * (icg * uPC.KH * uPC.KW);
+    // Input is [N, IC, IH, IW] row-major.
+    int x_base_n = n * uPC.IC * uPC.IH * uPC.IW;
+
+    // int8 weights: one dequant scale per output channel (read once).
+    float w_scale = (uPC.weight_int8 != 0) ? BUF_LOAD(uScale.data, oc) : 0.0;
+
+    float sum = 0.0;
+    for (int kic = 0; kic < icg; ++kic) {
+        for (int ky = 0; ky < uPC.KH; ++ky) {
+            int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
+            if (iy < 0 || iy >= uPC.IH) continue;
+            for (int kx = 0; kx < uPC.KW; ++kx) {
+                int ix = ow * uPC.stride_w + kx * uPC.dil_w - uPC.pad_w;
+                if (ix < 0 || ix >= uPC.IW) continue;
+                int xidx = x_base_n + (ic_base + kic) * uPC.IH * uPC.IW +
+                           iy * uPC.IW + ix;
+                int widx = w_base + (kic * uPC.KH + ky) * uPC.KW + kx;
+                float x = BUF_LOAD(uInputX.data, xidx);
+                float w;
+                if (uPC.weight_int8 != 0) {
+                    // int8 packed 4-per-uint, row-major byte stream.
+                    int b = int((uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFF);
+                    // Sign-extend 8-bit to int (reinterpret as signed).
+                    if (b >= 128) b -= 256;
+                    w = float(b) * w_scale;
+                } else {
+                    w = BUF_LOAD(uInputW.data, widx);
+                }
+                sum += x * w;
+            }
+        }
+    }
+
+    if (uPC.has_bias != 0) {
+        sum += BUF_LOAD(uBias.data, oc);
+    }
+
+    // Fused activation (applied in the fp32 reduce domain, before pack).
+    sum = activation(sum, uPC.activation);
+
+    if (uPC.fp32 != 0) {
+        uOutput.data[gid] = floatBitsToUint(sum);
+    } else {
+        // fp16 reduce pass: fp32 result to scratch (one uint per element).
+        uScratch.data[gid] = floatBitsToUint(sum);
+    }
+}

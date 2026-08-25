@@ -299,3 +299,155 @@ TEST(Conv2dTest, Conv2dComprehensiveTest) {
         }));
     }
 }
+
+// int8 weight-only quantized Conv2d (buffer backend). The optimizer quantizes
+// Conv weights per-output-channel: scale = amax/127, int8_w = round(w/scale),
+// dequant in shader as w = int8_val * scale (NO extra *127). This test mirrors
+// that pipeline end-to-end and checks the result against the fp32 unquantized
+// torch reference (quantization error ~1/127 ~0.8%, within the 2% threshold).
+class Conv2dInt8Test : public TestCase<float> {
+  public:
+    std::unordered_map<std::string, std::string> attributes;
+    std::shared_ptr<Tensor<float>> input;
+    std::shared_ptr<Tensor<float>> bias_data_;
+    std::shared_ptr<Tensor<float>> scale_data_;
+    std::shared_ptr<Tensor<int8_t>> weight_data_;
+    std::shared_ptr<Tensor<float>> output;
+
+    Conv2dInt8Test(const std::vector<int> &input_shape, int kernel_size,
+                   int stride, int pad, int group, int dilation,
+                   int feature_size)
+        : TestCase<float>("Conv2d"), input_shape_(input_shape),
+          kernel_size_(kernel_size), stride_(stride), pad_(pad),
+          group_(group), dilation_(dilation), feature_size_(feature_size) {
+        attributes = {
+            {"strides", std::to_string(stride_)},
+            {"pads", std::to_string(pad_)},
+            {"dilations", std::to_string(dilation_)},
+            {"group", std::to_string(group_)},
+            {"kernel_shape", std::to_string(kernel_size_)}
+        };
+        initTestData();
+    }
+
+    // int8 weight-only quantization adds ~amax/127 noise per MAC; small output
+    // values can have large relative error, so use a looser tolerance than the
+    // fp32 default (5% relative or 0.05 absolute, whichever is larger).
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &output,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<float>(output);
+        auto exp = vkop::core::as_tensor<float>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = (*out)[i], ev = (*exp)[i];
+            if (std::isnan(ov)) {
+                LOG_ERROR("int8 NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            float abs_exp = std::abs(ev);
+            float threshold = std::max(0.05F, abs_exp * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("int8 Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    std::vector<int> input_shape_;
+    int kernel_size_, stride_, pad_, group_, dilation_, feature_size_;
+
+    void initTestData() {
+        torch::manual_seed(42);
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1],
+                                         input_shape_[2], input_shape_[3]},
+                                       getTorchConf());
+        auto torch_weight = torch::randn({feature_size_, input_shape_[1] / group_,
+                                          kernel_size_, kernel_size_},
+                                        getTorchConf());
+        auto torch_bias = torch::randn({feature_size_}, getTorchConf());
+
+        input = std::make_shared<Tensor<float>>(input_shape_);
+        fillTensorFromTorch(input, torch_input);
+        bias_data_ = std::make_shared<Tensor<float>>(std::vector<int>{feature_size_});
+        fillTensorFromTorch(bias_data_, torch_bias);
+
+        // Per-output-channel int8 quantization (mirrors optimizer.py).
+        // weight: [oc, ic/g, kh, kw], axis=(1,2,3) -> scale [oc].
+        auto weight_abs = torch_weight.abs().reshape({feature_size_, -1});
+        auto amax = std::get<0>(weight_abs.max(1));  // [oc]
+        auto scale = amax / 127.0;
+        scale = torch::where(scale == 0, torch::ones_like(scale), scale);
+        auto scale_b = scale.reshape({-1, 1});       // broadcast over (ic/g*kh*kw)
+        auto int8_weight =
+            torch::round(torch_weight.reshape({feature_size_, -1}) / scale_b)
+                .to(torch::kInt8);
+
+        // Reference output uses the DEQUANTIZED int8 weights (int8_val * scale),
+        // not the original fp32 weights — so the comparison isolates the
+        // shader's dequant+conv math from quantization noise.
+        auto dequant_weight =
+            int8_weight.to(torch::kFloat32) * scale_b.to(torch::kFloat32);
+        dequant_weight = dequant_weight.reshape(torch_weight.sizes());
+        auto torch_output = torch::conv2d(torch_input, dequant_weight, torch_bias,
+            torch::IntArrayRef({stride_, stride_}),
+            torch::IntArrayRef({pad_, pad_}),
+            torch::IntArrayRef({dilation_, dilation_}), group_);
+
+        std::vector<int> output_shape;
+        for (int i = 0; i < torch_output.dim(); i++) {
+            output_shape.push_back(torch_output.size(i));
+        }
+        output = std::make_shared<Tensor<float>>(output_shape);
+        fillTensorFromTorch(output, torch_output);
+
+        weight_data_ = std::make_shared<Tensor<int8_t>>(
+            std::vector<int>{feature_size_, input_shape_[1] / group_,
+                             kernel_size_, kernel_size_});
+        auto cpu_int8 = int8_weight.reshape(torch_weight.sizes())
+                            .cpu().contiguous().flatten();
+        auto *ptr = cpu_int8.data_ptr<int8_t>();
+        std::vector<int8_t> wvec(ptr, ptr + cpu_int8.numel());
+        weight_data_->fillToCPU(wvec);
+
+        scale_data_ = std::make_shared<Tensor<float>>(std::vector<int>{feature_size_});
+        auto cpu_scale = scale.cpu().contiguous().flatten();
+        auto sacc = cpu_scale.accessor<float, 1>();
+        std::vector<float> svec;
+        svec.reserve(cpu_scale.numel());
+        for (int64_t i = 0; i < cpu_scale.numel(); i++) svec.push_back(sacc[i]);
+        scale_data_->fillToCPU(svec);
+    }
+};
+
+TEST(Conv2dTest, Conv2dInt8WeightOnlyBuffer) {
+    // Buffer-backend int8 weight-only Conv2d. Requires VKOP_BUFFER_BACKEND=1.
+    const char *env = std::getenv("VKOP_BUFFER_BACKEND");
+    if (!env || env[0] != '1') {
+        GTEST_SKIP() << "int8 weight-only Conv2d is buffer-backend only; set "
+                        "VKOP_BUFFER_BACKEND=1";
+    }
+    std::vector<std::tuple<std::vector<int>, int, int, int, int, int, int>>
+        cases = {
+            {{1, 10, 7, 7}, 2, 1, 0, 5, 1, 5},
+            {{1, 6, 8, 8}, 3, 1, 1, 2, 1, 4},
+            {{2, 4, 10, 10}, 3, 2, 1, 1, 1, 8},
+            {{1, 16, 5, 5}, 1, 1, 0, 1, 1, 32},
+        };
+    for (const auto &tc : cases) {
+        auto [input_shape, kernel_size, stride, pad, group, dilation,
+              feature_size] = tc;
+        Conv2dInt8Test t(input_shape, kernel_size, stride, pad, group, dilation,
+                         feature_size);
+        EXPECT_TRUE(t.run_test(
+            {t.input, t.weight_data_, t.bias_data_, t.scale_data_}, {t.output},
+            [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+                ASSERT_NE(conv_op, nullptr);
+                conv_op->setAttribute(t.attributes);
+            }));
+    }
+}
