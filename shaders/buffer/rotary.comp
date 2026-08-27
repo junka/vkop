@@ -1,0 +1,119 @@
+#version 450 core
+
+// RotaryEmbedding (RoPE) SSBO (buffer backend). Half-split (non-interleaved)
+// rotation, full head_dim rotation (rotary_embedding_dim == head_dim).
+//
+// Replaces the per-layer decomposed HF apply_rotary_pos_emb subgraph:
+//   rotate_half(x) = Concat(Neg(x[second_half]), x[first_half])
+//   q_rot = x * cos + rotate_half(x) * sin
+// which expands (with cos/sin half-repeated across the full head_dim, i.e.
+// cos[d] == cos[d + half]) to:
+//   d <  half: q_rot[d] = x[d]*cos[d] - x[d+half]*sin[d]   (real)
+//   d >= half: q_rot[d] = x[d]*cos[d] + x[d-half]*sin[d]   (imag)
+// mathematically equivalent to the ONNX RotaryEmbedding real/imag formula.
+//
+// cos/sin are pre-broadcast to [B, 1, S, head_dim] by /rotary_emb/* + the
+// shared /Unsqueeze_6 (cos) / /Unsqueeze_7 (sin) (axis=1 unsqueeze). They
+// broadcast across the heads dim, so their linear index has NO head axis:
+//   cs_idx = (b * S + s) * head_dim + d
+// (verified against llm.onnx: Concat_5 repeats the half tensor twice ->
+//  cos[d] == cos[d-half] for d >= half, so indexing by bare d is correct.)
+//
+// THREAD MODEL: differs by build to avoid the fp16 read-modify-write race
+// ([[expand-fp16-race]]):
+//   - fp16: one thread per OUTPUT WORD (2 packed half elements). Each thread
+//     computes BOTH elements of its word and writes the whole word once via
+//     packHalf2x16 -- no read-modify-write, no race. Dispatch = ceil(total/2).
+//   - fp32: one thread per element. BUF_STORE is a plain single write (no
+//     read-modify-write), so there is no race; dispatch = total.
+// (total is always even: head_dim is even and is the fastest axis.)
+//
+// cos/sin are pre-broadcast to [B, 1, S, head_dim] by /rotary_emb/* + the
+// shared /Unsqueeze_6 (cos) / /Unsqueeze_7 (sin) (axis=1 unsqueeze). They
+// broadcast across the heads dim, so their linear index has NO head axis:
+//   cs_idx = (b * S + s) * head_dim + d
+// (verified against llm.onnx: Concat_5 repeats the half tensor twice ->
+//  cos[d] == cos[d-half] for d >= half, so indexing by bare d is correct.)
+
+#ifdef FP16
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#endif
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InX {
+    uint data[];
+} uInputX;
+layout(set = 0, binding = 2) readonly buffer InCos {
+    uint data[];
+} uInputCos;
+layout(set = 0, binding = 3) readonly buffer InSin {
+    uint data[];
+} uInputSin;
+
+layout(push_constant) uniform PC {
+    int total;      // Y element count = B * num_heads * seq * head_dim (even)
+    int head_dim;   // full head dim (rotary_embedding_dim), e.g. 128
+    int num_heads;  // heads dim of X (unused for cos/sin indexing; cos broadcasts)
+    int seq;        // sequence len of X (for cos/sin (b*seq+s) index)
+    int _pad;
+} uPC;
+
+// Rotate one element at linear index `gid` (d decoded from gid).
+float rotate_one(int gid, int d, int half_dim, int head_dim, int seq,
+                 int num_heads) {
+    int b = gid / (head_dim * seq * num_heads);
+    int cs_idx = (b * seq + (gid / head_dim) % seq) * head_dim + d;
+    float x = BUF_LOAD(uInputX.data, gid);
+    float cos_v = BUF_LOAD(uInputCos.data, cs_idx);
+    float sin_v = BUF_LOAD(uInputSin.data, cs_idx);
+    if (d < half_dim) {
+        // real: x[d]*cos[d] - x[d+half]*sin[d]
+        float x2 = BUF_LOAD(uInputX.data, gid + half_dim);
+        return cos_v * x - sin_v * x2;
+    } else {
+        // imag: x[d]*cos[d] + x[d-half]*sin[d]
+        float x1 = BUF_LOAD(uInputX.data, gid - half_dim);
+        return sin_v * x1 + cos_v * x;
+    }
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = uPC.total;
+    int head_dim = uPC.head_dim;
+    int seq = uPC.seq;
+    int num_heads = uPC.num_heads;
+    int half_dim = head_dim / 2;
+
+#ifdef FP16
+    // fp16: one thread per OUTPUT WORD (2 packed elements). gid is a word index.
+    int words = (total + 1) / 2;
+    if (gid >= words) return;
+    int e0 = gid * 2;
+    int d0 = e0 % head_dim;
+    float r0 = rotate_one(e0, d0, half_dim, head_dim, seq, num_heads);
+    int e1 = e0 + 1;
+    if (e1 < total) {
+        int d1 = e1 % head_dim;
+        float r1 = rotate_one(e1, d1, half_dim, head_dim, seq, num_heads);
+        uOutput.data[gid] = packHalf2x16(vec2(r0, r1));
+    } else {
+        // Odd tail (head_dim even => total even; guard only).
+        BUF_STORE(uOutput.data, e0, r0);
+    }
+#else
+    // fp32: one thread per element. gid is an element index.
+    if (gid >= total) return;
+    int d = gid % head_dim;
+    float r = rotate_one(gid, d, half_dim, head_dim, seq, num_heads);
+    BUF_STORE(uOutput.data, gid, r);
+#endif
+}

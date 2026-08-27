@@ -748,6 +748,15 @@ class FusionOptimizer:
 
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "fuse_rotary_embedding",
+                FusionOptimizer.match_rotary_embedding,
+                FusionOptimizer.fold_rotary_embedding,
+                priority=80,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "fuse_into_attention",
                 FusionOptimizer.match_attention,
                 FusionOptimizer.fold_attention,
@@ -2489,6 +2498,179 @@ class FusionOptimizer:
         dag_model.nodes[attention_node.name] = attention_node
 
         print(f"Fused Attention pattern with Q:{q_node.name}, K:{k_node.name}, V:{v_node.name}")
+        return True
+
+    @staticmethod
+    def match_rotary_embedding(dag_model):
+        """Match the decomposed HF apply_rotary_pos_emb per-layer subgraph:
+
+            X (Q/K, 4D [B,heads,seq,head_dim])
+           / \\
+         Slice  Slice_1          (first_half / second_half, axis=-1)
+           |       |
+           |      Neg
+           |       |
+           ---Concat---             (rotate_half = Concat(Neg(Slice_1), Slice))
+               |
+         Mul(cos)  Mul_1(sin)       (cos/sin from /rotary_emb/*, pre-broadcast)
+               \\    /
+                Add                 (q_rot = X*cos + rotate_half(X)*sin)
+                 |
+                 Y
+
+        Bottom-up from each Add whose two inputs are both Mul outputs. cos/sin
+        may pass through a Cast (fp16<->fp32); we follow a single Cast hop to
+        find the rotary cos/sin tensor (the shared /Unsqueeze_6 / /Unsqueeze_7
+        broadcast output), which becomes the fused node's cos/sin input.
+        """
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+
+        def _other_input(node, exclude_name):
+            for inp in node.inputs:
+                if inp["name"] != exclude_name:
+                    return inp
+            return None
+
+        def _follow_cast(tdict):
+            """If tdict is produced by a Cast, return the Cast's input dict;
+            otherwise return tdict unchanged. (cos/sin sometimes Cast hop.)"""
+            pn = producer.get(tdict["name"])
+            if pn is not None and pn.op_type == "Cast" and len(pn.inputs) >= 1:
+                return pn.inputs[0]
+            return tdict
+
+        matches = []
+        for add_node in list(dag_model.nodes.values()):
+            if add_node.op_type != "Add" or len(add_node.inputs) != 2:
+                continue
+            mul_a = producer.get(add_node.inputs[0]["name"])
+            mul_b = producer.get(add_node.inputs[1]["name"])
+            if (mul_a is None or mul_b is None or
+                    mul_a.op_type != "Mul" or mul_b.op_type != "Mul"):
+                continue
+            # One Mul is X*cos, the other is rotate_half(X)*sin. The rotate_half
+            # Mul's non-cos input is a Concat; the X*cos Mul's non-cos input is
+            # X directly.
+            def _classify(mul):
+                # Returns (x_input, cos_sin_input, is_rotate_half) or None.
+                ia = mul.inputs[0]
+                ib = mul.inputs[1]
+                pa = producer.get(ia["name"])
+                # rotate_half branch: one input produced by Concat.
+                if pa is not None and pa.op_type == "Concat":
+                    return ib, ia, True   # other is sin, this is rotate_half
+                pb = producer.get(ib["name"])
+                if pb is not None and pb.op_type == "Concat":
+                    return ia, ib, True
+                # X*cos branch: neither input is a Concat (X + cos).
+                return None, None, False
+            ca = _classify(mul_a)
+            cb = _classify(mul_b)
+            if ca[2] and not cb[2]:
+                rot_mul, x_mul = mul_a, mul_b
+                rot_other = ca[1]      # the sin input (Concat) for rot_mul
+            elif cb[2] and not ca[2]:
+                rot_mul, x_mul = mul_b, mul_a
+                rot_other = cb[1]
+            else:
+                continue  # need exactly one rotate_half Mul
+
+            # rotate_half Concat: Concat(Neg(Slice_1), Slice)
+            concat_node = producer.get(rot_other["name"])
+            if (concat_node is None or concat_node.op_type != "Concat" or
+                    len(concat_node.inputs) != 2):
+                continue
+            in0 = concat_node.inputs[0]
+            in1 = concat_node.inputs[1]
+            neg_node = producer.get(in0["name"])
+            slice_first = in1
+            if neg_node is None or neg_node.op_type != "Neg":
+                # try the other ordering
+                neg_node = producer.get(in1["name"])
+                slice_first = in0
+                if neg_node is None or neg_node.op_type != "Neg":
+                    continue
+            # Neg's input is Slice_1 (second half).
+            slice_1_node = producer.get(neg_node.inputs[0]["name"])
+            if slice_1_node is None or slice_1_node.op_type != "Slice":
+                continue
+            # slice_first must be a Slice on the same X.
+            slice_node = producer.get(slice_first["name"])
+            if slice_node is None or slice_node.op_type != "Slice":
+                continue
+            # Both slices share the same data input X.
+            if slice_node.inputs[0]["name"] != slice_1_node.inputs[0]["name"]:
+                continue
+            x_name = slice_node.inputs[0]["name"]
+            # x_mul's X input must equal x_name; the other input is cos.
+            x_in_xmul = None
+            cos_in = None
+            for inp in x_mul.inputs:
+                if inp["name"] == x_name:
+                    x_in_xmul = inp
+                else:
+                    cos_in = inp
+            if x_in_xmul is None or cos_in is None:
+                continue
+            # rot_mul's sin input is the non-Concat input.
+            sin_in = _other_input(rot_mul, rot_other["name"])
+            if sin_in is None:
+                continue
+            # Follow a Cast hop on cos/sin to reach the rotary broadcast tensor.
+            cos_in = _follow_cast(cos_in)
+            sin_in = _follow_cast(sin_in)
+
+            matches.append({
+                "x_name": x_name,
+                "x_input": slice_node.inputs[0],  # X tensor dict
+                "cos_input": cos_in,
+                "sin_input": sin_in,
+                "add_node": add_node,
+                "mul_cos": x_mul,
+                "mul_sin": rot_mul,
+                "concat_node": concat_node,
+                "neg_node": neg_node,
+                "slice_node": slice_node,
+                "slice_1_node": slice_1_node,
+            })
+        print(f"Found {len(matches)} rotary-embedding patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_rotary_embedding(dag_model, match) -> bool:
+        """Fold the 7-node rotate_half subgraph into one RotaryEmbedding node.
+
+        New node: RotaryEmbedding(X, cos, sin) -> Add's output. cos/sin are the
+        pre-broadcast [B,1,S,head_dim] tensors (shared across layers, NOT
+        deleted). Only the per-layer apply nodes (Slice, Slice_1, Neg, Concat,
+        Mul(cos), Mul_1(sin), Add) are removed.
+        """
+        add_node = match["add_node"]
+        x_input = match["x_input"]
+        cos_input = match["cos_input"]
+        sin_input = match["sin_input"]
+
+        fused = Node(
+            op_type="RotaryEmbedding",
+            name=f"RotaryEmbedding_fused_{add_node.name}",
+            attributes={},
+            inputs=[x_input, cos_input, sin_input],
+            outputs=add_node.outputs[:],  # reuse the Add's output tensor
+        )
+
+        nodes_to_delete = [
+            match["slice_node"], match["slice_1_node"], match["neg_node"],
+            match["concat_node"], match["mul_cos"], match["mul_sin"],
+            match["add_node"],
+        ]
+        for n in nodes_to_delete:
+            if n and n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+
+        dag_model.nodes[fused.name] = fused
         return True
 
     @staticmethod

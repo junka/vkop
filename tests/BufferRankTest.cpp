@@ -729,4 +729,113 @@ TEST(BufferRankTest, ShapeRank4) {
     EXPECT_EQ(v[3], 5);
 }
 
+// =========================================================================
+// RotaryEmbedding
+// =========================================================================
+
+// HF-style rotate_half reference (half-split, non-interleaved). cos/sin are
+// [B, 1, S, head_dim] (half-repeated: cat(half, half)), broadcast over heads.
+//   rotate_half(x) = concat(-x[half:], x[:half], dim=-1)
+//   q_rot = x * cos + rotate_half(x) * sin
+torch::Tensor brt_ref_rotary(const torch::Tensor &x, const torch::Tensor &cos,
+                             const torch::Tensor &sin) {
+    int d = (int)x.size(-1);
+    int half = d / 2;
+    auto x1 = x.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                       torch::indexing::Slice(),
+                       torch::indexing::Slice(0, half)});
+    auto x2 = x.index({torch::indexing::Slice(), torch::indexing::Slice(),
+                       torch::indexing::Slice(),
+                       torch::indexing::Slice(half, d)});
+    auto rot = torch::cat({-x2, x1}, -1);
+    return x * cos + rot * sin;
+}
+
+template <typename T>
+bool brt_rotary_case(const std::vector<int> &xshape, bool fp16) {
+    Dev d;
+    int head_dim = xshape.back();
+    int seq = xshape[xshape.size() - 2];
+    int heads = xshape[xshape.size() - 3];
+    int batch = xshape[0];
+    // cos/sin: [B, 1, S, head_dim], half-repeated (cat(half, half)).
+    int half = head_dim / 2;
+    auto torch_x = torch::randn(
+        std::vector<int64_t>(xshape.begin(), xshape.end()), brt_torch_opt<T>());
+    auto cos_half = torch::randn({batch, 1, seq, half}, brt_torch_opt<T>());
+    auto sin_half = torch::randn({batch, 1, seq, half}, brt_torch_opt<T>());
+    auto torch_cos = torch::cat({cos_half, cos_half}, -1);
+    auto torch_sin = torch::cat({sin_half, sin_half}, -1);
+    auto torch_out = brt_ref_rotary(torch_x, torch_cos, torch_sin);
+
+    auto input = std::make_shared<Tensor<T>>(xshape);
+    brt_fill(input, torch_x);
+    brt_upload(input, d);
+    auto cos_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_cos));
+    brt_fill(cos_t, torch_cos);
+    brt_upload(cos_t, d);
+    auto sin_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_sin));
+    brt_fill(sin_t, torch_sin);
+    brt_upload(sin_t, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::ROTARY_EMBEDDING, fp16, {}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, cos_t, sin_t}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+
+    return brt_close_to_torch(output, torch_out, 0.02f, 0.02f);
+}
+
+TEST(BufferRankTest, RotaryEmbeddingPrefillAndDecode) {
+    // Prefill shape: B=1, heads=16, S=5, head_dim=128 (q-heads).
+    EXPECT_TRUE(brt_rotary_case<float>({1, 16, 5, 128}, false));
+    EXPECT_TRUE(brt_rotary_case<uint16_t>({1, 16, 5, 128}, true));
+    // Decode shape: B=1, heads=16, S=1, head_dim=128.
+    EXPECT_TRUE(brt_rotary_case<float>({1, 16, 1, 128}, false));
+    EXPECT_TRUE(brt_rotary_case<uint16_t>({1, 16, 1, 128}, true));
+    // K-heads (8) — cos/sin still broadcast over heads.
+    EXPECT_TRUE(brt_rotary_case<float>({1, 8, 3, 128}, false));
+    EXPECT_TRUE(brt_rotary_case<uint16_t>({1, 8, 3, 128}, true));
+}
+
+// Sanity: cos=1, sin=0 -> q_rot = x*1 + rotate_half(x)*0 = x. Isolates
+// indexing/binding from the rotate-half arithmetic.
+template <typename T>
+bool brt_rotary_identity_case(const std::vector<int> &xshape, bool fp16) {
+    Dev d;
+    auto torch_x = torch::randn(
+        std::vector<int64_t>(xshape.begin(), xshape.end()), brt_torch_opt<T>());
+    // Build cos/sin as [B,1,S,head_dim] of 1.0 / 0.0.
+    int B = xshape[0], S = xshape[2], hd = xshape[3];
+    auto cos_t = torch::ones({B, 1, S, hd}, brt_torch_opt<T>());
+    auto sin_t = torch::zeros({B, 1, S, hd}, brt_torch_opt<T>());
+    auto torch_out = torch_x; // cos=1, sin=0 => identity
+
+    auto input = std::make_shared<Tensor<T>>(xshape);
+    brt_fill(input, torch_x);
+    brt_upload(input, d);
+    auto cos_tt = std::make_shared<Tensor<T>>(brt_to_int_shape(cos_t));
+    brt_fill(cos_tt, cos_t);
+    brt_upload(cos_tt, d);
+    auto sin_tt = std::make_shared<Tensor<T>>(brt_to_int_shape(sin_t));
+    brt_fill(sin_tt, sin_t);
+    brt_upload(sin_tt, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::ROTARY_EMBEDDING, fp16, {}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, cos_tt, sin_tt}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out, 0.001f, 0.001f);
+}
+
+TEST(BufferRankTest, RotaryEmbeddingIdentity) {
+    EXPECT_TRUE(brt_rotary_identity_case<float>({1, 4, 2, 8}, false));
+}
+
 } // namespace

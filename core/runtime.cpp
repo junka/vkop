@@ -539,6 +539,7 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::TRANSPOSE:
                 case vkop::ops::OpType::CONCAT:
                 case vkop::ops::OpType::CONV2D:
+                case vkop::ops::OpType::ROTARY_EMBEDDING:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;

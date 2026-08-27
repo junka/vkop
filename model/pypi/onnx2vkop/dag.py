@@ -178,10 +178,16 @@ class DAGBasedModel:
             self._prune_materialize_done = True
 
     def _prune_dead_and_materialize_constants_impl(self):
-        pruneable = {
-            "Constant", "Identity", "Shape", "Unsqueeze", "Squeeze",
-            "Cast", "ScatterND",
-        }
+        # All vkop ops are pure (inputs -> outputs, no side effects / control
+        # flow), so ANY node whose output can't reach a graph output or a live
+        # initializer is dead and can be pruned — not just shape-meta ops.
+        # (Previously only {Constant,Identity,Shape,Unsqueeze,Squeeze,Cast,
+        # ScatterND} were pruned, which left dead Gather/Div/Mul/etc. orphaned
+        # when their pruneable shape-meta producers got deleted — e.g. the
+        # rotary half-boundary chain /Shape_2 -> /Gather_2 -> /Div -> /Cast ->
+        # /Unsqueeze_8 becomes dead after fuse_rotary_embedding removes the
+        # Slice consumers, but /Gather_2 and /Div were non-pruneable and stayed
+        # as orphans referencing now-missing tensors -> runtime lookup crash.)
         nodes = list(self.nodes.values())
         tensor_producer = {}
         for n in nodes:
@@ -214,8 +220,7 @@ class DAGBasedModel:
                 if n.op_type == "Constant":
                     live_constants.append(n)
                 continue
-            if n.op_type in pruneable:
-                dead_nodes.append(n)
+            dead_nodes.append(n)
 
         # 2) 物化活着的 Constant：值搬进 initializers，删节点。
         #    ONNX Constant 节点可能用任意一种属性携带值：

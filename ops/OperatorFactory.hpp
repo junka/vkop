@@ -53,6 +53,7 @@
 #include "ops/Cast.hpp"
 #include "ops/Equal.hpp"
 #include "ops/NonZero.hpp"
+#include "ops/RotaryEmbedding.hpp"
 #include "ops/ScatterElements.hpp"
 #include "ops/ScatterND.hpp"
 #include "ops/Shape.hpp"
@@ -171,6 +172,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<SqueezeUnsqueeze>(/*unsqueeze=*/false);
     case OpType::UNSQUEEZE:
         return std::make_unique<SqueezeUnsqueeze>(/*unsqueeze=*/true);
+    case OpType::ROTARY_EMBEDDING:
+        return std::make_unique<RotaryEmbedding>(fp16, backend_buffer);
     default:
         return nullptr;
     }

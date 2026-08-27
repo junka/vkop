@@ -60,6 +60,7 @@ enum class OpType {
     SCATTER_ND,
     SQUEEZE,
     UNSQUEEZE,
+    ROTARY_EMBEDDING,
     TOTAL_NUM
 };
 
@@ -116,6 +117,7 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "ScatterND",         // SCATTER_ND = 48
         "Squeeze",           // SQUEEZE = 49
         "Unsqueeze",         // UNSQUEEZE = 50
+        "RotaryEmbedding",   // ROTARY_EMBEDDING = 51
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -224,6 +226,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::SQUEEZE;
     if (name == "Unsqueeze")
         return vkop::ops::OpType::UNSQUEEZE;
+    if (name == "RotaryEmbedding")
+        return vkop::ops::OpType::ROTARY_EMBEDDING;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }
