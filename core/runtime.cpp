@@ -1487,9 +1487,17 @@ double Runtime::Run() {
             last_commands[ci]->wait();
         }
     }
+    // The final-level wait (timeline semaphore above) guarantees the GPU has
+    // reached the final level, but on the CPU side the intermediate-level
+    // command buffers may still read as "pending" to vkResetCommandBuffer.
+    // Resetting a pending buffer leaves the driver with an invalid handle
+    // (observed as a segfault inside vkBeginCommandBuffer on the NEXT Run() —
+    // e.g. LLM decode round1 reusing round0's command buffers). CPU-wait every
+    // command before reset so all buffers are back in the initial state.
     for (const auto &level_nodes : level_node_indices_) {
         for (auto node_idx : level_nodes) {
             auto cmd = node_ops_[node_idx]->get_record();
+            cmd->wait();
             cmd->clearWaits();
             cmd->reset();
         }

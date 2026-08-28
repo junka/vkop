@@ -84,6 +84,11 @@ void VulkanCommandBuffer::begin() {
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
+    // Defensive: a NULL handle means the buffer was never allocated (or was
+    // lost); re-allocate rather than crashing inside vkBeginCommandBuffer.
+    if (m_commandBuffer_ == VK_NULL_HANDLE) {
+        allocate();
+    }
     if (vkBeginCommandBuffer(m_commandBuffer_, &begin_info) != VK_SUCCESS) {
         throw std::runtime_error("Failed to begin recording command buffer!");
     }

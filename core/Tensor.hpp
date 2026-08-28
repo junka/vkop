@@ -670,7 +670,14 @@ template <typename T> class Tensor : public ITensor {
         // a null pointer; memcpy(nullptr,...,0) is UB and trips the optimized
         // memmove. Guard the no-op case.
         if (size_ > 0) {
-            memcpy(data_->data(), data.data(), size_);
+            // reserveOnCPU now grows data_ to match size_, but keep a defensive
+            // clamp so a future caller can never write past data_ (heap
+            // corruption that surfaces as an unrelated segfault).
+            size_t cap_bytes = data_->size() * sizeof(T);
+            size_t src_bytes = data.size() * sizeof(T);
+            size_t n = std::min<size_t>(size_, std::min(cap_bytes, src_bytes));
+            if (n > 0)
+                memcpy(data_->data(), data.data(), n);
         }
         toCPU();
     }
@@ -714,8 +721,19 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void reserveOnCPU() {
-        if (!data_ || data_->empty()) {
-            data_ = std::make_unique<std::vector<T>>(num_elements());
+        // (Re)allocate when data_ is missing OR when size_ has grown beyond
+        // the existing vector's capacity (e.g. resize() enlarged size_ after
+        // data_ was already populated). Without this, a subsequent fillToCPU
+        // memcpy of size_ bytes would write past the end of data_ — heap
+        // corruption that later surfaces as an unrelated segfault.
+        size_t need = num_elements();
+        if (!data_ || data_->size() < need) {
+            auto neu = std::make_unique<std::vector<T>>(need);
+            if (data_ && !data_->empty())
+                std::copy(data_->begin(),
+                          data_->begin() + std::min(data_->size(), need),
+                          neu->begin());
+            data_ = std::move(neu);
         }
         toCPU();
     }

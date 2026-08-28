@@ -27,6 +27,38 @@ struct GpuExpandParam {
     int _pad0;
     int _pad1;
 };
+
+// Read the ONNX Expand target-shape buffer (inputs[1]) as a vector<int>.
+// The shape input is conceptually int64, but callers (tests, older graphs)
+// may supply int32 — as_tensor<int64_t> on a Tensor<int> returns null and
+// dereferencing it segfaults. Accept any integer dtype by trying the common
+// ones; returns an empty vector if none match (caller's maxd() falls back to
+// inshape, a safe no-broadcast).
+inline std::vector<int>
+read_target_shape(const std::shared_ptr<core::ITensor> &t,
+                  const std::shared_ptr<VulkanCommandPool> &pool) {
+    auto read_as = [&](auto dummy) -> std::vector<int> {
+        using U = decltype(dummy);
+        auto shaped = core::as_tensor<U>(t);
+        if (!shaped)
+            return {};
+        if (!shaped->has_cpu_data())
+            shaped->copyToCPU(pool);
+        std::vector<int> out(shaped->num_elements());
+        for (int i = 0; i < shaped->num_elements(); ++i)
+            out[i] = static_cast<int>((*shaped)[i]);
+        return out;
+    };
+    // Try int64 first (ONNX-correct), then int32 (test/legacy). The first
+    // non-null cast wins; the others short-circuit.
+    auto v = read_as(int64_t{});
+    if (!v.empty())
+        return v;
+    v = read_as(int{});
+    if (!v.empty())
+        return v;
+    return read_as(int32_t{});
+}
 } // namespace expand
 
 // SSBO-only op: broadcasts input to the given output shape.
@@ -68,14 +100,8 @@ class Expand : public Operator {
         // shape (inputs[1]) is the authoritative source — do NOT trust a
         // recycled output's stale shape. inputs[1] is CPU-resident here.
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            auto shape_input = core::as_tensor<int64_t>(inputs[1]);
-            if (!shape_input->has_cpu_data()) {
-                shape_input->copyToCPU(m_cmdpool_);
-            }
-            std::vector<int> target_shape(shape_input->num_elements());
-            for (int i = 0; i < shape_input->num_elements(); ++i) {
-                target_shape[i] = static_cast<int>((*shape_input)[i]);
-            }
+            std::vector<int> target_shape =
+                expand::read_target_shape(inputs[1], m_cmdpool_);
             // ONNX Expand output shape = right-aligned broadcast of input vs
             // target: dim is the input dim when it is neither 1 nor -1 (a
             // concrete value, including 0=empty), else the target dim. This
@@ -124,14 +150,7 @@ class Expand : public Operator {
         // graph shape inference) can be stale/wrong, so recompute it here from
         // the authoritative target buffer + the input shape.
         std::vector<int> target_shape;
-        {
-            auto sh = core::as_tensor<int64_t>(inputs[1]);
-            if (!sh->has_cpu_data())
-                sh->copyToCPU(m_cmdpool_);
-            target_shape.resize(sh->num_elements());
-            for (int i = 0; i < sh->num_elements(); ++i)
-                target_shape[i] = static_cast<int>((*sh)[i]);
-        }
+        { target_shape = expand::read_target_shape(inputs[1], m_cmdpool_); }
         size_t maxd = std::max(inshape.size(), target_shape.size());
         out_shape.assign(maxd, 1);
         for (size_t i = 0; i < maxd; ++i) {

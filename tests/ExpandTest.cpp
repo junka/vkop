@@ -39,9 +39,15 @@ private:
 
         input = std::make_shared<Tensor<T>>(shape_);
         this->fillTensorFromTorch(input, torch_input);
-        toshape = std::make_shared<Tensor<int>>(outshape_);
+        // ONNX Expand's shape input is a 1-D tensor of int64 holding the target
+        // shape VALUES (e.g. [3,9,3]) — NOT a tensor whose own shape is [3,9,3].
+        // Building it as Tensor<int>(outshape_) gave it 27 elements (shape
+        // {3,9,3}) and only the first 3 were filled; Expand then read 27 target
+        // dims (mostly 0) and overran its dims_[16] array. Build a rank-1 tensor
+        // of length = outshape rank, holding the outshape values.
+        toshape = std::make_shared<Tensor<int>>(std::vector<int>{static_cast<int>(outshape_.size())});
         toshape->fillToCPU(outshape_);
-        
+
         output = std::make_shared<Tensor<T>>(outshape_);
         this->fillTensorFromTorch(output, torch_output);
     }

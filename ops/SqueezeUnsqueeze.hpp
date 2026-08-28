@@ -116,10 +116,16 @@ class SqueezeUnsqueeze : public Operator {
             auto output = core::as_tensor<T>(outputs[0]);
             output->resize(out_shape);
             // Element count must match (view op); copy the host data straight
-            // across. fillToCPU sets data_ to the provided values.
+            // across. fillToCPU sets data_ to the provided values. Guard the
+            // count: a mismatched out_shape (dynamic-dim divergence between
+            // the live input and the converter-recorded shape) would make
+            // output->num_elements() exceed input's actual data size, and the
+            // src.begin()+N read / fillToCPU write would overrun (heap
+            // corruption that later surfaces as a segfault in unrelated
+            // command-buffer code). Clamp to the input's real element count.
             const std::vector<T> &src = input->data();
-            std::vector<T> dst(src.begin(),
-                               src.begin() + output->num_elements());
+            size_t n = std::min<size_t>(output->num_elements(), src.size());
+            std::vector<T> dst(src.begin(), src.begin() + n);
             output->fillToCPU(dst);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPU(m_cmdpool_, dst.data());
