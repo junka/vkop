@@ -141,16 +141,18 @@ class ScatterElements : public BufferFactory {
                      int /*n_idx*/) {
         auto data = core::as_tensor<T>(inputs[0]);
         auto updates = core::as_tensor<T>(inputs[2]);
-        if (!data->has_cpu_data()) {
-            data->copyToCPU(m_cmdpool_);
-        }
-        if (!updates->has_cpu_data()) {
-            updates->copyToCPU(m_cmdpool_);
-        }
+        // Unconditional GPU readback: a GPU-resident input may have a stale
+        // CPU data_ from a prior round (the KV-cache/ScatterElements data
+        // tensor is recycled across decode rounds — its GPU buffer is
+        // rewritten each round but data_ still holds the previous round's
+        // values, tail zero-filled by reserveOnCPU). has_cpu_data() only
+        // checks data_ is non-empty, so the old guard skipped the readback
+        // and hostScatter seeded the output with stale data. copyToCPU reads
+        // back whenever a vkobj_ exists, so it is the authoritative check.
+        data->copyToCPU(m_cmdpool_);
+        updates->copyToCPU(m_cmdpool_);
         auto indices = core::as_tensor<int64_t>(inputs[1]);
-        if (!indices->has_cpu_data()) {
-            indices->copyToCPU(m_cmdpool_);
-        }
+        indices->copyToCPU(m_cmdpool_);
         // True index count from the host data (recycled shapes can lie).
         int n_idx = static_cast<int>(indices->num_elements());
 

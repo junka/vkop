@@ -111,8 +111,17 @@ class SqueezeUnsqueeze : public Operator {
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            if (!input->has_cpu_data())
-                input->copyToCPU(m_cmdpool_);
+            // Always read back from the GPU when a buffer exists. The input
+            // may be GPU-resident with a stale/short CPU data_ (e.g. a KV-cache
+            // Concat whose GPU buffer grew with kv_len but whose CPU staging
+            // still holds the previous round's smaller count, the tail
+            // zero-filled by reserveOnCPU). has_cpu_data() only checks data_
+            // is non-empty, and is_on_GPU() tracks the converted_ flag which
+            // is NOT set by every producer that binds an SSBO — neither
+            // reflects whether data_ matches the live GPU buffer. copyToCPU
+            // itself is the authoritative check (it reads back whenever
+            // vkobj_ exists), so call it unconditionally.
+            input->copyToCPU(m_cmdpool_);
             auto output = core::as_tensor<T>(outputs[0]);
             output->resize(out_shape);
             // Element count must match (view op); copy the host data straight

@@ -42,27 +42,35 @@ def main():
         for o in n.output:
             if o:
                 want.add(o)
-    # Build value_info for each (ONNX needs shape/type to mark as output; ORT
-    # can also infer). Use onnx.shape_inference to get types.
-    try:
-        m_inf = onnx.shape_inference.infer_shapes(m)
-        vi = {v.name: v for v in m_inf.graph.value_info}
-    except Exception as e:
-        print(f"shape inference failed: {e}")
-        vi = {}
-    # Append all wanted names as graph outputs.
+    # Append all wanted names as graph outputs. ORT can expose an intermediate
+    # value as an output even without upfront type/shape info — it infers from
+    # the producer node — so append an empty ValueInfoProto (just the name) for
+    # every node output not already a graph output. shape_inference on this
+    # large dynamic-shape model returns 0 value_info, so relying on it (the old
+    # `if name in vi` guard) skipped every intermediate.
     existing = {o.name for o in m.graph.output}
+    added = 0
     for name in sorted(want):
         if name in existing:
             continue
-        if name in vi:
-            m.graph.output.append(vi[name])
-        # If no value_info, skip — ORT needs type info to expose it.
-    onnx.save(m, "/tmp/llm_all_outs.onnx")
+        vi_proto = m.graph.output.add()
+        vi_proto.name = name
+        added += 1
+    print(f"Added {added} intermediate outputs ({len(m.graph.output)} total)")
+    # Save with external data into a temp dir so the 3.4GB weights do NOT get
+    # inlined into a single .onnx (which corrupts the file / blows memory) and
+    # so the real llm.weights.bin is never touched. location is a relative
+    # filename inside tmpdir.
+    import tempfile
+    _tmpdir = tempfile.mkdtemp()
+    _aug_path = os.path.join(_tmpdir, "aug.onnx")
+    onnx.save_model(m, _aug_path, save_as_external_data=True,
+                    size_threshold=0, convert_attribute=False,
+                    location="aug.weights.bin")
     print(f"Saved augmented model with {len(m.graph.output)} outputs")
 
     so = ort.SessionOptions()
-    sess = ort.InferenceSession("/tmp/llm_all_outs.onnx", sess_options=so,
+    sess = ort.InferenceSession(_aug_path, sess_options=so,
                                 providers=["CPUExecutionProvider"])
     out_names = [o.name for o in sess.get_outputs()]
     in_name_set = {i.name for i in sess.get_inputs()}
