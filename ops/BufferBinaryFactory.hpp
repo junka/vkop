@@ -85,14 +85,13 @@ class BufferBinaryFactory : public BufferFactory {
 
         auto a = core::as_tensor<int64_t>(inputs[0]);
         auto b = core::as_tensor<int64_t>(inputs[1]);
-        // int64 inputs may be GPU-resident only (e.g. NonZero's shader-computed
-        // output leaves data_ empty). Pull them to the host before (*a)[i].
-        if (!a->has_cpu_data()) {
-            a->copyToCPU(m_cmdpool_);
-        }
-        if (!b->has_cpu_data()) {
-            b->copyToCPU(m_cmdpool_);
-        }
+        // Unconditional readback: int64 inputs may be GPU-resident only
+        // (e.g. NonZero's shader-computed output leaves data_ empty), OR a
+        // cross-round-recycled GPU input with stale CPU data_ (see
+        // SqueezeUnsqueeze/ScatterElements fix). copyToCPU is the authority
+        // check (reads when vkobj_ exists).
+        a->copyToCPU(m_cmdpool_);
+        b->copyToCPU(m_cmdpool_);
 
         std::vector<int64_t> out(total);
         for (int i = 0; i < total; ++i) {

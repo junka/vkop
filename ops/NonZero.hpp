@@ -66,9 +66,9 @@ class NonZero : public BufferFactory {
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            if (!input->has_cpu_data()) {
-                input->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            input->copyToCPU(m_cmdpool_);
             // Precompute per-axis strides (row-major) for coordinate decode.
             std::vector<int64_t> stride(rank, 1);
             for (int d = rank - 2; d >= 0; --d) {

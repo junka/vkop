@@ -110,12 +110,10 @@ class Gather : public Operator {
 
         auto data = core::as_tensor<int64_t>(inputs[0]);
         auto indices = core::as_tensor<int64_t>(inputs[1]);
-        if (!data->has_cpu_data()) {
-            data->copyToCPU(m_cmdpool_);
-        }
-        if (!indices->has_cpu_data()) {
-            indices->copyToCPU(m_cmdpool_);
-        }
+        // Unconditional readback: a cross-round-recycled GPU input may have
+        // stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+        data->copyToCPU(m_cmdpool_);
+        indices->copyToCPU(m_cmdpool_);
         std::vector<int64_t> out(total);
 
         // Row-major strides of the data and indices tensors.

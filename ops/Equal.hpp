@@ -37,12 +37,12 @@ class Equal : public BufferBinaryFactory {
         if (inputs[0]->dtype() == typeid(int64_t)) {
             auto a = core::as_tensor<int64_t>(inputs[0]);
             auto b = core::as_tensor<int64_t>(inputs[1]);
-            if (!a->has_cpu_data()) {
-                a->copyToCPU(m_cmdpool_);
-            }
-            if (!b->has_cpu_data()) {
-                b->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            // copyToCPU is a no-op-safe authority check (reads when vkobj_
+            // exists, else just reserveOnCPU).
+            a->copyToCPU(m_cmdpool_);
+            b->copyToCPU(m_cmdpool_);
             std::vector<int64_t> out(total);
             for (int i = 0; i < total; ++i) {
                 int64_t av = (*a)[broadcast_index(shape_a, out_shape, i)];

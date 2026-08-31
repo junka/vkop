@@ -42,8 +42,9 @@ read_target_shape(const std::shared_ptr<core::ITensor> &t,
         auto shaped = core::as_tensor<U>(t);
         if (!shaped)
             return {};
-        if (!shaped->has_cpu_data())
-            shaped->copyToCPU(pool);
+        // Unconditional readback: a cross-round-recycled GPU input may have
+        // stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+        shaped->copyToCPU(pool);
         std::vector<int> out(shaped->num_elements());
         for (int i = 0; i < shaped->num_elements(); ++i)
             out[i] = static_cast<int>((*shaped)[i]);
@@ -128,9 +129,9 @@ class Expand : public Operator {
             int total = total_elems(out_shape);
             std::vector<int64_t> out(static_cast<size_t>(total));
             auto src = core::as_tensor<int64_t>(inputs[0]);
-            if (!src->has_cpu_data()) {
-                src->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[i] = (*src)[broadcast_index(inshape, out_shape, i)];
             }

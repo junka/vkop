@@ -75,15 +75,11 @@ class Where : public Operator {
             auto cond = core::as_tensor<int64_t>(inputs[0]);
             auto x = core::as_tensor<int64_t>(inputs[1]);
             auto y = core::as_tensor<int64_t>(inputs[2]);
-            if (!cond->has_cpu_data()) {
-                cond->copyToCPU(m_cmdpool_);
-            }
-            if (!x->has_cpu_data()) {
-                x->copyToCPU(m_cmdpool_);
-            }
-            if (!y->has_cpu_data()) {
-                y->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            cond->copyToCPU(m_cmdpool_);
+            x->copyToCPU(m_cmdpool_);
+            y->copyToCPU(m_cmdpool_);
             int total = total_elems(out_shape);
             std::vector<int64_t> out(total);
             for (int i = 0; i < total; ++i) {

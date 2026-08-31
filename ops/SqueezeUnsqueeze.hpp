@@ -56,8 +56,10 @@ class SqueezeUnsqueeze : public Operator {
         std::vector<int> axes;
         if (inputs.size() > 1 && inputs[1]) {
             auto ax = core::as_tensor<int64_t>(inputs[1]);
-            if (!ax->has_cpu_data())
-                ax->copyToCPU(m_cmdpool_);
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see the data-input fix below / the
+            // ScatterElements fix — same stale-data_ class).
+            ax->copyToCPU(m_cmdpool_);
             axes.reserve(ax->num_elements());
             for (int i = 0; i < ax->num_elements(); ++i)
                 axes.push_back(static_cast<int>((*ax)[i]));

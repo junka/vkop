@@ -220,9 +220,9 @@ class SliceBuffer : public BufferFactory {
             int total = total_elems(out_shape);
             std::vector<uint16_t> out(static_cast<size_t>(total));
             auto src = core::as_tensor<uint16_t>(inputs[0]);
-            if (!src->has_cpu_data()) {
-                src->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            src->copyToCPU(m_cmdpool_);
 
             std::vector<int> in_stride(rank, 1);
             for (int d = rank - 2; d >= 0; --d) {

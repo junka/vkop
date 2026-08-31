@@ -224,9 +224,10 @@ class ConcatBuffer : public BufferFactory {
                     in_str[i] = in_str[i + 1] * in_shape[i + 1];
                 }
                 auto src = core::as_tensor<int64_t>(in);
-                if (!src->has_cpu_data()) {
-                    src->copyToCPU(m_cmdpool_);
-                }
+                // Unconditional readback: a cross-round-recycled GPU input
+                // may have stale CPU data_ (see SqueezeUnsqueeze/
+                // ScatterElements fix).
+                src->copyToCPU(m_cmdpool_);
                 // Guard against a shape-meta tensor whose recorded dims_ claim
                 // elements (in_total>0) but whose backing buffer is empty
                 // (num_elements()==0, e.g. a seq=0 slice whose logical view was

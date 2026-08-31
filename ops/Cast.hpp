@@ -55,9 +55,9 @@ class Cast : public BufferFactory {
         if (inputs[0]->dtype() == typeid(int64_t) &&
             outputs[0]->dtype() == typeid(float)) {
             auto src = core::as_tensor<int64_t>(inputs[0]);
-            if (!src->has_cpu_data()) {
-                src->copyToCPU(m_cmdpool_);
-            }
+            // Unconditional readback: a cross-round-recycled GPU input may
+            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            src->copyToCPU(m_cmdpool_);
             int src_avail = src->num_elements();
             std::vector<float> out(total);
             for (int i = 0; i < total && i < src_avail; ++i) {
