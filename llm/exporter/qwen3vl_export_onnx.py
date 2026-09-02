@@ -373,3 +373,7 @@ for t in m2.graph.initializer:
 print(f"[verify] external locations: {locs} (expect {{'llm.weights.bin'}})")
 assert locs == {"llm.weights.bin"}, f"unexpected external locations: {locs}"
 print("done.")
+
+# embed_tokens 权重表不由本脚本导出：它不在 llm.onnx 图里（图输入是
+# inputs_embeds），C++ generate loop (llm_chat) 用独立脚本 dump_embed_tokens.py
+# 单独抽取为 embed_tokens.bin，无需重跑本 ONNX 导出。

@@ -475,3 +475,22 @@ if (ENABLE_TESTS)
 enable_testing()
 add_subdirectory(tests)
 endif()
+
+# LLM conversational driver (Qwen3-VL, buffer backend). Text in → text out.
+# Links vkop + vload (graph runtime + model loader) and the standalone Qwen
+# tokenizer (BBPE encode/decode + chat template). The tokenizer ships its own
+# CMake project under llm/tokenizer/; pulled in as a subdirectory its project()
+# is locally scoped and enable_testing() is a no-op (the top level already
+# called it), so its tokenizer_test joins the top-level ctest cleanly.
+# vulkan is resolved at runtime via dlopen inside libvkop (VulkanLib.cpp), so
+# no -lvulkan link is needed here.
+option(ENABLE_LLM_CHAT "Build the LLM conversational driver (llm_chat)" ON)
+if (ENABLE_LLM_CHAT)
+    add_subdirectory(llm/tokenizer llm_tokenizer)
+    add_executable(llm_chat llm/exporter/llm_chat.cpp)
+    target_link_libraries(llm_chat PRIVATE vkop vload tokenizer)
+    target_include_directories(llm_chat PRIVATE
+        ${CMAKE_SOURCE_DIR}/llm/tokenizer)
+    find_package(Threads REQUIRED)
+    target_link_libraries(llm_chat PRIVATE Threads::Threads)
+endif()

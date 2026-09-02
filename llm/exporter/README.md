@@ -224,3 +224,135 @@ ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图�
 - **采样未实现**：ONNX 驱动仅 greedy；采样需自行加 temperature/top_p。
 - **MRoPE 由调用方预算**：wrapper 不算位置，调用方用 HF `get_rope_index`。纯文本场景
   三行相等，简单；多模态需正确传 image_grid_thw + mm_token_type_ids。
+
+---
+
+## vkop C++ 驱动 (llm_chat)
+
+`llm_chat.cpp` 是 vkop（Vulkan ONNX runtime）的端到端对话驱动：文本输入 →
+tokenize → prefill（q_len=L）→ 逐 token greedy decode（q_len=1）→ detokenize 输出。
+不依赖 PyTorch / ONNX Runtime，只用 `llm.vkopbin`（转换后的 vkop 图）+
+`embed_tokens.bin`（host 端 embedding 查表）+ tokenizer。**纯文本场景**（无图像），
+MRoPE 三轴位置都取 `0..L-1`，`image_pad_mask` 全 false，`deepstack_embeds` 全零。
+
+### 构建
+
+已合并进主 CMake（`ENABLE_LLM_CHAT`，默认 ON）：
+
+```bash
+make -C build llm_chat        # 仅构建 llm_chat
+make -C build                 # 全量构建（含 llm_chat）
+```
+
+链接 `vkop + vload + tokenizer`（都来自主 CMake 的 target）。改了 `libvkop.a` 或
+`llm_chat.cpp` 后重跑 `make -C build llm_chat` 即可，无需手动 g++ 脚本。
+vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
+
+### 运行
+
+```bash
+./build/llm_chat <model.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new]
+# 然后在 stdin 输入 prompt，回车提交，Ctrl-D 退出
+```
+
+具体路径（从仓库根）：
+
+```bash
+./build/llm_chat \
+  llm/exporter/llm.vkopbin \
+  llm/exporter/embed_tokens.bin \
+  llm/tokenizer/qwen3_vl.bin
+```
+
+| 参数 | 含义 |
+|---|---|
+| `model.vkopbin` | 转换后的 vkop 模型（~3.4GB） |
+| `embed_tokens.bin` | token→hidden 查表（fp16 `[151936,2048]`，~590MB） |
+| `tokenizer.bin` | BBPE 词表（`tokenizer_to_bin.py` 产物） |
+| `max_new`（可选） | 最大生成 token 数（含 prefill 后的全部 decode），默认 **64** |
+
+启动时加载模型 + embedding + tokenizer（~2s），之后每轮 prefill/decode 约 1.5–2s
+（Intel ARL，buffer backend，fp16）。遇到 `<|im_end|>`（151645）自动停止当前轮。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `VKOP_RAW_PROMPT=1` | 跳过 chat template，把输入当 raw token 序列（对齐参考 `dump_llm_decode.py`，不走对话格式） |
+| `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
+| `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
+| `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
+| `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
+
+### 示例
+
+```bash
+# 对话模式（走 chat template）
+printf 'What is the capital of France?' | \
+  ./build/llm_chat llm/exporter/llm.vkopbin \
+  llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 12
+# → The capital of France is Paris.<|im_end|>
+
+# raw 模式（对齐 ORT 参考）
+echo "Hello" | VKOP_RAW_PROMPT=1 ./build/llm_chat \
+  llm/exporter/llm.vkopbin llm/exporter/embed_tokens.bin \
+  llm/tokenizer/qwen3_vl.bin 6
+# → 358,1184,311,3270,264,2805  ("I need to write a short")
+```
+
+### decode 轮数限制
+
+`max_new` 默认 64，对应代码：
+
+```cpp
+int max_new = (argc > 4) ? std::atoi(argv[4]) : 64;   // llm_chat.cpp:259
+...
+for (int step = 1; step < max_new; ++step) {          // decode 循环
+    if (next_id == IM_END) break;
+    ...
+}
+```
+
+注意 `max_new` 是**总输出预算**：prefill 占 1 个（step 从 1 起），所以实际 decode
+token 数 = `max_new - 1`。默认 64 → prefill 后最多再生成 63 个 decode token，遇
+`<|im_end|>` 提前停。这是**纯软限制**，不是 vkop 的硬约束——KV cache 每轮通过
+`feedback_kv` 调 `ResizeInput` 按实际 `kv_len` 动态增长（`past_len += 1`），无固定上限
+的 buffer 预分配，所以理论上可以无限 decode 下去。
+
+**放开限制的方式**（按推荐度排序）：
+
+1. **命令行传更大的 `max_new`**（最简单，无需改码）：
+   ```bash
+   ./build/llm_chat ... 4096    # 放到 4k token
+   ./build/llm_chat ... 100000  # 实质无限制（靠 IM_END 自然停）
+   ```
+
+2. **改默认值**：把 `llm_chat.cpp:259` 的 `: 64` 改成更大的数（如 `: 2048`）。
+   适合不想每次传参的场景。
+
+3. **完全去掉上界，只靠 IM_END 停**：把 `for (int step = 1; step < max_new; ++step)`
+   改成 `for (int step = 1; ; ++step)`，循环内只保留 `if (next_id == IM_END) break;`。
+   风险：若模型不输出 IM_END（坏采样 / 陷入循环），会无限生成；建议加一个
+   `step < HARD_CAP` 的安全上界（如 32768，Qwen3-VL 的训练上下文长度），超过则强制截断。
+
+**放开后的实际约束**（非 vkop 限制，是模型/硬件层面）：
+
+- **模型上下文长度**：Qwen3-VL 训练长度通常 32768。超过后 attention 质量下降
+  （不崩，但生成可能变乱）。KV cache 此时占 `NLAYERS × 2 × NKV × kv_len × 128 × 2B`
+  = `28 × 2 × 8 × 32768 × 128 × 2` ≈ 3.75GB 显存（fp16），需确保 GPU 内存够。
+- **显存**：KV cache 随 `kv_len` 线性增长，加上 attention 的 `(q, kv_len)` 中间张量也
+  线性增长。超显存会 Vulkan 内存分配失败（vkop 报错，不崩进程）。
+- **延迟**：每轮 decode 的 attention 计算量随 `kv_len` 线性增长，后期 token 越来越慢。
+
+简言之：**放开就是改 `max_new`**，vkop 侧无硬墙；真正的上界是 GPU 显存 + 模型训练长度。
+
+### 局限（llm_chat）
+
+- **仅 greedy**：无 temperature/top-p 采样，与 `Qwen3VLInference` 的 `do_sample=True`
+  路径不等价。logits 已与 ORT 对齐（见 memory `llm-chat-generate-loop`），接入采样器
+  后分布一致，但驱动本身未实现采样。
+- **仅纯文本**：v1 不处理图像（`image_pad_mask` 全 false、`deepstack_embeds` 全零、
+  MRoPE 三轴同值）。多模态需先跑 `visual.vkopbin` 取 deepstack 特征 + `get_rope_index`
+  算 3D 位置。
+- **单轮对话**：每次 prompt 独立 prefill（不复用上一轮的 KV cache 作为新轮的 past）。
+  真正的多轮需把上一轮 `present_kv` 喂回下一轮 prefill 的 `past_kv`，驱动目前未做。

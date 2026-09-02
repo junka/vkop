@@ -157,7 +157,14 @@ class ScatterElements : public BufferFactory {
         int n_idx = static_cast<int>(indices->num_elements());
 
         auto output = core::as_tensor<T>(outputs[0]);
-        if (output->size() == 0) {
+        // Resize if the output doesn't match data's element count. The output
+        // may be a recycled tensor with a stale shape/size from a prior round
+        // (e.g. a different kv_len / n_img); the old `size()==0` guard only
+        // caught the first-ever run, leaving later rounds with an undersized
+        // output whose `(*output)[i]` read (below, for i<total) went OOB →
+        // segfault on q_len>1 prefill. Mirror the fp32 path's num_elements
+        // check (line ~101).
+        if (output->num_elements() != total_elems(data_shape)) {
             output->resize(data_shape);
         }
         // If output is a distinct tensor from data, seed it with the data.
