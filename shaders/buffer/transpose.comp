@@ -50,11 +50,11 @@ void main() {
     if (gid >= nwords) return;
     int e0 = 2 * gid;
     int e1 = 2 * gid + 1;
-    float v0 = BUF_LOAD(uInput.data, transpose_elem(e0));
+    float v0 = float(BUF_LOAD(uInput.data, transpose_elem(e0)));
     if (e1 >= out_total) {
         uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
     } else {
-        float v1 = BUF_LOAD(uInput.data, transpose_elem(e1));
+        float v1 = float(BUF_LOAD(uInput.data, transpose_elem(e1)));
         uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
     }
 #else

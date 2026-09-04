@@ -10,6 +10,8 @@ extern unsigned char image_erf_spv[];
 extern unsigned int image_erf_spv_len;
 extern unsigned char buffer_erf_spv[];
 extern unsigned int buffer_erf_spv_len;
+extern unsigned char buffer_erf_fp16_spv[];
+extern unsigned int buffer_erf_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -24,8 +26,9 @@ class ErfImage : public UnaryFactory {
 class ErfBuffer : public BufferUnaryFactory {
   public:
     explicit ErfBuffer(int fp16)
-        : BufferUnaryFactory(OpType::ERF, buffer_erf_spv, buffer_erf_spv_len,
-                             fp16) {}
+        : BufferUnaryFactory(
+              OpType::ERF, fp16 ? buffer_erf_fp16_spv : buffer_erf_spv,
+              fp16 ? buffer_erf_fp16_spv_len : buffer_erf_spv_len, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

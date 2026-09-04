@@ -567,6 +567,18 @@ TEST(BufferRankTest, TransposeRank2) {
     EXPECT_TRUE(brt_transpose_case<float>({4, 7}, {1, 0}, false));
 }
 
+// fp16 transpose: word-per-thread packed-half path. Reproduces the visual
+// encoder's qkv Transpose ([196,3,16,64] fp16, perm [1,0,2,3] -> [3,196,16,64]).
+TEST(BufferRankTest, TransposeFp16) {
+    EXPECT_TRUE(brt_transpose_case<uint16_t>({2, 3, 4, 5}, {0, 3, 2, 1}, true));
+    EXPECT_TRUE(brt_transpose_case<uint16_t>({2, 3, 4, 5}, {3, 2, 1, 0}, true));
+    EXPECT_TRUE(brt_transpose_case<uint16_t>({1, 8, 2, 128}, {0, 2, 1, 3}, true));
+    // The exact visual shape: total = 602112 elems = 301056 fp16 words.
+    EXPECT_TRUE(brt_transpose_case<uint16_t>({196, 3, 16, 64}, {1, 0, 2, 3}, true));
+    // Odd total (one tail word) exercises the e1 >= out_total branch.
+    EXPECT_TRUE(brt_transpose_case<uint16_t>({3, 5}, {1, 0}, true));
+}
+
 // =========================================================================
 // Reduce (fp16 buffer shader exists; reduce_op is lowercase)
 // =========================================================================

@@ -300,6 +300,7 @@ set(DUAL_FP16_SHADERS
     buffer/cos
     buffer/sin
     buffer/neg
+    buffer/erf
     buffer/conv2d
     buffer/rotary
 )
@@ -493,4 +494,9 @@ if (ENABLE_LLM_CHAT)
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)
     find_package(Threads REQUIRED)
     target_link_libraries(llm_chat PRIVATE Threads::Threads)
+
+    # Visual encoder probe: runs visual.vkopbin standalone to verify the visual
+    # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.
+    add_executable(visual_probe llm/exporter/visual_probe.cpp)
+    target_link_libraries(visual_probe PRIVATE vkop vload)
 endif()

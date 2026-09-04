@@ -196,12 +196,14 @@ class SplitBuffer : public BufferFactory {
                 if (output->num_elements() != total_elems(out_shape)) {
                     output->resize(out_shape);
                 }
-                auto ob = bind_ssbo<T>(outputs[i], /*is_output=*/true);
-                (void)ob;
+                bind_ssbo<T>(outputs[i], /*is_output=*/true);
             });
-            // layout [input, output]
+            // layout [output, input] — matches split.comp (binding 0 =
+            // uOutput writeonly, binding 1 = uInput readonly). The previous
+            // {input, output} order bound the input as the write target,
+            // clobbering the producer's output (e.g. the qkv Transpose).
             std::vector<std::shared_ptr<VulkanResource>> ordered = {
-                in_buf, objs_.back()};
+                objs_.back(), in_buf};
             objs_ = ordered;
 
             SplitPC pc{};

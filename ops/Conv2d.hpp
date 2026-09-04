@@ -55,15 +55,16 @@ struct alignas(16) GPUConv2dParam {
 };
 
 // Buffer-backend (SSBO) push constant. Naive direct convolution: one thread
-// per output element [n,oc,oh,ow]. 21 ints = 84 bytes (well under the 128B
-// push-constant limit).
+// per output element [n,oc,od,oh,ow]. Supports both 2-D (4-D input, D=1) and
+// 3-D (5-D input) convolution — a 2-D conv is the D=1 degenerate case. 27 ints
+// = 108 bytes (well under the 128B push-constant limit).
 struct alignas(16) Conv2dBufferPC {
-    int N, IC, IH, IW;
-    int OC, OH, OW;
-    int KH, KW;
-    int stride_h, stride_w;
-    int pad_h, pad_w;
-    int dil_h, dil_w;
+    int N, IC, ID, IH, IW;
+    int OC, OD, OH, OW;
+    int KD, KH, KW;
+    int stride_d, stride_h, stride_w;
+    int pad_d, pad_h, pad_w;
+    int dil_d, dil_h, dil_w;
     int groups;
     int has_bias;
     int fp32; // 1 = fp32 single-pass (write output); 0 = fp16 reduce (write
@@ -438,25 +439,94 @@ class Conv2dBuffer : public BufferFactory {
         std::vector<int> input_shape = inputs[0]->getShape();
         std::vector<int> weight_shape = inputs[1]->getShape();
 
+        // Support both 2-D (4-D input NCHW) and 3-D (5-D input NCDHW)
+        // convolution. A 2-D conv is the 3-D path with depth dims = 1, so the
+        // host always fills the D fields and the shader's KD loop runs once.
+        int rank = static_cast<int>(input_shape.size());
+        bool is_3d = (rank >= 5);
         int batch = input_shape[0];
         int depth = input_shape[1];
-        int in_height = input_shape[2];
-        int in_width = input_shape[3];
+        int in_depth = is_3d ? input_shape[2] : 1;
+        int in_height = is_3d ? input_shape[3] : input_shape[2];
+        int in_width = is_3d ? input_shape[4] : input_shape[3];
         int out_depth = weight_shape[0];
-        int kernel_h =
-            kernel_shape_[0] == 0 ? weight_shape[2] : kernel_shape_[0];
-        int kernel_w =
-            kernel_shape_[1] == 0 ? weight_shape[3] : kernel_shape_[1];
+        // kernel_shape_: [KD,KH,KW] for 3-D, [KH,KW] for 2-D (parse_attr_list
+        // keeps the full ONNX list). Fall back to weight dims when unset.
+        int kd = is_3d ? (kernel_shape_.size() >= 3 ? kernel_shape_[0]
+                                                    : weight_shape[2])
+                       : 1;
+        int kernel_h = is_3d ? (kernel_shape_.size() >= 3 ? kernel_shape_[1]
+                                                          : weight_shape[3])
+                             : (kernel_shape_[0] == 0 ? weight_shape[2]
+                                                      : kernel_shape_[0]);
+        int kernel_w = is_3d ? (kernel_shape_.size() >= 3 ? kernel_shape_[2]
+                                                          : weight_shape[4])
+                             : (kernel_shape_[1] == 0 ? weight_shape[3]
+                                                      : kernel_shape_[1]);
+        int stride_d = is_3d ? (strides_.size() >= 3 ? strides_[0] : 1) : 1;
+        int stride_h = is_3d
+                           ? (strides_.size() >= 3 ? strides_[1] : strides_[0])
+                           : strides_[0];
+        int stride_w = is_3d
+                           ? (strides_.size() >= 3 ? strides_[2] : strides_[1])
+                           : strides_[1];
+        int pad_d = is_3d ? (pads_.size() >= 6 ? pads_[0] : 0) : 0;
+        int pad_h =
+            is_3d ? (pads_.size() >= 6 ? pads_[2] : pads_[0]) : pads_[0];
+        int pad_w =
+            is_3d ? (pads_.size() >= 6 ? pads_[3] : pads_[1]) : pads_[1];
+        int dil_d = is_3d ? (dilations_.size() >= 3 ? dilations_[0] : 1) : 1;
+        int dil_h =
+            is_3d ? (dilations_.size() >= 3 ? dilations_[1] : dilations_[0])
+                  : dilations_[0];
+        int dil_w =
+            is_3d ? (dilations_.size() >= 3 ? dilations_[2] : dilations_[1])
+                  : dilations_[1];
+        // ONNX pads for 3-D are [d_begin, d_end, h_begin, h_end, w_begin,
+        // w_end]; use the begin pads (d_begin, h_begin, w_begin).
+        if (is_3d && pads_.size() >= 6) {
+            pad_d = pads_[0];
+            pad_h = pads_[2];
+            pad_w = pads_[4];
+        }
+        int out_d =
+            ((in_depth + 2 * pad_d - dil_d * (kd - 1) - 1) / stride_d) + 1;
         int out_height =
-            ((in_height + 2 * pads_[0] - dilations_[0] * (kernel_h - 1) - 1) /
-             strides_[0]) +
+            ((in_height + 2 * pad_h - dil_h * (kernel_h - 1) - 1) / stride_h) +
             1;
         int out_width =
-            ((in_width + 2 * pads_[1] - dilations_[1] * (kernel_w - 1) - 1) /
-             strides_[1]) +
+            ((in_width + 2 * pad_w - dil_w * (kernel_w - 1) - 1) / stride_w) +
             1;
-        std::vector<int> out_shape = {batch, out_depth, out_height, out_width};
-        int total = batch * out_depth * out_height * out_width;
+        std::vector<int> out_shape =
+            is_3d ? std::vector<int>{batch, out_depth, out_d, out_height,
+                                     out_width}
+                  : std::vector<int>{batch, out_depth, out_height, out_width};
+        int total = batch * out_depth * out_d * out_height * out_width;
+        if (std::getenv("VKOP_CONVDBG")) {
+            std::printf("[convdbg] rank=%d is_3d=%d in=[", rank, is_3d);
+            for (size_t k = 0; k < input_shape.size(); ++k)
+                std::printf("%d ", input_shape[k]);
+            std::printf("] w=[");
+            for (size_t k = 0; k < weight_shape.size(); ++k)
+                std::printf("%d ", weight_shape[k]);
+            std::printf("] ksh=[");
+            for (size_t k = 0; k < kernel_shape_.size(); ++k)
+                std::printf("%d ", kernel_shape_[k]);
+            std::printf("] str=[");
+            for (size_t k = 0; k < strides_.size(); ++k)
+                std::printf("%d ", strides_[k]);
+            std::printf("] pad=[");
+            for (size_t k = 0; k < pads_.size(); ++k)
+                std::printf("%d ", pads_[k]);
+            std::printf(
+                "] kd=%d kh=%d kw=%d sd=%d sh=%d sw=%d pd=%d ph=%d pw=%d "
+                "ID=%d IH=%d IW=%d -> out=[",
+                kd, kernel_h, kernel_w, stride_d, stride_h, stride_w, pad_d,
+                pad_h, pad_w, in_depth, in_height, in_width);
+            for (size_t k = 0; k < out_shape.size(); ++k)
+                std::printf("%d ", out_shape[k]);
+            std::printf("] total=%d fp16=%d\n", total, fp16_);
+        }
 
         // int8 weight-only quantization: weight (inputs[1]) is int8 and a
         // per-output-channel scale is appended as the last input. Layout:
@@ -530,19 +600,25 @@ class Conv2dBuffer : public BufferFactory {
         conv2d::Conv2dBufferPC pc{};
         pc.N = batch;
         pc.IC = depth;
+        pc.ID = in_depth;
         pc.IH = in_height;
         pc.IW = in_width;
         pc.OC = out_depth;
+        pc.OD = out_d;
         pc.OH = out_height;
         pc.OW = out_width;
+        pc.KD = kd;
         pc.KH = kernel_h;
         pc.KW = kernel_w;
-        pc.stride_h = strides_[0];
-        pc.stride_w = strides_[1];
-        pc.pad_h = pads_[0];
-        pc.pad_w = pads_[1];
-        pc.dil_h = dilations_[0];
-        pc.dil_w = dilations_[1];
+        pc.stride_d = stride_d;
+        pc.stride_h = stride_h;
+        pc.stride_w = stride_w;
+        pc.pad_d = pad_d;
+        pc.pad_h = pad_h;
+        pc.pad_w = pad_w;
+        pc.dil_d = dil_d;
+        pc.dil_h = dil_h;
+        pc.dil_w = dil_w;
         pc.groups = groups_;
         pc.has_bias = has_bias ? 1 : 0;
         pc.fp32 = (fp16_ != 0) ? 0 : 1;

@@ -6,6 +6,7 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 extern "C" {
@@ -175,11 +176,15 @@ class TransposeBuffer : public BufferFactory {
         for (int i = 0; i < 8; ++i) {
             pc.perm[i] = (i < rank) ? perm_[i] : i;
         }
-        int total = total_elems(outshape);
         // fp16 packs two elements per uint word; dispatch one thread per output
         // word (the fp16 shader writes each word once — no RMW race).
+        int total = total_elems(outshape);
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        int total_groups = UP_DIV(nthreads, 256);
+        if (!m_ds_[m_id_]) {
+            m_ds_[m_id_] = pipeline_->allocDescriptorSets();
+        }
+        submit_per_ds(m_ds_[m_id_], &pc, total_groups, 1, 1);
     }
 
     std::vector<int> perm_ = {3, 2, 1, 0};

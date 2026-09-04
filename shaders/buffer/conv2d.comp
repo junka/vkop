@@ -64,12 +64,12 @@ layout(set = 0, binding = 5) readonly buffer Scale {
 } uScale;
 
 layout(push_constant) uniform PC {
-    int N, IC, IH, IW;
-    int OC, OH, OW;
-    int KH, KW;
-    int stride_h, stride_w;
-    int pad_h, pad_w;
-    int dil_h, dil_w;
+    int N, IC, ID, IH, IW;
+    int OC, OD, OH, OW;
+    int KD, KH, KW;
+    int stride_d, stride_h, stride_w;
+    int pad_d, pad_h, pad_w;
+    int dil_d, dil_h, dil_w;
     int groups;
     int has_bias;
     int fp32; // 1 = fp32 single-pass (write uOutput); 0 = fp16 reduce (write uScratch)
@@ -79,50 +79,58 @@ layout(push_constant) uniform PC {
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
-    int total = uPC.N * uPC.OC * uPC.OH * uPC.OW;
+    // 3D-convolution layout: input [N,IC,ID,IH,IW], weight [OC,icg,KD,KH,KW],
+    // output [N,OC,OD,OH,OW]. A 2-D conv is the special case ID=OD=KD=1,
+    // stride_d=pad_d=dil_d=0 (the host sets these so the D-loop runs once).
+    int total = uPC.N * uPC.OC * uPC.OD * uPC.OH * uPC.OW;
     if (gid >= total) return;
 
-    // Decode gid -> (n, oc, oh, ow) under row-major [N, OC, OH, OW].
+    // Decode gid -> (n, oc, od, oh, ow) under row-major [N, OC, OD, OH, OW].
     int ow = gid % uPC.OW;
     int oh = (gid / uPC.OW) % uPC.OH;
-    int oc = (gid / (uPC.OW * uPC.OH)) % uPC.OC;
-    int n = gid / (uPC.OW * uPC.OH * uPC.OC);
+    int od = (gid / (uPC.OW * uPC.OH)) % uPC.OD;
+    int oc = (gid / (uPC.OW * uPC.OH * uPC.OD)) % uPC.OC;
+    int n = gid / (uPC.OW * uPC.OH * uPC.OD * uPC.OC);
 
     int ocg = uPC.OC / uPC.groups; // output channels per group
     int icg = uPC.IC / uPC.groups; // input channels per group
     int g = oc / ocg;
     int ic_base = g * icg;
-    // Weight is [OC, icg, KH, KW] row-major.
-    int w_base = oc * (icg * uPC.KH * uPC.KW);
-    // Input is [N, IC, IH, IW] row-major.
-    int x_base_n = n * uPC.IC * uPC.IH * uPC.IW;
+    // Weight is [OC, icg, KD, KH, KW] row-major.
+    int w_base = oc * (icg * uPC.KD * uPC.KH * uPC.KW);
+    // Input is [N, IC, ID, IH, IW] row-major.
+    int x_base_n = n * uPC.IC * uPC.ID * uPC.IH * uPC.IW;
 
     // int8 weights: one dequant scale per output channel (read once).
     float w_scale = (uPC.weight_int8 != 0) ? BUF_LOAD(uScale.data, oc) : 0.0;
 
     float sum = 0.0;
     for (int kic = 0; kic < icg; ++kic) {
-        for (int ky = 0; ky < uPC.KH; ++ky) {
-            int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
-            if (iy < 0 || iy >= uPC.IH) continue;
-            for (int kx = 0; kx < uPC.KW; ++kx) {
-                int ix = ow * uPC.stride_w + kx * uPC.dil_w - uPC.pad_w;
-                if (ix < 0 || ix >= uPC.IW) continue;
-                int xidx = x_base_n + (ic_base + kic) * uPC.IH * uPC.IW +
-                           iy * uPC.IW + ix;
-                int widx = w_base + (kic * uPC.KH + ky) * uPC.KW + kx;
-                float x = BUF_LOAD(uInputX.data, xidx);
-                float w;
-                if (uPC.weight_int8 != 0) {
-                    // int8 packed 4-per-uint, row-major byte stream.
-                    int b = int((uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFF);
-                    // Sign-extend 8-bit to int (reinterpret as signed).
-                    if (b >= 128) b -= 256;
-                    w = float(b) * w_scale;
-                } else {
-                    w = BUF_LOAD(uInputW.data, widx);
+        for (int kd = 0; kd < uPC.KD; ++kd) {
+            int idd = od * uPC.stride_d + kd * uPC.dil_d - uPC.pad_d;
+            if (idd < 0 || idd >= uPC.ID) continue;
+            for (int ky = 0; ky < uPC.KH; ++ky) {
+                int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
+                if (iy < 0 || iy >= uPC.IH) continue;
+                for (int kx = 0; kx < uPC.KW; ++kx) {
+                    int ix = ow * uPC.stride_w + kx * uPC.dil_w - uPC.pad_w;
+                    if (ix < 0 || ix >= uPC.IW) continue;
+                    int xidx = x_base_n + (ic_base + kic) * uPC.ID * uPC.IH * uPC.IW +
+                               idd * uPC.IH * uPC.IW + iy * uPC.IW + ix;
+                    int widx = w_base + ((kic * uPC.KD + kd) * uPC.KH + ky) * uPC.KW + kx;
+                    float x = BUF_LOAD(uInputX.data, xidx);
+                    float w;
+                    if (uPC.weight_int8 != 0) {
+                        // int8 packed 4-per-uint, row-major byte stream.
+                        int b = int((uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFF);
+                        // Sign-extend 8-bit to int (reinterpret as signed).
+                        if (b >= 128) b -= 256;
+                        w = float(b) * w_scale;
+                    } else {
+                        w = BUF_LOAD(uInputW.data, widx);
+                    }
+                    sum += x * w;
                 }
-                sum += x * w;
             }
         }
     }
