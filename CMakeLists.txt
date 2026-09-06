@@ -500,4 +500,10 @@ if (ENABLE_LLM_CHAT)
     # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.
     add_executable(visual_probe llm/exporter/visual_probe.cpp)
     target_link_libraries(visual_probe PRIVATE vkop vload)
+
+    # get_rope_index probe: verifies the C++ MRoPE position-id port against a
+    # HF reference dump (dump_rope_ref.py). Header-only logic; links vkop only
+    # because image_preproc.hpp -> core/Tensor.hpp pulls in VulkanLib symbols.
+    add_executable(rope_probe llm/exporter/rope_probe.cpp)
+    target_link_libraries(rope_probe PRIVATE vkop vload)
 endif()

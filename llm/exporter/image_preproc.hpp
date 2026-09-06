@@ -158,6 +158,148 @@ inline PreprocResult preprocess_image_noresize(const uint8_t *hwc, int H, int W,
     return r;
 }
 
+// ---------------------------------------------------------------------------
+// get_rope_index: C++ port of HF Qwen3-VL RoPE position-id construction.
+//
+// Builds the 3D MRoPE position_ids (temporal, height, width) for a prefill
+// sequence that mixes text and image runs. Mirrors
+// transformers.models.qwen3_vl.modeling_qwen3_vl.get_rope_index +
+// get_vision_position_ids exactly (spatial_merge_size=2, temp_merge_size=1,
+// time_interval=1 — the only config Qwen3-VL-2B uses).
+//
+// Inputs (batch B=1 supported; multi-batch is a loop):
+//   input_ids : (B, L) int64
+//   mtt       : (B, L) int32  mm_token_type_ids — 0=text, 1=image, 2=video
+//   am        : (B, L) bool   attention_mask (1=keep, 0=pad). If null, all 1.
+//   grid_thw  : flat (n_img*3,) int — [T,H,W] per image, in encounter order.
+// Returns:
+//   pos_ids   : (3, B, L) int64, row-major [axis][batch][seq]
+//   rope_delta: (B,) int64 — llm_positions.max()+1 - L (per batch). Used for
+//               decode rounds: position_ids = past_len + rope_delta.
+//
+// Algorithm (per batch):
+//   - Group mtt (after masking) into contiguous runs (modality, start, end).
+//   - Text run  : pos = arange(text_len) + current_pos, replicated on all 3
+//                 axes; current_pos += text_len.
+//   - Image run : consume next grid_thw. llm_grid_t=T, llm_grid_h=H//2,
+//                 llm_grid_w=W//2, seq=thw. width  = arange(cp, cp+w) repeated
+//                 h*t times; height = arange(cp, cp+h) repeat_interleave w*t;
+//                 temporal = cp (constant). current_pos += max(H,W)//2.
+//   - rope_delta = max(pos)+1 - len(masked_seq).
+// Padding positions (am==0) are written as 0 in pos_ids (HF leaves the
+// pre-zeroed tensor unassigned there).
+struct RopeIndexResult {
+    std::vector<int64_t> pos_ids;       // (3, B, L)
+    std::vector<int64_t> rope_delta;    // (B,)
+};
+
+inline RopeIndexResult get_rope_index(
+    const int64_t *input_ids, const int32_t *mtt, const int8_t *am,
+    const int *grid_thw_flat, int n_img, int B, int L) {
+    RopeIndexResult res;
+    res.pos_ids.assign(3 * B * L, 0);
+    res.rope_delta.assign(B, 0);
+    const int spatial_merge_size = kMerge; // 2
+    const int temp_merge_size = 1;
+    const int time_interval = 1;
+    (void)input_ids; // not needed for pos computation (only mtt + grid_thw)
+
+    int grid_consumed = 0;
+    for (int b = 0; b < B; ++b) {
+        const int32_t *mtt_b = mtt + b * L;
+        const int8_t *am_b = am ? am + b * L : nullptr;
+
+        // Build the masked run list over mtt. First gather the kept indices,
+        // then group consecutive equal modality.
+        std::vector<int> kept;       // indices into the original L
+        std::vector<int32_t> kept_type;
+        kept.reserve(L);
+        kept_type.reserve(L);
+        for (int i = 0; i < L; ++i) {
+            if (am_b == nullptr || am_b[i] != 0) {
+                kept.push_back(i);
+                kept_type.push_back(mtt_b[i]);
+            }
+        }
+        int masked_len = static_cast<int>(kept.size());
+
+        // Run-length encode kept_type into (modality, start, end) over the
+        // kept sequence.
+        struct Run { int32_t mod; int start; int end; };
+        std::vector<Run> runs;
+        if (!kept_type.empty()) {
+            int32_t cur = kept_type[0];
+            int start = 0;
+            for (int i = 1; i <= static_cast<int>(kept_type.size()); ++i) {
+                if (i == static_cast<int>(kept_type.size()) ||
+                    kept_type[i] != cur) {
+                    runs.push_back({cur, start, i});
+                    if (i < static_cast<int>(kept_type.size())) {
+                        cur = kept_type[i];
+                        start = i;
+                    }
+                }
+            }
+        }
+
+        int current_pos = 0;
+        int64_t llm_max = -1;
+        // For each run, append its 3-axis pos values into a per-batch list,
+        // then scatter into res.pos_ids at the kept positions.
+        for (const auto &run : runs) {
+            int run_len = run.end - run.start;
+            if (run.mod == 0) {
+                // text: arange(run_len) + current_pos on all 3 axes
+                for (int t = 0; t < run_len; ++t) {
+                    int64_t p = current_pos + t;
+                    for (int axis = 0; axis < 3; ++axis) {
+                        int seq_idx = run.start + t;
+                        int orig = kept[seq_idx];
+                        res.pos_ids[(axis * B + b) * L + orig] = p;
+                    }
+                    llm_max = std::max(llm_max, (int64_t)(current_pos + t));
+                }
+                current_pos += run_len;
+            } else {
+                // image (1) or video (2): consume next grid_thw
+                if (grid_consumed >= n_img) break; // malformed; stop
+                int T = grid_thw_flat[grid_consumed * 3 + 0];
+                int H = grid_thw_flat[grid_consumed * 3 + 1];
+                int W = grid_thw_flat[grid_consumed * 3 + 2];
+                grid_consumed++;
+                int lt = T / temp_merge_size;
+                int lh = H / spatial_merge_size;
+                int lw = W / spatial_merge_size;
+                int seq = lt * lh * lw;
+                // Build width/height/temporal exactly as get_vision_position_ids:
+                //   width  = arange(cp, cp+lw) repeated lh*lt times
+                //   height = arange(cp, cp+lh) repeat_interleave lw*lt
+                //   temporal = cp (constant), * time_interval
+                for (int s = 0; s < seq; ++s) {
+                    int t = s / (lh * lw);        // 0..lt-1
+                    int rem = s % (lh * lw);
+                    int h = rem / lw;             // 0..lh-1
+                    int w = rem % lw;             // 0..lw-1
+                    (void)t;
+                    int64_t p_t = (int64_t)current_pos * time_interval;
+                    int64_t p_h = current_pos + h;
+                    int64_t p_w = current_pos + w;
+                    int seq_idx = run.start + s;
+                    if (seq_idx >= run.end) break; // grid larger than run (safe)
+                    int orig = kept[seq_idx];
+                    res.pos_ids[(0 * B + b) * L + orig] = p_t;
+                    res.pos_ids[(1 * B + b) * L + orig] = p_h;
+                    res.pos_ids[(2 * B + b) * L + orig] = p_w;
+                    llm_max = std::max(llm_max, std::max(p_t, std::max(p_h, p_w)));
+                }
+                current_pos += std::max(H, W) / spatial_merge_size;
+            }
+        }
+        res.rope_delta[b] = (llm_max + 1) - masked_len;
+    }
+    return res;
+}
+
 } // namespace export_
 } // namespace vkop
 
