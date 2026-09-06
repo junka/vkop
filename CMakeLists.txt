@@ -295,6 +295,7 @@ set(DUAL_FP16_SHADERS
     buffer/expand
     buffer/transpose
     buffer/concat
+    buffer/split
     buffer/softmax
     buffer/matmul
     buffer/cos

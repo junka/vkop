@@ -153,6 +153,10 @@ TEST(GemmTest, GemmComprehensiveTest) {
     const std::vector<std::tuple<std::vector<int>, std::vector<int>, float, float, bool, bool>> testcases = {
         {{1, 20}, {20, 16}, 1.0F, 1.0F, false, false},
         {{1, 2048}, {1000, 2048}, 1.0F, 1.0F, false, true},
+        // M>1 fp16 transB + bias case: the existing fp16 transB case only used
+        // M=1, so a row-1+ bias-indexing bug (C read as [M][N] instead of 1-D
+        // [N] broadcast) never surfaced there. Small M/N/K keeps it fast.
+        {{8, 64}, {128, 64}, 1.0F, 1.0F, false, true},
     };
 
     for (const auto &testcase : testcases) {

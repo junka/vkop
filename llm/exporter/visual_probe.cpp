@@ -1,16 +1,21 @@
 // junka @ 2026
-// Visual encoder probe: load visual.vkopbin, feed a pre-dumped pixel_values
-// (196,1536) fp16, run, and dump the 4 outputs (image_features +
-// deepstack_features_{0,1,2}) to /tmp/vkop_*.bin for ORT comparison.
+// Visual encoder probe: load visual.vkopbin, feed pixel_values (196,1536) fp16,
+// run, and dump the 4 outputs (image_features + deepstack_features_{0,1,2}).
 //
-// This is the stage-0/stage-1 verification harness: it exercises the full
-// visual graph including the patch_embed Conv3D (5-D Conv) to confirm the
-// Conv2d buffer-backend 5-D extension produces ORT-aligned outputs.
+// Stage-0/stage-1 verification harness: exercises the full visual graph incl.
+// the patch_embed Conv3D (5-D Conv) to confirm the Conv2d buffer-backend 5-D
+// extension produces ORT-aligned outputs, AND that the C++ image preprocessor
+// (image_preproc.hpp) reproduces HF's pixel_values layout.
 //
 // Usage:
-//   visual_probe <visual.vkopbin> <pv.bin> [seq_len]
-//   pv.bin is a raw fp16 [seq_len, 1536] buffer (dumped by ORT or Python).
+//   visual_probe <visual.vkopbin> --pv <pv.bin> [seq_len]   # raw fp16 input
+//   visual_probe <visual.vkopbin> --image <img> [seq_len]   # decode+preprocess in C++
+//     --ref-pv <dir>     diff C++ pixel_values vs <dir>/pv.bin (preproc check)
+//     --ref-out <dir>    diff 4 vkop outputs vs <dir>/<name>.bin (encoder check)
 //   Outputs: /tmp/vkop_image_features.bin, /tmp/vkop_deepstack_features_{0,1,2}.bin
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "include/stb_image.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -26,6 +31,7 @@
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "image_preproc.hpp"
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
@@ -33,16 +39,78 @@ using vkop::core::Runtime;
 using vkop::core::as_tensor;
 using vkop::core::ITensor;
 
+// Load a raw fp16 file into a vector<uint16_t>.
+static std::vector<uint16_t> load_raw_fp16(const std::string& path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path.c_str()); return {}; }
+    auto sz = f.tellg();
+    f.seekg(0);
+    std::vector<uint16_t> v(sz / sizeof(uint16_t));
+    f.read(reinterpret_cast<char*>(v.data()), sz);
+    return v;
+}
+
+// Load a raw fp16 file, return fp32 stats for diff printing.
+static std::vector<uint16_t> load_ref(const std::string& dir, const std::string& name) {
+    std::string p = dir + "/" + name + ".bin";
+    std::ifstream f(p, std::ios::binary | std::ios::ate);
+    if (!f) return {};
+    auto sz = f.tellg();
+    f.seekg(0);
+    std::vector<uint16_t> v(sz / sizeof(uint16_t));
+    f.read(reinterpret_cast<char*>(v.data()), sz);
+    return v;
+}
+
+// Diff two fp16 buffers: print max_abs / mean_abs / count of mismatches beyond tol.
+static void diff_fp16(const std::string& label, const uint16_t* a, const uint16_t* b,
+                      int n, float tol) {
+    if (n <= 0) { std::printf("[diff:%s] n=%d (skipped)\n", label.c_str(), n); return; }
+    float max_abs = 0, sum_abs = 0;
+    int over = 0;
+    for (int i = 0; i < n; ++i) {
+        float va = ITensor::fp16_to_fp32(a[i]);
+        float vb = ITensor::fp16_to_fp32(b[i]);
+        float d = std::fabs(va - vb);
+        if (d > max_abs) max_abs = d;
+        sum_abs += d;
+        if (d > tol) ++over;
+    }
+    std::printf("[diff:%s] n=%d max_abs=%.6f mean_abs=%.6f over_tol=%d (tol=%.4f)\n",
+                label.c_str(), n, max_abs, sum_abs / n, over, tol);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
-        std::fprintf(stderr, "usage: %s <visual.vkopbin> <pv.bin> [seq_len]\n",
-                     argv[0]);
+        std::fprintf(stderr,
+            "usage: %s <visual.vkopbin> --pv <pv.bin> [seq_len]\n"
+            "       %s <visual.vkopbin> --image <img> [seq_len] "
+            "[--ref-pv <dir>] [--ref-out <dir>]\n",
+            argv[0], argv[0]);
         return 1;
     }
     const std::string model_path = argv[1];
-    const std::string pv_path = argv[2];
-    int seq_len = (argc > 3) ? std::atoi(argv[3]) : 196;
-    int row = 1536;
+
+    // Parse remaining args: --pv/--image pick input mode; optional seq_len,
+    // --ref-pv / --ref-out for diffing.
+    std::string pv_path, image_path, ref_pv_dir, ref_out_dir;
+    int seq_len = 196; // default for 224x224 export
+    bool have_seq = false;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--pv" && i + 1 < argc) { pv_path = argv[++i]; }
+        else if (a == "--image" && i + 1 < argc) { image_path = argv[++i]; }
+        else if (a == "--ref-pv" && i + 1 < argc) { ref_pv_dir = argv[++i]; }
+        else if (a == "--ref-out" && i + 1 < argc) { ref_out_dir = argv[++i]; }
+        else if (!a.empty() && a[0] != '-' && !have_seq) {
+            seq_len = std::atoi(a.c_str()); have_seq = true;
+        }
+    }
+    if (pv_path.empty() && image_path.empty()) {
+        std::fprintf(stderr, "need --pv <pv.bin> or --image <img>\n");
+        return 1;
+    }
+    const int row = 1536;
 
     Logger::getInstance().setLevel(LOG_INFO);
     const auto& phydevs =
@@ -55,15 +123,48 @@ int main(int argc, char** argv) {
     std::printf("GPU: %s\n", dev->getDeviceName().c_str());
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
-    // Load pixel_values (fp16).
-    std::ifstream f(pv_path, std::ios::binary | std::ios::ate);
-    if (!f) { std::fprintf(stderr, "cannot open %s\n", pv_path.c_str()); return 1; }
-    auto sz = f.tellg();
-    f.seekg(0);
-    std::vector<uint16_t> pv(sz / sizeof(uint16_t));
-    f.read(reinterpret_cast<char*>(pv.data()), sz);
-    std::printf("[pv] %s  seq_len=%d row=%d  elems=%zu\n", pv_path.c_str(),
-                seq_len, row, pv.size());
+    // Build pixel_values (fp16). Either raw load or C++ preprocess.
+    std::vector<uint16_t> pv;
+    if (!image_path.empty()) {
+        int w = 0, h = 0, c = 0;
+        unsigned char* img = stbi_load(image_path.c_str(), &w, &h, &c, 3);
+        if (!img) {
+            std::fprintf(stderr, "stbi_load failed: %s: %s\n", image_path.c_str(),
+                         stbi_failure_reason());
+            return 1;
+        }
+        std::printf("[image] %s  %dx%d ch=%d\n", image_path.c_str(), w, h, c);
+        auto pr = vkop::export_::preprocess_image_noresize(img, h, w, 3);
+        stbi_image_free(img);
+        if (pr.pixel_values_fp16.empty()) {
+            std::fprintf(stderr,
+                "preprocess failed: image %dx%d not divisible by patch*merge=%d\n",
+                w, h, vkop::export_::kPatch * vkop::export_::kMerge);
+            return 1;
+        }
+        pv = std::move(pr.pixel_values_fp16);
+        seq_len = pr.seq_len;
+        std::printf("[preproc] grid_thw=[%d,%d,%d] seq_len=%d row=%d\n",
+                    pr.grid_t, pr.grid_h, pr.grid_w, pr.seq_len, pr.row);
+        // Optional: diff C++ pv vs HF reference pv.
+        if (!ref_pv_dir.empty()) {
+            auto ref = load_ref(ref_pv_dir, "pv");
+            if (ref.empty()) {
+                std::fprintf(stderr, "no ref pv at %s/pv.bin\n", ref_pv_dir.c_str());
+            } else {
+                int n = std::min<int>(ref.size(), pv.size());
+                diff_fp16("pixel_values", pv.data(), ref.data(), n, 1e-3f);
+                if ((int)ref.size() != (int)pv.size()) {
+                    std::printf("[diff:pixel_values] SIZE MISMATCH cpp=%zu ref=%zu\n",
+                                pv.size(), ref.size());
+                }
+            }
+        }
+    } else {
+        pv = load_raw_fp16(pv_path);
+        if (pv.empty()) return 1;
+    }
+    std::printf("[pv] seq_len=%d row=%d elems=%zu\n", seq_len, row, pv.size());
 
     // Runtime + visual model.
     auto rt = std::make_shared<Runtime>(cmdpool, model_path, /*precision=*/1);
@@ -142,13 +243,6 @@ int main(int argc, char** argv) {
             if (tns->dtype() != typeid(uint16_t)) continue;
             auto tg = as_tensor<uint16_t>(tns);
             if (!tg->has_gpu_buffer()) continue;
-            // DBG: print underlying VkBuffer handle for aliasing cross-ref
-            if (std::getenv("VKOP_DUMP_SAMPLE")) {
-                auto buf = tg->as_storage_buffer(dev);
-                std::printf("[buf:%s this=%p h=%p sz=%zu]\n", nm.c_str(),
-                            (void*)tns.get(), (void*)buf->getBuffer(),
-                            buf->getSize());
-            }
             tg->copyToCPU(cmdpool);
             const uint16_t* p =
                 reinterpret_cast<const uint16_t*>(tg->data().data());
@@ -165,46 +259,24 @@ int main(int argc, char** argv) {
             std::printf("[%s] ne=%d min=%.4g max=%.4g mean=%.4g first=%.4g\n",
                         nm.c_str(), ne, mn, mx, sum / std::max(1, ne),
                         ne ? ITensor::fp16_to_fp32(p[0]) : 0.f);
+            // Optional: raw dump for element-wise ORT diff. Writes the fp16
+            // buffer to /tmp/vkopdump_<sanitized_name>.bin.
             if (std::getenv("VKOP_DUMP_RAW")) {
-                int nraw = std::getenv("VKOP_DUMP_RAWN") ? std::atoi(std::getenv("VKOP_DUMP_RAWN")) : 8;
-                std::printf("  raw=[");
-                for (int i = 0; i < nraw && i < ne; ++i)
-                    std::printf("%.4g ", ITensor::fp16_to_fp32(p[i]));
-                std::printf("]\n");
-            }
-            // DBG: sample words at several offsets to see which gids wrote.
-            if (std::getenv("VKOP_DUMP_SAMPLE") && !std::getenv("VKOP_DUMP_INT64") &&
-                tns->dtype() == typeid(uint16_t)) {
-                int offs[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 100, 200702, 200704, 200706, 250000, 300000, 301055};
-                const uint32_t* wp = reinterpret_cast<const uint32_t*>(p);
-                int nwords = ne / 2;
-                std::printf("  words=[");
-                for (int off : offs) {
-                    if (off < nwords) {
-                        uint32_t u = wp[off];
-                        float bf;
-                        std::memcpy(&bf, &u, sizeof(bf));
-                        std::printf("%d:%.4g(u%u) ", off, bf, u);
-                    }
-                }
-                std::printf("]\n");
-                // Find first non-zero word and last non-zero word.
-                int first_nz = -1, last_nz = -1;
-                for (int i = 0; i < nwords; ++i) {
-                    if (wp[i] != 0) {
-                        if (first_nz < 0) first_nz = i;
-                        last_nz = i;
-                    }
-                }
-                std::printf("  nzrange: first=%d last=%d (nwords=%d)\n",
-                            first_nz, last_nz, nwords);
+                std::string fname = nm;
+                for (auto& ch : fname)
+                    if (ch == '/' || ch == '.') ch = '_';
+                std::string outp = "/tmp/vkopdump_" + fname + ".bin";
+                std::ofstream of(outp, std::ios::binary);
+                of.write(reinterpret_cast<const char*>(p),
+                         ne * sizeof(uint16_t));
             }
         }
     }
 
-    // Dump 4 outputs.
+    // Dump 4 outputs + optional ORT diff.
     const char* outs[] = {"image_features", "deepstack_features_0",
                           "deepstack_features_1", "deepstack_features_2"};
+    bool any_diff = false;
     for (const char* name : outs) {
         auto o = rt->GetOutput(name);
         if (!o) { std::fprintf(stderr, "no output %s\n", name); continue; }
@@ -230,6 +302,21 @@ int main(int argc, char** argv) {
         of.write(reinterpret_cast<const char*>(data.data()),
                  data.size() * sizeof(uint16_t));
         std::printf("  saved %s\n", outp.c_str());
+        // Optional ORT diff.
+        if (!ref_out_dir.empty()) {
+            auto ref = load_ref(ref_out_dir, name);
+            if (ref.empty()) {
+                std::printf("  [no ref %s/%s.bin]\n", ref_out_dir.c_str(), name);
+            } else {
+                int n = std::min<int>(ref.size(), data.size());
+                diff_fp16(name, data.data(), ref.data(), n, 0.05f);
+                if ((int)ref.size() != (int)data.size()) {
+                    std::printf("  [diff:%s] SIZE MISMATCH vkop=%zu ref=%zu\n",
+                                name, data.size(), ref.size());
+                    any_diff = true;
+                }
+            }
+        }
     }
-    return 0;
+    return any_diff ? 2 : 0;
 }

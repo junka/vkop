@@ -1,8 +1,12 @@
 #version 450 core
 
-// Split SSBO op (fp32). Per-output submit (host binds the input + this
-// output and dispatches UP_DIV(out_total,256)). For each output element,
-// out_nd -> in_nd with in_nd[axis] += split offset, then copy.
+// Split SSBO op. Per-output submit (host binds the input + this output and
+// dispatches UP_DIV(out_total,256) for fp32, UP_DIV((out_total+1)/2,256) for
+// fp16). For each output element, out_nd -> in_nd with
+// in_nd[axis] += split offset, then copy. fp16 packs 2 half/uint word, so one
+// thread writes one output word (2 elements) — each element reads its own
+// (non-contiguous-under-axis-split) input element via BUF_LOAD and the two
+// results are packed into one word written once (no read-modify-write race).
 
 #include "../common/buffer_common.comp"
 
@@ -26,18 +30,39 @@ layout(push_constant) uniform PC_uSplit {
     int _pad2;
 } uSplit;
 
+int split_elem(int gid) {
+    int rank = uSplit.rank;
+    IArr8 out_coord = linear_to_nd8(gid, uSplit.outDims, rank);
+    IArr8 in_coord;
+    for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
+    in_coord.v[uSplit.axis] += uSplit.split;
+    return nd_to_linear8(in_coord, uSplit.inDims, rank);
+}
+
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     int rank = uSplit.rank;
     int out_total = 1;
     for (int i = 0; i < rank; ++i) out_total *= uSplit.outDims.v[i];
+
+#ifdef FP16
+    // fp16 packs two halfs per uint word. One thread per output word: elements
+    // 2*gid (lo half) and 2*gid+1 (hi half). Each output element reads its own
+    // input element via BUF_LOAD (which unpacks the source half2), and the two
+    // results are packed into one word written once — no read-modify-write race.
+    int nwords = (out_total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = 2 * gid + 1;
+    float v0 = float(BUF_LOAD(uInput.data, split_elem(e0)));
+    if (e1 >= out_total) {
+        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+    } else {
+        float v1 = float(BUF_LOAD(uInput.data, split_elem(e1)));
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    }
+#else
     if (gid >= out_total) return;
-
-    IArr8 out_coord = linear_to_nd8(gid, uSplit.outDims, rank);
-    IArr8 in_coord;
-    for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
-    in_coord.v[uSplit.axis] += uSplit.split;
-
-    int in_linear = nd_to_linear8(in_coord, uSplit.inDims, rank);
-    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, in_linear)));
+    uOutput.data[gid] = floatBitsToUint(float(BUF_LOAD(uInput.data, split_elem(gid))));
+#endif
 }

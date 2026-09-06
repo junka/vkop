@@ -544,6 +544,7 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::EXPAND:
                 case vkop::ops::OpType::RESHAPE:
                 case vkop::ops::OpType::SLICE:
+                case vkop::ops::OpType::SPLIT:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;

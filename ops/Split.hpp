@@ -10,6 +10,8 @@ extern unsigned char image_split_spv[];
 extern unsigned int image_split_spv_len;
 extern unsigned char buffer_split_spv[];
 extern unsigned int buffer_split_spv_len;
+extern unsigned char buffer_split_fp16_spv[];
+extern unsigned int buffer_split_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -129,11 +131,14 @@ class SplitImage : public Operator {
 // output, dispatch UP_DIV(out_total, 256).
 class SplitBuffer : public BufferFactory {
   public:
-    explicit SplitBuffer(int /*fp16*/)
-        : BufferFactory(OpType::SPLIT, buffer_split_spv, buffer_split_spv_len,
+    explicit SplitBuffer(int fp16)
+        : BufferFactory(OpType::SPLIT,
+                        fp16 ? buffer_split_fp16_spv : buffer_split_spv,
+                        fp16 ? buffer_split_fp16_spv_len : buffer_split_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SplitPC)) {
         update_after_bind_ = true;
+        fp16_ = fp16;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -212,7 +217,9 @@ class SplitBuffer : public BufferFactory {
             fill_dims(pc.inDims, in_shape);
             fill_dims(pc.outDims, out_shape);
             pc.split = split_offset;
-            submit_per_ds(pass_ds[i], &pc, UP_DIV(out_total, 256), 1, 1);
+            // fp16 packs 2 half/uint word: one thread per output word.
+            int nthreads = (fp16_ != 0) ? (out_total + 1) / 2 : out_total;
+            submit_per_ds(pass_ds[i], &pc, UP_DIV(nthreads, 256), 1, 1);
             split_offset += static_cast<int>(split_vec[i]);
         }
         for (int i = 0; i < num_outputs_; ++i) {
@@ -227,10 +234,10 @@ class SplitBuffer : public BufferFactory {
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Split : public PimplFacade {
   public:
-    Split(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::SPLIT) {
+    Split(int fp16, bool backend_buffer) : PimplFacade(OpType::SPLIT) {
         impl_ =
             backend_buffer
-                ? std::unique_ptr<Operator>(std::make_unique<SplitBuffer>(0))
+                ? std::unique_ptr<Operator>(std::make_unique<SplitBuffer>(fp16))
                 : std::make_unique<SplitImage>();
     }
 };

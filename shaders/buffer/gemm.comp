@@ -85,7 +85,8 @@ void gemm32()
     sum *= uParams.alpha;
     float c_val;
     if (uParams.has_bias == 1) {
-        c_val = uintBitsToFloat(bufferC.data[yIndex]);
+        // Bias C is 1-D [N], broadcast across all M rows: element is C[j].
+        c_val = uintBitsToFloat(bufferC.data[j]);
         sum += c_val * uParams.beta;
     }
 
@@ -138,7 +139,16 @@ void gemm16() {
     sum *= uParams.alpha;
     vec2 c_val;
     if (uParams.has_bias == 1) {
-        c_val = unpackHalf2x16(bufferC.data[yIndex/2]);
+        // Bias C is 1-D [N], broadcast across all M rows. The two output
+        // columns (j*2, j*2+1) read C[j*2] and C[j*2+1].
+        int bcol0 = j * 2;
+        c_val.x = unpackHalf2x16(bufferC.data[bcol0/2])[bcol0%2];
+        int bcol1 = j * 2 + 1;
+        if (bcol1 < uParams.N) {
+            c_val.y = unpackHalf2x16(bufferC.data[bcol1/2])[bcol1%2];
+        } else {
+            c_val.y = 0.0;
+        }
         sum += c_val * uParams.beta;
     }
 
@@ -214,16 +224,18 @@ void gemmMixed16() {
     float c_val0;
     float c_val1 = 0;
     if (uParams.has_bias == 1) {
+        // Bias C is 1-D [N], broadcast across all M rows: C[j*2], C[j*2+1].
+        int bcol0 = j * 2;
+        int bcol1 = j * 2 + 1;
         if (uParams.fp16c == 1) {
-            vec2 c_val = unpackHalf2x16(bufferC.data[yIndex/2]);
-            c_val0 = c_val.x;
-            if (j * 2 + 1 < uParams.N) {
-                c_val1 = c_val.y;
+            c_val0 = unpackHalf2x16(bufferC.data[bcol0/2])[bcol0%2];
+            if (bcol1 < uParams.N) {
+                c_val1 = unpackHalf2x16(bufferC.data[bcol1/2])[bcol1%2];
             }
         } else {
-            c_val0 = uintBitsToFloat(bufferC.data[yIndex]);
-            if (j * 2 + 1 < uParams.N) {
-                c_val1 = uintBitsToFloat(bufferC.data[yIndex + 1]);
+            c_val0 = uintBitsToFloat(bufferC.data[bcol0]);
+            if (bcol1 < uParams.N) {
+                c_val1 = uintBitsToFloat(bufferC.data[bcol1]);
             }
         }
         sum.x += c_val0 * uParams.beta;
@@ -281,10 +293,11 @@ void gemmMixed32() {
     sum *= uParams.alpha;
     float c_val;
     if (uParams.has_bias == 1) {
+        // Bias C is 1-D [N], broadcast across all M rows: element is C[j].
         if (uParams.fp16c == 1) {
-            c_val = unpackHalf2x16(bufferC.data[yIndex/2])[yIndex%2];
+            c_val = unpackHalf2x16(bufferC.data[j/2])[j%2];
         } else {
-            c_val = uintBitsToFloat(bufferC.data[yIndex]);
+            c_val = uintBitsToFloat(bufferC.data[j]);
         }
         sum += c_val * uParams.beta;
     }
