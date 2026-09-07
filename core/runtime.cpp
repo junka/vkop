@@ -423,6 +423,14 @@ void Runtime::LoadModel() {
                         dtype_marker = "_i64_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
+                               node_inputs[0]->dtype() == typeid(int8_t)) {
+                        // int8/bool flows through (the LLM's image_pad_mask ->
+                        // Reshape -> NonZero chain). Without this the output
+                        // falls back to fp16 and the int8 Reshape CPU path
+                        // null-casts the output.
+                        dtype_marker = "_i8_";
+                    } else if (!node_inputs.empty() &&
+                               node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(uint16_t)) {
                         // fp16 data input -> fp16 output.
                         dtype_marker = "_f16_";
@@ -470,6 +478,15 @@ void Runtime::LoadModel() {
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
+                        } else if (dtype_marker == "_i8_") {
+                            // int8/bool output (image_pad_mask -> Reshape).
+                            // The Reshape CPU path uploads to an SSBO itself;
+                            // create off-GPU so copyToCPU doesn't deref null.
+                            auto t = std::make_shared<Tensor<int8_t>>(
+                                alloc_dims, false);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
                         } else {
                             auto t = std::make_shared<Tensor<float>>(alloc_dims,
                                                                      true);
@@ -496,6 +513,8 @@ void Runtime::LoadModel() {
                         key += "f32_";
                     } else if (t->dtype() == typeid(int)) {
                         key += "i32_";
+                    } else if (t->dtype() == typeid(int8_t)) {
+                        key += "i8_";
                     } else {
                         key += "other_";
                     }

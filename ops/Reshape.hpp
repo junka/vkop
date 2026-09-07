@@ -266,6 +266,25 @@ class ReshapeBuffer : public BufferFactory {
             return;
         }
 
+        // int8/bool data (e.g. the LLM's image_pad_mask): a reshape is a
+        // metadata-only byte copy. The buffer reshape shader reads uint words
+        // (fp32/fp16), which would misread 1-byte int8 elements as packed
+        // words — so copy on the host like the int64 path. The mask is tiny.
+        if (inputs[0]->dtype() == typeid(int8_t)) {
+            std::vector<int8_t> out(static_cast<size_t>(total));
+            auto src = core::as_tensor<int8_t>(inputs[0]);
+            src->copyToCPU(m_cmdpool_);
+            for (int i = 0; i < total; ++i) {
+                out[static_cast<size_t>(i)] = (*src)[i];
+            }
+            auto output = core::as_tensor<int8_t>(outputs[0]);
+            output->resize(dim);
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPU(m_cmdpool_, out.data());
+            return;
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
