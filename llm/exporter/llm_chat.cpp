@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <cmath>
 #include <cstdlib>
+#include <chrono>
 
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
@@ -49,6 +50,7 @@
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
+using vkop::VulkanCommandBuffer;
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::core::as_tensor;
@@ -183,55 +185,71 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
 }
 
 // Copy present_key_values_{i} output → past_key_values_{i} input for the next
-// round. present shape is (1,2,NKV,kv_len,128); past for next round takes the
-// same shape (kv_len already includes the just-appended token).
+// round, entirely on the GPU (device→device, no CPU round-trip). present shape
+// is (1,2,NKV,kv_len,128); past for next round takes the same shape (kv_len
+// already includes the just-appended token). All 28 layers' copies are recorded
+// into ONE command buffer and submitted with a single wait — vs the old path
+// which did 28 separate copyToCPU+copyToGPU cycles (56 sync points).
+//
+// Both past and present buffers are pre-allocated to MAX_KV (see
+// preallocate_buffer in LoadModel setup), so ResizeInput on past keeps the
+// same physical VkBuffer (prealloc_keep_) and the device→device copy writes
+// the logical region into the reused buffer.
 void feedback_kv(const std::shared_ptr<Runtime>& rt,
                  const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool) {
+    auto dev = cmdpool->getVulkanDevice();
+    // First pass: derive kv_len + ResizeInput past (logical shape only; buffer
+    // reused via prealloc_keep_). Must happen before the copy pass because
+    // ResizeInput sets converted_=false (off-GPU), and as_storage_buffer below
+    // re-marks the buffer for the copy.
+    std::vector<int> kv_lens(NLAYERS);
     for (int i = 0; i < NLAYERS; ++i) {
-        std::string pres_name = "present_key_values_" + std::to_string(i);
-        std::string past_name = "past_key_values_" + std::to_string(i);
-        auto pres = rt->GetOutput(pres_name);
-        if (!pres) throw std::runtime_error("no output " + pres_name);
+        auto pres = rt->GetOutput("present_key_values_" + std::to_string(i));
         auto pres_t = as_tensor<uint16_t>(pres);
-        // present was copyToCPU'd by ReadResult; data() holds the bytes.
-        auto shape = pres_t->getShape();
-        if (std::getenv("VKOP_CHATDBG")) {
-            std::printf("[kvdbg] layer%d pres shape=[", i);
-            for (size_t k = 0; k < shape.size(); ++k) std::printf("%d ", shape[k]);
-            std::printf("] ne=%d first=", pres_t->num_elements());
-            if (pres_t->num_elements() > 0)
-                std::printf("%04x", (int)pres_t->data()[0]);
-            std::printf("\n");
-        }
-        // The recorded output shape may carry -1 (dynamic kv_len); derive the
-        // concrete shape from num_elements: (1,2,NKV,kv_len,128) where
-        // kv_len = ne / (2*NKV*128).
-        std::vector<uint32_t> u32shape;
-        u32shape.push_back(1);
-        u32shape.push_back(2);
-        u32shape.push_back(static_cast<uint32_t>(NKV));
         int kv_len = pres_t->num_elements() / (2 * NKV * HD);
-        u32shape.push_back(static_cast<uint32_t>(kv_len));
-        u32shape.push_back(static_cast<uint32_t>(HD));
-        if (std::getenv("VKOP_CHATDBG"))
-            std::printf("[kvdbg] layer%d derived kv_len=%d\n", i, kv_len);
-        // Resize + fill the past input with present's host data, then upload.
-        rt->ResizeInput(past_name, u32shape);
-        auto past = rt->GetInput(past_name);
-        auto past_t = as_tensor<uint16_t>(past);
-        if (past_t->num_elements() > 0) {
-            past_t->fillToCPU(pres_t->data().data());
-        }
-        upload_input(cmdpool, past);
-        if (std::getenv("VKOP_CHATDBG") && i == 0) {
-            // Read back the uploaded past to confirm the SSBO holds present's data.
-            past_t->copyToCPU(cmdpool);
-            std::printf("[kvdbg] layer0 past after upload: ne=%d first=%04x "
-                        "(expect %04x)\n", past_t->num_elements(),
-                        past_t->num_elements() ? (int)past_t->data()[0] : -1,
-                        pres_t->num_elements() ? (int)pres_t->data()[0] : -1);
-        }
+        kv_lens[i] = kv_len;
+        std::vector<uint32_t> u32shape = {
+            1u, 2u, static_cast<uint32_t>(NKV),
+            static_cast<uint32_t>(kv_len), static_cast<uint32_t>(HD)};
+        rt->ResizeInput("past_key_values_" + std::to_string(i), u32shape);
     }
+    // Single command buffer for all 28 layers' device→device copies.
+    VulkanCommandBuffer cmd(cmdpool);
+    cmd.begin();
+    for (int i = 0; i < NLAYERS; ++i) {
+        auto pres = as_tensor<uint16_t>(
+            rt->GetOutput("present_key_values_" + std::to_string(i)));
+        auto past = as_tensor<uint16_t>(
+            rt->GetInput("past_key_values_" + std::to_string(i)));
+        // as_storage_buffer reuses the pre-allocated VkBuffer (prealloc_keep_,
+        // size >= aligned). present: read barrier for the copy source; past:
+        // the copyStageBufferToBuffer call below adds the write barrier.
+        auto pres_buf = pres->as_storage_buffer(dev, nullptr);
+        auto past_buf = past->as_storage_buffer(dev, nullptr);
+        // present was written by the Concat compute shader last round; barrier
+        // it to TRANSFER_READ before the copy. size = logical bytes (kv_len
+        // region); the buffer is oversized but only the logical region holds
+        // valid data.
+        VkDeviceSize copy_bytes = static_cast<VkDeviceSize>(
+            2 * NKV * kv_lens[i] * HD * sizeof(uint16_t));
+        if (copy_bytes == 0) {
+            // kv_len==0 (shouldn't happen post-prefill, but guard anyway):
+            // nothing to copy, just mark past on-GPU.
+            continue;
+        }
+        pres_buf->transferReadBarrier(cmd.get(), copy_bytes, 0);
+        // past->copyStageBufferToBuffer barriers past to TRANSFER_WRITE, copies
+        // from present's VkBuffer, then restores past's access. The source is
+        // the present VkBuffer (already barriered above).
+        past_buf->copyStageBufferToBuffer(cmd.get(), pres_buf->getBuffer(),
+                                          0, copy_bytes, 0);
+        // past is now populated on the GPU; mark on-GPU so the next Run()'s
+        // input binding reuses the buffer without a host upload.
+        past->toGPU();
+    }
+    cmd.end();
+    cmd.submit(dev->getComputeQueue());
+    cmd.wait();  // single sync point for all 28 layers
 }
 
 // Build the causal attention_bias (1,1,q,kv) fp16: upper-triangular above the
@@ -407,6 +425,30 @@ int main(int argc, char** argv) {
     rt->LoadModel();
     std::printf("=== LoadModel done ===\n");
 
+    // Pre-allocate the KV-cache buffers (past_key_values_i inputs +
+    // present_key_values_i outputs) to a max size once, so they are NOT
+    // reallocated every round as kv_len grows by 1. Each buffer holds
+    // (1, 2, NKV, MAX_KV, HD) fp16 = 2*8*MAX_KV*128 elements. With
+    // prealloc_keep_, make_vkbuff reuses the buffer (>= check) and
+    // recreate_storage_buffer skips the drop. The logical shape is still
+    // set per-round via ResizeInput (past) / Concat's resize (present);
+    // only the physical VkBuffer is oversized. MAX_KV covers prefill L +
+    // max_new decode tokens with headroom.
+    {
+        auto dev = cmdpool->getVulkanDevice();
+        // A generous upper bound; prompts are short and max_new caps decode.
+        const int MAX_KV = 8192;
+        std::size_t kv_elems =
+            static_cast<std::size_t>(2) * NKV * MAX_KV * HD;
+        for (int i = 0; i < NLAYERS; ++i) {
+            auto pin = rt->GetInput("past_key_values_" + std::to_string(i));
+            auto pout = rt->GetOutput("present_key_values_" +
+                                      std::to_string(i));
+            as_tensor<uint16_t>(pin)->preallocate_buffer(dev, kv_elems);
+            as_tensor<uint16_t>(pout)->preallocate_buffer(dev, kv_elems);
+        }
+    }
+
     // Per-round reusable zero buffers (deepstack + decode attention_bias +
     // image_pad_mask). deepstack_embeds_{0,1,2}: (1, HIDDEN) fp16 zeros.
     std::vector<uint16_t> ds_zero(HIDDEN, 0);
@@ -540,8 +582,11 @@ int main(int argc, char** argv) {
         std::printf("  upload ok, calling Run()...\n"); std::fflush(stdout);
 
         double ms = rt->Run();
-        std::printf("  Run done %.1fms, ReadResult...\n", ms); std::fflush(stdout);
-        rt->ReadResult();
+        std::printf("  Run done %.1fms\n", ms); std::fflush(stdout);
+        // Wait for GPU compute to finish, but do NOT ReadResult() — that would
+        // copyToCPU all 28 present_kv outputs (28 sync points) which we don't
+        // need: feedback_kv does device→device, and argmax reads only logits.
+        cmdpool->getVulkanDevice()->wait_all_done();
 
         // Optional named-intermediate dump (mirrors llm_driver's VKOP_DUMP_TENSORS).
         // VKOP_DUMP_ROUND=0 restricts to prefill; "*" dumps every fp16 tensor.
@@ -683,12 +728,19 @@ int main(int argc, char** argv) {
                 upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
             upload_input(cmdpool, rt->GetInput("image_pad_mask"));
 
+            auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
-            rt->ReadResult();
+            // Skip ReadResult (28 present_kv copyToCPU). argmax reads logits
+            // (self-syncing transferReadBarrier+wait); feedback_kv is
+            // device→device. One device wait ensures Run's shaders finished.
+            cmdpool->getVulkanDevice()->wait_all_done();
+            auto t1 = std::chrono::steady_clock::now();
             next_id = argmax_last_token(rt, cmdpool);
             out_ids.push_back(static_cast<uint32_t>(next_id));
-            std::printf("[r%d] %.1fms  past_len=%d pos=%lld  → %d  %s\n", step, ms,
-                        past_len, (long long)(past_len + rope_delta), next_id,
+            double run_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            std::printf("[r%d] %.1fms  past_len=%d pos=%lld  → %d  %s\n", step,
+                        run_ms, past_len, (long long)(past_len + rope_delta),
+                        next_id,
                         tok.decode({static_cast<uint32_t>(next_id)}).c_str());
             std::fflush(stdout);
 

@@ -54,6 +54,11 @@ class ITensor {
     bool get_transpose() const { return transpose_; }
     void set_pack() { pack_ = true; }
     bool get_pack() const { return pack_; }
+    // Mark this tensor's GPU buffer as pre-allocated to a max size; subsequent
+    // make_vkbuff calls reuse the buffer as long as it is large enough (>=)
+    // rather than requiring an exact size match. See prealloc_keep_ doc.
+    void set_prealloc_keep() { prealloc_keep_ = true; }
+    bool get_prealloc_keep() const { return prealloc_keep_; }
     // Per-row element count padded onto the GPU buffer's row stride beyond the
     // logical cols. When >0, the GPU wrote the buffer with a packed row stride
     // of (logical_cols + gpu_row_pad_) and copyBufferToCPU must compact it back
@@ -245,6 +250,15 @@ class ITensor {
     bool transpose_ = false;
     bool pack_ = false;
     bool converted_ = false;
+    // When true, make_vkbuff reuses an existing VkBuffer as long as it is
+    // LARGE ENOUGH (>= aligned) rather than requiring an exact size match.
+    // Used by the LLM KV-cache: past/present buffers are pre-allocated to
+    // max_kv_len once, then each round the logical kv_len grows by 1 but the
+    // physical buffer stays the same (shaders write only the logical region
+    // bounded by push-constant dims + dispatch count, so over-allocation is
+    // safe). Without this, make_vkbuff would drop and reallocate the buffer
+    // every round because aligned changes as kv_len grows.
+    bool prealloc_keep_ = false;
     // 64bytes here
     int gpu_row_pad_ = 0;
 };
@@ -478,11 +492,56 @@ template <typename T> class Tensor : public ITensor {
     // created a buffer sized to the model's recorded (symbolic) dims. Leaves
     // the tensor off-GPU so the caller's copyToGPU() actually performs the
     // upload (otherwise is_on_GPU() short-circuits it).
+    //
+    // When prealloc_keep_ is set (KV-cache buffers pre-allocated to
+    // max_kv_len), do NOT drop the buffer — only re-mark off-GPU so the
+    // caller's copyToGPU uploads into the existing oversized buffer.
+    // make_vkbuff would reuse it anyway (>= check), but resetting converted_ is
+    // the point: the logical shape changed so the host data must be
+    // re-uploaded.
     void recreate_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
+        if (prealloc_keep_ && vkobj_) {
+            converted_ = false;
+            return;
+        }
         vkobj_.reset();
         converted_ = false;
         make_vkbuff(vd, STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    }
+
+    // Pre-allocate the backing SSBO to hold `n_elements` items (rounded up to
+    // the 4-element alignment make_vkbuff uses), and mark the tensor so future
+    // make_vkbuff calls reuse this buffer as long as it is large enough (>=).
+    // The tensor's logical dims/size_ are NOT changed — only the physical
+    // buffer is oversized. Used by the LLM KV-cache: allocate once to
+    // max_kv_len so the buffer isn't reallocated every round as kv_len grows
+    // by 1. After this call the tensor is on-GPU with an oversized buffer; the
+    // producing op (Concat) writes only the logical region (bounded by
+    // push-constant outDims + dispatch count), so the tail beyond logical size
+    // is inert.
+    void preallocate_buffer(std::shared_ptr<VulkanDevice> &vd,
+                            std::size_t n_elements) {
+        prealloc_keep_ = true;
+        auto aligned = sizeof(T) * UP_DIV(n_elements, 4) * 4;
+        if (aligned == 0)
+            aligned = 16;
+        if (vkobj_) {
+            auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+            if (buff && buff->getSize() >= aligned) {
+                return;
+            }
+            vkobj_.reset();
+        }
+        vkobj_ = std::make_shared<VulkanBuffer>(
+            vd, aligned,
+            STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        // Leave converted_=false: the buffer is allocated but not yet filled.
+        // resize() will reserveOnCPU (since !is_on_GPU()), and the caller's
+        // copyToGPU uploads real data. recreate_storage_buffer keeps the
+        // buffer (prealloc_keep_) and only re-marks converted_=false.
     }
 
     std::shared_ptr<VulkanBuffer>
@@ -639,7 +698,7 @@ template <typename T> class Tensor : public ITensor {
         } else {
             copyToGPUBuffer(cmdpool, data ? data : data_->data());
         }
-        if (!data) {
+        if (!data && data_) {
             data_->clear();
             data_->shrink_to_fit();
         }
@@ -849,16 +908,23 @@ template <typename T> class Tensor : public ITensor {
         // past_key_values) get a minimal dummy buffer so creation succeeds.
         if (aligned == 0)
             aligned = 16;
-        // Reuse an existing buffer only if its size matches. A tensor whose
-        // backing was created for a smaller shape (e.g. the dummy 16-byte
-        // buffer allocated when kv_len=0) MUST be reallocated when the tensor
-        // is later resized to hold real data (kv_len>=1 decode rounds) —
-        // otherwise the shader writes past the end and downstream reads zero
-        // padding, silently corrupting the KV-cache.
+        // Reuse an existing buffer when its size is sufficient. By default
+        // require an EXACT match (a buffer created for a smaller shape, e.g.
+        // the 16-byte dummy for kv_len=0, MUST be reallocated when the tensor
+        // later holds real data — otherwise the shader writes past the end and
+        // downstream reads zero padding, silently corrupting the KV-cache).
+        // With prealloc_keep_ (LLM KV-cache buffers pre-allocated to
+        // max_kv_len), reuse as long as the buffer is large enough (>=): the
+        // logical kv_len grows by 1 each round but the physical buffer stays
+        // the same; shaders write only the logical region bounded by
+        // push-constant dims + the dispatch count, so over-allocation is safe.
         if (vkobj_) {
             auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
-            if (buff && buff->getSize() == aligned) {
-                return;
+            if (buff) {
+                if (prealloc_keep_ ? (buff->getSize() >= aligned)
+                                   : (buff->getSize() == aligned)) {
+                    return;
+                }
             }
             vkobj_.reset();
         }
