@@ -232,8 +232,18 @@ ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图�
 `llm_chat.cpp` 是 vkop（Vulkan ONNX runtime）的端到端对话驱动：文本输入 →
 tokenize → prefill（q_len=L）→ 逐 token greedy decode（q_len=1）→ detokenize 输出。
 不依赖 PyTorch / ONNX Runtime，只用 `llm.vkopbin`（转换后的 vkop 图）+
-`embed_tokens.bin`（host 端 embedding 查表）+ tokenizer。**纯文本场景**（无图像），
-MRoPE 三轴位置都取 `0..L-1`，`image_pad_mask` 全 false，`deepstack_embeds` 全零。
+`embed_tokens.bin`（host 端 embedding 查表）+ tokenizer。
+
+支持**多模态**（`--image` + `--visual`）：加载图片 → C++ 图像预处理（`image_preproc.hpp`）
+→ 跑 `visual.vkopbin` 取 image_features + 3 个 deepstack 特征 → scatter 进
+`inputs_embeds` 的 `<|image_pad|>` 位置 → `get_rope_index` 算 3 轴 MRoPE
+position_ids + rope_delta。decode 用 `position_ids = past_len + rope_delta`。
+纯文本场景（无 `--image`）三轴位置都取 `0..L-1`，`image_pad_mask` 全 false，
+`deepstack_embeds` 全零，rope_delta=0。
+
+**多模态输出已验证与 ORT 参考逐 token 一致**：合成 224×224 绿色图 +
+"What color is the image?" → `[6176, 151645]` = " green"，rope_delta=-42
+（单图 grid [1,14,14]）。详见 memory `int8-dtype-propagation-multimodal`。
 
 ### 构建
 
@@ -251,11 +261,12 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
 ### 运行
 
 ```bash
-./build/llm_chat <model.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new]
+./build/llm_chat <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new] \
+  [--image <img> --visual <visual.vkopbin>]
 # 然后在 stdin 输入 prompt，回车提交，Ctrl-D 退出
 ```
 
-具体路径（从仓库根）：
+纯文本（从仓库根）：
 
 ```bash
 ./build/llm_chat \
@@ -264,12 +275,29 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
   llm/tokenizer/qwen3_vl.bin
 ```
 
+多模态（单图，整轮会话共用一张图）：
+
+```bash
+./build/llm_chat \
+  llm/exporter/llm.vkopbin \
+  llm/exporter/embed_tokens.bin \
+  llm/tokenizer/qwen3_vl.bin \
+  --image llm/exporter/synth224.png \
+  --visual llm/exporter/visual.vkopbin
+```
+
 | 参数 | 含义 |
 |---|---|
-| `model.vkopbin` | 转换后的 vkop 模型（~3.4GB） |
+| `llm.vkopbin` | 转换后的 vkop LLM 图（~3.4GB） |
 | `embed_tokens.bin` | token→hidden 查表（fp16 `[151936,2048]`，~590MB） |
 | `tokenizer.bin` | BBPE 词表（`tokenizer_to_bin.py` 产物） |
 | `max_new`（可选） | 最大生成 token 数（含 prefill 后的全部 decode），默认 **64** |
+| `--image <img>` | 输入图片路径（多模态；需配合 `--visual`）。整会话共用一张图 |
+| `--visual <vkopbin>` | 视觉编码器 vkop 图（`visual.vkopbin`，~770MB）。多模态必需 |
+
+> 多模态约束：图片尺寸必须是 `patch_size*merge = 16*2 = 32` 的整数倍
+> （224×224 → grid [1,14,14] → n_img=49 个图像 token），否则 `image_preproc`
+> 报 "not divisible by patch*merge"。不同尺寸需重新导出 `visual.onnx` 并转换。
 
 启动时加载模型 + embedding + tokenizer（~2s），之后每轮 prefill/decode 约 1.5–2s
 （Intel ARL，buffer backend，fp16）。遇到 `<|im_end|>`（151645）自动停止当前轮。
@@ -298,6 +326,17 @@ echo "Hello" | VKOP_RAW_PROMPT=1 ./build/llm_chat \
   llm/exporter/llm.vkopbin llm/exporter/embed_tokens.bin \
   llm/tokenizer/qwen3_vl.bin 6
 # → 358,1184,311,3270,264,2805  ("I need to write a short")
+
+# 多模态（单图问答）
+printf 'What color is the image? Answer in one word.' | \
+  ./build/llm_chat llm/exporter/llm.vkopbin \
+  llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 8 \
+  --image llm/exporter/synth224.png --visual llm/exporter/visual.vkopbin
+# → [prompt] 70 tokens (image tokens 4..52)
+#   position_ids ok (rope_delta=-42)
+#   [prefill] → token 6176   green
+#   [r1] pos=28 → 151645  <|im_end|>
+#   green<|im_end|>
 ```
 
 ### decode 轮数限制
@@ -351,8 +390,10 @@ token 数 = `max_new - 1`。默认 64 → prefill 后最多再生成 63 个 deco
 - **仅 greedy**：无 temperature/top-p 采样，与 `Qwen3VLInference` 的 `do_sample=True`
   路径不等价。logits 已与 ORT 对齐（见 memory `llm-chat-generate-loop`），接入采样器
   后分布一致，但驱动本身未实现采样。
-- **仅纯文本**：v1 不处理图像（`image_pad_mask` 全 false、`deepstack_embeds` 全零、
-  MRoPE 三轴同值）。多模态需先跑 `visual.vkopbin` 取 deepstack 特征 + `get_rope_index`
-  算 3D 位置。
-- **单轮对话**：每次 prompt 独立 prefill（不复用上一轮的 KV cache 作为新轮的 past）。
-  真正的多轮需把上一轮 `present_kv` 喂回下一轮 prefill 的 `past_kv`，驱动目前未做。
+- **单图整会话**：`--image` 指定的图片对整个会话（所有轮次）生效；不支持中途换图，
+  也不支持一轮里多张图。多图需扩展 `expand_image_token` + 多组 deepstack 特征。
+- **视觉尺寸固定**：图片必须是 32 的整数倍（224×224 默认），且 `visual.vkopbin`
+  的 grid_thw 在导出时固化（见上文「视觉编码器」节）。不同尺寸需重新导出 + 转换。
+- **单轮对话（KV 不跨轮复用）**：每次 prompt 独立 prefill（不复用上一轮的 KV cache
+  作为新轮的 past）。多模态下每轮都重新 scatter 图像特征 + 重算 rope_delta。真正的
+  多轮需把上一轮 `present_kv` 喂回下一轮 prefill 的 `past_kv`，驱动目前未做。
