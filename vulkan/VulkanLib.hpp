@@ -95,6 +95,7 @@ namespace vkop {
     PFN(vkGetSemaphoreCounterValue)                                            \
     PFN(vkDestroySemaphore)                                                    \
     PFN(vkCmdFillBuffer)                                                       \
+    PFN(vkCmdUpdateBuffer)                                                     \
     PFN(vkCmdPushConstants)                                                    \
     PFN(vkWaitSemaphores)                                                      \
     PFN(vkResetFences)                                                         \

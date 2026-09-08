@@ -440,7 +440,9 @@ class Operator {
         pipeline_->freeDescriptorSets(ds);
     }
 
-  private:
+  protected:
+    // fillWriteDescriptorSets is overridden by façade ops (e.g. Gather's int64
+    // submit override calls it to bind the int64 pipeline's descriptor set).
     virtual void fillWriteDescriptorSets(VkDescriptorSet ds) {
         for (size_t i = 0; i < types_.size(); i++) {
             writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;

@@ -222,6 +222,11 @@ class ReshapeBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto in_shape = inputs[0]->getShape();
         auto shape = core::as_tensor<int64_t>(inputs[1]);
+        // The shape input may be GPU-resident only (produced by the int64
+        // Concat/Gather GPU shader in a prior level). Read it back so data_ is
+        // populated for the (*shape)[i] access below — same pattern as
+        // Unsqueeze/Slice/Cast/Expand. No-op (reserveOnCPU) if host-only.
+        shape->copyToCPU(m_cmdpool_);
         int n = shape->num_elements();
         std::vector<int> dim(n);
         for (int i = 0; i < n; ++i) {

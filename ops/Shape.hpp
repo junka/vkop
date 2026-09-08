@@ -9,9 +9,16 @@
 // CPU-only op: ONNX Shape. Outputs a 1-D int64 tensor holding the input's
 // dims. All 358 Shape nodes in llm.vkopbin read float/fp16 GPU-produced
 // data but only need getShape() (host metadata), so no shader is required —
-// the output is filled on the host and uploaded to the GPU SSBO for any
-// downstream int64 consumers (all of which read it via as_tensor<int64_t>()
-// on the CPU copy).
+// the output is filled on the host and uploaded to the GPU SSBO.
+//
+// Perf: this is the #1 decode bottleneck (804ms/round, 46% of the 1.75s —
+// measured via VKOP_OPPROF). The cost was the synchronous copyToGPU upload
+// (cmd.submit()+cmd.wait() per call, ~2.66ms × 302 calls) of a 32-64 byte
+// payload. We now upload NON-synchronously via vkCmdUpdateBuffer recorded
+// into the level's command buffer (m_cmd_) — no staging pool, no submit+wait.
+// The copy executes when the level submits, batched with all other ops.
+// Data is GPU-resident (safe for GPU consumers like the int64 Gather shader)
+// but costs ~0 to upload.
 namespace vkop {
 namespace ops {
 
@@ -29,11 +36,20 @@ class Shape : public Operator {
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(std::vector<int>{static_cast<int>(shape.size())});
         output->fillToCPU(dims);
+        // Create/reuse the SSBO, then upload non-synchronously into the level
+        // command buffer (no submit+wait stall). The explicit src in fillToCPU
+        // keeps data_ populated for copyToGPUDeferred and for downstream
+        // as_tensor<int64_t>() CPU readers.
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-        // Explicit src keeps the CPU copy alive for downstream as_tensor<>()
-        // readers; without it copyToGPU would clear data_ after upload.
-        output->copyToGPU(m_cmdpool_, dims.data());
+        output->copyToGPUDeferred(m_cmd_);
     }
+
+    // Shape is CPU-only (no pipeline/spv, no submit()). Its output changes
+    // every round (kv_len grows -> getShape() differs), so it must NOT be
+    // replay-cached — the record-once-replay state machine (keyed on submit()
+    // fingerprints) would see an empty fingerprint, mark it CACHED, and skip
+    // execute() on later rounds, leaving the output stale. Refuse replay.
+    void enable_replay(bool /*v*/) override { replay_enabled_ = false; }
 };
 
 } // namespace ops

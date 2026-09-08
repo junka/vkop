@@ -13,6 +13,8 @@ extern unsigned char buffer_gather_spv[];
 extern unsigned int buffer_gather_spv_len;
 extern unsigned char buffer_gather_fp16_spv[];
 extern unsigned int buffer_gather_fp16_spv_len;
+extern unsigned char buffer_gather_int64_spv[];
+extern unsigned int buffer_gather_int64_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -53,6 +55,85 @@ class Gather : public Operator {
         if (attributes.find("axis") != attributes.end()) {
             auto axis = std::stol(attributes.at("axis"));
             param_.axis = axis;
+        }
+    }
+
+    // Build the int64-data pipeline lazily on first int64 execute. The int64
+    // shader (gather_int64.comp) has the same descriptor layout (3× STORAGE)
+    // and PC layout as the fp32 gather, so it builds from the same types_/
+    // pc_size_; only the spv differs. Descriptor sets are allocated from the
+    // int64 pipeline (sets are pool-specific to a pipeline layout).
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_)
+            return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_,
+            reinterpret_cast<const uint32_t *>(buffer_gather_int64_spv),
+            buffer_gather_int64_spv_len, use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+    }
+
+    // Route the int64-data path through the int64 GPU shader instead of the
+    // CPU cpuComputeInt64 path. Same indexing math, but the data/output are
+    // int64 SSBOs (bound as ivec2[] in the shader — see gather_int64.comp).
+    // Eliminates the 2× copyToCPU + copyToGPU sync stalls (~665ms/round).
+    void
+    gpuGatherInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                   const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                   const std::vector<int> &out_shape) {
+        ensure_int64_pipeline();
+        int64_mode_ = true;
+
+        // Output SSBO (int64 as ivec2 — 8 bytes/elem, same stride).
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        // Data input SSBO.
+        auto data = core::as_tensor<int64_t>(inputs[0]);
+        objs_.emplace_back(data->as_storage_buffer(m_dev_, nullptr));
+        // Indices input SSBO (int64 indices, also ivec2 in-shader).
+        auto indices = core::as_tensor<int64_t>(inputs[1]);
+        objs_.emplace_back(indices->as_storage_buffer(m_dev_, nullptr));
+
+        auto inshape = inputs[0]->getShape();
+        auto indshape = inputs[1]->getShape();
+        param_.idims = inshape.size();
+        param_.nindex = indshape.size();
+        fill_dims(param_.inShape, inshape);
+        fill_dims(param_.indicesShape, indshape);
+        fill_dims(param_.outShape, out_shape);
+        param_.odims = out_shape.size();
+        auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
+                                          std::multiplies<>());
+        submit(&param_, UP_DIV(total_size, 256), 1, 1);
+        int64_mode_ = false;
+    }
+
+    // When in int64 mode, bind the int64 pipeline + its descriptor sets
+    // instead of the base fp32/fp16 pipeline. The base submit() hardcodes
+    // pipeline_/m_ds_; this override redirects them for the int64 dispatch.
+    void submit(void *ptr, int width, int height, int layers) override {
+        if (!int64_mode_) {
+            Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (!m_ds_int64_[m_id_]) {
+            m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+        pipeline_int64_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_int64_,
+                                   static_cast<uint32_t>(pc_size_), ptr);
+        }
+        m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
         }
     }
 
@@ -209,11 +290,12 @@ class Gather : public Operator {
         std::vector<int> out_shape =
             calculateGatherOutputShape(inshape, indshape, param_.axis);
 
-        // int64 data flows through a synchronous CPU path (see
-        // cpuComputeInt64); all 352 int64 gathers in the LLM are part of the
-        // shape/position meta-chain.
+        // int64 data: GPU shader path (gather_int64.comp). Previously this was
+        // a synchronous CPU path (cpuComputeInt64: 2× copyToCPU + host loop +
+        // copyToGPU = 3 sync stalls, ~665ms/round — the #1 decode bottleneck).
+        // The GPU dispatch records into the level command buffer with no stall.
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            cpuComputeInt64(inputs, outputs);
+            gpuGatherInt64(inputs, outputs, out_shape);
             return;
         }
 
@@ -263,6 +345,11 @@ class Gather : public Operator {
     }
 
     gather::GpuGatherParam param_;
+
+    // int64-data GPU path state. Lazily built on first int64 execute.
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
+    bool int64_mode_ = false;
 };
 
 } // namespace ops

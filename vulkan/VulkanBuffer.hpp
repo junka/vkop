@@ -65,6 +65,17 @@ class VulkanBuffer : public VulkanResource {
                                  VkBuffer srcbuffer, VkDeviceSize srcoffset,
                                  VkDeviceSize size, VkDeviceSize offset = 0);
 
+    // Copy up to 65536 bytes of host data directly into this buffer during
+    // command recording via vkCmdUpdateBuffer — NO staging buffer, NO staging
+    // pool, NO submit+wait. The driver copies the data inline into the command
+    // buffer (or defers it), so `data` must remain valid only for the duration
+    // of this call (not until submit). Used by CPU-only shape-meta producers
+    // (Shape) whose tiny outputs (32-64 bytes) don't justify a synchronous
+    // copyToGPU pipeline stall. Transitions to TRANSFER_WRITE then back to the
+    // prior access (shader read).
+    void updateBuffer(VkCommandBuffer commandBuffer, const void *data,
+                      VkDeviceSize size, VkDeviceSize offset = 0);
+
     void *getMappedMemory() {
 #ifdef USE_VMA
         return VMA::getMappedMemory(&m_vma_buffer_);

@@ -151,14 +151,29 @@ class SliceBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
+        // starts/ends/axes/steps (inputs[1..4]) are int64 shape-meta tensors
+        // that may be GPU-resident only (produced by the int64 Concat/Gather
+        // GPU shader in a prior level). Read them back before .data() — same
+        // pattern as the data input below.
+        auto starts_t = core::as_tensor<int64_t>(inputs[1]);
+        starts_t->copyToCPU(m_cmdpool_);
+        auto ends_t = core::as_tensor<int64_t>(inputs[2]);
+        ends_t->copyToCPU(m_cmdpool_);
+        std::vector<int64_t> axes_vec;
+        if (inputs.size() > 3) {
+            auto axes_t = core::as_tensor<int64_t>(inputs[3]);
+            axes_t->copyToCPU(m_cmdpool_);
+            axes_vec = axes_t->data();
+        }
+        std::vector<int64_t> steps_vec;
+        if (inputs.size() > 4) {
+            auto steps_t = core::as_tensor<int64_t>(inputs[4]);
+            steps_t->copyToCPU(m_cmdpool_);
+            steps_vec = steps_t->data();
+        }
         std::vector<std::vector<int>> out_size =
             slice_calc::calculate_output_shape<int64_t>(
-                inshape, core::as_tensor<int64_t>(inputs[1])->data(),
-                core::as_tensor<int64_t>(inputs[2])->data(),
-                inputs.size() > 3 ? core::as_tensor<int64_t>(inputs[3])->data()
-                                  : std::vector<int64_t>{},
-                inputs.size() > 4 ? core::as_tensor<int64_t>(inputs[4])->data()
-                                  : std::vector<int64_t>{});
+                inshape, starts_t->data(), ends_t->data(), axes_vec, steps_vec);
 
         // int64 data: CPU slice (part of the shape meta-chain). Walk the
         // output linearly; each output coordinate maps to an input coordinate

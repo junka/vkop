@@ -85,9 +85,18 @@ class Range : public Operator {
         // max(0, ceil((limit-start)/delta)) with the div rounding away from
         // zero per ONNX (delta and limit-start always share sign in practice).
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            auto start = core::as_tensor<int64_t>(inputs[0])->at(0);
-            auto limit = core::as_tensor<int64_t>(inputs[1])->at(0);
-            auto delta = core::as_tensor<int64_t>(inputs[2])->at(0);
+            // Inputs may be GPU-resident only (produced by the int64
+            // Concat/Gather GPU shader in a prior level); read back before
+            // at(0). Same pattern as the fp32 path above.
+            auto start_t = core::as_tensor<int64_t>(inputs[0]);
+            start_t->copyToCPU(m_cmdpool_);
+            auto limit_t = core::as_tensor<int64_t>(inputs[1]);
+            limit_t->copyToCPU(m_cmdpool_);
+            auto delta_t = core::as_tensor<int64_t>(inputs[2]);
+            delta_t->copyToCPU(m_cmdpool_);
+            auto start = start_t->at(0);
+            auto limit = limit_t->at(0);
+            auto delta = delta_t->at(0);
             int64_t range = limit - start;
             int64_t inums = 0;
             if (range == 0) {

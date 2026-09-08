@@ -447,6 +447,19 @@ template <typename T> class Tensor : public ITensor {
         return static_cast<int>(vkobj_->getResourceType());
     }
 
+    // Drop any backing GPU buffer/image and mark the tensor host-only. Used by
+    // CPU-only shape-meta producers (Shape) whose output is consumed ONLY via
+    // copyToCPU() by downstream int64 ops: leaving vkobj_ null makes those
+    // consumers take the !vkobj_ fast path (reserveOnCPU only, no submit+wait
+    // stall), instead of reading back the very data we just uploaded. Must be
+    // called AFTER fillToCPU() so data_ is populated, and clears a stale
+    // vkobj_ left on a recycled tensor by a previous round's GPU path.
+    void detach_gpu() {
+        vkobj_.reset();
+        vkobj_ = nullptr;
+        toCPU();
+    }
+
     T &operator[](std::size_t index) { return (*data_)[index]; }
 
     const T &operator[](std::size_t index) const { return (*data_)[index]; }
@@ -484,6 +497,34 @@ template <typename T> class Tensor : public ITensor {
             buff->readBarrier(cmd->get());
         }
         return buff;
+    }
+
+    // Upload host data (data_) into the backing SSBO NON-synchronously: records
+    // a vkCmdUpdateBuffer into the given command buffer (the level's m_cmd_),
+    // which executes when the level submits — no per-op submit+wait stall. Used
+    // by CPU-only shape-meta producers (Shape) whose tiny outputs (<=64KB) are
+    // read by GPU consumers (e.g. the int64 Gather shader) and must be
+    // GPU-resident, but don't justify a synchronous copyToGPU pipeline flush.
+    // The caller must have already called as_storage_buffer()/make_vkbuff so
+    // vkobj_ exists. No-op if the tensor is empty or exceeds the 65536-byte
+    // vkCmdUpdateBuffer limit (caller falls back to copyToGPU for those).
+    void copyToGPUDeferred(const std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        if (!vkobj_ || size_ == 0 || size_ > 65536) {
+            toGPU();
+            return;
+        }
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        if (!buff) {
+            return;
+        }
+        // data_ must hold the host data to upload. If it's empty (e.g. the
+        // tensor was filled then data_ cleared), fall back to sync upload.
+        if (!data_ || data_->empty()) {
+            return;
+        }
+        buff->updateBuffer(cmd->get(), data_->data(),
+                           static_cast<VkDeviceSize>(size_));
+        toGPU();
     }
 
     // Recreate the backing SSBO at the tensor's *current* dims/size, dropping

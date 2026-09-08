@@ -64,6 +64,10 @@ class SplitImage : public Operator {
         std::vector<int64_t> split_vec;
         if (inputs.size() > 1) {
             auto split = core::as_tensor<int64_t>(inputs[1]);
+            // The split input may be GPU-resident only (produced by the int64
+            // Concat/Gather GPU shader in a prior level); read back before the
+            // direct (*split)[i] access. No-op if host-only.
+            split->copyToCPU(m_cmdpool_);
             split_vec.resize(split->num_elements());
             for (size_t i = 0; i < split_vec.size(); i++) {
                 split_vec[i] = (*split)[i];
@@ -166,6 +170,7 @@ class SplitBuffer : public BufferFactory {
         std::vector<int64_t> split_vec;
         if (inputs.size() > 1) {
             auto split = core::as_tensor<int64_t>(inputs[1]);
+            split->copyToCPU(m_cmdpool_);
             split_vec.resize(split->num_elements());
             for (size_t i = 0; i < split_vec.size(); ++i) {
                 split_vec[i] = (*split)[i];

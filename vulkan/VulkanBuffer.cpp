@@ -253,4 +253,21 @@ void VulkanBuffer::fillBuffer(VkCommandBuffer commandBuffer, uint32_t value,
     vkCmdFillBuffer(commandBuffer, buffer, offset, size, value);
     transferBarrier(commandBuffer, old_access, size, offset);
 }
+
+void VulkanBuffer::updateBuffer(VkCommandBuffer commandBuffer, const void *data,
+                                VkDeviceSize size, VkDeviceSize offset) {
+    // vkCmdUpdateBuffer copies host data directly into the buffer during
+    // command recording (no staging buffer). Limited to 65536 bytes per call
+    // (Vulkan spec); Shape outputs are 32-64 bytes, well within range. The
+    // driver captures the data inline, so `data` need not survive past this
+    // call.
+    assert(size <= 65536);
+    VkAccessFlags old_access = m_access_;
+    if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
+        transferWriteBarrier(commandBuffer, size, offset);
+    }
+    VkBuffer buffer = getBuffer();
+    vkCmdUpdateBuffer(commandBuffer, buffer, offset, size, data);
+    transferBarrier(commandBuffer, old_access, size, offset);
+}
 } // namespace vkop

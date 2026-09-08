@@ -15,6 +15,8 @@ extern unsigned char buffer_concat_spv[];
 extern unsigned int buffer_concat_spv_len;
 extern unsigned char buffer_concat_fp16_spv[];
 extern unsigned int buffer_concat_fp16_spv_len;
+extern unsigned char buffer_concat_int64_spv[];
+extern unsigned int buffer_concat_int64_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -184,6 +186,82 @@ class ConcatBuffer : public BufferFactory {
     }
 
   private:
+    // Build the int64-data pipeline lazily on first int64 execute. The int64
+    // shader (concat_int64.comp) has the same descriptor layout (2x STORAGE)
+    // and PC layout (ConcatPC) as the fp32 concat, so it builds from the same
+    // types_/pc_size_; only the spv differs.
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_)
+            return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_,
+            reinterpret_cast<const uint32_t *>(buffer_concat_int64_spv),
+            buffer_concat_int64_spv_len, use_uab, required_subgroup_size_);
+    }
+
+    // Route the int64 path through the int64 GPU shader (concat_int64.comp).
+    // Same per-input submit pattern as the fp32 path (bind output + one input,
+    // dispatch that input's element count), but data/output are int64 SSBOs
+    // (bound as ivec2[] in-shader). Eliminates the N x copyToCPU + copyToGPU
+    // sync stalls (~1940ms/round, the #1 decode bottleneck). The output is
+    // GPU-resident only (data_ NOT populated); downstream int64 CPU readers
+    // (Reshape/Slice/Range/Split) call copyToCPU themselves to read it back,
+    // the same way they consume the int64 Gather shader's GPU output.
+    void
+    gpuConcatInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                   const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                   const std::vector<int> &out_shape) {
+        ensure_int64_pipeline();
+        int rank = static_cast<int>(out_shape.size());
+
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (output->num_elements() != total_elems(out_shape)) {
+            output->resize(out_shape);
+        }
+        auto out_buf = output->as_storage_buffer(m_dev_, m_cmd_);
+
+        int n_inputs = static_cast<int>(inputs.size());
+        std::vector<VkDescriptorSet> pass_ds(n_inputs);
+        for (int i = 0; i < n_inputs; ++i) {
+            pass_ds[i] = pipeline_int64_->allocDescriptorSets();
+        }
+
+        int offset = 0;
+        for (int i = 0; i < n_inputs; ++i) {
+            auto in_shape = inputs[i]->getShape();
+            int in_total = total_elems(in_shape);
+            auto input = core::as_tensor<int64_t>(inputs[i]);
+            auto in_buf = input->as_storage_buffer(m_dev_, nullptr);
+
+            objs_.clear();
+            objs_.emplace_back(out_buf);
+            objs_.emplace_back(in_buf);
+
+            ConcatPC pc{};
+            pc.axis = axis_;
+            pc.rank = rank;
+            fill_dims(pc.inDims, in_shape);
+            fill_dims(pc.outDims, out_shape);
+            pc.offset = offset;
+
+            fillWriteDescriptorSets(pass_ds[i]);
+            pipeline_int64_->updateDescriptorSets(writes_);
+            m_cmd_->bind(*pipeline_int64_, pass_ds[i]);
+            m_cmd_->push_constants(*pipeline_int64_,
+                                   static_cast<uint32_t>(pc_size_), &pc);
+            m_cmd_->dispatch(UP_DIV(in_total, 256), 1, 1);
+            if (replay_enabled_) {
+                record_fingerprint(&pc, UP_DIV(in_total, 256), 1, 1);
+            }
+            offset += in_shape[axis_];
+        }
+        for (int i = 0; i < n_inputs; ++i) {
+            pipeline_int64_->freeDescriptorSets(pass_ds[i]);
+        }
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -197,65 +275,13 @@ class ConcatBuffer : public BufferFactory {
             out_shape[axis_] += s[axis_];
         }
 
-        // int64 concat runs on the CPU (part of the shape meta-chain). All
-        // inputs are CPU-resident during recording, so a direct 1:1 copy of
-        // each input's contiguous data into the output at the axis offset is
-        // equivalent to a strided GPU concat.
+        // int64 concat: GPU shader path (concat_int64.comp). Previously this
+        // was a synchronous CPU path (copyToCPU per input + host strided-copy
+        // loop + copyToGPU = N+1 sync stalls, ~1940ms/round — the #1 decode
+        // bottleneck after Shape/Gather were GPU-ified). The GPU dispatch
+        // records into the level command buffer with no stall.
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            int total = total_elems(out_shape);
-            std::vector<int64_t> out(total);
-            std::vector<int> out_stride(rank, 1);
-            for (int i = rank - 2; i >= 0; --i) {
-                out_stride[i] = out_stride[i + 1] * out_shape[i + 1];
-            }
-            // Per-input strides (row-major). Used to decode each input's linear
-            // index into per-axis coordinates, then re-encode against the
-            // OUTPUT strides (with the axis offset added) — correct for ANY
-            // concat axis, including the last-axis case where inputs interleave
-            // ([...,1]+[...,1]+[...,1] -> [...,3]). The old in_stride-only math
-            // assumed axis was the last dim and overlapped inputs otherwise.
-            int offset = 0;
-            for (const auto &in : inputs) {
-                auto in_shape = in->getShape();
-                int in_total = total_elems(in_shape);
-                int in_axis = in_shape[axis_];
-                std::vector<int> in_str(rank, 1);
-                for (int i = rank - 2; i >= 0; --i) {
-                    in_str[i] = in_str[i + 1] * in_shape[i + 1];
-                }
-                auto src = core::as_tensor<int64_t>(in);
-                // Unconditional readback: a cross-round-recycled GPU input
-                // may have stale CPU data_ (see SqueezeUnsqueeze/
-                // ScatterElements fix).
-                src->copyToCPU(m_cmdpool_);
-                // Guard against a shape-meta tensor whose recorded dims_ claim
-                // elements (in_total>0) but whose backing buffer is empty
-                // (num_elements()==0, e.g. a seq=0 slice whose logical view was
-                // reshaped to [1]). Reading (*src)[i] would deref an empty
-                // vector; skip the copy for this input (its slots stay 0).
-                int src_avail = src->num_elements();
-                for (int li = 0; li < in_total; ++li) {
-                    if (li >= src_avail) {
-                        break;
-                    }
-                    // Decode li -> per-axis coords, re-encode against output
-                    // strides with the concat offset added on axis_.
-                    int rem = li;
-                    int lo = offset * out_stride[axis_];
-                    for (int d = 0; d < rank; ++d) {
-                        int c = rem / in_str[d];
-                        rem = rem % in_str[d];
-                        lo += c * out_stride[d];
-                    }
-                    out[lo] = (*src)[li];
-                }
-                offset += in_axis;
-            }
-            auto output = core::as_tensor<int64_t>(outputs[0]);
-            output->resize(out_shape);
-            output->fillToCPU(out);
-            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
+            gpuConcatInt64(inputs, outputs, out_shape);
             return;
         }
 
@@ -314,6 +340,9 @@ class ConcatBuffer : public BufferFactory {
     }
 
     int axis_ = 1;
+
+    // int64-data GPU path state. Lazily built on first int64 execute.
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

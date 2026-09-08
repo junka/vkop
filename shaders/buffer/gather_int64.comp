@@ -1,0 +1,114 @@
+#version 450 core
+
+// int64-data Gather: same indexing logic as gather.comp, but the DATA (binding
+// 1) and OUTPUT (binding 0) are int64 tensors, bound as ivec2[] (8 bytes/elem,
+// the established pattern — see gather.comp's indexBuffer binding comment). The
+// device has no shaderInt64 feature, so int64 SSBOs are viewed as ivec2 and
+// copied verbatim (both words) — no 64-bit math is needed for a gather, which
+// is just an indexed copy. Indices (binding 2) are also int64-as-ivec2, reading
+// the low 32 bits (.x) as the index value (correct for the model's small
+// non-negative indices).
+//
+// This replaces Gather::cpuComputeInt64 (ops/Gather.hpp), which did 2×
+// copyToCPU + a host loop + copyToGPU (3 sync stalls, ~665ms/round — the #1
+// decode bottleneck after Shape was fixed). The GPU dispatch records into the
+// level command buffer with no stall.
+
+layout(set=0, binding=0) writeonly buffer outputBuffer { ivec2 data[]; } uOutput;
+layout(set=0, binding=1) readonly buffer inputBuffer { ivec2 data[]; } uInput;
+layout(set=0, binding=2) readonly buffer indexBuffer { ivec2 data[]; } uIndex;
+
+struct IArr8 { int v[8]; };
+
+layout(push_constant) uniform gatherBuffer {
+    IArr8 inShape;       // data shape (idims valid entries)
+    IArr8 indicesShape;  // indices tensor shape (nindex valid entries)
+    IArr8 outShape;      // output shape (odims valid entries)
+    int axis;
+    int idims;
+    int odims;
+    int nindex; // rank of the indices tensor (NOT element count)
+} uGatherPara;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+int gather_total_size(IArr8 shape, int rank) {
+    int size = 1;
+    for (int i = 0; i < rank; ++i) size *= shape.v[i];
+    return size;
+}
+
+int gather_nd_to_linear(IArr8 coord, IArr8 dims, int rank) {
+    int linear = 0;
+    int stride = 1;
+    for (int i = rank - 1; i >= 0; --i) {
+        linear += coord.v[i] * stride;
+        stride *= dims.v[i];
+    }
+    return linear;
+}
+
+IArr8 gather_linear_to_nd(int linear, IArr8 dims, int rank) {
+    IArr8 coord;
+    for (int i = 0; i < 8; ++i) coord.v[i] = 0;
+    for (int i = rank - 1; i >= 0; --i) {
+        coord.v[i] = linear % dims.v[i];
+        linear /= dims.v[i];
+    }
+    return coord;
+}
+
+void main()
+{
+    int odims = uGatherPara.odims;
+    int total_output_size = gather_total_size(uGatherPara.outShape, odims);
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= total_output_size) return;
+
+    // 1. Linear output id -> row-major nd coordinate.
+    IArr8 out_coord = gather_linear_to_nd(gid, uGatherPara.outShape, odims);
+
+    // 2. Extract the indices sub-coordinate: output dims [axis, axis+nindex)
+    //    carry the indices coordinate.
+    IArr8 indices_coord;
+    for (int i = 0; i < 8; ++i) indices_coord.v[i] = 0;
+    for (int i = 0; i < uGatherPara.nindex; ++i) {
+        indices_coord.v[i] = out_coord.v[uGatherPara.axis + i];
+    }
+
+    // 3. Read the gathered index value (low 32 bits of the int64 element).
+    int indices_linear_idx =
+        gather_nd_to_linear(indices_coord, uGatherPara.indicesShape,
+                            uGatherPara.nindex);
+    int total_indices_size =
+        gather_total_size(uGatherPara.indicesShape, uGatherPara.nindex);
+    if (indices_linear_idx >= total_indices_size || indices_linear_idx < 0) return;
+    int gather_idx = uIndex.data[indices_linear_idx].x;
+
+    // 4. Negative-index wrap.
+    int axis_size = uGatherPara.inShape.v[uGatherPara.axis];
+    if (gather_idx < 0) gather_idx += axis_size;
+
+    // 5. Build the input coordinate: data dims [0,axis) and [axis+1,idims)
+    //    come from the output coordinate (shifted past the indices block for
+    //    the suffix), with the gathered index placed at `axis`.
+    IArr8 in_coord;
+    for (int i = 0; i < 8; ++i) in_coord.v[i] = 0;
+    for (int i = 0; i < uGatherPara.axis; ++i) {
+        in_coord.v[i] = out_coord.v[i];
+    }
+    in_coord.v[uGatherPara.axis] = gather_idx;
+    int out_src_dim = uGatherPara.axis + uGatherPara.nindex;
+    for (int i = uGatherPara.axis + 1; i < uGatherPara.idims; ++i) {
+        in_coord.v[i] = out_coord.v[out_src_dim];
+        ++out_src_dim;
+    }
+
+    // 6. Map to input linear index and copy the int64 element (both words of
+    //    the ivec2) verbatim.
+    int input_linear_idx =
+        gather_nd_to_linear(in_coord, uGatherPara.inShape, uGatherPara.idims);
+    if (input_linear_idx >= 0) {
+        uOutput.data[gid] = uInput.data[input_linear_idx];
+    }
+}

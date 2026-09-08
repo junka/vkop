@@ -1,10 +1,13 @@
 // junka @ 2025
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
+#include <numeric>
 #include <queue>
 #include <unordered_set>
 
@@ -1451,6 +1454,18 @@ double Runtime::Run() {
     double prof_record_ms = 0.0, prof_submit_ms = 0.0, prof_onexec_ms = 0.0;
     int prof_nlevels = 0, prof_nops = 0;
 
+    // VKOP_OPPROF=1 accumulates per-op-type onExecute wall time + call count
+    // across the Run(), printed once at Run() end. Reveals which op types
+    // actually dominate the ~1.7s/round onExecute cost (vs just being "dynamic"
+    // in the replay sense — a dynamic fp16 MatMul re-records in ~0, an int64
+    // Gather stalls ~1ms). Static (so not cleared across rounds within a Run);
+    // the caller sees the per-Run accumulation.
+    const char *opp_env = std::getenv("VKOP_OPPROF");
+    bool opprof = opp_env && opp_env[0] == '1';
+    static std::map<std::string, std::pair<double, int>> op_type_time_count;
+    if (opprof)
+        op_type_time_count.clear();
+
     std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_level_cmds;
     size_t last_level_index = level_node_indices_.size() - 1;
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
@@ -1501,6 +1516,9 @@ double Runtime::Run() {
             }
             auto oe_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
+            const auto oe_prof_t0 =
+                opprof ? std::chrono::steady_clock::now()
+                       : std::chrono::steady_clock::time_point{};
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
             if (run_profile) {
@@ -1508,6 +1526,17 @@ double Runtime::Run() {
                 onexec_ms +=
                     std::chrono::duration<double, std::milli>(oe_t1 - oe_t0)
                         .count();
+            }
+            if (opprof) {
+                auto oe_t1 = std::chrono::steady_clock::now();
+                double ms = std::chrono::duration<double, std::milli>(
+                                oe_t1 - oe_prof_t0)
+                                .count();
+                auto name =
+                    convert_optype_to_string(node_ops_[node_idx]->get_type());
+                auto &e = op_type_time_count[name];
+                e.first += ms;
+                e.second += 1;
             }
             // Snapshot live input shapes for the replay guard. Done every round
             // (cheap): if this op just re-recorded (refresh or first cache),
@@ -1638,6 +1667,28 @@ double Runtime::Run() {
                 "returns: %ld)\n",
                 replay_cached_count_, node_ops_.size(), hits);
         replay_cached_count_ = 0;
+    }
+
+    if (opprof) {
+        // Sort by total time descending.
+        std::vector<std::pair<std::string, std::pair<double, int>>> v(
+            op_type_time_count.begin(), op_type_time_count.end());
+        std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
+            return a.second.first > b.second.first;
+        });
+        double grand = 0.0;
+        fprintf(stderr, "[opprof] op-type        calls   total_ms   avg_ms\n");
+        for (const auto &p : v) {
+            fprintf(stderr, "[opprof] %-14s %6d  %9.2f  %7.3f\n",
+                    p.first.c_str(), p.second.second, p.second.first,
+                    p.second.first / std::max(1, p.second.second));
+            grand += p.second.first;
+        }
+        fprintf(stderr, "[opprof] %-14s %6d  %9.2f\n", "TOTAL",
+                static_cast<int>(std::accumulate(
+                    v.begin(), v.end(), 0,
+                    [](int s, const auto &p) { return s + p.second.second; })),
+                grand);
     }
 
     auto end = std::chrono::steady_clock::now();
