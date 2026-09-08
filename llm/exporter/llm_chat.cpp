@@ -583,6 +583,9 @@ int main(int argc, char** argv) {
 
         double ms = rt->Run();
         std::printf("  Run done %.1fms\n", ms); std::fflush(stdout);
+        // Prefill (q_len=L) and decode (q_len=1) have entirely different
+        // shapes; the replay cache from prefill must not bleed into decode.
+        rt->invalidate_replay();
         // Wait for GPU compute to finish, but do NOT ReadResult() — that would
         // copyToCPU all 28 present_kv outputs (28 sync points) which we don't
         // need: feedback_kv does device→device, and argmax reads only logits.

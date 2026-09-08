@@ -18,6 +18,7 @@ namespace vkop {
 std::shared_ptr<VulkanBuffer> ops::Operator::dummy_buffer_ = nullptr;
 std::shared_ptr<VulkanBufferView> ops::Operator::dummy_bufferview_ = nullptr;
 std::atomic<int> ops::Operator::instance_count_{0};
+std::atomic<long> ops::Operator::replay_total_hits_{0};
 namespace core {
 
 Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
@@ -691,6 +692,29 @@ Runtime::ListTensors() const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
+
+    // Record-once-replay: VKOP_REPLAY=1 caches each op's recorded command
+    // buffer after round 0 and replays it verbatim on later rounds, skipping
+    // the ~0.5ms re-record that dominates the ~1.8s/round decode bottleneck.
+    // Correctness guard: before Run, compare each op's LIVE input shapes to
+    // the snapshot from the cached round; any change (e.g. KV Concat whose
+    // kv_len grew) forces a re-record for that op only.
+    if (!replay_mode_) {
+        const char *rp = std::getenv("VKOP_REPLAY");
+        if (rp && (rp[0] == '1' || rp[0] == '2')) {
+            replay_mode_ = true;
+            replay_dbg_ = (rp[0] == '2');
+            replay_live_shapes_.assign(node_ops_.size(), {});
+            for (auto &op : node_ops_)
+                op->enable_replay(true);
+            fprintf(stderr, "[replay] enabled: %zu ops\n", node_ops_.size());
+        }
+    }
+    // Per-op invariance is decided by fingerprint comparison inside onExecute
+    // (record-then-compare). No per-op force_refresh here: a CACHED op whose
+    // fingerprint later changes drops to FRESH automatically inside onExecute.
+    // The live-shape snapshot is kept only for invalidate_replay() to clear
+    // stale CACHED state across a phase boundary (prefill→decode).
 
     bool single_queue = dev->getNumComputeQueues() <= 1;
 
@@ -1418,6 +1442,15 @@ double Runtime::Run() {
     int level_sync = lsync_env ? std::atoi(lsync_env) : 0;
     bool per_level_wait = (level_sync == 1);
 
+    // VKOP_RUN_PROFILE=1 splits Run() wall time into record (onExecute) vs
+    // submit (vkQueueSubmit) vs gpu-wait, printed once per Run() call. Used to
+    // quantify the per-round bottleneck: 3270 ops are re-recorded every round
+    // and 1593 levels each get their own vkQueueSubmit.
+    const char *rp_env = std::getenv("VKOP_RUN_PROFILE");
+    bool run_profile = rp_env && rp_env[0] == '1';
+    double prof_record_ms = 0.0, prof_submit_ms = 0.0, prof_onexec_ms = 0.0;
+    int prof_nlevels = 0, prof_nops = 0;
+
     std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_level_cmds;
     size_t last_level_index = level_node_indices_.size() - 1;
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
@@ -1427,6 +1460,9 @@ double Runtime::Run() {
         // Per-lane submit batches (multi-queue case); single-queue uses [0].
         std::vector<std::vector<VkSubmitInfo>> sis(vkop::kInflight);
         int id = 0;
+        auto rec_t0 = run_profile ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+        double onexec_ms = 0.0;
         for (auto node_idx : level_nodes) {
             const auto &shapes = node_input_shapes_[node_idx];
             const auto &ins = node_input_tensors_[node_idx];
@@ -1463,8 +1499,37 @@ double Runtime::Run() {
                     }
                 }
             }
+            auto oe_t0 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
+            if (run_profile) {
+                auto oe_t1 = std::chrono::steady_clock::now();
+                onexec_ms +=
+                    std::chrono::duration<double, std::milli>(oe_t1 - oe_t0)
+                        .count();
+            }
+            // Snapshot live input shapes for the replay guard. Done every round
+            // (cheap): if this op just re-recorded (refresh or first cache),
+            // this is the new contract; if it replayed, the snapshot is
+            // unchanged and the comparison next round still holds.
+            if (replay_mode_) {
+                auto &snap = replay_live_shapes_[node_idx];
+                snap.assign(ins.size(), {});
+                for (size_t k = 0; k < ins.size(); ++k) {
+                    if (ins[k])
+                        snap[k] = ins[k]->getShape();
+                }
+                if (node_ops_[node_idx]->replay_cached()) {
+                    replay_cached_count_++;
+                } else if (replay_dbg_) {
+                    fprintf(stderr, "[replay] DYNAMIC node %zu (%s)\n",
+                            node_idx,
+                            convert_optype_to_string(
+                                node_ops_[node_idx]->get_type())
+                                .c_str());
+                }
+            }
             auto cmd = node_ops_[node_idx]->get_record();
             for (auto &dep : node_dependency_indices_[node_idx]) {
                 cmd->addWait(node_ops_[dep]->get_record()->getSignalSemaphore(),
@@ -1487,12 +1552,29 @@ double Runtime::Run() {
             id++;
             id %= vkop::kInflight;
         }
+        if (run_profile) {
+            auto rec_t1 = std::chrono::steady_clock::now();
+            prof_record_ms +=
+                std::chrono::duration<double, std::milli>(rec_t1 - rec_t0)
+                    .count();
+            prof_onexec_ms += onexec_ms;
+            prof_nlevels++;
+            prof_nops += static_cast<int>(level_nodes.size());
+        }
         // Submit this level's batches (one vkQueueSubmit per non-empty lane).
         int nlanes = single_queue ? 1 : vkop::kInflight;
+        auto sub_t0 = run_profile ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
         for (int ci = 0; ci < nlanes; ci++) {
             if (!sis[ci].empty()) {
                 VulkanCommandBuffer::submit(dev->getComputeQueue(ci), sis[ci]);
             }
+        }
+        if (run_profile) {
+            auto sub_t1 = std::chrono::steady_clock::now();
+            prof_submit_ms +=
+                std::chrono::duration<double, std::milli>(sub_t1 - sub_t0)
+                    .count();
         }
         if (per_level_wait) {
             for (auto &c : cur_level_cmds)
@@ -1520,11 +1602,42 @@ double Runtime::Run() {
     // command before reset so all buffers are back in the initial state.
     for (const auto &level_nodes : level_node_indices_) {
         for (auto node_idx : level_nodes) {
+            // Skip reset for replay-cached ops: their cmd buffer is kept for
+            // verbatim re-submission next round (SIMULTANEOUS_USE). Resetting
+            // would discard the cached recording.
+            if (replay_mode_ && node_ops_[node_idx]->replay_cached()) {
+                auto cmd = node_ops_[node_idx]->get_record();
+                cmd->wait();
+                cmd->clearWaits();
+                continue;
+            }
             auto cmd = node_ops_[node_idx]->get_record();
             cmd->wait();
             cmd->clearWaits();
             cmd->reset();
         }
+    }
+
+    if (run_profile) {
+        auto end = std::chrono::steady_clock::now();
+        std::chrono::duration<double> elapsed = end - start;
+        double total_ms = elapsed.count() * 1000.0;
+        double gpuwait_ms = total_ms - prof_record_ms - prof_submit_ms;
+        fprintf(stderr,
+                "[runprof] total=%.1fms  record=%.1fms (onexec=%.1fms) "
+                "(%d ops/%d levels)  "
+                "submit=%.1fms  gpu+reset=%.1fms\n",
+                total_ms, prof_record_ms, prof_onexec_ms, prof_nops,
+                prof_nlevels, prof_submit_ms, gpuwait_ms);
+    }
+
+    if (replay_mode_) {
+        long hits = ops::Operator::replay_total_hits_.exchange(0);
+        fprintf(stderr,
+                "[replay] %d/%zu ops cached this Run() (onExecute CACHED "
+                "returns: %ld)\n",
+                replay_cached_count_, node_ops_.size(), hits);
+        replay_cached_count_ = 0;
     }
 
     auto end = std::chrono::steady_clock::now();

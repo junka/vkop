@@ -82,7 +82,12 @@ void VulkanCommandBuffer::allocate() {
 void VulkanCommandBuffer::begin() {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    // ONE_TIME_SUBMIT is the default (cheapest on most drivers) but prevents
+    // re-submission. Replayable buffers (cached for cuda-graph-style replay)
+    // use SIMULTANEOUS_USE so the same recording can be submitted every round.
+    begin_info.flags = replayable_
+                           ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
+                           : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
     // Defensive: a NULL handle means the buffer was never allocated (or was
     // lost); re-allocate rather than crashing inside vkBeginCommandBuffer.

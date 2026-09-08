@@ -74,6 +74,13 @@ class VulkanCommandBuffer {
     // Get the Vulkan command buffer handle
     VkCommandBuffer get() const { return m_commandBuffer_; }
 
+    // Mark this command buffer as replayable: begin() will use
+    // SIMULTANEOUS_USE_BIT instead of ONE_TIME_SUBMIT_BIT so the recorded
+    // buffer can be submitted more than once (cuda-graph-style replay). The
+    // caller must NOT call reset() between replays.
+    void set_replayable(bool v) { replayable_ = v; }
+    bool is_replayable() const { return replayable_; }
+
     void push_constants(VulkanPipeline &pipeline, uint32_t size,
                         const void *ptr);
     void dispatch(int w = 1, int h = 1, int z = 1);
@@ -101,6 +108,7 @@ class VulkanCommandBuffer {
     std::vector<uint64_t> m_sigvalues_;
     std::vector<VkPipelineStageFlags> m_waitstages_;
     VkTimelineSemaphoreSubmitInfo m_timeline_submit_info_ = {};
+    bool replayable_ = false;
 
     // Allocate command buffers
     void allocate();

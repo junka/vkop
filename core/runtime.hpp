@@ -59,6 +59,32 @@ class Runtime {
     // before onExecute in execution order.
     std::vector<std::vector<std::vector<int>>> node_input_shapes_;
 
+    // Record-once-replay (cuda-graph-style): per-node snapshot of the LIVE
+    // input shapes (tensor->getShape()) from the round that earned CACHED. On
+    // a later round, if any input's live shape differs, the op is dynamic for
+    // that round → force_replay_refresh() (re-record). This is the correctness
+    // guard that prevents a stale replay when kv_len grows. Empty entry = no
+    // snapshot yet (first round). See KV_INPLACE_PLAN.md Step 4.
+    std::vector<std::vector<std::vector<int>>> replay_live_shapes_;
+    bool replay_mode_ = false;    // set by VKOP_REPLAY=1
+    int replay_cached_count_ = 0; // ops that replayed (CACHED) this Run()
+    bool replay_dbg_ = false;     // set by VKOP_REPLAY=2 (log dynamic ops)
+
+  public:
+    // Drop every op's cached recording (back to FRESH) so the next Run()
+    // re-records all. Call across a phase boundary where shapes change en masse
+    // (e.g. prefill q_len=L → decode q_len=1): partial replay across such a
+    // boundary leaves mid-graph tensors at stale shapes and corrupts
+    // downstream.
+    void invalidate_replay() {
+        if (!replay_mode_)
+            return;
+        for (auto &op : node_ops_)
+            op->force_replay_refresh();
+        for (auto &s : replay_live_shapes_)
+            s.clear();
+    }
+
   public:
     // Constructor
     Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,

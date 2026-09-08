@@ -56,6 +56,9 @@ class PimplFacade : public Operator {
     void set_required_subgroup_size(uint32_t size) override {
         impl_->set_required_subgroup_size(size);
     }
+    void enable_replay(bool v) override { impl_->enable_replay(v); }
+    bool replay_cached() const override { return impl_->replay_cached(); }
+    void force_replay_refresh() override { impl_->force_replay_refresh(); }
 
   protected:
     std::unique_ptr<Operator> impl_;

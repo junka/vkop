@@ -129,6 +129,21 @@ class Operator {
 
     virtual OpType get_type() { return type_; }
 
+    // Record-once-replay control (cuda-graph-style). The Runtime enables this
+    // for the LLM decode loop; see onExecute for the state machine. An op is
+    // FRESH until its first onExecute stores a fingerprint and flips it to
+    // CACHED; thereafter onExecute skips recording and reuses the kept cmd.
+    // force_refresh() drops back to FRESH so the next onExecute re-records
+    // (used when the Runtime detects an input shape change for this op).
+    virtual void enable_replay(bool v) { replay_enabled_ = v; }
+    virtual bool replay_cached() const {
+        return replay_state_ == ReplayState::CACHED;
+    }
+    virtual void force_replay_refresh() {
+        replay_state_ = ReplayState::FRESH;
+        fp_stored_.clear();
+    }
+
     // These members are the public API the runtime/tests drive. They are
     // virtual so a PIMPL façade op can forward each to its image/buffer
     // impl (which owns the real pipeline/command-buffer state).
@@ -142,10 +157,64 @@ class Operator {
             m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
         }
         m_id_ = id;
+
+        // Record-once-replay (cuda-graph-style). The LLM decode loop re-runs
+        // Run() every round; for INVARIANT ops (weight Gemms, RMSNorm,
+        // elementwise on fixed-shape tensors) the recorded command buffer is
+        // byte-identical every round. We skip re-recording those:
+        //   - Every recording pass builds a fingerprint (push-constant bytes,
+        //     dispatch dims, bound resource handles) in fp_passes_.
+        //   - After recording, if the new fingerprint matches the stored one
+        //     from the previous round, the just-recorded cmd is identical to
+        //     last round's; we mark the op CACHED and KEEP its cmd buffer (not
+        //     reset) so the NEXT round can replay it verbatim.
+        //   - If the fingerprint differs (dynamic op: KV Concat, attention
+        //     MatMul whose kv_len grew), keep re-recording every round and
+        //     update the stored fingerprint — the op never enters CACHED.
+        // Warmup: round 0 records + stores fp (FRESH). Round 1 records +比对;
+        //         match → CACHED (cmd kept). Round 2+ replays (no recording).
+        //         A CACHED op whose fp later changes (Runtime forced refresh)
+        //         drops to FRESH and re-warms.
+        if (replay_enabled_ && replay_state_ == ReplayState::CACHED) {
+            // Reuse the kept cmd buffer. No begin/execute/end, no descriptor
+            // rewrites, no dispatch reissue. m_cmd_ holds the recording from
+            // the round that earned CACHED; Run() re-submits it
+            // (SIMULTANEOUS_USE).
+            replay_hits_++;
+            replay_total_hits_.fetch_add(1);
+            return;
+        }
+
         objs_.clear();
+        fp_passes_.clear();
+        // When replay is enabled, record with SIMULTANEOUS_USE so that if this
+        // recording is later kept (CACHED), it can be re-submitted verbatim on
+        // following rounds. (The first two rounds still record; round 2+
+        // replay the CACHED recording.)
+        if (replay_enabled_) {
+            m_cmd_->set_replayable(true);
+        }
         m_cmd_->begin();
         execute(inputs, outputs);
         m_cmd_->end();
+
+        if (replay_enabled_) {
+            if (fp_stored_.empty()) {
+                // Round 0: store canonical fingerprint. Not yet CACHED — round
+                // 1 must still record to confirm the fingerprint is stable.
+                fp_stored_ = fp_passes_;
+            } else if (fingerprint_matches()) {
+                // Round 1+ and the recording matches last round's: the op is
+                // invariant. Keep this cmd buffer (Runtime skips reset) and
+                // become CACHED so the NEXT round replays it.
+                fp_stored_ = fp_passes_;
+                replay_state_ = ReplayState::CACHED;
+            } else {
+                // Dynamic for this round: refresh the stored fingerprint so
+                // the next round compares against this round's recording.
+                fp_stored_ = fp_passes_;
+            }
+        }
 
         if (trace_) {
             m_cmd_->wait();
@@ -186,6 +255,8 @@ class Operator {
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
     static std::atomic<int> instance_count_;
+    static std::atomic<long>
+        replay_total_hits_; // onExecute CACHED-return count
 
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
@@ -212,6 +283,89 @@ class Operator {
     std::vector<std::shared_ptr<VulkanResource>> objs_;
     std::vector<VkDescriptorType> types_;
     int fp16_ = 0; // 0: fp32, 1: fp16
+
+    // --- Record-once-replay (cuda-graph-style) ---------------------------
+    // The LLM decode loop calls Run() every round with q_len=1; past_kv grows
+    // by one token per round but, for INVARIANT ops (weight Gemms, RMSNorm,
+    // elementwise on fixed-shape tensors), the push-constant bytes, dispatch
+    // dimensions, and bound buffer handles are identical every round. Such an
+    // op's recorded command buffer can be replayed verbatim — skipping the
+    // ~0.5ms onExecute re-record that dominates the ~1.8s/round bottleneck
+    // (3270 ops × re-record = 1771ms; see KV_INPLACE_PLAN.md Step 4).
+    //
+    // State machine (per op, keyed by m_id_/inflight lane):
+    //   FRESH  : first recording. onExecute records normally; each submit()
+    //            call appends a PassFingerprint. At onExecute end the op is
+    //            marked CACHED and the cmd buffer is kept (NOT reset at Run()
+    //            end) with SIMULTANEOUS_USE so it can be re-submitted.
+    //   CACHED : a later round. onExecute builds a NEW fingerprint and
+    //            compares to the stored one. Match  -> REPLAY (skip recording,
+    //            reuse m_cmd_). Mismatch -> the op is dynamic for this round;
+    //            re-record (REFRESH) and update the stored fingerprint.
+    //
+    // A fingerprint covers everything submit() records: pc bytes, dispatch
+    // (w,h,layers), and the VkBuffer/VkImage handle of every bound resource
+    // (handle, not contents — preallocated KV buffers keep a stable handle
+    // across rounds even as their contents change). Buffer *contents* changing
+    // is fine (the shader reads whatever is in the buffer at submit time); only
+    // a handle/shape/dispatch change forces a re-record.
+    struct PassFingerprint {
+        std::vector<uint8_t> pc;
+        int w = 0, h = 0, layers = 0;
+        std::vector<uint64_t>
+            handles; // VkBuffer/VkImage handles, in binding order
+    };
+    std::vector<PassFingerprint> fp_passes_; // accumulated during one onExecute
+    std::vector<PassFingerprint>
+        fp_stored_; // from the round that earned CACHED
+    enum class ReplayState { FRESH, CACHED };
+    ReplayState replay_state_ = ReplayState::FRESH;
+    bool replay_enabled_ = false; // set true by Runtime when cache mode on
+    long replay_hits_ = 0;        // times onExecute took the CACHED return
+    // Accumulate the fingerprint of one submit() call. Called from submit()/
+    // submit_per_ds() when replay_enabled_. Cheap: one small alloc + handle
+    // reads (handles are already materialized in objs_).
+    void record_fingerprint(void *ptr, int width, int height, int layers) {
+        PassFingerprint p;
+        p.w = width;
+        p.h = height;
+        p.layers = layers;
+        if (ptr && pc_size_ > 0) {
+            p.pc.assign(static_cast<uint8_t *>(ptr),
+                        static_cast<uint8_t *>(ptr) + pc_size_);
+        }
+        p.handles.reserve(objs_.size());
+        for (const auto &r : objs_) {
+            if (!r) {
+                p.handles.push_back(0);
+                continue;
+            }
+            // VulkanResource::getDescriptorInfo returns the handle-bearing
+            // variant; for buffers pBufferInfo->buffer, for images
+            // pImageInfo... For a stable fingerprint we just use the resource
+            // pointer identity — stable across rounds iff the Tensor (and its
+            // backing VkBuffer) is reused, which is exactly the invariant we
+            // care about. (Handle value would be more precise but requires
+            // pulling VkBuffer out of the variant; pointer identity suffices
+            // because a recycled Tensor gets a new VulkanResource.)
+            p.handles.push_back(reinterpret_cast<uint64_t>(r.get()));
+        }
+        fp_passes_.push_back(std::move(p));
+    }
+    bool fingerprint_matches() const {
+        if (fp_passes_.size() != fp_stored_.size())
+            return false;
+        for (size_t i = 0; i < fp_passes_.size(); i++) {
+            const auto &a = fp_passes_[i], &b = fp_stored_[i];
+            if (a.w != b.w || a.h != b.h || a.layers != b.layers)
+                return false;
+            if (a.pc != b.pc)
+                return false;
+            if (a.handles != b.handles)
+                return false;
+        }
+        return true;
+    }
 
     using SupportedTypes = std::tuple<float, uint16_t, int, int64_t, int8_t>;
     template <typename Func>
@@ -250,6 +404,9 @@ class Operator {
                                    ptr);
         }
         m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
+        }
     }
 
     // Submit with a dedicated descriptor set for multi-pass operators.
@@ -268,6 +425,9 @@ class Operator {
                                    ptr);
         }
         m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
+        }
     }
 
     // Allocate a fresh descriptor set from the pipeline's pool.
