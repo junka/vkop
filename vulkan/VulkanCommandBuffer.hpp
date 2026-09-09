@@ -74,6 +74,12 @@ class VulkanCommandBuffer {
     // Get the Vulkan command buffer handle
     VkCommandBuffer get() const { return m_commandBuffer_; }
 
+    // Get the command pool this buffer was allocated from (used by tensor
+    // upload fallbacks that need a VulkanCommandPool for a fresh staging copy).
+    std::shared_ptr<VulkanCommandPool> getCommandPool() const {
+        return m_cmdpool_;
+    }
+
     // Mark this command buffer as replayable: begin() will use
     // SIMULTANEOUS_USE_BIT instead of ONE_TIME_SUBMIT_BIT so the recorded
     // buffer can be submitted more than once (cuda-graph-style replay). The

@@ -127,9 +127,11 @@ class BufferBinaryFactory : public BufferFactory {
         output->resize(out_shape);
         output->fillToCPU(out);
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-        // Explicit src keeps the CPU copy alive for downstream as_tensor<>()
-        // readers (copyToGPU would clear data_ otherwise).
-        output->copyToGPU(m_cmdpool_, out.data());
+        // Deferred (no-stall) upload: records vkCmdUpdateBuffer into the level
+        // cmd buffer. data_ stays populated (copyToGPUDeferred doesn't clear
+        // it) for downstream as_tensor<>() readers -- same property the old
+        // explicit-src copyToGPU gave, without the submit+wait stall.
+        output->copyToGPUDeferred(m_cmd_);
     }
 
     void execute(

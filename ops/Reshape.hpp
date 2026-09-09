@@ -266,8 +266,11 @@ class ReshapeBuffer : public BufferFactory {
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(dim);
             output->fillToCPU(out);
+            // as_storage_buffer creates vkobj_ (STORAGE|TRANSFER_DST); the
+            // deferred upload records vkCmdUpdateBuffer into the level cmd
+            // buffer (no submit+wait stall) instead of copyToGPU's sync flush.
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
+            output->copyToGPUDeferred(m_cmd_);
             return;
         }
 
@@ -286,7 +289,7 @@ class ReshapeBuffer : public BufferFactory {
             output->resize(dim);
             output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
+            output->copyToGPUDeferred(m_cmd_);
             return;
         }
 

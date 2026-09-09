@@ -510,7 +510,14 @@ template <typename T> class Tensor : public ITensor {
     // vkCmdUpdateBuffer limit (caller falls back to copyToGPU for those).
     void copyToGPUDeferred(const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         if (!vkobj_ || size_ == 0 || size_ > 65536) {
-            toGPU();
+            // Fallback: synchronous upload for empty or >64KB tensors
+            // (vkCmdUpdateBuffer is capped at 65536 bytes). Must actually
+            // upload -- toGPU() alone would leave the buffer uninitialized.
+            if (data_ && !data_->empty()) {
+                copyToGPUBuffer(cmd->getCommandPool(), data_->data());
+            } else {
+                toGPU();
+            }
             return;
         }
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);

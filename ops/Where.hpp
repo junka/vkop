@@ -94,7 +94,7 @@ class Where : public Operator {
             output->resize(out_shape);
             output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
+            output->copyToGPUDeferred(m_cmd_);
             return;
         }
 

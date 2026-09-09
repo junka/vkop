@@ -139,7 +139,7 @@ class SqueezeUnsqueeze : public Operator {
             std::vector<T> dst(src.begin(), src.begin() + n);
             output->fillToCPU(dst);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, dst.data());
+            output->copyToGPUDeferred(m_cmd_);
         });
     }
 
