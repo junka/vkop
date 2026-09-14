@@ -142,26 +142,45 @@ class SqueezeUnsqueeze : public Operator {
             }
         }
 
-        // View: same bytes, new shape. Pull input to host, resize output,
-        // copy the bytes, re-upload. The element count is unchanged
+        // View: same bytes, new shape. The element count is unchanged
         // (squeeze removes only 1-dims; unsqueeze only adds 1-dims), so the
-        // byte copy is exact.
+        // byte copy is a pure metadata change.
+        //
+        // GPU-alias fast path: when the input is GPU-resident (has a
+        // VulkanBuffer), the output can SHARE the input's VkBuffer — same
+        // bytes, just a different logical shape. This eliminates the ~3.2ms
+        // copyToCPU readback that dominated decode (122 Unsqueeze × 3.4ms =
+        // 422ms). The output's shape (out_shape, set by resize) drives
+        // downstream dispatch; the underlying bytes are identical to the
+        // input's.
+        //
+        // CPU fallback: when the input is host-only (no vkobj_), there is no
+        // buffer to alias — pull input to host, resize, copy bytes, re-upload.
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
-            // Always read back from the GPU when a buffer exists. The input
-            // may be GPU-resident with a stale/short CPU data_ (e.g. a KV-cache
-            // Concat whose GPU buffer grew with kv_len but whose CPU staging
-            // still holds the previous round's smaller count, the tail
-            // zero-filled by reserveOnCPU). has_cpu_data() only checks data_
-            // is non-empty, and is_on_GPU() tracks the converted_ flag which
-            // is NOT set by every producer that binds an SSBO — neither
-            // reflects whether data_ matches the live GPU buffer. copyToCPU
-            // itself is the authoritative check (it reads back whenever
-            // vkobj_ exists), so call it unconditionally.
-            input->copyToCPU(m_cmdpool_);
             auto output = core::as_tensor<T>(outputs[0]);
             output->resize(out_shape);
+
+            if (input->has_gpu_buffer()) {
+                // Alias the input's GPU buffer: no readback, no re-upload. The
+                // view op preserves element count, so the input's buffer (sized
+                // for input->num_elements() == output->num_elements()) is
+                // exactly large enough.
+                auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                    input->as_storage_buffer(m_dev_, m_cmd_));
+                objs_.emplace_back(
+                    output->alias_storage_buffer(src_buff, m_cmd_));
+                return;
+            }
+
+            // Host-only input: copy bytes through the CPU. Always read back
+            // from the GPU when a buffer exists (defensive; the
+            // has_gpu_buffer() gate above already routed GPU inputs to the
+            // alias path, so this is the genuinely host-only branch). copyToCPU
+            // is a no-op-safe authority check (reads when vkobj_ exists, else
+            // just reserveOnCPU).
+            input->copyToCPU(m_cmdpool_);
             // Element count must match (view op); copy the host data straight
             // across. fillToCPU sets data_ to the provided values. Guard the
             // count: a mismatched out_shape (dynamic-dim divergence between

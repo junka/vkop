@@ -438,6 +438,15 @@ template <typename T> class Tensor : public ITensor {
     // consumers must check has_gpu_buffer() to decide whether a readback is
     // needed to populate data_ before (*this)[i].
     bool has_gpu_buffer() const { return vkobj_ != nullptr; }
+    // Stable identity of the attached GPU resource (the VulkanResource ptr),
+    // for cheap cross-round cache-keying by consumers that only need to know
+    // whether the buffer was replaced since last read (0 = no GPU buffer).
+    // Two tensors backed by the same recycled VulkanResource compare equal,
+    // which is exactly the condition under which a cached readback stays
+    // valid (the resource's contents are produced by the same recorded cmd).
+    uintptr_t gpu_resource_id() const {
+        return reinterpret_cast<uintptr_t>(vkobj_.get());
+    }
     // True if CPU staging (data_) holds valid element data.
     bool has_cpu_data() const { return data_ && !data_->empty(); }
     // 0=none, 1=VK_BUFFER, 2=VK_IMAGE, 3=VK_BUFFER_VIEW (debug helper).
@@ -494,6 +503,27 @@ template <typename T> class Tensor : public ITensor {
                             VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         if (cmd) {
+            buff->readBarrier(cmd->get());
+        }
+        return buff;
+    }
+
+    // View-op aliasing (Squeeze/Unsqueeze/Reshape-of-same-bytes): make this
+    // tensor share another tensor's GPU VulkanBuffer instead of allocating a
+    // new one and round-tripping the bytes through the CPU. The element bytes
+    // are identical for a pure view op (only the logical shape differs), so
+    // the output SSBO binding can reference the SAME underlying VkBuffer. This
+    // eliminates the ~3.2ms copyToCPU readback that dominated decode for these
+    // metadata-only ops. Caller must have already resize()d this tensor to the
+    // view shape and ensured the source's vkobj_ is a VulkanBuffer of
+    // sufficient size. Records a read barrier on the level cmd buffer so the
+    // alias is visible to the consumer's shader.
+    std::shared_ptr<VulkanBuffer>
+    alias_storage_buffer(std::shared_ptr<VulkanBuffer> src,
+                         const std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        vkobj_ = src; // share the same VkBuffer (shared_ptr refcount)
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        if (cmd && buff) {
             buff->readBarrier(cmd->get());
         }
         return buff;
