@@ -3,6 +3,7 @@
 #define OPS_BUFFER_BINARY_FACTORY_HPP_
 
 #include "ops/BufferBase.hpp"
+#include <array>
 #include <string>
 
 // Shared base for elementwise binary buffer (SSBO) ops with ONNX
@@ -66,6 +67,17 @@ class BufferBinaryFactory : public BufferFactory {
         return result;
     }
 
+    // Phase-boundary reset: re-learn int64-input stability. The int64 binary
+    // ops (Mul/Add/Sub/Div in the shape-meta chain) read shape values that are
+    // almost always round-invariant across decode (only kv_len-derived inputs
+    // change). After two matching readbacks per input, skip its copyToCPU and
+    // reuse the cached host vector. Mirrors ReshapeBuffer's auto-learning
+    // cache.
+    void invalidate_shape_cache() override {
+        for (auto &s : in_cache_state_)
+            s = InLearnState::LEARNING;
+    }
+
   private:
     // Host-compute an int64 elementwise binary op with right-aligned
     // broadcasting. All int64 producers (Shape/NonZero/Equal/Where/Gather/
@@ -85,13 +97,16 @@ class BufferBinaryFactory : public BufferFactory {
 
         auto a = core::as_tensor<int64_t>(inputs[0]);
         auto b = core::as_tensor<int64_t>(inputs[1]);
-        // Unconditional readback: int64 inputs may be GPU-resident only
-        // (e.g. NonZero's shader-computed output leaves data_ empty), OR a
-        // cross-round-recycled GPU input with stale CPU data_ (see
-        // SqueezeUnsqueeze/ScatterElements fix). copyToCPU is the authority
-        // check (reads when vkobj_ exists).
-        a->copyToCPU(m_cmdpool_);
-        b->copyToCPU(m_cmdpool_);
+        // Auto-learning per-input readback cache: each of a/b is a tiny int64
+        // tensor whose values are almost always round-invariant across decode
+        // (only the rare kv_len-derived one changes). After two matching
+        // readbacks, skip copyToCPU and reuse the cached host vector. The op
+        // still recomputes its output on CPU every round (its output feeds
+        // downstream shape-meta ops on CPU), so downstream correctness is
+        // unaffected — only the readback is skipped.
+        // invalidate_shape_cache() (phase boundary) resets to LEARNING.
+        read_int64_cached(a, 0);
+        read_int64_cached(b, 1);
 
         std::vector<int64_t> out(total);
         for (int i = 0; i < total; ++i) {
@@ -180,6 +195,48 @@ class BufferBinaryFactory : public BufferFactory {
     }
 
     int activation_;
+
+    // Read an int64 input into its host data_ with a per-input auto-learning
+    // cache. STABLE inputs skip copyToCPU (the ~3.2ms submit+wait) and reuse
+    // the cached host vector. The op still recomputes its output on CPU every
+    // round from the (cached or freshly-read) host data — only the readback is
+    // skipped, so downstream correctness is unaffected.
+    void read_int64_cached(std::shared_ptr<core::Tensor<int64_t>> &t, int idx) {
+        if (in_cache_state_[idx] == InLearnState::STABLE) {
+            if (cached_in_[idx] && !cached_in_[idx]->empty()) {
+                t->fillToCPU(*cached_in_[idx]);
+            }
+            return;
+        }
+        // Unconditional readback: int64 inputs may be GPU-resident only (e.g.
+        // NonZero's shader-computed output leaves data_ empty), OR a cross-
+        // round-recycled GPU input with stale CPU data_. copyToCPU is the
+        // authority check (reads when vkobj_ exists).
+        t->copyToCPU(m_cmdpool_);
+        const std::vector<int64_t> &cur = t->data();
+        if (in_cache_state_[idx] == InLearnState::LEARNING) {
+            *learned_in_[idx] = cur;
+            in_cache_state_[idx] = InLearnState::CONFIRMING;
+        } else if (in_cache_state_[idx] == InLearnState::CONFIRMING) {
+            if (cur == *learned_in_[idx]) {
+                in_cache_state_[idx] = InLearnState::STABLE;
+                *cached_in_[idx] = cur;
+            } else {
+                in_cache_state_[idx] = InLearnState::DYNAMIC;
+            }
+        }
+    }
+
+    // --- per-input readback cache (runtime auto-learning) ---
+    enum class InLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    std::array<InLearnState, 2> in_cache_state_ = {
+        {InLearnState::LEARNING, InLearnState::LEARNING}};
+    std::array<std::shared_ptr<std::vector<int64_t>>, 2> learned_in_ = {
+        {std::make_shared<std::vector<int64_t>>(),
+         std::make_shared<std::vector<int64_t>>()}};
+    std::array<std::shared_ptr<std::vector<int64_t>>, 2> cached_in_ = {
+        {std::make_shared<std::vector<int64_t>>(),
+         std::make_shared<std::vector<int64_t>>()}};
 };
 
 } // namespace ops
