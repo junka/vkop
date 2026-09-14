@@ -201,6 +201,7 @@ class BufferBinaryFactory : public BufferFactory {
     // the cached host vector. The op still recomputes its output on CPU every
     // round from the (cached or freshly-read) host data — only the readback is
     // skipped, so downstream correctness is unaffected.
+  protected:
     void read_int64_cached(std::shared_ptr<core::Tensor<int64_t>> &t, int idx) {
         if (in_cache_state_[idx] == InLearnState::STABLE) {
             if (cached_in_[idx] && !cached_in_[idx]->empty()) {
