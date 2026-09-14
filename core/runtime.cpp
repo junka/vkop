@@ -353,6 +353,7 @@ void Runtime::LoadModel() {
             std::vector<std::shared_ptr<ITensor>> node_inputs;
             std::vector<std::shared_ptr<ITensor>> node_outputs;
             std::vector<std::vector<int>> node_input_shapes;
+            std::vector<bool> node_input_vd;
 
             for (const auto &in_shape : n.inputs) {
                 // Capture the recorded logical shape for execute-time
@@ -364,6 +365,7 @@ void Runtime::LoadModel() {
                     rec.push_back(static_cast<int>(d));
                 }
                 node_input_shapes.push_back(std::move(rec));
+                node_input_vd.push_back(in_shape.value_dynamic);
 
                 if (tensor_map.find(in_shape.name) != tensor_map.end()) {
                     auto t = tensor_map[in_shape.name];
@@ -593,6 +595,7 @@ void Runtime::LoadModel() {
             node_input_tensors_.push_back(std::move(node_inputs));
             node_output_tensors_.push_back(std::move(node_outputs));
             node_input_shapes_.push_back(std::move(node_input_shapes));
+            node_input_value_dynamic_.push_back(std::move(node_input_vd));
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
@@ -809,6 +812,8 @@ double Runtime::Run() {
                         }
                     }
                 }
+                node_ops_[node_idx]->set_input_value_dynamic(
+                    node_input_value_dynamic_[node_idx]);
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                                node_output_tensors_[node_idx],
                                                id);
@@ -1107,6 +1112,8 @@ double Runtime::Run() {
                         }
                     }
                 }
+                node_ops_[node_idx]->set_input_value_dynamic(
+                    node_input_value_dynamic_[node_idx]);
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                                node_output_tensors_[node_idx],
                                                id);
@@ -1519,6 +1526,8 @@ double Runtime::Run() {
             const auto oe_prof_t0 =
                 opprof ? std::chrono::steady_clock::now()
                        : std::chrono::steady_clock::time_point{};
+            node_ops_[node_idx]->set_input_value_dynamic(
+                node_input_value_dynamic_[node_idx]);
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
             if (run_profile) {
@@ -1753,18 +1762,24 @@ void Runtime::RegisterPostProcess(
     // is a no-op at execute time).
     std::vector<std::vector<int>> post_input_shapes;
     post_input_shapes.reserve(inputs.size());
+    std::vector<bool> post_input_vd;
+    post_input_vd.reserve(inputs.size());
     for (const auto &in : inputs) {
         if (in) {
             post_input_shapes.push_back(in->getShape());
         } else {
             post_input_shapes.emplace_back();
         }
+        // Post-process inputs are concrete output tensors (no converter
+        // annotation) — conservatively mark dynamic so consumers readback.
+        post_input_vd.push_back(true);
     }
     node_ops_.push_back(std::move(op));
     node_attrs_.push_back(attributes);
     node_input_tensors_.push_back(std::move(inputs));
     node_output_tensors_.push_back(std::move(outputs));
     node_input_shapes_.push_back(std::move(post_input_shapes));
+    node_input_value_dynamic_.push_back(std::move(post_input_vd));
 
     std::vector<int> post_process_dependencies;
     if (!level_node_indices_.empty()) {

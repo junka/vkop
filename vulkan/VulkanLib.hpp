@@ -21,6 +21,7 @@ namespace vkop {
     PFN(vkBindBufferMemory)                                                    \
     PFN(vkCmdBindPipeline)                                                     \
     PFN(vkCmdDispatch)                                                         \
+    PFN(vkCmdDispatchIndirect)                                                 \
     PFN(vkCmdWriteTimestamp)                                                   \
     PFN(vkCmdBindDescriptorSets)                                               \
     PFN(vkCmdResetQueryPool)                                                   \

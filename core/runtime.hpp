@@ -59,6 +59,13 @@ class Runtime {
     // before onExecute in execution order.
     std::vector<std::vector<std::vector<int>>> node_input_shapes_;
 
+    // Per-node, per-input: whether the input tensor's ELEMENT VALUES vary
+    // across decode rounds (converter annotation, load::Shape::value_dynamic).
+    // Used by shape-consuming ops (Reshape inputs[1]) to cache readback results
+    // across rounds and skip the per-round copyToCPU stall. Only meaningful for
+    // int64 shape-meta inputs; false for all others (no cache attempted).
+    std::vector<std::vector<bool>> node_input_value_dynamic_;
+
     // Record-once-replay (cuda-graph-style): per-node snapshot of the LIVE
     // input shapes (tensor->getShape()) from the round that earned CACHED. On
     // a later round, if any input's live shape differs, the op is dynamic for
@@ -77,6 +84,12 @@ class Runtime {
     // boundary leaves mid-graph tensors at stale shapes and corrupts
     // downstream.
     void invalidate_replay() {
+        // Shape-input readback caches (option C) must drop across a phase
+        // boundary regardless of replay mode: a value_dynamic=false shape
+        // tensor is round-invariant WITHIN a phase, but prefill→decode changes
+        // shapes en masse. Cheap (virtual no-op on non-Reshape ops).
+        for (auto &op : node_ops_)
+            op->invalidate_shape_cache();
         if (!replay_mode_)
             return;
         for (auto &op : node_ops_)

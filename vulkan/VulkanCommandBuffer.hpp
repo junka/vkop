@@ -91,6 +91,15 @@ class VulkanCommandBuffer {
                         const void *ptr);
     void dispatch(int w = 1, int h = 1, int z = 1);
 
+    // Dispatch with dimensions read from a GPU buffer (vkCmdDispatchIndirect).
+    // `buffer` holds a VkDispatchIndirectCommand{uint32 x,y,z} at `offset`.
+    // Enables data-driven dispatch where the thread count depends on a shape
+    // value computed on the GPU (e.g. kv_len-dependent attention), avoiding a
+    // GPU->CPU readback just to know the dispatch dims. The buffer must have
+    // been written (e.g. by a shape->dispatch shader) and barriered to
+    // INDIRECT_READ before this call.
+    void dispatch_indirect(VkBuffer buffer, VkDeviceSize offset = 0);
+
     void exec(const std::shared_ptr<VulkanQueue> &queue);
 
     VkSemaphore getSignalSemaphore() const {

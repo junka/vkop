@@ -216,22 +216,80 @@ class ReshapeBuffer : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ReshapePC), fp16) {}
 
+    // Receive the converter's per-input value_dynamic annotation (option C).
+    // Used as a HINT only — the runtime auto-learning cache below is the
+    // authority. value_dynamic=true means "likely changes per round" so we
+    // skip the 2-round learning warmup and readback every round; false means
+    // "likely stable" so we still learn to confirm. Either way, the learned
+    // state (STABLE) is what actually skips readback.
+    void set_input_value_dynamic(const std::vector<bool> &vd) override {
+        shape_value_dynamic_ = (vd.size() > 1) ? vd[1] : true;
+    }
+    void invalidate_shape_cache() override {
+        // Phase boundary (prefill->decode): reset learning state so the new
+        // phase re-learns stability. The dims that were stable in prefill may
+        // differ in decode (seq collapses), so we can't carry STABLE across.
+        cache_state_ = LearnState::LEARNING;
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto in_shape = inputs[0]->getShape();
         auto shape = core::as_tensor<int64_t>(inputs[1]);
-        // The shape input may be GPU-resident only (produced by the int64
-        // Concat/Gather GPU shader in a prior level). Read it back so data_ is
-        // populated for the (*shape)[i] access below — same pattern as
-        // Unsqueeze/Slice/Cast/Expand. No-op (reserveOnCPU) if host-only.
-        shape->copyToCPU(m_cmdpool_);
-        int n = shape->num_elements();
-        std::vector<int> dim(n);
-        for (int i = 0; i < n; ++i) {
-            dim[i] = static_cast<int>((*shape)[i]);
+
+        // Resolve the output dim[] from the int64 shape input (inputs[1]).
+        //
+        // Runtime auto-learning cache (replaces converter-annotation-only
+        // caching): across decode rounds, most Reshape shape inputs are
+        // round-invariant (125/181 — only 56 kv_len-derived ones grow). Rather
+        // than trust the converter's value_dynamic hint, we LEARN by comparing
+        // two consecutive rounds' readback results:
+        //   LEARNING  (round 0): readback, store as learned_dim_.
+        //   CONFIRMING(round 1): readback, compare to learned_dim_.
+        //               match  -> STABLE: skip readback on round 2+ (reuse).
+        //               differ -> DYNAMIC: readback every round.
+        //   STABLE    (round 2+): reuse cached dim[], no copyToCPU stall.
+        //   DYNAMIC   (round 2+): readback every round (value changes).
+        // invalidate_shape_cache() (prefill->decode boundary) resets to
+        // LEARNING so the new phase re-learns. The 3.2ms submit+wait per
+        // Reshape is the dominant decode cost (181 × 3.2ms = 586ms); STABLE
+        // reshapes skip it entirely.
+        std::vector<int> dim;
+        bool need_readback = true;
+        if (cache_state_ == LearnState::STABLE) {
+            // Reuse the previously-read dim[] — no GPU->CPU sync this round.
+            dim = cached_dim_;
+            need_readback = false;
         }
+        if (need_readback) {
+            // The shape input may be GPU-resident only (produced by the int64
+            // Concat/Gather GPU shader in a prior level). Read it back so
+            // data_ is populated for the (*shape)[i] access below — same
+            // pattern as Unsqueeze/Slice/Cast/Expand. No-op (reserveOnCPU) if
+            // host-only.
+            shape->copyToCPU(m_cmdpool_);
+            int n = shape->num_elements();
+            dim.resize(n);
+            for (int i = 0; i < n; ++i) {
+                dim[i] = static_cast<int>((*shape)[i]);
+            }
+            // Advance the learning state machine.
+            if (cache_state_ == LearnState::LEARNING) {
+                learned_dim_ = dim;
+                cache_state_ = LearnState::CONFIRMING;
+            } else if (cache_state_ == LearnState::CONFIRMING) {
+                if (dim == learned_dim_) {
+                    cache_state_ = LearnState::STABLE;
+                    cached_dim_ = dim; // stable value to reuse next round
+                } else {
+                    cache_state_ = LearnState::DYNAMIC;
+                }
+            }
+            // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+        }
+        int n = static_cast<int>(dim.size());
         int total = total_elems(in_shape);
         // resolve a 0 dim by copying from the input, and -1 from the remainder
         for (int i = 0; i < n; ++i) {
@@ -318,6 +376,18 @@ class ReshapeBuffer : public BufferFactory {
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
         submit(&pc, UP_DIV(nthreads, 256), 1, 1);
     }
+
+    // --- shape-input value cache (runtime auto-learning) ---
+    // Most Reshape shape inputs are round-invariant across decode rounds
+    // (125/181; only 56 kv_len-derived grow). We learn stability by comparing
+    // two consecutive readbacks, then STABLE reshapes skip copyToCPU (the
+    // ~3.2ms submit+wait that dominates decode). See execute() for the state
+    // machine. invalidate_shape_cache() resets to LEARNING at phase boundaries.
+    enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    LearnState cache_state_ = LearnState::LEARNING;
+    bool shape_value_dynamic_ = true; // converter hint (unused by the learner)
+    std::vector<int> learned_dim_; // round-0 dim[] (compared against round-1)
+    std::vector<int> cached_dim_;  // STABLE dim[] reused on round 2+
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

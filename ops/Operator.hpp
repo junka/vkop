@@ -144,6 +144,12 @@ class Operator {
         fp_stored_.clear();
     }
 
+    // Drop any cached shape-input readback (option C: converter static
+    // annotation). Called by Runtime across a phase boundary (prefill→decode)
+    // where, even for value_dynamic=false shape tensors, the resolved dim[]
+    // could differ. Default no-op; only shape-consuming ops (Reshape) override.
+    virtual void invalidate_shape_cache() {}
+
     // These members are the public API the runtime/tests drive. They are
     // virtual so a PIMPL façade op can forward each to its image/buffer
     // impl (which owns the real pipeline/command-buffer state).
@@ -251,6 +257,18 @@ class Operator {
 
     virtual void set_name(const std::string &name) { name_ = name; }
     virtual std::string get_name() const { return name_; }
+
+    // Per-input "value_dynamic" annotation (converter-side: whether this
+    // input's ELEMENT VALUES vary across decode rounds — e.g. a shape tensor
+    // derived from kv_len is value_dynamic=true; a folded Constant shape is
+    // false). The runtime sets this before onExecute for shape-consuming ops
+    // (Reshape inputs[1]) so they can cache readback results across rounds and
+    // skip the per-round copyToCPU stall. Default no-op: only ops that read a
+    // shape input need override it. See core/runtime.cpp
+    // node_input_value_dynamic_.
+    virtual void set_input_value_dynamic(const std::vector<bool> &vd) {
+        (void)vd;
+    }
 
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
@@ -409,7 +427,34 @@ class Operator {
         }
     }
 
-    // Submit with a dedicated descriptor set for multi-pass operators.
+    // Variant of submit() where the dispatch dimensions come from a GPU buffer
+    // (vkCmdDispatchIndirect) instead of CPU-provided w/h/layers. Used by
+    // dynamic-dispatch ops whose thread count depends on a shape value that
+    // lives on the GPU (e.g. kv_len-driven attention) — avoids a GPU->CPU
+    // readback solely to know the dispatch dims. `dispatch_buf` must hold a
+    // VkDispatchIndirectCommand{w,h,z} at `dispatch_off`, written and
+    // barriered to INDIRECT_READ by a prior shader in the same cmd buffer.
+    // The fingerprint stores 0,0,0 for dims (the indirect buffer's contents
+    // aren't visible to the host at record time; replay of a dynamic op must
+    // re-run the shape->dispatch shader, so it never reaches CACHED anyway).
+    void submit_indirect(void *ptr, VkBuffer dispatch_buf,
+                         VkDeviceSize dispatch_off) {
+        if (!m_ds_[m_id_]) {
+            m_ds_[m_id_] = pipeline_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_[m_id_]);
+        pipeline_->updateDescriptorSets(writes_);
+
+        m_cmd_->bind(*pipeline_, m_ds_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_, static_cast<uint32_t>(pc_size_),
+                                   ptr);
+        }
+        m_cmd_->dispatch_indirect(dispatch_buf, dispatch_off);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, 0, 0, 0);
+        }
+    }
     // Each pass must use its own descriptor set because vkUpdateDescriptorSets
     // modifies the set immediately — all dispatches referencing the same set
     // see the LAST update's bindings, causing earlier passes to read wrong

@@ -225,6 +225,11 @@ void VulkanCommandBuffer::dispatch(int w, int h, int z) {
     vkCmdDispatch(m_commandBuffer_, w, h, z);
 }
 
+void VulkanCommandBuffer::dispatch_indirect(VkBuffer buffer,
+                                            VkDeviceSize offset) {
+    vkCmdDispatchIndirect(m_commandBuffer_, buffer, offset);
+}
+
 void VulkanCommandBuffer::exec(const std::shared_ptr<VulkanQueue> &queue) {
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;

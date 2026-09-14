@@ -417,6 +417,7 @@ class DAGBasedModel:
                 name = item["name"] if isinstance(item, dict) else str(item)
                 dims = item["shape"] if isinstance(item, dict) else []
                 dtype = item.get("dtype", "") if isinstance(item, dict) else ""
+                value_dynamic = bool(item.get("value_dynamic", False)) if isinstance(item, dict) else False
                 dtype = _dtype_to_str(dtype)
                 name_off = builder.CreateString(name)
                 ShapeRef.StartDimsVector(builder, len(dims))
@@ -429,6 +430,8 @@ class DAGBasedModel:
                 ShapeRef.AddDims(builder, dims_off)
                 if dtype_off:
                     ShapeRef.AddDtype(builder, dtype_off)
+                if value_dynamic:
+                    ShapeRef.AddValueDynamic(builder, True)
                 offs.append(ShapeRef.End(builder))
             Model.StartInputsVector(builder, len(offs))  # any Start*Vector works
             for off in reversed(offs):
@@ -597,7 +600,7 @@ class DAGBasedModel:
         # --- root Model table ---
         Model.Start(builder)
         Model.AddMagic(builder, 0x504F4B56)
-        Model.AddVersion(builder, 2)
+        Model.AddVersion(builder, 3)
         Model.AddInputs(builder, inputs_vec)
         Model.AddOutputs(builder, outputs_vec)
         Model.AddNodes(builder, nodes_vec)

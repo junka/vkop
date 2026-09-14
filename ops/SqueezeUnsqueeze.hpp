@@ -45,6 +45,16 @@ class SqueezeUnsqueeze : public Operator {
         }
     }
 
+    // Phase-boundary reset (prefill->decode): re-learn axis stability. The
+    // axes that are stable in prefill may differ in decode (seq collapses), so
+    // we can't carry STABLE across. Mirrors the ReshapeBuffer auto-learning
+    // cache: the axes input is a tiny int64 tensor whose values are almost
+    // always round-invariant (only the rare kv_len-derived one changes), so
+    // after two matching readbacks we skip copyToCPU and reuse cached axes.
+    void invalidate_shape_cache() override {
+        axes_cache_state_ = AxesLearnState::LEARNING;
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -53,16 +63,42 @@ class SqueezeUnsqueeze : public Operator {
         int rank = static_cast<int>(inshape.size());
 
         // Resolve axes: input[1] (int64) if present, else the attribute.
+        // The axes input (when present) is a tiny int64 tensor that is almost
+        // always round-invariant across decode (e.g. [-1], [0,2] fixed by the
+        // graph). Auto-learning cache: readback round0+round1; if equal, mark
+        // STABLE and skip copyToCPU on round 2+ (reuses cached axes). Same
+        // state-machine pattern as ReshapeBuffer. invalidate_shape_cache()
+        // (phase boundary) resets to LEARNING.
         std::vector<int> axes;
         if (inputs.size() > 1 && inputs[1]) {
-            auto ax = core::as_tensor<int64_t>(inputs[1]);
-            // Unconditional readback: a cross-round-recycled GPU input may
-            // have stale CPU data_ (see the data-input fix below / the
-            // ScatterElements fix — same stale-data_ class).
-            ax->copyToCPU(m_cmdpool_);
-            axes.reserve(ax->num_elements());
-            for (int i = 0; i < ax->num_elements(); ++i)
-                axes.push_back(static_cast<int>((*ax)[i]));
+            bool need_readback = true;
+            if (axes_cache_state_ == AxesLearnState::STABLE) {
+                axes = cached_axes_;
+                need_readback = false;
+            }
+            if (need_readback) {
+                auto ax = core::as_tensor<int64_t>(inputs[1]);
+                // Unconditional readback: a cross-round-recycled GPU input may
+                // have stale CPU data_ (see the data-input fix below / the
+                // ScatterElements fix — same stale-data_ class).
+                ax->copyToCPU(m_cmdpool_);
+                axes.reserve(ax->num_elements());
+                for (int i = 0; i < ax->num_elements(); ++i)
+                    axes.push_back(static_cast<int>((*ax)[i]));
+                // Advance the learning state machine.
+                if (axes_cache_state_ == AxesLearnState::LEARNING) {
+                    learned_axes_ = axes;
+                    axes_cache_state_ = AxesLearnState::CONFIRMING;
+                } else if (axes_cache_state_ == AxesLearnState::CONFIRMING) {
+                    if (axes == learned_axes_) {
+                        axes_cache_state_ = AxesLearnState::STABLE;
+                        cached_axes_ = axes;
+                    } else {
+                        axes_cache_state_ = AxesLearnState::DYNAMIC;
+                    }
+                }
+                // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+            }
         } else {
             axes = axes_attr_;
         }
@@ -145,6 +181,17 @@ class SqueezeUnsqueeze : public Operator {
 
     bool unsqueeze_;
     std::vector<int> axes_attr_;
+
+    // --- axes-input value cache (runtime auto-learning) ---
+    // The axes input is round-invariant across decode (only the rare
+    // kv_len-derived one changes). We learn stability by comparing two
+    // consecutive readbacks, then STABLE ops skip copyToCPU (the ~3.2ms
+    // submit+wait that dominates decode). See execute() for the state machine.
+    // invalidate_shape_cache() resets to LEARNING at phase boundaries.
+    enum class AxesLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    AxesLearnState axes_cache_state_ = AxesLearnState::LEARNING;
+    std::vector<int> learned_axes_; // round-0 axes (compared against round-1)
+    std::vector<int> cached_axes_;  // STABLE axes reused on round 2+
 };
 
 } // namespace ops

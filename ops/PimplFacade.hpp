@@ -59,6 +59,10 @@ class PimplFacade : public Operator {
     void enable_replay(bool v) override { impl_->enable_replay(v); }
     bool replay_cached() const override { return impl_->replay_cached(); }
     void force_replay_refresh() override { impl_->force_replay_refresh(); }
+    void invalidate_shape_cache() override { impl_->invalidate_shape_cache(); }
+    void set_input_value_dynamic(const std::vector<bool> &vd) override {
+        impl_->set_input_value_dynamic(vd);
+    }
 
   protected:
     std::unique_ptr<Operator> impl_;
