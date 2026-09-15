@@ -154,6 +154,7 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
             }
             for (uint32_t i = 0; i < propCount; i++) {
                 const auto &p = this->coopmatProps_[i];
+                (void)p;
                 LOG_INFO("CoopMat [%u]: %ux%ux%u AType=%d BType=%d CType=%d "
                          "ResultType=%d scope=%d",
                          i, p.MSize, p.NSize, p.KSize, p.AType, p.BType,
@@ -235,6 +236,8 @@ void VulkanDevice::assertImageConfigurationSupported(VkFormat format) {
         assert(false && "Unsupported tiling mode");
         return;
     }
+    (void)required_features_ptr; // used only in the assert below (empty under
+                                 // NDEBUG)
 
     VkFormatFeatureFlags required_features = 0;
     if (usage & VK_IMAGE_USAGE_SAMPLED_BIT) {
@@ -331,8 +334,9 @@ QueryChainResult VulkanDevice::buildFeatureQueryChain(
         auto struct_ptr = it->makeQueryStruct();
         if (!struct_ptr)
             continue;
-        struct_ptr->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
-        pnext = struct_ptr.get();
+        auto *base = static_cast<VkBaseOutStructure *>(struct_ptr.get());
+        base->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
+        pnext = base;
         result.ownedStructs.push_back(std::move(struct_ptr));
     }
     result.features2.pNext = pnext;
@@ -382,16 +386,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
             .extensionName = nullptr,
             .corePromotedVersion = VK_API_VERSION_1_1,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<VkPhysicalDeviceVulkan11Features>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceVulkan11Features,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan11Features *>(q);
                 if (!feat->storageBuffer16BitAccess &&
                     !feat->storageInputOutput16 &&
@@ -406,8 +408,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->storageInputOutput16 = feat->storageInputOutput16;
                 e->uniformAndStorageBuffer16BitAccess =
                     feat->uniformAndStorageBuffer16BitAccess;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -417,16 +418,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             .extensionName = nullptr,
             .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<VkPhysicalDeviceVulkan12Features>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceVulkan12Features,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan12Features *>(q);
                 if (!feat->shaderFloat16 && !feat->shaderInt8 &&
                     !feat->timelineSemaphore && !feat->bufferDeviceAddress &&
@@ -447,8 +446,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 m_support_timeline_semaphore_ = feat->timelineSemaphore;
                 m_support_descriptor_update_after_bind_ =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -460,17 +458,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
             .extensionName = VK_KHR_16BIT_STORAGE_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto queried =
                     std::make_unique<VkPhysicalDevice16BitStorageFeaturesKHR>();
                 *queried = makeFeatureStruct<
                     VkPhysicalDevice16BitStorageFeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(queried.release()));
+                return std::shared_ptr<void>(std::move(queried));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDevice16BitStorageFeaturesKHR *>(q);
                 if (!feat->storageBuffer16BitAccess &&
@@ -487,8 +483,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->storageInputOutput16 = feat->storageInputOutput16;
                 e->uniformAndStorageBuffer16BitAccess =
                     feat->uniformAndStorageBuffer16BitAccess;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -501,17 +496,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
             .extensionName = VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto queried = std::make_unique<
                     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR>();
                 *queried = makeFeatureStruct<
                     VkPhysicalDeviceShaderFloat16Int8FeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(queried.release()));
+                return std::shared_ptr<void>(std::move(queried));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *queried =
                     static_cast<VkPhysicalDeviceShaderFloat16Int8FeaturesKHR *>(
                         q);
@@ -525,8 +518,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR>();
                 enabled->shaderFloat16 = queried->shaderFloat16;
                 enabled->shaderInt8 = queried->shaderInt8;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(enabled.release()));
+                return std::shared_ptr<void>(std::move(enabled));
             }});
     }
 #endif
@@ -539,17 +531,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
             .extensionName = VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto queried = std::make_unique<
                     VkPhysicalDeviceShaderIntegerDotProductFeatures>();
                 *queried = makeFeatureStruct<
                     VkPhysicalDeviceShaderIntegerDotProductFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(queried.release()));
+                return std::shared_ptr<void>(std::move(queried));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *queried = static_cast<
                     VkPhysicalDeviceShaderIntegerDotProductFeatures *>(q);
                 if (!queried->shaderIntegerDotProduct)
@@ -562,8 +552,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR>();
                 enabled->shaderIntegerDotProduct =
                     queried->shaderIntegerDotProduct;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(enabled.release()));
+                return std::shared_ptr<void>(std::move(enabled));
             }});
     }
 #endif
@@ -574,16 +563,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
             .extensionName = nullptr, // Core
             .corePromotedVersion = VK_API_VERSION_1_3,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<VkPhysicalDeviceVulkan13Features>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceVulkan13Features,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan13Features *>(q);
                 if (!feat->robustImageAccess && !feat->maintenance4 &&
                     !feat->subgroupSizeControl)
@@ -595,8 +582,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->robustImageAccess = feat->robustImageAccess;
                 e->subgroupSizeControl = feat->subgroupSizeControl;
                 e->maintenance4 = feat->maintenance4;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -606,16 +592,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
             .extensionName = nullptr,
             .corePromotedVersion = VK_API_VERSION_1_4,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<VkPhysicalDeviceVulkan14Features>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceVulkan14Features,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan14Features *>(q);
                 printf("feat14 host image copy %d\n", feat->hostImageCopy);
                 if (!feat->hostImageCopy && !feat->maintenance5)
@@ -627,8 +611,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->hostImageCopy = feat->hostImageCopy;
                 m_support_host_image_copy_ = feat->hostImageCopy;
                 e->maintenance5 = feat->maintenance5;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -644,17 +627,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT,
             .extensionName = VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceHostImageCopyFeaturesEXT>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceHostImageCopyFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceHostImageCopyFeaturesEXT *>(q);
                 if (!feat->hostImageCopy)
@@ -666,8 +647,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_IMAGE_COPY_FEATURES_EXT>();
                 e->hostImageCopy = feat->hostImageCopy;
                 m_support_host_image_copy_ = feat->hostImageCopy;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -680,17 +660,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES,
             .extensionName = VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_3,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q =
                     std::make_unique<VkPhysicalDeviceImageRobustnessFeatures>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceImageRobustnessFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceImageRobustnessFeatures *>(q);
                 if (!feat->robustImageAccess)
@@ -701,8 +679,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceImageRobustnessFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_ROBUSTNESS_FEATURES>();
                 e->robustImageAccess = VK_TRUE;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             },
         });
     }
@@ -717,17 +694,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES,
             .extensionName = VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceTimelineSemaphoreFeatures>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceTimelineSemaphoreFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceTimelineSemaphoreFeatures *>(q);
                 if (!feat->timelineSemaphore)
@@ -739,8 +714,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
                 e->timelineSemaphore = VK_TRUE;
                 m_support_timeline_semaphore_ = true;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -754,17 +728,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES,
             .extensionName = VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceBufferDeviceAddressFeatures>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceBufferDeviceAddressFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceBufferDeviceAddressFeatures *>(
                         q);
@@ -776,8 +748,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceBufferDeviceAddressFeatures,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
                 e->bufferDeviceAddress = VK_TRUE;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -789,17 +760,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD,
             .extensionName = VK_AMD_DEVICE_COHERENT_MEMORY_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceCoherentMemoryFeaturesAMD>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceCoherentMemoryFeaturesAMD,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceCoherentMemoryFeaturesAMD *>(q);
                 if (!feat->deviceCoherentMemory)
@@ -810,8 +779,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceCoherentMemoryFeaturesAMD,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COHERENT_MEMORY_FEATURES_AMD>();
                 e->deviceCoherentMemory = feat->deviceCoherentMemory;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -824,17 +792,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR,
             .extensionName = VK_KHR_PERFORMANCE_QUERY_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDevicePerformanceQueryFeaturesKHR>();
                 *q = makeFeatureStruct<
                     VkPhysicalDevicePerformanceQueryFeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDevicePerformanceQueryFeaturesKHR *>(
                         q);
@@ -847,8 +813,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PERFORMANCE_QUERY_FEATURES_KHR>();
                 e->performanceCounterQueryPools =
                     feat->performanceCounterQueryPools;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -862,17 +827,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT,
             .extensionName = VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<
                     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT *>(q);
                 if (!feat->subgroupSizeControl)
@@ -883,8 +846,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceSubgroupSizeControlFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT>();
                 e->subgroupSizeControl = feat->subgroupSizeControl;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -896,17 +858,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT,
             .extensionName = VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceMemoryPriorityFeaturesEXT>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceMemoryPriorityFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceMemoryPriorityFeaturesEXT *>(q);
                 if (!feat->memoryPriority)
@@ -917,8 +877,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VkPhysicalDeviceMemoryPriorityFeaturesEXT,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PRIORITY_FEATURES_EXT>();
                 e->memoryPriority = feat->memoryPriority;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -930,17 +889,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR,
             .extensionName = VK_KHR_COOPERATIVE_MATRIX_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceCooperativeMatrixFeaturesKHR>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceCooperativeMatrixFeaturesKHR,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR *>(
                         q);
@@ -953,8 +910,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR>();
                 e->cooperativeMatrix = feat->cooperativeMatrix;
                 m_support_cooperate_matrix_ = feat->cooperativeMatrix;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -966,17 +922,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV,
             .extensionName = VK_NV_COOPERATIVE_MATRIX_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceCooperativeMatrixFeaturesNV>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceCooperativeMatrixFeaturesNV,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceCooperativeMatrixFeaturesNV *>(
                         q);
@@ -989,8 +943,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_NV>();
                 e->cooperativeMatrix = feat->cooperativeMatrix;
                 m_support_nv_tensor_core_ = feat->cooperativeMatrix;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -1003,17 +956,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV,
             .extensionName = VK_NV_CUDA_KERNEL_LAUNCH_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceCudaKernelLaunchFeaturesNV>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceCudaKernelLaunchFeaturesNV,
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV>();
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDeviceCudaKernelLaunchFeaturesNV *>(
                         q);
@@ -1026,8 +977,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV>();
                 e->cudaKernelLaunchFeatures = VK_TRUE;
                 m_support_cuda_kernel_launch_ = true;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -1037,15 +987,13 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
             .extensionName = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = []() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = []() -> std::shared_ptr<void> {
                 auto q = std::make_unique<VkPhysicalDeviceFeatures2>();
                 q->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
                 q->pNext = nullptr;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceFeatures2 *>(q);
                 if (!feat->features.geometryShader)
                     return nullptr;
@@ -1053,8 +1001,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
                 e->pNext = nullptr;
                 e->features = feat->features;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -1065,17 +1012,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT,
             .extensionName = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME,
             .corePromotedVersion = 0,
-            .makeQueryStruct = []() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = []() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceExternalMemoryHostPropertiesEXT>();
                 q->sType =
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
                 q->pNext = nullptr;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<
                     VkPhysicalDeviceExternalMemoryHostPropertiesEXT *>(q);
                 if (!feat->minImportedHostPointerAlignment)
@@ -1087,8 +1032,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->pNext = nullptr;
                 e->minImportedHostPointerAlignment =
                     feat->minImportedHostPointerAlignment;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
@@ -1100,17 +1044,15 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
             .extensionName = VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_2,
-            .makeQueryStruct = [this]() -> std::unique_ptr<VkBaseOutStructure> {
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
                 auto q = std::make_unique<
                     VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
                 q->sType =
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES;
                 q->pNext = nullptr;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(q.release()));
+                return std::shared_ptr<void>(std::move(q));
             },
-            .makeEnableStruct =
-                [this](void *q) -> std::unique_ptr<VkBaseOutStructure> {
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<
                     VkPhysicalDeviceDescriptorIndexingFeaturesEXT *>(q);
                 if (!feat->descriptorBindingStorageBufferUpdateAfterBind)
@@ -1124,8 +1066,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
                 m_support_descriptor_update_after_bind_ =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
-                return std::unique_ptr<VkBaseOutStructure>(
-                    reinterpret_cast<VkBaseOutStructure *>(e.release()));
+                return std::shared_ptr<void>(std::move(e));
             },
         });
     }
@@ -1144,6 +1085,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
         };
         const auto &desc = descs[i];
+        (void)desc;
         LOG_INFO("Descriptor %zu: sType=%s, extensionName=%s, coreVersion=%u",
                  i,
                  desc_names.find(desc.sType) != desc_names.end()
@@ -1211,13 +1153,15 @@ bool VulkanDevice::createLogicalDevice(
     void *pnext = nullptr;
     for (auto it = enable_result.enableChain.rbegin();
          it != enable_result.enableChain.rend(); ++it) {
-        (*it)->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
-        pnext = it->get();
+        auto *base = static_cast<VkBaseOutStructure *>(it->get());
+        base->pNext = reinterpret_cast<VkBaseOutStructure *>(pnext);
+        pnext = base;
     }
     create_info.pNext = pnext;
     LOG_INFO("enabled extensions count %d",
              enable_result.enabledExtensions.size());
-    for (auto &e : enable_result.enabledExtensions) {
+    for (const auto &e : enable_result.enabledExtensions) {
+        (void)e;
         LOG_INFO("enabled extension: %s", e);
     }
 

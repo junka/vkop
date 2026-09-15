@@ -97,6 +97,7 @@ VulkanSwapchain::VulkanSwapchain(std::shared_ptr<VulkanDevice> &vdev,
     create_info.oldSwapchain = VK_NULL_HANDLE;
     auto ret = vkCreateSwapchainKHR(vdev_->getLogicalDevice(), &create_info,
                                     nullptr, &swapchain_);
+    (void)ret; // checked only in the assert below (empty under NDEBUG)
     assert(ret == VK_SUCCESS);
     createSwapImages();
 }
@@ -137,6 +138,7 @@ void VulkanSwapchain::createSwapImages() {
         create_info.subresourceRange.layerCount = 1;
         auto ret = vkCreateImageView(vdev_->getLogicalDevice(), &create_info,
                                      nullptr, &image_views_[i]);
+        (void)ret; // checked only in the assert below (empty under NDEBUG)
         assert(ret == VK_SUCCESS);
     }
 }

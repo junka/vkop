@@ -30,17 +30,22 @@ struct FeatureDescriptor {
     const char *extensionName = nullptr;
     uint32_t corePromotedVersion = 0;
 
-    std::function<std::unique_ptr<VkBaseOutStructure>()> makeQueryStruct;
+    std::function<std::shared_ptr<void>()> makeQueryStruct;
 
-    std::function<std::unique_ptr<VkBaseOutStructure>(void *queried)>
-        makeEnableStruct;
+    std::function<std::shared_ptr<void>(void *queried)> makeEnableStruct;
 };
 struct QueryChainResult {
     VkPhysicalDeviceFeatures2 features2{};
-    std::vector<std::unique_ptr<VkBaseOutStructure>> ownedStructs;
+    // shared_ptr<void> (not unique_ptr<VkBaseOutStructure>): the type-erased
+    // deleter remembers the concrete struct type allocated by the
+    // makeQueryStruct/makeEnableStruct lambdas, so destruction frees the
+    // derived object correctly. unique_ptr<VkBaseOutStructure> would delete a
+    // plain C struct through the base pointer (new/delete type mismatch —
+    // caught by ASan, UB regardless).
+    std::vector<std::shared_ptr<void>> ownedStructs;
 };
 struct EnableResult {
-    std::vector<std::unique_ptr<VkBaseOutStructure>> enableChain;
+    std::vector<std::shared_ptr<void>> enableChain;
     std::vector<const char *> enabledExtensions;
 };
 class VulkanDevice {

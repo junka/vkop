@@ -553,6 +553,7 @@ void VulkanImage::copyImageToImage(VkCommandBuffer commandBuffer,
 #ifdef VK_EXT_host_image_copy
 void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     VkResult ret;
+    (void)ret; // checked only in the assert below (empty under NDEBUG)
     VkImageSubresourceRange subrange = {};
     subrange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
     subrange.baseMipLevel = 0;
