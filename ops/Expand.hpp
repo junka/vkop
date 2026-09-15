@@ -14,14 +14,22 @@ extern unsigned char buffer_expand_spv[];
 extern unsigned int buffer_expand_spv_len;
 extern unsigned char buffer_expand_fp16_spv[];
 extern unsigned int buffer_expand_fp16_spv_len;
+extern unsigned char buffer_expand_int64_spv[];
+extern unsigned int buffer_expand_int64_spv_len;
 }
 namespace vkop {
 namespace ops {
 
 namespace expand {
+// PC layout mirrors shaders/buffer/expand.comp (std430). Shapes are
+// left-aligned 8-int arrays (fill_dims pads trailing slots with 1). The `fp16`
+// field is the fp16 pack flag on the fp path; on the int64 path (separate
+// pipeline, expand_int64.comp) it is REPURPOSED as `total` (output element
+// count) — fp16 packing is irrelevant for int64-as-ivec2 data. The int64
+// pipeline shares this PC layout/size so only the spv differs.
 struct GpuExpandParam {
     int rank;
-    int fp16;
+    int fp16; // fp32/fp16 path: pack flag. int64 path: total (output count).
     int inDims[8];
     int outDims[8];
     int _pad0;
@@ -76,6 +84,49 @@ class Expand : public Operator {
         param_.fp16 = fp16 ? 1 : 0;
     }
 
+    // Build the int64-data pipeline lazily on first int64 execute. The int64
+    // shader (expand_int64.comp) has the same descriptor layout (2× STORAGE:
+    // output, input) and PC layout as the fp32 expand, so it builds from the
+    // same types_/pc_size_; only the spv differs. Descriptor sets are allocated
+    // from the int64 pipeline (sets are pool-specific to a pipeline layout).
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_)
+            return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_,
+            reinterpret_cast<const uint32_t *>(buffer_expand_int64_spv),
+            buffer_expand_int64_spv_len, use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+    }
+
+    // When in int64 mode, bind the int64 pipeline + its descriptor sets
+    // instead of the base fp32/fp16 pipeline. The base submit() hardcodes
+    // pipeline_/m_ds_; this override redirects them for the int64 dispatch.
+    void submit(void *ptr, int width, int height, int layers) override {
+        if (!int64_mode_) {
+            Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (!m_ds_int64_[m_id_]) {
+            m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+        pipeline_int64_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_int64_,
+                                   static_cast<uint32_t>(pc_size_), ptr);
+        }
+        m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
+        }
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -97,12 +148,46 @@ class Expand : public Operator {
             });
         }
 
-        // int64 data: CPU broadcast (part of the shape meta-chain). The target
-        // shape (inputs[1]) is the authoritative source — do NOT trust a
-        // recycled output's stale shape. inputs[1] is CPU-resident here.
+        // int64 data: GPU broadcast via expand_int64.comp (part of the shape
+        // meta-chain). Previously this was a CPU broadcast: read_target_shape
+        // (a sync readback) + src->copyToCPU (another readback) + host loop +
+        // copyToGPUDeferred. The GPU shader reads the input as ivec2[] and
+        // writes the broadcast output as ivec2[] — verbatim 8-byte copies, no
+        // 64-bit math needed (Expand is a broadcast indexed copy).
+        //
+        // The target shape (out dims) is passed via push_constant (outDims) —
+        // the runtime resolves it from the target-shape input via the
+        // auto-learning cache (decode-stable for most Expands) or a readback
+        // (dynamic ones). Either way the CPU knows outDims at dispatch time, so
+        // dispatch is exact (UP_DIV(total,256), no over-dispatch).
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            std::vector<int> target_shape =
-                expand::read_target_shape(inputs[1], m_cmdpool_);
+            // Resolve the target shape from inputs[1] with an auto-learning
+            // cache: across decode rounds, most Expand target shapes are
+            // round-invariant (only the kv_len-derived ones grow). After two
+            // matching readbacks, STABLE skips the readback and reuses the
+            // cached target_shape. invalidate_shape_cache() (phase boundary)
+            // resets to LEARNING.
+            std::vector<int> target_shape;
+            bool need_readback = true;
+            if (target_cache_state_ == TargetLearnState::STABLE) {
+                target_shape = cached_target_;
+                need_readback = false;
+            }
+            if (need_readback) {
+                target_shape = expand::read_target_shape(inputs[1], m_cmdpool_);
+                if (target_cache_state_ == TargetLearnState::LEARNING) {
+                    learned_target_ = target_shape;
+                    target_cache_state_ = TargetLearnState::CONFIRMING;
+                } else if (target_cache_state_ ==
+                           TargetLearnState::CONFIRMING) {
+                    if (target_shape == learned_target_) {
+                        target_cache_state_ = TargetLearnState::STABLE;
+                        cached_target_ = target_shape;
+                    } else {
+                        target_cache_state_ = TargetLearnState::DYNAMIC;
+                    }
+                }
+            }
             // ONNX Expand output shape = right-aligned broadcast of input vs
             // target: dim is the input dim when it is neither 1 nor -1 (a
             // concrete value, including 0=empty), else the target dim. This
@@ -127,19 +212,37 @@ class Expand : public Operator {
                 out_shape[maxd - 1 - i] = v;
             }
             int total = total_elems(out_shape);
-            std::vector<int64_t> out(static_cast<size_t>(total));
-            auto src = core::as_tensor<int64_t>(inputs[0]);
-            // Unconditional readback: a cross-round-recycled GPU input may
-            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
-            src->copyToCPU(m_cmdpool_);
-            for (int i = 0; i < total; ++i) {
-                out[i] = (*src)[broadcast_index(inshape, out_shape, i)];
-            }
+
+            ensure_int64_pipeline();
+            int64_mode_ = true;
+
+            // Output SSBO (int64 as ivec2 — 8 bytes/elem, same stride).
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(out_shape);
-            output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPUDeferred(m_cmd_);
+            // Data input SSBO (nullptr cmd: no barrier — the input was produced
+            // by a prior level's shader; the level submit provides ordering).
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            objs_.emplace_back(src->as_storage_buffer(m_dev_, nullptr));
+            // The base Expand pipeline declares a 3rd STORAGE binding for the
+            // target-shape input (used by the fp shader). The int64 shader
+            // does NOT read it (outDims come via push_constant), but the
+            // descriptor-set layout matches types_ (3× STORAGE), so bind a
+            // valid SSBO to keep fillWriteDescriptorSets in bounds. Bind the
+            // target tensor's SSBO whatever its dtype (int64 in the LLM; int32
+            // in some tests) — dispatch_by_dtype resolves the right as_tensor.
+            dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto target = core::as_tensor<T>(inputs[1]);
+                objs_.emplace_back(target->as_storage_buffer(m_dev_, nullptr));
+            });
+
+            param_.rank = static_cast<int>(out_shape.size());
+            param_.fp16 = total; // fp16 field repurposed as total on int64 path
+            fill_dims(param_.outDims, out_shape);
+            fill_dims_broadcast(param_.inDims, inshape, param_.rank);
+            submit(&param_, UP_DIV(total, 256), 1, 1);
+            int64_mode_ = false;
             return;
         }
 
@@ -218,7 +321,29 @@ class Expand : public Operator {
         submit(&param_, UP_DIV(nthreads, 256), 1, 1);
     }
 
-    expand::GpuExpandParam param_;
+  public:
+    // Phase boundary (prefill->decode): reset the target-shape learning state
+    // so the new phase re-learns stability. A target shape stable in prefill
+    // may differ in decode (seq collapses), so STABLE can't carry across.
+    void invalidate_shape_cache() override {
+        target_cache_state_ = TargetLearnState::LEARNING;
+    }
+
+  private:
+    // --- target-shape (inputs[1]) value cache (runtime auto-learning) ---
+    // Across decode rounds, most Expand target shapes are round-invariant
+    // (only the kv_len-derived ones grow). Learn stability by comparing two
+    // consecutive readbacks, then STABLE skips copyToCPU. See execute() for
+    // the state machine.
+    enum class TargetLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    TargetLearnState target_cache_state_ = TargetLearnState::LEARNING;
+    std::vector<int> learned_target_; // round-0 target (compared vs round-1)
+    std::vector<int> cached_target_;  // STABLE target reused on round 2+
+
+    expand::GpuExpandParam param_{};
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
+    bool int64_mode_ = false;
 };
 
 } // namespace ops

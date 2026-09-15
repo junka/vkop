@@ -1,0 +1,56 @@
+#version 450 core
+
+// int64-data Expand: ONNX Expand broadcasts the input (binding 1) to the target
+// shape, writing the output (binding 0). Same broadcast semantics as
+// buffer_expand.comp, but the DATA and OUTPUT are int64 tensors bound as
+// ivec2[] (8 bytes/elem — the established pattern, see gather_int64.comp). The
+// device has no shaderInt64 feature, so int64 SSBOs are viewed as ivec2 and
+// copied verbatim (both words) — Expand is a broadcast indexed copy, no 64-bit
+// math needed.
+//
+// Replaces Expand::execute int64 path (ops/Expand.hpp), which did
+// copyToCPU(src) + host broadcast loop + copyToGPUDeferred = a sync readback
+// stall per call (~1.5ms × 68 = ~100ms/round). The GPU dispatch records into
+// the level command buffer with no stall.
+//
+// The target shape (out dims) is passed via push_constant (outDims) — the
+// runtime resolves it from the target-shape input via the auto-learning cache
+// (decode-stable for most Expands) or a readback (dynamic ones). Either way the
+// CPU knows outDims at dispatch time, so dispatch is exact
+// (UP_DIV(total,256), no over-dispatch).
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    ivec2 data[];
+} uInput;
+
+// PC layout matches expand::GpuExpandParam (rank, fp16-reused-as-total,
+// inDims[8], outDims[8]) so the int64 pipeline shares the op's pc_size_ and
+// param_ struct — only the spv differs (see Gather's int64 pipeline pattern).
+// The `fp16` field is repurposed as `total` (output element count) on the
+// int64 path (fp16 packing is irrelevant for int64-as-ivec2 data).
+layout(push_constant) uniform PC_ExpandInt64 {
+    int rank;      // rank of input AND output (right-aligned broadcast)
+    int total;     // product(outDims) — output element count (fp16 field reused)
+    IArr8 inDims;  // input shape (rank valid entries)
+    IArr8 outDims; // output/target shape (rank valid entries)
+} uPC;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) return;
+
+    // Output nd-coordinate -> input nd-coordinate (broadcast: in dim of size 1
+    // maps every out coord to index 0). Right-aligned: dims beyond the input's
+    // rank are leading-1 (broadcast). broadcast_index handles this when both
+    // shapes share the same rank (outDims[i]=1 for leading broadcast dims).
+    int in_linear = broadcast_index(gid, uPC.outDims, uPC.inDims, uPC.rank);
+
+    uOutput.data[gid] = uInput.data[in_linear];
+}
