@@ -107,6 +107,18 @@ class Equal : public BufferBinaryFactory {
                 (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
             pc.total = total;
             submit(&pc, UP_DIV(total, 256), 1, 1);
+            // Flush the shader's writes to the output (cond) buffer so the
+            // next level's GPU reader (Where's int64 path) sees them. The
+            // output's readBarrier (from as_storage_buffer) tracked m_access_
+            // as SHADER_READ, which would make the next reader's barrier a
+            // no-op READ->READ and skip the SHADER_WRITE visibility.
+            // shaderWriteBarrier explicitly sets srcAccess=SHADER_WRITE so the
+            // write is flushed (see ScatterND/Where's same post-dispatch
+            // pattern).
+            auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+            if (out_buf) {
+                out_buf->shaderWriteBarrier(m_cmd_->get());
+            }
             int64_mode_ = false;
             return;
         }
