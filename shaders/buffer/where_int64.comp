@@ -14,10 +14,14 @@
 // records into the level command buffer with no stall. The output stays
 // GPU-resident for downstream Expand/Unsqueeze.
 //
-// PC layout: WhereInt64PC (rank, _pad, outDims, in0Dims, in1Dims, in2Dims) as
-// 4× ivec4 shapes (16B each). Where's outputs in the LLM are rank ≤ 4
+// PC layout: WhereInt64PC (rank, _pad×3, outDims, in0Dims, in1Dims, in2Dims).
+// The dim fields are ivec4 (16B each). Under std430 (Vulkan's default for
+// push_constant), ivec4 is 16-byte aligned, so outDims lands at byte offset 16
+// — the host struct MUST place 3 pad ints after `rank` to match (a single pad
+// would put outDims at offset 8 in C++ → silent layout mismatch → garbage
+// outDims → total=0 → only gid=0 writes). Where's outputs are rank ≤ 4
 // (rotary shape-meta, e.g. [5] = 1-D 5-elem, [4], [3], [2]), so ivec4 suffices
-// and keeps the PC at 72B (well under the 128B limit). A separate pipeline with
+// and keeps the PC at 80B (well under the 128B limit). A separate pipeline with
 // its own pc_size_ (Where's base pipeline has pc_size 0).
 
 layout(set = 0, binding = 0) writeonly buffer Output {
@@ -35,7 +39,9 @@ layout(set = 0, binding = 3) readonly buffer InputY {
 
 layout(push_constant) uniform PC_WhereInt64 {
     int rank;       // common rank for nd<->linear (== out rank, ≤ 4)
-    int _pad;       // alignas(16) padding (struct is alignas(16) on the host)
+    int _pad;       // explicit pad (outDims is 16-aligned in std430)
+    int _pad2;      // explicit pad so outDims lands at offset 16
+    int _pad3;      // explicit pad so outDims lands at offset 16
     ivec4 outDims;  // output shape (left-aligned, rank valid, rest = 1)
     ivec4 in0Dims;  // cond shape (right-aligned to rank)
     ivec4 in1Dims;  // X shape (right-aligned to rank)

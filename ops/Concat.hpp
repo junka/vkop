@@ -260,6 +260,16 @@ class ConcatBuffer : public BufferFactory {
         for (int i = 0; i < n_inputs; ++i) {
             pipeline_int64_->freeDescriptorSets(pass_ds[i]);
         }
+        // Flush the per-input shader writes to the output buffer so the next
+        // level's GPU reader (e.g. Where's int64 path) sees them. The output's
+        // readBarrier (from as_storage_buffer) tracked m_access_ as
+        // SHADER_READ, which would make the next reader's barrier a no-op
+        // READ->READ and skip the SHADER_WRITE visibility. (When the downstream
+        // consumer read Y on CPU via copyToCPU, the sync submit+wait masked
+        // this; a GPU consumer reads directly and needs the explicit flush.)
+        if (out_buf) {
+            out_buf->shaderWriteBarrier(m_cmd_->get());
+        }
     }
 
     void execute(
