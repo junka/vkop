@@ -1,0 +1,68 @@
+#version 450 core
+
+// int64-data Equal: C[i] = (A[i] == B[i]) ? 1 : 0, broadcasted to out_shape.
+// Same broadcast semantics as the fp buffer_equal path, but DATA/OUTPUT are
+// int64 tensors bound as ivec2[] (8 bytes/elem — the established pattern, see
+// gather_int64.comp / expand_int64.comp). The device has no shaderInt64
+// feature, so int64 SSBOs are viewed as ivec2 and compared word-pair-wise
+// (both .x and .y must match). Equal is a 64-bit equality, which is just two
+// 32-bit word comparisons ANDed — no 64-bit math needed.
+//
+// Replaces Equal::execute int64 path (ops/Equal.hpp), which did read_int64_cached
+// (a sync readback) + host comparison loop + copyToGPUDeferred. The GPU dispatch
+// records into the level command buffer with no stall. The output stays
+// GPU-resident for downstream Where (when Where is also GPU-ified) — otherwise
+// Where's readback still crosses GPU->CPU (the Equal output-cache lesson).
+//
+// The output is int64 1/0 (not bool/uint) because Where's int64 branch reads
+// `cond != 0`. PC layout mirrors BinaryElemPC (rank, outDims[8], in0Dims[8],
+// in1Dims[8], activation, broadcast, total, _pad) so the int64 pipeline shares
+// the op's pc_size_; only the spv differs. The shader reads `total` and
+// `broadcast`; `activation` is unused.
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InputA {
+    ivec2 data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InputB {
+    ivec2 data[];
+} uInputB;
+
+layout(push_constant) uniform PC_EqualInt64 {
+    int rank;      // common rank for nd<->linear (== out rank)
+    IArr8 outDims; // left-aligned output shape
+    IArr8 in0Dims; // input A, right-aligned to `rank`
+    IArr8 in1Dims; // input B, right-aligned to `rank`
+    int activation; // unused (kept for layout parity with BinaryElemPC)
+    int broadcast;  // 1 if either input needs broadcasting
+    int total;      // output element count
+    int _pad;
+} uPC;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) return;
+
+    int a_linear, b_linear;
+    if (uPC.broadcast == 0) {
+        a_linear = gid;
+        b_linear = gid;
+    } else {
+        a_linear = broadcast_index(gid, uPC.outDims, uPC.in0Dims, uPC.rank);
+        b_linear = broadcast_index(gid, uPC.outDims, uPC.in1Dims, uPC.rank);
+    }
+
+    ivec2 av = uInputA.data[a_linear];
+    ivec2 bv = uInputB.data[b_linear];
+    int eq = (av.x == bv.x && av.y == bv.y) ? 1 : 0;
+    // int64 1/0: .x holds the value, .y is 0 (both words written so the int64
+    // is well-formed regardless of endianness — the high word is 0 for small
+    // ints, which 1 and 0 both are).
+    uOutput.data[gid] = ivec2(eq, 0);
+}
