@@ -309,20 +309,43 @@ class ReshapeBuffer : public BufferFactory {
             }
         }
 
-        // int64 data: a reshape is a metadata-only change, so the output is a
-        // 1:1 contiguous copy (part of the shape meta-chain). The shape input
-        // (inputs[1]) is already CPU-resident.
+        // int64 data: a reshape is a metadata-only change — the element bytes
+        // are identical, only the logical shape differs. This is part of the
+        // int64 shape meta-chain.
+        //
+        // GPU-alias fast path (Phase 2): when the input is GPU-resident, the
+        // output SHARES the input's VkBuffer — same bytes, just a different
+        // shape. No readback, no re-upload. The view op preserves element count
+        // (total from inputs[0] == output total), so the input's buffer is
+        // exactly large enough. `dim` (the new shape) is still resolved above
+        // — via the auto-learning cache for stable reshapes (no readback) or a
+        // shape-input readback for dynamic ones — because downstream needs the
+        // CPU-known dims_ for getShape()/dispatch. But the DATA no longer
+        // crosses GPU->CPU.
+        //
+        // CPU fallback: when the input is host-only, copy bytes through CPU.
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            std::vector<int64_t> out(static_cast<size_t>(total));
             auto src = core::as_tensor<int64_t>(inputs[0]);
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(dim);
+
+            if (src->has_gpu_buffer()) {
+                // Alias the input's GPU buffer: no data readback, no re-upload.
+                auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                    src->as_storage_buffer(m_dev_, m_cmd_));
+                objs_.emplace_back(
+                    output->alias_storage_buffer(src_buff, m_cmd_));
+                return;
+            }
+
+            // Host-only input: copy bytes through the CPU.
+            std::vector<int64_t> out(static_cast<size_t>(total));
             // Unconditional readback: a cross-round-recycled GPU input may
             // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
             src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[static_cast<size_t>(i)] = (*src)[i];
             }
-            auto output = core::as_tensor<int64_t>(outputs[0]);
-            output->resize(dim);
             output->fillToCPU(out);
             // as_storage_buffer creates vkobj_ (STORAGE|TRANSFER_DST); the
             // deferred upload records vkCmdUpdateBuffer into the level cmd
@@ -335,16 +358,27 @@ class ReshapeBuffer : public BufferFactory {
         // int8/bool data (e.g. the LLM's image_pad_mask): a reshape is a
         // metadata-only byte copy. The buffer reshape shader reads uint words
         // (fp32/fp16), which would misread 1-byte int8 elements as packed
-        // words — so copy on the host like the int64 path. The mask is tiny.
+        // words — so on the CPU fallback we copy byte-by-byte. But when the
+        // input is GPU-resident, alias its buffer (same bytes, new shape) — no
+        // readback needed. The mask is tiny either way.
         if (inputs[0]->dtype() == typeid(int8_t)) {
-            std::vector<int8_t> out(static_cast<size_t>(total));
             auto src = core::as_tensor<int8_t>(inputs[0]);
+            auto output = core::as_tensor<int8_t>(outputs[0]);
+            output->resize(dim);
+
+            if (src->has_gpu_buffer()) {
+                auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                    src->as_storage_buffer(m_dev_, m_cmd_));
+                objs_.emplace_back(
+                    output->alias_storage_buffer(src_buff, m_cmd_));
+                return;
+            }
+
+            std::vector<int8_t> out(static_cast<size_t>(total));
             src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[static_cast<size_t>(i)] = (*src)[i];
             }
-            auto output = core::as_tensor<int8_t>(outputs[0]);
-            output->resize(dim);
             output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPUDeferred(m_cmd_);
