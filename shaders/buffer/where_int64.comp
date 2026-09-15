@@ -1,0 +1,103 @@
+#version 450 core
+
+// int64-data Where: out[i] = (cond[i] != 0) ? X[i] : Y[i], broadcasted to
+// out_shape. Same broadcast semantics as the int64 Where CPU branch, but
+// DATA/OUTPUT are int64 tensors bound as ivec2[] (8 bytes/elem — the
+// established pattern, see gather_int64.comp / expand_int64.comp). The device
+// has no shaderInt64 feature, so int64 SSBOs are viewed as ivec2 and copied
+// verbatim (both words). Where is a broadcast indexed select — no 64-bit math
+// (cond is compared != 0 on the low word only, which is sufficient because the
+// int64 Equal output writes ivec2(eq,0) and host int64 booleans are 0/1).
+//
+// Replaces Where::execute int64 path (ops/Where.hpp), which did read_int64_cached
+// (3× sync readback) + host select loop + copyToGPUDeferred. The GPU dispatch
+// records into the level command buffer with no stall. The output stays
+// GPU-resident for downstream Expand/Unsqueeze.
+//
+// PC layout: WhereInt64PC (rank, _pad, outDims, in0Dims, in1Dims, in2Dims) as
+// 4× ivec4 shapes (16B each). Where's outputs in the LLM are rank ≤ 4
+// (rotary shape-meta, e.g. [5] = 1-D 5-elem, [4], [3], [2]), so ivec4 suffices
+// and keeps the PC at 72B (well under the 128B limit). A separate pipeline with
+// its own pc_size_ (Where's base pipeline has pc_size 0).
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Cond {
+    ivec2 data[];
+} uCond;
+layout(set = 0, binding = 2) readonly buffer InputX {
+    ivec2 data[];
+} uInputX;
+layout(set = 0, binding = 3) readonly buffer InputY {
+    ivec2 data[];
+} uInputY;
+
+layout(push_constant) uniform PC_WhereInt64 {
+    int rank;       // common rank for nd<->linear (== out rank, ≤ 4)
+    int _pad;       // alignas(16) padding (struct is alignas(16) on the host)
+    ivec4 outDims;  // output shape (left-aligned, rank valid, rest = 1)
+    ivec4 in0Dims;  // cond shape (right-aligned to rank)
+    ivec4 in1Dims;  // X shape (right-aligned to rank)
+    ivec4 in2Dims;  // Y shape (right-aligned to rank)
+} uPC;
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// 4-D broadcast index: out_linear -> in_linear, right-aligned broadcast (in dim
+// of size 1 maps every out coord to index 0). Mirrors the C++ broadcast_index
+// in BufferBase.hpp.
+int broadcast_index4(int out_linear, ivec4 out_dims, ivec4 in_dims, int rank) {
+    int coord0, coord1, coord2, coord3;
+    int t = out_linear;
+    coord3 = (rank >= 4) ? (t % out_dims[3]) : 0;
+    if (rank >= 4) t /= out_dims[3];
+    coord2 = (rank >= 3) ? (t % out_dims[2]) : 0;
+    if (rank >= 3) t /= out_dims[2];
+    coord1 = (rank >= 2) ? (t % out_dims[1]) : 0;
+    if (rank >= 2) t /= out_dims[1];
+    coord0 = (rank >= 1) ? (t % out_dims[0]) : 0;
+
+    int in_linear = 0;
+    int stride = 1;
+    if (rank >= 4) {
+        int ic = (in_dims[3] == 1) ? 0 : coord3;
+        in_linear += ic * stride;
+        stride *= in_dims[3];
+    }
+    if (rank >= 3) {
+        int ic = (in_dims[2] == 1) ? 0 : coord2;
+        in_linear += ic * stride;
+        stride *= in_dims[2];
+    }
+    if (rank >= 2) {
+        int ic = (in_dims[1] == 1) ? 0 : coord1;
+        in_linear += ic * stride;
+        stride *= in_dims[1];
+    }
+    if (rank >= 1) {
+        int ic = (in_dims[0] == 1) ? 0 : coord0;
+        in_linear += ic * stride;
+        stride *= in_dims[0];
+    }
+    return in_linear;
+}
+
+void main() {
+    int total = 1;
+    for (int i = 0; i < uPC.rank; ++i) {
+        total *= uPC.outDims[i];
+    }
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= total) return;
+
+    int c_linear = broadcast_index4(gid, uPC.outDims, uPC.in0Dims, uPC.rank);
+    int x_linear = broadcast_index4(gid, uPC.outDims, uPC.in1Dims, uPC.rank);
+    int y_linear = broadcast_index4(gid, uPC.outDims, uPC.in2Dims, uPC.rank);
+
+    // cond != 0: the int64 Equal output writes ivec2(eq,0); host int64
+    // booleans are 0/1. Either way the low word (.x) is the discriminant.
+    ivec2 cv = uCond.data[c_linear];
+    ivec2 sel = (cv.x != 0) ? uInputX.data[x_linear] : uInputY.data[y_linear];
+    uOutput.data[gid] = sel;
+}

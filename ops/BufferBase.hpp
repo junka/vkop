@@ -158,6 +158,25 @@ inline void fill_dims_broadcast(int (&dims)[8], const std::vector<int> &shape,
         dims[out_rank - r + i] = shape[i];
 }
 
+// 4-int variants for ops whose PC uses ivec4 shapes (rank ≤ 4 — e.g. the
+// int64 Where GPU path, where 4× IArr8 would overflow the 128B PC limit).
+inline void fill_dims4(int (&dims)[4], const std::vector<int> &shape) {
+    for (int i = 0; i < 4; ++i)
+        dims[i] = 1;
+    int r = static_cast<int>(std::min<size_t>(shape.size(), 4));
+    for (int i = 0; i < r; ++i)
+        dims[i] = shape[i];
+}
+
+inline void fill_dims4_broadcast(int (&dims)[4], const std::vector<int> &shape,
+                                 int out_rank) {
+    for (int i = 0; i < 4; ++i)
+        dims[i] = 1;
+    int r = static_cast<int>(std::min<size_t>(shape.size(), 4));
+    for (int i = 0; i < r; ++i)
+        dims[out_rank - r + i] = shape[i];
+}
+
 inline int total_elems(const std::vector<int> &shape) {
     return static_cast<int>(
         std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>()));
