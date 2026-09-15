@@ -69,8 +69,15 @@ class ShapeRef(object):
             return self._tab.String(o + self._tab.Pos)
         return None
 
+    # ShapeRef
+    def ValueDynamic(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(10))
+        if o != 0:
+            return bool(self._tab.Get(flatbuffers.number_types.BoolFlags, o + self._tab.Pos))
+        return False
+
 def ShapeRefStart(builder):
-    builder.StartObject(3)
+    builder.StartObject(4)
 
 def Start(builder):
     ShapeRefStart(builder)
@@ -98,6 +105,12 @@ def ShapeRefAddDtype(builder, dtype):
 
 def AddDtype(builder, dtype):
     ShapeRefAddDtype(builder, dtype)
+
+def ShapeRefAddValueDynamic(builder, valueDynamic):
+    builder.PrependBoolSlot(3, valueDynamic, 0)
+
+def AddValueDynamic(builder, valueDynamic):
+    ShapeRefAddValueDynamic(builder, valueDynamic)
 
 def ShapeRefEnd(builder):
     return builder.EndObject()

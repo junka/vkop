@@ -128,6 +128,97 @@ class ModelConverter:
             if not node.name:
                 # 使用 op_type + index 生成唯一名，避免冲突
                 node.name = f"{node.op_type}_{i}"
+
+        # --- value_dynamic annotation pass ---
+        # A shape-meta tensor's element VALUES are "dynamic" (vary across decode
+        # rounds) when its producer chain reaches a graph-input dim that is
+        # symbolic (dim_param set, i.e. kv_len/batch/seq). The runtime uses this
+        # to cache readback results across rounds for STATIC shape tensors
+        # (Reshape/Unsqueeze/Slice inputs[1]), skipping the per-round copyToCPU
+        # stall. Default is static (cacheable); uncertain tensors MUST be marked
+        # dynamic to stay correct.
+        producer_of = {}  # tensor_name -> (node, output_index)
+        for node in graph.node:
+            for oi, out_name in enumerate(node.output):
+                if out_name:
+                    producer_of[out_name] = (node, oi)
+
+        # Which graph inputs carry a symbolic dim (dim_param)? Those names are
+        # the root of dynamic shape values.
+        graph_input_shape = {}  # name -> list of dim (concrete int or -1)
+        for inp in graph.input:
+            tt = inp.type.tensor_type
+            dims = [
+                dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                else -1
+                for dim in tt.shape.dim
+            ]
+            graph_input_shape[inp.name] = dims
+        initializer_names = {init.name for init in graph.initializer}
+
+        # value_dynamic cache: tensor_name -> bool. Memoized recursion.
+        value_dynamic_cache = {}
+
+        def tensor_value_dynamic(tname, visiting=None):
+            """True if tname's element values depend on a dynamic graph dim."""
+            if tname in value_dynamic_cache:
+                return value_dynamic_cache[tname]
+            if visiting is None:
+                visiting = set()
+            if tname in visiting:
+                return True  # cycle -> be conservative (dynamic)
+            visiting = visiting | {tname}
+            result = False
+            # Root: graph input. Dynamic iff it has a symbolic dim.
+            if tname in graph_input_shape:
+                result = any(d == -1 for d in graph_input_shape[tname])
+            elif tname in initializer_names:
+                result = False  # initializer: static
+            elif tname in producer_of:
+                node, _oi = producer_of[tname]
+                op = node.op_type
+                # Shape(x): output value is x's shape. Dynamic iff x has a
+                # symbolic dim. (Shape of an initializer -> static.)
+                if op == "Shape":
+                    if node.input:
+                        iname = node.input[0]
+                        # x's shape: look up value_info/graph_input
+                        xdims = None
+                        for vi in list(graph.value_info) + list(graph.input) + list(graph.output):
+                            if vi.name == iname:
+                                tt = vi.type.tensor_type
+                                xdims = [
+                                    dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
+                                    else -1
+                                    for dim in tt.shape.dim
+                                ]
+                                break
+                        if xdims is None and iname in graph_input_shape:
+                            xdims = graph_input_shape[iname]
+                        if xdims is None and iname in initializer_names:
+                            xdims = []  # initializer shape is concrete; static
+                        result = bool(xdims) and any(d == -1 for d in xdims)
+                    else:
+                        result = False
+                else:
+                    # Any other op: conservative — dynamic if ANY input's
+                    # values are dynamic. (Gather/Concat/Slice/Where/Equal/
+                    # Mul/Expand/Cast/Range all propagate dynamic-ness through
+                    # their data inputs.) ConstantOfShape with a dynamic shape
+                    # input is also dynamic, but its output VALUES are a fill
+                    # constant — however its SHAPE changes, so downstream
+                    # consumers treating it as shape metadata must re-read.
+                    # Mark dynamic to be safe.
+                    for iname in node.input:
+                        if iname and tensor_value_dynamic(iname, visiting):
+                            result = True
+                            break
+            # else: unknown (e.g. node output not in value_info) -> conservative dynamic
+            elif tname not in graph_input_shape and tname not in initializer_names:
+                result = True
+            value_dynamic_cache[tname] = result
+            return result
+
         for node in graph.node:
             print("Processing node:", node.name, "of type:", node.op_type)
             attributes = {}
@@ -214,7 +305,8 @@ class ModelConverter:
                 # 误判，原 FIXME 的根源）。1=float32, 10=float16, 6=int32, 7=int64 等。
                 out_dtype = tensor_type.elem_type
                 outputs_with_shape.append(
-                    {"name": output_name, "shape": shape_dims, "dtype": out_dtype})
+                    {"name": output_name, "shape": shape_dims, "dtype": out_dtype,
+                     "value_dynamic": tensor_value_dynamic(output_name)})
 
             inputs_with_shape = []
             for input_name in node.input:
@@ -286,7 +378,8 @@ class ModelConverter:
                     print(f"Modified shape of input {input_name} to {shape_dims}")
                 inputs_with_shape.append(
                     {"name": input_name, "shape": shape_dims,
-                     "dtype": tensor_type.elem_type})
+                     "dtype": tensor_type.elem_type,
+                     "value_dynamic": tensor_value_dynamic(input_name)})
 
             # if node.op_type in ELEMWISE_OPS and len(node.input) == 2:
             #     for i in range(len(inputs_with_shape)):

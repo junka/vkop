@@ -54,6 +54,14 @@ table ShapeRef {
   // they are always concrete.
   dims: [int];
   dtype: string;
+  // True when this tensor's ELEMENT VALUES vary across decode rounds (i.e. the
+  // value depends on a dynamic graph-input dim such as kv_len). Only meaningful
+  // for int64 shape-meta tensors consumed as a shape/axes input (Reshape/
+  // Unsqueeze/Slice/etc. inputs[1]). When false, the runtime may cache the
+  // readback-derived values across rounds and skip the per-round copyToCPU.
+  // Converter sets this via producer-chain trace; default false (static) is the
+  // safe cacheable case — uncertain tensors must be marked true (dynamic).
+  value_dynamic: bool = false;
 }
 
 table TensorData {
@@ -98,7 +106,7 @@ table ConcurrentLevel {
 
 table Model {
   magic: uint = 0x504F4B56;
-  version: ubyte = 2;
+  version: ubyte = 3;
   inputs: [ShapeRef];
   outputs: [ShapeRef];
   nodes: [Node];

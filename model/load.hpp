@@ -32,6 +32,11 @@ struct Shape {
     std::string name;
     std::vector<int32_t> dims; // -1 = dynamic sentinel, 0 = empty (see schema)
     std::string dtype; // "" if the writer didn't record one
+    // True when this int64 shape-meta tensor's element VALUES vary across
+    // decode rounds (depend on a dynamic graph-input dim like kv_len). When
+    // false, consumers (Reshape/Unsqueeze/Slice/...) may cache the readback-
+    // derived values and skip per-round copyToCPU. See schema ShapeRef.
+    bool value_dynamic = false;
 };
 
 struct Node {

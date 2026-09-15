@@ -53,10 +53,11 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
     }
 
     const auto* model = vkop::model::GetModel(buf);
-    if (model->version() != 2) {
+    if (model->version() != 3) {
         throw std::runtime_error(
             "Unsupported VKOP model version: " + std::to_string(model->version()) +
-            " (expected 2: -1 dynamic sentinel). Reconvert with "
+            " (expected 3: -1 dynamic sentinel + value_dynamic shape-cache "
+            "annotation). Reconvert with "
             "`python3 -m onnx2vkop.cli -i <model>.onnx`.");
     }
 
@@ -70,6 +71,7 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
                 Shape shape;
                 shape.name = s->name() ? s->name()->str() : "";
                 shape.dtype = s->dtype() ? s->dtype()->str() : "";
+                shape.value_dynamic = s->value_dynamic();
                 if (s->dims()) {
                     shape.dims.reserve(s->dims()->size());
                     for (uint32_t d = 0; d < s->dims()->size(); ++d) {
