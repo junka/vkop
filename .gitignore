@@ -66,4 +66,12 @@ llm/tokenizer/build/
 *.onx
 llm/exporter/inputs_dump/
 llm/exporter/decode_dump/
+llm/exporter/chat_prefill_dump/
+llm/exporter/raw13_dump/
+llm/exporter/embed_tokens.bin
+llm/exporter/synth224.png
+llm/exporter/p.py
 llm/tokenizer/*.bin
+
+# ASan build directory
+/build-asan/
