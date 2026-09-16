@@ -108,22 +108,56 @@ VERIFY Phase 4: VKOP_OPPROF Reshape~0ms, rbprof TOTAL~0, decode ~250ms. 6/6.
 Do Phase 2 first (non-breaking, low risk, verifiable). Then assess Phase 3
 scope before committing to it. Commit after each verified phase.
 
-### Phase 2 concrete steps:
-1. Tensor.hpp: add shape_ssbo_ member + accessors (ITensor base).
-2. Shape.hpp: set_shape_ssbo on output.
-3. Gather.hpp gpuGatherInt64: set_shape_ssbo on output (alias own SSBO).
-4. Concat.hpp int64: set_shape_ssbo on output.
-5. Reshape.hpp int64 path: set_shape_ssbo on output (rank from CPU-known
-   shape-input element count).
-6. Expand.hpp int64 path: set_shape_ssbo on output.
-7. Build + 6/6 MATCH + rbprof unchanged (still 134, readbacks still happen).
-8. Add VKOP_SHAPE_SSBO_DBG count to confirm side-channel populated on the
-   dynamic chain.
-9. Commit.
+### DONE — Phase 2 (committed cc0ec96):
+1. Tensor.hpp: add shape_ssbo_ member + accessors (ITensor base). ✅
+2. Shape.hpp: set_shape_ssbo on output. ✅
+3. Gather.hpp gpuGatherInt64: set_shape_ssbo on output (conservative: only if
+   data input has shape_ssbo_). ✅
+4. Concat.hpp int64: set_shape_ssbo on output. ✅
+5. Reshape.hpp int64 GPU-alias path: set_shape_ssbo on output. ✅
+6. Expand.hpp int64 path: set_shape_ssbo on output. ✅
+7. Build + 6/6 MATCH + rbprof unchanged (134 steady). ✅
+8. VKOP_SHAPE_SSBO_DBG confirms 834 tensors carry side-channel. ✅
+9. Committed. ✅
+
+### DONE — Phase 3 shader infra (committed ec58353):
+- shaders/buffer/dispatch_from_shape.comp (mode 0 BINARY). ✅
+- Symbol buffer_dispatch_from_shape_spv registered. ✅
+- Not yet wired to any op.
+
+### NEXT — Phase 3+4 atomic conversion (NOT YET STARTED):
+KEY INSIGHT discovered: in Phase 3, getShape() is STILL CPU-correct (Reshape/
+Expand still readback). So the SSBO path yields NOTHING until Phase 4 retires
+the readbacks. Phase 3 (Binary reads SSBO) + Phase 4 (retire readback) MUST
+land atomically — otherwise either half is a no-op or breaks correctness.
+
+BLOCKERS to atomic retire:
+1. Reshape int64 readback (line 272) resolves dim VALUES including -1/0
+   wildcards (lines 294-310: dim[i]==0 copies from input, dim[i]==-1 infers).
+   Skipping readback requires a GPU shader to resolve wildcards. Must check
+   whether the 56 dynamic LLM Reshapes actually use -1/0 (if not, simpler).
+2. Binary getShape() (BufferBinaryFactory.hpp:163-164) returns placeholder
+   {total} once Reshape retires → broadcast breaks. Must convert Binary to
+   read shape_ssbo_ (buffer_common load_dims + shader bindings + indirect).
+3. Must convert ALL binary shaders (add/sub/mul/div/pow/equal) + MatMul, not
+   just one, or the chain half-converts and corrupts.
+
+PROPOSED incremental path (future session):
+- Step A: instrument which of the 56 dynamic Reshapes use -1/0 wildcards.
+  If none → retire is simpler (no GPU wildcard resolution needed).
+- Step B: convert ONE binary shader (mul) to broadcast==2 SSBO path, behind
+  VKOP_GPU_SHAPE flag, validate output matches PC path on a broadcast test.
+- Step C: gate Reshape/Expand readback-skip on VKOP_GPU_SHAPE + downstream
+  consumer converted. Atomic per-chain rollout.
+- Step D: extend to all binary shaders + MatMul.
+- Step E: remove flag, remove option-C cache.
 
 ## Risk notes
-- Phase 2 is additive (side-channel only, no behavior change) → lowest risk.
-- The real risk is Phase 2 Step 4 (Reshape): shape_ssbo_rank_ must be correct.
-  It = the shape INPUT's element count = inputs[1]->getShape()[0], CPU-known
-  (the shape input tensor's OWN shape is metadata, not values). Verify.
-- Phase 3 is the big one (shader changes). Gate on Phase 2 verification first.
+- Phase 2 is additive (side-channel only, no behavior change) → lowest risk. ✅
+- Phase 3 shader infra is additive (unused) → lowest risk. ✅
+- The real risk is the atomic Phase 3+4 retire: output->resize without CPU
+  dim → downstream getShape() returns placeholder. Must convert the full
+  dynamic chain atomically, or carry both dims_ + shape_ssbo_ during migration
+  (the Phase 2 invariant already does this).
+- Indirect dispatch adds a pre-pass per dynamic op — extra GPU work but no
+  CPU sync. Net win if it replaces a ~0.43ms readback-forced submit.
