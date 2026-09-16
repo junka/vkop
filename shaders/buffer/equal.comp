@@ -19,6 +19,20 @@ layout(set = 0, binding = 2) readonly buffer InB {
     uint data[];
 } uInputB;
 
+// Phase 3 GPU-driven shape-meta: optional shape-SSBO bindings (out/in0/in1).
+// Declared to match the shared 6-binding descriptor layout; bound only when an
+// input carries shape_ssbo_ (Equal currently always uses CPU-known shapes, so
+// these stay unbound — legal under UPDATE_AFTER_BIND).
+layout(set = 0, binding = 3) readonly buffer ShapeOut {
+    ivec2 data[];
+} uShapeOut;
+layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
+    ivec2 data[];
+} uShapeIn0;
+layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
+    ivec2 data[];
+} uShapeIn1;
+
 layout(push_constant) uniform PC {
     int rank;
     IArr8 outDims;

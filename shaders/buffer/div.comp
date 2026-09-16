@@ -21,6 +21,24 @@ layout(set = 0, binding = 2) readonly buffer InputB {
     uint data[];
 } uInputB;
 
+// Phase 3 GPU-driven shape-meta: when broadcast==2, the real out/in0/in1 dims
+// are read from bound int64 shape SSBOs (as ivec2[], .x = value) instead of the
+// push_constant dims (which become a placeholder once Phase 4 retires the readback).
+// These bindings are OPTIONAL: bound only when an input carries shape_ssbo_.
+layout(set = 0, binding = 3) readonly buffer ShapeOut {
+    ivec2 data[];
+} uShapeOut;
+layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
+    ivec2 data[];
+} uShapeIn0;
+layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
+    ivec2 data[];
+} uShapeIn1;
+
+LOAD_DIMS_INIT(load_out_dims, uShapeOut.data)
+LOAD_DIMS_INIT(load_in0_dims, uShapeIn0.data)
+LOAD_DIMS_INIT(load_in1_dims, uShapeIn1.data)
+
 layout(push_constant) uniform PC_uPC {
     int rank;
     IArr8 outDims;
@@ -34,7 +52,9 @@ layout(push_constant) uniform PC_uPC {
 
 float bin_op(float a, float b) { return a / b; }
 
-float load_elem(int linear) {
+// Dims are threaded in so broadcast==2 reads the shape SSBOs ONCE (in main)
+// rather than per element. For broadcast==0/1 the PC dims are used directly.
+float load_elem(int linear, IArr8 out_d, IArr8 in0_d) {
     if (uPC.broadcast == 0) {
 #ifdef FP16
         return unpackHalf2x16(uInputA.data[linear >> 1])[linear & 1];
@@ -42,7 +62,7 @@ float load_elem(int linear) {
         return uintBitsToFloat(uInputA.data[linear]);
 #endif
     }
-    int ia = broadcast_index(linear, uPC.outDims, uPC.in0Dims, uPC.rank);
+    int ia = broadcast_index(linear, out_d, in0_d, uPC.rank);
 #ifdef FP16
     return unpackHalf2x16(uInputA.data[ia >> 1])[ia & 1];
 #else
@@ -50,10 +70,9 @@ float load_elem(int linear) {
 #endif
 }
 
-float load_elem_b(int linear) {
-    int ib = (uPC.broadcast == 0)
-        ? linear
-        : broadcast_index(linear, uPC.outDims, uPC.in1Dims, uPC.rank);
+float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
+    int ib = (uPC.broadcast == 0) ? linear
+                                   : broadcast_index(linear, out_d, in1_d, uPC.rank);
 #ifdef FP16
     return unpackHalf2x16(uInputB.data[ib >> 1])[ib & 1];
 #else
@@ -73,26 +92,37 @@ void store_elem(int linear, float v) {
 }
 
 void main() {
+    // Resolve the broadcast dims once. broadcast==2: GPU-driven, read from the
+    // int64 shape SSBOs (Phase 3). broadcast==1: PC dims (legacy). broadcast==0
+    // is no-broadcast (dims unused, load uses the raw linear index).
+    IArr8 out_d = uPC.outDims;
+    IArr8 in0_d = uPC.in0Dims;
+    IArr8 in1_d = uPC.in1Dims;
+    if (uPC.broadcast == 2) {
+        out_d = load_out_dims(uPC.rank);
+        in0_d = load_in0_dims(uPC.rank);
+        in1_d = load_in1_dims(uPC.rank);
+    }
     int gid = int(gl_GlobalInvocationID.x);
 #ifdef FP16
     int nwords = (uPC.total + 1) / 2;
     if (gid >= nwords) return;
     int i0 = 2 * gid;
     int i1 = 2 * gid + 1;
-    float a0 = load_elem(i0);
-    float b0 = load_elem_b(i0);
+    float a0 = load_elem(i0, out_d, in0_d);
+    float b0 = load_elem_b(i0, out_d, in1_d);
     float r0 = activation(FLOAT(bin_op(a0, b0)), uPC.activation);
     store_elem(i0, r0);
     if (i1 < uPC.total) {
-        float a1 = load_elem(i1);
-        float b1 = load_elem_b(i1);
+        float a1 = load_elem(i1, out_d, in0_d);
+        float b1 = load_elem_b(i1, out_d, in1_d);
         float r1 = activation(FLOAT(bin_op(a1, b1)), uPC.activation);
         store_elem(i1, r1);
     }
 #else
     if (gid >= uPC.total) return;
-    float a = load_elem(gid);
-    float b = load_elem_b(gid);
+    float a = load_elem(gid, out_d, in0_d);
+    float b = load_elem_b(gid, out_d, in1_d);
     float r = activation(FLOAT(bin_op(a, b)), uPC.activation);
     uOutput.data[gid] = floatBitsToUint(r);
 #endif
