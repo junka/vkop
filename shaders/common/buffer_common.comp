@@ -97,4 +97,25 @@ int broadcast_index(int out_linear, IArr8 out_dims, IArr8 in_dims, int rank) {
     return nd_to_linear8(ic, in_dims, rank);
 }
 
+// ---- GPU-driven shape-meta (Phase 3): load dims from a bound int64 SSBO ----
+// When a tensor carries shape_ssbo_ (its producing shape as an int64 SSBO),
+// downstream consumers read the REAL dims from the SSBO instead of the
+// push_constant dims (which become a placeholder once Phase 4 retires the
+// copyToCPU readback). The shape SSBO is int64 bound as ivec2[] (.x = dim
+// value, small non-negative). `rank` is CPU-known (shape-input element count).
+// Shapes are left-aligned into IArr8 (trailing 1s).
+//
+// GLSL forbids passing unsized arrays by value, so each shader defines a
+// per-SSBO loader via LOAD_DIMS_INIT(name, ssbo_array_expr). The shader calls
+// name(rank) once in main() and threads the IArr8 through broadcast_index.
+#define LOAD_DIMS_INIT(name, ssbo)                                \
+    IArr8 name(int rank) {                                        \
+        IArr8 d;                                                  \
+        for (int i = 0; i < 8; ++i) d.v[i] = 1;                   \
+        for (int i = 0; i < rank && i < 8; ++i) {                 \
+            d.v[i] = ssbo[i].x;                                   \
+        }                                                         \
+        return d;                                                 \
+    }
+
 #endif // BUFFER_COMMON_COMP

@@ -21,10 +21,19 @@ class BufferBinaryFactory : public BufferFactory {
   public:
     BufferBinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len, int fp16,
                         BufferActivation activation = BufferActivation::NONE)
-        : BufferFactory(type, spv, spv_len,
-                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                         DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(BinaryElemPC), fp16),
+        : BufferFactory(
+              type, spv, spv_len,
+              // Bindings 0/1/2 = out/in0/in1 data SSBOs (always bound).
+              // Bindings 3/4/5 = out/in0/in1 SHAPE SSBOs (Phase 3:
+              // bound only when an input carries shape_ssbo_; declared
+              // in the layout so the shader's optional shape bindings
+              // match the host descriptor set). Unused shape bindings
+              // are left unbound — legal under UPDATE_AFTER_BIND, and
+              // the shader only reads them when broadcast==2.
+              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+               DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+               DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+              sizeof(BinaryElemPC), fp16),
           activation_(static_cast<int>(activation)) {}
 
   protected:

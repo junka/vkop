@@ -2,6 +2,7 @@
 #ifndef OPS_OPERATOR_HPP_
 #define OPS_OPERATOR_HPP_
 
+#include <algorithm>
 #include <cassert>
 #include <cstddef>
 #include <iostream>
@@ -489,7 +490,17 @@ class Operator {
     // fillWriteDescriptorSets is overridden by façade ops (e.g. Gather's int64
     // submit override calls it to bind the int64 pipeline's descriptor set).
     virtual void fillWriteDescriptorSets(VkDescriptorSet ds) {
-        for (size_t i = 0; i < types_.size(); i++) {
+        // Write one descriptor per BOUND object. The pipeline layout may
+        // declare MORE bindings than we bind (e.g. Phase 3 binary shaders
+        // declare optional shape-SSBO bindings 3/4/5 that are only bound when
+        // an input carries shape_ssbo_). Under UPDATE_AFTER_BIND the unbound
+        // bindings are legal and the shader only reads them when its dispatch
+        // mode selects the SSBO path — so we never write descriptors we didn't
+        // bind.
+        size_t n = std::min(types_.size(), objs_.size());
+        writes_.resize(
+            types_.size()); // ensure capacity for all declared bindings
+        for (size_t i = 0; i < n; i++) {
             writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes_[i].dstSet = ds;
             writes_[i].dstBinding = static_cast<uint32_t>(i);
@@ -513,6 +524,10 @@ class Operator {
                 break;
             }
         }
+        // Truncate to the bound-object count so updateDescriptorSets() only
+        // sees the initialized writes (see the note above on optional
+        // bindings).
+        writes_.resize(n);
     }
 
     virtual void
