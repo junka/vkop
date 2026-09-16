@@ -1,0 +1,57 @@
+#version 450 core
+
+// dispatch_from_shape: derive a VkDispatchIndirectCommand{w,h,z} from an int64
+// shape-value SSBO, written into an indirect-dispatch buffer. This is the GPU-
+// driven shape-meta pre-pass (Phase 3): lets a dynamic-dispatch consumer op
+// (Binary/MatMul) dispatch without CPU knowing the shape values — eliminating
+// the copyToCPU readback that dominated decode (~677ms/round, 134 readbacks).
+//
+// The shape SSBO is the shape_ssbo_ side-channel (int64 dims, produced by
+// Shape/Gather/Concat/Reshape/Expand). int64 is bound as ivec2[] (the device
+// has no shaderInt64 feature); dim values are small non-negative ints, so the
+// low 32 bits (.x) are the value. We multiply `rank` dims to get the output
+// element total, then compute the dispatch dims per `mode`.
+//
+// VkDispatchIndirectCommand is { uint x, y, z; } (3 × uint32 = 12 bytes).
+//
+// Modes (uPC.mode):
+//   0 = BINARY: total = product(dims); w = UP_DIV(total, block); h=1; z=1.
+//       (One thread per fp32 element, or per uint word for fp16 packed half2 —
+//       the host passes block and a fp16-adjusted total via uPC; for fp16 the
+//       host sets mode such that total is already the word count. Simplest: host
+//       passes block and a per-element-divisor so the shader computes
+//       UP_DIV(total/divisor, block).)
+//   1 = reserved for MatMul (M/N/K/batch mapping — separate shader path).
+//
+// This shader runs as a 1-thread pre-pass (the work is trivial: read ≤8 ints,
+// multiply, write 3 ints). The indirect buffer is barriered to INDIRECT_READ
+// by the host before the consumer's submit_indirect (the level cmd buffer
+// ordering + a shaderWriteBarrier on the indirect buffer).
+
+layout(set = 0, binding = 0) readonly buffer ShapeSSBO {
+    ivec2 data[]; // int64 dims as ivec2; .x = value
+} uShape;
+layout(set = 0, binding = 1) writeonly buffer IndirectBuf {
+    uvec3 dispatch; // VkDispatchIndirectCommand{x,y,z}
+} uIndirect;
+
+layout(push_constant) uniform PC {
+    int rank;     // number of valid dims in uShape
+    int mode;     // 0 = BINARY
+    int block;    // threads-per-group for the consumer (e.g. 256)
+    int divisor;  // total is divided by this before UP_DIV (fp16: 2 elements/word)
+} uPC;
+
+layout(local_size_x = 1, local_size_y = 1, local_size_z = 1) in;
+
+void main() {
+    int total = 1;
+    for (int i = 0; i < uPC.rank; ++i) {
+        total *= uShape.data[i].x;
+    }
+    if (uPC.divisor > 1) {
+        total = (total + uPC.divisor - 1) / uPC.divisor; // UP_DIV
+    }
+    uint w = uint((total + uPC.block - 1) / uPC.block); // UP_DIV(total, block)
+    uIndirect.dispatch = uvec3(w, 1u, 1u);
+}
