@@ -92,6 +92,21 @@ class Gather : public Operator {
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(out_shape);
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        // Phase 2: propagate the shape-meta side-channel. When the DATA input
+        // carries a shape_ssbo_ (it IS shape values, produced by Shape/a prior
+        // shape-meta gather/concat), the gathered output is also shape values
+        // → tag the output's own SSBO as its shape_ssbo_ so downstream
+        // GPU-driven consumers skip readback. Conservative: only propagates
+        // along the shape-meta chain (a gather of real int64 data has no
+        // shape_ssbo_ on its data input, so its output stays untagged — Phase 3
+        // consumers never misread real data as shape dims). rank =
+        // out_shape.size().
+        if (inputs[0]->has_shape_ssbo()) {
+            output->set_shape_ssbo(
+                std::dynamic_pointer_cast<VulkanBuffer>(
+                    output->as_storage_buffer(m_dev_, m_cmd_)),
+                static_cast<int>(out_shape.size()));
+        }
         // Data input SSBO.
         auto data = core::as_tensor<int64_t>(inputs[0]);
         objs_.emplace_back(data->as_storage_buffer(m_dev_, nullptr));

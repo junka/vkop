@@ -66,6 +66,24 @@ class ITensor {
     // rounded up to even so packHalf2x16 writes have an even out_base.
     void set_gpu_row_pad(int pad) { gpu_row_pad_ = pad; }
     int get_gpu_row_pad() const { return gpu_row_pad_; }
+
+    // ---- GPU-driven shape-meta side-channel accessors (Phase 2-4) ----
+    // True when this tensor carries an authoritative GPU-resident shape SSBO
+    // that downstream GPU-driven consumers can read instead of getShape().
+    bool has_shape_ssbo() const { return shape_ssbo_ != nullptr; }
+    std::shared_ptr<VulkanBuffer> get_shape_ssbo() const { return shape_ssbo_; }
+    int get_shape_ssbo_rank() const { return shape_ssbo_rank_; }
+    // Populate the side-channel. `buf` is an int64 SSBO holding `rank` dims.
+    // Callers alias the tensor's OWN producing SSBO where the tensor's data IS
+    // shape values (Shape/Gather/Concat/Reshape/Expand int64 outputs).
+    void set_shape_ssbo(std::shared_ptr<VulkanBuffer> buf, int rank) {
+        shape_ssbo_ = std::move(buf);
+        shape_ssbo_rank_ = rank;
+    }
+    void clear_shape_ssbo() {
+        shape_ssbo_.reset();
+        shape_ssbo_rank_ = 0;
+    }
     std::vector<int> getShape() {
         std::vector<int> shape;
         shape.reserve(n_dims_);
@@ -261,6 +279,23 @@ class ITensor {
     bool prealloc_keep_ = false;
     // 64bytes here
     int gpu_row_pad_ = 0;
+
+    // ---- GPU-driven shape-meta side-channel (Phase 2-4) ----
+    // Authoritative producing-shape for GPU-driven downstream consumers. An
+    // int64 SSBO carrying this tensor's REAL shape values (rank dims),
+    // populated by the op that produced the tensor (Shape/Gather/Concat/
+    // Reshape/Expand on their int64 shape-value outputs). When non-null,
+    // downstream GPU shaders (Binary/MatMul) read broadcast/dispatch dims
+    // from here instead of push_constant dims — eliminating the copyToCPU
+    // readback those ops otherwise do to resolve output dims on the CPU.
+    //
+    // Migration invariant: a tensor carries BOTH dims_ (best-effort, may be a
+    // placeholder whose product == element count) AND shape_ssbo_
+    // (authoritative). Downstream checks shape_ssbo_ first; if absent it
+    // falls back to getShape() (compat with unconverted ops), so partial
+    // migration is safe. Cleared by the recycle path (see reset_for_reuse).
+    std::shared_ptr<VulkanBuffer> shape_ssbo_;
+    int shape_ssbo_rank_ = 0;
 };
 
 template <typename T> class Tensor : public ITensor {

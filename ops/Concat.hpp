@@ -270,6 +270,23 @@ class ConcatBuffer : public BufferFactory {
         if (out_buf) {
             out_buf->shaderWriteBarrier(m_cmd_->get());
         }
+        // Phase 2: propagate the shape-meta side-channel. When any input
+        // carries a shape_ssbo_ (it IS shape values), the concatenated output
+        // is also shape values → tag the output's own SSBO as its shape_ssbo_.
+        // Conservative: only propagates along the shape-meta chain. rank =
+        // out_shape.size() (CPU-known from the concat-axis accumulation above).
+        bool any_shape_meta = false;
+        for (const auto &in : inputs) {
+            if (in->has_shape_ssbo()) {
+                any_shape_meta = true;
+                break;
+            }
+        }
+        if (any_shape_meta) {
+            output->set_shape_ssbo(
+                std::dynamic_pointer_cast<VulkanBuffer>(out_buf),
+                static_cast<int>(out_shape.size()));
+        }
     }
 
     void execute(

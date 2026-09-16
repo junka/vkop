@@ -1472,20 +1472,64 @@ double Runtime::Run() {
     static std::map<std::string, std::pair<double, int>> op_type_time_count;
     if (opprof)
         op_type_time_count.clear();
+    // Per-op-type readback counter: which op types trigger a synchronous
+    // copyToCPU (and thus force a per-level submit — the ~600ms floor).
+    static std::map<std::string, int> op_type_readback_count;
+    if (opprof)
+        op_type_readback_count.clear();
+    // Phase 2 debug: count how many output tensors carry the GPU-driven
+    // shape_ssbo_ side-channel (populated by Shape/Gather/Concat/Reshape/
+    // Expand on the int64 shape-meta chain). Confirms the side-channel is
+    // threaded through the dynamic chain before Phase 3 consumers read it.
+    const char *ssbo_dbg_env = std::getenv("VKOP_SHAPE_SSBO_DBG");
+    bool ssbo_dbg = ssbo_dbg_env && ssbo_dbg_env[0] == '1';
+    int n_shape_ssbo = 0;
 
     std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_level_cmds;
     size_t last_level_index = level_node_indices_.size() - 1;
+
+    // [DEBUG] count levels that contain a synchronous readback (detected via
+    // the queue submit counter advancing during onExecute recording). Each
+    // readback level's copyToCPU does its own cmd.submit+wait on queue0,
+    // relying on single-queue FIFO ordering to see the producer's submitted
+    // work — so a readback level forces a per-level submit point. This count
+    // (printed by VKOP_BATCH_DBG / rbprof) quantifies the ~0.43ms × N submit
+    // floor that dominates decode. Batching was tried (VKOP_BATCH_LEVELS) and
+    // found net-neutral: readback levels can't be batched with their pending
+    // producers, so the submits just move to a pre-flush. See
+    // readback-per-level-submit-bottleneck.md.
+    int n_readback_levels = 0;
+    int n_total_levels = static_cast<int>(level_node_indices_.size());
+    bool batch_dbg = std::getenv("VKOP_BATCH_DBG");
+    auto queue0 = dev->getComputeQueue(0);
+    // [BATCH-PROF] fine-grained record split to find the non-onexec overhead.
+    double prof_reshape_ms = 0, prof_addwait_ms = 0, prof_buildsi_ms = 0;
+    // prof_preflush_ms stays 0 without batching; retained in the runprof line
+    // so a future re-enable of VKOP_BATCH_LEVELS reports it without format
+    // churn.
+    double prof_preflush_ms = 0;
+    // level_readback_ records, per level, whether round 0 saw a sync readback.
+    // Populated on round 0 (sees it empty) and read by rbprof/opprof on later
+    // rounds. Kept across the session (cleared only by invalidate_replay).
+    bool readback_learned = !level_readback_.empty();
+    if (!readback_learned) {
+        level_readback_.assign(level_node_indices_.size(), false);
+    }
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
          level_idx++) {
         const auto &level_nodes = level_node_indices_[level_idx];
         std::vector<std::shared_ptr<VulkanCommandBuffer>> cur_level_cmds;
+        bool level_had_readback = false;
         // Per-lane submit batches (multi-queue case); single-queue uses [0].
         std::vector<std::vector<VkSubmitInfo>> sis(vkop::kInflight);
         int id = 0;
+        double onexec_ms = 0.0;
+        double reshape_ms = 0, addwait_ms = 0, buildsi_ms = 0;
         auto rec_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
-        double onexec_ms = 0.0;
         for (auto node_idx : level_nodes) {
+            auto rs_t0 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
             const auto &shapes = node_input_shapes_[node_idx];
             const auto &ins = node_input_tensors_[node_idx];
             for (size_t k = 0; k < ins.size() && k < shapes.size(); ++k) {
@@ -1521,15 +1565,34 @@ double Runtime::Run() {
                     }
                 }
             }
+            if (run_profile) {
+                auto rs_t1 = std::chrono::steady_clock::now();
+                reshape_ms +=
+                    std::chrono::duration<double, std::milli>(rs_t1 - rs_t0)
+                        .count();
+            }
             auto oe_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
             const auto oe_prof_t0 =
                 opprof ? std::chrono::steady_clock::now()
                        : std::chrono::steady_clock::time_point{};
+            // [BATCH] snapshot the queue submit counter before onExecute; if it
+            // advances, this op did a synchronous readback (copyToCPU does its
+            // own cmd.submit+wait on queue0). Such a level cannot be batched
+            // with pending producers.
+            uint64_t sc_before = queue0->submitCount();
             node_ops_[node_idx]->set_input_value_dynamic(
                 node_input_value_dynamic_[node_idx]);
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
+            if (sc_before != queue0->submitCount()) {
+                level_had_readback = true;
+                if (opprof) {
+                    auto name = convert_optype_to_string(
+                        node_ops_[node_idx]->get_type());
+                    op_type_readback_count[name]++;
+                }
+            }
             if (run_profile) {
                 auto oe_t1 = std::chrono::steady_clock::now();
                 onexec_ms +=
@@ -1546,6 +1609,13 @@ double Runtime::Run() {
                 auto &e = op_type_time_count[name];
                 e.first += ms;
                 e.second += 1;
+            }
+            if (ssbo_dbg) {
+                const auto &outs = node_output_tensors_[node_idx];
+                for (const auto &o : outs) {
+                    if (o && o->has_shape_ssbo())
+                        n_shape_ssbo++;
+                }
             }
             // Snapshot live input shapes for the replay guard. Done every round
             // (cheap): if this op just re-recorded (refresh or first cache),
@@ -1568,6 +1638,8 @@ double Runtime::Run() {
                                 .c_str());
                 }
             }
+            auto aw_t0 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
             auto cmd = node_ops_[node_idx]->get_record();
             for (auto &dep : node_dependency_indices_[node_idx]) {
                 cmd->addWait(node_ops_[dep]->get_record()->getSignalSemaphore(),
@@ -1580,9 +1652,22 @@ double Runtime::Run() {
             for (const auto &pc : prev_level_cmds) {
                 cmd->addWait(pc->getSignalSemaphore(), pc->getSignalValue());
             }
-
+            if (run_profile) {
+                auto aw_t1 = std::chrono::steady_clock::now();
+                addwait_ms +=
+                    std::chrono::duration<double, std::milli>(aw_t1 - aw_t0)
+                        .count();
+            }
+            auto bs_t0 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
             int lane = single_queue ? 0 : id;
             sis[lane].push_back(cmd->buildSubmitInfo());
+            if (run_profile) {
+                auto bs_t1 = std::chrono::steady_clock::now();
+                buildsi_ms +=
+                    std::chrono::duration<double, std::milli>(bs_t1 - bs_t0)
+                        .count();
+            }
             cur_level_cmds.push_back(cmd);
             if (level_idx == last_level_index) {
                 last_commands[single_queue ? 0 : id] = cmd;
@@ -1596,6 +1681,9 @@ double Runtime::Run() {
                 std::chrono::duration<double, std::milli>(rec_t1 - rec_t0)
                     .count();
             prof_onexec_ms += onexec_ms;
+            prof_reshape_ms += reshape_ms;
+            prof_addwait_ms += addwait_ms;
+            prof_buildsi_ms += buildsi_ms;
             prof_nlevels++;
             prof_nops += static_cast<int>(level_nodes.size());
         }
@@ -1603,6 +1691,10 @@ double Runtime::Run() {
         int nlanes = single_queue ? 1 : vkop::kInflight;
         auto sub_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
+        if (level_had_readback) {
+            n_readback_levels++;
+            level_readback_[level_idx] = true;
+        }
         for (int ci = 0; ci < nlanes; ci++) {
             if (!sis[ci].empty()) {
                 VulkanCommandBuffer::submit(dev->getComputeQueue(ci), sis[ci]);
@@ -1660,13 +1752,27 @@ double Runtime::Run() {
         auto end = std::chrono::steady_clock::now();
         std::chrono::duration<double> elapsed = end - start;
         double total_ms = elapsed.count() * 1000.0;
-        double gpuwait_ms = total_ms - prof_record_ms - prof_submit_ms;
+        double gpuwait_ms =
+            total_ms - prof_record_ms - prof_submit_ms - prof_preflush_ms;
         fprintf(stderr,
                 "[runprof] total=%.1fms  record=%.1fms (onexec=%.1fms) "
                 "(%d ops/%d levels)  "
-                "submit=%.1fms  gpu+reset=%.1fms\n",
+                "submit=%.1fms  preflush=%.1fms  gpu+reset=%.1fms\n",
                 total_ms, prof_record_ms, prof_onexec_ms, prof_nops,
-                prof_nlevels, prof_submit_ms, gpuwait_ms);
+                prof_nlevels, prof_submit_ms, prof_preflush_ms, gpuwait_ms);
+        fprintf(stderr,
+                "[runprof2] reshape=%.1fms onexec=%.1fms addwait=%.1fms "
+                "buildsi=%.1fms\n",
+                prof_reshape_ms, prof_onexec_ms, prof_addwait_ms,
+                prof_buildsi_ms);
+    }
+    if (batch_dbg) {
+        fprintf(stderr, "[batchdbg] %d/%d levels had a sync readback\n",
+                n_readback_levels, n_total_levels);
+    }
+    if (ssbo_dbg) {
+        fprintf(stderr, "[sssbo] %d output tensors carry shape_ssbo_\n",
+                n_shape_ssbo);
     }
 
     if (replay_mode_) {
@@ -1698,6 +1804,20 @@ double Runtime::Run() {
                     v.begin(), v.end(), 0,
                     [](int s, const auto &p) { return s + p.second.second; })),
                 grand);
+        // Per-op-type synchronous-readback counts (each forces a per-level
+        // submit → the ~0.43ms × N floor).
+        std::vector<std::pair<std::string, int>> rv(
+            op_type_readback_count.begin(), op_type_readback_count.end());
+        std::sort(rv.begin(), rv.end(), [](const auto &a, const auto &b) {
+            return a.second > b.second;
+        });
+        int rg = 0;
+        fprintf(stderr, "[rbprof] op-type        readbacks\n");
+        for (const auto &p : rv) {
+            fprintf(stderr, "[rbprof] %-14s %6d\n", p.first.c_str(), p.second);
+            rg += p.second;
+        }
+        fprintf(stderr, "[rbprof] %-14s %6d\n", "TOTAL", rg);
     }
 
     auto end = std::chrono::steady_clock::now();

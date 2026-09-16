@@ -335,6 +335,20 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // Phase 2: propagate the shape-meta side-channel. When the
+                // input IS shape values (carries shape_ssbo_), the reshaped
+                // output is also shape values → tag the aliased buffer as the
+                // output's shape_ssbo_. The new rank = dim.size() = the shape
+                // input's element count (CPU-known via inputs[1]->num_elements,
+                // NOT the readback values — the readback at line ~272 resolves
+                // dim VALUES, but the COUNT of dims is metadata). Conservative:
+                // only propagates along the shape-meta chain.
+                if (src->has_shape_ssbo()) {
+                    output->set_shape_ssbo(
+                        std::dynamic_pointer_cast<VulkanBuffer>(
+                            output->as_storage_buffer(m_dev_, m_cmd_)),
+                        static_cast<int>(dim.size()));
+                }
                 return;
             }
 

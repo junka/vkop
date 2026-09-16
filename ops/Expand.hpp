@@ -243,6 +243,19 @@ class Expand : public Operator {
             fill_dims_broadcast(param_.inDims, inshape, param_.rank);
             submit(&param_, UP_DIV(total, 256), 1, 1);
             int64_mode_ = false;
+            // Phase 2: propagate the shape-meta side-channel. When the data
+            // input IS shape values (carries shape_ssbo_), the broadcast
+            // output is also shape values → tag the output's own SSBO as its
+            // shape_ssbo_. rank = out_shape.size() (CPU-known from the
+            // broadcast math above, which uses getShape — metadata, not the
+            // shape VALUES). Conservative: only propagates along the
+            // shape-meta chain.
+            if (inputs[0]->has_shape_ssbo()) {
+                output->set_shape_ssbo(
+                    std::dynamic_pointer_cast<VulkanBuffer>(
+                        output->as_storage_buffer(m_dev_, m_cmd_)),
+                    static_cast<int>(out_shape.size()));
+            }
             return;
         }
 

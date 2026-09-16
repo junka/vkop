@@ -42,6 +42,13 @@ class Shape : public Operator {
         // as_tensor<int64_t>() CPU readers.
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
         output->copyToGPUDeferred(m_cmd_);
+        // Phase 2: the Shape output IS the shape-value SSBO for the dynamic
+        // shape-meta chain. Tag it so downstream GPU-driven consumers (Phase 3
+        // Binary/MatMul) can read broadcast/dispatch dims from here instead of
+        // readback. rank = number of dims (CPU-known from getShape above).
+        output->set_shape_ssbo(std::dynamic_pointer_cast<VulkanBuffer>(
+                                   output->as_storage_buffer(m_dev_, m_cmd_)),
+                               static_cast<int>(shape.size()));
     }
 
     // Shape is CPU-only (no pipeline/spv, no submit()). Its output changes

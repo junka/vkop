@@ -19,10 +19,20 @@ class VulkanQueue {
 
     VkQueue getQueue() const { return queue_; }
     uint32_t getFamilyIdx() const { return familyIdx_; }
+    // Monotonic submit counter: incremented on every vkQueueSubmit through
+    // this queue. The runtime's level-batching uses it to DETECT synchronous
+    // readbacks (copyToCPU does its own cmd.submit+wait on this same queue)
+    // — if the counter advanced during a level's onExecute recording, that
+    // level contained a sync readback, so the batch MUST be flushed before
+    // it (the readback relied on the producer already being queued, which
+    // single-queue FIFO ordering only guarantees if prior levels submitted).
+    uint64_t submitCount() const { return submit_count_; }
+    void bumpSubmitCount() { submit_count_++; }
 
   private:
     uint32_t familyIdx_;
     VkQueue queue_ = VK_NULL_HANDLE;
+    uint64_t submit_count_ = 0;
 };
 
 struct FeatureDescriptor {

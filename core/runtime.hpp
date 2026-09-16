@@ -26,6 +26,19 @@ class Runtime {
 
     std::vector<std::vector<size_t>> level_node_indices_;
 
+    // Per-level "contains a synchronous readback" flag, learned on round 0
+    // (via the queue submit counter advancing during onExecute) and reused to
+    // attribute the ~0.43ms forced per-level submit floor. A readback level's
+    // copyToCPU does its own cmd.submit+wait on queue0, relying on single-queue
+    // FIFO ordering (its producer levels already queued). Stable across decode
+    // rounds (an op's readback behavior is determined by its dtype/path, not
+    // the round). Printed by VKOP_BATCH_DBG; per-op-type counts by VKOP_OPPROF
+    // (rbprof). Batching (VKOP_BATCH_LEVELS) was tried and found net-neutral
+    // (readback levels can't batch with pending producers); see
+    // readback-per-level-submit-bottleneck.md. The fix is GPU-driven shape-meta
+    // (eliminate the readbacks), not batching.
+    std::vector<bool> level_readback_;
+
     // Model file path
     std::string model_path_;
 
@@ -90,6 +103,9 @@ class Runtime {
         // shapes en masse. Cheap (virtual no-op on non-Reshape ops).
         for (auto &op : node_ops_)
             op->invalidate_shape_cache();
+        // The per-level readback map is phase-specific (prefill vs decode run
+        // different op paths); re-learn it on the first Run() of the new phase.
+        level_readback_.clear();
         if (!replay_mode_)
             return;
         for (auto &op : node_ops_)

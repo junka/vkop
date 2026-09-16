@@ -122,6 +122,7 @@ VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
         printf("ret %d\n", ret);
         throw std::runtime_error("Failed to submit sem command buffer!");
     }
+    queue->bumpSubmitCount();
     clearWaits();
     return m_signalValue_;
 }
@@ -135,6 +136,7 @@ void VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue,
         printf("ret %d\n", ret);
         throw std::runtime_error("Failed to submit sem command buffer!");
     }
+    queue->bumpSubmitCount();
 }
 
 VkSubmitInfo VulkanCommandBuffer::buildSubmitInfo() {
