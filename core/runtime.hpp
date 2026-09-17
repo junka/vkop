@@ -25,6 +25,9 @@ class Runtime {
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
 
     std::vector<std::vector<size_t>> level_node_indices_;
+    // Per-level op-type sequence, populated only when VKOP_DUMP_LEVEL_SEQ is
+    // set (build-time chain-structure analysis for kernel-fusion planning).
+    std::vector<std::vector<std::string>> level_op_seq_;
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
     // (via the queue submit counter advancing during onExecute) and reused to

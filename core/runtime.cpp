@@ -308,8 +308,15 @@ void Runtime::LoadModel() {
     const auto &concurrent_levels = model.getConcurrentExecutionLevels();
     printf("Building execution plan with %zu concurrent levels\n",
            concurrent_levels.size());
+    // Build-time chain-structure analysis (kernel-fusion planning). Populated
+    // once at LoadModel; no per-round cost. Printed to stderr so stdout model
+    // dumps stay clean.
+    const bool dump_level_seq = std::getenv("VKOP_DUMP_LEVEL_SEQ") != nullptr;
 
     level_node_indices_.resize(concurrent_levels.size());
+    if (dump_level_seq) {
+        level_op_seq_.resize(concurrent_levels.size());
+    }
     size_t global_node_index = 0;
     size_t total_nodes = 0;
     for (const auto &level_nodes : concurrent_levels) {
@@ -595,10 +602,34 @@ void Runtime::LoadModel() {
             node_input_tensors_.push_back(std::move(node_inputs));
             node_output_tensors_.push_back(std::move(node_outputs));
             node_input_shapes_.push_back(std::move(node_input_shapes));
+            if (dump_level_seq) {
+                // Append this level's op type to a per-level sequence string
+                // for chain-structure analysis (kernel-fusion planning).
+                level_op_seq_[level_idx].push_back(n.op_type);
+            }
             node_input_value_dynamic_.push_back(std::move(node_input_vd));
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
+    if (dump_level_seq && !level_op_seq_.empty()) {
+        // Print the per-level op-type sequence (one line per level). Used to
+        // find long single-node chains ripe for kernel fusion.
+        for (size_t i = 0; i < level_op_seq_.size(); i++) {
+            if (level_op_seq_[i].size() == 1) {
+                fprintf(stderr, "[lvlseq] L%zu: %s\n", i,
+                        level_op_seq_[i][0].c_str());
+            } else {
+                std::string s;
+                for (size_t j = 0; j < level_op_seq_[i].size(); j++) {
+                    if (j)
+                        s += " ";
+                    s += level_op_seq_[i][j];
+                }
+                fprintf(stderr, "[lvlseq] L%zu(%zu): %s\n", i,
+                        level_op_seq_[i].size(), s.c_str());
+            }
+        }
+    }
     // Persist a name->tensor view of every named tensor for post-Run
     // inspection (driver dumps intermediates to diagnose NaN propagation).
     tensor_map_ = tensor_map;
