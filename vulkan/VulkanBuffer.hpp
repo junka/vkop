@@ -50,6 +50,15 @@ class VulkanBuffer : public VulkanResource {
     void shaderWriteBarrier(VkCommandBuffer commandBuffer,
                             VkDeviceSize size = VK_WHOLE_SIZE,
                             VkDeviceSize offset = 0);
+    // shader-write -> indirect-command-read barrier. Used after a compute
+    // shader (dispatch_from_shape.comp) writes a VkDispatchIndirectCommand
+    // into an indirect buffer, before vkCmdDispatchIndirect reads it. The
+    // dst stage is DRAW_INDIRECT (the pipeline stage that sources indirect
+    // command data), dst access INDIRECT_COMMAND_READ. Without this, the
+    // indirect dispatch may read stale/unflushed bytes from the pre-pass.
+    void indirectReadBarrier(VkCommandBuffer commandBuffer,
+                             VkDeviceSize size = VK_WHOLE_SIZE,
+                             VkDeviceSize offset = 0);
 
     void copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
                                  VkBuffer dstbuffer, VkDeviceSize dstoffset,
