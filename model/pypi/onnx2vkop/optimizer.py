@@ -2973,11 +2973,22 @@ class FusionOptimizer:
         # --- Output shape + input shapes + rank ---
         # Output shape = terminal's output tensor shape. Input shapes = each
         # leaf input's shape (left-aligned, padded to rank).
+        #
+        # IMPORTANT: converter-time shapes may carry -1 (dynamic-dim sentinel
+        # for kv_len, which grows each decode round). These attributes are
+        # serialized as AttrType.Ints (uint32) — a -1 would fail serialization
+        # ("bad number -1 for type uint32"). The runtime FusedElemwise op
+        # derives the REAL shapes from the LIVE input/output tensors at execute
+        # time (build_program), so the converter-time shapes here are ONLY a
+        # fallback used when the live output shape is empty. We sanitize every
+        # dim to >= 1 (replacing -1 and any non-positive with 1) so the
+        # attributes serialize cleanly and the fallback is broadcast-neutral.
         term_out = terminal.outputs[0]
         out_shape = list(term_out.get("shape", [])) if isinstance(term_out, dict) \
             else list(getattr(term_out, "shape", []))
         if not out_shape:
             out_shape = [1]
+        out_shape = [d if (isinstance(d, int) and d > 0) else 1 for d in out_shape]
 
         # Gather each leaf input's shape. Leaves are tensor dicts {"name":...};
         # their dims live in dag_model shape info — look up via the producing
@@ -3012,6 +3023,9 @@ class FusionOptimizer:
             d = tensor_dims(tname)
             if not d:
                 d = [1]
+            # Sanitize: dynamic -1 sentinels -> 1 (see note above; runtime uses
+            # live shapes, so the converter value is just a fallback).
+            d = [x if (isinstance(x, int) and x > 0) else 1 for x in d]
             max_rank = max(max_rank, len(d))
         rank = max_rank
         # Left-align each input's shape padded to rank with 1.
@@ -3019,6 +3033,7 @@ class FusionOptimizer:
             d = tensor_dims(tname)
             if not d:
                 d = [1]
+            d = [x if (isinstance(x, int) and x > 0) else 1 for x in d]
             padded = list(d) + [1] * (rank - len(d))
             input_shapes.extend(padded[:rank])
 
