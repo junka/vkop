@@ -764,6 +764,19 @@ class FusionOptimizer:
             )
         )
 
+        # Elemwise chain fusion (kernel-fusion engine): collapse single-
+        # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
+        # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
+        # structural fusions + cast elimination) so chains are maximally long.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_elemwise_chain",
+                FusionOptimizer.match_fuse_elemwise_chain,
+                FusionOptimizer.fold_fuse_elemwise_chain,
+                priority=60,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "prune_and_materialize",
@@ -2670,6 +2683,393 @@ class FusionOptimizer:
             if n and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
 
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- elemwise chain fusion (kernel-fusion engine) ----
+    # Op codes — must match shaders/buffer/fused_elemwise.comp + ops/FusedElemwise.hpp.
+    _FUSED_OP_CODES = {
+        "Add": 1, "Sub": 2, "Mul": 3, "Div": 4, "Pow": 5,
+        "Sqrt": 6, "Sigmoid": 7, "Neg": 8, "Exp": 9, "Tanh": 10,
+    }
+    # Cast is deliberately excluded: a Cast inside a chain may be dtype-crossing
+    # (fp32<->fp16), and the fused runtime op requires all inputs to share the
+    # terminal dtype. The shader defines OP_CAST=11 for future same-dtype use,
+    # but the converter never emits it yet. A chain simply terminates at a Cast.
+    _FUSED_MAX_INPUTS = 8
+    _FUSED_MAX_REGS = 16
+    _FUSED_MAX_OPS = 32
+    _FUSED_MIN_CHAIN = 2  # don't fuse trivial 1-op chains (no dispatch saving)
+
+    @staticmethod
+    def match_fuse_elemwise_chain(dag_model):
+        """Match maximal single-consumer elemwise chains for kernel fusion.
+
+        A chain is a sequence of pointwise elemwise ops (Add/Sub/Mul/Div/Pow/
+        Sqrt/Sigmoid/Neg/Exp/Tanh) where every non-terminal op's output is
+        consumed by EXACTLY ONE node — the next op in the chain. This is the
+        validity invariant for fusion: no intermediate tensor is shared with
+        an external consumer (fusing would not delete its producer).
+
+        Chains are grown bottom-up from each chainable op treated as a
+        terminal, walking backward through inputs that are produced by a
+        chainable op whose output has a single consumer (the current op).
+        Maximal chains are kept; sub-chains of a longer chain are dropped.
+
+        Returns one match per maximal chain (length >= _FUSED_MIN_CHAIN).
+        """
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        chainable = FusionOptimizer._FUSED_OP_CODES.keys()
+
+        def is_chainable(node):
+            return node is not None and node.op_type in chainable and \
+                len(node.inputs) >= 1 and len(node.outputs) == 1
+
+        def single_consumer(tensor_name, exclude_node):
+            """True if tensor_name has exactly one consumer and it is exclude_node."""
+            cons = consumers.get(tensor_name, [])
+            return len(cons) == 1 and cons[0][0].name == exclude_node.name
+
+        # Grow the chain backward from `terminal`. Returns the ordered list of
+        # chain ops [first, ..., terminal] or None if a cycle/inconsistency.
+        visited = set()
+
+        def grow(op):
+            if op.name in visited:
+                return None
+            visited.add(op.name)
+            chain = [op]
+            # Walk backward through this op's inputs; any input produced by a
+            # chainable op whose output is consumed ONLY by `op` extends the
+            # chain (recurse). An input may be produced by a chain op that is
+            # shared — then it's a leaf (chain input), not a predecessor.
+            for inp in op.inputs:
+                pred = producer.get(inp["name"])
+                if not is_chainable(pred):
+                    continue
+                # The predecessor's output must be consumed only by `op`.
+                if not single_consumer(pred.outputs[0]["name"], op):
+                    continue
+                sub = grow(pred)
+                if sub is None:
+                    continue
+                # Merge: predecessor chain goes before current op.
+                chain = sub + chain
+            return chain
+
+        # Collect all maximal chains. Start a grow from every chainable op
+        # (as a potential terminal), then keep only maximal ones (not a
+        # strict sub-sequence of another). A terminal is an op whose output
+        # is NOT consumed solely by another chainable op extending it — but
+        # to keep this simple, grow from every op and dedup maximal below.
+        all_chains = []
+        for node in list(dag_model.nodes.values()):
+            if not is_chainable(node):
+                continue
+            visited = set()
+            chain = grow(node)
+            if chain and len(chain) >= FusionOptimizer._FUSED_MIN_CHAIN:
+                all_chains.append(chain)
+
+        # Keep maximal chains: drop a chain whose op-name set is a subset of a
+        # longer chain's set. (grow() from a mid-chain op yields a sub-chain.)
+        def names_set(chain):
+            return {n.name for n in chain}
+
+        maximal = []
+        name_sets = [names_set(c) for c in all_chains]
+        for i, ci in enumerate(all_chains):
+            is_sub = False
+            for j, cj in enumerate(all_chains):
+                if i == j:
+                    continue
+                if name_sets[i] < name_sets[j]:
+                    is_sub = True
+                    break
+            if not is_sub:
+                maximal.append(ci)
+        # Dedup identical chains (same op-name set) keeping one.
+        seen = set()
+        unique = []
+        for c in maximal:
+            key = tuple(sorted(names_set(c)))
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(c)
+
+        matches = []
+        for chain in unique:
+            matches.append({"chain": chain, "producer": producer,
+                            "consumers": consumers})
+        print(f"[fuse_elemwise_chain] {len(matches)} maximal chains "
+              f"(min length {FusionOptimizer._FUSED_MIN_CHAIN})")
+        if matches:
+            lens = [len(c) for c in unique]
+            hist = {}
+            for L in lens:
+                hist[L] = hist.get(L, 0) + 1
+            print(f"[fuse_elemwise_chain] length histogram: {dict(sorted(hist.items()))}")
+        return matches
+
+    @staticmethod
+    def fold_fuse_elemwise_chain(dag_model, match) -> bool:
+        """Fold a single-consumer elemwise chain into one FusedElemwise node.
+
+        Builds the register-machine program:
+          - Chain leaf inputs (not produced by a chain op) → registers 0..K-1.
+            Dedup by tensor name (same input reused → same register).
+          - Each chain op emits one program word {op, dst, a, b}:
+              * dst = a fresh register (allocate sequentially, reuse freed
+                registers via a simple free-list so long chains stay within
+                MAX_REGS).
+              * a/b = the register holding the operand. Binary op operands
+                are the two input-producing chain ops' dst registers, or a
+                leaf input register, or a scalar constant (encoded >= 100).
+              * For unary ops, b is unused (0).
+          - The terminal op's dst is reassigned to register 0 (the output
+            register the shader stores). If the terminal's allocated dst != 0,
+            rewrite the final op's dst to 0 (and rewrite any later references
+            — there are none, since terminal output goes external).
+          - Scalar constant operands (single-element initializer) are appended
+            to the scalars list and referenced as 100 + scalar_index.
+
+        Input shapes: each leaf input's shape (rank = max input rank; each
+        input left-aligned its dims and pads to rank). Slot 0 of the dims
+        block is the output shape (the terminal op's output shape).
+        """
+        chain = match["chain"]
+        producer = match["producer"]
+        consumers = match["consumers"]
+        chainable = FusionOptimizer._FUSED_OP_CODES.keys()
+        MAX_IN = FusionOptimizer._FUSED_MAX_INPUTS
+        MAX_REG = FusionOptimizer._FUSED_MAX_REGS
+        MAX_OPS = FusionOptimizer._FUSED_MAX_OPS
+
+        if len(chain) > MAX_OPS:
+            return False
+
+        chain_names = {n.name for n in chain}
+
+        # --- Collect leaf inputs (chain inputs not produced by a chain op) ---
+        # Ordered by first appearance; dedup by tensor name → one register.
+        leaf_inputs = []  # list of tensor-name
+        leaf_reg = {}     # tensor-name -> register index
+        for op in chain:
+            for inp in op.inputs:
+                tname = inp["name"]
+                if tname in leaf_reg:
+                    continue
+                pred = producer.get(tname)
+                # A leaf if not produced by a chain op in THIS chain.
+                if pred is not None and pred.name in chain_names:
+                    continue
+                if len(leaf_inputs) >= MAX_IN:
+                    return False  # too many distinct inputs
+                leaf_reg[tname] = len(leaf_inputs)
+                leaf_inputs.append(tname)
+
+        if not leaf_inputs:
+            return False
+
+        # --- Scalar constants: single-element initializers among leaves ---
+        # Operand encoding: 100 + scalar_index. Non-scalar leaves are registers.
+        scalars = []  # list of float
+        leaf_scalar_idx = {}  # tensor-name -> scalar index (if scalar)
+        for tname in leaf_inputs:
+            arr = dag_model.initializers.get(tname)
+            if arr is None:
+                continue
+            np_arr = numpy_helper.to_array(arr)
+            if np_arr.size == 1:
+                idx = len(scalars)
+                scalars.append(float(np_arr.item()))
+                leaf_scalar_idx[tname] = idx
+
+        # --- Register for each chain op's output ---
+        # op_out_reg: op.name -> register holding its output.
+        # Allocate from a free-list so a register is reclaimed once its last
+        # consumer op is emitted. Leaves occupy 0..K-1 (K = nLeafRegs);
+        # chain ops allocate from K upward.
+        n_leaf_regs = len(leaf_inputs)
+        # Free list starts empty; allocated on demand. reg 0 is reserved for
+        # the terminal output, but leaf inputs may use it too (the terminal
+        # rewrite below reassigns the final op's dst to 0 regardless).
+        op_out_reg = {}
+        # Track remaining uses of each register to know when to free it.
+        # A register produced by op X is consumed by ops that read X's output.
+        # Build use counts per producing-op (how many chain ops read it).
+        use_count = {n.name: 0 for n in chain}
+        for op in chain:
+            for inp in op.inputs:
+                pred = producer.get(inp["name"])
+                if pred is not None and pred.name in chain_names:
+                    use_count[pred.name] += 1
+
+        next_reg = n_leaf_regs
+        free_regs = []
+        consumed_so_far = {n.name: 0 for n in chain}
+
+        def alloc_reg():
+            nonlocal next_reg
+            if free_regs:
+                return free_regs.pop()
+            r = next_reg
+            next_reg += 1
+            return r
+
+        # Operand resolution: given an input tensor of `op`, return its value
+        # source — either a register index (int < MAX_REG) or a scalar code
+        # (>= 100), or None if it's a leaf register.
+        def operand_code(op, inp):
+            tname = inp["name"]
+            if tname in leaf_scalar_idx:
+                return 100 + leaf_scalar_idx[tname]
+            if tname in leaf_reg:
+                return leaf_reg[tname]
+            pred = producer.get(tname)
+            if pred is not None and pred.name in chain_names:
+                return op_out_reg[pred.name]
+            return None
+
+        program = []  # flat int list, 4 per op
+        for op in chain:
+            oc = FusionOptimizer._FUSED_OP_CODES[op.op_type]
+            dst = alloc_reg()
+            op_out_reg[op.name] = dst
+            # Resolve operands.
+            a_val = operand_code(op, op.inputs[0])
+            if a_val is None:
+                return False
+            b_val = 0
+            if op.op_type in ("Add", "Sub", "Mul", "Div", "Pow"):
+                if len(op.inputs) < 2:
+                    return False
+                b_val = operand_code(op, op.inputs[1])
+                if b_val is None:
+                    return False
+            program.extend([oc, dst, a_val, b_val])
+            # Free predecessor registers whose uses are exhausted.
+            for inp in op.inputs:
+                pred = producer.get(inp["name"])
+                if pred is not None and pred.name in chain_names:
+                    consumed_so_far[pred.name] += 1
+                    if consumed_so_far[pred.name] >= use_count[pred.name]:
+                        r = op_out_reg.get(pred.name)
+                        if r is not None and r >= n_leaf_regs:
+                            free_regs.append(r)
+
+        if next_reg > MAX_REG:
+            return False
+
+        # --- Rewrite the terminal op's dst to register 0 (the output reg). ---
+        terminal = chain[-1]
+        term_old_reg = op_out_reg[terminal.name]
+        # The terminal op is the LAST program word; rewrite its dst field.
+        program[-3] = 0  # dst of the last op -> 0
+        # No downstream chain op references the terminal's output (it's the
+        # terminal — its output goes external), so no further rewrite needed.
+
+        # --- Output shape + input shapes + rank ---
+        # Output shape = terminal's output tensor shape. Input shapes = each
+        # leaf input's shape (left-aligned, padded to rank).
+        term_out = terminal.outputs[0]
+        out_shape = list(term_out.get("shape", [])) if isinstance(term_out, dict) \
+            else list(getattr(term_out, "shape", []))
+        if not out_shape:
+            out_shape = [1]
+
+        # Gather each leaf input's shape. Leaves are tensor dicts {"name":...};
+        # their dims live in dag_model shape info — look up via the producing
+        # node's output dims or the value_info. Use the dims attached to the
+        # tensor dict if present, else [1].
+        def tensor_dims(tname):
+            # Check leaf input tensor dict (stored in the chain op's inputs).
+            # The converter stores dims under the "shape" key (may contain -1
+            # for dynamic dims like kv_len; -1 is left as-is — the runtime's
+            # FusedElemwise op resolves the real output shape from out_shape_
+            # and the shader only uses input dims for broadcast math, where a
+            # -1 would be wrong. But elemwise chains are pointwise on the
+            # FULL kv_len tensor, so all inputs share the output shape; a -1
+            # in a broadcast input dim is replaced by the output's concrete
+            # value at runtime via the dims block. For scalar/1-D bias inputs
+            # the dims are concrete. We pass dims verbatim; the host pads.)
+            for op in chain:
+                for inp in op.inputs:
+                    if inp["name"] == tname:
+                        d = inp.get("shape")
+                        if d:
+                            return list(d)
+            # Fall back to initializer dims.
+            arr = dag_model.initializers.get(tname)
+            if arr is not None:
+                return list(numpy_helper.to_array(arr).shape)
+            return [1]
+
+        input_shapes = []
+        max_rank = len(out_shape)
+        for tname in leaf_inputs:
+            d = tensor_dims(tname)
+            if not d:
+                d = [1]
+            max_rank = max(max_rank, len(d))
+        rank = max_rank
+        # Left-align each input's shape padded to rank with 1.
+        for tname in leaf_inputs:
+            d = tensor_dims(tname)
+            if not d:
+                d = [1]
+            padded = list(d) + [1] * (rank - len(d))
+            input_shapes.extend(padded[:rank])
+
+        # --- Build the fused node ---
+        # Inputs: the leaf input tensor dicts (in register order). Reuse the
+        # actual tensor dict objects from the chain so ShapeRef wiring stays
+        # valid. Scalar constant leaves are still passed as inputs (the shader
+        # reads element 0); the program just also encodes them as scalars for
+        # the operand path — but to avoid double-encoding, scalar leaves are
+        # referenced via the 100+ path and the shader reads from the program,
+        # NOT the SSBO. So we must NOT bind a scalar leaf as a register input
+        # that the shader preloads. Resolution: bind ALL leaf inputs as SSBOs
+        # (the shader preloads reg[0..nInputs-1]); for scalar leaves the
+        # preload reads element 0 (correct), AND the operand path uses the
+        # 100+ scalar (also correct, same value). To keep nInputs consistent
+        # with the program's register indices, scalar leaves still occupy a
+        # register slot — but their operand_code returns 100+idx, so the
+        # register is never read. That's fine (harmless preload).
+        leaf_tdicts = []
+        for tname in leaf_inputs:
+            # Find the tensor dict in the chain op inputs.
+            td = None
+            for op in chain:
+                for inp in op.inputs:
+                    if inp["name"] == tname:
+                        td = inp
+                        break
+                if td:
+                    break
+            if td is None:
+                return False
+            leaf_tdicts.append(td)
+
+        n_inputs = len(leaf_tdicts)
+        fused = Node(
+            op_type="FusedElemwise",
+            name=f"FusedElemwise_fused_{terminal.name}",
+            attributes={
+                "ops": program,
+                "input_shapes": input_shapes,
+                "out_shape": out_shape,
+                "rank": rank,
+                "scalars": scalars,
+            },
+            inputs=leaf_tdicts,
+            outputs=terminal.outputs[:],  # reuse the terminal's output tensor
+        )
+
+        for n in chain:
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
         dag_model.nodes[fused.name] = fused
         return True
 

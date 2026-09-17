@@ -961,4 +961,51 @@ TEST(BufferRankTest, FusedElemwiseAddSqrtMulBroadcastScalar) {
         brt_fused_addsqrtmul_broadcast_case<uint16_t>({2, 3, 4, 5}, true));
 }
 
+// Scalar-constant operand path: out = sqrt(A / 2.0). The 2.0 is encoded as a
+// program scalar (operand 100+), NOT a register input. Verifies the shader's
+// scalar-operand decode (a >= 100 reads uProg.data[scalarsBase + (a-100)]).
+// Program: Div{4,2,0,100} Sqrt{6,0,2,0} — reg0=A, Div(reg0,scalar0)->reg2,
+// Sqrt(reg2)->reg0. scalars=[2.0].
+template <typename T>
+bool brt_fused_divscalar_case(const std::vector<int> &shape, bool fp16) {
+    Dev d;
+    auto torch_a = torch::abs(torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>()));
+    float sval = 2.0f;
+    auto torch_out = torch::sqrt(torch_a / sval);
+
+    auto in_a = std::make_shared<Tensor<T>>(shape);
+    brt_fill(in_a, torch_a);
+    brt_upload(in_a, d);
+    // The scalar is NOT a bound input here — it lives only in the program.
+    // (In the real converter, scalar leaves are still bound as SSBOs but the
+    //  operand path uses 100+. Here we omit the scalar input to test the
+    //  pure program-scalar path: nInputs=1, only A is bound.)
+    auto output = brt_make_out<T>(shape, d);
+    // ops: Div{4,2,0,100} Sqrt{6,0,2,0}
+    std::string ops_str = "[4,2,0,100, 6,0,2,0]";
+    int n = vkop::ops::total_elems(shape);
+    std::string shp = "[" + std::to_string(n) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                      {{"ops", ops_str},
+                       {"input_shapes", shp},
+                       {"out_shape", shp},
+                       {"rank", "1"},
+                       {"scalars", "[2.0]"}},
+                      d);
+    if (!op)
+        return false;
+    op->onExecute({in_a}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+TEST(BufferRankTest, FusedElemwiseDivScalarProgram) {
+    EXPECT_TRUE(brt_fused_divscalar_case<float>({2, 3, 4, 5}, false));
+    EXPECT_TRUE(brt_fused_divscalar_case<uint16_t>({2, 3, 4, 5}, true));
+    EXPECT_TRUE(brt_fused_divscalar_case<float>({17}, false));
+    EXPECT_TRUE(brt_fused_divscalar_case<uint16_t>({17}, true));
+}
+
 } // namespace

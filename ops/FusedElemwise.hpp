@@ -138,40 +138,77 @@ class FusedElemwise : public BufferFactory {
     // Build the program SSBO contents. Layout (mirrors the shader):
     //   [0] nOps  [1] nInputs  [2] nScalars  [3] rank
     //   [4 .. 4+rank*nInputs) input dims (per input, left-aligned, padded to
-    //   rank)
+    //   rank; slot 0 = output shape)
     //   [...] ops: 4 ints/op
     //   [...] scalars (float bits as uint)
-    // Input dims slot 0 = output shape (the shader reads outDims from there).
-    void build_program(int nInputs) {
+    //
+    // Shapes are derived from the LIVE input/output tensors at execute time
+    // (the converter-time shapes carry -1 for dynamic dims like kv_len, which
+    // grows each decode round). The program (ops + scalars) is static; only
+    // the dims block is rebuilt each round.
+    void
+    build_program(int nInputs,
+                  const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                  const std::shared_ptr<core::ITensor> &output) {
         int nOps = static_cast<int>(ops_.size()) / 4;
         int nScalars = static_cast<int>(scalar_floats_.size());
+
+        // Resolve the output shape. The output tensor was resized by execute()
+        // to the broadcast-max shape (or the converter out_shape_ if concrete).
+        // For the dims block, slot 0 = output shape. Rank = max input rank.
+        std::vector<std::vector<int>> in_shapes;
+        in_shapes.reserve(nInputs);
+        int rank = 0;
+        for (int k = 0; k < nInputs; ++k) {
+            auto s = inputs[k]->getShape();
+            in_shapes.push_back(s);
+            rank = std::max(rank, static_cast<int>(s.size()));
+        }
+        std::vector<int> out_shp = output->getShape();
+        if (out_shp.empty())
+            out_shp = out_shape_; // fallback to converter
+        rank = std::max(rank, static_cast<int>(out_shp.size()));
+        if (rank == 0)
+            rank = 1;
+        rank = std::min(rank, 8); // IArr8 cap
+
         prog_data_.clear();
         prog_data_.push_back(nOps);
         prog_data_.push_back(nInputs);
         prog_data_.push_back(nScalars);
-        prog_data_.push_back(rank_);
+        prog_data_.push_back(rank);
 
-        // Per-input dims. The converter left-aligns each input's shape and
-        // pads to `rank`; slot 0 is the output shape.
-        int dimsCount = rank_ * nInputs;
-        // Ensure input_shapes_ has exactly dimsCount entries (pad with 1).
-        while (static_cast<int>(input_shapes_.size()) < dimsCount) {
-            input_shapes_.push_back(1);
-        }
-        // Slot 0 = output shape (left-aligned, padded to rank).
-        for (int i = 0; i < rank_; ++i) {
-            prog_data_.push_back(
-                i < static_cast<int>(out_shape_.size()) ? out_shape_[i] : 1);
-        }
-        // Slots 1..nInputs-1 = the converter-supplied input shapes.
-        for (int k = 1; k < nInputs; ++k) {
-            for (int i = 0; i < rank_; ++i) {
-                int idx = k * rank_ + i;
+        // Slot 0 = output shape (left-aligned, padded to rank with 1).
+        auto push_left_aligned = [&](const std::vector<int> &s) {
+            for (int i = 0; i < rank; ++i) {
                 prog_data_.push_back(
-                    idx < static_cast<int>(input_shapes_.size())
-                        ? input_shapes_[idx]
-                        : 1);
+                    (i < static_cast<int>(s.size()) && s[i] > 0) ? s[i] : 1);
             }
+        };
+        push_left_aligned(out_shp);
+        // Slots 1..nInputs-1 = each input's shape, ONNX right-aligned (pad
+        // LEADING with 1 so a lower-rank input broadcasts on its trailing
+        // axes — matches the shader's broadcast_index which treats any
+        // dim==1 as a broadcast axis).
+        for (int k = 0; k < nInputs; ++k) {
+            const auto &s = in_shapes[k];
+            // Right-align: leading 1s, then the shape in trailing slots.
+            std::vector<int> padded(rank, 1);
+            int r =
+                static_cast<int>(std::min(s.size(), static_cast<size_t>(rank)));
+            for (int i = 0; i < r; ++i) {
+                padded[rank - r + i] = (s[i] > 0) ? s[i] : 1;
+            }
+            // The shader reads input[k]'s dims at dimsBase + k*rank. Slot 0
+            // above is the output; input 0's dims are also written here (the
+            // shader reads outDims from input slot 0, so input 0 must carry
+            // the OUTPUT shape). For k==0 we already pushed out_shp; for a
+            // pointwise chain input 0 == output shape, so this is consistent.
+            // For k>=1 push the (right-aligned) input shape.
+            if (k == 0)
+                continue; // already pushed as out_shp
+            for (int i = 0; i < rank; ++i)
+                prog_data_.push_back(padded[i]);
         }
         // Ops.
         for (int v : ops_)
@@ -193,16 +230,40 @@ class FusedElemwise : public BufferFactory {
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
-            int total = total_elems(out_shape_.empty() ? output->getShape()
-                                                       : out_shape_);
-            if (output->num_elements() != total) {
-                output->resize(out_shape_.empty() ? output->getShape()
-                                                  : out_shape_);
-            }
-            auto out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
 
             int nInputs = static_cast<int>(inputs.size());
             nInputs = std::min(nInputs, kFusedMaxInputs);
+
+            // Compute the broadcast-max output shape from the LIVE input
+            // tensors (the converter-time shapes carry -1 for dynamic dims
+            // like kv_len, which grows each decode round). ONNX right-aligned
+            // broadcast: align to the max rank, element-wise max (1
+            // broadcasts).
+            int rank = 0;
+            for (int k = 0; k < nInputs; ++k) {
+                rank = std::max(rank,
+                                static_cast<int>(inputs[k]->getShape().size()));
+            }
+            rank = std::min(rank, 8); // IArr8 cap
+            std::vector<int> out_shp(rank, 1);
+            for (int k = 0; k < nInputs; ++k) {
+                auto s = inputs[k]->getShape();
+                int r = static_cast<int>(
+                    std::min(s.size(), static_cast<size_t>(rank)));
+                for (int i = 0; i < r; ++i) {
+                    int dim = s[r - 1 - i] > 0 ? s[r - 1 - i] : 1;
+                    int idx = rank - 1 - i;
+                    out_shp[idx] = std::max(out_shp[idx], dim);
+                }
+            }
+            if (out_shp.empty())
+                out_shp = out_shape_;
+            int total = total_elems(out_shp);
+            if (output->num_elements() != total) {
+                output->resize(out_shp);
+            }
+
+            auto out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
             for (int k = 0; k < nInputs; ++k) {
                 bind_ssbo<T>(inputs[k], /*is_output=*/false);
             }
@@ -215,11 +276,11 @@ class FusedElemwise : public BufferFactory {
                 objs_.emplace_back(out_buf);
             }
 
-            // Build + upload the program buffer (once; reused across rounds
-            // since the chain structure is static). The program is tiny (a
-            // few hundred bytes) so vkCmdUpdateBuffer handles it inline.
+            // Build the program SSBO each round (dims change with kv_len; the
+            // op program is static). The program is tiny (a few hundred bytes)
+            // so vkCmdUpdateBuffer handles it inline.
+            build_program(nInputs, inputs, outputs[0]);
             if (!prog_built_) {
-                build_program(nInputs);
                 prog_buf_ = std::make_shared<VulkanBuffer>(
                     m_dev_,
                     static_cast<VkDeviceSize>(prog_data_.size() *
@@ -230,9 +291,7 @@ class FusedElemwise : public BufferFactory {
                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                 prog_built_ = true;
             }
-            // Upload the program (cheap; data may change if the converter
-            // re-ran, but structure is static — still re-upload to be safe
-            // since the buffer may have been recycled).
+            // Upload (data may have grown if the dims changed across rounds).
             prog_buf_->updateBuffer(m_cmd_->get(), prog_data_.data(),
                                     prog_data_.size() * sizeof(int32_t));
             objs_.emplace_back(prog_buf_);
