@@ -1,0 +1,293 @@
+#version 450 core
+
+// Fused elementwise SSBO op: executes a CHAIN of N elemwise ops in ONE
+// dispatch (one thread per output element), instead of N separate dispatches.
+// This is the kernel-fusion engine — collapses chains like the 9-op SwiGLU
+// block (Add Sqrt Div Mul Cast Mul Sigmoid Mul Mul) into a single launch to
+// amortize the ~0.3ms Intel ARL iGPU kernel-launch overhead that dominates
+// the decode loop (3270 fragmented dispatches/round).
+//
+// Model: a small register machine. Each thread owns ONE output element and
+// runs the same op program. Inputs are either a bound SSBO element (with
+// ONNX right-aligned broadcasting) or a per-op scalar constant.
+//
+// Bindings:
+//   0           output SSBO (write)
+//   1..K        input SSBOs (read), K = nInputs (≤ MAX_INPUTS)
+//   K+1         program SSBO (read): int[] encoding the op list + per-input
+//               broadcast shapes + scalar constants. Layout (see host
+//               FusedElemwisePC + build_program_buffer):
+//                 [0]      nOps
+//                 [1]      nInputs
+//                 [2]      nScalars
+//                 [3]      rank            (common rank for nd<->linear)
+//                 [4..4+rank*nInputs)  input dims (left-aligned, per input)
+//                 [...]    op words: 4 ints/op {op, dst, a, b}
+//                 [...]    scalar constants (float-as-uint), 1 int each
+//
+// Push constant: total (output element count) + sizes only — all shape/program
+// detail lives in the program SSBO to stay within the 128B PC limit for long
+// chains.
+//
+// Registers: reg[0..MAX_REGS-1]. reg[0..nInputs-1] are preloaded with the
+// broadcast input elements for this thread's output index. Op dst writes a
+// register; op a/b operands encode (register index). The chain's final result
+// must land in a known output register (op program ensures the last op writes
+// reg 0, which is stored — see host builder).
+//
+// fp16: like the other elemwise shaders, one thread per uint WORD (two packed
+// half elements), read-modify-write the half2 — safe because each output word
+// is owned by exactly one thread (contiguous index range).
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_INPUTS 8
+#define MAX_REGS   16
+#define MAX_OPS    32
+
+// Op codes. Unary ops read a; b is unused. Binary ops read a and b.
+#define OP_ADD     1
+#define OP_SUB     2
+#define OP_MUL     3
+#define OP_DIV     4
+#define OP_POW     5
+#define OP_SQRT    6   // unary
+#define OP_SIGMOID 7   // unary
+#define OP_NEG     8   // unary
+#define OP_EXP     9   // unary
+#define OP_TANH    10  // unary
+#define OP_CAST    11  // unary, no-op (same-dtype chain only — host skips dtype-crossing casts)
+#define OP_WHERE   12  // ternary: b ? a : (next-reg) — handled specially below
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+
+// Input SSBOs. GLSL forbids indexing an array of buffer blocks by a runtime
+// variable, so we declare a fixed set and select by if-ladder (small K).
+layout(set = 0, binding = 1) readonly buffer In0 { uint data[]; } uIn0;
+layout(set = 0, binding = 2) readonly buffer In1 { uint data[]; } uIn1;
+layout(set = 0, binding = 3) readonly buffer In2 { uint data[]; } uIn2;
+layout(set = 0, binding = 4) readonly buffer In3 { uint data[]; } uIn3;
+layout(set = 0, binding = 5) readonly buffer In4 { uint data[]; } uIn4;
+layout(set = 0, binding = 6) readonly buffer In5 { uint data[]; } uIn5;
+layout(set = 0, binding = 7) readonly buffer In6 { uint data[]; } uIn6;
+layout(set = 0, binding = 8) readonly buffer In7 { uint data[]; } uIn7;
+
+// Program SSBO. Binding = MAX_INPUTS + 1 = 9.
+layout(set = 0, binding = 9) readonly buffer Prog {
+    int data[];
+} uProg;
+
+layout(push_constant) uniform PC_uPC {
+    int total;     // output element count
+    int nInputs;   // number of bound input SSBOs (≤ MAX_INPUTS)
+    int nOps;      // number of ops in the program
+    int nScalars;  // number of scalar constants appended to the program
+    int _pad0;
+    int _pad1;
+    int _pad2;
+    int _pad3;
+} uPC;
+
+// Read a uint word from input `k` at linear element index `lin` (already
+// broadcast-mapped by the caller). The if-ladder is necessary because GLSL
+// buffer blocks can't be indexed by a dynamic variable.
+float load_input_raw(int k, int lin) {
+    if (k == 0) {
+#ifdef FP16
+        return unpackHalf2x16(uIn0.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn0.data[lin]);
+#endif
+    } else if (k == 1) {
+#ifdef FP16
+        return unpackHalf2x16(uIn1.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn1.data[lin]);
+#endif
+    } else if (k == 2) {
+#ifdef FP16
+        return unpackHalf2x16(uIn2.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn2.data[lin]);
+#endif
+    } else if (k == 3) {
+#ifdef FP16
+        return unpackHalf2x16(uIn3.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn3.data[lin]);
+#endif
+    } else if (k == 4) {
+#ifdef FP16
+        return unpackHalf2x16(uIn4.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn4.data[lin]);
+#endif
+    } else if (k == 5) {
+#ifdef FP16
+        return unpackHalf2x16(uIn5.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn5.data[lin]);
+#endif
+    } else if (k == 6) {
+#ifdef FP16
+        return unpackHalf2x16(uIn6.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn6.data[lin]);
+#endif
+    } else {
+#ifdef FP16
+        return unpackHalf2x16(uIn7.data[lin >> 1])[lin & 1];
+#else
+        return uintBitsToFloat(uIn7.data[lin]);
+#endif
+    }
+}
+
+void store_out(int lin, float v) {
+#ifdef FP16
+    uint w = uint(lin) >> 1;
+    vec2 p = unpackHalf2x16(uOutput.data[w]);
+    p[uint(lin) & 1u] = v;
+    uOutput.data[w] = packHalf2x16(p);
+#else
+    uOutput.data[lin] = floatBitsToUint(v);
+#endif
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = 2 * gid + 1;
+#else
+    if (gid >= uPC.total) return;
+    int i0 = gid;
+    int i1 = -1; // unused
+#endif
+
+    // --- Decode program header ---
+    int nOps     = uPC.nOps;
+    int nInputs  = uPC.nInputs;
+    int nScalars = uPC.nScalars;
+    int rank     = uProg.data[3];
+
+    // Input dims live at [4 .. 4 + rank*nInputs). Each input's dims occupy
+    // `rank` consecutive ints (left-aligned; the host pads trailing with 1).
+    int dimsBase = 4;
+
+    // Op words start after the input dims.
+    int opsBase = dimsBase + rank * nInputs;
+    // Scalar constants start after the ops (4 ints/op).
+    int scalarsBase = opsBase + 4 * nOps;
+
+    // Process two output elements per thread in fp16 (one word), one in fp32.
+    // Loop over the 1 or 2 element indices.
+    for (int e = 0; e < 2; ++e) {
+#ifdef FP16
+        int lin = (e == 0) ? i0 : i1;
+        if (lin >= uPC.total) continue;
+#else
+        if (e == 1) break;
+        int lin = i0;
+#endif
+
+        float reg[MAX_REGS];
+        for (int i = 0; i < MAX_REGS; ++i) reg[i] = 0.0;
+
+        // Preload each input's broadcast element for this output index.
+        // broadcast_index needs the output coordinate + the input's dims.
+        IArr8 outDims;
+        for (int i = 0; i < 8; ++i) outDims.v[i] = 1;
+        // Output dims == input[0] dims when all inputs are same-shape
+        // (pointwise). For broadcast inputs, the output shape is the
+        // broadcast-max; the host writes the TRUE output shape as input[0]'s
+        // dims entry, so reading outDims from input[0] is correct when
+        // input[0] is the full-shape tensor. For a scalar-only input[0] the
+        // host still provides the output shape in a dedicated slot — see
+        // host builder (it always places output dims at input slot 0 of the
+        // dims block, and binds the full-shape tensor as input 0 when one
+        // exists). To keep this robust, the host guarantees dims slot 0 =
+        // output shape.
+        for (int i = 0; i < rank && i < 8; ++i) {
+            outDims.v[i] = uProg.data[dimsBase + i]; // input[0]'s dims = out shape
+        }
+
+        for (int k = 0; k < nInputs && k < MAX_INPUTS; ++k) {
+            IArr8 inDims;
+            for (int i = 0; i < 8; ++i) inDims.v[i] = 1;
+            for (int i = 0; i < rank && i < 8; ++i) {
+                inDims.v[i] = uProg.data[dimsBase + k * rank + i];
+            }
+            // Scalar input (rank 0 / 1-elem): always read element 0.
+            int inLin;
+            bool isScalar = true;
+            for (int i = 0; i < rank; ++i) {
+                if (inDims.v[i] != 1) { isScalar = false; break; }
+            }
+            if (isScalar) {
+                inLin = 0;
+            } else {
+                inLin = broadcast_index(lin, outDims, inDims, rank);
+            }
+            reg[k] = load_input_raw(k, inLin);
+        }
+
+        // Execute the op program.
+        for (int op = 0; op < nOps && op < MAX_OPS; ++op) {
+            int oc  = uProg.data[opsBase + op * 4 + 0];
+            int dst = uProg.data[opsBase + op * 4 + 1];
+            int a   = uProg.data[opsBase + op * 4 + 2];
+            int b   = uProg.data[opsBase + op * 4 + 3];
+
+            // Operand a/b encoding: values < MAX_INPUTS-are-registers? No —
+            // disambiguate by sign. a/b >= 0 and < MAX_REGS: a register.
+            // a/b in [100..100+nScalars): a scalar constant.
+            // (Inputs are preloaded into reg[0..nInputs-1], so an operand
+            //  referencing an input just names its register.)
+            float av = 0.0;
+            float bv = 0.0;
+            if (a >= 100) {
+                av = uintBitsToFloat(uProg.data[scalarsBase + (a - 100)]);
+            } else if (a >= 0 && a < MAX_REGS) {
+                av = reg[a];
+            }
+            if (b >= 100) {
+                bv = uintBitsToFloat(uProg.data[scalarsBase + (b - 100)]);
+            } else if (b >= 0 && b < MAX_REGS) {
+                bv = reg[b];
+            }
+
+            float r = 0.0;
+            if (oc == OP_ADD)      r = av + bv;
+            else if (oc == OP_SUB) r = av - bv;
+            else if (oc == OP_MUL) r = av * bv;
+            else if (oc == OP_DIV) r = av / bv;
+            else if (oc == OP_POW) r = pow(av, bv);
+            else if (oc == OP_SQRT)    r = sqrt(av);
+            else if (oc == OP_SIGMOID) r = 1.0 / (1.0 + exp(-av));
+            else if (oc == OP_NEG)     r = -av;
+            else if (oc == OP_EXP)     r = exp(av);
+            else if (oc == OP_TANH)    r = tanh(av);
+            else if (oc == OP_CAST)    r = av; // same-dtype no-op
+            else if (oc == OP_WHERE) {
+                // ternary: dst = (b != 0) ? reg[a] : reg[next]
+                // encoded as op=WHERE, a=true_src_reg, b=cond_reg, dst=out_reg;
+                // the false branch is the NEXT op's dst register — host lays
+                // out Where as a select with cond in b. Simplify: r = cond ? a : 0
+                // (full Where handled by host emitting ADD/MUL primitives when
+                // possible; OP_WHERE here is a fallback select against 0).
+                r = (bv != 0.0) ? av : 0.0;
+            }
+            if (dst >= 0 && dst < MAX_REGS) reg[dst] = r;
+        }
+
+        // The host guarantees the last op writes reg 0 (the output register).
+        store_out(lin, reg[0]);
+    }
+}

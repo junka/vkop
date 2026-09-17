@@ -850,4 +850,115 @@ TEST(BufferRankTest, RotaryEmbeddingIdentity) {
     EXPECT_TRUE(brt_rotary_identity_case<float>({1, 4, 2, 8}, false));
 }
 
+// =========================================================================
+// FusedElemwise — register-machine chain in ONE dispatch.
+// Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.
+// Program (op codes: ADD=1, SQRT=6, MUL=3; 4 ints/op {op,dst,a,b}):
+//   reg[0]=A, reg[1]=B (preloaded inputs)
+//   op0: ADD  dst=2 a=0 b=1   -> reg[2] = A+B
+//   op1: SQRT dst=3 a=2 b=0   -> reg[3] = sqrt(reg[2])   (b unused)
+//   op2: MUL  dst=0 a=3 b=0   -> reg[0] = sqrt(A+B)*A    (final, writes reg 0)
+// Verifies the fused single-dispatch result is bit-exact (within fp tol) vs
+// running the three ops sequentially.
+// =========================================================================
+
+template <typename T>
+bool brt_fused_addsqrtmul_case(const std::vector<int> &shape, bool fp16) {
+    Dev d;
+    auto torch_a = torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>());
+    // B biased positive so A+B >= 0 (sqrt domain); keep magnitude modest.
+    auto torch_b = torch::abs(torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>()));
+    auto torch_out = torch::sqrt(torch_a + torch_b) * torch_a;
+
+    auto in_a = std::make_shared<Tensor<T>>(shape);
+    auto in_b = std::make_shared<Tensor<T>>(shape);
+    brt_fill(in_a, torch_a);
+    brt_fill(in_b, torch_b);
+    brt_upload(in_a, d);
+    brt_upload(in_b, d);
+
+    auto output = brt_make_out<T>(shape, d);
+    // ops: ADD{1,2,0,1} SQRT{6,3,2,0} MUL{3,0,3,0}
+    std::string ops_str = "[1,2,0,1, 6,3,2,0, 3,0,3,0]";
+    // input_shapes: 2 inputs, rank 1 → [N, N] (both pointwise, full shape).
+    std::string shp = "[" + std::to_string(vkop::ops::total_elems(shape)) + "," +
+                      std::to_string(vkop::ops::total_elems(shape)) + "]";
+    std::string out_shp = "[" + std::to_string(vkop::ops::total_elems(shape)) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                      {{"ops", ops_str},
+                       {"input_shapes", shp},
+                       {"out_shape", out_shp},
+                       {"rank", "1"},
+                       {"scalars", "[]"}},
+                      d);
+    if (!op)
+        return false;
+    op->onExecute({in_a, in_b}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+// Broadcast variant: A is full shape, B is scalar (rank-1 size-1 → all 1s in
+// the dims block). Verifies broadcast_index + scalar-input fast path.
+template <typename T>
+bool brt_fused_addsqrtmul_broadcast_case(const std::vector<int> &shape,
+                                         bool fp16) {
+    Dev d;
+    auto torch_a = torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>());
+    // Scalar B (a single value broadcast). Keep A+B >= 0.
+    float bval = 1.5f;
+    auto torch_b_scalar = torch::full({}, bval, brt_torch_opt<T>());
+    auto torch_out = torch::sqrt(torch_a + bval) * torch_a;
+
+    auto in_a = std::make_shared<Tensor<T>>(shape);
+    brt_fill(in_a, torch_a);
+    brt_upload(in_a, d);
+    // Scalar input: a 1-element tensor.
+    auto in_b = std::make_shared<Tensor<T>>(std::vector<int>{1});
+    std::vector<T> bv{T(bval)};
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        bv[0] = vkop::core::ITensor::fp32_to_fp16(bval);
+    }
+    in_b->fillToCPU(bv);
+    brt_upload(in_b, d);
+
+    auto output = brt_make_out<T>(shape, d);
+    std::string ops_str = "[1,2,0,1, 6,3,2,0, 3,0,3,0]";
+    int n = vkop::ops::total_elems(shape);
+    // input_shapes: slot0 = out shape (N), slot1 = scalar (1).
+    std::string shp = "[" + std::to_string(n) + ",1]";
+    std::string out_shp = "[" + std::to_string(n) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                      {{"ops", ops_str},
+                       {"input_shapes", shp},
+                       {"out_shape", out_shp},
+                       {"rank", "1"},
+                       {"scalars", "[]"}},
+                      d);
+    if (!op)
+        return false;
+    op->onExecute({in_a, in_b}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+TEST(BufferRankTest, FusedElemwiseAddSqrtMulPointwise) {
+    EXPECT_TRUE(brt_fused_addsqrtmul_case<float>({2, 3, 4, 5}, false));
+    EXPECT_TRUE(brt_fused_addsqrtmul_case<uint16_t>({2, 3, 4, 5}, true));
+    // Odd count to exercise the fp16 tail word (one leftover half).
+    EXPECT_TRUE(brt_fused_addsqrtmul_case<float>({17}, false));
+    EXPECT_TRUE(brt_fused_addsqrtmul_case<uint16_t>({17}, true));
+}
+
+TEST(BufferRankTest, FusedElemwiseAddSqrtMulBroadcastScalar) {
+    EXPECT_TRUE(brt_fused_addsqrtmul_broadcast_case<float>({2, 3, 4, 5}, false));
+    EXPECT_TRUE(
+        brt_fused_addsqrtmul_broadcast_case<uint16_t>({2, 3, 4, 5}, true));
+}
+
 } // namespace

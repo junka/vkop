@@ -52,6 +52,7 @@
 #include "Where.hpp"
 #include "ops/Cast.hpp"
 #include "ops/Equal.hpp"
+#include "ops/FusedElemwise.hpp"
 #include "ops/NonZero.hpp"
 #include "ops/RotaryEmbedding.hpp"
 #include "ops/ScatterElements.hpp"
@@ -174,6 +175,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<SqueezeUnsqueeze>(/*unsqueeze=*/true);
     case OpType::ROTARY_EMBEDDING:
         return std::make_unique<RotaryEmbedding>(fp16, backend_buffer);
+    case OpType::FUSED_ELEMWISE:
+        return std::make_unique<FusedElemwise>(fp16);
     default:
         return nullptr;
     }
