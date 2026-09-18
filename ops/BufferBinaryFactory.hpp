@@ -4,6 +4,7 @@
 
 #include "ops/BufferBase.hpp"
 #include <array>
+#include <cstdlib>
 #include <string>
 
 // Shared base for elementwise binary buffer (SSBO) ops with ONNX
@@ -87,6 +88,34 @@ class BufferBinaryFactory : public BufferFactory {
             s = InLearnState::LEARNING;
     }
 
+    // Phase 3+4 (VKOP_GPU_SHAPE): build a tiny int64 SSBO holding `shape`'s
+    // dims, for an input/output that lacks a shape_ssbo_ but whose getShape()
+    // is CPU-correct. The shader's broadcast==2 path reads dims uniformly from
+    // bound shape SSBOs (out/in0/in1 at bindings 3/4/5), so every participant
+    // must have one — real-data tensors get a per-round SSBO built here.
+    // Mirrors Shape.hpp's SSBO-build pattern. The caller appends the returned
+    // buffer to objs_ at the right binding position.
+    std::shared_ptr<VulkanBuffer>
+    build_shape_ssbo(const std::vector<int> &shape) {
+        std::vector<int64_t> dims(shape.begin(), shape.end());
+        auto t = std::make_shared<core::Tensor<int64_t>>();
+        t->resize(std::vector<int>{static_cast<int>(shape.size())});
+        t->fillToCPU(dims);
+        auto buf = std::dynamic_pointer_cast<VulkanBuffer>(
+            t->as_storage_buffer(m_dev_, m_cmd_));
+        t->copyToGPUDeferred(m_cmd_);
+        // Keep the Tensor alive for the level's duration: its data_ backs the
+        // deferred vkCmdUpdateBuffer upload recorded above, which resolves when
+        // the level submits. The VulkanBuffer itself is held by the caller in
+        // objs_ (for descriptor binding); the Tensor is held here.
+        shape_ssbo_tensors_.emplace_back(t);
+        return buf;
+    }
+
+    // Holds per-round built shape-SSBO source tensors (build_shape_ssbo) so
+    // their deferred uploads resolve before the level submits.
+    std::vector<std::shared_ptr<core::Tensor<int64_t>>> shape_ssbo_tensors_;
+
   private:
     // Host-compute an int64 elementwise binary op with right-aligned
     // broadcasting. All int64 producers (Shape/NonZero/Equal/Where/Gather/
@@ -169,6 +198,21 @@ class BufferBinaryFactory : public BufferFactory {
             return;
         }
 
+        // Phase 3+4 (VKOP_GPU_SHAPE): when an input carries a shape_ssbo_, its
+        // dims_ is a placeholder (the authoritative shape is the GPU SSBO, set
+        // by the upstream Reshape's skip-readback path). The shader's
+        // broadcast==2 mode loads out/in0/in1 dims from bound shape SSBOs
+        // (bindings 3/4/5) instead of the push-constant dims, so the host
+        // doesn't need CPU-known dim values — only the element `total` (for
+        // dispatch sizing). The total is CPU-known when at least one input has
+        // a trustworthy getShape() (the real-data side); the shape-meta side
+        // broadcasts toward it.
+        if (std::getenv("VKOP_GPU_SHAPE") &&
+            (inputs[0]->has_shape_ssbo() || inputs[1]->has_shape_ssbo())) {
+            execute_gpu_shape(inputs, outputs);
+            return;
+        }
+
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
         auto out_shape = computeBroadcastShape(shape_a, shape_b);
@@ -201,6 +245,103 @@ class BufferBinaryFactory : public BufferFactory {
         pc.total = total;
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
         submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+    }
+
+    // Phase 3+4 GPU-shape path. Binds out/in0/in1 data SSBOs (bindings 0/1/2)
+    // then out/in0/in1 SHAPE SSBOs (bindings 3/4/5), sets broadcast==2, and
+    // dispatches. The shader loads all three dim sets from the shape SSBOs.
+    // `total` (for dispatch group count) and `out_shape` (for output buffer
+    // sizing + output shape SSBO) come from whichever inputs have trustworthy
+    // CPU getShape(); a shape_ssbo_-only input is treated as a broadcaster.
+    // Falls back to the CPU-known path (broadcast==1) when neither input has a
+    // CPU-known shape — not yet reached in the LLM but kept as a safety net.
+    void execute_gpu_shape(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        // Drop last round's built shape-SSBO source tensors. Their deferred
+        // uploads already resolved at the prior level submit; the VulkanBuffers
+        // themselves live in objs_ (cleared by onExecute). This op re-records
+        // every round under VKOP_GPU_SHAPE (its total/dims vary → fingerprint
+        // never matches → never CACHED), so execute() runs each round.
+        shape_ssbo_tensors_.clear();
+
+        bool a_cpu = !inputs[0]->has_shape_ssbo();
+        bool b_cpu = !inputs[1]->has_shape_ssbo();
+        std::vector<int> shape_a = inputs[0]->getShape();
+        std::vector<int> shape_b = inputs[1]->getShape();
+        std::vector<int> out_shape;
+        int total;
+        if (a_cpu && b_cpu) {
+            out_shape = computeBroadcastShape(shape_a, shape_b);
+            total = total_elems(out_shape);
+        } else if (a_cpu) {
+            // in0 is real data (CPU shape); in1 is the shape-meta broadcaster.
+            // Output shape = in0's shape (in1 broadcasts toward it).
+            out_shape = shape_a;
+            total = total_elems(shape_a);
+        } else if (b_cpu) {
+            out_shape = shape_b;
+            total = total_elems(shape_b);
+        } else {
+            // Both inputs are shape_ssbo_-only (no CPU shape). We can't size
+            // dispatch on the CPU. Fall back to the legacy path — but the
+            // placeholder dims_ would corrupt computeBroadcastShape. As a
+            // safety net, use the raw placeholder shapes (product may be wrong,
+            // but this branch is not reached in the current LLM graph).
+            out_shape = computeBroadcastShape(shape_a, shape_b);
+            total = total_elems(out_shape);
+        }
+
+        // Bind the three DATA SSBOs (bindings 0/1/2) in order: out, in0, in1.
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->num_elements() != total) {
+                output->resize(out_shape);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[1], /*is_output=*/false);
+        });
+
+        // Bind the three SHAPE SSBOs (bindings 3/4/5) in order: out, in0, in1.
+        // Use the input's shape_ssbo_ when it has one; otherwise build a tiny
+        // int64 SSBO from its CPU-known getShape(). The output's shape SSBO is
+        // built from the resolved out_shape (CPU-known here).
+        auto out_shape_ssbo = build_shape_ssbo(out_shape);
+        auto in0_shape_ssbo = inputs[0]->has_shape_ssbo()
+                                  ? inputs[0]->get_shape_ssbo()
+                                  : build_shape_ssbo(shape_a);
+        auto in1_shape_ssbo = inputs[1]->has_shape_ssbo()
+                                  ? inputs[1]->get_shape_ssbo()
+                                  : build_shape_ssbo(shape_b);
+        objs_.emplace_back(out_shape_ssbo);
+        objs_.emplace_back(in0_shape_ssbo);
+        objs_.emplace_back(in1_shape_ssbo);
+
+        BinaryElemPC pc{};
+        pc.rank = static_cast<int>(out_shape.size());
+        // Push-constant dims are unused under broadcast==2 (the shader loads
+        // from SSBOs), but fill them best-effort for any diagnostic read.
+        fill_dims(pc.outDims, out_shape);
+        fill_dims_broadcast(pc.in0Dims, shape_a, pc.rank);
+        fill_dims_broadcast(pc.in1Dims, shape_b, pc.rank);
+        pc.activation = activation_;
+        pc.broadcast = 2; // load out/in0/in1 dims from bound shape SSBOs
+        pc.total = total;
+        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+
+        // Tag the output with its producing shape SSBO so downstream
+        // GPU-driven consumers can read the broadcast dims without readback.
+        outputs[0]->set_shape_ssbo(out_shape_ssbo,
+                                   static_cast<int>(out_shape.size()));
     }
 
     int activation_;

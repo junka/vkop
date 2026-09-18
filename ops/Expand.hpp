@@ -266,8 +266,35 @@ class Expand : public Operator {
         // [3,1,1,1] yields output [3,1,64,1]. The host-computed out_shape (from
         // graph shape inference) can be stale/wrong, so recompute it here from
         // the authoritative target buffer + the input shape.
+        //
+        // Auto-learning target-shape cache (mirrors the int64 path above and
+        // ReshapeBuffer's cache): most fp Expand target shapes are round-
+        // invariant across decode (only kv_len-derived ones grow). After two
+        // matching readbacks, STABLE skips copyToCPU (the sync readback) and
+        // reuses the cached target_shape. invalidate_shape_cache() resets to
+        // LEARNING at the prefill→decode boundary. This is the dominant Expand
+        // cost (59 readbacks/round, ~57ms onexec).
         std::vector<int> target_shape;
-        { target_shape = expand::read_target_shape(inputs[1], m_cmdpool_); }
+        bool need_readback = true;
+        if (target_cache_state_ == TargetLearnState::STABLE) {
+            target_shape = cached_target_;
+            need_readback = false;
+        }
+        if (need_readback) {
+            target_shape = expand::read_target_shape(inputs[1], m_cmdpool_);
+            if (target_cache_state_ == TargetLearnState::LEARNING) {
+                learned_target_ = target_shape;
+                target_cache_state_ = TargetLearnState::CONFIRMING;
+            } else if (target_cache_state_ == TargetLearnState::CONFIRMING) {
+                if (target_shape == learned_target_) {
+                    target_cache_state_ = TargetLearnState::STABLE;
+                    cached_target_ = target_shape;
+                } else {
+                    target_cache_state_ = TargetLearnState::DYNAMIC;
+                }
+            }
+            // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+        }
         size_t maxd = std::max(inshape.size(), target_shape.size());
         out_shape.assign(maxd, 1);
         for (size_t i = 0; i < maxd; ++i) {
