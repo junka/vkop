@@ -137,8 +137,9 @@ class FusedElemwise : public BufferFactory {
 
     // Build the program SSBO contents. Layout (mirrors the shader):
     //   [0] nOps  [1] nInputs  [2] nScalars  [3] rank
-    //   [4 .. 4+rank*nInputs) input dims (per input, left-aligned, padded to
-    //   rank; slot 0 = output shape)
+    //   [4 .. 4+rank)            output dims (left-aligned, padded to rank)
+    //   [4+rank .. 4+rank*(1+nInputs))  input dims: input k at offset
+    //                                   (k+1)*rank, ONNX right-aligned
     //   [...] ops: 4 ints/op
     //   [...] scalars (float bits as uint)
     //
@@ -178,7 +179,14 @@ class FusedElemwise : public BufferFactory {
         prog_data_.push_back(nScalars);
         prog_data_.push_back(rank);
 
-        // Slot 0 = output shape (left-aligned, padded to rank with 1).
+        // Dims block layout: [outDims (rank)] [in0Dims (rank)] [in1Dims] ...
+        // The output shape occupies the FIRST `rank` ints (the shader reads
+        // outDims from dimsBase+0), then EACH input's own shape follows at
+        // dimsBase + (k+1)*rank. This is critical for broadcast chains: input
+        // 0 may be a lower-rank / broadcast tensor (e.g. a ReduceMean [1,1,N,1]
+        // feeding a pointwise Mul with a [1,1,N,M] tensor) and MUST NOT be
+        // aliased to the output shape — otherwise broadcast_index reads input
+        // 0 with the output dims and strays out of bounds.
         auto push_left_aligned = [&](const std::vector<int> &s) {
             for (int i = 0; i < rank; ++i) {
                 prog_data_.push_back(
@@ -186,10 +194,10 @@ class FusedElemwise : public BufferFactory {
             }
         };
         push_left_aligned(out_shp);
-        // Slots 1..nInputs-1 = each input's shape, ONNX right-aligned (pad
-        // LEADING with 1 so a lower-rank input broadcasts on its trailing
-        // axes — matches the shader's broadcast_index which treats any
-        // dim==1 as a broadcast axis).
+        // Each input's shape, ONNX right-aligned (pad LEADING with 1 so a
+        // lower-rank input broadcasts on its trailing axes — matches the
+        // shader's broadcast_index which treats any dim==1 as a broadcast
+        // axis).
         for (int k = 0; k < nInputs; ++k) {
             const auto &s = in_shapes[k];
             // Right-align: leading 1s, then the shape in trailing slots.
@@ -199,14 +207,6 @@ class FusedElemwise : public BufferFactory {
             for (int i = 0; i < r; ++i) {
                 padded[rank - r + i] = (s[i] > 0) ? s[i] : 1;
             }
-            // The shader reads input[k]'s dims at dimsBase + k*rank. Slot 0
-            // above is the output; input 0's dims are also written here (the
-            // shader reads outDims from input slot 0, so input 0 must carry
-            // the OUTPUT shape). For k==0 we already pushed out_shp; for a
-            // pointwise chain input 0 == output shape, so this is consistent.
-            // For k>=1 push the (right-aligned) input shape.
-            if (k == 0)
-                continue; // already pushed as out_shp
             for (int i = 0; i < rank; ++i)
                 prog_data_.push_back(padded[i]);
         }

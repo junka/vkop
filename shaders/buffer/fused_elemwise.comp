@@ -21,7 +21,9 @@
 //                 [1]      nInputs
 //                 [2]      nScalars
 //                 [3]      rank            (common rank for nd<->linear)
-//                 [4..4+rank*nInputs)  input dims (left-aligned, per input)
+//                 [4..4+rank)             OUTPUT dims (left-aligned)
+//                 [4+rank..4+rank*(1+nInputs))  input dims: input k at
+//                                          offset (k+1)*rank (right-aligned)
 //                 [...]    op words: 4 ints/op {op, dst, a, b}
 //                 [...]    scalar constants (float-as-uint), 1 int each
 //
@@ -177,12 +179,16 @@ void main() {
     int nScalars = uPC.nScalars;
     int rank     = uProg.data[3];
 
-    // Input dims live at [4 .. 4 + rank*nInputs). Each input's dims occupy
-    // `rank` consecutive ints (left-aligned; the host pads trailing with 1).
+    // Input dims live at [4 .. 4 + rank*(1+nInputs)). Layout:
+    //   slot 0 (offset +0)        = OUTPUT dims (left-aligned)
+    //   slot k+1 (offset +(k+1)*rank) = input k's dims (right-aligned)
+    // Input 0 is NOT aliased to the output — a broadcast chain's input 0 may
+    // be a lower-rank tensor (e.g. ReduceMean [1,1,N,1]) whose own dims differ
+    // from the output shape; reading it as the output dims would stray OOB.
     int dimsBase = 4;
 
-    // Op words start after the input dims.
-    int opsBase = dimsBase + rank * nInputs;
+    // Op words start after the output dims + all input dims.
+    int opsBase = dimsBase + rank * (1 + nInputs);
     // Scalar constants start after the ops (4 ints/op).
     int scalarsBase = opsBase + 4 * nOps;
 
@@ -206,23 +212,20 @@ void main() {
         for (int i = 0; i < 8; ++i) outDims.v[i] = 1;
         // Output dims == input[0] dims when all inputs are same-shape
         // (pointwise). For broadcast inputs, the output shape is the
-        // broadcast-max; the host writes the TRUE output shape as input[0]'s
-        // dims entry, so reading outDims from input[0] is correct when
-        // input[0] is the full-shape tensor. For a scalar-only input[0] the
-        // host still provides the output shape in a dedicated slot — see
-        // host builder (it always places output dims at input slot 0 of the
-        // dims block, and binds the full-shape tensor as input 0 when one
-        // exists). To keep this robust, the host guarantees dims slot 0 =
-        // output shape.
+        // broadcast-max; the host writes the TRUE output shape as the FIRST
+        // `rank` ints of the dims block (slot 0), and each input's OWN shape
+        // at slot (k+1). So outDims is always read from slot 0 — independent
+        // of which input (if any) carries the full output shape.
         for (int i = 0; i < rank && i < 8; ++i) {
-            outDims.v[i] = uProg.data[dimsBase + i]; // input[0]'s dims = out shape
+            outDims.v[i] = uProg.data[dimsBase + i]; // slot 0 = output shape
         }
 
         for (int k = 0; k < nInputs && k < MAX_INPUTS; ++k) {
             IArr8 inDims;
             for (int i = 0; i < 8; ++i) inDims.v[i] = 1;
+            // Input k's dims at slot (k+1): dimsBase + (k+1)*rank.
             for (int i = 0; i < rank && i < 8; ++i) {
-                inDims.v[i] = uProg.data[dimsBase + k * rank + i];
+                inDims.v[i] = uProg.data[dimsBase + (k + 1) * rank + i];
             }
             // Scalar input (rank 0 / 1-elem): always read element 0.
             int inLin;

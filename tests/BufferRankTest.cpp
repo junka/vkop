@@ -1008,4 +1008,66 @@ TEST(BufferRankTest, FusedElemwiseDivScalarProgram) {
     EXPECT_TRUE(brt_fused_divscalar_case<uint16_t>({17}, true));
 }
 
+// Broadcast chain where input 0 is a LOWER-RANK / non-scalar broadcast tensor
+// whose own dims DIFFER from the output dims — the q_norm RMSNorm failure
+// mode. In the real graph, a ReduceMean produces [1,1,N,1] feeding a pointwise
+// Mul with a [1,1,N,M] tensor (output [1,1,N,M]). The old build_program aliased
+// input 0's dims slot to the OUTPUT shape, so broadcast_index read input 0 with
+// the output dims → OOB garbage → fp16 Cast → inf → "!!!!!!" decode output.
+//
+// Reduced to rank 2: A=[M,1] (input 0, broadcasts along axis 1), B=[M,N]
+// (input 1, full shape). Chain Add->Sqrt->Mul: out[i][j] = sqrt(A[i,0]+B[i,j])
+// * A[i,0]. With the fix, each input carries its OWN dims in the program's
+// dims block (input 0 at slot 1, NOT aliased to the output shape at slot 0).
+template <typename T>
+bool brt_fused_addsqrtmul_input0_lowrank_case(int M, int N, bool fp16) {
+    Dev d;
+    // A: [M,1] broadcast leaf (input 0). Bias positive so A+B >= 0 (sqrt).
+    auto torch_a = torch::abs(torch::randn({M, 1}, brt_torch_opt<T>())) + 0.5;
+    auto torch_b = torch::abs(torch::randn({M, N}, brt_torch_opt<T>()));
+    // Reference: A broadcasts [M,1]->[M,N] in A+B and in the final mul.
+    auto torch_out = torch::sqrt(torch_a + torch_b) * torch_a;
+
+    auto in_a = std::make_shared<Tensor<T>>(std::vector<int>{M, 1});
+    auto in_b = std::make_shared<Tensor<T>>(std::vector<int>{M, N});
+    brt_fill(in_a, torch_a);
+    brt_fill(in_b, torch_b);
+    brt_upload(in_a, d);
+    brt_upload(in_b, d);
+
+    // Output is the broadcast-max shape [M,N] (NOT input 0's [M,1]).
+    auto output = brt_make_out<T>(std::vector<int>{M, N}, d);
+    // ops: ADD{1,2,0,1} SQRT{6,3,2,0} MUL{3,0,3,0}
+    std::string ops_str = "[1,2,0,1, 6,3,2,0, 3,0,3,0]";
+    // input_shapes attr (left-aligned per input, padded to rank 2): input0
+    // [M,1], input1 [M,N]. (build_program derives dims from LIVE tensors, so
+    // this attr is a fallback; the live [M,1]/[M,N] shapes are authoritative.)
+    std::string shp = "[" + std::to_string(M) + ",1," + std::to_string(M) +
+                      "," + std::to_string(N) + "]";
+    std::string out_shp = "[" + std::to_string(M) + "," + std::to_string(N) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                      {{"ops", ops_str},
+                       {"input_shapes", shp},
+                       {"out_shape", out_shp},
+                       {"rank", "2"},
+                       {"scalars", "[]"}},
+                      d);
+    if (!op)
+        return false;
+    op->onExecute({in_a, in_b}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+TEST(BufferRankTest, FusedElemwiseBroadcastInput0LowRank) {
+    // input0 [8,1] broadcasts to output [8,8] — input0's own dims (slot 1 in
+    // the dims block) must NOT be aliased to the output shape (slot 0).
+    EXPECT_TRUE(brt_fused_addsqrtmul_input0_lowrank_case<float>(8, 8, false));
+    EXPECT_TRUE(brt_fused_addsqrtmul_input0_lowrank_case<uint16_t>(8, 8, true));
+    // Odd total (8*7=56) to exercise the fp16 tail word.
+    EXPECT_TRUE(brt_fused_addsqrtmul_input0_lowrank_case<float>(8, 7, false));
+    EXPECT_TRUE(brt_fused_addsqrtmul_input0_lowrank_case<uint16_t>(8, 7, true));
+}
+
 } // namespace
