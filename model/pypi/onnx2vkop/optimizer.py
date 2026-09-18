@@ -2691,11 +2691,19 @@ class FusionOptimizer:
     _FUSED_OP_CODES = {
         "Add": 1, "Sub": 2, "Mul": 3, "Div": 4, "Pow": 5,
         "Sqrt": 6, "Sigmoid": 7, "Neg": 8, "Exp": 9, "Tanh": 10,
+        # Cast (OP_CAST=11) is now chainable: fusion across a dtype-crossing
+        # Cast. The shader computes in fp32 registers and loads each leaf input
+        # at its native dtype (per-input dtype flag in the program SSBO), so a
+        # Cast inside the chain is a register no-op — the conversion happens at
+        # the load/store boundary. A Cast is only folded when its output has a
+        # single consumer (the next chain op), which the chain-growth invariant
+        # already enforces. This collapses e.g. Cast(fp32->fp16)+Mul(weight)
+        # pairs that previously broke chains, cutting dispatch count.
+        "Cast": 11,
     }
-    # Cast is deliberately excluded: a Cast inside a chain may be dtype-crossing
-    # (fp32<->fp16), and the fused runtime op requires all inputs to share the
-    # terminal dtype. The shader defines OP_CAST=11 for future same-dtype use,
-    # but the converter never emits it yet. A chain simply terminates at a Cast.
+    # A Cast folded into a chain is a no-op at the register level (the dtype
+    # conversion is realized by the per-input load stride + the output store
+    # stride). The shader defines OP_CAST=11 as `r = av`.
     _FUSED_MAX_INPUTS = 8
     _FUSED_MAX_REGS = 16
     _FUSED_MAX_OPS = 32

@@ -210,6 +210,16 @@ class FusedElemwise : public BufferFactory {
             for (int i = 0; i < rank; ++i)
                 prog_data_.push_back(padded[i]);
         }
+        // Input dtypes block: nInputs ints, 1 = fp16 (uint16_t packed), 0 =
+        // fp32. Enables fusion across a dtype-crossing Cast — the shader reads
+        // each input at its native stride (unpackHalf2x16 vs uintBitsToFloat)
+        // and computes in fp32 registers, so a Cast inside the chain is a
+        // register no-op. The build dtype (fp16/fp32 spv) follows the OUTPUT
+        // dtype; inputs may differ.
+        for (int k = 0; k < nInputs; ++k) {
+            prog_data_.push_back(inputs[k]->dtype() == typeid(uint16_t) ? 1
+                                                                        : 0);
+        }
         // Ops.
         for (int v : ops_)
             prog_data_.push_back(v);
@@ -220,7 +230,6 @@ class FusedElemwise : public BufferFactory {
             prog_data_.push_back(static_cast<int32_t>(bits));
         }
     }
-
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -264,8 +273,15 @@ class FusedElemwise : public BufferFactory {
             }
 
             auto out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            // Bind each input at its OWN dtype (fusion across Cast means inputs
+            // may be fp16 while the output is fp32, or vice versa). The
+            // shader's per-input dtype flag (build_program) selects the load
+            // stride.
             for (int k = 0; k < nInputs; ++k) {
-                bind_ssbo<T>(inputs[k], /*is_output=*/false);
+                dispatch_by_dtype(inputs[k]->dtype(), [&](auto dummy) {
+                    using U = decltype(dummy);
+                    bind_ssbo<U>(inputs[k], /*is_output=*/false);
+                });
             }
             // The program SSBO lives at binding MAX_INPUTS+1 (=9). Descriptor
             // binding is positional (objs_[i] -> binding i), so the unused

@@ -427,6 +427,28 @@ void Runtime::LoadModel() {
                         } else {
                             dtype_marker = "_f32_";
                         }
+                    } else if (type == vkop::ops::OpType::FUSED_ELEMWISE) {
+                        // Fusion across Cast: the chain's terminal op may be a
+                        // dtype-crossing Cast, so the output dtype is NOT
+                        // necessarily node_inputs[0]'s dtype. The converter
+                        // reuses the terminal's output tensor dict, whose
+                        // recorded dtype (ShapeRef.dtype, e.g. "float16") is
+                        // authoritative. Honor it so the output tensor and the
+                        // fp16/fp32 shader build (selected below from
+                        // node_outputs[0]->dtype()) both match the terminal.
+                        const auto &odt = out_shape.dtype;
+                        if (odt == "float16") {
+                            dtype_marker = "_f16_";
+                        } else if (odt == "float32") {
+                            dtype_marker = "_f32_";
+                        } else if (!node_inputs.empty() &&
+                                   node_inputs[0] != nullptr &&
+                                   node_inputs[0]->dtype() ==
+                                       typeid(uint16_t)) {
+                            dtype_marker = "_f16_";
+                        } else {
+                            dtype_marker = "_f32_";
+                        }
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int64_t)) {
@@ -577,9 +599,19 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::RESHAPE:
                 case vkop::ops::OpType::SLICE:
                 case vkop::ops::OpType::SPLIT:
-                case vkop::ops::OpType::FUSED_ELEMWISE:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+                    break;
+                case vkop::ops::OpType::FUSED_ELEMWISE:
+                    // Fusion across Cast: the chain's leaf inputs may be mixed
+                    // fp16/fp32 (a Cast crosses dtype inside the chain). The
+                    // build dtype follows the OUTPUT (terminal) dtype, not
+                    // input[0], so the output packing matches the terminal.
+                    op_fp16 =
+                        (!node_outputs.empty() && node_outputs[0] != nullptr &&
+                         node_outputs[0]->dtype() == typeid(uint16_t))
+                            ? 1
+                            : 0;
                     break;
                 default:
                     break;

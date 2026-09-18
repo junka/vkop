@@ -24,6 +24,9 @@
 //                 [4..4+rank)             OUTPUT dims (left-aligned)
 //                 [4+rank..4+rank*(1+nInputs))  input dims: input k at
 //                                          offset (k+1)*rank (right-aligned)
+//                 [...]    input dtypes: nInputs ints, 0=fp32, 1=fp16
+//                                          (per-input load stride; enables
+//                                          fusion across dtype-crossing Cast)
 //                 [...]    op words: 4 ints/op {op, dst, a, b}
 //                 [...]    scalar constants (float-as-uint), 1 int each
 //
@@ -40,6 +43,13 @@
 // fp16: like the other elemwise shaders, one thread per uint WORD (two packed
 // half elements), read-modify-write the half2 — safe because each output word
 // is owned by exactly one thread (contiguous index range).
+//
+// Mixed-dtype inputs (fusion across Cast): each input SSBO has its own dtype
+// flag in the program. The fp16 BUILD still packs the OUTPUT two-per-word, but
+// a fp32 input is read at element stride (uintBitsToFloat) while a fp16 input
+// is read at word stride (unpackHalf2x16). All math is fp32 in registers, so a
+// Cast op inside the chain is a register no-op — the dtype conversion happens
+// at the load/store boundary based on the per-input/output dtype.
 
 #include "../common/buffer_common.comp"
 
@@ -94,58 +104,38 @@ layout(push_constant) uniform PC_uPC {
     int _pad3;
 } uPC;
 
-// Read a uint word from input `k` at linear element index `lin` (already
-// broadcast-mapped by the caller). The if-ladder is necessary because GLSL
-// buffer blocks can't be indexed by a dynamic variable.
-float load_input_raw(int k, int lin) {
+// Read input `k` at linear element index `lin` (already broadcast-mapped by
+// the caller). `isFp16` selects the load stride: fp16 inputs are packed
+// two-per-uint-word (read by unpackHalf2x16), fp32 inputs are one-per-uint
+// (uintBitsToFloat). The if-ladder is necessary because GLSL buffer blocks
+// can't be indexed by a dynamic variable. Mixed-dtype inputs let a chain
+// fuse across a dtype-crossing Cast (the Cast is a register no-op; the
+// conversion happens here at the load boundary).
+float load_input_raw(int k, int lin, bool isFp16) {
     if (k == 0) {
-#ifdef FP16
-        return unpackHalf2x16(uIn0.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn0.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn0.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn0.data[lin]);
     } else if (k == 1) {
-#ifdef FP16
-        return unpackHalf2x16(uIn1.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn1.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn1.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn1.data[lin]);
     } else if (k == 2) {
-#ifdef FP16
-        return unpackHalf2x16(uIn2.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn2.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn2.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn2.data[lin]);
     } else if (k == 3) {
-#ifdef FP16
-        return unpackHalf2x16(uIn3.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn3.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn3.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn3.data[lin]);
     } else if (k == 4) {
-#ifdef FP16
-        return unpackHalf2x16(uIn4.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn4.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn4.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn4.data[lin]);
     } else if (k == 5) {
-#ifdef FP16
-        return unpackHalf2x16(uIn5.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn5.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn5.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn5.data[lin]);
     } else if (k == 6) {
-#ifdef FP16
-        return unpackHalf2x16(uIn6.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn6.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn6.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn6.data[lin]);
     } else {
-#ifdef FP16
-        return unpackHalf2x16(uIn7.data[lin >> 1])[lin & 1];
-#else
-        return uintBitsToFloat(uIn7.data[lin]);
-#endif
+        return isFp16 ? unpackHalf2x16(uIn7.data[lin >> 1])[lin & 1]
+                      : uintBitsToFloat(uIn7.data[lin]);
     }
 }
 
@@ -187,8 +177,10 @@ void main() {
     // from the output shape; reading it as the output dims would stray OOB.
     int dimsBase = 4;
 
-    // Op words start after the output dims + all input dims.
-    int opsBase = dimsBase + rank * (1 + nInputs);
+    // Input dtypes block (nInputs ints, 0=fp32, 1=fp16) follows the dims block;
+    // then ops, then scalars.
+    int dtypesBase = dimsBase + rank * (1 + nInputs);
+    int opsBase = dtypesBase + nInputs;
     // Scalar constants start after the ops (4 ints/op).
     int scalarsBase = opsBase + 4 * nOps;
 
@@ -238,7 +230,9 @@ void main() {
             } else {
                 inLin = broadcast_index(lin, outDims, inDims, rank);
             }
-            reg[k] = load_input_raw(k, inLin);
+            // Per-input dtype flag (0=fp32, 1=fp16) selects the load stride.
+            bool inFp16 = uProg.data[dtypesBase + k] != 0;
+            reg[k] = load_input_raw(k, inLin, inFp16);
         }
 
         // Execute the op program.
