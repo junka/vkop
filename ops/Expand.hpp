@@ -161,33 +161,14 @@ class Expand : public Operator {
         // (dynamic ones). Either way the CPU knows outDims at dispatch time, so
         // dispatch is exact (UP_DIV(total,256), no over-dispatch).
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            // Resolve the target shape from inputs[1] with an auto-learning
-            // cache: across decode rounds, most Expand target shapes are
-            // round-invariant (only the kv_len-derived ones grow). After two
-            // matching readbacks, STABLE skips the readback and reuses the
-            // cached target_shape. invalidate_shape_cache() (phase boundary)
-            // resets to LEARNING.
-            std::vector<int> target_shape;
-            bool need_readback = true;
-            if (target_cache_state_ == TargetLearnState::STABLE) {
-                target_shape = cached_target_;
-                need_readback = false;
-            }
-            if (need_readback) {
-                target_shape = expand::read_target_shape(inputs[1], m_cmdpool_);
-                if (target_cache_state_ == TargetLearnState::LEARNING) {
-                    learned_target_ = target_shape;
-                    target_cache_state_ = TargetLearnState::CONFIRMING;
-                } else if (target_cache_state_ ==
-                           TargetLearnState::CONFIRMING) {
-                    if (target_shape == learned_target_) {
-                        target_cache_state_ = TargetLearnState::STABLE;
-                        cached_target_ = target_shape;
-                    } else {
-                        target_cache_state_ = TargetLearnState::DYNAMIC;
-                    }
-                }
-            }
+            // Resolve the target shape from inputs[1] with the auto-learning +
+            // linear-growth cache (see resolve_target_shape). STABLE skips the
+            // readback; LINEAR_GROW predicts kv_len+1 growth and verifies
+            // periodically. invalidate_shape_cache() (phase boundary) resets.
+            bool did_readback = false;
+            std::vector<int> target_shape =
+                resolve_target_shape(inputs[1], did_readback);
+            (void)did_readback;
             // ONNX Expand output shape = right-aligned broadcast of input vs
             // target: dim is the input dim when it is neither 1 nor -1 (a
             // concrete value, including 0=empty), else the target dim. This
@@ -267,34 +248,15 @@ class Expand : public Operator {
         // graph shape inference) can be stale/wrong, so recompute it here from
         // the authoritative target buffer + the input shape.
         //
-        // Auto-learning target-shape cache (mirrors the int64 path above and
-        // ReshapeBuffer's cache): most fp Expand target shapes are round-
-        // invariant across decode (only kv_len-derived ones grow). After two
-        // matching readbacks, STABLE skips copyToCPU (the sync readback) and
-        // reuses the cached target_shape. invalidate_shape_cache() resets to
-        // LEARNING at the prefill→decode boundary. This is the dominant Expand
-        // cost (59 readbacks/round, ~57ms onexec).
-        std::vector<int> target_shape;
-        bool need_readback = true;
-        if (target_cache_state_ == TargetLearnState::STABLE) {
-            target_shape = cached_target_;
-            need_readback = false;
-        }
-        if (need_readback) {
-            target_shape = expand::read_target_shape(inputs[1], m_cmdpool_);
-            if (target_cache_state_ == TargetLearnState::LEARNING) {
-                learned_target_ = target_shape;
-                target_cache_state_ = TargetLearnState::CONFIRMING;
-            } else if (target_cache_state_ == TargetLearnState::CONFIRMING) {
-                if (target_shape == learned_target_) {
-                    target_cache_state_ = TargetLearnState::STABLE;
-                    cached_target_ = target_shape;
-                } else {
-                    target_cache_state_ = TargetLearnState::DYNAMIC;
-                }
-            }
-            // DYNAMIC: stay DYNAMIC (readback every round, no caching).
-        }
+        // Target-shape cache (resolve_target_shape): STABLE skips the readback;
+        // LINEAR_GROW predicts the kv_len+1 growth pattern ([1,8,2,seq,128]
+        // where only seq increments) and verifies every 8 rounds. The 56
+        // kv_len-derived fp Expands were the dominant Expand cost (~57ms/round,
+        // 56 readbacks); LINEAR_GROW cuts them to ~7 readbacks/round.
+        bool did_readback = false;
+        std::vector<int> target_shape =
+            resolve_target_shape(inputs[1], did_readback);
+        (void)did_readback;
         size_t maxd = std::max(inshape.size(), target_shape.size());
         out_shape.assign(maxd, 1);
         for (size_t i = 0; i < maxd; ++i) {
@@ -367,6 +329,8 @@ class Expand : public Operator {
     // may differ in decode (seq collapses), so STABLE can't carry across.
     void invalidate_shape_cache() override {
         target_cache_state_ = TargetLearnState::LEARNING;
+        grow_dim_ = -1;
+        linear_rounds_ = 0;
     }
 
   private:
@@ -375,10 +339,118 @@ class Expand : public Operator {
     // (only the kv_len-derived ones grow). Learn stability by comparing two
     // consecutive readbacks, then STABLE skips copyToCPU. See execute() for
     // the state machine.
-    enum class TargetLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    //
+    // LINEAR_GROW: the 56 kv_len-derived Expands have a target like
+    // [1,8,2,seq,128] where only the seq dim grows by exactly +1 each round.
+    // After DYNAMIC is detected, the next readback checks for a single-dim
+    // +1 growth; if found, transition to LINEAR_GROW and predict the target
+    // (skip readback), verifying every LINEAR_VERIFY_INTERVAL rounds to catch
+    // drift (e.g. a non-unit growth or a phase boundary the invalidation
+    // missed). Cuts 56 readbacks/round → ~7/round.
+    enum class TargetLearnState {
+        LEARNING,
+        CONFIRMING,
+        STABLE,
+        DYNAMIC,
+        LINEAR_GROW
+    };
     TargetLearnState target_cache_state_ = TargetLearnState::LEARNING;
     std::vector<int> learned_target_; // round-0 target (compared vs round-1)
     std::vector<int> cached_target_;  // STABLE target reused on round 2+
+    // LINEAR_GROW prediction state.
+    std::vector<int> grow_target_; // last verified/predicted target
+    int grow_dim_ = -1;            // which dim grows by +1 each round
+    int linear_rounds_ = 0;        // consecutive rounds since last verify
+    static constexpr int LINEAR_VERIFY_INTERVAL = 8;
+
+    // Resolve the target shape with the auto-learning + linear-growth cache.
+    // Returns the target shape and whether a readback was performed (for
+    // rbprof attribution). inputs[1] is the target-shape tensor.
+    std::vector<int>
+    resolve_target_shape(const std::shared_ptr<core::ITensor> &target_tensor,
+                         bool &did_readback) {
+        did_readback = false;
+        // STABLE: reuse cached, no readback.
+        if (target_cache_state_ == TargetLearnState::STABLE) {
+            return cached_target_;
+        }
+        // LINEAR_GROW: predict by incrementing the grow dim. Verify
+        // periodically to catch drift.
+        if (target_cache_state_ == TargetLearnState::LINEAR_GROW) {
+            if (linear_rounds_ < LINEAR_VERIFY_INTERVAL) {
+                // Trust the prediction: increment the grow dim.
+                std::vector<int> predicted = grow_target_;
+                if (grow_dim_ >= 0 &&
+                    grow_dim_ < static_cast<int>(predicted.size())) {
+                    predicted[grow_dim_] += 1;
+                }
+                grow_target_ = predicted;
+                linear_rounds_++;
+                return predicted;
+            }
+            // Verification round: readback and check.
+            std::vector<int> actual =
+                expand::read_target_shape(target_tensor, m_cmdpool_);
+            std::vector<int> expected = grow_target_;
+            if (grow_dim_ >= 0 &&
+                grow_dim_ < static_cast<int>(expected.size())) {
+                expected[grow_dim_] += 1;
+            }
+            if (actual == expected) {
+                grow_target_ = actual;
+                linear_rounds_ = 0;
+                did_readback = true;
+                return actual;
+            }
+            // Drift: fall back to DYNAMIC (readback every round).
+            target_cache_state_ = TargetLearnState::DYNAMIC;
+            learned_target_ = actual;
+            did_readback = true;
+            return actual;
+        }
+        // LEARNING / CONFIRMING / DYNAMIC: readback + advance state machine.
+        did_readback = true;
+        std::vector<int> target =
+            expand::read_target_shape(target_tensor, m_cmdpool_);
+        if (target_cache_state_ == TargetLearnState::LEARNING) {
+            learned_target_ = target;
+            target_cache_state_ = TargetLearnState::CONFIRMING;
+        } else if (target_cache_state_ == TargetLearnState::CONFIRMING) {
+            if (target == learned_target_) {
+                target_cache_state_ = TargetLearnState::STABLE;
+                cached_target_ = target;
+            } else {
+                // Check for single-dim +1 linear growth (kv_len pattern).
+                int grow_dim = -1;
+                bool linear = (target.size() == learned_target_.size());
+                if (linear) {
+                    for (size_t i = 0; i < target.size(); ++i) {
+                        int delta = target[i] - learned_target_[i];
+                        if (delta == 0) {
+                            continue;
+                        } else if (delta == 1 && grow_dim < 0) {
+                            grow_dim = static_cast<int>(i);
+                        } else {
+                            linear = false;
+                            break;
+                        }
+                    }
+                    // require exactly one growing dim (grow_dim >= 0)
+                    linear = linear && grow_dim >= 0;
+                }
+                if (linear) {
+                    target_cache_state_ = TargetLearnState::LINEAR_GROW;
+                    grow_dim_ = grow_dim;
+                    grow_target_ = target;
+                    linear_rounds_ = 0;
+                } else {
+                    target_cache_state_ = TargetLearnState::DYNAMIC;
+                }
+            }
+        }
+        // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+        return target;
+    }
 
     expand::GpuExpandParam param_{};
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
