@@ -233,9 +233,10 @@ class FusedElemwise : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Resolve dtype from the output (the chain's terminal dtype). All
-        // fused inputs share the output dtype (dtype-crossing casts are NOT
-        // fused — the converter skips chains containing them).
+        // Build dtype follows the chain's TERMINAL (output) dtype. Leaf inputs
+        // may be mixed fp16/fp32 (fusion across a dtype-crossing Cast); each is
+        // bound at its own dtype and the shader's per-input dtype flag selects
+        // the load stride. The terminal/output dtype decides the store packing.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -317,8 +318,13 @@ class FusedElemwise : public BufferFactory {
             pc.nInputs = nInputs;
             pc.nOps = static_cast<int>(ops_.size()) / 4;
             pc.nScalars = static_cast<int>(scalar_floats_.size());
-            // fp16: one thread per uint word (two packed half elements).
-            int nthreads = total;
+            // fp16: one thread per uint word (two packed half elements). The
+            // shader guards `if (gid >= (total+1)/2) return;`, so dispatching
+            // `total` threads is a 2× overdispatch — correct but wasteful on
+            // large fp16 chains. Dispatch ceil(total/2) threads instead.
+            // fp32: one thread per element.
+            constexpr bool is_fp16 = std::is_same<T, uint16_t>::value;
+            int nthreads = is_fp16 ? (total + 1) / 2 : total;
             submit(&pc, UP_DIV(nthreads, 256), 1, 1);
         });
     }
