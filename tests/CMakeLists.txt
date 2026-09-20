@@ -254,10 +254,18 @@ else()
         -Wno-dangling-reference
     )
 endif()
-target_link_libraries(all_tests PRIVATE vkop vload -Wl,-force_load ${TORCH_LIBRARY}
+target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
+# Force-load the whole vkop static archive so the OperatorFactory's static
+# self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
+if(APPLE)
+    target_link_options(all_tests PRIVATE -Wl,-force_load,$<TARGET_FILE:vkop>)
+else()
+    target_link_options(all_tests PRIVATE
+        -Wl,--whole-archive $<TARGET_FILE:vkop> -Wl,--no-whole-archive)
+endif()
 if(NOT GTest_FOUND)
     target_include_directories(all_tests PRIVATE
         ${googletest_SOURCE_DIR}/googletest/include)

@@ -162,7 +162,7 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
     case OpType::NONZERO:
         return std::make_unique<NonZero>();
     case OpType::SCATTER_ELEMENTS:
-        return std::make_unique<ScatterElements>();
+        return std::make_unique<ScatterElements>(fp16);
     case OpType::SHAPE:
         return std::make_unique<Shape>();
     case OpType::CAST:

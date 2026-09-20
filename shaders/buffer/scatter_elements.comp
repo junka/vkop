@@ -1,13 +1,21 @@
 #version 450 core
 
-// ScatterElements SSBO op (fp32). Scatters updates into data along axis=0.
-// Supports 'none' (overwrite) and 'add' (atomic CAS float add) reduction.
+// ScatterElements SSBO op. Scatters updates into data along axis=0.
+// Supports 'none' (overwrite) and 'add' (atomic CAS add) reduction.
 //
 // For axis=0: data is [rows, cols], indices is [n_idx], updates is [n_idx, cols].
 // Each thread handles one (idx_slot, col) pair:
 //   data[indices[idx_slot] * cols + col] <op>= updates[idx_slot * cols + col]
 //
-// Dispatch: n_idx * cols threads.
+// Dispatch: n_idx * cols threads (fp32), or n_idx * cols threads (fp16 — one
+// per element; each updates one half of a packed uint word via word-level CAS).
+//
+// FP16 packing: data/updates are packed two fp16 per uint word. Two adjacent
+// elements (col, col+1) share a word, so a thread updating one half MUST use a
+// CAS on the whole word to avoid clobbering the other half (which a sibling
+// thread may be updating concurrently). This is the fp16 word-CAS variant —
+// it replaces the hostScatter CPU fallback (3x copyToCPU + host loop + reupload)
+// that cost ~16ms/call (48ms/round, the single biggest per-op readback cost).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -39,6 +47,31 @@ void main() {
     int row = uIndices.data[idx_slot].x;
     int target = row * uPC.cols + col;
 
+#ifdef FP16
+    // fp16: packed two-per-uint-word. target element index -> word + slot.
+    // updates[gid] is also packed; read the correct half from its word.
+    uint target_word = uint(target) >> 1;
+    int target_slot = target & 1;
+    uint upd_word = uUpdates.data[uint(gid) >> 1];
+    float update = unpackHalf2x16(upd_word)[gid & 1];
+
+    // Word-level CAS: read the whole word, modify only our half, CAS.
+    // Both 'add' and 'none' use CAS because a sibling thread may own the
+    // other half of the same word (adjacent columns share a word).
+    uint old_w = uData.data[target_word];
+    for (;;) {
+        vec2 p = unpackHalf2x16(old_w);
+        if (uPC.reduction == 1) {
+            p[target_slot] += update;
+        } else {
+            p[target_slot] = update;
+        }
+        uint new_w = packHalf2x16(p);
+        uint result = atomicCompSwap(uData.data[target_word], old_w, new_w);
+        if (result == old_w) break;
+        old_w = result;
+    }
+#else
     float update = uintBitsToFloat(uUpdates.data[gid]);
 
     if (uPC.reduction == 1) {
@@ -56,4 +89,5 @@ void main() {
     } else {
         uData.data[target] = floatBitsToUint(update);
     }
+#endif
 }

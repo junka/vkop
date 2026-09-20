@@ -8,6 +8,8 @@
 extern "C" {
 extern unsigned char buffer_scatter_elements_spv[];
 extern unsigned int buffer_scatter_elements_spv_len;
+extern unsigned char buffer_scatter_elements_fp16_spv[];
+extern unsigned int buffer_scatter_elements_fp16_spv_len;
 }
 
 namespace vkop {
@@ -36,12 +38,15 @@ struct alignas(16) ScatterPC {
 // one thread per (index, col) pair where col ranges over the row width.
 class ScatterElements : public BufferFactory {
   public:
-    explicit ScatterElements()
-        : BufferFactory(OpType::SCATTER_ELEMENTS, buffer_scatter_elements_spv,
-                        buffer_scatter_elements_spv_len,
+    explicit ScatterElements(int fp16 = 0)
+        : BufferFactory(OpType::SCATTER_ELEMENTS,
+                        fp16 ? buffer_scatter_elements_fp16_spv
+                             : buffer_scatter_elements_spv,
+                        fp16 ? buffer_scatter_elements_fp16_spv_len
+                             : buffer_scatter_elements_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(scatter::ScatterPC)) {
+                        sizeof(scatter::ScatterPC), fp16) {
         update_after_bind_ = true;
     }
 
@@ -83,17 +88,13 @@ class ScatterElements : public BufferFactory {
         });
         int n_threads = n_idx * cols;
 
-        // Host-compute path for fp16 data/updates. The fp32 GPU shader can't
-        // be trivially reused for fp16 (the float atomic-add CAS loop and the
-        // uintBitsToFloat reads would corrupt fp16 bits), and a packed fp16
-        // shader would need a word-level CAS to avoid RMW races between
-        // adjacent columns. ScatterElements in the LLM is tiny (1x2048 per
-        // layer, 28 layers) so a host scatter + re-upload is correct and cheap.
-        if (outputs[0]->dtype() == typeid(uint16_t)) {
-            hostScatter<uint16_t>(inputs, outputs, data_shape, cols, n_idx);
-            return;
-        }
-
+        // GPU dispatch path for BOTH fp32 and fp16. The fp16 shader variant
+        // (buffer_scatter_elements_fp16_spv, built with -DFP16) uses a
+        // word-level CAS: two adjacent fp16 elements share a uint word, so a
+        // thread updating one half CAS-swaps the whole word to avoid racing a
+        // sibling thread owning the other half. This replaces the fp16
+        // hostScatter fallback (3× copyToCPU + host loop + reupload) that cost
+        // ~16ms/call — the single biggest per-op readback cost in decode.
         // Bind: [0]=data/output (read-write), [1]=indices, [2]=updates
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
@@ -101,7 +102,42 @@ class ScatterElements : public BufferFactory {
             if (output->num_elements() != total_elems(data_shape)) {
                 output->resize(data_shape);
             }
-            bind_ssbo<T>(outputs[0], true);
+            // ScatterElements is read-modify-write: the shader reads the
+            // CURRENT data value at each target, then adds/overwrites. When
+            // output is a distinct tensor from data (the runtime's usual case —
+            // it allocates a fresh output per node), the output buffer starts
+            // empty, so the shader would read zeros and lose the original data
+            // at non-scattered positions. Seed the output with a device→device
+            // copy of the data buffer first. (hostScatter did the equivalent on
+            // the CPU; the GPU path must do it on the GPU to avoid readback.)
+            auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(
+                output->as_storage_buffer(m_dev_, m_cmd_));
+            if (outputs[0].get() != inputs[0].get()) {
+                auto data = core::as_tensor<T>(inputs[0]);
+                auto src_buf = std::dynamic_pointer_cast<VulkanBuffer>(
+                    data->as_storage_buffer(m_dev_, m_cmd_));
+                VkBufferCopy region{};
+                region.size =
+                    static_cast<VkDeviceSize>(std::min(output->num_elements(),
+                                                       data->num_elements())) *
+                    sizeof(T);
+                if (region.size > 0 && src_buf && out_buf) {
+                    // src is in SHADER_READ/WRITE from a prior op; transition
+                    // to TRANSFER_READ for the copy. out_buf was just created
+                    // and readBarrier'd by as_storage_buffer; transition it to
+                    // TRANSFER_WRITE as the copy destination.
+                    src_buf->transferReadBarrier(m_cmd_->get(), region.size);
+                    out_buf->transferWriteBarrier(m_cmd_->get(), region.size);
+                    vkCmdCopyBuffer(m_cmd_->get(), src_buf->getBuffer(),
+                                    out_buf->getBuffer(), 1, &region);
+                    // Leave out_buf in SHADER_READ for the scatter dispatch
+                    // (read-modify-write: the shader reads then CAS-writes).
+                    // Restore src to SHADER_READ for any downstream consumer.
+                    out_buf->readBarrier(m_cmd_->get(), region.size);
+                    src_buf->readBarrier(m_cmd_->get(), region.size);
+                }
+            }
+            objs_.emplace_back(out_buf);
         });
         // indices (binding 1): int64 data is byte-packed; bind as int64_t so
         // the ivec2[] shader view reads the true stride.
