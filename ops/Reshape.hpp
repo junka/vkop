@@ -376,30 +376,41 @@ class ReshapeBuffer : public BufferFactory {
             return;
         }
 
+        // fp16/fp32 data path. ONNX Reshape ALWAYS preserves element count
+        // (it's the spec invariant), so the data bytes are identical to the
+        // input's — only the logical shape differs. The reshape.comp shader
+        // does a flat 1:1 copy (`out[gid]=in[gid]`), which is byte-identical
+        // to aliasing the input's VkBuffer. Aliasing (like the int64/int8
+        // paths above) eliminates a redundant dispatch per Reshape — 181
+        // dispatches/decode round on the LLM. vkop ops use separate output
+        // buffers (no in-place writes), so sharing the input buffer is safe.
+        // The `dim` is already resolved above (auto-learning cache) for
+        // downstream getShape(); only the DATA copy is skipped.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(dim)) {
                 output->resize(dim);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            auto src = core::as_tensor<T>(inputs[0]);
+            if (src->has_gpu_buffer()) {
+                // Alias the input's GPU buffer: no data copy, no dispatch.
+                auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                    src->as_storage_buffer(m_dev_, m_cmd_));
+                objs_.emplace_back(
+                    output->alias_storage_buffer(src_buff, m_cmd_));
+                return;
+            }
+            // CPU fallback: host-only input (tests / rare non-GPU path).
+            std::vector<T> out(static_cast<size_t>(total));
+            src->copyToCPU(m_cmdpool_);
+            for (int i = 0; i < total; ++i) {
+                out[static_cast<size_t>(i)] = (*src)[i];
+            }
+            output->fillToCPU(out);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPUDeferred(m_cmd_);
         });
-        // The shape input (inputs[1]) is int64_t and lives on the CPU; the
-        // buffer shader only reads from inputs[0], so the shape tensor does
-        // not need an SSBO binding (the host already consumed it above).
-        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
-            using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
-        });
-
-        ReshapePC pc{};
-        pc.rank_in = static_cast<int>(in_shape.size());
-        fill_dims(pc.inDims, in_shape);
-        pc.rank_out = static_cast<int>(dim.size());
-        fill_dims(pc.outDims, dim);
-        pc.total = total;
-        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
     }
 
     // --- shape-input value cache (runtime auto-learning) ---
