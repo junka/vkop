@@ -1,0 +1,113 @@
+#version 450 core
+
+// RMSNorm SSBO op. Normalizes over the last `inner_size` elements (the
+// trailing dims, e.g. head_dim). One workgroup per outer slice. Two-pass
+// shared-memory tree reduce of sum(x^2) (no mean subtraction — that's the
+// difference from LayerNorm). Weight is 1-D over inner_size.
+//
+//   rms = mean(x^2);  inv_rms = rsqrt(rms + eps);  out = x * inv_rms * weight
+//
+// fp32 build: data words are float bits in uint slots. fp16 build (-DFP16):
+// data words are packed half2 (two fp16 per uint); each thread unpacks to
+// fp32 for the reduce and the normalize pass, repacking on store. One writer
+// per output element (no read-modify-write race) regardless of dtype.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Weight {
+    uint data[];
+} uWeight;
+
+layout(push_constant) uniform PC_RMSN {
+    float eps;
+    int inner_size;   // elements normalized together (head_dim)
+    int outer_size;   // independent normalization slices
+    int _pad;
+} uRMSN;
+
+shared float s_sumsq[256];
+
+#ifdef FP16
+// half2 load/store helpers (packed in uint words).
+float unpack_lo(uint w) { return unpackHalf2x16(w).x; }
+float unpack_hi(uint w) { return unpackHalf2x16(w).y; }
+uint pack2(float lo, float hi) { return packHalf2x16(vec2(lo, hi)); }
+#endif
+
+void main() {
+    uint wg = gl_WorkGroupID.x;          // slice index
+    uint lid = gl_LocalInvocationID.x;
+    if (wg >= uint(uRMSN.outer_size)) return;
+
+    int base = int(wg) * uRMSN.inner_size;
+
+    // ---- pass 1: sum(x^2) over the slice ----
+    float lsq = 0.0f;
+#ifdef FP16
+    // Packed half2: inner_size elements = ceil(inner_size/2) words. inner_size
+    // is head_dim (always even for these models), so each slice starts on a
+    // word boundary at base/2 and there's no padding tail to worry about; the
+    // odd-inner_size masking below is a defensive no-op for even sizes.
+    int nwords = (uRMSN.inner_size + 1) / 2;
+    int slice_end = int(wg) * uRMSN.inner_size + uRMSN.inner_size;
+    for (int w = int(lid); w < nwords; w += int(gl_WorkGroupSize.x)) {
+        uint word = uInput.data[base/2 + w];
+        float a = unpack_lo(word);
+        float b = unpack_hi(word);
+        lsq += a * a;
+        // Mask the padding half when inner_size is odd (last word's high half
+        // is past the slice). No-op for even inner_size.
+        if (base + w*2 + 1 < slice_end) {
+            lsq += b * b;
+        }
+    }
+#else
+    for (int i = int(lid); i < uRMSN.inner_size; i += int(gl_WorkGroupSize.x)) {
+        float x = uintBitsToFloat(uInput.data[base + i]);
+        lsq += x * x;
+    }
+#endif
+    s_sumsq[lid] = lsq;
+    memoryBarrierShared(); barrier();
+
+    for (uint s = 128; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_sumsq[lid] += s_sumsq[lid + s];
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float rms = s_sumsq[0] / float(uRMSN.inner_size);
+    float inv_rms = inversesqrt(rms + uRMSN.eps);
+
+    // ---- pass 2: out = x * inv_rms * weight ----
+#ifdef FP16
+    for (int w = int(lid); w < nwords; w += int(gl_WorkGroupSize.x)) {
+        uint xword = uInput.data[base/2 + w];
+        float xa = unpack_lo(xword);
+        float xb = unpack_hi(xword);
+        // Weight is also packed half2 (1-D over inner_size, word-indexed).
+        uint wword = uWeight.data[w];
+        float wa = unpack_lo(wword);
+        float wb = unpack_hi(wword);
+        float oa = xa * inv_rms * wa;
+        float ob = xb * inv_rms * wb;
+        // Mask the padding half of the last word when inner_size is odd.
+        if (base + w*2 + 1 >= slice_end) {
+            ob = 0.0f;
+        }
+        uOutput.data[base/2 + w] = pack2(oa, ob);
+    }
+#else
+    for (int i = int(lid); i < uRMSN.inner_size; i += int(gl_WorkGroupSize.x)) {
+        float x = uintBitsToFloat(uInput.data[base + i]);
+        float wt = uintBitsToFloat(uWeight.data[i]);
+        uOutput.data[base + i] = floatBitsToUint(x * inv_rms * wt);
+    }
+#endif
+}

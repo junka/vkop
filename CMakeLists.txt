@@ -305,6 +305,7 @@ set(DUAL_FP16_SHADERS
     buffer/conv2d
     buffer/rotary
     buffer/fused_elemwise
+    buffer/rmsnorm
     buffer/scatter_elements
 )
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})

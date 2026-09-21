@@ -755,6 +755,20 @@ class FusionOptimizer:
             )
         )
 
+        # RMSNorm fusion: collapse the 9-op Cast->Pow->ReduceMean->Add->Sqrt->
+        # Div->Mul->Cast->Mul decomposition into one RMSNorm op (113 instances
+        # in Qwen3-VL). Must run BEFORE fuse_elemwise_chain (priority 60) —
+        # otherwise the trailing Add->Sqrt->Div->Mul->Cast->Mul chain gets
+        # consumed by the elemwise fuser first.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_rms_norm",
+                FusionOptimizer.match_rms_norm,
+                FusionOptimizer.fold_rms_norm,
+                priority=82,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_into_attention",
@@ -2683,6 +2697,154 @@ class FusionOptimizer:
             if n and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
 
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- RMSNorm fusion ----
+    # Collapses the 9-op HF RMSNorm decomposition into one RMSNorm op:
+    #   Cast0(fp16->fp32) -> Pow(2) -> ReduceMean(axes=[-1]) -> Add(eps)
+    #     -> Sqrt -> Div(1,.) -> Mul(x,.) -> Cast1(->fp16) -> Mul(weight) -> OUT
+    # The leading Cast0 has 2 consumers (Pow for variance, Mul for x*inv_rms),
+    # which is why fuse_elemwise_chain can't take it (single-consumer invariant).
+    # Must run BEFORE fuse_elemwise_chain (priority 60); registered at 82.
+    @staticmethod
+    def match_rms_norm(dag_model):
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                consumers.setdefault(i["name"], []).append(n)
+
+        def _single_consumer(name):
+            cs = consumers.get(name, [])
+            return cs[0] if len(cs) == 1 else None
+
+        def _resolve_eps(eps_input):
+            """eps is a scalar Constant (folded to initializer) or Constant
+            node with a value/value_float attr. Return a python float or None."""
+            name = eps_input["name"]
+            # initializer (ConstantFolder folds Constants into initializers).
+            init = dag_model.initializers.get(name)
+            if init is not None:
+                try:
+                    import numpy as np
+                    from onnx import numpy_helper
+                    arr = numpy_helper.to_array(init)
+                    return float(arr.reshape(-1)[0])
+                except Exception:
+                    return None
+            # Constant node (value or value_float attr).
+            cn = producer.get(name)
+            if cn is not None and cn.op_type == "Constant":
+                v = cn.attributes.get("value")
+                if v is not None:
+                    try:
+                        import numpy as np
+                        from onnx import numpy_helper
+                        return float(numpy_helper.to_array(v).reshape(-1)[0])
+                    except Exception:
+                        pass
+                if "value_float" in cn.attributes:
+                    return float(cn.attributes["value_float"])
+            return None
+
+        matches = []
+        for rm_node in list(dag_model.nodes.values()):
+            if rm_node.op_type != "ReduceMean":
+                continue
+            pow_node = producer.get(rm_node.inputs[0]["name"])
+            if pow_node is None or pow_node.op_type != "Pow":
+                continue
+            cast0 = producer.get(pow_node.inputs[0]["name"])
+            if cast0 is None or cast0.op_type != "Cast":
+                continue
+            # Walk the exact forward chain: Add -> Sqrt -> Div -> Mul -> Cast -> Mul
+            chain = []
+            cur = rm_node
+            expected = ["Add", "Sqrt", "Div", "Mul", "Cast", "Mul"]
+            ok = True
+            for op_type in expected:
+                nxt = _single_consumer(cur.outputs[0]["name"])
+                if nxt is None or nxt.op_type != op_type:
+                    ok = False
+                    break
+                chain.append(nxt)
+                cur = nxt
+            if not ok or len(chain) != 6:
+                continue
+            add_node, sqrt_node, div_node, mul1_node, cast1_node, mul2_node = chain
+
+            # eps: Add's non-ReduceMean input.
+            eps_val = None
+            for inp in add_node.inputs:
+                if inp["name"] == rm_node.outputs[0]["name"]:
+                    continue
+                eps_val = _resolve_eps(inp)
+                if eps_val is not None:
+                    break
+            if eps_val is None:
+                continue
+
+            # Div must be 1/sqrt (numerator is a scalar Constant, denom is Sqrt).
+            # Mul1 must multiply Cast0 (the x) by Div (inv_rms): one input is
+            # Cast0's output, the other is Div's output.
+            cast0_out = cast0.outputs[0]["name"]
+            div_out = div_node.outputs[0]["name"]
+            mul1_ins = {i["name"] for i in mul1_node.inputs}
+            if cast0_out not in mul1_ins or div_out not in mul1_ins:
+                continue
+
+            # Mul2 (final): one input is Cast1's output (x_norm fp16), the other
+            # is the weight. Identify the weight input (not Cast1's output).
+            cast1_out = cast1_node.outputs[0]["name"]
+            weight_input = None
+            for inp in mul2_node.inputs:
+                if inp["name"] != cast1_out:
+                    weight_input = inp
+                    break
+            if weight_input is None:
+                continue
+
+            # x_input = Cast0's input (the fp16 activation).
+            x_input = cast0.inputs[0]
+
+            # axis from ReduceMean.axes (default [-1]).
+            axis = -1
+            axes_attr = rm_node.attributes.get("axes")
+            if isinstance(axes_attr, list) and len(axes_attr) == 1:
+                axis = int(axes_attr[0])
+
+            matches.append({
+                "x_input": x_input,
+                "weight_input": weight_input,
+                "eps_val": eps_val,
+                "axis": axis,
+                "mul2_node": mul2_node,
+                "nodes_to_delete": [
+                    cast0, pow_node, rm_node, add_node, sqrt_node,
+                    div_node, mul1_node, cast1_node, mul2_node,
+                ],
+            })
+        print(f"Found {len(matches)} RMSNorm patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_rms_norm(dag_model, match) -> bool:
+        """Emit RMSNorm(x, weight) -> Mul2's output. Delete the 9 source nodes."""
+        mul2_node = match["mul2_node"]
+        fused = Node(
+            op_type="RMSNorm",
+            name=f"RMSNorm_fused_{mul2_node.name}",
+            attributes={"eps": match["eps_val"], "axis": match["axis"]},
+            inputs=[match["x_input"], match["weight_input"]],
+            outputs=mul2_node.outputs[:],  # reuse the final Mul's output tensor
+        )
+        for n in match["nodes_to_delete"]:
+            if n and n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
         dag_model.nodes[fused.name] = fused
         return True
 

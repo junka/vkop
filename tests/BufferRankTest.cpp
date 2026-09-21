@@ -851,6 +851,57 @@ TEST(BufferRankTest, RotaryEmbeddingIdentity) {
 }
 
 // =========================================================================
+// RMSNorm — fuses the 9-op Cast->Pow->ReduceMean->Add->Sqrt->Div->Mul->Cast->
+// Mul decomposition into one dispatch. Ref: out = x * rsqrt(mean(x^2)+eps) * w
+// (normalize over the trailing axis; weight is 1-D over head_dim).
+// =========================================================================
+
+template <typename T>
+bool brt_rmsnorm_case(const std::vector<int> &xshape, bool fp16, float eps) {
+    Dev d;
+    auto torch_x = torch::randn(
+        std::vector<int64_t>(xshape.begin(), xshape.end()), brt_torch_opt<T>());
+    int head_dim = xshape.back();
+    auto torch_w = torch::randn({head_dim}, brt_torch_opt<T>());
+    // Ref: rms = mean(x^2) over last dim; out = x * rsqrt(rms+eps) * w.
+    auto msq = torch_x.pow(2).mean(-1, /*keepdim=*/true);
+    auto inv_rms = torch::rsqrt(msq + eps);
+    auto torch_out = torch_x * inv_rms * torch_w;
+
+    auto input = std::make_shared<Tensor<T>>(xshape);
+    brt_fill(input, torch_x);
+    brt_upload(input, d);
+    auto weight = std::make_shared<Tensor<T>>(std::vector<int>{head_dim});
+    brt_fill(weight, torch_w);
+    brt_upload(weight, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::RMSNORM, fp16,
+                          {{"eps", std::to_string(eps)}, {"axis", "-1"}}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, weight}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    // fp16 tolerance a touch looser (compute is fp32, but x/w are fp16).
+    float rtol = fp16 ? 0.03f : 0.001f;
+    float atol = fp16 ? 0.03f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+TEST(BufferRankTest, RMSNormFp32AndFp16) {
+    // head_dim=128 (the LLM decode shape), outer = B*H*S slices.
+    EXPECT_TRUE(brt_rmsnorm_case<float>({1, 16, 1, 128}, false, 1e-6f));
+    EXPECT_TRUE(brt_rmsnorm_case<uint16_t>({1, 16, 1, 128}, true, 1e-6f));
+    // Multi-slice outer (prefill-ish, S>1) + larger head_dim.
+    EXPECT_TRUE(brt_rmsnorm_case<float>({2, 8, 3, 64}, false, 1e-5f));
+    EXPECT_TRUE(brt_rmsnorm_case<uint16_t>({2, 8, 3, 64}, true, 1e-5f));
+    // head_dim=256 (q_norm/k_norm can be larger).
+    EXPECT_TRUE(brt_rmsnorm_case<float>({1, 4, 5, 256}, false, 1e-6f));
+    EXPECT_TRUE(brt_rmsnorm_case<uint16_t>({1, 4, 5, 256}, true, 1e-6f));
+}
+
+// =========================================================================
 // FusedElemwise — register-machine chain in ONE dispatch.
 // Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.
 // Program (op codes: ADD=1, SQRT=6, MUL=3; 4 ints/op {op,dst,a,b}):
