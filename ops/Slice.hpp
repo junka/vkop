@@ -7,6 +7,8 @@
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
 #include "ops/SliceCalc.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 extern "C" {
 extern unsigned char image_slice_spv[];
@@ -145,35 +147,154 @@ class SliceBuffer : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SlicePC)) {}
 
+    // The 8 Slice instances in the decode graph read back starts/ends/axes/
+    // steps (int64 shape-meta) every round. For the fp32 path these scalars
+    // are STABLE across decode rounds (deepstack/visual fixed shapes), and the
+    // fp32 path doesn't read back data at all (data goes through the GPU
+    // shader). So STABLE lets the fp32 path skip ALL readback. The i64/fp16
+    // paths still read back data (CPU slice), but STABLE still skips the
+    // starts/ends meta readback for them. Same LEARNING/CONFIRMING/STABLE
+    // machine as Reshape/Range. invalidate_shape_cache() resets at phase
+    // boundaries.
+    enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    LearnState slice_state_ = LearnState::LEARNING;
+    // Fingerprint of the meta inputs (inshape + starts/ends/axes/steps). When
+    // two consecutive rounds match, promote to STABLE.
+    std::vector<int> meta_inshape_;
+    std::vector<int64_t> meta_starts_, meta_ends_, meta_axes_, meta_steps_;
+    // Cached output-shape computation (out_size[0..3]).
+    std::vector<std::vector<int>> cached_out_size_;
+    static constexpr int STABLE_VERIFY_INTERVAL = 8;
+    int stable_rounds_ = 0;
+
+    void invalidate_shape_cache() override {
+        slice_state_ = LearnState::LEARNING;
+        meta_inshape_.clear();
+        meta_starts_.clear();
+        meta_ends_.clear();
+        meta_axes_.clear();
+        meta_steps_.clear();
+        cached_out_size_.clear();
+        stable_rounds_ = 0;
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
-        // starts/ends/axes/steps (inputs[1..4]) are int64 shape-meta tensors
-        // that may be GPU-resident only (produced by the int64 Concat/Gather
-        // GPU shader in a prior level). Read them back before .data() — same
-        // pattern as the data input below.
-        auto starts_t = core::as_tensor<int64_t>(inputs[1]);
-        starts_t->copyToCPU(m_cmdpool_);
-        auto ends_t = core::as_tensor<int64_t>(inputs[2]);
-        ends_t->copyToCPU(m_cmdpool_);
-        std::vector<int64_t> axes_vec;
-        if (inputs.size() > 3) {
-            auto axes_t = core::as_tensor<int64_t>(inputs[3]);
-            axes_t->copyToCPU(m_cmdpool_);
-            axes_vec = axes_t->data();
-        }
-        std::vector<int64_t> steps_vec;
-        if (inputs.size() > 4) {
-            auto steps_t = core::as_tensor<int64_t>(inputs[4]);
-            steps_t->copyToCPU(m_cmdpool_);
-            steps_vec = steps_t->data();
-        }
-        std::vector<std::vector<int>> out_size =
-            slice_calc::calculate_output_shape<int64_t>(
+
+        // STABLE fast path: if the meta inputs (inshape + starts/ends/axes/
+        // steps) matched last round, reuse the cached out_size and skip the
+        // starts/ends/axes/steps readback entirely. The data input is still
+        // read back below for the i64/fp16 CPU-slice paths; the fp32 path
+        // reads no data, so this is a complete readback skip for it.
+        std::vector<std::vector<int>> out_size;
+        bool meta_reused = false;
+        if (slice_state_ == LearnState::STABLE &&
+            stable_rounds_ < STABLE_VERIFY_INTERVAL) {
+            stable_rounds_++;
+            out_size = cached_out_size_;
+            meta_reused = true;
+            if (std::getenv("VKOP_RB_TRACE")) {
+                fprintf(stderr, "[rbtrace] Slice STABLE skip (out_shape=");
+                for (int d : out_size[0])
+                    fprintf(stderr, "%d,", d);
+                fprintf(stderr, ")\n");
+            }
+        } else {
+            // Readback path (LEARNING/CONFIRMING/DYNAMIC, or STABLE verify).
+            auto starts_t = core::as_tensor<int64_t>(inputs[1]);
+            starts_t->copyToCPU(m_cmdpool_);
+            auto ends_t = core::as_tensor<int64_t>(inputs[2]);
+            ends_t->copyToCPU(m_cmdpool_);
+            std::vector<int64_t> axes_vec;
+            if (inputs.size() > 3) {
+                auto axes_t = core::as_tensor<int64_t>(inputs[3]);
+                axes_t->copyToCPU(m_cmdpool_);
+                axes_vec = axes_t->data();
+            }
+            std::vector<int64_t> steps_vec;
+            if (inputs.size() > 4) {
+                auto steps_t = core::as_tensor<int64_t>(inputs[4]);
+                steps_t->copyToCPU(m_cmdpool_);
+                steps_vec = steps_t->data();
+            }
+            out_size = slice_calc::calculate_output_shape<int64_t>(
                 inshape, starts_t->data(), ends_t->data(), axes_vec, steps_vec);
+
+            if (std::getenv("VKOP_RB_TRACE")) {
+                fprintf(stderr, "[rbtrace] Slice inshape=");
+                for (int d : inshape)
+                    fprintf(stderr, "%d,", d);
+                fprintf(stderr, " starts=");
+                for (auto v : starts_t->data())
+                    fprintf(stderr, "%lld,", (long long)v);
+                fprintf(stderr, " ends=");
+                for (auto v : ends_t->data())
+                    fprintf(stderr, "%lld,", (long long)v);
+                fprintf(stderr, " -> out_shape=");
+                for (int d : out_size[0])
+                    fprintf(stderr, "%d,", d);
+                fprintf(stderr, " dtype=%s state=%d\n",
+                        inputs[0]->dtype() == typeid(int64_t)    ? "i64"
+                        : inputs[0]->dtype() == typeid(uint16_t) ? "fp16"
+                                                                 : "fp32",
+                        static_cast<int>(slice_state_));
+            }
+
+            // Advance the learn state machine. Fingerprint = inshape + the
+            // four meta vectors. STABLE when two consecutive rounds match.
+            std::vector<int64_t> s = starts_t->data();
+            std::vector<int64_t> e = ends_t->data();
+            bool match = (inshape == meta_inshape_ && s == meta_starts_ &&
+                          e == meta_ends_ && axes_vec == meta_axes_ &&
+                          steps_vec == meta_steps_);
+            if (slice_state_ == LearnState::LEARNING) {
+                meta_inshape_ = inshape;
+                meta_starts_ = s;
+                meta_ends_ = e;
+                meta_axes_ = axes_vec;
+                meta_steps_ = steps_vec;
+                cached_out_size_ = out_size;
+                slice_state_ = LearnState::CONFIRMING;
+            } else if (slice_state_ == LearnState::CONFIRMING) {
+                if (match) {
+                    slice_state_ = LearnState::STABLE;
+                    stable_rounds_ = 0;
+                } else {
+                    slice_state_ = LearnState::DYNAMIC;
+                    meta_inshape_ = inshape;
+                    meta_starts_ = s;
+                    meta_ends_ = e;
+                    meta_axes_ = axes_vec;
+                    meta_steps_ = steps_vec;
+                    cached_out_size_ = out_size;
+                }
+            } else if (slice_state_ == LearnState::STABLE) {
+                // Verify round: drift -> DYNAMIC.
+                if (!match) {
+                    slice_state_ = LearnState::DYNAMIC;
+                    meta_inshape_ = inshape;
+                    meta_starts_ = s;
+                    meta_ends_ = e;
+                    meta_axes_ = axes_vec;
+                    meta_steps_ = steps_vec;
+                    cached_out_size_ = out_size;
+                } else {
+                    stable_rounds_ = 0;
+                }
+            } else { // DYNAMIC
+                meta_inshape_ = inshape;
+                meta_starts_ = s;
+                meta_ends_ = e;
+                meta_axes_ = axes_vec;
+                meta_steps_ = steps_vec;
+                cached_out_size_ = out_size;
+            }
+        }
+        (void)meta_reused;
 
         // int64 data: CPU slice (part of the shape meta-chain). Walk the
         // output linearly; each output coordinate maps to an input coordinate

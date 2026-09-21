@@ -4,6 +4,8 @@
 
 #include "core/Tensor.hpp"
 #include "ops/BufferBase.hpp"
+#include <cstdio>
+#include <cstdlib>
 #include <numeric>
 
 extern "C" {
@@ -38,6 +40,12 @@ struct alignas(16) NonZeroPC {
 // host, set the exact [rank, count] shape, and upload. (All 6 decode rounds
 // have an all-False mask -> count=0 -> empty [1,0] output -> empty scatter,
 // which is the correct no-op.)
+//
+// STABLE cache: the mask is phase-invariant (fixed for the whole decode
+// phase — the image doesn't change between tokens), so two consecutive
+// matching readbacks promote to STABLE and skip the copyToCPU entirely,
+// reusing the cached [rank, count] output. invalidate_shape_cache() resets
+// at the prefill->decode boundary.
 class NonZero : public BufferFactory {
   public:
     explicit NonZero()
@@ -45,6 +53,27 @@ class NonZero : public BufferFactory {
                         buffer_nonzero_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(nonzero::NonZeroPC)) {}
+
+    enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    LearnState nz_state_ = LearnState::LEARNING;
+    // Fingerprint of the input: shape + flattened data (as double for
+    // dtype-agnostic comparison). Small (mask is tiny).
+    std::vector<int> cached_shape_;
+    std::vector<double> cached_input_;
+    // Cached output data + shape.
+    std::vector<int> cached_out_shape_;
+    std::vector<int64_t> cached_out_;
+    static constexpr int STABLE_VERIFY_INTERVAL = 8;
+    int stable_rounds_ = 0;
+
+    void invalidate_shape_cache() override {
+        nz_state_ = LearnState::LEARNING;
+        cached_shape_.clear();
+        cached_input_.clear();
+        cached_out_shape_.clear();
+        cached_out_.clear();
+        stable_rounds_ = 0;
+    }
 
   private:
     void execute(
@@ -58,11 +87,33 @@ class NonZero : public BufferFactory {
         }
         int total = total_elems(shape);
 
+        // STABLE fast path: reuse cached output, skip readback entirely.
+        // The mask is phase-invariant (image fixed for the whole decode
+        // phase), so the [rank, count] output is byte-identical when the
+        // input matches.
+        if (nz_state_ == LearnState::STABLE &&
+            stable_rounds_ < STABLE_VERIFY_INTERVAL) {
+            stable_rounds_++;
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(cached_out_shape_);
+            output->fillToCPU(cached_out_);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPUDeferred(m_cmd_);
+            if (std::getenv("VKOP_RB_TRACE")) {
+                fprintf(stderr, "[rbtrace] NonZero STABLE skip (count=%d)\n",
+                        cached_out_shape_.size() > 1 ? cached_out_shape_[1]
+                                                     : -1);
+            }
+            return;
+        }
+
+        // Readback path (LEARNING/CONFIRMING/DYNAMIC, or STABLE verify).
         // Pull the input to the host and collect the multi-dim coordinates of
         // every non-zero element. bool/int8 share the int8_t storage repr in
         // the runtime; float/int64 are also supported by dispatch_by_dtype.
         std::vector<std::vector<int64_t>>
             coords; // coords[k] = coord of k-th nz
+        std::vector<double> input_fp(total);
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
@@ -75,7 +126,9 @@ class NonZero : public BufferFactory {
                 stride[d] = stride[d + 1] * shape[d + 1];
             }
             for (int i = 0; i < total; ++i) {
-                if (static_cast<double>((*input)[i]) != 0.0) {
+                double v = static_cast<double>((*input)[i]);
+                input_fp[i] = v;
+                if (v != 0.0) {
                     std::vector<int64_t> c(rank);
                     int rem = i;
                     for (int d = 0; d < rank; ++d) {
@@ -88,6 +141,13 @@ class NonZero : public BufferFactory {
         });
 
         int count = static_cast<int>(coords.size());
+        if (std::getenv("VKOP_RB_TRACE")) {
+            fprintf(stderr, "[rbtrace] NonZero shape=");
+            for (int d : shape)
+                fprintf(stderr, "%d,", d);
+            fprintf(stderr, " total=%d count=%d state=%d\n", total, count,
+                    static_cast<int>(nz_state_));
+        }
         // ONNX NonZero output: [rank, count], column-major. For rank==1 this
         // is just [1, count] == a flat [count] of linear indices in memory.
         std::vector<int> out_shape = {rank, count};
@@ -96,6 +156,43 @@ class NonZero : public BufferFactory {
             for (int r = 0; r < rank; ++r) {
                 out[static_cast<size_t>(r) * count + k] = coords[k][r];
             }
+        }
+
+        // Advance the learn state machine. Fingerprint = shape + input data.
+        bool match = (shape == cached_shape_ && input_fp == cached_input_);
+        if (nz_state_ == LearnState::LEARNING) {
+            cached_shape_ = shape;
+            cached_input_ = input_fp;
+            cached_out_shape_ = out_shape;
+            cached_out_ = out;
+            nz_state_ = LearnState::CONFIRMING;
+        } else if (nz_state_ == LearnState::CONFIRMING) {
+            if (match) {
+                nz_state_ = LearnState::STABLE;
+                stable_rounds_ = 0;
+            } else {
+                nz_state_ = LearnState::DYNAMIC;
+                cached_shape_ = shape;
+                cached_input_ = input_fp;
+                cached_out_shape_ = out_shape;
+                cached_out_ = out;
+            }
+        } else if (nz_state_ == LearnState::STABLE) {
+            // Verify round: drift -> DYNAMIC.
+            if (!match) {
+                nz_state_ = LearnState::DYNAMIC;
+                cached_shape_ = shape;
+                cached_input_ = input_fp;
+                cached_out_shape_ = out_shape;
+                cached_out_ = out;
+            } else {
+                stable_rounds_ = 0;
+            }
+        } else { // DYNAMIC
+            cached_shape_ = shape;
+            cached_input_ = input_fp;
+            cached_out_shape_ = out_shape;
+            cached_out_ = out;
         }
 
         auto output = core::as_tensor<int64_t>(outputs[0]);
