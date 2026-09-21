@@ -2724,29 +2724,38 @@ class FusionOptimizer:
 
         def _resolve_eps(eps_input):
             """eps is a scalar Constant (folded to initializer) or Constant
-            node with a value/value_float attr. Return a python float or None."""
+            node with a value/value_float attr. Return a python float or None.
+            The dag_model stores Constant `value` attrs as ndarrays (converter
+            applies numpy_helper.to_array at load), while initializers remain
+            TensorProtos — handle both."""
+            def _to_float(v):
+                try:
+                    import numpy as np
+                    if isinstance(v, np.ndarray):
+                        return float(v.reshape(-1)[0])
+                except Exception:
+                    pass
+                try:
+                    from onnx import numpy_helper
+                    return float(numpy_helper.to_array(v).reshape(-1)[0])
+                except Exception:
+                    return None
+
             name = eps_input["name"]
             # initializer (ConstantFolder folds Constants into initializers).
             init = dag_model.initializers.get(name)
             if init is not None:
-                try:
-                    import numpy as np
-                    from onnx import numpy_helper
-                    arr = numpy_helper.to_array(init)
-                    return float(arr.reshape(-1)[0])
-                except Exception:
-                    return None
+                f = _to_float(init)
+                if f is not None:
+                    return f
             # Constant node (value or value_float attr).
             cn = producer.get(name)
             if cn is not None and cn.op_type == "Constant":
                 v = cn.attributes.get("value")
                 if v is not None:
-                    try:
-                        import numpy as np
-                        from onnx import numpy_helper
-                        return float(numpy_helper.to_array(v).reshape(-1)[0])
-                    except Exception:
-                        pass
+                    f = _to_float(v)
+                    if f is not None:
+                        return f
                 if "value_float" in cn.attributes:
                     return float(cn.attributes["value_float"])
             return None
