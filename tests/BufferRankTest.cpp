@@ -902,6 +902,61 @@ TEST(BufferRankTest, RMSNormFp32AndFp16) {
 }
 
 // =========================================================================
+// MatMul transB — fold Transpose(last-2-swap) into MatMul's B input. The
+// shader reads B[j*K+k] instead of B[k*N+j]. Verified by: MatMul(A, B^T) with
+// transB=1 must equal torch::matmul(A, B) where B is the UN-transposed matrix
+// (i.e. we feed B stored as [batch,N,K] and assert the result matches A@B).
+// =========================================================================
+
+template <typename T>
+bool brt_matmul_transB_case(const std::vector<int> &ashape,
+                            const std::vector<int> &bshape_untrans, bool fp16) {
+    // ashape = [B, M, K], bshape_untrans = [B, K, N] (the "logical" B).
+    // We store B physically as [B, N, K] (transposed last two) and set transB.
+    Dev d;
+    auto torch_a = torch::randn(
+        std::vector<int64_t>(ashape.begin(), ashape.end()), brt_torch_opt<T>());
+    auto torch_b = torch::randn(
+        std::vector<int64_t>(bshape_untrans.begin(), bshape_untrans.end()),
+        brt_torch_opt<T>());
+    // Reference: C = A @ B (B is the logical [B,K,N] matrix).
+    auto torch_out = torch::matmul(torch_a, torch_b);
+
+    // Physical B stored transposed: [B, N, K].
+    auto torch_b_phys = torch_b.transpose(-1, -2).contiguous();
+    int B = bshape_untrans[0], K = bshape_untrans[1], N = bshape_untrans[2];
+    std::vector<int> b_phys_shape = {B, N, K};
+
+    auto input_a = std::make_shared<Tensor<T>>(ashape);
+    brt_fill(input_a, torch_a);
+    brt_upload(input_a, d);
+    auto input_b = std::make_shared<Tensor<T>>(b_phys_shape);
+    brt_fill(input_b, torch_b_phys);
+    brt_upload(input_b, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::MATMUL, fp16,
+                          {{"transB", "1"}}, d);
+    if (!op)
+        return false;
+    op->onExecute({input_a, input_b}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    float rtol = fp16 ? 0.03f : 0.001f;
+    float atol = fp16 ? 0.03f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+TEST(BufferRankTest, MatMulTransB) {
+    // [B,M,K] @ [B,K,N], B stored physically as [B,N,K].
+    EXPECT_TRUE(brt_matmul_transB_case<float>({1, 8, 16}, {1, 16, 4}, false));
+    EXPECT_TRUE(brt_matmul_transB_case<uint16_t>({1, 8, 16}, {1, 16, 4}, true));
+    // batched, non-square M != N.
+    EXPECT_TRUE(brt_matmul_transB_case<float>({2, 5, 12}, {2, 12, 7}, false));
+    EXPECT_TRUE(brt_matmul_transB_case<uint16_t>({2, 5, 12}, {2, 12, 7}, true));
+}
+
+// =========================================================================
 // FusedElemwise — register-machine chain in ONE dispatch.
 // Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.
 // Program (op codes: ADD=1, SQRT=6, MUL=3; 4 ints/op {op,dst,a,b}):

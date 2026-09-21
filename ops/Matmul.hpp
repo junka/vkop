@@ -34,8 +34,9 @@ struct alignas(16) GpuMatMulParam {
     int M;
     int N;
     int K;
-    int C;    // image path: channel count; buffer path: batch count
-    int fp32; // 1 = fp32, 0 = fp16
+    int C;      // image path: channel count; buffer path: batch count
+    int fp32;   // 1 = fp32, 0 = fp16
+    int transB; // 1 = B is [batch, N, K] (transposed input); 0 = [batch, K, N]
 };
 } // namespace matmul
 
@@ -159,6 +160,13 @@ class MatMulBuffer : public BufferFactory {
         }
     }
 
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("transB") != attributes.end()) {
+            transB_ = std::stol(attributes.at("transB")) != 0;
+        }
+    }
+
   private:
     struct alignas(16) MatMulPackPC {
         int total;
@@ -196,7 +204,10 @@ class MatMulBuffer : public BufferFactory {
         }
         int m = shape_a[rank_a - 2];
         int k = shape_a[rank_a - 1];
-        int n = shape_b[rank_b - 1];
+        // transB: B is laid out as [batch, N, K] (a Transpose(perm=[..,last2
+        // swapped]) was folded into this MatMul). N comes from B's 2nd-to-last
+        // dim instead of the last; K from B's last dim must equal A's K.
+        int n = transB_ ? shape_b[rank_b - 2] : shape_b[rank_b - 1];
 
         int batch = 1;
         int lead_a = rank_a - 2;
@@ -281,6 +292,7 @@ class MatMulBuffer : public BufferFactory {
         para_.K = k;
         para_.C = batch;
         para_.fp32 = (fp16_ != 0) ? 0 : 1;
+        para_.transB = transB_ ? 1 : 0;
         submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
 
         if (fp16_ != 0) {
@@ -328,6 +340,7 @@ class MatMulBuffer : public BufferFactory {
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> pack_writes_;
+    bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

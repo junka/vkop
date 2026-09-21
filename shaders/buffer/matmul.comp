@@ -32,6 +32,7 @@ layout(push_constant) uniform PC {
     int K;
     int batch;
     int fp32;
+    int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
 } uPC;
 
 #ifdef FP16
@@ -58,12 +59,16 @@ void main() {
 
     float sum = 0.0;
     for (int k = 0; k < uPC.K; ++k) {
+        // transB: B is [batch, N, K] so element (n,j,k) lives at j*K+k instead
+        // of k*N+j. Avoids a separate Transpose dispatch before the MatMul.
+        int b_idx = (uPC.transB != 0) ? (b_base + j * uPC.K + k)
+                                      : (b_base + k * uPC.N + j);
 #ifdef FP16
         float a = load_a(a_base + i * uPC.K + k);
-        float b = load_b(b_base + k * uPC.N + j);
+        float b = load_b(b_idx);
 #else
         float a = uintBitsToFloat(uInputA.data[a_base + i * uPC.K + k]);
-        float b = uintBitsToFloat(uInputB.data[b_base + k * uPC.N + j]);
+        float b = uintBitsToFloat(uInputB.data[b_idx]);
 #endif
         sum += a * b;
     }

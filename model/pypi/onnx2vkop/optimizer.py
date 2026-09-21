@@ -769,6 +769,19 @@ class FusionOptimizer:
             )
         )
 
+        # Transpose-into-MatMul (transB): fold Transpose(last-2-swap) -> MatMul(B)
+        # into a MatMul with transB=1 (28 instances in Qwen3-VL attention).
+        # Saves a Transpose dispatch per instance; the matmul shader reads B
+        # transposed inline.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_transpose_into_matmul",
+                FusionOptimizer.match_transpose_into_matmul,
+                FusionOptimizer.fold_transpose_into_matmul,
+                priority=85,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_into_attention",
@@ -2854,6 +2867,80 @@ class FusionOptimizer:
         for n in match["nodes_to_delete"]:
             if n and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- Transpose-into-MatMul (transB) fusion ----
+    # Folds Transpose(perm=[..., last two swapped]) -> MatMul(B) into the
+    # MatMul with a transB attribute, so the matmul shader reads B transposed
+    # inline (B[j*K+k] instead of B[k*N+j]). The Qwen3-VL attention has 28
+    # instances (K-cache transpose before Q@K^T), all perm=[0,1,3,2].
+    # Only folds a pure last-two-dims swap (the transB shader flag handles
+    # exactly that); other perms are left as a real Transpose dispatch.
+    @staticmethod
+    def match_transpose_into_matmul(dag_model):
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                consumers.setdefault(i["name"], []).append(n)
+
+        def _is_last_two_swap(perm):
+            # perm must be identity except the last two dims swapped:
+            # [0,1,2,...,r-1] with [r-2,r-1] -> [r-1,r-2].
+            r = len(perm)
+            if r < 2:
+                return False
+            for i in range(r - 2):
+                if perm[i] != i:
+                    return False
+            return perm[r - 2] == r - 1 and perm[r - 1] == r - 2
+
+        matches = []
+        for t_node in list(dag_model.nodes.values()):
+            if t_node.op_type != "Transpose":
+                continue
+            perm_attr = t_node.attributes.get("perm")
+            if not isinstance(perm_attr, list) or not _is_last_two_swap(perm_attr):
+                continue
+            cs = consumers.get(t_node.outputs[0]["name"], [])
+            if len(cs) != 1 or cs[0].op_type != "MatMul":
+                continue
+            mm = cs[0]
+            # Only fold when the Transpose feeds MatMul's B (input[1]); folding
+            # into A (input[0]) would need a transA flag the shader doesn't have.
+            if mm.inputs[1]["name"] != t_node.outputs[0]["name"]:
+                continue
+            # Transpose's input becomes MatMul's B; mark MatMul transB=1.
+            new_b = t_node.inputs[0]
+            matches.append({
+                "matmul_node": mm,
+                "transpose_node": t_node,
+                "new_b_input": new_b,
+            })
+        print(f"Found {len(matches)} Transpose->MatMul(transB) patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_transpose_into_matmul(dag_model, match) -> bool:
+        mm = match["matmul_node"]
+        t = match["transpose_node"]
+        # Replace MatMul's B input with the Transpose's input, set transB=1.
+        new_inputs = [mm.inputs[0], match["new_b_input"]]
+        fused = Node(
+            op_type="MatMul",
+            name=mm.name,  # keep MatMul's name (its output tensor stays)
+            attributes=dict(mm.attributes),
+            inputs=new_inputs,
+            outputs=mm.outputs[:],
+        )
+        fused.attributes["transB"] = 1
+        del dag_model.nodes[mm.name]
+        if t.name in dag_model.nodes:
+            del dag_model.nodes[t.name]
         dag_model.nodes[fused.name] = fused
         return True
 
