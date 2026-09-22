@@ -102,6 +102,29 @@ class VulkanCommandBuffer {
 
     void exec(const std::shared_ptr<VulkanQueue> &queue);
 
+    // GPU timestamp profiling (submit-side attribution). Writes a timestamp
+    // into this command buffer's recording at the given query index. Call
+    // writeTimestampBegin AFTER begin() (TOP_OF_PIPE = when the cmd reaches
+    // the front of the queue) and writeTimestampEnd BEFORE end()
+    // (BOTTOM_OF_PIPE = after all prior work in this cmd completes). The host
+    // reads results via vkGetQueryPoolResults after the round's final wait.
+    // Used by VKOP_SUBMIT_PROF to attribute the ~515ms submit floor per op-type
+    // (opprof only measures CPU record time, not GPU execution).
+    void writeTimestampBegin(VkQueryPool pool, uint32_t query) {
+        vkCmdWriteTimestamp(m_commandBuffer_, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                            pool, query);
+    }
+    void writeTimestampEnd(VkQueryPool pool, uint32_t query) {
+        vkCmdWriteTimestamp(m_commandBuffer_,
+                            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, pool, query);
+    }
+    // Reset a range of timestamp queries at the start of the frame. Must be
+    // recorded into a command buffer that runs before any query writes.
+    static void resetQueryRange(VkCommandBuffer cmd, VkQueryPool pool,
+                                uint32_t first, uint32_t count) {
+        vkCmdResetQueryPool(cmd, pool, first, count);
+    }
+
     VkSemaphore getSignalSemaphore() const {
         return m_signalsem_->getSemaphore();
     }

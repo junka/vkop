@@ -790,6 +790,46 @@ double Runtime::Run() {
 
     bool single_queue = dev->getNumComputeQueues() <= 1;
 
+    // GPU submit-side profiling (VKOP_SUBMIT_PROF): allocate a timestamp
+    // query pool with 2 queries per op (begin/end) and assign each op its
+    // query base. Results are read back at Run() end and aggregated per
+    // op-type. opprof measures CPU record time; this measures GPU execution
+    // (the ~515ms submit floor that opprof cannot attribute).
+    if (!submit_prof_) {
+        const char *sp = std::getenv("VKOP_SUBMIT_PROF");
+        if (sp && sp[0] == '1' && !node_ops_.empty()) {
+            submit_prof_ = true;
+            timestamp_period_ = dev->getTimestampPeriod();
+            uint32_t nq = static_cast<uint32_t>(node_ops_.size()) * 2;
+            VkQueryPoolCreateInfo qpci{};
+            qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+            qpci.queryCount = nq;
+            if (vkCreateQueryPool(dev->getLogicalDevice(), &qpci, nullptr,
+                                  &submit_prof_pool_) == VK_SUCCESS) {
+                for (size_t i = 0; i < node_ops_.size(); ++i) {
+                    node_ops_[i]->set_prof_query(submit_prof_pool_,
+                                                 static_cast<uint32_t>(i) * 2);
+                }
+                fprintf(stderr,
+                        "[submitprof] enabled: %zu ops, %u queries, "
+                        "timestampPeriod=%.3f ns\n",
+                        node_ops_.size(), nq, timestamp_period_);
+            } else {
+                submit_prof_ = false;
+                fprintf(stderr, "[submitprof] query pool creation FAILED\n");
+            }
+        }
+    }
+    // Reset the query pool at the start of each profiled Run(). We record the
+    // reset into a fresh one-time cmd buffer and submit it (host-queued before
+    // any op recording this round, so the reset precedes all query writes in
+    // queue submission order on the single FIFO queue).
+    if (submit_prof_ && submit_prof_pool_ != VK_NULL_HANDLE) {
+        vkResetQueryPool(dev->getLogicalDevice(), submit_prof_pool_, 0,
+                         static_cast<uint32_t>(node_ops_.size()) * 2);
+    }
+
     // Set of initializer tensor pointers, used by the execute-time
     // reshape_view guard to distinguish a true scalar Constant (an
     // initializer whose ONNX shape was () but whose vkopbin dims_=[1] due to
@@ -1903,6 +1943,77 @@ double Runtime::Run() {
             rg += p.second;
         }
         fprintf(stderr, "[rbprof] %-14s %6d\n", "TOTAL", rg);
+    }
+
+    // GPU submit-side profiling: read back all timestamp queries and aggregate
+    // GPU time per op-type. Each op owns queries (2*i, 2*i+1); the delta ×
+    // timestampPeriod / 1e6 = ms of GPU execution for that op. This is the ONLY
+    // attribution of the ~515ms submit floor by op-type (opprof is
+    // record-side).
+    if (submit_prof_ && submit_prof_pool_ != VK_NULL_HANDLE) {
+        uint32_t nq = static_cast<uint32_t>(node_ops_.size()) * 2;
+        std::vector<uint64_t> ts(nq, 0);
+        // VK_QUERY_RESULT_WAIT_BIT blocks until each query is available; since
+        // the final-level wait above already drained the queue, all are ready.
+        VkResult r = vkGetQueryPoolResults(
+            dev->getLogicalDevice(), submit_prof_pool_, 0, nq,
+            nq * sizeof(uint64_t), ts.data(), sizeof(uint64_t),
+            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+        if (r == VK_SUCCESS) {
+            // Aggregate per op-type. Sum the per-op GPU ms.
+            std::map<std::string, std::pair<double, int>>
+                agg; // name -> (ms, count)
+            double total_gpu_ms = 0.0;
+            struct PerOp {
+                double ms;
+                std::string type;
+                std::string name;
+            };
+            std::vector<PerOp> per_op_ms;
+            for (size_t i = 0; i < node_ops_.size(); ++i) {
+                uint64_t b = ts[i * 2];
+                uint64_t e = ts[i * 2 + 1];
+                if (e < b)
+                    continue; // unavailable / wrapped
+                double ns = static_cast<double>(e - b) * timestamp_period_;
+                double ms = ns / 1.0e6;
+                if (ms < 0)
+                    continue;
+                auto name = convert_optype_to_string(node_ops_[i]->get_type());
+                auto &entry = agg[name];
+                entry.first += ms;
+                entry.second += 1;
+                total_gpu_ms += ms;
+                // Also collect per-op (name+type) for a top-N slowest listing.
+                per_op_ms.push_back({ms, name, node_ops_[i]->get_name()});
+            }
+            fprintf(stderr,
+                    "[submitprof] op-type       calls   gpu_ms   avg_ms\n");
+            std::vector<std::pair<std::string, std::pair<double, int>>> sv(
+                agg.begin(), agg.end());
+            std::sort(sv.begin(), sv.end(), [](const auto &a, const auto &b) {
+                return a.second.first > b.second.first;
+            });
+            for (const auto &p : sv) {
+                double avg =
+                    p.second.second ? p.second.first / p.second.second : 0.0;
+                fprintf(stderr, "[submitprof] %-14s %6d %8.2f %8.3f\n",
+                        p.first.c_str(), p.second.second, p.second.first, avg);
+            }
+            fprintf(stderr, "[submitprof] %-14s %6d %8.2f\n", "TOTAL",
+                    static_cast<int>(node_ops_.size()), total_gpu_ms);
+            // Top-N slowest individual ops (reveals which MatMuls dominate).
+            std::sort(per_op_ms.begin(), per_op_ms.end(),
+                      [](const auto &a, const auto &b) { return a.ms > b.ms; });
+            fprintf(stderr, "[submitprof] --- top 15 slowest ops ---\n");
+            for (int i = 0; i < 15 && i < (int)per_op_ms.size(); ++i) {
+                const auto &e = per_op_ms[i];
+                fprintf(stderr, "[submitprof] %8.3fms  %-12s %s\n", e.ms,
+                        e.type.c_str(), e.name.c_str());
+            }
+        } else {
+            fprintf(stderr, "[submitprof] vkGetQueryPoolResults = %d\n", r);
+        }
     }
 
     auto end = std::chrono::steady_clock::now();

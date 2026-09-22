@@ -151,6 +151,19 @@ class Operator {
     // could differ. Default no-op; only shape-consuming ops (Reshape) override.
     virtual void invalidate_shape_cache() {}
 
+    // GPU submit-side profiling (VKOP_SUBMIT_PROF). The Runtime assigns each
+    // op a pair of timestamp-query indices (base, base+1) in a shared pool;
+    // onExecute writes a TOP_OF_PIPE timestamp right after begin() and a
+    // BOTTOM_OF_PIPE timestamp right before end(), so the delta (×
+    // timestampPeriod) is this op's GPU execution time. No-op when pool is
+    // null. CACHED-replay ops keep their recorded timestamps (the recording
+    // from the round that earned CACHED carries them) and re-emit them on
+    // re-submission. Forwarded by PimplFacade to the impl.
+    virtual void set_prof_query(VkQueryPool pool, uint32_t base) {
+        prof_query_pool_ = pool;
+        prof_query_base_ = base;
+    }
+
     // These members are the public API the runtime/tests drive. They are
     // virtual so a PIMPL façade op can forward each to its image/buffer
     // impl (which owns the real pipeline/command-buffer state).
@@ -202,7 +215,17 @@ class Operator {
             m_cmd_->set_replayable(true);
         }
         m_cmd_->begin();
+        // GPU timestamp: TOP_OF_PIPE = the moment this cmd reaches the front
+        // of the queue (before its work starts). Written inside begin/end so
+        // CACHED-replay recordings carry it forward.
+        if (prof_query_pool_ != VK_NULL_HANDLE) {
+            m_cmd_->writeTimestampBegin(prof_query_pool_, prof_query_base_);
+        }
         execute(inputs, outputs);
+        if (prof_query_pool_ != VK_NULL_HANDLE) {
+            // BOTTOM_OF_PIPE = after all prior work in this cmd completes.
+            m_cmd_->writeTimestampEnd(prof_query_pool_, prof_query_base_ + 1);
+        }
         m_cmd_->end();
 
         if (replay_enabled_) {
@@ -341,6 +364,10 @@ class Operator {
     ReplayState replay_state_ = ReplayState::FRESH;
     bool replay_enabled_ = false; // set true by Runtime when cache mode on
     long replay_hits_ = 0;        // times onExecute took the CACHED return
+    // GPU timestamp profiling (VKOP_SUBMIT_PROF). Assigned once by Runtime
+    // (set_prof_query); null when profiling is off (no overhead).
+    VkQueryPool prof_query_pool_ = VK_NULL_HANDLE;
+    uint32_t prof_query_base_ = 0;
     // Accumulate the fingerprint of one submit() call. Called from submit()/
     // submit_per_ds() when replay_enabled_. Cheap: one small alloc + handle
     // reads (handles are already materialized in objs_).

@@ -93,6 +93,14 @@ class Runtime {
     int replay_cached_count_ = 0; // ops that replayed (CACHED) this Run()
     bool replay_dbg_ = false;     // set by VKOP_REPLAY=2 (log dynamic ops)
 
+    // GPU submit-side profiling (VKOP_SUBMIT_PROF=1). A timestamp query pool
+    // with 2 queries per op (begin/end); results read back at Run() end and
+    // aggregated per op-type to attribute the submit floor. opprof only
+    // measures CPU record time; this measures actual GPU execution.
+    VkQueryPool submit_prof_pool_ = VK_NULL_HANDLE;
+    bool submit_prof_ = false;
+    float timestamp_period_ = 1.0f;
+
   public:
     // Drop every op's cached recording (back to FRESH) so the next Run()
     // re-records all. Call across a phase boundary where shapes change en masse

@@ -63,6 +63,9 @@ class PimplFacade : public Operator {
     void set_input_value_dynamic(const std::vector<bool> &vd) override {
         impl_->set_input_value_dynamic(vd);
     }
+    void set_prof_query(VkQueryPool pool, uint32_t base) override {
+        impl_->set_prof_query(pool, base);
+    }
 
   protected:
     std::unique_ptr<Operator> impl_;
