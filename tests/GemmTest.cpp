@@ -112,7 +112,11 @@ private:
         // int kb = transB ? t2[1] : t2[0];
         int n = transB ? t2[0] : t2[1];
         int k = ka;
-        inputc = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
+        // ONNX Gemm C is 1-D [N], broadcast across all M rows (the shader
+        // reads bias by column only). A [M,N] C would make rows i>=1 read
+        // C[j] (row 0) while the expected adds C[i*N+j] -> row-indexed
+        // mismatch (regression guard in c4251a6).
+        inputc = std::make_shared<Tensor<T>>(std::vector<int>{n});
         output = std::make_shared<Tensor<T>>(std::vector<int>{m, n});
 
         torch::manual_seed(42);
@@ -120,7 +124,7 @@ private:
         std::vector<int64_t> t2shape(t2.begin(), t2.end());
         auto torch_inputa = torch::randn(t1shape, this->getTorchConf());
         auto torch_inputb = torch::randn(t2shape, this->getTorchConf());
-        auto torch_inputc = torch::randn({m, n}, this->getTorchConf());
+        auto torch_inputc = torch::randn({n}, this->getTorchConf());
 
         this->fillTensorFromTorch(inputa, torch_inputa);
         this->fillTensorFromTorch(inputb, torch_inputb);
