@@ -911,6 +911,13 @@ TEST(BufferRankTest, RotaryEmbeddingUntransposed) {
     // K-heads (8).
     EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 8, 3, 128}, false));
     EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 8, 3, 128}, true));
+    // LLM-exact prefill shapes (seq=9, the real prefill token count).
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 16, 9, 128}, false));
+    EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 16, 9, 128}, true));
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 8, 9, 128}, false));
+    EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 8, 9, 128}, true));
+    // Batch>1 (guard).
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({2, 16, 9, 128}, false));
 }
 
 // =========================================================================

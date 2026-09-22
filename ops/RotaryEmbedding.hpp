@@ -86,6 +86,17 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         }
         // Leading dims (batch etc.) collapse into `total - heads*seq*head_dim`.
         int total = total_elems(xshape);
+        // Output layout is [B, num_heads, seq, head_dim] (the transposed layout
+        // downstream MatMul Q@K^T / Concat K-cache expect). When X is
+        // untransposed ([B, seq, num_heads, head_dim]), the OUTPUT shape is the
+        // swapped input shape — NOT xshape. Resizing to xshape would set the
+        // output dims_ metadata to the untransposed layout and corrupt every
+        // downstream op that reads getShape() for dispatch/broadcast math.
+        std::vector<int> out_shape = xshape;
+        if (input_untransposed_ && out_shape.size() >= 3) {
+            std::swap(out_shape[out_shape.size() - 2],
+                      out_shape[out_shape.size() - 3]);
+        }
 
         // Output has the same shape as X; resize if the runtime created it
         // with a placeholder (e.g. dynamic -1 -> 1 at load).
@@ -93,7 +104,7 @@ class RotaryEmbeddingBuffer : public BufferFactory {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total) {
-                output->resize(xshape);
+                output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
