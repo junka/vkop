@@ -755,6 +755,21 @@ class FusionOptimizer:
             )
         )
 
+        # Transpose-into-RotaryEmbedding: fold Transpose(perm=[0,2,1,3]) ->
+        # RotaryEmbedding(X) into RE with input_untransposed=1 (56 instances in
+        # Qwen3-VL attention, all Q/K head-reorder before RoPE). RE reads the
+        # untransposed [B,seq,heads,head_dim] layout directly (swapped h/s decode
+        # in the shader), eliminating the Transpose dispatch. Must run AFTER
+        # fuse_rotary_embedding (80) so the RotaryEmbedding node already exists.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_transpose_into_rotary",
+                FusionOptimizer.match_transpose_into_rotary,
+                FusionOptimizer.fold_transpose_into_rotary,
+                priority=79,
+            )
+        )
+
         # RMSNorm fusion: collapse the 9-op Cast->Pow->ReduceMean->Add->Sqrt->
         # Div->Mul->Cast->Mul decomposition into one RMSNorm op (113 instances
         # in Qwen3-VL). Must run BEFORE fuse_elemwise_chain (priority 60) —
@@ -2939,6 +2954,66 @@ class FusionOptimizer:
         )
         fused.attributes["transB"] = 1
         del dag_model.nodes[mm.name]
+        if t.name in dag_model.nodes:
+            del dag_model.nodes[t.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    @staticmethod
+    def match_transpose_into_rotary(dag_model):
+        """Fold Transpose(perm=[0,2,1,3]) -> RotaryEmbedding(X) into RE with
+        input_untransposed=1. The Transpose is the Q/K head-reorder
+        ([B,seq,heads,head_dim] -> [B,heads,seq,head_dim]) that precedes RoPE;
+        RE can read the untransposed layout directly (the shader swaps the h/s
+        decode for its input reads). Only folds when the Transpose feeds RE's X
+        input (input[0]) and is its single consumer."""
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                consumers.setdefault(i["name"], []).append(n)
+
+        def _is_head_reorder_perm(perm):
+            # perm == [0, 2, 1, 3] (swap dims 1 and 2 of a 4-D tensor). This is
+            # the Q/K head-reorder: [B, seq, heads, head_dim] -> [B, heads, seq, head_dim].
+            return list(perm) == [0, 2, 1, 3]
+
+        matches = []
+        for t_node in list(dag_model.nodes.values()):
+            if t_node.op_type != "Transpose":
+                continue
+            perm_attr = t_node.attributes.get("perm")
+            if not isinstance(perm_attr, list) or not _is_head_reorder_perm(perm_attr):
+                continue
+            cs = consumers.get(t_node.outputs[0]["name"], [])
+            if len(cs) != 1 or cs[0].op_type != "RotaryEmbedding":
+                continue
+            re_node = cs[0]
+            # Only fold when the Transpose feeds RE's X (input[0]).
+            if re_node.inputs[0]["name"] != t_node.outputs[0]["name"]:
+                continue
+            matches.append({
+                "rotary_node": re_node,
+                "transpose_node": t_node,
+                "new_x_input": t_node.inputs[0],
+            })
+        print(f"Found {len(matches)} Transpose->RotaryEmbedding patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_transpose_into_rotary(dag_model, match) -> bool:
+        re_node = match["rotary_node"]
+        t = match["transpose_node"]
+        # Replace RE's X input with the Transpose's input, set input_untransposed=1.
+        new_inputs = [match["new_x_input"]] + re_node.inputs[1:]
+        fused = Node(
+            op_type="RotaryEmbedding",
+            name=re_node.name,  # keep RE's name (its output tensor stays)
+            attributes=dict(re_node.attributes),
+            inputs=new_inputs,
+            outputs=re_node.outputs[:],
+        )
+        fused.attributes["input_untransposed"] = 1
+        del dag_model.nodes[re_node.name]
         if t.name in dag_model.nodes:
             del dag_model.nodes[t.name]
         dag_model.nodes[fused.name] = fused

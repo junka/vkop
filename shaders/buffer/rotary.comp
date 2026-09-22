@@ -63,24 +63,42 @@ layout(push_constant) uniform PC {
     int head_dim;   // full head dim (rotary_embedding_dim), e.g. 128
     int num_heads;  // heads dim of X (unused for cos/sin indexing; cos broadcasts)
     int seq;        // sequence len of X (for cos/sin (b*seq+s) index)
-    int _pad;
+    int input_untransposed; // 1 = X is laid out as [B, seq, num_heads, head_dim]
+                            // (a Transpose(perm=[0,2,1,3]) was folded into RE);
+                            // 0 = X is [B, num_heads, seq, head_dim] (default)
 } uPC;
+
+// Decode (b, s, d) from an output gid in [B, num_heads, seq, head_dim] layout.
+// h is not needed for cos/sin (they broadcast across heads). When
+// input_untransposed is set, the INPUT X is [B, seq, num_heads, head_dim], so
+// reading x at the "same" linear position requires remapping gid -> gid_in:
+//   gid_in = b*(seq*num_heads*head_dim) + s*(num_heads*head_dim) + h*head_dim + d
+// head_dim is the fastest axis in BOTH layouts, so gid_in +/- half_dim still
+// addresses d +/- half within the same head (correct for the real/imag pair).
+int in_index(int gid, int b, int s, int d, int head_dim, int seq, int num_heads) {
+    if (uPC.input_untransposed == 0) return gid;
+    int h = (gid / (head_dim * seq)) % num_heads;
+    return b * (seq * num_heads * head_dim)
+         + s * (num_heads * head_dim)
+         + h * head_dim + d;
+}
 
 // Rotate one element at linear index `gid` (d decoded from gid).
 float rotate_one(int gid, int d, int half_dim, int head_dim, int seq,
                  int num_heads) {
     int b = gid / (head_dim * seq * num_heads);
     int cs_idx = (b * seq + (gid / head_dim) % seq) * head_dim + d;
-    float x = BUF_LOAD(uInputX.data, gid);
+    int xidx = in_index(gid, b, (gid / head_dim) % seq, d, head_dim, seq, num_heads);
+    float x = BUF_LOAD(uInputX.data, xidx);
     float cos_v = BUF_LOAD(uInputCos.data, cs_idx);
     float sin_v = BUF_LOAD(uInputSin.data, cs_idx);
     if (d < half_dim) {
         // real: x[d]*cos[d] - x[d+half]*sin[d]
-        float x2 = BUF_LOAD(uInputX.data, gid + half_dim);
+        float x2 = BUF_LOAD(uInputX.data, xidx + half_dim);
         return cos_v * x - sin_v * x2;
     } else {
         // imag: x[d]*cos[d] + x[d-half]*sin[d]
-        float x1 = BUF_LOAD(uInputX.data, gid - half_dim);
+        float x1 = BUF_LOAD(uInputX.data, xidx - half_dim);
         return sin_v * x1 + cos_v * x;
     }
 }

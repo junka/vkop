@@ -850,6 +850,69 @@ TEST(BufferRankTest, RotaryEmbeddingIdentity) {
     EXPECT_TRUE(brt_rotary_identity_case<float>({1, 4, 2, 8}, false));
 }
 
+// Folded-Transpose variant: when input_untransposed=1, X is laid out as
+// [B, seq, heads, head_dim] (a Transpose(perm=[0,2,1,3]) feeding RE was folded
+// away). The output is still [B, heads, seq, head_dim]. The result must match
+// running RE on the pre-transposed [B, heads, seq, head_dim] input.
+template <typename T>
+bool brt_rotary_untransposed_case(const std::vector<int> &xshape_transposed,
+                                  bool fp16) {
+    // xshape_transposed is [B, heads, seq, head_dim] (the "logical" RE input).
+    // The untransposed physical layout is [B, seq, heads, head_dim].
+    Dev d;
+    int B = xshape_transposed[0];
+    int heads = xshape_transposed[1];
+    int seq = xshape_transposed[2];
+    int head_dim = xshape_transposed[3];
+    int half = head_dim / 2;
+
+    auto torch_x_t = torch::randn({B, heads, seq, head_dim}, brt_torch_opt<T>());
+    auto cos_half = torch::randn({B, 1, seq, half}, brt_torch_opt<T>());
+    auto sin_half = torch::randn({B, 1, seq, half}, brt_torch_opt<T>());
+    auto torch_cos = torch::cat({cos_half, cos_half}, -1);
+    auto torch_sin = torch::cat({sin_half, sin_half}, -1);
+    // Reference: RE on the transposed-layout input.
+    auto torch_out = brt_ref_rotary(torch_x_t, torch_cos, torch_sin);
+
+    // Physical input: [B, seq, heads, head_dim] (the Transpose's INPUT, which
+    // is what RE sees after the fold — RE reads it as untransposed).
+    auto torch_x_untrans = torch_x_t.transpose(1, 2).contiguous();
+    std::vector<int> xshape_untrans = {B, seq, heads, head_dim};
+    auto input = std::make_shared<Tensor<T>>(xshape_untrans);
+    brt_fill(input, torch_x_untrans);
+    brt_upload(input, d);
+    auto cos_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_cos));
+    brt_fill(cos_t, torch_cos);
+    brt_upload(cos_t, d);
+    auto sin_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_sin));
+    brt_fill(sin_t, torch_sin);
+    brt_upload(sin_t, d);
+
+    // Output shape is the TRANSPOSED layout [B, heads, seq, head_dim].
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::ROTARY_EMBEDDING, fp16,
+                          {{"input_untransposed", "1"}}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, cos_t, sin_t}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    float rtol = fp16 ? 0.02f : 0.001f;
+    float atol = fp16 ? 0.02f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+TEST(BufferRankTest, RotaryEmbeddingUntransposed) {
+    // Q-heads (16), prefill seq=5 + decode seq=1.
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 16, 5, 128}, false));
+    EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 16, 5, 128}, true));
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 16, 1, 128}, false));
+    EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 16, 1, 128}, true));
+    // K-heads (8).
+    EXPECT_TRUE(brt_rotary_untransposed_case<float>({1, 8, 3, 128}, false));
+    EXPECT_TRUE(brt_rotary_untransposed_case<uint16_t>({1, 8, 3, 128}, true));
+}
+
 // =========================================================================
 // RMSNorm — fuses the 9-op Cast->Pow->ReduceMean->Add->Sqrt->Div->Mul->Cast->
 // Mul decomposition into one dispatch. Ref: out = x * rsqrt(mean(x^2)+eps) * w

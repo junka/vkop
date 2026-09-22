@@ -20,12 +20,18 @@ namespace ops {
 // X is [B, num_heads, seq, head_dim]; output is the same shape. cos/sin are
 // pre-broadcast to [B, 1, S, head_dim] (axis-1 unsqueeze from /rotary_emb/*)
 // and index without the heads axis: cs_idx = (b*seq + s)*head_dim + d.
+// When input_untransposed is set, X is actually laid out as
+// [B, seq, num_heads, head_dim] (a Transpose(perm=[0,2,1,3]) feeding RE was
+// folded away); the shader remaps the read index. num_heads/seq are still
+// passed in the output-layout order (num_heads = shape[-3], seq = shape[-2]
+// of the UNTRANSPOSED input, which the execute() swaps before filling PC).
 struct alignas(16) RotaryPC {
-    int total;     // Y element count = B * num_heads * seq * head_dim
-    int head_dim;  // full head dim (rotary_embedding_dim)
-    int num_heads; // heads dim of X
-    int seq;       // sequence len of X
-    int _pad;
+    int total;              // Y element count = B * num_heads * seq * head_dim
+    int head_dim;           // full head dim (rotary_embedding_dim)
+    int num_heads;          // heads dim of X
+    int seq;                // sequence len of X
+    int input_untransposed; // 1 = X is [B, seq, num_heads, head_dim] (folded
+                            // Transpose)
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
@@ -52,15 +58,32 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.find("input_untransposed") != attributes.end()) {
+            input_untransposed_ =
+                std::stol(attributes.at("input_untransposed")) != 0;
+        }
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // X is [B, num_heads, seq, head_dim].
+        // X is [B, num_heads, seq, head_dim] by default. When
+        // input_untransposed_ is set, a Transpose(perm=[0,2,1,3]) feeding X
+        // was folded away, so X is actually laid out [B, seq, num_heads,
+        // head_dim] — shape[-2] is num_heads and shape[-3] is seq (swapped
+        // relative to the default). The output is still [B, num_heads, seq,
+        // head_dim]; the shader remaps the read index accordingly.
         std::vector<int> xshape = inputs[0]->getShape();
         int head_dim = xshape.back();
         int seq = xshape[xshape.size() - 2];
         int num_heads = xshape.size() >= 3 ? xshape[xshape.size() - 3] : 1;
+        if (input_untransposed_) {
+            // X is [B, seq, num_heads, head_dim]: swap the two middle axes.
+            std::swap(seq, num_heads);
+        }
         // Leading dims (batch etc.) collapse into `total - heads*seq*head_dim`.
         int total = total_elems(xshape);
 
@@ -92,7 +115,7 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         pc.head_dim = head_dim;
         pc.num_heads = num_heads;
         pc.seq = seq;
-        pc._pad = 0;
+        pc.input_untransposed = input_untransposed_ ? 1 : 0;
 
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);
@@ -107,6 +130,8 @@ class RotaryEmbeddingBuffer : public BufferFactory {
 
   private:
     int fp16_;
+    bool input_untransposed_ =
+        false; // X laid out as [B, seq, num_heads, head_dim]
 };
 
 // PIMPL façade. Buffer-only (per the runtime-op authorization); the image
