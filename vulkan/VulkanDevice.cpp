@@ -163,6 +163,24 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
                          i, p.MSize, p.NSize, p.KSize, p.AType, p.BType,
                          p.CType, p.ResultType, p.scope);
             }
+            // VKOP_COOPMAT_PROBE=1: dump supported coopmat combos to stderr
+            // (LOG_INFO is compiled out in Release). Used to pick the GEMM
+            // tile shape for the SSBO cooperative-matrix matmul shader.
+            if (std::getenv("VKOP_COOPMAT_PROBE")) {
+                fprintf(stderr, "[coopmat] %u combos, stages=0x%x\n", propCount,
+                        coopmat_properties.cooperativeMatrixSupportedStages);
+                for (uint32_t i = 0; i < propCount; i++) {
+                    const auto &p = this->coopmatProps_[i];
+                    fprintf(stderr,
+                            "[coopmat] %u: %ux%ux%u A=%d B=%d C=%d R=%d "
+                            "scope=%d\n",
+                            i, p.MSize, p.NSize, p.KSize, p.AType, p.BType,
+                            p.CType, p.ResultType, p.scope);
+                }
+                fprintf(stderr, "[coopmat] subgroupSize=%u min=%u max=%u\n",
+                        subgroup_properties.subgroupSize, minSubgroupSize_,
+                        maxSubgroupSize_);
+            }
         }
     }
 #endif

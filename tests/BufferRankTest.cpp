@@ -1102,6 +1102,53 @@ TEST(BufferRankTest, MatMulTransB) {
     EXPECT_TRUE(brt_matmul_transB_case<uint16_t>({2, 5, 12}, {2, 12, 7}, true));
 }
 
+// Non-transB MatMul: standard [B,M,K] @ [B,K,N] (B stored row-major K x N).
+// Exercises the cooperative-matrix fp16 path on shapes that mirror the LLM:
+// M=1 (single-token decode), large K (multi K-tile loop), large N (many
+// N-workgroups). transB=0.
+template <typename T>
+bool brt_matmul_case(const std::vector<int> &ashape,
+                     const std::vector<int> &bshape, bool fp16) {
+    Dev d;
+    auto torch_a = torch::randn(
+        std::vector<int64_t>(ashape.begin(), ashape.end()), brt_torch_opt<T>());
+    auto torch_b = torch::randn(
+        std::vector<int64_t>(bshape.begin(), bshape.end()), brt_torch_opt<T>());
+    auto torch_out = torch::matmul(torch_a, torch_b);
+
+    auto input_a = std::make_shared<Tensor<T>>(ashape);
+    brt_fill(input_a, torch_a);
+    brt_upload(input_a, d);
+    auto input_b = std::make_shared<Tensor<T>>(bshape);
+    brt_fill(input_b, torch_b);
+    brt_upload(input_b, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::MATMUL, fp16, {}, d);
+    if (!op)
+        return false;
+    op->onExecute({input_a, input_b}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    float rtol = fp16 ? 0.03f : 0.001f;
+    float atol = fp16 ? 0.05f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+TEST(BufferRankTest, MatMulCoop) {
+    // small, single K-tile (K=16), M = BM = 16 exactly.
+    EXPECT_TRUE(brt_matmul_case<float>({1, 16, 16}, {1, 16, 32}, false));
+    EXPECT_TRUE(brt_matmul_case<uint16_t>({1, 16, 16}, {1, 16, 32}, true));
+    // M=1 (LLM decode shape), multi K-tile (K=64 = 4 tiles).
+    EXPECT_TRUE(brt_matmul_case<uint16_t>({1, 1, 64}, {1, 64, 32}, true));
+    // M=9 (prefill shape), non-tile-multiple M.
+    EXPECT_TRUE(brt_matmul_case<uint16_t>({1, 9, 64}, {1, 64, 48}, true));
+    // Large N spanning many N-workgroups, M=1, big K (like q_proj).
+    EXPECT_TRUE(brt_matmul_case<uint16_t>({1, 1, 128}, {1, 128, 256}, true));
+    // N not a multiple of BN=32 (tests odd-N pack path).
+    EXPECT_TRUE(brt_matmul_case<uint16_t>({1, 8, 16}, {1, 16, 17}, true));
+}
+
 // =========================================================================
 // FusedElemwise — register-machine chain in ONE dispatch.
 // Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.

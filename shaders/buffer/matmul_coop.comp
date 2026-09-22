@@ -1,0 +1,201 @@
+#version 450 core
+
+// SSBO cooperative-matrix MatMul (fp16 A/B, fp32 accumulate -> scratch).
+// Replaces the naive 1-thread-per-output reduce (matmul.comp) for the fp16
+// LLM path. Intel ARL supports exactly one fp16 coopmat combo:
+//   coopmat<float16_t, gl_ScopeSubgroup, 8, 16, A>
+//   coopmat<float16_t, gl_ScopeSubgroup, 16, 8, B>
+//   coopmat<float,       gl_ScopeSubgroup, 8,  8, Acc>   (fp16 in -> fp32 acc)
+// subgroupSize=32. One MMA does C[8x8] += A[8x16]*B[16x8].
+//
+// Workgroup = 16x16 = 256 threads = 8 subgroups. Subgroup grid 2(M) x 4(N)
+// => workgroup output footprint BM=16, BN=32. Each K-tile's shared A/B feeds
+// 8 MMAs (2 M-subgroups x 4 N-subgroups), amortizing the SSBO loads.
+//
+// A is [batch, M, K] (row-major; M=rows). B is [batch, K, N] (row-major) OR
+// [batch, N, K] when transB=1 (the transB fusion folds a Transpose(last-2-swap)
+// into the matmul; B is read transposed inline). Output C is [batch, M, N].
+//
+// fp16 is stored packed as half2 in uint words (2 elements / uint). This
+// shader accumulates in fp32 (coopmat accumulator) and writes the fp32 result
+// to the SCRATCH buffer (binding 3) at FLAT output-element indices. A separate
+// pack pass (buffer_matmul_pack.comp) then packs adjacent flat element pairs
+// into half2 words. The pack must be a separate flat pass because when N is
+// odd, a single output word straddles two rows (element 2w+1 of word w is the
+// next row's col 0); in-shader (col, col+1) packing would zero-fill the
+// straddling half and clobber the next row's first element.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InB {
+    uint data[];
+} uInputB;
+// binding 3 (Scratch) receives the flat fp32 accumulator output; the pack
+// pass (buffer_matmul_pack.comp) reads it and writes packed fp16 to binding 0.
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+// bindings 4 and 5 are UNUSED by the cooperative-matrix kernel. They exist
+// only so this pipeline's descriptor-set layout matches the quantized-weight
+// MatMul layouts (which bind a per-group scale table at 4 and an NVFP4 global
+// factor at 5). The op fills every descriptor set — coopmat included — from
+// the same objs_ vector (6 slots: out, A, B, scratch, scale/dummy, factor/dummy),
+// so the layout must declare all 6 bindings even though only 0-3 are read.
+layout(set = 0, binding = 4) readonly buffer ScaleTab {
+    uint data[];
+} uScaleTab;
+layout(set = 0, binding = 5) readonly buffer GlobalFac {
+    uint data[];
+} uGlobalFac;
+
+layout(push_constant) uniform PC {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int fp32;   // unused here (this shader is fp16-in only); kept for PC compat
+    int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
+} uPC;
+
+const int M_BLOCK = 8;
+const int N_BLOCK = 8;
+const int K_BLOCK = 16;
+
+const int BM = 16; // = 2 * M_BLOCK  (workgroup M footprint)
+const int BN = 32; // = 4 * N_BLOCK  (workgroup N footprint)
+
+// Load a fp16 element from a packed-half2 uint SSBO.
+float16_t loadA(int elem) {
+    return float16_t(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
+}
+float16_t loadB(int elem) {
+    return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
+}
+
+// Shared tiles laid out as float16_t, row-major.
+shared float16_t shA[BM * K_BLOCK]; // [16 x 16]
+shared float16_t shB[K_BLOCK * BN]; // [16 x 32]
+// Each subgroup stores its 8x8 fp32 result tile here before packing to fp16.
+// [sg][64] — one private 64-fp32 region per subgroup (no races).
+shared float shC[8][M_BLOCK * N_BLOCK];
+
+void main() {
+    int  b    = int(gl_WorkGroupID.z);     // batch index
+    int  m0   = int(gl_WorkGroupID.y) * BM;
+    int  n0   = int(gl_WorkGroupID.x) * BN;
+    uint sg   = gl_SubgroupID;             // 0..7
+    uint lane = gl_SubgroupInvocationID;   // 0..31
+    uint tid  = gl_LocalInvocationIndex;   // 0..255
+    int  sgx  = int(sg % 4);               // subgroup col (N) in 2x4 grid
+    int  sgy  = int(sg / 4);               // subgroup row (M) in 2x4 grid
+
+    int M = uPC.M;
+    int N = uPC.N;
+    int K = uPC.K;
+
+    int a_base = b * M * K; // A[batch, :, :]
+    int b_base = b * K * N; // B[batch, :, :] (row-major K x N)
+
+    coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+             gl_MatrixUseAccumulator>
+        matC;
+    matC = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                   gl_MatrixUseAccumulator>(0.0);
+
+    int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
+
+    for (int t = 0; t < k_tiles; t++) {
+        int k_base = t * K_BLOCK;
+
+        // 256 threads load A[BM x K_BLOCK] = 256 fp16 => 1/thread.
+        {
+            int row = int(tid) / K_BLOCK;
+            int col = int(tid) % K_BLOCK;
+            int h = m0 + row;
+            int kk = k_base + col;
+            float16_t v = (h < M && kk < K) ? loadA(a_base + h * K + kk)
+                                            : float16_t(0.0);
+            shA[int(tid)] = v;
+        }
+        // 256 threads load B[K_BLOCK x BN] = 512 fp16 => 2/thread.
+        for (int e = 0; e < 2; e++) {
+            int idx = int(tid) * 2 + e;          // 0..511
+            int row = idx / BN;                   // K dim
+            int col = idx % BN;                   // N dim
+            int kk = k_base + row;
+            int w = n0 + col;
+            float16_t v;
+            if (kk < K && w < N) {
+                if (uPC.transB != 0) {
+                    // B is [batch, N, K]: element (b, w, kk) at b_base + w*K + kk
+                    v = loadB(b_base + w * K + kk);
+                } else {
+                    // B is [batch, K, N]: element (b, kk, w) at b_base + kk*N + w
+                    v = loadB(b_base + kk * N + w);
+                }
+            } else {
+                v = float16_t(0.0);
+            }
+            shB[idx] = v;
+        }
+
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
+            matA;
+        coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
+            matB;
+        // Each subgroup loads its 8x16 / 16x8 slice from shared tiles.
+        coopMatLoad(matA, shA, sgy * M_BLOCK * K_BLOCK, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shB, sgx * N_BLOCK, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+
+        matC = coopMatMulAdd(matA, matB, matC);
+
+        barrier();
+    }
+
+    // Store matC (8x8 fp32) to the scratch buffer as FLAT fp32 values, indexed
+    // by the global output element index (c_base + hg*N + wg). A subsequent
+    // pack pass (buffer_matmul_pack.comp) reinterprets these flat fp32 values
+    // and packs adjacent element pairs into half2 words — which is correct for
+    // odd N, where a single output word can straddle two rows (element 2w+1 of
+    // word w may belong to the next row's col 0). In-shader packing would
+    // zero-fill the straddling half and clobber the next row's first element;
+    // the flat scratch + dedicated word-per-thread pack avoids that race and
+    // the cross-subgroup read it would otherwise require.
+    // Each subgroup owns a private 64-fp32 region of shC (no races).
+    coopMatStore(matC, shC[sg], 0, N_BLOCK,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // 32 threads scatter 64 fp32 results to the flat scratch SSBO.
+    // Global element index: C[batch, m0+sgy*8+row, n0+sgx*8+col].
+    int c_base = b * M * N;
+    for (int e = 0; e < 2; e++) {
+        int idx = int(lane) * 2 + e;          // 0..63
+        int row = idx / N_BLOCK;              // 0..7 (within 8x8 tile)
+        int col = idx % N_BLOCK;
+        int hg = m0 + sgy * M_BLOCK + row;
+        int wg = n0 + sgx * N_BLOCK + col;
+        if (hg < M && wg < N) {
+            float v = shC[sg][idx];
+            int out_elem = c_base + hg * N + wg;
+            uScratch.data[out_elem] = floatBitsToUint(v);
+        }
+    }
+}

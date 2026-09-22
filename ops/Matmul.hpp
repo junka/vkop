@@ -21,6 +21,8 @@ extern unsigned char buffer_matmul_fp16_spv[];
 extern unsigned int buffer_matmul_fp16_spv_len;
 extern unsigned char buffer_matmul_pack_spv[];
 extern unsigned int buffer_matmul_pack_spv_len;
+extern unsigned char buffer_matmul_coop_spv[];
+extern unsigned int buffer_matmul_coop_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -198,7 +200,40 @@ class MatMulBuffer : public BufferFactory {
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         BufferFactory::set_runtime_device(dev, cmdpool);
+        if (fp16_ != 0 && !coop_pipeline_) {
+            // fp16 cooperative-matrix kernel: a single dispatch reads fp16 A/B
+            // from SSBO, accumulates in fp32 via the 8x8x16 subgroup MMA
+            // (coopMatMulAdd), and writes FLAT fp32 results to the scratch
+            // buffer (binding 3). A separate pack pass (pack_pipeline_ below)
+            // then repacks adjacent flat element pairs into packed half2 words
+            // — kept as a distinct flat pass because when N is odd one output
+            // word straddles two rows (element 2w+1 of word w is the next row's
+            // col 0), and in-shader (col, col+1) packing would zero-fill the
+            // straddling half and clobber the next row's first element. Intel
+            // ARL exposes the required fp16 coopmat combo (8x8x16, fp16 A/B ->
+            // fp32 acc, subgroup scope, sg size 32). The pipeline's descriptor
+            // set declares 6 bindings to match the quantized-weight layouts:
+            // only 0-3 are read, 4-5 are bound-but-unused (filled from the same
+            // objs_ vector as every other MatMul pipeline).
+            bool use_uab = update_after_bind_ &&
+                           dev->is_support_descriptor_update_after_bind();
+            coop_pipeline_ = std::make_unique<VulkanPipeline>(
+                dev->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam),
+                reinterpret_cast<const uint32_t *>(buffer_matmul_coop_spv),
+                static_cast<int>(buffer_matmul_coop_spv_len), use_uab, 0);
+            for (auto &ds : coop_ds_) {
+                ds = coop_pipeline_->allocDescriptorSets();
+            }
+        }
         if (fp16_ != 0 && !pack_pipeline_) {
+            // Pack pass: reads flat fp32 from scratch, packs half2 to output.
+            // Separate pipeline to avoid Intel ANV push-constant interference
+            // between the coopmat dispatch and the pack dispatch.
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
             // Same binding count as the reduce pipeline: the pack set is filled
@@ -513,6 +548,19 @@ class MatMulBuffer : public BufferFactory {
         // cost a second dispatch per GEMM (~170 per decode token) and an fp32
         // scratch round trip for no benefit.
         const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        // Cooperative-matrix GEMM (Intel ARL fp16 8x8x16 subgroup MMA). A
+        // device-specific fast path: when the GPU exposes
+        // KHR_cooperative_matrix with the fp16->fp32 combo, a single
+        // coopMatMulAdd dispatch replaces the scalar reduce. It writes flat
+        // fp32 to the scratch buffer (odd-N safe: a word can straddle two
+        // rows), then the existing pack pass repacks half2 — so it also needs
+        // the scratch below. Only for plain fp16 A/B (a quantized weight has
+        // its own dequant kernels) and only when the device supports it;
+        // everything else falls through to the tiled / ksplit / fused / reduce
+        // path below.
+        const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
+                             m_dev_->is_support_cooperate_matrix() &&
+                             coop_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on
         // grid.y and use 16 of their workgroup's 256 lanes per row, so at
         // decode time (one A row) 15/16 of every workgroup idles and the
@@ -553,7 +601,11 @@ class MatMulBuffer : public BufferFactory {
         const bool tiled = fused_fp16 && !weight_4bit && (k % 16 == 0) &&
                            (m >= 12) &&
                            (!weight_byte || (!transB_ && (n % 4 == 0)));
-        if (fp16_ != 0 && !fused_fp16) {
+        // The odd-N reduce->pack fallback needs scratch; the cooperative-matrix
+        // path also needs it (it writes flat fp32 results that the pack pass
+        // repacks to half2, regardless of N parity). Even-N fused/reduce paths
+        // pack in-shader and bind the dummy for the 4th slot.
+        if (fp16_ != 0 && (!fused_fp16 || coopmat)) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
             // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
@@ -616,6 +668,41 @@ class MatMulBuffer : public BufferFactory {
         para_.nf4 = weight_nf4 ? 1 : 0;
         para_.nvfp4 = weight_nvfp4 ? 1 : 0;
         para_.group = weight_4bit ? group_size : 0;
+
+        // Cooperative-matrix fp16 path (Intel ARL subgroup MMA): ONE dispatch
+        // reads fp16 A/B, accumulates in fp32 via coopMatMulAdd, and writes
+        // flat fp32 to the scratch buffer. Workgroup footprint is BM=16 (M) x
+        // BN=32 (N); batch is the z dispatch dim (shader reads gl_WorkGroupID.z
+        // as the batch index). The accumulator replaces the naive per-element
+        // MAC loop; the scratch+pack structure is preserved for odd-N safety.
+        // This is the highest-priority fp16 path — it pre-empts
+        // tiled/ksplit/fused/reduce, which remain the fallback for quantized or
+        // non-coopmat hardware.
+        if (coopmat) {
+            fillDescriptorWrites(coop_ds_[m_id_]);
+            coop_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*coop_pipeline_, coop_ds_[m_id_]);
+            m_cmd_->push_constants(*coop_pipeline_,
+                                   sizeof(matmul::GpuMatMulParam), &para_);
+            m_cmd_->dispatch(UP_DIV(n, 32), UP_DIV(m, 16), batch);
+
+            // Barrier: flush coopmat's scratch writes for pack's reads.
+            scratch_->shaderWriteBarrier(m_cmd_->get());
+
+            // Pack pass: separate pipeline (no PC interference). One thread per
+            // output word; reads flat fp32 from scratch, packs half2 to output.
+            int nwords = (total + 1) / 2;
+            MatMulPackPC pack_pc{};
+            pack_pc.total = total;
+            fillDescriptorWrites(pack_ds_[m_id_]);
+            pack_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                   &pack_pc);
+            m_cmd_->dispatch(UP_DIV(nwords, 256), 1, 1);
+            return;
+        }
+
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the
@@ -638,41 +725,28 @@ class MatMulBuffer : public BufferFactory {
             return;
         }
         // Reduce pass: one thread per output element. Uses the main pipeline.
+        // For fp16 inputs without coopmat this is the fp16-in reduce shader;
+        // for fp32 inputs this is the naive fp32 reduce (batch*m collapsed into
+        // y).
         submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
-
-        if (fp16_ != 0) {
-            // Barrier: flush reduce's scratch writes for pack's reads.
-            scratch_->shaderWriteBarrier(m_cmd_->get());
-
-            // Pack pass: separate pipeline (no PC interference).
-            int nwords = (total + 1) / 2;
-            MatMulPackPC pack_pc{};
-            pack_pc.total = total;
-
-            // Fill the pack descriptor set with the same objs_.
-            fillPackDescriptorSet(pack_ds_[m_id_]);
-            pack_pipeline_->updateDescriptorSets(pack_writes_);
-            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
-            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
-                                   &pack_pc);
-            m_cmd_->dispatch(UP_DIV(nwords, 256), 1, 1);
-        }
     }
 
-    void fillPackDescriptorSet(VkDescriptorSet ds) {
-        pack_writes_.resize(objs_.size());
+    // Fill descriptor-set writes from the current objs_ vector (one SSBO per
+    // binding). Used by the fp16 cooperative-matrix dispatch path, which binds
+    // its own pipeline (coop_pipeline_) instead of the base Operator::submit().
+    void fillDescriptorWrites(VkDescriptorSet ds) {
+        ds_writes_.resize(objs_.size());
         for (size_t i = 0; i < objs_.size(); ++i) {
-            pack_writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-            pack_writes_[i].dstSet = ds;
-            pack_writes_[i].dstBinding = static_cast<uint32_t>(i);
-            pack_writes_[i].dstArrayElement = 0;
-            pack_writes_[i].descriptorCount = 1;
-            pack_writes_[i].descriptorType = DESCRIPTOR_TYPE_STORAGE;
+            ds_writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            ds_writes_[i].dstSet = ds;
+            ds_writes_[i].dstBinding = static_cast<uint32_t>(i);
+            ds_writes_[i].dstArrayElement = 0;
+            ds_writes_[i].descriptorCount = 1;
+            ds_writes_[i].descriptorType = DESCRIPTOR_TYPE_STORAGE;
             switch (objs_[i]->getResourceType()) {
             case ResourceType::VK_BUFFER:
-                pack_writes_[i].pBufferInfo =
-                    std::get<VkDescriptorBufferInfo *>(
-                        objs_[i]->getDescriptorInfo());
+                ds_writes_[i].pBufferInfo = std::get<VkDescriptorBufferInfo *>(
+                    objs_[i]->getDescriptorInfo());
                 break;
             default:
                 break;
@@ -683,9 +757,15 @@ class MatMulBuffer : public BufferFactory {
     matmul::GpuMatMulParam para_;
     std::shared_ptr<VulkanBuffer> scratch_;
     size_t scratch_bytes_ = 0;
+    // coop_pipeline_ runs the fp16 cooperative-matrix kernel (fp16-in, fp32
+    // accumulate -> flat scratch). pack_pipeline_ runs the half2 pack pass.
+    // ds_writes_/fillDescriptorWrites fill either pipeline's descriptor set
+    // from the same objs_ vector.
+    std::unique_ptr<VulkanPipeline> coop_pipeline_;
+    VkDescriptorSet coop_ds_[vkop::kInflight] = {nullptr};
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
-    std::vector<VkWriteDescriptorSet> pack_writes_;
+    std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
 };
 
