@@ -649,4 +649,17 @@ std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messa
     return out;
 }
 
+std::string Tokenizer::chat_role_shell(const std::string& role) const {
+    auto it = chat_template_.roles.find(role);
+    if (it == chat_template_.roles.end()) return "";
+    return it->second.prefix + it->second.suffix;
+}
+
+int32_t Tokenizer::special_token_id(const std::string& literal) const {
+    for (const auto& st : special_tokens_) {
+        if (st.content == literal) return static_cast<int32_t>(st.id);
+    }
+    return -1;
+}
+
 } // namespace qwen
