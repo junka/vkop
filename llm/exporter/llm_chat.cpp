@@ -459,6 +459,10 @@ int main(int argc, char** argv) {
         }
     }
     const bool multimodal = !image_paths.empty() && !visual_path.empty();
+    if (!image_paths.empty() && visual_path.empty()) {
+        std::fprintf(stderr,
+            "[warn] --image 提供了但没有 --visual —— 没有视觉编码器，图片被忽略\n");
+    }
 
     Logger::getInstance().setLevel(LOG_INFO);
     const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();

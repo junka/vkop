@@ -1188,6 +1188,23 @@ template <typename T> class Tensor : public ITensor {
             offset = view->getOffset();
         }
 
+        // Cross-queue ordering for a mid-graph readback. Runtime::Run() spreads
+        // each level over vkop::kInflight lanes (one VkQueue per lane) and
+        // orders them with timeline-semaphore waits that only exist BETWEEN op
+        // command buffers. This copy buffer is a fresh command buffer with no
+        // waits, submitted on queue0 — so when the producer of this tensor was
+        // submitted on another lane, the copy can run before that producer's
+        // dispatch finished. The host then reads whatever the recycled SSBO
+        // held: for the LLM's int64 shape-meta chain (NonZero/Where ->
+        // Reshape/Expand/Slice readbacks) that means garbage dims, showing up
+        // as a huge/negative buffer allocation, a broadcast-shape mismatch or
+        // std::length_error, ~40% of runs on a multi-queue device. Draining
+        // first restores the ordering that a single-queue device gets for free
+        // from per-queue FIFO. Costs nothing beyond the wait the copy already
+        // needed: at readback time the only outstanding work is earlier levels.
+        if (dev->getNumComputeQueues() > 1) {
+            dev->wait_all_done();
+        }
         cmd.begin();
         buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset,
                                         copy_bytes, offset);
@@ -1222,6 +1239,11 @@ template <typename T> class Tensor : public ITensor {
     void copyImageToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
         auto img = std::dynamic_pointer_cast<VulkanImage>(vkobj_);
         auto dev = cmdpool->getVulkanDevice();
+        // Same cross-queue readback ordering as copyBufferToCPU (and the
+        // host-image-copy path below has no queue submit at all to order it).
+        if (dev->getNumComputeQueues() > 1) {
+            dev->wait_all_done();
+        }
 
 #ifdef VK_EXT_host_image_copy
         if (dev->is_support_host_image_copy()) {
