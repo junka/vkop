@@ -7,6 +7,23 @@
 
 namespace vkop {
 
+#ifdef VK_EXT_host_image_copy
+// VK_EXT_host_image_copy was promoted to Vulkan 1.4 core (unsuffixed entry
+// points).  When a device enables hostImageCopy through
+// VkPhysicalDeviceVulkan14Features without naming the EXT extension, the
+// loader only fills the dispatch for the core names; calling the EXT-suffixed
+// function then jumps to a NULL pointer (e.g. MoltenVK).  Resolve the core
+// name first and fall back to the EXT name for older drivers.
+static void *get_host_image_copy_proc(const char *core_name,
+                                      const char *ext_name) {
+    auto instance = VulkanInstance::getVulkanInstance().getInstance();
+    auto proc = vkGetInstanceProcAddr(instance, core_name);
+    if (!proc)
+        proc = vkGetInstanceProcAddr(instance, ext_name);
+    return reinterpret_cast<void *>(proc);
+}
+#endif
+
 VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
                          uint32_t layers, VkImageUsageFlags usage,
                          VkFormat format,
@@ -569,9 +586,9 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     transinfo.image = img;
     transinfo.subresourceRange = subrange;
     auto vkTransitionImageLayoutEXT =
-        reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(vkGetInstanceProcAddr(
-            VulkanInstance::getVulkanInstance().getInstance(),
-            "vkTransitionImageLayoutEXT"));
+        reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+            get_host_image_copy_proc("vkTransitionImageLayout",
+                                     "vkTransitionImageLayoutEXT"));
     if (vkTransitionImageLayoutEXT) {
         ret = vkTransitionImageLayoutEXT(m_vdev_->getLogicalDevice(), 1,
                                          &transinfo);
@@ -602,9 +619,9 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     copyinfo.dstImageLayout = m_layout_;
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
-    auto vkCopyMemoryToImageEXT = reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(
-        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
-                              "vkCopyMemoryToImageEXT"));
+    auto vkCopyMemoryToImageEXT =
+        reinterpret_cast<PFN_vkCopyMemoryToImageEXT>(get_host_image_copy_proc(
+            "vkCopyMemoryToImage", "vkCopyMemoryToImageEXT"));
     if (vkCopyMemoryToImageEXT) {
         auto ret =
             vkCopyMemoryToImageEXT(m_vdev_->getLogicalDevice(), &copyinfo);
@@ -635,9 +652,9 @@ void VulkanImage::hostImageCopyToHost(void *ptr) {
     copyinfo.srcImageLayout = m_layout_;
     copyinfo.regionCount = 1;
     copyinfo.pRegions = &region;
-    auto vkCopyImageToMemoryEXT = reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(
-        vkGetInstanceProcAddr(VulkanInstance::getVulkanInstance().getInstance(),
-                              "vkCopyImageToMemoryEXT"));
+    auto vkCopyImageToMemoryEXT =
+        reinterpret_cast<PFN_vkCopyImageToMemoryEXT>(get_host_image_copy_proc(
+            "vkCopyImageToMemory", "vkCopyImageToMemoryEXT"));
     if (vkCopyImageToMemoryEXT) {
         auto ret =
             vkCopyImageToMemoryEXT(m_vdev_->getLogicalDevice(), &copyinfo);

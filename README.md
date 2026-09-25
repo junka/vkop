@@ -46,6 +46,41 @@ cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DE
 cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 ```
 
+##### macOS (Apple Silicon) 构建
+
+必须使用 Homebrew LLVM 的 clang++（`/opt/homebrew/opt/llvm/bin/clang++`）：
+
+- Apple clang 17 编译 `core/function.cpp` / `core/runtime.cpp` 时前端在
+  `TransformCXXFoldExpr` 处无限递归段错误，不可用；
+- GCC + Apple libc++ 桥接 ABI 不兼容（std::string/流运行时输出乱码），不可用。
+
+安装依赖并配置：
+```bash
+brew install cmake shaderc vulkan-loader vulkan-headers molten-vk \
+  glfw utf8proc pkgconf googletest libomp
+cmake .. -DENABLE_TESTS=ON \
+  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+  -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
+  -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/llvm" \
+  -DPython3_EXECUTABLE=$(which python3)
+```
+
+运行时 `VulkanLib.cpp` 通过 dlopen 加载 Vulkan loader，必须设置环境变量：
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+```
+
+代码中已处理的 clang/macOS 兼容性点：
+- `core/Tensor.hpp` fp16 内联汇编的 `h0`/`s0` 寄存器别名是 GCC 专有扩展，
+  已通过 `!defined(__clang__)` 守卫，clang 走可移植路径；
+- macOS 上 `size_t`（unsigned long）≠ `uint64_t`（unsigned long long），
+  `Tensor` 标量构造函数需显式接受 `std::size_t`，否则
+  `Tensor<int64_t>(v.size())` 会误配到 `Tensor(bool)` 构造出空张量；
+- `VK_EXT_host_image_copy` 在 Vulkan 1.4 晋升为核心功能后，MoltenVK 的
+  loader 对 EXT 后缀入口点 dispatch 为 NULL，
+  `vulkan/VulkanImage.cpp` 已改为优先解析无后缀核心名。
+
 #### 4. 模型转换
 ```bash
 python3 -m onnx2vkop.cli -i resnet18-v2-7.onnx
@@ -125,6 +160,46 @@ If you are cross-compiling, set up the cross-compilation environment variables, 
 ```
 cmake .. -DCMAKE_TOOLCHAIN_FILE=../toolchain.cmake -DENABLE_TESTS=OFF
 ```
+
+##### macOS (Apple Silicon) build
+
+Homebrew LLVM clang++ (`/opt/homebrew/opt/llvm/bin/clang++`) is required:
+
+- Apple clang 17 segfaults in its frontend (infinite recursion in
+  `TransformCXXFoldExpr`) when compiling `core/function.cpp` /
+  `core/runtime.cpp`;
+- GCC + Apple libc++ has a broken ABI (garbled std::string/stream output at
+  runtime).
+
+Install dependencies and configure:
+```bash
+brew install cmake shaderc vulkan-loader vulkan-headers molten-vk \
+  glfw utf8proc pkgconf googletest libomp
+cmake .. -DENABLE_TESTS=ON \
+  -DCMAKE_CXX_COMPILER=/opt/homebrew/opt/llvm/bin/clang++ \
+  -DCMAKE_C_COMPILER=/opt/homebrew/opt/llvm/bin/clang \
+  -DCMAKE_PREFIX_PATH="/opt/homebrew;/opt/homebrew/opt/llvm" \
+  -DPython3_EXECUTABLE=$(which python3)
+```
+
+`VulkanLib.cpp` loads the Vulkan loader via dlopen at runtime, so these
+environment variables must be set:
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib
+export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
+```
+
+macOS/clang compatibility points already handled in the code:
+- The `h0`/`s0` register aliases in the fp16 inline asm of
+  `core/Tensor.hpp` are GCC-only extensions, guarded by
+  `!defined(__clang__)`; clang takes the portable path;
+- On macOS `size_t` (unsigned long) is NOT `uint64_t` (unsigned long long),
+  so the `Tensor` scalar ctor must explicitly accept `std::size_t`, otherwise
+  `Tensor<int64_t>(v.size())` silently resolves to `Tensor(bool)` and yields
+  an empty tensor;
+- Once `VK_EXT_host_image_copy` was promoted to Vulkan 1.4 core, the MoltenVK
+  loader leaves the EXT-suffixed entry points with a NULL dispatch;
+  `vulkan/VulkanImage.cpp` resolves the unsuffixed core names first.
 
 #### 4. Model Conversion
 ```bash

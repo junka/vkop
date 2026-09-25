@@ -2,6 +2,7 @@
 #include "function.hpp"
 #include "core/runtime.hpp"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <fstream>

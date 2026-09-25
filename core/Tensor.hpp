@@ -174,7 +174,9 @@ class ITensor {
     }
 
     static float fp16_to_fp32(uint16_t h) {
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(__clang__)
+        // The h0/s0 register aliases below are GCC-only; clang (e.g. Apple
+        // clang on arm64) rejects them and falls back to the portable path.
         float f;
         __asm__ volatile("uxth   %w[h], %w[h]     \n\t"
                          "fmov   h0, %w[h]        \n\t"
@@ -222,7 +224,7 @@ class ITensor {
 #endif
     }
     static uint16_t fp32_to_fp16(float f) {
-#if defined(__ARM_NEON) || defined(__aarch64__)
+#if (defined(__ARM_NEON) || defined(__aarch64__)) && !defined(__clang__)
         uint16_t r;
         __asm__ volatile(
             "fcvt h0, s0\n\t"  // FP32 (s0) -> FP16 (h0)
@@ -308,15 +310,21 @@ template <typename T> class Tensor : public ITensor {
         }
     }
 
-    template <typename U, typename = typename std::enable_if<
-                              std::is_same<U, int>::value ||
-                              std::is_same<U, uint32_t>::value ||
-                              std::is_same<U, int64_t>::value ||
-                              std::is_same<U, uint64_t>::value ||
-                              std::is_same<U, int16_t>::value ||
-                              std::is_same<U, uint16_t>::value ||
-                              std::is_same<U, int8_t>::value ||
-                              std::is_same<U, uint8_t>::value>::type>
+    template <
+        typename U,
+        typename = typename std::enable_if<
+            std::is_same<U, int>::value || std::is_same<U, uint32_t>::value ||
+            std::is_same<U, int64_t>::value ||
+            std::is_same<U, uint64_t>::value ||
+            std::is_same<U, int16_t>::value ||
+            std::is_same<U, uint16_t>::value ||
+            std::is_same<U, int8_t>::value || std::is_same<U, uint8_t>::value ||
+            // On macOS size_t (unsigned long) is NOT uint64_t
+            // (unsigned long long), so without this a call
+            // like Tensor<int64_t>(v.size()) falls through to
+            // the Tensor(bool) ctor and yields an empty
+            // tensor.
+            std::is_same<U, std::size_t>::value>::type>
     explicit Tensor(U n) {
         memset(dims_, 0, sizeof(dims_));
         n_dims_ = 1;
