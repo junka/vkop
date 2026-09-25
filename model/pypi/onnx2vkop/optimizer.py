@@ -252,7 +252,14 @@ class ConstantFolder:
             for node in list(model.graph.node):
                 if node.op_type not in ConstantFolder._FOLDABLE_OPS:
                     continue
-                if not node.output or node.output[0] in const:
+                if not node.output:
+                    continue
+                # Constant 例外：_collect_constants 已把它的值收进 const 字典供
+                # 下游折叠使用，但节点本身仍要走一遍流程——物化成 initializer 并
+                # 删除。否则常量永远停留在 Constant 形态，DAG 阶段的按名查表
+                # （如 ReduceSum 从 inputs[1] 取 axes initializer）全部落空，
+                # 把 axes 静默当成空值处理。
+                if node.op_type != "Constant" and node.output[0] in const:
                     continue
                 # 判定输入是否全部「已知常量」。
                 # Shape 特殊：输入本身不必是常量，只要形状在 value_info 全已知即可。
@@ -326,8 +333,14 @@ class ONNXOptimizer:
             "fuse_consecutive_transposes",
             "fuse_add_bias_into_conv",
             "fuse_bn_into_conv",
-            # 形状/常量相关 pass（onnxoptimizer 原生，先尽力折叠 Shape/Gather/Slice-after-Shape）：
-            "extract_constant_to_initializer",
+            # 形状/常量相关 pass（onnxoptimizer 原生，先尽力折叠 Shape/Gather/Slice-after-Shape）。
+            # 注意：不要加 extract_constant_to_initializer——它把 Constant 节点的
+            # value 属性搬成 initializer，而 fold() 会为绕开 proto 2GB 上限原地剥掉
+            # 所有 initializer 的 raw_data；这些搬运来的字节不在调用方的 raw_map
+            # （按原始 initializer 建）里，折叠后无法还原，最终在 save_to_binary
+            # 的 to_array 处报 "cannot reshape array of size 0"。Constant 节点由
+            # ConstantFolder 直接折进 const 字典，活着的常量在 DAG 落盘前由
+            # prune_and_materialize 物化（读属性原始字节，无损）。
             "eliminate_shape_gather",
             "eliminate_slice_after_shape",
             "eliminate_shape_op",

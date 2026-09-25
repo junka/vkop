@@ -33,6 +33,11 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
+from transformers.vision_utils import (
+    get_vision_cu_seqlens,
+    get_vision_interpolation_indices_and_weights,
+    get_vision_position_ids,
+)
 
 MODEL_PATH = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 IMAGE_TOKEN_ID = 151655  # <|image_pad|>
@@ -88,14 +93,41 @@ def scatter_add_visual(hidden, embed, mask):
 # ---------------------------------------------------------------------------
 class VisualExport(nn.Module):
     """直接调 HF visual forward，返回 (pooler_output, *deepstack_features)。
-    HF 视觉 forward 无 create_causal_mask，不触 torch.diff，可安全 trace。"""
 
-    def __init__(self, visual):
+    HF 视觉 forward 里的三个 grid 预计算（pos_embed 插值索引/权重、rotary
+    position_ids、attention 的 cu_seqlens）用了 `torch.repeat_interleave(x, tensor)`
+    和 cumsum，legacy 导出器会把它 emit 成 ONNX 控制流（Loop / SequenceEmpty /
+    SequenceAt / SequenceInsert / SplitToSequence / ConcatFromSequence / CumSum），
+    而 vkop runtime 没有这些算子（且对未知 op 是静默 pass-through）。这三个 helper
+    都支持从 kwargs 里取预算好的值——官方给 trace/export 用的逃生口——所以在 trace
+    前用 eager 把它们算成常量张量传进去，图上就只剩静态数据流。
+    代价：这些常量与 grid_thw 一起被固化，换导出尺寸必须重跑本脚本（本来如此，
+    见下面 EXPORT_IMG_SIZE 的说明）。
+    """
+
+    def __init__(self, visual, grid_thw):
         super().__init__()
         self.visual = visual
+        cfg = visual.config
+        interp_indices, interp_weights = get_vision_interpolation_indices_and_weights(
+            grid_thw,
+            num_grid_per_side=int(cfg.num_position_embeddings ** 0.5),
+            mode=visual.interpolation_mode,
+            align_corners=visual.interpolation_align_corners,
+            spatial_merge_size=cfg.spatial_merge_size,
+        )
+        self.grid_consts = {
+            "interp_indices": interp_indices,
+            "interp_weights": interp_weights,
+            "position_ids": get_vision_position_ids(grid_thw, cfg.spatial_merge_size),
+            "cu_seqlens": get_vision_cu_seqlens(grid_thw),
+        }
+        print("[visual] precomputed grid consts: " + " ".join(
+            f"{k}{tuple(v.shape)}" for k, v in self.grid_consts.items()))
 
     def forward(self, pixel_values, grid_thw):
-        out = self.visual(pixel_values, grid_thw)
+        # visual.forward 会 pop 这些 kwargs，每次调用传一份浅拷贝。
+        out = self.visual(pixel_values, grid_thw, **dict(self.grid_consts))
         # out.pooler_output: (n_patches, out_hidden)
         # out.deepstack_features: list[3] of (n_patches, out_hidden)
         deepstack = out.deepstack_features
@@ -106,14 +138,17 @@ patch_size = visual.patch_embed.patch_size
 temporal_patch_size = visual.patch_embed.temporal_patch_size
 in_chans = visual.patch_embed.in_channels
 row = in_chans * temporal_patch_size * patch_size * patch_size
-# 导出尺寸从命令行 / 环境变量读，默认 224×224。注意：HF 视觉的 fast_pos_embed_interpolate
-# 用 grid_thw.tolist() 把 grid_thw 折成常量，故 visual.onnx 的 grid_thw 是「导出时固化」的
-# （非动态输入）。要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx。不同尺寸不能共用一个图。
+# 导出尺寸从环境变量 EXPORT_IMG_SIZE 读，默认 224×224。注意：visual.onnx 的整张图
+# 都是「导出时固化」的——grid_thw 及其派生量（pos_embed 插值索引/权重、rotary
+# position_ids、cu_seqlens）全部折成常量，输入输出也不标 dynamic_axes。
+# 要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx，不同尺寸不能共用一个图。
 EXPORT_IMG_SIZE = int(os.environ.get("EXPORT_IMG_SIZE", "224"))
 height = width = EXPORT_IMG_SIZE
 assert height % patch_size == 0 and width % patch_size == 0, \
     f"导出尺寸 {height}×{width} 必须是 patch_size={patch_size} 的整数倍"
 grid_t, grid_h, grid_w = 1, height // patch_size, width // patch_size
+assert grid_h % SPATIAL_MERGE == 0 and grid_w % SPATIAL_MERGE == 0, \
+    f"grid {grid_h}×{grid_w} 必须能被 spatial_merge_size={SPATIAL_MERGE} 整除"
 seq_len = grid_t * grid_h * grid_w
 grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
 pixel_values = torch.randn(seq_len, row, dtype=visual.dtype)
@@ -122,22 +157,25 @@ print(f"[visual] img={height}×{width} patch={patch_size} seq_len={seq_len} "
 
 visual_out_names = ["image_features", "deepstack_features_0",
                     "deepstack_features_1", "deepstack_features_2"]
-visual_dyn = {"pixel_values": {0: "seq_len"}, "grid_thw": {0: "num_images"},
-              "image_features": {0: "num_patches"}}
-for n in visual_out_names[1:]:
-    visual_dyn[n] = {0: "num_patches"}
 
 with torch.no_grad():
     torch.onnx.export(
-        VisualExport(visual), (pixel_values, grid_thw), "visual.onnx",
+        VisualExport(visual, grid_thw), (pixel_values, grid_thw), "visual.onnx",
         input_names=["pixel_values", "grid_thw"],
         output_names=visual_out_names,
-        dynamic_axes=visual_dyn,
+        # 不给 dynamic_axes：grid 相关量已全部固化成常量，标成动态只会骗人
+        # ——runtime 侧必须按导出尺寸喂图。grid_thw 仍留作输入位（llm_chat 不绑定它），
+        # 以免改动 C++ 侧的输入契约。
         opset_version=OPSET,
         dynamo=False,  # 用 legacy TorchScript 导出器：dynamo 对 visual 的
         # fast_pos_embed_interpolate (torch.linspace 含数据相关长度) 会 guard 失败。
     )
-print("[✓] visual.onnx exported (pooler_output + 3 deepstack_features)")
+print("[✓] visual.onnx exported (pooler_output + 3 deepstack_features, 无控制流)")
+
+if os.environ.get("EXPORT_VISUAL_ONLY") == "1":
+    # 只调视觉时用：llm.onnx 导出要几分钟且会重写 3.4GB 权重文件。
+    print("[visual-only] 跳过 llm.onnx 导出")
+    raise SystemExit(0)
 
 
 # ---------------------------------------------------------------------------

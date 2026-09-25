@@ -3,12 +3,13 @@
 // ScatterElements SSBO op. Scatters updates into data along axis=0.
 // Supports 'none' (overwrite) and 'add' (atomic CAS add) reduction.
 //
-// For axis=0: data is [rows, cols], indices is [n_idx], updates is [n_idx, cols].
-// Each thread handles one (idx_slot, col) pair:
-//   data[indices[idx_slot] * cols + col] <op>= updates[idx_slot * cols + col]
+// ONNX requires indices and updates to have the SAME shape [n, cols] (cols ==
+// the row width of data). So one thread handles one index/update element: its
+// flat position gid picks the trailing column (gid % cols) and the row to
+// scatter into:
+//   data[indices[gid] * cols + gid % cols] op= updates[gid]
 //
-// Dispatch: n_idx * cols threads (fp32), or n_idx * cols threads (fp16 — one
-// per element; each updates one half of a packed uint word via word-level CAS).
+// Dispatch: n_idx threads (n_idx = indices.numel() = updates.numel()).
 //
 // FP16 packing: data/updates are packed two fp16 per uint word. Two adjacent
 // elements (col, col+1) share a word, so a thread updating one half MUST use a
@@ -30,8 +31,8 @@ layout(set = 0, binding = 2) readonly buffer Updates {
 } uUpdates;
 
 layout(push_constant) uniform PC {
-    int n_threads; // n_idx * cols
-    int cols;      // row width (data_shape[1] * data_shape[2] * ...)
+    int n_threads; // n_idx = indices.numel() == updates.numel()
+    int cols;      // trailing width shared by indices/updates/data rows
     int reduction; // 0 = none (overwrite), 1 = add
     int _pad;
 } uPC;
@@ -40,11 +41,10 @@ void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= uPC.n_threads) return;
 
-    int idx_slot = gid / uPC.cols;  // which index/update row
-    int col = gid % uPC.cols;       // which column within the row
-
-    // int64 indices (bound as ivec2[], low 32 bits = value).
-    int row = uIndices.data[idx_slot].x;
+    int col = gid % uPC.cols;       // column within the scattered row
+    // int64 indices (bound as ivec2[], low 32 bits = value): gid is the flat
+    // index-element position, so no row/col decomposition is needed here.
+    int row = uIndices.data[gid].x;
     int target = row * uPC.cols + col;
 
 #ifdef FP16

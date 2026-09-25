@@ -32,6 +32,8 @@ struct alignas(16) RotaryPC {
     int seq;                // sequence len of X
     int input_untransposed; // 1 = X is [B, seq, num_heads, head_dim] (folded
                             // Transpose)
+    int seq_major; // 1 = X is [seq, num_heads, head_dim] (rank 3, vision
+                   // encoder: the seq axis leads the head axis)
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
@@ -86,6 +88,14 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         }
         // Leading dims (batch etc.) collapse into `total - heads*seq*head_dim`.
         int total = total_elems(xshape);
+        // Rank-3 [seq, heads, head_dim] (vision encoder: batch axis squeezed
+        // away and seq leading). cos/sin carry `seq` rows, so the row count
+        // they cover identifies the layout: xshape[-2] is heads, not seq.
+        bool seq_major =
+            (xshape.size() == 3 && !input_untransposed_ &&
+             total_elems(inputs[1]->getShape()) / head_dim == xshape[0]);
+        if (seq_major)
+            std::swap(seq, num_heads);
         // Output layout is [B, num_heads, seq, head_dim] (the transposed layout
         // downstream MatMul Q@K^T / Concat K-cache expect). When X is
         // untransposed ([B, seq, num_heads, head_dim]), the OUTPUT shape is the
@@ -127,6 +137,7 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         pc.num_heads = num_heads;
         pc.seq = seq;
         pc.input_untransposed = input_untransposed_ ? 1 : 0;
+        pc.seq_major = seq_major ? 1 : 0;
 
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);

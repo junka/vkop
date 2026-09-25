@@ -61,11 +61,15 @@ layout(set = 0, binding = 3) readonly buffer InSin {
 layout(push_constant) uniform PC {
     int total;      // Y element count = B * num_heads * seq * head_dim (even)
     int head_dim;   // full head dim (rotary_embedding_dim), e.g. 128
-    int num_heads;  // heads dim of X (unused for cos/sin indexing; cos broadcasts)
+    int num_heads;  // heads dim of X (broadcast over cos/sin; used as the
+                    // seq/divisor only in seq_major mode)
     int seq;        // sequence len of X (for cos/sin (b*seq+s) index)
     int input_untransposed; // 1 = X is laid out as [B, seq, num_heads, head_dim]
                             // (a Transpose(perm=[0,2,1,3]) was folded into RE);
                             // 0 = X is [B, num_heads, seq, head_dim] (default)
+    int seq_major;    // 1 = X is [seq, num_heads, head_dim] (rank 3, vision
+                      // encoder): the seq axis leads the head axis, so the
+                      // cos/sin row is gid/(head_dim*num_heads)
 } uPC;
 
 // Decode (b, s, d) from an output gid in [B, num_heads, seq, head_dim] layout.
@@ -86,9 +90,19 @@ int in_index(int gid, int b, int s, int d, int head_dim, int seq, int num_heads)
 // Rotate one element at linear index `gid` (d decoded from gid).
 float rotate_one(int gid, int d, int half_dim, int head_dim, int seq,
                  int num_heads) {
-    int b = gid / (head_dim * seq * num_heads);
-    int cs_idx = (b * seq + (gid / head_dim) % seq) * head_dim + d;
-    int xidx = in_index(gid, b, (gid / head_dim) % seq, d, head_dim, seq, num_heads);
+    // seq_major: X is [seq, num_heads, head_dim] (vision encoder, batch axis
+    // squeezed away and seq leading). No batch term, head axis sits between
+    // seq and head_dim.
+    int b = 0;
+    int s;
+    if (uPC.seq_major != 0) {
+        s = (gid / head_dim) / num_heads;
+    } else {
+        b = gid / (head_dim * seq * num_heads);
+        s = (gid / head_dim) % seq;
+    }
+    int cs_idx = (b * seq + s) * head_dim + d;
+    int xidx = in_index(gid, b, s, d, head_dim, seq, num_heads);
     float x = BUF_LOAD(uInputX.data, xidx);
     float cos_v = BUF_LOAD(uInputCos.data, cs_idx);
     float sin_v = BUF_LOAD(uInputSin.data, cs_idx);

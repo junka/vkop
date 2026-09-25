@@ -69,6 +69,16 @@ static void fill_float(std::shared_ptr<Tensor<float>> &t, const torch::Tensor &t
     t->fillToCPU(std::vector<float>(p, p + flat.numel()));
 }
 
+// ONNX requires indices and updates to share a shape, so 1-D row targets are
+// expanded across the update width (exactly what torch's scatter_ does).
+static std::vector<int64_t> expand_rows(const std::vector<int64_t> &rows,
+                                         int cols) {
+    std::vector<int64_t> out;
+    for (auto r : rows)
+        for (int c = 0; c < cols; ++c) out.push_back(r);
+    return out;
+}
+
 TEST(ScatterElementsTest, Overwrite) {
     auto data = torch::zeros({4, 3});
     auto indices = torch::tensor({0, 2, 1}).to(torch::kInt64);
@@ -79,10 +89,10 @@ TEST(ScatterElementsTest, Overwrite) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 3}), updates);
 
     auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
     auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
     fill_float(tout, data);
-    tidx->fillToCPU(std::vector<int64_t>{0, 2, 1});
+    tidx->fillToCPU(expand_rows({0, 2, 1}, 3));
     fill_float(tupd, updates);
 
     run_scatter("none", {tout, tidx, tupd}, {tout});
@@ -106,10 +116,10 @@ TEST(ScatterElementsTest, AddReduction) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 3}), updates, "add");
 
     auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
     auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
     fill_float(tout, data);
-    tidx->fillToCPU(std::vector<int64_t>{0, 2, 0});
+    tidx->fillToCPU(expand_rows({0, 2, 0}, 3));
     fill_float(tupd, updates);
 
     run_scatter("add", {tout, tidx, tupd}, {tout});
@@ -184,14 +194,14 @@ TEST(ScatterElementsTest, AddReductionFp16) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 3}), updates, "add");
 
     auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
     auto tupd = std::make_shared<Tensor<uint16_t>>(std::vector<int>{3, 3});
     std::vector<float> data_vec(data.data_ptr<float>(),
                                 data.data_ptr<float>() + data.numel());
     std::vector<float> upd_vec(updates.data_ptr<float>(),
                                updates.data_ptr<float>() + updates.numel());
     tout->fillFP32ToCPU(data_vec);
-    tidx->fillToCPU(std::vector<int64_t>{0, 2, 0});
+    tidx->fillToCPU(expand_rows({0, 2, 0}, 3));
     tupd->fillFP32ToCPU(upd_vec);
 
     run_scatter_fp16("add", {tout, tidx, tupd}, {tout});
@@ -216,14 +226,14 @@ TEST(ScatterElementsTest, OverwriteFp16EvenCols) {
     ref.scatter_(0, indices.unsqueeze(1).expand({3, 4}), updates);
 
     auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{4, 4});
-    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 4});
     auto tupd = std::make_shared<Tensor<uint16_t>>(std::vector<int>{3, 4});
     std::vector<float> data_vec(data.data_ptr<float>(),
                                 data.data_ptr<float>() + data.numel());
     std::vector<float> upd_vec(updates.data_ptr<float>(),
                                updates.data_ptr<float>() + updates.numel());
     tout->fillFP32ToCPU(data_vec);
-    tidx->fillToCPU(std::vector<int64_t>{0, 2, 1});
+    tidx->fillToCPU(expand_rows({0, 2, 1}, 4));
     tupd->fillFP32ToCPU(upd_vec);
 
     run_scatter_fp16("none", {tout, tidx, tupd}, {tout});
@@ -253,7 +263,7 @@ TEST(ScatterElementsTest, AddReductionFp16DistinctOutput) {
 
     // data input tensor (stays unmodified — distinct from output)
     auto tdata = std::make_shared<Tensor<uint16_t>>(std::vector<int>{4, 3});
-    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
     auto tupd = std::make_shared<Tensor<uint16_t>>(std::vector<int>{3, 3});
     // FRESH output tensor (never seeded on host — the op must GPU-copy data in)
     auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{4, 3});
@@ -262,7 +272,7 @@ TEST(ScatterElementsTest, AddReductionFp16DistinctOutput) {
     std::vector<float> upd_vec(updates.data_ptr<float>(),
                                updates.data_ptr<float>() + updates.numel());
     tdata->fillFP32ToCPU(data_vec);
-    tidx->fillToCPU(std::vector<int64_t>{0, 2, 0});
+    tidx->fillToCPU(expand_rows({0, 2, 0}, 3));
     tupd->fillFP32ToCPU(upd_vec);
 
     run_scatter_fp16("add", {tdata, tidx, tupd}, {tout});

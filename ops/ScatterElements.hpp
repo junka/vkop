@@ -24,18 +24,14 @@ struct alignas(16) ScatterPC {
 };
 } // namespace scatter
 
-// SSBO-only op: ONNX ScatterElements. Writes (or adds) updates to data
-// at the given indices along axis=0. The LLM uses axis=0 with 'add'
-// reduction (deepstack visual feature injection).
+// ScatterElements (axis=0, reduction 'none' or 'add'), SSBO/GPU only.
+// data, indices and updates share rank with indices.shape == updates.shape
+// (ONNX), e.g. the LLM's deepstack visual-feature injection, where torch
+// exports the 1-D nonzero row indices already expanded to the update width.
 //
-// For axis=0, indices[i] gives the row index in data where updates[i] is
-// scattered. Since the data is flat row-major [rows, cols], the linear
-// offset for (idx, col) = idx * cols + col. Each thread handles one
-// (index, update_col) pair.
-//
-// Actually, for the LLM's use case, the indices are 1-D and updates have
-// the same shape as indices (each update is a full row). So we dispatch
-// one thread per (index, col) pair where col ranges over the row width.
+// For axis=0, indices[i] gives the row index in data that element i lands in.
+// With the data viewed flat row-major [rows, cols], one thread handles one
+// index/update element: dest = indices[i] * cols + i % cols.
 class ScatterElements : public BufferFactory {
   public:
     explicit ScatterElements(int fp16 = 0)
@@ -73,10 +69,15 @@ class ScatterElements : public BufferFactory {
         // outputs[0] are the SAME tensor (in-place scatter). The shader
         // writes to binding 0 (uData = output = data).
         auto data_shape = inputs[0]->getShape();
+        auto idx_shape = inputs[1]->getShape();
 
+        // ONNX: data, indices and updates all have the same rank, and
+        // indices.shape == updates.shape. Thread gid is a flat index-element
+        // position, so the trailing width that splits gid into (row, col) is
+        // the trailing width of *indices* (== that of data by spec).
         int cols = 1;
-        for (size_t i = 1; i < data_shape.size(); ++i) {
-            cols *= data_shape[i];
+        for (size_t i = 1; i < idx_shape.size(); ++i) {
+            cols *= idx_shape[i];
         }
         // indices is int64 in the model (bound as ivec2[] in the shader);
         // read the element count on the correct dtype.
@@ -86,7 +87,7 @@ class ScatterElements : public BufferFactory {
             n_idx =
                 static_cast<int>(core::as_tensor<T>(inputs[1])->num_elements());
         });
-        int n_threads = n_idx * cols;
+        int n_threads = n_idx;
 
         // GPU dispatch path for BOTH fp32 and fp16. The fp16 shader variant
         // (buffer_scatter_elements_fp16_spv, built with -DFP16) uses a

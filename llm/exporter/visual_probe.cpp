@@ -227,17 +227,27 @@ int main(int argc, char** argv) {
                 const float* p = tg->data().data();
                 int ne = tg->num_elements();
                 float mn = 1e30f, mx = -1e30f, sum = 0;
+                int nnan = 0, ninf = 0;
                 for (int i = 0; i < ne; ++i) {
                     float v = p[i];
-                    if (!std::isnan(v) && !std::isinf(v)) {
-                        if (v > mx) mx = v;
-                        if (v < mn) mn = v;
-                        sum += v;
-                    }
+                    if (std::isnan(v)) { ++nnan; continue; }
+                    if (std::isinf(v)) { ++ninf; continue; }
+                    if (v > mx) mx = v;
+                    if (v < mn) mn = v;
+                    sum += v;
                 }
-                std::printf("[%s] ne=%d min=%.4g max=%.4g mean=%.4g first=%.4g\n",
+                std::printf("[%s] ne=%d min=%.4g max=%.4g mean=%.4g first=%.4g "
+                            "nan=%d inf=%d\n",
                             nm.c_str(), ne, mn, mx, sum / std::max(1, ne),
-                            ne ? p[0] : 0.f);
+                            ne ? p[0] : 0.f, nnan, ninf);
+                if (std::getenv("VKOP_DUMP_RAW")) {
+                    std::string fname = nm;
+                    for (auto& ch : fname)
+                        if (ch == '/' || ch == '.') ch = '_';
+                    std::ofstream of("/tmp/vkopdump_" + fname + ".f32.bin",
+                                     std::ios::binary);
+                    of.write(reinterpret_cast<const char*>(p), ne * sizeof(float));
+                }
                 continue;
             }
             if (tns->dtype() != typeid(uint16_t)) continue;
@@ -248,17 +258,19 @@ int main(int argc, char** argv) {
                 reinterpret_cast<const uint16_t*>(tg->data().data());
             int ne = tg->num_elements();
             float mn = 1e30f, mx = -1e30f, sum = 0;
+            int nnan = 0, ninf = 0;
             for (int i = 0; i < ne; ++i) {
                 float v = ITensor::fp16_to_fp32(p[i]);
-                if (!std::isnan(v) && !std::isinf(v)) {
-                    if (v > mx) mx = v;
-                    if (v < mn) mn = v;
-                    sum += v;
-                }
+                if (std::isnan(v)) { ++nnan; continue; }
+                if (std::isinf(v)) { ++ninf; continue; }
+                if (v > mx) mx = v;
+                if (v < mn) mn = v;
+                sum += v;
             }
-            std::printf("[%s] ne=%d min=%.4g max=%.4g mean=%.4g first=%.4g\n",
+            std::printf("[%s] ne=%d min=%.4g max=%.4g mean=%.4g first=%.4g "
+                        "nan=%d inf=%d\n",
                         nm.c_str(), ne, mn, mx, sum / std::max(1, ne),
-                        ne ? ITensor::fp16_to_fp32(p[0]) : 0.f);
+                        ne ? ITensor::fp16_to_fp32(p[0]) : 0.f, nnan, ninf);
             // Optional: raw dump for element-wise ORT diff. Writes the fp16
             // buffer to /tmp/vkopdump_<sanitized_name>.bin.
             if (std::getenv("VKOP_DUMP_RAW")) {
