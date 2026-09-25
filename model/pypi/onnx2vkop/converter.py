@@ -478,7 +478,22 @@ class ModelConverter:
         self.initializer_merger.merge_initializers(dag_model)
         self.initializer_merger.convert_flat_to_reshape(dag_model)
         self.initializer_merger.remove_redundant_reshape(dag_model)
+
+        # Save pre-optimize producer map for orphan cleanup after fusion
+        # passes may delete nodes without updating all consumers.
+        pre_producer = {}
+        for n in dag_model.nodes.values():
+            out_name = n.outputs[0]["name"] if isinstance(n.outputs[0], dict) else n.outputs[0]
+            pre_producer[out_name] = n
+
         self.fusion_optimizer.optimize(dag_model)
+
+        # Post-fusion orphan cleanup: some fusion passes delete nodes but miss
+        # updating all consumers (e.g. Unsqueeze eliminated by pass A but still
+        # consumed by Concat which pass B forgot). Walk all inputs, find orphans,
+        # and if their former producer was a passthrough (Unsqueeze/Identity/
+        # Squeeze), rewrite the consumer input to skip the eliminated node.
+        self._cleanup_orphan_inputs(dag_model, pre_producer)
 
         dag_model.build_dependencies()
 
@@ -492,3 +507,53 @@ class ModelConverter:
 
         if getattr(args, "unify", False):
             Unifier.unify(dag_model)
+
+    @staticmethod
+    def _cleanup_orphan_inputs(dag_model, pre_producer):
+        """Fix consumer nodes that reference tensors whose producer was deleted.
+
+        Iterates until convergence since one round of replacements can expose
+        additional orphans (e.g. replacing Expand_output with Expand_input
+        where Expand_input is also an orphan pointing to a deleted Unsqueeze).
+        """
+        passthrough_ops = {"Unsqueeze", "Identity", "Squeeze", "Transpose",
+                           "Cast", "Reshape", "Expand"}
+        total_fixed = 0
+        for _ in range(5):  # max 5 rounds
+            live = set()
+            for n in dag_model.nodes.values():
+                for o in n.outputs:
+                    live.add(o["name"] if isinstance(o, dict) else o)
+            for i in dag_model.inputs:
+                live.add(i["name"])
+            for k in dag_model.initializers.keys():
+                live.add(k)
+
+            fixed = 0
+            for n in list(dag_model.nodes.values()):
+                new_inputs = []
+                changed = False
+                for inp in n.inputs:
+                    if isinstance(inp, dict):
+                        iname = inp.get("name", "")
+                    else:
+                        iname = inp
+                    if iname and iname not in live and iname in pre_producer:
+                        prod = pre_producer[iname]
+                        if prod.op_type in passthrough_ops and len(prod.inputs) >= 1:
+                            new_inputs.append(prod.inputs[0])
+                            changed = True
+                            fixed += 1
+                            continue
+                    new_inputs.append(inp)
+                if changed:
+                    dag_model.nodes[n.name] = Node(
+                        op_type=n.op_type, name=n.name,
+                        attributes=dict(n.attributes),
+                        inputs=new_inputs, outputs=list(n.outputs),
+                    )
+            total_fixed += fixed
+            if fixed == 0:
+                break
+        if total_fixed:
+            print(f"Cleaned up {total_fixed} orphan inputs (passthrough producer elimination)")

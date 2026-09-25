@@ -783,6 +783,35 @@ class FusionOptimizer:
             )
         )
 
+        # Unsqueeze(cos/sin) -> RotaryEmbedding: skip the size-1-adding Unsqueeze
+        # that broadcasts cos/sin from [B,S,HD] to [B,1,S,HD]. A size-1 axis does
+        # not change the linear layout so RE reads the upstream tensor directly.
+        # Runs after fuse_transpose_into_rotary (79) — the Transpose path may add
+        # new consumers of the Unsqueeze output that we need to observe.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_unsqueeze_into_rotary",
+                FusionOptimizer.match_unsqueeze_into_rotary,
+                FusionOptimizer.fold_unsqueeze_into_rotary,
+                priority=78,
+            )
+        )
+
+        # Generic Unsqueeze elimination: skip single-axis Unsqueeze nodes
+        # whose consumers are all the same op type (Concat, Expand, Cast, ...).
+        # A size-1 axis is a linear-layout no-op — downstream ops read the
+        # upstream tensor directly. Collapses 124 remaining Unsqueeze nodes
+        # after fuse_unsqueeze_into_rotary (2 already fused). Runs AFTER the
+        # dedicated RE pass so that RE-bound Unsqueeze are handled first.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_unsqueeze_eliminate",
+                FusionOptimizer.match_unsqueeze_eliminate,
+                FusionOptimizer.fold_unsqueeze_eliminate,
+                priority=76,
+            )
+        )
+
         # RMSNorm fusion: collapse the 9-op Cast->Pow->ReduceMean->Add->Sqrt->
         # Div->Mul->Cast->Mul decomposition into one RMSNorm op (113 instances
         # in Qwen3-VL). Must run BEFORE fuse_elemwise_chain (priority 60) —
@@ -3030,6 +3059,194 @@ class FusionOptimizer:
         if t.name in dag_model.nodes:
             del dag_model.nodes[t.name]
         dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- Unsqueeze -> RotaryEmbedding(cos/sin) fusion ----
+    # Unsqueeze adds a size-1 axis (typically axis=1) to broadcast cos/sin
+    # from [B,S,HD] to [B,1,S,HD]. Adding a size-1 axis does not change the
+    # linear index layout (stride×1 = no-op), so RE can read the upstream
+    # tensor directly. Collapses 112 Unsqueeze nodes across 56 RE ops
+    # (cos+sin per layer) for zero runtime cost.
+    @staticmethod
+    def match_unsqueeze_into_rotary(dag_model):
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                name = i["name"] if isinstance(i, dict) else i
+                consumers.setdefault(name, []).append(n)
+        matches = []
+        for u_node in list(dag_model.nodes.values()):
+            if u_node.op_type != "Unsqueeze":
+                continue
+            # axes may be an attribute (opset ≤11) or input tensor (opset ≥13)
+            axes = u_node.attributes.get("axes")
+            if not isinstance(axes, list):
+                axes = None
+                if len(u_node.inputs) >= 2:
+                    axes_name = (u_node.inputs[1]["name"]
+                                 if isinstance(u_node.inputs[1], dict)
+                                 else u_node.inputs[1])
+                    axes_init = dag_model.initializers.get(axes_name)
+                    if axes_init is not None:
+                        try:
+                            import onnx.numpy_helper as _nh
+                            axes_arr = _nh.to_array(axes_init)
+                            axes = axes_arr.flatten().tolist()
+                        except Exception:
+                            axes = None
+            if not isinstance(axes, list) or len(axes) != 1:
+                continue
+            cs = consumers.get(u_node.outputs[0]["name"], [])
+            # Allow shared Unsqueeze (e.g. a single Unsqueeze feeds all 56
+            # RE ops' cos or sin input) — every consumer must be RE.
+            if not cs or any(c.op_type != "RotaryEmbedding" for c in cs):
+                continue
+            # One match per Unsqueeze — fold will update ALL RE consumers then
+            # delete the Unsqueeze once. Each consumer maps to "cos" or "sin".
+            u_out = (u_node.outputs[0]["name"] if isinstance(u_node.outputs[0], dict)
+                     else u_node.outputs[0])
+            re_updates = []
+            for re_node in cs:
+                re_cos = (re_node.inputs[1]["name"] if isinstance(re_node.inputs[1], dict)
+                          else re_node.inputs[1])
+                re_sin = (re_node.inputs[2]["name"] if isinstance(re_node.inputs[2], dict)
+                          else re_node.inputs[2])
+                which = None
+                if re_cos == u_out:
+                    which = "cos"
+                elif re_sin == u_out:
+                    which = "sin"
+                if which is None:
+                    continue
+                re_updates.append({"re_node": re_node, "which_input": which})
+            if not re_updates:
+                continue
+            matches.append({
+                "unsqueeze_node": u_node,
+                "re_updates": re_updates,
+                "new_input": u_node.inputs[0],
+            })
+        print(f"Found {len(matches)} Unsqueeze->RotaryEmbedding patterns ({sum(len(m['re_updates']) for m in matches)} RE updates)")
+        return matches
+
+    @staticmethod
+    def fold_unsqueeze_into_rotary(dag_model, match) -> bool:
+        u = match["unsqueeze_node"]
+        new_input = match["new_input"]
+        for upd in match["re_updates"]:
+            re_node = upd["re_node"]
+            which = upd["which_input"]
+            # re_node may already have been replaced by a prior iteration
+            # (unlikely since each match covers one Unsqueeze, but safe).
+            if re_node.name not in dag_model.nodes:
+                continue
+            cur = dag_model.nodes[re_node.name]
+            inputs = list(cur.inputs)
+            idx = 1 if which == "cos" else 2
+            inputs[idx] = new_input
+            fused = Node(
+                op_type="RotaryEmbedding",
+                name=cur.name,
+                attributes=dict(cur.attributes),
+                inputs=inputs,
+                outputs=cur.outputs[:],
+            )
+            dag_model.nodes[cur.name] = fused
+        if u.name in dag_model.nodes:
+            del dag_model.nodes[u.name]
+        return True
+
+    # ---- generic Unsqueeze elimination (Concat, Expand, Cast, ...) ----
+    # Any Unsqueeze with a single-element axis that feeds only one op type
+    # can be skipped — adding a size-1 axis never changes the linear buffer
+    # layout, so downstream ops can read the upstream tensor directly.
+    @staticmethod
+    def match_unsqueeze_eliminate(dag_model):
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                name = i["name"] if isinstance(i, dict) else i
+                consumers.setdefault(name, []).append(n)
+        import onnx.numpy_helper as _nh
+        matches = []
+        for u_node in list(dag_model.nodes.values()):
+            if u_node.op_type != "Unsqueeze":
+                continue
+            axes = u_node.attributes.get("axes")
+            if not isinstance(axes, list):
+                axes = None
+                if len(u_node.inputs) >= 2:
+                    axes_name = (u_node.inputs[1]["name"]
+                                 if isinstance(u_node.inputs[1], dict)
+                                 else u_node.inputs[1])
+                    axes_init = dag_model.initializers.get(axes_name)
+                    if axes_init is not None:
+                        try:
+                            axes_arr = _nh.to_array(axes_init)
+                            axes = axes_arr.flatten().tolist()
+                        except Exception:
+                            axes = None
+            if not isinstance(axes, list) or len(axes) != 1:
+                continue
+            u_out = (u_node.outputs[0]["name"] if isinstance(u_node.outputs[0], dict)
+                     else u_node.outputs[0])
+            cs = consumers.get(u_out, [])
+            if not cs:
+                continue
+            # All consumers must be the same op type (so fold logic is uniform)
+            ctype = cs[0].op_type
+            if any(c.op_type != ctype for c in cs):
+                continue
+            # Skip if the op type is RotaryEmbedding — handled by dedicated pass
+            if ctype == "RotaryEmbedding":
+                continue
+            # One match per Unsqueeze — fold updates all consumer inputs, then
+            # deletes the Unsqueeze once (handles shared consumers correctly).
+            consumer_updates = []
+            for c in cs:
+                new_inputs = []
+                replaced_any = False
+                for inp in c.inputs:
+                    iname = inp["name"] if isinstance(inp, dict) else inp
+                    if iname == u_out:
+                        new_inputs.append(u_node.inputs[0])
+                        replaced_any = True
+                    else:
+                        new_inputs.append(inp)
+                if replaced_any:
+                    consumer_updates.append({
+                        "consumer_name": c.name,
+                        "consumer_type": ctype,
+                        "new_inputs": new_inputs,
+                        "attributes": dict(c.attributes),
+                        "outputs": c.outputs[:],
+                    })
+            if not consumer_updates:
+                continue
+            matches.append({
+                "unsqueeze_node": u_node,
+                "consumer_updates": consumer_updates,
+            })
+        print(f"Found {len(matches)} generic Unsqueeze elimination patterns ({sum(len(m['consumer_updates']) for m in matches)} consumers)")
+        return matches
+
+    @staticmethod
+    def fold_unsqueeze_eliminate(dag_model, match) -> bool:
+        u = match["unsqueeze_node"]
+        for upd in match["consumer_updates"]:
+            cname = upd["consumer_name"]
+            if cname not in dag_model.nodes:
+                continue
+            fused = Node(
+                op_type=upd["consumer_type"],
+                name=cname,
+                attributes=upd["attributes"],
+                inputs=upd["new_inputs"],
+                outputs=upd["outputs"],
+            )
+            dag_model.nodes[cname] = fused
+        if u.name in dag_model.nodes:
+            del dag_model.nodes[u.name]
         return True
 
     # ---- elemwise chain fusion (kernel-fusion engine) ----
