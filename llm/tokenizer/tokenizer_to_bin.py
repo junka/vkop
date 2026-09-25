@@ -148,8 +148,13 @@ def convert_tokenizer():
 
         # --- 写入 Merge Rules Section ---
         skip_count = 0
-        for merge_str in merges_list:
-            parts = merge_str.split(" ", 1)
+        for merge_entry in merges_list:
+            # Qwen3-4B+ 的 tokenizer.json 用 list 格式 ["left","right"]，
+            # Qwen3-VL 用 string 格式 "left right"。统一处理。
+            if isinstance(merge_entry, list):
+                parts = merge_entry
+            else:
+                parts = merge_entry.split(" ", 1)
             if len(parts) != 2:
                 skip_count += 1
                 f.write(struct.pack("<III", 0, 0, 0))

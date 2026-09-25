@@ -1,24 +1,22 @@
 // junka @ 2026
-// End-to-end conversational driver for llm.vkopbin (Qwen3-VL-2B LLM, buffer
-// backend). Text in → generated text out, no .npy dumps required.
+// End-to-end conversational driver for llm.vkopbin (Qwen3 / Qwen3-VL LLM,
+// buffer backend). Text in → generated text out, no .npy dumps required.
+//
+// 架构参数 (NLAYERS / NKV / HD / HIDDEN) 在 LoadModel 之后从 runtime inputs
+// 动态推断 —— 同一个驱动同时支持：
+//   · Qwen3-VL-2B 多模态：3D MRoPE position_ids + deepstack_embeds_*
+//     + image_pad_mask（有 --image/--visual 时自动启用）
+//   · Qwen3-8B / Qwen3-4B / 其他纯文本：2D 标准 RoPE，无视觉 I/O
 //
 // Reuses:
 //   - llm/tokenizer   (BBPE encode/decode + chat template)
-//   - llm.vkopbin     (the 3649-node LLM graph, KV-cache as explicit I/O)
-//   - embed_tokens.bin (standalone [vocab, 2048] fp16 embedding table, exported
-//     by qwen3vl_export_onnx.py — the graph takes inputs_embeds, not input_ids,
-//     so the embedding lookup is done host-side here)
-//
-// The embedding lookup is a pure 1:1 row gather (token_id → row of HIDDEN fp16),
-// so it is done on the CPU (EmbeddingForward op is for multi-hot reduce, overkill
-// here and wants float). For L prefill tokens + 1 decode token the cost is nil.
-//
-// Text-only (delta=0): position_ids = [0..L-1] replicated across the 3 MRoPE
-// axes; image_pad_mask all false; deepstack_embeds all zero. Multimodal would
-// need get_rope_index's M-RoPE delta + visual features — out of scope v1.
+//   - llm.vkopbin     (LLM graph, KV-cache as explicit I/O)
+//   - embed_tokens.bin (standalone [vocab, hidden] fp16 embedding table,
+//     exported by qwen3vl_export_onnx.py 或 qwen3_export_onnx.py)
 //
 // Usage:
 //   llm_chat <model.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new]
+//            [--image <img> --visual <visual.vkopbin>]
 //   (then type prompts on stdin, Ctrl-D to quit)
 //
 // Build: `make llm_chat` (ENABLE_LLM_CHAT is on by default; `make` builds it
@@ -60,13 +58,28 @@ using qwen::Tokenizer;
 
 namespace {
 
-constexpr int HIDDEN = 2048;
-constexpr int NKV = 8;
-constexpr int HD = 128;
-constexpr int NLAYERS = 28;
+// Legacy fallback 默认值 (Qwen3-VL-2B)。真正的值在 LoadModel 之后从 runtime
+// inputs 的 shape 动态推断，存入 struct ModelArch 里。以下常量只用于
+// argmax_last_token 里 shape 不可靠时的 defensive fallback（极罕见）。
+constexpr int LEGACY_HIDDEN = 2048;
+constexpr int LEGACY_NKV = 8;
+constexpr int LEGACY_HD = 128;
+constexpr int LEGACY_NLAYERS = 28;
+
+// 架构参数 —— 在 LoadModel 之后由 infer_model_arch() 填充。
+// 纯文本 Qwen3 的 position_ids 是 2D (B, q)；多模态是 3D (3, B, q) MRoPE。
+struct ModelArch {
+    int hidden = LEGACY_HIDDEN;
+    int nkv = LEGACY_NKV;
+    int hd = LEGACY_HD;
+    int nlayers = LEGACY_NLAYERS;
+    int position_ids_dims = 2;   // 2 = 纯文本 2D RoPE, 3 = 多模态 3D MRoPE
+    bool has_deepstack = false;  // deepstack_embeds_{0,1,2} 输入存在
+    bool has_image_pad_mask = false;
+};
+
 constexpr uint32_t IM_END = 151645;
 constexpr uint32_t IMAGE_PAD = 151655;  // <|image_pad|>
-constexpr uint16_t FP16_NEG_INF = 0xFC00;  // -inf in fp16 (use finfo.min -65504)
 // Qwen3-VL uses torch.finfo(float16).min ≈ -65504 as the causal mask fill, not
 // -inf, so softmax keeps a tiny but finite distinction. -65504 = 0xFBFF.
 constexpr uint16_t FP16_MIN = 0xFBFF;
@@ -74,37 +87,94 @@ constexpr uint16_t FP16_MIN = 0xFBFF;
 // ---- fp16 helpers (match ITensor::fp16_to_fp32 / fp32_to_fp16) ----
 inline float fp16_to_f32(uint16_t h) { return ITensor::fp16_to_fp32(h); }
 
-// Read the whole embed_tokens.bin (raw fp16, [vocab, HIDDEN]) into memory.
-// vocab is inferred from the file size (bytes / (HIDDEN*2)) so the driver does
-// not depend on a tokenizer vocab accessor. Returns (buffer, vocab).
+// 从 Runtime 的 inputs 动态推断架构参数。
+// 纯文本 Qwen3 (position_ids 2D, 无 deepstack_embeds / image_pad_mask)
+// 和多模态 Qwen3-VL (position_ids 3D, 有 deepstack_embeds / image_pad_mask)
+// 都能自动识别。
+ModelArch infer_model_arch(const std::shared_ptr<Runtime>& rt) {
+    ModelArch arch;
+
+    // ---- NLAYERS: 数 past_key_values_i 的个数 ----
+    int nlayers = 0;
+    for (;; ++nlayers) {
+        auto t = rt->GetInput("past_key_values_" + std::to_string(nlayers));
+        if (!t) break;
+    }
+    if (nlayers == 0) throw std::runtime_error("no past_key_values_* inputs in model");
+    arch.nlayers = nlayers;
+
+    // ---- NKV / HD: 从 past_key_values_0 shape ----
+    auto pk0 = rt->GetInput("past_key_values_0");
+    auto pk0_g = as_tensor<uint16_t>(pk0);
+    auto pk0_shape = pk0_g->getShape();  // (B, 2, nkv, kv_len, hd)
+    if (pk0_shape.size() < 5) {
+        std::fprintf(stderr, "[arch] past_key_values_0 shape is %zu dims, expect 5\n",
+                     pk0_shape.size());
+    }
+    arch.nkv = pk0_shape.size() >= 3 ? static_cast<int>(pk0_shape[2]) : LEGACY_NKV;
+    arch.hd = pk0_shape.size() >= 5 ? static_cast<int>(pk0_shape[4]) : LEGACY_HD;
+
+    // ---- HIDDEN: 从 inputs_embeds shape ----
+    auto emb = rt->GetInput("inputs_embeds");
+    auto emb_g = as_tensor<uint16_t>(emb);
+    auto emb_shape = emb_g->getShape();  // (B, q, hidden)
+    arch.hidden = emb_shape.size() >= 3
+        ? static_cast<int>(emb_shape[emb_shape.size() - 1]) : LEGACY_HIDDEN;
+
+    // ---- position_ids dims ----
+    auto pid = rt->GetInput("position_ids");
+    // position_ids 是 int64，cast 到 int64 tensor 看 shape
+    auto pid_shape = pid ? rt->GetInput("position_ids")->getShape()
+                         : std::vector<int>{};
+    arch.position_ids_dims = static_cast<int>(pid_shape.size());  // 2 或 3
+
+    // ---- 视觉 I/O 是否存在 ----
+    arch.has_deepstack = (rt->GetInput("deepstack_embeds_0") != nullptr);
+    arch.has_image_pad_mask = (rt->GetInput("image_pad_mask") != nullptr);
+
+    return arch;
+}
+
+// Read the whole embed_tokens.bin (raw fp16, [vocab, hidden]) into memory.
+// hidden 必须等于模型的 HIDDEN（runtime inputs_embeds 的最后一维）。
+// 若 embed_tokens.bin 的 hidden 不匹配，尝试按模型 hidden 重新推断 vocab。
 std::pair<std::vector<uint16_t>, int>
-load_embed_table(const std::string& path) {
+load_embed_table(const std::string& path, int hidden) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) throw std::runtime_error("cannot open " + path);
     auto bytes = static_cast<size_t>(f.tellg());
     f.seekg(0);
-    if (bytes % (HIDDEN * sizeof(uint16_t)) != 0)
-        throw std::runtime_error("embed_tokens.bin size not a multiple of HIDDEN*2");
-    int vocab = static_cast<int>(bytes / (HIDDEN * sizeof(uint16_t)));
-    std::vector<uint16_t> buf(static_cast<size_t>(vocab) * HIDDEN);
+    const size_t row_bytes = hidden * sizeof(uint16_t);
+    if (row_bytes == 0) throw std::runtime_error("hidden must be > 0");
+    if (bytes % row_bytes != 0) {
+        // 可能是旧模型导出的 embed_tokens.bin（不同 hidden），
+        // 给出提示但仍按当前 hidden 推断 vocab。
+        std::fprintf(stderr,
+            "[warn] embed_tokens.bin size %zu not divisible by hidden*2=%zu, "
+            "model hidden=%d — will read max integer vocab, tail bytes ignored\n",
+            bytes, row_bytes, hidden);
+    }
+    int vocab = static_cast<int>(bytes / row_bytes);
+    std::vector<uint16_t> buf(static_cast<size_t>(vocab) * hidden);
     f.read(reinterpret_cast<char*>(buf.data()),
            static_cast<std::streamsize>(buf.size() * sizeof(uint16_t)));
     if (!f) throw std::runtime_error("short read on " + path);
     return {std::move(buf), vocab};
 }
 
-// Lookup L token ids → fp16 embedding rows, laid out as (1, L, HIDDEN).
+// Lookup L token ids → fp16 embedding rows, laid out as (1, L, hidden).
 std::vector<uint16_t> embed_lookup(const std::vector<uint16_t>& table,
-                                   const std::vector<uint32_t>& ids, int vocab) {
-    std::vector<uint16_t> out(ids.size() * HIDDEN, 0);
+                                   const std::vector<uint32_t>& ids,
+                                   int vocab, int hidden) {
+    std::vector<uint16_t> out(ids.size() * hidden, 0);
     for (size_t i = 0; i < ids.size(); ++i) {
         uint32_t id = ids[i];
         if (id >= static_cast<uint32_t>(vocab)) {
             std::fprintf(stderr, "[embed] token id %u >= vocab %d, zeroing\n", id, vocab);
             continue;
         }
-        std::memcpy(&out[i * HIDDEN], &table[static_cast<size_t>(id) * HIDDEN],
-                    HIDDEN * sizeof(uint16_t));
+        std::memcpy(&out[i * hidden], &table[static_cast<size_t>(id) * hidden],
+                    hidden * sizeof(uint16_t));
     }
     return out;
 }
@@ -186,70 +256,57 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
 
 // Copy present_key_values_{i} output → past_key_values_{i} input for the next
 // round, entirely on the GPU (device→device, no CPU round-trip). present shape
-// is (1,2,NKV,kv_len,128); past for next round takes the same shape (kv_len
-// already includes the just-appended token). All 28 layers' copies are recorded
+// is (1,2,NKV,kv_len,HD); past for next round takes the same shape (kv_len
+// already includes the just-appended token). All layers' copies are recorded
 // into ONE command buffer and submitted with a single wait — vs the old path
-// which did 28 separate copyToCPU+copyToGPU cycles (56 sync points).
+// which did NLAYERS separate copyToCPU+copyToGPU cycles.
 //
 // Both past and present buffers are pre-allocated to MAX_KV (see
 // preallocate_buffer in LoadModel setup), so ResizeInput on past keeps the
 // same physical VkBuffer (prealloc_keep_) and the device→device copy writes
 // the logical region into the reused buffer.
 void feedback_kv(const std::shared_ptr<Runtime>& rt,
-                 const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool) {
+                 const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                 int nlayers, int nkv, int hd) {
     auto dev = cmdpool->getVulkanDevice();
     // First pass: derive kv_len + ResizeInput past (logical shape only; buffer
     // reused via prealloc_keep_). Must happen before the copy pass because
     // ResizeInput sets converted_=false (off-GPU), and as_storage_buffer below
     // re-marks the buffer for the copy.
-    std::vector<int> kv_lens(NLAYERS);
-    for (int i = 0; i < NLAYERS; ++i) {
+    std::vector<int> kv_lens(nlayers);
+    for (int i = 0; i < nlayers; ++i) {
         auto pres = rt->GetOutput("present_key_values_" + std::to_string(i));
         auto pres_t = as_tensor<uint16_t>(pres);
-        int kv_len = pres_t->num_elements() / (2 * NKV * HD);
+        int kv_len = pres_t->num_elements() / (2 * nkv * hd);
         kv_lens[i] = kv_len;
         std::vector<uint32_t> u32shape = {
-            1u, 2u, static_cast<uint32_t>(NKV),
-            static_cast<uint32_t>(kv_len), static_cast<uint32_t>(HD)};
+            1u, 2u, static_cast<uint32_t>(nkv),
+            static_cast<uint32_t>(kv_len), static_cast<uint32_t>(hd)};
         rt->ResizeInput("past_key_values_" + std::to_string(i), u32shape);
     }
-    // Single command buffer for all 28 layers' device→device copies.
+    // Single command buffer for all layers' device→device copies.
     VulkanCommandBuffer cmd(cmdpool);
     cmd.begin();
-    for (int i = 0; i < NLAYERS; ++i) {
+    for (int i = 0; i < nlayers; ++i) {
         auto pres = as_tensor<uint16_t>(
             rt->GetOutput("present_key_values_" + std::to_string(i)));
         auto past = as_tensor<uint16_t>(
             rt->GetInput("past_key_values_" + std::to_string(i)));
-        // as_storage_buffer reuses the pre-allocated VkBuffer (prealloc_keep_,
-        // size >= aligned). present: read barrier for the copy source; past:
-        // the copyStageBufferToBuffer call below adds the write barrier.
         auto pres_buf = pres->as_storage_buffer(dev, nullptr);
         auto past_buf = past->as_storage_buffer(dev, nullptr);
-        // present was written by the Concat compute shader last round; barrier
-        // it to TRANSFER_READ before the copy. size = logical bytes (kv_len
-        // region); the buffer is oversized but only the logical region holds
-        // valid data.
         VkDeviceSize copy_bytes = static_cast<VkDeviceSize>(
-            2 * NKV * kv_lens[i] * HD * sizeof(uint16_t));
+            2 * nkv * kv_lens[i] * hd * sizeof(uint16_t));
         if (copy_bytes == 0) {
-            // kv_len==0 (shouldn't happen post-prefill, but guard anyway):
-            // nothing to copy, just mark past on-GPU.
             continue;
         }
         pres_buf->transferReadBarrier(cmd.get(), copy_bytes, 0);
-        // past->copyStageBufferToBuffer barriers past to TRANSFER_WRITE, copies
-        // from present's VkBuffer, then restores past's access. The source is
-        // the present VkBuffer (already barriered above).
         past_buf->copyStageBufferToBuffer(cmd.get(), pres_buf->getBuffer(),
                                           0, copy_bytes, 0);
-        // past is now populated on the GPU; mark on-GPU so the next Run()'s
-        // input binding reuses the buffer without a host upload.
         past->toGPU();
     }
     cmd.end();
     cmd.submit(dev->getComputeQueue());
-    cmd.wait();  // single sync point for all 28 layers
+    cmd.wait();  // single sync point for all layers
 }
 
 // Build the causal attention_bias (1,1,q,kv) fp16: upper-triangular above the
@@ -399,48 +456,62 @@ int main(int argc, char** argv) {
     tok.load(tok_path);
     std::printf("[tok] loaded %s\n", tok_path.c_str());
 
-    // Embedding table. vocab inferred from file size.
-    auto [embed_table, vocab] = load_embed_table(embed_path);
-    std::printf("[embed] loaded %s  vocab=%d  hidden=%d  (~%.0fMB, %zu rows)\n",
-                embed_path.c_str(), vocab, HIDDEN,
-                static_cast<double>(vocab) * HIDDEN * 2 / 1e6,
-                embed_table.size() / HIDDEN);
-
-    // Visual features (multimodal only). Precomputed once — the single --image
-    // arg applies to the whole session.
-    bool have_visual = false;
-    VisualFeatures vf;
-    if (multimodal) {
-        vf = run_visual(cmdpool, visual_path, image_path);
-        have_visual = true;
-        std::printf("[visual] image_features=%zu elems, deepstack=[%zu,%zu,%zu]\n",
-                    vf.image_features.size(), vf.deepstack[0].size(),
-                    vf.deepstack[1].size(), vf.deepstack[2].size());
-    }
-
-    // Runtime + model.
+    // Runtime + model. LoadModel 必须在 load_embed_table 之前 —— embed_tokens.bin
+    // 的 hidden 必须匹配模型的 HIDDEN（runtime inputs_embeds 的最后一维）。
+    // 先 LoadModel → 推断架构参数 → 再 load embed_table。
     auto rt = std::make_shared<Runtime>(cmdpool, model_path, /*precision=*/1);
     rt->set_backend_buffer(true);
     std::printf("=== LoadModel ===\n");
     rt->LoadModel();
     std::printf("=== LoadModel done ===\n");
 
+    // 从 runtime inputs 动态推断架构参数（纯文本 vs 多模态 自动识别）。
+    ModelArch arch = infer_model_arch(rt);
+    std::printf("[arch] hidden=%d nlayers=%d nkv=%d hd=%d "
+                "position_ids=%dD %s %s\n",
+                arch.hidden, arch.nlayers, arch.nkv, arch.hd,
+                arch.position_ids_dims,
+                arch.has_deepstack ? "has_deepstack" : "no_deepstack",
+                arch.has_image_pad_mask ? "has_image_pad_mask" : "no_image_pad_mask");
+
+    // Embedding table: vocab inferred from file size，按 arch.hidden 推断。
+    auto [embed_table, vocab] = load_embed_table(embed_path, arch.hidden);
+    std::printf("[embed] loaded %s  vocab=%d  hidden=%d  (~%.0fMB, %zu rows)\n",
+                embed_path.c_str(), vocab, arch.hidden,
+                static_cast<double>(vocab) * arch.hidden * 2 / 1e6,
+                embed_table.size() / arch.hidden);
+
+    // Visual features (multimodal only). Precomputed once — the single --image
+    // arg applies to the whole session.
+    bool have_visual = false;
+    VisualFeatures vf;
+    if (multimodal) {
+        if (!arch.has_deepstack || !arch.has_image_pad_mask) {
+            std::fprintf(stderr,
+                "[warn] --image/--visual 提供了，但模型没有 deepstack_embeds / "
+                "image_pad_mask 输入 —— 纯文本模型不支持多模态输入，忽略 image\n");
+        } else {
+            vf = run_visual(cmdpool, visual_path, image_path);
+            have_visual = true;
+            std::printf("[visual] image_features=%zu elems, deepstack=[%zu,%zu,%zu]\n",
+                        vf.image_features.size(), vf.deepstack[0].size(),
+                        vf.deepstack[1].size(), vf.deepstack[2].size());
+        }
+    }
+
     // Pre-allocate the KV-cache buffers (past_key_values_i inputs +
     // present_key_values_i outputs) to a max size once, so they are NOT
     // reallocated every round as kv_len grows by 1. Each buffer holds
-    // (1, 2, NKV, MAX_KV, HD) fp16 = 2*8*MAX_KV*128 elements. With
+    // (1, 2, NKV, MAX_KV, HD) fp16 = 2*nkv*MAX_KV*hd elements. With
     // prealloc_keep_, make_vkbuff reuses the buffer (>= check) and
-    // recreate_storage_buffer skips the drop. The logical shape is still
-    // set per-round via ResizeInput (past) / Concat's resize (present);
-    // only the physical VkBuffer is oversized. MAX_KV covers prefill L +
+    // recreate_storage_buffer skips the drop. MAX_KV covers prefill L +
     // max_new decode tokens with headroom.
     {
         auto dev = cmdpool->getVulkanDevice();
-        // A generous upper bound; prompts are short and max_new caps decode.
         const int MAX_KV = 8192;
         std::size_t kv_elems =
-            static_cast<std::size_t>(2) * NKV * MAX_KV * HD;
-        for (int i = 0; i < NLAYERS; ++i) {
+            static_cast<std::size_t>(2) * arch.nkv * MAX_KV * arch.hd;
+        for (int i = 0; i < arch.nlayers; ++i) {
             auto pin = rt->GetInput("past_key_values_" + std::to_string(i));
             auto pout = rt->GetOutput("present_key_values_" +
                                       std::to_string(i));
@@ -450,9 +521,9 @@ int main(int argc, char** argv) {
     }
 
     // Per-round reusable zero buffers (deepstack + decode attention_bias +
-    // image_pad_mask). deepstack_embeds_{0,1,2}: (1, HIDDEN) fp16 zeros.
-    std::vector<uint16_t> ds_zero(HIDDEN, 0);
-    std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(HIDDEN)};
+    // image_pad_mask). deepstack_embeds_{0,1,2}: (1, hidden) fp16 zeros.
+    std::vector<uint16_t> ds_zero(arch.hidden, 0);
+    std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(arch.hidden)};
 
     // REPL loop.
     std::printf("\n=== ready (max_new=%d, IM_END=%u). type a prompt, Ctrl-D to quit ===\n\n",
@@ -503,24 +574,24 @@ int main(int argc, char** argv) {
         std::vector<int8_t> amask(L, 1);
         for (int i = 0; i < img_count; ++i) mtt[img_start + i] = 1;
 
-        // inputs_embeds (1, L, HIDDEN): embed all ids, then scatter the visual
-        // image_features rows into the image-pad positions.
-        auto emb = embed_lookup(embed_table, ids, vocab);
+        // inputs_embeds (1, L, hidden): embed all ids, then scatter the visual
+        // image_features rows into the image-pad positions (多模态).
+        auto emb = embed_lookup(embed_table, ids, vocab, arch.hidden);
         if (have_visual) {
             for (int i = 0; i < img_count; ++i) {
-                std::memcpy(&emb[(img_start + i) * HIDDEN],
-                            &vf.image_features[static_cast<size_t>(i) * HIDDEN],
-                            HIDDEN * sizeof(uint16_t));
+                std::memcpy(&emb[(img_start + i) * arch.hidden],
+                            &vf.image_features[static_cast<size_t>(i) * arch.hidden],
+                            arch.hidden * sizeof(uint16_t));
             }
         }
         fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(L),
-                      static_cast<uint32_t>(HIDDEN)}, emb.data());
+                      static_cast<uint32_t>(arch.hidden)}, emb.data());
         std::printf("  inputs_embeds ok\n"); std::fflush(stdout);
 
-        // position_ids (3, 1, L) via get_rope_index (text-only collapses to
-        // arange; multimodal uses the M-RoPE delta). rope_delta drives decode.
+        // position_ids: 纯文本 2D (1, L) 或 多模态 3D (3, 1, L) MRoPE.
+        // 纯文本用 arange；多模态走 get_rope_index 拿 rope_delta（decode 时用）。
         int64_t rope_delta = 0;
-        {
+        if (arch.position_ids_dims == 3) {
             int grid_thw_flat[3] = {vf.grid_t, vf.grid_h, vf.grid_w};
             auto ri = get_rope_index(reinterpret_cast<const int64_t*>(ids.data()),
                                      mtt.data(), amask.data(),
@@ -529,9 +600,16 @@ int main(int argc, char** argv) {
             fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(L)},
                            ri.pos_ids.data());
             rope_delta = ri.rope_delta[0];
+        } else {
+            // 2D 标准 RoPE: (1, L) = arange(L). 无 rope_delta.
+            std::vector<int64_t> pos(static_cast<size_t>(L));
+            for (int i = 0; i < L; ++i) pos[i] = i;
+            fill_i64_input(rt, "position_ids", {1u, static_cast<uint32_t>(L)},
+                           pos.data());
         }
-        std::printf("  position_ids ok (rope_delta=%lld)\n",
-                    (long long)rope_delta); std::fflush(stdout);
+        std::printf("  position_ids ok (%dD, rope_delta=%lld)\n",
+                    arch.position_ids_dims, (long long)rope_delta); std::fflush(stdout);
+
         // attention_bias (1, 1, L, L) causal.
         {
             auto ab = causal_bias(L, L);
@@ -539,46 +617,54 @@ int main(int argc, char** argv) {
                           static_cast<uint32_t>(L)}, ab.data());
         }
         std::printf("  attention_bias ok\n"); std::fflush(stdout);
-        // deepstack_embeds_{0,1,2} (n_img, HIDDEN): visual features when
-        // multimodal, else (1, HIDDEN) zeros.
-        if (have_visual) {
-            for (int d = 0; d < 3; ++d)
-                fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
-                                {static_cast<uint32_t>(img_count),
-                                 static_cast<uint32_t>(HIDDEN)},
-                                vf.deepstack[d].data());
-        } else {
-            for (int d = 0; d < 3; ++d)
-                fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
-                                ds_shape, ds_zero.data());
+
+        // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。
+        if (arch.has_deepstack) {
+            if (have_visual) {
+                for (int d = 0; d < 3; ++d)
+                    fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
+                                    {static_cast<uint32_t>(img_count),
+                                     static_cast<uint32_t>(arch.hidden)},
+                                    vf.deepstack[d].data());
+            } else {
+                for (int d = 0; d < 3; ++d)
+                    fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
+                                    ds_shape, ds_zero.data());
+            }
+            std::printf("  deepstack ok\n"); std::fflush(stdout);
         }
-        std::printf("  deepstack ok\n"); std::fflush(stdout);
-        // image_pad_mask (1, L): true at image positions, false elsewhere.
-        {
+
+        // image_pad_mask (1, L): 仅多模态模型有此输入。
+        if (arch.has_image_pad_mask) {
             std::vector<int8_t> mask(L, 0);
             for (int i = 0; i < img_count; ++i) mask[img_start + i] = 1;
             rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(L)});
             auto t = rt->GetInput("image_pad_mask");
             auto tg = as_tensor<int8_t>(t);
             if (tg->num_elements() > 0) tg->fillToCPU(mask.data());
+            std::printf("  image_pad_mask ok\n"); std::fflush(stdout);
         }
-        std::printf("  image_pad_mask ok\n"); std::fflush(stdout);
-        // past_key_values_{i} (1,2,NKV,0,128) empty.
-        for (int i = 0; i < NLAYERS; ++i) {
+
+        // past_key_values_{i} (1, 2, nkv, 0, hd) empty.
+        for (int i = 0; i < arch.nlayers; ++i) {
             std::string n = "past_key_values_" + std::to_string(i);
-            rt->ResizeInput(n, {1u, 2u, static_cast<uint32_t>(NKV), 0u,
-                              static_cast<uint32_t>(HD)});
+            rt->ResizeInput(n, {1u, 2u, static_cast<uint32_t>(arch.nkv), 0u,
+                              static_cast<uint32_t>(arch.hd)});
         }
         std::printf("  past_kv resize ok\n"); std::fflush(stdout);
-        // Upload all inputs.
-        for (int i = 0; i < NLAYERS; ++i)
+
+        // Upload all inputs (跳过模型没有的 deepstack / image_pad_mask).
+        for (int i = 0; i < arch.nlayers; ++i)
             upload_input(cmdpool, rt->GetInput("past_key_values_" + std::to_string(i)));
         upload_input(cmdpool, rt->GetInput("inputs_embeds"));
         upload_input(cmdpool, rt->GetInput("position_ids"));
         upload_input(cmdpool, rt->GetInput("attention_bias"));
-        for (int d = 0; d < 3; ++d)
-            upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
-        upload_input(cmdpool, rt->GetInput("image_pad_mask"));
+        if (arch.has_deepstack) {
+            for (int d = 0; d < 3; ++d)
+                upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
+        }
+        if (arch.has_image_pad_mask)
+            upload_input(cmdpool, rt->GetInput("image_pad_mask"));
         std::printf("  upload ok, calling Run()...\n"); std::fflush(stdout);
 
         double ms = rt->Run();
@@ -688,7 +774,7 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         // Feed KV cache back for decode rounds.
-        feedback_kv(rt, cmdpool);
+        feedback_kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd);
         int past_len = L;  // KV now holds L tokens.
 
         // ---- Decode loop (q_len = 1) ----
@@ -697,16 +783,23 @@ int main(int argc, char** argv) {
                 std::printf("[done] IM_END\n");
                 break;
             }
-            // cur_emb (1, 1, HIDDEN) from the single next_id.
-            auto cur_emb = embed_lookup(embed_table, {static_cast<uint32_t>(next_id)}, vocab);
-            fill_fp16_input(rt, "inputs_embeds", {1u, 1u, static_cast<uint32_t>(HIDDEN)},
+            // cur_emb (1, 1, hidden) from the single next_id.
+            auto cur_emb = embed_lookup(embed_table,
+                                        {static_cast<uint32_t>(next_id)},
+                                        vocab, arch.hidden);
+            fill_fp16_input(rt, "inputs_embeds", {1u, 1u, static_cast<uint32_t>(arch.hidden)},
                           cur_emb.data());
-            // position_ids (3, 1, 1) = past_len + rope_delta (MRoPE delta;
-            // 0 for text-only, nonzero for multimodal image prompts).
+
+            // position_ids: 2D 纯文本 (1, 1) = past_len；3D 多模态 (3, 1, 1)
+            // = past_len + rope_delta（MRoPE delta）。
             {
                 int64_t p = static_cast<int64_t>(past_len) + rope_delta;
-                int64_t pos[3] = {p, p, p};
-                fill_i64_input(rt, "position_ids", {3u, 1u, 1u}, pos);
+                if (arch.position_ids_dims == 3) {
+                    int64_t pos[3] = {p, p, p};
+                    fill_i64_input(rt, "position_ids", {3u, 1u, 1u}, pos);
+                } else {
+                    fill_i64_input(rt, "position_ids", {1u, 1u}, &p);
+                }
             }
             // attention_bias (1, 1, 1, past_len+1) all zero (full history).
             {
@@ -714,28 +807,32 @@ int main(int argc, char** argv) {
                 fill_fp16_input(rt, "attention_bias", {1u, 1u, 1u,
                               static_cast<uint32_t>(past_len + 1)}, ab.data());
             }
-            // deepstack zeros (unchanged) + image_pad_mask (1,1) false.
-            for (int d = 0; d < 3; ++d)
-                fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d), ds_shape, ds_zero.data());
-            {
+            // deepstack zeros / image_pad_mask false（仅模型有这些输入时才写）。
+            if (arch.has_deepstack) {
+                for (int d = 0; d < 3; ++d)
+                    fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
+                                    ds_shape, ds_zero.data());
+            }
+            if (arch.has_image_pad_mask) {
                 std::vector<int8_t> mask(1, 0);
                 rt->ResizeInput("image_pad_mask", {1u, 1u});
                 auto t = rt->GetInput("image_pad_mask");
                 as_tensor<int8_t>(t)->fillToCPU(mask.data());
             }
+
             // Upload.
             upload_input(cmdpool, rt->GetInput("inputs_embeds"));
             upload_input(cmdpool, rt->GetInput("position_ids"));
             upload_input(cmdpool, rt->GetInput("attention_bias"));
-            for (int d = 0; d < 3; ++d)
-                upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
-            upload_input(cmdpool, rt->GetInput("image_pad_mask"));
+            if (arch.has_deepstack) {
+                for (int d = 0; d < 3; ++d)
+                    upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
+            }
+            if (arch.has_image_pad_mask)
+                upload_input(cmdpool, rt->GetInput("image_pad_mask"));
 
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
-            // Skip ReadResult (28 present_kv copyToCPU). argmax reads logits
-            // (self-syncing transferReadBarrier+wait); feedback_kv is
-            // device→device. One device wait ensures Run's shaders finished.
             cmdpool->getVulkanDevice()->wait_all_done();
             auto t1 = std::chrono::steady_clock::now();
             next_id = argmax_last_token(rt, cmdpool);
@@ -747,7 +844,7 @@ int main(int argc, char** argv) {
                         tok.decode({static_cast<uint32_t>(next_id)}).c_str());
             std::fflush(stdout);
 
-            feedback_kv(rt, cmdpool);
+            feedback_kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd);
             past_len += 1;
         }
 
