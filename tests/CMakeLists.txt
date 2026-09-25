@@ -251,8 +251,12 @@ else()
         -Wno-unused-parameter
         -Wno-unused-variable
         -Wno-unused-function
-        -Wno-dangling-reference
     )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        # GCC-only option; clang rejects unknown -Wno-* with
+        # -Werror,-Wunknown-warning-option.
+        target_compile_options(all_tests PRIVATE -Wno-dangling-reference)
+    endif()
 endif()
 target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}

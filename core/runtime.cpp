@@ -1628,6 +1628,43 @@ double Runtime::Run() {
     // so a future re-enable of VKOP_BATCH_LEVELS reports it without format
     // churn.
     double prof_preflush_ms = 0;
+    // -------------------------------------------------------------------
+    // Batch submit: accumulate BATCH_LEVELS levels' VkSubmitInfo into one
+    // vkQueueSubmit call. Each VkSubmitInfo already carries its timeline-
+    // semaphore waits to earlier producers; submitting N VkSubmitInfos in a
+    // single vkQueueSubmit is equivalent to N separate submits w.r.t. queue
+    // ordering and timeline semantics (the waits honor cross-item signal).
+    // This collapses the 815×~0.24ms host-side submit floor to ~13× (for
+    // BATCH_LEVELS=64). See doc/submit-bottleneck.md for why per-level submit
+    // was initially chosen; this change preserves correctness by keeping a
+    // forced flush on any readback level (the copyToCPU inside onExecute does
+    // its own queue submit and must see its producer work already submitted).
+    // Gated by VKOP_BATCH_LEVELS=N. Default BATCH_LEVELS=16. Setting N=1 is
+    // identical to the old per-level behavior. Setting N=0 flushes every
+    // level (debug).
+    int batch_levels = 0;  // default OFF: Apple driver does not honor timeline
+                           // waits across VkSubmitInfo array items within a
+                           // single vkQueueSubmit (every batch > 1 level
+                           // produces wrong outputs). Re-enable on platforms
+                           // where the driver correctly chains timeline across
+                           // array items (Linux/Windows).
+    if (const char *bl = std::getenv("VKOP_BATCH_LEVELS")) {
+        batch_levels = std::atoi(bl);
+        if (batch_levels < 0) batch_levels = 0;
+    }
+    auto flush_batched = [&](std::vector<std::vector<VkSubmitInfo>> &bsis,
+                             int nlanes) {
+        for (int ci = 0; ci < nlanes; ci++) {
+            if (!bsis[ci].empty()) {
+                VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
+                                            bsis[ci]);
+                bsis[ci].clear();
+            }
+        }
+    };
+    std::vector<std::vector<VkSubmitInfo>> batched_sis(vkop::kInflight);
+    int levels_since_flush = 0;
+    // -------------------------------------------------------------------
     // level_readback_ records, per level, whether round 0 saw a sync readback.
     // Populated on round 0 (sees it empty) and read by rbprof/opprof on later
     // rounds. Kept across the session (cleared only by invalidate_replay).
@@ -1812,7 +1849,11 @@ double Runtime::Run() {
             prof_nlevels++;
             prof_nops += static_cast<int>(level_nodes.size());
         }
-        // Submit this level's batches (one vkQueueSubmit per non-empty lane).
+        // Batch-submit this level: accumulate into batched_sis and flush when
+        // we hit a readback level (copyToCPU in onExecute does its own submit
+        // and needs the producer already visible), or when the batch reaches
+        // batch_levels. Setting batch_levels=0 flushes every level (old
+        // behavior, equivalent to per-level submit).
         int nlanes = single_queue ? 1 : vkop::kInflight;
         auto sub_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
@@ -1820,10 +1861,22 @@ double Runtime::Run() {
             n_readback_levels++;
             level_readback_[level_idx] = true;
         }
+        // Accumulate this level's submit infos into the batch.
         for (int ci = 0; ci < nlanes; ci++) {
             if (!sis[ci].empty()) {
-                VulkanCommandBuffer::submit(dev->getComputeQueue(ci), sis[ci]);
+                batched_sis[ci].insert(batched_sis[ci].end(),
+                                       sis[ci].begin(), sis[ci].end());
             }
+        }
+        sis.clear();  // level-local sis is no longer needed
+        levels_since_flush++;
+        bool must_flush = level_had_readback ||
+                          (batch_levels > 0 &&
+                           levels_since_flush >= batch_levels) ||
+                          (batch_levels == 0);
+        if (must_flush) {
+            flush_batched(batched_sis, nlanes);
+            levels_since_flush = 0;
         }
         if (run_profile) {
             auto sub_t1 = std::chrono::steady_clock::now();
@@ -1841,6 +1894,9 @@ double Runtime::Run() {
         }
         prev_level_cmds = std::move(cur_level_cmds);
     }
+    // Flush the tail: any remaining levels that didn't trigger a forced flush
+    // above (the last batch, or the tail of a non-readback run).
+    flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
 
     // Wait for the final level, then reset all command buffers.
     for (int ci = 0; ci < vkop::kInflight; ci++) {

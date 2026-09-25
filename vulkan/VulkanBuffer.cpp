@@ -70,7 +70,10 @@ void VulkanBuffer::createBuffer(VkBufferUsageFlags usage, bool device_local) {
                               nullptr, &m_buffer_);
 #endif
     if (ret != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create buffer!");
+        throw std::runtime_error("Failed to create buffer! size=" +
+                                 std::to_string(m_size_) + " usage=" +
+                                 std::to_string(usage) + " vkret=" +
+                                 std::to_string(ret));
     }
     if (usage & VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT) {
         m_desc_type_ = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;

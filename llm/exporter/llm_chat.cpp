@@ -16,7 +16,8 @@
 //
 // Usage:
 //   llm_chat <model.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new]
-//            [--image <img> --visual <visual.vkopbin>]
+//            [--image <img>]... --visual <visual.vkopbin>
+//   (--image 可重复，多图按给出顺序与 prompt 里的 image_pad 标记一一对应)
 //   (then type prompts on stdin, Ctrl-D to quit)
 //
 // Build: `make llm_chat` (ENABLE_LLM_CHAT is on by default; `make` builds it
@@ -326,9 +327,8 @@ std::vector<uint16_t> causal_bias(int q, int kv) {
     return m;
 }
 
-// Visual encoder run: load image, C++-preprocess, run visual.vkopbin, return
-// the 4 outputs (image_features + 3 deepstack), each (n_img, HIDDEN) fp16.
-// Also returns grid_thw (T,H,W) for rope_index.
+// One image's visual outputs: image_features + 3 deepstack tensors, each
+// (n_img, HIDDEN) fp16, plus grid_thw for rope_index.
 struct VisualFeatures {
     std::vector<uint16_t> image_features;   // (n_img * HIDDEN)
     std::vector<uint16_t> deepstack[3];     // each (n_img * HIDDEN)
@@ -336,81 +336,98 @@ struct VisualFeatures {
     int grid_t = 0, grid_h = 0, grid_w = 0;
 };
 
-VisualFeatures run_visual(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
-                          const std::string& visual_vkopbin,
-                          const std::string& image_path) {
-    VisualFeatures vf;
-    int w = 0, h = 0, c = 0;
-    unsigned char* img = stbi_load(image_path.c_str(), &w, &h, &c, 3);
-    if (!img) throw std::runtime_error("stbi_load failed: " + image_path);
-    std::printf("[visual] image %s  %dx%d ch=%d\n", image_path.c_str(), w, h, c);
-    auto pr = preprocess_image_noresize(img, h, w, 3);
-    stbi_image_free(img);
-    if (pr.pixel_values_fp16.empty())
-        throw std::runtime_error("image not divisible by patch*merge (16*2=32)");
-    vf.grid_t = pr.grid_t; vf.grid_h = pr.grid_h; vf.grid_w = pr.grid_w;
-    // n_img (LLM image-token count) = visual pixel seq_len / merge^2. The
-    // visual encoder consumes seq_len = grid_t*grid_h*grid_w patches (pre-merge)
-    // but emits image_features of (n_img, HIDDEN) where n_img = that / merge^2
-    // (the spatial merge happens inside the visual graph). For 224x224:
-    // seq_len=196, n_img=49.
-    vf.n_img = pr.seq_len / (vkop::export_::kMerge * vkop::export_::kMerge);
-    std::printf("[visual] grid_thw=[%d,%d,%d] n_img=%d seq_len=%d\n",
-                vf.grid_t, vf.grid_h, vf.grid_w, vf.n_img, pr.seq_len);
+// Visual encoder session: visual.vkopbin is loaded once and reused for every
+// image in the session (each run only refills pixel_values and re-reads the 4
+// outputs). The Runtime owns the tensor set, so features must be copied out
+// before the next run — run() returns them by value.
+struct VisualEngine {
+    std::shared_ptr<Runtime> vrt;
+    std::shared_ptr<vkop::VulkanCommandPool> cmdpool;
 
-    auto vrt = std::make_shared<Runtime>(cmdpool, visual_vkopbin, /*precision=*/1);
-    vrt->set_backend_buffer(true);
-    vrt->LoadModel();
-    vrt->ResizeInput("pixel_values",
-                     {static_cast<uint32_t>(pr.seq_len),
-                      static_cast<uint32_t>(pr.row)});
-    auto t = vrt->GetInput("pixel_values");
-    as_tensor<uint16_t>(t)->fillToCPU(pr.pixel_values_fp16.data());
-    as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
-    double ms = vrt->Run();
-    vrt->ReadResult();
-    std::printf("[visual] run %.1fms\n", ms);
-
-    const char* outs[] = {"image_features", "deepstack_features_0",
-                          "deepstack_features_1", "deepstack_features_2"};
-    std::vector<uint16_t>* dsts[] = {&vf.image_features, &vf.deepstack[0],
-                                     &vf.deepstack[1], &vf.deepstack[2]};
-    for (int i = 0; i < 4; ++i) {
-        auto o = vrt->GetOutput(outs[i]);
-        if (!o) throw std::runtime_error(std::string("no visual output ") + outs[i]);
-        auto og = as_tensor<uint16_t>(o);
-        og->copyToCPU(cmdpool);
-        *dsts[i] = og->data();
+    VisualEngine(const std::shared_ptr<vkop::VulkanCommandPool>& cp,
+                 const std::string& visual_vkopbin)
+        : cmdpool(cp) {
+        vrt = std::make_shared<Runtime>(cmdpool, visual_vkopbin, /*precision=*/1);
+        vrt->set_backend_buffer(true);
+        std::printf("=== LoadModel (visual) ===\n");
+        vrt->LoadModel();
+        std::printf("=== LoadModel (visual) done ===\n");
     }
-    return vf;
-}
 
-// Expand the single <|image_pad|> token (151655) in `ids` into n_img copies,
-// so the sequence length matches the visual feature count (HF processor does
-// this expansion based on grid_thw). Returns the expanded ids + the index of
-// the first image token (for mm_token_type_ids / image_pad_mask / scatter).
-// Returns {ids unchanged, -1} if no image token present.
+    VisualFeatures run(const std::string& image_path) {
+        VisualFeatures vf;
+        int w = 0, h = 0, c = 0;
+        unsigned char* img = stbi_load(image_path.c_str(), &w, &h, &c, 3);
+        if (!img) throw std::runtime_error("stbi_load failed: " + image_path);
+        std::printf("[visual] image %s  %dx%d ch=%d\n", image_path.c_str(), w, h, c);
+        auto pr = preprocess_image_noresize(img, h, w, 3);
+        stbi_image_free(img);
+        if (pr.pixel_values_fp16.empty())
+            throw std::runtime_error("image not divisible by patch*merge (16*2=32)");
+        vf.grid_t = pr.grid_t; vf.grid_h = pr.grid_h; vf.grid_w = pr.grid_w;
+        // n_img (LLM image-token count) = visual pixel seq_len / merge^2. The
+        // visual encoder consumes seq_len = grid_t*grid_h*grid_w patches
+        // (pre-merge) but emits image_features of (n_img, HIDDEN) where n_img
+        // = that / merge^2 (the spatial merge happens inside the visual
+        // graph). For 224x224: seq_len=196, n_img=49.
+        vf.n_img = pr.seq_len / (vkop::export_::kMerge * vkop::export_::kMerge);
+        std::printf("[visual] grid_thw=[%d,%d,%d] n_img=%d seq_len=%d\n",
+                    vf.grid_t, vf.grid_h, vf.grid_w, vf.n_img, pr.seq_len);
+
+        vrt->ResizeInput("pixel_values",
+                         {static_cast<uint32_t>(pr.seq_len),
+                          static_cast<uint32_t>(pr.row)});
+        auto t = vrt->GetInput("pixel_values");
+        as_tensor<uint16_t>(t)->fillToCPU(pr.pixel_values_fp16.data());
+        as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
+        double ms = vrt->Run();
+        vrt->ReadResult();
+        std::printf("[visual] run %.1fms\n", ms);
+
+        const char* outs[] = {"image_features", "deepstack_features_0",
+                              "deepstack_features_1", "deepstack_features_2"};
+        std::vector<uint16_t>* dsts[] = {&vf.image_features, &vf.deepstack[0],
+                                         &vf.deepstack[1], &vf.deepstack[2]};
+        for (int i = 0; i < 4; ++i) {
+            auto o = vrt->GetOutput(outs[i]);
+            if (!o) throw std::runtime_error(std::string("no visual output ") + outs[i]);
+            auto og = as_tensor<uint16_t>(o);
+            og->copyToCPU(cmdpool);
+            *dsts[i] = og->data();
+        }
+        return vf;
+    }
+};
+
+// Expand each image_pad token (one per image, in order) into that image's
+// n_img copies, so the sequence length matches the visual feature count (HF
+// processor does this expansion based on grid_thw). Returns the expanded ids
+// plus one span per image (start index + count in the expanded sequence), in
+// the same order as the features. Extra image_pad tokens with no feature
+// left pass through unexpanded.
 struct ExpandedIds {
     std::vector<uint32_t> ids;
-    int img_start = -1;   // first image-token index in the expanded sequence
-    int img_count = 0;    // number of image tokens (0 if none)
+    struct Span { int start; int count; };
+    std::vector<Span> spans;   // one per expanded image, order == vfs
+    int img_start = -1;        // first image-token index (-1 if none)
+    int img_count = 0;         // total image tokens across all images
 };
-ExpandedIds expand_image_token(const std::vector<uint32_t>& ids, int n_img) {
+ExpandedIds expand_image_token(const std::vector<uint32_t>& ids,
+                               const std::vector<VisualFeatures>& vfs) {
     ExpandedIds ex;
-    int single = -1;
+    size_t img_i = 0;
     for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] == IMAGE_PAD) { single = static_cast<int>(i); break; }
+        if (ids[i] == IMAGE_PAD && img_i < vfs.size() && vfs[img_i].n_img > 0) {
+            const int n = vfs[img_i].n_img;
+            if (ex.img_start < 0) ex.img_start = static_cast<int>(ex.ids.size());
+            ex.img_count += n;
+            ex.spans.push_back({static_cast<int>(ex.ids.size()), n});
+            for (int k = 0; k < n; ++k) ex.ids.push_back(IMAGE_PAD);
+            ++img_i;
+        } else {
+            ex.ids.push_back(ids[i]);
+        }
     }
-    if (single < 0 || n_img <= 0) {
-        ex.ids = ids;
-        return ex;
-    }
-    ex.ids.reserve(ids.size() - 1 + n_img);
-    for (int i = 0; i < single; ++i) ex.ids.push_back(ids[i]);
-    ex.img_start = single;
-    ex.img_count = n_img;
-    for (int i = 0; i < n_img; ++i) ex.ids.push_back(IMAGE_PAD);
-    for (size_t i = single + 1; i < ids.size(); ++i) ex.ids.push_back(ids[i]);
     return ex;
 }
 
@@ -420,7 +437,7 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
             "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new] "
-            "[--image <img> --visual <visual.vkopbin>]\n",
+            "[--image <img>]... --visual <visual.vkopbin>\n",
             argv[0]);
         return 1;
     }
@@ -428,18 +445,20 @@ int main(int argc, char** argv) {
     const std::string embed_path = argv[2];
     const std::string tok_path = argv[3];
     int max_new = 64;
-    std::string image_path, visual_path;
+    std::vector<std::string> image_paths;
+    std::string visual_path;
     // Parse optional positional max_new + --image/--visual flags (any order).
+    // --image is repeatable: order defines the image→prompt binding.
     bool have_max = false;
     for (int i = 4; i < argc; ++i) {
         std::string a = argv[i];
-        if (a == "--image" && i + 1 < argc) { image_path = argv[++i]; }
+        if (a == "--image" && i + 1 < argc) { image_paths.push_back(argv[++i]); }
         else if (a == "--visual" && i + 1 < argc) { visual_path = argv[++i]; }
         else if (!a.empty() && a[0] != '-' && !have_max) {
             max_new = std::atoi(a.c_str()); have_max = true;
         }
     }
-    const bool multimodal = !image_path.empty() && !visual_path.empty();
+    const bool multimodal = !image_paths.empty() && !visual_path.empty();
 
     Logger::getInstance().setLevel(LOG_INFO);
     const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
@@ -481,21 +500,40 @@ int main(int argc, char** argv) {
                 static_cast<double>(vocab) * arch.hidden * 2 / 1e6,
                 embed_table.size() / arch.hidden);
 
-    // Visual features (multimodal only). Precomputed once — the single --image
-    // arg applies to the whole session.
+    // Visual features (multimodal only): one --image arg per image, all
+    // encoded once up-front (the same images apply to the whole session).
+    // HF concatenates per-image features in prompt order into the single
+    // (total_img_tokens, hidden) deepstack/image_features input, so do that
+    // here too and keep only the flat buffers + the per-image token counts.
     bool have_visual = false;
-    VisualFeatures vf;
+    std::vector<VisualFeatures> vfs;
+    std::vector<uint16_t> img_feat_cat;          // (total_img, hidden)
+    std::vector<uint16_t> ds_cat[3];             // each (total_img, hidden)
+    std::vector<int> grid_thw_flat;              // (n_images * 3)
+    int total_img = 0;
     if (multimodal) {
         if (!arch.has_deepstack || !arch.has_image_pad_mask) {
             std::fprintf(stderr,
                 "[warn] --image/--visual 提供了，但模型没有 deepstack_embeds / "
                 "image_pad_mask 输入 —— 纯文本模型不支持多模态输入，忽略 image\n");
         } else {
-            vf = run_visual(cmdpool, visual_path, image_path);
+            VisualEngine venc(cmdpool, visual_path);
+            for (const auto& p : image_paths) {
+                auto vf = venc.run(p);
+                img_feat_cat.insert(img_feat_cat.end(), vf.image_features.begin(),
+                                    vf.image_features.end());
+                for (int d = 0; d < 3; ++d)
+                    ds_cat[d].insert(ds_cat[d].end(), vf.deepstack[d].begin(),
+                                     vf.deepstack[d].end());
+                grid_thw_flat.insert(grid_thw_flat.end(),
+                                     {vf.grid_t, vf.grid_h, vf.grid_w});
+                total_img += vf.n_img;
+                vfs.push_back(std::move(vf));
+            }
             have_visual = true;
-            std::printf("[visual] image_features=%zu elems, deepstack=[%zu,%zu,%zu]\n",
-                        vf.image_features.size(), vf.deepstack[0].size(),
-                        vf.deepstack[1].size(), vf.deepstack[2].size());
+            std::printf("[visual] %zu images, total_img=%d tokens, "
+                        "image_features=%zu elems\n",
+                        image_paths.size(), total_img, img_feat_cat.size());
         }
     }
 
@@ -531,6 +569,12 @@ int main(int argc, char** argv) {
     std::string line;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
+        // Phase boundary decode→prefill: previous prompt's decode left
+        // STABLE shape caches (Reshape/Range/Slice/Expand/Cast/...) keyed to
+        // its q_len=1/past_len shapes. A new prompt has a different L, so
+        // blind reuse would corrupt the graph — reset every op's cache, and
+        // do it BEFORE any input is filled (ResizeInput+fillToCPU).
+        rt->invalidate_replay();
         std::string prompt;
         if (std::getenv("VKOP_RAW_PROMPT")) {
             // Bypass chat template: encode the literal input (for matching the
@@ -538,11 +582,15 @@ int main(int argc, char** argv) {
             prompt = line;
         } else {
             // Render chat: user turn + generation prompt for assistant.
-            // Multimodal: insert an image content item before the text.
+            // Multimodal: one image content item per --image, before the text
+            // (each renders one image_pad marker, bound to its image in order).
             std::vector<qwen::ChatMessage> msgs;
             if (have_visual) {
-                msgs = {{/*role=*/"user", /*contents=*/{
-                    {/*type=*/"image", ""}, {/*type=*/"text", line}}}};
+                std::vector<qwen::ChatContent> contents;
+                for (size_t k = 0; k < image_paths.size(); ++k)
+                    contents.push_back({/*type=*/"image", ""});
+                contents.push_back({/*type=*/"text", line});
+                msgs = {{/*role=*/"user", contents}};
             } else {
                 msgs = {{/*role=*/"user", /*contents=*/{{/*type=*/"text", line}}}};
             }
@@ -553,17 +601,23 @@ int main(int argc, char** argv) {
             }
         }
         std::vector<uint32_t> raw_ids = tok.encode(prompt);
-        // Expand the single <|image_pad|> token into n_img copies (HF processor
-        // does this based on grid_thw). No-op when no visual.
-        ExpandedIds ex = have_visual
-            ? expand_image_token(raw_ids, vf.n_img)
-            : ExpandedIds{raw_ids, -1, 0};
+        // Expand each image_pad token into that image's n_img copies (HF
+        // processor does this based on grid_thw). No-op when no visual.
+        ExpandedIds ex = expand_image_token(raw_ids, vfs);
         std::vector<uint32_t> ids = ex.ids;
         const int img_start = ex.img_start;
         const int img_count = ex.img_count;
-        std::printf("[prompt] %zu tokens (image tokens %d..%d)\n", ids.size(),
-                    img_start, img_start + img_count - 1);
+        std::printf("[prompt] %zu tokens, %zu image span(s) (image tokens %d..%d)\n",
+                    ids.size(), ex.spans.size(), img_start,
+                    img_start + img_count - 1);
         std::fflush(stdout);
+
+        if (have_visual && ex.spans.size() != vfs.size()) {
+            std::fprintf(stderr,
+                "[warn] prompt 里有 %zu 个 image_pad 标记，但有 %zu 张图 —— "
+                "只有前 %zu 张会被用上（chat template 可能不支持 image）\n",
+                ex.spans.size(), vfs.size(), ex.spans.size());
+        }
 
         // ---- Prefill (q_len = L, kv_len = 0) ----
         int L = static_cast<int>(ids.size());
@@ -572,16 +626,21 @@ int main(int argc, char** argv) {
         // mm_token_type_ids (1, L): 0=text, 1=image. attention_mask all 1.
         std::vector<int32_t> mtt(L, 0);
         std::vector<int8_t> amask(L, 1);
-        for (int i = 0; i < img_count; ++i) mtt[img_start + i] = 1;
+        for (const auto& sp : ex.spans)
+            for (int i = 0; i < sp.count; ++i) mtt[sp.start + i] = 1;
 
         // inputs_embeds (1, L, hidden): embed all ids, then scatter the visual
-        // image_features rows into the image-pad positions (多模态).
+        // image_features rows into the image-pad positions (多模态). The flat
+        // feature buffer is in the same image order as the spans.
         auto emb = embed_lookup(embed_table, ids, vocab, arch.hidden);
         if (have_visual) {
-            for (int i = 0; i < img_count; ++i) {
-                std::memcpy(&emb[(img_start + i) * arch.hidden],
-                            &vf.image_features[static_cast<size_t>(i) * arch.hidden],
-                            arch.hidden * sizeof(uint16_t));
+            int feat_row = 0;   // running row index into img_feat_cat
+            for (const auto& sp : ex.spans) {
+                for (int i = 0; i < sp.count; ++i, ++feat_row) {
+                    std::memcpy(&emb[(sp.start + i) * arch.hidden],
+                                &img_feat_cat[static_cast<size_t>(feat_row) * arch.hidden],
+                                arch.hidden * sizeof(uint16_t));
+                }
             }
         }
         fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(L),
@@ -592,11 +651,11 @@ int main(int argc, char** argv) {
         // 纯文本用 arange；多模态走 get_rope_index 拿 rope_delta（decode 时用）。
         int64_t rope_delta = 0;
         if (arch.position_ids_dims == 3) {
-            int grid_thw_flat[3] = {vf.grid_t, vf.grid_h, vf.grid_w};
             auto ri = get_rope_index(reinterpret_cast<const int64_t*>(ids.data()),
                                      mtt.data(), amask.data(),
-                                     have_visual ? grid_thw_flat : nullptr,
-                                     have_visual ? 1 : 0, /*B=*/1, L);
+                                     have_visual ? grid_thw_flat.data() : nullptr,
+                                     have_visual ? static_cast<int>(vfs.size()) : 0,
+                                     /*B=*/1, L);
             fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(L)},
                            ri.pos_ids.data());
             rope_delta = ri.rope_delta[0];
@@ -618,14 +677,15 @@ int main(int argc, char** argv) {
         }
         std::printf("  attention_bias ok\n"); std::fflush(stdout);
 
-        // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。
+        // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。多图时 HF 把每张
+        // 图的 deepstack 按 prompt 顺序拼成 (total_img, hidden) 一个输入。
         if (arch.has_deepstack) {
             if (have_visual) {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
                                     {static_cast<uint32_t>(img_count),
                                      static_cast<uint32_t>(arch.hidden)},
-                                    vf.deepstack[d].data());
+                                    ds_cat[d].data());
             } else {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
@@ -637,7 +697,8 @@ int main(int argc, char** argv) {
         // image_pad_mask (1, L): 仅多模态模型有此输入。
         if (arch.has_image_pad_mask) {
             std::vector<int8_t> mask(L, 0);
-            for (int i = 0; i < img_count; ++i) mask[img_start + i] = 1;
+            for (const auto& sp : ex.spans)
+                for (int i = 0; i < sp.count; ++i) mask[sp.start + i] = 1;
             rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(L)});
             auto t = rt->GetInput("image_pad_mask");
             auto tg = as_tensor<int8_t>(t);
@@ -833,7 +894,6 @@ int main(int argc, char** argv) {
 
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
-            cmdpool->getVulkanDevice()->wait_all_done();
             auto t1 = std::chrono::steady_clock::now();
             next_id = argmax_last_token(rt, cmdpool);
             out_ids.push_back(static_cast<uint32_t>(next_id));

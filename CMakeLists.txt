@@ -96,6 +96,21 @@ if(MSVC)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast")
 else()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
+if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Warnings clang adds over GCC that the codebase (and vendored VMA /
+    # Vulkan headers) trip everywhere — -Werror from GCC's perspective is
+    # still in effect for real issues:
+    #  - nullability-completeness: Vulkan headers carry _Nullable/_Nonnull so
+    #    clang infers it for every un-annotated pointer
+    #  - unused-private-field / unused-lambda-capture: clang-only, GCC has no
+    #    equivalent, so these fire on the brew-clang build only
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-nullability-completeness")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-unused-private-field")
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-unused-lambda-capture")
+    # clang 21+: fires on ~shared_ptr<ITensor> destroying Tensor<T>. ITensor's
+    # dtor IS virtual, so polymorphic deletion is well-defined here.
+    string(APPEND CMAKE_CXX_FLAGS " -Wno-delete-non-abstract-non-virtual-dtor")
+endif()
 endif()
 
 if(DEFINED ENV{VULKAN_SDK})
