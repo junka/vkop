@@ -507,7 +507,7 @@ endif()
 option(ENABLE_LLM_CHAT "Build the LLM conversational driver (llm_chat)" ON)
 if (ENABLE_LLM_CHAT)
     add_subdirectory(llm/tokenizer llm_tokenizer)
-    add_executable(llm_chat llm/exporter/llm_chat.cpp)
+    add_executable(llm_chat llm/exporter/llm_chat.cpp llm/exporter/conversation.cc)
     target_link_libraries(llm_chat PRIVATE vkop vload tokenizer)
     target_include_directories(llm_chat PRIVATE
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)

@@ -10,6 +10,8 @@
 //
 // Reuses:
 //   - llm/tokenizer   (BBPE encode/decode + chat template)
+//   - llm/exporter/conversation.hpp (多轮上下文：token 级历史 + 整段重 prefill)
+//   - llm/exporter/kv_cache.hpp     (KV 预分配 / 每轮 reset / present→past)
 //   - llm.vkopbin     (LLM graph, KV-cache as explicit I/O)
 //   - embed_tokens.bin (standalone [vocab, hidden] fp16 embedding table,
 //     exported by qwen3vl_export_onnx.py 或 qwen3_export_onnx.py)
@@ -17,8 +19,10 @@
 // Usage:
 //   llm_chat <model.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new]
 //            [--image <img>]... --visual <visual.vkopbin>
-//   (--image 可重复，多图按给出顺序与 prompt 里的 image_pad 标记一一对应)
+//   (--image 可重复，多图按给出顺序与 prompt 里的 image_pad 标记一一对应；
+//    这些图属于第一轮，之后的轮次靠历史复用它们)
 //   (then type prompts on stdin, Ctrl-D to quit)
+//   同进程里的每条输入都是下一轮的上下文（VKOP_RAW_PROMPT=1 关掉，每行独立）。
 //
 // Build: `make llm_chat` (ENABLE_LLM_CHAT is on by default; `make` builds it
 // along with the rest). See the ENABLE_LLM_CHAT block in CMakeLists.txt.
@@ -43,6 +47,8 @@
 #include "core/runtime.hpp"
 #include "tokenizer.hpp"
 #include "image_preproc.hpp"
+#include "conversation.hpp"
+#include "kv_cache.hpp"
 
 #define STB_IMAGE_IMPLEMENTATION
 #include "include/stb_image.h"
@@ -53,6 +59,10 @@ using vkop::VulkanCommandBuffer;
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::core::as_tensor;
+using vkop::export_::Conversation;
+using vkop::export_::ImageBlock;
+using vkop::export_::KVCache;
+using vkop::export_::RenderedContext;
 using vkop::export_::get_rope_index;
 using vkop::export_::preprocess_image_noresize;
 using qwen::Tokenizer;
@@ -79,8 +89,8 @@ struct ModelArch {
     bool has_image_pad_mask = false;
 };
 
-constexpr uint32_t IM_END = 151645;
-constexpr uint32_t IMAGE_PAD = 151655;  // <|image_pad|>
+// 结束符 / 图像占位符的 id 由 Tokenizer 从注册表查（Conversation 也走同一入口），
+// 这里不写死 —— 换 checkpoint 时那些 id 会变。
 // Qwen3-VL uses torch.finfo(float16).min ≈ -65504 as the causal mask fill, not
 // -inf, so softmax keeps a tiny but finite distinction. -65504 = 0xFBFF.
 constexpr uint16_t FP16_MIN = 0xFBFF;
@@ -255,61 +265,6 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
     return best;
 }
 
-// Copy present_key_values_{i} output → past_key_values_{i} input for the next
-// round, entirely on the GPU (device→device, no CPU round-trip). present shape
-// is (1,2,NKV,kv_len,HD); past for next round takes the same shape (kv_len
-// already includes the just-appended token). All layers' copies are recorded
-// into ONE command buffer and submitted with a single wait — vs the old path
-// which did NLAYERS separate copyToCPU+copyToGPU cycles.
-//
-// Both past and present buffers are pre-allocated to MAX_KV (see
-// preallocate_buffer in LoadModel setup), so ResizeInput on past keeps the
-// same physical VkBuffer (prealloc_keep_) and the device→device copy writes
-// the logical region into the reused buffer.
-void feedback_kv(const std::shared_ptr<Runtime>& rt,
-                 const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
-                 int nlayers, int nkv, int hd) {
-    auto dev = cmdpool->getVulkanDevice();
-    // First pass: derive kv_len + ResizeInput past (logical shape only; buffer
-    // reused via prealloc_keep_). Must happen before the copy pass because
-    // ResizeInput sets converted_=false (off-GPU), and as_storage_buffer below
-    // re-marks the buffer for the copy.
-    std::vector<int> kv_lens(nlayers);
-    for (int i = 0; i < nlayers; ++i) {
-        auto pres = rt->GetOutput("present_key_values_" + std::to_string(i));
-        auto pres_t = as_tensor<uint16_t>(pres);
-        int kv_len = pres_t->num_elements() / (2 * nkv * hd);
-        kv_lens[i] = kv_len;
-        std::vector<uint32_t> u32shape = {
-            1u, 2u, static_cast<uint32_t>(nkv),
-            static_cast<uint32_t>(kv_len), static_cast<uint32_t>(hd)};
-        rt->ResizeInput("past_key_values_" + std::to_string(i), u32shape);
-    }
-    // Single command buffer for all layers' device→device copies.
-    VulkanCommandBuffer cmd(cmdpool);
-    cmd.begin();
-    for (int i = 0; i < nlayers; ++i) {
-        auto pres = as_tensor<uint16_t>(
-            rt->GetOutput("present_key_values_" + std::to_string(i)));
-        auto past = as_tensor<uint16_t>(
-            rt->GetInput("past_key_values_" + std::to_string(i)));
-        auto pres_buf = pres->as_storage_buffer(dev, nullptr);
-        auto past_buf = past->as_storage_buffer(dev, nullptr);
-        VkDeviceSize copy_bytes = static_cast<VkDeviceSize>(
-            2 * nkv * kv_lens[i] * hd * sizeof(uint16_t));
-        if (copy_bytes == 0) {
-            continue;
-        }
-        pres_buf->transferReadBarrier(cmd.get(), copy_bytes, 0);
-        past_buf->copyStageBufferToBuffer(cmd.get(), pres_buf->getBuffer(),
-                                          0, copy_bytes, 0);
-        past->toGPU();
-    }
-    cmd.end();
-    cmd.submit(dev->getComputeQueue());
-    cmd.wait();  // single sync point for all layers
-}
-
 // Build the causal attention_bias (1,1,q,kv) fp16: upper-triangular above the
 // diagonal = FP16_MIN, else 0. For prefill q=kv=L; this is the only place a
 // non-zero bias is needed (decode rounds use all-zero full-history masks).
@@ -399,36 +354,28 @@ struct VisualEngine {
     }
 };
 
-// Expand each image_pad token (one per image, in order) into that image's
-// n_img copies, so the sequence length matches the visual feature count (HF
-// processor does this expansion based on grid_thw). Returns the expanded ids
-// plus one span per image (start index + count in the expanded sequence), in
-// the same order as the features. Extra image_pad tokens with no feature
-// left pass through unexpanded.
-struct ExpandedIds {
-    std::vector<uint32_t> ids;
-    struct Span { int start; int count; };
-    std::vector<Span> spans;   // one per expanded image, order == vfs
-    int img_start = -1;        // first image-token index (-1 if none)
-    int img_count = 0;         // total image tokens across all images
-};
-ExpandedIds expand_image_token(const std::vector<uint32_t>& ids,
-                               const std::vector<VisualFeatures>& vfs) {
-    ExpandedIds ex;
-    size_t img_i = 0;
-    for (size_t i = 0; i < ids.size(); ++i) {
-        if (ids[i] == IMAGE_PAD && img_i < vfs.size() && vfs[img_i].n_img > 0) {
-            const int n = vfs[img_i].n_img;
-            if (ex.img_start < 0) ex.img_start = static_cast<int>(ex.ids.size());
-            ex.img_count += n;
-            ex.spans.push_back({static_cast<int>(ex.ids.size()), n});
-            for (int k = 0; k < n; ++k) ex.ids.push_back(IMAGE_PAD);
-            ++img_i;
+// VKOP_RAW_PROMPT 调试路径：不过 chat template、也不累积历史，把一行输入当成
+// 独立序列（对齐 dump_llm_decode.py 那种 proc(text=[text]) 的参考）。这里只做
+// HF processor 的 image pad 展开，凑出 Conversation::render() 同款的序列描述。
+RenderedContext render_raw(const std::vector<uint32_t>& ids, uint32_t image_pad_id,
+                           const std::vector<ImageBlock>& blocks) {
+    RenderedContext r;
+    size_t next_block = 0;
+    for (uint32_t id : ids) {
+        if (image_pad_id && id == image_pad_id && next_block < blocks.size()) {
+            const ImageBlock& blk = blocks[next_block];
+            r.spans.push_back({static_cast<int>(r.ids.size()), blk.n_img,
+                               static_cast<int>(next_block)});
+            for (int k = 0; k < blk.n_img; ++k) r.ids.push_back(id);
+            ++next_block;
         } else {
-            ex.ids.push_back(ids[i]);
+            r.ids.push_back(id);
         }
     }
-    return ex;
+    r.mm_types.assign(r.ids.size(), 0);
+    for (const auto& s : r.spans)
+        for (int i = 0; i < s.count; ++i) r.mm_types[s.start + i] = 1;
+    return r;
 }
 
 } // namespace
@@ -513,7 +460,7 @@ int main(int argc, char** argv) {
     std::vector<VisualFeatures> vfs;
     std::vector<uint16_t> img_feat_cat;          // (total_img, hidden)
     std::vector<uint16_t> ds_cat[3];             // each (total_img, hidden)
-    std::vector<int> grid_thw_flat;              // (n_images * 3)
+    std::vector<int> feat_row0;                  // 每张图在拼接特征里的首行
     int total_img = 0;
     if (multimodal) {
         if (!arch.has_deepstack || !arch.has_image_pad_mask) {
@@ -524,13 +471,12 @@ int main(int argc, char** argv) {
             VisualEngine venc(cmdpool, visual_path);
             for (const auto& p : image_paths) {
                 auto vf = venc.run(p);
+                feat_row0.push_back(total_img);
                 img_feat_cat.insert(img_feat_cat.end(), vf.image_features.begin(),
                                     vf.image_features.end());
                 for (int d = 0; d < 3; ++d)
                     ds_cat[d].insert(ds_cat[d].end(), vf.deepstack[d].begin(),
                                      vf.deepstack[d].end());
-                grid_thw_flat.insert(grid_thw_flat.end(),
-                                     {vf.grid_t, vf.grid_h, vf.grid_w});
                 total_img += vf.n_img;
                 vfs.push_back(std::move(vf));
             }
@@ -541,25 +487,39 @@ int main(int argc, char** argv) {
         }
     }
 
-    // Pre-allocate the KV-cache buffers (past_key_values_i inputs +
-    // present_key_values_i outputs) to a max size once, so they are NOT
-    // reallocated every round as kv_len grows by 1. Each buffer holds
-    // (1, 2, NKV, MAX_KV, HD) fp16 = 2*nkv*MAX_KV*hd elements. With
-    // prealloc_keep_, make_vkbuff reuses the buffer (>= check) and
-    // recreate_storage_buffer skips the drop. MAX_KV covers prefill L +
-    // max_new decode tokens with headroom.
-    {
-        auto dev = cmdpool->getVulkanDevice();
-        const int MAX_KV = 8192;
-        std::size_t kv_elems =
-            static_cast<std::size_t>(2) * arch.nkv * MAX_KV * arch.hd;
-        for (int i = 0; i < arch.nlayers; ++i) {
-            auto pin = rt->GetInput("past_key_values_" + std::to_string(i));
-            auto pout = rt->GetOutput("present_key_values_" +
-                                      std::to_string(i));
-            as_tensor<uint16_t>(pin)->preallocate_buffer(dev, kv_elems);
-            as_tensor<uint16_t>(pout)->preallocate_buffer(dev, kv_elems);
-        }
+    // KV cache：每层 past/present 的 buffer 一次开好（MAX_KV 上界），之后每轮
+    // 只做逻辑 resize + present→past 回填。生命周期见 kv_cache.hpp。
+    const int MAX_KV = 8192;
+    KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, MAX_KV);
+
+    // 会话上下文：图片块先登记（视觉塔已跑完），每轮的 user/assistant turn 累积
+    // 在 Conversation 里，每轮整段重新 prefill。预算 = KV 上界减去本轮最多要生成
+    // 的 token 数，超预算整对（user+assistant）丢最旧的；VKOP_MAX_CTX 可覆盖。
+    Conversation conv(tok);
+    for (const auto& vf : vfs) {
+        conv.addBlock({vf.n_img, vf.grid_t, vf.grid_h, vf.grid_w});
+    }
+    int max_ctx = MAX_KV - max_new;
+    if (const char* e = std::getenv("VKOP_MAX_CTX")) {
+        const int v = std::atoi(e);
+        if (v > 0) max_ctx = v;
+    }
+    // raw 模式（对齐参考 dump）不过 chat template；没有模板时也没法累积历史，
+    // 两种情况都退化成「每条输入独立」。
+    const bool raw_mode = std::getenv("VKOP_RAW_PROMPT") != nullptr;
+    const bool multi_turn = !raw_mode && conv.has_template();
+    if (raw_mode || !multi_turn) {
+        std::printf("[ctx] 单轮模式（%s）：不累积历史\n",
+                    raw_mode ? "VKOP_RAW_PROMPT" : "tokenizer.bin 无 chat template");
+    } else {
+        std::printf("[ctx] 多轮上下文已启用，预算 %d tokens（KV 上界 %d）\n",
+                    max_ctx, MAX_KV);
+    }
+    if (!raw_mode && have_visual && !conv.has_template()) {
+        // 图像内容项要靠 chat template 的占位格式渲染，没模板就渲染不出图。
+        std::fprintf(stderr,
+            "[warn] tokenizer.bin 没有 chat template，无法渲染图像内容 —— 忽略 --image\n");
+        have_visual = false;
     }
 
     // Per-round reusable zero buffers (deepstack + decode attention_bias +
@@ -568,9 +528,10 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(arch.hidden)};
 
     // REPL loop.
-    std::printf("\n=== ready (max_new=%d, IM_END=%u). type a prompt, Ctrl-D to quit ===\n\n",
-                max_new, IM_END);
+    std::printf("\n=== ready (max_new=%d, im_end=%u). type a prompt, Ctrl-D to quit ===\n\n",
+                max_new, conv.im_end_id());
     std::string line;
+    int turn = 0;
     while (std::getline(std::cin, line)) {
         if (line.empty()) continue;
         // Phase boundary decode→prefill: previous prompt's decode left
@@ -579,48 +540,35 @@ int main(int argc, char** argv) {
         // blind reuse would corrupt the graph — reset every op's cache, and
         // do it BEFORE any input is filled (ResizeInput+fillToCPU).
         rt->invalidate_replay();
-        std::string prompt;
-        if (std::getenv("VKOP_RAW_PROMPT")) {
-            // Bypass chat template: encode the literal input (for matching the
-            // reference dump_llm_decode.py, which uses proc(text=[text])).
-            prompt = line;
-        } else {
-            // Render chat: user turn + generation prompt for assistant.
-            // Multimodal: one image content item per --image, before the text
-            // (each renders one image_pad marker, bound to its image in order).
-            std::vector<qwen::ChatMessage> msgs;
-            if (have_visual) {
-                std::vector<qwen::ChatContent> contents;
-                for (size_t k = 0; k < image_paths.size(); ++k)
-                    contents.push_back({/*type=*/"image", ""});
-                contents.push_back({/*type=*/"text", line});
-                msgs = {{/*role=*/"user", contents}};
-            } else {
-                msgs = {{/*role=*/"user", /*contents=*/{{/*type=*/"text", line}}}};
-            }
-            prompt = tok.apply_chat_template(msgs, /*add_generation_prompt=*/true);
-            if (prompt.empty()) {
-                // No chat template baked in → fall back to raw text.
-                prompt = line;
-            }
-        }
-        std::vector<uint32_t> raw_ids = tok.encode(prompt);
-        // Expand each image_pad token into that image's n_img copies (HF
-        // processor does this based on grid_thw). No-op when no visual.
-        ExpandedIds ex = expand_image_token(raw_ids, vfs);
-        std::vector<uint32_t> ids = ex.ids;
-        const int img_start = ex.img_start;
-        const int img_count = ex.img_count;
-        std::printf("[prompt] %zu tokens, %zu image span(s) (image tokens %d..%d)\n",
-                    ids.size(), ex.spans.size(), img_start,
-                    img_start + img_count - 1);
-        std::fflush(stdout);
 
-        if (have_visual && ex.spans.size() != vfs.size()) {
+        // 本轮的序列描述：会话模式走 Conversation（含历史），raw 模式把这一行
+        // 当成独立序列。会话图片属于第一轮，之后的轮不再重复贴图。
+        RenderedContext rctx;
+        if (raw_mode) {
+            rctx = render_raw(tok.encode(line), conv.image_pad_id(), conv.blocks());
+        } else {
+            if (!multi_turn) conv.clear();
+            const int n_img_this_turn =
+                (turn == 0 && have_visual && conv.has_template())
+                    ? static_cast<int>(vfs.size()) : 0;
+            conv.addUserTurn(line, /*block_first=*/0, n_img_this_turn);
+            if (conv.trimToBudget(max_ctx)) {
+                std::printf("[ctx] 超出预算 %d，已丢掉最旧的一问一答（当前历史 %d tokens）\n",
+                            max_ctx, conv.context_len());
+            }
+            rctx = conv.render();
+        }
+        const std::vector<uint32_t>& ids = rctx.ids;
+        const int img_count = rctx.image_tokens();
+        std::printf("[prompt] %zu tokens, %zu image span(s) (history %d turns)\n",
+                    ids.size(), rctx.spans.size(), static_cast<int>(conv.size()));
+        std::fflush(stdout);
+        if (static_cast<int>(ids.size()) + max_new > MAX_KV) {
             std::fprintf(stderr,
-                "[warn] prompt 里有 %zu 个 image_pad 标记，但有 %zu 张图 —— "
-                "只有前 %zu 张会被用上（chat template 可能不支持 image）\n",
-                ex.spans.size(), vfs.size(), ex.spans.size());
+                "[error] 序列 %zu tokens + 最多生成 %d 超出 KV 预分配上界 %d —— "
+                "调小 max_new / VKOP_MAX_CTX，或重新预分配更大的 KV\n",
+                ids.size(), max_new, MAX_KV);
+            break;
         }
 
         // ---- Prefill (q_len = L, kv_len = 0) ----
@@ -628,22 +576,29 @@ int main(int argc, char** argv) {
         std::printf("[prefill] L=%d building inputs...\n", L); std::fflush(stdout);
 
         // mm_token_type_ids (1, L): 0=text, 1=image. attention_mask all 1.
-        std::vector<int32_t> mtt(L, 0);
+        // 序列里图片位置的判定由 Conversation/render_raw 一起算好了。
+        const std::vector<int32_t>& mtt = rctx.mm_types;
         std::vector<int8_t> amask(L, 1);
-        for (const auto& sp : ex.spans)
-            for (int i = 0; i < sp.count; ++i) mtt[sp.start + i] = 1;
 
         // inputs_embeds (1, L, hidden): embed all ids, then scatter the visual
-        // image_features rows into the image-pad positions (多模态). The flat
-        // feature buffer is in the same image order as the spans.
+        // image_features rows into the image-pad positions (多模态). 按 span 的
+        // 出现顺序取每张图自己的特征行（裁切掉历史里的图时行号会跳过）。
         auto emb = embed_lookup(embed_table, ids, vocab, arch.hidden);
-        if (have_visual) {
-            int feat_row = 0;   // running row index into img_feat_cat
-            for (const auto& sp : ex.spans) {
+        std::vector<uint16_t> ds_turn;   // (img_count, hidden) 本轮用的 deepstack
+        if (have_visual && img_count > 0) {
+            for (int d = 0; d < 3; ++d)
+                ds_turn.assign(static_cast<size_t>(img_count) * arch.hidden, 0);
+            int feat_row = 0;   // running row index into emb / ds_turn
+            for (const auto& sp : rctx.spans) {
+                const int row0 = feat_row0[sp.block];
                 for (int i = 0; i < sp.count; ++i, ++feat_row) {
                     std::memcpy(&emb[(sp.start + i) * arch.hidden],
-                                &img_feat_cat[static_cast<size_t>(feat_row) * arch.hidden],
+                                &img_feat_cat[static_cast<size_t>(row0 + i) * arch.hidden],
                                 arch.hidden * sizeof(uint16_t));
+                    for (int d = 0; d < 3; ++d)
+                        std::memcpy(&ds_turn[static_cast<size_t>(feat_row) * arch.hidden],
+                                    &ds_cat[d][static_cast<size_t>(row0 + i) * arch.hidden],
+                                    arch.hidden * sizeof(uint16_t));
                 }
             }
         }
@@ -655,10 +610,19 @@ int main(int argc, char** argv) {
         // 纯文本用 arange；多模态走 get_rope_index 拿 rope_delta（decode 时用）。
         int64_t rope_delta = 0;
         if (arch.position_ids_dims == 3) {
+            // 本轮实际用到的图（按出现顺序）的 grid_thw，从 ImageBlock 现取。
+            std::vector<int> span_grid;
+            for (const auto& sp : rctx.spans) {
+                const ImageBlock& blk = conv.blocks()[sp.block];
+                span_grid.insert(span_grid.end(),
+                                 {blk.grid_t, blk.grid_h, blk.grid_w});
+            }
             auto ri = get_rope_index(reinterpret_cast<const int64_t*>(ids.data()),
                                      mtt.data(), amask.data(),
-                                     have_visual ? grid_thw_flat.data() : nullptr,
-                                     have_visual ? static_cast<int>(vfs.size()) : 0,
+                                     have_visual && img_count > 0
+                                         ? span_grid.data() : nullptr,
+                                     have_visual && img_count > 0
+                                         ? static_cast<int>(rctx.spans.size()) : 0,
                                      /*B=*/1, L);
             fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(L)},
                            ri.pos_ids.data());
@@ -684,12 +648,12 @@ int main(int argc, char** argv) {
         // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。多图时 HF 把每张
         // 图的 deepstack 按 prompt 顺序拼成 (total_img, hidden) 一个输入。
         if (arch.has_deepstack) {
-            if (have_visual) {
+            if (have_visual && img_count > 0) {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
                                     {static_cast<uint32_t>(img_count),
                                      static_cast<uint32_t>(arch.hidden)},
-                                    ds_cat[d].data());
+                                    ds_turn.data());
             } else {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
@@ -701,8 +665,8 @@ int main(int argc, char** argv) {
         // image_pad_mask (1, L): 仅多模态模型有此输入。
         if (arch.has_image_pad_mask) {
             std::vector<int8_t> mask(L, 0);
-            for (const auto& sp : ex.spans)
-                for (int i = 0; i < sp.count; ++i) mask[sp.start + i] = 1;
+            for (size_t i = 0; i < rctx.mm_types.size(); ++i)
+                mask[i] = rctx.mm_types[i] ? 1 : 0;
             rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(L)});
             auto t = rt->GetInput("image_pad_mask");
             auto tg = as_tensor<int8_t>(t);
@@ -710,17 +674,12 @@ int main(int argc, char** argv) {
             std::printf("  image_pad_mask ok\n"); std::fflush(stdout);
         }
 
-        // past_key_values_{i} (1, 2, nkv, 0, hd) empty.
-        for (int i = 0; i < arch.nlayers; ++i) {
-            std::string n = "past_key_values_" + std::to_string(i);
-            rt->ResizeInput(n, {1u, 2u, static_cast<uint32_t>(arch.nkv), 0u,
-                              static_cast<uint32_t>(arch.hd)});
-        }
+        // 本轮整段重新 prefill：past 的逻辑 kv_len 归零（buffer 复用预分配的那块）。
+        kv.reset_for_prefill();
         std::printf("  past_kv resize ok\n"); std::fflush(stdout);
 
         // Upload all inputs (跳过模型没有的 deepstack / image_pad_mask).
-        for (int i = 0; i < arch.nlayers; ++i)
-            upload_input(cmdpool, rt->GetInput("past_key_values_" + std::to_string(i)));
+        kv.upload();
         upload_input(cmdpool, rt->GetInput("inputs_embeds"));
         upload_input(cmdpool, rt->GetInput("position_ids"));
         upload_input(cmdpool, rt->GetInput("attention_bias"));
@@ -839,13 +798,12 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         // Feed KV cache back for decode rounds.
-        feedback_kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd);
-        int past_len = L;  // KV now holds L tokens.
+        int past_len = kv.feedback();   // == L，KV 现在装着整段 prompt
 
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
-            if (static_cast<uint32_t>(next_id) == IM_END) {
-                std::printf("[done] IM_END\n");
+            if (static_cast<uint32_t>(next_id) == conv.im_end_id()) {
+                std::printf("[done] 本轮结束\n");
                 break;
             }
             // cur_emb (1, 1, hidden) from the single next_id.
@@ -908,11 +866,16 @@ int main(int argc, char** argv) {
                         tok.decode({static_cast<uint32_t>(next_id)}).c_str());
             std::fflush(stdout);
 
-            feedback_kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd);
-            past_len += 1;
+            past_len = kv.feedback();
         }
 
         std::printf("\n=== full decode ===\n%s\n\n", tok.decode(out_ids).c_str());
+        // 回复原样进历史（不重新分词）：下一轮整段重新 prefill 时，模型看到的
+        // 就是它自己上一轮写下的 token。
+        if (!raw_mode) {
+            conv.addAssistantTurn(out_ids);
+            ++turn;
+        }
     }
     return 0;
 }

@@ -649,17 +649,21 @@ std::string Tokenizer::apply_chat_template(const std::vector<ChatMessage>& messa
     return out;
 }
 
-std::string Tokenizer::chat_role_shell(const std::string& role) const {
-    auto it = chat_template_.roles.find(role);
-    if (it == chat_template_.roles.end()) return "";
-    return it->second.prefix + it->second.suffix;
-}
-
 int32_t Tokenizer::special_token_id(const std::string& literal) const {
     for (const auto& st : special_tokens_) {
         if (st.content == literal) return static_cast<int32_t>(st.id);
     }
     return -1;
+}
+
+// 词表里的特殊 token 以完整字面量为 key，这里替调用方收两个常用的：结束符决定
+// 每轮在哪里停，图像 pad 决定 user 轮里哪个 token 要按 grid 展开成 N 份。
+int32_t Tokenizer::im_end_token_id() const {
+    return special_token_id("<|im_end|>");
+}
+
+int32_t Tokenizer::image_pad_token_id() const {
+    return special_token_id("<|image_pad|>");
 }
 
 } // namespace qwen

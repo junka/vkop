@@ -275,7 +275,7 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
   llm/tokenizer/qwen3_vl.bin
 ```
 
-多模态（单图，整轮会话共用一张图）：
+多模态（单图；`--image` 可重复，多图属于第一轮）：
 
 ```bash
 ./build/llm_chat \
@@ -292,7 +292,7 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
 | `embed_tokens.bin` | token→hidden 查表（fp16 `[151936,2048]`，~590MB） |
 | `tokenizer.bin` | BBPE 词表（`tokenizer_to_bin.py` 产物） |
 | `max_new`（可选） | 最大生成 token 数（含 prefill 后的全部 decode），默认 **64** |
-| `--image <img>` | 输入图片路径（多模态；需配合 `--visual`）。整会话共用一张图 |
+| `--image <img>` | 输入图片路径（多模态；需配合 `--visual`）。可重复，按给出顺序与 prompt 里的图像占位一一对应；这些图算在第一轮头上，之后的轮次通过历史上下文继续「看到」它们 |
 | `--visual <vkopbin>` | 视觉编码器 vkop 图（`visual.vkopbin`，~770MB）。多模态必需 |
 
 > 多模态约束：图片尺寸必须是 `patch_size*merge = 16*2 = 32` 的整数倍
@@ -300,13 +300,42 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
 > 报 "not divisible by patch*merge"。不同尺寸需重新导出 `visual.onnx` 并转换。
 
 启动时加载模型 + embedding + tokenizer（~2s），之后每轮 prefill/decode 约 1.5–2s
-（Intel ARL，buffer backend，fp16）。遇到 `<|im_end|>`（151645）自动停止当前轮。
+（Intel ARL，buffer backend，fp16）。遇到结束符自动停止当前轮。
+
+### 多轮上下文（Conversation）
+
+同一个 REPL 进程里，每条输入都带着之前的对话：`llm/exporter/conversation.hpp`
+存 token 级的轮次历史（user 轮含角色前后缀与展开后的图像占位；assistant 轮含
+**生成时的原始 ids**），`render()` 把整段历史 + assistant 引导串拼成一次 prefill
+的输入，**每轮 KV 从零重新算**。两条不变量：
+
+- assistant 的回复绝不重新分词。BBPE 的 decode→encode 不保证可逆（词首空格标记
+  在 decode 时被丢），重新 encode 会把模型「自己写下的那段历史」改成另一个序列。
+- 上下文策略全在上层：`trimToBudget()` 按 token 预算整对（user+assistant）丢掉最旧
+  的轮次，预算默认 `MAX_KV - max_new`（KV 预分配上界 8192），`VKOP_MAX_CTX` 可覆盖。
+  序列 + `max_new` 超出上界时直接报错退出，不静默扩大 buffer。
+
+跨轮**续用** KV（跳过已算前缀）是纯加速层，前提是新序列是上一轮的严格前缀扩展，
+校验点已经留在 `Conversation::prefixMatch()`；vkop 目前没有 paged KV / block
+table，所以这条还没接（也就没有 vLLM/SGLang 那种跨请求 prefix caching）。
+
+验证（纯文本 Qwen3-4B，`llm/exporter/text_qwen3/`）：
+
+```bash
+printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回复"好的"。\n我的名字是什么？我喜欢什么运动？\n' | \
+  ./build/llm_chat llm/exporter/text_qwen3/llm.vkopbin \
+  llm/exporter/text_qwen3/embed_tokens.bin llm/exporter/text_qwen3/tokenizer.bin 28
+# [prompt] 27 tokens (history 1 turns) → 好的
+# [prompt] 45 tokens (history 3 turns) → 你的名字是小明，你喜欢的运动是打篮球。
+# 单独问第二个问题（新进程、无历史）则答不出名字 —— 上下文确实生效。
+```
 
 ### 环境变量
 
 | 变量 | 作用 |
 |---|---|
-| `VKOP_RAW_PROMPT=1` | 跳过 chat template，把输入当 raw token 序列（对齐参考 `dump_llm_decode.py`，不走对话格式） |
+| `VKOP_RAW_PROMPT=1` | 跳过 chat template **和多轮历史**，每行输入独立（对齐参考 `dump_llm_decode.py`，不走对话格式） |
+| `VKOP_MAX_CTX=<tokens>` | 多轮上下文的 token 预算，默认 `8192 - max_new`；超预算整对丢掉最旧的一问一答 |
 | `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
 | `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |

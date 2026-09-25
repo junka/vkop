@@ -101,15 +101,15 @@ public:
     std::string apply_chat_template(const std::vector<ChatMessage>& messages,
                                     bool add_generation_prompt = true) const;
 
-    // 单个角色的「壳」= prefix + suffix（正文为空）。多轮对话里把已生成的回复
-    // 接回历史时，正文用的是生成时的 token ids（重新分词不保证可逆），只有壳
-    // 需要 encode；role 未知时返回空串。
-    std::string chat_role_shell(const std::string& role) const;
-
-    // 按字面量查已注册的特殊 token id（结束符/图像 pad 等）；未注册返回 -1。
-    int32_t special_token_id(const std::string& literal) const;
+    // 对话里最常用的两个特殊 token：结束符（决定每轮在哪停）和图像 pad
+    // （决定 user 轮里哪个 token 要按 grid 展开成 N 份）。未注册返回 -1。
+    int32_t im_end_token_id() const;
+    int32_t image_pad_token_id() const;
 
 private:
+    // 按字面量查已注册的特殊 token id；调用方走下面两个具名入口。
+    int32_t special_token_id(const std::string& literal) const;
+
     // BBpe 核心合并逻辑
     void bpe_merge(std::vector<uint32_t>& tokens) const;
 

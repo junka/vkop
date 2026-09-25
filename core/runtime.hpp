@@ -1,4 +1,6 @@
 // Copyright 2025 @junka
+#ifndef CORE_RUNTIME_HPP_
+#define CORE_RUNTIME_HPP_
 
 #include <string>
 #include <unordered_map>
@@ -188,3 +190,5 @@ class Runtime {
 
 } // namespace core
 } // namespace vkop
+
+#endif // CORE_RUNTIME_HPP_
