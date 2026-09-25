@@ -15,6 +15,7 @@ layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 #define FLOAT float
 #endif
 
+#include "../common/addressing.comp"
 #include "../common/activation.comp"
 #include "../common/broadcast.comp"
 
@@ -31,18 +32,21 @@ layout(push_constant) uniform constBuffer {
 } uConstant;
 
 void main() {
+    // The broadcast path samples at a coordinate other than this invocation's,
+    // so it needs the logical triple; under a folded grid gid is physical and
+    // must go through vkop_decode_self() first.
     ivec3 texCoord = ivec3(gl_GlobalInvocationID);
 
     // Fetch data from RGBA texture memory and perform element-wise addition
     FLOAT4 a, b;
     if (uConstant.broadcast == 0) {
-        a = FLOAT4(texelFetch(inputA, texCoord, 0));
-        b = FLOAT4(texelFetch(inputB, texCoord, 0));
+        a = FLOAT4(VKOP_SELF(inputA));
+        b = FLOAT4(VKOP_SELF(inputB));
     } else {
         fetchWithBroadcast(inputA, inputB, uConstant.shapeA, uConstant.shapeB, texCoord, a, b);
     }
     FLOAT4 sum = a + b;
     sum = activation(sum, uConstant.activation);
     // Write the result to the output RGBA texture
-    imageStore(uOutput, texCoord, sum);
+    VKOP_SELF_STORE(uOutput, sum);
 }

@@ -318,3 +318,10 @@ target_compile_definitions(ModelTest PRIVATE
     TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
 )
 add_test(ModelTest ModelTest)
+
+# Image layout accounting probe (not a gtest): reports driver rowPitch /
+# arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
+# single image2D, plus the real per-tensor gap for a given .vkopbin.
+# Run:  ./ImageLayoutProbe [path/to/model.vkopbin]
+add_executable(ImageLayoutProbe ImageLayoutProbe.cpp)
+target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)

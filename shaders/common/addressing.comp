@@ -1,0 +1,88 @@
+// Tensor addressing for the packed image layout.
+//
+// NCHW tensors live in RGBA texels: a [N, C, H, W] tensor becomes an
+// image2DArray of extent [W, N*H, UP_DIV(C,4)], and
+//
+//   texel(w, n*H + h, c/4).xyzw == x[n, (c/4)*4 + 0..3, h, w]
+//
+// So the logical coordinate triple every shader works in is (w, nh, c4).
+// This file is the single place that turns such a triple into a texel, so the
+// runtime can change the physical layout without touching each op.
+//
+// Two layouts share that logical domain:
+//
+//   VKOP_C4_FOLD 0 (current): the channel group is the array layer,
+//     texel = (w, nh, c4). Dispatch is (UP_DIV(W,16), UP_DIV(NH,16), C4), so
+//     gl_GlobalInvocationID *is* the logical coordinate.
+//   VKOP_C4_FOLD 1: the channel group is folded into the width,
+//     texel = (w + c4*W, nh, 0) -- one image2D per tensor. Dispatch is
+//     (UP_DIV(W*C4,16), UP_DIV(NH,16), 1), so the invocation ID is the
+//     *physical* texel and vkop_decode() recovers the logical triple.
+//
+// Folding costs one integer division per invocation in the ~15 shaders that
+// decode coordinates; it costs nothing in the elementwise ones, which never
+// look at their coordinates at all (see VKOP_SELF below) and therefore need no
+// width. That is why width only ever appears in the explicit-coordinate macros.
+#ifndef VKOP_ADDRESSING_COMP
+#define VKOP_ADDRESSING_COMP
+
+// Selected by the host build, not by the shader author: every shader in a plan
+// must agree, since they read and write each other's buffers.
+#ifndef VKOP_C4_FOLD
+#define VKOP_C4_FOLD 0
+#endif
+
+// Logical (w, nh, c4) -> physical texel. `width` is the tensor's own W,
+// ignored when the channel group stays in the array layer.
+#if VKOP_C4_FOLD
+#define VKOP_TEXEL(w, nh, c4, width) ivec3((w) + (c4) * (width), (nh), 0)
+#else
+#define VKOP_TEXEL(w, nh, c4, width) ivec3((w), (nh), (c4))
+#endif
+
+// Sampled load (sampler2DArray / sampler2D both take the same ivec3 + lod).
+#define VKOP_FETCH(tex, w, nh, c4, width) texelFetch(tex, VKOP_TEXEL(w, nh, c4, width), 0)
+
+// Writeable store.
+#define VKOP_STORE(img, w, nh, c4, width, value) imageStore(img, VKOP_TEXEL(w, nh, c4, width), value)
+
+// Access at the invocation's own coordinate: no translation is possible or
+// needed, because under either layout the dispatch grid was chosen so that
+// gl_GlobalInvocationID lands on exactly this tensor's texel. Elementwise ops
+// use these to make that dependency explicit instead of incidental.
+#define VKOP_SELF(tex) texelFetch(tex, ivec3(gl_GlobalInvocationID), 0)
+#define VKOP_SELF_STORE(img, value) imageStore(img, ivec3(gl_GlobalInvocationID), value)
+
+#if VKOP_C4_FOLD
+// Recover the logical triple from a folded dispatch index. `width` and `height`
+// are this tensor's W and N*H; `c4_count` is UP_DIV(C, 4). Returns false past
+// the tail of the rounded-up dispatch grid, which is the bounds check shaders
+// used to get for free from comparing gid against imageSize(uOutput).
+bool vkop_decode(ivec3 gid, int width, int height, int c4_count,
+                 out int w, out int nh, out int c4) {
+    c4 = gid.x / width;
+    if (c4 >= c4_count) return false;
+    w = gid.x - c4 * width;
+    nh = gid.y;
+    return nh < height;
+}
+#else
+bool vkop_decode(ivec3 gid, int width, int height, int c4_count,
+                 out int w, out int nh, out int c4) {
+    w = gid.x;
+    nh = gid.y;
+    c4 = gid.z;
+    return w < width && nh < height && c4 < c4_count;
+}
+#endif
+
+// Same, for the usual case of decoding this invocation's own ID. Shaders call
+// this instead of reading gl_GlobalInvocationID components directly, which is
+// what lets the two dispatch grids differ without the op noticing.
+bool vkop_decode_self(int width, int height, int c4_count,
+                      out int w, out int nh, out int c4) {
+    return vkop_decode(ivec3(gl_GlobalInvocationID), width, height, c4_count,
+                       w, nh, c4);
+}
+
+#endif // VKOP_ADDRESSING_COMP

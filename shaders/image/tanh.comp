@@ -1,5 +1,7 @@
 #version 450 core
 
+#include "../common/addressing.comp"
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 // Binding points for input and output textures
@@ -7,8 +9,7 @@ layout(binding = 0) writeonly uniform image2DArray uOutput;
 layout(binding = 1) uniform sampler2DArray uInput;
 
 void main() {
-    ivec3 texCoord = ivec3(gl_GlobalInvocationID);
-    vec4 a = texelFetch(uInput, texCoord, 0);
+    vec4 a = VKOP_SELF(uInput);
     vec4 ret = tanh(a);
-    imageStore(uOutput, texCoord, ret);
+    VKOP_SELF_STORE(uOutput, ret);
 }

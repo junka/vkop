@@ -2,13 +2,11 @@
 #define BROADCAST_COMP
 #extension GL_AMD_gpu_shader_half_float: enable
 
-bool areTextureArraysSameSize(sampler2DArray inputA, sampler2DArray inputB) {
-    ivec3 sizeA = textureSize(inputA, 0);
-    ivec3 sizeB = textureSize(inputB, 0);
-    return sizeA.x == sizeB.x && sizeA.y == sizeB.y && sizeA.z == sizeB.z;
-}
+#include "addressing.comp"
 
 // NCHW -> W, N * H, C4
+// Returns a *logical* coordinate: folding into the physical texel happens at the
+// fetch, where the operand's own width is known (shape is nchw, so shape.w is W).
 ivec3 getBroadcastCoord(ivec3 originalCoord, ivec4 shape) {
     return ivec3(
         shape.w == 1 ? 0 : originalCoord.x,
@@ -49,26 +47,26 @@ f16vec4 broadcastChannels(f16vec4 data, int chan4, int total_chan) {
 }
 
 void fetchWithBroadcast(sampler2DArray inputA, sampler2DArray inputB, ivec4 shapeA, ivec4 shapeB, ivec3 texCoord, out vec4 valueA, out vec4 valueB) {
-    ivec3 sampleCoordA = getBroadcastCoord(texCoord, shapeA);
-    ivec3 sampleCoordB = getBroadcastCoord(texCoord, shapeB);
-    valueA = texelFetch(inputA, sampleCoordA, 0);
-    valueB = texelFetch(inputB, sampleCoordB, 0);
+    ivec3 coordA = getBroadcastCoord(texCoord, shapeA);
+    ivec3 coordB = getBroadcastCoord(texCoord, shapeB);
+    valueA = VKOP_FETCH(inputA, coordA.x, coordA.y, coordA.z, shapeA.w);
+    valueB = VKOP_FETCH(inputB, coordB.x, coordB.y, coordB.z, shapeB.w);
 
-    valueA = broadcastChannels(valueA, sampleCoordA.z, shapeA.y);
-    valueB = broadcastChannels(valueB, sampleCoordB.z, shapeB.y);
+    valueA = broadcastChannels(valueA, coordA.z, shapeA.y);
+    valueB = broadcastChannels(valueB, coordB.z, shapeB.y);
 }
 
 
 void fetchWithBroadcast(sampler2DArray inputA, sampler2DArray inputB, ivec4 shapeA, ivec4 shapeB, ivec3 texCoord, 
     out f16vec4 valueA, out f16vec4 valueB) {
 
-    ivec3 sampleCoordA = getBroadcastCoord(texCoord, shapeA);
-    ivec3 sampleCoordB = getBroadcastCoord(texCoord, shapeB);
-    valueA = f16vec4(texelFetch(inputA, sampleCoordA, 0));
-    valueB = f16vec4(texelFetch(inputB, sampleCoordB, 0));
+    ivec3 coordA = getBroadcastCoord(texCoord, shapeA);
+    ivec3 coordB = getBroadcastCoord(texCoord, shapeB);
+    valueA = f16vec4(VKOP_FETCH(inputA, coordA.x, coordA.y, coordA.z, shapeA.w));
+    valueB = f16vec4(VKOP_FETCH(inputB, coordB.x, coordB.y, coordB.z, shapeB.w));
 
-    valueA = broadcastChannels(valueA, sampleCoordA.z, shapeA.y);
-    valueB = broadcastChannels(valueB, sampleCoordB.z, shapeB.y);
+    valueA = broadcastChannels(valueA, coordA.z, shapeA.y);
+    valueB = broadcastChannels(valueB, coordB.z, shapeB.y);
 }
 
 #endif // BROADCAST_COMP

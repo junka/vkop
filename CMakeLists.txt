@@ -183,6 +183,10 @@ file(GLOB_RECURSE SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
 # compilation (they are pulled in by image/ and buffer/ shaders).
 list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
 
+# glslc resolves #include but cmake does not track it, so editing a shared
+# header would silently rebuild nothing. Track them explicitly.
+file(GLOB SHADER_INCLUDES ${SHADER_DIR}/common/*.comp)
+
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
 
@@ -262,7 +266,7 @@ foreach(SHADER ${SHADER_FILES})
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
         COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${_BUF_SHADER_FLAGS}
-        DEPENDS ${SHADER}
+        DEPENDS ${SHADER} ${SHADER_INCLUDES}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
     add_custom_command(
