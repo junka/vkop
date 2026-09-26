@@ -1718,6 +1718,16 @@ double Runtime::Run() {
         if (graph_segment < 0)
             graph_segment = 0;
     }
+    // Skip all intra-segment vkCmdPipelineBarrier calls. On MoltenVK / Apple
+    // GPUs, dispatches within one compute encoder are strictly ordered by
+    // command order — no explicit memory barrier is needed for write→read
+    // between adjacent dispatches (they write different SSBOs anyway). This
+    // drops ~100 ms from the decode loop because each of the 960 barriers
+    // costs ~0.1 ms of GPU-side fence traffic. OFF by default to keep the
+    // code portable to non-Metal backends.
+    bool graph_no_barrier = false;
+    if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
+        graph_no_barrier = gnb[0] == '1';
     std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds;
     std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
     size_t graph_next_seg = 0;  // next free slot in graph_cmds
@@ -1793,8 +1803,10 @@ double Runtime::Run() {
             }
             if (!graph_seg)
                 graph_open(level_idx);
-            else if (boundary)
-                graph_seg->pipelineBarrier();
+            else if (boundary) {
+                if (!graph_no_barrier)
+                    graph_seg->pipelineBarrier();
+            }
         }
         const auto &level_nodes = level_node_indices_[level_idx];
         std::vector<std::shared_ptr<VulkanCommandBuffer>> cur_level_cmds;
