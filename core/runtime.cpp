@@ -144,12 +144,13 @@ void Runtime::LoadModel() {
             inputs_for_node_type[init.name] == "Conv") {
             tensor->set_transpose();
             // 1x1 weights have always been folded into a single-layer image;
-            // VKOP_CONV_WEIGHT_FOLD extends that to kxk, where the array pitch
+            // kxk is folded the same way, since that is where the array pitch
             // padding actually is (a [3, K_H*Cin, C4] weight image pays ~78%
             // waste on its 3-texel rows). conv2d.comp reads the same flag to
-            // pick its weight addressing, so both layouts share one binary.
+            // pick its weight addressing, so both layouts share one binary, and
+            // VKOP_CONV_WEIGHT_FOLD=0 keeps the array layout for A/B runs.
             const char *fold_env = std::getenv("VKOP_CONV_WEIGHT_FOLD");
-            bool fold_kxk = fold_env != nullptr && fold_env[0] == '1';
+            bool fold_kxk = fold_env == nullptr || fold_env[0] != '0';
             // Only 4-D (image) conv weights; a 5-D Conv3d weight has no folded
             // addressing in conv2d.comp and must stay an array image.
             if (init.dims.size() == 4 &&
@@ -194,9 +195,9 @@ void Runtime::LoadModel() {
             inputs_for_node_type[init.name] == "Conv") {
             tensor->set_transpose();
             const char *fold_env = std::getenv("VKOP_CONV_WEIGHT_FOLD");
-            bool fold_kxk = fold_env != nullptr && fold_env[0] == '1';
-            // See handle_floating_point_tensor for why the folded layout is
-            // gated on an env var.
+            bool fold_kxk = fold_env == nullptr || fold_env[0] != '0';
+            // See handle_floating_point_tensor for why the folded layout keeps
+            // an env override: VKOP_CONV_WEIGHT_FOLD=0 is only an A/B switch.
             if (init.dims.size() == 4 &&
                 ((init.dims[2] == 1 && init.dims[3] == 1) || fold_kxk)) {
                 tensor->set_pack();

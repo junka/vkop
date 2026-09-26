@@ -189,13 +189,12 @@ int bytes_for_format(VkFormat f) {
 enum class Role {
     Activation, // runtime tensor: folded layout has NO shader support today
     Kernel1x1,  // 1x1 conv weight: conv1x1()/pack path already exists
-    Kernel3x3,  // kxk conv weight: would need a new folded shader branch
+    Kernel3x3,  // kxk conv weight: conv2d.comp folds it through wfold
 };
 
 struct Shape {
     std::string name;
     int n, c, h, w;
-    bool pack;     // fold C4 into width (1x1 conv weights)
     bool transpose; // conv weight layout: layers = C_in/4
     Role role = Role::Activation;
 };
@@ -249,7 +248,9 @@ Decision decide_fold(const Row &r) {
         d.pct = 100.0 * (double)d.saves / (double)arr;
     }
     d.want_fold = d.fits && d.saves >= 32u * 1024u && d.pct >= 10.0;
-    d.shaders_support = (r.role == Role::Kernel1x1);
+    // conv2d.comp addresses folded weights for both kernel sizes (wfold); an
+    // activation fold would still need every consumer's grid folded.
+    d.shaders_support = (r.role == Role::Kernel1x1 || r.role == Role::Kernel3x3);
     return d;
 }
 
@@ -263,12 +264,11 @@ Row measure_shape(const Shape &s, VkFormat format, bool verbose) {
     r.role = s.role;
     r.compact = static_cast<uint64_t>(s.w) * (s.h * batch) * chan4 * 4 * bpe;
 
+    // The array column is by definition the UNFOLDED extent: this function
+    // compares the two candidate layouts, so it never follows whichever one the
+    // runtime currently has selected.
     int width = s.w;
     int layers = chan4;
-    if (s.pack) {
-        width = s.w * chan4;
-        layers = 1;
-    }
     r.width = width;
     r.height = s.h * batch;
     r.layers = layers;
@@ -345,7 +345,7 @@ void print_row(const Row &r) {
     }
     Decision d = decide_fold(r);
     const char *role = r.role == Role::Kernel1x1   ? "kernel1x1(shaders OK)"
-                       : r.role == Role::Kernel3x3 ? "kernel3x3(NEEDS shader)"
+                       : r.role == Role::Kernel3x3 ? "kernel3x3(shaders OK)"
                                                    : "activation(NEEDS shader)";
     const char *verdict;
     if (!d.want_fold) {
@@ -420,25 +420,25 @@ void report_synthetic() {
     // heuristic is exercised across a whole real CNN without a 130MB download.
     const Shape shapes[] = {
         // stem + stage activations: [n, c, h, w]
-        {"act stem 64x112x112", 1, 64, 112, 112, false, false, Role::Activation},
-        {"act 64x56x56", 1, 64, 56, 56, false, false, Role::Activation},
-        {"act 128x28x28", 1, 128, 28, 28, false, false, Role::Activation},
-        {"act 256x28x28", 1, 256, 28, 28, false, false, Role::Activation},
-        {"act 256x14x14", 1, 256, 14, 14, false, false, Role::Activation},
-        {"act 512x14x14", 1, 512, 14, 14, false, false, Role::Activation},
-        {"act 512x7x7", 1, 512, 7, 7, false, false, Role::Activation},
-        {"act 2048x7x7", 1, 2048, 7, 7, false, false, Role::Activation},
+        {"act stem 64x112x112", 1, 64, 112, 112, false, Role::Activation},
+        {"act 64x56x56", 1, 64, 56, 56, false, Role::Activation},
+        {"act 128x28x28", 1, 128, 28, 28, false, Role::Activation},
+        {"act 256x28x28", 1, 256, 28, 28, false, Role::Activation},
+        {"act 256x14x14", 1, 256, 14, 14, false, Role::Activation},
+        {"act 512x14x14", 1, 512, 14, 14, false, Role::Activation},
+        {"act 512x7x7", 1, 512, 7, 7, false, Role::Activation},
+        {"act 2048x7x7", 1, 2048, 7, 7, false, Role::Activation},
         // conv weights [cout, cin, kh, kw], transpose layout:
         //   width=k_w, height=k_h*cin, layers=cout/4 (grouped per shader).
-        {"w 3x3 64->64", 64, 64, 3, 3, false, true, Role::Kernel3x3},
-        {"w 3x3 128->128", 128, 128, 3, 3, false, true, Role::Kernel3x3},
-        {"w 3x3 256->256", 256, 256, 3, 3, false, true, Role::Kernel3x3},
-        {"w 3x3 512->512", 512, 512, 3, 3, false, true, Role::Kernel3x3},
-        {"w 1x1 64->256 (proj)", 256, 64, 1, 1, false, true, Role::Kernel1x1},
-        {"w 1x1 256->64 (se)", 64, 256, 1, 1, false, true, Role::Kernel1x1},
-        {"w 1x1 512->256 (se)", 256, 512, 1, 1, false, true, Role::Kernel1x1},
+        {"w 3x3 64->64", 64, 64, 3, 3, true, Role::Kernel3x3},
+        {"w 3x3 128->128", 128, 128, 3, 3, true, Role::Kernel3x3},
+        {"w 3x3 256->256", 256, 256, 3, 3, true, Role::Kernel3x3},
+        {"w 3x3 512->512", 512, 512, 3, 3, true, Role::Kernel3x3},
+        {"w 1x1 64->256 (proj)", 256, 64, 1, 1, true, Role::Kernel1x1},
+        {"w 1x1 256->64 (se)", 64, 256, 1, 1, true, Role::Kernel1x1},
+        {"w 1x1 512->256 (se)", 256, 512, 1, 1, true, Role::Kernel1x1},
         // final head: FC-as-1x1 over 2048 channels at 1x1 spatial.
-        {"act 2048x1x1 (pool)", 1, 2048, 1, 1, false, false, Role::Activation},
+        {"act 2048x1x1 (pool)", 1, 2048, 1, 1, false, Role::Activation},
     };
     for (VkFormat format : {VK_FORMAT_R32G32B32A32_SFLOAT,
                             VK_FORMAT_R16G16B16A16_SFLOAT}) {
@@ -509,14 +509,11 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
         s.c = dims[nd - 3];
         s.h = dims[nd - 2];
         s.w = dims[nd - 1];
-        s.pack = t->get_pack();
         s.transpose = t->get_transpose();
-        // The runtime sets transpose_ only on Conv weights and pack_ only on
-        // 1x1 Conv weights (runtime.cpp:146), so the flags identify the role.
-        if (s.pack) {
-            s.role = Role::Kernel1x1;
-        } else if (s.transpose) {
-            s.role = Role::Kernel3x3;
+        // transpose_ marks Conv weights; the kernel extent says which size,
+        // because pack_ is now set for kxk weights too (folded by default).
+        if (s.transpose) {
+            s.role = (s.w == 1 && s.h == 1) ? Role::Kernel1x1 : Role::Kernel3x3;
         } else {
             s.role = Role::Activation;
         }
@@ -581,11 +578,11 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
            (double)total_folded / 1048576.0);
 
     printf("\n  fold decision (threshold: >32KB AND >10%% AND width<=limit):\n");
-    printf("    FOLD NOW (1x1 kernel, conv1x1/pack path exists): %d tensors, "
-           "%.1f MB recoverable\n",
+    printf("    foldable with the addressing conv2d.comp has today (any conv "
+           "weight, 1x1 or kxk): %d tensors, %.1f MB recoverable\n",
            fold_now_cnt, (double)foldable_now / 1048576.0);
-    printf("    FOLD candidate but NEEDS a new shader branch (kxk kernel / "
-           "activation): %d tensors, %.1f MB recoverable\n",
+    printf("    needs a new folded shader branch (activations): %d tensors, "
+           "%.1f MB\n",
            needs_shader_cnt, (double)foldable_needs_shader / 1048576.0);
 }
 

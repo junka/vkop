@@ -372,19 +372,19 @@ void grouped_conv2d() {
             for (int ky = 0; ky < K_H; ++ky) {
                 int iy = s0.y + ky * uConstant.dilation.y;
                 if (iy < 0 || iy >= H_in) continue;
+                int in_y = n * H_in + iy;
 
-                for (int kx = 0; kx < K_W; ++kx) {
-                    int ix = s0.x + kx * uConstant.dilation.x;
-                    if (ix < 0 || ix >= W_in) continue;
-                    if (use_vec4) {
-                        for (int v = 0; v < num_vec4; ++v) {
-                            int global_ic0 = ic_start + v * 4;
-                            int input_layer = global_ic0 / 4;
-                            int in_y = n * H_in + iy;
+                if (use_vec4) {
+                    for (int v = 0; v < num_vec4; ++v) {
+                        int global_ic0 = ic_start + v * 4;
+                        int input_layer = global_ic0 / 4;
+                        int local_ic = global_ic0 - ic_start;
+                        for (int kx = 0; kx < K_W; ++kx) {
+                            int ix = s0.x + kx * uConstant.dilation.x;
+                            if (ix < 0 || ix >= W_in) continue;
 
                             FLOAT4 x_vec = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)); // ic4
 
-                            int local_ic = global_ic0 - ic_start;
                             // Each output channel has its own row in Y, same layer c4
                             FLOAT4 w0 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ic * K_H, c4, K_W, wfold));
                             FLOAT4 w1 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + (local_ic + 1) * K_H, c4, K_W, wfold));
@@ -403,14 +403,19 @@ void grouped_conv2d() {
                             acc_local += x_vec.z * w2;
                             acc_local += x_vec.w * w3;
                         }
-                    } else {
-                        for (int ic = ic_start; ic < ic_end; ++ic) {
-                            int input_layer = ic / 4;
-                            int input_comp = ic % 4;
-                            int in_y = n * H_in + iy;
-                            FLOAT x = FLOAT(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp]);
+                    }
+                } else {
+                    for (int ic = ic_start; ic < ic_end; ++ic) {
+                        int input_layer = ic / 4;
+                        int input_comp = ic % 4;
+                        int local_ic = ic - ic_start;
+                        // kx innermost: its K_W texels are the only contiguous part of a
+                        // weight row, and a folded row is barely wider than one line.
+                        for (int kx = 0; kx < K_W; ++kx) {
+                            int ix = s0.x + kx * uConstant.dilation.x;
+                            if (ix < 0 || ix >= W_in) continue;
 
-                            int local_ic = ic - ic_start;
+                            FLOAT x = FLOAT(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0)[input_comp]);
 
                             FLOAT4 w_vec = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ic * K_H, c4, K_W, wfold));
                             if (uConstant.accuracy == 2) {
@@ -436,17 +441,19 @@ void grouped_conv2d() {
                 for (int ky = 0; ky < K_H; ++ky) {
                     int iy = s0.y + ky * uConstant.dilation.y;
                     if (iy < 0 || iy >= H_in) continue;
-                    for (int kx = 0; kx < K_W; ++kx) {
-                        int ix = s0.x + kx * uConstant.dilation.x;
-                        if (ix < 0 || ix >= W_in) continue;
+                    int in_y = n * H_in + iy;
+                    // kx innermost: its K_W texels are the only contiguous part
+                    // of a weight row, and a folded row is one cache line wide.
+                    for (int ci = ic_start; ci < ic_end; ++ci) {
+                        int global_ci4 = ci / 4;
+                        int global_ci_comp = ci % 4;
+                        int local_ci = ci - ic_start;
+                        for (int kx = 0; kx < K_W; ++kx) {
+                            int ix = s0.x + kx * uConstant.dilation.x;
+                            if (ix < 0 || ix >= W_in) continue;
 
-                        for (int ci = ic_start; ci < ic_end; ++ci) {
-                            int in_y = n * H_in + iy;
-                            int global_ci4 = ci / 4;
-                            int global_ci_comp = ci % 4;
                             FLOAT x = FLOAT(texelFetch(uInput, ivec3(ix, in_y, global_ci4), 0)[global_ci_comp]);
 
-                            int local_ci = ci - ic_start;
                             FLOAT w = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ci * K_H, c4, K_W, wfold)[comp]);
                             if (uConstant.accuracy == 2) {
                                 w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
@@ -454,7 +461,6 @@ void grouped_conv2d() {
 
                             sum += x * w;
                         }
-                        
                     }
                 }
                 acc[comp] = sum;
