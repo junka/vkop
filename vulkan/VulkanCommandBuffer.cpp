@@ -9,6 +9,20 @@ namespace vkop {
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
+std::function<void()> VulkanCommandBuffer::pre_readback_hook = nullptr;
+
+void VulkanCommandBuffer::pipelineBarrier() {
+    VkMemoryBarrier barrier{};
+    barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    barrier.pNext = nullptr;
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask =
+        VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    vkCmdPipelineBarrier(m_commandBuffer_, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &barrier, 0,
+                         nullptr, 0, nullptr);
+}
+
 VulkanCommandBuffer::VulkanCommandBuffer(
     std::shared_ptr<VulkanCommandPool> cmdpool, int id)
     : id_(id), m_cmdpool_(std::move(cmdpool)) {

@@ -1642,22 +1642,22 @@ double Runtime::Run() {
     // Gated by VKOP_BATCH_LEVELS=N. Default BATCH_LEVELS=16. Setting N=1 is
     // identical to the old per-level behavior. Setting N=0 flushes every
     // level (debug).
-    int batch_levels = 0;  // default OFF: Apple driver does not honor timeline
-                           // waits across VkSubmitInfo array items within a
-                           // single vkQueueSubmit (every batch > 1 level
-                           // produces wrong outputs). Re-enable on platforms
-                           // where the driver correctly chains timeline across
-                           // array items (Linux/Windows).
+    int batch_levels = 0; // default OFF: Apple driver does not honor timeline
+                          // waits across VkSubmitInfo array items within a
+                          // single vkQueueSubmit (every batch > 1 level
+                          // produces wrong outputs). Re-enable on platforms
+                          // where the driver correctly chains timeline across
+                          // array items (Linux/Windows).
     if (const char *bl = std::getenv("VKOP_BATCH_LEVELS")) {
         batch_levels = std::atoi(bl);
-        if (batch_levels < 0) batch_levels = 0;
+        if (batch_levels < 0)
+            batch_levels = 0;
     }
     auto flush_batched = [&](std::vector<std::vector<VkSubmitInfo>> &bsis,
                              int nlanes) {
         for (int ci = 0; ci < nlanes; ci++) {
             if (!bsis[ci].empty()) {
-                VulkanCommandBuffer::submit(dev->getComputeQueue(ci),
-                                            bsis[ci]);
+                VulkanCommandBuffer::submit(dev->getComputeQueue(ci), bsis[ci]);
                 bsis[ci].clear();
             }
         }
@@ -1672,8 +1672,130 @@ double Runtime::Run() {
     if (!readback_learned) {
         level_readback_.assign(level_node_indices_.size(), false);
     }
+
+    // -------------------------------------------------------------------
+    // Graph submit (VKOP_GRAPH_SUBMIT): record every level's ops into ONE
+    // shared command buffer and submit once per segment, instead of one
+    // vkQueueSubmit per level. Measured on MoltenVK, a vkQueueSubmit costs
+    // ~0.31ms of fixed driver time almost regardless of its contents, so the
+    // 981 per-level submits of the Qwen3-8B decode graph are ~324ms of the
+    // ~365ms steady-state round (folding the same 981 VkSubmitInfos into ONE
+    // call measured 22-26ms — the cost is the call count, not the payload).
+    // The ordering that used to come from the per-op timeline-semaphore chain
+    // is provided instead by (a) a full pipeline barrier at each level boundary
+    // inside the recording, and (b) the same timeline chain kept BETWEEN
+    // segments — the only submit shape Apple's driver honors a timeline wait
+    // in (a wait on a non-first VkSubmitInfo array item is silently ignored).
+    //
+    // Readback levels become segment boundaries: Tensor::copyToCPU issues its
+    // own submit+wait and must see its producers already submitted. They are
+    // located exactly, at the moment of the readback, through
+    // VulkanCommandBuffer::pre_readback_hook — not predicted from a learned
+    // map, which is phase-specific (prefill 328/981 readback levels vs decode
+    // 0/981) and would read stale data on a wrong guess.
+    const char *gs_env = std::getenv("VKOP_GRAPH_SUBMIT");
+    // Every segment is submitted to queue0 regardless of how many compute
+    // queues the device exposes: a segment's ops are packed into one command
+    // buffer and ordered by pipeline barriers, which requires them to share a
+    // queue. The per-level path's lane spread is unavailable here, but the
+    // level's ops are already recorded in order and the graph's parallelism is
+    // intra-level anyway.
+    bool graph_mode = gs_env && gs_env[0] == '1';
+    if (graph_mode && replay_mode_) {
+        // A recording shared with other ops cannot be cached per op, and replay
+        // buys nothing here: record is ~18ms/round against the ~324ms of submit
+        // this mode removes.
+        for (auto &op : node_ops_)
+            op->enable_replay(false);
+        replay_mode_ = false;
+    }
+    // Optional cap on levels per segment (VKOP_GRAPH_SEGMENT=N). 0 keeps one
+    // segment per readback-bounded stretch — the fast path, one command buffer
+    // and one submit for the whole 981-level decode graph.
+    int graph_segment = 0;
+    if (const char *gse = std::getenv("VKOP_GRAPH_SEGMENT")) {
+        graph_segment = std::atoi(gse);
+        if (graph_segment < 0)
+            graph_segment = 0;
+    }
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds;
+    std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
+    size_t graph_next_seg = 0;  // next free slot in graph_cmds
+    size_t graph_seg_start = 0; // level_idx the open segment started at
+    uint64_t graph_prev_val = 0;
+    VkSemaphore graph_prev_sem = VK_NULL_HANDLE;
+    int graph_op_idx = -1;   // node currently inside onExecute
+    int graph_readbacks = 0; // readback-hook firings this Run()
+    // One persistent command buffer per segment ordinal so rounds reuse the
+    // pool slots, and so the readback hook always opens a *distinct* buffer: a
+    // VkSubmitInfo may not wait on the semaphore it signals.
+    auto graph_open = [&](size_t level_idx) {
+        if (graph_next_seg >= graph_cmds.size()) {
+            graph_cmds.push_back(std::make_shared<VulkanCommandBuffer>(
+                m_cmdpool_, static_cast<int>(graph_next_seg)));
+        }
+        graph_seg = graph_cmds[graph_next_seg++];
+        graph_seg->clearWaits();
+        graph_seg->begin();
+        graph_seg_start = level_idx;
+    };
+    // Close + submit the open segment, chaining it onto the previous segment's
+    // timeline signal so the two are ordered on the queue.
+    auto graph_submit = [&]() {
+        if (!graph_seg)
+            return;
+        graph_seg->end();
+        if (graph_prev_sem != VK_NULL_HANDLE)
+            graph_seg->addWait(graph_prev_sem, graph_prev_val);
+        // Time the submit itself: MoltenVK encodes the whole command buffer
+        // into a Metal command buffer synchronously inside vkQueueSubmit, so a
+        // big segment's encoding cost lands here rather than in the GPU wait.
+        auto gs_t0 = run_profile ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        graph_prev_val = graph_seg->submit(queue0);
+        graph_prev_sem = graph_seg->getSignalSemaphore();
+        graph_seg = nullptr;
+        if (run_profile) {
+            auto gs_t1 = std::chrono::steady_clock::now();
+            prof_submit_ms +=
+                std::chrono::duration<double, std::milli>(gs_t1 - gs_t0)
+                    .count();
+        }
+    };
+    if (graph_mode) {
+        VulkanCommandBuffer::pre_readback_hook = [&]() {
+            graph_readbacks++;
+            // Close+submit everything recorded so far (this op's producers plus
+            // its own pre-readback commands), then reopen a segment and repoint
+            // the op at it so the remainder of its recording has a live target.
+            graph_submit();
+            graph_open(graph_seg_start);
+            if (graph_op_idx >= 0)
+                node_ops_[graph_op_idx]->repoint_graph_cmd(graph_seg);
+        };
+    }
+    int graph_readbacks_lvl = 0; // readback count at the current level's start
+
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
          level_idx++) {
+        // Graph mode: keep a segment open and put a memory barrier between the
+        // previous level's ops and this level's (the per-op timeline waits do
+        // not exist inside a single recording). VKOP_GRAPH_SEGMENT=N
+        // additionally forces a submit every N levels.
+        if (graph_mode) {
+            graph_readbacks_lvl = graph_readbacks;
+            bool boundary = graph_seg && level_idx != graph_seg_start;
+            if (boundary && graph_segment > 0 &&
+                static_cast<int>(level_idx - graph_seg_start) >=
+                    graph_segment) {
+                graph_submit();
+                boundary = false;
+            }
+            if (!graph_seg)
+                graph_open(level_idx);
+            else if (boundary)
+                graph_seg->pipelineBarrier();
+        }
         const auto &level_nodes = level_node_indices_[level_idx];
         std::vector<std::shared_ptr<VulkanCommandBuffer>> cur_level_cmds;
         bool level_had_readback = false;
@@ -1737,12 +1859,27 @@ double Runtime::Run() {
             // advances, this op did a synchronous readback (copyToCPU does its
             // own cmd.submit+wait on queue0). Such a level cannot be batched
             // with pending producers.
-            uint64_t sc_before = queue0->submitCount();
+            uint64_t sc_before = graph_mode ? 0 : queue0->submitCount();
+            if (graph_mode)
+                node_ops_[node_idx]->set_graph_cmd(graph_seg);
             node_ops_[node_idx]->set_input_value_dynamic(
                 node_input_value_dynamic_[node_idx]);
+            graph_op_idx = graph_mode ? static_cast<int>(node_idx) : -1;
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
-            if (sc_before != queue0->submitCount()) {
+            graph_op_idx = -1;
+            if (graph_mode) {
+                // Our own segment submits bump queue0's counter too, so a
+                // readback is counted from the hook instead of from the delta.
+                if (graph_readbacks != graph_readbacks_lvl) {
+                    level_had_readback = true;
+                    if (opprof) {
+                        auto name = convert_optype_to_string(
+                            node_ops_[node_idx]->get_type());
+                        op_type_readback_count[name]++;
+                    }
+                }
+            } else if (sc_before != queue0->submitCount()) {
                 level_had_readback = true;
                 if (opprof) {
                     auto name = convert_optype_to_string(
@@ -1797,6 +1934,13 @@ double Runtime::Run() {
             }
             auto aw_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
+            // In graph mode the op recorded straight into the shared segment,
+            // so there is no per-op command buffer to order or submit here.
+            if (graph_mode) {
+                id++;
+                id %= vkop::kInflight;
+                continue;
+            }
             auto cmd = node_ops_[node_idx]->get_record();
             for (auto &dep : node_dependency_indices_[node_idx]) {
                 cmd->addWait(node_ops_[dep]->get_record()->getSignalSemaphore(),
@@ -1854,9 +1998,30 @@ double Runtime::Run() {
         // and needs the producer already visible), or when the batch reaches
         // batch_levels. Setting batch_levels=0 flushes every level (old
         // behavior, equivalent to per-level submit).
-        int nlanes = single_queue ? 1 : vkop::kInflight;
         auto sub_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
+        // In graph mode the level's ops already sit in the open shared segment;
+        // there is nothing to accumulate or submit per level (segment submits
+        // happen at the loop top / the readback hook / the tail below).
+        if (graph_mode) {
+            if (level_had_readback) {
+                n_readback_levels++;
+                level_readback_[level_idx] = true;
+            }
+            if (run_profile) {
+                auto sub_t1 = std::chrono::steady_clock::now();
+                prof_submit_ms +=
+                    std::chrono::duration<double, std::milli>(sub_t1 - sub_t0)
+                        .count();
+            }
+            continue;
+        }
+        // Batch-submit this level: accumulate into batched_sis and flush when
+        // we hit a readback level (copyToCPU in onExecute does its own submit
+        // and needs the producer already visible), or when the batch reaches
+        // batch_levels. Setting batch_levels=0 flushes every level (old
+        // behavior, equivalent to per-level submit).
+        int nlanes = single_queue ? 1 : vkop::kInflight;
         if (level_had_readback) {
             n_readback_levels++;
             level_readback_[level_idx] = true;
@@ -1864,16 +2029,16 @@ double Runtime::Run() {
         // Accumulate this level's submit infos into the batch.
         for (int ci = 0; ci < nlanes; ci++) {
             if (!sis[ci].empty()) {
-                batched_sis[ci].insert(batched_sis[ci].end(),
-                                       sis[ci].begin(), sis[ci].end());
+                batched_sis[ci].insert(batched_sis[ci].end(), sis[ci].begin(),
+                                       sis[ci].end());
             }
         }
-        sis.clear();  // level-local sis is no longer needed
+        sis.clear(); // level-local sis is no longer needed
         levels_since_flush++;
-        bool must_flush = level_had_readback ||
-                          (batch_levels > 0 &&
-                           levels_since_flush >= batch_levels) ||
-                          (batch_levels == 0);
+        bool must_flush =
+            level_had_readback ||
+            (batch_levels > 0 && levels_since_flush >= batch_levels) ||
+            (batch_levels == 0);
         if (must_flush) {
             flush_batched(batched_sis, nlanes);
             levels_since_flush = 0;
@@ -1894,14 +2059,33 @@ double Runtime::Run() {
         }
         prev_level_cmds = std::move(cur_level_cmds);
     }
-    // Flush the tail: any remaining levels that didn't trigger a forced flush
-    // above (the last batch, or the tail of a non-readback run).
-    flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
+    if (graph_mode) {
+        // Submit the tail segment and tear the hook down. The segment buffers
+        // are waited and reset further down, alongside the per-op path's tail.
+        graph_submit();
+        VulkanCommandBuffer::pre_readback_hook = nullptr;
+        if (!graph_cmds.empty())
+            last_commands[0] = graph_cmds.back();
+    } else {
+        // Flush the tail: any remaining levels that didn't trigger a forced
+        // flush above (the last batch, or the tail of a non-readback run).
+        flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
+    }
 
     // Wait for the final level, then reset all command buffers.
     for (int ci = 0; ci < vkop::kInflight; ci++) {
         if (last_commands[ci]) {
             last_commands[ci]->wait();
+        }
+    }
+    if (graph_mode) {
+        // Every segment buffer must be returned to the initial state before the
+        // next round reuses its pool slot; waiting on the last one is not
+        // enough (see the reset note below).
+        for (auto &c : graph_cmds) {
+            c->wait();
+            c->clearWaits();
+            c->reset();
         }
     }
     // The final-level wait (timeline semaphore above) guarantees the GPU has
@@ -1911,21 +2095,24 @@ double Runtime::Run() {
     // (observed as a segfault inside vkBeginCommandBuffer on the NEXT Run() —
     // e.g. LLM decode round1 reusing round0's command buffers). CPU-wait every
     // command before reset so all buffers are back in the initial state.
-    for (const auto &level_nodes : level_node_indices_) {
-        for (auto node_idx : level_nodes) {
-            // Skip reset for replay-cached ops: their cmd buffer is kept for
-            // verbatim re-submission next round (SIMULTANEOUS_USE). Resetting
-            // would discard the cached recording.
-            if (replay_mode_ && node_ops_[node_idx]->replay_cached()) {
+    // Graph mode has no per-op buffers (the reset above handled its segments).
+    if (!graph_mode) {
+        for (const auto &level_nodes : level_node_indices_) {
+            for (auto node_idx : level_nodes) {
+                // Skip reset for replay-cached ops: their cmd buffer is kept
+                // for verbatim re-submission next round (SIMULTANEOUS_USE).
+                // Resetting would discard the cached recording.
+                if (replay_mode_ && node_ops_[node_idx]->replay_cached()) {
+                    auto cmd = node_ops_[node_idx]->get_record();
+                    cmd->wait();
+                    cmd->clearWaits();
+                    continue;
+                }
                 auto cmd = node_ops_[node_idx]->get_record();
                 cmd->wait();
                 cmd->clearWaits();
-                continue;
+                cmd->reset();
             }
-            auto cmd = node_ops_[node_idx]->get_record();
-            cmd->wait();
-            cmd->clearWaits();
-            cmd->reset();
         }
     }
 
@@ -1950,6 +2137,10 @@ double Runtime::Run() {
     if (batch_dbg) {
         fprintf(stderr, "[batchdbg] %d/%d levels had a sync readback\n",
                 n_readback_levels, n_total_levels);
+    }
+    if (graph_mode) {
+        fprintf(stderr, "[graph] %zu segments, %d readback boundaries\n",
+                graph_cmds.size(), graph_readbacks);
     }
     if (ssbo_dbg) {
         fprintf(stderr, "[sssbo] %d output tensors carry shape_ssbo_\n",

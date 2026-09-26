@@ -7,6 +7,7 @@
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanSemaphore.hpp"
 
+#include <functional>
 #include <memory>
 #include <vulkan/vulkan.hpp>
 
@@ -17,6 +18,15 @@ class VulkanCommandBuffer {
     explicit VulkanCommandBuffer(std::shared_ptr<VulkanCommandPool> cmdpool,
                                  int id = 0);
     ~VulkanCommandBuffer();
+
+    // Graph-submit readback hook. Set by Runtime::Run() while VKOP_GRAPH_SUBMIT
+    // is active, cleared at the end of the round. Tensor::copyToCPU fires it
+    // immediately before a synchronous GPU->CPU readback so the Runtime can
+    // close+submit the segment currently being recorded: the readback's own
+    // submission must observe its producers already submitted on the queue
+    // (the per-level path relies on the same single-queue FIFO ordering). Null
+    // whenever graph mode is off, so the hook is a no-op cost elsewhere.
+    static std::function<void()> pre_readback_hook;
 
     VulkanCommandBuffer() = delete;
 
@@ -90,6 +100,16 @@ class VulkanCommandBuffer {
     void push_constants(VulkanPipeline &pipeline, uint32_t size,
                         const void *ptr);
     void dispatch(int w = 1, int h = 1, int z = 1);
+
+    // Full memory barrier covering every prior write in this recording. Used
+    // by graph-submit mode (VKOP_GRAPH_SUBMIT), which packs many levels into
+    // ONE command buffer: the timeline-semaphore ordering that normally sits
+    // between per-op command buffers does not exist inside a single recording,
+    // so the producer->consumer memory dependency has to come from a barrier.
+    // MEMORY_WRITE -> MEMORY_READ|MEMORY_WRITE over ALL_COMMANDS covers every
+    // pair the graph can produce (shader, transfer via vkCmdCopyBuffer/
+    // vkCmdUpdateBuffer, indirect dispatch reads).
+    void pipelineBarrier();
 
     // Dispatch with dimensions read from a GPU buffer (vkCmdDispatchIndirect).
     // `buffer` holds a VkDispatchIndirectCommand{uint32 x,y,z} at `offset`.

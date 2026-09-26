@@ -169,14 +169,68 @@ class Operator {
     // impl (which owns the real pipeline/command-buffer state).
     virtual std::shared_ptr<VulkanCommandBuffer> get_record() { return m_cmd_; }
 
+    // Graph-submit mode (VKOP_GRAPH_SUBMIT). The Runtime records every level's
+    // ops into ONE shared command buffer so ~980 per-level vkQueueSubmit calls
+    // collapse into a handful. While a non-null graph cmd is set, onExecute
+    // records into it (borrowed — the Runtime owns begin/end/submit) and the
+    // per-op replay cache is bypassed, since a shared recording target cannot
+    // be cached per op. Passing nullptr restores the normal per-op path.
+    virtual void
+    set_graph_cmd(const std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        graph_cmd_ = cmd;
+    }
+
+    // Repoint the recording target mid-onExecute. The Runtime's readback hook
+    // (VulkanCommandBuffer::pre_readback_hook) closes the open segment right
+    // before an op does a synchronous GPU->CPU readback, then calls this so the
+    // remainder of the op's recording lands in the freshly opened segment.
+    virtual void
+    repoint_graph_cmd(const std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        graph_cmd_ = cmd;
+        m_cmd_ = cmd;
+    }
+
     virtual void
     onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
               const std::vector<std::shared_ptr<core::ITensor>> &outputs,
               int id) {
-        if (!m_cmd_) {
+        if (!m_cmd_ && !graph_cmd_) {
             m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
         }
         m_id_ = id;
+
+        // Graph-submit mode: record into the Runtime-owned shared command
+        // buffer. m_cmd_ is temporarily repointed at it so the op's own
+        // helper methods and m_cmd_->get() calls (barriers, copies, binds,
+        // dispatches) land there too; begin()/end()/submit() belong to the
+        // Runtime in this mode. The replay cache is skipped: a recording shared
+        // with other ops cannot be replayed per op. The op's own buffer (if it
+        // has one from an earlier non-graph round) is restored afterwards so no
+        // per-op buffer is ever allocated while the mode is on.
+        if (graph_cmd_) {
+            auto saved_cmd = m_cmd_;
+            m_cmd_ = graph_cmd_;
+            // objs_ is rebuilt by execute()'s bind helpers and read back by
+            // fillWriteDescriptorSets, which indexes it from 0. It MUST start
+            // empty for every recording, exactly as the per-op path guarantees
+            // via the objs_.clear() further down. Without this reset the second
+            // and later rounds kept the FIRST round's entries at [0, n) and
+            // bound descriptors for stale resources — on the LLM decode path
+            // that silently produced all-zero logits (prefill round 0 is
+            // correct because objs_ is still empty at that point).
+            objs_.clear();
+            fp_passes_.clear();
+            if (prof_query_pool_ != VK_NULL_HANDLE) {
+                m_cmd_->writeTimestampBegin(prof_query_pool_, prof_query_base_);
+            }
+            execute(inputs, outputs);
+            if (prof_query_pool_ != VK_NULL_HANDLE) {
+                m_cmd_->writeTimestampEnd(prof_query_pool_,
+                                          prof_query_base_ + 1);
+            }
+            m_cmd_ = saved_cmd;
+            return;
+        }
 
         // Record-once-replay (cuda-graph-style). The LLM decode loop re-runs
         // Run() every round; for INVARIANT ops (weight Gemms, RMSNorm,
@@ -304,6 +358,9 @@ class Operator {
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     std::shared_ptr<VulkanCommandBuffer> m_cmd_ = nullptr;
+    // Non-null only in graph-submit mode; borrowed from the Runtime (see
+    // set_graph_cmd). When set, onExecute records into it instead of m_cmd_.
+    std::shared_ptr<VulkanCommandBuffer> graph_cmd_ = nullptr;
 
     std::unique_ptr<VulkanPipeline> pipeline_;
     VkDescriptorSet m_ds_[vkop::kInflight] = {nullptr};

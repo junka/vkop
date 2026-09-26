@@ -791,7 +791,8 @@ template <typename T> class Tensor : public ITensor {
             auto stpool = cmdpool->getStagingBufferPool();
             auto b = stpool->allocate(imagesize);
             if (!b) {
-                printf("copyToGPUImage stpool alloc failed %d\n", imagesize);
+                printf("copyToGPUImage stpool alloc failed %llu\n",
+                       (unsigned long long)imagesize);
                 return;
             }
             if (!rgba) {
@@ -826,6 +827,13 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+        // Graph-submit mode: this readback issues its own vkQueueSubmit and
+        // then waits, so every producer of this tensor must already be
+        // submitted on that queue. Fire the hook first so the Runtime closes
+        // and submits the segment it is currently recording. No-op when graph
+        // mode is off (hook null).
+        if (VulkanCommandBuffer::pre_readback_hook)
+            VulkanCommandBuffer::pre_readback_hook();
         // Read GPU->CPU whenever a real buffer exists, regardless of the
         // converted_ flag (int64 outputs are created off-GPU but producer ops
         // like NonZero bind an SSBO without flipping converted_, so is_on_GPU()
@@ -1258,8 +1266,8 @@ template <typename T> class Tensor : public ITensor {
             auto stpool = cmdpool->getStagingBufferPool();
             auto b = stpool->allocate(img->getImageSize());
             if (!b) {
-                printf("copyImageToCPU stpool alloc failed %d\n",
-                       img->getImageSize());
+                printf("copyImageToCPU stpool alloc failed %llu\n",
+                       (unsigned long long)img->getImageSize());
                 return;
             }
 

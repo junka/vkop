@@ -66,6 +66,14 @@ class PimplFacade : public Operator {
     void set_prof_query(VkQueryPool pool, uint32_t base) override {
         impl_->set_prof_query(pool, base);
     }
+    void
+    set_graph_cmd(const std::shared_ptr<VulkanCommandBuffer> &cmd) override {
+        impl_->set_graph_cmd(cmd);
+    }
+    void repoint_graph_cmd(
+        const std::shared_ptr<VulkanCommandBuffer> &cmd) override {
+        impl_->repoint_graph_cmd(cmd);
+    }
 
   protected:
     std::unique_ptr<Operator> impl_;
