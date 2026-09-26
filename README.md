@@ -113,6 +113,17 @@ options:
 ```
 支持将postproc 手动注册到gpu 处理，比如softmax，topk减少CPU与GPU间的内存吞吐
 
+#### 5. LLM 推理（llm/exporter/llm_chat）
+
+- KV cache 已 GPU 化：decode 每轮 present→past 为单条命令缓冲内的
+  device→device 拷贝，无 CPU 往返（原 `KV_INPLACE_PLAN` 已完成并删除）。
+- GPU shape-meta：张量带 `shape_ssbo_` 侧信道（产出方填充），binary 广播
+  shader 的 broadcast==2 SSBO 路径 + `dispatch_from_shape` 间接派发已落地，
+  由 `VKOP_GPU_SHAPE` 开关控制（默认关，走 CPU dims 回退）。稳态 readback
+  主要通过 Reshape/Expand 的自动学习缓存（LEARNING→CONFIRMING→STABLE）和
+  host-authoritative int64/int32 initializer 跳过回读来消除（原
+  `PHASE2_4_PLAN` 已完成/被替代并删除）。
+
 ---
 
 ### Project Introduction
@@ -232,4 +243,18 @@ options:
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
 Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU.
+
+#### 6. LLM inference (llm/exporter/llm_chat)
+
+- KV cache is GPU-resident: each decode round copies present→past
+  device→device inside one command buffer, with no CPU round-trip (the
+  former `KV_INPLACE_PLAN` is done and removed).
+- GPU shape-meta: tensors carry a `shape_ssbo_` side-channel (populated by
+  the producing op); the broadcast==2 SSBO path in binary shaders plus
+  `dispatch_from_shape` indirect dispatch are wired up behind the
+  `VKOP_GPU_SHAPE` env flag (off by default, CPU dims fallback). Steady-state
+  readbacks are instead eliminated via the Reshape/Expand auto-learning cache
+  (LEARNING→CONFIRMING→STABLE) and host-authoritative int64/int32
+  initializers skipping readback (the former `PHASE2_4_PLAN` is done or
+  superseded and removed).
 
