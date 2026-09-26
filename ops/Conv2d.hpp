@@ -48,6 +48,9 @@ struct alignas(16) GPUConv2dParam {
     int groups;
     int bias;
     int transpose;
+    // 1 = the weight image folds its channel group into the width
+    // ([K_W * C4, K_H * C_other, 1]) instead of carrying array layers. Only
+    // 1x1 weights are packed today.
     int pack;
     int activation;
 

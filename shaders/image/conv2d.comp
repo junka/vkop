@@ -14,12 +14,13 @@
 
 
 #include "../common/activation.comp"
+#include "../common/addressing.comp"
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(set=0, binding=0) writeonly uniform image2DArray uOutput;   // [W_out, N*H_out, C4_out]
 layout(set=0, binding=1) uniform sampler2DArray uInput;            // [W_in, N*H_in, C4_in]
-layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]
+layout(set=0, binding=2) uniform sampler2DArray uKernel;           // [K_W , K_H * C_out, UP_DIV(C_in/group, 4)] or transpose [K_W, K_H * C_in/groups, C4_out]; with pack the channel group moves into the width instead: [K_W * C4, K_H * C_other, 1]
 layout(set=0, binding=3) uniform textureBuffer uBias;
 layout(set=0, binding=4) uniform textureBuffer uScalePara;
 
@@ -358,6 +359,9 @@ void grouped_conv2d() {
     bool can_vectorize_oc = full_vec4_valid && same_group;
     bool use_vec4 = (C_in_per_group % 4 == 0);
     int num_vec4 = (C_in_per_group + 3) / 4;
+    // K_W is the width the host folded the weight's channel groups against, so
+    // every weight fetch below is written in logical (kx, y, layer) form.
+    int wfold = uConstant.pack;
 
     if (uConstant.transpose == 1) {
         if (can_vectorize_oc) {
@@ -382,10 +386,10 @@ void grouped_conv2d() {
 
                             int local_ic = global_ic0 - ic_start;
                             // Each output channel has its own row in Y, same layer c4
-                            FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0));
-                            FLOAT4 w1 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + (local_ic + 1) * K_H, c4), 0));
-                            FLOAT4 w2 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + (local_ic + 2) * K_H, c4), 0));
-                            FLOAT4 w3 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + (local_ic + 3) * K_H, c4), 0));
+                            FLOAT4 w0 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ic * K_H, c4, K_W, wfold));
+                            FLOAT4 w1 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + (local_ic + 1) * K_H, c4, K_W, wfold));
+                            FLOAT4 w2 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + (local_ic + 2) * K_H, c4, K_W, wfold));
+                            FLOAT4 w3 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + (local_ic + 3) * K_H, c4, K_W, wfold));
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4) * FLOAT(127.0));
                                 w0 *= scale_vec;
@@ -408,7 +412,7 @@ void grouped_conv2d() {
 
                             int local_ic = ic - ic_start;
 
-                            FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + local_ic * K_H, c4), 0));
+                            FLOAT4 w_vec = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ic * K_H, c4, K_W, wfold));
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                                 w_vec *= scale_vec * FLOAT(127.0);
@@ -443,7 +447,7 @@ void grouped_conv2d() {
                             FLOAT x = FLOAT(texelFetch(uInput, ivec3(ix, in_y, global_ci4), 0)[global_ci_comp]);
 
                             int local_ci = ci - ic_start;
-                            FLOAT w = FLOAT(texelFetch(uKernel, ivec3(kx, ky + local_ci * K_H, c4), 0)[comp]);
+                            FLOAT w = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + local_ci * K_H, c4, K_W, wfold)[comp]);
                             if (uConstant.accuracy == 2) {
                                 w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                             }
@@ -481,10 +485,10 @@ void grouped_conv2d() {
 
                             // Fetch 4 weights for 4 output channels at once!
                             // Each oc has its own row in kernel texture
-                            FLOAT4 w0 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, v), 0));
-                            FLOAT4 w1 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, v), 0));
-                            FLOAT4 w2 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, v), 0));
-                            FLOAT4 w3 = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, v), 0));
+                            FLOAT4 w0 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[0] * K_H, v, K_W, wfold));
+                            FLOAT4 w1 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[1] * K_H, v, K_W, wfold));
+                            FLOAT4 w2 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[2] * K_H, v, K_W, wfold));
+                            FLOAT4 w3 = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[3] * K_H, v, K_W, wfold));
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4) * 127.0);
                                 w0 *= scale_vec[0];
@@ -512,10 +516,10 @@ void grouped_conv2d() {
                             int kernel_comp = local_ic % 4;
 
                             FLOAT4 w_vec;
-                            w_vec.x = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[0] * K_H, kernel_layer), 0)[kernel_comp]);
-                            w_vec.y = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[1] * K_H, kernel_layer), 0)[kernel_comp]);
-                            w_vec.z = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[2] * K_H, kernel_layer), 0)[kernel_comp]);
-                            w_vec.w = FLOAT(texelFetch(uKernel, ivec3(kx, ky + oc_vec[3] * K_H, kernel_layer), 0)[kernel_comp]);
+                            w_vec.x = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[0] * K_H, kernel_layer, K_W, wfold)[kernel_comp]);
+                            w_vec.y = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[1] * K_H, kernel_layer, K_W, wfold)[kernel_comp]);
+                            w_vec.z = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[2] * K_H, kernel_layer, K_W, wfold)[kernel_comp]);
+                            w_vec.w = FLOAT(VKOP_FETCH_FOLD(uKernel, kx, ky + oc_vec[3] * K_H, kernel_layer, K_W, wfold)[kernel_comp]);
                             if (uConstant.accuracy == 2) {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4) * 127.0);
                                 w_vec *= scale_vec;
@@ -558,7 +562,7 @@ void grouped_conv2d() {
 
                                 int in_y = n * H_in + iy;
                                 FLOAT4 x_vec = FLOAT4(texelFetch(uInput, ivec3(ix, in_y, input_layer), 0));
-                                FLOAT4 w_vec = FLOAT4(texelFetch(uKernel, ivec3(kx, ky + oc * K_H, v), 0));
+                                FLOAT4 w_vec = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx, ky + oc * K_H, v, K_W, wfold));
                                 if (uConstant.accuracy == 2) {
                                     w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                                 }
@@ -582,7 +586,7 @@ void grouped_conv2d() {
 
                                 int kx_k = kx;
                                 int ky_k = ky + oc * K_H;
-                                FLOAT4 weight_vec = FLOAT4(texelFetch(uKernel, ivec3(kx_k, ky_k, local_ic4), 0));
+                                FLOAT4 weight_vec = FLOAT4(VKOP_FETCH_FOLD(uKernel, kx_k, ky_k, local_ic4, K_W, wfold));
                                 FLOAT w = weight_vec[local_ic_comp];
                                 if (uConstant.accuracy == 2) {
                                     w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
@@ -609,7 +613,11 @@ void grouped_conv2d() {
 
 
 void main() {
-    if (uConstant.pack == 1) {
+    // conv1x1() skips the kernel spatial loop, so it is a shape specialisation,
+    // not a layout one. It also assumes a folded weight, which only packed 1x1
+    // weights get -- route on both, or a folded kxk weight would land here.
+    bool is_1x1 = uConstant.kernelSize.x == 1 && uConstant.kernelSize.y == 1;
+    if (uConstant.pack == 1 && is_1x1) {
         conv1x1();
     } else {
         grouped_conv2d();

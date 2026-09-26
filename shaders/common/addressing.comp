@@ -46,6 +46,21 @@
 // Writeable store.
 #define VKOP_STORE(img, w, nh, c4, width, value) imageStore(img, VKOP_TEXEL(w, nh, c4, width), value)
 
+// Runtime-selected fold for one operand, `fold` being 0 or 1.
+//
+// VKOP_TEXEL above is compile-time because activations must all agree -- ops
+// read and write each other's buffers. A conv weight is different: it is
+// written once at load and read by exactly one op, so the host can pick its
+// layout per tensor, and conv2d reads that choice from a push constant. Folding
+// the channel group into the width is what removes the array pitch padding a
+// [K_W, K_H*C, C4] weight image pays when K_W is only 3.
+ivec3 vkop_fold_texel(int x, int y, int layer, int width, int fold) {
+    return ivec3(x + layer * width * fold, y, layer * (1 - fold));
+}
+
+#define VKOP_FETCH_FOLD(tex, x, y, layer, width, fold)                        \
+    texelFetch(tex, vkop_fold_texel((x), (y), (layer), (width), (fold)), 0)
+
 // Access at the invocation's own coordinate: no translation is possible or
 // needed, because under either layout the dispatch grid was chosen so that
 // gl_GlobalInvocationID lands on exactly this tensor's texel. Elementwise ops
