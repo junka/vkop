@@ -68,7 +68,9 @@ llm/exporter/inputs_dump/
 llm/exporter/decode_dump/
 llm/exporter/chat_prefill_dump/
 llm/exporter/raw13_dump/
-llm/exporter/embed_tokens.bin
+# 无路径前缀：按名匹配任意层级。写成 llm/exporter/embed_tokens.bin 时漏掉了
+# text_qwen3/ 等子目录，742MB 产物因此被提交进历史、撞 GitHub 100MB 单文件上限。
+embed_tokens.bin
 llm/exporter/synth224.png
 llm/exporter/p.py
 llm/tokenizer/*.bin
