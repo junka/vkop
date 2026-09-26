@@ -1693,6 +1693,11 @@ double Runtime::Run() {
     // VulkanCommandBuffer::pre_readback_hook — not predicted from a learned
     // map, which is phase-specific (prefill 328/981 readback levels vs decode
     // 0/981) and would read stale data on a wrong guess.
+    // Graph submit is ON by default: on MoltenVK a per-level vkQueueSubmit
+    // costs ~0.24 ms of driver overhead, so the 981-level decode graph spent
+    // ~232 ms/round submitting and only ~16 ms computing. Set
+    // VKOP_GRAPH_SUBMIT=0 to fall back to the per-level path (e.g. when
+    // bisecting a correctness issue against the pre-graph behaviour).
     const char *gs_env = std::getenv("VKOP_GRAPH_SUBMIT");
     // Every segment is submitted to queue0 regardless of how many compute
     // queues the device exposes: a segment's ops are packed into one command
@@ -1700,7 +1705,7 @@ double Runtime::Run() {
     // queue. The per-level path's lane spread is unavailable here, but the
     // level's ops are already recorded in order and the graph's parallelism is
     // intra-level anyway.
-    bool graph_mode = gs_env && gs_env[0] == '1';
+    bool graph_mode = !(gs_env && gs_env[0] == '0');
     if (graph_mode && replay_mode_) {
         // A recording shared with other ops cannot be cached per op, and replay
         // buys nothing here: record is ~18ms/round against the ~324ms of submit
@@ -1709,10 +1714,13 @@ double Runtime::Run() {
             op->enable_replay(false);
         replay_mode_ = false;
     }
-    // Optional cap on levels per segment (VKOP_GRAPH_SEGMENT=N). 0 keeps one
-    // segment per readback-bounded stretch — the fast path, one command buffer
-    // and one submit for the whole 981-level decode graph.
-    int graph_segment = 0;
+    // Levels per segment (VKOP_GRAPH_SEGMENT=N). The default 64 splits the
+    // 981-level decode graph into 16 segments, which measured fastest: one
+    // segment for the whole round (N=0) is slower because the single Metal
+    // command buffer serializes the tail of the round, and N=1 degenerates to
+    // the per-level submit path. Readback levels still force a boundary
+    // regardless of this cap.
+    int graph_segment = 64;
     if (const char *gse = std::getenv("VKOP_GRAPH_SEGMENT")) {
         graph_segment = std::atoi(gse);
         if (graph_segment < 0)
