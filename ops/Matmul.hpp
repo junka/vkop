@@ -122,9 +122,11 @@ class MatMulImage : public Operator {
 };
 
 // Buffer (SSBO, compact row-major) implementation. fp32: one thread per
-// output element. fp16: 2-pass (reduce to fp32 scratch + pack half2) to
-// avoid cross-thread word races when N is odd. The pack pass uses a
-// SEPARATE pipeline (buffer_matmul_pack_spv) to avoid Intel ANV
+// output element. fp16 with even N: single pass — one thread per output
+// half2 word (two adjacent columns, A load shared), packed straight into
+// the output. fp16 with odd N: the half2 words straddle row boundaries, so
+// fall back to 2-pass (reduce to fp32 scratch + pack pass) with the pack
+// pass on a SEPARATE pipeline (buffer_matmul_pack_spv) to avoid Intel ANV
 // push-constant interference between dispatches of the same pipeline.
 class MatMulBuffer : public BufferFactory {
   public:
@@ -266,9 +268,10 @@ class MatMulBuffer : public BufferFactory {
             bind_ssbo<T>(inputs[1], /*is_output=*/false);
         });
 
-        // fp16 needs a scratch fp32 buffer (binding 3) for the 2-pass
-        // reduce->pack. fp32 binds dummy for the 4th slot.
-        if (fp16_ != 0) {
+        // fp16 needs a scratch fp32 buffer (binding 3) only for the odd-N
+        // reduce->pack fallback; even N packs in the reduce shader itself.
+        const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
             // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
@@ -277,22 +280,32 @@ class MatMulBuffer : public BufferFactory {
             if (scratch_bytes == 0) {
                 scratch_bytes = 16;
             }
-            scratch_ = std::make_shared<VulkanBuffer>(
-                m_dev_, scratch_bytes,
-                STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            // Grow-only pool: recreating a GPU buffer on every execute churns
+            // allocations when shapes are stable across rounds.
+            if (!scratch_ || scratch_bytes_ < scratch_bytes) {
+                scratch_ = std::make_shared<VulkanBuffer>(
+                    m_dev_, scratch_bytes,
+                    STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                scratch_bytes_ = scratch_bytes;
+            }
             objs_.emplace_back(scratch_);
         } else {
             objs_.emplace_back(dummy_buffer_);
         }
 
-        // Reduce pass: one thread per output element. Uses the main pipeline.
         para_.M = m;
         para_.N = n;
         para_.K = k;
         para_.C = batch;
         para_.fp32 = (fp16_ != 0) ? 0 : 1;
         para_.transB = transB_ ? 1 : 0;
+        if (fused_fp16) {
+            // Single pass: x covers output WORDS (column pairs).
+            submit(&para_, UP_DIV(n / 2, 16), UP_DIV(batch * m, 16), 1);
+            return;
+        }
+        // Reduce pass: one thread per output element. Uses the main pipeline.
         submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
 
         if (fp16_ != 0) {
@@ -337,6 +350,7 @@ class MatMulBuffer : public BufferFactory {
 
     matmul::GpuMatMulParam para_;
     std::shared_ptr<VulkanBuffer> scratch_;
+    size_t scratch_bytes_ = 0;
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> pack_writes_;

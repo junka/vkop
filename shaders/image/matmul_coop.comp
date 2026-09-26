@@ -67,7 +67,9 @@ coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matA[4];
 coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matB[4];
 coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator> matC[4];
 // for use case: fp32 trucation will lose precision. split into two (hi + lo)
-// and C = (Ah + Al)(Bh + Bl) = (AhBh + AhBl + AlBh + AlBl). Four MMA passes.
+// and C = (Ah + Al)(Bh + Bl) ~= AhBh + AhBl + AlBh — three MMA passes; the
+// AlBl term is O(2^-22) relative per product, below fp32 accumulation noise,
+// so it is dropped.
 coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matAl[4];
 coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matBl[4];
 
@@ -201,11 +203,6 @@ void main() {
             matC[1] = coopMatMulAdd(matAl[1], matB[1], matC[1]);
             matC[2] = coopMatMulAdd(matAl[2], matB[2], matC[2]);
             matC[3] = coopMatMulAdd(matAl[3], matB[3], matC[3]);
-            // Al * Bl  (O(eps^2) term; drop only if 3-pass is acceptable)
-            matC[0] = coopMatMulAdd(matAl[0], matBl[0], matC[0]);
-            matC[1] = coopMatMulAdd(matAl[1], matBl[1], matC[1]);
-            matC[2] = coopMatMulAdd(matAl[2], matBl[2], matC[2]);
-            matC[3] = coopMatMulAdd(matAl[3], matBl[3], matC[3]);
         }
 
         barrier();

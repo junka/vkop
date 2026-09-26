@@ -1,9 +1,15 @@
 #version 450 core
 
-// MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B, writing fp32
-// results to uOutput (fp32) or uScratch (fp16, for the pack pass).
-// The pack pass is a SEPARATE shader (buffer/matmul_pack.comp) to avoid
-// Intel ANV push-constant interference between dispatches of the same pipeline.
+// MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B.
+// fp32: one thread per output element, fp32 store to uOutput.
+// fp16: when N is even, one thread per output half2 WORD (two adjacent
+// columns of the same row, A load shared) packed straight into uOutput —
+// single pass, no scratch. When N is odd, half2 words straddle row
+// boundaries (word ownership would race across threads), so we fall back
+// to reduce-into-fp32-scratch + a SEPARATE pack dispatch
+// (buffer/matmul_pack.comp, kept for that case; the separate pipeline
+// also avoids Intel ANV push-constant interference between dispatches of
+// the same pipeline).
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -42,9 +48,73 @@ float load_a(int idx) {
 float load_b(int idx) {
     return unpackHalf2x16(uInputB.data[idx >> 1])[idx & 1];
 }
+
+// One thread owns output word (n, i, {ja, ja+1}) of an even-N C. ja is even
+// and n*M*N + i*N is even when N is even, so the pair is word-aligned.
+void matmul16_even_n() {
+    int p = int(gl_GlobalInvocationID.x); // column-pair (= word) index in a row
+    int yi = int(gl_GlobalInvocationID.y);
+    int ja = p * 2;
+    if (ja >= uPC.N) return;
+
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    int a_off = (n * uPC.M + i) * uPC.K;
+    int jb = ja + 1;
+    // transB: B is [batch, N, K] so element (n, col, k) is at col*K + k
+    // (k-step 1); otherwise B is [batch, K, N], element (n, k, col) is at
+    // k*N + col (k-step N). Hoisting this out of the K loop removes the
+    // per-iteration branch and keeps both column walks linear.
+    int b_base = n * uPC.K * uPC.N;
+    int b_step = (uPC.transB != 0) ? 1 : uPC.N;
+    int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
+    int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
+
+    float s0 = 0.0;
+    float s1 = 0.0;
+    for (int k = 0; k < uPC.K; ++k) {
+        float a = load_a(a_off + k);
+        s0 += a * load_b(b0);
+        s1 += a * load_b(b1);
+        b0 += b_step;
+        b1 += b_step;
+    }
+
+    int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
+    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(s0, s1));
+}
+
+// Odd-N fallback: one thread per output element, fp32 result to scratch;
+// matmul_pack.comp does the half2 pack afterwards.
+void matmul16_odd_n() {
+    int j = int(gl_GlobalInvocationID.x);
+    int yi = int(gl_GlobalInvocationID.y);
+    if (j >= uPC.N) return;
+
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    int a_base = n * uPC.M * uPC.K;
+    int b_base = n * uPC.K * uPC.N;
+    int c_base = n * uPC.M * uPC.N;
+
+    float sum = 0.0;
+    for (int k = 0; k < uPC.K; ++k) {
+        int b_idx = (uPC.transB != 0) ? (b_base + j * uPC.K + k)
+                                      : (b_base + k * uPC.N + j);
+        float a = load_a(a_base + i * uPC.K + k);
+        float b = load_b(b_idx);
+        sum += a * b;
+    }
+
+    uScratch.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
+}
 #endif
 
-void main() {
+void matmul32() {
     int j = int(gl_GlobalInvocationID.x);
     int yi = int(gl_GlobalInvocationID.y);
     if (j >= uPC.N) return;
@@ -63,20 +133,22 @@ void main() {
         // of k*N+j. Avoids a separate Transpose dispatch before the MatMul.
         int b_idx = (uPC.transB != 0) ? (b_base + j * uPC.K + k)
                                       : (b_base + k * uPC.N + j);
-#ifdef FP16
-        float a = load_a(a_base + i * uPC.K + k);
-        float b = load_b(b_idx);
-#else
         float a = uintBitsToFloat(uInputA.data[a_base + i * uPC.K + k]);
         float b = uintBitsToFloat(uInputB.data[b_idx]);
-#endif
         sum += a * b;
     }
 
-    int out_idx = c_base + i * uPC.N + j;
+    uOutput.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
+}
+
+void main() {
 #ifdef FP16
-    uScratch.data[out_idx] = floatBitsToUint(sum);
+    if ((uPC.N & 1) == 0) {
+        matmul16_even_n();
+    } else {
+        matmul16_odd_n();
+    }
 #else
-    uOutput.data[out_idx] = floatBitsToUint(sum);
+    matmul32();
 #endif
 }
