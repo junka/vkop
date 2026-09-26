@@ -72,18 +72,47 @@ void matmul16_even_n() {
     int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
     int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
 
-    float s0 = 0.0;
-    float s1 = 0.0;
-    for (int k = 0; k < uPC.K; ++k) {
+    // K even => a_off, b0 and b1 are even element indices (K even makes every
+    // row start word-aligned; under transB the B rows are contiguous too), so
+    // each k-pair is one 32-bit word per stream. Four accumulators break the
+    // serial FMA dependency chains.
+    float s0a = 0.0, s0b = 0.0, s1a = 0.0, s1b = 0.0;
+    int k = 0;
+    if ((uPC.K & 1) == 0) {
+        if (uPC.transB != 0) {
+            for (; k < uPC.K; k += 2) {
+                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                vec2 v0 = unpackHalf2x16(uInputB.data[(b0 + k) >> 1]);
+                vec2 v1 = unpackHalf2x16(uInputB.data[(b1 + k) >> 1]);
+                s0a += a.x * v0.x;
+                s0b += a.y * v0.y;
+                s1a += a.x * v1.x;
+                s1b += a.y * v1.y;
+            }
+        } else {
+            for (; k < uPC.K; k += 2) {
+                vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                s0a += a.x * load_b(b0);
+                s0b += a.y * load_b(b0 + uPC.N);
+                s1a += a.x * load_b(b1);
+                s1b += a.y * load_b(b1 + uPC.N);
+                b0 += 2 * uPC.N;
+                b1 += 2 * uPC.N;
+            }
+        }
+    }
+    // Odd-K tail: scalar walk (also covers K == 0 -> nothing).
+    for (; k < uPC.K; ++k) {
         float a = load_a(a_off + k);
-        s0 += a * load_b(b0);
-        s1 += a * load_b(b1);
+        s0a += a * load_b(b0);
+        s1a += a * load_b(b1);
         b0 += b_step;
         b1 += b_step;
     }
 
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
-    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(s0, s1));
+    uOutput.data[out_idx >> 1] =
+        packHalf2x16(vec2(s0a + s0b, s1a + s1b));
 }
 
 // Odd-N fallback: one thread per output element, fp32 result to scratch;

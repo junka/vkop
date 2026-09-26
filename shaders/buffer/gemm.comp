@@ -6,6 +6,12 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // A' = transpose(A) if transA else A
 // B' = transpose(B) if transB else B
 // Compute Y = alpha * A' * B' + beta * C,
+//
+// The K loop carries NO data-dependent branches: transA/transB are
+// hoisted into walk start + stride, and each (A dtype x B dtype) pair
+// gets its own specialized loop instance via macro expansion (4 per
+// output-width body, 8 total). fp16x == 2 (int8 storage) keeps the
+// legacy "read the raw word as fp32" behavior (fp16x == 1 check).
 
 
 #define FLOAT float
@@ -46,7 +52,32 @@ layout(push_constant) uniform paraBuffer {
     int activation;
 } uParams;
 
+#define A16 (uParams.fp16a == 1)
+#define B16 (uParams.fp16b == 1)
 
+// Element loaders parameterized by the walk-index variable.
+#define LDF(buf, idx) uintBitsToFloat(buf.data[idx])
+#define LDH(buf, idx) unpackHalf2x16(buf.data[idx >> 1])[idx & 1]
+
+// Specialized K loops. ai/a_step walk A; the caller's bi* variables walk B.
+#define KLOOP1(LA, LB, SUM)                                \
+    for (int k = 0; k < uParams.K; ++k) {                  \
+        SUM += (LA) * (LB);                                \
+        ai += a_step;                                      \
+        bi += b_step;                                      \
+    }
+
+#define KLOOP2(LA, LBX, LBY, SUM)                          \
+    for (int k = 0; k < uParams.K; ++k) {                  \
+        float av = (LA);                                   \
+        SUM.x += av * (LBX);                               \
+        SUM.y += av * (LBY);                               \
+        ai += a_step;                                      \
+        b0i += b_step;                                     \
+        b1i += b_step;                                     \
+    }
+
+// Y = alpha * A' * B' (+ bias), fp32 output, one thread per element.
 void gemm32()
 {
     int j = int(gl_GlobalInvocationID.x); // column index in Y
@@ -54,98 +85,86 @@ void gemm32()
 
     if (i >= uParams.M || j >= uParams.N) return;
 
-    float sum = 0.0;
-    for (int k = 0; k < uParams.K; ++k) {
-        // Load A[i][k] from bufferA, considering transA
-        float a_val;
-        int index;
-        if (uParams.transA == 1) {
-            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
-            index = k * uParams.M + i;
-        } else {
-            // A is stored as M×K, A[i][k] = A_physical[i][k]
-            index = i * uParams.K + k;
-        }
-        a_val = uintBitsToFloat(bufferA.data[index]);
+    // transA: A is stored K x M, row i of A' is the strided walk i + k*M.
+    // transB: B is stored N x K, column j of B' is the contiguous walk j*K + k.
+    int ai = (uParams.transA == 1) ? i : i * uParams.K;
+    int a_step = (uParams.transA == 1) ? uParams.M : 1;
+    int bi = (uParams.transB == 1) ? j * uParams.K : j;
+    int b_step = (uParams.transB == 1) ? 1 : uParams.N;
 
-        // Load B[k][j] from bufferB, considering transB
-        float b_val;
-        if (uParams.transB == 1) {
-            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
-            index = j * uParams.K + k;
-        } else {
-            // B is stored as K×N, B[k][j] = B_physical[k][j]
-            index = k * uParams.N + j;
-        }
-        b_val = uintBitsToFloat(bufferB.data[index]);
-        sum += a_val * b_val;
+    float sum = 0.0;
+    if (A16) {
+        if (B16) { KLOOP1(LDH(bufferA, ai), LDH(bufferB, bi), sum) }
+        else     { KLOOP1(LDH(bufferA, ai), LDF(bufferB, bi), sum) }
+    } else {
+        if (B16) { KLOOP1(LDF(bufferA, ai), LDH(bufferB, bi), sum) }
+        else     { KLOOP1(LDF(bufferA, ai), LDF(bufferB, bi), sum) }
     }
 
-    int yIndex = i * uParams.N + j;       // C[i][j] in row-major
     sum *= uParams.alpha;
-    float c_val;
     if (uParams.has_bias == 1) {
         // Bias C is 1-D [N], broadcast across all M rows: element is C[j].
-        c_val = uintBitsToFloat(bufferC.data[j]);
+        float c_val = (uParams.fp16c == 1)
+                          ? unpackHalf2x16(bufferC.data[j / 2])[j % 2]
+                          : uintBitsToFloat(bufferC.data[j]);
         sum += c_val * uParams.beta;
     }
 
     sum = activation(sum, uParams.activation);
-    bufferY.data[yIndex] = floatBitsToUint(sum);
+    bufferY.data[i * uParams.N + j] = floatBitsToUint(sum);
 }
 
-
+// fp16 output: one thread owns the half2 word of two adjacent columns
+// (j*2, j*2+1). NOTE (pre-existing): word-aligned stores assume even N;
+// odd N would race across row boundaries.
 void gemm16() {
-    int j = int(gl_GlobalInvocationID.x); // column index in Y
+    int j = int(gl_GlobalInvocationID.x); // column-pair index in Y
     int i = int(gl_GlobalInvocationID.y); // row index in Y
+    int j0 = j * 2;
 
-    if (i >= uParams.M || j >= (uParams.N + 1)/2) return;
+    if (i >= uParams.M || j0 >= uParams.N) return;
 
-    vec2 sum = vec2(0.0);
-    for (int k = 0; k < uParams.K; ++k) {
-        // Load A[i][k] from bufferA, considering transA
-        vec2 a_val;
-        int index;
-        if (uParams.transA == 1) {
-            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
-            index = k * uParams.M + i;
-        } else {
-            // A is stored as M×K, A[i][k] = A_physical[i][k]
-            index = i * uParams.K + k;
-        }
-        a_val = vec2(unpackHalf2x16(bufferA.data[index/2])[index%2]);
-
-        // Load B[k][j] from bufferB, considering transB
-        vec2 b_val;
-        if (uParams.transB == 1) {
-            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
-            index = j * 2 * uParams.K + k;
-            b_val.x = unpackHalf2x16(bufferB.data[index/2])[index%2];
-            if (j * 2 + 1 < uParams.N) {
-                index = (j * 2  + 1) * uParams.K + k;
-                b_val.y = unpackHalf2x16(bufferB.data[index/2])[index%2];
-            } else {
-                b_val.y = 0.0;
-            }
-        } else {
-            // B is stored as K×N, B[k][j] = B_physical[k][j]
-            index = k * uParams.N + j * 2;
-            b_val = unpackHalf2x16(bufferB.data[index/2]);
-        }
-        sum += a_val * b_val;
+    int ai = (uParams.transA == 1) ? i : i * uParams.K;
+    int a_step = (uParams.transA == 1) ? uParams.M : 1;
+    int b_step = (uParams.transB == 1) ? 1 : uParams.N;
+    int b0i, b1i;
+    if (uParams.transB == 1) {
+        b0i = j0 * uParams.K;
+        // Last column when N is odd: b1i aliases b0i; sum.y is computed from
+        // valid memory then masked out on store.
+        b1i = (j0 + 1 < uParams.N) ? (j0 + 1) * uParams.K : b0i;
+    } else {
+        b0i = j0;
+        b1i = (j0 + 1 < uParams.N) ? j0 + 1 : b0i;
     }
 
-    int yIndex = i * uParams.N + j * 2;       // C[i][j] in row-major
+    vec2 sum = vec2(0.0);
+    if (A16) {
+        if (B16) {
+            KLOOP2(LDH(bufferA, ai), LDH(bufferB, b0i), LDH(bufferB, b1i), sum)
+        } else {
+            KLOOP2(LDH(bufferA, ai), LDF(bufferB, b0i), LDF(bufferB, b1i), sum)
+        }
+    } else {
+        if (B16) {
+            KLOOP2(LDF(bufferA, ai), LDH(bufferB, b0i), LDH(bufferB, b1i), sum)
+        } else {
+            KLOOP2(LDF(bufferA, ai), LDF(bufferB, b0i), LDF(bufferB, b1i), sum)
+        }
+    }
+
     sum *= uParams.alpha;
-    vec2 c_val;
     if (uParams.has_bias == 1) {
-        // Bias C is 1-D [N], broadcast across all M rows. The two output
-        // columns (j*2, j*2+1) read C[j*2] and C[j*2+1].
-        int bcol0 = j * 2;
-        c_val.x = unpackHalf2x16(bufferC.data[bcol0/2])[bcol0%2];
-        int bcol1 = j * 2 + 1;
+        // Bias C is 1-D [N], broadcast across all M rows: C[j0], C[j0+1].
+        int bcol1 = j0 + 1;
+        vec2 c_val;
+        c_val.x = (uParams.fp16c == 1)
+                      ? unpackHalf2x16(bufferC.data[j0 / 2])[j0 % 2]
+                      : uintBitsToFloat(bufferC.data[j0]);
         if (bcol1 < uParams.N) {
-            c_val.y = unpackHalf2x16(bufferC.data[bcol1/2])[bcol1%2];
+            c_val.y = (uParams.fp16c == 1)
+                          ? unpackHalf2x16(bufferC.data[bcol1 / 2])[bcol1 % 2]
+                          : uintBitsToFloat(bufferC.data[bcol1]);
         } else {
             c_val.y = 0.0;
         }
@@ -154,166 +173,16 @@ void gemm16() {
 
     sum = activation(sum, uParams.activation);
 
-    bufferY.data[yIndex/2] = packHalf2x16(sum);
-}
-
-void gemmMixed16() {
-    int j = int(gl_GlobalInvocationID.x); // column index in Y
-    int i = int(gl_GlobalInvocationID.y); // row index in Y
-
-    if (i >= uParams.M || j >= (uParams.N + 1)/2) return;
-
-    vec2 sum = vec2(0.0);
-
-    for (int k = 0; k < uParams.K; ++k) {
-        // Load A[i][k] from bufferA, considering transA
-        float a_val;
-        int index;
-        if (uParams.transA == 1) {
-            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
-            index = k * uParams.M + i;
-        } else {
-            // A is stored as M×K, A[i][k] = A_physical[i][k]
-            index = i * uParams.K + k;
-        }
-        if (uParams.fp16a == 1) {
-            a_val = unpackHalf2x16(bufferA.data[index/2])[index%2];
-        } else {
-            a_val = uintBitsToFloat(bufferA.data[index]);
-        }
-
-        // Load B[k][j] from bufferB, considering transB
-        float b_val0;
-        float b_val1 = 0;
-        if (uParams.transB == 1) {
-            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
-            index = j * 2 * uParams.K + k;
-            if (uParams.fp16b == 1) {
-                b_val0 = unpackHalf2x16(bufferB.data[index/2])[index%2];
-                if (j * 2 + 1 < uParams.N) {
-                    index = (j * 2  + 1) * uParams.K + k;
-                    b_val1 = unpackHalf2x16(bufferB.data[index/2])[index%2];
-                }
-            } else {
-                b_val0 = uintBitsToFloat(bufferB.data[index]);
-                if (j * 2 + 1 < uParams.N) {
-                    index = (j * 2  + 1) * uParams.K + k;
-                    b_val1 = uintBitsToFloat(bufferB.data[index]);
-                }
-            }
-        } else {
-            // B is stored as K×N, B[k][j] = B_physical[k][j]
-            index = k * uParams.N + j * 2;
-            if (uParams.fp16b == 1) {
-                vec2 b_val = unpackHalf2x16(bufferB.data[index/2]);
-                b_val0 = b_val.x;
-                b_val1 = b_val.y;
-            } else {
-                b_val0 = uintBitsToFloat(bufferB.data[index]);
-                if (j * 2 + 1 < uParams.N) {
-                    b_val1 = uintBitsToFloat(bufferB.data[index + 1]);
-                }
-            }
-        }
-        sum.x += a_val * b_val0;
-        sum.y += a_val * b_val1;
+    if (j0 + 1 >= uParams.N) {
+        sum.y = 0.0; // odd-N tail: drop the aliased column
     }
-
-    int yIndex = i * uParams.N + j * 2;       // C[i][j] in row-major
-    sum *= uParams.alpha;
-    float c_val0;
-    float c_val1 = 0;
-    if (uParams.has_bias == 1) {
-        // Bias C is 1-D [N], broadcast across all M rows: C[j*2], C[j*2+1].
-        int bcol0 = j * 2;
-        int bcol1 = j * 2 + 1;
-        if (uParams.fp16c == 1) {
-            c_val0 = unpackHalf2x16(bufferC.data[bcol0/2])[bcol0%2];
-            if (bcol1 < uParams.N) {
-                c_val1 = unpackHalf2x16(bufferC.data[bcol1/2])[bcol1%2];
-            }
-        } else {
-            c_val0 = uintBitsToFloat(bufferC.data[bcol0]);
-            if (bcol1 < uParams.N) {
-                c_val1 = uintBitsToFloat(bufferC.data[bcol1]);
-            }
-        }
-        sum.x += c_val0 * uParams.beta;
-        sum.y += c_val1 * uParams.beta;
-    }
-
-    sum = activation(sum, uParams.activation);
-
-    bufferY.data[yIndex/2] = packHalf2x16(sum);
-}
-
-void gemmMixed32() {
-    int j = int(gl_GlobalInvocationID.x); // column index in Y
-    int i = int(gl_GlobalInvocationID.y); // row index in Y
-
-    if (i >= uParams.M || j >= uParams.N) return;
-
-    float sum = 0.0;
-
-    for (int k = 0; k < uParams.K; ++k) {
-        // Load A[i][k] from bufferA, considering transA
-        float a_val;
-        int index;
-        if (uParams.transA == 1) {
-            // A is stored as K×M (row-major), so A^T[i][k] = A_physical[k][i]
-            index = k * uParams.M + i;
-        } else {
-            // A is stored as M×K, A[i][k] = A_physical[i][k]
-            index = i * uParams.K + k;
-        }
-        if (uParams.fp16a == 1) {
-            a_val = unpackHalf2x16(bufferA.data[index/2])[index%2];
-        } else {
-            a_val = uintBitsToFloat(bufferA.data[index]);
-        }
-
-        // Load B[k][j] from bufferB, considering transB
-        float b_val;
-        if (uParams.transB == 1) {
-            // B is stored as N×K (row-major), so B^T[k][j] = B_physical[j][k]
-            index = j * uParams.K + k;
-        } else {
-            // B is stored as K×N, B[k][j] = B_physical[k][j]
-            index = k * uParams.N + j;
-        }
-        if (uParams.fp16b == 1) {
-            b_val = unpackHalf2x16(bufferB.data[index/2])[index%2];
-        } else {
-            b_val = uintBitsToFloat(bufferB.data[index]);
-        }
-        sum += a_val * b_val;
-    }
-
-    int yIndex = i * uParams.N + j;       // C[i][j] in row-major
-    sum *= uParams.alpha;
-    float c_val;
-    if (uParams.has_bias == 1) {
-        // Bias C is 1-D [N], broadcast across all M rows: element is C[j].
-        if (uParams.fp16c == 1) {
-            c_val = unpackHalf2x16(bufferC.data[j/2])[j%2];
-        } else {
-            c_val = uintBitsToFloat(bufferC.data[j]);
-        }
-        sum += c_val * uParams.beta;
-    }
-
-    sum = activation(sum, uParams.activation);
-    bufferY.data[yIndex] = floatBitsToUint(sum);
+    bufferY.data[(i * uParams.N + j0) / 2] = packHalf2x16(sum);
 }
 
 void main() {
-    if (uParams.fp16o == 0 && uParams.fp16a == 0 && uParams.fp16b == 0 && uParams.fp16c == 0) {
-        gemm32();
-    } else if (uParams.fp16o == 1 && uParams.fp16a == 1 && uParams.fp16b == 1 && uParams.fp16c == 1) {
+    if (uParams.fp16o == 1) {
         gemm16();
-    } else if (uParams.fp16o == 1) {
-        gemmMixed16();
-    } else if (uParams.fp16o == 0) {
-        gemmMixed32();
+    } else {
+        gemm32();
     }
 }
