@@ -307,6 +307,37 @@ struct VisualEngine {
         std::printf("=== LoadModel (visual) ===\n");
         vrt->LoadModel();
         std::printf("=== LoadModel (visual) done ===\n");
+        check_visual_graph(*vrt);
+    }
+
+    // The vkopbin bakes (seq_len, row) from the export-time model config into
+    // every shape; image_preproc.hpp's compile-time constants must describe
+    // THIS graph, not some config.json. Verify before the first image so a
+    // mismatch fails loudly at load instead of silently mis-slicing
+    // pixel_values.
+    static void check_visual_graph(Runtime& rt) {
+        auto pv = rt.GetInput("pixel_values");
+        if (!pv)
+            throw std::runtime_error("visual graph has no pixel_values input");
+        auto s = pv->getShape();
+        const int row = vkop::export_::kRow;
+        const int m2 = vkop::export_::kMerge * vkop::export_::kMerge;
+        if (s.size() != 2 || s[1] != row || s[0] % m2 != 0) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "visual graph pixel_values shape [%d,%d] does not "
+                          "match compiled constants (row=%d, seq %% %d == 0). "
+                          "The graph was exported for a different vision "
+                          "config — re-export it with a matching model.",
+                          s.empty() ? 0 : s[0], s.size() > 1 ? s[1] : 0,
+                          row, m2);
+            throw std::runtime_error(buf);
+        }
+        std::printf("[visual] graph pixel_values [%d,%d] matches "
+                    "patch=%d temporal=%d merge=%d chans=%d\n",
+                    s[0], s[1], vkop::export_::kPatch,
+                    vkop::export_::kTemporalPatch, vkop::export_::kMerge,
+                    vkop::export_::kInChans);
     }
 
     VisualFeatures run(const std::string& image_path) {
