@@ -49,6 +49,13 @@ class Shape : public Operator {
         output->set_shape_ssbo(std::dynamic_pointer_cast<VulkanBuffer>(
                                    output->as_storage_buffer(m_dev_, m_cmd_)),
                                static_cast<int>(shape.size()));
+        // Host-shape mode: the dims were filled on the host above and data_ is
+        // recomputed every round, so it stays authoritative — downstream
+        // host-side shape consumers (Gather/Concat/Reshape) read it with no
+        // GPU readback.
+        if (host_shape_enabled()) {
+            output->set_host_authoritative();
+        }
     }
 
     // Shape is CPU-only (no pipeline/spv, no submit()). Its output changes

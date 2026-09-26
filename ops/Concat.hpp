@@ -289,6 +289,72 @@ class ConcatBuffer : public BufferFactory {
         }
     }
 
+    // Host-shape mode: concatenate the int64 inputs on the host. In the
+    // shape-meta chain the inputs are host-resident (Gather/Shape outputs,
+    // int64 constants), so their copyToCPU is a free host-authoritative
+    // early-return; a genuinely GPU-only input still reads back correctly.
+    // The output carries authoritative host bytes and is mirrored to the GPU
+    // (copyToGPUDeferred) for any GPU consumer.
+    void
+    cpuConcatInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                   const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                   const std::vector<int> &out_shape) {
+        int rank = static_cast<int>(out_shape.size());
+        int axis = axis_;
+        if (axis < 0) {
+            axis += rank;
+        }
+        int outer = 1, inner = 1;
+        for (int i = 0; i < axis; ++i) {
+            outer *= out_shape[i];
+        }
+        for (int i = axis + 1; i < rank; ++i) {
+            inner *= out_shape[i];
+        }
+        int out_axis = out_shape[axis];
+
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (output->num_elements() != total_elems(out_shape)) {
+            output->resize(out_shape);
+        }
+        std::vector<int64_t> out(static_cast<size_t>(outer) * out_axis * inner,
+                                 0);
+        int axis_off = 0;
+        for (const auto &in : inputs) {
+            auto in_shape = in->getShape();
+            int in_axis = in_shape[axis];
+            auto t = core::as_tensor<int64_t>(in);
+            t->copyToCPU(m_cmdpool_);
+            for (int o = 0; o < outer; ++o) {
+                for (int a = 0; a < in_axis; ++a) {
+                    size_t dst =
+                        (static_cast<size_t>(o) * out_axis + (axis_off + a)) *
+                        inner;
+                    size_t src = (static_cast<size_t>(o) * in_axis + a) * inner;
+                    for (int i = 0; i < inner; ++i) {
+                        out[dst + i] = (*t)[src + i];
+                    }
+                }
+            }
+            axis_off += in_axis;
+        }
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        output->copyToGPUDeferred(m_cmd_);
+        output->set_host_authoritative();
+        // Preserve the Phase 2 shape-meta side-channel propagation (only along
+        // the shape-value chain).
+        for (const auto &in : inputs) {
+            if (in->has_shape_ssbo()) {
+                output->set_shape_ssbo(
+                    std::dynamic_pointer_cast<VulkanBuffer>(
+                        output->as_storage_buffer(m_dev_, m_cmd_)),
+                    rank);
+                break;
+            }
+        }
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -308,6 +374,10 @@ class ConcatBuffer : public BufferFactory {
         // bottleneck after Shape/Gather were GPU-ified). The GPU dispatch
         // records into the level command buffer with no stall.
         if (inputs[0]->dtype() == typeid(int64_t)) {
+            if (host_shape_enabled()) {
+                cpuConcatInt64(inputs, outputs, out_shape);
+                return;
+            }
             gpuConcatInt64(inputs, outputs, out_shape);
             return;
         }

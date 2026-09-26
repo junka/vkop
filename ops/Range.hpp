@@ -99,6 +99,8 @@ class Range : public Operator {
                 output->fillToCPU(cached_out_);
                 objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
                 output->copyToGPUDeferred(m_cmd_);
+                if (host_shape_enabled())
+                    output->set_host_authoritative();
                 if (std::getenv("VKOP_RB_TRACE")) {
                     fprintf(
                         stderr, "[rbtrace] Range i64 STABLE skip (inums=%d)\n",
@@ -227,6 +229,8 @@ class Range : public Operator {
             output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled())
+                output->set_host_authoritative();
             return;
         }
 

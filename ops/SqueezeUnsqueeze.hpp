@@ -171,6 +171,18 @@ class SqueezeUnsqueeze : public Operator {
                     input->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // Host-shape mode: this is a pure view (element count is
+                // unchanged), so propagate the input's authoritative host
+                // bytes to the output — downstream host readers then skip
+                // their GPU->CPU readback.
+                if (host_shape_enabled() && input->get_host_authoritative()) {
+                    const std::vector<T> &src = input->data();
+                    size_t n =
+                        std::min<size_t>(output->num_elements(), src.size());
+                    output->fillToCPU(
+                        std::vector<T>(src.begin(), src.begin() + n));
+                    output->set_host_authoritative();
+                }
                 return;
             }
 
@@ -195,6 +207,9 @@ class SqueezeUnsqueeze : public Operator {
             output->fillToCPU(dst);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled() && inputs[0]->dtype() == typeid(int64_t)) {
+                output->set_host_authoritative();
+            }
         });
     }
 

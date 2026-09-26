@@ -103,6 +103,41 @@ class Where : public Operator {
     void invalidate_shape_cache() override {}
 
   private:
+    // Host-shape mode: broadcast-select cond/X/Y on the host. cond (Equal) and
+    // the shape-value branches are host-authoritative in this mode, so their
+    // copyToCPU is a free early-return. The output carries authoritative host
+    // bytes so a downstream Expand (whose target shape comes from this Where)
+    // skips its GPU->CPU readback; it is mirrored to the GPU for any GPU
+    // consumer.
+    void
+    cpuWhereInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                  const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                  const std::vector<int> &out_shape) {
+        auto cs = inputs[0]->getShape();
+        auto xs = inputs[1]->getShape();
+        auto ys = inputs[2]->getShape();
+        int total = total_elems(out_shape);
+        auto cond = core::as_tensor<int64_t>(inputs[0]);
+        auto x = core::as_tensor<int64_t>(inputs[1]);
+        auto y = core::as_tensor<int64_t>(inputs[2]);
+        cond->copyToCPU(m_cmdpool_);
+        x->copyToCPU(m_cmdpool_);
+        y->copyToCPU(m_cmdpool_);
+        std::vector<int64_t> out(static_cast<size_t>(total));
+        for (int i = 0; i < total; ++i) {
+            int64_t cv = (*cond)[broadcast_index(cs, out_shape, i)];
+            out[static_cast<size_t>(i)] =
+                (cv != 0) ? (*x)[broadcast_index(xs, out_shape, i)]
+                          : (*y)[broadcast_index(ys, out_shape, i)];
+        }
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        output->copyToGPUDeferred(m_cmd_);
+        output->set_host_authoritative();
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -150,6 +185,10 @@ class Where : public Operator {
         // GPU-resident for downstream Expand/Unsqueeze, so the Equal->Where->
         // Expand chain never crosses GPU->CPU.
         if (inputs[0]->dtype() == typeid(int64_t)) {
+            if (host_shape_enabled()) {
+                cpuWhereInt64(inputs, outputs, out_shape);
+                return;
+            }
             ensure_int64_pipeline();
             int64_mode_ = true;
 

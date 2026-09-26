@@ -65,6 +65,37 @@ class Equal : public BufferBinaryFactory {
     }
 
   private:
+    // Host-shape mode: compare the int64 inputs on the host. The inputs are
+    // host-resident in the shape-meta chain (host-authoritative producers), so
+    // their copyToCPU is a free early-return. The output (1/0, matching Where's
+    // condition buffer) carries authoritative host bytes so a downstream host
+    // Where skips its GPU->CPU readback; it is mirrored to the GPU for any GPU
+    // consumer.
+    void
+    cpuEqualInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                  const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        auto shape_a = inputs[0]->getShape();
+        auto shape_b = inputs[1]->getShape();
+        auto out_shape = computeBroadcastShape(shape_a, shape_b);
+        int total = total_elems(out_shape);
+        auto a = core::as_tensor<int64_t>(inputs[0]);
+        auto b = core::as_tensor<int64_t>(inputs[1]);
+        a->copyToCPU(m_cmdpool_);
+        b->copyToCPU(m_cmdpool_);
+        std::vector<int64_t> out(static_cast<size_t>(total));
+        for (int i = 0; i < total; ++i) {
+            int64_t av = (*a)[broadcast_index(shape_a, out_shape, i)];
+            int64_t bv = (*b)[broadcast_index(shape_b, out_shape, i)];
+            out[static_cast<size_t>(i)] = (av == bv) ? 1 : 0;
+        }
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        output->resize(out_shape);
+        output->fillToCPU(out);
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        output->copyToGPUDeferred(m_cmd_);
+        output->set_host_authoritative();
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -83,6 +114,10 @@ class Equal : public BufferBinaryFactory {
         // authoritatively — correct, just a sync readback that this
         // optimization aims to remove by also GPU-ifying Where.)
         if (inputs[0]->dtype() == typeid(int64_t)) {
+            if (host_shape_enabled()) {
+                cpuEqualInt64(inputs, outputs);
+                return;
+            }
             ensure_int64_pipeline();
             int64_mode_ = true;
 

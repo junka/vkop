@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstddef>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -16,6 +17,24 @@
 
 namespace vkop {
 namespace ops {
+
+// VKOP_HOST_SHAPE evaluates the int64 shape/metadata chain entirely on the
+// host instead of via GPU shaders whose outputs must be read back to the CPU
+// by downstream shape-consuming ops (Reshape/Expand/Mul/Cast). The chain is
+// derived purely from tensor shape metadata + int64 constants — no hidden
+// state — so host evaluation is exact. Producers mark their int64 outputs
+// host-authoritative (Tensor::set_host_authoritative) so a downstream
+// copyToCPU returns the already-correct host bytes with no GPU round trip;
+// the bytes are still mirrored to the GPU via copyToGPUDeferred for GPU
+// consumers. On by default; VKOP_HOST_SHAPE=0 restores the GPU-shader baseline
+// for A/B comparison.
+inline bool host_shape_enabled() {
+    static const bool enabled = [] {
+        const char *env = std::getenv("VKOP_HOST_SHAPE");
+        return env == nullptr || env[0] != '0';
+    }();
+    return enabled;
+}
 
 class Operator {
   public:

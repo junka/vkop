@@ -152,7 +152,13 @@ class TransposeBuffer : public BufferFactory {
             output->resize(outshape);
             output->fillToCPU(out);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
+            // Deferred upload keeps data_ populated (no sync submit+wait) for
+            // downstream host readers. Host-shape mode: also mark the bytes
+            // authoritative so those readers skip their GPU->CPU readback.
+            output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled()) {
+                output->set_host_authoritative();
+            }
             return;
         }
 

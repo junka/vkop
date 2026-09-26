@@ -185,6 +185,12 @@ class BufferBinaryFactory : public BufferFactory {
         // it) for downstream as_tensor<>() readers -- same property the old
         // explicit-src copyToGPU gave, without the submit+wait stall.
         output->copyToGPUDeferred(m_cmd_);
+        // Host-shape mode: the int64 result is recomputed on the host every
+        // round and never written by a GPU shader, so data_ is authoritative —
+        // downstream host readers skip their GPU->CPU readback.
+        if (host_shape_enabled()) {
+            output->set_host_authoritative();
+        }
     }
 
     void execute(

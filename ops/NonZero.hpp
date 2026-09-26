@@ -99,6 +99,8 @@ class NonZero : public BufferFactory {
             output->fillToCPU(cached_out_);
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled())
+                output->set_host_authoritative();
             if (std::getenv("VKOP_RB_TRACE")) {
                 fprintf(stderr, "[rbtrace] NonZero STABLE skip (count=%d)\n",
                         cached_out_shape_.size() > 1 ? cached_out_shape_[1]
@@ -200,6 +202,8 @@ class NonZero : public BufferFactory {
         output->fillToCPU(out);
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
         output->copyToGPUDeferred(m_cmd_);
+        if (host_shape_enabled())
+            output->set_host_authoritative();
     }
 };
 

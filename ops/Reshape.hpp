@@ -312,6 +312,18 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // Host-shape mode: reshape is a pure view (element count is
+                // unchanged), so propagate the input's authoritative host
+                // bytes to the output — downstream host readers then skip
+                // their GPU->CPU readback.
+                if (host_shape_enabled() && src->get_host_authoritative()) {
+                    std::vector<int64_t> out(static_cast<size_t>(total));
+                    for (int i = 0; i < total; ++i) {
+                        out[static_cast<size_t>(i)] = (*src)[i];
+                    }
+                    output->fillToCPU(out);
+                    output->set_host_authoritative();
+                }
                 // Phase 2: propagate the shape-meta side-channel. When the
                 // input IS shape values (carries shape_ssbo_), the reshaped
                 // output is also shape values → tag the aliased buffer as the
@@ -343,6 +355,9 @@ class ReshapeBuffer : public BufferFactory {
             // buffer (no submit+wait stall) instead of copyToGPU's sync flush.
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
             output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled()) {
+                output->set_host_authoritative();
+            }
             return;
         }
 

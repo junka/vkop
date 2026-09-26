@@ -287,9 +287,16 @@ class Gather : public Operator {
         output->resize(out_shape);
         output->fillToCPU(out);
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-        // Explicit src keeps the CPU copy alive for downstream as_tensor<>()
-        // readers (copyToGPU would clear data_ otherwise).
-        output->copyToGPU(m_cmdpool_, out.data());
+        // Deferred (no-stall) upload: records vkCmdUpdateBuffer into the level
+        // cmd buffer and keeps data_ populated (unlike copyToGPU) for
+        // downstream host readers.
+        output->copyToGPUDeferred(m_cmd_);
+        // Host-shape mode: data_ is recomputed every round and never written by
+        // a GPU shader on this path, so it stays authoritative — downstream
+        // shape consumers skip their GPU->CPU readback.
+        if (host_shape_enabled()) {
+            output->set_host_authoritative();
+        }
     }
 
     void execute(
@@ -310,6 +317,14 @@ class Gather : public Operator {
         // copyToGPU = 3 sync stalls, ~665ms/round — the #1 decode bottleneck).
         // The GPU dispatch records into the level command buffer with no stall.
         if (inputs[0]->dtype() == typeid(int64_t)) {
+            // Host-shape mode: compute the gather on the host so the output
+            // carries authoritative host bytes (no downstream readback). Both
+            // inputs are host-resident in the shape-meta chain (Shape output,
+            // int64 constants), so the host path needs no GPU round trip.
+            if (host_shape_enabled()) {
+                cpuComputeInt64(inputs, outputs);
+                return;
+            }
             gpuGatherInt64(inputs, outputs, out_shape);
             return;
         }
