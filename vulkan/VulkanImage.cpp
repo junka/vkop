@@ -1,5 +1,6 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanImage.hpp"
+#include "include/logger.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <cassert>
@@ -39,11 +40,9 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     if (m_layers_ == 0 || m_layers_ > vdev->getMaxImageArrayLayers()) {
         throw std::runtime_error("Invalid Vulkan image layers.");
     }
-    if (dim.width > 32768 || dim.height > 32768) {
+    if (dim.width > vdev->getMaxImageDimension2D() ||
+        dim.height > vdev->getMaxImageDimension2D()) {
         throw std::runtime_error("too large Vulkan image size.");
-    }
-    if (m_layers_ > 2048) {
-        throw std::runtime_error("too many Vulkan image layers.");
     }
     calcImageSize();
     createImage();
@@ -64,6 +63,7 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     VkMemoryRequirements memoryRequirements;
     vkGetImageMemoryRequirements(m_device, m_image, &memoryRequirements);
 #endif
+    m_alloc_size_ = memory_requirements.size;
     if (!allocMemory(memory_requirements, requireProperties, ext_fd)) {
         destroyImage();
         throw std::runtime_error("failed to allocate image memory!");
@@ -245,8 +245,9 @@ void VulkanImage::createImage() {
     if (m_dim_.depth == 1) {
         m_imagetype_ = VK_IMAGE_TYPE_2D;
     }
-    printf("create image size %d %d %d layers %d, size %d vs \n", m_dim_.width,
-           m_dim_.height, m_dim_.depth, m_layers_, getImageSize());
+    LOG_INFO("create image %ux%ux%u layers %u, packed size %llu bytes",
+             m_dim_.width, m_dim_.height, m_dim_.depth, m_layers_,
+             (unsigned long long)getImageSize());
 
     VkImageCreateInfo image_create_info = {};
     image_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -271,10 +272,19 @@ void VulkanImage::createImage() {
                              nullptr, &m_image_);
 #endif
     if (ret != VK_SUCCESS) {
-        printf("fail create for image size %d, ret %d\n", getImageSize(), ret);
+        printf("fail create for image size %llu, ret %d\n",
+               (unsigned long long)getImageSize(), ret);
         throw std::runtime_error("Failed to CreateImage " +
                                  std::to_string(ret));
     }
+}
+
+uint64_t VulkanImage::getAllocatedSize() const {
+#ifdef USE_VMA
+    return m_vdev_->getVMA()->getAllocatedSize(&m_vma_image_);
+#else
+    return m_alloc_size_;
+#endif
 }
 
 void VulkanImage::destroyImage() {
@@ -611,6 +621,10 @@ void VulkanImage::hostImageCopyToDevice(void *ptr) {
     region.imageSubresource.layerCount = m_layers_;
     region.imageExtent = m_dim_;
     region.pHostPointer = ptr;
+    // 0 == tightly packed host layout, which is how the caller sized its
+    // buffer; the driver applies the image's own row/array pitch internally.
+    region.memoryRowLength = 0;
+    region.memoryImageHeight = 0;
 
     VkImage img = getImage();
     VkCopyMemoryToImageInfoEXT copyinfo = {};

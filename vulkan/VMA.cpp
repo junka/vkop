@@ -154,6 +154,12 @@ VkResult VMA::createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img) {
                           &img->allocation, nullptr);
 }
 
+uint64_t VMA::getAllocatedSize(const struct VmaImage *img) {
+    VmaAllocationInfo info;
+    vmaGetAllocationInfo(img->allocator, img->allocation, &info);
+    return static_cast<uint64_t>(info.size);
+}
+
 void *VMA::getMappedMemory(struct VmaBuffer *buf) {
     VmaAllocationInfo info;
     vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);

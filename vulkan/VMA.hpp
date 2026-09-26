@@ -50,6 +50,13 @@ class VMA {
 
     static void *getMappedMemory(struct VmaBuffer *buf);
 
+    // Bytes actually reserved for this image's allocation: the driver's padded
+    // requirement, possibly rounded up again by the pool. Always >= the image's
+    // packed texel count, so it is the only honest number for footprint
+    // accounting (measured equal to the requirement on MoltenVK, but that is
+    // the allocator's choice, not a guarantee).
+    static uint64_t getAllocatedSize(const struct VmaImage *img);
+
     void getStats();
 
     VMA() = delete;

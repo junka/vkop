@@ -61,13 +61,21 @@ class VulkanImage : public VulkanResource {
 #endif
     }
 
-    int getImageSize() const {
-        return m_chansize_ * m_chans_ * m_dim_.width * m_dim_.height *
-               m_dim_.depth * m_layers_;
+    // Packed texel bytes, i.e. the size of the host/staging buffer needed to
+    // carry this image's payload. 64-bit: a packed [W, N*H, C4] image overflows
+    // 32 bits within shapes this runtime accepts.
+    uint64_t getImageSize() const {
+        return static_cast<uint64_t>(m_chansize_) * m_chans_ * m_dim_.width *
+               m_dim_.height * m_dim_.depth * m_layers_;
     }
     uint32_t getImageWidth() const { return m_dim_.width; }
     uint32_t getImageHeight() const { return m_dim_.height; }
     uint32_t getImageLayers() const { return m_layers_; }
+
+    // Device memory really reserved for this image: getImageSize() plus
+    // whatever row/array-granularity padding the driver demanded. This is the
+    // number that belongs in a footprint report; getImageSize() is not.
+    uint64_t getAllocatedSize() const;
 
     int getImageChannelSize() const { return m_chansize_; }
     int getImageChannelNum() const { return m_chans_; }
@@ -94,6 +102,9 @@ class VulkanImage : public VulkanResource {
 
     int m_chansize_;
     int m_chans_;
+    // Only the non-VMA path has to remember this; VMA answers it from the
+    // allocation itself.
+    uint64_t m_alloc_size_ = 0;
 
     void calcImageSize();
 

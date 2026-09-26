@@ -115,9 +115,12 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     this->timestampPeriod_ = properties2.properties.limits.timestampPeriod;
     this->maxImageArrayLayers_ =
         properties2.properties.limits.maxImageArrayLayers;
+    this->maxImageDimension2D_ =
+        properties2.properties.limits.maxImageDimension2D;
     this->deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", this->deviceName_.c_str());
     LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
+    LOG_INFO("Max image dimension 2D %d", this->maxImageDimension2D_);
     LOG_INFO("Min TexelBuffer Alignment %llu",
              properties2.properties.limits.minTexelBufferOffsetAlignment);
 #ifdef VK_EXT_subgroup_size_control

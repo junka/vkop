@@ -134,6 +134,7 @@ class VulkanDevice {
 
     float getTimestampPeriod() const { return timestampPeriod_; }
     uint32_t getMaxImageArrayLayers() const { return maxImageArrayLayers_; }
+    uint32_t getMaxImageDimension2D() const { return maxImageDimension2D_; }
 
     bool checkHostImageCopyDstLayoutSupport(VkImageLayout layout) {
         return std::any_of(copyDstLayout_.begin(), copyDstLayout_.end(),
@@ -206,6 +207,9 @@ class VulkanDevice {
 
     float timestampPeriod_;
     uint32_t maxImageArrayLayers_;
+    // Packed NCHW images address along width, so a tensor whose W*C4 exceeds
+    // this cannot be represented as one image at all.
+    uint32_t maxImageDimension2D_ = 0;
 
     std::vector<VkImageLayout> copySrcLayout_;
     std::vector<VkImageLayout> copyDstLayout_;

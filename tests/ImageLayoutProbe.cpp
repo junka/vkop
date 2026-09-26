@@ -7,9 +7,12 @@
 // granularity. This tool measures that gap per tensor shape and reports what
 // the same data would cost as a single folded image2D (z folded into x).
 //
-// It creates VkImages without binding memory (legal for
-// vkGetImageMemoryRequirements and vkGetImageSubresourceLayout), so it does not
-// disturb the runtime's allocations and never touches device memory.
+// It measures in two steps. First it creates VkImages without binding memory
+// (legal for vkGetImageMemoryRequirements and vkGetImageSubresourceLayout) to
+// read the driver's own view of each layout. Then, when a device is available,
+// it allocates the same images through vkop::VulkanImage so the reported bytes
+// are what the allocator really reserves (VMA block rounding included) -- that
+// second number is the one a fold decision should trust.
 //
 // Usage:
 //   tests/ImageLayoutProbe                          # synthetic shapes only
@@ -27,6 +30,7 @@
 #include "core/runtime.hpp"
 #include "include/logger.hpp"
 #include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanLib.hpp"
 
@@ -34,12 +38,14 @@ using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::VulkanCommandPool;
 using vkop::VulkanDevice;
+using vkop::VulkanImage;
 using vkop::VulkanInstance;
 
 namespace {
 
 VkDevice g_device = VK_NULL_HANDLE;
 VkPhysicalDevice g_physdev = VK_NULL_HANDLE;
+std::shared_ptr<VulkanDevice> g_dev;
 uint32_t g_max_dim_2d = 0;
 uint32_t g_max_layers = 0;
 
@@ -47,6 +53,33 @@ void *proc(const char *name) {
     // Vulkan is loaded via dlopen in VulkanLib; the loader's exported entry
     // points (global + device commands) are resolved through its dlsym handle.
     return vkop::VulkanLib::getVulkanLib().get_proc_address(name);
+}
+
+// Allocate a real image through the runtime's own class and read back both the
+// packed texel count and the bytes the allocator reserved. Usage flags match
+// Tensor::as_output_image, so the numbers are comparable to a live tensor.
+// Returns false when the extent/format is not supported.
+bool runtime_alloc(VkExtent3D extent, uint32_t layers, VkFormat format,
+                   uint64_t *packed, uint64_t *reserved) {
+    if (!g_dev) {
+        return false;
+    }
+    VkImageUsageFlags usage =
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
+        VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+#ifdef VK_EXT_host_image_copy
+    if (g_dev->is_support_host_image_copy()) {
+        usage |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
+    }
+#endif
+    try {
+        VulkanImage img(g_dev, extent, layers, usage, format);
+        *packed = img.getImageSize();
+        *reserved = img.getAllocatedSize();
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
 }
 
 // 0 = success, otherwise the VkResult of vkCreateImage.
@@ -172,11 +205,24 @@ struct Row {
     uint64_t compact = 0;
     uint64_t array_size = 0;
     uint64_t folded_size = 0;
+    // Bytes the allocator really reserved, when g_dev is set. array_size comes
+    // from vkGetImageMemoryRequirements, which is the driver's minimum; these two
+    // are what a running model actually holds, including allocator rounding.
+    uint64_t array_alloc = 0;
+    uint64_t folded_alloc = 0;
+    bool alloc_ok = false;
     int width = 0, height = 0, layers = 0;
     int folded_width = 0, folded_height = 0;
     bool folded_ok = false;
     bool array_ok = false;
     Role role = Role::Activation;
+
+    // The number to use for this layout: what the allocator really reserved when
+    // we could allocate it, else the driver's stated requirement.
+    uint64_t array_bytes() const { return alloc_ok ? array_alloc : array_size; }
+    uint64_t folded_bytes() const {
+        return alloc_ok ? folded_alloc : folded_size;
+    }
 };
 
 // Fold decision: fold only when it saves both an absolute and a relative
@@ -197,9 +243,10 @@ Decision decide_fold(const Row &r) {
     if (!r.array_ok || !r.folded_ok) {
         return d;
     }
-    if (r.array_size > r.folded_size) {
-        d.saves = r.array_size - r.folded_size;
-        d.pct = 100.0 * (double)d.saves / (double)r.array_size;
+    uint64_t arr = r.array_bytes(), fold = r.folded_bytes();
+    if (arr > fold) {
+        d.saves = arr - fold;
+        d.pct = 100.0 * (double)d.saves / (double)arr;
     }
     d.want_fold = d.fits && d.saves >= 32u * 1024u && d.pct >= 10.0;
     d.shaders_support = (r.role == Role::Kernel1x1);
@@ -253,28 +300,44 @@ Row measure_shape(const Shape &s, VkFormat format, bool verbose) {
         r.folded_size = f.valid ? f.size : 0;
         release(f);
     }
+
+    // Now the real reservation for both layouts. Both have to allocate, and the
+    // runtime's own packed size has to agree with the compact figure this
+    // function mirrored from getGPUShape(), or the two numbers are not
+    // comparable and we fall back to the requirements-based ones.
+    uint64_t packed = 0;
+    r.alloc_ok =
+        runtime_alloc(VkExtent3D{static_cast<uint32_t>(width),
+                                 static_cast<uint32_t>(r.height), 1},
+                      static_cast<uint32_t>(std::max(layers, 1)), format,
+                      &packed, &r.array_alloc) &&
+        packed == r.compact && r.folded_ok &&
+        runtime_alloc(VkExtent3D{static_cast<uint32_t>(r.folded_width),
+                                 static_cast<uint32_t>(r.folded_height), 1},
+                      1, format, &packed, &r.folded_alloc) &&
+        packed == r.compact;
     return r;
 }
 
 void print_row(const Row &r) {
+    uint64_t arr = r.array_bytes(), fold = r.folded_bytes();
     double waste = r.array_ok && r.compact
-                       ? 100.0 * (double)(r.array_size - r.compact) /
-                             (double)r.compact
+                       ? 100.0 * (double)(arr - r.compact) / (double)r.compact
                        : 0.0;
     char folded[32];
     if (r.folded_ok) {
         snprintf(folded, sizeof(folded), "%lluKB",
-                 (unsigned long long)(r.folded_size / 1024));
+                 (unsigned long long)(fold / 1024));
     } else {
         snprintf(folded, sizeof(folded), "n/a");
     }
-    printf("  %-26s %5dx%-6d L=%-5d  compact=%-9llu array=%-9llu (%+6.2f%%)  "
+    printf("  %-26s %5dx%-6d L=%-5d  compact=%-9llu %s=%-9llu (%+6.2f%%)  "
            "folded2D=%-9s\n",
            r.name.c_str(), r.width, r.height, r.layers,
-           (unsigned long long)r.compact, (unsigned long long)r.array_size,
-           waste, folded);
+           (unsigned long long)r.compact, r.alloc_ok ? "alloc " : "req    ",
+           (unsigned long long)arr, waste, folded);
     if (r.array_ok) {
-        long long delta = (long long)r.array_size - (long long)r.folded_size;
+        long long delta = (long long)arr - (long long)fold;
         printf("  %-26s   folded width=%d (limit %u)%s, saves %lld KB vs array\n",
                "", r.folded_width, g_max_dim_2d,
                r.folded_ok ? "" : " -> OVER LIMIT, not foldable",
@@ -383,9 +446,16 @@ void report_synthetic() {
                format == VK_FORMAT_R32G32B32A32_SFLOAT ? "fp32" : "fp16");
         uint64_t now = 0, needs = 0;
         int cnt_now = 0, cnt_needs = 0;
+        int rounded = 0, with_alloc = 0;
         for (const auto &s : shapes) {
             Row r = measure_shape(s, format, false);
             print_row(r);
+            if (r.alloc_ok) {
+                ++with_alloc;
+                if (r.array_alloc != r.array_size) {
+                    ++rounded;
+                }
+            }
             Decision d = decide_fold(r);
             if (d.want_fold) {
                 if (d.shaders_support) {
@@ -400,6 +470,11 @@ void report_synthetic() {
         printf("  -- resnet18 sweep: FOLD NOW %d tensors (%.1f KB) | "
                "FOLD but needs shader %d tensors (%.1f KB)\n",
                cnt_now, (double)now / 1024.0, cnt_needs, (double)needs / 1024.0);
+        // If the allocator never reserved more than vkGetImageMemoryRequirements
+        // asked for, the requirements-based numbers were already the true cost.
+        printf("  -- accounting: %d of %zu shapes allocated, %d of those "
+               "reserved more than vkGetImageMemoryRequirements asked for\n",
+               with_alloc, sizeof(shapes) / sizeof(shapes[0]), rounded);
     }
 }
 
@@ -415,6 +490,7 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
               });
 
     uint64_t total_compact = 0, total_array = 0, total_folded = 0;
+    bool any_real = false;
     uint64_t foldable_now = 0, foldable_needs_shader = 0;
     int fold_now_cnt = 0, needs_shader_cnt = 0;
     int counted = 0, skipped_lowrank = 0, too_many_layers = 0;
@@ -453,10 +529,13 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
         }
         auto r = measure_shape(s, format_for_bytes(element_bytes_of(t)), false);
         rows.push_back(r);
+        if (r.alloc_ok) {
+            any_real = true;
+        }
         total_compact += r.compact;
-        total_array += r.array_size;
+        total_array += r.array_bytes();
         if (r.folded_ok) {
-            total_folded += r.folded_size;
+            total_folded += r.folded_bytes();
         }
         Decision d = decide_fold(r);
         if (d.want_fold) {
@@ -470,18 +549,21 @@ void report_model(const std::string &path, const std::shared_ptr<VulkanCommandPo
         }
         ++counted;
     }
+    printf("  (%s)\n", any_real
+                         ? "sizes are REAL allocator reservations (VMA)"
+                         : "sizes are vkGetImageMemoryRequirements minimums");
     for (const auto &r : rows) {
         print_row(r);
     }
     std::sort(rows.begin(), rows.end(), [](const Row &a, const Row &b) {
-        return (a.array_size - a.compact) > (b.array_size - b.compact);
+        return (a.array_bytes() - a.compact) > (b.array_bytes() - b.compact);
     });
     printf("\n  worst %zu by absolute padding:\n", std::min<size_t>(15, rows.size()));
     for (size_t i = 0; i < rows.size() && i < 15; ++i) {
         const auto &r = rows[i];
         printf("    %-40s +%8.1f KB (%.1f%%)\n", r.name.c_str(),
-               (double)(r.array_size - r.compact) / 1024.0,
-               r.compact ? 100.0 * (double)(r.array_size - r.compact) /
+               (double)(r.array_bytes() - r.compact) / 1024.0,
+               r.compact ? 100.0 * (double)(r.array_bytes() - r.compact) /
                                (double)r.compact
                          : 0.0);
     }
@@ -524,6 +606,7 @@ int main(int argc, char **argv) {
     }
     g_device = dev->getLogicalDevice();
     g_physdev = dev->getPhysicalDevice();
+    g_dev = dev;
 
     report_device_limits();
     report_synthetic();
@@ -534,5 +617,10 @@ int main(int argc, char **argv) {
     } else {
         printf("\n(no model path given — pass a .vkopbin to measure real tensors)\n");
     }
+    // VulkanImage's constructor wants a shared_ptr&, so g_dev has to be one —
+    // but a static-duration shared_ptr would destroy the device at exit(), by
+    // which time VulkanInstance's own static has already torn the instance down
+    // and vkDestroyDevice aborts. Release it while main's device is still live.
+    g_dev.reset();
     return 0;
 }
