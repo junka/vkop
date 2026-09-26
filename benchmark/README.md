@@ -62,6 +62,12 @@ python3 -m onnx2vkop.cli -i onnx_models/xxxx.onnx -q int8
 |Intel ARL| resnet18 | 31 | fp16 | 28.59 |
 |Intel ARL| resnet34 | 55 | fp32 | 62.29|
 |Intel ARL| resnet34 | 55 | fp16 | 55.75|
+|Apple M5 Max (MoltenVK)| resnet18 | 31 | fp32 | 4.27 |
+|Apple M5 Max (MoltenVK)| resnet18 | 31 | fp16 | 3.65 |
+|Apple M5 Max (MoltenVK)| resnet34 | 55 | fp32 | 7.19 |
+|Apple M5 Max (MoltenVK)| resnet34 | 55 | fp16 | 6.34 |
+|Apple M5 Max (MoltenVK)| resnet50 | 72 | fp32 | 8.13 |
+|Apple M5 Max (MoltenVK)| resnet50 | 72 | fp16 | 7.58 |
 
 
 ## 模型转换
