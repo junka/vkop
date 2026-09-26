@@ -284,6 +284,9 @@ void Runtime::LoadModel() {
             t->copyToGPU(m_cmdpool_,
                          const_cast<int64_t *>(
                              reinterpret_cast<const int64_t *>(src_ptr)));
+            // data_ is the authoritative copy (explicit src above keeps it
+            // alive); tell downstream copyToCPU to skip the GPU round trip.
+            t->set_host_authoritative();
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
         } else if (init.dtype == "int32") {
@@ -295,6 +298,7 @@ void Runtime::LoadModel() {
             t->copyToGPU(
                 m_cmdpool_,
                 const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
+            t->set_host_authoritative();
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
@@ -1794,8 +1798,16 @@ double Runtime::Run() {
         }
     };
     if (graph_mode) {
-        VulkanCommandBuffer::pre_readback_hook = [&]() {
+        VulkanCommandBuffer::pre_readback_hook = [&](core::ITensor &) {
             graph_readbacks++;
+            // Attribute this readback to the op whose onExecute is currently
+            // running (graph_op_idx). Counting here is exact; the
+            // post-onExecute delta test below cannot tell WHICH op in the level
+            // read back.
+            if (opprof && graph_op_idx >= 0) {
+                op_type_readback_count[convert_optype_to_string(
+                    node_ops_[graph_op_idx]->get_type())]++;
+            }
             // Close+submit everything recorded so far (this op's producers plus
             // its own pre-readback commands), then reopen a segment and repoint
             // the op at it so the remainder of its recording has a live target.
@@ -1902,15 +1914,12 @@ double Runtime::Run() {
                                            node_output_tensors_[node_idx], id);
             graph_op_idx = -1;
             if (graph_mode) {
-                // Our own segment submits bump queue0's counter too, so a
-                // readback is counted from the hook instead of from the delta.
+                // Readback count for this level is derived from the hook
+                // (graph_readbacks), which also does the per-op-type
+                // attribution. A segment submit bumps queue0's counter too, so
+                // the submitCount delta cannot be used in this mode.
                 if (graph_readbacks != graph_readbacks_lvl) {
                     level_had_readback = true;
-                    if (opprof) {
-                        auto name = convert_optype_to_string(
-                            node_ops_[node_idx]->get_type());
-                        op_type_readback_count[name]++;
-                    }
                 }
             } else if (sc_before != queue0->submitCount()) {
                 level_had_readback = true;

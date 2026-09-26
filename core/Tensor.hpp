@@ -59,6 +59,14 @@ class ITensor {
     // rather than requiring an exact size match. See prealloc_keep_ doc.
     void set_prealloc_keep() { prealloc_keep_ = true; }
     bool get_prealloc_keep() const { return prealloc_keep_; }
+    // Mark this tensor's host data_ as authoritative for its whole lifetime:
+    // the CPU bytes are the source of truth and are never overwritten by a GPU
+    // write. Set for read-only initializers whose bytes were loaded into data_
+    // at model-load (int64/int32 Constants) and merely mirrored to the GPU for
+    // shader consumers. copyToCPU can then skip the GPU->CPU round trip (and
+    // the graph segment boundary it forces) since data_ is already correct.
+    void set_host_authoritative() { host_authoritative_ = true; }
+    bool get_host_authoritative() const { return host_authoritative_; }
     // Per-row element count padded onto the GPU buffer's row stride beyond the
     // logical cols. When >0, the GPU wrote the buffer with a packed row stride
     // of (logical_cols + gpu_row_pad_) and copyBufferToCPU must compact it back
@@ -279,6 +287,9 @@ class ITensor {
     // safe). Without this, make_vkbuff would drop and reallocate the buffer
     // every round because aligned changes as kv_len grows.
     bool prealloc_keep_ = false;
+    // data_ is the source of truth for this tensor's lifetime (read-only
+    // initializer); copyToCPU skips the GPU->CPU round trip. See setter doc.
+    bool host_authoritative_ = false;
     // 64bytes here
     int gpu_row_pad_ = 0;
 
@@ -827,13 +838,17 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        // Graph-submit mode: this readback issues its own vkQueueSubmit and
-        // then waits, so every producer of this tensor must already be
-        // submitted on that queue. Fire the hook first so the Runtime closes
-        // and submits the segment it is currently recording. No-op when graph
-        // mode is off (hook null).
-        if (VulkanCommandBuffer::pre_readback_hook)
-            VulkanCommandBuffer::pre_readback_hook();
+        // Host-authoritative tensor (read-only int64/int32 initializer): data_
+        // was filled at model-load and never overwritten by a GPU write, so the
+        // GPU->CPU copy would just re-derive the same bytes. Return the
+        // existing host copy. Crucially this also skips the graph segment
+        // boundary the hook would force (~0.3ms submit) plus the copy's own
+        // submit+wait
+        // (~1ms) — the dominant prefill cost (219 of 581 readbacks/round).
+        if (host_authoritative_) {
+            reserveOnCPU();
+            return;
+        }
         // Read GPU->CPU whenever a real buffer exists, regardless of the
         // converted_ flag (int64 outputs are created off-GPU but producer ops
         // like NonZero bind an SSBO without flipping converted_, so is_on_GPU()
@@ -845,6 +860,16 @@ template <typename T> class Tensor : public ITensor {
             reserveOnCPU();
             return;
         }
+        // Graph-submit mode: this readback issues its own vkQueueSubmit and
+        // then waits, so every producer of this tensor must already be
+        // submitted on that queue. Fire the hook first so the Runtime closes
+        // and submits the segment it is currently recording. No-op when graph
+        // mode is off (hook null). Only fired on the real-copy path: a tensor
+        // with no GPU buffer needs no submission, so firing there would force a
+        // spurious segment boundary (~0.3ms) for nothing.
+        if (VulkanCommandBuffer::pre_readback_hook)
+            VulkanCommandBuffer::pre_readback_hook(
+                static_cast<core::ITensor &>(*this));
         reserveOnCPU();
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyImageToCPU(cmdpool);

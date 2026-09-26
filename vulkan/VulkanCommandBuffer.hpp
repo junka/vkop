@@ -12,6 +12,9 @@
 #include <vulkan/vulkan.hpp>
 
 namespace vkop {
+namespace core {
+class ITensor;
+}
 class VulkanCommandBuffer {
 
   public:
@@ -26,7 +29,7 @@ class VulkanCommandBuffer {
     // submission must observe its producers already submitted on the queue
     // (the per-level path relies on the same single-queue FIFO ordering). Null
     // whenever graph mode is off, so the hook is a no-op cost elsewhere.
-    static std::function<void()> pre_readback_hook;
+    static std::function<void(core::ITensor &)> pre_readback_hook;
 
     VulkanCommandBuffer() = delete;
 

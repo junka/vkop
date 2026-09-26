@@ -9,7 +9,8 @@ namespace vkop {
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
-std::function<void()> VulkanCommandBuffer::pre_readback_hook = nullptr;
+std::function<void(core::ITensor &)> VulkanCommandBuffer::pre_readback_hook =
+    nullptr;
 
 void VulkanCommandBuffer::pipelineBarrier() {
     // Narrow barrier: the graph segment only ever issues compute shader
