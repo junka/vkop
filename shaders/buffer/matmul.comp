@@ -2,14 +2,17 @@
 
 // MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B.
 // fp32: one thread per output element, fp32 store to uOutput.
-// fp16: when N is even, one thread per output half2 WORD (two adjacent
-// columns of the same row, A load shared) packed straight into uOutput —
-// single pass, no scratch. When N is odd, half2 words straddle row
-// boundaries (word ownership would race across threads), so we fall back
-// to reduce-into-fp32-scratch + a SEPARATE pack dispatch
-// (buffer/matmul_pack.comp, kept for that case; the separate pipeline
-// also avoids Intel ANV push-constant interference between dispatches of
-// the same pipeline).
+// fp16, three modes picked by the host (see MatMulBuffer::execute):
+//   - tiled (uPC.tile): shared-memory 64x64x16 GEMM for large-M / compute-bound
+//     calls, needs K % 16 == 0 and handles both B layouts.
+//   - even N: one thread per output half2 WORD (two adjacent columns of the
+//     same row, A load shared) packed straight into uOutput — single pass, no
+//     scratch.
+//   - odd N: half2 words straddle row boundaries (word ownership would race
+//     across threads), so we fall back to reduce-into-fp32-scratch + a
+//     SEPARATE pack dispatch (buffer/matmul_pack.comp, kept for that case; the
+//     separate pipeline also avoids Intel ANV push-constant interference
+//     between dispatches of the same pipeline).
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -39,6 +42,7 @@ layout(push_constant) uniform PC {
     int batch;
     int fp32;
     int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
+    int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch)
 } uPC;
 
 #ifdef FP16
@@ -115,6 +119,185 @@ void matmul16_even_n() {
         packHalf2x16(vec2(s0a + s0b, s1a + s1b));
 }
 
+// Tiled GEMM for the compute-bound regime (M big enough that the naive path
+// stops being bandwidth-bound). A 16x16 workgroup stages 64x64 A/B tiles in
+// shared memory and every thread owns a 4x4 sub-tile, so each global element
+// read feeds 4x4 outputs instead of ~2: the naive path re-reads the weight
+// rows for every output row, which is what caps it at ~2.7 TFLOP/s.
+// Both B layouts are covered; K % TILE_K == 0 keeps every tile word aligned
+// and removes all in-loop bounds tests. Grid: x = N/64, y = M/64, z = batch,
+// so a block never straddles a batch boundary.
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+// Words per [tile-row][k-pair] shared row: TILE_K/2 packed halves + 1 pad.
+// The pad breaks the 32-bank aliasing a power-of-2 stride causes across the
+// 16 lane threads (each thread's 4 columns start 4 words apart).
+#define SROW (TILE_K / 2 + 1)
+// Words per [k][column-pair] shared row, used when B is [batch, K, N].
+#define SBROW (TILE_N / 2)
+
+// glslang only accepts `shared` at global scope; the tiled path is the sole
+// user, and the naive paths never touch these.
+shared uint sA[TILE_M * SROW];
+// Sized for the wider of the two stagings: transB keeps [col][k-pair] (9 words
+// per row), [batch,K,N] keeps [k][col-pair] (32 words per row, 64 k-rows).
+shared uint sB[TILE_N * SBROW];
+
+int tile_tid() {
+    return int(gl_LocalInvocationID.x) + int(gl_LocalInvocationID.y) * 16;
+}
+
+// A tile: 64 rows x 8 k-pair words, packed along K. Identical for both B
+// layouts, and always coalesced (consecutive threads walk one row).
+void tile_load_a(int b, int row0, int kw, int halfK) {
+    int tid = tile_tid();
+    for (int t = 0; t < 2; ++t) {
+        int l = tid + t * 256;
+        int row = l >> 3;
+        int kt = l & 7;
+        sA[row * SROW + kt] = (row0 + row < uPC.M)
+                                  ? uInputA.data[(b * uPC.M + row0 + row) *
+                                                     halfK + kw + kt]
+                                  : 0u;
+    }
+}
+
+// transB: B is [batch, N, K], so a weight column is a contiguous row and the
+// tile keeps the same [row][k-pair] packing as A.
+void tile_load_b_t(int b, int col0, int kw, int halfK) {
+    int tid = tile_tid();
+    for (int t = 0; t < 2; ++t) {
+        int l = tid + t * 256;
+        int row = l >> 3;
+        int kt = l & 7;
+        sB[row * SROW + kt] = (col0 + row < uPC.N)
+                                  ? uInputB.data[(b * uPC.N + col0 + row) *
+                                                     halfK + kw + kt]
+                                  : 0u;
+    }
+}
+
+// B is [batch, K, N]: keep global's [k][column-pair] packing so the copy is a
+// straight word-for-word transfer (N even => every column pair is one word).
+void tile_load_b_n(int b, int col0, int kk, int halfN) {
+    int tid = tile_tid();
+    for (int t = 0; t < 2; ++t) {
+        int l = tid + t * 256;
+        int kr = l >> 5;
+        int cp = l & 31;
+        sB[kr * SBROW + cp] =
+            (col0 + cp * 2 + 1 < uPC.N)
+                ? uInputB.data[(b * uPC.K + kk + kr) * halfN + (col0 >> 1) + cp]
+                : 0u;
+    }
+}
+
+// One k-pair per thread, transB: a B word carries the two K values of one
+// column.
+void tile_fma_t(inout float acc[4][4], int lr, int lc) {
+#pragma unroll
+    for (int kt = 0; kt < TILE_K / 2; ++kt) {
+        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + kt]);
+        vec2 b0 = unpackHalf2x16(sB[(lc + 0) * SROW + kt]);
+        vec2 b1 = unpackHalf2x16(sB[(lc + 1) * SROW + kt]);
+        vec2 b2 = unpackHalf2x16(sB[(lc + 2) * SROW + kt]);
+        vec2 b3 = unpackHalf2x16(sB[(lc + 3) * SROW + kt]);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+            vec2 bv = c == 0 ? b0 : (c == 1 ? b1 : (c == 2 ? b2 : b3));
+            acc[0][c] += a0.x * bv.x + a0.y * bv.y;
+            acc[1][c] += a1.x * bv.x + a1.y * bv.y;
+            acc[2][c] += a2.x * bv.x + a2.y * bv.y;
+            acc[3][c] += a3.x * bv.x + a3.y * bv.y;
+        }
+    }
+}
+
+// B is [batch, K, N]: a B word carries two adjacent columns at one K, so the
+// thread's 4 columns come from 2 words per K.
+void tile_fma_n(inout float acc[4][4], int lr, int lc) {
+    int cp = lc >> 1;
+#pragma unroll
+    for (int kt = 0; kt < TILE_K / 2; ++kt) {
+        vec2 a0 = unpackHalf2x16(sA[(lr + 0) * SROW + kt]);
+        vec2 a1 = unpackHalf2x16(sA[(lr + 1) * SROW + kt]);
+        vec2 a2 = unpackHalf2x16(sA[(lr + 2) * SROW + kt]);
+        vec2 a3 = unpackHalf2x16(sA[(lr + 3) * SROW + kt]);
+        int w0 = (2 * kt) * SBROW + cp;
+        int w1 = (2 * kt + 1) * SBROW + cp;
+        vec2 p0 = unpackHalf2x16(sB[w0]);
+        vec2 p1 = unpackHalf2x16(sB[w0 + 1]);
+        vec2 q0 = unpackHalf2x16(sB[w1]);
+        vec2 q1 = unpackHalf2x16(sB[w1 + 1]);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            vec2 av = r == 0 ? a0 : (r == 1 ? a1 : (r == 2 ? a2 : a3));
+            acc[r][0] += av.x * p0.x + av.y * q0.x;
+            acc[r][1] += av.x * p0.y + av.y * q0.y;
+            acc[r][2] += av.x * p1.x + av.y * q1.x;
+            acc[r][3] += av.x * p1.y + av.y * q1.y;
+        }
+    }
+}
+
+void matmul16_tiled() {
+    // Workgroup (not invocation) ids: each block owns one 64x64 tile, so the
+    // local offset must not be folded into the tile origin.
+    int b = int(gl_WorkGroupID.z);
+    int row0 = int(gl_WorkGroupID.y) * TILE_M;
+    int col0 = int(gl_WorkGroupID.x) * TILE_N;
+    if (row0 >= uPC.M || col0 >= uPC.N) return;
+
+    int lr = int(gl_LocalInvocationID.y) * 4; // this thread's tile origin
+    int lc = int(gl_LocalInvocationID.x) * 4;
+    int halfK = uPC.K >> 1;
+    int halfN = uPC.N >> 1;
+
+    float acc[4][4];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            acc[r][c] = 0.0;
+
+    // The two layouts differ only in how B is staged and read, so each gets
+    // its own loop nest instead of a branch per k-step. transB is
+    // workgroup-uniform, so the barriers stay convergent.
+    if (uPC.transB != 0) {
+        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
+            tile_load_a(b, row0, kk >> 1, halfK);
+            tile_load_b_t(b, col0, kk >> 1, halfK);
+            barrier();
+            tile_fma_t(acc, lr, lc);
+            barrier();
+        }
+    } else {
+        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
+            tile_load_a(b, row0, kk >> 1, halfK);
+            tile_load_b_n(b, col0, kk, halfN);
+            barrier();
+            tile_fma_n(acc, lr, lc);
+            barrier();
+        }
+    }
+
+    // N even => col0 + lc is even, so each column pair is one word; the pair
+    // can never straddle the row end (that only happens with odd N).
+    for (int r = 0; r < 4; ++r) {
+        int grow = row0 + lr + r;
+        if (grow >= uPC.M) break;
+        int base = (b * uPC.M + grow) * uPC.N + col0 + lc;
+        if (col0 + lc + 1 < uPC.N)
+            uOutput.data[base >> 1] =
+                packHalf2x16(vec2(acc[r][0], acc[r][1]));
+        if (col0 + lc + 3 < uPC.N)
+            uOutput.data[(base + 2) >> 1] =
+                packHalf2x16(vec2(acc[r][2], acc[r][3]));
+    }
+}
+
 // Odd-N fallback: one thread per output element, fp32 result to scratch;
 // matmul_pack.comp does the half2 pack afterwards.
 void matmul16_odd_n() {
@@ -172,7 +355,9 @@ void matmul32() {
 
 void main() {
 #ifdef FP16
-    if ((uPC.N & 1) == 0) {
+    if (uPC.tile != 0) {
+        matmul16_tiled();
+    } else if ((uPC.N & 1) == 0) {
         matmul16_even_n();
     } else {
         matmul16_odd_n();

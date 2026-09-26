@@ -6,11 +6,7 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 
-#include <cstdio>
-#include <cstdlib>
-#include <map>
 #include <string>
-#include <tuple>
 #include <vector>
 extern "C" {
 extern unsigned char image_matmul_spv[];
@@ -44,76 +40,9 @@ struct alignas(16) GpuMatMulParam {
     int C;      // image path: channel count; buffer path: batch count
     int fp32;   // 1 = fp32, 0 = fp16
     int transB; // 1 = B is [batch, N, K] (transposed input); 0 = [batch, K, N]
+    int tile = 0; // 1 = shared-memory tiled GEMM; buffer path only
 };
 
-// VKOP_MATMUL_PROBE=1: report-only histogram of buffer-backend MatMul
-// shapes + theoretical work. Does NOT change dispatch or timing behavior.
-// Per-op GPU ms already comes from VKOP_SUBMIT_PROF, keyed by the same op
-// name — join the two tables by name for achieved GB/s / GFLOPS per shape.
-struct ProbeKey {
-    std::string name;
-    int M, N, K, batch;
-    int fp16, transB;
-    bool operator<(const ProbeKey &o) const {
-        return std::tie(name, M, N, K, batch, fp16, transB) <
-               std::tie(o.name, o.M, o.N, o.K, o.batch, o.fp16, o.transB);
-    }
-};
-
-struct ProbeAgg {
-    long long calls = 0;
-    double gflop = 0.0; // cumulative 2*M*N*K*batch
-    double gb = 0.0;    // cumulative (M*K + K*N + M*N)*batch*esz (upper bound:
-                        // assumes B is re-read per batch, ignores cache)
-};
-
-inline bool probe_enabled() {
-    static const bool on = [] {
-        const char *e = std::getenv("VKOP_MATMUL_PROBE");
-        return e && e[0] == '1';
-    }();
-    return on;
-}
-
-inline void probe_record(const ProbeKey &key, int esz) {
-    static std::map<ProbeKey, ProbeAgg> rows;
-    struct Dumper {
-        ~Dumper() {
-            fprintf(stderr, "[matmulprobe] name M N K batch fp16 transB calls "
-                            "GFLOP GB flop/B (sorted by GFLOP; join gpu_ms via "
-                            "VKOP_SUBMIT_PROF=1 on name)\n");
-            std::vector<std::pair<ProbeKey, ProbeAgg>> v(rows.begin(),
-                                                         rows.end());
-            std::sort(v.begin(), v.end(), [](const auto &a, const auto &b) {
-                return a.second.gflop > b.second.gflop;
-            });
-            double tot_f = 0, tot_b = 0;
-            for (const auto &r : v) {
-                fprintf(stderr,
-                        "[matmulprobe] %-44s %6d %6d %6d %5d %2d %2d %8lld "
-                        "%9.2f %8.3f %8.1f\n",
-                        r.first.name.c_str(), r.first.M, r.first.N, r.first.K,
-                        r.first.batch, r.first.fp16, r.first.transB,
-                        r.second.calls, r.second.gflop, r.second.gb,
-                        r.second.gb > 0 ? r.second.gflop * 1000.0 / r.second.gb
-                                        : 0.0);
-                tot_f += r.second.gflop;
-                tot_b += r.second.gb;
-            }
-            fprintf(stderr, "[matmulprobe] TOTAL %9.2f GFLOP %8.3f GB\n", tot_f,
-                    tot_b);
-        }
-    };
-    static Dumper dumper; // dumped once at process exit
-    ProbeAgg &agg = rows[key];
-    agg.calls += 1;
-    agg.gflop += 2.0 * key.batch * key.M * key.N * key.K / 1.0e9;
-    agg.gb += static_cast<double>(key.batch) *
-              (static_cast<double>(key.M) * key.K +
-               static_cast<double>(key.K) * key.N +
-               static_cast<double>(key.M) * key.N) *
-              esz / 1.0e9;
-}
 } // namespace matmul
 
 // Image (image2DArray NCHW->RGBA) implementation. Uses cooperative matrix
@@ -314,13 +243,6 @@ class MatMulBuffer : public BufferFactory {
 
         int total = batch * m * n;
 
-        if (matmul::probe_enabled()) {
-            matmul::ProbeKey pk{
-                get_name(),     m, n, k, batch, fp16_ != 0 ? 1 : 0,
-                transB_ ? 1 : 0};
-            matmul::probe_record(pk, fp16_ != 0 ? 2 : 4);
-        }
-
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -354,6 +276,14 @@ class MatMulBuffer : public BufferFactory {
         // fp16 needs a scratch fp32 buffer (binding 3) only for the odd-N
         // reduce->pack fallback; even N packs in the reduce shader itself.
         const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        // Shared-memory tiling pays only in the compute-bound regime, and only
+        // where its indexing assumptions hold: k % 16 keeps every tile word
+        // aligned on both B layouts. m >= 12 is measured, not guessed: at
+        // M <= 8 the naive GEMV is weight-bandwidth-bound and the 64-row tile
+        // is ~break-even (0.99-1.01x across N=1024..9728), while from M = 12
+        // the tile reuse wins 1.2-2.0x and never regresses (narrow N=64 and
+        // batched attention shapes included).
+        const bool tiled = fused_fp16 && (k % 16 == 0) && (m >= 12);
         if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
@@ -383,6 +313,14 @@ class MatMulBuffer : public BufferFactory {
         para_.C = batch;
         para_.fp32 = (fp16_ != 0) ? 0 : 1;
         para_.transB = transB_ ? 1 : 0;
+        para_.tile = tiled ? 1 : 0;
+        if (tiled) {
+            // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
+            // straddles a batch boundary, so no per-row batch fixups in the
+            // shader.
+            submit(&para_, UP_DIV(n, 64), UP_DIV(m, 64), batch);
+            return;
+        }
         if (fused_fp16) {
             // Single pass: x covers output WORDS (column pairs).
             submit(&para_, UP_DIV(n / 2, 16), UP_DIV(batch * m, 16), 1);
