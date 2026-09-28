@@ -575,10 +575,27 @@ std::string Tokenizer::emit_delta(StreamState& state, const std::vector<uint32_t
     if (all_ids.size() <= state.sent_count && state.pending_bytes.empty()) {
         return "";
     }
-    // 拼接所有新 token 的 piece 字节，过 UTF-8 sanitizer 保证增量是合法 UTF-8。
+    // Piece 串是 byte-level BPE 的映射码点 UTF-8 编码（见 ByteUnicodeMap），
+    // 必须先像 decode() 那样逐 codepoint 还原回原始字节，再交给流式
+    // sanitizer——否则多字节字符的组成字节会以映射码点的形式泄漏进输出，
+    // 跨 token 拆分的 codepoint 也永远拼不回原文。非映射码点（特殊 token
+    // 字面量里的非常规字符）与 decode() 一致按 UTF-8 透传。
+    const auto& m = byte_unicode_map();
     std::string raw;
     for (std::size_t k = state.sent_count; k < all_ids.size(); ++k) {
-        raw.append(id_to_piece(all_ids[k], skip_special));
+        std::string piece = id_to_piece(all_ids[k], skip_special);
+        const char* p = piece.data();
+        const char* end = p + piece.size();
+        while (p < end) {
+            const char* before = p;
+            uint32_t cp = decode_utf8(p, end);
+            auto it = m.cp_to_byte.find(cp);
+            if (it != m.cp_to_byte.end()) {
+                raw += static_cast<char>(it->second);
+            } else {
+                raw.append(before, p - before);
+            }
+        }
     }
     state.sent_count = all_ids.size();
     return utf8::sanitizeUtf8Streaming(raw, state.pending_bytes);
