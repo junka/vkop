@@ -79,6 +79,7 @@ set(TEST_SOURCES
     BufferRankTest.cpp
     WhereTest.cpp
     SqueezeUnsqueezeTest.cpp
+    RobustnessTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.
