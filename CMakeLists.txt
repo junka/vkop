@@ -517,6 +517,19 @@ if (ENABLE_LLM_CHAT)
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)
     find_package(Threads REQUIRED)
     target_link_libraries(llm_chat PRIVATE Threads::Threads)
+    # Ensure utf8proc is linked (tokenizer's PUBLIC dependency may not propagate in some configs).
+    # macOS: utf8proc is typically installed via Homebrew.
+    if(APPLE)
+        execute_process(COMMAND brew --prefix utf8proc OUTPUT_VARIABLE BREW_UTF8_PREFIX OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+        if(BREW_UTF8_PREFIX)
+            target_link_directories(llm_chat PRIVATE ${BREW_UTF8_PREFIX}/lib)
+            target_include_directories(llm_chat PRIVATE ${BREW_UTF8_PREFIX}/include)
+        else()
+            target_link_directories(llm_chat PRIVATE /opt/homebrew/lib)
+            target_include_directories(llm_chat PRIVATE /opt/homebrew/include)
+        endif()
+    endif()
+    target_link_libraries(llm_chat PRIVATE utf8proc)
 
     # Visual encoder probe: runs visual.vkopbin standalone to verify the visual
     # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.

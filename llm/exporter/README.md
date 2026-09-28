@@ -337,9 +337,47 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_RAW_PROMPT=1` | 跳过 chat template **和多轮历史**，每行输入独立（对齐参考 `dump_llm_decode.py`，不走对话格式） |
 | `VKOP_MAX_CTX=<tokens>` | 多轮上下文的 token 预算，默认 `8192 - max_new`；超预算整对丢掉最旧的一问一答 |
 | `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
+| `VKOP_PROFILE=1` | 开启性能分析：每轮结束输出 prefill/decode 的 tokens/s、延迟百分位 (p50/p90/p99)、KV cache 利用率；会话结束时打印全局汇总统计 |
 | `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
+
+### Profiling 性能分析
+
+设置 `VKOP_PROFILE=1` 后，`llm_chat` 会在每轮结束和会话结束时输出详细的性能指标：
+
+```bash
+VKOP_PROFILE=1 ./build/llm_chat llm/exporter/llm.vkopbin \
+  llm/exporter/embed_tokens.bin llm/tokenizer/qwen3_vl.bin 64
+```
+
+**每轮输出示例：**
+```
+[profile] round 1:
+  prefill: 9 tokens in 113.6ms (79.3 tok/s)
+  decode:  4 tokens in 393.0ms (10.2 tok/s, avg 98.2ms/token)
+  kv cache: 13/8192 (0.2%)
+```
+
+**会话汇总示例：**
+```
+[profile] session summary (1 rounds):
+  total prompt tokens: 9
+  total generated tokens: 4
+  avg prefill tok/s: 79.3
+  avg decode tok/s: 10.2
+  p50 decode latency: 98.3ms
+  p90 decode latency: 99.1ms
+  p99 decode latency: 99.4ms
+```
+
+指标说明：
+- **prefill tok/s**：prompt 处理速度，随历史长度增长而下降（需重新处理整段上下文）
+- **decode tok/s**：生成速度，相对稳定但受 past_len 影响（attention_bias 维度增大）
+- **p50/p90/p99 延迟**：decode 单步延迟的百分位，帮助发现偶发抖动（GC、内存分配等）
+- **kv cache 利用率**：当前序列长度占 MAX_KV (8192) 的比例，用于调优 `VKOP_MAX_CTX`
+
+实现细节见 [project-llm-profiling](../../memory/project-llm-profiling.md)。
 
 ### 示例
 

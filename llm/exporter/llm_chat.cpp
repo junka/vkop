@@ -69,6 +69,46 @@ using qwen::Tokenizer;
 
 namespace {
 
+// ---- profiling helpers ----
+struct PerfMetrics {
+    // Prefill (current round)
+    double prefill_ms = 0;
+    int prefill_tokens = 0;
+
+    // Decode (current round)
+    int decode_steps = 0;
+    double total_decode_ms = 0;
+    std::vector<double> per_token_ms;  // per-step latency for percentile calc
+
+    // Session-wide accumulators
+    int total_prompt_tokens = 0;
+    int total_generated_tokens = 0;
+    int total_rounds = 0;
+
+    double prefill_tok_per_sec() const {
+        return prefill_ms > 0 ? (prefill_tokens / (prefill_ms / 1000.0)) : 0;
+    }
+    double decode_tok_per_sec() const {
+        return total_decode_ms > 0 ? (decode_steps / (total_decode_ms / 1000.0)) : 0;
+    }
+    double avg_decode_ms() const {
+        return decode_steps > 0 ? (total_decode_ms / decode_steps) : 0;
+    }
+
+    // Percentile from per_token_ms (sorted internally).
+    double percentile(double p) const {
+        if (per_token_ms.empty()) return 0;
+        auto sorted = per_token_ms;
+        std::sort(sorted.begin(), sorted.end());
+        double idx = (p / 100.0) * (sorted.size() - 1);
+        size_t lo = static_cast<size_t>(idx);
+        size_t hi = lo + 1;
+        if (hi >= sorted.size()) return sorted.back();
+        double frac = idx - lo;
+        return sorted[lo] * (1 - frac) + sorted[hi] * frac;
+    }
+};
+
 // Legacy fallback 默认值 (Qwen3-VL-2B)。真正的值在 LoadModel 之后从 runtime
 // inputs 的 shape 动态推断，存入 struct ModelArch 里。以下常量只用于
 // argmax_last_token 里 shape 不可靠时的 defensive fallback（极罕见）。
@@ -558,6 +598,10 @@ int main(int argc, char** argv) {
     std::vector<uint16_t> ds_zero(arch.hidden, 0);
     std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(arch.hidden)};
 
+    // Profiling state (opt-in via VKOP_PROFILE=1).
+    const bool profile_mode = std::getenv("VKOP_PROFILE") != nullptr;
+    PerfMetrics session_metrics;
+
     // REPL loop.
     std::printf("\n=== ready (max_new=%d, im_end=%u). type a prompt, Ctrl-D to quit ===\n\n",
                 max_new, conv.im_end_id());
@@ -722,7 +766,14 @@ int main(int argc, char** argv) {
             upload_input(cmdpool, rt->GetInput("image_pad_mask"));
         std::printf("  upload ok, calling Run()...\n"); std::fflush(stdout);
 
+        auto t_prefill_start = std::chrono::steady_clock::now();
         double ms = rt->Run();
+        auto t_prefill_end = std::chrono::steady_clock::now();
+        if (profile_mode) {
+            session_metrics.prefill_ms = std::chrono::duration<double, std::milli>(
+                t_prefill_end - t_prefill_start).count();
+            session_metrics.prefill_tokens = L;
+        }
         std::printf("  Run done %.1fms\n", ms); std::fflush(stdout);
         // Prefill (q_len=L) and decode (q_len=1) have entirely different
         // shapes; the replay cache from prefill must not bleed into decode.
@@ -891,6 +942,11 @@ int main(int argc, char** argv) {
             next_id = argmax_last_token(rt, cmdpool);
             out_ids.push_back(static_cast<uint32_t>(next_id));
             double run_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            if (profile_mode) {
+                session_metrics.decode_steps++;
+                session_metrics.total_decode_ms += run_ms;
+                session_metrics.per_token_ms.push_back(run_ms);
+            }
             std::printf("[r%d] %.1fms  past_len=%d pos=%lld  → %d  %s\n", step,
                         run_ms, past_len, (long long)(past_len + rope_delta),
                         next_id,
@@ -901,6 +957,30 @@ int main(int argc, char** argv) {
         }
 
         std::printf("\n=== full decode ===\n%s\n\n", tok.decode(out_ids).c_str());
+
+        // Update session-wide metrics.
+        if (profile_mode) {
+            session_metrics.total_prompt_tokens += L;
+            int generated = static_cast<int>(out_ids.size()) - 1;  // first token from prefill
+            session_metrics.total_generated_tokens += generated;
+            session_metrics.total_rounds++;
+
+            // Per-round summary.
+            std::printf("[profile] round %d:\n", turn + 1);
+            std::printf("  prefill: %d tokens in %.1fms (%.1f tok/s)\n",
+                        session_metrics.prefill_tokens, session_metrics.prefill_ms,
+                        session_metrics.prefill_tok_per_sec());
+            std::printf("  decode:  %d tokens in %.1fms (%.1f tok/s, avg %.1fms/token)\n",
+                        session_metrics.decode_steps, session_metrics.total_decode_ms,
+                        session_metrics.decode_tok_per_sec(), session_metrics.avg_decode_ms());
+            std::printf("  kv cache: %d/%d (%.1f%%)\n",
+                        static_cast<int>(ids.size()) + session_metrics.decode_steps,
+                        MAX_KV,
+                        (static_cast<double>(ids.size()) + session_metrics.decode_steps) / MAX_KV * 100.0);
+            std::printf("\n");
+            std::fflush(stdout);
+        }
+
         // 回复原样进历史（不重新分词）：下一轮整段重新 prefill 时，模型看到的
         // 就是它自己上一轮写下的 token。
         if (!raw_mode) {
@@ -908,5 +988,24 @@ int main(int argc, char** argv) {
             ++turn;
         }
     }
+
+    // Session-wide summary on exit.
+    if (profile_mode && session_metrics.total_rounds > 0) {
+        std::printf("\n[profile] session summary (%d rounds):\n", session_metrics.total_rounds);
+        std::printf("  total prompt tokens: %d\n", session_metrics.total_prompt_tokens);
+        std::printf("  total generated tokens: %d\n", session_metrics.total_generated_tokens);
+        std::printf("  avg prefill tok/s: %.1f\n",
+                    session_metrics.total_prompt_tokens /
+                    (session_metrics.prefill_ms / 1000.0 * session_metrics.total_rounds));
+        std::printf("  avg decode tok/s: %.1f\n",
+                    session_metrics.total_generated_tokens /
+                    (session_metrics.total_decode_ms / 1000.0));
+        std::printf("  p50 decode latency: %.1fms\n", session_metrics.percentile(50));
+        std::printf("  p90 decode latency: %.1fms\n", session_metrics.percentile(90));
+        std::printf("  p99 decode latency: %.1fms\n", session_metrics.percentile(99));
+        std::printf("\n");
+        std::fflush(stdout);
+    }
+
     return 0;
 }
