@@ -171,6 +171,15 @@ class BufferBinaryFactory : public BufferFactory {
                 out[i] = r;
                 break;
             }
+            case OpType::MIN:
+                out[i] = std::min(av, bv);
+                break;
+            case OpType::MAX:
+                out[i] = std::max(av, bv);
+                break;
+            case OpType::MOD:
+                out[i] = av % bv;
+                break;
             default:
                 throw std::runtime_error("int64 binary op not supported");
             }

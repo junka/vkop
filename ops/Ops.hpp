@@ -63,6 +63,10 @@ enum class OpType {
     ROTARY_EMBEDDING,
     FUSED_ELEMWISE,
     RMSNORM,
+    REDUCEMEAN,
+    MIN,
+    MAX,
+    MOD,
     TOTAL_NUM
 };
 
@@ -122,6 +126,10 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "RotaryEmbedding",   // ROTARY_EMBEDDING = 51
         "FusedElemwise",     // FUSED_ELEMWISE = 52
         "RMSNorm",           // RMSNORM = 53
+        "ReduceMean",        // REDUCEMEAN = 54
+        "Min",               // MIN = 55
+        "Max",               // MAX = 56
+        "Mod",               // MOD = 57
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -236,6 +244,14 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::FUSED_ELEMWISE;
     if (name == "RMSNorm")
         return vkop::ops::OpType::RMSNORM;
+    if (name == "ReduceMean")
+        return vkop::ops::OpType::REDUCEMEAN;
+    if (name == "Min")
+        return vkop::ops::OpType::MIN;
+    if (name == "Max")
+        return vkop::ops::OpType::MAX;
+    if (name == "Mod")
+        return vkop::ops::OpType::MOD;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

@@ -326,6 +326,9 @@ set(DUAL_FP16_SHADERS
     buffer/fused_elemwise
     buffer/rmsnorm
     buffer/scatter_elements
+    buffer/min
+    buffer/max
+    buffer/mod
 )
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")
@@ -541,4 +544,13 @@ if (ENABLE_LLM_CHAT)
     # because image_preproc.hpp -> core/Tensor.hpp pulls in VulkanLib symbols.
     add_executable(rope_probe llm/exporter/rope_probe.cpp)
     target_link_libraries(rope_probe PRIVATE vkop vload)
+endif()
+
+# Image generation driver for Qwen-Image-2.1
+option(ENABLE_IMAGE_GEN "Build the image generation driver (image_gen)" ON)
+if (ENABLE_IMAGE_GEN)
+    add_executable(image_gen image/exporter/image_gen.cpp)
+    target_link_libraries(image_gen PRIVATE vkop vload)
+    target_include_directories(image_gen PRIVATE
+        ${CMAKE_SOURCE_DIR}/llm/tokenizer)  # For potential tokenizer reuse
 endif()

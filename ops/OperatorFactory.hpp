@@ -61,6 +61,11 @@
 #include "ops/Shape.hpp"
 #include "ops/SqueezeUnsqueeze.hpp"
 
+#include "Max.hpp"
+#include "Min.hpp"
+#include "Mod.hpp"
+#include "ReduceMean.hpp"
+
 namespace vkop {
 
 namespace ops {
@@ -180,6 +185,14 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<FusedElemwise>(fp16);
     case OpType::RMSNORM:
         return std::make_unique<RMSNorm>(fp16, backend_buffer);
+    case OpType::REDUCEMEAN:
+        return std::make_unique<ReduceMean>(fp16, backend_buffer);
+    case OpType::MIN:
+        return std::make_unique<Min>(fp16, backend_buffer);
+    case OpType::MAX:
+        return std::make_unique<Max>(fp16, backend_buffer);
+    case OpType::MOD:
+        return std::make_unique<Mod>(fp16, backend_buffer);
     default:
         return nullptr;
     }
