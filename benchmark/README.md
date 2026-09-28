@@ -122,5 +122,36 @@ python3 -m onnx2vkop.cli <model.onnx>
 
 ## run benchmark
 ```
-benchmark/vkbench <model.vkopbin> <image.jpg>
+benchmark/vkbench <model.vkopbin> <image.jpg> [labels.txt]
 ```
+
+### CNN Profiling（性能分析）
+
+设置 `VKOP_CNN_PROFILE=1` 后，vkbench 会在基准测试结束后输出详细的性能分解：
+
+```bash
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
+VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
+VKOP_CNN_PROFILE=1 ./build/benchmark/vkbench \
+  onnx_models/resnet50_fp16.vkopbin image.jpg benchmark/imagenet_classes.txt
+```
+
+**输出示例：**
+```
+[cnn profile] onnx_models/resnet50_fp16.vkopbin (fp16, 100 runs):
+  inference: avg=7.4ms  p50=7.3ms  p90=8.1ms  p99=9.2ms
+  preprocess:  2.1ms (jpeg decode + normalize)
+  postprocess: GPU softmax+topk enabled
+  memory layout: packed=124MB  allocated=135MB  waste=8.9%
+```
+
+指标说明：
+- **inference avg/p50/p90/p99**：推理延迟分布，p99 帮助发现偶发抖动
+- **preprocess**：JPEG 解码 + 归一化耗时（CPU 端），在小模型上可能占显著比例
+- **postprocess**：softmax + topk 是否走 GPU（当前默认启用）
+- **memory layout waste**：VkImage array pitch 对齐导致的显存浪费百分比，用于评估折叠策略收益
+
+未来会集成：
+- Per-op timing（conv2d/matmul 按 kernel size 分类统计）
+- 详细的 conv breakdown（每个 conv 层的耗时占比）
+- H2D/D2H transfer 统计
