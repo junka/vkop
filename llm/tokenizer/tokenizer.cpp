@@ -16,6 +16,16 @@ namespace qwen {
 
 namespace {
 
+// 轮末/图像占位标签名是模型专属的字面量。
+const char constexpr kChatMlTurnEnd[] = "<|im_end|>";
+const char constexpr kPhiTurnEnd[] = "<|end|>";
+const char constexpr kImagePadTag[] = "<|image_pad|>";
+
+// tokenizer.bin header 的 flags 位（写端 tokenizer_to_bin.py 从 tokenizer.json 的
+// pre_tokenizer 正则与 normalizer 自动推导）。0 = 既有 Qwen 口径。
+constexpr uint32_t kFlagPhiPreTokenizer = 1u << 0;
+constexpr uint32_t kFlagNoNormalizer = 1u << 1;
+
 // GPT-2/BBPE byte<->unicode 映射。68 个不可打印/特殊字节被映射到 U+0100..U+017F
 // 区间（UTF-8 编码为 0xC4 0x80..0xC4 0xBF），其余字节一对一映射到自身码点。
 // 因此 vocab 里的 token 字符串就是这些 codepoint 的 UTF-8 编码；encode 时把
@@ -81,6 +91,25 @@ inline bool is_number(uint32_t cp) {
         || c == UTF8PROC_CATEGORY_NO;
 }
 
+// Phi-4 的 pre_tokenizer 把字母按「形状」分两类（\p{M} 组合记号两边都算）：
+//   UL = \p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}   大写/形首
+//   LL = \p{Ll}\p{Lm}\p{Lo}\p{M}         小写/形尾
+// Lm/Lo/M 同属两类，这正是 [UL]*[LL]+ 需要回退的地方（见 pre_tokenize_phi）。
+inline bool is_upper_class(uint32_t cp) {
+    auto c = utf8proc_category(cp);
+    return c == UTF8PROC_CATEGORY_LU || c == UTF8PROC_CATEGORY_LT
+        || c == UTF8PROC_CATEGORY_LM || c == UTF8PROC_CATEGORY_LO
+        || c == UTF8PROC_CATEGORY_ME || c == UTF8PROC_CATEGORY_MN
+        || c == UTF8PROC_CATEGORY_MC;
+}
+
+inline bool is_lower_class(uint32_t cp) {
+    auto c = utf8proc_category(cp);
+    return c == UTF8PROC_CATEGORY_LL || c == UTF8PROC_CATEGORY_LM
+        || c == UTF8PROC_CATEGORY_LO || c == UTF8PROC_CATEGORY_ME
+        || c == UTF8PROC_CATEGORY_MN || c == UTF8PROC_CATEGORY_MC;
+}
+
 inline bool is_ws(uint32_t cp) {
     switch (cp) {
     case 0x09: case 0x0A: case 0x0B: case 0x0C: case 0x0D: case 0x20: case 0x85:
@@ -136,10 +165,14 @@ CpStream decode_to_cps(const std::string& s) {
     return st;
 }
 
-// GPT-2 pre_tokenizer 的缩写匹配 alt1: (?i:'s|'t|'re|'ve|'m|'ll|'d)
-// 在 cps[i] == '\'' 时尝试，返回匹配的 codepoint 数（0=不匹配）。
-std::size_t match_alt1(const std::vector<uint32_t>& cps, std::size_t i) {
+// 缩写后缀 (?i:'s|'t|'re|'ve|'m|'ll|'d)：返回从 i 起匹配的 codepoint 数，
+// i 处不是撇号（或后面接不上表里的词）就返回 0。GPT-2 把它当独立分支，Phi-4 只挂在
+// 字母段尾巴上 —— 尾巴那边调用点不知道下一个字符是什么，所以撇号必须在这里查：
+// 少了这道判断，" leading spaces" 会被当成「空格 + s」的缩写，把后面的 ' s' 吞进
+// 前一个 span。
+std::size_t match_contraction(const std::vector<uint32_t>& cps, std::size_t i) {
     std::size_t n = cps.size();
+    if (i >= n || cps[i] != 0x27) return 0;  // 0x27 = '\''
     if (i + 1 >= n) return 0;
     uint32_t c = cps[i + 1];
     auto lower = [](uint32_t ch) { return (ch >= 'A' && ch <= 'Z') ? ch + 32 : ch; };
@@ -170,6 +203,29 @@ std::size_t match_alt1(const std::vector<uint32_t>& cps, std::size_t i) {
 //  - alt5: \s-run 内含 CR/NL 时，吞 [i..最后一个CR/NL+1)，trailing 空白另起。
 //  - alt6: \s-run 末尾若紧跟非空白，回溯留最后一个 \s 给后续 alt2/alt4 吸附；
 //    run==1 且无法吸附（如后接数字）时 alt6 失败，由 alt7 吞。
+
+// \s-run 的三条分支在两个 pre_tokenizer 变体里完全一致，共享这一份：
+//   \s*[\r\n]+   run 内含 CR/NL 时吞到最后一个 CR/NL（前导空白一起吞）
+//   \s+(?!\S)    纯空白 run：到 EOF 吞满；后面还有非空白则回溯，留最后一个 \s
+//                给下一轮带可选前缀的 alt2/alt4 吸附
+//   \s+          run==1 且无处可吸附时整段吞掉
+// 返回匹配区间 [i, end)，end 一定 > i。
+std::size_t match_ws_run(const std::vector<uint32_t>& cps, std::size_t i) {
+    const std::size_t n = cps.size();
+    std::size_t j = i;
+    while (j < n && is_ws(cps[j])) ++j;
+
+    std::size_t last_crlf = std::size_t(-1);
+    for (std::size_t k = i; k < j; ++k) {
+        if (cps[k] == 0x0D || cps[k] == 0x0A) last_crlf = k;
+    }
+    if (last_crlf != std::size_t(-1)) return last_crlf + 1;
+
+    if (j == n) return j;           // EOF：没有 \S 跟在后面，前瞻成立
+    if (j - 1 > i) return j - 1;    // run>=2：留最后一个 \s 给后续吸附
+    return j;                       // run==1：alt6 失败，退到 alt7
+}
+
 void pre_tokenize(const std::string& s, std::vector<std::string>& out) {
     CpStream st = decode_to_cps(s);
     const auto& cps = st.cps;
@@ -187,7 +243,7 @@ void pre_tokenize(const std::string& s, std::vector<std::string>& out) {
 
         // alt1: 缩写
         if (cp == 0x27) { // apostrophe
-            std::size_t m = match_alt1(cps, i);
+            std::size_t m = match_contraction(cps, i);
             if (m > 0) { emit(i, i + m); i += m; continue; }
         }
 
@@ -216,39 +272,117 @@ void pre_tokenize(const std::string& s, std::vector<std::string>& out) {
             emit(i, j); i = j; continue;
         }
 
-        // 以下处理 \s。先取从 i 起的最大 \s-run [i..j)。
+        // 以下处理 \s（alt5/alt6/alt7，见 match_ws_run）。
         if (is_ws(cp)) {
-            std::size_t j = i;
-            while (j < n && is_ws(cps[j])) ++j;
-
-            // alt5: \s*[\r\n]+ —— run 内含 CR/NL 时，匹配 [i..最后一个CR/NL+1)
-            std::size_t last_crlf = std::size_t(-1);
-            for (std::size_t k = i; k < j; ++k) {
-                if (cps[k] == 0x0D || cps[k] == 0x0A) last_crlf = k;
-            }
-            if (last_crlf != std::size_t(-1)) {
-                emit(i, last_crlf + 1); i = last_crlf + 1; continue;
-            }
-
-            // run 内无 CR/NL：
-            // alt6: \s+(?!\S)
-            if (j == n) {
-                // EOF：吞整个 run
-                emit(i, j); i = j; continue;
-            }
-            // j < n，cps[j] 是 \S。回溯留最后一个 \s 给后续吸附。
-            if (j - 1 > i) {
-                // run>=2：吞 [i..j-1)，剩 1 个 \s 给 alt2/alt4 吸附或下一轮
-                emit(i, j - 1); i = j - 1; continue;
-            }
-            // run==1：alt6 失败（\s+ 需至少 1 个但不留空给 (?!\S)）。
-            // 此处单个 \s 紧跟 \S：若 \S 是字母/标点，alt2/alt4 在下一轮会把它吸附；
-            // 若 \S 是数字（alt3 无前缀），则该 \s 需独立成 token —— 由 alt7 吞。
-            // 直接走 alt7（下方）。
-            emit(i, j); i = j; continue; // alt7：吞当前 run
+            std::size_t j = match_ws_run(cps, i);
+            emit(i, j); i = j; continue;
         }
 
         // 兜底：单 codepoint（理论上 GPT-2 正则覆盖所有输入，不会到这）
+        emit(i, i + 1); i += 1;
+    }
+}
+
+// ---- Phi-4 / o200k 变体的 pre_tokenizer ----
+// tokenizer.json 里的 Split 正则（顺序即 Rust regex 的 leftmost-first 优先级）：
+//   [^CR LF \pL \pN]? [UL]* [LL]+ (contr)?   alt1   小写结尾的单词（含全小写）
+// | [^CR LF \pL \pN]? [UL]+ [LL]* (contr)?   alt2   大写开头的单词
+// | \pN{1,3}                                  alt3   最多 3 个连续数字
+// | ' ? [^ \t\n... \pL \pN]+ [CR LF /]*      alt4   标点串（可带一个前导空格）
+// | \s* [CR LF]+                              alt5
+// | \s+ (?!\S)                                alt6
+// | \s+                                       alt7
+// 其中 UL = Lu Lt Lm Lo M、LL = Ll Lm Lo M（Lm/Lo/M 同时属于两类），contr =
+// (?i:'s|'t|'re|'ve|'m|'ll|'d)。与 GPT-2 的三处实质差异：
+//  1. 字母按「大小写形状」切分：alt1 要求末尾段是小写类，alt2 要求开头段是大写
+//     类，于是 "HelloWorld" 切成 "Hello" + "World"，"ABc" 是一个 token。
+//     GPT-2 只有 \p{L}+，整串一个 token。
+//  2. 数字是 \p{N}{1,3}（贪心 1~3 个），GPT-2 是单个 \p{N}。
+//  3. 标点串的拖尾字符类多了一个 '/'，且缩写只能挂在单词尾巴上（GPT-2 有独立的
+//     缩写分支，所以 "'s" 单独也能成 token）。
+// 量化器的贪心与回退按 Rust regex 的语义复刻：[UL]* 先吃满，只有在 [LL]+ 无法满足
+// 时才逐个回退 —— 这在 Lm/Lo/M（同时属于两类）连续出现时会改变匹配长度，例如
+// "ᐁᐁ"（加拿大音节文字，Lo）要靠回退才能整体匹配。
+void pre_tokenize_phi(const std::string& s, std::vector<std::string>& out) {
+    CpStream st = decode_to_cps(s);
+    const auto& cps = st.cps;
+    const auto& off = st.offsets;
+    const std::size_t n = cps.size();
+    std::size_t i = 0;
+
+    auto emit = [&](std::size_t a, std::size_t b) {
+        out.emplace_back(s, off[a], off[b] - off[a]);
+    };
+
+    // 从 j 起匹配 [UL]*[LL]+（alt1）或 [UL]+[LL]*（alt2）；返回区间结束位置，
+    // 不匹配返回 npos。调用方再决定能否吸附缩写后缀。
+    auto letters = [&](std::size_t j, bool alt1) -> std::size_t {
+        std::size_t u = j;
+        while (u < n && is_upper_class(cps[u])) ++u;   // [UL]* / [UL]+ 贪心
+        std::size_t start = u;
+        if (alt1) {
+            // [LL]+ 至少要 1 个：u 处是小写类就直接起步，否则把 [UL] 逐个回退，
+            // 直到落在一个「同时属于两类」的字符上（Lm/Lo/M）；退到 j 仍无解则失败。
+            for (;; --start) {
+                if (start < n && is_lower_class(cps[start])) break;
+                if (start == j) return std::size_t(-1);
+            }
+        } else if (u == j) {
+            return std::size_t(-1);                    // [UL]+ 至少要 1 个
+        }
+        std::size_t t = start;
+        while (t < n && is_lower_class(cps[t])) ++t;
+        return t;
+    };
+
+    while (i < n) {
+        const uint32_t cp = cps[i];
+
+        // alt1 / alt2：可选前缀（非 CR/LF/字母/数字）+ 大小写形状 + 可选缩写。
+        // 前缀是贪婪可选：先试「带前缀」，整条分支失败才试「不带前缀」。缩写后缀
+        // 挂在字母段尾巴上；单独的 "'s" 也能匹配 —— 撇号正是那条可选前缀。
+        bool prefix_ok = cp != 0x0D && cp != 0x0A && !is_letter(cp) && !is_number(cp);
+        bool matched = false;
+        for (bool alt1 : {true, false}) {
+            std::size_t end = letters(i, alt1);
+            if (prefix_ok) {
+                std::size_t with_prefix = letters(i + 1, alt1);
+                if (with_prefix != std::size_t(-1)) end = with_prefix;
+            }
+            if (end == std::size_t(-1)) continue;
+            std::size_t m = match_contraction(cps, end);
+            emit(i, end + m);
+            i = end + m;
+            matched = true;
+            break;
+        }
+        if (matched) continue;
+
+        // alt3: \p{N}{1,3}
+        if (is_number(cp)) {
+            std::size_t j = i;
+            while (j < n && is_number(cps[j]) && j - i < 3) ++j;
+            emit(i, j); i = j; continue;
+        }
+
+        // alt4: ' ?[^\s\p{L}\p{N}]+[\r\n/]*  （前缀仅字面空格 0x20）
+        auto nonsln = [&](uint32_t c) {
+            return !is_ws(c) && !is_letter(c) && !is_number(c);
+        };
+        if ((cp == 0x20 && i + 1 < n && nonsln(cps[i + 1])) || nonsln(cp)) {
+            std::size_t j = (cp == 0x20) ? i + 1 : i;
+            while (j < n && nonsln(cps[j])) ++j;
+            while (j < n && (cps[j] == 0x0D || cps[j] == 0x0A || cps[j] == 0x2F)) ++j;
+            emit(i, j); i = j; continue;
+        }
+
+        // alt5/alt6/alt7
+        if (is_ws(cp)) {
+            std::size_t j = match_ws_run(cps, i);
+            emit(i, j); i = j; continue;
+        }
+
+        // 兜底：正则不覆盖的码点（例如落在两条分支缝隙里的字符）单独成 span。
         emit(i, i + 1); i += 1;
     }
 }
@@ -306,10 +440,16 @@ void Tokenizer::load(const std::string& bin_path) {
     vocab_size_ = read_u32(ptr); ptr += 4;
     uint32_t merge_count = read_u32(ptr); ptr += 4;
     uint32_t special_count = read_u32(ptr); ptr += 4;
-    ptr += 4; // reserved
+    // 第 5 个 u32 原本是 Reserved（写端恒填 0），现在当 flags：
+    //   bit0 = pre_tokenizer 走 Phi-4/o200k 变体，bit1 = tokenizer.json 没有
+    //   normalizer（跳过 NFC）。旧 bin 这里是 0 → 既有 Qwen 口径完全不变。
+    flags_ = read_u32(ptr); ptr += 4;
 
     std::cout << "[Tokenizer] Vocab: " << vocab_size_ << ", Merges: " << merge_count
-              << ", Special: " << special_count << "\n";
+              << ", Special: " << special_count
+              << ", Flags: " << flags_
+              << ((flags_ & kFlagPhiPreTokenizer) ? " (phi pre_tokenizer)" : "")
+              << ((flags_ & kFlagNoNormalizer) ? " (no NFC)" : "") << "\n";
 
     // 解析 Vocab Section
     id_to_token_.resize(vocab_size_);
@@ -420,7 +560,10 @@ std::string Tokenizer::normalize_nfc(const std::string& text) const {
 std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
     // pipeline: Normalizer(NFC) → special token 切分 → pre_tokenizer
     //           → ByteLevel + BPE。NFC 在最前，保证字节序列规范化后再切分。
-    std::string normalized = normalize_nfc(text);
+    // 两处口径都来自 bin header 的 flags：Phi-4 的 tokenizer.json 没有 normalizer
+    // （NFC 会把 é 这类「基码点+组合符」合成另一个码点，词表按原样建，必须跳过），
+    // pre_tokenizer 正则也与 GPT-2 不同。
+    std::string normalized = (flags_ & kFlagNoNormalizer) ? text : normalize_nfc(text);
     const std::string& input = normalized;
 
     std::vector<uint32_t> tokens;
@@ -475,7 +618,8 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
 
         std::string seg(input, i, seg_end - i);
         std::vector<std::string> pieces;
-        pre_tokenize(seg, pieces);
+        if (flags_ & kFlagPhiPreTokenizer) pre_tokenize_phi(seg, pieces);
+        else pre_tokenize(seg, pieces);
         for (const auto& piece : pieces) {
             encode_segment(piece, tokens);
         }
@@ -676,11 +820,18 @@ int32_t Tokenizer::special_token_id(const std::string& literal) const {
 // 词表里的特殊 token 以完整字面量为 key，这里替调用方收两个常用的：结束符决定
 // 每轮在哪里停，图像 pad 决定 user 轮里哪个 token 要按 grid 展开成 N 份。
 int32_t Tokenizer::im_end_token_id() const {
-    return special_token_id("<|im_end|>");
+    // Phi 系的每轮终止符与 ChatML 不是同一个标签；未注册进 bin 的字面量永远不会
+    // 命中，所以既有模型行为不变。
+    for (const std::string& candidate : {std::string(kChatMlTurnEnd),
+                                          std::string(kPhiTurnEnd)}) {
+        const int32_t id = special_token_id(candidate);
+        if (id >= 0) return id;
+    }
+    return -1;
 }
 
 int32_t Tokenizer::image_pad_token_id() const {
-    return special_token_id("<|image_pad|>");
+    return special_token_id(kImagePadTag);
 }
 
 } // namespace qwen

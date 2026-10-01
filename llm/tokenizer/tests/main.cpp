@@ -178,11 +178,12 @@ std::vector<Case> load_ground_truth(const std::string& path) {
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     try {
-        // 定位测试数据文件：优先环境变量，其次可执行文件旁/源码根，再 cwd。
-        std::string bin_path = find_data_file(kBinName);
-        std::string gt_path = find_data_file(kGtName);
+        // 定位测试数据文件：命令行参数优先（换模型时直接传），其次环境变量、
+        // 可执行文件旁/源码根，再 cwd。
+        std::string bin_path = argc > 1 ? argv[1] : find_data_file(kBinName);
+        std::string gt_path = argc > 2 ? argv[2] : find_data_file(kGtName);
         if (bin_path.empty()) {
             std::cerr << "找不到 " << kBinName << "。请设置 QWEN_TEST_DATA 指向含该文件的目录，"
                       << "或把可执行文件与该文件放同一目录。\n";
@@ -277,37 +278,53 @@ int main() {
         }
 
         // ===== 测试 7：chat template =====
+        // 期望值不写死某个模型的模板串：这里只验证「按角色拼装」这件事，拼装结果
+        // 与 HF jinja 渲染是否一致由 tests/check_chat_template.py 对着 HF tokenizer
+        // 比（C++ 侧拿不到 jinja）。
         {
             const auto& ct = tokenizer.chat_template();
             assert(!ct.empty() && "chat template not loaded");
             assert(ct.roles.count("system") && ct.roles.count("user") && ct.roles.count("assistant"));
-            assert(ct.generation_prompt == "<|im_start|>assistant\n");
 
             std::vector<qwen::ChatMessage> msgs = {
                 {"system", {{"text", "你是助手。"}}},
                 {"user",   {{"text", "你好"}}},
             };
+            const auto& sys = ct.roles.at("system");
+            const auto& usr = ct.roles.at("user");
+            std::string expected = sys.prefix + "你是助手。" + sys.suffix +
+                                   usr.prefix + "你好" + usr.suffix +
+                                   ct.generation_prompt;
             std::string prompt = tokenizer.apply_chat_template(msgs, true);
-            std::string expected =
-                "<|im_start|>system\n你是助手。<|im_end|>\n"
-                "<|im_start|>user\n你好<|im_end|>\n"
-                "<|im_start|>assistant\n";
             assert(prompt == expected && "chat template render mismatch");
+            assert(!ct.generation_prompt.empty() && "empty generation prompt");
             std::cout << "[Test 7] chat template 渲染 PASSED\n";
 
-            // 多模态：image/video 占位
-            std::vector<qwen::ChatMessage> mmsgs = {
-                {"user", {{"image", ""}, {"text", "这是什么？"}}},
-            };
-            std::string mp = tokenizer.apply_chat_template(mmsgs, true);
-            assert(mp.find("<|vision_start|><|image_pad|><|vision_end|>") != std::string::npos);
-            std::cout << "[Test 7b] chat template 多模态占位 PASSED\n";
+            // 多模态：只有模板烘进了 image 占位格式才测
+            if (ct.content_types.count("image")) {
+                std::vector<qwen::ChatMessage> mmsgs = {
+                    {"user", {{"image", ""}, {"text", "这是什么？"}}},
+                };
+                std::string mp = tokenizer.apply_chat_template(mmsgs, true);
+                assert(mp.find(ct.content_types.at("image")) != std::string::npos &&
+                       "image placeholder missing in render");
+                auto pids = tokenizer.encode(mp);
+                assert(!pids.empty());
+                assert(tokenizer.decode(pids) == mp);
+                std::cout << "[Test 7b] chat template 多模态占位 PASSED\n";
+            } else {
+                std::cout << "[Test 7b] 跳过：该模板没有 image 占位（纯文本模型）\n";
+            }
 
             // 渲染结果应能正确 encode（含 special token）
-            auto pids = tokenizer.encode(mp);
-            assert(!pids.empty());
-            assert(tokenizer.decode(pids) == mp);
-            std::cout << "[Test 7c] chat template → encode → decode round-trip PASSED\n";
+            {
+                std::vector<qwen::ChatMessage> one = {{"user", {{"text", "你好"}}}};
+                std::string p = tokenizer.apply_chat_template(one, true);
+                auto pids = tokenizer.encode(p);
+                assert(!pids.empty());
+                assert(tokenizer.decode(pids) == p);
+                std::cout << "[Test 7c] chat template → encode → decode round-trip PASSED\n";
+            }
         }
 
         // ===== 测试 8：性能 =====

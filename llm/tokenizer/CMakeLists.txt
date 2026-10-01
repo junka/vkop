@@ -17,9 +17,14 @@ endif()
 
 add_library(tokenizer STATIC tokenizer.cpp utf8.cpp)
 
+# tokenizer.hpp 在公开接口里就 include 了 <utf8proc.h>，所以头文件路径必须是
+# PUBLIC —— 否则下游（tests/ 与 llm_chat）在自己的目标里编不过。链接同理：
+# -L 要交给消费者，静态库不会把库搜索路径带过去（macOS 上 brew 的
+# /opt/homebrew/lib 不在默认搜索路径里，此前 target 链接直接失败）。
 target_include_directories(tokenizer PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_include_directories(tokenizer PRIVATE ${UTF8PROC_INCLUDE_DIRS})
+target_include_directories(tokenizer PUBLIC ${UTF8PROC_INCLUDE_DIRS})
 target_link_libraries(tokenizer PUBLIC ${UTF8PROC_LIBRARIES})
+target_link_directories(tokenizer PUBLIC ${UTF8PROC_LIBRARY_DIRS})
 target_link_options(tokenizer PRIVATE ${UTF8PROC_LDFLAGS})
 
 enable_testing()

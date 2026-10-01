@@ -1135,7 +1135,12 @@ template <typename T> class Tensor : public ITensor {
         }
         auto b = stpool->allocate(aligned);
         if (!b) {
-            printf("copyToGPUBuffer stpool alloc failed %d\n", size_);
+            // 张量比 staging pool 的上限（1GB）还大：Phi-4 这类
+            // tie_word_embeddings 模型，lm_head 就是那张 [vocab, hidden] 权重，
+            // 200064x3072 fp16 = 1.23GB，一次分配必定失败。原来这里打一行就
+            // return，SSBO 保持全 0 —— 于是整条链最后一级静默输出 0（症状是
+            // logits 全 0、argmax 恒等于 id 0，没有任何报错）。改为分块上传。
+            upload_buffer_chunked(cmdpool, aligned, src);
             return;
         }
         memset(b->ptr, 0, aligned);
@@ -1166,6 +1171,54 @@ template <typename T> class Tensor : public ITensor {
         cmd.submit(dev->getComputeQueue());
         cmd.wait();
         stpool->reset();
+        toGPU();
+    }
+
+    // 超过 staging pool 单次分配上限的大张量：按固定 64MB 一块，分配→拷贝→提交→
+    // 等待→复位，峰值只占一个块。常规尺寸仍走 copyToGPUBuffer 的单次快速路径。
+    void
+    upload_buffer_chunked(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                          size_t aligned, T *src) {
+        auto dev = cmdpool->getVulkanDevice();
+        auto stpool = cmdpool->getStagingBufferPool();
+        constexpr size_t kChunkBytes = static_cast<size_t>(64) << 20;
+
+        std::shared_ptr<VulkanBuffer> buffer;
+        size_t base_offset = 0;
+        if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
+            buffer = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        } else {
+            auto view = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            buffer = view->getBuffer();
+            base_offset = view->getOffset();
+        }
+
+        const char *bytes = reinterpret_cast<const char *>(
+            src ? static_cast<const void *>(src)
+                : static_cast<const void *>(data_->data()));
+        const size_t have = size_ > 0 ? static_cast<size_t>(size_) : 0;
+        for (size_t done = 0; done < aligned; done += kChunkBytes) {
+            size_t n = std::min(kChunkBytes, aligned - done);
+            VulkanCommandBuffer cmd(cmdpool);
+            auto part = stpool->allocate(n);
+            if (!part) {
+                printf("copyToGPUBuffer chunked alloc failed %zu\n", n);
+                return;
+            }
+            memset(part->ptr, 0, n);
+            size_t payload = done < have ? std::min(n, have - done) : 0;
+            if (payload > 0) {
+                memcpy(part->ptr, bytes + done, payload);
+            }
+            cmd.begin();
+            buffer->copyStageBufferToBuffer(
+                cmd.get(), part->buffer, part->offset, n, base_offset + done);
+            buffer->readBarrier(cmd.get());
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
+            cmd.wait();
+            stpool->reset();
+        }
         toGPU();
     }
 

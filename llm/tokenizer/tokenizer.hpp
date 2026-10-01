@@ -120,6 +120,10 @@ private:
 
     void post_process(std::vector<uint32_t>& ids) const;
 
+    // bin header 的 flags 字段（第 5 个 u32，原本是 Reserved）。bit0=Phi 系
+    // pre_tokenizer，bit1=不做 NFC 规范化。0 = Qwen/GPT-2 口径，旧 bin 不用重生成。
+    uint32_t flags_ = 0;
+
     // mmap 相关成员
     void* mmap_data_ = nullptr;
     size_t mmap_size_ = 0;

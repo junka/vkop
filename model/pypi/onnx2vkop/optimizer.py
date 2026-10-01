@@ -49,7 +49,7 @@ class ConstantFolder:
         "Concat", "Reshape", "Flatten", "Transpose", "Unsqueeze", "Squeeze",
         "Cast", "Slice", "ScatterND", "Range", "Where",
         "Mul", "Add", "Div", "Sub", "Pow", "Neg", "Sin", "Cos", "Sqrt",
-        "Floor", "Reduce",
+        "Floor", "Reduce", "Mod",
     }
 
     @staticmethod
@@ -133,6 +133,11 @@ class ConstantFolder:
         if op == "Concat":
             axis = _attr_i("axis", 0)
             return [np.concatenate(ins, axis=axis)]
+        if op == "Mod":
+            # fmod=0（默认）为符号随除数的取模（np.mod），fmod=1 为 C 风格余数
+            fmod = _attr_i("fmod", 0)
+            a, b = const[node.input[0]], const[node.input[1]]
+            return [np.fmod(a, b) if fmod else np.mod(a, b)]
         if op == "Reshape":
             return [const[node.input[0]].reshape(
                 const[node.input[1]].astype(int).tolist())]
@@ -215,25 +220,28 @@ class ConstantFolder:
 
     @staticmethod
     def _add_initializer(model, name, array):
-        """把 ndarray 作为 initializer 追加进 graph（避免重名则跳过）。"""
+        """把 ndarray 作为 initializer 追加进 graph。返回是否真正物化。"""
         existing = {i.name for i in model.graph.initializer}
         if name in existing:
-            return
+            return True
         if array.size * array.itemsize > (1 << 20):
             # 折叠产物 >1MB 不固化为 initializer：对 >2GB 模型会触发 proto
             # 序列化上限；直接给依赖它的下游算子当「已知常量」缓存即可。
-            return
+            return False
         model.graph.initializer.append(
             numpy_helper.from_array(array, name=name))
+        return True
 
     @staticmethod
     def fold(model, max_rounds: int = 25, verbose: bool = True):
         """迭代常量折叠，直到不动点或 max_rounds。原地修改 model。"""
-        # 1a. 剥离 initializer 的 raw_data：对大模型（>2GB proto 上限）shape
+        # 1a. 剥离大 initializer 的 raw_data：对大模型（>2GB proto 上限）shape
         #     inference 内部会 SerializeToString 整个 model 而失败。形状推断只
-        #     需要形状/类型信息，权重字节无用，剥离后模型缩小到几 MB。
+        #     需要形状/类型信息，权重字节无用。但小 initializer（int64 形状轴、
+        #     常量标量，通常 <1MB）的值是 shape 链（Shape/Gather/Slice/Reshape）
+        #     折叠的输入，剥掉会让下游 _eval 拿到空数组而静默失败，只剥大块。
         for init in model.graph.initializer:
-            if init.raw_data:
+            if len(init.raw_data) > (1 << 20):
                 init.raw_data = b""
 
         # 1. 形状推断（data propagation），给 Shape/ConstantOfShape 填 dim_value。
@@ -276,11 +284,20 @@ class ConstantFolder:
                     outs = ConstantFolder._eval(node, const, model)
                 except Exception:
                     continue
+                materialized = True
+                any_new = False
                 for nm, arr in zip(node.output, outs):
+                    any_new = any_new or (nm not in const)
                     const[nm] = arr
-                    ConstantFolder._add_initializer(model, nm, arr)
-                model.graph.node.remove(node)
-                changed = True
+                    if not ConstantFolder._add_initializer(model, nm, arr):
+                        materialized = False
+                # 有输出 >1MB 没物化成 initializer 时必须保留节点，否则下游
+                # 不可折叠算子（MatMul/Conv 等）的输入会悬空，图直接残废。
+                if materialized:
+                    model.graph.node.remove(node)
+                    changed = True
+                elif any_new:
+                    changed = True
                 total_folded += 1
             if not changed:
                 break
@@ -296,7 +313,10 @@ class ConstantFolder:
                 model = optimizer.optimize(model, [
                     "eliminate_deadend", "eliminate_unused_initializer",
                     "eliminate_identity"])
-                model = shape_inference.infer_shapes(model)
+                # data_prop=True：折叠后 shape 链已变成带值的 initializer，
+                # 不开 data_prop 的话 Reshape/Concat 等读不到值，形状推断
+                # 会把刚折出来的具体形状又丢回 unknown。
+                model = shape_inference.infer_shapes(model, data_prop=True)
             except Exception:
                 pass
 
@@ -3199,6 +3219,12 @@ class FusionOptimizer:
                 continue
             # Skip if the op type is RotaryEmbedding — handled by dedicated pass
             if ctype == "RotaryEmbedding":
+                continue
+            # Expand 按「shape 列表右对齐到输入秩」广播：把升秩的 Unsqueeze 消掉
+            # 会让它少拿到一维，广播轴整体错位（实测 Phi-4 的 GQA repeat 复制了 8 份
+            # 而不是 3 份，尺寸对不上之后下游 MatMul 的操作数直接是全 0 缓冲区）——
+            # 静默算错，不是报错。这类 Unsqueeze 留给 runtime 真正执行 view。
+            if ctype in ("Expand",):
                 continue
             # One match per Unsqueeze — fold updates all consumer inputs, then
             # deletes the Unsqueeze once (handles shared consumers correctly).

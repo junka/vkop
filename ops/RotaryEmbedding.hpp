@@ -16,10 +16,11 @@ extern unsigned int buffer_rotary_fp16_spv_len;
 namespace vkop {
 namespace ops {
 
-// Push constant for shaders/buffer/rotary.comp. 5 ints (20B), padded to 16.
+// Push constant for shaders/buffer/rotary.comp（字段顺序必须与 shader 里的
+// push_constant 完全一致，尾部可多不可少）。
 // X is [B, num_heads, seq, head_dim]; output is the same shape. cos/sin are
-// pre-broadcast to [B, 1, S, head_dim] (axis-1 unsqueeze from /rotary_emb/*)
-// and index without the heads axis: cs_idx = (b*seq + s)*head_dim + d.
+// pre-broadcast to [B, 1, S, rotary_dim]（rotary_dim == head_dim 时即整维旋转）
+// 且按 (b*seq + s)*rotary_dim + d 索引，不含 heads 轴。
 // When input_untransposed is set, X is actually laid out as
 // [B, seq, num_heads, head_dim] (a Transpose(perm=[0,2,1,3]) feeding RE was
 // folded away); the shader remaps the read index. num_heads/seq are still
@@ -34,11 +35,18 @@ struct alignas(16) RotaryPC {
                             // Transpose)
     int seq_major; // 1 = X is [seq, num_heads, head_dim] (rank 3, vision
                    // encoder: the seq axis leads the head axis)
+    // cos/sin 每行的列数 == RoPE 实际作用的维数。等于 head_dim
+    // 时整维旋转（Qwen、 DiT），小于 head_dim 时是 partial rotary（Phi-4:
+    // head_dim 128 只转前 96 维， 后 32 维直通）。0 = 按 head_dim
+    // 处理，兼容不填这个字段的旧图。
+    int rotary_dim;
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
-// Buffer-backend (SSBO) RotaryEmbedding. Half-split (non-interleaved), full
-// head_dim rotation. The shader runs ONE THREAD PER OUTPUT WORD (two packed
+// Buffer-backend (SSBO) RotaryEmbedding. Half-split (non-interleaved); 整维旋转
+// (rotary_dim == head_dim) 或 partial rotary（cos/sin
+// 行宽更窄时，超出的一段直通）。The shader runs ONE THREAD PER OUTPUT WORD (two
+// packed
 // elements) so the fp16 build avoids the half2 read-modify-write race
 // ([[expand-fp16-race]]): each output word is owned by a single thread that
 // computes both halves and writes the whole word once. Dispatch is therefore
@@ -86,6 +94,15 @@ class RotaryEmbeddingBuffer : public BufferFactory {
             // X is [B, seq, num_heads, head_dim]: swap the two middle axes.
             std::swap(seq, num_heads);
         }
+        // cos/sin 的行宽就是 RoPE 真正作用的维数：Phi-4 这类 partial rotary
+        // 模型里 它只有 head_dim 的一部分（128 维只转前 96
+        // 维），内核据此决定哪一段参与 旋转、哪一段直通。取不到（旧图/缺 shape
+        // 信息）时按整维处理，行为与原来 一致。
+        std::vector<int> cshape = inputs[1]->getShape();
+        int rotary_dim = cshape.empty() ? head_dim : cshape.back();
+        if (rotary_dim <= 0 || rotary_dim > head_dim)
+            rotary_dim = head_dim;
+
         // Leading dims (batch etc.) collapse into `total - heads*seq*head_dim`.
         int total = total_elems(xshape);
         // Rank-3 [seq, heads, head_dim] (vision encoder: batch axis squeezed
@@ -93,7 +110,7 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         // they cover identifies the layout: xshape[-2] is heads, not seq.
         bool seq_major =
             (xshape.size() == 3 && !input_untransposed_ &&
-             total_elems(inputs[1]->getShape()) / head_dim == xshape[0]);
+             total_elems(inputs[1]->getShape()) / rotary_dim == xshape[0]);
         if (seq_major)
             std::swap(seq, num_heads);
         // Output layout is [B, num_heads, seq, head_dim] (the transposed layout
@@ -138,6 +155,7 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         pc.seq = seq;
         pc.input_untransposed = input_untransposed_ ? 1 : 0;
         pc.seq_major = seq_major ? 1 : 0;
+        pc.rotary_dim = rotary_dim;
 
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);
@@ -165,10 +183,10 @@ class RotaryEmbedding : public PimplFacade {
         if (!backend_buffer) {
             throw std::runtime_error(
                 "RotaryEmbedding is buffer-backend only (no image impl).");
-        }
+        } // namespace ops
         impl_ = std::unique_ptr<Operator>(
             std::make_unique<RotaryEmbeddingBuffer>(fp16));
-    }
+    } // namespace vkop
 };
 
 } // namespace ops

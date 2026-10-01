@@ -3,11 +3,15 @@ import struct
 import os
 import re
 
-MODEL_DIR = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
+# 一条命令一个模型：MODEL_DIR / OUTPUT_BIN 用环境变量覆盖，默认保持 Qwen3-VL 原样。
+#   MODEL_DIR=~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
+#   OUTPUT_BIN=phi4.bin python3 tokenizer_to_bin.py
+MODEL_DIR = os.path.expanduser(os.environ.get("MODEL_DIR")
+                               or "~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 TOKENIZER_JSON = os.path.join(MODEL_DIR, "tokenizer.json")
 TOKENIZER_CONFIG_JSON = os.path.join(MODEL_DIR, "tokenizer_config.json")
 CHAT_TEMPLATE_JSON = os.path.join(MODEL_DIR, "chat_template.json")
-OUTPUT_BIN = "qwen3_vl.bin"
+OUTPUT_BIN = os.environ.get("OUTPUT_BIN") or "qwen3_vl.bin"
 
 def bytes_to_unicode():
     """标准 BBPE byte-to-unicode 映射表"""
@@ -21,6 +25,21 @@ def bytes_to_unicode():
             n += 1
     return dict(zip(bs, [chr(c) for c in cs]))
 
+def common_prefix_len(a, b):
+    """逐字符公共前缀长度。
+
+    不能用 os.path.commonprefix：它按路径语义在分隔符处截断（对 a/xx/yy 和 a/xx/zz
+    只返回 a/xx/），而这里的字符串是聊天模板的渲染结果，特殊 token 的字面量里就带
+    那个分隔符，截断点会错。
+    """
+    n = 0
+    for x, y in zip(a, b):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
 def extract_chat_template():
     """用 HF tokenizer 的 apply_chat_template 探针提取角色 prefix/suffix、
     内容占位格式、generation_prompt、default_system_prompt。
@@ -31,32 +50,94 @@ def extract_chat_template():
       generation_prompt, default_system_prompt
     """
     from transformers import AutoTokenizer
-    tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
+    try:
+        # 优先走本地原生实现：有些仓库（Phi-4-mini）的 auto_map 把 AutoTokenizer
+        # 指向外部仓库名，trust_remote_code=True 会去联网取，离线就失败。
+        tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=False)
+    except Exception:
+        tok = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
 
-    SYS = "__SENTINEL_SYS_a7f3e2b1__"
-    USR = "__SENTINEL_USR_c9d4f6e8__"
-    AST = "<placeholder_assistant_text>"
+    # 每个角色两条哨兵：第二条只用来连发同角色轮做长度差分，两条必须等长，否则
+    # 「len(two) - len(one)」量出来的一整轮会带上第二条约内容多出来的那几个字符。
+    SYS, SYS2 = "__SENTINEL_SYS_a7f3e2b1__", "__SENTINEL_SYS_b8g4f7d9__"
+    USR, USR2 = "__SENTINEL_USR_c9d4f6e8__", "__SENTINEL_USR_d0h5g7f0__"
+    AST, AST2 = "<placeholder_assistant_tx1>", "<placeholder_assistant_tx2>"
 
     sys_msg = {"role": "system", "content": SYS}
     usr_msg = {"role": "user", "content": USR}
-    ast_msg = {"role": "assistant", "content": AST}
 
-    sys_fmt = tok.apply_chat_template([sys_msg], tokenize=False, add_generation_prompt=False)
-    sys_prefix = sys_fmt[:sys_fmt.find(SYS)]
-    sys_suffix = sys_fmt[sys_fmt.find(SYS) + len(SYS):]
+    def render(ms, gp=False):
+        return tok.apply_chat_template(ms, tokenize=False, add_generation_prompt=gp)
 
-    usr_fmt = tok.apply_chat_template([sys_msg, usr_msg], tokenize=False, add_generation_prompt=False)
-    delta = usr_fmt[len(sys_fmt):]
-    usr_prefix = delta[:delta.find(USR)]
-    usr_suffix = delta[delta.find(USR) + len(USR):]
+    def probe_role(role, sent, sent2, prev):
+        """探一个角色的 (prefix, suffix)，顺带确认/更新整段对话的收尾串。
 
-    ast_fmt = tok.apply_chat_template([sys_msg, usr_msg, ast_msg], tokenize=False, add_generation_prompt=False)
-    delta2 = ast_fmt[len(usr_fmt):]
-    ast_prefix = delta2[:delta2.find(AST)]
-    ast_suffix = delta2[delta2.find(AST) + len(AST):]
+        不能把单轮差分整段当后缀：有的模板（Phi-4-mini）在
+        add_generation_prompt=False 时给整段对话补一个 eos
+        （`...{% else %}{{ eos_token }}{% endif %}`），那截收尾会被算进最后一条消息的
+        suffix；而 C++ 渲染器是逐条消息拼 prefix+content+suffix，等于每轮都注入一个
+        eos。收尾串在「同一角色连发两轮」的差分里长度不变，所以
+            一整轮长度 turn = len(two) - len(one) = prefix + content + suffix
+        再结合哨兵在渲染串里的位置就能把 prefix/suffix 各自解出来。
+        哨兵必须在整段渲染里恰好出现一次，否则位置就不可信（模板把 content 渲染了两
+        遍，或者把它吃掉/截断了），这种情况直接报错而不是产出错位的前缀。
+        """
+        nonlocal tail_len, tail_str
+        msgs = [{"role": r, "content": s} for r, s in prev]
+        # 空历史不用渲染：transformers 5 直接拒绝空 conversation。
+        prev_render = render(msgs) if msgs else ""
+        one = render(msgs + [{"role": role, "content": sent}])
+        two = render(msgs + [{"role": role, "content": sent},
+                             {"role": role, "content": sent2}])
+        turn = len(two) - len(one)
+        q = one.find(sent)
+        if q < 0 or one.count(sent) != 1:
+            raise RuntimeError(f"chat template probe failed for role {role!r}: "
+                               f"sentinel found {one.count(sent)} time(s)")
+        if turn < len(sent):
+            # 模板把重复的同角色轮丢掉了（Qwen 的 system 只取第一条）→ 量不出整轮
+            # 长度。此时把「整段减去已渲染历史」当作一整轮：两处收尾串相减正好抵消。
+            turn = len(one) - len(prev_render)
+        # 已渲染历史里属于「正文」的那一段长度：prev_render 结尾带着收尾串，要减掉。
+        # 空历史没有渲染，正文长度就是 0。
+        prev_body = 0 if not msgs else len(prev_render) - tail_len
+        if not msgs:
+            # 空历史时整段渲染 = 一整轮 + 收尾串，两个长度之差直接给出收尾串长度，
+            # 后面几条探针复用它（连发两轮的差分里收尾串长度不变）。
+            tail_len = len(one) - turn
+            if tail_len < 0:
+                raise RuntimeError(f"chat template probe failed for role {role!r}: "
+                                   f"turn {turn} is longer than the whole render")
+        p_len = q - prev_body
+        if p_len < 0 or p_len + len(sent) > turn:
+            raise RuntimeError(f"chat template probe failed for role {role!r}: "
+                               f"prefix len {p_len} inconsistent with turn len {turn}")
+        suffix = one[q + len(sent): prev_body + turn]
+        if prev_body + turn + tail_len != len(one):
+            raise RuntimeError(f"chat template probe failed for role {role!r}: "
+                               f"turn+tail does not cover the render")
+        if not msgs:
+            tail_str = one[prev_body + turn:]
+        return one[q - p_len:q], suffix
 
-    gen_fmt = tok.apply_chat_template([sys_msg, usr_msg], tokenize=False, add_generation_prompt=True)
-    generation_prompt = gen_fmt[len(usr_fmt):]
+    tail_len = 0
+    tail_str = ""
+    sys_prefix, sys_suffix = probe_role("system", SYS, SYS2, [])
+    usr_prefix, usr_suffix = probe_role("user", USR, USR2, [("system", SYS)])
+    ast_prefix, ast_suffix = probe_role("assistant", AST, AST2,
+                                        [("system", SYS), ("user", USR)])
+    print(f"[+] conversation tail (only with add_generation_prompt=False): {tail_str!r}")
+
+    # generation_prompt：同一段历史在 add_generation_prompt 真/假下的差。False 一侧
+    # 结尾是模板给整段对话补的收尾串（probe_role 已经量出来），先剥掉再取公共前缀，
+    # 否则收尾串和引导串排在同一位置、开头又都是 '<'，公共前缀会在引导串中间停下。
+    hist = [{"role": "system", "content": SYS}, {"role": "user", "content": USR}]
+    no_gen, with_gen = render(hist, False), render(hist, True)
+    if not no_gen.endswith(tail_str):
+        raise RuntimeError("chat template probe failed for generation_prompt: "
+                           f"conversation tail {tail_str!r} not at the end of the render")
+    cut = common_prefix_len(no_gen[:len(no_gen) - len(tail_str)], with_gen)
+    generation_prompt = with_gen[cut:]
 
     # default_system_prompt：仅 user 消息时若模板自动注入系统块则提取其内容。
     usr_only = tok.apply_chat_template([usr_msg], tokenize=False, add_generation_prompt=False)
@@ -71,37 +152,74 @@ def extract_chat_template():
                 default_system_prompt = ""
 
     # image/video 内容占位格式：对比「纯文本」与「带图/视频」的差分。
+    # 纯文本模板不接受 list 形式的 content（Phi-4 的模板直接做字符串拼接，遇到
+    # content 列表会 TypeError），这类模型没有视觉占位，content_types 留空即可。
     content_types = {}
     base_text = "<placeholder_user_text>"
-    base_fmt = tok.apply_chat_template(
-        [sys_msg, {"role": "user", "content": [{"type": "text", "text": base_text}]}],
-        tokenize=False, add_generation_prompt=False)
-    for kind, ph in [("image", "<placeholder_image_path>"), ("video", "<placeholder_video_path>")]:
-        u = {"role": "user", "content": [{"type": "text", "text": base_text}, {"type": kind, kind: ph}]}
-        withc = tok.apply_chat_template([sys_msg, u], tokenize=False, add_generation_prompt=False)
-        tp = base_fmt.find(base_text) + len(base_text)
-        cp = withc.find(base_text) + len(base_text)
-        bsuf = base_fmt[tp:]
-        wsuf = withc[cp:]
-        if wsuf.endswith(bsuf) and bsuf:
-            pat = wsuf[:-len(bsuf)]
-        else:
-            pat = wsuf
-        pat = re.sub(rf"^{kind.capitalize()} \d+:\s*", "", pat)
-        if pat:
-            content_types[kind] = {"format": pat}
+    try:
+        base_fmt = tok.apply_chat_template(
+            [sys_msg, {"role": "user", "content": [{"type": "text", "text": base_text}]}],
+            tokenize=False, add_generation_prompt=False)
+    except Exception as e:
+        print(f"[+] chat template takes no list-content messages ({e}); "
+              f"no image/video content types.")
+        base_fmt = None
+    if base_fmt is not None:
+        for kind, ph in [("image", "<placeholder_image_path>"), ("video", "<placeholder_video_path>")]:
+            u = {"role": "user", "content": [{"type": "text", "text": base_text}, {"type": kind, kind: ph}]}
+            withc = tok.apply_chat_template([sys_msg, u], tokenize=False, add_generation_prompt=False)
+            tp = base_fmt.find(base_text) + len(base_text)
+            cp = withc.find(base_text) + len(base_text)
+            # 取 base_text 之后到本轮结束的那一段：后面接着的是 user 轮的
+            # prefix+sent+suffix，它在两种渲染里完全一样，所以按「与纯文本渲染相同的
+            # 尾巴」剥掉即可。
+            bsuf = base_fmt[tp:]
+            wsuf = withc[cp:]
+            if wsuf.endswith(bsuf) and bsuf:
+                pat = wsuf[:-len(bsuf)]
+            else:
+                pat = wsuf
+            pat = re.sub(rf"^{kind.capitalize()} \d+:\s*", "", pat)
+            if pat:
+                content_types[kind] = {"format": pat}
+
+    roles = {
+        "system": {"prefix": sys_prefix, "suffix": sys_suffix},
+        "user": {"prefix": usr_prefix, "suffix": usr_suffix},
+        "assistant": {"prefix": ast_prefix, "suffix": ast_suffix},
+    }
+    for name in ("system", "user", "assistant"):
+        r = roles[name]
+        print(f"[+] role {name:9s} prefix={r['prefix']!r} suffix={r['suffix']!r}")
+    print(f"[+] generation_prompt={generation_prompt!r} "
+          f"default_system_prompt={default_system_prompt!r}")
 
     return {
         "model_path": MODEL_DIR,
-        "roles": {
-            "system": {"prefix": sys_prefix, "suffix": sys_suffix},
-            "user": {"prefix": usr_prefix, "suffix": usr_suffix},
-            "assistant": {"prefix": ast_prefix, "suffix": ast_suffix},
-        },
+        "roles": roles,
         "content_types": content_types,
         "generation_prompt": generation_prompt,
         "default_system_prompt": default_system_prompt,
     }
+
+
+def derive_flags(data):
+    r"""推导 bin header 的 flags（位定义见 tokenizer.cpp 的 kFlag*，0 = Qwen 口径）。
+
+    不靠模型名硬编码，全部从 tokenizer.json 的实际配置读：
+      bit0  pre_tokenizer 是 Phi-4/o200k 变体 —— 判据是正则里数字分支写成
+            \p{N}{1,3}（GPT-2 分支是单个 \p{N}），这条差异同时带着「字母按大小写
+            形状切分」和「标点后跟 [\\r\\n/]*」两套语义。
+      bit1  没有 normalizer —— C++ 侧跳过 NFC（Phi 的词表按原样码点建，做 NFC 会把
+            「é」这类组合序列换成另一个码点，切出不同的 token）。
+    """
+    pt_text = json.dumps(data.get("pre_tokenizer") or {})
+    phi = "\\p{N}{1,3}" in pt_text
+    no_normalizer = data.get("normalizer") is None
+    flags = (1 if phi else 0) | (2 if no_normalizer else 0)
+    print(f"[+] pre_tokenizer={'phi/o200k' if phi else 'gpt2'} "
+          f"normalizer={'none' if no_normalizer else 'present'} -> flags={flags}")
+    return flags
 
 
 def convert_tokenizer():
@@ -129,6 +247,7 @@ def convert_tokenizer():
     # 构建反向映射表 (Unicode Char -> Byte)
     b2u = bytes_to_unicode()
     u2b = {v: k for k, v in b2u.items()}
+    flags = derive_flags(data)
 
     with open(OUTPUT_BIN, "wb") as f:
         # --- 写入 File Header ---
@@ -137,7 +256,7 @@ def convert_tokenizer():
         f.write(struct.pack("<I", vocab_size))
         f.write(struct.pack("<I", merge_rules_count))
         f.write(struct.pack("<I", special_tokens_count))
-        f.write(struct.pack("<I", 0))     # Reserved
+        f.write(struct.pack("<I", flags))  # 原 Reserved 字段，见 derive_flags
 
         # --- 写入 Vocab Section ---
         for token, token_id in sorted_vocab:

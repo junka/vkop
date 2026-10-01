@@ -31,6 +31,8 @@
 | [cases.py](cases.py) | 一致性测试用例构造（合成 PIL 图、prompt 模板、`CASES` 列表，供 tests 复用）。 |
 | [tests/](tests/) | pytest 测试套件（数值对齐 + 端到端 token 一致性）。 |
 | [qwen3vl_infer.py](qwen3vl_infer.py) | HF 原生推理封装（`Qwen3VLInference`），作为对比基准。 |
+| [qwen3_export_onnx.py](qwen3_export_onnx.py) | 纯文本 Qwen3（`Qwen3ForCausalLM`）导出 → `text_qwen3/`。 |
+| [phi4_export_onnx.py](phi4_export_onnx.py) | Phi-4-mini（`Phi3ForCausalLM`）导出 → `text_phi4/`；与 Qwen 共用同一套张量 I/O 契约。 |
 | `visual.onnx` / `llm.onnx` / `llm.weights.bin` | 导出产物（`llm.weights.bin` 是 llm.onnx 的外部权重单文件）。 |
 
 ## 构建
@@ -452,6 +454,74 @@ token 数 = `max_new - 1`。默认 64 → prefill 后最多再生成 63 个 deco
 
 简言之：**放开就是改 `max_new`**，vkop 侧无硬墙；真正的上界是 GPU 显存 + 模型训练长度。
 
+---
+
+## 第二个架构：Phi-4-mini-instruct（`text_phi4/`）
+
+Phi-4-mini 是 `Phi3ForCausalLM`：32 层 / hidden 3072 / 24 q 头 8 kv 头（GQA 3 组）/
+head_dim 128 / intermediate 8192 / vocab 200064 / `tie_word_embeddings=true`。
+导出物与 Qwen **共用同一套张量 I/O 名字与形状**，所以 `llm_chat` / `kv_cache` /
+`conversation` 的加载逻辑一行都不用改；架构差异全部消化在导出脚本和 runtime 算子层。
+
+```bash
+# 1) 导出 ONNX（权重：ModelScope LLM-Research/Phi-4-mini-instruct）
+python3 phi4_export_onnx.py            # → text_phi4/llm.onnx + llm.weights.bin
+python3 dump_embed_tokens_phi4.py      # → text_phi4/embed_tokens.bin (200064x3072 fp16)
+# 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
+python3 phi4_check_onnx.py
+# 3) 转 vkopbin —— 多 GB 图不要加 -u（UnifiedMeta 的偏移是 int32，会溢出）
+python3 -m onnx2vkop.cli -i text_phi4/llm.onnx -o text_phi4/llm.vkopbin
+# 4) tokenizer bin（MODEL_DIR / OUTPUT_BIN 两个环境变量决定输入与产物）
+MODEL_DIR=~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
+  OUTPUT_BIN=../tokenizer/phi4_mini.bin python3 ../tokenizer/tokenizer_to_bin.py
+# 5) 三方 token 对齐（HF generate / ONNX Runtime / vkop GPU）
+python3 phi4_greedy_ref.py "用一个词回答：天空是什么颜色？"
+```
+
+
+**与 Qwen3 的四处架构差异**（都在导出脚本里逐 op 贴 HF 实现）：
+
+1. **fused 投影**：`qkv_proj` 一个 MatMul 出 q/k/v，`gate_up_proj` 一个 MatMul 出
+   gate/up。不动权重手术，照 HF 用切片拆**输出**（`qkv[..., :3072]` 等），数值路径
+   与 HF 一字不差。gate/up 用常量边界切片而**不是** `chunk(2, -1)` —— 见下面坑 1。
+2. **partial RoPE**：`rotary_dim = head_dim x 0.75 = 96`，每个 head 后 32 维不参与
+   旋转直通。runtime 的 `RotaryEmbedding` 原本假设 cos/sin 行宽 == head_dim，
+   现已按 cos 的实际行宽取 `rotary_dim`（等于 head_dim 时行为完全不变）。
+3. **longrope**：`attention_scaling = 1.190238` 由 HF 的 `rotary_emb` 乘进 cos/sin，
+   所以必须复用 HF 的 rotary_emb 而不是手写 RoPE；自己算会漏掉它，注意力分数差
+   1.190238^2 = 1.4167 倍。
+4. **模板与停止符**：Phi 的每轮壳是 `<|role|>...<|end|>`（无换行），且
+   `add_generation_prompt=False` 时模板会给整段对话补一个 eos。驱动里
+   `im_end_token_id()` 会同时探测 ChatML 与 `<|end|>` 两个字面量，Qwen 侧行为不变。
+
+**跑通 Phi 期间修掉的三个静默错误**（都会让输出变成全 0 或错位，且都不报错）：
+
+- **转换器的 Unsqueeze 消除会吃掉 GQA 的升秩**。`fuse_unsqueeze_eliminate` 无条件把
+  单轴 Unsqueeze 折进消费者；Expand 的广播是「shape 列表右对齐到输入秩」，少一维就
+  把复制轴安错位置 —— Phi 的 `repeat_kv` 复制了 8 份而不是 3 份，尺寸对不上之后
+  下游 MatMul 直接读到一个没被写过的全 0 缓冲区。现在 Expand 作为消费者的 Unsqueeze
+  一律保留，交给 runtime 真执行 view。
+- **`chunk(2, -1)` 导出的整数 shape 链被融成 FUSED_ELEMWISE**。那条链是
+  Shape→Gather→Add→Div→Mul→Slice（全 int64），而 FUSED_ELEMWISE 只有 fp16/fp32 变体；
+  融掉之后 Slice 的 `ends` 不再是 int64 张量，`SliceBuffer::execute` 里
+  `as_tensor<int64_t>` 得到空指针，直接 SIGSEGV（崩在
+  `Tensor<long long>::copyToCPU`，this=0）。导出侧改成常量边界切片，顺带每层少 4 个
+  动态 shape 节点。
+- **超过 1GB 的张量上传会静默失败**。staging pool 上限 1GB，而 Phi 是
+  tie_word_embeddings，`lm_head` 就是那张 200064x3072 的 fp16 表 = 1.23GB；
+  一次分配失败后原代码只 `printf` 一句就 return，SSBO 保持全 0 —— 症状是 logits 全 0、
+  argmax 恒等于 id 0（输出变成一串 `!`）。现在按 64MB 分块上传，常规尺寸仍走单次快速路径。
+
+**三方 token 一致（greedy，prompt「用一个词回答：天空是什么颜色？」）**：
+
+```
+HF generate = ONNX Runtime = vkop GPU = [72721, 4472, 788, 200020]  →  '蓝色。' + 轮末符
+```
+
+`phi4_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
+累积舍入），32 层 present_key_values 全部 < 1.4e-3，decode 单步 argmax 一致，
+每轮 GPU 约 330ms/token。
+
 ### 局限（llm_chat）
 
 - **仅 greedy**：无 temperature/top-p 采样，与 `Qwen3VLInference` 的 `do_sample=True`
@@ -461,6 +531,10 @@ token 数 = `max_new - 1`。默认 64 → prefill 后最多再生成 63 个 deco
   也不支持一轮里多张图。多图需扩展 `expand_image_token` + 多组 deepstack 特征。
 - **视觉尺寸固定**：图片必须是 32 的整数倍（224×224 默认），且 `visual.vkopbin`
   的 grid_thw 在导出时固化（见上文「视觉编码器」节）。不同尺寸需重新导出 + 转换。
-- **单轮对话（KV 不跨轮复用）**：每次 prompt 独立 prefill（不复用上一轮的 KV cache
-  作为新轮的 past）。多模态下每轮都重新 scatter 图像特征 + 重算 rope_delta。真正的
-  多轮需把上一轮 `present_kv` 喂回下一轮 prefill 的 `past_kv`，驱动目前未做。
+- **多轮 = 每轮重算 KV**：会话历史在 token 层累积后整体重新 prefill（见上文
+  「多轮上下文」一节）；跨轮续用 KV（跳过已算前缀）还没接——vkop 没有 paged KV /
+  block table，`Conversation::prefixMatch()` 留着校验点。
+- **Phi-4-mini 上下文 ≤ 4096**：longrope 在 `rotary_emb` 里按
+  `max(position_ids) > original_max_position_embeddings(=4096)` 选 short/long factor，
+  那是数据相关分支，trace 时被固化成导出时走的那一支（short factor 全 1，等价普通
+  RoPE，脚本导出前会断言这一点）。要超 4096 得用 long_factor 重新导出。

@@ -27,6 +27,45 @@ tokenizer.json  ──[tokenizer_to_bin.py]──▶  qwen3_vl.bin
 | [tests/gen_ground_truth.py](tests/gen_ground_truth.py) | 用 HF `tokenizers` 生成 `hf_ground_truth.json` 逐 id 对比基准。 |
 | [CMakeLists.txt](CMakeLists.txt) | 构建配置，依赖 `libutf8proc-dev`（pre-tokenizer 改手写扫描器，不再依赖 re2）。 |
 
+## 多模型：bin header 的 flags 与两种 pre-tokenizer
+
+同一个 C++ 实现服务多种 BBPE 分词器，差别写在 bin 的 header 里。header 是
+6 个 u32：magic/version/vocab/merges/special/**flags**；最后这一个原本是恒 0 的
+Reserved，现在是 flags，**旧 bin 那里全是 0 → 行为完全不变，不用重新生成**：
+
+| bit | 含义 | 写端怎么判定（`tokenizer_to_bin.py::derive_flags`，读 tokenizer.json 自动推） |
+|---|---|---|
+| 0 | pre-tokenizer 用 Phi-4/o200k 变体 | 正则里数字分支写成 `\p{N}{1,3}`（GPT-2 是单个 `\p{N}`） |
+| 1 | 不做 NFC 规范化 | `tokenizer.json` 的 `normalizer` 为 null |
+
+Phi-4 变体与 GPT-2 的三处实质差异（都在 `pre_tokenize_phi` 里按 Rust regex 的
+leftmost-first + 贪心/回退语义手写）：
+
+1. 字母按「形状」分两类切分 —— UL = `Lu Lt Lm Lo M`、LL = `Ll Lm Lo M`：
+   `[UL]*[LL]+`（alt1，小写收尾）与 `[UL]+[LL]*`（alt2，大写收尾）。于是
+   `HelloWorld` 切成 `Hello`+`World`，而 `ABc` 是一整段；GPT-2 的 `\p{L}+` 会整串
+   当一个 token。`Lm/Lo/M` 同属两类，`[UL]*` 贪心后要能回退（`ᐁᐁ` 这类连续 Lo 只有
+   回退才匹配得上）。
+2. 数字是 `\p{N}{1,3}`（贪心 1~3 个），GPT-2 逐位切。
+3. 标点串的拖尾字符类多一个 `/`（`[\r\n/]*`），且缩写 `(?i:'s|'t|...)` 只能挂在字母段
+   尾巴上，没有 GPT-2 那样的独立分支。
+
+缩写匹配 `match_contraction` **自己校验前导撇号**： Phi 分支是在字母段结尾无条件
+调它的，少了这道判断就会把「空格 + s」当成缩写吞进前一个 span
+（`" leading spaces"` 会变成 ` leading s` + `paces`）。
+
+跑第二个模型的测试（数据文件按参数给，不用换仓库里的默认路径）：
+
+```bash
+python3 gen_ground_truth.py                       # 默认 Qwen3-VL → hf_ground_truth.json
+TOK_JSON=<model>/tokenizer.json OUT=phi_ground_truth.json python3 gen_ground_truth.py
+./build/llm/tokenizer/tests/tokenizer_test <model.bin> <ground_truth.json>
+```
+
+`tests/main.cpp` 里 chat template 的期望值不再写死某个模型的标记串：拼装内容由
+bin 里的角色前后缀决定，与 HF jinja 渲染是否逐字符一致用
+`tests/check_chat_template.py` 对着 HF tokenizer 比（C++ 侧拿不到 jinja）。
+
 ## 构建
 
 ```bash

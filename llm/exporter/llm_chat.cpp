@@ -264,8 +264,11 @@ void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
 
 // Argmax over the last-position logits: logits is (1, q, vocab) fp16, take
 // [0, q-1, *]. Returns the vocab index of the max.
+// embed_vocab 是 embed_tokens.bin 的行数：logits 最后一维正常时它和 shape.back()
+// 相等（同一张表），只在 shape 记不住时用作兜底，所以不能写死某个模型的词表大小。
 int argmax_last_token(const std::shared_ptr<Runtime>& rt,
-                      const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool) {
+                      const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                      int embed_vocab) {
     auto logits = rt->GetOutput("logits");
     if (!logits) throw std::runtime_error("no 'logits' output");
     auto lg = as_tensor<uint16_t>(logits);
@@ -281,7 +284,7 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
     // Defensive: if shape is unreliable, assume total = q*vocab and vocab from
     // the known Qwen3-VL size.
     if (vocab <= 0 || q <= 0) {
-        vocab = 151936;
+        vocab = embed_vocab;
         q = total / vocab;
     }
     const uint16_t* row = p + (q - 1) * vocab;
@@ -873,7 +876,7 @@ int main(int argc, char** argv) {
             std::fflush(stdout);
         }
 
-        int next_id = argmax_last_token(rt, cmdpool);
+        int next_id = argmax_last_token(rt, cmdpool, vocab);
         std::printf("[prefill] %.1fms  → token %d  ", ms, next_id);
         std::vector<uint32_t> out_ids = {static_cast<uint32_t>(next_id)};
         std::printf("%s\n", tok.decode({static_cast<uint32_t>(next_id)}).c_str());
@@ -939,7 +942,7 @@ int main(int argc, char** argv) {
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
             auto t1 = std::chrono::steady_clock::now();
-            next_id = argmax_last_token(rt, cmdpool);
+            next_id = argmax_last_token(rt, cmdpool, vocab);
             out_ids.push_back(static_cast<uint32_t>(next_id));
             double run_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             if (profile_mode) {
