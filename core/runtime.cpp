@@ -618,6 +618,7 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::RESHAPE:
                 case vkop::ops::OpType::SLICE:
                 case vkop::ops::OpType::SPLIT:
+                case vkop::ops::OpType::RESIZE:
                 case vkop::ops::OpType::SCATTER_ELEMENTS:
                 case vkop::ops::OpType::RMSNORM:
                 case vkop::ops::OpType::REDUCEMEAN:
@@ -666,6 +667,63 @@ void Runtime::LoadModel() {
                 level_op_seq_[level_idx].push_back(n.op_type);
             }
             node_input_value_dynamic_.push_back(std::move(node_input_vd));
+        }
+    }
+    // Graph-output dtype fixup. outputs_/real_outputs_ are allocated up front
+    // from precision_, before any node exists — but an op that runs in the
+    // fp32 domain (e.g. a Max/Min tail after an fp32 Conv) writes one float
+    // per element. Handing it a half-typed output tensor binds a 2-byte/elem
+    // buffer and silently drops every other value, so reallocate the output
+    // to its producer's dtype. Cast/FusedElemwise are exempt: their output
+    // dtype is deliberately the other side of a Cast.
+    for (auto &entry : real_outputs_) {
+        const std::string &name = entry.first;
+        auto out_t = entry.second;
+        if (!out_t || (out_t->dtype() != typeid(uint16_t) &&
+                       out_t->dtype() != typeid(float))) {
+            continue;
+        }
+        for (size_t i = 0; i < node_output_tensors_.size(); ++i) {
+            const auto type = node_ops_[i]->get_type();
+            if (type == vkop::ops::OpType::CAST ||
+                type == vkop::ops::OpType::FUSED_ELEMWISE) {
+                continue;
+            }
+            if (i >= node_input_tensors_.size() ||
+                node_input_tensors_[i].empty() ||
+                node_input_tensors_[i][0] == nullptr) {
+                continue;
+            }
+            const auto &idt = node_input_tensors_[i][0]->dtype();
+            if (idt != typeid(uint16_t) && idt != typeid(float)) {
+                continue;
+            }
+            size_t k = 0;
+            for (; k < node_output_tensors_[i].size(); ++k) {
+                if (node_output_tensors_[i][k].get() == out_t.get()) {
+                    break;
+                }
+            }
+            if (k == node_output_tensors_[i].size()) {
+                continue;
+            }
+            bool want_fp16 = idt == typeid(uint16_t);
+            if (want_fp16 == (out_t->dtype() == typeid(uint16_t))) {
+                break;
+            }
+            auto dims = out_t->getShape();
+            std::shared_ptr<ITensor> nt;
+            if (want_fp16) {
+                nt = std::make_shared<Tensor<uint16_t>>(dims, true);
+            } else {
+                nt = std::make_shared<Tensor<float>>(dims, true);
+            }
+            nt->set_ref_cnt_forever();
+            node_output_tensors_[i][k] = nt;
+            tensor_map[name] = nt;
+            outputs_[name] = nt;
+            real_outputs_[name] = nt;
+            break;
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
