@@ -88,13 +88,63 @@ Add, Concat, Div, Gather, LayerNormalization, MatMul, Mul, Neg, Pow, Reshape, Si
 3. Operator coverage analysis
 4. C++ driver skeleton (image_gen.cpp)
 5. Python reference pipeline (run_image_gen.py)
+6. The 4 "missing" operators (ReduceMean, Min, Max, Mod) — implemented, `ctest` green
+7. Tiny DiT fully aligned with ORT on vkop GPU (prefill + 5-step velocity, node-level 0 BAD)
+8. VAE decoder aligned with ORT on vkop GPU — see "VAE Decoder on the vkop Vulkan GPU backend"
 
 ### Pending ⏸️
-1. Implement 4 missing operators (ReduceMean, Min, Max, Mod)
-2. Full DiT decode inference (replace dummy velocity)
-3. VAE decoder integration (ONNX or upstream diffusers)
-4. Text encoder integration (Qwen3-VL-7B tokenizer + embeddings)
-5. PNG output (stb_image_write.h or PIL)
+1. Full-size DiT (7.12B) inference on vkop GPU, replacing the tiny stand-in
+2. Text encoder integration (Qwen3-VL-7B tokenizer + embeddings)
+3. PNG output (stb_image_write.h or PIL)
+
+## VAE Decoder on the vkop Vulkan GPU backend (buffer/SSBO)
+
+512×512 decoder, latent `[1,64,1,32,32]` fp32 -> decoded `[1,4,1,512,512]` fp32, range `[-1,1]`.
+
+### Graph surgery chain (ONNX, before `onnx2vkop`)
+| Step | Script | What it removes |
+|------|--------|-----------------|
+| 1 | `simplify_vae_if.py` | constant-folds the `If` so both branches become one static subgraph |
+| 2 | `staticize_vae.py` | replaces dynamic `Shape/Gather/Mul/Div` chains with static `sizes=` on Resize etc. |
+| 3 | `fold_pad_into_conv.py` | merges the asymmetric `Pad` preceding each Conv into the Conv's own padding |
+| 4 | (inline) | `Clip` -> `Max`/`Min`, `Tile` -> `Expand`, then `infer_shapes` to back-fill `value_info` |
+
+### Numerical alignment (vkop GPU vs ORT reference)
+| Scope | maxabs | mean | cos |
+|-------|--------|------|-----|
+| Final `decoded` | 6.41e-05 | 7.79e-07 | 1.000000 |
+| 20 stage boundaries* | <= 8e-05 | - | ~1.0 |
+
+*`gen_vae_ref_intermediates.py` promotes 20 boundary tensors to ORT outputs (every `Resize`, each
+`up_blocks.*.resnets.2`/`Add`, `norm_out`, `nonlinearity`, `conv_out`); `compare_vae_node_dump.py`
+matches them against `VKOP_NODE_DUMP` files **by node name** — the dump's `#idx` is not the runtime
+`n` index, so matching by index silently compares the wrong tensors.
+
+### Timing (M5 Max, fp16 precision, buffer backend)
+| Phase | Duration |
+|-------|----------|
+| `LoadModel` | 0.42 s |
+| `Run` + `ReadResult` | 10.13 s |
+
+### Inputs and PNG stage
+The probe latent is regenerated, not committed:
+`np.random.default_rng(42).standard_normal((1,64,1,32,32), dtype=np.float32).tofile("vae_latent.raw")`.
+`vae_gen` writes the fp32 decode plus a PNG of the same basename; the 4-channel
+decode becomes an 8-bit RGBA image (`(v+1)/2*255`, clamped). Deflate uses stored
+blocks so the encoder needs no libpng/stb link. Round-trip check: PIL decodes the
+PNG bit-exactly against the fp32 decode quantized independently, and vs the ORT
+reference only 114 / 1048576 bytes differ, all by 1 (quantization-boundary flips).
+
+### Runtime fixes this required
+1. `OpType::RESIZE` was missing from the `op_fp16` dtype-following switch in `core/runtime.cpp`,
+   so a fp32 Resize input was executed by the fp16 shader at half width (output garbage, ~4e37).
+2. Graph outputs are pre-allocated from `precision_` early in `LoadModel`. When the producing
+   operator runs in the other domain (e.g. graph output forced fp16 but the final `Min` is fp32),
+   the bind silently truncated to 2 bytes/elem. A post-build fixup now re-allocates graph-output
+   tensors to match the producing node's input dtype (skipping `Cast`/`FusedElemwise`).
+3. `Resize` only had an image-backend port; the VAE mixes it with SSBO-only shape ops, so a
+   buffer port (`shaders/buffer/resize.comp`, `ops/Resize.hpp::ResizeBuffer`) was added — nearest /
+   asymmetric only, one invocation per 32-bit word in fp16 to avoid read-modify-write races.
 
 ## Optimization Opportunities
 
