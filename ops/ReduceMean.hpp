@@ -6,6 +6,8 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 extern "C" {
+extern unsigned char buffer_reduce_spv[];
+extern unsigned int buffer_reduce_spv_len;
 extern unsigned char buffer_reduce_fp16_spv[];
 extern unsigned int buffer_reduce_fp16_spv_len;
 }
@@ -19,8 +21,9 @@ class ReduceMeanBuffer : public BufferFactory {
   public:
     explicit ReduceMeanBuffer(int fp16)
         : BufferFactory(OpType::REDUCEMEAN,
-                        fp16 ? buffer_reduce_fp16_spv : nullptr,
-                        fp16 ? buffer_reduce_fp16_spv_len : 0,
+                        fp16 ? buffer_reduce_fp16_spv : buffer_reduce_spv,
+                        fp16 ? buffer_reduce_fp16_spv_len
+                             : buffer_reduce_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ReducePC), fp16) {}
 

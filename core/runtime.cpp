@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <limits>
 #include <map>
 #include <numeric>
@@ -619,6 +620,10 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::SPLIT:
                 case vkop::ops::OpType::SCATTER_ELEMENTS:
                 case vkop::ops::OpType::RMSNORM:
+                case vkop::ops::OpType::REDUCEMEAN:
+                case vkop::ops::OpType::MIN:
+                case vkop::ops::OpType::MAX:
+                case vkop::ops::OpType::MOD:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;
@@ -1914,6 +1919,98 @@ double Runtime::Run() {
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
             graph_op_idx = -1;
+            // [probe] report-only per-node live shape trace
+            if (std::getenv("VKOP_SHAPE_TRACE")) {
+                printf("[shape] lvl=%zu node=%zu %s", level_idx, node_idx,
+                       node_ops_[node_idx]->get_name().c_str());
+                for (size_t k = 0; k < node_input_tensors_[node_idx].size();
+                     ++k) {
+                    auto &t = node_input_tensors_[node_idx][k];
+                    if (!t)
+                        continue;
+                    printf(" | in%zu(", k);
+                    for (int d : t->getShape())
+                        printf("%d,", d);
+                    printf(")");
+                }
+                for (size_t k = 0; k < node_output_tensors_[node_idx].size();
+                     ++k) {
+                    auto &t = node_output_tensors_[node_idx][k];
+                    if (!t)
+                        continue;
+                    printf(" | out%zu(", k);
+                    for (int d : t->getShape())
+                        printf("%d,", d);
+                    printf(")");
+                }
+                printf("\n");
+            }
+            // [probe] report-only per-node output byte dump for offline
+            // first-divergence analysis against ORT intermediates.
+            if (std::getenv("VKOP_NODE_DUMP")) {
+                static int dump_seq = 0;
+                auto dump_one = [&](const std::shared_ptr<core::ITensor> &t,
+                                    const char *kind, size_t k) {
+                    if (!t)
+                        return;
+                    size_t elems = 1;
+                    for (int d : t->getShape())
+                        elems *= (size_t)std::max(d, 0);
+                    if (elems == 0)
+                        return;
+                    const char *bytes = nullptr;
+                    size_t nbytes = 0;
+                    const auto &dt = t->dtype();
+                    std::vector<float> fbuf;
+                    std::vector<uint16_t> hbuf;
+                    std::vector<int64_t> ibuf;
+                    if (dt == typeid(float)) {
+                        auto tg = as_tensor<float>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        fbuf = tg->data();
+                        bytes = reinterpret_cast<const char *>(fbuf.data());
+                        nbytes = fbuf.size() * sizeof(float);
+                    } else if (dt == typeid(uint16_t)) {
+                        auto tg = as_tensor<uint16_t>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        hbuf = tg->data();
+                        bytes = reinterpret_cast<const char *>(hbuf.data());
+                        nbytes = hbuf.size() * sizeof(uint16_t);
+                    } else if (dt == typeid(int64_t)) {
+                        auto tg = as_tensor<int64_t>(t);
+                        tg->copyToCPU(m_cmdpool_);
+                        ibuf = tg->data();
+                        bytes = reinterpret_cast<const char *>(ibuf.data());
+                        nbytes = ibuf.size() * sizeof(int64_t);
+                    }
+                    if (!bytes)
+                        return;
+                    char fname[256];
+                    snprintf(fname, sizeof(fname),
+                             "node_dump/%06d_lvl%zu_n%zu_%s_%s%zu.raw",
+                             dump_seq, level_idx, node_idx,
+                             node_ops_[node_idx]->get_name().c_str(), kind, k);
+                    for (char *c = fname + 10; *c; ++c) {
+                        if (*c == '/')
+                            *c = '_';
+                    }
+                    if (dump_seq == 0)
+                        system("mkdir -p node_dump");
+                    std::ofstream os(fname, std::ios::binary);
+                    if (os)
+                        os.write(bytes, (std::streamsize)nbytes);
+                    ++dump_seq;
+                };
+                for (size_t k = 0; k < node_input_tensors_[node_idx].size();
+                     ++k) {
+                    if (std::getenv("VKOP_NODE_DUMP_IN"))
+                        dump_one(node_input_tensors_[node_idx][k], "in", k);
+                }
+                for (size_t k = 0; k < node_output_tensors_[node_idx].size();
+                     ++k) {
+                    dump_one(node_output_tensors_[node_idx][k], "out", k);
+                }
+            }
             if (graph_mode) {
                 // Readback count for this level is derived from the hook
                 // (graph_readbacks), which also does the per-op-type

@@ -244,11 +244,18 @@ std::string VkModel::attrValueToString(const vkop::model::Attribute* attr) {
         case vkop::model::AttrType_Bool:
             return attr->bval() ? "1" : "0";
         case vkop::model::AttrType_Ints: {
+            // Schema stores [uint], but ops semantically need signed ints
+            // (e.g. ReduceMean axes=[-1]). The converter writes negatives as
+            // two's-complement uint32; reinterpret back. All previously
+            // emitted binaries only stored 0..2^31-1 here, so this is a
+            // no-op for them.
             const auto* v = attr->ints();
             if (!v || v->size() == 0) return "[]";
-            std::string value = "[" + std::to_string(v->Get(0));
+            std::string value =
+                "[" + std::to_string(static_cast<int32_t>(v->Get(0)));
             for (uint32_t j = 1; j < v->size(); ++j) {
-                value += ", " + std::to_string(v->Get(j));
+                value += ", " +
+                         std::to_string(static_cast<int32_t>(v->Get(j)));
             }
             return value + "]";
         }

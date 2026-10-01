@@ -206,7 +206,15 @@ class Cast : public BufferFactory {
         // mode 0 (f32->f16): each thread packs two fp32 words into one half2
         // output word. mode 1 (f16->f32): each thread unpacks one half2 input
         // word into two fp32 output words. Either way one thread per word.
-        pc.mode = (inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+        // mode 2 (same dtype both sides — an identity Cast like torch's
+        // .to(fp16) on an already-fp16 tensor): plain half2 word copy;
+        // picking 0/1 here reinterprets the buffer at the wrong element
+        // stride and writes 2x the output bytes.
+        if (inputs[0]->dtype() == outputs[0]->dtype()) {
+            pc.mode = 2;
+        } else {
+            pc.mode = (inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+        }
         pc.total = total;
         submit(&pc, UP_DIV((total + 1) / 2, 256), 1, 1);
     }

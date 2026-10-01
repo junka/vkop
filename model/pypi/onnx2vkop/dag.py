@@ -472,7 +472,10 @@ class DAGBasedModel:
                     attr_type = AttrType.Ints
                     Attribute.StartIntsVector(builder, len(value))
                     for v in reversed(value):
-                        builder.PrependUint32(int(v))
+                        # Schema is [uint]; store signed ints as two's
+                        # complement — the C++ loader (attrValueToString)
+                        # reinterprets back to int32 (e.g. axes=[-1]).
+                        builder.PrependUint32(int(v) & 0xFFFFFFFF)
                     ints_off = builder.EndVector()
                 elif isinstance(value, list) and all(isinstance(v, float) for v in value):
                     attr_type = AttrType.Floats

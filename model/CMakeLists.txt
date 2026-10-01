@@ -34,7 +34,7 @@ add_library(vload load.cpp)
 # (generated + vendored) code.
 target_include_directories(vload
     PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
-    SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/generated
+    SYSTEM PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/generated
 )
 
 if(FLATC)

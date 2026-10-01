@@ -38,11 +38,15 @@ void main() {
         vec2 v = vec2(uintBitsToFloat(uIn.data[i0]),
                       (i1 < uPC.total) ? uintBitsToFloat(uIn.data[i1]) : 0.0);
         uOut.data[gid] = packHalf2x16(v);
-    } else {
+    } else if (uPC.mode == 1) {
         // fp16 -> fp32: gid is the input half2 word index.
         vec2 v = unpackHalf2x16(uIn.data[gid]);
         uOut.data[2 * gid] = floatBitsToUint(v.x);
         if (2 * gid + 1 < uPC.total)
             uOut.data[2 * gid + 1] = floatBitsToUint(v.y);
+    } else {
+        // mode 2 (same dtype in/out, e.g. fp16->fp16 identity Cast from
+        // torch .to(dtype) on an already-fp16 tensor): raw half2 word copy.
+        uOut.data[gid] = uIn.data[gid];
     }
 }
