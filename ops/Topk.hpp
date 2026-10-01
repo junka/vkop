@@ -31,6 +31,9 @@ struct alignas(16) GpuTopkParam {
 // avoid Intel ANV descriptor-update interference.
 class Topk : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Topk(int fp16 = 0)
         : Operator(OpType::TOPK, buffer_topk_spv, buffer_topk_spv_len,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,

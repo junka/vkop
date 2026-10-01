@@ -26,6 +26,9 @@ struct GpuRangeParam {
 // SSBO-only op: generates a 1-D sequence [start, start+delta, ...].
 class Range : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Range()
         : Operator(OpType::RANGE, buffer_range_spv, buffer_range_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,

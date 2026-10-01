@@ -354,6 +354,94 @@ public:
         LOG_INFO("Test Passed for operator: %s, type %s", name_.c_str(), typeid(T).name());
         return true;
     }
+
+    // Does this op really have the requested backend? A façade whose buffer
+    // port is missing falls back to the image impl silently, so the flag the
+    // caller passed says nothing — construct the op and ask it.
+    bool has_backend(bool want_buffer) const {
+        // Buffer-only façades throw when asked for the image impl; a throw
+        // means that backend does not exist for this op.
+        try {
+            auto probe = ops::create_from_type(
+                vkop::ops::convert_opstring_to_enum(name_),
+                typeid(T) == typeid(uint16_t) ? 1 : 0, 0, want_buffer);
+            return probe && probe->uses_buffer_backend() == want_buffer;
+        } catch (const std::exception &) {
+            return false;
+        }
+    }
+
+    // The image path binds >2-D data as image2DArray NCHW->RGBA, so it can
+    // only carry 3-D/4-D tensors; anything else (scalar meta chains, 5-D KV
+    // slices) is buffer-only by construction.
+    bool image_input_representable(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs) const {
+        for (const auto &input : inputs) {
+            if (!input) {
+                continue;
+            }
+            if (input->num_dims() < 3 || input->num_dims() > 4) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // One backend row's freshly built case. Tensors bind exactly one GPU
+    // storage form on first upload (image2DArray *or* SSBO — a Tensor never
+    // switches afterwards, and reusing it for the other backend throws
+    // "Expected VulkanImage but got something else"), so every row has to
+    // construct its own tensors; `attrs` must therefore capture the attribute
+    // map by value, not the test object that built it.
+    struct DualCase {
+        std::vector<std::shared_ptr<core::ITensor>> inputs;
+        std::vector<std::shared_ptr<core::ITensor>> expects;
+        std::function<void(std::unique_ptr<ops::Operator> &)> attrs;
+    };
+
+    // Runs the same case on both backends and returns the AND of the rows that
+    // actually executed; a backend the op cannot serve is logged and skipped
+    // rather than silently re-running the other one. VKOP_BUFFER_BACKEND is
+    // read fresh on every run_test call, so toggling it here is enough.
+    bool run_test_on_both_backends(const std::function<DualCase()> &make_case) {
+        const char *prev = std::getenv("VKOP_BUFFER_BACKEND");
+        const std::string prev_val = prev ? prev : "";
+        const bool had = prev != nullptr;
+
+        bool all_ok = true;
+        int ran = 0;
+        for (const bool want_buffer : {false, true}) {
+            const char *tag = want_buffer ? "buffer" : "image";
+            if (!has_backend(want_buffer)) {
+                LOG_INFO("[both-backends] %s (%s): skipped, op has no %s impl",
+                         name_.c_str(), typeid(T).name(), tag);
+                continue;
+            }
+            auto dc = make_case();
+            if (!want_buffer && !image_input_representable(dc.inputs)) {
+                LOG_INFO("[both-backends] %s (%s): skipped image row, inputs "
+                         "outside the 3-D/4-D image layout",
+                         name_.c_str(), typeid(T).name());
+                continue;
+            }
+            if (want_buffer) setenv("VKOP_BUFFER_BACKEND", "1", 1);
+            else unsetenv("VKOP_BUFFER_BACKEND");
+            const bool ok = run_test(dc.inputs, dc.expects, dc.attrs);
+            LOG_INFO("[both-backends] %s (%s) on %s: %s", name_.c_str(),
+                     typeid(T).name(), tag, ok ? "PASS" : "FAIL");
+            all_ok = all_ok && ok;
+            ++ran;
+        }
+
+        if (had) setenv("VKOP_BUFFER_BACKEND", prev_val.c_str(), 1);
+        else unsetenv("VKOP_BUFFER_BACKEND");
+        if (ran == 0) {
+            LOG_ERROR("[both-backends] %s: no backend could serve this case",
+                      name_.c_str());
+            return false;
+        }
+        return all_ok;
+    }
 };
 
 } // namespace tests

@@ -57,7 +57,7 @@ public:
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<T>> output;
 
-    TransposeTest(std::vector<int>& input_shape, std::vector<int> & permute):TestCase<T>("Transpose"), input_shape_(input_shape), perm_(permute) {
+    TransposeTest(const std::vector<int>& input_shape, const std::vector<int> & permute):TestCase<T>("Transpose"), input_shape_(input_shape), perm_(permute) {
         if (!perm_.empty() && perm_.size() > 0) {
             std::string str = "[";
             for (int i = 0; i < static_cast<int>(perm_.size()); ++i) {
@@ -126,14 +126,25 @@ TEST(TransposeTest, TransposeComprehensiveTest) {
 
         LOG_INFO("Transpose FP32");
         TransposeTest<float> trans_test(input_shape, perm);
-        EXPECT_TRUE(trans_test.run_test({trans_test.input}, {trans_test.output}, [&trans_test](std::unique_ptr<vkop::ops::Operator> &op) {
-            auto *tran_op = dynamic_cast<Transpose *>(op.get());
-            if (!tran_op) {
-                LOG_ERROR("Failed to cast operator to Transpose");
-                return;
-            }
-            tran_op->setAttribute(trans_test.attributes);
-        }));
+        std::vector<int> shape_copy = input_shape;
+        std::vector<int> perm_copy = perm;
+        auto make_case = [shape_copy, perm_copy]() -> TransposeTest<float>::DualCase {
+            TransposeTest<float> t(shape_copy, perm_copy);
+            TransposeTest<float>::DualCase dc;
+            dc.inputs = {t.input};
+            dc.expects = {t.output};
+            auto attrs = t.attributes;
+            dc.attrs = [attrs](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *tran_op = dynamic_cast<Transpose *>(op.get());
+                if (!tran_op) {
+                    LOG_ERROR("Failed to cast operator to Transpose");
+                    return;
+                }
+                tran_op->setAttribute(attrs);
+            };
+            return dc;
+        };
+        EXPECT_TRUE(trans_test.run_test_on_both_backends(make_case));
 
         LOG_INFO("Transpose FP16");
         TransposeTest<uint16_t> trans_test1(input_shape, perm);

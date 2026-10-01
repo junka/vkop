@@ -24,6 +24,9 @@ namespace ops {
 
 class Shape : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Shape() : Operator(OpType::SHAPE, nullptr, 0, {}) {}
 
   private:

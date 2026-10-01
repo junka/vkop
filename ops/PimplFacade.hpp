@@ -49,6 +49,9 @@ class PimplFacade : public Operator {
         return impl_->get_record();
     }
     OpType get_type() override { return impl_->get_type(); }
+    bool uses_buffer_backend() const override {
+        return impl_->uses_buffer_backend();
+    }
     void set_name(const std::string &name) override { impl_->set_name(name); }
     std::string get_name() const override { return impl_->get_name(); }
     void enable_trace() override { impl_->enable_trace(); }

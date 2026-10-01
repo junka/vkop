@@ -80,6 +80,7 @@ set(TEST_SOURCES
     WhereTest.cpp
     SqueezeUnsqueezeTest.cpp
     RobustnessTest.cpp
+    BackendCoverageTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.

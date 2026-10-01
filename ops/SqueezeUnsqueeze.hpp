@@ -32,6 +32,9 @@ namespace ops {
 // axes is not valid ONNX (guard: treat as no-op).
 class SqueezeUnsqueeze : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit SqueezeUnsqueeze(bool unsqueeze)
         : Operator(unsqueeze ? OpType::UNSQUEEZE : OpType::SQUEEZE, nullptr, 0,
                    {}),

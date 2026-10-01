@@ -73,6 +73,9 @@ read_target_shape(const std::shared_ptr<core::ITensor> &t,
 // SSBO-only op: broadcasts input to the given output shape.
 class Expand : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Expand(int fp16 = 0)
         : Operator(OpType::EXPAND,
                    fp16 ? buffer_expand_fp16_spv : buffer_expand_spv,

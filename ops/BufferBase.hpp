@@ -212,6 +212,8 @@ class BufferFactory : public Operator {
   protected:
     using Operator::Operator;
 
+    bool uses_buffer_backend() const override { return true; }
+
     // Bind one tensor as an SSBO (read or write) and append to objs_.
     template <typename T>
     std::shared_ptr<VulkanBuffer>

@@ -149,6 +149,12 @@ class Operator {
 
     virtual OpType get_type() { return type_; }
 
+    // Which backend this instance actually implements. The PIMPL façades pick
+    // image/buffer at construction and a request for a missing backend falls
+    // back silently to the other one, so callers (tests) cannot infer it from
+    // the flag they passed — they have to ask the constructed op.
+    virtual bool uses_buffer_backend() const { return false; }
+
     // Record-once-replay control (cuda-graph-style). The Runtime enables this
     // for the LLM decode loop; see onExecute for the state machine. An op is
     // FRESH until its first onExecute stores a fingerprint and flips it to

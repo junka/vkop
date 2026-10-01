@@ -41,6 +41,9 @@ static_assert(sizeof(gather::GpuGatherParam) <= 128,
 // (float16_t elements) via DUAL_FP16_SHADERS.
 class Gather : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Gather(int fp16 = 0)
         : Operator(OpType::GATHER,
                    fp16 ? buffer_gather_fp16_spv : buffer_gather_spv,

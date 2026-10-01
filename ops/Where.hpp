@@ -48,6 +48,9 @@ static_assert(offsetof(WhereInt64PC, outDims) == 16,
 // boolean condition buffer.
 class Where : public Operator {
   public:
+    // Single-impl op: always the SSBO path (no image twin).
+    bool uses_buffer_backend() const override { return true; }
+
     explicit Where()
         : Operator(OpType::WHERE, buffer_where_spv, buffer_where_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
