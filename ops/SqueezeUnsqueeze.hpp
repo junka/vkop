@@ -11,6 +11,14 @@
 namespace vkop {
 namespace ops {
 
+// "[1,2]" for the Unsqueeze axis-range error below.
+inline std::string axes_str(const std::vector<int> &axes) {
+    std::string s = "[";
+    for (size_t i = 0; i < axes.size(); ++i)
+        s += std::to_string(axes[i]) + (i + 1 == axes.size() ? "" : ",");
+    return s + "]";
+}
+
 // CPU-only view ops: ONNX Squeeze / Unsqueeze. Both are pure shape-metadata
 // changes — the element bytes are unchanged, only the logical shape (and thus
 // rank) differs. Implemented on the host: pull the input, recompute the
@@ -118,8 +126,22 @@ class SqueezeUnsqueeze : public Operator {
             int nd = rank;
             int out_rank = nd + static_cast<int>(axes.size());
             std::set<int> norm;
-            for (int a : axes)
+            for (int a : axes) {
+                // An axis outside [-out_rank, out_rank) means the graph is
+                // invalid — in practice the input's rank was lost, because the
+                // .vkopbin recorded no shape for this node's input (a shape
+                // chain built on an ONNX graph with no value_info). Fail here
+                // instead of reading past the end of inshape below.
+                if (a < -out_rank || a >= out_rank) {
+                    throw std::runtime_error(
+                        "Unsqueeze " + get_name() + ": axis " +
+                        std::to_string(a) + " out of range for input rank " +
+                        std::to_string(rank) + " (axes=" + axes_str(axes) +
+                        "); shape chain lost its ranks, re-run ONNX shape "
+                        "inference before converting");
+                }
                 norm.insert(a < 0 ? a + out_rank : a);
+            }
             out_shape.reserve(out_rank);
             int ai = 0;
             for (int i = 0; i < out_rank; ++i) {

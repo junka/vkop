@@ -8,6 +8,7 @@ converted binary is caught without running the GPU.
     /Users/doudou/qi21-env/bin/python probe_vkopbin_weights.py dit_prefill_tiny_si.vkopbin ...
 """
 
+import mmap
 import struct
 import sys
 from pathlib import Path
@@ -17,6 +18,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 
 # Model table field ids (declaration order in vkop_model.fbs)
+F_INPUTS, F_OUTPUTS = 2, 3
 F_NODES, F_INITIALZERS, F_BLOB = 4, 5, 6
 # Node field ids
 N_OPTYPE, N_NAME, N_INPUTS, N_OUTPUTS, N_DEPS = 0, 1, 3, 4, 5
@@ -124,7 +126,17 @@ def read_vec_strs(b, pos):
 
 def dump_nodes(vkopbin, pattern):
     path = Path(vkopbin) if Path(vkopbin).is_absolute() else HERE / vkopbin
-    b = path.read_bytes()
+    # mmap, not read_bytes: the 7.12B graphs are 13 GB and only the header is
+    # touched here.
+    with open(path, "rb") as fh:
+        b = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            _dump_nodes(b, vkopbin, pattern)
+        finally:
+            b.close()
+
+
+def _dump_nodes(b, vkopbin, pattern):
     root = u32(b, 0)
     npos = field_pos(b, root, F_NODES)
     p = npos + u32(b, npos)
@@ -172,8 +184,43 @@ def dump_nodes(vkopbin, pattern):
         print(f"      deps {deps}")
 
 
+def dump_shapes(vkopbin):
+    """Print the graph inputs/outputs baked into a .vkopbin (mmap: no 13GB read)."""
+    path = Path(vkopbin) if Path(vkopbin).is_absolute() else HERE / vkopbin
+    # The fd must stay open for the mmap's lifetime: closing it first makes the
+    # mapping read garbage.
+    with open(path, "rb") as fh:
+        b = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            root = u32(b, 0)
+            for field, label in ((F_INPUTS, "in "), (F_OUTPUTS, "out")):
+                pos = field_pos(b, root, field)
+                if pos is None:
+                    print(f"[{vkopbin}] no {label.strip()}put list")
+                    continue
+                p = pos + u32(b, pos)
+                n = u32(b, p)
+                print(f"[{vkopbin}] {label} {n} tensors")
+                limit = min(n, 6) if label == "out" else n
+                for i in range(limit):
+                    sp = p + 4 + i * 4
+                    sp = sp + u32(b, sp)
+                    nf = field_pos(b, sp, S_NAME)
+                    df = field_pos(b, sp, S_DIMS)
+                    dims = read_intvec(b, df) if df else []
+                    print(f"    {read_string(b, nf)[:36]:36s} {dims}")
+                if n > limit:
+                    print(f"    ... {n - limit} more")
+        finally:
+            b.close()
+
+
 if __name__ == "__main__":
     args = sys.argv[1:]
+    if args and args[0] == "--shapes":
+        for arg in args[1:]:
+            dump_shapes(arg)
+        sys.exit(0)
     if args and args[0] == "--nodes":
         dump_nodes(args[1], args[2] if len(args) > 2 else "")
         sys.exit(0)

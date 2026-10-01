@@ -251,17 +251,19 @@ int main(int argc, char** argv) {
     prefill_rt->set_backend_buffer(true);
     prefill_rt->LoadModel();
     printf("[load] Prefill loaded\n");
-    
-    printf("[load] Loading DiT decode graph...\n");
-    auto decode_rt = std::make_shared<Runtime>(cmdpool, decode_path, /*precision=*/1);
-    decode_rt->set_backend_buffer(true);
-    try {
-        decode_rt->LoadModel();
-        printf("[load] Decode loaded\n");
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[error] Failed to load decode model: %s\n", e.what());
-        return 1;
-    }
+
+    // Header-only shape probe: the flatbuffer is mmap'd, so reading input dims
+    // costs nothing and lets the decode graph stay unloaded until the prefill is
+    // done. Each 7.12B graph is ~13 GB of device weights; both at once plus
+    // activations do not fit in 36 GB.
+    auto header_dims = [](const char* path, bool input,
+                          const std::string& name) -> std::vector<int32_t> {
+        vkop::load::VkModel m(path);
+        const auto& list = input ? m.inputs : m.outputs;
+        for (const auto& s : list)
+            if (s.name == name) return s.dims;
+        return {};
+    };
 
     // [probe] report-only: checksum the initializers embedded in each vkopbin
     // so silently-zeroed weights are caught before any GPU run.
@@ -318,15 +320,12 @@ int main(int argc, char** argv) {
         }
     }
     
-    // Detect latent channel dimension from decode model's target_latents input
+    // Detect latent channel dimension from the decode model's header
     int target_len = latent_h * latent_w;
-    auto target_latents_check = decode_rt->GetInput("target_latents");
-    if (target_latents_check) {
-        auto check_shape = target_latents_check->getShape();
-        if (check_shape.size() >= 3 && check_shape[2] > 0) {
-            latent_c = check_shape[2]; // Last dim is C in BLC format
-            printf("[model] Detected latent_c=%d from decode model\n", latent_c);
-        }
+    auto target_latents_dims = header_dims(decode_path, true, "target_latents");
+    if (target_latents_dims.size() >= 3 && target_latents_dims[2] > 0) {
+        latent_c = target_latents_dims[2]; // Last dim is C in BLC format
+        printf("[model] Detected latent_c=%d from decode model\n", latent_c);
     }
     
     int latent_n = 1 * latent_c * target_len;
@@ -546,7 +545,22 @@ int main(int argc, char** argv) {
     }
     
     printf("[kv] Cached %d KV layers (prefix_len=%d)\n", num_kv_layers, prefix_len);
-    
+
+    // Sequential loading (same strategy as the ORT baseline): the prefill graph
+    // is released before the decode graph takes its weights, so a 7.12B model
+    // needs one graph's worth of device memory at a time.
+    prefill_rt.reset();
+    printf("[load] Loading DiT decode graph...\n");
+    auto decode_rt = std::make_shared<Runtime>(cmdpool, decode_path, /*precision=*/1);
+    decode_rt->set_backend_buffer(true);
+    try {
+        decode_rt->LoadModel();
+        printf("[load] Decode loaded\n");
+    } catch (const std::exception& e) {
+        fprintf(stderr, "[error] Failed to load decode model: %s\n", e.what());
+        return 1;
+    }
+
     printf("[gen] Starting denoising loop (%d steps)...\n", steps);
     auto t_start = std::chrono::high_resolution_clock::now();
     

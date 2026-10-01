@@ -1974,6 +1974,13 @@ double Runtime::Run() {
             node_ops_[node_idx]->set_input_value_dynamic(
                 node_input_value_dynamic_[node_idx]);
             graph_op_idx = graph_mode ? static_cast<int>(node_idx) : -1;
+            // [probe] name the node on stderr (unbuffered) before executing it:
+            // with VKOP_SHAPE_TRACE the post-execute trace is block-buffered,
+            // so a crash inside onExecute loses it and the offending node stays
+            // anonymous. This line survives and names exactly that node.
+            if (std::getenv("VKOP_SHAPE_TRACE"))
+                fprintf(stderr, "[exec] lvl=%zu node=%zu %s\n", level_idx,
+                        node_idx, node_ops_[node_idx]->get_name().c_str());
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
             graph_op_idx = -1;

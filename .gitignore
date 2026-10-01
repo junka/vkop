@@ -78,6 +78,8 @@ llm/tokenizer/*.bin
 # Image-gen artifacts (ORT reference tensors, dumped latents, profiling logs)
 # — never commit; regenerate via image/exporter/gen_dit_ref.py / image_gen
 image/exporter/ref/
+image/exporter/ref_full/
+image/exporter/ref_out/
 image/exporter/vae_latent.raw
 image/exporter/vae_ref_decoded.raw
 image/exporter/vae_vkop_decoded.raw

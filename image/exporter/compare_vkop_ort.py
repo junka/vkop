@@ -44,13 +44,16 @@ def report(tag, a, b):
 
 
 def main():
-    global OUT
+    global OUT, REF
     ap = argparse.ArgumentParser()
     ap.add_argument("--steps", type=int, default=5)
     ap.add_argument("--out", default=None, help="vkop ref_out dir (cwd of image_gen run)")
+    ap.add_argument("--refdir", default=None, help="ORT reference dir, e.g. ref_full")
     args = ap.parse_args()
     if args.out:
         OUT = Path(args.out)
+    if args.refdir:
+        REF = HERE / args.refdir
 
     if not OUT.exists():
         raise SystemExit(f"{OUT} missing — run image_gen with --ref first")

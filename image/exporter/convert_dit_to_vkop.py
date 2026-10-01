@@ -4,7 +4,11 @@ Large models (>13 GB external data) cannot pass through onnxoptimizer or
 ConstantFolder because they try to serialize the full proto. This script
 patches the optimizer to be a no-op and directly converts the DAG structure.
 
-    /Users/doudou/qi21-env/bin/python convert_dit_to_vkop.py [prefill|decode]
+    /Users/doudou/qi21-env/bin/python convert_dit_to_vkop.py [prefill|decode] [_si]
+
+The optional second argument is an input/output filename suffix, so the
+shape-inferred graphs (dit_decode_si.onnx, see shape_infer_dit.py) convert to
+dit_decode_si.vkopbin without touching the un-inferred pair.
 """
 
 import sys
@@ -18,8 +22,8 @@ import onnx
 from onnx2vkop.converter import ModelConverter
 
 
-def main(mode):
-    path = Path(__file__).resolve().parent / f"dit_{mode}.onnx"
+def main(mode, suffix=""):
+    path = Path(__file__).resolve().parent / f"dit_{mode}{suffix}.onnx"
     print(f"[{mode}] loading {path.name}...")
 
     # Patch the optimizer to be a no-op for large models
@@ -55,7 +59,7 @@ def main(mode):
         print(f"{idx:<5} {op_type:<25} {count:<10}")
     
     # Try to save (will likely fail due to protobuf limits, but we get the stats)
-    out_path = Path(__file__).resolve().parent / f"dit_{mode}.vkopbin"
+    out_path = Path(__file__).resolve().parent / f"dit_{mode}{suffix}.vkopbin"
     try:
         print(f"\n[{mode}] Attempting to save to {out_path.name}...")
         dag_model.save_to_binary(str(out_path))
@@ -67,4 +71,4 @@ def main(mode):
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "prefill"
-    main(mode)
+    main(mode, sys.argv[2] if len(sys.argv) > 2 else "")

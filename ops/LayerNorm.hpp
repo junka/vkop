@@ -59,6 +59,15 @@ class LayerNormImage : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto input_shape = inputs[0]->getShape();
+        // Unknown rank (empty shape from the converter): fall back to the
+        // output tensor's live shape, which the producer already set correctly.
+        // This avoids OOB reads on input_shape[0..3] below.
+        if (input_shape.empty()) {
+            dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+                using T = decltype(t);
+                input_shape = core::as_tensor<T>(outputs[0])->getShape();
+            });
+        }
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputptr = core::as_tensor<T>(outputs[0]);

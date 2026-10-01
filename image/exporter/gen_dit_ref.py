@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Generate ORT reference inputs/outputs for the tiny DiT vkop alignment check.
+"""Generate ORT reference inputs/outputs for a DiT vkop alignment check.
 
 Everything the C++ driver needs is written to ref/ as raw little-endian files
 (dtype given in ref/manifest.txt). The same files feed ORT here, so both
 runtimes see bit-identical inputs and their velocities are directly comparable.
+Model widths (ctx_dim, latent_c) are read from the ONNX graph, so the same
+script serves the tiny and the 7.12B model.
 
     /Users/doudou/qi21-env/bin/python gen_dit_ref.py --steps 1
+    /Users/doudou/qi21-env/bin/python gen_dit_ref.py --suffix "" --steps 1 --refdir ref_full
 """
 
 import argparse
@@ -13,6 +16,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import onnx
 import onnxruntime as ort
 
 HERE = Path(__file__).resolve().parent
@@ -27,6 +31,15 @@ def save(name, arr):
         f.write(f"{name} {dims} {arr.dtype.itemsize}\n")
     print(f"[ref] {name}: {arr.shape} {arr.dtype} -> {(REF/name).stat().st_size} B")
     return arr
+
+
+def last_dim(onnx_path, input_name):
+    """Trailing (feature) dim of a graph input, read from the proto only."""
+    m = onnx.load(str(onnx_path), load_external_data=False)
+    for i in m.graph.input:
+        if i.name == input_name:
+            return i.type.tensor_type.shape.dim[-1].dim_value
+    raise KeyError(f"{input_name} not an input of {onnx_path}")
 
 
 def main():
@@ -47,11 +60,12 @@ def main():
     assert target_len == args.target_len
 
     prefix_len = args.prefix_len
-    ctx_dim = 96          # tiny model
-    latent_c = 16         # tiny model
-    kv_heads = 2          # tiny model
-    kv_inner = 2          # tiny model (2 heads x 128)
+    prefill_path = HERE / f"dit_prefill{args.suffix}.onnx"
+    decode_path = HERE / f"dit_decode{args.suffix}.onnx"
+    ctx_dim = last_dim(prefill_path, "prompt_embeds")
+    latent_c = last_dim(decode_path, "target_latents")
     hd = 128
+    print(f"[model] ctx_dim={ctx_dim} latent_c={latent_c} (from {args.suffix or 'full'})")
 
     REF.mkdir(exist_ok=True)
     (REF / "shapes.txt").write_text("")
@@ -85,7 +99,7 @@ def main():
 
     # ---- ORT prefill ----
     prefill_sess = ort.InferenceSession(
-        str(HERE / f"dit_prefill{args.suffix}.onnx"), providers=["CPUExecutionProvider"])
+        str(prefill_path), providers=["CPUExecutionProvider"])
     kv_names = [o.name for o in prefill_sess.get_outputs()]
     outs = prefill_sess.run(None, {
         "prompt_embeds": prompt_embeds,
@@ -102,7 +116,7 @@ def main():
 
     # ---- ORT decode, steps worth ----
     decode_sess = ort.InferenceSession(
-        str(HERE / f"dit_decode{args.suffix}.onnx"), providers=["CPUExecutionProvider"])
+        str(decode_path), providers=["CPUExecutionProvider"])
     timesteps = np.linspace(1.0, 0.0, args.steps, endpoint=False)
     latent = latent_init_fp16.copy()
     for step in range(args.steps):
