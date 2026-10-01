@@ -1246,4 +1246,72 @@ TEST(BufferRankTest, FusedElemwiseBroadcastInput0LowRank) {
     EXPECT_TRUE(brt_fused_addsqrtmul_input0_lowrank_case<uint16_t>(8, 7, true));
 }
 
+// =========================================================================
+// Resize (buffer port: nearest + asymmetric/floor only)
+// =========================================================================
+
+// out coord c reads in coord floor(c * in_dim / out_dim) per axis — the same
+// integer math resize.comp does. Applied per axis so dims that don't change
+// are skipped, as the shader does.
+torch::Tensor brt_ref_resize_nearest(const torch::Tensor &data,
+                                     const std::vector<int> &out_shape) {
+    torch::Tensor cur = data;
+    for (size_t axis = 0; axis < out_shape.size(); ++axis) {
+        int n_in = static_cast<int>(cur.size(axis));
+        int n_out = out_shape[axis];
+        if (n_in == n_out)
+            continue;
+        std::vector<int64_t> idx(static_cast<size_t>(n_out));
+        for (int i = 0; i < n_out; ++i)
+            idx[i] = static_cast<int64_t>((static_cast<int64_t>(i) * n_in) /
+                                          n_out);
+        cur = cur.index_select(static_cast<int64_t>(axis),
+                               torch::tensor(idx));
+    }
+    return cur;
+}
+
+template <typename T>
+bool brt_resize_case(const std::vector<int> &in_shape,
+                     const std::vector<int> &out_shape, bool fp16) {
+    Dev d;
+    std::vector<int64_t> shp(in_shape.begin(), in_shape.end());
+    auto torch_in = torch::randn(shp, brt_torch_opt<T>());
+    auto torch_out = brt_ref_resize_nearest(torch_in, out_shape);
+
+    auto input = std::make_shared<Tensor<T>>(in_shape);
+    brt_fill(input, torch_in);
+    brt_upload(input, d);
+
+    auto output = brt_make_out<T>(out_shape, d);
+    std::string sizes = "[";
+    for (size_t i = 0; i < out_shape.size(); ++i) {
+        sizes += std::to_string(out_shape[i]) + (i + 1 < out_shape.size() ? "," : "");
+    }
+    sizes += "]";
+    auto op = brt_make_op(vkop::ops::OpType::RESIZE, fp16,
+                          {{"mode", "nearest"},
+                           {"coordinate_transformation_mode", "asymmetric"},
+                           {"nearest_mode", "floor"},
+                           {"sizes", sizes}},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute({input}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+TEST(BufferRankTest, ResizeNearestUpAndDown) {
+    // upsample both spatial axes, plus a rank-5 case with identity dims.
+    EXPECT_TRUE(brt_resize_case<float>({1, 3, 4, 5}, {1, 3, 8, 10}, false));
+    EXPECT_TRUE(brt_resize_case<uint16_t>({1, 3, 4, 5}, {1, 3, 8, 10}, true));
+    EXPECT_TRUE(brt_resize_case<float>({1, 2, 3, 4, 5}, {1, 2, 6, 4, 10},
+                                       false));
+    // downsample, and an odd output count for the fp16 tail word.
+    EXPECT_TRUE(brt_resize_case<float>({1, 3, 8, 10}, {1, 3, 4, 5}, false));
+    EXPECT_TRUE(brt_resize_case<uint16_t>({1, 3, 4, 5}, {1, 3, 7, 5}, true));
+}
+
 } // namespace

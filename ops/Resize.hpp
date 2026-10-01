@@ -3,6 +3,7 @@
 #define OPS_RESIZE_HPP_
 
 #include "core/Tensor.hpp"
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
 
@@ -12,6 +13,10 @@
 extern "C" {
 extern unsigned char image_resize_spv[];
 extern unsigned int image_resize_spv_len;
+extern unsigned char buffer_resize_spv[];
+extern unsigned int buffer_resize_spv_len;
+extern unsigned char buffer_resize_fp16_spv[];
+extern unsigned int buffer_resize_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -328,13 +333,151 @@ class ResizeImage : public Operator {
     std::vector<float> scales_;
     std::vector<float> roi_;
 };
+// Buffer (SSBO) Resize. Nearest-neighbour with asymmetric/floor coordinate
+// mapping: out element (n,c,y,x...) reads in coord floor(out*i*in_dim/out_dim)
+// per axis, so the whole op is an indexed copy — the index math is exact in
+// integer arithmetic (no scale floats in the push constant).
+struct ResizeBufferPC {
+    int rank;
+    int fp16;
+    int inDims[8];
+    int outDims[8];
+    int _pad0;
+    int _pad1;
+};
+
+class ResizeBuffer : public BufferFactory {
+  public:
+    explicit ResizeBuffer(int fp16)
+        : BufferFactory(
+              OpType::RESIZE, fp16 ? buffer_resize_fp16_spv : buffer_resize_spv,
+              fp16 ? buffer_resize_fp16_spv_len : buffer_resize_spv_len,
+              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+              sizeof(ResizeBufferPC), fp16) {}
+
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        auto get = [&](const char *key) -> const std::string * {
+            auto it = attributes.find(key);
+            return it == attributes.end() ? nullptr : &it->second;
+        };
+        if (const auto *s = get("mode")) {
+            if (*s == "nearest") {
+                mode_ = 0;
+            } else if (*s == "linear" || *s == "bilinear") {
+                mode_ = 1;
+            } else {
+                mode_ = 2;
+            }
+        }
+        if (const auto *s = get("coordinate_transformation_mode")) {
+            coordinate_transformation_mode_ =
+                (*s == "asymmetric")
+                    ? static_cast<int>(
+                          resize::CoordinateTransformationMode::ASYMMETRIC)
+                    : -1;
+        }
+        if (const auto *s = get("axes"); s && !s->empty()) {
+            axes_ = parse_attr_list<int>(*s);
+        }
+        if (const auto *s = get("scales"); s && !s->empty()) {
+            scales_ = parse_attr_list<float>(*s);
+        }
+        if (const auto *s = get("sizes"); s && !s->empty()) {
+            sizes_ = parse_attr_list<int>(*s);
+        }
+    }
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (mode_ != 0 ||
+            coordinate_transformation_mode_ !=
+                static_cast<int>(
+                    resize::CoordinateTransformationMode::ASYMMETRIC)) {
+            throw std::runtime_error(
+                "Resize (buffer backend) supports only mode=nearest with "
+                "coordinate_transformation_mode=asymmetric");
+        }
+
+        auto inshape = inputs[0]->getShape();
+        int rank = static_cast<int>(inshape.size());
+
+        // The converter folds the ONNX scales/sizes inputs into attributes;
+        // either way the output dims come from the host (the shader does not
+        // read shape buffers). scales are per-axis and may cover only the
+        // resized axes (the converter emits `axes` in that case).
+        std::vector<int> outshape = inshape;
+        if (!sizes_.empty()) {
+            int off = rank - static_cast<int>(sizes_.size());
+            for (int i = 0; i < static_cast<int>(sizes_.size()); ++i) {
+                int d = sizes_[i];
+                outshape[off + i] = (d > 0) ? d : inshape[off + i];
+            }
+        } else if (!scales_.empty()) {
+            int off = rank - static_cast<int>(scales_.size());
+            if (!axes_.empty() && static_cast<int>(axes_.size()) ==
+                                      static_cast<int>(scales_.size())) {
+                for (size_t i = 0; i < axes_.size(); ++i) {
+                    int a = axes_[i] < 0 ? axes_[i] + rank : axes_[i];
+                    outshape[a] = static_cast<int>(inshape[a] * scales_[i]);
+                }
+            } else {
+                for (int i = 0; i < static_cast<int>(scales_.size()); ++i) {
+                    outshape[off + i] =
+                        static_cast<int>(inshape[off + i] * scales_[i]);
+                }
+            }
+        } else {
+            auto recorded = outputs[0]->getShape();
+            if (recorded.size() != static_cast<size_t>(rank)) {
+                throw std::runtime_error(
+                    "Resize (buffer backend): no scales/sizes attribute and "
+                    "no recorded output shape");
+            }
+            outshape = recorded;
+        }
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->num_elements() != total_elems(outshape)) {
+                output->resize(outshape);
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        ResizeBufferPC pc{};
+        pc.rank = rank;
+        pc.fp16 = (fp16_ != 0) ? 1 : 0;
+        fill_dims(pc.inDims, inshape);
+        fill_dims(pc.outDims, outshape);
+        // fp16 packs two elements per uint word; dispatch one thread per word
+        // (the fp16 shader writes each word once — no RMW race).
+        int total = total_elems(outshape);
+        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+    }
+
+    int mode_ = 0;
+    int coordinate_transformation_mode_ = 4; // ASYMMETRIC
+    std::vector<int> axes_;
+    std::vector<float> scales_;
+    std::vector<int> sizes_;
+};
+
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Resize : public PimplFacade {
   public:
-    Resize(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::RESIZE) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
-        impl_ = std::make_unique<ResizeImage>();
+    Resize(int fp16, bool backend_buffer) : PimplFacade(OpType::RESIZE) {
+        impl_ = backend_buffer ? std::unique_ptr<Operator>(
+                                     std::make_unique<ResizeBuffer>(fp16))
+                               : std::make_unique<ResizeImage>();
     }
 };
 

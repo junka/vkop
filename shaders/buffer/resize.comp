@@ -1,0 +1,69 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// Resize (SSBO) — nearest neighbour only, coordinate_transformation_mode
+// =asymmetric / nearest_mode=floor, which is exactly integer floor division:
+// in_coord = floor(out_coord * in_dim / out_dim). Handles arbitrary rank
+// (<=8) and both up- and down-sampling; a dim whose in/out sizes match is an
+// identity copy (no division).
+//
+// fp16 packs two halfs per uint word, so (like expand.comp) each thread owns a
+// whole output word and writes it once — a plain read-modify-write per element
+// would race whenever two output elements land in the same word.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) buffer outputBuffer {
+    uint data[];
+} uOutput;
+
+layout(set = 0, binding = 1) readonly buffer inputBuffer {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform paraBuffer {
+    int rank;
+    int fp16;
+    IArr8 inDims;
+    IArr8 outDims;
+    int _pad0;
+    int _pad1;
+} uParam;
+
+int resize_elem(int gid) {
+    IArr8 out_coord = linear_to_nd8(gid, uParam.outDims, uParam.rank);
+    IArr8 in_coord;
+    for (int i = 0; i < uParam.rank; ++i) {
+        int od = uParam.outDims.v[i];
+        int id = uParam.inDims.v[i];
+        in_coord.v[i] = (id == od) ? out_coord.v[i]
+                                   : (out_coord.v[i] * id) / od;
+    }
+    return nd_to_linear8(in_coord, uParam.inDims, uParam.rank);
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+
+    int out_total = 1;
+    for (int i = 0; i < uParam.rank; ++i) out_total *= uParam.outDims.v[i];
+
+#ifdef FP16
+    int nwords = (out_total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = 2 * gid + 1;
+    float v0 = BUF_LOAD(uInput.data, resize_elem(e0));
+    if (e1 >= out_total) {
+        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+    } else {
+        float v1 = BUF_LOAD(uInput.data, resize_elem(e1));
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    }
+#else
+    if (gid >= out_total) return;
+    BUF_STORE(uOutput.data, gid, BUF_LOAD(uInput.data, resize_elem(gid)));
+#endif
+}

@@ -312,6 +312,7 @@ set(DUAL_FP16_SHADERS
     buffer/prelu
     buffer/reshape
     buffer/expand
+    buffer/resize
     buffer/transpose
     buffer/concat
     buffer/split
@@ -553,4 +554,6 @@ if (ENABLE_IMAGE_GEN)
     target_link_libraries(image_gen PRIVATE vkop vload)
     target_include_directories(image_gen PRIVATE
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)  # For potential tokenizer reuse
+    add_executable(vae_gen image/exporter/vae_gen.cpp)
+    target_link_libraries(vae_gen PRIVATE vkop vload)
 endif()
