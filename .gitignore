@@ -75,5 +75,16 @@ llm/exporter/synth224.png
 llm/exporter/p.py
 llm/tokenizer/*.bin
 
+# Image-gen artifacts (ORT reference tensors, dumped latents, profiling logs)
+# — never commit; regenerate via image/exporter/gen_dit_ref.py / image_gen
+image/exporter/ref/
+image/exporter/ref_static/
+image/exporter/torch_reference.npz
+image/exporter/output_*.npy
+image/exporter/reference/*.npz
+/latent_out_*.raw
+/image/exporter/latent_out_*.raw
+/log
+
 # ASan build directory
 /build-asan/
