@@ -271,6 +271,18 @@ class FusedElemwise : public BufferFactory {
             int total = total_elems(out_shp);
             if (output->num_elements() != total) {
                 output->resize(out_shp);
+            } else {
+                // Same element count, possibly different RANK: the output may
+                // be a recycled tensor still carrying its previous owner's
+                // dims ([1,1152,32,32] and [1,1152,1,32,32] have the same
+                // element count). resize() is skipped by the count check, and
+                // build_program() then left-pads that stale lower-rank shape
+                // into the rank-sized output dims block, so the shader
+                // decomposes gid in the wrong coordinate system and applies
+                // every broadcast operand on the wrong axis. The output is this
+                // chain's own, so re-stamping its logical shape is always right
+                // no matter where the object came from.
+                output->reshape_view(out_shp);
             }
 
             auto out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);

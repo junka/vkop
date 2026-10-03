@@ -146,6 +146,195 @@ reference only 114 / 1048576 bytes differ, all by 1 (quantization-boundary flips
    buffer port (`shaders/buffer/resize.comp`, `ops/Resize.hpp::ResizeBuffer`) was added — nearest /
    asymmetric only, one invocation per 32-bit word in fp16 to avoid read-modify-write races.
 
+### Regression found 2026-10-03: the shape pool actually recycling buffers breaks the decoder
+
+The numbers above **do not reproduce on the current working tree**. Bisect, all runs on the
+reproducible probe latent (`default_rng(42).standard_normal((1,64,1,32,32))`) against an ORT CPU
+reference of the same `vae_decoder_512.onnx`:
+
+| Build | cos | maxabs |
+|-------|-----|--------|
+| `c920c8c` in a separate worktree | +1.000000 | 4.6e-05 |
+| `HEAD` (`ad15454`) in a separate worktree | +1.000000 | 4.6e-05 |
+| `HEAD` + the 6 uncommitted engine files | **-0.381480** | 2.0 |
+| ... reverting only `core/runtime.cpp` | +1.000000 | 4.6e-05 |
+| ... dirty `runtime.cpp`, write-site guard disabled | -0.381480 | 2.0 |
+| ... dirty `runtime.cpp`, pool pop disabled | +1.000000 | 4.6e-05 |
+
+So the regression is entirely in the uncommitted `core/runtime.cpp`, and it is the **pop side of
+`outshape_tensor_map`**, not the view-alias guard: the pop used to read `auto q = map[key]`, which
+copies the queue, so the pool never drained and every node output allocated its own buffer. Binding
+by reference makes the pool recycle tensor objects for the first time, and the decoder then breaks
+at the first node whose output buffer lands on bytes a live operand still reads.
+
+`VKOP_NODE_DUMP` + `compare_vae_node_dump.py` (per-node, matched by name) pin where:
+
+| Node | rms(ref) | rms(err) | relative |
+|------|----------|----------|----------|
+| `/decoder/conv_in/Conv` | - | 0.0 | exact |
+| `/decoder/mid_block/resnets.0/norm2/Expand` | 465.4 | 1.1e-04 | 2.3e-07 |
+| `/decoder/mid_block/resnets.0/norm2/Add` (`FusedElemwise`) | 0.907 | 5.2e-02 | **5.8e-02 ← first divergence** |
+| `/decoder/conv_out/Conv` | - | - | cos -0.35 |
+
+The failing `Add` consumes a broadcast operand of rms 465 and produces rms 0.9, so a single wrong
+buffer cancels large magnitudes and amplifies into the visible vertical green/magenta banding; the
+error then compounds through the five up-blocks. The current guard only treats
+`Reshape/Squeeze/Unsqueeze` as view ops and only inspects whether an *output* buffer was aliased
+out, which does not cover a fused elementwise program writing over bytes a still-live broadcast
+operand points at.
+
+#### Follow-up 2026-10-03 (later same day): four hypotheses measured and rejected
+
+Report-only probes in a detached worktree (`/private/tmp/vkop_head`, HEAD + the engine
+edits under test, `VKOP_POOL_PROBE=1`), same latent, same reference:
+
+| Hypothesis | Probe | Result |
+|------------|-------|--------|
+| recycled object still holds a live `VkBuffer` | print `gpu_resource_id()` at every pop | **all 215 pops report `rid=0`** — pooled objects are buffer-less at build time, so the buffer-identity check can never fire. This also means the write-site guard was never the thing protecting us |
+| buffer shared with a still-live input | compare popped buffer id against this node's inputs and every live `tensor_map` entry | 0 hits, but **void** — the ids are all 0 |
+| object released while another name still has readers | per-NAME `name_remaining` counter (the object-level `ref_cnt_` cannot express this once several names share one `Tensor`), checked at the push site | **0 premature releases** |
+| writer and last reader in the SAME level (intra-level concurrency, which the alias barrier does not order) | only recycle when the release level < the new node's level | 215 → 214 pops, **cos bit-identical to the broken run** |
+
+Confirmed instead: object sharing *is* happening — one `Tensor` serves up to 4 names at once
+(`mid_block/resnets.0`: `norm1/Expand` = `nonlinearity/Mul` = `norm2/Add` = `resnets.0/Add`), and
+the failure is **fully deterministic** (cos `-0.422326`, maxabs `2.0` on every run, before and
+after the level gate). A GPU race would not reproduce to the last digit, so the remaining
+explanation is a write overwriting bytes an earlier name still needs **in execution order** — or, since
+buffer-less recycle also changes *when* each output allocates (`as_storage_buffer` / `make_vkbuff`
+reuse-if-big-enough), the allocation path rather than the aliasing path is where to look next.
+The decisive probe not yet built: at execute time, record the object's last writing node per name
+and flag any input whose object was last written by a different node than its producer (needs
+`node_input_names_` / `node_output_tensors_` names, which `Runtime` does not currently keep).
+
+Built that probe (`node_input_names_` + `producer_of_name_` + a per-object last-writer map in
+`Run`): **0 violations** — for every input slot, the node that last wrote the object IS the node
+that produced the name it refers to. So the name↔object bookkeeping is sound and no pooled object
+is "read after being re-handled by somebody else". Combined with the two buffer-side results above
+(objects arrive buffer-less at recycle, `rid=0` for all 214 pops) the aliasing/scheduling family is
+effectively closed: nothing about *which object* or *which bytes* is provably wrong at build time,
+yet the output is deterministically `-0.422326`.
+
+Two further data points reframe it as an **op-side buffer-discipline** problem rather than an
+aliasing one: with the same build,
+* `VKOP_GUARD_OFF=1` (never `drop_gpu_buffer()` at the write site) → SIGSEGV at a null function
+  pointer (lldb: `frame #0: 0x0`), and
+* `VKOP_POOL_PRIVATE_BUFF=1` (always `drop_gpu_buffer()` for a writing node's outputs, so each gets
+  a private allocation) → the same SIGSEGV.
+So the write-site guard is load-bearing but not sufficient, and *any* change to when an output
+tensor holds a buffer trips a code path that dispatches a null shader — the same class of bug as
+the earlier `ReduceMeanBuffer` `nullptr` spv (exit 139). The next thing to look at is therefore not
+the pool's liveness bookkeeping but the ops' handling of an output tensor that arrives without a
+buffer (or whose buffer was just dropped): which buffer/stride/precision each op binds in that case.
+
+#### Third round of probes: three more carried-state candidates, all negative
+
+Same build, plus `VKOP_POOL_DISABLE=1` (reproduces the known-good behaviour from *inside* the pooled
+build — cos `+1.000000`, so the knob set is trustworthy) and `VKOP_POOL_PROBE_NODE=13`, which prints
+each slot of one node with the dims the converter recorded for that NAME versus the dims / buffer /
+side-channel / CPU staging the shared object actually carries at that instant.
+
+| Candidate | Evidence | Verdict |
+|-----------|----------|---------|
+| one `VkBuffer` used by two live tensors at execute | the last-writer test re-keyed by `gpu_resource_id()` instead of object pointer | **0 violations**. Note the failing node's output DOES carry its previous owner's buffer (`rid≠0`) whereas the pooled-off build leaves it `rid=0` — sharing is real, but no reader is ever handed a buffer somebody else wrote |
+| stale logical rank on the recycled object | node 13's OUT slot is live `[1,1152,32,32]` where the name records `[1,1152,1,32,32]` | real but **not the cause**: re-applying the recorded shape at pop (`VKOP_POOL_FIX_SHAPE=1`) leaves cos at `-0.422326`, and the previous owner's op reshapes the shared object during execute anyway |
+| stale GPU shape side-channel (`shape_ssbo_`) | `has_shape_ssbo()` = 0 on every slot of the failing node; clearing at the write site changes nothing | not the cause |
+| stale CPU staging (`data_`) | `has_cpu_data()` = 0 / `cpu_elems` = 0 on the failing output; clearing at the write site changes nothing | not the cause |
+
+Where that leaves it: every test above is at **node** granularity, and the first diverging node is a
+`FusedElemwise` — a fused program whose intermediate tensors are pooled objects too. A stage inside
+one fused node overwriting bytes an earlier stage of the *same* node still needs is invisible to all
+of these probes. That per-STAGE (not per-node) ownership inside the fused elementwise program is the
+next thing to instrument.
+
+#### RESOLVED 2026-10-03: it was a stale RANK on the fused op's own output, not an alias at all
+
+The per-stage hypothesis above is dead on arrival — `FusedElemwise` is ONE dispatch whose
+intermediates live in shader registers, so it has no pooled stage tensors. What it does have is a
+program SSBO whose dims block is rebuilt every round from the **live** shapes of its input and
+output tensors. That is where the regression was.
+
+Decisive measurement: ORT was run with the whole `mid_block/resnets.0` subtree exported as graph
+outputs (`/tmp/vae_ref_resnets0.npz`, 112 MB, built from `vaeprobe/vae_decoder_512_probe.onnx`), and
+vkop's per-node output dumps were compared against it **in absolute terms** instead of against
+another vkop run:
+
+| vkop node | tensor | cos vs ORT | maxabs | rel-rms |
+|---|---|---|---|---|
+| 4 | `norm1/ReduceL2` | 1.000000 | 0.00000 | 1.06e-07 |
+| 6 | `norm1/Expand` | 1.000000 | 0.00000 | 1.06e-07 |
+| 7 | `norm1/Add` (fused) | 1.000000 | 0.00001 | 5.58e-07 |
+| 9 | `conv1/Conv` | 1.000000 | 0.00052 | 1.62e-06 |
+| 12 | `norm2/Expand` | 1.000000 | 0.00046 | **2.28e-07** |
+| 13 | `norm2/Add` (fused) | 0.998334 | 1.39761 | **5.77e-02** |
+| 14 | `nonlinearity_1/Mul` | 0.899095 | 0.18323 | 4.59e-01 |
+
+So **every input of node 13 is exact against ORT** (the "operand `norm2/Expand` rms 465 vs output
+rms 0.9" that looked like cancellation is just what ORT computes — a GroupNorm denominator). Node 13
+itself is wrong, from correct inputs. An `VKOP_FUSED_PROBE=<name substring>` dump of the program
+inside the op, same binary, pool on vs `VKOP_POOL_DISABLE=1`:
+
+```
+BAD   norm2/Add  rank=5 total_dims=4   IN0..IN4 all 1,1152,1,32,32   OUT live_shape=1,1152,32,32
+GOOD  norm2/Add  rank=5 total_dims=5   IN0..IN4 all 1,1152,1,32,32   OUT live_shape=1,1152,1,32,32
+```
+
+Mechanism, three links, all now measured:
+
+1. the recycled object that serves node 13's output came from a previous owner whose tensor was
+   **rank 4** `[1,1152,32,32]` — the *same element count* as this node's rank-5
+   `[1,1152,1,32,32]`;
+2. `FusedElemwise::execute` resized its output only `if (output->num_elements() != total)`, so the
+   equal count made it keep the stale rank;
+3. `build_program` then wrote the output dims with `push_left_aligned` into a `rank`-sized block,
+   turning the rank-4 `[1,1152,32,32]` into `[1,1152,32,32,1]` instead of `[1,1152,1,32,32]`. The
+   shader decomposes `gid` through that block, so every broadcast operand is indexed on the wrong
+   axis — which is exactly a per-channel scale applied to the wrong channels: magnitude intact,
+   cos 0.998, maxabs 1.4.
+
+Fix (`ops/FusedElemwise.hpp`, in the `else` of that count check): re-stamp the chain's own computed
+broadcast shape with `reshape_view(out_shp)` — a pure logical reshape, guarded inside by
+element-count equality, so it can never desync a buffer from its dims. The output belongs to this
+node, so stamping it is correct no matter which object the pool handed over.
+
+Validation, same binary, pool **enabled**:
+
+| config | cos vs `/tmp/dec_c920c8c.raw` | byte-identical |
+|---|---|---|
+| repo working tree before the fix | −0.422326 | no |
+| repo + `reshape_view` fix | **+1.000000**, maxabs 0.0 | **yes** |
+| repo + fix + `VKOP_POOL_DISABLE=1` | +1.000000, maxabs 0.0 | yes |
+
+No DiT cost: `image_gen` 1-step `ref_static64` with the fix gives `velocity_step0 cos=0.999990`,
+`present_kv_0..21 OK`, `22..31 cos≈0.994–0.999` — the documented fp16 per-layer accumulation, i.e.
+unchanged; `ctest` 129/130 with only the known pre-existing `ModelTest (SEGFAULT)`.
+
+Two notes for whoever picks this up. (a) The stale shape is written by an op at **execute** time, so
+no build-time pop-side correction can help — that is why the earlier
+`VKOP_POOL_FIX_SHAPE=1`/`VKOP_POOL_PRIVATE_BUFF=1` experiments were no-ops while the bug lived here.
+(b) `if (output->num_elements() != total_elems(shape)) output->resize(shape)` is the pattern in
+~20 other ops (`BinaryFactory`, `BufferBinaryFactory`, `BufferUnaryFactory`, `Cast`, `Concat`,
+`Conv2d`, `LayerNorm`, `RMSNorm`, `Equal`, …) and any of them can inherit the same rank-vs-count
+confusion from a recycled object; the VAE only tripped `FusedElemwise`. They were NOT touched here —
+none is known broken, and each needs its own measurement first.
+
+Repro (≈10 s per data point, no DiT needed):
+
+```
+np.random.default_rng(42).standard_normal((1,64,1,32,32), np.float32).tofile("/tmp/vae_in_rng42.raw")
+# ORT reference: vae_decoder_512.onnx with that latent
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
+  build/vae_gen image/exporter/vae_decoder_512.vkopbin /tmp/vae_in_rng42.raw /tmp/dec.raw
+```
+
+Two gaps this exposed: `ctest` (130 cases) has **no VAE end-to-end numeric case**, so nothing
+guarded it; and matching ORT proves nothing about semantics — both sides share one exported graph
+and one input, so a wrong input stays "aligned". The cross-check that actually catches it is to feed
+`latent_out_512x512.raw` (fp32 packed `[1,1024,64]`) through the torch VAE
+(`transpose(1,2).reshape(1,64,1,32,32) * latents_std + latents_mean`, ~40 s on CPU) and look at the
+picture. Done that way, the pure-vkop 40-step latents of two different prompts (identical
+`latent_init`/`sigmas`/rope/bias, only `prompt_embeds` differing) decode into two correct, clearly
+distinct images — the DiT path is sound and only the VAE stage is broken.
+
 ## Optimization Opportunities
 
 1. **Constant Folding**: Would eliminate 4,423 nodes (40.6%) but requires >13 GB memory during conversion
