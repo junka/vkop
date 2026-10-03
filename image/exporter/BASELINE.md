@@ -20,6 +20,13 @@
 | 512×512 | 2,177 | 966 MB | 10.7 GB |
 | 1024×1024 | - | Export failed (OOM during trace) | ~23 GB estimated |
 
+### Text Encoder (only `model.language_model` is exported)
+| Component | Nodes | External Data | Notes |
+|-----------|-------|---------------|-------|
+| text_encoder.onnx | 4,860 | 13.89 GB | 1 input (embeds) / 1 output (hidden_states), static P=78 |
+| Embedding lookup (outside the graph) | — | 1.24 GB | `text_encoder_embeds.bin`, mmapped by the driver |
+| Not exported | — | `lm_head` 1.24 GB + vision tower ~1.1 GB | text-to-image never reads them |
+
 ## Memory Profile (ORT CPU Execution)
 
 ### Sequential Loading Strategy
@@ -91,11 +98,17 @@ Add, Concat, Div, Gather, LayerNormalization, MatMul, Mul, Neg, Pow, Reshape, Si
 6. The 4 "missing" operators (ReduceMean, Min, Max, Mod) — implemented, `ctest` green
 7. Tiny DiT fully aligned with ORT on vkop GPU (prefill + 5-step velocity, node-level 0 BAD)
 8. VAE decoder aligned with ORT on vkop GPU — see "VAE Decoder on the vkop Vulkan GPU backend"
+9. Full-size (7.12B) DiT prefill + decode on vkop GPU, ORT-aligned
+10. Text encoder (Qwen3-VL 7B) on vkop GPU, and the C++ front end that feeds it
+    (tokenizer → template → drop_idx → lookup → hidden_states) — see
+    "Text encoder (Qwen3-VL 7B) on the vkop Vulkan GPU backend"
 
 ### Pending ⏸️
-1. Full-size DiT (7.12B) inference on vkop GPU, replacing the tiny stand-in
-2. Text encoder integration (Qwen3-VL-7B tokenizer + embeddings)
-3. PNG output (stb_image_write.h or PIL)
+1. PNG output for a real sample without `--ref`: the no-reference path still uses the
+   placeholder σ schedule (`σ = 1 - t`, terminal σ = 0 so a 1-step run is a no-op) and the
+   simplified rope formula. Both are a few dozen lines to port from
+   `gen_dit_ref.py` (`FlowMatchEulerDiscreteScheduler` dynamic shift + `shift_terminal`, and
+   `joint_rope_positions`). Numeric alignment itself is already done through `--ref`.
 
 ## VAE Decoder on the vkop Vulkan GPU backend (buffer/SSBO)
 
@@ -306,7 +319,28 @@ Validation, same binary, pool **enabled**:
 
 No DiT cost: `image_gen` 1-step `ref_static64` with the fix gives `velocity_step0 cos=0.999990`,
 `present_kv_0..21 OK`, `22..31 cos≈0.994–0.999` — the documented fp16 per-layer accumulation, i.e.
-unchanged; `ctest` 129/130 with only the known pre-existing `ModelTest (SEGFAULT)`.
+unchanged; `ctest` 129/130 with only the `ModelTest (SEGFAULT)` that was then still open (see
+below).
+
+`ModelTest` read the graph output as `as_tensor<float>`, which was true until cc5a99a added the
+graph-output dtype fixup: the int8 conv chain runs in the fp16 domain, so the output tensor is
+now `uint16_t` and the float cast returned nullptr — dereferenced one line later at
+`result->getShape()[1]` (`KERN_INVALID_ADDRESS at 0x4e`, i.e. `this` null plus a member offset).
+The test now reads the fp16 output and converts per element; `ctest` is 130/130.
+
+### The 1-step `ref_static64` number moved, and why
+
+After the `fp32_to_fp16` RNE fix the same command gives `velocity_step0 cos=0.999957` instead of
+0.999990. That is not a regression in the port — it is the reference input changing under the
+test. `latent_init.raw` is stored fp32 and the driver converts it to fp16 at
+`image_gen.cpp:1170`, so 32 706 of its 65 536 elements sit 1 ulp higher than they did when the
+table above was measured; ORT's own input was always the numpy RNE value, so the driver now
+feeds the graph *the same bits ORT sees*. A/B with a ref dir whose `latent_init.raw` holds the
+truncation-rounded values (exactly representable in fp16, so RNE is a no-op on them) reproduces
+`cos=0.999990` bit for bit, and re-running either variant twice gives identical velocity buffers —
+the whole delta is that rounding, not noise. What the comparison actually says is unchanged:
+vkop's per-layer fp16 accumulation dominates, and a 1-ulp input nudge happens to cancel part of
+it in this metric.
 
 Two notes for whoever picks this up. (a) The stale shape is written by an op at **execute** time, so
 no build-time pop-side correction can help — that is why the earlier
@@ -334,6 +368,190 @@ and one input, so a wrong input stays "aligned". The cross-check that actually c
 picture. Done that way, the pure-vkop 40-step latents of two different prompts (identical
 `latent_init`/`sigmas`/rope/bias, only `prompt_embeds` differing) decode into two correct, clearly
 distinct images — the DiT path is sound and only the VAE stage is broken.
+
+## Text encoder (Qwen3-VL 7B) on the vkop Vulkan GPU backend
+
+The prompt encoder was, until now, the one stage that only ever ran under torch/CPU
+(`encode_prompt_real.py`). It is a full `Qwen3VLForConditionalGeneration` (8.77B params,
+17.5 GB bf16 across 4 shards), but text-to-image consumes only `model.language_model`
+(36 layers / hidden 4096 / 32 q heads + 8 kv heads / head_dim 128 / vocab 151936) and only
+its **hidden_states**, not logits.
+
+### Graph and conversion
+
+| Stage | Result |
+|-------|--------|
+| Export (`qi21_export_text_encoder_onnx.py`) | 4,860 nodes, 1 input / 1 output, 13.89 GB external data in 327 tensors, trace 23 s |
+| `onnx2vkop -q fp16` (full optimizer, no `-u`) | 105 s, peak RSS 30.7 GB, fused: RMSNorm×144, RotaryEmbedding×72, FusedElemwise×72, Softmax×36 |
+| `text_encoder.vkopbin` | 13.89 GB |
+
+Differences from the LLM export (`llm/exporter/qwen3vl_export_onnx.py`), all deliberate:
+
+1. **Output is `hidden_states`** — `lm_head` is cut and the final RMSNorm is bypassed
+   structurally (the wrapper has no `norm` step). transformers 5.x binds
+   `hidden_states[-1]` to the *normalized* `last_hidden_state`, which is why the official
+   pipeline neutralizes `text_model.norm` with a forward hook; a wrapper that never
+   normalizes cannot forget to.
+2. **No KV cache** — the tower runs once, whole, per prompt.
+3. **All shapes static**: sequence length `P = drop_idx + prefix_len` = 14 + 64 = 78.
+
+The rope table and the causal mask are baked in as graph **constants**, leaving exactly one
+input. That is forced, not cosmetic: mrope's section reordering is an in-place slice
+assignment (`freqs_thw[..., idx] = freq[dim][..., idx]`), which the legacy exporter writes as
+4 × `ScatterND` — an op vkop silently passes through. For text-only inputs the three position
+rows are identical, so the reordering is the identity; `check_rope_tables` asserts the
+standard 1-D rope is **bit-equal** to HF's `rotary_emb` (measured `maxdiff=0`) instead of
+arguing it.
+
+### Numerical alignment (three backends, identical 78 × 4096 fp16 input)
+
+| Comparison | cos | note |
+|------------|-----|------|
+| hand-written layer loop vs HF `Qwen3VLTextModel.forward` (both fp16) | 1.000009 | catches view/norm/GQA ordering errors |
+| vkop GPU vs torch fp16 | 0.999962 | valid rows 0.999990, worst row 0.999712 (row 0) |
+| vkop GPU vs official bf16 reference | 0.999313 | dtype dominates; logic error is ~1e-4 |
+
+bf16 → fp16 weight casting is lossless in range (8 → 11 mantissa bits); the residual is the
+**activation** rounding path, so bit-equality with the bf16 reference is not on the table
+without re-running `encode_prompt_real.py` in fp16.
+
+### Driver-side prompt encoding in C++ (`image_gen`, no `--ref`)
+
+The driver now runs the whole front end itself: tokenizer → raw ChatML template → `drop_idx`
+→ embedding lookup → text tower on GPU → slice and zero-pad → DiT prefill.
+
+- **Tokenizer is shared, not duplicated.** The Qwen-Image processor's `tokenizer.json` is
+  content-equal to Qwen3-VL-2B's — vocab, merges *including their order*, added tokens,
+  normalizer and pre-tokenizer all identical; only the merges serialization differs
+  (`["a","b"]` vs `"a b"`). So the driver loads `llm/tokenizer/qwen3_vl.bin`, and the 78 ids
+  it produces for the reference prompt are **byte-identical** to HF's.
+- Two env knobs are what made the claims above checkable, and they are the reason no
+  python-side re-run is needed to re-verify them: `VKOP_TE_DUMP_IDS=FILE` writes the driver's
+  token ids (comma-separated; compare the id column of `encode_prompt_real.py`'s
+  `prompt_tokens.txt`, which is one `index<TAB>id<TAB>surface` per line), and
+  `VKOP_TE_DUMP_EMBEDS=FILE` writes the sliced + zero-padded `prompt_embeds` fp16 buffer the
+  DiT prefill is about to receive — the same `(1, prefix_len, ctx_dim)` layout as
+  `prompt_embeds.raw`, so it compares element-wise against it (cos, not bytes: the reference
+  embeds come out of a bf16 forward).
+- **`drop_idx` is computed (14), never hardcoded**: it is the token count of the system
+  segment alone. Getting it wrong is silent and catastrophic — an earlier version measured
+  the whole template skeleton (22) and handed 56 rows to a graph built for 64.
+- The template is a literal string, **not** `Tokenizer::apply_chat_template`: the two
+  tokenize differently, and `encode_prompt_real.py` documents the same rule on the Python
+  side.
+- Padding rows are fed as **exact zeros**. The text tower is safe because its causal mask
+  keeps row *i* from seeing row *j > i*; the DiT is not — its image segment attends to the
+  text KV bidirectionally, so `attention_bias` masks the `prefix_len - valid_len` padding
+  columns with -65504 (same convention as `gen_dit_ref.py`'s `bias_t`).
+- The embedding table (`text_encoder_embeds.bin`, 1.24 GB, from `dump_text_embeds.py
+  --out-bin`) is **mmapped**: a prompt touches a few dozen of its 151936 rows, and reading
+  it wholesale would add 1.2 GB of RSS to a run that is already paging 14 GB graphs.
+- Cross-checks that stop the run instead of producing a plausible image: token ids bounds,
+  `valid_len > 64` (with the re-export hint), and the text tower's `(prefix_len, ctx_dim)`
+  against the prefill graph's own `prompt_embeds` shape.
+
+### Driver-side rope and σ schedule (`image_gen`, no `--ref`)
+
+`gen_dit_ref.py --real-rope / --schedule diffusers` used to be the only place the DiT's
+position table and σ schedule existed, so a `--ref`-less run fell back to two placeholders
+that were never meant to produce a sample: rope from `freq = i*0.01 + j*0.001` (a smooth
+ramp, not `theta^(-2i/dim)` frequencies) and `t = 1 - k/N` with `x -= σ·v`. Both are now
+ports of the reference — `joint_rope`/`build_rope` and `official_sigmas` in `image_gen.cpp`.
+The image rows keep the reference's asymmetry: text rows come from a table built with
+`txt_len = prefix_len`, image rows from one built with `txt_len = valid_len`, because the
+frame axis must freeze at the **real** token count or padding would push the image
+positions forward.
+
+`VKOP_DUMP_TABLES=DIR` writes what the driver computed, so the port can be diffed bit-wise
+against `ref_text/` without touching the GPU side of the run. Every `ref*/` directory below is
+a gitignored build artifact; regenerate the two this section measures against with
+
+```sh
+encode_prompt_real.py --prompt "A red fox sitting on a wooden bench in a sunlit park" \
+    --prefix-len 64 --out-dir ref_real
+gen_dit_ref.py --suffix _static --prefix-len 64 --size 512 --steps 40 --ort-steps 2 \
+    --real-rope --schedule diffusers --embeds ref_real/prompt_embeds.raw --refdir ref_text
+```
+
+(the second one only needs ORT for the two steps it anchors; add `--no-ort` to produce the
+input tensors alone), and the tables land in `ref_text/`:
+
+| Table (fp16 unless noted) | vs `ref_text` |
+|----------------------------|---------------|
+| `cos_prefill` 64×128 | **bit-identical** |
+| `cos_decode` 1024×128 | **bit-identical** |
+| `sin_decode` 1024×128 | **bit-identical** |
+| `sin_prefill` 64×128 | 4 entries 1 ulp low |
+| `sigmas` 41 fp32 | 23 entries ≤1 ulp, max abs diff 5.96e-8 |
+
+Those measurements surfaced three silent defects:
+
+1. **`ITensor::fp32_to_fp16` truncated on this machine.** The `#else` bit-twiddling branch
+   (clang on arm64 takes it: the inline-`fcvt` branch is guarded by `!__clang__`, the
+   `_cvtss_sh` one is x86-only) ended in `mantissa >> 13` — round-toward-zero, not
+   round-to-nearest-even. Re-running that branch on the same fp32 rope table changes
+   82 560 / 131 072 `cos_decode` entries and 68 608 / 131 072 `sin_decode` entries (in
+   `cos_decode`, where half the table is negative, 72 192 come out low and 10 368 high —
+   truncation is toward zero, so the sign decides the direction, which is exactly why the
+   raw dump looked like noise rather than a bias). Adding the guard+sticky RNE bias
+   (`(mantissa + 0x0FFF + lsb) >> 13`, which also carries into the exponent correctly) made
+   three of the four tables bit-identical and left 4 entries differing in `sin_prefill`.
+   Those 4 are one row (38) repeated across the duplicated `cat(ang, ang)` halves, and they
+   are a `sinf`-vs-torch-`sin` last-bit difference landing on an fp16 tie: torch's fp32 value
+   is 0.8518067002 while the midpoint of the two fp16 neighbours is 0.8518066406 — a margin
+   of one fp32 ulp (5.96e-8), so a one-ulp-lower `sinf` rounds down instead of up.
+2. **`np.linspace` without the `N-1`**: the first port multiplied by `(stop-start)` instead
+   of `(stop-start)/(N-1)`, so at 40 steps σ ran 1 → 1.63 → 4.97 → −4.12. Visible only
+   because the table got dumped and compared, not because the image looked wrong (it
+   looks wrong either way).
+3. **`(1/t − 1)` must be parenthesized.** Written as `e + 1/t − 1`, σ=1 evaluates to
+   0.9999999999999999 instead of 1.0, and `stretch_shift_to_terminal` divides by
+   `1 − σ_last` — so the divisor becomes 1.13e-16 and the *whole* schedule collapses onto
+   `shift_terminal` (all 40 σ printed 0.020000). One ulp, catastrophic downstream, and
+   still no error anywhere.
+
+The σ table is computed in double while diffusers stays in float32 from
+`astype(np.float32)` onward (NEP 50 keeps python scalars weak), which is the entire
+23-of-41 ulp difference — except the terminal value, where diffusers'
+`1 - 0.975/0.99487` is a float32 cancellation and lands 13 ulp off `shift_terminal`
+(0.01999998 vs 0.02). `steps == 1` is degenerate there (numpy divides 0/0), so the
+stretch is skipped for it. Bit-exactness with diffusers is available by reading
+`sigmas.raw` under `--ref`; the port's contract is "same formula, explained error".
+
+With both tables in the driver, `image_gen` needs no torch artifact for a sample — only the
+mmapped embedding table and the four vkopbin graphs:
+
+```sh
+VKOP_DUMP_TABLES=/tmp/vk_tables40 \
+image_gen dit_prefill_static.vkopbin dit_decode_static.vkopbin \
+  "A red fox sitting on a wooden bench in a sunlit park, autumn leaves scattered across the \
+path, soft morning light filtering through the trees, a low stone wall behind it, warm golden \
+tones, shallow depth of field, shot on 50mm film, natural lighting only" 40 7
+```
+
+`drop_idx=14 total=78 valid=64`, `mu=0.538710`, σ from 1.000000 down to 0.020000 (the driver
+prints `t=` and `σ=` as the same number because the model timestep *is* the shifted σ), then
+text tower 9.41 s load + 0.27 s forward, prefill 1.86 s, 40 decode steps in 849.3 s
+(21.2 s/step), VAE decode 10.02 s — 15 min wall for the first 512×512 sample generated
+end-to-end on vkop GPU from a text prompt. The result is a photorealistic red fox on a wooden
+bench, stone wall behind it, raking morning light through autumn trees: subject, setting and
+lighting condition are all present, which is the sanity check the numeric tables cannot
+provide on their own.
+
+### Sequential loading now has four segments
+
+| Phase | Size | Measured |
+|-------|------|----------|
+| Text tower load | 13.89 GB | 3.6–9.7 s (page-cache dependent) |
+| Text tower forward (78 tokens) | — | 0.27 s |
+| DiT prefill load + run | 13.83 GB | ~14 s + 1.7 s |
+| DiT decode load + step | 14.17 GB | ~14 s + 21.5 s/step |
+| VAE decode | 1.0 GB | 11.4 s |
+
+The 7 B scale is new for this repo (the LLM line tops out at 2 B): the *runtime* is not the
+constraint — 13.9 GB loads in seconds and one forward takes 0.27 s — the tight resource is
+the **conversion**, whose 30.7 GB peak against 36 GB unified memory leaves no headroom, and
+the driver must still release each graph before loading the next.
 
 ## Optimization Opportunities
 

@@ -137,7 +137,10 @@ int main() {
     auto bias = vkop::core::as_tensor<float>(rt->GetInitializer("conv.bias"));
     auto weight = vkop::core::as_tensor<int8_t>(rt->GetInitializer("conv.weight"));
     auto scale = vkop::core::as_tensor<float>(rt->GetInitializer("conv.weight_scale"));
-    auto result = vkop::core::as_tensor<float>(rt->GetOutput("output"));
+    // The int8 conv chain executes in the fp16 domain, so the graph output is
+    // an fp16 tensor even under precision 0 (see the graph-output dtype fixup
+    // in Runtime::LoadModel); reading it as float would yield a null tensor.
+    auto result = vkop::core::as_tensor<uint16_t>(rt->GetOutput("output"));
     std::vector<float> ref_output_data;
     bias->copyToCPU(cmdpool);
     weight->copyToCPU(cmdpool);
@@ -216,8 +219,9 @@ int main() {
     printf("num_elements: %d\n", result->num_elements());
 #endif
     for (int i = 0; i < result->num_elements(); ++i) {
-        if (std::isnan(result->at(i)) || std::fabs(result->at(i) - ref_output_data[i]) > 1e-2) {
-            printf("Failed at %d, %.5f vs %.5f\n", i, result->at(i), ref_output_data[i]);
+        const float got = ITensor::fp16_to_fp32(result->at(i));
+        if (std::isnan(got) || std::fabs(got - ref_output_data[i]) > 1e-2) {
+            printf("Failed at %d, %.5f vs %.5f\n", i, got, ref_output_data[i]);
             return 1;
         }
     }

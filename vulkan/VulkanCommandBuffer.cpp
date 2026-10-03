@@ -99,7 +99,7 @@ void VulkanCommandBuffer::allocate() {
     auto ret = vkAllocateCommandBuffers(device->getLogicalDevice(), &alloc_info,
                                         &m_commandBuffer_);
     if (ret != VK_SUCCESS) {
-        printf("ret %d\n", ret);
+        fprintf(stderr, "ret %d\n", ret);
         throw std::runtime_error("Failed to allocate command buffer");
     }
 }
@@ -144,7 +144,7 @@ VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
     auto ret =
         vkQueueSubmit(queue->getQueue(), 1, &submit_info, VK_NULL_HANDLE);
     if (ret != VK_SUCCESS) {
-        printf("ret %d\n", ret);
+        fprintf(stderr, "ret %d\n", ret);
         throw std::runtime_error("Failed to submit sem command buffer!");
     }
     queue->bumpSubmitCount();
@@ -158,7 +158,7 @@ void VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue,
                              static_cast<uint32_t>(submit_infos.size()),
                              submit_infos.data(), VK_NULL_HANDLE);
     if (ret != VK_SUCCESS) {
-        printf("ret %d\n", ret);
+        fprintf(stderr, "ret %d\n", ret);
         throw std::runtime_error("Failed to submit sem command buffer!");
     }
     queue->bumpSubmitCount();

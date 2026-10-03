@@ -124,6 +124,28 @@ options:
   host-authoritative int64/int32 initializer 跳过回读来消除（原
   `PHASE2_4_PLAN` 已完成/被替代并删除）。
 
+#### 6. 文生图（image/exporter/image_gen）
+
+一条 prompt 直接出 PNG，**运行期不读任何 python/ORT 中间产物**：C++ 分词 + 原始 ChatML
+模板 + `drop_idx` 截取 + padding 屏蔽，以及 DiT 的 joint rope 频率表和 FlowMatch σ 调度
+都在驱动内现算（`--ref DIR` 只用于数值对拍，可选）。
+
+```
+cd image/exporter
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
+VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
+../../build/image_gen dit_prefill_static.vkopbin dit_decode_static.vkopbin \
+  "A red fox sitting on a wooden bench in a sunlit park" 40 7
+```
+
+四份图按阶段顺序装载、用完立刻释放（单份 ~14 GB，任意两份同时驻留就超 36 GB 统一内存）：
+文本塔 `text_encoder.vkopbin` + 1.24 GB 输入查表 `text_encoder_embeds.bin`（mmap，一条
+prompt 只碰其中几十行）、DiT prefill/decode、VAE `vae_decoder_512.vkopbin`；分词器复用
+LLM 的 `llm/tokenizer/qwen3_vl.bin`。产物路径可用 `TEXT_ENCODER_VKOPBIN` /
+`TEXT_ENCODER_EMBEDS` / `TOKENIZER_BIN` / `VAE_VKOPBIN` 覆盖。512×512 / 40 步实测约 15
+分钟（decode 21.2 s/步，文本塔前向 0.27 s）。导出、转换与逐位对拍口径见
+`image/exporter/BASELINE.md`。
+
 ---
 
 ### Project Introduction
@@ -257,4 +279,31 @@ Supports manually registering post-processing operations like softmax and top-k 
   (LEARNING→CONFIRMING→STABLE) and host-authoritative int64/int32
   initializers skipping readback (the former `PHASE2_4_PLAN` is done or
   superseded and removed).
+
+#### 7. Text-to-image (image/exporter/image_gen)
+
+One prompt in, one PNG out, and the driver reads **no python/ORT intermediate
+artifacts at runtime**: tokenization, the raw ChatML template, `drop_idx`
+slicing and padding masking happen in C++, and so do the DiT joint-rope
+frequency table and the FlowMatch σ schedule (`--ref DIR` exists only for
+numeric alignment and is optional).
+
+```
+cd image/exporter
+DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib \
+VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
+../../build/image_gen dit_prefill_static.vkopbin dit_decode_static.vkopbin \
+  "A red fox sitting on a wooden bench in a sunlit park" 40 7
+```
+
+The four graphs load one stage at a time and are released right after use (each
+is ~14 GB; any two together exceed 36 GB of unified memory): the text tower
+`text_encoder.vkopbin` plus its 1.24 GB input table `text_encoder_embeds.bin`
+(mmapped — a prompt touches a few dozen of its rows), DiT prefill/decode, and
+the VAE `vae_decoder_512.vkopbin`. Tokenization reuses the LLM's
+`llm/tokenizer/qwen3_vl.bin`. Override paths with `TEXT_ENCODER_VKOPBIN`,
+`TEXT_ENCODER_EMBEDS`, `TOKENIZER_BIN`, `VAE_VKOPBIN`. Measured 512×512 at 40
+steps: ~15 min (21.2 s/step decode, 0.27 s text-tower forward). Export,
+conversion and the bit-wise alignment protocol are in
+`image/exporter/BASELINE.md`.
 

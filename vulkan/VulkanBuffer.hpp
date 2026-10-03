@@ -26,6 +26,25 @@ class VulkanBuffer : public VulkanResource {
 
     VkDeviceSize getSize() const { return m_size_; }
 
+    // True once some tensor handed this buffer's bytes to ANOTHER tensor object
+    // as a view alias (Tensor::alias_storage_buffer, the Reshape/Squeeze/
+    // Unsqueeze fast path). From then on at least two tensor objects address
+    // the same bytes. Sticky: an alias cannot be revoked from the producer
+    // side.
+    bool view_aliased() const { return view_aliased_; }
+    void mark_view_aliased() { view_aliased_ = true; }
+
+    // Global node index of the last op that WROTE these bytes (-1 = never).
+    // With view_aliased it lets Runtime::Run tell the two cases apart at the
+    // write site: the same node writing again is the LLM/DiT round loop
+    // re-making the same tensor (the view re-aliases the same bytes every
+    // round, so a fresh buffer there would be pure churn), while a DIFFERENT
+    // node is the shape pool having recycled this tensor object to an unrelated
+    // op — that write would clobber what the aliased view still reads, so the
+    // recycler takes its own buffer instead.
+    int32_t view_writer() const { return view_writer_; }
+    void set_view_writer(int32_t node_idx) { view_writer_ = node_idx; }
+
     void transferBarrier(VkCommandBuffer commandBuffer,
                          VkAccessFlags dstAccessMask,
                          VkDeviceSize size = VK_WHOLE_SIZE,
@@ -120,6 +139,8 @@ class VulkanBuffer : public VulkanResource {
 #endif
     VkDeviceSize m_size_;
     VkAccessFlags m_access_ = 0;
+    bool view_aliased_ = false;
+    int32_t view_writer_ = -1;
     void *data_ = nullptr;
 
     VkDescriptorBufferInfo buffer_info_;

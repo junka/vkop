@@ -75,23 +75,23 @@ llm/exporter/synth224.png
 llm/exporter/p.py
 llm/tokenizer/*.bin
 
-# Image-gen artifacts (ORT reference tensors, dumped latents, profiling logs)
-# — never commit; regenerate via image/exporter/gen_dit_ref.py / image_gen
-image/exporter/ref/
-image/exporter/ref_full/
-image/exporter/ref_out/
-image/exporter/vae_latent.raw
-image/exporter/vae_ref_decoded.raw
-image/exporter/vae_vkop_decoded.raw
-image/exporter/vae_ref_intermediates.npz
-image/exporter/vae_decoder_512_probe.onnx.data
+# Image-gen artifacts (ORT reference tensors, node dumps, vkop readbacks, the
+# 1.2 GB embedding table) — never commit; regenerate with
+# gen_dit_ref.py / encode_prompt_real.py / dump_text_embeds.py / image_gen.
+# ref*/ 覆盖 ref、ref_full、ref_static64、ref_text、ref_te、ref_out 等所有代次；
+# 枚举式写法每加一次对拍目录就会漏一次（embed_tokens.bin 那条就是教训）。
+image/exporter/ref*/
+/ref_out*/
+/node_dump/
+text_encoder_embeds.bin
+image/exporter/*.raw
+image/exporter/*.npz
 image/exporter/*.png
-image/exporter/ref_static/
-image/exporter/torch_reference.npz
-image/exporter/output_*.npy
+image/exporter/vae_decoder_512_probe.onnx.data
 image/exporter/reference/*.npz
+image/exporter/output_*.npy
 /latent_out_*.raw
-/image/exporter/latent_out_*.raw
+/output_*.png
 /log
 
 # ASan build directory

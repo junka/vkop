@@ -550,10 +550,19 @@ endif()
 # Image generation driver for Qwen-Image-2.1
 option(ENABLE_IMAGE_GEN "Build the image generation driver (image_gen)" ON)
 if (ENABLE_IMAGE_GEN)
+    # image_gen tokenizes the prompt itself (raw ChatML template -> ids -> text
+    # tower), so it needs the same tokenizer library llm_chat uses. The llm
+    # block normally adds the subdirectory already; only add it a second time
+    # when that option is off (CMake rejects a repeated add_subdirectory).
+    if (NOT ENABLE_LLM_CHAT)
+        add_subdirectory(llm/tokenizer llm_tokenizer)
+    endif()
     add_executable(image_gen image/exporter/image_gen.cpp)
-    target_link_libraries(image_gen PRIVATE vkop vload)
+    target_link_libraries(image_gen PRIVATE vkop vload tokenizer)
     target_include_directories(image_gen PRIVATE
-        ${CMAKE_SOURCE_DIR}/llm/tokenizer)  # For potential tokenizer reuse
+        ${CMAKE_SOURCE_DIR}/llm/tokenizer)
     add_executable(vae_gen image/exporter/vae_gen.cpp)
     target_link_libraries(vae_gen PRIVATE vkop vload)
+    add_executable(te_gen image/exporter/te_gen.cpp)
+    target_link_libraries(te_gen PRIVATE vkop vload)
 endif()

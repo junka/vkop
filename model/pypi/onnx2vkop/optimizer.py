@@ -254,6 +254,10 @@ class ConstantFolder:
 
         const = ConstantFolder._collect_constants(model)
         total_folded = 0
+        # >1MB 未物化、节点被保留的输出名：值已在 const 里，后续轮次不再
+        # 重复求值（Constant 分支每轮都会被重新处理，大张量的外部数据
+        # 重读一遍就是十几 GB IO）。
+        kept_big = set()
 
         for round_i in range(max_rounds):
             changed = False
@@ -268,6 +272,8 @@ class ConstantFolder:
                 # （如 ReduceSum 从 inputs[1] 取 axes initializer）全部落空，
                 # 把 axes 静默当成空值处理。
                 if node.op_type != "Constant" and node.output[0] in const:
+                    continue
+                if node.output[0] in kept_big:
                     continue
                 # 判定输入是否全部「已知常量」。
                 # Shape 特殊：输入本身不必是常量，只要形状在 value_info 全已知即可。
@@ -285,19 +291,16 @@ class ConstantFolder:
                 except Exception:
                     continue
                 materialized = True
-                any_new = False
                 for nm, arr in zip(node.output, outs):
-                    any_new = any_new or (nm not in const)
                     const[nm] = arr
                     if not ConstantFolder._add_initializer(model, nm, arr):
                         materialized = False
+                        kept_big.add(nm)
                 # 有输出 >1MB 没物化成 initializer 时必须保留节点，否则下游
                 # 不可折叠算子（MatMul/Conv 等）的输入会悬空，图直接残废。
                 if materialized:
                     model.graph.node.remove(node)
-                    changed = True
-                elif any_new:
-                    changed = True
+                changed = True
                 total_folded += 1
             if not changed:
                 break

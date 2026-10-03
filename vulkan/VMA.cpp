@@ -175,12 +175,17 @@ void VMA::destroyImage(struct VmaImage *img) {
 }
 
 void VMA::getStats() {
-    VmaBudget budgets[VK_MAX_MEMORY_HEAPS];
+    // vmaGetHeapBudgets 只填实际存在的 heap 个数，尾部元素保持调用前的值——
+    // 不清零就会打印出一堆越界的垃圾统计。
+    VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
     vmaGetHeapBudgets(allocator_, budgets);
     char *stats_string = nullptr;
     vmaBuildStatsString(allocator_, &stats_string, 1U);
     printf("%s\n", stats_string);
     for (auto &budget : budgets) {
+        if (budget.budget == 0 && budget.usage == 0 &&
+            budget.statistics.allocationCount == 0)
+            continue; // 不存在（或已空）的 heap 不必刷屏
         std::cout << "heap currently has " << budget.statistics.allocationCount
                   << " allocations taking " << budget.statistics.allocationBytes
                   << " B," << std::endl;

@@ -323,10 +323,10 @@ void Runtime::LoadModel() {
     for (const auto &n : model.nodes) {
         node_name_map[n.name] = &n;
     }
-
     const auto &concurrent_levels = model.getConcurrentExecutionLevels();
     printf("Building execution plan with %zu concurrent levels\n",
            concurrent_levels.size());
+
     // Build-time chain-structure analysis (kernel-fusion planning). Populated
     // once at LoadModel; no per-round cost. Printed to stderr so stdout model
     // dumps stay clean.
@@ -507,8 +507,22 @@ void Runtime::LoadModel() {
                         key += std::to_string(dim) + "_";
                     }
                     key += dtype_marker;
-                    auto q = outshape_tensor_map[key];
-                    if (!q.empty()) {
+                    // NOTE: must bind by reference — `auto q = map[key]`
+                    // copies the queue, so the pop below would silently
+                    // resurrect the same front tensor every time and never
+                    // drain the pool.
+                    auto &q = outshape_tensor_map[key];
+                    // Only pool tensors with a fully recorded static shape:
+                    // nodes whose recorded output dims are empty (the
+                    // converter omits them for some ops, e.g. Transpose) or
+                    // contain -1 sentinels would collide under a degenerate
+                    // key (e.g. "__f16_") and cross-alias unrelated outputs.
+                    bool poolable = !out_shape.dims.empty();
+                    for (int d : out_shape.dims) {
+                        if (d < 0)
+                            poolable = false;
+                    }
+                    if (poolable && !q.empty()) {
                         auto t = q.front();
                         q.pop();
                         t->set_ref_cnt(consumers[out_shape.name]);
@@ -551,9 +565,16 @@ void Runtime::LoadModel() {
                     }
                 }
             }
+            // An input name can be listed twice on one node (Pow(x,2), x-x),
+            // and the ref count then drops to zero on the first decrement —
+            // without this, the loop would push the same object into the pool
+            // twice and hand one buffer to two unrelated outputs.
+            std::unordered_set<const ITensor *> recycled_here;
             for (auto &t : node_inputs) {
-                if (t && t->ref_cnt() == 0) {
-                    // recycle to outshape_tensor_map
+                if (t && t->ref_cnt() == 0 && t->num_dims() > 0 &&
+                    recycled_here.insert(t.get()).second) {
+                    // recycle to outshape_tensor_map (rank-0/empty-dims
+                    // tensors are never pooled — see the pop-side gate).
                     std::string key = "_";
                     for (const auto &dim : t->getShape()) {
                         key += std::to_string(dim) + "_";
@@ -572,7 +593,10 @@ void Runtime::LoadModel() {
                     } else {
                         key += "other_";
                     }
-                    auto q = outshape_tensor_map[key];
+                    // NOTE: must bind by reference — pushing into a copy is
+                    // silently discarded and the pool stays empty forever
+                    // (every node output then allocates its own GPU buffer).
+                    auto &q = outshape_tensor_map[key];
                     q.push(t);
                 }
             }
@@ -1981,8 +2005,41 @@ double Runtime::Run() {
             if (std::getenv("VKOP_SHAPE_TRACE"))
                 fprintf(stderr, "[exec] lvl=%zu node=%zu %s\n", level_idx,
                         node_idx, node_ops_[node_idx]->get_name().c_str());
+            // A pure-view op (Reshape/Squeeze/Unsqueeze) hands its output the
+            // producer's VkBuffer instead of copying, so two tensor objects
+            // address the same bytes. The shape pool recycles tensor objects by
+            // shape and cannot see that sharing, so a recycled object can be
+            // handed to an unrelated node that then writes through the buffer a
+            // live view still reads. Guard it at the write site: if this node's
+            // output buffer was aliased out AND was last written by a different
+            // node, this node is that recycle — give it a buffer of its own.
+            // (Same node writing again is the round loop re-producing the same
+            // tensor, where a fresh buffer would be pure churn; and the view
+            // ops themselves are excluded because they re-alias rather than
+            // write.)
+            const auto view_op_type = node_ops_[node_idx]->get_type();
+            const bool is_view_op =
+                view_op_type == vkop::ops::OpType::RESHAPE ||
+                view_op_type == vkop::ops::OpType::SQUEEZE ||
+                view_op_type == vkop::ops::OpType::UNSQUEEZE;
+            if (!is_view_op) {
+                for (const auto &o : node_output_tensors_[node_idx]) {
+                    if (o && !o->get_prealloc_keep() &&
+                        o->gpu_buffer_view_shared() &&
+                        o->gpu_buffer_view_writer() != (int)node_idx) {
+                        o->drop_gpu_buffer();
+                    }
+                }
+            }
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
+            if (!is_view_op) {
+                for (const auto &o : node_output_tensors_[node_idx]) {
+                    if (o) {
+                        o->set_gpu_buffer_view_writer((int)node_idx);
+                    }
+                }
+            }
             graph_op_idx = -1;
             // [probe] report-only per-node live shape trace
             if (std::getenv("VKOP_SHAPE_TRACE")) {

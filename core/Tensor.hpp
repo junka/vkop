@@ -10,6 +10,7 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanResource.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -74,6 +75,23 @@ class ITensor {
     // rounded up to even so packHalf2x16 writes have an even out_base.
     void set_gpu_row_pad(int pad) { gpu_row_pad_ = pad; }
     int get_gpu_row_pad() const { return gpu_row_pad_; }
+
+    // ---- view alias at the WRITE site (used by Runtime::Run) ----
+    // The shape pool recycles tensor OBJECTS by shape while a pure-view op
+    // (Reshape/Squeeze/Unsqueeze) makes its output a second object aliasing the
+    // producer's VkBuffer. The pool cannot see that sharing (the alias is made
+    // at execute time), so just before a node writes its outputs the Runtime
+    // asks: is this buffer aliased out (gpu_buffer_view_shared), and was it
+    // last written by this very node (gpu_buffer_view_writer)? A different
+    // writer means the object was recycled from an unrelated node, and writing
+    // would clobber bytes the view still reads — so drop_gpu_buffer() hands the
+    // buffer back and the node's own as_storage_buffer() allocates a private
+    // one. Reads never go through this: a tensor that merely binds a buffer to
+    // read must keep it.
+    virtual bool gpu_buffer_view_shared() const { return false; }
+    virtual int gpu_buffer_view_writer() const { return -1; }
+    virtual void set_gpu_buffer_view_writer(int /* node_idx */) {}
+    virtual void drop_gpu_buffer() {}
 
     // ---- GPU-driven shape-meta side-channel accessors (Phase 2-4) ----
     // True when this tensor carries an authoritative GPU-resident shape SSBO
@@ -262,8 +280,14 @@ class ITensor {
             // Infinity or NaN
             return sign | 0x7C00;
         }
-        // Normal number
-        return sign | (exponent << 10) | (mantissa >> 13);
+        // Normal number. A bare `mantissa >> 13` truncates (round-toward-zero),
+        // while IEEE fp32->fp16 defaults to round-to-nearest-even, so every
+        // host-side conversion would sit up to 1 fp16 ulp (relative ~5e-4)
+        // below the true value. The guard+sticky bias below gives RNE, and the
+        // carry into the exponent falls out of the shift for free.
+        const uint32_t lsb = (mantissa >> 13) & 1u;
+        const uint32_t rounded = (mantissa + 0x0FFFu + lsb) >> 13;
+        return (uint16_t)(sign | (exponent << 10) | rounded);
 #endif
     }
 
@@ -576,11 +600,42 @@ template <typename T> class Tensor : public ITensor {
     alias_storage_buffer(std::shared_ptr<VulkanBuffer> src,
                          const std::shared_ptr<VulkanCommandBuffer> &cmd) {
         vkobj_ = src; // share the same VkBuffer (shared_ptr refcount)
+        // The bytes belong to the producer: this tensor is a read-only view of
+        // them. Marking the buffer tells the producer side the same thing, and
+        // lets Runtime::Run hand a buffer to the node that actually owns the
+        // data (see the write-site comment on gpu_buffer_view_shared).
+        if (src) {
+            src->mark_view_aliased();
+        }
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         if (cmd && buff) {
             buff->readBarrier(cmd->get());
         }
         return buff;
+    }
+
+    // Write-site view-alias handling; see the declaration on ITensor. All four
+    // are no-ops for a tensor with no GPU buffer, and for an image-backed one
+    // (VulkanBuffer is the only resource that can be aliased out).
+    bool gpu_buffer_view_shared() const override {
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        return buff && buff->view_aliased();
+    }
+    int gpu_buffer_view_writer() const override {
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        return buff ? (int)buff->view_writer() : -1;
+    }
+    void set_gpu_buffer_view_writer(int node_idx) override {
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        if (buff) {
+            buff->set_view_writer((int32_t)node_idx);
+        }
+    }
+    void drop_gpu_buffer() override {
+        if (!vkobj_) {
+            return;
+        }
+        vkobj_.reset();
     }
 
     // Upload host data (data_) into the backing SSBO NON-synchronously: records
@@ -1072,6 +1127,13 @@ template <typename T> class Tensor : public ITensor {
         // logical kv_len grows by 1 each round but the physical buffer stays
         // the same; shaders write only the logical region bounded by
         // push-constant dims + the dispatch count, so over-allocation is safe.
+        // NOTE: nothing here may consult view_aliased. This runs for READ paths
+        // too (every op binds the buffers it reads via as_storage_buffer), so
+        // refusing a reuse here silently replaces a tensor holding valid data
+        // with an empty one — the consumer then reads zeros instead of being
+        // protected from a clobber. The shape-pool/view-alias hazard is handled
+        // at the write site instead, where Runtime::Run knows which node is
+        // about to write (see the view-writer check there).
         if (vkobj_) {
             auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
             if (buff) {

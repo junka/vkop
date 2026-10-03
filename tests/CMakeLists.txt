@@ -329,3 +329,8 @@ add_test(ModelTest ModelTest)
 # Run:  ./ImageLayoutProbe [path/to/model.vkopbin]
 add_executable(ImageLayoutProbe ImageLayoutProbe.cpp)
 target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
+
+# Min/Max large-shape scalar-broadcast repro probe (full-DiT decode
+# DEVICE_LOST at /Min_24+/Max_24). Usage: MinMaxProbe [full|tiny]
+add_executable(MinMaxProbe MinMaxProbe.cpp)
+target_link_libraries(MinMaxProbe PRIVATE vkop vload)
