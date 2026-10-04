@@ -203,21 +203,139 @@ def extract_chat_template():
     }
 
 
+# tokenizer.cpp 里两个手写扫描器各自的正则分支表。分支 = 顶层 '|' 切出来的
+# alternative，顺序即 Rust regex 的 leftmost-first 优先级，所以比对必须逐分支、
+# 按位置比，不能只判「有没有出现过」。
+#   GPT-2 家族（Qwen3-VL / GLM-Edge / Llama-3）
+GPT2_BRANCHES = [
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)",
+    r"[^\r\n\p{L}\p{N}]?\p{L}+",
+    None,                                    # 数字段，见下
+    r" ?[^\s\p{L}\p{N}]+[\r\n]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+]
+GPT2_DIGITS = {r"\p{N}": False, r"\p{N}{1,3}": True}   # 值 = bit2（数字段切 1~3 个）
+#   Phi-4 / o200k 家族：字母按大小写「形状」切两段，数字固定 \p{N}{1,3}（扫描器
+#   内部就切 1~3 个，bit2 对它没有意义），标点尾巴多一个 '/'。
+PHI_BRANCHES = [
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+"
+    r"[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?",
+    r"\p{N}{1,3}",
+    r" ?[^\s\p{L}\p{N}]+[\r\n/]*",
+    r"\s*[\r\n]+",
+    r"\s+(?!\S)",
+    r"\s+",
+]
+# 每个家族对应的 Split 段 behavior/invert：GPT-2 用 Isolated/false（匹配到的 span
+# 保留、分隔符丢弃），Phi 的 o200k 写成 Removed/invert=true，语义上等价但字段不同，
+# 认错了会走错扫描器，所以一并进表。
+PRE_TOKENIZER_FAMILIES = {
+    "gpt2": (GPT2_BRANCHES, ("Isolated", False)),
+    "phi": (PHI_BRANCHES, ("Removed", True)),
+}
+
+
+def _split_stage(data):
+    r"""取 pre_tokenizer 里的 Split 段，返回 (正则, behavior, invert)。
+
+    Sequence 里其余子段只允许 ByteLevel(add_prefix_space=false)：add_prefix_space
+    会真的往首个 span 前插一个空格、改变切分结果，C++ 侧没有实现它。
+    """
+    pt = data.get("pre_tokenizer") or {}
+    stages = pt.get("pretokenizers") if pt.get("type") == "Sequence" else [pt]
+    splits = [s for s in stages or [] if s.get("type") == "Split"]
+    if len(splits) != 1:
+        raise ValueError(f"pre_tokenizer 需要恰好一个 Split 段，实际 {len(splits)} 个")
+    for s in stages or []:
+        if s.get("type") != "Split" and s.get("add_prefix_space"):
+            raise ValueError("ByteLevel add_prefix_space=true 未实现")
+    split = splits[0]
+    pattern = (split.get("pattern") or {}).get("Regex")
+    if not pattern:
+        raise ValueError("pre_tokenizer 的 Split 段不是 Regex 模式")
+    return pattern, split.get("behavior"), split.get("invert", False)
+
+
+def _split_alternatives(pattern):
+    r"""按顶层 '|' 切正则。括号内的 '|' 属于内层选择（如 (?i:'s|'t|...)），要跳过。"""
+    parts, depth, cur = [], 0, []
+    for ch in pattern:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        if ch == "|" and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    parts.append("".join(cur))
+    return parts
+
+
 def derive_flags(data):
     r"""推导 bin header 的 flags（位定义见 tokenizer.cpp 的 kFlag*，0 = Qwen 口径）。
 
-    不靠模型名硬编码，全部从 tokenizer.json 的实际配置读：
-      bit0  pre_tokenizer 是 Phi-4/o200k 变体 —— 判据是正则里数字分支写成
-            \p{N}{1,3}（GPT-2 分支是单个 \p{N}），这条差异同时带着「字母按大小写
-            形状切分」和「标点后跟 [\\r\\n/]*」两套语义。
+    不靠模型名硬编码，全部从 tokenizer.json 的实际配置读，且逐分支比对已知表：
+      bit0  pre_tokenizer 是 Phi-4/o200k 变体（字母按大小写形状切分 + 标点尾 '/'）。
       bit1  没有 normalizer —— C++ 侧跳过 NFC（Phi 的词表按原样码点建，做 NFC 会把
             「é」这类组合序列换成另一个码点，切出不同的 token）。
+      bit2  GPT-2 扫描器的数字段写成 \p{N}{1,3}（GLM-Edge、Llama-3）而不是 \p{N}
+            （Qwen3-VL）。
+
+    表外的正则形状一律报错，不做「看起来像」的猜测：切错 span 只会静默产出错 token，
+    数值链路一路跑完都发现不了，必须在生成 bin 这一步就炸。早先用
+    `"\\p{N}{1,3}" in 全文` 判 Phi 就是这么把 GLM-Edge 误判成 Phi 的 —— 它和 Qwen
+    只差数字段这一处，字母分支却完全是 GPT-2 口径。
     """
-    pt_text = json.dumps(data.get("pre_tokenizer") or {})
-    phi = "\\p{N}{1,3}" in pt_text
+    regex, behavior, invert = _split_stage(data)
+    branches = _split_alternatives(regex)
     no_normalizer = data.get("normalizer") is None
-    flags = (1 if phi else 0) | (2 if no_normalizer else 0)
-    print(f"[+] pre_tokenizer={'phi/o200k' if phi else 'gpt2'} "
+
+    family = None
+    for name, (table, want_bi) in PRE_TOKENIZER_FAMILIES.items():
+        if len(branches) != len(table):
+            continue
+        if table is GPT2_BRANCHES:
+            ok = (branches[:2] == table[:2] and branches[3:] == table[3:]
+                  and branches[2] in GPT2_DIGITS)
+        else:
+            ok = branches == table
+        if ok:
+            if (behavior, invert) != want_bi:
+                raise ValueError(
+                    f"{name} 家族的 pre_tokenizer 要求 behavior/invert="
+                    f"{want_bi}，实际 {(behavior, invert)}")
+            family = name
+            break
+
+    if family is None:
+        diff = ""
+        if len(branches) == len(GPT2_BRANCHES):
+            bad = [i for i in range(len(branches))
+                   if not (GPT2_BRANCHES[i] is None
+                           and branches[i] in GPT2_DIGITS)
+                   and branches[i] != GPT2_BRANCHES[i]]
+            diff = ("与 GPT-2 表不同的分支："
+                    + ", ".join(f"[{i}] {branches[i]!r} != {GPT2_BRANCHES[i]!r}"
+                                for i in bad))
+        raise ValueError(
+            "无法识别的 pre_tokenizer 正则：既不是已实现的 GPT-2 扫描器，也不是 "
+            "Phi/o200k 扫描器。\n"
+            f"  behavior={behavior!r} invert={invert!r}\n"
+            + "\n".join(f"  [{i}] {b!r}" for i, b in enumerate(branches)) + "\n"
+            + (diff + "\n" if diff else "")
+            + "只有 GPT-2 家族的数字段量化上限允许差异；其余分支必须逐字符一致。"
+              "新形状请先在 tokenizer.cpp 实现对应扫描器，再进本表。")
+
+    digit3 = family == "gpt2" and GPT2_DIGITS[branches[2]]
+    flags = (1 if family == "phi" else 0) | (2 if no_normalizer else 0) \
+        | (4 if digit3 else 0)
+    print(f"[+] pre_tokenizer={family} digits={'1-3' if digit3 else '1'} "
           f"normalizer={'none' if no_normalizer else 'present'} -> flags={flags}")
     return flags
 

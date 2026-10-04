@@ -13,52 +13,42 @@ namespace vkop {
 namespace export_ {
 
 Conversation::Conversation(const qwen::Tokenizer& tok) : tok_(tok) {
-    const int32_t end = tok_.im_end_token_id();
-    im_end_id_ = end < 0 ? 0 : static_cast<uint32_t>(end);
+    for (const int32_t id : tok_.stop_token_ids()) {
+        stop_ids_.push_back(static_cast<uint32_t>(id));
+    }
     const int32_t pad = tok_.image_pad_token_id();
     image_pad_id_ = pad < 0 ? 0 : static_cast<uint32_t>(pad);
 
-    // 探测模板能不能拆成「前缀 / 后缀」两段：分别渲染空正文和单字符正文的 user
-    // 轮，两者之差就是那段正文编码后的样子（占位符会被展开成 N 个重复 token，
-    // 所以「前缀+正文+后缀」不能拿整串直接切）。带正文的只用来取后缀 —— 它不含
-    // 正文，单独 encode 是精确的；user 和 assistant 在这套模板里共用同一个收尾串。
-    const std::string user_prefix = tok_.apply_chat_template(
-        {{"user", {{"text", ""}}}}, /*add_generation_prompt=*/false);
-    const std::string user_turn =
-        tok_.apply_chat_template({{"user", {{"text", "a"}}}}, false);
-    // assistant 轮的开头 = 引导串（角色模板的 prefix，不含收尾）。
+    // assistant 引导串 = 角色模板的 prefix；一 turn 的收尾串 = 同一套模板给一轮
+    // 封口的字面量（GLM 系为空串）。收尾串单独 encode 是精确的。
     auto asst_role = tok_.chat_template().roles.find("assistant");
     const std::string asst_prefix =
         asst_role == tok_.chat_template().roles.end()
             ? std::string() : asst_role->second.prefix;
-    if (user_prefix.empty() || user_turn.size() <= user_prefix.size() ||
-        asst_prefix.empty() || !im_end_id_) {
-        // 旧 tokenizer.bin 没烘 chat template：只能退化成「每轮独立、正文原样
-        // encode」，多轮累积交给调用方关掉（has_template() == false）。
+    const std::string tail_str = tok_.turn_tail_literal();
+    turn_tail_ = tok_.encode(tail_str);
+    if (asst_prefix.empty() || stop_ids_.empty() ||
+        (!tail_str.empty() && turn_tail_.empty())) {
+        // 退化成「每轮独立、正文原样 encode」，多轮累积交给调用方关掉
+        // （has_template() == false）：旧 tokenizer.bin 没烘模板，或者词表里根本没有
+        // 停止符，或者收尾字面量剥不干净（encode 出空 ids）—— 三种都没法可靠拼历史。
         return;
     }
-    const std::string suffix_str = user_turn.substr(user_prefix.size());
-    user_suffix_ = tok_.encode(suffix_str);
     gen_ids_ = tok_.encode(asst_prefix);
-    if (user_suffix_.empty() || gen_ids_.empty()) {
-        user_suffix_.clear();
-        gen_ids_.clear();
-    } else {
-        // 引导串不能只 encode 它自己：BBPE 的 ByteLevel 把「词首空格」编成独立
-        // 标记，收尾串末尾换行之后的那个空格属于 " assistant" 这个 token，单独
-        // encode 会把它丢掉（HF 是整段一次 encode 的）。所以 encode「收尾 +
-        // 引导」整串再剥掉与收尾等长的一段。
-        const std::vector<uint32_t> seam = tok_.encode(suffix_str + asst_prefix);
-        if (seam.size() <= user_suffix_.size() ||
-            !std::equal(user_suffix_.begin(), user_suffix_.end(), seam.begin())) {
-            // 拼接处被 BPE 合并掉了，剥不出干净的引导段：退回只 encode 引导串
-            // 本身（少一个词首空格标记），也不能留下错位的 ids。
-            user_suffix_.clear();
-            gen_ids_.clear();
-        } else {
-            gen_ids_.assign(seam.begin() + user_suffix_.size(), seam.end());
-        }
+    if (gen_ids_.empty()) return;
+    // 引导串不能只 encode 它自己：BBPE 的 ByteLevel 把「词首空格」编成独立
+    // 标记，收尾串末尾换行之后的那个空格属于 " assistant" 这个 token，单独
+    // encode 会把它丢掉（HF 是整段一次 encode 的）。所以 encode「收尾 +
+    // 引导」整串再剥掉与收尾等长的一段。收尾串为空时这条退化成 encode(引导串)
+    // 本身，剥不出错的东西。
+    const std::vector<uint32_t> seam = tok_.encode(tail_str + asst_prefix);
+    if (seam.size() <= turn_tail_.size() ||
+        !std::equal(turn_tail_.begin(), turn_tail_.end(), seam.begin())) {
+        // 拼接处被 BPE 合并掉了，剥不出干净的引导段：保留上面单独 encode 的
+        // 引导串（少一个词首空格标记），不能留下错位的 ids。
+        return;
     }
+    gen_ids_.assign(seam.begin() + turn_tail_.size(), seam.end());
 }
 
 void Conversation::addUserTurn(const std::string& text, int block_first,
@@ -126,28 +116,39 @@ void Conversation::addUserTurn(const std::string& text, int block_first,
 }
 
 void Conversation::addAssistantTurn(const std::vector<uint32_t>& gen_ids) {
+    // 正文里带着的那个停止符要不要留在本轮序列里，取决于它在模板里的身份：
+    //  - ChatML/Phi：<|im_end|> / <|end|> 就是「本轮的收尾」，模板自己也是这么写的
+    //    （收尾串里含它），留着才对。
+    //  - GLM 系：模板没有轮末标签，模型生成出来的 <|user|> 是**下一轮的开头**，下一轮
+    //    的 apply_chat_template 还会再渲染一次 —— 留在这里就成了双份标签，序列
+    //    不再是 HF 渲染出来的那个串。收尾串为空正是这一族的信号。
+    // 截断到正文一个 token 都没生成时，别把前缀尾部那个 token 判成「带收尾」。
+    std::size_t keep = gen_ids.size();
+    if (turn_tail_.empty() && keep && isStop(gen_ids.back())) --keep;
+
     Turn turn;
     turn.role = "assistant";
     // 正文 = 生成时的原始 ids，一个不改；外面套上角色前缀和收尾。
     turn.ids = gen_ids_;
-    turn.ids.insert(turn.ids.end(), gen_ids.begin(), gen_ids.end());
+    turn.ids.insert(turn.ids.end(), gen_ids.begin(),
+                    gen_ids.begin() + static_cast<std::ptrdiff_t>(keep));
     if (!has_template()) {                      // 无模板：正文原样，不累积
         total_len_ += static_cast<int>(turn.ids.size());
         turns_.push_back(std::move(turn));
         return;
     }
-    if (turn.ids.size() == gen_ids_.size()) {   // 空回复：只补收尾
-        turn.ids.insert(turn.ids.end(), user_suffix_.begin(), user_suffix_.end());
-    } else if (turn.ids.back() != im_end_id_) {
-        // 没生成到结束符（被 max_new 截断）：补完整收尾。
-        turn.ids.insert(turn.ids.end(), user_suffix_.begin(), user_suffix_.end());
-    } else if (turn.ids.size() <= gen_ids_.size() + 1 ||
-               turn.ids[turn.ids.size() - 2] != user_suffix_[0]) {
-        // 生成循环在结束符处就停了，收尾串的其余部分（换行）没进 out_ids。补上
-        // 结束符之后的那些 —— 少了它们，下一轮序列就不是上一轮的合法扩展，跨轮
-        // KV 前缀复用也就无从校验。
-        turn.ids.insert(turn.ids.end(), user_suffix_.begin() + 1,
-                        user_suffix_.end());
+    if (keep == gen_ids.size()) {
+        // 没在本轮正文里停下来（被 max_new 截断，或压根没生成正文）：补齐收尾串。
+        // GLM 系的收尾串是空串，这条什么都不做 —— 下一轮的开头标签自会封口。
+        turn.ids.insert(turn.ids.end(), turn_tail_.begin(), turn_tail_.end());
+    } else if (turn_tail_.size() > 1 &&
+               turn.ids.size() >= gen_ids_.size() + turn_tail_.size() &&
+               turn.ids[turn.ids.size() - turn_tail_.size()] == turn_tail_[0]) {
+        // 生成循环在停止符处就停了，收尾串的**其余**部分（""" + "<|im_end|>" + """ 之后那个换行）没进
+        // 正文。少了它们，下一轮序列就不是上一轮的合法扩展，跨轮 KV 前缀复用
+        // 也就无从校验。
+        turn.ids.insert(turn.ids.end(), turn_tail_.begin() + 1,
+                        turn_tail_.end());
     }
     total_len_ += static_cast<int>(turn.ids.size());
     turns_.push_back(std::move(turn));

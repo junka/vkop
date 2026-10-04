@@ -19,12 +19,21 @@ namespace {
 // 轮末/图像占位标签名是模型专属的字面量。
 const char constexpr kChatMlTurnEnd[] = "<|im_end|>";
 const char constexpr kPhiTurnEnd[] = "<|end|>";
+// GLM-Edge/Llama 那一族（ChatML 早期壳）没有轮末标签：一轮由「下一个角色标签」
+// 收尾，所以 generation_config 的 eos_token_id 是三个一串。字面量在这里按名查，
+// 不写死 id（换 checkpoint 即失效）。
+const char constexpr kGlmEndOfText[] = "<|endoftext|>";
+const char constexpr kGlmUserTag[] = "<|user|>";
+const char constexpr kGlmObservationTag[] = "<|observation|>";
 const char constexpr kImagePadTag[] = "<|image_pad|>";
 
 // tokenizer.bin header 的 flags 位（写端 tokenizer_to_bin.py 从 tokenizer.json 的
 // pre_tokenizer 正则与 normalizer 自动推导）。0 = 既有 Qwen 口径。
 constexpr uint32_t kFlagPhiPreTokenizer = 1u << 0;
 constexpr uint32_t kFlagNoNormalizer = 1u << 1;
+// GLM-Edge / Llama-3 那一族是 GPT-2 扫描器 + \p{N}{1,3}：只有数字段切成 1~3 个，
+// 字母仍按 \p{L}+ 整段切（Phi 的 UL/LL 大小写形状切分不适用于它们）。
+constexpr uint32_t kFlagDigitRun3 = 1u << 2;
 
 // GPT-2/BBPE byte<->unicode 映射。68 个不可打印/特殊字节被映射到 U+0100..U+017F
 // 区间（UTF-8 编码为 0xC4 0x80..0xC4 0xBF），其余字节一对一映射到自身码点。
@@ -192,7 +201,7 @@ std::size_t match_contraction(const std::vector<uint32_t>& cps, std::size_t i) {
 // GPT-2 pre_tokenizer 正则的手写实现。HF 原版（tokenizer.json）正则为：
 //   (?i:'s|'t|'re|'ve|'m|'ll|'d)              alt1
 //   | [^\r\n\p{L}\p{N}]? \p{L}+               alt2
-//   | \p{N}                                    alt3
+//   | \p{N}{1,digit_max}                       alt3   Qwen=1，GLM/Llama3=3
 //   | ' ?[^\s\p{L}\p{N}]+ [\r\n]*              alt4
 //   | \s* [\r\n]+                              alt5
 //   | \s+ (?!\S)                               alt6  (RE2 不支持前瞻，手写复刻)
@@ -203,6 +212,8 @@ std::size_t match_contraction(const std::vector<uint32_t>& cps, std::size_t i) {
 //  - alt5: \s-run 内含 CR/NL 时，吞 [i..最后一个CR/NL+1)，trailing 空白另起。
 //  - alt6: \s-run 末尾若紧跟非空白，回溯留最后一个 \s 给后续 alt2/alt4 吸附；
 //    run==1 且无法吸附（如后接数字）时 alt6 失败，由 alt7 吞。
+//  - alt3 的数字段长度由 digit_max 参数决定：Qwen3-VL 写 \p{N}（=1），GLM-Edge 与
+//   Llama-3 写 \p{N}{1,3}。这条差异只影响 span 边界，不影响其余分支。
 
 // \s-run 的三条分支在两个 pre_tokenizer 变体里完全一致，共享这一份：
 //   \s*[\r\n]+   run 内含 CR/NL 时吞到最后一个 CR/NL（前导空白一起吞）
@@ -226,7 +237,8 @@ std::size_t match_ws_run(const std::vector<uint32_t>& cps, std::size_t i) {
     return j;                       // run==1：alt6 失败，退到 alt7
 }
 
-void pre_tokenize(const std::string& s, std::vector<std::string>& out) {
+void pre_tokenize(const std::string& s, std::vector<std::string>& out,
+                  std::size_t digit_max) {
     CpStream st = decode_to_cps(s);
     const auto& cps = st.cps;
     const auto& off = st.offsets;
@@ -259,8 +271,12 @@ void pre_tokenize(const std::string& s, std::vector<std::string>& out) {
             emit(i, j); i = j; continue;
         }
 
-        // alt3: \p{N}（单个数字 codepoint，无前缀吸附）
-        if (is_number(cp)) { emit(i, i + 1); i += 1; continue; }
+        // alt3: \p{N}{1,digit_max}。Qwen3-VL 给 1（逐位切），GLM-Edge/Llama-3 给 3。
+        if (is_number(cp)) {
+            std::size_t j = i;
+            while (j < n && is_number(cps[j]) && j - i < digit_max) ++j;
+            emit(i, j); i = j; continue;
+        }
 
         // alt4: ' ?[^\s\p{L}\p{N}]+ [\r\n]*  （前缀仅字面空格 0x20）
         bool cp_nonsln = !is_ws(cp) && !is_letter(cp) && !is_number(cp);
@@ -442,13 +458,22 @@ void Tokenizer::load(const std::string& bin_path) {
     uint32_t special_count = read_u32(ptr); ptr += 4;
     // 第 5 个 u32 原本是 Reserved（写端恒填 0），现在当 flags：
     //   bit0 = pre_tokenizer 走 Phi-4/o200k 变体，bit1 = tokenizer.json 没有
-    //   normalizer（跳过 NFC）。旧 bin 这里是 0 → 既有 Qwen 口径完全不变。
+    //   normalizer（跳过 NFC），bit2 = GPT-2 扫描器的数字段切成 1~3 个。
+    //   旧 bin 这里是 0 → 既有 Qwen 口径完全不变。
     flags_ = read_u32(ptr); ptr += 4;
+    // 未定义的位一律拒绝：分词口径错了不会崩，只会静默切错 token，GPU 上跑完也
+    // 看不出来，所以写端加了新 bit 而读端不认识时必须当场报错，不能当 0 处理。
+    constexpr uint32_t kKnownFlags = kFlagPhiPreTokenizer | kFlagNoNormalizer
+                                   | kFlagDigitRun3;
+    if (flags_ & ~kKnownFlags)
+        throw std::runtime_error("tokenizer.bin has unknown flag bits: "
+                                 + std::to_string(flags_));
 
     std::cout << "[Tokenizer] Vocab: " << vocab_size_ << ", Merges: " << merge_count
               << ", Special: " << special_count
               << ", Flags: " << flags_
               << ((flags_ & kFlagPhiPreTokenizer) ? " (phi pre_tokenizer)" : "")
+              << ((flags_ & kFlagDigitRun3) ? " (digits 1-3)" : "")
               << ((flags_ & kFlagNoNormalizer) ? " (no NFC)" : "") << "\n";
 
     // 解析 Vocab Section
@@ -619,7 +644,7 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text) const {
         std::string seg(input, i, seg_end - i);
         std::vector<std::string> pieces;
         if (flags_ & kFlagPhiPreTokenizer) pre_tokenize_phi(seg, pieces);
-        else pre_tokenize(seg, pieces);
+        else pre_tokenize(seg, pieces, (flags_ & kFlagDigitRun3) ? 3 : 1);
         for (const auto& piece : pieces) {
             encode_segment(piece, tokens);
         }
@@ -817,17 +842,62 @@ int32_t Tokenizer::special_token_id(const std::string& literal) const {
     return -1;
 }
 
-// 词表里的特殊 token 以完整字面量为 key，这里替调用方收两个常用的：结束符决定
-// 每轮在哪里停，图像 pad 决定 user 轮里哪个 token 要按 grid 展开成 N 份。
-int32_t Tokenizer::im_end_token_id() const {
-    // Phi 系的每轮终止符与 ChatML 不是同一个标签；未注册进 bin 的字面量永远不会
-    // 命中，所以既有模型行为不变。
-    for (const std::string& candidate : {std::string(kChatMlTurnEnd),
-                                          std::string(kPhiTurnEnd)}) {
-        const int32_t id = special_token_id(candidate);
-        if (id >= 0) return id;
+// 一轮在哪个 token 停：ChatML/Phi 是单个轮末标签，GLM 系的模板根本没有轮末标签
+// （一轮靠「下一个角色标签」收尾），generation_config 的 eos_token_id 是三个。
+// 未注册进 bin 的字面量永远不命中，所以每张表只对自己那一族生效。
+std::vector<int32_t> Tokenizer::stop_token_ids() const {
+    std::vector<int32_t> ids;
+    for (const char* literal : {kChatMlTurnEnd, kPhiTurnEnd, kGlmEndOfText}) {
+        const int32_t id = special_token_id(literal);
+        if (id >= 0) ids.push_back(id);
     }
-    return -1;
+    for (const char* literal : {kGlmUserTag, kGlmObservationTag}) {
+        const int32_t id = special_token_id(literal);
+        if (id >= 0) ids.push_back(id);
+    }
+    return ids;
+}
+
+// 一 turn 的收尾字面量：渲染「单条 assistant 消息、带引导串」后剥掉前面所有已知
+// 部分，剩下的就是这套模板给一轮「封口」的串。ChatML 是轮末标签 + 换行，Phi 是
+// <|assistant|> + 换行，GLM 系是空串 —— 那一族的轮边界由下一轮的开头标签承担。
+//
+// 探针正文用空串而不是 "a"：正文夹在角色前缀和收尾之间，非空正文会被模板的空白处理
+// 规则牵连（Phi 的 jinja 在正文为空时会把收尾的最后几个字符吃掉，剥出来的是半截壳）。
+// 空正文时剥出来的才是纯收尾；再用「不带引导串」的那次渲染交叉校验，两次剥出来的串
+// 必须一致，否则判定这套模板不可用（返回空串，调用方按「无模板」退化）。
+std::string Tokenizer::turn_tail_literal() const {
+    if (chat_template_.empty()) return "";
+    const auto it = chat_template_.roles.find("assistant");
+    if (it == chat_template_.roles.end()) return "";
+    const std::vector<ChatMessage> msgs = {{"assistant", {{"text", ""}}}};
+    const std::string head = it->second.prefix;
+    auto peel = [&](bool add_gen) -> std::string {
+        const std::string rendered = apply_chat_template(msgs, add_gen);
+        std::string base = rendered;
+        if (add_gen) {   // 末尾的引导串按长度截掉（它就是这个 prefix）
+            if (base.size() < head.size()) return "";
+            base.erase(base.size() - head.size());
+        }
+        // 剩下的形如 [系统段] + 引导串 + 收尾：从后往前剥，先剥掉与引导串等长的那段，
+        // 再在其中以 prefix 开头的位置切开。
+        if (base.size() < head.size()) return "";
+        const std::string tail_of_base = base.substr(base.size() - head.size());
+        if (tail_of_base != head) return "";
+        const std::string body = base.substr(0, base.size() - head.size());
+        const std::size_t at = body.rfind(head);
+        if (at == std::string::npos) return "";
+        return body.substr(at + head.size());
+    };
+    const std::string with_gen = peel(/*add_gen=*/true);
+    if (with_gen.empty()) return "";
+    // 交叉校验：不追加引导串时，收尾就是「剥掉 prefix 之后剩的全部」。
+    const std::string plain = apply_chat_template(msgs, false);
+    if (plain.size() < head.size() || plain.compare(0, head.size(), head) != 0)
+        return "";
+    const std::string without_gen = plain.substr(head.size());
+    if (without_gen != with_gen) return "";
+    return with_gen;
 }
 
 int32_t Tokenizer::image_pad_token_id() const {

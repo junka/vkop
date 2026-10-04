@@ -101,13 +101,19 @@ public:
     std::string apply_chat_template(const std::vector<ChatMessage>& messages,
                                     bool add_generation_prompt = true) const;
 
-    // 对话里最常用的两个特殊 token：结束符（决定每轮在哪停）和图像 pad
-    // （决定 user 轮里哪个 token 要按 grid 展开成 N 份）。未注册返回 -1。
-    int32_t im_end_token_id() const;
+    // 一轮在哪个 token 停：按字面量查已注册的特殊 token，返回该模型的全部停止 id
+    // （ChatML/Phi 一个；GLM 系三个）。未注册的候选不命中，所以一族的表对另一族无影响。
+    std::vector<int32_t> stop_token_ids() const;
+
+    // 一 turn 的收尾字面量（渲染单条 assistant 消息、剥掉角色前缀和探针正文后剩下的
+    // 那段）：GLM 系模板没有轮末标签，这里就是空串。无模板时返回空串。
+    std::string turn_tail_literal() const;
+
+    // user 轮里哪个 token 要按 grid 展开成 N 份；未注册返回 -1。
     int32_t image_pad_token_id() const;
 
 private:
-    // 按字面量查已注册的特殊 token id；调用方走下面两个具名入口。
+    // 按字面量查已注册的特殊 token id；调用方走上面那几个具名入口。
     int32_t special_token_id(const std::string& literal) const;
 
     // BBpe 核心合并逻辑
@@ -121,7 +127,8 @@ private:
     void post_process(std::vector<uint32_t>& ids) const;
 
     // bin header 的 flags 字段（第 5 个 u32，原本是 Reserved）。bit0=Phi 系
-    // pre_tokenizer，bit1=不做 NFC 规范化。0 = Qwen/GPT-2 口径，旧 bin 不用重生成。
+    // pre_tokenizer，bit1=不做 NFC 规范化，bit2=GPT-2 扫描器的数字段按 1~3 个切。
+    // 0 = Qwen/GPT-2 口径，旧 bin 不用重生成。
     uint32_t flags_ = 0;
 
     // mmap 相关成员

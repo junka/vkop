@@ -464,16 +464,21 @@ private:
 // token 的话分词结果会整段错位，绝不能拿裸字符串继续算。
 bool chatml_tags(const qwen::Tokenizer& tok, std::string& im_start,
                  std::string& im_end) {
-    const int32_t end = tok.im_end_token_id();
-    if (end < 0) return false;
-    im_end = tok.id_to_piece((uint32_t)end, false);
-    // im_start 没有具名入口（LLM 只关心终止符）；它的 id 是 im_end 的前一个，
-    // 这是 Qwen 词表里唯一一处序号依赖。
-    im_start = tok.id_to_piece((uint32_t)(end - 1), false);
-    if (im_start.find("im_start") == std::string::npos ||
-        im_end.find("im_end") == std::string::npos)
-        return false;
-    return true;
+    // 停止符表里挑出真正是 ChatML 轮末标签的那一个：Phi/GLM 的表里没有它，
+    // 这里就返回 false，图像塔的模板绝不能拿裸字符串凑。
+    for (const int32_t end : tok.stop_token_ids()) {
+        const std::string end_piece = tok.id_to_piece(static_cast<uint32_t>(end), false);
+        // im_start 没有具名入口（LLM 只关心终止符）；它的 id 是 im_end 的前一个，
+        // 这是 Qwen 词表里唯一一处序号依赖。
+        const std::string start_piece =
+            tok.id_to_piece(static_cast<uint32_t>(end - 1), false);
+        if (start_piece.find("im_start") == std::string::npos ||
+            end_piece.find("im_end") == std::string::npos) continue;
+        im_end = end_piece;
+        im_start = start_piece;
+        return true;
+    }
+    return false;
 }
 
 // 官方 pipeline 的纯文生图模板（和 encode_prompt_real.py::build_template 一字

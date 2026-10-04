@@ -14,9 +14,11 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <stdexcept>
 #include <vector>
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -31,6 +33,15 @@ using ivec2 = int[2];
 
 namespace vkop {
 namespace core {
+
+// Fills dst[0,len) with the bytes of an upload that live at [upload_offset,
+// upload_offset+len), streaming them straight from the model file. The loader
+// uses this instead of a host pointer because touching a multi-GB initializer
+// blob through its mmap costs ~1.4 GB/s in page faults, while large preads
+// run ~13 GB/s on the same volume — and the bytes land in the Vulkan staging
+// buffer with no host->host copy at all. Must throw on a short read.
+using StagingFillFn =
+    std::function<void(void *dst, size_t len, size_t upload_offset)>;
 
 template <typename T> class Tensor;
 
@@ -877,8 +888,19 @@ template <typename T> class Tensor : public ITensor {
         toGPU();
     }
     void copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                   T *data = nullptr) {
+                   T *data = nullptr, const StagingFillFn &fill = nullptr) {
         if (is_on_GPU()) {
+            return;
+        }
+        if (fill) {
+            // Streaming from the file is a verbatim buffer copy; an image
+            // upload converts NCHW->RGBA on the host and needs real bytes.
+            if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
+                throw std::runtime_error(
+                    "copyToGPU: file streaming is only supported for buffer "
+                    "resources");
+            }
+            copyToGPUBuffer(cmdpool, nullptr, fill);
             return;
         }
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
@@ -1183,7 +1205,8 @@ template <typename T> class Tensor : public ITensor {
     }
 
     void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                         T *src = nullptr) {
+                         T *src = nullptr,
+                         const StagingFillFn &fill = nullptr) {
         auto dev = cmdpool->getVulkanDevice();
         VulkanCommandBuffer cmd(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
@@ -1202,17 +1225,29 @@ template <typename T> class Tensor : public ITensor {
             // 200064x3072 fp16 = 1.23GB，一次分配必定失败。原来这里打一行就
             // return，SSBO 保持全 0 —— 于是整条链最后一级静默输出 0（症状是
             // logits 全 0、argmax 恒等于 id 0，没有任何报错）。改为分块上传。
-            upload_buffer_chunked(cmdpool, aligned, src);
+            upload_buffer_chunked(cmdpool, aligned, src, fill);
             return;
         }
-        memset(b->ptr, 0, aligned);
-        // size_ may be 0 (empty tensor); src/data_ may be null then, and
-        // memcpy(dst, nullptr, 0) is UB under the optimized memmove.
-        if (size_ > 0) {
-            if (src) {
-                memcpy(b->ptr, src, size_);
-            } else {
-                memcpy(b->ptr, data_->data(), size_);
+        const auto payload = static_cast<size_t>(size_ > 0 ? size_ : 0);
+        if (fill) {
+            fill(b->ptr, payload, 0);
+            // Only the up-to-3-element tail that rounds the buffer to a vector
+            // boundary is padding; the memcpy path used to zero the whole
+            // region and then overwrite all but that tail.
+            if (aligned > payload) {
+                memset(static_cast<char *>(b->ptr) + payload, 0,
+                       aligned - payload);
+            }
+        } else {
+            memset(b->ptr, 0, aligned);
+            // size_ may be 0 (empty tensor); src/data_ may be null then, and
+            // memcpy(dst, nullptr, 0) is UB under the optimized memmove.
+            if (payload > 0) {
+                if (src) {
+                    memcpy(b->ptr, src, payload);
+                } else {
+                    memcpy(b->ptr, data_->data(), payload);
+                }
             }
         }
         std::shared_ptr<VulkanBuffer> buffer;
@@ -1240,7 +1275,8 @@ template <typename T> class Tensor : public ITensor {
     // 等待→复位，峰值只占一个块。常规尺寸仍走 copyToGPUBuffer 的单次快速路径。
     void
     upload_buffer_chunked(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                          size_t aligned, T *src) {
+                          size_t aligned, T *src,
+                          const StagingFillFn &fill = nullptr) {
         auto dev = cmdpool->getVulkanDevice();
         auto stpool = cmdpool->getStagingBufferPool();
         constexpr size_t kChunkBytes = static_cast<size_t>(64) << 20;
@@ -1255,9 +1291,12 @@ template <typename T> class Tensor : public ITensor {
             base_offset = view->getOffset();
         }
 
-        const char *bytes = reinterpret_cast<const char *>(
-            src ? static_cast<const void *>(src)
-                : static_cast<const void *>(data_->data()));
+        const char *bytes = nullptr;
+        if (!fill) {
+            bytes = reinterpret_cast<const char *>(
+                src ? static_cast<const void *>(src)
+                    : static_cast<const void *>(data_->data()));
+        }
         const size_t have = size_ > 0 ? static_cast<size_t>(size_) : 0;
         for (size_t done = 0; done < aligned; done += kChunkBytes) {
             size_t n = std::min(kChunkBytes, aligned - done);
@@ -1267,10 +1306,18 @@ template <typename T> class Tensor : public ITensor {
                 printf("copyToGPUBuffer chunked alloc failed %zu\n", n);
                 return;
             }
-            memset(part->ptr, 0, n);
             size_t payload = done < have ? std::min(n, have - done) : 0;
-            if (payload > 0) {
-                memcpy(part->ptr, bytes + done, payload);
+            if (fill) {
+                fill(part->ptr, payload, done);
+                if (n > payload) {
+                    memset(static_cast<char *>(part->ptr) + payload, 0,
+                           n - payload);
+                }
+            } else {
+                memset(part->ptr, 0, n);
+                if (payload > 0) {
+                    memcpy(part->ptr, bytes + done, payload);
+                }
             }
             cmd.begin();
             buffer->copyStageBufferToBuffer(

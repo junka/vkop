@@ -3,6 +3,7 @@
 #define MODEL_LOAD_HPP_
 
 #include <cassert>
+#include <cerrno>
 #include <memory>
 #include <stdexcept>
 #include <vector>
@@ -74,6 +75,69 @@ struct FileMapping {
     FileMapping& operator=(const FileMapping&) = delete;
     FileMapping(FileMapping&&) noexcept = default;
     FileMapping& operator=(FileMapping&&) noexcept = default;
+
+    // Hint that this fd will be swept front-to-back. Linux/FreeBSD only: the
+    // macOS SDK has no posix_fadvise at all (POSIX_FADV_SEQUENTIAL is not even
+    // declared), and there the per-file readahead detector keys off the
+    // ascending pread offsets instead, so the hint is not needed to get the
+    // same effect. Failure is ignored on purpose — a rejected hint only costs
+    // bandwidth, never correctness.
+    void advise_sequential() const {
+#if defined(__linux__) || defined(__FreeBSD__)
+        (void)::posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
+    }
+
+    // Read len bytes at a file offset without going through the mapping.
+    // Touching a multi-GB blob through mmap faults it in one 16KB page at a
+    // time (~1.4 GB/s measured on this volume); large preads run ~13 GB/s.
+    // Throws on a short read: a partially filled staging buffer would leave
+    // the rest of an initializer silently zeroed on the GPU.
+    void read_at(void* dst, size_t len, size_t offset) const {
+        if (len == 0) return;
+        if (offset > size || len > size - offset) {
+            throw std::runtime_error(
+                "read_at out of bounds: offset=" + std::to_string(offset) +
+                " len=" + std::to_string(len) +
+                " file_size=" + std::to_string(size));
+        }
+        char* out = static_cast<char*>(dst);
+        size_t done = 0;
+#ifdef _WIN32
+        OVERLAPPED ov = {};
+        LARGE_INTEGER pos;
+        while (done < len) {
+            pos.QuadPart = static_cast<LONGLONG>(offset + done);
+            ov.Offset = pos.LowPart;
+            ov.OffsetHigh = pos.HighPart;
+            DWORD got = 0;
+            if (!ReadFile(hFile, out + done, static_cast<DWORD>(len - done),
+                          &got, &ov) || got == 0) {
+                throw std::runtime_error("ReadFile failed at offset " +
+                                         std::to_string(offset + done));
+            }
+            done += got;
+        }
+#else
+        while (done < len) {
+            ssize_t n = ::pread(fd, out + done, len - done,
+                                static_cast<off_t>(offset + done));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                throw std::runtime_error("pread failed at offset " +
+                                         std::to_string(offset + done) + ": " +
+                                         std::strerror(errno));
+            }
+            if (n == 0) {
+                throw std::runtime_error("pread short read at offset " +
+                                         std::to_string(offset + done) +
+                                         " (" + std::to_string(len - done) +
+                                         " bytes requested)");
+            }
+            done += static_cast<size_t>(n);
+        }
+#endif
+    }
 
     ~FileMapping() {
 #ifdef _WIN32
@@ -157,6 +221,11 @@ public:
     const uint8_t* initializer_memory = nullptr;
     size_t initializer_memory_size = 0;
 
+    // Byte offset within the file that initializer_memory points at, so a
+    // recorded blob offset can be turned into an absolute pread offset (see
+    // FileMapping::read_at for why the loader streams weights that way).
+    size_t initializer_file_offset = 0;
+
     // Unified-tensor sub-allocation metadata (replaces the legacy
     // unified_metadata/unified_names/unified_tensors magic-initializer hack).
     // Copied out of the FlatBuffer struct array at load time (cheap: N x 32B);
@@ -170,6 +239,14 @@ public:
     std::vector<std::vector<std::string>> concurrent_execution_levels;
 
     explicit VkModel(const std::string& filePath);
+
+    // Backing mapping for initializer_memory / initializer_offsets. Only valid
+    // while this VkModel is alive, and only for models that loaded without
+    // throwing (loadFromBinary resets it on every failure path).
+    const FileMapping& fileMapping() const {
+        assert(file_mapping_);
+        return *file_mapping_;
+    }
 
     const std::vector<std::vector<std::string>>& getConcurrentExecutionLevels() const {
         return concurrent_execution_levels;

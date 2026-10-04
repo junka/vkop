@@ -35,8 +35,19 @@ Reserved，现在是 flags，**旧 bin 那里全是 0 → 行为完全不变，�
 
 | bit | 含义 | 写端怎么判定（`tokenizer_to_bin.py::derive_flags`，读 tokenizer.json 自动推） |
 |---|---|---|
-| 0 | pre-tokenizer 用 Phi-4/o200k 变体 | 正则里数字分支写成 `\p{N}{1,3}`（GPT-2 是单个 `\p{N}`） |
+| 0 | pre-tokenizer 用 Phi-4/o200k 变体 | 顶层分支逐条命中 `PHI_BRANCHES` 表（字母按大小写形状切两段、标点尾含 `/`），且 Split 段 `behavior/invert = (Removed, true)` |
 | 1 | 不做 NFC 规范化 | `tokenizer.json` 的 `normalizer` 为 null |
+| 2 | GPT-2 扫描器的数字段切 1~3 个 | GPT-2 家族且数字分支写成 `\p{N}{1,3}`（GLM-Edge、Llama-3）；写成 `\p{N}` 的就是 Qwen3-VL 那种逐位切，bit2 = 0 |
+
+判定是**白名单 + 表外即报错**，不做「看起来像」的猜测：切错 span 只会静默产出错 token，
+数值链路一路跑完都发现不了。只有 GPT-2 家族允许数字段那一处差异（`GPT2_DIGITS` 两个
+合法值），其余分支必须逐字符一致；Phi 的分支表则整张照抄。读端同样 fail-closed：
+`Tokenizer::load` 见到未定义的 flag 位直接抛，不会当 0 处理。
+用「正则全文里有没有 `\p{N}{1,3}`」判 Phi 曾把 GLM-Edge 误判成 Phi —— 它和 Qwen 只差
+数字段这一处，字母分支完全是 GPT-2 口径。
+
+已生成的三种口径：`qwen3_vl.bin`（flags=0）、`phi4_mini.bin`（flags=3）、
+`glm_edge.bin`（flags=6）。
 
 Phi-4 变体与 GPT-2 的三处实质差异（都在 `pre_tokenize_phi` 里按 Rust regex 的
 leftmost-first + 贪心/回退语义手写）：
@@ -46,7 +57,8 @@ leftmost-first + 贪心/回退语义手写）：
    `HelloWorld` 切成 `Hello`+`World`，而 `ABc` 是一整段；GPT-2 的 `\p{L}+` 会整串
    当一个 token。`Lm/Lo/M` 同属两类，`[UL]*` 贪心后要能回退（`ᐁᐁ` 这类连续 Lo 只有
    回退才匹配得上）。
-2. 数字是 `\p{N}{1,3}`（贪心 1~3 个），GPT-2 逐位切。
+2. 数字是 `\p{N}{1,3}`（贪心 1~3 个）；GPT-2 那一族由 bit2 决定，Qwen3-VL 传 1、
+   GLM-Edge/Llama-3 传 3（`pre_tokenize(..., digit_max)` 的 alt3）。
 3. 标点串的拖尾字符类多一个 `/`（`[\r\n/]*`），且缩写 `(?i:'s|'t|...)` 只能挂在字母段
    尾巴上，没有 GPT-2 那样的独立分支。
 
@@ -59,8 +71,13 @@ leftmost-first + 贪心/回退语义手写）：
 ```bash
 python3 gen_ground_truth.py                       # 默认 Qwen3-VL → hf_ground_truth.json
 TOK_JSON=<model>/tokenizer.json OUT=phi_ground_truth.json python3 gen_ground_truth.py
+TOK_JSON=<model>/tokenizer.json OUT=glm_ground_truth.json python3 gen_ground_truth.py
 ./build/llm/tokenizer/tests/tokenizer_test <model.bin> <ground_truth.json>
 ```
+
+ctest 里每个模型各一条用例（`tokenizer_test` / `tokenizer_test_phi` /
+`tokenizer_test_glm`），bin 与 ground truth 都在仓库里，见
+`tests/CMakeLists.txt` 的 `OTHER_TOKENIZERS` 表。
 
 `tests/main.cpp` 里 chat template 的期望值不再写死某个模型的标记串：拼装内容由
 bin 里的角色前后缀决定，与 HF jinja 渲染是否逐字符一致用

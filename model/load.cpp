@@ -147,6 +147,9 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
     if (blob_mem) {
         this->initializer_memory = blob_mem;
         this->initializer_memory_size = blob_size;
+        // buf is the mmap base, which is file offset 0, so this pointer delta
+        // is also the absolute offset to pread from.
+        this->initializer_file_offset = static_cast<size_t>(blob_mem - buf);
     } else {
         this->initializer_memory = nullptr;
         this->initializer_memory_size = 0;

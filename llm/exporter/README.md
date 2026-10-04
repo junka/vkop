@@ -33,6 +33,8 @@
 | [qwen3vl_infer.py](qwen3vl_infer.py) | HF 原生推理封装（`Qwen3VLInference`），作为对比基准。 |
 | [qwen3_export_onnx.py](qwen3_export_onnx.py) | 纯文本 Qwen3（`Qwen3ForCausalLM`）导出 → `text_qwen3/`。 |
 | [phi4_export_onnx.py](phi4_export_onnx.py) | Phi-4-mini（`Phi3ForCausalLM`）导出 → `text_phi4/`；与 Qwen 共用同一套张量 I/O 契约。 |
+| [glm_edge_export_onnx.py](glm_edge_export_onnx.py) | GLM-Edge-1.5B-Chat（`GlmForCausalLM`）导出 → `text_glm_edge/`；同一套张量 I/O 契约。 |
+| [greedy_ref.py](greedy_ref.py) | CPU ORT 的 greedy 逐步解码参考（架构参数全部从图形状读），用 `ONNX`/`EMBED`/`MODEL_PATH` 选模型，和 GPU 逐 token 对拍。 |
 | `visual.onnx` / `llm.onnx` / `llm.weights.bin` | 导出产物（`llm.weights.bin` 是 llm.onnx 的外部权重单文件）。 |
 
 ## 构建
@@ -351,6 +353,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_MAX_CTX=<tokens>` | 多轮上下文的 token 预算，默认 `8192 - max_new`；超预算整对丢掉最旧的一问一答 |
 | `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
 | `VKOP_PROFILE=1` | 开启性能分析：每轮结束输出 prefill/decode 的 tokens/s、延迟百分位 (p50/p90/p99)、KV cache 利用率；会话结束时打印全局汇总统计 |
+| `VKOP_LOAD_MMAP=1` | 载入走旧的 mmap 路径。默认（不设）走**从文件 pread 直灌 staging buffer**：多 GB initializer 逐页 fault 实测 ~1.4 GB/s，大块 pread 快得多且省掉 host→host memcpy。三个模型的 vkopbin 上 warm cache 差距只有 ~10%，冷启动才明显；仅影响 `LoadModel`，数值路径逐 token 不变 |
 | `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
@@ -486,7 +489,7 @@ python3 -m onnx2vkop.cli -i text_phi4/llm.onnx -o text_phi4/llm.vkopbin
 MODEL_DIR=~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
   OUTPUT_BIN=../tokenizer/phi4_mini.bin python3 ../tokenizer/tokenizer_to_bin.py
 # 5) 三方 token 对齐（HF generate / ONNX Runtime / vkop GPU）
-python3 phi4_greedy_ref.py "用一个词回答：天空是什么颜色？"
+python3 greedy_ref.py "用一个词回答：天空是什么颜色？"   # 默认指 text_phi4/
 ```
 
 
@@ -502,8 +505,9 @@ python3 phi4_greedy_ref.py "用一个词回答：天空是什么颜色？"
    所以必须复用 HF 的 rotary_emb 而不是手写 RoPE；自己算会漏掉它，注意力分数差
    1.190238^2 = 1.4167 倍。
 4. **模板与停止符**：Phi 的每轮壳是 `<|role|>...<|end|>`（无换行），且
-   `add_generation_prompt=False` 时模板会给整段对话补一个 eos。驱动里
-   `im_end_token_id()` 会同时探测 ChatML 与 `<|end|>` 两个字面量，Qwen 侧行为不变。
+   `add_generation_prompt=False` 时模板会给整段对话补一个 eos。当时为它加的
+   `im_end_token_id()` 双字面量探测，到 GLM 那一族已经不够用（三个停止 id、模板还
+   没有轮末标签），现在统一成 `stop_token_ids()`，见下一节。
 
 **跑通 Phi 期间修掉的三个静默错误**（都会让输出变成全 0 或错位，且都不报错）：
 
@@ -532,6 +536,85 @@ HF generate = ONNX Runtime = vkop GPU = [72721, 4472, 788, 200020]  →  '蓝色
 `phi4_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
 累积舍入），32 层 present_key_values 全部 < 1.4e-3，decode 单步 argmax 一致，
 每轮 GPU 约 330ms/token。
+
+---
+
+## 第三个架构：GLM-Edge-1.5B-Chat（`text_glm_edge/`）
+
+`ZhipuAI/glm-edge-1.5b-chat`（ModelScope）是 `GlmForCausalLM`：28 层 / hidden 2048 /
+16 q 头 4 kv 头（GQA 4 组）/ head_dim 128 / intermediate 6144 / vocab 59264 /
+`tie_word_embeddings=true` / `max_position_embeddings=8192`。导出物同样复用那套张量
+I/O 名字与形状，`llm_chat` / `kv_cache` 的加载逻辑一行没改；架构差异全部落在导出脚本、
+分词器和 `Conversation` 的轮边界处理里。
+
+```bash
+# 1) 导出 ONNX（朴素 pre-norm decoder，分离 q/k/v 投影 + fused gate_up_proj）
+python3 glm_edge_export_onnx.py          # → text_glm_edge/llm.onnx + llm.weights.bin
+python3 dump_embed_tokens_glm_edge.py    # → text_glm_edge/embed_tokens.bin (59264x2048 fp16, 243MB)
+# 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
+python3 glm_edge_check_onnx.py
+# 3) 转 vkopbin —— 权重 2.94GB，同样不能加 -u（UnifiedMeta 偏移是 int32）
+python3 -m onnx2vkop.cli -i text_glm_edge/llm.onnx -o text_glm_edge/llm.vkopbin
+# 4) tokenizer bin
+MODEL_DIR=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
+  OUTPUT_BIN=../tokenizer/glm_edge.bin python3 ../tokenizer/tokenizer_to_bin.py
+# 5) 三方 token 对齐（ONNX Runtime 这一路；HF 与 GPU 见下）
+ONNX=text_glm_edge/llm.onnx EMBED=text_glm_edge/embed_tokens.bin \
+MODEL_PATH=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
+  python3 greedy_ref.py "用一个词回答：天空是什么颜色？"
+# 6) GPU
+../../build/llm_chat text_glm_edge/llm.vkopbin text_glm_edge/embed_tokens.bin \
+  ../tokenizer/glm_edge.bin 48
+```
+
+**与 Qwen3 / Phi-4 的三处差异**（每一处都是「切错了不报错」的那类）：
+
+1. **RoPE 的配对方式是交错（interleaved）的**：`modeling_glm.apply_rotary_pos_emb` 用
+   `x[..., 0::2] / x[..., 1::2]` 配对并 `repeat_interleave(2)` cos/sin，即维度 (2i, 2i+1)
+   共享角度 i；Qwen/Phi 的 `rotate_half` 配的是 (i, i+64)。runtime 的
+   `RotaryEmbedding` 内核和转换器的 `fuse_rotary_embedding` 都只按半切实现，所以导出时
+   把交错形式**改写成半切 + 固定列置换**：对 x 施加 `P = [偶数列 ‖ 奇数列]`、做半切 RoPE、
+   再施加 `P⁻¹`。HF 的 `cos = cat(f, f)` 正好等于半切所需宽度，于是权重不动、内核不加模式；
+   代价是 q/k 各两个 Reshape+Transpose（成对抵消，present_key_values 仍与 HF 同基，
+   逐层 KV 对齐照常可比）。脚本导出前先自证这两种写法逐位等价。
+2. **分词器是 GPT-2 扫描器的第三种口径**：GLM 的 pre_tokenizer 与 Qwen3-VL 只差数字段
+   ——`\p{N}` 对 `\p{N}{1,3}`（字母分支完全是 GPT-2 口径），而 Phi 的 o200k 是按大小写
+   形状切分。所以 flags 加 **bit2 = 数字段按 1~3 个切**（`tokenizer.cpp` 的
+   `pre_tokenize(..., digit_max)`），GLM 的 bin 是 `flags=6`（bit1 无 NFC + bit2）。
+   写端逐分支比对已知正则表、表外形状直接报错，读端拒绝任何未定义的 flag 位：span 切错
+   只会静默产出错 token，整条数值链路跑完都看不出来。早先用
+   `"\p{N}{1,3}" in 全文` 判 Phi 就是把 GLM-Edge 误判成 Phi 的那次事故。
+3. **模板没有轮末标签，停止符是一组 id**：GLM 的 chat template 每轮渲染成
+   `<|user|>\n{content}`，`eos_token_id = [59246, 59253, 59255]`（依次是
+   `` / `<|user|>` / `<|observation|>`，见 tokenizer.json 的 `added_tokens`）—— 一轮是由**下一轮的开头标签**封口的。于是
+   `im_end_token_id()` 换成 `stop_token_ids()`（按字面量查、命中任意一个即停），
+   `Conversation` 的收尾串改由 `turn_tail_literal()` 从模板剥出（GLM 剥出来是空串）。
+   空收尾串就是这一族的信号：assistant 轮里生成出来的那个 `<|user|>` **必须丢掉**，
+   因为下一轮的 `apply_chat_template` 还会再渲染一次 —— 留着就成了双份角色标签，
+   历史序列不再是 HF 能渲染出来的那个串。ChatML/Phi 那一族正相反，轮末标签就是收尾串本身，
+   必须保留。
+
+**三方 token 一致（greedy，prompt「用一个词回答：天空是什么颜色？」）**：
+
+```
+HF generate (fp16 与 bf16 同解) = ONNX Runtime = vkop GPU
+  = [21499, 372, 7390, 9235, 326, 59253]  →  '天空是蓝色的。<|user|>'
+```
+
+prompt 侧也逐 token 相同：13 个 id `[59253, 10, 551, …]`（GPU 侧用 `VKOP_CHATDBG=1`
+打印）。`glm_edge_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3、argmax
+一致率 1.000，28 层 present_key_values 全部 < 1.7e-3，decode 单步 argmax 相同；
+GPU 上 prefill 约 90ms、decode 约 110ms/token。多轮：第二轮的历史是 37 个 token =
+第一轮 user 13 + assistant 正文 11 + 第二轮 user 13，正好是「丢掉末尾那个 `<|user|>`
+停止符」之后的长度（留着就是 38、并且角色标签成双），模型答 `小明。`。把它和 HF 整段
+（3 轮）渲染重 encode 的 36 个 token 对齐比：唯一差别在 assistant 正文里那一个 token
+（生成时是 `…13127, 552…` 两段，重 encode 同一段文本只出 10 段）—— 这正是
+`Conversation` 绝不重分词 assistant 轮的原因；两个 role 标签、换行和轮边界逐 token 相同。
+
+上下文上界是 8192（config 的 `max_position_embeddings`，与驱动侧 KV 预分配上界一致）；
+rope 是 `rope_type=default`、`attention_scaling=1.0`、inv_freq 常量，没有 Phi-4 那种
+数据相关的 longrope 分支。config 里没有 `sliding_window` / `layer_types` 字段，导出与
+对齐脚本都就此断言一次 —— 有滑窗的话加法 causal bias 不再与 HF 等价。
 
 ### 局限（llm_chat）
 

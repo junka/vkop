@@ -606,8 +606,14 @@ int main(int argc, char** argv) {
     PerfMetrics session_metrics;
 
     // REPL loop.
-    std::printf("\n=== ready (max_new=%d, im_end=%u). type a prompt, Ctrl-D to quit ===\n\n",
-                max_new, conv.im_end_id());
+    {
+        std::string stops;
+        for (uint32_t id : conv.stop_ids()) {
+            stops += (stops.empty() ? "" : ",") + std::to_string(id);
+        }
+        std::printf("\n=== ready (max_new=%d, stop=[%s]). type a prompt, Ctrl-D to quit ===\n\n",
+                    max_new, stops.c_str());
+    }
     std::string line;
     int turn = 0;
     while (std::getline(std::cin, line)) {
@@ -641,6 +647,11 @@ int main(int argc, char** argv) {
         std::printf("[prompt] %zu tokens, %zu image span(s) (history %d turns)\n",
                     ids.size(), rctx.spans.size(), static_cast<int>(conv.size()));
         std::fflush(stdout);
+        if (std::getenv("VKOP_CHATDBG")) {   // 与 HF/ORT 逐 token 对齐时用
+            std::printf("  [ids]");
+            for (uint32_t id : ids) std::printf(" %u", id);
+            std::printf("\n");
+        }
         if (static_cast<int>(ids.size()) + max_new > MAX_KV) {
             std::fprintf(stderr,
                 "[error] 序列 %zu tokens + 最多生成 %d 超出 KV 预分配上界 %d —— "
@@ -887,7 +898,7 @@ int main(int argc, char** argv) {
 
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
-            if (static_cast<uint32_t>(next_id) == conv.im_end_id()) {
+            if (conv.isStop(static_cast<uint32_t>(next_id))) {
                 std::printf("[done] 本轮结束\n");
                 break;
             }

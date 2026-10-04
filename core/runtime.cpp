@@ -51,6 +51,30 @@ void Runtime::LoadModel() {
     std::unordered_map<std::string, int> consumers;
 
     auto dev = m_cmdpool_->getVulkanDevice();
+
+    // Stream initializers straight out of the file instead of reading them
+    // through the mmap: faulting a multi-GB blob in one 16KB page at a time
+    // measures ~1.4 GB/s here, large preads ~13 GB/s in isolation (~4 GB/s once
+    // the per-buffer staging submit+wait is in the loop) — and the bytes land
+    // in the Vulkan staging buffer without the usual host->host memcpy. Only
+    // verbatim buffer copies can use it (an image upload converts the layout
+    // on the host, and the int64/int32 shape constants are consumed by the CPU
+    // anyway), so those keep the mapped view. VKOP_LOAD_MMAP=1 forces the old
+    // path for A/B runs.
+    const bool stream_blob = std::getenv("VKOP_LOAD_MMAP") == nullptr &&
+                             model.initializer_memory != nullptr;
+    const load::FileMapping *blob_file =
+        stream_blob ? &model.fileMapping() : nullptr;
+    const size_t blob_base = model.initializer_file_offset;
+    if (blob_file != nullptr)
+        blob_file->advise_sequential();
+    auto file_fill = [&](size_t blob_offset) {
+        return [blob_file, blob_base, blob_offset](void *dst, size_t len,
+                                                   size_t done) {
+            blob_file->read_at(dst, len, blob_base + blob_offset + done);
+        };
+    };
+
     // preprocess inputs, make sure we know node types for inputs
     for (const auto &n : model.nodes) {
         for (const auto &in_shape : n.inputs) {
@@ -135,7 +159,7 @@ void Runtime::LoadModel() {
 
     auto handle_floating_point_tensor = [&](const load::Initializer &init,
                                             const uint8_t *src_base,
-                                            auto &tensor) {
+                                            size_t blob_offset, auto &tensor) {
         using T =
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
@@ -165,7 +189,11 @@ void Runtime::LoadModel() {
             // rank (row-major compact, no NCHW->RGBA image packing). This is
             // the path the LLM (buffer-only ops) uses.
             tensor->as_storage_buffer(dev);
-            tensor->copyToGPU(m_cmdpool_, src);
+            if (stream_blob) {
+                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset));
+            } else {
+                tensor->copyToGPU(m_cmdpool_, src);
+            }
         } else if (tensor->num_dims() <= 2) {
             if (inputs_for_node_type[init.name] == "Conv" ||
                 inputs_for_node_type[init.name] == "BatchNormalization") {
@@ -175,7 +203,11 @@ void Runtime::LoadModel() {
             }
             // src points into the read-only mmap'd initializer blob; the
             // Tensor upload overloads only read from it.
-            tensor->copyToGPU(m_cmdpool_, src);
+            if (stream_blob) {
+                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset));
+            } else {
+                tensor->copyToGPU(m_cmdpool_, src);
+            }
         } else {
             tensor->as_input_image(dev, nullptr, false, true);
             tensor->copyToGPUImage(m_cmdpool_, src, model.rgba);
@@ -240,9 +272,14 @@ void Runtime::LoadModel() {
         auto unified_tensor = std::make_shared<Tensor<float>>(unified_dims);
         unified_tensor->set_ref_cnt_forever();
         auto buffer = unified_tensor->as_uniform_buffer(dev);
-        unified_tensor->copyToGPU(
-            m_cmdpool_,
-            const_cast<float *>(reinterpret_cast<const float *>(src_ptr)));
+        if (stream_blob) {
+            unified_tensor->copyToGPU(m_cmdpool_, nullptr,
+                                      file_fill(unified_base));
+        } else {
+            unified_tensor->copyToGPU(
+                m_cmdpool_,
+                const_cast<float *>(reinterpret_cast<const float *>(src_ptr)));
+        }
 
         size_t name_idx_offset = 0;
         for (const auto &meta : model.unified_meta) {
@@ -269,9 +306,25 @@ void Runtime::LoadModel() {
         }
     }
 
-    for (const auto &itr : model.initializers) {
-        auto init = itr.second;
-        size_t offset = model.initializer_offsets[init.name];
+    // Upload in ascending blob-offset order: the blob is written front-to-back,
+    // so this turns the per-tensor preads into one advancing sweep on this fd,
+    // which is the precondition for the POSIX_FADV_SEQUENTIAL hint above to
+    // mean anything on Linux/FreeBSD. Measured neutral here — paired cold loads
+    // of same-size graphs came out within +-6% either way — because the
+    // residual upload cost on this machine is the per-buffer staging
+    // submit+wait, not the read order. .at() rather than operator[] so a
+    // missing offset throws instead of silently reading from byte 0.
+    std::vector<std::pair<size_t, load::Initializer>> ordered_inits;
+    ordered_inits.reserve(model.initializers.size());
+    for (const auto &itr : model.initializers)
+        ordered_inits.emplace_back(model.initializer_offsets.at(itr.first),
+                                   itr.second);
+    std::sort(ordered_inits.begin(), ordered_inits.end(),
+              [](const auto &a, const auto &b) { return a.first < b.first; });
+
+    for (const auto &entry : ordered_inits) {
+        const auto &init = entry.second;
+        size_t offset = entry.first;
         const uint8_t *src_ptr = model.initializer_memory + offset;
         if (init.dtype == "int64") {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
@@ -305,13 +358,13 @@ void Runtime::LoadModel() {
             initializers_[init.name] = t;
         } else if (init.dtype == "float32") {
             auto t = std::make_shared<Tensor<float>>(init.dims);
-            handle_floating_point_tensor(init, src_ptr, t);
+            handle_floating_point_tensor(init, src_ptr, offset, t);
         } else if (init.dtype == "float16") {
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
-            handle_floating_point_tensor(init, src_ptr, t);
+            handle_floating_point_tensor(init, src_ptr, offset, t);
         } else if (init.dtype == "int8") {
             auto t = std::make_shared<Tensor<int8_t>>(init.dims);
-            handle_floating_point_tensor(init, src_ptr, t);
+            handle_floating_point_tensor(init, src_ptr, offset, t);
         } else {
             throw std::runtime_error("Only float32/int32/fp16/int8 initializer "
                                      "is supported for now " +

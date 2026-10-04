@@ -2,9 +2,13 @@
 // Conversation —— 多轮对话的上下文管理（纯 host 侧，不碰 Runtime / 算子）。
 //
 // 存的是 token 级的历史：每轮渲染并 tokenize 后的 ids（user 轮含 role 前后缀和
-// 已展开的 image pad；assistant 轮含 role 前缀 + 生成时的原始 ids + 结束符后缀），
+// 已展开的 image pad；assistant 轮含 role 前缀 + 生成时的原始 ids + 收尾串），
 // 外加每轮里每张图落在序列哪一段。render() 把保留的历史拼成一次 prefill 需要的
 // 完整序列。
+//
+// 「一轮怎么收尾」各家不一样，所以这里不假设它非空：ChatML 是<|im_end|>+换行，Phi 是
+// <|end|>，GLM-Edge 那套早期 ChatML 壳**没有轮末标签**（收尾串为空，一轮由下一轮的
+// 角色标签 <|user|> 封口），停止判据也就是一组 id 而不是一个。
 //
 // 两个不显然但决定正确性的点：
 //  1. assistant 轮绝不重新分词。BBPE 的 decode→encode 不保证可逆（piece 的词首
@@ -20,6 +24,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -68,8 +73,8 @@ public:
         std::vector<RenderedContext::Span> spans;  // 本轮每张图（start 相对本轮）
     };
 
-    // 结束符 / 图像 pad 两个特殊 token 的 id 都从 tokenizer 注册表按字面量查，
-    // 不在调用方写死数字（换 checkpoint 即失效）。
+    // 停止符 / 图像 pad / 轮收尾串都从 tokenizer 的模板与注册表推导，不在这里写死
+    // 数字或标签串（换 checkpoint 即失效）。
     explicit Conversation(const qwen::Tokenizer& tok);
 
     // 图片块在 REPL 之前登记完（视觉塔先跑），之后只读。
@@ -97,7 +102,11 @@ public:
     std::size_t size() const { return turns_.size(); }
     const std::vector<Turn>& turns() const { return turns_; }
     uint32_t image_pad_id() const { return image_pad_id_; }
-    uint32_t im_end_id() const { return im_end_id_; }
+    // 命中其中任意一个就算本轮结束。
+    const std::vector<uint32_t>& stop_ids() const { return stop_ids_; }
+    bool isStop(uint32_t id) const {
+        return std::find(stop_ids_.begin(), stop_ids_.end(), id) != stop_ids_.end();
+    }
     // tokenizer.bin 里没烘 chat template（旧产物）时为 false：只能每轮独立跑，
     // 累积历史没有意义（没模板就没法把一轮包成模型看得懂的对话格式）。
     bool has_template() const { return !gen_ids_.empty(); }
@@ -113,9 +122,9 @@ private:
     std::vector<ImageBlock> blocks_;
     std::vector<Turn> turns_;
     std::vector<uint32_t> gen_ids_;     // assistant 引导串（角色前缀）
-    std::vector<uint32_t> user_suffix_; // 一 turn 的收尾（结束符 + 换行）
+    std::vector<uint32_t> turn_tail_;   // 一 turn 的收尾串；GLM 系为空
+    std::vector<uint32_t> stop_ids_;
     uint32_t image_pad_id_ = 0;
-    uint32_t im_end_id_ = 0;
     int total_len_ = 0;                 // Σ turn.ids.size()
 };
 
