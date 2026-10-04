@@ -17,10 +17,10 @@ namespace ops {
 
 namespace scatter {
 struct alignas(16) ScatterPC {
-    int n_threads; // n_idx * cols
-    int cols;      // row width
-    int reduction; // 0 = none (overwrite), 1 = add
-    int _pad;
+    int n_threads;  // n_idx * cols
+    int cols;       // row width
+    int reduction;  // 0 = none (overwrite), 1 = add
+    int data_total; // elements in data/output; bounds-checks the target
 };
 } // namespace scatter
 
@@ -88,6 +88,47 @@ class ScatterElements : public BufferFactory {
                 static_cast<int>(core::as_tensor<T>(inputs[1])->num_elements());
         });
         int n_threads = n_idx;
+
+        // The (row, col) split takes cols from *indices* but reads updates at
+        // the same flat gid, so indices and updates must agree on rank and on
+        // the trailing width, and hold the same number of elements. Check it
+        // here: a shape chain that lost a rank-increasing view breaks all
+        // three, and every target address computed from it is then wrong. The
+        // shader drops out-of-range writes, but a dropped write is only half
+        // the story — the shapes say why. Skip when a dim is still dynamic
+        // (-1), where the comparison would be meaningless.
+        auto upd_shape = inputs[2]->getShape();
+        auto concrete = [](const std::vector<int> &s) {
+            for (int d : s)
+                if (d < 0)
+                    return false;
+            return true;
+        };
+        int upd_cols = 1;
+        for (size_t i = 1; i < upd_shape.size(); ++i) {
+            upd_cols *= upd_shape[i];
+        }
+        const int upd_total = static_cast<int>(total_elems(upd_shape));
+        if (concrete(idx_shape) && concrete(upd_shape) &&
+            (idx_shape.size() != upd_shape.size() || cols != upd_cols ||
+             n_idx != upd_total)) {
+            auto shp = [](const std::vector<int> &s) {
+                std::string r = "[";
+                for (size_t i = 0; i < s.size(); ++i)
+                    r += std::to_string(s[i]) + (i + 1 == s.size() ? "]" : ",");
+                return r;
+            };
+            throw std::runtime_error(
+                "ScatterElements " + get_name() + ": indices " +
+                shp(idx_shape) + " and updates " + shp(upd_shape) +
+                " must have equal rank, equal trailing "
+                "width and equal element count (cols=" +
+                std::to_string(cols) + " upd_cols=" + std::to_string(upd_cols) +
+                " n_idx=" + std::to_string(n_idx) +
+                " upd_total=" + std::to_string(upd_total) +
+                "); a view "
+                "node was folded out of the shape chain");
+        }
 
         // GPU dispatch path for BOTH fp32 and fp16. The fp16 shader variant
         // (buffer_scatter_elements_fp16_spv, built with -DFP16) uses a
@@ -157,6 +198,9 @@ class ScatterElements : public BufferFactory {
         pc.n_threads = n_threads;
         pc.cols = cols;
         pc.reduction = reduction_;
+        pc.data_total = concrete(data_shape)
+                            ? static_cast<int>(total_elems(data_shape))
+                            : 0; // shader skips the bounds check on 0
         submit(&pc, UP_DIV(n_threads, 256), 1, 1);
     }
 

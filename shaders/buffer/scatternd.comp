@@ -64,5 +64,10 @@ void main() {
         base = base * uPC.dataDims.v[k] + v;
     }
     int target = base * uPC.slice_size + within;
+    // The host checks the ONNX invariant, but a stray write here lands in
+    // whichever memory neighbours the output buffer (weights, not this
+    // tensor), so drop it instead. A dropped write is a wrong value at a
+    // visible output; a wrong write is corruption somewhere else entirely.
+    if (target < 0 || target >= uPC.data_total) return;
     uOut.data[target] = uUpd.data[uidx];
 }

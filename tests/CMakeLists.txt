@@ -323,6 +323,18 @@ target_compile_definitions(ModelTest PRIVATE
 )
 add_test(ModelTest ModelTest)
 
+# Converter unit tests (no GPU, no libtorch): standalone assert scripts over
+# synthetic DAGs at the repo root. Registered here so `ctest` covers the
+# optimizer's fold decision table, not just the runtime.
+file(GLOB CONVERTER_TESTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/test_*.py)
+foreach(script ${CONVERTER_TESTS})
+    get_filename_component(test_name ${script} NAME_WE)
+    add_test(NAME converter_${test_name}
+             COMMAND ${Python3_EXECUTABLE} ${script}
+             WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    set_tests_properties(converter_${test_name} PROPERTIES TIMEOUT 120)
+endforeach()
+
 # Image layout accounting probe (not a gtest): reports driver rowPitch /
 # arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
 # single image2D, plus the real per-tensor gap for a given .vkopbin.

@@ -34,7 +34,7 @@ layout(push_constant) uniform PC {
     int n_threads; // n_idx = indices.numel() == updates.numel()
     int cols;      // trailing width shared by indices/updates/data rows
     int reduction; // 0 = none (overwrite), 1 = add
-    int _pad;
+    int data_total; // elements in data / output, for the target bounds check
 } uPC;
 
 void main() {
@@ -46,6 +46,11 @@ void main() {
     // index-element position, so no row/col decomposition is needed here.
     int row = uIndices.data[gid].x;
     int target = row * uPC.cols + col;
+    // Out-of-range here is a write into whatever memory neighbours the data
+    // buffer (another tensor's bytes, or the weight blob), so drop it: a
+    // dropped scatter is a wrong value in this op's own output. data_total
+    // == 0 means the host had no concrete shape, so it cannot bound us.
+    if (uPC.data_total > 0 && (target < 0 || target >= uPC.data_total)) return;
 
 #ifdef FP16
     // fp16: packed two-per-uint-word. target element index -> word + slot.

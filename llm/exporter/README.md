@@ -140,6 +140,17 @@ present_kv = stack([k_new, v_new], dim=1)
    用 `-1e4` 会因 fp16 下 softmax 区分度不足产生偏差。
 5. **MRoPE position_ids**：形状 `(3,B,q)`，纯文本时三行相等退化为标准 RoPE；含图像时
    t/h/w 不同（图像 token 用 3D 位置）。由调用方用 HF `get_rope_index` 预算，wrapper 不算位置。
+6. **转换器折掉「升秩 Unsqueeze」**：`fuse_unsqueeze_eliminate` 会删掉只加一个 size-1 轴的
+   `Unsqueeze`（字节排布确实不变），但删掉之后消费者在 runtime 拿到的是 view **前**的秩。
+   `/rotary_emb` 的 `Unsqueeze(axes=[-1])×3 → Concat(axis=-1)` 就这样被折掉，`ScatterND`
+   把 `indices.shape[-1]=21` 当成 index_rank（应为 3），20 个 scatter 目标全部越出 256B 的
+   输出 buffer，按数据决定的地址把 fp32 的 rope cos/sin 写进相邻的 fp16 权重显存
+   （权重里出现 `0xfffa` = NaN），于是 decode 从某轮起全 NaN。**这就是「最早支持的模型
+   莫名其妙坏了」的真相：模型文件一个字没改，是转换器新增的折叠规则把它的地基挖空了。**
+   现在折叠走白名单（fail closed）：只有逐元素一元 op、以及「插入轴严格晚于拼接轴」的
+   Concat 才折；其余 view 节点留给 runtime 的 `SqueezeUnsqueeze`（纯 GPU 别名，不读回）。
+   runtime 侧同时补了不变量检查：`ScatterND`/`ScatterElements` 的形状不满足 ONNX 契约就
+   直接抛错并打印三边形状，shader 丢弃越界写 —— 越界不再静默。
 
 #### deepstack 注入（opset17 兼容）
 
@@ -327,8 +338,8 @@ table，所以这条还没接（也就没有 vLLM/SGLang 那种跨请求 prefix 
 printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回复"好的"。\n我的名字是什么？我喜欢什么运动？\n' | \
   ./build/llm_chat llm/exporter/text_qwen3/llm.vkopbin \
   llm/exporter/text_qwen3/embed_tokens.bin llm/exporter/text_qwen3/tokenizer.bin 28
-# [prompt] 27 tokens (history 1 turns) → 好的
-# [prompt] 45 tokens (history 3 turns) → 你的名字是小明，你喜欢的运动是打篮球。
+# [prompt] 28 tokens (history 1 turns) → 好的
+# [prompt] 46 tokens (history 3 turns) → 我的名字是小明，我喜欢打篮球。
 # 单独问第二个问题（新进程、无历史）则答不出名字 —— 上下文确实生效。
 ```
 

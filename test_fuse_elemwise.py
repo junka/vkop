@@ -57,10 +57,9 @@ def make_shared_intermediate():
     return m
 
 
-def make_cast_break():
-    """Add(A,B)->t1; Cast(t1)->t2 (Cast not chainable); Sqrt(t2)->out.
-    Two separate chains, each len-1 -> nothing fuses (below MIN=2).
-    A longer variant: Add->Mul [chainable] then Cast breaks."""
+def make_add_cast_sqrt():
+    """Add(A,B)->t1; Cast(t1)->t2; Sqrt(t2)->out. A chain that crosses a dtype
+    boundary in the middle -- Cast is chainable, so all three fuse."""
     m = DAGBasedModel()
     A = tdict("A", [8]); B = tdict("B", [8])
     t1 = tdict("t1", [8]); t2 = tdict("t2", [8]); out = tdict("out", [8])
@@ -152,14 +151,20 @@ def test_shared_not_fused():
     print("  PASS (shared producer Add not absorbed; Sqrt+Neg+Mul DAG fused)")
 
 
-def test_cast_break():
-    m = make_cast_break()
+def test_cast_is_chainable():
+    """Add -> Cast -> Sqrt. Cast (OP_CAST=11) is chainable since the register
+    machine made it a no-op (the dtype conversion happens at the store), so the
+    whole 3-op chain fuses. This replaced the older 'Cast breaks the chain'
+    behaviour."""
+    m = make_add_cast_sqrt()
     m = run_fusion(m)
     fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
-    # Add->Cast breaks (Cast not chainable); Cast->Sqrt: Cast not chainable so
-    # Sqrt is a len-1 chain. Nothing >= MIN=2 fuses.
-    assert len(fused) == 0, f"expected 0 fused (cast breaks chain), got {len(fused)}; nodes={[n.op_type for n in m.nodes.values()]}"
-    print("  PASS (cast breaks chain correctly)")
+    assert len(fused) == 1, f"expected 1 fused (cast chainable), got {len(fused)}; nodes={[n.op_type for n in m.nodes.values()]}"
+    f = fused[0]
+    # Add{1, dst=2, a=0, b=1}; Cast{11, dst=3, a=2, b=0}; Sqrt{6, dst=0, a=3}
+    assert f.attributes["ops"] == [1, 2, 0, 1, 11, 3, 2, 0, 6, 0, 3, 0], \
+        f.attributes["ops"]
+    print("  PASS (Cast is chainable; Add->Cast->Sqrt fuses as 3 ops)")
 
 
 def test_scalar_constant():
@@ -189,8 +194,8 @@ if __name__ == "__main__":
     test_addsqrtmul()
     print("test_shared_not_fused:")
     test_shared_not_fused()
-    print("test_cast_break:")
-    test_cast_break()
+    print("test_cast_is_chainable:")
+    test_cast_is_chainable()
     print("test_scalar_constant:")
     test_scalar_constant()
     print("\nALL PASS")

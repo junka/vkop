@@ -73,6 +73,39 @@ class ScatterND : public BufferFactory {
         int data_total = total_elems(data_shape);
         int updates_total = total_elems(updates_shape);
 
+        // ONNX invariant on these three shapes:
+        //   updates.shape == indices.shape[:-1] + data.shape[index_rank:]
+        // It is checked here because nothing downstream can be: the shader
+        // computes the target address from the indices themselves and has no
+        // bounds check, so a wrong index_rank turns every scatter into a write
+        // at a data-dependent address past the end of the output buffer — a
+        // silent corruption of whichever memory happens to neighbour it (this
+        // is how fp32 rope values ended up inside the fp16 weight blob). A
+        // shape chain that lost a rank-increasing view is exactly this case:
+        // fail loudly.
+        auto shape_str = [](const std::vector<int> &s) {
+            std::string r = "[";
+            for (size_t i = 0; i < s.size(); ++i)
+                r += std::to_string(s[i]) + (i + 1 == s.size() ? "]" : ",");
+            return r;
+        };
+        if (index_rank < 1 || index_rank > data_rank ||
+            (long)updates_total != (long)num_tuples * (long)slice_size) {
+            throw std::runtime_error(
+                "ScatterND " + get_name() +
+                ": violates updates.shape == "
+                "indices.shape[:-1] + data.shape[index_rank:] "
+                "(data=" +
+                shape_str(data_shape) + " indices=" + shape_str(indices_shape) +
+                " updates=" + shape_str(updates_shape) +
+                " | index_rank=" + std::to_string(index_rank) +
+                " num_tuples=" + std::to_string(num_tuples) +
+                " slice_size=" + std::to_string(slice_size) +
+                " updates_total=" + std::to_string(updates_total) +
+                "); a view node was folded out of the "
+                "converter's shape chain");
+        }
+
         // Bind [0]=output, [1]=data, [2]=indices (int64), [3]=updates.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);

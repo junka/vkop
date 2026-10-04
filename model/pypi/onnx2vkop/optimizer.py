@@ -27,6 +27,25 @@ _NP_DTYPE = {
 }
 
 
+def _concat_axis_ok(node, out_rank: int, u_ax: int) -> bool:
+    """Unsqueeze(axes=[u_ax]) 能否折进 Concat `node`。
+
+    `node.attributes["axis"]` 是在 view **后**的秩 out_rank 上记录的。折掉
+    Unsqueeze 后 Concat 实际拿到的是 view **前**的张量（秩少 1），所以只有
+    当插入轴严格晚于拼接轴（a < u_ax）时，轴 a 在 view 前后才指向同一个维，
+    各输入在输出 buffer 里的先后顺序也不变。注意 Concat 的记录输出形状保持
+    不变（仍是 view 后的形状），所以下游拿到的形状标签依然是图推断的真值。
+    """
+    a = node.attributes.get("axis", 0)
+    try:
+        a = int(a)
+    except (TypeError, ValueError):
+        return False
+    if a < 0:
+        a += out_rank
+    return 0 <= a < u_ax
+
+
 class ConstantFolder:
     """ONNX 常量折叠器：纯 numpy 实现，不依赖 onnxsim。
 
@@ -628,6 +647,15 @@ class MultiRoundOptimizer:
 
 class FusionOptimizer:
     """Class for fusing operators in the model."""
+
+    # 只看数、不看输入秩的逐元素一元 op（out shape == in shape）。
+    # 升秩 Unsqueeze 只对这类消费者可以无条件折叠；要加新 op 先确认它的
+    # host 侧实现不读 inputs[0]->getShape()。RotaryEmbedding 由专用 pass
+    # （fuse_unsqueeze_into_rotary / fuse_transpose_into_rotary）处理，别放进来。
+    _UNSQUEEZE_RANK_TRANSPARENT = {
+        "Cast", "Relu", "Sigmoid", "Tanh", "Neg", "Floor", "Erf", "Sqrt",
+        "Cos", "Sin", "Atan", "Softplus", "Identity",
+    }
 
     @staticmethod
     def create_default_optimizer(max_rounds: int = 10) -> MultiRoundOptimizer:
@@ -3220,15 +3248,40 @@ class FusionOptimizer:
             ctype = cs[0].op_type
             if any(c.op_type != ctype for c in cs):
                 continue
-            # Skip if the op type is RotaryEmbedding — handled by dedicated pass
-            if ctype == "RotaryEmbedding":
-                continue
-            # Expand 按「shape 列表右对齐到输入秩」广播：把升秩的 Unsqueeze 消掉
-            # 会让它少拿到一维，广播轴整体错位（实测 Phi-4 的 GQA repeat 复制了 8 份
-            # 而不是 3 份，尺寸对不上之后下游 MatMul 的操作数直接是全 0 缓冲区）——
-            # 静默算错，不是报错。这类 Unsqueeze 留给 runtime 真正执行 view。
-            if ctype in ("Expand",):
-                continue
+            # 升秩 Unsqueeze 删掉之后，消费者读到的是 view **前**的秩（fold 只能
+            # 改输入名，改不了生产者的 live shape），所以只有「证明不拿输入秩做
+            # 文章」的消费者能折叠。默认拒绝（fail closed）：新 op 要人工确认。
+            #   - 逐元素一元 op：out = in 的 shape，只搬数，秩对结果无影响；
+            #   - Concat：见下面的轴序条件；
+            #   - 其余（Expand 右对齐广播、Gather/ScatterND 用 shape[-1] 当轴/元组
+            #     长度、Reshape/Shape/Slice/Reduce/Transpose 读秩……）静默算错，
+            #     节点留给 runtime 的 SqueezeUnsqueeze —— 它现在是纯 GPU 别名，
+            #     不读回，成本近乎为零。
+            if ctype not in FusionOptimizer._UNSQUEEZE_RANK_TRANSPARENT:
+                if ctype != "Concat":
+                    continue
+                # 只有「插入轴严格晚于拼接轴」才安全：那时 Concat 的 axis 在
+                # view 前后指向同一个维，输出字节的先后顺序也不变。插入轴等于
+                # 或早于拼接轴，axis 会指到隔壁维 —— Qwen3-VL 的 /rotary_emb
+                # 就是 Unsqueeze(axes=[-1])x3 → Concat(axis=-1) 被折成 [1,1,21]
+                # 而不是 [1,1,20,3]，下游 ScatterND 拿 indices.shape[-1]=21 当
+                # index_rank，每个 scatter 目标都越出 256B 的输出 buffer，把
+                # fp32 的 rope cos/sin 按数据决定的地址写进相邻的 fp16 权重显存
+                # （权重里出现 0xfffa = NaN，decode 从某轮起全 NaN）。
+                # 只需要**秩**（轴序比较用的是 len），所以含 -1 的动态形状也能判。
+                # 没有记录形状（[]）就判不了秩 → 保留节点。
+                in_shape = u_node.inputs[0].get("shape", []) \
+                    if isinstance(u_node.inputs[0], dict) else []
+                if not in_shape:
+                    continue
+                out_rank = len(in_shape) + 1
+                u_ax = int(axes[0])
+                if u_ax < 0:
+                    u_ax += out_rank
+                if not (0 <= u_ax < out_rank):
+                    continue
+                if not all(_concat_axis_ok(c, out_rank, u_ax) for c in cs):
+                    continue
             # One match per Unsqueeze — fold updates all consumer inputs, then
             # deletes the Unsqueeze once (handles shared consumers correctly).
             consumer_updates = []
