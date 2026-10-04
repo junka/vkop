@@ -645,6 +645,7 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::RESIZE:
                 case vkop::ops::OpType::SCATTER_ELEMENTS:
                 case vkop::ops::OpType::RMSNORM:
+                case vkop::ops::OpType::LAYERNORM:
                 case vkop::ops::OpType::REDUCEMEAN:
                 case vkop::ops::OpType::MIN:
                 case vkop::ops::OpType::MAX:

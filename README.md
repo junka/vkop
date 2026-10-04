@@ -142,8 +142,8 @@ VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
 文本塔 `text_encoder.vkopbin` + 1.24 GB 输入查表 `text_encoder_embeds.bin`（mmap，一条
 prompt 只碰其中几十行）、DiT prefill/decode、VAE `vae_decoder_512.vkopbin`；分词器复用
 LLM 的 `llm/tokenizer/qwen3_vl.bin`。产物路径可用 `TEXT_ENCODER_VKOPBIN` /
-`TEXT_ENCODER_EMBEDS` / `TOKENIZER_BIN` / `VAE_VKOPBIN` 覆盖。512×512 / 40 步实测约 15
-分钟（decode 21.2 s/步，文本塔前向 0.27 s）。导出、转换与逐位对拍口径见
+`TEXT_ENCODER_EMBEDS` / `TOKENIZER_BIN` / `VAE_VKOPBIN` 覆盖。512×512 / 40 步实测 145 秒
+（decode 2.6 s/步，文本塔前向 0.26 s，VAE 10.7 s）。导出、转换与逐位对拍口径见
 `image/exporter/BASELINE.md`。
 
 ---
@@ -303,7 +303,7 @@ is ~14 GB; any two together exceed 36 GB of unified memory): the text tower
 the VAE `vae_decoder_512.vkopbin`. Tokenization reuses the LLM's
 `llm/tokenizer/qwen3_vl.bin`. Override paths with `TEXT_ENCODER_VKOPBIN`,
 `TEXT_ENCODER_EMBEDS`, `TOKENIZER_BIN`, `VAE_VKOPBIN`. Measured 512×512 at 40
-steps: ~15 min (21.2 s/step decode, 0.27 s text-tower forward). Export,
+steps: 145 s (2.6 s/step decode, 0.26 s text-tower forward, 10.7 s VAE). Export,
 conversion and the bit-wise alignment protocol are in
 `image/exporter/BASELINE.md`.
 

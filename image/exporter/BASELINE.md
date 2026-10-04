@@ -536,7 +536,44 @@ text tower 9.41 s load + 0.27 s forward, prefill 1.86 s, 40 decode steps in 849.
 end-to-end on vkop GPU from a text prompt. The result is a photorealistic red fox on a wooden
 bench, stone wall behind it, raking morning light through autumn trees: subject, setting and
 lighting condition are all present, which is the sanity check the numeric tables cannot
-provide on their own.
+provide on their own. **Those decode/prefill figures were superseded the same day** — see the
+next section; the 21.2 s/step was engine overhead, not model compute.
+
+### 2026-10-04: fp16 LayerNorm and fp16 Slice run on the GPU — 21.2 s/step → 2.6 s/step
+
+Profiling that 15 min run (`VKOP_OPPROF=1 VKOP_SUBMIT_PROF=1 VKOP_RUN_PROFILE=1`, graph submit
+on) attributed 22.30 s of a 22.31 s step to host-side `onExecute`, with `[graph] 350 segments,
+323 readback boundaries`: 128 readbacks from the fp16 host-slice branch of `SliceBuffer` and 195
+from `LayerNormBuffer::upcast_fp16()` (3 per call × 65 LNs). Both ops now have their own
+`-DFP16` shader build (`buffer_slice_fp16_spv`, `buffer_layernorm_fp16_spv`), so the fp16 route
+never touches the host:
+
+| Phase (same command, short prompt, seed 7) | before | after |
+|-------------------------------------------|--------|-------|
+| DiT decode step                            | 21.2 s (host 22.30 s of a 22.31 s `Run`) | 2.6 s (`gpu+reset` 2275 ms, host record 9.7 ms) |
+| readback boundaries per step               | 323 | 0 |
+| Slice, 352 calls                           | 15.09 s | 0.96 ms |
+| LayerNorm, 65 calls                        | 7.14 s | 0.16 ms |
+| DiT prefill                                | 1.86 s | 0.25 s |
+| 40-step decode                             | 849.3 s | 102.4 s |
+| whole 512×512 sample                       | ~15 min | **145 s** (text tower 8.9 s load + 0.26 s, VAE 10.7 s) |
+
+`gpu+reset` turning strongly positive is the point: 2.28 s/step is the first measurement of what
+the DiT actually costs the GPU — earlier that number was entirely hidden inside host stalls.
+
+Both fp16 shaders are bit-exact against what the host paths produced, not merely close:
+
+- `Slice` only moves bits, so `BufferRankTest.SliceFp16*` compares the packed halves with zero
+  tolerance (the rotary `[1,16,1,64]` slice and an odd-total case, where the last word's high
+  half must be zeroed instead of wrapping to a valid coordinate).
+- The 4-step sample from the same prompt/seed is **byte-identical** to the pre-fix PNG
+  (`md5 8b514b31…`), and re-running is deterministic.
+- `LayerNorm` fp16 is checked against torch at `BufferRankTest.LayerNormFp16LastDim`; the host
+  guard rejects an odd `inner_size` (a slice that would start mid-word) and any weight/bias
+  dtype that differs from `x`, instead of silently reading packed halves as float bits.
+- Qwen3-VL visual (52 fp16 LayerNorms) and the LLM rotary slices still hit their recorded
+  tokens: multimodal `6176` + `151645`, raw `358,1184,311,3270,264,2805`, Phi-4
+  `72721,4472,788,200020`.
 
 ### Sequential loading now has four segments
 
@@ -544,9 +581,9 @@ provide on their own.
 |-------|------|----------|
 | Text tower load | 13.89 GB | 3.6–9.7 s (page-cache dependent) |
 | Text tower forward (78 tokens) | — | 0.27 s |
-| DiT prefill load + run | 13.83 GB | ~14 s + 1.7 s |
-| DiT decode load + step | 14.17 GB | ~14 s + 21.5 s/step |
-| VAE decode | 1.0 GB | 11.4 s |
+| DiT prefill load + run | 13.83 GB | ~14 s + 0.25 s |
+| DiT decode load + step | 14.17 GB | ~14 s + 2.6 s/step |
+| VAE decode | 1.0 GB | 10.7 s |
 
 The 7 B scale is new for this repo (the LLM line tops out at 2 B): the *runtime* is not the
 constraint — 13.9 GB loads in seconds and one forward takes 0.27 s — the tight resource is

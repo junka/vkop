@@ -440,7 +440,7 @@ TEST(BufferRankTest, ReshapeRank3To2) {
 }
 
 // =========================================================================
-// Slice (fp32-only shader; starts/ends/[axes]/[steps] as int64 inputs)
+// Slice (fp32 + fp16 shader builds; starts/ends/[axes]/[steps] as int64 inputs)
 // =========================================================================
 
 template <typename T>
@@ -500,6 +500,11 @@ bool brt_slice_case(const std::vector<int> &in_shape,
     op->onExecute(ins, {output}, 0);
     brt_run_op(op.get(), d);
     output->copyToCPU(d.cmdpool);
+    // Slice only moves bits, so the fp16 case must reproduce the packed halves
+    // exactly — a word-packing off-by-one then fails loudly instead of hiding
+    // inside a percentage tolerance.
+    if (fp16)
+        return brt_close_to_torch(output, torch_out, 0.0f, 0.0f);
     return brt_close_to_torch(output, torch_out);
 }
 
@@ -518,6 +523,77 @@ TEST(BufferRankTest, SliceRank3NegativeEnd) {
 TEST(BufferRankTest, SliceEmptyResult) {
     // start==end → empty output along that axis.
     EXPECT_TRUE(brt_slice_case<float>({2, 4, 5}, {0}, {0}, {1}, {1}, false));
+}
+
+TEST(BufferRankTest, SliceFp16Contiguous) {
+    // The rotary cos/sin case: 4-D fp16, slice the last dim in half.
+    EXPECT_TRUE(brt_slice_case<uint16_t>({1, 16, 1, 128}, {0}, {64}, {3}, {1},
+                                         true));
+}
+
+TEST(BufferRankTest, SliceFp16SteppedAndOddTotal) {
+    // Odd element count (3*7=21): the last output word's high half is past the
+    // tensor and must be zeroed rather than wrapping to a valid coordinate.
+    EXPECT_TRUE(brt_slice_case<uint16_t>({3, 9}, {1}, {8}, {1}, {1}, true));
+    // Strided fp16 slice: output words span non-contiguous input words.
+    EXPECT_TRUE(brt_slice_case<uint16_t>({2, 6, 4, 8}, {1, 0}, {5, 8}, {1, 3},
+                                         {1, 2}, true));
+}
+
+// =========================================================================
+// LayerNorm (fp32 + fp16 shader builds; weight/bias 1-D over inner_size)
+// =========================================================================
+
+template <typename T>
+bool brt_layernorm_case(const std::vector<int> &in_shape, int inner_size,
+                        bool fp16) {
+    Dev d;
+    std::vector<int64_t> shape64(in_shape.begin(), in_shape.end());
+    // The shader computes in fp32 from the stored (possibly half-rounded)
+    // inputs, so the reference must see those same rounded inputs: quantise
+    // first, then normalise in fp32.
+    auto x = torch::randn(shape64).to(brt_torch_opt<T>());
+    auto w = torch::randn({static_cast<int64_t>(inner_size)})
+                 .to(brt_torch_opt<T>());
+    auto b = torch::randn({static_cast<int64_t>(inner_size)})
+                 .to(brt_torch_opt<T>());
+    auto ref = torch::layer_norm(x.to(torch::kFloat32),
+                                 {static_cast<int64_t>(inner_size)},
+                                 w.to(torch::kFloat32), b.to(torch::kFloat32),
+                                 1e-5)
+                   .to(brt_torch_opt<T>());
+
+    auto input = std::make_shared<Tensor<T>>(in_shape);
+    brt_fill(input, x);
+    brt_upload(input, d);
+    auto weight = std::make_shared<Tensor<T>>(std::vector<int>{inner_size});
+    brt_fill(weight, w);
+    brt_upload(weight, d);
+    auto bias = std::make_shared<Tensor<T>>(std::vector<int>{inner_size});
+    brt_fill(bias, b);
+    brt_upload(bias, d);
+
+    auto output = brt_make_out<T>(in_shape, d);
+    const std::string norm_attr = "[" + std::to_string(inner_size) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::LAYERNORM, fp16,
+                          {{"eps", "1e-5"}, {"normalized_shape", norm_attr}}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, weight, bias}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, ref);
+}
+
+TEST(BufferRankTest, LayerNormFp32LastDim) {
+    EXPECT_TRUE(brt_layernorm_case<float>({2, 5, 4, 4}, 4, false));
+}
+
+TEST(BufferRankTest, LayerNormFp16LastDim) {
+    // inner_size even (the host rejects an odd one: it would straddle words).
+    EXPECT_TRUE(brt_layernorm_case<uint16_t>({2, 5, 4, 4}, 4, true));
+    // Wide normalized row: 256 workgroups per slice loop over several words.
+    EXPECT_TRUE(brt_layernorm_case<uint16_t>({3, 1024}, 1024, true));
 }
 
 // =========================================================================

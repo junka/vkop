@@ -10,11 +10,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <numeric>
+#include <stdexcept>
 extern "C" {
 extern unsigned char image_slice_spv[];
 extern unsigned int image_slice_spv_len;
 extern unsigned char buffer_slice_spv[];
 extern unsigned int buffer_slice_spv_len;
+extern unsigned char buffer_slice_fp16_spv[];
+extern unsigned int buffer_slice_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -139,23 +142,29 @@ class SliceImage : public Operator {
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
     }
 };
-// Slice buffer op (fp32). Inputs: data, starts, ends, [axes], [steps].
+// Slice buffer op (SSBO). Inputs: data, starts/ends, [axes], [steps].
+// fp32 and fp16 are separate shader builds: fp16 packs two halfs per uint
+// word, so one thread owns a whole output word. The previous fp16 route sliced
+// on the host, which read back and rewrote every activation (128 readbacks per
+// DiT decode step).
 class SliceBuffer : public BufferFactory {
   public:
-    explicit SliceBuffer(int /*fp16*/)
-        : BufferFactory(OpType::SLICE, buffer_slice_spv, buffer_slice_spv_len,
+    explicit SliceBuffer(int fp16)
+        : BufferFactory(OpType::SLICE,
+                        fp16 ? buffer_slice_fp16_spv : buffer_slice_spv,
+                        fp16 ? buffer_slice_fp16_spv_len : buffer_slice_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(SlicePC)) {}
+                        sizeof(SlicePC), fp16),
+          fp16_(fp16) {}
 
     // The 8 Slice instances in the decode graph read back starts/ends/axes/
-    // steps (int64 shape-meta) every round. For the fp32 path these scalars
-    // are STABLE across decode rounds (deepstack/visual fixed shapes), and the
-    // fp32 path doesn't read back data at all (data goes through the GPU
-    // shader). So STABLE lets the fp32 path skip ALL readback. The i64/fp16
-    // paths still read back data (CPU slice), but STABLE still skips the
-    // starts/ends meta readback for them. Same LEARNING/CONFIRMING/STABLE
-    // machine as Reshape/Range. invalidate_shape_cache() resets at phase
-    // boundaries.
+    // steps (int64 shape-meta) every round. For the fp32/fp16 paths these
+    // scalars are STABLE across decode rounds (deepstack/visual fixed shapes),
+    // and neither reads back data anymore (data goes through the GPU shader).
+    // So STABLE lets them skip ALL readback. The i64 path still reads back data
+    // (CPU slice), but STABLE still skips the starts/ends meta readback for it.
+    // Same LEARNING/CONFIRMING/STABLE machine as Reshape/Range.
+    // invalidate_shape_cache() resets at phase boundaries.
     enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
     LearnState slice_state_ = LearnState::LEARNING;
     // Fingerprint of the meta inputs (inshape + starts/ends/axes/steps). When
@@ -185,11 +194,20 @@ class SliceBuffer : public BufferFactory {
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 
+        // The shader build is fixed at construction, so the live dtype has to
+        // match it: packed half2 read as float bits (or the reverse) is silent
+        // garbage. int64 data always takes the host slice below, so it must
+        // come with the fp32-built variant.
+        if ((inputs[0]->dtype() == typeid(uint16_t)) != (fp16_ != 0)) {
+            throw std::runtime_error(
+                "Slice: input dtype disagrees with the built fp16 variant");
+        }
+
         // STABLE fast path: if the meta inputs (inshape + starts/ends/axes/
         // steps) matched last round, reuse the cached out_size and skip the
         // starts/ends/axes/steps readback entirely. The data input is still
-        // read back below for the i64/fp16 CPU-slice paths; the fp32 path
-        // reads no data, so this is a complete readback skip for it.
+        // read back below for the i64 CPU-slice path; the fp32/fp16 GPU paths
+        // read no data, so this is a complete readback skip for them.
         std::vector<std::vector<int>> out_size;
         bool meta_reused = false;
         if (slice_state_ == LearnState::STABLE &&
@@ -345,53 +363,10 @@ class SliceBuffer : public BufferFactory {
             return;
         }
 
-        // fp16 data: CPU slice. The fp32 GPU slice shader indexes the SSBO in
-        // uint words (1 word = 2 packed fp16), but inDims/outDims are in
-        // elements — so for fp16 the shader's linear index runs to 2× the
-        // word count and reads OOB. The rotary cos/sin Slice ([1,16,1,128]
-        // fp16 -> [1,16,1,64]) is the canonical case. Small + rare -> host
-        // slice is correct and cheap. Same coord-map math as the int64 path.
-        if (inputs[0]->dtype() == typeid(uint16_t)) {
-            auto out_shape = out_size[0];
-            auto &full_starts = out_size[1];
-            auto &full_steps = out_size[3];
-            int total = total_elems(out_shape);
-            std::vector<uint16_t> out(static_cast<size_t>(total));
-            auto src = core::as_tensor<uint16_t>(inputs[0]);
-            // Unconditional readback: a cross-round-recycled GPU input may
-            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
-            src->copyToCPU(m_cmdpool_);
-
-            std::vector<int> in_stride(rank, 1);
-            for (int d = rank - 2; d >= 0; --d) {
-                in_stride[d] = in_stride[d + 1] * inshape[d + 1];
-            }
-            std::vector<int> out_stride(rank, 1);
-            for (int d = rank - 2; d >= 0; --d) {
-                out_stride[d] = out_stride[d + 1] * out_shape[d + 1];
-            }
-            std::vector<int> in_coord(rank, 0);
-            std::vector<int> out_coord(rank, 0);
-            for (int o = 0; o < total; ++o) {
-                int r = o;
-                for (int d = 0; d < rank; ++d) {
-                    out_coord[d] = (r / out_stride[d]) % out_shape[d];
-                }
-                int in_lin = 0;
-                for (int d = 0; d < rank; ++d) {
-                    in_coord[d] = full_starts[d] + out_coord[d] * full_steps[d];
-                    in_lin += in_coord[d] * in_stride[d];
-                }
-                out[static_cast<size_t>(o)] = (*src)[in_lin];
-            }
-
-            auto output = core::as_tensor<uint16_t>(outputs[0]);
-            output->resize(out_shape);
-            output->fillToCPU(out);
-            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            output->copyToGPU(m_cmdpool_, out.data());
-            return;
-        }
+        // fp16 data falls through to the GPU shader below
+        // (buffer_slice_fp16_spv): it extracts and stores raw packed half bits,
+        // so the rotary cos/sin slice that used to be host-sliced now stays on
+        // the GPU.
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
@@ -419,17 +394,22 @@ class SliceBuffer : public BufferFactory {
             pc.steps[i] = (i < rank) ? out_size[3][i] : 1;
         }
         int total = total_elems(out_size[0]);
-        submit(&pc, UP_DIV(total, 256), 1, 1);
+        // fp16 packs two halfs per uint word, so the shader dispatches one
+        // thread per output word.
+        int nthreads = fp16_ ? (total + 1) / 2 : total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
     }
+
+    int fp16_ = 0;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class Slice : public PimplFacade {
   public:
-    Slice(int /*fp16*/, bool backend_buffer) : PimplFacade(OpType::SLICE) {
+    Slice(int fp16, bool backend_buffer) : PimplFacade(OpType::SLICE) {
         impl_ =
             backend_buffer
-                ? std::unique_ptr<Operator>(std::make_unique<SliceBuffer>(0))
+                ? std::unique_ptr<Operator>(std::make_unique<SliceBuffer>(fp16))
                 : std::make_unique<SliceImage>();
     }
 

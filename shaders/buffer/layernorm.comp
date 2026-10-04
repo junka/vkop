@@ -1,10 +1,19 @@
 #version 450 core
 
-// LayerNorm SSBO op (fp32). Normalizes over the last `inner_size` elements
-// (the normalized shape is the trailing dims). One workgroup per outer slice.
+// LayerNorm SSBO op. Normalizes over the last `inner_size` elements (the
+// normalized shape is the trailing dims). One workgroup per outer slice.
 // Two-pass shared-memory tree reduce (no subgroup ops — those don't reduce
 // reliably on all drivers). Mirrors the image layernorm.comp reduce pattern.
-// Weight/bias are 1-D over the normalized shape (inner_size elements).
+// Weight/bias are 1-D over the normalized shape (inner_size elements), same
+// dtype as x.
+//
+// fp32 build: data words are float bits in uint slots. fp16 build (-DFP16):
+// data words are packed half2 (two fp16 per uint). Pass 1 keeps the fp32
+// build's per-thread element order so mean/var are bit-identical; pass 2 owns
+// one whole output word per thread (elements 2w, 2w+1) so no two threads
+// read-modify-write the same packed word. Values are unpacked to fp32 for the
+// arithmetic and rounded once on store — the same numbers the previous
+// host-side upcast → fp32 shader → pack-pass sequence produced.
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -15,10 +24,10 @@ layout(set = 0, binding = 1) readonly buffer Input {
     uint data[];
 } uInput;
 layout(set = 0, binding = 2) readonly buffer Weight {
-    float data[];
+    uint data[];
 } uWeight;
 layout(set = 0, binding = 3) readonly buffer Bias {
-    float data[];
+    uint data[];
 } uBias;
 
 layout(push_constant) uniform PC_uLN {
@@ -30,6 +39,14 @@ layout(push_constant) uniform PC_uLN {
 shared float s_sum[256];
 shared float s_sumsq[256];
 
+#ifdef FP16
+// Element e of a packed half2 word: low half is even, high half odd.
+float half_at(uint w, int e) {
+    vec2 h = unpackHalf2x16(w);
+    return (e & 1) == 0 ? h.x : h.y;
+}
+#endif
+
 void main() {
     uint wg = gl_WorkGroupID.x;          // = slice index
     uint lid = gl_LocalInvocationID.x;
@@ -39,11 +56,21 @@ void main() {
 
     // ---- pass 1: sum, sum_sq ----
     float lsum = 0.0f, lsq = 0.0f;
+#ifdef FP16
+    // Same i sequence as the fp32 build (the host rejects an odd inner_size, so
+    // every slice starts on a word boundary at base/2).
+    for (int i = int(lid); i < uLN.inner_size; i += int(gl_WorkGroupSize.x)) {
+        float x = half_at(uInput.data[(base + i) / 2], i);
+        lsum += x;
+        lsq += x * x;
+    }
+#else
     for (int i = int(lid); i < uLN.inner_size; i += int(gl_WorkGroupSize.x)) {
         float x = uintBitsToFloat(uInput.data[base + i]);
         lsum += x;
         lsq += x * x;
     }
+#endif
     s_sum[lid] = lsum;
     s_sumsq[lid] = lsq;
     memoryBarrierShared(); barrier();
@@ -60,9 +87,25 @@ void main() {
     float inv_std = inversesqrt(var + uLN.eps);
 
     // ---- pass 2: write back ----
+#ifdef FP16
+    int total = uLN.inner_size * uLN.outer_size;
+    for (int w = int(lid); w < uLN.inner_size / 2; w += int(gl_WorkGroupSize.x)) {
+        int gi = base + 2 * w; // global element index of this word's low half
+        vec2 x = unpackHalf2x16(uInput.data[gi / 2]);
+        vec2 g = unpackHalf2x16(uWeight.data[w]);
+        vec2 b = unpackHalf2x16(uBias.data[w]);
+        float r0 = ((x.x - mean) * inv_std) * g.x + b.x;
+        float r1 = ((x.y - mean) * inv_std) * g.y + b.y;
+        // Odd total: the last word's high half is past the tensor, and the fp32
+        // pack pass it replaces wrote 0 there.
+        uOutput.data[gi / 2] =
+            packHalf2x16(vec2(r0, (gi + 1 < total) ? r1 : 0.0));
+    }
+#else
     for (int i = int(lid); i < uLN.inner_size; i += int(gl_WorkGroupSize.x)) {
         float x = uintBitsToFloat(uInput.data[base + i]);
         float n = (x - mean) * inv_std;
-        uOutput.data[base + i] = floatBitsToUint(n * uWeight.data[i] + uBias.data[i]);
+        uOutput.data[base + i] = floatBitsToUint(n * uintBitsToFloat(uWeight.data[i]) + uintBitsToFloat(uBias.data[i]));
     }
+#endif
 }

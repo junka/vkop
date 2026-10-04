@@ -1,9 +1,15 @@
 #version 450 core
 
-// Slice SSBO op (fp32). For each output element, map output nd-coords back
-// to input via starts[i] + out[i]*steps[i], bounds-checked, then copy.
+// Slice SSBO op. For each output element, map output nd-coords back to input
+// via starts[i] + out[i]*steps[i], bounds-checked, then copy.
 // 6-D cap (push-constant budget: rank + 5×IArr6 = 124 bytes ≤ 128).
-// fp32-only (gather pattern would race on a shared half2 word).
+//
+// fp32 build: one thread per output element; words carry fp32 bit patterns and
+// copy raw (NOT float(uint) which would numerically reinterpret the bit pattern
+// as an integer value and corrupt the data). fp16 build (-DFP16): words pack two
+// halfs, so one thread owns a whole output word (elements 2*gid, 2*gid+1) to
+// avoid a read-modify-write race, and each half is extracted as raw bits —
+// a Slice copies, so it must not round-trip through fp32.
 //
 // NB: this op uses IArr6/int[6] (NOT the IArr8/int[8] convention of the other
 // buffer ops) so the push constant fits in 128 bytes — 5 full 8-int dim
@@ -31,46 +37,54 @@ layout(push_constant) uniform PC_uSlice {
     IArr6 steps;
 } uSlice;
 
-void main() {
-    int gid = int(gl_GlobalInvocationID.x);
-    int rank = uSlice.rank;
-    int total = 1;
-    for (int i = 0; i < rank; ++i) total *= uSlice.outDims.v[i];
-    if (gid >= total) return;
-
-    // Decompose gid into an output nd-coordinate (row-major, dims.v[0] outer).
-    int rem = gid;
+// Linear input index of output element `e`, or -1 if any of its coordinates
+// falls outside inDims (the caller zero-fills those).
+int in_linear_of(int e) {
+    int rem = e;
     IArr6 out_coord;
     for (int i = 0; i < 6; ++i) out_coord.v[i] = 0;
-    for (int i = rank - 1; i >= 0; --i) {
+    for (int i = uSlice.rank - 1; i >= 0; --i) {
         out_coord.v[i] = rem % uSlice.outDims.v[i];
         rem /= uSlice.outDims.v[i];
     }
 
-    // Map output coord → input coord via starts[i] + out[i]*steps[i], with a
-    // bounds check against inDims.v[i].
-    IArr6 in_coord;
-    for (int i = 0; i < 6; ++i) in_coord.v[i] = 0;
-    bool ok = true;
-    for (int i = 0; i < rank; ++i) {
-        int c = uSlice.starts.v[i] + out_coord.v[i] * uSlice.steps.v[i];
-        if (c < 0 || c >= uSlice.inDims.v[i]) { ok = false; break; }
-        in_coord.v[i] = c;
-    }
-    if (!ok) {
-        uOutput.data[gid] = 0u;
-        return;
-    }
-
-    // Re-compose the input nd-coordinate into a row-major linear index.
     int in_linear = 0;
     int stride = 1;
-    for (int i = rank - 1; i >= 0; --i) {
-        in_linear += in_coord.v[i] * stride;
+    for (int i = uSlice.rank - 1; i >= 0; --i) {
+        int c = uSlice.starts.v[i] + out_coord.v[i] * uSlice.steps.v[i];
+        if (c < 0 || c >= uSlice.inDims.v[i]) return -1;
+        in_linear += c * stride;
         stride *= uSlice.inDims.v[i];
     }
-    // uInput/uOutput are uint-word SSBOs holding fp32 bit patterns; copy the
-    // raw word (NOT float(uint) which would numerically reinterpret the bit
-    // pattern as an integer value and corrupt the data).
-    uOutput.data[gid] = uInput.data[in_linear];
+    return in_linear;
+}
+
+#ifdef FP16
+// The 16 bits of fp16 input element `e`, or 0 when e is past the input.
+uint in_half(int e) {
+    int lin = in_linear_of(e);
+    if (lin < 0) return 0u;
+    uint w = uInput.data[lin / 2];
+    return (lin & 1) == 0 ? (w & 0xFFFFu) : (w >> 16);
+}
+#endif
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int total = 1;
+    for (int i = 0; i < uSlice.rank; ++i) total *= uSlice.outDims.v[i];
+
+#ifdef FP16
+    int nwords = (total + 1) / 2;
+    if (gid >= nwords) return;
+    // Odd total: the last word's high half is past the tensor, and a coordinate
+    // decomposition of element `total` would wrap to a valid one instead of
+    // reading as out-of-range.
+    uint hi = (2 * gid + 1 < total) ? in_half(2 * gid + 1) : 0u;
+    uOutput.data[gid] = in_half(2 * gid) | (hi << 16);
+#else
+    if (gid >= total) return;
+    int in_linear = in_linear_of(gid);
+    uOutput.data[gid] = in_linear < 0 ? 0u : uInput.data[in_linear];
+#endif
 }
