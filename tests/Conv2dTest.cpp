@@ -285,6 +285,10 @@ void run_conv2d_matrix(bool force_buffer_backend) {
         {{1, 1, 224, 224}, 3, 1, 1, 1, 1, 32}, // Large input typical in CNNs
         {{4, 3, 32, 32}, 3, 1, 1, 1, 1, 16},   // Larger batch size
         {{1, 32, 8, 8}, 3, 1, 2, 1, 1, 64},    // Larger padding (pad > kernel/2)
+        // out_w = 10: the buffer backend's register-blocked 3x3 path (one
+        // thread per 8 output columns) gets a 2-column tail chunk here — every
+        // other 3x3 case in the matrix has out_w divisible by 8.
+        {{1, 6, 10, 10}, 3, 1, 1, 2, 1, 4},
         {{1, 12, 15, 15}, 5, 2, 2, 3, 1, 24},  // Larger kernel with stride
         {{1, 16, 7, 7}, 7, 1, 0, 1, 1, 32},    // Kernel size equals input size
         {{1, 4, 5, 5}, 3, 2, 1, 4, 1, 8},      // Stride > 1 with groups

@@ -75,7 +75,16 @@ struct alignas(16) Conv2dBufferPC {
     int activation;  // conv2d::ActivationMode (0 = NONE)
     int weight_int8; // 1 = weights are packed int8 bytes (dequant via scale);
                      // 0 = fp32/fp16 weights
+    // Output columns per shader thread: 1 = one output element per thread,
+    // CONV_OW_BLOCK = the register-blocked 3x3 path in buffer/conv2d.comp. The
+    // shader switches on this being > 1 and chunks by its own #define RW, so
+    // CONV_OW_BLOCK and RW must agree.
+    int ow_blk;
 };
+
+// Columns per thread in the register-blocked path; must match #define RW in
+// shaders/buffer/conv2d.comp.
+constexpr int CONV_OW_BLOCK = 8;
 
 } // namespace conv2d
 
@@ -505,6 +514,19 @@ class Conv2dBuffer : public BufferFactory {
                                      out_width}
                   : std::vector<int>{batch, out_depth, out_height, out_width};
         int total = batch * out_depth * out_d * out_height * out_width;
+        bool weight_int8 = inputs[1]->elem_kind() == core::ElemKind::kInt8;
+        bool has_bias =
+            weight_int8 ? (inputs.size() == 4) : (inputs.size() > 2);
+        // Register-blocked 3x3 path: one thread per CONV_OW_BLOCK contiguous
+        // output columns. The shader body assumes stride_w == 1 and
+        // dil_w == 1 (its tap offsets are ow0 + r + kx - pad_w) and stages
+        // exactly KW == 3 weights, so everything else stays on the element
+        // path. OW >= CONV_OW_BLOCK keeps a chunk from being mostly masked-off
+        // tail; the tail chunk itself is handled in the shader.
+        const bool row_blocked = !weight_int8 && kernel_w == 3 &&
+                                 stride_w == 1 && dil_w == 1 &&
+                                 out_width >= conv2d::CONV_OW_BLOCK;
+        const int ow_blk = row_blocked ? conv2d::CONV_OW_BLOCK : 1;
         if (std::getenv("VKOP_CONVDBG")) {
             std::printf("[convdbg] rank=%d is_3d=%d in=[", rank, is_3d);
             for (size_t k = 0; k < input_shape.size(); ++k)
@@ -528,7 +550,7 @@ class Conv2dBuffer : public BufferFactory {
                 pad_h, pad_w, in_depth, in_height, in_width);
             for (size_t k = 0; k < out_shape.size(); ++k)
                 std::printf("%d ", out_shape[k]);
-            std::printf("] total=%d fp16=%d\n", total, fp16_);
+            std::printf("] total=%d fp16=%d blk=%d\n", total, fp16_, ow_blk);
         }
 
         // int8 weight-only quantization: weight (inputs[1]) is int8 and a
@@ -537,9 +559,6 @@ class Conv2dBuffer : public BufferFactory {
         //   fp32/fp16, w/ bias : [X, W, bias]
         //   int8,     no bias : [X, W_int8, scale]
         //   int8,     w/ bias : [X, W_int8, bias, scale]
-        bool weight_int8 = inputs[1]->elem_kind() == core::ElemKind::kInt8;
-        bool has_bias =
-            weight_int8 ? (inputs.size() == 4) : (inputs.size() > 2);
         size_t bias_index = 2;
         size_t scale_index = weight_int8 ? (has_bias ? 3 : 2) : 0;
         // Reduce pipeline bindings: [out, X, W, scratch/dummy, bias/dummy,
@@ -627,8 +646,14 @@ class Conv2dBuffer : public BufferFactory {
         pc.fp32 = (fp16_ != 0) ? 0 : 1;
         pc.activation = static_cast<int>(activation_);
         pc.weight_int8 = weight_int8 ? 1 : 0;
+        pc.ow_blk = ow_blk;
 
-        submit(&pc, UP_DIV(total, 256), 1, 1);
+        // gid space: output elements for the element path, (row, chunk) pairs
+        // for the blocked path.
+        const int items = ow_blk > 1 ? batch * out_depth * out_d * out_height *
+                                           ((out_width + ow_blk - 1) / ow_blk)
+                                     : total;
+        submit(&pc, UP_DIV(items, 256), 1, 1);
 
         if (fp16_ != 0) {
             // Barrier: flush reduce's scratch writes for pack's reads.

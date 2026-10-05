@@ -75,13 +75,174 @@ layout(push_constant) uniform PC {
     int fp32; // 1 = fp32 single-pass (write uOutput); 0 = fp16 reduce (write uScratch)
     int activation; // ACTIVATION_* from activation.comp (0 = NONE)
     int weight_int8; // 1 = weights are packed int8 bytes (dequant via uScale); 0 = fp32/fp16
+    int ow_blk; // output columns per thread: 1 = conv_fp element path,
+                 // RW = conv_row3 register-blocked path (host gates the shape)
 } uPC;
+
+// fp32/fp16-weight convolution — the hot path. Same math as the int8 nest
+// below, but the per-tap kernel-x bounds test is replaced by a clamped tap
+// window: ix = offw + kx*dil_w must land in [0, IW), i.e.
+// kx in [ceil(-offw/dil_w), floor((IW-1-offw)/dil_w)] intersected with [0, KW).
+// Both numerators are non-negative where the divide runs, so the window is
+// exact regardless of the integer-division rounding rule. Dropping the
+// out-of-range taps up front removes three branches and the per-tap index
+// recompute from the innermost loop; with dil_w == 1 the kx run becomes a
+// straight FMA walk over two contiguous streams — the shape the naive GEMM
+// reaches ~2.7 TFLOP/s on while this kernel was stuck at 0.385.
+float conv_fp(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
+              int ow) {
+    const int HW = uPC.IH * uPC.IW;
+    const int IDHW = uPC.ID * HW;
+    const int KHW = uPC.KH * uPC.KW;
+    const int dilw = uPC.dil_w;
+
+    const int offw = ow * uPC.stride_w - uPC.pad_w;
+    int kx0 = 0;
+    int kx1 = 0;
+    const int hi = uPC.IW - 1 - offw;
+    if (hi >= 0) {
+        const int lo = -offw;
+        kx0 = lo > 0 ? (lo + dilw - 1) / dilw : 0;
+        kx1 = min(hi / dilw + 1, uPC.KW);
+    }
+
+    float sum = 0.0;
+    for (int kic = 0; kic < icg; ++kic) {
+        const int xch = x_base_n + (ic_base + kic) * IDHW;
+        int wk = w_base + kic * uPC.KD * KHW;
+        for (int kd = 0; kd < uPC.KD; ++kd, wk += KHW) {
+            const int idd = od * uPC.stride_d + kd * uPC.dil_d - uPC.pad_d;
+            if (idd < 0 || idd >= uPC.ID) continue;
+            const int xdp = xch + idd * HW;
+            for (int ky = 0; ky < uPC.KH; ++ky) {
+                const int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
+                if (iy < 0 || iy >= uPC.IH) continue;
+                const int xrow = xdp + iy * uPC.IW + offw;
+                const int wrow = wk + ky * uPC.KW;
+                if (dilw == 1) {
+                    for (int kx = kx0; kx < kx1; ++kx)
+                        sum += BUF_LOAD(uInputX.data, xrow + kx) *
+                               BUF_LOAD(uInputW.data, wrow + kx);
+                } else {
+                    for (int kx = kx0; kx < kx1; ++kx)
+                        sum += BUF_LOAD(uInputX.data, xrow + kx * dilw) *
+                               BUF_LOAD(uInputW.data, wrow + kx);
+                }
+            }
+        }
+    }
+    return sum;
+}
+
+// Columns per thread in the register-blocked 3x3 path.
+#define RW 8
+
+// Register-blocked 3x3 convolution (stride_w == dil_w == 1): one thread computes
+// RW contiguous output columns of one output row.
+//
+// The element path above reloads every input pixel KW times (once per output it
+// feeds), which is what kept it at ~0.6 TFLOP/s: 2 loads per FMA. Here the
+// RW+KW-1 = RW+2 input columns a chunk touches are staged once per (channel,
+// kernel row) into scalars x0..x(RW+1) together with the 3 weights, so a chunk
+// row costs RW+2+3 = 13 loads for RW*KW = 24 FMA instead of 48 — 0.54 loads per
+// FMA. All indices are literal constants (no local arrays): a variable index
+// would push the staging into thread-private memory and cost more than it saves.
+//
+// Accumulation order is exactly conv_fp's (ascending kic, kernel row, then kx),
+// and out-of-range taps multiply a staged 0.0 rather than being skipped, so the
+// result is bit-identical to the element path for finite weights.
+void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
+               int oc, int ow0, int out_lin) {
+    const int HW = uPC.IH * uPC.IW;
+    const int IDHW = uPC.ID * HW;
+    const int KHW = uPC.KH * uPC.KW;
+    const int IW = uPC.IW;
+    // Column of tap (r, kx) is ow0 + r + kx - pad_w, i.e. x slot index r + kx.
+    const int bw = ow0 - uPC.pad_w;
+
+    float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+    float s4 = 0.0, s5 = 0.0, s6 = 0.0, s7 = 0.0;
+    for (int kic = 0; kic < icg; ++kic) {
+        const int xch = x_base_n + (ic_base + kic) * IDHW;
+        int wk = w_base + kic * uPC.KD * KHW;
+        for (int kd = 0; kd < uPC.KD; ++kd, wk += KHW) {
+            const int idd = od * uPC.stride_d + kd * uPC.dil_d - uPC.pad_d;
+            if (idd < 0 || idd >= uPC.ID) continue;
+            const int xdp = xch + idd * HW;
+            for (int ky = 0; ky < uPC.KH; ++ky) {
+                const int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
+                if (iy < 0 || iy >= uPC.IH) continue;
+                const int xrow = xdp + iy * IW + bw;
+                const int wrow = wk + ky * uPC.KW;
+                float x0 = (bw >= 0 && bw < IW) ? BUF_LOAD(uInputX.data, xrow) : 0.0;
+                float x1 = (bw + 1 >= 0 && bw + 1 < IW) ? BUF_LOAD(uInputX.data, xrow + 1) : 0.0;
+                float x2 = (bw + 2 >= 0 && bw + 2 < IW) ? BUF_LOAD(uInputX.data, xrow + 2) : 0.0;
+                float x3 = (bw + 3 >= 0 && bw + 3 < IW) ? BUF_LOAD(uInputX.data, xrow + 3) : 0.0;
+                float x4 = (bw + 4 >= 0 && bw + 4 < IW) ? BUF_LOAD(uInputX.data, xrow + 4) : 0.0;
+                float x5 = (bw + 5 >= 0 && bw + 5 < IW) ? BUF_LOAD(uInputX.data, xrow + 5) : 0.0;
+                float x6 = (bw + 6 >= 0 && bw + 6 < IW) ? BUF_LOAD(uInputX.data, xrow + 6) : 0.0;
+                float x7 = (bw + 7 >= 0 && bw + 7 < IW) ? BUF_LOAD(uInputX.data, xrow + 7) : 0.0;
+                float x8 = (bw + 8 >= 0 && bw + 8 < IW) ? BUF_LOAD(uInputX.data, xrow + 8) : 0.0;
+                float x9 = (bw + 9 >= 0 && bw + 9 < IW) ? BUF_LOAD(uInputX.data, xrow + 9) : 0.0;
+                const float w0 = BUF_LOAD(uInputW.data, wrow);
+                const float w1 = BUF_LOAD(uInputW.data, wrow + 1);
+                const float w2 = BUF_LOAD(uInputW.data, wrow + 2);
+                s0 += x0 * w0; s0 += x1 * w1; s0 += x2 * w2;
+                s1 += x1 * w0; s1 += x2 * w1; s1 += x3 * w2;
+                s2 += x2 * w0; s2 += x3 * w1; s2 += x4 * w2;
+                s3 += x3 * w0; s3 += x4 * w1; s3 += x5 * w2;
+                s4 += x4 * w0; s4 += x5 * w1; s4 += x6 * w2;
+                s5 += x5 * w0; s5 += x6 * w1; s5 += x7 * w2;
+                s6 += x6 * w0; s6 += x7 * w1; s6 += x8 * w2;
+                s7 += x7 * w0; s7 += x8 * w1; s7 += x9 * w2;
+            }
+        }
+    }
+
+    const float bias =
+        (uPC.has_bias != 0) ? BUF_LOAD(uBias.data, oc) : 0.0;
+    const int cnt = min(RW, uPC.OW - ow0); // tail chunk: fewer than RW columns
+    for (int r = 0; r < cnt; ++r) {
+        float v = (r == 0 ? s0 : (r == 1 ? s1 : (r == 2 ? s2 : (r == 3 ? s3
+                    : (r == 4 ? s4 : (r == 5 ? s5 : (r == 6 ? s6 : s7)))))));
+        v += bias;
+        v = activation(v, uPC.activation);
+        // fp32 single pass writes the output; the fp16 reduce pass writes fp32
+        // scratch for the separate pack dispatch.
+        if (uPC.fp32 != 0) {
+            uOutput.data[out_lin + r] = floatBitsToUint(v);
+        } else {
+            uScratch.data[out_lin + r] = floatBitsToUint(v);
+        }
+    }
+}
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     // 3D-convolution layout: input [N,IC,ID,IH,IW], weight [OC,icg,KD,KH,KW],
     // output [N,OC,OD,OH,OW]. A 2-D conv is the special case ID=OD=KD=1,
     // stride_d=pad_d=dil_d=0 (the host sets these so the D-loop runs once).
+    //
+    // Register-blocked dispatch: gid then indexes (output row, RW-column
+    // chunk) instead of a single output element. The host only sets ow_blk for
+    // 3x3 stride-1 dilution-1 fp32/fp16-weight shapes.
+    if (uPC.ow_blk > 1) {
+        const int chunks = (uPC.OW + RW - 1) / RW;
+        const int row = gid / chunks; // [((n*OC + oc)*OD + od)*OH + oh]
+        if (row >= uPC.N * uPC.OC * uPC.OD * uPC.OH) return;
+        const int oh = row % uPC.OH;
+        const int od = (row / uPC.OH) % uPC.OD;
+        const int oc = (row / (uPC.OH * uPC.OD)) % uPC.OC;
+        const int n = row / (uPC.OH * uPC.OD * uPC.OC);
+        const int ocg = uPC.OC / uPC.groups;
+        const int icg = uPC.IC / uPC.groups;
+        conv_row3(n * uPC.IC * uPC.ID * uPC.IH * uPC.IW,
+                  oc * (icg * uPC.KD * uPC.KH * uPC.KW), (oc / ocg) * icg, icg,
+                  od, oh, oc, (gid - row * chunks) * RW,
+                  row * uPC.OW + (gid - row * chunks) * RW);
+        return;
+    }
+
     int total = uPC.N * uPC.OC * uPC.OD * uPC.OH * uPC.OW;
     if (gid >= total) return;
 
@@ -105,34 +266,38 @@ void main() {
     float w_scale = (uPC.weight_int8 != 0) ? BUF_LOAD(uScale.data, oc) : 0.0;
 
     float sum = 0.0;
-    for (int kic = 0; kic < icg; ++kic) {
-        for (int kd = 0; kd < uPC.KD; ++kd) {
-            int idd = od * uPC.stride_d + kd * uPC.dil_d - uPC.pad_d;
-            if (idd < 0 || idd >= uPC.ID) continue;
-            for (int ky = 0; ky < uPC.KH; ++ky) {
-                int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
-                if (iy < 0 || iy >= uPC.IH) continue;
-                for (int kx = 0; kx < uPC.KW; ++kx) {
-                    int ix = ow * uPC.stride_w + kx * uPC.dil_w - uPC.pad_w;
-                    if (ix < 0 || ix >= uPC.IW) continue;
-                    int xidx = x_base_n + (ic_base + kic) * uPC.ID * uPC.IH * uPC.IW +
-                               idd * uPC.IH * uPC.IW + iy * uPC.IW + ix;
-                    int widx = w_base + ((kic * uPC.KD + kd) * uPC.KH + ky) * uPC.KW + kx;
-                    float x = BUF_LOAD(uInputX.data, xidx);
-                    float w;
-                    if (uPC.weight_int8 != 0) {
-                        // int8 packed 4-per-uint, row-major byte stream.
-                        int b = int((uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFF);
+    if (uPC.weight_int8 != 0) {
+        // Byte-packed weights need per-tap index math, and no model runs int8
+        // conv on the buffer hot path, so this branch keeps the original
+        // general nest (test every tap, dequant inline).
+        for (int kic = 0; kic < icg; ++kic) {
+            for (int kd = 0; kd < uPC.KD; ++kd) {
+                int idd = od * uPC.stride_d + kd * uPC.dil_d - uPC.pad_d;
+                if (idd < 0 || idd >= uPC.ID) continue;
+                for (int ky = 0; ky < uPC.KH; ++ky) {
+                    int iy = oh * uPC.stride_h + ky * uPC.dil_h - uPC.pad_h;
+                    if (iy < 0 || iy >= uPC.IH) continue;
+                    for (int kx = 0; kx < uPC.KW; ++kx) {
+                        int ix = ow * uPC.stride_w + kx * uPC.dil_w - uPC.pad_w;
+                        if (ix < 0 || ix >= uPC.IW) continue;
+                        int xidx = x_base_n +
+                                   (ic_base + kic) * uPC.ID * uPC.IH * uPC.IW +
+                                   idd * uPC.IH * uPC.IW + iy * uPC.IW + ix;
+                        int widx = w_base +
+                                   ((kic * uPC.KD + kd) * uPC.KH + ky) * uPC.KW +
+                                   kx;
+                        int b = int((uInputW.data[widx >> 2] >>
+                                     ((widx & 3) * 8)) & 0xFF);
                         // Sign-extend 8-bit to int (reinterpret as signed).
                         if (b >= 128) b -= 256;
-                        w = float(b) * w_scale;
-                    } else {
-                        w = BUF_LOAD(uInputW.data, widx);
+                        sum += BUF_LOAD(uInputX.data, xidx) *
+                               (float(b) * w_scale);
                     }
-                    sum += x * w;
                 }
             }
         }
+    } else {
+        sum = conv_fp(x_base_n, w_base, ic_base, icg, od, oh, ow);
     }
 
     if (uPC.has_bias != 0) {
