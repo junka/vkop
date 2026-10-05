@@ -54,6 +54,12 @@ struct Initializer {
     std::string name;
     std::string dtype;
     std::vector<uint32_t> dims;
+    // Payload size in BYTES as the writer recorded it. Kept separate from dims
+    // because the two are only interchangeable while every element is a whole
+    // number of bytes: a packed format (int4, fp4) holds several elements per
+    // byte, so the runtime must take the byte count from the file and check it
+    // against dims rather than derive one from the other.
+    size_t size = 0;
 };
 
 // RAII handle over a memory-mapped file. Owned by VkModel so that the

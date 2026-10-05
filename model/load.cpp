@@ -162,6 +162,7 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
             Initializer init;
             init.name = e->name() ? e->name()->str() : "";
             init.dtype = e->dtype() ? e->dtype()->str() : "";
+            init.size = static_cast<size_t>(e->size());
             if (e->dims()) {
                 init.dims.reserve(e->dims()->size());
                 for (uint32_t d = 0; d < e->dims()->size(); ++d) {

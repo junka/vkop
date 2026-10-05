@@ -79,6 +79,13 @@ class MatMulImage : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // This kernel reads both operands as float or half; a quantized operand
+        // has to reach a kernel that dequantizes it first. Silent fallback to
+        // the fp32 loader would read payload bytes as exponents.
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            core::require_float_elem(inputs[i]->elem_kind(), "MatMul",
+                                     ("input " + std::to_string(i)).c_str());
+        }
         int chan = inputs[0]->get_channel();
         int m = inputs[0]->get_height();
         int n = inputs[1]->get_width();
@@ -185,6 +192,12 @@ class MatMulBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Same contract as the image path: float or half only. A quantized
+        // weight belongs to a kernel that dequantizes it.
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            core::require_float_elem(inputs[i]->elem_kind(), "MatMul",
+                                     ("input " + std::to_string(i)).c_str());
+        }
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
         int rank_a = static_cast<int>(shape_a.size());

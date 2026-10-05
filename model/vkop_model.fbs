@@ -84,6 +84,13 @@ table Attribute {
 
 table InitializerEntry {
   name: string;
+  // ONNX TensorProto DataType name ("float32", "float16", "int8", "bool",
+  // "int32", "int64"). This string is authoritative for what the bytes mean:
+  // the runtime parses it against the whitelist in core/DType.hpp and refuses
+  // anything unrecognized or recognized-but-kernel-less (bfloat16, float8*,
+  // *int4/fp4), so a quantized checkpoint fails at load instead of being read
+  // through a float kernel. `size` must equal prod(dims) * bits / 8 — checked,
+  // not derived, because a packed format holds several elements per byte.
   dtype: string;
   dims: [uint];
   offset: ulong;

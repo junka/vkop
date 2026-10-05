@@ -10,6 +10,8 @@
 #include "vulkan/VulkanImage.hpp"
 #include "vulkan/VulkanResource.hpp"
 
+#include "core/DType.hpp"
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -48,6 +50,16 @@ template <typename T> class Tensor;
 class ITensor {
   public:
     virtual const std::type_info &dtype() const = 0;
+
+    // What the elements MEAN, as opposed to dtype(), the C++ type holding them.
+    // See core/DType.hpp for why the two are separate. Tensor<T> answers with
+    // the format its storage type stands for, unless the model file recorded
+    // something else and set_elem_kind() pinned it.
+    virtual ElemKind elem_kind() const = 0;
+
+    // Pin the element semantics, overriding the storage-type default. Called by
+    // the loader with the dtype string read from the model file.
+    void set_elem_kind(ElemKind kind) { declared_kind_ = kind; }
 
     uint8_t num_dims() const { return n_dims_; }
 
@@ -303,6 +315,10 @@ class ITensor {
     }
 
   protected:
+    // ElemKind pinned by the model file's dtype string, or kInvalid to fall
+    // back on the storage type's own meaning (see Tensor::elem_kind()).
+    ElemKind declared_kind_ = ElemKind::kInvalid;
+
     // Logical tensor dims. The image path only ever uses the first 4 slots
     // (image packing is NCHW/NCW/etc.); the SSBO buffer path may use up to
     // 8 (push-constant dims[8] convention). 16 slots keep headroom.
@@ -423,6 +439,15 @@ template <typename T> class Tensor : public ITensor {
     }
 
     const std::type_info &dtype() const override { return typeid(T); }
+
+    // The storage type's meaning, unless the model file said otherwise
+    // (set_elem_kind). uint16_t storage means fp16 here, and int8_t means a
+    // signed byte — an ONNX bool rides on the same byte, and only the file's
+    // recorded dtype can tell a mask from a quantized weight.
+    ElemKind elem_kind() const override {
+        return declared_kind_ != ElemKind::kInvalid ? declared_kind_
+                                                    : elem_kind_of_storage<T>();
+    }
 
     void resize(int n, int c, int h, int w) {
         memset(dims_, 0, sizeof(dims_));

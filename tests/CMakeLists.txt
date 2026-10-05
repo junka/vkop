@@ -33,6 +33,7 @@ include_directories(${CMAKE_SOURCE_DIR}/model)
 
 set(TEST_SOURCES
     setup.cpp
+    DTypeTest.cpp
     GridSampleTest.cpp
     Conv2dTest.cpp
     AddTest.cpp

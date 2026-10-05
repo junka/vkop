@@ -12,6 +12,7 @@
 #include <queue>
 #include <unordered_set>
 
+#include "core/DType.hpp"
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
@@ -38,6 +39,43 @@ Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
 Runtime::~Runtime() = default;
 
 void Runtime::LoadCache() {}
+
+namespace {
+// The initializer's recorded byte count is authoritative, so cross-check it
+// against dims x the declared element width instead of deriving one from the
+// other. Two reasons it has to be a check and not a derivation: a packed format
+// (int4/fp4) holds several elements per byte, so byte count is not a function
+// of the element count the storage type implies; and a file whose dims, dtype
+// or offset disagree with its payload would otherwise be read as a differently
+// shaped tensor and produce numbers that look plausible. Every model the
+// converter writes satisfies this today, so a mismatch means the file did not
+// come from this pipeline — or was edited after it left.
+void check_initializer_payload(const load::Initializer &init, ElemKind kind,
+                               size_t offset, size_t blob_size) {
+    size_t elements = 1;
+    for (uint32_t d : init.dims) {
+        elements *= d;
+    }
+    const size_t expected = elem_bytes(kind, elements);
+    if (init.size != expected) {
+        std::string dims;
+        for (uint32_t d : init.dims) {
+            dims += (dims.empty() ? "" : "x") + std::to_string(d);
+        }
+        throw std::runtime_error(
+            "vkop: initializer " + init.name + " is recorded as " +
+            std::to_string(init.size) + " bytes but " + init.dtype + " [" +
+            dims + "] is " + std::to_string(expected));
+    }
+    if (offset + expected > blob_size) {
+        throw std::runtime_error("vkop: initializer " + init.name +
+                                 " payload at offset " +
+                                 std::to_string(offset) + " runs " +
+                                 std::to_string(offset + expected - blob_size) +
+                                 " bytes past the initializer blob");
+    }
+}
+} // namespace
 
 void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
@@ -101,34 +139,60 @@ void Runtime::LoadModel() {
         }
         std::shared_ptr<ITensor> t;
         if (backend_buffer_) {
-            if (i.dtype == "int64") {
+            // The file's dtype string decides; the C++ storage type is picked
+            // from it, never the other way round. An unrecorded dtype keeps the
+            // historical fp16 default (older writer versions omit the field).
+            const std::string dt = i.dtype.empty() ? "float16" : i.dtype;
+            const ElemKind kind =
+                require_supported_elem(dt, ("graph input " + i.name).c_str());
+            switch (kind) {
+            case ElemKind::kInt64: {
                 auto typed = std::make_shared<Tensor<int64_t>>(in_dims);
+                typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
-            } else if (i.dtype == "int32") {
+                break;
+            }
+            case ElemKind::kInt32: {
                 auto typed = std::make_shared<Tensor<int>>(in_dims);
+                typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
-            } else if (i.dtype == "bool" || i.dtype == "int8") {
+                break;
+            }
+            case ElemKind::kInt8:
+            case ElemKind::kBool: {
                 // bool/int8 share the int8 storage representation; the LLM's
                 // image_pad_mask is bool but buffer ops consume it as bytes.
                 auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
+                typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
-            } else if (i.dtype == "float32") {
+                break;
+            }
+            case ElemKind::kFloat32: {
                 auto typed = std::make_shared<Tensor<float>>(in_dims);
+                typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
-            } else {
-                // float16 / unknown -> fp16 (the historical default).
+                break;
+            }
+            case ElemKind::kFloat16: {
                 auto typed = std::make_shared<Tensor<uint16_t>>(in_dims);
+                typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
                 typed->as_storage_buffer(dev);
                 t = typed;
+                break;
+            }
+            default:
+                throw std::runtime_error(
+                    "vkop: graph input " + i.name + " has element format " +
+                    elem_name(kind) + ", which no input path can hold");
             }
         } else {
             // legacy image backend: fp16 inputs as images (original path).
@@ -288,18 +352,25 @@ void Runtime::LoadModel() {
                             name_ptr + name_idx_offset + meta.name_len());
             name_idx_offset += meta.name_len();
             auto init = model.initializers[name];
-            if (init.dtype == "float32") {
+            const ElemKind kind = require_supported_elem(
+                init.dtype, ("unified initializer " + init.name).c_str());
+            if (kind == ElemKind::kFloat32) {
                 auto t = std::make_shared<Tensor<float>>(init.dims);
+                t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
-            } else if (init.dtype == "float16") {
+            } else if (kind == ElemKind::kFloat16) {
                 auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
+                t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
-            } else if (init.dtype == "int8") {
+            } else if (kind == ElemKind::kInt8 || kind == ElemKind::kBool) {
                 auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+                t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
             } else {
-                throw std::runtime_error("Unsupported data type: " +
-                                         init.dtype);
+                throw std::runtime_error(
+                    "vkop: unified initializer " + init.name +
+                    " has element format " + elem_name(kind) +
+                    ", which the unified path cannot sub-allocate");
             }
 
             model.initializers.erase(name);
@@ -326,8 +397,13 @@ void Runtime::LoadModel() {
         const auto &init = entry.second;
         size_t offset = entry.first;
         const uint8_t *src_ptr = model.initializer_memory + offset;
-        if (init.dtype == "int64") {
+        const ElemKind kind = require_supported_elem(
+            init.dtype, ("initializer " + init.name).c_str());
+        check_initializer_payload(init, kind, offset,
+                                  model.initializer_memory_size);
+        if (kind == ElemKind::kInt64) {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
+            t->set_elem_kind(kind);
             t->set_ref_cnt_forever();
             t->fillToCPU(const_cast<int64_t *>(
                 reinterpret_cast<const int64_t *>(src_ptr)));
@@ -344,8 +420,9 @@ void Runtime::LoadModel() {
             t->set_host_authoritative();
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
-        } else if (init.dtype == "int32") {
+        } else if (kind == ElemKind::kInt32) {
             auto t = std::make_shared<Tensor<int>>(init.dims);
+            t->set_elem_kind(kind);
             t->set_ref_cnt_forever();
             t->fillToCPU(
                 const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
@@ -356,19 +433,20 @@ void Runtime::LoadModel() {
             t->set_host_authoritative();
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
-        } else if (init.dtype == "float32") {
+        } else if (kind == ElemKind::kFloat32) {
             auto t = std::make_shared<Tensor<float>>(init.dims);
+            t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
-        } else if (init.dtype == "float16") {
+        } else if (kind == ElemKind::kFloat16) {
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
-            handle_floating_point_tensor(init, src_ptr, offset, t);
-        } else if (init.dtype == "int8") {
-            auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+            t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
         } else {
-            throw std::runtime_error("Only float32/int32/fp16/int8 initializer "
-                                     "is supported for now " +
-                                     init.dtype);
+            // kInt8 / kBool: a quantized weight and a mask both land on the
+            // same byte storage, and only the recorded dtype tells them apart.
+            auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+            t->set_elem_kind(kind);
+            handle_floating_point_tensor(init, src_ptr, offset, t);
         }
     }
 
@@ -615,6 +693,17 @@ void Runtime::LoadModel() {
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);
                         }
+                    }
+                    // A byte-tensor output is either a bool mask or an int8
+                    // value, and the marker above cannot tell them apart; the
+                    // recorded dtype can. The float formats are left alone on
+                    // purpose: precision_ deliberately runs fp32-recorded
+                    // chains in fp16, so for them the file's dtype is not
+                    // authoritative about the bytes the runtime actually holds.
+                    if (dtype_marker == "_i8_") {
+                        node_outputs.back()->set_elem_kind(
+                            out_shape.dtype == "bool" ? ElemKind::kBool
+                                                      : ElemKind::kInt8);
                     }
                 }
             }

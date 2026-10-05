@@ -10,8 +10,10 @@ layout(local_size_x = 16, local_size_y = 16) in;
 // The K loop carries NO data-dependent branches: transA/transB are
 // hoisted into walk start + stride, and each (A dtype x B dtype) pair
 // gets its own specialized loop instance via macro expansion (4 per
-// output-width body, 8 total). fp16x == 2 (int8 storage) keeps the
-// legacy "read the raw word as fp32" behavior (fp16x == 1 check).
+// output-width body, 8 total). fp16a/fp16b/fp16c/fp16o are 0 (fp32) or 1
+// (fp16) only: Gemm::execute rejects every other element format, because
+// reading a quantized payload through LDF would reinterpret its bytes as
+// exponents and return a wrong answer with no error.
 
 
 #define FLOAT float

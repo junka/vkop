@@ -5,6 +5,7 @@
 #include "ops/Conv2d.hpp"
 #include "ops/Operator.hpp"
 #include <numeric>
+#include <string>
 
 extern "C" {
 extern unsigned char buffer_gemm_spv[];
@@ -133,38 +134,27 @@ class Gemm : public Operator {
         para_.M = m;
         para_.N = n;
         para_.K = k;
-        if (inputs[0]->dtype() == typeid(uint16_t)) {
-            para_.fp16a = 1;
-        } else if (inputs[0]->dtype() == typeid(uint8_t)) {
-            para_.fp16a = 2;
-        } else {
-            para_.fp16a = 0;
+        // A GEMM kernel reads its operands as float or half. A quantized weight
+        // has to arrive at a kernel that dequantizes it: the fp32 loader would
+        // take the payload bytes for exponents and return a plausible-looking
+        // wrong answer, so anything else fails here instead.
+        for (size_t i = 0; i < inputs.size(); ++i) {
+            core::require_float_elem(inputs[i]->elem_kind(), "Gemm",
+                                     ("input " + std::to_string(i)).c_str());
         }
-        if (inputs[1]->dtype() == typeid(uint16_t)) {
-            para_.fp16b = 1;
-        } else if (inputs[1]->dtype() == typeid(uint8_t)) {
-            para_.fp16b = 2;
-        } else {
-            para_.fp16b = 0;
-        }
+        core::require_float_elem(outputs[0]->elem_kind(), "Gemm", "output");
+        para_.fp16a =
+            inputs[0]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
+        para_.fp16b =
+            inputs[1]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
 
         if (inputs.size() > 2) {
             para_.has_bias = 1;
-            if (inputs[2]->dtype() == typeid(uint16_t)) {
-                para_.fp16c = 1;
-            } else if (inputs[2]->dtype() == typeid(uint8_t)) {
-                para_.fp16c = 2;
-            } else {
-                para_.fp16c = 0;
-            }
+            para_.fp16c =
+                inputs[2]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
         }
-        if (outputs[0]->dtype() == typeid(uint16_t)) {
-            para_.fp16o = 1;
-        } else if (inputs[1]->dtype() == typeid(uint8_t)) {
-            para_.fp16o = 2;
-        } else {
-            para_.fp16o = 0;
-        }
+        para_.fp16o =
+            outputs[0]->elem_kind() == core::ElemKind::kFloat16 ? 1 : 0;
 
         if (para_.fp16o == 1) {
             submit(&para_, UP_DIV(n, 32), UP_DIV(m, 16), 1);

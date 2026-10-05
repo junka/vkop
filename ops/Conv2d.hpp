@@ -537,7 +537,7 @@ class Conv2dBuffer : public BufferFactory {
         //   fp32/fp16, w/ bias : [X, W, bias]
         //   int8,     no bias : [X, W_int8, scale]
         //   int8,     w/ bias : [X, W_int8, bias, scale]
-        bool weight_int8 = inputs[1]->dtype() == typeid(int8_t);
+        bool weight_int8 = inputs[1]->elem_kind() == core::ElemKind::kInt8;
         bool has_bias =
             weight_int8 ? (inputs.size() == 4) : (inputs.size() > 2);
         size_t bias_index = 2;
