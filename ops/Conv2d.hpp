@@ -454,6 +454,17 @@ class Conv2dBuffer : public BufferFactory {
         // Support both 2-D (4-D input NCHW) and 3-D (5-D input NCDHW)
         // convolution. A 2-D conv is the 3-D path with depth dims = 1, so the
         // host always fills the D fields and the shader's KD loop runs once.
+        //
+        // conv2d.comp dequantizes an int8 weight and nothing else, so any other
+        // non-float kind reaching here would be read as exponents. The 4-bit
+        // weight-only payload exists for the buffer MatMul kernel only; a model
+        // that put one on a Conv has to say so rather than compute plausibly
+        // wrong numbers.
+        const bool weight_int8 =
+            inputs[1]->elem_kind() == core::ElemKind::kInt8;
+        if (!weight_int8) {
+            core::require_float_elem(inputs[1]->elem_kind(), "Conv", "input 1");
+        }
         int rank = static_cast<int>(input_shape.size());
         bool is_3d = (rank >= 5);
         int batch = input_shape[0];
@@ -514,7 +525,6 @@ class Conv2dBuffer : public BufferFactory {
                                      out_width}
                   : std::vector<int>{batch, out_depth, out_height, out_width};
         int total = batch * out_depth * out_d * out_height * out_width;
-        bool weight_int8 = inputs[1]->elem_kind() == core::ElemKind::kInt8;
         bool has_bias =
             weight_int8 ? (inputs.size() == 4) : (inputs.size() > 2);
         // Register-blocked 3x3 path: one thread per CONV_OW_BLOCK contiguous

@@ -501,6 +501,10 @@ class ModelConverter:
             self.quantizer.quantize_to_fp16_selective(dag_model)
         elif args.quant == "int8":
             self.quantizer.quantize_to_int8_weight_only(dag_model)
+        elif args.quant in ("int4", "nf4"):
+            self.quantizer.quantize_to_4bit_weight_only(
+                dag_model, getattr(args, "group_size", 64), args.quant
+            )
 
         if getattr(args, "rgba", False):
             RGBAConverter.convert(dag_model)

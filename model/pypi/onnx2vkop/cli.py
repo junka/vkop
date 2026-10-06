@@ -26,6 +26,8 @@ Examples:
   # With quantization
   onnx2vkop -i model.onnx -q fp16
   onnx2vkop -i model.onnx -q int8
+  onnx2vkop -i model.onnx -q int4 --group-size 64
+  onnx2vkop -i model.onnx -q nf4
 
   # With all optimizations
   onnx2vkop -i model.onnx -u -r -b 4
@@ -37,7 +39,14 @@ Examples:
         "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin)"
     )
     parser.add_argument(
-        "-q", "--quant", choices=["fp16", "int8"], help="Quantization type: fp16 or int8"
+        "-q", "--quant", choices=["fp16", "int8", "int4", "nf4"],
+        help="Quantization type: fp16, int8 (per-column scale), or a 4-bit "
+             "weight-only MatMul payload with a per-K-group scale "
+             "(int4 = signed nibble, nf4 = NF4 codebook index)",
+    )
+    parser.add_argument(
+        "--group-size", type=int, default=64,
+        help="Values of K sharing one fp32 scale for -q int4/nf4 (default: 64)",
     )
     parser.add_argument(
         "-u", "--unify", action="store_true", help="Convert initializers to a single memory block"
@@ -86,12 +95,14 @@ def main():
 
         # Create a simple args object for apply_optimizations
         class Args:
-            def __init__(self, quant, unify, rgba):
+            def __init__(self, quant, unify, rgba, group_size):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
+                self.group_size = group_size
 
-        converter.apply_optimizations(dag_model, Args(args.quant, args.unify, args.rgba))
+        converter.apply_optimizations(
+            dag_model, Args(args.quant, args.unify, args.rgba, args.group_size))
 
         # Print statistics (before binary save — dag_model may be huge for LLMs)
         op_stats = {}

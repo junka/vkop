@@ -4686,6 +4686,199 @@ class Quantizer:
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
+    # The 16 NF4 quantiles of a unit-normal distribution, normalized so the
+    # extreme codes are exactly -1 and +1. matmul.comp holds the same table:
+    # a weight is codebook[q] * group_absmax, so the fp32 scale the shader binds
+    # is the group absmax itself rather than absmax/7.
+    _NF4_CODEBOOK = np.array(
+        [
+            -1.0, -0.6961928009986877, -0.5250730514526367, -0.3949174189567566,
+            -0.2844413814544678, -0.1847814998626709, -0.0910967006323811, 0.0,
+            0.0795802986717224, 0.1601973110246658, 0.2447470557689667,
+            0.3361703515052795, 0.4407098295211792, 0.5626170039176941,
+            0.7229568369388580, 1.0,
+        ],
+        dtype=np.float32,
+    )
+
+    @staticmethod
+    def quantize_to_4bit_weight_only(dag_model, group_size: int = 64,
+                                     fmt: str = "int4"):
+        """
+        Quantize MatMul weights to a 4-bit weight-only payload with a
+        per-(K group, output column) fp32 scale.
+
+        For each quantized tensor [K, N]:
+        - codes: int4 (signed nibble, scale = amax/7) or nf4 (unsigned nibble
+          indexing _NF4_CODEBOOK, scale = amax), grouped along K so a group of
+          `group_size` rows shares one scale per column;
+        - payload: two nibbles per byte, the even element in the LOW nibble, in
+          row-major [K, N] order — an ONNX INT4/UINT4 tensor's packed raw_data,
+          which is the same layout;
+        - scale: a separate FLOAT initializer [K/group_size, N], appended as the
+          consuming node's third input.
+
+        Unlike INT8 this covers only the buffer MatMul kernel, and only for a
+        plain [K, N] weight: the nibble unpack and the four-columns-per-word
+        addressing both fall apart for a transposed layout, an odd N (a row that
+        does not start on a 32-bit word), or a group that is not a whole number
+        of rows. Every one of those is a gate below rather than a kernel
+        fallback — a graph the runtime cannot read correctly has to fail here,
+        where the reason is nameable, instead of computing plausible numbers.
+        """
+        if fmt not in ("int4", "nf4"):
+            raise ValueError(f"unknown 4-bit weight-only format: {fmt!r}")
+        if group_size <= 0 or group_size % 2 != 0:
+            # Even because the fp16 kernels walk A two halves per word: a group
+            # of odd length would leave a tap straddling a word.
+            raise ValueError(f"group_size must be a positive even number, got {group_size}")
+
+        print(f"Applying weight-only {fmt} quantization (group_size={group_size})...")
+
+        converted_count = 0
+        skipped_count = 0
+
+        initializer_consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                initializer_consumers[inp["name"]].append(node)
+
+        signed = fmt == "int4"
+
+        for name in list(dag_model.initializers.keys()):
+            initializer = dag_model.initializers[name]
+
+            if initializer.data_type not in (
+                onnx.TensorProto.FLOAT,
+                onnx.TensorProto.FLOAT16,
+            ):
+                print(f"Preserving '{name}': not a float weight")
+                skipped_count += 1
+                continue
+
+            consumers = initializer_consumers.get(name, [])
+            op_types = {node.op_type for node in consumers}
+            if not consumers:
+                print(f"Preserving '{name}': no consumers")
+                skipped_count += 1
+                continue
+            if op_types != {"MatMul"}:
+                # A 4-bit payload is only readable by the buffer MatMul kernel.
+                # Conv/Gemm weight-only int8 exists; the nibble kernels do not,
+                # so anything else keeps its float weight.
+                print(
+                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
+                    f"MatMul has a {fmt} kernel"
+                )
+                skipped_count += 1
+                continue
+
+            is_b_operand = all(
+                len(node.inputs) > 1 and node.inputs[1]["name"] == name
+                for node in consumers
+            )
+            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
+            dims = list(initializer.dims)
+            reasons = []
+            if not is_b_operand:
+                reasons.append("not the B operand")
+            if len(dims) != 2:
+                reasons.append(f"dims={dims} is not a plain 2-D matrix")
+            if transb != {0}:
+                reasons.append(f"transB={sorted(transb)} (only the [K, N] layout unpacks)")
+            if reasons:
+                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
+                skipped_count += 1
+                continue
+
+            k, n = dims
+            reasons = []
+            if n % 8 != 0:
+                reasons.append(f"N={n} is not a multiple of 8 (a packed row must "
+                               f"start on a 32-bit word)")
+            if k % group_size != 0:
+                reasons.append(f"K={k} is not a multiple of group_size={group_size}")
+            if reasons:
+                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
+                skipped_count += 1
+                continue
+
+            arr = numpy_helper.to_array(initializer).astype(np.float32)
+            n_groups = k // group_size
+            w3 = arr.reshape(n_groups, group_size, n)
+
+            amax = np.max(np.abs(w3), axis=1, keepdims=True)
+            if signed:
+                scale_keepdims = np.where(amax == 0, 1.0, amax / 7.0)
+                codes = np.clip(
+                    np.round(w3 / scale_keepdims), -8, 7
+                ).astype(np.int8)
+                dequantized = codes.astype(np.float32) * scale_keepdims
+            else:
+                scale_keepdims = np.where(amax == 0, 1.0, amax)
+                normalized = w3 / scale_keepdims
+                codes = np.abs(
+                    normalized[..., None] - Quantizer._NF4_CODEBOOK[None, None, None, :]
+                ).argmin(axis=-1).astype(np.int8)
+                dequantized = (
+                    Quantizer._NF4_CODEBOOK[codes.astype(np.int64)] * scale_keepdims
+                )
+
+            scale = scale_keepdims.reshape(n_groups, n).astype(np.float32)
+
+            # Compare in the grouped view: dequantized carries the
+            # [n_groups, group_size, N] shape the scale broadcasts over.
+            diff = dequantized - w3
+            mse = np.mean(diff**2)
+            mae = np.mean(np.abs(diff))
+            rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
+            print(f"Quantized '{name}':")
+            print(f"  Shape: [{k}, {n}], groups: {n_groups} x {group_size}")
+            print(f"  Scale shape: {list(scale.shape)}")
+            print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
+            print(
+                f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
+                f"Max Rel Error: {np.max(rel_error):.2%}"
+            )
+
+            # Pack row-major: element i in byte i/2, low nibble for even i. An
+            # int4 -8 is the nibble 0x8, so masking the byte keeps two's
+            # complement; nf4's index is already 0..15.
+            nib = codes.reshape(-1).astype(np.uint8) & 0xF
+            packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
+            packed_init = helper.make_tensor(
+                name,
+                TensorProto.INT4 if signed else TensorProto.UINT4,
+                dims,
+                packed.tobytes(),
+                raw=True,
+            )
+            if not signed:
+                # UINT4 is the nibble's *storage*; NF4 is what it means. ONNX
+                # has no NF4 element type, so the name rides in the tensor's
+                # metadata and the writer emits it as the initializer dtype.
+                packed_init.metadata_props.add(key="vkop_dtype", value="nf4")
+
+            scale_name = f"{name}_scale"
+            scale_init = numpy_helper.from_array(scale, scale_name)
+            scale_init.data_type = onnx.TensorProto.FLOAT
+
+            dag_model.initializers[name] = packed_init
+            dag_model.initializers[scale_name] = scale_init
+
+            for node in consumers:
+                node.inputs.append({"name": scale_name, "shape": list(scale.shape)})
+
+            print(
+                f"Converted {onnx.TensorProto.DataType.Name(initializer.data_type)} "
+                f"tensor '{name}' to {fmt} with group scale '{scale_name}'"
+            )
+            converted_count += 1
+
+        print(f"Converted {converted_count} tensors to {fmt} weight-only")
+        print(f"Preserved {skipped_count} tensors")
+        print(f"Total initializers after quantization: {len(dag_model.initializers)}")
+
 
 class Unifier:
     """Collapse eligible initializers into a single 64-byte-aligned sub-region

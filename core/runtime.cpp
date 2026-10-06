@@ -441,6 +441,21 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<uint16_t>>(init.dims);
             t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
+        } else if (elem_kind_packed(kind)) {
+            // int4 / nf4 weight-only payloads: two values per byte, so the
+            // tensor's byte count is elem_bytes(kind, prod(dims)) — which
+            // check_initializer_payload() has just proven matches what the file
+            // recorded — while dims stay the logical [K, N] (or [N, K]) matrix
+            // the kernel indexes. The int8_t container holds raw bytes; only
+            // the kernel's nibble unpack knows a value is half a slot.
+            size_t elements = 1;
+            for (uint32_t d : init.dims) {
+                elements *= d;
+            }
+            auto t = std::make_shared<Tensor<int8_t>>(init.dims);
+            t->set_elem_kind(kind);
+            t->set_payload_bytes(static_cast<int>(elem_bytes(kind, elements)));
+            handle_floating_point_tensor(init, src_ptr, offset, t);
         } else {
             // kInt8 / kBool: a quantized weight and a mask both land on the
             // same byte storage, and only the recorded dtype tells them apart.
@@ -1988,10 +2003,13 @@ double Runtime::Run() {
     // Skip all intra-segment vkCmdPipelineBarrier calls. On MoltenVK / Apple
     // GPUs, dispatches within one compute encoder are strictly ordered by
     // command order — no explicit memory barrier is needed for write→read
-    // between adjacent dispatches (they write different SSBOs anyway). This
-    // drops ~100 ms from the decode loop because each of the 960 barriers
-    // costs ~0.1 ms of GPU-side fence traffic. OFF by default to keep the
-    // code portable to non-Metal backends.
+    // between adjacent dispatches (they write different SSBOs anyway). The
+    // saving is small on this machine — measured 2026-10-06 on GLM-Edge with
+    // the split-K GEMV in place: -1.6% (0.7ms) per decode token for fp16
+    // weights and within noise for int8, with bit-identical token streams
+    // (an earlier "~100ms" note here predates split-K, when the round was
+    // 2.5x longer). Still OFF by default to keep the code portable to
+    // non-Metal backends, where intra-encoder ordering is not guaranteed.
     bool graph_no_barrier = false;
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';

@@ -29,6 +29,9 @@ constexpr NameEntry kNames[] = {
     {"float4e2m1fn", ElemKind::kFloat4E2M1},
     {"int4", ElemKind::kInt4},
     {"uint4", ElemKind::kUint4},
+    // Not an ONNX name (see the ElemKind comment): vkop's converter writes it,
+    // and only the buffer MatMul kernel reads it.
+    {"nf4", ElemKind::kNF4},
 };
 
 const char *kind_label(ElemKind kind) {
@@ -76,9 +79,14 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind) {
     case ElemKind::kBFloat16:
     case ElemKind::kFloat8E4M3FN:
     case ElemKind::kFloat8E5M2:
+    // The packed kinds are deliberately false here: no storage type holds "one
+    // int4 element" without reinterpreting, because two of them share a byte.
+    // The loader gives them an int8_t container sized by elem_bytes() instead
+    // (Tensor::set_payload_bytes), so num_elements() counts bytes, not values.
     case ElemKind::kFloat4E2M1:
     case ElemKind::kInt4:
     case ElemKind::kUint4:
+    case ElemKind::kNF4:
         return false;
     }
     return false;

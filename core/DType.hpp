@@ -36,6 +36,20 @@ enum class ElemKind : uint8_t {
     kInt32,
     kInt64,
 
+    // 4-bit weight-only payloads, two nibbles per byte, read by the buffer
+    // MatMul kernel (see MatMulBuffer) with a per-K-group fp32 scale. kNF4's
+    // nibble is an unsigned INDEX into the fixed 16-value NF4 codebook (the
+    // quantiles of a normal distribution), dequantized as
+    // codebook[q] * group_absmax, while kInt4's is a signed value.
+    //
+    // Neither is an ONNX TensorProto spelling that a third-party graph uses
+    // here: NF4 is not an ONNX element type at all, so its name is vkop's own.
+    // Both are written only by vkop's converter, and every consumer other than
+    // that one kernel still fails at the loader — a format is only "supported"
+    // where a kernel exists for it.
+    kInt4,
+    kNF4,
+
     // Spelled in a model file, but no kernel reads them yet. They are listed so
     // the loader can name the format and say "no kernel" instead of falling
     // into a storage guess.
@@ -44,7 +58,6 @@ enum class ElemKind : uint8_t {
     kFloat8E4M3FN,
     kFloat8E5M2,
     kFloat4E2M1,
-    kInt4,
     kUint4,
 };
 
@@ -67,6 +80,7 @@ constexpr int elem_bits(ElemKind kind) {
     case ElemKind::kFloat4E2M1:
     case ElemKind::kInt4:
     case ElemKind::kUint4:
+    case ElemKind::kNF4:
         return 4;
     case ElemKind::kInt64:
         return 64;
@@ -85,6 +99,17 @@ constexpr size_t elem_bytes(ElemKind kind, size_t n_elements) {
     return (n_elements * static_cast<size_t>(bits) + 7) / 8;
 }
 
+// True for the formats that pack several elements into one byte, so that a
+// tensor's byte count is NOT prod(dims) * sizeof(storage): the container holds
+// bytes, and two elements share one. The loader sizes such a tensor's staging
+// and SSBO from elem_bytes() instead of its element count (see
+// Tensor::set_payload_bytes), which is why ops must read a packed weight's
+// logical K and N from its dims rather than from num_elements().
+constexpr bool elem_kind_packed(ElemKind kind) {
+    const int bits = elem_bits(kind);
+    return bits > 0 && bits < 8;
+}
+
 const char *elem_name(ElemKind kind);
 
 // The model file's dtype spelling -> ElemKind, or kInvalid when the string is
@@ -100,6 +125,12 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     case ElemKind::kFloat32:
     case ElemKind::kFloat16:
     case ElemKind::kInt8:
+    // The 4-bit weight-only formats are read by the buffer MatMul kernel only
+    // (see MatMulBuffer): a packed nibble with a per-group fp32 scale. Every
+    // other consumer of them still fails at the loader, which is the point of
+    // the whitelist — the format is only "supported" where a kernel exists.
+    case ElemKind::kInt4:
+    case ElemKind::kNF4:
     case ElemKind::kBool:
     case ElemKind::kInt32:
     case ElemKind::kInt64:

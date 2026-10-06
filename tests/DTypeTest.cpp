@@ -11,6 +11,7 @@ using vkop::core::Tensor;
 using vkop::core::elem_bits;
 using vkop::core::elem_bytes;
 using vkop::core::elem_kind_from_name;
+using vkop::core::elem_kind_packed;
 using vkop::core::elem_kind_supported;
 using vkop::core::elem_name;
 using vkop::core::require_float_elem;
@@ -37,11 +38,35 @@ TEST(DTypeTest, RecognizesSupportedNames) {
 // picking a storage type for them. They parse, but nothing may compute on them.
 TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
     for (const char *name : {"uint8", "bfloat16", "float8e4m3fn", "float8e5m2",
-                              "float4e2m1fn", "int4", "uint4"}) {
+                              "float4e2m1fn", "uint4"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_FALSE(elem_kind_supported(kind)) << name;
         EXPECT_STREQ(elem_name(kind), name);
+    }
+}
+
+// The two 4-bit weight-only formats the buffer MatMul kernel unpacks. Supported,
+// but still not a storage type: their bytes are packed two to the byte, so a
+// tensor holds them as raw bytes with the logical shape in its dims (see
+// Tensor::set_payload_bytes).
+TEST(DTypeTest, RecognizesPackedWeightOnlyNames) {
+    for (const char *name : {"int4", "nf4"}) {
+        const ElemKind kind = elem_kind_from_name(name);
+        EXPECT_NE(kind, ElemKind::kInvalid) << name;
+        EXPECT_TRUE(elem_kind_supported(kind)) << name;
+        EXPECT_TRUE(elem_kind_packed(kind)) << name;
+        EXPECT_EQ(elem_bits(kind), 4);
+        EXPECT_STREQ(elem_name(kind), name);
+        EXPECT_FALSE(storage_matches_kind(typeid(int8_t), kind)) << name;
+        EXPECT_EQ(elem_bytes(kind, 8), 4u);
+    }
+    // "packed" is a statement about the bytes, not about having a kernel.
+    EXPECT_TRUE(elem_kind_packed(ElemKind::kUint4));
+    EXPECT_TRUE(elem_kind_packed(ElemKind::kFloat4E2M1));
+    for (ElemKind kind : {ElemKind::kInt8, ElemKind::kBool, ElemKind::kFloat16,
+                          ElemKind::kFloat32, ElemKind::kInvalid}) {
+        EXPECT_FALSE(elem_kind_packed(kind)) << elem_name(kind);
     }
 }
 
@@ -125,6 +150,42 @@ TEST(DTypeTest, TensorElemKind) {
     // The storage type is unchanged by the label: bytes are still one per
     // element, which is what dtype() reports.
     EXPECT_EQ(i8.dtype(), typeid(int8_t));
+}
+
+// A sub-byte weight: the bytes hold half as many values as the dims describe,
+// so the tensor's byte count is set from the payload instead of from
+// prod(dims) * sizeof(storage). The guards here are what keep a mis-sized or
+// late-sized packed tensor from silently reading the wrong bytes.
+TEST(DTypeTest, SetPayloadBytesShrinksOnlyPackedStorage) {
+    Tensor<int8_t> w(64); // 64 logical int4 values, [8, 8]-shaped
+    w.set_elem_kind(ElemKind::kInt4);
+    EXPECT_EQ(w.size(), 64);
+    EXPECT_NO_THROW(w.set_payload_bytes(32));
+    EXPECT_EQ(w.size(), 32);
+    // num_elements() stays a byte-count division; the logical K and N come from
+    // the dims, which is why ops read packed tensors through getShape().
+    EXPECT_EQ(w.num_elements(), 32);
+
+    // Not a packed format, so the byte count is not the caller's to restate.
+    Tensor<int8_t> i8(64);
+    EXPECT_THROW(i8.set_payload_bytes(32), std::runtime_error);
+    // Larger than the storage, or empty, means the dims and the payload
+    // disagree.
+    Tensor<int8_t> bad(64);
+    bad.set_elem_kind(ElemKind::kInt4);
+    EXPECT_THROW(bad.set_payload_bytes(65), std::runtime_error);
+    EXPECT_THROW(bad.set_payload_bytes(0), std::runtime_error);
+    // Too late: the host buffer already holds the full-size copy.
+    Tensor<int8_t> uploaded(64);
+    uploaded.set_elem_kind(ElemKind::kInt4);
+    uploaded.fillToCPU(std::vector<int8_t>(64, 0));
+    EXPECT_THROW(uploaded.set_payload_bytes(32), std::runtime_error);
+    try {
+        i8.set_payload_bytes(32);
+        FAIL() << "a non-packed tensor must not restate its byte count";
+    } catch (const std::runtime_error &e) {
+        EXPECT_NE(std::string(e.what()).find("non-packed"), std::string::npos);
+    }
 }
 
 // The guard float-only kernels run behind.

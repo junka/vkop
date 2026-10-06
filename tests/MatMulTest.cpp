@@ -267,7 +267,276 @@ void run_matmul_int8(
             }));
     }
 }
+
+// The NF4 codebook the shader carries: 16 quantiles of a unit normal, extreme
+// codes exactly -1 and +1. Duplicated here on purpose — if the test used the
+// shader's table the comparison would be vacuous.
+static const float kNf4Codebook[16] = {
+    -1.0f, -0.6961928009986877f, -0.5250730514526367f, -0.3949174189567566f,
+    -0.2844413814544678f, -0.1847814998626709f, -0.0910967006323811f, 0.0f,
+    0.0795802986717224f, 0.1601973110246658f, 0.2447470557689667f,
+    0.3361703515052795f, 0.4407098295211792f, 0.5626170039176941f,
+    0.7229568369388580f, 1.0f};
+
+// 4-bit weight-only MatMul (buffer backend). B is a nibble-packed weight: two
+// values per byte, the even element in the LOW nibble, so element i of the
+// row-major matrix lives in byte i/2 at nibble i%2. The LAST input is the fp32
+// dequant scale table laid out [K/group, N] — one absmax per (K group, output
+// column) — which is the multi-input convention the optimizer appends:
+//   int4 : [A, B_int4, scale]   nibble = signed value, scale = amax/7
+//   nf4  : [A, B_nf4,  scale]   nibble = codebook index, scale = amax
+// A group's taps are summed before its scale is applied, so the reference
+// dequantizes the same way instead of comparing against the original weight.
+template <typename T>
+class MatMulW4Test : public TestCase<T> {
+  public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<int8_t>> weight;
+    std::shared_ptr<Tensor<float>> scale_data;
+    std::shared_ptr<Tensor<T>> output;
+
+    MatMulW4Test(int batch, int m, int k, int n, int group, bool nf4,
+                 bool batched_b = false, bool transB = false)
+        : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
+          group_(group), nf4_(nf4), batched_b_(batched_b), transB_(transB) {
+        attr = {{"transB", transB_ ? "1" : "0"}};
+        initTestData();
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &output,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<T>(output);
+        auto exp = vkop::core::as_tensor<T>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = to_float((*out)[i]);
+            float ev = to_float((*exp)[i]);
+            if (std::isnan(ov)) {
+                LOG_ERROR("4bit MatMul NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("4bit MatMul Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    int batch_, m_, k_, n_, group_;
+    bool nf4_, batched_b_, transB_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        auto i64 = torch::TensorOptions().dtype(torch::kInt64);
+        torch::manual_seed(42);
+
+        const int n_groups = k_ / group_;
+        std::vector<int64_t> a_shape = shape({batch_, m_, k_});
+        auto a = store(torch::randn(a_shape, f32));
+
+        // Quantize on the [K, N] view: the kernel's unpack is defined for that
+        // layout only (a transB case below exists to be refused).
+        auto w_src = torch::randn({k_, n_}, f32);
+        auto w3 = w_src.reshape({n_groups, group_, n_});
+        auto amax = std::get<0>(w3.abs().max(1, true)); // [n_groups, 1, N]
+        torch::Tensor codes, deq3;
+        torch::Tensor scale = amax;
+        if (nf4_) {
+            // Nearest codebook entry to the group-normalized value; the scale
+            // the kernel multiplies by is the group absmax itself.
+            auto cb = torch::from_blob(const_cast<float *>(kNf4Codebook), {16},
+                                       f32)
+                          .clone();
+            auto norm = w3 / amax;
+            codes = (norm.unsqueeze(-1) - cb.reshape({1, 1, 1, 16}))
+                        .abs()
+                        .argmin(-1);
+            deq3 = cb.index_select(0, codes.reshape({-1}))
+                       .reshape({n_groups, group_, n_}) *
+                   amax;
+        } else {
+            scale = amax / 7.0; // symmetric int4 reaches +7; -8 stays unused
+            codes = (w3 / scale).round().clamp(-8, 7).to(torch::kInt64);
+            deq3 = codes.to(torch::kFloat32) * scale;
+        }
+        auto deq = deq3.reshape({k_, n_});
+        auto y = torch::matmul(a.to(torch::kFloat32), deq);
+
+        inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
+        this->fillTensorFromTorch(inputa, a);
+
+        // Pack the CODES nibble-wise: element i in byte i/2, low nibble for
+        // even i. A batched weight repeats the same matrix, so its bytes repeat.
+        auto flat_codes = codes.reshape({-1}).cpu();
+        auto cacc = flat_codes.accessor<int64_t, 1>();
+        const int64_t values = flat_codes.numel();
+        std::vector<int8_t> bytes(static_cast<size_t>((values + 1) / 2), 0);
+        for (int64_t i = 0; i < values; i += 2) {
+            const uint32_t lo = static_cast<uint32_t>(cacc[i]) & 0xFu;
+            const uint32_t hi = i + 1 < values
+                                    ? (static_cast<uint32_t>(cacc[i + 1]) & 0xFu)
+                                    : 0u;
+            bytes[static_cast<size_t>(i / 2)] =
+                static_cast<int8_t>(lo | (hi << 4));
+        }
+        std::vector<int8_t> wbytes = bytes;
+        if (batched_b_) {
+            for (int i = 1; i < batch_; i++)
+                wbytes.insert(wbytes.end(), bytes.begin(), bytes.end());
+        }
+        std::vector<int> w_ints = to_ints(shape(
+            batched_b_ ? std::vector<int64_t>{batch_, k_, n_}
+                       : std::vector<int64_t>{k_, n_}));
+        weight = std::make_shared<Tensor<int8_t>>(w_ints);
+        weight->set_elem_kind(nf4_ ? vkop::core::ElemKind::kNF4
+                                   : vkop::core::ElemKind::kInt4);
+        // Two values per byte: the payload is half the element count, while the
+        // dims keep describing the logical matrix (what the kernel indexes).
+        weight->set_payload_bytes(static_cast<int>(wbytes.size()));
+        weight->fillToCPU(wbytes);
+
+        // A broadcast batch shares one weight, so one [n_groups, N] table serves
+        // every slice — it is NOT repeated per batch.
+        scale_data = std::make_shared<Tensor<float>>(
+            std::vector<int>{n_groups * n_});
+        auto cpu_scale = scale.reshape({-1}).cpu().contiguous();
+        auto sacc = cpu_scale.accessor<float, 1>();
+        std::vector<float> svec;
+        svec.reserve(static_cast<size_t>(cpu_scale.numel()));
+        for (int64_t i = 0; i < cpu_scale.numel(); i++)
+            svec.push_back(sacc[i]);
+        scale_data->fillToCPU(svec);
+
+        output = std::make_shared<Tensor<T>>(to_ints(y.sizes().vec()));
+        this->fillTensorFromTorch(output, store(y));
+
+        LOG_INFO("4bit MatMul %s batch %d, M %d, N %d, K %d, group %d, "
+                 "batched B %d, transB %d, fp16 %d",
+                 nf4_ ? "nf4" : "int4", batch_, m_, n_, k_, group_,
+                 batched_b_ ? 1 : 0, transB_ ? 1 : 0,
+                 std::is_same_v<T, uint16_t> ? 1 : 0);
+    }
+
+    static std::vector<int64_t> shape(const std::vector<int64_t> &s) {
+        if (s.size() == 3 && s[0] == 1) {
+            return {s[1], s[2]};
+        }
+        return s;
+    }
+
+    static std::vector<int> to_ints(const std::vector<int64_t> &s) {
+        return std::vector<int>(s.begin(), s.end());
+    }
+};
+
+// Cases are picked for the edges, not for coverage of sizes: a group count
+// below / equal to / above the 16 K slices the split-K GEMV hands out, a last
+// 16-quad block that is partial, a single group (the table degenerates to one
+// scale per column), more than one A row, and a materialized broadcast batch.
+template <typename T>
+void run_matmul_w4(
+    const std::vector<std::tuple<int, int, int, int, int, bool>> &cases) {
+    for (const auto &tc : cases) {
+        auto [batch, m, k, n, group, batched_b] = tc;
+        for (const bool nf4 : {false, true}) {
+            MatMulW4Test<T> t(batch, m, k, n, group, nf4, batched_b);
+            EXPECT_TRUE(t.run_test(
+                {t.inputa, t.weight, t.scale_data}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }));
+        }
+    }
+}
 } // namespace
+
+TEST(MatMulTest, MatMulInt4Nf4WeightOnlyBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<int, int, int, int, int, bool>> cases = {
+        {1, 4, 32, 16, 8, false},    // 4 groups, plain quad path
+        {1, 1, 256, 64, 64, false},  // decode: 4 groups over 16 slices
+        {1, 1, 256, 64, 16, false},  // decode: exactly 16 groups
+        {1, 1, 256, 64, 8, false},   // decode: 32 groups, 2 per slice
+        {1, 1, 320, 104, 32, false}, // partial last 16-quad block
+        {1, 3, 96, 24, 24, false},   // a few rows, 4 groups
+        {2, 1, 128, 32, 128, true},  // one group: per-column scales, batched A
+        {1, 16, 64, 16, 64, false},  // prefill-shaped M
+        {2, 4, 64, 16, 32, true},    // materialized broadcast weight
+    };
+    LOG_INFO("4bit MatMul, FP32");
+    run_matmul_w4<float>(cases);
+    LOG_INFO("4bit MatMul, FP16");
+    run_matmul_w4<uint16_t>(cases);
+}
+
+// The contracts the converter is supposed to guarantee, checked here so a graph
+// that breaks one fails instead of computing a wrong answer: a packed row must
+// start on a word (N % 8), a group must be walkable in A's half2 pairs (even),
+// the table must be a whole number of N-rows whose count divides K, and only
+// the [K, N] layout is unpacked.
+TEST(MatMulTest, MatMulInt4ContractThrows) {
+    vkop::tests::ScopedBufferBackend buffer;
+    {
+        MatMulW4Test<float> t(1, 4, 32, 12, 8, false); // N % 8 != 0
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, t.scale_data}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+    {
+        MatMulW4Test<float> t(1, 4, 40, 16, 5, false); // odd group
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, t.scale_data}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+    {
+        // transB: the same bytes read as [N, K] would need different
+        // addressing, so the host refuses rather than unpacking a transpose.
+        MatMulW4Test<float> t(1, 4, 32, 16, 8, false, false, true);
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, t.scale_data}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+    {
+        // A scale row count that does not divide K: 24 entries over 16 columns
+        // says 1.5 groups, which no grouping of K could have produced.
+        MatMulW4Test<float> t(1, 4, 32, 16, 8, false);
+        auto wrong = std::make_shared<Tensor<float>>(std::vector<int>{24});
+        wrong->fillToCPU(std::vector<float>(24, 1.0F));
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, wrong}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+}
 
 TEST(MatMulTest, MatMulSplitKGemvBuffer) {
     vkop::tests::ScopedBufferBackend buffer;

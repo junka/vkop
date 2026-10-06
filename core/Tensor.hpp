@@ -602,6 +602,38 @@ template <typename T> class Tensor : public ITensor {
     }
     int num_elements() { return size_ / sizeof(T); }
 
+    // Shrink this tensor's payload to `bytes` while keeping its logical dims.
+    // Only for the packed (sub-byte) element formats, whose value count is not
+    // their byte count: int4 [K, N] holds K*N values in K*N/2 bytes, so the
+    // host staging and the SSBO are sized by elem_bytes() while dims still
+    // describe the matrix. Every allocation, upload and readback below derives
+    // its length from size_, so setting it here — before as_storage_buffer()
+    // and copyToGPU() — is the whole change. num_elements() then counts
+    // STORAGE slots (bytes, for the int8_t container), not values: a packed
+    // tensor's K and N come from getShape(), which is what its kernels already
+    // do. Must be called on a freshly constructed tensor; re-doing it after a
+    // buffer exists would leave the SSBO sized for the old length.
+    void set_payload_bytes(int bytes) {
+        if (!elem_kind_packed(elem_kind())) {
+            throw std::runtime_error(
+                std::string(
+                    "vkop: set_payload_bytes on a non-packed tensor (") +
+                elem_name(elem_kind()) + " has no sub-byte packing)");
+        }
+        if (sizeof(T) != 1 || bytes <= 0 || bytes > size_) {
+            throw std::runtime_error(
+                "vkop: packed payload of " + std::to_string(bytes) +
+                " bytes does not fit " + std::to_string(size_) +
+                " bytes of 1-byte storage");
+        }
+        if (vkobj_ || (data_ && !data_->empty())) {
+            throw std::runtime_error(
+                "vkop: set_payload_bytes must run before the tensor is "
+                "allocated or uploaded");
+        }
+        size_ = bytes;
+    }
+
     // Return by reference (NOT by value). A by-value return made callers that
     // did `tensor.data().data()` take a dangling pointer into an immediately
     // destroyed temporary vector — the root cause of the bogus "all-NaN logits"

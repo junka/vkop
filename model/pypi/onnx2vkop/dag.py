@@ -47,7 +47,78 @@ _DATA_TYPE_MAP = {
     14: "complex64",
     15: "complex128",
     16: "bfloat16",
+    # ONNX's 4-bit element types. vkop writes them only for a weight-only
+    # quantized payload; the C++ loader has a kernel for "int4" and for "nf4"
+    # (which is a UINT4 payload whose nibble indexes the NF4 codebook — the name
+    # comes from the tensor's vkop_dtype metadata, see _init_dtype_name).
+    21: "uint4",
+    22: "int4",
 }
+
+# Sub-byte element types: two values per byte, the even element in the low
+# nibble, in the array's row-major order. ONNX's raw_data for these is already
+# that packed byte string, while a numpy 4-bit array's tobytes() is one byte per
+# value — so a packed initializer's blob bytes are its raw_data verbatim, and
+# its size comes from the dims and the bit width, not from either dtype's
+# itemsize (see _init_byte_len / _init_bytes).
+_PACKED_DATA_TYPES = frozenset((21, 22))
+_PACKED_BITS = 4
+
+# The extension channel a quantizer uses to name a payload whose ONNX element
+# type is only its storage (nf4 rides on UINT4).
+_VKOP_DTYPE_META_KEY = "vkop_dtype"
+
+# 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
+# 权重，预扫描时把每个 initializer 解成 ndarray 再 tobytes 会瞬间分配
+# 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
+_DTYPE_BYTES = {
+    1: 4, 2: 1, 3: 1, 4: 2, 5: 2, 6: 4, 7: 8, 9: 1, 10: 2,
+    11: 8, 12: 4, 13: 8, 16: 2,
+}
+
+
+def _init_byte_len(arr) -> int:
+    """The bytes this initializer occupies in the blob.
+
+    Computed from the dtype and dims instead of by decoding the payload: a
+    prescan that ran to_array() + tobytes() on every initializer would allocate
+    several GB of temporaries for a 3.4GB LLM weight set, on top of the blob it
+    is only measuring."""
+    n = 1
+    for d in arr.dims:
+        n *= int(d)
+    if arr.data_type in _PACKED_DATA_TYPES:
+        return (n * _PACKED_BITS + 7) // 8
+    nbytes = _DTYPE_BYTES.get(arr.data_type, 0)
+    return n * nbytes
+
+
+def _init_bytes(arr) -> bytes:
+    """The initializer's payload exactly as the blob records it. A packed
+    sub-byte tensor's raw_data IS the packed nibbles, and re-serializing it
+    through numpy would write one byte per value instead; everything else goes
+    through the ndarray so a tensor stored in int64_data/int32_data lands
+    correctly."""
+    if arr.data_type in _PACKED_DATA_TYPES:
+        data = arr.raw_data
+        expected = _init_byte_len(arr)
+        if len(data) != expected:
+            raise ValueError(
+                f"packed initializer '{arr.name}' carries {len(data)} bytes, "
+                f"but its dims declare {expected}"
+            )
+        return data
+    return np.ascontiguousarray(numpy_helper.to_array(arr)).tobytes()
+
+
+def _init_dtype_name(arr) -> str:
+    """The dtype string the C++ loader reads: vkop's own name when the tensor
+    carries one (nf4), else the ONNX element type's spelling."""
+    for entry in arr.metadata_props:
+        if entry.key == _VKOP_DTYPE_META_KEY:
+            return entry.value
+    return _DATA_TYPE_MAP.get(arr.data_type, "UNDEFINED")
+
 
 # 64-byte alignment for the compact initializer blob, matching the legacy
 # C++ two-pass scan (load.cpp alignment constant).
@@ -287,20 +358,7 @@ class DAGBasedModel:
         # blob 整体写到文件末尾，FlatBuffer 内不存字节。判断标准与 2GB 上限
         # 留安全余量——超过 ~800MB 就外置。
         #
-        # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
-        # 权重，预扫描时把每个 initializer 解成 ndarray 再 tobytes 会瞬间分配
-        # 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
-        _DTYPE_BYTES = {
-            1: 4, 2: 1, 3: 1, 4: 2, 5: 2, 6: 4, 7: 8, 9: 1, 10: 2,
-            11: 8, 12: 4, 13: 8, 16: 2,
-        }
-
-        def _init_byte_len(arr) -> int:
-            nbytes = _DTYPE_BYTES.get(arr.data_type, 0)
-            n = 1
-            for d in arr.dims:
-                n *= int(d)
-            return n * nbytes
+        # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——见 _init_byte_len。
 
         external = False
         try:
@@ -333,12 +391,11 @@ class DAGBasedModel:
             else:
                 if pad:
                     blob.extend(b"\x00" * pad)
-                arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
-                blob.extend(arr_np.tobytes())
+                blob.extend(_init_bytes(arr))
             cur_blob_len = aligned_offset + data_size
             blob_offsets[name] = (aligned_offset, data_size)
 
-            dtype_str = _DATA_TYPE_MAP.get(arr.data_type, "UNDEFINED")
+            dtype_str = _init_dtype_name(arr)
             dims = list(arr.dims)
 
             name_off = builder.CreateString(name)
@@ -654,9 +711,9 @@ class DAGBasedModel:
                 # 之后；文件末尾 8 字节 LE uint64 记录 blob 起始偏移，以便 C++
                 # 加载器按此定位。FlatBuffer 的 blob 字段此时为空，加载器逻辑不变。
                 #
-                # 流式写：逐个 initializer to_array→tobytes→write，写完即释放。
-                # 旧实现把整个 blob（3.4GB）累积进一个 bytearray 再 bytes() 写，
-                # 峰值 ~2×blob 叠加 proto 原始副本导致 OOM。
+                # 流式写：逐个 initializer 取 payload 字节（_init_bytes）→write，
+                # 写完即释放。旧实现把整个 blob（3.4GB）累积进一个 bytearray 再
+                # bytes() 写，峰值 ~2×blob 叠加 proto 原始副本导致 OOM。
                 align = _BLOB_ALIGNMENT
                 pad = (align - (f.tell() % align)) % align
                 if pad:
@@ -666,8 +723,7 @@ class DAGBasedModel:
                 for _name, arr, aligned_offset, data_size, ipad in external_init_order:
                     if ipad:
                         f.write(b"\x00" * ipad)
-                    arr_np = np.ascontiguousarray(numpy_helper.to_array(arr))
-                    f.write(arr_np.tobytes())
+                    f.write(_init_bytes(arr))
                     written = aligned_offset + data_size
                 # unified sub-region (if any)
                 unified_bytes = getattr(self, "_unified_bytes", b"")

@@ -57,6 +57,17 @@ struct alignas(16) GpuMatMulParam {
     // the column-parallel kernels then leave 15 of every 16 lanes idle. Buffer
     // path, fp16 build only; the image shaders never see it set.
     int ksplit = 0;
+    // 1 = B is a 4-bit weight-only payload (two nibbles per byte, even element
+    // in the low nibble) with a per-K-group fp32 scale at binding 4, laid out
+    // [K/group, N]. Buffer path only, and the host gates it on transB == 0,
+    // N % 8 == 0 and K % group == 0 (see MatMulBuffer::execute).
+    int w4 = 0;
+    // 1 = the nibble is an unsigned NF4 codebook index, not a signed int4
+    // value.
+    int nf4 = 0;
+    // Values of K sharing one scale row (K / n_groups). Even, and a divisor of
+    // K.
+    int group = 0;
 };
 
 } // namespace matmul
@@ -214,35 +225,45 @@ class MatMulBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         // Element formats. A and the output must be float or half; B may also
-        // be an int8 weight, in which case the graph carries its dequant scale
-        // as the last input — the same appended-scale convention the optimizer
-        // and Conv2d use:
+        // be a quantized weight, in which case the graph carries its dequant
+        // scale as the last input — the same appended-scale convention the
+        // optimizer and Conv2d use:
         //   fp32/fp16 : [A, B]
-        //   int8      : [A, B_int8, scale]
+        //   int8      : [A, B_int8, scale(N)]            one scale per column
+        //   int4 / nf4 : [A, B_4bit, scale(n_groups*N)]  one per (K group,
+        //   column)
         // Everything else fails here instead of being handed to a float loader,
         // which would read a quantized payload's bytes as exponents and return
         // a plausible wrong answer.
         const bool weight_int8 = inputs.size() > 1 && inputs[1]->elem_kind() ==
                                                           core::ElemKind::kInt8;
+        const bool weight_nf4 =
+            inputs.size() > 1 && inputs[1]->elem_kind() == core::ElemKind::kNF4;
+        const bool weight_int4 = inputs.size() > 1 && inputs[1]->elem_kind() ==
+                                                          core::ElemKind::kInt4;
+        const bool weight_4bit = weight_nf4 || weight_int4;
         core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
-        if (!weight_int8) {
+        if (!weight_int8 && !weight_4bit) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
         }
         core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
         size_t scale_index = 0;
-        if (weight_int8) {
+        if (weight_int8 || weight_4bit) {
             if (inputs.size() != 3) {
-                throw std::runtime_error("vkop: MatMul with an int8 weight "
-                                         "needs exactly [A, B_int8, "
-                                         "scale], got " +
+                throw std::runtime_error(std::string("vkop: MatMul with a ") +
+                                         (weight_4bit ? "4-bit" : "int8") +
+                                         " weight needs exactly "
+                                         "[A, B, scale], got " +
                                          std::to_string(inputs.size()) +
                                          " inputs");
             }
             if (inputs[2]->elem_kind() != core::ElemKind::kFloat32) {
                 throw std::runtime_error(
-                    std::string("vkop: MatMul int8 dequant scale must be ") +
-                    "float32, got " + core::elem_name(inputs[2]->elem_kind()));
+                    std::string("vkop: MatMul ") +
+                    (weight_4bit ? "4-bit" : "int8") +
+                    " dequant scale must be float32, got " +
+                    core::elem_name(inputs[2]->elem_kind()));
             }
             scale_index = 2;
         }
@@ -325,6 +346,61 @@ class MatMulBuffer : public BufferFactory {
             // and one scale per column stays correct for every batch index.
         }
 
+        // With a 4-bit weight the scale table is [n_groups, N] fp32 — one
+        // absmax per output column per slice of K — so its length has to be a
+        // whole number of N-rows, and K a whole number of those slices. Both
+        // derive the group length the kernels walk; anything else means the
+        // weight was grouped along the wrong axis or with a group size that
+        // does not divide K, which no kernel can undo.
+        int group_size = k;
+        if (weight_4bit) {
+            const size_t entries =
+                inputs[scale_index]->size() /
+                core::elem_bytes(core::ElemKind::kFloat32, 1);
+            const std::string what = weight_nf4 ? "nf4" : "int4";
+            if (n == 0 || entries % static_cast<size_t>(n) != 0) {
+                throw std::runtime_error("vkop: MatMul " + what +
+                                         " scale has " +
+                                         std::to_string(entries) +
+                                         " entries, not a whole number of rows "
+                                         "of " +
+                                         std::to_string(n) + " columns");
+            }
+            const int n_groups = static_cast<int>(entries / n);
+            if (n_groups == 0 || k % n_groups != 0) {
+                throw std::runtime_error(
+                    "vkop: MatMul " + what + " scale has " +
+                    std::to_string(n_groups) + " K groups but K is " +
+                    std::to_string(k));
+            }
+            group_size = k / n_groups;
+            // transB: a [N, K] weight would put a column's nibbles side by side
+            // along K instead of across columns, which is a different
+            // addressing (and a different word-alignment story) than the
+            // kernels below.
+            if (transB_) {
+                throw std::runtime_error(
+                    "vkop: MatMul " + what +
+                    " weight with transB is not supported "
+                    "(only the [K, N] layout is unpacked)");
+            }
+            // N % 8: the packed row must start on a 32-bit word boundary, since
+            // one word is the unit of addressable weight data. It also makes
+            // the group scale rows contiguous for a thread's four columns.
+            if ((n % 8) != 0) {
+                throw std::runtime_error(
+                    "vkop: MatMul " + what +
+                    " needs N % 8 == 0, got N = " + std::to_string(n));
+            }
+            // Even group: the fp16 kernels read A two halves per word, so a
+            // group's taps have to come in pairs.
+            if ((group_size % 2) != 0) {
+                throw std::runtime_error("vkop: MatMul " + what +
+                                         " needs an even group size, got " +
+                                         std::to_string(group_size));
+            }
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -382,17 +458,21 @@ class MatMulBuffer : public BufferFactory {
         // pairs.
         const bool w8_quad =
             fused_fp16 && weight_int8 && !transB_ && (n % 4 == 0);
+        // 4-bit weights always take the four-column quad kernel: the validation
+        // above already proved transB == 0 and N % 8 == 0, which is what makes
+        // a thread's four columns exactly half of one packed weight word.
+        const bool w4_quad = fused_fp16 && weight_4bit;
         // Shared-memory tiling pays only in the compute-bound regime, and only
         // where its indexing assumptions hold: k % 16 keeps every tile word
         // aligned on both B layouts. m >= 12 is measured, not guessed: at
         // M <= 8 the naive GEMV is weight-bandwidth-bound and the 64-row tile
         // is ~break-even (0.99-1.01x across N=1024..9728), while from M = 12
         // the tile reuse wins 1.2-2.0x and never regresses (narrow N=64 and
-        // batched attention shapes included). int8 stays out of it: the tile
-        // loaders stage B as half2 words copied straight from global, which a
-        // byte-packed weight has no equivalent for.
-        const bool tiled =
-            fused_fp16 && !weight_int8 && (k % 16 == 0) && (m >= 12);
+        // batched attention shapes included). Quantized weights stay out of it:
+        // the tile loaders stage B as half2 words copied straight from global,
+        // which a packed weight has no equivalent for.
+        const bool tiled = fused_fp16 && !weight_int8 && !weight_4bit &&
+                           (k % 16 == 0) && (m >= 12);
         if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
@@ -416,9 +496,10 @@ class MatMulBuffer : public BufferFactory {
             objs_.emplace_back(dummy_buffer_);
         }
 
-        // binding 4: the int8 weight's per-column dequant scale, or a dummy to
+        // binding 4: the quantized weight's dequant scale table (per column for
+        // int8, per [K group, column] for the 4-bit formats), or a dummy to
         // keep the descriptor set fully bound (same convention as Conv2d).
-        if (weight_int8) {
+        if (weight_int8 || weight_4bit) {
             dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 bind_ssbo<T>(inputs[scale_index], /*is_output=*/false);
@@ -437,6 +518,9 @@ class MatMulBuffer : public BufferFactory {
         para_.weight_int8 = weight_int8 ? 1 : 0;
         para_.w8_quad = (w8_quad && !ksplit) ? 1 : 0;
         para_.ksplit = ksplit ? 1 : 0;
+        para_.w4 = weight_4bit ? 1 : 0;
+        para_.nf4 = weight_nf4 ? 1 : 0;
+        para_.group = weight_4bit ? group_size : 0;
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the
@@ -453,8 +537,8 @@ class MatMulBuffer : public BufferFactory {
         }
         if (fused_fp16) {
             // Single pass: x covers output WORDS (column pairs), or DWORDs for
-            // the four-column int8 kernel.
-            submit(&para_, UP_DIV(n / (w8_quad ? 4 : 2), 16),
+            // the four-column quantized kernels.
+            submit(&para_, UP_DIV(n / ((w8_quad || w4_quad) ? 4 : 2), 16),
                    UP_DIV(batch * m, 16), 1);
             return;
         }
