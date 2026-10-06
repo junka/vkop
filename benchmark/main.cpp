@@ -190,10 +190,18 @@ int main(int argc, char *argv[]) {
         }
     };
 
-    if (precision == 1) {
+    // The graph output's own dtype picks the pipeline, not `precision`: the
+    // image backend runs the whole activation chain in fp16 even for an fp32
+    // model file, so the runtime hands back a half-typed output tensor here and
+    // casting it to Tensor<float> yields a null pointer.
+    const auto graph_out = rt->GetOutput();
+    if (graph_out->dtype() == typeid(uint16_t)) {
         register_pipeline(uint16_t{});
-    } else {
+    } else if (graph_out->dtype() == typeid(float)) {
         register_pipeline(float{});
+    } else {
+        std::cerr << "unsupported graph output dtype" << std::endl;
+        return 1;
     }
 #endif
 
@@ -239,12 +247,15 @@ int main(int argc, char *argv[]) {
     const auto &top_idx = topk_result.second;
 #else
     const auto &top_idx = *indexs;
-    auto &top_vals = *values_float;
-    if (precision == 1) {
-        auto top_vals_half = values_half;
-        for (int i = 0; i < top_vals_half->num_elements(); ++i) {
-            top_vals[i] = vkop::core::ITensor::fp16_to_fp32((*top_vals_half)[i]);
+    std::vector<float> top_vals;
+    if (values_half) {
+        const auto &half = values_half->data();
+        top_vals.reserve(half.size());
+        for (uint16_t h : half) {
+            top_vals.push_back(vkop::core::ITensor::fp16_to_fp32(h));
         }
+    } else {
+        top_vals = values_float->data();
     }
 #endif
     std::cout << "\nPredictions:\n";
@@ -268,7 +279,7 @@ int main(int argc, char *argv[]) {
     if (profile_mode && !cnn_profile.run_times_ms.empty()) {
         std::printf("\n[cnn profile] %s (%s, %d runs):\n",
                     binary_file_path.c_str(),
-                    precision == 1 ? "fp16" : "fp32",
+                    values_half ? "fp16" : "fp32",
                     static_cast<int>(cnn_profile.run_times_ms.size()));
         std::printf("  inference: avg=%.1fms  p50=%.1fms  p90=%.1fms  p99=%.1fms\n",
                     cnn_profile.avg_ms(),

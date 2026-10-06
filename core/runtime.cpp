@@ -960,11 +960,22 @@ void Runtime::ResizeInput(const std::string &name,
 }
 
 std::shared_ptr<ITensor> Runtime::GetOutput(const std::string &name) const {
-    if (name.empty() && inputs_.size() > 1) {
-        throw std::runtime_error(
-            "Output name is empty but there are multiple outputs");
-    }
-    if (name.empty() && outputs_.size() == 1) {
+    // An empty name means "the single graph output", so the ambiguity lives in
+    // outputs_ (the old guard read inputs_, which threw for multi-input models
+    // and returned a silent nullptr for a model with zero or several outputs).
+    // A named miss stays nullptr: callers probe for optional outputs with it
+    // (image_gen counts KV layers until a name stops resolving).
+    if (name.empty()) {
+        if (outputs_.size() != 1) {
+            std::string names;
+            for (const auto &entry : outputs_) {
+                names += (names.empty() ? "" : ", ") + entry.first;
+            }
+            throw std::runtime_error(
+                "vkop: asked for the unnamed output but the model has " +
+                std::to_string(outputs_.size()) + " outputs" +
+                (names.empty() ? "" : ": " + names));
+        }
         return outputs_.begin()->second;
     }
     auto it = outputs_.find(name);
@@ -2715,8 +2726,35 @@ void Runtime::RegisterPostProcess(
             }
         }
     }
+    // The op's fp16/fp32 shader build must follow the tensors it is handed,
+    // not precision_: the image backend executes the activation chain in fp16
+    // even for an fp32 model file, so a graph output can be half-typed while
+    // the model was loaded with precision 0 (an fp32 build writing into a
+    // 2-byte/elem buffer yields garbage, not an error).
+    auto float_family_precision =
+        [](const std::vector<std::shared_ptr<ITensor>> &ts) {
+            for (const auto &t : ts) {
+                if (!t) {
+                    continue;
+                }
+                if (t->dtype() == typeid(uint16_t)) {
+                    return 1;
+                }
+                if (t->dtype() == typeid(float)) {
+                    return 0;
+                }
+            }
+            return -1;
+        };
+    int pp_precision = float_family_precision(inputs);
+    if (pp_precision < 0) {
+        pp_precision = float_family_precision(outputs);
+    }
+    if (pp_precision < 0) {
+        pp_precision = precision_;
+    }
     auto op = ops::create_from_type(
-        ops, precision_, dev->is_support_nv_tensor_core(), use_buffer);
+        ops, pp_precision, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
     op->set_runtime_device(dev, m_cmdpool_);
     op->setAttribute(attributes);
