@@ -276,6 +276,10 @@ TEST(MatMulTest, MatMulInt8WeightOnlyBuffer) {
         {1, 8, 20, 7, false, false},   // odd N: fp32 direct store, fp16
                                         // reduce->pack
         {1, 1, 64, 12, true, false},   // transB=1 GEMV over [N, K]
+        {1, 2, 22, 12, true, false},   // even N, K % 4 != 0: the word-aligned
+                                        // 4-taps-per-load nest does not apply
+        {1, 5, 10, 14, false, false},  // even N, transB=0: a column's bytes are
+                                       // N apart, so one tap per extract
         {2, 3, 24, 9, false, true},    // broadcast weight materialized, odd N
         {2, 4, 16, 6, true, true},     // transB=1 with a batched weight
     };

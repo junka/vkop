@@ -47,6 +47,11 @@ struct alignas(16) GpuMatMulParam {
     // but never read it). Defaulted because MatMulImage never assigns it and an
     // indeterminate byte in the push range is a wrong answer waiting to happen.
     int weight_int8 = 0;
+    // 1 = the int8 kernel owns four output columns per thread (N % 4 == 0 and B
+    // is [batch, K, N], where that quad is exactly one 32-bit weight word). The
+    // grid x extent counts column quads instead of column pairs, so the host
+    // and the shader must agree on it; defaulting keeps MatMulImage out of it.
+    int w8_quad = 0;
 };
 
 } // namespace matmul
@@ -347,17 +352,31 @@ class MatMulBuffer : public BufferFactory {
 
         // fp16 needs a scratch fp32 buffer (binding 3) only for the odd-N
         // reduce->pack fallback; even N packs in the reduce shader itself.
-        // int8 weights always take the reduce->pack route: the byte-packed B
-        // breaks the half2 word alignment the fused and tiled paths assume.
-        const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0) && !weight_int8;
+        // int8 weights use that same even-N single pass: the fused path's word
+        // alignment comes from the OUTPUT (N even), while byte packing only
+        // changes how B is loaded. Sending int8 through reduce->pack anyway
+        // cost a second dispatch per GEMM (~170 per decode token) and an fp32
+        // scratch round trip for no benefit.
+        const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        // With B as [batch, K, N] (transB == 0, what an ONNX MatMul weight is)
+        // the four columns of one K row are four adjacent weight BYTES, so one
+        // 32-bit load feeds four output columns. That needs N % 4 == 0 to keep
+        // every row start word-aligned, and it changes how many columns a
+        // thread owns, so the grid x extent below has to count quads instead of
+        // pairs.
+        const bool w8_quad =
+            fused_fp16 && weight_int8 && !transB_ && (n % 4 == 0);
         // Shared-memory tiling pays only in the compute-bound regime, and only
         // where its indexing assumptions hold: k % 16 keeps every tile word
         // aligned on both B layouts. m >= 12 is measured, not guessed: at
         // M <= 8 the naive GEMV is weight-bandwidth-bound and the 64-row tile
         // is ~break-even (0.99-1.01x across N=1024..9728), while from M = 12
         // the tile reuse wins 1.2-2.0x and never regresses (narrow N=64 and
-        // batched attention shapes included).
-        const bool tiled = fused_fp16 && (k % 16 == 0) && (m >= 12);
+        // batched attention shapes included). int8 stays out of it: the tile
+        // loaders stage B as half2 words copied straight from global, which a
+        // byte-packed weight has no equivalent for.
+        const bool tiled =
+            fused_fp16 && !weight_int8 && (k % 16 == 0) && (m >= 12);
         if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
@@ -400,6 +419,7 @@ class MatMulBuffer : public BufferFactory {
         para_.transB = transB_ ? 1 : 0;
         para_.tile = tiled ? 1 : 0;
         para_.weight_int8 = weight_int8 ? 1 : 0;
+        para_.w8_quad = w8_quad ? 1 : 0;
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the
@@ -408,8 +428,10 @@ class MatMulBuffer : public BufferFactory {
             return;
         }
         if (fused_fp16) {
-            // Single pass: x covers output WORDS (column pairs).
-            submit(&para_, UP_DIV(n / 2, 16), UP_DIV(batch * m, 16), 1);
+            // Single pass: x covers output WORDS (column pairs), or DWORDs for
+            // the four-column int8 kernel.
+            submit(&para_, UP_DIV(n / (w8_quad ? 4 : 2), 16),
+                   UP_DIV(batch * m, 16), 1);
             return;
         }
         // Reduce pass: one thread per output element. Uses the main pipeline.

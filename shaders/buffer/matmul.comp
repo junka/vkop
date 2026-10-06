@@ -13,9 +13,11 @@
 //     SEPARATE pack dispatch (buffer/matmul_pack.comp, kept for that case; the
 //     separate pipeline also avoids Intel ANV push-constant interference
 //     between dispatches of the same pipeline).
-// int8 weight-only B (uPC.weight_int8) is a fourth mode, ahead of all three:
-// one thread per output element in either build, and in the fp16 build it
-// always takes the reduce->pack route.
+// int8 weight-only B (uPC.weight_int8) is a fourth mode: with even N it keeps a
+// single pass that writes the packed half2 output directly (one thread per two
+// columns, or per four columns when uPC.w8_quad, see below), and only odd N
+// falls back to one thread per output element in reduce->pack form. Byte
+// packing changes how a weight is LOADED, not who owns an output word.
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -53,6 +55,8 @@ layout(push_constant) uniform PC {
     int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
     int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch)
     int weight_int8; // 1 = B is packed int8 bytes, dequant via uScale[j]
+    int w8_quad;     // 1 = int8 B, N % 4 == 0 and B is [batch, K, N]: one thread
+                     // owns four columns (the host sizes the grid to match)
 } uPC;
 
 #ifdef FP16
@@ -62,11 +66,135 @@ float load_a(int idx) {
 float load_b(int idx) {
     return unpackHalf2x16(uInputB.data[idx >> 1])[idx & 1];
 }
-// int8 weights land in the fp32 scratch and matmul_pack.comp halves them: the
-// byte-packed B breaks the word-alignment the fused even-N and tiled paths
-// assume, so this build routes through the same reduce->pass the odd-N case
-// already uses.
+#endif
+
+// One int8 weight byte as a float. The sign bit is XOR-ed out of the word
+// first so every lane is a plain unsigned byte-to-float convert plus a constant
+// subtract: a uint-to-int conversion of a value above INT_MAX is
+// implementation-defined, and an arithmetic right shift of a signed int is not
+// something to bet a kernel on across drivers either.
+float load_w8(int idx) {
+    uint word = uInputB.data[idx >> 2] ^ 0x80808080u;
+    return float((word >> ((idx & 3) * 8)) & 0xFFu) - 128.0;
+}
+
+// The four int8 weights of one word, low byte first.
+vec4 unpack_w8(uint word) {
+    word ^= 0x80808080u;
+    return vec4(float(word & 0xFFu), float((word >> 8) & 0xFFu),
+                float((word >> 16) & 0xFFu), float(word >> 24)) -
+           128.0;
+}
+
+#ifdef FP16
+// Odd-N int8 lands in the fp32 scratch and matmul_pack.comp halves it; the
+// fused even-N path below writes the output word itself.
 #define W8_STORE(idx, val) uScratch.data[idx] = floatBitsToUint(val)
+
+// int8 weight-only, N % 4 == 0 and B is [batch, K, N] (transB == 0): one thread
+// per output DWORD, i.e. four adjacent columns of one row. For this layout the
+// four columns of a given K are the four bytes of one word, so a single 32-bit
+// weight load feeds four FMAs and successive threads read successive words of
+// the same row (coalesced) while the A element broadcasts. That is the LLM
+// decode shape: A is one row, the weight stream is the whole cost, and the
+// byte-by-byte walk it replaces was one load plus one unpack per tap, which
+// made int8 read half the bytes yet run slower than fp16.
+void matmul16_w8_quad() {
+    int p = int(gl_GlobalInvocationID.x);
+    int yi = int(gl_GlobalInvocationID.y);
+    int ja = p * 4;
+    if (ja >= uPC.N) return;
+
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    int a_off = (n * uPC.M + i) * uPC.K;
+    // N % 4 == 0 makes every row start 4-aligned, so (k*N + ja) is 4-aligned for
+    // every k: the quad needs no per-tap alignment test.
+    int b_row = n * uPC.K * uPC.N + ja;
+
+    vec4 wsc = vec4(uintBitsToFloat(uScale.data[ja]),
+                    uintBitsToFloat(uScale.data[ja + 1]),
+                    uintBitsToFloat(uScale.data[ja + 2]),
+                    uintBitsToFloat(uScale.data[ja + 3]));
+
+    vec4 s = vec4(0.0);
+    // K even => a_off is even, so two consecutive A elements are one word.
+    if ((uPC.K & 1) == 0) {
+        for (int k = 0; k < uPC.K; k += 2) {
+            vec4 w0 = unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
+            vec4 w1 =
+                unpack_w8(uInputB.data[(b_row + (k + 1) * uPC.N) >> 2]);
+            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            s += a.x * w0 + a.y * w1;
+        }
+    } else {
+        for (int k = 0; k < uPC.K; ++k) {
+            s += load_a(a_off + k) *
+                 unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
+        }
+    }
+
+    vec4 v = s * wsc;
+    int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
+    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+}
+
+// int8 weight-only, even N, two columns per thread: single pass straight into
+// the output half2 word, same ownership as the fp16 even-N kernel. Nothing
+// about a byte-packed weight touches the OUTPUT alignment (the column pair
+// ja, ja+1 is word-aligned because N is even), only how B gets read, so int8
+// keeps the fused store instead of paying a second dispatch per GEMM.
+// Under transB a weight column is contiguous, so with K % 4 == 0 four taps of a
+// column come out of one 32-bit word: one B load per four FMAs.
+void matmul16_w8_even_n() {
+    int p = int(gl_GlobalInvocationID.x);
+    int yi = int(gl_GlobalInvocationID.y);
+    int ja = p * 2;
+    if (ja >= uPC.N) return;
+
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    int a_off = (n * uPC.M + i) * uPC.K;
+    int jb = ja + 1;
+    int b_base = n * uPC.K * uPC.N;
+    int b_step = (uPC.transB != 0) ? 1 : uPC.N;
+    int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
+    int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
+
+    // Constant along K, so both column scales leave the loop.
+    float wsc0 = uintBitsToFloat(uScale.data[ja]);
+    float wsc1 = uintBitsToFloat(uScale.data[jb]);
+
+    float s0 = 0.0, s1 = 0.0;
+    // b0 (and therefore every b0 + k) is 4-aligned when K % 4 == 0, because
+    // b_base = n*K*N and ja*K are multiples of K then.
+    if (uPC.transB != 0 && (uPC.K & 3) == 0) {
+        for (int k = 0; k < uPC.K; k += 4) {
+            vec4 w0 = unpack_w8(uInputB.data[(b0 + k) >> 2]);
+            vec4 w1 = unpack_w8(uInputB.data[(b1 + k) >> 2]);
+            vec2 a01 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a23 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+            s0 += a01.x * w0.x + a01.y * w0.y + a23.x * w0.z + a23.y * w0.w;
+            s1 += a01.x * w1.x + a01.y * w1.y + a23.x * w1.z + a23.y * w1.w;
+        }
+    } else {
+        for (int k = 0; k < uPC.K; ++k) {
+            float a = load_a(a_off + k);
+            s0 += a * load_w8(b0);
+            s1 += a * load_w8(b1);
+            b0 += b_step;
+            b1 += b_step;
+        }
+    }
+
+    int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
+    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(s0 * wsc0, s1 * wsc1));
+}
 
 // One thread owns output word (n, i, {ja, ja+1}) of an even-N C. ja is even
 // and n*M*N + i*N is even when N is even, so the pair is word-aligned.
@@ -349,12 +477,14 @@ float load_a(int idx) {
 #define W8_STORE(idx, val) uOutput.data[idx] = floatBitsToUint(val)
 #endif
 
-// int8 weight-only B. One thread per output element, fp32 accumulate over the
-// raw weight bytes, then one multiply by this column's dequant scale (the scale
-// is constant along K, so folding it out of the loop is both cheaper and
-// rounding-wise no worse than a per-tap dequant). Deliberately naive: the win
-// here is the halved weight bandwidth, and the fp16 tiled/even-N nests carry
-// half2 word-alignment assumptions a byte-packed B does not satisfy.
+// int8 weight-only B, odd N (and every fp32-build call). One thread per output
+// element, fp32 accumulate over the raw weight bytes, then one multiply by this
+// column's dequant scale (the scale is constant along K, so folding it out of
+// the loop is both cheaper and rounding-wise no worse than a per-tap dequant).
+// The shared-memory tiled nest is the remaining mode int8 does not use: its B
+// loaders stage half2 words straight from global, which a byte-packed weight
+// has no equivalent for — and tiling only pays at m >= 12, far from the
+// weight-bandwidth-bound regime this kernel exists for.
 void matmul_w8() {
     int j = int(gl_GlobalInvocationID.x);
     int yi = int(gl_GlobalInvocationID.y);
@@ -372,11 +502,7 @@ void matmul_w8() {
     for (int k = 0; k < uPC.K; ++k) {
         int b_idx = (uPC.transB != 0) ? (b_base + j * uPC.K + k)
                                       : (b_base + k * uPC.N + j);
-        uint word = uInputB.data[b_idx >> 2];
-        int b = int(word >> ((b_idx & 3) * 8)) & 0xFF;
-        // Sign-fold by hand: an arithmetic right shift of a signed int is not
-        // something to bet a kernel on across drivers.
-        sum += load_a(a_base + i * uPC.K + k) * float(b >= 128 ? b - 256 : b);
+        sum += load_a(a_base + i * uPC.K + k) * load_w8(b_idx);
     }
 
     W8_STORE(n * uPC.M * uPC.N + i * uPC.N + j, sum * wsc);
@@ -410,9 +536,22 @@ void matmul32() {
 }
 
 void main() {
-    // int8 weight-only owns its own kernel in both builds; the host never sets
-    // tile for it, so this test comes before the fp16 mode selection.
+    // int8 weight-only owns its own kernels: with even N in the fp16 build it
+    // keeps the fused single-pass half2 store, otherwise it reduces elementwise
+    // (fp32 build: straight to output; fp16 odd N: to scratch, then pack).
+    // The host never sets tile for it, so these tests come before the fp16 mode
+    // selection.
     if (uPC.weight_int8 != 0) {
+#ifdef FP16
+        if (uPC.w8_quad != 0) {
+            matmul16_w8_quad();
+            return;
+        }
+        if ((uPC.N & 1) == 0) {
+            matmul16_w8_even_n();
+            return;
+        }
+#endif
         matmul_w8();
         return;
     }
