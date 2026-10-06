@@ -57,6 +57,9 @@ layout(push_constant) uniform PC {
     int weight_int8; // 1 = B is packed int8 bytes, dequant via uScale[j]
     int w8_quad;     // 1 = int8 B, N % 4 == 0 and B is [batch, K, N]: one thread
                      // owns four columns (the host sizes the grid to match)
+    int ksplit; // 1 = split-K GEMV: a block covers 16 column quads and splits K
+                // 16 ways over the lanes the single A row leaves idle (grid is
+                // x = N/4/16, y = batch*M). Host picks it, see MatMulBuffer.
 } uPC;
 
 #ifdef FP16
@@ -140,6 +143,101 @@ void matmul16_w8_quad() {
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
     uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
     uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+}
+
+// ---- split-K GEMV -------------------------------------------------------
+// At decode time A has a single row, so the column-parallel kernels launch a
+// 16x16 workgroup in which only the yi == 0 lane survives: 15/16 of every
+// workgroup idles, and the surviving threads each walk the whole K serially.
+// That is why neither precision gets near the machine's bandwidth (measured on
+// GLM-Edge: int8 13.9 GB/s, fp16 26.8 GB/s) -- it is latency-bound, not
+// bandwidth-bound. Here the idle lanes take slices of K instead: a workgroup
+// covers 16 column quads x 16 K slices, each lane accumulating one vec4 over
+// its slice, and the partials fold through shared memory. Total weight bytes
+// read are unchanged; what changes is that 16x more lanes are in flight per
+// column at any instant, which is what the load has to have to stream.
+#define KS 16
+// One vec4 per (K slice, column quad) = 4 KB of shared, next to the tiled
+// path's staging arrays.
+shared vec4 ks_part[KS][16];
+
+// Both variants need K even: it makes a_off = row*K even (so two consecutive A
+// elements are one word) and, with the slice length rounded up to an even
+// chunk, k0 even as well. The host only selects this path under that condition.
+int ks_chunk() { return ((uPC.K + KS - 1) / KS + 1) & ~1; }
+
+void ks_store(vec4 s, int row, int ja) {
+    int lx = int(gl_LocalInvocationID.x);
+    int ly = int(gl_LocalInvocationID.y);
+    ks_part[ly][lx] = s;
+    barrier();
+    if (ly != 0) return;
+    vec4 v = ks_part[0][lx];
+    for (int t = 1; t < KS; ++t) v += ks_part[t][lx];
+    if (ja >= uPC.N) return;
+    int out_idx = row * uPC.N + ja;
+    if (uPC.weight_int8 != 0) {
+        v *= vec4(uintBitsToFloat(uScale.data[ja]),
+                  uintBitsToFloat(uScale.data[ja + 1]),
+                  uintBitsToFloat(uScale.data[ja + 2]),
+                  uintBitsToFloat(uScale.data[ja + 3]));
+    }
+    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+}
+
+// int8 weight-only, B is [batch, K, N], N % 4 == 0.
+void matmul16_w8_ksplit() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int ja = (int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x)) * 4;
+    int n = row / uPC.M;
+    int a_off = row * uPC.K;
+    int b_row = n * uPC.K * uPC.N + ja;
+
+    int chunk = ks_chunk();
+    int k0 = int(gl_LocalInvocationID.y) * chunk;
+    int kend = min(k0 + chunk, uPC.K);
+    vec4 s = vec4(0.0);
+    // A quad past the last column reads nothing; ks_store still publishes its
+    // zero so the reduction never sees an uninitialized slot.
+    if (ja < uPC.N) {
+        for (int k = k0; k + 1 < kend; k += 2) {
+            vec4 w0 = unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
+            vec4 w1 = unpack_w8(uInputB.data[(b_row + (k + 1) * uPC.N) >> 2]);
+            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            s += a.x * w0 + a.y * w1;
+        }
+    }
+    ks_store(s, row, ja);
+}
+
+// fp16 weight, B is [batch, K, N], N % 4 == 0: the same slicing, and a quad is
+// two half2 words per K row instead of one int8 word.
+void matmul16_ksplit() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int ja = (int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x)) * 4;
+    int n = row / uPC.M;
+    int a_off = row * uPC.K;
+    int b_row = n * uPC.K * uPC.N + ja;
+
+    int chunk = ks_chunk();
+    int k0 = int(gl_LocalInvocationID.y) * chunk;
+    int kend = min(k0 + chunk, uPC.K);
+    vec4 s = vec4(0.0);
+    if (ja < uPC.N) {
+        for (int k = k0; k + 1 < kend; k += 2) {
+            int bw = (b_row + k * uPC.N) >> 1;
+            vec4 w0 = vec4(unpackHalf2x16(uInputB.data[bw]),
+                           unpackHalf2x16(uInputB.data[bw + 1]));
+            vec4 w1 = vec4(unpackHalf2x16(uInputB.data[bw + uPC.N / 2]),
+                           unpackHalf2x16(uInputB.data[bw + uPC.N / 2 + 1]));
+            vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            s += a.x * w0 + a.y * w1;
+        }
+    }
+    ks_store(s, row, ja);
 }
 
 // int8 weight-only, even N, two columns per thread: single pass straight into
@@ -536,6 +634,18 @@ void matmul32() {
 }
 
 void main() {
+#ifdef FP16
+    // Split-K GEMV owns its own selection: the workgroup is laid out over K
+    // slices, which none of the column-only kernels below do.
+    if (uPC.ksplit != 0) {
+        if (uPC.weight_int8 != 0) {
+            matmul16_w8_ksplit();
+        } else {
+            matmul16_ksplit();
+        }
+        return;
+    }
+#endif
     // int8 weight-only owns its own kernels: with even N in the fp16 build it
     // keeps the fused single-pass half2 store, otherwise it reduces elementwise
     // (fp32 build: straight to output; fp16 odd N: to scratch, then pack).

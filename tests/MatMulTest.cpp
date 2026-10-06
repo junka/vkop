@@ -269,6 +269,27 @@ void run_matmul_int8(
 }
 } // namespace
 
+TEST(MatMulTest, MatMulSplitKGemvBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    // Decode-shaped calls (one A row, long K), where the kernel splits K across
+    // the workgroup lanes the single row leaves idle. The cases are chosen to
+    // cover the slicing edges rather than more sizes: K a multiple of 16 slices,
+    // K that is not (the tail slices go empty), an N whose last 16-quad block is
+    // partial, more than one output row, and a broadcast batch.
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{1, 1, 512}, {1, 512, 256}},
+        {{1, 1, 258}, {1, 258, 260}},
+        {{1, 8, 260}, {1, 260, 64}},
+        {{2, 1, 300}, {2, 300, 128}},
+    };
+    for (const auto &test_case : cases) {
+        auto [t1, t2] = test_case;
+        MatMulTest<uint16_t> mmtest(t1, t2);
+        EXPECT_TRUE(mmtest.run_test({mmtest.inputa, mmtest.inputb},
+                                    {mmtest.output}));
+    }
+}
+
 TEST(MatMulTest, MatMulInt8WeightOnlyBuffer) {
     vkop::tests::ScopedBufferBackend buffer;
     const std::vector<std::tuple<int, int, int, int, bool, bool>> cases = {
@@ -282,6 +303,14 @@ TEST(MatMulTest, MatMulInt8WeightOnlyBuffer) {
                                        // N apart, so one tap per extract
         {2, 3, 24, 9, false, true},    // broadcast weight materialized, odd N
         {2, 4, 16, 6, true, true},     // transB=1 with a batched weight
+        // Decode shapes: one A row over a long K, which the host routes to the
+        // split-K GEMV (K sliced across the workgroup's idle lanes). K divisible
+        // and not divisible by the slice length, a partial last 16-quad block,
+        // and more than one row all have to stay exact.
+        {1, 1, 512, 256, false, false},
+        {1, 1, 258, 260, false, false},
+        {1, 3, 258, 32, false, false},
+        {2, 1, 300, 128, false, true},
     };
     LOG_INFO("int8 MatMul, FP32");
     run_matmul_int8<float>(cases);

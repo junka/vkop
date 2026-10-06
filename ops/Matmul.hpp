@@ -52,6 +52,11 @@ struct alignas(16) GpuMatMulParam {
     // grid x extent counts column quads instead of column pairs, so the host
     // and the shader must agree on it; defaulting keeps MatMulImage out of it.
     int w8_quad = 0;
+    // 1 = the buffer kernel splits K across the workgroup's lanes instead of
+    // across output rows, because at decode time there is only one A row and
+    // the column-parallel kernels then leave 15 of every 16 lanes idle. Buffer
+    // path, fp16 build only; the image shaders never see it set.
+    int ksplit = 0;
 };
 
 } // namespace matmul
@@ -358,6 +363,17 @@ class MatMulBuffer : public BufferFactory {
         // cost a second dispatch per GEMM (~170 per decode token) and an fp32
         // scratch round trip for no benefit.
         const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        // Split-K GEMV: the column-parallel kernels above put output rows on
+        // grid.y and use 16 of their workgroup's 256 lanes per row, so at
+        // decode time (one A row) 15/16 of every workgroup idles and the
+        // surviving threads walk K serially. Measured on GLM-Edge that caps
+        // int8 at 13.9 GB/s and fp16 at 26.8 GB/s, far under the machine -- the
+        // fix is to spend those idle lanes on K, not on more bytes. Needs the
+        // quad ownership (N % 4 == 0, B as [batch, K, N], K even so A's k-pairs
+        // stay word-aligned) and only pays where columns alone are too few: the
+        // small batch*m, long-K regime.
+        const bool ksplit = fused_fp16 && !transB_ && (n % 4 == 0) &&
+                            (k % 2 == 0) && (batch * m <= 8) && (k >= 256);
         // With B as [batch, K, N] (transB == 0, what an ONNX MatMul weight is)
         // the four columns of one K row are four adjacent weight BYTES, so one
         // 32-bit load feeds four output columns. That needs N % 4 == 0 to keep
@@ -419,12 +435,20 @@ class MatMulBuffer : public BufferFactory {
         para_.transB = transB_ ? 1 : 0;
         para_.tile = tiled ? 1 : 0;
         para_.weight_int8 = weight_int8 ? 1 : 0;
-        para_.w8_quad = w8_quad ? 1 : 0;
+        para_.w8_quad = (w8_quad && !ksplit) ? 1 : 0;
+        para_.ksplit = ksplit ? 1 : 0;
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the
             // shader.
             submit(&para_, UP_DIV(n, 64), UP_DIV(m, 64), batch);
+            return;
+        }
+        if (ksplit) {
+            // x = column quads (16 per block), y = one output row per block:
+            // the block's own 16 lanes are the K slices, so y carries the row
+            // index the shader reads as gl_WorkGroupID.y.
+            submit(&para_, UP_DIV(n / 4, 16), batch * m, 1);
             return;
         }
         if (fused_fp16) {
