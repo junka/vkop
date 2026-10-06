@@ -25,6 +25,28 @@ namespace tests {
 
 using vkop::core::Tensor;
 
+// int8 weight-only lives only in the buffer (SSBO) shaders, so those cases have
+// to force the backend instead of hoping ctest was invoked with it. Scoped:
+// run_test re-reads VKOP_BUFFER_BACKEND on every call, and the env is restored
+// on destruction so later tests in the same binary are unaffected.
+class ScopedBufferBackend {
+public:
+    ScopedBufferBackend() {
+        const char *prev = std::getenv("VKOP_BUFFER_BACKEND");
+        had_ = prev != nullptr;
+        if (had_) prev_ = prev;
+        setenv("VKOP_BUFFER_BACKEND", "1", 1);
+    }
+    ~ScopedBufferBackend() {
+        if (had_) setenv("VKOP_BUFFER_BACKEND", prev_.c_str(), 1);
+        else unsetenv("VKOP_BUFFER_BACKEND");
+    }
+
+private:
+    bool had_;
+    std::string prev_;
+};
+
 class TestEnv : public testing::Environment {
 private:
     static std::shared_ptr<VulkanDevice> dev_;
@@ -129,6 +151,36 @@ public:
         }
         tensor->fillToCPU(data_vector);
     }
+    // Bind one input in the storage form this op/backend needs and upload it.
+    // SSBOs carry any rank; the image path can only represent 3-D/4-D data, and
+    // Conv2d/BatchNorm weights ride a uniform view instead.
+    template <typename TT>
+    bool upload_input(const std::shared_ptr<core::ITensor> &input,
+                      bool use_buffer, ops::OpType type) {
+        auto t = core::as_tensor<TT>(input);
+        if (!t) {
+            LOG_ERROR("Test input declared dtype %s, but the tensor is not that",
+                      typeid(TT).name());
+            return false;
+        }
+        if (use_buffer || type == vkop::ops::OpType::GATHER ||
+            type == vkop::ops::OpType::EXPAND) {
+            // Buffer backend: SSBOs support any rank, no RGBA conversion.
+            t->as_storage_buffer(dev_);
+        } else if (input->num_dims() <= 2) {
+            if (type == vkop::ops::OpType::CONV2D ||
+                type == vkop::ops::OpType::BATCHNORM) {
+                t->as_uniform_bufferview(dev_);
+            } else {
+                t->as_storage_buffer(dev_);
+            }
+        } else {
+            t->as_input_image(dev_, nullptr);
+        }
+        t->copyToGPU(cmdpool_);
+        return true;
+    }
+
     virtual bool verify_output(const std::unique_ptr<ops::Operator> &op,
                                int idx,
                                const std::shared_ptr<core::ITensor> &output,
@@ -293,25 +345,21 @@ public:
                 t->copyToGPU(cmdpool_);
                 continue;
             }
-            if (use_buffer || op->get_type() == vkop::ops::OpType::GATHER || op->get_type() == vkop::ops::OpType::EXPAND) {
-                // Buffer backend: SSBOs support any rank, no RGBA conversion.
-                auto t = core::as_tensor<T>(input);
-                t->as_storage_buffer(dev_);
-                t->copyToGPU(cmdpool_);
-                continue;
+            // Float-family inputs bind by their OWN element type, not by the
+            // test's T: an fp32 int8-dequant scale sitting next to an fp16
+            // activation is a Tensor<float>, and casting it through
+            // as_tensor<T> yields a null pointer.
+            const auto op_type = op->get_type();
+            const bool uploaded =
+                input->dtype() == typeid(float)
+                    ? upload_input<float>(input, use_buffer, op_type)
+                    : input->dtype() == typeid(uint16_t)
+                          ? upload_input<uint16_t>(input, use_buffer, op_type)
+                          : false;
+            if (!uploaded) {
+                LOG_ERROR("Unsupported test input dtype");
+                return false;
             }
-            auto t = core::as_tensor<T>(input);
-            assert(t);
-            if (input->num_dims() <= 2) {
-                if (vkop::ops::OpType::CONV2D == op->get_type() || vkop::ops::OpType::BATCHNORM == op->get_type()) {
-                    t->as_uniform_bufferview(dev_);
-                } else {
-                    t->as_storage_buffer(dev_);
-                }
-            } else {
-                t->as_input_image(dev_, nullptr);
-            }
-            t->copyToGPU(cmdpool_);
         }
         op->onExecute(inputs, outputs, 0);
         auto cmd = op->get_record();

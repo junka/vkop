@@ -1,3 +1,8 @@
+#include <cmath>
+#include <cstdint>
+#include <stdexcept>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "setup.hpp"
@@ -190,4 +195,199 @@ TEST(GemmTest, GemmComprehensiveTest) {
                 gemm_op->setAttribute(gmtest.attr);
             }));
     }
+}
+
+namespace {
+// int8 weight-only Gemm (buffer backend, where the int8 kernel lives). B is the
+// quantized weight and its per-output-column fp32 scale (amax/127 reduced over
+// K) is the LAST input, the same convention the optimizer appends and Conv2d
+// uses:
+//   [A, B_int8, scale]        no bias
+//   [A, B_int8, C, scale]     with bias
+// transB picks the physical layout ([K, N] when 0, [N, K] when 1) while the
+// scale always holds N entries. The reference is computed from the DEQUANTIZED
+// weight, so this pins the kernel's byte unpack and its fold-the-scale-out-of-
+// the-K-loop accumulate rather than re-measuring quantization noise.
+template <typename T>
+class GemmInt8Test : public TestCase<T> {
+public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<int8_t>> weight;
+    std::shared_ptr<Tensor<float>> scale_data;
+    std::shared_ptr<Tensor<T>> inputc;
+    std::shared_ptr<Tensor<T>> output;
+
+    GemmInt8Test(int m, int k, int n, bool transB, bool has_bias)
+        : TestCase<T>("Gemm"), m_(m), k_(k), n_(n), transB_(transB),
+          has_bias_(has_bias) {
+        attr = {{"alpha", "1"},
+                {"beta", "1"},
+                {"transA", "0"},
+                {"transB", transB_ ? "1" : "0"}};
+        initTestData();
+    }
+
+    // The quantization noise itself is out of scope here (the reference uses
+    // the dequantized weight), but the folded scale turns the accumulate into a
+    // different summation order, and the fp16 output rounds twice: keep the
+    // loose bound int8 Conv2d uses.
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &output,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<T>(output);
+        auto exp = vkop::core::as_tensor<T>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = to_float((*out)[i]);
+            float ev = to_float((*exp)[i]);
+            if (std::isnan(ov)) {
+                LOG_ERROR("int8 Gemm NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("int8 Gemm Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+private:
+    int m_, k_, n_;
+    bool transB_, has_bias_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    // Everything is generated in fp32 and only the tensors this build stores
+    // are cast; the reference then reads back exactly the stored values, so the
+    // comparison is against what the kernel actually sees.
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    static torch::Tensor as_ref(const torch::Tensor &t) {
+        return t.to(torch::kFloat32);
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(42);
+
+        auto a = store(torch::randn({m_, k_}, f32));
+        // transB=1 stores the weight as [N, K], so the axis that is NOT N is
+        // the one reduced for the per-column amax.
+        auto w_src =
+            torch::randn(transB_ ? std::vector<int64_t>{n_, k_}
+                                 : std::vector<int64_t>{k_, n_}, f32);
+        const int reduce_axis = transB_ ? 1 : 0;
+        auto amax = std::get<0>(w_src.abs().max(reduce_axis, true));
+        auto scale = amax / 127.0;
+        scale = torch::where(scale == 0, torch::ones_like(scale), scale);
+        auto q = torch::round(w_src / scale).to(torch::kInt8);
+        auto deq = q.to(torch::kFloat32) * scale.to(torch::kFloat32);
+        auto b = transB_ ? deq.t() : deq; // [K, N]
+
+        auto y = torch::matmul(as_ref(a), b);
+        auto bias = store(torch::randn({n_}, f32));
+        if (has_bias_) {
+            y = y + as_ref(bias);
+        }
+
+        inputa = std::make_shared<Tensor<T>>(std::vector<int>{m_, k_});
+        this->fillTensorFromTorch(inputa, a);
+        weight = std::make_shared<Tensor<int8_t>>(
+            std::vector<int>{transB_ ? n_ : k_, transB_ ? k_ : n_});
+        auto cpu_q = q.cpu().contiguous().flatten();
+        auto *qptr = cpu_q.data_ptr<int8_t>();
+        weight->fillToCPU(std::vector<int8_t>(qptr, qptr + cpu_q.numel()));
+        scale_data = std::make_shared<Tensor<float>>(std::vector<int>{n_});
+        scale_data->fillToCPU(to_std_vector(scale.cpu().contiguous().flatten()));
+        if (has_bias_) {
+            inputc = std::make_shared<Tensor<T>>(std::vector<int>{n_});
+            this->fillTensorFromTorch(inputc, bias);
+        }
+        output = std::make_shared<Tensor<T>>(std::vector<int>{m_, n_});
+        this->fillTensorFromTorch(output, store(y));
+
+        LOG_INFO("int8 Gemm M %d, N %d, K %d, transB %d, bias %d, fp16 %d", m_,
+                 n_, k_, transB_ ? 1 : 0, has_bias_ ? 1 : 0,
+                 std::is_same_v<T, uint16_t> ? 1 : 0);
+    }
+
+    static std::vector<float> to_std_vector(const torch::Tensor &t) {
+        auto acc = t.accessor<float, 1>();
+        std::vector<float> v;
+        v.reserve(t.numel());
+        for (int64_t i = 0; i < t.numel(); i++) v.push_back(acc[i]);
+        return v;
+    }
+};
+
+template <typename T>
+void run_gemm_int8(const std::vector<std::tuple<int, int, int, bool, bool>> &cases) {
+    // fp16 output packs two columns per word, so every N here is even (the
+    // odd-N tail is a known pre-existing limitation of gemm16, not something
+    // the int8 path introduces).
+    for (const auto &tc : cases) {
+        auto [m, k, n, transB, has_bias] = tc;
+        GemmInt8Test<T> t(m, k, n, transB, has_bias);
+        std::vector<std::shared_ptr<vkop::core::ITensor>> inputs =
+            has_bias ? std::vector<std::shared_ptr<vkop::core::ITensor>>{
+                           t.inputa, t.weight, t.inputc, t.scale_data}
+                     : std::vector<std::shared_ptr<vkop::core::ITensor>>{
+                           t.inputa, t.weight, t.scale_data};
+        EXPECT_TRUE(t.run_test(inputs, {t.output},
+            [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *gemm_op = dynamic_cast<Gemm *>(op.get());
+                if (!gemm_op) {
+                    LOG_ERROR("Failed to cast operator to Gemm");
+                    return;
+                }
+                gemm_op->setAttribute(t.attr);
+            }));
+    }
+}
+} // namespace
+
+TEST(GemmTest, GemmInt8WeightOnlyBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<int, int, int, bool, bool>> cases = {
+        {1, 2048, 1000, true, false}, // M=1 GEMV, transB=1, no bias
+        {8, 64, 128, true, true},     // transB=1 with bias
+        {4, 32, 16, false, false},    // [K, N] layout, no bias
+        {5, 20, 18, false, true},     // [K, N] layout with bias, odd M
+    };
+    LOG_INFO("int8 Gemm, FP32");
+    run_gemm_int8<float>(cases);
+    LOG_INFO("int8 Gemm, FP16");
+    run_gemm_int8<uint16_t>(cases);
+}
+
+// Same contract on the Gemm side: the scale indexes Y's columns, so a K-long
+// scale (quantized along the wrong axis) must be refused rather than folded
+// into the accumulate.
+TEST(GemmTest, GemmInt8WrongAxisScaleThrows) {
+    vkop::tests::ScopedBufferBackend buffer;
+    GemmInt8Test<float> t(/*m=*/4, /*k=*/32, /*n=*/16, /*transB=*/false,
+                          /*has_bias=*/false);
+    auto wrong = std::make_shared<Tensor<float>>(std::vector<int>{32});
+    wrong->fillToCPU(std::vector<float>(32, 1.0F));
+    EXPECT_THROW(t.run_test({t.inputa, t.weight, wrong}, {t.output},
+                            [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                op->setAttribute(t.attr);
+                            }),
+                 std::runtime_error);
 }

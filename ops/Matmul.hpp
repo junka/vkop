@@ -37,10 +37,16 @@ struct alignas(16) GpuMatMulParam {
     int M;
     int N;
     int K;
-    int C;      // image path: channel count; buffer path: batch count
-    int fp32;   // 1 = fp32, 0 = fp16
-    int transB; // 1 = B is [batch, N, K] (transposed input); 0 = [batch, K, N]
+    int C;        // image path: channel count; buffer path: batch count
+    int fp32;     // 1 = fp32, 0 = fp16
+    int transB;   // 1 = B is laid out as [batch, N, K] (transposed input); 0 =
+                  // [batch, K, N]
     int tile = 0; // 1 = shared-memory tiled GEMM; buffer path only
+    // 1 = B is a byte-packed int8 weight with a per-output-column fp32 scale
+    // bound at binding 4 (buffer path only; the image shaders declare the slot
+    // but never read it). Defaulted because MatMulImage never assigns it and an
+    // indeterminate byte in the push range is a wrong answer waiting to happen.
+    int weight_int8 = 0;
 };
 
 } // namespace matmul
@@ -148,7 +154,8 @@ class MatMulBuffer : public BufferFactory {
               fp16 ? buffer_matmul_fp16_spv_len : buffer_matmul_spv_len,
               std::vector<VkDescriptorType>{
                   DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                  DESCRIPTOR_TYPE_STORAGE},
               sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
     }
@@ -160,11 +167,15 @@ class MatMulBuffer : public BufferFactory {
         if (fp16_ != 0 && !pack_pipeline_) {
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
+            // Same binding count as the reduce pipeline: the pack set is filled
+            // straight from objs_, so the two layouts must have the same slots
+            // even though the pack shader only reads scratch and writes out.
             pack_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
                 sizeof(MatMulPackPC),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
                 static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0);
@@ -192,11 +203,38 @@ class MatMulBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Same contract as the image path: float or half only. A quantized
-        // weight belongs to a kernel that dequantizes it.
-        for (size_t i = 0; i < inputs.size(); ++i) {
-            core::require_float_elem(inputs[i]->elem_kind(), "MatMul",
-                                     ("input " + std::to_string(i)).c_str());
+        // Element formats. A and the output must be float or half; B may also
+        // be an int8 weight, in which case the graph carries its dequant scale
+        // as the last input — the same appended-scale convention the optimizer
+        // and Conv2d use:
+        //   fp32/fp16 : [A, B]
+        //   int8      : [A, B_int8, scale]
+        // Everything else fails here instead of being handed to a float loader,
+        // which would read a quantized payload's bytes as exponents and return
+        // a plausible wrong answer.
+        const bool weight_int8 = inputs.size() > 1 && inputs[1]->elem_kind() ==
+                                                          core::ElemKind::kInt8;
+        core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
+        if (!weight_int8) {
+            core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
+                                     "input 1");
+        }
+        core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
+        size_t scale_index = 0;
+        if (weight_int8) {
+            if (inputs.size() != 3) {
+                throw std::runtime_error("vkop: MatMul with an int8 weight "
+                                         "needs exactly [A, B_int8, "
+                                         "scale], got " +
+                                         std::to_string(inputs.size()) +
+                                         " inputs");
+            }
+            if (inputs[2]->elem_kind() != core::ElemKind::kFloat32) {
+                throw std::runtime_error(
+                    std::string("vkop: MatMul int8 dequant scale must be ") +
+                    "float32, got " + core::elem_name(inputs[2]->elem_kind()));
+            }
+            scale_index = 2;
         }
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
@@ -256,6 +294,27 @@ class MatMulBuffer : public BufferFactory {
 
         int total = batch * m * n;
 
+        if (weight_int8) {
+            // The scale indexes output columns, so its length IS N. A mismatch
+            // means the weight was quantized along the wrong axis (a [N, K]
+            // weight treated as [K, N], which is what a folded Transpose
+            // produces) and no kernel can recover the intended values. size()
+            // is bytes and the scale was just proven float32, so 4 bytes per
+            // entry.
+            const size_t entries =
+                inputs[scale_index]->size() /
+                core::elem_bytes(core::ElemKind::kFloat32, 1);
+            if (entries != static_cast<size_t>(n)) {
+                throw std::runtime_error(
+                    "vkop: MatMul int8 scale has " + std::to_string(entries) +
+                    " entries but the output has " + std::to_string(n) +
+                    " columns — the weight was quantized along the wrong axis");
+            }
+            // No batch check: the converter only quantizes a single 2-D weight,
+            // so a batched B here is that matrix broadcast (identical slices),
+            // and one scale per column stays correct for every batch index.
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -288,7 +347,9 @@ class MatMulBuffer : public BufferFactory {
 
         // fp16 needs a scratch fp32 buffer (binding 3) only for the odd-N
         // reduce->pack fallback; even N packs in the reduce shader itself.
-        const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0);
+        // int8 weights always take the reduce->pack route: the byte-packed B
+        // breaks the half2 word alignment the fused and tiled paths assume.
+        const bool fused_fp16 = (fp16_ != 0) && ((n & 1) == 0) && !weight_int8;
         // Shared-memory tiling pays only in the compute-bound regime, and only
         // where its indexing assumptions hold: k % 16 keeps every tile word
         // aligned on both B layouts. m >= 12 is measured, not guessed: at
@@ -320,6 +381,17 @@ class MatMulBuffer : public BufferFactory {
             objs_.emplace_back(dummy_buffer_);
         }
 
+        // binding 4: the int8 weight's per-column dequant scale, or a dummy to
+        // keep the descriptor set fully bound (same convention as Conv2d).
+        if (weight_int8) {
+            dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                bind_ssbo<T>(inputs[scale_index], /*is_output=*/false);
+            });
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+        }
+
         para_.M = m;
         para_.N = n;
         para_.K = k;
@@ -327,6 +399,7 @@ class MatMulBuffer : public BufferFactory {
         para_.fp32 = (fp16_ != 0) ? 0 : 1;
         para_.transB = transB_ ? 1 : 0;
         para_.tile = tiled ? 1 : 0;
+        para_.weight_int8 = weight_int8 ? 1 : 0;
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the

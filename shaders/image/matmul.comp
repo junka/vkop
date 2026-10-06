@@ -11,6 +11,11 @@ layout(push_constant) uniform paraBuffer {
     int K; // W for A and H for B
     int C;
     int fp32;
+    // Declared only so the push-constant range matches ops GpuMatMulParam;
+    // the image path reads none of them.
+    int transB;
+    int tile;
+    int weight_int8;
 } uMatMulParams;
 
 void main() {

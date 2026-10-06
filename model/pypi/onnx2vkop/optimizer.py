@@ -4390,7 +4390,15 @@ class Quantizer:
         }
 
         # Operators whose weights are usually safe to quantize to INT8
-        safe_weight_operators = {"Conv", "MatMul", "ConvTranspose", "LSTM", "GRU", "RNN"}
+        safe_weight_operators = {
+            "Conv",
+            "MatMul",
+            "Gemm",
+            "ConvTranspose",
+            "LSTM",
+            "GRU",
+            "RNN",
+        }
 
         # Parameters that are usually sensitive to INT8 quantization
         sensitive_parameters = {"BatchNormalization", "LayerNormalization", "GroupNormalization"}
@@ -4424,6 +4432,40 @@ class Quantizer:
             # Check who consumes this initializer
             consumers = initializer_consumers.get(name, [])
             consumer_ops = {node.op_type for node in consumers}
+
+            # Gemm/MatMul weights are quantizable only as long as the kernel can
+            # put every scale entry on an output column:
+            #   * the tensor has to be the B operand (inputs[1]) — on the A side
+            #     there is no per-column scale to index;
+            #   * it has to be a plain 2-D matrix — a batched weight would need
+            #     one scale vector per batch, which the shaders do not read;
+            #   * all consuming nodes must agree on transB, because transB is
+            #     what says whether the physical layout is [K, N] or [N, K] and
+            #     therefore which axis holds the output columns.
+            # Anything else stays fp32; emitting it anyway would produce a graph
+            # whose only possible answer is a wrong one.
+            mm_consumers = [
+                node
+                for node in consumers
+                if node.op_type in ("Gemm", "MatMul")
+            ]
+            if mm_consumers:
+                is_b_operand = all(
+                    len(node.inputs) > 1 and node.inputs[1]["name"] == name
+                    for node in mm_consumers
+                )
+                transb_flags = {
+                    int(node.attributes.get("transB", 0) or 0)
+                    for node in mm_consumers
+                }
+                if not is_b_operand or len(initializer.dims) != 2 or len(transb_flags) != 1:
+                    print(
+                        f"Preserving '{name}' as FP32: not a plain 2-D B operand of one "
+                        f"agreed-transB Gemm/MatMul (dims={list(initializer.dims)}, "
+                        f"transB={sorted(transb_flags)}, B_operand={is_b_operand})"
+                    )
+                    skipped_count += 1
+                    continue
 
             # Determine if this initializer should be quantized
             should_quantize = False
@@ -4496,23 +4538,16 @@ class Quantizer:
                                 # For other shapes, default to axis=1
                                 axis = 1
                             break
-                        elif op_type == "Gemm":
-                            # Gemm weights: [out, in] - quantize per output dimension
-                            # Reduce along in dimension -> axis=1
-                            if len(arr.shape) == 2:
-                                axis = 1
-                            else:
-                                # For other shapes, default to axis=0
-                                axis = 0
-                            break
-                        elif op_type == "MatMul":
-                            # MatMul weights: typically [in, out] - quantize per output dimension
-                            # Reduce along in dimension -> axis=0
-                            if len(arr.shape) == 2:
-                                axis = 0
-                            else:
-                                # For other shapes, default to axis=1
-                                axis = 1
+                        elif op_type in ("Gemm", "MatMul"):
+                            # The dequant scale indexes Y's output columns (dim
+                            # N) — both kernels read exactly one scale per
+                            # column. Which physical axis those columns sit on
+                            # is decided by transB: transB=0 stores B as [K, N]
+                            # (reduce axis 0), transB=1 stores it as [N, K]
+                            # (reduce axis 1). The gate above guaranteed a plain
+                            # 2-D B operand with one agreed transB across all its
+                            # consumers, so the choice here is unambiguous.
+                            axis = 1 if int(node.attributes.get("transB", 0) or 0) else 0
                             break
                         elif op_type in ["LSTM", "GRU"]:
                             # LSTM/GRU weights: [D, 4H, I] or [D, 4H, H] - quantize per output dimension
@@ -4557,12 +4592,13 @@ class Quantizer:
                         elif "ConvTranspose" in consumer_ops and len(arr.shape) == 4:
                             # ConvTranspose: [C_in, C_out, K, K], axis=(0,2,3) -> scale should be [C_out]
                             scale = scale.reshape(arr.shape[1])
-                        elif "Gemm" in consumer_ops and len(arr.shape) == 2:
-                            # Gemm: [out, in], axis=1 -> scale should be [out]
-                            scale = scale.reshape(arr.shape[0])
-                        elif "MatMul" in consumer_ops and len(arr.shape) == 2:
-                            # MatMul: [in, out], axis=0 -> scale should be [out]
-                            scale = scale.reshape(arr.shape[1])
+                        elif ("Gemm" in consumer_ops or "MatMul" in consumer_ops) and len(arr.shape) == 2:
+                            # One scale per output column, whatever the layout:
+                            # the axis above reduced K away, so N is the axis
+                            # that survived — take it from the layout instead of
+                            # trusting the reduce.
+                            n = arr.shape[1] if axis == 0 else arr.shape[0]
+                            scale = scale.reshape(n)
                         else:
                             # For other cases, flatten to 1D
                             scale = scale.flatten()

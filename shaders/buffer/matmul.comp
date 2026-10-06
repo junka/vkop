@@ -13,6 +13,9 @@
 //     SEPARATE pack dispatch (buffer/matmul_pack.comp, kept for that case; the
 //     separate pipeline also avoids Intel ANV push-constant interference
 //     between dispatches of the same pipeline).
+// int8 weight-only B (uPC.weight_int8) is a fourth mode, ahead of all three:
+// one thread per output element in either build, and in the fp16 build it
+// always takes the reduce->pack route.
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -34,6 +37,12 @@ layout(set = 0, binding = 2) readonly buffer InB {
 layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
+// Per-output-column dequant scale for int8 weight-only B (binding 4), inert
+// otherwise. The optimizer stores scale = amax/127 per column of C as fp32 and
+// MatMulBuffer::execute refuses any other scale format.
+layout(set = 0, binding = 4) readonly buffer Scale {
+    uint data[];
+} uScale;
 
 layout(push_constant) uniform PC {
     int M;
@@ -43,6 +52,7 @@ layout(push_constant) uniform PC {
     int fp32;
     int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
     int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch)
+    int weight_int8; // 1 = B is packed int8 bytes, dequant via uScale[j]
 } uPC;
 
 #ifdef FP16
@@ -52,6 +62,11 @@ float load_a(int idx) {
 float load_b(int idx) {
     return unpackHalf2x16(uInputB.data[idx >> 1])[idx & 1];
 }
+// int8 weights land in the fp32 scratch and matmul_pack.comp halves them: the
+// byte-packed B breaks the word-alignment the fused even-N and tiled paths
+// assume, so this build routes through the same reduce->pass the odd-N case
+// already uses.
+#define W8_STORE(idx, val) uScratch.data[idx] = floatBitsToUint(val)
 
 // One thread owns output word (n, i, {ja, ja+1}) of an even-N C. ja is even
 // and n*M*N + i*N is even when N is even, so the pair is word-aligned.
@@ -326,6 +341,47 @@ void matmul16_odd_n() {
 }
 #endif
 
+#ifndef FP16
+float load_a(int idx) {
+    return uintBitsToFloat(uInputA.data[idx]);
+}
+// fp32 build has no scratch: the reduce is the whole kernel.
+#define W8_STORE(idx, val) uOutput.data[idx] = floatBitsToUint(val)
+#endif
+
+// int8 weight-only B. One thread per output element, fp32 accumulate over the
+// raw weight bytes, then one multiply by this column's dequant scale (the scale
+// is constant along K, so folding it out of the loop is both cheaper and
+// rounding-wise no worse than a per-tap dequant). Deliberately naive: the win
+// here is the halved weight bandwidth, and the fp16 tiled/even-N nests carry
+// half2 word-alignment assumptions a byte-packed B does not satisfy.
+void matmul_w8() {
+    int j = int(gl_GlobalInvocationID.x);
+    int yi = int(gl_GlobalInvocationID.y);
+    if (j >= uPC.N) return;
+
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    float wsc = uintBitsToFloat(uScale.data[j]);
+    int a_base = n * uPC.M * uPC.K;
+    int b_base = n * uPC.K * uPC.N;
+
+    float sum = 0.0;
+    for (int k = 0; k < uPC.K; ++k) {
+        int b_idx = (uPC.transB != 0) ? (b_base + j * uPC.K + k)
+                                      : (b_base + k * uPC.N + j);
+        uint word = uInputB.data[b_idx >> 2];
+        int b = int(word >> ((b_idx & 3) * 8)) & 0xFF;
+        // Sign-fold by hand: an arithmetic right shift of a signed int is not
+        // something to bet a kernel on across drivers.
+        sum += load_a(a_base + i * uPC.K + k) * float(b >= 128 ? b - 256 : b);
+    }
+
+    W8_STORE(n * uPC.M * uPC.N + i * uPC.N + j, sum * wsc);
+}
+
 void matmul32() {
     int j = int(gl_GlobalInvocationID.x);
     int yi = int(gl_GlobalInvocationID.y);
@@ -354,6 +410,12 @@ void matmul32() {
 }
 
 void main() {
+    // int8 weight-only owns its own kernel in both builds; the host never sets
+    // tile for it, so this test comes before the fp16 mode selection.
+    if (uPC.weight_int8 != 0) {
+        matmul_w8();
+        return;
+    }
 #ifdef FP16
     if (uPC.tile != 0) {
         matmul16_tiled();

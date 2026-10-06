@@ -9,11 +9,12 @@ layout(local_size_x = 16, local_size_y = 16) in;
 //
 // The K loop carries NO data-dependent branches: transA/transB are
 // hoisted into walk start + stride, and each (A dtype x B dtype) pair
-// gets its own specialized loop instance via macro expansion (4 per
-// output-width body, 8 total). fp16a/fp16b/fp16c/fp16o are 0 (fp32) or 1
-// (fp16) only: Gemm::execute rejects every other element format, because
-// reading a quantized payload through LDF would reinterpret its bytes as
-// exponents and return a wrong answer with no error.
+// gets its own specialized loop instance via macro expansion.
+// fp16a/fp16b/fp16c/fp16o are 0 (fp32) or 1 (fp16) only, and B's format
+// is picked once by weight_int8: 0 = float/half, 1 = int8 weight-only.
+// Gemm::execute rejects anything else, because reading a quantized
+// payload through LDF would reinterpret its bytes as exponents and
+// return a wrong answer with no error.
 
 
 #define FLOAT float
@@ -38,6 +39,14 @@ layout(set=0, binding = 3) readonly buffer BufferC {
     uint data[];
 } bufferC;
 
+// Per-output-column dequant scale for int8 weight-only B (binding 4), inert
+// when weight_int8 == 0. The optimizer stores scale = amax/127 per column of
+// Y as fp32; Gemm::execute refuses any other scale format, so this reads the
+// word as a float unconditionally.
+layout(set=0, binding = 4) readonly buffer BufferScale {
+    uint data[];
+} bufferS;
+
 layout(push_constant) uniform paraBuffer {
     int M; // 行数
     int N; // 列数
@@ -52,6 +61,7 @@ layout(push_constant) uniform paraBuffer {
     int fp16c;
     int fp16o;
     int activation;
+    int weight_int8; // 1 = B is packed int8 bytes, dequant via bufferS[j]
 } uParams;
 
 #define A16 (uParams.fp16a == 1)
@@ -60,6 +70,16 @@ layout(push_constant) uniform paraBuffer {
 // Element loaders parameterized by the walk-index variable.
 #define LDF(buf, idx) uintBitsToFloat(buf.data[idx])
 #define LDH(buf, idx) unpackHalf2x16(buf.data[idx >> 1])[idx & 1]
+
+// int8 weight-only payload: four signed bytes per uint word. Same decode as
+// buffer/conv2d.comp's int8 nest — mask the byte, then fold the sign bit by
+// hand, since an arithmetic right shift of a signed int is not something to
+// bet a kernel on across drivers.
+float w8(uint word, int lane) {
+    int b = int(word >> (lane * 8)) & 0xFF;
+    return float(b >= 128 ? b - 256 : b);
+}
+#define LD8(buf, idx) w8(buf.data[idx >> 2], idx & 3)
 
 // Specialized K loops. ai/a_step walk A; the caller's bi* variables walk B.
 #define KLOOP1(LA, LB, SUM)                                \
@@ -95,7 +115,16 @@ void gemm32()
     int b_step = (uParams.transB == 1) ? 1 : uParams.N;
 
     float sum = 0.0;
-    if (A16) {
+    if (uParams.weight_int8 == 1) {
+        // The scale is per output column, so it is constant along K: fold the
+        // dot product over the raw bytes and dequantize once at the end. That
+        // is both cheaper than a per-tap multiply and rounding-wise no worse —
+        // one multiply instead of K of them.
+        float wsc = LDF(bufferS, j);
+        if (A16) { KLOOP1(LDH(bufferA, ai), LD8(bufferB, bi), sum) }
+        else     { KLOOP1(LDF(bufferA, ai), LD8(bufferB, bi), sum) }
+        sum *= wsc;
+    } else if (A16) {
         if (B16) { KLOOP1(LDH(bufferA, ai), LDH(bufferB, bi), sum) }
         else     { KLOOP1(LDH(bufferA, ai), LDF(bufferB, bi), sum) }
     } else {
@@ -141,7 +170,19 @@ void gemm16() {
     }
 
     vec2 sum = vec2(0.0);
-    if (A16) {
+    if (uParams.weight_int8 == 1) {
+        // One scale per column; the odd-N tail aliases b1i onto b0i, so its
+        // scale index is clamped to stay inside bufferS (the value is dropped
+        // on store anyway).
+        vec2 wsc = vec2(LDF(bufferS, j0),
+                        j0 + 1 < uParams.N ? LDF(bufferS, j0 + 1) : 0.0);
+        if (A16) {
+            KLOOP2(LDH(bufferA, ai), LD8(bufferB, b0i), LD8(bufferB, b1i), sum)
+        } else {
+            KLOOP2(LDF(bufferA, ai), LD8(bufferB, b0i), LD8(bufferB, b1i), sum)
+        }
+        sum *= wsc;
+    } else if (A16) {
         if (B16) {
             KLOOP2(LDH(bufferA, ai), LDH(bufferB, b0i), LDH(bufferB, b1i), sum)
         } else {
