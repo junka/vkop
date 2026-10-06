@@ -4409,14 +4409,19 @@ class Quantizer:
         for name in initializers_keys:
             initializer = dag_model.initializers[name]
 
-            # Skip non-FP32 tensors
-            if initializer.data_type != onnx.TensorProto.FLOAT:
+            # A half weight is a quantization source, not something to skip:
+            # every LLM export stores its initializers as FLOAT16, and the
+            # weight-only kernels that read them are buffer (SSBO) ops — which
+            # is exactly where those models run. The math below promotes to fp32
+            # first, so a half weight quantizes identically to its fp32 twin.
+            if initializer.data_type not in (
+                onnx.TensorProto.FLOAT,
+                onnx.TensorProto.FLOAT16,
+            ):
                 if initializer.data_type in preserve_types:
                     print(
                         f"Preserving {onnx.TensorProto.DataType.Name(initializer.data_type)} tensor '{name}'"
                     )
-                elif initializer.data_type == onnx.TensorProto.FLOAT16:
-                    print(f"Skipping already FP16 tensor '{name}'")
                 else:
                     data_type_name = (
                         onnx.TensorProto.DataType.Name(initializer.data_type)
@@ -4428,6 +4433,8 @@ class Quantizer:
                     )
                 skipped_count += 1
                 continue
+
+            source_dtype = onnx.TensorProto.DataType.Name(initializer.data_type)
 
             # Check who consumes this initializer
             consumers = initializer_consumers.get(name, [])
@@ -4509,8 +4516,9 @@ class Quantizer:
                     skipped_count += 1
                     should_quantize = False
             if should_quantize:
-                # Convert to numpy array
-                arr = numpy_helper.to_array(initializer)
+                # fp16 -> fp32 is lossless, so the quantization math and the
+                # error metrics below see exactly what an fp32 source would give.
+                arr = numpy_helper.to_array(initializer).astype(np.float32)
                 original_fp32 = arr.copy()
 
                 # Determine quantization axis based on operator type and tensor shape
@@ -4665,14 +4673,16 @@ class Quantizer:
                     node.inputs.append(scale_input)
 
                 print(
-                    f"Converted FP32 tensor '{name}' to INT8 with scale tensor '{scale_name}' ({reason})"
+                    f"Converted {source_dtype} tensor '{name}' to INT8 with scale tensor '{scale_name}' ({reason})"
                 )
                 print(f"Original shape: {initializer.dims}, scale shape: {scale_initializer.dims}")
                 converted_count += 1
             else:
                 skipped_count += 1
 
-        print(f"Converted {converted_count} FP32 tensors to INT8 with scale information")
+        print(
+            f"Converted {converted_count} FP32/FP16 tensors to INT8 with scale information"
+        )
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 

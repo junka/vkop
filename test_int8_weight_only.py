@@ -27,14 +27,14 @@ def tref(name):
     return {"name": name, "shape": [-1]}
 
 
-def build(weight_name, weight, consumers):
+def build(weight_name, weight, consumers, dtype=numpy.float32):
     """Model with one initializer and its consuming nodes.
 
     consumers: list of (op_type, node_name, attributes, input_names).
     """
     m = DAGBasedModel()
     m.initializers[weight_name] = numpy_helper.from_array(
-        numpy.asarray(weight, dtype=numpy.float32), weight_name
+        numpy.asarray(weight, dtype=dtype), weight_name
     )
     for op_type, node_name, attrs, ins in consumers:
         m.nodes[node_name] = Node(
@@ -185,6 +185,46 @@ def test_conv_bias_still_preserved():
     print("  PASS (Conv bias still preserved)")
 
 
+def test_fp16_weight_quantizes_like_its_fp32_twin():
+    """Every LLM export stores weights as FLOAT16, and the weight-only kernels
+    are buffer ops — i.e. the models that can use int8 are exactly the ones the
+    old FP32-only gate skipped. A half weight must quantize to the same payload
+    and scale as the same values read back as float32 (fp16 -> fp32 is
+    lossless), so nothing in the kernels or the error bound changes."""
+    numpy.random.seed(7)
+    n, k = 8, 5
+    w16 = (numpy.random.randn(n, k) * numpy.array(
+        [3.0, 0.5, 1.2, 2.4, 0.7, 1.9, 0.3, 4.1], dtype=numpy.float32).reshape(n, 1)
+        ).astype(numpy.float16)
+    consumers = [("MatMul", "mm", {"transB": 1}, ["x", "W"])]
+    m16 = quantize(build("W", w16, consumers, dtype=numpy.float16))
+    assert dtype_of(m16, "W") == TensorProto.INT8, "FP16 weight must quantize"
+    scale16 = numpy_helper.to_array(m16.initializers["W_scale"])
+    q16 = numpy_helper.to_array(m16.initializers["W"])
+    assert scale16.dtype == numpy.float32
+    assert scale16.shape == (n,)
+    assert input_names(m16.nodes["mm"]) == ["x", "W", "W_scale"]
+    check_roundtrip(w16.astype(numpy.float32), q16, scale16, reduce_axis=1)
+
+    m32 = quantize(build("W", w16.astype(numpy.float32), consumers))
+    numpy.testing.assert_array_equal(q16, numpy_helper.to_array(m32.initializers["W"]))
+    numpy.testing.assert_array_equal(
+        scale16, numpy_helper.to_array(m32.initializers["W_scale"]))
+    print("  PASS (FP16 weight quantizes to the FP32 twin's payload and scale)")
+
+
+def test_non_float_source_still_preserved():
+    """Widening the gate to FP16 must not widen it past the formats no kernel
+    reads: an int8 initializer arrives already quantized and gets no scale."""
+    w = numpy.arange(12, dtype=numpy.int8).reshape(4, 3)
+    m = quantize(build("W", w, [("MatMul", "mm", {"transB": 0}, ["x", "W"])],
+                      dtype=numpy.int8))
+    assert dtype_of(m, "W") == TensorProto.INT8
+    assert "W_scale" not in m.initializers
+    assert input_names(m.nodes["mm"]) == ["x", "W"]
+    print("  PASS (non-float initializer preserved, no scale appended)")
+
+
 if __name__ == "__main__":
     for fn in (test_gemm_transb_quantized_per_output_column,
                test_matmul_transb0_quantized_per_output_column,
@@ -192,7 +232,9 @@ if __name__ == "__main__":
                test_batched_weight_preserved,
                test_disagreeing_transb_preserved,
                test_gemm_bias_preserved,
-               test_conv_bias_still_preserved):
+               test_conv_bias_still_preserved,
+               test_fp16_weight_quantizes_like_its_fp32_twin,
+               test_non_float_source_still_preserved):
         print(fn.__name__ + ":")
         fn()
     print("\nALL PASS")
