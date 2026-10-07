@@ -1222,6 +1222,17 @@ TEST(MatMulTest, MatMulInt8WeightOnlyBuffer) {
         {1, 1, 258, 260, false, false},
         {1, 3, 258, 32, false, false},
         {2, 1, 300, 128, false, true},
+        // Compute-bound shapes: from m >= 12 with K % 16 == 0 and N % 4 == 0 the
+        // host puts a byte weight in the shared-memory tile, which stages the
+        // decoded value and applies the column scale in the epilogue. The 64-row
+        // tile edge, several k-tiles, a partial last 64-column block (only the
+        // quads at 128 and 132 are live) and the batched z extent all have to
+        // hold. The per-column scales differ enough that a column paired with
+        // another column's scale fails here.
+        {1, 12, 16, 4, false, false},    // the m >= 12 gate exactly
+        {1, 13, 32, 16, false, false},   // one A row past a 64-row tile
+        {1, 70, 64, 136, false, false},  // K over several k-tiles, partial block
+        {2, 16, 32, 24, false, true},    // batched, so the tile grid's z matters
     };
     LOG_INFO("int8 MatMul, FP32");
     run_matmul_int8<float>(cases);
@@ -1272,6 +1283,12 @@ TEST(MatMulTest, MatMulFp8WeightOnlyBuffer) {
             {2, 1, 300, 128, false, true, false},   // decode: batched
             {1, 4, 32, 16, false, false, true},    // wide spread: subnormals
             {1, 1, 256, 64, false, false, true},   // wide spread under split-K
+            // The tiled byte kernel (see the int8 list): fp8 reaches it through
+            // the same loader and only f8_val differs, so the same shapes run.
+            {1, 12, 16, 4, false, false, false},
+            {1, 13, 32, 16, false, false, false},
+            {1, 70, 64, 136, false, false, false},
+            {1, 64, 48, 32, false, false, true},   // wide spread inside a tile
         };
     LOG_INFO("fp8 MatMul, FP32");
     run_matmul_fp8<float>(cases);

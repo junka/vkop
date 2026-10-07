@@ -542,11 +542,17 @@ class MatMulBuffer : public BufferFactory {
         // M <= 8 the naive GEMV is weight-bandwidth-bound and the 64-row tile
         // is ~break-even (0.99-1.01x across N=1024..9728), while from M = 12
         // the tile reuse wins 1.2-2.0x and never regresses (narrow N=64 and
-        // batched attention shapes included). Quantized weights stay out of it:
-        // the tile loaders stage B as half2 words copied straight from global,
-        // which a packed weight has no equivalent for.
-        const bool tiled = fused_fp16 && !weight_byte && !weight_4bit &&
-                           (k % 16 == 0) && (m >= 12);
+        // batched attention shapes included). A byte-quantized weight joins it
+        // through tile_load_b_w8, which stages the decoded value: in the
+        // column-parallel quad kernel a weight is loaded and decoded once per
+        // output row, which on the DiT (m = 1024) cost int8 4.0x and fp8 5.5x
+        // what fp16 pays per step. That loader reads four columns of one K row
+        // out of one weight word, so it needs transB == 0 (the only layout the
+        // quantizer emits) and n % 4 == 0. 4-bit weights stay out: their scale
+        // varies along K, which a per-column epilogue cannot fold.
+        const bool tiled = fused_fp16 && !weight_4bit && (k % 16 == 0) &&
+                           (m >= 12) &&
+                           (!weight_byte || (!transB_ && (n % 4 == 0)));
         if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
@@ -604,7 +610,7 @@ class MatMulBuffer : public BufferFactory {
         para_.weight_int8 = weight_byte ? 1 : 0;
         para_.fp8 = weight_fp8 ? 1 : 0;
         para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
-        para_.w8_quad = (w8_quad && !ksplit) ? 1 : 0;
+        para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
         para_.ksplit = ksplit ? 1 : 0;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;

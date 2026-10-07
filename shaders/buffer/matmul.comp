@@ -18,7 +18,10 @@
 // directly (one thread per two columns, or per four columns when uPC.w8_quad,
 // see below), and only odd N falls back to one thread per output element in
 // reduce->pack form. Byte packing changes how a weight is LOADED, not who owns
-// an output word.
+// an output word. From the sizes where the tiled nest pays (m >= 12, host
+// picked) a byte weight joins it too: the tile stages the decoded value, so the
+// byte -> float step runs once per weight per 64-row block instead of once per
+// output element.
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -687,6 +690,32 @@ void tile_load_b_n(int b, int col0, int kk, int halfN) {
     }
 }
 
+// Byte-quantized weight, B is [batch, K, N] (the only layout a quantizer can
+// emit). One thread stages the four columns of one K row that a single 32-bit
+// weight word holds, decodes them, and writes the two half2 words the tile's
+// FMA nest already reads -- 256 threads x 2 words exactly cover TILE_K x TILE_N.
+// The decode is the whole point: in the column-parallel quad kernel it runs once
+// per output element (M*N*K times), here once per weight per 64-row block.
+// Nothing about it is approximate: int8 magnitudes are integers up to 128 and
+// both fp8 formats sit inside the half range, so the staged tile holds the same
+// values the naive kernel accumulates. The column scale is deliberately NOT
+// folded in here -- it is constant along K, so the epilogue applies it with one
+// multiply per output instead of one per tap.
+void tile_load_b_w8(int b, int col0, int kk) {
+    int l = tile_tid();
+    int kr = l >> 4;        // 16 K rows of the tile
+    int quad = l & 15;      // 16 four-column groups = TILE_N columns
+    int col = col0 + quad * 4;
+    // N % 4 == 0 (host-checked) makes every K row start 4-aligned, so a
+    // 4-aligned column always owns its whole byte word.
+    vec4 w = vec4(0.0);
+    if (col < uPC.N) {
+        w = unpack_w8(uInputB.data[((b * uPC.K + kk + kr) * uPC.N + col) >> 2]);
+    }
+    sB[kr * SBROW + 2 * quad] = (col + 1 < uPC.N) ? packHalf2x16(w.xy) : 0u;
+    sB[kr * SBROW + 2 * quad + 1] = (col + 3 < uPC.N) ? packHalf2x16(w.zw) : 0u;
+}
+
 // One k-pair per thread, transB: a B word carries the two K values of one
 // column.
 void tile_fma_t(inout float acc[4][4], int lr, int lc) {
@@ -767,6 +796,14 @@ void matmul16_tiled() {
             tile_fma_t(acc, lr, lc);
             barrier();
         }
+    } else if (uPC.weight_int8 != 0) {
+        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
+            tile_load_a(b, row0, kk >> 1, halfK);
+            tile_load_b_w8(b, col0, kk);
+            barrier();
+            tile_fma_n(acc, lr, lc);
+            barrier();
+        }
     } else {
         for (int kk = 0; kk < uPC.K; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
@@ -783,12 +820,20 @@ void matmul16_tiled() {
         int grow = row0 + lr + r;
         if (grow >= uPC.M) break;
         int base = (b * uPC.M + grow) * uPC.N + col0 + lc;
+        vec2 v0 = vec2(acc[r][0], acc[r][1]);
+        vec2 v1 = vec2(acc[r][2], acc[r][3]);
+        // A byte weight's dequant scale is per output column and constant along
+        // K, so it leaves the accumulation entirely: one multiply per output, in
+        // fp32, before the half pack -- the same shape the quad kernel uses.
+        if (uPC.weight_int8 != 0) {
+            int c = col0 + lc;
+            v0 *= vec2(scale1(c), scale1(c + 1));
+            v1 *= vec2(scale1(c + 2), scale1(c + 3));
+        }
         if (col0 + lc + 1 < uPC.N)
-            uOutput.data[base >> 1] =
-                packHalf2x16(vec2(acc[r][0], acc[r][1]));
+            uOutput.data[base >> 1] = packHalf2x16(v0);
         if (col0 + lc + 3 < uPC.N)
-            uOutput.data[(base + 2) >> 1] =
-                packHalf2x16(vec2(acc[r][2], acc[r][3]));
+            uOutput.data[(base + 2) >> 1] = packHalf2x16(v1);
     }
 }
 
@@ -939,13 +984,19 @@ void main() {
 #endif
         return;
     }
-    // int8 weight-only owns its own kernels: with even N in the fp16 build it
-    // keeps the fused single-pass half2 store, otherwise it reduces elementwise
+    // int8 weight-only owns its own kernels: from the compute-bound sizes it
+    // joins the tiled nest, otherwise with even N in the fp16 build it keeps the
+    // fused single-pass half2 store, and failing that it reduces elementwise
     // (fp32 build: straight to output; fp16 odd N: to scratch, then pack).
-    // The host never sets tile for it, so these tests come before the fp16 mode
-    // selection.
     if (uPC.weight_int8 != 0) {
 #ifdef FP16
+        // The tiled nest reads the same B through tile_load_b_w8, which stages
+        // the decoded value instead of copying a half2 word from global; the
+        // host only raises tile on the shapes that loader needs.
+        if (uPC.tile != 0) {
+            matmul16_tiled();
+            return;
+        }
         if (uPC.w8_quad != 0) {
             matmul16_w8_quad();
             return;
