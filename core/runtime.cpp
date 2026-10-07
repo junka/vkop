@@ -367,6 +367,21 @@ void Runtime::LoadModel() {
                 t->set_elem_kind(kind);
                 handle_unified_tensors(init, src_ptr, t, meta, buffer);
             } else {
+                // Widening this whitelist for quantized weights was measured,
+                // not assumed, to be worthless: fitting LoadModel over the five
+                // GLM-Edge graphs (fp16/int8/fp8/int4/nvfp4, paired repeats)
+                // gives t = 2.275 s fixed + 0.10 us/MiB + 0.21 ms per
+                // initializer, so the 169-338 payload/scale buffers a quantized
+                // graph adds cost 0.04-0.07 s ONCE at load and nothing per
+                // token (a 4-input vs 2-input MatMul decode was already inside
+                // noise). The per-buffer mass is elsewhere and mergeable only
+                // in principle: 3847 int64 shape constants per LLM graph, 8-40
+                // bytes each. Two harder limits sit on this path regardless of
+                // dtype -- UnifiedMeta's offset/size are int32, so a region
+                // over 2 GiB (any fp16 LLM) cannot be expressed at all, and the
+                // shared buffer's element count above comes from dividing the
+                // region by sizeof(float), which a byte or sub-byte payload
+                // would not survive.
                 throw std::runtime_error(
                     "vkop: unified initializer " + init.name +
                     " has element format " + elem_name(kind) +
