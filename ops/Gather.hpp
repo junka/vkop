@@ -315,6 +315,11 @@ class Gather : public Operator {
         std::vector<int> out_shape =
             calculateGatherOutputShape(inshape, indshape, param_.axis);
 
+        // Fail closed on a <= 1-byte data payload: this mover has no byte build
+        // (core::require_word_movable_elem) so a byte-typed gather (an fp8 KV
+        // slice) would mis-slice silently. int64 data has its own path below.
+        core::require_word_movable_elem(inputs[0]->elem_kind(), "Gather");
+
         // int64 data: GPU shader path (gather_int64.comp). Previously this was
         // a synchronous CPU path (cpuComputeInt64: 2× copyToCPU + host loop +
         // copyToGPU = 3 sync stalls, ~665ms/round — the #1 decode bottleneck).

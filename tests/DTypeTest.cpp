@@ -16,6 +16,7 @@ using vkop::core::elem_kind_supported;
 using vkop::core::elem_name;
 using vkop::core::require_float_elem;
 using vkop::core::require_supported_elem;
+using vkop::core::require_word_movable_elem;
 using vkop::core::storage_matches_kind;
 
 namespace {
@@ -224,6 +225,39 @@ TEST(DTypeTest, RequireFloatElem) {
         EXPECT_NE(what.find("MatMul"), std::string::npos);
         EXPECT_NE(what.find("input 1"), std::string::npos);
         EXPECT_NE(what.find("int8"), std::string::npos);
+    }
+}
+
+// The guard the word-granular buffer movers (Slice/Concat/Gather/Split/
+// Transpose/Expand) run behind. They move 2-byte (fp16) or 4-byte (fp32/int32)
+// elements, with int64 on a dedicated path; a <= 1-byte payload has no build and
+// would be copied 4-per-word and mis-sliced silently — so it must throw loudly.
+// This is the precondition the fp8 KV cache clears before its cache tensors can
+// reach a mover, and it also closes the same latent hole for int8/bool today.
+TEST(DTypeTest, RequireWordMovableElem) {
+    // Word-sized formats a mover can carry.
+    for (ElemKind kind : {ElemKind::kFloat32, ElemKind::kFloat16,
+                          ElemKind::kBFloat16, ElemKind::kInt32,
+                          ElemKind::kInt64}) {
+        EXPECT_NO_THROW(require_word_movable_elem(kind, "Slice"))
+            << elem_name(kind);
+    }
+    // <= 1 byte per element: no mover build, must reject.
+    for (ElemKind kind :
+         {ElemKind::kInt8, ElemKind::kUint8, ElemKind::kBool,
+          ElemKind::kFloat8E4M3FN, ElemKind::kFloat8E5M2, ElemKind::kInt4,
+          ElemKind::kUint4, ElemKind::kNF4, ElemKind::kFloat4E2M1}) {
+        EXPECT_THROW(require_word_movable_elem(kind, "Concat"),
+                     std::runtime_error)
+            << elem_name(kind);
+    }
+    try {
+        require_word_movable_elem(ElemKind::kFloat8E4M3FN, "Gather");
+        FAIL() << "an fp8 payload must not reach a word mover silently";
+    } catch (const std::runtime_error &e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("Gather"), std::string::npos);
+        EXPECT_NE(what.find("float8e4m3fn"), std::string::npos);
     }
 }
 

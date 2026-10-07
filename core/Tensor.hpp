@@ -799,6 +799,33 @@ template <typename T> class Tensor : public ITensor {
         // buffer (prealloc_keep_) and only re-marks converted_=false.
     }
 
+    // Exchange the GPU resource identity of two tensors of the same element
+    // type, leaving their logical shapes and host staging alone. The LLM KV
+    // cache uses this instead of a device->device copy: `present` holds the
+    // history the graph just wrote, and the next round's `past` must hold
+    // exactly those bytes, so re-pointing the two tensors at each other's
+    // buffer is the same statement done for free.
+    //
+    // Only pre-allocated tensors may be swapped: a buffer sized to the logical
+    // shape (the default) would be too small for the other tensor's next write,
+    // and shaders bound by push-constant dims would run past the end. That is
+    // why both sides are checked rather than assumed.
+    void swap_gpu_buffer_with(Tensor<T> &other) {
+        if (!prealloc_keep_ || !other.prealloc_keep_) {
+            throw std::runtime_error(
+                "vkop: swap_gpu_buffer_with on a tensor that is not "
+                "pre-allocated (the buffer may be too small for the other "
+                "side)");
+        }
+        if (!vkobj_ || !other.vkobj_) {
+            throw std::runtime_error(
+                "vkop: swap_gpu_buffer_with on a tensor without a GPU buffer");
+        }
+        auto mine = vkobj_;
+        vkobj_ = other.vkobj_;
+        other.vkobj_ = mine;
+    }
+
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (vkobj_) {

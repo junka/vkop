@@ -197,6 +197,14 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind);
 // one that reads the bytes as fp32 is a silent wrong answer.
 void require_float_elem(ElemKind kind, const char *op, const char *what);
 
+// Guard for the word-granular buffer data-movement kernels (Slice, Concat,
+// Gather, Split, Transpose, Expand). They model fp32/int32 (1 value per uint
+// word) or fp16 (2 per word), with int64 on a dedicated pipeline; none has a
+// build for a <= 1-byte-per-element payload, which would be copied 4-per-word
+// and mis-sliced silently. Throws for int8/bool/fp8/4-bit so a byte-typed cache
+// tensor cannot reach one of these movers without a real byte build existing.
+void require_word_movable_elem(ElemKind kind, const char *op);
+
 // Parse a model file's dtype string and demand a format the runtime computes
 // on. Throws when the string names nothing vkop knows, and when it names a
 // format that is recognized but has no kernel — the second case is what a

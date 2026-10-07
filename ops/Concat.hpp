@@ -368,6 +368,16 @@ class ConcatBuffer : public BufferFactory {
             out_shape[axis_] += s[axis_];
         }
 
+        // Fail closed on a <= 1-byte payload on any input or the output: the
+        // word-mover concat has no byte build (see
+        // core::require_word_movable_elem), so an fp8/int8/bool concat would
+        // mis-slice silently. int64 is fine — it has its own concat_int64 path
+        // below.
+        for (const auto &in : inputs) {
+            core::require_word_movable_elem(in->elem_kind(), "Concat");
+        }
+        core::require_word_movable_elem(outputs[0]->elem_kind(), "Concat");
+
         // int64 concat: GPU shader path (concat_int64.comp). Previously this
         // was a synchronous CPU path (copyToCPU per input + host strided-copy
         // loop + copyToGPU = N+1 sync stalls, ~1940ms/round — the #1 decode

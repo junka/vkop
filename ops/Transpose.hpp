@@ -120,6 +120,11 @@ class TransposeBuffer : public BufferFactory {
             outshape[i] = inshape[perm_[i]];
         }
 
+        // Fail closed on a <= 1-byte payload: no byte build in this mover (an
+        // fp8/int8/bool transpose would mis-gather 4-per-word). int64 takes the
+        // CPU permute below.
+        core::require_word_movable_elem(inputs[0]->elem_kind(), "Transpose");
+
         // int64 transpose: CPU permute (the single instance feeds NonZero,
         // part of the shape meta-chain).
         if (inputs[0]->dtype() == typeid(int64_t)) {

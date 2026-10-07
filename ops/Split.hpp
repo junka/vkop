@@ -183,6 +183,11 @@ class SplitBuffer : public BufferFactory {
         }
 
         auto in_shape = inputs[0]->getShape();
+        // Fail closed on a <= 1-byte payload: no byte build in this mover.
+        core::require_word_movable_elem(inputs[0]->elem_kind(), "Split");
+        for (const auto &o : outputs) {
+            core::require_word_movable_elem(o->elem_kind(), "Split");
+        }
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             bind_ssbo<T>(inputs[0], /*is_output=*/false);

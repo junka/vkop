@@ -137,6 +137,8 @@ class Expand : public Operator {
 
         std::vector<int> inshape = inputs[0]->getShape();
         std::vector<int> out_shape = outputs[0]->getShape();
+        // Fail closed on a <= 1-byte data payload: no byte build in this mover.
+        core::require_word_movable_elem(inputs[0]->elem_kind(), "Expand");
         if (out_shape.size() == 0) {
             dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);

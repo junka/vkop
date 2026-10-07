@@ -34,6 +34,12 @@ fuse_rotary_embedding pattern 都按半切约定实现，所以这里把交错�
 `rope_type=default`（无 longrope/llama3 那种数据相关分支），inv_freq 常量，
 attention_scaling 1.0 —— 脚本在导出前逐条断言，不接受「大概是默认」这类假设。
 
+注意力**不按 HF 那样 repeat_kv 展开 K/V**，而是把同一组的 g 个 q 头并进矩阵乘的
+m 维（`attention_gqa`，导出前用 `_selfcheck_gqa` 断言两条路等价）。展开在图上等于
+每步 decode 重写 g 倍历史长度 fp16（GLM 是 56 个 Expand），实测是 ms/token 随
+past_len 线性增长的主要来源之一。代价是 attention_bias 要沿 q 轴平铺 g 份
+（比 K/V 的展开小两个数量级），以及 q/out 各多一次 5-D permute 的搬数。
+
 用法:
   python3 glm_edge_export_onnx.py            # → text_glm_edge/llm.onnx + llm.weights.bin
   MODEL_PATH=/path/to/glm-edge-1.5b-chat EXPORT_PATH=llm.onnx python3 glm_edge_export_onnx.py
@@ -187,6 +193,71 @@ def _selfcheck_rope():
 
 _selfcheck_rope()
 
+
+# ---------------------------------------------------------------------------
+# GQA 注意力：K/V 一份都不复制，把同组的 q 头并进矩阵乘的 m 维
+# ---------------------------------------------------------------------------
+def attention_gqa(q, k, v, attention_bias, scaling, num_kv_groups):
+    """与「repeat_kv 后再算」等价的注意力，返回 (B, q_len, nq*head_dim)。
+
+    HF 的 repeat_kv(k, g) 把每组 K/V 展开成 nq 份 —— 在图上就是每步 decode 都要
+    整段重写 g 倍历史长度的 fp16（GLM 的图里是 56 个 Expand）。但同一 kv 头对这
+    g 个 q 头本来就是同一份 K/V，所以把这 g 个 q 头并进 m 维即可：
+        q (B, nq, q, hd) -> (B, nkv, g*q, hd)     # h = kv*g + j，正是 repeat_kv 的头序
+    每个输出元素读的 K/V 数值不变，变的只是 GEMM 的 m 维从 q_len 变成 g*q_len，
+    于是 fp32 累加顺序可能不同（fp16 下是最后几位），不是数学差异。
+    """
+    B, nq, q_len, hd = q.shape
+    nkv = k.shape[1]
+    kv_len = k.shape[2]
+    q_g = q.reshape(B, nkv, num_kv_groups * q_len, hd)
+    # 与 HF 的 eager_attention_forward 同序：先 matmul、再 *scaling、再 +bias
+    scores = torch.matmul(q_g, k.transpose(2, 3)) * scaling
+    # scores 的行是 (group, query) 合并的，group 在外层，所以 bias 要平铺 g 份
+    bias = attention_bias.unsqueeze(2).expand(
+        B, 1, num_kv_groups, q_len, kv_len).reshape(
+        B, 1, num_kv_groups * q_len, kv_len)
+    scores = scores + bias
+    w = torch.nn.functional.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = torch.matmul(w, v)                       # (B, nkv, g*q, hd)
+    out = out.reshape(B, nkv, num_kv_groups, q_len, hd)
+    return out.permute(0, 3, 1, 2, 4).reshape(B, q_len, nq * hd)
+
+
+def attention_repeat_kv(q, k, v, attention_bias, scaling, num_kv_groups):
+    """HF 原样（repeat_kv 展开 K/V），只用来自证上面那条路与它等价。"""
+    B, nq, q_len, hd = q.shape
+    k_r = repeat_kv(k, num_kv_groups)
+    v_r = repeat_kv(v, num_kv_groups)
+    scores = torch.matmul(q, k_r.transpose(2, 3)) * scaling
+    w = torch.nn.functional.softmax(
+        scores + attention_bias, dim=-1, dtype=torch.float32).to(q.dtype)
+    out = torch.matmul(w, v_r)
+    return out.transpose(1, 2).reshape(B, q_len, nq * hd)
+
+
+def _selfcheck_gqa():
+    """等价性必须是断言：随机 q/k/v + 真因果 bias，两条路在 fp16 下比。"""
+    torch.manual_seed(0)
+    g = NUM_KV_GROUPS
+    for B, S, KV in ((2, 7, 11), (1, 1, 32)):        # prefill 与 decode 两种形状
+        q = torch.randn(B, NUM_HEADS, S, HEAD_DIM, dtype=torch.float16)
+        k = torch.randn(B, NUM_KV_HEADS, KV, HEAD_DIM, dtype=torch.float16)
+        v = torch.randn(B, NUM_KV_HEADS, KV, HEAD_DIM, dtype=torch.float16)
+        causal = torch.triu(torch.full((S, KV), torch.finfo(torch.float16).min,
+                                      dtype=torch.float16), diagonal=1)
+        bias = causal.unsqueeze(0).unsqueeze(0)
+        a = attention_gqa(q, k, v, bias, SCALING, g)
+        b = attention_repeat_kv(q, k, v, bias, SCALING, g)
+        rel = ((a.float() - b.float()).abs().max()
+               / b.float().abs().max().clamp(min=1e-6)).item()
+        print(f"[gqa-check] B={B} q={S} kv={KV} bitwise_equal={torch.equal(a, b)} "
+              f"maxrel={rel:.3e}")
+        assert rel < 1e-3, "GQA 的 reshape 写法与 repeat_kv 不等价，不要继续导出"
+
+
+_selfcheck_gqa()
+
 lm = model.model
 embed_tokens = lm.embed_tokens
 layers = lm.layers
@@ -238,16 +309,9 @@ class GlmEdgeLLMOnnx(torch.nn.Module):
         k_new = torch.cat([past_k, k], dim=2)
         v_new = torch.cat([past_v, v], dim=2)
 
-        k_r = repeat_kv(k_new, self.num_kv_groups)
-        v_r = repeat_kv(v_new, self.num_kv_groups)
-
-        # attention（手写，与 eager_attention_forward 同序：先 *scaling 再 + mask）
-        attn_w = torch.matmul(q, k_r.transpose(2, 3)) * self.scaling
-        attn_w = attn_w + attention_bias
-        attn_w = torch.nn.functional.softmax(
-            attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn_w, v_r)
-        out = out.transpose(1, 2).reshape(B, q_len, self.num_heads * self.head_dim)
+        # GQA：不 repeat_kv（_selfcheck_gqa 已证等价），K/V 在图里只有一份
+        out = attention_gqa(q, k_new, v_new, attention_bias,
+                            self.scaling, self.num_kv_groups)
         out = attn.o_proj(out)
 
         hidden = residual + out

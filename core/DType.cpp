@@ -116,6 +116,28 @@ void require_float_elem(ElemKind kind, const char *op, const char *what) {
     }
 }
 
+// Guard for the buffer data-movement kernels — Slice/Concat/Gather/Split/
+// Transpose/Expand. They read and write whole uint words and model either one
+// element per word (fp32/int32) or two (fp16); int64 rides its own dedicated
+// pipeline. There is no build for a payload of one byte or fewer per element,
+// so such a tensor would be copied four values per word and mis-sliced with no
+// error — the exact silent wrong answer this guard exists to prevent. This
+// fires today for an int8/bool/fp8/4-bit tensor routed through a mover, and is
+// the precondition the fp8 KV cache must clear before its cache tensors can
+// flow.
+void require_word_movable_elem(ElemKind kind, const char *op) {
+    const int bits = elem_bits(kind);
+    if (bits > 0 && bits <= 8) {
+        std::string msg =
+            std::string("vkop: ") + op +
+            " is a word-granular buffer mover with no build for " +
+            elem_name(kind) +
+            " (<= 1 byte per element would be copied 4-per-word "
+            "and mis-sliced silently)";
+        throw std::runtime_error(msg);
+    }
+}
+
 ElemKind require_supported_elem(const std::string &name, const char *context) {
     const ElemKind kind = elem_kind_from_name(name);
     if (kind == ElemKind::kInvalid) {

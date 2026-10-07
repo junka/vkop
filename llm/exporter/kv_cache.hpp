@@ -10,8 +10,15 @@
 //     复用同一个 VkBuffer，不再每轮重分配几十 MB。
 //  2. reset_for_prefill()：把 past 的逻辑 kv_len 归零（整段重新 prefill 的
 //     语义），随后 upload() 把「空 past」真正传到 GPU。
-//  3. feedback()：present→past 的 device→device 拷贝（全部层记在同一个 command
-//     buffer 里，一次 wait），返回新的 past_len 供下一轮算位置/attention_bias。
+//  3. feedback()：present→past。两块 buffer 都按 max_kv 预分配、内容又正好是
+//     「本轮写出的历史 == 下一轮要读的历史」，所以交换两个张量的 VkBuffer 身份
+//     就够了，不需要每步把整段历史在设备里拷一遍（拷一次 = 每层 2×nkv×kv×hd
+//     字节 + 一次 submit/wait，随上下文线性增长）。
+//     实测（GLM-Edge，同一二进制两条路径、596 步逐位相同）：拷贝路径 feedback()
+//     每步 0.35~0.45ms，且 past_len 从 53 到 608 基本不涨 —— 被 submit/wait 的
+//     固定开销主导；swap 后 ~20µs（纯 host 改形状）。整步 42ms 里这 0.4ms 落在
+//     端到端噪声内，所以这里的收益是「去掉一个 O(past_len) 的每步 memcpy」这一
+//     结构性事实，而不是当前上下文长度上可测出的速度。
 //
 // 前缀续用（跨轮跳过已算 KV）的接口留在这里：需要 feedback() 之外再加一个
 // 「保留前缀、只补后面」的入口，并先有 token 前缀校验（Conversation::prefixMatch）。
@@ -73,46 +80,28 @@ public:
         }
     }
 
-    // present→past：全部层的拷贝记进一个 command buffer，一次 sync。返回新的
-    // past_len（下一轮的位置/attention_bias 都以它为准）。
+    // present→past：不再把整段历史在设备里拷一遍。两个张量都按 max_kv 预分配，
+    // 「present 的字节就是下一轮 past 的字节」这句话用交换 VkBuffer 来表达是免费的。
+    // 返回新的 past_len（下一轮的位置/attention_bias 都以它为准）。
     int feedback() {
-        auto dev = cmdpool_->getVulkanDevice();
-        // 先推出每层 kv_len 并 ResizeInput past（纯逻辑形状，buffer 走
-        // prealloc_keep_ 复用）。必须先做，因为 ResizeInput 会把 converted_
-        // 置 false，下面的 as_storage_buffer 才重新把 buffer 标给这次拷贝。
-        std::vector<int> kv_lens(nlayers_);
-        for (int i = 0; i < nlayers_; ++i) {
-            auto pres = core::as_tensor<uint16_t>(
-                rt_->GetOutput("present_key_values_" + std::to_string(i)));
-            const int kv_len = pres->num_elements() / (2 * nkv_ * hd_);
-            kv_lens[i] = kv_len;
-            rt_->ResizeInput("past_key_values_" + std::to_string(i),
-                             {1u, 2u, static_cast<uint32_t>(nkv_),
-                              static_cast<uint32_t>(kv_len),
-                              static_cast<uint32_t>(hd_)});
-        }
-        VulkanCommandBuffer cmd(cmdpool_);
-        cmd.begin();
         int past_len = 0;
         for (int i = 0; i < nlayers_; ++i) {
             auto pres = core::as_tensor<uint16_t>(
                 rt_->GetOutput("present_key_values_" + std::to_string(i)));
+            const int kv_len = pres->num_elements() / (2 * nkv_ * hd_);
+            // 先改逻辑形状（ResizeInput 会把 converted_ 置回 false，buffer 仍走
+            // prealloc_keep_ 复用），再换 buffer，最后把 past 标回「数据在 GPU 上」
+            // —— 换过来的那块装着本轮写出的历史，不需要任何上传。
+            rt_->ResizeInput("past_key_values_" + std::to_string(i),
+                             {1u, 2u, static_cast<uint32_t>(nkv_),
+                              static_cast<uint32_t>(kv_len),
+                              static_cast<uint32_t>(hd_)});
             auto past = core::as_tensor<uint16_t>(
                 rt_->GetInput("past_key_values_" + std::to_string(i)));
-            auto pres_buf = pres->as_storage_buffer(dev, nullptr);
-            auto past_buf = past->as_storage_buffer(dev, nullptr);
-            const VkDeviceSize copy_bytes = static_cast<VkDeviceSize>(
-                2 * nkv_ * kv_lens[i] * hd_ * sizeof(uint16_t));
-            if (copy_bytes == 0) continue;
-            pres_buf->transferReadBarrier(cmd.get(), copy_bytes, 0);
-            past_buf->copyStageBufferToBuffer(cmd.get(), pres_buf->getBuffer(), 0,
-                                             copy_bytes, 0);
+            past->swap_gpu_buffer_with(*pres);
             past->toGPU();
-            past_len = kv_lens[i];
+            past_len = kv_len;
         }
-        cmd.end();
-        cmd.submit(dev->getComputeQueue());
-        cmd.wait();
         return past_len;
     }
 

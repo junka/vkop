@@ -9,7 +9,7 @@ import onnx
 from onnx import numpy_helper
 
 try:
-    from .dag import DAGBasedModel, Node
+    from .dag import DAGBasedModel, Node, _DATA_TYPE_MAP
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -19,7 +19,7 @@ try:
         Unifier,
     )
 except ImportError:
-    from dag import DAGBasedModel, Node
+    from dag import DAGBasedModel, Node, _DATA_TYPE_MAP
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -28,6 +28,26 @@ except ImportError:
         RGBAConverter,
         Unifier,
     )
+
+
+# Graph inputs and outputs are the model's I/O contract, so their dtype is
+# resolved against the same table initializers use (writer and reader must agree
+# on the spelling — see dag._DATA_TYPE_MAP) and an element format missing from
+# it is a HARD error, not the old silent "". The C++ loader reads an empty
+# ShapeRef.dtype as "historical fp16" (core/runtime.cpp), which would store a
+# quantized fp8 KV cache at I/O as half-precision and read every byte wrong with
+# nothing to trace it to at load or run time. Raising by default is what keeps a
+# format we have no name for from laundering into fp16; a format that has a name
+# but no kernel yet still has to clear the loader's own per-format gate.
+def _io_dtype_name(elem_type, what):
+    name = _DATA_TYPE_MAP.get(int(elem_type))
+    if name is None:
+        raise ValueError(
+            f"vkop: {what} has ONNX elem_type {int(elem_type)}, which has no "
+            f"dtype name in the converter's table; refusing to emit it so the "
+            f"loader cannot silently read it as fp16."
+        )
+    return name
 
 
 class ModelConverter:
@@ -82,11 +102,8 @@ class ModelConverter:
                 dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
                 else -1 for dim in tensor_type.shape.dim
             ]
-            dtype_str = {
-                1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
-                6: "int32", 7: "int64", 9: "bool", 10: "float16",
-                11: "float64", 16: "bfloat16",
-            }.get(tensor_type.elem_type, "")
+            dtype_str = _io_dtype_name(
+                tensor_type.elem_type, f"graph input {inp.name}")
             print("Graph input:", inp.name, "of shape:", shape_dims, "tensor type:", tensor_type.elem_type)
             dag_model.inputs.append({"name": inp.name, "shape": shape_dims, "dtype": dtype_str})
 
@@ -97,11 +114,8 @@ class ModelConverter:
                 dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
                 else -1 for dim in tensor_type.shape.dim
             ]
-            dtype_str = {
-                1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
-                6: "int32", 7: "int64", 9: "bool", 10: "float16",
-                11: "float64", 16: "bfloat16",
-            }.get(tensor_type.elem_type, "")
+            dtype_str = _io_dtype_name(
+                tensor_type.elem_type, f"graph output {out.name}")
             print("Graph output:", out.name, "of shape:", shape_dims)
             dag_model.outputs.append({"name": out.name, "shape": shape_dims, "dtype": dtype_str})
 

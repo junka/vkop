@@ -194,6 +194,12 @@ class SliceBuffer : public BufferFactory {
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 
+        // Fail closed on a <= 1-byte payload: this mover has no byte build (see
+        // core::require_word_movable_elem), so an fp8/int8/bool slice would
+        // copy 4-per-word and mis-slice silently. int64 is fine — it takes the
+        // host slice below.
+        core::require_word_movable_elem(inputs[0]->elem_kind(), "Slice");
+
         // The shader build is fixed at construction, so the live dtype has to
         // match it: packed half2 read as float bits (or the reverse) is silent
         // garbage. int64 data always takes the host slice below, so it must
