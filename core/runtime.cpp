@@ -442,12 +442,13 @@ void Runtime::LoadModel() {
             t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);
         } else if (elem_kind_packed(kind)) {
-            // int4 / nf4 weight-only payloads: two values per byte, so the
-            // tensor's byte count is elem_bytes(kind, prod(dims)) — which
-            // check_initializer_payload() has just proven matches what the file
-            // recorded — while dims stay the logical [K, N] (or [N, K]) matrix
-            // the kernel indexes. The int8_t container holds raw bytes; only
-            // the kernel's nibble unpack knows a value is half a slot.
+            // int4 / nf4 / float4e2m1 weight-only payloads: two values per
+            // byte, so the tensor's byte count is elem_bytes(kind, prod(dims))
+            // — which check_initializer_payload() has just proven matches what
+            // the file recorded — while dims stay the logical [K, N] (or [N,
+            // K]) matrix the kernel indexes. The int8_t container holds raw
+            // bytes; only the kernel's nibble unpack knows a value is half a
+            // slot.
             size_t elements = 1;
             for (uint32_t d : init.dims) {
                 elements *= d;

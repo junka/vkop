@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
 #include <tuple>
 #include <vector>
@@ -689,6 +690,302 @@ void run_matmul_w4(
         }
     }
 }
+
+// NVFP4's nibble, decoded the way the buffer kernel does it: the magnitude
+// field's exponent and mantissa slid into an fp32's, with only exponent 0 on the
+// subnormal term. Restated from the shader's expression rather than read from a
+// grid table, so this checks the kernel's arithmetic instead of agreeing with it
+// twice.
+static float e2m1_bits(uint32_t c) {
+    const uint32_t m = c & 7u;
+    float v;
+    if (m > 1u) {
+        const uint32_t bits = (((m + 252u) >> 1u) << 23u) | ((m & 1u) << 22u);
+        std::memcpy(&v, &bits, sizeof(v));
+    } else {
+        v = static_cast<float>(m) * 0.5F;
+    }
+    return (c & 8u) != 0u ? -v : v;
+}
+
+// The same nibble's encoding, from libm's round-to-nearest-even instead of
+// numpy's: exponent from repeated halving, one mantissa bit rounded out of the
+// [1,2) significand, a carry bumping the exponent and clearing it. Below 1.0 the
+// grid is the subnormal step 0.5, and a carry there lands on the smallest normal
+// on its own (2 * 0.5 IS 1.0), so no extra case.
+static uint32_t e2m1_encode(float v) {
+    const uint32_t sign = std::signbit(v) ? 8u : 0u;
+    const float a = std::fabs(v);
+    if (a < 1.0F) return sign | static_cast<uint32_t>(std::nearbyint(a * 2.0F));
+    int e = 0;
+    float q = a;
+    while (q >= 2.0F) {
+        q *= 0.5F;
+        ++e;
+    }
+    float mb = std::nearbyint((q - 1.0F) * 2.0F);
+    if (mb > 1.5F) {
+        mb = 0.0F;
+        ++e;
+    }
+    return sign | (static_cast<uint32_t>(e + 1) << 1) |
+           static_cast<uint32_t>(mb);
+}
+
+// 4-bit weight-only MatMul with NVFP4's two scale levels (buffer backend). B is
+// an E2M1 nibble payload like int4's, but the dequant table is one fp8 E4M3 byte
+// per (16-value block of K, output column) and the tensor has one fp32 factor on
+// top, so the graph carries FOUR inputs:
+//   nvfp4 : [A, B_4bit, block_scale(n_blocks * N, fp8), global_scale(1, fp32)]
+// The factor is the absmax of the whole weight over 448 * 6, which puts the
+// largest block's scale exactly on e4m3's top byte — the reason one byte can
+// cover a block at all. A block's taps are summed before its scale, so the
+// reference dequantizes the same way.
+template <typename T>
+class MatMulNvfp4Test : public TestCase<T> {
+  public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<int8_t>> weight;
+    std::shared_ptr<Tensor<int8_t>> block_scale;
+    std::shared_ptr<Tensor<float>> global_scale;
+    std::shared_ptr<Tensor<T>> output;
+    // How many codes the block-scale rounding pushed past the grid's top, and how
+    // many block scales landed in e4m3's subnormal band or on zero, so a case can
+    // prove it exercised those arms rather than assuming a distribution did.
+    int saturated_ = 0;
+    int subnormal_scales_ = 0;
+    int dead_blocks_ = 0;
+
+    MatMulNvfp4Test(int batch, int m, int k, int n, bool batched_b = false,
+                    bool wide = false)
+        : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
+          batched_b_(batched_b), wide_(wide) {
+        attr = {{"transB", "0"}};
+        initTestData();
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &output,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<T>(output);
+        auto exp = vkop::core::as_tensor<T>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            const float ov = to_float((*out)[i]);
+            const float ev = to_float((*exp)[i]);
+            if (std::isnan(ov)) {
+                LOG_ERROR("nvfp4 MatMul NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            const float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("nvfp4 MatMul Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    static constexpr int kBlock = 16;
+
+    int batch_, m_, k_, n_;
+    bool batched_b_, wide_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(42);
+
+        const int n_blocks = k_ / kBlock;
+        std::vector<int64_t> a_shape = shape({batch_, m_, k_});
+        auto a = store(torch::randn(a_shape, f32));
+
+        auto w_src = torch::randn({k_, n_}, f32);
+        if (wide_) {
+            // A spread of decades ACROSS the K blocks of a column, so the
+            // tensor-wide factor leaves some blocks with a scale below e4m3's
+            // smallest normal and some with none at all. Neither arm is reachable
+            // on randn weights, and the second one is the format's own way of
+            // erasing a block, so it has to be exercised and counted rather than
+            // assumed away.
+            const int n_blocks_spread = k_ / kBlock;
+            w_src = w_src.reshape({n_blocks_spread, kBlock, n_}) *
+                    torch::pow(10.0, torch::rand({n_blocks_spread, 1, n_}, f32) *
+                                            -7.0)
+                        .reshape({n_blocks_spread, 1, n_});
+            w_src = w_src.reshape({k_, n_});
+        }
+        auto w3 = w_src.reshape({n_blocks, kBlock, n_});
+        const float amax_t = w_src.abs().max().item<float>();
+        const float g = amax_t / (448.0F * 6.0F);
+        auto amax_b = std::get<0>(w3.abs().max(1, true)); // [n_blocks, 1, N]
+        // The block scale as the format stores it: e4m3 rounded, so torch's own
+        // cast is the oracle for the converter's hand-written encoder.
+        auto s_real = amax_b / (6.0F * g);
+        auto s8 = s_real.to(c10::ScalarType::Float8_e4m3fn);
+        auto s_eff = s8.to(torch::kFloat32) * g; // [n_blocks, 1, N]
+        // A block scale that rounds to zero erases its block — the format's own
+        // answer, which the wide cases below reach. Dividing by it would be a
+        // nan, so encode against a stand-in: the dequantized product is zero
+        // either way, and that is what both the kernel and this oracle give.
+        auto divide_by = torch::where(s_eff == 0, torch::ones_like(s_eff), s_eff);
+        {
+            // What the two arms of the format's own scale grid did, counted here
+            // so a wide case can assert it reached them: e4m3's smallest normal is
+            // 2^-6, below it a scale is a multiple of 2^-9, and under half that
+            // the byte is zero and the block it covers decodes to nothing.
+            auto sv = s8.to(torch::kFloat32).reshape({-1}).cpu();
+            auto av = amax_b.reshape({-1}).cpu();
+            auto *sp = sv.data_ptr<float>();
+            auto *ap = av.data_ptr<float>();
+            for (int64_t i = 0; i < sv.numel(); i++) {
+                const float mag = std::fabs(sp[i]);
+                if (mag > 0.0F && mag < 1.0F / 64.0F)
+                    subnormal_scales_++;
+                if (mag == 0.0F && ap[i] > 0.0F)
+                    dead_blocks_++;
+            }
+        }
+        auto codes3 = torch::empty(
+            {n_blocks, kBlock, n_},
+            torch::TensorOptions().dtype(torch::kUInt8));
+        auto *cd = codes3.data_ptr<uint8_t>();
+        {
+            // Count on the ratio, before the clip: a block whose byte rounded down
+            // leaves its own absmax above the grid's top, and that is the saturation
+            // the case is meant to have exercised. A value that merely equals 6.0 is
+            // on the grid and encodes without clipping.
+            auto norm = w3 / divide_by;
+            auto cpu_norm = norm.cpu().contiguous();
+            auto acc = cpu_norm.accessor<float, 3>();
+            for (int b = 0; b < n_blocks; b++)
+                for (int i = 0; i < kBlock; i++)
+                    for (int j = 0; j < n_; j++) {
+                        const float v = acc[b][i][j];
+                        if (std::fabs(v) > 6.0F)
+                            saturated_++;
+                        cd[(b * kBlock + i) * n_ + j] =
+                            static_cast<uint8_t>(e2m1_encode(
+                                std::max(-6.0F, std::min(6.0F, v))));
+                    }
+        }
+        auto deq3 = codes3.to(torch::kFloat32);
+        {
+            // Decode through the kernel's bit arithmetic, not the nibble itself.
+            auto *p = deq3.data_ptr<float>();
+            for (int64_t i = 0; i < deq3.numel(); i++)
+                p[i] = e2m1_bits(cd[i]);
+        }
+        deq3 = deq3 * s_eff;
+        auto deq = deq3.reshape({k_, n_});
+        auto y = torch::matmul(a.to(torch::kFloat32), deq);
+
+        inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
+        this->fillTensorFromTorch(inputa, a);
+
+        // Pack the CODES nibble-wise: element i in byte i/2, low nibble for even
+        // i. A batched weight repeats the same matrix, so its bytes repeat.
+        const int64_t values = k_ * static_cast<int64_t>(n_);
+        std::vector<int8_t> bytes(static_cast<size_t>((values + 1) / 2), 0);
+        for (int64_t i = 0; i < values; i += 2) {
+            const uint32_t lo = cd[i] & 0xFu;
+            const uint32_t hi =
+                i + 1 < values ? (cd[i + 1] & 0xFu) : 0u;
+            bytes[static_cast<size_t>(i / 2)] =
+                static_cast<int8_t>(lo | (hi << 4));
+        }
+        std::vector<int8_t> wbytes = bytes;
+        if (batched_b_) {
+            for (int i = 1; i < batch_; i++)
+                wbytes.insert(wbytes.end(), bytes.begin(), bytes.end());
+        }
+        std::vector<int> w_ints = to_ints(shape(
+            batched_b_ ? std::vector<int64_t>{batch_, k_, n_}
+                       : std::vector<int64_t>{k_, n_}));
+        weight = std::make_shared<Tensor<int8_t>>(w_ints);
+        // int8_t is the container, not the element type: the kernel has to be
+        // told its nibble is an E2M1 code and not an int4 value or an NF4 index.
+        weight->set_elem_kind(vkop::core::ElemKind::kFloat4E2M1);
+        weight->set_payload_bytes(static_cast<int>(wbytes.size()));
+        weight->fillToCPU(wbytes);
+
+        // The block scale table travels as the bytes torch just wrote, one per
+        // (block, column) row-major — the same view the kernel reads four of them
+        // out of one word.
+        auto cpu_s8 =
+            s8.view(c10::ScalarType::Char).cpu().contiguous().flatten();
+        auto *sptr = cpu_s8.data_ptr<int8_t>();
+        std::vector<int8_t> sbytes(sptr, sptr + cpu_s8.numel());
+        block_scale = std::make_shared<Tensor<int8_t>>(
+            std::vector<int>{n_blocks * n_});
+        block_scale->set_elem_kind(vkop::core::ElemKind::kFloat8E4M3FN);
+        block_scale->fillToCPU(sbytes);
+
+        global_scale = std::make_shared<Tensor<float>>(std::vector<int>{1});
+        global_scale->fillToCPU(std::vector<float>{g});
+
+        output = std::make_shared<Tensor<T>>(to_ints(y.sizes().vec()));
+        this->fillTensorFromTorch(output, store(y));
+
+        LOG_INFO("nvfp4 MatMul batch %d, M %d, N %d, K %d, blocks %d, batched "
+                 "B %d, wide %d, fp16 %d, %d saturated, %d subnormal scales, "
+                 "%d dead blocks",
+                 batch_, m_, n_, k_, n_blocks, batched_b_ ? 1 : 0,
+                 wide_ ? 1 : 0, std::is_same_v<T, uint16_t> ? 1 : 0, saturated_,
+                 subnormal_scales_, dead_blocks_);
+    }
+
+    static std::vector<int64_t> shape(const std::vector<int64_t> &s) {
+        if (s.size() == 3 && s[0] == 1) {
+            return {s[1], s[2]};
+        }
+        return s;
+    }
+
+    static std::vector<int> to_ints(const std::vector<int64_t> &s) {
+        return std::vector<int>(s.begin(), s.end());
+    }
+};
+
+template <typename T>
+void run_matmul_nvfp4(
+    const std::vector<std::tuple<int, int, int, int, bool, bool>> &cases) {
+    for (const auto &tc : cases) {
+        auto [batch, m, k, n, batched_b, wide] = tc;
+        MatMulNvfp4Test<T> t(batch, m, k, n, batched_b, wide);
+        if (wide) {
+            // A wide case that reached neither arm would test the same thing an
+            // ordinary one does and leave its comment's claim unbacked.
+            EXPECT_GT(t.subnormal_scales_, 0);
+            EXPECT_GT(t.dead_blocks_, 0);
+        }
+        EXPECT_GT(t.saturated_, 0) << "no value saturated, so the grid's top "
+                                      "arm was never read";
+        EXPECT_TRUE(t.run_test(
+            {t.inputa, t.weight, t.block_scale, t.global_scale}, {t.output},
+            [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute(t.attr);
+            }));
+    }
+}
 } // namespace
 
 TEST(MatMulTest, MatMulInt4Nf4WeightOnlyBuffer) {
@@ -757,8 +1054,134 @@ TEST(MatMulTest, MatMulInt4ContractThrows) {
     }
 }
 
-TEST(MatMulTest, MatMulSplitKGemvBuffer) {
+TEST(MatMulTest, MatMulNvfp4WeightOnlyBuffer) {
     vkop::tests::ScopedBufferBackend buffer;
+    // The block is fixed at 16, so the edges are the same ones the split-K GEMV
+    // and the quad kernel care about: K below / at / above the 16 slices a
+    // workgroup hands out, a partial last 16-quad block, more than one A row, a
+    // materialized broadcast batch, and a weight spread across decades so the
+    // fp8 scale table reaches its own subnormal and zero arms.
+    const std::vector<std::tuple<int, int, int, int, bool, bool>> cases = {
+        {1, 4, 32, 16, false, false},    // 2 blocks, prefill-shaped M
+        {1, 1, 128, 64, false, false},   // decode: 8 blocks over 16 slices
+        {1, 1, 256, 64, false, false},   // decode: exactly 16 blocks
+        {1, 1, 512, 64, false, false},   // decode: 32 blocks, 2 per slice
+        {1, 1, 320, 104, false, false},  // partial last 16-quad block
+        {1, 3, 96, 24, false, false},    // 6 blocks, N not a multiple of 16
+        {2, 1, 128, 32, true, false},    // broadcast batch
+        {1, 16, 64, 16, false, false},   // 4 blocks, large M
+        {2, 4, 64, 16, true, false},     // materialized broadcast weight
+        {1, 4, 64, 16, false, true},     // decades-wide: subnormal + dead scales
+    };
+    LOG_INFO("nvfp4 MatMul, FP32");
+    run_matmul_nvfp4<float>(cases);
+    LOG_INFO("nvfp4 MatMul, FP16");
+    run_matmul_nvfp4<uint16_t>(cases);
+}
+
+// NVFP4's own contract, on top of the shared 4-bit gates: four inputs, an e4m3
+// block table, a single fp32 factor, and a table whose row count says 16 values
+// per block. A graph that breaks one of these is a different format, and reading
+// it as this one would apply every scale to the wrong span of values.
+TEST(MatMulTest, MatMulNvfp4ContractThrows) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const int kBlock = 16;
+    {
+        // The global factor missing: a three-input graph is int4's convention.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, t.block_scale}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+    {
+        // A block scale left as fp32 costs four bytes where the format promises
+        // one, so the byte count the kernel walks would be wrong fourfold.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        const int n_blocks = 32 / kBlock;
+        auto fp32_scales = std::make_shared<Tensor<float>>(
+            std::vector<int>{n_blocks * 16});
+        fp32_scales->fillToCPU(
+            std::vector<float>(static_cast<size_t>(n_blocks * 16), 1.0F));
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, fp32_scales, t.global_scale}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+    {
+        // The factor is not a byte: it is the one fp32 that lets the table be
+        // bytes at all, so an fp8 or half here is a mislabeled graph.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, t.block_scale, t.block_scale}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+    {
+        // More than one fp32 where the format defines exactly one.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        auto two_floats = std::make_shared<Tensor<float>>(std::vector<int>{2});
+        two_floats->fillToCPU(std::vector<float>{1.0F, 1.0F});
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, t.block_scale, two_floats}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+    {
+        // A table that says 32 values per block: the row count divides K and the
+        // columns cleanly, so only the format's own block length can reject it.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        auto half_table = std::make_shared<Tensor<int8_t>>(
+            std::vector<int>{16});
+        half_table->set_elem_kind(vkop::core::ElemKind::kFloat8E4M3FN);
+        half_table->fillToCPU(std::vector<int8_t>(16, 0x3c));
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, half_table, t.global_scale}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+    {
+        MatMulNvfp4Test<float> t(1, 4, 32, 12); // N % 8 != 0
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, t.block_scale, t.global_scale}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+    {
+        // 48 bytes over 16 columns says 1.5 blocks of 16 for K = 24... which no
+        // grouping produced, and 32 % 3 is not a block: the row count has to
+        // divide K before the block length can even be asked about.
+        MatMulNvfp4Test<float> t(1, 4, 32, 16);
+        auto ragged = std::make_shared<Tensor<int8_t>>(std::vector<int>{48});
+        ragged->set_elem_kind(vkop::core::ElemKind::kFloat8E4M3FN);
+        ragged->fillToCPU(std::vector<int8_t>(48, 0x3c));
+        EXPECT_THROW(
+            t.run_test(
+                {t.inputa, t.weight, ragged, t.global_scale}, {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    op->setAttribute(t.attr);
+                }),
+            std::runtime_error);
+    }
+}
+
+TEST(MatMulTest, MatMulSplitKGemvBuffer) {
     // Decode-shaped calls (one A row, long K), where the kernel splits K across
     // the workgroup lanes the single row leaves idle. The cases are chosen to
     // cover the slicing edges rather than more sizes: K a multiple of 16 slices,

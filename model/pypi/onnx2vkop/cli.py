@@ -29,6 +29,7 @@ Examples:
   onnx2vkop -i model.onnx -q fp8e4m3
   onnx2vkop -i model.onnx -q int4 --group-size 64
   onnx2vkop -i model.onnx -q nf4
+  onnx2vkop -i model.onnx -q nvfp4
 
   # With all optimizations
   onnx2vkop -i model.onnx -u -r -b 4
@@ -41,15 +42,18 @@ Examples:
     )
     parser.add_argument(
         "-q", "--quant", choices=["fp16", "int8", "fp8e4m3", "fp8e5m2",
-                                  "int4", "nf4"],
+                                  "int4", "nf4", "nvfp4"],
         help="Quantization type: fp16, int8 (per-column scale), an fp8 "
              "weight-only MatMul payload with a per-column scale (e4m3 or e5m2, "
              "one byte per value), or a 4-bit weight-only MatMul payload with a "
-             "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index)",
+             "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index, "
+             "nvfp4 = E2M1 nibble with an fp8 e4m3 scale per 16 values plus a "
+             "per-tensor fp32 factor)",
     )
     parser.add_argument(
         "--group-size", type=int, default=64,
-        help="Values of K sharing one fp32 scale for -q int4/nf4 (default: 64)",
+        help="Values of K sharing one fp32 scale for -q int4/nf4 (default: 64). "
+             "-q nvfp4 ignores it: its block is fixed at 16 values.",
     )
     parser.add_argument(
         "-u", "--unify", action="store_true", help="Convert initializers to a single memory block"

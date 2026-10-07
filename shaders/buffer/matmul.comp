@@ -43,12 +43,19 @@ layout(set = 0, binding = 3) buffer Scratch {
 // Per-output-column dequant scale for a quantized weight-only B (binding 4),
 // inert otherwise. int8 and fp8 store scale = absmax / the format's largest
 // finite value (127, 448, 57344) per column as fp32; the 4-bit formats store one
-// scale per (K group, column) as fp32, laid out [n_groups, N] row-major so a
-// thread's columns of one group are contiguous. MatMulBuffer refuses any other
-// scale format or count.
+// scale per (K group, column), laid out [n_groups, N] row-major so a
+// thread's columns of one group are contiguous -- as fp32 for int4 and nf4, as
+// fp8 e4m3 bytes for NVFP4 (one byte per 16-value block, times uGlobal).
+// MatMulBuffer refuses any other scale format or count.
 layout(set = 0, binding = 4) readonly buffer Scale {
     uint data[];
 } uScale;
+// NVFP4's second scale level: one fp32 factor for the whole tensor, held as a
+// 1-element input so it travels with the weight instead of being a readback.
+// Inert for every other format (the host binds a dummy).
+layout(set = 0, binding = 5) readonly buffer GlobalScale {
+    uint data[];
+} uGlobal;
 
 layout(push_constant) uniform PC {
     int M;
@@ -79,6 +86,9 @@ layout(push_constant) uniform PC {
                 // and same kernels as int8.
     int e5m2;   // 1 = the fp8 bytes are E5M2 (5 exponent, 2 mantissa bits)
                 // instead of E4M3. Only meaningful with fp8.
+    int nvfp4;  // 1 = a w4 payload whose nibble is an E2M1 code, scaled by an
+                // e4m3 byte per (16-value K block, column) at binding 4 and one
+                // fp32 per-tensor factor at binding 5. Also fixes group to 16.
 } uPC;
 
 #ifdef FP16
@@ -118,18 +128,24 @@ float w8_val(uint b) { return float(b ^ 0x80u) - 128.0; }
 // deliberately not decoded: a quantized weight cannot reach them, since the
 // converter divides by the column absmax over that largest finite value and
 // clips to it.
-float f8_val(uint b) {
+//
+// e4m3 is also what NVFP4's block scale is stored as (see scale4), so it stands
+// on its own rather than living inside the fp8-weight branch.
+float e4m3_val(uint b) {
     uint m = b & 0x7Fu;
-    float v;
-    if (uPC.e5m2 != 0) {
-        v = m > 3u ? uintBitsToFloat((m + 448u) << 21u)
-                   : float(m) * 1.52587890625e-05;
-    } else {
-        v = m > 7u ? uintBitsToFloat((m + 960u) << 20u)
-                   : float(m) * 0.001953125;
-    }
+    float v =
+        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
     return (b & 0x80u) != 0u ? -v : v;
 }
+
+float e5m2_val(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 3u ? uintBitsToFloat((m + 448u) << 21u) : float(m) * 1.52587890625e-05;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+float f8_val(uint b) { return uPC.e5m2 != 0 ? e5m2_val(b) : e4m3_val(b); }
 
 float w_val(uint b) { return uPC.fp8 != 0 ? f8_val(b) : w8_val(b); }
 
@@ -172,8 +188,30 @@ float w4_val(uint word, int e) {
     return float(bitfieldExtract(int(word), e * 4, 4));
 }
 
+// One E2M1 nibble -- sign, 2 exponent bits, 1 mantissa bit -- so its eight
+// magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. Same field slide as fp8: with the
+// sign stripped, a normal code is an fp32 whose exponent is (code >> 1) - 1 and
+// whose mantissa is the low bit, i.e. bits = ((code + 252) >> 1) << 23 with the
+// mantissa bit at 1 << 22. `(code + 252) >> 1` is bias-adjusted for both
+// mantissas of a pair, so one expression covers the whole normal range; only
+// exponent 0 needs its own term, where the value is a multiple of the subnormal
+// step 2^-1. There is no Inf or NaN encoding: all 16 nibbles are values.
+float e2m1_val(uint c) {
+    uint m = c & 7u;
+    float v = m > 1u
+                  ? uintBitsToFloat((((m + 252u) >> 1u) << 23u) |
+                                    ((m & 1u) << 22u))
+                  : float(m) * 0.5;
+    return (c & 8u) != 0u ? -v : v;
+}
+
 // Four consecutive 4-bit weights starting at nibble `base` (0 or 4) of a word.
 vec4 unpack_w4(uint word, int base) {
+    if (uPC.nvfp4 != 0) {
+        word >>= base * 4;
+        return vec4(e2m1_val(word & 15u), e2m1_val((word >> 4) & 15u),
+                    e2m1_val((word >> 8) & 15u), e2m1_val(word >> 12));
+    }
     if (uPC.nf4 != 0) {
         word >>= base * 4;
         return vec4(nf4_code(int(word & 15u)), nf4_code(int((word >> 4) & 15u)),
@@ -188,16 +226,39 @@ vec4 unpack_w4(uint word, int base) {
 float unpack_w4_at(int idx) {
     uint word = uInputB.data[idx >> 3];
     int e = idx & 7;
+    if (uPC.nvfp4 != 0) return e2m1_val((word >> (e * 4)) & 15u);
     return uPC.nf4 != 0 ? nf4_code(int((word >> (e * 4)) & 15u))
                         : w4_val(word, e);
 }
 
+// The fp32 factor NVFP4 multiplies every block scale by: the one level the
+// format carries per tensor rather than per block.
+float global_scale() { return uintBitsToFloat(uGlobal.data[0]); }
+
 // This thread's four column scales of one K group.
 vec4 scale4(int sw) {
+    if (uPC.nvfp4 != 0) {
+        // Four adjacent columns' e4m3 block scales are one word: sw is a
+        // multiple of 4 because a thread's column start is, and every group row
+        // starts 4-aligned because N % 8 == 0.
+        uint w = uScale.data[sw >> 2];
+        return vec4(e4m3_val(w & 0xFFu), e4m3_val((w >> 8) & 0xFFu),
+                    e4m3_val((w >> 16) & 0xFFu), e4m3_val(w >> 24)) *
+               global_scale();
+    }
     return vec4(uintBitsToFloat(uScale.data[sw]),
                 uintBitsToFloat(uScale.data[sw + 1]),
                 uintBitsToFloat(uScale.data[sw + 2]),
                 uintBitsToFloat(uScale.data[sw + 3]));
+}
+
+// One column's group scale, for the fp32 build's per-element path.
+float scale1(int sw) {
+    if (uPC.nvfp4 != 0) {
+        return e4m3_val((uScale.data[sw >> 2] >> ((sw & 3) * 8)) & 0xFFu) *
+               global_scale();
+    }
+    return uintBitsToFloat(uScale.data[sw]);
 }
 
 #ifdef FP16
@@ -822,7 +883,7 @@ void matmul_w4() {
             acc += load_a(a_base + i * uPC.K + k) *
                    unpack_w4_at(b_base + k * uPC.N + j);
         }
-        total += acc * uintBitsToFloat(uScale.data[g * uPC.N + j]);
+        total += acc * scale1(g * uPC.N + j);
     }
 
     W8_STORE(n * uPC.M * uPC.N + i * uPC.N + j, total);

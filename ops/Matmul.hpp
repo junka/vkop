@@ -75,6 +75,12 @@ struct alignas(16) GpuMatMulParam {
     int fp8 = 0;
     // 1 = the fp8 layout is E5M2 (5 exponent, 2 mantissa bits) instead of E4M3.
     int fp8_e5m2 = 0;
+    // 1 = NVFP4: the w4 nibble is an E2M1 code, binding 4 holds one fp8 E4M3
+    // block scale per (16-value K block, output column) instead of an fp32
+    // table, and binding 5 holds the tensor's single fp32 factor that every
+    // block scale is multiplied by. Buffer path only; the image shader declares
+    // neither slot and never reads them.
+    int nvfp4 = 0;
 };
 
 } // namespace matmul
@@ -183,7 +189,7 @@ class MatMulBuffer : public BufferFactory {
               std::vector<VkDescriptorType>{
                   DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                   DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE},
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
               sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
     }
@@ -203,7 +209,7 @@ class MatMulBuffer : public BufferFactory {
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                 sizeof(MatMulPackPC),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
                 static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0);
@@ -239,6 +245,10 @@ class MatMulBuffer : public BufferFactory {
         //   int8/fp8  : [A, B_byte, scale(N)]             one scale per column
         //   int4 / nf4 : [A, B_4bit, scale(n_groups*N)]  one per (K group,
         //   column)
+        //   nvfp4      : [A, B_4bit, block_scale, global_scale], block_scale
+        //   being one fp8 E4M3 byte per (16-value K block, column) and
+        //   global_scale one fp32 for the whole tensor — the format's two scale
+        //   levels, both carried as tensors so neither has to be read back.
         // Everything else fails here instead of being handed to a float loader,
         // which would read a quantized payload's bytes as exponents and return
         // a plausible wrong answer.
@@ -253,26 +263,59 @@ class MatMulBuffer : public BufferFactory {
         const bool weight_byte = weight_int8 || weight_fp8;
         const bool weight_nf4 = bkind == core::ElemKind::kNF4;
         const bool weight_int4 = bkind == core::ElemKind::kInt4;
-        const bool weight_4bit = weight_nf4 || weight_int4;
+        const bool weight_nvfp4 = bkind == core::ElemKind::kFloat4E2M1;
+        // NVFP4 packs its nibbles exactly like int4 and nf4 and walks K in
+        // groups like both, so it shares those gates; what differs is the
+        // nibble's meaning and a two-level, partly fp8 scale table — checked
+        // separately below rather than folded into the shared ones.
+        const bool weight_4bit = weight_nf4 || weight_int4 || weight_nvfp4;
         core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
         if (!weight_byte && !weight_4bit) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
         }
         core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
-        const std::string weight_label = weight_int8  ? "int8"
-                                         : weight_fp8 ? "fp8"
-                                                      : "4-bit";
+        const std::string weight_label = weight_int8    ? "int8"
+                                         : weight_fp8   ? "fp8"
+                                         : weight_nvfp4 ? "nvfp4"
+                                                        : "4-bit";
         size_t scale_index = 0;
+        size_t global_index = 0;
         if (weight_byte || weight_4bit) {
-            if (inputs.size() != 3) {
+            const size_t want = weight_nvfp4 ? 4 : 3;
+            if (inputs.size() != want) {
                 throw std::runtime_error(
                     std::string("vkop: MatMul with a ") + weight_label +
-                    " weight needs exactly "
-                    "[A, B, scale], got " +
-                    std::to_string(inputs.size()) + " inputs");
+                    " weight needs exactly " +
+                    (weight_nvfp4 ? "[A, B, block_scale, global_scale]"
+                                  : "[A, B, scale]") +
+                    ", got " + std::to_string(inputs.size()) + " inputs");
             }
-            if (inputs[2]->elem_kind() != core::ElemKind::kFloat32) {
+            if (weight_nvfp4) {
+                // A block scale that is not an e4m3 byte is not NVFP4: the
+                // format's whole point is that 16-value groups cost one byte
+                // instead of four.
+                if (inputs[2]->elem_kind() != core::ElemKind::kFloat8E4M3FN) {
+                    throw std::runtime_error(
+                        std::string("vkop: MatMul nvfp4 block scale must be "
+                                    "float8e4m3fn, got ") +
+                        core::elem_name(inputs[2]->elem_kind()));
+                }
+                if (inputs[3]->elem_kind() != core::ElemKind::kFloat32) {
+                    throw std::runtime_error(
+                        std::string("vkop: MatMul nvfp4 global scale must be "
+                                    "float32, got ") +
+                        core::elem_name(inputs[3]->elem_kind()));
+                }
+                if (inputs[3]->size() !=
+                    core::elem_bytes(core::ElemKind::kFloat32, 1)) {
+                    throw std::runtime_error(
+                        "vkop: MatMul nvfp4 global scale is " +
+                        std::to_string(inputs[3]->size()) +
+                        " bytes, not the single fp32 the format defines");
+                }
+                global_index = 3;
+            } else if (inputs[2]->elem_kind() != core::ElemKind::kFloat32) {
                 throw std::runtime_error(
                     std::string("vkop: MatMul ") + weight_label +
                     " dequant scale must be float32, got " +
@@ -368,10 +411,17 @@ class MatMulBuffer : public BufferFactory {
         // does not divide K, which no kernel can undo.
         int group_size = k;
         if (weight_4bit) {
-            const size_t entries =
-                inputs[scale_index]->size() /
-                core::elem_bytes(core::ElemKind::kFloat32, 1);
-            const std::string what = weight_nf4 ? "nf4" : "int4";
+            // int4 and nf4 carry an fp32 scale per (group, column); NVFP4
+            // carries one e4m3 BYTE per (block, column), so its table's byte
+            // count is its entry count. Both are [rows, N] row-major, which is
+            // what keeps a thread's four columns contiguous either way.
+            const size_t entry_bytes =
+                weight_nvfp4 ? 1u
+                             : core::elem_bytes(core::ElemKind::kFloat32, 1);
+            const size_t entries = inputs[scale_index]->size() / entry_bytes;
+            const std::string what = weight_nvfp4 ? "nvfp4"
+                                     : weight_nf4 ? "nf4"
+                                                  : "int4";
             if (n == 0 || entries % static_cast<size_t>(n) != 0) {
                 throw std::runtime_error("vkop: MatMul " + what +
                                          " scale has " +
@@ -388,6 +438,16 @@ class MatMulBuffer : public BufferFactory {
                     std::to_string(k));
             }
             group_size = k / n_groups;
+            // A 16-value block is part of what NVFP4 *is*: its scale byte is
+            // the block's absmax over 6. Any other grouping is a different
+            // format, and decoding it as this one would apply each scale to the
+            // wrong span of values.
+            if (weight_nvfp4 && group_size != 16) {
+                throw std::runtime_error(
+                    "vkop: MatMul nvfp4 blocks 16 values of K, but " +
+                    std::to_string(n_groups) + " scale rows over K = " +
+                    std::to_string(k) + " say " + std::to_string(group_size));
+            }
             // transB: a [N, K] weight would put a column's nibbles side by side
             // along K instead of across columns, which is a different
             // addressing (and a different word-alignment story) than the
@@ -523,6 +583,17 @@ class MatMulBuffer : public BufferFactory {
             objs_.emplace_back(dummy_buffer_);
         }
 
+        // binding 5: the fp32 factor that multiplies NVFP4's block scales, or a
+        // dummy so the descriptor set stays fully bound for every other format.
+        if (weight_nvfp4) {
+            dispatch_by_dtype(inputs[global_index]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                bind_ssbo<T>(inputs[global_index], /*is_output=*/false);
+            });
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+        }
+
         para_.M = m;
         para_.N = n;
         para_.K = k;
@@ -537,6 +608,7 @@ class MatMulBuffer : public BufferFactory {
         para_.ksplit = ksplit ? 1 : 0;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;
+        para_.nvfp4 = weight_nvfp4 ? 1 : 0;
         para_.group = weight_4bit ? group_size : 0;
         if (tiled) {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never

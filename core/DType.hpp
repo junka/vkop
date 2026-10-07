@@ -47,25 +47,34 @@ enum class ElemKind : uint8_t {
     kFloat8E5M2,
 
     // 4-bit weight-only payloads, two nibbles per byte, read by the buffer
-    // MatMul kernel (see MatMulBuffer) with a per-K-group fp32 scale. kNF4's
-    // nibble is an unsigned INDEX into the fixed 16-value NF4 codebook (the
-    // quantiles of a normal distribution), dequantized as
-    // codebook[q] * group_absmax, while kInt4's is a signed value.
+    // MatMul kernel (see MatMulBuffer). kNF4's nibble is an unsigned INDEX into
+    // the fixed 16-value NF4 codebook (the quantiles of a normal distribution),
+    // dequantized as codebook[q] * group_absmax, kInt4's is a signed value, and
+    // both take one fp32 scale per (K group, column).
     //
-    // Neither is an ONNX TensorProto spelling that a third-party graph uses
-    // here: NF4 is not an ONNX element type at all, so its name is vkop's own.
-    // Both are written only by vkop's converter, and every consumer other than
-    // that one kernel still fails at the loader — a format is only "supported"
-    // where a kernel exists for it.
+    // kFloat4E2M1's nibble is an E2M1 code (sign, 2 exponent bits, 1 mantissa
+    // bit), so its 16 values are +-0, .5, 1, 1.5, 2, 3, 4, 6 -- a *relative*
+    // step like fp8, with no Inf or NaN encoding. It is the payload of the
+    // NVFP4 recipe and dequantizes against a two-level scale instead: one fp8
+    // E4M3 factor per 16-element K block plus one fp32 factor per tensor
+    // (value * block_scale * global_scale). The e4m3 block scale is what makes
+    // a group of 16 affordable: an fp32 table would cost 4 bytes where this
+    // costs 1.
+    //
+    // INT4 and FLOAT4E2M1 are ONNX TensorProto spellings (22 and 23); NF4 is
+    // not an ONNX element type at all, so its name is vkop's own. All three are
+    // written only by vkop's converter, and every consumer other than that one
+    // kernel still fails at the loader — a format is only "supported" where a
+    // kernel exists for it.
     kInt4,
     kNF4,
+    kFloat4E2M1,
 
     // Spelled in a model file, but no kernel reads them yet. They are listed so
     // the loader can name the format and say "no kernel" instead of falling
     // into a storage guess.
     kUint8,
     kBFloat16,
-    kFloat4E2M1,
     kUint4,
 };
 
@@ -140,11 +149,13 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     case ElemKind::kFloat8E4M3FN:
     case ElemKind::kFloat8E5M2:
     // The 4-bit weight-only formats are read by the buffer MatMul kernel only
-    // (see MatMulBuffer): a packed nibble with a per-group fp32 scale. Every
-    // other consumer of them still fails at the loader, which is the point of
-    // the whitelist — the format is only "supported" where a kernel exists.
+    // (see MatMulBuffer): a packed nibble, scaled per K group (int4, nf4) or
+    // per 16-value block plus a per-tensor factor (float4e2m1). Every other
+    // consumer of them still fails at the loader, which is the point of the
+    // whitelist — the format is only "supported" where a kernel exists.
     case ElemKind::kInt4:
     case ElemKind::kNF4:
+    case ElemKind::kFloat4E2M1:
     case ElemKind::kBool:
     case ElemKind::kInt32:
     case ElemKind::kInt64:

@@ -53,11 +53,14 @@ _DATA_TYPE_MAP = {
     17: "float8e4m3fn",
     19: "float8e5m2",
     # ONNX's 4-bit element types. vkop writes them only for a weight-only
-    # quantized payload; the C++ loader has a kernel for "int4" and for "nf4"
+    # quantized payload; the C++ loader has a kernel for "int4", for "nf4"
     # (which is a UINT4 payload whose nibble indexes the NF4 codebook — the name
-    # comes from the tensor's vkop_dtype metadata, see _init_dtype_name).
+    # comes from the tensor's vkop_dtype metadata, see _init_dtype_name), and for
+    # "float4e2m1fn" (NVFP4's E2M1 nibble, scaled per 16-value block by a
+    # float8e4m3fn table plus one fp32 factor per tensor).
     21: "uint4",
     22: "int4",
+    23: "float4e2m1fn",
 }
 
 # Sub-byte element types: two values per byte, the even element in the low
@@ -66,7 +69,7 @@ _DATA_TYPE_MAP = {
 # value — so a packed initializer's blob bytes are its raw_data verbatim, and
 # its size comes from the dims and the bit width, not from either dtype's
 # itemsize (see _init_byte_len / _init_bytes).
-_PACKED_DATA_TYPES = frozenset((21, 22))
+_PACKED_DATA_TYPES = frozenset((21, 22, 23))
 _PACKED_BITS = 4
 
 # Element types numpy cannot round-trip: onnx's numpy_helper decodes the fp8 ones

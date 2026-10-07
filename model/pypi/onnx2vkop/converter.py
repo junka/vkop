@@ -507,6 +507,8 @@ class ModelConverter:
             )
         elif args.quant in ("fp8e4m3", "fp8e5m2"):
             self.quantizer.quantize_to_fp8_weight_only(dag_model, args.quant)
+        elif args.quant == "nvfp4":
+            self.quantizer.quantize_to_nvfp4_weight_only(dag_model)
 
         if getattr(args, "rgba", False):
             RGBAConverter.convert(dag_model)

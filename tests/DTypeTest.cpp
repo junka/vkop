@@ -37,7 +37,7 @@ TEST(DTypeTest, RecognizesSupportedNames) {
 // Quantized formats are named so the loader can say "no kernel yet" instead of
 // picking a storage type for them. They parse, but nothing may compute on them.
 TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
-    for (const char *name : {"uint8", "bfloat16", "float4e2m1fn", "uint4"}) {
+    for (const char *name : {"uint8", "bfloat16", "uint4"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_FALSE(elem_kind_supported(kind)) << name;
@@ -62,12 +62,14 @@ TEST(DTypeTest, RecognizesFp8WeightOnlyNames) {
     }
 }
 
-// The two 4-bit weight-only formats the buffer MatMul kernel unpacks. Supported,
+// The 4-bit weight-only formats the buffer MatMul kernel unpacks. Supported,
 // but still not a storage type: their bytes are packed two to the byte, so a
 // tensor holds them as raw bytes with the logical shape in its dims (see
-// Tensor::set_payload_bytes).
+// Tensor::set_payload_bytes). float4e2m1 is the NVFP4 payload: same packing as
+// int4/nf4, a different nibble meaning (E2M1) and a two-level scale instead of
+// one fp32 per group.
 TEST(DTypeTest, RecognizesPackedWeightOnlyNames) {
-    for (const char *name : {"int4", "nf4"}) {
+    for (const char *name : {"int4", "nf4", "float4e2m1fn"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_TRUE(elem_kind_supported(kind)) << name;
@@ -79,7 +81,6 @@ TEST(DTypeTest, RecognizesPackedWeightOnlyNames) {
     }
     // "packed" is a statement about the bytes, not about having a kernel.
     EXPECT_TRUE(elem_kind_packed(ElemKind::kUint4));
-    EXPECT_TRUE(elem_kind_packed(ElemKind::kFloat4E2M1));
     for (ElemKind kind : {ElemKind::kInt8, ElemKind::kBool, ElemKind::kFloat16,
                           ElemKind::kFloat32, ElemKind::kInvalid}) {
         EXPECT_FALSE(elem_kind_packed(kind)) << elem_name(kind);

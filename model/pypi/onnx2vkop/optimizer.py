@@ -5118,7 +5118,265 @@ class Quantizer:
             )
             converted_count += 1
 
-        print(f"Converted {converted_count} tensors to {fmt} weight-only")
+    # NVFP4's payload: E2M1 -- sign, 2 exponent bits, 1 mantissa bit -- whose
+    # eight magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. There is no Inf or NaN
+    # encoding, so every nibble is a value and the largest finite one, 6, is what
+    # a block's absmax is divided by to get its scale.
+    _E2M1_MAX = 6.0
+    _E2M1_GRID = np.array(
+        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32
+    )
+    # A block is 16 contiguous values of K, and its scale is one fp8 E4M3 byte.
+    # Both are part of what the format *is*: e2m1.on (a.k.a. NVFP4) defines the
+    # block length, and the e4m3 byte is what makes a group that fine affordable
+    # -- an fp32 table would cost four bytes where this costs one.
+    _NVFP4_BLOCK = 16
+
+    @staticmethod
+    def _e2m1_encode(values):
+        """Round-to-nearest-even float32 -> e2m1 nibbles (sign|exp(2)|mant(1)).
+
+        Handwritten for the same reason as _fp8_encode: numpy has no fp4 dtype and
+        the converter must not gain a dependency for one. Two regimes again:
+        - normal (|v| >= 1.0): the exponent comes straight from the float32 bits
+          and the single mantissa bit is that quotient rounded with np.rint
+          (IEEE round-half-even), so 0.75 -> 1.0, 2.5 -> 2.0 and 5.0 -> 4.0, which
+          is what ml_dtypes' float4_e2m1fn does (a test says so);
+        - below the smallest normal: the value is a multiple of the subnormal step
+          2^-1, and a carry there lands on the smallest normal's own code
+          (1.5 * 0.5 IS 1.0), so no special case beyond the divide.
+
+        `values` must already be clipped to +-6. Unlike fp8, saturating is the
+        *only* thing that can go wrong above the grid -- there is no Inf code to
+        land on -- so a value past it would carry out of the 3-bit magnitude
+        field, and the check below catches that rather than truncating it into a
+        legal-looking small code.
+        """
+        v = np.asarray(values, dtype=np.float32)
+        sign = (v.view(np.uint32) >> 31) & np.uint32(1)
+        a = np.abs(v)
+        normal = a >= 1.0
+        a_n = np.where(normal, a, 1.0)
+        e = ((a_n.view(np.uint32) >> 23) & 0xFF).astype(np.int32) - 127
+        frac = a_n / np.ldexp(np.ones_like(a_n), e) - 1.0
+        code_m = np.rint(frac * 2.0)
+        carry = code_m == 2.0
+        e = e + carry.astype(np.int32)
+        code_m = np.where(carry, 0.0, code_m)
+        code_n = ((e + 1) << 1) | code_m.astype(np.int32)
+        code_s = np.rint(np.where(normal, 0.0, a) / 0.5).astype(np.int32)
+        code = np.where(normal, code_n, code_s)
+        over = code > 7
+        if np.any(over):
+            raise ValueError(
+                f"e2m1: {int(over.sum())} value(s), up to "
+                f"{float(a[over].max()):g}, are past the grid's largest finite "
+                f"number 6 and so overflow the magnitude field"
+            )
+        return (code | (sign << 3)).astype(np.uint8)
+
+    @staticmethod
+    def _e2m1_decode(nibbles):
+        """What the kernel reads back: the nibble's grid value, signed. The
+        shader assembles the same number out of fp32 bit fields."""
+        m = (np.asarray(nibbles, dtype=np.uint8) & 0x07).astype(np.int64)
+        mag = Quantizer._E2M1_GRID[m]
+        return np.where(np.asarray(nibbles, dtype=np.uint8) & 0x08, -mag, mag)
+
+    @staticmethod
+    def quantize_to_nvfp4_weight_only(dag_model, group_size: int = _NVFP4_BLOCK):
+        """
+        Quantize MatMul weights to NVFP4: an E2M1 nibble per value, an fp8 E4M3
+        block scale per 16 contiguous values of K, and one fp32 scale per tensor.
+
+        Two levels because one is not enough. A block's scale has to cover that
+        block's absmax and reach e4m3's range without underflowing to zero, which
+        would erase the whole block; dividing the tensor's absmax by 6 * 448 gives
+        a per-tensor factor that puts the largest block scale exactly on e4m3's
+        largest finite value, so every block's scale lands inside the layout:
+        - global = amax_tensor / (448 * 6), stored fp32;
+        - block_scale = e4m3_round(amax_block / (6 * global)), one byte per
+          (block, output column), laid out [K/16, N] row-major;
+        - codes = e2m1_round(w / (block_scale * global)), two per byte, the even
+          element in the low nibble (ONNX's FLOAT4E2M1 packing);
+        - dequant, in the kernel: code * block_scale * global.
+
+        Rounding the block scale to nearest rather than up is deliberate: rounding
+        up costs accuracy (measured 1.01% of the weights' variance against 0.90%
+        on GLM-Edge) to buy nothing, because the values it would saturate are
+        already within one quantization step of the top of the block. Saturation
+        to +-6 is therefore expected and bounded, not a defect.
+
+        The graph carries both scales as inputs (3rd and 4th) so the runtime never
+        has to read a value back to the host to build a push constant. Gates are
+        the 4-bit ones -- MatMul only, plain 2-D B operand, transB == 0, N % 8 --
+        plus the block length, which this format fixes at 16.
+        """
+        if group_size != Quantizer._NVFP4_BLOCK:
+            raise ValueError(
+                f"nvfp4 blocks {Quantizer._NVFP4_BLOCK} values of K, got "
+                f"group_size={group_size}"
+            )
+        block = Quantizer._NVFP4_BLOCK
+        max_f4 = Quantizer._E2M1_MAX
+        values_lut, first_bad = Quantizer._fp8_lut(4, 3, 448.0)
+        print("Applying weight-only nvfp4 quantization "
+              f"(block={block}, e4m3 block scale)...")
+
+        converted_count = 0
+        skipped_count = 0
+
+        initializer_consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                initializer_consumers[inp["name"]].append(node)
+
+        for name in list(dag_model.initializers.keys()):
+            initializer = dag_model.initializers[name]
+
+            if initializer.data_type not in (
+                onnx.TensorProto.FLOAT,
+                onnx.TensorProto.FLOAT16,
+            ):
+                print(f"Preserving '{name}': not a float weight")
+                skipped_count += 1
+                continue
+
+            consumers = initializer_consumers.get(name, [])
+            op_types = {node.op_type for node in consumers}
+            if not consumers:
+                print(f"Preserving '{name}': no consumers")
+                skipped_count += 1
+                continue
+            if op_types != {"MatMul"}:
+                print(
+                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
+                    f"MatMul has an nvfp4 kernel"
+                )
+                skipped_count += 1
+                continue
+
+            is_b_operand = all(
+                len(node.inputs) > 1 and node.inputs[1]["name"] == name
+                for node in consumers
+            )
+            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
+            dims = list(initializer.dims)
+            reasons = []
+            if not is_b_operand:
+                reasons.append("not the B operand")
+            if len(dims) != 2:
+                reasons.append(f"dims={dims} is not a plain 2-D matrix")
+            if transb != {0}:
+                reasons.append("transB != 0 (only the [K, N] layout unpacks)")
+            if reasons:
+                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
+                skipped_count += 1
+                continue
+
+            k, n = dims
+            reasons = []
+            if n % 8 != 0:
+                reasons.append(f"N={n} is not a multiple of 8 (a packed row must "
+                               f"start on a 32-bit word)")
+            if k % block != 0:
+                reasons.append(f"K={k} is not a multiple of the {block}-value "
+                               f"nvfp4 block")
+            if reasons:
+                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
+                skipped_count += 1
+                continue
+
+            arr = numpy_helper.to_array(initializer).astype(np.float32)
+            n_blocks = k // block
+            w3 = arr.reshape(n_blocks, block, n)
+
+            amax_t = float(np.max(np.abs(arr)))
+            global_scale = np.float32(
+                amax_t / (448.0 * max_f4) if amax_t > 0 else 1.0
+            )
+            amax_b = np.max(np.abs(w3), axis=1)  # [n_blocks, n]
+            # <= 448 by construction: amax_b <= amax_t, and global divides
+            # amax_t by 448 * 6. Clip anyway, so a bug shows up as an error
+            # rather than as an Inf/NaN scale byte.
+            s_real = amax_b / (max_f4 * float(global_scale))
+            scale_codes = Quantizer._fp8_encode(
+                np.clip(s_real, -448.0, 448.0), 4, 3
+            )
+            bad_scale = int(np.count_nonzero((scale_codes & 0x7F) >= first_bad))
+            if bad_scale:
+                raise ValueError(
+                    f"nvfp4: block scale of '{name}' encoded {bad_scale} byte(s) "
+                    f"at or past 0x{first_bad:x}, which is fp8 Inf or NaN"
+                )
+            # What the kernel multiplies by. A block whose scale rounds to zero
+            # decodes to 0 for every value in it -- the format's own behavior, and
+            # counted out loud here because it is the one thing that can silently
+            # flatten a span of weights.
+            s = values_lut[scale_codes & 0x7F]
+            dead = int(np.count_nonzero((s == 0) & (amax_b > 0)))
+            dequant_scale = (s * float(global_scale)).astype(np.float32)
+            # divide_by only keeps the encoding division finite for a block whose
+            # scale rounded to zero; the error report multiplies by the real
+            # scale, which is what the kernel does and flattens such a block to 0.
+            divide_by = np.where(dequant_scale == 0, np.float32(1.0),
+                                 dequant_scale)[:, None, :]
+            scaled = w3 / divide_by
+            codes = Quantizer._e2m1_encode(np.clip(scaled, -max_f4, max_f4))
+            dequantized = Quantizer._e2m1_decode(codes) * dequant_scale[:, None, :]
+
+            diff = dequantized - w3
+            rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
+            print(f"Quantized '{name}':")
+            print(f"  Shape: [{k}, {n}], blocks: {n_blocks} x {block}")
+            print(f"  Global scale: {float(global_scale):.6e} fp32, "
+                  f"block scale table [{n_blocks}, {n}] fp8e4m3")
+            print(f"  Blocks whose scale rounded to 0 with nonzero values: {dead}")
+            print(f"  MSE: {np.mean(diff**2):.6e}, MAE: {np.mean(np.abs(diff)):.6e}")
+            print(
+                f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
+                f"Max Rel Error: {np.max(rel_error):.2%}"
+            )
+
+            nib = codes.reshape(-1)
+            packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
+            payload = helper.make_tensor(
+                name,
+                TensorProto.FLOAT4E2M1,
+                dims,
+                packed.tobytes(),
+                raw=True,
+            )
+
+            scale_name = f"{name}_scale"
+            scale_init = helper.make_tensor(
+                scale_name,
+                TensorProto.FLOAT8E4M3FN,
+                [n_blocks, n],
+                scale_codes.reshape(-1).tobytes(),
+                raw=True,
+            )
+            global_name = f"{name}_scale_global"
+            global_init = numpy_helper.from_array(
+                np.array([global_scale], dtype=np.float32), global_name
+            )
+
+            dag_model.initializers[name] = payload
+            dag_model.initializers[scale_name] = scale_init
+            dag_model.initializers[global_name] = global_init
+            for node in consumers:
+                node.inputs.append({"name": scale_name,
+                                    "shape": [n_blocks, n]})
+                node.inputs.append({"name": global_name, "shape": [1]})
+
+            print(
+                f"Converted {onnx.TensorProto.DataType.Name(initializer.data_type)} "
+                f"tensor '{name}' to nvfp4 with block scale '{scale_name}' and "
+                f"global scale '{global_name}'"
+            )
+            converted_count += 1
+
+        print(f"Converted {converted_count} tensors to nvfp4 weight-only")
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
