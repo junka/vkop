@@ -46,18 +46,19 @@ class GlobalAveragePoolImage : public Operator {
             objs_.emplace_back(output_buffer);
         });
 
-        int accuracy = 0;
+        // globalaveragepool.comp only stores for accuracy 0 (fp32) and 1
+        // (fp16); it has no int8 path, so an int8_t-storage input (a mask, or
+        // any weight-only payload riding the same container) must throw instead
+        // of silently leaving the output unwritten.
+        const int accuracy = core::image_accuracy_elem(
+            inputs[0]->elem_kind(), "GlobalAveragePool", "input 0",
+            /*allow_int8=*/false);
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
 
             objs_.emplace_back(input_image);
-            if (typeid(T) == typeid(uint16_t)) {
-                accuracy = 1;
-            } else if (typeid(T) == typeid(int8_t)) {
-                accuracy = 2;
-            }
         });
 
         globalaveragepool::GpuGAPParam para{};

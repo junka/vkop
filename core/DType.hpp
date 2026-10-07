@@ -205,6 +205,27 @@ void require_float_elem(ElemKind kind, const char *op, const char *what);
 // tensor cannot reach one of these movers without a real byte build existing.
 void require_word_movable_elem(ElemKind kind, const char *op);
 
+// The image (texture) kernels choose their element format from the `accuracy`
+// uniform: 0 = fp32, 1 = fp16, 2 = an int8 weight-only payload. Returns that
+// value for the formats the calling kernel actually has a build for and throws
+// otherwise, so `allow_int8` belongs to the caller, not to the format:
+// conv2d.comp dequantizes an int8 weight, while globalaveragepool.comp has no
+// accuracy==2 path at all — it computes the sum and stores nothing, so picking
+// 2 there loses the output silently rather than wrongly.
+//
+// The reason this cannot come from the storage type is the alias above: an
+// int8_t container holds an int8 weight, a bool mask, an fp8 payload and a
+// packed 4-bit payload alike, and only elem_kind tells them apart.
+int image_accuracy_elem(ElemKind kind, const char *op, const char *what,
+                        bool allow_int8);
+
+// Guard for the byte-per-element copy paths (Reshape's int8/bool branch, which
+// moves one byte per value). A packed 4-bit payload shares each byte between
+// two values, so copying num_elements() bytes reads past what was stored, and
+// an fp8 payload moved by a kernel that never dequantizes it just relocates the
+// codes. Both ride the same int8_t container as a mask does.
+void require_plain_byte_elem(ElemKind kind, const char *op, const char *what);
+
 // Parse a model file's dtype string and demand a format the runtime computes
 // on. Throws when the string names nothing vkop knows, and when it names a
 // format that is recognized but has no kernel — the second case is what a

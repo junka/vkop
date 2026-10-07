@@ -138,6 +138,45 @@ void require_word_movable_elem(ElemKind kind, const char *op) {
     }
 }
 
+int image_accuracy_elem(ElemKind kind, const char *op, const char *what,
+                        bool allow_int8) {
+    switch (kind) {
+    case ElemKind::kFloat32:
+        return 0;
+    case ElemKind::kFloat16:
+        return 1;
+    case ElemKind::kInt8:
+        if (allow_int8) {
+            return 2;
+        }
+        break;
+    default:
+        break;
+    }
+    throw_unsupported_elem(kind, op, what);
+}
+
+// Only a value that occupies exactly one byte and IS that byte can be moved by
+// a byte-per-element copy. A packed payload stores two values per byte, so the
+// copy's element count and the stored byte count differ — reading that far past
+// the payload is the loud half of this, and the quiet half is fp8 codes leaving
+// a kernel that never scales them.
+void require_plain_byte_elem(ElemKind kind, const char *op, const char *what) {
+    if (kind == ElemKind::kInt8 || kind == ElemKind::kBool) {
+        return;
+    }
+    const int bits = elem_bits(kind);
+    std::string msg = std::string("vkop: ") + op + " got " + what +
+                      " in element format " + elem_name(kind);
+    if (bits > 0 && bits < 8) {
+        msg += " — two values share one byte, so a byte-per-element copy reads "
+               "past the stored payload";
+    } else {
+        msg += " — this copy moves one byte per value and never decodes it";
+    }
+    throw std::runtime_error(msg);
+}
+
 ElemKind require_supported_elem(const std::string &name, const char *context) {
     const ElemKind kind = elem_kind_from_name(name);
     if (kind == ElemKind::kInvalid) {

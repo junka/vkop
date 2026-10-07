@@ -233,18 +233,18 @@ class Conv2dImage : public Operator {
             auto input_image = input->as_input_image(m_dev_, m_cmd_);
             objs_.emplace_back(input_image);
         });
-        int accuracy = 0;
+        // accuracy picks conv2d.comp's weight format, so it has to come from
+        // what the bytes MEAN: the int8_t container also carries bool masks,
+        // fp8 and packed 4-bit weight payloads, none of which the int8 build
+        // decodes.
+        const int accuracy = core::image_accuracy_elem(
+            inputs[1]->elem_kind(), "Conv", "input 1", /*allow_int8=*/true);
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto weight = core::as_tensor<T>(inputs[1]);
             auto weight_image =
                 weight->as_input_image(m_dev_, m_cmd_, false, true);
             objs_.emplace_back(weight_image);
-            if (typeid(T) == typeid(uint16_t)) {
-                accuracy = 1;
-            } else if (typeid(T) == typeid(int8_t)) {
-                accuracy = 2;
-            }
         });
         size_t scale_index = 2;
         if ((inputs.size() == 3 && accuracy != 2) ||

@@ -14,7 +14,9 @@ using vkop::core::elem_kind_from_name;
 using vkop::core::elem_kind_packed;
 using vkop::core::elem_kind_supported;
 using vkop::core::elem_name;
+using vkop::core::image_accuracy_elem;
 using vkop::core::require_float_elem;
+using vkop::core::require_plain_byte_elem;
 using vkop::core::require_supported_elem;
 using vkop::core::require_word_movable_elem;
 using vkop::core::storage_matches_kind;
@@ -258,6 +260,73 @@ TEST(DTypeTest, RequireWordMovableElem) {
         const std::string what = e.what();
         EXPECT_NE(what.find("Gather"), std::string::npos);
         EXPECT_NE(what.find("float8e4m3fn"), std::string::npos);
+    }
+}
+
+TEST(DTypeTest, ImageAccuracyElem) {
+    // conv2d.comp has all three builds, keyed by what the bytes mean.
+    EXPECT_EQ(image_accuracy_elem(ElemKind::kFloat32, "Conv", "input 1", true),
+              0);
+    EXPECT_EQ(image_accuracy_elem(ElemKind::kFloat16, "Conv", "input 1", true),
+              1);
+    EXPECT_EQ(image_accuracy_elem(ElemKind::kInt8, "Conv", "input 1", true), 2);
+
+    // globalaveragepool.comp has no accuracy==2 path: it sums and stores
+    // nothing, so an int8_t container there has to fail instead.
+    EXPECT_THROW(image_accuracy_elem(ElemKind::kInt8, "GlobalAveragePool",
+                                     "input 0", /*allow_int8=*/false),
+                 std::runtime_error);
+
+    // A byte container that is not an int8 weight is not accuracy 2 either.
+    for (ElemKind kind : {ElemKind::kBool, ElemKind::kUint8,
+                          ElemKind::kFloat8E4M3FN, ElemKind::kFloat8E5M2,
+                          ElemKind::kInt4, ElemKind::kUint4, ElemKind::kNF4,
+                          ElemKind::kFloat4E2M1}) {
+        EXPECT_THROW(
+            image_accuracy_elem(kind, "Conv", "input 1", /*allow_int8=*/true),
+            std::runtime_error)
+            << elem_name(kind);
+    }
+
+    try {
+        image_accuracy_elem(ElemKind::kInt8, "GlobalAveragePool", "input 0",
+                            false);
+        FAIL() << "an int8 payload must not pick a missing GAP build silently";
+    } catch (const std::runtime_error &e) {
+        const std::string what = e.what();
+        EXPECT_NE(what.find("GlobalAveragePool"), std::string::npos);
+        EXPECT_NE(what.find("int8"), std::string::npos);
+    }
+}
+
+TEST(DTypeTest, RequirePlainByteElem) {
+    EXPECT_NO_THROW(require_plain_byte_elem(ElemKind::kInt8, "Reshape",
+                                            "input 0"));
+    EXPECT_NO_THROW(require_plain_byte_elem(ElemKind::kBool, "Reshape",
+                                            "input 0"));
+
+    // Packed: two values share a byte, so the copy's length is not the payload.
+    for (ElemKind kind : {ElemKind::kInt4, ElemKind::kUint4, ElemKind::kNF4,
+                          ElemKind::kFloat4E2M1}) {
+        try {
+            require_plain_byte_elem(kind, "Reshape", "input 0");
+            FAIL() << elem_name(kind);
+        } catch (const std::runtime_error &e) {
+            const std::string what = e.what();
+            EXPECT_NE(what.find("share one byte"), std::string::npos) << what;
+        }
+    }
+
+    // One byte per value, but the byte is a code nothing here decodes.
+    for (ElemKind kind :
+         {ElemKind::kFloat8E4M3FN, ElemKind::kFloat8E5M2, ElemKind::kUint8}) {
+        try {
+            require_plain_byte_elem(kind, "Reshape", "input 0");
+            FAIL() << elem_name(kind);
+        } catch (const std::runtime_error &e) {
+            const std::string what = e.what();
+            EXPECT_NE(what.find("never decodes"), std::string::npos) << what;
+        }
     }
 }
 

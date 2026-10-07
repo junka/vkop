@@ -367,7 +367,16 @@ class ReshapeBuffer : public BufferFactory {
         // words — so on the CPU fallback we copy byte-by-byte. But when the
         // input is GPU-resident, alias its buffer (same bytes, new shape) — no
         // readback needed. The mask is tiny either way.
+        //
+        // The branch key is the element format, not the container: the same
+        // int8_t storage also holds fp8 and packed 4-bit weight payloads, and a
+        // byte-per-element copy is not what those bytes mean.
+        const core::ElemKind src_kind = inputs[0]->elem_kind();
         if (inputs[0]->dtype() == typeid(int8_t)) {
+            core::require_plain_byte_elem(src_kind, "Reshape", "input 0");
+        }
+        if (src_kind == core::ElemKind::kInt8 ||
+            src_kind == core::ElemKind::kBool) {
             auto src = core::as_tensor<int8_t>(inputs[0]);
             auto output = core::as_tensor<int8_t>(outputs[0]);
             output->resize(dim);
