@@ -26,6 +26,7 @@ Examples:
   # With quantization
   onnx2vkop -i model.onnx -q fp16
   onnx2vkop -i model.onnx -q int8
+  onnx2vkop -i model.onnx -q fp8e4m3
   onnx2vkop -i model.onnx -q int4 --group-size 64
   onnx2vkop -i model.onnx -q nf4
 
@@ -39,10 +40,12 @@ Examples:
         "-o", "--output", help="Output VKOP binary file path (default: input_name.vkopbin)"
     )
     parser.add_argument(
-        "-q", "--quant", choices=["fp16", "int8", "int4", "nf4"],
-        help="Quantization type: fp16, int8 (per-column scale), or a 4-bit "
-             "weight-only MatMul payload with a per-K-group scale "
-             "(int4 = signed nibble, nf4 = NF4 codebook index)",
+        "-q", "--quant", choices=["fp16", "int8", "fp8e4m3", "fp8e5m2",
+                                  "int4", "nf4"],
+        help="Quantization type: fp16, int8 (per-column scale), an fp8 "
+             "weight-only MatMul payload with a per-column scale (e4m3 or e5m2, "
+             "one byte per value), or a 4-bit weight-only MatMul payload with a "
+             "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index)",
     )
     parser.add_argument(
         "--group-size", type=int, default=64,

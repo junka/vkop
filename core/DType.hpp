@@ -36,6 +36,16 @@ enum class ElemKind : uint8_t {
     kInt32,
     kInt64,
 
+    // Weight-only quantized payloads, one byte per value, read by the buffer
+    // MatMul kernel (see MatMulBuffer) with a per-output-column fp32 scale: the
+    // byte is a code to scale, not a float to use. kFloat8E5M2 keeps 5
+    // exponent bits to 2 mantissa bits (wide range, coarse steps),
+    // kFloat8E4M3FN the other way round (4:3, so a finer step inside the +-448
+    // range it saturates at). Neither carries a zero-point: the sign, exponent
+    // and mantissa are decoded in the shader.
+    kFloat8E4M3FN,
+    kFloat8E5M2,
+
     // 4-bit weight-only payloads, two nibbles per byte, read by the buffer
     // MatMul kernel (see MatMulBuffer) with a per-K-group fp32 scale. kNF4's
     // nibble is an unsigned INDEX into the fixed 16-value NF4 codebook (the
@@ -55,8 +65,6 @@ enum class ElemKind : uint8_t {
     // into a storage guess.
     kUint8,
     kBFloat16,
-    kFloat8E4M3FN,
-    kFloat8E5M2,
     kFloat4E2M1,
     kUint4,
 };
@@ -125,6 +133,12 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     case ElemKind::kFloat32:
     case ElemKind::kFloat16:
     case ElemKind::kInt8:
+    // The fp8 weight-only formats are read by the buffer MatMul kernel only
+    // (see MatMulBuffer): one byte per value, decoded to float in the shader
+    // and scaled per output column — the same shape as an int8 weight, which is
+    // why they share its kernels.
+    case ElemKind::kFloat8E4M3FN:
+    case ElemKind::kFloat8E5M2:
     // The 4-bit weight-only formats are read by the buffer MatMul kernel only
     // (see MatMulBuffer): a packed nibble with a per-group fp32 scale. Every
     // other consumer of them still fails at the loader, which is the point of

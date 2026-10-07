@@ -47,6 +47,11 @@ _DATA_TYPE_MAP = {
     14: "complex64",
     15: "complex128",
     16: "bfloat16",
+    # ONNX's fp8 element types. vkop writes them only for a weight-only
+    # quantized MatMul payload: one byte per value, decoded to float by the
+    # buffer kernel (see f8_val in shaders/buffer/matmul.comp).
+    17: "float8e4m3fn",
+    19: "float8e5m2",
     # ONNX's 4-bit element types. vkop writes them only for a weight-only
     # quantized payload; the C++ loader has a kernel for "int4" and for "nf4"
     # (which is a UINT4 payload whose nibble indexes the NF4 codebook — the name
@@ -64,6 +69,12 @@ _DATA_TYPE_MAP = {
 _PACKED_DATA_TYPES = frozenset((21, 22))
 _PACKED_BITS = 4
 
+# Element types numpy cannot round-trip: onnx's numpy_helper decodes the fp8 ones
+# only if ml_dtypes is installed, which the converter must not depend on. Their
+# raw_data is already the byte string the blob wants, so they go the same
+# pass-through route as the packed types and only get length-checked.
+_RAW_ONLY_DATA_TYPES = _PACKED_DATA_TYPES | frozenset((17, 19))
+
 # The extension channel a quantizer uses to name a payload whose ONNX element
 # type is only its storage (nf4 rides on UINT4).
 _VKOP_DTYPE_META_KEY = "vkop_dtype"
@@ -73,7 +84,7 @@ _VKOP_DTYPE_META_KEY = "vkop_dtype"
 # 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
 _DTYPE_BYTES = {
     1: 4, 2: 1, 3: 1, 4: 2, 5: 2, 6: 4, 7: 8, 9: 1, 10: 2,
-    11: 8, 12: 4, 13: 8, 16: 2,
+    11: 8, 12: 4, 13: 8, 16: 2, 17: 1, 19: 1,
 }
 
 
@@ -96,15 +107,16 @@ def _init_byte_len(arr) -> int:
 def _init_bytes(arr) -> bytes:
     """The initializer's payload exactly as the blob records it. A packed
     sub-byte tensor's raw_data IS the packed nibbles, and re-serializing it
-    through numpy would write one byte per value instead; everything else goes
-    through the ndarray so a tensor stored in int64_data/int32_data lands
-    correctly."""
-    if arr.data_type in _PACKED_DATA_TYPES:
+    through numpy would write one byte per value instead; fp8 lands here too
+    because numpy can only decode it through an optional dependency. Everything
+    else goes through the ndarray so a tensor stored in int64_data/int32_data
+    lands correctly."""
+    if arr.data_type in _RAW_ONLY_DATA_TYPES:
         data = arr.raw_data
         expected = _init_byte_len(arr)
         if len(data) != expected:
             raise ValueError(
-                f"packed initializer '{arr.name}' carries {len(data)} bytes, "
+                f"raw-only initializer '{arr.name}' carries {len(data)} bytes, "
                 f"but its dims declare {expected}"
             )
         return data

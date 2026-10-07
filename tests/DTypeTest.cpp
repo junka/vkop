@@ -37,12 +37,28 @@ TEST(DTypeTest, RecognizesSupportedNames) {
 // Quantized formats are named so the loader can say "no kernel yet" instead of
 // picking a storage type for them. They parse, but nothing may compute on them.
 TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
-    for (const char *name : {"uint8", "bfloat16", "float8e4m3fn", "float8e5m2",
-                              "float4e2m1fn", "uint4"}) {
+    for (const char *name : {"uint8", "bfloat16", "float4e2m1fn", "uint4"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_FALSE(elem_kind_supported(kind)) << name;
         EXPECT_STREQ(elem_name(kind), name);
+    }
+}
+
+// The fp8 weight-only payloads the buffer MatMul kernel decodes: one byte per
+// value, so unlike int4 they need no packing and their byte count is their value
+// count -- but no C++ type spells them, so a Tensor<int8_t> only holds their
+// bytes and only the kernel turns them into floats.
+TEST(DTypeTest, RecognizesFp8WeightOnlyNames) {
+    for (const char *name : {"float8e4m3fn", "float8e5m2"}) {
+        const ElemKind kind = elem_kind_from_name(name);
+        EXPECT_NE(kind, ElemKind::kInvalid) << name;
+        EXPECT_TRUE(elem_kind_supported(kind)) << name;
+        EXPECT_FALSE(elem_kind_packed(kind)) << name;
+        EXPECT_EQ(elem_bits(kind), 8);
+        EXPECT_EQ(elem_bytes(kind, 8), 8u);
+        EXPECT_STREQ(elem_name(kind), name);
+        EXPECT_FALSE(storage_matches_kind(typeid(int8_t), kind)) << name;
     }
 }
 
@@ -85,7 +101,7 @@ TEST(DTypeTest, RequireSupportedElemThrowsLoudly) {
                  std::runtime_error);
     // The two failure modes read differently on purpose.
     try {
-        require_supported_elem("float8e4m3fn", "initializer w");
+        require_supported_elem("bfloat16", "initializer w");
         FAIL() << "a format with no kernel must not load";
     } catch (const std::runtime_error &e) {
         EXPECT_NE(std::string(e.what()).find("no kernel"), std::string::npos);

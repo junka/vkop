@@ -4879,6 +4879,249 @@ class Quantizer:
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
+    # name -> (largest finite value, exponent bits, mantissa bits). f8_val in
+    # shaders/buffer/matmul.comp decodes the same two fields out of the same
+    # byte, so this table and that bit arithmetic are one contract: the largest
+    # finite value is what a column's scale divides by, and it is also the clip
+    # that keeps an encoded weight out of the layout's Inf/NaN encodings.
+    _FP8_FORMATS = {
+        "fp8e4m3": (448.0, 4, 3),
+        "fp8e5m2": (57344.0, 5, 2),
+    }
+
+    @staticmethod
+    def _fp8_lut(exp_bits: int, mant_bits: int, max_finite: float):
+        """Every magnitude byte (0x00..0x7f) as the float it stands for, plus the
+        first magnitude byte that is not a value.
+
+        The same field arithmetic the shader does, from the other direction: the
+        two have to agree or the converter ships weights the runtime misreads, so
+        a test compares them. numpy has no fp8 dtype and this must not become a
+        dependency for one. Past `max_finite` the only encodings left are
+        Inf/NaN (E4M3's 0x7f, E5M2's 0x7c..0x7f); the grid formula keeps counting
+        them as the next step, so the first bad byte is simply the first one whose
+        decoded value exceeds max_finite."""
+        bias = 2 ** (exp_bits - 1) - 1
+        step = 2.0 ** (1 - bias - mant_bits)
+        vals = np.empty(1 << (exp_bits + mant_bits), dtype=np.float32)
+        for m in range(vals.size):
+            e = m >> mant_bits
+            frac = m & ((1 << mant_bits) - 1)
+            vals[m] = (
+                frac * step
+                if e == 0
+                else (1.0 + frac / (1 << mant_bits)) * (2.0 ** (e - bias))
+            )
+        return vals, int(np.searchsorted(vals, max_finite, side="right"))
+
+    @staticmethod
+    def _fp8_encode(values, exp_bits: int, mant_bits: int) -> np.ndarray:
+        """Round-to-nearest-even float32 -> fp8 bytes, fields as the shader
+        reads them (sign, then exp_bits exponent, then mant_bits mantissa).
+
+        Handwritten because numpy has no fp8 dtype and the converter must not
+        gain a dependency for one. Two regimes, exactly the shader's two:
+        - normal: exponent straight from the float32 bits, mantissa rounded with
+          np.rint (IEEE round-half-even). A mantissa that rounds up to 2^mant_bits
+          carries into the exponent rather than overflowing its field;
+        - a value below the smallest normal instead rounds to a multiple of the
+          subnormal step, and a carry there lands on the smallest normal's own
+          code (8 * 2^-9 IS 2^-6), so no special case beyond the division.
+
+        `values` must already be clipped to the layout's largest finite number:
+        above it the only encodings left are Inf/NaN. quantize_to_fp8_weight_only
+        clips and then re-checks, so a caller that forgot gets an error, not a
+        weight that silently decodes as NaN.
+        """
+        v = np.asarray(values, dtype=np.float32)
+        sign = (v.view(np.uint32) >> 31) & np.uint32(1)
+        a = np.abs(v)
+        bias = 2 ** (exp_bits - 1) - 1
+        min_normal = np.float32(2.0 ** (1 - bias))
+        sub_step = np.float32(2.0 ** (1 - bias - mant_bits))
+
+        normal = a >= min_normal
+        # Keep the normal-path arithmetic defined for every lane, including the
+        # subnormals it will discard.
+        a_n = np.where(normal, a, min_normal)
+        e = ((a_n.view(np.uint32) >> 23) & 0xFF).astype(np.int32) - 127
+        frac = a_n / np.ldexp(np.ones_like(a_n), e) - 1.0
+        code_m = np.rint(frac * (1 << mant_bits))
+        carry = code_m == (1 << mant_bits)
+        e = e + carry.astype(np.int32)
+        code_m = np.where(carry, 0, code_m)
+        code_n = ((e + bias) << mant_bits) | code_m.astype(np.int32)
+        # Only the subnormal lanes' quotient matters, and a normal value divided
+        # by the subnormal step overflows int32 (57344 / 2^-16 is 3.8e9), so the
+        # rest are zeroed before the divide rather than discarded after it.
+        code_s = np.rint(np.where(normal, 0.0, a) / sub_step).astype(np.int32)
+        code = np.where(normal, code_n, code_s)
+        # The magnitude field is exp_bits + mant_bits wide, so a value past the
+        # layout's largest finite one either lands on an Inf/NaN byte (caught by
+        # the caller's re-check below) or runs off the end of the field and, once
+        # the sign is ORed in and the value truncated to a byte, comes back as a
+        # legal-looking small one. Check while it is still wide.
+        over = code >= (1 << (exp_bits + mant_bits))
+        if np.any(over):
+            raise ValueError(
+                f"fp8e{exp_bits}m{mant_bits}: {int(over.sum())} value(s), up to "
+                f"{float(a[over].max()):g}, overflow the magnitude field and so "
+                f"are past the layout's largest finite number"
+            )
+        return (code.astype(np.uint16) | (sign.astype(np.uint16) << 7)).astype(
+            np.uint8
+        )
+
+    @staticmethod
+    def quantize_to_fp8_weight_only(dag_model, fmt: str = "fp8e4m3"):
+        """
+        Quantize MatMul weights to an fp8 weight-only payload with a
+        per-output-column fp32 scale.
+
+        For each quantized tensor:
+        - codes: one byte per value, the layout's sign/exponent/mantissa fields,
+          rounded to nearest from value / scale;
+        - scale: amax / largest_finite_value per column, a FLOAT initializer of
+          length N appended as the consuming node's third input;
+        - dequant: the shader decodes the byte to float and multiplies by that
+          column's scale.
+
+        fp8's step is relative to each value instead of absolute, so at one byte
+        per weight it trades int8's uniform quantization noise for a uniform
+        *relative* error -- which is what a weight matrix made of values spanning
+        several orders of magnitude wants. The encoding is the same cost, and the
+        byte count is the same, so this buys accuracy and not volume.
+
+        Same input contract as INT8 (one scale per column, whatever transB says),
+        but only MatMul: conv2d.comp and gemm.comp dequantize int8 and nothing
+        else, and the ops refuse a non-int8 quantized weight rather than reading
+        exponent bits as a two's-complement value.
+        """
+        if fmt not in Quantizer._FP8_FORMATS:
+            raise ValueError(
+                f"unknown fp8 weight-only format: {fmt!r}, expected one of "
+                f"{sorted(Quantizer._FP8_FORMATS)}"
+            )
+        max_finite, exp_bits, mant_bits = Quantizer._FP8_FORMATS[fmt]
+        values_lut, first_bad = Quantizer._fp8_lut(exp_bits, mant_bits, max_finite)
+        print(f"Applying weight-only {fmt} quantization...")
+
+        converted_count = 0
+        skipped_count = 0
+
+        initializer_consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                initializer_consumers[inp["name"]].append(node)
+
+        for name in list(dag_model.initializers.keys()):
+            initializer = dag_model.initializers[name]
+
+            if initializer.data_type not in (
+                onnx.TensorProto.FLOAT,
+                onnx.TensorProto.FLOAT16,
+            ):
+                print(f"Preserving '{name}': not a float weight")
+                skipped_count += 1
+                continue
+
+            consumers = initializer_consumers.get(name, [])
+            op_types = {node.op_type for node in consumers}
+            if not consumers:
+                print(f"Preserving '{name}': no consumers")
+                skipped_count += 1
+                continue
+            if op_types != {"MatMul"}:
+                print(
+                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
+                    f"MatMul has a {fmt} kernel"
+                )
+                skipped_count += 1
+                continue
+
+            is_b_operand = all(
+                len(node.inputs) > 1 and node.inputs[1]["name"] == name
+                for node in consumers
+            )
+            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
+            dims = list(initializer.dims)
+            reasons = []
+            if not is_b_operand:
+                reasons.append("not the B operand")
+            if len(dims) != 2:
+                reasons.append(f"dims={dims} is not a plain 2-D matrix")
+            if len(transb) != 1:
+                reasons.append(f"consumers disagree on transB={sorted(transb)}")
+            if reasons:
+                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
+                skipped_count += 1
+                continue
+
+            # The scale indexes output columns; which physical axis those sit on
+            # is transB's answer, the same one INT8 takes.
+            axis = 1 if transb == {1} else 0
+
+            arr = numpy_helper.to_array(initializer).astype(np.float32)
+            amax = np.amax(np.abs(arr), axis=axis, keepdims=False)
+            scale = np.where(amax == 0, 1.0, amax / max_finite).astype(np.float32)
+            broadcast = np.expand_dims(scale, axis=axis)
+
+            clipped = np.clip(arr / broadcast, -max_finite, max_finite)
+            codes = Quantizer._fp8_encode(clipped, exp_bits, mant_bits)
+
+            # A magnitude byte at or past the Inf/NaN encodings means the clip or
+            # the encoder is wrong, and a weight that decodes as NaN is worse
+            # than aborting the conversion.
+            overflow = int(np.count_nonzero((codes & 0x7F) >= first_bad))
+            if overflow:
+                raise ValueError(
+                    f"{fmt}: quantized weight '{name}' encoded {overflow} byte(s) "
+                    f"at or past 0x{first_bad:x}, which is Inf or NaN"
+                )
+
+            # What the kernel will read back, for the error metrics below.
+            mag = values_lut[codes & 0x7F]
+            dequantized = np.where(codes & 0x80, -mag, mag) * broadcast
+
+            diff = dequantized - arr
+            rel_error = np.abs(diff) / (np.abs(arr) + 1e-8)
+            print(f"Quantized '{name}':")
+            print(f"  Shape: {list(dims)}, scale axis: {axis}")
+            print(f"  Scale shape: {list(scale.shape)}")
+            print(f"  MSE: {np.mean(diff**2):.6e}, MAE: {np.mean(np.abs(diff)):.6e}")
+            print(
+                f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
+                f"Max Rel Error: {np.max(rel_error):.2%}"
+            )
+
+            payload = helper.make_tensor(
+                name,
+                onnx.TensorProto.FLOAT8E4M3FN if fmt == "fp8e4m3"
+                else onnx.TensorProto.FLOAT8E5M2,
+                dims,
+                codes.tobytes(),
+                raw=True,
+            )
+
+            scale_name = f"{name}_scale"
+            scale_init = numpy_helper.from_array(scale, scale_name)
+            scale_init.data_type = onnx.TensorProto.FLOAT
+
+            dag_model.initializers[name] = payload
+            dag_model.initializers[scale_name] = scale_init
+            for node in consumers:
+                node.inputs.append({"name": scale_name, "shape": list(scale.shape)})
+
+            print(
+                f"Converted {onnx.TensorProto.DataType.Name(initializer.data_type)} "
+                f"tensor '{name}' to {fmt} with column scale '{scale_name}'"
+            )
+            converted_count += 1
+
+        print(f"Converted {converted_count} tensors to {fmt} weight-only")
+        print(f"Preserved {skipped_count} tensors")
+        print(f"Total initializers after quantization: {len(dag_model.initializers)}")
+
 
 class Unifier:
     """Collapse eligible initializers into a single 64-byte-aligned sub-region

@@ -68,6 +68,13 @@ struct alignas(16) GpuMatMulParam {
     // Values of K sharing one scale row (K / n_groups). Even, and a divisor of
     // K.
     int group = 0;
+    // 1 = the weight bytes are fp8 (E4M3, or E5M2 when fp8_e5m2 below) rather
+    // than two's-complement int8. Same per-column scale, same kernels -- only
+    // the byte-to-float step differs -- so this flag rides on weight_int8 being
+    // set as well. Buffer path only.
+    int fp8 = 0;
+    // 1 = the fp8 layout is E5M2 (5 exponent, 2 mantissa bits) instead of E4M3.
+    int fp8_e5m2 = 0;
 };
 
 } // namespace matmul
@@ -229,39 +236,45 @@ class MatMulBuffer : public BufferFactory {
         // scale as the last input — the same appended-scale convention the
         // optimizer and Conv2d use:
         //   fp32/fp16 : [A, B]
-        //   int8      : [A, B_int8, scale(N)]            one scale per column
+        //   int8/fp8  : [A, B_byte, scale(N)]             one scale per column
         //   int4 / nf4 : [A, B_4bit, scale(n_groups*N)]  one per (K group,
         //   column)
         // Everything else fails here instead of being handed to a float loader,
         // which would read a quantized payload's bytes as exponents and return
         // a plausible wrong answer.
-        const bool weight_int8 = inputs.size() > 1 && inputs[1]->elem_kind() ==
-                                                          core::ElemKind::kInt8;
-        const bool weight_nf4 =
-            inputs.size() > 1 && inputs[1]->elem_kind() == core::ElemKind::kNF4;
-        const bool weight_int4 = inputs.size() > 1 && inputs[1]->elem_kind() ==
-                                                          core::ElemKind::kInt4;
+        const core::ElemKind bkind = inputs.size() > 1
+                                         ? inputs[1]->elem_kind()
+                                         : core::ElemKind::kInvalid;
+        const bool weight_int8 = bkind == core::ElemKind::kInt8;
+        const bool weight_fp8 = bkind == core::ElemKind::kFloat8E4M3FN ||
+                                bkind == core::ElemKind::kFloat8E5M2;
+        // int8 and fp8 are one byte per value and scale per column, so they
+        // share every gate, every kernel and the scale-length check below.
+        const bool weight_byte = weight_int8 || weight_fp8;
+        const bool weight_nf4 = bkind == core::ElemKind::kNF4;
+        const bool weight_int4 = bkind == core::ElemKind::kInt4;
         const bool weight_4bit = weight_nf4 || weight_int4;
         core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
-        if (!weight_int8 && !weight_4bit) {
+        if (!weight_byte && !weight_4bit) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
                                      "input 1");
         }
         core::require_float_elem(outputs[0]->elem_kind(), "MatMul", "output");
+        const std::string weight_label = weight_int8  ? "int8"
+                                         : weight_fp8 ? "fp8"
+                                                      : "4-bit";
         size_t scale_index = 0;
-        if (weight_int8 || weight_4bit) {
+        if (weight_byte || weight_4bit) {
             if (inputs.size() != 3) {
-                throw std::runtime_error(std::string("vkop: MatMul with a ") +
-                                         (weight_4bit ? "4-bit" : "int8") +
-                                         " weight needs exactly "
-                                         "[A, B, scale], got " +
-                                         std::to_string(inputs.size()) +
-                                         " inputs");
+                throw std::runtime_error(
+                    std::string("vkop: MatMul with a ") + weight_label +
+                    " weight needs exactly "
+                    "[A, B, scale], got " +
+                    std::to_string(inputs.size()) + " inputs");
             }
             if (inputs[2]->elem_kind() != core::ElemKind::kFloat32) {
                 throw std::runtime_error(
-                    std::string("vkop: MatMul ") +
-                    (weight_4bit ? "4-bit" : "int8") +
+                    std::string("vkop: MatMul ") + weight_label +
                     " dequant scale must be float32, got " +
                     core::elem_name(inputs[2]->elem_kind()));
             }
@@ -325,7 +338,7 @@ class MatMulBuffer : public BufferFactory {
 
         int total = batch * m * n;
 
-        if (weight_int8) {
+        if (weight_byte) {
             // The scale indexes output columns, so its length IS N. A mismatch
             // means the weight was quantized along the wrong axis (a [N, K]
             // weight treated as [K, N], which is what a folded Transpose
@@ -337,8 +350,9 @@ class MatMulBuffer : public BufferFactory {
                 core::elem_bytes(core::ElemKind::kFloat32, 1);
             if (entries != static_cast<size_t>(n)) {
                 throw std::runtime_error(
-                    "vkop: MatMul int8 scale has " + std::to_string(entries) +
-                    " entries but the output has " + std::to_string(n) +
+                    "vkop: MatMul " + weight_label + " scale has " +
+                    std::to_string(entries) + " entries but the output has " +
+                    std::to_string(n) +
                     " columns — the weight was quantized along the wrong axis");
             }
             // No batch check: the converter only quantizes a single 2-D weight,
@@ -457,7 +471,7 @@ class MatMulBuffer : public BufferFactory {
         // thread owns, so the grid x extent below has to count quads instead of
         // pairs.
         const bool w8_quad =
-            fused_fp16 && weight_int8 && !transB_ && (n % 4 == 0);
+            fused_fp16 && weight_byte && !transB_ && (n % 4 == 0);
         // 4-bit weights always take the four-column quad kernel: the validation
         // above already proved transB == 0 and N % 8 == 0, which is what makes
         // a thread's four columns exactly half of one packed weight word.
@@ -471,7 +485,7 @@ class MatMulBuffer : public BufferFactory {
         // batched attention shapes included). Quantized weights stay out of it:
         // the tile loaders stage B as half2 words copied straight from global,
         // which a packed weight has no equivalent for.
-        const bool tiled = fused_fp16 && !weight_int8 && !weight_4bit &&
+        const bool tiled = fused_fp16 && !weight_byte && !weight_4bit &&
                            (k % 16 == 0) && (m >= 12);
         if (fp16_ != 0 && !fused_fp16) {
             // total may be 0 for a dynamic-shape output that resolved empty
@@ -497,9 +511,10 @@ class MatMulBuffer : public BufferFactory {
         }
 
         // binding 4: the quantized weight's dequant scale table (per column for
-        // int8, per [K group, column] for the 4-bit formats), or a dummy to
-        // keep the descriptor set fully bound (same convention as Conv2d).
-        if (weight_int8 || weight_4bit) {
+        // int8 and fp8, per [K group, column] for the 4-bit formats), or a
+        // dummy to keep the descriptor set fully bound (same convention as
+        // Conv2d).
+        if (weight_byte || weight_4bit) {
             dispatch_by_dtype(inputs[scale_index]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 bind_ssbo<T>(inputs[scale_index], /*is_output=*/false);
@@ -515,7 +530,9 @@ class MatMulBuffer : public BufferFactory {
         para_.fp32 = (fp16_ != 0) ? 0 : 1;
         para_.transB = transB_ ? 1 : 0;
         para_.tile = tiled ? 1 : 0;
-        para_.weight_int8 = weight_int8 ? 1 : 0;
+        para_.weight_int8 = weight_byte ? 1 : 0;
+        para_.fp8 = weight_fp8 ? 1 : 0;
+        para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
         para_.w8_quad = (w8_quad && !ksplit) ? 1 : 0;
         para_.ksplit = ksplit ? 1 : 0;
         para_.w4 = weight_4bit ? 1 : 0;

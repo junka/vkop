@@ -457,8 +457,11 @@ void Runtime::LoadModel() {
             t->set_payload_bytes(static_cast<int>(elem_bytes(kind, elements)));
             handle_floating_point_tensor(init, src_ptr, offset, t);
         } else {
-            // kInt8 / kBool: a quantized weight and a mask both land on the
-            // same byte storage, and only the recorded dtype tells them apart.
+            // kInt8 / kBool / fp8: a quantized weight, a mask and an fp8
+            // payload all land on the same one-byte-per-value storage, and only
+            // the recorded dtype tells them apart. (The fp8 kinds are decoded
+            // to float inside the buffer MatMul kernel, never reinterpreted
+            // here.)
             auto t = std::make_shared<Tensor<int8_t>>(init.dims);
             t->set_elem_kind(kind);
             handle_floating_point_tensor(init, src_ptr, offset, t);

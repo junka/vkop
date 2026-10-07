@@ -77,12 +77,17 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind) {
     case ElemKind::kInvalid:
     case ElemKind::kUint8:
     case ElemKind::kBFloat16:
+    // No C++ type means "one fp8 value", so these ride an int8_t container the
+    // same way a bool mask does: the bytes are a payload only the shader
+    // decodes, and elem_kind() is what records that. Kept false so that a
+    // Tensor<T> never claims a float format from sizeof(T) alone.
     case ElemKind::kFloat8E4M3FN:
     case ElemKind::kFloat8E5M2:
-    // The packed kinds are deliberately false here: no storage type holds "one
-    // int4 element" without reinterpreting, because two of them share a byte.
-    // The loader gives them an int8_t container sized by elem_bytes() instead
-    // (Tensor::set_payload_bytes), so num_elements() counts bytes, not values.
+    // The packed kinds are deliberately false here too: no storage type holds
+    // "one int4 element" without reinterpreting, because two of them share a
+    // byte. The loader gives them an int8_t container sized by elem_bytes()
+    // instead (Tensor::set_payload_bytes), so num_elements() counts bytes, not
+    // values.
     case ElemKind::kFloat4E2M1:
     case ElemKind::kInt4:
     case ElemKind::kUint4:

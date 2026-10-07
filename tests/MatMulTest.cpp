@@ -268,6 +268,225 @@ void run_matmul_int8(
     }
 }
 
+// fp8 weight-only MatMul (buffer backend): the same multi-input convention as
+// int8 — [A, B_fp8, scale], one fp32 scale per output column — but each byte
+// holds sign | exponent | mantissa instead of a two's-complement value, because
+// MoltenVK has no shader-float8 extension and the kernel unpacks it with bit
+// math (f8_val in shaders/buffer/matmul.comp). The scale is amax/max_finite
+// (448 for E4M3, 57344 for E5M2), so a column's largest weight lands on the
+// layout's largest finite code.
+//
+// The bytes come from libtorch's own Float8 cast, which knows nothing about that
+// bit math or about the converter's encoder. Three independent implementations
+// of one grid agreeing is the point: if the kernel decoded a different grid than
+// the one the writer emits, the product here would be wrong.
+//
+// Every byte path int8 has, fp8 rides — which is the whole design — so the case
+// list below mirrors the int8 one shape for shape.
+template <typename T>
+class MatMulFp8Test : public TestCase<T> {
+  public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<int8_t>> weight;
+    std::shared_ptr<Tensor<float>> scale_data;
+    std::shared_ptr<Tensor<T>> output;
+
+    // Payload coverage, filled in by initTestData.
+    int subnormal_codes_ = 0;
+    int zero_codes_ = 0;
+
+    MatMulFp8Test(int batch, int m, int k, int n, bool e5m2, bool transB,
+                  bool batched_b, bool wide = false)
+        : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
+          e5m2_(e5m2), transB_(transB), batched_b_(batched_b), wide_(wide) {
+        attr = {{"transB", transB_ ? "1" : "0"}};
+        initTestData();
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &output,
+                       const std::shared_ptr<vkop::core::ITensor> &expect)
+        override {
+        auto out = vkop::core::as_tensor<T>(output);
+        auto exp = vkop::core::as_tensor<T>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = to_float((*out)[i]);
+            float ev = to_float((*exp)[i]);
+            if (std::isnan(ov)) {
+                LOG_ERROR("fp8 MatMul NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("fp8 MatMul Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    int batch_, m_, k_, n_;
+    bool e5m2_, transB_, batched_b_, wide_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(42);
+
+        const auto fp8 = e5m2_ ? c10::ScalarType::Float8_e5m2
+                               : c10::ScalarType::Float8_e4m3fn;
+        const float max_finite = e5m2_ ? 57344.0F : 448.0F;
+
+        std::vector<int64_t> a_shape = shape({batch_, m_, k_});
+        auto a = store(torch::randn(a_shape, f32));
+
+        auto w_src = torch::randn(
+            transB_ ? std::vector<int64_t>{n_, k_}
+                    : std::vector<int64_t>{k_, n_},
+            f32);
+        if (wide_) {
+            // A spread wide enough, in one column, for the column's absolute
+            // scale to push a real share of its weights under the layout's
+            // smallest normal (f8_val's subnormal arm) and under half its step
+            // (the zero byte). Neither is reachable on randn weights. E5M2 needs
+            // more decades than E4M3 because its range is 57344-wide but its
+            // smallest normal is 2^-14, so its subnormal band starts a further
+            // 10^4 below the top.
+            const double spread = e5m2_ ? 14.0 : 8.0;
+            w_src = w_src * torch::pow(10.0,
+                                       torch::rand(w_src.sizes().vec(), f32) *
+                                           -spread);
+        }
+        // N entries either way; transB only says which physical axis of the
+        // stored matrix N runs along.
+        auto amax = std::get<0>(w_src.abs().max(transB_ ? 1 : 0, false));
+        auto scale =
+            torch::where(amax == 0, torch::ones_like(amax), amax / max_finite);
+        auto bcast = scale.reshape(transB_ ? std::vector<int64_t>{n_, 1}
+                                           : std::vector<int64_t>{1, n_});
+        // The clamp is the converter's: past the largest finite code the only
+        // encodings left are Inf/NaN, which no kernel decodes.
+        auto q8 = (w_src / bcast).clamp(-max_finite, max_finite).to(fp8);
+        auto deq = q8.to(torch::kFloat32) * bcast;
+        auto b = transB_ ? deq.t() : deq; // [K, N]
+        auto y = torch::matmul(a.to(torch::kFloat32), b);
+
+        // How much of the payload sits in the layout's subnormal band (a nonzero
+        // magnitude below its smallest normal) or below it (a zero byte). Counted
+        // on the normalized values rather than the bytes, and recorded, so the
+        // wide cases can prove they reach those two arms of f8_val instead of
+        // assuming a particular magnitude distribution did.
+        {
+            const float min_normal = e5m2_ ? 1.0F / 16384.0F : 1.0F / 64.0F;
+            auto norm = (deq / bcast).abs();
+            subnormal_codes_ = static_cast<int>(
+                norm.lt(min_normal).logical_and(norm.gt(0)).sum().item<int64_t>());
+            zero_codes_ = static_cast<int>(norm.eq(0).sum().item<int64_t>());
+        }
+
+        inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
+        this->fillTensorFromTorch(inputa, a);
+
+        // The fp8 byte pattern is the payload; reinterpreting it as int8 is how
+        // a host with no fp8 container moves it.
+        auto cpu_bytes =
+            q8.view(c10::ScalarType::Char).cpu().contiguous().flatten();
+        auto *bptr = cpu_bytes.data_ptr<int8_t>();
+        std::vector<int8_t> bytes(bptr, bptr + cpu_bytes.numel());
+        if (batched_b_) {
+            const size_t one = bytes.size();
+            bytes.resize(one * static_cast<size_t>(batch_));
+            for (int i = 1; i < batch_; i++) {
+                std::copy_n(bytes.begin(), one, bytes.begin() + i * one);
+            }
+        }
+        std::vector<int> w_ints = to_ints(shape(
+            batched_b_
+                ? std::vector<int64_t>{batch_, transB_ ? n_ : k_,
+                                       transB_ ? k_ : n_}
+                : std::vector<int64_t>{transB_ ? n_ : k_, transB_ ? k_ : n_}));
+        weight = std::make_shared<Tensor<int8_t>>(w_ints);
+        // int8_t is the container, not the element type: the kernel has to be
+        // told which of the two byte grids to decode against.
+        weight->set_elem_kind(
+            e5m2_ ? vkop::core::ElemKind::kFloat8E5M2
+                  : vkop::core::ElemKind::kFloat8E4M3FN);
+        weight->fillToCPU(bytes);
+
+        scale_data = std::make_shared<Tensor<float>>(std::vector<int>{n_});
+        auto cpu_scale = scale.cpu().contiguous().flatten();
+        auto sacc = cpu_scale.accessor<float, 1>();
+        std::vector<float> svec;
+        svec.reserve(static_cast<size_t>(cpu_scale.numel()));
+        for (int64_t i = 0; i < cpu_scale.numel(); i++)
+            svec.push_back(sacc[i]);
+        scale_data->fillToCPU(svec);
+
+        output = std::make_shared<Tensor<T>>(to_ints(y.sizes().vec()));
+        this->fillTensorFromTorch(output, store(y));
+
+        LOG_INFO("fp8 (%s) MatMul batch %d, M %d, N %d, K %d, transB %d, "
+                 "batched B %d, wide %d, fp16 %d, %d subnormal / %d zero bytes",
+                 e5m2_ ? "e5m2" : "e4m3", batch_, m_, n_, k_, transB_ ? 1 : 0,
+                 batched_b_ ? 1 : 0, wide_ ? 1 : 0,
+                 std::is_same_v<T, uint16_t> ? 1 : 0, subnormal_codes_,
+                 zero_codes_);
+    }
+
+    static std::vector<int64_t> shape(const std::vector<int64_t> &s) {
+        if (s.size() == 3 && s[0] == 1) {
+            return {s[1], s[2]};
+        }
+        return s;
+    }
+
+    static std::vector<int> to_ints(const std::vector<int64_t> &s) {
+        return std::vector<int>(s.begin(), s.end());
+    }
+};
+
+template <typename T>
+void run_matmul_fp8(
+    const std::vector<std::tuple<int, int, int, int, bool, bool, bool>> &cases) {
+    for (const auto &tc : cases) {
+        auto [batch, m, k, n, transB, batched_b, wide] = tc;
+        for (const bool e5m2 : {false, true}) {
+            MatMulFp8Test<T> t(batch, m, k, n, e5m2, transB, batched_b, wide);
+            if (wide) {
+                // A wide case that quantized to nothing but normals would test
+                // the same arm as an ordinary one and leave the claim in its
+                // comment unbacked.
+                EXPECT_GT(t.subnormal_codes_, 0);
+                EXPECT_GT(t.zero_codes_, 0);
+            }
+            EXPECT_TRUE(t.run_test({t.inputa, t.weight, t.scale_data},
+                                   {t.output},
+                                   [&t](
+                                       std::unique_ptr<vkop::ops::Operator> &op) {
+                                       op->setAttribute(t.attr);
+                                   }));
+        }
+    }
+}
+
 // The NF4 codebook the shader carries: 16 quantiles of a unit normal, extreme
 // codes exactly -1 and +1. Duplicated here on purpose — if the test used the
 // shader's table the comparison would be vacuous.
@@ -603,4 +822,62 @@ TEST(MatMulTest, MatMulInt8WrongAxisScaleThrows) {
                                 op->setAttribute(t.attr);
                             }),
                  std::runtime_error);
+}
+
+// The same shapes the int8 list runs, because fp8 is meant to reach the same
+// kernels through the same [A, B, scale] contract — a byte-grid change should
+// cost the dispatch layer nothing. Both layouts are run per shape (E4M3 and
+// E5M2), since they differ only in two shader constants and a case that used one
+// would leave the other's shift widths unverified. The last two add a weight
+// column spanning 1e-8..1, which is the only way the subnormal branch and the
+// rounds-to-zero byte ever execute.
+TEST(MatMulTest, MatMulFp8WeightOnlyBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<int, int, int, int, bool, bool, bool>> cases =
+        {
+            {1, 4, 32, 16, false, false, false},  // even N, plain 2-D weight
+            {1, 8, 20, 7, false, false, false},   // odd N
+            {1, 1, 64, 12, true, false, false},   // transB=1 GEMV over [N, K]
+            {1, 2, 22, 12, true, false, false},   // K % 4 != 0
+            {1, 5, 10, 14, false, false, false},  // one tap per byte extract
+            {2, 3, 24, 9, false, true, false},    // materialized broadcast, odd N
+            {2, 4, 16, 6, true, true, false},     // transB=1 with a batched weight
+            {1, 1, 512, 256, false, false, false},  // decode: split-K GEMV
+            {1, 1, 258, 260, false, false, false},  // decode: K not a multiple of
+                                                   // the slice length
+            {1, 3, 258, 32, false, false, false},   // decode: several rows
+            {2, 1, 300, 128, false, true, false},   // decode: batched
+            {1, 4, 32, 16, false, false, true},    // wide spread: subnormals
+            {1, 1, 256, 64, false, false, true},   // wide spread under split-K
+        };
+    LOG_INFO("fp8 MatMul, FP32");
+    run_matmul_fp8<float>(cases);
+    LOG_INFO("fp8 MatMul, FP16");
+    run_matmul_fp8<uint16_t>(cases);
+}
+
+// fp8 inherits int8's two host-side contracts, checked on the fp8 tensor so the
+// shared gate is proven for both formats rather than only the one that predates
+// it: a byte weight with no scale has no dequantization at all, and a scale that
+// is not one entry per output column mixes columns silently.
+TEST(MatMulTest, MatMulFp8ContractThrows) {
+    vkop::tests::ScopedBufferBackend buffer;
+    {
+        MatMulFp8Test<float> t(1, 4, 32, 16, false, false, false);
+        EXPECT_THROW(t.run_test({t.inputa, t.weight}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
+    {
+        MatMulFp8Test<float> t(1, 4, 32, 16, false, false, false);
+        auto wrong = std::make_shared<Tensor<float>>(std::vector<int>{32});
+        wrong->fillToCPU(std::vector<float>(32, 1.0F));
+        EXPECT_THROW(t.run_test({t.inputa, t.weight, wrong}, {t.output},
+                                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                    op->setAttribute(t.attr);
+                                }),
+                     std::runtime_error);
+    }
 }

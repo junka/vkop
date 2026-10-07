@@ -13,11 +13,12 @@
 //     SEPARATE pack dispatch (buffer/matmul_pack.comp, kept for that case; the
 //     separate pipeline also avoids Intel ANV push-constant interference
 //     between dispatches of the same pipeline).
-// int8 weight-only B (uPC.weight_int8) is a fourth mode: with even N it keeps a
-// single pass that writes the packed half2 output directly (one thread per two
-// columns, or per four columns when uPC.w8_quad, see below), and only odd N
-// falls back to one thread per output element in reduce->pack form. Byte
-// packing changes how a weight is LOADED, not who owns an output word.
+// A byte-quantized weight-only B (uPC.weight_int8, fp8 when uPC.fp8) is a fourth
+// mode: with even N it keeps a single pass that writes the packed half2 output
+// directly (one thread per two columns, or per four columns when uPC.w8_quad,
+// see below), and only odd N falls back to one thread per output element in
+// reduce->pack form. Byte packing changes how a weight is LOADED, not who owns
+// an output word.
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -40,10 +41,11 @@ layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
 // Per-output-column dequant scale for a quantized weight-only B (binding 4),
-// inert otherwise. int8 stores scale = amax/127 per column as fp32; the 4-bit
-// formats store one scale per (K group, column) as fp32, laid out [n_groups, N]
-// row-major so a thread's columns of one group are contiguous. MatMulBuffer
-// refuses any other scale format or count.
+// inert otherwise. int8 and fp8 store scale = absmax / the format's largest
+// finite value (127, 448, 57344) per column as fp32; the 4-bit formats store one
+// scale per (K group, column) as fp32, laid out [n_groups, N] row-major so a
+// thread's columns of one group are contiguous. MatMulBuffer refuses any other
+// scale format or count.
 layout(set = 0, binding = 4) readonly buffer Scale {
     uint data[];
 } uScale;
@@ -56,9 +58,11 @@ layout(push_constant) uniform PC {
     int fp32;
     int transB; // 1 = B is laid out as [batch, N, K] (transposed); read B[j*K+k]
     int tile;   // 1 = shared-memory tiled GEMM (grid is x=N/64, y=M/64, z=batch)
-    int weight_int8; // 1 = B is packed int8 bytes, dequant via uScale[j]
-    int w8_quad;     // 1 = int8 B, N % 4 == 0 and B is [batch, K, N]: one thread
-                     // owns four columns (the host sizes the grid to match)
+    int weight_int8; // 1 = B is one byte per quantized value, dequant via
+                     // uScale[j]; fp8 when uPC.fp8, int8 otherwise
+    int w8_quad;     // 1 = a byte-quantized B, N % 4 == 0 and B is [batch, K, N]:
+                     // one thread owns four columns (the host sizes the grid to
+                     // match)
     int ksplit; // 1 = split-K GEMV: a block covers 16 column quads and splits K
                 // 16 ways over the lanes the single A row leaves idle (grid is
                 // x = N/4/16, y = batch*M). Host picks it, see MatMulBuffer.
@@ -69,6 +73,12 @@ layout(push_constant) uniform PC {
                 // instead of a signed int4 value. Only meaningful with w4.
     int group;  // with w4: values of K sharing one scale row (K / n_groups),
                 // even and a divisor of K. Unused otherwise.
+    int fp8;    // 1 = the weight_int8 bytes are fp8, not two's complement: one
+                // value per byte, decoded by reassembling its exponent and
+                // mantissa (uPC.e5m2 picks the layout). Same per-column scale
+                // and same kernels as int8.
+    int e5m2;   // 1 = the fp8 bytes are E5M2 (5 exponent, 2 mantissa bits)
+                // instead of E4M3. Only meaningful with fp8.
 } uPC;
 
 #ifdef FP16
@@ -80,22 +90,62 @@ float load_b(int idx) {
 }
 #endif
 
-// One int8 weight byte as a float. The sign bit is XOR-ed out of the word
-// first so every lane is a plain unsigned byte-to-float convert plus a constant
-// subtract: a uint-to-int conversion of a value above INT_MAX is
-// implementation-defined, and an arithmetic right shift of a signed int is not
-// something to bet a kernel on across drivers either.
-float load_w8(int idx) {
-    uint word = uInputB.data[idx >> 2] ^ 0x80808080u;
-    return float((word >> ((idx & 3) * 8)) & 0xFFu) - 128.0;
+// ---- byte-per-value quantized weights ---------------------------------
+// int8 and fp8 share everything below: one byte per weight, one fp32 scale per
+// output column, and therefore a scale that folds out of the K loop. Only the
+// byte-to-float step differs, and it is the whole of both kernels' difference,
+// so the four byte-shaped paths (quad, split-K, even-N and the fp32 build's
+// per-element one) stay single implementations.
+
+// One int8 weight byte as a float. The sign bit is XOR-ed out first so every
+// lane is a plain unsigned byte-to-float convert plus a constant subtract: a
+// uint-to-int conversion of a value above INT_MAX is implementation-defined, and
+// an arithmetic right shift of a signed int is not something to bet a kernel on
+// across drivers either.
+float w8_val(uint b) { return float(b ^ 0x80u) - 128.0; }
+
+// One fp8 byte as a float. There is no hardware path on this stack -- MoltenVK's
+// device extensions stop at VK_KHR_shader_float16_int8, so VK_EXT_shader_float8
+// is absent -- which leaves reassembling the fields by hand. With the sign
+// stripped, a normal fp8 byte's [exp|mant] is already the top of an fp32's
+// [exp|mantissa] once the two biases agree:
+//   E4M3 (bias 7, mantissa lsb 2^-3): bits = (m + (120 << 3)) << 20
+//   E5M2 (bias 15, mantissa lsb 2^-2): bits = (m + (112 << 2)) << 21
+// Both are exact for every normal byte (checked against all 128 magnitudes).
+// Only exponent == 0 needs its own term, because a subnormal there is an integer
+// multiple of the smallest step, 2^-9 for E4M3 and 2^-16 for E5M2. The encodings
+// past the largest finite value (E4M3 0x7f, E5M2 0x7c..0x7f) are NaN/Inf and are
+// deliberately not decoded: a quantized weight cannot reach them, since the
+// converter divides by the column absmax over that largest finite value and
+// clips to it.
+float f8_val(uint b) {
+    uint m = b & 0x7Fu;
+    float v;
+    if (uPC.e5m2 != 0) {
+        v = m > 3u ? uintBitsToFloat((m + 448u) << 21u)
+                   : float(m) * 1.52587890625e-05;
+    } else {
+        v = m > 7u ? uintBitsToFloat((m + 960u) << 20u)
+                   : float(m) * 0.001953125;
+    }
+    return (b & 0x80u) != 0u ? -v : v;
 }
 
-// The four int8 weights of one word, low byte first.
+float w_val(uint b) { return uPC.fp8 != 0 ? f8_val(b) : w8_val(b); }
+
+// One quantized weight by its index in the logical [K, N] matrix.
+float load_w8(int idx) {
+    return w_val((uInputB.data[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu);
+}
+
+// The four weights of one word, low byte first.
 vec4 unpack_w8(uint word) {
-    word ^= 0x80808080u;
-    return vec4(float(word & 0xFFu), float((word >> 8) & 0xFFu),
-                float((word >> 16) & 0xFFu), float(word >> 24)) -
-           128.0;
+    if (uPC.fp8 != 0) {
+        return vec4(f8_val(word & 0xFFu), f8_val((word >> 8) & 0xFFu),
+                    f8_val((word >> 16) & 0xFFu), f8_val(word >> 24));
+    }
+    return vec4(w8_val(word & 0xFFu), w8_val((word >> 8) & 0xFFu),
+                w8_val((word >> 16) & 0xFFu), w8_val(word >> 24));
 }
 
 // ---- 4-bit weight-only payloads ---------------------------------------
