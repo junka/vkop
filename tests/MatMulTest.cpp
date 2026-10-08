@@ -569,7 +569,6 @@ class MatMulW4Test : public TestCase<T> {
 
     void initTestData() {
         auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
-        auto i64 = torch::TensorOptions().dtype(torch::kInt64);
         torch::manual_seed(42);
 
         const int n_groups = k_ / group_;

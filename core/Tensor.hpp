@@ -1058,7 +1058,8 @@ template <typename T> class Tensor : public ITensor {
     }
     void fillToCPU(const T *data) {
         reserveOnCPU();
-        if (size_ > 0) {
+        // fillToCPU({}) binds this overload with nullptr, not the vector one.
+        if (size_ > 0 && data != nullptr) {
             memcpy(data_->data(), data, size_);
         }
         toCPU();
