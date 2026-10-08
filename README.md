@@ -39,7 +39,7 @@ source path/to/VulkanSDK/setup-env.sh
 #### 3. 编译项目
 
 ```
-cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF -DPython3_EXECUTABLE=$(which python3)
+cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=ON -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_MEASURE_TIME=OFF -DPython3_EXECUTABLE=$(which python3)
 ```
 如果是交叉编译，需要设置交叉编译环境变量，借鉴参考toolchain.cmake
 ```
@@ -187,7 +187,7 @@ source path/to/VulkanSDK/setup-env.sh
 
 #### 3. Compilation
 ```bash
-cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=OFF -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_FP16=OFF -DUSE_MEASURE_TIME=OFF
+cmake .. -DENABLE_TESTS=ON -DUSE_VALIDATION_LAYERS=OFF -DENABLE_ASAN=OFF -DUSE_DEBUG_LAYERS=OFF -DUSE_MEASURE_TIME=OFF
 ```
 If you are cross-compiling, set up the cross-compilation environment variables, based on toolchain.cmake:
 ```

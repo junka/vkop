@@ -825,6 +825,7 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::REDUCEMEAN:
                 case vkop::ops::OpType::MIN:
                 case vkop::ops::OpType::MAX:
+                case vkop::ops::OpType::MAXPOOL2D:
                 case vkop::ops::OpType::MOD:
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;

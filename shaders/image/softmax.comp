@@ -14,6 +14,12 @@
 #define FLOAT2 vec2
 #endif
 
+// Running max and exp-sum are fp32 in both builds. FLOAT only picks the texel
+// width: an exp-sum over N terms accumulated in half loses log2(N)/2 bits of
+// mantissa, which is a reduction error, not a storage one.
+#define ACC float
+#define ACC4 vec4
+
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
 layout(binding = 0) writeonly uniform image2DArray OutputImage;
@@ -44,26 +50,26 @@ void softmax_axis0() {
     uint c_base = z * 4;
 
     // Initialize max value and sum of exp values
-    FLOAT4 max_val = FLOAT4(-1e9);
-    FLOAT4 sum_exp = FLOAT4(0.0);
+    ACC4 max_val = ACC4(-1e9);
+    ACC4 sum_exp = ACC4(0.0);
 
     // Step 1: Find the maximum value over height (h)
     for (uint n = 0; n < N; ++n) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + h, z), 0));
-        max_val = max(max_val, v);
+        max_val = max(max_val, ACC4(v));
     }
 
     // Step 2: Compute the sum of exp(values - max_val)
     for (uint n = 0; n < N; ++n) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + y, z), 0));
-        FLOAT4 exp_v = exp(v - max_val);
+        ACC4 exp_v = exp(ACC4(v) - max_val);
         sum_exp += exp_v;
     }
 
     // Step 3: Normalize and store the result back to the output image
     for (uint n = 0; n < N; ++n) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + y, z), 0));
-        FLOAT4 softmax_v = exp(v - max_val) / sum_exp;
+        ACC4 softmax_v = exp(ACC4(v) - max_val) / sum_exp;
         imageStore(OutputImage, ivec3(x, n * H + y, z), softmax_v);
     }
 }
@@ -84,15 +90,15 @@ void softmax_axis1() {
      uint y = n * H + h;
 
     // Initialize max value and sum of exp values
-    FLOAT max_val = FLOAT(-1e9);
-    FLOAT sum_exp = FLOAT(0.0);
+    ACC max_val = ACC(-1e9);
+    ACC sum_exp = ACC(0.0);
 
      for (int z = 0; z < C4; ++z) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(w, y, z), 0));
         for (int comp = 0; comp < 4; ++comp) {
             uint c = z * 4 + comp;
             if (c < C) {
-                max_val = FLOAT(max(max_val, v[comp]));
+                max_val = max(max_val, ACC(v[comp]));
             }
         }
     }
@@ -103,7 +109,7 @@ void softmax_axis1() {
         for (int comp = 0; comp < 4; ++comp) {
             uint c = z * 4 + comp;
             if (c < C) {
-                sum_exp += exp(v[comp] - max_val);
+                sum_exp += exp(ACC(v[comp]) - max_val);
             }
         }
     }
@@ -111,11 +117,11 @@ void softmax_axis1() {
     // Step 3: Normalize and store the result back to the output image
     for (int z = 0; z < C4; ++z) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(w, y, z), 0));
-        FLOAT4 out_v = FLOAT4(0.0);
+        ACC4 out_v = ACC4(0.0);
         for (int comp = 0; comp < 4; ++comp) {
             uint c = z * 4 + comp;
             if (c < C) {
-                out_v[comp] = exp(v[comp] - max_val) / sum_exp;
+                out_v[comp] = exp(ACC(v[comp]) - max_val) / sum_exp;
             }
         }
         imageStore(OutputImage, ivec3(w, y, z), out_v);
@@ -140,26 +146,26 @@ void softmax_axis2() {
     uint c_base = z * 4;
 
     // Initialize max value and sum of exp values
-    FLOAT4 max_val = FLOAT4(-1e9);
-    FLOAT4 sum_exp = FLOAT4(0.0);
+    ACC4 max_val = ACC4(-1e9);
+    ACC4 sum_exp = ACC4(0.0);
 
     // Step 1: Find the maximum value over height (h)
     for (uint h = 0; h < H; ++h) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + h, z), 0));
-        max_val = max(max_val, v);
+        max_val = max(max_val, ACC4(v));
     }
 
     // Step 2: Compute the sum of exp(values - max_val)
     for (uint h = 0; h < H; ++h) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + h, z), 0));
-        FLOAT4 exp_v = exp(v - max_val);
+        ACC4 exp_v = exp(ACC4(v) - max_val);
         sum_exp += exp_v;
     }
 
     // Step 3: Normalize and store the result back to the output image
     for (uint h = 0; h < H; ++h) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(x, n * H + h, z), 0));
-        FLOAT4 softmax_v = exp(v - max_val) / sum_exp;
+        ACC4 softmax_v = exp(ACC4(v) - max_val) / sum_exp;
         imageStore(OutputImage, ivec3(x, n * H + h, z), softmax_v);
     }
 }
@@ -182,26 +188,26 @@ void softmax_axis3() {
     uint c_base = z * 4;
 
     // Initialize max value and sum of exp values
-    FLOAT4 max_val = FLOAT4(-1e9);
-    FLOAT4 sum_exp = FLOAT4(0.0);
+    ACC4 max_val = ACC4(-1e9);
+    ACC4 sum_exp = ACC4(0.0);
 
     // Step 1: Find the maximum value over height (h)
     for (uint w = 0; w < W; ++w) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(w, n * H + h, z), 0));
-        max_val = FLOAT4(max(max_val, v));
+        max_val = max(max_val, ACC4(v));
     }
 
     // Step 2: Compute the sum of exp(values - max_val)
     for (uint w = 0; w < W; ++w) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(w, n * H + h, z), 0));
-        FLOAT4 exp_v = exp(v - max_val);
+        ACC4 exp_v = exp(ACC4(v) - max_val);
         sum_exp += exp_v;
     }
 
     // Step 3: Normalize and store the result back to the output image
     for (uint w = 0; w < W; ++w) {
         FLOAT4 v = FLOAT4(texelFetch(InputImage, ivec3(w, n * H + h, z), 0));
-        FLOAT4 softmax_v = exp(v - max_val) / sum_exp;
+        ACC4 softmax_v = exp(ACC4(v) - max_val) / sum_exp;
         imageStore(OutputImage, ivec3(w, n * H + h, z), softmax_v);
     }
 }

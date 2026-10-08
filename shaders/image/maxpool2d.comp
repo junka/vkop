@@ -12,6 +12,12 @@
 #define FLOAT2 vec2
 #endif
 
+// The running max is fp32 in both builds: the -100000 sentinel is not
+// representable in half (it becomes -inf), which a padding-only window would
+// then store instead of the sentinel.
+#define ACC float
+#define ACC4 vec4
+
 layout(set=0, binding=0) writeonly uniform image2DArray uOutput;
 layout(set=0, binding=1) uniform sampler2DArray uInput;
 
@@ -56,7 +62,7 @@ void main()
     int H_in = uConstant.inputSize.y;
 
     // Initialize with very small value
-    FLOAT4 max_val = FLOAT4(-100000.0);
+    ACC4 max_val = ACC4(-100000.0);
 
     // Kernel bounds with clipping
     ivec2 k_start = max(ivec2(0), -start_input);
@@ -73,7 +79,7 @@ void main()
 
             // Sample from the same layer (c4)
             FLOAT4 val = FLOAT4(texelFetch(uInput, ivec3(input_coord, c4), 0));
-            max_val = FLOAT4(max(max_val, val));
+            max_val = max(max_val, ACC4(val));
         }
     }
 

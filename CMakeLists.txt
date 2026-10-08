@@ -190,10 +190,10 @@ file(GLOB SHADER_INCLUDES ${SHADER_DIR}/common/*.comp)
 # Ensure SPIRV output directory exists
 file(MAKE_DIRECTORY ${SPIRV_DIR})
 
-option(USE_FP16 "Enable usage of FP16" OFF)
-if(USE_FP16)
-    set(SHADER_FLAGS "-DFP16")
-endif()
+# No USE_FP16 knob: fp16 kernels are per-shader dual builds (DUAL_FP16_SHADERS)
+# selected from the tensor dtype in the operators, so a build flag cannot make
+# a graph fp16 or fp32 any more. The caller picks the graph precision (the
+# Runtime ctor's precision argument, defaulting to fp32).
 
 # spv_to_c.py: embeds a SPIR-V blob as `unsigned char <sym_name>_spv[]` +
 # `<sym_name>_spv_len`. Used on all platforms (replaces the xxd+sed path,
@@ -253,19 +253,14 @@ foreach(SHADER ${SHADER_FILES})
     set(SPIRV_FILE ${SPIRV_DIR}/${SYM_BASE}.spv)
     set(SPIRV_SOURCE_FILE ${SPIRV_DIR}/${SYM_BASE}.c)
 
-    # Buffer shaders ship their own separate fp16 dual build (DUAL_FP16_SHADERS
-    # below), so the base build here is always the fp32 variant — do NOT pass
-    # -DFP16 to buffer shaders even when USE_FP16 is on (it would make the base
-    # build an fp16 variant, colliding with the op's fp32-vs-fp16 selection).
-    string(FIND "${SHADER_REL}" "buffer/" _is_buffer)
-    if(_is_buffer EQUAL 0)
-        set(_BUF_SHADER_FLAGS "")
-    else()
-        set(_BUF_SHADER_FLAGS "${SHADER_FLAGS}")
-    endif()
+    # Both folders ship fp16 as a separate dual build (DUAL_FP16_SHADERS
+    # below), so the base build here is always the fp32 variant — never pass
+    # -DFP16 (it would make the base build the fp16 variant, which for the
+    # image path silently re-types every accumulator to float16_t regardless of
+    # the tensor dtype, since the image ops bind one module for all dtypes).
     add_custom_command(
         OUTPUT ${SPIRV_FILE}
-        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE} ${_BUF_SHADER_FLAGS}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER} -fshader-stage=compute -g --target-spv=spv1.3 -o ${SPIRV_FILE}
         DEPENDS ${SHADER} ${SHADER_INCLUDES}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
@@ -332,6 +327,13 @@ set(DUAL_FP16_SHADERS
     buffer/min
     buffer/max
     buffer/mod
+    # Image kernels accumulate in fp32 (ACC types in the .comp), so the fp16
+    # variant only changes the load/store width. The op picks the module from
+    # the tensor dtype; a fp32 graph must never land on the fp16 module.
+    image/add
+    image/conv2d
+    image/maxpool2d
+    image/softmax
 )
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")
@@ -435,9 +437,6 @@ if(USE_MEASURE_TIME)
 endif()
 if(USE_VMA)
     target_compile_definitions(vkop PUBLIC USE_VMA)
-endif()
-if(USE_FP16)
-    target_compile_definitions(vkop PUBLIC FP16)
 endif()
 if (ENABLE_CUDA_LAUNCH)
     target_compile_definitions(vkop PUBLIC ENABLE_CUDA_LAUNCH)

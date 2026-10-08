@@ -8,6 +8,8 @@
 extern "C" {
 extern unsigned char image_softmax_spv[];
 extern unsigned int image_softmax_spv_len;
+extern unsigned char image_softmax_fp16_spv[];
+extern unsigned int image_softmax_fp16_spv_len;
 extern unsigned char buffer_softmax_spv[];
 extern unsigned int buffer_softmax_spv_len;
 extern unsigned char buffer_softmax_fp16_spv[];
@@ -36,8 +38,10 @@ class SoftmaxImage : public Operator {
     SoftmaxImage &operator=(const SoftmaxImage &) = delete;
     SoftmaxImage(SoftmaxImage &&) = delete;
     SoftmaxImage &operator=(SoftmaxImage &&) = delete;
-    explicit SoftmaxImage()
-        : Operator(OpType::SOFTMAX, image_softmax_spv, image_softmax_spv_len,
+    explicit SoftmaxImage(int fp16)
+        : Operator(OpType::SOFTMAX,
+                   fp16 ? image_softmax_fp16_spv : image_softmax_spv,
+                   fp16 ? image_softmax_fp16_spv_len : image_softmax_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(softmax::GpuSoftMaxParam)) {
@@ -256,7 +260,7 @@ class Softmax : public PimplFacade {
     Softmax(int fp16, bool backend_buffer) : PimplFacade(OpType::SOFTMAX) {
         impl_ = backend_buffer ? std::unique_ptr<Operator>(
                                      std::make_unique<SoftmaxBuffer>(fp16))
-                               : std::make_unique<SoftmaxImage>();
+                               : std::make_unique<SoftmaxImage>(fp16);
     }
 };
 

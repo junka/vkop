@@ -8,6 +8,8 @@
 extern "C" {
 extern unsigned char image_add_spv[];
 extern unsigned int image_add_spv_len;
+extern unsigned char image_add_fp16_spv[];
+extern unsigned int image_add_fp16_spv_len;
 extern unsigned char buffer_add_spv[];
 extern unsigned int buffer_add_spv_len;
 extern unsigned char buffer_add_fp16_spv[];
@@ -18,7 +20,9 @@ namespace ops {
 
 class AddImage : public BinaryFactory {
   public:
-    AddImage() : BinaryFactory(OpType::ADD, image_add_spv, image_add_spv_len) {}
+    explicit AddImage(int fp16)
+        : BinaryFactory(OpType::ADD, fp16 ? image_add_fp16_spv : image_add_spv,
+                        fp16 ? image_add_fp16_spv_len : image_add_spv_len) {}
 };
 
 class AddBuffer : public BufferBinaryFactory {
@@ -35,7 +39,7 @@ class Add : public PimplFacade {
         impl_ =
             backend_buffer
                 ? std::unique_ptr<Operator>(std::make_unique<AddBuffer>(fp16))
-                : std::make_unique<AddImage>();
+                : std::make_unique<AddImage>(fp16);
     }
 };
 

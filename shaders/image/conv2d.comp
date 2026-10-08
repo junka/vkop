@@ -12,6 +12,13 @@
 #define FLOAT2 vec2
 #endif
 
+// Accumulators are always fp32. FLOAT/FLOAT4 only pick the load and store
+// width, so the fp16 build halves the texel/register footprint without
+// truncating the sum: a half dot product widened here costs one rounding per
+// term instead of one per addition.
+#define ACC float
+#define ACC4 vec4
+
 
 #include "../common/activation.comp"
 #include "../common/addressing.comp"
@@ -41,9 +48,9 @@ layout(push_constant) uniform constBuffer {
 } uConstant;
 
 // support both accuracy and fp32 initializer
-FLOAT4 add_bias(FLOAT4 value, int c4, bvec4 valid_oc) {
-    FLOAT4 bias_value = FLOAT4(texelFetch(uBias, c4));
-    bias_value *= FLOAT4(valid_oc);
+ACC4 add_bias(ACC4 value, int c4, bvec4 valid_oc) {
+    ACC4 bias_value = ACC4(texelFetch(uBias, c4));
+    bias_value *= ACC4(valid_oc);
     return value + bias_value;
 }
 
@@ -97,7 +104,7 @@ void conv1x1() {
     bool use_vec4 = (C_in_per_group % 4 == 0);
     int num_vec4 = (C_in_per_group + 3) / 4;
 
-    FLOAT4 acc = FLOAT4(0.0);
+    ACC4 acc = ACC4(0.0);
     int in_y = n * H_in + iy;
 
     // ————————————————————————
@@ -107,7 +114,7 @@ void conv1x1() {
         if (can_vectorize_oc) {
             int ic_start = g0 * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
-            FLOAT4 acc_local = FLOAT4(0.0);
+            ACC4 acc_local = ACC4(0.0);
 
             if (use_vec4) {
                 for (int v = 0; v < num_vec4; ++v) {
@@ -131,10 +138,10 @@ void conv1x1() {
                         w3 *= FLOAT(scale_vec[3]);
                     }
 
-                    acc_local.x += dot(x_vec, w0);
-                    acc_local.y += dot(x_vec, w1);
-                    acc_local.z += dot(x_vec, w2);
-                    acc_local.w += dot(x_vec, w3);
+                    acc_local.x += ACC(dot(x_vec, w0));
+                    acc_local.y += ACC(dot(x_vec, w1));
+                    acc_local.z += ACC(dot(x_vec, w2));
+                    acc_local.w += ACC(dot(x_vec, w3));
                 }
             } else {
                 for (int ic = ic_start; ic < ic_end; ++ic) {
@@ -157,7 +164,7 @@ void conv1x1() {
                         FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4));
                         w_vec *= scale_vec * FLOAT(127.0);
                     }
-                    acc_local += x * w_vec;
+                    acc_local += ACC4(x * w_vec);
                 }
             }
             acc = acc_local;
@@ -169,7 +176,7 @@ void conv1x1() {
                 int oc = oc_vec[comp];
                 int g = oc / C_out_per_group;
                 int ic_start = g * C_in_per_group;
-                FLOAT sum = FLOAT(0.0);
+                ACC sum = ACC(0.0);
 
                 if (use_vec4) {
                     for (int v = 0; v < num_vec4; ++v) {
@@ -180,7 +187,7 @@ void conv1x1() {
                         if (uConstant.accuracy == 2) {
                             w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
-                        sum += dot(x_vec, w_vec);
+                        sum += ACC(dot(x_vec, w_vec));
                     }
                 } else {
                     for (int ic = ic_start; ic < ic_start + C_in_per_group; ++ic) {
@@ -196,7 +203,7 @@ void conv1x1() {
                         if (uConstant.accuracy == 2) {
                             w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
-                        sum += x * w;
+                        sum += ACC(x * w);
                     }
                 }
                 acc[comp] = sum;
@@ -206,7 +213,7 @@ void conv1x1() {
         if (can_vectorize_oc) {
             int ic_start = g0 * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
-            FLOAT4 acc_local = FLOAT4(0.0);
+            ACC4 acc_local = ACC4(0.0);
 
             if (use_vec4) {
                 // Vectorize over input channels and output channels, oc4, ic4
@@ -231,10 +238,10 @@ void conv1x1() {
                         w3 *= scale_vec;
                     }
 
-                    acc_local += x_vec.x * w0;
-                    acc_local += x_vec.y * w1;
-                    acc_local += x_vec.z * w2;
-                    acc_local += x_vec.w * w3;
+                    acc_local += ACC4(x_vec.x * w0);
+                    acc_local += ACC4(x_vec.y * w1);
+                    acc_local += ACC4(x_vec.z * w2);
+                    acc_local += ACC4(x_vec.w * w3);
                 }
             } else {
                 // Handle each output channel individually (oc4, ic)
@@ -251,7 +258,7 @@ void conv1x1() {
                         FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4)) * FLOAT(127.0);
                         w_vec *= scale_vec;
                     }
-                    acc_local += x * w_vec;
+                    acc_local += ACC4(x * w_vec);
                 }
             }
             acc = acc_local;
@@ -263,7 +270,7 @@ void conv1x1() {
                 int oc = oc_vec[comp];
                 int g = oc / C_out_per_group;
                 int ic_start = g * C_in_per_group;
-                FLOAT sum = FLOAT(0.0);
+                ACC sum = ACC(0.0);
 
                 if (use_vec4) {
                     // vector path, fetch each weight(oc, ic4) * input(ic4)
@@ -281,7 +288,7 @@ void conv1x1() {
                             FLOAT scale = FLOAT(texelFetch(uScalePara, c4)[comp]) * FLOAT(127.0);
                             w_vec *= scale;
                         }
-                        sum += dot(x_vec, w_vec);
+                        sum += ACC(dot(x_vec, w_vec));
                     }
                 } else {
                     // most scalar path, fetch each wieght(oc, ic) * input(ic)
@@ -295,7 +302,7 @@ void conv1x1() {
                         if (uConstant.accuracy == 2) {
                             w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                         }
-                        sum += x * w;
+                        sum += ACC(x * w);
                     }
                 }
                 acc[comp] = sum;
@@ -307,7 +314,9 @@ void conv1x1() {
         acc = add_bias(acc, c4, valid_oc);
     }
 
-    acc = activation(acc, uConstant.activation);
+    // Activation runs in the storage width: the accumulator is already exact,
+    // and the fp16 build's single rounding here is the store rounding anyway.
+    acc = activation(FLOAT4(acc), uConstant.activation);
 
     imageStore(uOutput, gid, acc);
 }
@@ -347,7 +356,7 @@ void grouped_conv2d() {
     ivec2 out_pos = ivec2(w, h);
     ivec2 s0 = out_pos * uConstant.stride - uConstant.padding;
 
-    FLOAT4 acc = FLOAT4(0.0);
+    ACC4 acc = ACC4(0.0);
 
     int K_W = uConstant.kernelSize.x;
     int K_H = uConstant.kernelSize.y;
@@ -367,7 +376,7 @@ void grouped_conv2d() {
         if (can_vectorize_oc) {
             int ic_start = g0 * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
-            FLOAT4 acc_local = FLOAT4(0.0);
+            ACC4 acc_local = ACC4(0.0);
 
             for (int ky = 0; ky < K_H; ++ky) {
                 int iy = s0.y + ky * uConstant.dilation.y;
@@ -398,10 +407,10 @@ void grouped_conv2d() {
                                 w3 *= scale_vec;
                             }
 
-                            acc_local += x_vec.x * w0;
-                            acc_local += x_vec.y * w1;
-                            acc_local += x_vec.z * w2;
-                            acc_local += x_vec.w * w3;
+                            acc_local += ACC4(x_vec.x * w0);
+                            acc_local += ACC4(x_vec.y * w1);
+                            acc_local += ACC4(x_vec.z * w2);
+                            acc_local += ACC4(x_vec.w * w3);
                         }
                     }
                 } else {
@@ -423,7 +432,7 @@ void grouped_conv2d() {
                                 w_vec *= scale_vec * FLOAT(127.0);
                             }
 
-                            acc_local += x * w_vec;
+                            acc_local += ACC4(x * w_vec);
                         }
                     }
                 }
@@ -436,7 +445,7 @@ void grouped_conv2d() {
                 int g = oc / C_out_per_group;
                 int ic_start = g * C_in_per_group;
                 int ic_end = ic_start + C_in_per_group;
-                FLOAT sum = FLOAT(0.0);
+                ACC sum = ACC(0.0);
 
                 for (int ky = 0; ky < K_H; ++ky) {
                     int iy = s0.y + ky * uConstant.dilation.y;
@@ -459,7 +468,7 @@ void grouped_conv2d() {
                                 w *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                             }
 
-                            sum += x * w;
+                            sum += ACC(x * w);
                         }
                     }
                 }
@@ -471,7 +480,7 @@ void grouped_conv2d() {
             int ic_start = g0 * C_in_per_group;
             int ic_end = ic_start + C_in_per_group;
 
-            FLOAT4 acc_local = FLOAT4(0.0);
+            ACC4 acc_local = ACC4(0.0);
 
             for (int ky = 0; ky < K_H; ++ky) {
                 int iy = s0.y + ky * uConstant.dilation.y;
@@ -504,10 +513,10 @@ void grouped_conv2d() {
                             }
 
                             // Broadcast x_vec and multiply per-output-channel weights
-                            acc_local.x += dot(x_vec, w0);
-                            acc_local.y += dot(x_vec, w1);
-                            acc_local.z += dot(x_vec, w2);
-                            acc_local.w += dot(x_vec, w3);
+                            acc_local.x += ACC(dot(x_vec, w0));
+                            acc_local.y += ACC(dot(x_vec, w1));
+                            acc_local.z += ACC(dot(x_vec, w2));
+                            acc_local.w += ACC(dot(x_vec, w3));
                         }
                     } else {
                         // Scalar input channels, but vectorized over output
@@ -530,7 +539,7 @@ void grouped_conv2d() {
                                 FLOAT4 scale_vec = FLOAT4(texelFetch(uScalePara, c4) * 127.0);
                                 w_vec *= scale_vec;
                             }
-                            acc_local += x * w_vec;
+                            acc_local += ACC4(x * w_vec);
                         }
                     }
                 }
@@ -549,7 +558,7 @@ void grouped_conv2d() {
                 int ic_start = g * C_in_per_group;
                 int ic_end = ic_start + C_in_per_group;
 
-                FLOAT sum = FLOAT(0.0);
+                ACC sum = ACC(0.0);
 
                 for (int ky = 0; ky < K_H; ++ky) {
                     int iy = s0.y + ky * uConstant.dilation.y;
@@ -560,7 +569,7 @@ void grouped_conv2d() {
                         if (ix < 0 || ix >= W_in) continue;
 
                         if (use_vec4) {
-                            FLOAT4 sum4 = FLOAT4(0.0);
+                            ACC4 sum4 = ACC4(0.0);
                             for (int v = 0; v < num_vec4; ++v) {
                                 // Global input layer for channels [ic_start + v*4, ...)
                                 int global_ic0 = ic_start + v * 4;
@@ -572,9 +581,9 @@ void grouped_conv2d() {
                                 if (uConstant.accuracy == 2) {
                                     w_vec *= FLOAT(texelFetch(uScalePara, c4)[comp] * 127.0);
                                 }
-                                sum4 += x_vec * w_vec;
+                                sum4 += ACC4(x_vec * w_vec);
                             }
-                            sum += dot(sum4, FLOAT4(1.0));
+                            sum += dot(sum4, ACC4(1.0));
                         } else {
                             // Iterate over input channels in this group
                             for (int ic = ic_start; ic < ic_end; ++ic) {
@@ -612,7 +621,9 @@ void grouped_conv2d() {
         acc = add_bias(acc, c4, valid_oc);
     }
 
-    acc = activation(acc, uConstant.activation);
+    // Activation runs in the storage width: the accumulator is already exact,
+    // and the fp16 build's single rounding here is the store rounding anyway.
+    acc = activation(FLOAT4(acc), uConstant.activation);
 
     imageStore(uOutput, gid, acc);
 }

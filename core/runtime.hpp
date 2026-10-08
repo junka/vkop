@@ -14,11 +14,11 @@ namespace core {
 
 class Runtime {
   private:
-#ifdef FP16
-    int precision_ = 1;
-#else
+    // Graph precision for the tensors this Runtime allocates (outputs at load
+    // time, plus the fallback for ops whose own dtypes are not informative).
+    // The fp16/fp32 shader module is picked per op from the tensor dtype, so
+    // this is not a kernel-selection flag; drivers running a half model pass 1.
     int precision_ = 0; // 0: fp32, 1: fp16
-#endif
     // When true, ops are built on the SSBO buffer backend (compact
     // row-major tensors of arbitrary rank) instead of the image backend
     // (NCHW->RGBA). Each op's PIMPL façade selects its BufferImpl when this

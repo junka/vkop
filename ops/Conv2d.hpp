@@ -12,6 +12,8 @@
 extern "C" {
 extern unsigned char image_conv2d_spv[];
 extern unsigned int image_conv2d_spv_len;
+extern unsigned char image_conv2d_fp16_spv[];
+extern unsigned int image_conv2d_fp16_spv_len;
 extern unsigned char buffer_conv2d_spv[];
 extern unsigned int buffer_conv2d_spv_len;
 extern unsigned char buffer_conv2d_fp16_spv[];
@@ -90,8 +92,13 @@ constexpr int CONV_OW_BLOCK = 8;
 
 class Conv2dImage : public Operator {
   public:
-    Conv2dImage()
-        : Operator(OpType::CONV2D, image_conv2d_spv, image_conv2d_spv_len,
+    // fp16 picks the half-width image module; both modules accumulate in fp32,
+    // so this only changes the load/store width. It follows the graph dtype
+    // (the same flag the buffer impl gets), not the build configuration.
+    explicit Conv2dImage(int fp16)
+        : Operator(OpType::CONV2D,
+                   fp16 ? image_conv2d_fp16_spv : image_conv2d_spv,
+                   fp16 ? image_conv2d_fp16_spv_len : image_conv2d_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -723,7 +730,7 @@ class Conv2d : public PimplFacade {
             impl_ =
                 std::unique_ptr<Operator>(std::make_unique<Conv2dBuffer>(fp16));
         } else {
-            impl_ = std::make_unique<Conv2dImage>();
+            impl_ = std::make_unique<Conv2dImage>(fp16);
         }
     }
 };
