@@ -2308,7 +2308,7 @@ double Runtime::Run() {
                             *c = '_';
                     }
                     if (dump_seq == 0)
-                        system("mkdir -p node_dump");
+                        (void)!system("mkdir -p node_dump");
                     std::ofstream os(fname, std::ios::binary);
                     if (os)
                         os.write(bytes, (std::streamsize)nbytes);
