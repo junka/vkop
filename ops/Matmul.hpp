@@ -729,6 +729,23 @@ class MatMulBuffer : public BufferFactory {
         // for fp32 inputs this is the naive fp32 reduce (batch*m collapsed into
         // y).
         submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
+
+        if (fp16_ != 0) {
+            // Reaching here with fp16_ means odd N (even N returned above) and
+            // not coopmat (it dispatches its own pack and returns), so the
+            // reduce wrote flat fp32 scratch that nothing has repacked.
+            scratch_->shaderWriteBarrier(m_cmd_->get());
+
+            int nwords = (total + 1) / 2;
+            MatMulPackPC pack_pc{};
+            pack_pc.total = total;
+            fillDescriptorWrites(pack_ds_[m_id_]);
+            pack_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                   &pack_pc);
+            m_cmd_->dispatch(UP_DIV(nwords, 256), 1, 1);
+        }
     }
 
     // Fill descriptor-set writes from the current objs_ vector (one SSBO per
