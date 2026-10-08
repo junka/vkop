@@ -33,19 +33,37 @@ static void ql_upload(std::shared_ptr<Tensor<T>> t) {
 // Run one QuantizeLinear/DequantizeLinear pass. scale is the per-tensor fp32
 // scale at ONNX inputs[1]; zero_point (if any) is the int8/uint8 byte at
 // inputs[2]. fp8 has no zero_point (zp_t = nullptr).
+//
+// scale_t_override: if non-null, used as inputs[1] instead of building a fresh
+// fp32 scale tensor. Used to exercise the op reading a fp16 (uint16_t-container)
+// scale initializer — the form ORT's quantizer emits on an fp16 model, which the
+// op must decode to float rather than silently fall back to scale=1.0.
 static void run_quant(const std::shared_ptr<vkop::core::ITensor> &input,
                       const std::shared_ptr<vkop::core::ITensor> &output,
                       float scale,
-                      std::shared_ptr<vkop::core::ITensor> zp_t = nullptr) {
+                      std::shared_ptr<vkop::core::ITensor> zp_t = nullptr,
+                      std::shared_ptr<vkop::core::ITensor> scale_t_override = nullptr) {
     auto dev = TestEnv::get_device();
     auto cmdpool = TestEnv::get_command_pool();
     auto op = ops::create_from_type(ops::OpType::QUANTIZE_LINEAR, 0, 0, true);
     op->set_runtime_device(dev, cmdpool);
 
-    // Scale input: a 1-element fp32 tensor at ONNX inputs[1].
-    auto scale_t = std::make_shared<Tensor<float>>(std::vector<int>{1});
-    scale_t->fillToCPU(std::vector<float>{scale});
-    ql_upload(scale_t);
+    // Scale input: a 1-element fp32 tensor at ONNX inputs[1], unless the caller
+    // supplied a custom scale tensor (e.g. a fp16 one).
+    std::shared_ptr<vkop::core::ITensor> scale_t;
+    if (scale_t_override) {
+        scale_t = scale_t_override;
+    } else {
+        auto s = std::make_shared<Tensor<float>>(std::vector<int>{1});
+        s->fillToCPU(std::vector<float>{scale});
+        scale_t = s;
+    }
+    // Upload the scale (fp32 float container or fp16 uint16_t container).
+    if (scale_t->dtype() == typeid(float)) {
+        ql_upload(as_tensor<float>(scale_t));
+    } else if (scale_t->dtype() == typeid(uint16_t)) {
+        ql_upload(as_tensor<uint16_t>(scale_t));
+    }
 
     // Upload the data input.
     if (input->dtype() == typeid(uint16_t)) {
@@ -327,6 +345,56 @@ TEST(QuantizeLinearTest, UInt8ScaledAsymmetric) {
     for (int i = 0; i < n; ++i) {
         EXPECT_EQ((*tout)[i], ref_p[i])
             << "uint8 scaled dequant mismatch at " << i;
+    }
+}
+
+// The scale initializer in an ORT-quantized fp16 model is itself fp16
+// (uint16_t container, kFloat16 elem_kind). The op must decode that half to a
+// float scale, NOT silently fall back to scale=1.0 (which is what
+// as_tensor<float> on a uint16_t tensor would yield — a null pointer). This
+// test feeds a fp16 scale and checks the dequant matches the fp32-scale path.
+TEST(QuantizeLinearTest, Fp16ScaleIsDecodedNotDropped) {
+    auto vals = torch::tensor({0.0f, 1.0f, 2.0f, 5.0f, 10.0f, 50.0f, 100.0f,
+                               200.0f, 250.0f, 0.5f, 7.25f, 13.0f, 99.0f,
+                               150.0f, 3.7f, 255.0f})
+                    .to(torch::kFloat16);
+    int n = static_cast<int>(vals.numel());
+    float scale = 1.0f;
+    int zp = 128;
+
+    // Encode the uint8 weight with a normal fp32 scale first.
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+    auto tq = std::make_shared<Tensor<int8_t>>(std::vector<int>{n}, true);
+    tq->set_elem_kind(vkop::core::ElemKind::kUint8);
+    auto zp_t = ql_zp_tensor(zp, vkop::core::ElemKind::kUint8);
+    run_quant(tin, tq, scale, zp_t);
+
+    // Now dequant with a fp16 scale tensor carrying the SAME scalar value.
+    // Build a 1-element fp16 (uint16_t) tensor whose bits encode `scale`.
+    auto scale_f16 = torch::tensor({scale}).to(torch::kFloat16);
+    const uint16_t scale_bits =
+        *reinterpret_cast<const uint16_t *>(scale_f16.data_ptr<at::Half>());
+    auto scale_t = std::make_shared<Tensor<uint16_t>>(std::vector<int>{1});
+    scale_t->fillToCPU(std::vector<uint16_t>{scale_bits});
+    scale_t->set_elem_kind(vkop::core::ElemKind::kFloat16);
+
+    auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n}, true);
+    run_quant(tq, tout, scale, zp_t, scale_t);
+
+    // Reference: same as the uint8 asymmetric path with the fp32 scale.
+    auto x = vals.to(torch::kFloat32);
+    auto q = torch::clamp(torch::round(x / scale) + float(zp), 0.0f, 255.0f)
+                 .to(torch::kUInt8);
+    auto ref = (q.to(torch::kFloat32) - float(zp)) * scale;
+    ref = ref.to(torch::kFloat16);
+    const auto *ref_p =
+        reinterpret_cast<const uint16_t *>(ref.data_ptr<at::Half>());
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout)[i], ref_p[i])
+            << "fp16-scale dequant mismatch at " << i
+            << " (if all values look like scale=1.0, the op dropped the fp16 "
+               "scale instead of decoding it)";
     }
 }
 

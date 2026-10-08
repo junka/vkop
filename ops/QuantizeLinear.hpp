@@ -4,8 +4,10 @@
 
 #include "core/DType.hpp"
 #include "ops/BufferBase.hpp"
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 
 extern "C" {
 extern unsigned char buffer_quantize_linear_spv[];
@@ -130,12 +132,51 @@ class QuantizeLinear : public BufferFactory {
         }
 
         // Per-tensor scale from inputs[1] (ONNX: x, scale, [zero_point]).
+        // The scale initializer may be fp32 OR fp16: ORT's quantizer on an fp16
+        // model emits fp16 scales (legal per spec, since DequantizeLinear's
+        // output type matches the scale's element type). Reading it via
+        // as_tensor<float> would return null on a fp16 (uint16_t-container)
+        // scale and silently fall back to scale=1.0 — a latent bug that breaks
+        // every weight in an ORT-quantized fp16 model. So read the scalar
+        // across float elem kinds.
         float scale = 1.0f;
         if (inputs.size() >= 2 && inputs[1]) {
-            auto s = core::as_tensor<float>(inputs[1]);
-            if (s && s->num_elements() > 0) {
-                s->copyToCPU(m_cmdpool_);
-                scale = (*s)[0];
+            const auto s_kind = inputs[1]->elem_kind();
+            if (core::is_float_elem(s_kind) && inputs[1]->size() > 0) {
+                if (s_kind == core::ElemKind::kFloat32) {
+                    auto s = core::as_tensor<float>(inputs[1]);
+                    if (s) {
+                        s->copyToCPU(m_cmdpool_);
+                        scale = (*s)[0];
+                    }
+                } else { // fp16 (uint16_t container): decode one half to float.
+                    auto s = core::as_tensor<uint16_t>(inputs[1]);
+                    if (s) {
+                        s->copyToCPU(m_cmdpool_);
+                        const uint16_t bits = (*s)[0];
+                        // IEEE 754 half -> float.
+                        const uint32_t sign = (bits >> 15) & 0x1u;
+                        const uint32_t exp = (bits >> 10) & 0x1fu;
+                        const uint32_t mant = bits & 0x3ffu;
+                        float f;
+                        if (exp == 0u) {
+                            f = (mant == 0u) ? (sign ? -0.0f : 0.0f)
+                                             : std::ldexp(mant, -24) *
+                                                   (sign ? -1.0f : 1.0f);
+                        } else if (exp == 31u) {
+                            f = (mant == 0u)
+                                    ? (sign ? -std::numeric_limits<
+                                                  float>::infinity()
+                                            : std::numeric_limits<
+                                                  float>::infinity())
+                                    : std::numeric_limits<float>::quiet_NaN();
+                        } else {
+                            f = std::ldexp((mant | 0x400u), int(exp) - 25) *
+                                (sign ? -1.0f : 1.0f);
+                        }
+                        scale = f;
+                    }
+                }
             }
         }
         if (scale == 0.0f)
