@@ -5,7 +5,7 @@
 // stages (each DiT/text-tower graph is ~14 GB; two never fit in 36 GB).
 //
 // Usage:
-//   image_gen <dit_prefill.vkopbin> <dit_decode.vkopbin> <prompt> \
+//   image_gen <dit_prefill.vkopbin> <dit_decode.vkopbin> <prompt>
 //             [steps] [seed] [--size 512|1024] [--ref DIR]
 //
 // Without --ref everything is computed here; the text tower's three artifacts
