@@ -54,6 +54,7 @@
 #include "ops/Equal.hpp"
 #include "ops/FusedElemwise.hpp"
 #include "ops/NonZero.hpp"
+#include "ops/QuantizeLinear.hpp"
 #include "ops/RMSNorm.hpp"
 #include "ops/RotaryEmbedding.hpp"
 #include "ops/ScatterElements.hpp"
@@ -193,6 +194,11 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Max>(fp16, backend_buffer);
     case OpType::MOD:
         return std::make_unique<Mod>(fp16, backend_buffer);
+    case OpType::QUANTIZE_LINEAR:
+    case OpType::DEQUANTIZE_LINEAR:
+        // One class handles both directions; the input dtype decides at
+        // execute() time (fp16->fp8 vs fp8->fp16).
+        return std::make_unique<QuantizeLinear>();
     default:
         return nullptr;
     }

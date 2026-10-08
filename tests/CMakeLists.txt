@@ -76,6 +76,7 @@ set(TEST_SOURCES
     ScatterElementsTest.cpp
     ShapeTest.cpp
     CastTest.cpp
+    QuantizeLinearTest.cpp
     ScatterNDTest.cpp
     BufferRankTest.cpp
     WhereTest.cpp

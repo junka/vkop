@@ -159,6 +159,12 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     case ElemKind::kBool:
     case ElemKind::kInt32:
     case ElemKind::kInt64:
+    // uint8 rides an int8_t container the same way bool/fp8 do (the byte is a
+    // payload the QDQ shaders decode), and is read by the QuantizeLinear/
+    // DequantizeLinear op for externally-quantized (QDQ) models. ORT's dynamic
+    // quantizer emits uint8 weights by default, so this must clear the loader
+    // or the most common QDQ graph is rejected at graph-input creation.
+    case ElemKind::kUint8:
         return true;
     default:
         return false;
@@ -196,6 +202,13 @@ bool storage_matches_kind(const std::type_info &storage, ElemKind kind);
 // quantized weight must arrive at a kernel that dequantizes it; handing it to
 // one that reads the bytes as fp32 is a silent wrong answer.
 void require_float_elem(ElemKind kind, const char *op, const char *what);
+
+// True for the two float formats a kernel can compute on directly (fp32/fp16).
+// Used to tell a quantize/dequantize op which side of the boundary is the
+// float operand without reaching for the throwing require_float_elem.
+constexpr bool is_float_elem(ElemKind kind) {
+    return kind == ElemKind::kFloat32 || kind == ElemKind::kFloat16;
+}
 
 // Guard for the word-granular buffer data-movement kernels (Slice, Concat,
 // Gather, Split, Transpose, Expand). They model fp32/int32 (1 value per uint

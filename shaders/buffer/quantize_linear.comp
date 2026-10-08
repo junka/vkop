@@ -1,0 +1,224 @@
+#version 450 core
+
+// QuantizeLinear / DequantizeLinear SSBO op.
+//
+// Two use sites share this shader:
+//
+//   1. fp8 KV cache (internal). The LLM stores each layer's past/present
+//      key_values as E4M3 (or E5M2) fp8 bytes (1 B/elem) to shrink KV-cache
+//      VRAM; attention computes in fp16, so the graph wraps the cache boundary
+//      with QuantizeLinear (fp16->fp8) and DequantizeLinear (fp8->fp16).
+//
+//   2. External QDQ int8/uint8 quantization. A model whose ONNX graph already
+//      carries QuantizeLinear/DequantizeLinear nodes (e.g. ORT
+//      quantize_dynamic output) is imported as-is; this shader runs those
+//      nodes. int8/uint8 are asymmetric: scale + zero_point.
+//
+// Push constant `fmt` selects the byte format:
+//   0 = fp8 E4M3 (sign|4 exp|3 mant, bias 7, +-448 finite, no zero_point)
+//   1 = fp8 E5M2 (sign|5 exp|2 mant, bias 15, +-57344 finite, no zero_point)
+//   2 = int8     (two's complement; x = (q - zp) * scale)
+//   3 = uint8    (unsigned;        x = (q - zp) * scale)
+//
+// `mode` selects direction: 0 = quantize (float->byte), 1 = dequant (byte->
+// float). `scale` and `zp` are per-tensor scalars (per-axis is a later phase).
+//
+// The float side is fp16 (in_fp32=0) or fp32 (in_fp32=1 / out_fp32=1).
+//
+// Word packing: the byte side packs 4 values per uint word. The float side
+// packs 2 values per uint word (fp16) or 1 (fp32). One thread per BYTE-WORD
+// (4 values); the thread reads/writes the corresponding float word(s):
+//   - fp16 float side: 4 values = 2 fp16 words.
+//   - fp32 float side: 4 values = 4 fp32 words.
+// `total` is the element count (== byte count on the byte side == element
+// count on the float side).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer OutBuf { uint data[]; } uOut;
+layout(set = 0, binding = 1) readonly buffer InBuf { uint data[]; } uIn;
+
+layout(push_constant) uniform PC {
+    int mode;     // 0 = quantize, 1 = dequantize
+    int total;    // element count
+    float scale;  // per-tensor fp32 scale
+    int zp;       // per-tensor zero_point (int); 0 for fp8
+    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8
+    int out_fp32; // dequant: 1 = fp32 output
+    int in_fp32;  // quant:   1 = fp32 input
+    int _pad;
+} uPC;
+
+// ---- fp8 E4M3 decode (mirrors matmul.comp e4m3_val) ----------------------
+float e4m3_decode(uint b) {
+    uint m = b & 0x7Fu;
+    float v = m > 7u
+        ? uintBitsToFloat((m + 960u) << 20u)
+        : float(m) * 0.001953125;  // subnormal: step 2^-9
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// ---- fp8 E5M2 decode (mirrors matmul.comp e5m2_val) ----------------------
+float e5m2_decode(uint b) {
+    uint m = b & 0x7Fu;
+    float v = m > 3u
+        ? uintBitsToFloat((m + 448u) << 21u)
+        : float(m) * 1.52587890625e-05;  // subnormal: step 2^-16
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// ---- fp8 E4M3 encode (fp32 -> byte, round-to-nearest-even) ---------------
+// Input is assumed already scaled (divided by uPC.scale). Returns the 8-bit
+// code; sign in bit 7, 4 exp + 3 mant (bias 7). Saturates at 0x7e (never
+// 0x7f Inf/NaN). Exact inverse of e4m3_decode on the finite grid.
+uint e4m3_encode(float x) {
+    uint sign = (x < 0.0) ? 0x80u : 0x00u;
+    float a = abs(x);
+    const float min_normal = 0.015625;
+    const float sub_step = 0.001953125;
+    uint code;
+    if (a >= min_normal) {
+        uint bits = floatBitsToUint(a);
+        int e32 = int((bits >> 23u) & 0xFFu) - 127;
+        float frac = a / uintBitsToFloat(uint(e32 + 127) << 23u) - 1.0;
+        int m_i = int(roundEven(frac * 8.0));
+        if (m_i >= 8) { m_i = 0; e32 += 1; }
+        int e_code = e32 + 7;
+        if (e_code >= 15) {
+            code = 0x7Eu;
+        } else {
+            code = (uint(e_code) << 3u) | uint(m_i);
+        }
+    } else {
+        code = uint(roundEven(a / sub_step));
+    }
+    code = min(code, 0x7Eu);
+    return sign | code;
+}
+
+// ---- fp8 E5M2 encode (fp32 -> byte, round-to-nearest-even) ---------------
+// sign | 5 exp | 2 mant (bias 15), +-57344 finite, saturates at 0x7b (the
+// largest finite magnitude; 0x7c..0x7f are Inf/NaN).
+uint e5m2_encode(float x) {
+    uint sign = (x < 0.0) ? 0x80u : 0x00u;
+    float a = abs(x);
+    const float min_normal = 6.103515625e-05;  // 2^-14
+    const float sub_step = 1.52587890625e-05;  // 2^-16
+    uint code;
+    if (a >= min_normal) {
+        uint bits = floatBitsToUint(a);
+        int e32 = int((bits >> 23u) & 0xFFu) - 127;
+        float frac = a / uintBitsToFloat(uint(e32 + 127) << 23u) - 1.0;
+        int m_i = int(roundEven(frac * 4.0));
+        if (m_i >= 4) { m_i = 0; e32 += 1; }
+        int e_code = e32 + 15;
+        if (e_code >= 30) {
+            code = 0x7Bu;  // largest finite E5M2 magnitude
+        } else {
+            code = (uint(e_code) << 2u) | uint(m_i);
+        }
+    } else {
+        code = uint(roundEven(a / sub_step));
+    }
+    code = min(code, 0x7Bu);
+    return sign | code;
+}
+
+// ---- int8 / uint8 encode (fp32 -> byte, round-to-nearest-even) -----------
+// Input is the raw value (NOT pre-scaled): q = round(x / scale) + zp, then
+// clamp to the format's range. zp is added in the integer domain so the
+// decode (q - zp) * scale is an exact inverse on the grid.
+uint int_encode(float x, bool is_uint) {
+    float q = roundEven(x / uPC.scale) + float(uPC.zp);
+    float lo = is_uint ? 0.0 : -128.0;
+    float hi = is_uint ? 255.0 : 127.0;
+    q = clamp(q, lo, hi);
+    return uint(int(q)) & 0xFFu;
+}
+
+// ---- decode dispatch -----------------------------------------------------
+float decode_byte(uint b) {
+    if (uPC.fmt == 0) return e4m3_decode(b) * uPC.scale;
+    if (uPC.fmt == 1) return e5m2_decode(b) * uPC.scale;
+    // int8 / uint8: (q - zp) * scale. uint8 reads the byte as unsigned
+    // [0,255]; int8 sign-extends the byte's top bit into [-128,127].
+    int q;
+    if (uPC.fmt == 3) {
+        q = int(b);                 // uint8: unsigned
+    } else {
+        uint raw = b & 0xFFu;
+        q = (raw & 0x80u) != 0u     // int8: sign-extend
+                ? int(raw | 0xFFFFFF00u)
+                : int(raw);
+    }
+    return (float(q) - float(uPC.zp)) * uPC.scale;
+}
+
+uint encode_val(float x) {
+    if (uPC.fmt == 0) return e4m3_encode(x / uPC.scale);
+    if (uPC.fmt == 1) return e5m2_encode(x / uPC.scale);
+    return int_encode(x, uPC.fmt == 3);
+}
+
+// Read 4 float values from the float side starting at element index i0.
+// fp16: 2 words; fp32: 4 words. Bounds-clamped (OOB reads return 0).
+void load_float4(int i0, out float v[4]) {
+    if (uPC.in_fp32 != 0) {
+        // fp32: 1 value per word.
+        v[0] = (i0 + 0 < uPC.total) ? uintBitsToFloat(uIn.data[i0 + 0]) : 0.0;
+        v[1] = (i0 + 1 < uPC.total) ? uintBitsToFloat(uIn.data[i0 + 1]) : 0.0;
+        v[2] = (i0 + 2 < uPC.total) ? uintBitsToFloat(uIn.data[i0 + 2]) : 0.0;
+        v[3] = (i0 + 3 < uPC.total) ? uintBitsToFloat(uIn.data[i0 + 3]) : 0.0;
+    } else {
+        // fp16: 2 values per word.
+        uint w0 = uIn.data[(i0 + 0) / 2];
+        uint w1 = (i0 + 2 < uPC.total) ? uIn.data[(i0 + 2) / 2] : 0u;
+        vec2 a = unpackHalf2x16(w0);
+        vec2 b = unpackHalf2x16(w1);
+        v[0] = a.x; v[1] = a.y; v[2] = b.x; v[3] = b.y;
+    }
+}
+
+// Write 4 float values to the float side starting at element index i0.
+// fp16: 2 words; fp32: 4 words. Bounds-clamped (OOB writes skipped).
+void store_float4(int i0, float v[4]) {
+    if (uPC.out_fp32 != 0) {
+        if (i0 + 0 < uPC.total) uOut.data[i0 + 0] = floatBitsToUint(v[0]);
+        if (i0 + 1 < uPC.total) uOut.data[i0 + 1] = floatBitsToUint(v[1]);
+        if (i0 + 2 < uPC.total) uOut.data[i0 + 2] = floatBitsToUint(v[2]);
+        if (i0 + 3 < uPC.total) uOut.data[i0 + 3] = floatBitsToUint(v[3]);
+    } else {
+        if (i0 + 0 < uPC.total)
+            uOut.data[(i0 + 0) / 2] = packHalf2x16(vec2(v[0], v[1]));
+        if (i0 + 2 < uPC.total)
+            uOut.data[(i0 + 2) / 2] = packHalf2x16(vec2(v[2], v[3]));
+    }
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= (uPC.total + 3) / 4) return;
+
+    int i0 = 4 * gid;  // first element index this thread owns (byte side)
+
+    if (uPC.mode == 0) {
+        // Quantize: float input -> byte output.
+        float v[4];
+        load_float4(i0, v);
+        uint packed = 0u;
+        for (int k = 0; k < 4; ++k) {
+            if (i0 + k >= uPC.total) break;
+            packed |= (encode_val(v[k]) << (k * 8));
+        }
+        uOut.data[gid] = packed;
+    } else {
+        // Dequantize: byte input -> float output.
+        uint w = uIn.data[gid];
+        float v[4];
+        v[0] = decode_byte(w & 0xFFu);
+        v[1] = decode_byte((w >> 8u) & 0xFFu);
+        v[2] = decode_byte((w >> 16u) & 0xFFu);
+        v[3] = decode_byte(w >> 24u);
+        store_float4(i0, v);
+    }
+}

@@ -59,6 +59,8 @@ using vkop::VulkanCommandBuffer;
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::core::as_tensor;
+using vkop::core::ElemKind;
+using vkop::core::elem_name;
 using vkop::export_::Conversation;
 using vkop::export_::ImageBlock;
 using vkop::export_::KVCache;
@@ -127,6 +129,9 @@ struct ModelArch {
     int position_ids_dims = 2;   // 2 = 纯文本 2D RoPE, 3 = 多模态 3D MRoPE
     bool has_deepstack = false;  // deepstack_embeds_{0,1,2} 输入存在
     bool has_image_pad_mask = false;
+    // KV cache 存储语义：从 past_key_values_0 的 elem_kind() 读。fp16 是历史
+    // 默认；fp8 (E4M3/E5M2) 时 KVCache 用 int8_t 容器承载字节，显存减半。
+    ElemKind cache_kind = ElemKind::kFloat16;
 };
 
 // 结束符 / 图像占位符的 id 由 Tokenizer 从注册表查（Conversation 也走同一入口），
@@ -155,15 +160,28 @@ ModelArch infer_model_arch(const std::shared_ptr<Runtime>& rt) {
     arch.nlayers = nlayers;
 
     // ---- NKV / HD: 从 past_key_values_0 shape ----
+    // getShape() 在 ITensor 基类上，与容器类型无关 —— fp8 cache 的 past 是
+    // Tensor<int8_t>，但仍能直接读 shape，无需 as_tensor 到具体容器。
     auto pk0 = rt->GetInput("past_key_values_0");
-    auto pk0_g = as_tensor<uint16_t>(pk0);
-    auto pk0_shape = pk0_g->getShape();  // (B, 2, nkv, kv_len, hd)
+    auto pk0_shape = pk0->getShape();  // (B, 2, nkv, kv_len, hd)
     if (pk0_shape.size() < 5) {
         std::fprintf(stderr, "[arch] past_key_values_0 shape is %zu dims, expect 5\n",
                      pk0_shape.size());
     }
     arch.nkv = pk0_shape.size() >= 3 ? static_cast<int>(pk0_shape[2]) : LEGACY_NKV;
     arch.hd = pk0_shape.size() >= 5 ? static_cast<int>(pk0_shape[4]) : LEGACY_HD;
+
+    // ---- cache_kind: 从 past_key_values_0 的 elem_kind() 读 ----
+    // fp16 (默认) / fp8 (E4M3/E5M2)。shape 读取仍走 as_tensor<uint16_t> 是因为
+    // getShape() 在 ITensor 接口上、与容器类型无关；elem_kind() 才记录语义。
+    arch.cache_kind = pk0->elem_kind();
+    if (arch.cache_kind != ElemKind::kFloat16 &&
+        arch.cache_kind != ElemKind::kFloat8E4M3FN &&
+        arch.cache_kind != ElemKind::kFloat8E5M2) {
+        std::fprintf(stderr, "[arch] past_key_values_0 cache dtype %s unsupported, "
+                     "falling back to fp16\n", elem_name(arch.cache_kind));
+        arch.cache_kind = ElemKind::kFloat16;
+    }
 
     // ---- HIDDEN: 从 inputs_embeds shape ----
     auto emb = rt->GetInput("inputs_embeds");
@@ -564,7 +582,8 @@ int main(int argc, char** argv) {
     // KV cache：每层 past/present 的 buffer 一次开好（MAX_KV 上界），之后每轮
     // 只做逻辑 resize + present→past 回填。生命周期见 kv_cache.hpp。
     const int MAX_KV = 8192;
-    KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, MAX_KV);
+    KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, MAX_KV,
+               arch.cache_kind);
 
     // 会话上下文：图片块先登记（视觉塔已跑完），每轮的 user/assistant turn 累积
     // 在 Conversation 里，每轮整段重新 prefill。预算 = KV 上界减去本轮最多要生成

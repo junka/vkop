@@ -39,13 +39,33 @@ TEST(DTypeTest, RecognizesSupportedNames) {
 
 // Quantized formats are named so the loader can say "no kernel yet" instead of
 // picking a storage type for them. They parse, but nothing may compute on them.
+// uint8 used to live here but now has a kernel (the QuantizeLinear/
+// DequantizeLinear QDQ op decodes it for externally-quantized models), so it
+// graduated to the supported set in RecognizesUint8QDQ below.
 TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
-    for (const char *name : {"uint8", "bfloat16", "uint4"}) {
+    for (const char *name : {"bfloat16", "uint4"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_FALSE(elem_kind_supported(kind)) << name;
         EXPECT_STREQ(elem_name(kind), name);
     }
+}
+
+// uint8 rides an int8_t container and is decoded by the QDQ shaders
+// (QuantizeLinear/DequantizeLinear) for externally-quantized (QDQ) models —
+// ORT's dynamic quantizer emits uint8 weights by default. It is now a
+// supported format (cleared the loader's gate), unlike bfloat16/uint4 above.
+TEST(DTypeTest, RecognizesUint8QDQ) {
+    const ElemKind kind = elem_kind_from_name("uint8");
+    EXPECT_NE(kind, ElemKind::kInvalid);
+    EXPECT_TRUE(elem_kind_supported(kind));
+    EXPECT_FALSE(elem_kind_packed(kind));
+    EXPECT_EQ(elem_bits(kind), 8);
+    EXPECT_EQ(elem_bytes(kind, 8), 8u);
+    EXPECT_STREQ(elem_name(kind), "uint8");
+    // No C++ type spells "one uint8 value"; it rides int8_t storage and the
+    // elem_kind records the unsigned interpretation, same as bool/fp8.
+    EXPECT_FALSE(storage_matches_kind(typeid(int8_t), kind));
 }
 
 // The fp8 weight-only payloads the buffer MatMul kernel decodes: one byte per

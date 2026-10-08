@@ -20,6 +20,13 @@
 //     端到端噪声内，所以这里的收益是「去掉一个 O(past_len) 的每步 memcpy」这一
 //     结构性事实，而不是当前上下文长度上可测出的速度。
 //
+// 存储类型：cache_kind 决定每层 past/present 的字节容器语义。fp16 是历史默认
+// （uint16_t 容器，2B/elem）；fp8（E4M3/E5M2）用 int8_t 容器（1B/elem），把
+// KV cache 显存减半。两者走同一套预分配/reset/swap 机制 —— preallocate_buffer
+// 和 swap_gpu_buffer_with 都是 sizeof(T) 的纯字节操作，dtype 无关。attention
+// 计算仍走 fp16：图里在 cache 边界插 QuantizeLinear/DequantizeLinear，所以
+// 这里看到的 past/present 永远是「原始 payload 字节」，不参与反量化。
+//
 // 前缀续用（跨轮跳过已算 KV）的接口留在这里：需要 feedback() 之外再加一个
 // 「保留前缀、只补后面」的入口，并先有 token 前缀校验（Conversation::prefixMatch）。
 // 目前图是单段连续 buffer、无 block table，所以还没接。
@@ -31,6 +38,7 @@
 #include <string>
 #include <vector>
 
+#include "core/DType.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
@@ -40,14 +48,29 @@ namespace export_ {
 
 class KVCache {
 public:
+    // cache_kind 选择 KV cache 的存储语义。fp16 是历史默认；传 kFloat8E4M3FN /
+    // kFloat8E5M2 则每层 past/present 用 int8_t 容器承载 fp8 字节（图侧需在
+    // cache 边界插 QuantizeLinear/DequantizeLinear，见 qwen3_export_onnx.py
+    // 的 --kv-fp8 分支）。
     KVCache(const std::shared_ptr<core::Runtime>& rt,
             const std::shared_ptr<VulkanCommandPool>& cmdpool, int nlayers,
-            int nkv, int hd, int max_kv)
-        : rt_(rt), cmdpool_(cmdpool), nlayers_(nlayers), nkv_(nkv), hd_(hd) {
+            int nkv, int hd, int max_kv,
+            core::ElemKind cache_kind = core::ElemKind::kFloat16)
+        : rt_(rt), cmdpool_(cmdpool), nlayers_(nlayers), nkv_(nkv), hd_(hd),
+          cache_kind_(cache_kind) {
         if (nlayers <= 0 || nkv <= 0 || hd <= 0 || max_kv <= 0) {
             throw std::runtime_error("KVCache: invalid arch parameters");
         }
-        // past/present 都按 max_kv 开好，长度增长时不再重分配。
+        if (cache_kind != core::ElemKind::kFloat16 &&
+            cache_kind != core::ElemKind::kFloat8E4M3FN &&
+            cache_kind != core::ElemKind::kFloat8E5M2) {
+            throw std::runtime_error(
+                "KVCache: unsupported cache element format " +
+                std::string(core::elem_name(cache_kind)));
+        }
+        // past/present 都按 max_kv 开好，长度增长时不再重分配。元素总数与 dtype
+        // 无关（2 × nkv × max_kv × hd，K/V 在 dim 1 叠在一起）；字节宽由容器类型
+        // 决定，preallocate_buffer 内部按 sizeof(T) 对齐。
         const std::size_t kv_elems = static_cast<std::size_t>(2) * nkv * max_kv * hd;
         auto dev = cmdpool->getVulkanDevice();
         for (int i = 0; i < nlayers; ++i) {
@@ -57,8 +80,8 @@ public:
                 throw std::runtime_error("KVCache: missing KV tensor layer " +
                                          std::to_string(i));
             }
-            core::as_tensor<uint16_t>(pin)->preallocate_buffer(dev, kv_elems);
-            core::as_tensor<uint16_t>(pout)->preallocate_buffer(dev, kv_elems);
+            preallocate_kv_(pin, dev, kv_elems);
+            preallocate_kv_(pout, dev, kv_elems);
         }
     }
 
@@ -76,7 +99,7 @@ public:
     void upload() {
         for (int i = 0; i < nlayers_; ++i) {
             auto t = rt_->GetInput("past_key_values_" + std::to_string(i));
-            core::as_tensor<uint16_t>(t)->copyToGPU(cmdpool_);
+            upload_kv_(t);
         }
     }
 
@@ -86,9 +109,8 @@ public:
     int feedback() {
         int past_len = 0;
         for (int i = 0; i < nlayers_; ++i) {
-            auto pres = core::as_tensor<uint16_t>(
-                rt_->GetOutput("present_key_values_" + std::to_string(i)));
-            const int kv_len = pres->num_elements() / (2 * nkv_ * hd_);
+            auto pres = rt_->GetOutput("present_key_values_" + std::to_string(i));
+            const int kv_len = num_kv_elems_(pres) / (2 * nkv_ * hd_);
             // 先改逻辑形状（ResizeInput 会把 converted_ 置回 false，buffer 仍走
             // prealloc_keep_ 复用），再换 buffer，最后把 past 标回「数据在 GPU 上」
             // —— 换过来的那块装着本轮写出的历史，不需要任何上传。
@@ -96,10 +118,9 @@ public:
                              {1u, 2u, static_cast<uint32_t>(nkv_),
                               static_cast<uint32_t>(kv_len),
                               static_cast<uint32_t>(hd_)});
-            auto past = core::as_tensor<uint16_t>(
-                rt_->GetInput("past_key_values_" + std::to_string(i)));
-            past->swap_gpu_buffer_with(*pres);
-            past->toGPU();
+            auto past = rt_->GetInput("past_key_values_" + std::to_string(i));
+            swap_kv_(past, pres);
+            mark_gpu_(past);
             past_len = kv_len;
         }
         return past_len;
@@ -108,11 +129,55 @@ public:
     int nlayers() const { return nlayers_; }
     int nkv() const { return nkv_; }
     int hd() const { return hd_; }
+    core::ElemKind cache_kind() const { return cache_kind_; }
 
 private:
     std::shared_ptr<core::Runtime> rt_;
     std::shared_ptr<VulkanCommandPool> cmdpool_;
     int nlayers_, nkv_, hd_;
+    core::ElemKind cache_kind_;
+
+    // 按 cache_kind 分派到对应容器的预分配。fp16 走 uint16_t，fp8 走 int8_t
+    // （和 bool/int8 同一容器，elem_kind() 记录 fp8 语义）。
+    void preallocate_kv_(const std::shared_ptr<core::ITensor>& t,
+                         std::shared_ptr<VulkanDevice>& dev,
+                         std::size_t kv_elems) {
+        if (cache_kind_ == core::ElemKind::kFloat16) {
+            core::as_tensor<uint16_t>(t)->preallocate_buffer(dev, kv_elems);
+        } else {
+            core::as_tensor<int8_t>(t)->preallocate_buffer(dev, kv_elems);
+        }
+    }
+    void upload_kv_(const std::shared_ptr<core::ITensor>& t) {
+        if (cache_kind_ == core::ElemKind::kFloat16) {
+            core::as_tensor<uint16_t>(t)->copyToGPU(cmdpool_);
+        } else {
+            core::as_tensor<int8_t>(t)->copyToGPU(cmdpool_);
+        }
+    }
+    int num_kv_elems_(const std::shared_ptr<core::ITensor>& t) {
+        if (cache_kind_ == core::ElemKind::kFloat16) {
+            return core::as_tensor<uint16_t>(t)->num_elements();
+        }
+        return core::as_tensor<int8_t>(t)->num_elements();
+    }
+    void swap_kv_(const std::shared_ptr<core::ITensor>& past,
+                  const std::shared_ptr<core::ITensor>& pres) {
+        if (cache_kind_ == core::ElemKind::kFloat16) {
+            core::as_tensor<uint16_t>(past)->swap_gpu_buffer_with(
+                *core::as_tensor<uint16_t>(pres));
+        } else {
+            core::as_tensor<int8_t>(past)->swap_gpu_buffer_with(
+                *core::as_tensor<int8_t>(pres));
+        }
+    }
+    void mark_gpu_(const std::shared_ptr<core::ITensor>& t) {
+        if (cache_kind_ == core::ElemKind::kFloat16) {
+            core::as_tensor<uint16_t>(t)->toGPU();
+        } else {
+            core::as_tensor<int8_t>(t)->toGPU();
+        }
+    }
 };
 
 } // namespace export_

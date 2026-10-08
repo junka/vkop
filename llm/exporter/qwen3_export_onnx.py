@@ -264,9 +264,107 @@ print(f"[✓] exported → {EXPORT_PATH}")
 # 合并散权重（如果 >2GB 触发 torch external-data）
 # ---------------------------------------------------------------------------
 import onnx
+from onnx import helper, TensorProto
 
 print("[consolidate] checking external data ...")
 m = onnx.load(EXPORT_PATH, load_external_data=True)
+
+# ---------------------------------------------------------------------------
+# 可选：FP8 KV cache。VKOP_KV_FP8=1 时把每层 past/present_key_values 的存储
+# 从 fp16 改成 E4M3 fp8（1B/elem，显存减半）。attention 仍走 fp16 —— 在 cache
+# 边界插 QuantizeLinear(fp16->fp8)/DequantizeLinear(fp8->fp16)。
+# scale 是 per-tensor 常量，由 VKOP_KV_SCALE 指定（默认 0.1，覆盖 Qwen3 K/V
+# 经 RMSNorm 后的典型值域；超出 ±448 会被 saturate）。
+# ---------------------------------------------------------------------------
+def insert_fp8_kv_cache(model, scale=0.1):
+    """Rewrite the KV cache I/O to fp8.
+
+    For each layer i:
+      - present side: the node that produces present_key_values_i now feeds a
+        new QuantizeLinear node whose fp8 output is the graph output (renamed
+        in place); the graph output keeps the name present_key_values_i but
+        its dtype becomes float8e4m3fn.
+      - past side: a new DequantizeLinear node sits between the past_key_values_i
+        graph input (now fp8) and every original consumer, turning the fp8 bytes
+        back into fp16 for the attention Concat.
+
+    The past/present graph I/O dtype is recorded by the converter from the
+    ValueInfoProto we set here; the runtime reads that string and creates an
+    int8_t container for the fp8 bytes.
+    """
+    g = model.graph
+    nlayers = 0
+    while any(o.name == f"present_key_values_{nlayers}" for o in g.output):
+        nlayers += 1
+    if nlayers == 0:
+        print("[kv-fp8] no present_key_values_* outputs found, skipping")
+        return
+
+    fp8_dt = TensorProto.FLOAT8E4M3FN
+    # One per-tensor scale initializer, reused by every layer (same scale for
+    # K and V; a single fp32 scalar).
+    scale_name = "kv_cache_fp8_scale"
+    scale_init = helper.make_tensor(scale_name, TensorProto.FLOAT, [], [scale])
+    g.initializer.append(scale_init)
+
+    for i in range(nlayers):
+        past_name = f"past_key_values_{i}"
+        pres_name = f"present_key_values_{i}"
+
+        # ---- past side: fp8 input -> DequantizeLinear -> fp16 ------------
+        # Find the graph input's ValueInfo and change its dtype to fp8.
+        for vi in list(g.input):
+            if vi.name == past_name:
+                vi.type.tensor_type.elem_type = fp8_dt
+                break
+        # The fp16 tensor the original consumers expect to see.
+        past_fp16 = f"{past_name}_fp16"
+        dq = helper.make_node(
+            "DequantizeLinear",
+            inputs=[past_name, scale_name],
+            outputs=[past_fp16],
+            name=f"DequantizeLinear_kv_{i}",
+        )
+        g.node.append(dq)
+        # Rewire every consumer of past_name (except the new DQ node) to read
+        # past_fp16 instead.
+        for node in g.node:
+            if node is dq:
+                continue
+            for k in range(len(node.input)):
+                if node.input[k] == past_name:
+                    node.input[k] = past_fp16
+
+        # ---- present side: fp16 producer -> QuantizeLinear -> fp8 output --
+        # The node that currently outputs present_key_values_i is renamed to
+        # feed an intermediate; a QuantizeLinear turns that into fp8 bytes,
+        # which become the graph output under the same name.
+        pres_fp16 = f"{pres_name}_fp16"
+        # Rename the producer's output.
+        for node in g.node:
+            for k in range(len(node.output)):
+                if node.output[k] == pres_name:
+                    node.output[k] = pres_fp16
+        q = helper.make_node(
+            "QuantizeLinear",
+            inputs=[pres_fp16, scale_name],
+            outputs=[pres_name],
+            name=f"QuantizeLinear_kv_{i}",
+        )
+        g.node.append(q)
+        # Change the graph output's dtype to fp8.
+        for o in g.output:
+            if o.name == pres_name:
+                o.type.tensor_type.elem_type = fp8_dt
+                break
+
+    print(f"[kv-fp8] rewrote {nlayers} layer(s): past/present_key_values "
+          f"now E4M3 fp8 (per-tensor scale={scale})")
+
+if os.environ.get("VKOP_KV_FP8") == "1":
+    kv_scale = float(os.environ.get("VKOP_KV_SCALE", "0.1"))
+    insert_fp8_kv_cache(m, scale=kv_scale)
+
 n_init = len(m.graph.initializer)
 n_ext = sum(1 for t in m.graph.initializer
             if t.HasField("data_location") and t.data_location == 1)

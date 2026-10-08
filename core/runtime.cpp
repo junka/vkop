@@ -163,9 +163,13 @@ void Runtime::LoadModel() {
                 break;
             }
             case ElemKind::kInt8:
-            case ElemKind::kBool: {
-                // bool/int8 share the int8 storage representation; the LLM's
-                // image_pad_mask is bool but buffer ops consume it as bytes.
+            case ElemKind::kBool:
+            case ElemKind::kUint8: {
+                // bool/int8/uint8 share the int8 storage representation; the
+                // LLM's image_pad_mask is bool but buffer ops consume it as
+                // bytes, and a uint8 QDQ weight (ORT dynamic quantize's default
+                // for weights) rides the same container with elem_kind
+                // recording the unsigned interpretation.
                 auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
@@ -189,6 +193,20 @@ void Runtime::LoadModel() {
                 t = typed;
                 break;
             }
+            // fp8 rides an int8_t container the same way a bool mask or an int8
+            // weight does: the byte is a payload only a shader decodes, and
+            // elem_kind() is what records which fp8 variant it is. The LLM KV
+            // cache uses this path when the graph's past_key_values inputs are
+            // spelled float8e4m3fn (see kv_cache.hpp).
+            case ElemKind::kFloat8E4M3FN:
+            case ElemKind::kFloat8E5M2: {
+                auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
+                typed->set_elem_kind(kind);
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+                break;
+            }
             default:
                 throw std::runtime_error(
                     "vkop: graph input " + i.name + " has element format " +
@@ -206,7 +224,21 @@ void Runtime::LoadModel() {
     }
 
     for (const auto &o : model.outputs) {
-        if (precision_ == 1) {
+        // The file's dtype string decides for fp8 outputs (the LLM KV cache's
+        // present_key_values when stored as fp8); precision_ stays the fallback
+        // for the historical fp16/fp32-only outputs (logits, visual features).
+        const std::string odt = o.dtype.empty() ? "" : o.dtype;
+        const ElemKind okind =
+            odt.empty() ? ElemKind::kInvalid : elem_kind_from_name(odt);
+        if (okind == ElemKind::kFloat8E4M3FN ||
+            okind == ElemKind::kFloat8E5M2) {
+            auto t = std::make_shared<Tensor<int8_t>>(o.dims, true);
+            t->set_elem_kind(okind);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
+        } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
             outputs_[o.name] = t;
@@ -611,6 +643,26 @@ void Runtime::LoadModel() {
                         } else {
                             dtype_marker = "_f32_";
                         }
+                    } else if (type == vkop::ops::OpType::QUANTIZE_LINEAR) {
+                        // fp16/fp32 -> int8/uint8/fp8 bytes: the output is an
+                        // int8_t container regardless of which byte format.
+                        // Marked _i8_ so the byte-tensor creation path below
+                        // fires; elem_kind is then set from the recorded dtype
+                        // so a reader can tell fp8 from a bool/int8/uint8
+                        // payload (the _i8_ dispatch below reads
+                        // out_shape.dtype).
+                        dtype_marker = "_i8_";
+                    } else if (type == vkop::ops::OpType::DEQUANTIZE_LINEAR) {
+                        // int8/uint8/fp8 -> float: output dtype follows the
+                        // graph's recorded output dtype (float16 for the fp16
+                        // LLM, float32 for an fp32 model), not a hardcoded
+                        // fp16.
+                        const auto &odt = out_shape.dtype;
+                        if (odt == "float32") {
+                            dtype_marker = "_f32_";
+                        } else {
+                            dtype_marker = "_f16_";
+                        }
                     } else if (type == vkop::ops::OpType::FUSED_ELEMWISE) {
                         // Fusion across Cast: the chain's terminal op may be a
                         // dtype-crossing Cast, so the output dtype is NOT
@@ -728,16 +780,27 @@ void Runtime::LoadModel() {
                             node_outputs.push_back(t);
                         }
                     }
-                    // A byte-tensor output is either a bool mask or an int8
-                    // value, and the marker above cannot tell them apart; the
-                    // recorded dtype can. The float formats are left alone on
-                    // purpose: precision_ deliberately runs fp32-recorded
-                    // chains in fp16, so for them the file's dtype is not
-                    // authoritative about the bytes the runtime actually holds.
+                    // A byte-tensor output is either a bool mask, an int8
+                    // value, or an fp8 payload, and the marker above cannot
+                    // tell them apart; the recorded dtype can. The float
+                    // formats are left alone on purpose: precision_
+                    // deliberately runs fp32-recorded chains in fp16, so for
+                    // them the file's dtype is not authoritative about the
+                    // bytes the runtime actually holds.
                     if (dtype_marker == "_i8_") {
-                        node_outputs.back()->set_elem_kind(
-                            out_shape.dtype == "bool" ? ElemKind::kBool
-                                                      : ElemKind::kInt8);
+                        const ElemKind recorded =
+                            elem_kind_from_name(out_shape.dtype);
+                        if (recorded == ElemKind::kFloat8E4M3FN ||
+                            recorded == ElemKind::kFloat8E5M2) {
+                            node_outputs.back()->set_elem_kind(recorded);
+                        } else if (out_shape.dtype == "bool") {
+                            node_outputs.back()->set_elem_kind(ElemKind::kBool);
+                        } else if (out_shape.dtype == "uint8") {
+                            node_outputs.back()->set_elem_kind(
+                                ElemKind::kUint8);
+                        } else {
+                            node_outputs.back()->set_elem_kind(ElemKind::kInt8);
+                        }
                     }
                 }
             }
@@ -888,7 +951,9 @@ void Runtime::LoadModel() {
         for (size_t i = 0; i < node_output_tensors_.size(); ++i) {
             const auto type = node_ops_[i]->get_type();
             if (type == vkop::ops::OpType::CAST ||
-                type == vkop::ops::OpType::FUSED_ELEMWISE) {
+                type == vkop::ops::OpType::FUSED_ELEMWISE ||
+                type == vkop::ops::OpType::QUANTIZE_LINEAR ||
+                type == vkop::ops::OpType::DEQUANTIZE_LINEAR) {
                 continue;
             }
             if (i >= node_input_tensors_.size() ||
