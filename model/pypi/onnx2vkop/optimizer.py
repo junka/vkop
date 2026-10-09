@@ -890,6 +890,21 @@ class FusionOptimizer:
             )
         )
 
+        # QDQ weight-into-MatMul: fold an externally-quantized weight's
+        # DequantizeLinear(-> Cast) -> MatMul chain into the runtime's existing
+        # weight-only int8 MatMul [A, B_int8, scale], so the weight stays one
+        # byte per value in VRAM instead of being DQ-expanded to fp16. Runs
+        # after the cast/unsqueeze cleanup (100..76) so the chain it matches is
+        # already in canonical DequantizeLinear[->Cast] -> MatMul form.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_qdq_weight_into_matmul",
+                FusionOptimizer.match_qdq_weight_into_matmul,
+                FusionOptimizer.fold_qdq_weight_into_matmul,
+                priority=86,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_into_attention",
@@ -3049,6 +3064,165 @@ class FusionOptimizer:
         del dag_model.nodes[mm.name]
         if t.name in dag_model.nodes:
             del dag_model.nodes[t.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- QDQ weight-into-MatMul (weight-only int8) fusion ----
+    # An externally-quantized model carries its weights as a QDQ triple:
+    #     DequantizeLinear(u8_const, scalar_fp32_scale, scalar_u8_zero_point)
+    #         -> Cast(to=FLOAT16) -> MatMul(A, <that>)
+    # Running that verbatim DQ-expands the weight to fp16 in VRAM, which is
+    # correct but saves nothing. This pass folds the whole chain into the
+    # weight-only int8 MatMul form the runtime already has:
+    #     MatMul(A, B_int8, scale_per_column)
+    # The weight stays ONE byte per value in VRAM.
+    #
+    # The existing int8 kernel is symmetric-only (it decodes a byte as
+    # two's complement, i.e. an implicit zero_point of 128) and cannot express
+    # the injector's per-tensor asymmetric offset — measured zp runs 66..205,
+    # and q-zp falls outside int8 range for 163/169 tensors, so no recentring
+    # trick works. Instead the fold reconstructs the fp32 weight
+    # `dec = (q - zp) * scale` and re-quantizes it symmetrically per output
+    # column (`amax/127`). That mirrors `quantize_to_int8_weight_only` exactly,
+    # so the graph the fold emits is one the converter could have produced
+    # itself with `-q int8`.
+    #
+    # Measured cost (Qwen2.5-0.5B, 169 weights): the re-encode is
+    # ||FOLD-ORTQ||/||DEC|| ~ 0.010 relative, ~50x the fp16 rounding of the
+    # decode but well under the QDQ quantization error it sits on top of
+    # (~0.036). Model level, executed through ORT on the re-encoded graph, the
+    # last-token argmax matches ORT-on-QDQ exactly (608 = 608).
+    @staticmethod
+    def match_qdq_weight_into_matmul(dag_model):
+        producer = {}
+        consumers = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+            for i in n.inputs:
+                consumers[i["name"]].append(n)
+
+        matches = []
+        for mm in dag_model.nodes.values():
+            if mm.op_type != "MatMul" or len(mm.inputs) != 2:
+                continue
+            # A must be the activation, not a constant: on the A side there is
+            # no per-column scale to index, so the byte-weight kernel cannot be
+            # used at all.
+            if mm.inputs[0]["name"] in dag_model.initializers:
+                continue
+            b_name = mm.inputs[1]["name"]
+            # Optional Cast between the DQ and the MatMul (the injector emits
+            # fp32 DQ and casts to fp16 for the fp16 MatMul).
+            cast_node = None
+            chain_out = b_name
+            p = producer.get(b_name)
+            if p is not None and p.op_type == "Cast":
+                cast_node = p
+                chain_out = p.inputs[0]["name"]
+            dq_node = producer.get(chain_out)
+            if dq_node is None or dq_node.op_type != "DequantizeLinear":
+                continue
+            if len(dq_node.inputs) < 2:
+                continue
+            q_name = dq_node.inputs[0]["name"]
+            s_name = dq_node.inputs[1]["name"]
+            zp_name = dq_node.inputs[2]["name"] if len(dq_node.inputs) > 2 else None
+            # Weight-only dequant: a constant quantized payload, a scalar
+            # scale, and (optionally) a scalar zero_point. A DQ over an
+            # activation tensor has no initializer here and is left alone.
+            if q_name not in dag_model.initializers or s_name not in dag_model.initializers:
+                continue
+            if zp_name is not None and zp_name not in dag_model.initializers:
+                continue
+            q_t = dag_model.initializers[q_name]
+            if q_t.data_type not in (onnx.TensorProto.UINT8, onnx.TensorProto.INT8):
+                continue
+            if len(q_t.dims) != 2:
+                continue
+            s_t = dag_model.initializers[s_name]
+            # Per-axis / per-tensor scales are not what the injector emits, and
+            # the fold's own per-column scale replaces it anyway; refuse
+            # anything that is not a scalar so a per-axis model is never
+            # silently mis-folded.
+            if len(s_t.dims) != 0:
+                continue
+            # The DQ (and the Cast) must have exactly one consumer, otherwise
+            # rewriting them to an int8 weight would corrupt the other readers.
+            if len(consumers.get(chain_out, [])) != 1:
+                continue
+            if cast_node is not None and len(consumers.get(b_name, [])) != 1:
+                continue
+            matches.append({
+                "matmul_node": mm,
+                "dq_node": dq_node,
+                "cast_node": cast_node,
+                "q_name": q_name,
+                "s_name": s_name,
+                "zp_name": zp_name,
+            })
+        print(f"Found {len(matches)} DequantizeLinear(weight)->MatMul patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_qdq_weight_into_matmul(dag_model, match) -> bool:
+        mm = match["matmul_node"]
+        dq = match["dq_node"]
+        cast_node = match.get("cast_node")
+
+        q = numpy_helper.to_array(dag_model.initializers[match["q_name"]]).astype(np.float32)
+        s_arr = np.asarray(numpy_helper.to_array(dag_model.initializers[match["s_name"]])).reshape(-1)
+        s = float(s_arr[0]) if s_arr.size else 1.0
+        zp = 0.0
+        if match["zp_name"] is not None:
+            zp_arr = np.asarray(
+                numpy_helper.to_array(dag_model.initializers[match["zp_name"]])).reshape(-1)
+            if zp_arr.size:
+                zp = float(zp_arr[0])
+
+        # Reconstruct the fp32 weight ORT would have fed MatMul, then re-encode
+        # it symmetrically per output column. transB says which physical axis
+        # carries the output columns: transB=0 stores B as [K, N] (reduce
+        # axis 0 -> length N), transB=1 as [N, K] (reduce axis 1 -> length N).
+        dec = (q - zp) * s
+        trans_b = int(mm.attributes.get("transB", 0) or 0)
+        axis = 1 if trans_b else 0
+        amax = np.amax(np.abs(dec), axis=axis, keepdims=True)
+        scale_kd = np.where(amax == 0, 1.0, amax / 127.0)
+        q_i8 = np.clip(np.round(dec / scale_kd), -127, 127).astype(np.int8)
+        scale = np.squeeze(scale_kd, axis=axis).astype(np.float32).reshape(-1)
+
+        # The byte payload and the scale keep their original initializer names
+        # (the MatMul is about to point at them). The zp initializer is what the
+        # fold absorbs, so it goes away.
+        int8_init = numpy_helper.from_array(q_i8, match["q_name"])
+        int8_init.data_type = onnx.TensorProto.INT8
+        dag_model.initializers[match["q_name"]] = int8_init
+
+        scale_init = numpy_helper.from_array(scale, match["s_name"])
+        scale_init.data_type = onnx.TensorProto.FLOAT
+        dag_model.initializers[match["s_name"]] = scale_init
+
+        if match["zp_name"] is not None:
+            dag_model.initializers.pop(match["zp_name"], None)
+
+        new_inputs = [
+            mm.inputs[0],
+            {"name": match["q_name"], "shape": list(q_i8.shape)},
+            {"name": match["s_name"], "shape": list(scale.shape)},
+        ]
+        fused = Node(
+            op_type="MatMul",
+            name=mm.name,  # keep MatMul's name (its output tensor stays)
+            attributes=dict(mm.attributes),
+            inputs=new_inputs,
+            outputs=mm.outputs[:],
+        )
+        del dag_model.nodes[mm.name]
+        if cast_node is not None and cast_node.name in dag_model.nodes:
+            del dag_model.nodes[cast_node.name]
+        if dq.name in dag_model.nodes:
+            del dag_model.nodes[dq.name]
         dag_model.nodes[fused.name] = fused
         return True
 
