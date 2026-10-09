@@ -126,6 +126,12 @@ TEST(DTypeTest, RequireSupportedElemThrowsLoudly) {
                  std::runtime_error);
     // The two failure modes read differently on purpose.
     try {
+        // bfloat16 stays rejected here on purpose: the runtime has no bf16
+        // kernel and no bf16 storage type (every 16-bit-float buffer shader
+        // unpacks half2). The converter normalizes a bf16 model to fp16 before
+        // it is written (converter._downcast_bfloat16), so a bf16 name reaching
+        // the loader means that normalization was bypassed and this is the
+        // error that says so.
         require_supported_elem("bfloat16", "initializer w");
         FAIL() << "a format with no kernel must not load";
     } catch (const std::runtime_error &e) {

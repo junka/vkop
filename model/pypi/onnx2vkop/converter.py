@@ -71,6 +71,63 @@ def _io_dtype_override(model, vi):
     return None
 
 
+# ONNX BFLOAT16 is not a format the runtime can compute on: every buffer (SSBO)
+# shader unpacks fp16 with unpackHalf2x16, so a bf16 tensor has no storage type
+# it could ride and no kernel that could read it. Rather than grow a second
+# 16-bit float format through every op, the converter normalizes it away. bf16's
+# 8-bit mantissa is narrower than fp16's 11-bit significand, so a weight that
+# fits fp16's exponent range converts with NO rounding at all -- the same
+# argument the image exporter's bf16 checkpoint path already relies on
+# (image/exporter/qi21_export_text_encoder_onnx.py:46-48). Values outside fp16's
+# +-65504 saturate, which is why this is a weight/IO normalization and not an
+# arithmetic path a mid-graph bf16 activation could depend on.
+_BFLOAT16 = onnx.TensorProto.BFLOAT16
+_FLOAT16 = onnx.TensorProto.FLOAT16
+
+
+def _bf16_bytes_to_fp16(raw: bytes) -> bytes:
+    """Reinterpret a buffer of bf16 bit patterns as fp16.
+
+    bf16 is fp32 with the low 16 mantissa bits dropped, so the conversion is a
+    shift: widen each uint16 into the high half of a uint32 and read it as
+    float32, then let numpy round once to fp16. Pure numpy on purpose -- numpy
+    has no native bfloat16, and taking on ml_dtypes just to move a tensor
+    between two float formats would be a new converter dependency."""
+    u16 = np.frombuffer(raw, dtype=np.uint16)
+    f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+    with np.errstate(over="ignore"):
+        # A magnitude past fp16's +-65504 saturates to inf; numpy would warn,
+        # but that is the defined outcome here, not an error.
+        return np.ascontiguousarray(f32.astype(np.float16)).tobytes()
+
+
+def _downcast_bfloat16(model) -> int:
+    """Rewrite every bfloat16 tensor in the model to float16, in place.
+
+    Covers the three places a dtype is spelled: an initializer's payload, a
+    ValueInfoProto's element type (graph input/output/value_info), and a node
+    attribute holding a tensor (Constant). Returns how many were converted."""
+    count = 0
+    for init in model.graph.initializer:
+        if init.data_type == _BFLOAT16:
+            init.raw_data = _bf16_bytes_to_fp16(init.raw_data)
+            init.data_type = _FLOAT16
+            count += 1
+    for vi in (list(model.graph.input) + list(model.graph.output)
+               + list(model.graph.value_info)):
+        if vi.type.tensor_type.elem_type == _BFLOAT16:
+            vi.type.tensor_type.elem_type = _FLOAT16
+            count += 1
+    for node in model.graph.node:
+        for attr in node.attribute:
+            if (attr.type == onnx.AttributeProto.TENSOR
+                    and attr.t.data_type == _BFLOAT16):
+                attr.t.raw_data = _bf16_bytes_to_fp16(attr.t.raw_data)
+                attr.t.data_type = _FLOAT16
+                count += 1
+    return count
+
+
 class ModelConverter:
     """Main class for converting ONNX models to DAG-based format."""
 
@@ -86,6 +143,15 @@ class ModelConverter:
         # Load external weights (llm.weights.bin) into memory so the optimized
         # model can be processed without a 2GB+ single-file protobuf save.
         onnx.load_external_data_for_model(model, os.path.dirname(os.path.abspath(onnx_path)))
+
+        # Normalize bf16 away before anything reads a dtype: the runtime has no
+        # bf16 kernel and no bf16 storage type, so a model that spells it has to
+        # become fp16 here or the loader rejects it at the format gate. Runs
+        # before optimize_model so the ConstantFolder and every fusion pass only
+        # ever see the fp16 form.
+        bf16_count = _downcast_bfloat16(model)
+        if bf16_count:
+            print(f"[bf16] downcast {bf16_count} bfloat16 tensor(s) to float16")
 
         print("Optimizing ONNX model...")
         model = self.optimizer.optimize_model(model, batch_size)

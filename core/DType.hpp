@@ -79,6 +79,13 @@ enum class ElemKind : uint8_t {
     // Spelled in a model file, but no kernel reads them yet. They are listed so
     // the loader can name the format and say "no kernel" instead of falling
     // into a storage guess.
+    //
+    // kBFloat16 is never meant to reach the runtime: every 16-bit-float buffer
+    // shader unpacks with unpackHalf2x16 (fp16's layout, not bf16's), so the
+    // converter normalizes a bf16 model to fp16 up front
+    // (converter._downcast_bfloat16) rather than growing a second 16-bit float
+    // format through every op. This case stays so a bf16 tensor that somehow
+    // reaches the loader is named and rejected, not silently read as fp16.
     kUint8,
     kBFloat16,
 };
