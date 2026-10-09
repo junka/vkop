@@ -1,9 +1,8 @@
 #version 450 core
 
-// SSBO cooperative-matrix MatMul (fp16 A, fp16 or quantized weight B, fp32
-// accumulate -> scratch). Replaces the naive 1-thread-per-output reduce
-// (matmul.comp) for the fp16 LLM path. Intel ARL supports exactly one fp16
-// coopmat combo:
+// SSBO cooperative-matrix MatMul (fp16 A/B, fp32 accumulate -> scratch).
+// Replaces the naive 1-thread-per-output reduce (matmul.comp) for the fp16
+// LLM path. Intel ARL supports exactly one fp16 coopmat combo:
 //   coopmat<float16_t, gl_ScopeSubgroup, 8, 16, A>
 //   coopmat<float16_t, gl_ScopeSubgroup, 16, 8, B>
 //   coopmat<float,       gl_ScopeSubgroup, 8,  8, Acc>   (fp16 in -> fp32 acc)
@@ -49,13 +48,12 @@ layout(set = 0, binding = 2) readonly buffer InB {
 layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
-// bindings 4 and 5 are the quantized weight's dequant scales: binding 4 is
-// the scale table (one fp32 per output column for int8/fp8, one per
-// [K group, column] for the 4-bit formats, an e4m3 byte per block for NVFP4)
-// and binding 5 is NVFP4's single fp32 tensor factor. Both are inert for a
-// plain fp16 B, where the host binds dummies; the layout declares all 6
-// bindings because the op fills every descriptor set from the same objs_
-// vector (6 slots: out, A, B, scratch, scale/dummy, factor/dummy).
+// bindings 4 and 5 are UNUSED by the cooperative-matrix kernel. They exist
+// only so this pipeline's descriptor-set layout matches the quantized-weight
+// MatMul layouts (which bind a per-group scale table at 4 and an NVFP4 global
+// factor at 5). The op fills every descriptor set — coopmat included — from
+// the same objs_ vector (6 slots: out, A, B, scratch, scale/dummy, factor/dummy),
+// so the layout must declare all 6 bindings even though only 0-3 are read.
 layout(set = 0, binding = 4) readonly buffer ScaleTab {
     uint data[];
 } uScaleTab;
@@ -63,32 +61,13 @@ layout(set = 0, binding = 5) readonly buffer GlobalFac {
     uint data[];
 } uGlobalFac;
 
-// The push-constant block is the host's GpuMatMulParam verbatim (see
-// ops/Matmul.hpp), so every field must keep its offset. Only the ones this
-// shader reads are commented; the rest are declared to hold the layout.
 layout(push_constant) uniform PC {
     int M;
     int N;
     int K;
     int batch;
-    int fp32;        // unused here (this shader is fp16-in only); PC compat
-    int transB;      // 1 = B is [batch, N, K]; only 0 reaches this shader
-    int tile;        // unused (host-side selector)
-    int weight_int8; // 1 = B is one byte per quantized value, dequant via
-                     // uScaleTab[w]; fp8 when fp8 != 0, int8 otherwise
-    int w8_quad;     // unused (host-side selector)
-    int ksplit;      // unused (host-side selector)
-    int w4;          // 1 = B is a packed 4-bit weight (two nibbles per byte,
-                     // even element in the low nibble) with a per-group scale
-                     // row at uScaleTab, laid out [K/group, N]
-    int nf4;         // 1 = the nibble is an unsigned NF4 codebook index
-                     // instead of a signed int4 value
-    int group;       // with w4: values of K sharing one scale row (K / n_groups)
-    int fp8;         // 1 = the weight bytes are fp8 (E5M2 when fp8_e5m2)
-    int fp8_e5m2;    // 1 = the fp8 bytes are E5M2 instead of E4M3
-    int nvfp4;       // 1 = the w4 nibble is an E2M1 code scaled by an e4m3 byte
-                     // per (16-value K block, column) times the fp32 tensor
-                     // factor at uGlobalFac; also fixes group to 16
+    int fp32;   // unused here (this shader is fp16-in only); kept for PC compat
+    int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
 } uPC;
 
 const int M_BLOCK = 8;
@@ -104,98 +83,6 @@ float16_t loadA(int elem) {
 }
 float16_t loadB(int elem) {
     return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
-}
-
-// ---- quantized weight decode ------------------------------------------
-// The shared-memory staging below is the only place a weight is touched, so
-// decoding there turns one fp16 tile load into the format's own load: the
-// MMA itself is unchanged (the fp16/e5m2 shapes always go in as fp16 tiles).
-// These are matmul.comp's decoders, verbatim -- a weight byte has to decode
-// the same way in both kernels or a quantized model would answer differently
-// depending on which GEMM shape the host picked.
-
-// One int8 weight byte as a float.
-float w8_val(uint b) { return float(b ^ 0x80u) - 128.0; }
-
-// One fp8 byte as a float, by reassembling the fields (no hardware path on
-// this stack). See matmul.comp for the derivation of the two constants.
-float e4m3_val(uint b) {
-    uint m = b & 0x7Fu;
-    float v =
-        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
-    return (b & 0x80u) != 0u ? -v : v;
-}
-
-float e5m2_val(uint b) {
-    uint m = b & 0x7Fu;
-    float v =
-        m > 3u ? uintBitsToFloat((m + 448u) << 21u) : float(m) * 1.52587890625e-05;
-    return (b & 0x80u) != 0u ? -v : v;
-}
-
-float f8_val(uint b) { return uPC.fp8_e5m2 != 0 ? e5m2_val(b) : e4m3_val(b); }
-
-float w_val(uint b) { return uPC.fp8 != 0 ? f8_val(b) : w8_val(b); }
-
-// The NF4 codebook: the 16 quantiles of a unit-normal distribution,
-// normalized so the extreme codes are exactly -1 and +1.
-float nf4_code(int q) {
-    const float cb[16] = float[16](
-        -1.0, -0.6961928009986877, -0.5250730514526367, -0.3949174189567566,
-        -0.2844413814544678, -0.1847814998626709, -0.0910967006323811, 0.0,
-        0.0795802986717224, 0.1601973110246658, 0.2447470557689667,
-        0.3361703515052795, 0.4407098295211792, 0.5626170039176941,
-        0.7229568369388580, 1.0);
-    return cb[q];
-}
-
-// One signed 4-bit value: bitfieldExtract sign-extends the nibble.
-float w4_val(uint word, int e) {
-    return float(bitfieldExtract(int(word), e * 4, 4));
-}
-
-// One E2M1 nibble -- sign, 2 exponent bits, 1 mantissa bit -- so its eight
-// magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6.
-float e2m1_val(uint c) {
-    uint m = c & 7u;
-    float v = m > 1u
-                  ? uintBitsToFloat((((m + 252u) >> 1u) << 23u) |
-                                    ((m & 1u) << 22u))
-                  : float(m) * 0.5;
-    return (c & 8u) != 0u ? -v : v;
-}
-
-// One weight by its index in the logical [K, N] matrix. Only valid when
-// weight_int8 or w4 is set; the staging below keeps the two apart so this is
-// a cold path either way.
-float weight_at(int idx) {
-    if (uPC.w4 != 0) {
-        uint word = uInputB.data[idx >> 3];
-        int e = idx & 7;
-        if (uPC.nvfp4 != 0) return e2m1_val((word >> (e * 4)) & 15u);
-        return uPC.nf4 != 0 ? nf4_code(int((word >> (e * 4)) & 15u))
-                            : w4_val(word, e);
-    }
-    return w_val((uInputB.data[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu);
-}
-
-// One column's dequant scale at K row `kr` (the group row index). The byte
-// formats carry one scale per column, so kr is ignored for them; the 4-bit
-// formats carry a [n_groups, N] fp32 row (an e4m3 byte per column for NVFP4)
-// indexed by the K group. group is a push constant, so the division is by a
-// uniform value.
-float weight_scale(int kr, int col) {
-    if (uPC.w4 != 0) {
-        int g = kr / uPC.group;
-        int sw = g * uPC.N + col;
-        if (uPC.nvfp4 != 0) {
-            return e4m3_val((uScaleTab.data[sw >> 2] >> ((sw & 3) * 8)) &
-                            0xFFu) *
-                   uintBitsToFloat(uGlobalFac.data[0]);
-        }
-        return uintBitsToFloat(uScaleTab.data[sw]);
-    }
-    return uintBitsToFloat(uScaleTab.data[col]);
 }
 
 // Shared tiles laid out as float16_t, row-major.
@@ -222,10 +109,6 @@ void main() {
     int a_base = b * M * K; // A[batch, :, :]
     int b_base = b * K * N; // B[batch, :, :] (row-major K x N)
 
-    // A quantized weight: B's bytes/nibbles go through the decoders above into
-    // the shared tile instead of the packed-half2 path.
-    bool quant = uPC.weight_int8 != 0 || uPC.w4 != 0;
-
     coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
              gl_MatrixUseAccumulator>
         matC;
@@ -247,11 +130,7 @@ void main() {
                                             : float16_t(0.0);
             shA[int(tid)] = v;
         }
-        // 256 threads load B[K_BLOCK x BN] = 512 fp16 => 2/thread. A
-        // quantized weight is decoded here, once per tile, so the dequant
-        // cost is amortized over the 8 MMAs this tile feeds -- that is the
-        // whole reason a quantized weight can ride the cooperative matrix at
-        // all (coopMatLoad cannot read packed nibbles or bytes).
+        // 256 threads load B[K_BLOCK x BN] = 512 fp16 => 2/thread.
         for (int e = 0; e < 2; e++) {
             int idx = int(tid) * 2 + e;          // 0..511
             int row = idx / BN;                   // K dim
@@ -260,13 +139,7 @@ void main() {
             int w = n0 + col;
             float16_t v;
             if (kk < K && w < N) {
-                if (quant) {
-                    // B is [batch, K, N] for both quantized formats (the host
-                    // refuses transB with a quantized weight, and the byte and
-                    // 4-bit kernels all index the weight with a batch stride).
-                    v = float16_t(weight_at(b_base + kk * N + w) *
-                                  weight_scale(kk, w));
-                } else if (uPC.transB != 0) {
+                if (uPC.transB != 0) {
                     // B is [batch, N, K]: element (b, w, kk) at b_base + w*K + kk
                     v = loadB(b_base + w * K + kk);
                 } else {

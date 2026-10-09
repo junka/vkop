@@ -195,6 +195,7 @@ class MatMulBuffer : public BufferFactory {
               sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
     }
+
     void set_runtime_device(
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
@@ -553,17 +554,13 @@ class MatMulBuffer : public BufferFactory {
         // coopMatMulAdd dispatch replaces the scalar reduce. It writes flat
         // fp32 to the scratch buffer (odd-N safe: a word can straddle two
         // rows), then the existing pack pass repacks half2 — so it also needs
-        // the scratch below. A quantized weight rides the same kernel: its
-        // packed bytes/nibbles are decoded into the shared B tile (the one
-        // place a weight is touched), so the MMA still sees fp16 operands.
-        // The quantized staging reads B as [K, N], so a quantized weight with
-        // transB is refused here; the 4-bit host checks already enforce that
-        // and the byte formats satisfy it. A plain fp16 B keeps the transposed
-        // read this shader already implements. Everything else falls through
-        // to the tiled / ksplit / fused / reduce path below.
-        const bool coopmat =
-            fp16_ != 0 && !(transB_ && (weight_byte || weight_4bit)) &&
-            m_dev_->is_support_cooperate_matrix() && coop_pipeline_ != nullptr;
+        // the scratch below. Only for plain fp16 A/B (a quantized weight has
+        // its own dequant kernels) and only when the device supports it;
+        // everything else falls through to the tiled / ksplit / fused / reduce
+        // path below.
+        const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
+                             m_dev_->is_support_cooperate_matrix() &&
+                             coop_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on
         // grid.y and use 16 of their workgroup's 256 lanes per row, so at
         // decode time (one A row) 15/16 of every workgroup idles and the
@@ -679,8 +676,8 @@ class MatMulBuffer : public BufferFactory {
         // as the batch index). The accumulator replaces the naive per-element
         // MAC loop; the scratch+pack structure is preserved for odd-N safety.
         // This is the highest-priority fp16 path — it pre-empts
-        // tiled/ksplit/fused/reduce, which remain the fallback for non-coopmat
-        // hardware.
+        // tiled/ksplit/fused/reduce, which remain the fallback for quantized or
+        // non-coopmat hardware.
         if (coopmat) {
             fillDescriptorWrites(coop_ds_[m_id_]);
             coop_pipeline_->updateDescriptorSets(ds_writes_);
