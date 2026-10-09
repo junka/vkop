@@ -9,8 +9,8 @@
 //   llm_driver <model.vkopbin> <inputs_dump_dir>
 //
 // Build (from repo root):
-//   g++ -std=c++17 -I. -Imodel/generated llm/exporter/llm_driver.cpp \
-//       build/libvkop.a build/model/libvload.a -o build/llm_driver \
+//   g++ -std=c++17 -I. -Imodel/generated llm/exporter/llm_driver.cpp
+//       build/libvkop.a build/model/libvload.a -o build/llm_driver
 //       $(pkg-config --libs vulkan) -lpthread
 //
 // Env: VKOP_BUFFER_BACKEND=1 is not needed — we call set_backend_buffer(true).
@@ -282,6 +282,7 @@ int main(int argc, char** argv) {
         // and compare their first elements / norms against the npy source, to
         // confirm round-to-round input updates actually landed on the SSBOs.
         if (const char *v = std::getenv("VKOP_VERIFY_INPUTS")) {
+            (void)v;  // presence-only gate
             auto verify = [&](const std::string& tname, bool is_fp16) {
                 auto t = rt->GetInput(tname);
                 if (!t) { std::printf("[vin] %s: NOT FOUND\n", tname.c_str()); return; }

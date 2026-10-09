@@ -546,6 +546,12 @@ if (ENABLE_LLM_CHAT)
     # because image_preproc.hpp -> core/Tensor.hpp pulls in VulkanLib symbols.
     add_executable(rope_probe llm/exporter/rope_probe.cpp)
     target_link_libraries(rope_probe PRIVATE vkop vload)
+
+    # npy-feed LLM driver: loads <dump_dir>/roundN/*.npy inputs, runs the model,
+    # and compares 'logits' against reference_logits.npy (ORT ground truth).
+    # Used for Qwen2/Qwen3 e2e correctness checks (fp16, fp8 KV, QDQ).
+    add_executable(llm_driver llm/exporter/llm_driver.cpp)
+    target_link_libraries(llm_driver PRIVATE vkop vload)
 endif()
 
 # Image generation driver for Qwen-Image-2.1
