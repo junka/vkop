@@ -474,6 +474,13 @@ class DAGBasedModel:
             1: "float32", 2: "uint8", 3: "int8", 4: "uint16", 5: "int16",
             6: "int32", 7: "int64", 8: "string", 9: "bool", 10: "float16",
             11: "float64", 12: "uint32", 13: "uint64", 16: "bfloat16",
+            # Quantized captions: a KV cache rewritten to a low-bit format
+            # carries its per-node dtype here (the same spellings the graph
+            # I/O and initializers use). Missing, these came out as "" and the
+            # runtime fell back to "historical fp16" for the Q/DQ chain that
+            # feeds the cache.
+            17: "float8e4m3fn", 19: "float8e5m2",
+            21: "uint4", 22: "int4", 23: "float4e2m1fn",
         }
 
         def _dtype_to_str(dtype):

@@ -466,6 +466,10 @@ template <typename T> class Tensor : public ITensor {
             n_dims_ = 1;
         }
         size_ = sizeof(T) * n * c * h * w;
+        if (elem_kind_packed(elem_kind())) {
+            size_ = static_cast<int>(
+                elem_bytes(elem_kind(), static_cast<size_t>(n) * c * h * w));
+        }
         if (!is_on_GPU())
             reserveOnCPU();
     }
@@ -484,6 +488,16 @@ template <typename T> class Tensor : public ITensor {
         for (auto d : dims) {
             size_ *= d;
             dims_[i++] = static_cast<int>(d);
+        }
+        // A packed element format (4-bit) holds two values per storage byte, so
+        // the payload is half the element count. dims_ stays logical (the
+        // kernels index it that way); only size_ — from which every allocation,
+        // upload and readback derives its length — shrinks. This is what lets
+        // the 4-bit KV cache resize past/present with ResizeInput like the
+        // fp16/fp8 caches do.
+        if (elem_kind_packed(elem_kind())) {
+            size_ = static_cast<int>(elem_bytes(
+                elem_kind(), static_cast<size_t>(size_ / sizeof(T))));
         }
         if (!is_on_GPU()) {
             // data_ may exist but be empty: copyToGPU clears it after upload,

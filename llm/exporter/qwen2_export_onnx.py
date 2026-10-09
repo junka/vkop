@@ -282,6 +282,122 @@ if os.environ.get("VKOP_KV_FP8") == "1":
     kv_scale = float(os.environ.get("VKOP_KV_SCALE", "0.1"))
     insert_fp8_kv_cache(m, scale=kv_scale)
 
+def insert_4bit_kv_cache(model, kind="int4", scale=1.0):
+    """Rewrite the KV cache I/O to a 4-bit format (int4 or nf4).
+
+    Same shape as insert_fp8_kv_cache: for each layer a DequantizeLinear sits
+    between the (now 4-bit) past graph input and every original consumer, and a
+    QuantizeLinear turns the present producer's fp16 into the 4-bit graph
+    output. The difference is the storage: two values share one byte, so the
+    past/present tensors carry logical dims at half the payload length (the
+    loader's packed path sizes them with elem_bytes()).
+
+    ONNX has no NF4 element type. We spell the nibbles UINT4 (their storage)
+    and name the meaning in a `vkop_dtype` metadata prop on the graph I/O's
+    ValueInfoProto -- the same extension channel a packed initializer uses
+    (see onnx2vkop/dag.py:_VKOP_DTYPE_META_KEY). int4 is INT4 outright, and the
+    loader's elem_type table maps it with no override.
+
+    scale is a per-tensor fp32 constant (VKOP_KV_SCALE). int4 is symmetric
+    [-8, 7]*scale; nf4 indexes the 16-entry codebook in [-1, 1]*scale, so the
+    two want very different scale magnitudes for the same K/V range.
+    """
+    g = model.graph
+    nlayers = 0
+    while any(o.name == f"present_key_values_{nlayers}" for o in g.output):
+        nlayers += 1
+    if nlayers == 0:
+        print("[kv-4bit] no present_key_values_* outputs found, skipping")
+        return
+
+    nf4 = kind == "nf4"
+    elem_dt = TensorProto.UINT4 if nf4 else TensorProto.INT4
+    vkop_dtype = "nf4" if nf4 else "int4"
+
+    def _mark(vi, name):
+        # Only nf4 needs the metadata: ONNX cannot tell it from a plain uint4
+        # nibble, and the loader decodes the nibble through a codebook.
+        if not nf4:
+            return
+        # Two channels on purpose. The ValueInfoProto prop is the readable place
+        # to carry it, but onnxoptimizer.optimize() rebuilds the graph I/O and
+        # silently DROPS every ValueInfoProto metadata_props (model-level props
+        # and node attributes survive -- verified). So the copy the converter
+        # actually reads is the model-level one, keyed by tensor name; without
+        # it an nf4 cache reaches the loader as plain uint4.
+        vi.metadata_props.add(key="vkop_dtype", value="nf4")
+        model.metadata_props.add(key=f"vkop_io_dtype:{name}", value="nf4")
+
+    scale_name = "kv_cache_4bit_scale"
+    scale_init = helper.make_tensor(scale_name, TensorProto.FLOAT, [], [scale])
+    g.initializer.append(scale_init)
+
+    for i in range(nlayers):
+        past_name = f"past_key_values_{i}"
+        pres_name = f"present_key_values_{i}"
+
+        # ---- past side: 4-bit input -> DequantizeLinear -> fp16 ----------
+        past_shape = None
+        for vi in list(g.input):
+            if vi.name == past_name:
+                past_shape = [
+                    d.dim_value if d.HasField("dim_value") else d.dim_param
+                    for d in vi.type.tensor_type.shape.dim
+                ]
+                vi.type.tensor_type.elem_type = elem_dt
+                _mark(vi, past_name)
+                break
+        # The fp16 tensor the original consumers expect to see. Declared FLOAT16
+        # for the same reason as the fp8 path: without a value_info entry ONNX
+        # shape inference types the DequantizeLinear output float32 and drags
+        # the whole K/V concat chain fp32, where the fp32 word-mover shaders
+        # reinterpret the fp16 bytes as 32-bit words (garbage K/V, NaN
+        # attention).
+        past_fp16 = f"{past_name}_fp16"
+        g.value_info.append(helper.make_tensor_value_info(
+            past_fp16, TensorProto.FLOAT16, past_shape))
+        # Rewire consumers BEFORE appending the DQ node: iterating a protobuf
+        # repeated field yields fresh Python wrappers, so an `is`-identity skip
+        # of the new node does NOT work and the DQ would rewrite its own input
+        # into a self-loop (the converter then reports a dependency cycle).
+        for node in g.node:
+            for k in range(len(node.input)):
+                if node.input[k] == past_name:
+                    node.input[k] = past_fp16
+        dq = helper.make_node(
+            "DequantizeLinear",
+            inputs=[past_name, scale_name],
+            outputs=[past_fp16],
+            name=f"DequantizeLinear_kv_{i}",
+        )
+        g.node.append(dq)
+
+        # ---- present side: fp16 producer -> QuantizeLinear -> 4-bit output
+        pres_fp16 = f"{pres_name}_fp16"
+        for node in g.node:
+            for k in range(len(node.output)):
+                if node.output[k] == pres_name:
+                    node.output[k] = pres_fp16
+        q = helper.make_node(
+            "QuantizeLinear",
+            inputs=[pres_fp16, scale_name],
+            outputs=[pres_name],
+            name=f"QuantizeLinear_kv_{i}",
+        )
+        g.node.append(q)
+        for o in g.output:
+            if o.name == pres_name:
+                o.type.tensor_type.elem_type = elem_dt
+                _mark(o, pres_name)
+                break
+
+    print(f"[kv-4bit] rewrote {nlayers} layer(s): past/present_key_values "
+          f"now {vkop_dtype} (per-tensor scale={scale})")
+
+if os.environ.get("VKOP_KV_4BIT"):
+    kv_scale = float(os.environ.get("VKOP_KV_SCALE", "1.0"))
+    insert_4bit_kv_cache(m, kind=os.environ["VKOP_KV_4BIT"], scale=kv_scale)
+
 n_init = len(m.graph.initializer)
 n_ext = sum(1 for t in m.graph.initializer
             if t.HasField("data_location") and t.data_location == 1)

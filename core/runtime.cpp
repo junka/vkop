@@ -207,6 +207,29 @@ void Runtime::LoadModel() {
                 t = typed;
                 break;
             }
+            // A packed 4-bit graph input (the LLM's 4-bit KV cache): int4/nf4/
+            // float4e2m1 hold two values per byte, so dims stay the logical
+            // shape while the payload is half the element count.
+            // set_payload_bytes must run before as_storage_buffer() sizes the
+            // SSBO. The same int8_t container carries the raw nibbles -- only
+            // the consuming shader knows a value is half a slot.
+            case ElemKind::kInt4:
+            case ElemKind::kNF4:
+            case ElemKind::kFloat4E2M1:
+            case ElemKind::kUint4: {
+                auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
+                typed->set_elem_kind(kind);
+                size_t elements = 1;
+                for (auto d : in_dims) {
+                    elements *= static_cast<size_t>(d);
+                }
+                typed->set_payload_bytes(
+                    static_cast<int>(elem_bytes(kind, elements)));
+                typed->set_ref_cnt_forever();
+                typed->as_storage_buffer(dev);
+                t = typed;
+                break;
+            }
             default:
                 throw std::runtime_error(
                     "vkop: graph input " + i.name + " has element format " +
@@ -232,6 +255,16 @@ void Runtime::LoadModel() {
             odt.empty() ? ElemKind::kInvalid : elem_kind_from_name(odt);
         if (okind == ElemKind::kFloat8E4M3FN ||
             okind == ElemKind::kFloat8E5M2) {
+            auto t = std::make_shared<Tensor<int8_t>>(o.dims, true);
+            t->set_elem_kind(okind);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
+        } else if (elem_kind_packed(okind)) {
+            // A packed 4-bit graph output (the LLM's 4-bit present_key_values):
+            // logical dims from the file, payload half the element count. The
+            // kind must be set before the ctor's packed branch sizes size_.
             auto t = std::make_shared<Tensor<int8_t>>(o.dims, true);
             t->set_elem_kind(okind);
             t->set_ref_cnt_forever();
@@ -798,6 +831,23 @@ void Runtime::LoadModel() {
                         } else if (out_shape.dtype == "uint8") {
                             node_outputs.back()->set_elem_kind(
                                 ElemKind::kUint8);
+                        } else if (elem_kind_packed(recorded)) {
+                            // A packed 4-bit payload (an int4/nf4
+                            // QuantizeLinear output feeding the KV cache). The
+                            // container is int8_t; the kind records the nibble
+                            // packing, and Tensor::resize() derives size_ from
+                            // it (half the element count under logical dims).
+                            // No set_payload_bytes needed — the kind alone is
+                            // the contract.
+                            auto ti =
+                                core::as_tensor<int8_t>(node_outputs.back());
+                            ti->set_elem_kind(recorded);
+                            size_t elements = 1;
+                            for (int d : alloc_dims)
+                                elements *= static_cast<size_t>(d);
+                            const size_t nb = elem_bytes(recorded, elements);
+                            if (nb > 0)
+                                ti->set_payload_bytes(static_cast<int>(nb));
                         } else {
                             node_outputs.back()->set_elem_kind(ElemKind::kInt8);
                         }

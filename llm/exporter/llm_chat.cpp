@@ -174,10 +174,14 @@ ModelArch infer_model_arch(const std::shared_ptr<Runtime>& rt) {
     // ---- cache_kind: 从 past_key_values_0 的 elem_kind() 读 ----
     // fp16 (默认) / fp8 (E4M3/E5M2)。shape 读取仍走 as_tensor<uint16_t> 是因为
     // getShape() 在 ITensor 接口上、与容器类型无关；elem_kind() 才记录语义。
+    // 4-bit (kInt4/kNF4) 也走 int8_t 容器，但一个字节两个值 —— KVCache 内部按
+    // cache_kind 分派，逻辑元素数不变（见 kv_cache.hpp）。
     arch.cache_kind = pk0->elem_kind();
     if (arch.cache_kind != ElemKind::kFloat16 &&
         arch.cache_kind != ElemKind::kFloat8E4M3FN &&
-        arch.cache_kind != ElemKind::kFloat8E5M2) {
+        arch.cache_kind != ElemKind::kFloat8E5M2 &&
+        arch.cache_kind != ElemKind::kInt4 &&
+        arch.cache_kind != ElemKind::kNF4) {
         std::fprintf(stderr, "[arch] past_key_values_0 cache dtype %s unsupported, "
                      "falling back to fp16\n", elem_name(arch.cache_kind));
         arch.cache_kind = ElemKind::kFloat16;

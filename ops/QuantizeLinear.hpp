@@ -22,22 +22,27 @@ namespace quant {
 // Push constant for the combined QuantizeLinear/DequantizeLinear shader.
 //
 //   fmt        which byte format the quantized side holds:
-//                0 = fp8 E4M3, 1 = fp8 E5M2, 2 = int8, 3 = uint8
+//                0 = fp8 E4M3, 1 = fp8 E5M2, 2 = int8, 3 = uint8,
+//                4 = int4 (packed, 2 values/byte), 5 = nf4 (packed)
 //   mode       0 = quantize (float -> bytes), 1 = dequantize (bytes -> float)
-//   total      element count (== byte count on the quantized side)
+//   total      element count (== byte count on the quantized side == element
+//              count on the float side) — the LOGICAL value count, not the
+//              packed byte count, for the 4-bit formats.
 //   scale      per-tensor fp32 scale (read from inputs[1])
 //   zp         per-tensor zero_point as a plain int (read from inputs[2]).
 //              fp8 has no zero_point (zp stays 0); int8/uint8 are asymmetric in
-//              general (ORT dynamic quantize emits a non-zero uint8 zp).
+//              general (ORT dynamic quantize emits a non-zero uint8 zp). The
+//              4-bit formats are symmetric (int4/nf4 grids are zero-centred),
+//              so zp stays 0 for them too.
 //   out_fp32   dequant only: 0 = fp16 output, 1 = fp32 output. The float side
 //              of quantize follows inputs[0]'s dtype the same way.
 //   in_fp32    quant only: 0 = fp16 input,  1 = fp32 input.
 struct alignas(16) QuantPC {
     int mode;     // 0 = quantize, 1 = dequantize
-    int total;    // element count
+    int total;    // element count (logical values)
     float scale;  // per-tensor fp32 scale
     int zp;       // per-tensor zero_point (int)
-    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8
+    int fmt;      // 0=e4m3, 1=e5m2, 2=int8, 3=uint8, 4=int4, 5=nf4
     int out_fp32; // dequant: output fp32?
     int in_fp32;  // quant: input fp32?
     int _pad;
@@ -123,6 +128,12 @@ class QuantizeLinear : public BufferFactory {
             break;
         case core::ElemKind::kUint8:
             fmt = 3;
+            break;
+        case core::ElemKind::kInt4:
+            fmt = 4;
+            break;
+        case core::ElemKind::kNF4:
+            fmt = 5;
             break;
         default:
             throw std::runtime_error(
@@ -218,8 +229,15 @@ class QuantizeLinear : public BufferFactory {
             }
             bind_ssbo<int8_t>(inputs[0], /*is_output=*/false);
         } else {
+            // Quantize. The packed 4-bit formats hold two values per container
+            // byte, so num_elements() (container slots) is total/2 for them —
+            // the guard has to compare in the same units or every execute would
+            // re-resize. resize(shape) itself is packed-aware (Tensor.hpp) and
+            // sizes the payload at total/2 for them.
             auto out = core::as_tensor<int8_t>(outputs[0]);
-            if (out->num_elements() != total)
+            const int want =
+                core::elem_kind_packed(q_kind) ? (total + 1) / 2 : total;
+            if (out->num_elements() != want)
                 out->resize(shape);
             bind_ssbo<int8_t>(outputs[0], /*is_output=*/true);
             if (float_fp32) {
@@ -238,11 +256,12 @@ class QuantizeLinear : public BufferFactory {
         pc.out_fp32 = dequant ? (float_fp32 ? 1 : 0) : 0;
         pc.in_fp32 = dequant ? 0 : (float_fp32 ? 1 : 0);
         pc.in_fp32 = dequant ? 0 : (float_fp32 ? 1 : 0);
-        // One thread per 4-element word on the byte side: int8/uint8/fp8 all
-        // pack 4 bytes/word. The float side is fp16 (2 vals/word, so 4 values
-        // = 2 fp16 words) or fp32 (1 val/word, so 4 values = 4 fp32 words).
-        // The shader handles the byte:float word mapping per fmt.
-        submit(&pc, UP_DIV((total + 3) / 4, 256), 1, 1);
+        // One thread per byte-side word: int8/uint8/fp8 pack 4 values/word, the
+        // 4-bit formats pack 8 (two values per byte). The float side is fp16
+        // (2 vals/word) or fp32 (1 val/word); the shader works out the
+        // float-word mapping per fmt.
+        const int group = (fmt >= 4) ? 8 : 4;
+        submit(&pc, UP_DIV((total + group - 1) / group, 256), 1, 1);
     }
 };
 

@@ -50,6 +50,27 @@ def _io_dtype_name(elem_type, what):
     return name
 
 
+# ONNX has no NF4 element type, so a 4-bit KV cache that stores NF4 nibbles
+# spells them UINT4 (its storage) and names the meaning in a `vkop_dtype`
+# metadata prop on the ValueInfoProto -- the same extension channel a packed
+# *initializer* uses (dag._VKOP_DTYPE_META_KEY). Graph I/O therefore has to be
+# resolved through it before the elem_type table, or the nf4 cache would be
+# loaded as uint4 and every nibble decoded through the wrong codebook.
+def _io_dtype_override(model, vi):
+    # Model-level FIRST: onnxoptimizer.optimize() rebuilds the graph and drops
+    # every ValueInfoProto metadata_props, so by the time the converter sees the
+    # graph only the model-level copy survives (verified against onnxoptimizer).
+    # The ValueInfoProto prop is still accepted so a hand-built or un-optimized
+    # model works too.
+    for entry in getattr(model, "metadata_props", []):
+        if entry.key == f"vkop_io_dtype:{vi.name}":
+            return entry.value
+    for entry in getattr(vi, "metadata_props", []):
+        if entry.key == "vkop_dtype":
+            return entry.value
+    return None
+
+
 class ModelConverter:
     """Main class for converting ONNX models to DAG-based format."""
 
@@ -102,7 +123,7 @@ class ModelConverter:
                 dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
                 else -1 for dim in tensor_type.shape.dim
             ]
-            dtype_str = _io_dtype_name(
+            dtype_str = _io_dtype_override(model, inp) or _io_dtype_name(
                 tensor_type.elem_type, f"graph input {inp.name}")
             print("Graph input:", inp.name, "of shape:", shape_dims, "tensor type:", tensor_type.elem_type)
             dag_model.inputs.append({"name": inp.name, "shape": shape_dims, "dtype": dtype_str})
@@ -114,7 +135,7 @@ class ModelConverter:
                 dim.dim_value if dim.HasField("dim_value") and not dim.dim_param
                 else -1 for dim in tensor_type.shape.dim
             ]
-            dtype_str = _io_dtype_name(
+            dtype_str = _io_dtype_override(model, out) or _io_dtype_name(
                 tensor_type.elem_type, f"graph output {out.name}")
             print("Graph output:", out.name, "of shape:", shape_dims)
             dag_model.outputs.append({"name": out.name, "shape": shape_dims, "dtype": dtype_str})

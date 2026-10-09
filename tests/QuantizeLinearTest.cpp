@@ -398,5 +398,186 @@ TEST(QuantizeLinearTest, Fp16ScaleIsDecodedNotDropped) {
     }
 }
 
+// ---- 4-bit packed formats (int4 / nf4) -----------------------------------
+//
+// The int4/nf4 KV-cache formats store two values per container byte. The
+// quantized side is an int8_t container carrying kInt4/kNF4 (payload
+// ceil(n/2) bytes, logical dims [n]); the shader packs element 2k into the low
+// nibble and 2k+1 into the high nibble. These tests compare the packed bytes
+// against a torch reference bit-for-bit and the dequantized fp16 against the
+// same reference's decode. `total` stays the LOGICAL value count in the push
+// constant; only the payload halves.
+
+// Pack a vector of 4-bit codes (low nibble = even index) into bytes, zeroing
+// any tail nibble past `n` -- the shader breaks out of the packing loop at
+// total, so the unused high nibble of the last byte stays 0.
+static std::vector<int8_t> ql_pack_nibbles(const std::vector<int> &codes,
+                                           int n) {
+    std::vector<int8_t> out((n + 1) / 2, 0);
+    for (int i = 0; i < n; ++i) {
+        uint8_t &b = reinterpret_cast<uint8_t &>(out[i / 2]);
+        const uint8_t q = static_cast<uint8_t>(codes[i]) & 0xFu;
+        b = static_cast<uint8_t>(b | (q << ((i % 2) * 4)));
+    }
+    return out;
+}
+
+// A packed 4-bit tensor: int8_t container, kind set, payload ceil(n/2) bytes.
+// set_elem_kind() only records the format; resize() is what re-sizes size_ to
+// the packed length (Tensor.hpp), leaving dims at the logical [n]. The packed
+// length is only correct once BOTH are done.
+static std::shared_ptr<Tensor<int8_t>>
+ql_packed(int n, vkop::core::ElemKind kind) {
+    auto t = std::make_shared<Tensor<int8_t>>(std::vector<int>{n}, true);
+    t->set_elem_kind(kind);
+    t->resize(std::vector<int>{n});
+    return t;
+}
+
+// int4: symmetric two's-complement nibble, x = q * scale, q in [-8, 7]. The
+// reference is torch's own round-half-to-even grid (the shader uses roundEven
+// too), so the packed bytes must agree exactly.
+TEST(QuantizeLinearTest, Int4PackedRoundTrip) {
+    auto vals = torch::tensor({0.0f,  0.5f,  -0.5f,  1.0f,  -1.0f,  2.0f,
+                               -2.0f, 3.5f,  -3.5f,  7.0f,  -7.0f,  0.25f,
+                               6.0f,  -6.0f, 1.25f,  -1.25f, 0.75f})
+                    .to(torch::kFloat16);
+    int n = static_cast<int>(vals.numel());
+    float scale = 1.0f;
+
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+
+    auto tq = ql_packed(n, vkop::core::ElemKind::kInt4);
+    run_quant(tin, tq, scale);
+
+    // Reference: clamp(x/scale, -8, 7) rounded to nearest-even, then mask to
+    // the two's-complement nibble (negative q becomes q + 16).
+    auto qref = torch::round(vals.to(torch::kFloat32) / scale)
+                    .clamp(-8.0f, 7.0f)
+                    .to(torch::kInt32);
+    std::vector<int> codes(n);
+    for (int i = 0; i < n; ++i) {
+        codes[i] = static_cast<int>(qref[i].item<int32_t>());
+    }
+    const auto want = ql_pack_nibbles(codes, n);
+    ASSERT_EQ(tq->num_elements(), (n + 1) / 2)
+        << "packed payload should be ceil(n/2) bytes";
+    for (int i = 0; i < (n + 1) / 2; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>((*tq)[i]),
+                  static_cast<uint8_t>(want[i]))
+            << "int4 packed byte mismatch at " << i;
+    }
+
+    // Dequantize: q -> fp16. q is sign-extended from the nibble, then *scale.
+    auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n}, true);
+    run_quant(tq, tout, scale);
+
+    auto dsigned = qref.clone();
+    for (int i = 0; i < n; ++i) {
+        int32_t q = dsigned[i].item<int32_t>();
+        if (q > 7)
+            q -= 16; // two's-complement nibble -> [-8, 7]
+        dsigned[i] = q;
+    }
+    auto ref = (dsigned.to(torch::kFloat32) * scale).to(torch::kFloat16);
+    const auto *ref_p =
+        reinterpret_cast<const uint16_t *>(ref.data_ptr<at::Half>());
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout)[i], ref_p[i])
+            << "int4 dequant mismatch at " << i
+            << " (orig=" << vals[i].item<float>() << ")";
+    }
+}
+
+// nf4: the 16-level quantile codebook, x = codebook[q] * scale. The q is the
+// nearest code to x/scale (an explicit 16-way sweep, not roundEven), so a torch
+// reference built from the same table pins the packed bytes exactly.
+TEST(QuantizeLinearTest, NF4PackedRoundTrip) {
+    const std::vector<float> cb = {
+        -1.0f,           -0.6961928009986877f, -0.5250730514526367f,
+        -0.3949174189567566f, -0.2844413814544678f, -0.1847814998626709f,
+        -0.0910967006323811f, 0.0f,               0.0795802986717224f,
+        0.1601973110246658f,  0.2447470557689667f, 0.3361703515052795f,
+        0.4407098295211792f,  0.5626170039176941f, 0.7229568369388580f,
+        1.0f};
+
+    auto vals = torch::tensor({0.0f,   1.0f,   -1.0f,  0.5f,   -0.5f,  0.25f,
+                               -0.25f, 0.7f,   -0.72f, 0.09f,  -0.1f,  0.15f,
+                               0.33f,  -0.45f, 0.99f,  -0.99f, 0.55f})
+                    .to(torch::kFloat16);
+    int n = static_cast<int>(vals.numel());
+    float scale = 1.0f;
+
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+
+    auto tq = ql_packed(n, vkop::core::ElemKind::kNF4);
+    run_quant(tin, tq, scale);
+
+    // Reference: nearest codebook entry to x/scale (ties -> lowest index, the
+    // same rule the shader's sweep uses since it only updates on strict <).
+    auto xf = vals.to(torch::kFloat32) / scale;
+    std::vector<int> codes(n);
+    for (int i = 0; i < n; ++i) {
+        float x = xf[i].item<float>();
+        int best = 0;
+        float bd = std::abs(x - cb[0]);
+        for (int q = 1; q < 16; ++q) {
+            float d = std::abs(x - cb[q]);
+            if (d < bd) {
+                bd = d;
+                best = q;
+            }
+        }
+        codes[i] = best;
+    }
+    const auto want = ql_pack_nibbles(codes, n);
+    for (int i = 0; i < (n + 1) / 2; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>((*tq)[i]),
+                  static_cast<uint8_t>(want[i]))
+            << "nf4 packed byte mismatch at " << i;
+    }
+
+    // Dequantize: codebook[q] * scale, in fp16.
+    auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n}, true);
+    run_quant(tq, tout, scale);
+
+    std::vector<float> dec(n);
+    for (int i = 0; i < n; ++i)
+        dec[i] = cb[codes[i]] * scale;
+    auto ref = torch::tensor(dec).to(torch::kFloat16);
+    const auto *ref_p =
+        reinterpret_cast<const uint16_t *>(ref.data_ptr<at::Half>());
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout)[i], ref_p[i])
+            << "nf4 dequant mismatch at " << i
+            << " (orig=" << vals[i].item<float>() << ")";
+    }
+}
+
+// An odd logical count (17 above, 5 here) leaves the last byte's high nibble
+// unused: the shader must emit 0 there and must not read past the float side.
+TEST(QuantizeLinearTest, Int4OddTotal) {
+    auto vals =
+        torch::tensor({1.0f, -2.0f, 3.0f, -4.0f, 5.0f}).to(torch::kFloat16);
+    int n = 5;
+    float scale = 1.0f;
+
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+    auto tq = ql_packed(n, vkop::core::ElemKind::kInt4);
+    run_quant(tin, tq, scale);
+
+    // codes: 1, -2, 3, -4, 5 -> masked nibbles 1, 14, 3, 12, 5
+    const auto want = ql_pack_nibbles({1, -2, 3, -4, 5}, n);
+    ASSERT_EQ(tq->num_elements(), 3);
+    for (int i = 0; i < 3; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>((*tq)[i]),
+                  static_cast<uint8_t>(want[i]))
+            << "int4 odd-total byte mismatch at " << i;
+    }
+}
+
 } // namespace
 

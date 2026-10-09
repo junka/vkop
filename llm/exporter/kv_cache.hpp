@@ -27,6 +27,13 @@
 // 计算仍走 fp16：图里在 cache 边界插 QuantizeLinear/DequantizeLinear，所以
 // 这里看到的 past/present 永远是「原始 payload 字节」，不参与反量化。
 //
+// 4-bit（kInt4/kNF4）沿用 int8_t 容器，但一个字节装两个值：逻辑元素数不变
+// （2 × nkv × max_kv × hd），payload 字节只有它的一半。preallocate_buffer 拿的
+// 是「容器槽位」数（= kv_elems/2），逻辑形状仍由 getShape() 表达 —— 4-bit 的
+// K/N 本来就只能从形状读，不能靠 num_elements()。同理 num_kv_elems_ 要把字节数
+// 乘回 2 才是「一段 KV 有几个值」，否则 feedback() 算出的 kv_len 会少一半。
+// 图侧同样在 cache 边界插 Q/DQ（fmt 4/5），scale 是每张量一个 fp32 标量。
+//
 // 前缀续用（跨轮跳过已算 KV）的接口留在这里：需要 feedback() 之外再加一个
 // 「保留前缀、只补后面」的入口，并先有 token 前缀校验（Conversation::prefixMatch）。
 // 目前图是单段连续 buffer、无 block table，所以还没接。
@@ -51,7 +58,8 @@ public:
     // cache_kind 选择 KV cache 的存储语义。fp16 是历史默认；传 kFloat8E4M3FN /
     // kFloat8E5M2 则每层 past/present 用 int8_t 容器承载 fp8 字节（图侧需在
     // cache 边界插 QuantizeLinear/DequantizeLinear，见 qwen3_export_onnx.py
-    // 的 --kv-fp8 分支）。
+    // 的 --kv-fp8 分支）。kInt4 / kNF4 同样走 int8_t 容器，但一字节两个值
+    // （图侧 Q/DQ 用 fmt 4/5），显存再减半。
     KVCache(const std::shared_ptr<core::Runtime>& rt,
             const std::shared_ptr<VulkanCommandPool>& cmdpool, int nlayers,
             int nkv, int hd, int max_kv,
@@ -63,14 +71,17 @@ public:
         }
         if (cache_kind != core::ElemKind::kFloat16 &&
             cache_kind != core::ElemKind::kFloat8E4M3FN &&
-            cache_kind != core::ElemKind::kFloat8E5M2) {
+            cache_kind != core::ElemKind::kFloat8E5M2 &&
+            cache_kind != core::ElemKind::kInt4 &&
+            cache_kind != core::ElemKind::kNF4) {
             throw std::runtime_error(
                 "KVCache: unsupported cache element format " +
                 std::string(core::elem_name(cache_kind)));
         }
         // past/present 都按 max_kv 开好，长度增长时不再重分配。元素总数与 dtype
         // 无关（2 × nkv × max_kv × hd，K/V 在 dim 1 叠在一起）；字节宽由容器类型
-        // 决定，preallocate_buffer 内部按 sizeof(T) 对齐。
+        // 决定，preallocate_buffer 内部按 sizeof(T) 对齐。4-bit 的两个值挤一字节，
+        // 所以给它的「容器槽位数」是逻辑元素数的一半（见 preallocate_kv_）。
         const std::size_t kv_elems = static_cast<std::size_t>(2) * nkv * max_kv * hd;
         auto dev = cmdpool->getVulkanDevice();
         for (int i = 0; i < nlayers; ++i) {
@@ -138,12 +149,17 @@ private:
     core::ElemKind cache_kind_;
 
     // 按 cache_kind 分派到对应容器的预分配。fp16 走 uint16_t，fp8 走 int8_t
-    // （和 bool/int8 同一容器，elem_kind() 记录 fp8 语义）。
+    // （和 bool/int8 同一容器，elem_kind() 记录 fp8 语义）。4-bit 也走 int8_t，
+    // 但一个字节装两个值：kv_elems 是逻辑值数，容器槽位（字节）是它的一半
+    // （kv_elems 含因子 2，必为偶数）。
     void preallocate_kv_(const std::shared_ptr<core::ITensor>& t,
                          std::shared_ptr<VulkanDevice>& dev,
                          std::size_t kv_elems) {
         if (cache_kind_ == core::ElemKind::kFloat16) {
             core::as_tensor<uint16_t>(t)->preallocate_buffer(dev, kv_elems);
+        } else if (cache_kind_ == core::ElemKind::kInt4 ||
+                   cache_kind_ == core::ElemKind::kNF4) {
+            core::as_tensor<int8_t>(t)->preallocate_buffer(dev, kv_elems / 2);
         } else {
             core::as_tensor<int8_t>(t)->preallocate_buffer(dev, kv_elems);
         }
@@ -155,11 +171,19 @@ private:
             core::as_tensor<int8_t>(t)->copyToGPU(cmdpool_);
         }
     }
+    // 一段 KV 的逻辑值数。fp16/fp8 的 num_elements() 就是值数；4-bit 的
+    // num_elements() 是字节数（容器槽位），要乘 2 才是值数 —— 否则 feedback()
+    // 会把 kv_len 算成一半，下一轮的 attention_bias/位置就全错位。
     int num_kv_elems_(const std::shared_ptr<core::ITensor>& t) {
         if (cache_kind_ == core::ElemKind::kFloat16) {
             return core::as_tensor<uint16_t>(t)->num_elements();
         }
-        return core::as_tensor<int8_t>(t)->num_elements();
+        const int slots = core::as_tensor<int8_t>(t)->num_elements();
+        if (cache_kind_ == core::ElemKind::kInt4 ||
+            cache_kind_ == core::ElemKind::kNF4) {
+            return slots * 2;
+        }
+        return slots;
     }
     void swap_kv_(const std::shared_ptr<core::ITensor>& past,
                   const std::shared_ptr<core::ITensor>& pres) {
