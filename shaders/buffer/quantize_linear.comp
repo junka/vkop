@@ -140,7 +140,7 @@ uint int_encode(float x, bool is_uint) {
     return uint(int(q)) & 0xFFu;
 }
 
-// ---- 4-bit formats (fmt 4 = int4, 5 = nf4) -------------------------------
+// ---- 4-bit formats (fmt 4 = int4, 5 = nf4, 6 = uint4) -------------------------------
 // The NF4 codebook: the 16 quantiles of a unit-normal distribution, normalized
 // so the extreme codes are exactly -1 and +1. A value is codebook[q] * scale,
 // so the per-tensor scale holds the group absmax itself -- NOT absmax/7 as the
@@ -173,16 +173,23 @@ uint nf4_encode(float x) {
 // One 4-bit code -> float (value only; the caller applies the scale).
 float nibble_decode(uint q) {
     if (uPC.fmt == 5) return nf4_code(int(q & 15u));
+    // uint4: the nibble is already the unsigned value in [0, 15] -- no sign
+    // extension, so the grid runs from 0 to 15 * scale with a zero point of 0.
+    if (uPC.fmt == 6) return float(q & 15u);
     // int4: bitfieldExtract with a signed result sign-extends the nibble into
     // [-8, 7] -- the two's-complement conversion without a compare.
     return float(bitfieldExtract(int(q) & 15, 0, 4));
 }
 
 // One float -> 4-bit code. The value is NOT pre-scaled: int4 divides by the
-// scale and rounds to [-8, 7]; nf4 picks the nearest codebook entry of x/scale.
+// scale and rounds to [-8, 7]; uint4 the same but to [0, 15]; nf4 picks the
+// nearest codebook entry of x/scale.
 uint nibble_encode(float x) {
     if (uPC.fmt == 5) return nf4_encode(x / uPC.scale);
     float q = roundEven(x / uPC.scale);
+    if (uPC.fmt == 6) {
+        return uint(int(clamp(q, 0.0, 15.0))) & 0xFu;
+    }
     q = clamp(q, -8.0, 7.0);
     return uint(int(q)) & 0xFu;
 }

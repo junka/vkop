@@ -83,6 +83,13 @@ struct alignas(16) GpuMatMulParam {
     // block scale is multiplied by. Buffer path only; the image shader declares
     // neither slot and never reads them.
     int nvfp4 = 0;
+    // 1 = the 4-bit weight's nibble is an unsigned value in [0, 15] scaled by
+    // the per-group fp32 scale table — the unsigned counterpart of int4's
+    // signed [-8, 7] grid (zero point 0, the scale carrying the group absmax/15
+    // rather than /7). Same packing, same kernels, same scale table shape as
+    // int4; only the nibble-to-float step differs. Buffer path only, and only
+    // meaningful with w4 set.
+    int uint4 = 0;
 };
 
 } // namespace matmul
@@ -299,11 +306,17 @@ class MatMulBuffer : public BufferFactory {
         const bool weight_nf4 = bkind == core::ElemKind::kNF4;
         const bool weight_int4 = bkind == core::ElemKind::kInt4;
         const bool weight_nvfp4 = bkind == core::ElemKind::kFloat4E2M1;
+        // An unsigned 4-bit weight: the same packing, the same per-group fp32
+        // scale table and the same kernels as int4, with the nibble read as
+        // [0, 15] instead of [-8, 7]. Nothing about the geometry changes, so it
+        // joins weight_4bit and rides every gate below unchanged.
+        const bool weight_uint4 = bkind == core::ElemKind::kUint4;
         // NVFP4 packs its nibbles exactly like int4 and nf4 and walks K in
         // groups like both, so it shares those gates; what differs is the
         // nibble's meaning and a two-level, partly fp8 scale table — checked
         // separately below rather than folded into the shared ones.
-        const bool weight_4bit = weight_nf4 || weight_int4 || weight_nvfp4;
+        const bool weight_4bit =
+            weight_nf4 || weight_int4 || weight_nvfp4 || weight_uint4;
         core::require_float_elem(inputs[0]->elem_kind(), "MatMul", "input 0");
         if (!weight_byte && !weight_4bit) {
             core::require_float_elem(inputs[1]->elem_kind(), "MatMul",
@@ -313,6 +326,7 @@ class MatMulBuffer : public BufferFactory {
         const std::string weight_label = weight_int8    ? "int8"
                                          : weight_fp8   ? "fp8"
                                          : weight_nvfp4 ? "nvfp4"
+                                         : weight_uint4 ? "uint4"
                                                         : "4-bit";
         size_t scale_index = 0;
         size_t global_index = 0;
@@ -454,9 +468,10 @@ class MatMulBuffer : public BufferFactory {
                 weight_nvfp4 ? 1u
                              : core::elem_bytes(core::ElemKind::kFloat32, 1);
             const size_t entries = inputs[scale_index]->size() / entry_bytes;
-            const std::string what = weight_nvfp4 ? "nvfp4"
-                                     : weight_nf4 ? "nf4"
-                                                  : "int4";
+            const std::string what = weight_nvfp4   ? "nvfp4"
+                                     : weight_nf4   ? "nf4"
+                                     : weight_uint4 ? "uint4"
+                                                    : "int4";
             if (n == 0 || entries % static_cast<size_t>(n) != 0) {
                 throw std::runtime_error("vkop: MatMul " + what +
                                          " scale has " +
@@ -667,6 +682,7 @@ class MatMulBuffer : public BufferFactory {
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;
         para_.nvfp4 = weight_nvfp4 ? 1 : 0;
+        para_.uint4 = weight_uint4 ? 1 : 0;
         para_.group = weight_4bit ? group_size : 0;
 
         // Cooperative-matrix fp16 path (Intel ARL subgroup MMA): ONE dispatch

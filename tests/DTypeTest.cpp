@@ -43,7 +43,7 @@ TEST(DTypeTest, RecognizesSupportedNames) {
 // DequantizeLinear QDQ op decodes it for externally-quantized models), so it
 // graduated to the supported set in RecognizesUint8QDQ below.
 TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
-    for (const char *name : {"bfloat16", "uint4"}) {
+    for (const char *name : {"bfloat16"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_FALSE(elem_kind_supported(kind)) << name;
@@ -54,7 +54,7 @@ TEST(DTypeTest, RecognizesQuantizedNamesWithoutKernel) {
 // uint8 rides an int8_t container and is decoded by the QDQ shaders
 // (QuantizeLinear/DequantizeLinear) for externally-quantized (QDQ) models —
 // ORT's dynamic quantizer emits uint8 weights by default. It is now a
-// supported format (cleared the loader's gate), unlike bfloat16/uint4 above.
+// supported format (cleared the loader's gate), unlike bfloat16 above.
 TEST(DTypeTest, RecognizesUint8QDQ) {
     const ElemKind kind = elem_kind_from_name("uint8");
     EXPECT_NE(kind, ElemKind::kInvalid);
@@ -90,9 +90,10 @@ TEST(DTypeTest, RecognizesFp8WeightOnlyNames) {
 // tensor holds them as raw bytes with the logical shape in its dims (see
 // Tensor::set_payload_bytes). float4e2m1 is the NVFP4 payload: same packing as
 // int4/nf4, a different nibble meaning (E2M1) and a two-level scale instead of
-// one fp32 per group.
+// one fp32 per group. uint4 is int4's unsigned counterpart: same packing and
+// same group-scale table, a nibble read as [0, 15].
 TEST(DTypeTest, RecognizesPackedWeightOnlyNames) {
-    for (const char *name : {"int4", "nf4", "float4e2m1fn"}) {
+    for (const char *name : {"int4", "nf4", "float4e2m1fn", "uint4"}) {
         const ElemKind kind = elem_kind_from_name(name);
         EXPECT_NE(kind, ElemKind::kInvalid) << name;
         EXPECT_TRUE(elem_kind_supported(kind)) << name;

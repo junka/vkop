@@ -69,13 +69,18 @@ enum class ElemKind : uint8_t {
     kInt4,
     kNF4,
     kFloat4E2M1,
+    // An unsigned nibble in [0, 15] scaled by a per-group absmax/15: the
+    // unsigned counterpart of kInt4's signed [-8, 7] grid, with the same
+    // packing and same per-group fp32 scale table. Like the three above it is
+    // written only by vkop's converter, and only the buffer MatMul kernel reads
+    // it.
+    kUint4,
 
     // Spelled in a model file, but no kernel reads them yet. They are listed so
     // the loader can name the format and say "no kernel" instead of falling
     // into a storage guess.
     kUint8,
     kBFloat16,
-    kUint4,
 };
 
 // Bits per element. Sub-byte kinds are the reason byte counts and element
@@ -156,6 +161,11 @@ constexpr bool elem_kind_supported(ElemKind kind) {
     case ElemKind::kInt4:
     case ElemKind::kNF4:
     case ElemKind::kFloat4E2M1:
+    // An unsigned nibble in [0, 15] scaled by a per-group absmax/15: the
+    // unsigned counterpart of int4's signed [-8, 7] grid. Same packing and same
+    // group-scale table, a different nibble meaning (the shader's unpack takes
+    // the unsigned branch), so it rides the same buffer MatMul kernels.
+    case ElemKind::kUint4:
     case ElemKind::kBool:
     case ElemKind::kInt32:
     case ElemKind::kInt64:

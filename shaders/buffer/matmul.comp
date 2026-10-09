@@ -92,6 +92,10 @@ layout(push_constant) uniform PC {
     int nvfp4;  // 1 = a w4 payload whose nibble is an E2M1 code, scaled by an
                 // e4m3 byte per (16-value K block, column) at binding 4 and one
                 // fp32 per-tensor factor at binding 5. Also fixes group to 16.
+    int uint4;  // 1 = the w4 nibble is an unsigned value in [0, 15] scaled by
+                // the group scale (the unsigned counterpart of the signed int4
+                // grid), instead of a signed [-8, 7] two's-complement nibble.
+                // Only meaningful with w4; nvfp4/nf4 take precedence over it.
 } uPC;
 
 #ifdef FP16
@@ -191,6 +195,13 @@ float w4_val(uint word, int e) {
     return float(bitfieldExtract(int(word), e * 4, 4));
 }
 
+// One UNSIGNED 4-bit value in [0, 15]. Same bits as w4_val, read without the
+// sign extension -- the grid is 16 levels below the group absmax rather than a
+// symmetric +-7, so the zero point is 0 and the scale carries absmax/15.
+float w4u_val(uint word, int e) {
+    return float((word >> uint(e * 4)) & 15u);
+}
+
 // One E2M1 nibble -- sign, 2 exponent bits, 1 mantissa bit -- so its eight
 // magnitudes are 0, .5, 1, 1.5, 2, 3, 4, 6. Same field slide as fp8: with the
 // sign stripped, a normal code is an fp32 whose exponent is (code >> 1) - 1 and
@@ -221,6 +232,10 @@ vec4 unpack_w4(uint word, int base) {
                     nf4_code(int((word >> 8) & 15u)),
                     nf4_code(int((word >> 12) & 15u)));
     }
+    if (uPC.uint4 != 0) {
+        return vec4(w4u_val(word, base), w4u_val(word, base + 1),
+                    w4u_val(word, base + 2), w4u_val(word, base + 3));
+    }
     return vec4(w4_val(word, base), w4_val(word, base + 1),
                 w4_val(word, base + 2), w4_val(word, base + 3));
 }
@@ -230,6 +245,7 @@ float unpack_w4_at(int idx) {
     uint word = uInputB.data[idx >> 3];
     int e = idx & 7;
     if (uPC.nvfp4 != 0) return e2m1_val((word >> (e * 4)) & 15u);
+    if (uPC.uint4 != 0) return w4u_val(word, e);
     return uPC.nf4 != 0 ? nf4_code(int((word >> (e * 4)) & 15u))
                         : w4_val(word, e);
 }

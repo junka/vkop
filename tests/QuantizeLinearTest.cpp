@@ -556,6 +556,56 @@ TEST(QuantizeLinearTest, NF4PackedRoundTrip) {
     }
 }
 
+// uint4 is int4's unsigned counterpart: the same packed nibble and the same
+// single per-tensor scale, but the nibble is a value in [0, 15] with a zero
+// point of 0 rather than a sign-extended two's-complement one, so the grid
+// spans 0..15*scale and a negative input clamps to 0.
+TEST(QuantizeLinearTest, Uint4PackedRoundTrip) {
+    auto vals = torch::tensor({0.0f,  0.5f,  1.0f,   2.0f,  7.5f,  15.0f,
+                               3.25f, 8.0f,  -0.5f,  0.25f, 9.75f, 12.5f,
+                               6.0f,  1.5f,  14.0f,  -2.0f, 4.75f})
+                    .to(torch::kFloat16);
+    int n = static_cast<int>(vals.numel());
+    float scale = 1.0f;
+
+    auto tin = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n});
+    tin->fillToCPU(ql_fp16_bits(vals));
+
+    auto tq = ql_packed(n, vkop::core::ElemKind::kUint4);
+    run_quant(tin, tq, scale);
+
+    // Reference: clamp(x/scale, 0, 15) rounded to nearest-even, straight to the
+    // nibble -- no two's-complement wrap, because the shader never sign-extends.
+    auto qref = torch::round(vals.to(torch::kFloat32) / scale)
+                    .clamp(0.0f, 15.0f)
+                    .to(torch::kInt32);
+    std::vector<int> codes(n);
+    for (int i = 0; i < n; ++i) {
+        codes[i] = static_cast<int>(qref[i].item<int32_t>());
+    }
+    const auto want = ql_pack_nibbles(codes, n);
+    ASSERT_EQ(tq->num_elements(), (n + 1) / 2)
+        << "packed payload should be ceil(n/2) bytes";
+    for (int i = 0; i < (n + 1) / 2; ++i) {
+        EXPECT_EQ(static_cast<uint8_t>((*tq)[i]),
+                  static_cast<uint8_t>(want[i]))
+            << "uint4 packed byte mismatch at " << i;
+    }
+
+    // Dequantize: the nibble read unsigned, then *scale.
+    auto tout = std::make_shared<Tensor<uint16_t>>(std::vector<int>{n}, true);
+    run_quant(tq, tout, scale);
+
+    auto ref = (qref.to(torch::kFloat32) * scale).to(torch::kFloat16);
+    const auto *ref_p =
+        reinterpret_cast<const uint16_t *>(ref.data_ptr<at::Half>());
+    for (int i = 0; i < n; ++i) {
+        EXPECT_EQ((*tout)[i], ref_p[i])
+            << "uint4 dequant mismatch at " << i
+            << " (orig=" << vals[i].item<float>() << ")";
+    }
+}
+
 // An odd logical count (17 above, 5 here) leaves the last byte's high nibble
 // unused: the shader must emit 0 there and must not read past the float side.
 TEST(QuantizeLinearTest, Int4OddTotal) {

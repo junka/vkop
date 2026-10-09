@@ -135,6 +135,12 @@ class QuantizeLinear : public BufferFactory {
         case core::ElemKind::kNF4:
             fmt = 5;
             break;
+        // Unsigned 4-bit: the same packed nibble as fmt 4 (int4), read as
+        // [0, 15] against a zero point of 0 rather than sign-extended. The
+        // encoders round to [0, 15] instead of clamping to [-8, 7].
+        case core::ElemKind::kUint4:
+            fmt = 6;
+            break;
         default:
             throw std::runtime_error(
                 std::string("vkop: QuantizeLinear unsupported quantized format "

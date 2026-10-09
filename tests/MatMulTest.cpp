@@ -517,9 +517,11 @@ class MatMulW4Test : public TestCase<T> {
     std::shared_ptr<Tensor<T>> output;
 
     MatMulW4Test(int batch, int m, int k, int n, int group, bool nf4,
-                 bool batched_b = false, bool transB = false)
+                 bool batched_b = false, bool transB = false,
+                 bool uint4 = false)
         : TestCase<T>("MatMul"), batch_(batch), m_(m), k_(k), n_(n),
-          group_(group), nf4_(nf4), batched_b_(batched_b), transB_(transB) {
+          group_(group), nf4_(nf4), batched_b_(batched_b), transB_(transB),
+          uint4_(uint4) {
         attr = {{"transB", transB_ ? "1" : "0"}};
         initTestData();
     }
@@ -549,7 +551,7 @@ class MatMulW4Test : public TestCase<T> {
 
   private:
     int batch_, m_, k_, n_, group_;
-    bool nf4_, batched_b_, transB_;
+    bool nf4_, batched_b_, transB_, uint4_;
 
     static float to_float(T v) {
         if constexpr (std::is_same_v<T, uint16_t>) {
@@ -595,6 +597,15 @@ class MatMulW4Test : public TestCase<T> {
             deq3 = cb.index_select(0, codes.reshape({-1}))
                        .reshape({n_groups, group_, n_}) *
                    amax;
+        } else if (uint4_) {
+            // Unsigned nibble: 16 levels from 0 to 15 below the group absmax,
+            // with a zero point of 0. The shader reads the nibble without a
+            // sign extension and multiplies by the scale, so a faithful
+            // reference quantizes against amax / 15 and reconstructs codes *
+            // scale, never a signed grid.
+            scale = amax / 15.0;
+            codes = (w3 / scale).round().clamp(0, 15).to(torch::kInt64);
+            deq3 = codes.to(torch::kFloat32) * scale;
         } else {
             scale = amax / 7.0; // symmetric int4 reaches +7; -8 stays unused
             codes = (w3 / scale).round().clamp(-8, 7).to(torch::kInt64);
@@ -629,8 +640,9 @@ class MatMulW4Test : public TestCase<T> {
             batched_b_ ? std::vector<int64_t>{batch_, k_, n_}
                        : std::vector<int64_t>{k_, n_}));
         weight = std::make_shared<Tensor<int8_t>>(w_ints);
-        weight->set_elem_kind(nf4_ ? vkop::core::ElemKind::kNF4
-                                   : vkop::core::ElemKind::kInt4);
+        weight->set_elem_kind(nf4_    ? vkop::core::ElemKind::kNF4
+                              : uint4_ ? vkop::core::ElemKind::kUint4
+                                       : vkop::core::ElemKind::kInt4);
         // Two values per byte: the payload is half the element count, while the
         // dims keep describing the logical matrix (what the kernel indexes).
         weight->set_payload_bytes(static_cast<int>(wbytes.size()));
@@ -653,8 +665,8 @@ class MatMulW4Test : public TestCase<T> {
 
         LOG_INFO("4bit MatMul %s batch %d, M %d, N %d, K %d, group %d, "
                  "batched B %d, transB %d, fp16 %d",
-                 nf4_ ? "nf4" : "int4", batch_, m_, n_, k_, group_,
-                 batched_b_ ? 1 : 0, transB_ ? 1 : 0,
+                 nf4_ ? "nf4" : uint4_ ? "uint4" : "int4", batch_, m_, n_, k_,
+                 group_, batched_b_ ? 1 : 0, transB_ ? 1 : 0,
                  std::is_same_v<T, uint16_t> ? 1 : 0);
     }
 
@@ -679,8 +691,14 @@ void run_matmul_w4(
     const std::vector<std::tuple<int, int, int, int, int, bool>> &cases) {
     for (const auto &tc : cases) {
         auto [batch, m, k, n, group, batched_b] = tc;
-        for (const bool nf4 : {false, true}) {
-            MatMulW4Test<T> t(batch, m, k, n, group, nf4, batched_b);
+        // uint4 is the third nibble meaning and shares every gate with int4 --
+        // same packing, same group-scale table, only the decode branch differs,
+        // so it rides the identical geometry sweep.
+        for (const int variant : {0, 1, 2}) {
+            const bool nf4 = variant == 1;
+            const bool uint4 = variant == 2;
+            MatMulW4Test<T> t(batch, m, k, n, group, nf4, batched_b, false,
+                              uint4);
             EXPECT_TRUE(t.run_test(
                 {t.inputa, t.weight, t.scale_data}, {t.output},
                 [&t](std::unique_ptr<vkop::ops::Operator> &op) {
