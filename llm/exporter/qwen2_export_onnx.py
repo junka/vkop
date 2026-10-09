@@ -221,11 +221,36 @@ def insert_fp8_kv_cache(model, scale=0.1):
     for i in range(nlayers):
         past_name = f"past_key_values_{i}"
         pres_name = f"present_key_values_{i}"
+        past_shape = None
         for vi in list(g.input):
             if vi.name == past_name:
+                past_shape = [
+                    d.dim_value if d.HasField("dim_value") else d.dim_param
+                    for d in vi.type.tensor_type.shape.dim
+                ]
                 vi.type.tensor_type.elem_type = fp8_dt
                 break
         past_fp16 = f"{past_name}_fp16"
+        # Declare the DQ output as FLOAT16. Without a value_info entry, ONNX
+        # shape-inference types the DequantizeLinear output as float32 (DQ's
+        # default when no output_dtype attribute is present) and propagates
+        # fp32 down the entire K/V concat chain. The runtime then builds those
+        # Concat/Gather/Expand tensors with fp32 containers, and the fp32
+        # word-mover shaders reinterpret the fp16 (and fp8) bytes as 32-bit
+        # words -- garbage K/V and NaN attention. Forcing the bridge to fp16
+        # makes shape-inference propagate fp16 to every consumer. The sibling
+        # present_*_fp16 needs no entry: it is the K/V concat output, whose
+        # inputs are now correctly fp16.
+        g.value_info.append(helper.make_tensor_value_info(
+            past_fp16, TensorProto.FLOAT16, past_shape))
+        # Rewire consumers BEFORE appending the DQ node: iterating a protobuf
+        # repeated field yields fresh Python wrappers, so an `is`-identity skip
+        # of the new node does NOT work and the DQ would rewrite its own input
+        # into a self-loop (the converter then reports a dependency cycle).
+        for node in g.node:
+            for k in range(len(node.input)):
+                if node.input[k] == past_name:
+                    node.input[k] = past_fp16
         dq = helper.make_node(
             "DequantizeLinear",
             inputs=[past_name, scale_name],
@@ -233,12 +258,6 @@ def insert_fp8_kv_cache(model, scale=0.1):
             name=f"DequantizeLinear_kv_{i}",
         )
         g.node.append(dq)
-        for node in g.node:
-            if node is dq:
-                continue
-            for k in range(len(node.input)):
-                if node.input[k] == past_name:
-                    node.input[k] = past_fp16
         pres_fp16 = f"{pres_name}_fp16"
         for node in g.node:
             for k in range(len(node.output)):
