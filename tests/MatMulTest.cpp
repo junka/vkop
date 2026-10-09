@@ -154,10 +154,27 @@ public:
                 LOG_ERROR("int8 MatMul NaN at %d, expected %f", i, ev);
                 return false;
             }
-            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            // Weight-only int8 leaves A exact, so the old floor of 0.05 was
+            // enough. The coopmat kernel quantizes A per output row as well
+            // (W8A8), and the error that adds is bounded by the activation
+            // step, not by the magnitude of any single output: it is at most
+            // (amax_row/254) * sum_k |b_k|, which tol_bound_ holds per
+            // element. That bound collapses to ~0 on a device without the
+            // SINT8 cooperative matrix, where the weight-only kernel runs and
+            // this check is exactly as tight as it was. Measured error on a
+            // device that does have it is ~0.5% of |E|max -- an order of
+            // magnitude inside the bound -- so a real bug (a transposed or
+            // misstrided B read is ~100% wrong) still fails loudly.
+            float threshold =
+                std::max(0.05F, std::max(std::abs(ev) * 0.05F, tol_bound_[i]));
             if (std::abs(ov - ev) > threshold) {
                 LOG_ERROR("int8 MatMul Fail (%d): %f vs %f (thr %f)", i, ov, ev,
                           threshold);
+                // LOG_ERROR is compiled out under NDEBUG (the test build), so
+                // mirror it to stderr; a bare EXPECT_TRUE failure with no
+                // numbers is undebuggable.
+                fprintf(stderr, "[int8] MatMul Fail (%d): %f vs %f (thr %f)\n",
+                        i, ov, ev, threshold);
                 return false;
             }
         }
@@ -167,6 +184,9 @@ public:
   private:
     int batch_, m_, k_, n_;
     bool transB_, batched_b_;
+    // Per-output-element bound on the error A's int8 quantization introduces,
+    // flattened in the same order as the output.
+    std::vector<float> tol_bound_;
 
     static float to_float(T v) {
         if constexpr (std::is_same_v<T, uint16_t>) {
@@ -204,6 +224,24 @@ public:
         auto b = transB_ ? deq.t() : deq; // [K, N]
 
         auto y = torch::matmul(a.to(torch::kFloat32), b);
+
+        // A is quantized to int8 per output ROW at runtime (the weight path
+        // only quantized B), so each A element carries up to amax_row/254 of
+        // error. Worst case every tap aligns with |b|: bound = (amax/254) *
+        // sum_k|b|. On a device without the SINT8 cooperative matrix the
+        // weight-only kernel runs, A stays exact, and this collapses to ~0.
+        {
+            auto a32 = a.to(torch::kFloat32);
+            auto row_amax = std::get<0>(a32.abs().max(-1, true)); // [.., m, 1]
+            auto col_abs_sum = b.abs().sum(-2, true);             // [1, n]
+            auto bound = (row_amax / 254.0) * col_abs_sum;        // [.., m, n]
+            auto flat = bound.contiguous().flatten();
+            auto acc = flat.accessor<float, 1>();
+            tol_bound_.reserve(flat.numel());
+            for (int64_t i = 0; i < flat.numel(); i++) {
+                tol_bound_.push_back(acc[i]);
+            }
+        }
 
         inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
         this->fillTensorFromTorch(inputa, a);

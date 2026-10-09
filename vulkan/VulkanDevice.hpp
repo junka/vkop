@@ -163,6 +163,24 @@ class VulkanDevice {
     getCooperativeMatrixProperties() const {
         return coopmatProps_;
     }
+    // SINT8 -> SINT32 subgroup-scope cooperative matrix (W8A8). There is no
+    // boolean feature for "this device does integer MMA"; the KHR properties
+    // list is the only source of truth, so scan it for the exact combination
+    // the int8 MatMul kernel declares. Intel ARL reports 8x8x32 A=SINT8
+    // B=SINT8 C=SINT32 R=SINT32 at subgroup scope.
+    bool supports_coopmat_sint8() const {
+        for (const auto &p : coopmatProps_) {
+            if (p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
+                p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
+                p.scope == VK_SCOPE_SUBGROUP_KHR) {
+                return true;
+            }
+        }
+        return false;
+    }
+#else
+    bool supports_coopmat_sint8() const { return false; }
 #endif
     bool is_support_descriptor_update_after_bind() const {
         return m_support_descriptor_update_after_bind_;

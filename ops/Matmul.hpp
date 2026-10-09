@@ -23,6 +23,8 @@ extern unsigned char buffer_matmul_pack_spv[];
 extern unsigned int buffer_matmul_pack_spv_len;
 extern unsigned char buffer_matmul_coop_spv[];
 extern unsigned int buffer_matmul_coop_spv_len;
+extern unsigned char buffer_matmul_coop_i8_spv[];
+extern unsigned int buffer_matmul_coop_i8_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -235,6 +237,29 @@ class MatMulBuffer : public BufferFactory {
                 static_cast<int>(buffer_matmul_coop_spv_len), use_uab, 0);
             for (auto &ds : coop_ds_) {
                 ds = coop_pipeline_->allocDescriptorSets();
+            }
+        }
+        if (fp16_ != 0 && !coop_i8_pipeline_ &&
+            dev->is_support_cooperate_matrix() &&
+            dev->supports_coopmat_sint8()) {
+            // W8A8 cooperative-matrix kernel: int8 weight bytes x an int8
+            // activation the kernel quantizes itself (per output row, see the
+            // shader header), accumulated in int32 by the 8x8x32 subgroup MMA.
+            // Built only when the device actually lists the SINT8 combo — the
+            // KHR property list is the only feature query for integer MMA.
+            bool use_uab = update_after_bind_ &&
+                           dev->is_support_descriptor_update_after_bind();
+            coop_i8_pipeline_ = std::make_unique<VulkanPipeline>(
+                dev->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam),
+                reinterpret_cast<const uint32_t *>(buffer_matmul_coop_i8_spv),
+                static_cast<int>(buffer_matmul_coop_i8_spv_len), use_uab, 0);
+            for (auto &ds : coop_i8_ds_) {
+                ds = coop_i8_pipeline_->allocDescriptorSets();
             }
         }
         if (fp16_ != 0 && !pack_pipeline_) {
@@ -576,6 +601,17 @@ class MatMulBuffer : public BufferFactory {
         const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
                              m_dev_->is_support_cooperate_matrix() &&
                              coop_pipeline_ != nullptr;
+        // W8A8 sibling of the path above: an int8 weight with an int8
+        // activation the kernel quantizes itself (per output row), accumulated
+        // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
+        // a byte weight -- that is the whole point -- but it does keep the
+        // existing gate's transB == 0 and N % 8 == 0 constraints, since its B
+        // loader walks K rows of contiguous N bytes. Requires the device to
+        // list the SINT8 combo; the pipeline is built only then.
+        const bool coopmat_i8 = fp16_ != 0 && weight_int8 && !transB_ &&
+                                (n % 8 == 0) &&
+                                m_dev_->is_support_cooperate_matrix() &&
+                                coop_i8_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on
         // grid.y and use 16 of their workgroup's 256 lanes per row, so at
         // decode time (one A row) 15/16 of every workgroup idles and the
@@ -620,7 +656,7 @@ class MatMulBuffer : public BufferFactory {
         // path also needs it (it writes flat fp32 results that the pack pass
         // repacks to half2, regardless of N parity). Even-N fused/reduce paths
         // pack in-shader and bind the dummy for the 4th slot.
-        if (fp16_ != 0 && (!fused_fp16 || coopmat)) {
+        if (fp16_ != 0 && (!fused_fp16 || coopmat || coopmat_i8)) {
             // total may be 0 for a dynamic-shape output that resolved empty
             // (a 0 dim). vkCreateBuffer rejects size 0 with
             // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
@@ -694,6 +730,30 @@ class MatMulBuffer : public BufferFactory {
         // This is the highest-priority fp16 path — it pre-empts
         // tiled/ksplit/fused/reduce, which remain the fallback for quantized or
         // non-coopmat hardware.
+        if (coopmat_i8) {
+            // int8 weight x runtime-quantized int8 activation (SINT8 MMA).
+            // Same scratch + pack tail as the fp16 coopmat path.
+            fillDescriptorWrites(coop_i8_ds_[m_id_]);
+            coop_i8_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*coop_i8_pipeline_, coop_i8_ds_[m_id_]);
+            m_cmd_->push_constants(*coop_i8_pipeline_,
+                                   sizeof(matmul::GpuMatMulParam), &para_);
+            m_cmd_->dispatch(UP_DIV(n, 32), UP_DIV(m, 16), batch);
+
+            scratch_->shaderWriteBarrier(m_cmd_->get());
+
+            int nwords = (total + 1) / 2;
+            MatMulPackPC pack_pc{};
+            pack_pc.total = total;
+            fillDescriptorWrites(pack_ds_[m_id_]);
+            pack_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                   &pack_pc);
+            m_cmd_->dispatch(UP_DIV(nwords, 256), 1, 1);
+            return;
+        }
+
         if (coopmat) {
             fillDescriptorWrites(coop_ds_[m_id_]);
             coop_pipeline_->updateDescriptorSets(ds_writes_);
@@ -796,6 +856,11 @@ class MatMulBuffer : public BufferFactory {
     // from the same objs_ vector.
     std::unique_ptr<VulkanPipeline> coop_pipeline_;
     VkDescriptorSet coop_ds_[vkop::kInflight] = {nullptr};
+    // coop_i8_pipeline_ runs the W8A8 SINT8 cooperative-matrix kernel (int8
+    // weight x runtime-quantized int8 activation -> flat fp32 scratch). Built
+    // only when the device lists the SINT8 coopmat combo.
+    std::unique_ptr<VulkanPipeline> coop_i8_pipeline_;
+    VkDescriptorSet coop_i8_ds_[vkop::kInflight] = {nullptr};
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> ds_writes_;

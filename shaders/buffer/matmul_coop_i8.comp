@@ -1,0 +1,230 @@
+#version 450 core
+
+// SSBO cooperative-matrix MatMul for an int8 quantized weight with a
+// RUNTIME-quantized int8 activation (W8A8). Intel ARL exposes exactly one
+// SINT8 combo:
+//   coopmat<int8_t, gl_ScopeSubgroup, 8, 32, A>
+//   coopmat<int8_t, gl_ScopeSubgroup, 32, 8, B>
+//   coopmat<int,    gl_ScopeSubgroup, 8,  8, Acc>   (int8 in -> int32 acc)
+// subgroupSize=32, K=32. One MMA does C[8x8] += A[8x32]*B[32x8].
+//
+// This is the int8 sibling of buffer/matmul_coop.comp (fp16 8x8x16). It exists
+// because the fp16 kernel's K is 16 and its A/B are fp16: routing an int8
+// weight through it means expanding every weight byte to fp16 in shared memory
+// first, and that dequant tax (measured, see the reverted
+// "route quantized weight-only GEMM through the coopmat kernel") cost 3x at
+// decode. Here the weight is staged as raw bytes -- no decode in the K loop --
+// and the MMA accumulates in int32, so the per-column dequant scale leaves the
+// inner loop and lands once in the epilogue.
+//
+// The activation A is fp16 (that is what the graph carries; the op's signature
+// is unchanged from the weight-only int8 path: [A, B_int8, scale_b]). Rather
+// than require the converter to quantize A, this kernel quantizes it itself,
+// per output ROW: a workgroup owns BM rows and walks the whole K, so it sees
+// every tap of its rows and can take a true row amax before the MMA. That
+// makes W8A8 a pure runtime upgrade of the existing int8 kernel -- no new
+// input, no graph change, no calibration data.
+//
+// Phases:
+//   1. row amax of A over K (per workgroup row), -> per-row scale amax/127
+//   2. per K-tile: quantize A into shared int8, stage B bytes into shared int8,
+//      one coopMatMulAdd
+//   3. epilogue: int32 acc * scale_a[row] * scale_b[col] -> FLAT fp32 scratch
+//
+// A is [batch, M, K] row-major (fp16, packed half2). B is [batch, K, N]
+// row-major, one int8 byte per element. Output is [batch, M, N]; the flat fp32
+// result goes to the scratch buffer and the existing pack pass
+// (buffer_matmul_pack.comp) repacks it to packed half2 -- the same
+// odd-N-straddle reason as the fp16 kernel.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+// A: fp16, packed half2 (2 elements/uint), [batch, M, K].
+layout(set = 0, binding = 1) readonly buffer InA {
+    uint data[];
+} uInputA;
+// B: int8, one byte per element, [batch, K, N].
+layout(set = 0, binding = 2) readonly buffer InB {
+    uint data[];
+} uInputB;
+// binding 3: flat fp32 accumulator output, read by the pack pass.
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+// binding 4: the weight's per-output-column dequant scale, fp32[N] -- the same
+// scale the weight-only int8 kernel reads.
+layout(set = 0, binding = 4) readonly buffer Scale {
+    uint data[];
+} uScale;
+
+layout(push_constant) uniform PC {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int fp32;   // unused (this kernel is fp16-out); kept for PC compat
+    int transB; // unused (the gate requires transB == 0); kept for PC compat
+} uPC;
+
+const int M_BLOCK = 8;
+const int N_BLOCK = 8;
+const int K_BLOCK = 32; // the device's SINT8 coopmat K
+
+const int BM = 16; // = 2 * M_BLOCK  (workgroup M footprint)
+const int BN = 32; // = 4 * N_BLOCK  (workgroup N footprint)
+
+// One signed byte out of a 32-bit word. No reliance on an arithmetic shift of
+// a signed int or on uint->int conversion above INT_MAX: mask to 0..255, then
+// subtract 256 above 127.
+int s8(uint word, int elem) {
+    int b = int((word >> uint((elem & 3) * 8)) & 0xFFu);
+    return b < 128 ? b : b - 256;
+}
+// A's fp16 element `elem` (packed half2, element 0 in the low half).
+float loadA_f16(int elem) {
+    return float(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
+}
+int loadA_i8(int elem) { return s8(uInputA.data[elem >> 2], elem); }
+int loadB_i8(int elem) { return s8(uInputB.data[elem >> 2], elem); }
+
+// A tile, quantized to int8, row-major [BM x K_BLOCK].
+shared int8_t shAq[BM * K_BLOCK];
+// B tile as raw bytes, row-major [K_BLOCK x BN].
+shared int8_t shB[K_BLOCK * BN];
+// Per-row activation scale for the workgroup's BM rows (1 when amax == 0).
+shared float shSa[BM];
+// Per-row |A| max, accumulated as float bits (abs of a finite float is
+// non-negative, so the uint ordering matches the float ordering).
+shared uint shAmaxU[BM];
+// Each subgroup parks its 8x8 int32 accumulator here before scaling.
+shared int shC[8][M_BLOCK * N_BLOCK];
+
+void main() {
+    int b = int(gl_WorkGroupID.z);
+    int m0 = int(gl_WorkGroupID.y) * BM;
+    int n0 = int(gl_WorkGroupID.x) * BN;
+    uint sg = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    uint tid = gl_LocalInvocationIndex;
+    int sgx = int(sg % 4);
+    int sgy = int(sg / 4);
+
+    int M = uPC.M;
+    int N = uPC.N;
+    int K = uPC.K;
+
+    int a_base = b * M * K; // A[batch] in elements
+    int b_base = b * K * N; // B[batch] in bytes
+
+    // ---- Phase 1: per-row amax of A over the full K -----------------------
+    if (tid < uint(BM)) {
+        shAmaxU[tid] = 0u;
+    }
+    barrier();
+    {
+        // 16 threads cooperate on each of the BM rows; each walks K/16 taps.
+        int h = int(tid) % BM;
+        int klane = int(tid) / BM; // 0..15
+        int hg = m0 + h;
+        if (hg < M) {
+            float mx = 0.0;
+            for (int kk = klane; kk < K; kk += 16) {
+                mx = max(mx, abs(loadA_f16(a_base + hg * K + kk)));
+            }
+            atomicMax(shAmaxU[h], floatBitsToUint(mx));
+        }
+    }
+    barrier();
+    if (tid < uint(BM)) {
+        float amax = uintBitsToFloat(shAmaxU[tid]);
+        // A row of all zeros quantizes to all zeros under any scale; 1.0 keeps
+        // the reciprocal finite and the output 0.
+        shSa[tid] = (amax > 0.0) ? (amax / 127.0) : 1.0;
+    }
+    barrier();
+
+    coopmat<int, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
+        matC;
+    matC = coopmat<int, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                   gl_MatrixUseAccumulator>(0);
+
+    int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
+
+    for (int t = 0; t < k_tiles; t++) {
+        int k_base = t * K_BLOCK;
+
+        // 256 threads quantize A[BM x K_BLOCK] => 2/thread.
+        for (int e = 0; e < 2; e++) {
+            int idx = int(tid) * 2 + e; // 0..511
+            int row = idx / K_BLOCK;
+            int kk = k_base + (idx % K_BLOCK);
+            int hg = m0 + row;
+            int q = 0;
+            if (hg < M && kk < K) {
+                float v = loadA_f16(a_base + hg * K + kk) / shSa[row];
+                q = int(round(clamp(v, -127.0, 127.0)));
+            }
+            shAq[idx] = int8_t(q);
+        }
+        // 256 threads stage B[K_BLOCK x BN] bytes => 4/thread.
+        for (int e = 0; e < 4; e++) {
+            int idx = int(tid) * 4 + e; // 0..1023
+            int row = idx / BN;         // K dim
+            int col = idx % BN;         // N dim
+            int kk = k_base + row;
+            int w = n0 + col;
+            // B is [batch, K, N] row-major; the gate rejects transB.
+            shB[idx] = (kk < K && w < N)
+                           ? int8_t(loadB_i8(b_base + kk * N + w))
+                           : int8_t(0);
+        }
+
+        barrier();
+
+        coopmat<int8_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
+            matA;
+        coopmat<int8_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
+            matB;
+        coopMatLoad(matA, shAq, sgy * M_BLOCK * K_BLOCK, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shB, sgx * N_BLOCK, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+
+        matC = coopMatMulAdd(matA, matB, matC);
+
+        barrier();
+    }
+
+    // ---- Phase 3: scale out of the accumulator -> flat fp32 scratch -------
+    // The int32 accumulator holds sum(a_q * b_q); the real value is
+    // sum(a * b) = acc * scale_a[row] * scale_b[col], applied here once per
+    // output element rather than once per K step.
+    coopMatStore(matC, shC[sg], 0, N_BLOCK,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    int c_base = b * M * N;
+    for (int e = 0; e < 2; e++) {
+        int idx = int(lane) * 2 + e; // 0..63
+        int row = idx / N_BLOCK;
+        int col = idx % N_BLOCK;
+        int hg = m0 + sgy * M_BLOCK + row;
+        int wg = n0 + sgx * N_BLOCK + col;
+        if (hg < M && wg < N) {
+            float sb = uintBitsToFloat(uScale.data[wg]);
+            float v = float(shC[sg][idx]) * shSa[sgy * M_BLOCK + row] * sb;
+            uScratch.data[c_base + hg * N + wg] = floatBitsToUint(v);
+        }
+    }
+}
