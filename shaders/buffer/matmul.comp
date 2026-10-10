@@ -73,9 +73,17 @@ layout(push_constant) uniform PC {
     int w8_quad;     // 1 = a byte-quantized B, N % 4 == 0 and B is [batch, K, N]:
                      // one thread owns four columns (the host sizes the grid to
                      // match)
-    int ksplit; // 1 = split-K GEMV: a block covers 16 column quads and splits K
-                // 16 ways over the lanes the single A row leaves idle (grid is
-                // x = N/4/16, y = batch*M). Host picks it, see MatMulBuffer.
+    int ksplit; // 1 = split-K GEMV: a block covers ksplit_q column quads and
+                // splits K over the lanes the single A row leaves idle (grid is
+                // x = N/4/ksplit_q, y = batch*M). Host picks it, see
+                // MatMulBuffer.
+    int ksplit_q; // column quads per block for the split-K GEMV. The block's
+                // 256 lanes are laid out flat as quad = lane % ksplit_q, k
+                // slice = lane / ksplit_q, so ksplit_q trades column coverage
+                // for K parallelism: a narrow-N layer (down_proj N=896) put only
+                // 14 blocks on the device at q=16 and ran at 21 GB/s, while
+                // lm_head (2374 blocks) reached 25. Host sets it; 16 reproduces
+                // the original layout.
     int w4;     // 1 = B is a packed 4-bit weight (two nibbles per byte, low one
                 // first) with a per-group scale: N % 8 == 0, transB == 0 and
                 // K % group == 0 are all host-checked (see MatMulBuffer).
@@ -422,29 +430,105 @@ void ks_store(vec4 s, int row, int ja) {
 }
 
 // int8 weight-only, B is [batch, K, N], N % 4 == 0.
+//
+// Flat split-K GEMV. The block's 256 lanes are laid out as
+//   quad  = lane % ksplit_q        (which column quad this lane owns)
+//   slice = lane / ksplit_q        (which slice of K it accumulates)
+// so ksplit_q is a pure occupancy knob: it sets both how many column quads a
+// block covers (grid x = N/4/ksplit_q) and how deep K is cut (ksplit_q *
+// n_slice == 256). The original 16x16 form is ksplit_q == 16. Decode is one A
+// row, so the column-parallel kernels leave 15 of every 16 lanes idle; putting
+// them on K is the whole point, and the narrow-N projections need the extra
+// blocks more than they need the extra K depth -- at q = 16 down_proj (N=896)
+// launched 14 blocks and ran at 21 GB/s against lm_head's 25 GB/s at 2374.
+//
+// The partials fold through one flat shared array indexed slice*ksplit_q +
+// quad; a runtime stride into shared is legal, and it keeps the fold code
+// identical for every q (the array is sized for the 256-lane block, so the
+// q == 4 case uses it exactly).
+shared vec4 ks_flat[256];
+
+void ks_store_flat(vec4 s, int row, int ja) {
+    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int q = uPC.ksplit_q;
+    int n_slice = 256 / q;
+    int quad = lane % q;
+    int slice = lane / q;
+    ks_flat[slice * q + quad] = s;
+    barrier();
+    // One folding lane per column quad; the rest of the block is done.
+    if (lane >= q) return;
+    vec4 v = ks_flat[quad];
+    for (int t = 1; t < n_slice; ++t) v += ks_flat[t * q + quad];
+    int cja = (int(gl_WorkGroupID.x) * q + quad) * 4;
+    if (cja >= uPC.N) return;
+    int out_idx = row * uPC.N + cja;
+    if (uPC.weight_int8 != 0) {
+        v *= vec4(uintBitsToFloat(uScale.data[cja]),
+                  uintBitsToFloat(uScale.data[cja + 1]),
+                  uintBitsToFloat(uScale.data[cja + 2]),
+                  uintBitsToFloat(uScale.data[cja + 3]));
+    }
+    uOutput.data[out_idx >> 1] = packHalf2x16(v.xy);
+    uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(v.zw);
+}
+
 void matmul16_w8_ksplit() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
-    int ja = (int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x)) * 4;
+    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int q = uPC.ksplit_q;
+    int n_slice = 256 / q;
+    int quad = lane % q;
+    int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
     int b_row = n * uPC.K * uPC.N + ja;
 
-    int chunk = ks_chunk();
-    int k0 = int(gl_LocalInvocationID.y) * chunk;
+    int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
+    int slice = lane / q;
+    int k0 = slice * chunk;
     int kend = min(k0 + chunk, uPC.K);
     vec4 s = vec4(0.0);
-    // A quad past the last column reads nothing; ks_store still publishes its
-    // zero so the reduction never sees an uninitialized slot.
+    // A quad past the last column reads nothing; ks_store_flat still publishes
+    // its zero so the reduction never sees an uninitialized slot.
     if (ja < uPC.N) {
-        for (int k = k0; k + 1 < kend; k += 2) {
+        // Eight k's per trip: every weight word (and the trip's A half2 words)
+        // is issued before any is consumed, so the trip's loads are all in
+        // flight together. The two-at-a-time form kept only two loads in flight
+        // per lane and stalled on DRAM latency -- measured on Qwen2.5-0.5B int8
+        // it capped the large projections near 21 GB/s. The addresses within a
+        // trip are independent (K rows are N bytes apart), so this is pure
+        // memory-level parallelism with identical arithmetic: the same FMAs in
+        // the same order, just scheduled wider.
+        int k = k0;
+        for (; k + 7 < kend; k += 8) {
+            uint r0 = uInputB.data[(b_row + (k + 0) * uPC.N) >> 2];
+            uint r1 = uInputB.data[(b_row + (k + 1) * uPC.N) >> 2];
+            uint r2 = uInputB.data[(b_row + (k + 2) * uPC.N) >> 2];
+            uint r3 = uInputB.data[(b_row + (k + 3) * uPC.N) >> 2];
+            uint r4 = uInputB.data[(b_row + (k + 4) * uPC.N) >> 2];
+            uint r5 = uInputB.data[(b_row + (k + 5) * uPC.N) >> 2];
+            uint r6 = uInputB.data[(b_row + (k + 6) * uPC.N) >> 2];
+            uint r7 = uInputB.data[(b_row + (k + 7) * uPC.N) >> 2];
+            uint aw = (a_off + k) >> 1;
+            vec2 a0 = unpackHalf2x16(uInputA.data[aw]);
+            vec2 a1 = unpackHalf2x16(uInputA.data[aw + 1]);
+            vec2 a2 = unpackHalf2x16(uInputA.data[aw + 2]);
+            vec2 a3 = unpackHalf2x16(uInputA.data[aw + 3]);
+            s += a0.x * unpack_w8(r0) + a0.y * unpack_w8(r1) +
+                 a1.x * unpack_w8(r2) + a1.y * unpack_w8(r3) +
+                 a2.x * unpack_w8(r4) + a2.y * unpack_w8(r5) +
+                 a3.x * unpack_w8(r6) + a3.y * unpack_w8(r7);
+        }
+        for (; k + 1 < kend; k += 2) {
             vec4 w0 = unpack_w8(uInputB.data[(b_row + k * uPC.N) >> 2]);
             vec4 w1 = unpack_w8(uInputB.data[(b_row + (k + 1) * uPC.N) >> 2]);
             vec2 a = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
             s += a.x * w0 + a.y * w1;
         }
     }
-    ks_store(s, row, ja);
+    ks_store_flat(s, row, ja);
 }
 
 // 4-bit weight-only, B is [batch, K, N], N % 8 == 0: decode slicing over K, but

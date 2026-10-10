@@ -62,6 +62,13 @@ struct alignas(16) GpuMatMulParam {
     // the column-parallel kernels then leave 15 of every 16 lanes idle. Buffer
     // path, fp16 build only; the image shaders never see it set.
     int ksplit = 0;
+    // Column quads per block for the split-K GEMV (buffer path, fp16 build).
+    // The block's 256 lanes are laid out flat as quad = lane % ksplit_q,
+    // K slice = lane / ksplit_q, so this trades column coverage for K
+    // parallelism: at 16 (the original layout) down_proj's N = 896 put only 14
+    // blocks on the device and ran at 21 GB/s while lm_head's 2374 blocks
+    // reached 25. Host picks it in execute(); 16 keeps the original layout.
+    int ksplit_q = 16;
     // 1 = B is a 4-bit weight-only payload (two nibbles per byte, even element
     // in the low nibble) with a per-K-group fp32 scale at binding 4, laid out
     // [K/group, N]. Buffer path only, and the host gates it on transB == 0,
@@ -799,12 +806,22 @@ class MatMulBuffer : public BufferFactory {
             return;
         }
         if (ksplit) {
-            // x = column quads (16 per block), y = one output row per block:
-            // the block's own 16 lanes are the K slices, so y carries the row
-            // index the shader reads as gl_WorkGroupID.y.
-            submit(&para_, UP_DIV(n / 4, 16), batch * m, 1);
+            // x = column-quad groups, y = one output row per block: the block's
+            // own lanes are the K slices, so y carries the row index the shader
+            // reads as gl_WorkGroupID.y. How many quads a block covers is the
+            // occupancy knob -- halve it (16 -> 4) while the row's N is narrow
+            // enough that a 16-quad block would launch too few blocks to keep
+            // the device busy; the K slices grow to match, since lane count is
+            // fixed at 256.
+            int q = 16;
+            while (q > 4 && UP_DIV(n / 4, q) < 32) {
+                q /= 2;
+            }
+            para_.ksplit_q = q;
+            submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
             return;
         }
+        para_.ksplit_q = 16;
         if (fused_fp16) {
             // Single pass: x covers output WORDS (column pairs), or DWORDs for
             // the four-column quantized kernels.
