@@ -704,6 +704,15 @@ class FusionOptimizer:
         )
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "eliminate_redundant_shape",
+                FusionOptimizer.match_redundant_shape,
+                FusionOptimizer.fold_redundant_shape,
+                priority=97,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "fold_aliasable_squeeze_unsqueeze",
                 FusionOptimizer.match_aliasable_squeeze_unsqueeze,
                 FusionOptimizer.fold_aliasable_squeeze_unsqueeze,
@@ -1483,6 +1492,87 @@ class FusionOptimizer:
             del dag_model.initializers[init_name]
 
         return True
+
+    # ---- Redundant Shape elimination (shape-vector CSE) ----
+    # The exporter emits Shape(x) once per consumer chain even when several
+    # chains read the *same* tensor, so one runtime shape gets recomputed a
+    # dozen times: post-fusion the LLM graph carries 241 Shape nodes over only
+    # 4 distinct declared input shapes. Shape's output is a pure function of
+    # its input's runtime shape, so two Shape nodes reading the same upstream
+    # tensor necessarily produce bit-identical int64 vectors -- the later one's
+    # consumers can be rebound onto the first and the node deleted.
+    #
+    # Soundness: the merge key is the **producer identity** (same input tensor
+    # name => same byte buffer => same runtime shape), which is provable from
+    # the graph alone. The declared shape is deliberately NOT used as a key:
+    # ONNX shape inference runs earlier in optimize_model and rewrites the
+    # exporter's 4 dim_params into ~991 per-dim junk symbols (unk__N), and the
+    # DAG drops symbol names altogether (dynamic dims collapse to a -1
+    # sentinel). A prototype that keyed on those symbols "collapsed" ~980
+    # nodes, but 236 of the 241 shapes carry junk symbols after inference, and
+    # the -1 dims cannot distinguish `seq` from `kv_len` -- so that reach
+    # silently mis-merges distinct runtime dims. Keying on producer identity
+    # reaches 241 -> 73 names (168 merges); "all dims concrete" adds nothing
+    # because only 3 of the 241 shapes are fully static. That bound is real,
+    # not an artifact of the key.
+    @staticmethod
+    def match_redundant_shape(dag_model):
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+        initializer_names = set(getattr(dag_model, "initializers", {}))
+
+        groups: Dict[str, List] = {}
+        for node in dag_model.nodes.values():
+            if node.op_type != "Shape" or len(node.inputs) != 1 or len(node.outputs) != 1:
+                continue
+            in_name = node.inputs[0]["name"]
+            out_name = node.outputs[0]["name"]
+            if not in_name or not out_name:
+                continue
+            # Never delete a node that produces a graph output, and stay
+            # explicitly inside the int64 domain (Shape is int64 by
+            # definition; a mis-typed graph must not merge across dtypes).
+            if out_name in graph_outputs or out_name in initializer_names:
+                continue
+            if node.outputs[0].get("dtype") != 7:
+                continue
+            groups.setdefault(in_name, []).append(node)
+
+        matches = []
+        for in_name, nodes in groups.items():
+            if len(nodes) < 2:
+                continue
+            canonical = nodes[0]
+            duplicates = [n for n in nodes[1:]
+                          if n.name in dag_model.nodes
+                          and n.outputs[0]["name"] != in_name]
+            if not duplicates:
+                continue
+            matches.append({"canonical": canonical, "duplicates": duplicates})
+        return matches
+
+    @staticmethod
+    def fold_redundant_shape(dag_model, match) -> bool:
+        canonical = match["canonical"]
+        if canonical.name not in dag_model.nodes:
+            return False
+        canon_out = canonical.outputs[0]["name"]
+        changed = False
+        for dup in match["duplicates"]:
+            if dup.name not in dag_model.nodes:
+                continue
+            dup_out = dup.outputs[0]["name"]
+            # Rebind every consumer of the duplicate's shape vector onto the
+            # canonical one, then drop the duplicate.
+            if dup_out != canon_out:
+                for other in dag_model.nodes.values():
+                    if other.name == dup.name:
+                        continue
+                    for inp in other.inputs:
+                        if inp["name"] == dup_out:
+                            inp["name"] = canon_out
+            del dag_model.nodes[dup.name]
+            changed = True
+        return changed
 
     @staticmethod
     def match_conv_bn(dag_model):
