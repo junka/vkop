@@ -6,6 +6,7 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 
+#include <cstdlib>
 #include <string>
 #include <vector>
 extern "C" {
@@ -608,8 +609,19 @@ class MatMulBuffer : public BufferFactory {
         // existing gate's transB == 0 and N % 8 == 0 constraints, since its B
         // loader walks K rows of contiguous N bytes. Requires the device to
         // list the SINT8 combo; the pipeline is built only then.
-        const bool coopmat_i8 = fp16_ != 0 && weight_int8 && !transB_ &&
-                                (n % 8 == 0) &&
+        //
+        // Off by default: measured on Qwen2.5-0.5B int8 it is ~2x slower than
+        // the weight-only GEMV at decode (m=1, matches the reverted 623a836)
+        // and ~1.4x slower at prefill -- the MMA saves no weight bandwidth and
+        // a 16x32 output tile wastes most of itself at m=1. Kept for the case
+        // it was built for (large M with a quantized A); opt in with
+        // VKOP_COOP_I8=1.
+        static const bool coop_i8_enabled = [] {
+            const char *v = std::getenv("VKOP_COOP_I8");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        const bool coopmat_i8 = coop_i8_enabled && fp16_ != 0 && weight_int8 &&
+                                !transB_ && (n % 8 == 0) &&
                                 m_dev_->is_support_cooperate_matrix() &&
                                 coop_i8_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on
