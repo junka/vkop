@@ -100,6 +100,11 @@ struct alignas(16) GpuMatMulParam {
     // int4; only the nibble-to-float step differs. Buffer path only, and only
     // meaningful with w4 set.
     int uint4 = 0;
+    // 1 = fp16 split-K GEMV uses the 16-byte-load variant: each lane owns
+    // eight contiguous columns (one uvec4 weight load per k, two accumulator
+    // chains) and ksplit_q counts 8-column groups per block. Host requires
+    // N % 8 == 0; see MatMulBuffer::execute. Buffer path only.
+    int wide = 0;
 };
 
 } // namespace matmul
@@ -217,7 +222,16 @@ class MatMulBuffer : public BufferFactory {
         const std::shared_ptr<VulkanDevice> &dev,
         const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
         BufferFactory::set_runtime_device(dev, cmdpool);
-        if (fp16_ != 0 && !coop_pipeline_) {
+        // MoltenVK lists KHR_cooperative_matrix but its SPIR-V -> MSL backend
+        // only lowers 8x8 coopmat dims, so the 8x16/16x8 A/B tiles here fail
+        // pipeline creation ("MSL cooperative matrices only support 8x8
+        // dimensions"). VKOP_NO_COOP=1 skips the coop paths entirely and keeps
+        // the reduce fallback usable on such portability drivers.
+        static const bool coop_disabled = [] {
+            const char *v = std::getenv("VKOP_NO_COOP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        if (fp16_ != 0 && !coop_pipeline_ && !coop_disabled) {
             // fp16 cooperative-matrix kernel: a single dispatch reads fp16 A/B
             // from SSBO, accumulates in fp32 via the 8x8x16 subgroup MMA
             // (coopMatMulAdd), and writes FLAT fp32 results to the scratch
@@ -606,9 +620,13 @@ class MatMulBuffer : public BufferFactory {
         // its own dequant kernels) and only when the device supports it;
         // everything else falls through to the tiled / ksplit / fused / reduce
         // path below.
-        const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
-                             m_dev_->is_support_cooperate_matrix() &&
-                             coop_pipeline_ != nullptr;
+        static const bool coop_disabled = [] {
+            const char *v = std::getenv("VKOP_NO_COOP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        const bool coopmat =
+            fp16_ != 0 && !weight_byte && !weight_4bit && !coop_disabled &&
+            m_dev_->is_support_cooperate_matrix() && coop_pipeline_ != nullptr;
         // W8A8 sibling of the path above: an int8 weight with an int8
         // activation the kernel quantizes itself (per output row), accumulated
         // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
@@ -734,6 +752,7 @@ class MatMulBuffer : public BufferFactory {
         para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
         para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
         para_.ksplit = ksplit ? 1 : 0;
+        para_.wide = 0;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;
         para_.nvfp4 = weight_nvfp4 ? 1 : 0;
@@ -812,8 +831,31 @@ class MatMulBuffer : public BufferFactory {
             // occupancy knob -- halve it (16 -> 4) while the row's N is narrow
             // enough that a 16-quad block would launch too few blocks to keep
             // the device busy; the K slices grow to match, since lane count is
-            // fixed at 256.
+            // fixed at 256. VKOP_KSPLIT_Q overrides the pick (tuning only).
             int q = 16;
+            if (const char *e = std::getenv("VKOP_KSPLIT_Q")) {
+                int v = std::atoi(e);
+                if (v > 0)
+                    q = v;
+            }
+            // VKOP_KSPLIT_WIDE=1 picks the 16-byte-load GEMV: each lane owns
+            // eight contiguous columns, one uvec4 weight load per k. Needs
+            // N % 8 == 0 for the 16B element alignment of every (k, octet)
+            // address. ksplit_q now counts 8-column groups per block, so the
+            // same block-count heuristic runs on n / 8.
+            static const bool wide_env = [] {
+                const char *e = std::getenv("VKOP_KSPLIT_WIDE");
+                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            }();
+            if (wide_env && (n % 8 == 0)) {
+                while (q > 4 && UP_DIV(n / 8, q) < 32) {
+                    q /= 2;
+                }
+                para_.wide = 1;
+                para_.ksplit_q = q;
+                submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
+                return;
+            }
             while (q > 4 && UP_DIV(n / 4, q) < 32) {
                 q /= 2;
             }
