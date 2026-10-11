@@ -713,6 +713,15 @@ class FusionOptimizer:
 
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "eliminate_expand_negone_guard",
+                FusionOptimizer.match_expand_negone_guard,
+                FusionOptimizer.fold_expand_negone_guard,
+                priority=96,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "fold_aliasable_squeeze_unsqueeze",
                 FusionOptimizer.match_aliasable_squeeze_unsqueeze,
                 FusionOptimizer.fold_aliasable_squeeze_unsqueeze,
@@ -1573,6 +1582,136 @@ class FusionOptimizer:
             del dag_model.nodes[dup.name]
             changed = True
         return changed
+
+    # ---- Expand(-1) 守卫消除（Where(Equal(S, -ones), ones, S)） ----
+    # torch 导出器把 expand(..., -1) 写成运行时守卫（LLM 图 59 处）：
+    #   S = Concat(Shape 链…, ones)          # expand 的目标 shape 向量
+    #   Where(Equal(S, Mul(ConstantOfShape(S), -1)), COS, S)
+    # 语义：若调用方传 -1 则用 1 补维；静态导出图里 -1 永不流入 S（S 的元素
+    # 全部来自 Shape/非负常量），Equal 恒 False，Where 恒取 Y=S。上游的
+    # Mul/ConstantOfShape 已被 ConstantFolder 折叠，DAG 层残留形态为
+    # Where(Equal(S, 全负 int 常量), 常量, S)。
+    #
+    # 折叠 = 纯 rewire（Where 的消费者改接 Y），不重建上游链、不新增节点；
+    # 孤儿 Equal/常量由 prune_and_materialize 清理，被链外复用的维度 Gather
+    # 自然保留。对比 ONNX 层 patch：DAG 层折叠不需要重建形状链，还省掉
+    # 重建引入的新 dispatch。
+    #
+    # 可靠性论证：Equal 一侧被数据流证明「逐元素 ≥0」（shape 值域），另一侧
+    # 是全负 int 常量 → 逐元素相等不可能 → Equal 输出全 False → Where ≡ Y，
+    # 与 X 无关。非负传播取保守闭包（值语义逐元素拷贝）：
+    #   Shape → 恒非负（张量维度定义非负）
+    #   Concat → 所有输入非负才非负
+    #   Gather/Unsqueeze/Squeeze/Reshape/Expand/Transpose/Slice/Identity/Cast
+    #     → 取值来自 inputs[0]（其余输入只管选位/定形，不影响值域）
+    #   initializer/Constant → 逐值判断；graph 输入与其余 op → UNKNOWN
+    _VALUE_FROM_INPUT0_OPS = {
+        "Gather", "Unsqueeze", "Squeeze", "Reshape", "Expand",
+        "Transpose", "Slice", "Identity", "Cast",
+    }
+
+    @staticmethod
+    def _guard_const_array(tname, dag_model, producer):
+        """取张量名的常量载荷（initializer 或 Constant 节点），否则 None。"""
+        if tname in dag_model.initializers:
+            return numpy_helper.to_array(dag_model.initializers[tname])
+        node = producer.get(tname)
+        if node is not None and node.op_type == "Constant":
+            v = node.attributes.get("value")
+            return v if isinstance(v, np.ndarray) else None
+        return None
+
+    @staticmethod
+    def match_expand_negone_guard(dag_model):
+        producer, _ = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+        initializers = getattr(dag_model, "initializers", {})
+
+        nonneg_cache = {}
+
+        def is_nonneg(tname, visiting=None):
+            """tname 的值是否被证明逐元素 ≥0（shape 值域）。证不出即否。"""
+            if tname in nonneg_cache:
+                return nonneg_cache[tname]
+            if visiting is None:
+                visiting = set()
+            if tname in visiting:
+                return False  # 环 → 保守 UNKNOWN
+            visiting = visiting | {tname}
+            res = False
+            node = producer.get(tname)
+            if node is None:
+                if tname in initializers:
+                    arr = numpy_helper.to_array(initializers[tname])
+                    # 数值 dtype 均可（int/float）：值是字面量，>=0 即非负
+                    res = (arr.dtype.kind in "iuf" and arr.size > 0
+                           and bool((arr >= 0).all()))
+                # graph 输入等其他来源 → UNKNOWN
+            elif node.op_type == "Shape":
+                res = True  # 张量维度定义非负
+            elif node.op_type == "Concat":
+                res = all(is_nonneg(i["name"], visiting)
+                          for i in node.inputs if i["name"])
+            elif node.op_type in FusionOptimizer._VALUE_FROM_INPUT0_OPS:
+                res = is_nonneg(node.inputs[0]["name"], visiting)
+            elif node.op_type == "Constant":
+                arr = node.attributes.get("value")
+                res = (isinstance(arr, np.ndarray) and arr.dtype.kind in "iuf"
+                       and arr.size > 0 and bool((arr >= 0).all()))
+            nonneg_cache[tname] = res
+            return res
+
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type != "Where" or len(node.inputs) != 3:
+                continue
+            out_name = node.outputs[0]["name"]
+            if not out_name or out_name in graph_outputs:
+                continue
+            cond = producer.get(node.inputs[0]["name"])
+            if cond is None or cond.op_type != "Equal" or len(cond.inputs) != 2:
+                continue
+            neg_name = shape_name = None
+            for inp in cond.inputs:
+                nm = inp["name"]
+                arr = FusionOptimizer._guard_const_array(nm, dag_model, producer)
+                if (arr is not None and arr.dtype.kind in "iuf" and arr.size > 0
+                        and bool((arr < 0).all())):
+                    neg_name = nm
+                elif not shape_name:
+                    shape_name = nm
+            if neg_name is None or shape_name is None:
+                continue
+            if not is_nonneg(shape_name):
+                continue
+            matches.append({"where": node, "equal": cond,
+                            "y_name": node.inputs[2]["name"]})
+        return matches
+
+    @staticmethod
+    def fold_expand_negone_guard(dag_model, match) -> bool:
+        where = match["where"]
+        if where.name not in dag_model.nodes:
+            return False
+        out_name = where.outputs[0]["name"]
+        y_name = match["y_name"]
+        # Where 的消费者全部改接 Y（Equal 恒 False → Where ≡ Y）
+        _, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        for consumer, idx in consumers.get(out_name, []):
+            consumer.inputs[idx]["name"] = y_name
+        del dag_model.nodes[where.name]
+        # Equal 无剩余消费者（且非图输出）才删；否则留给 prune
+        equal = match["equal"]
+        if equal.name in dag_model.nodes:
+            equal_out = equal.outputs[0]["name"]
+            graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+            still_used = (equal_out in graph_outputs
+                          or any(inp["name"] == equal_out
+                                 for n in dag_model.nodes.values()
+                                 for inp in n.inputs))
+            if not still_used:
+                del dag_model.nodes[equal.name]
+        return True
 
     @staticmethod
     def match_conv_bn(dag_model):

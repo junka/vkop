@@ -134,53 +134,126 @@ class VisualExport(nn.Module):
         return out.pooler_output, deepstack[0], deepstack[1], deepstack[2]
 
 
-patch_size = visual.patch_embed.patch_size
-temporal_patch_size = visual.patch_embed.temporal_patch_size
-in_chans = visual.patch_embed.in_channels
-row = in_chans * temporal_patch_size * patch_size * patch_size
-# 导出尺寸从环境变量 EXPORT_IMG_SIZE 读，默认 224×224。注意：visual.onnx 的整张图
-# 都是「导出时固化」的——grid_thw 及其派生量（pos_embed 插值索引/权重、rotary
-# position_ids、cu_seqlens）全部折成常量，输入输出也不标 dynamic_axes。
-# 要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx，不同尺寸不能共用一个图。
-EXPORT_IMG_SIZE = int(os.environ.get("EXPORT_IMG_SIZE", "224"))
-height = width = EXPORT_IMG_SIZE
-assert height % patch_size == 0 and width % patch_size == 0, \
-    f"导出尺寸 {height}×{width} 必须是 patch_size={patch_size} 的整数倍"
-grid_t, grid_h, grid_w = 1, height // patch_size, width // patch_size
-assert grid_h % SPATIAL_MERGE == 0 and grid_w % SPATIAL_MERGE == 0, \
-    f"grid {grid_h}×{grid_w} 必须能被 spatial_merge_size={SPATIAL_MERGE} 整除"
-seq_len = grid_t * grid_h * grid_w
-grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
-pixel_values = torch.randn(seq_len, row, dtype=visual.dtype)
-print(f"[visual] img={height}×{width} patch={patch_size} seq_len={seq_len} "
-      f"row={row} grid_thw={grid_thw.tolist()}")
+EXPORT_LLM_ONLY = os.environ.get("EXPORT_LLM_ONLY") == "1"
 
-visual_out_names = ["image_features", "deepstack_features_0",
-                    "deepstack_features_1", "deepstack_features_2"]
+if not EXPORT_LLM_ONLY:
+    patch_size = visual.patch_embed.patch_size
+    temporal_patch_size = visual.patch_embed.temporal_patch_size
+    in_chans = visual.patch_embed.in_channels
+    row = in_chans * temporal_patch_size * patch_size * patch_size
+    # 导出尺寸从环境变量 EXPORT_IMG_SIZE 读，默认 224×224。注意：visual.onnx 的整张图
+    # 都是「导出时固化」的——grid_thw 及其派生量（pos_embed 插值索引/权重、rotary
+    # position_ids、cu_seqlens）全部折成常量，输入输出也不标 dynamic_axes。
+    # 要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx，不同尺寸不能共用一个图。
+    EXPORT_IMG_SIZE = int(os.environ.get("EXPORT_IMG_SIZE", "224"))
+    height = width = EXPORT_IMG_SIZE
+    assert height % patch_size == 0 and width % patch_size == 0, \
+        f"导出尺寸 {height}×{width} 必须是 patch_size={patch_size} 的整数倍"
+    grid_t, grid_h, grid_w = 1, height // patch_size, width // patch_size
+    assert grid_h % SPATIAL_MERGE == 0 and grid_w % SPATIAL_MERGE == 0, \
+        f"grid {grid_h}×{grid_w} 必须能被 spatial_merge_size={SPATIAL_MERGE} 整除"
+    seq_len = grid_t * grid_h * grid_w
+    grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
+    pixel_values = torch.randn(seq_len, row, dtype=visual.dtype)
+    print(f"[visual] img={height}×{width} patch={patch_size} seq_len={seq_len} "
+          f"row={row} grid_thw={grid_thw.tolist()}")
 
-with torch.no_grad():
-    torch.onnx.export(
-        VisualExport(visual, grid_thw), (pixel_values, grid_thw), "visual.onnx",
-        input_names=["pixel_values", "grid_thw"],
-        output_names=visual_out_names,
-        # 不给 dynamic_axes：grid 相关量已全部固化成常量，标成动态只会骗人
-        # ——runtime 侧必须按导出尺寸喂图。grid_thw 仍留作输入位（llm_chat 不绑定它），
-        # 以免改动 C++ 侧的输入契约。
-        opset_version=OPSET,
-        dynamo=False,  # 用 legacy TorchScript 导出器：dynamo 对 visual 的
-        # fast_pos_embed_interpolate (torch.linspace 含数据相关长度) 会 guard 失败。
-    )
-print("[✓] visual.onnx exported (pooler_output + 3 deepstack_features, 无控制流)")
+    visual_out_names = ["image_features", "deepstack_features_0",
+                        "deepstack_features_1", "deepstack_features_2"]
 
-if os.environ.get("EXPORT_VISUAL_ONLY") == "1":
-    # 只调视觉时用：llm.onnx 导出要几分钟且会重写 3.4GB 权重文件。
-    print("[visual-only] 跳过 llm.onnx 导出")
-    raise SystemExit(0)
+    with torch.no_grad():
+        torch.onnx.export(
+            VisualExport(visual, grid_thw), (pixel_values, grid_thw), "visual.onnx",
+            input_names=["pixel_values", "grid_thw"],
+            output_names=visual_out_names,
+            # 不给 dynamic_axes：grid 相关量已全部固化成常量，标成动态只会骗人
+            # ——runtime 侧必须按导出尺寸喂图。grid_thw 仍留作输入位（llm_chat 不绑定它），
+            # 以免改动 C++ 侧的输入契约。
+            opset_version=OPSET,
+            dynamo=False,  # 用 legacy TorchScript 导出器：dynamo 对 visual 的
+            # fast_pos_embed_interpolate (torch.linspace 含数据相关长度) 会 guard 失败。
+        )
+    print("[✓] visual.onnx exported (pooler_output + 3 deepstack_features, 无控制流)")
+
+    if os.environ.get("EXPORT_VISUAL_ONLY") == "1":
+        # 只调视觉时用：llm.onnx 导出要几分钟且会重写 3.4GB 权重文件。
+        print("[visual-only] 跳过 llm.onnx 导出")
+        raise SystemExit(0)
 
 
 # ---------------------------------------------------------------------------
 # 2. 语言模型：带 KV cache + deepstack 的自定义 wrapper
 # ---------------------------------------------------------------------------
+class StaticInterleavedMrope(nn.Module):
+    """HF Qwen3VLTextRotaryEmbedding 的静态等价实现（消灭 61-op 动态链）。
+
+    HF 路径把整条 mrope 交错选择 trace 成 Shape/Gather/Concat/Equal/Where/
+    Expand/ScatterND 的 int64 动态链（~57 ops + 4 个同步 readback），而选择
+    本身是「按列的静态行选择」：mrope 交错后的 freqs (B,q,64) 每一列 j 来自
+    t/h/w 三行的固定一行——
+      行(j) = 1(H) 若 j%3==1 且 j < 3*s1
+            = 2(W) 若 j%3==2 且 j < 3*s2
+            = 0(T) 其余
+    （s1/s2 = mrope_section[1]/[2]，对齐 apply_interleaved_mrope 的
+    slice(offset, length, 3)。）且 HF 的 freqs = pos[...,None] * inv_freq，
+    即 freqs[b,q,j] = pos[行(j),b,q] * inv_freq[j]。
+
+    于是整条链等价于一次 matmul：pos_t (B,q,3) @ M (3,64)，其中
+      M[r,j] = inv_freq[j] * (r == 行(j))
+    M 每列恰好一个非零元、其余列为 0（0*pos 精确为 0，+0 求和精确），
+    fp32 下与 HF 逐位一致。导出前有逐位自证断言。
+    """
+
+    def __init__(self, rotary_emb):
+        super().__init__()
+        inv_freq = rotary_emb.inv_freq.float()      # (64,)
+        half = inv_freq.shape[0]
+        section = rotary_emb.mrope_section           # [24,20,20]
+        assert len(section) == 3 and 3 * section[1] <= half and 3 * section[2] <= half
+        s1, s2 = section[1], section[2]
+        sel = torch.zeros(half, dtype=torch.long)
+        for j in range(half):
+            if j % 3 == 1 and j < 3 * s1:
+                sel[j] = 1
+            elif j % 3 == 2 and j < 3 * s2:
+                sel[j] = 2
+            else:
+                sel[j] = 0
+        M = torch.zeros(3, half, dtype=torch.float32)
+        M[sel, torch.arange(half)] = inv_freq
+        self.register_buffer("M", M)                 # (3,64)
+        self.attention_scaling = rotary_emb.attention_scaling
+
+    def forward(self, x, position_ids):
+        assert position_ids.ndim == 3 and position_ids.shape[0] == 3
+        pos = position_ids.to(torch.float32)         # (3,B,q)
+        pos_t = pos.permute(1, 2, 0)                 # (B,q,3)
+        freqs = torch.matmul(pos_t, self.M)          # (B,q,64) fp32
+        emb = torch.cat((freqs, freqs), dim=-1)      # (B,q,128) — HF 同款
+        cos = emb.cos() * self.attention_scaling
+        sin = emb.sin() * self.attention_scaling
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+
+
+def assert_static_mrope_bitwise(rotary_emb, static_mrope):
+    """与 HF rotary_emb 逐位对拍：纯文本（三行相等）+ 随机 3D 位置。"""
+    x = torch.zeros(1, 1, 4, dtype=torch.float16)    # HF 只用它取 dtype/device
+    gen = torch.Generator().manual_seed(0)
+    cases = [
+        torch.arange(4, dtype=torch.int64).reshape(1, 1, 4).expand(3, 1, 4),  # decode 形状 (3,1,q)
+        torch.arange(9, dtype=torch.int64).reshape(1, 1, 9).expand(3, 1, 9),  # t=h=w
+        torch.randint(0, 3000, (3, 1, 7), generator=gen),               # 3D 乱序
+    ]
+    with torch.no_grad():
+        for pid in cases:
+            c0, s0 = rotary_emb(x, pid)
+            c1, s1_ = static_mrope(x, pid)
+            assert c0.dtype == c1.dtype and torch.equal(c0, c1), \
+                f"cos mismatch {pid.shape}: maxdiff={(c0.float()-c1.float()).abs().max()}"
+            assert torch.equal(s0, s1_), f"sin mismatch {pid.shape}"
+    print("[mrope] bitwise-identical to HF on all probe shapes ✓")
+
+
 class Qwen3VLLMOnnx(nn.Module):
     """复用 HF 层权重，自己写 forward 层循环，绕开 Cache 与 create_causal_mask。
 
@@ -196,6 +269,9 @@ class Qwen3VLLMOnnx(nn.Module):
         self.layers = self.lm.layers
         self.norm = self.lm.norm
         self.rotary_emb = self.lm.rotary_emb
+        # 静态 mrope：等价替换 HF rotary_emb 的 61-op 动态链（见类 docstring）。
+        # rotary_emb 仍保留作对拍基准。
+        self.mrope_static = StaticInterleavedMrope(self.lm.rotary_emb)
         self.lm_head = full_model.lm_head
 
         self.num_heads = NUM_HEADS
@@ -264,7 +340,7 @@ class Qwen3VLLMOnnx(nn.Module):
     def forward(self, inputs_embeds, position_ids, attention_bias,
                 deepstack_0, deepstack_1, deepstack_2, image_pad_mask, *past_kvs):
         hidden = inputs_embeds
-        cos, sin = self.rotary_emb(hidden, position_ids)
+        cos, sin = self.mrope_static(hidden, position_ids)
         deepstacks = [deepstack_0, deepstack_1, deepstack_2]
 
         presents = []
@@ -358,9 +434,11 @@ for i in range(NUM_LAYERS):
     dynamic_axes[f"present_key_values_{i}"] = {0: "batch", 3: "kv_len"}
 
 print(f"[llm] exporting {NUM_LAYERS} layers, {len(input_names)} inputs / {len(output_names)} outputs ...")
+llm_wrapper = Qwen3VLLMOnnx(model)
+assert_static_mrope_bitwise(lm.rotary_emb, llm_wrapper.mrope_static)
 with torch.no_grad():
     torch.onnx.export(
-        Qwen3VLLMOnnx(model), inputs, "llm.onnx",
+        llm_wrapper, inputs, "llm.onnx",
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
