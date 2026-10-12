@@ -16,9 +16,6 @@ are indistinguishable, so distinct runtime dims would be silently merged.
 These cases pin the pass's decision table by calling the matcher directly, and
 one end-to-end case checks the fold actually rebinds + deletes.
 """
-import sys
-
-sys.path.insert(0, "model/pypi")
 from onnx2vkop.dag import DAGBasedModel, Node
 from onnx2vkop.optimizer import FusionOptimizer
 
@@ -123,16 +120,3 @@ def test_fan_out_all_consumers_rebound():
     for c in consumers:
         assert c.inputs[0]["name"] == "shape_0", c.inputs[0]
     return True
-
-
-if __name__ == "__main__":
-    tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
-    failed = 0
-    for t in tests:
-        try:
-            t()
-            print("PASS %s" % t.__name__)
-        except AssertionError as e:
-            failed += 1
-            print("FAIL %s: %s" % (t.__name__, e))
-    sys.exit(1 if failed else 0)

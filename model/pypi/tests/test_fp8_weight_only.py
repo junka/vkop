@@ -22,9 +22,6 @@ the large ones.
 """
 import contextlib
 import io
-import sys
-
-sys.path.insert(0, "model/pypi")
 
 import numpy
 from onnx import TensorProto, numpy_helper
@@ -445,20 +442,3 @@ def test_writer_records_the_fp8_size_and_name():
         numpy_helper.from_array(numpy.zeros((2, 2), dtype=numpy.float32), "s")
     ) == "float32"
     print("  PASS (writer: fp8 size, dtype name, raw bytes, mismatch raises)")
-
-
-if __name__ == "__main__":
-    for fn in (test_e4m3_payload_and_scale,
-               test_e5m2_payload_and_scale,
-               test_encoder_and_shader_decode_agree_on_every_byte,
-               test_encoder_is_round_to_nearest,
-               test_unclipped_input_is_caught_not_shipped,
-               test_fp8_trades_absolute_precision_for_relative,
-               test_transb_1_quantizes_the_other_axis,
-               test_gates_preserve_the_float_weight,
-               test_odd_shapes_still_quantize,
-               test_unknown_format_raises_before_any_work,
-               test_writer_records_the_fp8_size_and_name):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

@@ -16,10 +16,6 @@ Two things have to hold and they are what these cases pin:
     input/output/value_info, and a tensor-valued node attribute -- because a
     single one left behind is still a hard load error.
 """
-import sys
-
-sys.path.insert(0, "model/pypi")
-
 import numpy
 import onnx
 from onnx import TensorProto, helper, numpy_helper
@@ -108,12 +104,3 @@ def test_already_fp16_model_is_untouched():
     assert bytes(init.raw_data) == before
     assert init.data_type == TensorProto.FLOAT16
     print("  PASS (fp16 model untouched, zero conversions)")
-
-
-if __name__ == "__main__":
-    for fn in (test_bytes_helper_is_exact,
-               test_downcast_covers_every_dtype_site,
-               test_already_fp16_model_is_untouched):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

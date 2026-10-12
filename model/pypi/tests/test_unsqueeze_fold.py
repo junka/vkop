@@ -15,9 +15,6 @@ else keeps its node. These cases pin that decision table -- they call the
 matcher directly (the rest of the optimizer would also fold views through the
 separate, already-sound alias pass and blur the result).
 """
-import sys
-
-sys.path.insert(0, "model/pypi")
 from onnx2vkop.dag import DAGBasedModel, Node
 from onnx2vkop.optimizer import FusionOptimizer
 
@@ -180,16 +177,3 @@ def test_mixed_consumers_rejected():
     ms = matches_of(m)
     assert len(ms) == 0, f"mixed consumer op types must NOT fold, got {len(ms)}"
     print("  PASS (mixed-consumer view rejected)")
-
-
-if __name__ == "__main__":
-    for fn in (test_rank_transparent_unary_folds,
-               test_concat_same_axis_rejected,
-               test_concat_rotary_signature_rejected,
-               test_concat_axis_before_inserted_folds,
-               test_concat_without_recorded_shape_rejected,
-               test_rank_sensitive_ops_rejected,
-               test_mixed_consumers_rejected):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

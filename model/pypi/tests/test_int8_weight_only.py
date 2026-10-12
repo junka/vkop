@@ -12,9 +12,6 @@ quantized, along which axis, and where the scale lands in the node's inputs.
 """
 import contextlib
 import io
-import sys
-
-sys.path.insert(0, "model/pypi")
 
 import numpy
 from onnx import TensorProto, numpy_helper
@@ -223,18 +220,3 @@ def test_non_float_source_still_preserved():
     assert "W_scale" not in m.initializers
     assert input_names(m.nodes["mm"]) == ["x", "W"]
     print("  PASS (non-float initializer preserved, no scale appended)")
-
-
-if __name__ == "__main__":
-    for fn in (test_gemm_transb_quantized_per_output_column,
-               test_matmul_transb0_quantized_per_output_column,
-               test_a_operand_preserved,
-               test_batched_weight_preserved,
-               test_disagreeing_transb_preserved,
-               test_gemm_bias_preserved,
-               test_conv_bias_still_preserved,
-               test_fp16_weight_quantizes_like_its_fp32_twin,
-               test_non_float_source_still_preserved):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

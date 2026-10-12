@@ -20,9 +20,6 @@ gate above.
 """
 import contextlib
 import io
-import sys
-
-sys.path.insert(0, "model/pypi")
 
 import numpy
 from onnx import TensorProto, numpy_helper
@@ -334,16 +331,3 @@ def test_writer_records_the_packed_size_and_name():
     assert _init_byte_len(f32) == 48 and _init_dtype_name(f32) == "float32"
     assert _init_bytes(f32) == numpy.arange(12, dtype=numpy.float32).tobytes()
     print("  PASS (writer: packed size, dtype name, raw bytes, mismatch raises)")
-
-
-if __name__ == "__main__":
-    for fn in (test_int4_payload_and_scale,
-               test_nf4_payload_is_a_codebook_index,
-               test_int4_and_nf4_share_the_byte_layout,
-               test_fp16_source_quantizes_like_its_fp32_twin,
-               test_gates_preserve_the_float_weight,
-               test_odd_group_size_is_rejected_before_any_work,
-               test_writer_records_the_packed_size_and_name):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

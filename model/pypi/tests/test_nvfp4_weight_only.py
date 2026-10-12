@@ -24,9 +24,6 @@ format can offer at that price.
 """
 import contextlib
 import io
-import sys
-
-sys.path.insert(0, "model/pypi")
 
 import numpy
 from onnx import TensorProto, numpy_helper
@@ -528,20 +525,3 @@ def test_writer_records_the_nvfp4_size_and_names():
     odd.raw_data = b"\x00\x00"
     assert _init_byte_len(odd) == 4, _init_byte_len(odd)
     print("  PASS (writer: 128 + 16 bytes, both dtype names, mismatch raises)")
-
-
-if __name__ == "__main__":
-    for fn in (test_three_tensors_and_their_layout,
-               test_e2m1_encoder_matches_the_shader_decoder,
-               test_e2m1_encoder_is_round_to_nearest_even,
-               test_value_past_the_grid_raises,
-               test_block_scale_stays_inside_e4m3,
-               test_a_zero_block_is_reported_not_silently_flattened,
-               test_group_size_other_than_16_raises_before_any_work,
-               test_gates_preserve_the_float_weight,
-               test_a_fine_group_at_half_a_byte_per_value,
-               test_fp16_source_arrives_as_the_same_payload,
-               test_writer_records_the_nvfp4_size_and_names):
-        print(fn.__name__ + ":")
-        fn()
-    print("\nALL PASS")

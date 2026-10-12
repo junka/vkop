@@ -5,8 +5,6 @@ verifies the fusion produces one FusedElemwise node with the expected
 program, then checks a broadcast-scalar variant and a chain that should
 NOT fuse (shared intermediate).
 """
-import sys
-sys.path.insert(0, "model/pypi")
 from onnx2vkop.dag import DAGBasedModel, Node
 from onnx2vkop.optimizer import FusionOptimizer
 
@@ -187,15 +185,3 @@ def test_scalar_constant():
     # reg1 from it, but the operand path uses the 100+ scalar; harmless).
     assert [i["name"] for i in f.inputs] == ["A", "two"]
     print("  PASS (scalar constant encoded as operand 100+)")
-
-
-if __name__ == "__main__":
-    print("test_addsqrtmul:")
-    test_addsqrtmul()
-    print("test_shared_not_fused:")
-    test_shared_not_fused()
-    print("test_cast_is_chainable:")
-    test_cast_is_chainable()
-    print("test_scalar_constant:")
-    test_scalar_constant()
-    print("\nALL PASS")
