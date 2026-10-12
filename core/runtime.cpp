@@ -2821,8 +2821,11 @@ double Runtime::Run() {
             // Top-N slowest individual ops (reveals which MatMuls dominate).
             std::sort(per_op_ms.begin(), per_op_ms.end(),
                       [](const auto &a, const auto &b) { return a.ms > b.ms; });
-            fprintf(stderr, "[submitprof] --- top 15 slowest ops ---\n");
-            for (int i = 0; i < 15 && i < (int)per_op_ms.size(); ++i) {
+            int topn = 15;
+            if (const char *e = getenv("VKOP_TOPN"))
+                topn = atoi(e);
+            fprintf(stderr, "[submitprof] --- top %d slowest ops ---\n", topn);
+            for (int i = 0; i < topn && i < (int)per_op_ms.size(); ++i) {
                 const auto &e = per_op_ms[i];
                 fprintf(stderr, "[submitprof] %8.3fms  %-12s %s\n", e.ms,
                         e.type.c_str(), e.name.c_str());

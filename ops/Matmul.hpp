@@ -838,15 +838,26 @@ class MatMulBuffer : public BufferFactory {
                 if (v > 0)
                     q = v;
             }
-            // VKOP_KSPLIT_WIDE=1 picks the 16-byte-load GEMV: each lane owns
-            // eight contiguous columns, one uvec4 weight load per k. Needs
-            // N % 8 == 0 for the 16B element alignment of every (k, octet)
-            // address. ksplit_q now counts 8-column groups per block, so the
-            // same block-count heuristic runs on n / 8.
+            // VKOP_KSPLIT_WIDE=1 picks a 16-byte-load GEMV. For an fp16 weight
+            // each lane owns eight columns (one uvec4 = 8 fp16), needs N % 8;
+            // for a byte (int8/fp8) weight each lane owns SIXTEEN columns (one
+            // uvec4 = 16 bytes), needs N % 16, and ksplit_q counts 16-column
+            // groups per block. The int8 WIDE kernel (matmul16_w8_ksplit_wide)
+            // decodes the uvec4 via unpack_w8 -- the buggy fp16 WIDE variant
+            // decoded int8 bytes as fp16 and produced garbage.
             static const bool wide_env = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE");
                 return e != nullptr && e[0] != '\0' && e[0] != '0';
             }();
+            if (wide_env && weight_byte && (n % 16 == 0)) {
+                while (q > 4 && UP_DIV(n / 16, q) < 32) {
+                    q /= 2;
+                }
+                para_.wide = 1;
+                para_.ksplit_q = q;
+                submit(&para_, UP_DIV(n / 16, q), batch * m, 1);
+                return;
+            }
             if (wide_env && (n % 8 == 0)) {
                 while (q > 4 && UP_DIV(n / 8, q) < 32) {
                     q /= 2;
@@ -856,6 +867,12 @@ class MatMulBuffer : public BufferFactory {
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             }
+            // Block-count heuristic: halve q (16 -> 4) while the row's N would
+            // launch too few blocks to keep the device busy. Do NOT raise q
+            // back up: an interleaved paired A/B (8 pairs, /tmp/qab.sh) shows
+            // q=16 beats q=32 on the big-N decode layers (MIN 15.5 vs 16.8 ms,
+            // mean 19.9 vs 22.3, wins 5/8). The earlier non-interleaved sweep
+            // that suggested q=32 was host-drift noise, not a real gain.
             while (q > 4 && UP_DIV(n / 4, q) < 32) {
                 q /= 2;
             }
