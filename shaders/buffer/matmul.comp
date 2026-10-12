@@ -116,7 +116,36 @@ layout(push_constant) uniform PC {
                 // uvec4 load per k (two independent vec4 accumulator chains).
                 // Host checks N % 8 == 0; ksplit_q then counts 8-column
                 // groups per block instead of 4-column quads.
+    int rep;        // >1: exactly one leading axis of A is rep consecutive
+                    // copies of B's axis (repeat_kv folded into this MatMul by
+                    // the converter), so B's flat batch is rep times smaller
+                    // than the dispatch's. 0/1 = identity bmap().
+    int rep_stride; // product of A's leading dims after the grouped axis (1
+                    // when it is the last leading axis, the repeat_kv case).
+    int a_dim;      // A's dim on the grouped axis (= b_dim * rep).
+    int b_dim;      // B's dim on the grouped axis.
 } uPC;
+
+// A flat batch index -> B's slice, when the host detected a grouped leading
+// axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
+// consecutively (repeat_kv interleave), and any outer leading axes are shared.
+// Decomposing n over A's leading dims gives n = prefix*(rep*rep_stride*b_dim)
+// + h*rep_stride + tail, and B's slice is prefix*(rep_stride*b_dim) +
+// (h/rep)*rep_stride + tail; the two divisions below fold that out of (n, the
+// strides and the dims) directly. With rep <= 1 this is the identity -- and
+// the early return is what keeps a_span = 0 out of the div/mod when the host
+// leaves the grouped fields unset.
+int bmap(int n) {
+    if (uPC.rep <= 1) {
+        return n;
+    }
+    int a_span = uPC.rep_stride * uPC.a_dim;
+    int rest = n % a_span;
+    int prefix = n / a_span;
+    int b_span = uPC.rep_stride * uPC.b_dim;
+    return prefix * b_span + (rest / (uPC.rep * uPC.rep_stride)) * uPC.rep_stride +
+           (rest % uPC.rep_stride);
+}
 
 #ifdef FP16
 float load_a(int idx) {
@@ -594,7 +623,7 @@ void matmul16_ksplit() {
     int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
-    int b_row = n * uPC.K * uPC.N + ja;
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
 
     int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
     int slice = lane / q;
@@ -698,7 +727,7 @@ void matmul16_ksplit_wide() {
     int ja = (int(gl_WorkGroupID.x) * q + oct) * 8;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
-    int b_base = n * uPC.K * uPC.N + ja;
+    int b_base = bmap(n) * uPC.K * uPC.N + ja;
 
     int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
     int slice = lane / q;
@@ -965,8 +994,10 @@ void matmul16_even_n() {
     // transB: B is [batch, N, K] so element (n, col, k) is at col*K + k
     // (k-step 1); otherwise B is [batch, K, N], element (n, k, col) is at
     // k*N + col (k-step N). Hoisting this out of the K loop removes the
-    // per-iteration branch and keeps both column walks linear.
-    int b_base = n * uPC.K * uPC.N;
+    // per-iteration branch and keeps both column walks linear. bmap: A and
+    // the output are dispatch-batch-sized; only B's batch shrinks when the
+    // host folded a repeat_kv into this MatMul.
+    int b_base = bmap(n) * uPC.K * uPC.N;
     int b_step = (uPC.transB != 0) ? 1 : uPC.N;
     int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
     int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
@@ -1173,6 +1204,9 @@ void matmul16_tiled() {
     int col0 = int(gl_WorkGroupID.x) * TILE_N;
     if (row0 >= uPC.M || col0 >= uPC.N) return;
 
+    // A and the output are dispatch-batch-sized; B's batch shrinks when the
+    // host folded a repeat_kv into this MatMul, so the B loaders walk bmap(b).
+    int bb = bmap(b);
     int lr = int(gl_LocalInvocationID.y) * 4; // this thread's tile origin
     int lc = int(gl_LocalInvocationID.x) * 4;
     int halfK = uPC.K >> 1;
@@ -1189,7 +1223,7 @@ void matmul16_tiled() {
     if (uPC.transB != 0) {
         for (int kk = 0; kk < uPC.K; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
-            tile_load_b_t(b, col0, kk >> 1, halfK);
+            tile_load_b_t(bb, col0, kk >> 1, halfK);
             barrier();
             tile_fma_t(acc, lr, lc);
             barrier();
@@ -1197,7 +1231,7 @@ void matmul16_tiled() {
     } else if (uPC.weight_int8 != 0) {
         for (int kk = 0; kk < uPC.K; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
-            tile_load_b_w8(b, col0, kk);
+            tile_load_b_w8(bb, col0, kk);
             barrier();
             tile_fma_n(acc, lr, lc);
             barrier();
@@ -1205,7 +1239,7 @@ void matmul16_tiled() {
     } else {
         for (int kk = 0; kk < uPC.K; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
-            tile_load_b_n(b, col0, kk, halfN);
+            tile_load_b_n(bb, col0, kk, halfN);
             barrier();
             tile_fma_n(acc, lr, lc);
             barrier();
@@ -1247,7 +1281,7 @@ void matmul16_odd_n() {
     if (n >= uPC.batch) return;
 
     int a_base = n * uPC.M * uPC.K;
-    int b_base = n * uPC.K * uPC.N;
+    int b_base = bmap(n) * uPC.K * uPC.N;
     int c_base = n * uPC.M * uPC.N;
 
     float sum = 0.0;
@@ -1342,7 +1376,7 @@ void matmul32() {
     if (n >= uPC.batch) return;
 
     int a_base = n * uPC.M * uPC.K;
-    int b_base = n * uPC.K * uPC.N;
+    int b_base = bmap(n) * uPC.K * uPC.N;
     int c_base = n * uPC.M * uPC.N;
 
     float sum = 0.0;

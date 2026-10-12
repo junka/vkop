@@ -105,6 +105,21 @@ struct alignas(16) GpuMatMulParam {
     // chains) and ksplit_q counts 8-column groups per block. Host requires
     // N % 8 == 0; see MatMulBuffer::execute. Buffer path only.
     int wide = 0;
+    // Grouped leading batch axis (repeat_kv folded into this MatMul by the
+    // converter): exactly one leading axis of A is `rep` consecutive copies of
+    // B's axis (kv heads repeated into q heads), so B's flat batch is rep times
+    // smaller than the dispatch's. The kernels map A's flat batch index onto
+    // B's slices with bmap() instead of reading a B slice that does not exist.
+    // rep <= 1 (the default) leaves every kernel's addressing untouched. Buffer
+    // path only; the image shaders never read these.
+    int rep = 1;
+    // Product of A's leading dims after the grouped axis (1 when the grouped
+    // axis is the last leading axis, which is the repeat_kv case).
+    int rep_stride = 1;
+    // A's dim on the grouped axis (= b_dim * rep). 0 when rep <= 1.
+    int a_dim = 0;
+    // B's dim on the grouped axis. 0 when rep <= 1.
+    int b_dim = 0;
 };
 
 } // namespace matmul
@@ -460,12 +475,43 @@ class MatMulBuffer : public BufferFactory {
         // leading dims.
         std::vector<int> lead_shape;
         lead_shape.reserve(lead);
+        // Grouped leading-axis detection (repeat_kv elimination): after the
+        // converter folds the Expand(Unsqueeze(KV)) broadcast into this MatMul,
+        // exactly one leading axis of A is `rep` consecutive copies of B's
+        // axis. Detected per execute, so a growing kv dim re-fires every decode
+        // round. Strict on purpose: one axis with db > 1 && da == db * rep and
+        // every other axis exactly equal; anything else keeps the plain
+        // broadcast behavior (the db > 1 guard also keeps a 2-D weight's
+        // virtual leading axes — db reads as 1 past B's rank — from posing as
+        // rep copies, and a quantized weight never qualifies at all). The coop
+        // shaders have no bmap, so the coopmat gates below exclude rep > 1.
+        int rep = 1;
+        int rep_stride = 1;
+        int a_dim = 0;
+        int b_dim = 0;
+        int grouped_axis = -1;
+        bool grouped_ok = !weight_byte && !weight_4bit;
         for (int i = 0; i < lead; ++i) {
             int da = (i < lead_a) ? shape_a[i] : 1;
             int db = (i < lead_b) ? shape_b[i] : 1;
+            if (grouped_ok && da != db) {
+                if (grouped_axis < 0 && db > 1 && da > db && da % db == 0) {
+                    grouped_axis = i;
+                    a_dim = da;
+                    b_dim = db;
+                } else {
+                    grouped_ok = false;
+                }
+            }
             int dmax = std::max(da, db);
             batch *= dmax;
             lead_shape.push_back(dmax);
+        }
+        if (grouped_axis >= 0) {
+            rep = a_dim / b_dim;
+            for (int i = grouped_axis + 1; i < lead; ++i) {
+                rep_stride *= lead_shape[i];
+            }
         }
 
         std::vector<int> out_shape = lead_shape;
@@ -624,9 +670,10 @@ class MatMulBuffer : public BufferFactory {
             const char *v = std::getenv("VKOP_NO_COOP");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        const bool coopmat =
-            fp16_ != 0 && !weight_byte && !weight_4bit && !coop_disabled &&
-            m_dev_->is_support_cooperate_matrix() && coop_pipeline_ != nullptr;
+        const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
+                             !coop_disabled && rep == 1 &&
+                             m_dev_->is_support_cooperate_matrix() &&
+                             coop_pipeline_ != nullptr;
         // W8A8 sibling of the path above: an int8 weight with an int8
         // activation the kernel quantizes itself (per output row), accumulated
         // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
@@ -758,6 +805,10 @@ class MatMulBuffer : public BufferFactory {
         para_.nvfp4 = weight_nvfp4 ? 1 : 0;
         para_.uint4 = weight_uint4 ? 1 : 0;
         para_.group = weight_4bit ? group_size : 0;
+        para_.rep = rep;
+        para_.rep_stride = rep_stride;
+        para_.a_dim = a_dim;
+        para_.b_dim = b_dim;
 
         // Cooperative-matrix fp16 path (Intel ARL subgroup MMA): ONE dispatch
         // reads fp16 A/B, accumulates in fp32 via coopMatMulAdd, and writes

@@ -720,6 +720,20 @@ class FusionOptimizer:
             )
         )
 
+        # repeat_kv Expand 消除：MatMul B 侧改接 KV cache 本体，GQA head 复制
+        # 下沉到 MatMul（host grouped-batch 检测 + shader bmap）。必须在
+        # fuse_transpose_into_matmul (85) 之后——k 链的 Transpose 折成
+        # transB=1 后 B 侧才是 Reshape 输出；在 fuse_unsqueeze_eliminate (76)
+        # 之前——整链结构完整时才能匹配消除。
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "eliminate_repeat_kv_expand",
+                FusionOptimizer.match_repeat_kv_expand,
+                FusionOptimizer.fold_repeat_kv_expand,
+                priority=84,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fold_aliasable_squeeze_unsqueeze",
@@ -1725,6 +1739,132 @@ class FusionOptimizer:
                                  for inp in n.inputs))
             if not still_used:
                 del dag_model.nodes[equal.name]
+        return True
+
+    # ---- repeat_kv Expand 消除（grouped MatMul 的转换器前置 pass）----
+    # HF GQA 的 repeat_interleave 在导出图为每层 k/v 各一条链：
+    #   R = Reshape(Expand(Unsqueeze(X)))
+    #   X (b,hkv,S,D) → U (b,hkv,1,S,D) → E (b,hkv,rep,S,D) → R (b,hkv*rep,S,D)
+    # R 直接作 attention 两个 MatMul 的 B 侧（k 链尾 Transpose 已被
+    # fuse_transpose_into_matmul 折成 transB=1）。Expand+Reshape 纯为把 B 的
+    # head 轴复制 rep 倍以对齐 A 的 head 轴——运行期逐字节复制 dispatch，还
+    # 把动态 kv 维拖进 Expand 的 target-shape 解析（每轮 host↔GPU 往返）。
+    #
+    # 消除 = MatMul 的 B 侧整体改接 X 本体（含 shape/dtype 的 dict，A 侧不
+    # 动），复制语义下沉到 MatMul：host 侧 lead 维检测 B == A/rep
+    # （MatMulBuffer::execute），shader 用 bmap() 把 A 批索引映射到 B 批索引
+    # （interleave 语义：head h 共享 kv head h//rep）。链上 U/E/R 变孤儿，
+    # 其上游形状链由 prune_and_materialize 统一清理。
+    #
+    # 匹配条件全部为静态可证：hkv 与 rep 必须是静态注解值（rep>=2），形状
+    # 契约逐轴核对。在 fuse_transpose_into_matmul (85) 之后运行——k 链的
+    # Transpose 折进 transB=1 后，MatMul 的 B 侧才是 Reshape 输出。
+    @staticmethod
+    def match_repeat_kv_expand(dag_model):
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+
+        def sole_consumer(out_name, expected):
+            lst = consumers.get(out_name, [])
+            return len(lst) == 1 and lst[0][0].name == expected.name
+
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type != "MatMul" or len(node.inputs) < 2:
+                continue
+            a_dict, b_dict = node.inputs[0], node.inputs[1]
+            ashape, rshape = a_dict["shape"], b_dict["shape"]
+            if len(ashape) != 4 or len(rshape) != 4:
+                continue
+            # B 侧链：R(Reshape) ← E(Expand) ← U(Unsqueeze) ← X，逐环单消费者
+            r_node = producer.get(b_dict["name"])
+            if (r_node is None or r_node.op_type != "Reshape"
+                    or b_dict["name"] in graph_outputs
+                    or not sole_consumer(b_dict["name"], node)):
+                continue
+            e_node = producer.get(r_node.inputs[0]["name"])
+            if e_node is None or e_node.op_type != "Expand":
+                continue
+            e_out = e_node.outputs[0]["name"]
+            if e_out in graph_outputs or not sole_consumer(e_out, r_node):
+                continue
+            u_node = producer.get(e_node.inputs[0]["name"])
+            if u_node is None or u_node.op_type != "Unsqueeze":
+                continue
+            u_out = u_node.outputs[0]["name"]
+            if u_out in graph_outputs or not sole_consumer(u_out, e_node):
+                continue
+            x_dict = u_node.inputs[0]
+            xshape = x_dict["shape"]
+            ushape = u_node.outputs[0]["shape"]
+            eshape = e_node.outputs[0]["shape"]
+            if len(xshape) != 4 or len(ushape) != 5 or len(eshape) != 5:
+                continue
+            hkv = xshape[1]
+            if hkv in (-1, 0):
+                continue
+            # U = X 在轴 2 插 1（-1 动态轴按逐位相等核对）
+            if not (ushape[0] == xshape[0] and ushape[1] == xshape[1]
+                    and ushape[2] == 1 and ushape[3] == xshape[2]
+                    and ushape[4] == xshape[3]):
+                continue
+            # E 与 U 除轴 2 外同形。E[2] 注解可为 -1（target shape 走动态
+            # Concat 链，转换期解析不出 rep）——rep 改由 R/A 侧静态 head 数
+            # 唯一确定：Reshape 元素数守恒要求 8*E[2] = R[1]，MatMul 批广播
+            # 要求 A[1] = R[1]，故 rep = R[1]/hkv = A[1]/hkv。
+            if not (eshape[0] == ushape[0] and eshape[1] == ushape[1]
+                    and eshape[3] == ushape[3] and eshape[4] == ushape[4]):
+                continue
+            # R 轴结构：(b, hkv*rep, S, D)
+            if not (rshape[0] == xshape[0] and rshape[2] == xshape[2]
+                    and rshape[3] == xshape[3]):
+                continue
+            # rep 静态来源取交集（存在即须一致且 >=2；至少一处静态可证）
+            reps = []
+            if eshape[2] != -1:
+                reps.append(eshape[2])
+            if rshape[1] != -1:
+                if rshape[1] % hkv != 0:
+                    continue
+                reps.append(rshape[1] // hkv)
+            if ashape[1] != -1:
+                if ashape[1] % hkv != 0:
+                    continue
+                reps.append(ashape[1] // hkv)
+            if (not reps or reps[0] < 2
+                    or any(r != reps[0] for r in reps)):
+                continue
+            if x_dict["dtype"] != b_dict["dtype"]:
+                continue
+            matches.append({
+                "mm": node,
+                "x_dict": dict(x_dict),
+                "chain": [r_node, e_node, u_node],
+            })
+        return matches
+
+    @staticmethod
+    def fold_repeat_kv_expand(dag_model, match) -> bool:
+        mm = match["mm"]
+        if mm.name not in dag_model.nodes:
+            return False
+        # B 侧整体改接 X 的输出 dict（A 侧不动）；grouped 复制语义由
+        # runtime 的 host lead 维检测 + shader bmap 接管
+        mm.inputs[1] = match["x_dict"]
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+        _, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        for nd in match["chain"]:
+            if nd.name not in dag_model.nodes:
+                continue
+            out = nd.outputs[0]["name"]
+            # 匹配时已验单消费者，此处必为孤儿；防御式保留仍有消费者的节点。
+            # consumers 表是 rewiring 后一次性算的，链内下游（R）先删后，
+            # 上游（E/U）名下仍挂着已出图的消费者——按「仍在图中」过滤后再判。
+            if out in graph_outputs or any(
+                    c.name in dag_model.nodes
+                    for c, _ in consumers.get(out, [])):
+                continue
+            del dag_model.nodes[nd.name]
         return True
 
     @staticmethod

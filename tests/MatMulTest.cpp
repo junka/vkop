@@ -1376,3 +1376,133 @@ TEST(MatMulTest, MatMulFp8ContractThrows) {
                      std::runtime_error);
     }
 }
+
+namespace {
+// Grouped leading batch axis (the runtime half of repeat_kv elimination): the
+// converter rewires the attention MatMul's B side to the KV cache itself, so
+// the op now sees A (b0, a_heads, [s,] M, K) against B (b0, b_heads, [s,] K, N)
+// with a_heads = b_heads * rep on exactly one leading axis. The host detects
+// that axis per execute, the kernels map A's flat batch slice onto B's with
+// bmap() — interleave semantics, A head h shares kv head h/rep — and the
+// output is the full (b0, a_heads, ...) matrix the reference computes against
+// the materialized repeat_interleave'd B. Every path that addresses B by
+// batch (fused even-N, odd-N reduce->pack, tiled, split-K GEMV, fp32 reduce)
+// has to agree with it; a wrong mapping reads the wrong kv head, which is a
+// ~100% wrong answer, not noise.
+template <typename T>
+class MatMulGroupedTest : public TestCase<T> {
+public:
+    std::unordered_map<std::string, std::string> attr;
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<T>> inputb;
+    std::shared_ptr<Tensor<T>> output;
+
+    // s = one extra leading dim AFTER the grouped axis (A/B (b0, heads, s, ...)),
+    // which makes the grouped axis not the last leading one and exercises the
+    // host's rep_stride product; 0 keeps the plain repeat_kv shape.
+    MatMulGroupedTest(int b0, int ah, int bh, int m, int k, int n, bool transB,
+                      int s = 0)
+        : TestCase<T>("MatMul"), b0_(b0), ah_(ah), bh_(bh), m_(m), k_(k),
+          n_(n), transB_(transB), s_(s) {
+        attr = {{"transB", transB_ ? "1" : "0"}};
+        initTestData();
+    }
+
+  private:
+    int b0_, ah_, bh_, m_, k_, n_;
+    bool transB_;
+    int s_;
+
+    static float to_float(T v) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return vkop::core::ITensor::fp16_to_fp32(v);
+        } else {
+            return v;
+        }
+    }
+
+    static torch::Tensor store(const torch::Tensor &t) {
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            return t.to(torch::kFloat16);
+        } else {
+            return t;
+        }
+    }
+
+    void initTestData() {
+        auto f32 = torch::TensorOptions().dtype(torch::kFloat32);
+        torch::manual_seed(42);
+
+        std::vector<int64_t> a_shape =
+            s_ > 0 ? std::vector<int64_t>{b0_, ah_, s_, m_, k_}
+                   : std::vector<int64_t>{b0_, ah_, m_, k_};
+        std::vector<int64_t> b_shape =
+            s_ > 0 ? (transB_ ? std::vector<int64_t>{b0_, bh_, s_, n_, k_}
+                              : std::vector<int64_t>{b0_, bh_, s_, k_, n_})
+                   : (transB_ ? std::vector<int64_t>{b0_, bh_, n_, k_}
+                              : std::vector<int64_t>{b0_, bh_, k_, n_});
+        auto a = store(torch::randn(a_shape, f32));
+        auto b = store(torch::randn(b_shape, f32));
+
+        const int rep = ah_ / bh_;
+        auto b_mat = transB_ ? b.transpose(-1, -2) : b; // (..., k, n)
+        auto b_rep = b_mat.repeat_interleave(rep, 1);
+        auto y = torch::matmul(a.to(torch::kFloat32), b_rep.to(torch::kFloat32));
+
+        inputa = std::make_shared<Tensor<T>>(to_ints(a_shape));
+        this->fillTensorFromTorch(inputa, a);
+        inputb = std::make_shared<Tensor<T>>(to_ints(b_shape));
+        this->fillTensorFromTorch(inputb, b);
+        output = std::make_shared<Tensor<T>>(to_ints(y.sizes().vec()));
+        this->fillTensorFromTorch(output, store(y));
+
+        LOG_INFO("grouped MatMul b0 %d, a_heads %d, b_heads %d (rep %d), "
+                 "M %d, N %d, K %d, transB %d, extra lead s %d, fp16 %d",
+                 b0_, ah_, bh_, rep, m_, n_, k_, transB_ ? 1 : 0, s_,
+                 std::is_same_v<T, uint16_t> ? 1 : 0);
+    }
+
+    static std::vector<int> to_ints(const std::vector<int64_t> &s) {
+        return std::vector<int>(s.begin(), s.end());
+    }
+};
+} // namespace
+
+// Shapes pick one B-addressing path each: the fused even-N single pass, the
+// attention transB layout, the split-K GEMV (one A row, long K), the
+// shared-memory tile (m >= 12), the odd-N reduce->pack fallback, and a grouped
+// axis that is NOT the last leading dim (rep_stride > 1). fp32 runs the same
+// list through the plain reduce kernel, which shares bmap().
+TEST(MatMulTest, MatMulGroupedBatchBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<int, int, int, int, int, int, bool, int>>
+        cases = {
+            {2, 4, 2, 3, 16, 8, false, 0},   // even-N fused / fp32 reduce
+            {2, 4, 2, 3, 16, 8, true, 0},    // transB, the attention k^T layout
+            {1, 4, 2, 1, 512, 64, false, 0}, // one A row, long K: split-K GEMV
+            {1, 4, 2, 1, 512, 64, true, 0},  // transB routes past ksplit to even-N
+            {1, 4, 2, 13, 64, 64, false, 0}, // m >= 12: shared-memory tile
+            {1, 4, 2, 13, 64, 64, true, 0},  // tile over transB
+            {1, 8, 2, 1, 64, 7, false, 0},   // odd N: reduce->pack
+            {1, 4, 2, 3, 16, 8, false, 3},   // grouped axis mid-rank: rep_stride 3
+            {1, 4, 2, 3, 16, 8, true, 3},    // same, transB
+        };
+    LOG_INFO("grouped-batch MatMul, FP32");
+    for (const auto &tc : cases) {
+        auto [b0, ah, bh, m, k, n, transB, s] = tc;
+        MatMulGroupedTest<float> t(b0, ah, bh, m, k, n, transB, s);
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb}, {t.output},
+                               [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                   op->setAttribute(t.attr);
+                               }));
+    }
+    LOG_INFO("grouped-batch MatMul, FP16");
+    for (const auto &tc : cases) {
+        auto [b0, ah, bh, m, k, n, transB, s] = tc;
+        MatMulGroupedTest<uint16_t> t(b0, ah, bh, m, k, n, transB, s);
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb}, {t.output},
+                               [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                                   op->setAttribute(t.attr);
+                               }));
+    }
+}
