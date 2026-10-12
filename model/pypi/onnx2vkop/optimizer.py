@@ -819,6 +819,20 @@ class FusionOptimizer:
             )
         )
 
+        # Lower Gemm -> MatMul (+ Add for bias). Runs below the GAP+Conv fusion
+        # (75) so the Gemm it creates is caught in the same multi-round sweep,
+        # and above weight-only quantization (a separate converter step that
+        # treats Gemm and MatMul identically). Lets the runtime keep a single
+        # set of MatMul kernels and drop the Gemm shader.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "lower_gemm_to_matmul",
+                FusionOptimizer.match_gemm_to_matmul,
+                FusionOptimizer.fold_gemm_to_matmul,
+                priority=70,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_isnan_where_softmax",
@@ -2098,6 +2112,97 @@ class FusionOptimizer:
         dag_model.nodes[gemm_node.name] = gemm_node
 
         print(f"Replaced Conv '{conv_node.name}' after GlobalAveragePool with GEMM")
+        return True
+
+    @staticmethod
+    def match_gemm_to_matmul(dag_model):
+        """Lower every ONNX Gemm to MatMul (+ Add for the bias).
+
+        Gemm and MatMul compute the same matrix product; the runtime only has
+        high-performance kernels behind MatMul (split-K GEMV, WIDE, coopmat,
+        tiled). Gemm's extras -- alpha, beta, transA, fused activation -- are
+        unused on every model this converter sees (the GAP+Conv fusion emits
+        alpha=1, beta=1, transA=0, transB=0, no activation; no other path
+        produces a Gemm). Lowering here routes the image classifier head
+        through the same kernels as the LLM MatMuls and lets Gemm's op/shader
+        be deleted downstream.
+
+        Supported: alpha==1, beta in {0,1}, transA==0, no activation.
+        transB!=0 is carried as a MatMul attribute (the runtime reads B
+        transposed, same convention as the Transpose->MatMul fusion). beta==1
+        with a bias C becomes MatMul -> Add(C). Anything else is left alone
+        (fail-closed) so a future Gemm with a real alpha/activation is not
+        silently mis-compiled.
+        """
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type != "Gemm":
+                continue
+            attrs = node.attributes or {}
+            alpha = attrs.get("alpha", 1.0)
+            beta = attrs.get("beta", 1.0)
+            trans_a = attrs.get("transA", 0)
+            activation = attrs.get("activation")
+            has_bias = len(node.inputs) >= 3
+            if trans_a != 0 or alpha != 1.0 or activation:
+                # Not equivalent to a plain MatMul(+Add); leave for the Gemm
+                # runtime op if it ever exists. Print so the gap is visible.
+                print(f"  skip Gemm->MatMul for '{node.name}': "
+                      f"alpha={alpha}, transA={trans_a}, activation={activation}")
+                continue
+            if beta == 1.0 and not has_bias:
+                # beta defaults to 1 but there is no C to apply it to -- a no-op.
+                beta = 0.0
+            if beta not in (0.0, 1.0):
+                print(f"  skip Gemm->MatMul for '{node.name}': beta={beta}")
+                continue
+            matches.append({"node": node, "beta": beta})
+        return matches
+
+    @staticmethod
+    def fold_gemm_to_matmul(dag_model, match) -> bool:
+        node = match["node"]
+        beta = match["beta"]
+        trans_b = (node.attributes or {}).get("transB", 0)
+        orig_output = node.outputs[0]
+        out_name = orig_output["name"]
+
+        if beta == 1.0:
+            # MatMul writes a fresh tensor; Add reads it + the bias, writes the
+            # Gemm's original output. Keeps every downstream consumer intact.
+            mm_out_name = f"{out_name}_mm"
+            mm_out = {"name": mm_out_name,
+                      "shape": list(orig_output.get("shape", [])),
+                      "dtype": orig_output.get("dtype"),
+                      "value_dynamic": orig_output.get("value_dynamic", False)}
+            mm_node = Node(
+                op_type="MatMul",
+                name=f"{node.name}_mm",
+                attributes={"transB": trans_b} if trans_b else {},
+                inputs=[node.inputs[0], node.inputs[1]],
+                outputs=[mm_out],
+            )
+            add_node = Node(
+                op_type="Add",
+                name=f"{node.name}_bias",
+                attributes={},
+                inputs=[{"name": mm_out_name}, node.inputs[2]],
+                outputs=[orig_output],
+            )
+            dag_model.nodes[mm_node.name] = mm_node
+            dag_model.nodes[add_node.name] = add_node
+            del dag_model.nodes[node.name]
+            print(f"Lowered Gemm '{node.name}' -> MatMul + Add(bias)")
+        else:
+            mm_node = Node(
+                op_type="MatMul",
+                name=node.name,
+                attributes={"transB": trans_b} if trans_b else {},
+                inputs=[node.inputs[0], node.inputs[1]],
+                outputs=[orig_output],
+            )
+            dag_model.nodes[node.name] = mm_node
+            print(f"Lowered Gemm '{node.name}' -> MatMul")
         return True
 
     @staticmethod
@@ -5220,9 +5325,32 @@ class Quantizer:
             else:
                 scale_keepdims = np.where(amax == 0, 1.0, amax)
                 normalized = w3 / scale_keepdims
-                codes = np.abs(
-                    normalized[..., None] - Quantizer._NF4_CODEBOOK[None, None, None, :]
-                ).argmin(axis=-1).astype(np.int8)
+                # NF4 nearest-codebook lookup. The codebook is a sorted 16-point
+                # grid, so np.searchsorted finds each value's insertion index in
+                # O(log 16) with no broadcast temp — the naive
+                #   np.abs(normalized[..., None] - CODEBOOK[None,None,None,:])
+                #   .argmin(-1)
+                # materializes a [n_groups, group_size, N, 16] fp32 array (~8.7GB
+                # for the 151936x896 lm_head) and OOMs the converter. This path
+                # uses O(1) extra memory and is bit-identical to it.
+                codebook = Quantizer._NF4_CODEBOOK  # ascending, length 16
+                # Clip into [codebook[0], codebook[-1]] so searchsorted is
+                # stable. NaN (a degenerate group that is all-zero except a
+                # NaN, which shouldn't happen for real weights but guard it)
+                # maps to index 0, matching what the broadcast argmin path did.
+                clipped = np.clip(np.nan_to_num(normalized, nan=codebook[0]),
+                                  codebook[0], codebook[-1])
+                hi = np.searchsorted(codebook, clipped, side="left")
+                # hi is in [1, 16]; the nearest code is either hi-1 or hi (clipped
+                # to [0, 15]). Compare the two candidates.
+                lo = hi - 1
+                hi = np.minimum(hi, 15)
+                d_lo = np.abs(clipped - codebook[lo])
+                d_hi = np.abs(clipped - codebook[hi])
+                # Tie-break toward the smaller index (matches argmin, which picks
+                # the first minimum): when d_lo <= d_hi take lo.
+                codes = np.where(d_lo <= d_hi, lo, hi).astype(np.int8)
+                del clipped, hi, lo, d_lo, d_hi
                 dequantized = (
                     Quantizer._NF4_CODEBOOK[codes.astype(np.int64)] * scale_keepdims
                 )
