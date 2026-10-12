@@ -1,6 +1,6 @@
 """把 qi21_dit 的 prefill/decode 两张图导出成 onnx2vkop 友好的 ONNX。
 
-和 llm/exporter/qwen3vl_export_onnx.py 同一个套路：legacy TorchScript 导出器
+和 llm/exporter/export/qwen3vl_export_onnx.py 同一个套路：legacy TorchScript 导出器
 （`dynamo=False`，避开 dynamo 的 guard）、opset 17、权重合进单个 external-data 文件。
 
     # 不需要 checkpoint：2 层随机权重，只看图结构和 fold 模式是否成形

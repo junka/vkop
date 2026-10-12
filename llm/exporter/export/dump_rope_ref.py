@@ -13,15 +13,15 @@ So the C++ side can reconstruct the exact same inputs and diff its pos_ids
 byte-for-byte.
 
 Usage:
-  python3 dump_rope_ref.py --image <img> --text "<prompt>" --out <dir>
-  python3 dump_rope_ref.py --synth 224 --text "<prompt>" --out <dir>
+  python3 export/dump_rope_ref.py --image <img> --text "<prompt>" --out <dir>
+  python3 export/dump_rope_ref.py --synth 224 --text "<prompt>" --out <dir>
 """
 import os, sys, argparse
 import numpy as np
 import torch
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 
 

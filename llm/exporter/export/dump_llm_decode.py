@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Dump prefill + N decode rounds for the C++ vkop driver.
 
-Text-only (no image). Mirrors llm/exporter/infer.py::generate but, instead of
+Text-only (no image). Mirrors llm/exporter/check/infer.py::generate but, instead of
 looping inside one ORT session, exports each round's full input set + reference
 logits as .npy under <out_dir>/round{t}/. The C++ driver loads each round,
 uploads it, runs one Run(), and compares logits — verifying the buffer-backend
@@ -9,7 +9,7 @@ ops (esp. the 5-D Gather on growing [1,2,8,kv_len,128] KV-cache and the fp16
 Expand) hold up across decode rounds where kv_len increments.
 
 Usage:
-  python3 dump_llm_decode.py <text> <out_dir> [max_new]
+  python3 export/dump_llm_decode.py <text> <out_dir> [max_new]
 
 Writes:
   <out_dir>/round0/   prefill (kv_len=0)
@@ -26,7 +26,7 @@ import torch
 import onnxruntime as ort
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLM_ONNX = os.path.join(_PKG_DIR, "llm.onnx")
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 

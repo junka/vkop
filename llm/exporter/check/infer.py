@@ -16,7 +16,7 @@ from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 # 导出产物路径：相对本包目录，让从任意 cwd 调用都能找到。
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VISUAL_ONNX = os.path.join(_PKG_DIR, "visual.onnx")
 LLM_ONNX = os.path.join(_PKG_DIR, "llm.onnx")
 D = "cpu"

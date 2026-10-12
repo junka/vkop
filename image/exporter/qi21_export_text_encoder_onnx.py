@@ -13,7 +13,7 @@
     # 顺带用 fp16 eager 跑一条真实 prompt，产出可与 encode_prompt_real.py 对拍的文件
     ... --prompt "a red cube" --emit-ref ref_te
 
-和 LLM 那条线（llm/exporter/qwen3vl_export_onnx.py）的三处不同：
+和 LLM 那条线（llm/exporter/export/qwen3vl_export_onnx.py）的三处不同：
 
   1. **输出是 hidden_states，不是 logits**：砍掉 lm_head，而且**不过最后那个
      RMSNorm** —— 官方 pipeline 用 forward hook 把 `text_model.norm` 绕开（transformers

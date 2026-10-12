@@ -1,6 +1,6 @@
 """Qwen-Image-2.1 DiT 的 ONNX 友好实现（自定义 wrapper，绕开 diffusers 内部）。
 
-和 llm/exporter/qwen3vl_export_onnx.py 里的 `Qwen3VLLMOnnx` 同一个套路：复用原
+和 llm/exporter/export/qwen3vl_export_onnx.py 里的 `Qwen3VLLMOnnx` 同一个套路：复用原
 checkpoint 的权重，但自己写 forward，把所有不可 trace 的东西换成显式张量 I/O。
 
 绕开的四处不可导出实现（都在 diffusers `transformer_qwenimage21.py`）：

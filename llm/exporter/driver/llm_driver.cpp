@@ -2,14 +2,14 @@
 // End-to-end driver for llm.vkopbin (Qwen3-VL-2B LLM, buffer backend).
 //
 // Loads the 3649-node model, fills the 35 prefill inputs from .npy files
-// dumped by llm/exporter/dump_llm_inputs.py, runs prefill, and compares the
+// dumped by llm/exporter/export/dump_llm_inputs.py, runs prefill, and compares the
 // logits output against reference_logits.npy (ONNX Runtime).
 //
 // Usage:
 //   llm_driver <model.vkopbin> <inputs_dump_dir>
 //
 // Build (from repo root):
-//   g++ -std=c++17 -I. -Imodel/generated llm/exporter/llm_driver.cpp
+//   g++ -std=c++17 -I. -Imodel/generated llm/exporter/driver/llm_driver.cpp
 //       build/libvkop.a build/model/libvload.a -o build/llm_driver
 //       $(pkg-config --libs vulkan) -lpthread
 //

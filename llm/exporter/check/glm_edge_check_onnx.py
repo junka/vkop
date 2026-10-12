@@ -1,34 +1,34 @@
 #!/usr/bin/env python3
-"""Phi-4-mini 导出的 llm.onnx 与 HF 的数值对齐检查（CPU onnxruntime，fp16）。
+"""GLM-Edge-1.5B-Chat 导出的 llm.onnx 与 HF 的数值对齐检查（CPU onnxruntime，fp16）。
 
-三项对比，缺一不可：
-  1. prefill logits       —— 端到端数值路径
-  2. 每层 present_key_values —— 逐层定位（kv 依赖前面所有层，逐层比对等于逐层
-     hidden 对齐，不需要给图加中间输出）
-  3. decode 单步 logits    —— 带 past_kv 的第二条 shape 分支（q_len=1）
+三项对比，缺一不可（口径同 phi4_check_onnx.py）：
+  1. prefill logits          —— 端到端数值路径
+  2. 每层 present_key_values —— 逐层定位（交错 RoPE 的半切等价改写主要靠这项证明）
+  3. decode 单步 logits      —— 带 past_kv 的第二条 shape 分支（q_len=1）
 
 HF 参考用 model.model(...) + lm_head，喂 2D attention_mask；ONNX 侧喂显式的加法
-causal bias。两者只在 sliding_window 不起作用时等价 —— Phi-4-mini 的
-sliding_window=262144 > 任何上下文，所以窗口不裁剪，纯 causal。
+causal bias。GLM-Edge 的 config 里**没有** sliding_window / layer_types 字段，
+所以纯 causal，两者等价（脚本会再断言一次，不接受"大概是纯 causal"）。
 
 用法:
-    python3 phi4_check_onnx.py                    # 默认 L=32
-    CHECK_LEN=64 python3 phi4_check_onnx.py
+    python3 check/glm_edge_check_onnx.py                 # 默认 L=32
+    CHECK_LEN=64 python3 check/glm_edge_check_onnx.py
 """
+import json
 import os
 import sys
 
 import numpy as np
 import torch
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.environ.get("MODEL_PATH") or os.path.join(
     os.path.expanduser("~"), ".cache/modelscope/models/"
-    "LLM-Research--Phi-4-mini-instruct/snapshots/master")
-ONNX_PATH = os.environ.get("ONNX_PATH") or os.path.join(HERE, "text_phi4", "llm.onnx")
+    "ZhipuAI--glm-edge-1.5b-chat/snapshots/master")
+ONNX_PATH = os.environ.get("ONNX_PATH") or os.path.join(HERE, "text_glm_edge", "llm.onnx")
 CHECK_LEN = int(os.environ.get("CHECK_LEN", "32"))
 
-# fp16 + CPU ort 的累积舍入：量级 ~10 的 logits 用 mean<2e-2 判逻辑性偏差，
+# 口径与 phi4 一致：fp16 + CPU ort 的累积舍入，logits 量级 ~10 用 mean<2e-2，
 # kv 量级 ~1 收紧到 5e-3。逻辑错时 mean 通常大一个数量级。
 LOGITS_MEAN_TOL = 2e-2
 KV_MEAN_TOL = 5e-3
@@ -73,18 +73,22 @@ def ort_prefill(sess, embeds, pos, bias, kv_shape, nlayers):
 
 def main():
     import onnxruntime as ort  # noqa: E402
-    from transformers.models.phi3.modeling_phi3 import Phi3ForCausalLM  # noqa: E402
+    from transformers.models.glm.modeling_glm import GlmForCausalLM  # noqa: E402
+
+    raw_cfg = json.load(open(os.path.join(MODEL_PATH, "config.json")))
+    assert "sliding_window" not in raw_cfg and "layer_types" not in raw_cfg, \
+        "config 有滑窗字段，加法 causal bias 不再与 HF 等价"
 
     print(f"[load] HF {MODEL_PATH}")
-    model = Phi3ForCausalLM.from_pretrained(
+    model = GlmForCausalLM.from_pretrained(
         MODEL_PATH, attn_implementation="eager", torch_dtype=torch.float16,
         local_files_only=True)
     model.eval()
-    # 关掉梯度：embeds / kv 要直接 .numpy() 喂 ORT
     model.requires_grad_(False)
     cfg = model.config
-    nl, nkv, hd = cfg.num_hidden_layers, cfg.num_key_value_heads, (
-        getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads)
+    nl = cfg.num_hidden_layers
+    nkv = cfg.num_key_value_heads
+    hd = getattr(cfg, "head_dim", None) or cfg.hidden_size // cfg.num_attention_heads
 
     print(f"[load] ORT {ONNX_PATH}")
     so = ort.SessionOptions()
@@ -118,7 +122,6 @@ def main():
     print(f"[{'ok ' if arg_ok > 0.95 else 'FAIL'}] logits argmax 一致率 = {arg_ok:.3f}")
     ok.append(arg_ok > 0.95)
 
-    # 逐层 kv：只打印最差的两层，全部数值参与判定
     worst = []
     for i in range(nl):
         d = (onnx_kv[i].float() - hf_kv[i].float()).abs().mean().item()
@@ -136,7 +139,8 @@ def main():
 
     # ---------------- decode 单步 ----------------
     dl = L + 1
-    dec_ids = torch.randint(0, cfg.vocab_size, (1, 1), generator=torch.Generator().manual_seed(7))
+    dec_ids = torch.randint(0, cfg.vocab_size, (1, 1),
+                            generator=torch.Generator().manual_seed(7))
     dec_pos = torch.full((1, 1), L, dtype=torch.long)
     dec_emb = model.model.embed_tokens(dec_ids)
     dec_bias = torch.zeros(1, 1, 1, dl, dtype=torch.float16)

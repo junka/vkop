@@ -41,8 +41,8 @@ past_len 线性增长的主要来源之一。代价是 attention_bias 要沿 q �
 （比 K/V 的展开小两个数量级），以及 q/out 各多一次 5-D permute 的搬数。
 
 用法:
-  python3 glm_edge_export_onnx.py            # → text_glm_edge/llm.onnx + llm.weights.bin
-  MODEL_PATH=/path/to/glm-edge-1.5b-chat EXPORT_PATH=llm.onnx python3 glm_edge_export_onnx.py
+  python3 export/glm_edge_export_onnx.py            # → text_glm_edge/llm.onnx + llm.weights.bin
+  MODEL_PATH=/path/to/glm-edge-1.5b-chat EXPORT_PATH=llm.onnx python3 export/glm_edge_export_onnx.py
 """
 
 import json
@@ -55,7 +55,7 @@ MODEL_PATH = os.environ.get("MODEL_PATH") or os.path.join(
     "ZhipuAI--glm-edge-1.5b-chat/snapshots/master")
 
 # 产物目录与 text_qwen3/ text_phi4/ 平级，避免多套模型的 llm.onnx 互相覆盖
-_DEFAULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "text_glm_edge")
+_DEFAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "text_glm_edge")
 EXPORT_PATH = os.environ.get("EXPORT_PATH") or os.path.join(_DEFAULT_DIR, "llm.onnx")
 WEIGHTS_BIN = os.path.basename(EXPORT_PATH).replace(".onnx", ".weights.bin")
 

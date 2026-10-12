@@ -8,10 +8,10 @@ vkop GPU 的输出逐 token 对齐。
   hidden = inputs_embeds 的最后一维，停止符 = generation_config.eos_token_id。
 
 用法:
-    python3 greedy_ref.py "用一个词回答：天空是什么颜色？"
+    python3 check/greedy_ref.py "用一个词回答：天空是什么颜色？"
     ONNX=text_glm_edge/llm.onnx EMBED=text_glm_edge/embed_tokens.bin \
     MODEL_PATH=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
-      python3 greedy_ref.py "你好"
+      python3 check/greedy_ref.py "你好"
 """
 import os
 import sys
@@ -20,7 +20,7 @@ import numpy as np
 import onnxruntime as ort
 from transformers import AutoTokenizer
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODEL_PATH = os.environ.get("MODEL_PATH") or os.path.join(
     os.path.expanduser("~"), ".cache/modelscope/models/"
     "LLM-Research--Phi-4-mini-instruct/snapshots/master")

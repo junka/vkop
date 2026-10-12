@@ -516,7 +516,7 @@ endif()
 option(ENABLE_LLM_CHAT "Build the LLM conversational driver (llm_chat)" ON)
 if (ENABLE_LLM_CHAT)
     add_subdirectory(llm/tokenizer llm_tokenizer)
-    add_executable(llm_chat llm/exporter/llm_chat.cpp llm/exporter/conversation.cc)
+    add_executable(llm_chat llm/exporter/driver/llm_chat.cpp llm/exporter/driver/conversation.cc)
     target_link_libraries(llm_chat PRIVATE vkop vload tokenizer)
     target_include_directories(llm_chat PRIVATE
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)
@@ -538,19 +538,19 @@ if (ENABLE_LLM_CHAT)
 
     # Visual encoder probe: runs visual.vkopbin standalone to verify the visual
     # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.
-    add_executable(visual_probe llm/exporter/visual_probe.cpp)
+    add_executable(visual_probe llm/exporter/driver/visual_probe.cpp)
     target_link_libraries(visual_probe PRIVATE vkop vload)
 
     # get_rope_index probe: verifies the C++ MRoPE position-id port against a
     # HF reference dump (dump_rope_ref.py). Header-only logic; links vkop only
     # because image_preproc.hpp -> core/Tensor.hpp pulls in VulkanLib symbols.
-    add_executable(rope_probe llm/exporter/rope_probe.cpp)
+    add_executable(rope_probe llm/exporter/driver/rope_probe.cpp)
     target_link_libraries(rope_probe PRIVATE vkop vload)
 
     # npy-feed LLM driver: loads <dump_dir>/roundN/*.npy inputs, runs the model,
     # and compares 'logits' against reference_logits.npy (ORT ground truth).
     # Used for Qwen2/Qwen3 e2e correctness checks (fp16, fp8 KV, QDQ).
-    add_executable(llm_driver llm/exporter/llm_driver.cpp)
+    add_executable(llm_driver llm/exporter/driver/llm_driver.cpp)
     target_link_libraries(llm_driver PRIVATE vkop vload)
 endif()
 

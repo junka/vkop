@@ -113,7 +113,7 @@ options:
 ```
 支持将postproc 手动注册到gpu 处理，比如softmax，topk减少CPU与GPU间的内存吞吐
 
-#### 5. LLM 推理（llm/exporter/llm_chat）
+#### 5. LLM 推理（llm/exporter/driver/llm_chat.cpp）
 
 - KV cache 已 GPU 化：decode 每轮 present→past 为单条命令缓冲内的
   device→device 拷贝，无 CPU 往返（原 `KV_INPLACE_PLAN` 已完成并删除）。
@@ -266,7 +266,7 @@ options:
 ```
 Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU.
 
-#### 6. LLM inference (llm/exporter/llm_chat)
+#### 6. LLM inference (llm/exporter/driver/llm_chat.cpp)
 
 - KV cache is GPU-resident: each decode round copies present→past
   device→device inside one command buffer, with no CPU round-trip (the

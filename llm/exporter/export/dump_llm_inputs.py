@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Dump llm.onnx prefill inputs + reference logits for the C++ driver.
 
-Text-only (no image) prefill, mirroring llm/exporter/infer.py::run_llm with
+Text-only (no image) prefill, mirroring llm/exporter/check/infer.py::run_llm with
 past=None. Writes one .npy per graph input and one reference_logits.npy under
 the output dir, so the C++ vkop driver can load+upload them and compare.
 
 Usage:
-  python3 dump_llm_inputs.py <text> <out_dir>
+  python3 export/dump_llm_inputs.py <text> <out_dir>
 """
 import os
 import sys
@@ -16,7 +16,7 @@ import torch
 import onnxruntime as ort
 from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLM_ONNX = os.path.join(_PKG_DIR, "llm.onnx")
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 

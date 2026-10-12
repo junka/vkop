@@ -12,7 +12,7 @@ import torch
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from infer import HIDDEN, NLAYERS, NKV, HD
+from check.infer import HIDDEN, NLAYERS, NKV, HD
 
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 IMG_TOK = 151655

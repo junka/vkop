@@ -24,23 +24,29 @@
 
 ## 组件
 
+脚本按用途分三个子目录：`export/`（导出与 dump）、`check/`（参考与验证）、
+`driver/`（C++ 推理驱动与探针）。
+
 | 文件 | 作用 |
 |---|---|
-| [qwen3vl_export_onnx.py](qwen3vl_export_onnx.py) | 导出 visual.onnx / llm.onnx（含 deepstack、KV cache、权重合并）。 |
-| [infer.py](infer.py) | ONNX 端到端推理驱动（`OnnxQwen3VL`：visual + LLM prefill/decode + greedy 生成）。 |
+| [export/qwen3vl_export_onnx.py](export/qwen3vl_export_onnx.py) | 导出 visual.onnx / llm.onnx（含 deepstack、KV cache、权重合并）。 |
+| [check/infer.py](check/infer.py) | ONNX 端到端推理驱动（`OnnxQwen3VL`：visual + LLM prefill/decode + greedy 生成）。 |
 | [cases.py](cases.py) | 一致性测试用例构造（合成 PIL 图、prompt 模板、`CASES` 列表，供 tests 复用）。 |
 | [tests/](tests/) | pytest 测试套件（数值对齐 + 端到端 token 一致性）。 |
-| [qwen3vl_infer.py](qwen3vl_infer.py) | HF 原生推理封装（`Qwen3VLInference`），作为对比基准。 |
-| [qwen3_export_onnx.py](qwen3_export_onnx.py) | 纯文本 Qwen3（`Qwen3ForCausalLM`）导出 → `text_qwen3/`。 |
-| [phi4_export_onnx.py](phi4_export_onnx.py) | Phi-4-mini（`Phi3ForCausalLM`）导出 → `text_phi4/`；与 Qwen 共用同一套张量 I/O 契约。 |
-| [glm_edge_export_onnx.py](glm_edge_export_onnx.py) | GLM-Edge-1.5B-Chat（`GlmForCausalLM`）导出 → `text_glm_edge/`；同一套张量 I/O 契约。 |
-| [greedy_ref.py](greedy_ref.py) | CPU ORT 的 greedy 逐步解码参考（架构参数全部从图形状读），用 `ONNX`/`EMBED`/`MODEL_PATH` 选模型，和 GPU 逐 token 对拍。 |
+| [check/qwen3vl_infer.py](check/qwen3vl_infer.py) | HF 原生推理封装（`Qwen3VLInference`），作为对比基准。 |
+| [export/qwen3_export_onnx.py](export/qwen3_export_onnx.py) | 纯文本 Qwen3（`Qwen3ForCausalLM`）导出 → `text_qwen3/`。 |
+| [export/phi4_export_onnx.py](export/phi4_export_onnx.py) | Phi-4-mini（`Phi3ForCausalLM`）导出 → `text_phi4/`；与 Qwen 共用同一套张量 I/O 契约。 |
+| [export/glm_edge_export_onnx.py](export/glm_edge_export_onnx.py) | GLM-Edge-1.5B-Chat（`GlmForCausalLM`）导出 → `text_glm_edge/`；同一套张量 I/O 契约。 |
+| [check/greedy_ref.py](check/greedy_ref.py) | CPU ORT 的 greedy 逐步解码参考（架构参数全部从图形状读），用 `ONNX`/`EMBED`/`MODEL_PATH` 选模型，和 GPU 逐 token 对拍。 |
 | `visual.onnx` / `llm.onnx` / `llm.weights.bin` | 导出产物（`llm.weights.bin` 是 llm.onnx 的外部权重单文件）。 |
 
 ## 构建
 
+以下命令都在 `llm/exporter/` 目录下执行（脚本按用途分在 `export/`、`check/`、
+`driver/` 三个子目录，产物仍落在 exporter 根目录）：
+
 ```bash
-python3 qwen3vl_export_onnx.py   # 产出 visual.onnx / llm.onnx / llm.weights.bin
+python3 export/qwen3vl_export_onnx.py   # 产出 visual.onnx / llm.onnx / llm.weights.bin
 pytest                            # 跑全部测试（数值对齐 + 端到端一致性）
 pytest tests/test_numeric.py        # 仅数值对齐
 pytest tests/test_consistency.py -k ocr   # 仅 OCR 用例
@@ -48,7 +54,7 @@ pytest tests/test_consistency.py -k ocr   # 仅 OCR 用例
 
 依赖：`torch`、`transformers`、`onnx`、`onnxruntime`、`pytest`、`qwen_vl_utils`。
 
-> `infer.py` 也可 `python3 infer.py` 直接跑一个单图样例（ONNX vs HF 对比），
+> `check/infer.py` 也可 `python3 check/infer.py` 直接跑一个单图样例（ONNX vs HF 对比），
 > 主要逻辑在 `OnnxQwen3VL` 类，被 tests 复用。
 
 ---
@@ -68,7 +74,7 @@ pytest tests/test_consistency.py -k ocr   # 仅 OCR 用例
   **只有 `pixel_values`**（grid_thw 在导出时固化）。这是 HF 视觉实现的特性，导出
   尺寸固定。默认 224×224 → patch_size=16 → 14×14=196 个 patch（grid_h=grid_w=14，
   即每个维度 14 个 patch，不是 patch_size=14）。不同图像尺寸需重新导出
-  （`EXPORT_IMG_SIZE=336 python3 qwen3vl_export_onnx.py`）。
+  （`EXPORT_IMG_SIZE=336 python3 export/qwen3vl_export_onnx.py`）。
   > 注意区分：`patch_size`（=16，config 里读，每个 patch 的像素边长）与
   > `grid_h/grid_w`（=14，图像在每维切出的 patch 数）。224÷16=14。
 - 视觉 attention 是 eager（无 `create_causal_mask`），不触 `torch.diff`，安全 trace。
@@ -196,7 +202,7 @@ llm.onnx 权重 ~2.3GB 超 protobuf 2GB 上限，`torch.onnx.export` 自动 exte
 
 ### 端到端 token 级（tests/test_consistency.py，ONNX 推理 vs HF `model.generate`）
 
-`infer.py` 的 `OnnxQwen3VL` 用 `visual.onnx` + `llm.onnx` 跑完整生成（prefill +
+`check/infer.py` 的 `OnnxQwen3VL` 用 `visual.onnx` + `llm.onnx` 跑完整生成（prefill +
 greedy decode 循环，KV 在步间传递），与 HF `Qwen3VLForConditionalGeneration.generate(do_sample=False)`
 对比生成的 token id 序列。用例来自 [cases.py](cases.py)（10 个业界通用场景）：
 
@@ -215,9 +221,9 @@ ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图�
 
 ### 与 Qwen3VLInference 对比
 
-[qwen3vl_infer.py](qwen3vl_infer.py) 的 `Qwen3VLInference` 是 HF 原生推理封装
+[check/qwen3vl_infer.py](check/qwen3vl_infer.py) 的 `Qwen3VLInference` 是 HF 原生推理封装
 （`processor.apply_chat_template` + `model.generate(do_sample=True)`）。
-`infer.py` 复用同一 `AutoProcessor` 生成 `input_ids`/`pixel_values`/`grid_thw`/
+`check/infer.py` 复用同一 `AutoProcessor` 生成 `input_ids`/`pixel_values`/`grid_thw`/
 `mm_token_type_ids`，区别仅在 LLM 推理路径（ONNX 图 vs PyTorch）。
 
 - **greedy（do_sample=False）**：ONNX 与 HF token id 逐个一致（见上表）。
@@ -244,7 +250,7 @@ ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图�
 
 ## vkop C++ 驱动 (llm_chat)
 
-`llm_chat.cpp` 是 vkop（Vulkan ONNX runtime）的端到端对话驱动：文本输入 →
+`driver/llm_chat.cpp` 是 vkop（Vulkan ONNX runtime）的端到端对话驱动：文本输入 →
 tokenize → prefill（q_len=L）→ 逐 token greedy decode（q_len=1）→ detokenize 输出。
 不依赖 PyTorch / ONNX Runtime，只用 `llm.vkopbin`（转换后的 vkop 图）+
 `embed_tokens.bin`（host 端 embedding 查表）+ tokenizer。
@@ -270,7 +276,7 @@ make -C build                 # 全量构建（含 llm_chat）
 ```
 
 链接 `vkop + vload + tokenizer`（都来自主 CMake 的 target）。改了 `libvkop.a` 或
-`llm_chat.cpp` 后重跑 `make -C build llm_chat` 即可，无需手动 g++ 脚本。
+`driver/llm_chat.cpp` 后重跑 `make -C build llm_chat` 即可，无需手动 g++ 脚本。
 vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
 
 ### 运行
@@ -349,7 +355,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 
 | 变量 | 作用 |
 |---|---|
-| `VKOP_RAW_PROMPT=1` | 跳过 chat template **和多轮历史**，每行输入独立（对齐参考 `dump_llm_decode.py`，不走对话格式） |
+| `VKOP_RAW_PROMPT=1` | 跳过 chat template **和多轮历史**，每行输入独立（对齐参考 `export/dump_llm_decode.py`，不走对话格式） |
 | `VKOP_MAX_CTX=<tokens>` | 多轮上下文的 token 预算，默认 `8192 - max_new`；超预算整对丢掉最旧的一问一答 |
 | `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
 | `VKOP_PROFILE=1` | 开启性能分析：每轮结束输出 prefill/decode 的 tokens/s、延迟百分位 (p50/p90/p99)、KV cache 利用率；会话结束时打印全局汇总统计 |
@@ -427,7 +433,7 @@ printf 'What color is the image? Answer in one word.' | \
 `max_new` 默认 64，对应代码：
 
 ```cpp
-int max_new = (argc > 4) ? std::atoi(argv[4]) : 64;   // llm_chat.cpp:259
+int max_new = (argc > 4) ? std::atoi(argv[4]) : 64;   // driver/llm_chat.cpp:259
 ...
 for (int step = 1; step < max_new; ++step) {          // decode 循环
     if (next_id == IM_END) break;
@@ -449,7 +455,7 @@ token 数 = `max_new - 1`。默认 64 → prefill 后最多再生成 63 个 deco
    ./build/llm_chat ... 100000  # 实质无限制（靠 IM_END 自然停）
    ```
 
-2. **改默认值**：把 `llm_chat.cpp:259` 的 `: 64` 改成更大的数（如 `: 2048`）。
+2. **改默认值**：把 `driver/llm_chat.cpp:259` 的 `: 64` 改成更大的数（如 `: 2048`）。
    适合不想每次传参的场景。
 
 3. **完全去掉上界，只靠 IM_END 停**：把 `for (int step = 1; step < max_new; ++step)`
@@ -479,17 +485,17 @@ head_dim 128 / intermediate 8192 / vocab 200064 / `tie_word_embeddings=true`。
 
 ```bash
 # 1) 导出 ONNX（权重：ModelScope LLM-Research/Phi-4-mini-instruct）
-python3 phi4_export_onnx.py            # → text_phi4/llm.onnx + llm.weights.bin
-python3 dump_embed_tokens_phi4.py      # → text_phi4/embed_tokens.bin (200064x3072 fp16)
+python3 export/phi4_export_onnx.py            # → text_phi4/llm.onnx + llm.weights.bin
+python3 export/dump_embed_tokens_phi4.py      # → text_phi4/embed_tokens.bin (200064x3072 fp16)
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
-python3 phi4_check_onnx.py
+python3 check/phi4_check_onnx.py
 # 3) 转 vkopbin —— 多 GB 图不要加 -u（UnifiedMeta 的偏移是 int32，会溢出）
 python3 -m onnx2vkop.cli -i text_phi4/llm.onnx -o text_phi4/llm.vkopbin
 # 4) tokenizer bin（MODEL_DIR / OUTPUT_BIN 两个环境变量决定输入与产物）
 MODEL_DIR=~/.cache/modelscope/models/LLM-Research--Phi-4-mini-instruct/snapshots/master \
   OUTPUT_BIN=../tokenizer/phi4_mini.bin python3 ../tokenizer/tokenizer_to_bin.py
 # 5) 三方 token 对齐（HF generate / ONNX Runtime / vkop GPU）
-python3 greedy_ref.py "用一个词回答：天空是什么颜色？"   # 默认指 text_phi4/
+python3 check/greedy_ref.py "用一个词回答：天空是什么颜色？"   # 默认指 text_phi4/
 ```
 
 
@@ -533,7 +539,7 @@ python3 greedy_ref.py "用一个词回答：天空是什么颜色？"   # 默认
 HF generate = ONNX Runtime = vkop GPU = [72721, 4472, 788, 200020]  →  '蓝色。' + 轮末符
 ```
 
-`phi4_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
+`check/phi4_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3（fp16+CPU ORT 的
 累积舍入），32 层 present_key_values 全部 < 1.4e-3，decode 单步 argmax 一致，
 每轮 GPU 约 330ms/token。
 
@@ -549,10 +555,10 @@ I/O 名字与形状，`llm_chat` / `kv_cache` 的加载逻辑一行没改；架�
 
 ```bash
 # 1) 导出 ONNX（朴素 pre-norm decoder，分离 q/k/v 投影 + fused gate_up_proj）
-python3 glm_edge_export_onnx.py          # → text_glm_edge/llm.onnx + llm.weights.bin
-python3 dump_embed_tokens_glm_edge.py    # → text_glm_edge/embed_tokens.bin (59264x2048 fp16, 243MB)
+python3 export/glm_edge_export_onnx.py          # → text_glm_edge/llm.onnx + llm.weights.bin
+python3 export/dump_embed_tokens_glm_edge.py    # → text_glm_edge/embed_tokens.bin (59264x2048 fp16, 243MB)
 # 2) 数值对齐（ORT fp16 CPU vs HF）：prefill logits + 逐层 present_kv + decode 单步
-python3 glm_edge_check_onnx.py
+python3 check/glm_edge_check_onnx.py
 # 3) 转 vkopbin —— 权重 2.94GB，同样不能加 -u（UnifiedMeta 偏移是 int32）
 python3 -m onnx2vkop.cli -i text_glm_edge/llm.onnx -o text_glm_edge/llm.vkopbin
 # 4) tokenizer bin
@@ -561,7 +567,7 @@ MODEL_DIR=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/maste
 # 5) 三方 token 对齐（ONNX Runtime 这一路；HF 与 GPU 见下）
 ONNX=text_glm_edge/llm.onnx EMBED=text_glm_edge/embed_tokens.bin \
 MODEL_PATH=~/.cache/modelscope/models/ZhipuAI--glm-edge-1.5b-chat/snapshots/master \
-  python3 greedy_ref.py "用一个词回答：天空是什么颜色？"
+  python3 check/greedy_ref.py "用一个词回答：天空是什么颜色？"
 # 6) GPU
 ../../build/llm_chat text_glm_edge/llm.vkopbin text_glm_edge/embed_tokens.bin \
   ../tokenizer/glm_edge.bin 48
@@ -602,7 +608,7 @@ HF generate (fp16 与 bf16 同解) = ONNX Runtime = vkop GPU
 ```
 
 prompt 侧也逐 token 相同：13 个 id `[59253, 10, 551, …]`（GPU 侧用 `VKOP_CHATDBG=1`
-打印）。`glm_edge_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3、argmax
+打印）。`check/glm_edge_check_onnx.py` 的数值口径：prefill logits 相对均值差 1.5e-3、argmax
 一致率 1.000，28 层 present_key_values 全部 < 1.7e-3，decode 单步 argmax 相同；
 GPU 上 prefill 约 90ms、decode 约 110ms/token。多轮：第二轮的历史是 37 个 token =
 第一轮 user 13 + assistant 正文 11 + 第二轮 user 13，正好是「丢掉末尾那个 `<|user|>`

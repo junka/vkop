@@ -6,14 +6,14 @@ Reads /tmp/vref/pv.bin (from dump_visual_ref.py) as pixel_values, adds every
 node output as a graph output, runs ORT, prints per-tensor stats in the same
 format as the C++ driver's [name] line.
 
-Usage: python3 dump_visual_intermediates.py [pv.bin]
+Usage: python3 export/dump_visual_intermediates.py [pv.bin]
 """
 import os, sys
 import numpy as np
 import onnx
 import onnxruntime as ort
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VISUAL_ONNX = os.path.join(_PKG_DIR, "visual.onnx")
 
 

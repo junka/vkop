@@ -6,7 +6,7 @@ generate loop (llm_chat) 需要这张 [vocab, hidden] fp16 表做 token_id→emb
 本脚本只抽 embed_tokens，不重跑 ONNX 导出，避免重做耗时的 trace/export。
 
 用法:
-    python3 llm/exporter/dump_embed_tokens.py [输出路径]
+    python3 llm/exporter/export/dump_embed_tokens.py [输出路径]
 默认输出 llm/exporter/embed_tokens.bin。
 """
 import os
@@ -17,7 +17,7 @@ from transformers import Qwen3VLForConditionalGeneration
 MODEL_PATH = os.path.expanduser(
     "~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(__file__), "embed_tokens.bin")
+    os.path.dirname(os.path.dirname(__file__)), "embed_tokens.bin")
 
 print(f"[load] {MODEL_PATH}")
 model = Qwen3VLForConditionalGeneration.from_pretrained(

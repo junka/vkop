@@ -2,12 +2,12 @@
 """Compare vkop VKOP_DUMP_TENSORS='*' output against ORT intermediate stats,
 in ONNX topological order, to find the first diverging tensor.
 
-Usage: python3 compare_visual_intermediates.py <vkop_dump.txt> <ort_dump.txt>
+Usage: python3 check/compare_visual_intermediates.py <vkop_dump.txt> <ort_dump.txt>
 """
 import os, sys, re
 import onnx
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VISUAL_ONNX = os.path.join(_PKG_DIR, "visual.onnx")
 
 

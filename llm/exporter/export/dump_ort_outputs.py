@@ -3,14 +3,14 @@
 present_key_values_*) for one decode round, in the same format as the C++
 driver's [name] line, so they can be diffed against VKOP_DUMP_TENSORS output.
 
-Usage: python3 dump_ort_outputs.py <round_dir>
+Usage: python3 export/dump_ort_outputs.py <round_dir>
 """
 import os
 import sys
 import numpy as np
 import onnxruntime as ort
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLM_ONNX = os.path.join(_PKG_DIR, "llm.onnx")
 
 

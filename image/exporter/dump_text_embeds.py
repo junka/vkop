@@ -12,7 +12,7 @@
         --ids-file /tmp/ref_real_ids.txt --out-embeds ref_te/te_embeds.raw
 
 只 `safe_open` 一个张量：checkpoint 是 4 个分片共 17.5 GB，而 embed_tokens 只有 1.24 GB，
-用 `from_pretrained` 把整个模型拉起来（就像 llm/exporter/dump_embed_tokens.py 那样）在这
+用 `from_pretrained` 把整个模型拉起来（就像 llm/exporter/export/dump_embed_tokens.py 那样）在这
 台 36 GB 的机器上等于把交换区打开。
 """
 

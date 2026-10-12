@@ -6,12 +6,12 @@
 
 ## 现状关键事实(已核对)
 
-- **KV cache 管理器** `llm/exporter/kv_cache.hpp`:
+- **KV cache 管理器** `llm/exporter/driver/kv_cache.hpp`:
   - 构造函数 `as_tensor<uint16_t>(pin)->preallocate_buffer(dev, kv_elems)`,
     `kv_elems = 2 * nkv * max_kv * hd` —— 硬编码 fp16。
   - `reset_for_prefill()` / `upload()` / `feedback()` 全用 `as_tensor<uint16_t>`。
   - `feedback()` 用 `swap_gpu_buffer_with` 交换 present→past 的 VkBuffer(dtype 无关)。
-- **LLM 驱动** `llm/exporter/llm_chat.cpp`:
+- **LLM 驱动** `llm/exporter/driver/llm_chat.cpp`:
   - `infer_model_arch` 用 `as_tensor<uint16_t>(pk0)` 读 NKV/HD。
   - `FP16_MIN = 0xFBFF` 是 causal mask 填充值(attention_bias 输入,不是 cache)。
   - `fill_fp16_input` / `upload_input` 按 uint16_t 走 cache。
@@ -23,7 +23,7 @@
     /Expand/Reshape 全挡)。
 - **运行时输入创建** `core/runtime.cpp:148-196`:
   - switch 覆盖 int64/int32/int8/bool/float32/float16;fp8 落到 `default:` throw。
-- **导出器** `llm/exporter/qwen3_export_onnx.py:155-183`:
+- **导出器** `llm/exporter/export/qwen3_export_onnx.py:155-183`:
   - `present_kv = torch.stack([k_new, v_new], dim=1)` —— cache 是 fp16。
   - cache shape `(B, 2, NKV, kv_len, HD)`,dim 1 = {K, V}。
 - **转换器** `model/pypi/onnx2vkop/dag.py`: ONNX dtype 17/19 → "float8e4m3fn"/"float8e5m2"。
@@ -74,7 +74,7 @@ graph dtype 走。但 runtime 输出现在按 `precision_` (fp16/fp32) 二选一
 
 ### 步骤 2:KVCache 参数化存储类型
 
-**文件**: `llm/exporter/kv_cache.hpp`
+**文件**: `llm/exporter/driver/kv_cache.hpp`
 
 构造函数加 `ElemKind cache_kind = ElemKind::kFloat16` 参数:
 - fp16: `as_tensor<uint16_t>`, `kv_elems = 2*nkv*max_kv*hd`。
@@ -85,7 +85,7 @@ graph dtype 走。但 runtime 输出现在按 `precision_` (fp16/fp32) 二选一
 
 ### 步骤 3:LLM 驱动读 cache dtype
 
-**文件**: `llm/exporter/llm_chat.cpp`
+**文件**: `llm/exporter/driver/llm_chat.cpp`
 
 `infer_model_arch` 从 `past_key_values_0` 的 elem_kind() 读 cache dtype(不再假设 uint16)。
 KVCache 构造传入该 dtype。
@@ -118,7 +118,7 @@ cache 方案里,Concat 仍作用于 fp16(past 反量化后 + 新 K/V),不是 fp8
 
 ### 步骤 6:导出器插 Quant/Dequant
 
-**文件**: `llm/exporter/qwen3_export_onnx.py` 加 `--kv-fp8` 分支
+**文件**: `llm/exporter/export/qwen3_export_onnx.py` 加 `--kv-fp8` 分支
 
 在 `decoder_layer` 里:
 - 读 past: `past_kv (fp8) → DequantLinear → fp16 past_k/past_v`。
@@ -154,7 +154,7 @@ past_key_values 输入 dtype 改 float8e4m3fn。
 
 ### 端到端验证  ⏳ 待用户执行
 
-- `VKOP_KV_FP8=1 python3 qwen3_export_onnx.py` 导出 fp8 KV cache 版 llm.onnx。
+- `VKOP_KV_FP8=1 python3 export/qwen3_export_onnx.py` 导出 fp8 KV cache 版 llm.onnx。
 - onnx2vkop 转换(用户手动,VSCode 在 3.4GB 转换时崩溃)。
 - ORT 逐轮比对:6/6 decode rounds MATCH。
 - NANSCAN:无 NaN/Inf。

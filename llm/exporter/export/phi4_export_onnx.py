@@ -29,9 +29,9 @@
 position_ids < 4096 的场景；超过 4096 需要重导出（改走 long_factor）。
 
 用法:
-  python3 phi4_export_onnx.py                      # 默认导出到 llm/exporter/text_phi4/
+  python3 export/phi4_export_onnx.py                      # 默认导出到 llm/exporter/text_phi4/
   MODEL_PATH=/path/to/Phi-4-mini-instruct EXPORT_PATH=llm.onnx \
-    python3 phi4_export_onnx.py
+    python3 export/phi4_export_onnx.py
 """
 
 import os
@@ -43,7 +43,7 @@ MODEL_PATH = os.environ.get("MODEL_PATH") or os.path.join(
     "LLM-Research--Phi-4-mini-instruct/snapshots/master")
 
 # 产物目录：与 Qwen 的 text_qwen3/ 平级，避免两套模型的 llm.onnx 互相覆盖
-_DEFAULT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "text_phi4")
+_DEFAULT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "text_phi4")
 EXPORT_PATH = os.environ.get("EXPORT_PATH") or os.path.join(_DEFAULT_DIR, "llm.onnx")
 WEIGHTS_BIN = os.path.basename(EXPORT_PATH).replace(".onnx", ".weights.bin")
 
@@ -312,5 +312,5 @@ assert locs == {WEIGHTS_BIN}, f"unexpected external locations: {locs}"
 print(f"\ndone. {EXPORT_PATH} ({os.path.getsize(EXPORT_PATH)/1e6:.1f} MB)")
 print("下一步：导出 embed_tokens 权重表")
 print("  MODEL_PATH=", MODEL_PATH)
-print("  python3 llm/exporter/dump_embed_tokens_phi4.py "
+print("  python3 llm/exporter/export/dump_embed_tokens_phi4.py "
       f"{os.path.join(out_dir, 'embed_tokens.bin')}")

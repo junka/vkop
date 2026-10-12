@@ -2,7 +2,7 @@
 """Dump HF-preprocessed pixel_values + ORT visual.onnx outputs as ground truth
 for visual_probe's --ref-pv / --ref-out diff.
 
-Replaces dump_visual_ref.py, which dies on `Qwen3VLVideoProcessor requires the
+Replaces export/dump_visual_ref.py, which dies on `Qwen3VLVideoProcessor requires the
 Torchvision library` (AutoProcessor pulls the video processor). AutoImageProcessor
 alone needs no torchvision.
 """
@@ -12,7 +12,7 @@ import onnxruntime as ort
 from PIL import Image
 from transformers import AutoImageProcessor
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 VISUAL_ONNX = os.path.join(_PKG_DIR, "visual.onnx")
 MODEL = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 NAMES = ["image_features", "deepstack_features_0", "deepstack_features_1",

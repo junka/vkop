@@ -10,8 +10,8 @@
 //
 // Reuses:
 //   - llm/tokenizer   (BBPE encode/decode + chat template)
-//   - llm/exporter/conversation.hpp (多轮上下文：token 级历史 + 整段重 prefill)
-//   - llm/exporter/kv_cache.hpp     (KV 预分配 / 每轮 reset / present→past)
+//   - llm/exporter/driver/conversation.hpp (多轮上下文：token 级历史 + 整段重 prefill)
+//   - llm/exporter/driver/kv_cache.hpp     (KV 预分配 / 每轮 reset / present→past)
 //   - llm.vkopbin     (LLM graph, KV-cache as explicit I/O)
 //   - embed_tokens.bin (standalone [vocab, hidden] fp16 embedding table,
 //     exported by qwen3vl_export_onnx.py 或 qwen3_export_onnx.py)

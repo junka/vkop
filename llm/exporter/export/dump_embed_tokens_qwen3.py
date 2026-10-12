@@ -9,9 +9,9 @@ generate loop (llm_chat) 需要这张 [vocab, hidden] fp16 表做 token_id→emb
 和 llm_chat.cpp 配合：它从 embed_tokens.bin 文件大小反推 hidden 和 vocab。
 
 用法:
-    python3 dump_embed_tokens_qwen3.py                    # 默认 Qwen3-8B
+    python3 export/dump_embed_tokens_qwen3.py                    # 默认 Qwen3-8B
     MODEL_PATH=Qwen/Qwen3-4B-Instruct \
-    python3 dump_embed_tokens_qwen3.py ./embed_tokens.bin
+    python3 export/dump_embed_tokens_qwen3.py ./embed_tokens.bin
 """
 import os
 import sys
@@ -20,7 +20,7 @@ import torch
 DEFAULT_PATH = "Qwen/Qwen3-8B-Instruct"
 MODEL_PATH = os.environ.get("MODEL_PATH") or DEFAULT_PATH
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-    os.path.dirname(__file__), "embed_tokens.bin")
+    os.path.dirname(os.path.dirname(__file__)), "embed_tokens.bin")
 
 print(f"[load] model = {MODEL_PATH}")
 

@@ -1,28 +1,27 @@
-"""导出纯文本 Qwen3 系列 (Qwen3ForCausalLM) 的 LLM 到 ONNX。
+"""导出纯文本 Qwen2.5 系列 (Qwen2ForCausalLM) 的 LLM 到 ONNX。
 
-与 qwen3vl_export_onnx.py (Qwen3-VL 多模态) 的区别：
-  · 无视觉塔，只导出一个 llm.onnx（纯 decoder-only LM）
-  · 无 deepstack 注入 / image_pad_mask / visual.onnx
-  · position_ids 用标准 2D RoPE (B, q)，不是 3D MRoPE (3, B, q)
-  · attention_bias 只有 causal mask（加法 bias）
+qwen3_export_onnx.py 的 Qwen2 版本。区别:
+  · Qwen2 没有 q_norm / k_norm (Qwen3 有),attention 更简单
+  · Qwen2ForCausalLM 而非 Qwen3ForCausalLM
+  · RoPE 仍是标准 2D (B, q),与 Qwen3 文本一致
 
-支持的模型（从 ModelScope / HuggingFace 路径加载均可）：
-  · Qwen/Qwen3-4B-Instruct
-  · Qwen/Qwen3-8B-Instruct
-  · Qwen/Qwen3-32B-Instruct
+支持模型 (从 ModelScope / HuggingFace 路径加载):
+  · Qwen/Qwen2.5-0.5B-Instruct   (896 hidden, 24 layers, 14 heads, 2 kv heads)
+  · Qwen/Qwen2.5-1.5B-Instruct
+  · Qwen/Qwen2.5-7B-Instruct
 
-I/O 契约（llm.onnx）：
-  入：inputs_embeds      (B, q, HIDDEN)   fp16
+I/O 契约 (llm.onnx):
+  入: inputs_embeds      (B, q, HIDDEN)   fp16
       position_ids       (B, q)          int64
-      attention_bias     (B, 1, q, kv)   fp16      # 加法 bias，仅 causal
+      attention_bias     (B, 1, q, kv)   fp16      # 加法 bias,仅 causal
       past_key_values_{0..NLAYERS-1}    (B, 2, NKV, kv, HD)   fp16
-  出：logits             (B, q, VOCAB)   fp16
+  出: logits             (B, q, VOCAB)   fp16
       present_key_values_{0..NLAYERS-1} (B, 2, NKV, kv, HD)   fp16
 
 用法:
-  python3 qwen3_export_onnx.py                 # 默认导出 Qwen3-8B
-  MODEL_PATH=~/.cache/modelscope/hub/models/Qwen/Qwen3-4B-Instruct \
-    python3 qwen3_export_onnx.py               # 指定模型路径
+  python3 export/qwen2_export_onnx.py                 # 默认 Qwen2.5-0.5B
+  MODEL_PATH=... python3 export/qwen2_export_onnx.py  # 指定模型
+  VKOP_KV_FP8=1 python3 export/qwen2_export_onnx.py   # fp8 KV cache (同 qwen3)
 """
 
 import os
@@ -30,87 +29,52 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------------------------------------------------------------------------
-# 模型路径：环境变量 MODEL_PATH 优先，否则尝试 ModelScope / HF 常见位置
-# ---------------------------------------------------------------------------
-DEFAULT_PATH = "Qwen/Qwen3-4B-Instruct-2507"
-
+DEFAULT_PATH = "Qwen/Qwen2.5-0.5B-Instruct"
 MODEL_PATH = os.environ.get("MODEL_PATH") or DEFAULT_PATH
-
 print(f"[load] model = {MODEL_PATH}")
 
-# 根据模型类名选择对应的 Qwen3 文本模型（自动适配 HF transformers 版本）
-# Qwen3ForCausalLM 在 transformers.models.qwen3.modeling_qwen3
-# 它的 rotary_emb 实现是标准 RoPE（2D position_ids）
-try:
-    from transformers import Qwen3ForCausalLM
-    from transformers.models.qwen3.modeling_qwen3 import (
-        apply_rotary_pos_emb,
-        repeat_kv,
-    )
-except ImportError:
-    # 兼容 transformers < 某个版本的 fallback 路径（部分版本用 qwen2.5 路径）
-    from transformers import AutoModelForCausalLM
-    Qwen3ForCausalLM = None
-    print("[warn] Qwen3ForCausalLM not found, falling back to AutoModelForCausalLM")
+from transformers import Qwen2ForCausalLM
+from transformers.models.qwen2.modeling_qwen2 import (
+    apply_rotary_pos_emb,
+    repeat_kv,
+)
 
 OPSET = 17
 
-# ---------------------------------------------------------------------------
-# 加载模型（fp16，eager attention —— 绕开 FlashAttention / SDPA 等不可 trace 实现）
-# ---------------------------------------------------------------------------
-if Qwen3ForCausalLM is not None:
-    model = Qwen3ForCausalLM.from_pretrained(
-        MODEL_PATH,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
-        local_files_only=os.path.isdir(os.path.expanduser(MODEL_PATH)),
-    )
-else:
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL_PATH,
-        attn_implementation="eager",
-        torch_dtype=torch.float16,
-        trust_remote_code=True,
-        local_files_only=os.path.isdir(os.path.expanduser(MODEL_PATH)),
-    )
+model = Qwen2ForCausalLM.from_pretrained(
+    MODEL_PATH,
+    attn_implementation="eager",
+    torch_dtype=torch.float16,
+    local_files_only=os.path.isdir(os.path.expanduser(MODEL_PATH)),
+)
 model.eval()
 
-# ---------------------------------------------------------------------------
-# 从 config 读取架构参数 —— 全部动态，不硬编码
-# ---------------------------------------------------------------------------
 config = model.config
-NLAYERS = config.num_hidden_layers          # e.g. 32 (8B), 36 (4B), 28 (2B)
-HIDDEN = config.hidden_size                 # e.g. 4096 (8B), 2560 (4B)
-NUM_HEADS = config.num_attention_heads      # e.g. 32 (8B), 20 (4B)
-NUM_KV_HEADS = config.num_key_value_heads   # e.g. 8 (8B), 10 (4B)
-HEAD_DIM = config.head_dim or HIDDEN // NUM_HEADS
+NLAYERS = config.num_hidden_layers
+HIDDEN = config.hidden_size
+NUM_HEADS = config.num_attention_heads
+NUM_KV_HEADS = config.num_key_value_heads
+# Qwen2Config has no head_dim field (Qwen3 does); derive from hidden/heads.
+HEAD_DIM = getattr(config, "head_dim", None) or HIDDEN // NUM_HEADS
 NUM_KV_GROUPS = NUM_HEADS // NUM_KV_HEADS
 VOCAB = config.vocab_size
-# scaling: 从第一层 attention 读，对齐 HF 实际值
 SCALING = model.model.layers[0].self_attn.scaling
 
 print(f"[config] layers={NLAYERS} hidden={HIDDEN} heads={NUM_HEADS} "
       f"kv_heads={NUM_KV_HEADS} head_dim={HEAD_DIM} scaling={SCALING:.6f} "
       f"vocab={VOCAB}")
 
-lm = model.model  # Qwen3Model
+lm = model.model
 embed_tokens = lm.embed_tokens
 layers = lm.layers
 norm = lm.norm
 rotary_emb = lm.rotary_emb
 lm_head = model.lm_head
 
-# ---------------------------------------------------------------------------
-# 自定义 Qwen3 LLM ONNX wrapper —— 复用 HF 层权重，手写 forward 层循环
-# 绕开 HF 内部不可 trace 的部分：
-#   · Cache 对象（past_key_values 动态 list append）
-#   · create_causal_mask（内部 torch.diff，opset17 不支持）
-# 把 KV cache 和 attention mask 暴露为显式张量 I/O
-# ---------------------------------------------------------------------------
-class Qwen3LLMOnnx(nn.Module):
-    """纯 decoder-only wrapper，每层手写 Q/K/V proj + q/k_norm + RoPE +
-    GQA + attention + MLP；KV 显式传递。"""
+
+class Qwen2LLMOnnx(nn.Module):
+    """纯 decoder-only wrapper,每层手写 Q/K/V proj + RoPE + GQA + attention + MLP;
+    KV 显式传递。Qwen2 无 q_norm/k_norm。"""
 
     def __init__(self):
         super().__init__()
@@ -119,7 +83,6 @@ class Qwen3LLMOnnx(nn.Module):
         self.norm = norm
         self.rotary_emb = rotary_emb
         self.lm_head = lm_head
-
         self.num_heads = NUM_HEADS
         self.num_kv_heads = NUM_KV_HEADS
         self.num_kv_groups = NUM_KV_GROUPS
@@ -128,41 +91,29 @@ class Qwen3LLMOnnx(nn.Module):
         self.scaling = SCALING
 
     def decoder_layer(self, layer, hidden, cos, sin, attention_bias, past_kv):
-        """单层前向。返回 (hidden, present_kv)。"""
         B, q_len, _ = hidden.shape
         residual = hidden
         h = layer.input_layernorm(hidden)
 
         attn = layer.self_attn
-        # HF 顺序（严格对齐 modeling_qwen3.py 的实现）：
-        #   q = q_norm(q_proj(h).view(B,q,heads,hd)).transpose(1,2)
-        #   k = k_norm(k_proj(h).view(B,q,nkv,hd)).transpose(1,2)
-        #   v = v_proj(h).view(B,q,nkv,hd).transpose(1,2)       # v 无 norm
+        # Qwen2: no q_norm/k_norm (unlike Qwen3).
         hidden_shape = (B, q_len, self.num_heads, self.head_dim)
-        q = attn.q_proj(h).view(hidden_shape)
-        q = attn.q_norm(q)
-        q = q.transpose(1, 2)
+        q = attn.q_proj(h).view(hidden_shape).transpose(1, 2)
 
         kv_shape = (B, q_len, self.num_kv_heads, self.head_dim)
-        k = attn.k_norm(attn.k_proj(h).view(kv_shape))
-        k = k.transpose(1, 2)
+        k = attn.k_proj(h).view(kv_shape).transpose(1, 2)
         v = attn.v_proj(h).view(kv_shape).transpose(1, 2)
 
-        # RoPE: cos/sin 形状 (B, q, head_dim)；apply_rotary_pos_emb 内部
-        # 会 unsqueeze(1) 广播到 q/k 的 (B, heads, q, hd)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
-        # concat past KV: past_kv (B,2,nkv,past,hd)
         past_k = past_kv[:, 0]
         past_v = past_kv[:, 1]
         k_new = torch.cat([past_k, k], dim=2)
         v_new = torch.cat([past_v, v], dim=2)
 
-        # GQA repeat
         k_r = repeat_kv(k_new, self.num_kv_groups)
         v_r = repeat_kv(v_new, self.num_kv_groups)
 
-        # attention（手写，纯标准 ONNX op）
         attn_w = torch.matmul(q, k_r.transpose(2, 3)) * self.scaling
         attn_w = attn_w + attention_bias
         attn_w = F.softmax(attn_w, dim=-1, dtype=torch.float32).to(q.dtype)
@@ -172,7 +123,6 @@ class Qwen3LLMOnnx(nn.Module):
 
         hidden = residual + out
 
-        # MLP (gate/up/down)
         residual = hidden
         h = layer.post_attention_layernorm(hidden)
         mlp = layer.mlp
@@ -183,7 +133,6 @@ class Qwen3LLMOnnx(nn.Module):
         return hidden, present_kv
 
     def forward(self, inputs_embeds, position_ids, attention_bias, *past_kvs):
-        # 复用 HF rotary_emb —— 输入 position_ids (B, q) 得到 cos/sin (B, q, hd)
         hidden = inputs_embeds
         cos, sin = self.rotary_emb(hidden, position_ids)
 
@@ -198,36 +147,27 @@ class Qwen3LLMOnnx(nn.Module):
         return (logits, *presents)
 
 
-wrapper = Qwen3LLMOnnx()
+wrapper = Qwen2LLMOnnx()
 wrapper.eval()
 
-# ---------------------------------------------------------------------------
-# 构造 prefill dummy inputs（纯文本，无视觉相关 I/O）
-# ---------------------------------------------------------------------------
 B = 1
-L = 32          # prefill 序列长度（随便，只要 < 模型训练长度）
+L = 32
 q_len = L
-kv_len = L      # prefill 时 kv_len = q_len，无 past
+kv_len = L
 
 inputs_embeds = torch.randn(B, q_len, HIDDEN, dtype=torch.float16)
 position_ids = torch.arange(L, dtype=torch.long).unsqueeze(0).expand(B, -1)
-# causal mask: 上三角 = finfo(float16).min (-65504)，与 HF create_causal_mask 一致
-# 不用 -inf：fp16 softmax 需要微小区分度
 causal = torch.triu(
     torch.full((q_len, kv_len), torch.finfo(torch.float16).min, dtype=torch.float16),
     diagonal=1)
-attention_bias = causal.unsqueeze(0).unsqueeze(0)  # (1, 1, q, kv)
+attention_bias = causal.unsqueeze(0).unsqueeze(0)
 
-# past_key_values: NLAYERS 个空张量 (B, 2, NKV, 0, HD)
 past_kvs = tuple(
     torch.zeros(B, 2, NUM_KV_HEADS, 0, HEAD_DIM, dtype=torch.float16)
     for _ in range(NLAYERS))
 
 inputs = (inputs_embeds, position_ids, attention_bias, *past_kvs)
 
-# ---------------------------------------------------------------------------
-# ONNX 导出
-# ---------------------------------------------------------------------------
 input_names = ["inputs_embeds", "position_ids", "attention_bias"]
 input_names += [f"past_key_values_{i}" for i in range(NLAYERS)]
 output_names = ["logits"] + [f"present_key_values_{i}" for i in range(NLAYERS)]
@@ -242,7 +182,7 @@ for i in range(NLAYERS):
     dynamic_axes[f"past_key_values_{i}"] = {0: "batch", 3: "kv_len"}
     dynamic_axes[f"present_key_values_{i}"] = {0: "batch", 3: "kv_len"}
 
-print(f"[export] Qwen3-onnx: {NLAYERS} layers, {len(input_names)} inputs / "
+print(f"[export] Qwen2-onnx: {NLAYERS} layers, {len(input_names)} inputs / "
       f"{len(output_names)} outputs, opset={OPSET} ...")
 
 EXPORT_PATH = os.environ.get("EXPORT_PATH", "llm.onnx")
@@ -255,43 +195,18 @@ with torch.no_grad():
         dynamic_axes=dynamic_axes,
         opset_version=OPSET,
         do_constant_folding=True,
-        dynamo=False,  # legacy TorchScript 导出器；dynamo 对 RoPE 的数据依赖
-                        # cos/sin 可能 trigger GuardOnDataDependentSymNode
+        dynamo=False,
     )
-print(f"[✓] exported → {EXPORT_PATH}")
+print(f"[ok] exported -> {EXPORT_PATH}")
 
-# ---------------------------------------------------------------------------
-# 合并散权重（如果 >2GB 触发 torch external-data）
-# ---------------------------------------------------------------------------
 import onnx
 from onnx import helper, TensorProto
 
 print("[consolidate] checking external data ...")
 m = onnx.load(EXPORT_PATH, load_external_data=True)
 
-# ---------------------------------------------------------------------------
-# 可选：FP8 KV cache。VKOP_KV_FP8=1 时把每层 past/present_key_values 的存储
-# 从 fp16 改成 E4M3 fp8（1B/elem，显存减半）。attention 仍走 fp16 —— 在 cache
-# 边界插 QuantizeLinear(fp16->fp8)/DequantizeLinear(fp8->fp16)。
-# scale 是 per-tensor 常量，由 VKOP_KV_SCALE 指定（默认 0.1，覆盖 Qwen3 K/V
-# 经 RMSNorm 后的典型值域；超出 ±448 会被 saturate）。
-# ---------------------------------------------------------------------------
+
 def insert_fp8_kv_cache(model, scale=0.1):
-    """Rewrite the KV cache I/O to fp8.
-
-    For each layer i:
-      - present side: the node that produces present_key_values_i now feeds a
-        new QuantizeLinear node whose fp8 output is the graph output (renamed
-        in place); the graph output keeps the name present_key_values_i but
-        its dtype becomes float8e4m3fn.
-      - past side: a new DequantizeLinear node sits between the past_key_values_i
-        graph input (now fp8) and every original consumer, turning the fp8 bytes
-        back into fp16 for the attention Concat.
-
-    The past/present graph I/O dtype is recorded by the converter from the
-    ValueInfoProto we set here; the runtime reads that string and creates an
-    int8_t container for the fp8 bytes.
-    """
     g = model.graph
     nlayers = 0
     while any(o.name == f"present_key_values_{nlayers}" for o in g.output):
@@ -299,20 +214,13 @@ def insert_fp8_kv_cache(model, scale=0.1):
     if nlayers == 0:
         print("[kv-fp8] no present_key_values_* outputs found, skipping")
         return
-
     fp8_dt = TensorProto.FLOAT8E4M3FN
-    # One per-tensor scale initializer, reused by every layer (same scale for
-    # K and V; a single fp32 scalar).
     scale_name = "kv_cache_fp8_scale"
     scale_init = helper.make_tensor(scale_name, TensorProto.FLOAT, [], [scale])
     g.initializer.append(scale_init)
-
     for i in range(nlayers):
         past_name = f"past_key_values_{i}"
         pres_name = f"present_key_values_{i}"
-
-        # ---- past side: fp8 input -> DequantizeLinear -> fp16 ------------
-        # Find the graph input's ValueInfo and change its dtype to fp8.
         past_shape = None
         for vi in list(g.input):
             if vi.name == past_name:
@@ -322,17 +230,17 @@ def insert_fp8_kv_cache(model, scale=0.1):
                 ]
                 vi.type.tensor_type.elem_type = fp8_dt
                 break
-        # The fp16 tensor the original consumers expect to see.
         past_fp16 = f"{past_name}_fp16"
-        # Declare it as FLOAT16. Without a value_info entry, ONNX shape
-        # inference types the DequantizeLinear output as float32 (DQ's default
-        # with no output_dtype attribute) and propagates fp32 down the entire
-        # K/V concat chain. The runtime then builds those Concat/Gather/Expand
-        # tensors with fp32 containers, and the fp32 word-mover shaders
-        # reinterpret the fp16 (and fp8) bytes as 32-bit words -- garbage K/V
-        # and NaN attention. Forcing the bridge to fp16 makes shape inference
-        # propagate fp16 to every consumer. The sibling present_*_fp16 needs no
-        # entry: it is the K/V concat output, whose inputs are now fp16.
+        # Declare the DQ output as FLOAT16. Without a value_info entry, ONNX
+        # shape-inference types the DequantizeLinear output as float32 (DQ's
+        # default when no output_dtype attribute is present) and propagates
+        # fp32 down the entire K/V concat chain. The runtime then builds those
+        # Concat/Gather/Expand tensors with fp32 containers, and the fp32
+        # word-mover shaders reinterpret the fp16 (and fp8) bytes as 32-bit
+        # words -- garbage K/V and NaN attention. Forcing the bridge to fp16
+        # makes shape-inference propagate fp16 to every consumer. The sibling
+        # present_*_fp16 needs no entry: it is the K/V concat output, whose
+        # inputs are now correctly fp16.
         g.value_info.append(helper.make_tensor_value_info(
             past_fp16, TensorProto.FLOAT16, past_shape))
         # Rewire consumers BEFORE appending the DQ node: iterating a protobuf
@@ -350,13 +258,7 @@ def insert_fp8_kv_cache(model, scale=0.1):
             name=f"DequantizeLinear_kv_{i}",
         )
         g.node.append(dq)
-
-        # ---- present side: fp16 producer -> QuantizeLinear -> fp8 output --
-        # The node that currently outputs present_key_values_i is renamed to
-        # feed an intermediate; a QuantizeLinear turns that into fp8 bytes,
-        # which become the graph output under the same name.
         pres_fp16 = f"{pres_name}_fp16"
-        # Rename the producer's output.
         for node in g.node:
             for k in range(len(node.output)):
                 if node.output[k] == pres_name:
@@ -368,14 +270,13 @@ def insert_fp8_kv_cache(model, scale=0.1):
             name=f"QuantizeLinear_kv_{i}",
         )
         g.node.append(q)
-        # Change the graph output's dtype to fp8.
         for o in g.output:
             if o.name == pres_name:
                 o.type.tensor_type.elem_type = fp8_dt
                 break
-
     print(f"[kv-fp8] rewrote {nlayers} layer(s): past/present_key_values "
           f"now E4M3 fp8 (per-tensor scale={scale})")
+
 
 if os.environ.get("VKOP_KV_FP8") == "1":
     kv_scale = float(os.environ.get("VKOP_KV_SCALE", "0.1"))
@@ -511,29 +412,15 @@ if n_ext > 0:
         location="llm.weights.bin",
         convert_attribute=True,
     )
-    # 删除散文件
     removed = 0
     for f in os.listdir("."):
         if f.endswith(".weight") or f.startswith("onnx__MatMul_"):
             if f != "llm.weights.bin":
                 os.remove(f)
                 removed += 1
-    print(f"[✓] consolidated into llm.weights.bin, removed {removed} scattered files")
-
-    # 验证
-    m2 = onnx.load(EXPORT_PATH, load_external_data=False)
-    locs = set()
-    for t in m2.graph.initializer:
-        if t.HasField("data_location") and t.data_location == 1:
-            for kv in t.external_data:
-                if kv.key == "location":
-                    locs.add(kv.value)
-    print(f"[verify] external locations: {locs} (expect {{'llm.weights.bin'}})")
-    assert locs == {"llm.weights.bin"}, f"unexpected external locations: {locs}"
+    print(f"[ok] consolidated into llm.weights.bin, removed {removed} scattered files")
 else:
-    # 无 external data 但模型可能 >2GB protobuf 限制 —— 强制 external 保存
-    print("[consolidate] model has no external data but may exceed 2GB protobuf limit, "
-          "saving with external data ...")
+    print("[consolidate] no external data; saving with external data to be safe ...")
     onnx.save_model(
         m, EXPORT_PATH,
         save_as_external_data=True,
@@ -541,12 +428,8 @@ else:
         location="llm.weights.bin",
         convert_attribute=True,
     )
-    print("[✓] saved with external data (llm.weights.bin)")
+    print("[ok] saved with external data (llm.weights.bin)")
 
 print(f"\ndone. llm.onnx ({os.path.getsize(EXPORT_PATH)/1e6:.1f} MB)")
-
-# embed_tokens 权重表不在 llm.onnx 图里（图输入是 inputs_embeds），需要单独导出：
-#   python3 dump_embed_tokens_qwen3.py    (本脚本同目录，自动适配模型路径)
-print("\n下一步：导出 embed_tokens 权重表")
+print("\n下一步:导出 embed_tokens 权重表")
 print("  MODEL_PATH=", MODEL_PATH)
-print("  python3 llm/exporter/dump_embed_tokens_qwen3.py [embed_tokens.bin]")

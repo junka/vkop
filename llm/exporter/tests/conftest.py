@@ -8,12 +8,12 @@ import sys
 import pytest
 import torch
 
-# 让 tests/ 子目录能 import 上级 exporter 包（onnx_infer / cases）。
+# 让 tests/ 子目录能 import 上级 exporter 包（check.infer / cases）。
 _EXPORTER_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _EXPORTER_DIR not in sys.path:
     sys.path.insert(0, _EXPORTER_DIR)
 
-from infer import OnnxQwen3VL
+from check.infer import OnnxQwen3VL
 
 
 @pytest.fixture(scope="session")

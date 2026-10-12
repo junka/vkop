@@ -385,7 +385,7 @@ its **hidden_states**, not logits.
 | `onnx2vkop -q fp16` (full optimizer, no `-u`) | 105 s, peak RSS 30.7 GB, fused: RMSNorm×144, RotaryEmbedding×72, FusedElemwise×72, Softmax×36 |
 | `text_encoder.vkopbin` | 13.89 GB |
 
-Differences from the LLM export (`llm/exporter/qwen3vl_export_onnx.py`), all deliberate:
+Differences from the LLM export (`llm/exporter/export/qwen3vl_export_onnx.py`), all deliberate:
 
 1. **Output is `hidden_states`** — `lm_head` is cut and the final RMSNorm is bypassed
    structurally (the wrapper has no `norm` step). transformers 5.x binds

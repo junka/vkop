@@ -6,7 +6,7 @@ Adds every graph value_info output as a session output, runs round1's feed,
 and prints per-tensor min/max/mean/first4 stats — same format as the C++
 driver's [dump] line. Compare line-by-line to find the first diverging op.
 
-Usage: python3 dump_ort_intermediates.py <round_dir>
+Usage: python3 export/dump_ort_intermediates.py <round_dir>
 """
 import os
 import sys
@@ -14,7 +14,7 @@ import numpy as np
 import onnx
 import onnxruntime as ort
 
-_PKG_DIR = os.path.dirname(os.path.abspath(__file__))
+_PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LLM_ONNX = os.path.join(_PKG_DIR, "llm.onnx")
 
 

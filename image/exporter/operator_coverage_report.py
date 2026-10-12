@@ -13,7 +13,7 @@ from pathlib import Path
 
 import onnx
 
-# Ops the vkop runtime supports today (from llm/exporter/vkop_report.py)
+# Ops the vkop runtime supports today (from llm/exporter/check/vkop_report.py)
 SUPPORTED = {
     "Add", "Atan", "AveragePool", "BatchNormalization", "BatchNorm", "Col2Im",
     "Concat", "Conv", "Conv2d", "Div", "EmbeddingForward", "Erf", "Floor",
