@@ -383,8 +383,29 @@ class ConcatBuffer : public BufferFactory {
         // loop + copyToGPU = N+1 sync stalls, ~1940ms/round — the #1 decode
         // bottleneck after Shape/Gather were GPU-ified). The GPU dispatch
         // records into the level command buffer with no stall.
+        //
+        // host_shape mode routes small int64 concats to the CPU path because
+        // for host-authoritative inputs (shape vectors filled at load time)
+        // copyToCPU is a no-op and a host strided copy beats a GPU dispatch.
+        // But that only holds when EVERY input is host-authoritative: a
+        // non-authoritative input (e.g. a GPU-resident Expand output feeding
+        // the rotary position_ids Concat) forces a real GPU->CPU readback per
+        // input (~1.3ms submit+wait each), so a 3-input Concat costs ~3.9ms
+        // vs ~0.3ms on the GPU shader. Gate the CPU path to all-inputs-
+        // authoritative; otherwise fall through to the GPU shader which needs
+        // no readback. ( rotary_emb/Concat_1 and /Concat_3 — the MRoPE
+        // position_ids assembly — are the case that motivated this: their
+        // Unsqueeze inputs alias GPU Expand outputs, so they are NOT
+        // host-authoritative and must take the GPU path. )
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            if (host_shape_enabled()) {
+            bool all_host_auth = true;
+            for (const auto &in : inputs) {
+                if (!in->get_host_authoritative()) {
+                    all_host_auth = false;
+                    break;
+                }
+            }
+            if (host_shape_enabled() && all_host_auth) {
                 cpuConcatInt64(inputs, outputs, out_shape);
                 return;
             }
