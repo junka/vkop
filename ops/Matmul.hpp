@@ -122,6 +122,24 @@ struct alignas(16) GpuMatMulParam {
     int a_dim = 0;
     // B's dim on the grouped axis. 0 when rep <= 1.
     int b_dim = 0;
+    // Attention QK^T epilogue: the converter folds `MatMul * epi_scale +
+    // epi_bias[col]` (the per-layer 1/sqrt(head_dim) scale and the causal
+    // attention_bias) into the MatMul so the FusedElemwise dispatch disappears.
+    // epi_bias=1 means a bias tensor is bound at binding 6 (broadcast over the
+    // M and head axes — shape [B,1,q,kv] or narrower); epi_scale multiplies
+    // every output element before the bias add. Both default off so every
+    // non-attention MatMul is untouched. Buffer path only.
+    float epi_scale = 1.0f;
+    int epi_bias = 0;
+    // The bias tensor's flat batch count (== total batch / head-broadcast
+    // ratio). 0 when epi_bias is off.
+    int epi_bias_batch = 0;
+    // Plan B: fuse the trailing Softmax into this MatMul. When set, the kernel
+    // reduces each output row across all N columns (online max→sum→normalize)
+    // and stores exp(x-max)/sum, so the fp16 2-dispatch Softmax vanishes. Host
+    // only raises this on attention QK^T (small M, even N, single-consumer).
+    // Buffer path only; requires the softmax workgroup to cover a full row.
+    int attn_softmax = 0;
 };
 
 } // namespace matmul
@@ -230,7 +248,8 @@ class MatMulBuffer : public BufferFactory {
               std::vector<VkDescriptorType>{
                   DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                   DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                  DESCRIPTOR_TYPE_STORAGE},
               sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
     }
@@ -258,7 +277,7 @@ class MatMulBuffer : public BufferFactory {
             // word straddles two rows (element 2w+1 of word w is the next row's
             // col 0), and in-shader (col, col+1) packing would zero-fill the
             // straddling half and clobber the next row's first element. The
-            // pipeline's descriptor set declares 6 bindings to match the
+            // pipeline's descriptor set declares 7 bindings to match the
             // quantized-weight layouts: only 0-3 are read, 4-5 are
             // bound-but-unused (filled from the same objs_ vector as every
             // other MatMul pipeline).
@@ -292,7 +311,8 @@ class MatMulBuffer : public BufferFactory {
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), spv, spv_len, use_uab, 0);
             for (auto &ds : coop_ds_) {
                 ds = coop_pipeline_->allocDescriptorSets();
@@ -313,7 +333,8 @@ class MatMulBuffer : public BufferFactory {
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_coop_i8_spv),
                 static_cast<int>(buffer_matmul_coop_i8_spv_len), use_uab, 0);
@@ -335,7 +356,8 @@ class MatMulBuffer : public BufferFactory {
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
                 sizeof(MatMulPackPC),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
                 static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0);
@@ -349,6 +371,15 @@ class MatMulBuffer : public BufferFactory {
                           &attributes) override {
         if (attributes.find("transB") != attributes.end()) {
             transB_ = std::stol(attributes.at("transB")) != 0;
+        }
+        if (attributes.find("epi_scale") != attributes.end()) {
+            epi_scale_ = std::stof(attributes.at("epi_scale"));
+        }
+        if (attributes.find("epi_bias") != attributes.end()) {
+            epi_bias_ = std::stol(attributes.at("epi_bias")) != 0;
+        }
+        if (attributes.find("attn_softmax") != attributes.end()) {
+            attn_softmax_ = std::stol(attributes.at("attn_softmax")) != 0;
         }
     }
 
@@ -411,7 +442,8 @@ class MatMulBuffer : public BufferFactory {
                                          : weight_fp8   ? "fp8"
                                          : weight_nvfp4 ? "nvfp4"
                                          : weight_uint4 ? "uint4"
-                                                        : "4-bit";
+                                         : weight_4bit  ? "4-bit"
+                                                        : "fp16";
         size_t scale_index = 0;
         size_t global_index = 0;
         if (weight_byte || weight_4bit) {
@@ -692,22 +724,32 @@ class MatMulBuffer : public BufferFactory {
             const char *v = std::getenv("VKOP_NO_COOP");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
-                             !coop_disabled && rep == 1 &&
-                             m_dev_->is_support_cooperate_matrix() &&
-                             coop_pipeline_ != nullptr &&
-                             // The 16x16x16 variant (coop_bm_ == 32, NVIDIA)
-                             // has a 32-row workgroup M footprint. At decode
-                             // M=1 that is 1/32 utilization -- the MMA does 256
-                             // output elements of which 1 row is live -- and
-                             // the ksplit GEMV path beats it ~4x (measured:
-                             // coop16 MatMul 42-78ms vs tiled/GEMV 11.9ms for
-                             // 254 calls on RTX 4000 Ada). Gate the large tile
-                             // to M >= 8 so decode GEMVs fall through to
-                             // ksplit. The 8x8x16 ARL path (coop_bm_ == 16)
-                             // keeps the old behavior: it is ARL's only fast
-                             // path and was never regressed by small M.
-                             (coop_bm_ < 32 || m >= 8);
+        const bool coopmat =
+            fp16_ != 0 && !weight_byte && !weight_4bit && !coop_disabled &&
+            rep == 1 && m_dev_->is_support_cooperate_matrix() &&
+            coop_pipeline_ != nullptr &&
+            // The coopmat shaders (matmul_coop*.comp) do NOT implement the
+            // attention QK^T epilogue (epi_scale/epi_bias at binding 6); only
+            // the buffer matmul.comp kernels do. A MatMul with epi_bias_ set
+            // MUST take the buffer-shader path or the epilogue is silently
+            // dropped AND binding 6 has no slot in the coopmat descriptor
+            // layout, which the Intel driver faults on. So epi_bias excludes
+            // coopmat unconditionally.
+            !epi_bias_ &&
+            // coopmat is a tiled MMA: it wins at prefill (M>1) and loses to the
+            // ksplit GEMV at decode (M=1). NVIDIA's 16x16x16 variant
+            // (coop_bm_ == 32) has a 32-row workgroup M, so M=1 is 1/32
+            // utilization; gate it to m >= 8. ARL's 8x8x16 (coop_bm_ == 16)
+            // used to take M=1 too (the old comment claimed it "was never
+            // regressed by small M"), but a paired A/B (Qwen3-VL-2B decode, 8
+            // pairs, min-scored) shows ksplit + the per-N WIDE heuristic beats
+            // ARL coopmat ~2x at M=1 (126-160ms vs 63-72ms/round). So ARL
+            // decode M=1 now also falls through to ksplit. ksplit is
+            // GEMV-shaped and catastrophically slow at prefill (1510ms vs
+            // coopmat 253ms for 254 calls), so the gate cuts both ways: keep
+            // coopmat for the M>1 prefill regime, route decode M=1 (batch*m <=
+            // 8, the ksplit gate) to ksplit + per-N WIDE.
+            (coop_bm_ < 32 ? (batch * m > 8) : (m >= 8));
         // W8A8 sibling of the path above: an int8 weight with an int8
         // activation the kernel quantizes itself (per output row), accumulated
         // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
@@ -741,6 +783,14 @@ class MatMulBuffer : public BufferFactory {
         // small batch*m, long-K regime.
         const bool ksplit = fused_fp16 && !transB_ && (n % 4 == 0) &&
                             (k % 2 == 0) && (batch * m <= 8) && (k >= 256);
+        if (ksplit && std::getenv("VKOP_KSPLIT_DUMP")) {
+            std::fprintf(stderr,
+                         "[ksplit] %-22s m=%d n=%d k=%d batch=%d rep=%d "
+                         "weight=%s w4=%d wbyte=%d\n",
+                         get_name().c_str(), m, n, k, batch, rep,
+                         weight_label.c_str(), (int)weight_4bit,
+                         (int)weight_byte);
+        }
         // With B as [batch, K, N] (transB == 0, what an ONNX MatMul weight is)
         // the four columns of one K row are four adjacent weight BYTES, so one
         // 32-bit load feeds four output columns. That needs N % 4 == 0 to keep
@@ -768,7 +818,7 @@ class MatMulBuffer : public BufferFactory {
         // quantizer emits) and n % 4 == 0. 4-bit weights stay out: their scale
         // varies along K, which a per-column epilogue cannot fold.
         const bool tiled = fused_fp16 && !weight_4bit && (k % 16 == 0) &&
-                           (m >= 12) &&
+                           (m >= 12) && !epi_bias_ &&
                            (!weight_byte || (!transB_ && (n % 4 == 0)));
         // The odd-N reduce->pack fallback needs scratch; the cooperative-matrix
         // path also needs it (it writes flat fp32 results that the pack pass
@@ -821,6 +871,20 @@ class MatMulBuffer : public BufferFactory {
             objs_.emplace_back(dummy_buffer_);
         }
 
+        // binding 6: the attention-bias tensor appended to a plain 2-input
+        // MatMul by fuse_scale_bias_into_matmul (inputs[2]). The converter only
+        // folds onto a plain [A,B] MatMul, so a quantized weight (which already
+        // uses inputs[2..] for its scale table) never lands here. A dummy keeps
+        // the descriptor set fully bound for every other MatMul.
+        if (epi_bias_ && inputs.size() > 2 && inputs[2] != nullptr) {
+            dispatch_by_dtype(inputs[2]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                bind_ssbo<T>(inputs[2], /*is_output=*/false);
+            });
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+        }
+
         para_.M = m;
         para_.N = n;
         para_.K = k;
@@ -843,6 +907,46 @@ class MatMulBuffer : public BufferFactory {
         para_.rep_stride = rep_stride;
         para_.a_dim = a_dim;
         para_.b_dim = b_dim;
+        para_.epi_scale = epi_scale_;
+        para_.epi_bias = epi_bias_ ? 1 : 0;
+        // The bias is [B,1,q,kv] broadcast over the head axis, so its element
+        // count is B*M*N while the output's is batch*M*N (batch = B*heads).
+        // epi_bias_batch = B = bias_elems / (M*N); the shader divides the flat
+        // batch by this to land each output row on its bias row.
+        if (epi_bias_ && inputs.size() > 2 && inputs[2] != nullptr && m > 0 &&
+            n > 0) {
+            const size_t bias_elems =
+                inputs[2]->size() / core::elem_bytes(inputs[2]->elem_kind(), 1);
+            para_.epi_bias_batch =
+                static_cast<int>(bias_elems / (static_cast<size_t>(m) * n));
+        } else {
+            para_.epi_bias_batch = 0;
+        }
+        // Plan B: when the host decides this MatMul is an attention QK^T whose
+        // trailing Softmax can be fused, the kernel reduces each row over all N
+        // columns in one workgroup and writes normalized values. The dispatch
+        // is (batch*M, 1, 1) -- one workgroup per output row -- which only
+        // makes sense when M is small (decode q_len=1) so the grid isn't
+        // trivial and the row fits the workgroup's column coverage. Gated to
+        // fp16, even N, buffer path, no quant/ksplit/coopmat/tiled overlap,
+        // single consumer.
+        para_.attn_softmax =
+            (attn_softmax_ && fp16_ != 0 && (n & 1) == 0 && !weight_int8 &&
+             !weight_fp8 && !weight_4bit && n > 0 && n <= 32768 && k <= 1024)
+                ? 1
+                : 0;
+
+        // Plan B: fused QK^T+scale+bias+Softmax. One workgroup per output row
+        // (batch*M rows); the kernel does the K-dot, applies the epilogue, and
+        // reduces each row to exp(x-max)/sum in-place, so the standalone
+        // FusedElemwise + 2-dispatch Softmax all vanish. Must pre-empt coopmat
+        // (which writes flat fp32 to scratch + a separate pack pass and cannot
+        // do the row reduction). Gating on attn_softmax already excludes quant
+        // and odd-N; this only fires on attention QK^T decode (small M).
+        if (para_.attn_softmax) {
+            submit(&para_, batch * m, 1, 1);
+            return;
+        }
 
         // Cooperative-matrix fp16 path (Intel ARL subgroup MMA): ONE dispatch
         // reads fp16 A/B, accumulates in fp32 via coopMatMulAdd, and writes
@@ -923,41 +1027,65 @@ class MatMulBuffer : public BufferFactory {
                 if (v > 0)
                     q = v;
             }
-            // VKOP_KSPLIT_WIDE=1 picks a 16-byte-load GEMV. For an fp16 weight
-            // each lane owns eight columns (one uvec4 = 8 fp16), needs N % 8;
-            // for a byte (int8/fp8) weight each lane owns SIXTEEN columns (one
-            // uvec4 = 16 bytes), needs N % 16, and ksplit_q counts 16-column
-            // groups per block. The int8 WIDE kernel (matmul16_w8_ksplit_wide)
-            // decodes the uvec4 via unpack_w8; the fp16 WIDE kernel
-            // (matmul16_ksplit_wide) decodes via unpackHalf2x16. An earlier
-            // fp16 variant wrongly reused unpack_w8 (read fp16 bytes as int8)
-            // and produced garbage -- that is fixed, but WIDE stays env-gated:
-            // measured (Intel ARL, Qwen3-VL-2B) it cuts lm_head alone ~15%
-            // (min 21.4->18.2ms, M=1 GEMV N=151936) yet the per-round TOTAL is
-            // flat (min 198.5 vs 198.9, 12 interleaved pairs 6/6) because the
-            // smaller-N layer projections (q/k/v/o/gate/up/down, N=2048-8192)
-            // give back the gain. Net-neutral on this bandwidth-bound iGPU, so
-            // not on by default; leave the knob for devices where lm_head
-            // dominates more (or for future tuning of the per-N q heuristic).
-            static const bool wide_env = [] {
-                const char *e = std::getenv("VKOP_KSPLIT_WIDE");
-                return e != nullptr && e[0] != '\0' && e[0] != '0';
+            // fp16 WIDE split-K GEMV: each lane owns 8 columns (one uvec4
+            // 16-byte load, two vec4 accumulator chains) vs the standard
+            // 4-column/word-load ksplit. WIDE wins on BIG-N GEMVs (lm_head,
+            // N=151936: ~15% faster, measured) because halving the load count
+            // is a pure bandwidth win there. But on SMALL N it regresses:
+            // WIDE dispatches UP_DIV(n/8, q) blocks vs the standard
+            // UP_DIV(n/4, q), so to keep >= 32 blocks (the occupancy floor)
+            // WIDE has to halve q, which doubles the K-slice count and
+            // stretches the shared-mem fold stage -- at q=4 (the floor) 252 of
+            // 256 lanes sit idle during the fold. The break-even is where WIDE
+            // keeps q=16 without halving: UP_DIV(n/8, 16) >= 32 => n >= 4096.
+            // Below that the standard kernel wins; at/above it WIDE wins/ties.
+            // So fp16 WIDE auto-enables per-N at n >= wide_threshold (default
+            // 4096). The byte-quantized WIDE path (int8/fp8, 16 cols/lane) has
+            // the same economics at 1/2 the column count, so it shares the
+            // threshold. Env overrides (tuning): VKOP_KSPLIT_WIDE=1 forces WIDE
+            // on ALL eligible N; =0 disables it entirely (incl. the auto path);
+            // VKOP_KSPLIT_WIDE_N=<n> sets the auto threshold.
+            static const int wide_threshold = [] {
+                const char *e = std::getenv("VKOP_KSPLIT_WIDE_N");
+                if (e && e[0] != '\0')
+                    return std::atoi(e);
+                return 4096;
             }();
-            if (wide_env && weight_byte && (n % 16 == 0)) {
+            const int wide_env_val = [] {
+                const char *e = std::getenv("VKOP_KSPLIT_WIDE");
+                if (!e || e[0] == '\0')
+                    return 0;                  // unset: auto (per-N)
+                return (e[0] == '0') ? -1 : 1; // 0=off, else=force on
+            }();
+            const bool wide_disabled = wide_env_val < 0;
+            const bool wide_forced = wide_env_val > 0;
+            // Byte WIDE (int8/fp8): force-only -- preserves prior behaviour and
+            // its separate measured tuning; not auto-enabled per-N.
+            if (wide_forced && weight_byte && (n % 16 == 0)) {
                 while (q > 4 && UP_DIV(n / 16, q) < 32) {
                     q /= 2;
                 }
                 para_.wide = 1;
                 para_.ksplit_q = q;
+                if (std::getenv("VKOP_KSPLIT_DUMP"))
+                    std::fprintf(stderr,
+                                 "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
+                                 get_name().c_str(), 1, q, UP_DIV(n / 16, q));
                 submit(&para_, UP_DIV(n / 16, q), batch * m, 1);
                 return;
             }
-            if (wide_env && (n % 8 == 0)) {
+            // fp16 WIDE: auto per-N (n >= wide_threshold) or forced on all.
+            if (!wide_disabled && !weight_byte && (n % 8 == 0) &&
+                (wide_forced || n >= wide_threshold)) {
                 while (q > 4 && UP_DIV(n / 8, q) < 32) {
                     q /= 2;
                 }
                 para_.wide = 1;
                 para_.ksplit_q = q;
+                if (std::getenv("VKOP_KSPLIT_DUMP"))
+                    std::fprintf(stderr,
+                                 "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
+                                 get_name().c_str(), 1, q, UP_DIV(n / 8, q));
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             }
@@ -971,6 +1099,10 @@ class MatMulBuffer : public BufferFactory {
                 q /= 2;
             }
             para_.ksplit_q = q;
+            if (std::getenv("VKOP_KSPLIT_DUMP"))
+                std::fprintf(stderr,
+                             "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
+                             get_name().c_str(), 0, q, UP_DIV(n / 4, q));
             submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
             return;
         }
@@ -1052,6 +1184,14 @@ class MatMulBuffer : public BufferFactory {
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
+    // Attention QK^T epilogue (folded from a FusedElemwise by the converter):
+    // epi_scale_ multiplies every output element, epi_bias_ flags that a bias
+    // tensor is appended as inputs[2] and bound at binding 6.
+    float epi_scale_ = 1.0f;
+    bool epi_bias_ = false;
+    // Plan B: fuse the trailing Softmax into this MatMul (online softmax in the
+    // kernel). Set by the converter via the "attn_softmax" attribute.
+    bool attn_softmax_ = false;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

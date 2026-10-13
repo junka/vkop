@@ -973,6 +973,24 @@ class FusionOptimizer:
             )
         )
 
+        # Fold a FusedElemwise that is exactly (MatMul * scalar + bias) into the
+        # MatMul as an epilogue: the scalar scale and the bias tensor become a
+        # MatMul attribute (epi_scale) and an appended input (epi_bias=1). The
+        # MatMul shader applies `s = s*scale + bias[col]` at the store, so the
+        # QK^T→scale→+mask chain that every attention layer emits collapses from
+        # 2 dispatches (MatMul + FusedElemwise) into 1. Runs AFTER
+        # fuse_elemwise_chain (60) so the scale+bias chain is already a single
+        # FusedElemwise node. Pure structural fold; only the canonical 2-op
+        # MUL(MM,scalar)+ADD(bias) program matches — anything else is left alone.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_scale_bias_into_matmul",
+                FusionOptimizer.match_scale_bias_into_matmul,
+                FusionOptimizer.fold_scale_bias_into_matmul,
+                priority=59,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "prune_and_materialize",
@@ -4386,6 +4404,148 @@ class FusionOptimizer:
         for n in chain:
             if n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- Scale+bias epilogue fold into MatMul (attention QK^T * scale + mask) ----
+    # A FusedElemwise whose register program is exactly
+    #   op0: MUL(reg[MatMul_out], scalar)   -> dst0
+    #   op1: ADD(dst0, reg[bias_tensor])    -> reg0 (output)
+    # is the post-attention-MatMul scale+mask chain. Fold the scalar into a
+    # MatMul attribute `epi_scale` and the bias tensor into an appended MatMul
+    # input with attribute `epi_bias=1`; the MatMul shader applies the epilogue
+    # at the store. The FusedElemwise is then dead and removed.
+    _EPI_MUL = 3   # OP_MUL
+    _EPI_ADD = 1   # OP_ADD
+
+    @staticmethod
+    def _fe_program(fe):
+        """Decode a FusedElemwise node's `ops` attribute into a list of
+        (op_code, dst, a, b) words. Returns ([words], scalars_list)."""
+        ops = fe.attributes.get("ops", [])
+        scalars = fe.attributes.get("scalars", [])
+        words = [tuple(ops[i:i + 4]) for i in range(0, len(ops), 4)]
+        return words, scalars
+
+    @staticmethod
+    def match_scale_bias_into_matmul(dag_model):
+        matches = []
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        for fe in dag_model.nodes.values():
+            if fe.op_type != "FusedElemwise":
+                continue
+            words, scalars = FusionOptimizer._fe_program(fe)
+            if len(words) != 2:
+                continue
+            (oc0, dst0, a0, b0), (oc1, dst1, a1, b1) = words
+            if oc0 != FusionOptimizer._EPI_MUL or oc1 != FusionOptimizer._EPI_ADD:
+                continue
+            # op0: a0 = leaf register (MatMul output), b0 = scalar (>=100)
+            if a0 >= 100 or b0 < 100:
+                continue
+            if a0 >= len(fe.inputs):
+                continue
+            mm_name = fe.inputs[a0]["name"]
+            mm_node = producer.get(mm_name)
+            if mm_node is None or mm_node.op_type != "MatMul":
+                continue
+            sidx = b0 - 100
+            if sidx >= len(scalars):
+                continue
+            scale_val = float(scalars[sidx])
+            # op1: a1 must be op0's dst, b1 a leaf register (bias tensor, not scalar)
+            if a1 != dst0:
+                continue
+            if b1 >= 100 or b1 >= len(fe.inputs):
+                continue
+            bias_name = fe.inputs[b1]["name"]
+            # bias must be a real tensor, not a scalar initializer
+            if bias_name in dag_model.initializers:
+                arr = numpy_helper.to_array(dag_model.initializers[bias_name])
+                if arr.size == 1:
+                    continue
+            # The MatMul must currently be a plain 2-input (A,B) MatMul: a
+            # quantized weight MatMul already uses binding 4/5 for its scale
+            # table, and folding an epilogue onto it would collide. The
+            # attention QK^T is plain fp16 A/B.
+            if len(mm_node.inputs) != 2:
+                continue
+            # FE output must be the only consumer path (single external output):
+            # the FE has exactly one output and we are replacing it with the
+            # MatMul, so its output name is what downstream (Softmax) reads.
+            fe_out_name = fe.outputs[0]["name"] if fe.outputs else None
+            fold_softmax = False
+            if fe_out_name is not None:
+                cs = consumers.get(fe_out_name, [])
+                # Single Softmax consumer of the scaled+bias QK^T: Plan B fuses
+                # the softmax into the MatMul kernel (online row reduction).
+                if len(cs) == 1 and cs[0][0].op_type == "Softmax":
+                    fold_softmax = True
+            matches.append({
+                "fe": fe,
+                "matmul": mm_node,
+                "scale": scale_val,
+                "bias_input": fe.inputs[b1],
+                "fold_softmax": fold_softmax,
+            })
+        if matches:
+            print(f"[fuse_scale_bias_into_matmul] {len(matches)} "
+                  f"MatMul*scale+bias epilogue patterns")
+        return matches
+
+    @staticmethod
+    def fold_scale_bias_into_matmul(dag_model, match) -> bool:
+        mm = match["matmul"]
+        fe = match["fe"]
+        scale = match["scale"]
+        bias_input = match["bias_input"]
+        fold_softmax = match.get("fold_softmax", False)
+
+        # Append the bias as a third input and mark the epilogue in attributes.
+        new_attrs = dict(mm.attributes)
+        new_attrs["epi_scale"] = scale
+        new_attrs["epi_bias"] = 1
+        new_inputs = list(mm.inputs) + [dict(bias_input)]
+
+        # The MatMul output is the FE's output (so the downstream consumer of
+        # scale+bias, normally Softmax, still resolves).
+        out_name = fe.outputs[0]["name"]
+        out_shape = fe.outputs[0].get("shape") if fe.outputs else None
+        out_dtype = fe.outputs[0].get("dtype") if fe.outputs else None
+
+        softmax_node = None
+        if fold_softmax:
+            # Plan B: the single Softmax consumer is folded into the MatMul
+            # kernel (attn_softmax=1 → online row reduction). The MatMul now
+            # produces the Softmax's output tensor name so the ·V MatMul reads
+            # the normalized attention probabilities directly.
+            cs = FusionOptimizer.get_producer_consumer_from_dag(dag_model)[1]
+            consumers_of_fe = cs.get(out_name, [])
+            if len(consumers_of_fe) == 1 and \
+                    consumers_of_fe[0][0].op_type == "Softmax":
+                softmax_node = consumers_of_fe[0][0]
+                new_attrs["attn_softmax"] = 1
+                if softmax_node.outputs:
+                    out_name = softmax_node.outputs[0]["name"]
+                    out_shape = softmax_node.outputs[0].get("shape", out_shape)
+                    out_dtype = softmax_node.outputs[0].get("dtype", out_dtype)
+
+        fused = Node(
+            op_type="MatMul",
+            name=mm.name,  # keep the MatMul name; its output tensor is the FE's
+            attributes=new_attrs,
+            inputs=new_inputs,
+            outputs=[{
+                "name": out_name,
+                **({"shape": out_shape} if out_shape is not None else {}),
+                **({"dtype": out_dtype} if out_dtype is not None else {}),
+            }],
+        )
+        del dag_model.nodes[mm.name]
+        if fe.name in dag_model.nodes:
+            del dag_model.nodes[fe.name]
+        if softmax_node is not None and softmax_node.name in dag_model.nodes:
+            del dag_model.nodes[softmax_node.name]
         dag_model.nodes[fused.name] = fused
         return True
 

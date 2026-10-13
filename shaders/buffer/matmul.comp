@@ -66,6 +66,14 @@ layout(set = 0, binding = 4) readonly buffer Scale {
 layout(set = 0, binding = 5) readonly buffer GlobalScale {
     uint data[];
 } uGlobal;
+// Attention QK^T epilogue bias (binding 6): one fp16/fp32 value per output
+// element [batch, M, N] (the causal attention_bias, broadcast over the head
+// axis by the host binding a [B,1,q,kv] tensor). Applied as s = s*epi_scale +
+// bias at the store when uPC.epi_bias == 1. Inert (dummy) for every MatMul the
+// converter did not tag.
+layout(set = 0, binding = 6) readonly buffer EpiBias {
+    uint data[];
+} uEpiBias;
 
 layout(push_constant) uniform PC {
     int M;
@@ -124,6 +132,18 @@ layout(push_constant) uniform PC {
                     // when it is the last leading axis, the repeat_kv case).
     int a_dim;      // A's dim on the grouped axis (= b_dim * rep).
     int b_dim;      // B's dim on the grouped axis.
+    float epi_scale; // attention epilogue: multiply every output by this (the
+                     // 1/sqrt(head_dim) scale) before adding epi_bias.
+    int epi_bias;   // 1 = apply uEpiBias[out_idx] after the scale. 0 = off.
+    int epi_bias_batch; // when epi_bias: the bias tensor's flat batch count
+                        // (== total batch / broadcast ratio over the head axis).
+                        // bias_idx = (n / (batch / epi_bias_batch)) * M * N + ...
+    int attn_softmax; // 1 = fuse the trailing Softmax into this MatMul: after
+                      // the scale+bias epilogue, normalize each row over N
+                      // (online softmax: per-thread max/sum + workgroup reduce)
+                      // and store exp(x-max)/sum directly. The host gates this
+                      // on epi_bias && M small (decode) and routes a dedicated
+                      // one-workgroup-per-row kernel.
 } uPC;
 
 // A flat batch index -> B's slice, when the host detected a grouped leading
@@ -145,6 +165,22 @@ int bmap(int n) {
     int b_span = uPC.rep_stride * uPC.b_dim;
     return prefix * b_span + (rest / (uPC.rep * uPC.rep_stride)) * uPC.rep_stride +
            (rest % uPC.rep_stride);
+}
+
+// Attention QK^T epilogue: the bias is laid out [epi_bias_batch, M, N] (the
+// causal attention_bias broadcast over the head axis), while this kernel's flat
+// batch is `batch` = epi_bias_batch * heads. So output row n maps to bias batch
+// n / (batch / epi_bias_batch). Returns the bias value for output element
+// (n, i, j). fp16 build: bias is half2-packed like the output.
+float epi_bias_at(int n, int i, int j) {
+    int ratio = uPC.batch / max(uPC.epi_bias_batch, 1);
+    int bn = n / max(ratio, 1);
+    int idx = bn * uPC.M * uPC.N + i * uPC.N + j;
+#ifdef FP16
+    return unpackHalf2x16(uEpiBias.data[idx >> 1])[idx & 1];
+#else
+    return uintBitsToFloat(uEpiBias.data[idx]);
+#endif
 }
 
 #ifdef FP16
@@ -1041,8 +1077,130 @@ void matmul16_even_n() {
     }
 
     int out_idx = n * uPC.M * uPC.N + i * uPC.N + ja;
-    uOutput.data[out_idx >> 1] =
-        packHalf2x16(vec2(s0a + s0b, s1a + s1b));
+    float r0 = s0a + s0b;
+    float r1 = s1a + s1b;
+    if (uPC.epi_bias != 0) {
+        r0 = r0 * uPC.epi_scale + epi_bias_at(n, i, ja);
+        r1 = r1 * uPC.epi_scale + epi_bias_at(n, i, ja + 1);
+    }
+    uOutput.data[out_idx >> 1] = packHalf2x16(vec2(r0, r1));
+}
+
+// Fused MatMul + scale/bias epilogue + Softmax for attention QK^T. One
+// workgroup reduces one output row (n, i) over all N columns: each lane owns
+// a strided set of columns, computes the K-dot for each, applies scale+bias,
+// then a two-pass workgroup reduction (max, then sum-of-exp) normalizes the
+// row and stores exp(x-max)/sum. Replaces MatMul(QK^T) + FusedElemwise +
+// Softmax(reduce+pack) = 4 dispatches with 1. The A row (K values) is staged
+// in shared memory once per workgroup.
+//
+// Constraints (host-checked): N even (half2 store), one workgroup covers a
+// full row so N <= SOFTMAX_WG * SOFTMAX_COLS (else the host falls back to the
+// unfused path). Decode M is small so batch*M workgroups is a reasonable grid.
+#define SOFTMAX_WG 256
+#define SOFTMAX_COLS 2   // columns per lane per trip (half2)
+shared float sA_row[1024];        // A row staging (K <= 1024; head_dim is 128)
+shared float s_red[SOFTMAX_WG];   // reduction scratch
+void matmul16_softmax() {
+    int yi = int(gl_WorkGroupID.x);   // row index (n*M + i)
+    // The pipeline's workgroup is 16x16 = 256 lanes (2D, set at the top of this
+    // file); flatten to a 1D lane index so the reduction and strided column
+    // ownership below see all 256 lanes.
+    int lid = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int n = yi / uPC.M;
+    int i = yi % uPC.M;
+    if (n >= uPC.batch) return;
+
+    int a_off = (n * uPC.M + i) * uPC.K;
+    // Stage the A row into shared memory (K values, K <= 1024 for head_dim).
+    for (int k = lid; k < uPC.K; k += SOFTMAX_WG) {
+        sA_row[k] = load_a(a_off + k);
+    }
+    barrier();
+
+    int b_base = bmap(n) * uPC.K * uPC.N;
+    // Each lane owns column pairs [lid*2, lid*2+1, +SOFTMAX_WG*2, ...].
+    // Compute the dot product for this lane's first owned pair, then stride.
+    // We need the full row in registers for the softmax passes, but N can be
+    // large — so we do online softmax: one pass for max, one for sum, a third
+    // for the store, recomputing or caching the dot products. To avoid
+    // recomputing the K-dot three times, cache this lane's owned columns in
+    // a local array (bounded by SOFTMAX_COLS * ceil(N/SOFTMAX_WG)).
+    const int MAX_OWNED = 64;  // >= ceil(2048 / (SOFTMAX_WG/SOFTMAX_COLS))
+    float owned[MAX_OWNED];
+    int n_owned = 0;
+
+    int b_step = (uPC.transB != 0) ? 1 : uPC.N;
+    for (int ja = lid * SOFTMAX_COLS; ja < uPC.N && n_owned < MAX_OWNED;
+         ja += SOFTMAX_WG * SOFTMAX_COLS) {
+        float s0 = 0.0, s1 = 0.0;
+        int jb = ja + 1;
+        int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
+        int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
+        for (int k = 0; k < uPC.K; ++k) {
+            float a = sA_row[k];
+            s0 += a * load_b(b0);
+            s1 += a * load_b(b1);
+            b0 += b_step;
+            b1 += b_step;
+        }
+        if (uPC.epi_bias != 0) {
+            s0 = s0 * uPC.epi_scale + epi_bias_at(n, i, ja);
+            s1 = s1 * uPC.epi_scale + epi_bias_at(n, i, jb);
+        }
+        owned[n_owned++] = s0;
+        if (jb < uPC.N) {
+            owned[n_owned++] = s1;
+        }
+    }
+
+    // ---- pass 1: row max (online) ----
+    float local_max = -1e30f;
+    for (int t = 0; t < n_owned; ++t) {
+        local_max = max(local_max, owned[t]);
+    }
+    s_red[lid] = local_max;
+    memoryBarrierShared(); barrier();
+    for (uint s = SOFTMAX_WG / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_red[lid] = max(s_red[lid], s_red[lid + s]);
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float row_max = s_red[0];
+
+    // ---- pass 2: sum of exp(x - row_max) ----
+    float local_sum = 0.0;
+    for (int t = 0; t < n_owned; ++t) {
+        local_sum += exp(owned[t] - row_max);
+    }
+    s_red[lid] = local_sum;
+    memoryBarrierShared(); barrier();
+    for (uint s = SOFTMAX_WG / 2; s > 0; s >>= 1) {
+        if (lid < s) {
+            s_red[lid] += s_red[lid + s];
+        }
+        memoryBarrierShared(); barrier();
+    }
+    float row_sum = s_red[0] + 1e-30f;
+
+    // ---- pass 3: store normalized ----
+    int idx = 0;
+    for (int ja = lid * SOFTMAX_COLS; ja < uPC.N && idx < n_owned;
+         ja += SOFTMAX_WG * SOFTMAX_COLS) {
+        float r0 = exp(owned[idx] - row_max) / row_sum;
+        idx++;
+        if (ja + 1 < uPC.N && idx < n_owned) {
+            float r1 = exp(owned[idx] - row_max) / row_sum;
+            idx++;
+            uOutput.data[(n * uPC.M * uPC.N + i * uPC.N + ja) >> 1] =
+                packHalf2x16(vec2(r0, r1));
+        } else {
+            // odd tail column (N even should avoid this, but be safe)
+            uOutput.data[(n * uPC.M * uPC.N + i * uPC.N + ja) >> 1] =
+                packHalf2x16(vec2(r0, 0.0));
+        }
+    }
 }
 
 // Tiled GEMM for the compute-bound regime (M big enough that the naive path
@@ -1446,6 +1604,10 @@ void main() {
         return;
     }
 #ifdef FP16
+    if (uPC.attn_softmax != 0) {
+        matmul16_softmax();
+        return;
+    }
     if (uPC.tile != 0) {
         matmul16_tiled();
     } else if ((uPC.N & 1) == 0) {

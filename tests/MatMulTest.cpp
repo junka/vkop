@@ -110,6 +110,129 @@ TEST(MatMulTest, MatMulComprehensiveTest) {
     }
 }
 
+// Attention QK^T epilogue: MatMul * epi_scale + epi_bias[col], where the bias
+// is broadcast over the head axis (bias batch = total batch / heads). Verifies
+// the shader's epi_bias_at indexing and the scale-then-add order against a
+// torch reference that does the same matmul * scale + bias.
+namespace {
+template <typename T>
+class MatMulEpiTest : public TestCase<T> {
+public:
+    int B, heads, M, K, N;
+    float scale;
+    std::shared_ptr<Tensor<T>> inputa, inputb, bias, output;
+
+    MatMulEpiTest(int B, int heads, int M, int K, int N, float scale)
+        : TestCase<T>("MatMul"), B(B), heads(heads), M(M), K(K), N(N),
+          scale(scale) {
+        int batch = B * heads;
+        inputa = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, K});
+        inputb = std::make_shared<Tensor<T>>(std::vector<int>{batch, K, N});
+        // bias is [B, M, N] (broadcast over heads); the runtime reads
+        // epi_bias_batch = B from its element count.
+        bias = std::make_shared<Tensor<T>>(std::vector<int>{B, M, N});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, N});
+
+        auto ta = torch::randn({batch, M, K}, this->getTorchConf());
+        auto tb = torch::randn({batch, K, N}, this->getTorchConf());
+        auto tbias = torch::randn({B, M, N}, this->getTorchConf());
+        // ref = (A @ B) * scale + bias[b/heads]
+        auto mm = torch::matmul(ta, tb);
+        auto bias_rep = tbias.repeat_interleave(heads, 0); // [B*heads, M, N]
+        auto ref = mm * scale + bias_rep;
+        this->fillTensorFromTorch(inputa, ta);
+        this->fillTensorFromTorch(inputb, tb);
+        this->fillTensorFromTorch(bias, tbias);
+        this->fillTensorFromTorch(output, ref);
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulEpilogueScaleBias) {
+    // (B, heads, M, K, N, scale) — decode shape: 1 batch, 16 heads, q=1, hd=128
+    // is too slow to fill; use a smaller K and a couple of shapes.
+    const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
+        {2, 4, 1, 16, 8, 0.0884f},
+        {1, 8, 3, 32, 16, 0.5f},
+        {2, 2, 4, 16, 16, 1.0f},
+    };
+    for (const auto &c : cases) {
+        auto [B, heads, M, K, N, scale] = c;
+        MatMulEpiTest<uint16_t> t(B, heads, M, K, N, scale);
+        std::unordered_map<std::string, std::string> attr = {
+            {"epi_scale", std::to_string(scale)},
+            {"epi_bias", "1"},
+        };
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb, t.bias}, {t.output},
+            [&attr](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute(attr);
+            })) << "B=" << B << " heads=" << heads << " M=" << M
+                << " K=" << K << " N=" << N;
+    }
+}
+
+// Plan B: fused QK^T + scale/bias epilogue + Softmax. The MatMul kernel does
+// the K-dot, applies epi_scale*result + epi_bias[col], then an in-kernel online
+// softmax (per-row max -> sum-of-exp -> normalize) and stores exp(x-max)/sum.
+// Verifies against a torch reference that does softmax(mm*scale + bias, dim=-1)
+// with the same head-broadcast bias as the epi test.
+namespace {
+template <typename T>
+class MatMulSoftmaxTest : public TestCase<T> {
+public:
+    int B, heads, M, K, N;
+    float scale;
+    std::shared_ptr<Tensor<T>> inputa, inputb, bias, output;
+
+    MatMulSoftmaxTest(int B, int heads, int M, int K, int N, float scale)
+        : TestCase<T>("MatMul"), B(B), heads(heads), M(M), K(K), N(N),
+          scale(scale) {
+        int batch = B * heads;
+        inputa = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, K});
+        inputb = std::make_shared<Tensor<T>>(std::vector<int>{batch, K, N});
+        bias = std::make_shared<Tensor<T>>(std::vector<int>{B, M, N});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, N});
+
+        auto ta = torch::randn({batch, M, K}, this->getTorchConf());
+        auto tb = torch::randn({batch, K, N}, this->getTorchConf());
+        auto tbias = torch::randn({B, M, N}, this->getTorchConf());
+        auto mm = torch::matmul(ta, tb);
+        auto bias_rep = tbias.repeat_interleave(heads, 0);
+        auto logits = mm * scale + bias_rep;
+        // softmax over the last (N) axis, computed in fp32 then cast back.
+        auto ref = torch::softmax(logits.to(torch::kFloat32), -1).to(this->getTorchConf());
+        this->fillTensorFromTorch(inputa, ta);
+        this->fillTensorFromTorch(inputb, tb);
+        this->fillTensorFromTorch(bias, tbias);
+        this->fillTensorFromTorch(output, ref);
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulSoftmaxFusion) {
+    // (B, heads, M, K, N, scale) — attention-QK^T decode shapes. M is the q_len
+    // (1 at decode); a small M>1 case exercises multi-row workgroups.
+    const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
+        {2, 4, 1, 16, 64, 0.0884f},
+        {1, 8, 1, 32, 128, 0.5f},
+        {2, 2, 2, 16, 64, 1.0f},
+    };
+    for (const auto &c : cases) {
+        auto [B, heads, M, K, N, scale] = c;
+        MatMulSoftmaxTest<uint16_t> t(B, heads, M, K, N, scale);
+        std::unordered_map<std::string, std::string> attr = {
+            {"epi_scale", std::to_string(scale)},
+            {"epi_bias", "1"},
+            {"attn_softmax", "1"},
+        };
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb, t.bias}, {t.output},
+            [&attr](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute(attr);
+            })) << "B=" << B << " heads=" << heads << " M=" << M
+                << " K=" << K << " N=" << N;
+    }
+}
+
 namespace {
 // int8 weight-only MatMul (buffer backend, where the int8 kernel lives). B is
 // the quantized weight and its per-output-column fp32 scale (amax/127 reduced
