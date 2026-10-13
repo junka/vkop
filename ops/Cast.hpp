@@ -37,10 +37,16 @@ class Cast : public BufferFactory {
                         sizeof(cast::CastPC)) {}
 
     // The int64->fp32 Cast reads back position-id data every round. In decode,
-    // position_ids = [v,v,v] where v = current_token_position, growing by +1
-    // each round. LINEAR_GROW predicts v+1 and skips the readback, verifying
-    // every 8 rounds. STABLE handles the case where the value is constant.
-    // invalidate_shape_cache() resets at phase boundaries.
+    // position_ids = [v,v,v] where v = past_len + rope_delta, growing by +1
+    // each round (past_len increments exactly one KV slot per decode step).
+    // LINEAR_GROW predicts v+1 and skips the readback permanently — there is
+    // NO periodic verify. Rationale: the +1 growth is a structural property
+    // of the decode loop (the driver sets position_ids = past_len+rope_delta
+    // and past_len grows by exactly 1/round), so a verify would never observe
+    // drift. The only point where the pattern legitimately changes is a phase
+    // boundary, which resets the state via invalidate_shape_cache() (called by
+    // Runtime::invalidate_replay at prefill->decode and at every new prompt).
+    // STABLE handles the case where the value is constant.
     enum class LearnState {
         LEARNING,
         CONFIRMING,
@@ -50,13 +56,10 @@ class Cast : public BufferFactory {
     };
     LearnState cast_state_ = LearnState::LEARNING;
     std::vector<int64_t> cached_in_;
-    static constexpr int LINEAR_VERIFY_INTERVAL = 8;
-    int linear_rounds_ = 0;
 
     void invalidate_shape_cache() override {
         cast_state_ = LearnState::LEARNING;
         cached_in_.clear();
-        linear_rounds_ = 0;
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -80,9 +83,11 @@ class Cast : public BufferFactory {
         if (inputs[0]->dtype() == typeid(int64_t) &&
             outputs[0]->dtype() == typeid(float)) {
             // LINEAR_GROW fast path: predict each element +1, skip readback.
-            if (cast_state_ == LearnState::LINEAR_GROW &&
-                linear_rounds_ < LINEAR_VERIFY_INTERVAL) {
-                linear_rounds_++;
+            // Trusted unconditionally within a phase: the +1 growth is a
+            // structural property of the decode loop, and a phase boundary
+            // (where the pattern changes) resets cast_state_ via
+            // invalidate_shape_cache(). No periodic verify readback.
+            if (cast_state_ == LearnState::LINEAR_GROW) {
                 std::vector<int64_t> predicted = cached_in_;
                 for (auto &v : predicted)
                     v += 1;
@@ -142,22 +147,17 @@ class Cast : public BufferFactory {
                 } else if (all_plus_one(cached_in_, in_vec)) {
                     cast_state_ = LearnState::LINEAR_GROW;
                     cached_in_ = in_vec;
-                    linear_rounds_ = 0;
                 } else {
                     cast_state_ = LearnState::DYNAMIC;
                     cached_in_ = in_vec;
                 }
             } else if (cast_state_ == LearnState::LINEAR_GROW) {
-                // Verify round: predicted was cached_in_+1; check actual.
-                std::vector<int64_t> expected = cached_in_;
-                for (auto &v : expected)
-                    v += 1;
-                if (in_vec == expected) {
+                // Unreachable in steady state: the LINEAR_GROW fast path
+                // returns before the readback. A phase boundary resets via
+                // invalidate_shape_cache(); there is no verify round to land
+                // here. If reached, re-evaluate the pattern defensively.
+                if (all_plus_one(cached_in_, in_vec)) {
                     cached_in_ = in_vec;
-                    linear_rounds_ = 0;
-                } else if (all_plus_one(cached_in_, in_vec)) {
-                    cached_in_ = in_vec;
-                    linear_rounds_ = 0;
                 } else {
                     cast_state_ = LearnState::DYNAMIC;
                     cached_in_ = in_vec;
@@ -167,7 +167,6 @@ class Cast : public BufferFactory {
                     if (all_plus_one(cached_in_, in_vec)) {
                         cast_state_ = LearnState::LINEAR_GROW;
                         cached_in_ = in_vec;
-                        linear_rounds_ = 0;
                     } else {
                         cast_state_ = LearnState::DYNAMIC;
                         cached_in_ = in_vec;

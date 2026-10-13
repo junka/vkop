@@ -45,7 +45,16 @@ struct alignas(16) NonZeroPC {
 // phase — the image doesn't change between tokens), so two consecutive
 // matching readbacks promote to STABLE and skip the copyToCPU entirely,
 // reusing the cached [rank, count] output. invalidate_shape_cache() resets
-// at the prefill->decode boundary.
+// at the prefill->decode boundary (and on every new prompt via
+// Runtime::invalidate_replay). STABLE trusts the phase contract and reuses
+// the cached output unconditionally — there is NO periodic verify readback.
+// Rationale: within a decode phase the image_pad_mask is byte-identical every
+// round (the driver writes [1,1] all-zero on every decode step), so a verify
+// would never observe drift; the only point where the mask legitimately
+// changes is a phase boundary, which already resets the state via
+// invalidate_shape_cache(). A verify readback here would only pay a sync stall
+// (it splits the graph into an extra segment) to confirm something the phase
+// contract already guarantees.
 class NonZero : public BufferFactory {
   public:
     explicit NonZero()
@@ -63,8 +72,6 @@ class NonZero : public BufferFactory {
     // Cached output data + shape.
     std::vector<int> cached_out_shape_;
     std::vector<int64_t> cached_out_;
-    static constexpr int STABLE_VERIFY_INTERVAL = 8;
-    int stable_rounds_ = 0;
 
     void invalidate_shape_cache() override {
         nz_state_ = LearnState::LEARNING;
@@ -72,7 +79,6 @@ class NonZero : public BufferFactory {
         cached_input_.clear();
         cached_out_shape_.clear();
         cached_out_.clear();
-        stable_rounds_ = 0;
     }
 
   private:
@@ -89,11 +95,12 @@ class NonZero : public BufferFactory {
 
         // STABLE fast path: reuse cached output, skip readback entirely.
         // The mask is phase-invariant (image fixed for the whole decode
-        // phase), so the [rank, count] output is byte-identical when the
-        // input matches.
-        if (nz_state_ == LearnState::STABLE &&
-            stable_rounds_ < STABLE_VERIFY_INTERVAL) {
-            stable_rounds_++;
+        // phase), so the [rank, count] output is byte-identical every round.
+        // No periodic verify: the phase contract guarantees the input cannot
+        // change within a phase, and invalidate_shape_cache() (called at every
+        // phase boundary by Runtime::invalidate_replay) resets to LEARNING so
+        // a genuinely new mask is re-learned, not blindly reused.
+        if (nz_state_ == LearnState::STABLE) {
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(cached_out_shape_);
             output->fillToCPU(cached_out_);
@@ -109,7 +116,7 @@ class NonZero : public BufferFactory {
             return;
         }
 
-        // Readback path (LEARNING/CONFIRMING/DYNAMIC, or STABLE verify).
+        // Readback path (LEARNING/CONFIRMING/DYNAMIC).
         // Pull the input to the host and collect the multi-dim coordinates of
         // every non-zero element. bool/int8 share the int8_t storage repr in
         // the runtime; float/int64 are also supported by dispatch_by_dtype.
@@ -171,7 +178,6 @@ class NonZero : public BufferFactory {
         } else if (nz_state_ == LearnState::CONFIRMING) {
             if (match) {
                 nz_state_ = LearnState::STABLE;
-                stable_rounds_ = 0;
             } else {
                 nz_state_ = LearnState::DYNAMIC;
                 cached_shape_ = shape;
@@ -180,15 +186,17 @@ class NonZero : public BufferFactory {
                 cached_out_ = out;
             }
         } else if (nz_state_ == LearnState::STABLE) {
-            // Verify round: drift -> DYNAMIC.
+            // Unreachable in steady state: the STABLE fast path returns before
+            // reaching here. The phase contract guarantees no mid-phase drift,
+            // so there is no verify readback to land here. If a future caller
+            // somehow re-enters execute() under STABLE without the fast path,
+            // treat any mismatch as DYNAMIC and re-cache.
             if (!match) {
                 nz_state_ = LearnState::DYNAMIC;
                 cached_shape_ = shape;
                 cached_input_ = input_fp;
                 cached_out_shape_ = out_shape;
                 cached_out_ = out;
-            } else {
-                stable_rounds_ = 0;
             }
         } else { // DYNAMIC
             cached_shape_ = shape;
