@@ -24,6 +24,8 @@ extern unsigned char buffer_matmul_pack_spv[];
 extern unsigned int buffer_matmul_pack_spv_len;
 extern unsigned char buffer_matmul_coop_spv[];
 extern unsigned int buffer_matmul_coop_spv_len;
+extern unsigned char buffer_matmul_coop16_spv[];
+extern unsigned int buffer_matmul_coop16_spv_len;
 extern unsigned char buffer_matmul_coop_i8_spv[];
 extern unsigned int buffer_matmul_coop_i8_spv_len;
 }
@@ -248,30 +250,50 @@ class MatMulBuffer : public BufferFactory {
         }();
         if (fp16_ != 0 && !coop_pipeline_ && !coop_disabled) {
             // fp16 cooperative-matrix kernel: a single dispatch reads fp16 A/B
-            // from SSBO, accumulates in fp32 via the 8x8x16 subgroup MMA
+            // from SSBO, accumulates in fp32 via a subgroup MMA
             // (coopMatMulAdd), and writes FLAT fp32 results to the scratch
             // buffer (binding 3). A separate pack pass (pack_pipeline_ below)
             // then repacks adjacent flat element pairs into packed half2 words
             // — kept as a distinct flat pass because when N is odd one output
             // word straddles two rows (element 2w+1 of word w is the next row's
             // col 0), and in-shader (col, col+1) packing would zero-fill the
-            // straddling half and clobber the next row's first element. Intel
-            // ARL exposes the required fp16 coopmat combo (8x8x16, fp16 A/B ->
-            // fp32 acc, subgroup scope, sg size 32). The pipeline's descriptor
-            // set declares 6 bindings to match the quantized-weight layouts:
-            // only 0-3 are read, 4-5 are bound-but-unused (filled from the same
-            // objs_ vector as every other MatMul pipeline).
+            // straddling half and clobber the next row's first element. The
+            // pipeline's descriptor set declares 6 bindings to match the
+            // quantized-weight layouts: only 0-3 are read, 4-5 are
+            // bound-but-unused (filled from the same objs_ vector as every
+            // other MatMul pipeline).
+            //
+            // Two shader variants, picked by the device's supported combo:
+            //  · 8x8x16  (matmul_coop.comp)     — the only fp16 shape on Intel
+            //    ARL. Workgroup BM=16, BN=32.
+            //  · 16x16x16 (matmul_coop16.comp)  — NVIDIA Ada Lovelace, which
+            //    does NOT list 8x8x16 (the 8x8x16 pipeline validates but
+            //    coopMatMulAdd silently miscomputes -> all-zero logits). 4x the
+            //    single-MMA throughput. Workgroup BM=32, BN=64.
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
+            const uint32_t *spv;
+            int spv_len;
+            if (dev->supports_coopmat_fp16_tile(16, 16, 16)) {
+                spv = reinterpret_cast<const uint32_t *>(
+                    buffer_matmul_coop16_spv);
+                spv_len = static_cast<int>(buffer_matmul_coop16_spv_len);
+                coop_bm_ = 32;
+                coop_bn_ = 64;
+            } else {
+                spv =
+                    reinterpret_cast<const uint32_t *>(buffer_matmul_coop_spv);
+                spv_len = static_cast<int>(buffer_matmul_coop_spv_len);
+                coop_bm_ = 16;
+                coop_bn_ = 32;
+            }
             coop_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                sizeof(matmul::GpuMatMulParam),
-                reinterpret_cast<const uint32_t *>(buffer_matmul_coop_spv),
-                static_cast<int>(buffer_matmul_coop_spv_len), use_uab, 0);
+                sizeof(matmul::GpuMatMulParam), spv, spv_len, use_uab, 0);
             for (auto &ds : coop_ds_) {
                 ds = coop_pipeline_->allocDescriptorSets();
             }
@@ -673,7 +695,19 @@ class MatMulBuffer : public BufferFactory {
         const bool coopmat = fp16_ != 0 && !weight_byte && !weight_4bit &&
                              !coop_disabled && rep == 1 &&
                              m_dev_->is_support_cooperate_matrix() &&
-                             coop_pipeline_ != nullptr;
+                             coop_pipeline_ != nullptr &&
+                             // The 16x16x16 variant (coop_bm_ == 32, NVIDIA)
+                             // has a 32-row workgroup M footprint. At decode
+                             // M=1 that is 1/32 utilization -- the MMA does 256
+                             // output elements of which 1 row is live -- and
+                             // the ksplit GEMV path beats it ~4x (measured:
+                             // coop16 MatMul 42-78ms vs tiled/GEMV 11.9ms for
+                             // 254 calls on RTX 4000 Ada). Gate the large tile
+                             // to M >= 8 so decode GEMVs fall through to
+                             // ksplit. The 8x8x16 ARL path (coop_bm_ == 16)
+                             // keeps the old behavior: it is ARL's only fast
+                             // path and was never regressed by small M.
+                             (coop_bm_ < 32 || m >= 8);
         // W8A8 sibling of the path above: an int8 weight with an int8
         // activation the kernel quantizes itself (per output row), accumulated
         // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
@@ -849,7 +883,7 @@ class MatMulBuffer : public BufferFactory {
             m_cmd_->bind(*coop_pipeline_, coop_ds_[m_id_]);
             m_cmd_->push_constants(*coop_pipeline_,
                                    sizeof(matmul::GpuMatMulParam), &para_);
-            m_cmd_->dispatch(UP_DIV(n, 32), UP_DIV(m, 16), batch);
+            m_cmd_->dispatch(UP_DIV(n, coop_bn_), UP_DIV(m, coop_bm_), batch);
 
             // Barrier: flush coopmat's scratch writes for pack's reads.
             scratch_->shaderWriteBarrier(m_cmd_->get());
@@ -995,6 +1029,11 @@ class MatMulBuffer : public BufferFactory {
     // from the same objs_ vector.
     std::unique_ptr<VulkanPipeline> coop_pipeline_;
     VkDescriptorSet coop_ds_[vkop::kInflight] = {nullptr};
+    // Workgroup output footprint of the selected coopmat shader variant:
+    // 16x32 (8x8x16 combo, ARL) or 32x64 (16x16x16 combo, NVIDIA). Set when
+    // coop_pipeline_ is built; the dispatch grid divides M/N by these.
+    int coop_bm_ = 16;
+    int coop_bn_ = 32;
     // coop_i8_pipeline_ runs the W8A8 SINT8 cooperative-matrix kernel (int8
     // weight x runtime-quantized int8 activation -> flat fp32 scratch). Built
     // only when the device lists the SINT8 coopmat combo.

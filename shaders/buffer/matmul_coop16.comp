@@ -1,0 +1,176 @@
+#version 450 core
+
+// SSBO cooperative-matrix MatMul, 16x16x16 fp16 tile variant.
+// Sister shader of matmul_coop.comp (which uses the 8x8x16 combo -- the only
+// fp16 coopmat shape Intel ARL exposes). NVIDIA (RTX 4000 Ada / Ada Lovelace)
+// does NOT support 8x8x16: it lists 16x16x16, 16x8x16, 16x8x8. Using the
+// 8x8x16 combo on NVIDIA silently miscomputes (pipeline validates but
+// coopMatMulAdd produces garbage -> all-zero logits). This shader uses the
+// 16x16x16 combo (A[16x16]·B[16x16] -> C[16x16], fp16 in / fp32 accumulate),
+// which is 4x the single-MMA throughput of 8x8x16 (256 output elements vs 64).
+//
+// Workgroup = 16x16 = 256 threads = 8 subgroups (sg size 32). Subgroup grid
+// 2(M) x 4(N) => workgroup output footprint BM=32, BN=64. Each K-tile's
+// shared A/B feeds 8 MMAs (2 M-subgroups x 4 N-subgroups), amortizing loads.
+//
+// Semantics (scratch + pack) are identical to matmul_coop.comp: fp32 results
+// go to the flat scratch buffer (binding 3), then buffer_matmul_pack.comp
+// repacks half2 words (odd-N safe). Descriptor layout (6 bindings) matches.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InB {
+    uint data[];
+} uInputB;
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+layout(set = 0, binding = 4) readonly buffer ScaleTab {
+    uint data[];
+} uScaleTab;
+layout(set = 0, binding = 5) readonly buffer GlobalFac {
+    uint data[];
+} uGlobalFac;
+
+layout(push_constant) uniform PC {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int fp32;   // unused (fp16-in only); kept for PC compat
+    int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
+} uPC;
+
+// 16x16x16 coopmat tile.
+const int M_BLOCK = 16;
+const int N_BLOCK = 16;
+const int K_BLOCK = 16;
+
+const int BM = 32; // = 2 * M_BLOCK  (workgroup M footprint)
+const int BN = 64; // = 4 * N_BLOCK  (workgroup N footprint)
+
+// Load a fp16 element from a packed-half2 uint SSBO.
+float16_t loadA(int elem) {
+    return float16_t(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
+}
+float16_t loadB(int elem) {
+    return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
+}
+
+// Shared tiles laid out as float16_t, row-major.
+shared float16_t shA[BM * K_BLOCK];  // [32 x 16] = 512
+shared float16_t shB[K_BLOCK * BN];  // [16 x 64] = 1024
+// Each subgroup stores its 16x16 fp32 result tile here before scattering.
+// [sg][256] -- one private 256-fp32 region per subgroup (no races).
+shared float shC[8][M_BLOCK * N_BLOCK];
+
+void main() {
+    int  b    = int(gl_WorkGroupID.z);     // batch index
+    int  m0   = int(gl_WorkGroupID.y) * BM;
+    int  n0   = int(gl_WorkGroupID.x) * BN;
+    uint sg   = gl_SubgroupID;             // 0..7
+    uint lane = gl_SubgroupInvocationID;   // 0..31
+    uint tid  = gl_LocalInvocationIndex;   // 0..255
+    int  sgx  = int(sg % 4);               // subgroup col (N) in 2x4 grid
+    int  sgy  = int(sg / 4);               // subgroup row (M) in 2x4 grid
+
+    int M = uPC.M;
+    int N = uPC.N;
+    int K = uPC.K;
+
+    int a_base = b * M * K; // A[batch, :, :]
+    int b_base = b * K * N; // B[batch, :, :] (row-major K x N)
+
+    coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+             gl_MatrixUseAccumulator>
+        matC;
+    matC = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                   gl_MatrixUseAccumulator>(0.0);
+
+    int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
+
+    for (int t = 0; t < k_tiles; t++) {
+        int k_base = t * K_BLOCK;
+
+        // 256 threads load A[BM x K_BLOCK] = 32*16 = 512 fp16 => 2/thread.
+        for (int e = 0; e < 2; e++) {
+            int idx = int(tid) * 2 + e;            // 0..511
+            int row = idx / K_BLOCK;                // M dim (0..31)
+            int col = idx % K_BLOCK;                // K dim (0..15)
+            int h = m0 + row;
+            int kk = k_base + col;
+            float16_t v = (h < M && kk < K) ? loadA(a_base + h * K + kk)
+                                            : float16_t(0.0);
+            shA[idx] = v;
+        }
+        // 256 threads load B[K_BLOCK x BN] = 16*64 = 1024 fp16 => 4/thread.
+        for (int e = 0; e < 4; e++) {
+            int idx = int(tid) * 4 + e;            // 0..1023
+            int row = idx / BN;                     // K dim (0..15)
+            int col = idx % BN;                     // N dim (0..63)
+            int kk = k_base + row;
+            int w = n0 + col;
+            float16_t v;
+            if (kk < K && w < N) {
+                if (uPC.transB != 0) {
+                    v = loadB(b_base + w * K + kk);
+                } else {
+                    v = loadB(b_base + kk * N + w);
+                }
+            } else {
+                v = float16_t(0.0);
+            }
+            shB[idx] = v;
+        }
+
+        barrier();
+
+        coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
+            matA;
+        coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
+            matB;
+        // Each subgroup loads its 16x16 / 16x16 slice from shared tiles.
+        coopMatLoad(matA, shA, sgy * M_BLOCK * K_BLOCK, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shB, sgx * N_BLOCK, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+
+        matC = coopMatMulAdd(matA, matB, matC);
+
+        barrier();
+    }
+
+    // Store matC (16x16 fp32) to the per-subgroup private region of shC.
+    coopMatStore(matC, shC[sg], 0, N_BLOCK,
+                 gl_CooperativeMatrixLayoutRowMajor);
+    barrier();
+
+    // 32 threads scatter 256 fp32 results to the flat scratch SSBO.
+    // Global element index: C[batch, m0+sgy*16+row, n0+sgx*16+col].
+    int c_base = b * M * N;
+    for (int e = 0; e < 8; e++) {
+        int idx = int(lane) * 8 + e;            // 0..255
+        int row = idx / N_BLOCK;                // 0..15 (within 16x16 tile)
+        int col = idx % N_BLOCK;
+        int hg = m0 + sgy * M_BLOCK + row;
+        int wg = n0 + sgx * N_BLOCK + col;
+        if (hg < M && wg < N) {
+            float v = shC[sg][idx];
+            int out_elem = c_base + hg * N + wg;
+            uScratch.data[out_elem] = floatBitsToUint(v);
+        }
+    }
+}

@@ -179,8 +179,30 @@ class VulkanDevice {
         }
         return false;
     }
+    // fp16 -> fp32 subgroup-scope cooperative matrix with an explicit tile
+    // shape. The 8x8x16 combo is the only fp16 shape Intel ARL exposes; it
+    // is what matmul_coop.comp declares. NVIDIA (Ada Lovelace) does NOT list
+    // 8x8x16 -- it lists 16x16x16 / 16x8x16 / 16x8x8 -- so the 8x8x16 shader
+    // silently miscomputes there. matmul_coop16.comp declares 16x16x16; this
+    // query picks the shader whose tile the device actually supports.
+    bool supports_coopmat_fp16_tile(uint32_t M, uint32_t N, uint32_t K) const {
+        for (const auto &p : coopmatProps_) {
+            if (p.AType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                p.BType == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                p.CType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                p.ResultType == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                p.scope == VK_SCOPE_SUBGROUP_KHR && p.MSize == M &&
+                p.NSize == N && p.KSize == K) {
+                return true;
+            }
+        }
+        return false;
+    }
 #else
     bool supports_coopmat_sint8() const { return false; }
+    bool supports_coopmat_fp16_tile(uint32_t, uint32_t, uint32_t) const {
+        return false;
+    }
 #endif
     bool is_support_descriptor_update_after_bind() const {
         return m_support_descriptor_update_after_bind_;
