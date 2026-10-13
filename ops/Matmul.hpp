@@ -928,8 +928,17 @@ class MatMulBuffer : public BufferFactory {
             // for a byte (int8/fp8) weight each lane owns SIXTEEN columns (one
             // uvec4 = 16 bytes), needs N % 16, and ksplit_q counts 16-column
             // groups per block. The int8 WIDE kernel (matmul16_w8_ksplit_wide)
-            // decodes the uvec4 via unpack_w8 -- the buggy fp16 WIDE variant
-            // decoded int8 bytes as fp16 and produced garbage.
+            // decodes the uvec4 via unpack_w8; the fp16 WIDE kernel
+            // (matmul16_ksplit_wide) decodes via unpackHalf2x16. An earlier
+            // fp16 variant wrongly reused unpack_w8 (read fp16 bytes as int8)
+            // and produced garbage -- that is fixed, but WIDE stays env-gated:
+            // measured (Intel ARL, Qwen3-VL-2B) it cuts lm_head alone ~15%
+            // (min 21.4->18.2ms, M=1 GEMV N=151936) yet the per-round TOTAL is
+            // flat (min 198.5 vs 198.9, 12 interleaved pairs 6/6) because the
+            // smaller-N layer projections (q/k/v/o/gate/up/down, N=2048-8192)
+            // give back the gain. Net-neutral on this bandwidth-bound iGPU, so
+            // not on by default; leave the knob for devices where lm_head
+            // dominates more (or for future tuning of the per-N q heuristic).
             static const bool wide_env = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE");
                 return e != nullptr && e[0] != '\0' && e[0] != '0';
