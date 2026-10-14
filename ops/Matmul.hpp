@@ -1033,23 +1033,27 @@ class MatMulBuffer : public BufferFactory {
             // N=151936: ~15% faster, measured) because halving the load count
             // is a pure bandwidth win there. But on SMALL N it regresses:
             // WIDE dispatches UP_DIV(n/8, q) blocks vs the standard
-            // UP_DIV(n/4, q), so to keep >= 32 blocks (the occupancy floor)
-            // WIDE has to halve q, which doubles the K-slice count and
-            // stretches the shared-mem fold stage -- at q=4 (the floor) 252 of
-            // 256 lanes sit idle during the fold. The break-even is where WIDE
-            // keeps q=16 without halving: UP_DIV(n/8, 16) >= 32 => n >= 4096.
-            // Below that the standard kernel wins; at/above it WIDE wins/ties.
-            // So fp16 WIDE auto-enables per-N at n >= wide_threshold (default
-            // 4096). The byte-quantized WIDE path (int8/fp8, 16 cols/lane) has
-            // the same economics at 1/2 the column count, so it shares the
-            // threshold. Env overrides (tuning): VKOP_KSPLIT_WIDE=1 forces WIDE
-            // on ALL eligible N; =0 disables it entirely (incl. the auto path);
+            // UP_DIV(n/4, q), so NARROW rows would launch too few blocks and
+            // WIDE has to halve q to keep >= 32 blocks (the occupancy floor),
+            // which doubles the K-slice count and stretches the shared-mem fold
+            // stage. The 8/16-column N GEMVs survive the halving: an
+            // interleaved A/B on the real model (N=2048
+            // q_proj/o_proj/down_proj, WIDE with q=8) beats the standard kernel
+            // by ~19-23% -- the halved load count is a bigger win than the q=8
+            // fold cost. Only N=1024 (k/v_proj) is left out: there WIDE would
+            // have to drop to q=4 (252/256 lanes idle in the fold) and the
+            // paired A/B is flat-to-negative there. So fp16 WIDE auto-enables
+            // per-N at n >= wide_threshold (default 2048). The byte-quantized
+            // WIDE path (int8/fp8, 16 cols/lane) has the same economics at 1/2
+            // the column count, so it shares the threshold. Env overrides
+            // (tuning): VKOP_KSPLIT_WIDE=1 forces WIDE on ALL eligible N; =0
+            // disables it entirely (incl. the auto path);
             // VKOP_KSPLIT_WIDE_N=<n> sets the auto threshold.
             static const int wide_threshold = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE_N");
                 if (e && e[0] != '\0')
                     return std::atoi(e);
-                return 4096;
+                return 2048;
             }();
             const int wide_env_val = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE");
