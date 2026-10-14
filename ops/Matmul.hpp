@@ -1043,18 +1043,20 @@ class MatMulBuffer : public BufferFactory {
             // fold cost. Only N=1024 (k/v_proj) is left out: there WIDE would
             // have to drop to q=4 (252/256 lanes idle in the fold) and the
             // paired A/B is flat-to-negative there. So fp16 WIDE auto-enables
-            // per-N at n >= wide_threshold (default 2048). The byte-quantized
-            // WIDE path (int8/fp8, 16 cols/lane) has the same economics at 1/2
-            // the column count, so it shares the threshold. Env overrides
-            // (tuning): VKOP_KSPLIT_WIDE=1 forces WIDE on ALL eligible N; =0
-            // disables it entirely (incl. the auto path);
-            // VKOP_KSPLIT_WIDE_N=<n> sets the auto threshold.
-            static const int wide_threshold = [] {
+            // per-N at n >= wide_threshold_fp16 (default 2048). The
+            // byte-quantized WIDE path (int8/fp8, 16 cols/lane) is a different
+            // trade and gets its own threshold (see wide_threshold_byte below).
+            // Env overrides (tuning): VKOP_KSPLIT_WIDE=1 forces WIDE on ALL
+            // eligible N; =0 disables it entirely (incl. the auto path);
+            // VKOP_KSPLIT_WIDE_N=<n> sets BOTH auto thresholds.
+            const auto wide_threshold_env = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE_N");
                 if (e && e[0] != '\0')
                     return std::atoi(e);
-                return 2048;
+                return -1;
             }();
+            const int wide_threshold_fp16 =
+                (wide_threshold_env >= 0) ? wide_threshold_env : 2048;
             const int wide_env_val = [] {
                 const char *e = std::getenv("VKOP_KSPLIT_WIDE");
                 if (!e || e[0] == '\0')
@@ -1065,18 +1067,24 @@ class MatMulBuffer : public BufferFactory {
             const bool wide_forced = wide_env_val > 0;
             // Byte WIDE (int8/fp8): 16 columns per lane, twice the fp16 WIDE
             // width, so its block count is UP_DIV(n/16, q) and the 32-block
-            // occupancy floor holds only down to q=4 -- i.e. only for
-            // n >= 2048. Narrower rows pin q at its floor with fewer than 32
-            // blocks launched and most lanes idle in the shared-mem fold, so
-            // auto-enable at the same n >= wide_threshold as fp16 WIDE. At and
-            // above it the win is large: an interleaved 10-pair A/B on the qdq
-            // Qwen2.5-0.5B model (min-per-op) shows lm_head -56.7%
-            // (50.9 -> 22.0 ms), up_proj -22.6%, gate_proj -19.2%, total
-            // decode 323.8 -> 278.6 ms (-14%); q/k/v/o (N=896, below the
-            // threshold) are untouched at <1%. VKOP_KSPLIT_WIDE=1 still forces
-            // it on all eligible N.
+            // occupancy floor holds only down to q=4, i.e. only for n >= 512.
+            // At n=896 (q/o/down_proj in this model) WIDE runs q=4 / 14 blocks
+            // and is still a large win, so the byte threshold sits at 896
+            // rather than the fp16 one. An interleaved 6-pair 3-arm A/B on the
+            // qdq Qwen2.5-0.5B model (min-per-op, single picked decode level)
+            // gives, vs the old n >= 2048 default (A):
+            //   C = threshold 896 : MatMul 19.95 -> 16.77 ms (-15.9%),
+            //       down_proj 4.66 -> 2.63 (-43.6%), q_proj -30.2%,
+            //       o_proj -15.8%; k/v_proj (N=128, below 896) untouched.
+            //   B = VKOP_KSPLIT_WIDE=1 (force all): MatMul -12.5%, but
+            //       k_proj 0.49 -> 0.73 (+49%) and v_proj +46% -- at N=128
+            //       only 8 blocks launch and the shared-mem fold stalls.
+            // 896 is therefore strictly better than both: it takes the N=896
+            // win without the N=128 loss.
+            const int wide_threshold_byte =
+                (wide_threshold_env >= 0) ? wide_threshold_env : 896;
             if (!wide_disabled && weight_byte && (n % 16 == 0) &&
-                (wide_forced || n >= wide_threshold)) {
+                (wide_forced || n >= wide_threshold_byte)) {
                 while (q > 4 && UP_DIV(n / 16, q) < 32) {
                     q /= 2;
                 }
@@ -1089,9 +1097,10 @@ class MatMulBuffer : public BufferFactory {
                 submit(&para_, UP_DIV(n / 16, q), batch * m, 1);
                 return;
             }
-            // fp16 WIDE: auto per-N (n >= wide_threshold) or forced on all.
+            // fp16 WIDE: auto per-N (n >= wide_threshold_fp16) or forced on
+            // all.
             if (!wide_disabled && !weight_byte && (n % 8 == 0) &&
-                (wide_forced || n >= wide_threshold)) {
+                (wide_forced || n >= wide_threshold_fp16)) {
                 while (q > 4 && UP_DIV(n / 8, q) < 32) {
                     q /= 2;
                 }
