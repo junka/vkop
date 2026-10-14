@@ -21,6 +21,43 @@ namespace vkop {
 namespace ops {
 
 namespace transpose {
+// True when `perm` merely reorders unit-size dims, so the permuted tensor's
+// flat (row-major) memory is byte-identical to the source's — the Transpose is
+// a pure VIEW on the bytes.
+//
+// The shader emits output flat index o from input flat index
+//     in(o) = sum_i c_i * in_stride[perm[i]]
+// (it assigns in_coord[perm[i]] = out_coord[i] and reads the input linearly),
+// while o itself is sum_i c_i * out_stride[i]. A 1:1 flat copy is therefore
+// exact iff out_stride[i] == in_stride[perm[i]] for every i whose source dim
+// size[perm[i]] is > 1 (a size-1 dim has c_i == 0, so its stride is moot).
+//
+// This is not a heuristic: it is the exact condition under which the naive
+// gather degenerates to an identity, and it is the common case in decode —
+// [1,heads,1,head_dim] under perm [0,2,1,3], and [1,1,head_dim] under [0,2,1].
+bool flat_identity_perm(const std::vector<int> &shape,
+                        const std::vector<int> &perm) {
+    int rank = static_cast<int>(shape.size());
+    if (static_cast<int>(perm.size()) != rank)
+        return false;
+    std::vector<int> in_stride(rank, 1), out_stride(rank, 1);
+    for (int d = rank - 2; d >= 0; --d) {
+        in_stride[d] = in_stride[d + 1] * shape[d + 1];
+    }
+    for (int d = rank - 2; d >= 0; --d) {
+        out_stride[d] = out_stride[d + 1] * shape[perm[d + 1]];
+    }
+    for (int i = 0; i < rank; ++i) {
+        if (shape[perm[i]] == 1) {
+            continue;
+        }
+        if (out_stride[i] != in_stride[perm[i]]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct GpuTransposeParam {
     ivec4 inShape;
     ivec4 outShape;
@@ -165,6 +202,38 @@ class TransposeBuffer : public BufferFactory {
                 output->set_host_authoritative();
             }
             return;
+        }
+
+        // Flat-identity perm (see flat_identity_perm): the permuted bytes are
+        // identical to the source's, so this Transpose is a pure VIEW — alias
+        // the input's VkBuffer exactly like Reshape does (ops/Reshape.hpp:413),
+        // skipping the gather dispatch entirely. 24 dispatches/decode round on
+        // the Qwen2.5 attention output ([1,heads,1,head_dim], perm [0,2,1,3]),
+        // plus the rotary [1,1,head_dim] instance during decode. In prefill the
+        // seq dim is > 1 and the perm is no longer an identity, so those levels
+        // keep the real dispatch — this only fires where the bytes genuinely do
+        // not move.
+        if (transpose::flat_identity_perm(inshape, perm_)) {
+            bool aliased = false;
+            dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto src = core::as_tensor<T>(inputs[0]);
+                if (!src->has_gpu_buffer()) {
+                    return;
+                }
+                auto output = core::as_tensor<T>(outputs[0]);
+                if (output->num_elements() != total_elems(outshape)) {
+                    output->resize(outshape);
+                }
+                auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                    src->as_storage_buffer(m_dev_, m_cmd_));
+                objs_.emplace_back(
+                    output->alias_storage_buffer(src_buff, m_cmd_));
+                aliased = true;
+            });
+            if (aliased) {
+                return;
+            }
         }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
