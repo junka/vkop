@@ -149,6 +149,9 @@ public:
 } // namespace
 
 TEST(MatMulTest, MatMulEpilogueScaleBias) {
+    // The scale/bias epilogue only exists in the buffer (SSBO) shader set;
+    // the image path has no epilogue at all, so force the backend here.
+    vkop::tests::ScopedBufferBackend buffer;
     // (B, heads, M, K, N, scale) — decode shape: 1 batch, 16 heads, q=1, hd=128
     // is too slow to fill; use a smaller K and a couple of shapes.
     const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
@@ -210,6 +213,8 @@ public:
 } // namespace
 
 TEST(MatMulTest, MatMulSoftmaxFusion) {
+    // attn_softmax only exists in the buffer (SSBO) shader set; force it.
+    vkop::tests::ScopedBufferBackend buffer;
     // (B, heads, M, K, N, scale) — attention-QK^T decode shapes. M is the q_len
     // (1 at decode); a small M>1 case exercises multi-row workgroups.
     const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
@@ -267,6 +272,8 @@ public:
 } // namespace
 
 TEST(MatMulTest, MatMulSoftmaxFusionTransB) {
+    // attn_softmax only exists in the buffer (SSBO) shader set; force it.
+    vkop::tests::ScopedBufferBackend buffer;
     // transB=1, the layout the attention QK^T actually uses at runtime.
     const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
         {2, 4, 1, 16, 64, 0.0884f},
