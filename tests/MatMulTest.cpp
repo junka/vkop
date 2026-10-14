@@ -233,6 +233,62 @@ TEST(MatMulTest, MatMulSoftmaxFusion) {
     }
 }
 
+// transB=1 variant: the real attention QK^T ships K transposed ([batch, N, K]),
+// so the kernel's transB column-walk must produce the same softmax. B is stored
+// as [batch, N, K]; the reference matmul uses the un-transposed [K, N] weight.
+namespace {
+template <typename T>
+class MatMulSoftmaxTransBTest : public TestCase<T> {
+public:
+    MatMulSoftmaxTransBTest(int B, int heads, int M, int K, int N, float scale)
+        : TestCase<T>("MatMul") {
+        int batch = B * heads;
+        auto inputa = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, K});
+        auto inputb = std::make_shared<Tensor<T>>(std::vector<int>{batch, N, K});
+        auto bias = std::make_shared<Tensor<T>>(std::vector<int>{B, M, N});
+        auto output = std::make_shared<Tensor<T>>(std::vector<int>{batch, M, N});
+
+        auto ta = torch::randn({batch, M, K}, this->getTorchConf());
+        auto tb_kn = torch::randn({batch, K, N}, this->getTorchConf());  // ref weight
+        auto tb_nk = tb_kn.transpose(-1, -2).contiguous();               // stored [N,K]
+        auto tbias = torch::randn({B, M, N}, this->getTorchConf());
+        auto mm = torch::matmul(ta, tb_kn);
+        auto bias_rep = tbias.repeat_interleave(heads, 0);
+        auto logits = mm * scale + bias_rep;
+        auto ref = torch::softmax(logits.to(torch::kFloat32), -1).to(this->getTorchConf());
+        this->fillTensorFromTorch(inputa, ta);
+        this->fillTensorFromTorch(inputb, tb_nk);
+        this->fillTensorFromTorch(bias, tbias);
+        this->fillTensorFromTorch(output, ref);
+        inputa_ = inputa; inputb_ = inputb; bias_ = bias; output_ = output;
+    }
+    std::shared_ptr<Tensor<T>> inputa_, inputb_, bias_, output_;
+};
+} // namespace
+
+TEST(MatMulTest, MatMulSoftmaxFusionTransB) {
+    // transB=1, the layout the attention QK^T actually uses at runtime.
+    const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
+        {2, 4, 1, 16, 64, 0.0884f},
+        {1, 8, 1, 128, 256, 0.0884f},  // real head_dim=128, decode kv slice
+    };
+    for (const auto &c : cases) {
+        auto [B, heads, M, K, N, scale] = c;
+        MatMulSoftmaxTransBTest<uint16_t> t(B, heads, M, K, N, scale);
+        std::unordered_map<std::string, std::string> attr = {
+            {"transB", "1"},
+            {"epi_scale", std::to_string(scale)},
+            {"epi_bias", "1"},
+            {"attn_softmax", "1"},
+        };
+        EXPECT_TRUE(t.run_test({t.inputa_, t.inputb_, t.bias_}, {t.output_},
+            [&attr](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute(attr);
+            })) << "transB B=" << B << " heads=" << heads << " M=" << M
+                << " K=" << K << " N=" << N;
+    }
+}
+
 namespace {
 // int8 weight-only MatMul (buffer backend, where the int8 kernel lives). B is
 // the quantized weight and its per-output-column fp32 scale (amax/127 reduced

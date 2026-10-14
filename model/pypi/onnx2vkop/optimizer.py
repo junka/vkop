@@ -4480,7 +4480,19 @@ class FusionOptimizer:
                 # Single Softmax consumer of the scaled+bias QK^T: Plan B fuses
                 # the softmax into the MatMul kernel (online row reduction).
                 if len(cs) == 1 and cs[0][0].op_type == "Softmax":
-                    fold_softmax = True
+                    # Safety gate: the kernel reduces one row in a single
+                    # workgroup, so it can only fire when N (the row length =
+                    # the FE output's last dim) is STATICALLY known and within
+                    # the kernel's coverage (<= 16384 cols). Attention QK^T's N
+                    # is the dynamic kv_len, so this guard keeps the Softmax in
+                    # place there and only folds when N is provably bounded --
+                    # deleting the Softmax over a dynamic-N tensor would leave
+                    # the runtime no fallback if the kernel's N gate tripped.
+                    fe_shape = fe.outputs[0].get("shape")
+                    n_static = (isinstance(fe_shape, list) and len(fe_shape) >= 1
+                                and isinstance(fe_shape[-1], int)
+                                and 0 < fe_shape[-1] <= 16384)
+                    fold_softmax = n_static
             matches.append({
                 "fe": fe,
                 "matmul": mm_node,

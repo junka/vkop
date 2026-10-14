@@ -1126,7 +1126,12 @@ void matmul16_softmax() {
     // for the store, recomputing or caching the dot products. To avoid
     // recomputing the K-dot three times, cache this lane's owned columns in
     // a local array (bounded by SOFTMAX_COLS * ceil(N/SOFTMAX_WG)).
-    const int MAX_OWNED = 64;  // >= ceil(2048 / (SOFTMAX_WG/SOFTMAX_COLS))
+    // MAX_OWNED holds 2 cols per stride trip: 2 * ceil(N / (SOFTMAX_WG*
+    // SOFTMAX_COLS)). At N=16384 that is 64, which the host gate enforces
+    // (n <= 16384). Larger N would need more registers than fit comfortably
+    // in the 16x16 workgroup's file, so the host falls back to the unfused
+    // path beyond it. Realistic decode kv_len is well under this.
+    const int MAX_OWNED = 64;
     float owned[MAX_OWNED];
     int n_owned = 0;
 

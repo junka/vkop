@@ -132,10 +132,117 @@ def test_quantized_matmul_rejected():
     print("  PASS (quantized 3-input MatMul rejected)")
 
 
+def test_softmax_consumer_folds_into_attn_softmax():
+    """When the FE's single consumer is a Softmax, Plan B folds the Softmax
+    into the MatMul: attn_softmax=1, the Softmax node is deleted, and the
+    MatMul produces the Softmax's output tensor name (so the ·V MatMul that
+    read the Softmax now reads the fused MatMul directly)."""
+    m = DAGBasedModel()
+    mm = matmul_node("MM", [tdict("q", [1, 16, 4, 128]), tdict("k", [1, 8, 4, 128])],
+                     out_name="mm_out")
+    fe = canonical_fe("mm_out", "attn_bias", 0.088379, fe_out="fe_out")
+    # Softmax reads fe_out; its output feeds the value MatMul downstream.
+    sm = Node("Softmax", "SM", {"axis": -1},
+              [tdict("fe_out", [1, 16, 4, 8])],
+              [tdict("attn_probs", [1, 16, 4, 8])])
+    m.nodes[mm.name] = mm
+    m.nodes[fe.name] = fe
+    m.nodes[sm.name] = sm
+    m.outputs = [tdict("attn_probs", [1, 16, 4, 8])]
+
+    ms = matches_of(m)
+    assert len(ms) == 1, ms
+    assert ms[0].get("fold_softmax") is True, ms[0]
+    FusionOptimizer.fold_scale_bias_into_matmul(m, ms[0])
+
+    assert count(m, "FusedElemwise") == 0
+    assert count(m, "Softmax") == 0
+    assert count(m, "MatMul") == 1
+    mm2 = m.nodes["MM"]
+    assert mm2.attributes["epi_scale"] == 0.088379
+    assert mm2.attributes["epi_bias"] == 1
+    assert mm2.attributes["attn_softmax"] == 1
+    assert len(mm2.inputs) == 3
+    assert mm2.inputs[2]["name"] == "attn_bias"
+    # MatMul now produces the Softmax's output name, not the FE's.
+    assert mm2.outputs[0]["name"] == "attn_probs"
+    print("  PASS (Softmax consumer -> attn_softmax=1, Softmax deleted)")
+
+
+def test_non_softmax_consumer_not_folded():
+    """If the FE's single consumer is NOT a Softmax (e.g. an Add), Plan B
+    must not fire: attn_softmax absent, the consumer node survives, and the
+    MatMul produces the FE's output (Plan A behaviour)."""
+    m = DAGBasedModel()
+    mm = matmul_node("MM", [tdict("q"), tdict("k")], out_name="mm_out")
+    fe = canonical_fe("mm_out", "attn_bias", 0.5, fe_out="fe_out")
+    add = Node("Add", "ADD", {}, [tdict("fe_out"), tdict("resid", [1, 16, 4, 8])],
+               [tdict("add_out", [1, 16, 4, 8])])
+    m.nodes[mm.name] = mm
+    m.nodes[fe.name] = fe
+    m.nodes[add.name] = add
+    m.outputs = [tdict("add_out", [1, 16, 4, 8])]
+
+    ms = matches_of(m)
+    assert len(ms) == 1, ms
+    assert ms[0].get("fold_softmax") is False, ms[0]
+    FusionOptimizer.fold_scale_bias_into_matmul(m, ms[0])
+    mm2 = m.nodes["MM"]
+    assert "attn_softmax" not in mm2.attributes
+    assert count(m, "Add") == 1   # consumer survives
+    assert mm2.outputs[0]["name"] == "fe_out"
+    print("  PASS (non-Softmax consumer -> Plan A only, attn_softmax absent)")
+
+
+def test_dynamic_n_softmax_not_folded():
+    """Safety gate: the softmax-fusion kernel reduces one row in a single
+    workgroup, so it can only fire when N is STATICALLY known and <= 16384.
+    Attention QK^T's N is the dynamic kv_len (a -1 / symbolic dim at convert
+    time). Folding the Softmax there would delete the runtime fallback when
+    the kernel's N gate trips, so the converter must leave the Softmax in
+    place and NOT set attn_softmax. The MatMul still gets the scale+bias
+    epilogue (Plan A); only Plan B is suppressed."""
+    m = DAGBasedModel()
+    # FE output shape with a dynamic last dim (-1 = kv_len).
+    fe = Node("FusedElemwise", "FE",
+              {"ops": [3, 3, 0, 100, 1, 0, 3, 2], "scalars": [0.088379]},
+              [tdict("mm_out", [-1, -1, -1, -1]),
+               tdict("scalar_const", [], 10),
+               tdict("attn_bias", [1, 1, 4, -1], 10)],
+              [tdict("fe_out", [1, 16, 4, -1])])
+    mm = matmul_node("MM", [tdict("q", [1, 16, 4, 128]),
+                            tdict("k", [1, 8, 4, 128])], out_name="mm_out")
+    sm = Node("Softmax", "SM", {"axis": -1},
+              [tdict("fe_out", [1, 16, 4, -1])],
+              [tdict("attn_probs", [1, 16, 4, -1])])
+    m.nodes[mm.name] = mm
+    m.nodes[fe.name] = fe
+    m.nodes[sm.name] = sm
+    m.outputs = [tdict("attn_probs", [1, 16, 4, -1])]
+
+    ms = matches_of(m)
+    assert len(ms) == 1, ms
+    assert ms[0].get("fold_softmax") is False, ms[0]
+    FusionOptimizer.fold_scale_bias_into_matmul(m, ms[0])
+    mm2 = m.nodes["MM"]
+    # Plan A still applied...
+    assert mm2.attributes["epi_scale"] == 0.088379
+    assert mm2.attributes["epi_bias"] == 1
+    # ...but Plan B is NOT (dynamic N), so the Softmax survives.
+    assert "attn_softmax" not in mm2.attributes
+    assert count(m, "Softmax") == 1
+    print("  PASS (dynamic-N Softmax consumer -> Plan A only, Softmax kept)")
+
+
 if __name__ == "__main__":
     test_canonical_scale_bias_folds_into_matmul()
     test_mul_then_mul_does_not_match()
     test_non_scalar_first_operand_rejected()
     test_three_op_chain_rejected()
     test_quantized_matmul_rejected()
+    test_softmax_consumer_folds_into_attn_softmax()
+    test_non_softmax_consumer_not_folded()
+    test_dynamic_n_softmax_not_folded()
     print("\nAll fuse_scale_bias_into_matmul tests passed.")
+
+

@@ -932,7 +932,7 @@ class MatMulBuffer : public BufferFactory {
         // single consumer.
         para_.attn_softmax =
             (attn_softmax_ && fp16_ != 0 && (n & 1) == 0 && !weight_int8 &&
-             !weight_fp8 && !weight_4bit && n > 0 && n <= 32768 && k <= 1024)
+             !weight_fp8 && !weight_4bit && n > 0 && n <= 16384 && k <= 1024)
                 ? 1
                 : 0;
 
