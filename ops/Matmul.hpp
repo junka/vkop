@@ -1063,9 +1063,20 @@ class MatMulBuffer : public BufferFactory {
             }();
             const bool wide_disabled = wide_env_val < 0;
             const bool wide_forced = wide_env_val > 0;
-            // Byte WIDE (int8/fp8): force-only -- preserves prior behaviour and
-            // its separate measured tuning; not auto-enabled per-N.
-            if (wide_forced && weight_byte && (n % 16 == 0)) {
+            // Byte WIDE (int8/fp8): 16 columns per lane, twice the fp16 WIDE
+            // width, so its block count is UP_DIV(n/16, q) and the 32-block
+            // occupancy floor holds only down to q=4 -- i.e. only for
+            // n >= 2048. Narrower rows pin q at its floor with fewer than 32
+            // blocks launched and most lanes idle in the shared-mem fold, so
+            // auto-enable at the same n >= wide_threshold as fp16 WIDE. At and
+            // above it the win is large: an interleaved 10-pair A/B on the qdq
+            // Qwen2.5-0.5B model (min-per-op) shows lm_head -56.7%
+            // (50.9 -> 22.0 ms), up_proj -22.6%, gate_proj -19.2%, total
+            // decode 323.8 -> 278.6 ms (-14%); q/k/v/o (N=896, below the
+            // threshold) are untouched at <1%. VKOP_KSPLIT_WIDE=1 still forces
+            // it on all eligible N.
+            if (!wide_disabled && weight_byte && (n % 16 == 0) &&
+                (wide_forced || n >= wide_threshold)) {
                 while (q > 4 && UP_DIV(n / 16, q) < 32) {
                     q /= 2;
                 }
