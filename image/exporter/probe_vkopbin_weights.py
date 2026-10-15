@@ -20,12 +20,36 @@ HERE = Path(__file__).resolve().parent
 # Model table field ids (declaration order in vkop_model.fbs)
 F_INPUTS, F_OUTPUTS = 2, 3
 F_NODES, F_INITIALZERS, F_BLOB = 4, 5, 6
+F_UNIFIED, F_UNIFIED_META, F_UNIFIED_NAMES = 7, 9, 10
+F_UNIFIED_BLOB_OFFSET = 13
 # Node field ids
 N_OPTYPE, N_NAME, N_INPUTS, N_OUTPUTS, N_DEPS = 0, 1, 3, 4, 5
 # ShapeRef field ids
 S_NAME, S_DIMS, S_VALUE_DYNAMIC = 0, 1, 4
 # InitializerEntry field ids
 E_NAME, E_DTYPE, E_DIMS, E_OFFSET, E_SIZE = 0, 1, 2, 3, 4
+
+# InitializerEntry.dtype -> numpy view. `bfloat16` and the quantized payloads
+# (fp8 one byte/value, 4-bit two values/byte, per dag.py _PACKED_DATA_TYPES) are
+# shown as bytes: the probe reports what is stored, not what it decodes to.
+_NP_VIEW = {
+    "float16": np.float16, "float32": np.float32, "float64": np.float64,
+    "bool": np.uint8, "string": np.uint8, "bfloat16": np.uint8,
+    "uint8": np.uint8, "int8": np.int8,
+    "uint16": np.uint16, "int16": np.int16,
+    "uint32": np.uint32, "int32": np.int32,
+    "uint64": np.uint64, "int64": np.int64,
+    "float8e4m3fn": np.uint8, "float8e5m2": np.uint8,
+    "uint4": np.uint8, "int4": np.uint8, "float4e2m1fn": np.uint8,
+}
+# Two values per byte: the element count is 2 * the byte count, not size/itemsize.
+_PACKED = frozenset(("uint4", "int4", "float4e2m1fn"))
+
+# UnifiedMeta.dtype stores the ONNX TensorProto element type verbatim
+# (optimizer.py `dtype_map = {1: 1, 10: 10, 3: 3}`), so decode it with the same
+# names dag.py `_DATA_TYPE_MAP` writes into InitializerEntry.dtype.
+_ONNX_DTYPE_NAME = {1: "float32", 2: "uint8", 3: "int8", 6: "int32", 7: "int64",
+                    9: "bool", 10: "float16", 11: "float64"}
 
 
 def u32(b, p):
@@ -43,6 +67,15 @@ def field_pos(b, table_pos, field_id):
     return table_pos + fo if fo else None
 
 
+def field_u64(b, table_pos, field_id):
+    """Scalar ulong field. A flatbuffers writer omits a field that equals its
+    schema default, and `offset: ulong` (vkop_model.fbs) defaults to 0 -- so an
+    absent field is 0, not a parse failure. The first initializer of every blob
+    sits at offset 0 for exactly this reason."""
+    pos = field_pos(b, table_pos, field_id)
+    return 0 if pos is None else struct.unpack_from("<Q", b, pos)[0]
+
+
 def read_string(b, pos):
     p = pos + u32(b, pos)
     n = u32(b, p)
@@ -50,6 +83,8 @@ def read_string(b, pos):
 
 
 def read_uintvec(b, pos):
+    if pos is None:  # absent vector == empty
+        return []
     p = pos + u32(b, pos)
     n = u32(b, p)
     return list(struct.unpack_from(f"<{n}I", b, p + 4))
@@ -65,6 +100,54 @@ def read_blob(b, pos):
     p = pos + u32(b, pos)
     n = u32(b, p)
     return memoryview(b)[p + 4:p + 4 + n]
+
+
+def probe_unified(b, root, blob, init_names):
+    """Walk the `-u` unified region, which is where the weights actually live once
+    Unifier has merged them.
+
+    `unified_meta` is a vector of inline 32-byte `struct UnifiedMeta` (8 x int32:
+    dtype, name_len, offset, size, dims[4]) and `unified_names` is ONE concatenated
+    byte string consumed sequentially by name_len in meta order -- the same two
+    facts core/runtime.cpp:379-420 reads. `offset` is RELATIVE to the region: the
+    runtime basing its pointer at unified_blob_offset is what makes it absolute,
+    and that is also the only way it fits the int32 field for a multi-GB blob.
+    The InitializerEntry rows for the same names carry the absolute offset.
+    """
+    mpos = field_pos(b, root, F_UNIFIED_META)
+    if mpos is None:
+        return
+    p = mpos + u32(b, mpos)
+    n = u32(b, p)
+    npos = field_pos(b, root, F_UNIFIED_NAMES)
+    if npos is None:
+        print("[unified] meta present but no unified_names -- cannot resolve names")
+        return
+    np_ = npos + u32(b, npos)
+    names = b[np_ + 4:np_ + 4 + u32(b, np_)]
+    base = field_u64(b, root, F_UNIFIED_BLOB_OFFSET)
+    print(f"[unified] {n} sub-tensors at blob+{base}, names table {len(names)} B, "
+          f"{len(init_names)} InitializerEntry rows")
+    cur = missing = 0
+    for i in range(n):
+        ep = p + 4 + i * 32
+        dtype_i, name_len, off, size = struct.unpack_from("<4i", b, ep)
+        dims = list(struct.unpack_from("<4i", b, ep + 16))
+        while dims and dims[-1] == 0:  # fixed-4 slot, zero padded
+            dims.pop()
+        name = names[cur:cur + name_len].decode(errors="replace")
+        cur += name_len
+        if name not in init_names:
+            missing += 1
+        dt = _ONNX_DTYPE_NAME.get(dtype_i, f"onnx{dtype_i}")
+        abs_off = base + off
+        view = np.frombuffer(blob[abs_off:abs_off + size], dtype=np.dtype(_NP_VIEW.get(dt, np.uint8)))
+        nz = int(np.count_nonzero(view))
+        print(f"    {name[:36]:36s} {dt:14s} {str(dims)[:22]:22s} "
+              f"off={off}(+{base}={abs_off}) size={size:<8d} nz={nz}/{len(view)}")
+    if missing:
+        print(f"    !! {missing}/{n} unified names have no InitializerEntry row, "
+              f"but the runtime looks each one up there (runtime.cpp:418)")
 
 
 def probe(vkopbin):
@@ -94,23 +177,28 @@ def probe(vkopbin):
     print(f"[{vkopbin}] nodes={sum(ops.values())} ops={dict(sorted(ops.items()))}")
     p = ipos + u32(b, ipos)
     n = u32(b, p)
+    init_names = set()
     print(f"[{vkopbin}] {n} initializers, blob={len(blob)} B "
           f"blob_nz={int(np.count_nonzero(np.frombuffer(blob, dtype=np.uint8)))}")
     for i in range(n):
         epos = p + 4 + i * 4
         tpos = epos + u32(b, epos)
         name = read_string(b, field_pos(b, tpos, E_NAME))
+        init_names.add(name)
         dtype = read_string(b, field_pos(b, tpos, E_DTYPE))
         dims = read_uintvec(b, field_pos(b, tpos, E_DIMS))
-        off = struct.unpack_from("<Q", b, field_pos(b, tpos, E_OFFSET))[0]
-        size = struct.unpack_from("<Q", b, field_pos(b, tpos, E_SIZE))[0]
-        view = np.frombuffer(blob[off:off + size], dtype=np.float16)
-        nz = int(np.count_nonzero(view.view(np.uint16) & 0x7FFF))
-        fin = view[np.isfinite(view)]
-        print(f"    {name[:36]:36s} {dtype:8s} {str(dims)[:22]:22s} "
-              f"off={off:<9d} size={size:<8d} nz={nz}/{len(view)} "
+        off = field_u64(b, tpos, E_OFFSET)
+        size = field_u64(b, tpos, E_SIZE)
+        np_dt = np.dtype(_NP_VIEW.get(dtype, np.uint8))
+        view = np.frombuffer(blob[off:off + size], dtype=np_dt)
+        nel = 2 * size if dtype in _PACKED else len(view)
+        nz = int(np.count_nonzero(view))
+        fin = view[np.isfinite(view)] if view.dtype.kind == "f" else view
+        print(f"    {name[:36]:36s} {dtype:14s} {str(dims)[:22]:22s} "
+              f"off={off:<9d} size={size:<8d} nz={nz}/{nel} "
               f"min={float(fin.min()) if fin.size else 0:.4g} max={float(fin.max()) if fin.size else 0:.4g} "
               f"mean={float(fin.mean()) if fin.size else 0:.4g}")
+    probe_unified(b, root, blob, init_names)
 
 
 def read_vec_strs(b, pos):
