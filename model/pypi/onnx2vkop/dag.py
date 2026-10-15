@@ -350,37 +350,61 @@ class DAGBasedModel:
                   f"Constant(s) as initializers")
         self.build_dependencies()
 
-    def drop_unreferenced_initializers(self) -> None:
-        """Delete initializers no node input and no graph output reads.
+    def terminal_liveness_prune(self) -> None:
+        """Delete nodes nothing consumes, then initializers no LIVE node reads.
 
-        The runtime uploads every InitializerEntry it finds, one staging submit
-        plus fence wait each -- 271 us whatever the buffer holds. prune_dead...
-        runs once, before the fusion passes, and those passes delete consumers
-        without touching self.initializers, so the constants they orphan stay in
-        the file (llm.vkopbin: 2106 of 2846 rows, 19 KiB of payload, ~0.7 s of
-        load time). Writing is the one point where nothing can orphan a name
-        afterwards, so the sweep belongs here rather than in a graph pass.
+        The runtime uploads every InitializerEntry it finds, one staging copy
+        plus one submit/fence-wait each -- measured ~85 us per dead entry, ~190
+        us per suppressed wait -- so an entry or a node nothing reads is pure
+        load-time cost. prune_dead... runs once, BEFORE the fusion passes, and
+        those passes rebind or delete consumers without touching either
+        self.nodes or self.initializers, so whatever they orphan stays in the
+        file (llm.vkopbin shipped 2134 unreferenced initializers, 19,324 bytes
+        of folded shape-chain constants). Writing is the one point where
+        nothing can orphan anything afterwards, so this sweep runs there rather
+        than as another optimizer pass -- and it has to be a node sweep too,
+        because an initializer read only by a dead node is as dead as the node.
 
         Unified / RGBA sub-allocation members are kept even when unreferenced:
         their bytes already live in the shared region, dropping one would mean
         repacking every offset in it, and they cost a BufferView each (0.18 us),
         not an upload.
         """
+        producer = {}
+        for node in self.nodes.values():
+            for out in node.outputs:
+                producer[out["name"]] = node
+        live_nodes = set()
+        stack = [o["name"] for o in self.outputs]
+        while stack:
+            n = producer.get(stack.pop())
+            if n is None or n.name in live_nodes:
+                continue
+            live_nodes.add(n.name)
+            stack.extend(inp["name"] for inp in n.inputs)
+        dead_nodes = [name for name in self.nodes if name not in live_nodes]
+        for name in dead_nodes:
+            del self.nodes[name]
+
         live = {o["name"] for o in self.outputs}
         live.update(i["name"] for i in self.inputs)
         for m in self.unified_meta:
             live.add(m["_name"])
         for m in self.rgba_meta:
             live.add(m.get("_name", ""))
-        for node in self.nodes.values():
-            live.update(inp["name"] for inp in node.inputs)
-        dead = [name for name in self.initializers if name not in live]
-        freed = sum(_init_byte_len(self.initializers[name]) for name in dead)
-        for name in dead:
+        for name in live_nodes:
+            live.update(inp["name"] for inp in self.nodes[name].inputs)
+        dead_inits = [name for name in self.initializers if name not in live]
+        freed = sum(_init_byte_len(self.initializers[name])
+                    for name in dead_inits)
+        for name in dead_inits:
             del self.initializers[name]
-        if dead:
-            print(f"[prune-inits] dropped {len(dead)} unreferenced initializers "
+        if dead_nodes or dead_inits:
+            print(f"[terminal-prune] dropped {len(dead_nodes)} dead node(s), "
+                  f"{len(dead_inits)} unreferenced initializer(s) "
                   f"({freed} bytes)")
+        if dead_nodes:
+            self.build_dependencies()
 
     def save_to_binary(self, file_path: str):
         """Save model to a FlatBuffers binary file.
@@ -393,9 +417,9 @@ class DAGBasedModel:
         """
         # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
         self.prune_dead_and_materialize_constants()
-        # 终局剪枝：所有 pass 跑完后，把没有任何节点输入引用的初始值删掉，
-        # 不再写进侧表/blob（见 drop_unreferenced_initializers）。
-        self.drop_unreferenced_initializers()
+        # 终局 liveness：所有 pass 跑完后，先删没有任何消费者指向的节点，再删
+        # 没有活节点引用的初始值，两者都不写进产物（见 terminal_liveness_prune）。
+        self.terminal_liveness_prune()
 
         builder = flatbuffers.Builder(1 << 16)
 
