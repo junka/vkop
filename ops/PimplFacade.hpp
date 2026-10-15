@@ -66,6 +66,9 @@ class PimplFacade : public Operator {
     void set_input_value_dynamic(const std::vector<bool> &vd) override {
         impl_->set_input_value_dynamic(vd);
     }
+    void set_host_target_shape(const std::vector<int> &dims) override {
+        impl_->set_host_target_shape(dims);
+    }
     void set_prof_query(VkQueryPool pool, uint32_t base) override {
         impl_->set_prof_query(pool, base);
     }

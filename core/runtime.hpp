@@ -84,6 +84,28 @@ class Runtime {
     // int64 shape-meta inputs; false for all others (no cache attempted).
     std::vector<std::vector<bool>> node_input_value_dynamic_;
 
+    // Phase 4-r2 shape-chain host-ification: per-node parsed term list from
+    // the converter's `vkop_host_shape` Reshape attribute. Each term is
+    // either a constant dim or "the dim_idx-th dim of tensor src". The
+    // runtime evaluates the term list from LIVE tensor metadata right before
+    // the Reshape executes each round — lazy, because a REF term may
+    // reference a tensor produced earlier in the SAME round whose dims are
+    // only final once its producer has run — and pushes the result via
+    // Operator::set_host_target_shape. Empty list = legacy two-input Reshape
+    // (target still read from a GPU int64 chain).
+    struct HostShapeTerm {
+        bool is_const = false;
+        int cval = 0;
+        int dim_idx = 0;
+        std::shared_ptr<ITensor> src;
+    };
+    std::vector<std::vector<HostShapeTerm>> node_host_shapes_;
+
+    // Evaluate node_host_shapes_[node_idx] (if any) from live tensor shapes
+    // and push the result to the op (set_host_target_shape). No-op for
+    // legacy two-input Reshapes (empty term list).
+    void eval_host_target_shape(size_t node_idx);
+
     // Record-once-replay (cuda-graph-style): per-node snapshot of the LIVE
     // input shapes (tensor->getShape()) from the round that earned CACHED. On
     // a later round, if any input's live shape differs, the op is dynamic for

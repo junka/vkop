@@ -1053,6 +1053,61 @@ void Runtime::LoadModel() {
                 level_op_seq_[level_idx].push_back(n.op_type);
             }
             node_input_value_dynamic_.push_back(std::move(node_input_vd));
+
+            // Phase 4-r2: parse the converter's host-evaluated target-shape
+            // attribute (model/pypi/onnx2vkop/host_shape.py). Terms:
+            //   c<val>            constant dim
+            //   i<dim_idx>:<name> live dim of tensor <name>
+            // REF tensors are guaranteed (Python-side reachability check) to
+            // be graph inputs, initializers, or producers of this node's
+            // data inputs — i.e. already in tensor_map by the time this
+            // level loads. Evaluation is deferred to Run() (see
+            // eval_host_target_shape) because a REF tensor's dims are only
+            // final once its producer has executed.
+            std::vector<HostShapeTerm> host_terms;
+            if (type == vkop::ops::OpType::RESHAPE) {
+                auto hs = n.attributes.find("vkop_host_shape");
+                if (hs != n.attributes.end() && !hs->second.empty()) {
+                    size_t pos = 0;
+                    while (pos < hs->second.size()) {
+                        size_t comma = hs->second.find(',', pos);
+                        if (comma == std::string::npos) {
+                            comma = hs->second.size();
+                        }
+                        std::string tok = hs->second.substr(pos, comma - pos);
+                        pos = comma + 1;
+                        if (tok.empty()) {
+                            continue;
+                        }
+                        if (tok[0] == 'c') {
+                            HostShapeTerm t;
+                            t.is_const = true;
+                            t.cval = std::stoi(tok.substr(1));
+                            host_terms.push_back(std::move(t));
+                        } else if (tok[0] == 'i') {
+                            size_t colon = tok.find(':');
+                            if (colon == std::string::npos) {
+                                throw std::runtime_error(
+                                    "bad vkop_host_shape term: " + tok);
+                            }
+                            HostShapeTerm t;
+                            t.dim_idx = std::stoi(tok.substr(1, colon - 1));
+                            auto src = tensor_map.find(tok.substr(colon + 1));
+                            if (src == tensor_map.end()) {
+                                throw std::runtime_error(
+                                    "vkop_host_shape REF tensor not found: " +
+                                    tok);
+                            }
+                            t.src = src->second;
+                            host_terms.push_back(std::move(t));
+                        } else {
+                            throw std::runtime_error(
+                                "bad vkop_host_shape term: " + tok);
+                        }
+                    }
+                }
+            }
+            node_host_shapes_.push_back(std::move(host_terms));
         }
     }
     // Graph-output dtype fixup. outputs_/real_outputs_ are allocated up front
@@ -1398,6 +1453,7 @@ double Runtime::Run() {
                         }
                     }
                 }
+                eval_host_target_shape(node_idx);
                 node_ops_[node_idx]->set_input_value_dynamic(
                     node_input_value_dynamic_[node_idx]);
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
@@ -1698,6 +1754,7 @@ double Runtime::Run() {
                         }
                     }
                 }
+                eval_host_target_shape(node_idx);
                 node_ops_[node_idx]->set_input_value_dynamic(
                     node_input_value_dynamic_[node_idx]);
                 node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
@@ -2220,6 +2277,16 @@ double Runtime::Run() {
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';
     std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds;
+    // VKOP_SEG_PROF=1: per-segment CPU submit time + GPU completion time.
+    // Splits the round wall into per-segment execution and inter-segment
+    // gaps: graph_submit() stamps the CPU submit instant, the end-of-round
+    // reset loop waits each segment in order (they are timeline-chained, so
+    // wait i returns when segment i finishes) and stamps the completion
+    // instant. All offsets share the seg_prof_t0 clock.
+    bool seg_prof =
+        std::getenv("VKOP_SEG_PROF") && std::getenv("VKOP_SEG_PROF")[0] == '1';
+    auto seg_prof_t0 = std::chrono::steady_clock::now();
+    std::vector<std::pair<double, double>> seg_submit_at; // (at_ms, dur_ms)
     std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
     size_t graph_next_seg = 0;  // next free slot in graph_cmds
     size_t graph_seg_start = 0; // level_idx the open segment started at
@@ -2253,7 +2320,17 @@ double Runtime::Run() {
         // big segment's encoding cost lands here rather than in the GPU wait.
         auto gs_t0 = run_profile ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-        graph_prev_val = graph_seg->submit(queue0);
+        if (seg_prof) {
+            auto s0 = std::chrono::steady_clock::now();
+            graph_prev_val = graph_seg->submit(queue0);
+            auto s1 = std::chrono::steady_clock::now();
+            seg_submit_at.emplace_back(
+                std::chrono::duration<double, std::milli>(s0 - seg_prof_t0)
+                    .count(),
+                std::chrono::duration<double, std::milli>(s1 - s0).count());
+        } else {
+            graph_prev_val = graph_seg->submit(queue0);
+        }
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
         if (run_profile) {
@@ -2318,6 +2395,11 @@ double Runtime::Run() {
         auto rec_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
         for (auto node_idx : level_nodes) {
+            // seg-prof marker: op indices at which each new segment begins,
+            // to align [tsdump] gap positions with segment boundaries.
+            if (seg_prof && level_idx == graph_seg_start)
+                fprintf(stderr, "[segmark] level=%zu op=%zu\n", level_idx,
+                        node_idx);
             auto rs_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
             const auto &shapes = node_input_shapes_[node_idx];
@@ -2373,6 +2455,7 @@ double Runtime::Run() {
             uint64_t sc_before = graph_mode ? 0 : queue0->submitCount();
             if (graph_mode)
                 node_ops_[node_idx]->set_graph_cmd(graph_seg);
+            eval_host_target_shape(node_idx);
             node_ops_[node_idx]->set_input_value_dynamic(
                 node_input_value_dynamic_[node_idx]);
             graph_op_idx = graph_mode ? static_cast<int>(node_idx) : -1;
@@ -2712,9 +2795,38 @@ double Runtime::Run() {
         flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
     }
 
+    if (graph_mode && seg_prof) {
+        // Ordered per-segment wait BEFORE the final wait: the segments are
+        // timeline-chained, so waiting seg 0..N in order returns exactly when
+        // each segment finished on the GPU — the completion timeline. The
+        // final wait below is then already satisfied (skip it under seg_prof;
+        // the last iteration of this loop waited the same buffer).
+        double prev_done = 0.0;
+        size_t seg_i = 0;
+        for (auto &c : graph_cmds) {
+            c->wait();
+            auto w1 = std::chrono::steady_clock::now();
+            double done =
+                std::chrono::duration<double, std::milli>(w1 - seg_prof_t0)
+                    .count();
+            double sub_at = seg_i < seg_submit_at.size()
+                                ? seg_submit_at[seg_i].first
+                                : -1.0;
+            double sub_dur = seg_i < seg_submit_at.size()
+                                 ? seg_submit_at[seg_i].second
+                                 : -1.0;
+            fprintf(stderr,
+                    "[segprof] seg %2zu: submit_at=%7.1fms"
+                    " (submit took %5.1fms)  done_at=%7.1fms"
+                    "  delta_vs_prev_done=%6.1fms\n",
+                    seg_i, sub_at, sub_dur, done, done - prev_done);
+            prev_done = done;
+            seg_i++;
+        }
+    }
     // Wait for the final level, then reset all command buffers.
     for (int ci = 0; ci < vkop::kInflight; ci++) {
-        if (last_commands[ci]) {
+        if (last_commands[ci] && !seg_prof) {
             last_commands[ci]->wait();
         }
     }
@@ -2889,6 +3001,55 @@ double Runtime::Run() {
             }
             fprintf(stderr, "[submitprof] %-14s %6d %8.2f\n", "TOTAL",
                     static_cast<int>(node_ops_.size()), total_gpu_ms);
+            // VKOP_SUBMIT_DUMP=1: absolute per-op GPU timeline (ms from the
+            // round's first begin tick). Overlapping windows mean the driver
+            // does not timestamp in dispatch order (unreliable); inter-window
+            // gaps are GPU-timeline time no op owns.
+            if (const char *de = std::getenv("VKOP_SUBMIT_DUMP");
+                de && de[0] == '1') {
+                double base = -1.0;
+                for (size_t i = 0; i < node_ops_.size(); ++i) {
+                    if (ts[i * 2] == 0 || ts[i * 2 + 1] == 0)
+                        continue;
+                    double bm = static_cast<double>(ts[i * 2]) *
+                                timestamp_period_ / 1.0e6;
+                    if (base < 0.0 || bm < base)
+                        base = bm;
+                }
+                double prev_end = -1.0;
+                double gap_total = 0.0, overlap_total = 0.0;
+                for (size_t i = 0; i < node_ops_.size(); ++i) {
+                    uint64_t b = ts[i * 2], e = ts[i * 2 + 1];
+                    if (b == 0 || e == 0)
+                        continue;
+                    double bm =
+                        static_cast<double>(b) * timestamp_period_ / 1.0e6 -
+                        base;
+                    double em =
+                        static_cast<double>(e) * timestamp_period_ / 1.0e6 -
+                        base;
+                    const char *rel = "seq";
+                    if (prev_end >= 0.0) {
+                        if (bm > prev_end) {
+                            gap_total += bm - prev_end;
+                            rel = "GAP";
+                        } else if (em < prev_end) {
+                            overlap_total += prev_end - em;
+                            rel = "OVL";
+                        }
+                    }
+                    fprintf(stderr,
+                            "[tsdump] %4zu %s begin=%9.3f end=%9.3f"
+                            " dur=%8.3f %s %s\n",
+                            i, rel, bm, em, em - bm,
+                            convert_optype_to_string(node_ops_[i]->get_type())
+                                .c_str(),
+                            node_ops_[i]->get_name().c_str());
+                    prev_end = std::max(prev_end, em);
+                }
+                fprintf(stderr, "[tsdump] gaps=%.1fms overlaps=%.1fms\n",
+                        gap_total, overlap_total);
+            }
             // Top-N slowest individual ops (reveals which MatMuls dominate).
             std::sort(per_op_ms.begin(), per_op_ms.end(),
                       [](const auto &a, const auto &b) { return a.ms > b.ms; });
@@ -3013,6 +3174,9 @@ void Runtime::RegisterPostProcess(
     node_output_tensors_.push_back(std::move(outputs));
     node_input_shapes_.push_back(std::move(post_input_shapes));
     node_input_value_dynamic_.push_back(std::move(post_input_vd));
+    // Keep node_host_shapes_ parallel with node_ops_ (Run indexes both by
+    // node_idx). Post-process ops never carry a host shape expression.
+    node_host_shapes_.emplace_back();
 
     std::vector<int> post_process_dependencies;
     if (!level_node_indices_.empty()) {
@@ -3033,6 +3197,41 @@ void Runtime::RegisterPostProcess(
         real_outputs_["post_" + convert_optype_to_string(ops) +
                       std::to_string(i)] = outputs[i];
     }
+}
+
+// Phase 4-r2 shape-chain host-ification: evaluate a Reshape's parsed
+// vkop_host_shape term list from LIVE tensor metadata and push the result
+// to the op. Called right before onExecute every round — a REF term may
+// reference a tensor produced earlier in the SAME round, whose dims are
+// only final once its producer has run, so this cannot be hoisted to
+// LoadModel. Replaces the GPU int64 chain (Shape/Gather/Concat) the
+// converter deleted: zero GPU dispatches, zero readbacks for the target.
+void Runtime::eval_host_target_shape(size_t node_idx) {
+    if (node_idx >= node_host_shapes_.size())
+        return;
+    const auto &terms = node_host_shapes_[node_idx];
+    if (terms.empty())
+        return;
+    std::vector<int> dims;
+    dims.reserve(terms.size());
+    for (const auto &t : terms) {
+        if (t.is_const) {
+            dims.push_back(t.cval);
+            continue;
+        }
+        if (!t.src) {
+            throw std::runtime_error("vkop_host_shape: null REF tensor");
+        }
+        const auto &s = t.src->getShape();
+        if (t.dim_idx < 0 || t.dim_idx >= static_cast<int>(s.size())) {
+            throw std::runtime_error("vkop_host_shape: dim_idx " +
+                                     std::to_string(t.dim_idx) +
+                                     " out of range for REF tensor (rank " +
+                                     std::to_string(s.size()) + ")");
+        }
+        dims.push_back(s[static_cast<size_t>(t.dim_idx)]);
+    }
+    node_ops_[node_idx]->set_host_target_shape(dims);
 }
 
 void Runtime::TraceNode(const std::string &name) {

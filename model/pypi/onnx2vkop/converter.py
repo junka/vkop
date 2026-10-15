@@ -617,6 +617,20 @@ class ModelConverter:
         if getattr(args, "unify", False):
             Unifier.unify(dag_model)
 
+        # Phase 4-r2 形状链 host 化：把 Reshape target shape 的 int64 链
+        # （Shape->Gather->Concat）提取成 host 表达式，写进 vkop_host_shape
+        # 属性。转换失败的 Reshape 保持原两输入形态回退旧路径。死链节点由
+        # save_to_binary 的 liveness 剪枝删除。
+        from .host_shape import extract_host_shape_expressions
+        hs = extract_host_shape_expressions(dag_model)
+        if hs["converted"]:
+            print(f"[host_shape] {hs['converted']}/{hs['reshapes']} Reshape "
+                  f"target shapes extracted to host expressions")
+            # 重跑本次提取前 optimizer 循环已消耗过一次 prune
+            # （_prune_materialize_done 守卫会把 save_to_binary 里的再调用
+            # 变成空操作）——重置守卫，让孤儿化的形状链在写盘前被剪掉。
+            dag_model._prune_materialize_done = False
+
     @staticmethod
     def _cleanup_orphan_inputs(dag_model, pre_producer):
         """Fix consumer nodes that reference tensors whose producer was deleted.

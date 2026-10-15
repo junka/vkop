@@ -373,6 +373,17 @@ class Operator {
         (void)vd;
     }
 
+    // Phase 4-r2 shape-chain host-ification: the runtime evaluates the
+    // converter's `vkop_host_shape` term list from LIVE tensor metadata each
+    // round and pushes the resulting target dims here, right before
+    // onExecute. The Reshape then has NO inputs[1] (single-input form — the
+    // converter deleted the int64 Shape/Gather/Concat chain) and takes its
+    // target shape from this call instead. Default no-op; only ops that
+    // consume a shape input override it.
+    virtual void set_host_target_shape(const std::vector<int> &dims) {
+        (void)dims;
+    }
+
     static std::shared_ptr<VulkanBuffer> dummy_buffer_;
     static std::shared_ptr<VulkanBufferView> dummy_bufferview_;
     static std::atomic<int> instance_count_;

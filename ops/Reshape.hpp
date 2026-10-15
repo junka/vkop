@@ -44,20 +44,35 @@ class ReshapeImage : public Operator {
             allowzero_ = std::stol(attributes.at("allowzero"));
         }
     }
+    // Phase 4-r2: host-evaluated target shape. When set (each round, right
+    // before onExecute), the Reshape has NO inputs[1] — the converter
+    // extracted the int64 target chain into `vkop_host_shape` and the
+    // runtime evaluates it from live tensor metadata.
+    void set_host_target_shape(const std::vector<int> &dims) override {
+        host_target_ = dims;
+        host_target_valid_ = true;
+    }
 
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto inshape = inputs[0]->getShape();
-        auto shape = core::as_tensor<int64_t>(inputs[1]);
-        assert(shape->num_dims() == 1);
-        int n = shape->num_elements();
-
-        std::vector<int> dim(n);
-        for (int i = 0; i < n; i++) {
-            dim[i] = static_cast<int>((*shape)[i]);
+        // Target dims: host-evaluated (single-input form) or read back from
+        // the int64 shape input (legacy two-input form).
+        std::vector<int> dim;
+        if (host_target_valid_) {
+            dim = host_target_;
+        } else {
+            auto shape = core::as_tensor<int64_t>(inputs[1]);
+            assert(shape->num_dims() == 1);
+            int n = shape->num_elements();
+            dim.resize(n);
+            for (int i = 0; i < n; i++) {
+                dim[i] = static_cast<int>((*shape)[i]);
+            }
         }
+        int n = static_cast<int>(dim.size());
         auto total = std::accumulate(inshape.begin(), inshape.end(), 1,
                                      std::multiplies<>());
         for (int i = 0; i < n; i++) {
@@ -201,6 +216,10 @@ class ReshapeImage : public Operator {
     }
 
     int allowzero_ = 0;
+    // Host-evaluated target shape (Phase 4-r2). Valid only when the
+    // converter attached vkop_host_shape — the node then has a single input.
+    std::vector<int> host_target_;
+    bool host_target_valid_ = false;
 };
 
 // Buffer (SSBO, compact row-major) reshape. Data is flat row-major so a
@@ -225,6 +244,16 @@ class ReshapeBuffer : public BufferFactory {
     void set_input_value_dynamic(const std::vector<bool> &vd) override {
         shape_value_dynamic_ = (vd.size() > 1) ? vd[1] : true;
     }
+    // Phase 4-r2: host-evaluated target shape. When set (each round, right
+    // before onExecute), the Reshape has NO inputs[1] — the converter
+    // extracted the int64 target chain into `vkop_host_shape` and the
+    // runtime evaluates it from live tensor metadata. execute() then takes
+    // dims from host_target_ and skips resolve_dim (and its readbacks)
+    // entirely.
+    void set_host_target_shape(const std::vector<int> &dims) override {
+        host_target_ = dims;
+        host_target_valid_ = true;
+    }
     void invalidate_shape_cache() override {
         // Phase boundary (prefill->decode): reset learning state so the new
         // phase re-learns stability. The dims that were stable in prefill may
@@ -240,15 +269,19 @@ class ReshapeBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto in_shape = inputs[0]->getShape();
-        auto shape = core::as_tensor<int64_t>(inputs[1]);
 
-        // Resolve the output dim[] from the int64 shape input (inputs[1]).
+        // Resolve the output dim[].
         //
-        // Runtime auto-learning cache (replaces converter-annotation-only
-        // caching): across decode rounds, most Reshape shape inputs are
-        // round-invariant (125/181 — only 56 kv_len-derived ones grow). Rather
-        // than trust the converter's value_dynamic hint, we LEARN by comparing
-        // two consecutive rounds' readback results:
+        // Host-shape mode (Phase 4-r2): the runtime pushed the evaluated
+        // target right before onExecute — no shape input exists, so no
+        // readback and no learning cache.
+        //
+        // Legacy two-input mode: the int64 shape input (inputs[1]) via the
+        // runtime auto-learning + linear-growth cache (resolve_dim). Across
+        // decode rounds, most Reshape shape inputs are round-invariant
+        // (125/181 — only 56 kv_len-derived ones grow). Rather than trust
+        // the converter's value_dynamic hint, we LEARN by comparing two
+        // consecutive rounds' readback results:
         //   LEARNING  (round 0): readback, store as learned_dim_.
         //   CONFIRMING(round 1): readback, compare to learned_dim_.
         //               match  -> STABLE: skip readback on round 2+ (reuse).
@@ -258,14 +291,18 @@ class ReshapeBuffer : public BufferFactory {
         // invalidate_shape_cache() (prefill->decode boundary) resets to
         // LEARNING so the new phase re-learns. The 3.2ms submit+wait per
         // Reshape is the dominant decode cost (181 × 3.2ms = 586ms); STABLE
-        // reshapes skip it entirely.
-        // Resolve the output dim[] from the int64 shape input (inputs[1]) via
-        // the auto-learning + linear-growth cache (resolve_dim). STABLE skips
-        // the readback; LINEAR_GROW predicts kv_len+1 growth; RE_STABLE re-
-        // promotes a changed-once-then-constant shape. The 56 kv_len Reshapes
-        // were the dominant readback cost after Expand; this cuts them to ~7
-        // verification readbacks/round.
-        std::vector<int> dim = resolve_dim(shape);
+        // reshapes skip it entirely. STABLE skips the readback; LINEAR_GROW
+        // predicts kv_len+1 growth; RE_STABLE re-promotes a changed-once-
+        // then-constant shape. The 56 kv_len Reshapes were the dominant
+        // readback cost after Expand; this cuts them to ~7 verification
+        // readbacks/round.
+        std::vector<int> dim;
+        if (host_target_valid_) {
+            dim = host_target_;
+        } else {
+            auto shape = core::as_tensor<int64_t>(inputs[1]);
+            dim = resolve_dim(shape);
+        }
         int n = static_cast<int>(dim.size());
         int total = total_elems(in_shape);
         // resolve a 0 dim by copying from the input, and -1 from the remainder
@@ -460,6 +497,10 @@ class ReshapeBuffer : public BufferFactory {
     };
     LearnState cache_state_ = LearnState::LEARNING;
     bool shape_value_dynamic_ = true; // converter hint (unused by the learner)
+    // Host-evaluated target shape (Phase 4-r2). Valid only when the
+    // converter attached vkop_host_shape — the node then has a single input.
+    std::vector<int> host_target_;
+    bool host_target_valid_ = false;
     std::vector<int> learned_dim_; // round-0 dim[] (compared against round-1)
     std::vector<int> cached_dim_;  // STABLE dim[] reused on round 2+
     // LINEAR_GROW / RE_STABLE state.
