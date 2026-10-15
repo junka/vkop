@@ -71,9 +71,15 @@ def run(step_ids, pos_start):
     bias = np.zeros((L, kv), dtype=np.float16)
     for i in range(L):
         bias[i, pos_start + i + 1:] = np.finfo(np.float16).min
+    # position_ids: 纯文本 Qwen3/Phi-4/GLM 是 2D (B, q)；Qwen3-VL 是 3D mrope
+    # (3, B, q)，文本 token 三轴位置相等，三行重复即可退化为标准 RoPE。
+    pos = np.arange(pos_start, pos_start + L, dtype=np.int64)
+    pid_shape = by_name["position_ids"].shape
+    pos_feed = (np.stack([pos] * 3)[:, None, :] if len(pid_shape) == 3
+                else pos[None])
     feed = {
         "inputs_embeds": np.ascontiguousarray(emb_table[step_ids][None]),
-        "position_ids": np.arange(pos_start, pos_start + L, dtype=np.int64)[None],
+        "position_ids": np.ascontiguousarray(pos_feed),
         "attention_bias": bias[None, None],
     }
     for i in range(nl):
@@ -84,6 +90,8 @@ def run(step_ids, pos_start):
 
 
 logits = run(ids, 0)
+top5 = np.argsort(logits[0, -1].astype(np.float32))[::-1][:5]
+print("[prefill top5]", [(int(i), round(float(logits[0, -1, i]), 2)) for i in top5])
 gen = [int(np.argmax(logits[0, -1].astype(np.float32)))]
 for step in range(N - 1):
     if gen[-1] in stop:
