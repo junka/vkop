@@ -224,7 +224,18 @@ class ConstantFolder:
         if op in ("Mul", "Add", "Div", "Sub", "Pow"):
             f = {"Mul": np.multiply, "Add": np.add, "Div": np.divide,
                  "Sub": np.subtract, "Pow": np.power}[op]
-            return [f(ins[0], ins[1])]
+            out = f(ins[0], ins[1])
+            # ONNX integer Div truncates toward zero, but np.divide promotes
+            # int64/int64 to float64. That float64 then leaks into a shape
+            # chain (Shape -> Gather -> Div -> Cast -> Unsqueeze) as an
+            # initializer the runtime rejects ("unrecognized dtype
+            # 'float64'"). A redundant int64 Cast downstream used to hide it;
+            # eliminate_nop_cast drops that Cast the moment shape/dtype info
+            # exists, exposing the wrong dtype.
+            if op == "Div" and np.issubdtype(ins[0].dtype, np.integer) \
+                    and np.issubdtype(ins[1].dtype, np.integer):
+                out = np.trunc(out).astype(ins[0].dtype)
+            return [out]
         if op in ("Neg", "Sin", "Cos", "Sqrt", "Floor"):
             f = {"Neg": np.negative, "Sin": np.sin, "Cos": np.cos,
                  "Sqrt": np.sqrt, "Floor": np.floor}[op]
