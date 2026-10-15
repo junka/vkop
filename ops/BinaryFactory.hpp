@@ -34,7 +34,7 @@ class BinaryFactory : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   (type == OpType::ADD) ? sizeof(binary::GPUBinParam) : 0) {
+                   sizeof(binary::GPUBinParam)) {
         param_.activation = static_cast<int>(binary::ActivationMode::NONE);
         param_.broadcast = 0;
     }
