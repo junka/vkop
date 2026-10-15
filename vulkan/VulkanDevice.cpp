@@ -135,6 +135,8 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
     }
 #ifdef VK_KHR_cooperative_matrix
+    m_coopmat_supported_stages_ =
+        coopmat_properties.cooperativeMatrixSupportedStages;
     LOG_INFO("Cooperative matrix supported stages 0x%x",
              coopmat_properties.cooperativeMatrixSupportedStages);
 
@@ -922,7 +924,13 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 auto *feat =
                     static_cast<VkPhysicalDeviceCooperativeMatrixFeaturesKHR *>(
                         q);
-                if (!feat->cooperativeMatrix)
+                // The feature bool alone is not enough: MoltenVK advertises
+                // the extension + feature but reports 0 supported stages, and
+                // any coopmat pipeline then dies in SPIR-V -> MSL conversion.
+                // Gate on the stages the device actually reported in
+                // getProperties().
+                if (!feat->cooperativeMatrix ||
+                    m_coopmat_supported_stages_ == 0)
                     return nullptr;
                 auto e = std::make_unique<
                     VkPhysicalDeviceCooperativeMatrixFeaturesKHR>();

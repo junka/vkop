@@ -1456,6 +1456,13 @@ void matmul16_odd_n() {
         sum += a * b;
     }
 
+    // The attention QK^T epilogue must ride along here too: prefill/decode
+    // with an odd kv_len lands on this kernel, and matmul_pack.comp only
+    // converts fp32->half2 -- it never applies scale/bias. Skipping it wrote
+    // raw QK^T where scaled+masked scores belonged.
+    if (uPC.epi_bias != 0) {
+        sum = sum * uPC.epi_scale + epi_bias_at(n, i, j);
+    }
     uScratch.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
 }
 #endif
@@ -1553,6 +1560,11 @@ void matmul32() {
         sum += a * b;
     }
 
+    // fp32 build's one-pass kernel: same attention epilogue obligation as the
+    // fp16 even-N path above (the fp32 bias is word-per-element).
+    if (uPC.epi_bias != 0) {
+        sum = sum * uPC.epi_scale + epi_bias_at(n, i, j);
+    }
     uOutput.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
 }
 

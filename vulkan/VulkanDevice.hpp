@@ -158,6 +158,13 @@ class VulkanDevice {
     bool is_support_cooperate_matrix() const {
         return m_support_cooperate_matrix_;
     }
+    // cooperativeMatrixSupportedStages as reported by the physical device.
+    // MoltenVK advertises the KHR extension and the feature bool, but reports
+    // 0 supported stages — a combo that fails at pipeline creation, so the
+    // feature gate below must treat 0 stages as "not usable".
+    uint32_t coopmat_supported_stages() const {
+        return m_coopmat_supported_stages_;
+    }
 #ifdef VK_KHR_cooperative_matrix
     const std::vector<VkCooperativeMatrixPropertiesKHR> &
     getCooperativeMatrixProperties() const {
@@ -234,6 +241,7 @@ class VulkanDevice {
     bool m_support_cuda_kernel_launch_ = false;
     bool m_support_nv_tensor_core_ = false;
     bool m_support_cooperate_matrix_ = false;
+    uint32_t m_coopmat_supported_stages_ = 0;
     bool m_support_descriptor_update_after_bind_ = false;
 
 #ifdef VK_EXT_subgroup_size_control

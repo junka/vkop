@@ -267,7 +267,13 @@ class MatMulBuffer : public BufferFactory {
             const char *v = std::getenv("VKOP_NO_COOP");
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
-        if (fp16_ != 0 && !coop_pipeline_ && !coop_disabled) {
+        if (fp16_ != 0 && !coop_pipeline_ && !coop_disabled &&
+            // Skip the eager build on devices whose coopmat support is
+            // nominal only: MoltenVK advertises the feature bool but reports
+            // 0 supported stages (see VulkanDevice's feature gate), and its
+            // MSL backend only lowers 8x8 coopmat dims, so pipeline creation
+            // here would throw and take the whole MatMul down with it.
+            dev->is_support_cooperate_matrix()) {
             // fp16 cooperative-matrix kernel: a single dispatch reads fp16 A/B
             // from SSBO, accumulates in fp32 via a subgroup MMA
             // (coopMatMulAdd), and writes FLAT fp32 results to the scratch

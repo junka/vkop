@@ -158,6 +158,10 @@ TEST(MatMulTest, MatMulEpilogueScaleBias) {
         {2, 4, 1, 16, 8, 0.0884f},
         {1, 8, 3, 32, 16, 0.5f},
         {2, 2, 4, 16, 16, 1.0f},
+        // Odd N routes through matmul16_odd_n + the fp32->half2 pack pass,
+        // which must carry the epilogue too (a real prefill has odd kv_len).
+        {1, 2, 3, 16, 9, 0.0884f},
+        {2, 4, 1, 32, 7, 0.5f},
     };
     for (const auto &c : cases) {
         auto [B, heads, M, K, N, scale] = c;

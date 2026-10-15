@@ -4502,7 +4502,13 @@ class FusionOptimizer:
                     fe_shape = fe.outputs[0].get("shape")
                     n_static = (isinstance(fe_shape, list) and len(fe_shape) >= 1
                                 and isinstance(fe_shape[-1], int)
-                                and 0 < fe_shape[-1] <= 16384)
+                                and 0 < fe_shape[-1] <= 16384
+                                # The runtime's attn_softmax kernel only fires
+                                # on EVEN N (half2 row stores) — folding with a
+                                # static odd N would delete the Softmax while
+                                # the host silently skips the fusion, leaving
+                                # raw logits where probabilities belong.
+                                and fe_shape[-1] % 2 == 0)
                     fold_softmax = n_static
             matches.append({
                 "fe": fe,
