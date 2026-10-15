@@ -68,7 +68,7 @@ class ConstantFolder:
         "Concat", "Reshape", "Flatten", "Transpose", "Unsqueeze", "Squeeze",
         "Cast", "Slice", "ScatterND", "Range", "Where",
         "Mul", "Add", "Div", "Sub", "Pow", "Neg", "Sin", "Cos", "Sqrt",
-        "Floor", "Reduce", "Mod",
+        "Floor", "Mod",
     }
 
     @staticmethod
@@ -240,12 +240,6 @@ class ConstantFolder:
             f = {"Neg": np.negative, "Sin": np.sin, "Cos": np.cos,
                  "Sqrt": np.sqrt, "Floor": np.floor}[op]
             return [f(const[node.input[0]])]
-        if op == "Reduce":
-            axes = (const[node.input[1]].tolist() if len(node.input) > 1
-                     else _attr_ints("axes", []))
-            keep = _attr_i("keepdims", 1)
-            return [np.sum(const[node.input[0]],
-                           axis=tuple(axes), keepdims=bool(keep))]
         raise NotImplementedError(op)
 
     @staticmethod
@@ -676,9 +670,15 @@ class OptimizationStats:
         print(
             f"Node :{self.nodes_before} → {self.nodes_after} (reduce {self.nodes_before - self.nodes_after})"
         )
+        print(
+            f"Initializer :{self.initializers_before} → {self.initializers_after} "
+            f"(reduce {self.initializers_before - self.initializers_after})"
+        )
+        print(f"Rounds :{self.rounds_executed}")
         if self.patterns_fused:
             print("Fused Pattern:")
-            for pattern, count in self.patterns_fused.items():
+            for pattern, count in sorted(self.patterns_fused.items(),
+                                         key=lambda kv: (-kv[1], kv[0])):
                 print(f"  - {pattern}: {count}")
 
 
@@ -700,15 +700,13 @@ class PatternBasedFusionPass(OptimizationPass):
         self.pattern_matcher = pattern_matcher
         self.folder = folder
 
-    def apply(self, dag_model) -> bool:
-        changed = False
-        matches = self.pattern_matcher(dag_model)
-
-        for match in matches:
+    def apply(self, dag_model) -> int:
+        """Number of matches fused (0 = graph unchanged)."""
+        fused = 0
+        for match in self.pattern_matcher(dag_model):
             if self.folder(dag_model, match):
-                changed = True
-
-        return changed
+                fused += 1
+        return fused
 
 
 class MultiRoundOptimizer:
@@ -732,22 +730,25 @@ class MultiRoundOptimizer:
 
         for round_idx in range(self.max_rounds):
             round_changed = False
+            self.stats.rounds_executed = round_idx + 1
 
             if verbose:
                 print(f"\n=== {round_idx + 1} round Optimization ===")
 
             for opt_pass in self.passes:
                 try:
-                    changed = opt_pass.apply(dag_model)
-                    if changed:
+                    fused = opt_pass.apply(dag_model)
+                    if fused:
                         round_changed = True
                         self.stats.passes_applied.append(opt_pass.name)
+                        self.stats.patterns_fused[opt_pass.name] = (
+                            self.stats.patterns_fused.get(opt_pass.name, 0) + fused)
 
                         if verbose:
                             current_nodes = len(dag_model.nodes)
-                            status = "✓" if changed else "○"
                             print(
-                                f"  {status} {opt_pass.name} match (Current Nodes: {current_nodes})"
+                                f"  ✓ {opt_pass.name} match "
+                                f"({fused} fused, Current Nodes: {current_nodes})"
                             )
 
                 except Exception as e:
