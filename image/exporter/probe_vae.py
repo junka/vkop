@@ -18,6 +18,7 @@ VAE 上游这边看着温和得多：`CausalConv3d` 已经是图像特化（`nn.
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -30,7 +31,7 @@ sys.path.insert(0, str(HERE / "reference"))
 
 from probe_dit import RssSampler, cur_rss_gb  # noqa: E402
 
-MS_ROOT = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master")
+MS_ROOT = Path(os.environ["QI21_MS_ROOT"])
 SCALE = 16  # vae.config.scale_factor_spatial：latent 每边 1 格 = 图像 16x16 像素
 
 

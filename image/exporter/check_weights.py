@@ -10,6 +10,7 @@ wrapper 把 32 层的同类权重堆成一个 (L, out, in) 参数，所以这里
 """
 
 import json
+import os
 import struct
 import sys
 from collections import defaultdict
@@ -20,7 +21,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from qi21_dit import DiTConfig, DiTWeights  # noqa: E402
 
-MS_ROOT = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master")
+MS_ROOT = Path(os.environ["QI21_MS_ROOT"])
 
 SCALARS = {
     "img_in.weight": "img_in_w",

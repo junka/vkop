@@ -15,12 +15,13 @@ raw 模板字符串（不走 apply_chat_template，两者分词不同）、丢�
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import torch
 
 HERE = Path(__file__).resolve().parent
-MS_ROOT = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master")
+MS_ROOT = Path(os.environ["QI21_MS_ROOT"])
 SYS_PROMPT = "Comprehend and analyze the provided prompt."
 
 

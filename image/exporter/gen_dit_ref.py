@@ -26,6 +26,7 @@ script serves the tiny and the 7.12B model.
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 import numpy as np
@@ -34,8 +35,7 @@ import onnxruntime as ort
 
 HERE = Path(__file__).resolve().parent
 REF = HERE / "ref"
-SCHED_DIR = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1"
-                 "/snapshots/master/scheduler")
+SCHED_DIR = Path(os.environ["QI21_MS_ROOT"]) / "scheduler"
 
 
 def save(name, arr):

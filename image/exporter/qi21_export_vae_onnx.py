@@ -16,6 +16,7 @@ needs decode. The text encoder is handled separately (Qwen3-VL-7B).
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -31,8 +32,9 @@ import qi21_vae as R  # noqa: E402
 
 def load_vae(dtype=torch.float32):
     """Load the VAE decoder from safetensors."""
-    cfg_path = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master/vae/config.json")
-    ckpt_path = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master/vae/diffusion_pytorch_model.safetensors")
+    ms_root = Path(os.environ["QI21_MS_ROOT"])
+    cfg_path = ms_root / "vae" / "config.json"
+    ckpt_path = ms_root / "vae" / "diffusion_pytorch_model.safetensors"
 
     cfg = json.loads(cfg_path.read_text())
     print(f"[vae] config: z_dim={cfg['z_dim']} base_dim={cfg['base_dim']} "

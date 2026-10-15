@@ -9,6 +9,7 @@ fp32 占位 + 整份 fp16 副本 + 整 shard 字典"这三份（fp16 权重 14.2
 """
 
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -17,7 +18,7 @@ from safetensors import safe_open
 
 from qi21_dit import DiTConfig, DiTWeights
 
-MS_ROOT = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master")
+MS_ROOT = Path(os.environ["QI21_MS_ROOT"])
 SCALARS = {
     "img_in.weight": "img_in_w",
     "txt_in.text_norm.weight": "txt_norm_w",

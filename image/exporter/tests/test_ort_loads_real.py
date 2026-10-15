@@ -13,6 +13,7 @@ data 是坏账，ORT 在解析阶段就直接拒载（`GetExternalDataInfo ... e
 """
 
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -25,8 +26,7 @@ HERE = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(HERE))
 from probe_dit import cur_rss_gb  # noqa: E402  和内存探针同一把尺子（ps 的 KB -> GB）
 
-CFG_PATH = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master"
-                "/transformer/config.json")
+CFG_PATH = Path(os.environ["QI21_MS_ROOT"]) / "transformer" / "config.json"
 # 故意取小到 S=32：这一测只关心"载入 + 绑定 + 算得动"，激活尺寸越小越好，
 # 序列轴是 dynamic 的，所以换尺寸不用重导图。
 S = {"prefill": 32, "decode": 32}

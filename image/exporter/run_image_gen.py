@@ -18,6 +18,7 @@ reimplementation if diffusers isn't available).
 
 import argparse
 import json
+import os
 import time
 from pathlib import Path
 
@@ -30,7 +31,7 @@ HERE = Path(__file__).resolve().parent
 
 def load_scheduler_config():
     """Load scheduler config from model checkpoint."""
-    cfg_path = Path("/Users/doudou/qi21-env/ms/models/Qwen--Qwen-Image-2.1/snapshots/master/scheduler/scheduler_config.json")
+    cfg_path = Path(os.environ["QI21_MS_ROOT"]) / "scheduler" / "scheduler_config.json"
     return json.loads(cfg_path.read_text())
 
 
