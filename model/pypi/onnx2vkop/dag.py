@@ -207,7 +207,7 @@ class DAGBasedModel:
         while queue:
             current = queue.popleft()
             sorted_nodes.append(current)
-            for dependent_name in self.nodes[current].dependents:
+            for dependent_name in sorted(self.nodes[current].dependents):
                 in_degree[dependent_name] -= 1
                 if in_degree[dependent_name] == 0:
                     queue.append(dependent_name)
@@ -232,7 +232,7 @@ class DAGBasedModel:
                 node_name = queue.popleft()
                 current_level.append(node_name)
 
-                for dependent_name in self.nodes[node_name].dependents:
+                for dependent_name in sorted(self.nodes[node_name].dependents):
                     in_degree[dependent_name] -= 1
                     if in_degree[dependent_name] == 0:
                         queue.append(dependent_name)
@@ -697,8 +697,8 @@ class DAGBasedModel:
                     builder.PrependUOffsetTRelative(off)
                 return builder.EndVector()
 
-            deps_vec = build_str_vec(list(node.dependencies))
-            dependents_vec = build_str_vec(list(node.dependents))
+            deps_vec = build_str_vec(sorted(node.dependencies))
+            dependents_vec = build_str_vec(sorted(node.dependents))
 
             NodeTable.Start(builder)
             NodeTable.AddOpType(builder, op_type_off)
