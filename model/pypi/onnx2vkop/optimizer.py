@@ -359,6 +359,79 @@ class ConstantFolder:
         return model
 
 
+# onnxoptimizer's C++ backend serializes the whole proto. A model whose weights
+# are loaded from external data holds them as raw_data in memory, so the
+# serialized size blows past protobuf's 2 GiB limit -- and onnxoptimizer does
+# not even raise, it silently returns a 0-node graph. Feeding it a value-free
+# view (big initializers temporarily demoted to graph inputs) keeps the proto
+# small enough to parse, which is what unlocks the structural passes on
+# llm.onnx / DiT. ConstantFolder only folds tensors <= 1 MiB, so demoting above
+# that cap costs it nothing.
+_VIEW_DEMOTE_CAP = 1 << 20
+_VIEW_MIN_INIT_BYTES = 3 * (1 << 30) // 2
+_MAX_VIEW_ROUNDS = 3
+
+
+def _demote_large_initializers(model):
+    """Move initializers carrying >= _VIEW_DEMOTE_CAP raw bytes out of the graph.
+
+    Returns [(name, data_type, dims)] plus the list of graph inputs we had to
+    synthesize, so _reattach_initializers can put everything back exactly.
+    Initializers whose values live in the typed fields instead of raw_data are
+    left in place -- we can only restore what we can byte-copy.
+    """
+    graph = model.graph
+    demoted = []
+    for init in graph.initializer:
+        if len(init.raw_data) >= _VIEW_DEMOTE_CAP:
+            demoted.append((init.name, init.data_type, tuple(init.dims)))
+    for idx in reversed([i for i, init in enumerate(graph.initializer)
+                         if len(init.raw_data) >= _VIEW_DEMOTE_CAP]):
+        del graph.initializer[idx]
+
+    existing = {inp.name for inp in graph.input}
+    added = []
+    for name, dtype, dims in demoted:
+        if name in existing:
+            continue
+        vi = graph.input.add()
+        vi.name = name
+        vi.type.tensor_type.elem_type = dtype
+        for d in dims:
+            vi.type.tensor_type.shape.dim.add().dim_value = d
+        added.append(name)
+    return demoted, added
+
+
+def _reattach_initializers(model, demoted, added_inputs, raw_map):
+    """Undo _demote_large_initializers on the optimized graph.
+
+    Only tensors a surviving node still reads come back (eliminate_deadend and
+    eliminate_unused_initializer may legitimately have dropped the rest), and
+    the synthetic inputs are removed so the graph contract the converter sees
+    is unchanged.
+    """
+    graph = model.graph
+    used = {inp for node in graph.node for inp in node.input}
+    have = {init.name for init in graph.initializer}
+    for name, dtype, dims in demoted:
+        data = raw_map.get(name)
+        if not data or name in have or name not in used:
+            continue
+        init = graph.initializer.add()
+        init.name = name
+        init.data_type = dtype
+        for d in dims:
+            init.dims.append(d)
+        init.raw_data = data
+        del raw_map[name]
+
+    if added_inputs:
+        keep = [inp for inp in graph.input if inp.name not in added_inputs]
+        del graph.input[:]
+        graph.input.extend(keep)
+
+
 class ONNXOptimizer:
     """Class for optimizing ONNX models."""
 
@@ -419,39 +492,82 @@ class ONNXOptimizer:
                     fixed_shape.append(1)
             input_shapes[name] = fixed_shape
 
-        optimized_model = None
-        try:
-            optimized_model = optimizer.optimize(onnx_model, passes)
-        except Exception as e:
-            # Large models (>2GB serialized proto, e.g. llm.onnx) cannot pass
-            # through onnxoptimizer's C++ backend which serializes the model.
-            # Fall back to ConstantFolder-only (pure numpy, no serialization).
-            print(f"[optimize] onnxoptimizer skipped ({e}); using ConstantFolder only")
-            optimized_model = onnx_model
-
-        # onnxoptimizer's C++ backend serializes the model internally; for a
-        # >2GB model (weights loaded as external data → raw_data in memory) it
-        # does NOT raise but silently returns a degenerate graph with 0 nodes
-        # (only the "IR version too old" warning is printed). Detect that and
-        # fall back to the un-optimized model so ConstantFolder still sees the
-        # full graph. Without this guard the converter writes a 96-byte empty
-        # vkopbin and the runtime sees no graph inputs.
-        if optimized_model is not None and len(onnx_model.graph.node) > 0 and \
-                len(optimized_model.graph.node) == 0:
-            print("[optimize] onnxoptimizer returned an empty graph "
-                  "(model too large to serialize); using ConstantFolder only")
-            optimized_model = onnx_model
-
-        # 常量折叠：内置 ConstantFolder（纯 numpy，无外部依赖）。
-        # 把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather/
-        # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
-        # fold() 内部会剥离 initializer 的 raw_data 以绕开 proto 2GB 上限，
-        # 这里在折叠后按名字把权重字节还原，保证返回的 model 权重完整可用。
+        # raw_map is the byte source for everything fold() strips; build it
+        # before the view demotes initializers out of the graph.
         raw_map = {init.name: init.raw_data for init in onnx_model.graph.initializer}
-        optimized_model = ConstantFolder.fold(optimized_model, verbose=True)
-        for init in optimized_model.graph.initializer:
-            if init.name in raw_map and raw_map[init.name]:
-                init.raw_data = raw_map[init.name]
+        total_init_bytes = sum(len(b) for b in raw_map.values())
+
+        demoted: List = []
+        added_inputs: List = []
+        if total_init_bytes >= _VIEW_MIN_INIT_BYTES:
+            demoted, added_inputs = _demote_large_initializers(onnx_model)
+            print(f"[optimize] value-free view for onnxoptimizer: "
+                  f"{len(demoted)} initializer(s) demoted to inputs "
+                  f"({total_init_bytes >> 20} MiB of weights)")
+
+        optimized_model = None
+        if demoted:
+            # Interleave structural passes with constant folding until the node
+            # count stops moving: folding a Shape/Slice chain is what creates
+            # the dead ends and nop Reshape/Concat that eliminate_deadend and
+            # friends clean up, so one pass round before folding finds nothing.
+            optimized_model = onnx_model
+            prev_nodes = -1
+            for round_i in range(_MAX_VIEW_ROUNDS):
+                cur_nodes = len(optimized_model.graph.node)
+                if cur_nodes == prev_nodes:
+                    break
+                prev_nodes = cur_nodes
+                try:
+                    nxt = optimizer.optimize(optimized_model, passes)
+                    if nxt is not None and len(nxt.graph.node) > 0:
+                        optimized_model = nxt
+                    else:
+                        print("[optimize] onnxoptimizer returned an empty graph; "
+                              "keeping the folded view")
+                except Exception as e:
+                    print(f"[optimize] onnxoptimizer skipped ({e})")
+                optimized_model = ConstantFolder.fold(
+                    optimized_model, verbose=(round_i == 0))
+            _reattach_initializers(optimized_model, demoted, added_inputs, raw_map)
+            # fold() strips raw_data from anything above its own 1 MiB cap; the
+            # demoted weights are back, the survivors just need their bytes.
+            for init in optimized_model.graph.initializer:
+                if not init.raw_data and raw_map.get(init.name):
+                    init.raw_data = raw_map[init.name]
+
+        else:
+            try:
+                optimized_model = optimizer.optimize(onnx_model, passes)
+            except Exception as e:
+                # Large models (>2GB serialized proto, e.g. llm.onnx) cannot pass
+                # through onnxoptimizer's C++ backend which serializes the model.
+                # Fall back to ConstantFolder-only (pure numpy, no serialization).
+                print(f"[optimize] onnxoptimizer skipped ({e}); using ConstantFolder only")
+                optimized_model = onnx_model
+
+            # onnxoptimizer's C++ backend serializes the model internally; for a
+            # >2GB model (weights loaded as external data → raw_data in memory) it
+            # does NOT raise but silently returns a degenerate graph with 0 nodes
+            # (only the "IR version too old" warning is printed). Detect that and
+            # fall back to the un-optimized model so ConstantFolder still sees the
+            # full graph. Without this guard the converter writes a 96-byte empty
+            # vkopbin and the runtime sees no graph inputs.
+            if optimized_model is not None and len(onnx_model.graph.node) > 0 and \
+                    len(optimized_model.graph.node) == 0:
+                print("[optimize] onnxoptimizer returned an empty graph "
+                      "(model too large to serialize); using ConstantFolder only")
+                optimized_model = onnx_model
+
+            # 常量折叠：内置 ConstantFolder（纯 numpy，无外部依赖）。
+            # 把 Constant/ConstantOfShape/Shape/Tile/ScatterND/Expand/常量 Gather/
+            # Sin/Cos/Reshape/Concat 等输入全常量的算子整段折叠成 initializer。
+            # fold() 内部会剥离 initializer 的 raw_data 以绕开 proto 2GB 上限，
+            # 这里在折叠后按名字把权重字节还原，保证返回的 model 权重完整可用。
+            optimized_model = ConstantFolder.fold(optimized_model, verbose=True)
+            for init in optimized_model.graph.initializer:
+                if init.name in raw_map and raw_map[init.name]:
+                    init.raw_data = raw_map[init.name]
 
         # 若装了 onnxsim，再跑一遍作为增强（兜底 ConstantFolder 未覆盖的算子，
         # 如更复杂的 data-dependent 折叠）。失败则忽略——ConstantFolder 已覆盖主路径。
