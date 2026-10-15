@@ -375,10 +375,18 @@ class DAGBasedModel:
         #
         # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——见 _init_byte_len。
 
+        # Members of the unified sub-region: their bytes live in _unified_bytes
+        # rather than the regular blob, but they still need an InitializerEntry
+        # row -- the runtime looks each one up by name for dtype/dims before
+        # sub-allocating it (core/runtime.cpp:419).
+        unified_names = {m["_name"] for m in self.unified_meta}
+
         external = False
         try:
             total_blob = 0
             for _name, arr in self.initializers.items():
+                if _name in unified_names:
+                    continue
                 total_blob += _init_byte_len(arr)
             if getattr(self, "_unified_bytes", b""):
                 total_blob += len(self._unified_bytes)
@@ -397,7 +405,28 @@ class DAGBasedModel:
         blob_offsets: Dict[str, tuple] = {}
         # external-only: ordered (name, arr) list to replay at write time.
         external_init_order = [] if external else None
+
+        def add_entry(name, arr, offset, size):
+            """One InitializerEntry side-table row for `name` at blob `offset`."""
+            name_off = builder.CreateString(name)
+            dtype_off = builder.CreateString(_init_dtype_name(arr))
+            dims = list(arr.dims)
+            InitializerEntry.StartDimsVector(builder, len(dims))
+            for d in reversed(dims):
+                builder.PrependUint32(int(d))
+            dims_off = builder.EndVector()
+
+            InitializerEntry.Start(builder)
+            InitializerEntry.AddName(builder, name_off)
+            InitializerEntry.AddDtype(builder, dtype_off)
+            InitializerEntry.AddDims(builder, dims_off)
+            InitializerEntry.AddOffset(builder, offset)
+            InitializerEntry.AddSize(builder, size)
+            init_entries.append(InitializerEntry.End(builder))
+
         for name, arr in self.initializers.items():
+            if name in unified_names:
+                continue
             data_size = _init_byte_len(arr)
             aligned_offset = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
             pad = aligned_offset - cur_blob_len
@@ -409,29 +438,11 @@ class DAGBasedModel:
                 blob.extend(_init_bytes(arr))
             cur_blob_len = aligned_offset + data_size
             blob_offsets[name] = (aligned_offset, data_size)
-
-            dtype_str = _init_dtype_name(arr)
-            dims = list(arr.dims)
-
-            name_off = builder.CreateString(name)
-            dtype_off = builder.CreateString(dtype_str)
-            InitializerEntry.StartDimsVector(builder, len(dims))
-            for d in reversed(dims):
-                builder.PrependUint32(int(d))
-            dims_off = builder.EndVector()
-
-            InitializerEntry.Start(builder)
-            InitializerEntry.AddName(builder, name_off)
-            InitializerEntry.AddDtype(builder, dtype_off)
-            InitializerEntry.AddDims(builder, dims_off)
-            InitializerEntry.AddOffset(builder, aligned_offset)
-            InitializerEntry.AddSize(builder, data_size)
-            init_entries.append(InitializerEntry.End(builder))
+            add_entry(name, arr, aligned_offset, data_size)
 
         # --- Append the unified sub-region (if any) and record its base. ---
         unified_bytes = getattr(self, "_unified_bytes", b"")
         if unified_bytes:
-            # Rewrite unified_meta offsets to be absolute into the full blob.
             unified_base = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
             unified_pad = unified_base - cur_blob_len
             if external:
@@ -443,8 +454,17 @@ class DAGBasedModel:
                 blob.extend(unified_bytes)
                 cur_blob_len = len(blob)
             self.unified_blob_offset = unified_base
+            # UnifiedMeta offsets stay relative to the region: LoadModel bases the
+            # region's source pointer at unified_blob_offset and then indexes the
+            # shared buffer by meta.offset() (core/runtime.cpp:384-394), and a
+            # relative offset is the only thing that fits UnifiedMeta's int32 for
+            # a multi-GB blob. The side-table rows keep the schema's rule of
+            # absolute-into-blob, so add the base back for those.
             for m in self.unified_meta:
-                m["offset"] = m["offset"] + unified_base
+                name = m["_name"]
+                abs_offset = m["offset"] + unified_base
+                blob_offsets[name] = (abs_offset, m["size"])
+                add_entry(name, self.initializers[name], abs_offset, m["size"])
         else:
             self.unified_blob_offset = 0
 

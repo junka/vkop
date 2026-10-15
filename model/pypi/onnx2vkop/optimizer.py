@@ -6302,8 +6302,10 @@ class Unifier:
                     "dtype": dtype_map[init.data_type],
                     "name_len": name_len,
                     "name_offset": name_offset_in_names,
-                    # offset is relative to the unified sub-region; the writer
-                    # adds unified_blob_offset when emitting absolute offsets.
+                    # offset is relative to the unified sub-region, which is how
+                    # the runtime indexes the shared unified buffer; save_to_binary
+                    # adds unified_blob_offset only for the absolute
+                    # InitializerEntry rows.
                     "offset": offset,
                     "size": data_size,
                     "dims": dims,
@@ -6318,10 +6320,11 @@ class Unifier:
         # append them to the main blob and set unified_blob_offset accordingly.
         dag_model._unified_bytes = bytes(unified_bytes)
 
-        # Remove unified initializers from the top-level table — they are now
-        # sub-allocations of the unified region.
-        for name in eligible:
-            del dag_model.initializers[name]
+        # The unified members STAY in dag_model.initializers: the runtime reads
+        # each one's dtype/dims out of the InitializerEntry side table before
+        # sub-allocating it (core/runtime.cpp:419), and erases it there once
+        # handled. save_to_binary writes their bytes once, into the unified
+        # region, and points the side-table entry at that region.
 
         print(f"Unified {len(eligible)} initializers into a {len(unified_bytes)}-byte region")
         return len(eligible)
