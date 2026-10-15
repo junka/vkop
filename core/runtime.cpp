@@ -121,6 +121,63 @@ void Runtime::LoadModel() {
         }
     }
     printf("Total nodes %zu\n", model.nodes.size());
+
+    // Batched initializer upload. Every initializer otherwise gets its own
+    // staging copy plus a submit and a fence wait, which measures 271 us
+    // whatever the buffer holds: llm.vkopbin's 2846 entries are therefore
+    // dominated by pipeline round trips, not by bytes (19 KiB of payload sits
+    // in entries of 64 B and below). Recording those copies into one command
+    // buffer and flushing it every few MiB keeps the identical aligned,
+    // zero-tailed upload while turning N waits into about one. Big weights stay
+    // on their own synchronous flush because they are bandwidth-bound -- the
+    // submit is nothing next to the copy -- and staging several MiB at once
+    // would only pin that much host memory. VKOP_BATCH_UPLOAD=0 restores the
+    // per-tensor flush, for A/B runs.
+    const char *batch_env = std::getenv("VKOP_BATCH_UPLOAD");
+    const bool batch_upload = batch_env == nullptr || batch_env[0] != '0';
+    constexpr size_t kBatchMaxInit = 65536;
+    constexpr size_t kBatchStagingLimit = 4 << 20;
+    std::shared_ptr<VulkanCommandBuffer> batch_cmd;
+    size_t batched_uploads = 0;
+    size_t batched_bytes = 0;
+    auto batch_flush = [&]() {
+        if (!batch_cmd) {
+            return;
+        }
+        batch_cmd->end();
+        batch_cmd->submit(dev->getComputeQueue());
+        batch_cmd->wait();
+        // The staged bytes are only consumed now, so the pool must not recycle
+        // them before this point -- that is why the per-upload reset moved
+        // here.
+        m_cmdpool_->getStagingBufferPool()->reset();
+        batch_cmd.reset();
+        batched_bytes = 0;
+    };
+    // The command buffer this upload records into, or nullptr when it has to
+    // run synchronously (batching off, or a buffer too big to be
+    // latency-bound).
+    auto batch_for = [&](size_t bytes) -> std::shared_ptr<VulkanCommandBuffer> {
+        // A synchronous upload ends with stpool->reset(), which recycles every
+        // staged byte the pool has handed out -- including the ones still
+        // referenced by copies recorded into the open batch and not yet
+        // submitted. Drain the batch first so those copies read real data.
+        if (!batch_upload || bytes == 0 || bytes > kBatchMaxInit) {
+            batch_flush();
+            return nullptr;
+        }
+        if (batch_cmd && batched_bytes + bytes > kBatchStagingLimit) {
+            batch_flush();
+        }
+        if (!batch_cmd) {
+            batch_cmd = std::make_shared<VulkanCommandBuffer>(m_cmdpool_);
+            batch_cmd->begin();
+        }
+        batched_bytes += bytes;
+        batched_uploads++;
+        return batch_cmd;
+    };
+
     // Inputs are dtype-aware now that ShapeRef carries dtype. For the buffer
     // (SSBO) backend every input is a storage buffer; for the legacy image
     // backend fp16 inputs stay as input images (matching the original
@@ -318,10 +375,12 @@ void Runtime::LoadModel() {
             // rank (row-major compact, no NCHW->RGBA image packing). This is
             // the path the LLM (buffer-only ops) uses.
             tensor->as_storage_buffer(dev);
+            auto batch = batch_for(init.size);
             if (stream_blob) {
-                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset));
+                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset),
+                                  batch);
             } else {
-                tensor->copyToGPU(m_cmdpool_, src);
+                tensor->copyToGPU(m_cmdpool_, src, nullptr, batch);
             }
         } else if (tensor->num_dims() <= 2) {
             if (inputs_for_node_type[init.name] == "Conv" ||
@@ -332,12 +391,17 @@ void Runtime::LoadModel() {
             }
             // src points into the read-only mmap'd initializer blob; the
             // Tensor upload overloads only read from it.
+            auto batch = batch_for(init.size);
             if (stream_blob) {
-                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset));
+                tensor->copyToGPU(m_cmdpool_, nullptr, file_fill(blob_offset),
+                                  batch);
             } else {
-                tensor->copyToGPU(m_cmdpool_, src);
+                tensor->copyToGPU(m_cmdpool_, src, nullptr, batch);
             }
         } else {
+            // The image upload runs synchronously and resets the staging pool,
+            // so it cannot overlap a batch that is still pending its submit.
+            batch_flush();
             tensor->as_input_image(dev, nullptr, false, true);
             tensor->copyToGPUImage(m_cmdpool_, src, model.rgba);
         }
@@ -467,9 +531,10 @@ void Runtime::LoadModel() {
     // missing offset throws instead of silently reading from byte 0.
     std::vector<std::pair<size_t, load::Initializer>> ordered_inits;
     ordered_inits.reserve(model.initializers.size());
-    for (const auto &itr : model.initializers)
+    for (const auto &itr : model.initializers) {
         ordered_inits.emplace_back(model.initializer_offsets.at(itr.first),
                                    itr.second);
+    }
     std::sort(ordered_inits.begin(), ordered_inits.end(),
               [](const auto &a, const auto &b) { return a.first < b.first; });
 
@@ -494,7 +559,8 @@ void Runtime::LoadModel() {
             t->as_storage_buffer(dev);
             t->copyToGPU(m_cmdpool_,
                          const_cast<int64_t *>(
-                             reinterpret_cast<const int64_t *>(src_ptr)));
+                             reinterpret_cast<const int64_t *>(src_ptr)),
+                         nullptr, batch_for(init.size));
             // data_ is the authoritative copy (explicit src above keeps it
             // alive); tell downstream copyToCPU to skip the GPU round trip.
             t->set_host_authoritative();
@@ -509,7 +575,8 @@ void Runtime::LoadModel() {
             t->as_storage_buffer(dev);
             t->copyToGPU(
                 m_cmdpool_,
-                const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
+                const_cast<int *>(reinterpret_cast<const int *>(src_ptr)),
+                nullptr, batch_for(init.size));
             t->set_host_authoritative();
             tensor_map[init.name] = t;
             initializers_[init.name] = t;
@@ -548,6 +615,10 @@ void Runtime::LoadModel() {
             handle_floating_point_tensor(init, src_ptr, offset, t);
         }
     }
+
+    batch_flush();
+    printf("Initializers: %zu loaded, %zu uploads batched\n",
+           ordered_inits.size(), batched_uploads);
 
     std::unordered_map<std::string, const load::Node *> node_name_map;
     for (const auto &n : model.nodes) {

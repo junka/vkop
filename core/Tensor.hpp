@@ -985,8 +985,10 @@ template <typename T> class Tensor : public ITensor {
         }
         toGPU();
     }
-    void copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                   T *data = nullptr, const StagingFillFn &fill = nullptr) {
+    void
+    copyToGPU(const std::shared_ptr<VulkanCommandPool> &cmdpool,
+              T *data = nullptr, const StagingFillFn &fill = nullptr,
+              const std::shared_ptr<VulkanCommandBuffer> &batch = nullptr) {
         if (is_on_GPU()) {
             return;
         }
@@ -998,13 +1000,14 @@ template <typename T> class Tensor : public ITensor {
                     "copyToGPU: file streaming is only supported for buffer "
                     "resources");
             }
-            copyToGPUBuffer(cmdpool, nullptr, fill);
+            copyToGPUBuffer(cmdpool, nullptr, fill, batch);
             return;
         }
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyToGPUImage(cmdpool, data ? data : data_->data());
         } else {
-            copyToGPUBuffer(cmdpool, data ? data : data_->data());
+            copyToGPUBuffer(cmdpool, data ? data : data_->data(), nullptr,
+                            batch);
         }
         if (!data && data_) {
             data_->clear();
@@ -1303,11 +1306,15 @@ template <typename T> class Tensor : public ITensor {
         vkobj_ = std::make_shared<VulkanImage>(vd, vkdim, chan4, flags, format);
     }
 
-    void copyToGPUBuffer(const std::shared_ptr<VulkanCommandPool> &cmdpool,
-                         T *src = nullptr,
-                         const StagingFillFn &fill = nullptr) {
+    void copyToGPUBuffer(
+        const std::shared_ptr<VulkanCommandPool> &cmdpool, T *src = nullptr,
+        const StagingFillFn &fill = nullptr,
+        const std::shared_ptr<VulkanCommandBuffer> &batch = nullptr) {
         auto dev = cmdpool->getVulkanDevice();
-        VulkanCommandBuffer cmd(cmdpool);
+        // Without a batch the upload owns its own recording; with one it only
+        // records, and the caller submits and waits once for the group.
+        std::shared_ptr<VulkanCommandBuffer> cmd =
+            batch ? batch : std::make_shared<VulkanCommandBuffer>(cmdpool);
         auto stpool = cmdpool->getStagingBufferPool();
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
         if (aligned == 0) {
@@ -1359,13 +1366,19 @@ template <typename T> class Tensor : public ITensor {
             offset = view->getOffset();
         }
 
-        cmd.begin();
-        buffer->copyStageBufferToBuffer(cmd.get(), b->buffer, b->offset,
+        if (!batch) {
+            cmd->begin();
+        }
+        buffer->copyStageBufferToBuffer(cmd->get(), b->buffer, b->offset,
                                         aligned, offset);
-        buffer->readBarrier(cmd.get());
-        cmd.end();
-        cmd.submit(dev->getComputeQueue());
-        cmd.wait();
+        buffer->readBarrier(cmd->get());
+        if (batch) {
+            toGPU();
+            return;
+        }
+        cmd->end();
+        cmd->submit(dev->getComputeQueue());
+        cmd->wait();
         stpool->reset();
         toGPU();
     }
