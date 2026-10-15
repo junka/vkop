@@ -35,8 +35,8 @@ namespace transpose {
 // This is not a heuristic: it is the exact condition under which the naive
 // gather degenerates to an identity, and it is the common case in decode —
 // [1,heads,1,head_dim] under perm [0,2,1,3], and [1,1,head_dim] under [0,2,1].
-bool flat_identity_perm(const std::vector<int> &shape,
-                        const std::vector<int> &perm) {
+inline bool flat_identity_perm(const std::vector<int> &shape,
+                               const std::vector<int> &perm) {
     int rank = static_cast<int>(shape.size());
     if (static_cast<int>(perm.size()) != rank)
         return false;
