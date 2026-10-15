@@ -1,7 +1,7 @@
 """DAG-based model representation."""
 
 from collections import deque
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Tuple
 
 import numpy as np
 import flatbuffers
@@ -217,6 +217,29 @@ class DAGBasedModel:
 
         return [self.nodes[name] for name in sorted_nodes]
 
+    def dangling_inputs(self) -> List[Tuple[str, str]]:
+        """Return (node name, input name) pairs whose producer is gone.
+
+        A fusion pass may delete or rename a producer and forget to rebind a
+        consumer; the name then resolves to nothing in the manifest, and the
+        runtime binds that input to an empty buffer -- the kernel reads zeros
+        instead of failing. Terminal pruning drops unreferenced things, but a
+        consumer pointing at a missing producer is the other half of that
+        problem and nothing checked it, so this is the audit the fusion stage
+        runs against itself.
+        """
+        produced = {inp["name"] for inp in self.inputs}
+        produced |= set(self.initializers)
+        for node in self.nodes.values():
+            for out in node.outputs:
+                produced.add(out["name"])
+        return [
+            (node.name, name)
+            for node in self.nodes.values()
+            for name in (inp["name"] for inp in node.inputs)
+            if name and name not in produced
+        ]
+
     def find_concurrent_nodes(self) -> List[List[str]]:
         """Find nodes that can be executed in parallel."""
         levels = []
@@ -420,6 +443,15 @@ class DAGBasedModel:
         # 终局 liveness：所有 pass 跑完后，先删没有任何消费者指向的节点，再删
         # 没有活节点引用的初始值，两者都不写进产物（见 terminal_liveness_prune）。
         self.terminal_liveness_prune()
+
+        # 最后一道完整性检查：融合 pass 删了生产者却忘了改绑消费者时，那个输入名
+        # 在产物里谁都不指向，runtime 会把它绑到空 buffer 读出 0（静默错值而不是
+        # 报错）。写盘点是唯一能看到全部 pass 结果的地方，所以在这里查一次。
+        stranded = self.dangling_inputs()
+        if stranded:
+            print(f"[integrity] {len(stranded)} dangling input(s), runtime reads "
+                  f"zeros for them: "
+                  + ", ".join(f"{n} <- {i}" for n, i in stranded[:5]))
 
         builder = flatbuffers.Builder(1 << 16)
 

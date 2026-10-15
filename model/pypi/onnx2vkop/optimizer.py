@@ -750,6 +750,13 @@ class MultiRoundOptimizer:
                                 f"  ✓ {opt_pass.name} match "
                                 f"({fused} fused, Current Nodes: {current_nodes})"
                             )
+                            stranded = dag_model.dangling_inputs()
+                            if stranded:
+                                node_name, input_name = stranded[0]
+                                print(
+                                    f"    ! {len(stranded)} dangling input(s) after "
+                                    f"{opt_pass.name}, e.g. {node_name} <- {input_name}"
+                                )
 
                 except Exception as e:
                     if verbose:
