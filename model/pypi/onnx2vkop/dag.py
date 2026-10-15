@@ -350,6 +350,38 @@ class DAGBasedModel:
                   f"Constant(s) as initializers")
         self.build_dependencies()
 
+    def drop_unreferenced_initializers(self) -> None:
+        """Delete initializers no node input and no graph output reads.
+
+        The runtime uploads every InitializerEntry it finds, one staging submit
+        plus fence wait each -- 271 us whatever the buffer holds. prune_dead...
+        runs once, before the fusion passes, and those passes delete consumers
+        without touching self.initializers, so the constants they orphan stay in
+        the file (llm.vkopbin: 2106 of 2846 rows, 19 KiB of payload, ~0.7 s of
+        load time). Writing is the one point where nothing can orphan a name
+        afterwards, so the sweep belongs here rather than in a graph pass.
+
+        Unified / RGBA sub-allocation members are kept even when unreferenced:
+        their bytes already live in the shared region, dropping one would mean
+        repacking every offset in it, and they cost a BufferView each (0.18 us),
+        not an upload.
+        """
+        live = {o["name"] for o in self.outputs}
+        live.update(i["name"] for i in self.inputs)
+        for m in self.unified_meta:
+            live.add(m["_name"])
+        for m in self.rgba_meta:
+            live.add(m.get("_name", ""))
+        for node in self.nodes.values():
+            live.update(inp["name"] for inp in node.inputs)
+        dead = [name for name in self.initializers if name not in live]
+        freed = sum(_init_byte_len(self.initializers[name]) for name in dead)
+        for name in dead:
+            del self.initializers[name]
+        if dead:
+            print(f"[prune-inits] dropped {len(dead)} unreferenced initializers "
+                  f"({freed} bytes)")
+
     def save_to_binary(self, file_path: str):
         """Save model to a FlatBuffers binary file.
 
@@ -361,6 +393,9 @@ class DAGBasedModel:
         """
         # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
         self.prune_dead_and_materialize_constants()
+        # 终局剪枝：所有 pass 跑完后，把没有任何节点输入引用的初始值删掉，
+        # 不再写进侧表/blob（见 drop_unreferenced_initializers）。
+        self.drop_unreferenced_initializers()
 
         builder = flatbuffers.Builder(1 << 16)
 
