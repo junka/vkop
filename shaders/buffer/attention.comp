@@ -18,10 +18,26 @@
 // scale with the context; this form keeps ~3 KB of shared regardless of kv, so
 // kv is unbounded (the host only enforces the shape-level invariants).
 //
+// KV-cache form (has_cache != 0). The key/value positions [0, kv_len) are no
+// longer all in K/V: positions [0, kv_past) live in the preallocated cache
+// (binding 5) and only [kv_past, kv_len) are the freshly projected rows in
+// K/V. The cache is [1,2,nkv,cap,hd] — K and V stacked on dim 1 — and `cap`
+// (its row stride) can exceed the logical kv_len, which is what makes appending
+// S rows O(S): growing kv_len never moves the rows already written. Same-
+// dispatch workgroups past the attention grid copy the history plus the new
+// rows into binding 6 (`present`), which is what the driver's feedback() swap
+// consumes; with `inplace != 0` binding 6 is the same buffer as binding 5 and
+// only the new rows are written, so the whole present write is O(S) too. The
+// attention workgroups never read a row the copy workgroups are writing (they
+// take j >= kv_past from K/V, not from the cache), so no cross-workgroup
+// barrier is needed.
+//
 // Bindings: 0=Y, 1=Q, 2=K, 3=V, 4=mask (additive [B,1,S,kv], dummy when
-// has_mask==0). Q/K/V/Y/mask share one dtype. fp16 build (-DFP16) reads packed
-// half2 words and computes in fp32; the only multi-element writer is the Y
-// store, which is one whole half2 word per lane (no read-modify-write race).
+// has_mask==0; for the cache form K/V hold only the S new rows), 5=cache_in,
+// 6=cache_out (dummies when has_cache==0). Q/K/V/Y/mask/cache share one dtype.
+// fp16 build (-DFP16) reads packed half2 words and computes in fp32; every
+// multi-element writer (the Y store, the cache copy) writes one whole half2
+// word per lane (no read-modify-write race).
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
@@ -40,24 +56,41 @@ layout(set = 0, binding = 3) readonly buffer V {
 layout(set = 0, binding = 4) readonly buffer Mask {
     uint data[];
 } uMask;
+layout(set = 0, binding = 5) readonly buffer CacheIn {
+    uint data[];
+} uCacheIn;
+layout(set = 0, binding = 6) buffer CacheOut {
+    uint data[];
+} uCacheOut;
 
 layout(push_constant) uniform PC_ATTN {
-    float scale;   // 1/sqrt(head_dim), folded by the converter
-    int batch;     // B
-    int heads;     // H (query heads)
-    int kv_heads;  // Hkv
-    int seq;       // S (query rows per batch)
-    int kv_len;    // kv (key/value positions; -1/static both fine, host gates)
-    int head_dim;  // D (even)
-    int rep;       // H / Hkv (GQA group size)
-    int causal;    // 0/1: mask j > (kv_len - seq) + s
-    int has_mask;  // 0/1: bind mask at binding 4
+    float scale;      // 1/sqrt(head_dim), folded by the converter
+    int batch;        // B
+    int heads;        // H (query heads)
+    int kv_heads;     // Hkv
+    int seq;          // S (query rows per batch)
+    int kv_len;       // kv (total key/value positions: kv_past + S)
+    int head_dim;     // D (even)
+    int rep;          // H / Hkv (GQA group size)
+    int causal;       // 0/1: mask j > (kv_len - seq) + s
+    int has_mask;     // 0/1: bind mask at binding 4
+    int kv_past;      // positions already in the cache (0 without a cache)
+    int has_cache;    // 0/1: positions < kv_past come from binding 5
+    int src_stride;   // cache_in row stride (logical kv dim of that tensor)
+    int dst_stride;   // cache_out row stride
+    int inplace;      // 0/1: cache_out aliases cache_in (skip the history copy)
     int _pad0;
-    int _pad1;
 } uA;
 
 #define TILE_KV 256
 #define MAX_HD 256
+
+// Cache row stride in uint words (a fp16 row is D/2 packed words, fp32 D).
+#ifdef FP16
+#define CACHE_ROW_WORDS(D) ((D) >> 1)
+#else
+#define CACHE_ROW_WORDS(D) (D)
+#endif
 
 // Element-loaded float: fp16 reads packed half2 (2 elements/word), fp32 one
 // element per word.
@@ -107,21 +140,67 @@ shared float s_red[256];
         }                                                                      \
     } while (false)
 
+// The cache workgroups: write `present` (binding 6) for every position in
+// [0, kv_len). Positions [0, kv_past) are copied from cache_in, the rest come
+// from the freshly projected K/V rows. Runs in the same dispatch as the
+// attention, over positions it does not read (see the header). One uint word
+// per lane, so an fp16 half2 is never read-modify-written.
+//
+// Layout of both caches: [1,2,nkv,<stride>,D] with K on dim-1 index 0 and V on
+// 1; the row stride (kv dimension pitch) is `src_stride`/`dst_stride`, which may
+// exceed the logical kv_len (that is what makes the append O(S)).
+void copy_cache(int cwg) {
+    int D = uA.head_dim;
+    int nkv = uA.kv_heads;
+    int kv = uA.kv_len;
+    int R = CACHE_ROW_WORDS(D); // words per D-element row
+    int total_words = 2 * nkv * kv * R;
+    int gid = cwg * 256 + int(gl_LocalInvocationID.x);
+    if (gid >= total_words) {
+        return;
+    }
+    int w = gid % R;
+    int row = gid / R;
+    int j = row % kv;
+    int h = (row / kv) % nkv;
+    int c = row / (kv * nkv); // 0 = K, 1 = V
+
+    uint word;
+    if (j < uA.kv_past) {
+        if (uA.inplace != 0) {
+            return; // cache_out IS cache_in: the history is already in place
+        }
+        word = uCacheIn.data[((c * nkv + h) * uA.src_stride + j) * R + w];
+    } else {
+        // Fresh rows, batch 0 (the host requires B == 1 with a cache).
+        int off = (h * uA.seq + (j - uA.kv_past)) * R + w;
+        word = (c == 0) ? uK.data[off] : uV.data[off];
+    }
+    uCacheOut.data[((c * nkv + h) * uA.dst_stride + j) * R + w] = word;
+}
+
 void main() {
     int wg = int(gl_WorkGroupID.x);
     int lid = int(gl_LocalInvocationID.x);
     int S = uA.seq;
     int H = uA.heads;
-
-    int s = wg % S;
-    int h = (wg / S) % H;
-    int b = wg / (S * H);
-
     int D = uA.head_dim;
     int kv = uA.kv_len;
     if (D <= 0 || D > MAX_HD || (D & 1) != 0 || kv <= 0) {
         return; // host gates these; a stray dispatch must not corrupt memory
     }
+    int kv_past = (uA.has_cache != 0) ? uA.kv_past : 0;
+
+    // extra workgroups, if any, are the cache copy
+    int attn_wgs = uA.batch * H * S;
+    if (uA.has_cache != 0 && wg >= attn_wgs) {
+        copy_cache(wg - attn_wgs);
+        return;
+    }
+
+    int s = wg % S;
+    int h = (wg / S) % H;
+    int b = wg / (S * H);
     int h_kv = h / uA.rep;
 
     // ---- stage the Q row (every lane needs all of it) ----
@@ -131,9 +210,16 @@ void main() {
     }
     barrier();
 
-    int k_base = ((b * uA.kv_heads + h_kv) * kv) * D;
-    int v_base = k_base; // K and V share [B,Hkv,kv,D]
-    int past = kv - S;   // absolute position of query row s is past + s
+    // Key/value element offset for position j, head h_kv: the cache for the
+    // positions already written (dim-1 index `c`), else the fresh rows in K/V
+    // at j - kv_past. Element offsets; LOADF folds the fp16 >>1. K/V hold
+    // kv_new rows per head — kv without a cache, S with one.
+    int kv_new = kv - kv_past;
+    int k_base = ((b * uA.kv_heads + h_kv) * kv_new) * D;
+    int v_base = k_base;
+    int c_base = (h_kv * uA.src_stride) * D; // c = 0 (K); V adds nkv rows
+    int c_v_base = c_base + (uA.kv_heads * uA.src_stride) * D;
+    int past = kv - S; // absolute position of query row s is past + s
 
     // Lane t owns output dims (2t, 2t+1) — one whole fp16 word per writer.
     int n_pair = D >> 1;
@@ -150,16 +236,24 @@ void main() {
 
         // ---- score the tile: sS[t] = Q·K[t0+t] * scale + bias ----
         if (lid < tn) {
-            int off = k_base + (t0 + lid) * D;
+            int j = t0 + lid;
+            int off;
+            bool from_cache = (uA.has_cache != 0) && (j < kv_past);
+            if (from_cache) {
+                off = c_base + j * D;
+            } else {
+                off = k_base + (j - kv_past) * D;
+            }
             float dot = 0.0;
             for (int d = 0; d < D; ++d) {
-                dot += sQ[d] * LOADF(uK, off + d);
+                dot += sQ[d] *
+                       (from_cache ? LOADF(uCacheIn, off + d) : LOADF(uK, off + d));
             }
             float sc = dot * uA.scale;
             if (uA.has_mask != 0) {
-                sc += LOADF(uMask, (b * S + s) * kv + t0 + lid);
+                sc += LOADF(uMask, (b * S + s) * kv + j);
             }
-            if (uA.causal != 0 && (t0 + lid) > past + s) {
+            if (uA.causal != 0 && j > past + s) {
                 sc = -65504.0; // fp16 min; exp() -> 0 (not -inf, which NaNs)
             }
             sS[lid] = sc;
@@ -193,13 +287,22 @@ void main() {
         barrier();
 
         // ---- AV: fold this tile into the rescaled accumulator ----
+        // Split at kv_past so the inner loops pick the source buffer once
+        // instead of testing per element.
         if (lid < n_pair) {
             int d0 = lid * 2;
             o0 *= alpha;
             o1 *= alpha;
-            for (int j = 0; j < tn; ++j) {
-                float p = sS[j];
-                int off = v_base + (t0 + j) * D + d0;
+            int hi = min(t0 + tn, kv_past);
+            for (int j = t0; j < hi; ++j) {
+                float p = sS[j - t0];
+                o0 += p * LOADF(uCacheIn, c_v_base + j * D + d0);
+                o1 += p * LOADF(uCacheIn, c_v_base + j * D + d0 + 1);
+            }
+            int lo = max(t0, kv_past);
+            for (int j = lo; j < t0 + tn; ++j) {
+                float p = sS[j - t0];
+                int off = v_base + (j - kv_past) * D + d0;
                 o0 += p * LOADF(uV, off);
                 o1 += p * LOADF(uV, off + 1);
             }

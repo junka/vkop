@@ -1523,6 +1523,156 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
     return brt_close_to_torch(output, ref, rtol, rtol);
 }
 
+// Attention with a KV cache: `past` holds positions [0, kv_past) as
+// [1,2,Hkv,cap,D] (K and V stacked on dim 1), K/V hold the S fresh rows, and
+// the op appends into `present` in the same dispatch. Ref: same softmax over
+// the *concatenated* K/V, per round. Covers both cache layouts — `prealloc`
+// false sizes each round's present to its logical kv_len (stride == kv_len),
+// true preallocates both caches to the session max the way the driver's
+// KVCache does (stride == max_kv), which is the layout a growing context
+// actually runs under.
+// =========================================================================
+
+template <typename T>
+bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
+                              bool use_mask, bool causal, bool prealloc) {
+    Dev d;
+    const int Hkv = H / rep;
+    const int kv_total = S0 + S1;
+    const int max_kv = prealloc ? kv_total : 0;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    using torch::indexing::Slice;
+
+    auto opt = brt_torch_opt<T>();
+    auto kf = torch::randn({1, Hkv, kv_total, D}, torch::kFloat32);
+    auto vf = torch::randn({1, Hkv, kv_total, D}, torch::kFloat32);
+    const int rounds[2] = {S0, S1};
+    // A mask big enough for every round, [1,1,S_max,kv_total].
+    const int s_max = std::max(S0, S1);
+    torch::Tensor mask_ = use_mask
+                              ? torch::randn({1, 1, s_max, kv_total}, opt)
+                              : torch::Tensor();
+
+    // Reference: softmax(Q @ K[:, :, :kv]ᵀ * scale + mask) @ V[:, :, :kv].
+    auto reference = [&](const torch::Tensor &q, int past, int S) {
+        const int kv = past + S;
+        auto qf = q.to(torch::kFloat32);
+        auto yf = torch::zeros({1, H, S, D}, torch::kFloat32);
+        for (int g = 0; g < Hkv; ++g) {
+            auto Qg = qf.index(
+                {Slice(), Slice(g * rep, (g + 1) * rep), Slice(), Slice()});
+            auto Kg = kf.index({Slice(), g, Slice(0, kv), Slice()}).unsqueeze(1);
+            auto Vg = vf.index({Slice(), g, Slice(0, kv), Slice()}).unsqueeze(1);
+            auto sc = torch::matmul(Qg, Kg.transpose(-1, -2)) * scale;
+            if (use_mask)
+                sc = sc + mask_.index(
+                               {Slice(), Slice(), Slice(0, S), Slice(0, kv)});
+            if (causal) {
+                auto j = torch::arange(kv, torch::kFloat32);
+                auto pos = torch::arange(S, torch::kFloat32) + float(past);
+                auto allow = j.unsqueeze(0) <= pos.unsqueeze(1);
+                sc = sc.masked_fill(~allow.unsqueeze(0).unsqueeze(0), -1e30f);
+            }
+            auto p = torch::softmax(sc, -1);
+            yf.index_put_(
+                {Slice(), Slice(g * rep, (g + 1) * rep), Slice(), Slice()},
+                torch::matmul(p, Vg));
+        }
+        return yf.to(opt.dtype());
+    };
+
+    auto shape_of = [](std::initializer_list<int> s) {
+        return std::vector<int>(s);
+    };
+    // Cache tensors are reused round to round exactly as the driver does it:
+    // this round's `present` becomes next round's `past`.
+    auto alloc_cache = [&](const std::vector<int> &shape) {
+        auto t = std::make_shared<Tensor<T>>(shape);
+        if (prealloc) {
+            const std::size_t elems =
+                static_cast<std::size_t>(2) * Hkv * max_kv * D;
+            t->preallocate_buffer(d.dev, elems);
+            t->toGPU();
+        } else {
+            t->as_storage_buffer(d.dev);
+            t->toGPU();
+        }
+        return t;
+    };
+    auto past = alloc_cache(shape_of({1, 2, Hkv, 0, D}));
+    auto pres = alloc_cache(shape_of({1, 2, Hkv, 0, D}));
+
+    const float rtol = std::is_same_v<T, uint16_t> ? 0.03f : 0.002f;
+    for (int r = 0; r < 2; ++r) {
+        const int S = rounds[r];
+        const int past_len = (r == 0) ? 0 : S0;
+        const int kv = past_len + S;
+
+        auto q = torch::randn({1, H, S, D}, opt);
+        auto kn = kf.index({Slice(), Slice(), Slice(past_len, kv), Slice()})
+                      .contiguous()
+                      .to(opt.dtype());
+        auto vn = vf.index({Slice(), Slice(), Slice(past_len, kv), Slice()})
+                      .contiguous()
+                      .to(opt.dtype());
+
+        auto Qi = std::make_shared<Tensor<T>>(shape_of({1, H, S, D}));
+        brt_fill(Qi, q);
+        brt_upload(Qi, d);
+        auto Ki = std::make_shared<Tensor<T>>(shape_of({1, Hkv, S, D}));
+        brt_fill(Ki, kn);
+        brt_upload(Ki, d);
+        auto Vi = std::make_shared<Tensor<T>>(shape_of({1, Hkv, S, D}));
+        brt_fill(Vi, vn);
+        brt_upload(Vi, d);
+
+        std::vector<std::shared_ptr<vkop::core::ITensor>> ins{Qi, Ki, Vi, past};
+        if (use_mask) {
+            auto m = mask_.index({Slice(), Slice(), Slice(0, S), Slice(0, kv)})
+                         .contiguous();
+            auto Mi = std::make_shared<Tensor<T>>(shape_of({1, 1, S, kv}));
+            brt_fill(Mi, m);
+            brt_upload(Mi, d);
+            ins.push_back(Mi);
+        }
+
+        auto ref = reference(q, past_len, S);
+        auto Y = brt_make_out<T>(brt_to_int_shape(ref), d);
+        auto op = brt_make_op(vkop::ops::OpType::ATTENTION,
+                              std::is_same_v<T, uint16_t>,
+                              {{"scale", std::to_string(scale)},
+                               {"num_heads", std::to_string(H)},
+                               {"num_kv_heads", std::to_string(Hkv)},
+                               {"causal", causal ? "1" : "0"},
+                               {"has_cache", "1"}},
+                              d);
+        if (!op)
+            return false;
+        op->onExecute(ins, {Y, pres}, 0);
+        brt_run_op(op.get(), d);
+        Y->copyToCPU(d.cmdpool);
+        if (!brt_close_to_torch(Y, ref, rtol, rtol))
+            return false;
+
+        // present must hold the whole history: K then V on dim 1. Only
+        // readable as a packed tensor when the stride is the logical kv_len.
+        if (!prealloc) {
+            auto want =
+                torch::cat({kf.index({Slice(), Slice(), Slice(0, kv), Slice()}),
+                            vf.index({Slice(), Slice(), Slice(0, kv), Slice()})},
+                           /*dim=*/1)
+                    .to(opt.dtype());
+            pres->copyToCPU(d.cmdpool);
+            if (!brt_close_to_torch(pres, want, rtol, rtol))
+                return false;
+        }
+
+        std::swap(past, pres);
+        past->resize(shape_of({1, 2, Hkv, kv, D}));
+    }
+    return true;
+}
+
 TEST(BufferRankTest, AttentionFp32AndFp16) {
     // MHA, self (kv==S), no mask, no causal.
     EXPECT_TRUE(brt_attention_case<float>(2, 4, 5, 64, 5, 1, false, false));
@@ -1564,6 +1714,25 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     EXPECT_TRUE(brt_attention_case<float>(1, 2, 1, 128, 4096, 2, false, true));
     // Wide row and multi-tile kv at the same time.
     EXPECT_TRUE(brt_attention_case<float>(1, 8, 200, 64, 700, 1, false, false));
+
+    // KV-cache form (has_cache): K/V hold only the fresh rows, the history
+    // comes from the cache, and the same dispatch appends to `present`.
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 5, 3, 1, false, false, false));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 5, 3, 1, false, false, false));
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 5, 3, 1, true, false, false));
+    // GQA + causal + a decode-shaped second round (S=1, kv grows by one).
+    EXPECT_TRUE(brt_attention_cache_case<float>(8, 128, 6, 1, 2, false, true, false));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 6, 1, 2, false, true, false));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 5, 1, 1, true, true, false));
+    // Same sequence with the caches preallocated to the session max (the
+    // driver's KVCache layout): the row stride is then max_kv, not the logical
+    // kv_len, which is what makes the append O(S) instead of a move.
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 5, 3, 1, false, false, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 6, 1, 2, true, true, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 5, 1, 1, true, true, true));
+    // Multi-tile kv: 300 positions over three rounds.
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 256, 44, 1, false, false, false));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 256, 44, 1, false, false, true));
 }
 
 } // namespace

@@ -1184,6 +1184,22 @@ class FusionOptimizer:
             )
         )
 
+        # KV-cache append: fold the per-layer Gather/Concat/Unsqueeze rotation
+        # into the Attention op's cache form (has_cache=1) — the op reads the
+        # preallocated past in place and appends only the S fresh rows, which is
+        # what collapses 196 copy dispatches/round (48-71% of a decode round at
+        # kv_len 1024..4096) to zero. Runs *after* fuse_into_attention so its
+        # anchor — the Attention node — already exists. Disable with
+        # VKOP_NO_FUSIONS=fuse_kv_cache_append for an A/B of the decode path.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_kv_cache_append",
+                FusionOptimizer.match_kv_cache_append,
+                FusionOptimizer.fold_kv_cache_append,
+                priority=74,
+            )
+        )
+
         # Elemwise chain fusion (kernel-fusion engine): collapse single-
         # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
         # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
@@ -3397,6 +3413,220 @@ class FusionOptimizer:
         dag_model.nodes[fused.name] = fused
 
         print(f"Fused Attention pattern into '{fused.name}'")
+        return True
+
+    @staticmethod
+    def match_kv_cache_append(dag_model):
+        """Match the KV-cache rotation around an already-fused Attention.
+
+        HF's cached decode path never keeps one KV tensor; every layer rotates
+        it with a 7-node chain whose cost is linear in the context:
+
+            past_key_values_L [1,2,Hkv,kv_past,D]        (graph input, driver-
+                |             |                            preallocated to max_kv)
+            Gather(axis=1,0) Gather(axis=1,1)             K history / V history
+                 |               |
+                 |          Transpose_2   Add_1          this round's projections
+                 |               |         |
+              Concat_5(ax=2)  Concat_6(ax=2)              K_full / V_full
+                 |    |          |    |
+                 |    Unsqueeze_32  Unsqueeze_33          (both axes=[1])
+                 |        |             |
+                 |        ---Concat_12(ax=1)---           present_key_values_L
+                 |                            |
+            Attention(Q,K_full,V_full,mask)  |           (both K_full/V_full feed
+                 |                           |            it *and* the rotation)
+                 Y                  present_key_values_L  (graph output)
+
+        Every round both Concats *copy the entire past*, and the two Gathers copy
+        it again: 2 Gather + 2 Concat + 2 Unsqueeze + 1 Concat = 7 dispatches per
+        layer, 196 per round, moving ~4x the cache. Measured on Qwen3-VL that is
+        48-50% of a decode round at kv_len=1024 and 69-71% at 4096.
+
+        The Attention op's cache form subsumes all of it: it takes the history
+        straight from `past` (a preallocated [1,2,Hkv,cap,D] SSBO it reads at the
+        buffer's own row pitch — appending S rows never moves the past) plus the
+        S fresh rows, and appends them to `present` in the same dispatch. So this
+        fold rewires K_full/V_full to their *new-rows* operands, hands `past` to
+        the op as input 3, makes `present` its output 1, and deletes all 7 nodes.
+
+        Every deleted node is checked single-consumer first: K_full and V_full
+        are the only tensors here with two consumers (the Attention and its
+        Unsqueeze), and a fold that mis-deletes one would rewrite a live
+        subgraph. The Gather index must be 0 for K and 1 for V — that is the
+        [1,2,...] layout the op hardcodes — and both gathers must read the *same*
+        graph input, which is what makes it a cache rather than two unrelated
+        slices.
+        """
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        graph_inputs = {i["name"] for i in dag_model.inputs}
+        graph_outputs = {o["name"] for o in dag_model.outputs}
+
+        def _int_scalar(name):
+            """The value of a scalar initializer / Constant output, or None.
+            The loader folds Constants into initializers, but a pass that ran
+            earlier may have left the node, so check both."""
+            v = dag_model.initializers.get(name)
+            if v is None:
+                p = producer.get(name)
+                if p is not None and p.op_type == "Constant":
+                    v = p.attributes.get("value")
+            if v is None:
+                return None
+            try:
+                import numpy as np
+
+                if not isinstance(v, np.ndarray):
+                    from onnx import numpy_helper
+
+                    v = numpy_helper.to_array(v)
+                if v.size != 1:
+                    return None
+                return int(v.reshape(-1)[0])
+            except Exception:
+                return None
+
+        def _axis(node, default=0):
+            v = node.attributes.get("axis", default)
+            try:
+                return int(v)
+            except Exception:
+                return default
+
+        def _single_consumer(name):
+            cs = consumers.get(name, [])
+            return cs[0][0] if len(cs) == 1 else None
+
+        def _unsqueezed_at_1(node, src_shape):
+            """`node` is Unsqueeze(src) -> a tensor of one higher rank with the
+            new axis at 1 and every other dim preserved. Reads the shape rather
+            than the axes operand: opset>=13 carries axes as an input, older
+            ones as an attribute, and both mean the same thing here."""
+            if node is None or node.op_type != "Unsqueeze" or len(node.inputs) < 1:
+                return False
+            if _single_consumer(node.outputs[0]["name"]) is None:
+                return False
+            out = list(node.outputs[0].get("shape") or [])
+            if len(out) != len(src_shape) + 1 or out[1] != 1:
+                return False
+            return out[0] == src_shape[0] and out[2:] == list(src_shape[1:])
+
+        matches = []
+        for att in list(dag_model.nodes.values()):
+            if att.op_type != "Attention" or len(att.inputs) < 3:
+                continue
+            k_full, v_full = att.inputs[1], att.inputs[2]
+            kc = producer.get(k_full["name"])
+            vc = producer.get(v_full["name"])
+            if kc is None or vc is None:
+                continue
+            if kc.op_type != "Concat" or vc.op_type != "Concat":
+                continue
+            if _axis(kc) not in (2, -2) or _axis(vc) not in (2, -2):
+                continue
+            if len(kc.inputs) != 2 or len(vc.inputs) != 2:
+                continue
+            # [history, fresh rows] — the order the kernel indexes from kv_past.
+            g_k, k_new = producer.get(kc.inputs[0]["name"]), kc.inputs[1]
+            g_v, v_new = producer.get(vc.inputs[0]["name"]), vc.inputs[1]
+            if g_k is None or g_v is None:
+                continue
+            if g_k.op_type != "Gather" or g_v.op_type != "Gather":
+                continue
+            if len(g_k.inputs) != 2 or len(g_v.inputs) != 2:
+                continue
+            if _axis(g_k, 1) != 1 or _axis(g_v, 1) != 1:
+                continue
+            past_k, past_v = g_k.inputs[0], g_v.inputs[0]
+            if past_k["name"] != past_v["name"]:
+                continue
+            if past_k["name"] not in graph_inputs:
+                continue  # a cache the driver did not allocate is not a cache
+            if past_k["name"] in graph_outputs:
+                continue
+            # K on dim-1 index 0, V on 1 — the op's layout, and the layout the
+            # driver's KVCache::feedback() reads back.
+            if _int_scalar(g_k.inputs[1]["name"]) != 0:
+                continue
+            if _int_scalar(g_v.inputs[1]["name"]) != 1:
+                continue
+            # The history slices must feed nothing but their Concat; otherwise
+            # some other consumer is reading the past and would keep doing so
+            # against a tensor this fold stops producing.
+            if _single_consumer(g_k.outputs[0]["name"]) is not kc:
+                continue
+            if _single_consumer(g_v.outputs[0]["name"]) is not vc:
+                continue
+            # K_full/V_full feed exactly the Attention and their Unsqueeze.
+            k_cons = consumers.get(k_full["name"], [])
+            v_cons = consumers.get(v_full["name"], [])
+            if len(k_cons) != 2 or len(v_cons) != 2:
+                continue
+            usq_k = next((c[0] for c in k_cons
+                          if c[0].op_type == "Unsqueeze" and c[1] == 0), None)
+            usq_v = next((c[0] for c in v_cons
+                          if c[0].op_type == "Unsqueeze" and c[1] == 0), None)
+            if usq_k is None or usq_v is None:
+                continue
+            if not any(c[0] is att for c in k_cons):
+                continue
+            if not any(c[0] is att for c in v_cons):
+                continue
+            k_shape = list(k_full.get("shape") or [])
+            v_shape = list(v_full.get("shape") or [])
+            if not _unsqueezed_at_1(usq_k, k_shape):
+                continue
+            if not _unsqueezed_at_1(usq_v, v_shape):
+                continue
+            # Both Unsqueezes feed one Concat(axis=1) — the `present` tensor,
+            # which must be the graph output the driver preallocates.
+            present_node = _single_consumer(usq_k.outputs[0]["name"])
+            if present_node is None or present_node is not _single_consumer(
+                    usq_v.outputs[0]["name"]):
+                continue
+            if present_node.op_type != "Concat" or len(present_node.inputs) != 2:
+                continue
+            if _axis(present_node) not in (1, -4):
+                continue
+            present_out = present_node.outputs[0]
+            if present_out["name"] not in graph_outputs:
+                continue
+
+            matches.append({
+                "attention": att,
+                "k_new": k_new,
+                "v_new": v_new,
+                "past": past_k,
+                "present": present_out,
+                "nodes_to_delete": [g_k, g_v, kc, vc, usq_k, usq_v,
+                                    present_node],
+            })
+
+        print(f"Found {len(matches)} KV-cache append patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_kv_cache_append(dag_model, match) -> bool:
+        """Rewire an Attention to the cache form and drop the rotation.
+
+        `past` and `present` are graph inputs/outputs the driver allocated, so
+        they are NOT deleted — only the 7-node rotation between them. Output 0
+        keeps the MatMul's tensor name; output 1 takes `present`'s, which is how
+        the runtime resolves it back to the preallocated buffer.
+        """
+        att = match["attention"]
+        inputs = [att.inputs[0], match["k_new"], match["v_new"], match["past"]]
+        inputs += att.inputs[3:]  # the additive mask, when the graph has one
+        att.inputs = inputs
+        att.outputs = att.outputs[:1] + [match["present"]]
+        # The cache replaces the mask-carried causality *and* the Concat-chain
+        # present tensor; both are attributes the op reads at execute() time.
+        att.attributes = dict(att.attributes)
+        att.attributes["has_cache"] = 1
+        for n in match["nodes_to_delete"]:
+            del dag_model.nodes[n.name]
+        print(f"Fused KV-cache append into '{att.name}' "
+              f"(present={match['present']['name']})")
         return True
 
     @staticmethod
