@@ -15,8 +15,18 @@
 // as `alpha = exp(m_old - m_new)`, and the output accumulator rescales by
 // alpha before folding that tile's contribution. The P1 form staged the whole
 // row (shared `sS[MAX_KV]`), which capped kv at 2048 and made shared memory
-// scale with the context; this form keeps ~3 KB of shared regardless of kv, so
+// scale with the context; this form keeps ~7 KB of shared regardless of kv, so
 // kv is unbounded (the host only enforces the shape-level invariants).
+//
+// Both inner passes are written for ILP and lane occupancy rather than for the
+// fewest lanes (measured on an iGPU: the naive form ran at 36 GFLOP/s with the
+// same 36 GB/s of traffic, i.e. latency-bound, not bandwidth-bound). The score
+// pass loads one half2 word per two elements and keeps four independent
+// accumulators, so its dependency chain is D/8; the AV pass splits the tile's
+// kv range `nsplit` ways, so all 256 lanes work and the chain is tn/nsplit.
+// Both changes are pure scheduling — the arithmetic and the memory layout are
+// unchanged; only the order the fp32 sums associate in moves, so the result
+// shifts by rounding, not by structure.
 //
 // KV-cache form (has_cache != 0). The key/value positions [0, kv_len) are no
 // longer all in K/V: positions [0, kv_past) live in the preallocated cache
@@ -105,6 +115,74 @@ layout(push_constant) uniform PC_ATTN {
 shared float sQ[MAX_HD];
 shared float sS[TILE_KV];
 shared float s_red[256];
+// AV partials: nsplit slices of one tile, each n_pair wide. Smallest of the
+// four arrays by far is sS; this one is the budget ceiling at 4 KB.
+shared float sAcc[4][MAX_HD];
+
+// Q·K[:,j] for one key row, into DOT. Two things about the naive form this
+// replaces: it loaded a whole uint word per *element* (half2 holds two), and
+// it chained D dependent FMAs into one accumulator. This reads one word per two
+// elements and keeps four independent accumulators, so the dependency is D/8
+// long. sQ[d] is the same address for every lane of the warp, i.e. a broadcast.
+// OFF is an even element offset (rows are D-aligned, D is even).
+#ifdef FP16
+#define SCORE_DOT(BUF, OFF, DOT)                                                \
+    do {                                                                        \
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;                           \
+        const int wo = (OFF) >> 1;                                              \
+        const int nw = D >> 1;                                                  \
+        int w = 0;                                                              \
+        for (; w + 4 <= nw; w += 4) {                                           \
+            vec2 v0 = unpackHalf2x16((BUF).data[wo + w]);                       \
+            vec2 v1 = unpackHalf2x16((BUF).data[wo + w + 1]);                   \
+            vec2 v2 = unpackHalf2x16((BUF).data[wo + w + 2]);                   \
+            vec2 v3 = unpackHalf2x16((BUF).data[wo + w + 3]);                   \
+            a0 += sQ[2 * w] * v0.x + sQ[2 * w + 1] * v0.y;                      \
+            a1 += sQ[2 * w + 2] * v1.x + sQ[2 * w + 3] * v1.y;                  \
+            a2 += sQ[2 * w + 4] * v2.x + sQ[2 * w + 5] * v2.y;                  \
+            a3 += sQ[2 * w + 6] * v3.x + sQ[2 * w + 7] * v3.y;                  \
+        }                                                                       \
+        for (; w < nw; ++w) {                                                   \
+            vec2 v = unpackHalf2x16((BUF).data[wo + w]);                        \
+            a0 += sQ[2 * w] * v.x + sQ[2 * w + 1] * v.y;                        \
+        }                                                                       \
+        (DOT) = (a0 + a1) + (a2 + a3);                                          \
+    } while (false)
+#else
+#define SCORE_DOT(BUF, OFF, DOT)                                                \
+    do {                                                                        \
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;                           \
+        int d = 0;                                                              \
+        for (; d + 4 <= D; d += 4) {                                            \
+            a0 += sQ[d] * uintBitsToFloat((BUF).data[(OFF) + d]);               \
+            a1 += sQ[d + 1] * uintBitsToFloat((BUF).data[(OFF) + d + 1]);       \
+            a2 += sQ[d + 2] * uintBitsToFloat((BUF).data[(OFF) + d + 2]);       \
+            a3 += sQ[d + 3] * uintBitsToFloat((BUF).data[(OFF) + d + 3]);       \
+        }                                                                       \
+        for (; d < D; ++d) {                                                    \
+            a0 += sQ[d] * uintBitsToFloat((BUF).data[(OFF) + d]);               \
+        }                                                                       \
+        (DOT) = (a0 + a1) + (a2 + a3);                                          \
+    } while (false)
+#endif
+
+// One V dim-pair (D0, D0+1) of row ROWOFF, scaled by P, folded into (A0, A1).
+// D0 is even, so the two elements share one fp16 word; ROWOFF is even too, so
+// the word index splits as (row>>1) + (d0>>1). fp32 has no packing to exploit.
+#ifdef FP16
+#define ACC_PAIR(BUF, ROWOFF, D0, P, A0, A1)                                    \
+    do {                                                                        \
+        vec2 v_ = unpackHalf2x16((BUF).data[((ROWOFF) >> 1) + ((D0) >> 1)]);    \
+        (A0) += (P) * v_.x;                                                     \
+        (A1) += (P) * v_.y;                                                     \
+    } while (false)
+#else
+#define ACC_PAIR(BUF, ROWOFF, D0, P, A0, A1)                                    \
+    do {                                                                        \
+        (A0) += (P) * uintBitsToFloat((BUF).data[(ROWOFF) + (D0)]);             \
+        (A1) += (P) * uintBitsToFloat((BUF).data[(ROWOFF) + (D0) + 1]);         \
+    } while (false)
+#endif
 
 // Tree-reduce `s_red` (256 lanes) with `op`, leaving the result in s_red[0].
 // Each step fences, so the value every lane latched before the call is not
@@ -223,6 +301,19 @@ void main() {
 
     // Lane t owns output dims (2t, 2t+1) — one whole fp16 word per writer.
     int n_pair = D >> 1;
+    // AV work split: `n_pair` lanes cover the head dim and `nsplit` slices
+    // cover this tile's kv range, so every lane does useful work instead of the
+    // D/2 that one-pair-per-lane gave (64 of 256 at D=128) and the per-lane
+    // dependency chain is tn/nsplit long instead of tn. Slices are contiguous
+    // ranges, not interleaved, so the two loops below still pick their source
+    // buffer once each and lanes inside a warp read one broadcast sS entry.
+    int nsplit = 256 / n_pair;
+    if (nsplit > 4) {
+        nsplit = 4;
+    }
+    if (nsplit < 1) {
+        nsplit = 1;
+    }
     float o0 = 0.0;
     float o1 = 0.0;
     float m = -1e30; // running row max
@@ -239,15 +330,13 @@ void main() {
             int j = t0 + lid;
             int off;
             bool from_cache = (uA.has_cache != 0) && (j < kv_past);
+            float dot;
             if (from_cache) {
                 off = c_base + j * D;
+                SCORE_DOT(uCacheIn, off, dot);
             } else {
                 off = k_base + (j - kv_past) * D;
-            }
-            float dot = 0.0;
-            for (int d = 0; d < D; ++d) {
-                dot += sQ[d] *
-                       (from_cache ? LOADF(uCacheIn, off + d) : LOADF(uK, off + d));
+                SCORE_DOT(uK, off, dot);
             }
             float sc = dot * uA.scale;
             if (uA.has_mask != 0) {
@@ -286,29 +375,44 @@ void main() {
         memoryBarrierShared();
         barrier();
 
-        // ---- AV: fold this tile into the rescaled accumulator ----
-        // Split at kv_past so the inner loops pick the source buffer once
-        // instead of testing per element.
+        // ---- AV: fold this tile into the accumulator ----
+        // Each of the nsplit slices sums P·V over its own contiguous run of the
+        // tile into one dim pair; the partials meet in sAcc and the lanes that
+        // own the running accumulator (0..n_pair) rescale and fold them in.
+        // Slicing by range rather than by stride keeps the two inner loops able
+        // to pick their source buffer once instead of testing per element.
+        if (lid < n_pair * nsplit) {
+            int sub = lid / n_pair;
+            int d0 = (lid - sub * n_pair) * 2;
+            int jlo = t0 + (tn * sub) / nsplit;
+            int jhi = t0 + (tn * (sub + 1)) / nsplit;
+            float p0 = 0.0;
+            float p1 = 0.0;
+            int hi = min(jhi, kv_past);
+            for (int j = jlo; j < hi; ++j) {
+                ACC_PAIR(uCacheIn, c_v_base + j * D, d0, sS[j - t0], p0, p1);
+            }
+            int lo = max(jlo, kv_past);
+            for (int j = lo; j < jhi; ++j) {
+                ACC_PAIR(uV, v_base + (j - kv_past) * D, d0, sS[j - t0], p0, p1);
+            }
+            sAcc[sub][d0] = p0;
+            sAcc[sub][d0 + 1] = p1;
+        }
+        memoryBarrierShared();
+        barrier();
         if (lid < n_pair) {
             int d0 = lid * 2;
-            o0 *= alpha;
-            o1 *= alpha;
-            int hi = min(t0 + tn, kv_past);
-            for (int j = t0; j < hi; ++j) {
-                float p = sS[j - t0];
-                o0 += p * LOADF(uCacheIn, c_v_base + j * D + d0);
-                o1 += p * LOADF(uCacheIn, c_v_base + j * D + d0 + 1);
+            float n0 = o0 * alpha;
+            float n1 = o1 * alpha;
+            for (int k = 0; k < nsplit; ++k) {
+                n0 += sAcc[k][d0];
+                n1 += sAcc[k][d0 + 1];
             }
-            int lo = max(t0, kv_past);
-            for (int j = lo; j < t0 + tn; ++j) {
-                float p = sS[j - t0];
-                int off = v_base + (j - kv_past) * D + d0;
-                o0 += p * LOADF(uV, off);
-                o1 += p * LOADF(uV, off + 1);
-            }
+            o0 = n0;
+            o1 = n1;
         }
-        // A lane that skipped the AV block must still not run ahead into the
-        // next tile's `sS` write.
+        // Also the fence before the next tile overwrites sS and sAcc.
         memoryBarrierShared();
         barrier();
         m = m_new;
