@@ -628,6 +628,27 @@ int main(int argc, char** argv) {
     const bool profile_mode = std::getenv("VKOP_PROFILE") != nullptr;
     PerfMetrics session_metrics;
 
+    // ---- 跨轮 KV 前缀复用 ----
+    // 上一轮结束时 KV 里装的是哪一段序列（token 级）。下一轮的 render() 只要以
+    // 它为前缀，就能从 kv_len=P 接着 prefill，只算新增的那几个 token —— 多轮
+    // 对话里省掉的是「把整段历史重新 encode + 重新过一遍 attention」。
+    //
+    // 为什么数值上成立：解码器自回归，位置 i 的 K/V 只由 ≤i 的 token 决定，
+    // 后面再接什么都不影响它（attention 的 mask 决定读出什么，不影响写进去的
+    // K/V）。Conversation::addAssistantTurn 特意把「生成停在停止符」那轮的收尾
+    // 补齐，就是为了让下一轮序列是上一轮的合法扩展；否则前缀对不上，这里会
+    // 直接放弃复用。
+    struct KvCoverage {
+        std::vector<uint32_t> ids;    // 模型实际吃进去过的 token（prefill 的
+                                      // ids + decode 每步喂进去的那个）
+        std::vector<int32_t> mm_types;
+        std::vector<RenderedContext::Span> spans;
+    };
+    KvCoverage covered;
+    // 默认开（前提检查不通过就自动退回整段 prefill，只会慢不会错）；
+    // VKOP_NO_KV_REUSE=1 强制整段，用来 A/B 出「复用是否逐位相同」。
+    const bool kv_reuse = std::getenv("VKOP_NO_KV_REUSE") == nullptr;
+
     // REPL loop.
     {
         std::string stops;
@@ -687,24 +708,69 @@ int main(int argc, char** argv) {
         int L = static_cast<int>(ids.size());
         std::printf("[prefill] L=%d building inputs...\n", L); std::fflush(stdout);
 
+        // ---- 本轮从哪接着算：P = 复用的前缀长度，S = 要新算的 token 数 ----
+        // 复用要求 ids 以「上一轮 KV 装的那段序列」为前缀，且前缀里的 mm 类型
+        // 与图像 span 逐位一致 —— 占位 token 相同但配错图，K/V 就是错的，而
+        // 这种错不会自己暴露。任何一条不满足都退回整段 prefill（P=0）。
+        int P = 0;
+        if (kv_reuse && !covered.ids.empty() && covered.ids.size() < ids.size() &&
+            Conversation::prefixMatch(covered.ids, ids)) {
+            bool ok = covered.mm_types.size() == covered.ids.size();
+            for (int i = 0; ok && i < static_cast<int>(covered.ids.size()); ++i) {
+                ok = covered.mm_types[i] == rctx.mm_types[i];
+            }
+            size_t j = 0;
+            for (const auto& s : covered.spans) {
+                if (!ok) break;
+                // span 跨在边界上就没法只复用前半段：整段重算。
+                ok = s.start + s.count <= static_cast<int>(covered.ids.size()) &&
+                     j < rctx.spans.size();
+                if (!ok) break;
+                const auto& n = rctx.spans[j++];
+                ok = n.start == s.start && n.count == s.count && n.block == s.block;
+            }
+            for (; ok && j < rctx.spans.size(); ++j) {
+                ok = rctx.spans[j].start >= static_cast<int>(covered.ids.size());
+            }
+            if (ok) P = static_cast<int>(covered.ids.size());
+        }
+        const int S = L - P;
+        // 本轮 decode 实际喂进去的 token（prefill 的 ids 之外的部分）—— 和
+        // past_len 一起长，本轮结束后就是 KV 覆盖的完整序列。
+        std::vector<uint32_t> consumed_gen;
+        consumed_gen.reserve(static_cast<size_t>(max_new));
+        if (P > 0) {
+            std::printf("[prefill] reusing %d/%d kv positions, %d to compute\n",
+                        P, L, S);
+        } else if (kv_reuse && !covered.ids.empty()) {
+            std::printf("[prefill] no reusable prefix (previous kv covered %zu "
+                        "tokens) — full prefill\n", covered.ids.size());
+        }
+
         // mm_token_type_ids (1, L): 0=text, 1=image. attention_mask all 1.
         // 序列里图片位置的判定由 Conversation/render_raw 一起算好了。
         const std::vector<int32_t>& mtt = rctx.mm_types;
         std::vector<int8_t> amask(L, 1);
 
-        // inputs_embeds (1, L, hidden): embed all ids, then scatter the visual
-        // image_features rows into the image-pad positions (多模态). 按 span 的
-        // 出现顺序取每张图自己的特征行（裁切掉历史里的图时行号会跳过）。
-        auto emb = embed_lookup(embed_table, ids, vocab, arch.hidden);
-        std::vector<uint16_t> ds_turn;   // (img_count, hidden) 本轮用的 deepstack
-        if (have_visual && img_count > 0) {
-            for (int d = 0; d < 3; ++d)
-                ds_turn.assign(static_cast<size_t>(img_count) * arch.hidden, 0);
+        // inputs_embeds (1, S, hidden): embed the new tokens, then scatter the
+        // visual image_features rows into the image-pad positions (多模态). 按
+        // span 的出现顺序取每张图自己的特征行（裁切掉历史里的图时行号会跳过）。
+        // 前缀里的图不在这里：它们的行已经在 KV 里了。
+        const std::vector<uint32_t> tail_ids(ids.begin() + P, ids.end());
+        auto emb = embed_lookup(embed_table, tail_ids, vocab, arch.hidden);
+        std::vector<uint16_t> ds_turn;   // (img_count_in_suffix, hidden)
+        int img_suffix = 0;
+        for (const auto& sp : rctx.spans) {
+            if (sp.start >= P) img_suffix += sp.count;
+        }
+        if (have_visual && img_suffix > 0) {
+            ds_turn.assign(static_cast<size_t>(img_suffix) * arch.hidden, 0);
             int feat_row = 0;   // running row index into emb / ds_turn
             for (const auto& sp : rctx.spans) {
+                if (sp.start < P) continue;
                 const int row0 = feat_row0[sp.block];
                 for (int i = 0; i < sp.count; ++i, ++feat_row) {
-                    std::memcpy(&emb[(sp.start + i) * arch.hidden],
+                    std::memcpy(&emb[static_cast<size_t>(sp.start - P + i) * arch.hidden],
                                 &img_feat_cat[static_cast<size_t>(row0 + i) * arch.hidden],
                                 arch.hidden * sizeof(uint16_t));
                     for (int d = 0; d < 3; ++d)
@@ -714,12 +780,15 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(L),
+        fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(S),
                       static_cast<uint32_t>(arch.hidden)}, emb.data());
         std::printf("  inputs_embeds ok\n"); std::fflush(stdout);
 
-        // position_ids: 纯文本 2D (1, L) 或 多模态 3D (3, 1, L) MRoPE.
+        // position_ids: 纯文本 2D (1, S) 或 多模态 3D (3, 1, S) MRoPE.
         // 纯文本用 arange；多模态走 get_rope_index 拿 rope_delta（decode 时用）。
+        // 位置是绝对位置，所以复用前缀时两种形式都要带上 P 的偏移 —— 3D 更是
+        // 必须在**整段** ids 上算一次（MRoPE 的位置是顺着序列走出来的），再切
+        // 尾部 S 个，才能保证前缀那几行的位置和上一轮算出的一模一样。
         int64_t rope_delta = 0;
         if (arch.position_ids_dims == 3) {
             // 本轮实际用到的图（按出现顺序）的 grid_thw，从 ImageBlock 现取。
@@ -736,34 +805,43 @@ int main(int argc, char** argv) {
                                      have_visual && img_count > 0
                                          ? static_cast<int>(rctx.spans.size()) : 0,
                                      /*B=*/1, L);
-            fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(L)},
-                           ri.pos_ids.data());
+            std::vector<int64_t> pos3(static_cast<size_t>(3) * S);
+            for (int c = 0; c < 3; ++c) {
+                for (int i = 0; i < S; ++i) {
+                    pos3[static_cast<size_t>(c) * S + i] =
+                        ri.pos_ids[static_cast<size_t>(c) * L + P + i];
+                }
+            }
+            fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(S)},
+                           pos3.data());
             rope_delta = ri.rope_delta[0];
         } else {
-            // 2D 标准 RoPE: (1, L) = arange(L). 无 rope_delta.
-            std::vector<int64_t> pos(static_cast<size_t>(L));
-            for (int i = 0; i < L; ++i) pos[i] = i;
-            fill_i64_input(rt, "position_ids", {1u, static_cast<uint32_t>(L)},
+            // 2D 标准 RoPE: (1, S) = arange(P, P+S). 无 rope_delta.
+            std::vector<int64_t> pos(static_cast<size_t>(S));
+            for (int i = 0; i < S; ++i) pos[i] = P + i;
+            fill_i64_input(rt, "position_ids", {1u, static_cast<uint32_t>(S)},
                            pos.data());
         }
         std::printf("  position_ids ok (%dD, rope_delta=%lld)\n",
                     arch.position_ids_dims, (long long)rope_delta); std::fflush(stdout);
 
-        // attention_bias (1, 1, L, L) causal.
+        // attention_bias (1, 1, S, P+S) causal: query i (绝对位置 P+i) 看得到
+        // [0, P+i]。causal_bias 的 threshold 就是按 kv-q 算的，复用前缀时 q=S、
+        // kv=P+S，正好落到同一个偏移上。
         {
-            auto ab = causal_bias(L, L);
-            fill_fp16_input(rt, "attention_bias", {1u, 1u, static_cast<uint32_t>(L),
-                          static_cast<uint32_t>(L)}, ab.data());
+            auto ab = causal_bias(S, P + S);
+            fill_fp16_input(rt, "attention_bias", {1u, 1u, static_cast<uint32_t>(S),
+                          static_cast<uint32_t>(P + S)}, ab.data());
         }
         std::printf("  attention_bias ok\n"); std::fflush(stdout);
 
         // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。多图时 HF 把每张
         // 图的 deepstack 按 prompt 顺序拼成 (total_img, hidden) 一个输入。
         if (arch.has_deepstack) {
-            if (have_visual && img_count > 0) {
+            if (have_visual && img_suffix > 0) {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
-                                    {static_cast<uint32_t>(img_count),
+                                    {static_cast<uint32_t>(img_suffix),
                                      static_cast<uint32_t>(arch.hidden)},
                                     ds_turn.data());
             } else {
@@ -774,24 +852,29 @@ int main(int argc, char** argv) {
             std::printf("  deepstack ok\n"); std::fflush(stdout);
         }
 
-        // image_pad_mask (1, L): 仅多模态模型有此输入。
+        // image_pad_mask (1, S): 仅多模态模型有此输入。
         if (arch.has_image_pad_mask) {
-            std::vector<int8_t> mask(L, 0);
-            for (size_t i = 0; i < rctx.mm_types.size(); ++i)
-                mask[i] = rctx.mm_types[i] ? 1 : 0;
-            rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(L)});
+            std::vector<int8_t> mask(S, 0);
+            for (int i = 0; i < S; ++i)
+                mask[i] = rctx.mm_types[P + i] ? 1 : 0;
+            rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(S)});
             auto t = rt->GetInput("image_pad_mask");
             auto tg = as_tensor<int8_t>(t);
             if (tg->num_elements() > 0) tg->fillToCPU(mask.data());
             std::printf("  image_pad_mask ok\n"); std::fflush(stdout);
         }
 
-        // 本轮整段重新 prefill：past 的逻辑 kv_len 归零（buffer 复用预分配的那块）。
-        kv.reset_for_prefill();
-        std::printf("  past_kv resize ok\n"); std::fflush(stdout);
+        // past：复用前缀只是把逻辑 kv_len 设成 P（buffer 里那 P 行是上一轮写下
+        // 的，一个字都不动），整段 prefill 才需要归零 + 重新上传。
+        if (P > 0) {
+            kv.resume_from(P);
+        } else {
+            kv.reset_for_prefill();
+            kv.upload();
+        }
+        std::printf("  past_kv resize ok (kv_len=%d)\n", P); std::fflush(stdout);
 
         // Upload all inputs (跳过模型没有的 deepstack / image_pad_mask).
-        kv.upload();
         upload_input(cmdpool, rt->GetInput("inputs_embeds"));
         upload_input(cmdpool, rt->GetInput("position_ids"));
         upload_input(cmdpool, rt->GetInput("attention_bias"));
@@ -929,6 +1012,8 @@ int main(int argc, char** argv) {
             auto cur_emb = embed_lookup(embed_table,
                                         {static_cast<uint32_t>(next_id)},
                                         vocab, arch.hidden);
+            // 这个 token 马上要被模型吃进 KV，记下来（下一轮判断能否复用前缀）。
+            consumed_gen.push_back(static_cast<uint32_t>(next_id));
             fill_fp16_input(rt, "inputs_embeds", {1u, 1u, static_cast<uint32_t>(arch.hidden)},
                           cur_emb.data());
 
@@ -1024,6 +1109,17 @@ int main(int argc, char** argv) {
             conv.addAssistantTurn(out_ids);
             ++turn;
         }
+
+        // KV 现在覆盖的序列：prefill 的 ids + decode 每步喂进去的 token（停止符
+        // 被生成出来但没喂进去，所以不在其中 —— 与 past_len 一致）。下一轮拿它
+        // 做前缀校验；模板补齐收尾串（addAssistantTurn）正是为了让下一轮的 ids
+        // 是它的合法扩展。
+        covered.ids = ids;
+        covered.ids.insert(covered.ids.end(), consumed_gen.begin(),
+                           consumed_gen.end());
+        covered.mm_types = rctx.mm_types;
+        covered.mm_types.resize(covered.ids.size(), 0); // 生成出来的都是文本
+        covered.spans = rctx.spans;
     }
 
     // Session-wide summary on exit.

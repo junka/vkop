@@ -71,7 +71,7 @@ public:
             int nkv, int hd, int max_kv,
             core::ElemKind cache_kind = core::ElemKind::kFloat16)
         : rt_(rt), cmdpool_(cmdpool), nlayers_(nlayers), nkv_(nkv), hd_(hd),
-          cache_kind_(cache_kind) {
+          max_kv_(max_kv), cache_kind_(cache_kind) {
         if (nlayers <= 0 || nkv <= 0 || hd <= 0 || max_kv <= 0) {
             throw std::runtime_error("KVCache: invalid arch parameters");
         }
@@ -121,6 +121,25 @@ public:
         }
     }
 
+    // 从已有的 KV 继续：past 的逻辑 kv_len 设成 prefix_len —— buffer 里那
+    // prefix_len 行是上一轮写下的历史，内容一个字都不动，所以**不要**再调
+    // upload()（那会把 staging 里的旧字节盖上去）。跨轮前缀复用用这个入口：
+    // 新的 prefill 只需要算 [prefix_len, prefix_len + S) 那几行。
+    //
+    // prefix_len 会变成 shader 读 cache 的行数，所以在这里挡住越界 —— 超出
+    // 预分配的 max_kv 就是读进了 buffer 外面。
+    void resume_from(int prefix_len) {
+        if (prefix_len < 0 || prefix_len > max_kv_) {
+            throw std::runtime_error("KVCache: resume_from(" +
+                                     std::to_string(prefix_len) +
+                                     ") is outside [0, max_kv=" +
+                                     std::to_string(max_kv_) + "]");
+        }
+        for (int i = 0; i < nlayers_; ++i) {
+            set_past_len_(i, prefix_len);
+        }
+    }
+
     // present→past：两个张量一开始就是同一块 buffer，所以这里没有设备拷贝、
     // 也没有 buffer 身份交换，只有「past 的逻辑长度跟上本轮」这一件 host 侧的事。
     // 返回新的 past_len（下一轮的位置/attention_bias 都以它为准）。
@@ -129,14 +148,7 @@ public:
         for (int i = 0; i < nlayers_; ++i) {
             auto pres = rt_->GetOutput("present_key_values_" + std::to_string(i));
             const int kv_len = num_kv_elems_(pres) / (2 * nkv_ * hd_);
-            // ResizeInput 会把 converted_ 置回 false（buffer 走 prealloc_keep_
-            // 复用，不重分配），所以最后要把 past 标回「数据在 GPU 上」：那块
-            // buffer 里装的就是本轮写出的历史，不需要任何上传。
-            rt_->ResizeInput("past_key_values_" + std::to_string(i),
-                             {1u, 2u, static_cast<uint32_t>(nkv_),
-                              static_cast<uint32_t>(kv_len),
-                              static_cast<uint32_t>(hd_)});
-            mark_gpu_(rt_->GetInput("past_key_values_" + std::to_string(i)));
+            set_past_len_(i, kv_len);
             past_len = kv_len;
         }
         return past_len;
@@ -150,8 +162,19 @@ public:
 private:
     std::shared_ptr<core::Runtime> rt_;
     std::shared_ptr<VulkanCommandPool> cmdpool_;
-    int nlayers_, nkv_, hd_;
+    int nlayers_, nkv_, hd_, max_kv_;
     core::ElemKind cache_kind_;
+
+    // past 的逻辑长度跟上写出的历史。ResizeInput 会把 converted_ 置回 false
+    // （buffer 走 prealloc_keep_ 复用，不重分配），所以最后要把 past 标回「数据
+    // 在 GPU 上」——那块 buffer 里装的正是本轮的历史，不需要任何上传。
+    void set_past_len_(int layer, int kv_len) {
+        const std::string name = "past_key_values_" + std::to_string(layer);
+        rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(nkv_),
+                                static_cast<uint32_t>(kv_len),
+                                static_cast<uint32_t>(hd_)});
+        mark_gpu_(rt_->GetInput(name));
+    }
 
     // 按 cache_kind 分派到对应容器的预分配。fp16 走 uint16_t，fp8 走 int8_t
     // （和 bool/int8 同一容器，elem_kind() 记录 fp8 语义）。4-bit 也走 int8_t，
