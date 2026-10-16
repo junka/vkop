@@ -50,6 +50,7 @@
 #include "Sqrt.hpp"
 #include "Tanh.hpp"
 #include "Where.hpp"
+#include "ops/Attention.hpp"
 #include "ops/Cast.hpp"
 #include "ops/Equal.hpp"
 #include "ops/FusedElemwise.hpp"
@@ -186,6 +187,8 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<FusedElemwise>(fp16);
     case OpType::RMSNORM:
         return std::make_unique<RMSNorm>(fp16, backend_buffer);
+    case OpType::ATTENTION:
+        return std::make_unique<Attention>(fp16, backend_buffer);
     case OpType::REDUCEMEAN:
         return std::make_unique<ReduceMean>(fp16, backend_buffer);
     case OpType::MIN:

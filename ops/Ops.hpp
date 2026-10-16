@@ -69,6 +69,7 @@ enum class OpType {
     MOD,
     QUANTIZE_LINEAR,
     DEQUANTIZE_LINEAR,
+    ATTENTION,
     TOTAL_NUM
 };
 
@@ -134,6 +135,7 @@ inline std::string convert_optype_to_string(const OpType &type) {
         "Mod",               // MOD = 57
         "QuantizeLinear",    // QUANTIZE_LINEAR = 58
         "DequantizeLinear",  // DEQUANTIZE_LINEAR = 59
+        "Attention",         // ATTENTION = 60
         ""};                 // TOTAL_NUM (should not be accessed)
     if (type >= OpType::TOTAL_NUM)
         return names[0];
@@ -260,6 +262,8 @@ inline OpType convert_opstring_to_enum(const std::string &name) {
         return vkop::ops::OpType::QUANTIZE_LINEAR;
     if (name == "DequantizeLinear")
         return vkop::ops::OpType::DEQUANTIZE_LINEAR;
+    if (name == "Attention")
+        return vkop::ops::OpType::ATTENTION;
     printf("Unknown op type: %s\n", name.c_str());
     return vkop::ops::OpType::UNKNOWN;
 }

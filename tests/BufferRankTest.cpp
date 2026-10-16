@@ -1437,4 +1437,133 @@ TEST(BufferRankTest, ResizeNearestUpAndDown) {
     EXPECT_TRUE(brt_resize_case<uint16_t>({1, 3, 4, 5}, {1, 3, 7, 5}, true));
 }
 
+// =========================================================================
+// Attention — fused Q·Kᵀ·scale (+mask) -> softmax -> ·V in one dispatch,
+// replacing the converter's MatMul -> scale+bias -> Softmax -> MatMul chain.
+// Q=[B,H,S,D], K=V=[B,Hkv,kv,D]; GQA h_kv = h/rep. Ref: per kv head g,
+// softmax(Q_g @ Kᵀ * scale + mask) @ V_g (computed in fp32, cast to T).
+// =========================================================================
+
+template <typename T>
+bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
+                        bool causal, bool use_mask) {
+    Dev d;
+    const int Hkv = H / rep;
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    using torch::indexing::Slice;
+
+    auto opt = brt_torch_opt<T>();
+    auto q = torch::randn({B, H, S, D}, opt);
+    auto k = torch::randn({B, Hkv, kv, D}, opt);
+    auto v = torch::randn({B, Hkv, kv, D}, opt);
+    torch::Tensor mask;
+    if (use_mask)
+        mask = torch::randn({B, 1, S, kv}, opt);
+
+    // Reference in fp32, cast to T at the end.
+    auto qf = q.to(torch::kFloat32);
+    auto kf = k.to(torch::kFloat32);
+    auto vf = v.to(torch::kFloat32);
+    auto yf = torch::zeros({B, H, S, D}, torch::kFloat32);
+    for (int g = 0; g < Hkv; ++g) {
+        auto Qg = qf.index(
+            {Slice(), Slice(g * rep, (g + 1) * rep), Slice(), Slice()});
+        auto Kg = kf.index({Slice(), g, Slice(), Slice()}).unsqueeze(1);
+        auto Vg = vf.index({Slice(), g, Slice(), Slice()}).unsqueeze(1);
+        auto sc = torch::matmul(Qg, Kg.transpose(-1, -2)) * scale;
+        if (use_mask) {
+            auto m =
+                mask.to(torch::kFloat32).index({Slice(), 0, Slice(), Slice()});
+            sc = sc + m.unsqueeze(1);
+        }
+        if (causal) {
+            auto j = torch::arange(kv, torch::kFloat32);
+            auto pos = torch::arange(S, torch::kFloat32) + float(kv - S);
+            auto allow = j.unsqueeze(0) <= pos.unsqueeze(1);
+            sc = sc.masked_fill(~allow.unsqueeze(0).unsqueeze(0), -1e30f);
+        }
+        auto p = torch::softmax(sc, -1);
+        yf.index_put_(
+            {Slice(), Slice(g * rep, (g + 1) * rep), Slice(), Slice()},
+            torch::matmul(p, Vg));
+    }
+    auto ref = yf.to(opt.dtype());
+
+    auto Qi = std::make_shared<Tensor<T>>(std::vector<int>{B, H, S, D});
+    brt_fill(Qi, q);
+    brt_upload(Qi, d);
+    auto Ki = std::make_shared<Tensor<T>>(std::vector<int>{B, Hkv, kv, D});
+    brt_fill(Ki, k);
+    brt_upload(Ki, d);
+    auto Vi = std::make_shared<Tensor<T>>(std::vector<int>{B, Hkv, kv, D});
+    brt_fill(Vi, v);
+    brt_upload(Vi, d);
+
+    std::vector<std::shared_ptr<vkop::core::ITensor>> ins{Qi, Ki, Vi};
+    if (use_mask) {
+        auto Mi = std::make_shared<Tensor<T>>(std::vector<int>{B, 1, S, kv});
+        brt_fill(Mi, mask);
+        brt_upload(Mi, d);
+        ins.push_back(Mi);
+    }
+    auto output = brt_make_out<T>(brt_to_int_shape(ref), d);
+    auto op = brt_make_op(vkop::ops::OpType::ATTENTION,
+                          std::is_same_v<T, uint16_t>,
+                          {{"scale", std::to_string(scale)},
+                           {"num_heads", std::to_string(H)},
+                           {"num_kv_heads", std::to_string(Hkv)},
+                           {"causal", causal ? "1" : "0"}},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute(ins, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    float rtol = std::is_same_v<T, uint16_t> ? 0.03f : 0.002f;
+    return brt_close_to_torch(output, ref, rtol, rtol);
+}
+
+TEST(BufferRankTest, AttentionFp32AndFp16) {
+    // MHA, self (kv==S), no mask, no causal.
+    EXPECT_TRUE(brt_attention_case<float>(2, 4, 5, 64, 5, 1, false, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(2, 4, 5, 64, 5, 1, false, false));
+    // GQA (rep=2,4) + causal.
+    EXPECT_TRUE(brt_attention_case<float>(1, 8, 6, 128, 6, 2, true, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 4, 64, 4, 4, true, false));
+    // Decode-shaped: S=1, kv>1 (past), causal.
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 1, 128, 9, 1, true, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 1, 128, 9, 1, true, false));
+    // Additive mask, and mask+causal together.
+    EXPECT_TRUE(brt_attention_case<float>(2, 2, 5, 64, 5, 1, false, true));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 3, 64, 3, 2, true, true));
+    // Prefill-shaped: a few rows against a longer kv.
+    EXPECT_TRUE(brt_attention_case<float>(1, 16, 3, 64, 196, 1, false, false));
+    // Production-shaped static ViT attention (visual.onnx): [1,16,196,64],
+    // scale-only, bidirectional. This is the shape the converter's rewritten
+    // fuse_into_attention matcher activates on; kv=196 < 256 also exercises
+    // the reduction with lanes that never score a key.
+    EXPECT_TRUE(brt_attention_case<float>(1, 16, 196, 64, 196, 1, false, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 16, 196, 64, 196, 1, false,
+                                             false));
+    // S at/past the 128-lane reduction step: once more than 128 lanes hold a
+    // score, REDUCE_MAX/REDUCE_SUM read a slot another *warp* wrote, which is
+    // the window that lost the race before the leading barrier was added
+    // (symptom: one whole output row scaled to ~1e-31, ~1 row in 20).
+    EXPECT_TRUE(brt_attention_case<float>(1, 16, 128, 64, 128, 1, false, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 16, 257, 64, 257, 1, false,
+                                             false));
+    // Tiled / online-softmax sweep: kv past one TILE_KV (256), including a
+    // partial trailing tile (300 = 256 + 44) and the long-context 4096 case,
+    // plus the decoder signature (S=1, GQA rep=2, D=128) with a large kv.
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 3, 64, 300, 1, false, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 3, 64, 300, 2, false, false));
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 5, 64, 512, 1, true, false));
+    EXPECT_TRUE(brt_attention_case<float>(1, 2, 1, 128, 1000, 2, true, false));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 2, 1, 128, 4096, 2, true,
+                                             false));
+    EXPECT_TRUE(brt_attention_case<float>(1, 2, 1, 128, 4096, 2, false, true));
+    // Wide row and multi-tile kv at the same time.
+    EXPECT_TRUE(brt_attention_case<float>(1, 8, 200, 64, 700, 1, false, false));
+}
+
 } // namespace

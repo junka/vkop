@@ -322,6 +322,7 @@ set(DUAL_FP16_SHADERS
     buffer/fused_elemwise
     buffer/rmsnorm
     buffer/layernorm
+    buffer/attention
     buffer/slice
     buffer/scatter_elements
     buffer/min

@@ -682,12 +682,13 @@ class ONNXOptimizer:
 # invents an op name does not fail, it silently deletes the node and every
 # consumer reads an unwritten buffer. Four passes shipped that way
 # (SkipLayerNormalization / BiasGelu / MatMulGelu / EmbeddingLayerNormalization /
-# BertEncoder; fuse_into_attention's "Attention" is a fifth, still dormant).
+# BertEncoder; fuse_into_attention's "Attention" was a fifth, dormant until
+# ops/Attention.hpp gave it a real runtime op).
 # _check_no_unknown_op below turns that class into a hard conversion error.
 # tests/test_fusion_op_types.py re-derives this set from ops/Ops.hpp, so it
 # cannot rot silently.
 RUNTIME_OPS = frozenset({
-    "Add", "Atan", "AveragePool", "BatchNorm", "BatchNormalization", "Cast",
+    "Add", "Atan", "Attention", "AveragePool", "BatchNorm", "BatchNormalization", "Cast",
     "Col2Im", "Concat", "Conv", "Conv2d", "Cos", "DequantizeLinear", "Div",
     "EmbeddingForward", "Equal", "Erf", "Expand", "Floor", "FusedElemwise",
     "Gather", "Gemm", "GlobalAveragePool", "GridSample", "LayerNorm",
@@ -3099,326 +3100,303 @@ class FusionOptimizer:
 
     @staticmethod
     def match_attention(dag_model):
-        """
-        Match attention patterns for potential fusion.
+        """Match the *post-fold* fused-attention subgraph.
 
-        The pattern to match:
-            Q          K             V
-            |          |             |
-        MUL(scale)    MUL(scale)     |
-            |          |             |
-            |       Transpose        |
-            |          |             |
-            ---MatMul---             |
-                |                    |
-        att_mask---Add               |
-                |                    |
-                |                    |
-            Softmax                  |
-                |                    |
-                -----MatMul----------
-                        |
-                        Y
+        The pattern (scale and mask optional; the scale must be *inside* the
+        mask Add, which is the order every real export uses):
+
+              Q         K          V
+              |         |          |
+              |     [Transpose]?   |
+              \\        |          |
+               MatMul_qk           |
+                  |                |
+              [Mul/Div(scale)]     |    (HF: QK^T * head_dim**-0.5)
+              [Add(att_mask)]      |    (HF: + attention_bias)
+                  |                |
+               Softmax             |
+                  \\               /
+                   -----MatMul_v--
+                          |
+                          Y
+
+        Emits ``Attention(Q, K, V[, mask]) -> Y``, deleting the scale Mul/Div,
+        the mask Add, the Softmax, both MatMuls and an unfolded K Transpose.
+        ``softmax((QK^T + mask) * s)`` is *not* this pattern — the kernel
+        scales QK^T only, so it declines and the MatMul epilogue keeps it.
+
+        Two properties this matcher must have:
+
+        * **Sound.** Every node it deletes is checked single-consumer first.
+          The version this replaced checked none of that, required a scale-only
+          Q path *and* a scale+transpose K path (so it never matched a modern
+          graph, which scales QK^T after the MatMul), and emitted an op the
+          runtime did not have. A fold here rewrites a live subgraph, so the
+          single-consumer invariant is what makes the deletion safe.
+        * **Bounded by what the kernel actually needs.** rank-4 ``[B,H,s,D]``
+          inputs, a static even head_dim <= 256 (the shader's compile-time
+          envelope), and consistent head counts. Everything else — batch, seq,
+          kv_len — is read from the bound tensors at execute() time, so the
+          decoder graph's symbolic ``[-1,16,-1,128]`` Q is fine and its 28
+          attention blocks route through this op. (The P1 kernel staged the
+          whole KV row in shared memory and so declined anything symbolic; the
+          tiled/online-softmax kernel lifted that.)
         """
-        matches = []
         producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
 
-        # 首先寻找Softmax节点，这是Attention模式的关键特征之一
-        for softmax_node in dag_model.nodes.values():
+        def _single_consumer(name):
+            cs = consumers.get(name, [])
+            return cs[0][0] if len(cs) == 1 else None
+
+        def _to_float(v):
+            """A 1-element scalar as a python float, or None. Initializers
+            arrive as TensorProtos and folded Constants as ndarrays, but a
+            plain numpy scalar (np.float32) is neither an ndarray nor a
+            TensorProto, so fall back to float() rather than failing."""
+            if v is None:
+                return None
+            try:
+                import numpy as np
+
+                arr = v if isinstance(v, np.ndarray) else None
+                if arr is None:
+                    from onnx import numpy_helper
+
+                    arr = numpy_helper.to_array(v)
+                if arr.size == 1:
+                    return float(arr.reshape(-1)[0])
+            except Exception:
+                try:
+                    return float(v)
+                except Exception:
+                    return None
+            return None
+
+        def _scalar_const(node):
+            """(value, input_index) if node is a Mul/Div with a scalar
+            initializer/Constant operand, else None. Constant `value` attrs are
+            stored as ndarrays by the loader while initializers stay
+            TensorProtos — _to_float accepts both."""
+            for i, inp in enumerate(node.inputs):
+                v = _to_float(dag_model.initializers.get(inp["name"]))
+                if v is not None:
+                    return v, i
+                p = producer.get(inp["name"])
+                if p is not None and p.op_type == "Constant":
+                    val = p.attributes.get("value")
+                    if val is not None:
+                        v = _to_float(val)
+                        if v is not None:
+                            return v, i
+                    if "value_float" in p.attributes:
+                        return float(p.attributes["value_float"]), i
+            return None
+
+        def _is_scale_node(node):
+            return (node is not None and node.op_type in ("Mul", "Div")
+                    and len(node.inputs) == 2 and _scalar_const(node) is not None)
+
+        def _add_side(inp):
+            """Classify an Add operand: the QK data side feeds a MatMul or a
+            scale node; the mask side feeds anything else."""
+            p = producer.get(inp["name"])
+            if p is None:
+                return "mask"
+            if p.op_type == "MatMul" or _is_scale_node(p):
+                return "data"
+            return "mask"
+
+        matches = []
+        for softmax_node in list(dag_model.nodes.values()):
             if softmax_node.op_type != "Softmax":
                 continue
+            if len(softmax_node.inputs) != 1 or len(softmax_node.outputs) != 1:
+                continue
+            sx_out = softmax_node.outputs[0]
 
-            softmax_input_name = softmax_node.inputs[0]["name"]
-            input_producer = producer.get(softmax_input_name)
+            # Softmax feeds exactly one MatMul: P @ V.
+            mm_v = _single_consumer(sx_out["name"])
+            if mm_v is None or mm_v.op_type != "MatMul":
+                continue
+            if int(mm_v.attributes.get("transB", 0) or 0) != 0:
+                continue
+            if len(mm_v.inputs) != 2:
+                continue
+            v_side = [i for i in mm_v.inputs if i["name"] != sx_out["name"]]
+            if len(v_side) != 1:
+                continue
+            v_input = v_side[0]
 
+            # Peel the optional scale / mask back down to the QK MatMul.
+            scale_val = 1.0
+            scale_node = None
             add_node = None
-            att_mask_input = None
-            matmul_qk_node = None
-
-            if input_producer and input_producer.op_type == "Add":
-                add_node = input_producer
-                # Add节点应该有两个输入：一个来自matmul_qk，一个来自att_mask
-                for inp in add_node.inputs:
-                    inp_producer = producer.get(inp["name"])
-                    if inp_producer and inp_producer.op_type == "MatMul":
-                        matmul_qk_node = inp_producer
-                    elif inp["name"] != softmax_input_name:  # 另一个输入是att_mask
-                        att_mask_input = inp
-
-                # 如果Add节点没有MatMul输入，则不是我们要找的模式
-                if not matmul_qk_node:
-                    continue
-            elif input_producer and input_producer.op_type == "MatMul":
-                # 没有Add节点，直接就是MatMul -> Softmax
-                matmul_qk_node = input_producer
-            else:
-                # 既不是Add也不是MatMul，不符合模式
-                continue
-
-            if not matmul_qk_node:
-                continue
-
-            print(f"Found Softmax node '{softmax_node.name}' with preceding MatMul '{matmul_qk_node.name}' and Add '{add_node.name if add_node else 'None'}'")
-
-            input_paths = []
-            for inp in matmul_qk_node.inputs:
-                inp_name = inp["name"]
-                inp_producer = producer.get(inp_name)
-                
-                path_info = {
-                    "input_name": inp_name,
-                    "producer": inp_producer,
-                    "is_scale_only": False,      # 只有scale操作 (Mul/Div)
-                    "is_transpose_only": False,  # 只有transpose操作
-                    "has_scale_and_transpose": False,  # 同时有scale和transpose操作（顺序无关）
-                    "original_node": None
-                }
-                
-                if inp_producer:
-                    if inp_producer.op_type == "Transpose":
-                        # 检查Transpose的输入是否有scale操作 (Transpose -> Scale)
-                        transpose_input_name = inp_producer.inputs[0]["name"]
-                        transpose_input_producer = producer.get(transpose_input_name)
-                        
-                        if transpose_input_producer and transpose_input_producer.op_type in ["Mul", "Div"]:
-                            # Transpose <- Scale: 有scale和transpose操作
-                            path_info["has_scale_and_transpose"] = True
-                            # 查找原始节点
-                            for scale_inp in transpose_input_producer.inputs:
-                                if scale_inp["name"] != transpose_input_name and scale_inp["name"] in dag_model.initializers:
-                                    path_info["original_node"] = producer.get(
-                                        transpose_input_producer.inputs[0]["name"]
-                                        if transpose_input_producer.inputs[0]["name"] != scale_inp["name"]
-                                        else transpose_input_producer.inputs[1]["name"]
-                                    )
-                                    break
-                            if path_info["original_node"] is None:
-                                path_info["original_node"] = transpose_input_producer
-                        else:
-                            # Transpose only
-                            path_info["is_transpose_only"] = True
-                            path_info["original_node"] = transpose_input_producer
-                            
-                    elif inp_producer.op_type in ["Mul", "Div"]:
-                        # 检查是否有initializer作为scale因子
-                        has_initializer_scale = False
-                        for scale_inp in inp_producer.inputs:
-                            if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
-                                has_initializer_scale = True
-                                break
-                        
-                        if has_initializer_scale:
-                            # 检查Scale的输入是否有Transpose (Scale <- Transpose)
-                            scale_input_name = None
-                            for scale_inp in inp_producer.inputs:
-                                if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
-                                    continue  # 这是scale值，不是数据输入
-                                else:
-                                    scale_input_name = scale_inp["name"]
-                                    break
-                            
-                            if scale_input_name:
-                                scale_input_producer = producer.get(scale_input_name)
-                                if scale_input_producer and scale_input_producer.op_type == "Transpose":
-                                    # Scale <- Transpose: 有scale和transpose操作（顺序相反）
-                                    path_info["has_scale_and_transpose"] = True
-                                    # 获取Transpose的输入作为原始节点
-                                    transpose_input_name = scale_input_producer.inputs[0]["name"]
-                                    path_info["original_node"] = producer.get(transpose_input_name)
-                                else:
-                                    # Scale only
-                                    path_info["is_scale_only"] = True
-                                    # 查找原始节点
-                                    for scale_inp in inp_producer.inputs:
-                                        if scale_inp["name"] != inp_name and scale_inp["name"] in dag_model.initializers:
-                                            path_info["original_node"] = producer.get(
-                                                inp_producer.inputs[0]["name"]
-                                                if inp_producer.inputs[0]["name"] != scale_inp["name"]
-                                                else inp_producer.inputs[1]["name"]
-                                            )
-                                            break
-                        else:
-                            # Scale without initializer: 可能是其他类型的scale
-                            path_info["original_node"] = inp_producer
-                    else:
-                        # 其他类型：可能是原始的Q或K
-                        path_info["original_node"] = inp_producer
-                
-                input_paths.append(path_info)
-
-            # 需要找到一个scale-only路径和一个scale+transpose或transpose-only路径
-            scale_only_path = None
-            scale_transpose_path = None
-            
-            for path in input_paths:
-                if path["is_scale_only"] and path["original_node"]:
-                    scale_only_path = path
-                elif (path["has_scale_and_transpose"]) and path["original_node"]:
-                    scale_transpose_path = path
-
-            if not scale_only_path or not scale_transpose_path:
-                continue
-
-            # 3. 现在我们有了Q和K路径，继续检查
-            q_path = scale_only_path
-            k_path = scale_transpose_path
-
-            original_q = q_path["original_node"]
-            original_k = k_path["original_node"]
-            q_scaled = q_path["producer"] if q_path["is_scale_only"] else None
-            k_scaled = None
-            transpose_k = None
-
-            # 确定k_scaled和transpose_k
-            if k_path["producer"] and k_path["producer"].op_type in ["Mul", "Div"]:
-                # Scale -> Transpose case
-                k_scaled = k_path["producer"]
-                # 找到transpose节点
-                temp_producer = k_path["producer"]
-                for inp in temp_producer.inputs:
-                    if inp["name"] != k_path["input_name"] and inp["name"] in dag_model.initializers:
-                        continue  # 这是scale值
-                    else:
-                        temp_input_name = inp["name"]
-                        temp_input_producer = producer.get(temp_input_name)
-                        if temp_input_producer and temp_input_producer.op_type == "Transpose":
-                            transpose_k = temp_input_producer
-                            break
-            elif k_path["producer"] and k_path["producer"].op_type == "Transpose":
-                # Transpose -> Scale case
-                transpose_k = k_path["producer"]
-                # 找到scale节点
-                temp_input_name = k_path["producer"].inputs[0]["name"]
-                temp_input_producer = producer.get(temp_input_name)
-                if temp_input_producer and temp_input_producer.op_type in ["Mul", "Div"]:
-                    k_scaled = temp_input_producer
-
-            # Softmax的输出应该连接到一个MatMul（用于与V相乘）
-            softmax_output_name = softmax_node.outputs[0]["name"]
-            matmul_v_candidates = []
-            
-            # 使用consumer映射来查找使用softmax输出的MatMul节点
-            for consumer_node, _ in consumers.get(softmax_output_name, []):
-                if consumer_node.op_type == "MatMul":
-                    matmul_v_candidates.append(consumer_node)
-
-            if not matmul_v_candidates:
-                continue
-
-            # 4. 检查V是否直接连接到第二个MatMul
-            matched = False
-            for matmul_v_node in matmul_v_candidates:
-                v_input_name = None
-                for inp in matmul_v_node.inputs:
-                    if inp["name"] != softmax_output_name:  # 找到V的输入
-                        v_input_name = inp["name"]
+            mask_input = None
+            matmul_qk = None
+            data_name = softmax_node.inputs[0]["name"]
+            for _ in range(3):
+                p = producer.get(data_name)
+                if p is None:
+                    break
+                if p.op_type == "MatMul":
+                    matmul_qk = p
+                    break
+                if len(p.inputs) != 2:
+                    break
+                # p's output has at least one consumer (the node below); a
+                # _single_consumer() of None means zero *or* several, and
+                # deleting a node with several is the unsound case.
+                if _single_consumer(p.outputs[0]["name"]) is None:
+                    break
+                if p.op_type in ("Mul", "Div"):
+                    if scale_node is not None:
                         break
+                    sc = _scalar_const(p)
+                    if sc is None:
+                        break
+                    val, idx = sc
+                    if p.op_type == "Div" and idx != 1:
+                        break  # Div(const, x) is not a scale
+                    scale_val = (scale_val * val if p.op_type == "Mul"
+                                 else scale_val / val)
+                    scale_node = p
+                    data_name = p.inputs[1 - idx]["name"]
+                elif p.op_type == "Add":
+                    # The kernel applies scale to QK^T only. Once a scale has
+                    # been peeled, this Add is *outside* it — softmax((QK^T +
+                    # mask) * s) scales the mask too, which this op cannot
+                    # reproduce (the mask is a runtime tensor). Decline; the
+                    # scale+bias MatMul epilogue keeps that form.
+                    if add_node is not None or scale_node is not None:
+                        break
+                    data = [i for i in p.inputs if _add_side(i) == "data"]
+                    masks = [i for i in p.inputs if _add_side(i) == "mask"]
+                    if len(data) != 1 or len(masks) != 1:
+                        break  # ambiguous: both look like data, or neither does
+                    add_node = p
+                    mask_input = masks[0]
+                    data_name = data[0]["name"]
+                else:
+                    break
 
-                if not v_input_name:
-                    continue
+            if matmul_qk is None or len(matmul_qk.inputs) != 2:
+                continue
+            if _single_consumer(matmul_qk.outputs[0]["name"]) is None:
+                continue
+            # The kernel reads A in [.., rows, dim] and B in [.., dim, rows];
+            # a transA would hand it one of these already transposed and the
+            # head_dim check below would read the wrong axis.
+            if int(matmul_qk.attributes.get("transA", 0) or 0) != 0:
+                continue
+            if int(mm_v.attributes.get("transA", 0) or 0) != 0:
+                continue
 
-                original_v = producer.get(v_input_name)
+            # Q and K. transB=1 (fuse_transpose_into_matmul@85 folded K's
+            # transpose away) means B is the un-transposed [B,Hkv,kv,D] K —
+            # exactly what the op wants. Otherwise accept an explicit 4-D
+            # last-two-dims Transpose on B.
+            q_in = k_in = transpose_k = None
+            if int(matmul_qk.attributes.get("transB", 0) or 0) == 1:
+                q_in, k_in = matmul_qk.inputs[0], matmul_qk.inputs[1]
+            else:
+                tp = producer.get(matmul_qk.inputs[1]["name"])
+                if (tp is not None and tp.op_type == "Transpose"
+                        and len(tp.inputs) == 1
+                        and _single_consumer(tp.outputs[0]["name"]) is not None
+                        and list(tp.attributes.get("perm", [])) == [0, 1, 3, 2]):
+                    q_in, k_in, transpose_k = matmul_qk.inputs[0], tp.inputs[0], tp
+            if q_in is None:
+                continue
+            # The kernel reads Q/K/V in [B,H,s,D] with no further permute; a
+            # Transpose feeding any of them means the memory layout is
+            # something else, so decline.
+            if any(producer.get(t["name"]) is not None
+                   and producer[t["name"]].op_type == "Transpose"
+                   for t in (q_in, k_in, v_input)):
+                continue
 
-                if original_v:
-                    # 验证找到了完整的Attention模式
-                    match = {
-                        "q_node": original_q,
-                        "k_node": original_k,
-                        "v_node": original_v,
-                        "q_scaled": q_scaled,
-                        "k_scaled": k_scaled,
-                        "transpose_k": transpose_k,
-                        "matmul_qk": matmul_qk_node,
-                        "add_node": add_node,
-                        "softmax_node": softmax_node,
-                        "matmul_v": matmul_v_node,
-                        "att_mask": att_mask_input,
-                    }
+            q_shape = list(q_in.get("shape") or [])
+            k_shape = list(k_in.get("shape") or [])
+            v_shape = list(v_input.get("shape") or [])
+            if len(q_shape) != 4 or len(k_shape) != 4 or len(v_shape) != 4:
+                continue
+            # Batch/seq/kv may be symbolic (recorded as -1): the kernel reads
+            # them from the bound tensors at execute() time, so the decoder
+            # graph's [-1,16,-1,128] Q reaches the op. What must be static is
+            # what the shader's compile-time envelope depends on: head_dim
+            # (MAX_HD, even-for-half2) and the head counts' divisibility.
+            batch, num_heads, _seq, head_dim = q_shape
+            kb, num_kv_heads, kv_len, kd = k_shape
+            vb, vhkv, vkv, vd = v_shape
+            if head_dim <= 0 or head_dim > 256 or head_dim % 2 != 0:
+                continue
+            if kd != head_dim or vd != head_dim:
+                continue
+            if kb != batch or vb != batch:
+                continue
+            if vhkv != num_kv_heads or vkv != kv_len:
+                continue
+            if num_heads == 0 or num_kv_heads == 0 or kv_len == 0:
+                continue  # a genuinely empty dim, not a symbolic one
+            if (num_heads > 0 and num_kv_heads > 0
+                    and num_heads % num_kv_heads != 0):
+                continue
 
-                    matches.append(match)
-                    matched = True
-                    break  # 找到一个匹配即可
+            nodes_to_delete = [matmul_qk, softmax_node, mm_v]
+            for extra in (add_node, scale_node, transpose_k):
+                if extra is not None:
+                    nodes_to_delete.append(extra)
+
+            matches.append({
+                "q_input": q_in,
+                "k_input": k_in,
+                "v_input": v_input,
+                "mask_input": mask_input,
+                "scale_val": scale_val,
+                "num_heads": num_heads,
+                "num_kv_heads": num_kv_heads,
+                "matmul_v": mm_v,
+                "nodes_to_delete": nodes_to_delete,
+            })
+
         print(f"Found {len(matches)} attention patterns for potential fusion")
         return matches
 
     @staticmethod
     def fold_attention(dag_model, match) -> bool:
-        """
-        Fold the matched attention pattern into a single Attention operator.
-        """
-        q_node = match["q_node"]
-        k_node = match["k_node"]
-        v_node = match["v_node"]
-        q_scaled = match["q_scaled"]
-        k_scaled = match["k_scaled"]
-        transpose_k = match["transpose_k"]
-        matmul_qk = match["matmul_qk"]
-        add_node = match["add_node"]
-        softmax_node = match["softmax_node"]
-        matmul_v = match["matmul_v"]
-        att_mask = match["att_mask"]
+        """Emit Attention(Q, K, V[, mask]) -> Y, reusing the final MatMul's
+        output tensor. Q/K/V and the mask are shared tensors (or graph inputs)
+        and are NOT deleted — only the per-layer op chain is."""
+        mm_v = match["matmul_v"]
 
-        # 提取scale值
-        scale_val = 1.0  # 默认值
-        if q_scaled and q_scaled.op_type in ["Mul", "Div"]:
-            for inp in q_scaled.inputs:
-                if inp["name"] in dag_model.initializers:
-                    scale_tensor = dag_model.initializers[inp["name"]]
-                    scale_array = numpy_helper.to_array(scale_tensor)
-                    if q_scaled.op_type == "Div":
-                        scale_val = 1.0 / scale_array.item()  # 如果是除法，需要倒置
-                    else:
-                        scale_val = scale_array.item()  # 如果是乘法，直接使用
-                    break
+        inputs = [match["q_input"], match["k_input"], match["v_input"]]
+        if match["mask_input"] is not None:
+            inputs.append(match["mask_input"])
 
-        # 构建新的Attention节点
-        attention_inputs = [
-            q_node.outputs[0],  # Q
-            k_node.outputs[0],  # K
-            v_node.outputs[0],  # V
-        ]
+        attrs = {
+            "num_heads": match["num_heads"],
+            "num_kv_heads": match["num_kv_heads"],
+            # P1: causality rides the additive mask the graph already exports
+            # (HF materializes attention_bias as [B,1,S,kv]). The kernel's own
+            # causal term is wired from the driver graph in P3.
+            "causal": 0,
+        }
+        if match["scale_val"] != 1.0:
+            attrs["scale"] = match["scale_val"]
 
-        # 如果有attention mask，添加到输入
-        if att_mask:
-            attention_inputs.append(att_mask)
-
-        # 设置Attention算子的属性
-        attention_attrs = {}
-        if scale_val != 1.0:
-            attention_attrs["scale"] = scale_val
-
-        # 确定unified_layout和其他属性（根据输入张量的形状推断）
-        # 这里需要根据具体的Q/K/V形状来推断
-        q_shape = q_node.outputs[0]["shape"]
-        k_shape = k_node.outputs[0]["shape"]
-
-        # 根据形状推断num_heads等参数
-        # 通常形状为 [batch_size, seq_len, hidden_size] 或 [batch_size, num_heads, seq_len, head_dim]
-        if len(q_shape) == 4:  # [batch, num_heads, seq_len, head_dim]
-            num_heads = q_shape[1]
-            attention_attrs["num_heads"] = num_heads
-
-        attention_node = Node(
+        fused = Node(
             op_type="Attention",
-            name=f"Attention_fused_{q_node.name}_{k_node.name}_{v_node.name}",
-            attributes=attention_attrs,
-            inputs=attention_inputs,
-            outputs=matmul_v.outputs[:],  # 使用原来的最终输出
+            name=f"Attention_fused_{mm_v.name}",
+            attributes=attrs,
+            inputs=inputs,
+            outputs=mm_v.outputs[:],
         )
+        for n in match["nodes_to_delete"]:
+            if n is not None and n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
 
-        # 删除旧的节点
-        nodes_to_delete = [q_scaled, k_scaled, transpose_k, matmul_qk, softmax_node, matmul_v]
-        if add_node:
-            nodes_to_delete.append(add_node)
-
-        for node in nodes_to_delete:
-            if node and node.name in dag_model.nodes:
-                del dag_model.nodes[node.name]
-
-        # 添加新的Attention节点
-        dag_model.nodes[attention_node.name] = attention_node
-
-        print(f"Fused Attention pattern with Q:{q_node.name}, K:{k_node.name}, V:{v_node.name}")
+        print(f"Fused Attention pattern into '{fused.name}'")
         return True
 
     @staticmethod

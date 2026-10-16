@@ -1,0 +1,225 @@
+#version 450 core
+
+// Fused Attention (SSBO/fp16+fp32), tiled / online-softmax form. One workgroup
+// per query row (b, h, s): grid = (B*H*S, 1, 1). Computes
+//
+//   P = softmax( Q[b,h,s,:] · K[b,h_kv,:,:]^T * scale + mask )   (row softmax)
+//   Y[b,h,s,:] = P · V[b,h,kv,:,:]
+//
+// in one dispatch, replacing the converter's MatMul(QK^T) -> [*scale +bias]
+// -> Softmax -> MatMul(·V) chain. GQA is served without materializing the
+// repeated K/V: h_kv = h / rep (group-contiguous, matching HF repeat_kv).
+//
+// The KV row is swept in TILE_KV-wide chunks with a running max/sum: per tile
+// the raw scores live in shared `sS`, the tile max folds into the running max
+// as `alpha = exp(m_old - m_new)`, and the output accumulator rescales by
+// alpha before folding that tile's contribution. The P1 form staged the whole
+// row (shared `sS[MAX_KV]`), which capped kv at 2048 and made shared memory
+// scale with the context; this form keeps ~3 KB of shared regardless of kv, so
+// kv is unbounded (the host only enforces the shape-level invariants).
+//
+// Bindings: 0=Y, 1=Q, 2=K, 3=V, 4=mask (additive [B,1,S,kv], dummy when
+// has_mask==0). Q/K/V/Y/mask share one dtype. fp16 build (-DFP16) reads packed
+// half2 words and computes in fp32; the only multi-element writer is the Y
+// store, which is one whole half2 word per lane (no read-modify-write race).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Q {
+    uint data[];
+} uQ;
+layout(set = 0, binding = 2) readonly buffer K {
+    uint data[];
+} uK;
+layout(set = 0, binding = 3) readonly buffer V {
+    uint data[];
+} uV;
+layout(set = 0, binding = 4) readonly buffer Mask {
+    uint data[];
+} uMask;
+
+layout(push_constant) uniform PC_ATTN {
+    float scale;   // 1/sqrt(head_dim), folded by the converter
+    int batch;     // B
+    int heads;     // H (query heads)
+    int kv_heads;  // Hkv
+    int seq;       // S (query rows per batch)
+    int kv_len;    // kv (key/value positions; -1/static both fine, host gates)
+    int head_dim;  // D (even)
+    int rep;       // H / Hkv (GQA group size)
+    int causal;    // 0/1: mask j > (kv_len - seq) + s
+    int has_mask;  // 0/1: bind mask at binding 4
+    int _pad0;
+    int _pad1;
+} uA;
+
+#define TILE_KV 256
+#define MAX_HD 256
+
+// Element-loaded float: fp16 reads packed half2 (2 elements/word), fp32 one
+// element per word.
+#ifdef FP16
+#define LOADF(buf, e)                                                          \
+    ((((e) & 1) != 0) ? unpackHalf2x16((buf).data[(e) >> 1]).y                 \
+                      : unpackHalf2x16((buf).data[(e) >> 1]).x)
+#else
+#define LOADF(buf, e) uintBitsToFloat((buf).data[(e)])
+#endif
+
+shared float sQ[MAX_HD];
+shared float sS[TILE_KV];
+shared float s_red[256];
+
+// Tree-reduce `s_red` (256 lanes) with `op`, leaving the result in s_red[0].
+// Each step fences, so the value every lane latched before the call is not
+// clobbered by a lane that has already moved on. The leading fence is
+// load-bearing: `s_red[lid]` is written by every lane and the first step reads
+// `s_red[lid + 128]`, i.e. another *warp's* slot — without it a warp can fold a
+// stale value (or -1e30/0) into the reduction. The P1 form lacked it and read a
+// wrong row max, which makes `exp(x - m)` overflow and scales the whole output
+// row to ~1e-31, on ~1 row in 20 and only for workgroups that lose the race.
+#define REDUCE_MAX()                                                           \
+    do {                                                                       \
+        memoryBarrierShared();                                                 \
+        barrier();                                                             \
+        for (uint t = 128; t > 0; t >>= 1) {                                   \
+            if (lid < int(t)) {                                                \
+                s_red[lid] = max(s_red[lid], s_red[lid + int(t)]);             \
+            }                                                                  \
+            memoryBarrierShared();                                             \
+            barrier();                                                         \
+        }                                                                      \
+    } while (false)
+
+#define REDUCE_SUM()                                                           \
+    do {                                                                       \
+        memoryBarrierShared();                                                 \
+        barrier();                                                             \
+        for (uint t = 128; t > 0; t >>= 1) {                                   \
+            if (lid < int(t)) {                                                \
+                s_red[lid] += s_red[lid + int(t)];                             \
+            }                                                                  \
+            memoryBarrierShared();                                             \
+            barrier();                                                         \
+        }                                                                      \
+    } while (false)
+
+void main() {
+    int wg = int(gl_WorkGroupID.x);
+    int lid = int(gl_LocalInvocationID.x);
+    int S = uA.seq;
+    int H = uA.heads;
+
+    int s = wg % S;
+    int h = (wg / S) % H;
+    int b = wg / (S * H);
+
+    int D = uA.head_dim;
+    int kv = uA.kv_len;
+    if (D <= 0 || D > MAX_HD || (D & 1) != 0 || kv <= 0) {
+        return; // host gates these; a stray dispatch must not corrupt memory
+    }
+    int h_kv = h / uA.rep;
+
+    // ---- stage the Q row (every lane needs all of it) ----
+    int q_base = ((b * H + h) * S + s) * D;
+    for (int d = lid; d < D; d += 256) {
+        sQ[d] = LOADF(uQ, q_base + d);
+    }
+    barrier();
+
+    int k_base = ((b * uA.kv_heads + h_kv) * kv) * D;
+    int v_base = k_base; // K and V share [B,Hkv,kv,D]
+    int past = kv - S;   // absolute position of query row s is past + s
+
+    // Lane t owns output dims (2t, 2t+1) — one whole fp16 word per writer.
+    int n_pair = D >> 1;
+    float o0 = 0.0;
+    float o1 = 0.0;
+    float m = -1e30; // running row max
+    float l = 0.0;   // running sum of exp(x - m)
+
+    for (int t0 = 0; t0 < kv; t0 += TILE_KV) {
+        int tn = kv - t0;
+        if (tn > TILE_KV) {
+            tn = TILE_KV;
+        }
+
+        // ---- score the tile: sS[t] = Q·K[t0+t] * scale + bias ----
+        if (lid < tn) {
+            int off = k_base + (t0 + lid) * D;
+            float dot = 0.0;
+            for (int d = 0; d < D; ++d) {
+                dot += sQ[d] * LOADF(uK, off + d);
+            }
+            float sc = dot * uA.scale;
+            if (uA.has_mask != 0) {
+                sc += LOADF(uMask, (b * S + s) * kv + t0 + lid);
+            }
+            if (uA.causal != 0 && (t0 + lid) > past + s) {
+                sc = -65504.0; // fp16 min; exp() -> 0 (not -inf, which NaNs)
+            }
+            sS[lid] = sc;
+        }
+        memoryBarrierShared();
+        barrier();
+
+        // ---- running max ----
+        s_red[lid] = (lid < tn) ? sS[lid] : -1e30;
+        REDUCE_MAX();
+        float tile_max = s_red[0];
+        // Latch tile_max before s_red is reused as the sum accumulator: lane 0
+        // overwrites s_red[0], and a warp that read it late would take a
+        // partial sum as its max. (This is not hypothetical — the P1
+        // whole-row kernel shipped without it and failed nondeterministically.)
+        memoryBarrierShared();
+        barrier();
+        float m_new = max(m, tile_max);
+        float alpha = exp(m - m_new); // m starts at -1e30 -> first tile: 0
+
+        // ---- exp + running sum ----
+        float lp = 0.0;
+        if (lid < tn) {
+            lp = exp(sS[lid] - m_new);
+            sS[lid] = lp; // reuse the tile as P, for the AV pass below
+        }
+        s_red[lid] = lp;
+        REDUCE_SUM();
+        l = l * alpha + s_red[0];
+        memoryBarrierShared();
+        barrier();
+
+        // ---- AV: fold this tile into the rescaled accumulator ----
+        if (lid < n_pair) {
+            int d0 = lid * 2;
+            o0 *= alpha;
+            o1 *= alpha;
+            for (int j = 0; j < tn; ++j) {
+                float p = sS[j];
+                int off = v_base + (t0 + j) * D + d0;
+                o0 += p * LOADF(uV, off);
+                o1 += p * LOADF(uV, off + 1);
+            }
+        }
+        // A lane that skipped the AV block must still not run ahead into the
+        // next tile's `sS` write.
+        memoryBarrierShared();
+        barrier();
+        m = m_new;
+    }
+
+    if (lid < n_pair) {
+        int d0 = lid * 2;
+        float inv = 1.0 / (l + 1e-30);
+        int y_off = q_base + d0;
+#ifdef FP16
+        uOutput.data[y_off >> 1] = packHalf2x16(vec2(o0 * inv, o1 * inv));
+#else
+        uOutput.data[y_off] = floatBitsToUint(o0 * inv);
+        uOutput.data[y_off + 1] = floatBitsToUint(o1 * inv);
+#endif
+    }
+}

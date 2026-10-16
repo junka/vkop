@@ -1014,6 +1014,12 @@ void Runtime::LoadModel() {
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;
+                case vkop::ops::OpType::ATTENTION:
+                    // Q/K/V share one dtype (fp16 on the LLM path, fp32 in
+                    // tests); the build follows input[0] (Q) like RMSNorm.
+                    op_fp16 =
+                        (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+                    break;
                 case vkop::ops::OpType::FUSED_ELEMWISE:
                     // Fusion across Cast: the chain's leaf inputs may be mixed
                     // fp16/fp32 (a Cast crosses dtype inside the chain). The
