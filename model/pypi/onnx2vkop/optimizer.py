@@ -1,5 +1,6 @@
 """Model optimization utilities."""
 
+import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List
@@ -426,6 +427,52 @@ def _reattach_initializers(model, demoted, added_inputs, raw_map):
         graph.input.extend(keep)
 
 
+# onnxoptimizer pass list. A module constant so tools/ablate.py can enumerate
+# the same list it subtracts from via VKOP_NO_PASSES (mirrored by VKOP_NO_FUSIONS
+# for the DAG passes) -- which pass pays for which model is a measurement, not
+# a property of the pass.
+ONNXOPTIMIZER_PASSES = [
+    "eliminate_nop_cast",
+    "eliminate_deadend",
+    "eliminate_identity",
+    "eliminate_nop_dropout",
+    "eliminate_nop_monotone_argmax",
+    "eliminate_nop_pad",
+    "eliminate_nop_transpose",
+    "eliminate_unused_initializer",
+    "fuse_consecutive_squeezes",
+    "fuse_consecutive_unsqueezes",
+    "fuse_consecutive_transposes",
+    "fuse_add_bias_into_conv",
+    "fuse_bn_into_conv",
+    # 形状/常量相关 pass（onnxoptimizer 原生，先尽力折叠 Shape/Gather/Slice-after-Shape）。
+    # 注意：不要加 extract_constant_to_initializer——它把 Constant 节点的
+    # value 属性搬成 initializer，而 fold() 会为绕开 proto 2GB 上限原地剥掉
+    # 所有 initializer 的 raw_data；这些搬运来的字节不在调用方的 raw_map
+    # （按原始 initializer 建）里，折叠后无法还原，最终在 save_to_binary
+    # 的 to_array 处报 "cannot reshape array of size 0"。Constant 节点由
+    # ConstantFolder 直接折进 const 字典，活着的常量在 DAG 落盘前由
+    # prune_and_materialize 物化（读属性原始字节，无损）。
+    "eliminate_shape_gather",
+    "eliminate_slice_after_shape",
+    "eliminate_shape_op",
+    "eliminate_nop_reshape",
+    # 折叠 Shape/Slice 链会产出大量内容相同的 int64 常量，且 llm 的 rotary 分支
+    # 里整段重复子图成对出现。value-free view 上实测：节点 3813->3408、初始器条目
+    # 2541->689，重挂权重后无悬空输入。llm 的 decode 是权重带宽受限（3.205 GiB/步），
+    # 所以这两条在 llm 上只是"不伤害"；它们省的是重复计算与重复字节，在
+    # 非带宽受限的模型（小 CNN、visual、大 batch prefill）和带 tied/复制权重的
+    # 模型上是真收益，且节点更少 = descriptor/VMA 分片更少、大图转换更快。
+    "eliminate_common_subexpression",
+    "eliminate_duplicate_initializer",
+]
+
+
+def _disabled_passes(env_var):
+    """Names subtracted from a pass list by an env var (comma separated)."""
+    return {p.strip() for p in os.environ.get(env_var, "").split(",") if p.strip()}
+
+
 class ONNXOptimizer:
     """Class for optimizing ONNX models."""
 
@@ -439,34 +486,10 @@ class ONNXOptimizer:
           等元算子整段折叠成 initializer）。若装了 onnxsim 也作为可选增强。
         失败自动回退到 onnxoptimizer + shape_inference。
         """
-        passes = [
-            "eliminate_nop_cast",
-            "eliminate_deadend",
-            "eliminate_identity",
-            "eliminate_nop_dropout",
-            "eliminate_nop_monotone_argmax",
-            "eliminate_nop_pad",
-            "eliminate_nop_transpose",
-            "eliminate_unused_initializer",
-            "fuse_consecutive_squeezes",
-            "fuse_consecutive_unsqueezes",
-            "fuse_consecutive_transposes",
-            "fuse_add_bias_into_conv",
-            "fuse_bn_into_conv",
-            # 形状/常量相关 pass（onnxoptimizer 原生，先尽力折叠 Shape/Gather/Slice-after-Shape）。
-            # 注意：不要加 extract_constant_to_initializer——它把 Constant 节点的
-            # value 属性搬成 initializer，而 fold() 会为绕开 proto 2GB 上限原地剥掉
-            # 所有 initializer 的 raw_data；这些搬运来的字节不在调用方的 raw_map
-            # （按原始 initializer 建）里，折叠后无法还原，最终在 save_to_binary
-            # 的 to_array 处报 "cannot reshape array of size 0"。Constant 节点由
-            # ConstantFolder 直接折进 const 字典，活着的常量在 DAG 落盘前由
-            # prune_and_materialize 物化（读属性原始字节，无损）。
-            "eliminate_shape_gather",
-            "eliminate_slice_after_shape",
-            "eliminate_shape_op",
-            "eliminate_nop_reshape",
-        ]
-
+        off = _disabled_passes("VKOP_NO_PASSES")
+        passes = [p for p in ONNXOPTIMIZER_PASSES if p not in off]
+        if off:
+            print(f"[ablate] onnxoptimizer passes disabled: {sorted(off)}")
         initializer_names = {init.name for init in onnx_model.graph.initializer}
         actual_inputs = [inp for inp in onnx_model.graph.input if inp.name not in initializer_names]
 
@@ -716,6 +739,13 @@ class MultiRoundOptimizer:
         self.stats = OptimizationStats()
 
     def register_pass(self, pass_instance: OptimizationPass):
+        # VKOP_NO_FUSIONS=<comma list> drops named passes. Which fusion pays off
+        # is model-dependent (a rope fusion that removes 200 nodes on an LLM is
+        # dead weight on a CNN), so ablation is done by env rather than by
+        # editing this list -- see tools/ablate.py.
+        if pass_instance.name in _disabled_passes("VKOP_NO_FUSIONS"):
+            print(f"[ablate] fusion pass disabled by VKOP_NO_FUSIONS: {pass_instance.name}")
+            return
         self.passes.append(pass_instance)
         self.passes.sort(key=lambda p: p.priority, reverse=True)
 
