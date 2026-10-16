@@ -33,11 +33,6 @@ from transformers.models.qwen3_vl.modeling_qwen3_vl import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from transformers.vision_utils import (
-    get_vision_cu_seqlens,
-    get_vision_interpolation_indices_and_weights,
-    get_vision_position_ids,
-)
 
 MODEL_PATH = os.path.expanduser("~/.cache/modelscope/hub/models/Qwen/Qwen3-VL-2B-Instruct")
 IMAGE_TOKEN_ID = 151655  # <|image_pad|>
@@ -136,27 +131,38 @@ class VisualExport(nn.Module):
 
 EXPORT_LLM_ONLY = os.environ.get("EXPORT_LLM_ONLY") == "1"
 
+# 导出尺寸从环境变量 EXPORT_IMG_SIZE 读，默认 224×224。注意：visual.onnx 的整张图
+# 都是「导出时固化」的——grid_thw 及其派生量（pos_embed 插值索引/权重、rotary
+# position_ids、cu_seqlens）全部折成常量，输入输出也不标 dynamic_axes。
+# 要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx，不同尺寸不能共用一个图。
+# LLM 图也依赖这个尺寸：deepstack_embeds_* 的行数 n_img = seq_len / merge**2。
+patch_size = visual.patch_embed.patch_size
+temporal_patch_size = visual.patch_embed.temporal_patch_size
+in_chans = visual.patch_embed.in_channels
+row = in_chans * temporal_patch_size * patch_size * patch_size
+EXPORT_IMG_SIZE = int(os.environ.get("EXPORT_IMG_SIZE", "224"))
+height = width = EXPORT_IMG_SIZE
+assert height % patch_size == 0 and width % patch_size == 0, \
+    f"导出尺寸 {height}×{width} 必须是 patch_size={patch_size} 的整数倍"
+grid_t, grid_h, grid_w = 1, height // patch_size, width // patch_size
+assert grid_h % SPATIAL_MERGE == 0 and grid_w % SPATIAL_MERGE == 0, \
+    f"grid {grid_h}×{grid_w} 必须能被 spatial_merge_size={SPATIAL_MERGE} 整除"
+seq_len = grid_t * grid_h * grid_w
+grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
+print(f"[sizing] img={height}×{width} patch={patch_size} seq_len={seq_len} "
+      f"row={row} grid_thw={grid_thw.tolist()}")
+
 if not EXPORT_LLM_ONLY:
-    patch_size = visual.patch_embed.patch_size
-    temporal_patch_size = visual.patch_embed.temporal_patch_size
-    in_chans = visual.patch_embed.in_channels
-    row = in_chans * temporal_patch_size * patch_size * patch_size
-    # 导出尺寸从环境变量 EXPORT_IMG_SIZE 读，默认 224×224。注意：visual.onnx 的整张图
-    # 都是「导出时固化」的——grid_thw 及其派生量（pos_embed 插值索引/权重、rotary
-    # position_ids、cu_seqlens）全部折成常量，输入输出也不标 dynamic_axes。
-    # 要换尺寸就改 EXPORT_IMG_SIZE 重新导出一个 visual.onnx，不同尺寸不能共用一个图。
-    EXPORT_IMG_SIZE = int(os.environ.get("EXPORT_IMG_SIZE", "224"))
-    height = width = EXPORT_IMG_SIZE
-    assert height % patch_size == 0 and width % patch_size == 0, \
-        f"导出尺寸 {height}×{width} 必须是 patch_size={patch_size} 的整数倍"
-    grid_t, grid_h, grid_w = 1, height // patch_size, width // patch_size
-    assert grid_h % SPATIAL_MERGE == 0 and grid_w % SPATIAL_MERGE == 0, \
-        f"grid {grid_h}×{grid_w} 必须能被 spatial_merge_size={SPATIAL_MERGE} 整除"
-    seq_len = grid_t * grid_h * grid_w
-    grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.int32)
+    # Only the visual graph needs these three helpers; importing them lazily
+    # keeps the LLM-only export working on transformers versions that dropped
+    # the vision_utils module.
+    from transformers.vision_utils import (
+        get_vision_cu_seqlens,
+        get_vision_interpolation_indices_and_weights,
+        get_vision_position_ids,
+    )
+
     pixel_values = torch.randn(seq_len, row, dtype=visual.dtype)
-    print(f"[visual] img={height}×{width} patch={patch_size} seq_len={seq_len} "
-          f"row={row} grid_thw={grid_thw.tolist()}")
 
     visual_out_names = ["image_features", "deepstack_features_0",
                         "deepstack_features_1", "deepstack_features_2"]
