@@ -1535,11 +1535,15 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
 
 template <typename T>
 bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
-                              bool use_mask, bool causal, bool prealloc) {
+                              bool use_mask, bool causal, bool prealloc,
+                              bool inplace = false) {
     Dev d;
     const int Hkv = H / rep;
     const int kv_total = S0 + S1;
     const int max_kv = prealloc ? kv_total : 0;
+    if (inplace && !prealloc) {
+        return false; // one buffer only makes sense at max_kv preallocation
+    }
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     using torch::indexing::Slice;
 
@@ -1601,6 +1605,16 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
     };
     auto past = alloc_cache(shape_of({1, 2, Hkv, 0, D}));
     auto pres = alloc_cache(shape_of({1, 2, Hkv, 0, D}));
+    // In-place: `present` is not a second allocation but a handle on the very
+    // buffer `past` addresses, exactly as the driver's KVCache sets it up. The
+    // op then finds cache_in and cache_out to be one buffer and skips the
+    // history copy (the shader's `inplace`), so what this case pins is that the
+    // history is still intact after a round that only appended — every round's
+    // Y is scored against the full reference history, so a row written at the
+    // wrong stride, or a history the append walked over, fails round 2.
+    if (inplace) {
+        pres->alias_gpu_buffer(*past);
+    }
 
     const float rtol = std::is_same_v<T, uint16_t> ? 0.03f : 0.002f;
     for (int r = 0; r < 2; ++r) {
@@ -1667,10 +1681,66 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
                 return false;
         }
 
-        std::swap(past, pres);
-        past->resize(shape_of({1, 2, Hkv, kv, D}));
+        if (inplace) {
+            // One buffer, so there is no handle to exchange: the round boundary
+            // is only the logical length moving forward. (`pres` keeps its
+            // handle on it and is resized by the op each round.)
+            past->resize(shape_of({1, 2, Hkv, kv, D}));
+        } else {
+            std::swap(past, pres);
+            past->resize(shape_of({1, 2, Hkv, kv, D}));
+        }
     }
     return true;
+}
+
+// Tensor::alias_gpu_buffer — the one-buffer KV cache. `present` becomes a
+// second handle on `past`'s preallocated buffer, so a round boundary is a
+// logical resize instead of a device copy (or a handle swap). Two properties
+// matter downstream: one allocation, so the attention op sees cache_in and
+// cache_out as the same buffer and skips the history copy it would otherwise
+// do onto itself; and the bytes written through either handle are the others',
+// at the preallocated pitch. The pitch is the whole reason the source must be
+// pre-allocated — a shape-sized buffer is too small for the next round.
+TEST(BufferRankTest, TensorAliasGpuBuffer) {
+    Dev d;
+    const int Hkv = 2, D = 8, max_kv = 6;
+    const std::vector<int> full{1, 2, Hkv, max_kv, D};
+    const std::size_t n = static_cast<std::size_t>(1) * 2 * Hkv * max_kv * D;
+
+    auto past = std::make_shared<Tensor<uint16_t>>(
+        std::vector<int>{1, 2, Hkv, 0, D});
+    past->preallocate_buffer(d.dev, n);
+    EXPECT_TRUE(past->get_prealloc_keep());
+
+    // A tensor with only a shape-sized buffer is not a valid source: the alias
+    // writes at the source's pitch, which that buffer cannot hold.
+    auto small = std::make_shared<Tensor<uint16_t>>(full);
+    small->as_storage_buffer(d.dev);
+    auto pres = std::make_shared<Tensor<uint16_t>>(std::vector<int>{1, 2, Hkv, 0, D});
+    EXPECT_THROW(pres->alias_gpu_buffer(*small), std::runtime_error);
+
+    // Past keeps its own handle; present now names the same buffer.
+    auto past_buf = past->as_storage_buffer(d.dev);
+    pres->alias_gpu_buffer(*past);
+    EXPECT_TRUE(pres->get_prealloc_keep());
+    EXPECT_EQ(past_buf, pres->as_storage_buffer(d.dev));
+    EXPECT_EQ(past_buf, past->as_storage_buffer(d.dev));
+
+    // A write through one handle is a read through the other — bit for bit.
+    auto t = torch::randn({1, 2, Hkv, max_kv, D}, brt_torch_opt<uint16_t>());
+    past->resize(full);
+    brt_fill(past, t);
+    past->copyToGPU(d.cmdpool);
+    pres->resize(full);
+    pres->copyToCPU(d.cmdpool);
+    EXPECT_TRUE(brt_close_to_torch(pres, t, 0.0f, 0.0f));
+
+    // …and the two logical lengths are independent, which is what lets the
+    // driver resize `past` to kv_len while `present` still reports the row
+    // count the op wrote.
+    past->resize(std::vector<int>{1, 2, Hkv, 2, D});
+    EXPECT_EQ(pres->num_elements(), static_cast<int>(n));
 }
 
 TEST(BufferRankTest, AttentionFp32AndFp16) {
@@ -1733,6 +1803,14 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     // Multi-tile kv: 300 positions over three rounds.
     EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 256, 44, 1, false, false, false));
     EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 256, 44, 1, false, false, true));
+
+    // In-place: past and present are one preallocated buffer (the driver's
+    // KVCache), so the append must leave the history exactly where the next
+    // round reads it — no copy, no exchange.
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 5, 3, 1, false, false, true, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 6, 1, 2, true, true, true, true));
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 256, 44, 1, false, false, true, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 1, 1, 1, false, true, true, true));
 }
 
 } // namespace

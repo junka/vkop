@@ -840,6 +840,35 @@ template <typename T> class Tensor : public ITensor {
         other.vkobj_ = mine;
     }
 
+    // Make this tensor a second handle on `other`'s buffer, leaving `other`
+    // where it is — unlike swap_gpu_buffer_with, which exchanges the two. The
+    // LLM KV cache uses this so `present` and `past` address the same bytes:
+    // the attention op's cache form then sees its cache_in and cache_out as one
+    // buffer, skips the history copy (the history is already where it belongs),
+    // and the driver's per-round present->past exchange becomes the identity.
+    // It also halves KV VRAM, since there is only one allocation.
+    //
+    // `other` must be pre-allocated (see preallocate_buffer): the point of the
+    // alias is that this side is written at `other`'s row pitch, so a buffer
+    // sized to a logical shape is not enough — the same reason
+    // swap_gpu_buffer_with checks both sides. Any buffer this tensor already
+    // had is dropped (its last owner frees it).
+    //
+    // The upload state is left alone: the aliasing call is not an upload, so
+    // whoever makes this tensor host-authoritative decides that (for a graph
+    // output — the only current user — the runtime already made it on-GPU and
+    // never uploads it). Do not copyToGPU() into an aliased tensor afterwards,
+    // or this side's staging data would land in `other`'s buffer.
+    void alias_gpu_buffer(const Tensor<T> &other) {
+        if (!other.prealloc_keep_ || !other.vkobj_) {
+            throw std::runtime_error(
+                "vkop: alias_gpu_buffer needs a pre-allocated source buffer "
+                "(a shape-sized one is too small to write at that pitch)");
+        }
+        vkobj_ = other.vkobj_;
+        prealloc_keep_ = true;
+    }
+
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (vkobj_) {

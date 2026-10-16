@@ -41,7 +41,7 @@ struct alignas(16) AttentionPC {
     int has_cache;  // 0/1
     int src_stride; // cache_in row stride (kv pitch of that SSBO)
     int dst_stride; // cache_out row stride
-    int inplace;    // 0/1: cache_out aliases cache_in
+    int inplace;    // 0/1: cache_out aliases cache_in (detected, not asked)
     int _pad0;
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
@@ -65,8 +65,10 @@ static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 //   cache_in, then the new rows. This is what replaces the graph's
 //   Gather/Concat/Unsqueeze rotation, which copied the entire past every decode
 //   round (7 dispatches/layer, linear in kv_len — 48-70% of a round at
-//   kv_len 1024..4096). `inplace` says cache_out IS cache_in (the history copy
-//   is then a no-op) — see KV_INPLACE notes in the converter pass.
+//   kv_len 1024..4096). When cache_out IS cache_in (the driver gives past and
+//   present one preallocated buffer) the history copy is a no-op and only the
+//   fresh rows are written — see `inplace`, which is worked out from the bound
+//   buffers at execute() time, never from an attribute.
 //
 // The host gates head_dim (even, <= 256) and the shape-level invariants and
 // THROWS on a violation, never a silent wrong answer. Batch/seq/kv_len come
@@ -108,9 +110,6 @@ class AttentionBuffer : public BufferFactory {
         if (attributes.find("has_cache") != attributes.end()) {
             has_cache_ =
                 static_cast<int>(std::stol(attributes.at("has_cache")));
-        }
-        if (attributes.find("inplace") != attributes.end()) {
-            inplace_ = static_cast<int>(std::stol(attributes.at("inplace")));
         }
     }
 
@@ -234,7 +233,6 @@ class AttentionBuffer : public BufferFactory {
         pc.has_mask = has_mask ? 1 : 0;
         pc.kv_past = kv_past;
         pc.has_cache = has_cache ? 1 : 0;
-        pc.inplace = inplace_ ? 1 : 0;
 
         int grid = batch * heads * seq;
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
@@ -273,6 +271,14 @@ class AttentionBuffer : public BufferFactory {
             }
             auto pbuf = bind_ssbo<T>(outputs[1], /*is_output=*/true);
             pc.dst_stride = row_capacity(pbuf, elem_bytes, row_elems, kv_len);
+            // `present` may BE the cache: the driver hands past and present one
+            // preallocated buffer (Tensor::alias_gpu_buffer), so the history is
+            // already where the next round will read it and the copy is pure
+            // overhead. Detected from the two bound buffers rather than from an
+            // attribute, so the flag and the wiring cannot disagree — same
+            // buffer skips the history copy, different buffers runs it. Never
+            // an assumption that could yield a silently stale cache.
+            pc.inplace = (cbuf && pbuf && cbuf.get() == pbuf.get()) ? 1 : 0;
             // The copy half of the dispatch: one uint word per lane, and a
             // word holds 4/sizeof(T) elements (2 for the packed fp16 build, 1
             // for fp32). Dividing by elem_bytes here instead would under-
@@ -291,7 +297,6 @@ class AttentionBuffer : public BufferFactory {
     int num_kv_heads_ = 0; // ditto
     int causal_ = 0;
     int has_cache_ = 0;
-    int inplace_ = 0;
 };
 
 // PIMPL façade. Buffer-only (no image impl), like RMSNorm.

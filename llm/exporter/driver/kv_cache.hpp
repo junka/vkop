@@ -5,25 +5,31 @@
 // 收拢成一个对象，让驱动只表达「本轮 prefill 从空 KV 开始」「本轮结束把 KV 接上」。
 //
 // 三件事：
-//  1. 预分配：LoadModel 之后立刻把每层 past/present 的 buffer 一次性按 max_kv
-//     开好。之后每轮 ResizeInput 只改逻辑形状，make_vkbuff 走 prealloc_keep_
-//     复用同一个 VkBuffer，不再每轮重分配几十 MB。
+//  1. 预分配：LoadModel 之后立刻把每层 past 的 buffer 一次性按 max_kv 开好，
+//     present 直接 alias 到同一块（Tensor::alias_gpu_buffer）—— 每层一块，不是
+//     两块。之后每轮 ResizeInput 只改逻辑形状，make_vkbuff 走 prealloc_keep_
+//     复用同一个 VkBuffer，不再每轮重分配几十 MB，KV 显存也就减半。
 //  2. reset_for_prefill()：把 past 的逻辑 kv_len 归零（整段重新 prefill 的
 //     语义），随后 upload() 把「空 past」真正传到 GPU。
-//  3. feedback()：present→past。两块 buffer 都按 max_kv 预分配、内容又正好是
-//     「本轮写出的历史 == 下一轮要读的历史」，所以交换两个张量的 VkBuffer 身份
-//     就够了，不需要每步把整段历史在设备里拷一遍（拷一次 = 每层 2×nkv×kv×hd
-//     字节 + 一次 submit/wait，随上下文线性增长）。
-//     实测（GLM-Edge，同一二进制两条路径、596 步逐位相同）：拷贝路径 feedback()
-//     每步 0.35~0.45ms，且 past_len 从 53 到 608 基本不涨 —— 被 submit/wait 的
-//     固定开销主导；swap 后 ~20µs（纯 host 改形状）。整步 42ms 里这 0.4ms 落在
-//     端到端噪声内，所以这里的收益是「去掉一个 O(past_len) 的每步 memcpy」这一
-//     结构性事实，而不是当前上下文长度上可测出的速度。
+//  3. feedback()：present→past —— 现在只剩改一个逻辑形状。两块张量本来就是
+//     同一块 buffer，「present 的字节就是下一轮 past 的字节」这句话是字面成立
+//     的，连交换身份都不需要。于是每轮 KV 的开销与上下文长度完全无关：不是
+//     「拷整段历史」O(kv)，也不是「换 buffer 身份」，而是 O(1) 的 host 改形状。
+//     （历史：拷贝路径实测每步 0.35~0.45ms 且随 past_len 基本不涨 —— 被
+//     submit/wait 的固定开销主导；换身份后 ~20µs。同一二进制两条路径、596 步
+//     逐位相同。）
+//
+// 共享一块 buffer 对图侧也是对的，包括不走 cache 形式的路径：图里唯一的读者是
+// Gather(past)，唯一的写者是写 present 的那个算子，两者之间隔着依赖序的 barrier，
+// 而且写 present 的从来不是读 past 的那一条（矩阵乘/Concat 各自落在自己的临时
+// 张量上）。所以「本轮写 present == 写下一轮的 past」不会与「本轮读 past」打架。
+// attention 形式下更是如此：cache_in/cache_out 是同一块，kernel 直接跳过历史拷贝
+// （inplace 由算子从绑定的两块的指针自己判定，见 ops/Attention.hpp）。
 //
 // 存储类型：cache_kind 决定每层 past/present 的字节容器语义。fp16 是历史默认
 // （uint16_t 容器，2B/elem）；fp8（E4M3/E5M2）用 int8_t 容器（1B/elem），把
-// KV cache 显存减半。两者走同一套预分配/reset/swap 机制 —— preallocate_buffer
-// 和 swap_gpu_buffer_with 都是 sizeof(T) 的纯字节操作，dtype 无关。attention
+// KV cache 显存再减半。两者走同一套预分配/alias/reset 机制 —— preallocate_buffer
+// 和 alias_gpu_buffer 都是 sizeof(T) 的纯字节操作，dtype 无关。attention
 // 计算仍走 fp16：图里在 cache 边界插 QuantizeLinear/DequantizeLinear，所以
 // 这里看到的 past/present 永远是「原始 payload 字节」，不参与反量化。
 //
@@ -78,10 +84,11 @@ public:
                 "KVCache: unsupported cache element format " +
                 std::string(core::elem_name(cache_kind)));
         }
-        // past/present 都按 max_kv 开好，长度增长时不再重分配。元素总数与 dtype
-        // 无关（2 × nkv × max_kv × hd，K/V 在 dim 1 叠在一起）；字节宽由容器类型
-        // 决定，preallocate_buffer 内部按 sizeof(T) 对齐。4-bit 的两个值挤一字节，
-        // 所以给它的「容器槽位数」是逻辑元素数的一半（见 preallocate_kv_）。
+        // past 按 max_kv 开好，present 共享同一块（每层一块 buffer，长度增长时
+        // 不再重分配）。元素总数与 dtype 无关（2 × nkv × max_kv × hd，K/V 在
+        // dim 1 叠在一起）；字节宽由容器类型决定，preallocate_buffer 内部按
+        // sizeof(T) 对齐。4-bit 的两个值挤一字节，所以给它的「容器槽位数」是
+        // 逻辑元素数的一半（见 preallocate_kv_）。
         const std::size_t kv_elems = static_cast<std::size_t>(2) * nkv * max_kv * hd;
         auto dev = cmdpool->getVulkanDevice();
         for (int i = 0; i < nlayers; ++i) {
@@ -92,7 +99,7 @@ public:
                                          std::to_string(i));
             }
             preallocate_kv_(pin, dev, kv_elems);
-            preallocate_kv_(pout, dev, kv_elems);
+            share_kv_(pout, pin);
         }
     }
 
@@ -114,24 +121,22 @@ public:
         }
     }
 
-    // present→past：不再把整段历史在设备里拷一遍。两个张量都按 max_kv 预分配，
-    // 「present 的字节就是下一轮 past 的字节」这句话用交换 VkBuffer 来表达是免费的。
+    // present→past：两个张量一开始就是同一块 buffer，所以这里没有设备拷贝、
+    // 也没有 buffer 身份交换，只有「past 的逻辑长度跟上本轮」这一件 host 侧的事。
     // 返回新的 past_len（下一轮的位置/attention_bias 都以它为准）。
     int feedback() {
         int past_len = 0;
         for (int i = 0; i < nlayers_; ++i) {
             auto pres = rt_->GetOutput("present_key_values_" + std::to_string(i));
             const int kv_len = num_kv_elems_(pres) / (2 * nkv_ * hd_);
-            // 先改逻辑形状（ResizeInput 会把 converted_ 置回 false，buffer 仍走
-            // prealloc_keep_ 复用），再换 buffer，最后把 past 标回「数据在 GPU 上」
-            // —— 换过来的那块装着本轮写出的历史，不需要任何上传。
+            // ResizeInput 会把 converted_ 置回 false（buffer 走 prealloc_keep_
+            // 复用，不重分配），所以最后要把 past 标回「数据在 GPU 上」：那块
+            // buffer 里装的就是本轮写出的历史，不需要任何上传。
             rt_->ResizeInput("past_key_values_" + std::to_string(i),
                              {1u, 2u, static_cast<uint32_t>(nkv_),
                               static_cast<uint32_t>(kv_len),
                               static_cast<uint32_t>(hd_)});
-            auto past = rt_->GetInput("past_key_values_" + std::to_string(i));
-            swap_kv_(past, pres);
-            mark_gpu_(past);
+            mark_gpu_(rt_->GetInput("past_key_values_" + std::to_string(i)));
             past_len = kv_len;
         }
         return past_len;
@@ -185,14 +190,22 @@ private:
         }
         return slots;
     }
-    void swap_kv_(const std::shared_ptr<core::ITensor>& past,
-                  const std::shared_ptr<core::ITensor>& pres) {
+    // dst 变成 src 那块 buffer 的第二个句柄，src 原地不动。src 必须是已经
+    // preallocate 过的（形状大小的 buffer 装不下按 max_kv 长起来的历史，
+    // 见 Tensor::alias_gpu_buffer）。dst 自己可能带着 LoadModel 时开的
+    // buffer（present 是图输出）—— 被这里替换掉，由 shared_ptr 释放。
+    //
+    // 两边的容器类型必须一致：alias 只搬 buffer 身份、不看元素类型，如果
+    // cache_kind 把 past 和 present 分到不同容器上，绑定时才会发现宽窄不对。
+    // 事实上不会 —— preallocate_kv_ 按同一个 cache_kind_ 分派。
+    void share_kv_(const std::shared_ptr<core::ITensor>& dst,
+                   const std::shared_ptr<core::ITensor>& src) {
         if (cache_kind_ == core::ElemKind::kFloat16) {
-            core::as_tensor<uint16_t>(past)->swap_gpu_buffer_with(
-                *core::as_tensor<uint16_t>(pres));
+            core::as_tensor<uint16_t>(dst)->alias_gpu_buffer(
+                *core::as_tensor<uint16_t>(src));
         } else {
-            core::as_tensor<int8_t>(past)->swap_gpu_buffer_with(
-                *core::as_tensor<int8_t>(pres));
+            core::as_tensor<int8_t>(dst)->alias_gpu_buffer(
+                *core::as_tensor<int8_t>(src));
         }
     }
     void mark_gpu_(const std::shared_ptr<core::ITensor>& t) {
