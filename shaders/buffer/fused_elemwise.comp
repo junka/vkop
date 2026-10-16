@@ -72,6 +72,7 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define OP_TANH    10  // unary
 #define OP_CAST    11  // unary, no-op (same-dtype chain only — host skips dtype-crossing casts)
 #define OP_WHERE   12  // ternary: b ? a : (next-reg) — handled specially below
+#define OP_ERF     13  // unary, erf(a) — the GELU primitive (see FusedElemwise.hpp)
 
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
@@ -271,6 +272,7 @@ void main() {
             else if (oc == OP_NEG)     r = -av;
             else if (oc == OP_EXP)     r = exp(av);
             else if (oc == OP_TANH)    r = tanh(av);
+            else if (oc == OP_ERF)     r = buffer_erf(av);
             else if (oc == OP_CAST)    r = av; // same-dtype no-op
             else if (oc == OP_WHERE) {
                 // ternary: dst = (b != 0) ? reg[a] : reg[next]

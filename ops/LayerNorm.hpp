@@ -127,6 +127,16 @@ class LayerNormImage : public Operator {
 // shader builds — the fp16 one reads/writes packed half2 words in place. The
 // previous fp16 route upcast on the host, which read back every activation:
 // 65 LayerNorms per DiT decode step, 7.1 s of a 22 s step.
+//
+// A 4th input (skip) makes it LayerNorm(x + skip): the converter's
+// fuse_skip_layernorm folds `Add(x, skip) -> LayerNormalization(X, scale,
+// bias)` into that form when the Add's only consumer is the LayerNormalization.
+// The pattern needs a post-norm residual (BERT-style); in a pre-norm block the
+// residual stream also feeds the next sub-layer's Add, so the matcher rejects
+// it. Keeping it inside this op rather than adding a SkipLayerNormalization op
+// means the fused node still resolves to LAYERNORM and no new kernel/shaders
+// exist to keep in sync — the added cost to the no-skip path is one uniform
+// scalar test per element.
 class LayerNormBuffer : public BufferFactory {
   public:
     explicit LayerNormBuffer(int fp16)
@@ -135,7 +145,8 @@ class LayerNormBuffer : public BufferFactory {
                         fp16 ? buffer_layernorm_fp16_spv_len
                              : buffer_layernorm_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                         DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                         DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                         DESCRIPTOR_TYPE_STORAGE},
                         sizeof(LayerNormPC), fp16),
           fp16_(fp16) {}
 
@@ -208,6 +219,14 @@ class LayerNormBuffer : public BufferFactory {
             throw std::runtime_error(
                 "LayerNorm: weight/bias dtype differs from the input");
         }
+        // Optional skip (fused residual, see the class comment). Absent for a
+        // plain LayerNormalization.
+        const bool has_skip =
+            inputs.size() > 3 && inputs[3] != nullptr && inputs[3]->size() > 0;
+        if (has_skip && inputs[3]->dtype() != inputs[0]->dtype()) {
+            throw std::runtime_error(
+                "LayerNorm: skip dtype differs from the input");
+        }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
@@ -227,11 +246,19 @@ class LayerNormBuffer : public BufferFactory {
                 bind_ssbo<T>(inputs[i], /*is_output=*/false);
             });
         }
+        // Binding 4 is declared unconditionally; without a skip, bind x itself
+        // so the descriptor is valid and the shader's has_skip==0 branch never
+        // reads it.
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(has_skip ? inputs[3] : inputs[0], /*is_output=*/false);
+        });
 
         LayerNormPC pc{};
         pc.eps = eps_;
         pc.inner_size = inner_size;
         pc.outer_size = outer_size;
+        pc.has_skip = has_skip ? 1 : 0;
         submit(&pc, outer_size, 1, 1);
     }
 

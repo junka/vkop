@@ -676,6 +676,39 @@ class ONNXOptimizer:
         return True
 
 
+# Names ops/Ops.hpp::convert_opstring_to_enum resolves to a real OpType.
+# Anything else resolves to OpType::UNKNOWN, and core/runtime.cpp:702 then skips
+# the node outright ("make it as input for next ops") — so a fusion pass that
+# invents an op name does not fail, it silently deletes the node and every
+# consumer reads an unwritten buffer. Four passes shipped that way
+# (SkipLayerNormalization / BiasGelu / MatMulGelu / EmbeddingLayerNormalization /
+# BertEncoder; fuse_into_attention's "Attention" is a fifth, still dormant).
+# _check_no_unknown_op below turns that class into a hard conversion error.
+# tests/test_fusion_op_types.py re-derives this set from ops/Ops.hpp, so it
+# cannot rot silently.
+RUNTIME_OPS = frozenset({
+    "Add", "Atan", "AveragePool", "BatchNorm", "BatchNormalization", "Cast",
+    "Col2Im", "Concat", "Conv", "Conv2d", "Cos", "DequantizeLinear", "Div",
+    "EmbeddingForward", "Equal", "Erf", "Expand", "Floor", "FusedElemwise",
+    "Gather", "Gemm", "GlobalAveragePool", "GridSample", "LayerNorm",
+    "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d", "Min", "Mod",
+    "Mul", "Neg", "Nms", "NonZero", "Pow", "PRelu", "QuantizeLinear", "RMSNorm",
+    "Range", "Reduce", "ReduceMean", "Relu", "Reshape", "Resize",
+    "RotaryEmbedding", "ScatterElements", "ScatterND", "Shape", "Sigmoid",
+    "Sin", "Slice", "Softmax", "Softplus", "Split", "Sqrt", "Squeeze", "Sub",
+    "Tanh", "TopK", "Transpose", "Unsqueeze", "Where",
+})
+
+
+class UnknownFusedOpError(RuntimeError):
+    """A fusion pass emitted an op type the runtime cannot build.
+
+    Deliberately fatal: MultiRoundOptimizer re-raises it instead of logging and
+    continuing, because by the time it is raised the pass has already rewritten
+    the graph — continuing would ship the broken artifact.
+    """
+
+
 @dataclass
 class OptimizationStats:
     """Class for storing optimization statistics."""
@@ -705,6 +738,26 @@ class OptimizationStats:
                 print(f"  - {pattern}: {count}")
 
 
+def _check_no_unknown_op(pass_name, dag_model, nodes_before):
+    """Fail the conversion if a pass just added a node the runtime can't build.
+
+    Only nodes the pass *added* are checked: unknown op types already present in
+    the input graph are the runtime's long-standing "skip and continue" behavior
+    and not this guard's business.
+    """
+    for name in set(dag_model.nodes) - nodes_before:
+        op_type = dag_model.nodes[name].op_type
+        if op_type not in RUNTIME_OPS:
+            raise UnknownFusedOpError(
+                f"pass '{pass_name}' emitted op type '{op_type}', which "
+                f"ops/Ops.hpp::convert_opstring_to_enum does not know. The "
+                f"runtime would resolve it to OpType::UNKNOWN and skip the node "
+                f"(core/runtime.cpp:702), leaving its output uninitialized. "
+                f"Either fold the pattern onto an existing runtime op or add "
+                f"the op to the runtime before registering this pass."
+            )
+
+
 class OptimizationPass:
     def __init__(self, name: str, priority: int = 0):
         self.name = name
@@ -727,7 +780,9 @@ class PatternBasedFusionPass(OptimizationPass):
         """Number of matches fused (0 = graph unchanged)."""
         fused = 0
         for match in self.pattern_matcher(dag_model):
+            before = set(dag_model.nodes)
             if self.folder(dag_model, match):
+                _check_no_unknown_op(self.name, dag_model, before)
                 fused += 1
         return fused
 
@@ -789,6 +844,9 @@ class MultiRoundOptimizer:
                                 )
 
                 except Exception as e:
+                    if isinstance(e, UnknownFusedOpError):
+                        # Not recoverable: the pass already rewrote the graph.
+                        raise
                     if verbose:
                         print(f"  ✗ {opt_pass.name} Fail: {str(e)}")
                     import traceback
@@ -1156,6 +1214,8 @@ class FusionOptimizer:
             )
         )
 
+        # Post-norm residual folding. Needs a single-consumer Add (see the
+        # matcher); it is a no-op on pre-norm graphs, which is most of them.
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_skip_layernorm",
@@ -1165,32 +1225,26 @@ class FusionOptimizer:
             )
         )
 
-        optimizer.register_pass(
-            PatternBasedFusionPass(
-                "fuse_bias_gelu",
-                FusionOptimizer.match_bias_gelu,
-                FusionOptimizer.fold_bias_gelu,
-                priority=85,
-            )
-        )
-
-        optimizer.register_pass(
-            PatternBasedFusionPass(
-                "fuse_embedding_layernorm",
-                FusionOptimizer.match_embedding_layernorm,
-                FusionOptimizer.fold_embedding_layernorm,
-                priority=80,
-            )
-        )
-
-        optimizer.register_pass(
-            PatternBasedFusionPass(
-                "fuse_bert_encoder",
-                FusionOptimizer.match_bert_encoder,
-                FusionOptimizer.fold_bert_encoder,
-                priority=75,
-            )
-        )
+        # fuse_bias_gelu / fuse_embedding_layernorm / fuse_bert_encoder used to
+        # be registered here (priorities 85/80/75). They are deleted rather than
+        # ported:
+        #
+        #   * They emitted BiasGelu / MatMulGelu / EmbeddingLayerNormalization /
+        #     BertEncoder, none of which exist in ops/Ops.hpp. The runtime
+        #     resolves those to OpType::UNKNOWN and skips the node outright
+        #     (core/runtime.cpp:702), so the fold silently deleted real
+        #     computation. _check_no_unknown_op now makes that a hard error.
+        #   * Add(bias) -> Gelu needs no pass at all: Erf is in
+        #     _FUSED_OP_CODES, so the ordinary kernel-fusion engine collapses the
+        #     whole pair (and any gelu decomposition around it) into one
+        #     FusedElemwise dispatch. A dedicated op would only duplicate it.
+        #   * Gather(table) -> LayerNormalization is already one dispatch for the
+        #     lookup; ONNX Runtime's EmbedLayerNormalization also folds position
+        #     and segment embeddings, which this runtime has no form of.
+        #   * BertEncoder fused nothing real: it hardcoded BERT-base
+        #     num_heads/hidden_size, deleted 4 of the ~25 nodes it claimed, and
+        #     rewired the layer output to the layer input. ONNX Runtime's
+        #     transformer optimizer does not fuse whole encoder layers either.
 
         optimizer.register_pass(
             PatternBasedFusionPass(
@@ -3687,363 +3741,93 @@ class FusionOptimizer:
         return True
 
     # ---- SkipLayerNormalization fusion ----
-    # Fuses Add → LayerNormalization into a single SkipLayerNorm op. Pattern:
+    # Folds `Add(x, skip) -> LayerNormalization(A, scale, bias)` into ONE
+    # LayerNormalization node with the skip appended as a 4th input:
     #   input_x ──┐
-    #             ├→ Add → LayerNormalization → output
+    #             ├→ Add → LayerNormalization(X, scale, bias)   ──►
     #   skip ─────┘
-    # The Add adds the residual (skip connection) to the normalized input, and
-    # LayerNormalization does mean/var normalization + scale+bias. This is a
-    # standard Transformer pattern (residual + post-norm).
+    #   LayerNormalization(X, scale, bias, skip)   [= LN(x + skip)]
+    #
+    # Why not a SkipLayerNormalization op: the runtime has no such op and adding
+    # one would mean a second LayerNorm kernel to keep numerically in sync with
+    # the fp16/fp32 pair in ops/LayerNorm.hpp. LayerNormBuffer instead takes an
+    # optional 4th input (see its class comment), so the fused node still
+    # resolves to LAYERNORM through convert_opstring_to_enum and the no-skip
+    # path pays one uniform scalar test per element.
+    #
+    # Soundness — the invariant that matters is the single-consumer one, and it
+    # is what makes this pattern *rare* rather than pervasive:
+    #
+    #   * Post-norm (BERT-style) `LN(x + Attn(x))`: the Add's output feeds only
+    #     the LayerNormalization, so it fuses — and that is exactly ONNX
+    #     Runtime's SkipLayerNormalization pattern.
+    #   * Pre-norm (GPT/Qwen/ViT-style) `x = x + Attn(LN(x))`: the residual
+    #     stream also feeds the NEXT sub-layer's Add, so the Add has two
+    #     consumers and folding it would strand the second one on a tensor
+    #     nobody writes (converter._cleanup_orphan_inputs only rewrites
+    #     pass-through ops, and Add is not one). visual.onnx has 48 Add -> LN
+    #     pairs; 47 are multi-consumer and only 1 is fusable.
+    #
+    # The previous version of this matcher checked none of that, emitted an op
+    # the runtime does not have, and dropped the LayerNormalization's scale and
+    # bias — on visual.onnx it would have deleted 48 Adds and 48 LayerNorms.
     @staticmethod
     def match_skip_layernorm(dag_model):
-        producer = {}
-        for n in dag_model.nodes.values():
-            for o in n.outputs:
-                producer[o["name"]] = n
-        consumers = {}
-        for n in dag_model.nodes.values():
-            for i in n.inputs:
-                consumers.setdefault(i["name"], []).append(n)
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
 
         matches = []
         for ln_node in list(dag_model.nodes.values()):
             if ln_node.op_type != "LayerNormalization":
                 continue
-            # LayerNormalization has 1-3 inputs: X, [Scale], [Bias]
-            if len(ln_node.inputs) < 1:
+            # Exactly X, Scale, Bias. A 2-input LayerNormalization would put the
+            # fused skip at index 2, where the runtime reads bias.
+            if len(ln_node.inputs) != 3:
                 continue
-            x_input_name = ln_node.inputs[0]["name"]
-            add_node = producer.get(x_input_name)
+            add_node = producer.get(ln_node.inputs[0]["name"])
             if add_node is None or add_node.op_type != "Add":
                 continue
-            # Add must have exactly 2 inputs: one is the main path, one is skip
-            if len(add_node.inputs) != 2:
+            if len(add_node.inputs) != 2 or len(add_node.outputs) != 1:
                 continue
-            # Both Add inputs should come from different sources (not both constants)
-            inp0 = add_node.inputs[0]["name"]
-            inp1 = add_node.inputs[1]["name"]
-            # At least one should be a node output (not just an initializer/graph input)
-            has_producer = (inp0 in producer) or (inp1 in producer)
-            if not has_producer:
+            # The Add's output must have exactly one consumer: this
+            # LayerNormalization. Otherwise the residual is still live and
+            # deleting the Add strands it.
+            cons = consumers.get(add_node.outputs[0]["name"], [])
+            if len(cons) != 1 or cons[0][0].name != ln_node.name:
                 continue
 
             matches.append({
                 "add_node": add_node,
                 "ln_node": ln_node,
-                "x_input": add_node.inputs[:],  # both Add inputs
+                # LayerNormalization's own scale/bias are carried through, not
+                # dropped. Order is the runtime's: [X, scale, bias, skip] —
+                # LayerNormBuffer reads weight at binding 2 and bias at 3, so
+                # the skip has to be appended, not inserted. Which Add operand
+                # is the residual does not matter (both are summed), so
+                # inputs[0] stays X.
+                "inputs": ([add_node.inputs[0]] + ln_node.inputs[1:]
+                           + [add_node.inputs[1]]),
                 "output": ln_node.outputs[:],
+                "epsilon": ln_node.attributes.get("epsilon", 1e-5),
+                "axis": ln_node.attributes.get("axis", -1),
             })
         print(f"Found {len(matches)} SkipLayerNorm patterns for potential fusion")
         return matches
 
     @staticmethod
     def fold_skip_layernorm(dag_model, match) -> bool:
-        """Fuse Add → LayerNormalization into SkipLayerNorm."""
+        """Fold Add -> LayerNormalization into a 4-input LayerNormalization."""
         add_node = match["add_node"]
         ln_node = match["ln_node"]
 
-        # Extract LayerNormalization attributes
-        eps = ln_node.attributes.get("epsilon", 1e-5)
-        axis = ln_node.attributes.get("axis", -1)
-        stash_type = ln_node.attributes.get("stash_type", 1)  # default fp32
-
         fused = Node(
-            op_type="SkipLayerNormalization",
+            op_type="LayerNormalization",
             name=f"SkipLayerNorm_fused_{ln_node.name}",
-            attributes={"epsilon": eps, "axis": axis, "stash_type": stash_type},
-            inputs=match["x_input"],  # Add's two inputs: main + skip
-            outputs=match["output"],  # LayerNormalization's output
-        )
-        # Delete source nodes
-        for n in [add_node, ln_node]:
-            if n and n.name in dag_model.nodes:
-                del dag_model.nodes[n.name]
-        dag_model.nodes[fused.name] = fused
-        return True
-
-    # ---- BiasGelu fusion ----
-    # Fuses (MatMul/Add) → Gelu into a single BiasGelu op. Pattern:
-    #   input ──→ MatMul ──→ Add(bias) ──→ Gelu → output
-    # OR simpler: any node → Gelu where the predecessor is a bias add.
-    # This is common in Transformer FFN layers.
-    @staticmethod
-    def match_bias_gelu(dag_model):
-        producer = {}
-        for n in dag_model.nodes.values():
-            for o in n.outputs:
-                producer[o["name"]] = n
-
-        matches = []
-        for gelu_node in list(dag_model.nodes.values()):
-            if gelu_node.op_type != "Gelu":
-                continue
-            if len(gelu_node.inputs) != 1:
-                continue
-            gelu_input_name = gelu_node.inputs[0]["name"]
-            prev_node = producer.get(gelu_input_name)
-            if prev_node is None:
-                continue
-
-            # Case 1: prev is Add with a bias (one input is a constant/initializer)
-            if prev_node.op_type == "Add" and len(prev_node.inputs) == 2:
-                # Check if one input is a constant/initializer (bias)
-                inp0 = prev_node.inputs[0]["name"]
-                inp1 = prev_node.inputs[1]["name"]
-                is_bias0 = (inp0 in dag_model.initializers) or (inp0 not in producer)
-                is_bias1 = (inp1 in dag_model.initializers) or (inp1 not in producer)
-                if is_bias0 or is_bias1:
-                    # Identify the non-bias input (the actual data path)
-                    bias_input = prev_node.inputs[0] if is_bias0 else prev_node.inputs[1]
-                    data_input = prev_node.inputs[1] if is_bias0 else prev_node.inputs[0]
-                    matches.append({
-                        "gelu_node": gelu_node,
-                        "add_node": prev_node,
-                        "data_input": data_input,
-                        "bias_input": bias_input,
-                        "output": gelu_node.outputs[:],
-                    })
-                    continue
-
-            # Case 2: prev is MatMul (no explicit bias, but can still fuse)
-            if prev_node.op_type == "MatMul":
-                matches.append({
-                    "gelu_node": gelu_node,
-                    "matmul_node": prev_node,
-                    "data_input": prev_node.inputs[:],  # both MatMul inputs
-                    "bias_input": None,
-                    "output": gelu_node.outputs[:],
-                })
-
-        print(f"Found {len(matches)} BiasGelu patterns for potential fusion")
-        return matches
-
-    @staticmethod
-    def fold_bias_gelu(dag_model, match) -> bool:
-        """Fuse (MatMul/Add) → Gelu into BiasGelu."""
-        gelu_node = match["gelu_node"]
-        output = match["output"]
-
-        if "add_node" in match:
-            # Add → Gelu case
-            add_node = match["add_node"]
-            fused = Node(
-                op_type="BiasGelu",
-                name=f"BiasGelu_fused_{gelu_node.name}",
-                attributes={},
-                inputs=[match["data_input"], match["bias_input"]],
-                outputs=output,
-            )
-            for n in [add_node, gelu_node]:
-                if n and n.name in dag_model.nodes:
-                    del dag_model.nodes[n.name]
-        elif "matmul_node" in match:
-            # MatMul → Gelu case (no bias)
-            matmul_node = match["matmul_node"]
-            fused = Node(
-                op_type="MatMulGelu",
-                name=f"MatMulGelu_fused_{gelu_node.name}",
-                attributes={},
-                inputs=match["data_input"],
-                outputs=output,
-            )
-            for n in [matmul_node, gelu_node]:
-                if n and n.name in dag_model.nodes:
-                    del dag_model.nodes[n.name]
-        else:
-            return False
-
-        dag_model.nodes[fused.name] = fused
-        return True
-
-    # ---- EmbeddingLayerNormalization fusion ----
-    # Fuses Embedding (Gather from embedding table) → LayerNormalization into a
-    # single EmbeddingLayerNorm op. Pattern:
-    #   input_ids ──→ Gather(embedding_table) ──→ LayerNormalization → output
-    # This is common in BERT/GPT input layers where token embeddings are
-    # immediately normalized. Reduces memory bandwidth by fusing the lookup
-    # and normalization into one kernel.
-    @staticmethod
-    def match_embedding_layernorm(dag_model):
-        producer = {}
-        for n in dag_model.nodes.values():
-            for o in n.outputs:
-                producer[o["name"]] = n
-
-        matches = []
-        for ln_node in list(dag_model.nodes.values()):
-            if ln_node.op_type != "LayerNormalization":
-                continue
-            if len(ln_node.inputs) < 1:
-                continue
-            x_input_name = ln_node.inputs[0]["name"]
-            gather_node = producer.get(x_input_name)
-            if gather_node is None or gather_node.op_type != "Gather":
-                continue
-            # Gather must have 2 inputs: embedding table (initializer) and indices
-            if len(gather_node.inputs) != 2:
-                continue
-            # The first input should be an initializer (the embedding table)
-            emb_table_name = gather_node.inputs[0]["name"]
-            if emb_table_name not in dag_model.initializers:
-                continue
-            # The second input is the token indices
-            indices_input = gather_node.inputs[1]
-
-            matches.append({
-                "gather_node": gather_node,
-                "ln_node": ln_node,
-                "emb_table_name": emb_table_name,
-                "indices_input": indices_input,
-                "output": ln_node.outputs[:],
-            })
-        print(f"Found {len(matches)} EmbeddingLayerNorm patterns for potential fusion")
-        return matches
-
-    @staticmethod
-    def fold_embedding_layernorm(dag_model, match) -> bool:
-        """Fuse Gather → LayerNormalization into EmbeddingLayerNorm."""
-        gather_node = match["gather_node"]
-        ln_node = match["ln_node"]
-
-        eps = ln_node.attributes.get("epsilon", 1e-5)
-        axis = ln_node.attributes.get("axis", -1)
-
-        fused = Node(
-            op_type="EmbeddingLayerNormalization",
-            name=f"EmbLayerNorm_fused_{ln_node.name}",
-            attributes={"epsilon": eps, "axis": axis},
-            inputs=[match["indices_input"], {"name": match["emb_table_name"]}],
+            attributes={"epsilon": match["epsilon"], "axis": match["axis"]},
+            inputs=match["inputs"],
             outputs=match["output"],
         )
-        for n in [gather_node, ln_node]:
-            if n and n.name in dag_model.nodes:
-                del dag_model.nodes[n.name]
-        dag_model.nodes[fused.name] = fused
-        return True
-
-    # ---- BertEncoder fusion (simplified) ----
-    # Fuses a complete BERT encoder layer pattern into a single BertEncoder op.
-    # Simplified pattern (one attention head + FFN):
-    #   input → SelfAttention(Q,K,V) → Add(residual1) → LayerNorm1 →
-    #   FFN(MatMul+Gelu+MatMul) → Add(residual2) → LayerNorm2 → output
-    #
-    # This is a high-level structural fusion that replaces ~20-30 nodes with
-    # a single custom op. The actual implementation recognizes the key
-    # components: attention block, two residual+norm pairs, and an FFN block.
-    #
-    # Note: This is a simplified version that looks for the canonical pattern.
-    # Real BERT models may have variations (different norm positions, extra
-    # bias adds, etc.) that this matcher won't catch.
-    @staticmethod
-    def match_bert_encoder(dag_model):
-        producer = {}
-        for n in dag_model.nodes.values():
-            for o in n.outputs:
-                producer[o["name"]] = n
-        consumers = {}
-        for n in dag_model.nodes.values():
-            for i in n.inputs:
-                consumers.setdefault(i["name"], []).append(n)
-
-        def _single_consumer(name):
-            cs = consumers.get(name, [])
-            return cs[0] if len(cs) == 1 else None
-
-        matches = []
-        # Look for LayerNorm nodes that could be the final norm of an encoder layer
-        for final_ln in list(dag_model.nodes.values()):
-            if final_ln.op_type != "LayerNormalization":
-                continue
-
-            # Walk backwards to find the second residual Add
-            prev = _single_consumer(final_ln.inputs[0]["name"])
-            if prev is None or prev.op_type != "Add":
-                continue
-            add2 = prev
-
-            # One input of Add2 should come from FFN, the other is a skip connection
-            # Try to trace back through FFN (MatMul → Gelu → MatMul pattern)
-            ffn_input_name = None
-            for inp in add2.inputs:
-                inp_name = inp["name"]
-                prod = producer.get(inp_name)
-                if prod is not None and prod.op_type == "MatMul":
-                    # This might be the FFN output MatMul
-                    # Check if its input comes from Gelu
-                    gelu_candidate = producer.get(prod.inputs[0]["name"])
-                    if gelu_candidate is not None and gelu_candidate.op_type == "Gelu":
-                        # Found FFN pattern: Gelu → MatMul
-                        # Now check if Gelu's input comes from another MatMul
-                        ffn_matmul1 = producer.get(gelu_candidate.inputs[0]["name"])
-                        if ffn_matmul1 is not None and ffn_matmul1.op_type == "MatMul":
-                            ffn_input_name = ffn_matmul1.inputs[0]["name"]
-                            break
-
-            if ffn_input_name is None:
-                continue
-
-            # The other input of Add2 is the skip connection from first LayerNorm
-            skip_from_first_ln = None
-            for inp in add2.inputs:
-                if inp["name"] != ffn_input_name.split("->")[0] if "->" in str(ffn_input_name) else inp["name"]:
-                    # Rough heuristic: the non-FFN input should trace back to first LN
-                    skip_prod = producer.get(inp["name"])
-                    if skip_prod is not None and skip_prod.op_type == "LayerNormalization":
-                        skip_from_first_ln = skip_prod
-                        break
-
-            if skip_from_first_ln is None:
-                continue
-
-            # Try to find attention block before first LN
-            # First LN's input should come from Add(residual from attention)
-            first_ln_input = skip_from_first_ln.inputs[0]["name"]
-            add1 = producer.get(first_ln_input)
-            if add1 is None or add1.op_type != "Add":
-                continue
-
-            # One input of Add1 should come from attention (MatMul pattern)
-            attn_found = False
-            for inp in add1.inputs:
-                inp_name = inp["name"]
-                prod = producer.get(inp_name)
-                if prod is not None and prod.op_type == "MatMul":
-                    # Check if this MatMul has Q@K^T pattern (two MatMul inputs)
-                    # This is a rough heuristic; real attention has Softmax between them
-                    attn_found = True
-                    break
-
-            if not attn_found:
-                continue
-
-            # Collect all nodes in this encoder layer for deletion
-            # This is a simplified approach — in reality we'd need to trace the
-            # exact subgraph. For now, just mark the key nodes.
-            nodes_to_delete = [add1, skip_from_first_ln, add2, final_ln]
-
-            matches.append({
-                "input": add1.inputs[0],  # The main input to the encoder layer
-                "output": final_ln.outputs[:],
-                "nodes_to_delete": nodes_to_delete,
-                "has_attention": True,
-                "has_ffn": True,
-            })
-
-        print(f"Found {len(matches)} BertEncoder patterns for potential fusion")
-        return matches
-
-    @staticmethod
-    def fold_bert_encoder(dag_model, match) -> bool:
-        """Fuse attention + FFN + residuals into BertEncoder."""
-        fused = Node(
-            op_type="BertEncoder",
-            name=f"BertEncoder_fused_{len(dag_model.nodes)}",
-            attributes={"num_heads": 12, "hidden_size": 768},  # Default BERT-base
-            inputs=[match["input"]],
-            outputs=match["output"],
-        )
-        for n in match["nodes_to_delete"]:
-            if n and n.name in dag_model.nodes:
+        for n in (add_node, ln_node):
+            if n is not None and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
         dag_model.nodes[fused.name] = fused
         return True
@@ -4565,6 +4349,14 @@ class FusionOptimizer:
     _FUSED_OP_CODES = {
         "Add": 1, "Sub": 2, "Mul": 3, "Div": 4, "Pow": 5,
         "Sqrt": 6, "Sigmoid": 7, "Neg": 8, "Exp": 9, "Tanh": 10,
+        # Erf (OP_ERF=13): the primitive exact GELU is built from. Exports write
+        # gelu as 0.5*x*(1+erf(x/sqrt(2))) rather than a Gelu node, so without
+        # Erf the chain fuser stops at the erf and the rest of the FFN's
+        # pointwise tail stays a separate dispatch each. Adding it here is what
+        # makes an Add(bias) -> Gelu pair fold into ONE dispatch — which is the
+        # job the (deleted) fuse_bias_gelu pass was trying to do with an op the
+        # runtime does not have.
+        "Erf": 13,
         # Cast (OP_CAST=11) is now chainable: fusion across a dtype-crossing
         # Cast. The shader computes in fp32 registers and loads each leaf input
         # at its native dtype (per-input dtype flag in the program SSBO), so a

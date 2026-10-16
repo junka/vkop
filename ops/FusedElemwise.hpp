@@ -37,9 +37,10 @@ namespace ops {
 // limit for long chains.
 //
 // Op-code set (mirrors shaders/buffer/fused_elemwise.comp):
-//   ADD, SUB, MUL, DIV, POW (binary); SQRT, SIGMOID, NEG, EXP, TANH, CAST
-//   (unary). Operand encoding: 0..MAX_REGS-1 = register; 100..100+nScalars-1
-//   = scalar constant. Inputs are preloaded into reg[0..nInputs-1].
+//   ADD, SUB, MUL, DIV, POW (binary); SQRT, SIGMOID, NEG, EXP, TANH, ERF,
+//   CAST (unary). Operand encoding: 0..MAX_REGS-1 = register;
+//   100..100+nScalars-1 = scalar constant. Inputs are preloaded into
+//   reg[0..nInputs-1].
 //
 // The converter (model/pypi/onnx2vkop/optimizer.py fuse_elemwise_chain)
 // emits a FUSED_ELEMWISE node whose attributes encode the chain. This op
@@ -62,6 +63,11 @@ enum class FusedOp {
     TANH = 10,
     CAST = 11,
     WHERE = 12,
+    // Exact GELU's missing primitive: ONNX exports gelu(x) as
+    // 0.5*x*(1+erf(x/sqrt(2))) (TorchScript does; tanh-approx exports use
+    // TANH, already opcode 10). Without ERF those chains break at the erf and
+    // the einsum around it stays unfolded — visual.onnx carries 4 such nodes.
+    ERF = 13,
 };
 
 struct alignas(16) FusedElemwisePC {

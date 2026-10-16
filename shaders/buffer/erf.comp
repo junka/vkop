@@ -23,19 +23,7 @@ layout(push_constant) uniform PC_uPC {
     int _pad;
 } uPC;
 
-float apply(float x) {
-    const float a1 =  0.254829592;
-    const float a2 = -0.284496736;
-    const float a3 =  1.421413741;
-    const float a4 = -1.453152027;
-    const float a5 =  1.061405429;
-    const float p  =  0.3275911;
-    float sign = sign(x);
-    x = abs(x);
-    float t = 1.0 / (1.0 + p * x);
-    float y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp(-x * x);
-    return sign * y;
-}
+float apply(float x) { return buffer_erf(x); }
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);

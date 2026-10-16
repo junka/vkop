@@ -97,6 +97,27 @@ int broadcast_index(int out_linear, IArr8 out_dims, IArr8 in_dims, int rank) {
     return nd_to_linear8(ic, in_dims, rank);
 }
 
+// ---- Erf (Abramowitz & Stegun 7.1.26, max abs error 1.5e-7) ----
+// Lives here because two shaders need the SAME erf: the standalone Erf op
+// (shaders/buffer/erf.comp) and the fused-elementwise chain, which needs it as
+// the GELU primitive (0.5*x*(1+erf(x/sqrt(2)))). GLSL's built-in erf() is not
+// available on this toolchain (glslang rejects it at `#version 450`), and two
+// hand-copied polynomials would let a fused chain and an unfused one disagree
+// on the same model.
+float buffer_erf(float x) {
+    const float a1 =  0.254829592;
+    const float a2 = -0.284496736;
+    const float a3 =  1.421413741;
+    const float a4 = -1.453152027;
+    const float a5 =  1.061405429;
+    const float p  =  0.3275911;
+    float sign = sign(x);
+    x = abs(x);
+    float t = 1.0 / (1.0 + p * x);
+    float y = 1.0 - ((((a5 * t + a4) * t + a3) * t + a2) * t + a1) * t * exp(-x * x);
+    return sign * y;
+}
+
 // ---- GPU-driven shape-meta (Phase 3): load dims from a bound int64 SSBO ----
 // When a tensor carries shape_ssbo_ (its producing shape as an int64 SSBO),
 // downstream consumers read the REAL dims from the SSBO instead of the

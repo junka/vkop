@@ -108,6 +108,11 @@ struct alignas(16) LayerNormPC {
     float eps;
     int inner_size;
     int outer_size;
+    // 1 = a 4th input (binding 4) is bound and added to x before the
+    // mean/variance reduce: LayerNorm(x + skip). The converter's
+    // fuse_skip_layernorm folds the Add of a post-norm residual block into
+    // this op, so no separate Add dispatch and no round-trip of x+skip.
+    int has_skip;
 };
 
 struct alignas(16) ReducePC {
