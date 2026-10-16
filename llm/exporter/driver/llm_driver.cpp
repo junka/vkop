@@ -34,12 +34,14 @@
 #include "include/logger.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
+#include "kv_cache.hpp"
 
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::ITensor;
 using vkop::core::Runtime;
 using vkop::core::as_tensor;
+using vkop::export_::KVCache;
 
 namespace {
 
@@ -154,10 +156,14 @@ void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
 // Fill + upload every input for one round from <round_dir>/input_names.txt.
 // Each round's KV-cache past_key_values_{i} grows (kv_len increments), so we
 // re-resize + recreate the SSBO + re-upload every round.
+//
+// `skip_kv` drops the past_key_values_* inputs: in the cache form the caller
+// stages those itself, at the cache's own row pitch (see stage_cache_history).
 void load_round_inputs(const std::shared_ptr<Runtime>& rt,
                        const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
                        const std::string& round_dir,
-                       std::vector<std::string>* input_names_out) {
+                       std::vector<std::string>* input_names_out,
+                       bool skip_kv = false) {
     std::ifstream nf(round_dir + "/input_names.txt");
     if (!nf) throw std::runtime_error("no input_names.txt in " + round_dir);
     std::vector<std::string> names;
@@ -166,11 +172,99 @@ void load_round_inputs(const std::shared_ptr<Runtime>& rt,
         if (!line.empty()) names.push_back(line);
     }
     for (const auto& name : names) {
+        if (skip_kv && name.rfind("past_key_values_", 0) == 0) continue;
         NpyArray arr = load_npy(round_dir + "/" + name + ".npy");
         fill_input(rt, name, arr);
         upload_input(cmdpool, rt->GetInput(name));
     }
     if (input_names_out) *input_names_out = names;
+}
+
+// Does the converted model carry the fused KV-cache form (i.e. each layer's
+// present_key_values_i is written by the attention op itself, aliasing the
+// preallocated past, rather than by the graph's Gather/Concat/Unsqueeze
+// rotation)?
+//
+// Asking the loaded graph would need a runtime accessor for "is there an
+// Attention node with has_cache set", which does not exist, so read it off the
+// file instead: the converter emits the `has_cache` attribute only when
+// fuse_kv_cache_append fired, and a vkopbin serialises the whole graph — node
+// names and attributes — ahead of the weight blob. Verified on an 814 MB model:
+// all node metadata lands in the first megabyte, so an 8 MB header read is both
+// sufficient and cheap. (The roadmap's own check for a stale binary is the same
+// `grep has_cache`.)
+//
+// The obvious-looking alternative does NOT work: present_key_values_0 is a graph
+// output in *both* forms, since the rotation's Unsqueeze/Concat produces it too,
+// so keying on that flags every model.
+bool model_has_cache_form(const std::string& model_path) {
+    std::ifstream f(model_path, std::ios::binary);
+    if (!f) return false;
+    constexpr std::size_t kScan = 8u << 20;
+    std::vector<char> buf(kScan);
+    f.read(buf.data(), static_cast<std::streamsize>(kScan));
+    const std::size_t n = static_cast<std::size_t>(f.gcount());
+    const std::string needle = "has_cache";
+    return std::search(buf.begin(), buf.begin() + n, needle.begin(),
+                       needle.end()) != buf.begin() + n;
+}
+
+// Stage one layer's history into its preallocated cache buffer.
+//
+// The reference bundle hands us the history the way the rotation-form graph
+// wants it: <round_dir>/past_key_values_<layer>.npy, shape [1,2,nkv,kv_len,hd],
+// i.e. rows packed at pitch kv_len. The cache is [1,2,nkv,cap,hd] and the
+// kernel reads it at pitch `cap` (AttentionBuffer::row_capacity takes the row
+// pitch from the bound buffer's capacity, never from the tensor's logical
+// kv_len) — so the rows have to be laid out at stride cap. Within one (c,h)
+// plane both layouts are contiguous in j, so each plane is one memcpy; only the
+// plane stride differs. Getting this wrong does not crash, it reads the wrong
+// K/V rows, which is exactly what this driver exists to catch.
+//
+// The staging tensor is resized to the cap-shaped logical length so its CPU
+// staging is cap-sized (fillToCPU copies num_elements() worth), uploaded, and
+// then handed back to the true kv_len by the caller via KVCache::resume_from.
+// Returns the history length.
+int stage_cache_history(const std::shared_ptr<Runtime>& rt,
+                        const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
+                        const std::string& round_dir, int layer, int cap) {
+    const std::string name = "past_key_values_" + std::to_string(layer);
+    NpyArray arr = load_npy(round_dir + "/" + name + ".npy");
+    if (arr.shape.size() != 5) {
+        throw std::runtime_error(name + ": expected a rank-5 [1,2,nkv,kv,hd] npy");
+    }
+    const int nkv = static_cast<int>(arr.shape[2]);
+    const int kv_len = static_cast<int>(arr.shape[3]);
+    const int hd = static_cast<int>(arr.shape[4]);
+    if (kv_len > cap) {
+        throw std::runtime_error(name + ": kv_len " + std::to_string(kv_len) +
+                                 " exceeds the cache cap " + std::to_string(cap) +
+                                 " (raise VKOP_KV_MAX)");
+    }
+    const uint16_t* src = reinterpret_cast<const uint16_t*>(arr.data.data());
+    // Zero the staging so the untouched tail of the cap-sized buffer is
+    // deterministic; the kernel never reads rows >= kv_len.
+    std::vector<uint16_t> stage(static_cast<size_t>(2) * nkv * cap * hd, 0);
+    // Index the K and V halves of every head as one flat run of 2*nkv blocks.
+    // These flatten the same way in both layouts — (c,h) then (j,d) — so the
+    // only difference is the block stride, cap*hd against kv_len*hd. Each block
+    // is kv_len rows of hd, contiguous in both, so it is a single memcpy.
+    const size_t src_stride = static_cast<size_t>(kv_len) * hd;
+    const size_t dst_stride = static_cast<size_t>(cap) * hd;
+    const size_t block = src_stride; // kv_len * hd elements
+    for (int blk = 0; blk < 2 * nkv; ++blk) {
+        std::memcpy(stage.data() + blk * dst_stride, src + blk * src_stride,
+                    block * sizeof(uint16_t));
+    }
+    // Row-major [cap][hd] == [kv_len][hd] then a tail: the block's own memory
+    // order does not change, only where the next block starts. That is what
+    // makes the layout a relayout and not a transpose.
+    rt->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(nkv),
+                           static_cast<uint32_t>(cap), static_cast<uint32_t>(hd)});
+    auto typed = as_tensor<uint16_t>(rt->GetInput(name));
+    typed->fillToCPU(stage.data());
+    typed->copyToGPU(cmdpool);
+    return kv_len;
 }
 
 // Compare the runtime's 'logits' output against <round_dir>/reference_logits.npy.
@@ -268,15 +362,89 @@ int main(int argc, char** argv) {
     }
     std::printf("Found %zu round(s)\n", rounds.size());
 
+    // ---- KV-cache form ----------------------------------------------------
+    // The converted model may carry the fused KV-cache form (present_key_values_i
+    // graph outputs aliasing a preallocated past). llm_driver's normal path
+    // cannot exercise that: it resizes past_key_values_i to the round's own
+    // kv_len, so the buffer pitch equals the logical length and the kernel's
+    // src_stride/dst_stride are degenerate. VKOP_KV_CACHE=1 preallocates each
+    // layer's cache at VKOP_KV_MAX (default 8192) instead and stages the history
+    // at that pitch — the cap > kv_len case, on the real 28-layer model against
+    // the real reference logits.
+    //
+    // Opt-in, and a no-op when the model has no cache form, so the default gate
+    // is untouched. Note the reference rounds are independent states (round0
+    // past=0, round1 past=1024, ...), not a chain, so the history is re-staged
+    // from the npy each round rather than carried across rounds by feedback();
+    // this covers the cache-form *kernel* path, not cross-round persistence.
+    std::unique_ptr<KVCache> kv;
+    int cache_cap = 0;
+    const bool cache_form = model_has_cache_form(model_path);
+    const bool cache_wanted = std::getenv("VKOP_KV_CACHE") != nullptr;
+    const bool cache_mode = cache_form && cache_wanted;
+    if (cache_wanted && !cache_form) {
+        // Refuse rather than mis-run: on the rotation form the driver's default
+        // path is already correct, and preallocating here would feed the
+        // rotation's contiguous Gather reads a cap-pitched buffer.
+        std::fprintf(stderr,
+                     "[kvcache] VKOP_KV_CACHE=1 but %s has no has_cache attribute"
+                     " (it is the rotation form) — rerun without the flag\n",
+                     model_path.c_str());
+        return -1;
+    }
+    if (cache_form && !cache_wanted) {
+        std::printf("[kvcache] model has the cache form; set VKOP_KV_CACHE=1 to "
+                    "run it (preallocated past at VKOP_KV_MAX, default 8192)\n");
+    }
+    if (cache_mode) {
+        const std::string rd0 =
+            (rounds[0] < 0) ? dump_dir : dump_dir + "/round" + std::to_string(rounds[0]);
+        std::ifstream nf(rd0 + "/input_names.txt");
+        std::string ln;
+        int nlayers = 0;
+        while (std::getline(nf, ln)) {
+            if (ln.rfind("past_key_values_", 0) == 0) ++nlayers;
+        }
+        if (nlayers == 0) {
+            std::fprintf(stderr, "[kvcache] no past_key_values_* inputs to cache\n");
+            return -1;
+        }
+        NpyArray p0 = load_npy(rd0 + "/past_key_values_0.npy");
+        const int nkv = static_cast<int>(p0.shape[2]);
+        const int hd = static_cast<int>(p0.shape[4]);
+        cache_cap = std::getenv("VKOP_KV_MAX")
+                        ? std::atoi(std::getenv("VKOP_KV_MAX"))
+                        : 8192;
+        kv = std::make_unique<KVCache>(rt, cmdpool, nlayers, nkv, hd, cache_cap,
+                                       vkop::core::ElemKind::kFloat16);
+        std::printf("[kvcache] layers=%d nkv=%d hd=%d cap=%d\n", nlayers, nkv, hd,
+                    cache_cap);
+    }
+
     int n_match = 0, n_round = 0;
     for (int t : rounds) {
         std::string rd = (t < 0) ? dump_dir : dump_dir + "/round" + std::to_string(t);
         std::printf("\n=== round%d (%s) ===\n", n_round, rd.c_str());
         try {
-            load_round_inputs(rt, cmdpool, rd, nullptr);
+            load_round_inputs(rt, cmdpool, rd, nullptr, /*skip_kv=*/cache_mode);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "load_round_inputs failed: %s\n", e.what());
             return -1;
+        }
+        if (kv) {
+            try {
+                int past_len = 0;
+                for (int i = 0; i < kv->nlayers(); ++i) {
+                    past_len = stage_cache_history(rt, cmdpool, rd, i, cache_cap);
+                }
+                // Logical lengths back to the true history; the bytes stay put.
+                kv->resume_from(past_len);
+                std::printf("[kvcache] staged past_len=%d at pitch %d\n", past_len,
+                            cache_cap);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[kvcache] staging failed: %s\n", e.what());
+                return -1;
+            }
         }
         // Optional upload-verify: readback inputs_embeds + past_key_values_0
         // and compare their first elements / norms against the npy source, to
@@ -401,6 +569,13 @@ int main(int argc, char** argv) {
                 if (fr > mv) { mv = fr; argmax_ref = int(i); }
             }
             if (argmax_out == argmax_ref) ++n_match;
+        }
+        // present→past. The bytes are already in place (the two are one buffer);
+        // this only carries the logical length forward, which is what a chained
+        // caller would need. Here the next round re-stages from its own npy, so
+        // it is exercised for its side effects on the shape, not chained.
+        if (kv) {
+            std::printf("[kvcache] feedback -> past_len=%d\n", kv->feedback());
         }
         ++n_round;
         fflush(stdout);
