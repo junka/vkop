@@ -1158,6 +1158,24 @@ class FusionOptimizer:
 
         optimizer.register_pass(
             PatternBasedFusionPass(
+                "fuse_skip_layernorm",
+                FusionOptimizer.match_skip_layernorm,
+                FusionOptimizer.fold_skip_layernorm,
+                priority=90,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_bias_gelu",
+                FusionOptimizer.match_bias_gelu,
+                FusionOptimizer.fold_bias_gelu,
+                priority=85,
+            )
+        )
+
+        optimizer.register_pass(
+            PatternBasedFusionPass(
                 "prune_and_materialize",
                 FusionOptimizer.match_prune_and_materialize,
                 FusionOptimizer.fold_prune_and_materialize,
@@ -3647,6 +3665,175 @@ class FusionOptimizer:
         for n in match["nodes_to_delete"]:
             if n and n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- SkipLayerNormalization fusion ----
+    # Fuses Add → LayerNormalization into a single SkipLayerNorm op. Pattern:
+    #   input_x ──┐
+    #             ├→ Add → LayerNormalization → output
+    #   skip ─────┘
+    # The Add adds the residual (skip connection) to the normalized input, and
+    # LayerNormalization does mean/var normalization + scale+bias. This is a
+    # standard Transformer pattern (residual + post-norm).
+    @staticmethod
+    def match_skip_layernorm(dag_model):
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        consumers = {}
+        for n in dag_model.nodes.values():
+            for i in n.inputs:
+                consumers.setdefault(i["name"], []).append(n)
+
+        matches = []
+        for ln_node in list(dag_model.nodes.values()):
+            if ln_node.op_type != "LayerNormalization":
+                continue
+            # LayerNormalization has 1-3 inputs: X, [Scale], [Bias]
+            if len(ln_node.inputs) < 1:
+                continue
+            x_input_name = ln_node.inputs[0]["name"]
+            add_node = producer.get(x_input_name)
+            if add_node is None or add_node.op_type != "Add":
+                continue
+            # Add must have exactly 2 inputs: one is the main path, one is skip
+            if len(add_node.inputs) != 2:
+                continue
+            # Both Add inputs should come from different sources (not both constants)
+            inp0 = add_node.inputs[0]["name"]
+            inp1 = add_node.inputs[1]["name"]
+            # At least one should be a node output (not just an initializer/graph input)
+            has_producer = (inp0 in producer) or (inp1 in producer)
+            if not has_producer:
+                continue
+
+            matches.append({
+                "add_node": add_node,
+                "ln_node": ln_node,
+                "x_input": add_node.inputs[:],  # both Add inputs
+                "output": ln_node.outputs[:],
+            })
+        print(f"Found {len(matches)} SkipLayerNorm patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_skip_layernorm(dag_model, match) -> bool:
+        """Fuse Add → LayerNormalization into SkipLayerNorm."""
+        add_node = match["add_node"]
+        ln_node = match["ln_node"]
+
+        # Extract LayerNormalization attributes
+        eps = ln_node.attributes.get("epsilon", 1e-5)
+        axis = ln_node.attributes.get("axis", -1)
+        stash_type = ln_node.attributes.get("stash_type", 1)  # default fp32
+
+        fused = Node(
+            op_type="SkipLayerNormalization",
+            name=f"SkipLayerNorm_fused_{ln_node.name}",
+            attributes={"epsilon": eps, "axis": axis, "stash_type": stash_type},
+            inputs=match["x_input"],  # Add's two inputs: main + skip
+            outputs=match["output"],  # LayerNormalization's output
+        )
+        # Delete source nodes
+        for n in [add_node, ln_node]:
+            if n and n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
+    # ---- BiasGelu fusion ----
+    # Fuses (MatMul/Add) → Gelu into a single BiasGelu op. Pattern:
+    #   input ──→ MatMul ──→ Add(bias) ──→ Gelu → output
+    # OR simpler: any node → Gelu where the predecessor is a bias add.
+    # This is common in Transformer FFN layers.
+    @staticmethod
+    def match_bias_gelu(dag_model):
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+
+        matches = []
+        for gelu_node in list(dag_model.nodes.values()):
+            if gelu_node.op_type != "Gelu":
+                continue
+            if len(gelu_node.inputs) != 1:
+                continue
+            gelu_input_name = gelu_node.inputs[0]["name"]
+            prev_node = producer.get(gelu_input_name)
+            if prev_node is None:
+                continue
+
+            # Case 1: prev is Add with a bias (one input is a constant/initializer)
+            if prev_node.op_type == "Add" and len(prev_node.inputs) == 2:
+                # Check if one input is a constant/initializer (bias)
+                inp0 = prev_node.inputs[0]["name"]
+                inp1 = prev_node.inputs[1]["name"]
+                is_bias0 = (inp0 in dag_model.initializers) or (inp0 not in producer)
+                is_bias1 = (inp1 in dag_model.initializers) or (inp1 not in producer)
+                if is_bias0 or is_bias1:
+                    # Identify the non-bias input (the actual data path)
+                    bias_input = prev_node.inputs[0] if is_bias0 else prev_node.inputs[1]
+                    data_input = prev_node.inputs[1] if is_bias0 else prev_node.inputs[0]
+                    matches.append({
+                        "gelu_node": gelu_node,
+                        "add_node": prev_node,
+                        "data_input": data_input,
+                        "bias_input": bias_input,
+                        "output": gelu_node.outputs[:],
+                    })
+                    continue
+
+            # Case 2: prev is MatMul (no explicit bias, but can still fuse)
+            if prev_node.op_type == "MatMul":
+                matches.append({
+                    "gelu_node": gelu_node,
+                    "matmul_node": prev_node,
+                    "data_input": prev_node.inputs[:],  # both MatMul inputs
+                    "bias_input": None,
+                    "output": gelu_node.outputs[:],
+                })
+
+        print(f"Found {len(matches)} BiasGelu patterns for potential fusion")
+        return matches
+
+    @staticmethod
+    def fold_bias_gelu(dag_model, match) -> bool:
+        """Fuse (MatMul/Add) → Gelu into BiasGelu."""
+        gelu_node = match["gelu_node"]
+        output = match["output"]
+
+        if "add_node" in match:
+            # Add → Gelu case
+            add_node = match["add_node"]
+            fused = Node(
+                op_type="BiasGelu",
+                name=f"BiasGelu_fused_{gelu_node.name}",
+                attributes={},
+                inputs=[match["data_input"], match["bias_input"]],
+                outputs=output,
+            )
+            for n in [add_node, gelu_node]:
+                if n and n.name in dag_model.nodes:
+                    del dag_model.nodes[n.name]
+        elif "matmul_node" in match:
+            # MatMul → Gelu case (no bias)
+            matmul_node = match["matmul_node"]
+            fused = Node(
+                op_type="MatMulGelu",
+                name=f"MatMulGelu_fused_{gelu_node.name}",
+                attributes={},
+                inputs=match["data_input"],
+                outputs=output,
+            )
+            for n in [matmul_node, gelu_node]:
+                if n and n.name in dag_model.nodes:
+                    del dag_model.nodes[n.name]
+        else:
+            return False
+
         dag_model.nodes[fused.name] = fused
         return True
 
