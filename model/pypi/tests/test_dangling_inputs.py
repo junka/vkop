@@ -46,6 +46,24 @@ def test_writer_reports_stranding_at_write_time(tmp_path, capsys):
     assert "add <- gone" in out
 
 
+def test_writer_tolerates_an_input_ref_with_no_dims(tmp_path):
+    """A name-only input ref must serialize as an empty ShapeRef.
+
+    "No dims recorded" is a legitimate state the reader already understands —
+    the parser writes "shape": [] for a tensor it cannot resolve. A hard
+    subscript on the key instead made one such ref fatal: KeyError('shape') in
+    dag.build_shape_vec, raised at *write* time, after the whole conversion, with
+    no .vkopbin produced. The Gemm -> MatMul(+Add) lowering was the caller that
+    hit it (104 refs on visual.onnx).
+    """
+    m = _model(False)
+    m.nodes["add"].inputs[0] = {"name": "m"}  # no shape/dtype/value_dynamic
+    m.build_dependencies()
+    out = tmp_path / "nodims.vkopbin"
+    m.save_to_binary(str(out))
+    assert out.stat().st_size > 0
+
+
 def test_the_pass_that_strands_it_is_named(capsys):
     class _StrandPass(OptimizationPass):
         """Deletes a producer and forgets to rebind the consumer that reads it."""

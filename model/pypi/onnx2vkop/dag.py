@@ -605,7 +605,12 @@ class DAGBasedModel:
             offs = []
             for item in shapes:
                 name = item["name"] if isinstance(item, dict) else str(item)
-                dims = item["shape"] if isinstance(item, dict) else []
+                # .get(), not []: a tensor reference may legitimately carry no
+                # dims (the parser writes "shape": [] for an input tensor it
+                # cannot find), and dtype/value_dynamic above are already
+                # read tolerantly. A hard subscript here turned one name-only
+                # reference into an unsavable model.
+                dims = (item.get("shape") or []) if isinstance(item, dict) else []
                 dtype = item.get("dtype", "") if isinstance(item, dict) else ""
                 value_dynamic = bool(item.get("value_dynamic", False)) if isinstance(item, dict) else False
                 dtype = _dtype_to_str(dtype)

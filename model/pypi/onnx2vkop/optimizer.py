@@ -2595,11 +2595,22 @@ class FusionOptimizer:
                 inputs=[node.inputs[0], node.inputs[1]],
                 outputs=[mm_out],
             )
+            # The Add's first operand references the MatMul's output. Node input
+            # dicts are {name, shape, dtype, value_dynamic} everywhere else (the
+            # parser builds them that way, and writes an explicit "shape": [] for
+            # a tensor it cannot resolve), so mirror mm_out rather than passing a
+            # bare {"name": ...}: that ref saved an empty ShapeRef, and
+            # dag.build_shape_vec then raised KeyError('shape') *at save time* --
+            # after the whole 4-minute conversion, with no .vkopbin written.
+            mm_in = {"name": mm_out_name,
+                     "shape": list(mm_out["shape"]),
+                     "dtype": mm_out["dtype"],
+                     "value_dynamic": mm_out["value_dynamic"]}
             add_node = Node(
                 op_type="Add",
                 name=f"{node.name}_bias",
                 attributes={},
-                inputs=[{"name": mm_out_name}, node.inputs[2]],
+                inputs=[mm_in, node.inputs[2]],
                 outputs=[orig_output],
             )
             dag_model.nodes[mm_node.name] = mm_node
