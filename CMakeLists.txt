@@ -542,6 +542,13 @@ if (ENABLE_LLM_CHAT)
     add_executable(visual_probe llm/exporter/driver/visual_probe.cpp)
     target_link_libraries(visual_probe PRIVATE vkop vload)
 
+    # KV-cache probe: runs a minimal attention+cache graph (see
+    # /tmp/gen_cache_graph.py) for several rounds so the Attention op's cache
+    # form is actually executed. VKOP_NO_FUSIONS=fuse_kv_cache_append on the
+    # same binary is the rotation-vs-cache-form A/B.
+    add_executable(cache_probe llm/exporter/driver/cache_probe.cpp)
+    target_link_libraries(cache_probe PRIVATE vkop vload)
+
     # get_rope_index probe: verifies the C++ MRoPE position-id port against a
     # HF reference dump (dump_rope_ref.py). Header-only logic; links vkop only
     # because image_preproc.hpp -> core/Tensor.hpp pulls in VulkanLib symbols.
