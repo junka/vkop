@@ -71,10 +71,11 @@ class Gather : public Operator {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
+        auto i64 = resolve_spv("buffer_gather_int64", buffer_gather_int64_spv,
+                               buffer_gather_int64_spv_len);
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
-            m_dev_->getLogicalDevice(), types_, pc_size_,
-            reinterpret_cast<const uint32_t *>(buffer_gather_int64_spv),
-            buffer_gather_int64_spv_len, use_uab, required_subgroup_size_);
+            m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
+            use_uab, required_subgroup_size_);
         for (auto &ds : m_ds_int64_) {
             ds = pipeline_int64_->allocDescriptorSets();
         }

@@ -16,6 +16,9 @@
 #include "ops/Ops.hpp"
 
 namespace vkop {
+namespace core {
+class ShaderArchive;
+}
 namespace ops {
 
 // VKOP_HOST_SHAPE evaluates the int64 shape/metadata chain entirely on the
@@ -78,12 +81,60 @@ class Operator {
     Operator(Operator &&) = delete;
     Operator &operator=(Operator &&) = delete;
 
+    // Replace the SPIR-V this op builds its pipeline from, called by the
+    // Runtime after create_from_type() and before set_runtime_device(). The
+    // default wiring lets each op's ctor point spv_ at an `extern
+    // unsigned char X_spv[]` C array baked into libvkop at build time; a
+    // deployment that ships SPIR-V in an external vkop_shaders.bin archive
+    // instead calls this to swap in the mapped blob range. Passing nullptr
+    // leaves the ctor-assigned pointer alone (used when the archive does not
+    // have an entry for this op — e.g. an int64 shape-meta path).
+    //
+    // `spv_len == 0` is the "no shader" sentinel (a PimplFacade shell whose
+    // impl_ owns the real pipeline). Both fields are updated together so a
+    // caller can't leave spv_ and spv_len_ in disagreeing states.
+    virtual void override_spv(const uint32_t *spv, uint32_t spv_len) {
+        if (!spv || spv_len == 0) {
+            return;
+        }
+        spv_ = reinterpret_cast<uint8_t *>(const_cast<uint32_t *>(spv));
+        spv_len_ = spv_len;
+    }
+
+    // Ops whose set_runtime_device override builds secondary pipelines
+    // (Matmul's coop/pack/coop_i8, Conv2d's pack) call this to reach the
+    // archive from inside those builds. Runtime calls set_shader_archive()
+    // immediately after create_from_type(), before any override_spv() or
+    // set_runtime_device(), so an archive is available whenever the op needs
+    // one. Null leaves the op to use its embedded externs, which is what
+    // happens in the default (non-stripped) build.
+    virtual void set_shader_archive(const vkop::core::ShaderArchive *archive) {
+        shader_archive_ = archive;
+    }
+
     virtual void
     set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                        const std::shared_ptr<VulkanCommandPool> &cmdpool,
                        VkPipelineCache cache = VK_NULL_HANDLE) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
+        // A stub array (unsigned char X_spv[1] = {0}; X_spv_len = 0) is what
+        // spv_to_c.py writes when VKOP_STRIP_BUILTIN_SHADERS=ON. If we reach
+        // here with a non-null spv_ pointer but zero length, the archive was
+        // not loaded to override it, so pipeline_ would stay null and every
+        // later submit() would crash on pipeline_->allocDescriptorSets().
+        // Fail with an actionable message at load time instead. PimplFacade
+        // passes spv_=nullptr, len=0 (not a stub) and is unaffected.
+        if (spv_len_ == 0 && spv_ != nullptr) {
+            throw std::runtime_error(
+                "vkop: " +
+                (name_.empty() ? std::string(convert_optype_to_string(type_))
+                               : name_) +
+                " has a stubbed SPIR-V array (this libvkop was built with "
+                "VKOP_STRIP_BUILTIN_SHADERS=ON). Set VKOP_SHADER_ARCHIVE="
+                "<path to vkop_shaders.bin> before LoadModel so the archive "
+                "can populate shaders at runtime.");
+        }
         if (spv_len_ > 0 && spv_) {
             bool use_uab = update_after_bind_ &&
                            m_dev_->is_support_descriptor_update_after_bind();
@@ -409,10 +460,26 @@ class Operator {
     size_t pc_size_ = 0;
     uint8_t *spv_ = nullptr;
     uint32_t spv_len_ = 0;
+    // When Runtime loaded a vkop_shaders.bin archive, this points at it so
+    // ops with secondary pipelines (Matmul/Conv2d) can consult it inside
+    // their set_runtime_device overrides. Null otherwise.
+    const vkop::core::ShaderArchive *shader_archive_ = nullptr;
     bool update_after_bind_ = false;
     bool trace_ = false;
     std::string name_;
     uint32_t required_subgroup_size_ = 0;
+
+    // Secondary-pipeline helper for ops like Matmul/Conv2d that build more
+    // than one VulkanPipeline inside their set_runtime_device override.
+    // Runtime's post-construct override_spv() can only reach the op's primary
+    // spv_; these extra pipelines need to consult the archive directly. If
+    // the archive is loaded and holds `key`, returns the mapped blob range;
+    // otherwise falls back to the extern symbols baked into libvkop, so a
+    // default (unstripped) build with the archive unset keeps its existing
+    // byte-for-byte behaviour.
+    std::pair<const uint32_t *, uint32_t>
+    resolve_spv(const std::string &key, const unsigned char *embedded,
+                unsigned int embedded_len) const;
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

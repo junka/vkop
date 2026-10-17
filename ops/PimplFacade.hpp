@@ -36,6 +36,16 @@ class PimplFacade : public Operator {
                             VkPipelineCache cache = VK_NULL_HANDLE) override {
         impl_->set_runtime_device(dev, cmdpool, cache);
     }
+    // The facade's own spv_ is nullptr/0 (its ctor passes a no-op pointer),
+    // so overriding the base without forwarding would just silently write
+    // fields nobody reads. Route to the impl_ that actually builds the
+    // pipeline.
+    void override_spv(const uint32_t *spv, uint32_t spv_len) override {
+        impl_->override_spv(spv, spv_len);
+    }
+    void set_shader_archive(const vkop::core::ShaderArchive *archive) override {
+        impl_->set_shader_archive(archive);
+    }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         impl_->setAttribute(attributes);

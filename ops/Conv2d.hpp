@@ -349,16 +349,17 @@ class Conv2dBuffer : public BufferFactory {
             // (Out=0, Scratch=3); we bind 6 (matching the reduce pipeline) so
             // the same objs_ vector feeds both passes — the extra bias/scale
             // slots are inert in the pack shader.
+            auto pack =
+                resolve_spv("buffer_matmul_pack", buffer_matmul_pack_spv,
+                            buffer_matmul_pack_spv_len);
             pack_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                sizeof(MatMulPackPC),
-                reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
-                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0,
-                cache);
+                sizeof(MatMulPackPC), pack.first, static_cast<int>(pack.second),
+                use_uab, 0, cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
             }

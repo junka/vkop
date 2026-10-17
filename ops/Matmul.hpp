@@ -300,15 +300,19 @@ class MatMulBuffer : public BufferFactory {
             const uint32_t *spv;
             int spv_len;
             if (dev->supports_coopmat_fp16_tile(16, 16, 16)) {
-                spv = reinterpret_cast<const uint32_t *>(
-                    buffer_matmul_coop16_spv);
-                spv_len = static_cast<int>(buffer_matmul_coop16_spv_len);
+                auto r = resolve_spv("buffer_matmul_coop16",
+                                     buffer_matmul_coop16_spv,
+                                     buffer_matmul_coop16_spv_len);
+                spv = r.first;
+                spv_len = static_cast<int>(r.second);
                 coop_bm_ = 32;
                 coop_bn_ = 64;
             } else {
-                spv =
-                    reinterpret_cast<const uint32_t *>(buffer_matmul_coop_spv);
-                spv_len = static_cast<int>(buffer_matmul_coop_spv_len);
+                auto r =
+                    resolve_spv("buffer_matmul_coop", buffer_matmul_coop_spv,
+                                buffer_matmul_coop_spv_len);
+                spv = r.first;
+                spv_len = static_cast<int>(r.second);
                 coop_bm_ = 16;
                 coop_bn_ = 32;
             }
@@ -335,6 +339,9 @@ class MatMulBuffer : public BufferFactory {
             // KHR property list is the only feature query for integer MMA.
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
+            auto coop_i8 =
+                resolve_spv("buffer_matmul_coop_i8", buffer_matmul_coop_i8_spv,
+                            buffer_matmul_coop_i8_spv_len);
             coop_i8_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
@@ -342,10 +349,8 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
-                sizeof(matmul::GpuMatMulParam),
-                reinterpret_cast<const uint32_t *>(buffer_matmul_coop_i8_spv),
-                static_cast<int>(buffer_matmul_coop_i8_spv_len), use_uab, 0,
-                cache);
+                sizeof(matmul::GpuMatMulParam), coop_i8.first,
+                static_cast<int>(coop_i8.second), use_uab, 0, cache);
             for (auto &ds : coop_i8_ds_) {
                 ds = coop_i8_pipeline_->allocDescriptorSets();
             }
@@ -359,6 +364,9 @@ class MatMulBuffer : public BufferFactory {
             // Same binding count as the reduce pipeline: the pack set is filled
             // straight from objs_, so the two layouts must have the same slots
             // even though the pack shader only reads scratch and writes out.
+            auto pack =
+                resolve_spv("buffer_matmul_pack", buffer_matmul_pack_spv,
+                            buffer_matmul_pack_spv_len);
             pack_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
@@ -366,10 +374,8 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
-                sizeof(MatMulPackPC),
-                reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
-                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0,
-                cache);
+                sizeof(MatMulPackPC), pack.first, static_cast<int>(pack.second),
+                use_uab, 0, cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
             }

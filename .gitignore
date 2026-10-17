@@ -100,6 +100,9 @@ image/exporter/output_*.npy
 # ASan build directory
 /build-asan/
 
+# Stripped-shader build directory (VKOP_STRIP_BUILTIN_SHADERS=ON)
+/build-strip/
+
 # Vulkan pipeline cache (per-model, written by VK_PIPELINE_CACHE=1). Device-
 # specific (VkPipelineCache header embeds driver UUID), so a stale file is
 # silently discarded by the driver anyway; never commit.

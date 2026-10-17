@@ -195,10 +195,11 @@ class ConcatBuffer : public BufferFactory {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
+        auto i64 = resolve_spv("buffer_concat_int64", buffer_concat_int64_spv,
+                               buffer_concat_int64_spv_len);
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
-            m_dev_->getLogicalDevice(), types_, pc_size_,
-            reinterpret_cast<const uint32_t *>(buffer_concat_int64_spv),
-            buffer_concat_int64_spv_len, use_uab, required_subgroup_size_);
+            m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
+            use_uab, required_subgroup_size_);
     }
 
     // Route the int64 path through the int64 GPU shader (concat_int64.comp).

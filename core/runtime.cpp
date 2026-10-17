@@ -13,6 +13,7 @@
 #include <unordered_set>
 
 #include "core/DType.hpp"
+#include "core/ShaderKeys.hpp"
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
@@ -161,6 +162,29 @@ void check_initializer_payload(const load::Initializer &init, ElemKind kind,
 
 void Runtime::LoadModel() {
     LoadPipelineCache();
+
+    // VKOP_SHADER_ARCHIVE=<path> makes every op's SPIR-V come from the packed
+    // archive instead of its linked C array. A missing or malformed archive
+    // is not fatal -- the ops keep their ctor-assigned embedded pointers and
+    // the run proceeds, matching the pre-archive behaviour exactly. Debug
+    // mode reports the outcome either way so a mis-set env is visible.
+    if (const char *apath = std::getenv("VKOP_SHADER_ARCHIVE")) {
+        if (apath[0] != '\0') {
+            shader_archive_ = ShaderArchive::open(apath);
+            if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                if (shader_archive_) {
+                    std::fprintf(stderr, "[shaders] opened %s (%zu entries)\n",
+                                 apath, shader_archive_->entry_count());
+                } else {
+                    std::fprintf(stderr,
+                                 "[shaders] failed to open %s, falling back to "
+                                 "embedded SPIR-V\n",
+                                 apath);
+                }
+            }
+        }
+    }
+
     auto model = load::VkModel(model_path_);
     model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
@@ -1127,6 +1151,42 @@ void Runtime::LoadModel() {
             }
 
             op->set_name(n.name);
+            // Give the op a handle on the archive so its set_runtime_device
+            // override can look up secondary pipelines (Matmul's coop/pack,
+            // Conv2d's pack) by key. The primary spv_ is replaced below via
+            // override_spv(); those secondaries never pass through spv_ and
+            // would otherwise read the stub placeholder on a stripped build.
+            op->set_shader_archive(shader_archive_.get());
+            // If VKOP_SHADER_ARCHIVE is loaded, replace this op's SPIR-V
+            // pointer with the mapped archive range before the pipeline is
+            // built. A miss on the archive (e.g. an op whose name isn't in
+            // the static key table, or a variant the packer skipped) leaves
+            // the ctor-assigned embedded bytes in place, so an incomplete
+            // archive still runs.
+            if (shader_archive_) {
+                auto key = shader_key_for(type, backend_buffer_, op_fp16);
+                if (!key.empty()) {
+                    auto [spv, len] = shader_archive_->lookup(key);
+                    if (spv) {
+                        op->override_spv(spv, len);
+                        if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                            std::fprintf(stderr,
+                                         "[shaders] hit key=%s len=%u op=%s\n",
+                                         key.c_str(), len, n.name.c_str());
+                        }
+                    } else if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                        std::fprintf(stderr,
+                                     "[shaders] miss key=%s op=%s, using "
+                                     "embedded\n",
+                                     key.c_str(), n.name.c_str());
+                    }
+                } else if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                    std::fprintf(
+                        stderr, "[shaders] no key for op_type=%s op=%s\n",
+                        vkop::ops::convert_optype_to_string(type).c_str(),
+                        n.name.c_str());
+                }
+            }
             op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
             op->setAttribute(n.attributes);
 
@@ -3235,6 +3295,15 @@ void Runtime::RegisterPostProcess(
     auto op = ops::create_from_type(
         ops, pp_precision, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
+    if (shader_archive_) {
+        auto key = shader_key_for(ops, use_buffer, pp_precision);
+        if (!key.empty()) {
+            auto [spv, len] = shader_archive_->lookup(key);
+            if (spv) {
+                op->override_spv(spv, len);
+            }
+        }
+    }
     op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
     op->setAttribute(attributes);
 

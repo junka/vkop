@@ -199,6 +199,13 @@ file(MAKE_DIRECTORY ${SPIRV_DIR})
 # `<sym_name>_spv_len`. Used on all platforms (replaces the xxd+sed path,
 # which derived the symbol from the xxd-of-filepath and could not disambiguate
 # two shaders with the same basename in different folders).
+#
+# VKOP_STUB_SPIRV=1 (exported by the CMake custom_command when the
+# VKOP_STRIP_BUILTIN_SHADERS option is ON) drops the SPIR-V bytes and emits a
+# 1-byte placeholder with _len = 0 instead, cutting ~2.7 MB out of every libvkop
+# consumer. The runtime then fills each op's spv_ from vkop_shaders.bin at
+# LoadModel time; without the archive, Operator::set_runtime_device raises a
+# clear error rather than crashing later on a null pipeline_.
 set(PY_SCRIPT_CONTENT
 "import sys
 import os
@@ -210,6 +217,23 @@ def main():
     input_spv = sys.argv[1]
     output_h  = sys.argv[2]
     sym_name  = sys.argv[3] + '_spv'
+    stub_mode = os.environ.get('VKOP_STUB_SPIRV', '') == '1'
+
+    if stub_mode:
+        # Placeholder symbols keep the linker happy. Runtime overrides them
+        # via Operator::override_spv() when a shader archive is open; if the
+        # archive is missing, set_runtime_device() throws instead of silently
+        # leaving the pipeline_ null and crashing at submit().
+        content = f'''// Auto-generated STUB for {os.path.basename(input_spv)}.
+// libvkop was built with VKOP_STRIP_BUILTIN_SHADERS=ON: the SPIR-V bytes
+// live in vkop_shaders.bin, and LoadModel populates each op from that
+// archive before building its pipeline. Set VKOP_SHADER_ARCHIVE=<path>.
+unsigned char {sym_name}[1] = {{0}};
+unsigned int {sym_name}_len = 0;
+'''
+        with open(output_h, 'w') as f:
+            f.write(content)
+        return
 
     with open(input_spv, 'rb') as f:
         data = f.read()
@@ -243,6 +267,22 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # shaders/buffer/unary.comp -> buffer_unary_spv. Both image and buffer
 # shaders get their folder as a prefix, so same-named shaders in different
 # folders never collide.
+#
+# VKOP_STRIP_BUILTIN_SHADERS=ON drops the SPIR-V bytes from libvkop entirely:
+# spv_to_c.py writes a 1-byte placeholder with _len=0 for every symbol, and
+# the archive build (vkop_shaders.bin, always produced) becomes the only
+# source of shader bytes. Deployments then have to set VKOP_SHADER_ARCHIVE at
+# runtime or LoadModel throws with a clear message. Default OFF preserves
+# the pre-archive behaviour byte-for-byte.
+option(VKOP_STRIP_BUILTIN_SHADERS
+       "Emit stub C arrays in place of the SPIR-V bytes; requires a shader archive at runtime"
+       OFF)
+if(VKOP_STRIP_BUILTIN_SHADERS)
+    set(VKOP_STUB_ENV "VKOP_STUB_SPIRV=1")
+else()
+    set(VKOP_STUB_ENV "VKOP_STUB_SPIRV=0")
+endif()
+
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
     file(RELATIVE_PATH SHADER_REL ${SHADER_DIR} ${SHADER})
@@ -266,7 +306,8 @@ foreach(SHADER ${SHADER_FILES})
     )
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE}
-        COMMAND ${Python3_EXECUTABLE}
+        COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
+            ${Python3_EXECUTABLE}
             ${PY_SCRIPT_FILE}
             ${SPIRV_FILE}
             ${SPIRV_SOURCE_FILE}
@@ -350,7 +391,8 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     )
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE_FP16}
-        COMMAND ${Python3_EXECUTABLE}
+        COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
+            ${Python3_EXECUTABLE}
             ${PY_SCRIPT_FILE}
             ${SPIRV_FILE_FP16}
             ${SPIRV_SOURCE_FILE_FP16}
@@ -364,6 +406,47 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_FP16})
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_FP16})
 endforeach()
+
+# ---------------------------------------------------------------------------
+# SPIR-V external archive (vkop_shaders.bin).
+#
+# Every .spv produced above is packed once more into a single archive the
+# runtime can load with VKOP_SHADER_ARCHIVE=/path/to/vkpv_shaders.bin. Keys
+# inside the archive are the same folder-derived names already used for the
+# embedded C-array symbols (buffer_add, image_add_fp16, ...), so a caller can
+# look up any op's SPIR-V without knowing anything about how CMake produced
+# it. libvkop still embeds the C arrays above, so the archive is additive for
+# now: setting VKOP_SHADER_ARCHIVE overrides the embedded bytes at LoadModel
+# time; leaving it unset runs the pre-archive path unchanged.
+# ---------------------------------------------------------------------------
+set(ARCHIVE_ARGS "")
+set(ARCHIVE_DEPS "")
+foreach(SHADER ${SHADER_FILES})
+    file(RELATIVE_PATH SHADER_REL ${SHADER_DIR} ${SHADER})
+    string(REPLACE "/" "_" SYM_BASE "${SHADER_REL}")
+    get_filename_component(SYM_BASE "${SYM_BASE}" NAME_WE)
+    list(APPEND ARCHIVE_ARGS --spv ${SYM_BASE}:${SPIRV_DIR}/${SYM_BASE}.spv)
+    list(APPEND ARCHIVE_DEPS ${SPIRV_DIR}/${SYM_BASE}.spv)
+endforeach()
+foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
+    string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")
+    list(APPEND ARCHIVE_ARGS
+         --spv ${DUAL_BASE}_fp16:${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
+    list(APPEND ARCHIVE_DEPS ${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
+endforeach()
+
+set(VKOP_SHADER_ARCHIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.bin)
+add_custom_command(
+    OUTPUT ${VKOP_SHADER_ARCHIVE_FILE}
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/tools/spv_to_archive.py
+        --output ${VKOP_SHADER_ARCHIVE_FILE}
+        ${ARCHIVE_ARGS}
+    DEPENDS ${ARCHIVE_DEPS} ${CMAKE_SOURCE_DIR}/tools/spv_to_archive.py
+    COMMENT "Packing SPIR-V shaders into vkop_shaders.bin archive"
+)
+add_custom_target(shader_archive ALL DEPENDS ${VKOP_SHADER_ARCHIVE_FILE})
+add_dependencies(shader_archive compile_shaders)
 
 
 # Add executable

@@ -2,10 +2,12 @@
 #ifndef CORE_RUNTIME_HPP_
 #define CORE_RUNTIME_HPP_
 
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
+#include "core/ShaderArchive.hpp"
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
 
@@ -137,6 +139,16 @@ class Runtime {
 
     void LoadPipelineCache();
     void SavePipelineCache();
+
+    // VKOP_SHADER_ARCHIVE=<path> makes LoadModel override every op's SPIR-V
+    // pointer from the packed vkop_shaders.bin archive before building its
+    // pipeline. Null when the env is unset or the archive fails to open;
+    // the ops then fall through to their ctor-assigned embedded symbols.
+    // The archive is memory-mapped, so only the shader blobs a model
+    // actually fires become resident -- this is the trtexec-style "extract
+    // only what's needed" property that avoids baking every libvkop shader
+    // into every driver binary.
+    std::unique_ptr<ShaderArchive> shader_archive_;
 
   public:
     // Drop every op's cached recording (back to FRESH) so the next Run()
