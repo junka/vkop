@@ -1,18 +1,19 @@
 // junka @ 2026
-// vkop-bench -- trtexec-style generic benchmark driver for any .vkopbin.
+// vkop-bench -- trtexec-style generic benchmark + verify driver for any
+// .vkopbin.
 //
 // Loads a model, sizes its graph inputs to something the runtime can
-// dispatch on, fills them with deterministic pseudo-random data, warms
-// up, then times N iterations of Runtime::Run() and prints a percentile
-// table. This is the "give me ms/throughput for this vkopbin" path
-// trtexec covers with `--iterations / --warmUp / --duration`, and the
-// reason it exists here is that every prior vkop benchmark was
-// model-specific (llm_chat / image_gen / cache_probe) and needed a
-// driver-side harness to feed the tokens or the images or the KV cache.
+// dispatch on, warms up, then times N iterations of Runtime::Run() and
+// prints a percentile table. Inputs default to deterministic pseudo-random
+// fill (fast path: no data on disk needed); --load-inputs points at a
+// directory of .npy files to run against real values instead, and
+// --save-outputs dumps every output tensor to a matching directory so a
+// numpy script can diff against an ORT reference without going through
+// llm_driver's fixed 35-input LLM contract.
 //
-// What it does NOT do: verify numerics. Inputs are random, so outputs
-// are garbage. The point is timing and load-phase measurement, not
-// correctness; use llm_driver / compare_vkop_ort.py for that.
+// The .npy reader is minimal (little-endian, C-contiguous, v1.0 header),
+// the same subset llm_driver reads. Non-contiguous or big-endian files
+// raise with a clear message rather than silently reading shuffled bytes.
 //
 // Usage:
 //   vkop-bench model.vkopbin
@@ -20,12 +21,14 @@
 //       [--backend buffer|image]
 //       [--shape name:d1xd2x...]      (may repeat; required for dynamic dims)
 //       [--seed N]
+//       [--load-inputs DIR]           (per-input <DIR>/<name>.npy, random for misses)
+//       [--save-outputs DIR]          (raw bytes to <DIR>/<name>.bin after the last run)
 //
 // Dynamic-shape inputs: LoadModel turns every -1 sentinel into a
 // placeholder dim of 1 (see core/runtime.cpp:186ff), so a raw run without
 // --shape would execute a [1,1,...] kernel. --shape rebinds the tensor
-// via ResizeInput to a concrete dim and is required for anything
-// meaningful on an LLM.
+// via ResizeInput to a concrete dim. With --load-inputs the npy's own
+// shape wins over --shape (the file records its dims).
 //
 // Composition with the pipeline cache / shader archive / stripped build:
 // the binary respects VK_PIPELINE_CACHE, VKOP_SHADER_ARCHIVE, and
@@ -74,6 +77,22 @@ struct Options {
     std::unordered_map<std::string, std::vector<uint32_t>> shapes;
     bool list_inputs_only = false;
     bool time_load_only = false;
+    // Real input tensors read from <load_inputs_dir>/<name>.npy; anything
+    // missing falls back to the pseudo-random fill. Same path convention
+    // llm_driver uses, so the same dump_dir works in either tool.
+    std::string load_inputs_dir;
+    // After the last iteration, dump every graph output tensor as raw
+    // bytes to <save_outputs_dir>/<name>.bin. Shape and dtype are known
+    // from the vkopbin; a numpy reader can reconstruct via
+    // np.frombuffer(...).reshape(shape).astype(dtype).
+    std::string save_outputs_dir;
+    // Turn on per-op GPU timestamp profiling (same pipeline VKOP_SUBMIT_PROF
+    // uses) and dump the last Run()'s timings as JSON to this path. Shape:
+    //   { "timestamp_period_ns": ..., "level_count": ...,
+    //     "total_gpu_ms": ..., "nodes": [
+    //       { "op_type": "MatMul", "name": "/q_proj/MatMul",
+    //         "level": 12, "ms": 0.42 }, ... ] }
+    std::string profile_out_path;
 };
 
 void usage(const char *argv0) {
@@ -85,6 +104,9 @@ void usage(const char *argv0) {
                  "  --backend buffer|image  runtime backend (default buffer)\n"
                  "  --shape name:d1xd2x...   resize an input; may repeat\n"
                  "  --seed N                fill RNG seed (default 0xc0ffee)\n"
+                 "  --load-inputs DIR     fill inputs from DIR/<name>.npy; misses fall back to random\n"
+                 "  --save-outputs DIR    write each output to DIR/<name>.bin after the last run\n"
+                 "  --profile-out FILE    dump per-node GPU timings as JSON (enables submit profiling)\n"
                  "  --list-inputs         print each input's name/dtype/shape and exit\n"
                  "  --time-load-only      measure LoadModel only, no Run()\n",
                  argv0);
@@ -165,6 +187,12 @@ bool parse_args(int argc, char **argv, Options &o) {
             }
         } else if (a == "--seed") {
             o.seed = static_cast<uint32_t>(std::strtoul(need_next("--seed"), nullptr, 0));
+        } else if (a == "--load-inputs") {
+            o.load_inputs_dir = need_next("--load-inputs");
+        } else if (a == "--save-outputs") {
+            o.save_outputs_dir = need_next("--save-outputs");
+        } else if (a == "--profile-out") {
+            o.profile_out_path = need_next("--profile-out");
         } else if (a == "--shape") {
             std::string spec = need_next("--shape");
             std::string name;
@@ -278,6 +306,213 @@ int64_t element_count(const std::vector<int> &shape) {
         n *= static_cast<int64_t>(std::max(0, d));
     }
     return n;
+}
+
+size_t npy_count(const std::vector<uint32_t> &shape);
+void upload_by_dtype(const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                     const std::shared_ptr<ITensor> &t);
+void prep_input(const std::shared_ptr<Runtime> &rt,
+                const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                const std::string &name, const Options &o, uint32_t salt);
+
+// ---- NumPy .npy reader (little-endian, C-contiguous, v1.0 header) ----
+// Same subset llm_driver consumes. Version 2.0 headers (uint32 header
+// length) and big-endian / fortran-order files are refused loudly rather
+// than silently mis-read.
+struct NpyArray {
+    std::vector<uint32_t> shape;
+    std::string descr; // "<f2", "<i8", "<f4", "|i1", "<u2", ...
+    std::vector<uint8_t> bytes;
+};
+
+NpyArray load_npy(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f)
+        throw std::runtime_error("cannot open " + path);
+    std::vector<uint8_t> buf((std::istreambuf_iterator<char>(f)),
+                             std::istreambuf_iterator<char>());
+    if (buf.size() < 10 || buf[0] != 0x93 ||
+        std::memcmp(buf.data() + 1, "NUMPY", 5) != 0)
+        throw std::runtime_error("bad npy magic in " + path);
+    if (buf[6] != 1)
+        throw std::runtime_error("npy v" + std::to_string(buf[6]) +
+                                 " not supported (only 1.x), in " + path);
+    uint16_t hdr_len = static_cast<uint16_t>(buf[8]) |
+                       (static_cast<uint16_t>(buf[9]) << 8);
+    size_t hdr_start = 10;
+    size_t data_start = hdr_start + hdr_len;
+    if (data_start > buf.size())
+        throw std::runtime_error("truncated npy header in " + path);
+    std::string header(buf.begin() + hdr_start, buf.begin() + data_start);
+    if (header.find("'fortran_order': True") != std::string::npos)
+        throw std::runtime_error(
+            "fortran-order npy not supported in " + path);
+
+    NpyArray arr;
+    auto find_str = [&](const char *key) -> std::string {
+        auto kp = header.find(key);
+        if (kp == std::string::npos)
+            return "";
+        auto colon = header.find(':', kp);
+        auto q1 = header.find('\'', colon);
+        auto q2 = header.find('\'', q1 + 1);
+        if (q1 == std::string::npos || q2 == std::string::npos)
+            return "";
+        return header.substr(q1 + 1, q2 - q1 - 1);
+    };
+    arr.descr = find_str("descr");
+    auto sb = header.find('(');
+    auto se = header.find(')', sb);
+    if (sb != std::string::npos && se != std::string::npos) {
+        std::stringstream ss(header.substr(sb + 1, se - sb - 1));
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            size_t a = tok.find_first_not_of(" \t");
+            if (a == std::string::npos)
+                continue;
+            arr.shape.push_back(
+                static_cast<uint32_t>(std::stoul(tok.substr(a))));
+        }
+    }
+    arr.bytes.assign(buf.begin() + data_start, buf.end());
+    return arr;
+}
+
+// Fill one input from an NpyArray. Resizes the tensor to the npy's shape
+// so an input whose .vkopbin recorded a dynamic dim still lands at the
+// concrete size from disk. dtype dispatch mirrors llm_driver's fill_input;
+// the npy descr is used only to sanity-check we aren't silently reinterpreting.
+template <typename T>
+void fill_typed_from_npy(const std::shared_ptr<ITensor> &t, const NpyArray &a,
+                         const std::string &name) {
+    if (a.bytes.size() < sizeof(T) * npy_count(a.shape)) {
+        throw std::runtime_error("npy " + name + " short read: file " +
+                                 std::to_string(a.bytes.size()) +
+                                 " bytes, need more");
+    }
+    auto typed = as_tensor<T>(t);
+    typed->resize(a.shape);
+    size_t n = npy_count(a.shape);
+    if (n > 0) {
+        typed->fillToCPU(reinterpret_cast<const T *>(a.bytes.data()));
+    }
+}
+
+size_t npy_count(const std::vector<uint32_t> &shape) {
+    size_t n = 1;
+    for (auto d : shape)
+        n *= d;
+    return n;
+}
+
+// Resize + fill + upload one input from an .npy if load_inputs_dir has it,
+// else fall through to the deterministic pseudo-random path.
+void prep_input_from_dir_or_random(const std::shared_ptr<Runtime> &rt,
+                                   const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                                   const std::string &name, const Options &o,
+                                   uint32_t salt, bool &served_from_npy) {
+    served_from_npy = false;
+    if (!o.load_inputs_dir.empty()) {
+        std::string path = o.load_inputs_dir + "/" + name + ".npy";
+        std::ifstream probe(path);
+        if (probe) {
+            probe.close();
+            NpyArray arr = load_npy(path);
+            auto t = rt->GetInput(name);
+            if (!t)
+                throw std::runtime_error("no such input: " + name);
+            rt->ResizeInput(name, arr.shape);
+            t = rt->GetInput(name);
+            const auto &dt = t->dtype();
+            if (dt == typeid(int64_t))
+                fill_typed_from_npy<int64_t>(t, arr, name);
+            else if (dt == typeid(int))
+                fill_typed_from_npy<int>(t, arr, name);
+            else if (dt == typeid(int8_t))
+                fill_typed_from_npy<int8_t>(t, arr, name);
+            else if (dt == typeid(float))
+                fill_typed_from_npy<float>(t, arr, name);
+            else
+                fill_typed_from_npy<uint16_t>(t, arr, name);
+            upload_by_dtype(cmdpool, t);
+            served_from_npy = true;
+            return;
+        }
+    }
+    prep_input(rt, cmdpool, name, o, salt);
+}
+
+void upload_by_dtype(const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                     const std::shared_ptr<ITensor> &t) {
+    if (t->size() == 0)
+        return;
+    const auto &dt = t->dtype();
+    if (dt == typeid(int64_t))
+        as_tensor<int64_t>(t)->copyToGPU(cmdpool);
+    else if (dt == typeid(int))
+        as_tensor<int>(t)->copyToGPU(cmdpool);
+    else if (dt == typeid(int8_t))
+        as_tensor<int8_t>(t)->copyToGPU(cmdpool);
+    else if (dt == typeid(float))
+        as_tensor<float>(t)->copyToGPU(cmdpool);
+    else
+        as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
+}
+
+// Write every graph output's bytes to <dir>/<name>.bin. Shape and dtype
+// stay implicit (from the .vkopbin + inspect); a consumer reconstructs
+// via np.frombuffer(open(...,'rb').read(), dtype).reshape(shape).
+void save_outputs(const std::shared_ptr<Runtime> &rt,
+                  const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+                  const std::string &dir) {
+    auto names = rt->ListOutputNames();
+    for (const auto &name : names) {
+        auto t = rt->GetOutput(name);
+        if (!t) {
+            std::fprintf(stderr, "save: no output %s\n", name.c_str());
+            continue;
+        }
+        const auto &dt = t->dtype();
+        std::string path = dir + "/" + name + ".bin";
+        std::ofstream f(path, std::ios::binary);
+        if (!f) {
+            std::fprintf(stderr, "save: cannot write %s\n", path.c_str());
+            continue;
+        }
+        // Read GPU buffer back to CPU before writing.
+        if (dt == typeid(int64_t)) {
+            auto tt = as_tensor<int64_t>(t);
+            tt->copyToCPU(cmdpool);
+            const auto &d = tt->data();
+            f.write(reinterpret_cast<const char *>(d.data()),
+                    d.size() * sizeof(int64_t));
+        } else if (dt == typeid(int)) {
+            auto tt = as_tensor<int>(t);
+            tt->copyToCPU(cmdpool);
+            const auto &d = tt->data();
+            f.write(reinterpret_cast<const char *>(d.data()),
+                    d.size() * sizeof(int));
+        } else if (dt == typeid(int8_t)) {
+            auto tt = as_tensor<int8_t>(t);
+            tt->copyToCPU(cmdpool);
+            const auto &d = tt->data();
+            f.write(reinterpret_cast<const char *>(d.data()),
+                    d.size() * sizeof(int8_t));
+        } else if (dt == typeid(float)) {
+            auto tt = as_tensor<float>(t);
+            tt->copyToCPU(cmdpool);
+            const auto &d = tt->data();
+            f.write(reinterpret_cast<const char *>(d.data()),
+                    d.size() * sizeof(float));
+        } else {
+            auto tt = as_tensor<uint16_t>(t);
+            tt->copyToCPU(cmdpool);
+            const auto &d = tt->data();
+            f.write(reinterpret_cast<const char *>(d.data()),
+                    d.size() * sizeof(uint16_t));
+        }
+        std::printf("  saved %s -> %s\n", name.c_str(), path.c_str());
+    }
 }
 
 // Resize + fill + upload one input. Every dispatch is dtype-gated
@@ -418,8 +653,26 @@ int main(int argc, char **argv) {
     // backing, so a shape not declared via --shape falls back to
     // LoadModel's placeholder [1, 1, ...] -- the model still runs, just
     // on a tiny tensor, which is not what you want but never crashes.
+    // With --load-inputs, each tensor is filled from DIR/<name>.npy when
+    // the file exists (its shape wins over --shape); otherwise the random
+    // fill path is taken so a partial dump still runs.
+    int from_npy = 0;
     for (size_t i = 0; i < names.size(); ++i) {
-        prep_input(rt, cmdpool, names[i], o, static_cast<uint32_t>(i));
+        bool served = false;
+        prep_input_from_dir_or_random(rt, cmdpool, names[i], o,
+                                      static_cast<uint32_t>(i), served);
+        if (served)
+            ++from_npy;
+    }
+    if (!o.load_inputs_dir.empty()) {
+        std::printf("inputs: %d from npy, %d random\n", from_npy,
+                    static_cast<int>(names.size()) - from_npy);
+    }
+    // Enabling profiling has to happen BEFORE the first Run(), where the
+    // query pool is allocated. Post-warmup would leave the pool null for
+    // every measurement iteration.
+    if (!o.profile_out_path.empty()) {
+        rt->enable_submit_profiling();
     }
     dev->wait_all_done();
 
@@ -447,5 +700,61 @@ int main(int argc, char **argv) {
     std::printf("  max  %8.3f ms\n", s.max_ms);
     std::printf("  avg  %8.3f ms\n", s.avg_ms);
     std::printf("  throughput %8.2f runs/s\n", 1000.0 / s.avg_ms);
+
+    // Outputs land after the LAST run; a --load-inputs verification dump
+    // matches whatever the final iteration produced. If the caller only
+    // wants a correctness dump (no timing), --iters 1 --warmup 0 gives
+    // exactly one Run() before save.
+    if (!o.save_outputs_dir.empty()) {
+        std::printf("\nsaving outputs to %s\n", o.save_outputs_dir.c_str());
+        save_outputs(rt, cmdpool, o.save_outputs_dir);
+    }
+
+    // JSON dump of per-node GPU timings from the LAST profiled Run(). Same
+    // data the runtime prints to stderr under VKOP_SUBMIT_PROF, but as a
+    // machine-readable form so --profile-out runs can be diffed against
+    // baseline runs, sorted by op, or folded into a flamegraph.
+    if (!o.profile_out_path.empty()) {
+        auto &timings = rt->last_run_timings();
+        std::ofstream pf(o.profile_out_path);
+        if (!pf) {
+            std::fprintf(stderr, "profile: cannot write %s\n",
+                         o.profile_out_path.c_str());
+        } else {
+            double total = 0.0;
+            for (const auto &t : timings)
+                total += t.ms;
+            auto esc = [](const std::string &s) {
+                std::string out;
+                out.reserve(s.size());
+                for (char c : s) {
+                    if (c == '"' || c == '\\')
+                        out.push_back('\\');
+                    out.push_back(c);
+                }
+                return out;
+            };
+            pf << "{\n";
+            pf << "  \"timestamp_period_ns\": " << rt->timestamp_period_ns()
+               << ",\n";
+            pf << "  \"total_gpu_ms\": " << total << ",\n";
+            pf << "  \"node_count\": " << timings.size() << ",\n";
+            pf << "  \"nodes\": [\n";
+            for (size_t i = 0; i < timings.size(); ++i) {
+                const auto &t = timings[i];
+                pf << "    {\"op_type\": \"" << esc(t.op_type) << "\", "
+                   << "\"name\": \"" << esc(t.name) << "\", "
+                   << "\"level\": " << t.level << ", "
+                   << "\"ms\": " << t.ms << "}";
+                if (i + 1 < timings.size())
+                    pf << ",";
+                pf << "\n";
+            }
+            pf << "  ]\n";
+            pf << "}\n";
+            std::printf("\nprofile: wrote %zu nodes to %s (total %.3f ms)\n",
+                        timings.size(), o.profile_out_path.c_str(), total);
+        }
+    }
     return 0;
 }

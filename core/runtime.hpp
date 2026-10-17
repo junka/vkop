@@ -126,6 +126,18 @@ class Runtime {
     VkQueryPool submit_prof_pool_ = VK_NULL_HANDLE;
     bool submit_prof_ = false;
     float timestamp_period_ = 1.0f;
+    // Per-node GPU timings from the last profiled Run(), filled when
+    // submit_prof_ is on. A driver that wants the same data VKOP_SUBMIT_PROF
+    // prints to stderr (but as a structured vector for a JSON dump or a
+    // table view) calls enable_submit_profiling() before Run() and reads
+    // last_run_timings_ after.
+    struct NodeTiming {
+        std::string op_type;
+        std::string name;
+        int level;
+        double ms;
+    };
+    std::vector<NodeTiming> last_run_timings_;
 
     // Vulkan pipeline cache (VK_PIPELINE_CACHE=1). Serialises compiled
     // VkPipeline binaries to disk so a subsequent LoadModel on the same device
@@ -196,6 +208,10 @@ class Runtime {
     // without parsing the .vkopbin a second time via load::VkModel.
     std::vector<std::string> ListInputNames() const;
 
+    // Counterpart to ListInputNames for outputs. Same sorted-for-
+    // determinism contract.
+    std::vector<std::string> ListOutputNames() const;
+
     // Resize a graph input to the caller's actual shape and recreate its SSBO
     // at the new size. Used by the LLM driver: the model records symbolic
     // dims (e.g. past_key_values kv_len=1) but the real prefill tensor has a
@@ -232,6 +248,23 @@ class Runtime {
     // Select the buffer (SSBO) backend for subsequently-loaded operators.
     void set_backend_buffer(bool b) { backend_buffer_ = b; }
     bool get_backend_buffer() const { return backend_buffer_; }
+
+    // Turn on per-op GPU timestamp profiling programmatically. Same path
+    // VKOP_SUBMIT_PROF=1 takes; setting the flag here before the first
+    // Run() gets the query pool allocated without needing an env var, so a
+    // driver can produce a --profile-out JSON dump on demand. Idempotent;
+    // the pool survives across Run()s and each call overwrites the last
+    // results, so a consumer can read timings from any run.
+    void enable_submit_profiling() { submit_prof_ = true; }
+    bool submit_profiling_enabled() const { return submit_prof_; }
+    const std::vector<NodeTiming> &last_run_timings() const {
+        return last_run_timings_;
+    }
+    // Nanoseconds per Vulkan timestamp tick on this device (from
+    // VkPhysicalDeviceLimits::timestampPeriod). Only meaningful once
+    // enable_submit_profiling() has been set and Run() has captured
+    // timestamps; before that it is the vkop default 1.0f.
+    float timestamp_period_ns() const { return timestamp_period_; }
 
     void RegisterPostProcess(
         ops::OpType ops,

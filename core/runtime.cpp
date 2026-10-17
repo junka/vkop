@@ -1374,6 +1374,16 @@ std::vector<std::string> Runtime::ListInputNames() const {
     return out;
 }
 
+std::vector<std::string> Runtime::ListOutputNames() const {
+    std::vector<std::string> out;
+    out.reserve(outputs_.size());
+    for (const auto &kv : outputs_) {
+        out.push_back(kv.first);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 void Runtime::ResizeInput(const std::string &name,
                           const std::vector<uint32_t> &dims) {
     auto it = inputs_.find(name);
@@ -1490,35 +1500,40 @@ double Runtime::Run() {
 
     bool single_queue = dev->getNumComputeQueues() <= 1;
 
-    // GPU submit-side profiling (VKOP_SUBMIT_PROF): allocate a timestamp
-    // query pool with 2 queries per op (begin/end) and assign each op its
-    // query base. Results are read back at Run() end and aggregated per
-    // op-type. opprof measures CPU record time; this measures GPU execution
-    // (the ~515ms submit floor that opprof cannot attribute).
+    // GPU submit-side profiling (VKOP_SUBMIT_PROF env OR
+    // Runtime::enable_submit_profiling()): allocate a timestamp query pool
+    // with 2 queries per op (begin/end) and assign each op its query base.
+    // Results are read back at Run() end and aggregated per op-type. opprof
+    // measures CPU record time; this measures GPU execution (the ~515ms
+    // submit floor that opprof cannot attribute). The env check only runs
+    // when the caller hasn't already turned profiling on programmatically
+    // (e.g. vkop-bench --profile-out), so the two paths coexist.
     if (!submit_prof_) {
         const char *sp = std::getenv("VKOP_SUBMIT_PROF");
-        if (sp && sp[0] == '1' && !node_ops_.empty()) {
+        if (sp && sp[0] == '1')
             submit_prof_ = true;
-            timestamp_period_ = dev->getTimestampPeriod();
-            uint32_t nq = static_cast<uint32_t>(node_ops_.size()) * 2;
-            VkQueryPoolCreateInfo qpci{};
-            qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-            qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
-            qpci.queryCount = nq;
-            if (vkCreateQueryPool(dev->getLogicalDevice(), &qpci, nullptr,
-                                  &submit_prof_pool_) == VK_SUCCESS) {
-                for (size_t i = 0; i < node_ops_.size(); ++i) {
-                    node_ops_[i]->set_prof_query(submit_prof_pool_,
-                                                 static_cast<uint32_t>(i) * 2);
-                }
-                fprintf(stderr,
-                        "[submitprof] enabled: %zu ops, %u queries, "
-                        "timestampPeriod=%.3f ns\n",
-                        node_ops_.size(), nq, timestamp_period_);
-            } else {
-                submit_prof_ = false;
-                fprintf(stderr, "[submitprof] query pool creation FAILED\n");
+    }
+    if (submit_prof_ && submit_prof_pool_ == VK_NULL_HANDLE &&
+        !node_ops_.empty()) {
+        timestamp_period_ = dev->getTimestampPeriod();
+        uint32_t nq = static_cast<uint32_t>(node_ops_.size()) * 2;
+        VkQueryPoolCreateInfo qpci{};
+        qpci.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+        qpci.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpci.queryCount = nq;
+        if (vkCreateQueryPool(dev->getLogicalDevice(), &qpci, nullptr,
+                              &submit_prof_pool_) == VK_SUCCESS) {
+            for (size_t i = 0; i < node_ops_.size(); ++i) {
+                node_ops_[i]->set_prof_query(submit_prof_pool_,
+                                             static_cast<uint32_t>(i) * 2);
             }
+            fprintf(stderr,
+                    "[submitprof] enabled: %zu ops, %u queries, "
+                    "timestampPeriod=%.3f ns\n",
+                    node_ops_.size(), nq, timestamp_period_);
+        } else {
+            submit_prof_ = false;
+            fprintf(stderr, "[submitprof] query pool creation FAILED\n");
         }
     }
     // Reset the query pool at the start of each profiled Run(). We record the
@@ -3150,6 +3165,41 @@ double Runtime::Run() {
                 total_gpu_ms += ms;
                 // Also collect per-op (name+type) for a top-N slowest listing.
                 per_op_ms.push_back({ms, name, node_ops_[i]->get_name()});
+            }
+            // Cache the same data as last_run_timings_ so a driver (e.g.
+            // vkop-bench --profile-out) can walk it without scraping stderr.
+            // Node index -> level mapping comes from level_node_indices_,
+            // built once per readback (cheap; runs after Run()).
+            {
+                std::vector<int> node_level(node_ops_.size(), -1);
+                for (size_t lvl = 0; lvl < level_node_indices_.size(); ++lvl) {
+                    for (size_t ni : level_node_indices_[lvl]) {
+                        if (ni < node_level.size())
+                            node_level[ni] = static_cast<int>(lvl);
+                    }
+                }
+                last_run_timings_.clear();
+                last_run_timings_.reserve(per_op_ms.size());
+                // Correlate per_op_ms entries back to node index by the
+                // order they were pushed -- same iteration order as the
+                // query readback above.
+                size_t oi = 0;
+                for (size_t i = 0; i < node_ops_.size(); ++i) {
+                    uint64_t b = ts[i * 2];
+                    uint64_t e = ts[i * 2 + 1];
+                    if (e < b)
+                        continue;
+                    double ns = static_cast<double>(e - b) * timestamp_period_;
+                    double ms = ns / 1.0e6;
+                    if (ms < 0)
+                        continue;
+                    if (oi >= per_op_ms.size())
+                        break;
+                    last_run_timings_.push_back({per_op_ms[oi].type,
+                                                 per_op_ms[oi].name,
+                                                 node_level[i], ms});
+                    ++oi;
+                }
             }
             fprintf(stderr,
                     "[submitprof] op-type       calls   gpu_ms   avg_ms\n");
