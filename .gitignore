@@ -99,3 +99,8 @@ image/exporter/output_*.npy
 
 # ASan build directory
 /build-asan/
+
+# Vulkan pipeline cache (per-model, written by VK_PIPELINE_CACHE=1). Device-
+# specific (VkPipelineCache header embeds driver UUID), so a stale file is
+# silently discarded by the driver anyway; never commit.
+*.pcache

@@ -125,6 +125,19 @@ class Runtime {
     bool submit_prof_ = false;
     float timestamp_period_ = 1.0f;
 
+    // Vulkan pipeline cache (VK_PIPELINE_CACHE=1). Serialises compiled
+    // VkPipeline binaries to disk so a subsequent LoadModel on the same device
+    // can skip per-shader driver compilation. The cache is device-specific:
+    // Vulkan's pipeline cache header embeds the device UUID, vendor ID, and
+    // driver info, so a mismatched cache is silently discarded by the driver
+    // (the cache simply misses, and pipelines rebuild from SPIR-V).
+    VkPipelineCache pipeline_cache_ = VK_NULL_HANDLE;
+    bool pipeline_cache_enabled_ = false;
+    std::string pipeline_cache_path_;
+
+    void LoadPipelineCache();
+    void SavePipelineCache();
+
   public:
     // Drop every op's cached recording (back to FRESH) so the next Run()
     // re-records all. Call across a phase boundary where shapes change en masse

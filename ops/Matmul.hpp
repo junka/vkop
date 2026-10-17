@@ -254,10 +254,10 @@ class MatMulBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
-    void set_runtime_device(
-        const std::shared_ptr<VulkanDevice> &dev,
-        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
-        BufferFactory::set_runtime_device(dev, cmdpool);
+    void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
+                            const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                            VkPipelineCache cache = VK_NULL_HANDLE) override {
+        BufferFactory::set_runtime_device(dev, cmdpool, cache);
         // MoltenVK lists KHR_cooperative_matrix but its SPIR-V -> MSL backend
         // only lowers 8x8 coopmat dims, so the 8x16/16x8 A/B tiles here fail
         // pipeline creation ("MSL cooperative matrices only support 8x8
@@ -319,7 +319,8 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},
-                sizeof(matmul::GpuMatMulParam), spv, spv_len, use_uab, 0);
+                sizeof(matmul::GpuMatMulParam), spv, spv_len, use_uab, 0,
+                cache);
             for (auto &ds : coop_ds_) {
                 ds = coop_pipeline_->allocDescriptorSets();
             }
@@ -343,7 +344,8 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_coop_i8_spv),
-                static_cast<int>(buffer_matmul_coop_i8_spv_len), use_uab, 0);
+                static_cast<int>(buffer_matmul_coop_i8_spv_len), use_uab, 0,
+                cache);
             for (auto &ds : coop_i8_ds_) {
                 ds = coop_i8_pipeline_->allocDescriptorSets();
             }
@@ -366,7 +368,8 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(MatMulPackPC),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
-                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0);
+                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0,
+                cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
             }

@@ -80,7 +80,8 @@ class Operator {
 
     virtual void
     set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
-                       const std::shared_ptr<VulkanCommandPool> &cmdpool) {
+                       const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                       VkPipelineCache cache = VK_NULL_HANDLE) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         if (spv_len_ > 0 && spv_) {
@@ -89,7 +90,7 @@ class Operator {
             pipeline_ = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(), types_, pc_size_,
                 reinterpret_cast<const uint32_t *>(spv_), spv_len_, use_uab,
-                required_subgroup_size_);
+                required_subgroup_size_, cache);
             for (auto &ds : m_ds_) {
                 ds = pipeline_->allocDescriptorSets();
             }

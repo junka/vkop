@@ -338,10 +338,10 @@ class Conv2dBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
-    void set_runtime_device(
-        const std::shared_ptr<VulkanDevice> &dev,
-        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
-        BufferFactory::set_runtime_device(dev, cmdpool);
+    void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
+                            const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                            VkPipelineCache cache = VK_NULL_HANDLE) override {
+        BufferFactory::set_runtime_device(dev, cmdpool, cache);
         if (fp16_ != 0 && !pack_pipeline_) {
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
@@ -357,7 +357,8 @@ class Conv2dBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                 sizeof(MatMulPackPC),
                 reinterpret_cast<const uint32_t *>(buffer_matmul_pack_spv),
-                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0);
+                static_cast<int>(buffer_matmul_pack_spv_len), use_uab, 0,
+                cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
             }

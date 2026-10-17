@@ -14,7 +14,8 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
                                std::vector<VkDescriptorType> types,
                                size_t pushconstant_size, const uint32_t *spirv,
                                int codesize, bool update_after_bind,
-                               uint32_t required_subgroup_size)
+                               uint32_t required_subgroup_size,
+                               VkPipelineCache cache)
     : VulkanBasePipeline(device, std::move(types)),
       m_pushconstant_size_(pushconstant_size),
       required_subgroup_size_(required_subgroup_size) {
@@ -23,12 +24,13 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
     createDescriptorPool(update_after_bind);
 
-    createComputePipeline(m_pipelineLayout_, shader.getShaderModule());
+    createComputePipeline(m_pipelineLayout_, shader.getShaderModule(), cache);
     // could destroy shader here
 }
 
 void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
-                                           VkShaderModule shaderModule) {
+                                           VkShaderModule shaderModule,
+                                           VkPipelineCache cache) {
     VkPipelineShaderStageCreateInfo shader_stage_create_info = {};
     shader_stage_create_info.sType =
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -60,8 +62,8 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     pipeline_info.stage = shader_stage_create_info;
     pipeline_info.layout = pipelineLayout;
 
-    auto ret = vkCreateComputePipelines(m_device_, VK_NULL_HANDLE, 1,
-                                        &pipeline_info, nullptr, &m_pipeline_);
+    auto ret = vkCreateComputePipelines(m_device_, cache, 1, &pipeline_info,
+                                        nullptr, &m_pipeline_);
     if (ret != VK_SUCCESS) {
         throw std::runtime_error("Failed to create compute pipeline!" +
                                  std::to_string(ret));

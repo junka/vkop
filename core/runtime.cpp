@@ -36,8 +36,90 @@ Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
     : m_cmdpool_(std::move(cmdpool)), model_path_(std::move(model_path)),
       cache_dir_(std::move(cache_dir)) {}
 
-Runtime::~Runtime() = default;
+Runtime::~Runtime() {
+    if (pipeline_cache_ != VK_NULL_HANDLE) {
+        auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
+        vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
+        pipeline_cache_ = VK_NULL_HANDLE;
+    }
+}
 
+// --- Vulkan pipeline cache (VK_PIPELINE_CACHE=1) --------------------------
+// Gate: the env var must be set to "1". The cache file lives alongside the
+// model: `<model_path>.pcache`. The first LoadModel on a given GPU creates
+// the cache file; subsequent loads on the same GPU + driver combo hit it and
+// skip per-shader driver compilation (vkCreateComputePipelines consults the
+// cache automatically when a non-null VkPipelineCache is passed).
+
+void Runtime::LoadPipelineCache() {
+    const char *env = std::getenv("VK_PIPELINE_CACHE");
+    if (!env || env[0] != '1') {
+        return;
+    }
+    pipeline_cache_enabled_ = true;
+    pipeline_cache_path_ = model_path_ + ".pcache";
+
+    auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
+
+    std::vector<char> data;
+    {
+        std::ifstream f(pipeline_cache_path_, std::ios::binary);
+        if (f) {
+            f.seekg(0, std::ios::end);
+            auto sz = f.tellg();
+            if (sz > 0) {
+                data.resize(static_cast<size_t>(sz));
+                f.seekg(0, std::ios::beg);
+                f.read(data.data(), sz);
+            }
+        }
+    }
+
+    VkPipelineCacheCreateInfo ci{};
+    ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+    if (!data.empty()) {
+        ci.initialDataSize = data.size();
+        ci.pInitialData = data.data();
+    }
+    if (vkCreatePipelineCache(device, &ci, nullptr, &pipeline_cache_) !=
+        VK_SUCCESS) {
+        pipeline_cache_ = VK_NULL_HANDLE;
+        pipeline_cache_enabled_ = false;
+    } else if (std::getenv("VK_PIPELINE_CACHE_DEBUG")) {
+        std::fprintf(stderr, "[pcache] opened %s, loaded %zu initial bytes\n",
+                     pipeline_cache_path_.c_str(), data.size());
+    }
+}
+
+void Runtime::SavePipelineCache() {
+    if (!pipeline_cache_enabled_ || pipeline_cache_ == VK_NULL_HANDLE) {
+        return;
+    }
+    auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
+    size_t size = 0;
+    if (vkGetPipelineCacheData(device, pipeline_cache_, &size, nullptr) !=
+            VK_SUCCESS ||
+        size == 0) {
+        return;
+    }
+    std::vector<char> data(size);
+    if (vkGetPipelineCacheData(device, pipeline_cache_, &size, data.data()) !=
+        VK_SUCCESS) {
+        return;
+    }
+    data.resize(size);
+    std::ofstream f(pipeline_cache_path_, std::ios::binary | std::ios::trunc);
+    if (f) {
+        f.write(data.data(), static_cast<std::streamsize>(size));
+    }
+    if (std::getenv("VK_PIPELINE_CACHE_DEBUG")) {
+        std::fprintf(stderr, "[pcache] wrote %zu bytes to %s\n", size,
+                     pipeline_cache_path_.c_str());
+    }
+}
+
+// Kept as a forward-compatible stub (the model-level cache hook). The pipeline
+// cache lives in LoadPipelineCache/SavePipelineCache.
 void Runtime::LoadCache() {}
 
 namespace {
@@ -78,6 +160,7 @@ void check_initializer_payload(const load::Initializer &init, ElemKind kind,
 } // namespace
 
 void Runtime::LoadModel() {
+    LoadPipelineCache();
     auto model = load::VkModel(model_path_);
     model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
@@ -1044,7 +1127,7 @@ void Runtime::LoadModel() {
             }
 
             op->set_name(n.name);
-            op->set_runtime_device(dev, m_cmdpool_);
+            op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
             op->setAttribute(n.attributes);
 
             level_node_indices_[level_idx].push_back(global_node_index++);
@@ -1198,6 +1281,8 @@ void Runtime::LoadModel() {
     // Persist a name->tensor view of every named tensor for post-Run
     // inspection (driver dumps intermediates to diagnose NaN propagation).
     tensor_map_ = tensor_map;
+
+    SavePipelineCache();
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
@@ -3150,7 +3235,7 @@ void Runtime::RegisterPostProcess(
     auto op = ops::create_from_type(
         ops, pp_precision, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
-    op->set_runtime_device(dev, m_cmdpool_);
+    op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
     op->setAttribute(attributes);
 
     size_t current_op_idx = node_ops_.size();

@@ -31,10 +31,10 @@ class PimplFacade : public Operator {
     PimplFacade(OpType type)
         : Operator(type, nullptr, 0, std::vector<VkDescriptorType>{}, 0, 0) {}
 
-    void set_runtime_device(
-        const std::shared_ptr<VulkanDevice> &dev,
-        const std::shared_ptr<VulkanCommandPool> &cmdpool) override {
-        impl_->set_runtime_device(dev, cmdpool);
+    void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
+                            const std::shared_ptr<VulkanCommandPool> &cmdpool,
+                            VkPipelineCache cache = VK_NULL_HANDLE) override {
+        impl_->set_runtime_device(dev, cmdpool, cache);
     }
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

@@ -122,7 +122,10 @@ namespace vkop {
     PFN(vkCreateGraphicsPipelines)                                             \
     PFN(vkCmdDraw)                                                             \
     PFN(vkCmdBindVertexBuffers)                                                \
-    PFN(vkCmdBindIndexBuffer)
+    PFN(vkCmdBindIndexBuffer)                                                  \
+    PFN(vkCreatePipelineCache)                                                 \
+    PFN(vkDestroyPipelineCache)                                                \
+    PFN(vkGetPipelineCacheData)
 
 class VulkanLib {
   public:
