@@ -2,15 +2,67 @@
 """Command-line interface for onnx2vkop."""
 
 import argparse
+import os.path as _osp
 import sys
 from pathlib import Path
 
 import onnx
 
+# filter_shaders.py lives in tools/, outside the wheel. Reach it via a path
+# hop so the CLI does not have to subprocess out to Python again.
+_TOOLS = _osp.normpath(
+    _osp.join(_osp.dirname(__file__), "..", "..", "..", "tools")
+)
+if _osp.isdir(_TOOLS) and _TOOLS not in sys.path:
+    sys.path.append(_TOOLS)
+
 try:
     from .converter import ModelConverter
+    from . import shader_map
 except ImportError:
     from converter import ModelConverter
+    import shader_map
+
+# filter_shaders may or may not be on sys.path yet (the block above appends
+# tools/ when it exists); import lazily so a CLI invocation without
+# --emit-shader-archive keeps working even if tools/ is missing.
+try:
+    import filter_shaders
+except ImportError:
+    filter_shaders = None  # checked below when --emit-shader-archive is used
+
+
+def emit_shader_archive(dag_model, master_path, out_path, backend="buffer"):
+    """Write a per-model vkop_shaders.bin subset at out_path.
+
+    Reads the graph's op-type census from `dag_model.nodes` (the same set
+    the CLI already prints in "Operator Statistics"), maps it through
+    shader_map.shader_keys_for_model to the set of archive keys this model
+    can dispatch, and filters the master archive down to that set.
+    """
+    op_types = {node.op_type for node in dag_model.nodes.values()}
+    keys = shader_map.shader_keys_for_model(op_types, backend=backend)
+    master = filter_shaders.read_master(master_path)
+    subset = {k: master[k] for k in keys if k in master}
+    missing = sorted(keys - set(master))
+    if missing:
+        for k in missing:
+            print(f"[shaders] master has no {k!r}", file=sys.stderr)
+        print(
+            f"[shaders] {len(missing)} key(s) missing from {master_path}; "
+            "an op whose shader is absent here falls back to its embedded "
+            "C array under the default build and to a stubbed pointer "
+            "under VKOP_STRIP_BUILTIN_SHADERS=ON.",
+            file=sys.stderr,
+        )
+    filter_shaders.write_subset(subset, out_path)
+    out_size = Path(out_path).stat().st_size
+    master_size = Path(master_path).stat().st_size
+    print(
+        f"[shaders] wrote {out_path}: {len(subset)} of {len(master)} "
+        f"shaders, {out_size:,} / {master_size:,} bytes "
+        f"({100.0 * out_size / max(1, master_size):.1f}%)"
+    )
 
 
 def parse_args():
@@ -67,6 +119,29 @@ Examples:
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output")
     parser.add_argument(
         "--version", action="version", version=f"%(prog)s {__import__('onnx2vkop').__version__}"
+    )
+    parser.add_argument(
+        "--emit-shader-archive", metavar="PATH",
+        help="After conversion, write a per-model vkop_shaders.bin subset to PATH "
+             "containing only the SPIR-V entries this graph can dispatch. Pair "
+             "with --master-archive pointing at the full archive the CMake "
+             "build produced. Deploy the model with "
+             "VKOP_SHADER_ARCHIVE=<PATH> to skip loading shaders the model "
+             "never fires; combined with a libvkop built under "
+             "VKOP_STRIP_BUILTIN_SHADERS=ON, the process RSS ends up carrying "
+             "only this subset.",
+    )
+    parser.add_argument(
+        "--master-archive", metavar="PATH",
+        help="Path to the full vkop_shaders.bin the CMake build produced. "
+             "Required with --emit-shader-archive.",
+    )
+    parser.add_argument(
+        "--target-backend", choices=["buffer", "image"], default="buffer",
+        help="Backend the model targets at runtime (default: buffer). Chosen "
+             "at convert time because it's the only place that knows what "
+             "the driver will call set_backend_buffer() with; matches the "
+             "-r/--rgba image flag for image-backend models.",
     )
 
     return parser.parse_args()
@@ -127,6 +202,28 @@ def main():
 
         print("\nConversion completed successfully!")
         print(f"Output file size: {output_path.stat().st_size:,} bytes")
+
+        if args.emit_shader_archive:
+            if not args.master_archive:
+                print(
+                    "Error: --emit-shader-archive requires --master-archive "
+                    "(path to the full vkop_shaders.bin)",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            if filter_shaders is None:
+                print(
+                    f"Error: --emit-shader-archive needs filter_shaders.py "
+                    f"from {_TOOLS}",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+            emit_shader_archive(
+                dag_model,
+                master_path=args.master_archive,
+                out_path=args.emit_shader_archive,
+                backend=args.target_backend,
+            )
 
     except Exception as e:
         print(f"\nError during conversion: {e}")
