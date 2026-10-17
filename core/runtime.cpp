@@ -1360,6 +1360,20 @@ std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
     return it->second;
 }
 
+std::vector<std::string> Runtime::ListInputNames() const {
+    // Sorted for determinism across runs; the underlying map does not
+    // preserve LoadModel's insertion order (which is the vkopbin's
+    // declared order, but that would require an extra vector to track
+    // without a payoff for the benchmark caller).
+    std::vector<std::string> out;
+    out.reserve(inputs_.size());
+    for (const auto &kv : inputs_) {
+        out.push_back(kv.first);
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
 void Runtime::ResizeInput(const std::string &name,
                           const std::vector<uint32_t> &dims) {
     auto it = inputs_.find(name);

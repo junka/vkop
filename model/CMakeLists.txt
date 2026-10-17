@@ -19,11 +19,19 @@ if(FLATC)
         COMMAND ${FLATC} --cpp --gen-mutable --gen-object-api --reflect-names
                         -o ${CMAKE_CURRENT_SOURCE_DIR}/generated
                         ${FBS_SCHEMA}
+        COMMAND ${FLATC} --python
+                        -o ${CMAKE_CURRENT_SOURCE_DIR}/pypi/onnx2vkop/generated
+                        ${FBS_SCHEMA}
         DEPENDS ${FBS_SCHEMA}
-        COMMENT "Regenerating FlatBuffers C++ header from ${FBS_SCHEMA}"
+        COMMENT "Regenerating FlatBuffers C++ header + Python bindings from ${FBS_SCHEMA}"
         VERBATIM
     )
     add_custom_target(generate_flatbuffers DEPENDS ${FBS_GENERATED_HEADER})
+    # The Python tree is committed alongside the C++ header. If a schema
+    # change lands a diff there, `git add` it in the same commit as the .fbs
+    # edit; onnx2vkop's `inspect.py` reads those bindings, so a stale
+    # generated/ would show as a Python attribute error at CLI time rather
+    # than a compile failure.
 endif()
 
 #add_executable(vload load.cpp)

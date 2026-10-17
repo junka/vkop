@@ -191,6 +191,11 @@ class Runtime {
     // Get input tensor by name
     std::shared_ptr<ITensor> GetInput(const std::string &name = "") const;
 
+    // Names of every graph input, in the order the vkopbin declared them.
+    // Lets a caller (vkop-bench, a debug dumper) iterate all inputs by name
+    // without parsing the .vkopbin a second time via load::VkModel.
+    std::vector<std::string> ListInputNames() const;
+
     // Resize a graph input to the caller's actual shape and recreate its SSBO
     // at the new size. Used by the LLM driver: the model records symbolic
     // dims (e.g. past_key_values kv_len=1) but the real prefill tensor has a
