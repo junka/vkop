@@ -143,13 +143,68 @@ Examples:
              "the driver will call set_backend_buffer() with; matches the "
              "-r/--rgba image flag for image-backend models.",
     )
+    # Build-time knobs that mirror env vars the code already reads. Setting
+    # these on the CLI overrides the env for the current invocation only.
+    parser.add_argument(
+        "--external-blob-mb", type=int, default=None, metavar="N",
+        help="Weight blob larger than N MiB switches to the external-data "
+             "vkopbin layout (default 800, matching the FlatBuffer 2 GiB "
+             "vector cap with safety margin). Set to 1 to force a small "
+             "model through the external path for testing.",
+    )
+    parser.add_argument(
+        "--max-fold-rounds", type=int, default=None, metavar="N",
+        help="ConstantFolder iteration cap (default 25). Raise when a model "
+             "has a deep Shape/Gather/Concat chain that needs more rounds "
+             "to reach fixed point.",
+    )
+    parser.add_argument(
+        "--max-fuse-rounds", type=int, default=None, metavar="N",
+        help="MultiRoundOptimizer iteration cap (default 10). Each round "
+             "re-runs every registered fusion pass until nothing changes.",
+    )
+    parser.add_argument(
+        "--no-passes", metavar="A,B,C", default=None,
+        help="Comma-separated ONNXOptimizer pass names to skip "
+             "(equivalent to VKOP_NO_PASSES=A,B,C). Use to ablate a suspect "
+             "pass on a single model without an env edit.",
+    )
+    parser.add_argument(
+        "--no-fusions", metavar="A,B,C", default=None,
+        help="Comma-separated FusionOptimizer pass names to skip "
+             "(equivalent to VKOP_NO_FUSIONS=A,B,C). Common pair for "
+             "attention A/B: --no-fusions fuse_into_attention.",
+    )
 
     return parser.parse_args()
+
+
+def _apply_build_knobs(args) -> None:
+    """Push the CLI's build-time knobs into the env the pipeline reads.
+
+    Only the ones the user actually set; anything left as None lets the
+    code's own default (or a pre-existing env from the shell) win. This
+    keeps CLI and env as two spellings of the same knobs rather than two
+    independent config sources that can disagree.
+    """
+    import os
+    mapping = {
+        "VKOP_EXTERNAL_BLOB_MB": args.external_blob_mb,
+        "VKOP_MAX_FOLD_ROUNDS": args.max_fold_rounds,
+        "VKOP_MAX_FUSE_ROUNDS": args.max_fuse_rounds,
+        "VKOP_NO_PASSES": args.no_passes,
+        "VKOP_NO_FUSIONS": args.no_fusions,
+    }
+    for env_name, val in mapping.items():
+        if val is not None:
+            os.environ[env_name] = str(val)
+            print(f"[config] {env_name}={val}")
 
 
 def main():
     """Main entry point for the CLI."""
     args = parse_args()
+    _apply_build_knobs(args)
 
     # Validate input file
     input_path = Path(args.input)

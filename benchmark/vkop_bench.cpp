@@ -86,13 +86,16 @@ struct Options {
     // from the vkopbin; a numpy reader can reconstruct via
     // np.frombuffer(...).reshape(shape).astype(dtype).
     std::string save_outputs_dir;
-    // Turn on per-op GPU timestamp profiling (same pipeline VKOP_SUBMIT_PROF
-    // uses) and dump the last Run()'s timings as JSON to this path. Shape:
-    //   { "timestamp_period_ns": ..., "level_count": ...,
-    //     "total_gpu_ms": ..., "nodes": [
-    //       { "op_type": "MatMul", "name": "/q_proj/MatMul",
-    //         "level": 12, "ms": 0.42 }, ... ] }
+    // JSON dump of per-node GPU timings from the last Run(), written as JSON. Enables
+    // the runtime's submit-side timestamp query pool (same as
+    // VKOP_SUBMIT_PROF=1) before warmup so the last run is populated.
     std::string profile_out_path;
+    // Physical-device selector. VulkanInstance sorts discrete > integrated >
+    // virtual > CPU, so --device 0 is "the fastest real GPU present"; --device
+    // 1 hits the integrated iGPU on a laptop with both. --list-devices
+    // enumerates in that same order without loading any model.
+    int device_index = 0;
+    bool list_devices_only = false;
 };
 
 void usage(const char *argv0) {
@@ -107,6 +110,8 @@ void usage(const char *argv0) {
                  "  --load-inputs DIR     fill inputs from DIR/<name>.npy; misses fall back to random\n"
                  "  --save-outputs DIR    write each output to DIR/<name>.bin after the last run\n"
                  "  --profile-out FILE    dump per-node GPU timings as JSON (enables submit profiling)\n"
+                 "  --device N            pick physical device N (sorted discrete>iGPU>cpu; default 0)\n"
+                 "  --list-devices        enumerate physical devices and exit\n"
                  "  --list-inputs         print each input's name/dtype/shape and exit\n"
                  "  --time-load-only      measure LoadModel only, no Run()\n",
                  argv0);
@@ -151,8 +156,17 @@ bool parse_args(int argc, char **argv, Options &o) {
         usage(argv[0]);
         return false;
     }
-    o.model_path = first;
-    for (int i = 2; i < argc; ++i) {
+    // --list-devices does not need a model; accept it as argv[1] and start
+    // option parsing at argv[2] like normal, but skip the "no model path"
+    // check below.
+    int start = 1;
+    if (first == "--list-devices") {
+        o.list_devices_only = true;
+    } else {
+        o.model_path = first;
+        start = 2;
+    }
+    for (int i = start; i < argc; ++i) {
         std::string a = argv[i];
         auto need_next = [&](const char *flag) -> const char * {
             if (i + 1 >= argc) {
@@ -193,6 +207,10 @@ bool parse_args(int argc, char **argv, Options &o) {
             o.save_outputs_dir = need_next("--save-outputs");
         } else if (a == "--profile-out") {
             o.profile_out_path = need_next("--profile-out");
+        } else if (a == "--device") {
+            o.device_index = std::atoi(need_next("--device"));
+        } else if (a == "--list-devices") {
+            o.list_devices_only = true;
         } else if (a == "--shape") {
             std::string spec = need_next("--shape");
             std::string name;
@@ -610,7 +628,50 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no vulkan device\n");
         return 1;
     }
-    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    if (o.list_devices_only) {
+        std::printf("%d physical device(s), in vkop's preferred order:\n",
+                    static_cast<int>(phydevs.size()));
+        for (size_t i = 0; i < phydevs.size(); ++i) {
+            VkPhysicalDeviceProperties props;
+            // VulkanLib.hpp installs per-TU static function pointers inside
+            // namespace vkop (the loader is dlopen-based, so the global
+            // vkGetPhysicalDeviceProperties symbol is deliberately not
+            // linked). Reach the vkop-scoped alias for the same entry point.
+            vkop::vkGetPhysicalDeviceProperties(phydevs[i], &props);
+            const char *type = "UNKNOWN";
+            switch (props.deviceType) {
+            case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+                type = "DISCRETE";
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+                type = "INTEGRATED";
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+                type = "VIRTUAL";
+                break;
+            case VK_PHYSICAL_DEVICE_TYPE_CPU:
+                type = "CPU";
+                break;
+            default:
+                break;
+            }
+            std::printf("  [%zu] %-11s %s  (vendor=0x%04x device=0x%04x)\n", i,
+                        type, props.deviceName, props.vendorID, props.deviceID);
+        }
+        return 0;
+    }
+    if (o.device_index < 0 ||
+        static_cast<size_t>(o.device_index) >= phydevs.size()) {
+        std::fprintf(stderr,
+                     "--device %d out of range (0..%zu); use --list-devices\n",
+                     o.device_index, phydevs.size() - 1);
+        return 2;
+    }
+    if (o.model_path.empty()) {
+        std::fprintf(stderr, "no model path (also accepts --list-devices)\n");
+        return 2;
+    }
+    auto dev = std::make_shared<VulkanDevice>(phydevs[o.device_index]);
     auto cmdpool = std::make_shared<vkop::VulkanCommandPool>(dev);
 
     auto t_load_0 = std::chrono::steady_clock::now();
@@ -656,13 +717,30 @@ int main(int argc, char **argv) {
     // With --load-inputs, each tensor is filled from DIR/<name>.npy when
     // the file exists (its shape wins over --shape); otherwise the random
     // fill path is taken so a partial dump still runs.
+    //
+    // Wall time and byte total for this phase become h2d_ms / h2d_bytes
+    // in the profile JSON. This is the transfer cost the "steady-state
+    // decode 110ms" number elides: every input's first upload is here,
+    // not inside Run(). For a llm.vkopbin decode bench at past=512 the
+    // KV caches alone are ~28 MB of H2D before the first iteration.
     int from_npy = 0;
+    double h2d_ms = 0.0;
+    uint64_t h2d_bytes = 0;
+    auto t_h2d_0 = std::chrono::steady_clock::now();
     for (size_t i = 0; i < names.size(); ++i) {
         bool served = false;
         prep_input_from_dir_or_random(rt, cmdpool, names[i], o,
                                       static_cast<uint32_t>(i), served);
         if (served)
             ++from_npy;
+        auto t = rt->GetInput(names[i]);
+        if (t)
+            h2d_bytes += static_cast<uint64_t>(t->size());
+    }
+    dev->wait_all_done();
+    {
+        auto t_h2d_1 = std::chrono::steady_clock::now();
+        h2d_ms = std::chrono::duration<double, std::milli>(t_h2d_1 - t_h2d_0).count();
     }
     if (!o.load_inputs_dir.empty()) {
         std::printf("inputs: %d from npy, %d random\n", from_npy,
@@ -704,10 +782,33 @@ int main(int argc, char **argv) {
     // Outputs land after the LAST run; a --load-inputs verification dump
     // matches whatever the final iteration produced. If the caller only
     // wants a correctness dump (no timing), --iters 1 --warmup 0 gives
-    // exactly one Run() before save.
+    // exactly one Run() before save. Wall time and byte total become
+    // d2h_ms / d2h_bytes in the profile JSON. Done before the transfer
+    // print so D2H sits next to H2D in both stdout and the JSON.
+    double d2h_ms = 0.0;
+    uint64_t d2h_bytes = 0;
     if (!o.save_outputs_dir.empty()) {
         std::printf("\nsaving outputs to %s\n", o.save_outputs_dir.c_str());
+        auto t_d2h_0 = std::chrono::steady_clock::now();
+        for (const auto &n : rt->ListOutputNames()) {
+            auto t = rt->GetOutput(n);
+            if (t)
+                d2h_bytes += static_cast<uint64_t>(t->size());
+        }
         save_outputs(rt, cmdpool, o.save_outputs_dir);
+        dev->wait_all_done();
+        auto t_d2h_1 = std::chrono::steady_clock::now();
+        d2h_ms = std::chrono::duration<double, std::milli>(t_d2h_1 - t_d2h_0).count();
+    }
+
+    std::printf("\ntransfers:\n");
+    std::printf("  h2d  %8.3f ms  %12llu bytes  %8.2f MB/s\n", h2d_ms,
+                (unsigned long long)h2d_bytes,
+                h2d_ms > 0 ? h2d_bytes / (h2d_ms * 1e3) : 0.0);
+    if (d2h_ms > 0 || d2h_bytes > 0) {
+        std::printf("  d2h  %8.3f ms  %12llu bytes  %8.2f MB/s\n", d2h_ms,
+                    (unsigned long long)d2h_bytes,
+                    d2h_ms > 0 ? d2h_bytes / (d2h_ms * 1e3) : 0.0);
     }
 
     // JSON dump of per-node GPU timings from the LAST profiled Run(). Same
@@ -738,6 +839,11 @@ int main(int argc, char **argv) {
             pf << "  \"timestamp_period_ns\": " << rt->timestamp_period_ns()
                << ",\n";
             pf << "  \"total_gpu_ms\": " << total << ",\n";
+            pf << "  \"device_index\": " << o.device_index << ",\n";
+            pf << "  \"h2d_ms\": " << h2d_ms << ",\n";
+            pf << "  \"h2d_bytes\": " << h2d_bytes << ",\n";
+            pf << "  \"d2h_ms\": " << d2h_ms << ",\n";
+            pf << "  \"d2h_bytes\": " << d2h_bytes << ",\n";
             pf << "  \"node_count\": " << timings.size() << ",\n";
             pf << "  \"nodes\": [\n";
             for (size_t i = 0; i < timings.size(); ++i) {

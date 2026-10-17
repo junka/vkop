@@ -18,6 +18,21 @@ except ImportError:  # onnxsim 可选；缺失则退回 ConstantFolder
 from .dag import Node
 
 
+def _env_int(name: str, default: int) -> int:
+    """Read an int from env with a fallback. Empty or unparsable values
+    return `default` so `VKOP_MAX_FOLD_ROUNDS=` is a no-op, not a crash.
+    onnx2vkop's CLI writes the same env names to plumb its flags without
+    threading knobs through every function signature; library callers can
+    also just set them before invoking."""
+    v = os.environ.get(name)
+    if v is None or v == "":
+        return default
+    try:
+        return int(v)
+    except ValueError:
+        return default
+
+
 # ONNX TensorProto elem_type -> numpy dtype，常量折叠算值用。
 _NP_DTYPE = {
     TensorProto.FLOAT: np.float32, TensorProto.FLOAT16: np.float16,
@@ -258,8 +273,14 @@ class ConstantFolder:
         return True
 
     @staticmethod
-    def fold(model, max_rounds: int = 25, verbose: bool = True):
-        """迭代常量折叠，直到不动点或 max_rounds。原地修改 model。"""
+    def fold(model, max_rounds: int = None, verbose: bool = True):
+        """迭代常量折叠，直到不动点或 max_rounds。原地修改 model。
+
+        max_rounds defaults to VKOP_MAX_FOLD_ROUNDS env, or 25. A caller
+        (onnx2vkop --max-fold-rounds) overrides both.
+        """
+        if max_rounds is None:
+            max_rounds = _env_int("VKOP_MAX_FOLD_ROUNDS", 25)
         # 1a. 剥离大 initializer 的 raw_data：对大模型（>2GB proto 上限）shape
         #     inference 内部会 SerializeToString 整个 model 而失败。形状推断只
         #     需要形状/类型信息，权重字节无用。但小 initializer（int64 形状轴、
@@ -364,7 +385,9 @@ class ConstantFolder:
 # that cap costs it nothing.
 _VIEW_DEMOTE_CAP = 1 << 20
 _VIEW_MIN_INIT_BYTES = 3 * (1 << 30) // 2
-_MAX_VIEW_ROUNDS = 3
+# View-chain folding rounds. Env-overridable so a caller chasing a fold
+# that doesn't quite converge can bump it without editing code.
+_MAX_VIEW_ROUNDS = _env_int("VKOP_MAX_VIEW_ROUNDS", 3)
 
 
 def _demote_large_initializers(model):
@@ -789,9 +812,14 @@ class PatternBasedFusionPass(OptimizationPass):
 
 
 class MultiRoundOptimizer:
-    def __init__(self, max_rounds: int = 10):
+    def __init__(self, max_rounds: int = None):
         self.passes: List[OptimizationPass] = []
-        self.max_rounds = max_rounds
+        # None -> VKOP_MAX_FUSE_ROUNDS env (default 10). A caller that
+        # explicitly passes an int wins over the env.
+        self.max_rounds = (
+            max_rounds if max_rounds is not None
+            else _env_int("VKOP_MAX_FUSE_ROUNDS", 10)
+        )
         self.stats = OptimizationStats()
 
     def register_pass(self, pass_instance: OptimizationPass):
@@ -882,7 +910,7 @@ class FusionOptimizer:
     }
 
     @staticmethod
-    def create_default_optimizer(max_rounds: int = 10) -> MultiRoundOptimizer:
+    def create_default_optimizer(max_rounds: int = None) -> MultiRoundOptimizer:
         optimizer = MultiRoundOptimizer(max_rounds=max_rounds)
 
         optimizer.register_pass(
@@ -1275,7 +1303,10 @@ class FusionOptimizer:
         return optimizer
 
     @staticmethod
-    def optimize(dag_model, max_rounds: int = 10):
+    def optimize(dag_model, max_rounds: int = None):
+        # None -> VKOP_MAX_FUSE_ROUNDS env (default 10), same source the
+        # MultiRoundOptimizer ctor uses; a caller passing an explicit int
+        # still wins.
         optimizer = FusionOptimizer.create_default_optimizer(max_rounds)
         optimizer.optimize(dag_model, verbose=True)
         return dag_model

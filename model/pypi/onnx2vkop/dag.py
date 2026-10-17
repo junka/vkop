@@ -1,5 +1,6 @@
 """DAG-based model representation."""
 
+import os
 from collections import deque
 from typing import Any, Dict, List, Set, Tuple
 
@@ -481,7 +482,15 @@ class DAGBasedModel:
                 total_blob += _init_byte_len(arr)
             if getattr(self, "_unified_bytes", b""):
                 total_blob += len(self._unified_bytes)
-            if total_blob > (800 << 20):
+            # VKOP_EXTERNAL_BLOB_MB (default 800) is the switch point; a
+            # smaller value forces external mode on models that would
+            # otherwise inline (useful for testing the trailer path without
+            # a multi-GB file). onnx2vkop --external-blob-mb writes this env.
+            threshold_mb = 800
+            _e = os.environ.get("VKOP_EXTERNAL_BLOB_MB")
+            if _e and _e.isdigit():
+                threshold_mb = int(_e)
+            if total_blob > (threshold_mb << 20):
                 external = True
         except Exception:
             external = False
