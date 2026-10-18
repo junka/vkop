@@ -363,6 +363,50 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
+| `VK_PIPELINE_CACHE=1` | 任意驱动都认：把 pipeline 序列化进 `<model>.vkopbin.pcache`。llm 上 `vkop-bench --time-load-only` 实测 4083.8 → 1512.4 ms，但**只有配 `MESA_SHADER_CACHE_DISABLE=1` 才看得出来**；开着 Mesa 时两侧只差 ~70 ms，会把 vkop 的贡献完全掩盖 |
+| `VKOP_SHADER_ARCHIVE=<path>` | SPIR-V 全部改从打包归档取；`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit / miss / no key`。生产配对 `llm.vkopbin` + `llm.vkopbin.shaders.bin`（1,025,704 B、41 条）现在是 681 hit / **0 miss** |
+| `VKOP_KV_CACHE=1` | 仅 `llm_driver`：预分配每层 `VKOP_KV_MAX` 容量的 cache 并按该步长搬运历史，用来驱动 `has_cache` 形态的 `Attention`。在旋转形态（无 `has_cache`）的 vkopbin 上会直接拒绝而不是错跑 |
+| `VKOP_KV_MAX=<rows>` | 上一条的容量，默认 8192。**注意计时陷阱**：驱动会把 cap 步长的 staging 清零，8192 行 × 28 层 ≈ 938 MB，在 `past_len=0` 上白烧 ~39 ms，看起来像 attention 融合变慢了。实测 fused cap=8192 → 125.63 ms、cap=64 → 86.70 ms、旋转形式 → 94.33 ms；数值与 cap 无关（两档都是 max 0.2305 / mean 0.04192） |
+
+### 构建期开关（onnx2vkop）
+
+`python3 -m onnx2vkop.cli` 上的这五个开关只影响构建图的过程，值以前要么写死在代码里、
+要么只能靠环境变量：
+
+| 开关 | 原来 | 默认 |
+|---|---|---|
+| `--external-blob-mb N` | 写死 `total_blob > 800 << 20` | 800 MiB（FlatBuffer 2 GiB 向量上限留余量；llm 3.4 GB 自动走外置 trailer） |
+| `--max-fold-rounds N` | 写死 `ConstantFolder.fold(max_rounds=25)` | 25 |
+| `--max-fuse-rounds N` | 写死 `MultiRoundOptimizer(max_rounds=10)` | 10 |
+| `--no-passes=A,B,C` | `VKOP_NO_PASSES` | 关 |
+| `--no-fusions=A,B,C` | `VKOP_NO_FUSIONS` | 关 |
+
+命令行与环境变量是同一条代码路径（CLI 只是先写 `os.environ`，读取方在调用时取值），
+所以不会出现两套配置互相漂移。三点要注意：
+
+- 显式传参的调用者优先于环境变量；环境变量为空或不可解析时回落默认值而不是报错。
+- `VKOP_MAX_VIEW_ROUNDS` 是**第六个**旋钮，但它是模块 import 期求值的模块级常量，
+  所以只认进程启动前的 shell 环境变量，也没有对应 CLI flag。
+- 消融名单里拼错的名字现在会被单独点名（`names no onnxoptimizer pass: [...]` /
+  `names no registered pass: [...]`），不再跟着真正关掉的一起打印——否则一次 A/B
+  量的其实是同一条流水线两遍。
+
+per-model 归档与部署配对（`--target-backend` 决定选哪批 key，这个差别是实打实的字节数）：
+
+```bash
+python3 -m onnx2vkop.cli -i llm/exporter/llm.onnx -o llm/exporter/llm.vkopbin \
+  --emit-shader-archive llm/exporter/llm.vkopbin.shaders.bin \
+  --master-archive build/vkop_shaders.bin --target-backend buffer
+VKOP_SHADER_ARCHIVE=llm/exporter/llm.vkopbin.shaders.bin \
+  VKOP_KV_CACHE=1 VKOP_KV_MAX=64 build/llm_driver llm/exporter/llm.vkopbin \
+  llm/exporter/decode_dump
+```
+
+同一张 master（`build/vkop_shaders.bin`，2,761,008 B / 135 条）上实测的子集大小：
+`cache_block` 99,472 B（3.6%）；resnet18 HEAD 转换 buffer 615,332 B（22.3%，13 条）
+vs image 342,124 B（12.4%，10 条）；llm 旋转形态 953,220 B（34.5%）；
+llm 融合形态 1,025,704 B（37.1%，41 条，比旋转形态多 `buffer_attention{,_fp16}`、
+少 `buffer_softmax{,_fp16}`）。
 
 ### Profiling 性能分析
 

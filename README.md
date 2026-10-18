@@ -115,8 +115,11 @@ options:
 
 #### 5. LLM 推理（llm/exporter/driver/llm_chat.cpp）
 
-- KV cache 已 GPU 化：decode 每轮 present→past 为单条命令缓冲内的
-  device→device 拷贝，无 CPU 往返（原 `KV_INPLACE_PLAN` 已完成并删除）。
+- KV cache 已 GPU 化，而且**不再有任何拷贝**：converter 把每层的 past/present
+  合成同一个 buffer（`fuse_kv_cache_append`，`Attention` 带 `has_cache`），
+  decode 每轮由 kernel 就地在容量步长上追加一行，present 就是 past，既无
+  device→device 拷贝也无 CPU 往返（原 `KV_INPLACE_PLAN` 已完成并删除）。
+  当前 `llm/exporter/llm.vkopbin` 的 28 层全是这个形态。
 - GPU shape-meta：张量带 `shape_ssbo_` 侧信道（产出方填充），binary 广播
   shader 的 broadcast==2 SSBO 路径 + `dispatch_from_shape` 间接派发已落地，
   由 `VKOP_GPU_SHAPE` 开关控制（默认关，走 CPU dims 回退）。稳态 readback
@@ -268,9 +271,11 @@ Supports manually registering post-processing operations like softmax and top-k 
 
 #### 6. LLM inference (llm/exporter/driver/llm_chat.cpp)
 
-- KV cache is GPU-resident: each decode round copies present→past
-  device→device inside one command buffer, with no CPU round-trip (the
-  former `KV_INPLACE_PLAN` is done and removed).
+- KV cache is GPU-resident and, since `fuse_kv_cache_append`, **not copied at
+  all**: each layer's past and present are one buffer (`Attention` carries
+  `has_cache`), so a decode round appends the new row in place at the bound
+  buffer's capacity pitch and hands back the same tensor — no device→device
+  copy, no CPU round-trip (the former `KV_INPLACE_PLAN` is done and removed).
 - GPU shape-meta: tensors carry a `shape_ssbo_` side-channel (populated by
   the producing op); the broadcast==2 SSBO path in binary shaders plus
   `dispatch_from_shape` indirect dispatch are wired up behind the

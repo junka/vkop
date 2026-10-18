@@ -152,6 +152,66 @@ VKOP_CNN_PROFILE=1 ./build/benchmark/vkbench \
 - **memory layout waste**：VkImage array pitch 对齐导致的显存浪费百分比，用于评估折叠策略收益
 
 未来会集成：
-- Per-op timing（conv2d/matmul 按 kernel size 分类统计）
+- Per-op timing（conv2d/matmul 按 kernel size 分类统计）→ 已由 `vkop-bench --profile-out` 提供
 - 详细的 conv breakdown（每个 conv 层的耗时占比）
-- H2D/D2H transfer 统计
+- H2D/D2H transfer 统计 → 已由 `vkop-bench` 的 `h2d_ms/h2d_bytes/d2h_ms/d2h_bytes` 提供
+
+## vkop-bench — 任意 vkopbin 的通用驱动
+
+上面的 `vkbench` 是 CNN 专用的：它要一张真实图片和 `imagenet_classes.txt`，输出
+top-k 分类结果。`vkop-bench` 不挑模型、不需要外部数据，dtype 匹配的随机输入或
+`--load-inputs` 的 `.npy` 都能喂：
+
+```bash
+build/benchmark/vkop-bench <model.vkopbin> [options]
+```
+
+| 选项 | 作用 |
+|---|---|
+| `--iters N` / `--warmup N` | 计时轮数 / 计时前的预热轮数（默认 10 / 3） |
+| `--precision fp16\|fp32` | 图精度（默认 fp16） |
+| `--backend buffer\|image` | 运行时后端（默认 buffer）。模型与后端不匹配现在是**可读错误**，见下 |
+| `--shape name:d1xd2x...` | 把某个动态输入 resize 到具体维度，可重复 |
+| `--seed N` | 随机输入的种子（默认 `0xc0ffee`，同种子同输入可复现） |
+| `--load-inputs DIR` | 从 `DIR/<name>.npy` 填输入；缺的文件回退到随机 |
+| `--save-outputs DIR` | 最后一轮把每个输出写成裸 `.bin`（做逐字节 A/B 用） |
+| `--profile-out FILE` | 输出逐 op GPU 计时 JSON，并隐式打开 submit profiling |
+| `--list-devices` | 按 vkop 的偏好顺序（DISCRETE > INTEGRATED > VIRTUAL > CPU）列出物理设备并退出 |
+| `--device N` | 选择第 N 个物理设备；越界直接报错退出（`--list-devices` 时同样检查） |
+| `--list-inputs` | 打印每个输入的名字/类型/形状后退出 |
+| `--time-load-only` | 只测 `LoadModel`，不跑 `Run()` |
+
+实测例子（Intel ARL，`llm.vkopbin`，decode round 5 的真输入）：
+
+```bash
+build/benchmark/vkop-bench llm/exporter/llm.vkopbin \
+  --load-inputs llm/exporter/decode_dump/round5 \
+  --iters 5 --warmup 2 --profile-out /tmp/llm.json --save-outputs /tmp/out
+```
+
+`/tmp/llm.json` 的顶层字段是 `timestamp_period_ns / total_gpu_ms / device_index /
+h2d_ms / h2d_bytes / d2h_ms / d2h_bytes / node_count / nodes`。同一份模型两种形态的
+对照（round 5，`--iters 5`）：fused cache 形式 683 节点、total GPU 69.387 ms、
+14.01 runs/s；`--no-fusions fuse_into_attention` 转出来的旋转形式 935 节点、72.309 ms、
+13.27 runs/s。
+
+两个 `LoadModel`/绑定阶段的后端不匹配现在都以 rc=2 报出来，不再 abort：
+
+```
+vkop-bench: Run(model/onnx_models/resnet18.vkopbin) failed: Expected VulkanImage but got something else.
+           if this vkopbin was converted for the other backend, pass --backend image
+vkop-bench: --device 99 out of range (0..1); use --list-devices
+```
+
+影响 `vkop-bench` 的环境变量（它自己不含这些逻辑，都在 libvkop 里）：
+
+| 变量 | 作用 |
+|---|---|
+| `VK_PIPELINE_CACHE=1` | 把 pipeline 序列化到 `<model>.vkopbin.pcache`；`=debug` 打印命中情况。llm 上实测 4083.8 → 1512.4 ms（**必须**配 `MESA_SHADER_CACHE_DISABLE=1` 才看得见，否则 Intel 自己的 disk cache 会把差别吃掉，看着只有 ~70 ms） |
+| `VKOP_SHADER_ARCHIVE=<path>` | 所有 op 的 SPIR-V 改从打包归档取；`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit/miss/no key`，并打 `opened <path> (N entries)` |
+| `VKOP_SUBMIT_PROF=1` | 把逐 op GPU 时间打到 stderr（`--profile-out` 走的是同一条采集路径，但输出成 JSON） |
+| `MESA_SHADER_CACHE_DISABLE=1` | 关掉 Mesa 的 disk shader cache，用来把 vkop 自己的 pipeline cache 贡献单独量出来 |
+
+归档模式的正确性是量过的，不是假设：stripped 构建（`VKOP_STRIP_BUILTIN_SHADERS=ON`）
+配 `llm.vkopbin.shaders.bin`（1,025,704 B、41 条）跑 round 5，`--save-outputs` 的
+29 个文件与内嵌 shader 的普通构建**逐字节相同**，归档命中 681 次、miss 0 次。
