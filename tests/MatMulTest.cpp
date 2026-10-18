@@ -1432,6 +1432,13 @@ TEST(MatMulTest, MatMulSplitKGemvBuffer) {
     // cover the slicing edges rather than more sizes: K a multiple of 16 slices,
     // K that is not (the tail slices go empty), an N whose last 16-quad block is
     // partial, more than one output row, and a broadcast batch.
+    //
+    // The guard is what makes the name true: without VKOP_BUFFER_BACKEND the
+    // fixture builds the *image* MatMul, so this "Buffer" test was exercising
+    // the image path -- and it only shows up on a stripped build, where the
+    // split-K GEMV shape resolves a different shader key than the one the
+    // image op wants.
+    vkop::tests::ScopedBufferBackend buffer;
     const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
         {{1, 1, 512}, {1, 512, 256}},
         {{1, 1, 258}, {1, 258, 260}},

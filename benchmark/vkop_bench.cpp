@@ -41,6 +41,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <fstream>
 #include <memory>
 #include <numeric>
@@ -628,6 +629,16 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "no vulkan device\n");
         return 1;
     }
+    // Validate --device before the --list-devices early return: `vkop-bench
+    // --list-devices --device 99` used to print the list and exit 0, silently
+    // ignoring an index that would have been rejected on any other path.
+    if (o.device_index < 0 ||
+        static_cast<size_t>(o.device_index) >= phydevs.size()) {
+        std::fprintf(stderr,
+                     "--device %d out of range (0..%zu); use --list-devices\n",
+                     o.device_index, phydevs.size() - 1);
+        return 2;
+    }
     if (o.list_devices_only) {
         std::printf("%d physical device(s), in vkop's preferred order:\n",
                     static_cast<int>(phydevs.size()));
@@ -660,13 +671,6 @@ int main(int argc, char **argv) {
         }
         return 0;
     }
-    if (o.device_index < 0 ||
-        static_cast<size_t>(o.device_index) >= phydevs.size()) {
-        std::fprintf(stderr,
-                     "--device %d out of range (0..%zu); use --list-devices\n",
-                     o.device_index, phydevs.size() - 1);
-        return 2;
-    }
     if (o.model_path.empty()) {
         std::fprintf(stderr, "no model path (also accepts --list-devices)\n");
         return 2;
@@ -677,7 +681,28 @@ int main(int argc, char **argv) {
     auto t_load_0 = std::chrono::steady_clock::now();
     auto rt = std::make_shared<Runtime>(cmdpool, o.model_path, o.precision);
     rt->set_backend_buffer(o.buffer_backend);
-    rt->LoadModel();
+    // A .vkopbin records no backend flag that predicts this failure: a graph
+    // converted for the other backend throws where a tensor is bound for the
+    // layout the runtime chose (as_input_image() in core/Tensor.hpp), so it
+    // can surface in LoadModel, in the input pre-fill, or in Run().
+    // `vkop-bench model/onnx_models/resnet18.vkopbin` on the default buffer
+    // backend used to abort uncaught with "Expected VulkanImage but got
+    // something else." (rc=134), which reads as a runtime bug rather than a
+    // flag mismatch. Name the phase, the model and the switch to flip.
+    auto backend_mismatch = [&](const char *phase, const std::exception &e) {
+        std::fprintf(stderr,
+                    "vkop-bench: %s(%s) failed: %s\n"
+                    "           if this vkopbin was converted for the other "
+                    "backend, pass --backend %s\n",
+                    phase, o.model_path.c_str(), e.what(),
+                    o.buffer_backend ? "image" : "buffer");
+    };
+    try {
+        rt->LoadModel();
+    } catch (const std::exception &e) {
+        backend_mismatch("LoadModel", e);
+        return 2;
+    }
     auto t_load_1 = std::chrono::steady_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(t_load_1 - t_load_0).count();
 
@@ -727,15 +752,20 @@ int main(int argc, char **argv) {
     double h2d_ms = 0.0;
     uint64_t h2d_bytes = 0;
     auto t_h2d_0 = std::chrono::steady_clock::now();
-    for (size_t i = 0; i < names.size(); ++i) {
-        bool served = false;
-        prep_input_from_dir_or_random(rt, cmdpool, names[i], o,
-                                      static_cast<uint32_t>(i), served);
-        if (served)
-            ++from_npy;
-        auto t = rt->GetInput(names[i]);
-        if (t)
-            h2d_bytes += static_cast<uint64_t>(t->size());
+    try {
+        for (size_t i = 0; i < names.size(); ++i) {
+            bool served = false;
+            prep_input_from_dir_or_random(rt, cmdpool, names[i], o,
+                                          static_cast<uint32_t>(i), served);
+            if (served)
+                ++from_npy;
+            auto t = rt->GetInput(names[i]);
+            if (t)
+                h2d_bytes += static_cast<uint64_t>(t->size());
+        }
+    } catch (const std::exception &e) {
+        backend_mismatch("input pre-fill", e);
+        return 2;
     }
     dev->wait_all_done();
     {
@@ -754,18 +784,23 @@ int main(int argc, char **argv) {
     }
     dev->wait_all_done();
 
-    for (int w = 0; w < o.warmup; ++w) {
-        rt->Run();
-    }
-    dev->wait_all_done();
-
     std::vector<double> samples;
     samples.reserve(o.iters);
-    for (int i = 0; i < o.iters; ++i) {
-        auto t0 = std::chrono::steady_clock::now();
-        rt->Run();
-        auto t1 = std::chrono::steady_clock::now();
-        samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    try {
+        for (int w = 0; w < o.warmup; ++w) {
+            rt->Run();
+        }
+        dev->wait_all_done();
+
+        for (int i = 0; i < o.iters; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            rt->Run();
+            auto t1 = std::chrono::steady_clock::now();
+            samples.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+        }
+    } catch (const std::exception &e) {
+        backend_mismatch("Run", e);
+        return 2;
     }
     dev->wait_all_done();
 
