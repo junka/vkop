@@ -126,14 +126,23 @@ class Operator {
         // Fail with an actionable message at load time instead. PimplFacade
         // passes spv_=nullptr, len=0 (not a stub) and is unaffected.
         if (spv_len_ == 0 && spv_ != nullptr) {
-            throw std::runtime_error(
-                "vkop: " +
-                (name_.empty() ? std::string(convert_optype_to_string(type_))
-                               : name_) +
-                " has a stubbed SPIR-V array (this libvkop was built with "
-                "VKOP_STRIP_BUILTIN_SHADERS=ON). Set VKOP_SHADER_ARCHIVE="
-                "<path to vkop_shaders.bin> before LoadModel so the archive "
-                "can populate shaders at runtime.");
+            // Runtime swaps archive bytes into the primary before calling this
+            // for ops it builds from a model file. Ops built straight through
+            // create_from_type() (unit-test fixtures, example drivers) never
+            // get that call, so try this op's own key against the
+            // process-wide archive before declaring it unrunnable.
+            if (!resolve_stubbed_primary_spv()) {
+                throw std::runtime_error(
+                    "vkop: " +
+                    (name_.empty()
+                         ? std::string(convert_optype_to_string(type_))
+                         : name_) +
+                    " has a stubbed SPIR-V array (this libvkop was built with "
+                    "VKOP_STRIP_BUILTIN_SHADERS=ON). Set VKOP_SHADER_ARCHIVE="
+                    "<path to vkop_shaders.bin> before LoadModel so the "
+                    "archive "
+                    "can populate shaders at runtime.");
+            }
         }
         if (spv_len_ > 0 && spv_) {
             bool use_uab = update_after_bind_ &&
@@ -480,6 +489,15 @@ class Operator {
     std::pair<const uint32_t *, uint32_t>
     resolve_spv(const std::string &key, const unsigned char *embedded,
                 unsigned int embedded_len) const;
+
+    // Last-resort recovery of this op's PRIMARY shader when it still holds a
+    // stub array: looks up shader_key_for(type_, uses_buffer_backend(), fp16_)
+    // on the op's own archive pointer, or on ShaderArchive::process_default()
+    // when Runtime never set one, and feeds the result through override_spv().
+    // False means no archive is reachable or the key is absent, so the caller
+    // keeps the loud throw. Lives in Operator.cpp: it needs ShaderKeys.hpp and
+    // the complete ShaderArchive type, both of which the header avoids.
+    bool resolve_stubbed_primary_spv();
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

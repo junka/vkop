@@ -1,7 +1,10 @@
 // Copyright 2025 @junka
 #include "core/ShaderArchive.hpp"
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <memory>
 
 namespace vkop {
 namespace core {
@@ -76,6 +79,34 @@ ShaderArchive::lookup(const std::string &key) const {
     // well-formed uint32_t SPIR-V word stream.
     return {reinterpret_cast<const uint32_t *>(base + it->second.offset),
             it->second.size};
+}
+
+const ShaderArchive *ShaderArchive::process_default() {
+    // Function-local static: the environment is read once per process on first
+    // need, and C++11 guarantees the initialisation is thread-safe. A bad path
+    // is reported once here rather than per op.
+    static const std::unique_ptr<ShaderArchive> archive = [] {
+        const char *path = std::getenv("VKOP_SHADER_ARCHIVE");
+        if (path == nullptr || path[0] == '\0') {
+            return std::unique_ptr<ShaderArchive>{};
+        }
+        auto opened = ShaderArchive::open(path);
+        if (!opened) {
+            std::fprintf(stderr,
+                         "[shaders] VKOP_SHADER_ARCHIVE=%s is not a usable "
+                         "archive; ops built outside LoadModel keep their "
+                         "stubbed SPIR-V\n",
+                         path);
+            return std::unique_ptr<ShaderArchive>{};
+        }
+        if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+            std::fprintf(stderr,
+                         "[shaders] process-default opened %s (%zu entries)\n",
+                         path, opened->entry_count());
+        }
+        return opened;
+    }();
+    return archive.get();
 }
 
 } // namespace core

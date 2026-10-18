@@ -51,7 +51,11 @@ class Gather : public Operator {
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
-                   sizeof(gather::GpuGatherParam)) {}
+                   // The base's fp16_ is what archive-key resolution reads;
+                   // omitting it here made an fp16 Gather ask for the fp32
+                   // shader (invisible in the embedded build, where the ctor
+                   // already picked the array).
+                   sizeof(gather::GpuGatherParam), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

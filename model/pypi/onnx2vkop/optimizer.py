@@ -496,6 +496,19 @@ def _disabled_passes(env_var):
     return {p.strip() for p in os.environ.get(env_var, "").split(",") if p.strip()}
 
 
+def _disabled_split(env_var, universe):
+    """Split an ablation list into names that exist and names that do not.
+
+    The notices used to echo the requested list back, so an ablation list with
+    one letter transposed printed as though it had disabled something while it
+    disabled nothing -- the resulting A/B number measures the same pipeline
+    twice. Callers keep subtracting the whole set (unknown names can only ever
+    match nothing); this exists so the log can say which is which.
+    """
+    off = _disabled_passes(env_var)
+    return sorted(off & universe), sorted(off - universe)
+
+
 class ONNXOptimizer:
     """Class for optimizing ONNX models."""
 
@@ -509,10 +522,13 @@ class ONNXOptimizer:
           等元算子整段折叠成 initializer）。若装了 onnxsim 也作为可选增强。
         失败自动回退到 onnxoptimizer + shape_inference。
         """
-        off = _disabled_passes("VKOP_NO_PASSES")
+        matching, stray = _disabled_split("VKOP_NO_PASSES", set(ONNXOPTIMIZER_PASSES))
+        off = set(matching) | set(stray)
         passes = [p for p in ONNXOPTIMIZER_PASSES if p not in off]
         if off:
-            print(f"[ablate] onnxoptimizer passes disabled: {sorted(off)}")
+            print(f"[ablate] onnxoptimizer passes disabled: {matching}")
+            if stray:
+                print(f"[ablate] VKOP_NO_PASSES names no onnxoptimizer pass: {stray}")
         initializer_names = {init.name for init in onnx_model.graph.initializer}
         actual_inputs = [inp for inp in onnx_model.graph.input if inp.name not in initializer_names]
 
@@ -814,6 +830,11 @@ class PatternBasedFusionPass(OptimizationPass):
 class MultiRoundOptimizer:
     def __init__(self, max_rounds: int = None):
         self.passes: List[OptimizationPass] = []
+        # Every name this optimizer was asked to register, including the ones
+        # VKOP_NO_FUSIONS dropped. warn_unknown_disabled needs the full set: a
+        # disabled pass is absent from self.passes, so judging the ablation
+        # list against self.passes would call a correct --no-fusions a typo.
+        self.known_passes: set = set()
         # None -> VKOP_MAX_FUSE_ROUNDS env (default 10). A caller that
         # explicitly passes an int wins over the env.
         self.max_rounds = (
@@ -823,6 +844,7 @@ class MultiRoundOptimizer:
         self.stats = OptimizationStats()
 
     def register_pass(self, pass_instance: OptimizationPass):
+        self.known_passes.add(pass_instance.name)
         # VKOP_NO_FUSIONS=<comma list> drops named passes. Which fusion pays off
         # is model-dependent (a rope fusion that removes 200 nodes on an LLM is
         # dead weight on a CNN), so ablation is done by env rather than by
@@ -832,6 +854,18 @@ class MultiRoundOptimizer:
             return
         self.passes.append(pass_instance)
         self.passes.sort(key=lambda p: p.priority, reverse=True)
+
+    def warn_unknown_disabled(self, env_var="VKOP_NO_FUSIONS"):
+        """Name the ablation entries that match no pass, and return them.
+
+        Called once the registry is complete (see
+        FusionOptimizer.create_default_optimizer), because a single
+        register_pass cannot tell a typo from a pass registered later.
+        """
+        _matched, stray = _disabled_split(env_var, self.known_passes)
+        if stray:
+            print(f"[ablate] {env_var} names no registered pass: {stray}")
+        return stray
 
     def optimize(self, dag_model, verbose: bool = True) -> OptimizationStats:
         self.stats = OptimizationStats()
@@ -1299,6 +1333,10 @@ class FusionOptimizer:
                 priority=0,
             )
         )
+
+        # Registry is complete now, so this is the first point where an
+        # unmatched VKOP_NO_FUSIONS name can be recognised as one.
+        optimizer.warn_unknown_disabled()
 
         return optimizer
 

@@ -56,6 +56,11 @@ class Gemm : public Operator {
         para_.activation = static_cast<int>(conv2d::ActivationMode::NONE);
     }
 
+    // Gemm has a buffer shader only (no image twin exists in shaders/), so the
+    // base's default false is wrong here: shader_key_for() and anything
+    // resolving an archive key by (type, backend, fp16) needs the truth.
+    bool uses_buffer_backend() const override { return true; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("alpha") != attributes.end()) {

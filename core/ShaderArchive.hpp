@@ -31,6 +31,17 @@ class ShaderArchive {
   public:
     static std::unique_ptr<ShaderArchive> open(const std::string &path);
 
+    // The archive named by VKOP_SHADER_ARCHIVE, opened once per process and
+    // owned here. Runtime::LoadModel hands its own handle to every op it
+    // builds, but ops created straight through ops::create_from_type() — the
+    // unit-test fixtures and the example drivers — never pass through that
+    // hook, so under VKOP_STRIP_BUILTIN_SHADERS=ON they could not reach any
+    // SPIR-V at all and died on the stub array even with a valid archive in
+    // the environment. Operator falls back to this when its own pointer is
+    // null. Returns nullptr when the env is unset or the file is unusable,
+    // which leaves the existing loud throw in place.
+    static const ShaderArchive *process_default();
+
     // Returns (nullptr, 0) on miss. On hit, the returned pointer is a stable
     // address inside the mapping and remains valid for the archive's
     // lifetime. `size` is in bytes and is always 4-byte aligned so a
