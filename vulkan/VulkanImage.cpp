@@ -42,7 +42,13 @@ VulkanImage::VulkanImage(std::shared_ptr<VulkanDevice> &vdev, VkExtent3D dim,
     }
     if (dim.width > vdev->getMaxImageDimension2D() ||
         dim.height > vdev->getMaxImageDimension2D()) {
-        throw std::runtime_error("too large Vulkan image size.");
+        // Name the extent: a bogus one here is almost always a shape bug
+        // upstream (a tensor whose dims don't describe it), not a device limit.
+        throw std::runtime_error(
+            "too large Vulkan image size: " + std::to_string(dim.width) + "x" +
+            std::to_string(dim.height) + "x" + std::to_string(layers) +
+            " (max 2D dimension is " +
+            std::to_string(vdev->getMaxImageDimension2D()) + ")");
     }
     calcImageSize();
     createImage();

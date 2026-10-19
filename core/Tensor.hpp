@@ -21,6 +21,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #if defined(__ARM_NEON) || defined(__aarch64__)
 #include <arm_neon.h>
@@ -46,6 +47,30 @@ using StagingFillFn =
     std::function<void(void *dst, size_t len, size_t upload_offset)>;
 
 template <typename T> class Tensor;
+
+// Rendering for the VKOP_SHAPE_DEBUG diagnostics and the throws that name a
+// shape (a bare "[1,64,56,56]" beats four unlabeled integers).
+inline std::string shape_to_string(const int *dims, uint8_t n) {
+    std::string s = "[";
+    for (uint8_t i = 0; i < n; ++i) {
+        if (i) {
+            s += ",";
+        }
+        s += std::to_string(dims[i]);
+    }
+    return s + "]";
+}
+
+template <typename U> std::string shape_to_string(const std::vector<U> &shape) {
+    std::string s = "[";
+    for (size_t i = 0; i < shape.size(); ++i) {
+        if (i) {
+            s += ",";
+        }
+        s += std::to_string(static_cast<int>(shape[i]));
+    }
+    return s + "]";
+}
 
 class ITensor {
   public:
@@ -141,6 +166,29 @@ class ITensor {
         }
         return shape;
     }
+    // --- shape-view / buffer-alias accounting ------------------------------
+    // A view op is zero-copy only while its guard holds. When the guard fails
+    // the call currently does NOTHING and does not say so, which is how a
+    // tensor ends up used with the wrong rank (a Conv2dImage input reached
+    // execute() with rank 0). These counters make that observable without
+    // changing any behavior: VKOP_SHAPE_DEBUG=1 logs each accepted/rejected
+    // view, and a driver prints the totals at the end.
+    struct ShapeViewStats {
+        uint64_t views_applied = 0;
+        uint64_t views_rejected = 0;
+        uint64_t buffer_aliases = 0;
+    };
+
+    static ShapeViewStats &shape_view_stats() {
+        static ShapeViewStats stats;
+        return stats;
+    }
+
+    static bool shape_debug_enabled() {
+        static const bool on = std::getenv("VKOP_SHAPE_DEBUG") != nullptr;
+        return on;
+    }
+
     // Pure-logical reshape: reset dims_/n_dims_ to `shape` WITHOUT touching the
     // underlying storage (vkobj_ GPU buffer or CPU data_). Safe only when
     // product(shape) == num_elements() — i.e. the new view has the same element
@@ -165,7 +213,24 @@ class ITensor {
         // Guard: only reshape if the element count is unchanged. A mismatch
         // would silently desync the logical view from the physical buffer.
         if (ne_new != ne_old) {
+            shape_view_stats().views_rejected++;
+            if (shape_debug_enabled()) {
+                std::fprintf(stderr,
+                             "[shapeview] REJECTED view %s -> %s (elements %d "
+                             "!= %d); tensor keeps rank %u and the caller "
+                             "silently sees the old shape\n",
+                             shape_to_string(dims_, n_dims_).c_str(),
+                             shape_to_string(shape).c_str(), ne_new, ne_old,
+                             static_cast<unsigned>(n_dims_));
+            }
             return;
+        }
+        shape_view_stats().views_applied++;
+        if (shape_debug_enabled()) {
+            std::fprintf(stderr,
+                         "[shapeview] applied view %s -> %s (%d elements)\n",
+                         shape_to_string(dims_, n_dims_).c_str(),
+                         shape_to_string(shape).c_str(), ne_new);
         }
         memset(dims_, 0, sizeof(dims_));
         n_dims_ = static_cast<uint8_t>(shape.size());
@@ -176,13 +241,22 @@ class ITensor {
     }
     std::vector<int> getGPUShape() {
         uint8_t ndim = num_dims();
-        assert(ndim >= 3);
+        // The image layout is defined by the TRAILING dims (right-aligned, the
+        // same convention computeBroadcastShape and get_width() use):
+        // [..., C, H, W]. Before this, dims_[ndim-3] and dims_[ndim-2] were
+        // read unconditionally, so any tensor of rank 1 or 2 indexed OFF THE
+        // FRONT of dims_ — and the `assert(ndim >= 3)` that documented the
+        // assumption is compiled out under NDEBUG, which is exactly how a conv
+        // bias ([64]) in image mode reached VulkanImage with
+        // width=0xFFFEC4B0 height=0x7FFF (adjacent memory) and the user saw
+        // "too large Vulkan image size.". Ranks below 3 now mean what ONNX
+        // means by them: [N] is a row of width N, [H,W] a plane.
+        auto width = (ndim >= 1) ? dims_[ndim - 1] : 1;
+        auto height = (ndim >= 2) ? dims_[ndim - 2] : 1;
         int pre = ((ndim == 4) ? dims_[0] : 1);
         int sec = ((ndim >= 3) ? dims_[ndim - 3] : 1);
         auto batch = transpose_ ? sec : pre;
         auto chan = transpose_ ? pre : sec;
-        auto height = dims_[ndim - 2];
-        auto width = dims_[ndim - 1];
         int chan4 = UP_DIV(chan, 4);
         return std::vector<int>{width, height * batch, chan4};
     }
@@ -203,7 +277,12 @@ class ITensor {
         if (n_dims_ == 3) {
             return dims_[1];
         }
-        return dims_[0];
+        if (n_dims_ == 2) {
+            return dims_[0];
+        }
+        // rank <= 1: there is no height axis. Matches getGPUShape(), which
+        // puts every element of a rank-1 tensor along width.
+        return 1;
     }
     int get_width() const {
         if (n_dims_ == 4) {
@@ -212,7 +291,11 @@ class ITensor {
         if (n_dims_ == 3) {
             return dims_[2];
         }
-        return dims_[1];
+        if (n_dims_ == 2) {
+            return dims_[1];
+        }
+        // rank 1: the single dim IS the width; rank 0: a 1x1 plane.
+        return (n_dims_ == 1) ? dims_[0] : 1;
     }
 
     void get_shape(ivec4 &shape) const {
@@ -688,6 +771,13 @@ template <typename T> class Tensor : public ITensor {
         // data (see the write-site comment on gpu_buffer_view_shared).
         if (src) {
             src->mark_view_aliased();
+            shape_view_stats().buffer_aliases++;
+            if (shape_debug_enabled()) {
+                std::fprintf(stderr,
+                             "[shapeview] aliased %s (%d bytes) onto the "
+                             "producer's VkBuffer\n",
+                             shape_to_string(dims_, n_dims_).c_str(), size_);
+            }
         }
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         if (cmd && buff) {
@@ -886,6 +976,27 @@ template <typename T> class Tensor : public ITensor {
                           size_t offset = 0) {
         if (vkobj_) {
             auto buff = std::dynamic_pointer_cast<VulkanBufferView>(vkobj_);
+            if (!buff) {
+                // The tensor is already bound as a different resource kind —
+                // typically an image created for the image backend while an op
+                // (Conv2d/BatchNorm bias, scale) needs a uniform texel view.
+                // Every caller emplaces the result straight into objs_ without
+                // checking, so returning nullptr here used to turn into a null
+                // shared_ptr dereference inside fillWriteDescriptorSets.
+                auto gpushape = getGPUShape();
+                throw std::runtime_error(
+                    "vkop: tensor of shape [" + std::to_string(get_batch()) +
+                    ", " + std::to_string(get_channel()) + ", " +
+                    std::to_string(get_height()) + ", " +
+                    std::to_string(get_width()) +
+                    "] is already bound as a non-buffer resource (image "
+                    "extent " +
+                    std::to_string(gpushape[0]) + "x" +
+                    std::to_string(gpushape[1]) + "x" +
+                    std::to_string(gpushape[2]) +
+                    ") but a uniform buffer view was requested; the op "
+                    "reading it needs the other backend's storage");
+            }
             return buff;
         }
 

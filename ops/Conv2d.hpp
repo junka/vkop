@@ -205,6 +205,18 @@ class Conv2dImage : public Operator {
         std::vector<int> input_shape = inputs[0]->getShape();
         std::vector<int> weight_shape = inputs[1]->getShape();
 
+        // getShape() returns exactly n_dims_ entries, and this path reads
+        // [0..3] unconditionally: a rank<4 input (which is what a mis-folded
+        // bias Add leaves behind) walked off the end of a 1-element vector and
+        // segfaulted inside Conv2dImage::execute rather than naming itself.
+        if (input_shape.size() < 4 || weight_shape.size() < 4) {
+            throw std::runtime_error(
+                "vkop: " + (name_.empty() ? std::string("Conv") : name_) +
+                " needs 4-D NCHW operands, got input rank " +
+                std::to_string(input_shape.size()) + " and weight rank " +
+                std::to_string(weight_shape.size()));
+        }
+
         int batch = input_shape[0];
         int depth = input_shape[1];
         int in_height = input_shape[2];
@@ -476,6 +488,17 @@ class Conv2dBuffer : public BufferFactory {
         }
         int rank = static_cast<int>(input_shape.size());
         bool is_3d = (rank >= 5);
+        // Same reason as the image path above: [0..3] (or [0..4]) are read
+        // whether or not the tensor has that many dims.
+        if (input_shape.size() < (is_3d ? 5u : 4u) ||
+            weight_shape.size() < (is_3d ? 5u : 4u)) {
+            throw std::runtime_error(
+                "vkop: " + (name_.empty() ? std::string("Conv") : name_) +
+                " needs " + std::to_string(is_3d ? 5 : 4) +
+                "-D operands, got input rank " +
+                std::to_string(input_shape.size()) + " and weight rank " +
+                std::to_string(weight_shape.size()));
+        }
         int batch = input_shape[0];
         int depth = input_shape[1];
         int in_depth = is_3d ? input_shape[2] : 1;

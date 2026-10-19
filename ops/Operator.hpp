@@ -707,6 +707,19 @@ class Operator {
         writes_.resize(
             types_.size()); // ensure capacity for all declared bindings
         for (size_t i = 0; i < n; i++) {
+            if (!objs_[i]) {
+                // A null entry means some op bound an input whose storage was
+                // already created as the other backend's resource kind; the
+                // dereference below would segfault with no hint of which op or
+                // which binding, so name both.
+                throw std::runtime_error(
+                    "vkop: " +
+                    (name_.empty()
+                         ? std::string(convert_optype_to_string(type_))
+                         : name_) +
+                    " has no resource for binding " + std::to_string(i) +
+                    "; an input was bound for the other backend");
+            }
             writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes_[i].dstSet = ds;
             writes_[i].dstBinding = static_cast<uint32_t>(i);

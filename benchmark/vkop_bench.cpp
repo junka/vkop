@@ -706,6 +706,25 @@ int main(int argc, char **argv) {
     auto t_load_1 = std::chrono::steady_clock::now();
     double load_ms = std::chrono::duration<double, std::milli>(t_load_1 - t_load_0).count();
 
+    // VKOP_SHAPE_DEBUG=1 asks the view ops how they did: `applied` is a pure
+    // metadata reshape, `rejected` is the case that today silently keeps the
+    // old rank (the reason a Conv2dImage input can arrive with rank 0), and
+    // `buffer_aliases` counts outputs that share the producer's VkBuffer
+    // instead of round-tripping bytes. Scope guard so both the --time-load-only
+    // exit and the normal one report.
+    struct ShapeViewReport {
+        ~ShapeViewReport() {
+            if (!vkop::core::ITensor::shape_debug_enabled()) {
+                return;
+            }
+            const auto &s = vkop::core::ITensor::shape_view_stats();
+            std::printf("shape-view: applied=%llu rejected=%llu buffer_aliases=%llu\n",
+                        static_cast<unsigned long long>(s.views_applied),
+                        static_cast<unsigned long long>(s.views_rejected),
+                        static_cast<unsigned long long>(s.buffer_aliases));
+        }
+    } shape_view_report;
+
     std::printf("=== vkop-bench ===\n");
     std::printf("model:    %s\n", o.model_path.c_str());
     std::printf("gpu:      %s\n", dev->getDeviceName().c_str());
