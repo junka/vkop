@@ -583,6 +583,25 @@ int main(int argc, char** argv) {
                                 nm.c_str(), ne, nan, inf, zero, mn, mx);
                     for(int i=0;i<4&&i<ne;++i)std::printf("%04x,",p[i]);
                     std::printf("]\n");
+                    // VKOP_DUMP_RAW=<dir>: raw little-endian fp16 + a .shape
+                    // sidecar, so a tensor can be diffed element-by-element in
+                    // numpy instead of by the four-value preview above. The
+                    // name's slashes become '_' ("/lm_head/MatMul__lastrow" ->
+                    // "lm_head_MatMul__lastrow").
+                    if (const char *raw = std::getenv("VKOP_DUMP_RAW")) {
+                        std::string base = nm;
+                        for (char &c : base) if (c == '/') c = '_';
+                        std::string path = std::string(raw) + "/" + base;
+                        std::ofstream fp(path + ".f16", std::ios::binary);
+                        if (fp) fp.write(reinterpret_cast<const char*>(p),
+                                         std::streamsize(ne) * 2);
+                        std::ofstream sp(path + ".shape");
+                        if (sp) {
+                            sp << tns->getShape().size();
+                            for (int d : tns->getShape()) sp << " " << d;
+                            sp << " " << ne << "\n";
+                        }
+                    }
                 }
                 fflush(stdout);
             }
