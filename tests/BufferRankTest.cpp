@@ -1444,9 +1444,17 @@ TEST(BufferRankTest, ResizeNearestUpAndDown) {
 // softmax(Q_g @ Kᵀ * scale + mask) @ V_g (computed in fp32, cast to T).
 // =========================================================================
 
+// `mask_causal` (implies use_mask) passes the standard causal bias AS AN
+// ADDITIVE MASK with causal=0 — 0 at j <= kv - S + s, fp16 min above, exactly
+// what llm_chat's causal_bias() builds — so the kernel learns the mask is
+// causal only from the op's `mask_causal` declaration. That is the one path
+// the causal tile skip (attention.comp: t_end) depends on, and the only one
+// that can catch a skip that stops too early: nothing else in this file
+// reaches it, because every causal case here is S <= 197 < TILE_KV=256, and a
+// causal-only op never carries a mask at all.
 template <typename T>
 bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
-                        bool causal, bool use_mask) {
+                        bool causal, bool use_mask, bool mask_causal = false) {
     Dev d;
     const int Hkv = H / rep;
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -1457,8 +1465,15 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
     auto k = torch::randn({B, Hkv, kv, D}, opt);
     auto v = torch::randn({B, Hkv, kv, D}, opt);
     torch::Tensor mask;
-    if (use_mask)
+    if (use_mask && mask_causal) {
+        mask = torch::full({B, 1, S, kv}, -65504.0f, opt);
+        for (int i = 0; i < S; ++i) {
+            mask.index_put_({Slice(), Slice(), i, Slice(0, i + (kv - S) + 1)},
+                            0.0f);
+        }
+    } else if (use_mask) {
         mask = torch::randn({B, 1, S, kv}, opt);
+    }
 
     // Reference in fp32, cast to T at the end.
     auto qf = q.to(torch::kFloat32);
@@ -1512,7 +1527,8 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
                           {{"scale", std::to_string(scale)},
                            {"num_heads", std::to_string(H)},
                            {"num_kv_heads", std::to_string(Hkv)},
-                           {"causal", causal ? "1" : "0"}},
+                           {"causal", causal ? "1" : "0"},
+                           {"mask_causal", mask_causal ? "1" : "0"}},
                           d);
     if (!op)
         return false;
@@ -1536,7 +1552,7 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
 template <typename T>
 bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
                               bool use_mask, bool causal, bool prealloc,
-                              bool inplace = false) {
+                              bool inplace = false, bool mask_causal = false) {
     Dev d;
     const int Hkv = H / rep;
     const int kv_total = S0 + S1;
@@ -1553,12 +1569,29 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
     const int rounds[2] = {S0, S1};
     // A mask big enough for every round, [1,1,S_max,kv_total].
     const int s_max = std::max(S0, S1);
-    torch::Tensor mask_ = use_mask
+    torch::Tensor mask_ = (use_mask && !mask_causal)
                               ? torch::randn({1, 1, s_max, kv_total}, opt)
                               : torch::Tensor();
+    // The additive mask for one round. A causal mask has to be built per round:
+    // its threshold is past + s, which grows with `past`, while the [0,S) x
+    // [0,kv) window the round reads out of it pins the top-left corner in
+    // place — so one prebuilt tensor cannot be causal-correct for both rounds.
+    auto make_mask = [&](int past, int S, int kv) {
+        if (!use_mask)
+            return torch::Tensor();
+        if (!mask_causal)
+            return mask_.index({Slice(), Slice(), Slice(0, S), Slice(0, kv)})
+                .contiguous();
+        auto m = torch::full({1, 1, S, kv}, -65504.0f, opt);
+        for (int i = 0; i < S; ++i) {
+            m.index_put_({Slice(), Slice(), i, Slice(0, past + i + 1)}, 0.0f);
+        }
+        return m;
+    };
 
     // Reference: softmax(Q @ K[:, :, :kv]ᵀ * scale + mask) @ V[:, :, :kv].
-    auto reference = [&](const torch::Tensor &q, int past, int S) {
+    auto reference = [&](const torch::Tensor &q, int past, int S,
+                         const torch::Tensor &m) {
         const int kv = past + S;
         auto qf = q.to(torch::kFloat32);
         auto yf = torch::zeros({1, H, S, D}, torch::kFloat32);
@@ -1569,8 +1602,7 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
             auto Vg = vf.index({Slice(), g, Slice(0, kv), Slice()}).unsqueeze(1);
             auto sc = torch::matmul(Qg, Kg.transpose(-1, -2)) * scale;
             if (use_mask)
-                sc = sc + mask_.index(
-                               {Slice(), Slice(), Slice(0, S), Slice(0, kv)});
+                sc = sc + m.to(torch::kFloat32);
             if (causal) {
                 auto j = torch::arange(kv, torch::kFloat32);
                 auto pos = torch::arange(S, torch::kFloat32) + float(past);
@@ -1641,16 +1673,15 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
         brt_upload(Vi, d);
 
         std::vector<std::shared_ptr<vkop::core::ITensor>> ins{Qi, Ki, Vi, past};
+        auto m = make_mask(past_len, S, kv);
         if (use_mask) {
-            auto m = mask_.index({Slice(), Slice(), Slice(0, S), Slice(0, kv)})
-                         .contiguous();
             auto Mi = std::make_shared<Tensor<T>>(shape_of({1, 1, S, kv}));
             brt_fill(Mi, m);
             brt_upload(Mi, d);
             ins.push_back(Mi);
         }
 
-        auto ref = reference(q, past_len, S);
+        auto ref = reference(q, past_len, S, m);
         auto Y = brt_make_out<T>(brt_to_int_shape(ref), d);
         auto op = brt_make_op(vkop::ops::OpType::ATTENTION,
                               std::is_same_v<T, uint16_t>,
@@ -1658,6 +1689,7 @@ bool brt_attention_cache_case(int H, int D, int S0, int S1, int rep,
                                {"num_heads", std::to_string(H)},
                                {"num_kv_heads", std::to_string(Hkv)},
                                {"causal", causal ? "1" : "0"},
+                               {"mask_causal", mask_causal ? "1" : "0"},
                                {"has_cache", "1"}},
                               d);
         if (!op)
@@ -1785,6 +1817,23 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     // Wide row and multi-tile kv at the same time.
     EXPECT_TRUE(brt_attention_case<float>(1, 8, 200, 64, 700, 1, false, false));
 
+    // The causal mask a *graph* carries (causal=0, mask_causal=1), at S past
+    // one TILE_KV so the kernel's diagonal bounding of the KV sweep actually
+    // fires — rows 0..255 stop at t=256 against rows 256..511 reaching 512.
+    // This is the only coverage of that bound; if it stopped a tile early the
+    // masked tail would still be exact, so only a case where a real j is
+    // wrongly skipped fails here (that row's output collapses toward V[0]).
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 512, 64, 512, 1, false, true,
+                                          true));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 512, 64, 512, 1, false, true,
+                                             true));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 512, 128, 512, 2, false, true,
+                                             true));
+    // Same, with a history: past=212 puts the diagonal of the first 44 rows
+    // back in tile 0 and the rest in tile 1, so both bounds are live at once.
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 300, 64, 512, 1, false, true,
+                                          true));
+
     // KV-cache form (has_cache): K/V hold only the fresh rows, the history
     // comes from the cache, and the same dispatch appends to `present`.
     EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 5, 3, 1, false, false, false));
@@ -1803,6 +1852,16 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     // Multi-tile kv: 300 positions over three rounds.
     EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 256, 44, 1, false, false, false));
     EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 256, 44, 1, false, false, true));
+
+    // A causal mask on the cache form. Round 0 is a 300-row prefill, so its
+    // sweep is bounded per row (past=0, diagonal inside tile 0 for 44 of
+    // them); round 1 is one decode row against past=300, whose diagonal is
+    // past the last full tile, so it must read the *whole* history — t_end
+    // rounding up to 512 here is not a skip, and a bound that clipped it to
+    // the diagonal would drop every unmasked position from tile 1 onward.
+    EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 300, 1, 1, true, false, false, false, true));
+    EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 300, 1, 1, true, false, true, false, true));
+    EXPECT_TRUE(brt_attention_cache_case<float>(8, 128, 300, 1, 2, true, false, true, true, true));
 
     // In-place: past and present are one preallocated buffer (the driver's
     // KVCache), so the append must leave the history exactly where the next

@@ -84,12 +84,12 @@ layout(push_constant) uniform PC_ATTN {
     int rep;          // H / Hkv (GQA group size)
     int causal;       // 0/1: mask j > (kv_len - seq) + s
     int has_mask;     // 0/1: bind mask at binding 4
+    int mask_causal;  // 0/1: that mask IS the standard causal one (declared)
     int kv_past;      // positions already in the cache (0 without a cache)
     int has_cache;    // 0/1: positions < kv_past come from binding 5
     int src_stride;   // cache_in row stride (logical kv dim of that tensor)
     int dst_stride;   // cache_out row stride
     int inplace;      // 0/1: cache_out aliases cache_in (skip the history copy)
-    int _pad0;
 } uA;
 
 #define TILE_KV 256
@@ -319,7 +319,20 @@ void main() {
     float m = -1e30; // running row max
     float l = 0.0;   // running sum of exp(x - m)
 
-    for (int t0 = 0; t0 < kv; t0 += TILE_KV) {
+    // Causal rows only need the tiles up to their own diagonal: every position
+    // past `past + s` is masked to fp16 min, and a whole tile of those
+    // contributes exactly 0 to the running sum (exp(-65504 - m) underflows to
+    // 0 in fp32) and alpha = exp(0) = 1 to the accumulator — provided the
+    // running max is already a real score, which the first tile always
+    // supplies (it holds j = 0, valid for every row). So stopping here is
+    // bit-neutral and halves the sweep of a causal prefill. Decode is
+    // unaffected: S = 1 puts the diagonal in the last tile, so t_end = kv.
+    int t_end = kv;
+    if (uA.causal != 0 || uA.mask_causal != 0) {
+        t_end = min(kv, ((past + s) / TILE_KV + 1) * TILE_KV);
+    }
+
+    for (int t0 = 0; t0 < t_end; t0 += TILE_KV) {
         int tn = kv - t0;
         if (tn > TILE_KV) {
             tn = TILE_KV;

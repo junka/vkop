@@ -27,22 +27,22 @@ namespace ops {
 // strides live here: they all move with kv_len. See
 // Operator::fingerprint_matches.
 struct alignas(16) AttentionPC {
-    float scale;    // 1/sqrt(head_dim), folded by the converter
-    int batch;      // B
-    int heads;      // H (query heads)
-    int kv_heads;   // Hkv
-    int seq;        // S (query rows per batch)
-    int kv_len;     // kv (total positions: kv_past + S with a cache)
-    int head_dim;   // D
-    int rep;        // H / Hkv (GQA group size)
-    int causal;     // 0/1
-    int has_mask;   // 0/1
-    int kv_past;    // positions already in the cache (0 without one)
-    int has_cache;  // 0/1
-    int src_stride; // cache_in row stride (kv pitch of that SSBO)
-    int dst_stride; // cache_out row stride
-    int inplace;    // 0/1: cache_out aliases cache_in (detected, not asked)
-    int _pad0;
+    float scale;     // 1/sqrt(head_dim), folded by the converter
+    int batch;       // B
+    int heads;       // H (query heads)
+    int kv_heads;    // Hkv
+    int seq;         // S (query rows per batch)
+    int kv_len;      // kv (total positions: kv_past + S with a cache)
+    int head_dim;    // D
+    int rep;         // H / Hkv (GQA group size)
+    int causal;      // 0/1
+    int has_mask;    // 0/1
+    int mask_causal; // 0/1: that mask is the standard causal one
+    int kv_past;     // positions already in the cache (0 without one)
+    int has_cache;   // 0/1
+    int src_stride;  // cache_in row stride (kv pitch of that SSBO)
+    int dst_stride;  // cache_out row stride
+    int inplace;     // 0/1: cache_out aliases cache_in (detected, not asked)
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 
@@ -106,6 +106,13 @@ class AttentionBuffer : public BufferFactory {
         }
         if (attributes.find("causal") != attributes.end()) {
             causal_ = static_cast<int>(std::stol(attributes.at("causal")));
+        }
+        if (attributes.find("mask_causal") != attributes.end()) {
+            mask_causal_ =
+                static_cast<int>(std::stol(attributes.at("mask_causal")));
+        }
+        if (const char *e = getenv("VKOP_ATTN_MASK_CAUSAL")) {
+            mask_causal_ = (e[0] == '1') ? 1 : 0;
         }
         if (attributes.find("has_cache") != attributes.end()) {
             has_cache_ =
@@ -231,6 +238,7 @@ class AttentionBuffer : public BufferFactory {
         pc.rep = heads / kv_heads;
         pc.causal = causal_;
         pc.has_mask = has_mask ? 1 : 0;
+        pc.mask_causal = mask_causal_;
         pc.kv_past = kv_past;
         pc.has_cache = has_cache ? 1 : 0;
 
@@ -297,6 +305,14 @@ class AttentionBuffer : public BufferFactory {
     int num_kv_heads_ = 0; // ditto
     int causal_ = 0;
     int has_cache_ = 0;
+    // Declared invariant: the bound mask is the standard causal one (0 at
+    // j <= kv_len - seq + s, fp16 min above). It lets the kernel stop its kv
+    // sweep at the query row's diagonal, which halves a causal prefill. Only
+    // an assertion if the declaration is wrong: whatever builds the bias --
+    // llm_chat's causal_bias(), an exporter writing the mask -- is the only
+    // party that knows, so it has to say so. Set from the op attribute, with
+    // an env override for A/B without a reconversion.
+    int mask_causal_ = 0;
 };
 
 // PIMPL façade. Buffer-only (no image impl), like RMSNorm.
