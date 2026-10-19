@@ -63,6 +63,9 @@ llm/tokenizer/build/
 # LLM model artifacts (multi-GB weights, converted binaries, runtime dumps) —
 # never commit; regenerate via onnx2vkop / dump_llm_inputs.py
 *.weights.bin
+# Per-model SPIR-V archive onnx2vkop writes next to the .vkopbin; regenerated
+# with the model, never hand-edited.
+*.vkopbin.shaders.bin
 *.onx
 llm/exporter/inputs_dump/
 llm/exporter/decode_dump/
