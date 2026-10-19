@@ -9,7 +9,12 @@ import onnx
 from onnx import numpy_helper
 
 try:
-    from .dag import DAGBasedModel, Node, _DATA_TYPE_MAP
+    from .dag import (
+        DAGBasedModel,
+        Node,
+        _DATA_TYPE_MAP,
+        _VKOP_CAUSAL_MASK_META_PREFIX,
+    )
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -19,7 +24,12 @@ try:
         Unifier,
     )
 except ImportError:
-    from dag import DAGBasedModel, Node, _DATA_TYPE_MAP
+    from dag import (
+        DAGBasedModel,
+        Node,
+        _DATA_TYPE_MAP,
+        _VKOP_CAUSAL_MASK_META_PREFIX,
+    )
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -160,6 +170,33 @@ class ModelConverter:
         # single-file limit. The DAG converter reads model.graph directly
         # from the in-memory object.
         dag_model = DAGBasedModel()
+        # Graph-level declarations that no amount of staring at the graph can
+        # recover — today just "this tensor is the standard causal attention
+        # bias". Model-level metadata_props is the only channel that survives
+        # onnxoptimizer.optimize() (see _io_dtype_override), so it is read from
+        # `model` and not from the value infos.
+        for entry in getattr(model, "metadata_props", []):
+            if not entry.key.startswith(_VKOP_CAUSAL_MASK_META_PREFIX):
+                continue
+            if entry.value in ("", "0"):
+                continue
+            dag_model.causal_mask_inputs.add(
+                entry.key[len(_VKOP_CAUSAL_MASK_META_PREFIX) :]
+            )
+        # The same declaration from the environment, for a model already
+        # exported without it: VKOP_CAUSAL_MASK=attention_bias (comma
+        # separated). Conversion happens once per model while the metadata
+        # has to be re-emitted by whoever built the ONNX, so this is the
+        # bridge that lets an existing .onnx be reconverted with the
+        # declaration rather than re-exported.
+        for name in os.environ.get("VKOP_CAUSAL_MASK", "").split(","):
+            if name.strip():
+                dag_model.causal_mask_inputs.add(name.strip())
+        if dag_model.causal_mask_inputs:
+            print(
+                "Declared causal attention mask(s):",
+                ", ".join(sorted(dag_model.causal_mask_inputs)),
+            )
 
         graph = model.graph
         try:

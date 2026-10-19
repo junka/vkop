@@ -83,6 +83,18 @@ _RAW_ONLY_DATA_TYPES = _PACKED_DATA_TYPES | frozenset((17, 19))
 # type is only its storage (nf4 rides on UINT4).
 _VKOP_DTYPE_META_KEY = "vkop_dtype"
 
+# The extension channel a *graph* uses to declare a property the converter
+# cannot check by looking at the graph. Today that is `vkop_causal_mask:<tensor>`
+# = 1: the tensor rides in as an additive attention bias whose untouched
+# entries are exactly the standard causal mask (0 at j <= kv - q + i, fp16 min
+# above). Only whoever *builds* the bias knows that — in this model it is a
+# graph input filled by the driver (llm_chat's causal_bias) — so the fact has
+# to travel with the model. It reaches the Attention op as `mask_causal` and
+# lets the kernel stop a causal row's KV sweep at its diagonal (attention.comp
+# t_end), which halves a causal prefill. A model that says nothing gets the
+# full sweep, so the declaration can only add speed, never change a result.
+_VKOP_CAUSAL_MASK_META_PREFIX = "vkop_causal_mask:"
+
 # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
 # 权重，预扫描时把每个 initializer 解成 ndarray 再 tobytes 会瞬间分配
 # 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
@@ -175,6 +187,10 @@ class DAGBasedModel:
         self.rgba_meta: List[Dict] = []
         self.rgba_names: str = ""
         self.unified_blob_offset: int = 0
+        # Tensor names the model declared (model-level metadata_props) to be the
+        # standard causal additive mask. Read by the attention matcher; empty
+        # for a model that declares nothing.
+        self.causal_mask_inputs: set = set()
 
     def add_node(self, node: Node):
         """Add a node to the model."""

@@ -66,7 +66,14 @@ def build(scale=True, mask=True, folded=True, qh=4, kvh=4, seq=5, kv=5, hd=64,
         m.nodes["TP_K"] = tp
 
     if scale:
-        m.initializers["scale_const"] = np.float32(0.125)
+        # A TensorProto, not a bare numpy scalar: the loader folds Constants
+        # into TensorProto initializers, and that is the only form the writer
+        # can serialize (dag._init_byte_len reads .dims). The matcher reads
+        # both, which _to_float is there to cover.
+        from onnx import numpy_helper
+
+        m.initializers["scale_const"] = numpy_helper.from_array(
+            np.float32(0.125), "scale_const")
         mul = Node("Mul", "MUL", {},
                    [tdict(cur, [1, qh, seq, kv]),
                     tdict("scale_const", [])],
@@ -122,6 +129,53 @@ def test_transb_scale_mask_folds():
     assert fused.attributes["causal"] == 0
     # output tensor is reused so downstream consumers still resolve
     assert fused.outputs[0]["name"] == "out"
+
+
+# ------------------------------------------------- mask_causal declaration
+
+def test_declared_causal_mask_sets_attribute():
+    """A graph that declares its bias *is* the standard causal mask gets
+    mask_causal=1, which lets the kernel stop a row's KV sweep at its
+    diagonal. The declaration is the only source: nothing in the graph shows
+    it, because the bias rides in as a graph input."""
+    m = build()
+    m.causal_mask_inputs = {"att_mask"}
+    ms = matches_of(m)
+    assert FusionOptimizer.fold_attention(m, ms[0])
+    fused = m.nodes["Attention_fused_MM_V"]
+    assert fused.attributes["mask_causal"] == 1
+    # causality is still the mask's job; the kernel does not synthesize it
+    assert fused.attributes["causal"] == 0
+
+
+def test_undeclared_mask_omits_attribute():
+    """Silence means "not declared", not "declared false": the op must then
+    sweep the whole row. Absence of the attribute is what carries that, so a
+    model converted before the declaration existed is bit-identical."""
+    m = build()
+    assert not m.causal_mask_inputs
+    ms = matches_of(m)
+    assert FusionOptimizer.fold_attention(m, ms[0])
+    assert "mask_causal" not in m.nodes["Attention_fused_MM_V"].attributes
+
+
+def test_declaration_for_other_tensor_ignored():
+    m = build()
+    m.causal_mask_inputs = {"some_other_mask"}
+    ms = matches_of(m)
+    assert FusionOptimizer.fold_attention(m, ms[0])
+    assert "mask_causal" not in m.nodes["Attention_fused_MM_V"].attributes
+
+
+def test_declared_but_no_mask_still_omits_attribute():
+    """A declaration without a bound mask is inert — the kernel's tile bound
+    keys off the *op's* causal terms, and neither is set, so the op behaves
+    exactly as an undeclared one."""
+    m = build(mask=False)
+    m.causal_mask_inputs = {"att_mask"}
+    ms = matches_of(m)
+    assert FusionOptimizer.fold_attention(m, ms[0])
+    assert "mask_causal" not in m.nodes["Attention_fused_MM_V"].attributes
 
 
 def test_explicit_transpose_form_folds():
@@ -319,3 +373,120 @@ def test_transposed_qk_declined():
     m = build()
     m.nodes["MM_QK"].attributes["transA"] = 1
     assert matches_of(m) == []
+
+
+# ------------------------------------- the declaration's converter plumbing
+
+def _tiny_onnx(tmp_path, metadata=(), env=None, monkeypatch=None):
+    """A convertible 1-node ONNX whose graph input `attention_bias` stands in
+    for the real model's additive causal bias. Small enough that a real
+    onnxoptimizer + checker pass runs on it."""
+    import onnx
+    from onnx import TensorProto, helper
+
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [1, 4])
+    b = helper.make_tensor_value_info("attention_bias", TensorProto.FLOAT16,
+                                      [1, 1, 1, 4])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [1, 4])
+    node = helper.make_node("Identity", ["x"], ["y"], name="ID")
+    graph = helper.make_graph([node], "g", [x, b], [y])
+    model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    for key, val in metadata:
+        model.metadata_props.add(key=key, value=val)
+    path = str(tmp_path / "tiny.onnx")
+    onnx.save_model(model, path)
+    if monkeypatch is not None:
+        for k, v in (env or {}).items():
+            monkeypatch.setenv(k, v)
+    return path
+
+
+def test_model_metadata_declares_causal_mask(tmp_path, monkeypatch):
+    """The export-side channel: a model that names its causal bias in
+    metadata_props gets its name into the DAG, where the matcher picks it up.
+    Model-level (not ValueInfoProto) because onnxoptimizer.optimize() rebuilds
+    the graph and drops the per-value-info props — the same reason
+    vkop_io_dtype is model-level."""
+    from onnx2vkop.converter import ModelConverter
+
+    path = _tiny_onnx(
+        tmp_path,
+        metadata=[("vkop_causal_mask:attention_bias", "1")],
+        monkeypatch=monkeypatch,
+    )
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.causal_mask_inputs == {"attention_bias"}
+
+
+def test_env_declares_causal_mask_for_an_existing_model(tmp_path, monkeypatch):
+    """The bridge for a model exported before the declaration existed: the
+    same names can be supplied at conversion time instead of re-exporting."""
+    from onnx2vkop.converter import ModelConverter
+
+    path = _tiny_onnx(tmp_path, env={"VKOP_CAUSAL_MASK": "attention_bias, other"},
+                      monkeypatch=monkeypatch)
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.causal_mask_inputs == {"attention_bias", "other"}
+
+
+def test_no_declaration_means_no_causal_mask(tmp_path, monkeypatch):
+    """Silence stays silent: a model converted with neither the metadata nor
+    the env var declares nothing, so the op sweeps the full row exactly as it
+    did before the flag existed."""
+    from onnx2vkop.converter import ModelConverter
+
+    monkeypatch.delenv("VKOP_CAUSAL_MASK", raising=False)
+    path = _tiny_onnx(tmp_path, monkeypatch=monkeypatch)
+    dag = ModelConverter().parse_onnx_model(path, 1)
+    assert dag.causal_mask_inputs == set()
+
+
+def test_written_artifact_carries_the_declaration():
+    """The runtime reads the op's surface off the .vkopbin, not off the
+    attribute dict, so the declaration has to survive serialization: a writer
+    that dropped mask_causal would silently fall back to the full sweep (the
+    speed fix quietly gone), and one that *invented* it for an undeclared
+    model would be the dangerous direction. Both halves are read back here."""
+    import mmap
+    import os
+    import sys
+    import tempfile
+
+    _gen = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(__file__))), "onnx2vkop", "generated")
+    if _gen not in sys.path:
+        sys.path.insert(0, _gen)
+    from onnx2vkop.generated.vkop.model.AttrType import AttrType
+    from onnx2vkop.generated.vkop.model.Model import Model
+
+    def read_back(dag):
+        dag.build_dependencies()
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "attn.vkopbin")
+            dag.save_to_binary(out)
+            with open(out, "rb") as fh:
+                mm = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+                model = Model.GetRootAsModel(mm, 0)
+                attrs = None
+                for i in range(model.NodesLength()):
+                    node = model.Nodes(i)
+                    if node.OpType() != b"Attention":
+                        continue
+                    attrs = {}
+                    for k in range(node.AttributesLength()):
+                        a = node.Attributes(k)
+                        if a.Type() == AttrType.Int64:
+                            attrs[a.Key().decode()] = a.Ival()
+                    break
+                mm.close()
+        assert attrs is not None, "Attention missing from the artifact"
+        return attrs
+
+    declared = build()
+    declared.causal_mask_inputs = {"att_mask"}
+    assert FusionOptimizer.fold_attention(declared, matches_of(declared)[0])
+    assert read_back(declared)["mask_causal"] == 1
+
+    undeclared = build()
+    assert FusionOptimizer.fold_attention(undeclared, matches_of(undeclared)[0])
+    assert "mask_causal" not in read_back(undeclared)

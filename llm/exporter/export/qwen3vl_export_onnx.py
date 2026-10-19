@@ -466,6 +466,15 @@ n_init = len(m.graph.initializer)
 n_ext = sum(1 for t in m.graph.initializer if t.HasField("data_location") and t.data_location == 1)
 print(f"[consolidate] initializers={n_init} external={n_ext}")
 
+# 声明 attention_bias 就是标准因果 mask（上三角全 fp16 min，diagonal=1 那条线
+# 起）。kv=q 的 prefill 下这是图里看不出来的信息：bias 只是个图输入，谁填它谁
+# 知道。带上声明后 converter 会给 Attention 打 mask_causal=1，kernel 就能把一行
+# 的 KV 扫描在它自己的对角线上截断（长 prefill 少扫一半的 tile）。不带声明只是
+# 退化成全行扫描，结果不变——mask 本身照样相加，所以声明只可能更快。
+# 必须挂在 model 级：onnxoptimizer.optimize() 重建计算图时会丢掉 ValueInfoProto
+# 上的 metadata_props（同 vkop_io_dtype）。
+m.metadata_props.add(key="vkop_causal_mask:attention_bias", value="1")
+
 print("[consolidate] saving as single llm.weights.bin ...")
 onnx.save_model(
     m, "llm.onnx",

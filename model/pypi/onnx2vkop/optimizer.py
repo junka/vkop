@@ -3461,11 +3461,22 @@ class FusionOptimizer:
         attrs = {
             "num_heads": match["num_heads"],
             "num_kv_heads": match["num_kv_heads"],
-            # P1: causality rides the additive mask the graph already exports
-            # (HF materializes attention_bias as [B,1,S,kv]). The kernel's own
-            # causal term is wired from the driver graph in P3.
+            # Causality rides the additive mask the graph already exports (HF
+            # materializes attention_bias as [B,1,S,kv]) — the kernel does not
+            # synthesize it. Whether that mask is the *standard causal* one
+            # (0 at j <= kv - q + i, fp16 min above) is the one thing the
+            # graph cannot show, so it is taken from the model's declaration
+            # (`vkop_causal_mask:<tensor>` metadata, or VKOP_CAUSAL_MASK at
+            # conversion time). With it the kernel stops a causal row's KV
+            # sweep at its diagonal, which halves a causal prefill; without
+            # it the whole row is swept. The mask itself is applied either
+            # way, so the flag can only change the speed, never the answer.
             "causal": 0,
         }
+        if match["mask_input"] is not None and match["mask_input"].get(
+            "name"
+        ) in getattr(dag_model, "causal_mask_inputs", ()):
+            attrs["mask_causal"] = 1
         if match["scale_val"] != 1.0:
             attrs["scale"] = match["scale_val"]
 
