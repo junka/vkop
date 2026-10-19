@@ -655,7 +655,12 @@ class ModelConverter:
         dag_model.build_dependencies()
 
         if args.quant == "fp16":
-            self.quantizer.quantize_to_fp16_selective(dag_model)
+            # The fp16 weight pass needs the target backend: only the buffer
+            # backend creates tensors with the dtype the file declares, so only
+            # there can a "this op runs fp32" verdict be read off the graph.
+            self.quantizer.quantize_to_fp16_selective(
+                dag_model, getattr(args, "target_backend", "buffer")
+            )
         elif args.quant == "int8":
             self.quantizer.quantize_to_int8_weight_only(dag_model)
         elif args.quant in ("int4", "nf4"):

@@ -5784,7 +5784,7 @@ class Quantizer:
     """Class for quantizing model weights."""
 
     @staticmethod
-    def quantize_to_fp16_selective(dag_model):
+    def quantize_to_fp16_selective(dag_model, target_backend="buffer"):
         """
         Selectively quantize model weights to FP16 based on operator type and parameter sensitivity.
 
@@ -5792,6 +5792,8 @@ class Quantizer:
         1. Which operator uses the initializer
         2. What role the initializer plays (weights vs. batch norm parameters)
         3. Sensitivity of different parameter types to quantization
+        4. Whether the consuming op actually RUNS in fp16 (see the dtype note
+           below — a weight whose op runs fp32 must stay fp32)
 
         Generally safe to convert:
         - Convolution weights
@@ -5801,6 +5803,13 @@ class Quantizer:
         Usually NOT safe to convert:
         - BatchNorm parameters (scale, bias, mean, var)
         - Small embedding tables
+        - Weights of an op the runtime will run with its fp32 shader
+
+        `target_backend` mirrors the driver's `set_backend_buffer()`: the dtype
+        the file declares for a tensor is what the runtime actually holds only
+        on the buffer (SSBO) backend. The legacy image backend forces fp16
+        input images regardless of the declaration, so there the declared dtype
+        says nothing and the guard below is skipped.
         """
         print("Selectively quantizing model to FP16...")
 
@@ -5901,6 +5910,44 @@ class Quantizer:
         # Parameters that are usually sensitive to FP16 quantization
         sensitive_parameters = {"BatchNormalization"}
 
+        # The shader dtype of an op is decided by its DATA input, not by its
+        # weight: core/runtime.cpp propagates the dtype along the data flow
+        # (`node_inputs[0]->dtype() == uint16_t` -> fp16, `== float` -> fp32)
+        # and only falls back to precision_ when no input is typed. The weight
+        # is then bound to that same shader, so a weight stored in the wrong
+        # dtype is not an accuracy loss — a fp32 Conv/MatMul shader reading a
+        # fp16 buffer walks past the end of a half-length operand and the whole
+        # graph is silently wrong.
+        #
+        # The file's declaration is the signal: the parser records each node
+        # input's ONNX elem_type (shape_inference in optimize_model fills it in
+        # for every intermediate), so a data input declared FLOAT means the
+        # runtime holds fp32 bytes there. Only an explicit float32 blocks the
+        # downcast — an input with no recorded dtype follows precision_ at
+        # runtime, i.e. stays fp16.
+        #
+        # Caught by this on llm.onnx: mrope_static.M is the model's only FLOAT
+        # initializer, and its consumer /mrope_static/MatMul reads
+        # /mrope_static/Transpose_output_0 — a Cast(to=float) chain, genuinely
+        # fp32. Storing M as fp16 left the node declaring float32 x float32
+        # while the table was 384 bytes for a 768-byte operand, corrupting
+        # every position after 0 of the whole prefill.
+        fp32_elem_types = {onnx.TensorProto.FLOAT, onnx.TensorProto.DOUBLE}
+
+        def consumer_runs_fp32(node, name):
+            """True when a non-initializer data input of `node` is fp32.
+
+            Skipping the initializers leaves the op's data operand (x in
+            MatMul(x, W) / Gemm(x, W, B)); an op all of whose inputs are
+            initializers has no data flow to read the dtype from.
+            """
+            for inp in node.inputs:
+                if inp["name"] == name or inp["name"] in dag_model.initializers:
+                    continue
+                if inp.get("dtype") in fp32_elem_types:
+                    return True
+            return False
+
         for name, initializer in dag_model.initializers.items():
             # Skip non-FP32 tensors
             if initializer.data_type != onnx.TensorProto.FLOAT:
@@ -5932,9 +5979,19 @@ class Quantizer:
 
             arr = numpy_helper.to_array(initializer)
             if any(op in safe_weight_operators for op in consumer_ops):
-                # This initializer is consumed by operators known to be safe for FP16
-                should_quantize = True
-                reason = f"consumed by safe operators {consumer_ops}"
+                # This initializer is consumed by operators known to be safe
+                # for FP16 — but only if the op really runs fp16. An op whose
+                # data input is fp32 keeps its fp32 shader (see the dtype note
+                # above), and the weight has to be stored the way that shader
+                # reads it.
+                if target_backend == "buffer" and any(
+                    consumer_runs_fp32(c, name) for c in consumers
+                ):
+                    should_quantize = False
+                    reason = f"fp32 data input to {consumer_ops} (fp32 shader)"
+                else:
+                    should_quantize = True
+                    reason = f"consumed by safe operators {consumer_ops}"
             elif not consumers:
                 # Orphaned initializer - better to preserve
                 should_quantize = False
