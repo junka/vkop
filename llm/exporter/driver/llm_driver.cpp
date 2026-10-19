@@ -269,6 +269,32 @@ int stage_cache_history(const std::shared_ptr<Runtime>& rt,
 
 // Compare the runtime's 'logits' output against <round_dir>/reference_logits.npy.
 // Returns the vkop argmax (== ref argmax on success). Prints top8 + diffs.
+
+// The window of the reference array to compare against, as (offset, count).
+//
+// A model converted with VKOP_LOGITS_LAST_ROW=<logits tensor> computes only
+// the LM head's last row — row L-1 is all a greedy loop reads, and the other
+// L-1 rows are a 1.13 GB buffer at L=1860 plus 14% of the prefill. The
+// reference npy is still the full [1,L,vocab] ORT produced from the unshrunk
+// graph, so the comparison has to shrink to its last row too; otherwise this
+// driver's size check rejects exactly the graph the flag exists to produce.
+//
+// Same env name as the conversion flag, but only its presence matters here:
+// which tensors to shrink was decided when the .vkopbin was written.
+bool logits_last_row_only() {
+    const char *v = std::getenv("VKOP_LOGITS_LAST_ROW");
+    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+}
+
+void ref_window(const NpyArray &ref, size_t &offset, size_t &count) {
+    count = npy_elem_count(ref.shape);
+    offset = 0;
+    if (logits_last_row_only() && ref.shape.size() >= 2) {
+        count = ref.shape.back();
+        offset = npy_elem_count(ref.shape) - count;
+    }
+}
+
 int compare_round(const std::shared_ptr<Runtime>& rt,
                   const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
                   const std::string& round_dir) {
@@ -278,12 +304,15 @@ int compare_round(const std::shared_ptr<Runtime>& rt,
     auto lg = as_tensor<uint16_t>(logits);
     lg->copyToCPU(cmdpool);
     const uint16_t* out_bits = reinterpret_cast<const uint16_t*>(lg->data().data());
-    size_t n = npy_elem_count(ref.shape);
+    size_t ref_off = 0, n = 0;
+    ref_window(ref, ref_off, n);
     if (size_t(lg->num_elements()) != n) {
         std::fprintf(stderr, "[%s] logits size mismatch out=%d ref=%zu\n",
                      round_dir.c_str(), lg->num_elements(), n);
         return -1;
     }
+    const uint16_t* ref_bits =
+        reinterpret_cast<const uint16_t*>(ref.data.data()) + ref_off;
     int argmax_out = -1, argmax_ref = -1;
     float maxv_out = -1e30f, maxv_ref = -1e30f;
     double sum_abs_diff = 0;
@@ -292,7 +321,7 @@ int compare_round(const std::shared_ptr<Runtime>& rt,
     vk.reserve(n); rf.reserve(n);
     for (size_t i = 0; i < n; ++i) {
         float fo = ITensor::fp16_to_fp32(out_bits[i]);
-        float fr = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[i]);
+        float fr = ITensor::fp16_to_fp32(ref_bits[i]);
         if (fo > maxv_out) { maxv_out = fo; argmax_out = int(i); }
         if (fr > maxv_ref) { maxv_ref = fr; argmax_ref = int(i); }
         float d = std::fabs(fo - fr);
@@ -561,11 +590,17 @@ int main(int argc, char** argv) {
 
         int argmax_out = compare_round(rt, cmdpool, rd);
         if (argmax_out >= 0) {
-            // Re-fetch ref argmax for the match tally.
+            // Re-fetch ref argmax for the match tally, over the same window
+            // compare_round used — a model converted with
+            // VKOP_LOGITS_LAST_ROW only carries the last row.
             NpyArray ref = load_npy(rd + "/reference_logits.npy");
+            size_t ref_off = 0, ref_n = 0;
+            ref_window(ref, ref_off, ref_n);
+            const uint16_t *rb =
+                reinterpret_cast<const uint16_t*>(ref.data.data()) + ref_off;
             int argmax_ref = -1; float mv = -1e30f;
-            for (size_t i = 0; i < npy_elem_count(ref.shape); ++i) {
-                float fr = ITensor::fp16_to_fp32(reinterpret_cast<const uint16_t*>(ref.data.data())[i]);
+            for (size_t i = 0; i < ref_n; ++i) {
+                float fr = ITensor::fp16_to_fp32(rb[i]);
                 if (fr > mv) { mv = fr; argmax_ref = int(i); }
             }
             if (argmax_out == argmax_ref) ++n_match;

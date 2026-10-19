@@ -191,6 +191,10 @@ class DAGBasedModel:
         # standard causal additive mask. Read by the attention matcher; empty
         # for a model that declares nothing.
         self.causal_mask_inputs: set = set()
+        # Graph outputs to keep only at their last position (VKOP_LOGITS_LAST_ROW
+        # at conversion time). "*" means every graph output a MatMul produces.
+        # Empty — the default — leaves the graph exactly as exported.
+        self.logits_last_row: set = set()
 
     def add_node(self, node: Node):
         """Add a node to the model."""

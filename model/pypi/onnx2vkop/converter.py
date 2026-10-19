@@ -198,6 +198,25 @@ class ModelConverter:
                 ", ".join(sorted(dag_model.causal_mask_inputs)),
             )
 
+        # VKOP_LOGITS_LAST_ROW=<graph output names>: keep only the last position
+        # of those outputs. A greedy decode reads logits[0, L-1, :] and nothing
+        # else, while the LM head computes and stores all L rows — at L=1860
+        # that is a 2505 ms MatMul (14% of the prefill, linear in M) writing a
+        # 1.13 GB fp16 buffer nobody reads. The flag is a *policy* choice (the
+        # graph cannot show that the tail rows are unused and a caller may
+        # legitimately want them), so unlike the causal declaration it has no
+        # metadata channel — it lives at conversion time only. "*" means every
+        # graph output a MatMul produces.
+        for name in os.environ.get("VKOP_LOGITS_LAST_ROW", "").split(","):
+            name = name.strip()
+            if name:
+                dag_model.logits_last_row.add(name)
+        if dag_model.logits_last_row:
+            print(
+                "Logits last row only:",
+                ", ".join(sorted(dag_model.logits_last_row)),
+            )
+
         graph = model.graph
         try:
             # 大模型（>2GB 权重）full_check 内部会 SerializeToString 整个 model

@@ -1334,6 +1334,19 @@ class FusionOptimizer:
             )
         )
 
+        # Priority 1: after every pass that could still want to fold something
+        # *into* the LM head MatMul, and before prune_and_materialize
+        # materializes the three initializers this one inserts. A no-op unless
+        # VKOP_LOGITS_LAST_ROW named a graph output.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "logits_last_row",
+                FusionOptimizer.match_logits_last_row,
+                FusionOptimizer.fold_logits_last_row,
+                priority=1,
+            )
+        )
+
         # Registry is complete now, so this is the first point where an
         # unmatched VKOP_NO_FUSIONS name can be recognised as one.
         optimizer.warn_unknown_disabled()
@@ -5219,6 +5232,154 @@ class FusionOptimizer:
         if softmax_node is not None and softmax_node.name in dag_model.nodes:
             del dag_model.nodes[softmax_node.name]
         dag_model.nodes[fused.name] = fused
+        return True
+
+    # --------------------------------- logits: last position only (opt-in)
+    #
+    # A greedy loop reads exactly one row of the LM head's output, the last
+    # one; every other row is computed and thrown away. `logits` has no
+    # in-graph consumer at all — the runtime hands it straight to the driver —
+    # so on the L=1860 prefill that waste is the whole of /lm_head/MatMul's
+    # 2505 ms (14% of the round, linear in M: S=15 costs 26.6 ms and S=1860
+    # costs 2505 ms on the same 622 MB of weights), and the discarded
+    # [1,L,151936] fp16 buffer is 1.13 GB — the allocation that fails first on
+    # a small iGPU, long before anything else does.
+    #
+    # The fix needs no kernel work: a Slice on the LM head's activation input,
+    # so the MatMul only ever sees one row and runs with M=1. `starts=[-1]` is
+    # ONNX's last-element slice and SliceCalc resolves it against the live seq
+    # dim, so nothing about a prompt length is baked in.
+    #
+    # Opt-in (VKOP_LOGITS_LAST_ROW at conversion time, see converter.py),
+    # because it changes what a graph OUTPUT means: row L-1 only. A driver
+    # comparing all L rows against a full reference (llm_driver without the
+    # same flag) sees a size mismatch, and a caller who wants per-position
+    # logits loses them. Silence leaves the graph exactly as exported.
+    @staticmethod
+    def match_logits_last_row(dag_model):
+        wanted = getattr(dag_model, "logits_last_row", ())
+        if not wanted:
+            return []
+        wildcard = "*" in wanted
+        graph_outputs = {
+            o["name"]: o for o in dag_model.outputs
+            if wildcard or o["name"] in wanted
+        }
+        if not graph_outputs:
+            return []
+        producer = {}
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type != "MatMul" or len(node.inputs) < 2:
+                continue
+            if len(node.outputs) != 1:
+                continue
+            out = graph_outputs.get(node.outputs[0]["name"])
+            if out is None:
+                continue
+            a = node.inputs[0]
+            # The weight is an initializer, so its shape is always recorded;
+            # the activation's is often not (an intermediate value_info the
+            # exporter dropped). The output's rank is what the axis needs, and
+            # a graph output always carries one.
+            b_shape = node.inputs[1].get("shape") or []
+            out_shape = out.get("shape") or []
+            if len(out_shape) < 3 or (b_shape and len(b_shape) != 2):
+                continue
+            # Idempotence: the multi-round loop re-runs every matcher, and a
+            # second Slice in front of the same MatMul would cut the row out
+            # of a tensor that is already one row.
+            prev = producer.get(a["name"])
+            if prev is not None and prev.op_type == "Slice":
+                continue
+            matches.append({
+                "node": node,
+                "a": a,
+                "out": out,
+                "node_out": node.outputs[0],
+                "axis": len(out_shape) - 2,
+            })
+        return matches
+
+    @staticmethod
+    def fold_logits_last_row(dag_model, match) -> bool:
+        """Insert Slice(activation, last row) in front of the LM head MatMul
+        and shrink the graph output to match. The MatMul node itself is only
+        rewired — no kernel, no attribute, nothing the runtime has to know."""
+        node = match["node"]
+        axis = match["axis"]
+        max64 = np.iinfo(np.int64).max
+
+        taken = {o["name"] for n in dag_model.nodes.values() for o in n.outputs}
+        taken.update(dag_model.initializers)
+        base = f"{node.name}__lastrow"
+        k = 0
+        while base in taken:
+            k += 1
+            base = f"{node.name}__lastrow_{k}"
+
+        for suffix, axis_value in (("starts", -1), ("ends", max64), ("axes", axis)):
+            init_name = f"{base}_{suffix}"
+            dag_model.initializers[init_name] = numpy_helper.from_array(
+                np.array([axis_value], dtype=np.int64), init_name
+            )
+
+        # The Slice cuts the activation, so its output is the activation's
+        # shape with the seq axis collapsed. The activation's recorded shape is
+        # often missing (an intermediate the exporter left out of value_info),
+        # but the weight's is always there and pins the hidden dim; with
+        # neither, an empty shape is the same "unknown" the parser writes for
+        # a tensor it cannot find, and the Slice op resizes from the live
+        # shape at execute time anyway.
+        out_shape = list(match["out"]["shape"])
+        out_shape[axis] = 1
+        a_shape = list(match["a"].get("shape") or [])
+        b_shape = list(node.inputs[1].get("shape") or [])
+        if len(a_shape) == len(out_shape):
+            slice_shape = list(a_shape)
+            slice_shape[axis] = 1
+        elif len(b_shape) == 2:
+            slice_shape = list(out_shape)
+            slice_shape[-1] = b_shape[0]
+        else:
+            slice_shape = []
+        slice_out = {
+            "name": base,
+            "shape": slice_shape,
+            "dtype": match["node_out"].get("dtype", ""),
+        }
+
+        slice_node = Node(
+            op_type="Slice",
+            name=f"Slice_last_row_{node.name}",
+            attributes={},
+            inputs=[
+                match["a"],
+                {"name": f"{base}_starts", "shape": [1], "dtype": TensorProto.INT64},
+                {"name": f"{base}_ends", "shape": [1], "dtype": TensorProto.INT64},
+                {"name": f"{base}_axes", "shape": [1], "dtype": TensorProto.INT64},
+            ],
+            outputs=[slice_out],
+        )
+        # Keyed by node name, like every other node: build_dependencies
+        # resolves a tensor's producer through self.nodes[node.name].
+        dag_model.nodes[slice_node.name] = slice_node
+        node.inputs[0] = slice_out
+        # Last-position only: the graph output's seq axis becomes 1, and so
+        # does the MatMul's own recorded view (same tensor at runtime).
+        for entry in (match["out"], match["node_out"]):
+            shape = list(entry.get("shape") or [])
+            if len(shape) == len(out_shape):
+                shape[axis] = 1
+                entry["shape"] = shape
+
+        print(
+            f"Kept only the last position of '{match['out']['name']}' "
+            f"(axis {axis}) via '{base}'"
+        )
         return True
 
     @staticmethod
