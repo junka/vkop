@@ -157,3 +157,69 @@ def test_secondary_keys_exist_in_master_archive():
                 "in the master archive -- either the shader was never "
                 "compiled or the table lists a stale name"
             )
+
+
+# ------------------------------------------------------------- kernel plan
+# Model.kernel_plans is written into every .vkopbin and read by
+# Runtime::kernel_key_for_node in place of the C++ table, and the per-model
+# archive is filtered from the same rows. So the plan is now a third copy of
+# the op -> key decision; these tests pin it to the two that came before.
+def _legacy_key_selection(op_types, backend, emit_fp16=True):
+    """The formula shader_keys_for_model used before the plan existed:
+    this backend's primary keys + this backend's secondary pipelines."""
+    keys = set()
+    for op in set(op_types):
+        keys.update(shader_map._primary_keys(op, backend, emit_fp16))
+        keys.update(shader_map._SECONDARY.get((op, backend), ()))
+    return keys
+
+
+def test_plan_reproduces_the_legacy_key_selection():
+    """The plan-derived selection must equal the formula it replaced, for
+    every op and backend. A difference means an already-converted model (or
+    one reconverted today) would lose a shader its graph dispatches."""
+    ops = shader_map.known_ops()
+    for op in sorted(ops, key=str):
+        for backend in ("buffer", "image"):
+            for emit_fp16 in (True, False):
+                got = shader_map.shader_keys_for_model(
+                    [op], backend=backend, emit_fp16=emit_fp16)
+                want = _legacy_key_selection([op], backend, emit_fp16)
+                assert got == want, (op, backend, emit_fp16, got, want)
+    for backend in ("buffer", "image"):
+        assert (shader_map.shader_keys_for_model(ops, backend=backend)
+                == _legacy_key_selection(ops, backend))
+    assert (shader_map.shader_keys_for_model(ops, backend="auto")
+            == (_legacy_key_selection(ops, "buffer")
+                | _legacy_key_selection(ops, "image")))
+
+
+def test_plan_variants_carry_their_backend_prefix():
+    """A pinned backend keeps only the variants matching its prefix (the
+    selection _SECONDARY used to make), so a variant spelled with the other
+    backend's prefix would be dropped from that archive."""
+    for (op, backend), keys in shader_map._SECONDARY.items():
+        for k in keys:
+            assert k.startswith(backend + "_"), (op, backend, k)
+
+
+def test_plan_cells_are_post_fallback():
+    """Each cell is the key the runtime will ask for, not a raw basename:
+    an op without a variant on a backend resolves to the other backend's
+    spelling (Attention is buffer-only, MaxPool is image-only), and an op
+    that is not in DUAL_FP16_SHADERS repeats its fp32 key in the fp16 cell
+    rather than leaving the cell empty and letting the runtime guess."""
+    attention = shader_map.plan_for_op("Attention")
+    assert attention["image"] == "buffer_attention"
+    assert attention["image_fp16"] == "buffer_attention_fp16"
+    assert attention["buffer"] == "buffer_attention"
+    assert shader_map.plan_for_op("MaxPool")["buffer"] == "image_maxpool2d"
+    assert shader_map.plan_for_op("MaxPool")["buffer_fp16"] == "image_maxpool2d_fp16"
+    # dual: Conv has both an fp32 and an fp16 shader per backend
+    assert shader_map.plan_for_op("Conv")["buffer_fp16"] == "buffer_conv2d_fp16"
+    # not dual: Relu's fp16 request resolves to the same shader
+    assert shader_map.plan_for_op("Relu")["buffer_fp16"] == "buffer_relu"
+    assert shader_map.plan_for_op("Relu")["image_fp16"] == "image_relu"
+    # host-only ops have no key under any spelling, hence no row
+    for host_only in ("Shape", "Squeeze", "Unsqueeze", "Identity", "NotAnOp"):
+        assert shader_map.plan_for_op(host_only) is None

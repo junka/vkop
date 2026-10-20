@@ -31,6 +31,13 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 import filter_shaders  # noqa: E402
 
+# Model.KernelPlans(j) does a lazy *absolute* import of `vkop.model.KernelPlan`
+# (generated FlatBuffers code), so any reader has to have onnx2vkop/generated on
+# sys.path -- same setup the other reader tests use.
+_GENERATED = str(Path(__file__).resolve().parents[1] / "onnx2vkop" / "generated")
+if _GENERATED not in sys.path:
+    sys.path.insert(0, _GENERATED)
+
 
 def td(name, dims=(2, 2), dtype=1):
     return {"name": name, "shape": list(dims), "dtype": dtype}
@@ -275,3 +282,127 @@ def test_shader_map_covers_a_union_of_backends():
             | shader_map.shader_keys_for_model(ops, backend="image"))
     assert both >= shader_map.shader_keys_for_model(ops, backend="buffer")
     assert both >= shader_map.shader_keys_for_model(ops, backend="image")
+    assert both == shader_map.shader_keys_for_model(ops, backend="auto")
+
+
+# -------------------------------------------------------------- kernel plan
+# The converter's kernel selection is written into the .vkopbin
+# (Model.kernel_plans, indexed by Node.plan) and the archive is filtered from
+# the same rows, so the runtime reads one answer instead of deriving a second.
+# tests/KernelPlanTest.cpp checks the C++ half against the built-in table; the
+# tests here pin the writer, the indexing, and the plan/archive agreement.
+def read_plans(path):
+    """(rows, node_plans) exactly as the C++ reader sees them."""
+    buf = bytearray(Path(path).read_bytes())
+    model = Model.GetRootAs(buf, 0)
+    s = lambda v: v.decode() if v else ""  # noqa: E731 (field is absent = 0)
+    rows = []
+    for i in range(model.KernelPlansLength()):
+        p = model.KernelPlans(i)
+        rows.append({
+            "op_type": s(p.OpType()),
+            "image": s(p.Image()),
+            "image_fp16": s(p.ImageFp16()),
+            "buffer": s(p.Buffer()),
+            "buffer_fp16": s(p.BufferFp16()),
+            "variants": [s(p.Variants(j)) for j in range(p.VariantsLength())],
+        })
+    nodes = [(s(model.Nodes(i).Name()), s(model.Nodes(i).OpType()),
+              model.Nodes(i).Plan()) for i in range(model.NodesLength())]
+    return rows, nodes
+
+
+def planned_keys(row):
+    """Every archive key the row claims the runtime may ask for."""
+    return [k for k in (row["image"], row["image_fp16"], row["buffer"],
+                        row["buffer_fp16"]) if k] + row["variants"]
+
+
+def test_plan_is_written_and_indexed_by_node(tmp_path):
+    out = tmp_path / "m.vkopbin"
+    tiny_dag().save_to_binary(str(out))
+    rows, nodes = read_plans(out)
+
+    assert [r["op_type"] for r in rows] == ["Mul", "Add"]
+    by_op = {r["op_type"]: r for r in rows}
+    assert by_op["Mul"]["buffer"] == "buffer_mul"
+    assert by_op["Mul"]["image"] == "image_mul"
+    assert by_op["Add"]["buffer_fp16"] == "buffer_add_fp16"
+    # Every node points at its own op_type's row and nothing else.
+    for name, op_type, plan in nodes:
+        assert plan == [r["op_type"] for r in rows].index(op_type), name
+
+
+def test_plan_rows_are_deduplicated_and_deterministic(tmp_path):
+    """One row per distinct op_type (two Adds share a row), and a second
+    conversion of the same graph produces the identical file."""
+    m = tiny_dag()
+    m.nodes["mul2"] = Node("Mul", "mul2", {}, [td("out"), td("x")], [td("m2")])
+    m.outputs.append(td("m2"))
+    m.build_dependencies()
+    a, b = tmp_path / "a.vkopbin", tmp_path / "b.vkopbin"
+    m.save_to_binary(str(a))
+    m.save_to_binary(str(b))
+    rows, nodes = read_plans(a)
+    assert [r["op_type"] for r in rows] == ["Mul", "Add"]
+    assert sorted(p for _, _, p in nodes) == [0, 0, 1]
+    assert a.read_bytes() == b.read_bytes()
+
+
+def test_plan_agrees_with_the_archive_the_cli_embeds(tmp_path, monkeypatch):
+    """The invariant that makes VKOP_STRIP_BUILTIN_SHADERS=ON safe: every key
+    the plan promises is in the archive written next to it. Synthetic master
+    holding exactly the planned keys, so nothing else can cover a gap."""
+    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
+    needed = sorted(shader_map.shader_keys_for_model({"Add"}, backend="auto"))
+    master, _ = fake_master(tmp_path, needed)
+    out = tmp_path / "tiny.vkopbin"
+    monkeypatch.setattr(sys, "argv", [
+        "onnx2vkop", "-i", str(src), "-o", str(out),
+        "--master-archive", str(master),
+    ])
+    cli.main()
+
+    rows, _ = read_plans(out)
+    assert rows, "the converted model carries no plan"
+    embedded_names = read_master_names(read_embedded(out))
+    for row in rows:
+        for k in planned_keys(row):
+            assert k in embedded_names, (row["op_type"], k)
+
+
+def test_plan_reports_a_key_the_master_does_not_have(tmp_path, monkeypatch):
+    """A planned key missing from the master is a genuine gap (the plan holds
+    the post-fallback spelling, so there is no phantom to excuse) and on a
+    stripped build it is a hard failure -- conversion has to say so."""
+    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
+    master, _ = fake_master(tmp_path, ["buffer_add"])
+    out = tmp_path / "tiny.vkopbin"
+    monkeypatch.setattr(sys, "argv", [
+        "onnx2vkop", "-i", str(src), "-o", str(out),
+        "--master-archive", str(master),
+    ])
+    cli.main()
+    # Add's other spellings (and variants) are absent from this stub master;
+    # the run still completes, with the embedded archive short of them.
+    rows, _ = read_plans(out)
+    embedded_names = read_master_names(read_embedded(out))
+    promised = {k for row in rows for k in planned_keys(row)}
+    assert "buffer_add" in embedded_names
+    assert promised - embedded_names, "expected some planned key to be missing"
+
+
+def test_host_only_nodes_get_no_row(tmp_path):
+    """A node whose op_type has no shader keeps plan = -1, i.e. the runtime's
+    built-in table (which returns no key for it) -- the same behaviour as a
+    model written before the field existed."""
+    m = tiny_dag()
+    m.nodes["sh"] = Node("Shape", "sh", {}, [td("x")], [td("s", (2,), 7)])
+    m.nodes["mul"].inputs[0] = td("s")
+    m.build_dependencies()
+    out = tmp_path / "m.vkopbin"
+    m.save_to_binary(str(out))
+    rows, nodes = read_plans(out)
+    assert [r["op_type"] for r in rows] == ["Mul", "Add"]
+    plan_of = {name: plan for name, _, plan in nodes}
+    assert plan_of["sh"] == -1

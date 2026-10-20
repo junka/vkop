@@ -20,6 +20,7 @@ from .generated.vkop.model import (
     Attribute,
     ConcurrentLevel,
     InitializerEntry,
+    KernelPlan,
     Model,
     Node as NodeTable,
     RGBAConversionMeta,
@@ -28,6 +29,7 @@ from .generated.vkop.model import (
     UnifiedMeta,
 )
 from .generated.vkop.model.AttrType import AttrType
+from . import shader_map
 
 # ONNX TensorProto data_type int -> dtype string. Mirrors the C++ reader's
 # datatyep_map[] so writer and reader agree on the spelling.
@@ -466,6 +468,10 @@ class DAGBasedModel:
         libvkop built without VKOP_STRIP_BUILTIN_SHADERS. onnx2vkop passes one
         by default; pass None for a model that should run against whatever
         archive the host provides.
+
+        The kernel selection that archive was filtered by is written into the
+        same file (Model.kernel_plans, indexed by Node.plan), so the runtime
+        reads the converter's answer instead of re-deriving it.
         """
         # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
         self.prune_dead_and_materialize_constants()
@@ -684,6 +690,49 @@ class DAGBasedModel:
         inputs_vec = build_shape_vec(self.inputs)
         outputs_vec = build_shape_vec(self.outputs)
 
+        # --- kernel plan (the converter's kernel selection, frozen in-file) ---
+        # One row per distinct op_type that has a GPU shader, referenced by
+        # Node.plan. shader_map.kernel_plans_for_model is the same table the
+        # embedded archive is filtered by (cli.build_shader_subset), so the
+        # runtime's lookup key and the bytes shipped for it come from one
+        # decision instead of two. Rows are emitted in first-appearance order
+        # so reconverting an unchanged graph yields an identical table.
+        plan_rows, plan_index = shader_map.kernel_plans_for_model(
+            [n.op_type for n in self.nodes.values()])
+        plan_offs = []
+        for row in plan_rows:
+            op_type_off = builder.CreateString(row["op_type"])
+            image_off = builder.CreateString(row["image"]) if row["image"] else 0
+            image16_off = (builder.CreateString(row["image_fp16"])
+                           if row["image_fp16"] else 0)
+            buffer_off = builder.CreateString(row["buffer"]) if row["buffer"] else 0
+            buffer16_off = (builder.CreateString(row["buffer_fp16"])
+                            if row["buffer_fp16"] else 0)
+            var_offs = [builder.CreateString(v) for v in row["variants"]]
+            KernelPlan.StartVariantsVector(builder, len(var_offs))
+            for off in reversed(var_offs):
+                builder.PrependUOffsetTRelative(off)
+            variants_vec = builder.EndVector()
+            KernelPlan.Start(builder)
+            KernelPlan.AddOpType(builder, op_type_off)
+            if image_off:
+                KernelPlan.AddImage(builder, image_off)
+            if image16_off:
+                KernelPlan.AddImageFp16(builder, image16_off)
+            if buffer_off:
+                KernelPlan.AddBuffer(builder, buffer_off)
+            if buffer16_off:
+                KernelPlan.AddBufferFp16(builder, buffer16_off)
+            KernelPlan.AddVariants(builder, variants_vec)
+            plan_offs.append(KernelPlan.End(builder))
+        if plan_offs:
+            Model.StartKernelPlansVector(builder, len(plan_offs))
+            for off in reversed(plan_offs):
+                builder.PrependUOffsetTRelative(off)
+            kernel_plans_vec = builder.EndVector()
+        else:
+            kernel_plans_vec = 0
+
         # --- nodes ---
         node_offs = []
         for node in self.nodes.values():
@@ -793,6 +842,11 @@ class DAGBasedModel:
             NodeTable.AddOutputs(builder, node_outputs_vec)
             NodeTable.AddDependencies(builder, deps_vec)
             NodeTable.AddDependents(builder, dependents_vec)
+            # -1 (the field default, and what a planless op_type gets) keeps
+            # the runtime on its built-in key table.
+            plan_idx = plan_index.get(node.op_type, -1)
+            if plan_idx >= 0:
+                NodeTable.AddPlan(builder, plan_idx)
             node_offs.append(NodeTable.End(builder))
 
         Model.StartNodesVector(builder, len(node_offs))
@@ -889,6 +943,8 @@ class DAGBasedModel:
         Model.AddConcurrentLevels(builder, concurrent_vec)
         if shader_archive_vec:
             Model.AddShaderArchive(builder, shader_archive_vec)
+        if kernel_plans_vec:
+            Model.AddKernelPlans(builder, kernel_plans_vec)
         root = Model.End(builder)
         builder.Finish(root, file_identifier=b"VKOP")
 

@@ -488,6 +488,12 @@ class Operator {
     // otherwise falls back to the extern symbols baked into libvkop, so a
     // default (unstripped) build with the archive unset keeps its existing
     // byte-for-byte behaviour.
+    //
+    // On a stripped build those externs are the 1-byte stubs spv_to_c.py
+    // writes (`X_spv[1] = {0}`, `X_spv_len = 0`), so that fallback cannot
+    // produce a usable module -- it would fail later inside VulkanPipeline
+    // with nothing pointing at the cause. A stub is therefore detected here
+    // and reported as a missing-variant error naming the key.
     std::pair<const uint32_t *, uint32_t>
     resolve_spv(const std::string &key, const unsigned char *embedded,
                 unsigned int embedded_len) const;

@@ -23,6 +23,7 @@
     #include <unistd.h>
 #endif
 
+#include "core/KernelPlan.hpp"
 #include "generated/vkop_model_generated.h"
 
 namespace vkop {
@@ -48,6 +49,11 @@ struct Node {
     std::vector<Shape> outputs;
     std::unordered_set<std::string> dependencies;
     std::unordered_set<std::string> dependents;
+    // Row in VkModel::kernel_plans holding this node's kernel selection, or -1
+    // for a file written before the field existed / an op_type with no GPU
+    // shader. -1 means the runtime falls back to its built-in OpType table,
+    // which is what every model did until now.
+    int plan_index = -1;
 };
 
 struct Initializer {
@@ -251,6 +257,13 @@ public:
     // to the SPIR-V arrays linked into libvkop.
     const uint8_t* shader_archive_memory = nullptr;
     size_t shader_archive_size = 0;
+
+    // The kernel selection the converter committed to, one row per op_type in
+    // this graph (Node::plan_index points into it). Empty for a file written
+    // before the field existed, which is exactly the "derive the key from the
+    // built-in table" behaviour. Copied (not a view) because the strings are
+    // heap-allocated by FlatBuffers and Runtime outlives this VkModel.
+    std::vector<vkop::core::KernelPlan> kernel_plans;
 
     explicit VkModel(const std::string& filePath);
 

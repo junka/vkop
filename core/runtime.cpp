@@ -160,6 +160,34 @@ void check_initializer_payload(const load::Initializer &init, ElemKind kind,
 }
 } // namespace
 
+// Which archive key this node's op should be looked up under. The .vkopbin
+// records the converter's answer (Model.kernel_plans, Node.plan) and that is
+// what we read: the embedded archive was built from the same rows by
+// shader_map.shader_keys_for_model, so "the key we ask for" and "the bytes we
+// shipped" come from one decision instead of two independent derivations of
+// it. A file without the field (every model converted before it existed) falls
+// back to the built-in OpType table, unchanged.
+std::string
+Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
+                             int op_fp16,
+                             const vkop::core::KernelPlan **plan) const {
+    *plan = nullptr;
+    if (n.plan_index >= 0 &&
+        n.plan_index < static_cast<int>(kernel_plans_.size())) {
+        const auto &p = kernel_plans_[n.plan_index];
+        if (!p.empty() && (p.op_type.empty() || p.op_type == n.op_type)) {
+            *plan = &p;
+            return p.key(backend_buffer_, op_fp16);
+        }
+        std::fprintf(stderr,
+                     "[load] node %s (op_type=%s) points at kernel plan %d "
+                     "which describes %s; using the built-in kernel table\n",
+                     n.name.c_str(), n.op_type.c_str(), n.plan_index,
+                     p.empty() ? "no op" : p.op_type.c_str());
+    }
+    return shader_key_for(type, backend_buffer_, op_fp16);
+}
+
 void Runtime::LoadModel() {
     LoadPipelineCache();
 
@@ -221,6 +249,11 @@ void Runtime::LoadModel() {
     }
 
     model.dump_model();
+    // Take ownership of the kernel plan before anything can outlive `model`:
+    // LoadModel's VkModel is a local and its FlatBuffer strings die with it,
+    // while the ops built below live for the Runtime's whole lifetime. Empty
+    // for a pre-plan file, which then uses the built-in table.
+    kernel_plans_ = std::move(model.kernel_plans);
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 
     std::unordered_map<std::string, std::string> inputs_for_node_type;
@@ -1198,16 +1231,36 @@ void Runtime::LoadModel() {
             // the ctor-assigned embedded bytes in place, so an incomplete
             // archive still runs.
             if (shader_archive_) {
-                auto key = shader_key_for(type, backend_buffer_, op_fp16);
+                const vkop::core::KernelPlan *plan = nullptr;
+                auto key = kernel_key_for_node(n, type, op_fp16, &plan);
                 if (!key.empty()) {
                     auto [spv, len] = shader_archive_->lookup(key);
                     if (spv) {
                         op->override_spv(spv, len);
                         if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
                             std::fprintf(stderr,
-                                         "[shaders] hit key=%s len=%u op=%s\n",
-                                         key.c_str(), len, n.name.c_str());
+                                         "[shaders] hit key=%s len=%u op=%s "
+                                         "(from %s)\n",
+                                         key.c_str(), len, n.name.c_str(),
+                                         plan ? "kernel plan"
+                                              : "built-in table");
                         }
+                    } else if (plan != nullptr &&
+                               shader_archive_source_ == "<model>") {
+                        // The model's own embedded subset lacks a key its own
+                        // plan lists. That is a converter bug (the two are
+                        // built from the same rows), and under
+                        // VKOP_STRIP_BUILTIN_SHADERS=ON it is fatal a moment
+                        // later, so say so here while the cause is still
+                        // obvious rather than only in debug mode.
+                        std::fprintf(
+                            stderr,
+                            "[shaders] %s: the model's embedded "
+                            "archive has no key=%s although its kernel "
+                            "plan requires it (op=%s). Reconvert it "
+                            "with onnx2vkop; the run will fail with a "
+                            "stubbed SPIR-V error.\n",
+                            model_path_.c_str(), key.c_str(), n.name.c_str());
                     } else if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
                         std::fprintf(stderr,
                                      "[shaders] miss key=%s op=%s, using "

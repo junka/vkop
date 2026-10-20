@@ -157,8 +157,15 @@ class Node(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(16))
         return o == 0
 
+    # Node
+    def Plan(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(18))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return -1
+
 def NodeStart(builder):
-    builder.StartObject(7)
+    builder.StartObject(8)
 
 def Start(builder):
     NodeStart(builder)
@@ -234,6 +241,12 @@ def NodeStartDependentsVector(builder, numElems):
 
 def StartDependentsVector(builder, numElems):
     return NodeStartDependentsVector(builder, numElems)
+
+def NodeAddPlan(builder, plan):
+    builder.PrependInt32Slot(7, plan, -1)
+
+def AddPlan(builder, plan):
+    NodeAddPlan(builder, plan)
 
 def NodeEnd(builder):
     return builder.EndObject()

@@ -8,6 +8,14 @@ embedded pointer, defeating strip mode) or ships shaders the graph never
 touches (wasted bytes). model/pypi/tests/test_shader_map_agrees.py parses
 both sides and fails on drift.
 
+Since the kernel plan landed, agreement is no longer something the two sides
+have to *re-derive* at run time: `plan_for_op` is written into the .vkopbin
+as `Model.kernel_plans` and Node.plan points at it, so the runtime reads the
+answer the converter committed to (C++'s table is the fallback for files
+written before the field existed, and for the host-side post-process ops).
+The same plans drive the archive filter above, so "what the file says" and
+"what the file carries" cannot disagree.
+
 Keys are the ONNX-style op_type strings a vkopbin actually stores (Conv,
 MaxPool, BatchNormalization, ...) — the same inputs C++'s
 convert_opstring_to_enum() accepts. Where the vkop-internal name differs
@@ -180,19 +188,101 @@ def shader_keys_for_model(
     a shader_map maintenance failure, not a conversion crash; the C++ side
     has the same policy in `convert_opstring_to_enum`).
 
-    `backend` picks image or buffer primary; the secondary table is emitted
-    regardless because those pipelines are selected on device features the
-    converter cannot know. `emit_fp16` broadens primary keys to include the
-    fp16 dual build; False keeps the archive minimal when the target is
-    known to be fp32.
+    `backend` picks image or buffer primary (plus "auto" for both); the
+    secondary table is emitted regardless because those pipelines are selected
+    on device features the converter cannot know. `emit_fp16` broadens primary
+    keys to include the fp16 dual build; False keeps the archive minimal when
+    the target is known to be fp32.
+
+    Derived from `kernel_plans_for_model`, which is the same table written
+    into the .vkopbin as `Model.kernel_plans`. That is the point: the file
+    records the keys, and the archive is filtered to exactly those keys, so
+    the two can no longer drift apart (under VKOP_STRIP_BUILTIN_SHADERS=ON a
+    drift is a hard failure at pipeline creation, not a fallback).
     """
-    if backend not in ("buffer", "image"):
-        raise ValueError(f"unknown backend {backend!r}, want buffer|image")
+    if backend not in ("buffer", "image", "auto"):
+        raise ValueError(f"unknown backend {backend!r}, want buffer|image|auto")
     keys: Set[str] = set()
     for op in set(op_types):
-        keys.update(_primary_keys(op, backend, emit_fp16))
-        keys.update(_SECONDARY.get((op, backend), ()))
+        plan = plan_for_op(op)
+        if plan is None:
+            continue
+        columns = ("image", "buffer") if backend == "auto" else (backend,)
+        for col in columns:
+            cells = (col, col + "_fp16") if emit_fp16 else (col,)
+            for cell in cells:
+                if plan[cell]:
+                    keys.add(plan[cell])
+        for v in plan["variants"]:
+            # Variants carry their backend's prefix (enforced by
+            # test_shader_map_agrees), so a pinned backend takes only its own
+            # half -- the same selection _SECONDARY used to make.
+            if backend == "auto" or v.startswith(backend + "_"):
+                keys.add(v)
     return keys
+
+
+def _column(op: str, backend: str) -> tuple:
+    """(fp32 key, fp16 key) for one op on one backend.
+
+    The fp16 key IS the fp32 key when the op's variant is not in
+    DUAL_FP16_SHADERS: the runtime asks for "..._fp16" only when the op
+    actually has one, so recording the fallback here keeps the cell
+    meaningful ("what key does fp16 resolve to") instead of empty.
+    """
+    keys = tuple(_primary_keys(op, backend, emit_fp16=True))
+    if not keys:
+        return "", ""
+    return keys[0], (keys[1] if len(keys) > 1 else keys[0])
+
+
+def plan_for_op(op: str):
+    """The kernel plan for one op_type, or None when it has no GPU shader.
+
+    None covers the host-only ops (Shape / Squeeze / Unsqueeze / Identity) and
+    any name the tables do not know; both mean "no key for this op", which is
+    also what the C++ fallback table returns for them, so a planless node
+    behaves exactly as it did before plans existed.
+
+    The returned dict mirrors the KernelPlan flatbuffer table field for field.
+    """
+    if op not in _PRIMARY:
+        return None
+    img, img16 = _column(op, "image")
+    buf, buf16 = _column(op, "buffer")
+    if not (img or buf):
+        return None
+    variants = sorted(set(_SECONDARY.get((op, "image"), ())) |
+                      set(_SECONDARY.get((op, "buffer"), ())))
+    return {
+        "op_type": op,
+        "image": img,
+        "image_fp16": img16,
+        "buffer": buf,
+        "buffer_fp16": buf16,
+        "variants": variants,
+    }
+
+
+def kernel_plans_for_model(op_types: Iterable[str]):
+    """Return (rows, index) for a graph's op census.
+
+    `rows` is the deduplicated KernelPlan list to write into Model.kernel_plans
+    (first-appearance order, so two conversions of the same graph produce the
+    same table) and `index` maps op_type -> row index for Node.plan. An
+    op_type with no plan is absent from `index`, i.e. its nodes carry -1.
+    """
+    rows: List[dict] = []
+    index: Dict[str, int] = {}
+    for op in op_types:
+        if op in index:
+            continue
+        plan = plan_for_op(op)
+        if plan is None:
+            continue
+        index[op] = len(rows)
+        rows.append(plan)
+    return rows, index
 
 
 def known_ops() -> Set[str]:

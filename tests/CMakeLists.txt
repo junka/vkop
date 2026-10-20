@@ -247,6 +247,18 @@ else()
     add_executable(all_tests ${TEST_SOURCES})
 endif()
 
+# libvkop's own SPIR-V is stubbed out by default (VKOP_STRIP_BUILTIN_SHADERS=ON),
+# so a binary that builds operators without a model file -- this whole suite,
+# the probes, bench_matmul -- has to be handed the build tree's archive. CMake
+# bakes its path in and setup.cpp seeds VKOP_SHADER_ARCHIVE from it; see
+# include/dev_shaders.hpp for why this is dev-only and why an explicit
+# VKOP_SHADER_ARCHIVE still wins. The dependency is what guarantees the archive
+# exists before the tests run.
+set(VKOP_DEV_ARCHIVE_DEF
+    "VKOP_DEV_SHADER_ARCHIVE=\"${VKOP_SHADER_ARCHIVE_FILE}\"")
+add_dependencies(all_tests shader_archive)
+target_compile_definitions(all_tests PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+
 if(MSVC)
     target_compile_options(all_tests PRIVATE /wd4100)
 else()
@@ -357,6 +369,21 @@ target_compile_definitions(UnifiedLoadTest PRIVATE
 add_dependencies(UnifiedLoadTest shader_archive)
 add_test(UnifiedLoadTest UnifiedLoadTest)
 
+# Kernel-plan reader test (not a gtest: no torch). The .vkopbin records the
+# kernel selection it was converted with (Model.kernel_plans, Node.plan) and
+# the runtime looks ops up by it; this checks every row against the built-in
+# shader_key_for() table and against the model's own embedded archive, which
+# is the agreement VKOP_STRIP_BUILTIN_SHADERS=ON depends on. Uses the same
+# build-time-converted fixture as ModelTest.
+# Run:  ./KernelPlanTest build/tests/model/add_conv_model.vkopbin
+add_executable(KernelPlanTest KernelPlanTest.cpp)
+target_link_libraries(KernelPlanTest PRIVATE vkop vload)
+# The fixture is a custom-command OUTPUT, not a target, so hang the ordering
+# off ModelTest -- it lists the same .vkopbin as a source and therefore builds
+# it. (add_dependencies rejects an output path.)
+add_dependencies(KernelPlanTest ModelTest shader_archive)
+add_test(NAME KernelPlanTest COMMAND KernelPlanTest ${MODEL_VKOPBIN})
+
 # VKSP reader unit test (not a gtest: no torch, so it stays cheap to rebuild).
 # Covers the parse() validation branches -- bad magic/version/count, truncated
 # header, damaged or non-SPIR-V entries, and that open_from_memory owns its
@@ -380,3 +407,6 @@ target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
 # DEVICE_LOST at /Min_24+/Max_24). Usage: MinMaxProbe [full|tiny]
 add_executable(MinMaxProbe MinMaxProbe.cpp)
 target_link_libraries(MinMaxProbe PRIVATE vkop vload)
+# Builds its ops directly, so it needs the same archive seed as all_tests.
+add_dependencies(MinMaxProbe shader_archive)
+target_compile_definitions(MinMaxProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})

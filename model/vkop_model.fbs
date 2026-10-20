@@ -105,10 +105,58 @@ table Node {
   outputs: [ShapeRef];
   dependencies: [string];
   dependents: [string];
+  // Index into Model.kernel_plans: which shaders this node may ask the runtime
+  // to launch. -1 (the default, and what every file written before this field
+  // existed reads back as) means "no plan": the runtime falls back to its own
+  // OpType -> key table, which is what libvkop did for every model until now.
+  // Appended last: FlatBuffers addresses fields by declaration order.
+  plan: int = -1;
 }
 
 table ConcurrentLevel {
   nodes: [string];
+}
+
+// The kernel selection, frozen into the file. One row per distinct op_type
+// that has a GPU shader; Node.plan indexes it.
+//
+// Why it is here: the runtime used to *derive* each op's archive key from its
+// own OpType -> name table (core/ShaderKeys.hpp), and the converter derived
+// the same key independently (model/pypi/onnx2vkop/shader_map.py) to decide
+// which shaders to embed. Two independent derivations of one decision, and
+// with VKOP_STRIP_BUILTIN_SHADERS=ON (the default) a disagreement is no
+// longer a silent fallback to a linked-in C array — it is a hard failure at
+// pipeline creation. Writing the converter's answer down removes the second
+// derivation: onnx2vkop embeds exactly these keys, and the runtime looks up
+// exactly these keys.
+//
+// The four columns are the key per (backend, precision) *as resolved*, i.e.
+// they already fold in the two rules that used to live in shader_key_for():
+//   - an op with no variant on the requested backend uses the other backend's
+//     basename (and that backend's prefix: an image-only op asked for on the
+//     buffer backend resolves to "image_<name>", never "buffer_<name>");
+//   - an op whose variant is not in DUAL_FP16_SHADERS resolves to the same key
+//     for fp16 and fp32, so `buffer` == `buffer_fp16` for it rather than the
+//     fp16 cell being empty.
+// An empty cell means the op genuinely has no shader for that (backend,
+// precision) pair — for an op in the table that only happens when neither
+// backend has one, otherwise the fallback above fills it.
+//
+// `variants` lists the secondary pipelines the op may build *by literal key*
+// through Operator::resolve_spv() (Matmul's coop/coop16/coop_i8/pack, the
+// int64 twin of Expand/Concat/Gather/Equal/Where, ...). Which of them runs is
+// a device-feature or input-dtype question the converter cannot answer, so the
+// list is over-inclusive on purpose (the same reason `image` and `buffer` are
+// both filled for a graph that will only ever use one) — but it is what the
+// embedded archive was built from, so a missing variant is now reportable as
+// "not converted in" instead of "stub SPIR-V".
+table KernelPlan {
+  op_type: string;
+  image: string;
+  image_fp16: string;
+  buffer: string;
+  buffer_fp16: string;
+  variants: [string];
 }
 
 table Model {
@@ -140,6 +188,12 @@ table Model {
   // earlier would renumber every field after it and silently misread every
   // already-converted .vkopbin in the field.
   shader_archive: [ubyte];
+
+  // Kernel selection for every op_type in this graph (Node.plan indexes it).
+  // Appended last for the same reason as shader_archive; also read as empty by
+  // every file written before it existed, which is exactly the "no plan, use
+  // the built-in OpType table" behaviour.
+  kernel_plans: [KernelPlan];
 }
 
 root_type Model;

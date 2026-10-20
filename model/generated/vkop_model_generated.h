@@ -44,6 +44,10 @@ struct ConcurrentLevel;
 struct ConcurrentLevelBuilder;
 struct ConcurrentLevelT;
 
+struct KernelPlan;
+struct KernelPlanBuilder;
+struct KernelPlanT;
+
 struct Model;
 struct ModelBuilder;
 struct ModelT;
@@ -63,6 +67,8 @@ inline const ::flatbuffers::TypeTable *InitializerEntryTypeTable();
 inline const ::flatbuffers::TypeTable *NodeTypeTable();
 
 inline const ::flatbuffers::TypeTable *ConcurrentLevelTypeTable();
+
+inline const ::flatbuffers::TypeTable *KernelPlanTypeTable();
 
 inline const ::flatbuffers::TypeTable *ModelTypeTable();
 
@@ -823,6 +829,7 @@ struct NodeT : public ::flatbuffers::NativeTable {
   std::vector<std::unique_ptr<vkop::model::ShapeRefT>> outputs{};
   std::vector<std::string> dependencies{};
   std::vector<std::string> dependents{};
+  int32_t plan = -1;
   NodeT() = default;
   NodeT(const NodeT &o);
   NodeT(NodeT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -842,7 +849,8 @@ struct Node FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_INPUTS = 10,
     VT_OUTPUTS = 12,
     VT_DEPENDENCIES = 14,
-    VT_DEPENDENTS = 16
+    VT_DEPENDENTS = 16,
+    VT_PLAN = 18
   };
   const ::flatbuffers::String *op_type() const {
     return GetPointer<const ::flatbuffers::String *>(VT_OP_TYPE);
@@ -886,6 +894,12 @@ struct Node FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *mutable_dependents() {
     return GetPointer<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *>(VT_DEPENDENTS);
   }
+  int32_t plan() const {
+    return GetField<int32_t>(VT_PLAN, -1);
+  }
+  bool mutate_plan(int32_t _plan = -1) {
+    return SetField<int32_t>(VT_PLAN, _plan, -1);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -908,6 +922,7 @@ struct Node FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_DEPENDENTS) &&
            verifier.VerifyVector(dependents()) &&
            verifier.VerifyVectorOfStrings(dependents()) &&
+           VerifyField<int32_t>(verifier, VT_PLAN, 4) &&
            verifier.EndTable();
   }
   NodeT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -940,6 +955,9 @@ struct NodeBuilder {
   void add_dependents(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> dependents) {
     fbb_.AddOffset(Node::VT_DEPENDENTS, dependents);
   }
+  void add_plan(int32_t plan) {
+    fbb_.AddElement<int32_t>(Node::VT_PLAN, plan, -1);
+  }
   explicit NodeBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -959,8 +977,10 @@ inline ::flatbuffers::Offset<Node> CreateNode(
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ShapeRef>>> inputs = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ShapeRef>>> outputs = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> dependencies = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> dependents = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> dependents = 0,
+    int32_t plan = -1) {
   NodeBuilder builder_(_fbb);
+  builder_.add_plan(plan);
   builder_.add_dependents(dependents);
   builder_.add_dependencies(dependencies);
   builder_.add_outputs(outputs);
@@ -979,7 +999,8 @@ inline ::flatbuffers::Offset<Node> CreateNodeDirect(
     const std::vector<::flatbuffers::Offset<vkop::model::ShapeRef>> *inputs = nullptr,
     const std::vector<::flatbuffers::Offset<vkop::model::ShapeRef>> *outputs = nullptr,
     const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *dependencies = nullptr,
-    const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *dependents = nullptr) {
+    const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *dependents = nullptr,
+    int32_t plan = -1) {
   auto op_type__ = op_type ? _fbb.CreateString(op_type) : 0;
   auto name__ = name ? _fbb.CreateString(name) : 0;
   auto attributes__ = attributes ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::Attribute>>(*attributes) : 0;
@@ -995,7 +1016,8 @@ inline ::flatbuffers::Offset<Node> CreateNodeDirect(
       inputs__,
       outputs__,
       dependencies__,
-      dependents__);
+      dependents__,
+      plan);
 }
 
 ::flatbuffers::Offset<Node> CreateNode(::flatbuffers::FlatBufferBuilder &_fbb, const NodeT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -1070,6 +1092,166 @@ inline ::flatbuffers::Offset<ConcurrentLevel> CreateConcurrentLevelDirect(
 
 ::flatbuffers::Offset<ConcurrentLevel> CreateConcurrentLevel(::flatbuffers::FlatBufferBuilder &_fbb, const ConcurrentLevelT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
 
+struct KernelPlanT : public ::flatbuffers::NativeTable {
+  typedef KernelPlan TableType;
+  std::string op_type{};
+  std::string image{};
+  std::string image_fp16{};
+  std::string buffer{};
+  std::string buffer_fp16{};
+  std::vector<std::string> variants{};
+};
+
+struct KernelPlan FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
+  typedef KernelPlanT NativeTableType;
+  typedef KernelPlanBuilder Builder;
+  static const ::flatbuffers::TypeTable *MiniReflectTypeTable() {
+    return KernelPlanTypeTable();
+  }
+  enum FlatBuffersVTableOffset FLATBUFFERS_VTABLE_UNDERLYING_TYPE {
+    VT_OP_TYPE = 4,
+    VT_IMAGE = 6,
+    VT_IMAGE_FP16 = 8,
+    VT_BUFFER = 10,
+    VT_BUFFER_FP16 = 12,
+    VT_VARIANTS = 14
+  };
+  const ::flatbuffers::String *op_type() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_OP_TYPE);
+  }
+  ::flatbuffers::String *mutable_op_type() {
+    return GetPointer<::flatbuffers::String *>(VT_OP_TYPE);
+  }
+  const ::flatbuffers::String *image() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_IMAGE);
+  }
+  ::flatbuffers::String *mutable_image() {
+    return GetPointer<::flatbuffers::String *>(VT_IMAGE);
+  }
+  const ::flatbuffers::String *image_fp16() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_IMAGE_FP16);
+  }
+  ::flatbuffers::String *mutable_image_fp16() {
+    return GetPointer<::flatbuffers::String *>(VT_IMAGE_FP16);
+  }
+  const ::flatbuffers::String *buffer() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_BUFFER);
+  }
+  ::flatbuffers::String *mutable_buffer() {
+    return GetPointer<::flatbuffers::String *>(VT_BUFFER);
+  }
+  const ::flatbuffers::String *buffer_fp16() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_BUFFER_FP16);
+  }
+  ::flatbuffers::String *mutable_buffer_fp16() {
+    return GetPointer<::flatbuffers::String *>(VT_BUFFER_FP16);
+  }
+  const ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *variants() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *>(VT_VARIANTS);
+  }
+  ::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *mutable_variants() {
+    return GetPointer<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>> *>(VT_VARIANTS);
+  }
+  template <bool B = false>
+  bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
+    return VerifyTableStart(verifier) &&
+           VerifyOffset(verifier, VT_OP_TYPE) &&
+           verifier.VerifyString(op_type()) &&
+           VerifyOffset(verifier, VT_IMAGE) &&
+           verifier.VerifyString(image()) &&
+           VerifyOffset(verifier, VT_IMAGE_FP16) &&
+           verifier.VerifyString(image_fp16()) &&
+           VerifyOffset(verifier, VT_BUFFER) &&
+           verifier.VerifyString(buffer()) &&
+           VerifyOffset(verifier, VT_BUFFER_FP16) &&
+           verifier.VerifyString(buffer_fp16()) &&
+           VerifyOffset(verifier, VT_VARIANTS) &&
+           verifier.VerifyVector(variants()) &&
+           verifier.VerifyVectorOfStrings(variants()) &&
+           verifier.EndTable();
+  }
+  KernelPlanT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  void UnPackTo(KernelPlanT *_o, const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
+  static ::flatbuffers::Offset<KernelPlan> Pack(::flatbuffers::FlatBufferBuilder &_fbb, const KernelPlanT* _o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+};
+
+struct KernelPlanBuilder {
+  typedef KernelPlan Table;
+  ::flatbuffers::FlatBufferBuilder &fbb_;
+  ::flatbuffers::uoffset_t start_;
+  void add_op_type(::flatbuffers::Offset<::flatbuffers::String> op_type) {
+    fbb_.AddOffset(KernelPlan::VT_OP_TYPE, op_type);
+  }
+  void add_image(::flatbuffers::Offset<::flatbuffers::String> image) {
+    fbb_.AddOffset(KernelPlan::VT_IMAGE, image);
+  }
+  void add_image_fp16(::flatbuffers::Offset<::flatbuffers::String> image_fp16) {
+    fbb_.AddOffset(KernelPlan::VT_IMAGE_FP16, image_fp16);
+  }
+  void add_buffer(::flatbuffers::Offset<::flatbuffers::String> buffer) {
+    fbb_.AddOffset(KernelPlan::VT_BUFFER, buffer);
+  }
+  void add_buffer_fp16(::flatbuffers::Offset<::flatbuffers::String> buffer_fp16) {
+    fbb_.AddOffset(KernelPlan::VT_BUFFER_FP16, buffer_fp16);
+  }
+  void add_variants(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> variants) {
+    fbb_.AddOffset(KernelPlan::VT_VARIANTS, variants);
+  }
+  explicit KernelPlanBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
+        : fbb_(_fbb) {
+    start_ = fbb_.StartTable();
+  }
+  ::flatbuffers::Offset<KernelPlan> Finish() {
+    const auto end = fbb_.EndTable(start_);
+    auto o = ::flatbuffers::Offset<KernelPlan>(end);
+    return o;
+  }
+};
+
+inline ::flatbuffers::Offset<KernelPlan> CreateKernelPlan(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    ::flatbuffers::Offset<::flatbuffers::String> op_type = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> image = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> image_fp16 = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> buffer = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> buffer_fp16 = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<::flatbuffers::String>>> variants = 0) {
+  KernelPlanBuilder builder_(_fbb);
+  builder_.add_variants(variants);
+  builder_.add_buffer_fp16(buffer_fp16);
+  builder_.add_buffer(buffer);
+  builder_.add_image_fp16(image_fp16);
+  builder_.add_image(image);
+  builder_.add_op_type(op_type);
+  return builder_.Finish();
+}
+
+inline ::flatbuffers::Offset<KernelPlan> CreateKernelPlanDirect(
+    ::flatbuffers::FlatBufferBuilder &_fbb,
+    const char *op_type = nullptr,
+    const char *image = nullptr,
+    const char *image_fp16 = nullptr,
+    const char *buffer = nullptr,
+    const char *buffer_fp16 = nullptr,
+    const std::vector<::flatbuffers::Offset<::flatbuffers::String>> *variants = nullptr) {
+  auto op_type__ = op_type ? _fbb.CreateString(op_type) : 0;
+  auto image__ = image ? _fbb.CreateString(image) : 0;
+  auto image_fp16__ = image_fp16 ? _fbb.CreateString(image_fp16) : 0;
+  auto buffer__ = buffer ? _fbb.CreateString(buffer) : 0;
+  auto buffer_fp16__ = buffer_fp16 ? _fbb.CreateString(buffer_fp16) : 0;
+  auto variants__ = variants ? _fbb.CreateVector<::flatbuffers::Offset<::flatbuffers::String>>(*variants) : 0;
+  return vkop::model::CreateKernelPlan(
+      _fbb,
+      op_type__,
+      image__,
+      image_fp16__,
+      buffer__,
+      buffer_fp16__,
+      variants__);
+}
+
+::flatbuffers::Offset<KernelPlan> CreateKernelPlan(::flatbuffers::FlatBufferBuilder &_fbb, const KernelPlanT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
+
 struct ModelT : public ::flatbuffers::NativeTable {
   typedef Model TableType;
   uint32_t magic = 1347373910;
@@ -1088,6 +1270,7 @@ struct ModelT : public ::flatbuffers::NativeTable {
   uint64_t unified_blob_offset = 0;
   std::vector<std::unique_ptr<vkop::model::ConcurrentLevelT>> concurrent_levels{};
   std::vector<uint8_t> shader_archive{};
+  std::vector<std::unique_ptr<vkop::model::KernelPlanT>> kernel_plans{};
   ModelT() = default;
   ModelT(const ModelT &o);
   ModelT(ModelT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -1116,7 +1299,8 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_RGBA_NAMES = 28,
     VT_UNIFIED_BLOB_OFFSET = 30,
     VT_CONCURRENT_LEVELS = 32,
-    VT_SHADER_ARCHIVE = 34
+    VT_SHADER_ARCHIVE = 34,
+    VT_KERNEL_PLANS = 36
   };
   uint32_t magic() const {
     return GetField<uint32_t>(VT_MAGIC, 1347373910);
@@ -1214,6 +1398,12 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   ::flatbuffers::Vector<uint8_t> *mutable_shader_archive() {
     return GetPointer<::flatbuffers::Vector<uint8_t> *>(VT_SHADER_ARCHIVE);
   }
+  const ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>> *kernel_plans() const {
+    return GetPointer<const ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>> *>(VT_KERNEL_PLANS);
+  }
+  ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>> *mutable_kernel_plans() {
+    return GetPointer<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>> *>(VT_KERNEL_PLANS);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -1249,6 +1439,9 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            verifier.VerifyVectorOfTables(concurrent_levels()) &&
            VerifyOffset(verifier, VT_SHADER_ARCHIVE) &&
            verifier.VerifyVector(shader_archive()) &&
+           VerifyOffset(verifier, VT_KERNEL_PLANS) &&
+           verifier.VerifyVector(kernel_plans()) &&
+           verifier.VerifyVectorOfTables(kernel_plans()) &&
            verifier.EndTable();
   }
   ModelT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -1308,6 +1501,9 @@ struct ModelBuilder {
   void add_shader_archive(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> shader_archive) {
     fbb_.AddOffset(Model::VT_SHADER_ARCHIVE, shader_archive);
   }
+  void add_kernel_plans(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>>> kernel_plans) {
+    fbb_.AddOffset(Model::VT_KERNEL_PLANS, kernel_plans);
+  }
   explicit ModelBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -1336,9 +1532,11 @@ inline ::flatbuffers::Offset<Model> CreateModel(
     ::flatbuffers::Offset<::flatbuffers::String> rgba_names = 0,
     uint64_t unified_blob_offset = 0,
     ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>> concurrent_levels = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> shader_archive = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> shader_archive = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::KernelPlan>>> kernel_plans = 0) {
   ModelBuilder builder_(_fbb);
   builder_.add_unified_blob_offset(unified_blob_offset);
+  builder_.add_kernel_plans(kernel_plans);
   builder_.add_shader_archive(shader_archive);
   builder_.add_concurrent_levels(concurrent_levels);
   builder_.add_rgba_names(rgba_names);
@@ -1374,7 +1572,8 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
     const char *rgba_names = nullptr,
     uint64_t unified_blob_offset = 0,
     const std::vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> *concurrent_levels = nullptr,
-    const std::vector<uint8_t> *shader_archive = nullptr) {
+    const std::vector<uint8_t> *shader_archive = nullptr,
+    const std::vector<::flatbuffers::Offset<vkop::model::KernelPlan>> *kernel_plans = nullptr) {
   auto inputs__ = inputs ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ShapeRef>>(*inputs) : 0;
   auto outputs__ = outputs ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ShapeRef>>(*outputs) : 0;
   auto nodes__ = nodes ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::Node>>(*nodes) : 0;
@@ -1386,6 +1585,7 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
   auto rgba_names__ = rgba_names ? _fbb.CreateString(rgba_names) : 0;
   auto concurrent_levels__ = concurrent_levels ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>(*concurrent_levels) : 0;
   auto shader_archive__ = shader_archive ? _fbb.CreateVector<uint8_t>(*shader_archive) : 0;
+  auto kernel_plans__ = kernel_plans ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::KernelPlan>>(*kernel_plans) : 0;
   return vkop::model::CreateModel(
       _fbb,
       magic,
@@ -1403,7 +1603,8 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
       rgba_names__,
       unified_blob_offset,
       concurrent_levels__,
-      shader_archive__);
+      shader_archive__,
+      kernel_plans__);
 }
 
 ::flatbuffers::Offset<Model> CreateModel(::flatbuffers::FlatBufferBuilder &_fbb, const ModelT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -1592,7 +1793,8 @@ inline NodeT::NodeT(const NodeT &o)
       : op_type(o.op_type),
         name(o.name),
         dependencies(o.dependencies),
-        dependents(o.dependents) {
+        dependents(o.dependents),
+        plan(o.plan) {
   attributes.reserve(o.attributes.size());
   for (const auto &attributes_ : o.attributes) { attributes.emplace_back((attributes_) ? new vkop::model::AttributeT(*attributes_) : nullptr); }
   inputs.reserve(o.inputs.size());
@@ -1609,6 +1811,7 @@ inline NodeT &NodeT::operator=(NodeT o) FLATBUFFERS_NOEXCEPT {
   std::swap(outputs, o.outputs);
   std::swap(dependencies, o.dependencies);
   std::swap(dependents, o.dependents);
+  std::swap(plan, o.plan);
   return *this;
 }
 
@@ -1628,6 +1831,7 @@ inline void Node::UnPackTo(NodeT *_o, const ::flatbuffers::resolver_function_t *
   { auto _e = outputs(); if (_e) { _o->outputs.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->outputs[_i]) { _e->Get(_i)->UnPackTo(_o->outputs[_i].get(), _resolver); } else { _o->outputs[_i] = std::unique_ptr<vkop::model::ShapeRefT>(_e->Get(_i)->UnPack(_resolver)); } } } else { _o->outputs.resize(0); } }
   { auto _e = dependencies(); if (_e) { _o->dependencies.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->dependencies[_i] = _e->Get(_i)->str(); } } else { _o->dependencies.resize(0); } }
   { auto _e = dependents(); if (_e) { _o->dependents.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->dependents[_i] = _e->Get(_i)->str(); } } else { _o->dependents.resize(0); } }
+  { auto _e = plan(); _o->plan = _e; }
 }
 
 inline ::flatbuffers::Offset<Node> CreateNode(::flatbuffers::FlatBufferBuilder &_fbb, const NodeT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -1645,6 +1849,7 @@ inline ::flatbuffers::Offset<Node> Node::Pack(::flatbuffers::FlatBufferBuilder &
   auto _outputs = _o->outputs.size() ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ShapeRef>> (_o->outputs.size(), [](size_t i, _VectorArgs *__va) { return CreateShapeRef(*__va->__fbb, __va->__o->outputs[i].get(), __va->__rehasher); }, &_va ) : 0;
   auto _dependencies = _o->dependencies.size() ? _fbb.CreateVectorOfStrings(_o->dependencies) : 0;
   auto _dependents = _o->dependents.size() ? _fbb.CreateVectorOfStrings(_o->dependents) : 0;
+  auto _plan = _o->plan;
   return vkop::model::CreateNode(
       _fbb,
       _op_type,
@@ -1653,7 +1858,8 @@ inline ::flatbuffers::Offset<Node> Node::Pack(::flatbuffers::FlatBufferBuilder &
       _inputs,
       _outputs,
       _dependencies,
-      _dependents);
+      _dependents,
+      _plan);
 }
 
 inline ConcurrentLevelT *ConcurrentLevel::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
@@ -1682,6 +1888,47 @@ inline ::flatbuffers::Offset<ConcurrentLevel> ConcurrentLevel::Pack(::flatbuffer
       _nodes);
 }
 
+inline KernelPlanT *KernelPlan::UnPack(const ::flatbuffers::resolver_function_t *_resolver) const {
+  auto _o = std::unique_ptr<KernelPlanT>(new KernelPlanT());
+  UnPackTo(_o.get(), _resolver);
+  return _o.release();
+}
+
+inline void KernelPlan::UnPackTo(KernelPlanT *_o, const ::flatbuffers::resolver_function_t *_resolver) const {
+  (void)_o;
+  (void)_resolver;
+  { auto _e = op_type(); if (_e) _o->op_type = _e->str(); }
+  { auto _e = image(); if (_e) _o->image = _e->str(); }
+  { auto _e = image_fp16(); if (_e) _o->image_fp16 = _e->str(); }
+  { auto _e = buffer(); if (_e) _o->buffer = _e->str(); }
+  { auto _e = buffer_fp16(); if (_e) _o->buffer_fp16 = _e->str(); }
+  { auto _e = variants(); if (_e) { _o->variants.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { _o->variants[_i] = _e->Get(_i)->str(); } } else { _o->variants.resize(0); } }
+}
+
+inline ::flatbuffers::Offset<KernelPlan> CreateKernelPlan(::flatbuffers::FlatBufferBuilder &_fbb, const KernelPlanT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  return KernelPlan::Pack(_fbb, _o, _rehasher);
+}
+
+inline ::flatbuffers::Offset<KernelPlan> KernelPlan::Pack(::flatbuffers::FlatBufferBuilder &_fbb, const KernelPlanT* _o, const ::flatbuffers::rehasher_function_t *_rehasher) {
+  (void)_rehasher;
+  (void)_o;
+  struct _VectorArgs { ::flatbuffers::FlatBufferBuilder *__fbb; const KernelPlanT* __o; const ::flatbuffers::rehasher_function_t *__rehasher; } _va = { &_fbb, _o, _rehasher}; (void)_va;
+  auto _op_type = _o->op_type.empty() ? 0 : _fbb.CreateString(_o->op_type);
+  auto _image = _o->image.empty() ? 0 : _fbb.CreateString(_o->image);
+  auto _image_fp16 = _o->image_fp16.empty() ? 0 : _fbb.CreateString(_o->image_fp16);
+  auto _buffer = _o->buffer.empty() ? 0 : _fbb.CreateString(_o->buffer);
+  auto _buffer_fp16 = _o->buffer_fp16.empty() ? 0 : _fbb.CreateString(_o->buffer_fp16);
+  auto _variants = _o->variants.size() ? _fbb.CreateVectorOfStrings(_o->variants) : 0;
+  return vkop::model::CreateKernelPlan(
+      _fbb,
+      _op_type,
+      _image,
+      _image_fp16,
+      _buffer,
+      _buffer_fp16,
+      _variants);
+}
+
 inline ModelT::ModelT(const ModelT &o)
       : magic(o.magic),
         version(o.version),
@@ -1704,6 +1951,8 @@ inline ModelT::ModelT(const ModelT &o)
   for (const auto &initializers_ : o.initializers) { initializers.emplace_back((initializers_) ? new vkop::model::InitializerEntryT(*initializers_) : nullptr); }
   concurrent_levels.reserve(o.concurrent_levels.size());
   for (const auto &concurrent_levels_ : o.concurrent_levels) { concurrent_levels.emplace_back((concurrent_levels_) ? new vkop::model::ConcurrentLevelT(*concurrent_levels_) : nullptr); }
+  kernel_plans.reserve(o.kernel_plans.size());
+  for (const auto &kernel_plans_ : o.kernel_plans) { kernel_plans.emplace_back((kernel_plans_) ? new vkop::model::KernelPlanT(*kernel_plans_) : nullptr); }
 }
 
 inline ModelT &ModelT::operator=(ModelT o) FLATBUFFERS_NOEXCEPT {
@@ -1723,6 +1972,7 @@ inline ModelT &ModelT::operator=(ModelT o) FLATBUFFERS_NOEXCEPT {
   std::swap(unified_blob_offset, o.unified_blob_offset);
   std::swap(concurrent_levels, o.concurrent_levels);
   std::swap(shader_archive, o.shader_archive);
+  std::swap(kernel_plans, o.kernel_plans);
   return *this;
 }
 
@@ -1751,6 +2001,7 @@ inline void Model::UnPackTo(ModelT *_o, const ::flatbuffers::resolver_function_t
   { auto _e = unified_blob_offset(); _o->unified_blob_offset = _e; }
   { auto _e = concurrent_levels(); if (_e) { _o->concurrent_levels.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->concurrent_levels[_i]) { _e->Get(_i)->UnPackTo(_o->concurrent_levels[_i].get(), _resolver); } else { _o->concurrent_levels[_i] = std::unique_ptr<vkop::model::ConcurrentLevelT>(_e->Get(_i)->UnPack(_resolver)); } } } else { _o->concurrent_levels.resize(0); } }
   { auto _e = shader_archive(); if (_e) { _o->shader_archive.resize(_e->size()); std::copy(_e->begin(), _e->end(), _o->shader_archive.begin()); } }
+  { auto _e = kernel_plans(); if (_e) { _o->kernel_plans.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->kernel_plans[_i]) { _e->Get(_i)->UnPackTo(_o->kernel_plans[_i].get(), _resolver); } else { _o->kernel_plans[_i] = std::unique_ptr<vkop::model::KernelPlanT>(_e->Get(_i)->UnPack(_resolver)); } } } else { _o->kernel_plans.resize(0); } }
 }
 
 inline ::flatbuffers::Offset<Model> CreateModel(::flatbuffers::FlatBufferBuilder &_fbb, const ModelT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -1777,6 +2028,7 @@ inline ::flatbuffers::Offset<Model> Model::Pack(::flatbuffers::FlatBufferBuilder
   auto _unified_blob_offset = _o->unified_blob_offset;
   auto _concurrent_levels = _o->concurrent_levels.size() ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> (_o->concurrent_levels.size(), [](size_t i, _VectorArgs *__va) { return CreateConcurrentLevel(*__va->__fbb, __va->__o->concurrent_levels[i].get(), __va->__rehasher); }, &_va ) : 0;
   auto _shader_archive = _o->shader_archive.size() ? _fbb.CreateVector(_o->shader_archive) : 0;
+  auto _kernel_plans = _o->kernel_plans.size() ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::KernelPlan>> (_o->kernel_plans.size(), [](size_t i, _VectorArgs *__va) { return CreateKernelPlan(*__va->__fbb, __va->__o->kernel_plans[i].get(), __va->__rehasher); }, &_va ) : 0;
   return vkop::model::CreateModel(
       _fbb,
       _magic,
@@ -1794,7 +2046,8 @@ inline ::flatbuffers::Offset<Model> Model::Pack(::flatbuffers::FlatBufferBuilder
       _rgba_names,
       _unified_blob_offset,
       _concurrent_levels,
-      _shader_archive);
+      _shader_archive,
+      _kernel_plans);
 }
 
 inline const ::flatbuffers::TypeTable *AttrTypeTypeTable() {
@@ -1969,7 +2222,8 @@ inline const ::flatbuffers::TypeTable *NodeTypeTable() {
     { ::flatbuffers::ET_SEQUENCE, 1, 1 },
     { ::flatbuffers::ET_SEQUENCE, 1, 1 },
     { ::flatbuffers::ET_STRING, 1, -1 },
-    { ::flatbuffers::ET_STRING, 1, -1 }
+    { ::flatbuffers::ET_STRING, 1, -1 },
+    { ::flatbuffers::ET_INT, 0, -1 }
   };
   static const ::flatbuffers::TypeFunction type_refs[] = {
     vkop::model::AttributeTypeTable,
@@ -1982,10 +2236,11 @@ inline const ::flatbuffers::TypeTable *NodeTypeTable() {
     "inputs",
     "outputs",
     "dependencies",
-    "dependents"
+    "dependents",
+    "plan"
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 7, type_codes, type_refs, nullptr, nullptr, names
+    ::flatbuffers::ST_TABLE, 8, type_codes, type_refs, nullptr, nullptr, names
   };
   return &tt;
 }
@@ -1999,6 +2254,29 @@ inline const ::flatbuffers::TypeTable *ConcurrentLevelTypeTable() {
   };
   static const ::flatbuffers::TypeTable tt = {
     ::flatbuffers::ST_TABLE, 1, type_codes, nullptr, nullptr, nullptr, names
+  };
+  return &tt;
+}
+
+inline const ::flatbuffers::TypeTable *KernelPlanTypeTable() {
+  static const ::flatbuffers::TypeCode type_codes[] = {
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_STRING, 1, -1 }
+  };
+  static const char * const names[] = {
+    "op_type",
+    "image",
+    "image_fp16",
+    "buffer",
+    "buffer_fp16",
+    "variants"
+  };
+  static const ::flatbuffers::TypeTable tt = {
+    ::flatbuffers::ST_TABLE, 6, type_codes, nullptr, nullptr, nullptr, names
   };
   return &tt;
 }
@@ -2020,7 +2298,8 @@ inline const ::flatbuffers::TypeTable *ModelTypeTable() {
     { ::flatbuffers::ET_STRING, 0, -1 },
     { ::flatbuffers::ET_ULONG, 0, -1 },
     { ::flatbuffers::ET_SEQUENCE, 1, 5 },
-    { ::flatbuffers::ET_UCHAR, 1, -1 }
+    { ::flatbuffers::ET_UCHAR, 1, -1 },
+    { ::flatbuffers::ET_SEQUENCE, 1, 6 }
   };
   static const ::flatbuffers::TypeFunction type_refs[] = {
     vkop::model::ShapeRefTypeTable,
@@ -2028,7 +2307,8 @@ inline const ::flatbuffers::TypeTable *ModelTypeTable() {
     vkop::model::InitializerEntryTypeTable,
     vkop::model::UnifiedMetaTypeTable,
     vkop::model::RGBAConversionMetaTypeTable,
-    vkop::model::ConcurrentLevelTypeTable
+    vkop::model::ConcurrentLevelTypeTable,
+    vkop::model::KernelPlanTypeTable
   };
   static const char * const names[] = {
     "magic",
@@ -2046,10 +2326,11 @@ inline const ::flatbuffers::TypeTable *ModelTypeTable() {
     "rgba_names",
     "unified_blob_offset",
     "concurrent_levels",
-    "shader_archive"
+    "shader_archive",
+    "kernel_plans"
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 16, type_codes, type_refs, nullptr, nullptr, names
+    ::flatbuffers::ST_TABLE, 17, type_codes, type_refs, nullptr, nullptr, names
   };
   return &tt;
 }

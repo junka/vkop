@@ -424,10 +424,30 @@ env 是**覆盖**而不是 fallback：想 A/B 一张新 master 上的子集，�
 `--emit-shader-archive`（不带 `--no-embed-shaders`）写出的字节和嵌进 vkopbin 的
 **逐字节相同**，所以把两者都留着也不会漂移。
 
-关键收益在 `VKOP_STRIP_BUILTIN_SHADERS=ON` 的构建上：那种 libvkop 里每个
-`*_spv[]` 都是抛异常的桩，过去必须配 `VKOP_SHADER_ARCHIVE` 才能跑，现在内嵌的归档
-自己就够——单文件 vkopbin 因此在 stripped 构建上也能独立运行（`ModelTest` 已在
-`build-strip/` 上验证这条路）。
+和归档一起写进文件的还有 **kernel 选择本身**：`Model.kernel_plans` 是去重后的
+per-op_type 行（四个 post-fallback cell `image`/`image_fp16`/`buffer`/`buffer_fp16`
+加 `variants`），`Node.plan` 索引自己那一行（`-1` = 该 op 无 shader，走 host）。
+`Runtime::LoadModel` 优先按 `Node.plan` 查 key（`VKOP_SHADER_ARCHIVE_DEBUG=1` 下
+`hit key=… (from kernel plan)`；老模型没有 plan 字段时仍退回
+`core/ShaderKeys.hpp` 的表，行为不变）。这样"哪个 op 用哪个 kernel"只有一份答案：
+归档是按同一张表筛的，`build/tests/KernelPlanTest` 拿真实转换出的 vkopbin 验证
+每个 plan cell 在模型自己的内嵌归档里都有——这正是 stripped 构建能只带模型跑的前提。
+
+`VKOP_STRIP_BUILTIN_SHADERS=ON` 现在是**默认**：libvkop 里每个 `*_spv[]` 都是
+1 字节桩（`_len = 0`），SPIR-V 只从模型来。所以内嵌归档不是可选项而是默认运行路径——
+单文件 vkopbin 在任何构建上都能独立跑（`ModelTest` 在 `build/` 和 `build-strip/` 上都
+验证了这条路）。反过来，用 `--no-embed-shaders` 转出来的模型（或归档比 master 旧/缺失
+时转出来的）在这种 lib 上**跑不起来**：`LoadModel` 会明确报
+`... has a stubbed SPIR-V array ...`，此时要么重转，要么给
+`VKOP_SHADER_ARCHIVE=<vkop_shaders.bin>`（`--master-archive`/`$VKOP_MASTER_ARCHIVE`
+能找到的那张 master 就行）。`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可以退回旧布局
+（每个 shader 都进 `.rodata`，约 2.7 MB/消费者）。
+
+单元测试、probe、`bench_matmul` 这类**不经模型**直接 `create_from_type()` 建算子的
+二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及 `MinMaxProbe`）
+从编译期注入的构建树路径 seed `VKOP_SHADER_ARCHIVE`，见
+[include/dev_shaders.hpp](../include/dev_shaders.hpp)。显式设置的
+`VKOP_SHADER_ARCHIVE` 优先级更高，所以想拿别的归档做 A/B 直接设环境变量即可。
 
 `--target-backend` 决定筛哪批 key（`auto` 是 buffer ∪ image，默认；pin 住一种能实打实省字节）：
 

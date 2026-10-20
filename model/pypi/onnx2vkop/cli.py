@@ -41,7 +41,8 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     have, and `master_count` is how many entries the master holds (for the
     summary lines). The op-type census comes from `dag_model.nodes`, the
     same set the CLI already prints in "Operator Statistics", mapped through
-    shader_map.shader_keys_for_model.
+    shader_map.shader_keys_for_model — which is the same plan table
+    dag_model.save_to_binary writes into the .vkopbin as Model.kernel_plans.
 
     backend="auto" (the default) takes the union of the buffer and image key
     sets. Which one the driver picks is a runtime choice -- Runtime defaults
@@ -54,20 +55,18 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     never asks for it. Pin "buffer"/"image" for the tight set.
     """
     op_types = {node.op_type for node in dag_model.nodes.values()}
-    if backend == "auto":
-        keys = (shader_map.shader_keys_for_model(op_types, backend="buffer")
-                | shader_map.shader_keys_for_model(op_types, backend="image"))
-    else:
-        keys = shader_map.shader_keys_for_model(op_types, backend=backend)
+    keys = shader_map.shader_keys_for_model(op_types, backend=backend)
     master = filter_shaders.read_master(master_path)
     subset = {k: master[k] for k in keys if k in master}
-    # Only complain about a key that is absent under BOTH prefixes: the
-    # selection helper emits e.g. "image_gather" for an op that has no image
-    # variant, meaning "the runtime falls back to buffer_gather", and that
-    # phantom can't be in any archive. Both spellings missing is a real gap.
-    have = {k.split("_", 1)[1] for k in subset}
-    missing = sorted(k for k in keys
-                     if k not in master and k.split("_", 1)[1] not in have)
+    # The keys above come from the graph's kernel plan, which records the
+    # post-fallback spelling per (backend, precision) -- the exact string the
+    # runtime will look up. So an absent one is a genuine gap, not a phantom:
+    # there is no "image_gather" style entry to filter out, because an op with
+    # no image variant already resolves to the buffer spelling. Report them
+    # all: on a stripped build (the default) each one is a hard failure at
+    # pipeline creation, and this is the only place that can say so before the
+    # model is deployed.
+    missing = sorted(k for k in keys if k not in master)
     return subset, missing, len(master)
 
 
@@ -190,7 +189,10 @@ def build_embedded_archive(args, dag_model, backend):
             "[shaders] no vkop_shaders.bin found (looked at --master-archive, "
             "$VKOP_MASTER_ARCHIVE, build/vkop_shaders.bin, "
             "build-strip/vkop_shaders.bin); converting without an embedded "
-            "archive. Pass --no-embed-shaders to silence this.",
+            "archive. libvkop is built with VKOP_STRIP_BUILTIN_SHADERS=ON by "
+            "default and carries no SPIR-V of its own, so this .vkopbin will "
+            "need VKOP_SHADER_ARCHIVE=<vkop_shaders.bin> at run time. Pass "
+            "--no-embed-shaders to silence this.",
             file=sys.stderr,
         )
         return None
@@ -255,10 +257,12 @@ Examples:
     )
     parser.add_argument(
         "--no-embed-shaders", action="store_true",
-        help="Do not embed the per-model SPIR-V archive in the .vkopbin "
-             "(which is what makes it a single self-contained file). The "
-             "model then needs VKOP_SHADER_ARCHIVE at run time, or a libvkop "
-             "built without VKOP_STRIP_BUILTIN_SHADERS=ON.",
+        help="Do not embed the per-model SPIR-V archive in the .vkopbin. The "
+             "model is then no longer a single self-contained file: libvkop "
+             "built with VKOP_STRIP_BUILTIN_SHADERS=ON (the default) has no "
+             "SPIR-V of its own, so the deployment must supply "
+             "VKOP_SHADER_ARCHIVE=<vkop_shaders.bin>, or the model must be run "
+             "against a libvkop built with that option OFF.",
     )
     parser.add_argument(
         "--emit-shader-archive", metavar="PATH",
@@ -403,6 +407,17 @@ def main():
 
         # Save the converted model
         dag_model.save_to_binary(str(output_path), shader_archive=shader_blob)
+
+        if shader_blob is None and args.no_embed_shaders:
+            print(
+                "[shaders] --no-embed-shaders: this .vkopbin carries no "
+                "shaders. libvkop is built with "
+                "VKOP_STRIP_BUILTIN_SHADERS=ON by default, so run it with "
+                "VKOP_SHADER_ARCHIVE=<vkop_shaders.bin> (or against a libvkop "
+                "built with that option OFF), otherwise LoadModel refuses the "
+                "op with a stubbed-SPIR-V error.",
+                file=sys.stderr,
+            )
 
         print("\nConversion completed successfully!")
         print(f"Output file size: {output_path.stat().st_size:,} bytes")

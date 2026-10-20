@@ -304,8 +304,33 @@ class Model(object):
         o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(34))
         return o == 0
 
+    # Model
+    def KernelPlans(self, j):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(36))
+        if o != 0:
+            x = self._tab.Vector(o)
+            x += flatbuffers.number_types.UOffsetTFlags.py_type(j) * 4
+            x = self._tab.Indirect(x)
+            from vkop.model.KernelPlan import KernelPlan
+            obj = KernelPlan()
+            obj.Init(self._tab.Bytes, x)
+            return obj
+        return None
+
+    # Model
+    def KernelPlansLength(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(36))
+        if o != 0:
+            return self._tab.VectorLen(o)
+        return 0
+
+    # Model
+    def KernelPlansIsNone(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(36))
+        return o == 0
+
 def ModelStart(builder):
-    builder.StartObject(16)
+    builder.StartObject(17)
 
 def Start(builder):
     ModelStart(builder)
@@ -459,6 +484,18 @@ def ModelStartShaderArchiveVector(builder, numElems):
 
 def StartShaderArchiveVector(builder, numElems):
     return ModelStartShaderArchiveVector(builder, numElems)
+
+def ModelAddKernelPlans(builder, kernelPlans):
+    builder.PrependUOffsetTRelativeSlot(16, flatbuffers.number_types.UOffsetTFlags.py_type(kernelPlans), 0)
+
+def AddKernelPlans(builder, kernelPlans):
+    ModelAddKernelPlans(builder, kernelPlans)
+
+def ModelStartKernelPlansVector(builder, numElems):
+    return builder.StartVector(4, numElems, 4)
+
+def StartKernelPlansVector(builder, numElems):
+    return ModelStartKernelPlansVector(builder, numElems)
 
 def ModelEnd(builder):
     return builder.EndObject()

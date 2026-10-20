@@ -167,6 +167,19 @@ class Runtime {
     // prints it, VKOP_SHADER_ARCHIVE_DEBUG logs it).
     std::string shader_archive_source_;
 
+    // The kernel selection the .vkopbin records (Model.kernel_plans), copied
+    // out of the transient load::VkModel because ops outlive it. Empty for a
+    // file written before the field existed: LoadModel then derives each key
+    // from the built-in table in core/ShaderKeys.hpp exactly as it always did.
+    std::vector<vkop::core::KernelPlan> kernel_plans_;
+
+    // The key this node's op should be looked up under: the plan's answer when
+    // the file carries one, else the built-in OpType table. `plan` is set to
+    // the row used (nullptr when the fallback ran) for diagnostics.
+    std::string kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
+                                    int op_fp16,
+                                    const vkop::core::KernelPlan **plan) const;
+
   public:
     // e.g. "/path/to/llm.vkopbin.shaders.bin", "<model>" or "". The bench
     // reports this so an A/B that meant to exercise the archive can tell

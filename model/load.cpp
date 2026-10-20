@@ -1,6 +1,7 @@
 // Copyright 2025 @junka
 #include <string>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 
 #include "load.hpp"
@@ -61,6 +62,36 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
             "`python3 -m onnx2vkop.cli -i <model>.onnx`.");
     }
 
+    // Kernel plans: the converter's kernel selection, read before the nodes so
+    // Node.plan can be range-checked against them. A file written by an older
+    // writer has none, and a node's plan then stays -1 — the built-in OpType
+    // table, which is what the runtime used for every model until now.
+    if (model->kernel_plans()) {
+        auto fbstr = [](const ::flatbuffers::String *s) {
+            return s ? s->str() : std::string();
+        };
+        this->kernel_plans.reserve(model->kernel_plans()->size());
+        for (uint32_t i = 0; i < model->kernel_plans()->size(); ++i) {
+            const auto *p = model->kernel_plans()->Get(i);
+            vkop::core::KernelPlan plan;
+            plan.op_type = fbstr(p->op_type());
+            plan.image = fbstr(p->image());
+            plan.image_fp16 = fbstr(p->image_fp16());
+            plan.buffer = fbstr(p->buffer());
+            plan.buffer_fp16 = fbstr(p->buffer_fp16());
+            if (p->variants()) {
+                plan.variants.reserve(p->variants()->size());
+                for (uint32_t v = 0; v < p->variants()->size(); ++v) {
+                    const auto *s = p->variants()->Get(v);
+                    if (s) {
+                        plan.variants.push_back(s->str());
+                    }
+                }
+            }
+            this->kernel_plans.push_back(std::move(plan));
+        }
+    }
+
     // inputs / outputs
     auto read_shapes = [](const ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ShapeRef>>* v) {
         std::vector<Shape> out;
@@ -118,6 +149,21 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
                     const auto* s = n->dependents()->Get(d);
                     if (s) node.dependents.insert(s->str());
                 }
+            }
+            // Out-of-range is a malformed file, not a fatal one: the built-in
+            // key table is still there, so warn and treat it as planless
+            // rather than refusing a model that would otherwise run.
+            const int plan_index = n->plan();
+            if (plan_index >= 0 &&
+                plan_index >= static_cast<int>(this->kernel_plans.size())) {
+                std::fprintf(stderr,
+                             "[load] node %s has plan=%d but the model carries "
+                             "%zu plan row(s); falling back to the built-in "
+                             "kernel table\n",
+                             node.name.c_str(), plan_index,
+                             this->kernel_plans.size());
+            } else {
+                node.plan_index = plan_index;
             }
             this->nodes.push_back(std::move(node));
         }
