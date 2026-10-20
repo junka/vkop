@@ -6051,18 +6051,42 @@ class Quantizer:
                 # fp16 SSBO shader, so the bit pattern must be float16 — see
                 # the long note on precision_tracking_operators above.
                 #
-                # EXCEPTION: if every consumer's sibling (data) input is in the
-                # fp32 domain (Cast-to=1 output propagated through the RMSNorm
-                # chain — see fp32_cast_outputs above), the op runs fp32 and the
-                # scalar must STAY fp32: a fp32 shader reading a fp16 scalar
-                # SSBO re-introduces the unpackHalf2x16 garbage.
+                # EXCEPTION 1: if every consumer's sibling (data) input is in
+                # the fp32 domain (Cast-to=1 output propagated through the
+                # RMSNorm chain — see fp32_cast_outputs above), the op runs fp32
+                # and the scalar must STAY fp32: a fp32 shader reading a fp16
+                # scalar SSBO re-introduces the unpackHalf2x16 garbage.
                 all_fp32_domain = bool(consumers) and all(
                     any(inp["name"] != name and inp["name"] in fp32_cast_outputs
                         for inp in c.inputs)
                     for c in consumers)
-                if all_fp32_domain:
+                # EXCEPTION 2: same verdict read straight off the declared
+                # dtypes — a consumer with a non-initializer input declared
+                # FLOAT runs fp32 no matter how that input was produced.
+                #
+                # The premise above ("the runtime reads this via an fp16
+                # shader") is SELF-FULFILLING when the initializer is the
+                # consumer's inputs[0]: the runtime picks the shader from
+                # inputs[0]->dtype(), so quantizing a leading scalar flips the
+                # whole op to fp16 and the fp16 kernel then reads the genuinely
+                # fp32 sibling operand as half2 garbage. EXCEPTION 1 misses
+                # this whenever the fps sibling is fp32 by construction rather
+                # than by a Cast(to=1) — the dynamic-grid pos_embed weight
+                # `1 - dh` (Sub(Constant 1.0, Reshape(lin_dh))): lin_dh is an
+                # fp32 initializer, so the sibling is fp32 with no Cast in
+                # sight, the scalar went fp16, and /Sub became an fp16 op over
+                # fp32 bytes — weights came out as [-26, 1.006] instead of
+                # [0.077, 1] and image_features was off by max 6.3.
+                runs_fp32 = target_backend == "buffer" and any(
+                    consumer_runs_fp32(c, name) for c in consumers
+                )
+                if all_fp32_domain or runs_fp32:
                     should_quantize = False
-                    reason = f"fp32-domain scalar for {consumer_ops} (sibling is fp32-domain)"
+                    reason = (
+                        f"fp32-domain scalar for {consumer_ops} (sibling is fp32-domain)"
+                        if all_fp32_domain
+                        else f"fp32 data input to {consumer_ops} (fp32 shader)"
+                    )
                 else:
                     should_quantize = True
                     reason = f"precision-tracking scalar/vector for {consumer_ops}"

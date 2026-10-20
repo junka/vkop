@@ -151,6 +151,57 @@ def test_already_fp16_weight_is_untouched():
     assert is_fp16(quantize(m))
 
 
+# ------------------------------------- precision-tracking branch (2nd hole) --
+
+def test_precision_tracking_scalar_stays_fp32_when_consumer_runs_fp32():
+    """The visual graph's pos-embed weight: Sub(Constant 1.0, fp32 sibling).
+
+    This initializer IS the consumer's inputs[0], and the runtime picks the
+    op's shader from inputs[0] — so quantizing it does not merely misread the
+    scalar, it flips Sub itself to fp16 and the fp16 kernel then reads the
+    fp32 sibling as half2. `1 - dh` came out as [-26, 1.006] instead of
+    [0.077, 1] and image_features was off by max 6.33.
+
+    The sibling is fp32 by construction (an initializer-derived intermediate,
+    not a Cast(to=1)), which the older `all_fp32_domain` exception could not
+    see — it only knows the Cast-seeded fp32 domain.
+    """
+    m = build("W", None, [("Sub", "sub", [tref("W"), tref("dh", TensorProto.FLOAT)])])
+    assert not is_fp16(quantize(m))
+
+
+def test_precision_tracking_scalar_quantizes_behind_an_fp16_sibling():
+    """The normal case the branch exists for: Pow(x_fp16, 2), Add(x_fp16, eps)."""
+    for op in ("Sub", "Mul", "Div", "Pow", "Add"):
+        m = build("W", None, [(op, "n", [tref("W"), tref("dh", TensorProto.FLOAT16)])])
+        assert is_fp16(quantize(m)), op
+
+
+def test_precision_tracking_untyped_sibling_quantizes_the_scalar():
+    """No recorded dtype -> the runtime follows precision_ (fp16)."""
+    m = build("W", None, [("Sub", "sub", [tref("W"), tref("dh")])])
+    assert is_fp16(quantize(m))
+
+
+def test_precision_tracking_scalar_quantizes_on_the_image_backend():
+    """The guard is buffer-only, same as the weight branch."""
+    m = build("W", None, [("Sub", "sub", [tref("W"), tref("dh", TensorProto.FLOAT)])])
+    assert is_fp16(quantize(m, target_backend="image"))
+
+
+def test_precision_tracking_one_fp32_consumer_blocks_the_downcast():
+    """A shared scalar feeding both an fp16 and an fp32 op must stay fp32."""
+    m = build(
+        "W",
+        None,
+        [
+            ("Mul", "a", [tref("x16", TensorProto.FLOAT16), tref("W")]),
+            ("Sub", "b", [tref("W"), tref("x32", TensorProto.FLOAT)]),
+        ],
+    )
+    assert not is_fp16(quantize(m))
+
+
 # ------------------------------------------------------- end to end ---------
 
 def test_declared_dtype_reaches_the_dag_through_shape_inference():
@@ -184,3 +235,56 @@ def test_declared_dtype_reaches_the_dag_through_shape_inference():
             Quantizer.quantize_to_fp16_selective(dag)
         # Stored fp32 -- storing fp16 here is what corrupted the LLM prefill.
         assert dag.initializers["M"].data_type == TensorProto.FLOAT
+
+
+def test_constant_scalar_stays_fp32_in_the_visual_pos_embed_chain():
+    """The dynamic-grid visual graph, end to end through parse + folding.
+
+    Mirrors the real chain /Constant_23 -> Sub(., Reshape(Gather(lin_dh))) with
+    the Gather index a graph input, so neither the `1.0` Constant node (which
+    the ConstantFolder materializes into an initializer) nor the Gather is
+    foldable and the Sub really has an intermediate fp32 sibling. There is no
+    Cast(to=1) anywhere in this graph, which is exactly why the old exception
+    let the scalar be quantized.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "pos.onnx")
+        graph = helper.make_graph(
+            [
+                helper.make_node(
+                    "Constant",
+                    [],
+                    ["one"],
+                    value=numpy_helper.from_array(
+                        numpy.array(1.0, dtype=numpy.float32), "one_v"
+                    ),
+                ),
+                helper.make_node("Gather", ["lin", "idx"], ["g"], axis=0),
+                helper.make_node("Reshape", ["g", "shape"], ["r"]),
+                helper.make_node("Sub", ["one", "r"], ["y"]),
+            ],
+            "pos",
+            [
+                helper.make_tensor_value_info("idx", TensorProto.INT64, [1]),
+            ],
+            [helper.make_tensor_value_info("y", TensorProto.FLOAT, [1])],
+            [
+                numpy_helper.from_array(numpy.zeros((8,), dtype=numpy.float32), "lin"),
+                numpy_helper.from_array(numpy.array([1], dtype=numpy.int64), "shape"),
+            ],
+        )
+        onnx.save(
+            helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)]), path
+        )
+
+        dag = ModelConverter().parse_onnx_model(path, 1)
+        sub = next(n for n in dag.nodes.values() if n.op_type == "Sub")
+        assert sub.inputs[1]["dtype"] == TensorProto.FLOAT, sub.inputs
+        scalar = sub.inputs[0]["name"]
+        assert dag.initializers[scalar].data_type == TensorProto.FLOAT
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            Quantizer.quantize_to_fp16_selective(dag)
+        # Stored fp16 here is what turned /Sub into an fp16 op and made the
+        # pos_embed interpolation weights garbage.
+        assert dag.initializers[scalar].data_type == TensorProto.FLOAT
