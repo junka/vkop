@@ -584,6 +584,13 @@ if (ENABLE_BENCHMARK)
 add_subdirectory(benchmark)
 endif ()
 
+# vkop_gpu_top -- rootless Intel GPU utilization monitor for profiling runs.
+# Reads per-engine busy time from /proc/<pid>/fdinfo and frequency/RC6 from
+# i915 GT sysfs (no perf_event, no root), in the style of intel_gpu_top.
+# Deliberately links nothing: it is pure /proc + sysfs, so it builds and runs
+# independently of the runtime and of the GPU stack.
+add_executable(vkop_gpu_top tools/vkop_gpu_top.cpp)
+
 if (ENABLE_TESTS)
 enable_testing()
 add_subdirectory(tests)
