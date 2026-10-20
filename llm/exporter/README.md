@@ -375,7 +375,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
 | `VK_PIPELINE_CACHE=1` | 任意驱动都认：把 pipeline 序列化进 `<model>.vkopbin.pcache`。llm 上 `vkop-bench --time-load-only` 实测 4083.8 → 1512.4 ms，但**只有配 `MESA_SHADER_CACHE_DISABLE=1` 才看得出来**；开着 Mesa 时两侧只差 ~70 ms，会把 vkop 的贡献完全掩盖 |
-| `VKOP_SHADER_ARCHIVE=<path>` | SPIR-V 全部改从打包归档取；`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit / miss / no key`。生产配对 `llm.vkopbin` + `llm.vkopbin.shaders.bin`（1,025,704 B、41 条）现在是 681 hit / **0 miss** |
+| `VKOP_SHADER_ARCHIVE=<path>` | 覆盖式指定归档：**优先于**模型自带的那份。默认部署不需要它——`onnx2vkop` 现在把 per-model 子集直接嵌进 `.vkopbin`（见下），载入顺序是 `VKOP_SHADER_ARCHIVE` → 模型内嵌 → libvkop 链进去的 SPIR-V。`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit / miss / no key`，并在 `LoadModel` 时打 `opened <source> (N entries)` |
 | `VKOP_KV_CACHE=1` | 仅 `llm_driver`：预分配每层 `VKOP_KV_MAX` 容量的 cache 并按该步长搬运历史，用来驱动 `has_cache` 形态的 `Attention`。在旋转形态（无 `has_cache`）的 vkopbin 上会直接拒绝而不是错跑 |
 | `VKOP_KV_MAX=<rows>` | 上一条的容量，默认 8192。**注意计时陷阱**：驱动会把 cap 步长的 staging 清零，8192 行 × 28 层 ≈ 938 MB，在 `past_len=0` 上白烧 ~39 ms，看起来像 attention 融合变慢了。实测 fused cap=8192 → 125.63 ms、cap=64 → 86.70 ms、旋转形式 → 94.33 ms；数值与 cap 无关（两档都是 max 0.2305 / mean 0.04192） |
 
@@ -402,22 +402,52 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
   `names no registered pass: [...]`），不再跟着真正关掉的一起打印——否则一次 A/B
   量的其实是同一条流水线两遍。
 
-per-model 归档与部署配对（`--target-backend` 决定选哪批 key，这个差别是实打实的字节数）：
+单文件 `.vkopbin`：`onnx2vkop` 默认就把这个模型能派发的 SPIR-V 子集塞进
+`Model.shader_archive`，所以转换出来的一颗文件本身自带 shader，部署时不再需要配套的
+`.shaders.bin`：
 
 ```bash
-python3 -m onnx2vkop.cli -i llm/exporter/llm.onnx -o llm/exporter/llm.vkopbin \
-  --emit-shader-archive llm/exporter/llm.vkopbin.shaders.bin \
-  --master-archive build/vkop_shaders.bin --target-backend buffer
-VKOP_SHADER_ARCHIVE=llm/exporter/llm.vkopbin.shaders.bin \
-  VKOP_KV_CACHE=1 VKOP_KV_MAX=64 build/llm_driver llm/exporter/llm.vkopbin \
+# 默认即内嵌（--master-archive 只是指定从哪张 master 里筛；缺省顺序是
+# $VKOP_MASTER_ARCHIVE → build/vkop_shaders.bin → build-strip/vkop_shaders.bin）
+python3 -m onnx2vkop.cli -i llm/exporter/llm.onnx -o llm/exporter/llm.vkopbin
+VKOP_KV_CACHE=1 VKOP_KV_MAX=64 build/llm_driver llm/exporter/llm.vkopbin \
   llm/exporter/decode_dump
+
+# 只想拷模型、或想自己管归档路径（archive 会被 check 成 VKSP，文件形式仍可用）
+python3 -m onnx2vkop.cli -i m.onnx -o m.vkopbin --no-embed-shaders \
+  --emit-shader-archive m.vkopbin.shaders.bin   # 两个 flag 合起来 = 旧的分离流程
+VKOP_SHADER_ARCHIVE=m.vkopbin.shaders.bin build/llm_driver m.vkopbin decode_dump
 ```
 
-同一张 master（`build/vkop_shaders.bin`，2,761,008 B / 135 条）上实测的子集大小：
+载入时的取值顺序是 `VKOP_SHADER_ARCHIVE` → 模型内嵌 → libvkop 链进去的 SPIR-V。
+env 是**覆盖**而不是 fallback：想 A/B 一张新 master 上的子集，直接设 env 即可，不用重转模型。
+`--emit-shader-archive`（不带 `--no-embed-shaders`）写出的字节和嵌进 vkopbin 的
+**逐字节相同**，所以把两者都留着也不会漂移。
+
+关键收益在 `VKOP_STRIP_BUILTIN_SHADERS=ON` 的构建上：那种 libvkop 里每个
+`*_spv[]` 都是抛异常的桩，过去必须配 `VKOP_SHADER_ARCHIVE` 才能跑，现在内嵌的归档
+自己就够——单文件 vkopbin 因此在 stripped 构建上也能独立运行（`ModelTest` 已在
+`build-strip/` 上验证这条路）。
+
+`--target-backend` 决定筛哪批 key（`auto` 是 buffer ∪ image，默认；pin 住一种能实打实省字节）：
+
+```bash
+python3 -m onnx2vkop.cli -i m.onnx -o m.vkopbin \
+  --master-archive build/vkop_shaders.bin --target-backend buffer
+```
+
+默认 `auto` 是因为后端是**运行期**选择：`Runtime` 默认 image，而仓库里的 driver 都调
+`set_backend_buffer(true)`，猜错的那一半会让 op 悄悄回落到 libvkop 内嵌的 SPIR-V
+（stripped 构建上则直接抛桩）。多带的那一半不会 fault in——op 根本不会去查它——
+所以只有在意文件大小时才需要 pin。
+
+同一张 master（`build/vkop_shaders.bin`，2,763,760 B / 135 条）上实测的子集大小：
 `cache_block` 99,472 B（3.6%）；resnet18 HEAD 转换 buffer 615,332 B（22.3%，13 条）
 vs image 342,124 B（12.4%，10 条）；llm 旋转形态 953,220 B（34.5%）；
 llm 融合形态 1,025,704 B（37.1%，41 条，比旋转形态多 `buffer_attention{,_fp16}`、
-少 `buffer_softmax{,_fp16}`）。
+少 `buffer_softmax{,_fp16}`）。转一个 `auto` 的小图对照：`model/add_conv_model.onnx`
+嵌 9/135 条 = 442,816 B（整个文件 444,768 B；`--no-embed-shaders` 时 1,952 B）。
+
 
 ### Profiling 性能分析
 

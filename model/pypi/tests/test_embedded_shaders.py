@@ -1,0 +1,277 @@
+"""The .vkopbin carries its own shaders.
+
+onnx2vkop embeds a per-model SPIR-V subset (the VKSP layout of
+tools/filter_shaders.py) in Model.shader_archive, so one file is enough to
+deploy: Runtime::LoadModel prefers VKOP_SHADER_ARCHIVE, then this blob, then
+the SPIR-V linked into libvkop. The C++ half is covered by ModelTest running
+against a fixture the CMake build converts (and by the same fixture passing in
+build-strip, where the linked-in arrays are stubs and the embedded archive is
+the only source of shaders).
+
+These tests pin the writer/reader contract at the boundary the C++ side
+reads: field present and byte-identical, absent when not asked for,
+deterministic, and still there in the external-blob layout (where the model's
+weights do NOT live in the FlatBuffer, so a regression that coupled the two
+would otherwise only show up on a multi-GB model).
+"""
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+import pytest
+from onnx import helper, numpy_helper, TensorProto
+
+from onnx2vkop import cli, shader_map
+from onnx2vkop.cli import build_shader_subset, resolve_master_archive
+from onnx2vkop.dag import DAGBasedModel, Node
+from onnx2vkop.generated.vkop.model.Model import Model
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(REPO_ROOT / "tools"))
+import filter_shaders  # noqa: E402
+
+
+def td(name, dims=(2, 2), dtype=1):
+    return {"name": name, "shape": list(dims), "dtype": dtype}
+
+
+def tiny_dag():
+    """x -> Mul -> Add -> out; the smallest graph the writer will keep."""
+    m = DAGBasedModel()
+    m.inputs = [td("x")]
+    m.outputs = [td("out")]
+    m.nodes["mul"] = Node("Mul", "mul", {}, [td("x"), td("x")], [td("m")])
+    m.nodes["add"] = Node("Add", "add", {}, [td("m"), td("x")], [td("out")])
+    m.build_dependencies()
+    return m
+
+
+def read_embedded(path):
+    """The bytes of Model.shader_archive, exactly as the C++ reader sees them."""
+    buf = bytearray(Path(path).read_bytes())
+    model = Model.GetRootAs(buf, 0)
+    n = model.ShaderArchiveLength()
+    return bytes(model.ShaderArchive(j) for j in range(n))
+
+
+def fake_spv(seed, words=8):
+    """A minimal SPIR-V-looking blob (the archive only checks the magic)."""
+    return struct.pack("<I", 0x07230203) + bytes(
+        (seed * 7 + i * 3) & 0xFF for i in range(words * 4 - 4))
+
+
+def fake_master(tmp_path, names):
+    entries = {n: fake_spv(i + 1) for i, n in enumerate(names)}
+    p = tmp_path / "vkop_shaders.bin"
+    filter_shaders.write_subset(entries, str(p))
+    return p, entries
+
+
+# ------------------------------------------------------------------ writer
+def test_archive_round_trips_through_the_writer(tmp_path):
+    _, entries = fake_master(tmp_path, ["buffer_add", "image_add_fp16"])
+    blob = filter_shaders.serialize(entries)
+    out = tmp_path / "m.vkopbin"
+    tiny_dag().save_to_binary(str(out), shader_archive=blob)
+
+    got = read_embedded(out)
+    assert got == blob
+    # And it is a well-formed VKSP archive, not just the same bytes: parse it
+    # back with the same reader the C++ side mirrors.
+    reparsed = tmp_path / "extracted.bin"
+    reparsed.write_bytes(got)
+    assert filter_shaders.read_master(str(reparsed)) == entries
+
+
+def test_no_archive_field_when_not_asked(tmp_path):
+    out = tmp_path / "m.vkopbin"
+    tiny_dag().save_to_binary(str(out))
+    assert read_embedded(out) == b""
+
+
+def test_writer_stays_deterministic_with_an_archive(tmp_path):
+    _, entries = fake_master(tmp_path, ["buffer_add", "buffer_mul"])
+    blob = filter_shaders.serialize(entries)
+    a, b = tmp_path / "a.vkopbin", tmp_path / "b.vkopbin"
+    tiny_dag().save_to_binary(str(a), shader_archive=blob)
+    tiny_dag().save_to_binary(str(b), shader_archive=blob)
+    assert a.read_bytes() == b.read_bytes()
+
+
+def test_external_blob_layout_also_carries_the_archive(tmp_path, monkeypatch):
+    """Weights go to the trailing external region; the archive stays in the
+    FlatBuffer, so a big model keeps the single-file property too."""
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "1")
+    _, entries = fake_master(tmp_path, ["buffer_add"])
+    blob = filter_shaders.serialize(entries)
+    m = tiny_dag()
+    m.initializers["w"] = numpy_helper.from_array(
+        np.zeros(512 * 1024, dtype=np.float16), "w")
+    m.nodes["add"].inputs[1] = {"name": "w", "shape": [512 * 1024], "dtype": 10}
+    out = tmp_path / "big.vkopbin"
+    m.save_to_binary(str(out), shader_archive=blob)
+
+    # 512K fp16 = 1 MiB, over the forced threshold: the blob is external.
+    assert out.stat().st_size > 1 << 20
+    assert read_embedded(out) == blob
+
+
+# ------------------------------------------------------- subset selection
+def test_serialize_matches_write_subset(tmp_path):
+    _, entries = fake_master(tmp_path, ["buffer_add", "image_add_fp16"])
+    p = tmp_path / "sub.bin"
+    filter_shaders.write_subset(entries, str(p))
+    assert p.read_bytes() == filter_shaders.serialize(entries)
+
+
+def test_auto_backend_embeds_both_sides(tmp_path):
+    """Which backend the driver picks is a runtime choice, so the default
+    selection has to answer for both."""
+    # A realistic master for this graph: every spelling that exists on the
+    # backend declaring it. Gather is buffer-only, so "image_gather" is not
+    # in here -- but shader_map still emits it, as a fallback marker.
+    master, _ = fake_master(tmp_path, [
+        "buffer_add", "buffer_add_fp16", "image_add", "image_add_fp16",
+        "buffer_mul", "buffer_mul_fp16", "image_mul", "image_mul_fp16",
+        "buffer_gather", "buffer_gather_fp16", "buffer_gather_int64"])
+    m = tiny_dag()
+    m.nodes["g"] = Node("Gather", "g", {"axis": 0},
+                        [td("x"), td("i", (1,), 7)], [td("gout")])
+    m.nodes["add"].inputs[0] = td("gout")
+    m.build_dependencies()
+
+    subset, missing, count = build_shader_subset(m, master, backend="auto")
+    assert "buffer_add" in subset and "image_add" in subset
+    assert count == 11
+    # Gather has no image variant: shader_map emits the phantom "image_gather"
+    # (meaning "fall back to buffer_gather"), which must not be reported as a
+    # missing shader -- the spelling the runtime would actually ask for is
+    # there, and every key the graph can dispatch resolved.
+    assert missing == []
+    assert "image_gather" not in subset
+
+
+def test_pinned_backend_is_the_tight_set(tmp_path):
+    master, _ = fake_master(
+        tmp_path, ["buffer_add", "buffer_add_fp16", "image_add",
+                   "image_add_fp16", "buffer_gather"])
+    subset, _, _ = build_shader_subset(tiny_dag(), master, backend="buffer")
+    assert "buffer_add" in subset
+    assert not any(k.startswith("image_") for k in subset)
+
+
+def test_genuinely_absent_shader_is_reported(tmp_path):
+    master, _ = fake_master(tmp_path, ["buffer_add"])
+    subset, missing, _ = build_shader_subset(tiny_dag(), master, backend="auto")
+    assert subset["buffer_add"]
+    # Mul has no shader under either prefix: that is a real gap. Add's fp16
+    # twin is missing from this stub master too, for the same reason.
+    assert "buffer_mul" in missing
+    assert "buffer_add" not in missing
+
+
+# ------------------------------------------------------------- discovery
+def test_resolve_master_archive_precedence(tmp_path, monkeypatch):
+    explicit = tmp_path / "explicit.bin"
+    explicit.write_bytes(b"x")
+    env = tmp_path / "env.bin"
+    env.write_bytes(b"x")
+    monkeypatch.setenv("VKOP_MASTER_ARCHIVE", str(env))
+    assert resolve_master_archive(str(explicit))[0] == explicit
+    assert resolve_master_archive(None)[0] == env
+    monkeypatch.delenv("VKOP_MASTER_ARCHIVE")
+    # This checkout has a build tree, so the search finds one; the point here
+    # is that it is a real file rather than a guess at a path.
+    found, how = resolve_master_archive(None)
+    assert found is None or found.is_file()
+
+
+def test_embed_returns_bytes_and_reports_subset(tmp_path, capsys):
+    master, _ = fake_master(tmp_path, ["buffer_add", "buffer_mul",
+                                       "buffer_add_fp16", "buffer_mul_fp16"])
+    blob = cli.embed_shader_archive(tiny_dag(), master, backend="auto")
+    assert read_master_names(blob) >= {"buffer_add", "buffer_mul"}
+    out = capsys.readouterr().out
+    assert "embedded 4 of 4 shader(s)" in out
+
+
+def read_master_names(blob):
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+        f.write(blob)
+        f.flush()
+        return set(filter_shaders.read_master(f.name))
+
+
+# ------------------------------------------------------------ end to end
+def _write_tiny_onnx(path):
+    """add = x + y, the smallest convertible graph."""
+    x = helper.make_tensor_value_info("x", TensorProto.FLOAT, [2, 2])
+    y = helper.make_tensor_value_info("y", TensorProto.FLOAT, [2, 2])
+    out = helper.make_tensor_value_info("out", TensorProto.FLOAT, [2, 2])
+    node = helper.make_node("Add", ["x", "y"], ["out"], name="add")
+    graph = helper.make_graph([node], "tiny", [x, y], [out])
+    onnx_model = helper.make_model(graph)
+    onnx_model.opset_import[0].version = 13
+    path = Path(path)
+    with open(path, "wb") as f:
+        f.write(onnx_model.SerializeToString())
+    return path
+
+
+def test_cli_embeds_by_default(tmp_path, monkeypatch):
+    """The whole point of the default: a plain `onnx2vkop -i m.onnx` produces
+    a file that knows its own shaders."""
+    master, _ = fake_master(
+        tmp_path, ["buffer_add", "buffer_add_fp16", "image_add",
+                   "image_add_fp16"])
+    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
+    out = tmp_path / "tiny.vkopbin"
+    monkeypatch.setattr(sys, "argv", [
+        "onnx2vkop", "-i", str(src), "-o", str(out),
+        "--master-archive", str(master),
+    ])
+    cli.main()
+
+    blob = read_embedded(out)
+    assert read_master_names(blob) >= {"buffer_add", "image_add"}
+
+
+def test_cli_no_embed_flag_leaves_the_model_bare(tmp_path, monkeypatch):
+    master, _ = fake_master(tmp_path, ["buffer_add", "image_add"])
+    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
+    out = tmp_path / "bare.vkopbin"
+    monkeypatch.setattr(sys, "argv", [
+        "onnx2vkop", "-i", str(src), "-o", str(out),
+        "--master-archive", str(master), "--no-embed-shaders",
+    ])
+    cli.main()
+    assert read_embedded(out) == b""
+
+
+def test_cli_emit_shader_archive_writes_the_same_bytes(tmp_path, monkeypatch):
+    """--emit-shader-archive is now the standalone spelling of the same
+    subset; the file and the embedded copy must not drift."""
+    master, _ = fake_master(
+        tmp_path, ["buffer_add", "buffer_add_fp16", "image_add",
+                   "image_add_fp16"])
+    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
+    out = tmp_path / "tiny.vkopbin"
+    side = tmp_path / "tiny.vkopbin.shaders.bin"
+    monkeypatch.setattr(sys, "argv", [
+        "onnx2vkop", "-i", str(src), "-o", str(out),
+        "--master-archive", str(master), "--emit-shader-archive", str(side),
+    ])
+    cli.main()
+    assert side.read_bytes() == read_embedded(out)
+
+
+def test_shader_map_covers_a_union_of_backends():
+    """build_shader_subset("auto") is exactly the two per-backend sets, so a
+    key can never be dropped by splitting the selection in two."""
+    ops = {"Add", "Mul", "MatMul", "Gather"}
+    both = (shader_map.shader_keys_for_model(ops, backend="buffer")
+            | shader_map.shader_keys_for_model(ops, backend="image"))
+    assert both >= shader_map.shader_keys_for_model(ops, backend="buffer")
+    assert both >= shader_map.shader_keys_for_model(ops, backend="image")

@@ -155,6 +155,19 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
         this->initializer_memory_size = 0;
     }
 
+    // Embedded SPIR-V archive (VKSP), written by onnx2vkop by default so a
+    // single .vkopbin carries the shaders its graph dispatches. Same
+    // zero-copy-view contract as the initializer blob: the pointer is into
+    // the mmap and only valid while this VkModel lives. Runtime copies it
+    // out (ShaderArchive::open_from_memory owns its bytes) because that
+    // mapping is released when LoadModel returns.
+    if (const auto* arch = model->shader_archive()) {
+        if (arch->size() > 0) {
+            this->shader_archive_memory = arch->Data();
+            this->shader_archive_size = arch->size();
+        }
+    }
+
     // initializer entries — offsets come pre-computed from the Python writer.
     if (model->initializers()) {
         for (uint32_t i = 0; i < model->initializers()->size(); ++i) {

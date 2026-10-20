@@ -1087,6 +1087,7 @@ struct ModelT : public ::flatbuffers::NativeTable {
   std::string rgba_names{};
   uint64_t unified_blob_offset = 0;
   std::vector<std::unique_ptr<vkop::model::ConcurrentLevelT>> concurrent_levels{};
+  std::vector<uint8_t> shader_archive{};
   ModelT() = default;
   ModelT(const ModelT &o);
   ModelT(ModelT&&) FLATBUFFERS_NOEXCEPT = default;
@@ -1114,7 +1115,8 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_RGBA_META = 26,
     VT_RGBA_NAMES = 28,
     VT_UNIFIED_BLOB_OFFSET = 30,
-    VT_CONCURRENT_LEVELS = 32
+    VT_CONCURRENT_LEVELS = 32,
+    VT_SHADER_ARCHIVE = 34
   };
   uint32_t magic() const {
     return GetField<uint32_t>(VT_MAGIC, 1347373910);
@@ -1206,6 +1208,12 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   ::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> *mutable_concurrent_levels() {
     return GetPointer<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> *>(VT_CONCURRENT_LEVELS);
   }
+  const ::flatbuffers::Vector<uint8_t> *shader_archive() const {
+    return GetPointer<const ::flatbuffers::Vector<uint8_t> *>(VT_SHADER_ARCHIVE);
+  }
+  ::flatbuffers::Vector<uint8_t> *mutable_shader_archive() {
+    return GetPointer<::flatbuffers::Vector<uint8_t> *>(VT_SHADER_ARCHIVE);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -1239,6 +1247,8 @@ struct Model FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_CONCURRENT_LEVELS) &&
            verifier.VerifyVector(concurrent_levels()) &&
            verifier.VerifyVectorOfTables(concurrent_levels()) &&
+           VerifyOffset(verifier, VT_SHADER_ARCHIVE) &&
+           verifier.VerifyVector(shader_archive()) &&
            verifier.EndTable();
   }
   ModelT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -1295,6 +1305,9 @@ struct ModelBuilder {
   void add_concurrent_levels(::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>> concurrent_levels) {
     fbb_.AddOffset(Model::VT_CONCURRENT_LEVELS, concurrent_levels);
   }
+  void add_shader_archive(::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> shader_archive) {
+    fbb_.AddOffset(Model::VT_SHADER_ARCHIVE, shader_archive);
+  }
   explicit ModelBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -1322,9 +1335,11 @@ inline ::flatbuffers::Offset<Model> CreateModel(
     ::flatbuffers::Offset<::flatbuffers::Vector<const vkop::model::RGBAConversionMeta *>> rgba_meta = 0,
     ::flatbuffers::Offset<::flatbuffers::String> rgba_names = 0,
     uint64_t unified_blob_offset = 0,
-    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>> concurrent_levels = 0) {
+    ::flatbuffers::Offset<::flatbuffers::Vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>> concurrent_levels = 0,
+    ::flatbuffers::Offset<::flatbuffers::Vector<uint8_t>> shader_archive = 0) {
   ModelBuilder builder_(_fbb);
   builder_.add_unified_blob_offset(unified_blob_offset);
+  builder_.add_shader_archive(shader_archive);
   builder_.add_concurrent_levels(concurrent_levels);
   builder_.add_rgba_names(rgba_names);
   builder_.add_rgba_meta(rgba_meta);
@@ -1358,7 +1373,8 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
     const std::vector<vkop::model::RGBAConversionMeta> *rgba_meta = nullptr,
     const char *rgba_names = nullptr,
     uint64_t unified_blob_offset = 0,
-    const std::vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> *concurrent_levels = nullptr) {
+    const std::vector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> *concurrent_levels = nullptr,
+    const std::vector<uint8_t> *shader_archive = nullptr) {
   auto inputs__ = inputs ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ShapeRef>>(*inputs) : 0;
   auto outputs__ = outputs ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ShapeRef>>(*outputs) : 0;
   auto nodes__ = nodes ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::Node>>(*nodes) : 0;
@@ -1369,6 +1385,7 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
   auto rgba_meta__ = rgba_meta ? _fbb.CreateVectorOfStructs<vkop::model::RGBAConversionMeta>(*rgba_meta) : 0;
   auto rgba_names__ = rgba_names ? _fbb.CreateString(rgba_names) : 0;
   auto concurrent_levels__ = concurrent_levels ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>>(*concurrent_levels) : 0;
+  auto shader_archive__ = shader_archive ? _fbb.CreateVector<uint8_t>(*shader_archive) : 0;
   return vkop::model::CreateModel(
       _fbb,
       magic,
@@ -1385,7 +1402,8 @@ inline ::flatbuffers::Offset<Model> CreateModelDirect(
       rgba_meta__,
       rgba_names__,
       unified_blob_offset,
-      concurrent_levels__);
+      concurrent_levels__,
+      shader_archive__);
 }
 
 ::flatbuffers::Offset<Model> CreateModel(::flatbuffers::FlatBufferBuilder &_fbb, const ModelT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -1674,7 +1692,8 @@ inline ModelT::ModelT(const ModelT &o)
         unified_names(o.unified_names),
         rgba_meta(o.rgba_meta),
         rgba_names(o.rgba_names),
-        unified_blob_offset(o.unified_blob_offset) {
+        unified_blob_offset(o.unified_blob_offset),
+        shader_archive(o.shader_archive) {
   inputs.reserve(o.inputs.size());
   for (const auto &inputs_ : o.inputs) { inputs.emplace_back((inputs_) ? new vkop::model::ShapeRefT(*inputs_) : nullptr); }
   outputs.reserve(o.outputs.size());
@@ -1703,6 +1722,7 @@ inline ModelT &ModelT::operator=(ModelT o) FLATBUFFERS_NOEXCEPT {
   std::swap(rgba_names, o.rgba_names);
   std::swap(unified_blob_offset, o.unified_blob_offset);
   std::swap(concurrent_levels, o.concurrent_levels);
+  std::swap(shader_archive, o.shader_archive);
   return *this;
 }
 
@@ -1730,6 +1750,7 @@ inline void Model::UnPackTo(ModelT *_o, const ::flatbuffers::resolver_function_t
   { auto _e = rgba_names(); if (_e) _o->rgba_names = _e->str(); }
   { auto _e = unified_blob_offset(); _o->unified_blob_offset = _e; }
   { auto _e = concurrent_levels(); if (_e) { _o->concurrent_levels.resize(_e->size()); for (::flatbuffers::uoffset_t _i = 0; _i < _e->size(); _i++) { if(_o->concurrent_levels[_i]) { _e->Get(_i)->UnPackTo(_o->concurrent_levels[_i].get(), _resolver); } else { _o->concurrent_levels[_i] = std::unique_ptr<vkop::model::ConcurrentLevelT>(_e->Get(_i)->UnPack(_resolver)); } } } else { _o->concurrent_levels.resize(0); } }
+  { auto _e = shader_archive(); if (_e) { _o->shader_archive.resize(_e->size()); std::copy(_e->begin(), _e->end(), _o->shader_archive.begin()); } }
 }
 
 inline ::flatbuffers::Offset<Model> CreateModel(::flatbuffers::FlatBufferBuilder &_fbb, const ModelT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -1755,6 +1776,7 @@ inline ::flatbuffers::Offset<Model> Model::Pack(::flatbuffers::FlatBufferBuilder
   auto _rgba_names = _o->rgba_names.empty() ? 0 : _fbb.CreateString(_o->rgba_names);
   auto _unified_blob_offset = _o->unified_blob_offset;
   auto _concurrent_levels = _o->concurrent_levels.size() ? _fbb.CreateVector<::flatbuffers::Offset<vkop::model::ConcurrentLevel>> (_o->concurrent_levels.size(), [](size_t i, _VectorArgs *__va) { return CreateConcurrentLevel(*__va->__fbb, __va->__o->concurrent_levels[i].get(), __va->__rehasher); }, &_va ) : 0;
+  auto _shader_archive = _o->shader_archive.size() ? _fbb.CreateVector(_o->shader_archive) : 0;
   return vkop::model::CreateModel(
       _fbb,
       _magic,
@@ -1771,7 +1793,8 @@ inline ::flatbuffers::Offset<Model> Model::Pack(::flatbuffers::FlatBufferBuilder
       _rgba_meta,
       _rgba_names,
       _unified_blob_offset,
-      _concurrent_levels);
+      _concurrent_levels,
+      _shader_archive);
 }
 
 inline const ::flatbuffers::TypeTable *AttrTypeTypeTable() {
@@ -1996,7 +2019,8 @@ inline const ::flatbuffers::TypeTable *ModelTypeTable() {
     { ::flatbuffers::ET_SEQUENCE, 1, 4 },
     { ::flatbuffers::ET_STRING, 0, -1 },
     { ::flatbuffers::ET_ULONG, 0, -1 },
-    { ::flatbuffers::ET_SEQUENCE, 1, 5 }
+    { ::flatbuffers::ET_SEQUENCE, 1, 5 },
+    { ::flatbuffers::ET_UCHAR, 1, -1 }
   };
   static const ::flatbuffers::TypeFunction type_refs[] = {
     vkop::model::ShapeRefTypeTable,
@@ -2021,10 +2045,11 @@ inline const ::flatbuffers::TypeTable *ModelTypeTable() {
     "rgba_meta",
     "rgba_names",
     "unified_blob_offset",
-    "concurrent_levels"
+    "concurrent_levels",
+    "shader_archive"
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 15, type_codes, type_refs, nullptr, nullptr, names
+    ::flatbuffers::ST_TABLE, 16, type_codes, type_refs, nullptr, nullptr, names
   };
   return &tt;
 }

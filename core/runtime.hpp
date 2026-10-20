@@ -152,17 +152,33 @@ class Runtime {
     void LoadPipelineCache();
     void SavePipelineCache();
 
-    // VKOP_SHADER_ARCHIVE=<path> makes LoadModel override every op's SPIR-V
-    // pointer from the packed vkop_shaders.bin archive before building its
-    // pipeline. Null when the env is unset or the archive fails to open;
-    // the ops then fall through to their ctor-assigned embedded symbols.
-    // The archive is memory-mapped, so only the shader blobs a model
-    // actually fires become resident -- this is the trtexec-style "extract
-    // only what's needed" property that avoids baking every libvkop shader
-    // into every driver binary.
+    // SPIR-V source for this model, in precedence order: VKOP_SHADER_ARCHIVE
+    // (an explicit override), else the archive the .vkopbin itself carries
+    // (onnx2vkop embeds one by default), else null -- ops then keep their
+    // ctor-assigned embedded symbols. The archive is memory-mapped for the
+    // file form and copied out of the model mmap for the embedded form, so
+    // only the shader blobs a model actually fires become resident: this is
+    // the trtexec-style "extract only what's needed" property that avoids
+    // baking every libvkop shader into every driver binary.
     std::unique_ptr<ShaderArchive> shader_archive_;
 
+    // Where shader_archive_ came from: the env path, "<model>" for the
+    // embedded copy, or "" when there is none. Diagnostics only (vkop-bench
+    // prints it, VKOP_SHADER_ARCHIVE_DEBUG logs it).
+    std::string shader_archive_source_;
+
   public:
+    // e.g. "/path/to/llm.vkopbin.shaders.bin", "<model>" or "". The bench
+    // reports this so an A/B that meant to exercise the archive can tell
+    // whether it actually loaded one.
+    const std::string &shader_archive_source() const {
+        return shader_archive_source_;
+    }
+    // Entry count of the loaded archive, 0 when there is none.
+    size_t shader_archive_entries() const {
+        return shader_archive_ ? shader_archive_->entry_count() : 0;
+    }
+
     // Drop every op's cached recording (back to FRESH) so the next Run()
     // re-records all. Call across a phase boundary where shapes change en masse
     // (e.g. prefill q_len=L → decode q_len=1): partial replay across such a

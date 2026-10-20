@@ -163,29 +163,63 @@ void check_initializer_payload(const load::Initializer &init, ElemKind kind,
 void Runtime::LoadModel() {
     LoadPipelineCache();
 
-    // VKOP_SHADER_ARCHIVE=<path> makes every op's SPIR-V come from the packed
-    // archive instead of its linked C array. A missing or malformed archive
-    // is not fatal -- the ops keep their ctor-assigned embedded pointers and
-    // the run proceeds, matching the pre-archive behaviour exactly. Debug
+    auto model = load::VkModel(model_path_);
+
+    // SPIR-V source, in precedence order:
+    //   1. VKOP_SHADER_ARCHIVE=<path> — an explicit override, e.g. to run a
+    //      model against a rebuilt archive without reconverting it.
+    //   2. the archive the .vkopbin itself carries (onnx2vkop embeds one by
+    //      default), which is what makes a single .vkopbin deployable.
+    //   3. nothing — ops keep their ctor-assigned embedded C arrays.
+    // A missing or malformed archive at any step is not fatal: we fall
+    // through to the next source, matching the pre-archive behaviour. Debug
     // mode reports the outcome either way so a mis-set env is visible.
-    if (const char *apath = std::getenv("VKOP_SHADER_ARCHIVE")) {
-        if (apath[0] != '\0') {
-            shader_archive_ = ShaderArchive::open(apath);
-            if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
-                if (shader_archive_) {
-                    std::fprintf(stderr, "[shaders] opened %s (%zu entries)\n",
-                                 apath, shader_archive_->entry_count());
-                } else {
-                    std::fprintf(stderr,
-                                 "[shaders] failed to open %s, falling back to "
-                                 "embedded SPIR-V\n",
-                                 apath);
-                }
-            }
+    const char *apath = std::getenv("VKOP_SHADER_ARCHIVE");
+    if (apath != nullptr && apath[0] != '\0') {
+        shader_archive_ = ShaderArchive::open(apath);
+        if (shader_archive_) {
+            shader_archive_source_ = apath;
+        } else {
+            std::fprintf(stderr,
+                         "[shaders] VKOP_SHADER_ARCHIVE=%s is not a usable "
+                         "archive; falling back\n",
+                         apath);
+        }
+    }
+    const bool embedded_ok = model.shader_archive_size > 0 &&
+                             std::getenv("VKOP_NO_EMBEDDED_SHADERS") == nullptr;
+    if (!shader_archive_ && embedded_ok) {
+        shader_archive_ = ShaderArchive::open_from_memory(
+            model.shader_archive_memory, model.shader_archive_size);
+        if (shader_archive_) {
+            shader_archive_source_ = "<model>";
+        } else {
+            std::fprintf(stderr,
+                         "[shaders] %s carries a shader archive blob that is "
+                         "not a usable VKSP archive; falling back to the "
+                         "embedded SPIR-V\n",
+                         model_path_.c_str());
+        }
+    }
+    if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+        if (shader_archive_) {
+            std::fprintf(stderr, "[shaders] opened %s (%zu entries)\n",
+                         apath && apath[0] ? apath : "<model-embedded>",
+                         shader_archive_->entry_count());
+        } else if (model.shader_archive_size == 0) {
+            std::fprintf(stderr,
+                         "[shaders] %s carries no shader archive; using the "
+                         "SPIR-V linked into libvkop\n",
+                         model_path_.c_str());
+        } else {
+            std::fprintf(stderr,
+                         "[shaders] %s's shader archive disabled by "
+                         "VKOP_NO_EMBEDDED_SHADERS; using the SPIR-V linked "
+                         "into libvkop\n",
+                         model_path_.c_str());
         }
     }
 
-    auto model = load::VkModel(model_path_);
     model.dump_model();
     std::unordered_map<std::string, std::shared_ptr<ITensor>> tensor_map;
 

@@ -6,30 +6,45 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 #include "model/load.hpp"
 
 namespace vkop {
 namespace core {
 
-// Loads the vkop_shaders.bin archive produced by tools/spv_to_archive.py at
-// build time. The archive mirrors the folder_name convention CMakeLists.txt
-// already uses for its embedded `buffer_<op>_spv` / `image_<op>_spv` C-array
-// symbols, so a runtime lookup key is exactly the string an op header would
-// have referenced through its `extern unsigned char X_spv[]` block.
+// Loads a VKSP archive: either the whole vkop_shaders.bin the CMake build
+// produces (tools/spv_to_archive.py), or the per-model subset embedded in a
+// .vkopbin (onnx2vkop writes one by default). The archive mirrors the
+// folder_name convention CMakeLists.txt already uses for its embedded
+// `buffer_<op>_spv` / `image_<op>_spv` C-array symbols, so a runtime lookup
+// key is exactly the string an op header would have referenced through its
+// `extern unsigned char X_spv[]` block.
 //
-// The archive is mapped through load::FileMapping, so only the pages an
+// The file form is mapped through load::FileMapping, so only the pages an
 // actually-loaded shader touches fault into RSS. A model that fires 26
 // shaders out of the ~95 in libvkop sees ~26 blob ranges resident, not the
-// whole file.
+// whole file. The embedded form is a bounded copy out of the vkopbin mmap
+// (the mapping is released when LoadModel returns) and is small by
+// construction: it holds only the keys that graph can dispatch.
 //
-// Failure mode: `open()` returns nullptr on any structural problem (missing
-// file, bad magic, version mismatch, corrupt index). Callers (Runtime) treat
-// a null archive as "use the embedded SPIR-V symbols", so a deployment that
-// forgot the .bin still runs, just without the memory saving.
+// Failure mode: `open()` / `open_from_memory()` return nullptr on any
+// structural problem (missing file, bad magic, version mismatch, corrupt
+// index). Callers (Runtime) treat that as "use the embedded SPIR-V symbols
+// of the next source in line", so a deployment that forgot the .bin still
+// runs, just without the memory saving.
 class ShaderArchive {
   public:
     static std::unique_ptr<ShaderArchive> open(const std::string &path);
+
+    // Open an archive that lives inside another file's mapping -- the
+    // `shader_archive` blob a .vkopbin carries (Runtime::LoadModel). `data`
+    // must point at a VKSP header and `size` covers the whole archive; the
+    // bytes are copied into an owned buffer, so the caller's mapping (the
+    // transient load::VkModel) may be released immediately after. Returns
+    // nullptr on a structural problem, exactly like open().
+    static std::unique_ptr<ShaderArchive> open_from_memory(const uint8_t *data,
+                                                           size_t size);
 
     // The archive named by VKOP_SHADER_ARCHIVE, opened once per process and
     // owned here. Runtime::LoadModel hands its own handle to every op it
@@ -58,7 +73,19 @@ class ShaderArchive {
         uint64_t offset;
         uint32_t size;
     };
+
+    // Parse a VKSP archive at `base`. Shared by both open paths so the
+    // mmap'd and the copied-into-memory case validate identically. Returns
+    // false (leaving index_ empty) on any structural problem.
+    bool parse(const uint8_t *base, size_t total);
+
+    // Only one of these is populated: open() maps a file, open_from_memory()
+    // owns a copy of bytes that live in someone else's mapping. base_/size_
+    // are what parse() and lookup() actually read.
     load::FileMapping mapping_;
+    std::vector<uint8_t> owned_;
+    const uint8_t *base_ = nullptr;
+    size_t size_ = 0;
     std::unordered_map<std::string, Entry> index_;
 };
 

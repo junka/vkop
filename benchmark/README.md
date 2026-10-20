@@ -208,10 +208,15 @@ vkop-bench: --device 99 out of range (0..1); use --list-devices
 | 变量 | 作用 |
 |---|---|
 | `VK_PIPELINE_CACHE=1` | 把 pipeline 序列化到 `<model>.vkopbin.pcache`；`=debug` 打印命中情况。llm 上实测 4083.8 → 1512.4 ms（**必须**配 `MESA_SHADER_CACHE_DISABLE=1` 才看得见，否则 Intel 自己的 disk cache 会把差别吃掉，看着只有 ~70 ms） |
-| `VKOP_SHADER_ARCHIVE=<path>` | 所有 op 的 SPIR-V 改从打包归档取；`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit/miss/no key`，并打 `opened <path> (N entries)` |
+| `VKOP_SHADER_ARCHIVE=<path>` | 指定打包归档并**覆盖**模型自带的那份（顺序：env → `Model.shader_archive` → libvkop 内嵌）。`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit/miss/no key`，并在载入时打 `opened <source> (N entries)`；`VKOP_NO_EMBEDDED_SHADERS=1` 忽略模型内嵌的那份 |
 | `VKOP_SUBMIT_PROF=1` | 把逐 op GPU 时间打到 stderr（`--profile-out` 走的是同一条采集路径，但输出成 JSON） |
 | `MESA_SHADER_CACHE_DISABLE=1` | 关掉 Mesa 的 disk shader cache，用来把 vkop 自己的 pipeline cache 贡献单独量出来 |
 
+`vkop-bench` 载入时会打一行 `shader-archive: <source> (N entries)`（或
+`none (libvkop-embedded SPIR-V)`），stderr 里也可见。
+
 归档模式的正确性是量过的，不是假设：stripped 构建（`VKOP_STRIP_BUILTIN_SHADERS=ON`）
 配 `llm.vkopbin.shaders.bin`（1,025,704 B、41 条）跑 round 5，`--save-outputs` 的
-29 个文件与内嵌 shader 的普通构建**逐字节相同**，归档命中 681 次、miss 0 次。
+29 个文件与内嵌 shader 的普通构建**逐字节相同**，归档命中 681 次、miss 0 次。那条
+配对现在退化成一个文件：`onnx2vkop` 默认把同一份子集嵌进 `.vkopbin`，
+stripped 构建只喂 `llm.vkopbin` 就能跑（`build-strip/tests/ModelTest` 即此路径）。

@@ -138,10 +138,12 @@ class Operator {
                          ? std::string(convert_optype_to_string(type_))
                          : name_) +
                     " has a stubbed SPIR-V array (this libvkop was built with "
-                    "VKOP_STRIP_BUILTIN_SHADERS=ON). Set VKOP_SHADER_ARCHIVE="
-                    "<path to vkop_shaders.bin> before LoadModel so the "
-                    "archive "
-                    "can populate shaders at runtime.");
+                    "VKOP_STRIP_BUILTIN_SHADERS=ON) and no archive supplied "
+                    "one. Reconvert the model with onnx2vkop (it embeds the "
+                    "per-model shader archive by default), or set "
+                    "VKOP_SHADER_ARCHIVE=<path to vkop_shaders.bin> before "
+                    "LoadModel so the archive can populate shaders at "
+                    "runtime.");
             }
         }
         if (spv_len_ > 0 && spv_) {

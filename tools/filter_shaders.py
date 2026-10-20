@@ -7,6 +7,9 @@ line). Blobs are copied verbatim, so a shader selected here is byte-identical
 to the one a full-archive run would use; a pipeline cache built against one
 archive hits on the other.
 
+serialize() returns that archive as bytes instead of writing it, which is what
+onnx2vkop uses to embed the subset in the .vkopbin (Model.shader_archive).
+
 Layout of the input and output archives is the same VKSP format (see
 spv_to_archive.py for the field-by-field definition). Output is deterministic:
 entries are re-sorted by name, so two invocations with the same set of keys
@@ -62,6 +65,18 @@ def read_master(path):
 
 def write_subset(entries, path):
     """entries is a dict {name: bytes} to serialise into a new archive."""
+    with open(path, "wb") as f:
+        f.write(serialize(entries))
+
+
+def serialize(entries):
+    """Serialise {name: bytes} into the VKSP layout, returning the bytes.
+
+    Same layout write_subset() puts on disk; onnx2vkop embeds the result in
+    the .vkopbin instead of writing it next to one. Deterministic: entries
+    are re-sorted by name, so the same key set always yields the same bytes
+    (the FlatBuffers writer's determinism test relies on this).
+    """
     ordered = sorted(entries.items(), key=lambda kv: kv[0].encode("utf-8"))
     count = len(ordered)
     blob_start = HEADER_SIZE + ENTRY_SIZE * count
@@ -92,8 +107,7 @@ def write_subset(entries, path):
         pad = _align_up(len(buf), BLOB_ALIGN) - len(buf)
         buf += b"\x00" * pad
 
-    with open(path, "wb") as f:
-        f.write(buf)
+    return bytes(buf)
 
 
 def _crc32(data):

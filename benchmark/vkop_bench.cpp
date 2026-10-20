@@ -733,8 +733,14 @@ int main(int argc, char **argv) {
     std::printf("load:     %.1f ms\n", load_ms);
     std::printf("pipeline-cache: %s\n",
                 std::getenv("VK_PIPELINE_CACHE") ? "on" : "off");
-    std::printf("shader-archive: %s\n",
-                std::getenv("VKOP_SHADER_ARCHIVE") ? std::getenv("VKOP_SHADER_ARCHIVE") : "embedded");
+    std::printf("shader-archive: %s",
+                rt->shader_archive_source().empty()
+                    ? "none (libvkop-embedded SPIR-V)"
+                    : rt->shader_archive_source().c_str());
+    if (rt->shader_archive_entries()) {
+        std::printf(" (%zu entries)", rt->shader_archive_entries());
+    }
+    std::printf("\n");
 
     auto names = rt->ListInputNames();
     if (o.list_inputs_only) {

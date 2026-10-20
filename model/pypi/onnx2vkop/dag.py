@@ -450,7 +450,7 @@ class DAGBasedModel:
         if dead_nodes:
             self.build_dependencies()
 
-    def save_to_binary(self, file_path: str):
+    def save_to_binary(self, file_path: str, shader_archive: bytes = None):
         """Save model to a FlatBuffers binary file.
 
         The initializer data is laid out as a single contiguous, 64-byte-aligned
@@ -458,6 +458,14 @@ class DAGBasedModel:
         table of (name, dtype, dims, offset, size) entries. The Python writer
         computes the offsets once; the C++ reader memmaps the file and points
         straight at the blob — zero-copy, no two-pass scan.
+
+        `shader_archive`, when given, is a VKSP archive (tools/filter_shaders.py
+        serialize()) stored in the Model's `shader_archive` field. The runtime
+        then takes every op's SPIR-V from the .vkopbin itself, so the model is
+        a single deployable file and does not need VKOP_SHADER_ARCHIVE or a
+        libvkop built without VKOP_STRIP_BUILTIN_SHADERS. onnx2vkop passes one
+        by default; pass None for a model that should run against whatever
+        archive the host provides.
         """
         # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
         self.prune_dead_and_materialize_constants()
@@ -604,6 +612,17 @@ class DAGBasedModel:
             for b in reversed(blob):
                 builder.PrependByte(b)
             blob_vec = builder.EndVector()
+
+        # --- embedded SPIR-V archive (VKSP) ---
+        # 单文件部署：C++ 的 Runtime::LoadModel 优先用 VKOP_SHADER_ARCHIVE，其次
+        # 用这里的字节，最后才回落到 libvkop 内嵌的 C 数组。字节数很小（只含本图
+        # 能 dispatch 的 key，llm 旋转形态 ~933 KB），所以直接放进 FlatBuffer，
+        # 不走 initializer blob 那套外置 trailer——那套是为几 GB 权重准备的，而
+        # 2 GiB 的向量上限对归档来说完全够用。
+        if shader_archive:
+            shader_archive_vec = builder.CreateByteVector(bytes(shader_archive))
+        else:
+            shader_archive_vec = 0
 
         # --- inputs / outputs (ShapeRef vectors) ---
         # ONNX elem_type int -> canonical dtype name. Per-node shapes in the
@@ -868,6 +887,8 @@ class DAGBasedModel:
             Model.AddRgbaNames(builder, rgba_names_off)
         Model.AddUnifiedBlobOffset(builder, self.unified_blob_offset)
         Model.AddConcurrentLevels(builder, concurrent_vec)
+        if shader_archive_vec:
+            Model.AddShaderArchive(builder, shader_archive_vec)
         root = Model.End(builder)
         builder.Finish(root, file_identifier=b"VKOP")
 
