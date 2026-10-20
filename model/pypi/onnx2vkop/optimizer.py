@@ -1133,6 +1133,40 @@ class FusionOptimizer:
             )
         )
 
+        # Whole-input Conv (the ViT/CLIP patch_embed: kernel == stride == the
+        # input's spatial extent) -> Reshape + MatMul(+Add). Same intent as the
+        # Gemm lowering above -- one set of high-performance kernels instead of
+        # a naive op -- but a much bigger multiple: the direct convolution runs
+        # at ~8 GFLOP/s where the coopmat/tiled MatMul reaches ~270 GFLOP/s on
+        # the Qwen3-VL vision tower (75.9 ms -> ~2.3 ms for the patch_embed,
+        # ~11% of a 224x224 image). Runs below every Conv pass (83-90) so a
+        # fused BN/bias/activation is already on the node and travels with the
+        # Add, and above fuse_elemwise_chain (60) so the bias Add is visible to
+        # the chain matcher.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_single_patch_conv",
+                FusionOptimizer.match_single_patch_conv,
+                FusionOptimizer.fold_single_patch_conv_to_matmul,
+                priority=73,
+            )
+        )
+
+        # 常量索引 Gather：单位轴 + 标量索引 → Squeeze（下一轮被别名成 view，
+        # 0 dispatch），索引恰是 [0..n-1] → Identity，常量表切片 → 转换期物化成
+        # initializer（表随之消失）。priority 72 排在 fuse_kv_cache_append(74)
+        # 之下：KV 轮的 Gather(cache, 0/1, axis=1) 也是常量索引，但必须先让那条
+        # 融合拿到手 —— 它把整轮 KV 拷贝折成 0 dispatch（长上下文下占一轮的
+        # 48-71%），早折就把它拆散了。
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_const_index_gather",
+                FusionOptimizer.match_const_index_gather,
+                FusionOptimizer.fold_const_index_gather,
+                priority=72,
+            )
+        )
+
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "fuse_isnan_where_softmax",
@@ -2625,6 +2659,368 @@ class FusionOptimizer:
 
         print(f"Replaced Conv '{conv_node.name}' after GlobalAveragePool with GEMM")
         return True
+
+    @staticmethod
+    def match_single_patch_conv(dag_model):
+        """Match a Conv whose kernel covers the whole input -- a plain GEMM.
+
+        The ViT/CLIP patch_embed is this shape: kernel == stride == the input's
+        whole spatial extent, no pad, no dilation, group 1. Every batch item
+        then has exactly one output pixel whose receptive field is the entire
+        input, so
+
+            out[b, oc] = sum_{ic,kd,kh,kw} X[b, ic, kd, kh, kw]
+                                           * W[oc, ic, kd, kh, kw]
+
+        is a MatMul with A = X flattened to [B, C*KD*KH*KW] (row-major identity
+        -- the ONNX element order of X already is that flattening) and
+        B = W flattened to [OC, C*KD*KH*KW] read transposed. No im2col
+        permutation is needed because there is only one window.
+
+        Worth doing: the SSBO direct convolution is one thread per output
+        element with two scalar loads per FMA and no output-channel reuse --
+        measured 8 GFLOP/s (75.9 ms) on the Qwen3-VL patch_embed, the single
+        largest non-MatMul node of the vision tower, while the graph's own
+        MatMuls run at ~270 GFLOP/s.
+
+        Fail-closed on everything that would need a real im2col: overlapping
+        windows (stride != kernel), padding, dilation, groups != 1, an input
+        spatial dim that is not statically known, a weight that is not a
+        constant, a weight shared with another node, or a consumer that would
+        read the dropped all-ones output axes (only Reshape/Flatten are
+        accepted -- the fold removes the [B, OC, 1, .., 1] -> [B, OC] unit
+        dims, which a Concat/Reduce/broadcast consumer would see).
+        """
+        matches = []
+        used = {}
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                used.setdefault(inp["name"], []).append(node.name)
+        # Consumers of the Conv output, by tensor name.
+        consumers = {}
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers.setdefault(inp["name"], []).append(node)
+        for node in dag_model.nodes.values():
+            if node.op_type != "Conv" or len(node.inputs) < 2:
+                continue
+            attrs = node.attributes or {}
+            if int(attrs.get("group", 1)) != 1:
+                continue
+            kernel = [int(k) for k in attrs.get("kernel_shape", [])]
+            ndim = len(kernel)
+            if ndim not in (2, 3):
+                continue
+            strides = [int(s) for s in attrs.get("strides", [1] * ndim)]
+            dilations = [int(d) for d in attrs.get("dilations", [1] * ndim)]
+            pads = [int(p) for p in attrs.get("pads", [0] * (2 * ndim))]
+            if len(strides) != ndim or len(dilations) != ndim:
+                continue
+            if len(pads) != 2 * ndim or any(pads):
+                continue
+            if any(d != 1 for d in dilations):
+                continue
+            # Non-overlapping: the windows tile the input exactly.
+            if strides != kernel:
+                continue
+            in_shape = node.inputs[0].get("shape") or []
+            if len(in_shape) != ndim + 2 or any(
+                not isinstance(d, int) or d <= 0 for d in in_shape[2:]
+            ):
+                continue
+            # One window per batch item: the input *is* the receptive field.
+            if [int(s) for s in in_shape[2:]] != kernel:
+                continue
+            weight_name = node.inputs[1]["name"]
+            if weight_name not in dag_model.initializers:
+                continue
+            if len(used.get(weight_name, [])) != 1:
+                # Sharing the constant would make the reshape below a lie for
+                # the other consumer.
+                continue
+            weight_dims = [int(d) for d in dag_model.initializers[weight_name].dims]
+            if len(weight_dims) != ndim + 2:
+                continue
+            if weight_dims[1] != int(in_shape[1]) or weight_dims[2:] != kernel:
+                continue
+            if any(c.op_type not in ("Reshape", "Flatten")
+                   for c in consumers.get(node.outputs[0]["name"], [])):
+                continue
+            matches.append({
+                "conv": node,
+                "weight_name": weight_name,
+                "kernel": kernel,
+                "in_shape": [int(d) for d in in_shape],
+                "out_channels": weight_dims[0],
+                "has_bias": len(node.inputs) > 2,
+            })
+        if matches:
+            print(f"[fold_single_patch_conv] {len(matches)} whole-input Conv -> "
+                  f"MatMul candidate(s)")
+        return matches
+
+    @staticmethod
+    def fold_single_patch_conv_to_matmul(dag_model, match) -> bool:
+        """Rewrite a matched whole-input Conv as Reshape -> MatMul (-> Add).
+
+        The Conv's output lost its all-ones spatial dims, so the tensor the
+        consumers see is [B, OC] instead of [B, OC, 1, .., 1] -- the same bytes
+        in the same order, and anything down the line either reshapes it (the
+        Qwen3-VL tower reshapes it to [B, hidden] immediately) or reads no
+        spatial axis. Every consumer's input ref and any graph-output
+        declaration are updated to the new rank so shape-based passes
+        downstream agree.
+        """
+        conv = match["conv"]
+        weight_name = match["weight_name"]
+        in_shape = match["in_shape"]
+        out_channels = match["out_channels"]
+
+        weight = dag_model.initializers[weight_name]
+        arr = numpy_helper.to_array(weight)
+        k = 1
+        for d in arr.shape[1:]:
+            k *= int(d)
+        flat_weight = numpy_helper.from_array(arr.reshape(int(arr.shape[0]), k),
+                                              weight_name)
+        flat_weight.data_type = weight.data_type
+        dag_model.initializers[weight_name] = flat_weight
+
+        orig_output = conv.outputs[0]
+        out_name = orig_output["name"]
+        dtype = orig_output.get("dtype")
+        out_shape = [in_shape[0], out_channels]
+        new_nodes = []
+
+        # A must be rank 2. ONNX guarantees a Conv input is [N, C, D, ..], so
+        # there is always a flattening Reshape to insert; it is a 1:1 view of
+        # the same bytes, which the runtime aliases (no copy).
+        a_ref = conv.inputs[0]
+        flat_name = f"{conv.name}_patch_flat"
+        shape_name = f"{conv.name}_patch_flat_shape"
+        shape_arr = np.array([-1, k], dtype=np.int64)
+        dag_model.initializers[shape_name] = numpy_helper.from_array(
+            shape_arr, shape_name)
+        flat_ref = {"name": flat_name, "shape": [-1, k], "dtype": dtype,
+                    "value_dynamic": a_ref.get("value_dynamic", False)}
+        new_nodes.append(Node(
+            op_type="Reshape",
+            name=f"{conv.name}_patch_flatten",
+            attributes={},
+            inputs=[a_ref, {"name": shape_name, "shape": [2],
+                            "dtype": TensorProto.INT64}],
+            outputs=[flat_ref],
+        ))
+        a_ref = flat_ref
+
+        if match["has_bias"]:
+            mm_ref = {"name": f"{out_name}_mm", "shape": out_shape, "dtype": dtype,
+                      "value_dynamic": orig_output.get("value_dynamic", False)}
+        else:
+            mm_ref = {"name": out_name, "shape": out_shape, "dtype": dtype,
+                      "value_dynamic": orig_output.get("value_dynamic", False)}
+
+        # transB: the ONNX weight is [OC, K] -- already the transposed B layout,
+        # so nothing has to be materialized.
+        new_nodes.append(Node(
+            op_type="MatMul",
+            name=f"{conv.name}_mm",
+            attributes={"transB": 1},
+            inputs=[a_ref, {"name": weight_name, "shape": [out_channels, k],
+                            "dtype": dtype}],
+            outputs=[mm_ref],
+        ))
+
+        if match["has_bias"]:
+            bias_ref = dict(conv.inputs[2])
+            bias_ref["shape"] = list(bias_ref.get("shape") or [out_channels])
+            new_nodes.append(Node(
+                op_type="Add",
+                name=f"{conv.name}_bias",
+                attributes={},
+                inputs=[dict(mm_ref), bias_ref],
+                outputs=[{"name": out_name, "shape": out_shape, "dtype": dtype,
+                          "value_dynamic": orig_output.get("value_dynamic", False)}],
+            ))
+
+        # The produced tensor really is rank 2 now: repoint every reference to
+        # the old rank-5 declaration, including a graph-output declaration.
+        for other in dag_model.nodes.values():
+            if other is conv:
+                continue
+            for inp in other.inputs:
+                if inp["name"] == out_name:
+                    inp["shape"] = list(out_shape)
+        if hasattr(dag_model, "outputs"):
+            for model_output in dag_model.outputs:
+                if model_output["name"] == out_name:
+                    model_output["shape"] = list(out_shape)
+
+        del dag_model.nodes[conv.name]
+        for node in new_nodes:
+            dag_model.nodes[node.name] = node
+
+        print(f"Folded whole-input Conv '{conv.name}' -> Reshape+MatMul"
+              f"{'+Add' if match['has_bias'] else ''} "
+              f"(K={k}, OC={out_channels}, weight {list(weight.dims)} -> "
+              f"[{out_channels}, {k}])")
+        return True
+
+    # ---- 常量索引 Gather 折叠（priority 72） ----
+    #
+    # Gather(data, indices=常量, axis=a) 的索引常常是导出器写死的：ViT 的
+    # grid_thw 分解、KV 轮里 K/V 的选择、shape 链的维度抽取。三条**等价**改写，
+    # 一律 fail-closed（形状或索引证不出常量就原样留着，这次不折）：
+    #
+    #   (1) 沿 axis 长度为 1 + 标量索引 → Squeeze(data, axes=[a])。输出名与
+    #       声明形状都不变，只是换了个算子；下一轮
+    #       fold_aliasable_squeeze_unsqueeze (priority 95) 会把它别名成 view
+    #       → 0 dispatch。
+    #   (2) 索引恰是 [0..n-1] → 语义即 Identity：删节点，消费者直接改接 data
+    #       （rank 与 shape 都不变，别名安全）。
+    #   (3) data 是常量表（initializer / Constant 节点）且**只有本节点引用** →
+    #       转换期把 np.take 的结果物化成新 initializer（沿用 Gather 的输出名，
+    #       消费者一个都不用改），删节点、删原表。
+    #
+    # 为什么需要 (3)：ONNX 层的 ConstantFolder 只物化 ≤1MiB 的折叠结果
+    # （_add_initializer 的 proto 2GB 上限保护）。更大的表折不动 —— 值进了 const
+    # 字典当「已知常量」缓存，Gather 节点却原地保留，于是整张表以权重形态留在
+    # vkopbin/VRAM 里，每轮还多一次 dispatch。这条补上 >1MiB 那块，且因为只在
+    # 表的唯一消费者就是本节点时才折，blob 只会变小（表被删、切片 ≤ 表）。
+    #
+    # 不做：data 是运行期张量、索引是常量**向量**且选的是非单位轴的一段 —— 那是
+    # 真切片，Slice 不见得比 Gather 便宜（还多一个 Squeeze 去维），收益为负；
+    # 索引 >1 维（会升秩）也不覆盖。
+    @staticmethod
+    def _gather_axis(node, rank):
+        """Gather 的 axis 归一化到 [0, rank)。"""
+        axis = node.attributes.get("axis", 0)
+        return axis + rank if axis < 0 else axis
+
+    @staticmethod
+    def _tensor_refs_elsewhere(dag_model, name, skip_node_name):
+        """除 skip_node_name 外，是否还有节点输入或 graph 输出引用张量 name。"""
+        for other in dag_model.nodes.values():
+            if other.name == skip_node_name:
+                continue
+            for inp in other.inputs:
+                if inp["name"] == name:
+                    return True
+        return any(o["name"] == name for o in getattr(dag_model, "outputs", []))
+
+    @staticmethod
+    def match_const_index_gather(dag_model):
+        matches = []
+        producer, _consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+        for node in dag_model.nodes.values():
+            if node.op_type != "Gather" or len(node.inputs) < 2 or not node.outputs:
+                continue
+            # 三条改写都会改这个张量的来源（换算子 / 变初始器），graph 输出的
+            # 声明对它敏感，不碰。
+            if any(o["name"] in graph_outputs for o in node.outputs):
+                continue
+            idx = FusionOptimizer._guard_const_array(
+                node.inputs[1]["name"], dag_model, producer)
+            if idx is None or idx.dtype.kind not in "iu" or idx.ndim > 1:
+                continue
+            in_shape = list(node.inputs[0].get("shape") or [])
+            if not in_shape or len(idx.reshape(-1)) != idx.size:
+                continue
+            axis = FusionOptimizer._gather_axis(node, len(in_shape))
+            if not (0 <= axis < len(in_shape)):
+                continue
+            matches.append({"node": node})
+        return matches
+
+    @staticmethod
+    def fold_const_index_gather(dag_model, match) -> bool:
+        node = match["node"]
+        if node.name not in dag_model.nodes:
+            return False
+        producer, _consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        data_ref = node.inputs[0]
+        data_name = data_ref["name"]
+        out_name = node.outputs[0]["name"]
+        in_shape = list(data_ref.get("shape") or [])
+        idx = FusionOptimizer._guard_const_array(
+            node.inputs[1]["name"], dag_model, producer)
+        if idx is None or idx.dtype.kind not in "iu" or idx.ndim > 1 or not in_shape:
+            return False
+        axis = FusionOptimizer._gather_axis(node, len(in_shape))
+        if not (0 <= axis < len(in_shape)):
+            return False
+
+        # (3) 常量表：转换期切片物化，表和节点一起消失。
+        #     标量索引 + 一维表 → 结果是 rank-0，而 0 维初始器在 C++ 端
+        #     Tensor<T> 里 size_ = 0（数据会丢），这种形状留给 (1)/(2) 与
+        #     ConstantFolder。
+        if not (idx.ndim == 0 and len(in_shape) == 1) \
+                and out_name not in dag_model.initializers:
+            try:
+                table = FusionOptimizer._guard_const_array(
+                    data_name, dag_model, producer)
+            except Exception as e:
+                table = None
+                print(f"[fold_const_index_gather] table '{data_name}' "
+                      f"undecodable ({e}); keeping Gather '{node.name}'")
+            graph_inputs = {i["name"] for i in getattr(dag_model, "inputs", [])}
+            if (table is not None and table.size
+                    and data_name not in graph_inputs
+                    and not FusionOptimizer._tensor_refs_elsewhere(
+                        dag_model, data_name, node.name)):
+                taken = np.ascontiguousarray(np.take(table, idx, axis=axis))
+                dag_model.initializers[out_name] = numpy_helper.from_array(
+                    taken, out_name)
+                del dag_model.nodes[node.name]
+                if data_name in dag_model.initializers:
+                    del dag_model.initializers[data_name]
+                else:
+                    src = producer.get(data_name)
+                    if src is not None and src.name in dag_model.nodes:
+                        del dag_model.nodes[src.name]
+                print(f"Materialized const-index Gather '{node.name}' -> "
+                      f"initializer '{out_name}' ({list(table.shape)} "
+                      f"{table.dtype} -> {list(taken.shape)}; table "
+                      f"'{data_name}' dropped)")
+                return True
+
+        # (1) 单位长度 axis + 标量索引 → Squeeze（唯一的等价去维）。
+        if idx.ndim == 0 and in_shape[axis] == 1:
+            axes_name = f"{node.name}/squeeze_axes"
+            if axes_name not in dag_model.initializers:
+                dag_model.initializers[axes_name] = numpy_helper.from_array(
+                    np.array([axis], dtype=np.int64), axes_name)
+            dag_model.nodes[node.name] = Node(
+                op_type="Squeeze",
+                name=node.name,
+                attributes={},
+                inputs=[dict(data_ref),
+                        {"name": axes_name, "shape": [1],
+                         "dtype": TensorProto.INT64}],
+                outputs=[node.outputs[0]],
+            )
+            print(f"Folded const-index Gather '{node.name}' -> Squeeze"
+                  f"(axes=[{axis}]) (axis {axis} of {in_shape} has extent 1)")
+            return True
+
+        # (2) 索引恰是 [0..n-1] → Identity：删节点，消费者改接 data。
+        if (idx.ndim == 1 and in_shape[axis] == int(idx.size)
+                and np.array_equal(np.arange(idx.size, dtype=idx.dtype),
+                                   idx.reshape(-1))
+                and out_name not in getattr(dag_model, "causal_mask_inputs", ())):
+            for other in dag_model.nodes.values():
+                if other.name == node.name:
+                    continue
+                for inp in other.inputs:
+                    if inp["name"] == out_name:
+                        inp["name"] = data_name
+            del dag_model.nodes[node.name]
+            print(f"Folded identity Gather '{node.name}' (indices "
+                  f"0..{idx.size - 1} over axis {axis}) -> '{data_name}'")
+            return True
+
+        return False
 
     @staticmethod
     def match_gemm_to_matmul(dag_model):
