@@ -4,11 +4,18 @@ Large models (>13 GB external data) cannot pass through onnxoptimizer or
 ConstantFolder because they try to serialize the full proto. This script
 patches the optimizer to be a no-op and directly converts the DAG structure.
 
-    /Users/doudou/qi21-env/bin/python convert_dit_to_vkop.py [prefill|decode] [_si]
+    /Users/doudou/qi21-env/bin/python convert_dit_to_vkop.py [prefill|decode] [_si] [quant]
 
 The optional second argument is an input/output filename suffix, so the
 shape-inferred graphs (dit_decode_si.onnx, see shape_infer_dit.py) convert to
 dit_decode_si.vkopbin without touching the un-inferred pair.
+
+The optional third argument applies a weight-only quantization to the DAG. This
+script never reaches ModelConverter.apply_optimizations (that is the cli.py
+path), so without it the graph keeps whatever precision its ONNX has:
+    fp8e4m3 -> dit_decode_static_fp8e4m3.vkopbin
+Only MatMul has an fp8 kernel, and only in the buffer backend, so the quantizer
+leaves every other weight alone and the driver must run with set_backend_buffer.
 """
 
 import sys
@@ -22,7 +29,7 @@ import onnx
 from onnx2vkop.converter import ModelConverter
 
 
-def main(mode, suffix=""):
+def main(mode, suffix="", quant=""):
     path = Path(__file__).resolve().parent / f"dit_{mode}{suffix}.onnx"
     print(f"[{mode}] loading {path.name}...")
 
@@ -57,9 +64,25 @@ def main(mode, suffix=""):
     print(f"{'idx':<5} {'type':<25} {'count':<10}")
     for idx, (op_type, count) in enumerate(sorted(op_stats.items()), 1):
         print(f"{idx:<5} {op_type:<25} {count:<10}")
-    
+
+    out_tag = suffix
+    if quant:
+        from onnx2vkop.optimizer import Quantizer
+        if quant not in Quantizer._FP8_FORMATS:
+            raise SystemExit(
+                f"[{mode}] unknown quant {quant!r}; this script only does the fp8 "
+                f"weight-only payloads {sorted(Quantizer._FP8_FORMATS)}"
+            )
+        # The weights of this graph are Constant *nodes*, not initializers, and
+        # the quantizer only walks initializers — without materializing first it
+        # would see the handful of external ones and leave 2197 weights alone.
+        # save_to_binary calls this too; it is idempotent.
+        dag_model.prune_dead_and_materialize_constants()
+        Quantizer.quantize_to_fp8_weight_only(dag_model, quant)
+        out_tag = f"{suffix}_{quant}"
+
     # Try to save (will likely fail due to protobuf limits, but we get the stats)
-    out_path = Path(__file__).resolve().parent / f"dit_{mode}{suffix}.vkopbin"
+    out_path = Path(__file__).resolve().parent / f"dit_{mode}{out_tag}.vkopbin"
     try:
         print(f"\n[{mode}] Attempting to save to {out_path.name}...")
         dag_model.save_to_binary(str(out_path))
@@ -70,5 +93,6 @@ def main(mode, suffix=""):
 
 
 if __name__ == "__main__":
-    mode = sys.argv[1] if len(sys.argv) > 1 else "prefill"
-    main(mode, sys.argv[2] if len(sys.argv) > 2 else "")
+    main(sys.argv[1] if len(sys.argv) > 1 else "prefill",
+         sys.argv[2] if len(sys.argv) > 2 else "",
+         sys.argv[3] if len(sys.argv) > 3 else "")
