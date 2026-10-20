@@ -9,6 +9,7 @@ import numpy as np
 import onnx
 import onnxoptimizer as optimizer
 from onnx import numpy_helper, shape_inference, TensorProto, helper
+from onnx.external_data_helper import uses_external_data
 
 try:
     from onnxsim import simplify as _onnxsim_simplify
@@ -450,6 +451,81 @@ def _reattach_initializers(model, demoted, added_inputs, raw_map):
         graph.input.extend(keep)
 
 
+def _demote_external_initializers(model):
+    """Move every initializer whose payload lives in an external file out of the graph.
+
+    weight_stream leaves a large pass-through weight as an external reference,
+    so it arrives here with no bytes. The structural passes do not care, except
+    the ones that compare initializer *content*: to
+    `eliminate_duplicate_initializer` two different 96 MB weights both look like
+    the empty string, and it merges them (measured on text_encoder_tiny: 14
+    distinct layer weights became 4, silently corrupting the model). Demoted to
+    graph inputs for the duration of the passes they cannot be merged, and the
+    dedup of the genuinely inline constants keeps working exactly as before --
+    which is why this is a demotion and not a switch that turns the pass off.
+
+    Returns `([(name, data_type, dims, [(key, value)])], added_input_names)`,
+    enough for `_reattach_external_initializers` to restore the reference
+    verbatim. Where it lands in the list does not matter: the side table records
+    every blob offset, and appending is what `_reattach_initializers` already
+    does for the inline-demoted weights, so the streamed and the hydrated
+    conversion lay the blob out the same way.
+    """
+    graph = model.graph
+    demoted = []
+    for init in graph.initializer:
+        if uses_external_data(init):
+            demoted.append((init.name, init.data_type, tuple(init.dims),
+                            [(e.key, e.value) for e in init.external_data]))
+    for idx in reversed([i for i, init in enumerate(graph.initializer)
+                         if uses_external_data(init)]):
+        del graph.initializer[idx]
+
+    existing = {inp.name for inp in graph.input}
+    added = []
+    for name, dtype, dims, _entries in demoted:
+        if name in existing:
+            continue
+        vi = graph.input.add()
+        vi.name = name
+        vi.type.tensor_type.elem_type = dtype
+        for d in dims:
+            vi.type.tensor_type.shape.dim.add().dim_value = d
+        added.append(name)
+    return demoted, added
+
+
+def _reattach_external_initializers(model, demoted, added_inputs):
+    """Undo _demote_external_initializers, with the payload still in its file.
+
+    Which tensors come back follows `_reattach_initializers`: only what a
+    surviving node still reads. A deferred weight no node reads is not an error
+    here (a fusion that stopped needing a weight is a byte saving) -- the check
+    that a *live* node still names a tensor the writer promised to stream is
+    `weight_stream.verify_deferred`, which sees the finished DAG.
+    """
+    graph = model.graph
+    used = {inp for node in graph.node for inp in node.input}
+    have = {init.name for init in graph.initializer}
+    for name, dtype, dims, entries in demoted:
+        if name in have or name not in used:
+            continue
+        init = graph.initializer.add()
+        init.name = name
+        init.data_type = dtype
+        for d in dims:
+            init.dims.append(d)
+        for key, value in entries:
+            entry = init.external_data.add()
+            entry.key, entry.value = key, value
+        init.data_location = TensorProto.EXTERNAL
+
+    if added_inputs:
+        keep = [inp for inp in graph.input if inp.name not in added_inputs]
+        del graph.input[:]
+        graph.input.extend(keep)
+
+
 # onnxoptimizer pass list. A module constant so tools/ablate.py can enumerate
 # the same list it subtracts from via VKOP_NO_PASSES (mirrored by VKOP_NO_FUSIONS
 # for the DAG passes) -- which pass pays for which model is a measurement, not
@@ -555,6 +631,14 @@ class ONNXOptimizer:
 
         demoted: List = []
         added_inputs: List = []
+        # Tensors whose payload weight_stream left in the external data file have
+        # no bytes here for any pass to compare, so they come out of the graph for
+        # the duration of the passes and go back (still as references) at the end.
+        ext_demoted, ext_added = _demote_external_initializers(onnx_model)
+        if ext_demoted:
+            print(f"[optimize] external-payload view: {len(ext_demoted)} "
+                  f"initializer(s) whose bytes are still in the data file "
+                  f"demoted to inputs for the passes")
         if total_init_bytes >= _VIEW_MIN_INIT_BYTES:
             demoted, added_inputs = _demote_large_initializers(onnx_model)
             print(f"[optimize] value-free view for onnxoptimizer: "
@@ -562,7 +646,14 @@ class ONNXOptimizer:
                   f"({total_init_bytes >> 20} MiB of weights)")
 
         optimized_model = None
-        if demoted:
+        # The interleaved rounds are for a value-free view, whatever made it
+        # value-free: folding a Shape/Slice/Gather chain is what creates the dead
+        # ends eliminate_deadend then cleans, and one round before folding finds
+        # nothing. Keying this only on the 1.5 GiB inline-bytes gate silently
+        # cost a streamed model 33 folded nodes (llm.onnx: 819 nodes instead of
+        # 786, three fewer constants) because its weights were never in RAM to
+        # be counted.
+        if demoted or ext_demoted:
             # Interleave structural passes with constant folding until the node
             # count stops moving: folding a Shape/Slice chain is what creates
             # the dead ends and nop Reshape/Concat that eliminate_deadend and
@@ -653,6 +744,13 @@ class ONNXOptimizer:
         elif _onnxsim_simplify is not None:
             print(f"[optimize] onnxsim skipped (large model, "
                   f"{_total_init_bytes >> 20} MB initializers)")
+
+        # The external-payload view closes here, after every pass that could
+        # compare initializer content. Restoring the reference (not the bytes --
+        # those never entered this process) is what makes the caller's graph
+        # contract identical to the non-streamed one.
+        if ext_demoted:
+            _reattach_external_initializers(optimized_model, ext_demoted, ext_added)
 
         return optimized_model
 

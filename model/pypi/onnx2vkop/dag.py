@@ -8,6 +8,8 @@ import numpy as np
 import flatbuffers
 from onnx import numpy_helper
 
+from . import weight_stream
+
 # FlatBuffers 的 Builder 最大 2GB（内部用 32-bit offset 寻址）。LLM 权重达
 # 数 GB 时无法把 initializer_blob 塞进 FlatBuffer 向量，改为把 blob 以「外部
 # 数据」形式追加在文件末尾：vkopbin = FlatBuffer(root) || external_blob，
@@ -189,6 +191,11 @@ class DAGBasedModel:
         self.rgba_meta: List[Dict] = []
         self.rgba_names: str = ""
         self.unified_blob_offset: int = 0
+        # Weights whose payload never entered RAM (see weight_stream): name ->
+        # {location, offset, length, data_type, dims}. The writer copies them
+        # from the source ONNX data file straight into the external trailer.
+        self.deferred_weights: Dict[str, Any] = {}
+        self.weight_base_dir: str = ""
         # Tensor names the model declared (model-level metadata_props) to be the
         # standard causal additive mask. Read by the attention matcher; empty
         # for a model that declares nothing.
@@ -488,6 +495,11 @@ class DAGBasedModel:
                   f"zeros for them: "
                   + ", ".join(f"{n} <- {i}" for n, i in stranded[:5]))
 
+        # Same place to hold the streaming contract to account: a weight whose
+        # bytes were left in the source file must still be the tensor we
+        # promised to copy. See weight_stream.verify_deferred.
+        weight_stream.verify_deferred(self.deferred_weights, self)
+
         builder = flatbuffers.Builder(1 << 16)
 
         # --- Build the 64-byte-aligned initializer blob + side table. ---
@@ -528,6 +540,19 @@ class DAGBasedModel:
                 external = True
         except Exception:
             external = False
+
+        # A deferred weight has no bytes in this process to put in a FlatBuffer
+        # vector, so the inline layout cannot carry one. The threshold that
+        # selects the layout is a CLI knob, so say what to change instead of
+        # letting the trailer writer meet a tensor with no payload.
+        if self.deferred_weights and not external:
+            raise weight_stream.DeferredWeightError(
+                f"{len(self.deferred_weights)} weight(s) were left in their "
+                f"external file, but the blob ({total_blob >> 20} MiB) fits a "
+                f"FlatBuffer vector (threshold {threshold_mb} MiB) and that "
+                f"path needs the bytes in memory. Reconvert with "
+                f"--external-blob-mb 1 to force the trailer, or "
+                f"VKOP_STREAM_WEIGHTS=0 to hydrate everything.")
 
         # external 模式：blob 直接流式写盘（见文件写入段），这里只建侧表 +
         # 记录 (offset, byte_len)，绝不把整个 blob 累积进内存。非 external
@@ -967,7 +992,18 @@ class DAGBasedModel:
                 for _name, arr, aligned_offset, data_size, ipad in external_init_order:
                     if ipad:
                         f.write(b"\x00" * ipad)
-                    f.write(_init_bytes(arr))
+                    entry = self.deferred_weights.get(_name)
+                    if entry is not None:
+                        # Never held in RAM: copy it from the source file, at
+                        # the offset the side table already promised.
+                        if entry["length"] != data_size:
+                            raise weight_stream.DeferredWeightError(
+                                f"deferred weight '{_name}': side table says "
+                                f"{data_size} bytes, the source says "
+                                f"{entry['length']}")
+                        weight_stream.write_payload(entry, f, self.weight_base_dir)
+                    else:
+                        f.write(_init_bytes(arr))
                     written = aligned_offset + data_size
                 # unified sub-region (if any)
                 unified_bytes = getattr(self, "_unified_bytes", b"")

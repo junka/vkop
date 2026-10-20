@@ -15,6 +15,7 @@ try:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
     )
+    from . import weight_stream
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -31,6 +32,7 @@ except ImportError:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
     )
+    import weight_stream
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -149,12 +151,22 @@ class ModelConverter:
         self.initializer_merger = InitializerMerger()
         self.quantizer = Quantizer()
 
-    def parse_onnx_model(self, onnx_path: str, batch_size: int = 1) -> DAGBasedModel:
+    def parse_onnx_model(self, onnx_path: str, batch_size: int = 1, *,
+                         quant: str = None, unify: bool = False,
+                         rgba: bool = False) -> DAGBasedModel:
         """Parse and convert ONNX model to DAG format."""
         model = onnx.load(onnx_path, load_external_data=False)
-        # Load external weights (llm.weights.bin) into memory so the optimized
-        # model can be processed without a 2GB+ single-file protobuf save.
-        onnx.load_external_data_for_model(model, os.path.dirname(os.path.abspath(onnx_path)))
+        # Load external weights (llm.weights.bin) so the optimized model can be
+        # processed without a 2GB+ single-file protobuf save -- but not
+        # necessarily *all* of them: a pass-through weight is one the pipeline
+        # cannot read by value (see weight_stream), and holding a 13.9 GB set of
+        # those in raw_data plus a second copy in raw_map is what took the
+        # machine down. Deferred tensors keep their external_data reference and
+        # are streamed into the .vkopbin trailer at save time.
+        base_dir = os.path.dirname(os.path.abspath(onnx_path))
+        weight_stream.install_guard()
+        deferred_weights = weight_stream.prepare(
+            model, base_dir, quant=quant, unify=unify, rgba=rgba)
 
         # Normalize bf16 away before anything reads a dtype: the runtime has no
         # bf16 kernel and no bf16 storage type, so a model that spells it has to
@@ -172,6 +184,11 @@ class ModelConverter:
         # single-file limit. The DAG converter reads model.graph directly
         # from the in-memory object.
         dag_model = DAGBasedModel()
+        # The streaming contract the parse step negotiated: names whose payload
+        # never entered RAM, and where to read them from when the blob is
+        # written. save_to_binary verifies it before writing anything.
+        dag_model.deferred_weights = deferred_weights
+        dag_model.weight_base_dir = base_dir
         # Graph-level declarations that no amount of staring at the graph can
         # recover — today just "this tensor is the standard causal attention
         # bias". Model-level metadata_props is the only channel that survives

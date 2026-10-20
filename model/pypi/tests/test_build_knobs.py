@@ -151,16 +151,29 @@ def _count_constants(model):
 
 def test_cli_writes_only_the_knobs_it_was_given(monkeypatch):
     monkeypatch.setenv("VKOP_MAX_FOLD_ROUNDS", "9")  # pre-existing shell value
-    _apply_build_knobs(SimpleNamespace(
-        external_blob_mb=1, max_fold_rounds=None, max_fuse_rounds=3,
-        no_passes="a,b", no_fusions=None,
-    ))
-    assert os.environ["VKOP_EXTERNAL_BLOB_MB"] == "1"
-    assert os.environ["VKOP_MAX_FUSE_ROUNDS"] == "3"
-    assert os.environ["VKOP_NO_PASSES"] == "a,b"
-    # An omitted flag leaves the shell's value alone instead of clearing it.
-    assert os.environ["VKOP_MAX_FOLD_ROUNDS"] == "9"
-    assert "VKOP_NO_FUSIONS" not in os.environ
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "4")   # pre-existing shell value
+    # _apply_build_knobs writes os.environ itself, which monkeypatch cannot
+    # undo -- it only restores keys a test set through it. Without this the
+    # knobs below (VKOP_NO_PASSES=a,b, VKOP_STREAM_WEIGHTS=off, ...) leak into
+    # every later test in the session and quietly change what they convert.
+    saved = dict(os.environ)
+    try:
+        _apply_build_knobs(SimpleNamespace(
+            external_blob_mb=1, max_fold_rounds=None, max_fuse_rounds=3,
+            no_passes="a,b", no_fusions=None, stream_weights="off",
+            stream_min_mib=None,
+        ))
+        assert os.environ["VKOP_EXTERNAL_BLOB_MB"] == "1"
+        assert os.environ["VKOP_MAX_FUSE_ROUNDS"] == "3"
+        assert os.environ["VKOP_NO_PASSES"] == "a,b"
+        assert os.environ["VKOP_STREAM_WEIGHTS"] == "off"
+        # An omitted flag leaves the shell's value alone instead of clearing it.
+        assert os.environ["VKOP_MAX_FOLD_ROUNDS"] == "9"
+        assert "VKOP_NO_FUSIONS" not in os.environ
+        assert os.environ["VKOP_STREAM_MIN_MIB"] == "4"
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 # ------------------------------------------------- the writer's blob switch --

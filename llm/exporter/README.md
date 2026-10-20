@@ -395,7 +395,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 
 ### 构建期开关（onnx2vkop）
 
-`python3 -m onnx2vkop.cli` 上的这五个开关只影响构建图的过程，值以前要么写死在代码里、
+`python3 -m onnx2vkop.cli` 上的这七个开关只影响构建图的过程，值以前要么写死在代码里、
 要么只能靠环境变量：
 
 | 开关 | 原来 | 默认 |
@@ -405,6 +405,30 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `--max-fuse-rounds N` | 写死 `MultiRoundOptimizer(max_rounds=10)` | 10 |
 | `--no-passes=A,B,C` | `VKOP_NO_PASSES` | 关 |
 | `--no-fusions=A,B,C` | `VKOP_NO_FUSIONS` | 关 |
+| `--stream-weights=on\|off` | 无（所有外部权重一律读进内存） | on |
+| `--stream-min-mib N` | 无 | 1 MiB |
+
+**`--stream-weights` 是给 10 GB 级模型续命的**。`-q fp16` 下，一个 float16 权重若只被
+MatMul/Gemm/Conv 读，转换器就没法按值看它（这些算子有激活输入，常量折叠折不动），于是它
+**留在 `.weights.bin` 里不进 RAM**，写盘时按 offset 直接搬进 vkopbin 的 trailer。全量读进内存
+的代价是实测 33 GiB RSS（36 GiB 的机器直接被 Jetsam 打崩重启）：protobuf 每次读 `raw_data`
+都返回一份新副本，`raw_map` 那一行就再乘一遍。实测：
+
+| 模型 | 流式关 | 流式开 | 产物 |
+|---|---|---|---|
+| `llm.onnx`（197/310 个 initializer 走流式，3.28 GiB） | 10.332 GiB | **0.169 GiB** | 逐字节相同 |
+| `text_encoder.onnx`（252 个，12.9 GiB） | 33.07 GiB → **崩溃** | **0.135 GiB，9 s** | 13,893,730,120 B（与 10-03 产物同尺寸量级） |
+
+三条必须知道的边界：
+
+- 只延「直通」的那部分。`-q int8/fp8/int4/nf4/nvfp4`、`-u`、`-r` 要重写权重字节，一律不延
+  （日志会打 `weights not streamed (<原因>)`）；`VKOP_STREAM_WEIGHTS=0` 是同一个开关的另一侧。
+- 被延迟的张量**没有内容可比**，所以 `eliminate_duplicate_initializer` 会把它们看成同一个
+  （text_encoder_tiny 上 14 个不同权重被并成 4 个）。做法是把带外部载荷的 initializer 临时降级成
+  图输入跑完 pass 再原样挂回引用（`optimizer.py` 的 `_demote_external_initializers`），小常量的去重照旧。
+- 谁想读它的字节就必须响：`numpy_helper.to_array` 装了守卫，写盘前 `verify_deferred` 还要复查
+  dtype/dims/length 与引用有没有变，inline blob 路径直接拒绝。所以「静默算成 0 字节」这一类
+  坏法在这条路上不存在——要么转换当场失败，要么产物逐字节正确。
 
 命令行与环境变量是同一条代码路径（CLI 只是先写 `os.environ`，读取方在调用时取值），
 所以不会出现两套配置互相漂移。三点要注意：

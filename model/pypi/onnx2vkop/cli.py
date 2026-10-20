@@ -308,6 +308,25 @@ Examples:
              "(equivalent to VKOP_NO_FUSIONS=A,B,C). Common pair for "
              "attention A/B: --no-fusions fuse_into_attention.",
     )
+    parser.add_argument(
+        "--stream-weights", choices=["on", "off"], default=None,
+        help="Leave large pass-through weights in the ONNX external-data file "
+             "instead of loading them into memory (default on). A float16 "
+             "weight only ever read by MatMul/Gemm/Conv cannot be folded or "
+             "inspected by any pass, so it is copied from its file straight "
+             "into the .vkopbin trailer and never occupies RAM -- which is the "
+             "difference between converting a 13 GB model in ~1 GB and in 2x "
+             "its weights. off forces the old hydrate-everything path (same as "
+             "VKOP_STREAM_WEIGHTS=0) and is what to set when a quantization, "
+             "--unify or --rgba needs the payloads.",
+    )
+    parser.add_argument(
+        "--stream-min-mib", type=int, default=None, metavar="N",
+        help="Smallest weight (in MiB) that may be left in its file (default "
+             "1, the cap the value-free view already demotes at). Set 0 to "
+             "defer every eligible tensor, including the small ones -- useful "
+             "to test the streaming path on a model that fits in memory.",
+    )
 
     return parser.parse_args()
 
@@ -327,6 +346,8 @@ def _apply_build_knobs(args) -> None:
         "VKOP_MAX_FUSE_ROUNDS": args.max_fuse_rounds,
         "VKOP_NO_PASSES": args.no_passes,
         "VKOP_NO_FUSIONS": args.no_fusions,
+        "VKOP_STREAM_WEIGHTS": args.stream_weights,
+        "VKOP_STREAM_MIN_MIB": args.stream_min_mib,
     }
     for env_name, val in mapping.items():
         if val is not None:
@@ -361,7 +382,12 @@ def main():
     try:
         # Create converter and run conversion
         converter = ModelConverter()
-        dag_model = converter.parse_onnx_model(str(input_path), args.batch)
+        # quant/unify/rgba decide whether weights may be streamed, so the parse
+        # step needs them: all three either rewrite a payload or concatenate
+        # payloads, and a tensor they touch must be in memory.
+        dag_model = converter.parse_onnx_model(
+            str(input_path), args.batch, quant=args.quant,
+            unify=args.unify, rgba=args.rgba)
 
         # Create a simple args object for apply_optimizations
         class Args:
