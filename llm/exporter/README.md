@@ -47,6 +47,10 @@
 
 ```bash
 python3 export/qwen3vl_export_onnx.py   # 产出 visual.onnx / llm.onnx / llm.weights.bin
+# 只改视觉时（llm.onnx 导出要几分钟且重写 3.4GB 权重文件）：
+EXPORT_VISUAL_ONLY=1 python3 export/qwen3vl_export_onnx.py   # 只产 visual.onnx
+# vkop 图由 onnx2vkop 转，转换同时把该图能派发的 SPIR-V 子集与 kernel plan 塞进文件：
+python3 -m onnx2vkop.cli -i visual.onnx -o visual.vkopbin -q fp16
 pytest                            # 跑全部测试（数值对齐 + 端到端一致性）
 pytest tests/test_numeric.py        # 仅数值对齐
 pytest tests/test_consistency.py -k ocr   # 仅 OCR 用例
@@ -220,12 +224,20 @@ greedy decode 循环，KV 在步间传递），与 HF `Qwen3VLForConditionalGene
 | 纯文本 "Count 1 to 5" | `1, 2, 3, 4,` | `1, 2, 3, 4,` | ✅ |
 | 纯文本 "translate hello→中文" | `你好` | `你好` | ✅ |
 | 纯文本 "capital of France" | `Paris` | `Paris` | ✅ |
-| 红/绿/蓝/黄图 "what color" | `red`/`green`/`blue`/`yellow` | 同 | ✅ |
+| 红/绿/蓝图 "what color" | `red`/`green`/`blue` | 同 | ✅ |
+| 黄图 "what color" | `yellow` | ` yellow` | ⚠️ 同义，见下 |
 | OCR "42" | `42` | `42` | ✅ |
 | OCR "HI" | `hi` | `hi` | ✅ |
 | 长文本 "3 primary colors" | `Red, Blue, Yellow` | 同 | ✅ |
 
-ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图像理解 + OCR）。
+ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图像理解 + OCR），
+**黄图那一例除外，且它不是图错了**：`' yellow'`(13753) 与 `'yellow'`(27869) 在 HF
+里就是并列边界——首步 logits 31.703 vs 31.656（margin 0.047，softmax 0.440 vs
+0.420），ORT 侧 31.734 vs 31.719（margin 0.016），两边 argmax 互换但解码出来是
+同一个词，只差前导空格。整条 logits 向量的相对差是 1.0%，属于 fp16 导出与 HF 的
+正常数值距离。所以该例走 `test_consistency.py` 的 `LEADING_SPACE_TIE` 白名单：
+只比「词序列 + token 数」，命中时打 `[tolerated]` 行；其余用例仍逐 token id 严格
+相等，别把新用例塞进这个集合来"修"回归。
 `pytest tests/test_consistency.py` 全 10 用例 PASS。
 
 ### 与 Qwen3VLInference 对比
@@ -329,7 +341,9 @@ vulkan 在 `libvkop` 内部 `dlopen` 加载，链接期不需要 `-lvulkan`。
 
 > 多模态约束：图片尺寸必须是 `patch_size*merge = 16*2 = 32` 的整数倍
 > （224×224 → grid [1,14,14] → n_img=49 个图像 token），否则 `image_preproc`
-> 报 "not divisible by patch*merge"。不同尺寸需重新导出 `visual.onnx` 并转换。
+> 报 "not divisible by patch*merge"。尺寸不是图的属性：`grid_thw` 是 `visual.onnx`
+> 的第二个输入，换尺寸只改喂进去的那一行 `[1, H/16, W/16]`，**不必重新导出或重转**
+> （上界见「视觉编码器」节：每条边偶数且 ≤ 256）。
 
 启动时加载模型 + embedding + tokenizer（~2s），之后每轮 prefill/decode 约 1.5–2s
 （Intel ARL，buffer backend，fp16）。遇到结束符自动停止当前轮。

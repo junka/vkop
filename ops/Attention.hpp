@@ -267,6 +267,16 @@ class AttentionBuffer : public BufferFactory {
             }
             const int row_elems = 2 * kv_heads * head_dim;
             const int elem_bytes = static_cast<int>(sizeof(T));
+            // The copy below counts uint words and a word holds 4/elem_bytes
+            // elements, so only the two cache layouts the shader writes are
+            // possible here: 2-byte packed half2 and 4-byte fp32. An 8-byte Q
+            // would truncate that ratio to 0 and divide by it -- which clang
+            // constant-folds in this lambda's int64_t instantiation even though
+            // no such dtype reaches here, so state the contract instead.
+            if (elem_bytes != 2 && elem_bytes != 4) {
+                throw std::runtime_error("Attention: the fused KV cache path "
+                                         "takes a 2- or 4-byte Q");
+            }
             // cache_in: the history. Its buffer's row capacity is the pitch the
             // previous round wrote at (the same kernel), so read at that.
             auto cbuf = bind_ssbo<T>(inputs[cache_idx], /*is_output=*/false);

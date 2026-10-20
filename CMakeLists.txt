@@ -413,6 +413,40 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_FP16})
 endforeach()
 
+# A second fp16 build of buffer/matmul.comp, entered through that file's
+# -DW8_WIDE entry point (the int8/fp8 weight-only WIDE GEMV). Same source, same
+# push-constant layout, so the two modules can never drift apart; SPIR-V DCE
+# drops every other kernel from each build. It is a separate module because
+# MoltenVK cannot compile that one kernel: as part of the general fp16 module its
+# pipeline creation failed and took every buffer MatMul down with it (see the
+# W8_WIDE entry in shaders/buffer/matmul.comp and MatMulBuffer::w8_wide_pipeline).
+set(SPIRV_FILE_W8WIDE ${SPIRV_DIR}/buffer_matmul_w8_wide_fp16.spv)
+set(SPIRV_SOURCE_FILE_W8WIDE ${SPIRV_DIR}/buffer_matmul_w8_wide_fp16.c)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_W8WIDE}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_W8WIDE} -DFP16 -DW8_WIDE
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (int8 weight-only WIDE, fp16) to SPIR-V"
+)
+add_custom_command(
+    OUTPUT ${SPIRV_SOURCE_FILE_W8WIDE}
+    COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
+        ${Python3_EXECUTABLE}
+        ${PY_SCRIPT_FILE}
+        ${SPIRV_FILE_W8WIDE}
+        ${SPIRV_SOURCE_FILE_W8WIDE}
+        buffer_matmul_w8_wide_fp16
+    DEPENDS
+        ${SPIRV_FILE_W8WIDE}
+        ${PY_SCRIPT_FILE}
+    COMMENT "Embedding fp16 SPIR-V shader buffer_matmul_w8_wide_fp16 into C header"
+)
+set_source_files_properties(${SPIRV_SOURCE_FILE_W8WIDE} PROPERTIES LANGUAGE C)
+list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_W8WIDE})
+list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_W8WIDE})
+
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #
@@ -440,6 +474,14 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
          --spv ${DUAL_BASE}_fp16:${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
     list(APPEND ARCHIVE_DEPS ${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
 endforeach()
+# The -DW8_WIDE build above is neither its own .comp nor a DUAL_FP16_SHADERS
+# entry (it is a second define over buffer/matmul.comp), so neither loop picks it
+# up. Without this key a VKOP_STRIP_BUILTIN_SHADERS=ON build would hand
+# MatMulBuffer::w8_wide_pipeline a zero-length stub and lose the wide GEMV even
+# on the devices whose driver compiles it fine.
+list(APPEND ARCHIVE_ARGS
+     --spv buffer_matmul_w8_wide_fp16:${SPIRV_FILE_W8WIDE})
+list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_W8WIDE})
 
 set(VKOP_SHADER_ARCHIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.bin)
 add_custom_command(

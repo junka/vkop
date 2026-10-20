@@ -28,6 +28,8 @@ extern unsigned char buffer_matmul_coop16_spv[];
 extern unsigned int buffer_matmul_coop16_spv_len;
 extern unsigned char buffer_matmul_coop_i8_spv[];
 extern unsigned int buffer_matmul_coop_i8_spv_len;
+extern unsigned char buffer_matmul_w8_wide_fp16_spv[];
+extern unsigned int buffer_matmul_w8_wide_fp16_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -1098,8 +1100,17 @@ class MatMulBuffer : public BufferFactory {
             // win without the N=128 loss.
             const int wide_threshold_byte =
                 (wide_threshold_env >= 0) ? wide_threshold_env : 896;
-            if (!wide_disabled && weight_byte && (n % 16 == 0) &&
-                (wide_forced || n >= wide_threshold_byte)) {
+            // Byte WIDE runs a different module, so it binds its own pipeline
+            // and descriptor set the way the coopmat paths above do. w8_wide_
+            // pipeline() returns null where the driver refuses the kernel, and
+            // the GEMV then falls through to the 4-column split-K kernel below
+            // instead of taking the whole MatMul down with a failed dispatch.
+            VulkanPipeline *wide_pipe =
+                (!wide_disabled && weight_byte && (n % 16 == 0) &&
+                 (wide_forced || n >= wide_threshold_byte))
+                    ? w8_wide_pipeline()
+                    : nullptr;
+            if (wide_pipe != nullptr) {
                 while (q > 4 && UP_DIV(n / 16, q) < 32) {
                     q /= 2;
                 }
@@ -1109,7 +1120,12 @@ class MatMulBuffer : public BufferFactory {
                     std::fprintf(stderr,
                                  "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
                                  get_name().c_str(), 1, q, UP_DIV(n / 16, q));
-                submit(&para_, UP_DIV(n / 16, q), batch * m, 1);
+                fillDescriptorWrites(w8_wide_ds_[m_id_]);
+                wide_pipe->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*wide_pipe, w8_wide_ds_[m_id_]);
+                m_cmd_->push_constants(*wide_pipe,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                m_cmd_->dispatch(UP_DIV(n / 16, q), batch * m, 1);
                 return;
             }
             // fp16 WIDE: auto per-N (n >= wide_threshold_fp16) or forced on
@@ -1177,6 +1193,84 @@ class MatMulBuffer : public BufferFactory {
         }
     }
 
+    // The int8/fp8 weight-only WIDE GEMV, which lives in a module of its own
+    // (matmul16_w8_ksplit_wide is not in the general fp16 module -- MoltenVK
+    // cannot compile it there, and as part of that module its failed pipeline
+    // creation took every buffer MatMul down; see the W8_WIDE entry in
+    // shaders/buffer/matmul.comp). nullptr means this weight has no wide path,
+    // so byte weights stay on the 4-column split-K GEMV: correct, but without
+    // the 16-columns-per-lane load that measured -15.9% on the big-N decode
+    // layers above the threshold.
+    //
+    // Built on first use, not in set_runtime_device: a graph with no quantized
+    // weight must never pay to compile a kernel it will not dispatch.
+    //
+    // Two verdicts reach nullptr and they are not the same width of state.
+    // A driver that cannot compile the kernel is the DEVICE's answer, recorded
+    // once for the process. A model whose archive has no bytes for the key is
+    // that MODEL's answer -- with VKOP_STRIP_BUILTIN_SHADERS=ON the default the
+    // SPIR-V comes from the .vkopbin's own archive, and Operator::resolve_spv
+    // throws by name when neither it nor the dev archive carries the key -- so
+    // a graph converted before shader_map listed buffer_matmul_w8_wide_fp16
+    // loses the path while a reconverted one keeps it, in the same process.
+    VulkanPipeline *w8_wide_pipeline() {
+        static bool refused_by_driver = false;
+        static bool warned_missing_bytes = false;
+        if (w8_wide_pipeline_) {
+            return w8_wide_pipeline_.get();
+        }
+        if (refused_by_driver || w8_wide_no_bytes_) {
+            return nullptr;
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        std::pair<const uint32_t *, uint32_t> wide;
+        try {
+            wide = resolve_spv("buffer_matmul_w8_wide_fp16",
+                               buffer_matmul_w8_wide_fp16_spv,
+                               buffer_matmul_w8_wide_fp16_spv_len);
+        } catch (const std::exception &e) {
+            // Thrown, not returned: resolve_spv treats a secondary it cannot
+            // name as a broken model. Stay per-op and say it once -- the
+            // fallback is still the right answer, and a silent 15% is the
+            // failure mode this whole probe exists to avoid.
+            w8_wide_no_bytes_ = true;
+            if (!warned_missing_bytes) {
+                warned_missing_bytes = true;
+                std::fprintf(stderr,
+                             "[vkop] %s\n[vkop] byte-weight decode GEMVs use "
+                             "the 4-column kernel until that key is shipped\n",
+                             e.what());
+            }
+            return nullptr;
+        }
+        try {
+            w8_wide_pipeline_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), wide.first,
+                static_cast<int>(wide.second), use_uab, 0);
+            for (auto &ds : w8_wide_ds_) {
+                ds = w8_wide_pipeline_->allocDescriptorSets();
+            }
+        } catch (const std::exception &e) {
+            // Loud: the fallback computes the right answer more slowly, so
+            // nothing else would ever report that this device lost the path.
+            refused_by_driver = true;
+            w8_wide_pipeline_.reset();
+            std::fprintf(stderr,
+                         "[vkop] int8/fp8 WIDE GEMV pipeline rejected (%s); "
+                         "byte-weight decode GEMVs use the 4-column kernel\n",
+                         e.what());
+            return nullptr;
+        }
+        return w8_wide_pipeline_.get();
+    }
+
     // Fill descriptor-set writes from the current objs_ vector (one SSBO per
     // binding). Used by the fp16 cooperative-matrix dispatch path, which binds
     // its own pipeline (coop_pipeline_) instead of the base Operator::submit().
@@ -1221,6 +1315,15 @@ class MatMulBuffer : public BufferFactory {
     VkDescriptorSet coop_i8_ds_[vkop::kInflight] = {nullptr};
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
+    // The int8/fp8 weight-only WIDE GEMV module (buffer_matmul_w8_wide_fp16,
+    // a second build of buffer/matmul.comp whose entry reaches only that
+    // kernel) and its descriptor sets. Built on first use, see
+    // w8_wide_pipeline.
+    std::unique_ptr<VulkanPipeline> w8_wide_pipeline_;
+    VkDescriptorSet w8_wide_ds_[vkop::kInflight] = {nullptr};
+    // This op's archive supplies no bytes for the WIDE key, so it stays on the
+    // 4-column kernel; another MatMul from a reconverted model still tries.
+    bool w8_wide_no_bytes_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
     // Attention QK^T epilogue (folded from a FusedElemwise by the converter):

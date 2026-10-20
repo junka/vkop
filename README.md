@@ -79,7 +79,18 @@ export VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json
   `Tensor<int64_t>(v.size())` 会误配到 `Tensor(bool)` 构造出空张量；
 - `VK_EXT_host_image_copy` 在 Vulkan 1.4 晋升为核心功能后，MoltenVK 的
   loader 对 EXT 后缀入口点 dispatch 为 NULL，
-  `vulkan/VulkanImage.cpp` 已改为优先解析无后缀核心名。
+  `vulkan/VulkanImage.cpp` 已改为优先解析无后缀核心名；
+- int8/fp8 权重 WIDE GEMV 的 kernel MoltenVK 编不出来
+  （`vkCreateComputePipelines` 返回 `VK_ERROR_INITIALIZATION_FAILED`），已拆成
+  `shaders/buffer/matmul.comp` 的第二个 fp16 模块（`-DW8_WIDE`，host 侧见
+  `MatMulBuffer::w8_wide_pipeline`）单独探测；留在通用模块里时，它一次建流失败
+  会拖垮本机**所有** buffer MatMul。能走到该 kernel 的形状
+  （单行 A 且 N ≥ 896）由 `MatMulInt8WeightOnlyBuffer`/
+  `MatMulFp8WeightOnlyBuffer` 覆盖；
+- 融合 KV cache 的复制长度写成 `4 / sizeof(T)`，8 字节 dtype 的模板实例里
+  这个比值折成 0，clang 会按实例常量折叠并报
+  `-Werror,-Wdivision-by-zero`——即使运行时根本不会传到那个 dtype。
+  `ops/Attention.hpp` 已显式声明该路径只接受 2/4 字节的 Q。
 
 #### 4. 模型转换
 ```bash
@@ -145,8 +156,10 @@ VK_ICD_FILENAMES=/opt/homebrew/etc/vulkan/icd.d/MoltenVK_icd.json \
 文本塔 `text_encoder.vkopbin` + 1.24 GB 输入查表 `text_encoder_embeds.bin`（mmap，一条
 prompt 只碰其中几十行）、DiT prefill/decode、VAE `vae_decoder_512.vkopbin`；分词器复用
 LLM 的 `llm/tokenizer/qwen3_vl.bin`。产物路径可用 `TEXT_ENCODER_VKOPBIN` /
-`TEXT_ENCODER_EMBEDS` / `TOKENIZER_BIN` / `VAE_VKOPBIN` 覆盖。512×512 / 40 步实测 145 秒
-（decode 2.6 s/步，文本塔前向 0.26 s，VAE 10.7 s）。导出、转换与逐位对拍口径见
+`TEXT_ENCODER_EMBEDS` / `TOKENIZER_BIN` / `VAE_VKOPBIN` 覆盖。512×512 / 40 步实测冷机 138 秒、
+热机 152 秒（decode 冷启动 2.6 s/步、爬升后稳在 2.9–3.4 s/步，文本塔前向 0.27 s，VAE 4.8 s）。
+中文 prompt 直接可用，但静态文本段只有 64 token（约 42 个汉字），超长会报错而不是截断。
+导出、转换与逐位对拍口径见
 `image/exporter/BASELINE.md`。
 
 ---
@@ -235,7 +248,19 @@ macOS/clang compatibility points already handled in the code:
   an empty tensor;
 - Once `VK_EXT_host_image_copy` was promoted to Vulkan 1.4 core, the MoltenVK
   loader leaves the EXT-suffixed entry points with a NULL dispatch;
-  `vulkan/VulkanImage.cpp` resolves the unsuffixed core names first.
+  `vulkan/VulkanImage.cpp` resolves the unsuffixed core names first;
+- MoltenVK's SPIR-V → MSL backend cannot compile the int8/fp8 weight-only WIDE
+  GEMV (`vkCreateComputePipelines` → `VK_ERROR_INITIALIZATION_FAILED`), so it
+  lives in a second fp16 module of `shaders/buffer/matmul.comp` (`-DW8_WIDE`,
+  see `MatMulBuffer::w8_wide_pipeline`). While it sat in the general module its
+  failed pipeline creation aborted **every** buffer MatMul on this GPU;
+  `MatMulInt8WeightOnlyBuffer`/`MatMulFp8WeightOnlyBuffer` cover the shape range
+  that reaches it (N ≥ 896 with one A row);
+- the fused KV-cache copy sizes itself with `4 / sizeof(T)`, which folds to 0 in
+  the 8-byte instantiations, and clang reports the resulting
+  `-Werror,-Wdivision-by-zero` per template instantiation even though no such
+  dtype ever reaches that branch; `ops/Attention.hpp` now states the contract
+  (the cache path takes a 2- or 4-byte Q).
 
 #### 4. Model Conversion
 ```bash
@@ -308,7 +333,10 @@ is ~14 GB; any two together exceed 36 GB of unified memory): the text tower
 the VAE `vae_decoder_512.vkopbin`. Tokenization reuses the LLM's
 `llm/tokenizer/qwen3_vl.bin`. Override paths with `TEXT_ENCODER_VKOPBIN`,
 `TEXT_ENCODER_EMBEDS`, `TOKENIZER_BIN`, `VAE_VKOPBIN`. Measured 512×512 at 40
-steps: 145 s (2.6 s/step decode, 0.26 s text-tower forward, 10.7 s VAE). Export,
+steps: 138 s cold / 152 s warm (decode 2.6 s/step on a cold start, settling at
+2.9–3.4 s/step once the SoC throttles; 0.27 s text-tower forward; 4.8 s VAE).
+Chinese prompts work, but the static text segment holds only 64 tokens (~42
+Chinese characters) and the driver errors rather than truncating. Export,
 conversion and the bit-wise alignment protocol are in
 `image/exporter/BASELINE.md`.
 

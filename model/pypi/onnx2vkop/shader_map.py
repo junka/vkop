@@ -29,7 +29,8 @@ Runtime actually dispatches on a given GPU. Two kinds of over-inclusion:
     GPU with only fp32 shader support picks the fp32 key at load time; a
     GPU that supports fp16 might pick the fp16 key. Emitting both keeps the
     archive portable across targets without a reconvert.
-  · Secondary pipelines (Matmul's coop / coop16 / coop_i8 / pack, Conv2d's
+  · Secondary pipelines (Matmul's coop / coop16 / coop_i8 / pack / w8_wide,
+    Conv2d's
     pack, the int64 twin of Expand/Concat/Gather/Equal/Where). These are
     built lazily inside each op's set_runtime_device() based on device
     features and input dtype. Conversion time cannot know them, so we ship
@@ -128,6 +129,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_matmul_coop16",
         "buffer_matmul_coop_i8",
         "buffer_matmul_pack",
+        # The int8/fp8 weight-only WIDE GEMV: a second fp16 build of
+        # buffer/matmul.comp (-DW8_WIDE), not its own .comp, so nothing derives
+        # this key from a file name. MatMulBuffer::w8_wide_pipeline builds it
+        # lazily only for a byte weight with N >= 896 and one A row, which the
+        # converter cannot know, so it ships with every MatMul.
+        "buffer_matmul_w8_wide_fp16",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",

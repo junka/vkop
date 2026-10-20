@@ -38,6 +38,17 @@
 #include "model/load.hpp"
 #include "tokenizer.hpp"
 
+// Wall clock since main() entered, so the stage markers can be costed against
+// the whole run instead of only against each other.
+namespace {
+std::chrono::high_resolution_clock::time_point g_run_start;
+double stage_s() {
+    return std::chrono::duration<double>(
+               std::chrono::high_resolution_clock::now() - g_run_start)
+        .count();
+}
+} // namespace
+
 // ---- Minimal PNG writer (from vae_gen.cpp) ----
 namespace png {
 static uint32_t crc(const uint8_t* p, size_t n) {
@@ -576,12 +587,13 @@ bool encode_prompt(const std::string& te_path, const std::string& table_path,
                (size_t)ctx_dim * sizeof(uint16_t));
 
     auto t0 = std::chrono::high_resolution_clock::now();
+    printf("[stage] setup+tokenizer+embed gather: +%.2fs\n", stage_s());
     auto te_rt = std::make_shared<Runtime>(cmdpool, te_path.c_str(), /*precision=*/1);
     te_rt->set_backend_buffer(true);
     te_rt->LoadModel();
-    printf("[te] loaded in %.2fs\n",
+    printf("[te] loaded in %.2fs (+%.2fs)\n",
            std::chrono::duration<double>(
-               std::chrono::high_resolution_clock::now() - t0).count());
+               std::chrono::high_resolution_clock::now() - t0).count(), stage_s());
 
     auto input = te_rt->GetInput("inputs_embeds");
     if (!input) {
@@ -641,16 +653,22 @@ bool encode_prompt(const std::string& te_path, const std::string& table_path,
     }
 
     // 顺序装载：文本塔的 13.9 GB 必须先还给设备，DiT prefill 才装得下。
+    auto t_te_rel = std::chrono::high_resolution_clock::now();
     te_rt.reset();
     dev->wait_all_done();
     cmdpool->reset();
-    printf("[mem] text tower released\n");
+    printf("[mem] text tower released in %.2fs (+%.2fs)\n",
+           std::chrono::duration<double>(
+               std::chrono::high_resolution_clock::now() - t_te_rel)
+               .count(),
+           stage_s());
     return true;
 }
 
 } // anonymous namespace
 
 int main(int argc, char** argv) {
+    g_run_start = std::chrono::high_resolution_clock::now();
     if (argc < 4) {
         fprintf(stderr, 
                 "Usage: %s <dit_prefill.vkopbin> <dit_decode.vkopbin> <prompt> "
@@ -789,7 +807,7 @@ int main(int argc, char** argv) {
     auto prefill_rt = std::make_shared<Runtime>(cmdpool, prefill_path, /*precision=*/1);
     prefill_rt->set_backend_buffer(true);
     prefill_rt->LoadModel();
-    printf("[load] Prefill loaded\n");
+    printf("[load] Prefill loaded (+%.2fs)\n", stage_s());
 
     // Header-only shape probe: the flatbuffer is mmap'd, so reading input dims
     // costs nothing and lets the decode graph stay unloaded until the prefill is
@@ -1049,7 +1067,8 @@ int main(int argc, char** argv) {
         num_kv_layers++;
     }
     
-    printf("[prefill] Done in %.3fs, found %d KV layers\n", t_prefill, num_kv_layers);
+    printf("[prefill] Done in %.3fs (+%.2fs), found %d KV layers\n", t_prefill,
+           stage_s(), num_kv_layers);
     
     if (num_kv_layers == 0) {
         fprintf(stderr, "[error] No present_kv outputs found in prefill model\n");
@@ -1112,6 +1131,7 @@ int main(int argc, char** argv) {
     // Sequential loading (same strategy as the ORT baseline): the prefill graph
     // is released before the decode graph takes its weights, so a 7.12B model
     // needs one graph's worth of device memory at a time.
+    auto t_pf_rel = std::chrono::high_resolution_clock::now();
     prefill_rt.reset();
 
     // Force GPU to finish and release MoltenVK/Metal resources before loading
@@ -1119,7 +1139,11 @@ int main(int argc, char** argv) {
     // reclaim GPU heap back to system RAM.
     cmdpool->getVulkanDevice()->wait_all_done();
     cmdpool->reset();
-    printf("[mem] Prefill released, device idle\n");
+    printf("[mem] Prefill released in %.2fs (+%.2fs), device idle\n",
+           std::chrono::duration<double>(
+               std::chrono::high_resolution_clock::now() - t_pf_rel)
+               .count(),
+           stage_s());
 
     // VAE_ONLY mode: skip DiT decode entirely, load latent from file.
     const char* vae_only_env = getenv("VAE_ONLY");
@@ -1131,7 +1155,7 @@ int main(int argc, char** argv) {
         decode_rt->set_backend_buffer(true);
         try {
             decode_rt->LoadModel();
-            printf("[load] Decode loaded\n");
+            printf("[load] Decode loaded (+%.2fs)\n", stage_s());
         } catch (const std::exception& e) {
             fprintf(stderr, "[error] Failed to load decode model: %s\n", e.what());
             return 1;
@@ -1327,8 +1351,21 @@ int main(int argc, char** argv) {
     
     auto t_end = std::chrono::high_resolution_clock::now();
     double elapsed = std::chrono::duration<double>(t_end - t_start).count();
-    printf("[gen] Denoising complete: %.1fs (%.1f s/step)\n", 
-           elapsed, elapsed / steps);
+    printf("[gen] Denoising complete: %.1fs (%.1f s/step, +%.2fs)\n",
+           elapsed, elapsed / steps, stage_s());
+    {
+        // Release the decode graph here so its teardown is measured; leaving it
+        // to the scope end hides ~14 GB of device frees inside the VAE load.
+        auto t_dc_rel = std::chrono::high_resolution_clock::now();
+        decode_rt.reset();
+        cmdpool->getVulkanDevice()->wait_all_done();
+        cmdpool->reset();
+        printf("[mem] decode released in %.2fs (+%.2fs)\n",
+               std::chrono::duration<double>(
+                   std::chrono::high_resolution_clock::now() - t_dc_rel)
+                   .count(),
+               stage_s());
+    }
     
     // Save output
     char out_path[256];
@@ -1407,7 +1444,7 @@ int main(int argc, char** argv) {
     vae_rt->set_backend_buffer(true);
     try {
         vae_rt->LoadModel();
-        printf("[load] VAE loaded\n");
+        printf("[load] VAE loaded (+%.2fs)\n", stage_s());
     } catch (const std::exception& e) {
         fprintf(stderr, "[vae] LoadModel failed: %s\n", e.what());
         return 1;
@@ -1433,7 +1470,7 @@ int main(int argc, char** argv) {
     auto t_vae_end = std::chrono::high_resolution_clock::now();
     double vae_elapsed =
         std::chrono::duration<double>(t_vae_end - t_vae_start).count();
-    printf("[time] vae decode %.2fs\n", vae_elapsed);
+    printf("[time] vae decode %.2fs (+%.2fs)\n", vae_elapsed, stage_s());
 
     // Read decoded output.
     auto vae_output = vae_rt->GetOutput("decoded");
@@ -1464,7 +1501,8 @@ int main(int argc, char** argv) {
     char png_path[256];
     snprintf(png_path, sizeof(png_path), "output_%dx%d.png", img_h, img_w);
     if (save_latent_as_png(decoded_data, img_h, img_w, png_path)) {
-        printf("[png] Saved %s (%dx%d RGB)\n", png_path, img_w, img_h);
+        printf("[png] Saved %s (%dx%d RGB, +%.2fs)\n", png_path, img_w, img_h,
+               stage_s());
     } else {
         fprintf(stderr, "[png] Failed to write %s\n", png_path);
     }

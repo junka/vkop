@@ -159,6 +159,35 @@ def test_secondary_keys_exist_in_master_archive():
             )
 
 
+def test_every_literal_resolve_spv_key_is_declared():
+    """The other direction: every key an op hard-codes into
+    Operator::resolve_spv() must appear in shader_map._SECONDARY.
+
+    Those are the pipelines Runtime never sees (they are built lazily inside
+    set_runtime_device from a device-feature or dtype test), so nothing derives
+    their archive key from the op table -- the C++ literal is the only place it
+    exists. Omit one and a converted model's subset simply lacks it: the op
+    resolves to its stub array and loses that kernel, on a stripped build, with
+    only a runtime warning to say so. This is the silent half of the drift the
+    master-archive test above cannot see, because the key does exist in the
+    master (CMake compiled it) -- it just never reaches the model.
+    """
+    ops_dir = os.path.join(REPO_ROOT, "ops")
+    literals = set()
+    for name in sorted(os.listdir(ops_dir)):
+        if not name.endswith((".hpp", ".cpp")):
+            continue
+        with open(os.path.join(ops_dir, name)) as f:
+            literals.update(
+                re.findall(r'resolve_spv\(\s*"([^"]+)"', f.read()))
+    shipped = {k for keys in shader_map._SECONDARY.values() for k in keys}
+    missing = sorted(literals - shipped)
+    assert not missing, (
+        f"ops/ builds pipelines with {missing}, which shader_map._SECONDARY "
+        "does not list, so onnx2vkop never embeds them into a model's archive"
+    )
+
+
 # ------------------------------------------------------------- kernel plan
 # Model.kernel_plans is written into every .vkopbin and read by
 # Runtime::kernel_key_for_node in place of the C++ table, and the per-model

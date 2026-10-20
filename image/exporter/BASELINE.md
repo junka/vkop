@@ -575,6 +575,77 @@ Both fp16 shaders are bit-exact against what the host paths produced, not merely
   tokens: multimodal `6176` + `151645`, raw `358,1184,311,3270,264,2805`, Phi-4
   `72721,4472,788,200020`.
 
+**The 2.6 s/step and 10.7 s VAE in the table above moved again on 2026-10-06** — see the next
+section; the decode figure there is a cold-start best case.
+
+### 2026-10-06: the VAE costs 4.8 s, and the decode step is thermally gated — 138 s cold / 152 s hot
+
+Same command (`VKOP_RUN_PROFILE=1`, 512×512, 40 steps, seed 42), now with a Chinese prompt:
+
+| Phase | 2026-10-04 | 2026-10-06 |
+|-------|-----------|------------|
+| text tower load + forward | 8.9 s + 0.26 s | 4.30 s + 0.273 s (`gpu+reset` 255 ms) |
+| DiT prefill | 0.25 s | 0.224 s (3195 ops, `gpu+reset` 181 ms) |
+| DiT decode, 40 steps | 102.4 s | 114.1 s cold / 130.7 s warm |
+| VAE decode | 10.7 s | **4.83 s** (311 ops, `gpu+reset` 4722 ms) |
+| whole 512×512 sample | 145 s | **138 s cold / 152 s warm** |
+
+Three facts worth keeping:
+
+- The VAE is **55% faster** than the 10.7 s recorded above, from
+  `64680fd perf(ops): register-block the buffer Conv2d 3x3 path over output columns`. Its time
+  is now essentially pure GPU work (`gpu+reset` 4.72 s of a 4.83 s run).
+- **2.6 s/step is a cold-start best case, not a steady-state figure.** Per-step `Run` climbs
+  monotonically 2.58 → 2.95 s over the first ~21 steps and then holds at 2.89–2.95 s; a second
+  run on an already-warm machine sits at 3.17 → 3.41 s for all 40 steps. Host `record` stays at
+  11–14 ms throughout and `gpu+reset` grows by exactly the same amount as the total, so the
+  drift is SoC clock throttling rather than engine overhead — do not read it as a regression,
+  and do not budget 2.6 s/step when estimating a batch. That also explains the 102.4 s → 114.1 s
+  in the table: the first six steps of this run are 2.58–2.64 s, i.e. identical to the 2026-10-04
+  figure, and the whole difference is the ramp the earlier run did not sample.
+- Chinese prompts run end-to-end through the C++ tokenizer: `drop_idx=14 total=48 valid=34` and
+  `total=56 valid=42`, both inside the 64-token static text segment (P=78). That budget is only
+  ~42 Chinese characters, and the driver aborts on overflow instead of truncating. Prompt *word
+  order* matters more than length here — with 古装美女 mid-sentence the sample came out as a
+  male warrior, and moving 一位美丽的古装女侠…她 to the front produced the intended female lead.
+
+### 2026-10-19: the four segments are now measured, not inferred
+
+`image_gen` carries cumulative `[stage]`/`[load]`/`[mem]` markers, so every graph's load, forward
+and release is its own number instead of a residual. Same setup as above (512×512, 40 steps,
+seed 7, English prompt), on an already-warm machine:
+
+| Phase | Measured |
+|-------|----------|
+| tokenizer + embed gather | 0.13 s |
+| text tower load / forward / release | 5.41 s / 0.31 s / 0.04 s |
+| DiT prefill load / run / release | 5.28 s / 0.27 s / 0.09 s |
+| DiT decode load / 40 steps / release | 5.50 s / **123.3 s** (median step 2.98 s) / 0.06 s |
+| VAE load / decode | 0.48 s / 4.86 s |
+| PNG encode | 0.04 s |
+| **wall clock** | **146.1 s** |
+
+The rows account for 145.8 of the 146.1 s: the ~18 s the section above left unaccounted was the
+three graph releases plus load times nobody had stamped — there is no hidden engine overhead.
+Outside the denoising step itself, the loads are now the whole remaining budget (16.7 s of 146 s).
+Two runs minutes apart gave 121.4 s / 143.3 s and 123.3 s / 146.1 s, so the thermal gate described
+above still dominates the decode number; both sit in the 2.9–3.4 s/step band.
+
+**The same build also proves the fp16 graphs are not affected by the WIDE byte-weight split.** On
+2026-10-18 neither `image_gen` nor `llm_chat` could create a *single* buffer MatMul pipeline on
+this GPU: the int8/fp8 weight-only WIDE GEMV (16 columns per lane) lived in
+`shaders/buffer/matmul.comp`, which is every buffer MatMul's module, and MoltenVK's SPIR-V → MSL
+backend cannot compile that kernel — `vkCreateComputePipelines` returned
+`VK_ERROR_INITIALIZATION_FAILED` for the whole module, so each op aborted during load. The kernel
+is now a second build of the same file (`-DW8_WIDE`, 107 KB against the general module's 212 KB,
+each with the other's kernels dropped by SPIR-V DCE), and `MatMulBuffer::w8_wide_pipeline()` builds
+it on first byte-weight use and probes it: a driver that refuses it logs one warning and keeps byte
+weights on the 4-column split-K GEMV. Apple compiles the standalone module, so the path is live
+here — three interleaved A/B pairs on `text_glm_edge/llm_int8.vkopbin` (25 decode rounds each)
+give median rounds 36.2 / 40.5 / 41.4 ms with WIDE versus 41.5 / 41.6 / 44.7 ms without, WIDE
+winning every pair. `MatMulInt8WeightOnlyBuffer` and `MatMulFp8WeightOnlyBuffer` now include N=896
+single-row shapes, the smallest that reach this kernel.
+
 ### Sequential loading now has four segments
 
 | Phase | Size | Measured |
@@ -582,8 +653,11 @@ Both fp16 shaders are bit-exact against what the host paths produced, not merely
 | Text tower load | 13.89 GB | 3.6–9.7 s (page-cache dependent) |
 | Text tower forward (78 tokens) | — | 0.27 s |
 | DiT prefill load + run | 13.83 GB | ~14 s + 0.25 s |
-| DiT decode load + step | 14.17 GB | ~14 s + 2.6 s/step |
-| VAE decode | 1.0 GB | 10.7 s |
+| DiT decode load + step | 14.17 GB | ~14 s + 2.6 s/step cold, 2.9–3.4 s/step warm |
+| VAE decode | 1.0 GB | 4.8 s |
+
+The per-graph figures above supersede this table's estimates: see the 2026-10-19 section for the
+measured load, forward and release of each of the four segments.
 
 The 7 B scale is new for this repo (the LLM line tops out at 2 B): the *runtime* is not the
 constraint — 13.9 GB loads in seconds and one forward takes 0.27 s — the tight resource is

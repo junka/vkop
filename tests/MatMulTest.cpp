@@ -1474,6 +1474,13 @@ TEST(MatMulTest, MatMulInt8WeightOnlyBuffer) {
         {1, 1, 258, 260, false, false},
         {1, 3, 258, 32, false, false},
         {2, 1, 300, 128, false, true},
+        // Byte WIDE: from N >= 896 (host heuristic) a byte weight's split-K GEMV
+        // moves to a module of its own whose lanes own SIXTEEN columns, so the
+        // column-octet addressing, the four accumulator chains and the
+        // shared-memory fold over K slices all need their own shapes. K % 16
+        // != 0 keeps the kernel's two-per-trip tail live.
+        {1, 1, 512, 896, false, false},
+        {1, 1, 258, 896, false, false},
         // Compute-bound shapes: from m >= 12 with K % 16 == 0 and N % 4 == 0 the
         // host puts a byte weight in the shared-memory tile, which stages the
         // decoded value and applies the column scale in the epilogue. The 64-row
@@ -1533,6 +1540,10 @@ TEST(MatMulTest, MatMulFp8WeightOnlyBuffer) {
                                                    // the slice length
             {1, 3, 258, 32, false, false, false},   // decode: several rows
             {2, 1, 300, 128, false, true, false},   // decode: batched
+            {1, 1, 512, 896, false, false,
+             false},  // byte WIDE: sixteen columns per lane, fp8 decode
+            {1, 1, 258, 896, false, false,
+             false},  // byte WIDE: K % 16 != 0, so its tail loop runs
             {1, 4, 32, 16, false, false, true},    // wide spread: subnormals
             {1, 1, 256, 64, false, false, true},   // wide spread under split-K
             // The tiled byte kernel (see the int8 list): fp8 reaches it through

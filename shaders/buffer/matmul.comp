@@ -22,6 +22,10 @@
 // picked) a byte weight joins it too: the tile stages the decoded value, so the
 // byte -> float step runs once per weight per 64-row block instead of once per
 // output element.
+// The sixteen-columns-per-lane split-K GEMV for a byte weight is NOT in this
+// module: it is reached through a second build of this file (-DW8_WIDE), which
+// the host probes on its own because MoltenVK cannot compile that kernel. See
+// the entries at the end of the file.
 
 #ifdef FP16
 #extension GL_EXT_shader_16bit_storage : enable
@@ -889,6 +893,9 @@ void ks_store_wide_w8(vec4 s0, vec4 s1, vec4 s2, vec4 s3, int row, int c) {
     if (c + 15 < uPC.N) uOutput.data[(out_idx + 14) >> 1] = packHalf2x16(v3.zw);
 }
 
+// Reached only from the -DW8_WIDE module build's entry at the end of this file;
+// the general fp16 module never calls it, so SPIR-V DCE drops it there and
+// MoltenVK never sees it.
 void matmul16_w8_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
@@ -1568,6 +1575,19 @@ void matmul32() {
     uOutput.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
 }
 
+// The -DW8_WIDE build: this file's second fp16 module, entered only by the
+// int8/fp8 weight-only WIDE GEMV.
+#ifdef W8_WIDE
+// MoltenVK's SPIR-V -> MSL backend cannot compile that kernel: as part of the
+// general fp16 module this one failure sank EVERY buffer MatMul pipeline
+// (vkCreateComputePipelines -> VK_ERROR_INITIALIZATION_FAILED). An entry that
+// reaches nothing else keeps the general module alive -- SPIR-V DCE drops this
+// kernel from it -- and lets the host probe the wide one on its own and fall
+// back to matmul16_w8_ksplit where the driver refuses, see w8_wide_pipeline()
+// in ops/Matmul.hpp. Same bindings, push constants and workgroup as the general
+// module, so only the pipeline it is bound to differs.
+void main() { matmul16_w8_ksplit_wide(); }
+#else
 void main() {
 #ifdef FP16
     // Split-K GEMV owns its own selection: the workgroup is laid out over K
@@ -1575,9 +1595,12 @@ void main() {
     if (uPC.ksplit != 0) {
         if (uPC.w4 != 0) {
             matmul16_w4_ksplit();
-        } else if (uPC.weight_int8 != 0 && uPC.wide != 0) {
-            matmul16_w8_ksplit_wide();
         } else if (uPC.weight_int8 != 0) {
+            // A byte weight here is the four-columns-per-lane split-K GEMV even
+            // when uPC.wide is set: the sixteen-column variant is not in this
+            // module (see the W8_WIDE build above), and the host only raises
+            // wide when it has the separate pipeline to dispatch it on.
+            // matmul16_w8_ksplit ignores wide, so this stays correct either way.
             matmul16_w8_ksplit();
         } else if (uPC.wide != 0) {
             matmul16_ksplit_wide();
@@ -1636,3 +1659,4 @@ void main() {
     matmul32();
 #endif
 }
+#endif  // W8_WIDE
