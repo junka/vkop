@@ -7567,6 +7567,481 @@ class Quantizer:
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
 
+class PreQuantizedWeights:
+    """Import weights that arrive ALREADY quantized, as ONNX DequantizeLinear.
+
+    A third-party quantized graph spells a Linear weight as
+    `MatMul(X, DequantizeLinear(W_q, s[, zp]))`: the payload and the scale are
+    initializers and the node is the only thing that makes them readable. vkop's
+    buffer MatMul/Gemm kernels ARE that dequantizer, fed from the same two
+    initializers with the scale appended last — the exact input shape Quantizer
+    emits — so importing means deleting the node and re-pointing its consumers:
+
+      INT8     + 1-D fp32 per-column scale  -> [A, W, s]   (MatMul, Gemm)
+      fp8 e4m3/e5m2 + the same              -> [A, W, s]   (MatMul)
+      int4/nf4 + fp32 [K/g, N] group table  -> [A, W, s]   (MatMul)
+
+    A [N, K] 4-bit weight is normalized rather than rejected: the packed payload
+    and the scale table are both transposed and the consumer's transB flipped to
+    0, because the nibble kernel walks a column down K (ops/MatMul.hpp refuses
+    transB for 4-bit), and a [N, K] export with a folded Transpose is what a
+    third-party Linear actually looks like by the time this pass runs.
+
+    Everything the spec leaves undetermined is an error, not a guess:
+      * a non-zero zero_point — every vkop weight format is symmetric
+        (value = code * scale), so an offset payload belongs to the a8w8 family
+        of operators, not to a fold;
+      * a payload that is a graph value — that is the activation side of a QDQ
+        pair, and there is no activation quantization here;
+      * a per-tensor or blocked scale for the byte formats, and a per-column
+        scale for 4-bit — a kernel binds exactly the table its shader walks;
+      * FLOAT4E2M1 — NVFP4's second scale level is one fp32 per tensor and
+        ONNX has nowhere to put it; a graph that folded it into the e4m3 block
+        bytes is a different format from the one the kernel decodes;
+      * a UINT4 payload that does not name itself nf4 in its vkop_dtype metadata
+        — the ONNX element type says how the nibbles are stored, not what they
+        mean, and only the codebook kernel reads a nibble as an index.
+
+    Constant folding runs before this on the ONNX proto and does NOT evaluate
+    DequantizeLinear (ConstantFolder._FOLDABLE_OPS), so the payload arrives as
+    the initializer this pass needs. onnxsim, when installed, does evaluate it:
+    that graph reaches the converter as a dequantized float weight, which is the
+    same numbers without the quantized storage.
+    """
+
+    # ONNX element type -> (name for messages, the ops whose kernels dequantize
+    # it). int8 is the only byte format Gemm reads: gemm.comp/conv2d.comp decode
+    # int8 and nothing else.
+    _BYTE_WEIGHTS = {
+        TensorProto.INT8: ("int8", ("MatMul", "Gemm")),
+        TensorProto.FLOAT8E4M3FN: ("float8e4m3fn", ("MatMul",)),
+        TensorProto.FLOAT8E5M2: ("float8e5m2", ("MatMul",)),
+    }
+    _4BIT_WEIGHTS = (TensorProto.INT4, TensorProto.UINT4)
+
+    @staticmethod
+    def fold(dag_model) -> int:
+        """Fold every DequantizeLinear(weight initializer) into its consumers.
+
+        Runs after fusion (so a DQ -> Transpose -> MatMul has already become a
+        transB=1 operand) and before the -q dispatch, which is what keeps a graph
+        that is already on a quantization grid from being re-quantized from the
+        float its DQ node would have produced. Auto-detected: a graph with no
+        DequantizeLinear is untouched."""
+        dq_nodes = [
+            node for node in dag_model.nodes.values()
+            if node.op_type == "DequantizeLinear"
+        ]
+        if not dq_nodes:
+            return 0
+
+        print(f"Importing {len(dq_nodes)} externally-quantized weight(s)...")
+        consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                consumers[inp["name"]].append(node)
+
+        for node in dq_nodes:
+            PreQuantizedWeights._fold_one(dag_model, node, consumers)
+            del dag_model.nodes[node.name]
+            if len(node.inputs) > 2:
+                zp_name = node.inputs[2]["name"]
+                # The zero point was only ever this node's input; once the node is
+                # gone it is dead weight in the blob, so drop it.
+                if all(c is node for c in consumers.get(zp_name, [])):
+                    dag_model.initializers.pop(zp_name, None)
+
+        # The deleted nodes are still named in every dependency set built before
+        # this pass.
+        dag_model.build_dependencies()
+        print(
+            f"Imported {len(dq_nodes)} quantized weight(s) as weight-only "
+            f"MatMul/Gemm inputs"
+        )
+        return len(dq_nodes)
+
+    @staticmethod
+    def _fold_one(dag_model, node, consumers):
+        out_name = node.outputs[0]["name"]
+        if len(node.inputs) < 2:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}' has {len(node.inputs)} input(s); "
+                f"the op needs a quantized tensor and its scale"
+            )
+        x_name = node.inputs[0]["name"]
+        s_name = node.inputs[1]["name"]
+
+        payload = dag_model.initializers.get(x_name)
+        if payload is None:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': '{x_name}' is a graph value, not "
+                f"a weight initializer. vkop dequantizes weights only, so this is "
+                f"the activation side of a QDQ pair, which needs the a8w8 "
+                f"operators rather than a fold."
+            )
+        scale_init = dag_model.initializers.get(s_name)
+        if scale_init is None:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': scale '{s_name}' is computed at "
+                f"run time, and a weight-only kernel binds a constant scale table."
+            )
+
+        if len(node.inputs) > 2:
+            zp_name = node.inputs[2]["name"]
+            zp = dag_model.initializers.get(zp_name)
+            if zp is None:
+                raise ValueError(
+                    f"DequantizeLinear '{node.name}': zero_point '{zp_name}' is "
+                    f"computed at run time; a constant offset the shader never "
+                    f"subtracts is a wrong answer by construction."
+                )
+            if zp.data_type != payload.data_type:
+                raise ValueError(
+                    f"DequantizeLinear '{node.name}': zero_point '{zp_name}' is "
+                    f"{PreQuantizedWeights._dt_name(zp.data_type)} while the payload "
+                    f"is {PreQuantizedWeights._dt_name(payload.data_type)}; ONNX "
+                    f"requires them to match, and reading one as the other is "
+                    f"silent corruption."
+                )
+            if not PreQuantizedWeights._is_all_zero(zp):
+                raise ValueError(
+                    f"DequantizeLinear '{node.name}': non-zero zero_point on "
+                    f"'{x_name}'. Every vkop weight format is symmetric "
+                    f"(value = code * scale), so an offset payload is the "
+                    f"a8w8/GPTQ family of kernels, not a fold."
+                )
+
+        # The dequantized product's type. The fold leaves the multiply to the
+        # shader, which does it in fp32 and hands the consumer fp16/fp32, so
+        # those targets are equal-or-better precision; anything else (bf16, an
+        # int output) says the exporter rounded the weight through a layout the
+        # kernel does not reproduce.
+        out_dtype = int(node.attributes.get("output_dtype", 0) or 0)
+        if out_dtype not in (
+            0,
+            TensorProto.FLOAT,
+            TensorProto.FLOAT16,
+            TensorProto.DOUBLE,
+        ):
+            raise ValueError(
+                f"DequantizeLinear '{node.name}' declares output_dtype "
+                f"{PreQuantizedWeights._dt_name(out_dtype)}; the weight-only "
+                f"kernels produce float32/fp16 and cannot reproduce that "
+                f"rounding."
+            )
+
+        cs = consumers.get(out_name, [])
+        if not cs:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': nothing reads '{out_name}', so "
+                f"there is no weight to import"
+            )
+        ops = {c.op_type for c in cs}
+        if not ops <= {"MatMul", "Gemm"}:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}' feeds {sorted(ops)}; a quantized "
+                f"payload is only readable by MatMul/Gemm weight-only kernels."
+            )
+        for c in cs:
+            uses = [i for i, inp in enumerate(c.inputs) if inp["name"] == out_name]
+            if uses != [1]:
+                raise ValueError(
+                    f"'{c.name}' reads the dequantized weight '{out_name}' at "
+                    f"input(s) {uses}; it has to be the single B operand, because "
+                    f"on the A side there is no per-column scale to index."
+                )
+        transb = {int(c.attributes.get("transB", 0) or 0) for c in cs}
+        if len(transb) != 1:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': its consumers disagree on "
+                f"transB={sorted(transb)}, and transB is what says which physical "
+                f"axis holds the output columns the scale indexes."
+            )
+        tb = transb.pop()
+        dims = [int(d) for d in payload.dims]
+        if len(dims) != 2:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': payload '{x_name}' has rank "
+                f"{len(dims)} ({dims}); a batched weight would need one scale "
+                f"table per batch, which the shaders do not read."
+            )
+
+        if payload.data_type in PreQuantizedWeights._BYTE_WEIGHTS:
+            label, kernels = PreQuantizedWeights._BYTE_WEIGHTS[payload.data_type]
+            if not ops <= set(kernels):
+                raise ValueError(
+                    f"'{x_name}': {label} is dequantized by "
+                    f"{'/'.join(kernels)} only, but its consumers are "
+                    f"{sorted(ops)}"
+                )
+            PreQuantizedWeights._fold_per_axis(
+                dag_model, node, cs, payload, scale_init, dims, tb, label
+            )
+        elif payload.data_type in PreQuantizedWeights._4BIT_WEIGHTS:
+            label = PreQuantizedWeights._nibble_name(payload, node)
+            if ops != {"MatMul"}:
+                raise ValueError(
+                    f"'{x_name}': {label} is dequantized by MatMul only, but its "
+                    f"consumers are {sorted(ops)}"
+                )
+            PreQuantizedWeights._fold_blocked_4bit(
+                dag_model, node, cs, payload, scale_init, dims, tb, label
+            )
+        elif payload.data_type == TensorProto.FLOAT4E2M1:
+            raise ValueError(
+                f"'{x_name}': an e2m1 payload is NVFP4, whose definition needs one "
+                f"more fp32 scale per TENSOR on top of the per-16 e4m3 block bytes "
+                f"— and ONNX has no input slot for it. A graph that folded that "
+                f"factor into the block bytes is not the format the kernel decodes."
+            )
+        else:
+            raise ValueError(
+                f"'{x_name}': payload type "
+                f"{PreQuantizedWeights._dt_name(payload.data_type)} has no vkop "
+                f"dequantization kernel (int8, fp8 e4m3/e5m2, int4 and nf4 only)."
+            )
+
+    @staticmethod
+    def _fold_per_axis(dag_model, node, cs, payload, scale_init, dims, tb, label):
+        """One fp32 scale per output column — the INT8/fp8 weight-only contract."""
+        # Which physical axis holds the output columns is transB's answer, the
+        # same one Quantizer takes for the byte formats.
+        cols_axis = 1 if tb == 0 else 0
+        n = dims[cols_axis]
+        scale = PreQuantizedWeights._scale_array(scale_init, payload.name, label)
+        if scale.ndim != 1:
+            raise ValueError(
+                f"'{payload.name}': {label} scale has rank {scale.ndim}. The "
+                f"{label} kernel walks one fp32 scale per output column, so neither "
+                f"a per-tensor scalar nor a blocked table has a kernel here."
+            )
+        axis = PreQuantizedWeights._axis(node, 1, len(dims))
+        if axis != cols_axis or scale.shape[0] != n:
+            raise ValueError(
+                f"'{payload.name}': per-axis {label} scale indexes dim {axis} "
+                f"(length {scale.shape[0]}), but the kernel's scale indexes the "
+                f"output columns — dim {cols_axis} (length {n}) of a {dims} "
+                f"{'[K, N]' if tb == 0 else '[N, K]'} weight."
+            )
+        PreQuantizedWeights._require_finite(scale, payload.name, label)
+
+        # fp16 -> fp32 is exact, and the kernels demand a float32 table.
+        if scale_init.data_type != TensorProto.FLOAT:
+            dag_model.initializers[scale_init.name] = numpy_helper.from_array(
+                np.ascontiguousarray(scale, dtype=np.float32), scale_init.name
+            )
+        PreQuantizedWeights._rewire(cs, node, payload, dims, scale_init.name, [n])
+
+    @staticmethod
+    def _fold_blocked_4bit(dag_model, node, cs, payload, scale_init, dims, tb, label):
+        """One fp32 scale per (group of K, output column) — the int4/nf4 contract,
+        always delivered as a [K/group, N] row-major table over a [K, N] payload."""
+        cols_axis = 1 if tb == 0 else 0
+        k_axis = 1 - cols_axis
+        k, n = dims[k_axis], dims[cols_axis]
+
+        scale = PreQuantizedWeights._scale_array(scale_init, payload.name, label)
+        if scale.ndim != 2:
+            raise ValueError(
+                f"'{payload.name}': a 4-bit weight's scale has to be a blocked "
+                f"table with one entry per (K group, output column), got rank "
+                f"{scale.ndim}. The per-column table the byte formats use has no "
+                f"nibble kernel, because a 4-bit grid cannot carry one scale over "
+                f"a whole span of K."
+            )
+        block = node.attributes.get("block_size")
+        if not isinstance(block, (list, tuple)) or len(block) != 1:
+            raise ValueError(
+                f"'{payload.name}': a 4-bit weight is blocked, so the op needs "
+                f"exactly one block_size; got {block!r}"
+            )
+        group = int(block[0])
+        if group <= 0 or group % 2:
+            raise ValueError(
+                f"'{payload.name}': block_size={group}; a 4-bit group must be a "
+                f"positive EVEN number of K values, because the fp16 kernels read A "
+                f"two halves per word."
+            )
+        axis = PreQuantizedWeights._axis(node, 1, len(dims))
+        if axis != k_axis:
+            raise ValueError(
+                f"'{payload.name}': blocked along dim {axis}, but a 4-bit weight's "
+                f"groups cut the K axis — dim {k_axis} of a {dims} "
+                f"{'[K, N]' if tb == 0 else '[N, K]'} weight."
+            )
+        if k % group:
+            raise ValueError(
+                f"'{payload.name}': K={k} is not a multiple of block_size={group}, "
+                f"so the last group's scale would cover a partial slice"
+            )
+        n_groups = k // group
+        want = list(dims)
+        want[k_axis] = n_groups
+        if list(scale.shape) != want:
+            raise ValueError(
+                f"'{payload.name}': {label} scale is {list(scale.shape)}, expected "
+                f"{want} (one entry per (K group, output column))"
+            )
+        if n % 8:
+            raise ValueError(
+                f"'{payload.name}': N={n} is not a multiple of 8, so a packed row "
+                f"would not start on a 32-bit word"
+            )
+        PreQuantizedWeights._require_finite(scale, payload.name, label)
+
+        raw = payload.raw_data
+        want_bytes = (k * n + 1) // 2
+        if len(raw) != want_bytes:
+            raise ValueError(
+                f"'{payload.name}': packed payload carries {len(raw)} bytes but "
+                f"{dims} x 4 bits is {want_bytes} (two nibbles per byte)"
+            )
+
+        if tb == 1:
+            # [N, K] -> [K, N]: the nibble kernel addresses a column by walking
+            # K, so both the payload grid and the scale table get transposed and
+            # the consumers' transB flipped to 0 (the product is unchanged).
+            packed = PreQuantizedWeights._transpose_packed(raw, dims)
+            new_payload = helper.make_tensor(
+                payload.name, payload.data_type, [k, n], packed, raw=True
+            )
+            # The name the loader reads (nf4 rides on UINT4 storage through this
+            # metadata entry) must survive the rewrite.
+            for entry in payload.metadata_props:
+                new_payload.metadata_props.append(entry)
+            dag_model.initializers[payload.name] = new_payload
+            scale = np.ascontiguousarray(scale.T)
+            for c in cs:
+                c.attributes["transB"] = 0
+            dims = [k, n]
+
+        # Written back as float32 either way: the kernels bind a fp32 table, and
+        # the transposed view above is not what the initializer held.
+        dag_model.initializers[scale_init.name] = numpy_helper.from_array(
+            np.ascontiguousarray(scale, dtype=np.float32), scale_init.name
+        )
+        PreQuantizedWeights._rewire(
+            cs, node, dag_model.initializers[payload.name], dims,
+            scale_init.name, list(scale.shape),
+        )
+
+    @staticmethod
+    def _rewire(cs, node, payload, dims, scale_name, scale_shape):
+        """Point every consumer at the payload where it read the DQ's output, and
+        append the scale last — the slot order the weight-only kernels index."""
+        out_name = node.outputs[0]["name"]
+        for c in cs:
+            for i, inp in enumerate(c.inputs):
+                if inp["name"] == out_name:
+                    # The input metadata now describes the payload, not the
+                    # dequantized float the deleted node emitted.
+                    c.inputs[i] = {
+                        "name": payload.name,
+                        "shape": list(dims),
+                        "dtype": payload.data_type,
+                        "value_dynamic": False,
+                    }
+                    break
+            c.inputs.append({"name": scale_name, "shape": list(scale_shape)})
+
+    @staticmethod
+    def _axis(node, default, rank):
+        """ONNX's axis attribute, normalized to a non-negative index."""
+        axis = int(node.attributes.get("axis", default))
+        return axis + rank if axis < 0 else axis
+
+    @staticmethod
+    def _scale_array(scale_init, payload_name, label):
+        """The scale table as an ndarray, in whatever rank the graph declared.
+
+        Only fp32 and fp16 get through: the kernels bind a float32 table, fp16 ->
+        fp32 is exact, and anything narrower (bf16) or wider (double) would have
+        to be re-rounded by the converter to reach the shader's precision, which
+        is a numerical claim this pass has no business making."""
+        if scale_init.data_type not in (
+            TensorProto.FLOAT,
+            TensorProto.FLOAT16,
+        ):
+            raise ValueError(
+                f"'{payload_name}': {label} dequant scale is "
+                f"{PreQuantizedWeights._dt_name(scale_init.data_type)}; the "
+                f"weight-only kernels bind a float32 table (fp16 is accepted and "
+                f"widened exactly)."
+            )
+        return numpy_helper.to_array(scale_init)
+
+    @staticmethod
+    def _require_finite(scale, payload_name, label):
+        if not np.all(np.isfinite(scale)):
+            raise ValueError(
+                f"'{payload_name}': {label} scale holds {int(np.count_nonzero(~np.isfinite(scale)))} "
+                f"non-finite entries, which every output column it touches would "
+                f"inherit."
+            )
+
+    @staticmethod
+    def _nibble_name(payload, node):
+        """'int4' or 'nf4' from the payload's element type plus its vkop_dtype
+        metadata — the channel ONNX has for a nibble whose type only says how it
+        is stored."""
+        names = [(e.key, e.value) for e in payload.metadata_props]
+        if payload.data_type == TensorProto.INT4:
+            for key, value in names:
+                if key == "vkop_dtype" and value != "int4":
+                    raise ValueError(
+                        f"'{payload.name}': an INT4 payload names itself "
+                        f"'{value}' in its {key} metadata; the signed nibble is "
+                        f"int4."
+                    )
+            return "int4"
+        if ("vkop_dtype", "nf4") in names:
+            return "nf4"
+        raise ValueError(
+            f"'{payload.name}': a UINT4 payload names itself nf4 in its vkop_dtype "
+            f"metadata or nothing does. ONNX's element type records the nibbles' "
+            f"storage, not their meaning, and a plain 0..15 grid has no kernel. "
+            f"(metadata: {names})"
+        )
+
+    @staticmethod
+    def _transpose_packed(raw, dims):
+        """Packed-nibble grid transpose: unpack, transpose, repack.
+
+        Element order inside a byte is part of the contract (even element in the
+        LOW nibble, row-major), so it is restated here rather than reused from
+        the writer: a test compares this against the bytes the -q path emits for
+        the same weight laid out the other way."""
+        byte_arr = np.frombuffer(raw, dtype=np.uint8)
+        nib = np.empty(byte_arr.size * 2, dtype=np.uint8)
+        nib[0::2] = byte_arr & 0x0F
+        nib[1::2] = byte_arr >> 4
+        grid = np.ascontiguousarray(nib.reshape(dims).T)
+        flat = grid.reshape(-1)
+        packed = (flat[0::2] | (flat[1::2] << 4)).astype(np.uint8)
+        return packed.tobytes()
+
+    @staticmethod
+    def _is_all_zero(init):
+        """Is every zero_point entry zero? Read from the proto's own fields,
+        because a 4-bit or fp8 payload's zero point has the same element type and
+        numpy cannot decode those without an optional dependency."""
+        if init.raw_data:
+            return all(b == 0 for b in init.raw_data)
+        for field in ("int32_data", "int64_data", "uint64_data"):
+            values = getattr(init, field, None)
+            if values:
+                return all(int(v) == 0 for v in values)
+        # No data at all is not a zero point to assume.
+        return False
+
+    @staticmethod
+    def _dt_name(data_type):
+        try:
+            return onnx.TensorProto.DataType.Name(data_type)
+        except (KeyError, ValueError):
+            return f"elem_type {data_type}"
+
+
 class Unifier:
     """Collapse eligible initializers into a single 64-byte-aligned sub-region
     of the model's initializer blob, described by a UnifiedMeta side table.

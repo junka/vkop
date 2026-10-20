@@ -19,6 +19,7 @@ try:
         FusionOptimizer,
         InitializerMerger,
         ONNXOptimizer,
+        PreQuantizedWeights,
         Quantizer,
         RGBAConverter,
         Unifier,
@@ -34,6 +35,7 @@ except ImportError:
         FusionOptimizer,
         InitializerMerger,
         ONNXOptimizer,
+        PreQuantizedWeights,
         Quantizer,
         RGBAConverter,
         Unifier,
@@ -653,6 +655,14 @@ class ModelConverter:
         self._cleanup_orphan_inputs(dag_model, pre_producer)
 
         dag_model.build_dependencies()
+
+        # A graph from outside can arrive with its Linear weights already on a
+        # quantization grid (DequantizeLinear over a payload initializer). Fold
+        # those into the same weight-only inputs the -q path emits, BEFORE -q
+        # runs: otherwise a `-q int8` conversion of such a graph re-quantizes the
+        # dequantized float (a second round of error) and a plain conversion
+        # fails on an operator the runtime does not have.
+        PreQuantizedWeights.fold(dag_model)
 
         if args.quant == "fp16":
             # The fp16 weight pass needs the target backend: only the buffer
