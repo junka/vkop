@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "core/Tensor.hpp"
+#include "include/dev_shaders.hpp"
 #include "include/logger.hpp"
 #include "ops/Min.hpp"
 #include "ops/Max.hpp"
@@ -153,6 +154,9 @@ int run_case(vkop::ops::OpType op_type, const char *op_name,
 
 int main(int argc, char **argv) {
     bool full = (argc < 2) || std::string(argv[1]) == "full";
+    // Builds Min/Max through the op factory, not through a model, so on the
+    // default stripped libvkop it needs the build tree's archive.
+    vkop::dev::seed_shader_archive_from_build_tree();
 
     Logger::getInstance().setLevel(LOG_INFO);
     const auto &phydevs =

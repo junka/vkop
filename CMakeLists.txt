@@ -268,15 +268,21 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # shaders get their folder as a prefix, so same-named shaders in different
 # folders never collide.
 #
-# VKOP_STRIP_BUILTIN_SHADERS=ON drops the SPIR-V bytes from libvkop entirely:
-# spv_to_c.py writes a 1-byte placeholder with _len=0 for every symbol, and
-# the archive build (vkop_shaders.bin, always produced) becomes the only
-# source of shader bytes. Deployments then have to set VKOP_SHADER_ARCHIVE at
-# runtime or LoadModel throws with a clear message. Default OFF preserves
-# the pre-archive behaviour byte-for-byte.
+# VKOP_STRIP_BUILTIN_SHADERS=ON (the default) drops the SPIR-V bytes from
+# libvkop entirely: spv_to_c.py writes a 1-byte placeholder with _len=0 for
+# every symbol, and shaders come from the model instead. onnx2vkop embeds the
+# per-model archive in the .vkopbin by default, so Runtime::LoadModel has
+# everything it needs from the single file; a model converted with
+# --no-embed-shaders needs VKOP_SHADER_ARCHIVE pointing at a vkop_shaders.bin
+# (the archive build below always produces one), and LoadModel throws with a
+# message saying so rather than failing later on a null pipeline.
+#
+# OFF restores the pre-archive layout: libvkop carries every shader byte for
+# every backend (~2.7 MB of .rodata per consumer) whether or not the model
+# uses it.
 option(VKOP_STRIP_BUILTIN_SHADERS
        "Emit stub C arrays in place of the SPIR-V bytes; requires a shader archive at runtime"
-       OFF)
+       ON)
 if(VKOP_STRIP_BUILTIN_SHADERS)
     set(VKOP_STUB_ENV "VKOP_STUB_SPIRV=1")
 else()
