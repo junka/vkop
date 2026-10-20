@@ -4707,9 +4707,54 @@ class FusionOptimizer:
         producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
         chainable = FusionOptimizer._FUSED_OP_CODES.keys()
 
+        # FusedElemwise has fp16/fp32 kernels only: the shader loads each leaf
+        # input as fp16 or fp32 off a 1-bit flag, chosen at execute() from the
+        # live input's dtype (ops/FusedElemwise.hpp:226 -- uint16_t -> 1, else
+        # 0). A non-float tensor would therefore be read with the wrong stride
+        # and element width: an int64 chain -- the shape-meta arithmetic over
+        # Shape/Gather/Range results -- came out of the fp16 kernel as garbage,
+        # and the garbage then null-cast its int64 reader (as_tensor<int64_t>
+        # returns nullptr, so e.g. the Gather indexing the pos_embed
+        # interpolation table segfaulted inside copyToCPU).
+        #
+        # Nothing is lost by not fusing them: int64 Add/Mul/Div run on the CPU
+        # path, Shape/Gather/Concat/Cast are the ops the host-shape resolver
+        # understands, and these chains have no dispatch to save (they are a
+        # handful of nodes either way).
+        _FLOAT_ELEM_TYPES = {1, 10, 11, 16}  # float32/float16/float64/bfloat16
+
+        def is_scalar_init(tname) -> bool:
+            """A single-element initializer among the leaves.
+
+            Its value is carried in the fused node's `scalars` program block
+            and read from there (operand code >= 100), never from its bytes,
+            so its storage dtype is irrelevant to the kernel.
+            """
+            init = dag_model.initializers.get(tname)
+            if init is None:
+                return False
+            n = 1
+            for d in init.dims:
+                n *= d
+            return len(init.dims) == 0 or n == 1
+
+        def float_typed(td) -> bool:
+            """False only for a tensor that DECLARES a non-float dtype.
+
+            A dict with no dtype (a tensor the converter could not resolve) is
+            allowed through: that is the pre-existing behaviour, and missing a
+            fusion is a far cheaper error than fusing a tensor we cannot read.
+            """
+            code = td.get("dtype") if isinstance(td, dict) else None
+            if not isinstance(code, int) or code == 0:  # 0 = UNDEFINED
+                return True
+            return code in _FLOAT_ELEM_TYPES or is_scalar_init(td.get("name"))
+
         def is_chainable(node):
             return node is not None and node.op_type in chainable and \
-                len(node.inputs) >= 1 and len(node.outputs) == 1
+                len(node.inputs) >= 1 and len(node.outputs) == 1 and \
+                float_typed(node.outputs[0]) and \
+                all(float_typed(td) for td in node.inputs)
 
         def single_consumer(tensor_name, exclude_node):
             """True if tensor_name has exactly one consumer and it is exclude_node."""

@@ -96,6 +96,36 @@ def make_chain_with_scalar():
     return m
 
 
+def make_int64_chain(non_float=("A", "B", "t1", "t2", "out")):
+    """Add(A,B)->t1; Mul(t1,A)->t2; Div(t2,B)->out, with `non_float` declaring
+    elem_type 7 (INT64) instead of leaving the dtype unset.
+
+    This is the shape-meta arithmetic over Shape/Gather/Range results: same
+    ops, same shape, but the tensors are integers.
+    """
+    m = DAGBasedModel()
+
+    def td(name, dims):
+        d = tdict(name, dims)
+        if name in non_float:
+            d["dtype"] = 7  # TensorProto.INT64
+        return d
+
+    A = td("A", [8])
+    B = td("B", [8])
+    t1 = td("t1", [8])
+    t2 = td("t2", [8])
+    out = td("out", [8])
+    for n in (Node("Add", "Add_0", {}, [A, B], [t1]),
+              Node("Mul", "Mul_0", {}, [t1, A], [t2]),
+              Node("Div", "Div_0", {}, [t2, B], [out])):
+        m.nodes[n.name] = n
+    m.inputs = [A, B]
+    m.outputs = [out]
+    m.build_dependencies()
+    return m
+
+
 def run_fusion(m):
     opt = FusionOptimizer.create_default_optimizer(max_rounds=5)
     stats = opt.optimize(m, verbose=False)
@@ -185,3 +215,43 @@ def test_scalar_constant():
     # reg1 from it, but the operand path uses the 100+ scalar; harmless).
     assert [i["name"] for i in f.inputs] == ["A", "two"]
     print("  PASS (scalar constant encoded as operand 100+)")
+
+
+def test_float_chain_fuses():
+    """Baseline for the two tests below: the same chain DOES fuse when the
+    tensors declare a float dtype."""
+    m = make_int64_chain(non_float=())
+    m = run_fusion(m)
+    fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
+    assert len(fused) == 1, f"expected 1 fused, got {len(fused)}; nodes={[n.op_type for n in m.nodes.values()]}"
+    print("  PASS (fp chain fuses)")
+
+
+def test_non_float_chain_not_fused():
+    """An int64 chain must survive unfused.
+
+    FusedElemwise has fp16/fp32 kernels only: the shader picks one off a 1-bit
+    flag read from the live input's dtype (ops/FusedElemwise.hpp), so an int64
+    input is loaded at the wrong element width and comes out as garbage. On the
+    dynamic-grid visual export the shape-meta Add/Mul chains over Shape/Gather
+    results are exactly this, and the garbage then null-cast its int64 reader
+    (as_tensor<int64_t> returns nullptr) inside copyToCPU.
+    """
+    m = make_int64_chain()
+    m = run_fusion(m)
+    fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
+    assert not fused, f"int64 chain must not fuse; got {[f.name for f in fused]}"
+    # The three ops are still there, untouched.
+    optypes = sorted(n.op_type for n in m.nodes.values())
+    assert optypes == ["Add", "Div", "Mul"], optypes
+    print("  PASS (int64 chain left alone)")
+
+
+def test_one_non_float_leaf_blocks_the_chain():
+    """Every input and the output is checked, not just one of them: a single
+    int64 leaf is enough (it would be bound as an SSBO and preloaded)."""
+    m = make_int64_chain(non_float=("B",))
+    m = run_fusion(m)
+    fused = [n for n in m.nodes.values() if n.op_type == "FusedElemwise"]
+    assert not fused, f"one int64 leaf must block the chain; got {[f.name for f in fused]}"
+    print("  PASS (one int64 leaf blocks the chain)")
