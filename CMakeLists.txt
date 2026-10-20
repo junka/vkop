@@ -632,12 +632,21 @@ if (ENABLE_BENCHMARK)
 add_subdirectory(benchmark)
 endif ()
 
-# vkop_gpu_top -- rootless Intel GPU utilization monitor for profiling runs.
-# Reads per-engine busy time from /proc/<pid>/fdinfo and frequency/RC6 from
-# i915 GT sysfs (no perf_event, no root), in the style of intel_gpu_top.
-# Deliberately links nothing: it is pure /proc + sysfs, so it builds and runs
-# independently of the runtime and of the GPU stack.
+# vkop_gpu_top -- rootless GPU utilization monitor for profiling runs. Reads
+# cumulative per-client busy time from whatever the OS already accounts for
+# without privileges: /proc/<pid>/fdinfo plus i915 GT sysfs on Linux (no
+# perf_event, no root), the AGX GPU-client nodes in the IORegistry on macOS (no
+# powermetrics, no root). In the style of intel_gpu_top / nvtop.
+# Deliberately links nothing but libc (plus IOKit on macOS), so it builds and
+# runs independently of the runtime and of the GPU stack.
 add_executable(vkop_gpu_top tools/vkop_gpu_top.cpp)
+if (APPLE)
+    target_sources(vkop_gpu_top PRIVATE tools/gpu_top_darwin.cpp)
+    target_link_libraries(vkop_gpu_top PRIVATE "-framework IOKit"
+                                               "-framework CoreFoundation")
+else()
+    target_sources(vkop_gpu_top PRIVATE tools/gpu_top_linux.cpp)
+endif()
 
 if (ENABLE_TESTS)
 enable_testing()
