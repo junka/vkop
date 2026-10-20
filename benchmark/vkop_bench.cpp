@@ -31,9 +31,10 @@
 // shape wins over --shape (the file records its dims).
 //
 // Composition with the pipeline cache / shader archive / stripped build:
-// the binary respects VK_PIPELINE_CACHE, VKOP_SHADER_ARCHIVE, and
-// MESA_SHADER_CACHE_DISABLE the same way llm_chat does. Bench in the
-// deployment's env, not this binary's default.
+// the binary respects VK_PIPELINE_CACHE and MESA_SHADER_CACHE_DISABLE the
+// same way llm_chat does, and takes its shaders from the model it was handed
+// (see the shader-archive line it prints). Bench in the deployment's env,
+// not this binary's default.
 
 #include <algorithm>
 #include <chrono>
@@ -733,10 +734,11 @@ int main(int argc, char **argv) {
     std::printf("load:     %.1f ms\n", load_ms);
     std::printf("pipeline-cache: %s\n",
                 std::getenv("VK_PIPELINE_CACHE") ? "on" : "off");
-    std::printf("shader-archive: %s",
-                rt->shader_archive_source().empty()
-                    ? "none (libvkop-embedded SPIR-V)"
-                    : rt->shader_archive_source().c_str());
+    std::printf("shader-archive: %s", rt->shader_archive_entries()
+                                          ? "<model>"
+                                          : "none (the model carries no "
+                                            "archive; a stripped libvkop will "
+                                            "fail to build its ops)");
     if (rt->shader_archive_entries()) {
         std::printf(" (%zu entries)", rt->shader_archive_entries());
     }

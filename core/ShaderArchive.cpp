@@ -105,32 +105,34 @@ ShaderArchive::lookup(const std::string &key) const {
             it->second.size};
 }
 
+namespace {
+// The one archive the whole process can fall back on, owned here for the
+// process lifetime so an operator's pointer into it stays valid. Only
+// include/dev_shaders.hpp installs one.
+std::unique_ptr<ShaderArchive> &process_default_slot() {
+    static std::unique_ptr<ShaderArchive> slot;
+    return slot;
+}
+} // namespace
+
 const ShaderArchive *ShaderArchive::process_default() {
-    // Function-local static: the environment is read once per process on first
-    // need, and C++11 guarantees the initialisation is thread-safe. A bad path
-    // is reported once here rather than per op.
-    static const std::unique_ptr<ShaderArchive> archive = [] {
-        const char *path = std::getenv("VKOP_SHADER_ARCHIVE");
-        if (path == nullptr || path[0] == '\0') {
-            return std::unique_ptr<ShaderArchive>{};
-        }
-        auto opened = ShaderArchive::open(path);
-        if (!opened) {
-            std::fprintf(stderr,
-                         "[shaders] VKOP_SHADER_ARCHIVE=%s is not a usable "
-                         "archive; ops built outside LoadModel keep their "
-                         "stubbed SPIR-V\n",
-                         path);
-            return std::unique_ptr<ShaderArchive>{};
-        }
-        if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
-            std::fprintf(stderr,
-                         "[shaders] process-default opened %s (%zu entries)\n",
-                         path, opened->entry_count());
-        }
-        return opened;
-    }();
-    return archive.get();
+    return process_default_slot().get();
+}
+
+void ShaderArchive::set_process_default(const std::string &path) {
+    auto opened = ShaderArchive::open(path);
+    if (!opened) {
+        std::fprintf(stderr,
+                     "[shaders] dev archive %s is not a usable VKSP file; ops "
+                     "built outside LoadModel keep their stubbed SPIR-V\n",
+                     path.c_str());
+        return;
+    }
+    if (std::getenv("VKOP_SHADER_DEBUG")) {
+        std::fprintf(stderr, "[shaders] dev archive opened %s (%zu entries)\n",
+                     path.c_str(), opened->entry_count());
+    }
+    process_default_slot() = std::move(opened);
 }
 
 } // namespace core

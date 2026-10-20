@@ -250,10 +250,9 @@ endif()
 # libvkop's own SPIR-V is stubbed out by default (VKOP_STRIP_BUILTIN_SHADERS=ON),
 # so a binary that builds operators without a model file -- this whole suite,
 # the probes, bench_matmul -- has to be handed the build tree's archive. CMake
-# bakes its path in and setup.cpp seeds VKOP_SHADER_ARCHIVE from it; see
-# include/dev_shaders.hpp for why this is dev-only and why an explicit
-# VKOP_SHADER_ARCHIVE still wins. The dependency is what guarantees the archive
-# exists before the tests run.
+# bakes its path in and setup.cpp installs it as the process default; see
+# include/dev_shaders.hpp for why this is dev-only. The dependency is what
+# guarantees the archive exists before the tests run.
 set(VKOP_DEV_ARCHIVE_DEF
     "VKOP_DEV_SHADER_ARCHIVE=\"${VKOP_SHADER_ARCHIVE_FILE}\"")
 add_dependencies(all_tests shader_archive)

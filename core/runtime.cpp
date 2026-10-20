@@ -193,57 +193,35 @@ void Runtime::LoadModel() {
 
     auto model = load::VkModel(model_path_);
 
-    // SPIR-V source, in precedence order:
-    //   1. VKOP_SHADER_ARCHIVE=<path> — an explicit override, e.g. to run a
-    //      model against a rebuilt archive without reconverting it.
-    //   2. the archive the .vkopbin itself carries (onnx2vkop embeds one by
-    //      default), which is what makes a single .vkopbin deployable.
-    //   3. nothing — ops keep their ctor-assigned embedded C arrays.
-    // A missing or malformed archive at any step is not fatal: we fall
-    // through to the next source, matching the pre-archive behaviour. Debug
-    // mode reports the outcome either way so a mis-set env is visible.
-    const char *apath = std::getenv("VKOP_SHADER_ARCHIVE");
-    if (apath != nullptr && apath[0] != '\0') {
-        shader_archive_ = ShaderArchive::open(apath);
-        if (shader_archive_) {
-            shader_archive_source_ = apath;
-        } else {
-            std::fprintf(stderr,
-                         "[shaders] VKOP_SHADER_ARCHIVE=%s is not a usable "
-                         "archive; falling back\n",
-                         apath);
-        }
-    }
-    const bool embedded_ok = model.shader_archive_size > 0 &&
-                             std::getenv("VKOP_NO_EMBEDDED_SHADERS") == nullptr;
-    if (!shader_archive_ && embedded_ok) {
+    // SPIR-V source: the archive the .vkopbin itself carries. onnx2vkop
+    // always embeds one, and libvkop is built with
+    // VKOP_STRIP_BUILTIN_SHADERS=ON, so this is the only place a shipping
+    // binary can get shaders from -- that is the single-file property, and
+    // there is deliberately no environment override that could quietly
+    // substitute different kernels at run time. A model without an archive
+    // (an old file, or one converted before the master archive existed)
+    // leaves every op on its stub array and fails loudly at op build time.
+    // Ops built outside LoadModel -- unit fixtures, probes -- get theirs from
+    // ShaderArchive::process_default(), installed by include/dev_shaders.hpp.
+    if (model.shader_archive_size > 0) {
         shader_archive_ = ShaderArchive::open_from_memory(
             model.shader_archive_memory, model.shader_archive_size);
-        if (shader_archive_) {
-            shader_archive_source_ = "<model>";
-        } else {
+        if (!shader_archive_) {
             std::fprintf(stderr,
                          "[shaders] %s carries a shader archive blob that is "
-                         "not a usable VKSP archive; falling back to the "
-                         "embedded SPIR-V\n",
+                         "not a usable VKSP archive; every op will fail on its "
+                         "stubbed SPIR-V. Reconvert it with onnx2vkop.\n",
                          model_path_.c_str());
         }
     }
-    if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+    if (std::getenv("VKOP_SHADER_DEBUG")) {
         if (shader_archive_) {
             std::fprintf(stderr, "[shaders] opened %s (%zu entries)\n",
-                         apath && apath[0] ? apath : "<model-embedded>",
-                         shader_archive_->entry_count());
+                         model_path_.c_str(), shader_archive_->entry_count());
         } else if (model.shader_archive_size == 0) {
             std::fprintf(stderr,
-                         "[shaders] %s carries no shader archive; using the "
-                         "SPIR-V linked into libvkop\n",
-                         model_path_.c_str());
-        } else {
-            std::fprintf(stderr,
-                         "[shaders] %s's shader archive disabled by "
-                         "VKOP_NO_EMBEDDED_SHADERS; using the SPIR-V linked "
-                         "into libvkop\n",
+                         "[shaders] %s carries no shader archive; there is no "
+                         "other source on a stripped libvkop\n",
                          model_path_.c_str());
         }
     }
@@ -1224,12 +1202,11 @@ void Runtime::LoadModel() {
             // override_spv(); those secondaries never pass through spv_ and
             // would otherwise read the stub placeholder on a stripped build.
             op->set_shader_archive(shader_archive_.get());
-            // If VKOP_SHADER_ARCHIVE is loaded, replace this op's SPIR-V
-            // pointer with the mapped archive range before the pipeline is
-            // built. A miss on the archive (e.g. an op whose name isn't in
-            // the static key table, or a variant the packer skipped) leaves
-            // the ctor-assigned embedded bytes in place, so an incomplete
-            // archive still runs.
+            // Replace this op's SPIR-V pointer with the mapped archive range
+            // before the pipeline is built. A miss (an op whose name isn't in
+            // the key table, or a key the converter's subset skipped) leaves
+            // the placeholder in place, and Operator's stub check then fails
+            // with the op and the key named.
             if (shader_archive_) {
                 const vkop::core::KernelPlan *plan = nullptr;
                 auto key = kernel_key_for_node(n, type, op_fp16, &plan);
@@ -1237,7 +1214,7 @@ void Runtime::LoadModel() {
                     auto [spv, len] = shader_archive_->lookup(key);
                     if (spv) {
                         op->override_spv(spv, len);
-                        if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                        if (std::getenv("VKOP_SHADER_DEBUG")) {
                             std::fprintf(stderr,
                                          "[shaders] hit key=%s len=%u op=%s "
                                          "(from %s)\n",
@@ -1245,8 +1222,7 @@ void Runtime::LoadModel() {
                                          plan ? "kernel plan"
                                               : "built-in table");
                         }
-                    } else if (plan != nullptr &&
-                               shader_archive_source_ == "<model>") {
+                    } else if (plan != nullptr) {
                         // The model's own embedded subset lacks a key its own
                         // plan lists. That is a converter bug (the two are
                         // built from the same rows), and under
@@ -1261,13 +1237,13 @@ void Runtime::LoadModel() {
                             "with onnx2vkop; the run will fail with a "
                             "stubbed SPIR-V error.\n",
                             model_path_.c_str(), key.c_str(), n.name.c_str());
-                    } else if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                    } else if (std::getenv("VKOP_SHADER_DEBUG")) {
                         std::fprintf(stderr,
                                      "[shaders] miss key=%s op=%s, using "
                                      "embedded\n",
                                      key.c_str(), n.name.c_str());
                     }
-                } else if (std::getenv("VKOP_SHADER_ARCHIVE_DEBUG")) {
+                } else if (std::getenv("VKOP_SHADER_DEBUG")) {
                     std::fprintf(
                         stderr, "[shaders] no key for op_type=%s op=%s\n",
                         vkop::ops::convert_optype_to_string(type).c_str(),

@@ -24,12 +24,12 @@ except ImportError:
     import shader_map
 
 # filter_shaders may or may not be on sys.path yet (the block above appends
-# tools/ when it exists); import lazily so a CLI invocation without
-# --emit-shader-archive keeps working even if tools/ is missing.
+# tools/ when it exists); import lazily so a conversion still works, with a
+# warning, in a checkout whose tools/ is missing.
 try:
     import filter_shaders
 except ImportError:
-    filter_shaders = None  # checked below when --emit-shader-archive is used
+    filter_shaders = None  # build_embedded_archive reports it and moves on
 
 
 def build_shader_subset(dag_model, master_path, backend="auto"):
@@ -87,9 +87,9 @@ def report_missing_keys(missing, master_path):
 def emit_shader_archive(dag_model, master_path, out_path, backend="auto"):
     """Write a per-model vkop_shaders.bin subset at out_path.
 
-    The standalone-file spelling of what --embed-shaders puts in the
-    .vkopbin: same key set, same bytes, kept for callers that deploy the
-    archive separately (VKOP_SHADER_ARCHIVE).
+    Not part of conversion: a model always carries its own copy (see
+    embed_shader_archive). Kept for tooling that wants to inspect or diff the
+    subset the converter would pick, e.g. a size report.
     """
     subset, missing, master_count = build_shader_subset(
         dag_model, master_path, backend)
@@ -141,9 +141,10 @@ def newest_shader_source(root):
 def embed_shader_archive(dag_model, master_path, backend="auto"):
     """Build the per-model VKSP subset and return it as bytes to embed.
 
-    The .vkopbin then carries its own shaders: Runtime::LoadModel picks it up
-    without VKOP_SHADER_ARCHIVE, and a libvkop built with
-    VKOP_STRIP_BUILTIN_SHADERS=ON can still run the model.
+    The .vkopbin then carries its own shaders: Runtime::LoadModel takes them
+    from the file -- there is no other source on a libvkop built with
+    VKOP_STRIP_BUILTIN_SHADERS=ON (the default) -- and the same rows decide
+    which keys the runtime looks up (Model.kernel_plans).
     """
     subset, missing, master_count = build_shader_subset(
         dag_model, master_path, backend)
@@ -174,10 +175,11 @@ def build_embedded_archive(args, dag_model, backend):
     """Resolve the master archive and return the subset to embed, or None.
 
     Every failure path here is a warning plus a None return, never an abort:
-    a model whose .vkopbin lacks the archive still runs against the SPIR-V
-    linked into libvkop, which is exactly the pre-embedding behaviour. The
-    one caller that must not silently proceed (--emit-shader-archive, which
-    has nothing to write) checks for None itself.
+    conversion always produces a model file, and a model whose .vkopbin lacks
+    the archive still loads against a libvkop built with
+    VKOP_STRIP_BUILTIN_SHADERS=OFF. On the default (stripped) build it will
+    instead fail at op build time with the op and key named, which is why the
+    no-archive case is worth printing loudly here.
     """
     if filter_shaders is None:
         print(f"[shaders] no filter_shaders.py under {_TOOLS}; converting "
@@ -191,8 +193,8 @@ def build_embedded_archive(args, dag_model, backend):
             "build-strip/vkop_shaders.bin); converting without an embedded "
             "archive. libvkop is built with VKOP_STRIP_BUILTIN_SHADERS=ON by "
             "default and carries no SPIR-V of its own, so this .vkopbin will "
-            "need VKOP_SHADER_ARCHIVE=<vkop_shaders.bin> at run time. Pass "
-            "--no-embed-shaders to silence this.",
+            "not be runnable: build the archive (cmake --build <dir> --target "
+            "shader_archive) and reconvert.",
             file=sys.stderr,
         )
         return None
@@ -256,26 +258,13 @@ Examples:
         "--version", action="version", version=f"%(prog)s {__import__('onnx2vkop').__version__}"
     )
     parser.add_argument(
-        "--no-embed-shaders", action="store_true",
-        help="Do not embed the per-model SPIR-V archive in the .vkopbin. The "
-             "model is then no longer a single self-contained file: libvkop "
-             "built with VKOP_STRIP_BUILTIN_SHADERS=ON (the default) has no "
-             "SPIR-V of its own, so the deployment must supply "
-             "VKOP_SHADER_ARCHIVE=<vkop_shaders.bin>, or the model must be run "
-             "against a libvkop built with that option OFF.",
-    )
-    parser.add_argument(
-        "--emit-shader-archive", metavar="PATH",
-        help="Additionally write the same per-model vkop_shaders.bin subset "
-             "to PATH as a standalone file, for deployments that hand the "
-             "archive to VKOP_SHADER_ARCHIVE instead of relying on the copy "
-             "embedded in the .vkopbin.",
-    )
-    parser.add_argument(
         "--master-archive", metavar="PATH",
-        help="Path to the full vkop_shaders.bin the CMake build produced. "
-             "Defaults to $VKOP_MASTER_ARCHIVE, then build/vkop_shaders.bin "
-             "or build-strip/vkop_shaders.bin next to this checkout.",
+        help="Path to the full vkop_shaders.bin the CMake build produced, the "
+             "source the per-model subset embedded in the .vkopbin is filtered "
+             "from. Defaults to $VKOP_MASTER_ARCHIVE, then "
+             "build/vkop_shaders.bin or build-strip/vkop_shaders.bin next to "
+             "this checkout. There is no runtime equivalent: the model carries "
+             "its own shaders, and nothing at run time can substitute others.",
     )
     parser.add_argument(
         "--target-backend", choices=["auto", "buffer", "image"], default="auto",
@@ -396,44 +385,26 @@ def main():
         for idx, (op_type, count) in enumerate(op_stats.items(), 1):
             print(f"{idx:<5} {op_type:<20} {count:<10}")
 
-        # Build the model's own shader subset once, then use the same bytes
-        # both for the embedded copy and (if asked) the standalone file. The
-        # graph has to be final by now -- the key set is derived from the op
-        # census, and FusionOptimizer already ran inside apply_optimizations.
+        # Build the model's own shader subset, derived from the op census the
+        # graph has now. It has to happen here and not later: the key set comes
+        # from the final op set, and FusionOptimizer already ran inside
+        # apply_optimizations.
         backend = args.target_backend
-        shader_blob = None
-        if not args.no_embed_shaders or args.emit_shader_archive:
-            shader_blob = build_embedded_archive(args, dag_model, backend)
+        shader_blob = build_embedded_archive(args, dag_model, backend)
 
         # Save the converted model
         dag_model.save_to_binary(str(output_path), shader_archive=shader_blob)
 
-        if shader_blob is None and args.no_embed_shaders:
+        if shader_blob is None:
             print(
-                "[shaders] --no-embed-shaders: this .vkopbin carries no "
-                "shaders. libvkop is built with "
-                "VKOP_STRIP_BUILTIN_SHADERS=ON by default, so run it with "
-                "VKOP_SHADER_ARCHIVE=<vkop_shaders.bin> (or against a libvkop "
-                "built with that option OFF), otherwise LoadModel refuses the "
-                "op with a stubbed-SPIR-V error.",
+                "[shaders] this .vkopbin carries no shaders and will not run "
+                "against libvkop built with VKOP_STRIP_BUILTIN_SHADERS=ON (the "
+                "default); it needs a libvkop built with that option OFF.",
                 file=sys.stderr,
             )
 
         print("\nConversion completed successfully!")
         print(f"Output file size: {output_path.stat().st_size:,} bytes")
-
-        if args.emit_shader_archive:
-            if shader_blob is None:
-                print(
-                    "Error: --emit-shader-archive produced no archive (no "
-                    "master vkop_shaders.bin was found, or the graph needs no "
-                    "shaders); pass --master-archive PATH.",
-                    file=sys.stderr,
-                )
-                sys.exit(2)
-            Path(args.emit_shader_archive).write_bytes(shader_blob)
-            print(f"[shaders] wrote {args.emit_shader_archive}: "
-                  f"{len(shader_blob):,} bytes")
 
     except Exception as e:
         print(f"\nError during conversion: {e}")

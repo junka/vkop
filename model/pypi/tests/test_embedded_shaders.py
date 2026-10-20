@@ -2,11 +2,11 @@
 
 onnx2vkop embeds a per-model SPIR-V subset (the VKSP layout of
 tools/filter_shaders.py) in Model.shader_archive, so one file is enough to
-deploy: Runtime::LoadModel prefers VKOP_SHADER_ARCHIVE, then this blob, then
-the SPIR-V linked into libvkop. The C++ half is covered by ModelTest running
-against a fixture the CMake build converts (and by the same fixture passing in
-build-strip, where the linked-in arrays are stubs and the embedded archive is
-the only source of shaders).
+deploy: Runtime::LoadModel takes every op's shaders from it, which is the only
+source on a libvkop built with VKOP_STRIP_BUILTIN_SHADERS=ON (the default).
+The C++ half is covered by ModelTest running against a fixture the CMake build
+converts (and by the same fixture passing in build-strip, where the linked-in
+arrays are stubs and the embedded archive is the only source of shaders).
 
 These tests pin the writer/reader contract at the boundary the C++ side
 reads: field present and byte-identical, absent when not asked for,
@@ -245,33 +245,22 @@ def test_cli_embeds_by_default(tmp_path, monkeypatch):
     assert read_master_names(blob) >= {"buffer_add", "image_add"}
 
 
-def test_cli_no_embed_flag_leaves_the_model_bare(tmp_path, monkeypatch):
-    master, _ = fake_master(tmp_path, ["buffer_add", "image_add"])
+def test_cli_without_a_master_archive_reports_an_unrunnable_model(
+        tmp_path, monkeypatch, capsys):
+    """A conversion with no master archive to filter from cannot embed shaders,
+    and on the default stripped libvkop that model is unrunnable -- which has
+    to be said at conversion time, not discovered at LoadModel. Simulated by
+    hiding filter_shaders.py, which is the one reason the subset cannot be
+    built at all."""
     src = _write_tiny_onnx(tmp_path / "tiny.onnx")
     out = tmp_path / "bare.vkopbin"
+    monkeypatch.setattr(cli, "filter_shaders", None)
     monkeypatch.setattr(sys, "argv", [
         "onnx2vkop", "-i", str(src), "-o", str(out),
-        "--master-archive", str(master), "--no-embed-shaders",
     ])
     cli.main()
     assert read_embedded(out) == b""
-
-
-def test_cli_emit_shader_archive_writes_the_same_bytes(tmp_path, monkeypatch):
-    """--emit-shader-archive is now the standalone spelling of the same
-    subset; the file and the embedded copy must not drift."""
-    master, _ = fake_master(
-        tmp_path, ["buffer_add", "buffer_add_fp16", "image_add",
-                   "image_add_fp16"])
-    src = _write_tiny_onnx(tmp_path / "tiny.onnx")
-    out = tmp_path / "tiny.vkopbin"
-    side = tmp_path / "tiny.vkopbin.shaders.bin"
-    monkeypatch.setattr(sys, "argv", [
-        "onnx2vkop", "-i", str(src), "-o", str(out),
-        "--master-archive", str(master), "--emit-shader-archive", str(side),
-    ])
-    cli.main()
-    assert side.read_bytes() == read_embedded(out)
+    assert "will not run" in capsys.readouterr().err
 
 
 def test_shader_map_covers_a_union_of_backends():

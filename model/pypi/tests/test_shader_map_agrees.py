@@ -1,6 +1,6 @@
 """shader_map.py and core/ShaderKeys.hpp must describe the same op → shader table.
 
-The Python side drives onnx2vkop's `--emit-shader-archive` per-model filtering;
+The Python side drives onnx2vkop's per-model archive filtering;
 the C++ side drives Runtime::LoadModel's post-create_from_type `override_spv()`
 lookup. A divergence between them is silent at conversion time and shows up
 later as either:

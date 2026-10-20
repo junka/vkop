@@ -152,20 +152,16 @@ class Runtime {
     void LoadPipelineCache();
     void SavePipelineCache();
 
-    // SPIR-V source for this model, in precedence order: VKOP_SHADER_ARCHIVE
-    // (an explicit override), else the archive the .vkopbin itself carries
-    // (onnx2vkop embeds one by default), else null -- ops then keep their
-    // ctor-assigned embedded symbols. The archive is memory-mapped for the
-    // file form and copied out of the model mmap for the embedded form, so
-    // only the shader blobs a model actually fires become resident: this is
-    // the trtexec-style "extract only what's needed" property that avoids
-    // baking every libvkop shader into every driver binary.
+    // SPIR-V source for this model: the archive the .vkopbin itself carries.
+    // onnx2vkop always embeds one, and libvkop is stripped by default, so this
+    // is the only source a shipping binary has -- there is deliberately no
+    // environment override, which could otherwise substitute different kernels
+    // at run time. Null means the model has no archive: every op then keeps
+    // its placeholder array and fails by name at build time. The archive is
+    // copied out of the model mmap, so only the shader blobs a model actually
+    // fires become resident: the trtexec-style "extract only what's needed"
+    // property that avoids baking every libvkop shader into every driver.
     std::unique_ptr<ShaderArchive> shader_archive_;
-
-    // Where shader_archive_ came from: the env path, "<model>" for the
-    // embedded copy, or "" when there is none. Diagnostics only (vkop-bench
-    // prints it, VKOP_SHADER_ARCHIVE_DEBUG logs it).
-    std::string shader_archive_source_;
 
     // The kernel selection the .vkopbin records (Model.kernel_plans), copied
     // out of the transient load::VkModel because ops outlive it. Empty for a
@@ -181,13 +177,8 @@ class Runtime {
                                     const vkop::core::KernelPlan **plan) const;
 
   public:
-    // e.g. "/path/to/llm.vkopbin.shaders.bin", "<model>" or "". The bench
-    // reports this so an A/B that meant to exercise the archive can tell
-    // whether it actually loaded one.
-    const std::string &shader_archive_source() const {
-        return shader_archive_source_;
-    }
-    // Entry count of the loaded archive, 0 when there is none.
+    // Entry count of the loaded archive, 0 when there is none. The bench
+    // reports this so an A/B can tell whether the model actually carried one.
     size_t shader_archive_entries() const {
         return shader_archive_ ? shader_archive_->entry_count() : 0;
     }

@@ -375,7 +375,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
 | `VK_PIPELINE_CACHE=1` | 任意驱动都认：把 pipeline 序列化进 `<model>.vkopbin.pcache`。llm 上 `vkop-bench --time-load-only` 实测 4083.8 → 1512.4 ms，但**只有配 `MESA_SHADER_CACHE_DISABLE=1` 才看得出来**；开着 Mesa 时两侧只差 ~70 ms，会把 vkop 的贡献完全掩盖 |
-| `VKOP_SHADER_ARCHIVE=<path>` | 覆盖式指定归档：**优先于**模型自带的那份。默认部署不需要它——`onnx2vkop` 现在把 per-model 子集直接嵌进 `.vkopbin`（见下），载入顺序是 `VKOP_SHADER_ARCHIVE` → 模型内嵌 → libvkop 链进去的 SPIR-V。`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit / miss / no key`，并在 `LoadModel` 时打 `opened <source> (N entries)` |
+| `VKOP_SHADER_DEBUG=1` | 逐 op 打 shader 来源：`hit key=… (from kernel plan|built-in table)` / `miss` / `no key`，并在 `LoadModel` 时打 `opened <model> (N entries)`。**没有**对应的运行期覆盖变量——shader 只从模型来，见下 |
 | `VKOP_KV_CACHE=1` | 仅 `llm_driver`：预分配每层 `VKOP_KV_MAX` 容量的 cache 并按该步长搬运历史，用来驱动 `has_cache` 形态的 `Attention`。在旋转形态（无 `has_cache`）的 vkopbin 上会直接拒绝而不是错跑 |
 | `VKOP_KV_MAX=<rows>` | 上一条的容量，默认 8192。**注意计时陷阱**：驱动会把 cap 步长的 staging 清零，8192 行 × 28 层 ≈ 938 MB，在 `past_len=0` 上白烧 ~39 ms，看起来像 attention 融合变慢了。实测 fused cap=8192 → 125.63 ms、cap=64 → 86.70 ms、旋转形式 → 94.33 ms；数值与 cap 无关（两档都是 max 0.2305 / mean 0.04192） |
 
@@ -407,47 +407,39 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 `.shaders.bin`：
 
 ```bash
-# 默认即内嵌（--master-archive 只是指定从哪张 master 里筛；缺省顺序是
-# $VKOP_MASTER_ARCHIVE → build/vkop_shaders.bin → build-strip/vkop_shaders.bin）
+# --master-archive 只是指定从哪张 master 里筛；缺省顺序是
+# $VKOP_MASTER_ARCHIVE → build/vkop_shaders.bin → build-strip/vkop_shaders.bin
 python3 -m onnx2vkop.cli -i llm/exporter/llm.onnx -o llm/exporter/llm.vkopbin
 VKOP_KV_CACHE=1 VKOP_KV_MAX=64 build/llm_driver llm/exporter/llm.vkopbin \
   llm/exporter/decode_dump
-
-# 只想拷模型、或想自己管归档路径（archive 会被 check 成 VKSP，文件形式仍可用）
-python3 -m onnx2vkop.cli -i m.onnx -o m.vkopbin --no-embed-shaders \
-  --emit-shader-archive m.vkopbin.shaders.bin   # 两个 flag 合起来 = 旧的分离流程
-VKOP_SHADER_ARCHIVE=m.vkopbin.shaders.bin build/llm_driver m.vkopbin decode_dump
 ```
 
-载入时的取值顺序是 `VKOP_SHADER_ARCHIVE` → 模型内嵌 → libvkop 链进去的 SPIR-V。
-env 是**覆盖**而不是 fallback：想 A/B 一张新 master 上的子集，直接设 env 即可，不用重转模型。
-`--emit-shader-archive`（不带 `--no-embed-shaders`）写出的字节和嵌进 vkopbin 的
-**逐字节相同**，所以把两者都留着也不会漂移。
+运行期**没有任何**替换 shader 的开关：既没有环境变量，也没有 CLI flag。这就是单文件
+的意义——profile 跑的就是部署跑的那份 kernel，不存在"环境里那张旧归档悄悄生效"的
+错配。代价是换 shader 必须重转（转换本身很快，`--master-archive` 指到新的 master 即可）。
 
 和归档一起写进文件的还有 **kernel 选择本身**：`Model.kernel_plans` 是去重后的
 per-op_type 行（四个 post-fallback cell `image`/`image_fp16`/`buffer`/`buffer_fp16`
 加 `variants`），`Node.plan` 索引自己那一行（`-1` = 该 op 无 shader，走 host）。
-`Runtime::LoadModel` 优先按 `Node.plan` 查 key（`VKOP_SHADER_ARCHIVE_DEBUG=1` 下
+`Runtime::LoadModel` 优先按 `Node.plan` 查 key（`VKOP_SHADER_DEBUG=1` 下
 `hit key=… (from kernel plan)`；老模型没有 plan 字段时仍退回
 `core/ShaderKeys.hpp` 的表，行为不变）。这样"哪个 op 用哪个 kernel"只有一份答案：
 归档是按同一张表筛的，`build/tests/KernelPlanTest` 拿真实转换出的 vkopbin 验证
 每个 plan cell 在模型自己的内嵌归档里都有——这正是 stripped 构建能只带模型跑的前提。
 
-`VKOP_STRIP_BUILTIN_SHADERS=ON` 现在是**默认**：libvkop 里每个 `*_spv[]` 都是
-1 字节桩（`_len = 0`），SPIR-V 只从模型来。所以内嵌归档不是可选项而是默认运行路径——
+`VKOP_STRIP_BUILTIN_SHADERS=ON` 是**默认**：libvkop 里每个 `*_spv[]` 都是
+1 字节桩（`_len = 0`），SPIR-V 只从模型来。所以内嵌归档不是可选项而是唯一的运行路径——
 单文件 vkopbin 在任何构建上都能独立跑（`ModelTest` 在 `build/` 和 `build-strip/` 上都
-验证了这条路）。反过来，用 `--no-embed-shaders` 转出来的模型（或归档比 master 旧/缺失
-时转出来的）在这种 lib 上**跑不起来**：`LoadModel` 会明确报
-`... has a stubbed SPIR-V array ...`，此时要么重转，要么给
-`VKOP_SHADER_ARCHIVE=<vkop_shaders.bin>`（`--master-archive`/`$VKOP_MASTER_ARCHIVE`
-能找到的那张 master 就行）。`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可以退回旧布局
-（每个 shader 都进 `.rodata`，约 2.7 MB/消费者）。
+验证了这条路）。反过来，老 writer 写出的、或转换时找不到 master 而没内嵌的模型在这种
+lib 上**跑不起来**：建 op 时就明确报 `... has a stubbed SPIR-V array ...` 并点名 op 和
+它要的 key，只能重转。`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可以退回旧布局（每个 shader
+都进 `.rodata`，约 2.7 MB/消费者），那时没内嵌归档的模型还能靠链进去的数组跑。
 
 单元测试、probe、`bench_matmul` 这类**不经模型**直接 `create_from_type()` 建算子的
 二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及 `MinMaxProbe`）
-从编译期注入的构建树路径 seed `VKOP_SHADER_ARCHIVE`，见
-[include/dev_shaders.hpp](../include/dev_shaders.hpp)。显式设置的
-`VKOP_SHADER_ARCHIVE` 优先级更高，所以想拿别的归档做 A/B 直接设环境变量即可。
+从编译期注入的构建树路径把归档装成进程默认，见
+[include/dev_shaders.hpp](../include/dev_shaders.hpp)。这是 dev-only 的：出货的
+`llm_driver`/`vkbench` 不 include 这个头，所以它们除了模型那份拿不到别的 shader。
 
 `--target-backend` 决定筛哪批 key（`auto` 是 buffer ∪ image，默认；pin 住一种能实打实省字节）：
 
@@ -457,16 +449,15 @@ python3 -m onnx2vkop.cli -i m.onnx -o m.vkopbin \
 ```
 
 默认 `auto` 是因为后端是**运行期**选择：`Runtime` 默认 image，而仓库里的 driver 都调
-`set_backend_buffer(true)`，猜错的那一半会让 op 悄悄回落到 libvkop 内嵌的 SPIR-V
-（stripped 构建上则直接抛桩）。多带的那一半不会 fault in——op 根本不会去查它——
-所以只有在意文件大小时才需要 pin。
+`set_backend_buffer(true)`，猜错的那一半会让 op 直接抛桩（没有可回落的 SPIR-V 了）。
+多带的那一半不会 fault in——op 根本不会去查它——所以只有在意文件大小时才需要 pin。
 
 同一张 master（`build/vkop_shaders.bin`，2,763,760 B / 135 条）上实测的子集大小：
 `cache_block` 99,472 B（3.6%）；resnet18 HEAD 转换 buffer 615,332 B（22.3%，13 条）
 vs image 342,124 B（12.4%，10 条）；llm 旋转形态 953,220 B（34.5%）；
 llm 融合形态 1,025,704 B（37.1%，41 条，比旋转形态多 `buffer_attention{,_fp16}`、
 少 `buffer_softmax{,_fp16}`）。转一个 `auto` 的小图对照：`model/add_conv_model.onnx`
-嵌 9/135 条 = 442,816 B（整个文件 444,768 B；`--no-embed-shaders` 时 1,952 B）。
+嵌 9/135 条 = 442,816 B（整个文件 444,768 B；空归档时 1,952 B）。
 
 
 ### Profiling 性能分析

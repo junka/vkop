@@ -208,12 +208,12 @@ vkop-bench: --device 99 out of range (0..1); use --list-devices
 | 变量 | 作用 |
 |---|---|
 | `VK_PIPELINE_CACHE=1` | 把 pipeline 序列化到 `<model>.vkopbin.pcache`；`=debug` 打印命中情况。llm 上实测 4083.8 → 1512.4 ms（**必须**配 `MESA_SHADER_CACHE_DISABLE=1` 才看得见，否则 Intel 自己的 disk cache 会把差别吃掉，看着只有 ~70 ms） |
-| `VKOP_SHADER_ARCHIVE=<path>` | 指定打包归档并**覆盖**模型自带的那份（顺序：env → `Model.shader_archive` → libvkop 内嵌的 SPIR-V，而最后这一级在默认构建里只剩桩）。`VKOP_SHADER_ARCHIVE_DEBUG=1` 逐 op 打 `hit/miss/no key`，并在载入时打 `opened <source> (N entries)`；`VKOP_NO_EMBEDDED_SHADERS=1` 忽略模型内嵌的那份 |
+| `VKOP_SHADER_DEBUG=1` | 逐 op 打 shader 来源：`hit key=… (from kernel plan)` / `miss` / `no key`，并在载入时打 `opened <model> (N entries)`。**没有**可以替换 shader 的变量——只从模型来（见下） |
 | `VKOP_SUBMIT_PROF=1` | 把逐 op GPU 时间打到 stderr（`--profile-out` 走的是同一条采集路径，但输出成 JSON） |
 | `MESA_SHADER_CACHE_DISABLE=1` | 关掉 Mesa 的 disk shader cache，用来把 vkop 自己的 pipeline cache 贡献单独量出来 |
 
-`vkop-bench` 载入时会打一行 `shader-archive: <source> (N entries)`（或
-`none (libvkop-embedded SPIR-V)`），stderr 里也可见。
+`vkop-bench` 载入时会打一行 `shader-archive: <model> (N entries)`（模型没带归档时
+打 `none`，那在默认构建上就意味着建 op 时会失败）。
 
 归档模式的正确性是量过的，不是假设：strip 构建配 `llm.vkopbin.shaders.bin`
 （1,025,704 B、41 条）跑 round 5，`--save-outputs` 的 29 个文件与带内嵌 shader 的
@@ -221,8 +221,10 @@ vkop-bench: --device 99 out of range (0..1); use --list-devices
 `onnx2vkop` 默认把同一份子集嵌进 `.vkopbin`，而
 `VKOP_STRIP_BUILTIN_SHADERS=ON` 已是 libvkop 的默认（它自己不再带 SPIR-V），所以
 只喂 `llm.vkopbin` 就能跑（`build/tests/ModelTest`、`build-strip/tests/ModelTest`
-两条路径都验证过）。一个没内嵌归档的模型在这种 lib 上会明确报 stubbed-SPIR-V，
-需要 `VKOP_SHADER_ARCHIVE`；`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可退回旧布局。
+两条路径都验证过）。运行期**没有**任何替换 shader 的开关（没有 env、没有 flag）：
+profile 跑的就是部署跑的那份 kernel，这是"只带一个文件"换来的性质，代价是换 shader
+必须重转。一个没内嵌归档的模型在这种 lib 上建 op 时就会明确报 stubbed-SPIR-V；
+`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可退回旧布局。
 
 shader 被默认剥掉之后，"某个 op 该跑哪个 kernel"这件事不能再有两份答案：Python
 侧按同样的表筛归档，C++ 侧按表查 key，两边一旦漂移就是一个硬失败（stripped 构建
@@ -230,7 +232,7 @@ shader 被默认剥掉之后，"某个 op 该跑哪个 kernel"这件事不能再
 `Model.kernel_plans` 是去重后的 per-op_type 行（`image`/`image_fp16`/`buffer`/
 `buffer_fp16` 四个 **post-fallback** cell 加 `variants`），`Node.plan` 索引自己的
 那一行，`-1` 表示该 op 无 shader（走 host 路径）。Runtime::LoadModel 优先用
-`Node.plan` 查 key（`VKOP_SHADER_ARCHIVE_DEBUG=1` 下打 `… (from kernel plan)`，
+`Node.plan` 查 key（`VKOP_SHADER_DEBUG=1` 下打 `… (from kernel plan)`，
 否则 `(from built-in table)`），旧的 planless 模型行为不变。
 `build/tests/KernelPlanTest` 拿真实转换出来的 `.vkopbin` 校验三件事：每行的四个
 cell 与 `core/ShaderKeys.hpp::shader_key_for()` 一致、行里列出的每个 key（含

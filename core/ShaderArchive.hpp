@@ -30,9 +30,9 @@ namespace core {
 //
 // Failure mode: `open()` / `open_from_memory()` return nullptr on any
 // structural problem (missing file, bad magic, version mismatch, corrupt
-// index). Callers (Runtime) treat that as "use the embedded SPIR-V symbols
-// of the next source in line", so a deployment that forgot the .bin still
-// runs, just without the memory saving.
+// index). Runtime treats that as "this model has no shaders": the op keeps
+// the placeholder array it was built with, and Operator turns that into a
+// named error instead of a null pipeline.
 class ShaderArchive {
   public:
     static std::unique_ptr<ShaderArchive> open(const std::string &path);
@@ -46,15 +46,23 @@ class ShaderArchive {
     static std::unique_ptr<ShaderArchive> open_from_memory(const uint8_t *data,
                                                            size_t size);
 
-    // The archive named by VKOP_SHADER_ARCHIVE, opened once per process and
-    // owned here. Runtime::LoadModel hands its own handle to every op it
-    // builds, but ops created straight through ops::create_from_type() — the
-    // unit-test fixtures and the example drivers — never pass through that
-    // hook, so under VKOP_STRIP_BUILTIN_SHADERS=ON they could not reach any
-    // SPIR-V at all and died on the stub array even with a valid archive in
-    // the environment. Operator falls back to this when its own pointer is
-    // null. Returns nullptr when the env is unset or the file is unusable,
-    // which leaves the existing loud throw in place.
+    // Install a process-wide archive for ops built outside
+    // Runtime::LoadModel. Runtime hands its own handle to every op it builds,
+    // but the unit-test fixtures, the probes and bench_matmul construct
+    // operators straight through ops::create_from_type(), so they never pass
+    // through that hook: under VKOP_STRIP_BUILTIN_SHADERS=ON (the default)
+    // they would have no SPIR-V at all and die on the stub array. Operator
+    // falls back to this when its own pointer is null.
+    //
+    // Dev-only, and deliberately not driven by an environment variable: this
+    // is the build tree's own archive, installed by a header the shipping
+    // binaries do not include (include/dev_shaders.hpp). A runtime override
+    // would let a profiled run quietly execute kernels other than the ones
+    // the model carries, which is exactly what the single-file design is
+    // meant to rule out.
+    static void set_process_default(const std::string &path);
+
+    // The archive installed above, or nullptr.
     static const ShaderArchive *process_default();
 
     // Returns (nullptr, 0) on miss. On hit, the returned pointer is a stable
@@ -64,7 +72,7 @@ class ShaderArchive {
     std::pair<const uint32_t *, uint32_t> lookup(const std::string &key) const;
 
     // Reports how many shader entries the archive contains. Used by
-    // VKOP_SHADER_ARCHIVE_DEBUG diagnostics; not on any hot path.
+    // VKOP_SHADER_DEBUG diagnostics; not on any hot path.
     size_t entry_count() const { return index_.size(); }
 
   private:

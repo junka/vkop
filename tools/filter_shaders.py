@@ -20,13 +20,12 @@ Usage:
         --manifest /tmp/keys.txt \
         --output build/llm.vkopbin.shaders.bin
 
-Missing keys are reported on stderr but do NOT abort the run — the
-Runtime treats an archive miss as "use embedded SPIR-V", which is fine for a
-non-stripped build and turns into a loud "stubbed SPIR-V" throw from
-Operator::set_runtime_device() on a stripped build. The manifest writer
-(onnx2vkop --emit-shader-archive) is the one place that knows whether the
-target build is stripped; the filter tool stays permissive so an archive
-that omits a shader only a rare GPU feature would pick still works.
+Missing keys are reported on stderr but do NOT abort the run — on a
+non-stripped build a miss leaves the op on its linked-in SPIR-V. On the
+default stripped build it is a hard failure at op build time instead, so the
+key set onnx2vkop feeds in has to be complete: the per-model subset is
+filtered from the graph's kernel plan, which is the same set the runtime looks
+up, and cli.build_shader_subset reports every planned key the master lacks.
 """
 import argparse
 import struct

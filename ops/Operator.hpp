@@ -106,8 +106,9 @@ class Operator {
     // archive from inside those builds. Runtime calls set_shader_archive()
     // immediately after create_from_type(), before any override_spv() or
     // set_runtime_device(), so an archive is available whenever the op needs
-    // one. Null leaves the op to use its embedded externs, which is what
-    // happens in the default (non-stripped) build.
+    // one. Null means the op was built with no model behind it; it then falls
+    // back to ShaderArchive::process_default(), which only the dev binaries
+    // install.
     virtual void set_shader_archive(const vkop::core::ShaderArchive *archive) {
         shader_archive_ = archive;
     }
@@ -119,18 +120,19 @@ class Operator {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         // A stub array (unsigned char X_spv[1] = {0}; X_spv_len = 0) is what
-        // spv_to_c.py writes when VKOP_STRIP_BUILTIN_SHADERS=ON. If we reach
-        // here with a non-null spv_ pointer but zero length, the archive was
-        // not loaded to override it, so pipeline_ would stay null and every
-        // later submit() would crash on pipeline_->allocDescriptorSets().
-        // Fail with an actionable message at load time instead. PimplFacade
-        // passes spv_=nullptr, len=0 (not a stub) and is unaffected.
+        // spv_to_c.py writes when VKOP_STRIP_BUILTIN_SHADERS=ON (the default).
+        // If we reach here with a non-null spv_ pointer but zero length, no
+        // archive supplied this op's shader, so pipeline_ would stay null and
+        // every later submit() would crash on
+        // pipeline_->allocDescriptorSets(). Fail with an actionable message at
+        // load time instead. PimplFacade passes spv_=nullptr, len=0 (not a
+        // stub) and is unaffected.
         if (spv_len_ == 0 && spv_ != nullptr) {
             // Runtime swaps archive bytes into the primary before calling this
             // for ops it builds from a model file. Ops built straight through
             // create_from_type() (unit-test fixtures, example drivers) never
             // get that call, so try this op's own key against the
-            // process-wide archive before declaring it unrunnable.
+            // process-wide dev archive before declaring it unrunnable.
             if (!resolve_stubbed_primary_spv()) {
                 throw std::runtime_error(
                     "vkop: " +
@@ -138,12 +140,10 @@ class Operator {
                          ? std::string(convert_optype_to_string(type_))
                          : name_) +
                     " has a stubbed SPIR-V array (this libvkop was built with "
-                    "VKOP_STRIP_BUILTIN_SHADERS=ON) and no archive supplied "
-                    "one. Reconvert the model with onnx2vkop (it embeds the "
-                    "per-model shader archive by default), or set "
-                    "VKOP_SHADER_ARCHIVE=<path to vkop_shaders.bin> before "
-                    "LoadModel so the archive can populate shaders at "
-                    "runtime.");
+                    "VKOP_STRIP_BUILTIN_SHADERS=ON) and the model it was built "
+                    "from carries no archive entry for it. Reconvert the model "
+                    "with onnx2vkop, which embeds every key its kernel plan "
+                    "lists.");
             }
         }
         if (spv_len_ > 0 && spv_) {

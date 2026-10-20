@@ -221,13 +221,13 @@ def main():
 
     if stub_mode:
         # Placeholder symbols keep the linker happy. Runtime overrides them
-        # via Operator::override_spv() when a shader archive is open; if the
-        # archive is missing, set_runtime_device() throws instead of silently
-        # leaving the pipeline_ null and crashing at submit().
+        # via Operator::override_spv() with the archive the .vkopbin itself
+        # carries; without one, set_runtime_device() throws instead of
+        # silently leaving the pipeline_ null and crashing at submit().
         content = f'''// Auto-generated STUB for {os.path.basename(input_spv)}.
 // libvkop was built with VKOP_STRIP_BUILTIN_SHADERS=ON: the SPIR-V bytes
-// live in vkop_shaders.bin, and LoadModel populates each op from that
-// archive before building its pipeline. Set VKOP_SHADER_ARCHIVE=<path>.
+// live in the .vkopbin and LoadModel populates each op from that archive
+// before building its pipeline.
 unsigned char {sym_name}[1] = {{0}};
 unsigned int {sym_name}_len = 0;
 '''
@@ -271,11 +271,11 @@ find_package(Python3 COMPONENTS Interpreter REQUIRED)
 # VKOP_STRIP_BUILTIN_SHADERS=ON (the default) drops the SPIR-V bytes from
 # libvkop entirely: spv_to_c.py writes a 1-byte placeholder with _len=0 for
 # every symbol, and shaders come from the model instead. onnx2vkop embeds the
-# per-model archive in the .vkopbin by default, so Runtime::LoadModel has
-# everything it needs from the single file; a model converted with
-# --no-embed-shaders needs VKOP_SHADER_ARCHIVE pointing at a vkop_shaders.bin
-# (the archive build below always produces one), and LoadModel throws with a
-# message saying so rather than failing later on a null pipeline.
+# per-model archive in the .vkopbin, so Runtime::LoadModel has everything it
+# needs from the single file and there is nothing to configure at run time. A
+# model without an archive (an old file) gets a named error instead of a null
+# pipeline. Development binaries that build ops without a model take the
+# build tree's archive via include/dev_shaders.hpp.
 #
 # OFF restores the pre-archive layout: libvkop carries every shader byte for
 # every backend (~2.7 MB of .rodata per consumer) whether or not the model
@@ -416,14 +416,14 @@ endforeach()
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #
-# Every .spv produced above is packed once more into a single archive the
-# runtime can load with VKOP_SHADER_ARCHIVE=/path/to/vkpv_shaders.bin. Keys
-# inside the archive are the same folder-derived names already used for the
-# embedded C-array symbols (buffer_add, image_add_fp16, ...), so a caller can
-# look up any op's SPIR-V without knowing anything about how CMake produced
-# it. libvkop still embeds the C arrays above, so the archive is additive for
-# now: setting VKOP_SHADER_ARCHIVE overrides the embedded bytes at LoadModel
-# time; leaving it unset runs the pre-archive path unchanged.
+# Every .spv produced above is packed once more into a single archive. It is
+# the source onnx2vkop filters a model's own subset from (--master-archive),
+# and the file the runtime used to be handed directly -- so it is what the
+# per-model archive is derived from, and what the dev binaries read through
+# include/dev_shaders.hpp. Keys inside the archive are the same folder-derived
+# names already used for the embedded C-array symbols (buffer_add,
+# image_add_fp16, ...), so a lookup needs to know nothing about how CMake
+# produced it.
 # ---------------------------------------------------------------------------
 set(ARCHIVE_ARGS "")
 set(ARCHIVE_DEPS "")

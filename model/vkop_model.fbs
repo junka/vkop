@@ -178,10 +178,10 @@ table Model {
   // SPIR-V archive (VKSP format, tools/spv_to_archive.py): the per-model
   // subset of the build's vkop_shaders.bin holding exactly the shaders this
   // graph can dispatch. When present the .vkopbin is self-contained and
-  // Runtime::LoadModel takes every op's SPIR-V from here, with no
-  // VKOP_SHADER_ARCHIVE file to deploy alongside. Empty for models written by
-  // an older writer or converted with --no-embed-shaders, which fall back to
-  // the libvkop-embedded C arrays exactly as before.
+  // Runtime::LoadModel takes every op's SPIR-V from here -- on a libvkop built
+  // with VKOP_STRIP_BUILTIN_SHADERS=ON (the default) that is the only source,
+  // since there is no run-time override by design. Empty for models written by
+  // an older writer, which then fall back to the C arrays linked into libvkop.
   //
   // Appended last on purpose: FlatBuffers addresses fields by declaration
   // order, so a new field may only be added at the end -- inserting one

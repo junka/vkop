@@ -464,10 +464,10 @@ class DAGBasedModel:
         `shader_archive`, when given, is a VKSP archive (tools/filter_shaders.py
         serialize()) stored in the Model's `shader_archive` field. The runtime
         then takes every op's SPIR-V from the .vkopbin itself, so the model is
-        a single deployable file and does not need VKOP_SHADER_ARCHIVE or a
-        libvkop built without VKOP_STRIP_BUILTIN_SHADERS. onnx2vkop passes one
-        by default; pass None for a model that should run against whatever
-        archive the host provides.
+        a single deployable file with nothing to configure at run time.
+        onnx2vkop always passes one; None is the writer-level "bare model"
+        case, which only runs against a libvkop built with
+        VKOP_STRIP_BUILTIN_SHADERS=OFF.
 
         The kernel selection that archive was filtered by is written into the
         same file (Model.kernel_plans, indexed by Node.plan), so the runtime
@@ -620,9 +620,9 @@ class DAGBasedModel:
             blob_vec = builder.EndVector()
 
         # --- embedded SPIR-V archive (VKSP) ---
-        # 单文件部署：C++ 的 Runtime::LoadModel 优先用 VKOP_SHADER_ARCHIVE，其次
-        # 用这里的字节，最后才回落到 libvkop 内嵌的 C 数组。字节数很小（只含本图
-        # 能 dispatch 的 key，llm 旋转形态 ~933 KB），所以直接放进 FlatBuffer，
+        # 单文件部署：C++ 的 Runtime::LoadModel 只从这里取 shader（默认构建
+        # 的 libvkop 只剩桩，运行期没有任何环境变量能替换），字节数很小（只含
+        # 本图能 dispatch 的 key，llm 旋转形态 ~933 KB），所以直接放进 FlatBuffer，
         # 不走 initializer blob 那套外置 trailer——那套是为几 GB 权重准备的，而
         # 2 GiB 的向量上限对归档来说完全够用。
         if shader_archive:
