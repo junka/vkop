@@ -357,15 +357,12 @@ struct VisualFeatures {
 };
 
 // Visual encoder session: visual.vkopbin is loaded once and reused for every
-// image in the session (each run only refills pixel_values and re-reads the 4
-// outputs). The Runtime owns the tensor set, so features must be copied out
-// before the next run — run() returns them by value.
+// image in the session (each run only refills pixel_values + grid_thw and
+// re-reads the 4 outputs). The Runtime owns the tensor set, so features must be
+// copied out before the next run — run() returns them by value.
 struct VisualEngine {
     std::shared_ptr<Runtime> vrt;
     std::shared_ptr<vkop::VulkanCommandPool> cmdpool;
-    // The seq_len the graph's baked grid constants describe (see
-    // check_visual_graph). Every image must reduce to this grid.
-    int export_seq = 0;
 
     VisualEngine(const std::shared_ptr<vkop::VulkanCommandPool>& cp,
                  const std::string& visual_vkopbin)
@@ -375,48 +372,52 @@ struct VisualEngine {
         std::printf("=== LoadModel (visual) ===\n");
         vrt->LoadModel();
         std::printf("=== LoadModel (visual) done ===\n");
-        export_seq = check_visual_graph(*vrt);
+        check_visual_graph(*vrt);
     }
 
-    // The vkopbin bakes (grid_thw and everything derived from it) from the
-    // export-time model config into constants; image_preproc.hpp's compile-time
-    // constants must describe THIS graph, not some config.json. Verify before
-    // the first image so a mismatch fails loudly at load instead of silently
-    // mis-slicing pixel_values.
+    // The graph takes grid_thw as an input, so the pos_embed interpolation,
+    // rotary tables and everything else derived from the grid are computed
+    // inside it at run time (see qwen3vl_visual_dynamic.py). The only grid-free
+    // constants left are the patch geometry, which image_preproc.hpp must
+    // describe exactly. Verify before the first image so a mismatch fails
+    // loudly at load instead of silently mis-slicing pixel_values.
     //
-    // pixel_values' leading dim is NOT the export's seq_len: the ONNX dim is
-    // symbolic ("seq_len") and the runtime substitutes 1 for a dynamic dim at
-    // load, while the driver ResizeInput's it to the real seq_len per image.
-    // The export's grid is only observable in the OUTPUT row count, where
-    // n_patches = seq_len / merge^2. Returns that seq_len.
-    static int check_visual_graph(Runtime& rt) {
+    // The row dim (kRow) is a real graph constant; pixel_values' leading dim
+    // and image_features' rows are symbolic ("seq_len"/"num_image_patches") and
+    // the runtime substitutes 1 for a dynamic dim at load, so they carry no
+    // information here — the driver ResizeInput's the first one per image.
+    static void check_visual_graph(Runtime& rt) {
         auto pv = rt.GetInput("pixel_values");
         if (!pv)
             throw std::runtime_error("visual graph has no pixel_values input");
+        auto g = rt.GetInput("grid_thw");
+        if (!g)
+            throw std::runtime_error(
+                "visual graph has no grid_thw input — it is a static-grid "
+                "export; re-export with the current qwen3vl_export_onnx.py");
+        if (g->dtype() != typeid(int64_t))
+            throw std::runtime_error("visual grid_thw input is not int64");
         auto s = pv->getShape();
         const int row = vkop::export_::kRow;
-        const int m2 = vkop::export_::kMerge * vkop::export_::kMerge;
-        auto feat = rt.GetOutput("image_features");
-        auto fs = feat ? feat->getShape() : std::vector<int>{};
-        if (s.size() != 2 || s[1] != row || fs.size() != 2 || fs[0] <= 0) {
+        if (s.size() != 2 || s[1] != row) {
             char buf[384];
             std::snprintf(buf, sizeof(buf),
-                          "visual graph shapes do not match compiled constants "
-                          "(pixel_values [%d,%d] want row=%d; image_features "
-                          "[%d,%d] want n_patches > 0). The graph was exported "
-                          "for a different vision config — re-export it with a "
-                          "matching model.",
+                          "visual graph pixel_values [%d,%d] does not match "
+                          "compiled constants (want [seq_len,%d] with "
+                          "patch=%d temporal=%d chans=%d). The graph was "
+                          "exported for a different vision config — re-export "
+                          "it with a matching model.",
                           s.empty() ? 0 : s[0], s.size() > 1 ? s[1] : 0, row,
-                          fs.empty() ? 0 : fs[0], fs.size() > 1 ? fs[1] : 0);
+                          vkop::export_::kPatch, vkop::export_::kTemporalPatch,
+                          vkop::export_::kInChans);
             throw std::runtime_error(buf);
         }
-        std::printf("[visual] graph pixel_values [%d,%d] matches "
-                    "patch=%d temporal=%d merge=%d chans=%d, export grid "
-                    "seq_len=%d\n",
+        std::printf("[visual] graph pixel_values [%d,%d] + grid_thw int64 "
+                    "matches patch=%d temporal=%d merge=%d chans=%d (dynamic "
+                    "grid)\n",
                     s[0], s[1], vkop::export_::kPatch,
                     vkop::export_::kTemporalPatch, vkop::export_::kMerge,
-                    vkop::export_::kInChans, fs[0] * m2);
-        return fs[0] * m2;
+                    vkop::export_::kInChans);
     }
 
     VisualFeatures run(const std::string& image_path) {
@@ -438,24 +439,22 @@ struct VisualEngine {
         vf.n_img = pr.seq_len / (vkop::export_::kMerge * vkop::export_::kMerge);
         std::printf("[visual] grid_thw=[%d,%d,%d] n_img=%d seq_len=%d\n",
                     vf.grid_t, vf.grid_h, vf.grid_w, vf.n_img, pr.seq_len);
-        // The graph's grid-derived constants (pos_embed interp indices/weights,
-        // rotary position_ids, cu_seqlens) are frozen at export time, so a
-        // differently-shaped image does not resize — it silently reads the
-        // wrong interpolation table. The image must reduce to the same grid.
-        if (pr.seq_len != export_seq) {
-            char buf[512];
-            std::snprintf(
-                buf, sizeof(buf),
-                "image %dx%d gives seq_len=%d (grid %dx%d), but the visual "
-                "graph was exported for seq_len=%d. Its grid-derived "
-                "constants (pos_embed interpolation, rotary position ids, "
-                "cu_seqlens) are frozen at export time, so a differently "
-                "shaped image reads the wrong table: scale the image to the "
-                "export size, or re-export with EXPORT_IMG_SIZE set to it.",
-                w, h, pr.seq_len, pr.grid_h, pr.grid_w, export_seq);
+        if (pr.seq_len != pr.grid_t * pr.grid_h * pr.grid_w) {
+            char buf[256];
+            std::snprintf(buf, sizeof(buf),
+                          "preprocess produced seq_len=%d but grid=[%d,%d,%d] "
+                          "(=%d patches)",
+                          pr.seq_len, pr.grid_t, pr.grid_h, pr.grid_w,
+                          pr.grid_t * pr.grid_h * pr.grid_w);
             throw std::runtime_error(buf);
         }
 
+        // grid_thw drives the whole grid-derived half of the graph (pos_embed
+        // interpolation table lookup, rotary, merge order), so it is a real
+        // input now — one row per image, (1,3) int64 {t,h,w}.
+        const int64_t gthw[3] = {vf.grid_t, vf.grid_h, vf.grid_w};
+        fill_i64_input(vrt, "grid_thw", {1u, 3u}, gthw);
+        upload_input(cmdpool, vrt->GetInput("grid_thw"));
         vrt->ResizeInput("pixel_values",
                          {static_cast<uint32_t>(pr.seq_len),
                           static_cast<uint32_t>(pr.row)});

@@ -1,17 +1,23 @@
 // junka @ 2026
-// Visual encoder probe: load visual.vkopbin, feed pixel_values (196,1536) fp16,
-// run, and dump the 4 outputs (image_features + deepstack_features_{0,1,2}).
+// Visual encoder probe: load visual.vkopbin, feed pixel_values + grid_thw, run,
+// and dump the 4 outputs (image_features + deepstack_features_{0,1,2}).
 //
 // Stage-0/stage-1 verification harness: exercises the full visual graph incl.
 // the patch_embed Conv3D (5-D Conv) to confirm the Conv2d buffer-backend 5-D
 // extension produces ORT-aligned outputs, AND that the C++ image preprocessor
 // (image_preproc.hpp) reproduces HF's pixel_values layout.
 //
+// The graph is dynamic-grid: every grid-derived quantity (pos_embed
+// interpolation, rotary tables, merge order) is computed in-graph from the
+// grid_thw input, so any size whose sides are multiples of patch*merge runs.
+//
 // Usage:
-//   visual_probe <visual.vkopbin> --pv <pv.bin> [seq_len]   # raw fp16 input
-//   visual_probe <visual.vkopbin> --image <img> [seq_len]   # decode+preprocess in C++
+//   visual_probe <visual.vkopbin> --pv <pv.bin> [seq_len] [--grid h,w]
+//   visual_probe <visual.vkopbin> --image <img> [--grid h,w]
 //     --ref-pv <dir>     diff C++ pixel_values vs <dir>/pv.bin (preproc check)
 //     --ref-out <dir>    diff 4 vkop outputs vs <dir>/<name>.bin (encoder check)
+//   --grid defaults to the C++ preprocess's grid for --image, and to
+//   sqrt(seq_len) for --pv when seq_len is a perfect square (196 -> 14x14).
 //   Outputs: /tmp/vkop_image_features.bin, /tmp/vkop_deepstack_features_{0,1,2}.bin
 
 #define STB_IMAGE_IMPLEMENTATION
@@ -83,8 +89,8 @@ static void diff_fp16(const std::string& label, const uint16_t* a, const uint16_
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: %s <visual.vkopbin> --pv <pv.bin> [seq_len]\n"
-            "       %s <visual.vkopbin> --image <img> [seq_len] "
+            "usage: %s <visual.vkopbin> --pv <pv.bin> [seq_len] [--grid h,w]\n"
+            "       %s <visual.vkopbin> --image <img> [--grid h,w] "
             "[--ref-pv <dir>] [--ref-out <dir>]\n",
             argv[0], argv[0]);
         return 1;
@@ -92,9 +98,10 @@ int main(int argc, char** argv) {
     const std::string model_path = argv[1];
 
     // Parse remaining args: --pv/--image pick input mode; optional seq_len,
-    // --ref-pv / --ref-out for diffing.
+    // --grid h,w, --ref-pv / --ref-out for diffing.
     std::string pv_path, image_path, ref_pv_dir, ref_out_dir;
-    int seq_len = 196; // default for 224x224 export
+    int seq_len = 196; // default for the export's 224x224 trace example
+    int grid_h = 0, grid_w = 0;
     bool have_seq = false;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -102,6 +109,12 @@ int main(int argc, char** argv) {
         else if (a == "--image" && i + 1 < argc) { image_path = argv[++i]; }
         else if (a == "--ref-pv" && i + 1 < argc) { ref_pv_dir = argv[++i]; }
         else if (a == "--ref-out" && i + 1 < argc) { ref_out_dir = argv[++i]; }
+        else if (a == "--grid" && i + 1 < argc) {
+            if (std::sscanf(argv[++i], "%d,%d", &grid_h, &grid_w) != 2) {
+                std::fprintf(stderr, "--grid wants h,w (e.g. 14,14)\n");
+                return 1;
+            }
+        }
         else if (!a.empty() && a[0] != '-' && !have_seq) {
             seq_len = std::atoi(a.c_str()); have_seq = true;
         }
@@ -144,6 +157,7 @@ int main(int argc, char** argv) {
         }
         pv = std::move(pr.pixel_values_fp16);
         seq_len = pr.seq_len;
+        grid_h = pr.grid_h; grid_w = pr.grid_w;
         std::printf("[preproc] grid_thw=[%d,%d,%d] seq_len=%d row=%d\n",
                     pr.grid_t, pr.grid_h, pr.grid_w, pr.seq_len, pr.row);
         // Optional: diff C++ pv vs HF reference pv.
@@ -165,6 +179,21 @@ int main(int argc, char** argv) {
         if (pv.empty()) return 1;
     }
     std::printf("[pv] seq_len=%d row=%d elems=%zu\n", seq_len, row, pv.size());
+    if (grid_h == 0 || grid_w == 0) {
+        int s = static_cast<int>(std::lround(std::sqrt(static_cast<double>(seq_len))));
+        if (s * s != seq_len) {
+            std::fprintf(stderr,
+                "seq_len=%d is not a perfect square: pass --grid h,w\n", seq_len);
+            return 1;
+        }
+        grid_h = grid_w = s;
+    }
+    if (grid_h * grid_w != seq_len) {
+        std::fprintf(stderr, "grid %dx%d = %d patches but pixel_values has %d rows\n",
+                     grid_h, grid_w, grid_h * grid_w, seq_len);
+        return 1;
+    }
+    std::printf("[grid] thw=[1,%d,%d]\n", grid_h, grid_w);
 
     // Runtime + visual model.
     auto rt = std::make_shared<Runtime>(cmdpool, model_path, /*precision=*/1);
@@ -172,6 +201,18 @@ int main(int argc, char** argv) {
     std::printf("=== LoadModel ===\n");
     rt->LoadModel();
     std::printf("=== LoadModel done ===\n");
+
+    // Feed grid_thw (1,3) int64 — the dynamic-grid graph's second input.
+    const int64_t gthw[3] = {1, grid_h, grid_w};
+    auto gt_in = rt->GetInput("grid_thw");
+    if (!gt_in || gt_in->dtype() != typeid(int64_t)) {
+        std::fprintf(stderr, "graph has no int64 grid_thw input (static-grid export?)\n");
+        return 1;
+    }
+    rt->ResizeInput("grid_thw", {1u, 3u});
+    auto gt = as_tensor<int64_t>(rt->GetInput("grid_thw"));
+    gt->fillToCPU(gthw);
+    gt->copyToGPU(cmdpool);
 
     // Fill pixel_values input (seq_len, 1536) fp16.
     rt->ResizeInput("pixel_values",
@@ -181,7 +222,7 @@ int main(int argc, char** argv) {
     auto tg = as_tensor<uint16_t>(t);
     tg->fillToCPU(pv.data());
     tg->copyToGPU(cmdpool);
-    std::printf("[pv] uploaded\n");
+    std::printf("[pv] uploaded (pixel_values + grid_thw)\n");
 
     // Run.
     double ms = rt->Run();

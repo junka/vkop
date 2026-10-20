@@ -1,7 +1,8 @@
 """一致性测试用例构造：合成 PIL 图、prompt 模板、CASES 列表。
 
 供 tests/ 下的 pytest 用例复用，也可被 ad-hoc 脚本 import。
-所有合成图像尺寸固定 224×224（= visual.onnx 导出尺寸，因 grid_thw 被常量折叠）。
+合成图像默认 224×224（visual.onnx 的 trace 示例尺寸）；visual.onnx 现在是动态
+grid 图，任意 32 的整数倍边长都能跑，尺寸只影响速度不影响可跑性。
 """
 import os
 from PIL import Image, ImageDraw, ImageFont

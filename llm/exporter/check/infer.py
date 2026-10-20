@@ -66,9 +66,12 @@ class OnnxQwen3VL:
                 image_grid_thw=image_grid_thw, attention_mask=attention_mask)
         return pos_ids, rope_delta  # (3,B,L), (B,1)
 
-    def run_visual(self, pixel_values):
+    def run_visual(self, pixel_values, grid_thw):
         pv = pixel_values.cpu().numpy().astype(np.float16)
-        out = self.vsess.run(None, {"pixel_values": pv})
+        # visual.onnx 是动态 grid 图：pos_embed 插值 / rotary / merge 顺序全部由图内的
+        # grid_thw 算出来，所以每张图都要把它喂进去（(1,3) int64 {t,h,w}）。
+        gt = np.asarray(grid_thw, dtype=np.int64).reshape(1, 3)
+        out = self.vsess.run(None, {"pixel_values": pv, "grid_thw": gt})
         pool = out[0]              # (n_img, 2048) fp16
         ds = [out[1], out[2], out[3]]
         return pool, ds
@@ -121,7 +124,7 @@ class OnnxQwen3VL:
         image_pad_mask[input_ids == IMG_TOK] = True
         # visual
         if pixel_values is not None and n_img > 0:
-            pool, ds = self.run_visual(pixel_values)  # (n_img, H) numpy
+            pool, ds = self.run_visual(pixel_values, grid_thw)  # (n_img, H) numpy
             pool_t = torch.tensor(pool)
             ds_t = [torch.tensor(d) for d in ds]
         else:

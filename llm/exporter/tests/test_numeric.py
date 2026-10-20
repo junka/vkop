@@ -54,8 +54,9 @@ def test_visual_pooler_and_deepstack(onnx_eng):
     visual = onnx_eng.ref.model.visual
     device = "cpu"
     pv, grid_thw, hf_out = _build_prefill_inputs(visual, onnx_eng.lm, device)
-    # visual.onnx 因 grid_thw 被常量折叠，只接受 pixel_values
-    out = onnx_eng.vsess.run(None, {"pixel_values": pv.cpu().numpy().astype(np.float16)})
+    out = onnx_eng.vsess.run(None, {
+        "pixel_values": pv.cpu().numpy().astype(np.float16),
+        "grid_thw": grid_thw.cpu().numpy().astype(np.int64)})
     v_pool = torch.tensor(out[0]).float()
     v_ds = [torch.tensor(out[i]).float() for i in (1, 2, 3)]
     assert _mean_ok(v_pool, hf_out.pooler_output.float()), "visual pooler_output 均值差过大"

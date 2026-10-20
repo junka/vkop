@@ -387,7 +387,12 @@ class Gather : public Operator {
         submit(&param_, UP_DIV(total_size, 256), 1, 1);
     }
 
-    gather::GpuGatherParam param_;
+    // Value-initialized so `axis` starts at 0 — ONNX Gather's default, and the
+    // attribute is OPTIONAL, so an exporter is free to omit it (torch does,
+    // for the pos_embed table lookup). Without this the axis was whatever the
+    // heap held, and calculateGatherOutputShape threw "Axis is out of range"
+    // on a perfectly legal node.
+    gather::GpuGatherParam param_{};
 
     // int64-data GPU path state. Lazily built on first int64 execute.
     std::unique_ptr<VulkanPipeline> pipeline_int64_;

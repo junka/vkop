@@ -8,8 +8,8 @@
 ```
 ┌─────────────────┐  pixel_values (seq_len,1536)   ┌──────────────┐
 │ HF image proc   │ ─────────────────────────────▶ │ visual.onnx  │
-│ + tokenizer     │                                 │ (deepstack)  │
-└─────────────────┘  input_ids, grid_thw, mask     └──────┬───────┘
+│ + tokenizer     │        + grid_thw (1,3)         │ (deepstack)  │
+└─────────────────┘                                └──────┬───────┘
         │                                              pooler_output + 3×deepstack
         │ get_rope_index (3D pos_ids)                           │
         │ causal attention_bias                                ▼
@@ -63,18 +63,27 @@ pytest tests/test_consistency.py -k ocr   # 仅 OCR 用例
 
 ### 1. 视觉编码器（visual.onnx）
 
-直接包一层 `VisualExport` 调 HF `visual(pixel_values, grid_thw)`，导出
-`pooler_output` + 3 个 `deepstack_features`（来自视觉层 5/11/17）。
+直接包一层 `VisualDynamic`（`export/qwen3vl_visual_dynamic.py`）调 HF 视觉塔的
+权重，导出 `pooler_output` + 3 个 `deepstack_features`（来自视觉层 5/11/17）。
 
 - **为什么用 `dynamo=False`**：torch 2.9 默认 dynamo 导出器对视觉的
   `fast_pos_embed_interpolate`（`torch.linspace` 含数据相关长度）会触发
   `GuardOnDataDependentSymNode`。改用 legacy TorchScript 导出器（`dynamo=False`）绕开。
-- **grid_thw 被常量折叠**：`fast_pos_embed_interpolate` 内部 `grid_thw.tolist()`
-  把 grid_thw 转成 Python list，trace 后被当常量折进图，故 `visual.onnx` 的输入
-  **只有 `pixel_values`**（grid_thw 在导出时固化）。这是 HF 视觉实现的特性，导出
-  尺寸固定。默认 224×224 → patch_size=16 → 14×14=196 个 patch（grid_h=grid_w=14，
-  即每个维度 14 个 patch，不是 patch_size=14）。不同图像尺寸需重新导出
-  （`EXPORT_IMG_SIZE=336 python3 export/qwen3vl_export_onnx.py`）。
+- **grid_thw 是真正的图输入**：HF 的 `fast_pos_embed_interpolate` /
+  `rot_pos_emb` / `cu_seqlens` 三处都从 `grid_thw.tolist()` 派生（数据相关
+  Python 控制流，trace 不了），老版导出因此把它们 eager 算好后当常量 kwargs
+  传进 HF forward，图上只剩静态数据流，代价是尺寸被永久固化。
+  `VisualDynamic` 把这三件事重写成只由 `grid_thw` 驱动的张量运算（pos_embed
+  双线性插值的索引/权重、rotary 频表、单图 attention），于是
+  **`visual.onnx` 的输入是 `pixel_values` + `grid_thw`，同一张图吃任意尺寸**
+  （grid 每条边为偶数且 ≤ 256，即 HF `smart_resize` 的 4096×4096 上界）。
+  - 默认 trace 尺寸仍是 224×224 → patch_size=16 → 14×14=196 个 patch
+    （grid_h=grid_w=14，即每维 14 个 patch，不是 patch_size=14）；
+    驱动侧按实际图算出 `grid_thw` 喂进去。
+  - `linspace(0, N-1, h)` 的**精确值查表**（`lin_fl` floor / `lin_dh` 小数），
+    不做任何近似公式：ViT 在 fp16 下对 pos_embed 的 1-ULP 扰动是混沌放大的
+    （0.1% 元素差 1 ULP → `image_features` 差 max 0.45）。
+  - `pos_embed_padded` 补 `N+1` 行零向量，ceil 角点无需 clamp；越界项必然乘 0。
   > 注意区分：`patch_size`（=16，config 里读，每个 patch 的像素边长）与
   > `grid_h/grid_w`（=14，图像在每维切出的 patch 数）。224÷16=14。
 - 视觉 attention 是 eager（无 `create_causal_mask`），不触 `torch.diff`，安全 trace。
@@ -238,8 +247,10 @@ ONNX 端 greedy 生成的 token id 与 HF greedy 完全一致（含多模态图�
 
 ## 局限
 
-- **视觉尺寸固定**：`visual.onnx` 的 grid_thw 被常量折叠，导出尺寸（224×224）固定。
-  不同图像尺寸需重新导出，或改用 TRT-edge 的 `Qwen3VLVisionModelPatch`（grid_thw 作输入）。
+- **视觉尺寸必须是 32 的整数倍**：`visual.onnx` 现在是动态 grid 图（`grid_thw`
+  为图输入），任意边长 ≤ 4096 且为 `patch*merge = 32` 的整数倍都能跑，不再需要
+  重新导出。但驱动侧的 `preprocess_image_noresize` 不做 HF 的 `smart_resize`
+  等比缩放，非 32 倍数的图会被拒（不会静默出错）。
 - **prefill/decode 共用一图**：单图两用，decode 时 q_len=1 仍走完整 attention 路径，
   效率非最优但正确。生产环境可拆 prefill/decode 双图。
 - **采样未实现**：ONNX 驱动仅 greedy；采样需自行加 temperature/top_p。
@@ -673,8 +684,9 @@ rope 是 `rope_type=default`、`attention_scaling=1.0`、inv_freq 常量，没�
   后分布一致，但驱动本身未实现采样。
 - **单图整会话**：`--image` 指定的图片对整个会话（所有轮次）生效；不支持中途换图，
   也不支持一轮里多张图。多图需扩展 `expand_image_token` + 多组 deepstack 特征。
-- **视觉尺寸固定**：图片必须是 32 的整数倍（224×224 默认），且 `visual.vkopbin`
-  的 grid_thw 在导出时固化（见上文「视觉编码器」节）。不同尺寸需重新导出 + 转换。
+- **视觉尺寸**：图片边长必须是 32 的整数倍（`patch*merge`），上界由 HF
+  `smart_resize` 的 4096×4096 给出；`visual.vkopbin` 的 grid_thw 是图输入，
+  换尺寸无需重新导出（见上文「视觉编码器」节）。
 - **多轮 = 每轮重算 KV**：会话历史在 token 层累积后整体重新 prefill（见上文
   「多轮上下文」一节）；跨轮续用 KV（跳过已算前缀）还没接——vkop 没有 paged KV /
   block table，`Conversation::prefixMatch()` 留着校验点。

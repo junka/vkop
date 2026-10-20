@@ -39,9 +39,10 @@ def main():
         img = Image.fromarray(arr, "RGB")
 
     proc = AutoImageProcessor.from_pretrained(MODEL)
-    inputs = proc(images=[img], do_resize=False, return_tensors="np")
-    pv = np.asarray(inputs.pixel_values)
-    grid = np.asarray(inputs.image_grid_thw)
+    # transformers 5.3's fast image processor only returns torch tensors.
+    inputs = proc(images=[img], do_resize=False, return_tensors="pt")
+    pv = inputs.pixel_values.numpy()
+    grid = inputs.image_grid_thw.numpy()
     print(f"image={img.size} pixel_values={pv.shape} dtype={pv.dtype} grid_thw={grid.tolist()}")
 
     sess = ort.InferenceSession(VISUAL_ONNX, providers=["CPUExecutionProvider"])
@@ -49,7 +50,7 @@ def main():
     want = {"tensor(float)": np.float32, "tensor(float16)": np.float16}.get(info.type)
     print(f"ort input {info.name} type={info.type} -> cast to {want}")
     pv_in = pv.astype(want)
-    outs = sess.run(None, {info.name: pv_in})
+    outs = sess.run(None, {info.name: pv_in, "grid_thw": grid.astype(np.int64)})
 
     for name, a in zip(NAMES, outs):
         a16 = a.astype(np.float16)
