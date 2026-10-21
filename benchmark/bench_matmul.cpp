@@ -5,14 +5,22 @@
 // SIMULTANEOUS_USE cmd buffer R times and waits once, so the measurement is
 // pure GPU time without per-call sync overhead.
 //
-// Build (mirrors the llm_chat link line):
+// Build (mirrors the tests link line: libvkop + libvload; libvkop carries no
+// SPIR-V, so -DVKOP_DEV_SHADER_ARCHIVE must point at build/vkop_shaders.bin):
 //   /usr/local/bin/g++-14 -nostdinc++ \
 //     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 \
 //     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include \
-//     -O2 -std=gnu++17 -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS \
+//     -O2 -std=gnu++17 -mf16c -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS \
+//     -DVKOP_DEV_SHADER_ARCHIVE=\"/Users/uqland/github/vkop/build/vkop_shaders.bin\" \
 //     -I/usr/local/include -I/Users/uqland/github/vkop -I/Users/uqland/github/vkop/model \
 //     -I/Users/uqland/github/vkop/model/SYSTEM -I/Users/uqland/github/vkop/model/generated \
-//     benchmark/bench_matmul.cpp -o build/bench_matmul -Lbuild libvkop.a -lc++
+//     benchmark/bench_matmul.cpp -o build/bench_matmul \
+//     build/libvkop.a build/model/libvload.a -lc++
+//
+// Run (x86_64 binary -> the /usr/local Vulkan SDK stack, not /opt/homebrew):
+//   DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib \
+//   VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json \
+//   VKOP_NO_COOP=1 ./build/bench_matmul
 //
 // Env: VKOP_NO_COOP=1 on MoltenVK (16x16 coopmat tiles cannot compile to MSL).
 #include <algorithm>
@@ -28,6 +36,7 @@
 #include "vulkan/VulkanBuffer.hpp"
 #include "core/Tensor.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "include/dev_shaders.hpp"
 #include "include/logger.hpp"
 
 using namespace vkop;
@@ -55,6 +64,7 @@ void fill_ones(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
 
 int main(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_ERROR);
+    vkop::dev::seed_shader_archive_from_build_tree();
     const auto &phydevs =
         VulkanInstance::getVulkanInstance().getPhysicalDevices();
     if (phydevs.empty()) {

@@ -134,9 +134,36 @@ options:
 - GPU shape-meta：张量带 `shape_ssbo_` 侧信道（产出方填充），binary 广播
   shader 的 broadcast==2 SSBO 路径 + `dispatch_from_shape` 间接派发已落地，
   由 `VKOP_GPU_SHAPE` 开关控制（默认关，走 CPU dims 回退）。稳态 readback
-  主要通过 Reshape/Expand 的自动学习缓存（LEARNING→CONFIRMING→STABLE）和
-  host-authoritative int64/int32 initializer 跳过回读来消除（原
+  主要通过 Reshape/Expand 的自动学习缓存（LEARNING→CONFIRMING→STABLE）和 host-authoritative int64/int32 initializer 跳过回读来消除（原
   `PHASE2_4_PLAN` 已完成/被替代并删除）。
+
+##### MatMul 优化经验（实测）
+
+host 选路按 `attn_softmax → coopmat_i8(默认关) → coopmat → tiled → ksplit(+WIDE) → fused → reduce`
+第一个命中即返回（`ops/Matmul.hpp`）：prefill 走 coopmat，decode GEMV 走 ksplit+WIDE。
+以下结论在 Intel ARL + Qwen2.5-0.5B 上实测得出，完整实验记录见 git 历史（原 `MATMUL_OPTIMIZATION.md`）：
+
+- 已证伪、勿重试：改 coopmat tile 形状（BM=32 无可测差异——瓶颈是延迟/occupancy，
+  不是权重 DRAM 带宽）；削减权重带宽（同一结论）；ksplit 放宽到 prefill（1510ms vs coopmat 253ms）；
+  tiled 替代 coopmat（慢 1.3–1.4x）；量化提速 prefill（quantized coopmat 慢 3x、W8A8 慢 ~2x）；
+  `ksplit_q=32`（相对 16 回退）。
+- NVIDIA Ada 不支持 8×8×16 coopmat 组合（静默算错），必须走 16×16×16 变体 + 运行时选组合。
+- 未试候选：把偶数 N 的 pack 折回 coopmat kernel（省 fp32 scratch 往返 + 一次 dispatch）；
+  K 循环软件流水（每个 barrier 做 2 个 K-tile）。
+- 测量方法学：iGPU 跑间噪声 2–3x，单次运行无意义，min-of-N 也不可靠（幸运快跑会造假结论）；
+  必须交替成对比较（A,B,A,B,...）看逐对胜负；低于 ~20% 的差异量不出来。
+
+调参/诊断开关：
+
+| 变量 | 作用 |
+|---|---|
+| `VKOP_NO_COOP=1` | 关掉 coopmat，回落 tiled |
+| `VKOP_COOP_I8=1` | 开 W8A8 SINT8 coopmat（默认关） |
+| `VKOP_KSPLIT_Q=<n>` | 覆盖 ksplit 的列-quad 数（调优用） |
+| `VKOP_KSPLIT_WIDE=0/1` | 关/强制 WIDE |
+| `VKOP_KSPLIT_WIDE_N=<n>` | 设 fp16+byte 两个 WIDE 阈值 |
+| `VKOP_SUBMIT_PROF=1` | 每个 op 的 GPU 时间戳查询（权威） |
+| `VKOP_OPPROF=1` | record 侧 wall time |
 
 #### 6. 文生图（image/exporter/image_gen）
 
@@ -309,6 +336,42 @@ Supports manually registering post-processing operations like softmax and top-k 
   (LEARNING→CONFIRMING→STABLE) and host-authoritative int64/int32
   initializers skipping readback (the former `PHASE2_4_PLAN` is done or
   superseded and removed).
+
+##### MatMul optimization notes (measured)
+
+Host path selection returns on first match in
+`attn_softmax → coopmat_i8 (off by default) → coopmat → tiled → ksplit(+WIDE) → fused → reduce`
+(`ops/Matmul.hpp`): prefill goes coopmat, decode GEMV goes ksplit+WIDE.
+Conclusions below were measured on Intel ARL + Qwen2.5-0.5B; the full
+experiment log lives in git history (the former `MATMUL_OPTIMIZATION.md`):
+
+- Disproven, do not retry: changing coopmat tile shape (BM=32 made no
+  measurable difference — the bottleneck is latency/occupancy, not weight DRAM
+  bandwidth); cutting weight DRAM traffic (same conclusion); relaxing ksplit
+  into prefill (1510 ms vs coopmat 253 ms); tiled instead of coopmat
+  (1.3–1.4x slower); quantization for prefill speed (quantized coopmat 3x
+  slower, W8A8 ~2x); `ksplit_q=32` (regresses vs 16).
+- NVIDIA Ada does not support the 8×8×16 coopmat combination (silently wrong);
+  the 16×16×16 variant plus runtime selection is required.
+- Untried candidates: folding the even-N pack back into the coopmat kernel
+  (saves an fp32 scratch round-trip plus a dispatch); software pipelining of
+  the K loop (2 K-tiles per barrier).
+- Measurement methodology: iGPU run-to-run noise is 2–3x; single runs are
+  meaningless and min-of-N is unreliable (one lucky fast run fabricates
+  conclusions); use alternating paired comparisons (A,B,A,B,...) judged
+  per-pair; effects below ~20% are unmeasurable on this machine.
+
+Tuning/diagnostic switches:
+
+| Variable | Effect |
+|---|---|
+| `VKOP_NO_COOP=1` | disable coopmat, fall back to tiled |
+| `VKOP_COOP_I8=1` | enable W8A8 SINT8 coopmat (off by default) |
+| `VKOP_KSPLIT_Q=<n>` | override ksplit column-quad count (tuning) |
+| `VKOP_KSPLIT_WIDE=0/1` | disable/force WIDE |
+| `VKOP_KSPLIT_WIDE_N=<n>` | set both WIDE auto thresholds |
+| `VKOP_SUBMIT_PROF=1` | per-op GPU timestamp queries (authoritative) |
+| `VKOP_OPPROF=1` | record-side wall time |
 
 #### 7. Text-to-image (image/exporter/image_gen)
 
