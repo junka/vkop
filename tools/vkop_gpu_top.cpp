@@ -13,12 +13,17 @@
 // perf_event, no powermetrics, no root:
 //   Linux (i915/xe)   /proc/<pid>/fdinfo cumulative ns per engine + GT sysfs
 //                     (see gpu_top_linux.cpp)
+//   Linux (NVIDIA)    NVML per-process SM/memory/encoder/decoder utilization,
+//                     dlopen'd at runtime (see gpu_top_linux.cpp; NVML reports
+//                     percentages, so that backend synthesizes the cumulative
+//                     counters this core needs)
 //   macOS (AGX)       the AGXDeviceUserClient nodes' AppUsage cumulative ns
 //                     per GPU client (see gpu_top_darwin.cpp)
 // The platform-specific half is small and narrow: a backend produces a list of
 // GPU clients, each carrying cumulative nanosecond counters. Everything here
 // (matching clients across samples, differencing, aggregating per process,
-// rendering) is shared.
+// rendering) is shared. A platform that has several stacks (Linux usually has
+// an Intel card *and* an NVIDIA one) picks between them with -g.
 //
 // Two rules the whole design rests on, both of which a naive first attempt
 // breaks:
@@ -39,7 +44,8 @@
 // the exact figure for one profiled process.
 //
 // Usage:
-//   vkop_gpu_top [-p PID] [-s MS] [-n COUNT] [-r ROWS] [-P] [--no-proc] [-l]
+//   vkop_gpu_top [-p PID] [-s MS] [-n COUNT] [-r ROWS] [-P] [--no-proc] [-g N]
+//                [-l]
 //
 //   -p PID    monitor this process (default: aggregate over every readable
 //             GPU client, i.e. whole-GPU busy)
@@ -196,11 +202,14 @@ constexpr int kResW = 9;   // "%9.1f" / "%9s"
 struct EngineSet {
     std::vector<const gputop::EngineSpec *> cols;
     void seen(const Window &w) {
-        for (const auto &kv : w.delta_ns)
-            if (!has(kv.first))
-                for (const auto &e : gputop::backend().engines())
-                    if (std::strcmp(e.key, kv.first.c_str()) == 0)
-                        cols.push_back(&e);
+        // Walk the backend's declared order, not the window's: delta_ns is a
+        // std::map, so iterating it would lay the columns out alphabetically
+        // (compute, copy, render, ...) and make the *first* column -- the one
+        // format_row uses to name the busiest client -- the least interesting
+        // engine on the part.
+        for (const auto &e : gputop::backend().engines())
+            if (!has(e.key) && w.delta_ns.count(e.key) != 0)
+                cols.push_back(&e);
     }
     bool has(const std::string &k) const {
         for (const auto *e : cols)
@@ -373,7 +382,7 @@ std::vector<std::string> format_proc_lines(const Window &cur, double wall_s,
 // Terminal height in rows, or 24 when stdout is not a tty (in which case the
 // callers do not redraw anyway).
 int terminal_height() {
-    struct winsize ws{};
+    struct winsize ws {};
     if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
         return ws.ws_row;
     return 24;
@@ -397,6 +406,10 @@ static void usage(const char *argv0) {
         "  -P        force per-process rows on (default: on for whole-GPU,\n"
         "            off with -p since a single process is already named)\n"
         "  --no-proc force per-process rows off (compact one-line summary)\n"
+        "  -g NAME   pick the GPU stack when a host has more than one\n"
+        "            (Linux: intel | nvidia | auto). Auto prefers intel\n"
+        "            when an i915/xe card is bound. VKOP_GPU_TOP_BACKEND\n"
+        "            sets the same thing.\n"
         "  -l        line mode: append every row (a scrolling log to\n"
         "            save/pipe) instead of redrawing a fixed window\n",
         argv0);
@@ -409,6 +422,7 @@ int main(int argc, char **argv) {
     int max_rows = 0;   // 0 = auto
     int proc_mode = -1; // -1 auto (on for whole-GPU, off with -p), 0 off, 1 on
     bool line_mode = false;
+    std::string backend_want; // -g: only meaningful where a platform has two
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -428,6 +442,8 @@ int main(int argc, char **argv) {
             proc_mode = 0;
         } else if (a == "-l") {
             line_mode = true;
+        } else if (a == "-g") {
+            backend_want = need_next("-g");
         } else if (a == "-p") {
             pid = std::atoi(need_next("-p"));
         } else if (a == "-s") {
@@ -450,6 +466,13 @@ int main(int argc, char **argv) {
     std::signal(SIGINT, on_sigint);
     std::signal(SIGTERM, on_sigint);
     gputop::Backend &be = gputop::backend();
+    if (!backend_want.empty() && !be.select(backend_want)) {
+        std::fprintf(stderr,
+                     "vkop_gpu_top: no '%s' backend on this host "
+                     "(try -g auto)\n",
+                     backend_want.c_str());
+        return 2;
+    }
     const gputop::Columns cols = be.columns();
     // Whole-GPU mode is a *shared* device: list the clients by default, the way
     // a `top` would. With -p there is only one process, already named in the

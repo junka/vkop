@@ -87,6 +87,17 @@ class Backend {
     // previous reading, because idle residency is itself a cumulative counter.
     virtual uint64_t freq_mhz() { return 0; }
     virtual double idle_pct(double /*wall_s*/) { return -1.0; }
+
+    // Choose one of several implementations when a single platform offers more
+    // than one -- Linux has both Intel (i915/xe) and NVIDIA cards, and a
+    // workstation usually has both drivers loaded. Called once, before the
+    // first collect(); "auto" returns to the platform's own preference.
+    // Returns false when the name is not offered here, which is also the
+    // default for platforms that have nothing to choose (macOS).
+    virtual bool select(const std::string &name) {
+        (void)name;
+        return false;
+    }
 };
 
 // Provided by the platform source selected in CMake
