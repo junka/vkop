@@ -5,8 +5,12 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <set>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 
 namespace vkop {
@@ -20,22 +24,28 @@ namespace ops {
 // strides live here: they all move with kv_len. See
 // Operator::fingerprint_matches.
 struct alignas(16) AttentionPC {
-    float scale;     // 1/sqrt(head_dim), folded by the converter
-    int batch;       // B
-    int heads;       // H (query heads)
-    int kv_heads;    // Hkv
-    int seq;         // S (query rows per batch)
-    int kv_len;      // kv (total positions: kv_past + S with a cache)
-    int head_dim;    // D
-    int rep;         // H / Hkv (GQA group size)
-    int causal;      // 0/1
-    int has_mask;    // 0/1
-    int mask_causal; // 0/1: that mask is the standard causal one
-    int kv_past;     // positions already in the cache (0 without one)
-    int has_cache;   // 0/1
-    int src_stride;  // cache_in row stride (kv pitch of that SSBO)
-    int dst_stride;  // cache_out row stride
-    int inplace;     // 0/1: cache_out aliases cache_in (detected, not asked)
+    float scale;       // 1/sqrt(head_dim), folded by the converter
+    int batch;         // B
+    int heads;         // H (query heads)
+    int kv_heads;      // Hkv
+    int seq;           // S (query rows per batch)
+    int kv_len;        // kv (total positions: kv_past + S with a cache)
+    int head_dim;      // D
+    int rep;           // H / Hkv (GQA group size)
+    int causal;        // 0/1
+    int has_mask;      // 0/1
+    int mask_causal;   // 0/1: that mask is the standard causal one
+    int kv_past;       // positions already in the cache (0 without one)
+    int has_cache;     // 0/1
+    int src_stride;    // cache_in row stride (kv pitch of that SSBO)
+    int dst_stride;    // cache_out row stride
+    int inplace;       // 0/1: cache_out aliases cache_in (detected, not asked)
+    int ring;          // 0/1: sliding-window ring over the cache rows
+    int ring_head;     // physical slot of logical row 0 (0 when ring == 0)
+    float cache_scale; // fp8 cache dequant/quant scale (1.0 for an fp16 cache)
+    int cache_fp8;     // 0/1: the cache holds E4M3 bytes, not Q-dtype elements
+    int _pad0;
+    int _pad1;
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 
@@ -108,6 +118,17 @@ class AttentionBuffer : public BufferFactory {
             has_cache_ =
                 static_cast<int>(std::stol(attributes.at("has_cache")));
         }
+        if (attributes.find("has_ring") != attributes.end()) {
+            ring_ = static_cast<int>(std::stol(attributes.at("has_ring")));
+        }
+        // fp8 cache: the cache SSBO holds E4M3 bytes and the op does the
+        // decode/encode itself, which is what lets an fp8 cache be written in
+        // place (past == present) instead of through a fp16 intermediate. The
+        // converter sets this only after folding the graph's Q/DQ pair into
+        // this op, so an attribute without that fold cannot occur.
+        if (attributes.find("cache_scale") != attributes.end()) {
+            cache_scale_ = std::stof(attributes.at("cache_scale"));
+        }
     }
 
   private:
@@ -120,9 +141,12 @@ class AttentionBuffer : public BufferFactory {
     // to the session's max context, so its capacity — not the tensor's logical
     // kv_len — is the row pitch the kernel must use. That is exactly what makes
     // appending cheap: the rows already written never move as kv_len grows.
-    // `elem_bytes` is the element width the shader binds (2 for the fp16 half2
-    // SSBO, 4 for fp32); anything else means the cache is not the same dtype as
-    // Q, which the caller rejects before we get here.
+    // The capacity, not the logical length, is the answer even when the buffer
+    // is the smaller of the two: `at_least` is the caller's logical floor, and
+    // returning it here would make the kernel address at a pitch the allocation
+    // does not have. `elem_bytes` is the element width the shader binds (2 for
+    // the fp16 half2 SSBO, 4 for fp32); anything else means the cache is not
+    // the same dtype as Q, which the caller rejects before we get here.
     static int row_capacity(const std::shared_ptr<VulkanBuffer> &buf,
                             int elem_bytes, int row_elems, int at_least) {
         if (!buf || elem_bytes <= 0 || row_elems <= 0) {
@@ -130,7 +154,7 @@ class AttentionBuffer : public BufferFactory {
         }
         const int64_t rows =
             static_cast<int64_t>(buf->getSize()) / (elem_bytes * row_elems);
-        return static_cast<int>(rows > at_least ? rows : at_least);
+        return static_cast<int>(rows > 0 ? rows : at_least);
     }
 
     void execute(
@@ -206,15 +230,117 @@ class AttentionBuffer : public BufferFactory {
                 "Attention: the KV cache form needs a present output");
         }
         const int mask_idx = has_cache ? 4 : 3;
-        const bool has_mask =
-            static_cast<int>(inputs.size()) > mask_idx && inputs[mask_idx];
+        // An int32 tensor in the mask slot is the ring head, not a mask: the
+        // converter appends kv_ring_head after the mask, so a graph that has
+        // the ring but no additive bias puts it at index 4. The mask is
+        // fp16/fp32, the ring head int32, so the dtype tells them apart.
+        const bool has_mask = static_cast<int>(inputs.size()) > mask_idx &&
+                              inputs[mask_idx] &&
+                              inputs[mask_idx]->dtype() != typeid(int);
+        // Q/K/V/mask must all be Q's element type: the dispatch below picks ONE
+        // T from Q and binds every operand through as_tensor<T>(), which
+        // returns null on a mismatch — and bind_ssbo dereferences it, so a
+        // graph whose dtype propagation left K or V at another width segfaults
+        // here instead of reporting. (That is reachable: an fp8 KV graph whose
+        // Quantize/Dequantize pair has been ablated through
+        // VKOP_NO_FUSIONS=fuse_kv_cache_append leaves the fp8 bytes flowing
+        // into the concat that feeds K.) The cache is deliberately exempt: it
+        // has its own dispatch below and may be 1-byte fp8 while Q/K/V stay
+        // fp16.
+        for (int i = 1; i <= 2; ++i) {
+            if (inputs[i] && inputs[i]->dtype() != inputs[0]->dtype()) {
+                throw std::runtime_error(
+                    std::string("Attention: K/V must have Q's element type — "
+                                "K/V at a different width would bind a null "
+                                "buffer (Q is ") +
+                    core::elem_name(inputs[0]->elem_kind()) + ", K/V is " +
+                    core::elem_name(inputs[i]->elem_kind()) + ")");
+            }
+        }
+        if (has_mask && inputs[mask_idx]->dtype() != inputs[0]->dtype()) {
+            throw std::runtime_error(
+                std::string("Attention: the attention bias must have Q's "
+                            "element type (Q is ") +
+                core::elem_name(inputs[0]->elem_kind()) + ", the bias is " +
+                core::elem_name(inputs[mask_idx]->elem_kind()) + ")");
+        }
         // An fp8/fp4 cache rides its own 1-byte container through the graph's
         // Q/DQ pair; this op computes in the Q dtype, so a cache of a different
-        // width is a wiring bug, not something to guess a reinterpret for.
-        if (has_cache && inputs[3]->dtype() != inputs[0]->dtype()) {
+        // width is a wiring bug, not something to guess a reinterpret for. The
+        // one exception is the fp8 cache this op now serves itself (see
+        // cache_scale_): there the cache IS E4M3 bytes and the op does the
+        // decode/encode inline, so a byte container is what it expects.
+        const bool cache_fp8 =
+            has_cache && inputs[3]->dtype() == typeid(int8_t);
+        if (has_cache && !cache_fp8 &&
+            inputs[3]->dtype() != inputs[0]->dtype()) {
             throw std::runtime_error(
                 "Attention: cache dtype must match Q (quantized caches are "
                 "served by the graph's Quantize/Dequantize pair)");
+        }
+        if (cache_fp8 && !(cache_scale_ > 0.0f)) {
+            throw std::runtime_error(
+                "Attention: an fp8 cache needs a positive `cache_scale`");
+        }
+        // The fp8 kernel copies four cache bytes per lane, so a row has to be
+        // a whole number of words. Every real head_dim is a multiple of 16.
+        if (cache_fp8 && (head_dim % 4) != 0) {
+            throw std::runtime_error(
+                "Attention: an fp8 cache needs head_dim % 4 == 0");
+        }
+
+        // Sliding-window ring. `kv_ring_head` (the int32 input the converter
+        // appends after the mask) carries the physical slot of logical row 0;
+        // the op is otherwise stateless per dispatch and derives `kv_past` from
+        // the cache shape alone. The driver keeps kv_len <= W by shrinking the
+        // cache shape before a run that would overflow — so the ring is pure
+        // addressing, never a row move, and the preallocated past/present alias
+        // stays intact. Read on the host: this is a 1-element int32 metadata
+        // input, filled by the driver each round, not a device buffer the
+        // shader indexes. Located by dtype (the mask is fp16/fp32, this is
+        // int32) so it works whether or not the graph carries a mask.
+        int ring = 0;
+        int ring_head = 0;
+        int ring_idx = -1;
+        if (has_cache && ring_ != 0) {
+            for (size_t k = 4; k < inputs.size(); ++k) {
+                if (inputs[k] && inputs[k]->dtype() == typeid(int)) {
+                    ring_idx = static_cast<int>(k);
+                    break;
+                }
+            }
+            if (ring_idx < 0) {
+                throw std::runtime_error("Attention: has_ring is set but no "
+                                         "int32 kv_ring_head input "
+                                         "is bound");
+            }
+            auto ht = core::as_tensor<int>(inputs[ring_idx]);
+            if (!ht || ht->num_elements() < 1) {
+                throw std::runtime_error(
+                    "Attention: kv_ring_head must be int32 with >= 1 element");
+            }
+            if (ht->has_cpu_data()) {
+                ring_head = ht->data()[0];
+            } else {
+                ht->copyToCPU(m_cmdpool_);
+                ring_head = ht->at(0);
+            }
+            ring = 1;
+        }
+
+        // Diagnostic for the sliding-window ring: what this dispatch was
+        // handed. The driver prints the same tuple it *intends*, so a
+        // difference between the two means the head never reached the op. One
+        // line per distinct tuple, not per layer instance.
+        if (ring && std::getenv("VKOP_ATTN_RING_DBG")) {
+            static std::set<std::tuple<int, int, int>> seen;
+            std::tuple<int, int, int> key{kv_past, kv_new, ring_head};
+            if (seen.insert(key).second) {
+                std::fprintf(stderr,
+                             "[attn-dbg] kv_past=%d kv_new=%d kv_len=%d "
+                             "head=%d\n",
+                             kv_past, kv_new, kv_len, ring_head);
+            }
         }
 
         AttentionPC pc{};
@@ -231,6 +357,10 @@ class AttentionBuffer : public BufferFactory {
         pc.mask_causal = mask_causal_;
         pc.kv_past = kv_past;
         pc.has_cache = has_cache ? 1 : 0;
+        pc.ring = ring;
+        pc.ring_head = ring_head;
+        pc.cache_scale = cache_fp8 ? cache_scale_ : 1.0f;
+        pc.cache_fp8 = cache_fp8 ? 1 : 0;
 
         int grid = batch * heads * seq;
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
@@ -255,46 +385,95 @@ class AttentionBuffer : public BufferFactory {
                 objs_.emplace_back(dummy_buffer_); // binding 6
                 return;
             }
-            const int row_elems = 2 * kv_heads * head_dim;
-            const int elem_bytes = static_cast<int>(sizeof(T));
-            // The copy below counts uint words and a word holds 4/elem_bytes
-            // elements, so only the two cache layouts the shader writes are
-            // possible here: 2-byte packed half2 and 4-byte fp32. An 8-byte Q
-            // would truncate that ratio to 0 and divide by it -- which clang
-            // constant-folds in this lambda's int64_t instantiation even though
-            // no such dtype reaches here, so state the contract instead.
-            if (elem_bytes != 2 && elem_bytes != 4) {
-                throw std::runtime_error("Attention: the fused KV cache path "
-                                         "takes a 2- or 4-byte Q");
-            }
-            // cache_in: the history. Its buffer's row capacity is the pitch the
-            // previous round wrote at (the same kernel), so read at that.
-            auto cbuf = bind_ssbo<T>(inputs[cache_idx], /*is_output=*/false);
-            pc.src_stride = row_capacity(cbuf, elem_bytes, row_elems, kv_past);
-            // cache_out: present, logical shape [1,2,Hkv,kv_len,D].
-            auto pres = core::as_tensor<T>(outputs[1]);
-            std::vector<int> p_shape{1, 2, kv_heads, kv_len, head_dim};
-            if (pres->num_elements() != total_elems(p_shape)) {
-                pres->resize(p_shape);
-            }
-            auto pbuf = bind_ssbo<T>(outputs[1], /*is_output=*/true);
-            pc.dst_stride = row_capacity(pbuf, elem_bytes, row_elems, kv_len);
-            // `present` may BE the cache: the driver hands past and present one
-            // preallocated buffer (Tensor::alias_gpu_buffer), so the history is
-            // already where the next round will read it and the copy is pure
-            // overhead. Detected from the two bound buffers rather than from an
-            // attribute, so the flag and the wiring cannot disagree — same
-            // buffer skips the history copy, different buffers runs it. Never
-            // an assumption that could yield a silently stale cache.
-            pc.inplace = (cbuf && pbuf && cbuf.get() == pbuf.get()) ? 1 : 0;
-            // The copy half of the dispatch: one uint word per lane, and a
-            // word holds 4/sizeof(T) elements (2 for the packed fp16 build, 1
-            // for fp32). Dividing by elem_bytes here instead would under-
-            // dispatch fp32 fourfold and leave `present` half-written.
-            const int elems_per_word = 4 / elem_bytes;
-            const int64_t words =
-                static_cast<int64_t>(row_elems) * kv_len / elems_per_word;
-            grid += static_cast<int>((words + 255) / 256);
+            // The cache is bound as its OWN element type, not the compute
+            // dtype: an fp8 cache is E4M3 bytes in an int8_t container while
+            // Q/K/V/Y stay fp16, and binding it through as_tensor<T> would
+            // return null and then address at the wrong pitch. Everything
+            // downstream of the binding (row capacity, the copy grid) is
+            // expressed in elements and elem_bytes, so the two cases share
+            // one body.
+            dispatch_by_dtype(inputs[cache_idx]->dtype(), [&](auto cache_tag) {
+                using C = decltype(cache_tag);
+                const int row_elems = 2 * kv_heads * head_dim;
+                const int elem_bytes = static_cast<int>(sizeof(C));
+                // The copy below counts uint words and a word holds
+                // 4/elem_bytes elements, so only the cache layouts the shader
+                // writes are possible here: the 2-byte packed half2, the
+                // 4-byte fp32 and the 1-byte fp8. An 8-byte element would
+                // truncate that ratio to 0 and divide by it -- which clang
+                // constant-folds in this lambda's int64_t instantiation even
+                // though no such dtype reaches here, so state the contract
+                // instead.
+                if (elem_bytes != 1 && elem_bytes != 2 && elem_bytes != 4) {
+                    throw std::runtime_error(
+                        "Attention: the fused KV cache path takes a 1-, 2- "
+                        "or 4-byte element");
+                }
+                // cache_in: the history. Its buffer's row capacity is the pitch
+                // the previous round wrote at (the same kernel), so read at
+                // that.
+                auto cbuf =
+                    bind_ssbo<C>(inputs[cache_idx], /*is_output=*/false);
+                pc.src_stride =
+                    row_capacity(cbuf, elem_bytes, row_elems, kv_past);
+                // cache_out: present, logical shape [1,2,Hkv,kv_len,D].
+                auto pres = core::as_tensor<C>(outputs[1]);
+                std::vector<int> p_shape{1, 2, kv_heads, kv_len, head_dim};
+                if (pres->num_elements() != total_elems(p_shape)) {
+                    pres->resize(p_shape);
+                }
+                auto pbuf = bind_ssbo<C>(outputs[1], /*is_output=*/true);
+                pc.dst_stride =
+                    row_capacity(pbuf, elem_bytes, row_elems, kv_len);
+                // `present` may BE the cache: the driver hands past and present
+                // one preallocated buffer (Tensor::alias_gpu_buffer), so the
+                // history is already where the next round will read it and the
+                // copy is pure overhead. Detected from the two bound buffers
+                // rather than from an attribute, so the flag and the wiring
+                // cannot disagree — same buffer skips the history copy,
+                // different buffers runs it. Never an assumption that could
+                // yield a silently stale cache.
+                pc.inplace = (cbuf && pbuf && cbuf.get() == pbuf.get()) ? 1 : 0;
+                // Ring invariants: the history must stay put (a ring only
+                // rotates the addressing, so past and present have to be one
+                // buffer), and the logical window must fit the physical one —
+                // the whole point of the shape-shrink protocol is that kv_len
+                // never exceeds W.
+                if (ring) {
+                    if (pc.inplace == 0) {
+                        throw std::runtime_error(
+                            "Attention: the KV ring requires present to alias "
+                            "past (inplace); the driver must hand both one "
+                            "buffer");
+                    }
+                    if (kv_len > pc.src_stride) {
+                        throw std::runtime_error(
+                            "Attention: KV ring window (kv_len=" +
+                            std::to_string(kv_len) +
+                            ") exceeds the cache capacity (" +
+                            std::to_string(pc.src_stride) + ")");
+                    }
+                    if (!ring_logged_) {
+                        std::fprintf(stderr, "[attn] kv ring active (W=%d%s)\n",
+                                     pc.src_stride, cache_fp8 ? ", fp8" : "");
+                        ring_logged_ = true;
+                    }
+                }
+                // The copy half of the dispatch: one uint word per lane, and a
+                // word holds 4/sizeof(C) elements (2 for the packed fp16 cache,
+                // 4 for the fp8 one, 1 for fp32). Dividing by elem_bytes here
+                // instead would under-dispatch fp32 fourfold and leave
+                // `present` half-written — and over-dispatch fp8 just as badly.
+                const int elems_per_word = 4 / elem_bytes;
+                // Under the ring the history is already in place and only the
+                // fresh rows are written — the same rows the kernel's copy
+                // covers — so the dispatch is sized to them rather than to the
+                // whole window.
+                const int64_t copy_rows = ring ? kv_new : kv_len;
+                const int64_t words = static_cast<int64_t>(row_elems) *
+                                      copy_rows / elems_per_word;
+                grid += static_cast<int>((words + 255) / 256);
+            });
         });
 
         submit(&pc, grid, 1, 1);
@@ -305,6 +484,13 @@ class AttentionBuffer : public BufferFactory {
     int num_kv_heads_ = 0; // ditto
     int causal_ = 0;
     int has_cache_ = 0;
+    // Sliding-window ring (see execute()). Off unless the converter declares
+    // it, so a graph without the ring is byte-identical to before.
+    int ring_ = 0;
+    bool ring_logged_ = false;
+    // fp8 cache scale (see setAttribute). 0 = no fp8 cache folded in, which is
+    // also the check that rejects an fp8 cache bound without one.
+    float cache_scale_ = 0.0F;
     // Declared invariant: the bound mask is the standard causal one (0 at
     // j <= kv_len - seq + s, fp16 min above). It lets the kernel stop its kv
     // sweep at the query row's diagonal, which halves a causal prefill. Only

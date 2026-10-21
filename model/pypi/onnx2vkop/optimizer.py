@@ -4073,6 +4073,29 @@ class FusionOptimizer:
             except Exception:
                 return None
 
+        def _float_scalar(name):
+            """_int_scalar's float twin: the value of a scalar fp32 initializer
+            (an fp8 cache's per-tensor Q/DQ scale), or None."""
+            v = dag_model.initializers.get(name)
+            if v is None:
+                p = producer.get(name)
+                if p is not None and p.op_type == "Constant":
+                    v = p.attributes.get("value")
+            if v is None:
+                return None
+            try:
+                import numpy as np
+
+                if not isinstance(v, np.ndarray):
+                    from onnx import numpy_helper
+
+                    v = numpy_helper.to_array(v)
+                if v.size != 1:
+                    return None
+                return float(v.reshape(-1)[0])
+            except Exception:
+                return None
+
         def _axis(node, default=0):
             v = node.attributes.get("axis", default)
             try:
@@ -4127,6 +4150,31 @@ class FusionOptimizer:
             past_k, past_v = g_k.inputs[0], g_v.inputs[0]
             if past_k["name"] != past_v["name"]:
                 continue
+            # An fp8 cache stores the graph's past/present as E4M3 bytes and
+            # wraps the boundary in a DequantizeLinear (past -> fp16) /
+            # QuantizeLinear (fp16 -> present), so the Gathers read the DQ's
+            # output rather than the graph input. Follow that pair: folding it
+            # into the op is what lets an fp8 cache stay in place (past ==
+            # present) instead of routing the whole history through an fp16
+            # intermediate every round — and it is the only way an fp8 cache can
+            # take the ring, which requires the history not to move.
+            cache_scale = None
+            dq_node = producer.get(past_k["name"])
+            if dq_node is not None and dq_node.op_type == "DequantizeLinear":
+                if len(dq_node.inputs) < 2:
+                    continue
+                cache_scale = _float_scalar(dq_node.inputs[1]["name"])
+                if cache_scale is None or cache_scale <= 0.0:
+                    continue
+                # The DQ must feed nothing but the two Gathers, or deleting it
+                # would strand a live consumer.
+                dq_cons = consumers.get(past_k["name"], [])
+                if len(dq_cons) != 2:
+                    continue
+                if not ((dq_cons[0][0] is g_k and dq_cons[1][0] is g_v) or
+                        (dq_cons[0][0] is g_v and dq_cons[1][0] is g_k)):
+                    continue
+                past_k = dq_node.inputs[0]
             if past_k["name"] not in graph_inputs:
                 continue  # a cache the driver did not allocate is not a cache
             if past_k["name"] in graph_outputs:
@@ -4176,8 +4224,24 @@ class FusionOptimizer:
             if _axis(present_node) not in (1, -4):
                 continue
             present_out = present_node.outputs[0]
+            q_node = None
             if present_out["name"] not in graph_outputs:
-                continue
+                # fp8 cache: the present Concat feeds a QuantizeLinear whose fp8
+                # output is the graph output. Both sides must share one scale —
+                # the exporter emits a single per-tensor initializer — or the
+                # round trip would not be the one the graph describes.
+                if cache_scale is None:
+                    continue
+                q_node = _single_consumer(present_out["name"])
+                if (q_node is None or q_node.op_type != "QuantizeLinear" or
+                        len(q_node.inputs) < 2):
+                    continue
+                q_scale = _float_scalar(q_node.inputs[1]["name"])
+                if q_scale is None or q_scale != cache_scale:
+                    continue
+                if q_node.outputs[0]["name"] not in graph_outputs:
+                    continue
+                present_out = q_node.outputs[0]
 
             matches.append({
                 "attention": att,
@@ -4185,8 +4249,11 @@ class FusionOptimizer:
                 "v_new": v_new,
                 "past": past_k,
                 "present": present_out,
+                "cache_scale": cache_scale,
                 "nodes_to_delete": [g_k, g_v, kc, vc, usq_k, usq_v,
-                                    present_node],
+                                    present_node] +
+                                   ([dq_node] if dq_node is not None else []) +
+                                   ([q_node] if q_node is not None else []),
             })
 
         print(f"Found {len(matches)} KV-cache append patterns for potential fusion")
@@ -4204,12 +4271,29 @@ class FusionOptimizer:
         att = match["attention"]
         inputs = [att.inputs[0], match["k_new"], match["v_new"], match["past"]]
         inputs += att.inputs[3:]  # the additive mask, when the graph has one
+        # A sliding-window ring needs the slot of logical row 0, which no shape
+        # carries. The exporter declares it as a 1-element int32 graph input
+        # `kv_ring_head`; when present, hand it to the op as a trailing input
+        # (after the mask — the op finds it by dtype) and declare the ring. A
+        # graph without it converts exactly as before.
+        has_ring = any(i["name"] == "kv_ring_head"
+                       for i in getattr(dag_model, "inputs", []))
+        if has_ring:
+            inputs.append({"name": "kv_ring_head"})
         att.inputs = inputs
         att.outputs = att.outputs[:1] + [match["present"]]
         # The cache replaces the mask-carried causality *and* the Concat-chain
         # present tensor; both are attributes the op reads at execute() time.
         att.attributes = dict(att.attributes)
         att.attributes["has_cache"] = 1
+        if has_ring:
+            att.attributes["has_ring"] = 1
+        # fp8 cache: the Q/DQ pair that used to wrap the boundary is gone, so
+        # the op owns the scale (it decodes on read, encodes on write). Present
+        # only when the matcher followed that pair, so an fp16 cache is
+        # unaffected.
+        if match.get("cache_scale") is not None:
+            att.attributes["cache_scale"] = float(match["cache_scale"])
         for n in match["nodes_to_delete"]:
             del dag_model.nodes[n.name]
         print(f"Fused KV-cache append into '{att.name}' "

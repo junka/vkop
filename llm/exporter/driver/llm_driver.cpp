@@ -177,6 +177,18 @@ void load_round_inputs(const std::shared_ptr<Runtime>& rt,
         fill_input(rt, name, arr);
         upload_input(cmdpool, rt->GetInput(name));
     }
+    // 滑窗环的那条通道（1 元素 int32 的 kv_ring_head = 逻辑行 0 的物理槽）。
+    // 它不在 dump 的 input_names.txt 里（dump 早于环），所以没人填 —— 而它是
+    // host-authoritative 的：Attention 直接读它的 host 值当槽位偏移，读到未初始
+    // 化的 buffer 就会去读错的槽，而且错得很安静。llm_driver 跑的轮次都满足
+    // kv_len <= W（它不丢行），所以 head 恒为 0，这里显式写死。
+    if (auto rt_head = rt->GetInput("kv_ring_head")) {
+        if (rt_head->getShape() != std::vector<int>{1}) rt->ResizeInput("kv_ring_head", {1u});
+        const int head = 0;
+        auto tg = as_tensor<int>(rt->GetInput("kv_ring_head"));
+        if (tg->num_elements() > 0) tg->fillToCPU(&head);
+        upload_input(cmdpool, rt->GetInput("kv_ring_head"));
+    }
     if (input_names_out) *input_names_out = names;
 }
 

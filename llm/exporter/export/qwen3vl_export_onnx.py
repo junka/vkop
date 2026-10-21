@@ -26,6 +26,8 @@ I/O 契约（llm.onnx）：
 
 import os
 import sys
+
+LLM_STEM = os.environ.get("VKOP_LLM_STEM", "llm")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -401,7 +403,7 @@ llm_wrapper = Qwen3VLLMOnnx(model)
 assert_static_mrope_bitwise(lm.rotary_emb, llm_wrapper.mrope_static)
 with torch.no_grad():
     torch.onnx.export(
-        llm_wrapper, inputs, "llm.onnx",
+        llm_wrapper, inputs, f"{LLM_STEM}.onnx",
         input_names=input_names,
         output_names=output_names,
         dynamic_axes=dynamic_axes,
@@ -416,9 +418,15 @@ print("[✓] llm.onnx exported (KV cache + deepstack)")
 # 3. 合并 llm.onnx 的散权重为单文件 llm.weights.bin，删除散文件
 # ---------------------------------------------------------------------------
 import onnx
+from onnx import helper, TensorProto
+
+# KV fp8 改写实现抽在同目录的 kv_fp8_rewrite.py：make_kv_variant.py 要从已经
+# 导出的 llm.onnx 上离线套同一份变换（省掉每变体一次 3.4GB 的权重导出），两边
+# 必须逐字一致，所以只有一份实现。
+from kv_fp8_rewrite import insert_fp8_kv_cache  # noqa: E402
 
 print("[consolidate] loading llm.onnx with external data (scattered files) ...")
-m = onnx.load("llm.onnx", load_external_data=True)
+m = onnx.load(f"{LLM_STEM}.onnx", load_external_data=True)
 n_init = len(m.graph.initializer)
 n_ext = sum(1 for t in m.graph.initializer if t.HasField("data_location") and t.data_location == 1)
 print(f"[consolidate] initializers={n_init} external={n_ext}")
@@ -432,12 +440,49 @@ print(f"[consolidate] initializers={n_init} external={n_ext}")
 # 上的 metadata_props（同 vkop_io_dtype）。
 m.metadata_props.add(key="vkop_causal_mask:attention_bias", value="1")
 
-print("[consolidate] saving as single llm.weights.bin ...")
+# VKOP_RING=1 声明滑窗环的那条通道：一个 1 元素的 int32 图输入 kv_ring_head，
+# 内容 = 「逻辑行 0 落在环里的哪个物理槽」。它不被任何 HF 节点消费 —— 它存在的
+# 唯一理由是当一条没有任何张量形状能表达、又是每轮都会变的会话状态（同 kv_len
+# 之于形状）传给融合后的 Attention：converter 见到这个名字就把输入接到算子上并
+# 打 has_ring=1（见 onnx2vkop/optimizer.py 的 fold_kv_cache_append）。关掉时
+# llm.onnx 一个字节都不变，转换路径也和从前完全一致。
+if os.environ.get("VKOP_RING", "") not in ("", "0"):
+    m.graph.input.append(onnx.helper.make_tensor_value_info(
+        "kv_ring_head", onnx.TensorProto.INT32, [1]))
+    print("[ring] declared graph input kv_ring_head (int32 [1])")
+
+
+# ---------------------------------------------------------------------------
+# 可选：FP8 KV cache（E4M3，1B/elem —— 显存再减半）。
+#
+# 与 qwen3/qwen2 导出脚本里的同名函数逐字一致（那份已经在 llm_fp8 上跑通过了
+# 单元 + e2e），这里只是补上 Qwen3-VL 这条导出路径 —— 它的 llm.onnx 多出
+# deepstack/image_pad_mask 两族输入，但 KV 那 28 层 past/present 的形状与
+# 语义完全一样，所以缓存边界这段改写可以原样搬。实现在 kv_fp8_rewrite.py，
+# make_kv_variant.py 也 import 它（同一次变换的第二个入口）。
+#
+# attention 仍然在 fp16 里算：fp8 只是**存储**，在 cache 的边界插一对
+# QuantizeLinear / DequantizeLinear。scale 是 per-tensor 的 fp32 标量常量
+# （VKOP_KV_SCALE，默认 0.1 —— 覆盖 Qwen3 K/V 过完 k_norm 后的典型值域；超过
+# ±448 会被 E4M3 saturate）。
+#
+# 显存收益是实打实的：2·nkv·hd·nlayers = 57,344 elems/token，fp16 是 112KB/token，
+# fp8 是 56KB/token —— 8192 行的 cache 从 ~896MB 掉到 ~448MB。
+# ---------------------------------------------------------------------------
+if os.environ.get("VKOP_KV_FP8") == "1":
+    insert_fp8_kv_cache(m, scale=float(os.environ.get("VKOP_KV_SCALE", "0.1")))
+
+# 变体命名：KV 的存储格式决定了必须换一个模型文件（cache 张量的元素宽度写在
+# ValueInfoProto 里，运行时按它建容器），而本脚本的产物名是写死的，所以 fp8 /
+# 滑窗这两个变体用 VKOP_LLM_STEM 换个前缀 —— 默认仍是 llm.*，旧路径一个字节
+# 都不动；变体不会碰到 llm.weights.bin（那是 3.4GB 的原始权重，只能由默认运行
+# 重建）。
+print(f"[consolidate] saving as single {LLM_STEM}.weights.bin ...")
 onnx.save_model(
-    m, "llm.onnx",
+    m, f"{LLM_STEM}.onnx",
     save_as_external_data=True,
     all_tensors_to_one_file=True,
-    location="llm.weights.bin",
+    location=f"{LLM_STEM}.weights.bin",
     convert_attribute=True,
 )
 
@@ -445,21 +490,21 @@ onnx.save_model(
 removed = 0
 for f in os.listdir("."):
     if f.endswith(".weight") or f.startswith("onnx__MatMul_"):
-        if f != "llm.weights.bin":
+        if f != f"{LLM_STEM}.weights.bin":
             os.remove(f)
             removed += 1
-print(f"[✓] consolidated into llm.weights.bin, removed {removed} scattered files")
+print(f"[✓] consolidated into {LLM_STEM}.weights.bin, removed {removed} scattered files")
 
 # 验证：重载确认 location 全指向 llm.weights.bin
-m2 = onnx.load("llm.onnx", load_external_data=False)
+m2 = onnx.load(f"{LLM_STEM}.onnx", load_external_data=False)
 locs = set()
 for t in m2.graph.initializer:
     if t.HasField("data_location") and t.data_location == 1:
         for kv in t.external_data:
             if kv.key == "location":
                 locs.add(kv.value)
-print(f"[verify] external locations: {locs} (expect {{'llm.weights.bin'}})")
-assert locs == {"llm.weights.bin"}, f"unexpected external locations: {locs}"
+print(f"[verify] external locations: {locs} (expect {{'{LLM_STEM}.weights.bin'}})")
+assert locs == {f"{LLM_STEM}.weights.bin"}, f"unexpected external locations: {locs}"
 print("done.")
 
 # embed_tokens 权重表不由本脚本导出：它不在 llm.onnx 图里（图输入是

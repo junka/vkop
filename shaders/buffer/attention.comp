@@ -90,10 +90,30 @@ layout(push_constant) uniform PC_ATTN {
     int src_stride;   // cache_in row stride (logical kv dim of that tensor)
     int dst_stride;   // cache_out row stride
     int inplace;      // 0/1: cache_out aliases cache_in (skip the history copy)
+    int ring;         // 0/1: sliding-window ring over the cache rows
+    int ring_head;    // physical slot of logical row 0 (0 when ring == 0)
+    float cache_scale; // fp8 cache scale (dequant multiplies, quant divides)
+    int cache_fp8;    // 0/1: the cache holds E4M3 bytes, not compute-dtype elems
+    int _pad0;
+    int _pad1;
 } uA;
 
 #define TILE_KV 256
 #define MAX_HD 256
+
+// Physical slot of logical key position j. Without the ring this is the
+// identity: the cache rows are written in order and j < kv_len <= capacity, so
+// no modulo is needed (and none is done, keeping the off path bit-identical).
+// With the ring the resident rows are the newest W and logical row 0 sits at
+// slot `ring_head`, so slot(j) = (ring_head + j) mod W with W = the row
+// capacity (src_stride). Row j and row j+W collide on one slot, which is what
+// makes the oldest S rows fall out when the driver appends S more.
+int kv_slot(int j) {
+    if (uA.ring == 0) {
+        return j;
+    }
+    return (uA.ring_head + j) % uA.src_stride;
+}
 
 // Cache row stride in uint words (a fp16 row is D/2 packed words, fp32 D).
 #ifdef FP16
@@ -101,6 +121,61 @@ layout(push_constant) uniform PC_ATTN {
 #else
 #define CACHE_ROW_WORDS(D) (D)
 #endif
+
+// ---- fp8 (E4M3) cache ------------------------------------------------------
+// The cache may hold one byte per element instead of the compute dtype: the
+// driver stores past/present as E4M3 and this op decodes on read and encodes on
+// write. That is what an fp8 cache needs to be appendable in place (past ==
+// present): the graph's Q/DQ pair would otherwise force the present through an
+// fp16 intermediate, and the whole history would be re-quantized every round.
+//
+// Four bytes per uint word, so a row is D/4 words (the host requires
+// D % 4 == 0 for this cache, which every real head_dim satisfies). The scale is
+// one per-tensor fp32, applied on read (multiply) and write (divide).
+//
+// Decode mirrors matmul.comp's e4m3_val and quantize_linear.comp's
+// e4m3_decode — with the sign stripped, a normal E4M3 byte's [exp|mant] is
+// already the top of an fp32's once the biases agree (bias 7, mantissa lsb
+// 2^-3); only exponent 0 (a subnormal) needs its own term. There is no
+// VK_EXT_shader_float8 on this stack.
+float e4m3_decode(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// fp32 -> E4M3 byte, round-to-nearest-even, saturating at 0x7e (0x7f is
+// Inf/NaN). Input is already divided by the scale. Mirrors
+// quantize_linear.comp's e4m3_encode.
+uint e4m3_encode(float x) {
+    uint sign = (x < 0.0) ? 0x80u : 0x00u;
+    float a = abs(x);
+    uint code;
+    if (a >= 0.015625) {
+        uint bits = floatBitsToUint(a);
+        int e32 = int((bits >> 23u) & 0xFFu) - 127;
+        float frac = a / uintBitsToFloat(uint(e32 + 127) << 23u) - 1.0;
+        int m_i = int(roundEven(frac * 8.0));
+        if (m_i >= 8) {
+            m_i = 0;
+            e32 += 1;
+        }
+        int e_code = e32 + 7;
+        code = (e_code >= 15) ? 0x7Eu : ((uint(e_code) << 3u) | uint(m_i));
+    } else {
+        code = uint(roundEven(a / 0.001953125));
+    }
+    return sign | min(code, 0x7Eu);
+}
+
+// Element `e` of the fp8 cache, decoded but NOT yet scaled (the scale is folded
+// into the callers: one multiply per row/accumulator instead of one per
+// element). Only called when uA.cache_fp8 != 0.
+float cache_elem(int e) {
+    uint b = (uCacheIn.data[e >> 2] >> ((uint(e) & 3u) << 3u)) & 0xFFu;
+    return e4m3_decode(b);
+}
 
 // Element-loaded float: fp16 reads packed half2 (2 elements/word), fp32 one
 // element per word.
@@ -184,6 +259,38 @@ shared float sAcc[4][MAX_HD];
     } while (false)
 #endif
 
+// One V dim-pair of an fp8 cache row. The lane mapping is deliberately the same
+// as ACC_PAIR's (one even dim pair per lane) rather than repacking to 4 bytes
+// per lane: the cache/scale multiply stays per-pair, and the byte extract is
+// two shifts of one word, which the L1 has already brought in for its
+// neighbour. Element offsets, so the scale is the only extra per-row work.
+#define ACC_PAIR_F8(ROWOFF, D0, P, A0, A1)                                      \
+    do {                                                                        \
+        float ps_ = (P) * uA.cache_scale;                                       \
+        int e_ = (ROWOFF) + (D0);                                               \
+        (A0) += ps_ * cache_elem(e_);                                           \
+        (A1) += ps_ * cache_elem(e_ + 1);                                       \
+    } while (false)
+
+// Q·K[:,j] over an fp8 cache row, into DOT (scale applied once at the end).
+// Same four-accumulator ILP shape as SCORE_DOT; each element costs a byte
+// extract plus the decode, which is why the scale is not folded per element.
+#define SCORE_DOT_F8(OFF, DOT)                                                  \
+    do {                                                                        \
+        float a0 = 0.0, a1 = 0.0, a2 = 0.0, a3 = 0.0;                           \
+        int d = 0;                                                              \
+        for (; d + 4 <= D; d += 4) {                                            \
+            a0 += sQ[d] * cache_elem((OFF) + d);                                \
+            a1 += sQ[d + 1] * cache_elem((OFF) + d + 1);                        \
+            a2 += sQ[d + 2] * cache_elem((OFF) + d + 2);                        \
+            a3 += sQ[d + 3] * cache_elem((OFF) + d + 3);                        \
+        }                                                                       \
+        for (; d < D; ++d) {                                                    \
+            a0 += sQ[d] * cache_elem((OFF) + d);                                \
+        }                                                                       \
+        (DOT) = ((a0 + a1) + (a2 + a3)) * uA.cache_scale;                       \
+    } while (false)
+
 // Tree-reduce `s_red` (256 lanes) with `op`, leaving the result in s_red[0].
 // Each step fences, so the value every lane latched before the call is not
 // clobbered by a lane that has already moved on. The leading fence is
@@ -230,31 +337,86 @@ shared float sAcc[4][MAX_HD];
 void copy_cache(int cwg) {
     int D = uA.head_dim;
     int nkv = uA.kv_heads;
-    int kv = uA.kv_len;
     int R = CACHE_ROW_WORDS(D); // words per D-element row
-    int total_words = 2 * nkv * kv * R;
+    // With the ring the history never moves (the ring requires inplace, checked
+    // on the host), so only the fresh rows [kv_past, kv_len) are written and the
+    // dispatch is sized to them — otherwise every history lane would be a
+    // wasted early-return.
+    int nrows = (uA.ring != 0) ? (uA.kv_len - uA.kv_past) : uA.kv_len;
+    int j0 = (uA.ring != 0) ? uA.kv_past : 0;
+    int total_words = 2 * nkv * nrows * R;
     int gid = cwg * 256 + int(gl_LocalInvocationID.x);
     if (gid >= total_words) {
         return;
     }
     int w = gid % R;
     int row = gid / R;
-    int j = row % kv;
-    int h = (row / kv) % nkv;
-    int c = row / (kv * nkv); // 0 = K, 1 = V
+    int j = j0 + row % nrows;
+    int h = (row / nrows) % nkv;
+    int c = row / (nrows * nkv); // 0 = K, 1 = V
 
     uint word;
     if (j < uA.kv_past) {
         if (uA.inplace != 0) {
             return; // cache_out IS cache_in: the history is already in place
         }
-        word = uCacheIn.data[((c * nkv + h) * uA.src_stride + j) * R + w];
+        word = uCacheIn
+                   .data[((c * nkv + h) * uA.src_stride + kv_slot(j)) * R + w];
     } else {
         // Fresh rows, batch 0 (the host requires B == 1 with a cache).
         int off = (h * uA.seq + (j - uA.kv_past)) * R + w;
         word = (c == 0) ? uK.data[off] : uV.data[off];
     }
-    uCacheOut.data[((c * nkv + h) * uA.dst_stride + j) * R + w] = word;
+    uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
+}
+
+// The fp8 twin of copy_cache: same position mapping (including the ring slot),
+// but one byte-word per lane and an encode on the fresh rows, whose source is
+// the fp16 compute domain. A lane writes 4 bytes, so it reads two packed half2
+// words there; the history is a straight byte-word copy.
+void copy_cache_f8(int cwg) {
+    int D = uA.head_dim;
+    int nkv = uA.kv_heads;
+    int R = D >> 2; // fp8: 4 bytes per uint word
+    int nrows = (uA.ring != 0) ? (uA.kv_len - uA.kv_past) : uA.kv_len;
+    int j0 = (uA.ring != 0) ? uA.kv_past : 0;
+    int total_words = 2 * nkv * nrows * R;
+    int gid = cwg * 256 + int(gl_LocalInvocationID.x);
+    if (gid >= total_words) {
+        return;
+    }
+    int w = gid % R;
+    int row = gid / R;
+    int j = j0 + row % nrows;
+    int h = (row / nrows) % nkv;
+    int c = row / (nrows * nkv); // 0 = K, 1 = V
+
+    uint word;
+    if (j < uA.kv_past) {
+        if (uA.inplace != 0) {
+            return; // cache_out IS cache_in: the history is already in place
+        }
+        word = uCacheIn
+                   .data[((c * nkv + h) * uA.src_stride + kv_slot(j)) * R + w];
+    } else {
+        // Fresh rows, batch 0 (the host requires B == 1 with a cache). They are
+        // fp16 rows of D/2 words; this lane owns elements [4w, 4w+4), i.e. half2
+        // words 2w and 2w+1.
+        int krow = (h * uA.seq + (j - uA.kv_past)) * (D >> 1) + (w << 1);
+        vec2 p0;
+        vec2 p1;
+        if (c == 0) {
+            p0 = unpackHalf2x16(uK.data[krow]);
+            p1 = unpackHalf2x16(uK.data[krow + 1]);
+        } else {
+            p0 = unpackHalf2x16(uV.data[krow]);
+            p1 = unpackHalf2x16(uV.data[krow + 1]);
+        }
+        float inv = 1.0 / uA.cache_scale;
+        word = e4m3_encode(p0.x * inv) | (e4m3_encode(p0.y * inv) << 8u) |
+               (e4m3_encode(p1.x * inv) << 16u) | (e4m3_encode(p1.y * inv) << 24u);
+    }
+    uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
 }
 
 void main() {
@@ -272,7 +434,11 @@ void main() {
     // extra workgroups, if any, are the cache copy
     int attn_wgs = uA.batch * H * S;
     if (uA.has_cache != 0 && wg >= attn_wgs) {
-        copy_cache(wg - attn_wgs);
+        if (uA.cache_fp8 != 0) {
+            copy_cache_f8(wg - attn_wgs);
+        } else {
+            copy_cache(wg - attn_wgs);
+        }
         return;
     }
 
@@ -345,8 +511,12 @@ void main() {
             bool from_cache = (uA.has_cache != 0) && (j < kv_past);
             float dot;
             if (from_cache) {
-                off = c_base + j * D;
-                SCORE_DOT(uCacheIn, off, dot);
+                off = c_base + kv_slot(j) * D;
+                if (uA.cache_fp8 != 0) {
+                    SCORE_DOT_F8(off, dot);
+                } else {
+                    SCORE_DOT(uCacheIn, off, dot);
+                }
             } else {
                 off = k_base + (j - kv_past) * D;
                 SCORE_DOT(uK, off, dot);
@@ -403,7 +573,12 @@ void main() {
             float p1 = 0.0;
             int hi = min(jhi, kv_past);
             for (int j = jlo; j < hi; ++j) {
-                ACC_PAIR(uCacheIn, c_v_base + j * D, d0, sS[j - t0], p0, p1);
+                if (uA.cache_fp8 != 0) {
+                    ACC_PAIR_F8(c_v_base + kv_slot(j) * D, d0, sS[j - t0], p0, p1);
+                } else {
+                    ACC_PAIR(uCacheIn, c_v_base + kv_slot(j) * D, d0, sS[j - t0],
+                             p0, p1);
+                }
             }
             int lo = max(jlo, kv_past);
             for (int j = lo; j < jhi; ++j) {

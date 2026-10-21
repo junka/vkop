@@ -274,6 +274,17 @@ void fill_i64_input(const std::shared_ptr<Runtime>& rt,
     if (tg->num_elements() > 0) tg->fillToCPU(data);
 }
 
+// Fill the ring-head input ([1] int32, host-authoritative — the Attention op
+// reads it through has_cpu_data(), so there is nothing to upload).
+void fill_i32_input(const std::shared_ptr<Runtime>& rt,
+                    const std::string& name, int value) {
+    auto t = rt->GetInput(name);
+    if (!t) return;
+    if (t->getShape() != std::vector<int>{1}) rt->ResizeInput(name, {1u});
+    auto tg = as_tensor<int>(rt->GetInput(name));
+    if (tg->num_elements() > 0) tg->fillToCPU(&value);
+}
+
 // Upload whatever dtype input to GPU.
 void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
                   const std::shared_ptr<ITensor>& t) {
@@ -510,7 +521,8 @@ int main(int argc, char** argv) {
     if (argc < 4) {
         std::fprintf(stderr,
             "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> [max_new] "
-            "[--image <img>]... --visual <visual.vkopbin>\n",
+            "[--image <img>]... --visual <visual.vkopbin> [--max-kv N] "
+            "[--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
             argv[0]);
         return 1;
     }
@@ -518,8 +530,10 @@ int main(int argc, char** argv) {
     const std::string embed_path = argv[2];
     const std::string tok_path = argv[3];
     int max_new = 64;
+    int max_kv = 8192;
     std::vector<std::string> image_paths;
     std::string visual_path;
+    std::string kv_kind_opt = "auto";
     // Parse optional positional max_new + --image/--visual flags (any order).
     // --image is repeatable: order defines the image→prompt binding.
     bool have_max = false;
@@ -527,9 +541,20 @@ int main(int argc, char** argv) {
         std::string a = argv[i];
         if (a == "--image" && i + 1 < argc) { image_paths.push_back(argv[++i]); }
         else if (a == "--visual" && i + 1 < argc) { visual_path = argv[++i]; }
+        else if (a == "--max-kv" && i + 1 < argc) { max_kv = std::atoi(argv[++i]); }
+        else if (a == "--kv-kind" && i + 1 < argc) { kv_kind_opt = argv[++i]; }
         else if (!a.empty() && a[0] != '-' && !have_max) {
             max_new = std::atoi(a.c_str()); have_max = true;
         }
+    }
+    if (max_kv <= 0) {
+        std::fprintf(stderr, "[error] --max-kv must be > 0 (got %d)\n", max_kv);
+        return 1;
+    }
+    if (max_kv < max_new) {
+        std::fprintf(stderr, "[error] --max-kv %d < max_new %d — the window must "
+                     "hold at least one generation\n", max_kv, max_new);
+        return 1;
     }
     const bool multimodal = !image_paths.empty() && !visual_path.empty();
     if (!image_paths.empty() && visual_path.empty()) {
@@ -569,6 +594,36 @@ int main(int argc, char** argv) {
                 arch.position_ids_dims,
                 arch.has_deepstack ? "has_deepstack" : "no_deepstack",
                 arch.has_image_pad_mask ? "has_image_pad_mask" : "no_image_pad_mask");
+
+    // --kv-kind：覆盖 KVCache 的元素宽度。默认 auto = 跟随模型的
+    // past_key_values_0（见 infer_model_arch）。cache 宽度必须与图的 cache
+    // 张量一致 —— 不一致时 vkop 会静默误读，所以这里硬警告。
+    if (kv_kind_opt != "auto") {
+        const ElemKind pk0_kind = rt->GetInput("past_key_values_0")->elem_kind();
+        static const std::pair<const char*, ElemKind> kKinds[] = {
+            {"fp16", ElemKind::kFloat16},
+            {"fp8e4m3", ElemKind::kFloat8E4M3FN},
+            {"fp8e5m2", ElemKind::kFloat8E5M2},
+            {"int4", ElemKind::kInt4},
+            {"nf4", ElemKind::kNF4},
+        };
+        bool ok = false;
+        for (const auto& k : kKinds) {
+            if (kv_kind_opt == k.first) { arch.cache_kind = k.second; ok = true; break; }
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[error] --kv-kind %s 未知（auto/fp16/fp8e4m3/"
+                         "fp8e5m2/int4/nf4）\n", kv_kind_opt.c_str());
+            return 1;
+        }
+        if (arch.cache_kind != pk0_kind) {
+            std::fprintf(stderr,
+                "[warn] --kv-kind %s 覆盖了模型的 cache dtype %s —— 两者不一致会"
+                "误读 KV 缓冲，除非模型文件确实按该 dtype 导出\n",
+                kv_kind_opt.c_str(), elem_name(pk0_kind));
+        }
+    }
+    std::printf("[arch] kv cache dtype = %s\n", elem_name(arch.cache_kind));
 
     // Embedding table: vocab inferred from file size，按 arch.hidden 推断。
     auto [embed_table, vocab] = load_embed_table(embed_path, arch.hidden);
@@ -613,11 +668,33 @@ int main(int argc, char** argv) {
         }
     }
 
-    // KV cache：每层 past/present 的 buffer 一次开好（MAX_KV 上界），之后每轮
+    // KV cache：每层 past/present 的 buffer 一次开好（max_kv 上界），之后每轮
     // 只做逻辑 resize + present→past 回填。生命周期见 kv_cache.hpp。
-    const int MAX_KV = 8192;
-    KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, MAX_KV,
+    // --max-kv 可调：它同时是滑窗环的表观容量 W（见 Attention 的 ring）。
+    KVCache kv(rt, cmdpool, arch.nlayers, arch.nkv, arch.hd, max_kv,
                arch.cache_kind);
+
+    // ---- 滑窗环（graph 侧带 kv_ring_head 时启用，见 ops/Attention.hpp）----
+    // KV 变成 W 行的一个环：逻辑行 j 落在物理槽 (kv_head + j) % W，覆盖的绝对
+    // 位置是 [kv_base, kv_base + kv_resident)。三条会话级不变量：
+    //   · kv_resident + S <= W —— 本轮 Run **之前**必须成立，否则新行会写进
+    //     本轮查询还要读的最旧几行（kernel 是原地写）。这由窗口起点在
+    //     prefill 之前就定死来保证（见下面的 ring 分支）：S = L - kv_base 且
+    //     kv_base >= L - W，所以 S <= W 恒成立；
+    //   · 图的 kv_past 是 kv_resident（cache 的行数），而 position_ids 用的是
+    //     绝对位置 kv_base + kv_resident —— 两者在 base 移动后就分岔了；
+    //   · 丢行只动 kv_head/kv_base，一个字都不搬，这正是精力在 ring 上而不是
+    //     在 shape 推断上的原因。
+    const bool ring = rt->GetInput("kv_ring_head") != nullptr;
+    const int W = max_kv;
+    int kv_resident = 0;   // KV 里现在有几行
+    int kv_head = 0;       // 逻辑行 0 所在的物理槽
+    int kv_base = 0;       // 逻辑行 0 的绝对位置
+    if (ring) {
+        std::printf("[ctx] KV 滑窗环 W=%d 行：序列可以无限长，最旧的行让位\n", W);
+    } else if (max_kv < 8192) {
+        std::printf("[ctx] KV 上限 %d 行（图不支持滑窗环：序列不得超出）\n", max_kv);
+    }
 
     // 会话上下文：图片块先登记（视觉塔已跑完），每轮的 user/assistant turn 累积
     // 在 Conversation 里，每轮整段重新 prefill。预算 = KV 上界减去本轮最多要生成
@@ -626,7 +703,7 @@ int main(int argc, char** argv) {
     for (const auto& vf : vfs) {
         conv.addBlock({vf.n_img, vf.grid_t, vf.grid_h, vf.grid_w});
     }
-    int max_ctx = MAX_KV - max_new;
+    int max_ctx = max_kv - max_new;
     if (const char* e = std::getenv("VKOP_MAX_CTX")) {
         const int v = std::atoi(e);
         if (v > 0) max_ctx = v;
@@ -640,7 +717,7 @@ int main(int argc, char** argv) {
                     raw_mode ? "VKOP_RAW_PROMPT" : "tokenizer.bin 无 chat template");
     } else {
         std::printf("[ctx] 多轮上下文已启用，预算 %d tokens（KV 上界 %d）\n",
-                    max_ctx, MAX_KV);
+                    max_ctx, max_kv);
     }
     if (!raw_mode && have_visual && !conv.has_template()) {
         // 图像内容项要靠 chat template 的占位格式渲染，没模板就渲染不出图。
@@ -710,7 +787,9 @@ int main(int argc, char** argv) {
                 (turn == 0 && have_visual && conv.has_template())
                     ? static_cast<int>(vfs.size()) : 0;
             conv.addUserTurn(line, /*block_first=*/0, n_img_this_turn);
-            if (conv.trimToBudget(max_ctx)) {
+            // 环模式下丢轮次是多余的：窗口本身就是那条界，而且丢了轮次会让
+            // 下一轮的 ids 对不上 kv_base，跨轮复用直接失效（退化成整段重算）。
+            if (!ring && conv.trimToBudget(max_ctx)) {
                 std::printf("[ctx] 超出预算 %d，已丢掉最旧的一问一答（当前历史 %d tokens）\n",
                             max_ctx, conv.context_len());
             }
@@ -726,11 +805,13 @@ int main(int argc, char** argv) {
             for (uint32_t id : ids) std::printf(" %u", id);
             std::printf("\n");
         }
-        if (static_cast<int>(ids.size()) + max_new > MAX_KV) {
+        // 环模式下序列可以无限长：超出的部分丢最旧的若干行（见 kv_base）。
+        // 无环时仍是硬上界 —— buffer 装不下就是装不下。
+        if (!ring && static_cast<int>(ids.size()) + max_new > max_kv) {
             std::fprintf(stderr,
-                "[error] 序列 %zu tokens + 最多生成 %d 超出 KV 预分配上界 %d —— "
-                "调小 max_new / VKOP_MAX_CTX，或重新预分配更大的 KV\n",
-                ids.size(), max_new, MAX_KV);
+                "[error] 序列 %zu tokens + 最多生成 %d 超出 KV 上限 %d —— "
+                "调大 --max-kv / 调小 max_new, 或设 VKOP_MAX_CTX\n",
+                ids.size(), max_new, max_kv);
             break;
         }
 
@@ -738,13 +819,86 @@ int main(int argc, char** argv) {
         int L = static_cast<int>(ids.size());
         std::printf("[prefill] L=%d building inputs...\n", L); std::fflush(stdout);
 
-        // ---- 本轮从哪接着算：P = 复用的前缀长度，S = 要新算的 token 数 ----
+        // ---- 本轮从哪接着算 ----
+        // 两个「前缀长度」在这一轮里是不同的东西，环模式下尤其要分开：
+        //   P     —— 图里 kv_past 的值，也就是从 cache 读几行 = kv_resident；
+        //   P_abs —— 新算的那几个 token 的**绝对**位置起点 = kv_base + P。
+        // 无环时 base 恒为 0，两者相等，代码路径与从前逐位一致。
+        //
         // 复用要求 ids 以「上一轮 KV 装的那段序列」为前缀，且前缀里的 mm 类型
         // 与图像 span 逐位一致 —— 占位 token 相同但配错图，K/V 就是错的，而
         // 这种错不会自己暴露。任何一条不满足都退回整段 prefill（P=0）。
-        int P = 0;
-        if (kv_reuse && !covered.ids.empty() && covered.ids.size() < ids.size() &&
-            Conversation::prefixMatch(covered.ids, ids)) {
+        int P = 0, P_abs = 0;
+        if (ring) {
+            // 环：先把窗口推到本轮结束时的位置。本轮算完 KV 只留最后 ≤W 行，
+            // 所以比窗口更旧的 token 既不在环里、也不会被任何一个查询看到 ——
+            // **根本不必算**。窗口起点 nb = max(kv_base, L-W) 因此必须在算之前
+            // 就定下来，而不是让每块按「装不下就丢最旧的」临时丢（那样某几行会
+            // 带着已经被丢掉的 token 的上下文，结果就随块长变了）。
+            //
+            // 起点可以越过 KV 里已经算过的那一段（那时那些行作废，resident 归
+            // 零、从头的槽位重写）。「只能丢已经写进 KV 的行」约束的是**槽位
+            // 复用**，不是起点：起跳只是让被跳过的 token 不进 KV，没有槽位冲突。
+            // 整张图要么留要么整个丢 —— 从图片 span 中间起跳的话，后缀里那几个
+            // 占位 token 的 MRoPE 位置就没法从「纯文本序列」重新推出来。
+            int nb = std::max(kv_base, L - W);
+            for (const auto& sp : rctx.spans) {
+                if (sp.start < nb && nb < sp.start + sp.count) nb = sp.start + sp.count;
+            }
+            if (nb > kv_base + kv_resident) {
+                // 起点跨过了 KV 的末尾：中间那些 token 本轮不参与（它们在窗口
+                // 之外，没有算好的行可以复用），旧行一并作废。
+                kv_resident = 0;
+                kv_head = 0;
+            } else {
+                // 起点落在已有行里：把它们让出去，一个字都不搬。
+                const int drop = nb - kv_base;
+                kv_head = (kv_head + drop) % W;
+                kv_resident -= drop;
+            }
+            kv_base = nb;
+            // KV 里那 kv_resident 行必须逐位就是 ids[kv_base ...) —— 序列只增
+            // 不减，但 assistant 轮在模板里会被补收尾串，所以还是要核对一遍。
+            bool ok = kv_reuse && kv_resident > 0 &&
+                      kv_resident <= L - kv_base &&
+                      covered.ids.size() >= static_cast<size_t>(kv_base + kv_resident) &&
+                      covered.mm_types.size() >=
+                          static_cast<size_t>(kv_base + kv_resident);
+            for (int i = 0; ok && i < kv_resident; ++i) {
+                ok = covered.ids[kv_base + i] == ids[kv_base + i] &&
+                     covered.mm_types[kv_base + i] == rctx.mm_types[kv_base + i];
+            }
+            size_t j = 0;
+            for (const auto& s : covered.spans) {
+                if (!ok) break;
+                if (j >= rctx.spans.size()) { ok = false; break; }
+                if (s.start + s.count <= kv_base) { ++j; continue; }  // 已丢
+                if (s.start >= kv_base + kv_resident) break;          // 窗口之后
+                ok = rctx.spans[j].start == s.start &&
+                     rctx.spans[j].count == s.count &&
+                     rctx.spans[j].block == s.block;
+                ++j;
+            }
+            for (; ok && j < rctx.spans.size(); ++j) {
+                ok = rctx.spans[j].start >= kv_base + kv_resident;
+            }
+            if (ok) {
+                P = kv_resident;
+            } else {
+                if (kv_resident > 0) {
+                    std::printf("[prefill] 环内前缀对不上（KV 覆盖 %d..%d）"
+                                " — 整段重算\n", kv_base, kv_base + kv_resident);
+                }
+                // 只作废行，不动 base：base 就是窗口起点，重算的是 [base, L)。
+                kv_resident = 0;
+                P = 0;
+            }
+            // 本轮要算的绝对区间是 [kv_base + kv_resident, L)：复用成功就接着
+            // 已有行往下算，否则从窗口起点整段重算。窗口起点 ≥ L-W，所以
+            // S = L - P_abs <= W —— 环里的 prefill 永远装得下。
+            P_abs = kv_base + kv_resident;
+        } else if (kv_reuse && !covered.ids.empty() && covered.ids.size() < ids.size() &&
+                   Conversation::prefixMatch(covered.ids, ids)) {
             bool ok = covered.mm_types.size() == covered.ids.size();
             for (int i = 0; ok && i < static_cast<int>(covered.ids.size()); ++i) {
                 ok = covered.mm_types[i] == rctx.mm_types[i];
@@ -764,43 +918,88 @@ int main(int argc, char** argv) {
             }
             if (ok) P = static_cast<int>(covered.ids.size());
         }
-        const int S = L - P;
+        if (!ring) P_abs = P;
+        const int S = L - P_abs;
         // 本轮 decode 实际喂进去的 token（prefill 的 ids 之外的部分）—— 和
         // past_len 一起长，本轮结束后就是 KV 覆盖的完整序列。
         std::vector<uint32_t> consumed_gen;
         consumed_gen.reserve(static_cast<size_t>(max_new));
         if (P > 0) {
-            std::printf("[prefill] reusing %d/%d kv positions, %d to compute\n",
-                        P, L, S);
+            std::printf("[prefill] reusing %d kv positions (base=%d, abs=%d), "
+                        "%d to compute\n", P, kv_base, P_abs, S);
         } else if (kv_reuse && !covered.ids.empty()) {
             std::printf("[prefill] no reusable prefix (previous kv covered %zu "
                         "tokens) — full prefill\n", covered.ids.size());
         }
-
         // mm_token_type_ids (1, L): 0=text, 1=image. attention_mask all 1.
         // 序列里图片位置的判定由 Conversation/render_raw 一起算好了。
         const std::vector<int32_t>& mtt = rctx.mm_types;
         std::vector<int8_t> amask(L, 1);
 
-        // inputs_embeds (1, S, hidden): embed the new tokens, then scatter the
-        // visual image_features rows into the image-pad positions (多模态). 按
-        // span 的出现顺序取每张图自己的特征行（裁切掉历史里的图时行号会跳过）。
-        // 前缀里的图不在这里：它们的行已经在 KV 里了。
-        const std::vector<uint32_t> tail_ids(ids.begin() + P, ids.end());
-        auto emb = embed_lookup(embed_table, tail_ids, vocab, arch.hidden);
-        std::vector<uint16_t> ds_turn;   // (img_count_in_suffix, hidden)
-        int img_suffix = 0;
-        for (const auto& sp : rctx.spans) {
-            if (sp.start >= P) img_suffix += sp.count;
+        // ---- 分块 prefill ----
+        // 窗口起点在上面就定死了，所以 P + S <= W 恒成立，这个 loop 默认只跑
+        // 一次；VKOP_PREFILL_CHUNK 把它压小用来 A/B（同一条序列、同一个窗口、
+        // 不同块边界必须得到同一个结果 —— 这是「窗口只由 W 决定」的直接检验），
+        // 也用来给 lm_head 的 logits buffer 封顶。每块的丢行因此恒为 0，留着
+        // 只是兜底。
+        bool chunked = ring && P + S > W;
+        int C_max = std::max(1, W / 2);
+        // 调试用：把块长压小并强制分块（W 不变，所以一块行都不会丢）。这样
+        // 「分块 vs 单块」能在同一条序列上直接对比 —— 没有窗口损失时两者应当
+        // 只差一个 softmax 归约顺序。
+        if (const char* e = std::getenv("VKOP_PREFILL_CHUNK")) {
+            const int v = std::atoi(e);
+            if (v > 0) {
+                C_max = v;
+                chunked = ring && S > C_max;
+            }
         }
-        if (have_visual && img_suffix > 0) {
-            ds_turn.assign(static_cast<size_t>(img_suffix) * arch.hidden, 0);
+        const int n_chunks = chunked ? (S + C_max - 1) / C_max : 1;
+        if (chunked) {
+            std::printf("[prefill] 分块 prefill：本轮 %d 个 token，每块 ≤%d，"
+                        "共 %d 块（窗口 %d 行，起点 base=%d）\n",
+                        S, C_max, n_chunks, W, kv_base);
+            std::fflush(stdout);
+        }
+        double ms = 0, prefill_chunk_ms = 0;
+        int64_t rope_delta = 0;   // 每块都算（同值），decode 循环还要用
+        for (int blk = 0; blk < n_chunks; ++blk) {
+        // 本块的绝对起点 A、长度 C，以及本块能从 cache 读到几行 Pc。
+        const int A = chunked ? P_abs + blk * C_max : P_abs;
+        const int C = chunked ? std::min(C_max, P_abs + S - A) : S;
+        if (chunked) {
+            // 丢的只能是已经写进 KV 的最旧那些行。kv_resident + C <= W 是
+            // Attention 侧的硬约束：新的 C 行要写进还空着的槽。
+            const int drop = std::max(0, kv_resident + C - W);
+            kv_head = (kv_head + drop) % W;
+            kv_resident -= drop;
+            kv_base += drop;
+        }
+        const int Pc = chunked ? kv_resident : P;
+
+        // inputs_embeds (1, C, hidden): embed this chunk's tokens, then scatter
+        // the visual image_features rows into the image-pad positions (多模态).
+        // 取的是 [A, A+C) 与 span 的**交集** —— 图比窗口还大时块边界必然切在
+        // 图中间，那时从该图第 i = j - sp.start 行取起。
+        const std::vector<uint32_t> chunk_ids(ids.begin() + A, ids.begin() + A + C);
+        auto emb = embed_lookup(embed_table, chunk_ids, vocab, arch.hidden);
+        std::vector<uint16_t> ds_turn;   // (img_in_chunk, hidden)
+        int img_in_chunk = 0;
+        for (const auto& sp : rctx.spans) {
+            img_in_chunk += std::max(0, std::min(sp.start + sp.count, A + C) -
+                                            std::max(sp.start, A));
+        }
+        if (have_visual && img_in_chunk > 0) {
+            ds_turn.assign(static_cast<size_t>(img_in_chunk) * arch.hidden, 0);
             int feat_row = 0;   // running row index into emb / ds_turn
             for (const auto& sp : rctx.spans) {
-                if (sp.start < P) continue;
+                const int lo = std::max(sp.start, A);
+                const int hi = std::min(sp.start + sp.count, A + C);
+                if (hi <= lo) continue;
                 const int row0 = feat_row0[sp.block];
-                for (int i = 0; i < sp.count; ++i, ++feat_row) {
-                    std::memcpy(&emb[static_cast<size_t>(sp.start - P + i) * arch.hidden],
+                for (int j = lo; j < hi; ++j, ++feat_row) {
+                    const int i = j - sp.start;   // 该图内的第几行
+                    std::memcpy(&emb[static_cast<size_t>(j - A) * arch.hidden],
                                 &img_feat_cat[static_cast<size_t>(row0 + i) * arch.hidden],
                                 arch.hidden * sizeof(uint16_t));
                     for (int d = 0; d < 3; ++d)
@@ -810,7 +1009,7 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(S),
+        fill_fp16_input(rt, "inputs_embeds", {1u, static_cast<uint32_t>(C),
                       static_cast<uint32_t>(arch.hidden)}, emb.data());
         std::printf("  inputs_embeds ok\n"); std::fflush(stdout);
 
@@ -819,7 +1018,7 @@ int main(int argc, char** argv) {
         // 位置是绝对位置，所以复用前缀时两种形式都要带上 P 的偏移 —— 3D 更是
         // 必须在**整段** ids 上算一次（MRoPE 的位置是顺着序列走出来的），再切
         // 尾部 S 个，才能保证前缀那几行的位置和上一轮算出的一模一样。
-        int64_t rope_delta = 0;
+        rope_delta = 0;
         if (arch.position_ids_dims == 3) {
             // 本轮实际用到的图（按出现顺序）的 grid_thw，从 ImageBlock 现取。
             std::vector<int> span_grid;
@@ -835,43 +1034,45 @@ int main(int argc, char** argv) {
                                      have_visual && img_count > 0
                                          ? static_cast<int>(rctx.spans.size()) : 0,
                                      /*B=*/1, L);
-            std::vector<int64_t> pos3(static_cast<size_t>(3) * S);
+            std::vector<int64_t> pos3(static_cast<size_t>(3) * C);
             for (int c = 0; c < 3; ++c) {
-                for (int i = 0; i < S; ++i) {
-                    pos3[static_cast<size_t>(c) * S + i] =
-                        ri.pos_ids[static_cast<size_t>(c) * L + P + i];
+                for (int i = 0; i < C; ++i) {
+                    pos3[static_cast<size_t>(c) * C + i] =
+                        ri.pos_ids[static_cast<size_t>(c) * L + A + i];
                 }
             }
-            fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(S)},
+            fill_i64_input(rt, "position_ids", {3u, 1u, static_cast<uint32_t>(C)},
                            pos3.data());
             rope_delta = ri.rope_delta[0];
         } else {
-            // 2D 标准 RoPE: (1, S) = arange(P, P+S). 无 rope_delta.
-            std::vector<int64_t> pos(static_cast<size_t>(S));
-            for (int i = 0; i < S; ++i) pos[i] = P + i;
-            fill_i64_input(rt, "position_ids", {1u, static_cast<uint32_t>(S)},
+            // 2D 标准 RoPE: (1, S) = arange(P_abs, P_abs+S)。无 rope_delta。
+            // 环模式下 P_abs = kv_base + kv_resident，位置仍是绝对位置 ——
+            // RoPE 只吃 position_ids，图自己的 kv_past 只是「读几行 cache」。
+            std::vector<int64_t> pos(static_cast<size_t>(C));
+            for (int i = 0; i < C; ++i) pos[i] = A + i;
+            fill_i64_input(rt, "position_ids", {1u, static_cast<uint32_t>(C)},
                            pos.data());
         }
         std::printf("  position_ids ok (%dD, rope_delta=%lld)\n",
                     arch.position_ids_dims, (long long)rope_delta); std::fflush(stdout);
 
-        // attention_bias (1, 1, S, P+S) causal: query i (绝对位置 P+i) 看得到
-        // [0, P+i]。causal_bias 的 threshold 就是按 kv-q 算的，复用前缀时 q=S、
-        // kv=P+S，正好落到同一个偏移上。
+        // attention_bias (1, 1, C, Pc+C) causal: 查询 i 在本块的坐标系里看的是
+        // [0, Pc+i]（Pc = cache 的行数）。causal_bias 的 threshold 就是按 kv-q
+        // 算的，分块后每块都是同一个式子。绝对位置只通过 position_ids 进 RoPE。
         {
-            auto ab = causal_bias(S, P + S);
-            fill_fp16_input(rt, "attention_bias", {1u, 1u, static_cast<uint32_t>(S),
-                          static_cast<uint32_t>(P + S)}, ab.data());
+            auto ab = causal_bias(C, Pc + C);
+            fill_fp16_input(rt, "attention_bias", {1u, 1u, static_cast<uint32_t>(C),
+                          static_cast<uint32_t>(Pc + C)}, ab.data());
         }
         std::printf("  attention_bias ok\n"); std::fflush(stdout);
 
         // deepstack_embeds_{0,1,2}: 仅多模态模型有此输入。多图时 HF 把每张
         // 图的 deepstack 按 prompt 顺序拼成 (total_img, hidden) 一个输入。
         if (arch.has_deepstack) {
-            if (have_visual && img_suffix > 0) {
+            if (have_visual && img_in_chunk > 0) {
                 for (int d = 0; d < 3; ++d)
                     fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
-                                    {static_cast<uint32_t>(img_suffix),
+                                    {static_cast<uint32_t>(img_in_chunk),
                                      static_cast<uint32_t>(arch.hidden)},
                                     ds_turn.data());
             } else {
@@ -884,25 +1085,33 @@ int main(int argc, char** argv) {
 
         // image_pad_mask (1, S): 仅多模态模型有此输入。
         if (arch.has_image_pad_mask) {
-            std::vector<int8_t> mask(S, 0);
-            for (int i = 0; i < S; ++i)
-                mask[i] = rctx.mm_types[P + i] ? 1 : 0;
-            rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(S)});
+            std::vector<int8_t> mask(C, 0);
+            for (int i = 0; i < C; ++i)
+                mask[i] = mtt[A + i] ? 1 : 0;
+            rt->ResizeInput("image_pad_mask", {1u, static_cast<uint32_t>(C)});
             auto t = rt->GetInput("image_pad_mask");
             auto tg = as_tensor<int8_t>(t);
             if (tg->num_elements() > 0) tg->fillToCPU(mask.data());
             std::printf("  image_pad_mask ok\n"); std::fflush(stdout);
         }
 
-        // past：复用前缀只是把逻辑 kv_len 设成 P（buffer 里那 P 行是上一轮写下
-        // 的，一个字都不动），整段 prefill 才需要归零 + 重新上传。
-        if (P > 0) {
-            kv.resume_from(P);
-        } else {
+        // past：复用前缀只是把逻辑 kv_len 设成 Pc（buffer 里那 Pc 行是上一轮/
+        // 上一块写下的，一个字都不动），只有本轮的**第一块**在整段重算时才需要
+        // 归零 + 重新上传。环模式下 Pc 是窗口内的行数，`present==past` 那块
+        // buffer 里的行本来就是按时间排的，所以只靠 kv_ring_head 给槽位偏移。
+        if (Pc > 0) {
+            kv.resume_from(Pc);
+        } else if (blk == 0) {
             kv.reset_for_prefill();
             kv.upload();
+        } else {
+            kv.resume_from(0);   // 窗口丢空了：buffer 内容无所谓，读 0 行
         }
-        std::printf("  past_kv resize ok (kv_len=%d)\n", P); std::fflush(stdout);
+        // 环头必须在 Run() 之前写进去：它和 kv_len 一样是本轮的调度输入，变了就
+        // 得让 replay 失效（PushConstant 的指纹会自己做到）。
+        if (ring) fill_i32_input(rt, "kv_ring_head", kv_head);
+        std::printf("  past_kv resize ok (kv_len=%d, head=%d)\n", Pc,
+                    ring ? kv_head : 0); std::fflush(stdout);
 
         // Upload all inputs (跳过模型没有的 deepstack / image_pad_mask).
         upload_input(cmdpool, rt->GetInput("inputs_embeds"));
@@ -917,21 +1126,34 @@ int main(int argc, char** argv) {
         std::printf("  upload ok, calling Run()...\n"); std::fflush(stdout);
 
         auto t_prefill_start = std::chrono::steady_clock::now();
-        double ms = rt->Run();
+        double run_ms = rt->Run();
         auto t_prefill_end = std::chrono::steady_clock::now();
+        ms += run_ms;
         if (profile_mode) {
-            session_metrics.prefill_ms = std::chrono::duration<double, std::milli>(
+            prefill_chunk_ms += std::chrono::duration<double, std::milli>(
                 t_prefill_end - t_prefill_start).count();
             session_metrics.prefill_tokens = L;
         }
-        std::printf("  Run done %.1fms\n", ms); std::fflush(stdout);
-        // Prefill (q_len=L) and decode (q_len=1) have entirely different
-        // shapes; the replay cache from prefill must not bleed into decode.
+        std::printf("  Run done %.1fms\n", run_ms); std::fflush(stdout);
+        // Prefill (q_len=C) and decode (q_len=1) have entirely different
+        // shapes; the replay cache from prefill must not bleed into decode —
+        // and a following chunk of another length must not reuse it either.
         rt->invalidate_replay();
         // Wait for GPU compute to finish, but do NOT ReadResult() — that would
         // copyToCPU all 28 present_kv outputs (28 sync points) which we don't
         // need: feedback_kv does device→device, and argmax reads only logits.
         cmdpool->getVulkanDevice()->wait_all_done();
+
+        if (chunked) {
+            kv_resident += C;   // 本块的 C 行已经写进环里
+            std::printf("[prefill] 第 %d/%d 块: A=%d C=%d Pc=%d → kv=%d "
+                        "(base=%d, head=%d) %.1fms\n",
+                        blk + 1, n_chunks, A, C, Pc, kv_resident, kv_base,
+                        kv_head, run_ms);
+            std::fflush(stdout);
+        }
+        }   // for (blk)
+        if (profile_mode) session_metrics.prefill_ms = prefill_chunk_ms;
 
         // Optional named-intermediate dump (mirrors llm_driver's VKOP_DUMP_TENSORS).
         // VKOP_DUMP_ROUND=0 restricts to prefill; "*" dumps every fp16 tensor.
@@ -1030,7 +1252,17 @@ int main(int argc, char** argv) {
         std::fflush(stdout);
 
         // Feed KV cache back for decode rounds.
-        int past_len = kv.feedback();   // == L，KV 现在装着整段 prompt
+        // 无环：feedback() 报的就是 KV 里现在的行数（== L）。环模式下它是
+        // 窗口内的行数：单块时就是 P+S；分块时块循环里已经跟着丢行减过了，
+        // 行数**不会**超过 W（那些越界的行在块边界上就被丢掉了）。
+        int past_len;
+        if (ring) {
+            if (!chunked) kv_resident = P + S;
+            past_len = kv_resident;
+        } else {
+            past_len = kv.feedback();   // == L，KV 现在装着整段 prompt
+        }
+        int dec_base = kv_base;   // 本轮 decode 期间逻辑行 0 的绝对位置
 
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
@@ -1047,10 +1279,26 @@ int main(int argc, char** argv) {
             fill_fp16_input(rt, "inputs_embeds", {1u, 1u, static_cast<uint32_t>(arch.hidden)},
                           cur_emb.data());
 
-            // position_ids: 2D 纯文本 (1, 1) = past_len；3D 多模态 (3, 1, 1)
-            // = past_len + rope_delta（MRoPE delta）。
+            // 环：新的一行要进去，就得先给最旧的一行腾槽。丢的是 cache 第 0
+            // 行（kv_base 那一行），头上那一格挪一格、行数减一，绝对位置前移
+            // —— 一步里只动 host 侧的三个整数。每一步都要把 past 的逻辑
+            // kv_len 摆成「本步从 cache 读几行」，非环路径是 feedback() 在做。
+            if (ring) {
+                if (past_len + 1 > W) {
+                    kv_head = (kv_head + 1) % W;
+                    past_len -= 1;
+                    dec_base += 1;
+                }
+                kv_resident = past_len;
+                kv.resume_from(kv_resident);
+                fill_i32_input(rt, "kv_ring_head", kv_head);
+            }
+
+            // position_ids: 2D 纯文本 (1, 1) = 绝对位置；3D 多模态 (3, 1, 1)
+            // = 绝对位置 + rope_delta（MRoPE delta）。环模式下图的 kv_past 是
+            // 窗口内的序号，绝对位置是 dec_base + past_len。
             {
-                int64_t p = static_cast<int64_t>(past_len) + rope_delta;
+                int64_t p = static_cast<int64_t>(dec_base + past_len) + rope_delta;
                 if (arch.position_ids_dims == 3) {
                     int64_t pos[3] = {p, p, p};
                     fill_i64_input(rt, "position_ids", {3u, 1u, 1u}, pos);
@@ -1099,14 +1347,24 @@ int main(int argc, char** argv) {
                 session_metrics.total_decode_ms += run_ms;
                 session_metrics.per_token_ms.push_back(run_ms);
             }
-            std::printf("[r%d] %.1fms  past_len=%d pos=%lld  → %d  %s\n", step,
-                        run_ms, past_len, (long long)(past_len + rope_delta),
+            std::printf("[r%d] %.1fms  past_len=%d pos=%lld%s  → %d  %s\n", step,
+                        run_ms, past_len,
+                        (long long)(dec_base + past_len + rope_delta),
+                        ring ? " ring" : "",
                         next_id,
                         tok.decode({static_cast<uint32_t>(next_id)}).c_str());
             std::fflush(stdout);
 
-            past_len = kv.feedback();
+            // 非环：present→past 的逻辑长度跟进（== past_len+1）。环：自己记，
+            // 末尾把会话级的三个整数交回去给下一轮。
+            if (ring) {
+                past_len += 1;
+                kv_resident = past_len;
+            } else {
+                past_len = kv.feedback();
+            }
         }
+        if (ring) kv_base = dec_base;   // 下一轮接在这里
 
         std::printf("\n=== full decode ===\n%s\n\n", tok.decode(out_ids).c_str());
 
@@ -1127,8 +1385,8 @@ int main(int argc, char** argv) {
                         session_metrics.decode_tok_per_sec(), session_metrics.avg_decode_ms());
             std::printf("  kv cache: %d/%d (%.1f%%)\n",
                         static_cast<int>(ids.size()) + session_metrics.decode_steps,
-                        MAX_KV,
-                        (static_cast<double>(ids.size()) + session_metrics.decode_steps) / MAX_KV * 100.0);
+                        max_kv,
+                        (static_cast<double>(ids.size()) + session_metrics.decode_steps) / max_kv * 100.0);
             std::printf("\n");
             std::fflush(stdout);
         }
