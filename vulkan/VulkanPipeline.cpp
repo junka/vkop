@@ -24,13 +24,15 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
     createDescriptorPool(update_after_bind);
 
-    createComputePipeline(m_pipelineLayout_, shader.getShaderModule(), cache);
+    createComputePipeline(m_pipelineLayout_, shader.getShaderModule(), cache,
+                          codesize);
     // could destroy shader here
 }
 
 void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
                                            VkShaderModule shaderModule,
-                                           VkPipelineCache cache) {
+                                           VkPipelineCache cache,
+                                           int spv_size) {
     VkPipelineShaderStageCreateInfo shader_stage_create_info = {};
     shader_stage_create_info.sType =
         VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
@@ -65,8 +67,10 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     auto ret = vkCreateComputePipelines(m_device_, cache, 1, &pipeline_info,
                                         nullptr, &m_pipeline_);
     if (ret != VK_SUCCESS) {
-        throw std::runtime_error("Failed to create compute pipeline!" +
-                                 std::to_string(ret));
+        throw std::runtime_error(
+            "Failed to create compute pipeline!" + std::to_string(ret) +
+            " spv_bytes=" + std::to_string(spv_size) +
+            " req_subgroup=" + std::to_string(required_subgroup_size_));
     }
 }
 

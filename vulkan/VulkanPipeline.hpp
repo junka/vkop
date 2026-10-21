@@ -21,7 +21,7 @@ class VulkanPipeline : public VulkanBasePipeline {
 
     void createComputePipeline(VkPipelineLayout pipelineLayout,
                                VkShaderModule shaderModule,
-                               VkPipelineCache cache);
+                               VkPipelineCache cache, int spv_size = 0);
 };
 } // namespace vkop
 

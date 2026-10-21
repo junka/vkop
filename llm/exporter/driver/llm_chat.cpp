@@ -576,7 +576,14 @@ int main(int argc, char** argv) {
     Logger::getInstance().setLevel(LOG_INFO);
     const auto& phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
     if (phydevs.empty()) { std::printf("no vulkan device\n"); return -1; }
-    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    unsigned device_index = 0;
+    if (const char* s = std::getenv("VKOP_DEVICE")) { device_index = (unsigned)atoi(s); }
+    if (device_index >= phydevs.size()) {
+        std::fprintf(stderr, "VKOP_DEVICE=%u out of range (0..%zu)\n",
+                     device_index, phydevs.size() - 1);
+        return -1;
+    }
+    auto dev = std::make_shared<VulkanDevice>(phydevs[device_index]);
     if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {
         std::printf("no valid vulkan device\n"); return -1;
     }
