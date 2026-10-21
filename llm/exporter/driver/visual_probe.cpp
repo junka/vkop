@@ -179,21 +179,6 @@ int main(int argc, char** argv) {
         if (pv.empty()) return 1;
     }
     std::printf("[pv] seq_len=%d row=%d elems=%zu\n", seq_len, row, pv.size());
-    if (grid_h == 0 || grid_w == 0) {
-        int s = static_cast<int>(std::lround(std::sqrt(static_cast<double>(seq_len))));
-        if (s * s != seq_len) {
-            std::fprintf(stderr,
-                "seq_len=%d is not a perfect square: pass --grid h,w\n", seq_len);
-            return 1;
-        }
-        grid_h = grid_w = s;
-    }
-    if (grid_h * grid_w != seq_len) {
-        std::fprintf(stderr, "grid %dx%d = %d patches but pixel_values has %d rows\n",
-                     grid_h, grid_w, grid_h * grid_w, seq_len);
-        return 1;
-    }
-    std::printf("[grid] thw=[1,%d,%d]\n", grid_h, grid_w);
 
     // Runtime + visual model.
     auto rt = std::make_shared<Runtime>(cmdpool, model_path, /*precision=*/1);
@@ -202,17 +187,41 @@ int main(int argc, char** argv) {
     rt->LoadModel();
     std::printf("=== LoadModel done ===\n");
 
-    // Feed grid_thw (1,3) int64 — the dynamic-grid graph's second input.
+    // Feed grid_thw (1,3) int64 — the dynamic-grid graph's second input. An
+    // archived static-grid export has no such input: its grid-derived tensors
+    // are baked in, so the image must reduce to the export's own grid and
+    // there is nothing to feed. Handled rather than rejected so a
+    // static-vs-dynamic timing A/B stays runnable with one binary.
     const int64_t gthw[3] = {1, grid_h, grid_w};
     auto gt_in = rt->GetInput("grid_thw");
-    if (!gt_in || gt_in->dtype() != typeid(int64_t)) {
-        std::fprintf(stderr, "graph has no int64 grid_thw input (static-grid export?)\n");
+    if (gt_in && gt_in->dtype() != typeid(int64_t)) {
+        std::fprintf(stderr, "grid_thw input is not int64\n");
         return 1;
     }
-    rt->ResizeInput("grid_thw", {1u, 3u});
-    auto gt = as_tensor<int64_t>(rt->GetInput("grid_thw"));
-    gt->fillToCPU(gthw);
-    gt->copyToGPU(cmdpool);
+    if (!gt_in) {
+        std::printf("[grid] graph has no grid_thw input (static-grid export); "
+                    "its grid is baked in, feeding pixel_values only\n");
+    } else {
+        if (grid_h == 0 || grid_w == 0) {
+            int s = static_cast<int>(std::lround(std::sqrt(static_cast<double>(seq_len))));
+            if (s * s != seq_len) {
+                std::fprintf(stderr,
+                    "seq_len=%d is not a perfect square: pass --grid h,w\n", seq_len);
+                return 1;
+            }
+            grid_h = grid_w = s;
+        }
+        if (grid_h * grid_w != seq_len) {
+            std::fprintf(stderr, "grid %dx%d = %d patches but pixel_values has %d rows\n",
+                         grid_h, grid_w, grid_h * grid_w, seq_len);
+            return 1;
+        }
+        std::printf("[grid] thw=[1,%d,%d]\n", grid_h, grid_w);
+        rt->ResizeInput("grid_thw", {1u, 3u});
+        auto gt = as_tensor<int64_t>(rt->GetInput("grid_thw"));
+        gt->fillToCPU(gthw);
+        gt->copyToGPU(cmdpool);
+    }
 
     // Fill pixel_values input (seq_len, 1536) fp16.
     rt->ResizeInput("pixel_values",
