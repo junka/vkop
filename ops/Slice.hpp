@@ -211,12 +211,6 @@ class SliceBuffer : public BufferFactory {
             stable_rounds_++;
             out_size = cached_out_size_;
             meta_reused = true;
-            if (std::getenv("VKOP_RB_TRACE")) {
-                fprintf(stderr, "[rbtrace] Slice STABLE skip (out_shape=");
-                for (int d : out_size[0])
-                    fprintf(stderr, "%d,", d);
-                fprintf(stderr, ")\n");
-            }
         } else {
             // Readback path (LEARNING/CONFIRMING/DYNAMIC, or STABLE verify).
             auto starts_t = core::as_tensor<int64_t>(inputs[1]);
@@ -237,26 +231,6 @@ class SliceBuffer : public BufferFactory {
             }
             out_size = slice_calc::calculate_output_shape<int64_t>(
                 inshape, starts_t->data(), ends_t->data(), axes_vec, steps_vec);
-
-            if (std::getenv("VKOP_RB_TRACE")) {
-                fprintf(stderr, "[rbtrace] Slice inshape=");
-                for (int d : inshape)
-                    fprintf(stderr, "%d,", d);
-                fprintf(stderr, " starts=");
-                for (auto v : starts_t->data())
-                    fprintf(stderr, "%lld,", (long long)v);
-                fprintf(stderr, " ends=");
-                for (auto v : ends_t->data())
-                    fprintf(stderr, "%lld,", (long long)v);
-                fprintf(stderr, " -> out_shape=");
-                for (int d : out_size[0])
-                    fprintf(stderr, "%d,", d);
-                fprintf(stderr, " dtype=%s state=%d\n",
-                        inputs[0]->dtype() == typeid(int64_t)    ? "i64"
-                        : inputs[0]->dtype() == typeid(uint16_t) ? "fp16"
-                                                                 : "fp32",
-                        static_cast<int>(slice_state_));
-            }
 
             // Advance the learn state machine. Fingerprint = inshape + the
             // four meta vectors. STABLE when two consecutive rounds match.

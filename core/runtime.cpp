@@ -783,12 +783,7 @@ void Runtime::LoadModel() {
     // Build-time chain-structure analysis (kernel-fusion planning). Populated
     // once at LoadModel; no per-round cost. Printed to stderr so stdout model
     // dumps stay clean.
-    const bool dump_level_seq = std::getenv("VKOP_DUMP_LEVEL_SEQ") != nullptr;
-
     level_node_indices_.resize(concurrent_levels.size());
-    if (dump_level_seq) {
-        level_op_seq_.resize(concurrent_levels.size());
-    }
     size_t global_node_index = 0;
     size_t total_nodes = 0;
     for (const auto &level_nodes : concurrent_levels) {
@@ -1257,11 +1252,6 @@ void Runtime::LoadModel() {
             node_input_tensors_.push_back(std::move(node_inputs));
             node_output_tensors_.push_back(std::move(node_outputs));
             node_input_shapes_.push_back(std::move(node_input_shapes));
-            if (dump_level_seq) {
-                // Append this level's op type to a per-level sequence string
-                // for chain-structure analysis (kernel-fusion planning).
-                level_op_seq_[level_idx].push_back(n.op_type);
-            }
             node_input_value_dynamic_.push_back(std::move(node_input_vd));
 
             // Phase 4-r2: parse the converter's host-evaluated target-shape
@@ -1380,25 +1370,6 @@ void Runtime::LoadModel() {
         }
     }
     printf("Execution plan built with %zu operations\n", node_ops_.size());
-    if (dump_level_seq && !level_op_seq_.empty()) {
-        // Print the per-level op-type sequence (one line per level). Used to
-        // find long single-node chains ripe for kernel fusion.
-        for (size_t i = 0; i < level_op_seq_.size(); i++) {
-            if (level_op_seq_[i].size() == 1) {
-                fprintf(stderr, "[lvlseq] L%zu: %s\n", i,
-                        level_op_seq_[i][0].c_str());
-            } else {
-                std::string s;
-                for (size_t j = 0; j < level_op_seq_[i].size(); j++) {
-                    if (j)
-                        s += " ";
-                    s += level_op_seq_[i][j];
-                }
-                fprintf(stderr, "[lvlseq] L%zu(%zu): %s\n", i,
-                        level_op_seq_[i].size(), s.c_str());
-            }
-        }
-    }
     // Persist a name->tensor view of every named tensor for post-Run
     // inspection (driver dumps intermediates to diagnose NaN propagation).
     tensor_map_ = tensor_map;
@@ -2375,13 +2346,6 @@ double Runtime::Run() {
     static std::map<std::string, int> op_type_readback_count;
     if (opprof)
         op_type_readback_count.clear();
-    // Phase 2 debug: count how many output tensors carry the GPU-driven
-    // shape_ssbo_ side-channel (populated by Shape/Gather/Concat/Reshape/
-    // Expand on the int64 shape-meta chain). Confirms the side-channel is
-    // threaded through the dynamic chain before Phase 3 consumers read it.
-    const char *ssbo_dbg_env = std::getenv("VKOP_SHAPE_SSBO_DBG");
-    bool ssbo_dbg = ssbo_dbg_env && ssbo_dbg_env[0] == '1';
-    int n_shape_ssbo = 0;
 
     std::vector<std::shared_ptr<VulkanCommandBuffer>> prev_level_cmds;
     size_t last_level_index = level_node_indices_.size() - 1;
@@ -2518,16 +2482,6 @@ double Runtime::Run() {
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';
     std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds;
-    // VKOP_SEG_PROF=1: per-segment CPU submit time + GPU completion time.
-    // Splits the round wall into per-segment execution and inter-segment
-    // gaps: graph_submit() stamps the CPU submit instant, the end-of-round
-    // reset loop waits each segment in order (they are timeline-chained, so
-    // wait i returns when segment i finishes) and stamps the completion
-    // instant. All offsets share the seg_prof_t0 clock.
-    bool seg_prof =
-        std::getenv("VKOP_SEG_PROF") && std::getenv("VKOP_SEG_PROF")[0] == '1';
-    auto seg_prof_t0 = std::chrono::steady_clock::now();
-    std::vector<std::pair<double, double>> seg_submit_at; // (at_ms, dur_ms)
     std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
     size_t graph_next_seg = 0;  // next free slot in graph_cmds
     size_t graph_seg_start = 0; // level_idx the open segment started at
@@ -2561,17 +2515,7 @@ double Runtime::Run() {
         // big segment's encoding cost lands here rather than in the GPU wait.
         auto gs_t0 = run_profile ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-        if (seg_prof) {
-            auto s0 = std::chrono::steady_clock::now();
-            graph_prev_val = graph_seg->submit(queue0);
-            auto s1 = std::chrono::steady_clock::now();
-            seg_submit_at.emplace_back(
-                std::chrono::duration<double, std::milli>(s0 - seg_prof_t0)
-                    .count(),
-                std::chrono::duration<double, std::milli>(s1 - s0).count());
-        } else {
-            graph_prev_val = graph_seg->submit(queue0);
-        }
+        graph_prev_val = graph_seg->submit(queue0);
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
         if (run_profile) {
@@ -2636,11 +2580,6 @@ double Runtime::Run() {
         auto rec_t0 = run_profile ? std::chrono::steady_clock::now()
                                   : std::chrono::steady_clock::time_point{};
         for (auto node_idx : level_nodes) {
-            // seg-prof marker: op indices at which each new segment begins,
-            // to align [tsdump] gap positions with segment boundaries.
-            if (seg_prof && level_idx == graph_seg_start)
-                fprintf(stderr, "[segmark] level=%zu op=%zu\n", level_idx,
-                        node_idx);
             auto rs_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
             const auto &shapes = node_input_shapes_[node_idx];
@@ -2868,13 +2807,6 @@ double Runtime::Run() {
                 e.first += ms;
                 e.second += 1;
             }
-            if (ssbo_dbg) {
-                const auto &outs = node_output_tensors_[node_idx];
-                for (const auto &o : outs) {
-                    if (o && o->has_shape_ssbo())
-                        n_shape_ssbo++;
-                }
-            }
             // Snapshot live input shapes for the replay guard. Done every round
             // (cheap): if this op just re-recorded (refresh or first cache),
             // this is the new contract; if it replayed, the snapshot is
@@ -3036,38 +2968,9 @@ double Runtime::Run() {
         flush_batched(batched_sis, single_queue ? 1 : vkop::kInflight);
     }
 
-    if (graph_mode && seg_prof) {
-        // Ordered per-segment wait BEFORE the final wait: the segments are
-        // timeline-chained, so waiting seg 0..N in order returns exactly when
-        // each segment finished on the GPU — the completion timeline. The
-        // final wait below is then already satisfied (skip it under seg_prof;
-        // the last iteration of this loop waited the same buffer).
-        double prev_done = 0.0;
-        size_t seg_i = 0;
-        for (auto &c : graph_cmds) {
-            c->wait();
-            auto w1 = std::chrono::steady_clock::now();
-            double done =
-                std::chrono::duration<double, std::milli>(w1 - seg_prof_t0)
-                    .count();
-            double sub_at = seg_i < seg_submit_at.size()
-                                ? seg_submit_at[seg_i].first
-                                : -1.0;
-            double sub_dur = seg_i < seg_submit_at.size()
-                                 ? seg_submit_at[seg_i].second
-                                 : -1.0;
-            fprintf(stderr,
-                    "[segprof] seg %2zu: submit_at=%7.1fms"
-                    " (submit took %5.1fms)  done_at=%7.1fms"
-                    "  delta_vs_prev_done=%6.1fms\n",
-                    seg_i, sub_at, sub_dur, done, done - prev_done);
-            prev_done = done;
-            seg_i++;
-        }
-    }
     // Wait for the final level, then reset all command buffers.
     for (int ci = 0; ci < vkop::kInflight; ci++) {
-        if (last_commands[ci] && !seg_prof) {
+        if (last_commands[ci]) {
             last_commands[ci]->wait();
         }
     }
@@ -3134,10 +3037,6 @@ double Runtime::Run() {
     if (graph_mode) {
         fprintf(stderr, "[graph] %zu segments, %d readback boundaries\n",
                 graph_cmds.size(), graph_readbacks);
-    }
-    if (ssbo_dbg) {
-        fprintf(stderr, "[sssbo] %d output tensors carry shape_ssbo_\n",
-                n_shape_ssbo);
     }
 
     if (replay_mode_) {
@@ -3277,61 +3176,10 @@ double Runtime::Run() {
             }
             fprintf(stderr, "[submitprof] %-14s %6d %8.2f\n", "TOTAL",
                     static_cast<int>(node_ops_.size()), total_gpu_ms);
-            // VKOP_SUBMIT_DUMP=1: absolute per-op GPU timeline (ms from the
-            // round's first begin tick). Overlapping windows mean the driver
-            // does not timestamp in dispatch order (unreliable); inter-window
-            // gaps are GPU-timeline time no op owns.
-            if (const char *de = std::getenv("VKOP_SUBMIT_DUMP");
-                de && de[0] == '1') {
-                double base = -1.0;
-                for (size_t i = 0; i < node_ops_.size(); ++i) {
-                    if (ts[i * 2] == 0 || ts[i * 2 + 1] == 0)
-                        continue;
-                    double bm = static_cast<double>(ts[i * 2]) *
-                                timestamp_period_ / 1.0e6;
-                    if (base < 0.0 || bm < base)
-                        base = bm;
-                }
-                double prev_end = -1.0;
-                double gap_total = 0.0, overlap_total = 0.0;
-                for (size_t i = 0; i < node_ops_.size(); ++i) {
-                    uint64_t b = ts[i * 2], e = ts[i * 2 + 1];
-                    if (b == 0 || e == 0)
-                        continue;
-                    double bm =
-                        static_cast<double>(b) * timestamp_period_ / 1.0e6 -
-                        base;
-                    double em =
-                        static_cast<double>(e) * timestamp_period_ / 1.0e6 -
-                        base;
-                    const char *rel = "seq";
-                    if (prev_end >= 0.0) {
-                        if (bm > prev_end) {
-                            gap_total += bm - prev_end;
-                            rel = "GAP";
-                        } else if (em < prev_end) {
-                            overlap_total += prev_end - em;
-                            rel = "OVL";
-                        }
-                    }
-                    fprintf(stderr,
-                            "[tsdump] %4zu %s begin=%9.3f end=%9.3f"
-                            " dur=%8.3f %s %s\n",
-                            i, rel, bm, em, em - bm,
-                            convert_optype_to_string(node_ops_[i]->get_type())
-                                .c_str(),
-                            node_ops_[i]->get_name().c_str());
-                    prev_end = std::max(prev_end, em);
-                }
-                fprintf(stderr, "[tsdump] gaps=%.1fms overlaps=%.1fms\n",
-                        gap_total, overlap_total);
-            }
             // Top-N slowest individual ops (reveals which MatMuls dominate).
             std::sort(per_op_ms.begin(), per_op_ms.end(),
                       [](const auto &a, const auto &b) { return a.ms > b.ms; });
-            int topn = 15;
-            if (const char *e = getenv("VKOP_TOPN"))
-                topn = atoi(e);
+            const int topn = 15;
             fprintf(stderr, "[submitprof] --- top %d slowest ops ---\n", topn);
             for (int i = 0; i < topn && i < (int)per_op_ms.size(); ++i) {
                 const auto &e = per_op_ms[i];

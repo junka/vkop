@@ -95,12 +95,6 @@ class Cast : public BufferFactory {
                 output->fillToCPU(out);
                 objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
                 output->copyToGPUDeferred(m_cmd_);
-                if (std::getenv("VKOP_RB_TRACE")) {
-                    fprintf(
-                        stderr,
-                        "[rbtrace] Cast i64->fp32 LINEAR_GROW skip (v=%lld)\n",
-                        predicted.empty() ? -1LL : (long long)predicted[0]);
-                }
                 return;
             }
 
@@ -112,15 +106,6 @@ class Cast : public BufferFactory {
             std::vector<int64_t> in_vec(src_avail); // capture for state machine
             for (int i = 0; i < src_avail; ++i)
                 in_vec[i] = (*src)[i];
-            if (std::getenv("VKOP_RB_TRACE")) {
-                fprintf(stderr, "[rbtrace] Cast i64->fp32 shape=");
-                for (int d : shape)
-                    fprintf(stderr, "%d,", d);
-                fprintf(stderr, " total=%d vals=", total);
-                for (int i = 0; i < src_avail && i < 8; ++i)
-                    fprintf(stderr, "%lld,", (long long)in_vec[i]);
-                fprintf(stderr, " state=%d\n", static_cast<int>(cast_state_));
-            }
 
             // Advance the learn state machine. Detect uniform +1 growth across
             // all elements (the position-id pattern).

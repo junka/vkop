@@ -765,14 +765,6 @@ class MatMulBuffer : public BufferFactory {
         // small batch*m, long-K regime.
         const bool ksplit = fused_fp16 && !transB_ && (n % 4 == 0) &&
                             (k % 2 == 0) && (batch * m <= 8) && (k >= 256);
-        if (ksplit && std::getenv("VKOP_KSPLIT_DUMP")) {
-            std::fprintf(stderr,
-                         "[ksplit] %-22s m=%d n=%d k=%d batch=%d rep=%d "
-                         "weight=%s w4=%d wbyte=%d\n",
-                         get_name().c_str(), m, n, k, batch, rep,
-                         weight_label.c_str(), (int)weight_4bit,
-                         (int)weight_byte);
-        }
         // With B as [batch, K, N] (transB == 0, what an ONNX MatMul weight is)
         // the four columns of one K row are four adjacent weight BYTES, so one
         // 32-bit load feeds four output columns. That needs N % 4 == 0 to keep
@@ -1081,10 +1073,6 @@ class MatMulBuffer : public BufferFactory {
                 }
                 para_.wide = 1;
                 para_.ksplit_q = q;
-                if (std::getenv("VKOP_KSPLIT_DUMP"))
-                    std::fprintf(stderr,
-                                 "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
-                                 get_name().c_str(), 1, q, UP_DIV(n / 16, q));
                 fillDescriptorWrites(w8_wide_ds_[m_id_]);
                 wide_pipe->updateDescriptorSets(ds_writes_);
                 m_cmd_->bind(*wide_pipe, w8_wide_ds_[m_id_]);
@@ -1102,10 +1090,6 @@ class MatMulBuffer : public BufferFactory {
                 }
                 para_.wide = 1;
                 para_.ksplit_q = q;
-                if (std::getenv("VKOP_KSPLIT_DUMP"))
-                    std::fprintf(stderr,
-                                 "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
-                                 get_name().c_str(), 1, q, UP_DIV(n / 8, q));
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             }
@@ -1119,10 +1103,6 @@ class MatMulBuffer : public BufferFactory {
                 q /= 2;
             }
             para_.ksplit_q = q;
-            if (std::getenv("VKOP_KSPLIT_DUMP"))
-                std::fprintf(stderr,
-                             "[ksplit=>] %-22s wide=%d q=%d blocks=%d\n",
-                             get_name().c_str(), 0, q, UP_DIV(n / 4, q));
             submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
             return;
         }

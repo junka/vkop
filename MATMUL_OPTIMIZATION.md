@@ -196,10 +196,8 @@ attention_bias Expand 折进 QKᵀ),Concat/Transpose/Reshape 合计只剩 2.5%,
 | `VKOP_KSPLIT_Q=<n>` | 覆盖 ksplit 的列-quad 数(调优用) |
 | `VKOP_KSPLIT_WIDE=0/1` | 关/强制 WIDE |
 | `VKOP_KSPLIT_WIDE_N=<n>` | 设 fp16+byte 两个 WIDE 阈值 |
-| `VKOP_KSPLIT_DUMP=1` | 打印 ksplit 选择(wide/q/blocks) |
 | `VKOP_SUBMIT_PROF=1` | 每个 op 的 GPU 时间戳查询(权威) |
 | `VKOP_OPPROF=1` | record 侧 wall time |
-| `VKOP_TOPN=<n>` | 打印最慢的前 n 个 op(**测分类型汇总时要设大,否则截断**) |
 
 ---
 

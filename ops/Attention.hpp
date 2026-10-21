@@ -8,9 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
-#include <set>
 #include <string>
-#include <tuple>
 #include <unordered_map>
 
 namespace vkop {
@@ -326,21 +324,6 @@ class AttentionBuffer : public BufferFactory {
                 ring_head = ht->at(0);
             }
             ring = 1;
-        }
-
-        // Diagnostic for the sliding-window ring: what this dispatch was
-        // handed. The driver prints the same tuple it *intends*, so a
-        // difference between the two means the head never reached the op. One
-        // line per distinct tuple, not per layer instance.
-        if (ring && std::getenv("VKOP_ATTN_RING_DBG")) {
-            static std::set<std::tuple<int, int, int>> seen;
-            std::tuple<int, int, int> key{kv_past, kv_new, ring_head};
-            if (seen.insert(key).second) {
-                std::fprintf(stderr,
-                             "[attn-dbg] kv_past=%d kv_new=%d kv_len=%d "
-                             "head=%d\n",
-                             kv_past, kv_new, kv_len, ring_head);
-            }
         }
 
         AttentionPC pc{};

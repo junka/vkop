@@ -102,11 +102,6 @@ class NonZero : public BufferFactory {
             output->copyToGPUDeferred(m_cmd_);
             if (host_shape_enabled())
                 output->set_host_authoritative();
-            if (std::getenv("VKOP_RB_TRACE")) {
-                fprintf(stderr, "[rbtrace] NonZero STABLE skip (count=%d)\n",
-                        cached_out_shape_.size() > 1 ? cached_out_shape_[1]
-                                                     : -1);
-            }
             return;
         }
 
@@ -144,13 +139,6 @@ class NonZero : public BufferFactory {
         });
 
         int count = static_cast<int>(coords.size());
-        if (std::getenv("VKOP_RB_TRACE")) {
-            fprintf(stderr, "[rbtrace] NonZero shape=");
-            for (int d : shape)
-                fprintf(stderr, "%d,", d);
-            fprintf(stderr, " total=%d count=%d state=%d\n", total, count,
-                    static_cast<int>(nz_state_));
-        }
         // ONNX NonZero output: [rank, count], column-major. For rank==1 this
         // is just [1, count] == a flat [count] of linear indices in memory.
         std::vector<int> out_shape = {rank, count};

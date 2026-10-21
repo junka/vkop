@@ -100,11 +100,6 @@ class Range : public Operator {
                 output->copyToGPUDeferred(m_cmd_);
                 if (host_shape_enabled())
                     output->set_host_authoritative();
-                if (std::getenv("VKOP_RB_TRACE")) {
-                    fprintf(
-                        stderr, "[rbtrace] Range i64 STABLE skip (inums=%d)\n",
-                        cached_out_shape_.empty() ? -1 : cached_out_shape_[0]);
-                }
                 return;
             }
             // Verify: fall through to readback + compare.
@@ -201,14 +196,6 @@ class Range : public Operator {
                 cached_limit_ = limit;
                 cached_delta_ = delta;
             }
-        }
-
-        if (std::getenv("VKOP_RB_TRACE")) {
-            fprintf(stderr,
-                    "[rbtrace] Range %s start=%lld limit=%lld delta=%lld -> "
-                    "inums=%d state=%d\n",
-                    is_int64 ? "i64" : "fp", (long long)start, (long long)limit,
-                    (long long)delta, inums, static_cast<int>(range_state_));
         }
 
         // int64 range runs on the CPU (all 6 instances are part of the shape

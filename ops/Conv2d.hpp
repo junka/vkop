@@ -553,31 +553,6 @@ class Conv2dBuffer : public BufferFactory {
                                  stride_w == 1 && dil_w == 1 &&
                                  out_width >= conv2d::CONV_OW_BLOCK;
         const int ow_blk = row_blocked ? conv2d::CONV_OW_BLOCK : 1;
-        if (std::getenv("VKOP_CONVDBG")) {
-            std::printf("[convdbg] rank=%d is_3d=%d in=[", rank, is_3d);
-            for (size_t k = 0; k < input_shape.size(); ++k)
-                std::printf("%d ", input_shape[k]);
-            std::printf("] w=[");
-            for (size_t k = 0; k < weight_shape.size(); ++k)
-                std::printf("%d ", weight_shape[k]);
-            std::printf("] ksh=[");
-            for (size_t k = 0; k < kernel_shape_.size(); ++k)
-                std::printf("%d ", kernel_shape_[k]);
-            std::printf("] str=[");
-            for (size_t k = 0; k < strides_.size(); ++k)
-                std::printf("%d ", strides_[k]);
-            std::printf("] pad=[");
-            for (size_t k = 0; k < pads_.size(); ++k)
-                std::printf("%d ", pads_[k]);
-            std::printf(
-                "] kd=%d kh=%d kw=%d sd=%d sh=%d sw=%d pd=%d ph=%d pw=%d "
-                "ID=%d IH=%d IW=%d -> out=[",
-                kd, kernel_h, kernel_w, stride_d, stride_h, stride_w, pad_d,
-                pad_h, pad_w, in_depth, in_height, in_width);
-            for (size_t k = 0; k < out_shape.size(); ++k)
-                std::printf("%d ", out_shape[k]);
-            std::printf("] total=%d fp16=%d blk=%d\n", total, fp16_, ow_blk);
-        }
 
         // int8 weight-only quantization: weight (inputs[1]) is int8 and a
         // per-output-channel scale is appended as the last input. Layout:
