@@ -1208,11 +1208,11 @@ class MatMulBuffer : public BufferFactory {
     // Two verdicts reach nullptr and they are not the same width of state.
     // A driver that cannot compile the kernel is the DEVICE's answer, recorded
     // once for the process. A model whose archive has no bytes for the key is
-    // that MODEL's answer -- with VKOP_STRIP_BUILTIN_SHADERS=ON the default the
-    // SPIR-V comes from the .vkopbin's own archive, and Operator::resolve_spv
-    // throws by name when neither it nor the dev archive carries the key -- so
-    // a graph converted before shader_map listed buffer_matmul_w8_wide_fp16
-    // loses the path while a reconverted one keeps it, in the same process.
+    // that MODEL's answer -- the SPIR-V comes from the .vkopbin's own archive,
+    // and Operator::resolve_spv throws by name when neither it nor the dev
+    // archive carries the key -- so a graph converted before shader_map listed
+    // buffer_matmul_w8_wide_fp16 loses the path while a reconverted one keeps
+    // it, in the same process.
     VulkanPipeline *w8_wide_pipeline() {
         static bool refused_by_driver = false;
         static bool warned_missing_bytes = false;

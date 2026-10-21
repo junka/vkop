@@ -463,15 +463,13 @@ per-op_type 行（四个 post-fallback cell `image`/`image_fp16`/`buffer`/`buffe
 `hit key=… (from kernel plan)`；老模型没有 plan 字段时仍退回
 `core/ShaderKeys.hpp` 的表，行为不变）。这样"哪个 op 用哪个 kernel"只有一份答案：
 归档是按同一张表筛的，`build/tests/KernelPlanTest` 拿真实转换出的 vkopbin 验证
-每个 plan cell 在模型自己的内嵌归档里都有——这正是 stripped 构建能只带模型跑的前提。
+每个 plan cell 在模型自己的内嵌归档里都有——这正是只带模型就能跑的前提。
 
-`VKOP_STRIP_BUILTIN_SHADERS=ON` 是**默认**：libvkop 里每个 `*_spv[]` 都是
-1 字节桩（`_len = 0`），SPIR-V 只从模型来。所以内嵌归档不是可选项而是唯一的运行路径——
-单文件 vkopbin 在任何构建上都能独立跑（`ModelTest` 在 `build/` 和 `build-strip/` 上都
-验证了这条路）。反过来，老 writer 写出的、或转换时找不到 master 而没内嵌的模型在这种
-lib 上**跑不起来**：建 op 时就明确报 `... has a stubbed SPIR-V array ...` 并点名 op 和
-它要的 key，只能重转。`-DVKOP_STRIP_BUILTIN_SHADERS=OFF` 可以退回旧布局（每个 shader
-都进 `.rodata`，约 2.7 MB/消费者），那时没内嵌归档的模型还能靠链进去的数组跑。
+libvkop 里每个 `*_spv[]` 都是 1 字节桩（`_len = 0`），自己不携带任何 SPIR-V，
+SPIR-V 只从模型来。所以内嵌归档不是可选项而是唯一的运行路径——单文件 vkopbin 在任何
+构建上都能独立跑。反过来，老 writer 写出的、或转换时找不到 master 而没内嵌的模型
+**跑不起来**：建 op 时就明确报 `... has a stubbed SPIR-V array ...` 并点名 op 和
+它要的 key，只能重转。
 
 单元测试、probe、`bench_matmul` 这类**不经模型**直接 `create_from_type()` 建算子的
 二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及 `MinMaxProbe`）

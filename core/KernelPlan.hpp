@@ -14,10 +14,10 @@ namespace core {
 // Before this existed the runtime *derived* each op's archive key from its own
 // OpType -> name table (core/ShaderKeys.hpp) while the converter derived the
 // same key independently to decide what to embed (shader_map.py). Two
-// derivations of one decision, and with VKOP_STRIP_BUILTIN_SHADERS=ON — the
-// default — a disagreement is not a graceful fallback to a linked-in C array
-// any more, it is a hard failure when the pipeline is created. Reading the
-// answer out of the file removes the second derivation.
+// derivations of one decision, and since libvkop carries no built-in SPIR-V a
+// disagreement is not a graceful fallback to a linked-in C array any more, it
+// is a hard failure when the pipeline is created. Reading the answer out of the
+// file removes the second derivation.
 //
 // The four key fields are post-fallback, i.e. exactly what shader_key_for()
 // returns for that (backend, precision) pair: the backend's own basename when

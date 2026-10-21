@@ -472,9 +472,9 @@ class DAGBasedModel:
         serialize()) stored in the Model's `shader_archive` field. The runtime
         then takes every op's SPIR-V from the .vkopbin itself, so the model is
         a single deployable file with nothing to configure at run time.
-        onnx2vkop always passes one; None is the writer-level "bare model"
-        case, which only runs against a libvkop built with
-        VKOP_STRIP_BUILTIN_SHADERS=OFF.
+        onnx2vkop always passes one; None is the writer-level "bare model" case,
+        which no libvkop can run — libvkop carries no built-in SPIR-V, so its
+        shaders can only come from a model that has them.
 
         The kernel selection that archive was filtered by is written into the
         same file (Model.kernel_plans, indexed by Node.plan), so the runtime

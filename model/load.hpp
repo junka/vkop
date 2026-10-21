@@ -253,8 +253,8 @@ public:
     // Embedded SPIR-V archive (VKSP format) — a zero-copy view into the
     // FlatBuffer, valid for this VkModel's lifetime like initializer_memory.
     // Empty (size 0) for a model written by an older writer; Runtime then has
-    // no SPIR-V to give its ops, which is fatal on a stripped libvkop (the
-    // default) and falls back to the linked-in arrays otherwise.
+    // no SPIR-V to give its ops, which is fatal -- libvkop links in no shader
+    // bytes of its own.
     const uint8_t* shader_archive_memory = nullptr;
     size_t shader_archive_size = 0;
 

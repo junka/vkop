@@ -20,9 +20,8 @@ Usage:
         --manifest /tmp/keys.txt \
         --output build/llm.vkopbin.shaders.bin
 
-Missing keys are reported on stderr but do NOT abort the run — on a
-non-stripped build a miss leaves the op on its linked-in SPIR-V. On the
-default stripped build it is a hard failure at op build time instead, so the
+Missing keys are reported on stderr but do NOT abort the run — but a miss is a
+hard failure at op build time, since libvkop embeds no SPIR-V of its own, so the
 key set onnx2vkop feeds in has to be complete: the per-model subset is
 filtered from the graph's kernel plan, which is the same set the runtime looks
 up, and cli.build_shader_subset reports every planned key the master lacks.

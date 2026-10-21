@@ -5,9 +5,9 @@ the C++ side drives Runtime::LoadModel's post-create_from_type `override_spv()`
 lookup. A divergence between them is silent at conversion time and shows up
 later as either:
 
-  * a stripped build whose model archive lacks a shader the graph dispatches on
+  * a model whose archive lacks a shader the graph dispatches on
     (Runtime falls through to a stubbed array and Operator::set_runtime_device
-    throws with "this libvkop was built with VKOP_STRIP_BUILTIN_SHADERS=ON"), or
+    throws with "this libvkop carries no built-in shaders"), or
   * a full-archive run that ships bytes for a shader no graph ever uses, which
     just wastes space.
 
@@ -140,9 +140,9 @@ def test_python_table_matches_cpp_table():
 def test_secondary_keys_exist_in_master_archive():
     """Every (op, backend) secondary key must exist in the master archive or
     a filtered per-model archive will silently drop it. Filtered archive
-    misses at LoadModel time fall through to embedded, so on a stripped
-    build the op hits the stubbed-array throw and a whole model becomes
-    unrunnable — this catches it at build/CI time instead.
+    misses at LoadModel time fall through to embedded, so the op hits the
+    stubbed-array throw and a whole model becomes unrunnable — this catches
+    it at build/CI time instead.
     """
     from filter_shaders import read_master  # tools/ on sys.path in the CLI
 
@@ -167,7 +167,7 @@ def test_every_literal_resolve_spv_key_is_declared():
     set_runtime_device from a device-feature or dtype test), so nothing derives
     their archive key from the op table -- the C++ literal is the only place it
     exists. Omit one and a converted model's subset simply lacks it: the op
-    resolves to its stub array and loses that kernel, on a stripped build, with
+    resolves to its stub array and loses that kernel, with
     only a runtime warning to say so. This is the silent half of the drift the
     master-archive test above cannot see, because the key does exist in the
     master (CMake compiled it) -- it just never reaches the model.

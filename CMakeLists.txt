@@ -195,17 +195,18 @@ file(MAKE_DIRECTORY ${SPIRV_DIR})
 # a graph fp16 or fp32 any more. The caller picks the graph precision (the
 # Runtime ctor's precision argument, defaulting to fp32).
 
-# spv_to_c.py: embeds a SPIR-V blob as `unsigned char <sym_name>_spv[]` +
-# `<sym_name>_spv_len`. Used on all platforms (replaces the xxd+sed path,
-# which derived the symbol from the xxd-of-filepath and could not disambiguate
-# two shaders with the same basename in different folders).
+# spv_to_c.py: defines one shader symbol as `unsigned char <sym_name>_spv[1] =
+# {0}` + `unsigned int <sym_name>_spv_len = 0`. libvkop carries no SPIR-V of its
+# own: these stubs only keep the linker happy, and the runtime fills each op's
+# spv_ from the archive the .vkopbin itself carries (or, for dev binaries, the
+# build tree's archive via include/dev_shaders.hpp). A symbol left as a stub --
+# an archive miss -- makes Operator::set_runtime_device raise a clear error
+# naming the key rather than crashing later on a null pipeline_.
 #
-# VKOP_STUB_SPIRV=1 (exported by the CMake custom_command when the
-# VKOP_STRIP_BUILTIN_SHADERS option is ON) drops the SPIR-V bytes and emits a
-# 1-byte placeholder with _len = 0 instead, cutting ~2.7 MB out of every libvkop
-# consumer. The runtime then fills each op's spv_ from vkop_shaders.bin at
-# LoadModel time; without the archive, Operator::set_runtime_device raises a
-# clear error rather than crashing later on a null pipeline_.
+# The symbol is folder-derived on the CMake side (image/relu.comp ->
+# image_relu_spv), because the older xxd+sed path derived it from the
+# xxd-of-filepath and could not disambiguate two shaders with the same basename
+# in different folders.
 set(PY_SCRIPT_CONTENT
 "import sys
 import os
@@ -217,41 +218,13 @@ def main():
     input_spv = sys.argv[1]
     output_h  = sys.argv[2]
     sym_name  = sys.argv[3] + '_spv'
-    stub_mode = os.environ.get('VKOP_STUB_SPIRV', '') == '1'
 
-    if stub_mode:
-        # Placeholder symbols keep the linker happy. Runtime overrides them
-        # via Operator::override_spv() with the archive the .vkopbin itself
-        # carries; without one, set_runtime_device() throws instead of
-        # silently leaving the pipeline_ null and crashing at submit().
-        content = f'''// Auto-generated STUB for {os.path.basename(input_spv)}.
-// libvkop was built with VKOP_STRIP_BUILTIN_SHADERS=ON: the SPIR-V bytes
-// live in the .vkopbin and LoadModel populates each op from that archive
-// before building its pipeline.
+    content = f'''// Auto-generated STUB for {os.path.basename(input_spv)}.
+// libvkop carries no built-in SPIR-V: the bytes live in the .vkopbin and
+// LoadModel populates each op from that archive before building its pipeline.
 unsigned char {sym_name}[1] = {{0}};
 unsigned int {sym_name}_len = 0;
 '''
-        with open(output_h, 'w') as f:
-            f.write(content)
-        return
-
-    with open(input_spv, 'rb') as f:
-        data = f.read()
-
-    hex_lines = []
-    for i in range(0, len(data), 16):
-        chunk = data[i:i+16]
-        line = ', '.join(f'0x{b:02x}' for b in chunk)
-        hex_lines.append(line)
-    hex_str = ',\\n'.join(hex_lines)
-
-    content = f'''// Auto-generated from {os.path.basename(input_spv)}
-unsigned char {sym_name}[] = {{
-{hex_str}
-}};
-unsigned int {sym_name}_len = {len(data)};
-'''
-
     with open(output_h, 'w') as f:
         f.write(content)
 
@@ -262,32 +235,19 @@ set(PY_SCRIPT_FILE "${CMAKE_BINARY_DIR}/spv_to_c.py")
 file(WRITE "${PY_SCRIPT_FILE}" "${PY_SCRIPT_CONTENT}")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-# Compile shaders to SPIR-V and embed as C headers. The embedded symbol is
+# Compile shaders to SPIR-V and define one C symbol per shader. The symbol is
 # folder-derived: shaders/image/relu.comp -> image_relu_spv,
 # shaders/buffer/unary.comp -> buffer_unary_spv. Both image and buffer
 # shaders get their folder as a prefix, so same-named shaders in different
 # folders never collide.
 #
-# VKOP_STRIP_BUILTIN_SHADERS=ON (the default) drops the SPIR-V bytes from
-# libvkop entirely: spv_to_c.py writes a 1-byte placeholder with _len=0 for
-# every symbol, and shaders come from the model instead. onnx2vkop embeds the
-# per-model archive in the .vkopbin, so Runtime::LoadModel has everything it
-# needs from the single file and there is nothing to configure at run time. A
-# model without an archive (an old file) gets a named error instead of a null
-# pipeline. Development binaries that build ops without a model take the
-# build tree's archive via include/dev_shaders.hpp.
-#
-# OFF restores the pre-archive layout: libvkop carries every shader byte for
-# every backend (~2.7 MB of .rodata per consumer) whether or not the model
-# uses it.
-option(VKOP_STRIP_BUILTIN_SHADERS
-       "Emit stub C arrays in place of the SPIR-V bytes; requires a shader archive at runtime"
-       ON)
-if(VKOP_STRIP_BUILTIN_SHADERS)
-    set(VKOP_STUB_ENV "VKOP_STUB_SPIRV=1")
-else()
-    set(VKOP_STUB_ENV "VKOP_STUB_SPIRV=0")
-endif()
+# libvkop itself carries no SPIR-V: spv_to_c.py writes a 1-byte placeholder
+# with _len=0 for every symbol, and shaders come from the model instead.
+# onnx2vkop embeds the per-model archive in the .vkopbin, so Runtime::LoadModel
+# has everything it needs from the single file and there is nothing to
+# configure at run time. A model without an archive (an old file) gets a named
+# error instead of a null pipeline. Development binaries that build ops without
+# a model take the build tree's archive via include/dev_shaders.hpp.
 
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
@@ -312,8 +272,7 @@ foreach(SHADER ${SHADER_FILES})
     )
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE}
-        COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
-            ${Python3_EXECUTABLE}
+        COMMAND ${Python3_EXECUTABLE}
             ${PY_SCRIPT_FILE}
             ${SPIRV_FILE}
             ${SPIRV_SOURCE_FILE}
@@ -397,8 +356,7 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     )
     add_custom_command(
         OUTPUT ${SPIRV_SOURCE_FILE_FP16}
-        COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
-            ${Python3_EXECUTABLE}
+        COMMAND ${Python3_EXECUTABLE}
             ${PY_SCRIPT_FILE}
             ${SPIRV_FILE_FP16}
             ${SPIRV_SOURCE_FILE_FP16}
@@ -432,8 +390,7 @@ add_custom_command(
 )
 add_custom_command(
     OUTPUT ${SPIRV_SOURCE_FILE_W8WIDE}
-    COMMAND ${CMAKE_COMMAND} -E env ${VKOP_STUB_ENV}
-        ${Python3_EXECUTABLE}
+    COMMAND ${Python3_EXECUTABLE}
         ${PY_SCRIPT_FILE}
         ${SPIRV_FILE_W8WIDE}
         ${SPIRV_SOURCE_FILE_W8WIDE}
@@ -476,8 +433,8 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
 endforeach()
 # The -DW8_WIDE build above is neither its own .comp nor a DUAL_FP16_SHADERS
 # entry (it is a second define over buffer/matmul.comp), so neither loop picks it
-# up. Without this key a VKOP_STRIP_BUILTIN_SHADERS=ON build would hand
-# MatMulBuffer::w8_wide_pipeline a zero-length stub and lose the wide GEMV even
+# up. Without this key the archive would lack it and MatMulBuffer::
+# w8_wide_pipeline would get a zero-length stub, losing the wide GEMV even
 # on the devices whose driver compiles it fine.
 list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_w8_wide_fp16:${SPIRV_FILE_W8WIDE})

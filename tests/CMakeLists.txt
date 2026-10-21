@@ -247,7 +247,7 @@ else()
     add_executable(all_tests ${TEST_SOURCES})
 endif()
 
-# libvkop's own SPIR-V is stubbed out by default (VKOP_STRIP_BUILTIN_SHADERS=ON),
+# libvkop carries no SPIR-V of its own,
 # so a binary that builds operators without a model file -- this whole suite,
 # the probes, bench_matmul -- has to be handed the build tree's archive. CMake
 # bakes its path in and setup.cpp installs it as the process default; see
@@ -372,7 +372,7 @@ add_test(UnifiedLoadTest UnifiedLoadTest)
 # kernel selection it was converted with (Model.kernel_plans, Node.plan) and
 # the runtime looks ops up by it; this checks every row against the built-in
 # shader_key_for() table and against the model's own embedded archive, which
-# is the agreement VKOP_STRIP_BUILTIN_SHADERS=ON depends on. Uses the same
+# is the agreement the model-only design depends on. Uses the same
 # build-time-converted fixture as ModelTest.
 # Run:  ./KernelPlanTest build/tests/model/add_conv_model.vkopbin
 add_executable(KernelPlanTest KernelPlanTest.cpp)

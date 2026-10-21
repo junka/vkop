@@ -30,11 +30,10 @@
 // via ResizeInput to a concrete dim. With --load-inputs the npy's own
 // shape wins over --shape (the file records its dims).
 //
-// Composition with the pipeline cache / shader archive / stripped build:
-// the binary respects VK_PIPELINE_CACHE and MESA_SHADER_CACHE_DISABLE the
-// same way llm_chat does, and takes its shaders from the model it was handed
-// (see the shader-archive line it prints). Bench in the deployment's env,
-// not this binary's default.
+// Composition with the pipeline cache / shader archive: the binary respects
+// VK_PIPELINE_CACHE and MESA_SHADER_CACHE_DISABLE the same way llm_chat does,
+// and takes its shaders from the model it was handed (see the shader-archive
+// line it prints). Bench in the deployment's env, not this binary's default.
 
 #include <algorithm>
 #include <chrono>
@@ -737,8 +736,8 @@ int main(int argc, char **argv) {
     std::printf("shader-archive: %s", rt->shader_archive_entries()
                                           ? "<model>"
                                           : "none (the model carries no "
-                                            "archive; a stripped libvkop will "
-                                            "fail to build its ops)");
+                                            "archive; libvkop embeds no "
+                                            "shaders, so its ops cannot build)");
     if (rt->shader_archive_entries()) {
         std::printf(" (%zu entries)", rt->shader_archive_entries());
     }

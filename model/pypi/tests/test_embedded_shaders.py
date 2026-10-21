@@ -3,10 +3,10 @@
 onnx2vkop embeds a per-model SPIR-V subset (the VKSP layout of
 tools/filter_shaders.py) in Model.shader_archive, so one file is enough to
 deploy: Runtime::LoadModel takes every op's shaders from it, which is the only
-source on a libvkop built with VKOP_STRIP_BUILTIN_SHADERS=ON (the default).
+source, since libvkop carries no built-in SPIR-V.
 The C++ half is covered by ModelTest running against a fixture the CMake build
-converts (and by the same fixture passing in build-strip, where the linked-in
-arrays are stubs and the embedded archive is the only source of shaders).
+converts (where the linked-in arrays are stubs and the embedded archive is the
+only source of shaders).
 
 These tests pin the writer/reader contract at the boundary the C++ side
 reads: field present and byte-identical, absent when not asked for,
@@ -248,10 +248,10 @@ def test_cli_embeds_by_default(tmp_path, monkeypatch):
 def test_cli_without_a_master_archive_reports_an_unrunnable_model(
         tmp_path, monkeypatch, capsys):
     """A conversion with no master archive to filter from cannot embed shaders,
-    and on the default stripped libvkop that model is unrunnable -- which has
-    to be said at conversion time, not discovered at LoadModel. Simulated by
-    hiding filter_shaders.py, which is the one reason the subset cannot be
-    built at all."""
+    and libvkop, which carries no shaders of its own, cannot run that model --
+    which has to be said at conversion time, not discovered at LoadModel.
+    Simulated by hiding filter_shaders.py, which is the one reason the subset
+    cannot be built at all."""
     src = _write_tiny_onnx(tmp_path / "tiny.onnx")
     out = tmp_path / "bare.vkopbin"
     monkeypatch.setattr(cli, "filter_shaders", None)
@@ -339,7 +339,7 @@ def test_plan_rows_are_deduplicated_and_deterministic(tmp_path):
 
 
 def test_plan_agrees_with_the_archive_the_cli_embeds(tmp_path, monkeypatch):
-    """The invariant that makes VKOP_STRIP_BUILTIN_SHADERS=ON safe: every key
+    """The invariant that makes the model-only design safe: every key
     the plan promises is in the archive written next to it. Synthetic master
     holding exactly the planned keys, so nothing else can cover a gap."""
     src = _write_tiny_onnx(tmp_path / "tiny.onnx")
@@ -362,8 +362,8 @@ def test_plan_agrees_with_the_archive_the_cli_embeds(tmp_path, monkeypatch):
 
 def test_plan_reports_a_key_the_master_does_not_have(tmp_path, monkeypatch):
     """A planned key missing from the master is a genuine gap (the plan holds
-    the post-fallback spelling, so there is no phantom to excuse) and on a
-    stripped build it is a hard failure -- conversion has to say so."""
+    the post-fallback spelling, so there is no phantom to excuse) and it is a
+    hard failure -- conversion has to say so."""
     src = _write_tiny_onnx(tmp_path / "tiny.onnx")
     master, _ = fake_master(tmp_path, ["buffer_add"])
     out = tmp_path / "tiny.vkopbin"

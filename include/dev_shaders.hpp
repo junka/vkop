@@ -10,9 +10,9 @@ namespace dev {
 // Point a development binary that builds ops outside Runtime::LoadModel at
 // this build tree's shader archive.
 //
-// libvkop is built with VKOP_STRIP_BUILTIN_SHADERS=ON by default, so its own
-// `*_spv[]` arrays are 1-byte placeholders: every shader byte comes from an
-// archive. A model carries its own (onnx2vkop always embeds one), but the unit
+// libvkop ships no built-in SPIR-V: its own `*_spv[]` arrays are 1-byte
+// placeholders, so every shader byte comes from an archive. A model carries its
+// own (onnx2vkop always embeds one), but the unit
 // tests' torch fixtures, the probes and bench_matmul construct operators
 // straight through ops::create_from_type(), so they have no model to take
 // shaders from and die on the stub array instead. Operator falls back to

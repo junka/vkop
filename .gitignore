@@ -103,7 +103,7 @@ image/exporter/output_*.npy
 # ASan build directory
 /build-asan/
 
-# Stripped-shader build directory (VKOP_STRIP_BUILTIN_SHADERS=ON)
+# Alternate CMake build directory (kept ignored for existing checkouts)
 /build-strip/
 
 # Vulkan pipeline cache (per-model, written by VK_PIPELINE_CACHE=1). Device-

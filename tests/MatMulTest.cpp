@@ -1435,9 +1435,9 @@ TEST(MatMulTest, MatMulSplitKGemvBuffer) {
     //
     // The guard is what makes the name true: without VKOP_BUFFER_BACKEND the
     // fixture builds the *image* MatMul, so this "Buffer" test was exercising
-    // the image path -- and it only shows up on a stripped build, where the
+    // the image path -- and with no linked-in SPIR-V to hide it, the
     // split-K GEMV shape resolves a different shader key than the one the
-    // image op wants.
+    // image op wants and the lookup fails.
     vkop::tests::ScopedBufferBackend buffer;
     const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
         {{1, 1, 512}, {1, 512, 256}},

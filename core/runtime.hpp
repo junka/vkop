@@ -153,8 +153,8 @@ class Runtime {
     void SavePipelineCache();
 
     // SPIR-V source for this model: the archive the .vkopbin itself carries.
-    // onnx2vkop always embeds one, and libvkop is stripped by default, so this
-    // is the only source a shipping binary has -- there is deliberately no
+    // onnx2vkop always embeds one, and libvkop carries no built-in SPIR-V, so
+    // this is the only source a shipping binary has -- there is deliberately no
     // environment override, which could otherwise substitute different kernels
     // at run time. Null means the model has no archive: every op then keeps
     // its placeholder array and fails by name at build time. The archive is

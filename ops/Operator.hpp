@@ -120,10 +120,10 @@ class Operator {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
         // A stub array (unsigned char X_spv[1] = {0}; X_spv_len = 0) is what
-        // spv_to_c.py writes when VKOP_STRIP_BUILTIN_SHADERS=ON (the default).
-        // If we reach here with a non-null spv_ pointer but zero length, no
-        // archive supplied this op's shader, so pipeline_ would stay null and
-        // every later submit() would crash on
+        // spv_to_c.py writes for every shader: libvkop carries no SPIR-V of its
+        // own. If we reach here with a non-null spv_ pointer but zero length,
+        // no archive supplied this op's shader, so pipeline_ would stay null
+        // and every later submit() would crash on
         // pipeline_->allocDescriptorSets(). Fail with an actionable message at
         // load time instead. PimplFacade passes spv_=nullptr, len=0 (not a
         // stub) and is unaffected.
@@ -139,11 +139,10 @@ class Operator {
                     (name_.empty()
                          ? std::string(convert_optype_to_string(type_))
                          : name_) +
-                    " has a stubbed SPIR-V array (this libvkop was built with "
-                    "VKOP_STRIP_BUILTIN_SHADERS=ON) and the model it was built "
-                    "from carries no archive entry for it. Reconvert the model "
-                    "with onnx2vkop, which embeds every key its kernel plan "
-                    "lists.");
+                    " has a stubbed SPIR-V array (this libvkop carries no "
+                    "built-in shaders) and the model it was built from carries "
+                    "no archive entry for it. Reconvert the model with "
+                    "onnx2vkop, which embeds every key its kernel plan lists.");
             }
         }
         if (spv_len_ > 0 && spv_) {
@@ -485,15 +484,13 @@ class Operator {
     // Runtime's post-construct override_spv() can only reach the op's primary
     // spv_; these extra pipelines need to consult the archive directly. If
     // the archive is loaded and holds `key`, returns the mapped blob range;
-    // otherwise falls back to the extern symbols baked into libvkop, so a
-    // default (unstripped) build with the archive unset keeps its existing
-    // byte-for-byte behaviour.
+    // otherwise falls back to the extern symbols linked into libvkop.
     //
-    // On a stripped build those externs are the 1-byte stubs spv_to_c.py
-    // writes (`X_spv[1] = {0}`, `X_spv_len = 0`), so that fallback cannot
-    // produce a usable module -- it would fail later inside VulkanPipeline
-    // with nothing pointing at the cause. A stub is therefore detected here
-    // and reported as a missing-variant error naming the key.
+    // Those externs are the 1-byte stubs spv_to_c.py writes (`X_spv[1] = {0}`,
+    // `X_spv_len = 0`) -- libvkop carries no SPIR-V of its own -- so that
+    // fallback cannot produce a usable module: it would fail later inside
+    // VulkanPipeline with nothing pointing at the cause. A stub is therefore
+    // detected here and reported as a missing-variant error naming the key.
     std::pair<const uint32_t *, uint32_t>
     resolve_spv(const std::string &key, const unsigned char *embedded,
                 unsigned int embedded_len) const;

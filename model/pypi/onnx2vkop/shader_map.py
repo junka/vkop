@@ -204,7 +204,7 @@ def shader_keys_for_model(
     Derived from `kernel_plans_for_model`, which is the same table written
     into the .vkopbin as `Model.kernel_plans`. That is the point: the file
     records the keys, and the archive is filtered to exactly those keys, so
-    the two can no longer drift apart (under VKOP_STRIP_BUILTIN_SHADERS=ON a
+    the two can no longer drift apart (with no built-in SPIR-V in libvkop a
     drift is a hard failure at pipeline creation, not a fallback).
     """
     if backend not in ("buffer", "image", "auto"):

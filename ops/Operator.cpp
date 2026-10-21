@@ -66,8 +66,8 @@ Operator::resolve_spv(const std::string &key, const unsigned char *embedded,
             return r;
         }
     }
-    // A stub is what VKOP_STRIP_BUILTIN_SHADERS=ON leaves behind (spv_to_c.py
-    // writes `X_spv[1] = {0}` with a zero length), and it is not a shader: the
+    // A stub is what spv_to_c.py writes for every shader in libvkop
+    // (`X_spv[1] = {0}` with a zero length), and it is not a shader: the
     // caller would build a zero-length module and fail inside VulkanPipeline
     // with no hint as to which key went missing. Every in-tree caller feeds
     // the pair straight into a pipeline, so failing here is strictly clearer.
@@ -77,11 +77,11 @@ Operator::resolve_spv(const std::string &key, const unsigned char *embedded,
             (name_.empty() ? std::string(convert_optype_to_string(type_))
                            : name_) +
             " needs the shader variant '" + key +
-            "' and nothing supplied it: this libvkop's copy is a stub "
-            "(VKOP_STRIP_BUILTIN_SHADERS=ON is the default) and the archive "
-            "the .vkopbin carries does not have that key. Reconvert the model "
-            "with onnx2vkop -- it embeds every key its kernel plan lists -- "
-            "against a complete vkop_shaders.bin (--master-archive).");
+            "' and nothing supplied it: this libvkop carries no built-in "
+            "SPIR-V and the archive the .vkopbin carries does not have that "
+            "key. Reconvert the model with onnx2vkop -- it embeds every key "
+            "its kernel plan lists -- against a complete vkop_shaders.bin "
+            "(--master-archive).");
     }
     return {reinterpret_cast<const uint32_t *>(
                 const_cast<unsigned char *>(embedded)),

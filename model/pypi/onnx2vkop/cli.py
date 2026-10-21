@@ -48,8 +48,8 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     sets. Which one the driver picks is a runtime choice -- Runtime defaults
     to the image backend and every in-tree driver calls
     set_backend_buffer(true) -- so a self-contained .vkopbin has to be able
-    to answer for both, or a miss would silently drop the op back to the
-    libvkop-embedded C arrays (and to a stub, on a stripped build).
+    to answer for both, or a miss would drop the op back to a stub array --
+    libvkop embeds no shaders of its own.
     shader_map already over-includes on purpose for the same reason; the
     unused half costs bytes in the file but never faults in, since the op
     never asks for it. Pin "buffer"/"image" for the tight set.
@@ -63,7 +63,7 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     # runtime will look up. So an absent one is a genuine gap, not a phantom:
     # there is no "image_gather" style entry to filter out, because an op with
     # no image variant already resolves to the buffer spelling. Report them
-    # all: on a stripped build (the default) each one is a hard failure at
+    # all: each one is a hard failure at
     # pipeline creation, and this is the only place that can say so before the
     # model is deployed.
     missing = sorted(k for k in keys if k not in master)
@@ -77,9 +77,8 @@ def report_missing_keys(missing, master_path):
         print(f"[shaders] master has no {k!r}", file=sys.stderr)
     print(
         f"[shaders] {len(missing)} key(s) missing from {master_path}; "
-        "an op whose shader is absent falls back to its embedded C array "
-        "under the default build and to a stubbed pointer under "
-        "VKOP_STRIP_BUILTIN_SHADERS=ON.",
+        "an op whose shader is absent will fail at pipeline creation, since "
+        "libvkop carries no built-in SPIR-V to fall back on.",
         file=sys.stderr,
     )
 
@@ -142,9 +141,9 @@ def embed_shader_archive(dag_model, master_path, backend="auto"):
     """Build the per-model VKSP subset and return it as bytes to embed.
 
     The .vkopbin then carries its own shaders: Runtime::LoadModel takes them
-    from the file -- there is no other source on a libvkop built with
-    VKOP_STRIP_BUILTIN_SHADERS=ON (the default) -- and the same rows decide
-    which keys the runtime looks up (Model.kernel_plans).
+    from the file -- there is no other source, since libvkop carries no
+    built-in SPIR-V -- and the same rows decide which keys the runtime looks up
+    (Model.kernel_plans).
     """
     subset, missing, master_count = build_shader_subset(
         dag_model, master_path, backend)
@@ -175,11 +174,9 @@ def build_embedded_archive(args, dag_model, backend):
     """Resolve the master archive and return the subset to embed, or None.
 
     Every failure path here is a warning plus a None return, never an abort:
-    conversion always produces a model file, and a model whose .vkopbin lacks
-    the archive still loads against a libvkop built with
-    VKOP_STRIP_BUILTIN_SHADERS=OFF. On the default (stripped) build it will
-    instead fail at op build time with the op and key named, which is why the
-    no-archive case is worth printing loudly here.
+    conversion always produces a model file. The no-archive case is still worth
+    printing loudly: libvkop carries no built-in SPIR-V, so a model whose
+    .vkopbin lacks the archive fails at op build time with the op and key named.
     """
     if filter_shaders is None:
         print(f"[shaders] no filter_shaders.py under {_TOOLS}; converting "
@@ -191,10 +188,9 @@ def build_embedded_archive(args, dag_model, backend):
             "[shaders] no vkop_shaders.bin found (looked at --master-archive, "
             "$VKOP_MASTER_ARCHIVE, build/vkop_shaders.bin, "
             "build-strip/vkop_shaders.bin); converting without an embedded "
-            "archive. libvkop is built with VKOP_STRIP_BUILTIN_SHADERS=ON by "
-            "default and carries no SPIR-V of its own, so this .vkopbin will "
-            "not be runnable: build the archive (cmake --build <dir> --target "
-            "shader_archive) and reconvert.",
+            "archive. libvkop carries no SPIR-V of its own, so this .vkopbin "
+            "will not be runnable: build the archive (cmake --build <dir> "
+            "--target shader_archive) and reconvert.",
             file=sys.stderr,
         )
         return None
@@ -271,9 +267,9 @@ Examples:
         help="Which backend's shader variant names to embed. The default "
              "(auto) ships both, because the backend is the driver's runtime "
              "choice -- Runtime defaults to image and the in-tree drivers "
-             "call set_backend_buffer(true) -- and a wrong guess would make "
-             "the op fall back to libvkop's SPIR-V (or to a stub on a "
-             "stripped build). Unused entries never fault in, so pinning "
+             "call set_backend_buffer(true) -- and a wrong guess would leave "
+             "the op without a shader, since libvkop has no built-in SPIR-V to "
+             "fall back on. Unused entries never fault in, so pinning "
              "buffer/image only shrinks the file.",
     )
     # Build-time knobs that mirror env vars the code already reads. Setting
@@ -424,8 +420,8 @@ def main():
         if shader_blob is None:
             print(
                 "[shaders] this .vkopbin carries no shaders and will not run "
-                "against libvkop built with VKOP_STRIP_BUILTIN_SHADERS=ON (the "
-                "default); it needs a libvkop built with that option OFF.",
+                "against libvkop, which has no built-in SPIR-V of its own. "
+                "Reconvert it with a master archive so it carries its shaders.",
                 file=sys.stderr,
             )
 

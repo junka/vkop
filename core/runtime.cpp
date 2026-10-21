@@ -194,15 +194,15 @@ void Runtime::LoadModel() {
     auto model = load::VkModel(model_path_);
 
     // SPIR-V source: the archive the .vkopbin itself carries. onnx2vkop
-    // always embeds one, and libvkop is built with
-    // VKOP_STRIP_BUILTIN_SHADERS=ON, so this is the only place a shipping
-    // binary can get shaders from -- that is the single-file property, and
-    // there is deliberately no environment override that could quietly
-    // substitute different kernels at run time. A model without an archive
-    // (an old file, or one converted before the master archive existed)
-    // leaves every op on its stub array and fails loudly at op build time.
-    // Ops built outside LoadModel -- unit fixtures, probes -- get theirs from
-    // ShaderArchive::process_default(), installed by include/dev_shaders.hpp.
+    // always embeds one, and libvkop ships no built-in SPIR-V, so this is the
+    // only place a shipping binary can get shaders from -- that is the
+    // single-file property, and there is deliberately no environment override
+    // that could quietly substitute different kernels at run time. A model
+    // without an archive (an old file, or one converted before the master
+    // archive existed) leaves every op on its stub array and fails loudly at
+    // op build time. Ops built outside LoadModel -- unit fixtures, probes --
+    // get theirs from ShaderArchive::process_default(), installed by
+    // include/dev_shaders.hpp.
     if (model.shader_archive_size > 0) {
         shader_archive_ = ShaderArchive::open_from_memory(
             model.shader_archive_memory, model.shader_archive_size);
@@ -221,7 +221,7 @@ void Runtime::LoadModel() {
         } else if (model.shader_archive_size == 0) {
             std::fprintf(stderr,
                          "[shaders] %s carries no shader archive; there is no "
-                         "other source on a stripped libvkop\n",
+                         "other source, since libvkop embeds no shaders\n",
                          model_path_.c_str());
         }
     }
@@ -1200,7 +1200,7 @@ void Runtime::LoadModel() {
             // override can look up secondary pipelines (Matmul's coop/pack,
             // Conv2d's pack) by key. The primary spv_ is replaced below via
             // override_spv(); those secondaries never pass through spv_ and
-            // would otherwise read the stub placeholder on a stripped build.
+            // would otherwise read the stub placeholder.
             op->set_shader_archive(shader_archive_.get());
             // Replace this op's SPIR-V pointer with the mapped archive range
             // before the pipeline is built. A miss (an op whose name isn't in
@@ -1225,10 +1225,10 @@ void Runtime::LoadModel() {
                     } else if (plan != nullptr) {
                         // The model's own embedded subset lacks a key its own
                         // plan lists. That is a converter bug (the two are
-                        // built from the same rows), and under
-                        // VKOP_STRIP_BUILTIN_SHADERS=ON it is fatal a moment
-                        // later, so say so here while the cause is still
-                        // obvious rather than only in debug mode.
+                        // built from the same rows), and with no built-in
+                        // SPIR-V to fall back on it is fatal a moment later, so
+                        // say so here while the cause is still obvious rather
+                        // than only in debug mode.
                         std::fprintf(
                             stderr,
                             "[shaders] %s: the model's embedded "

@@ -171,10 +171,10 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         dual = backend_buffer ? s.image_fp16 : s.buffer_fp16;
         // The prefix has to follow the base we actually took, not the backend
         // that was asked for. Emitting "image_" + the buffer basename produced
-        // a key no archive can contain ("image_gemm"), which the default build
-        // hid (an archive miss just keeps the embedded array) and a stripped
-        // build turned into a hard miss. shader_map.py's _primary_keys already
-        // picks the prefix from the chosen basename; this mirrors it.
+        // a key no archive can contain ("image_gemm"), and with no linked-in
+        // SPIR-V to mask the miss it now fails hard. shader_map.py's
+        // _primary_keys already picks the prefix from the chosen basename;
+        // this mirrors it.
         backend_buffer = !backend_buffer;
         if (!base) {
             return std::string();

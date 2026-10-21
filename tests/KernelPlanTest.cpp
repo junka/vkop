@@ -9,15 +9,15 @@
 //      four (backend, precision) combinations -- i.e. the file's answer and
 //      the built-in table agree for the ops it plans;
 //   2. every key a plan lists (cells and variants) is inside the model's own
-//      embedded archive. That is the invariant that makes
-//      VKOP_STRIP_BUILTIN_SHADERS=ON safe: with no linked-in SPIR-V left, a
-//      key that is planned but not embedded is a hard failure at pipeline
-//      creation rather than a fallback;
+//      embedded archive. That is the invariant that makes the model-only
+//      design safe: with no linked-in SPIR-V in libvkop, a key that is planned
+//      but not embedded is a hard failure at pipeline creation rather than a
+//      fallback;
 //   3. a node without a plan has no key at all under the built-in table, so
 //      Node.plan = -1 can only ever mean "nothing to look up".
 //
-// Plain main (no gtest, no torch) so it stays cheap to rebuild and runs in the
-// strip build too. Fixture comes from argv[1] (the CMake-converted artifact).
+// Plain main (no gtest, no torch) so it stays cheap to rebuild and runs
+// without torch. Fixture comes from argv[1] (the CMake-converted artifact).
 
 #include <cstdio>
 #include <string>

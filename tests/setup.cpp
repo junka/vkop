@@ -19,10 +19,10 @@ bool TestEnv::initialized_ = false;
 
 
 int main(int argc, char **argv) {
-    // Every test in this binary builds its ops directly (no model file), so on
-    // the default stripped libvkop they need the build tree's archive: see
-    // include/dev_shaders.hpp. Done before gtest init so the env is in place
-    // for whatever the first test does.
+    // Every test in this binary builds its ops directly (no model file), so
+    // they need the build tree's archive, since libvkop embeds no shaders of
+    // its own: see include/dev_shaders.hpp. Done before gtest init so the env
+    // is in place for whatever the first test does.
     vkop::dev::seed_shader_archive_from_build_tree();
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

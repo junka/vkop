@@ -50,9 +50,9 @@ class ShaderArchive {
     // Runtime::LoadModel. Runtime hands its own handle to every op it builds,
     // but the unit-test fixtures, the probes and bench_matmul construct
     // operators straight through ops::create_from_type(), so they never pass
-    // through that hook: under VKOP_STRIP_BUILTIN_SHADERS=ON (the default)
-    // they would have no SPIR-V at all and die on the stub array. Operator
-    // falls back to this when its own pointer is null.
+    // through that hook: libvkop carries no built-in SPIR-V, so without an
+    // archive they would have no SPIR-V at all and die on the stub array.
+    // Operator falls back to this when its own pointer is null.
     //
     // Dev-only, and deliberately not driven by an environment variable: this
     // is the build tree's own archive, installed by a header the shipping
