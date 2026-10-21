@@ -52,7 +52,6 @@ float init_acc() {
 float transform_val(float v) {
     if (uReduce.reduce_op == REDUCE_L1) return abs(v);
     if (uReduce.reduce_op == REDUCE_L2 || uReduce.reduce_op == REDUCE_SUMSQUARE) return v * v;
-    if (uReduce.reduce_op == REDUCE_LOGSUMEXP) return exp(v);
     return v;
 }
 
@@ -87,37 +86,57 @@ float reduce_one(int out_gid, int rank) {
     }
     int total_elems = n_iter; // for MEAN
 
-    float acc = init_acc();
-    int counter[8];
-    for (int i = 0; i < n_red; ++i) counter[i] = 0;
+    // LogSumExp needs a max-subtraction pass: Σexp(v) overflows to +inf once any
+    // v > 88.7 (fp32 exp range), and the old single-pass form then returned inf
+    // for inputs that are perfectly finite. Pass 0 finds the row max, pass 1 sums
+    // exp(v - max); m + log(Σ) is then exact. Every other reduction is one pass.
+    const bool lse = (uReduce.reduce_op == REDUCE_LOGSUMEXP);
+    if (lse && n_iter == 0) return -1.0f / 0.0f; // -inf: nothing to reduce over
 
-    for (int step = 0; step < n_iter; ++step) {
-        IArr8 in_coord;
-        for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
-        for (int r = 0; r < n_red; ++r) {
-            in_coord.v[red_axes[r]] = counter[r];
+    float shift = 0.0f;
+    float acc = lse ? -1e30f : init_acc();
+
+    for (int pass = 0; pass < (lse ? 2 : 1); ++pass) {
+        if (pass == 1) {
+            shift = acc; // the row max found in pass 0
+            acc = 0.0f;  // restart as the exp sum
         }
-        int in_linear = nd_to_linear8(in_coord, uReduce.inDims, rank);
-#ifdef FP16
-        // fp16: element in_linear lives in word in_linear/2, lane in_linear%2.
-        float v = BUF_LOAD(uInput.data, in_linear);
-#else
-        float v = uintBitsToFloat(uInput.data[in_linear]);
-#endif
-        acc = combine(acc, transform_val(v));
 
-        for (int r = n_red - 1; r >= 0; --r) {
-            counter[r] += 1;
-            if (counter[r] < red_dims[r]) break;
-            counter[r] = 0;
+        int counter[8];
+        for (int i = 0; i < n_red; ++i) counter[i] = 0;
+
+        for (int step = 0; step < n_iter; ++step) {
+            IArr8 in_coord;
+            for (int i = 0; i < rank; ++i) in_coord.v[i] = out_coord.v[i];
+            for (int r = 0; r < n_red; ++r) {
+                in_coord.v[red_axes[r]] = counter[r];
+            }
+            int in_linear = nd_to_linear8(in_coord, uReduce.inDims, rank);
+#ifdef FP16
+            // fp16: element in_linear lives in word in_linear/2, lane in_linear%2.
+            float v = BUF_LOAD(uInput.data, in_linear);
+#else
+            float v = uintBitsToFloat(uInput.data[in_linear]);
+#endif
+            if (lse) {
+                acc = (pass == 0) ? max(acc, v) : acc + exp(v - shift);
+            } else {
+                acc = combine(acc, transform_val(v));
+            }
+
+            for (int r = n_red - 1; r >= 0; --r) {
+                counter[r] += 1;
+                if (counter[r] < red_dims[r]) break;
+                counter[r] = 0;
+            }
         }
     }
 
     float result = acc;
     if (uReduce.reduce_op == REDUCE_MEAN) {
         result = (total_elems > 0) ? acc / float(total_elems) : 0.0f;
-    } else if (uReduce.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(acc + 1e-12f);
+    } else if (lse) {
+        result = shift + log(acc + 1e-12f);
     } else if (uReduce.reduce_op == REDUCE_L2) {
         result = sqrt(acc);
     } else if (uReduce.reduce_op == REDUCE_LOGSUM) {

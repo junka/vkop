@@ -10,21 +10,28 @@ namespace ops {
 
 namespace scatter {
 struct alignas(16) ScatterPC {
-    int n_threads;  // n_idx * cols
-    int cols;       // row width
-    int reduction;  // 0 = none (overwrite), 1 = add
+    int n_threads;  // indices/updates element count (== updates.numel())
+    int inner;      // product of dims after `axis` (trailing width)
+    int idx_axis;   // indices.shape[axis]
+    int data_axis;  // data.shape[axis] — the coordinate the index selects
+    int reduction;  // 0=none 1=add 2=mul 3=max 4=min
     int data_total; // elements in data/output; bounds-checks the target
+    int _pad0;
+    int _pad1;
 };
 } // namespace scatter
 
-// ScatterElements (axis=0, reduction 'none' or 'add'), SSBO/GPU only.
-// data, indices and updates share rank with indices.shape == updates.shape
-// (ONNX), e.g. the LLM's deepstack visual-feature injection, where torch
-// exports the 1-D nonzero row indices already expanded to the update width.
+// ScatterElements, SSBO/GPU only. data, indices and updates share rank with
+// indices.shape == updates.shape (ONNX), e.g. the LLM's deepstack
+// visual-feature injection, where torch exports the 1-D nonzero row indices
+// already expanded to the update width.
 //
-// For axis=0, indices[i] gives the row index in data that element i lands in.
-// With the data viewed flat row-major [rows, cols], one thread handles one
-// index/update element: dest = indices[i] * cols + i % cols.
+// General axis: for index element i, every coordinate of its data destination
+// equals i's own coordinate except along `axis`, where it is indices[i]. So
+// with `inner` = product(shape[axis+1:]), one thread handles one index/update
+// element and computes
+//   dst = (outer * data_axis + indices[i]) * inner + inner_i
+// where inner_i = i % inner and outer = (i / inner) / idx_axis.
 class ScatterElements : public BufferFactory {
   public:
     explicit ScatterElements(int fp16 = 0)
@@ -41,11 +48,21 @@ class ScatterElements : public BufferFactory {
             axis_ = std::stol(attributes.at("axis"));
         }
         if (attributes.find("reduction") != attributes.end()) {
-            std::string r = attributes.at("reduction");
-            if (r == "add")
+            const std::string r = attributes.at("reduction");
+            if (r == "none")
+                reduction_ = 0;
+            else if (r == "add")
                 reduction_ = 1;
+            else if (r == "mul")
+                reduction_ = 2;
+            else if (r == "max")
+                reduction_ = 3;
+            else if (r == "min")
+                reduction_ = 4;
             else
-                reduction_ = 0; // none
+                throw std::runtime_error(
+                    "ScatterElements: unsupported reduction '" + r +
+                    "' (want none|add|mul|max|min)");
         }
     }
 
@@ -59,15 +76,61 @@ class ScatterElements : public BufferFactory {
         // writes to binding 0 (uData = output = data).
         auto data_shape = inputs[0]->getShape();
         auto idx_shape = inputs[1]->getShape();
+        auto upd_shape = inputs[2]->getShape();
+        const int rank = static_cast<int>(idx_shape.size());
 
-        // ONNX: data, indices and updates all have the same rank, and
-        // indices.shape == updates.shape. Thread gid is a flat index-element
-        // position, so the trailing width that splits gid into (row, col) is
-        // the trailing width of *indices* (== that of data by spec).
-        int cols = 1;
-        for (size_t i = 1; i < idx_shape.size(); ++i) {
-            cols *= idx_shape[i];
+        // axis: ONNX allows a negative value; normalize into [0, rank).
+        int axis = axis_;
+        if (axis < 0)
+            axis += rank;
+        if (rank == 0 || axis < 0 || axis >= rank) {
+            throw std::runtime_error("ScatterElements " + get_name() +
+                                     ": axis " + std::to_string(axis_) +
+                                     " out of range for rank " +
+                                     std::to_string(rank));
         }
+
+        // A shape chain that lost a rank-increasing view breaks the address
+        // math below, so validate the shapes before using them. Skip when a dim
+        // is still dynamic (-1), where the comparison would be meaningless.
+        auto concrete = [](const std::vector<int> &s) {
+            for (int d : s)
+                if (d < 0)
+                    return false;
+            return true;
+        };
+        auto shp = [](const std::vector<int> &s) {
+            std::string r = "[";
+            for (size_t i = 0; i < s.size(); ++i)
+                r += std::to_string(s[i]) + (i + 1 == s.size() ? "]" : ",");
+            return r;
+        };
+        // ONNX: indices.shape == updates.shape (same rank, same dims).
+        if (concrete(idx_shape) && concrete(upd_shape) &&
+            idx_shape != upd_shape) {
+            throw std::runtime_error(
+                "ScatterElements " + get_name() + ": indices " +
+                shp(idx_shape) + " and updates " + shp(upd_shape) +
+                " must have the same shape (ONNX); a view node was folded out "
+                "of the shape chain");
+        }
+        if (concrete(data_shape) &&
+            static_cast<int>(data_shape.size()) != rank) {
+            throw std::runtime_error(
+                "ScatterElements " + get_name() + ": data rank " +
+                std::to_string(data_shape.size()) + " != indices rank " +
+                std::to_string(rank));
+        }
+
+        const int idx_axis = idx_shape[axis];
+        const int data_axis =
+            (concrete(data_shape) && axis < static_cast<int>(data_shape.size()))
+                ? data_shape[axis]
+                : idx_axis;
+        int inner = 1;
+        for (int i = axis + 1; i < rank; ++i)
+            inner *= idx_shape[i];
+
         // indices is int64 in the model (bound as ivec2[] in the shader);
         // read the element count on the correct dtype.
         int n_idx = 0;
@@ -76,48 +139,7 @@ class ScatterElements : public BufferFactory {
             n_idx =
                 static_cast<int>(core::as_tensor<T>(inputs[1])->num_elements());
         });
-        int n_threads = n_idx;
-
-        // The (row, col) split takes cols from *indices* but reads updates at
-        // the same flat gid, so indices and updates must agree on rank and on
-        // the trailing width, and hold the same number of elements. Check it
-        // here: a shape chain that lost a rank-increasing view breaks all
-        // three, and every target address computed from it is then wrong. The
-        // shader drops out-of-range writes, but a dropped write is only half
-        // the story — the shapes say why. Skip when a dim is still dynamic
-        // (-1), where the comparison would be meaningless.
-        auto upd_shape = inputs[2]->getShape();
-        auto concrete = [](const std::vector<int> &s) {
-            for (int d : s)
-                if (d < 0)
-                    return false;
-            return true;
-        };
-        int upd_cols = 1;
-        for (size_t i = 1; i < upd_shape.size(); ++i) {
-            upd_cols *= upd_shape[i];
-        }
-        const int upd_total = static_cast<int>(total_elems(upd_shape));
-        if (concrete(idx_shape) && concrete(upd_shape) &&
-            (idx_shape.size() != upd_shape.size() || cols != upd_cols ||
-             n_idx != upd_total)) {
-            auto shp = [](const std::vector<int> &s) {
-                std::string r = "[";
-                for (size_t i = 0; i < s.size(); ++i)
-                    r += std::to_string(s[i]) + (i + 1 == s.size() ? "]" : ",");
-                return r;
-            };
-            throw std::runtime_error(
-                "ScatterElements " + get_name() + ": indices " +
-                shp(idx_shape) + " and updates " + shp(upd_shape) +
-                " must have equal rank, equal trailing "
-                "width and equal element count (cols=" +
-                std::to_string(cols) + " upd_cols=" + std::to_string(upd_cols) +
-                " n_idx=" + std::to_string(n_idx) +
-                " upd_total=" + std::to_string(upd_total) +
-                "); a view "
-                "node was folded out of the shape chain");
-        }
+        const int n_threads = n_idx;
 
         // GPU dispatch path for BOTH fp32 and fp16. The fp16 shader variant
         // (buffer_scatter_elements_fp16, built with -DFP16) uses a
@@ -185,7 +207,9 @@ class ScatterElements : public BufferFactory {
 
         scatter::ScatterPC pc{};
         pc.n_threads = n_threads;
-        pc.cols = cols;
+        pc.inner = inner;
+        pc.idx_axis = idx_axis;
+        pc.data_axis = data_axis;
         pc.reduction = reduction_;
         pc.data_total = concrete(data_shape)
                             ? static_cast<int>(total_elems(data_shape))
@@ -194,7 +218,7 @@ class ScatterElements : public BufferFactory {
     }
 
     int axis_ = 0;
-    int reduction_ = 0; // 0=none, 1=add
+    int reduction_ = 0; // 0=none 1=add 2=mul 3=max 4=min
 };
 
 } // namespace ops

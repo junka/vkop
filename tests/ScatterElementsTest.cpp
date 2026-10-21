@@ -22,12 +22,13 @@ namespace {
 static void run_scatter(
     const std::string &reduction,
     const std::vector<std::shared_ptr<vkop::core::ITensor>> &inputs,
-    const std::vector<std::shared_ptr<vkop::core::ITensor>> &outputs) {
+    const std::vector<std::shared_ptr<vkop::core::ITensor>> &outputs,
+    const std::string &axis = "0") {
     auto dev = vkop::tests::TestEnv::get_device();
     auto cmdpool = vkop::tests::TestEnv::get_command_pool();
     auto op = ops::create_from_type(ops::OpType::SCATTER_ELEMENTS, 0, 0, true);
     op->set_runtime_device(dev, cmdpool);
-    op->setAttribute({{"axis", "0"}, {"reduction", reduction}});
+    op->setAttribute({{"axis", axis}, {"reduction", reduction}});
 
     // Upload all tensors (data/indices/updates) — data is also the output.
     for (auto &t : inputs) {
@@ -137,12 +138,13 @@ TEST(ScatterElementsTest, AddReduction) {
 static void run_scatter_fp16(
     const std::string &reduction,
     const std::vector<std::shared_ptr<vkop::core::ITensor>> &inputs,
-    const std::vector<std::shared_ptr<vkop::core::ITensor>> &outputs) {
+    const std::vector<std::shared_ptr<vkop::core::ITensor>> &outputs,
+    const std::string &axis = "0") {
     auto dev = vkop::tests::TestEnv::get_device();
     auto cmdpool = vkop::tests::TestEnv::get_command_pool();
     auto op = ops::create_from_type(ops::OpType::SCATTER_ELEMENTS, 1, 0, true);
     op->set_runtime_device(dev, cmdpool);
-    op->setAttribute({{"axis", "0"}, {"reduction", reduction}});
+    op->setAttribute({{"axis", axis}, {"reduction", reduction}});
 
     for (auto &t : inputs) {
         if (!t) continue;
@@ -291,6 +293,103 @@ TEST(ScatterElementsTest, AddReductionFp16DistinctOutput) {
         EXPECT_NEAR(got, data.flatten()[i].item<float>(), 1.0f)
             << "data input clobbered at " << i << " got=" << got;
     }
+}
+
+// axis=1: the index picks the COLUMN, so dst = (row * data_axis + idx) with
+// inner == 1. The old kernel hardcoded axis=0 (dst = row*cols+col), so this
+// case came out as a silently wrong scatter.
+TEST(ScatterElementsTest, Axis1Overwrite) {
+    auto data = torch::zeros({3, 3});
+    auto indices =
+        torch::tensor({{2, 0, 1}, {0, 2, 1}, {1, 0, 2}}).to(torch::kInt64);
+    auto updates = torch::tensor({{10.0f, 20.0f, 30.0f},
+                                   {40.0f, 50.0f, 60.0f},
+                                   {70.0f, 80.0f, 90.0f}});
+    auto ref = data.clone();
+    ref.scatter_(1, indices, updates);
+
+    auto tout = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
+    auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
+    fill_float(tout, data);
+    tidx->fillToCPU(std::vector<int64_t>(indices.data_ptr<int64_t>(),
+                                         indices.data_ptr<int64_t>() + 9));
+    fill_float(tupd, updates);
+
+    run_scatter("none", {tout, tidx, tupd}, {tout}, "1");
+
+    for (int i = 0; i < 9; ++i) {
+        EXPECT_NEAR((*tout)[i], ref.flatten()[i].item<float>(), 0.01f)
+            << "mismatch at " << i;
+    }
+}
+
+// mul / max / min reductions. The old setAttribute only recognised "add" and
+// silently left every other string at the default 0 == "none", so mul/max/min
+// overwrote instead of combining. Distinct target rows here, so the expected
+// values are unambiguous regardless of thread order.
+static void run_reduction_case(const std::string &reduction,
+                               const std::vector<float> &expected) {
+    auto data = torch::tensor({{1.0f, 1.0f, 1.0f},
+                                {2.0f, 2.0f, 2.0f},
+                                {3.0f, 3.0f, 3.0f},
+                                {4.0f, 4.0f, 4.0f}});
+    auto updates = torch::tensor({{10.0f, 20.0f, 30.0f},
+                                   {40.0f, 50.0f, 60.0f},
+                                   {70.0f, 80.0f, 90.0f}});
+
+    auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
+    auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
+    fill_float(tout, data);
+    tidx->fillToCPU(expand_rows({0, 2, 1}, 3)); // rows 0, 2, 1
+    fill_float(tupd, updates);
+
+    run_scatter(reduction, {tout, tidx, tupd}, {tout});
+
+    ASSERT_EQ(expected.size(), 12u);
+    for (int i = 0; i < 12; ++i) {
+        EXPECT_NEAR((*tout)[i], expected[i], 0.01f)
+            << reduction << " mismatch at " << i;
+    }
+}
+
+TEST(ScatterElementsTest, MulReduction) {
+    // row0 *={10,20,30}; row2 *={40,50,60}; row1 *={70,80,90}; row3 untouched
+    run_reduction_case("mul", {10, 20, 30, 140, 160, 180, 120, 150, 180, 4, 4,
+                               4});
+}
+
+TEST(ScatterElementsTest, MaxReduction) {
+    run_reduction_case("max", {10, 20, 30, 70, 80, 90, 40, 50, 60, 4, 4, 4});
+}
+
+TEST(ScatterElementsTest, MinReduction) {
+    run_reduction_case("min", {1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4});
+}
+
+TEST(ScatterElementsTest, UnknownReductionThrows) {
+    auto dev = vkop::tests::TestEnv::get_device();
+    auto cmdpool = vkop::tests::TestEnv::get_command_pool();
+    auto op = ops::create_from_type(ops::OpType::SCATTER_ELEMENTS, 0, 0, true);
+    op->set_runtime_device(dev, cmdpool);
+    EXPECT_THROW(
+        op->setAttribute({{"axis", "0"}, {"reduction", "sum"}}),
+        std::runtime_error);
+}
+
+TEST(ScatterElementsTest, AxisOutOfRangeThrows) {
+    auto data = torch::zeros({4, 3});
+    auto updates = torch::zeros({3, 3});
+    auto tout = std::make_shared<Tensor<float>>(std::vector<int>{4, 3});
+    auto tidx = std::make_shared<Tensor<int64_t>>(std::vector<int>{3, 3});
+    auto tupd = std::make_shared<Tensor<float>>(std::vector<int>{3, 3});
+    fill_float(tout, data);
+    tidx->fillToCPU(expand_rows({0, 2, 1}, 3));
+    fill_float(tupd, updates);
+    // rank 2 → axis 2 (and its negative form -3) is out of range.
+    EXPECT_THROW(run_scatter("none", {tout, tidx, tupd}, {tout}, "2"),
+                 std::runtime_error);
 }
 
 } // namespace

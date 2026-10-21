@@ -110,6 +110,61 @@ TEST(MatMulTest, MatMulComprehensiveTest) {
     }
 }
 
+// ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
+// [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
+// dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.
+// The buffer op used to `return` on rank < 2 without dispatching at all, so the
+// freshly allocated output kept whatever it held (zeros); MatMulImage read
+// shape[rank-2] out of bounds.
+namespace {
+template <typename T>
+class MatMulRank1Test : public TestCase<T> {
+public:
+    std::shared_ptr<Tensor<T>> inputa;
+    std::shared_ptr<Tensor<T>> inputb;
+    std::shared_ptr<Tensor<T>> output;
+
+    MatMulRank1Test(const std::vector<int> &t1, const std::vector<int> &t2)
+        : TestCase<T>("MatMul") {
+        inputa = std::make_shared<Tensor<T>>(t1);
+        inputb = std::make_shared<Tensor<T>>(t2);
+        std::vector<int64_t> s1(t1.begin(), t1.end());
+        std::vector<int64_t> s2(t2.begin(), t2.end());
+        auto torch_in1 = torch::randn(s1, this->getTorchConf());
+        auto torch_in2 = torch::randn(s2, this->getTorchConf());
+        auto torch_output = torch::matmul(torch_in1, torch_in2);
+
+        // Rank-0 (both operands 1-D) materializes as [1], the form the
+        // converter writes ONNX scalars in.
+        std::vector<int> to(torch_output.sizes().begin(),
+                            torch_output.sizes().end());
+        if (to.empty()) {
+            to = {1};
+        }
+        output = std::make_shared<Tensor<T>>(to);
+        this->fillTensorFromTorch(inputa, torch_in1);
+        this->fillTensorFromTorch(inputb, torch_in2);
+        this->fillTensorFromTorch(output, torch_output);
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulRank1Operands) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{6}, {6, 4}}, // [K] x [K,N] -> [N]
+        {{5, 6}, {6}}, // [M,K] x [K] -> [M]
+        {{6}, {6}},    // [K] x [K] -> scalar ([1])
+    };
+    for (const auto &test_case : cases) {
+        auto [t1, t2] = test_case;
+        MatMulRank1Test<float> t(t1, t2);
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb}, {t.output}));
+        MatMulRank1Test<uint16_t> th(t1, t2);
+        EXPECT_TRUE(th.run_test({th.inputa, th.inputb}, {th.output}));
+    }
+}
+
 // Attention QK^T epilogue: MatMul * epi_scale + epi_bias[col], where the bias
 // is broadcast over the head axis (bias batch = total batch / heads). Verifies
 // the shader's epi_bias_at indexing and the scale-then-add order against a

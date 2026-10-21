@@ -76,8 +76,13 @@ calculate_output_shape(const std::vector<int> &input_shape,
         int end = static_cast<int>(e);
         int step = (steps.size() > i) ? static_cast<int>(steps[i]) : 1;
 
-        if (step == 0)
-            step = 1;
+        // ONNX requires a non-zero step; the old code silently treated 0 as 1,
+        // which turned a malformed Slice into a plausible-looking full-axis
+        // copy instead of an error.
+        if (step == 0) {
+            throw std::invalid_argument(
+                "Slice: step 0 is invalid (ONNX requires a non-zero step)");
+        }
 
         if (start < 0)
             start += dim_size;

@@ -209,6 +209,35 @@ public:
     explicit ReduceTest(const std::vector<int> &shape, const std::vector<int> &axes):TestCase<T>("Reduce"), t(shape), axes(axes) {
     }
 
+    // Variant of initTestdata for a caller-supplied input. The random inputs
+    // above stay in a range where a naive sum-of-exp happens to be finite, so
+    // the log-sum-exp overflow case needs values the generator never produces.
+    void initTestdataFromTensor(const std::string &reduce_op,
+                                const torch::Tensor &given_input) {
+        attributes["reduce_op"] = reduce_op;
+        // Match the fixture's dtype: fillTensorFromTorch reads an fp16 tensor
+        // through at::Half, so the reference has to be built in that dtype too.
+        torch::Tensor torch_input = given_input.to(this->getTorchConf().dtype());
+        input = std::make_shared<Tensor<T>>(t);
+        std::vector<int> output_shape = Reduce::calculateOutputShape(
+            input->getShape(), axes, attributes.at("keepdims") == "1");
+        output = std::make_shared<Tensor<T>>(output_shape);
+        this->fillTensorFromTorch(input, torch_input);
+
+        std::vector<int64_t> axeshape(axes.begin(), axes.end());
+        const bool keepdims = attributes.at("keepdims") == "1";
+        torch::Tensor torch_output;
+        if (reduce_op == "log_sum_exp") {
+            torch_output = torch::logsumexp(torch_input, axeshape, keepdims);
+        } else if (reduce_op == "sum") {
+            torch_output = torch::sum(torch_input, axeshape, keepdims);
+        } else {
+            throw std::runtime_error(
+                "initTestdataFromTensor: unsupported op " + reduce_op);
+        }
+        this->fillTensorFromTorch(output, torch_output);
+    }
+
     void initTestdata(const std::string& reduce_op)
     {
         attributes["reduce_op"] = reduce_op;
@@ -321,4 +350,37 @@ TEST(ReduceTest, ReduceComprehensiveTest) {
         }
 
     }
+}
+
+// exp() overflows fp32 above v ~= 88.7, so the old single-pass ReduceLogSumExp
+// (accumulate exp(v), then log) returned +inf for a perfectly finite input —
+// silently, and only for large activations (e.g. an unscaled logit row). The
+// stable form subtracts the row max first, so the same inputs stay finite.
+// Buffer backend only: the stabilised kernel is shaders/buffer/reduce.comp (the
+// image variant's per-case loops still accumulate exp(v) directly).
+TEST(ReduceTest, LogSumExpLargeValues) {
+    vkop::tests::ScopedBufferBackend buffer;
+    // Row 1 stays in the ordinary range: the max-subtraction must not change
+    // the answer when no term is anywhere near the overflow threshold.
+    auto torch_input = torch::tensor({{100.0f, 101.0f, 99.0f, 100.5f},
+                                       {-3.0f, 3.0f, 0.0f, 1.0f}});
+    const std::vector<int> t{2, 4};
+    const std::vector<int> axes{1};
+
+    auto run_case = [&](auto type_tag) -> bool {
+        using U = decltype(type_tag);
+        ReduceTest<U> rt(t, axes);
+        rt.initTestdataFromTensor("log_sum_exp", torch_input);
+        return rt.run_test({rt.input}, {rt.output},
+            [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *reduce_op = dynamic_cast<Reduce *>(op.get());
+                if (!reduce_op) {
+                    LOG_ERROR("Failed to cast operator to Reduce");
+                    return;
+                }
+                reduce_op->setAttribute(rt.attributes);
+            });
+    };
+    EXPECT_TRUE(run_case(float{}));
+    EXPECT_TRUE(run_case(uint16_t{}));
 }

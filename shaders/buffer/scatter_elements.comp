@@ -1,13 +1,18 @@
 #version 450 core
 
-// ScatterElements SSBO op. Scatters updates into data along axis=0.
-// Supports 'none' (overwrite) and 'add' (atomic CAS add) reduction.
+// ScatterElements SSBO op, general axis. Scatters updates into data along
+// `axis`; supports reduction none / add / mul / max / min.
 //
-// ONNX requires indices and updates to have the SAME shape [n, cols] (cols ==
-// the row width of data). So one thread handles one index/update element: its
-// flat position gid picks the trailing column (gid % cols) and the row to
-// scatter into:
-//   data[indices[gid] * cols + gid % cols] op= updates[gid]
+// ONNX requires indices and updates to have the same shape and data to share
+// the rank. For index element i, every coordinate of its data destination equals
+// i's own coordinate except along `axis`, where it is indices[i]. With
+//   inner     = product(data.shape[axis+1:])   (trailing width)
+//   idx_axis  = indices.shape[axis]
+//   data_axis = data.shape[axis]
+// one thread handles one index/update element:
+//   inner_i = i % inner
+//   outer   = (i / inner) / idx_axis
+//   dst = (outer * data_axis + indices[i]) * inner + inner_i
 //
 // Dispatch: n_idx threads (n_idx = indices.numel() = updates.numel()).
 //
@@ -32,24 +37,41 @@ layout(set = 0, binding = 2) readonly buffer Updates {
 
 layout(push_constant) uniform PC {
     int n_threads; // n_idx = indices.numel() == updates.numel()
-    int cols;      // trailing width shared by indices/updates/data rows
-    int reduction; // 0 = none (overwrite), 1 = add
+    int inner;     // product of dims after `axis` (trailing width)
+    int idx_axis;  // indices.shape[axis]
+    int data_axis; // data.shape[axis] — the coordinate the index selects
+    int reduction; // 0=none 1=add 2=mul 3=max 4=min
     int data_total; // elements in data / output, for the target bounds check
+    int _pad0;
+    int _pad1;
 } uPC;
+
+// Merge an existing destination value `a` with the incoming `u`.
+float combine(float a, float u) {
+    if (uPC.reduction == 0) return u;         // none: overwrite
+    if (uPC.reduction == 2) return a * u;     // mul
+    if (uPC.reduction == 3) return max(a, u); // max
+    if (uPC.reduction == 4) return min(a, u); // min
+    return a + u;                             // add (1, the default)
+}
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= uPC.n_threads) return;
 
-    int col = gid % uPC.cols;       // column within the scattered row
+    int inner_i = gid % uPC.inner;
+    int outer = (gid / uPC.inner) / uPC.idx_axis;
     // int64 indices (bound as ivec2[], low 32 bits = value): gid is the flat
-    // index-element position, so no row/col decomposition is needed here.
-    int row = uIndices.data[gid].x;
-    int target = row * uPC.cols + col;
+    // index-element position, so no row/col decomposition of the index itself
+    // is needed here.
+    int row = uIndices.data[gid].x; // target coordinate along `axis`
+    int target = (outer * uPC.data_axis + row) * uPC.inner + inner_i;
     // Out-of-range here is a write into whatever memory neighbours the data
     // buffer (another tensor's bytes, or the weight blob), so drop it: a
-    // dropped scatter is a wrong value in this op's own output. data_total
-    // == 0 means the host had no concrete shape, so it cannot bound us.
+    // dropped scatter is a wrong value in this op's own output. data_axis <= 0
+    // means the host had no concrete data shape (dynamic dims) — skip the row
+    // check and fall back to the flat target bound. data_total == 0 likewise.
+    if (uPC.data_axis > 0 && (row < 0 || row >= uPC.data_axis)) return;
     if (uPC.data_total > 0 && (target < 0 || target >= uPC.data_total)) return;
 
 #ifdef FP16
@@ -60,17 +82,13 @@ void main() {
     uint upd_word = uUpdates.data[uint(gid) >> 1];
     float update = unpackHalf2x16(upd_word)[gid & 1];
 
-    // Word-level CAS: read the whole word, modify only our half, CAS.
-    // Both 'add' and 'none' use CAS because a sibling thread may own the
-    // other half of the same word (adjacent columns share a word).
+    // Word-level CAS: read the whole word, modify only our half, CAS. Every
+    // reduction (including 'none') uses CAS because a sibling thread may own
+    // the other half of the same word (adjacent columns share a word).
     uint old_w = uData.data[target_word];
     for (;;) {
         vec2 p = unpackHalf2x16(old_w);
-        if (uPC.reduction == 1) {
-            p[target_slot] += update;
-        } else {
-            p[target_slot] = update;
-        }
+        p[target_slot] = combine(p[target_slot], update);
         uint new_w = packHalf2x16(p);
         uint result = atomicCompSwap(uData.data[target_word], old_w, new_w);
         if (result == old_w) break;
@@ -79,20 +97,19 @@ void main() {
 #else
     float update = uintBitsToFloat(uUpdates.data[gid]);
 
-    if (uPC.reduction == 1) {
-        // CAS loop for float atomic add.
+    if (uPC.reduction == 0) {
+        uData.data[target] = floatBitsToUint(update);
+    } else {
+        // CAS loop for a float atomic combine (GLSL has no float atomics).
         uint old = uData.data[target];
-        uint expected;
         for (;;) {
-            expected = old;
-            float new_val = uintBitsToFloat(expected) + update;
+            uint expected = old;
+            float new_val = combine(uintBitsToFloat(expected), update);
             uint new_bits = floatBitsToUint(new_val);
             uint result = atomicCompSwap(uData.data[target], expected, new_bits);
             if (result == expected) break;
             old = result;
         }
-    } else {
-        uData.data[target] = floatBitsToUint(update);
     }
 #endif
 }

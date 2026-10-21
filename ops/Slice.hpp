@@ -107,28 +107,34 @@ class SliceImage : public Operator {
         auto outshape = outputs[0]->getShape();
         auto out_gpu_shape = outputs[0]->getGPUShape();
         auto in_gpu_shape = inputs[0]->getGPUShape();
-        slice::GpuSliceParam param;
-        if (rank == 4) {
-            for (int i = 0; i < 4; i++) {
-                param.inShape[i] = inshape[i];
-                param.outShape[i] = out_size[0][i];
-                param.start[i] = out_size[1][i];
-                param.end[i] = out_size[2][i];
-                param.step[i] = out_size[3][i];
-            }
-        } else if (rank == 3) {
-            param.inShape[0] = 1;
-            param.outShape[0] = 1;
-            param.start[0] = 0;
-            param.end[0] = 1;
-            param.step[0] = 1;
-            for (int i = 0; i < 3; i++) {
-                param.inShape[i + 1] = inshape[i];
-                param.outShape[i + 1] = out_size[0][i];
-                param.start[i + 1] = out_size[1][i];
-                param.end[i + 1] = out_size[2][i];
-                param.step[i + 1] = out_size[3][i];
-            }
+        // The image shader reads one fixed-width ivec4 per
+        // shape/start/end/step, so a rank below 4 is expressed by left-padding
+        // a 1-wide leading axis (a leading 1 contributes nothing to the linear
+        // addressing) and pinning the spare lanes. This used to be filled only
+        // for rank 3 and 4: every other rank submitted an uninitialised
+        // GpuSliceParam holding whatever the stack had, which corrupted the
+        // output non-deterministically. rank > 4 cannot be expressed in an
+        // ivec4 at all, and rank 0 has no shape to slice.
+        if (rank == 0 || rank > 4) {
+            throw std::runtime_error(
+                "Slice (image backend) supports rank 1..4, got rank " +
+                std::to_string(rank));
+        }
+        slice::GpuSliceParam param{};
+        const int pad = 4 - rank;
+        for (int i = 0; i < pad; i++) {
+            param.inShape[i] = 1;
+            param.outShape[i] = 1;
+            param.start[i] = 0;
+            param.end[i] = 1;
+            param.step[i] = 1;
+        }
+        for (int i = 0; i < rank; i++) {
+            param.inShape[i + pad] = inshape[i];
+            param.outShape[i + pad] = out_size[0][i];
+            param.start[i + pad] = out_size[1][i];
+            param.end[i + pad] = out_size[2][i];
+            param.step[i + pad] = out_size[3][i];
         }
         submit(&param, UP_DIV(out_gpu_shape[0], 16),
                UP_DIV(out_gpu_shape[1], 16), out_gpu_shape[2]);
@@ -183,6 +189,17 @@ class SliceBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
+
+        // SlicePC carries 6 dims (the shader's IArr6) and the shader walks all
+        // `rank` of them, so a rank above 6 reads past the array into the
+        // neighbouring push-constant fields and aliases them as shape values.
+        // Nothing emits such a Slice; refuse rather than silently slice the
+        // wrong elements.
+        if (rank > 6) {
+            throw std::runtime_error(
+                "Slice (buffer backend) supports at most rank 6, got rank " +
+                std::to_string(rank));
+        }
 
         // Fail closed on a <= 1-byte payload: this mover has no byte build (see
         // core::require_word_movable_elem), so an fp8/int8/bool slice would

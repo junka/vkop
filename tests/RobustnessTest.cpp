@@ -246,8 +246,9 @@ TEST(RobustnessTest, ScatterNDUpdatesSizeMismatchThrows) {
         "updates_total=3");
 }
 
-// The op takes the (row, col) split width from indices and reads updates at the
-// same flat gid, so indices and updates must agree on rank and size.
+// ONNX requires indices.shape == updates.shape (same rank, same dims), because
+// the op reads updates at the same flat index-element position it reads the
+// index from. A view node folded out of the shape chain breaks that invariant.
 TEST(RobustnessTest, ScatterElementsRankMismatchThrows) {
     auto data = rt_make<float>({4}, {1.f, 2.f, 3.f, 4.f});
     auto indices = rt_make<int64_t>({1, 4}, {0, 0, 1, 1});
@@ -258,7 +259,7 @@ TEST(RobustnessTest, ScatterElementsRankMismatchThrows) {
     ASSERT_NE(op, nullptr);
     expect_throw_contains(
         [&] { op->onExecute({data, indices, updates}, {out}, 0); },
-        "equal rank, equal trailing");
+        "must have the same shape");
 }
 
 TEST(RobustnessTest, ScatterNDTargetOutOfRangeDropped) {

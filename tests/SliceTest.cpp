@@ -198,3 +198,53 @@ TEST(SliceTest, SliceComprehensiveTest) {
         EXPECT_TRUE(slice_test1.run_test(inputs1, {slice_test1.output}));
     }
 }
+
+// A rank-2 slice on the buffer path. The buffer variant has always been
+// rank-generic (it pads the unused int[6] lanes), so this is the regression
+// guard for the shape math that the image variant used to skip entirely.
+TEST(SliceTest, SliceRank2Buffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{6, 4};
+    std::vector<int64_t> starts{0, 2};
+    std::vector<int64_t> ends{6, 4};
+    std::vector<int64_t> steps{2, 1};
+    std::vector<int64_t> axes{0, 1};
+
+    SliceTest<float> slice_test(input_shape, starts, ends, steps, axes);
+    const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
+        slice_test.input, slice_test.starts_, slice_test.ends_,
+        slice_test.axes_,  slice_test.steps_};
+    EXPECT_TRUE(slice_test.run_test(inputs, {slice_test.output}));
+}
+
+// ONNX requires a non-zero step. 0 used to be silently rewritten to 1, which
+// turned a malformed Slice into a plausible-looking full-axis copy.
+TEST(SliceTest, SliceStepZeroThrows) {
+    const std::vector<int> shape{4, 4};
+    const std::vector<int64_t> starts{0};
+    const std::vector<int64_t> ends{4};
+    const std::vector<int64_t> axes{1};
+    const std::vector<int64_t> steps{0};
+    EXPECT_THROW(Slice::CalculateOutputShape<int64_t>(shape, starts, ends, axes,
+                                                      steps),
+                 std::invalid_argument);
+}
+
+// The buffer shader walks `rank` lanes of an int[6], so rank 7 would read past
+// the array into the neighbouring push-constant fields and slice the wrong
+// elements. It has to fail instead.
+TEST(SliceTest, SliceRank7BufferThrows) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{1, 1, 1, 1, 1, 2, 4};
+    std::vector<int64_t> starts{0};
+    std::vector<int64_t> ends{2};
+    std::vector<int64_t> steps{1};
+    std::vector<int64_t> axes{5};
+
+    SliceTest<float> slice_test(input_shape, starts, ends, steps, axes);
+    const std::vector<std::shared_ptr<vkop::core::ITensor>> inputs = {
+        slice_test.input, slice_test.starts_, slice_test.ends_,
+        slice_test.axes_,  slice_test.steps_};
+    EXPECT_THROW(slice_test.run_test(inputs, {slice_test.output}),
+                 std::runtime_error);
+}

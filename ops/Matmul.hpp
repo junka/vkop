@@ -167,6 +167,16 @@ class MatMulImage : public Operator {
         int n = inputs[1]->get_width();
         int k = inputs[0]->get_width();
         int rank = inputs[0]->num_dims();
+        if (rank < 2) {
+            // This path takes M and K straight off A's height/width, so a
+            // rank-1 (or scalar) A has no M axis: shape[rank - 2] below would
+            // write out of bounds. The buffer backend promotes rank-1 operands;
+            // the image path does not, so say so loudly rather than corrupt the
+            // shape vector.
+            throw std::runtime_error(
+                "MatMul (image backend) needs rank >= 2 for A, got rank " +
+                std::to_string(rank));
+        }
         auto shape = inputs[0]->getShape();
         shape[rank - 1] = n;
         shape[rank - 2] = m;
@@ -472,8 +482,27 @@ class MatMulBuffer : public BufferFactory {
         }
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
-        int rank_a = static_cast<int>(shape_a.size());
-        int rank_b = static_cast<int>(shape_b.size());
+        const int rank_a = static_cast<int>(shape_a.size());
+        const int rank_b = static_cast<int>(shape_b.size());
+
+        // ONNX MatMul allows 1-D operands: a rank-1 A is a single row [K]
+        // (promoted to [1, K]) and a rank-1 B is a single column [K] (promoted
+        // to [K, 1]); the promoted dim is then dropped from the output shape
+        // again. This used to `return` for rank < 2, silently leaving the
+        // output buffer unwritten — a bias-vector or single-row matmul came out
+        // as zeros. The kernels only ever see a flat [batch, M, K] x [batch, K,
+        // N], so the promotion is pure metadata and M=1 / N=1 are already
+        // first-class (the ksplit GEMV and the reduce path both handle them).
+        std::vector<int> a_eff = shape_a;
+        std::vector<int> b_eff = shape_b;
+        if (rank_a < 2)
+            a_eff = rank_a == 1 ? std::vector<int>{1, shape_a[0]}
+                                : std::vector<int>{1, 1};
+        if (rank_b < 2)
+            b_eff = rank_b == 1 ? std::vector<int>{shape_b[0], 1}
+                                : std::vector<int>{1, 1};
+        const int ra = static_cast<int>(a_eff.size());
+        const int rb = static_cast<int>(b_eff.size());
 
         // ONNX MatMul: A is [..., M, K], B is [..., K, N]. The leading
         // ("batch") dims are broadcast (right-aligned). The reduce shader works
@@ -490,20 +519,23 @@ class MatMulBuffer : public BufferFactory {
         // leading-broadcast shape by the time MatMul runs (graph shape
         // inference / the preceding Expand materializes it), so the per-dim max
         // is exact and product(batch) is exact.
-        if (rank_a < 2 || rank_b < 2) {
-            // Degenerate; nothing to do (should not happen for a valid model).
-            return;
-        }
-        int m = shape_a[rank_a - 2];
-        int k = shape_a[rank_a - 1];
+        int m = a_eff[ra - 2];
+        int k = a_eff[ra - 1];
         // transB: B is laid out as [batch, N, K] (a Transpose(perm=[..,last2
         // swapped]) was folded into this MatMul). N comes from B's 2nd-to-last
-        // dim instead of the last; K from B's last dim must equal A's K.
-        int n = transB_ ? shape_b[rank_b - 2] : shape_b[rank_b - 1];
+        // dim instead of the last; K from B's last dim must equal A's K. A
+        // promoted rank-1 B is [K, 1] and has no transposed interpretation —
+        // the Transpose that sets transB necessarily had rank >= 2.
+        if (transB_ && rank_b < 2) {
+            throw std::runtime_error(
+                "vkop: MatMul with a rank-" + std::to_string(rank_b) +
+                " B cannot carry transB (the folded Transpose had rank >= 2)");
+        }
+        int n = transB_ ? b_eff[rb - 2] : b_eff[rb - 1];
 
         int batch = 1;
-        int lead_a = rank_a - 2;
-        int lead_b = rank_b - 2;
+        int lead_a = ra - 2;
+        int lead_b = rb - 2;
         int lead = std::max(lead_a, lead_b);
         // Leading broadcast dims in natural (left-to-right) order, taking the
         // per-axis max (ONNX broadcast: a dim of 1 matches the other's value).
@@ -528,8 +560,8 @@ class MatMulBuffer : public BufferFactory {
         int grouped_axis = -1;
         bool grouped_ok = !weight_byte && !weight_4bit;
         for (int i = 0; i < lead; ++i) {
-            int da = (i < lead_a) ? shape_a[i] : 1;
-            int db = (i < lead_b) ? shape_b[i] : 1;
+            int da = (i < lead_a) ? a_eff[i] : 1;
+            int db = (i < lead_b) ? b_eff[i] : 1;
             if (grouped_ok && da != db) {
                 if (grouped_axis < 0 && db > 1 && da > db && da % db == 0) {
                     grouped_axis = i;
@@ -550,12 +582,16 @@ class MatMulBuffer : public BufferFactory {
             }
         }
 
+        // ONNX drops the output dim contributed by a rank-1 operand; when both
+        // are rank-1 the result is a scalar (kept as a 1-element vector, the
+        // form the converter materializes scalars in).
         std::vector<int> out_shape = lead_shape;
-        out_shape.push_back(m);
-        out_shape.push_back(n);
-        if (out_shape.empty()) {
-            out_shape = {m, n}; // degenerate guard
-        }
+        if (rank_a >= 2)
+            out_shape.push_back(m);
+        if (rank_b >= 2)
+            out_shape.push_back(n);
+        if (out_shape.empty())
+            out_shape = {1};
 
         int total = batch * m * n;
 
