@@ -74,13 +74,13 @@ void main() {
     }
 #endif
     s_sumsq[lid] = lsq;
-    memoryBarrierShared(); barrier();
+    barrier();
 
     for (uint s = 128; s > 0; s >>= 1) {
         if (lid < s) {
             s_sumsq[lid] += s_sumsq[lid + s];
         }
-        memoryBarrierShared(); barrier();
+        barrier();
     }
     float rms = s_sumsq[0] / float(uRMSN.inner_size);
     float inv_rms = inversesqrt(rms + uRMSN.eps);

@@ -103,13 +103,13 @@ void main() {
         localMax = max(localMax, load_elem(idx));
     }
     s_max[lid] = localMax;
-    memoryBarrierShared(); barrier();
+    barrier();
 
     for (uint s = 128; s > 0; s >>= 1) {
         if (lid < s) {
             s_max[lid] = max(s_max[lid], s_max[lid + s]);
         }
-        memoryBarrierShared(); barrier();
+        barrier();
     }
     float globalMax = s_max[0];
 
@@ -120,12 +120,12 @@ void main() {
         localSum += exp(load_elem(idx) - globalMax);
     }
     s_sum[lid] = localSum;
-    memoryBarrierShared(); barrier();
+    barrier();
     for (uint s = 128; s > 0; s >>= 1) {
         if (lid < s) {
             s_sum[lid] += s_sum[lid + s];
         }
-        memoryBarrierShared(); barrier();
+        barrier();
     }
     float globalSum = s_sum[0];
 

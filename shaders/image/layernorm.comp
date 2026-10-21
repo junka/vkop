@@ -62,7 +62,6 @@ void norm_for_w() {
 
     sum[lid] = local_sum;
     sum_sq[lid] = local_sum_sq;
-    memoryBarrierShared();
     barrier();
 
     // Parallel reduction
@@ -71,7 +70,6 @@ void norm_for_w() {
             sum[lid] += sum[lid + s];
             sum_sq[lid] += sum_sq[lid + s];
         }
-        memoryBarrierShared();
         barrier();
     }
 
@@ -134,7 +132,6 @@ void norm_for_hw() {
 
     sum[lid] = local_sum;
     sum_sq[lid] = local_sum_sq;
-    memoryBarrierShared();
     barrier();
 
     // --- Step 2: Parallel reduction ---
@@ -143,7 +140,6 @@ void norm_for_hw() {
             sum[lid] += sum[lid + s];
             sum_sq[lid] += sum_sq[lid + s];
         }
-        memoryBarrierShared();
         barrier();
     }
 
@@ -220,7 +216,6 @@ void norm_for_chw () {
     // Store in shared memory (use first component of vec4)
     sum[lid].x = local_sum;
     sum_sq[lid].x = local_sum_sq;
-    memoryBarrierShared();
     barrier();
 
     // === Stage 2: Scalar tree reduction ===
@@ -229,7 +224,6 @@ void norm_for_chw () {
             sum[lid].x += sum[lid + stride].x;
             sum_sq[lid].x += sum_sq[lid + stride].x;
         }
-        memoryBarrierShared();
         barrier();
     }
 

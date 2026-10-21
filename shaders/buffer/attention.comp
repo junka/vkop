@@ -293,7 +293,7 @@ shared float sAcc[4][MAX_HD];
 
 // Tree-reduce `s_red` (256 lanes) with `op`, leaving the result in s_red[0].
 // Each step fences, so the value every lane latched before the call is not
-// clobbered by a lane that has already moved on. The leading fence is
+// clobbered by a lane that has already moved on. The leading barrier is
 // load-bearing: `s_red[lid]` is written by every lane and the first step reads
 // `s_red[lid + 128]`, i.e. another *warp's* slot — without it a warp can fold a
 // stale value (or -1e30/0) into the reduction. The P1 form lacked it and read a
@@ -301,26 +301,22 @@ shared float sAcc[4][MAX_HD];
 // row to ~1e-31, on ~1 row in 20 and only for workgroups that lose the race.
 #define REDUCE_MAX()                                                           \
     do {                                                                       \
-        memoryBarrierShared();                                                 \
         barrier();                                                             \
         for (uint t = 128; t > 0; t >>= 1) {                                   \
             if (lid < int(t)) {                                                \
                 s_red[lid] = max(s_red[lid], s_red[lid + int(t)]);             \
             }                                                                  \
-            memoryBarrierShared();                                             \
             barrier();                                                         \
         }                                                                      \
     } while (false)
 
 #define REDUCE_SUM()                                                           \
     do {                                                                       \
-        memoryBarrierShared();                                                 \
         barrier();                                                             \
         for (uint t = 128; t > 0; t >>= 1) {                                   \
             if (lid < int(t)) {                                                \
                 s_red[lid] += s_red[lid + int(t)];                             \
             }                                                                  \
-            memoryBarrierShared();                                             \
             barrier();                                                         \
         }                                                                      \
     } while (false)
@@ -530,7 +526,6 @@ void main() {
             }
             sS[lid] = sc;
         }
-        memoryBarrierShared();
         barrier();
 
         // ---- running max ----
@@ -541,7 +536,6 @@ void main() {
         // overwrites s_red[0], and a warp that read it late would take a
         // partial sum as its max. (This is not hypothetical — the P1
         // whole-row kernel shipped without it and failed nondeterministically.)
-        memoryBarrierShared();
         barrier();
         float m_new = max(m, tile_max);
         float alpha = exp(m - m_new); // m starts at -1e30 -> first tile: 0
@@ -555,7 +549,6 @@ void main() {
         s_red[lid] = lp;
         REDUCE_SUM();
         l = l * alpha + s_red[0];
-        memoryBarrierShared();
         barrier();
 
         // ---- AV: fold this tile into the accumulator ----
@@ -587,7 +580,6 @@ void main() {
             sAcc[sub][d0] = p0;
             sAcc[sub][d0 + 1] = p1;
         }
-        memoryBarrierShared();
         barrier();
         if (lid < n_pair) {
             int d0 = lid * 2;
@@ -601,7 +593,6 @@ void main() {
             o1 = n1;
         }
         // Also the fence before the next tile overwrites sS and sAcc.
-        memoryBarrierShared();
         barrier();
         m = m_new;
     }
