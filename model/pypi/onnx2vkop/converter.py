@@ -15,6 +15,7 @@ try:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
     )
+    from . import shader_map
     from . import weight_stream
     from .optimizer import (
         FusionOptimizer,
@@ -32,6 +33,7 @@ except ImportError:
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
     )
+    import shader_map
     import weight_stream
     from optimizer import (
         FusionOptimizer,
@@ -42,6 +44,23 @@ except ImportError:
         RGBAConverter,
         Unifier,
     )
+
+
+class UnsupportedOpError(RuntimeError):
+    """A graph contains an op_type the runtime cannot execute.
+
+    Raised at conversion time so a missing operator is a loud failure rather
+    than a node the runtime silently skips (core/runtime.cpp used to `continue`
+    on OpType::UNKNOWN, leaving downstream consumers reading a null/misaligned
+    input — wrong output with every test still green).
+    """
+
+
+# Control-flow op_types carry their body as a GRAPH attribute (then_branch /
+# body), which vkop has no way to lower. They also resolve to UNKNOWN in the
+# runtime, so validate_supported_ops catches them anyway; naming them here lets
+# the error say *why* instead of just "unknown op".
+_CONTROL_FLOW_OPS = {"If", "Loop", "Scan"}
 
 
 # Graph inputs and outputs are the model's I/O contract, so their dtype is
@@ -432,6 +451,21 @@ class ModelConverter:
                     attributes[attr.name] = list(attr.ints)
                 elif attr.type == onnx.AttributeProto.FLOATS:
                     attributes[attr.name] = list(attr.floats)
+                elif attr.type in (
+                    onnx.AttributeProto.GRAPH,
+                    onnx.AttributeProto.GRAPHS,
+                ):
+                    # A subgraph attribute means control flow (If/Loop/Scan):
+                    # its body is a nested ONNX graph vkop has no representation
+                    # for. Dropping it here (the old behaviour: a warning) left
+                    # the node with no branches and passed it through to be
+                    # silently skipped at load. Fail loudly instead.
+                    raise UnsupportedOpError(
+                        f"vkop: node '{node.name}' ({node.op_type}) carries a "
+                        f"subgraph attribute '{attr.name}'. Control flow "
+                        f"(If/Loop/Scan) is not supported; fold it to constants "
+                        f"at export time (see image/exporter/simplify_vae_if.py)."
+                    )
                 else:
                     print(
                         f"Warning: Unsupported attribute type {attr.type} for attribute {attr.name}"
@@ -648,6 +682,42 @@ class ModelConverter:
                 raise ValueError(f"Shapes {shape_a} and {shape_b} are not broadcastable")
         return result
 
+    def validate_supported_ops(self, dag_model: DAGBasedModel) -> None:
+        """Fail loudly if any node's op_type has no runtime implementation.
+
+        The runtime used to `continue` past an unknown op (core/runtime.cpp),
+        registering no output tensor for it — so a missing operator produced
+        wrong output (a downstream consumer reads a null/misaligned input, or a
+        graph output keeps a previous round's bytes) with every test still
+        green. Catching it here, at conversion time, is what makes an operator
+        gap attributable instead of silent.
+
+        `shader_map.runtime_op_names()` is the accepted set: exactly the strings
+        Ops.hpp's convert_opstring_to_enum resolves to a real OpType, host-only
+        ops included, archive-only aliases (Topk/Maxpool2d) excluded.
+        """
+        allowed = shader_map.runtime_op_names()
+        counts = {}
+        for node in dag_model.nodes.values():
+            if node.op_type not in allowed:
+                counts[node.op_type] = counts.get(node.op_type, 0) + 1
+        if not counts:
+            return
+        detail = ", ".join(f"{op} x{n}" for op, n in sorted(counts.items()))
+        hint = ""
+        control_flow = sorted(op for op in counts if op in _CONTROL_FLOW_OPS)
+        if control_flow:
+            hint = (
+                " Control flow (" + ", ".join(control_flow) + ") has no runtime "
+                "support: its body is a GRAPH attribute vkop cannot lower — fold "
+                "it to constants at export time."
+            )
+        raise UnsupportedOpError(
+            f"vkop: graph uses {len(counts)} op type(s) with no runtime kernel: "
+            f"{detail}. These used to be silently skipped at load, producing "
+            f"wrong output; conversion refuses them instead." + hint
+        )
+
     def apply_optimizations(self, dag_model: DAGBasedModel, args):
         """Apply all optimizations to the model."""
         self.initializer_merger.move_input_tensor_to_attr(dag_model)
@@ -718,6 +788,11 @@ class ModelConverter:
             # （_prune_materialize_done 守卫会把 save_to_binary 里的再调用
             # 变成空操作）——重置守卫，让孤儿化的形状链在写盘前被剪掉。
             dag_model._prune_materialize_done = False
+
+        # Final gate: any op the runtime cannot execute fails the conversion
+        # here (see validate_supported_ops) instead of being skipped at load.
+        # Runs last so it sees the post-fusion, post-prune graph.
+        self.validate_supported_ops(dag_model)
 
     @staticmethod
     def _cleanup_orphan_inputs(dag_model, pre_producer):

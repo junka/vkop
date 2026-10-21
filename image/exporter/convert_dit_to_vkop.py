@@ -81,6 +81,13 @@ def main(mode, suffix="", quant=""):
         Quantizer.quantize_to_fp8_weight_only(dag_model, quant)
         out_tag = f"{suffix}_{quant}"
 
+    # Fail loudly on any op the runtime cannot execute. This path skips
+    # ModelConverter.apply_optimizations, so without this call a missing op
+    # would be silently skipped at load (core/runtime.cpp). Prune first so a
+    # dead leftover is not reported; both calls are idempotent.
+    dag_model.prune_dead_and_materialize_constants()
+    converter.validate_supported_ops(dag_model)
+
     # Try to save (will likely fail due to protobuf limits, but we get the stats)
     out_path = Path(__file__).resolve().parent / f"dit_{mode}{out_tag}.vkopbin"
     try:

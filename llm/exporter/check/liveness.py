@@ -12,20 +12,23 @@ Supported op names mirror the runtime's convert_opstring_to_enum + factory.
 """
 import sys
 from collections import Counter, defaultdict, deque
+from pathlib import Path
 
 import sys
 sys.path.insert(0, "/tmp/vkmod")
 from vkop.model import Model
 
-SUPPORTED = {
-    "Add", "Atan", "AveragePool", "BatchNormalization", "BatchNorm", "Col2Im",
-    "Concat", "Conv", "Conv2d", "Div", "EmbeddingForward", "Erf", "Floor",
-    "Gemm", "GlobalAveragePool", "GridSample", "LayerNormalization", "LayerNorm",
-    "MatMul", "MaxPool", "MaxPool2d", "Mul", "Pow", "PRelu", "Reduce", "Relu",
-    "Reshape", "Resize", "Sigmoid", "Slice", "Softmax", "Softplus", "Split",
-    "Sub", "TopK", "Transpose", "Nms", "Gather", "Range", "Expand", "Sqrt",
-    "Sin", "Cos", "Neg", "Where", "Tanh", "Equal", "NonZero", "ScatterElements",
-}
+# Ops the runtime executes, derived from the single source of truth
+# (onnx2vkop.shader_map.runtime_op_names, mirrored by Ops.hpp's
+# convert_opstring_to_enum) instead of a hand-copied list. The hand-copied set
+# this replaced had drifted: it was missing RMSNorm, RotaryEmbedding,
+# FusedElemwise, ReduceMean, Min, Max, Mod, QuantizeLinear, DequantizeLinear and
+# Attention, so it reported those September ops as unsupported.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+sys.path.insert(0, str(_REPO_ROOT / "model" / "pypi"))
+from onnx2vkop import shader_map  # noqa: E402
+
+SUPPORTED = shader_map.runtime_op_names()
 
 
 def load_model(path):

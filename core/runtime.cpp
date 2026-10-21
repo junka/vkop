@@ -807,8 +807,16 @@ void Runtime::LoadModel() {
             const auto &n = *(node_it->second);
             auto type = vkop::ops::convert_opstring_to_enum(n.op_type);
             if (type == vkop::ops::OpType::UNKNOWN) {
-                // make it as input for next ops
-                continue;
+                // No implementation for this op_type. Skipping it (the old
+                // behaviour) registered no output tensor for the node, so a
+                // downstream consumer reads a null/short node_inputs vector and
+                // a graph output keeps stale bytes — wrong output, no error.
+                // Fail loudly: the converter validates its graph against this
+                // same op set, so reaching here means a stale or hand-edited
+                // file.
+                throw std::runtime_error("vkop: unsupported op type '" +
+                                         n.op_type + "' (node '" + n.name +
+                                         "')");
             }
 
             std::vector<int> current_node_dependencies;

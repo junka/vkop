@@ -293,6 +293,33 @@ def kernel_plans_for_model(op_types: Iterable[str]):
 
 
 def known_ops() -> Set[str]:
-    """Every OpType string the map knows about. Tests use this to catch
-    drift when a new operator lands on one side but not the other."""
-    return set(_PRIMARY.keys()) | set(_SECONDARY.keys())
+    """Every op_type string the shader map carries a shader for. Tests use
+    this to catch drift when a new operator lands on one side but not the
+    other. (`_SECONDARY` is keyed by (op, backend) tuples, not names, so it
+    contributes nothing here.)"""
+    return set(_PRIMARY.keys())
+
+
+# Spellings `_PRIMARY` accepts for the archive filter but that the runtime's
+# convert_opstring_to_enum does NOT resolve (it wants TopK / MaxPool2d). A
+# graph node written with one of these maps to OpType::UNKNOWN at load time, so
+# they must not be offered as accepted names to front-end validation.
+_ARCHIVE_ONLY_SPELLINGS = {"Topk", "Maxpool2d"}
+
+# Host-only ops: real OpType values the runtime handles on the host with no
+# shader, hence absent from `_PRIMARY` (see the closing comment there).
+HOST_ONLY_OPS = {"Shape", "Squeeze", "Unsqueeze"}
+
+
+def runtime_op_names() -> Set[str]:
+    """Every op_type string core/runtime.cpp resolves to a real OpType.
+
+    This is the single source of truth for "what a converted graph may
+    contain": converter-side validation, the coverage tools, and Ops.hpp's
+    convert_opstring_to_enum must all agree on it. It is deliberately NOT
+    `known_ops()` — that set carries archive-filter aliases the runtime
+    rejects (see `_ARCHIVE_ONLY_SPELLINGS`), and omits the host-only ops.
+
+    test_runtime_op_names.py parses Ops.hpp and fails if this drifts.
+    """
+    return (set(_PRIMARY) - _ARCHIVE_ONLY_SPELLINGS) | set(HOST_ONLY_OPS)
