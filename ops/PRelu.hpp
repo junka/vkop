@@ -5,21 +5,12 @@
 #include "BinaryFactory.hpp"
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_prelu_spv[];
-extern unsigned int image_prelu_spv_len;
-extern unsigned char buffer_prelu_spv[];
-extern unsigned int buffer_prelu_spv_len;
-extern unsigned char buffer_prelu_fp16_spv[];
-extern unsigned int buffer_prelu_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 class PReluImage : public BinaryFactory {
   public:
-    PReluImage()
-        : BinaryFactory(OpType::PRELU, image_prelu_spv, image_prelu_spv_len) {}
+    PReluImage() : BinaryFactory(OpType::PRELU) {}
 };
 
 // PReLU buffer op: f(x) = max(0,x) + slope*min(0,x). Slope is broadcast
@@ -29,8 +20,6 @@ class PReluBuffer : public BufferFactory {
   public:
     explicit PReluBuffer(int fp16)
         : BufferFactory(OpType::PRELU,
-                        fp16 ? buffer_prelu_fp16_spv : buffer_prelu_spv,
-                        fp16 ? buffer_prelu_fp16_spv_len : buffer_prelu_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},
                         sizeof(BinaryElemPC), fp16) {}

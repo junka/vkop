@@ -5,30 +5,19 @@
 #include "UnaryFactory.hpp"
 #include "ops/BufferUnaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_sin_spv[];
-extern unsigned int image_sin_spv_len;
-extern unsigned char buffer_sin_spv[];
-extern unsigned int buffer_sin_spv_len;
-extern unsigned char buffer_sin_fp16_spv[];
-extern unsigned int buffer_sin_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 // Image (image2DArray NCHW->RGBA) implementation.
 class SinImage : public UnaryFactory {
   public:
-    SinImage() : UnaryFactory(OpType::SIN, image_sin_spv, image_sin_spv_len) {}
+    SinImage() : UnaryFactory(OpType::SIN) {}
 };
 
 // Buffer (SSBO, compact row-major) implementation.
 class SinBuffer : public BufferUnaryFactory {
   public:
-    explicit SinBuffer(int fp16)
-        : BufferUnaryFactory(
-              OpType::SIN, fp16 ? buffer_sin_fp16_spv : buffer_sin_spv,
-              fp16 ? buffer_sin_fp16_spv_len : buffer_sin_spv_len, fp16) {}
+    explicit SinBuffer(int fp16) : BufferUnaryFactory(OpType::SIN, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

@@ -10,14 +10,6 @@
 
 #include "core/Tensor.hpp"
 #include "ops/Operator.hpp"
-extern "C" {
-extern unsigned char image_reshape_spv[];
-extern unsigned int image_reshape_spv_len;
-extern unsigned char buffer_reshape_spv[];
-extern unsigned int buffer_reshape_spv_len;
-extern unsigned char buffer_reshape_fp16_spv[];
-extern unsigned int buffer_reshape_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -34,7 +26,7 @@ struct GpuReshapeParam {
 class ReshapeImage : public Operator {
   public:
     explicit ReshapeImage()
-        : Operator(OpType::RESHAPE, image_reshape_spv, image_reshape_spv_len,
+        : Operator(OpType::RESHAPE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(reshape::GpuReshapeParam)) {}
@@ -229,9 +221,6 @@ class ReshapeBuffer : public BufferFactory {
   public:
     explicit ReshapeBuffer(int fp16)
         : BufferFactory(OpType::RESHAPE,
-                        fp16 ? buffer_reshape_fp16_spv : buffer_reshape_spv,
-                        fp16 ? buffer_reshape_fp16_spv_len
-                             : buffer_reshape_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ReshapePC), fp16) {}
 

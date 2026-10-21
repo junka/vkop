@@ -465,11 +465,13 @@ per-op_type 行（四个 post-fallback cell `image`/`image_fp16`/`buffer`/`buffe
 归档是按同一张表筛的，`build/tests/KernelPlanTest` 拿真实转换出的 vkopbin 验证
 每个 plan cell 在模型自己的内嵌归档里都有——这正是只带模型就能跑的前提。
 
-libvkop 里每个 `*_spv[]` 都是 1 字节桩（`_len = 0`），自己不携带任何 SPIR-V，
-SPIR-V 只从模型来。所以内嵌归档不是可选项而是唯一的运行路径——单文件 vkopbin 在任何
-构建上都能独立跑。反过来，老 writer 写出的、或转换时找不到 master 而没内嵌的模型
-**跑不起来**：建 op 时就明确报 `... has a stubbed SPIR-V array ...` 并点名 op 和
-它要的 key，只能重转。
+libvkop 里**不链接任何 shader 字节**：没有 `*_spv[]` 符号，SPIR-V 只从模型来。
+每个 op 的主 shader 由 `core::shader_key_for(type, backend, fp16)` 自己推 key 再从
+归档取（`Runtime::LoadModel` 已经先按 `Node.plan` 注入过，语义一致）。所以内嵌归档
+不是可选项而是唯一的运行路径——单文件 vkopbin 在任何构建上都能独立跑。反过来，老
+writer 写出的、或转换时找不到 master 而没内嵌的模型**跑不起来**：建 op 时就明确报
+`... needs the shader ... and nothing supplied it ...` 并点名 op 和它要的 key，
+只能重转。
 
 单元测试、probe、`bench_matmul` 这类**不经模型**直接 `create_from_type()` 建算子的
 二进制是例外：它们没有模型可拿 shader，所以 `tests/setup.cpp`（以及 `MinMaxProbe`）

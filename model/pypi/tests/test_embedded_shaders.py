@@ -5,8 +5,7 @@ tools/filter_shaders.py) in Model.shader_archive, so one file is enough to
 deploy: Runtime::LoadModel takes every op's shaders from it, which is the only
 source, since libvkop carries no built-in SPIR-V.
 The C++ half is covered by ModelTest running against a fixture the CMake build
-converts (where the linked-in arrays are stubs and the embedded archive is the
-only source of shaders).
+converts (where the embedded archive is the only source of shaders).
 
 These tests pin the writer/reader contract at the boundary the C++ side
 reads: field present and byte-identical, absent when not asked for,

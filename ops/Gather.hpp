@@ -8,14 +8,6 @@
 #include <cstdlib>
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_gather_spv[];
-extern unsigned int buffer_gather_spv_len;
-extern unsigned char buffer_gather_fp16_spv[];
-extern unsigned int buffer_gather_fp16_spv_len;
-extern unsigned char buffer_gather_int64_spv[];
-extern unsigned int buffer_gather_int64_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -46,8 +38,6 @@ class Gather : public Operator {
 
     explicit Gather(int fp16 = 0)
         : Operator(OpType::GATHER,
-                   fp16 ? buffer_gather_fp16_spv : buffer_gather_spv,
-                   fp16 ? buffer_gather_fp16_spv_len : buffer_gather_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
@@ -75,8 +65,7 @@ class Gather : public Operator {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
-        auto i64 = resolve_spv("buffer_gather_int64", buffer_gather_int64_spv,
-                               buffer_gather_int64_spv_len);
+        auto i64 = resolve_spv("buffer_gather_int64");
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
             use_uab, required_subgroup_size_);

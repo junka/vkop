@@ -5,32 +5,17 @@
 #include "BinaryFactory.hpp"
 #include "ops/BufferBinaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_add_spv[];
-extern unsigned int image_add_spv_len;
-extern unsigned char image_add_fp16_spv[];
-extern unsigned int image_add_fp16_spv_len;
-extern unsigned char buffer_add_spv[];
-extern unsigned int buffer_add_spv_len;
-extern unsigned char buffer_add_fp16_spv[];
-extern unsigned int buffer_add_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 class AddImage : public BinaryFactory {
   public:
-    explicit AddImage(int fp16)
-        : BinaryFactory(OpType::ADD, fp16 ? image_add_fp16_spv : image_add_spv,
-                        fp16 ? image_add_fp16_spv_len : image_add_spv_len) {}
+    explicit AddImage(int fp16) : BinaryFactory(OpType::ADD, fp16) {}
 };
 
 class AddBuffer : public BufferBinaryFactory {
   public:
-    explicit AddBuffer(int fp16)
-        : BufferBinaryFactory(
-              OpType::ADD, fp16 ? buffer_add_fp16_spv : buffer_add_spv,
-              fp16 ? buffer_add_fp16_spv_len : buffer_add_spv_len, fp16) {}
+    explicit AddBuffer(int fp16) : BufferBinaryFactory(OpType::ADD, fp16) {}
 };
 
 class Add : public PimplFacade {

@@ -5,28 +5,17 @@
 #include "BinaryFactory.hpp"
 #include "ops/BufferBinaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_pow_spv[];
-extern unsigned int image_pow_spv_len;
-extern unsigned char buffer_pow_spv[];
-extern unsigned int buffer_pow_spv_len;
-extern unsigned char buffer_pow_fp16_spv[];
-extern unsigned int buffer_pow_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 class PowImage : public BinaryFactory {
   public:
-    PowImage() : BinaryFactory(OpType::POW, image_pow_spv, image_pow_spv_len) {}
+    PowImage() : BinaryFactory(OpType::POW) {}
 };
 
 class PowBuffer : public BufferBinaryFactory {
   public:
-    explicit PowBuffer(int fp16)
-        : BufferBinaryFactory(
-              OpType::POW, fp16 ? buffer_pow_fp16_spv : buffer_pow_spv,
-              fp16 ? buffer_pow_fp16_spv_len : buffer_pow_spv_len, fp16) {}
+    explicit PowBuffer(int fp16) : BufferBinaryFactory(OpType::POW, fp16) {}
 };
 
 class Pow : public PimplFacade {

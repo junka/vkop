@@ -4,10 +4,6 @@
 
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_globalaveragepool_spv[];
-extern unsigned int image_globalaveragepool_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace globalaveragepool {
@@ -20,8 +16,7 @@ struct alignas(16) GpuGAPParam {
 class GlobalAveragePoolImage : public Operator {
   public:
     GlobalAveragePoolImage()
-        : Operator(OpType::GLOBALAVERAGEPOOL, image_globalaveragepool_spv,
-                   image_globalaveragepool_spv_len,
+        : Operator(OpType::GLOBALAVERAGEPOOL,
                    {DESCRIPTOR_TYPE_STORAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(globalaveragepool::GpuGAPParam)) {}

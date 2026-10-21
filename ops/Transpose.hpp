@@ -9,14 +9,6 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
-extern "C" {
-extern unsigned char image_transpose_spv[];
-extern unsigned int image_transpose_spv_len;
-extern unsigned char buffer_transpose_spv[];
-extern unsigned int buffer_transpose_spv_len;
-extern unsigned char buffer_transpose_fp16_spv[];
-extern unsigned int buffer_transpose_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -70,8 +62,7 @@ struct GpuTransposeParam {
 class TransposeImage : public Operator {
   public:
     explicit TransposeImage()
-        : Operator(OpType::TRANSPOSE, image_transpose_spv,
-                   image_transpose_spv_len,
+        : Operator(OpType::TRANSPOSE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(transpose::GpuTransposeParam)) {}
@@ -133,9 +124,6 @@ class TransposeBuffer : public BufferFactory {
   public:
     explicit TransposeBuffer(int fp16)
         : BufferFactory(OpType::TRANSPOSE,
-                        fp16 ? buffer_transpose_fp16_spv : buffer_transpose_spv,
-                        fp16 ? buffer_transpose_fp16_spv_len
-                             : buffer_transpose_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(TransposePC), fp16) {}
 

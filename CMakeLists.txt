@@ -195,69 +195,29 @@ file(MAKE_DIRECTORY ${SPIRV_DIR})
 # a graph fp16 or fp32 any more. The caller picks the graph precision (the
 # Runtime ctor's precision argument, defaulting to fp32).
 
-# spv_to_c.py: defines one shader symbol as `unsigned char <sym_name>_spv[1] =
-# {0}` + `unsigned int <sym_name>_spv_len = 0`. libvkop carries no SPIR-V of its
-# own: these stubs only keep the linker happy, and the runtime fills each op's
-# spv_ from the archive the .vkopbin itself carries (or, for dev binaries, the
-# build tree's archive via include/dev_shaders.hpp). A symbol left as a stub --
-# an archive miss -- makes Operator::set_runtime_device raise a clear error
-# naming the key rather than crashing later on a null pipeline_.
-#
-# The symbol is folder-derived on the CMake side (image/relu.comp ->
-# image_relu_spv), because the older xxd+sed path derived it from the
-# xxd-of-filepath and could not disambiguate two shaders with the same basename
-# in different folders.
-set(PY_SCRIPT_CONTENT
-"import sys
-import os
-
-def main():
-    if len(sys.argv) != 4:
-        print('Usage: spv_to_c.py <input.spv> <output.h> <symbol_name>')
-        sys.exit(1)
-    input_spv = sys.argv[1]
-    output_h  = sys.argv[2]
-    sym_name  = sys.argv[3] + '_spv'
-
-    content = f'''// Auto-generated STUB for {os.path.basename(input_spv)}.
-// libvkop carries no built-in SPIR-V: the bytes live in the .vkopbin and
-// LoadModel populates each op from that archive before building its pipeline.
-unsigned char {sym_name}[1] = {{0}};
-unsigned int {sym_name}_len = 0;
-'''
-    with open(output_h, 'w') as f:
-        f.write(content)
-
-if __name__ == '__main__':
-    main()
-")
-set(PY_SCRIPT_FILE "${CMAKE_BINARY_DIR}/spv_to_c.py")
-file(WRITE "${PY_SCRIPT_FILE}" "${PY_SCRIPT_CONTENT}")
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 
-# Compile shaders to SPIR-V and define one C symbol per shader. The symbol is
-# folder-derived: shaders/image/relu.comp -> image_relu_spv,
-# shaders/buffer/unary.comp -> buffer_unary_spv. Both image and buffer
-# shaders get their folder as a prefix, so same-named shaders in different
-# folders never collide.
+# Compile shaders to SPIR-V. Nothing about a shader is linked into libvkop:
+# libvkop carries no SPIR-V of its own, and each op resolves its shader by key
+# from the archive the model's .vkopbin carries (Operator::resolve_primary_spv).
+# Only the .spv files matter here, as inputs to the archive below. The key is
+# folder-derived: shaders/image/relu.comp -> image_relu,
+# shaders/buffer/unary.comp -> buffer_unary, so two same-named shaders in
+# different folders never collide, and the same name ids the model's embedded
+# subset (onnx2vkop copies from this archive at convert time).
 #
-# libvkop itself carries no SPIR-V: spv_to_c.py writes a 1-byte placeholder
-# with _len=0 for every symbol, and shaders come from the model instead.
-# onnx2vkop embeds the per-model archive in the .vkopbin, so Runtime::LoadModel
-# has everything it needs from the single file and there is nothing to
-# configure at run time. A model without an archive (an old file) gets a named
-# error instead of a null pipeline. Development binaries that build ops without
-# a model take the build tree's archive via include/dev_shaders.hpp.
+# Development binaries that build ops without a model take this build tree's
+# archive via include/dev_shaders.hpp; there is no env override, so a shipping
+# run always executes the kernels its own file names.
 
 foreach(SHADER ${SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
     file(RELATIVE_PATH SHADER_REL ${SHADER_DIR} ${SHADER})
     string(REPLACE "/" "_" SYM_BASE "${SHADER_REL}")
     get_filename_component(SYM_BASE "${SYM_BASE}" NAME_WE)
-    # SPIRV and embed outputs are folder-prefixed so two same-named shaders
-    # in different folders (image/concat vs buffer/concat) don't collide.
+    # SPIRV outputs are folder-prefixed so two same-named shaders in different
+    # folders (image/concat vs buffer/concat) don't collide.
     set(SPIRV_FILE ${SPIRV_DIR}/${SYM_BASE}.spv)
-    set(SPIRV_SOURCE_FILE ${SPIRV_DIR}/${SYM_BASE}.c)
 
     # Both folders ship fp16 as a separate dual build (DUAL_FP16_SHADERS
     # below), so the base build here is always the fp32 variant — never pass
@@ -270,27 +230,13 @@ foreach(SHADER ${SHADER_FILES})
         DEPENDS ${SHADER} ${SHADER_INCLUDES}
         COMMENT "Compiling ${SHADER_NAME} to SPIR-V"
     )
-    add_custom_command(
-        OUTPUT ${SPIRV_SOURCE_FILE}
-        COMMAND ${Python3_EXECUTABLE}
-            ${PY_SCRIPT_FILE}
-            ${SPIRV_FILE}
-            ${SPIRV_SOURCE_FILE}
-            ${SYM_BASE}
-        DEPENDS
-            ${SPIRV_FILE}
-            ${PY_SCRIPT_FILE}
-        COMMENT "Embedding SPIR-V shader ${SYM_BASE} into C header"
-    )
-    set_source_files_properties(${SPIRV_SOURCE_FILE} PROPERTIES LANGUAGE C)
-    list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE})
-    list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE})
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE})
 endforeach()
 
 # Some shaders keep separate fp32/fp16 SPIR-V builds (no runtime branch in
 # the shader; the operator picks the right one at construction). Each entry is
 # a path relative to SHADER_DIR (e.g. buffer/gather, buffer/unary). The fp16
-# build is compiled with -DFP16 and embedded as <folder>_<name>_fp16_spv
+# build is compiled with -DFP16 and archived as <folder>_<name>_fp16
 # (folder-derived, same as the base build).
 #
 # fp16 buffer storage packs two half values per uint word, so the fp16 path
@@ -345,7 +291,6 @@ set(DUAL_FP16_SHADERS
 foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
     string(REPLACE "/" "_" DUAL_BASE "${DUAL_NAME}")
     set(SPIRV_FILE_FP16 ${SPIRV_DIR}/${DUAL_BASE}_fp16.spv)
-    set(SPIRV_SOURCE_FILE_FP16 ${SPIRV_DIR}/${DUAL_BASE}_fp16.c)
     add_custom_command(
         OUTPUT ${SPIRV_FILE_FP16}
         COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${DUAL_NAME}.comp
@@ -354,21 +299,7 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
         DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp
         COMMENT "Compiling ${DUAL_NAME} (fp16) to SPIR-V"
     )
-    add_custom_command(
-        OUTPUT ${SPIRV_SOURCE_FILE_FP16}
-        COMMAND ${Python3_EXECUTABLE}
-            ${PY_SCRIPT_FILE}
-            ${SPIRV_FILE_FP16}
-            ${SPIRV_SOURCE_FILE_FP16}
-            ${DUAL_BASE}_fp16
-        DEPENDS
-            ${SPIRV_FILE_FP16}
-            ${PY_SCRIPT_FILE}
-        COMMENT "Embedding fp16 SPIR-V shader ${DUAL_BASE}_fp16 into C header"
-    )
-    set_source_files_properties(${SPIRV_SOURCE_FILE_FP16} PROPERTIES LANGUAGE C)
-    list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_FP16})
-    list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_FP16})
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_FP16})
 endforeach()
 
 # A second fp16 build of buffer/matmul.comp, entered through that file's
@@ -379,7 +310,6 @@ endforeach()
 # pipeline creation failed and took every buffer MatMul down with it (see the
 # W8_WIDE entry in shaders/buffer/matmul.comp and MatMulBuffer::w8_wide_pipeline).
 set(SPIRV_FILE_W8WIDE ${SPIRV_DIR}/buffer_matmul_w8_wide_fp16.spv)
-set(SPIRV_SOURCE_FILE_W8WIDE ${SPIRV_DIR}/buffer_matmul_w8_wide_fp16.c)
 add_custom_command(
     OUTPUT ${SPIRV_FILE_W8WIDE}
     COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
@@ -388,33 +318,17 @@ add_custom_command(
     DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
     COMMENT "Compiling buffer/matmul (int8 weight-only WIDE, fp16) to SPIR-V"
 )
-add_custom_command(
-    OUTPUT ${SPIRV_SOURCE_FILE_W8WIDE}
-    COMMAND ${Python3_EXECUTABLE}
-        ${PY_SCRIPT_FILE}
-        ${SPIRV_FILE_W8WIDE}
-        ${SPIRV_SOURCE_FILE_W8WIDE}
-        buffer_matmul_w8_wide_fp16
-    DEPENDS
-        ${SPIRV_FILE_W8WIDE}
-        ${PY_SCRIPT_FILE}
-    COMMENT "Embedding fp16 SPIR-V shader buffer_matmul_w8_wide_fp16 into C header"
-)
-set_source_files_properties(${SPIRV_SOURCE_FILE_W8WIDE} PROPERTIES LANGUAGE C)
-list(APPEND SPIRV_HEADERS ${SPIRV_SOURCE_FILE_W8WIDE})
-list(APPEND SRC_FILES ${SPIRV_SOURCE_FILE_W8WIDE})
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_W8WIDE})
 
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #
-# Every .spv produced above is packed once more into a single archive. It is
-# the source onnx2vkop filters a model's own subset from (--master-archive),
-# and the file the runtime used to be handed directly -- so it is what the
-# per-model archive is derived from, and what the dev binaries read through
-# include/dev_shaders.hpp. Keys inside the archive are the same folder-derived
-# names already used for the embedded C-array symbols (buffer_add,
-# image_add_fp16, ...), so a lookup needs to know nothing about how CMake
-# produced it.
+# Every .spv produced above is packed into a single archive. It is the source
+# onnx2vkop filters a model's own subset from (--master-archive) and the file
+# the dev binaries read through include/dev_shaders.hpp. Keys inside the
+# archive are the folder-derived names (buffer_add, image_add_fp16, ...), which
+# are exactly the keys shader_key_for returns, so a lookup needs to know
+# nothing about how CMake produced it.
 # ---------------------------------------------------------------------------
 set(ARCHIVE_ARGS "")
 set(ARCHIVE_DEPS "")
@@ -457,12 +371,11 @@ add_dependencies(shader_archive compile_shaders)
 # Add executable
 add_library(vkop ${SRC_FILES})
 
-# Add generated headers to the target
-add_custom_target(compile_shaders DEPENDS ${SPIRV_HEADERS})
+# Compiling the SPIR-V is not a dependency of the library (no shader bytes are
+# linked in), but the archive below consumes it, and shader_archive is ALL.
+add_custom_target(compile_shaders DEPENDS ${SPIRV_OUTPUTS})
 add_dependencies(vkop compile_shaders)
 
-# Include SPIR-V headers
-target_include_directories(vkop PRIVATE ${SPIRV_DIR})
 # FlatBuffers: generated schema header + vendored runtime headers live under
 # model/generated. SYSTEM so -Wall/-Wextra/-Werror skip third-party code.
 target_include_directories(vkop SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/model/generated)

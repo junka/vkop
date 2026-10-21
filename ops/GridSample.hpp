@@ -6,10 +6,6 @@
 #include <vector>
 
 #include "Operator.hpp"
-extern "C" {
-extern unsigned char image_gridsample_spv[];
-extern unsigned int image_gridsample_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -31,8 +27,7 @@ struct alignas(32) GpuGridSampleParam {
 class GridSampleImage : public Operator {
   public:
     GridSampleImage()
-        : Operator(OpType::GRIDSAMPLE, image_gridsample_spv,
-                   image_gridsample_spv_len,
+        : Operator(OpType::GRIDSAMPLE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},

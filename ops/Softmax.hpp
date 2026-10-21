@@ -5,16 +5,6 @@
 #include "Operator.hpp"
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_softmax_spv[];
-extern unsigned int image_softmax_spv_len;
-extern unsigned char image_softmax_fp16_spv[];
-extern unsigned int image_softmax_fp16_spv_len;
-extern unsigned char buffer_softmax_spv[];
-extern unsigned int buffer_softmax_spv_len;
-extern unsigned char buffer_softmax_fp16_spv[];
-extern unsigned int buffer_softmax_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace softmax {
@@ -40,11 +30,9 @@ class SoftmaxImage : public Operator {
     SoftmaxImage &operator=(SoftmaxImage &&) = delete;
     explicit SoftmaxImage(int fp16)
         : Operator(OpType::SOFTMAX,
-                   fp16 ? image_softmax_fp16_spv : image_softmax_spv,
-                   fp16 ? image_softmax_fp16_spv_len : image_softmax_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(softmax::GpuSoftMaxParam)) {
+                   sizeof(softmax::GpuSoftMaxParam), fp16) {
         // should be safe to fail to set subgroup size
         required_subgroup_size_ = 32;
     }
@@ -140,9 +128,6 @@ class SoftmaxBuffer : public BufferFactory {
   public:
     explicit SoftmaxBuffer(int fp16)
         : BufferFactory(OpType::SOFTMAX,
-                        fp16 ? buffer_softmax_fp16_spv : buffer_softmax_spv,
-                        fp16 ? buffer_softmax_fp16_spv_len
-                             : buffer_softmax_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SoftmaxPC), fp16) {}

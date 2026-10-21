@@ -11,14 +11,6 @@
 #include <cstdlib>
 #include <numeric>
 #include <stdexcept>
-extern "C" {
-extern unsigned char image_slice_spv[];
-extern unsigned int image_slice_spv_len;
-extern unsigned char buffer_slice_spv[];
-extern unsigned int buffer_slice_spv_len;
-extern unsigned char buffer_slice_fp16_spv[];
-extern unsigned int buffer_slice_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -38,7 +30,7 @@ struct GpuSliceParam {
 class SliceImage : public Operator {
   public:
     explicit SliceImage()
-        : Operator(OpType::SLICE, image_slice_spv, image_slice_spv_len,
+        : Operator(OpType::SLICE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(slice::GpuSliceParam)) {}
@@ -151,8 +143,6 @@ class SliceBuffer : public BufferFactory {
   public:
     explicit SliceBuffer(int fp16)
         : BufferFactory(OpType::SLICE,
-                        fp16 ? buffer_slice_fp16_spv : buffer_slice_spv,
-                        fp16 ? buffer_slice_fp16_spv_len : buffer_slice_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SlicePC), fp16),
           fp16_(fp16) {}

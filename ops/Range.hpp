@@ -10,10 +10,6 @@
 #include <cstdlib>
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_range_spv[];
-extern unsigned int buffer_range_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -30,7 +26,7 @@ class Range : public Operator {
     bool uses_buffer_backend() const override { return true; }
 
     explicit Range()
-        : Operator(OpType::RANGE, buffer_range_spv, buffer_range_spv_len,
+        : Operator(OpType::RANGE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,

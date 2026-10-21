@@ -5,10 +5,6 @@
 #include "Operator.hpp"
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_col2im_spv[];
-extern unsigned int image_col2im_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace col2im {
@@ -25,7 +21,7 @@ struct alignas(16) GpuCol2ImParam {
 class Col2ImImage : public Operator {
   public:
     Col2ImImage()
-        : Operator(OpType::COL2IM, image_col2im_spv, image_col2im_spv_len,
+        : Operator(OpType::COL2IM,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(col2im::GpuCol2ImParam)) {}

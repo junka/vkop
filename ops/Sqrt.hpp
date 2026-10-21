@@ -5,31 +5,19 @@
 #include "UnaryFactory.hpp"
 #include "ops/BufferUnaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_sqrt_spv[];
-extern unsigned int image_sqrt_spv_len;
-extern unsigned char buffer_sqrt_spv[];
-extern unsigned int buffer_sqrt_spv_len;
-extern unsigned char buffer_sqrt_fp16_spv[];
-extern unsigned int buffer_sqrt_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 // Image (image2DArray NCHW->RGBA) implementation.
 class SqrtImage : public UnaryFactory {
   public:
-    SqrtImage()
-        : UnaryFactory(OpType::SQRT, image_sqrt_spv, image_sqrt_spv_len) {}
+    SqrtImage() : UnaryFactory(OpType::SQRT) {}
 };
 
 // Buffer (SSBO, compact row-major) implementation.
 class SqrtBuffer : public BufferUnaryFactory {
   public:
-    explicit SqrtBuffer(int fp16)
-        : BufferUnaryFactory(
-              OpType::SQRT, fp16 ? buffer_sqrt_fp16_spv : buffer_sqrt_spv,
-              fp16 ? buffer_sqrt_fp16_spv_len : buffer_sqrt_spv_len, fp16) {}
+    explicit SqrtBuffer(int fp16) : BufferUnaryFactory(OpType::SQRT, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

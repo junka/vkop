@@ -41,11 +41,14 @@ inline bool host_shape_enabled() {
 
 class Operator {
   public:
-    explicit Operator(OpType type, uint8_t *spv, uint32_t spv_len,
-                      const std::vector<VkDescriptorType> &types,
+    // Ops take no shader symbol: their primary SPIR-V is resolved from the
+    // archive the .vkopbin carries, keyed by shader_key_for(type_,
+    // uses_buffer_backend(), fp16_) — see set_runtime_device. Only ops with
+    // secondary pipelines (Matmul/Conv2d) ever name a key themselves.
+    explicit Operator(OpType type, const std::vector<VkDescriptorType> &types,
                       size_t pc_size = 0, int fp16 = 0)
-        : type_(type), pc_size_(pc_size), spv_(spv), spv_len_(spv_len),
-          types_(std::move(types)), fp16_(fp16) {
+        : type_(type), pc_size_(pc_size), types_(std::move(types)),
+          fp16_(fp16) {
         assert(pc_size_ <= 128);
         instance_count_.fetch_add(1);
 
@@ -82,13 +85,12 @@ class Operator {
     Operator &operator=(Operator &&) = delete;
 
     // Replace the SPIR-V this op builds its pipeline from, called by the
-    // Runtime after create_from_type() and before set_runtime_device(). The
-    // default wiring lets each op's ctor point spv_ at an `extern
-    // unsigned char X_spv[]` C array baked into libvkop at build time; a
-    // deployment that ships SPIR-V in an external vkop_shaders.bin archive
-    // instead calls this to swap in the mapped blob range. Passing nullptr
-    // leaves the ctor-assigned pointer alone (used when the archive does not
-    // have an entry for this op — e.g. an int64 shape-meta path).
+    // Runtime after create_from_type() and before set_runtime_device().
+    // libvkop links in no shader bytes of its own: the model's .vkopbin is the
+    // only source, and this is how its per-op entry reaches the op. Passing
+    // nullptr leaves whatever the op resolved for itself alone (used when the
+    // archive does not have an entry for this op — e.g. an int64 shape-meta
+    // path that reaches the archive by a different key).
     //
     // `spv_len == 0` is the "no shader" sentinel (a PimplFacade shell whose
     // impl_ owns the real pipeline). Both fields are updated together so a
@@ -119,31 +121,16 @@ class Operator {
                        VkPipelineCache cache = VK_NULL_HANDLE) {
         m_dev_ = dev;
         m_cmdpool_ = cmdpool;
-        // A stub array (unsigned char X_spv[1] = {0}; X_spv_len = 0) is what
-        // spv_to_c.py writes for every shader: libvkop carries no SPIR-V of its
-        // own. If we reach here with a non-null spv_ pointer but zero length,
-        // no archive supplied this op's shader, so pipeline_ would stay null
-        // and every later submit() would crash on
-        // pipeline_->allocDescriptorSets(). Fail with an actionable message at
-        // load time instead. PimplFacade passes spv_=nullptr, len=0 (not a
-        // stub) and is unaffected.
-        if (spv_len_ == 0 && spv_ != nullptr) {
-            // Runtime swaps archive bytes into the primary before calling this
-            // for ops it builds from a model file. Ops built straight through
-            // create_from_type() (unit-test fixtures, example drivers) never
-            // get that call, so try this op's own key against the
-            // process-wide dev archive before declaring it unrunnable.
-            if (!resolve_stubbed_primary_spv()) {
-                throw std::runtime_error(
-                    "vkop: " +
-                    (name_.empty()
-                         ? std::string(convert_optype_to_string(type_))
-                         : name_) +
-                    " has a stubbed SPIR-V array (this libvkop carries no "
-                    "built-in shaders) and the model it was built from carries "
-                    "no archive entry for it. Reconvert the model with "
-                    "onnx2vkop, which embeds every key its kernel plan lists.");
-            }
+        // Nothing supplied this op's shader yet: Runtime swaps archive bytes in
+        // via override_spv() before calling this for ops it builds from a model
+        // file, and ops built straight through create_from_type() (unit-test
+        // fixtures, example drivers) never get that call. Resolve this op's own
+        // key against whatever archive is reachable, and throw a named error if
+        // that fails rather than letting pipeline_ stay null and every later
+        // submit() crash on pipeline_->allocDescriptorSets(). A host-only op
+        // (Shape, SqueezeUnsqueeze) has no key and legitimately builds none.
+        if (spv_len_ == 0) {
+            resolve_primary_spv();
         }
         if (spv_len_ > 0 && spv_) {
             bool use_uab = update_after_bind_ &&
@@ -480,29 +467,24 @@ class Operator {
     uint32_t required_subgroup_size_ = 0;
 
     // Secondary-pipeline helper for ops like Matmul/Conv2d that build more
-    // than one VulkanPipeline inside their set_runtime_device override.
-    // Runtime's post-construct override_spv() can only reach the op's primary
-    // spv_; these extra pipelines need to consult the archive directly. If
-    // the archive is loaded and holds `key`, returns the mapped blob range;
-    // otherwise falls back to the extern symbols linked into libvkop.
-    //
-    // Those externs are the 1-byte stubs spv_to_c.py writes (`X_spv[1] = {0}`,
-    // `X_spv_len = 0`) -- libvkop carries no SPIR-V of its own -- so that
-    // fallback cannot produce a usable module: it would fail later inside
-    // VulkanPipeline with nothing pointing at the cause. A stub is therefore
-    // detected here and reported as a missing-variant error naming the key.
+    // than one VulkanPipeline inside their set_runtime_device override, and so
+    // name a variant key the op's primary lookup does not cover. Runtime's
+    // post-construct override_spv() can only reach the op's primary spv_; these
+    // extra pipelines need to consult the archive directly. Returns the mapped
+    // blob range for `key`, or throws a missing-variant error naming it: there
+    // is no fallback, because libvkop links in no SPIR-V of its own.
     std::pair<const uint32_t *, uint32_t>
-    resolve_spv(const std::string &key, const unsigned char *embedded,
-                unsigned int embedded_len) const;
+    resolve_spv(const std::string &key) const;
 
-    // Last-resort recovery of this op's PRIMARY shader when it still holds a
-    // stub array: looks up shader_key_for(type_, uses_buffer_backend(), fp16_)
-    // on the op's own archive pointer, or on ShaderArchive::process_default()
-    // when Runtime never set one, and feeds the result through override_spv().
-    // False means no archive is reachable or the key is absent, so the caller
-    // keeps the loud throw. Lives in Operator.cpp: it needs ShaderKeys.hpp and
-    // the complete ShaderArchive type, both of which the header avoids.
-    bool resolve_stubbed_primary_spv();
+    // Recovery of this op's PRIMARY shader when nothing supplied one: looks up
+    // shader_key_for(type_, uses_buffer_backend(), fp16_) on the op's own
+    // archive pointer, or on ShaderArchive::process_default() when Runtime
+    // never set one, and feeds the result through override_spv(). An empty key
+    // means a host-only op (Shape, SqueezeUnsqueeze) and returns quietly;
+    // otherwise a miss throws the named "carries no built-in shaders …
+    // reconvert" error. Lives in Operator.cpp: it needs ShaderKeys.hpp and the
+    // complete ShaderArchive type, both of which the header avoids.
+    void resolve_primary_spv();
 
     // we should release objs_ here, since for some intermediate tensor, we will
     // release them in the end of the execution.

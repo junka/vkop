@@ -5,11 +5,6 @@
 #include "ops/BufferBase.hpp"
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_scatternd_spv[];
-extern unsigned int buffer_scatternd_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -42,8 +37,7 @@ static_assert(sizeof(ScatterNDPC) <= 128, "ScatterNDPC PC overflow");
 class ScatterND : public BufferFactory {
   public:
     explicit ScatterND()
-        : BufferFactory(OpType::SCATTER_ND, buffer_scatternd_spv,
-                        buffer_scatternd_spv_len,
+        : BufferFactory(OpType::SCATTER_ND,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(scatternd::ScatterNDPC)) {

@@ -9,11 +9,6 @@
 // op: no image path (the gather pattern has no NCHW->RGBA representation).
 // fp32, int32 indices this pass.
 
-extern "C" {
-extern unsigned char buffer_embedding_forward_spv[];
-extern unsigned int buffer_embedding_forward_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -34,8 +29,7 @@ enum class EmbedCombineMode { kSum = 0, kMean = 1, kConcat = 2 };
 class EmbeddingForwardBuffer : public BufferFactory {
   public:
     EmbeddingForwardBuffer()
-        : BufferFactory(OpType::EMBEDDING_FORWARD, buffer_embedding_forward_spv,
-                        buffer_embedding_forward_spv_len,
+        : BufferFactory(OpType::EMBEDDING_FORWARD,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},

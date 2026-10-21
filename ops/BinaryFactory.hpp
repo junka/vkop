@@ -29,12 +29,12 @@ struct alignas(16) GPUBinParam {
 } // namespace binary
 class BinaryFactory : public Operator {
   public:
-    explicit BinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
-        : Operator(type, spv, spv_len,
+    explicit BinaryFactory(OpType type, int fp16 = 0)
+        : Operator(type,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(binary::GPUBinParam)) {
+                   sizeof(binary::GPUBinParam), fp16) {
         param_.activation = static_cast<int>(binary::ActivationMode::NONE);
         param_.broadcast = 0;
     }

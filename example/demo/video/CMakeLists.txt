@@ -52,6 +52,32 @@ file(GLOB VIDEO_SHADER_FILES
     ${VIDEO_SHADER_DIR}/*.frag
 )
 
+# These are graphics-stage shaders the window draws with directly, so unlike the
+# compute kernels in shaders/ they genuinely are linked in as C arrays (wired to
+# it here, not by libvkop). xxd does the job on Unix; Windows has no xxd, so the
+# WIN32 branch runs this equivalent generator, kept local to the demo — the
+# parent project no longer generates any SPIR-V C arrays at all.
+set(PY_SCRIPT_CONTENT
+"import sys
+
+def main():
+    with open(sys.argv[1], 'rb') as f:
+        data = f.read()
+    name = sys.argv[3]
+    lines = ['unsigned char %s[] = {' % name]
+    for i in range(0, len(data), 12):
+        lines.append('  ' + ','.join('0x%02x' % b for b in data[i:i+12]) + ',')
+    lines.append('};')
+    lines.append('unsigned int %s_len = %d;' % (name, len(data)))
+    with open(sys.argv[2], 'w') as f:
+        f.write('\\n'.join(lines) + '\\n')
+
+if __name__ == '__main__':
+    main()
+")
+set(PY_SCRIPT_FILE "${CMAKE_CURRENT_BINARY_DIR}/spv_to_c.py")
+file(WRITE "${PY_SCRIPT_FILE}" "${PY_SCRIPT_CONTENT}")
+
 foreach(SHADER ${VIDEO_SHADER_FILES})
     get_filename_component(SHADER_NAME ${SHADER} NAME_WE)
     get_filename_component(SHADER_EXT ${SHADER} EXT)
@@ -76,18 +102,17 @@ foreach(SHADER ${VIDEO_SHADER_FILES})
         COMMENT "Compiling ${SHADER_NAME}.${SHADER_STAGE} to SPIR-V"
     )
     
-    # Convert SPIR-V to C header using the same script as parent project
+    # Convert SPIR-V to a C array
     if(WIN32)
         find_package(Python3 COMPONENTS Interpreter REQUIRED)
-        
         add_custom_command(
             OUTPUT ${SPIRV_SOURCE_FILE}
-            COMMAND ${Python3_EXECUTABLE} 
+            COMMAND ${Python3_EXECUTABLE}
                 ${PY_SCRIPT_FILE}
                 ${SPIRV_FILE}
                 ${SPIRV_SOURCE_FILE}
                 ${SHADER_NAME}
-            DEPENDS 
+            DEPENDS
                 ${SPIRV_FILE}
                 ${PY_SCRIPT_FILE}
             COMMENT "Embedding SPIR-V shader ${SHADER_NAME} into C header"

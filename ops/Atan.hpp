@@ -5,31 +5,19 @@
 #include "UnaryFactory.hpp"
 #include "ops/BufferUnaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_atan_spv[];
-extern unsigned int image_atan_spv_len;
-extern unsigned char buffer_atan_spv[];
-extern unsigned int buffer_atan_spv_len;
-extern unsigned char buffer_atan_fp16_spv[];
-extern unsigned int buffer_atan_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 // Image (image2DArray NCHW->RGBA) implementation.
 class AtanImage : public UnaryFactory {
   public:
-    AtanImage()
-        : UnaryFactory(OpType::ATAN, image_atan_spv, image_atan_spv_len) {}
+    AtanImage() : UnaryFactory(OpType::ATAN) {}
 };
 
 // Buffer (SSBO, compact row-major) implementation.
 class AtanBuffer : public BufferUnaryFactory {
   public:
-    explicit AtanBuffer(int fp16)
-        : BufferUnaryFactory(
-              OpType::ATAN, fp16 ? buffer_atan_fp16_spv : buffer_atan_spv,
-              fp16 ? buffer_atan_fp16_spv_len : buffer_atan_spv_len, fp16) {}
+    explicit AtanBuffer(int fp16) : BufferUnaryFactory(OpType::ATAN, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

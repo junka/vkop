@@ -5,14 +5,6 @@
 #include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_split_spv[];
-extern unsigned int image_split_spv_len;
-extern unsigned char buffer_split_spv[];
-extern unsigned int buffer_split_spv_len;
-extern unsigned char buffer_split_fp16_spv[];
-extern unsigned int buffer_split_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace split {
@@ -28,7 +20,7 @@ struct GpuSplitParam {
 class SplitImage : public Operator {
   public:
     explicit SplitImage()
-        : Operator(OpType::SPLIT, image_split_spv, image_split_spv_len,
+        : Operator(OpType::SPLIT,
                    {
                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -137,8 +129,6 @@ class SplitBuffer : public BufferFactory {
   public:
     explicit SplitBuffer(int fp16)
         : BufferFactory(OpType::SPLIT,
-                        fp16 ? buffer_split_fp16_spv : buffer_split_spv,
-                        fp16 ? buffer_split_fp16_spv_len : buffer_split_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SplitPC)) {
         update_after_bind_ = true;

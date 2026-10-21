@@ -5,13 +5,6 @@
 #include "ops/BufferBase.hpp"
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_scatter_elements_spv[];
-extern unsigned int buffer_scatter_elements_spv_len;
-extern unsigned char buffer_scatter_elements_fp16_spv[];
-extern unsigned int buffer_scatter_elements_fp16_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -36,10 +29,6 @@ class ScatterElements : public BufferFactory {
   public:
     explicit ScatterElements(int fp16 = 0)
         : BufferFactory(OpType::SCATTER_ELEMENTS,
-                        fp16 ? buffer_scatter_elements_fp16_spv
-                             : buffer_scatter_elements_spv,
-                        fp16 ? buffer_scatter_elements_fp16_spv_len
-                             : buffer_scatter_elements_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},
                         sizeof(scatter::ScatterPC), fp16) {
@@ -131,7 +120,7 @@ class ScatterElements : public BufferFactory {
         }
 
         // GPU dispatch path for BOTH fp32 and fp16. The fp16 shader variant
-        // (buffer_scatter_elements_fp16_spv, built with -DFP16) uses a
+        // (buffer_scatter_elements_fp16, built with -DFP16) uses a
         // word-level CAS: two adjacent fp16 elements share a uint word, so a
         // thread updating one half CAS-swaps the whole word to avoid racing a
         // sibling thread owning the other half. This is far cheaper than the

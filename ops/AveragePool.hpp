@@ -4,10 +4,6 @@
 
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_averagepool_spv[];
-extern unsigned int image_averagepool_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace averagepool {
@@ -24,8 +20,7 @@ struct alignas(16) GpuAveragePoolParam {
 class AveragePoolImage : public Operator {
   public:
     AveragePoolImage()
-        : Operator(OpType::AVERAGEPOOL, image_averagepool_spv,
-                   image_averagepool_spv_len,
+        : Operator(OpType::AVERAGEPOOL,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(averagepool::GpuAveragePoolParam)) {}

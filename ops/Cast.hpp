@@ -6,11 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-extern "C" {
-extern unsigned char buffer_cast_spv[];
-extern unsigned int buffer_cast_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -32,7 +27,7 @@ struct alignas(16) CastPC {
 class Cast : public BufferFactory {
   public:
     explicit Cast()
-        : BufferFactory(OpType::CAST, buffer_cast_spv, buffer_cast_spv_len,
+        : BufferFactory(OpType::CAST,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(cast::CastPC)) {}
 

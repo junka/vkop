@@ -8,14 +8,6 @@
 
 #include <memory>
 #include <stdexcept>
-extern "C" {
-extern unsigned char image_layernorm_spv[];
-extern unsigned int image_layernorm_spv_len;
-extern unsigned char buffer_layernorm_spv[];
-extern unsigned int buffer_layernorm_spv_len;
-extern unsigned char buffer_layernorm_fp16_spv[];
-extern unsigned int buffer_layernorm_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace layernorm {
@@ -35,8 +27,7 @@ struct alignas(16) GpuLayerNormParam {
 class LayerNormImage : public Operator {
   public:
     LayerNormImage()
-        : Operator(OpType::LAYERNORM, image_layernorm_spv,
-                   image_layernorm_spv_len,
+        : Operator(OpType::LAYERNORM,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
@@ -141,9 +132,6 @@ class LayerNormBuffer : public BufferFactory {
   public:
     explicit LayerNormBuffer(int fp16)
         : BufferFactory(OpType::LAYERNORM,
-                        fp16 ? buffer_layernorm_fp16_spv : buffer_layernorm_spv,
-                        fp16 ? buffer_layernorm_fp16_spv_len
-                             : buffer_layernorm_spv_len,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},

@@ -200,8 +200,8 @@ static void test_damaged_entry_is_skipped() {
               "the damaged entry itself does not resolve");
     }
 
-    // An entry whose blob is not SPIR-V (the writer refusing to pack a stub,
-    // or a truncated tail) is dropped the same way.
+    // An entry whose blob is not SPIR-V (a truncated tail, or a writer that
+    // packed something else) is dropped the same way.
     auto no_magic = bytes;
     std::memset(no_magic.data() + kHeaderSize + kEntrySize * 2, 0,
                 specs[0].blob.size());

@@ -5,13 +5,6 @@
 #include "ops/BufferBinaryFactory.hpp"
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_equal_spv[];
-extern unsigned int buffer_equal_spv_len;
-extern unsigned char buffer_equal_int64_spv[];
-extern unsigned int buffer_equal_int64_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -19,9 +12,7 @@ namespace ops {
 // Output is uint (1=true, 0=false), matching Where's condition buffer.
 class Equal : public BufferBinaryFactory {
   public:
-    explicit Equal()
-        : BufferBinaryFactory(OpType::EQUAL, buffer_equal_spv,
-                              buffer_equal_spv_len, /*fp16=*/0) {}
+    explicit Equal() : BufferBinaryFactory(OpType::EQUAL, /*fp16=*/0) {}
 
     // Build the int64-data pipeline lazily on first int64 execute. The int64
     // shader (equal_int64.comp) has the same descriptor layout (3× STORAGE:
@@ -32,8 +23,7 @@ class Equal : public BufferBinaryFactory {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
-        auto i64 = resolve_spv("buffer_equal_int64", buffer_equal_int64_spv,
-                               buffer_equal_int64_spv_len);
+        auto i64 = resolve_spv("buffer_equal_int64");
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
             use_uab, required_subgroup_size_);

@@ -6,10 +6,6 @@
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
 
-extern "C" {
-extern unsigned char image_nms_spv[];
-extern unsigned int image_nms_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace nms {
@@ -29,7 +25,7 @@ struct alignas(16) GpuNMSParam {
 class NmsImage : public Operator {
   public:
     NmsImage()
-        : Operator(OpType::NMS, image_nms_spv, image_nms_spv_len,
+        : Operator(OpType::NMS,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,

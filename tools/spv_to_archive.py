@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Pack a set of compiled SPIR-V blobs into a single vkop_shaders.bin archive.
 
-The archive mirrors the folder_name convention CMakeLists.txt already uses
-when embedding each shader as a C array (`shaders/buffer/add.comp ->
-buffer_add_spv[]`). Entry names are therefore the same strings an op header
-would reference through its `extern unsigned char X_spv[]` block, so a runtime
-loader can look up "buffer_add" or "image_add_fp16" and get the byte range
-that was previously baked into libvkop.
+The entry names are the folder-derived keys CMakeLists.txt compiles each
+shader under (`shaders/buffer/add.comp -> buffer_add`), which is exactly what
+core::shader_key_for() returns for an op. So a runtime loader can look up
+"buffer_add" or "image_add_fp16" and get the byte range for that kernel --
+nothing about the shader is linked into libvkop.
 
 Layout (little-endian):
     offset  size   field

@@ -15,24 +15,23 @@ namespace core {
 
 // Loads a VKSP archive: either the whole vkop_shaders.bin the CMake build
 // produces (tools/spv_to_archive.py), or the per-model subset embedded in a
-// .vkopbin (onnx2vkop writes one by default). The archive mirrors the
-// folder_name convention CMakeLists.txt already uses for its embedded
-// `buffer_<op>_spv` / `image_<op>_spv` C-array symbols, so a runtime lookup
-// key is exactly the string an op header would have referenced through its
-// `extern unsigned char X_spv[]` block.
+// .vkopbin (onnx2vkop writes one by default). Keys are the folder_name
+// convention CMakeLists.txt uses for the .spv files it compiles
+// (buffer/add.comp -> "buffer_add"), which is exactly what
+// core::shader_key_for() returns for an op.
 //
 // The file form is mapped through load::FileMapping, so only the pages an
 // actually-loaded shader touches fault into RSS. A model that fires 26
-// shaders out of the ~95 in libvkop sees ~26 blob ranges resident, not the
-// whole file. The embedded form is a bounded copy out of the vkopbin mmap
+// shaders out of the ~95 in the build tree sees ~26 blob ranges resident, not
+// the whole file. The embedded form is a bounded copy out of the vkopbin mmap
 // (the mapping is released when LoadModel returns) and is small by
 // construction: it holds only the keys that graph can dispatch.
 //
 // Failure mode: `open()` / `open_from_memory()` return nullptr on any
 // structural problem (missing file, bad magic, version mismatch, corrupt
-// index). Runtime treats that as "this model has no shaders": the op keeps
-// the placeholder array it was built with, and Operator turns that into a
-// named error instead of a null pipeline.
+// index). Runtime treats that as "this model has no shaders", and Operator
+// turns the resulting lookup miss into a named error instead of a null
+// pipeline.
 class ShaderArchive {
   public:
     static std::unique_ptr<ShaderArchive> open(const std::string &path);
@@ -50,9 +49,9 @@ class ShaderArchive {
     // Runtime::LoadModel. Runtime hands its own handle to every op it builds,
     // but the unit-test fixtures, the probes and bench_matmul construct
     // operators straight through ops::create_from_type(), so they never pass
-    // through that hook: libvkop carries no built-in SPIR-V, so without an
-    // archive they would have no SPIR-V at all and die on the stub array.
-    // Operator falls back to this when its own pointer is null.
+    // through that hook: libvkop links in no SPIR-V, so without an archive they
+    // would have nothing to build a pipeline from. Operator falls back to this
+    // when its own pointer is null.
     //
     // Dev-only, and deliberately not driven by an environment variable: this
     // is the build tree's own archive, installed by a header the shipping

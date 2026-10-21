@@ -10,18 +10,8 @@
 #include "Operator.hpp"
 #include "ops/BufferBase.hpp"
 extern "C" {
-extern unsigned char image_conv2d_spv[];
-extern unsigned int image_conv2d_spv_len;
-extern unsigned char image_conv2d_fp16_spv[];
-extern unsigned int image_conv2d_fp16_spv_len;
-extern unsigned char buffer_conv2d_spv[];
-extern unsigned int buffer_conv2d_spv_len;
-extern unsigned char buffer_conv2d_fp16_spv[];
-extern unsigned int buffer_conv2d_fp16_spv_len;
 // Reuse the MatMul pack pass (read two adjacent fp32 -> pack half2) for the
 // fp16 conv two-pass reduce+pack.
-extern unsigned char buffer_matmul_pack_spv[];
-extern unsigned int buffer_matmul_pack_spv_len;
 }
 namespace vkop {
 namespace ops {
@@ -97,13 +87,11 @@ class Conv2dImage : public Operator {
     // (the same flag the buffer impl gets), not the build configuration.
     explicit Conv2dImage(int fp16)
         : Operator(OpType::CONV2D,
-                   fp16 ? image_conv2d_fp16_spv : image_conv2d_spv,
-                   fp16 ? image_conv2d_fp16_spv_len : image_conv2d_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     DESCRIPTOR_TYPE_UNIFORM, DESCRIPTOR_TYPE_UNIFORM},
-                   sizeof(conv2d::GPUConv2dParam)) {
+                   sizeof(conv2d::GPUConv2dParam), fp16) {
         activation_ = conv2d::ActivationMode::NONE;
     }
 
@@ -334,19 +322,17 @@ class Conv2dImage : public Operator {
 // output element [n,oc,oh,ow], accumulating IC/groups * KH * KW MACs in fp32.
 // Mirrors the MatMulBuffer two-pass fp16 pattern: the reduce pass (this
 // shader, fp16 build) writes fp32 results to a scratch buffer (one uint per
-// output element — no half2 word race); the pack pass (buffer_matmul_pack_spv,
+// output element — no half2 word race); the pack pass (buffer_matmul_pack,
 // reused) packs two adjacent fp32 results into a half2 output word.
 class Conv2dBuffer : public BufferFactory {
   public:
     explicit Conv2dBuffer(int fp16)
-        : BufferFactory(
-              OpType::CONV2D, fp16 ? buffer_conv2d_fp16_spv : buffer_conv2d_spv,
-              fp16 ? buffer_conv2d_fp16_spv_len : buffer_conv2d_spv_len,
-              std::vector<VkDescriptorType>{
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-              sizeof(conv2d::Conv2dBufferPC), fp16) {
+        : BufferFactory(OpType::CONV2D,
+                        std::vector<VkDescriptorType>{
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(conv2d::Conv2dBufferPC), fp16) {
         update_after_bind_ = true;
     }
 
@@ -361,9 +347,7 @@ class Conv2dBuffer : public BufferFactory {
             // (Out=0, Scratch=3); we bind 6 (matching the reduce pipeline) so
             // the same objs_ vector feeds both passes — the extra bias/scale
             // slots are inert in the pack shader.
-            auto pack =
-                resolve_spv("buffer_matmul_pack", buffer_matmul_pack_spv,
-                            buffer_matmul_pack_spv_len);
+            auto pack = resolve_spv("buffer_matmul_pack");
             pack_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{

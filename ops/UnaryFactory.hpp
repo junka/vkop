@@ -10,11 +10,11 @@ namespace ops {
 
 class UnaryFactory : public Operator {
   public:
-    explicit UnaryFactory(OpType type, uint8_t *spv, uint32_t spv_len)
-        : Operator(type, spv, spv_len,
+    explicit UnaryFactory(OpType type)
+        : Operator(type,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   0) {};
+                   0){};
 
   private:
     void execute(

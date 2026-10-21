@@ -199,9 +199,9 @@ void Runtime::LoadModel() {
     // single-file property, and there is deliberately no environment override
     // that could quietly substitute different kernels at run time. A model
     // without an archive (an old file, or one converted before the master
-    // archive existed) leaves every op on its stub array and fails loudly at
-    // op build time. Ops built outside LoadModel -- unit fixtures, probes --
-    // get theirs from ShaderArchive::process_default(), installed by
+    // archive existed) leaves every op with nothing to build from and fails
+    // loudly at op build time. Ops built outside LoadModel -- unit fixtures,
+    // probes -- get theirs from ShaderArchive::process_default(), installed by
     // include/dev_shaders.hpp.
     if (model.shader_archive_size > 0) {
         shader_archive_ = ShaderArchive::open_from_memory(
@@ -209,8 +209,8 @@ void Runtime::LoadModel() {
         if (!shader_archive_) {
             std::fprintf(stderr,
                          "[shaders] %s carries a shader archive blob that is "
-                         "not a usable VKSP archive; every op will fail on its "
-                         "stubbed SPIR-V. Reconvert it with onnx2vkop.\n",
+                         "not a usable VKSP archive; every op will fail to "
+                         "resolve its shader. Reconvert it with onnx2vkop.\n",
                          model_path_.c_str());
         }
     }
@@ -1196,17 +1196,15 @@ void Runtime::LoadModel() {
             }
 
             op->set_name(n.name);
-            // Give the op a handle on the archive so its set_runtime_device
-            // override can look up secondary pipelines (Matmul's coop/pack,
-            // Conv2d's pack) by key. The primary spv_ is replaced below via
-            // override_spv(); those secondaries never pass through spv_ and
-            // would otherwise read the stub placeholder.
+            // Give the op a handle on the archive so it can look up its own
+            // primary shader and any secondary pipelines (Matmul's coop/pack,
+            // Conv2d's pack) by key.
             op->set_shader_archive(shader_archive_.get());
-            // Replace this op's SPIR-V pointer with the mapped archive range
-            // before the pipeline is built. A miss (an op whose name isn't in
-            // the key table, or a key the converter's subset skipped) leaves
-            // the placeholder in place, and Operator's stub check then fails
-            // with the op and the key named.
+            // Hand the op its primary SPIR-V before the pipeline is built. A
+            // miss (an op whose name isn't in the key table, or a key the
+            // converter's subset skipped) leaves the op to resolve its own
+            // built-in key, and Operator then fails with the op and the key
+            // named.
             if (shader_archive_) {
                 const vkop::core::KernelPlan *plan = nullptr;
                 auto key = kernel_key_for_node(n, type, op_fp16, &plan);
@@ -1235,12 +1233,12 @@ void Runtime::LoadModel() {
                             "archive has no key=%s although its kernel "
                             "plan requires it (op=%s). Reconvert it "
                             "with onnx2vkop; the run will fail with a "
-                            "stubbed SPIR-V error.\n",
+                            "missing-shader error.\n",
                             model_path_.c_str(), key.c_str(), n.name.c_str());
                     } else if (std::getenv("VKOP_SHADER_DEBUG")) {
                         std::fprintf(stderr,
-                                     "[shaders] miss key=%s op=%s, using "
-                                     "embedded\n",
+                                     "[shaders] miss key=%s op=%s, leaving the "
+                                     "op to resolve its own key\n",
                                      key.c_str(), n.name.c_str());
                     }
                 } else if (std::getenv("VKOP_SHADER_DEBUG")) {
@@ -3423,6 +3421,7 @@ void Runtime::RegisterPostProcess(
         ops, pp_precision, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
     if (shader_archive_) {
+        op->set_shader_archive(shader_archive_.get());
         auto key = shader_key_for(ops, use_buffer, pp_precision);
         if (!key.empty()) {
             auto [spv, len] = shader_archive_->lookup(key);

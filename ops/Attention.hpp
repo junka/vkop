@@ -9,13 +9,6 @@
 #include <string>
 #include <unordered_map>
 
-extern "C" {
-extern unsigned char buffer_attention_spv[];
-extern unsigned int buffer_attention_spv_len;
-extern unsigned char buffer_attention_fp16_spv[];
-extern unsigned int buffer_attention_fp16_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -79,9 +72,6 @@ class AttentionBuffer : public BufferFactory {
   public:
     explicit AttentionBuffer(int fp16)
         : BufferFactory(OpType::ATTENTION,
-                        fp16 ? buffer_attention_fp16_spv : buffer_attention_spv,
-                        fp16 ? buffer_attention_fp16_spv_len
-                             : buffer_attention_spv_len,
                         std::vector<VkDescriptorType>{
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,

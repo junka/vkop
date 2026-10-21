@@ -8,10 +8,6 @@
 #include <memory>
 #include <vector>
 
-extern "C" {
-extern unsigned char buffer_topk_spv[];
-extern unsigned int buffer_topk_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -35,7 +31,7 @@ class Topk : public Operator {
     bool uses_buffer_backend() const override { return true; }
 
     explicit Topk(int fp16 = 0)
-        : Operator(OpType::TOPK, buffer_topk_spv, buffer_topk_spv_len,
+        : Operator(OpType::TOPK,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                    sizeof(topk::GpuTopkParam), fp16) {

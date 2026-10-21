@@ -16,30 +16,29 @@
 // set_required_subgroup_size. The impl owns its own
 // pipeline/command-buffer/descriptor state; the façade's stays null.
 //
-// The façade passes a no-op (spv=nullptr, len=0) Operator base ctor so it
-// never builds a pipeline of its own — all dispatch flows through impl_.
+// The façade passes an empty Operator base ctor so it never builds a pipeline
+// of its own — all dispatch flows through impl_.
 
 namespace vkop {
 namespace ops {
 
 class PimplFacade : public Operator {
   public:
-    // Empty façade: spv=nullptr/0 so set_runtime_device's pipeline build is
-    // skipped (the guard `if (spv_len_ > 0 && spv_)` in
-    // Operator::set_runtime_device skips it). impl_ is assigned by the derived
-    // class ctor body.
+    // Empty façade: no descriptor layout and no shader, so set_runtime_device
+    // is overridden below to forward to impl_ and the base class's
+    // resolve_primary_spv()/pipeline build never runs here. impl_ is assigned
+    // by the derived class ctor body.
     PimplFacade(OpType type)
-        : Operator(type, nullptr, 0, std::vector<VkDescriptorType>{}, 0, 0) {}
+        : Operator(type, std::vector<VkDescriptorType>{}, 0, 0) {}
 
     void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                             const std::shared_ptr<VulkanCommandPool> &cmdpool,
                             VkPipelineCache cache = VK_NULL_HANDLE) override {
         impl_->set_runtime_device(dev, cmdpool, cache);
     }
-    // The facade's own spv_ is nullptr/0 (its ctor passes a no-op pointer),
-    // so overriding the base without forwarding would just silently write
-    // fields nobody reads. Route to the impl_ that actually builds the
-    // pipeline.
+    // The facade's own spv_ is null/0 (it builds no pipeline), so overriding
+    // the base without forwarding would just silently write fields nobody
+    // reads. Route to the impl_ that actually builds the pipeline.
     void override_spv(const uint32_t *spv, uint32_t spv_len) override {
         impl_->override_spv(spv, spv_len);
     }

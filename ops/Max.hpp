@@ -5,21 +5,12 @@
 #include "BinaryFactory.hpp"
 #include "ops/BufferBinaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char buffer_max_spv[];
-extern unsigned int buffer_max_spv_len;
-extern unsigned char buffer_max_fp16_spv[];
-extern unsigned int buffer_max_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 class MaxBuffer : public BufferBinaryFactory {
   public:
-    explicit MaxBuffer(int fp16)
-        : BufferBinaryFactory(
-              OpType::MAX, fp16 ? buffer_max_fp16_spv : buffer_max_spv,
-              fp16 ? buffer_max_fp16_spv_len : buffer_max_spv_len, fp16) {}
+    explicit MaxBuffer(int fp16) : BufferBinaryFactory(OpType::MAX, fp16) {}
 };
 
 class Max : public PimplFacade {

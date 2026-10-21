@@ -7,10 +7,6 @@
 #include <numeric>
 #include <string>
 
-extern "C" {
-extern unsigned char buffer_gemm_spv[];
-extern unsigned int buffer_gemm_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -44,7 +40,7 @@ struct alignas(16) GpuGemmParam {
 class Gemm : public Operator {
   public:
     Gemm()
-        : Operator(OpType::GEMM, buffer_gemm_spv, buffer_gemm_spv_len,
+        : Operator(OpType::GEMM,
                    {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                     DESCRIPTOR_TYPE_STORAGE},

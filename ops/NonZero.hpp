@@ -8,11 +8,6 @@
 #include <cstdlib>
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_nonzero_spv[];
-extern unsigned int buffer_nonzero_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -58,8 +53,7 @@ struct alignas(16) NonZeroPC {
 class NonZero : public BufferFactory {
   public:
     explicit NonZero()
-        : BufferFactory(OpType::NONZERO, buffer_nonzero_spv,
-                        buffer_nonzero_spv_len,
+        : BufferFactory(OpType::NONZERO,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(nonzero::NonZeroPC)) {}
 

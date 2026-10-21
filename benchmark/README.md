@@ -222,7 +222,8 @@ vkop-bench: --device 99 out of range (0..1); use --list-devices
 只喂 `llm.vkopbin` 就能跑（`build/tests/ModelTest` 验证过）。运行期**没有**任何替换
 shader 的开关（没有 env、没有 flag）：
 profile 跑的就是部署跑的那份 kernel，这是"只带一个文件"换来的性质，代价是换 shader
-必须重转。一个没内嵌归档的模型建 op 时就会明确报 stubbed-SPIR-V。
+必须重转。一个没内嵌归档的模型建 op 时就会明确报 `needs the shader ... and
+nothing supplied it`。
 
 shader 只在模型里之后，"某个 op 该跑哪个 kernel"这件事不能再有两份答案：Python
 侧按同样的表筛归档，C++ 侧按表查 key，两边一旦漂移就是一个硬失败（libvkop 里

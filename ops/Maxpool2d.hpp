@@ -4,12 +4,6 @@
 
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_maxpool2d_spv[];
-extern unsigned int image_maxpool2d_spv_len;
-extern unsigned char image_maxpool2d_fp16_spv[];
-extern unsigned int image_maxpool2d_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace maxpool2d {
@@ -28,12 +22,9 @@ class Maxpool2dImage : public Operator {
   public:
     Maxpool2dImage(int fp16)
         : Operator(OpType::MAXPOOL2D,
-                   fp16 ? image_maxpool2d_fp16_spv : image_maxpool2d_spv,
-                   fp16 ? image_maxpool2d_fp16_spv_len
-                        : image_maxpool2d_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
-                   sizeof(maxpool2d::GpuMaxpoolParam)) {
+                   sizeof(maxpool2d::GpuMaxpoolParam), fp16) {
         kernel_shape_.reserve(2);
         dilations_.reserve(2);
         strides_.reserve(2);

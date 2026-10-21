@@ -10,20 +10,20 @@
 // Shared base for elementwise binary buffer (SSBO) ops with ONNX
 // right-aligned broadcasting + optional post-fuse activation. Mirrors the
 // image path's BinaryFactory: each per-op leaf (AddBuffer, SubBuffer, ...)
-// derives from this and passes its own `buffer_<op>_spv` symbol; the
-// shared execute() binds the output + two input SSBOs, fills the
-// BinaryElemPC push constant (broadcast shapes + activation + total), and
-// dispatches one thread per output element (fp32) or per uint word (fp16).
+// derives from this and just names its own OpType; the shared execute() binds
+// the output + two input SSBOs, fills the BinaryElemPC push constant
+// (broadcast shapes + activation + total), and dispatches one thread per
+// output element (fp32) or per uint word (fp16).
 
 namespace vkop {
 namespace ops {
 
 class BufferBinaryFactory : public BufferFactory {
   public:
-    BufferBinaryFactory(OpType type, uint8_t *spv, uint32_t spv_len, int fp16,
+    BufferBinaryFactory(OpType type, int fp16,
                         BufferActivation activation = BufferActivation::NONE)
         : BufferFactory(
-              type, spv, spv_len,
+              type,
               // Bindings 0/1/2 = out/in0/in1 data SSBOs (always bound).
               // Bindings 3/4/5 = out/in0/in1 SHAPE SSBOs (Phase 3:
               // bound only when an input carries shape_ssbo_; declared

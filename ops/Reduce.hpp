@@ -6,21 +6,13 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 #include "ops/ReduceTypes.hpp"
-extern "C" {
-extern unsigned char image_reduce_spv[];
-extern unsigned int image_reduce_spv_len;
-extern unsigned char buffer_reduce_spv[];
-extern unsigned int buffer_reduce_spv_len;
-extern unsigned char buffer_reduce_fp16_spv[];
-extern unsigned int buffer_reduce_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 class ReduceImage : public Operator {
   public:
     ReduceImage()
-        : Operator(OpType::REDUCE, image_reduce_spv, image_reduce_spv_len,
+        : Operator(OpType::REDUCE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(reduce::GpuReduceParam)) {}
@@ -147,11 +139,9 @@ class ReduceImage : public Operator {
 class ReduceBuffer : public BufferFactory {
   public:
     explicit ReduceBuffer(int fp16)
-        : BufferFactory(
-              OpType::REDUCE, fp16 ? buffer_reduce_fp16_spv : buffer_reduce_spv,
-              fp16 ? buffer_reduce_fp16_spv_len : buffer_reduce_spv_len,
-              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-              sizeof(ReducePC), fp16) {}
+        : BufferFactory(OpType::REDUCE,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(ReducePC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

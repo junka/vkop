@@ -5,28 +5,19 @@
 #include "UnaryFactory.hpp"
 #include "ops/BufferUnaryFactory.hpp"
 #include "ops/PimplFacade.hpp"
-extern "C" {
-extern unsigned char image_floor_spv[];
-extern unsigned int image_floor_spv_len;
-extern unsigned char buffer_floor_spv[];
-extern unsigned int buffer_floor_spv_len;
-}
 namespace vkop {
 namespace ops {
 
 // Image (image2DArray NCHW->RGBA) implementation.
 class FloorImage : public UnaryFactory {
   public:
-    FloorImage()
-        : UnaryFactory(OpType::FLOOR, image_floor_spv, image_floor_spv_len) {}
+    FloorImage() : UnaryFactory(OpType::FLOOR) {}
 };
 
 // Buffer (SSBO, compact row-major) implementation.
 class FloorBuffer : public BufferUnaryFactory {
   public:
-    explicit FloorBuffer(int fp16)
-        : BufferUnaryFactory(OpType::FLOOR, buffer_floor_spv,
-                             buffer_floor_spv_len, fp16) {}
+    explicit FloorBuffer(int fp16) : BufferUnaryFactory(OpType::FLOOR, fp16) {}
 };
 
 // PIMPL façade: picks the buffer SSBO impl when backend_buffer is set,

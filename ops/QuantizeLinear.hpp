@@ -9,11 +9,6 @@
 #include <cstdlib>
 #include <limits>
 
-extern "C" {
-extern unsigned char buffer_quantize_linear_spv[];
-extern unsigned int buffer_quantize_linear_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -86,8 +81,7 @@ struct alignas(16) QuantPC {
 class QuantizeLinear : public BufferFactory {
   public:
     QuantizeLinear()
-        : BufferFactory(OpType::QUANTIZE_LINEAR, buffer_quantize_linear_spv,
-                        buffer_quantize_linear_spv_len,
+        : BufferFactory(OpType::QUANTIZE_LINEAR,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(quant::QuantPC)) {}
 

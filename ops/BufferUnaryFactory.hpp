@@ -6,23 +6,24 @@
 
 // Shared base for elementwise unary buffer (SSBO) ops. Mirrors the image
 // path's UnaryFactory: each per-op leaf (ReluBuffer, SigmoidBuffer, ...)
-// derives from this and just passes its own `buffer_<op>_spv` symbol; the
-// shared execute() below binds the input/output SSBOs, fills the
-// UnaryElemPC push constant (shape + element count), and dispatches one
-// thread per element (fp32) or per uint word (fp16 packed half2).
+// derives from this and just names its own OpType; the shared execute() below
+// binds the input/output SSBOs, fills the UnaryElemPC push constant (shape +
+// element count), and dispatches one thread per element (fp32) or per uint
+// word (fp16 packed half2).
 //
-// fp16 note: where a per-op shader ships a -DFP16 build, the leaf ctor
-// passes that spv when fp16 is set; otherwise fp32. The fp16 path packs
-// two elements per uint word, so dispatch is one thread per word (two
-// elements) — no two threads target the same word.
+// fp16 note: where a per-op shader ships a -DFP16 build, shader_key_for picks
+// it off the fp16 flag (the leaf ctor passes `fp16` through and the base
+// resolves the matching key). The fp16 path packs two elements per uint word,
+// so dispatch is one thread per word (two elements) — no two threads target
+// the same word.
 
 namespace vkop {
 namespace ops {
 
 class BufferUnaryFactory : public BufferFactory {
   public:
-    BufferUnaryFactory(OpType type, uint8_t *spv, uint32_t spv_len, int fp16)
-        : BufferFactory(type, spv, spv_len,
+    BufferUnaryFactory(OpType type, int fp16)
+        : BufferFactory(type,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(UnaryElemPC), fp16) {}
 

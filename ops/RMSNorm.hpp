@@ -6,13 +6,6 @@
 #include "ops/PimplFacade.hpp"
 #include <memory>
 
-extern "C" {
-extern unsigned char buffer_rmsnorm_spv[];
-extern unsigned int buffer_rmsnorm_spv_len;
-extern unsigned char buffer_rmsnorm_fp16_spv[];
-extern unsigned int buffer_rmsnorm_fp16_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -42,9 +35,6 @@ class RMSNormBuffer : public BufferFactory {
   public:
     explicit RMSNormBuffer(int fp16)
         : BufferFactory(OpType::RMSNORM,
-                        fp16 ? buffer_rmsnorm_fp16_spv : buffer_rmsnorm_spv,
-                        fp16 ? buffer_rmsnorm_fp16_spv_len
-                             : buffer_rmsnorm_spv_len,
                         std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE,
                                                       DESCRIPTOR_TYPE_STORAGE,
                                                       DESCRIPTOR_TYPE_STORAGE},

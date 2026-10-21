@@ -10,14 +10,6 @@
 #include <climits>
 #include <cmath>
 #include <numeric>
-extern "C" {
-extern unsigned char image_resize_spv[];
-extern unsigned int image_resize_spv_len;
-extern unsigned char buffer_resize_spv[];
-extern unsigned int buffer_resize_spv_len;
-extern unsigned char buffer_resize_fp16_spv[];
-extern unsigned int buffer_resize_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace resize {
@@ -56,7 +48,7 @@ enum class KeepAspectRatioPolicy { STRETCH, NOT_LARGER, NOT_SMALLER };
 class ResizeImage : public Operator {
   public:
     ResizeImage()
-        : Operator(OpType::RESIZE, image_resize_spv, image_resize_spv_len,
+        : Operator(OpType::RESIZE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
                    sizeof(resize::GpuResizeParam)) {}
@@ -349,11 +341,9 @@ struct ResizeBufferPC {
 class ResizeBuffer : public BufferFactory {
   public:
     explicit ResizeBuffer(int fp16)
-        : BufferFactory(
-              OpType::RESIZE, fp16 ? buffer_resize_fp16_spv : buffer_resize_spv,
-              fp16 ? buffer_resize_fp16_spv_len : buffer_resize_spv_len,
-              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-              sizeof(ResizeBufferPC), fp16) {}
+        : BufferFactory(OpType::RESIZE,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(ResizeBufferPC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {

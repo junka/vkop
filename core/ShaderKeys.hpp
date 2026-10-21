@@ -10,17 +10,18 @@ namespace vkop {
 namespace core {
 
 // Map (OpType, backend, fp16) to the shader's name inside vkop_shaders.bin.
-// Names match the folder-derived symbol CMakeLists.txt bakes as C arrays
-// today (shaders/buffer/add.comp -> buffer_add_spv[] -> archive key
-// "buffer_add"). An empty return means "the runtime should leave the op's
-// ctor-assigned SPIR-V pointer alone" -- either because the op has no GPU
-// shader (Shape, SqueezeUnsqueeze run on the host), or because its fp16
-// variant is not in DUAL_FP16_SHADERS and we do not want to feed the driver
-// the wrong shader.
+// Names match the folder-derived key the archive is built under
+// (shaders/buffer/add.comp -> archive key "buffer_add"), and this is the one
+// place an op's primary shader is decided: Runtime asks it for each node's
+// plan, and an op that was handed nothing resolves its own key through it. An
+// empty return means "this op has no GPU shader to resolve" -- either because
+// it runs on the host (Shape, SqueezeUnsqueeze), or because its fp16 variant
+// is not in DUAL_FP16_SHADERS and we do not want to feed the driver the wrong
+// shader.
 //
 // The fp16 flag only affects names: an op whose buffer variant is not in the
 // DUAL_FP16_SHADERS list falls back to the non-fp16 key even when fp16 is
-// requested, matching what the leaf ctor already does.
+// requested.
 inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
                                   int fp16) {
     using T = vkop::ops::OpType;
@@ -30,9 +31,8 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         bool image_fp16;
         bool buffer_fp16;
     };
-    // Entries mirror the extern symbols each op header references. Ops not
-    // listed here (Shape, SqueezeUnsqueeze) run on the host and have no
-    // shader to swap in.
+    // Entries mirror the keys vkop_shaders.bin carries. Ops not listed here
+    // (Shape, SqueezeUnsqueeze) run on the host and have no shader to resolve.
     auto lookup_spec = [](T t) -> Spec {
         switch (t) {
         case T::ADD:

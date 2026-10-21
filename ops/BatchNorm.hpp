@@ -7,10 +7,6 @@
 #include "ops/PimplFacade.hpp"
 
 #include <memory>
-extern "C" {
-extern unsigned char image_batchnorm_spv[];
-extern unsigned int image_batchnorm_spv_len;
-}
 namespace vkop {
 namespace ops {
 namespace batchnorm {
@@ -28,8 +24,7 @@ struct alignas(16) GpuBatchNormParam {
 class BatchNormImage : public Operator {
   public:
     BatchNormImage()
-        : Operator(OpType::BATCHNORM, image_batchnorm_spv,
-                   image_batchnorm_spv_len,
+        : Operator(OpType::BATCHNORM,
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     DESCRIPTOR_TYPE_UNIFORM},

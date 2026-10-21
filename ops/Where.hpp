@@ -10,12 +10,6 @@
 #include <cmath>
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_where_spv[];
-extern unsigned int buffer_where_spv_len;
-extern unsigned char buffer_where_int64_spv[];
-extern unsigned int buffer_where_int64_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -52,7 +46,7 @@ class Where : public Operator {
     bool uses_buffer_backend() const override { return true; }
 
     explicit Where()
-        : Operator(OpType::WHERE, buffer_where_spv, buffer_where_spv_len,
+        : Operator(OpType::WHERE,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -68,8 +62,7 @@ class Where : public Operator {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
-        auto i64 = resolve_spv("buffer_where_int64", buffer_where_int64_spv,
-                               buffer_where_int64_spv_len);
+        auto i64 = resolve_spv("buffer_where_int64");
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, sizeof(WhereInt64PC), i64.first,
             i64.second, use_uab, required_subgroup_size_);

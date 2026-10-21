@@ -156,8 +156,9 @@ class Runtime {
     // onnx2vkop always embeds one, and libvkop carries no built-in SPIR-V, so
     // this is the only source a shipping binary has -- there is deliberately no
     // environment override, which could otherwise substitute different kernels
-    // at run time. Null means the model has no archive: every op then keeps
-    // its placeholder array and fails by name at build time. The archive is
+    // at run time. Null means the model has no archive: every op then has
+    // nothing to build a pipeline from and fails by name at build time. The
+    // archive is
     // copied out of the model mmap, so only the shader blobs a model actually
     // fires become resident: the trtexec-style "extract only what's needed"
     // property that avoids baking every libvkop shader into every driver.

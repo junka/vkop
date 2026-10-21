@@ -8,16 +8,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
-extern "C" {
-extern unsigned char image_concat_spv[];
-extern unsigned int image_concat_spv_len;
-extern unsigned char buffer_concat_spv[];
-extern unsigned int buffer_concat_spv_len;
-extern unsigned char buffer_concat_fp16_spv[];
-extern unsigned int buffer_concat_fp16_spv_len;
-extern unsigned char buffer_concat_int64_spv[];
-extern unsigned int buffer_concat_int64_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -35,7 +25,7 @@ struct ConcatParam {
 class ConcatImage : public Operator {
   public:
     explicit ConcatImage()
-        : Operator(OpType::CONCAT, image_concat_spv, image_concat_spv_len,
+        : Operator(OpType::CONCAT,
                    {
                        VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                        VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
@@ -170,11 +160,9 @@ class ConcatImage : public Operator {
 class ConcatBuffer : public BufferFactory {
   public:
     explicit ConcatBuffer(int fp16)
-        : BufferFactory(
-              OpType::CONCAT, fp16 ? buffer_concat_fp16_spv : buffer_concat_spv,
-              fp16 ? buffer_concat_fp16_spv_len : buffer_concat_spv_len,
-              {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-              sizeof(ConcatPC), fp16) {
+        : BufferFactory(OpType::CONCAT,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(ConcatPC), fp16) {
         update_after_bind_ = true;
     }
 
@@ -195,8 +183,7 @@ class ConcatBuffer : public BufferFactory {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
-        auto i64 = resolve_spv("buffer_concat_int64", buffer_concat_int64_spv,
-                               buffer_concat_int64_spv_len);
+        auto i64 = resolve_spv("buffer_concat_int64");
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
             use_uab, required_subgroup_size_);

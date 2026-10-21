@@ -48,7 +48,7 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     sets. Which one the driver picks is a runtime choice -- Runtime defaults
     to the image backend and every in-tree driver calls
     set_backend_buffer(true) -- so a self-contained .vkopbin has to be able
-    to answer for both, or a miss would drop the op back to a stub array --
+    to answer for both, or a miss leaves the op with no shader at all --
     libvkop embeds no shaders of its own.
     shader_map already over-includes on purpose for the same reason; the
     unused half costs bytes in the file but never faults in, since the op

@@ -11,13 +11,6 @@
 #include <numeric>
 #include <vector>
 
-extern "C" {
-extern unsigned char buffer_fused_elemwise_spv[];
-extern unsigned int buffer_fused_elemwise_spv_len;
-extern unsigned char buffer_fused_elemwise_fp16_spv[];
-extern unsigned int buffer_fused_elemwise_fp16_spv_len;
-}
-
 namespace vkop {
 namespace ops {
 
@@ -87,9 +80,6 @@ class FusedElemwise : public BufferFactory {
     explicit FusedElemwise(int fp16 = 0)
         : BufferFactory(
               OpType::FUSED_ELEMWISE,
-              fp16 ? buffer_fused_elemwise_fp16_spv : buffer_fused_elemwise_spv,
-              fp16 ? buffer_fused_elemwise_fp16_spv_len
-                   : buffer_fused_elemwise_spv_len,
               // Bindings: 0 = output, 1..8 = inputs (kFusedMaxInputs), 9 =
               // prog. All STORAGE (the program buffer is read-only but
               // SSBO-typed in the shader; UPDATE_AFTER_BIND lets unused input

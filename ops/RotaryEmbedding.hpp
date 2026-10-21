@@ -7,12 +7,6 @@
 
 #include "Operator.hpp"
 #include "ops/BufferBase.hpp"
-extern "C" {
-extern unsigned char buffer_rotary_spv[];
-extern unsigned int buffer_rotary_spv_len;
-extern unsigned char buffer_rotary_fp16_spv[];
-extern unsigned int buffer_rotary_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -57,9 +51,6 @@ class RotaryEmbeddingBuffer : public BufferFactory {
   public:
     explicit RotaryEmbeddingBuffer(int fp16)
         : BufferFactory(OpType::ROTARY_EMBEDDING,
-                        fp16 ? buffer_rotary_fp16_spv : buffer_rotary_spv,
-                        fp16 ? buffer_rotary_fp16_spv_len
-                             : buffer_rotary_spv_len,
                         std::vector<VkDescriptorType>{
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},

@@ -124,7 +124,7 @@ void ShaderArchive::set_process_default(const std::string &path) {
     if (!opened) {
         std::fprintf(stderr,
                      "[shaders] dev archive %s is not a usable VKSP file; ops "
-                     "built outside LoadModel keep their stubbed SPIR-V\n",
+                     "built outside LoadModel will have no shader to resolve\n",
                      path.c_str());
         return;
     }

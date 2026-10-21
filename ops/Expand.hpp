@@ -9,14 +9,6 @@
 #include <cstdlib>
 #include <numeric>
 
-extern "C" {
-extern unsigned char buffer_expand_spv[];
-extern unsigned int buffer_expand_spv_len;
-extern unsigned char buffer_expand_fp16_spv[];
-extern unsigned int buffer_expand_fp16_spv_len;
-extern unsigned char buffer_expand_int64_spv[];
-extern unsigned int buffer_expand_int64_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -78,8 +70,6 @@ class Expand : public Operator {
 
     explicit Expand(int fp16 = 0)
         : Operator(OpType::EXPAND,
-                   fp16 ? buffer_expand_fp16_spv : buffer_expand_spv,
-                   fp16 ? buffer_expand_fp16_spv_len : buffer_expand_spv_len,
                    {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
@@ -97,8 +87,7 @@ class Expand : public Operator {
             return;
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
-        auto i64 = resolve_spv("buffer_expand_int64", buffer_expand_int64_spv,
-                               buffer_expand_int64_spv_len);
+        auto i64 = resolve_spv("buffer_expand_int64");
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
             use_uab, required_subgroup_size_);

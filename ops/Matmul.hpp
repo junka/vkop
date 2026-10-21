@@ -9,28 +9,6 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
-extern "C" {
-extern unsigned char image_matmul_spv[];
-extern unsigned int image_matmul_spv_len;
-extern unsigned char image_matmul_nv_spv[];
-extern unsigned int image_matmul_nv_spv_len;
-extern unsigned char image_matmul_coop_spv[];
-extern unsigned int image_matmul_coop_spv_len;
-extern unsigned char buffer_matmul_spv[];
-extern unsigned int buffer_matmul_spv_len;
-extern unsigned char buffer_matmul_fp16_spv[];
-extern unsigned int buffer_matmul_fp16_spv_len;
-extern unsigned char buffer_matmul_pack_spv[];
-extern unsigned int buffer_matmul_pack_spv_len;
-extern unsigned char buffer_matmul_coop_spv[];
-extern unsigned int buffer_matmul_coop_spv_len;
-extern unsigned char buffer_matmul_coop16_spv[];
-extern unsigned int buffer_matmul_coop16_spv_len;
-extern unsigned char buffer_matmul_coop_i8_spv[];
-extern unsigned int buffer_matmul_coop_i8_spv_len;
-extern unsigned char buffer_matmul_w8_wide_fp16_spv[];
-extern unsigned int buffer_matmul_w8_wide_fp16_spv_len;
-}
 namespace vkop {
 namespace ops {
 
@@ -155,16 +133,13 @@ class MatMulImage : public Operator {
     MatMulImage(MatMulImage &&) = delete;
     MatMulImage &operator=(MatMulImage &&) = delete;
 
+    // use_tensorcore still selects the host-side schedule (method_ below), but
+    // the image backend's SPIR-V arm no longer varies with it: with no shader
+    // symbols linked in, the image MatMul resolves the single "matmul" key
+    // from the archive like every other op. The nv/coop image shaders are only
+    // reachable if the archive names them, which the buffer backend does.
     explicit MatMulImage(int use_tensorcore = 0)
         : Operator(OpType::MATMUL,
-                   use_tensorcore == 2
-                       ? image_matmul_nv_spv
-                       : (use_tensorcore == 1 ? image_matmul_coop_spv
-                                              : image_matmul_spv),
-                   use_tensorcore == 2
-                       ? image_matmul_nv_spv_len
-                       : (use_tensorcore == 1 ? image_matmul_coop_spv_len
-                                              : image_matmul_spv_len),
                    {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
                     VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER},
@@ -244,15 +219,13 @@ class MatMulImage : public Operator {
 class MatMulBuffer : public BufferFactory {
   public:
     explicit MatMulBuffer(int fp16)
-        : BufferFactory(
-              OpType::MATMUL, fp16 ? buffer_matmul_fp16_spv : buffer_matmul_spv,
-              fp16 ? buffer_matmul_fp16_spv_len : buffer_matmul_spv_len,
-              std::vector<VkDescriptorType>{
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                  DESCRIPTOR_TYPE_STORAGE},
-              sizeof(matmul::GpuMatMulParam), fp16) {
+        : BufferFactory(OpType::MATMUL,
+                        std::vector<VkDescriptorType>{
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
     }
 
@@ -302,17 +275,13 @@ class MatMulBuffer : public BufferFactory {
             const uint32_t *spv;
             int spv_len;
             if (dev->supports_coopmat_fp16_tile(16, 16, 16)) {
-                auto r = resolve_spv("buffer_matmul_coop16",
-                                     buffer_matmul_coop16_spv,
-                                     buffer_matmul_coop16_spv_len);
+                auto r = resolve_spv("buffer_matmul_coop16");
                 spv = r.first;
                 spv_len = static_cast<int>(r.second);
                 coop_bm_ = 32;
                 coop_bn_ = 64;
             } else {
-                auto r =
-                    resolve_spv("buffer_matmul_coop", buffer_matmul_coop_spv,
-                                buffer_matmul_coop_spv_len);
+                auto r = resolve_spv("buffer_matmul_coop");
                 spv = r.first;
                 spv_len = static_cast<int>(r.second);
                 coop_bm_ = 16;
@@ -341,9 +310,7 @@ class MatMulBuffer : public BufferFactory {
             // KHR property list is the only feature query for integer MMA.
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
-            auto coop_i8 =
-                resolve_spv("buffer_matmul_coop_i8", buffer_matmul_coop_i8_spv,
-                            buffer_matmul_coop_i8_spv_len);
+            auto coop_i8 = resolve_spv("buffer_matmul_coop_i8");
             coop_i8_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
@@ -366,9 +333,7 @@ class MatMulBuffer : public BufferFactory {
             // Same binding count as the reduce pipeline: the pack set is filled
             // straight from objs_, so the two layouts must have the same slots
             // even though the pack shader only reads scratch and writes out.
-            auto pack =
-                resolve_spv("buffer_matmul_pack", buffer_matmul_pack_spv,
-                            buffer_matmul_pack_spv_len);
+            auto pack = resolve_spv("buffer_matmul_pack");
             pack_pipeline_ = std::make_unique<VulkanPipeline>(
                 dev->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
@@ -1226,9 +1191,7 @@ class MatMulBuffer : public BufferFactory {
                        m_dev_->is_support_descriptor_update_after_bind();
         std::pair<const uint32_t *, uint32_t> wide;
         try {
-            wide = resolve_spv("buffer_matmul_w8_wide_fp16",
-                               buffer_matmul_w8_wide_fp16_spv,
-                               buffer_matmul_w8_wide_fp16_spv_len);
+            wide = resolve_spv("buffer_matmul_w8_wide_fp16");
         } catch (const std::exception &e) {
             // Thrown, not returned: resolve_spv treats a secondary it cannot
             // name as a broken model. Stay per-op and say it once -- the

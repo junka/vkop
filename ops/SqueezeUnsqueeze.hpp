@@ -44,8 +44,7 @@ class SqueezeUnsqueeze : public Operator {
     bool uses_buffer_backend() const override { return true; }
 
     explicit SqueezeUnsqueeze(bool unsqueeze)
-        : Operator(unsqueeze ? OpType::UNSQUEEZE : OpType::SQUEEZE, nullptr, 0,
-                   {}),
+        : Operator(unsqueeze ? OpType::UNSQUEEZE : OpType::SQUEEZE, {}),
           unsqueeze_(unsqueeze) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
