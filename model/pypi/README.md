@@ -22,5 +22,5 @@ pip install -e .
 quantize with fp16
 
 ```
-onnx2vkop -i model.onnx -q --fp16
+onnx2vkop -i model.onnx -q fp16
 ```

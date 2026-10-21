@@ -89,7 +89,8 @@ static void diff_fp16(const std::string& label, const uint16_t* a, const uint16_
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr,
-            "usage: %s <visual.vkopbin> --pv <pv.bin> [seq_len] [--grid h,w]\n"
+            "usage: %s <visual.vkopbin> --pv <pv.bin> [seq_len] [--grid h,w] "
+            "[--ref-out <dir>]\n"
             "       %s <visual.vkopbin> --image <img> [--grid h,w] "
             "[--ref-pv <dir>] [--ref-out <dir>]\n",
             argv[0], argv[0]);
@@ -118,10 +119,21 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-' && !have_seq) {
             seq_len = std::atoi(a.c_str()); have_seq = true;
         }
+        else {
+            std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
+            return 1;
+        }
     }
     if (pv_path.empty() && image_path.empty()) {
         std::fprintf(stderr, "need --pv <pv.bin> or --image <img>\n");
         return 1;
+    }
+    // --ref-pv diffs the C++ preprocess output against HF's pv.bin, which only
+    // exists on the --image path; on --pv the pv *is* the reference.
+    if (!ref_pv_dir.empty() && image_path.empty()) {
+        std::fprintf(stderr,
+                     "[warn] --ref-pv is ignored without --image (the --pv input "
+                     "is already the reference)\n");
     }
     const int row = 1536;
 
@@ -258,7 +270,8 @@ int main(int argc, char** argv) {
             auto& tns = it.second;
             if (!tns) { std::printf("[%s] NOT FOUND\n", nm.c_str()); continue; }
             if (tns->dtype() == typeid(int64_t)) {
-                if (!std::getenv("VKOP_DUMP_INT64")) continue;
+                if (const char* di = std::getenv("VKOP_DUMP_INT64");
+                    !di || di[0] != '1') continue;
                 auto tg = as_tensor<int64_t>(tns);
                 if (!tg->has_gpu_buffer()) continue;
                 tg->copyToCPU(cmdpool);

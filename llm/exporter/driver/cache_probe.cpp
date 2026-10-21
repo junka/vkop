@@ -17,7 +17,8 @@
 //
 // Usage:
 //   cache_probe <cache_block.vkopbin> [--max-kv N] [--prefill S0] [--rounds N]
-//               [--window W] [--no-check] [--dump]
+//               [--window W] [--scale S] [--check-max N] [--step S]
+//               [--no-check] [--dump]
 //
 // --window W turns the cache into a sliding-window ring of W rows: the driver
 // lets rounds run past W (the guard is off), advancing the slot of logical row 0
@@ -213,6 +214,10 @@ int main(int argc, char** argv) {
         else if (a == "--scale" && i + 1 < argc) kv_scale = std::atof(argv[++i]);
         else if (a == "--no-check") check = false;
         else if (a == "--dump") dump = true;
+        else {
+            std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
+            return 1;
+        }
     }
     // The ring size IS the cache capacity: W rows preallocated, W rows resident.
     const bool ring = window > 0;

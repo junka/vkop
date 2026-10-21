@@ -1,7 +1,7 @@
 ## benchmark
 
 不会使用 CPU 做推理，CPU利用率低于2%，batch cmd 提交占用
-measure 1000 rounds avgerage
+measure 100 rounds avgerage
 
 download models from using script:
 ```
@@ -142,14 +142,15 @@ VKOP_CNN_PROFILE=1 ./build/benchmark/vkbench \
   inference: avg=7.4ms  p50=7.3ms  p90=8.1ms  p99=9.2ms
   preprocess:  2.1ms (jpeg decode + normalize)
   postprocess: GPU softmax+topk enabled
-  memory layout: packed=124MB  allocated=135MB  waste=8.9%
 ```
 
 指标说明：
 - **inference avg/p50/p90/p99**：推理延迟分布，p99 帮助发现偶发抖动
 - **preprocess**：JPEG 解码 + 归一化耗时（CPU 端），在小模型上可能占显著比例
 - **postprocess**：softmax + topk 是否走 GPU（当前默认启用）
-- **memory layout waste**：VkImage array pitch 对齐导致的显存浪费百分比，用于评估折叠策略收益
+- **memory layout waste**：**目前不会打印**——它的两个计数器
+  (`CnnProfile::total_packed_bytes/total_allocated_bytes`) 还没有任何地方赋值，
+  打印语句被 `total_allocated_bytes > 0` 挡掉，等 `ImageLayoutProbe` 接进来才有
 
 未来会集成：
 - Per-op timing（conv2d/matmul 按 kernel size 分类统计）→ 已由 `vkop-bench --profile-out` 提供

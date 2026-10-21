@@ -19,7 +19,7 @@ static const char* kGtName = "hf_ground_truth.json";
 namespace {
 
 // 在若干候选位置查找测试数据文件，返回首个存在的路径，找不到返回空串。
-// 候选顺序：$QWEN_TOKENIZER_BIN/$QWEN_TEST_DATA 目录、可执行文件所在目录、
+// 候选顺序：$QWEN_TEST_DATA 目录、可执行文件所在目录、
 // 可执行文件所在目录的上一级（源码根）、源码根/tests。
 std::string find_data_file(const char* name) {
     std::vector<std::string> dirs;

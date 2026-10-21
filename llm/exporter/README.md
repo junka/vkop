@@ -383,11 +383,16 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `VKOP_RAW_PROMPT=1` | 跳过 chat template **和多轮历史**，每行输入独立（对齐参考 `export/dump_llm_decode.py`，不走对话格式） |
 | `VKOP_MAX_CTX=<tokens>` | 多轮上下文的 token 预算，默认 `8192 - max_new`；超预算整对丢掉最旧的一问一答 |
 | `VKOP_CHATDBG=1` | 打印每轮 KV cache 反馈形状 + logits top5 |
+| `VKOP_NO_KV_REUSE=1` | 关掉跨轮 KV 前缀复用，每轮整段重新 prefill，用来 A/B 出「复用是否逐位相同」 |
+| `VKOP_PREFILL_CHUNK=<n>` | 把分块 prefill 的块长压到 `n` 并强制分块（窗口 `W` 不变，所以一块行都不会丢）。同一条序列、同一个窗口、不同块边界必须得到同一个结果 —— 这是「窗口只由 W 决定」的直接检验；也用来给 lm_head 的 logits buffer 封顶 |
 | `VKOP_PROFILE=1` | 开启性能分析：每轮结束输出 prefill/decode 的 tokens/s、延迟百分位 (p50/p90/p99)、KV cache 利用率；会话结束时打印全局汇总统计 |
 | `VKOP_LOAD_MMAP=1` | 载入走旧的 mmap 路径。默认（不设）走**从文件 pread 直灌 staging buffer**：多 GB initializer 逐页 fault 实测 ~1.4 GB/s，大块 pread 快得多且省掉 host→host memcpy。三个模型的 vkopbin 上 warm cache 差距只有 ~10%，冷启动才明显；仅影响 `LoadModel`，数值路径逐 token 不变 |
 | `VKOP_DUMP_TENSORS='*'` | dump 所有命名中间张量（fp16 hex + fp32 dec；配合 `VKOP_DUMP_INT64=1` 看 int64） |
 | `VKOP_DUMP_OFF='name:offset'` | 只 dump 某张量 offset 起 16 个元素 |
 | `VKOP_DUMP_INT64=1` | dump int64 张量（默认跳过，因为体积大） |
+| `VKOP_DUMP_FP32=1` | dump fp32 张量（`typeid(float)` 的那些；默认跳过） |
+| `VKOP_DUMP_RAW=<dir>` | 把 `VKOP_DUMP_TENSORS` 选中的 fp16 张量整体写成 `<dir>/<name>.f16` + `.shape` sidecar，供 numpy 逐元素比对（名字里的 `/` 换成 `_`）。值是**目录**，不是开关 |
+| `VKOP_VERIFY_INPUTS=1` | 仅 `llm_driver`：每轮上传后把 `inputs_embeds`/`past_key_values_0` 读回，和 npy 源比首元素与 norm，确认输入真的落到了 SSBO 上 |
 | `VK_PIPELINE_CACHE=1` | 任意驱动都认：把 pipeline 序列化进 `<model>.vkopbin.pcache`。llm 上 `vkop-bench --time-load-only` 实测 4083.8 → 1512.4 ms，但**只有配 `MESA_SHADER_CACHE_DISABLE=1` 才看得出来**；开着 Mesa 时两侧只差 ~70 ms，会把 vkop 的贡献完全掩盖 |
 | `VKOP_SHADER_DEBUG=1` | 逐 op 打 shader 来源：`hit key=… (from kernel plan|built-in table)` / `miss` / `no key`，并在 `LoadModel` 时打 `opened <model> (N entries)`。**没有**对应的运行期覆盖变量——shader 只从模型来，见下 |
 | `VKOP_KV_CACHE=1` | 仅 `llm_driver`：预分配每层 `VKOP_KV_MAX` 容量的 cache 并按该步长搬运历史，用来驱动 `has_cache` 形态的 `Attention`。在旋转形态（无 `has_cache`）的 vkopbin 上会直接拒绝而不是错跑 |

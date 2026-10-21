@@ -327,7 +327,7 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         float v = fp16_to_f32(row[i]);
         if (v > bestv) { bestv = v; best = i; }
     }
-    if (std::getenv("VKOP_CHATDBG")) {
+    if (const char* dbg = std::getenv("VKOP_CHATDBG"); dbg && dbg[0] == '1') {
         // top5 for sanity vs ORT.
         std::vector<std::pair<float,int>> tp;
         tp.reserve(vocab);
@@ -546,6 +546,17 @@ int main(int argc, char** argv) {
         else if (!a.empty() && a[0] != '-' && !have_max) {
             max_new = std::atoi(a.c_str()); have_max = true;
         }
+        else {
+            // A typo'd flag used to be dropped silently, which reads as "the
+            // option had no effect" rather than "the option was not parsed".
+            std::fprintf(stderr,
+                "unknown arg: %s\n"
+                "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
+                "[max_new] [--image <img>]... --visual <visual.vkopbin> "
+                "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}]\n",
+                argv[i], argv[0]);
+            return 1;
+        }
     }
     if (max_kv <= 0) {
         std::fprintf(stderr, "[error] --max-kv must be > 0 (got %d)\n", max_kv);
@@ -710,7 +721,8 @@ int main(int argc, char** argv) {
     }
     // raw 模式（对齐参考 dump）不过 chat template；没有模板时也没法累积历史，
     // 两种情况都退化成「每条输入独立」。
-    const bool raw_mode = std::getenv("VKOP_RAW_PROMPT") != nullptr;
+    const char* raw_env = std::getenv("VKOP_RAW_PROMPT");
+    const bool raw_mode = raw_env != nullptr && raw_env[0] == '1';
     const bool multi_turn = !raw_mode && conv.has_template();
     if (raw_mode || !multi_turn) {
         std::printf("[ctx] 单轮模式（%s）：不累积历史\n",
@@ -732,7 +744,8 @@ int main(int argc, char** argv) {
     std::vector<uint32_t> ds_shape = {1u, static_cast<uint32_t>(arch.hidden)};
 
     // Profiling state (opt-in via VKOP_PROFILE=1).
-    const bool profile_mode = std::getenv("VKOP_PROFILE") != nullptr;
+    const char* prof_env = std::getenv("VKOP_PROFILE");
+    const bool profile_mode = prof_env != nullptr && prof_env[0] == '1';
     PerfMetrics session_metrics;
 
     // ---- 跨轮 KV 前缀复用 ----
@@ -754,7 +767,8 @@ int main(int argc, char** argv) {
     KvCoverage covered;
     // 默认开（前提检查不通过就自动退回整段 prefill，只会慢不会错）；
     // VKOP_NO_KV_REUSE=1 强制整段，用来 A/B 出「复用是否逐位相同」。
-    const bool kv_reuse = std::getenv("VKOP_NO_KV_REUSE") == nullptr;
+    const char* no_reuse_env = std::getenv("VKOP_NO_KV_REUSE");
+    const bool kv_reuse = !(no_reuse_env != nullptr && no_reuse_env[0] == '1');
 
     // REPL loop.
     {
@@ -800,7 +814,8 @@ int main(int argc, char** argv) {
         std::printf("[prompt] %zu tokens, %zu image span(s) (history %d turns)\n",
                     ids.size(), rctx.spans.size(), static_cast<int>(conv.size()));
         std::fflush(stdout);
-        if (std::getenv("VKOP_CHATDBG")) {   // 与 HF/ORT 逐 token 对齐时用
+        if (const char* dbg = std::getenv("VKOP_CHATDBG"); dbg && dbg[0] == '1') {
+            // 与 HF/ORT 逐 token 对齐时用
             std::printf("  [ids]");
             for (uint32_t id : ids) std::printf(" %u", id);
             std::printf("\n");
@@ -1156,8 +1171,8 @@ int main(int argc, char** argv) {
         if (profile_mode) session_metrics.prefill_ms = prefill_chunk_ms;
 
         // Optional named-intermediate dump (mirrors llm_driver's VKOP_DUMP_TENSORS).
-        // VKOP_DUMP_ROUND=0 restricts to prefill; "*" dumps every fp16 tensor.
-        // Output matches dump_ort_intermediates.py for line-by-line topological diff.
+        // "*" dumps every fp16 tensor. Output matches dump_ort_intermediates.py
+        // for line-by-line topological diff.
         if (const char *d = std::getenv("VKOP_DUMP_TENSORS")) {
             std::string s(d);
             std::vector<std::pair<std::string, std::shared_ptr<ITensor>>> items;

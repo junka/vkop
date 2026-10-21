@@ -128,7 +128,8 @@ int main(int argc, char *argv[]) {
     // rt->TraceNode("node_Conv_291");
 
     // Profiling state (opt-in via VKOP_CNN_PROFILE=1).
-    const bool profile_mode = std::getenv("VKOP_CNN_PROFILE") != nullptr;
+    const char* cnn_prof_env = std::getenv("VKOP_CNN_PROFILE");
+    const bool profile_mode = cnn_prof_env != nullptr && cnn_prof_env[0] == '1';
     CnnProfile cnn_profile;
     cnn_profile.gpu_postprocess = true;  // USE_GPU_POSTPROCESS is defined
 

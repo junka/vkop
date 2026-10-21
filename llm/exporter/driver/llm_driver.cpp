@@ -421,7 +421,8 @@ int main(int argc, char** argv) {
     std::unique_ptr<KVCache> kv;
     int cache_cap = 0;
     const bool cache_form = model_has_cache_form(model_path);
-    const bool cache_wanted = std::getenv("VKOP_KV_CACHE") != nullptr;
+    const char *cache_env = std::getenv("VKOP_KV_CACHE");
+    const bool cache_wanted = cache_env != nullptr && cache_env[0] == '1';
     const bool cache_mode = cache_form && cache_wanted;
     if (cache_wanted && !cache_form) {
         // Refuse rather than mis-run: on the rotation form the driver's default
@@ -490,8 +491,8 @@ int main(int argc, char** argv) {
         // Optional upload-verify: readback inputs_embeds + past_key_values_0
         // and compare their first elements / norms against the npy source, to
         // confirm round-to-round input updates actually landed on the SSBOs.
-        if (const char *v = std::getenv("VKOP_VERIFY_INPUTS")) {
-            (void)v;  // presence-only gate
+        const char *verify_env = std::getenv("VKOP_VERIFY_INPUTS");
+        if (verify_env != nullptr && verify_env[0] == '1') {
             auto verify = [&](const std::string& tname, bool is_fp16) {
                 auto t = rt->GetInput(tname);
                 if (!t) { std::printf("[vin] %s: NOT FOUND\n", tname.c_str()); return; }
