@@ -179,19 +179,26 @@ class SplitBuffer : public BufferFactory {
             core::require_word_movable_elem(o->elem_kind(), "Split");
         }
 
-        // Zero-copy fast path: a Split along axis 0 (the outermost dim) carves
-        // the input into contiguous blocks, so each output can bind the input's
-        // VkBuffer at its block's byte offset instead of dispatching
-        // split.comp. (Any other axis interleaves the pieces -> a real gather.)
-        // Requires a GPU input and every block offset to satisfy the device
-        // alignment + fp16 word parity; otherwise fall through to the dispatch
-        // below.
-        if (axis_ == 0 && static_cast<int>(in_shape.size()) == rank) {
+        // Zero-copy fast path: a Split carves the input into contiguous blocks
+        // whenever every dimension BEFORE the split axis is 1 (there is no
+        // outer stride walked between pieces, so the input is effectively a 2-D
+        // [axis_size, inner] matrix split along its rows). axis 0 always
+        // qualifies (empty prefix); so does e.g. [1,1,4,8] split on axis 2.
+        // Each output then binds the input's VkBuffer at its block's byte
+        // offset instead of dispatching split.comp. Any real outer dim
+        // interleaves the pieces -> a real gather, and falls through to the
+        // dispatch below. Requires a GPU input and every block offset to
+        // satisfy the device alignment + fp16 word parity.
+        int prefix = 1;
+        for (int d = 0; d < axis_; ++d) {
+            prefix *= in_shape[d];
+        }
+        if (prefix == 1 && static_cast<int>(in_shape.size()) == rank) {
             size_t esz = (inputs[0]->dtype() == typeid(uint16_t))
                              ? sizeof(uint16_t)
                              : sizeof(float);
             VkDeviceSize inner = 1;
-            for (int d = 1; d < rank; ++d) {
+            for (int d = axis_ + 1; d < rank; ++d) {
                 inner *= static_cast<VkDeviceSize>(in_shape[d]);
             }
             VkDeviceSize align = m_dev_->minStorageBufferOffsetAlignment();

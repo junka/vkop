@@ -178,6 +178,35 @@ class Gather : public Operator {
         return output_shape;
     }
 
+    // Host-resolve the gather indices for the zero-copy view fast path. Only
+    // called when the tensor is host-authoritative (a model constant), so the
+    // read is free — no GPU->CPU stall. Returns false for a dtype we cannot
+    // read, or an empty/GPU-only tensor; the caller then dispatches normally.
+    static bool readHostIndices(const std::shared_ptr<core::ITensor> &t,
+                                std::vector<int64_t> &out) {
+        if (auto i64 = std::dynamic_pointer_cast<core::Tensor<int64_t>>(t)) {
+            if (!i64->has_cpu_data()) {
+                return false;
+            }
+            out.resize(i64->num_elements());
+            for (size_t i = 0; i < out.size(); ++i) {
+                out[i] = (*i64)[i];
+            }
+            return true;
+        }
+        if (auto i32 = std::dynamic_pointer_cast<core::Tensor<int>>(t)) {
+            if (!i32->has_cpu_data()) {
+                return false;
+            }
+            out.resize(i32->num_elements());
+            for (size_t i = 0; i < out.size(); ++i) {
+                out[i] = (*i32)[i];
+            }
+            return true;
+        }
+        return false;
+    }
+
     // Host-compute an int64-data Gather along `axis`. All 352 int64-data
     // gathers in the LLM have int64 indices produced by Shape/Concat (CPU
     // ops during the synchronous recording pass), so both tensors are valid
@@ -329,6 +358,62 @@ class Gather : public Operator {
             }
             gpuGatherInt64(inputs, outputs, out_shape);
             return;
+        }
+
+        // Zero-copy fast path: when the gathered output is one contiguous run
+        // of the data's bytes — every dim before `axis` is 1 and the indices
+        // are a consecutive ascending block — bind the data's VkBuffer at the
+        // block's byte offset instead of dispatching gather.comp. The indices
+        // must be readable for free (host-authoritative, i.e. a model
+        // constant), so this never pays a GPU->CPU stall; a GPU-produced index
+        // tensor (embedding lookups, the KV gathers) falls straight through to
+        // the dispatch. Fires on the ViT vision tower's [33024] fp32 row runs.
+        // Needs a GPU data buffer and an aligned offset (device + fp16 parity).
+        if (inputs[1]->get_host_authoritative() && param_.axis >= 0 &&
+            param_.axis < rank &&
+            (inputs[0]->dtype() == typeid(uint16_t) ||
+             inputs[0]->dtype() == typeid(float))) {
+            std::vector<int64_t> idx_host;
+            VkDeviceSize bo = 0;
+            VkDeviceSize bl = 0;
+            if (readHostIndices(inputs[1], idx_host)) {
+                for (auto &v : idx_host) {
+                    if (v < 0) {
+                        v += inshape[param_.axis];
+                    }
+                }
+                size_t esz = (inputs[0]->dtype() == typeid(uint16_t))
+                                 ? sizeof(uint16_t)
+                                 : sizeof(float);
+                if (contiguous_gather_range(inshape, idx_host, param_.axis, esz,
+                                            bo, bl) &&
+                    offset_view_aligned(
+                        bo, m_dev_->minStorageBufferOffsetAlignment())) {
+                    bool aliased = false;
+                    dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+                        using T = decltype(dummy);
+                        auto data = core::as_tensor<T>(inputs[0]);
+                        if (!data->has_gpu_buffer()) {
+                            return; // host-only data: no buffer to alias
+                        }
+                        auto output = core::as_tensor<T>(outputs[0]);
+                        if (output->num_elements() != total_elems(out_shape)) {
+                            output->resize(out_shape);
+                        }
+                        auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                            data->as_storage_buffer(m_dev_, m_cmd_));
+                        if (!src_buff) {
+                            return;
+                        }
+                        objs_.emplace_back(output->alias_storage_buffer_range(
+                            src_buff, bo, bl, m_cmd_));
+                        aliased = true;
+                    });
+                    if (aliased) {
+                        return;
+                    }
+                }
+            }
         }
 
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {

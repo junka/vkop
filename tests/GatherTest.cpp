@@ -127,3 +127,89 @@ TEST(GatherTest, GatherComprehensiveTest) {
         }));
     }
 }
+
+// Pure math behind the Gather zero-copy fast path: a gather is one contiguous
+// run of the data's bytes iff every dim before `axis` is 1 (no outer stride
+// between blocks) and the indices are consecutive ascending. A wrong answer
+// here is silently-wrong data (a bad offset binds the wrong bytes), so pin the
+// interesting cases.
+TEST(GatherTest, ContiguousGatherRangeMath) {
+    using vkop::ops::contiguous_gather_range;
+    VkDeviceSize bo = 0;
+    VkDeviceSize bl = 0;
+    // axis 0, consecutive {2,3} on {8,4,4}: inner 16 -> offset 2*16 elements.
+    EXPECT_TRUE(contiguous_gather_range({8, 4, 4}, {2, 3}, 0, sizeof(float), bo,
+                                        bl));
+    EXPECT_EQ(bo, VkDeviceSize(2 * 16) * sizeof(float));
+    EXPECT_EQ(bl, VkDeviceSize(2 * 16) * sizeof(float));
+    // A single index is trivially contiguous.
+    EXPECT_TRUE(
+        contiguous_gather_range({8, 4, 4}, {5}, 0, sizeof(float), bo, bl));
+    EXPECT_EQ(bo, VkDeviceSize(5 * 16) * sizeof(float));
+    // Non-consecutive / descending -> a real gather.
+    EXPECT_FALSE(
+        contiguous_gather_range({8, 4, 4}, {0, 2}, 0, sizeof(float), bo, bl));
+    EXPECT_FALSE(
+        contiguous_gather_range({8, 4, 4}, {3, 2}, 0, sizeof(float), bo, bl));
+    // An outer dim > 1 strides between the gathered blocks -> not one run.
+    EXPECT_FALSE(
+        contiguous_gather_range({2, 4, 4}, {1}, 1, sizeof(float), bo, bl));
+    // prefix all 1 lets an inner axis qualify: [1,4,4] axis 1 idx {1,2}.
+    EXPECT_TRUE(
+        contiguous_gather_range({1, 4, 4}, {1, 2}, 1, sizeof(float), bo, bl));
+    EXPECT_EQ(bo, VkDeviceSize(1 * 4) * sizeof(float));
+    EXPECT_EQ(bl, VkDeviceSize(2 * 4) * sizeof(float));
+    // Out-of-range block and empty indices.
+    EXPECT_FALSE(
+        contiguous_gather_range({8, 4, 4}, {7, 8}, 0, sizeof(float), bo, bl));
+    EXPECT_FALSE(
+        contiguous_gather_range({8, 4, 4}, {}, 0, sizeof(float), bo, bl));
+}
+
+// Zero-copy contiguous Gather end to end. When a gather selects a contiguous
+// run of the data, Gather binds the data's VkBuffer at the block's byte offset
+// (VkDescriptorBufferInfo.offset, transparent to the shader) instead of
+// dispatching gather.comp. Two assertions: the numbers still match torch (this
+// exercises the offset forwarding in VulkanBuffer::getDescriptorInfo /
+// copyBufferToStageBuffer — read at the parent's start instead of +offset and
+// the output would be the data's head), and the alias actually fired, since a
+// regression that silently disables the fast path would still pass a
+// correctness-only check.
+TEST(GatherTest, GatherContiguousBufferAlias) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{8, 4, 8};
+    std::vector<int> indices_shape{2};
+    std::vector<int> indices_data{2, 3};
+
+    LOG_INFO("Testing Gather contiguous alias fp32");
+    GatherTest<float> fp32(input_shape, 0, indices_shape, indices_data);
+    fp32.indices->set_host_authoritative();
+    auto before = vkop::core::ITensor::shape_view_stats().buffer_aliases;
+    EXPECT_TRUE(fp32.run_test({fp32.input, fp32.indices}, {fp32.output}));
+    EXPECT_EQ(vkop::core::ITensor::shape_view_stats().buffer_aliases,
+              before + 1);
+
+    LOG_INFO("Testing Gather contiguous alias fp16");
+    GatherTest<uint16_t> fp16(input_shape, 0, indices_shape, indices_data);
+    fp16.indices->set_host_authoritative();
+    before = vkop::core::ITensor::shape_view_stats().buffer_aliases;
+    EXPECT_TRUE(fp16.run_test({fp16.input, fp16.indices}, {fp16.output}));
+    EXPECT_EQ(vkop::core::ITensor::shape_view_stats().buffer_aliases,
+              before + 1);
+}
+
+// The complement: non-consecutive indices must NOT alias — they fall through to
+// the real gather dispatch and still produce correct numbers. Guards against a
+// fast path that fires too eagerly and binds the wrong block.
+TEST(GatherTest, GatherNonContiguousNoAlias) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{8, 4, 8};
+    std::vector<int> indices_shape{2};
+    std::vector<int> indices_data{0, 2};
+
+    GatherTest<float> fp32(input_shape, 0, indices_shape, indices_data);
+    fp32.indices->set_host_authoritative();
+    auto before = vkop::core::ITensor::shape_view_stats().buffer_aliases;
+    EXPECT_TRUE(fp32.run_test({fp32.input, fp32.indices}, {fp32.output}));
+    EXPECT_EQ(vkop::core::ITensor::shape_view_stats().buffer_aliases, before);
+}

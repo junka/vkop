@@ -236,6 +236,48 @@ inline bool contiguous_slice_range(const std::vector<int> &in_shape,
     return true;
 }
 
+// Contiguous sub-range test for the Gather zero-copy view fast path. A Gather
+// along `axis` produces the contiguous run of the data's row-major elements
+// [s, s+1, ..., s+k-1] (k = indices count) lifted by the inner block size iff
+// (a) every dimension before `axis` is 1 — otherwise the outer dims stride
+// between the gathered blocks and the output is not one run — and (b) the
+// flattened indices are consecutive ascending. Then the output is exactly data
+// elements [s*inner, (s+k)*inner), inner = prod(in_shape[axis+1..]). `idx` must
+// already be host-resolved and normalized to >= 0 (see Gather::execute).
+// Mirrors contiguous_slice_range: same "count == span" idea, expressed on the
+// gather's index list instead of per-axis starts/steps.
+inline bool contiguous_gather_range(const std::vector<int> &in_shape,
+                                    const std::vector<int64_t> &idx, int axis,
+                                    size_t elem_size, VkDeviceSize &byte_offset,
+                                    VkDeviceSize &byte_len) {
+    int rank = static_cast<int>(in_shape.size());
+    if (axis < 0 || axis >= rank || idx.empty()) {
+        return false;
+    }
+    for (int d = 0; d < axis; ++d) {
+        if (in_shape[d] != 1) {
+            return false; // an outer dim > 1 strides between blocks
+        }
+    }
+    int64_t k = static_cast<int64_t>(idx.size());
+    int64_t s = idx[0];
+    if (s < 0 || s + k > in_shape[axis]) {
+        return false;
+    }
+    for (int64_t i = 1; i < k; ++i) {
+        if (idx[i] != s + i) {
+            return false; // not consecutive ascending -> a real gather
+        }
+    }
+    int64_t inner = 1;
+    for (int d = axis + 1; d < rank; ++d) {
+        inner *= in_shape[d];
+    }
+    byte_offset = static_cast<VkDeviceSize>(s * inner) * elem_size;
+    byte_len = static_cast<VkDeviceSize>(k * inner) * elem_size;
+    return true;
+}
+
 // True when a binding at `byte_offset` is legal for an SSBO AND preserves the
 // fp16 word packing. Vulkan requires the offset to be a multiple of the
 // device's minStorageBufferOffsetAlignment; the fp16 backed layout packs two
