@@ -406,7 +406,21 @@ TEST(RobustnessTest, GemmRankOneOperandThrows) {
     auto op = rt_make_op(vkop::ops::OpType::GEMM);
     ASSERT_NE(op, nullptr);
     expect_throw_contains([&] { op->onExecute({a, b}, {out}, 0); },
-                          "rank >= 2");
+                          "must be rank 2");
+}
+
+// A rank-3 operand does not trip the old rank>=2 guard, but only dims [0] and
+// [1] are read, so every axis above 2 was dropped and the GEMM silently
+// computed a smaller product (ONNX requires both operands to be 2-D).
+TEST(RobustnessTest, GemmRankThreeOperandThrows) {
+    auto a = rt_make<float>({1, 2, 3}, std::vector<float>(6, 1.f));
+    auto b = rt_make<float>({3, 4}, std::vector<float>(12, 1.f));
+    auto out = std::make_shared<Tensor<float>>(std::vector<int>{1, 4});
+
+    auto op = rt_make_op(vkop::ops::OpType::GEMM);
+    ASSERT_NE(op, nullptr);
+    expect_throw_contains([&] { op->onExecute({a, b}, {out}, 0); },
+                          "must be rank 2");
 }
 
 // attention.comp reads the additive bias as ONE flat [B,S,kv] block indexed
@@ -531,6 +545,23 @@ TEST(RobustnessTest, ResizeImageCubicThrows) {
     op->setAttribute({{"mode", "cubic"}, {"size", "[2, 2]"}});
     expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
                           "does not implement cubic");
+}
+
+// resize.comp's transform_coordinate() names tf_crop_and_resize in its else
+// branch but leaves the coordinate at (0,0), so every output pixel sampled the
+// input corner and `extrapolation_value` was never read. Refused now instead.
+TEST(RobustnessTest, ResizeTfCropAndResizeThrows) {
+    auto in = rt_make<float>({1, 2, 4, 4}, std::vector<float>(32, 1.f));
+    auto out = std::make_shared<Tensor<float>>(std::vector<int>{1, 2, 2, 2});
+
+    auto op = std::make_unique<vkop::ops::Resize>(0, /*backend_buffer=*/false);
+    op->set_runtime_device(rt_dev(), rt_cmdpool());
+    op->setAttribute({{"mode", "nearest"},
+                      {"size", "[2, 2]"},
+                      {"coordinate_transformation_mode", "tf_crop_and_resize"},
+                      {"extrapolation_value", "5.0"}});
+    expect_throw_contains([&] { op->onExecute({in}, {out}, 0); },
+                          "tf_crop_and_resize");
 }
 
 // ONNX requires a non-zero step; a zero delta silently produced an empty range.

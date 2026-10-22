@@ -149,12 +149,18 @@ class Gemm : public Operator {
         }
 
         // A and B are indexed as rank-2 ([M,K]/[K,N], or their transposes);
-        // getShape()[1] on a rank-1 operand is out of bounds, not an error.
-        if (inputs[0]->getShape().size() < 2 ||
-            inputs[1]->getShape().size() < 2) {
+        // getShape()[1] on a rank-1 operand is out of bounds, not an error, and
+        // a rank-3 operand would silently drop every axis above 2 (ONNX
+        // requires both to be 2-D, and gemm.comp reads exactly one M/K or K/N
+        // pair).
+        if (inputs[0]->getShape().size() != 2 ||
+            inputs[1]->getShape().size() != 2) {
             throw std::runtime_error(
-                "Gemm: A and B must be rank >= 2 (a rank-1 operand has no "
-                "K/N axis to read)");
+                "Gemm: A and B must be rank 2 (got rank " +
+                std::to_string(inputs[0]->getShape().size()) + " and " +
+                std::to_string(inputs[1]->getShape().size()) +
+                "); the kernel reads a single M/K and K/N pair, so any other "
+                "rank is either out of bounds or silently mis-read");
         }
         int m = inputs[0]->getShape()[0];
         int n = inputs[1]->getShape()[1];

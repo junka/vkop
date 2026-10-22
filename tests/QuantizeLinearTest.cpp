@@ -629,5 +629,31 @@ TEST(QuantizeLinearTest, Int4OddTotal) {
     }
 }
 
+// A per-axis scale (one value per output channel, ONNX's `axis` form) used to
+// be read as scale[0] and applied to every channel — silently wrong for all but
+// the first. The op now refuses it rather than quantizing with the wrong scale.
+TEST(QuantizeLinearTest, PerAxisScaleThrows) {
+    const int n = 8;
+    auto tin = std::make_shared<Tensor<float>>(std::vector<int>{n});
+    tin->fillToCPU(std::vector<float>(n, 0.5f));
+    auto tq = std::make_shared<Tensor<int8_t>>(std::vector<int>{n}, true);
+    tq->set_elem_kind(vkop::core::ElemKind::kFloat8E4M3FN);
+
+    // inputs[1] with one scale per channel instead of a single scalar.
+    auto per_axis = std::make_shared<Tensor<float>>(std::vector<int>{n});
+    per_axis->fillToCPU(std::vector<float>(n, 1.0f));
+
+    bool threw = false;
+    try {
+        run_quant(tin, tq, 1.0f, nullptr, per_axis);
+    } catch (const std::runtime_error &e) {
+        threw = true;
+        EXPECT_NE(std::string(e.what()).find("per-axis"), std::string::npos)
+            << "unexpected message: " << e.what();
+    }
+    EXPECT_TRUE(threw) << "a per-axis scale must not be silently reduced to "
+                          "scale[0]";
+}
+
 } // namespace
 

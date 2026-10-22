@@ -65,15 +65,36 @@ vec4 init_acc_vec(int op) {
 float transform_val(float v, int op) {
     if (op == REDUCE_L1) return abs(v);
     if (op == REDUCE_L2 || op == REDUCE_SUMSQUARE) return v * v;
-    if (op == REDUCE_LOGSUMEXP) return exp(v);
+    // REDUCE_LOGSUMEXP is deliberately NOT transformed here: a plain exp(v)
+    // overflows to +inf once any v > 88.7 (fp32 exp range), and summing the
+    // infinities afterwards cannot undo it — the old form returned inf for
+    // perfectly finite inputs. It runs through the online accumulator below.
     return v;
 }
 
 vec4 transform_val(vec4 v, int op) {
     if (op == REDUCE_L1) return abs(v);
     if (op == REDUCE_L2 || op == REDUCE_SUMSQUARE) return v * v;
-    if (op == REDUCE_LOGSUMEXP) return exp(v);
     return v;
+}
+
+// Online (streaming) log-sum-exp, one component at a time: `m` holds the
+// running max, `s` the sum of exp(v - m). Whenever the max grows, s is rescaled
+// by exp(m - new_m) so that every exp() argument stays <= 0 and neither factor
+// can overflow. This is the single-read equivalent of the buffer shader's
+// max-then-sum two-pass (same trick as the fused-attention online softmax).
+// Callers finalize with m + log(s + 1e-12). Init: m = -1e30, s = 0 — the first
+// element sets m=v with exp(m-nm)=exp(0)=1 and s=0*1+exp(0)=1.
+void lse_acc(inout vec4 m, inout vec4 s, vec4 v) {
+    vec4 nm = max(m, v);
+    s = s * exp(m - nm) + exp(v - nm);
+    m = nm;
+}
+
+void lse_acc(inout float m, inout float s, float v) {
+    float nm = max(m, v);
+    s = s * exp(m - nm) + exp(v - nm);
+    m = nm;
 }
 
 float combine_vals(float a, float b, int op) {
@@ -113,11 +134,17 @@ void reduce_spatial_hw() {
 
     uint total_elements = uint(pc.inShape.z * pc.inShape.w);
     vec4 acc = init_acc_vec(pc.reduce_op);
+    vec4 m_acc = vec4(-1e30);
+    vec4 s_acc = vec4(0.0);
 
     for (uint h = 0; h < pc.inShape.z ; h ++) {
         for (int w = 0; w < pc.inShape.w; ++w) {
             vec4 v = texelFetch(uInput, ivec3(w, n * pc.inShape.z + h, c4), 0);
-            acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+            if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+                lse_acc(m_acc, s_acc, v);
+            } else {
+                acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+            }
         }
     }
 
@@ -125,7 +152,7 @@ void reduce_spatial_hw() {
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_L2) {
         result = sqrt(result);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
@@ -151,13 +178,19 @@ void reduce_batch_channel() {
 
     uint total_elements = uint(pc.inShape.x * pc.inShape.y);
     float acc = init_acc_one(pc.reduce_op);
+    float m_acc = -1e30;
+    float s_acc = 0.0;
 
     for (int n = 0; n < pc.inShape.x; ++n) {
         for (int c4 = 0; c4 < (pc.inShape.y + 3)/4; ++c4) {
             vec4 v = texelFetch(uInput, ivec3(w, n * H + h, c4), 0);
             for (int c = 0; c < 4; ++c) {
                 if (c4 * 4 + c >= pc.inShape.y) break;
-                acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+                if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+                    lse_acc(m_acc, s_acc, v[c]);
+                } else {
+                    acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+                }
             }
         }
     }
@@ -165,7 +198,7 @@ void reduce_batch_channel() {
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
         result = log(max(result, 1e-12));
     } else if (pc.reduce_op == REDUCE_L2) {
@@ -190,17 +223,23 @@ void reduce_batch_only() {
 
     uint total_elements = uint(pc.inShape.x);
     vec4 acc = init_acc_vec(pc.reduce_op);
+    vec4 m_acc = vec4(-1e30);
+    vec4 s_acc = vec4(0.0);
 
     for (int b = 0; b < pc.inShape.x; ++b) {
         vec4 v = texelFetch(uInput, ivec3(w, b * H + h, c4), 0);
-        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+            lse_acc(m_acc, s_acc, v);
+        } else {
+            acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        }
     }
 
     vec4 result = acc;
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
         result = log(max(result, 1e-12));
     } else if (pc.reduce_op == REDUCE_L2) {
@@ -229,12 +268,18 @@ void reduce_channel_only() {
 
     uint total_elements = uint(pc.inShape.y);
     float acc = init_acc_one(pc.reduce_op);
+    float m_acc = -1e30;
+    float s_acc = 0.0;
 
     for (int c4 = 0; c4 < (pc.inShape.y + 3)/4; ++c4) {
         vec4 v = texelFetch(uInput, ivec3(w, nh, c4), 0);
         for (int c = 0; c < 4; ++c) {
             if (c4 * 4 + c >= pc.inShape.y) break;
-            acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+            if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+                lse_acc(m_acc, s_acc, v[c]);
+            } else {
+                acc = combine_vals(acc, transform_val(v[c], pc.reduce_op), pc.reduce_op);
+            }
         }
     }
 
@@ -242,7 +287,7 @@ void reduce_channel_only() {
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
         result = log(max(result, 1e-12));
     } else if (pc.reduce_op == REDUCE_L2) {
@@ -267,17 +312,23 @@ void reduce_width_only() {
 
     uint total_elements = uint(pc.inShape.w);
     vec4 acc = init_acc_vec(pc.reduce_op);
+    vec4 m_acc = vec4(-1e30);
+    vec4 s_acc = vec4(0.0);
 
     for (int w = 0; w < pc.inShape.w; ++w) {
         vec4 v = texelFetch(uInput, ivec3(w, nh, c4), 0);
-        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+            lse_acc(m_acc, s_acc, v);
+        } else {
+            acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        }
     }
 
     vec4 result = acc;
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
         result = log(max(result, 1e-12));
     } else if (pc.reduce_op == REDUCE_L2) {
@@ -307,17 +358,23 @@ void reduce_height_only() {
 
     uint total_elements = uint(pc.inShape.z);
     vec4 acc = init_acc_vec(pc.reduce_op);
+    vec4 m_acc = vec4(-1e30);
+    vec4 s_acc = vec4(0.0);
 
     for (int h = 0; h < pc.inShape.z; ++h) {
         vec4 v = texelFetch(uInput, ivec3(w, n * pc.inShape.z + h, c4), 0);
-        acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        if (pc.reduce_op == REDUCE_LOGSUMEXP) {
+            lse_acc(m_acc, s_acc, v);
+        } else {
+            acc = combine_vals(acc, transform_val(v, pc.reduce_op), pc.reduce_op);
+        }
     }
 
     vec4 result = acc;
     if (pc.reduce_op == REDUCE_MEAN) {
         result /= float(total_elements);
     } else if (pc.reduce_op == REDUCE_LOGSUMEXP) {
-        result = log(result + 1e-12);
+        result = m_acc + log(s_acc + 1e-12);
     } else if (pc.reduce_op == REDUCE_LOGSUM) {
         result = log(max(result, 1e-12));
     } else if (pc.reduce_op == REDUCE_L2) {

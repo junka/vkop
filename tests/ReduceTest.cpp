@@ -207,6 +207,18 @@ public:
     };
 
     explicit ReduceTest(const std::vector<int> &shape, const std::vector<int> &axes):TestCase<T>("Reduce"), t(shape), axes(axes) {
+        // The op parses its axes from the attribute map, NOT from the `axes`
+        // member the torch reference below uses. The two used to disagree: the
+        // map kept the class default [0,1] whatever the caller asked for, so the
+        // kernel and the reference reduced different axes and the comparison
+        // passed on whatever the two output shapes happened to share. Keep them
+        // in lockstep. (parse_attr_list wants the "[a, b]" spelling — a bare
+        // list parses empty.)
+        attributes["axes"] = "[";
+        for (size_t i = 0; i < axes.size(); ++i) {
+            attributes["axes"] += (i ? ", " : "") + std::to_string(axes[i]);
+        }
+        attributes["axes"] += "]";
     }
 
     // Variant of initTestdata for a caller-supplied input. The random inputs
@@ -356,8 +368,8 @@ TEST(ReduceTest, ReduceComprehensiveTest) {
 // (accumulate exp(v), then log) returned +inf for a perfectly finite input —
 // silently, and only for large activations (e.g. an unscaled logit row). The
 // stable form subtracts the row max first, so the same inputs stay finite.
-// Buffer backend only: the stabilised kernel is shaders/buffer/reduce.comp (the
-// image variant's per-case loops still accumulate exp(v) directly).
+// Buffer backend here (shaders/buffer/reduce.comp); the image variant, whose six
+// per-case loops had the same defect, is covered by LogSumExpLargeValuesImage.
 TEST(ReduceTest, LogSumExpLargeValues) {
     vkop::tests::ScopedBufferBackend buffer;
     // Row 1 stays in the ordinary range: the max-subtraction must not change
@@ -383,4 +395,41 @@ TEST(ReduceTest, LogSumExpLargeValues) {
     };
     EXPECT_TRUE(run_case(float{}));
     EXPECT_TRUE(run_case(uint16_t{}));
+}
+
+// The image backend's log-sum-exp, same defect and same fix (online running
+// max instead of a plain exp(v) sum, in shaders/image/reduce.comp). No
+// ScopedBufferBackend, so this runs the default image path. A (1,C,H,W) input
+// whose every element is well above the fp32 exp ceiling forces the overflow:
+// the naive form returns inf for both shapes below, the stable one returns the
+// finite max + log(sum exp(v-max)).
+TEST(ReduceTest, LogSumExpLargeValuesImage) {
+    const std::vector<int> shape{1, 4, 5, 4}; // N, C, H, W
+    // 100.00, 100.37, 100.74, ... — min value 100 > 88.7, so every exp(v) term
+    // overflows on its own.
+    auto torch_input =
+        (torch::arange(1 * 4 * 5 * 4, torch::kFloat32).reshape({1, 4, 5, 4}) *
+             0.37f +
+         100.0f);
+
+    auto run_case = [&](auto type_tag, const std::vector<int> &axes) -> bool {
+        using U = decltype(type_tag);
+        ReduceTest<U> rt(shape, axes);
+        rt.initTestdataFromTensor("log_sum_exp", torch_input);
+        return rt.run_test({rt.input}, {rt.output},
+            [&rt](std::unique_ptr<vkop::ops::Operator> &op) {
+                auto *reduce_op = dynamic_cast<Reduce *>(op.get());
+                if (!reduce_op) {
+                    LOG_ERROR("Failed to cast operator to Reduce");
+                    return;
+                }
+                reduce_op->setAttribute(rt.attributes);
+            });
+    };
+    // axes {2,3} -> reduce H,W: mask 12, the vec4-accumulator case.
+    // axes {0,1} -> reduce N,C: mask 3, the scalar-accumulator case.
+    EXPECT_TRUE((run_case(float{}, {2, 3})));
+    EXPECT_TRUE((run_case(float{}, {0, 1})));
+    EXPECT_TRUE((run_case(uint16_t{}, {2, 3})));
+    EXPECT_TRUE((run_case(uint16_t{}, {0, 1})));
 }

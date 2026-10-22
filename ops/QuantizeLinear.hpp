@@ -142,6 +142,22 @@ class QuantizeLinear : public BufferFactory {
                 core::elem_name(q_kind) + "'");
         }
 
+        // Per-axis scale is a legal ONNX form (one scale per output channel,
+        // selected by the `axis` attribute) that this op does not implement:
+        // the read below takes element 0 and applies it to every channel,
+        // silently wrong for all but the first. Refuse rather than guess.
+        // (Zero_point has the same per-axis form and is likewise
+        // unimplemented.)
+        if (inputs.size() >= 2 && inputs[1] &&
+            total_elems(inputs[1]->getShape()) > 1) {
+            throw std::runtime_error(
+                "QuantizeLinear/DequantizeLinear: per-axis scale (" +
+                std::to_string(total_elems(inputs[1]->getShape())) +
+                " elements) is not implemented; only a per-tensor scalar "
+                "scale is (the kernel would otherwise apply scale[0] to every "
+                "channel)");
+        }
+
         // Per-tensor scale from inputs[1] (ONNX: x, scale, [zero_point]).
         // The scale initializer may be fp32 OR fp16: ORT's quantizer on an fp16
         // model emits fp16 scales (legal per spec, since DequantizeLinear's

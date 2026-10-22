@@ -104,6 +104,9 @@ class ResizeImage : public Operator {
             exclude_outside_ = std::stol(attrs.at("exclude_outside"));
         }
         if (attrs.find("extrapolation_value") != attrs.end()) {
+            // Parsed for completeness only: ONNX defines this fill value solely
+            // for coordinate_transformation_mode=tf_crop_and_resize, and that
+            // mode now throws on the image path, so nothing consumes it.
             extrapolation_value_ = std::stof(attrs.at("extrapolation_value"));
         }
         // The guard has to name the same attribute the body reads: keyed on
@@ -197,6 +200,18 @@ class ResizeImage : public Operator {
         if (antialias_ != 0) {
             throw std::runtime_error(
                 "Resize (image backend) does not implement antialias");
+        }
+        // resize.comp's transform_coordinate() names tf_crop_and_resize in its
+        // else branch but returns (0,0) there, so the whole output came back as
+        // one corner pixel of the input — silently, and `extrapolation_value`
+        // (which only applies to this mode) was never read either.
+        if (coordinate_transformation_mode_ ==
+            static_cast<int>(
+                resize::CoordinateTransformationMode::TF_CROP_AND_RESIZE)) {
+            throw std::runtime_error(
+                "Resize (image backend) does not implement "
+                "coordinate_transformation_mode=tf_crop_and_resize (the shader "
+                "samples the input corner for every output pixel)");
         }
         std::shared_ptr<core::Tensor<int64_t>> sizes = nullptr;
         std::shared_ptr<core::Tensor<float>> scales = nullptr;
