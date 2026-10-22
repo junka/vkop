@@ -23,8 +23,12 @@
 //   VKOP_NO_COOP=1 ./build/bench_matmul
 //
 // Env: VKOP_NO_COOP=1 on MoltenVK (16x16 coopmat tiles cannot compile to MSL).
+//      BENCH_INT8=1 swaps B for a byte int8 weight + a per-column fp32 scale,
+//      which is the only way to exercise the byte WIDE (16 cols/lane) GEMV
+//      without a whole quantized model on disk.
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -60,6 +64,16 @@ void fill_ones(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
     std::fill(t->data().begin(), t->data().end(), 0x3C00); // fp16 1.0
 }
 
+// Column-only weight ramp: B[k][j] = wpat(j), so with A all ones every output
+// element is exactly K * wpat(j) -- independent of k, and cheap enough to
+// check against a one-line reference at any size. Unlike an all-ones B this is
+// sensitive to the COLUMN indexing, which is the thing a ksplit_q change can
+// break: the fold remaps (column quad, K slice) through oct/slice, and the
+// byte kernel additionally applies a per-column scale at a c+4/c+8/c+12
+// offset. A remap or a scale phase error makes out[j] come out as K*wpat(j')
+// for the wrong j', which the all-ones probe cannot see.
+inline int wpat(int j) { return (j % 7) - 3; }
+
 } // namespace
 
 int main(int argc, char **argv) {
@@ -92,11 +106,23 @@ int main(int argc, char **argv) {
     }
 
     const int reps = (argc > 3) ? std::atoi(argv[3]) : 30;
+    const bool int8_mode = std::getenv("BENCH_INT8") != nullptr;
+    if (int8_mode) {
+        printf("weight: int8 (byte WIDE path)\n");
+    }
 
     // DRAM ceiling probe: vkCmdCopyBuffer of a 256MB region, same submit
     // batch as the GEMV measurements. Read+write so effective bandwidth is
     // bytes_moved/2/s per direction.
-    {
+    //
+    // Skip with BENCH_SKIP_MEMPROBE=1 when only the GEMV rows matter: moving
+    // 256MB x reps immediately before the measured window puts the iGPU under
+    // a sustained memory load that its power management reacts to, and a run
+    // that inherits a partial throttle measures the matmul ~2x slow at exactly
+    // the sizes where the window is longest. The min-of-N is then bimodal
+    // (one un-throttled round). Nothing in the probe is needed for the GEMV
+    // A/B, so drop it.
+    if (std::getenv("BENCH_SKIP_MEMPROBE") == nullptr) {
         const size_t bytes = 256u << 20;
         auto src = std::make_shared<VulkanBuffer>(
             dev, bytes,
@@ -144,22 +170,66 @@ int main(int argc, char **argv) {
                    200);
     }
 
+    // BENCH_M: rows in A. Default 1 (true decode). M > 1 is the batched-decode
+    // / small-prefill regime, where the split-K GEMV's one-workgroup-per-row
+    // layout reads the whole weight M times.
+    const int bench_m = [] {
+        const char *v = std::getenv("BENCH_M");
+        return (v && *v) ? std::atoi(v) : 1;
+    }();
     for (const auto &s : shapes) {
         auto A = std::make_shared<core::Tensor<uint16_t>>(
-            std::vector<int>{1, s.K});
-        auto B = std::make_shared<core::Tensor<uint16_t>>(
-            std::vector<int>{s.K, s.N});
+            std::vector<int>{bench_m, s.K});
         auto O = std::make_shared<core::Tensor<uint16_t>>(
-            std::vector<int>{1, s.N});
+            std::vector<int>{bench_m, s.N});
         fill_ones(A);
-        fill_ones(B);
         // Allocate + upload BEFORE binding: as_storage_buffer only allocates
         // (make_vkbuff), the upload is copyToGPU's staging copy. Binding an
         // unuploaded tensor silently computes on zeros.
         A->as_storage_buffer(dev);
-        B->as_storage_buffer(dev);
         A->copyToGPU(cmdpool);
-        B->copyToGPU(cmdpool);
+
+        // B is either an fp16 weight [K, N] or, in int8 mode, an int8 weight
+        // [K, N] plus the per-column fp32 dequant scale the byte kernels read
+        // (A fp16 x int8 weight x scale -> fp16 out is the W8A16 path).
+        std::shared_ptr<core::ITensor> b_keep, s_keep;
+        std::vector<std::shared_ptr<core::ITensor>> in;
+        if (int8_mode) {
+            auto B8 = std::make_shared<core::Tensor<int8_t>>(
+                std::vector<int>{s.K, s.N});
+            B8->reserveOnCPU();
+            for (int j = 0; j < s.N; ++j) {
+                for (int k = 0; k < s.K; ++k) {
+                    B8->data()[k * s.N + j] = static_cast<int8_t>(wpat(j));
+                }
+            }
+            auto S = std::make_shared<core::Tensor<float>>(
+                std::vector<int>{s.N});
+            S->reserveOnCPU();
+            std::fill(S->data().begin(), S->data().end(), 1.0f);
+            B8->as_storage_buffer(dev);
+            S->as_storage_buffer(dev);
+            B8->copyToGPU(cmdpool);
+            S->copyToGPU(cmdpool);
+            b_keep = B8;
+            s_keep = S;
+            in = {A, B8, S};
+        } else {
+            auto B = std::make_shared<core::Tensor<uint16_t>>(
+                std::vector<int>{s.K, s.N});
+            B->reserveOnCPU();
+            for (int j = 0; j < s.N; ++j) {
+                uint16_t v = core::ITensor::fp32_to_fp16(static_cast<float>(wpat(j)));
+                for (int k = 0; k < s.K; ++k) {
+                    B->data()[k * s.N + j] = v;
+                }
+            }
+            B->as_storage_buffer(dev);
+            B->copyToGPU(cmdpool);
+            b_keep = B;
+            in = {A, B};
+        }
+        std::vector<std::shared_ptr<core::ITensor>> out = {O};
 
         auto op = ops::create_from_type(ops::OpType::MATMUL, /*fp16=*/1,
                                         /*use_tensorcore=*/0,
@@ -167,7 +237,6 @@ int main(int argc, char **argv) {
         op->set_name(s.name);
         op->set_runtime_device(dev, cmdpool);
         op->enable_replay(true);
-        std::vector<std::shared_ptr<core::ITensor>> in = {A, B}, out = {O};
         op->onExecute(in, out, 0); // round 0: record + store fingerprint
         op->onExecute(in, out, 0); // round 1: match -> CACHED (cmd kept)
         auto cmd = op->get_record();
@@ -180,7 +249,10 @@ int main(int argc, char **argv) {
         cmd->submit(queue);
         dev->wait_all_done();
 
-        // correctness probe (A=B=1.0 -> every output element must equal K)
+        // Correctness probe: A is all ones and B[k][j] = wpat(j), so every
+        // output element must equal K * wpat(j) exactly. Reported as the first
+        // mismatching column, since the interesting failure is a column remap
+        // (right value, wrong column) rather than a bad sum.
         cmd->submit(queue);
         dev->wait_all_done();
         O->reserveOnCPU();
@@ -193,9 +265,11 @@ int main(int argc, char **argv) {
         for (int j = 0; j < s.N; ++j) {
             uint16_t v = O->data()[j];
             float f = vkop::core::ITensor::fp16_to_fp32(v);
-            if (f != static_cast<float>(s.K)) {
+            float want = static_cast<float>(s.K) * static_cast<float>(wpat(j));
+            if (f != want) {
                 ok = false;
-                printf("  MISMATCH at %d: %f != %d\n", j, f, s.K);
+                printf("  MISMATCH at col %d: got %f, want %f (K*wpat(%d))\n", j,
+                       f, want, j);
                 break;
             }
         }
@@ -213,7 +287,8 @@ int main(int argc, char **argv) {
         auto t1 = std::chrono::steady_clock::now();
         double ms =
             std::chrono::duration<double, std::milli>(t1 - t0).count() / reps;
-        double bytes = static_cast<double>(s.K) * s.N * 2; // fp16 weights
+        double bytes = static_cast<double>(s.K) * s.N *
+                       (int8_mode ? 1 : 2); // weight bytes
         printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s\n", s.name, s.K, s.N,
                ms, bytes / ms / 1e6);
 

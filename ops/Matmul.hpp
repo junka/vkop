@@ -813,22 +813,59 @@ class MatMulBuffer : public BufferFactory {
         // above already proved transB == 0 and N % 8 == 0, which is what makes
         // a thread's four columns exactly half of one packed weight word.
         const bool w4_quad = fused_fp16 && weight_4bit;
-        // Shared-memory tiling pays only in the compute-bound regime, and only
-        // where its indexing assumptions hold: k % 16 keeps every tile word
-        // aligned on both B layouts. m >= 12 is measured, not guessed: at
-        // M <= 8 the naive GEMV is weight-bandwidth-bound and the 64-row tile
-        // is ~break-even (0.99-1.01x across N=1024..9728), while from M = 12
-        // the tile reuse wins 1.2-2.0x and never regresses (narrow N=64 and
-        // batched attention shapes included). A byte-quantized weight joins it
-        // through tile_load_b_w8, which stages the decoded value: in the
-        // column-parallel quad kernel a weight is loaded and decoded once per
-        // output row, which on the DiT (m = 1024) cost int8 4.0x and fp8 5.5x
-        // what fp16 pays per step. That loader reads four columns of one K row
-        // out of one weight word, so it needs transB == 0 (the only layout the
-        // quantizer emits) and n % 4 == 0. 4-bit weights stay out: their scale
-        // varies along K, which a per-column epilogue cannot fold.
+        // Shared-memory tiling pays only where its indexing assumptions hold:
+        // k % 16 keeps every tile word aligned on both B layouts. The row
+        // threshold is measured, and it is about DRAM residency, not compute.
+        // The split-K GEMV below gives every output ROW its own workgroup
+        // (row = gl_WorkGroupID.y, dispatch y = batch*m), so it streams the
+        // whole weight once per row. While the weight fits in cache that is
+        // free, which is how the old m >= 12 threshold was calibrated
+        // (measured on N <= 9728); once the weight is DRAM-resident the
+        // re-read costs a full extra weight pass per row. The tiled kernel
+        // stages B in shared memory and reuses it across its TILE_M = 64 rows,
+        // so from the point that reuse covers the tile's own per-workgroup B
+        // pass it is strictly the better kernel. Interleaved min-of-7 on the
+        // ARL iGPU, DRAM-resident weights:
+        //   byte weight (int8): m = 2..8 -> 1.3x-5.0x faster; m >= 12 unchanged
+        //   fp16 weight:        m >= 3   -> 1.4x-5.3x faster; m >= 12 unchanged
+        // fp16 starts one row later because on the 622 MB lm_head weight
+        // (K=2048, N=151936) m = 2 is the one shape that regresses (0.79x):
+        // the GEMV is already at the ~65 GB/s device ceiling there and the
+        // tile's B pass dominates. int8 is 1.34x FASTER on that same shape,
+        // its weight being half the bytes.
+        // A byte-quantized weight joins it through tile_load_b_w8, which
+        // stages the decoded value: in the column-parallel quad kernel a weight
+        // is loaded and decoded once per output row, which on the DiT
+        // (m = 1024) cost int8 4.0x and fp8 5.5x what fp16 pays per step. That
+        // loader reads four columns of one K row out of one weight word, so it
+        // needs transB == 0 (the only layout the quantizer emits) and
+        // n % 4 == 0. 4-bit weights stay out: their scale varies along K, which
+        // a per-column epilogue cannot fold.
+        //
+        // One shape class defeats the relaxed threshold: a weight row stride
+        // that is a power of two of 64 KiB or more. The tile stages B at
+        // TILE_N = 64 columns per row -- 64 bytes for a byte weight, 128 for
+        // fp16 -- and across such a stride the staging reads lose
+        // miss-level parallelism, falling to 6-13 GB/s where the identical
+        // shape shifted by 64 bytes runs at 35-54 GB/s (measured byte
+        // N = 65536 and 131072, fp16 N = 32768/65536/131072, i.e. row strides
+        // of exactly 64/128/256 KiB; byte N = 32768, a 32 KiB stride, is
+        // unaffected, and byte N = 65600 is back to 37 GB/s). The penalty is
+        // flat in m while the GEMV's M-fold re-read is not, so for small m the
+        // GEMV still wins there (m = 2..4: tiled is 0.27x-0.54x of the GEMV)
+        // and the tile only takes over at m >= 12 -- i.e. the old calibration
+        // is the correct one for exactly these strides. Taking the old value
+        // there rather than re-tuning also costs nothing at m >= 12 by
+        // construction; the one thing it gives up is fp16 at m = 8..11, where
+        // the tile still wins (1.3x-1.8x) despite the stride penalty -- judged
+        // not worth a second, dtype-specific threshold.
+        const long long b_row_bytes =
+            static_cast<long long>(n) * (weight_byte ? 1 : 2);
+        const bool b_stride_pow2_big =
+            b_row_bytes >= 65536 && (b_row_bytes & (b_row_bytes - 1)) == 0;
+        const int tiled_min_m = b_stride_pow2_big ? 12 : (weight_byte ? 2 : 3);
         const bool tiled = fused_fp16 && !weight_4bit && (k % 16 == 0) &&
-                           (m >= 12) && !epi_bias_ &&
+                           (m >= tiled_min_m) && !epi_bias_ &&
                            (!weight_byte || (!transB_ && (n % 4 == 0)));
         // The odd-N reduce->pack fallback needs scratch; the cooperative-matrix
         // path also needs it (it writes flat fp32 results that the pack pass
@@ -1030,12 +1067,17 @@ class MatMulBuffer : public BufferFactory {
             // occupancy knob -- halve it (16 -> 4) while the row's N is narrow
             // enough that a 16-quad block would launch too few blocks to keep
             // the device busy; the K slices grow to match, since lane count is
-            // fixed at 256. VKOP_KSPLIT_Q overrides the pick (tuning only).
+            // fixed at 256. VKOP_KSPLIT_Q pins the pick (tuning only); the
+            // WIDE branch below re-picks its own starting point when it is
+            // not pinned, but still applies the 32-block floor.
             int q = 16;
+            bool q_tuned = false;
             if (const char *e = std::getenv("VKOP_KSPLIT_Q")) {
                 int v = std::atoi(e);
-                if (v > 0)
+                if (v > 0) {
                     q = v;
+                    q_tuned = true;
+                }
             }
             // fp16 WIDE split-K GEMV: each lane owns 8 columns (one uvec4
             // 16-byte load, two vec4 accumulator chains) vs the standard
@@ -1104,6 +1146,31 @@ class MatMulBuffer : public BufferFactory {
                     ? w8_wide_pipeline()
                     : nullptr;
             if (wide_pipe != nullptr) {
+                // Same search-direction fix as the fp16 WIDE branch below, and
+                // for the same reason: the 32-block floor is the only reason to
+                // split K, so start at the shallowest split and let the floor
+                // walk it down. The byte kernel is 16 cols/lane, so the rule
+                // picks the largest q with UP_DIV(n/16, q) >= 32, i.e. n >
+                // 496q; the old search capped that at 16, so every n <= 15872
+                // lands on exactly the q it used to and the two rules only part
+                // company from n = 15873 up. Measured on ARL, interleaved
+                // min-of-5 on bench_matmul in int8 weight mode (BENCH_INT8=1),
+                // so these are pure byte-WIDE GEMVs: K=2048/N=131072 11.2
+                // -> 4.1 ms (-64%), N=65536 4.9 -> 2.2 (-55%),
+                // K=4096/N=65536 10.7 -> 4.1 (-62%), K=8192/N=32768 9.7 -> 4.1
+                // (-58%). Below N = 16384 the auto pick lands on q = 16, the
+                // old default, so those shapes change at most by noise (N =
+                // 16384: 0.62 -> 0.58 ms; N = 32768: 1.06 -> 1.03) -- quote no
+                // gradient there, the run-to-run spread on a 1 ms GEMV is
+                // larger than the effect. The byte WIDE path
+                // auto-covers n >= 896 and returns, so in practice this only
+                // bites where the driver refuses the WIDE pipeline
+                // (w8_wide_pipeline() returns null) or the row's n is not
+                // 16-aligned -- both of which then run the 4-column kernel with
+                // an un-split K.
+                if (!q_tuned) {
+                    q = 256;
+                }
                 while (q > 4 && UP_DIV(n / 16, q) < 32) {
                     q /= 2;
                 }
@@ -1121,6 +1188,23 @@ class MatMulBuffer : public BufferFactory {
             // all.
             if (!wide_disabled && !weight_byte && (n % 8 == 0) &&
                 (wide_forced || n >= wide_threshold_fp16)) {
+                // Search q DOWN from the shallowest split (256 == each lane
+                // accumulates the whole K, so no fold at all) instead of up
+                // from 16: the block floor is the ONLY reason to split K, so
+                // take the least split that clears it. This is a large win
+                // exactly where the weight outgrows cache and a loss nowhere
+                // else -- ARL, interleaved min-of-8 on bench_matmul, then the
+                // real model: K=2048/N=151936 15.9 -> 9.2 ms, and the model's
+                // own /lm_head/MatMul 17.6 -> 8.7 ms (-51%) for -11% on a
+                // decode round with byte-identical output (N=32768..65536 gain
+                // 9-35%; small cache-resident shapes flat). The old search
+                // started at 16 and only ever halved, so it never reached any
+                // of that. Shallow K is the one exception -- K=512/N=151936
+                // regressed 23% at q=256 -- so below k=1024 keep the old
+                // start. VKOP_KSPLIT_Q still pins q outright.
+                if (!q_tuned) {
+                    q = (k >= 1024) ? 256 : 16;
+                }
                 while (q > 4 && UP_DIV(n / 8, q) < 32) {
                     q /= 2;
                 }
