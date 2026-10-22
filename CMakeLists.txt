@@ -320,6 +320,32 @@ add_custom_command(
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_W8WIDE})
 
+# Two 512-lane split-K builds of buffer/matmul.comp (VKOP_KSPLIT512=1 host
+# switch): the ksplit-only general module and the int8 WIDE module. Same source
+# and push constants as the 256-lane builds; only local_size (32x16), the
+# KS_LANES slice depth and the entry differ. Host probes each key and falls
+# back to the 256-lane pipeline where the driver or the model archive refuses.
+set(SPIRV_FILE_KS512 ${SPIRV_DIR}/buffer_matmul_ksplit512_fp16.spv)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_KS512}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_KS512} -DFP16 -DKSPLIT512
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (512-lane ksplit, fp16) to SPIR-V"
+)
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS512})
+set(SPIRV_FILE_KS512_W8WIDE ${SPIRV_DIR}/buffer_matmul_ksplit512_w8_wide_fp16.spv)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_KS512_W8WIDE}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_KS512_W8WIDE} -DFP16 -DW8_WIDE -DKSPLIT512
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (512-lane int8 WIDE, fp16) to SPIR-V"
+)
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS512_W8WIDE})
+
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #
@@ -353,6 +379,11 @@ endforeach()
 list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_w8_wide_fp16:${SPIRV_FILE_W8WIDE})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_W8WIDE})
+# Same story for the two 512-lane split-K builds above.
+list(APPEND ARCHIVE_ARGS
+     --spv buffer_matmul_ksplit512_fp16:${SPIRV_FILE_KS512}
+     --spv buffer_matmul_ksplit512_w8_wide_fp16:${SPIRV_FILE_KS512_W8WIDE})
+list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
 
 set(VKOP_SHADER_ARCHIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.bin)
 add_custom_command(

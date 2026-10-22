@@ -135,6 +135,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # lazily only for a byte weight with N >= 896 and one A row, which the
         # converter cannot know, so it ships with every MatMul.
         "buffer_matmul_w8_wide_fp16",
+        # The 512-lane split-K GEMV builds of the same file (-DKSPLIT512,
+        # VKOP_KSPLIT512=1 host switch): ksplit-only general module plus the
+        # int8 WIDE module. Probed lazily like the WIDE one; each falls back
+        # to the 256-lane kernel where the driver or this archive refuses.
+        "buffer_matmul_ksplit512_fp16",
+        "buffer_matmul_ksplit512_w8_wide_fp16",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",

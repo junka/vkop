@@ -33,7 +33,23 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #endif
 
+#ifdef KSPLIT512
+layout(local_size_x = 32, local_size_y = 16, local_size_z = 1) in;
+#else
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+#endif
+// Lane geometry of the split-K GEMV kernels: KSG is local_size_x, KS_LANES the
+// block's total lane count. The -DKSPLIT512 build keeps ksplit_q's column
+// coverage and doubles the K-slice depth (KS_LANES / q slices instead of
+// 256 / q) — same experiment as raising ksplit_q, without changing the grid.
+// Default is the historical 256-lane block.
+#ifdef KSPLIT512
+#define KSG 32
+#define KS_LANES 512
+#else
+#define KSG 16
+#define KS_LANES 256
+#endif
 
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
@@ -517,7 +533,9 @@ void ks_store(vec4 s, int row, int ja) {
 //   slice = lane / ksplit_q        (which slice of K it accumulates)
 // so ksplit_q is a pure occupancy knob: it sets both how many column quads a
 // block covers (grid x = N/4/ksplit_q) and how deep K is cut (ksplit_q *
-// n_slice == 256). The original 16x16 form is ksplit_q == 16. Decode is one A
+// n_slice == KS_LANES: 256 lanes, or 512 in the -DKSPLIT512 build -- see the
+// VKOP_KSPLIT512 note in ops/Matmul.hpp). The original 16x16 form is
+// ksplit_q == 16. Decode is one A
 // row, so the column-parallel kernels leave 15 of every 16 lanes idle; putting
 // them on K is the whole point, and the narrow-N projections need the extra
 // blocks more than they need the extra K depth -- at q = 16 down_proj (N=896)
@@ -525,14 +543,14 @@ void ks_store(vec4 s, int row, int ja) {
 //
 // The partials fold through one flat shared array indexed slice*ksplit_q +
 // quad; a runtime stride into shared is legal, and it keeps the fold code
-// identical for every q (the array is sized for the 256-lane block, so the
-// q == 4 case uses it exactly).
-shared vec4 ks_flat[256];
+// identical for every q (the array is sized for the KS_LANES-lane block, so
+// the q == 4 case uses it exactly).
+shared vec4 ks_flat[KS_LANES];
 
 void ks_store_flat(vec4 s, int row, int ja) {
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int quad = lane % q;
     int slice = lane / q;
     ks_flat[slice * q + quad] = s;
@@ -557,9 +575,9 @@ void ks_store_flat(vec4 s, int row, int ja) {
 void matmul16_w8_ksplit() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int quad = lane % q;
     int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
@@ -656,9 +674,9 @@ void matmul16_w4_ksplit() {
 void matmul16_ksplit() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int quad = lane % q;
     int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
@@ -731,23 +749,23 @@ void matmul16_ksplit() {
 //   oct   = lane % ksplit_q      (which 8-column group this lane owns)
 //   slice = lane / ksplit_q      (which slice of K it accumulates)
 // so a block covers ksplit_q * 8 columns and 256 / ksplit_q K slices.
-shared vec4 ks_w[512];
+shared vec4 ks_w[2 * KS_LANES];
 
 void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int oct = lane % q;
     int slice = lane / q;
     ks_w[slice * q + oct] = s0;
-    ks_w[256 + slice * q + oct] = s1;
+    ks_w[KS_LANES + slice * q + oct] = s1;
     barrier();
     if (lane >= q) return;
     vec4 v0 = ks_w[oct];
-    vec4 v1 = ks_w[256 + oct];
+    vec4 v1 = ks_w[KS_LANES + oct];
     for (int t = 1; t < n_slice; ++t) {
         v0 += ks_w[t * q + oct];
-        v1 += ks_w[256 + t * q + oct];
+        v1 += ks_w[KS_LANES + t * q + oct];
     }
     if (c >= uPC.N) return;
     int out_idx = row * uPC.N + c;
@@ -760,9 +778,9 @@ void ks_store_wide(vec4 s0, vec4 s1, int row, int c) {
 void matmul16_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int oct = lane % q;
     int ja = (int(gl_WorkGroupID.x) * q + oct) * 8;
     int n = row / uPC.M;
@@ -835,30 +853,30 @@ void matmul16_ksplit_wide() {
 //   s3 = cols [ja+12 .. ja+15](w.w)
 // The host picks this only when N % 16 == 0 and dispatches UP_DIV(n/16, q)
 // blocks. ks_store_wide_w8 applies the per-column int8 scale before packing.
-shared vec4 ks_w_w8[1024];
+shared vec4 ks_w_w8[4 * KS_LANES];
 
 void ks_store_wide_w8(vec4 s0, vec4 s1, vec4 s2, vec4 s3, int row, int c) {
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int oct = lane % q;
     int slice = lane / q;
     int base = slice * q + oct;
     ks_w_w8[base] = s0;
-    ks_w_w8[256 + base] = s1;
-    ks_w_w8[512 + base] = s2;
-    ks_w_w8[768 + base] = s3;
+    ks_w_w8[KS_LANES + base] = s1;
+    ks_w_w8[2 * KS_LANES + base] = s2;
+    ks_w_w8[3 * KS_LANES + base] = s3;
     barrier();
     if (lane >= q) return;
     vec4 v0 = ks_w_w8[oct];
-    vec4 v1 = ks_w_w8[256 + oct];
-    vec4 v2 = ks_w_w8[512 + oct];
-    vec4 v3 = ks_w_w8[768 + oct];
+    vec4 v1 = ks_w_w8[KS_LANES + oct];
+    vec4 v2 = ks_w_w8[2 * KS_LANES + oct];
+    vec4 v3 = ks_w_w8[3 * KS_LANES + oct];
     for (int t = 1; t < n_slice; ++t) {
         v0 += ks_w_w8[t * q + oct];
-        v1 += ks_w_w8[256 + t * q + oct];
-        v2 += ks_w_w8[512 + t * q + oct];
-        v3 += ks_w_w8[768 + t * q + oct];
+        v1 += ks_w_w8[KS_LANES + t * q + oct];
+        v2 += ks_w_w8[2 * KS_LANES + t * q + oct];
+        v3 += ks_w_w8[3 * KS_LANES + t * q + oct];
     }
     if (c >= uPC.N) return;
     // Per-column int8 dequant scale, applied after the K-reduction (scales
@@ -899,9 +917,9 @@ void ks_store_wide_w8(vec4 s0, vec4 s1, vec4 s2, vec4 s3, int row, int c) {
 void matmul16_w8_ksplit_wide() {
     int row = int(gl_WorkGroupID.y);
     if (row >= uPC.batch * uPC.M) return;
-    int lane = int(gl_LocalInvocationID.y) * 16 + int(gl_LocalInvocationID.x);
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
     int q = uPC.ksplit_q;
-    int n_slice = 256 / q;
+    int n_slice = KS_LANES / q;
     int oct = lane % q;
     int ja = (int(gl_WorkGroupID.x) * q + oct) * 16;
     int n = row / uPC.M;
@@ -1587,6 +1605,22 @@ void matmul32() {
 // in ops/Matmul.hpp. Same bindings, push constants and workgroup as the general
 // module, so only the pipeline it is bound to differs.
 void main() { matmul16_w8_ksplit_wide(); }
+#elif defined(KSPLIT512)
+// The -DKSPLIT512 build: a ksplit-only 512-lane module (local_size 32x16,
+// KS_LANES above). Its host selects it with VKOP_KSPLIT512=1 only for
+// non-w4 ksplit dispatches, so anything else reaching here is a host bug;
+// return without writing rather than run a 256-lane kernel's lane math on a
+// 512-lane block (w4's ks_part indexing would run off the array).
+void main() {
+    if (uPC.ksplit == 0 || uPC.w4 != 0) return;
+    if (uPC.weight_int8 != 0) {
+        matmul16_w8_ksplit();
+    } else if (uPC.wide != 0) {
+        matmul16_ksplit_wide();
+    } else {
+        matmul16_ksplit();
+    }
+}
 #else
 void main() {
 #ifdef FP16
@@ -1659,4 +1693,4 @@ void main() {
     matmul32();
 #endif
 }
-#endif  // W8_WIDE
+#endif  // W8_WIDE / KSPLIT512 / general module

@@ -162,6 +162,7 @@ host 选路按 `attn_softmax → coopmat_i8(默认关) → coopmat → tiled →
 | `VKOP_KSPLIT_Q=<n>` | 覆盖 ksplit 的列-quad 数（调优用） |
 | `VKOP_KSPLIT_WIDE=0/1` | 关/强制 WIDE |
 | `VKOP_KSPLIT_WIDE_N=<n>` | 设 fp16+byte 两个 WIDE 阈值 |
+| `VKOP_KSPLIT512=1` | ksplit 走 512-lane 变体（同 q、K 切深翻倍；探测失败自动回落 256-lane） |
 | `VKOP_SUBMIT_PROF=1` | 每个 op 的 GPU 时间戳查询（权威） |
 | `VKOP_OPPROF=1` | record 侧 wall time |
 
@@ -370,6 +371,8 @@ Tuning/diagnostic switches:
 | `VKOP_KSPLIT_Q=<n>` | override ksplit column-quad count (tuning) |
 | `VKOP_KSPLIT_WIDE=0/1` | disable/force WIDE |
 | `VKOP_KSPLIT_WIDE_N=<n>` | set both WIDE auto thresholds |
+| `VKOP_KSPLIT512=1` | route ksplit through the 512-lane build (same q, double K-slice depth; falls back to 256-lane on any refusal) |
+| `VKOP_KSPLIT_FLOOR=<n>` | block floor the int8 q search insists on (default 8; raise to split K deeper) |
 | `VKOP_SUBMIT_PROF=1` | per-op GPU timestamp queries (authoritative) |
 | `VKOP_OPPROF=1` | record-side wall time |
 

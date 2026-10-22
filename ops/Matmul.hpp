@@ -1079,6 +1079,31 @@ class MatMulBuffer : public BufferFactory {
                     q_tuned = true;
                 }
             }
+            // The occupancy floor the q search below insists on: how many
+            // workgroups the row's N must still launch after splitting K.
+            // It is the ONLY reason to split K at all, so a floor that is too
+            // high is not free -- it buys block count with shorter per-lane
+            // chunks, and the byte GEMV is chunk-bound well before it is
+            // block-bound. 8 was measured against 4/16/32 on int8 K=896
+            // (560X, min-of-3, BENCH_INT8=1): mid-N wins 20-54% and
+            // N >= 32768 is flat, because there the floor no longer binds
+            // (q = 256 already clears it) and only chunk length decides.
+            //   N=4864  0.152/0.127/0.180/0.158 ms for floor 4/8/16/32
+            //   N=8192  0.243/0.133/0.271/0.287
+            //   N=16384 0.411/0.260/0.258/0.515
+            //   N=32768..151936: min-of-5 differences <= 0.8%, i.e. noise.
+            // floor 16 is the trap: it lands on chunk 112 at N=8192 (0.271)
+            // and chunk 224 at N=16384 (0.258), so only 8 covers both.
+            // VKOP_KSPLIT_FLOOR exists to re-measure this on another device;
+            // 8 is the default.
+            const int ksplit_floor = [] {
+                const char *e = std::getenv("VKOP_KSPLIT_FLOOR");
+                if (e == nullptr) {
+                    return 8;
+                }
+                const int v = std::atoi(e);
+                return (v >= 1) ? v : 8;
+            }();
             // fp16 WIDE split-K GEMV: each lane owns 8 columns (one uvec4
             // 16-byte load, two vec4 accumulator chains) vs the standard
             // 4-column/word-load ksplit. WIDE wins on BIG-N GEMVs (lm_head,
@@ -1140,48 +1165,58 @@ class MatMulBuffer : public BufferFactory {
             // pipeline() returns null where the driver refuses the kernel, and
             // the GEMV then falls through to the 4-column split-K kernel below
             // instead of taking the whole MatMul down with a failed dispatch.
-            VulkanPipeline *wide_pipe =
-                (!wide_disabled && weight_byte && (n % 16 == 0) &&
-                 (wide_forced || n >= wide_threshold_byte))
-                    ? w8_wide_pipeline()
-                    : nullptr;
+            // VKOP_KSPLIT512=1 first tries the 512-lane build of the same
+            // module (same ksplit_q coverage, twice the K-slice depth), still
+            // falling back downward on any refusal.
+            const bool ks512 = ksplit512_on() && !weight_4bit;
+            VulkanPipeline *wide_pipe = nullptr;
+            if (!wide_disabled && weight_byte && (n % 16 == 0) &&
+                (wide_forced || n >= wide_threshold_byte)) {
+                wide_pipe = w8_wide_pipeline();
+                if (ks512) {
+                    if (VulkanPipeline *p = secondary_pipeline(
+                            1, "buffer_matmul_ksplit512_w8_wide_fp16",
+                            w8_wide512_pipeline_, w8_wide512_ds_)) {
+                        wide_pipe = p;
+                    }
+                }
+            }
             if (wide_pipe != nullptr) {
-                // Same search-direction fix as the fp16 WIDE branch below, and
-                // for the same reason: the 32-block floor is the only reason to
-                // split K, so start at the shallowest split and let the floor
-                // walk it down. The byte kernel is 16 cols/lane, so the rule
-                // picks the largest q with UP_DIV(n/16, q) >= 32, i.e. n >
-                // 496q; the old search capped that at 16, so every n <= 15872
-                // lands on exactly the q it used to and the two rules only part
-                // company from n = 15873 up. Measured on ARL, interleaved
-                // min-of-5 on bench_matmul in int8 weight mode (BENCH_INT8=1),
-                // so these are pure byte-WIDE GEMVs: K=2048/N=131072 11.2
-                // -> 4.1 ms (-64%), N=65536 4.9 -> 2.2 (-55%),
+                // Start at the shallowest split (256 == each lane accumulates
+                // the whole K, so no fold at all) and let the block floor walk
+                // it down: the floor is the only reason to split K, so take the
+                // least split that clears it. The byte kernel is 16 cols/lane,
+                // so the rule picks the largest q with UP_DIV(n/16, q) >=
+                // ksplit_floor. The old search both started at 16 (so it could
+                // never reach the shallow split) and used a 32-block floor (so
+                // mid-N rows got a K split they did not need); see the floor's
+                // definition above for the measurements behind 8. Measured on
+                // ARL, interleaved min-of-5 on bench_matmul in int8 weight mode
+                // (BENCH_INT8=1), the direction fix alone is K=2048/N=131072
+                // 11.2 -> 4.1 ms (-64%), N=65536 4.9 -> 2.2 (-55%),
                 // K=4096/N=65536 10.7 -> 4.1 (-62%), K=8192/N=32768 9.7 -> 4.1
-                // (-58%). Below N = 16384 the auto pick lands on q = 16, the
-                // old default, so those shapes change at most by noise (N =
-                // 16384: 0.62 -> 0.58 ms; N = 32768: 1.06 -> 1.03) -- quote no
-                // gradient there, the run-to-run spread on a 1 ms GEMV is
-                // larger than the effect. The byte WIDE path
-                // auto-covers n >= 896 and returns, so in practice this only
-                // bites where the driver refuses the WIDE pipeline
-                // (w8_wide_pipeline() returns null) or the row's n is not
-                // 16-aligned -- both of which then run the 4-column kernel with
-                // an un-split K.
+                // (-58%). The floor relaxation is what pays below N = 32768.
+                // The byte WIDE path auto-covers n >= 896 and returns, so in
+                // practice the fall-through below only bites where the driver
+                // refuses the WIDE pipeline (w8_wide_pipeline() returns null)
+                // or the row's n is not 16-aligned -- both of which then run
+                // the 4-column kernel with an un-split K.
                 if (!q_tuned) {
                     q = 256;
+                    while (q > 4 && UP_DIV(n / 16, q) < ksplit_floor) {
+                        q /= 2;
+                    }
                 }
-                while (q > 4 && UP_DIV(n / 16, q) < 32) {
-                    q /= 2;
-                }
+                // A pinned q (VKOP_KSPLIT_Q) is a true override: the floor must
+                // not walk it back, or floor and pin cannot be measured
+                // independently.
                 para_.wide = 1;
                 para_.ksplit_q = q;
-                fillDescriptorWrites(w8_wide_ds_[m_id_]);
-                wide_pipe->updateDescriptorSets(ds_writes_);
-                m_cmd_->bind(*wide_pipe, w8_wide_ds_[m_id_]);
-                m_cmd_->push_constants(*wide_pipe,
-                                       sizeof(matmul::GpuMatMulParam), &para_);
-                m_cmd_->dispatch(UP_DIV(n / 16, q), batch * m, 1);
+                dispatch_on(wide_pipe,
+                            wide_pipe == w8_wide512_pipeline_.get()
+                                ? w8_wide512_ds_[m_id_]
+                                : w8_wide_ds_[m_id_],
+                            UP_DIV(n / 16, q), batch * m);
                 return;
             }
             // fp16 WIDE: auto per-N (n >= wide_threshold_fp16) or forced on
@@ -1210,6 +1245,15 @@ class MatMulBuffer : public BufferFactory {
                 }
                 para_.wide = 1;
                 para_.ksplit_q = q;
+                if (ks512) {
+                    if (VulkanPipeline *p = secondary_pipeline(
+                            0, "buffer_matmul_ksplit512_fp16",
+                            ksplit512_pipeline_, ksplit512_ds_)) {
+                        dispatch_on(p, ksplit512_ds_[m_id_], UP_DIV(n / 8, q),
+                                    batch * m);
+                        return;
+                    }
+                }
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             }
@@ -1223,6 +1267,15 @@ class MatMulBuffer : public BufferFactory {
                 q /= 2;
             }
             para_.ksplit_q = q;
+            if (ks512) {
+                if (VulkanPipeline *p = secondary_pipeline(
+                        0, "buffer_matmul_ksplit512_fp16", ksplit512_pipeline_,
+                        ksplit512_ds_)) {
+                    dispatch_on(p, ksplit512_ds_[m_id_], UP_DIV(n / 4, q),
+                                batch * m);
+                    return;
+                }
+            }
             submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
             return;
         }
@@ -1334,6 +1387,90 @@ class MatMulBuffer : public BufferFactory {
         return w8_wide_pipeline_.get();
     }
 
+    // VKOP_KSPLIT512=1: route split-K GEMV dispatches through the 512-lane
+    // builds of the ksplit kernels (local_size 32x16, KS_LANES = 512: the same
+    // ksplit_q column coverage, twice the K-slice depth per block). This is
+    // the no-subgroup probe for the shared-memory fold's cost -- deeper slices
+    // per block without touching the grid. Each 512 pipeline is probed on
+    // first use like w8_wide_pipeline and falls back to the 256-lane path
+    // when the driver refuses it or the model archive lacks the key, so the
+    // switch can never take a MatMul down. w4 is excluded on the host (its
+    // 16x16 kernel is not in the 512 module) and again in the shader.
+    static bool ksplit512_on() {
+        static const bool on = [] {
+            const char *e = std::getenv("VKOP_KSPLIT512");
+            return e != nullptr && e[0] == '1';
+        }();
+        return on;
+    }
+
+    // Shared probe/build for the two 512-lane keys. id pins the process-wide
+    // verdict (0 = ksplit-only module, 1 = int8 WIDE module) so a device
+    // refusal or a missing-archive-bytes answer is reached once per process,
+    // not once per MatMul instance.
+    VulkanPipeline *secondary_pipeline(int id, const char *key,
+                                       std::unique_ptr<VulkanPipeline> &slot,
+                                       VkDescriptorSet *ds_slot) {
+        static bool no_bytes[2] = {false, false};
+        static bool refused[2] = {false, false};
+        static bool warned_missing[2] = {false, false};
+        if (slot) {
+            return slot.get();
+        }
+        if (no_bytes[id] || refused[id]) {
+            return nullptr;
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(key);
+        } catch (const std::exception &e) {
+            no_bytes[id] = true;
+            if (!warned_missing[id]) {
+                warned_missing[id] = true;
+                std::fprintf(stderr,
+                             "[vkop] %s\n[vkop] ksplit512 stays on the 256-"
+                             "lane kernels until that key is shipped\n",
+                             e.what());
+            }
+            return nullptr;
+        }
+        try {
+            slot = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0);
+            for (int i = 0; i < vkop::kInflight; ++i) {
+                ds_slot[i] = slot->allocDescriptorSets();
+            }
+        } catch (const std::exception &e) {
+            refused[id] = true;
+            slot.reset();
+            std::fprintf(stderr,
+                         "[vkop] %s pipeline rejected (%s); ksplit512 stays "
+                         "on the 256-lane kernels\n",
+                         key, e.what());
+            return nullptr;
+        }
+        return slot.get();
+    }
+
+    // Bind + push + dispatch on a secondary ksplit pipeline (same 7-binding
+    // layout and push constants as the wide path above).
+    void dispatch_on(VulkanPipeline *pipe, VkDescriptorSet ds, int gx, int gy) {
+        fillDescriptorWrites(ds);
+        pipe->updateDescriptorSets(ds_writes_);
+        m_cmd_->bind(*pipe, ds);
+        m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam), &para_);
+        m_cmd_->dispatch(gx, gy, 1);
+    }
+
     // Fill descriptor-set writes from the current objs_ vector (one SSBO per
     // binding). Used by the fp16 cooperative-matrix dispatch path, which binds
     // its own pipeline (coop_pipeline_) instead of the base Operator::submit().
@@ -1384,6 +1521,13 @@ class MatMulBuffer : public BufferFactory {
     // w8_wide_pipeline.
     std::unique_ptr<VulkanPipeline> w8_wide_pipeline_;
     VkDescriptorSet w8_wide_ds_[vkop::kInflight] = {nullptr};
+    // The 512-lane split-K modules (VKOP_KSPLIT512=1), probed through
+    // secondary_pipeline(): the ksplit-only general module and the int8 WIDE
+    // module, both -DKSPLIT512 builds of shaders/buffer/matmul.comp.
+    std::unique_ptr<VulkanPipeline> ksplit512_pipeline_;
+    VkDescriptorSet ksplit512_ds_[vkop::kInflight] = {nullptr};
+    std::unique_ptr<VulkanPipeline> w8_wide512_pipeline_;
+    VkDescriptorSet w8_wide512_ds_[vkop::kInflight] = {nullptr};
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
     // 4-column kernel; another MatMul from a reconverted model still tries.
     bool w8_wide_no_bytes_ = false;
