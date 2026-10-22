@@ -50,6 +50,21 @@ class VMA {
 
     static void *getMappedMemory(struct VmaBuffer *buf);
 
+    // Host -> device visibility for direct mapped access. The staging pool
+    // can land on HOST_CACHED memory WITHOUT HOST_COHERENT (VMA's
+    // HOST_ACCESS_RANDOM prefers cached; e.g. Intel exposes HOST_CACHED and
+    // HOST_COHERENT as two separate types), where staging writes are not
+    // automatically visible to device copies. No-op on HOST_COHERENT memory;
+    // otherwise flushes exactly the [offset, offset+size) range.
+    static void flushAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
+                                VkDeviceSize size);
+
+    // Device -> host visibility for the same range after a D2H copy: must be
+    // called after the copy's wait and before host reads of the mapped
+    // pointer. No-op on HOST_COHERENT memory.
+    static void invalidateAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
+                                     VkDeviceSize size);
+
     // Bytes actually reserved for this image's allocation: the driver's padded
     // requirement, possibly rounded up again by the pool. Always >= the image's
     // packed texel count, so it is the only honest number for footprint

@@ -133,11 +133,18 @@ VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         // alloc_info.pool = storage_pool_;
     } else {
+        // Staging pool serves BOTH directions: H2D upload writes and D2H
+        // readback reads (memcpy out of the mapped pointer in
+        // Tensor::copyBufferToCPU). HOST_ACCESS_RANDOM makes VMA prefer
+        // HOST_CACHED system memory. The previous SEQUENTIAL_WRITE +
+        // ALLOW_TRANSFER_INSTEAD combo steered VMA to uncached,
+        // write-combined DEVICE_LOCAL memory (BAR on dGPUs) — good for pure
+        // writes, disastrous for every readback memcpy. ALLOW_TRANSFER_INSTEAD
+        // was also invalid here: VMA may hand back non-host-visible memory,
+        // which this pool maps and dereferences directly.
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO;
-        alloc_info.flags =
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT |
-            VMA_ALLOCATION_CREATE_HOST_ACCESS_ALLOW_TRANSFER_INSTEAD_BIT |
-            VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        alloc_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT |
+                           VMA_ALLOCATION_CREATE_MAPPED_BIT;
         // alloc_info.pool = staging_pool_;
     }
     buf->allocator = allocator_;
@@ -164,6 +171,18 @@ void *VMA::getMappedMemory(struct VmaBuffer *buf) {
     VmaAllocationInfo info;
     vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);
     return info.pMappedData;
+}
+
+void VMA::flushAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
+                          VkDeviceSize size) {
+    // vmaFlushAllocation is a no-op on HOST_COHERENT memory types; the
+    // explicit call only costs a branch there.
+    vmaFlushAllocation(buf->allocator, buf->allocation, offset, size);
+}
+
+void VMA::invalidateAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
+                               VkDeviceSize size) {
+    vmaInvalidateAllocation(buf->allocator, buf->allocation, offset, size);
 }
 
 void VMA::destroyBuffer(struct VmaBuffer *buf) {

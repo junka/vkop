@@ -120,6 +120,10 @@ class VulkanBuffer : public VulkanResource {
 #endif
     };
 
+#ifdef USE_VMA
+    VMA::VmaBuffer *getVmaBuffer() { return &m_vma_buffer_; }
+#endif
+
     void unmapMemory() {
         // VMA_ALLOCATION_CREATE_MAPPED_BIT already keeps the memory mapped, so
         // we don't need to unmap it.

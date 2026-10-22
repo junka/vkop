@@ -1115,6 +1115,7 @@ template <typename T> class Tensor : public ITensor {
             } else {
                 memcpy(static_cast<T *>(b->ptr), src, imagesize);
             }
+            stpool->flush(*b);
             cmd.begin();
             img->copyBufferToImage(cmd.get(), b->buffer, b->offset);
             img->readBarrier(cmd.get());
@@ -1496,6 +1497,10 @@ template <typename T> class Tensor : public ITensor {
                 }
             }
         }
+        // Staging may be cached-but-non-coherent: the GPU copy must observe
+        // these bytes. In batch mode the caller submits later — flushing at
+        // write time is still correct (every flush precedes that submit).
+        stpool->flush(*b);
         std::shared_ptr<VulkanBuffer> buffer;
         size_t offset = 0;
         if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
@@ -1571,6 +1576,7 @@ template <typename T> class Tensor : public ITensor {
                     memcpy(part->ptr, bytes + done, payload);
                 }
             }
+            stpool->flush(*part);
             cmd.begin();
             buffer->copyStageBufferToBuffer(
                 cmd.get(), part->buffer, part->offset, n, base_offset + done);
@@ -1658,6 +1664,10 @@ template <typename T> class Tensor : public ITensor {
         cmd.end();
         cmd.submit(dev->getComputeQueue());
         cmd.wait();
+        // Device->host visibility: the copy wrote through non-coherent cached
+        // memory (when the pool landed there); drop stale cache lines before
+        // the host reads.
+        stpool->invalidate(*b);
         if constexpr (std::is_same_v<T, uint16_t>) {
             // diagnostic print silenced during LLM numerics debug
         }
@@ -1715,6 +1725,7 @@ template <typename T> class Tensor : public ITensor {
             cmd.end();
             cmd.submit(dev->getComputeQueue());
             cmd.wait();
+            stpool->invalidate(*b);
             convertRGBAToTensor(static_cast<T *>(b->ptr));
             stpool->reset();
         }

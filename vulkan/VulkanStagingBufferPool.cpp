@@ -40,6 +40,12 @@ bool VulkanStagingBufferPool::resizeBuffer(size_t newSize) {
     auto new_buffer = std::make_unique<VulkanBuffer>(
         m_vdev_, newSize,
         VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+        // COHERENT stays a hard requirement: on devices where HOST_CACHED
+        // comes without it (e.g. Intel exposes exactly such a split), a
+        // required-CACHED mask would match no type at all. The cached
+        // preference is made inside VMA::createBuffer (HOST_ACCESS_RANDOM),
+        // and the lost coherence is made up for with the pool's
+        // flush()/invalidate() around every mapped staging access.
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
             VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
@@ -166,6 +172,36 @@ VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
     }
 
     return std::nullopt;
+}
+
+void VulkanStagingBufferPool::flush(const StagingAllocation &alloc) {
+#ifdef USE_VMA
+    VMA::flushAllocation(m_buffer_->getVmaBuffer(),
+                         static_cast<VkDeviceSize>(alloc.offset),
+                         static_cast<VkDeviceSize>(alloc.size));
+#else
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = m_buffer_->getMemory();
+    range.offset = alloc.offset;
+    range.size = alloc.size;
+    vkFlushMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
+#endif
+}
+
+void VulkanStagingBufferPool::invalidate(const StagingAllocation &alloc) {
+#ifdef USE_VMA
+    VMA::invalidateAllocation(m_buffer_->getVmaBuffer(),
+                              static_cast<VkDeviceSize>(alloc.offset),
+                              static_cast<VkDeviceSize>(alloc.size));
+#else
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = m_buffer_->getMemory();
+    range.offset = alloc.offset;
+    range.size = alloc.size;
+    vkInvalidateMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
+#endif
 }
 
 void VulkanStagingBufferPool::reset() {

@@ -196,6 +196,7 @@ std::shared_ptr<vkop::VulkanImage> createTexture(std::shared_ptr<VulkanDevice> d
 
     memcpy(b->ptr, pixels, image_size);
 
+    stpool->flush(*b);
     cmd.begin();
     texture->copyBufferToImage(cmd.get(), b->buffer, b->offset);
     texture->readBarrier(cmd.get());

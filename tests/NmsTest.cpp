@@ -65,6 +65,7 @@ public:
                 cmd.end();
                 cmd.submit(this->dev_->getComputeQueue());
                 cmd.wait();
+                stpool->invalidate(*b);
                 std::memcpy(&count, b->ptr, sizeof(uint32_t));
                 stpool->reset();
             }

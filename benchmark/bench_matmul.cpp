@@ -216,6 +216,25 @@ int main(int argc, char **argv) {
         double bytes = static_cast<double>(s.K) * s.N * 2; // fp16 weights
         printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s\n", s.name, s.K, s.N,
                ms, bytes / ms / 1e6);
+
+        // Staging D2H readback probe: the same copyToCPU path the runtime
+        // uses (GPU->staging copy, submit+wait, then a host memcpy out of the
+        // MAPPED STAGING POINTER). The GEMV number above never touches host
+        // memory, so this row is the one that moves when the staging pool's
+        // memory type changes (HOST_CACHED vs write-combined BAR). Min over
+        // reps; O holds a verified fp16 row of N elements.
+        double rb_ms = 1e9;
+        for (int r = 0; r < reps; ++r) {
+            auto rb0 = std::chrono::steady_clock::now();
+            O->copyToCPU(cmdpool);
+            auto rb1 = std::chrono::steady_clock::now();
+            rb_ms = std::min(rb_ms, std::chrono::duration<double, std::milli>(
+                                        rb1 - rb0)
+                                        .count());
+        }
+        double rb_bytes = static_cast<double>(s.N) * 2; // fp16 out row
+        printf("%-9s readback %6.0f kB: %8.4f ms  %7.2f GB/s\n", s.name,
+               rb_bytes / 1e3, rb_ms, rb_bytes / rb_ms / 1e6);
     }
     return 0;
 }

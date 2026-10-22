@@ -27,6 +27,13 @@ class VulkanStagingBufferPool {
     std::optional<StagingAllocation> allocate(size_t size,
                                               size_t alignment = 256);
 
+    // Host writes to `alloc` (upload staging) must be flushed before the GPU
+    // copy that consumes it is submitted; device writes into `alloc` (D2H
+    // readback) must be invalidated after the copy's wait and before host
+    // reads of alloc.ptr. No-ops when the pool's memory is HOST_COHERENT.
+    void flush(const StagingAllocation &alloc);
+    void invalidate(const StagingAllocation &alloc);
+
     void reset();
 
   private:
