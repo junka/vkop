@@ -3798,6 +3798,11 @@ class FusionOptimizer:
                 return "data"
             return "mask"
 
+        def _dim_ok(got, want):
+            """A recorded dim matches unless both are concrete and differ
+            (<= 0 is the symbolic/unknown sentinel)."""
+            return got <= 0 or want <= 0 or got == want
+
         matches = []
         for softmax_node in list(dag_model.nodes.values()):
             if softmax_node.op_type != "Softmax":
@@ -3933,6 +3938,29 @@ class FusionOptimizer:
             if (num_heads > 0 and num_kv_heads > 0
                     and num_heads % num_kv_heads != 0):
                 continue
+
+            # The fused kernel reads the additive bias as ONE flat [B,S,kv]
+            # block, indexed (b*S+s)*kv + j. Only a [B,1,S,kv] bias (which is
+            # what HF exports and what the drivers ResizeInput per round) or a
+            # batch-1 [S,kv] matrix lives in that layout. A per-head
+            # [B,H,S,kv] bias, a [1,1,1,kv] row broadcast, or anything else
+            # addresses the wrong element — or runs off the end — and no later
+            # pass can see it. Declining the fusion keeps the graph's own
+            # QK^T + mask Add, which is correct. (Dims the converter baked to
+            # 1 are placeholders the driver resizes at run time, so this
+            # compares the *recorded* dims; the runtime re-checks the real
+            # element count and both are non-negative-or-unknown.)
+            if mask_input is not None:
+                m_shape = list(mask_input.get("shape") or [])
+                ok = False
+                if len(m_shape) == 4:
+                    mb, mh, ms, mkv = m_shape
+                    ok = (mh in (1, -1, 0) and _dim_ok(mb, batch)
+                          and _dim_ok(ms, _seq) and _dim_ok(mkv, kv_len))
+                elif len(m_shape) == 2 and batch == 1:
+                    ok = _dim_ok(m_shape[0], _seq) and _dim_ok(m_shape[1], kv_len)
+                if not ok:
+                    continue
 
             nodes_to_delete = [matmul_qk, softmax_node, mm_v]
             for extra in (add_node, scale_node, transpose_k):

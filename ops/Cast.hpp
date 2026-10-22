@@ -71,6 +71,25 @@ class Cast : public BufferFactory {
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
 
+        // `to_` (ONNX's TensorProto id: 1 = fp32, 10 = fp16) and the output
+        // tensor's dtype must agree. The runtime sizes the output tensor from
+        // this same attribute and the mode selection below reads the tensor
+        // dtypes, so a disagreement means one of the two is stale — and the
+        // shader would then reinterpret the buffer at the wrong element
+        // stride. A third dtype (int64 indices, int8, bool) has no kernel at
+        // all: it must not fall through to a float word copy.
+        const int to_dtype = outputs[0]->dtype() == typeid(uint16_t) ? 10
+                             : outputs[0]->dtype() == typeid(float)  ? 1
+                                                                     : 0;
+        if (to_ != 0 && to_ != to_dtype) {
+            throw std::runtime_error(
+                std::string("Cast: the graph says to=") + std::to_string(to_) +
+                " but the output tensor is " +
+                core::elem_name(outputs[0]->elem_kind()) +
+                " (node's input is " + core::elem_name(inputs[0]->elem_kind()) +
+                "); only FLOAT and FLOAT16 are supported");
+        }
+
         // int64 -> fp32 cast (the rotary position-id Cast). int64 tensors are
         // CPU-resident during recording (shape-meta domain), so cast on the
         // host: read the int64 input, write fp32 values, resize + re-upload.
@@ -189,10 +208,21 @@ class Cast : public BufferFactory {
         // .to(fp16) on an already-fp16 tensor): plain half2 word copy;
         // picking 0/1 here reinterprets the buffer at the wrong element
         // stride and writes 2x the output bytes.
-        if (inputs[0]->dtype() == outputs[0]->dtype()) {
+        //
+        // Anything else is a conversion no kernel implements: the old code
+        // treated "not fp16" as fp32 and would have run the f32->f16 packing
+        // over, say, an int8 buffer.
+        const auto &idt = inputs[0]->dtype();
+        if (idt != typeid(float) && idt != typeid(uint16_t)) {
+            throw std::runtime_error(
+                std::string("Cast: no kernel converts from ") +
+                core::elem_name(inputs[0]->elem_kind()) +
+                " (only fp32<->fp16, plus the int64->fp32 host path)");
+        }
+        if (idt == outputs[0]->dtype()) {
             pc.mode = 2;
         } else {
-            pc.mode = (inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
+            pc.mode = (idt == typeid(uint16_t)) ? 1 : 0;
         }
         pc.total = total;
         submit(&pc, UP_DIV((total + 1) / 2, 256), 1, 1);

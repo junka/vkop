@@ -158,6 +158,51 @@ void check_initializer_payload(const load::Initializer &init, ElemKind kind,
                                  " bytes past the initializer blob");
     }
 }
+
+// ONNX TensorProto DataType -> the name Cast's `to` attribute carries, for
+// diagnostics only. Kept next to check_initializer_payload because both exist
+// to turn a file whose contents disagree with its own metadata into a message
+// that names the offending value.
+const char *onnx_type_name(int t) {
+    switch (t) {
+    case 1:
+        return "FLOAT";
+    case 2:
+        return "UINT8";
+    case 3:
+        return "INT8";
+    case 4:
+        return "UINT16";
+    case 5:
+        return "INT16";
+    case 6:
+        return "INT32";
+    case 7:
+        return "INT64";
+    case 9:
+        return "BOOL";
+    case 10:
+        return "FLOAT16";
+    case 11:
+        return "DOUBLE";
+    case 12:
+        return "UINT32";
+    case 13:
+        return "UINT64";
+    case 16:
+        return "BFLOAT16";
+    case 17:
+        return "FLOAT8E4M3FN";
+    case 19:
+        return "FLOAT8E5M2";
+    case 22:
+        return "INT4";
+    case 23:
+        return "FLOAT4E2M1";
+    default:
+        return nullptr;
+    }
+}
 } // namespace
 
 // Which archive key this node's op should be looked up under. The .vkopbin
@@ -897,10 +942,29 @@ void Runtime::LoadModel() {
                         if (it != n.attributes.end()) {
                             to = std::stoi(it->second);
                         }
+                        // Only the two float widths have a kernel (the shader
+                        // does fp32<->fp16 words; Cast::execute adds the
+                        // int64->fp32 host path). Allocating anything else —
+                        // notably ONNX's default int64 indices — as fp32
+                        // would hand every consumer a tensor whose container
+                        // disagrees with its declared dtype. That is the one
+                        // thing a wrong `to` cannot be allowed to do quietly.
                         if (to == 10) { // fp16
                             dtype_marker = "_f16_";
-                        } else {
+                        } else if (to == 1) { // fp32
                             dtype_marker = "_f32_";
+                        } else {
+                            const char *name = onnx_type_name(to);
+                            throw std::runtime_error(
+                                "vkop: Cast to " +
+                                (name != nullptr ? std::string(name)
+                                                 : std::string("elem_type ")) +
+                                (name != nullptr
+                                     ? "(" + std::to_string(to) + ")"
+                                     : std::to_string(to)) +
+                                " in node '" + n.name +
+                                "' is not supported (only FLOAT and FLOAT16 "
+                                "have a conversion kernel)");
                         }
                     } else if (type == vkop::ops::OpType::QUANTIZE_LINEAR) {
                         // fp16/fp32 -> int8/uint8/fp8 bytes: the output is an

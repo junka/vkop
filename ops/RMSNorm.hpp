@@ -63,10 +63,35 @@ class RMSNormBuffer : public BufferFactory {
         int ax = axis_;
         if (ax < 0)
             ax += rank;
+        // The range check has to precede the loop below: a still-negative ax
+        // (an axis more negative than -rank) would index shape[] out of bounds
+        // there, before any later check could fire.
+        if (ax < 0 || ax >= rank) {
+            throw std::runtime_error(std::string("RMSNorm: axis ") +
+                                     std::to_string(axis_) +
+                                     " is out of range for a rank-" +
+                                     std::to_string(rank) + " input");
+        }
         // Normalize over dims [axis, rank). inner_size = product of those.
         int inner_size = 1;
         for (int d = ax; d < rank; ++d) {
             inner_size *= shape[d];
+        }
+        // A zero/negative product would divide by zero in outer_size and
+        // submit a nonsense grid; a -1 sentinel reaching here is the same class
+        // of bug, not a shape RMSNorm can serve.
+        if (inner_size <= 0) {
+            throw std::runtime_error(
+                std::string("RMSNorm: axis ") + std::to_string(axis_) +
+                " over a rank-" + std::to_string(rank) +
+                " input gives an empty normalization slice");
+        }
+        // Same packed-half2 contract as LayerNorm (rmsnorm.comp states it only
+        // in a comment): an odd slice starts mid-word, so its last half would
+        // share a word with the neighbouring slice.
+        if (fp16_ == 1 && (inner_size % 2) != 0) {
+            throw std::runtime_error(
+                "RMSNorm fp16: odd inner_size straddles packed half2 words");
         }
         int outer_size = total / inner_size;
 

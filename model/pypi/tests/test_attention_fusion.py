@@ -215,7 +215,7 @@ def test_scale_outside_mask_add_declined():
                             [tdict("mm_out", [1, 4, 5, 64])])
     m.nodes["ADD"] = Node("Add", "ADD", {},
                           [tdict("mm_out", [1, 4, 5, 64]),
-                           tdict("att_mask", [1, 1, 5, 64])],
+                           tdict("att_mask", [1, 1, 5, 5])],
                           [tdict("biased", [1, 4, 5, 64])])
     m.nodes["MUL"] = Node("Mul", "MUL", {},
                           [tdict("biased", [1, 4, 5, 64]), tdict("scale_const", [])],
@@ -239,9 +239,11 @@ def test_add_around_div_folds():
     m.nodes["DIV"] = Node("Div", "DIV", {},
                           [tdict("mm_out", [1, 4, 5, 64]), tdict("sqrt_d", [])],
                           [tdict("scaled", [1, 4, 5, 64])])
+    # [B,1,S,kv] — kv is the KV length (5), not the head dim (64). The kernel
+    # reads the bias as one flat [B,S,kv] block, so the last axis has to be kv.
     m.nodes["ADD"] = Node("Add", "ADD", {},
                           [tdict("scaled", [1, 4, 5, 64]),
-                           tdict("att_mask", [1, 1, 5, 64])],
+                           tdict("att_mask", [1, 1, 5, 5])],
                           [tdict("biased", [1, 4, 5, 64])])
     m.nodes["SX"] = Node("Softmax", "SX", {}, [tdict("biased", [1, 4, 5, 64])],
                          [tdict("sx_out", [1, 4, 5, 64])])
@@ -254,6 +256,32 @@ def test_add_around_div_folds():
     assert len(ms) == 1, ms
     assert ms[0]["scale_val"] == pytest.approx(0.125)
     assert ms[0]["mask_input"]["name"] == "att_mask"
+
+
+# ---------------------------------------------- mask shape (fail-closed)
+# attention.comp reads the additive bias as ONE flat [B,S,kv] block, indexed
+# (b*S+s)*kv+j. Anything else — a per-head [B,H,S,kv] bias, a single broadcast
+# row, a scalar, a rank-3 carry-over — reads the wrong element or past the end,
+# and nothing downstream can tell. The matcher declines the whole fusion
+# instead, which keeps the unfused (correct) path.
+
+def test_mask_shapes_the_kernel_cannot_read_are_declined():
+    for bad in ([1, 4, 5, 5],   # per-head: the head axis is not folded out
+                [1, 1, 1, 5],   # one broadcast row, not S rows
+                [1, 1, 5, 64],  # head_dim in the kv slot (the shape these
+                                # fixtures used to carry by copy-paste)
+                [1, 1, 5],      # rank 3
+                []):            # scalar
+        m = build()
+        m.nodes["ADD"].inputs[1] = tdict("att_mask", bad)
+        assert matches_of(m) == [], bad
+
+
+def test_rank2_mask_accepted_for_batch_one():
+    """[S,kv] with batch 1 is the same flat block, so it stays foldable."""
+    m = build()
+    m.nodes["ADD"].inputs[1] = tdict("att_mask", [5, 5])
+    assert len(matches_of(m)) == 1
 
 
 def test_gqa_head_map_attributes():

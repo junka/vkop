@@ -1,5 +1,13 @@
 #version 450 core
 
+// NOT DISPATCHED. ops/Range.hpp generates every Range on the host now; this
+// file stays in the archive only because the converter records a shader name
+// per node and the loader builds a pipeline by that name. It also could not
+// have worked for the float case it was reached for: binding the params as
+// `int data[]` reads an fp32/fp16 operand's BIT PATTERN as an integer (1.0f is
+// 0x3F800000), so a float arange came out as 1.065e9 + i. Do not revive it for
+// fp params without fixing the bindings.
+
 layout(set=0, binding=0) writeonly buffer outputBuffer {
     uint data[];
 } uOutput;

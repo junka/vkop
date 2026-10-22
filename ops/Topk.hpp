@@ -99,7 +99,31 @@ class Topk : public Operator {
         auto inshape = inputs[0]->getShape();
         int rank = inputs[0]->num_dims();
         int axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
-        assert(axis <= 2 && axis >= 0);
+        // The indices output is written as int32 (tempindex*_ are
+        // core::Tensor<int>) and the runtime's output-dtype inference has no
+        // TOPK branch, so an indices tensor of any other width would reach
+        // as_tensor<int> below as a null pointer and be dereferenced. ONNX's
+        // default is int64 indices, which this kernel cannot write at all.
+        if (outputs.size() < 2) {
+            throw std::runtime_error(
+                "TopK: expected a values and an indices output");
+        }
+        if (outputs[1]->dtype() != typeid(int)) {
+            throw std::runtime_error(
+                std::string("TopK: the indices output must be int32, got ") +
+                core::elem_name(outputs[1]->elem_kind()) +
+                " (ONNX's default int64 indices cannot be written by this "
+                "kernel)");
+        }
+        // topk.comp only branches on axis==0 and axis==1 of a 2-D view
+        // (uParam.inShape.x/.y); any other axis silently writes nothing.
+        // (This used to be an assert, i.e. a no-op in a release build.)
+        if (rank != 2 || axis < 0 || axis > 1) {
+            throw std::runtime_error(
+                std::string("TopK: only a rank-2 input with axis 0 or 1 is "
+                            "implemented (got rank ") +
+                std::to_string(rank) + ", axis " + std::to_string(axis) + ")");
+        }
         assert(para_.k < 256);
         int original_k = para_.k;
         if (fp16_ == 1 && para_.k % 2 != 0) {

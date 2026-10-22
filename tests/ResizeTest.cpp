@@ -52,7 +52,13 @@ public:
             {"coordinate_transformation_mode", align_corners_ ? "align_corners": "half_pixel"},
             {"antialias", antialias_ ? "True" : "False"},
             {"cubic_coeff_a", std::to_string(cubic_coeff_a_)},
-            {"nearest_mode", "nearest"},
+            // ONNX spells the rounding rule round_prefer_floor / round_prefer_ceil
+            // / floor / ceil; "nearest" is a *mode* name and is not one of them.
+            // The parser used to look the string up and dereference the end
+            // iterator when it missed, which happened to leave the default 0
+            // (round_prefer_floor) in place. It now rejects an unknown spelling,
+            // so the case has to name a real one.
+            {"nearest_mode", "round_prefer_floor"},
         };
         initTestData();
     }

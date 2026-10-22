@@ -88,9 +88,12 @@ class ResizeImage : public Operator {
                      resize::CoordinateTransformationMode::TF_CROP_AND_RESIZE}};
             auto it =
                 kTmodeMap.find(attrs.at("coordinate_transformation_mode"));
-            if (it != kTmodeMap.end()) {
-                coordinate_transformation_mode_ = static_cast<int>(it->second);
+            if (it == kTmodeMap.end()) {
+                throw std::runtime_error(
+                    "Resize: unknown coordinate_transformation_mode '" +
+                    attrs.at("coordinate_transformation_mode") + "'");
             }
+            coordinate_transformation_mode_ = static_cast<int>(it->second);
         }
 
         if (attrs.find("cubic_coeff_a") != attrs.end()) {
@@ -103,7 +106,10 @@ class ResizeImage : public Operator {
         if (attrs.find("extrapolation_value") != attrs.end()) {
             extrapolation_value_ = std::stof(attrs.at("extrapolation_value"));
         }
-        if (attrs.find("keep_aspect_ratio") != attrs.end()) {
+        // The guard has to name the same attribute the body reads: keyed on
+        // keep_aspect_ratio it threw out_of_range whenever the policy was
+        // given, and silently ignored the policy whenever it was not.
+        if (attrs.find("keep_aspect_ratio_policy") != attrs.end()) {
 
             static const std::unordered_map<std::string,
                                             resize::KeepAspectRatioPolicy>
@@ -114,9 +120,12 @@ class ResizeImage : public Operator {
                      resize::KeepAspectRatioPolicy::NOT_SMALLER}};
             const auto &policy_str = attrs.at("keep_aspect_ratio_policy");
             auto it = kPolicyMap.find(policy_str);
-            if (it != kPolicyMap.end()) {
-                keep_aspect_ratio_policy_ = static_cast<int>(it->second);
+            if (it == kPolicyMap.end()) {
+                throw std::runtime_error(
+                    "Resize: unknown keep_aspect_ratio_policy '" + policy_str +
+                    "' (expected stretch, not_larger or not_smaller)");
             }
+            keep_aspect_ratio_policy_ = static_cast<int>(it->second);
         }
         if (attrs.find("mode") != attrs.end()) {
             const std::string &mode_value = attrs.at("mode");
@@ -126,9 +135,18 @@ class ResizeImage : public Operator {
                 mode_ = 1;
             } else if (mode_value == "cubic" || mode_value == "bicubic") {
                 mode_ = 2;
+            } else {
+                // Defaulting to nearest here is what made an unknown spelling
+                // (e.g. "lanczos") read as a working op.
+                throw std::runtime_error(
+                    "Resize: unknown mode '" + mode_value +
+                    "' (expected nearest, linear or cubic)");
             }
         }
-        if (attrs.find("coordinate_transformation_mode") != attrs.end()) {
+        // Same mis-guard as the policy block above: keyed on
+        // coordinate_transformation_mode, so a bare nearest_mode threw
+        // out_of_range and a real nearest_mode was never applied.
+        if (attrs.find("nearest_mode") != attrs.end()) {
 
             static std::unordered_map<std::string, resize::NearestMode>
                 mode_map = {{"round_prefer_floor",
@@ -137,10 +155,15 @@ class ResizeImage : public Operator {
                              resize::NearestMode::ROUND_PREFER_CEIL},
                             {"floor", resize::NearestMode::FLOOR},
                             {"ceil", resize::NearestMode::CEIL}};
-            auto itr = mode_map.find(attrs.at("nearest_mode"));
-            if (itr != mode_map.end()) {
-                nearest_mode_ = static_cast<int>(itr->second);
+            const auto &nearest_str = attrs.at("nearest_mode");
+            auto itr = mode_map.find(nearest_str);
+            if (itr == mode_map.end()) {
+                throw std::runtime_error(
+                    "Resize: unknown nearest_mode '" + nearest_str +
+                    "' (expected round_prefer_floor, round_prefer_ceil, floor "
+                    "or ceil)");
             }
+            nearest_mode_ = static_cast<int>(itr->second);
         }
         if (attrs.find("size") != attrs.end()) {
             sizes_ = parse_attr_list<int>(attrs.at("size"));
@@ -161,6 +184,20 @@ class ResizeImage : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // resize.comp implements exactly two modes: `mode == 1` is bilinear
+        // and everything else samples as nearest. Cubic therefore resolved to
+        // nearest without a word of complaint, and `antialias` is not read by
+        // the shader at all. Both are silently-different-from-ONNX, so they
+        // stop here instead. (The buffer path has its own, stricter check.)
+        if (mode_ == 2) {
+            throw std::runtime_error(
+                "Resize (image backend) does not implement cubic/bicubic "
+                "sampling; only nearest and linear are available");
+        }
+        if (antialias_ != 0) {
+            throw std::runtime_error(
+                "Resize (image backend) does not implement antialias");
+        }
         std::shared_ptr<core::Tensor<int64_t>> sizes = nullptr;
         std::shared_ptr<core::Tensor<float>> scales = nullptr;
 

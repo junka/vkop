@@ -148,6 +148,14 @@ class Gemm : public Operator {
                 core::elem_name(inputs[scale_index]->elem_kind()));
         }
 
+        // A and B are indexed as rank-2 ([M,K]/[K,N], or their transposes);
+        // getShape()[1] on a rank-1 operand is out of bounds, not an error.
+        if (inputs[0]->getShape().size() < 2 ||
+            inputs[1]->getShape().size() < 2) {
+            throw std::runtime_error(
+                "Gemm: A and B must be rank >= 2 (a rank-1 operand has no "
+                "K/N axis to read)");
+        }
         int m = inputs[0]->getShape()[0];
         int n = inputs[1]->getShape()[1];
         int k = inputs[0]->getShape()[1];
@@ -158,6 +166,22 @@ class Gemm : public Operator {
         if (para_.transB) {
             n = inputs[1]->getShape()[0];
             k = inputs[1]->getShape()[1];
+        }
+        // The kernel broadcasts C as 1-D [N] (gemm.comp: "Bias C is 1-D [N],
+        // broadcast across all M rows: element is C[j]"). A [M,N] C has only
+        // its row 0 read and a scalar C is read out of bounds — both silent.
+        if (has_bias) {
+            const size_t entries = static_cast<size_t>(
+                total_elems(inputs[bias_index]->getShape()));
+            if (entries != static_cast<size_t>(n)) {
+                throw std::runtime_error(
+                    "vkop: Gemm bias C has " + std::to_string(entries) +
+                    " elements but the kernel only implements the ONNX 1-D "
+                    "[N] broadcast form (" +
+                    std::to_string(n) +
+                    " columns); a [M,N] or scalar C would be silently "
+                    "mis-read");
+            }
         }
         // The scale indexes Y's columns, so its length IS N. A mismatch means
         // the weight was quantized along the wrong axis (a [N, K] weight read

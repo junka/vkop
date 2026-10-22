@@ -262,6 +262,25 @@ class AttentionBuffer : public BufferFactory {
                 core::elem_name(inputs[0]->elem_kind()) + ", the bias is " +
                 core::elem_name(inputs[mask_idx]->elem_kind()) + ")");
         }
+        // The kernel reads the additive bias as one flat [B,S,kv] block,
+        // indexed (b*S+s)*kv + j (attention.comp). A per-head [B,H,S,kv]
+        // bias, a [1,1,1,kv] row broadcast, or a scalar all read the wrong
+        // element — or past the end — and nothing downstream can tell.
+        if (has_mask) {
+            const size_t want = static_cast<size_t>(batch) *
+                                static_cast<size_t>(seq) *
+                                static_cast<size_t>(kv_len);
+            const size_t got =
+                static_cast<size_t>(total_elems(inputs[mask_idx]->getShape()));
+            if (got != want) {
+                throw std::runtime_error(
+                    std::string("Attention: the additive bias must be the flat "
+                                "[B,S,kv] form the kernel indexes as "
+                                "(b*S+s)*kv+j — got ") +
+                    std::to_string(got) + " elements, expected " +
+                    std::to_string(want));
+            }
+        }
         // An fp8/fp4 cache rides its own 1-byte container through the graph's
         // Q/DQ pair; this op computes in the Q dtype, so a cache of a different
         // width is a wiring bug, not something to guess a reinterpret for. The
