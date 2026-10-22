@@ -32,15 +32,13 @@ class Runtime {
 
     // Per-level "contains a synchronous readback" flag, learned on round 0
     // (via the queue submit counter advancing during onExecute) and reused to
-    // attribute the ~0.43ms forced per-level submit floor. A readback level's
-    // copyToCPU does its own cmd.submit+wait on queue0, relying on single-queue
-    // FIFO ordering (its producer levels already queued). Stable across decode
-    // rounds (an op's readback behavior is determined by its dtype/path, not
-    // the round). Printed by VKOP_BATCH_DBG; per-op-type counts by VKOP_OPPROF
-    // (rbprof). Batching (VKOP_BATCH_LEVELS) was tried and found net-neutral
-    // (readback levels can't batch with pending producers); see
-    // readback-per-level-submit-bottleneck.md. The fix is GPU-driven shape-meta
-    // (eliminate the readbacks), not batching.
+    // attribute any forced per-level submit. A readback level's copyToCPU does
+    // its own cmd.submit+wait on queue0, relying on single-queue FIFO ordering
+    // (an op's readback behavior is determined by its dtype/path, not the
+    // round), so such a level cannot batch with pending producers. Most levels
+    // are readback-free now (the int64 shape-meta chain is folded at build time
+    // and host-authoritative inputs skip the copy), so this map is usually
+    // empty; see the 2026-10 llm.vkopbin numbers in runtime.cpp Run().
     std::vector<bool> level_readback_;
 
     // Model file path

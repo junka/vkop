@@ -116,6 +116,26 @@ class ITensor {
     // the graph segment boundary it forces) since data_ is already correct.
     void set_host_authoritative() { host_authoritative_ = true; }
     bool get_host_authoritative() const { return host_authoritative_; }
+    // Mark this tensor's host data_ as valid for its whole lifetime WITHOUT
+    // claiming membership in the host-computed shape chain. Set for a graph
+    // input the driver filled from the host (fillToCPU + copyToGPU before
+    // Run): the CPU bytes are exactly the bytes the driver wrote and no node
+    // in the graph writes the tensor (a graph input is a leaf), so copyToCPU
+    // can return them instead of paying a GPU->CPU round trip plus the graph
+    // segment boundary it forces. A byte-preserving VIEW of such a tensor
+    // (Reshape's alias path) mirrors the bytes and propagates this flag.
+    //
+    // Deliberately NOT get_host_authoritative(): that flag is also a path
+    // SELECTOR — Reshape / SqueezeUnsqueeze / Concat / Gather / Transpose /
+    // Slice / Where / Equal each branch to a CPU implementation when their
+    // input is authoritative. Flipping a driver-supplied input onto those
+    // paths changes the graph's shape arithmetic, not just its readbacks:
+    // measured 2026-10-22, marking the vision graph's int64 grid_thw left the
+    // tower's attention K at seq=-1 ("Attention: kv_len must be > 0"), because
+    // the grid-derived seq chain then resolved on the host instead of through
+    // the converter's intended path. Only copyToCPU consults this flag.
+    void set_host_copy_valid() { host_copy_valid_ = true; }
+    bool get_host_copy_valid() const { return host_copy_valid_; }
     // Per-row element count padded onto the GPU buffer's row stride beyond the
     // logical cols. When >0, the GPU wrote the buffer with a packed row stride
     // of (logical_cols + gpu_row_pad_) and copyBufferToCPU must compact it back
@@ -424,6 +444,11 @@ class ITensor {
     // data_ is the source of truth for this tensor's lifetime (read-only
     // initializer); copyToCPU skips the GPU->CPU round trip. See setter doc.
     bool host_authoritative_ = false;
+    // A driver-supplied graph input: data_ is the bytes the driver wrote and
+    // no op overwrites them, so copyToCPU may return them — but the tensor is
+    // not a host-chain member, so path selection must ignore this flag. See
+    // setter doc.
+    bool host_copy_valid_ = false;
     // 64bytes here
     int gpu_row_pad_ = 0;
 
@@ -786,6 +811,56 @@ template <typename T> class Tensor : public ITensor {
         return buff;
     }
 
+    // Zero-copy byte-range view: make this tensor bind the SAME VkBuffer as
+    // `src` but only the byte window [byte_offset, byte_offset+byte_len). The
+    // descriptor's VkDescriptorBufferInfo.offset carries the shift, which is
+    // transparent to the shader (its element 0 maps to parent byte
+    // `byte_offset`), so a consumer reads the sub-region with NO shader change
+    // and NO data movement. This is the contiguous-Slice/Split fast path: an
+    // output that selects a contiguous block of its producer can alias the
+    // producer's buffer at an offset instead of dispatching a gather/copy.
+    //
+    // Distinct from alias_storage_buffer(): that one shares the WHOLE buffer
+    // (same bytes, new shape — Reshape/Squeeze/Unsqueeze); this one shifts the
+    // binding. The caller must have resize()d this tensor to the view shape and
+    // guaranteed byte_offset % minStorageBufferOffsetAlignment == 0 (the device
+    // limit) — the op checks that before calling.
+    //
+    // The view is a borrowed VulkanBuffer (owns nothing, keeps `src` alive) and
+    // is cached on this tensor so the same object/binding is reused across
+    // rounds: replay fingerprints use objs_ pointer identity, and a fresh
+    // object every round would miss the cache.
+    std::shared_ptr<VulkanBuffer> alias_storage_buffer_range(
+        const std::shared_ptr<VulkanBuffer> &src, VkDeviceSize byte_offset,
+        VkDeviceSize byte_len,
+        const std::shared_ptr<VulkanCommandBuffer> &cmd) {
+        if (!src) {
+            throw std::runtime_error(
+                "vkop: alias_storage_buffer_range with a null source buffer");
+        }
+        if (!view_range_ || view_range_->parent() != src ||
+            view_range_->range_offset() != byte_offset ||
+            view_range_->getSize() != byte_len) {
+            view_range_ =
+                std::make_shared<VulkanBuffer>(src, byte_offset, byte_len);
+        }
+        vkobj_ = view_range_;
+        src->mark_view_aliased();
+        shape_view_stats().buffer_aliases++;
+        if (shape_debug_enabled()) {
+            std::fprintf(stderr,
+                         "[shapeview] range-aliased %s (%d bytes) onto "
+                         "producer +%llu\n",
+                         shape_to_string(dims_, n_dims_).c_str(), size_,
+                         static_cast<unsigned long long>(byte_offset));
+        }
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        if (cmd && buff) {
+            buff->readBarrier(cmd->get());
+        }
+        return buff;
+    }
+
     // Write-site view-alias handling; see the declaration on ITensor. All four
     // are no-ops for a tensor with no GPU buffer, and for an image-backed one
     // (VulkanBuffer is the only resource that can be aliased out).
@@ -808,6 +883,7 @@ template <typename T> class Tensor : public ITensor {
             return;
         }
         vkobj_.reset();
+        view_range_.reset();
     }
 
     // Upload host data (data_) into the backing SSBO NON-synchronously: records
@@ -1150,21 +1226,30 @@ template <typename T> class Tensor : public ITensor {
             copyToGPUBuffer(cmdpool, data ? data : data_->data(), nullptr,
                             batch);
         }
-        if (!data && data_) {
+        // Drop the host staging: it was only the upload's source, and keeping
+        // it would double the tensor's footprint. Skipped when the caller
+        // supplied an explicit src (already the case for initializers, whose
+        // CPU copy downstream host readers want) and for a driver-filled graph
+        // input, whose staged bytes are the only host copy there will ever be
+        // — without this the upload would empty data_, and the next
+        // copyToCPU would hand its reader a freshly zero-filled vector
+        // (measured: the vision graph's int64 grid_thw came back as [0,0,0],
+        // collapsing the tower's attention seq to 0).
+        if (!data && data_ && !host_copy_valid_) {
             data_->clear();
             data_->shrink_to_fit();
         }
     }
 
     void copyToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {
-        // Host-authoritative tensor (read-only int64/int32 initializer): data_
-        // was filled at model-load and never overwritten by a GPU write, so the
-        // GPU->CPU copy would just re-derive the same bytes. Return the
-        // existing host copy. Crucially this also skips the graph segment
-        // boundary the hook would force (~0.3ms submit) plus the copy's own
-        // submit+wait
+        // Host-authoritative tensor (read-only int64/int32 initializer, or a
+        // driver-filled graph input): data_ was filled at model-load / by the
+        // driver and never overwritten by a GPU write, so the GPU->CPU copy
+        // would just re-derive the same bytes. Return the existing host copy.
+        // Crucially this also skips the graph segment boundary the hook would
+        // force (~0.3ms submit) plus the copy's own submit+wait
         // (~1ms) — the dominant prefill cost (219 of 581 readbacks/round).
-        if (host_authoritative_) {
+        if (host_authoritative_ || host_copy_valid_) {
             reserveOnCPU();
             return;
         }
@@ -1375,6 +1460,10 @@ template <typename T> class Tensor : public ITensor {
   private:
     std::shared_ptr<VulkanResource> vkobj_;
     std::unique_ptr<std::vector<T>> data_;
+    // Cached borrowed sub-range view (see alias_storage_buffer_range). Kept so
+    // the same view object — hence the same descriptor binding and objs_
+    // pointer identity — is reused across rounds rather than re-created.
+    std::shared_ptr<VulkanBuffer> view_range_;
 
     void make_vkbuff(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;
@@ -1401,6 +1490,13 @@ template <typename T> class Tensor : public ITensor {
         // about to write (see the view-writer check there).
         if (vkobj_) {
             auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+            // A borrowed sub-range view must NEVER be reallocated: its size is
+            // the view's byte range, not a pool slot, and dropping it here
+            // would silently turn the view back into a private (empty) buffer
+            // and lose the aliasing. Keep it as-is.
+            if (buff && buff->is_view_range()) {
+                return;
+            }
             if (buff) {
                 if (prealloc_keep_ ? (buff->getSize() >= aligned)
                                    : (buff->getSize() == aligned)) {
@@ -1408,6 +1504,7 @@ template <typename T> class Tensor : public ITensor {
                 }
             }
             vkobj_.reset();
+            view_range_.reset();
         }
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, aligned, flags, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);

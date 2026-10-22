@@ -412,6 +412,21 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // A byte-preserving view of a tensor whose host copy is valid
+                // (a driver-filled graph input, e.g. image_pad_mask) has that
+                // same valid copy — the bytes are identical and only the shape
+                // differs. Mirror them so a downstream copyToCPU (NonZero
+                // reads the mask on the host) returns them instead of paying a
+                // readback plus the graph segment boundary it forces.
+                if (src->get_host_copy_valid() &&
+                    src->num_elements() >= total) {
+                    std::vector<int8_t> out(static_cast<size_t>(total));
+                    for (int i = 0; i < total; ++i) {
+                        out[static_cast<size_t>(i)] = (*src)[i];
+                    }
+                    output->fillToCPU(out);
+                    output->set_host_copy_valid();
+                }
                 return;
             }
 

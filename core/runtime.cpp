@@ -489,6 +489,36 @@ void Runtime::LoadModel() {
                     "vkop: graph input " + i.name + " has element format " +
                     elem_name(kind) + ", which no input path can hold");
             }
+            // A graph input the driver fills from the host (fillToCPU +
+            // copyToGPU before Run) has valid host bytes for its whole
+            // lifetime: it is a leaf no node writes, so a copyToCPU could only
+            // re-derive the same bytes. Without this every consumer that
+            // reaches one through a CPU-path op pays a full sync readback —
+            // pre_readback_hook forces a graph-segment boundary, then
+            // submit+wait. Measured 2026-10-22: the vision tower's two
+            // grid_thw Gathers, and the LLM's /mrope_static/Cast
+            // (position_ids) + /NonZero (image_pad_mask), ~0.7-0.9 ms each,
+            // re-paid once per phase because invalidate_replay() resets the
+            // shape caches at the prefill->decode boundary.
+            //
+            // set_host_copy_valid(), NOT set_host_authoritative(): the
+            // latter doubles as a CPU-path selector in Reshape /
+            // SqueezeUnsqueeze / Concat / Gather / Transpose / Slice / Where /
+            // Equal, and marking grid_thw with it sent the vision graph's
+            // grid-derived seq chain down the host path, leaving the tower's
+            // attention K at seq=-1 ("Attention: kv_len must be > 0"). The new
+            // flag is read by copyToCPU alone, so it removes the readbacks and
+            // changes no branch.
+            //
+            // Restricted to the metadata dtypes on purpose: the fp16/fp8/int4
+            // past_key_values inputs are written IN PLACE by the fused
+            // Attention op (present==past), so their host bytes go stale after
+            // the first round and must not be advertised as valid.
+            if (kind == ElemKind::kInt64 || kind == ElemKind::kInt32 ||
+                kind == ElemKind::kInt8 || kind == ElemKind::kBool ||
+                kind == ElemKind::kUint8) {
+                t->set_host_copy_valid();
+            }
         } else {
             // legacy image backend: fp16 inputs as images (original path).
             auto t16 = std::make_shared<Tensor<uint16_t>>(in_dims);
@@ -2395,8 +2425,9 @@ double Runtime::Run() {
 
     // VKOP_RUN_PROFILE=1 splits Run() wall time into record (onExecute) vs
     // submit (vkQueueSubmit) vs gpu-wait, printed once per Run() call. Used to
-    // quantify the per-round bottleneck: 3270 ops are re-recorded every round
-    // and 1593 levels each get their own vkQueueSubmit.
+    // quantify the per-round bottleneck: every op is re-recorded each round and
+    // each level gets its own vkQueueSubmit (unfused; graph-submit mode batches
+    // them). The 2026-10 llm.vkopbin fused graph is 683 ops / 439 levels.
     const char *rp_env = std::getenv("VKOP_RUN_PROFILE");
     bool run_profile = rp_env && rp_env[0] == '1';
     double prof_record_ms = 0.0, prof_submit_ms = 0.0, prof_onexec_ms = 0.0;
@@ -2404,7 +2435,7 @@ double Runtime::Run() {
 
     // VKOP_OPPROF=1 accumulates per-op-type onExecute wall time + call count
     // across the Run(), printed once at Run() end. Reveals which op types
-    // actually dominate the ~1.7s/round onExecute cost (vs just being "dynamic"
+    // actually dominate the onExecute (record) cost (vs just being "dynamic"
     // in the replay sense — a dynamic fp16 MatMul re-records in ~0, an int64
     // Gather stalls ~1ms). Static (so not cleared across rounds within a Run);
     // the caller sees the per-Run accumulation.
@@ -2414,7 +2445,7 @@ double Runtime::Run() {
     if (opprof)
         op_type_time_count.clear();
     // Per-op-type readback counter: which op types trigger a synchronous
-    // copyToCPU (and thus force a per-level submit — the ~600ms floor).
+    // copyToCPU (and thus force a per-level submit).
     static std::map<std::string, int> op_type_readback_count;
     if (opprof)
         op_type_readback_count.clear();
@@ -2426,12 +2457,12 @@ double Runtime::Run() {
     // the queue submit counter advancing during onExecute recording). Each
     // readback level's copyToCPU does its own cmd.submit+wait on queue0,
     // relying on single-queue FIFO ordering to see the producer's submitted
-    // work — so a readback level forces a per-level submit point. This count
-    // (printed by VKOP_BATCH_DBG / rbprof) quantifies the ~0.43ms × N submit
-    // floor that dominates decode. Batching was tried (VKOP_BATCH_LEVELS) and
-    // found net-neutral: readback levels can't be batched with their pending
-    // producers, so the submits just move to a pre-flush. See
-    // readback-per-level-submit-bottleneck.md.
+    // work — so a readback level forces a per-level submit point. Printed by
+    // VKOP_BATCH_DBG / rbprof. Batching (VKOP_BATCH_LEVELS) was tried and found
+    // net-neutral: readback levels can't be batched with their pending
+    // producers, so the submits just move to a pre-flush. The count is small
+    // now (2026-10 llm.vkopbin: 2/439 prefill, 0/439 decode) since the shape-
+    // meta chain is folded at build time.
     int n_readback_levels = 0;
     int n_total_levels = static_cast<int>(level_node_indices_.size());
     bool batch_dbg = std::getenv("VKOP_BATCH_DBG");
@@ -2505,11 +2536,17 @@ double Runtime::Run() {
     // own submit+wait and must see its producers already submitted. They are
     // located exactly, at the moment of the readback, through
     // VulkanCommandBuffer::pre_readback_hook — not predicted from a learned
-    // map, which is phase-specific (prefill 328/981 readback levels vs decode
-    // 0/981) and would read stale data on a wrong guess.
+    // map, which is phase-specific and would read stale data on a wrong guess.
+    // The map is mostly empty now: the int64 shape-meta chain is gone (the
+    // converter's host_shape pass folds every Reshape target, and the host-
+    // authoritative metadata inputs make the survivors' copyToCPU a free
+    // early-return). Measured on llm.vkopbin (683 nodes / 439 levels, text
+    // prompt, 2026-10): prefill 2/439 readback levels (NonZero + the rotary
+    // int64->fp32 Cast), decode 0/439.
     // Graph submit is ON by default: on MoltenVK a per-level vkQueueSubmit
-    // costs ~0.24 ms of driver overhead, so the 981-level decode graph spent
-    // ~232 ms/round submitting and only ~16 ms computing. Set
+    // costs ~0.24 ms of driver overhead, so that measurement's 981-level
+    // Qwen3-8B decode graph spent ~232 ms/round submitting and only ~16 ms
+    // computing. Set
     // VKOP_GRAPH_SUBMIT=0 to fall back to the per-level path (e.g. when
     // bisecting a correctness issue against the pre-graph behaviour).
     const char *gs_env = std::getenv("VKOP_GRAPH_SUBMIT");
@@ -3140,8 +3177,9 @@ double Runtime::Run() {
                     v.begin(), v.end(), 0,
                     [](int s, const auto &p) { return s + p.second.second; })),
                 grand);
-        // Per-op-type synchronous-readback counts (each forces a per-level
-        // submit → the ~0.43ms × N floor).
+        // Per-op-type synchronous-readback counts (each historically forced a
+        // per-level submit; the submit floor that made that costly is gone
+        // now — see the readback-level note at the top of this Run()).
         std::vector<std::pair<std::string, int>> rv(
             op_type_readback_count.begin(), op_type_readback_count.end());
         std::sort(rv.begin(), rv.end(), [](const auto &a, const auto &b) {
