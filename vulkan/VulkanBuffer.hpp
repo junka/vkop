@@ -38,7 +38,18 @@ class VulkanBuffer : public VulkanResource {
     // the VkBuffer; never map/free it.
     bool is_view_range() const { return parent_ != nullptr; }
     std::shared_ptr<VulkanBuffer> parent() const { return parent_; }
+    // Byte offset of this view's window within its immediate parent (the
+    // parent-relative offset). Forwarding the byte movers adds this up the
+    // chain, so it must stay parent-relative.
     VkDeviceSize range_offset() const { return range_offset_; }
+    // Byte offset within the ROOT allocation. getBuffer() recurses to the root
+    // VkBuffer, so the descriptor offset must accumulate the chain too: a view
+    // of a view (a contiguous Slice of a Split block) is otherwise bound short
+    // by every ancestor's offset. Only the descriptor path needs this — the
+    // movers adopt the root buffer but walk offsets incrementally.
+    VkDeviceSize abs_offset() const {
+        return range_offset_ + (parent_ ? parent_->abs_offset() : 0);
+    }
     std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *,
                  VkBufferView *>
     getDescriptorInfo() override;

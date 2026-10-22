@@ -8,6 +8,7 @@
 using vkop::core::Tensor;
 using vkop::tests::TestCase;
 using vkop::ops::Slice;
+using vkop::VulkanBuffer;
 
 namespace {
 #if 0
@@ -276,6 +277,25 @@ TEST(SliceTest, SliceOuterAxisContiguousBuffer) {
     EXPECT_TRUE(fp16.run_test(
         {fp16.input, fp16.starts_, fp16.ends_, fp16.axes_, fp16.steps_},
         {fp16.output}));
+}
+
+// A view whose input is itself a view (a contiguous Slice of a Split block, say)
+// must bind at the offset within the ROOT allocation, because getBuffer()
+// recurses to the root VkBuffer while range_offset_ is only parent-relative.
+// Getting this wrong binds the wrong bytes with no error, so pin the math.
+TEST(SliceTest, NestedViewDescriptorOffset) {
+    auto dev = vkop::tests::TestEnv::get_device();
+    auto owner = std::make_shared<VulkanBuffer>(
+        dev, 4096, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto outer = std::make_shared<VulkanBuffer>(owner, 512, 1024);
+    auto inner = std::make_shared<VulkanBuffer>(outer, 256, 128);
+
+    auto info = inner->getDescriptorInfo();
+    auto *bi = std::get<VkDescriptorBufferInfo *>(info);
+    EXPECT_EQ(bi->buffer, owner->getBuffer());
+    EXPECT_EQ(bi->offset, VkDeviceSize(768)); // 512 + 256, root-relative
+    EXPECT_EQ(bi->range, VkDeviceSize(128));
 }
 
 // ONNX requires a non-zero step. 0 used to be silently rewritten to 1, which

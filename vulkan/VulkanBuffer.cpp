@@ -109,8 +109,10 @@ VulkanBuffer::getDescriptorInfo() {
     // A borrowed sub-range binds the parent's VkBuffer at a byte offset; the
     // shader's element 0 then maps to parent byte `range_offset_` with no
     // shader change (the descriptor offset is transparent). An owning buffer
-    // binds from 0.
-    buffer_info_.offset = parent_ ? range_offset_ : 0;
+    // binds from 0. The offset is ROOT-relative (abs_offset), because
+    // getBuffer() returns the root VkBuffer — a view of a view would otherwise
+    // drop every ancestor's offset.
+    buffer_info_.offset = parent_ ? abs_offset() : 0;
     buffer_info_.range = m_size_;
     return &buffer_info_;
 }
