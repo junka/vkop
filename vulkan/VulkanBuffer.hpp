@@ -14,12 +14,31 @@ class VulkanBuffer : public VulkanResource {
     VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, VkDeviceSize size,
                  VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                  int ext_fd = -1);
+
+    // Borrowed sub-range ctor: this object OWNS NOTHING — it shares `parent`'s
+    // VkBuffer and exposes only the byte window [offset, offset+range). The
+    // descriptor it produces is bound at that offset (VkDescriptorBufferInfo
+    // offset is transparent to the shader, so a consumer reads element 0 =
+    // parent byte `offset` with no shader change). Used for zero-copy Slice/
+    // Split views: the output aliases the producer's buffer at a byte offset
+    // instead of moving the bytes. The parent is kept alive by shared_ptr.
+    // All barriers and the view_aliased/view_writer bookkeeping forward to the
+    // parent, so access tracking and the shape-pool write-site hazard logic
+    // keep keying on the one real allocation.
+    VulkanBuffer(std::shared_ptr<VulkanBuffer> parent, VkDeviceSize offset,
+                 VkDeviceSize range);
     ~VulkanBuffer() override;
 
     VkBuffer getBuffer() const;
     ResourceType getResourceType() const override {
         return ResourceType::VK_BUFFER;
     }
+
+    // True for a borrowed sub-range view (see the ctor above). Not the owner of
+    // the VkBuffer; never map/free it.
+    bool is_view_range() const { return parent_ != nullptr; }
+    std::shared_ptr<VulkanBuffer> parent() const { return parent_; }
+    VkDeviceSize range_offset() const { return range_offset_; }
     std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *,
                  VkBufferView *>
     getDescriptorInfo() override;
@@ -30,9 +49,18 @@ class VulkanBuffer : public VulkanResource {
     // as a view alias (Tensor::alias_storage_buffer, the Reshape/Squeeze/
     // Unsqueeze fast path). From then on at least two tensor objects address
     // the same bytes. Sticky: an alias cannot be revoked from the producer
-    // side.
-    bool view_aliased() const { return view_aliased_; }
-    void mark_view_aliased() { view_aliased_ = true; }
+    // side. A borrowed sub-range view reports the PARENT's flag, so the
+    // write-site hazard check in Runtime::Run sees the shared bytes.
+    bool view_aliased() const {
+        return parent_ ? parent_->view_aliased() : view_aliased_;
+    }
+    void mark_view_aliased() {
+        if (parent_) {
+            parent_->mark_view_aliased();
+        } else {
+            view_aliased_ = true;
+        }
+    }
 
     // Global node index of the last op that WROTE these bytes (-1 = never).
     // With view_aliased it lets Runtime::Run tell the two cases apart at the
@@ -42,7 +70,17 @@ class VulkanBuffer : public VulkanResource {
     // node is the shape pool having recycled this tensor object to an unrelated
     // op — that write would clobber what the aliased view still reads, so the
     // recycler takes its own buffer instead.
-    int32_t view_writer() const { return view_writer_; }
+    //
+    // A borrowed sub-range view keeps its OWN marker: it is RE-ALIASED each
+    // round, not written, so Runtime's post-execute set_gpu_buffer_view_writer
+    // must not stomp the parent's writer (which belongs to the real producer).
+    // Reading the view's writer falls back to the parent's when unset, so the
+    // aliased-from-producer case is still detected on the first round.
+    int32_t view_writer() const {
+        if (!parent_)
+            return view_writer_;
+        return view_writer_ >= 0 ? view_writer_ : parent_->view_writer();
+    }
     void set_view_writer(int32_t node_idx) { view_writer_ = node_idx; }
 
     void transferBarrier(VkCommandBuffer commandBuffer,
@@ -105,6 +143,8 @@ class VulkanBuffer : public VulkanResource {
                       VkDeviceSize size, VkDeviceSize offset = 0);
 
     void *getMappedMemory() {
+        if (parent_)
+            return parent_->getMappedMemory();
 #ifdef USE_VMA
         return VMA::getMappedMemory(&m_vma_buffer_);
 
@@ -121,10 +161,16 @@ class VulkanBuffer : public VulkanResource {
     };
 
 #ifdef USE_VMA
-    VMA::VmaBuffer *getVmaBuffer() { return &m_vma_buffer_; }
+    VMA::VmaBuffer *getVmaBuffer() {
+        return parent_ ? parent_->getVmaBuffer() : &m_vma_buffer_;
+    }
 #endif
 
     void unmapMemory() {
+        if (parent_) {
+            parent_->unmapMemory();
+            return;
+        }
         // VMA_ALLOCATION_CREATE_MAPPED_BIT already keeps the memory mapped, so
         // we don't need to unmap it.
 #ifndef USE_VMA
@@ -146,6 +192,9 @@ class VulkanBuffer : public VulkanResource {
     bool view_aliased_ = false;
     int32_t view_writer_ = -1;
     void *data_ = nullptr;
+    // Borrowed sub-range state (null parent_ = this object owns its VkBuffer).
+    std::shared_ptr<VulkanBuffer> parent_;
+    VkDeviceSize range_offset_ = 0;
 
     VkDescriptorBufferInfo buffer_info_;
 

@@ -217,6 +217,67 @@ TEST(SliceTest, SliceRank2Buffer) {
     EXPECT_TRUE(slice_test.run_test(inputs, {slice_test.output}));
 }
 
+// Pure math behind the zero-copy fast path: contiguous_slice_range decides
+// whether a slice is one contiguous byte run and, if so, its offset/length;
+// offset_view_aligned is the descriptor-alignment + fp16 word-parity gate. A
+// wrong answer here is silently-wrong data (a bad offset binds the wrong
+// bytes), so pin the interesting shapes.
+TEST(SliceTest, ContiguousRangeMath) {
+    using vkop::ops::contiguous_slice_range;
+    using vkop::ops::offset_view_aligned;
+    VkDeviceSize bo = 0, bl = 0;
+    // Outer-axis slice of {6,4,4}: [2:5] is 3*4*4 == 48 contiguous fp32 at
+    // element 32 -> byte 128.
+    EXPECT_TRUE(contiguous_slice_range({6, 4, 4}, {3, 4, 4}, {2, 0, 0},
+                                       {1, 1, 1}, sizeof(float), bo, bl));
+    EXPECT_EQ(bo, VkDeviceSize(128));
+    EXPECT_EQ(bl, VkDeviceSize(48) * sizeof(float));
+    // Any step != 1 is strided -> never a contiguous block.
+    EXPECT_FALSE(contiguous_slice_range({6, 4, 4}, {3, 4, 4}, {0, 0, 0},
+                                        {2, 1, 1}, sizeof(float), bo, bl));
+    // A partial innermost slice leaves gaps between the selected rows.
+    EXPECT_FALSE(contiguous_slice_range({6, 4, 4}, {6, 2, 4}, {0, 1, 0},
+                                        {1, 1, 1}, sizeof(float), bo, bl));
+    // Slicing two axes at once interleaves -> not contiguous.
+    EXPECT_FALSE(contiguous_slice_range({6, 4, 4}, {2, 2, 4}, {1, 1, 0},
+                                        {1, 1, 1}, sizeof(float), bo, bl));
+    // Alignment: 4 bytes is the floor (fp16 packs 2 half/uint word, so an odd
+    // fp16 element would straddle two words), the device limit raises it.
+    EXPECT_TRUE(offset_view_aligned(128, 16));
+    EXPECT_FALSE(offset_view_aligned(3, 16)); // not a multiple of the limit
+    EXPECT_FALSE(offset_view_aligned(2, 1));  // below the 4-byte floor
+    EXPECT_TRUE(offset_view_aligned(4, 1));
+}
+
+// Zero-copy contiguous fast path end to end. Slicing the OUTERMOST axis with
+// step 1 selects a contiguous byte run of the input, so SliceBuffer binds the
+// input's VkBuffer at that offset (VkDescriptorBufferInfo.offset, transparent
+// to the shader) instead of dispatching slice.comp. The real assertion is
+// correctness: the borrowed view has to read back exactly its window, which
+// exercises the offset forwarding in VulkanBuffer::copyBufferToStageBuffer —
+// read at the parent's start instead of +range_offset and the output would be
+// the input's head, not the slice.
+TEST(SliceTest, SliceOuterAxisContiguousBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{6, 4, 4};
+    std::vector<int64_t> starts{2};
+    std::vector<int64_t> ends{5};
+    std::vector<int64_t> steps{1};
+    std::vector<int64_t> axes{0};
+
+    LOG_INFO("Testing Slice outer-axis fast path fp32");
+    SliceTest<float> fp32(input_shape, starts, ends, steps, axes);
+    EXPECT_TRUE(fp32.run_test(
+        {fp32.input, fp32.starts_, fp32.ends_, fp32.axes_, fp32.steps_},
+        {fp32.output}));
+
+    LOG_INFO("Testing Slice outer-axis fast path fp16");
+    SliceTest<uint16_t> fp16(input_shape, starts, ends, steps, axes);
+    EXPECT_TRUE(fp16.run_test(
+        {fp16.input, fp16.starts_, fp16.ends_, fp16.axes_, fp16.steps_},
+        {fp16.output}));
+}
+
 // ONNX requires a non-zero step. 0 used to be silently rewritten to 1, which
 // turned a malformed Slice into a plausible-looking full-axis copy.
 TEST(SliceTest, SliceStepZeroThrows) {

@@ -178,6 +178,68 @@ class SplitBuffer : public BufferFactory {
         for (const auto &o : outputs) {
             core::require_word_movable_elem(o->elem_kind(), "Split");
         }
+
+        // Zero-copy fast path: a Split along axis 0 (the outermost dim) carves
+        // the input into contiguous blocks, so each output can bind the input's
+        // VkBuffer at its block's byte offset instead of dispatching
+        // split.comp. (Any other axis interleaves the pieces -> a real gather.)
+        // Requires a GPU input and every block offset to satisfy the device
+        // alignment + fp16 word parity; otherwise fall through to the dispatch
+        // below.
+        if (axis_ == 0 && static_cast<int>(in_shape.size()) == rank) {
+            size_t esz = (inputs[0]->dtype() == typeid(uint16_t))
+                             ? sizeof(uint16_t)
+                             : sizeof(float);
+            VkDeviceSize inner = 1;
+            for (int d = 1; d < rank; ++d) {
+                inner *= static_cast<VkDeviceSize>(in_shape[d]);
+            }
+            VkDeviceSize align = m_dev_->minStorageBufferOffsetAlignment();
+            bool offs_ok = true;
+            VkDeviceSize off_elems = 0;
+            for (int i = 0; i < num_outputs_; ++i) {
+                if (!offset_view_aligned(off_elems * esz, align)) {
+                    offs_ok = false;
+                    break;
+                }
+                off_elems += static_cast<VkDeviceSize>(split_vec[i]) * inner;
+            }
+            if (offs_ok) {
+                std::shared_ptr<VulkanBuffer> src_buff;
+                dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+                    using T = decltype(dummy);
+                    auto src = core::as_tensor<T>(inputs[0]);
+                    if (!src->has_gpu_buffer()) {
+                        return;
+                    }
+                    src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                        src->as_storage_buffer(m_dev_, m_cmd_));
+                });
+                if (src_buff) {
+                    VkDeviceSize block_elems = 0;
+                    for (int i = 0; i < num_outputs_; ++i) {
+                        auto out_shape = in_shape;
+                        out_shape[axis_] = static_cast<int>(split_vec[i]);
+                        int out_total = total_elems(out_shape);
+                        dispatch_by_dtype(outputs[i]->dtype(), [&](auto d2) {
+                            using T = decltype(d2);
+                            auto output = core::as_tensor<T>(outputs[i]);
+                            if (output->num_elements() != out_total) {
+                                output->resize(out_shape);
+                            }
+                            output->alias_storage_buffer_range(
+                                src_buff, block_elems * esz,
+                                static_cast<VkDeviceSize>(out_total) * esz,
+                                m_cmd_);
+                        });
+                        block_elems +=
+                            static_cast<VkDeviceSize>(split_vec[i]) * inner;
+                    }
+                    return;
+                }
+            }
+        }
+
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             bind_ssbo<T>(inputs[0], /*is_output=*/false);

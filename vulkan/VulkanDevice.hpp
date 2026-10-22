@@ -105,6 +105,12 @@ class VulkanDevice {
     VkPhysicalDevice getPhysicalDevice() const { return physicalDevice_; }
     size_t getNumComputeQueues() const { return computeQueues_.size(); }
 
+    // minStorageBufferOffsetAlignment, cached on first use. A binding that
+    // points an SSBO at a non-zero byte offset (the Slice/Split zero-copy
+    // range-view fast path) must keep that offset a multiple of this, so the
+    // op gates on it before aliasing.
+    VkDeviceSize minStorageBufferOffsetAlignment();
+
     std::shared_ptr<VulkanQueue> getComputeQueue(uint32_t idx = 0) const {
         int offset = idx / 2;
         int cat = idx % 2;
@@ -255,6 +261,8 @@ class VulkanDevice {
 
     float timestampPeriod_;
     uint32_t maxImageArrayLayers_;
+    // Cached minStorageBufferOffsetAlignment (0 = not yet queried).
+    VkDeviceSize min_sb_offset_align_ = 0;
     // Packed NCHW images address along width, so a tensor whose W*C4 exceeds
     // this cannot be represented as one image at all.
     uint32_t maxImageDimension2D_ = 0;

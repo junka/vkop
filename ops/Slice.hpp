@@ -355,6 +355,47 @@ class SliceBuffer : public BufferFactory {
         // so the rotary cos/sin slice that used to be host-sliced now stays on
         // the GPU.
 
+        // Zero-copy contiguous fast path: when the slice selects a contiguous
+        // run of the input (all steps 1, no gaps) and the byte offset satisfies
+        // the device alignment + fp16 word parity, the output can bind the
+        // input's VkBuffer at that offset instead of dispatching the gather
+        // shader. The descriptor offset is transparent to downstream shaders,
+        // so this removes both the dispatch and the read/write of the bytes.
+        {
+            size_t esz = (inputs[0]->dtype() == typeid(uint16_t))
+                             ? sizeof(uint16_t)
+                             : sizeof(float);
+            VkDeviceSize bo = 0, bl = 0;
+            if (contiguous_slice_range(inshape, out_size[0], out_size[1],
+                                       out_size[3], esz, bo, bl) &&
+                offset_view_aligned(
+                    bo, m_dev_->minStorageBufferOffsetAlignment())) {
+                bool aliased = false;
+                dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+                    using T = decltype(dummy);
+                    auto src = core::as_tensor<T>(inputs[0]);
+                    if (!src->has_gpu_buffer()) {
+                        return; // host-only input: no buffer to alias
+                    }
+                    auto output = core::as_tensor<T>(outputs[0]);
+                    if (output->num_elements() != total_elems(out_size[0])) {
+                        output->resize(out_size[0]);
+                    }
+                    auto src_buff = std::dynamic_pointer_cast<VulkanBuffer>(
+                        src->as_storage_buffer(m_dev_, m_cmd_));
+                    if (!src_buff) {
+                        return;
+                    }
+                    objs_.emplace_back(output->alias_storage_buffer_range(
+                        src_buff, bo, bl, m_cmd_));
+                    aliased = true;
+                });
+                if (aliased) {
+                    return;
+                }
+            }
+        }
+
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

@@ -187,6 +187,66 @@ inline int total_elems(const std::vector<int> &shape) {
         std::accumulate(shape.begin(), shape.end(), 1, std::multiplies<>()));
 }
 
+// Contiguous sub-range test for the zero-copy view fast path. Given the input
+// shape, the Slice-selected output shape, and the full-rank per-axis
+// starts/steps, decide whether the selected block is a CONTIGUOUS run of the
+// input's row-major elements. On success, set `byte_offset` (byte position of
+// the block's first element) and `byte_len`, and return true.
+//
+// With every step == 1 the output->input index map is affine and monotone, so
+// the block is contiguous iff its element count equals the linear span between
+// its first and last element (count == last - first + 1). A partial innermost-
+// axis slice (rows with a gap) or slicing two axes at once fails this and falls
+// back to the gather shader.
+inline bool contiguous_slice_range(const std::vector<int> &in_shape,
+                                   const std::vector<int> &out_shape,
+                                   const std::vector<int> &starts,
+                                   const std::vector<int> &steps,
+                                   size_t elem_size, VkDeviceSize &byte_offset,
+                                   VkDeviceSize &byte_len) {
+    int rank = static_cast<int>(in_shape.size());
+    if (static_cast<int>(out_shape.size()) != rank ||
+        static_cast<int>(starts.size()) < rank ||
+        static_cast<int>(steps.size()) < rank) {
+        return false;
+    }
+    std::vector<int64_t> stride(rank, 1);
+    for (int d = rank - 2; d >= 0; --d) {
+        stride[d] = stride[d + 1] * in_shape[d + 1];
+    }
+    int64_t first = 0, last = 0, n = 1;
+    for (int d = 0; d < rank; ++d) {
+        if (steps[d] != 1) {
+            return false; // a strided slice is never a contiguous block
+        }
+        int64_t s = starts[d];
+        int64_t o = out_shape[d];
+        if (o <= 0 || s < 0 || s + o > in_shape[d]) {
+            return false;
+        }
+        n *= o;
+        first += s * stride[d];
+        last += (s + o - 1) * stride[d];
+    }
+    if (n != last - first + 1) {
+        return false; // gaps between selected elements -> not contiguous
+    }
+    byte_offset = static_cast<VkDeviceSize>(first) * elem_size;
+    byte_len = static_cast<VkDeviceSize>(n) * elem_size;
+    return true;
+}
+
+// True when a binding at `byte_offset` is legal for an SSBO AND preserves the
+// fp16 word packing. Vulkan requires the offset to be a multiple of the
+// device's minStorageBufferOffsetAlignment; the fp16 backed layout packs two
+// halves per uint, so the offset must also be 4-byte aligned (an even element
+// index) or a consumer's word read would straddle two halves of different
+// words. Both fall out of requiring max(align, 4).
+inline bool offset_view_aligned(VkDeviceSize byte_offset, VkDeviceSize align) {
+    VkDeviceSize a = align > 4 ? align : 4;
+    return (byte_offset % a) == 0;
+}
+
 // ONNX right-aligned broadcast: given the (lower-or-equal-rank) input shape
 // `in_shape` and the broadcast `out_shape`, map a linear output index `lin`
 // to the linear input index (broadcast dims / leading padding dims map to

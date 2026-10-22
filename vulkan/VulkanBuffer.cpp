@@ -3,6 +3,7 @@
 #include "VulkanLib.hpp"
 #include "VulkanResource.hpp"
 #include <stdexcept>
+#include <utility>
 
 namespace vkop {
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
@@ -34,7 +35,19 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
 #endif
 }
 
+// Borrowed sub-range view: share the parent's VkBuffer, own nothing. m_vdev_
+// comes from the parent (protected member accessed on a VulkanBuffer object,
+// which the language allows from a VulkanBuffer member). No createBuffer, no
+// allocMemory, no vkBindBufferMemory.
+VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanBuffer> parent,
+                           VkDeviceSize offset, VkDeviceSize range)
+    : VulkanResource(parent->m_vdev_), m_size_(range),
+      parent_(std::move(parent)), range_offset_(offset) {}
+
 VulkanBuffer::~VulkanBuffer() {
+    if (parent_) {
+        return; // borrowed: the parent owns and frees the VkBuffer/memory
+    }
 #ifndef USE_VMA
     if (m_buffer_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(m_vdev_->getLogicalDevice(), m_buffer_, nullptr);
@@ -45,6 +58,9 @@ VulkanBuffer::~VulkanBuffer() {
 }
 
 VkBuffer VulkanBuffer::getBuffer() const {
+    if (parent_) {
+        return parent_->getBuffer();
+    }
 #ifndef USE_VMA
     return m_buffer_;
 #else
@@ -90,7 +106,11 @@ std::variant<VkDescriptorImageInfo *, VkDescriptorBufferInfo *, VkBufferView *>
 VulkanBuffer::getDescriptorInfo() {
     VkBuffer buff = getBuffer();
     buffer_info_.buffer = buff;
-    buffer_info_.offset = 0;
+    // A borrowed sub-range binds the parent's VkBuffer at a byte offset; the
+    // shader's element 0 then maps to parent byte `range_offset_` with no
+    // shader change (the descriptor offset is transparent). An owning buffer
+    // binds from 0.
+    buffer_info_.offset = parent_ ? range_offset_ : 0;
     buffer_info_.range = m_size_;
     return &buffer_info_;
 }
@@ -100,6 +120,15 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
                                     VkPipelineStageFlags src_stage,
                                     VkPipelineStageFlags dst_stage,
                                     VkDeviceSize size, VkDeviceSize offset) {
+    // A borrowed sub-range view forwards barriers to the parent: the access
+    // state that matters belongs to the one real allocation, so the producer's
+    // next transition sees the prior read/write. Over-wide (whole parent) is
+    // safe.
+    if (parent_) {
+        parent_->transitionBuffer(commandBuffer, dstAccessMask, src_stage,
+                                  dst_stage, size, offset);
+        return;
+    }
     VkBuffer buff = getBuffer();
     VkBufferMemoryBarrier barrier;
     barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
@@ -120,6 +149,10 @@ void VulkanBuffer::transitionBuffer(VkCommandBuffer commandBuffer,
 
 void VulkanBuffer::shaderWriteBarrier(VkCommandBuffer commandBuffer,
                                       VkDeviceSize size, VkDeviceSize offset) {
+    if (parent_) {
+        parent_->shaderWriteBarrier(commandBuffer, size, offset);
+        return;
+    }
     // Explicitly set srcAccess=SHADER_WRITE (prior compute-shader writes),
     // dstAccess=SHADER_READ (subsequent compute-shader reads). Does NOT rely
     // on m_access_ tracking (which doesn't capture shader writes).
@@ -142,6 +175,10 @@ void VulkanBuffer::shaderWriteBarrier(VkCommandBuffer commandBuffer,
 
 void VulkanBuffer::indirectReadBarrier(VkCommandBuffer commandBuffer,
                                        VkDeviceSize size, VkDeviceSize offset) {
+    if (parent_) {
+        parent_->indirectReadBarrier(commandBuffer, size, offset);
+        return;
+    }
     // shader-write -> indirect-command-read. The dispatch_from_shape pre-pass
     // (compute shader) wrote the VkDispatchIndirectCommand;
     // vkCmdDispatchIndirect reads it at the DRAW_INDIRECT stage.
@@ -232,6 +269,14 @@ void VulkanBuffer::copyBufferToStageBuffer(VkCommandBuffer commandBuffer,
                                            VkDeviceSize dstoffset,
                                            VkDeviceSize size,
                                            VkDeviceSize offset) {
+    if (parent_) {
+        // Read the view's window: shift by range_offset_ and default the size
+        // to the range so a WHOLE_SIZE caller reads exactly the view.
+        VkDeviceSize sz = (size == VK_WHOLE_SIZE) ? m_size_ : size;
+        parent_->copyBufferToStageBuffer(commandBuffer, dstbuffer, dstoffset,
+                                         sz, offset + range_offset_);
+        return;
+    }
     VkAccessFlags old_access = m_access_;
     if (m_access_ != VK_ACCESS_TRANSFER_READ_BIT) {
         transferReadBarrier(commandBuffer, size, offset);
@@ -253,6 +298,12 @@ void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
                                            VkDeviceSize srcoffset,
                                            VkDeviceSize size,
                                            VkDeviceSize offset) {
+    if (parent_) {
+        VkDeviceSize sz = (size == VK_WHOLE_SIZE) ? m_size_ : size;
+        parent_->copyStageBufferToBuffer(commandBuffer, srcbuffer, srcoffset,
+                                         sz, offset + range_offset_);
+        return;
+    }
     VkAccessFlags old_access = m_access_;
     if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
         transferWriteBarrier(commandBuffer, size, offset);
@@ -271,6 +322,11 @@ void VulkanBuffer::copyStageBufferToBuffer(VkCommandBuffer commandBuffer,
 
 void VulkanBuffer::fillBuffer(VkCommandBuffer commandBuffer, uint32_t value,
                               VkDeviceSize size, VkDeviceSize offset) {
+    if (parent_) {
+        VkDeviceSize sz = (size == VK_WHOLE_SIZE) ? m_size_ : size;
+        parent_->fillBuffer(commandBuffer, value, sz, offset + range_offset_);
+        return;
+    }
     VkAccessFlags old_access = m_access_;
     if (m_access_ != VK_ACCESS_TRANSFER_WRITE_BIT) {
         transferWriteBarrier(commandBuffer, size, offset);
@@ -282,6 +338,11 @@ void VulkanBuffer::fillBuffer(VkCommandBuffer commandBuffer, uint32_t value,
 
 void VulkanBuffer::updateBuffer(VkCommandBuffer commandBuffer, const void *data,
                                 VkDeviceSize size, VkDeviceSize offset) {
+    if (parent_) {
+        parent_->updateBuffer(commandBuffer, data, size,
+                              offset + range_offset_);
+        return;
+    }
     // vkCmdUpdateBuffer copies host data directly into the buffer during
     // command recording (no staging buffer). Limited to 65536 bytes per call
     // (Vulkan spec); Shape outputs are 32-64 bytes, well within range. The

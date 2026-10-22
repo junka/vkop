@@ -169,3 +169,43 @@ TEST(SplitTest, SplitComprehensiveTest) {
         }));
     }
 }
+
+// Zero-copy contiguous fast path. A Split along the OUTERMOST axis carves the
+// input into contiguous blocks, so SplitBuffer binds the input's VkBuffer at
+// each block's byte offset instead of dispatching split.comp. Every case above
+// splits an inner axis, which interleaves the pieces and must stay a real
+// gather; this is the fast-path guard. Correctness here also covers the
+// borrowed view's byte-window readback (each output must read its own block,
+// not the input's head).
+TEST(SplitTest, SplitOuterAxisContiguousBuffer) {
+    vkop::tests::ScopedBufferBackend buffer;
+    std::vector<int> input_shape{8, 4, 8};
+    int axis = 0;
+    std::vector<int64_t> split_shape{2, 6};
+
+    auto attrs_for = [](SplitTest<float> &t) {
+        return [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+            auto *s = dynamic_cast<Split *>(op.get());
+            ASSERT_NE(s, nullptr);
+            s->setAttribute(t.attributes);
+        };
+    };
+
+    LOG_INFO("Testing Split outer-axis fast path fp32");
+    SplitTest<float> fp32(input_shape, axis, split_shape);
+    std::vector<std::shared_ptr<vkop::core::ITensor>> out32(fp32.outputs.begin(),
+                                                            fp32.outputs.end());
+    EXPECT_TRUE(fp32.run_test({fp32.input, fp32.split_}, out32,
+                              attrs_for(fp32)));
+
+    LOG_INFO("Testing Split outer-axis fast path fp16");
+    SplitTest<uint16_t> fp16(input_shape, axis, split_shape);
+    std::vector<std::shared_ptr<vkop::core::ITensor>> out16(fp16.outputs.begin(),
+                                                            fp16.outputs.end());
+    auto attrs16 = [&fp16](std::unique_ptr<vkop::ops::Operator> &op) {
+        auto *s = dynamic_cast<Split *>(op.get());
+        ASSERT_NE(s, nullptr);
+        s->setAttribute(fp16.attributes);
+    };
+    EXPECT_TRUE(fp16.run_test({fp16.input, fp16.split_}, out16, attrs16));
+}

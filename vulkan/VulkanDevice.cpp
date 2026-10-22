@@ -187,6 +187,17 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     return properties2.properties;
 }
 
+VkDeviceSize VulkanDevice::minStorageBufferOffsetAlignment() {
+    if (min_sb_offset_align_ == 0) {
+        min_sb_offset_align_ =
+            getProperties().limits.minStorageBufferOffsetAlignment;
+        if (min_sb_offset_align_ == 0) {
+            min_sb_offset_align_ = 1;
+        }
+    }
+    return min_sb_offset_align_;
+}
+
 uint32_t VulkanDevice::findComputeQueueFamily() {
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice_,
