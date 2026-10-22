@@ -1452,9 +1452,20 @@ TEST(BufferRankTest, ResizeNearestUpAndDown) {
 // that can catch a skip that stops too early: nothing else in this file
 // reaches it, because every causal case here is S <= 197 < TILE_KV=256, and a
 // causal-only op never carries a mask at all.
+// `seq_rank` selects the non-native Q/K/V layout: 0 is the kernel's native
+// [B,H,S,D]; 4 is seq_major's [B,S,H,D], the very same numbers handed over with
+// the head and seq axes swapped; 3 is the rank-3 [S,H,D] the ViT vision tower's
+// fold actually leaves behind (its Split drops the batch axis, so the tensor
+// the head-reorder Transpose reads is rank 3). Either way it is a pure
+// addressing change — a row is D contiguous elements in every layout — so the
+// reference is just the [B,S,H,D] view of the identical fp32 result, and the
+// bar is unchanged. A wrong row base reads a *different head's* row and still
+// produces plausible-looking softmax output, which is exactly the failure that
+// would otherwise reach the vision tower silently.
 template <typename T>
 bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
-                        bool causal, bool use_mask, bool mask_causal = false) {
+                        bool causal, bool use_mask, bool mask_causal = false,
+                        int seq_rank = 0) {
     Dev d;
     const int Hkv = H / rep;
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
@@ -1502,16 +1513,39 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
             {Slice(), Slice(g * rep, (g + 1) * rep), Slice(), Slice()},
             torch::matmul(p, Vg));
     }
+    const bool seq_major = seq_rank != 0;
+    const bool seq_rank3 = seq_rank == 3;
     auto ref = yf.to(opt.dtype());
+    auto q_i = q;
+    auto k_i = k;
+    auto v_i = v;
+    std::vector<int> q_shape{B, H, S, D};
+    std::vector<int> kv_shape{B, Hkv, kv, D};
+    if (seq_major) {
+        ref = ref.transpose(1, 2).contiguous();
+        q_i = q.transpose(1, 2).contiguous();
+        k_i = k.transpose(1, 2).contiguous();
+        v_i = v.transpose(1, 2).contiguous();
+        q_shape = {B, S, H, D};
+        kv_shape = {B, kv, Hkv, D};
+        if (seq_rank3) {
+            // The rank-3 operand: the batch axis simply is not declared. The
+            // bytes are untouched (the batch dim was 1), and the OUTPUT stays
+            // rank-4 — that is the whole contract, so one of the cases below
+            // hands the op a rank-3 output placeholder to prove it resizes.
+            q_shape = {S, H, D};
+            kv_shape = {kv, Hkv, D};
+        }
+    }
 
-    auto Qi = std::make_shared<Tensor<T>>(std::vector<int>{B, H, S, D});
-    brt_fill(Qi, q);
+    auto Qi = std::make_shared<Tensor<T>>(q_shape);
+    brt_fill(Qi, q_i);
     brt_upload(Qi, d);
-    auto Ki = std::make_shared<Tensor<T>>(std::vector<int>{B, Hkv, kv, D});
-    brt_fill(Ki, k);
+    auto Ki = std::make_shared<Tensor<T>>(kv_shape);
+    brt_fill(Ki, k_i);
     brt_upload(Ki, d);
-    auto Vi = std::make_shared<Tensor<T>>(std::vector<int>{B, Hkv, kv, D});
-    brt_fill(Vi, v);
+    auto Vi = std::make_shared<Tensor<T>>(kv_shape);
+    brt_fill(Vi, v_i);
     brt_upload(Vi, d);
 
     std::vector<std::shared_ptr<vkop::core::ITensor>> ins{Qi, Ki, Vi};
@@ -1521,20 +1555,32 @@ bool brt_attention_case(int B, int H, int S, int D, int kv, int rep,
         brt_upload(Mi, d);
         ins.push_back(Mi);
     }
-    auto output = brt_make_out<T>(brt_to_int_shape(ref), d);
+    // A rank-3 output placeholder with the same element count: without an
+    // explicit shape comparison the op would leave it rank 3, and the tensor
+    // the converter's fold hands over is declared rank-4 — the dims metadata a
+    // downstream Reshape reads would then be wrong.
+    auto out_shape = seq_rank3 ? std::vector<int>{S, H, D}
+                               : brt_to_int_shape(ref);
+    auto output = brt_make_out<T>(out_shape, d);
     auto op = brt_make_op(vkop::ops::OpType::ATTENTION,
                           std::is_same_v<T, uint16_t>,
                           {{"scale", std::to_string(scale)},
                            {"num_heads", std::to_string(H)},
                            {"num_kv_heads", std::to_string(Hkv)},
                            {"causal", causal ? "1" : "0"},
-                           {"mask_causal", mask_causal ? "1" : "0"}},
+                           {"mask_causal", mask_causal ? "1" : "0"},
+                           {"seq_major", seq_major ? "1" : "0"}},
                           d);
     if (!op)
         return false;
     op->onExecute(ins, {output}, 0);
     brt_run_op(op.get(), d);
     output->copyToCPU(d.cmdpool);
+    if (seq_rank3 && output->getShape().size() != 4) {
+        LOG_ERROR("seq_major rank-3: Y stayed rank %d, expected rank 4",
+                  static_cast<int>(output->getShape().size()));
+        return false;
+    }
     float rtol = std::is_same_v<T, uint16_t> ? 0.03f : 0.002f;
     return brt_close_to_torch(output, ref, rtol, rtol);
 }
@@ -1870,6 +1916,96 @@ TEST(BufferRankTest, AttentionFp32AndFp16) {
     EXPECT_TRUE(brt_attention_cache_case<uint16_t>(8, 128, 6, 1, 2, true, true, true, true));
     EXPECT_TRUE(brt_attention_cache_case<float>(4, 64, 256, 44, 1, false, false, true, true));
     EXPECT_TRUE(brt_attention_cache_case<uint16_t>(4, 64, 1, 1, 1, false, true, true, true));
+}
+
+// The same kernel with `seq_major`: Q/K/V/Y are [B,S,H,D]. Every case above
+// gets its seq-major twin here — the addressing is a different arithmetic path
+// entirely (row base and kv step both change), so it needs its own coverage,
+// not just the one shape the converter happens to emit. The GQA cases matter
+// most: `kv_step` becomes Hkv*D, so a wrong step walks off into the next
+// position's head rather than the next head of the same position.
+//
+// The last group repeats the whole thing at rank 3, the form the ViT vision
+// tower actually produces: its Split drops the batch axis and the op reads the
+// tensor *before* the head-reorder Transpose, so Q/K/V are [S,H,D] while Y is
+// still the rank-4 [1,S,H,D] the dropped undo Transpose used to write.
+TEST(BufferRankTest, AttentionSeqMajor) {
+    // MHA self-attention, the plain case.
+    EXPECT_TRUE(brt_attention_case<float>(2, 4, 5, 64, 5, 1, false, false, false,
+                                          4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(2, 4, 5, 64, 5, 1, false, false,
+                                             false, 4));
+    // GQA (rep=2,4) — kv_step != D — with and without causal.
+    EXPECT_TRUE(brt_attention_case<float>(1, 8, 6, 128, 6, 2, true, false, false,
+                                          4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 8, 4, 64, 4, 4, false, false,
+                                             false, 4));
+    // Decode-shaped (S=1, past).
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 1, 128, 9, 1, true, false, false,
+                                          4));
+    // An additive mask: its [B,1,S,kv] index is layout-independent, so this
+    // pins that seq_major does not leak into the mask addressing.
+    EXPECT_TRUE(brt_attention_case<float>(2, 2, 5, 64, 5, 1, false, true, false,
+                                          4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 3, 64, 3, 2, true, true, true,
+                                             4));
+    // Multi-tile kv, so the tile walk is exercised too.
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 3, 64, 300, 1, false, false,
+                                          false, 4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 3, 64, 300, 2, false, false,
+                                             false, 4));
+
+    // Rank 3: the vision tower's operand form. B is 1 by construction, and the
+    // op derives it rather than reading a batch axis.
+    EXPECT_TRUE(brt_attention_case<float>(1, 4, 5, 64, 5, 1, false, false, false,
+                                          3));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 5, 64, 5, 1, false, false,
+                                             false, 3));
+    EXPECT_TRUE(brt_attention_case<float>(1, 8, 6, 128, 6, 2, true, false, false,
+                                          3));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 4, 3, 64, 300, 2, false, false,
+                                             false, 3));
+    // Production-shaped static ViT attention (visual.onnx): [1,16,196,64], at
+    // both operand ranks.
+    EXPECT_TRUE(brt_attention_case<float>(1, 16, 196, 64, 196, 1, false, false,
+                                          false, 4));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 16, 196, 64, 196, 1, false,
+                                             false, false, 4));
+    EXPECT_TRUE(brt_attention_case<float>(1, 16, 196, 64, 196, 1, false, false,
+                                          false, 3));
+    EXPECT_TRUE(brt_attention_case<uint16_t>(1, 16, 196, 64, 196, 1, false,
+                                             false, false, 3));
+}
+
+// seq_major is defined only for the no-cache form. The cache form addresses its
+// fresh K/V rows at the native [H,S,D] pitch inside copy_cache / copy_cache_f8,
+// which seq_major does not touch, so accepting both would read the wrong rows
+// with no other symptom. The converter never emits both; the op rejects the
+// combination rather than compute wrong numbers.
+TEST(BufferRankTest, AttentionSeqMajorRejectsCacheForm) {
+    Dev d;
+    auto qh = torch::randn({1, 4, 2, 8}, brt_torch_opt<float>());
+    auto kh = torch::randn({1, 2, 4, 8}, brt_torch_opt<float>());
+    auto vh = torch::randn({1, 2, 4, 8}, brt_torch_opt<float>());
+    auto qi = std::make_shared<Tensor<float>>(std::vector<int>{1, 4, 2, 8});
+    brt_fill(qi, qh);
+    brt_upload(qi, d);
+    auto ki = std::make_shared<Tensor<float>>(std::vector<int>{1, 2, 4, 8});
+    brt_fill(ki, kh);
+    brt_upload(ki, d);
+    auto vi = std::make_shared<Tensor<float>>(std::vector<int>{1, 2, 4, 8});
+    brt_fill(vi, vh);
+    brt_upload(vi, d);
+    auto out = brt_make_out<float>({1, 2, 4, 8}, d);
+    auto op = brt_make_op(vkop::ops::OpType::ATTENTION, false,
+                          {{"scale", "0.35355339"},
+                           {"num_heads", "4"},
+                           {"num_kv_heads", "4"},
+                           {"seq_major", "1"},
+                           {"has_cache", "1"}},
+                          d);
+    ASSERT_TRUE(op);
+    EXPECT_THROW(op->onExecute({qi, ki, vi}, {out}, 0), std::runtime_error);
 }
 
 } // namespace

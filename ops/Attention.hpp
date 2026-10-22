@@ -42,7 +42,7 @@ struct alignas(16) AttentionPC {
     int ring_head;     // physical slot of logical row 0 (0 when ring == 0)
     float cache_scale; // fp8 cache dequant/quant scale (1.0 for an fp16 cache)
     int cache_fp8;     // 0/1: the cache holds E4M3 bytes, not Q-dtype elements
-    int _pad0;
+    int seq_major;     // 0/1: Q/K/V are [B,S,H,D] and Y is written likewise
     int _pad1;
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
@@ -119,6 +119,16 @@ class AttentionBuffer : public BufferFactory {
         if (attributes.find("has_ring") != attributes.end()) {
             ring_ = static_cast<int>(std::stol(attributes.at("has_ring")));
         }
+        // seq_major: Q/K/V arrive as [B,S,H,D] (or the rank-3 [S,H,D] the
+        // vision encoder's fold leaves) and Y is written as [B,S,H,D], instead
+        // of the kernel's native [B,H,S,D]. The converter sets it when it drops
+        // the head-reorder Transpose+Unsqueeze that exists only to hand this op
+        // its native order. Purely an addressing change: a row is D contiguous
+        // elements in either order.
+        if (attributes.find("seq_major") != attributes.end()) {
+            seq_major_ =
+                static_cast<int>(std::stol(attributes.at("seq_major")));
+        }
         // fp8 cache: the cache SSBO holds E4M3 bytes and the op does the
         // decode/encode itself, which is what lets an fp8 cache be written in
         // place (past == present) instead of through a fp16 intermediate. The
@@ -161,17 +171,47 @@ class AttentionBuffer : public BufferFactory {
         // Inputs: 0=Q, 1=K, 2=V, then [cache,] [mask].
         auto q_shape = inputs[0]->getShape();
         auto k_shape = inputs[1]->getShape();
-        if (q_shape.size() != 4 || k_shape.size() != 4) {
-            throw std::runtime_error(
-                "Attention: Q and K must be rank-4 [B,H,S,D] / [B,Hkv,kv,D]");
-        }
         const bool has_cache = has_cache_ != 0;
-        int batch = dim(q_shape, 0);
-        int heads = dim(q_shape, 1);
-        int seq = dim(q_shape, 2);
-        int head_dim = dim(q_shape, 3);
-        int kv_heads = dim(k_shape, 1);
-        int kv_new = dim(k_shape, 2); // fresh rows: S with a cache, kv without
+        const bool seq_major = seq_major_ != 0;
+        // Rank 4 is [B,H,S,D] natively and [B,S,H,D] under seq_major. Under
+        // seq_major a rank-3 [S,H,D] (batch 1) is also accepted: that is the
+        // vision encoder's form, and it is what the converter's
+        // fuse_attention_seq_major leaves behind — it moves this op's read
+        // point back past the Transpose(perm=[1,0,2])+Unsqueeze pair, and the
+        // tensor those read is the rank-3 one. Addressing is identical to the
+        // rank-4 [1,S,H,D] case because the batch term is 0 either way.
+        const bool rank3 = q_shape.size() == 3;
+        if (rank3 ? !seq_major : q_shape.size() != 4) {
+            throw std::runtime_error(
+                "Attention: Q and K must be rank-4 [B,H,S,D] / [B,Hkv,kv,D]"
+                " (or rank-3 [S,H,D] under seq_major)");
+        }
+        if (k_shape.size() != q_shape.size()) {
+            throw std::runtime_error(
+                "Attention: K must have the same rank as Q");
+        }
+        // The cache form's fresh-row operands are addressed by the shader's
+        // copy_cache/copy_cache_f8 at the native [H,S,D] pitch; seq_major would
+        // silently mis-read them. The converter never sets both, so this is a
+        // declaration check, not a live path.
+        if (seq_major && has_cache) {
+            throw std::runtime_error(
+                "Attention: seq_major cannot be combined with has_cache");
+        }
+        int batch = rank3 ? 1 : dim(q_shape, 0);
+        // Heads/seq trade places with the layout: [B,H,S,D] natively, [B,S,H,D]
+        // under seq_major — where the batch axis may be gone entirely. Every
+        // axis of Q belongs to exactly one of these cases.
+        int heads = rank3 ? dim(q_shape, 1)
+                          : (seq_major ? dim(q_shape, 2) : dim(q_shape, 1));
+        int seq = rank3 ? dim(q_shape, 0)
+                        : (seq_major ? dim(q_shape, 1) : dim(q_shape, 2));
+        int head_dim = dim(q_shape, q_shape.size() - 1);
+        int kv_heads = rank3 ? dim(k_shape, 1)
+                             : (seq_major ? dim(k_shape, 2) : dim(k_shape, 1));
+        // Fresh rows: S with a cache, kv without.
+        int kv_new = rank3 ? dim(k_shape, 0)
+                           : (seq_major ? dim(k_shape, 1) : dim(k_shape, 2));
 
         // GQA: kv_heads divides heads; group-contiguous h_kv = h / rep.
         if (kv_heads <= 0 || heads % kv_heads != 0) {
@@ -363,14 +403,25 @@ class AttentionBuffer : public BufferFactory {
         pc.ring_head = ring_head;
         pc.cache_scale = cache_fp8 ? cache_scale_ : 1.0f;
         pc.cache_fp8 = cache_fp8 ? 1 : 0;
+        pc.seq_major = seq_major ? 1 : 0;
 
         int grid = batch * heads * seq;
+        // Y is written in the [B,S,H,D] order under seq_major whatever rank Q
+        // arrived at, because its bytes always land at the rank-4 seq-major
+        // offset: for rank 3 that is the [1,S,H,D] form the converter's fold
+        // hands over (the dropped undo-Transpose's output). Resizing to Q's
+        // rank-3 shape would declare the wrong dims on that tensor, and the
+        // element count can be unchanged, so the shape has to be compared too.
+        std::vector<int> y_shape = q_shape;
+        if (seq_major) {
+            y_shape = {batch, seq, heads, head_dim};
+        }
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            // Y has Q's shape; resize if the runtime made a placeholder.
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->num_elements() != total_elems(q_shape)) {
-                output->resize(q_shape);
+            if (output->num_elements() != total_elems(y_shape) ||
+                (seq_major && output->getShape() != y_shape)) {
+                output->resize(y_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true); // binding 0
             bind_ssbo<T>(inputs[0], /*is_output=*/false); // binding 1 (Q)
@@ -486,6 +537,11 @@ class AttentionBuffer : public BufferFactory {
     int num_kv_heads_ = 0; // ditto
     int causal_ = 0;
     int has_cache_ = 0;
+    // Q/K/V/Y are [B,S,H,D] (see setAttribute), Q/K/V optionally rank-3
+    // [S,H,D]. Set by the converter when it drops the Transpose+Unsqueeze
+    // head-reorder feeding this op; 0 keeps the native [B,H,S,D] addressing
+    // every existing graph relies on.
+    int seq_major_ = 0;
     // Sliding-window ring (see execute()). Off unless the converter declares
     // it, so a graph without the ring is byte-identical to before.
     int ring_ = 0;

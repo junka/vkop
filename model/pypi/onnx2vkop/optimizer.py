@@ -1394,6 +1394,24 @@ class FusionOptimizer:
             )
         )
 
+        # Q/K/V head-reorder: drop the Squeeze/Transpose/Unsqueeze chain that
+        # only exists to hand Attention its native [B,H,S,D] order, and the
+        # Transpose that undoes it, declaring seq_major=1 instead. Runs after
+        # both attention fusions so the anchor exists and already has its final
+        # Q/K/V wiring. 96 Transposes + 72 Unsqueezes on the ViT vision tower,
+        # measured at -12.7 ms of Transpose GPU time and -168 dispatches
+        # (876 -> 708) on a 49-token run; a no-op on every graph that exports in
+        # the native order (all of Q/K/V must match, so a partial fold cannot
+        # happen).
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_attention_seq_major",
+                FusionOptimizer.match_attention_seq_major,
+                FusionOptimizer.fold_attention_seq_major,
+                priority=73,
+            )
+        )
+
         # Elemwise chain fusion (kernel-fusion engine): collapse single-
         # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
         # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
@@ -1830,6 +1848,15 @@ class FusionOptimizer:
     @staticmethod
     def fold_cast_wrapped_layernorm(dag_model, match) -> bool:
         return FusionOptimizer.fold_post_unary_upcast(dag_model, match)
+
+    @staticmethod
+    def _dim_matches(got, want):
+        """A recorded dim matches unless both are concrete and differ. A
+        symbolic dim is a non-positive int (or a dim_param string, which also
+        fails the isinstance), and matches anything."""
+        if not isinstance(got, int) or not isinstance(want, int):
+            return True
+        return got <= 0 or want <= 0 or got == want
 
     # ---- P2: Squeeze/Unsqueeze 在转换期 fuse 掉（纯 view，不进 GPU）----
     # Squeeze/Unsqueeze 是 view 算子：只改逻辑 shape，不搬数据。在 VKOP 的 4D
@@ -4326,6 +4353,158 @@ class FusionOptimizer:
             del dag_model.nodes[n.name]
         print(f"Fused KV-cache append into '{att.name}' "
               f"(present={match['present']['name']})")
+        return True
+
+    # ---- Attention: fold the Q/K/V head-reorder into the op (seq_major) -----
+    #
+    # The ViT vision encoder projects Q/K/V in seq-major order ([B,S,H,D]) and
+    # then spends a Transpose per operand swapping heads and seq into the
+    # [B,H,S,D] the Attention kernel was written for, plus one more to swap the
+    # output back:
+    #
+    #     Split(axis=0) -> [1,N,H,D]        (a zero-copy range view)
+    #       Squeeze -> [N,H,D]              (free view)
+    #       ... fp16->fp32 Cast, RotaryEmbedding, fp32->fp16 Cast, for Q/K ...
+    #       Transpose([1,0,2]) -> [H,N,D]   (a real permutation of the whole
+    #       Unsqueeze(0) -> [1,H,N,D]        tensor -- ~0.13 ms, not a view)
+    #       Attention -> [1,H,N,D]
+    #     Transpose([0,2,1,3]) -> [1,N,H,D] (the same permutation, back)
+    #
+    # The kernel reads Q/K/V in D-long rows whichever way the H and S axes are
+    # ordered -- only a row's base address and the step between consecutive kv
+    # positions change -- so the op can read the Transpose's own input, the
+    # rank-3 seq-major [N,H,D], and write the rank-4 [1,N,H,D] the undo
+    # Transpose used to produce. That is `seq_major=1`; see ops/Attention.hpp.
+    #
+    # Nothing *before* the Transpose moves. That is the point: the vision tower
+    # puts the RotaryEmbedding (and its Cast pair) between the Squeeze and the
+    # Transpose, so the fold cannot rewire Q/K back to the Split output -- it
+    # relabels where the op reads from, and the whole RoPE path stays wired to
+    # the tensor it already had. Deleting the pair removes 3 real Transpose
+    # dispatches and 3 Unsqueezes per block, plus the undo Transpose: on the
+    # 24-block tower that is 96 + 72 dispatches gone, measured against the same
+    # graph converted with VKOP_NO_FUSIONS=fuse_attention_seq_major as -12.7 ms
+    # of Transpose GPU time (21.2 -> 8.6 ms) with the four outputs bit-identical.
+    #
+    # Sound because every deleted node is bound to exactly one consumer, the
+    # pair's net effect is exactly Transpose([0,2,1,3]) on the rank-4 view
+    # (squeeze(0)/unsqueeze(0) cancel, and [1,0,2] on the rank-3 inner axes is
+    # that same swap), and all of Q/K/V must match -- a partial fold would leave
+    # one operand in the other order. The output side is checked too: the undo
+    # Transpose must be that exact permutation and single-consumer, or the
+    # result would come out swapped twice. An Attention with a KV cache is
+    # skipped: its fresh rows are read by the cache copy at the native pitch,
+    # and the op rejects the combination.
+    @staticmethod
+    def _attn_head_reorder(dag_model, producer, consumers, tdict):
+        """{"unsqueeze", "transpose", "src"} when `tdict` is the rank-4
+        [1,H,S,D] view reached from a rank-3 [S,H,D] tensor by a
+        Transpose(perm=[1,0,2]) plus the Unsqueeze(0) that restores the batch
+        axis, else None. Only the two hops that turn the layout are inspected;
+        whatever produced the Transpose's input stays where it is."""
+        if len(consumers.get(tdict["name"], [])) != 1:
+            return None
+        unsq = producer.get(tdict["name"])
+        if unsq is None or unsq.op_type != "Unsqueeze" or len(unsq.outputs) != 1:
+            return None
+        if not unsq.inputs:
+            return None
+        tr = producer.get(unsq.inputs[0]["name"])
+        if (tr is None or tr.op_type != "Transpose" or len(tr.outputs) != 1
+                or len(consumers.get(tr.outputs[0]["name"], [])) != 1):
+            return None
+        # The perm must swap exactly the seq and head axes of the rank-3 inner
+        # form: [S,H,D] -> [H,S,D].
+        perm = tr.attributes.get("perm")
+        if not isinstance(perm, list) or [int(p) for p in perm] != [1, 0, 2]:
+            return None
+        if len(tr.inputs) != 1:
+            return None
+        # The Unsqueeze must put the batch axis back at the front, exactly
+        # undoing the Squeeze upstream, or the pair is not a pure rank no-op.
+        if FusionOptimizer._axes_as_list(dag_model, unsq) != [0]:
+            return None
+        src = tr.inputs[0]
+        sdims = src.get("shape")
+        # Rank 3, [S,H,D]: the form the op reads under seq_major (batch 1).
+        # Rank 4 here would mean the transpose was not the head/seq swap at all.
+        # The leading dim stays symbolic in the exported graph, so only the rank
+        # is checked here.
+        if sdims is None or len(sdims) != 3:
+            return None
+        return {"unsqueeze": unsq, "transpose": tr, "src": src}
+
+    @staticmethod
+    def match_attention_seq_major(dag_model):
+        """Match a fused Attention whose Q/K/V are all wrapped in the
+        head-reorder pair and whose output is transposed straight back."""
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+
+        matches = []
+        for node in list(dag_model.nodes.values()):
+            if node.op_type != "Attention" or node.attributes.get("has_cache"):
+                continue
+            if len(node.inputs) < 3 or len(node.outputs) != 1:
+                continue
+            chains = []
+            for i in (0, 1, 2):
+                c = FusionOptimizer._attn_head_reorder(
+                    dag_model, producer, consumers, node.inputs[i])
+                if c is None:
+                    break
+                chains.append(c)
+            else:
+                # The head counts the op will derive from the shapes must be the
+                # ones this graph was built for; a mismatch means the operands
+                # were reordered somewhere upstream and the pairing is wrong.
+                want = [node.attributes.get("num_heads"),
+                        node.attributes.get("num_kv_heads"),
+                        node.attributes.get("num_kv_heads")]
+                if any(w is not None
+                       and not FusionOptimizer._dim_matches(
+                           chains[i]["src"]["shape"][1], int(w))
+                       for i, w in enumerate(want)):
+                    continue
+                # The undo Transpose: Y is written in seq-major order too, so it
+                # must go, or the result comes out swapped twice.
+                y_name = node.outputs[0]["name"]
+                cs = consumers.get(y_name, [])
+                if len(cs) != 1:
+                    continue
+                otr = cs[0][0]
+                if otr.op_type != "Transpose" or len(otr.outputs) != 1:
+                    continue
+                operm = otr.attributes.get("perm")
+                if not isinstance(operm, list) or [int(p) for p in operm] != [0, 2, 1, 3]:
+                    continue
+                matches.append({
+                    "attention": node,
+                    "chains": chains,
+                    "out_transpose": otr,
+                    "out_tensor": otr.outputs[0],
+                    "nodes_to_delete": [c["unsqueeze"] for c in chains]
+                    + [c["transpose"] for c in chains]
+                    + [otr],
+                })
+        return matches
+
+    @staticmethod
+    def fold_attention_seq_major(dag_model, match) -> bool:
+        """Move the op's read point onto the pre-permute rank-3 operands, take
+        over the undo Transpose's output tensor, and declare seq_major=1."""
+        att = match["attention"]
+        att.inputs = list(att.inputs)
+        for i, chain in enumerate(match["chains"]):
+            att.inputs[i] = chain["src"]
+        # Y now carries the layout the undo Transpose used to produce, so it
+        # takes over that tensor: the consumers that named it keep resolving.
+        att.outputs = [match["out_tensor"]] + list(att.outputs[1:])
+        att.attributes = dict(att.attributes)
+        att.attributes["seq_major"] = 1
+        for n in match["nodes_to_delete"]:
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        print(f"Folded the Q/K/V head-reorder into '{att.name}' (seq_major=1)")
         return True
 
     @staticmethod

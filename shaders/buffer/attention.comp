@@ -94,7 +94,7 @@ layout(push_constant) uniform PC_ATTN {
     int ring_head;    // physical slot of logical row 0 (0 when ring == 0)
     float cache_scale; // fp8 cache scale (dequant multiplies, quant divides)
     int cache_fp8;    // 0/1: the cache holds E4M3 bytes, not compute-dtype elems
-    int _pad0;
+    int seq_major;    // 0/1: Q/K/V are [B,S,H,D] and Y is written the same way
     int _pad1;
 } uA;
 
@@ -444,7 +444,14 @@ void main() {
     int h_kv = h / uA.rep;
 
     // ---- stage the Q row (every lane needs all of it) ----
-    int q_base = ((b * H + h) * S + s) * D;
+    // Q/K/V/Y are [B,H,S,D] by default, or [B,S,H,D] when seq_major is set —
+    // the layout the producer already holds, which is what lets the converter
+    // drop the head-reorder Transpose that would otherwise exist only to hand
+    // this kernel its native order. A row is D contiguous elements either way;
+    // what changes is its base address and the step between consecutive kv
+    // positions, so the load/store patterns are untouched.
+    int q_base = (uA.seq_major != 0) ? ((b * S + s) * H + h) * D
+                                     : ((b * H + h) * S + s) * D;
     for (int d = lid; d < D; d += 256) {
         sQ[d] = LOADF(uQ, q_base + d);
     }
@@ -455,8 +462,13 @@ void main() {
     // at j - kv_past. Element offsets; LOADF folds the fp16 >>1. K/V hold
     // kv_new rows per head — kv without a cache, S with one.
     int kv_new = kv - kv_past;
-    int k_base = ((b * uA.kv_heads + h_kv) * kv_new) * D;
+    int k_base = (uA.seq_major != 0)
+                     ? (b * kv_new * uA.kv_heads + h_kv) * D
+                     : ((b * uA.kv_heads + h_kv) * kv_new) * D;
     int v_base = k_base;
+    // Elements between two consecutive kv positions of one head. D in the
+    // native [.., S, D] order, a whole head stride when the seq axis leads.
+    int kv_step = (uA.seq_major != 0) ? uA.kv_heads * D : D;
     int c_base = (h_kv * uA.src_stride) * D; // c = 0 (K); V adds nkv rows
     int c_v_base = c_base + (uA.kv_heads * uA.src_stride) * D;
     int past = kv - S; // absolute position of query row s is past + s
@@ -514,7 +526,7 @@ void main() {
                     SCORE_DOT(uCacheIn, off, dot);
                 }
             } else {
-                off = k_base + (j - kv_past) * D;
+                off = k_base + (j - kv_past) * kv_step;
                 SCORE_DOT(uK, off, dot);
             }
             float sc = dot * uA.scale;
@@ -575,7 +587,7 @@ void main() {
             }
             int lo = max(jlo, kv_past);
             for (int j = lo; j < jhi; ++j) {
-                ACC_PAIR(uV, v_base + (j - kv_past) * D, d0, sS[j - t0], p0, p1);
+                ACC_PAIR(uV, v_base + (j - kv_past) * kv_step, d0, sS[j - t0], p0, p1);
             }
             sAcc[sub][d0] = p0;
             sAcc[sub][d0 + 1] = p1;
