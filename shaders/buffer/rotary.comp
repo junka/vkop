@@ -65,7 +65,23 @@ layout(push_constant) uniform PC {
     int rotary_dim;   // 旋转区间宽度 = cos/sin 每行的列数；== head_dim 是整维旋转
                       // (Qwen/DiT)，< head_dim 是 partial rotary (Phi-4: 128 维里
                       // 只转前 96 维)。0 按 head_dim 处理。
+    int cs_fp32;      // 1 = cos/sin 是 fp32（X 可以是 fp16）。视觉塔的导出把 RoPE
+                      // 整个放在 fp32 域里（HF 的 tensor.float()/.to(orig_dtype)
+                      // 被 trace 成了 Cast 对），而激活是 fp16；这个标志让 fp16
+                      // build 按真实步长读 cos/sin，两种 build 的 fp32 内部运算
+                      // 因此逐位相同。0 = cos/sin 与 X 同为 fp16（LLM 的 MRoPE）。
 } uPC;
+
+// cos/sin 的读取视 cos/sin 自身的 dtype 而定，与 X 无关：fp16 build 里 X 走
+// BUF_LOAD（半精度打包），cos/sin 走这里按 cs_fp32 选。fp32 build 两者同一表达式，
+// 编译器会把分支折掉。
+#ifdef FP16
+#define BUF_LOAD_CS(data, idx) (uPC.cs_fp32 != 0 \
+        ? uintBitsToFloat((data)[(idx)]) \
+        : unpackHalf2x16((data)[(idx) >> 1])[(idx) & 1])
+#else
+#define BUF_LOAD_CS(data, idx) uintBitsToFloat((data)[(idx)])
+#endif
 
 // 旋转区间宽度：cos/sin 每行有多少列。== head_dim 就是整维旋转（Qwen / DiT），
 // < head_dim 是 partial rotary（Phi-4：head_dim 128 里只转前 96 维，后 32 维
@@ -110,8 +126,8 @@ float rotate_one(int gid, int d, int half_dim, int head_dim, int seq,
     float x = BUF_LOAD(uInputX.data, xidx);
     if (d >= rd) return x;
     int cs_idx = (b * seq + s) * rd + d;
-    float cos_v = BUF_LOAD(uInputCos.data, cs_idx);
-    float sin_v = BUF_LOAD(uInputSin.data, cs_idx);
+    float cos_v = BUF_LOAD_CS(uInputCos.data, cs_idx);
+    float sin_v = BUF_LOAD_CS(uInputSin.data, cs_idx);
     if (d < half_dim) {
         // real: x[d]*cos[d] - x[d+half]*sin[d]
         float x2 = BUF_LOAD(uInputX.data, xidx + half_dim);

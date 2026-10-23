@@ -889,6 +889,63 @@ TEST(BufferRankTest, RotaryEmbeddingPrefillAndDecode) {
     EXPECT_TRUE(brt_rotary_case<uint16_t>({1, 8, 3, 128}, true));
 }
 
+// The vision tower's folded form: fp16 X and Y, but the exporter's fp32 cos/sin
+// (RotaryEmbedding.cs_fp32=1 — the graph computes RoPE in fp32 while everything
+// around it is fp16, and fold_cast_into_rotary deletes the Cast pair that used
+// to carry X across that boundary). The shader must therefore load cos/sin at
+// the fp32 stride while reading X at the half2 one; getting that wrong reads a
+// half2 word as an fp32 bit pattern (~1e-5, not ~1), so the tolerance is sharp.
+bool brt_rotary_mixed_dtype_case(const std::vector<int> &xshape) {
+    Dev d;
+    int head_dim = xshape.back();
+    int seq = xshape[xshape.size() - 2];
+    int batch = xshape[0];
+    int half = head_dim / 2;
+    auto torch_x =
+        torch::randn(std::vector<int64_t>(xshape.begin(), xshape.end()),
+                     brt_torch_opt<uint16_t>());
+    auto cos_half = torch::randn({batch, 1, seq, half}, brt_torch_opt<float>());
+    auto sin_half = torch::randn({batch, 1, seq, half}, brt_torch_opt<float>());
+    auto torch_cos = torch::cat({cos_half, cos_half}, -1); // fp32, half-repeated
+    auto torch_sin = torch::cat({sin_half, sin_half}, -1);
+    // Reference = exactly what the deleted Cast pair did: promote X to fp32
+    // (exact — every half is a float), rotate in fp32 against fp32 cos/sin, then
+    // round once to fp16.
+    auto torch_out = brt_ref_rotary(torch_x.to(torch::kFloat32), torch_cos,
+                                    torch_sin)
+                         .to(torch::kFloat16);
+
+    auto input = std::make_shared<Tensor<uint16_t>>(xshape);
+    brt_fill(input, torch_x);
+    brt_upload(input, d);
+    auto cos_t = std::make_shared<Tensor<float>>(brt_to_int_shape(torch_cos));
+    brt_fill(cos_t, torch_cos);
+    brt_upload(cos_t, d);
+    auto sin_t = std::make_shared<Tensor<float>>(brt_to_int_shape(torch_sin));
+    brt_fill(sin_t, torch_sin);
+    brt_upload(sin_t, d);
+
+    auto output = brt_make_out<uint16_t>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::ROTARY_EMBEDDING, /*fp16=*/true, {},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute({input, cos_t, sin_t}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+
+    // rtol/atol of one fp16 ulp in either direction: the only difference left
+    // is fp32 contraction inside the multiply-add.
+    return brt_close_to_torch(output, torch_out, 0.005f, 0.005f);
+}
+
+TEST(BufferRankTest, RotaryEmbeddingFp16WithFp32CosSin) {
+    // 16 q-heads (prefill + decode) and 8 k-heads, mirroring the test above.
+    EXPECT_TRUE(brt_rotary_mixed_dtype_case({1, 16, 5, 128}));
+    EXPECT_TRUE(brt_rotary_mixed_dtype_case({1, 16, 1, 128}));
+    EXPECT_TRUE(brt_rotary_mixed_dtype_case({1, 8, 3, 128}));
+}
+
 // Sanity: cos=1, sin=0 -> q_rot = x*1 + rotate_half(x)*0 = x. Isolates
 // indexing/binding from the rotate-half arithmetic.
 template <typename T>

@@ -34,6 +34,12 @@ struct alignas(16) RotaryPC {
     // head_dim 128 只转前 96 维， 后 32 维直通）。0 = 按 head_dim
     // 处理，兼容不填这个字段的旧图。
     int rotary_dim;
+    // 1 = cos/sin 是 fp32（X 允许是 fp16）。视觉塔的导出把整个 RoPE 放在 fp32
+    // 域里，激活却是 fp16；fp16 build 的 shader 据此按 fp32 步长读 cos/sin，
+    // 于是两个 build 内部的 fp32 运算逐位一致 —— 这正是把包裹 RE 的
+    // Cast(f16->f32)/Cast(f32->f16) 对折掉仍然逐位相同的前提。
+    // 0 = cos/sin 与 X 同 dtype（LLM 的 MRoPE 是 fp16）。
+    int cs_fp32;
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
@@ -147,6 +153,10 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         pc.input_untransposed = input_untransposed_ ? 1 : 0;
         pc.seq_major = seq_major ? 1 : 0;
         pc.rotary_dim = rotary_dim;
+        // cos/sin are read at their own dtype's stride, which is independent of
+        // X's. The vision tower folds away the fp16->fp32 Cast that used to
+        // feed this op, leaving fp16 X next to the exporter's fp32 cos/sin.
+        pc.cs_fp32 = (inputs[1]->dtype() == typeid(uint16_t)) ? 0 : 1;
 
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);

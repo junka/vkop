@@ -1312,6 +1312,22 @@ class FusionOptimizer:
             )
         )
 
+        # Cast pair around RotaryEmbedding: the vision tower's exporter puts a
+        # Cast(f16->f32) / Cast(f32->f16) pair around every RE (HF's
+        # apply_rotary_pos_emb_vision does .float() ... .to(orig_dtype)), so the
+        # op runs fp32 while the rest of the tower runs fp16. The fold is
+        # bit-identical (see match_cast_into_rotary) and removes 96 dispatches
+        # on the 24-block tower. Must run after fuse_rotary_embedding (80), which
+        # is what creates the RE node the pair wraps.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fold_cast_into_rotary",
+                FusionOptimizer.match_cast_into_rotary,
+                FusionOptimizer.fold_cast_into_rotary,
+                priority=77,
+            )
+        )
+
         # Generic Unsqueeze elimination: skip single-axis Unsqueeze nodes
         # whose consumers are all the same op type (Concat, Expand, Cast, ...).
         # A size-1 axis is a linear-layout no-op — downstream ops read the
@@ -5315,6 +5331,72 @@ class FusionOptimizer:
             dag_model.nodes[cur.name] = fused
         if u.name in dag_model.nodes:
             del dag_model.nodes[u.name]
+        return True
+
+    # ---- Cast 对包裹 RotaryEmbedding 的 fp16 化吸收 ----
+    # The vision tower exports HF's apply_rotary_pos_emb_vision verbatim, whose
+    # `tensor = tensor.float()` / `return tensor.to(orig_dtype)` the tracer
+    # turned into a real Cast pair around every one of the 48 Q/K rotations:
+    #
+    #     Squeeze [f16] -> Cast(to=f32) -> RotaryEmbedding -> Cast(to=f16)
+    #
+    # vkop's RE runs the whole rotation in fp32 in BOTH shader builds — the
+    # fp16 build unpacks each half to float, does the same arithmetic, and packs
+    # the result back for its output word — so deleting the pair is not merely
+    # equivalent, it is bit-identical: the up-Cast is exact (every half is
+    # exactly representable in float) and the down-Cast's rounding is the same
+    # packHalf2x16 the fp16 build ends on. cos/sin stay fp32, which is how the
+    # exporter computes them; the op forwards that as pc.cs_fp32 so the fp16
+    # build loads them at their own (fp32) stride instead of the half2 one.
+    #
+    # Neither deleted node may have a second consumer: the tensors it read/wrote
+    # change dtype, and an op still declaring the old one would read half2-packed
+    # words as fp32 ([[fp32-buffer-op-built-with-fp16-shader]]).
+    @staticmethod
+    def match_cast_into_rotary(dag_model):
+        F16, F32 = 10, 1
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        matches = []
+        for node in dag_model.nodes.values():
+            if node.op_type != "RotaryEmbedding" or len(node.inputs) < 1:
+                continue
+            if len(node.outputs) != 1:
+                continue
+            up = producer.get(node.inputs[0]["name"])
+            if (up is None or up.op_type != "Cast" or len(up.inputs) != 1
+                    or len(up.outputs) != 1 or up.attributes.get("to") != F32):
+                continue
+            if len(consumers.get(up.outputs[0]["name"], [])) != 1:
+                continue
+            src = up.inputs[0]
+            # X is fp16 on the far side of the up-Cast, or there is nothing to
+            # fold — a fp32->fp32 Cast is eliminate_redundant_cast's business.
+            if FusionOptimizer._tensor_dtype(dag_model, src["name"]) != F16:
+                continue
+            cons = consumers.get(node.outputs[0]["name"], [])
+            if len(cons) != 1:
+                continue
+            down, _ = cons[0]
+            if (down.op_type != "Cast" or len(down.outputs) != 1
+                    or down.attributes.get("to") != F16):
+                continue
+            matches.append({"rotary": node, "src": src, "up": up,
+                            "down": down, "out": down.outputs[0]})
+        return matches
+
+    @staticmethod
+    def fold_cast_into_rotary(dag_model, match) -> bool:
+        """RE reads the fp16 tensor the up-Cast promoted and writes the fp16
+        tensor the down-Cast produced; both Casts go away."""
+        node = match["rotary"]
+        node.inputs = [match["src"]] + list(node.inputs[1:])
+        # Y takes over the down-Cast's output tensor so the consumers that named
+        # it keep resolving — the same relabelling fuse_attention_seq_major does.
+        node.outputs = [match["out"]]
+        for n in (match["up"], match["down"]):
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        print(f"Folded the fp16<->fp32 Cast pair around '{node.name}'")
         return True
 
     # ---- generic Unsqueeze elimination (Concat, Expand, Cast, ...) ----
