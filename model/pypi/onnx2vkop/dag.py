@@ -99,6 +99,18 @@ _VKOP_DTYPE_META_KEY = "vkop_dtype"
 # full sweep, so the declaration can only add speed, never change a result.
 _VKOP_CAUSAL_MASK_META_PREFIX = "vkop_causal_mask:"
 
+# The same channel for a different non-inferable fact: `vkop_logits_last_row:<output>`
+# = 1 declares that a graph output is only ever read at its last position along
+# the sequence axis. A greedy decoder reads logits[0, L-1, :] and nothing else,
+# but the graph cannot show that — `logits` has no in-graph consumer at all — so
+# a caller that wants per-position logits (perplexity, prompt logprobs, an
+# ORT-diffing driver) and one that wants only the next token look identical.
+# Declaring it lets the converter cut the LM head's M down to 1, which needs no
+# kernel work (a Slice on the activation) and nothing the runtime has to know.
+# A model that says nothing computes all L rows, exactly as exported, so the
+# declaration can only add speed on the declared output.
+_VKOP_LOGITS_LAST_ROW_META_PREFIX = "vkop_logits_last_row:"
+
 # 字节数用 dtype+dims 直接算，不调 to_array/tobytes——对 3.4GB 的 LLM
 # 权重，预扫描时把每个 initializer 解成 ndarray 再 tobytes 会瞬间分配
 # 数 GB 临时内存，叠加后面 blob 累积导致 OOM。
@@ -200,9 +212,12 @@ class DAGBasedModel:
         # standard causal additive mask. Read by the attention matcher; empty
         # for a model that declares nothing.
         self.causal_mask_inputs: set = set()
-        # Graph outputs to keep only at their last position (VKOP_LOGITS_LAST_ROW
-        # at conversion time). "*" means every graph output a MatMul produces.
-        # Empty — the default — leaves the graph exactly as exported.
+        # Graph outputs to keep only at their last position, declared by the
+        # model-level metadata prop `vkop_logits_last_row:<output>` or the
+        # conversion-time env var VKOP_LOGITS_LAST_ROW. "*" means every graph
+        # output a MatMul produces. Empty — the default — leaves the graph
+        # exactly as exported (a graph that carries the last-row Slice itself
+        # needs no entry here; the optimizer's matcher finds that on its own).
         self.logits_last_row: set = set()
 
     def add_node(self, node: Node):

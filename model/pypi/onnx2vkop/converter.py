@@ -14,9 +14,11 @@ try:
         Node,
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
+        _VKOP_LOGITS_LAST_ROW_META_PREFIX,
     )
     from . import shader_map
     from . import weight_stream
+    from . import layout_audit
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -33,9 +35,11 @@ except ImportError:
         Node,
         _DATA_TYPE_MAP,
         _VKOP_CAUSAL_MASK_META_PREFIX,
+        _VKOP_LOGITS_LAST_ROW_META_PREFIX,
     )
     import shader_map
     import weight_stream
+    import layout_audit
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -242,11 +246,22 @@ class ModelConverter:
         # of those outputs. A greedy decode reads logits[0, L-1, :] and nothing
         # else, while the LM head computes and stores all L rows — at L=1860
         # that is a 2505 ms MatMul (14% of the prefill, linear in M) writing a
-        # 1.13 GB fp16 buffer nobody reads. The flag is a *policy* choice (the
-        # graph cannot show that the tail rows are unused and a caller may
-        # legitimately want them), so unlike the causal declaration it has no
-        # metadata channel — it lives at conversion time only. "*" means every
-        # graph output a MatMul produces.
+        # 1.13 GB fp16 buffer nobody reads. Which rows a caller wants is a
+        # *policy* the graph cannot show (`logits` has no in-graph consumer),
+        # so it is declared, not inferred — same shape as the causal mask two
+        # blocks up: a model-level metadata prop is the carrier, the env var
+        # the bridge for an .onnx that cannot be re-exported. "*" means every
+        # graph output a MatMul produces. A graph whose export already contains
+        # the last-row Slice needs neither (optimizer.match_logits_last_row
+        # pushes it through the MatMul on its own).
+        for entry in getattr(model, "metadata_props", []):
+            if not entry.key.startswith(_VKOP_LOGITS_LAST_ROW_META_PREFIX):
+                continue
+            if entry.value in ("", "0"):
+                continue
+            dag_model.logits_last_row.add(
+                entry.key[len(_VKOP_LOGITS_LAST_ROW_META_PREFIX) :]
+            )
         for name in os.environ.get("VKOP_LOGITS_LAST_ROW", "").split(","):
             name = name.strip()
             if name:
@@ -775,6 +790,14 @@ class ModelConverter:
         elif args.quant == "nvfp4":
             self.quantizer.quantize_to_nvfp4_weight_only(dag_model)
 
+        # Every consumer-driven weight layout is settled by now: the fusion
+        # passes that fold a Transpose or a Q/DQ pair have re-pointed each
+        # consumer at its real weight, and quantization has fixed that weight's
+        # element size. Run the layout audit in this window -- RGBA below is the
+        # one remaining pass that rewrites a 4-D initializer's dims (into its
+        # packed form), and an audit needs the logical rank.
+        self._audit_weight_layouts(dag_model)
+
         if getattr(args, "rgba", False):
             RGBAConverter.convert(dag_model)
 
@@ -849,6 +872,37 @@ class ModelConverter:
                         f"{rank}-D weight (expected {expected}); the image conv "
                         f"cannot address that layout"
                     )
+
+    @staticmethod
+    def _audit_weight_layouts(dag_model):
+        """Report any weight whose stored layout costs its kernel speed.
+
+        Called once, from apply_optimizations, in the window after the fusion
+        passes and quantization have settled every weight's consumer and element
+        size but before RGBA rewrites a 4-D initializer's dims. The audit itself
+        is report-only (layout_audit.py explains the three checks and why each
+        one is a line of a kernel); VKOP_LAYOUT_AUDIT=strict is the CI mode that
+        turns a hazard into a conversion failure, which is opt-in on purpose --
+        a weight in a slow layout still computes correctly, and a performance
+        hazard must not decide whether a model converts.
+
+        The structural half of the contract is a different question and stays
+        fail-closed in _validate_conv_weight_layout above.
+
+        Not an OptimizationPass: the MultiRoundOptimizer calls every pass's
+        apply() once per round and swallows the exceptions it raises
+        (optimizer.py:1007-1016), so a check placed there would both repeat and
+        be silently skipped.
+        """
+        audit = layout_audit.report_layout_audit(dag_model)
+        if audit.hazards and layout_audit.layout_audit_mode() == "strict":
+            detail = "\n  ".join(audit.hazard_lines())
+            raise UnsupportedOpError(
+                f"layout audit (VKOP_LAYOUT_AUDIT=strict): {len(audit.hazards)} "
+                f"weight(s) sit in a layout their kernel's fast path cannot "
+                f"read:\n  {detail}"
+            )
+        return audit
 
     @staticmethod
     def _cleanup_orphan_inputs(dag_model, pre_producer):

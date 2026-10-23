@@ -1104,6 +1104,13 @@ class MultiRoundOptimizer:
         return self.stats
 
 
+# A Slice's `ends` value that means "to the end of the axis". ONNX has no
+# dedicated spelling for it; exporters write INT32_MAX or INT64_MAX, both far
+# above any sequence length, so a large value is the signal and a real length
+# is not. Only used to recognise an already-written last-row Slice.
+_LAST_ROW_END_MIN = 1 << 31
+
+
 class FusionOptimizer:
     """Class for fusing operators in the model."""
 
@@ -1603,8 +1610,9 @@ class FusionOptimizer:
 
         # Priority 1: after every pass that could still want to fold something
         # *into* the LM head MatMul, and before prune_and_materialize
-        # materializes the three initializers this one inserts. A no-op unless
-        # VKOP_LOGITS_LAST_ROW named a graph output.
+        # materializes the three initializers the declared form inserts. Fires
+        # on a declaration (metadata prop or VKOP_LOGITS_LAST_ROW) or on a
+        # graph that already carries the last-row Slice — see the matcher.
         optimizer.register_pass(
             PatternBasedFusionPass(
                 "logits_last_row",
@@ -6439,44 +6447,77 @@ class FusionOptimizer:
     # ONNX's last-element slice and SliceCalc resolves it against the live seq
     # dim, so nothing about a prompt length is baked in.
     #
-    # Opt-in (VKOP_LOGITS_LAST_ROW at conversion time, see converter.py),
-    # because it changes what a graph OUTPUT means: row L-1 only. A driver
-    # comparing all L rows against a full reference (llm_driver without the
-    # same flag) sees a size mismatch, and a caller who wants per-position
-    # logits loses them. Silence leaves the graph exactly as exported.
+    # It changes what a graph OUTPUT means — row L-1 only — so a caller that
+    # wants all L rows (perplexity, prompt logprobs, an ORT-diffing driver)
+    # must keep getting them, and "this caller only wants the last row" is not
+    # something the graph can show. Two ways to say it, and one way not to:
+    #
+    #   * declared — the model-level metadata prop `vkop_logits_last_row:<out>`
+    #     (carrier) or the conversion-time env var VKOP_LOGITS_LAST_ROW
+    #     (bridge for an .onnx that cannot be re-exported). See converter.py.
+    #   * self-described — the graph already contains the last-row Slice. Then
+    #     no declaration is needed at all: the export said which rows it wants,
+    #     and a Slice commutes with a MatMul (rows are independent — no
+    #     reduction crosses them), so pushing it in front is a plain peephole:
+    #
+    #         Slice(MatMul(a, B), last, axis=k) == MatMul(Slice(a, last, axis=k), B)
+    #
+    # Silence (neither form present) leaves the graph exactly as exported.
+    @staticmethod
+    def _const_scalar_ints(dag_model, producer, node, indices):
+        """The listed inputs of `node` as Python ints, or None if any is not a
+        constant scalar (an initializer or a Constant node)."""
+        out = []
+        for i in indices:
+            if i >= len(node.inputs):
+                return None
+            arr = FusionOptimizer._guard_const_array(
+                node.inputs[i]["name"], dag_model, producer)
+            if arr is None or arr.size != 1:
+                return None
+            out.append(int(arr.flatten()[0]))
+        return out
+
+    @staticmethod
+    def _is_last_row_slice(dag_model, producer, node, axis, rank):
+        """Is `node` a Slice(x, starts=[-1], ends=[to the end], axes=[axis])
+        with a unit step — i.e. ONNX's "last element along axis"?"""
+        if node.op_type != "Slice" or len(node.inputs) < 4:
+            return False
+        # A blank optional input is ONNX's "not supplied"; only `steps` may be
+        # omitted, and an omitted step is 1.
+        if len(node.inputs) >= 5 and node.inputs[4]["name"]:
+            steps = FusionOptimizer._const_scalar_ints(
+                dag_model, producer, node, [4])
+            if steps is None or steps[0] != 1:
+                return False
+        vals = FusionOptimizer._const_scalar_ints(
+            dag_model, producer, node, [1, 2, 3])
+        if vals is None:
+            return False
+        start, end, ax = vals
+        if ax < 0:
+            ax += rank
+        return start == -1 and end >= _LAST_ROW_END_MIN and ax == axis
+
     @staticmethod
     def match_logits_last_row(dag_model):
         wanted = getattr(dag_model, "logits_last_row", ())
-        if not wanted:
-            return []
         wildcard = "*" in wanted
-        graph_outputs = {
-            o["name"]: o for o in dag_model.outputs
-            if wildcard or o["name"] in wanted
-        }
+        graph_outputs = {o["name"]: o for o in getattr(dag_model, "outputs", [])}
         if not graph_outputs:
             return []
-        producer = {}
-        for n in dag_model.nodes.values():
-            for o in n.outputs:
-                producer[o["name"]] = n
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(
+            dag_model)
         matches = []
         for node in dag_model.nodes.values():
             if node.op_type != "MatMul" or len(node.inputs) < 2:
                 continue
             if len(node.outputs) != 1:
                 continue
-            out = graph_outputs.get(node.outputs[0]["name"])
-            if out is None:
-                continue
             a = node.inputs[0]
-            # The weight is an initializer, so its shape is always recorded;
-            # the activation's is often not (an intermediate value_info the
-            # exporter dropped). The output's rank is what the axis needs, and
-            # a graph output always carries one.
             b_shape = node.inputs[1].get("shape") or []
-            out_shape = out.get("shape") or []
-            if len(out_shape) < 3 or (b_shape and len(b_shape) != 2):
+            if b_shape and len(b_shape) != 2:
                 continue
             # Idempotence: the multi-round loop re-runs every matcher, and a
             # second Slice in front of the same MatMul would cut the row out
@@ -6484,22 +6525,70 @@ class FusionOptimizer:
             prev = producer.get(a["name"])
             if prev is not None and prev.op_type == "Slice":
                 continue
+            raw = node.outputs[0]
+
+            # (A) declared: the MatMul's own output IS the named graph output.
+            target = graph_outputs.get(raw["name"])
+            if target is not None and (wildcard or raw["name"] in wanted):
+                dims = target.get("shape") or []
+                if len(dims) >= 3:
+                    matches.append({
+                        "kind": "declared",
+                        "node": node,
+                        "a": a,
+                        "out": target,
+                        "node_out": raw,
+                        "axis": len(dims) - 2,
+                    })
+                continue
+
+            # (B) self-described: MatMul -> Slice(last row) -> graph output.
+            # Nothing has to be declared — the Slice IS the declaration. Only a
+            # graph output's tail is taken, so the fold can never start walking
+            # the Slice back through the operators behind this MatMul (a Slice
+            # pushed through e.g. a softmax would be wrong: the rows there are
+            # not independent).
+            if raw["name"] in graph_outputs:
+                continue  # a MatMul with two graph outputs is not this pattern
+            consumers_of_raw = consumers.get(raw["name"], [])
+            if len(consumers_of_raw) != 1:
+                continue
+            sl = consumers_of_raw[0][0]
+            if sl.op_type != "Slice" or len(sl.outputs) != 1:
+                continue
+            target = graph_outputs.get(sl.outputs[0]["name"])
+            # Only a graph output's tail: `logits` has no consumer, so nothing
+            # downstream can depend on the pre-slice shape.
+            if target is None:
+                continue
+            dims = target.get("shape") or []
+            if len(dims) < 3:
+                continue
+            if not FusionOptimizer._is_last_row_slice(
+                    dag_model, producer, sl, len(dims) - 2, len(dims)):
+                continue
             matches.append({
+                "kind": "self",
                 "node": node,
                 "a": a,
-                "out": out,
-                "node_out": node.outputs[0],
-                "axis": len(out_shape) - 2,
+                "out": target,
+                "node_out": raw,
+                "slice": sl,
+                "axis": len(dims) - 2,
             })
         return matches
 
     @staticmethod
     def fold_logits_last_row(dag_model, match) -> bool:
-        """Insert Slice(activation, last row) in front of the LM head MatMul
-        and shrink the graph output to match. The MatMul node itself is only
-        rewired — no kernel, no attribute, nothing the runtime has to know."""
+        """Put a Slice(activation, last row) in front of the LM head MatMul and
+        shrink the graph output to match. The MatMul node itself is only
+        rewired — no kernel, no attribute, nothing the runtime has to know.
+        When the graph already carried the Slice (match['kind'] == 'self') it
+        is the same rewrite seen from the other side: the Slice moves in front
+        and the MatMul takes over the tensor name downstream was reading."""
         node = match["node"]
         axis = match["axis"]
+        embedded = match.get("slice")
         max64 = np.iinfo(np.int64).max
 
         taken = {o["name"] for n in dag_model.nodes.values() for o in n.outputs}
@@ -6510,11 +6599,22 @@ class FusionOptimizer:
             k += 1
             base = f"{node.name}__lastrow_{k}"
 
-        for suffix, axis_value in (("starts", -1), ("ends", max64), ("axes", axis)):
-            init_name = f"{base}_{suffix}"
-            dag_model.initializers[init_name] = numpy_helper.from_array(
-                np.array([axis_value], dtype=np.int64), init_name
-            )
+        if embedded is not None:
+            # The bounds are already exactly right, so the existing Slice keeps
+            # them; it only changes which side of the MatMul it is on.
+            bound_inputs = list(embedded.inputs[1:])
+            dag_model.nodes.pop(embedded.name, None)
+        else:
+            for suffix, axis_value in (("starts", -1), ("ends", max64),
+                                       ("axes", axis)):
+                init_name = f"{base}_{suffix}"
+                dag_model.initializers[init_name] = numpy_helper.from_array(
+                    np.array([axis_value], dtype=np.int64), init_name
+                )
+            bound_inputs = [
+                {"name": f"{base}_{suffix}", "shape": [1], "dtype": TensorProto.INT64}
+                for suffix in ("starts", "ends", "axes")
+            ]
 
         # The Slice cuts the activation, so its output is the activation's
         # shape with the seq axis collapsed. The activation's recorded shape is
@@ -6523,7 +6623,9 @@ class FusionOptimizer:
         # neither, an empty shape is the same "unknown" the parser writes for
         # a tensor it cannot find, and the Slice op resizes from the live
         # shape at execute time anyway.
-        out_shape = list(match["out"]["shape"])
+        # For the self-described form the graph output is already [.., 1, ..]
+        # and the write below is the no-op it looks like.
+        out_shape = list(match["out"].get("shape") or [])
         out_shape[axis] = 1
         a_shape = list(match["a"].get("shape") or [])
         b_shape = list(node.inputs[1].get("shape") or [])
@@ -6541,16 +6643,17 @@ class FusionOptimizer:
             "dtype": match["node_out"].get("dtype", ""),
         }
 
+        slice_name = f"Slice_last_row_{node.name}"
+        if slice_name in dag_model.nodes:
+            k = 0
+            while f"{slice_name}_{k}" in dag_model.nodes:
+                k += 1
+            slice_name = f"{slice_name}_{k}"
         slice_node = Node(
             op_type="Slice",
-            name=f"Slice_last_row_{node.name}",
+            name=slice_name,
             attributes={},
-            inputs=[
-                match["a"],
-                {"name": f"{base}_starts", "shape": [1], "dtype": TensorProto.INT64},
-                {"name": f"{base}_ends", "shape": [1], "dtype": TensorProto.INT64},
-                {"name": f"{base}_axes", "shape": [1], "dtype": TensorProto.INT64},
-            ],
+            inputs=[match["a"]] + bound_inputs,
             outputs=[slice_out],
         )
         # Keyed by node name, like every other node: build_dependencies
@@ -6560,10 +6663,11 @@ class FusionOptimizer:
         # Last-position only: the graph output's seq axis becomes 1, and so
         # does the MatMul's own recorded view (same tensor at runtime).
         for entry in (match["out"], match["node_out"]):
-            shape = list(entry.get("shape") or [])
-            if len(shape) == len(out_shape):
-                shape[axis] = 1
-                entry["shape"] = shape
+            entry["shape"] = list(out_shape)
+        if embedded is not None:
+            # The MatMul now writes what downstream was already reading; the
+            # Slice's old output tensor disappears with its node.
+            match["node_out"]["name"] = embedded.outputs[0]["name"]
 
         print(
             f"Kept only the last position of '{match['out']['name']}' "

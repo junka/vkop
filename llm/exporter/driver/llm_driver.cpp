@@ -284,24 +284,26 @@ int stage_cache_history(const std::shared_ptr<Runtime>& rt,
 
 // The window of the reference array to compare against, as (offset, count).
 //
-// A model converted with VKOP_LOGITS_LAST_ROW=<logits tensor> computes only
-// the LM head's last row — row L-1 is all a greedy loop reads, and the other
-// L-1 rows are a 1.13 GB buffer at L=1860 plus 14% of the prefill. The
-// reference npy is still the full [1,L,vocab] ORT produced from the unshrunk
-// graph, so the comparison has to shrink to its last row too; otherwise this
-// driver's size check rejects exactly the graph the flag exists to produce.
+// A model whose logits output carries only the LM head's last row computes
+// row L-1 alone — all a greedy loop reads, and the other L-1 rows are a
+// 1.13 GB buffer at L=1860 plus 14% of the prefill. The reference npy is the
+// full [1,L,vocab] the same graph produced before the row was cut, so the
+// comparison has to shrink to its last row too; otherwise this driver's size
+// check rejects exactly the graph the fold exists to produce.
 //
-// Same env name as the conversion flag, but only its presence matters here:
-// which tensors to shrink was decided when the .vkopbin was written.
-bool logits_last_row_only() {
-    const char *v = std::getenv("VKOP_LOGITS_LAST_ROW");
-    return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
-}
-
-void ref_window(const NpyArray &ref, size_t &offset, size_t &count) {
+// Whether the row was cut is read off the two shapes, not off an env var:
+// VKOP_LOGITS_LAST_ROW is a conversion-time input the .vkopbin does not
+// carry, and a model converted from the `vkop_logits_last_row` metadata prop
+// never sets it. out_seq == 1 against ref_seq > 1 is exactly the folded form;
+// any other shape keeps the plain whole-tensor comparison, so a wrong rank or
+// vocab dim still trips the size check below.
+void ref_window(const NpyArray &ref, const std::vector<int> &out_shape,
+                size_t &offset, size_t &count) {
     count = npy_elem_count(ref.shape);
     offset = 0;
-    if (logits_last_row_only() && ref.shape.size() >= 2) {
+    if (ref.shape.size() >= 2 && out_shape.size() == ref.shape.size() &&
+        out_shape[out_shape.size() - 2] == 1 &&
+        ref.shape[ref.shape.size() - 2] > 1) {
         count = ref.shape.back();
         offset = npy_elem_count(ref.shape) - count;
     }
@@ -317,7 +319,7 @@ int compare_round(const std::shared_ptr<Runtime>& rt,
     lg->copyToCPU(cmdpool);
     const uint16_t* out_bits = reinterpret_cast<const uint16_t*>(lg->data().data());
     size_t ref_off = 0, n = 0;
-    ref_window(ref, ref_off, n);
+    ref_window(ref, lg->getShape(), ref_off, n);
     if (size_t(lg->num_elements()) != n) {
         std::fprintf(stderr, "[%s] logits size mismatch out=%d ref=%zu\n",
                      round_dir.c_str(), lg->num_elements(), n);
@@ -623,11 +625,11 @@ int main(int argc, char** argv) {
         int argmax_out = compare_round(rt, cmdpool, rd);
         if (argmax_out >= 0) {
             // Re-fetch ref argmax for the match tally, over the same window
-            // compare_round used — a model converted with
-            // VKOP_LOGITS_LAST_ROW only carries the last row.
+            // compare_round used — a folded model only carries the last row.
             NpyArray ref = load_npy(rd + "/reference_logits.npy");
             size_t ref_off = 0, ref_n = 0;
-            ref_window(ref, ref_off, ref_n);
+            auto lg2 = as_tensor<uint16_t>(rt->GetOutput("logits"));
+            ref_window(ref, lg2->getShape(), ref_off, ref_n);
             const uint16_t *rb =
                 reinterpret_cast<const uint16_t*>(ref.data.data()) + ref_off;
             int argmax_ref = -1; float mv = -1e30f;
