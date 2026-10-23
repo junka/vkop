@@ -324,6 +324,16 @@ Examples:
              "to test the streaming path on a model that fits in memory.",
     )
 
+    parser.add_argument(
+        "--layout-audit", choices=["off", "summary", "full", "strict"],
+        default=None,
+        help="Report weights whose stored layout costs their kernel speed "
+             "(equivalent to VKOP_LAYOUT_AUDIT). summary (default) prints a "
+             "one-line tally plus any hazard; full lists every weight; strict "
+             "also fails the conversion on a hazard, for CI; off is silent. "
+             "See onnx2vkop/layout_audit.py for the three checks.",
+    )
+
     return parser.parse_args()
 
 
@@ -344,6 +354,7 @@ def _apply_build_knobs(args) -> None:
         "VKOP_NO_FUSIONS": args.no_fusions,
         "VKOP_STREAM_WEIGHTS": args.stream_weights,
         "VKOP_STREAM_MIN_MIB": args.stream_min_mib,
+        "VKOP_LAYOUT_AUDIT": args.layout_audit,
     }
     for env_name, val in mapping.items():
         if val is not None:

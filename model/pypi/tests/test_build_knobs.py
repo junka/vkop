@@ -161,12 +161,13 @@ def test_cli_writes_only_the_knobs_it_was_given(monkeypatch):
         _apply_build_knobs(SimpleNamespace(
             external_blob_mb=1, max_fold_rounds=None, max_fuse_rounds=3,
             no_passes="a,b", no_fusions=None, stream_weights="off",
-            stream_min_mib=None,
+            stream_min_mib=None, layout_audit="full",
         ))
         assert os.environ["VKOP_EXTERNAL_BLOB_MB"] == "1"
         assert os.environ["VKOP_MAX_FUSE_ROUNDS"] == "3"
         assert os.environ["VKOP_NO_PASSES"] == "a,b"
         assert os.environ["VKOP_STREAM_WEIGHTS"] == "off"
+        assert os.environ["VKOP_LAYOUT_AUDIT"] == "full"
         # An omitted flag leaves the shell's value alone instead of clearing it.
         assert os.environ["VKOP_MAX_FOLD_ROUNDS"] == "9"
         assert "VKOP_NO_FUSIONS" not in os.environ
