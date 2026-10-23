@@ -1428,6 +1428,24 @@ class FusionOptimizer:
             )
         )
 
+        # Q/K/V component read: the vision tower Transposes its [N,3,H,D] qkv
+        # projection to [3,N,H,D] only so the following Split(axis=0) yields
+        # three contiguous (zero-copy) slices, then Squeezes each back to
+        # [N,H,D] for RE(Q)/RE(K)/Attention(V). Point the three consumers at the
+        # pre-Transpose tensor with a component index each and the whole chain
+        # goes: 120 dispatches (24 blocks x 5) on the ViT tower, of which the 24
+        # Transposes are 9.4 ms. Needs the Attention to already carry seq_major
+        # (it is what makes the rank-3 Q/K addressing the component read builds
+        # on), so it runs right after fuse_attention_seq_major.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_qkv_components",
+                FusionOptimizer.match_qkv_components,
+                FusionOptimizer.fold_qkv_components,
+                priority=72,
+            )
+        )
+
         # Elemwise chain fusion (kernel-fusion engine): collapse single-
         # consumer pointwise chains (Add/Sub/Mul/Div/Pow/Sqrt/Sigmoid/Neg/
         # Exp/Tanh) into one FusedElemwise dispatch. Runs late (after all
@@ -4521,6 +4539,182 @@ class FusionOptimizer:
             if n.name in dag_model.nodes:
                 del dag_model.nodes[n.name]
         print(f"Folded the Q/K/V head-reorder into '{att.name}' (seq_major=1)")
+        return True
+
+    # ---- Q/K/V component read (vision tower) -------------------------------
+    # The vision tower computes one qkv projection per block as a single
+    # MatMul -> [N, 3*H*D], Reshapes it to [N, 3, H, D], and then Transposes
+    # ([1,0,2,3]) to [3, N, H, D] for exactly one reason: the following
+    # Split(axis=0) then takes three *contiguous* slices, each a zero-copy
+    # range view ([[zero-copy-range-views]]). Without it the split would be on
+    # axis 1 and each slice would be strided (row pitch 3*H*D).
+    #
+    #     Transpose([N,C,H,D] -> [C,N,H,D])
+    #       Split(axis=0) -> C x [1,N,H,D]   (range views)
+    #       C x Squeeze   -> C x [N,H,D]
+    #       -> RotaryEmbedding(Q), RotaryEmbedding(K), Attention(V)
+    #
+    # 5 dispatches per block, 24 blocks: the Transpose is a real kernel at
+    # 9.4 ms (median, 8 interleaved rounds) and the Split/Squeezes are views.
+    #
+    # Neither obvious fold works: a Reshape is metadata-only and this is a real
+    # permutation, and a row-major [M,N] MatMul output has the token axis
+    # outermost while [C,N,H,D] needs it in the middle -- no weight permutation
+    # moves where the token stride falls. So the three consumers read their
+    # component straight out of the pre-Transpose tensor instead: RE gains
+    # `input_component` and Attention gains `v_component`, each shifting the
+    # read point by a constant stride. head_dim stays the innermost axis in
+    # both layouts, so every existing access pattern (RE's real/imag pair at
+    # d +/- half_dim, Attention's D-long V row) is untouched -- see
+    # ops/RotaryEmbedding.hpp and ops/Attention.hpp.
+    #
+    # Sound because every deleted node has exactly one consumer and one output,
+    # all three roles must match, and the two REs must be that same Attention's
+    # Q and K -- a partial fold would leave an operand naming a tensor that no
+    # longer exists, or silently pair one component with the wrong role. The
+    # component index comes from the Split's output position (mapped by role,
+    # not by the order the consumers are discovered), so a graph that packs
+    # qkv differently still gets the right component.
+    @staticmethod
+    def _split_sizes(dag_model, split, count):
+        """The Split's per-output sizes as a list, or None when they are not
+        statically known (a missing input means ONNX's even split, which is
+        [1]*count here and worth returning rather than declining)."""
+        if len(split.inputs) < 2:
+            return None
+        name = split.inputs[1]["name"]
+        init = dag_model.initializers.get(name)
+        if init is None:
+            return []
+        try:
+            arr = numpy_helper.to_array(init)
+        except Exception:
+            return []
+        return [int(v) for v in arr.flatten().tolist()]
+
+    @staticmethod
+    def match_qkv_components(dag_model):
+        producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(
+            dag_model)
+        graph_outputs = {o["name"] for o in getattr(dag_model, "outputs", [])}
+        matches = []
+        for tr in list(dag_model.nodes.values()):
+            if (tr.op_type != "Transpose" or len(tr.inputs) != 1
+                    or len(tr.outputs) != 1):
+                continue
+            perm = tr.attributes.get("perm")
+            if not isinstance(perm, list) or [int(p) for p in perm] != [1, 0, 2, 3]:
+                continue
+            src = tr.inputs[0]
+            dims = src.get("shape")
+            if dims is None or len(dims) != 4:
+                continue
+            count = dims[1] if isinstance(dims[1], int) else 0
+            if count <= 1:
+                continue
+            # The Transpose's only consumer is the Split ...
+            cs = consumers.get(tr.outputs[0]["name"], [])
+            if len(cs) != 1:
+                continue
+            split = cs[0][0]
+            if (split.op_type != "Split" or len(split.outputs) != count
+                    or int(split.attributes.get("axis", 0)) != 0):
+                continue
+            # ... and its slices are the even ones: the fold hands each
+            # consumer a component *index*, which only describes an equal split.
+            sizes = FusionOptimizer._split_sizes(dag_model, split, count)
+            if sizes is None:
+                sizes = [1] * count
+            if sizes != [1] * count:
+                continue
+            # Each slice: exactly one consumer, a Squeeze that drops the leading
+            # size-1 axis (so what the role below reads is the rank-3 tensor its
+            # addressing assumes), itself single-consumer.
+            entries = []
+            for comp, out in enumerate(split.outputs):
+                if out["name"] in graph_outputs:
+                    break
+                cs2 = consumers.get(out["name"], [])
+                if len(cs2) != 1:
+                    break
+                sq = cs2[0][0]
+                if (sq.op_type != "Squeeze" or len(sq.inputs) != 2
+                        or len(sq.outputs) != 1
+                        or FusionOptimizer._axes_as_list(dag_model, sq) != [0]):
+                    break
+                if sq.outputs[0]["name"] in graph_outputs:
+                    break
+                cs3 = consumers.get(sq.outputs[0]["name"], [])
+                if len(cs3) != 1:
+                    break
+                role, slot = cs3[0]
+                entries.append({"comp": comp, "squeeze": sq, "role": role,
+                                "slot": slot})
+            else:
+                qk = [e for e in entries
+                      if e["role"].op_type == "RotaryEmbedding" and e["slot"] == 0
+                      and len(e["role"].outputs) == 1]
+                vs = [e for e in entries
+                      if e["role"].op_type == "Attention" and e["slot"] == 2]
+                if len(qk) != 2 or len(vs) != 1:
+                    continue
+                if len(qk) + len(vs) != count:
+                    continue
+                att = vs[0]["role"]
+                if att.attributes.get("has_cache"):
+                    continue
+                # The two REs must be this same Attention's Q and K: the fold
+                # assumes the tensor's components are the q/k/v of one op, and
+                # an RE whose rotated output went elsewhere would mean it is
+                # not that operand.
+                att_slots = []
+                ok = True
+                for e in qk:
+                    if e["role"].attributes.get("input_untransposed"):
+                        ok = False
+                        break
+                    ocs = consumers.get(e["role"].outputs[0]["name"], [])
+                    if (len(ocs) != 1 or ocs[0][0] is not att
+                            or ocs[0][1] not in (0, 1)):
+                        ok = False
+                        break
+                    att_slots.append(ocs[0][1])
+                if not ok or sorted(att_slots) != [0, 1]:
+                    continue
+                matches.append({
+                    "transpose": tr,
+                    "split": split,
+                    "src": src,
+                    "qk": qk,
+                    "v": vs[0],
+                    "attention": att,
+                    "nodes_to_delete": [tr, split]
+                    + [e["squeeze"] for e in entries],
+                })
+        return matches
+
+    @staticmethod
+    def fold_qkv_components(dag_model, match) -> bool:
+        """Point Q's and K's RotaryEmbedding and the Attention's V at the
+        pre-Transpose [N,C,H,D] tensor, each declaring which component it
+        reads, and drop the Transpose/Split/Squeezes."""
+        for e in match["qk"]:
+            e["role"].inputs = list(e["role"].inputs)
+            e["role"].inputs[0] = match["src"]
+            e["role"].attributes = dict(e["role"].attributes)
+            e["role"].attributes["input_component"] = e["comp"]
+        v = match["v"]
+        v["role"].inputs = list(v["role"].inputs)
+        v["role"].inputs[2] = match["src"]
+        v["role"].attributes = dict(v["role"].attributes)
+        v["role"].attributes["v_component"] = v["comp"]
+        for n in match["nodes_to_delete"]:
+            if n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        att = match["attention"]
+        print(f"Folded the qkv Transpose/Split/Squeeze chain into '{att.name}' "
+              f"(components {[e['comp'] for e in match['qk']]} for Q/K, "
+              f"{v['comp']} for V)")
         return True
 
     @staticmethod

@@ -70,6 +70,18 @@ layout(push_constant) uniform PC {
                       // 被 trace 成了 Cast 对），而激活是 fp16；这个标志让 fp16
                       // build 按真实步长读 cos/sin，两种 build 的 fp32 内部运算
                       // 因此逐位相同。0 = cos/sin 与 X 同为 fp16（LLM 的 MRoPE）。
+    int comp;         // >= 0: X 是视觉塔 qkv 的 [seq, C, num_heads, head_dim]
+                      // 张量，本轮只读第 comp 个分量（C 是 qkv 的 3），Y 仍是
+                      // rank-3 [seq, num_heads, head_dim]。converter 的
+                      // fuse_qkv_components 把 Transpose([N,C,H,D]->[C,N,H,D]) +
+                      // Split(axis=0) + Squeeze 折成这个寻址：那些节点只为让
+                      // Split 落在 axis 0（连续字节范围 → 零拷贝 view）而存在，
+                      // head_dim 在两种布局里都是最内维，所以读点只多一个
+                      // stride 项。 -1 = 关闭（默认）。
+    int in_seq_stride; // comp >= 0 时的 X 相邻 seq 行距离（元素 =
+                       // C*num_heads*head_dim）。X 是 [seq, C, H, D] 而 Y 是
+                       // [seq, H, D]，所以 xidx = gid + s*(in_seq_stride - H*D)
+                       // + comp*(H*D)。comp < 0 时不用。
 } uPC;
 
 // cos/sin 的读取视 cos/sin 自身的 dtype 而定，与 X 无关：fp16 build 里 X 走
@@ -97,7 +109,19 @@ int rotary_width() {
 //   gid_in = b*(seq*num_heads*head_dim) + s*(num_heads*head_dim) + h*head_dim + d
 // head_dim is the fastest axis in BOTH layouts, so gid_in +/- half_dim still
 // addresses d +/- half within the same head (correct for the real/imag pair).
+//
+// When `comp` is set the INPUT is [seq, C, num_heads, head_dim] and the output
+// stays the rank-3 seq-major [seq, num_heads, head_dim], so gid already carries
+// (s, h, d) and only the seq and component strides differ:
+//   gid_in = s*(C*H*D) + comp*(H*D) + h*D + d
+//          = gid + s*(in_seq_stride - H*D) + comp*(H*D)
+// Same argument for the pair: head_dim is the fastest axis here too, so
+// +/- half_dim lands in the same head row of the same component.
 int in_index(int gid, int b, int s, int d, int head_dim, int seq, int num_heads) {
+    if (uPC.comp >= 0) {
+        int hd = num_heads * head_dim;
+        return gid + s * (uPC.in_seq_stride - hd) + uPC.comp * hd;
+    }
     if (uPC.input_untransposed == 0) return gid;
     int h = (gid / (head_dim * seq)) % num_heads;
     return b * (seq * num_heads * head_dim)
@@ -110,10 +134,12 @@ float rotate_one(int gid, int d, int half_dim, int head_dim, int seq,
                  int num_heads) {
     // seq_major: X is [seq, num_heads, head_dim] (vision encoder, batch axis
     // squeezed away and seq leading). No batch term, head axis sits between
-    // seq and head_dim.
+    // seq and head_dim. A component read implies the same output layout, so it
+    // selects this branch too rather than depending on the host to also set
+    // seq_major (a disagreement here would silently read the wrong row).
     int b = 0;
     int s;
-    if (uPC.seq_major != 0) {
+    if (uPC.seq_major != 0 || uPC.comp >= 0) {
         s = (gid / head_dim) / num_heads;
     } else {
         b = gid / (head_dim * seq * num_heads);

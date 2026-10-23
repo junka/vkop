@@ -40,6 +40,15 @@ struct alignas(16) RotaryPC {
     // Cast(f16->f32)/Cast(f32->f16) 对折掉仍然逐位相同的前提。
     // 0 = cos/sin 与 X 同 dtype（LLM 的 MRoPE 是 fp16）。
     int cs_fp32;
+    // >= 0: X 是视觉塔 qkv 的 [seq, C, num_heads, head_dim] 张量，本 op 只读第
+    // comp 个分量，Y 仍是 rank-3 [seq, num_heads, head_dim]。converter 的
+    // fuse_qkv_components 把「Transpose([N,C,H,D]->[C,N,H,D]) + Split(axis=0)
+    // + Squeeze」三个 op 折成这条寻址（它们只为让 Split 落在 axis 0 而存在，
+    // 见 [[zero-copy-range-views]]）。head_dim 在两种布局里都是最内维，所以
+    // 只有读点的 stride 变了。 -1 = 关闭（默认）。
+    int comp;
+    // comp >= 0 时 X 相邻 seq 行的距离（元素）= C*num_heads*head_dim。
+    int in_seq_stride;
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
@@ -71,6 +80,14 @@ class RotaryEmbeddingBuffer : public BufferFactory {
             input_untransposed_ =
                 std::stol(attributes.at("input_untransposed")) != 0;
         }
+        // input_component: read one component out of a [seq, C, heads, dim]
+        // tensor instead of a whole [seq, heads, dim] one (see RotaryPC::comp).
+        // Set by the converter's fuse_qkv_components; absent on every other
+        // graph, which leaves the addressing exactly as it was.
+        if (attributes.find("input_component") != attributes.end()) {
+            input_component_ =
+                static_cast<int>(std::stol(attributes.at("input_component")));
+        }
     }
 
   private:
@@ -87,7 +104,33 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         int head_dim = xshape.back();
         int seq = xshape[xshape.size() - 2];
         int num_heads = xshape.size() >= 3 ? xshape[xshape.size() - 3] : 1;
-        if (input_untransposed_) {
+        // Component read: X is the vision tower's rank-4 qkv tensor
+        // [seq, C, heads, dim] and only component `input_component_` is
+        // rotated. Y is still the rank-3 [seq, heads, dim] the Split+Squeeze
+        // chain used to hand over, so heads/seq come from the other two axes
+        // and C is the component count. Checked rather than assumed: reading
+        // the wrong axis here would rotate the wrong tensor silently.
+        int comp_count = 1;
+        if (input_component_ >= 0) {
+            if (xshape.size() != 4) {
+                throw std::runtime_error(
+                    "RotaryEmbedding: input_component needs a rank-4 "
+                    "[seq, C, heads, dim] input");
+            }
+            seq = xshape[0];
+            comp_count = xshape[1];
+            num_heads = xshape[2];
+            if (comp_count <= 0 || input_component_ >= comp_count) {
+                throw std::runtime_error(
+                    "RotaryEmbedding: input_component " +
+                    std::to_string(input_component_) +
+                    " is outside C=" + std::to_string(comp_count));
+            }
+            if (seq <= 0 || num_heads <= 0) {
+                throw std::runtime_error("RotaryEmbedding: input_component "
+                                         "needs resolved seq/heads");
+            }
+        } else if (input_untransposed_) {
             // X is [B, seq, num_heads, head_dim]: swap the two middle axes.
             std::swap(seq, num_heads);
         }
@@ -101,14 +144,18 @@ class RotaryEmbeddingBuffer : public BufferFactory {
             rotary_dim = head_dim;
 
         // Leading dims (batch etc.) collapse into `total - heads*seq*head_dim`.
-        int total = total_elems(xshape);
+        // A component read outputs the rank-3 [seq, heads, dim], not X's
+        // [seq, C, heads, dim], so its total is the product of those three.
+        int total = (input_component_ >= 0) ? seq * num_heads * head_dim
+                                            : total_elems(xshape);
         // Rank-3 [seq, heads, head_dim] (vision encoder: batch axis squeezed
         // away and seq leading). cos/sin carry `seq` rows, so the row count
         // they cover identifies the layout: xshape[-2] is heads, not seq.
         bool seq_major =
-            (xshape.size() == 3 && !input_untransposed_ &&
-             total_elems(inputs[1]->getShape()) / rotary_dim == xshape[0]);
-        if (seq_major)
+            (input_component_ >= 0 ||
+             (xshape.size() == 3 && !input_untransposed_ &&
+              total_elems(inputs[1]->getShape()) / rotary_dim == xshape[0]));
+        if (seq_major && input_component_ < 0)
             std::swap(seq, num_heads);
         // Output layout is [B, num_heads, seq, head_dim] (the transposed layout
         // downstream MatMul Q@K^T / Concat K-cache expect). When X is
@@ -116,18 +163,26 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         // swapped input shape — NOT xshape. Resizing to xshape would set the
         // output dims_ metadata to the untransposed layout and corrupt every
         // downstream op that reads getShape() for dispatch/broadcast math.
+        // A component read likewise outputs [seq, heads, dim], not X's rank-4.
         std::vector<int> out_shape = xshape;
-        if (input_untransposed_ && out_shape.size() >= 3) {
+        if (input_component_ >= 0) {
+            out_shape = {seq, num_heads, head_dim};
+        } else if (input_untransposed_ && out_shape.size() >= 3) {
             std::swap(out_shape[out_shape.size() - 2],
                       out_shape[out_shape.size() - 3]);
         }
 
         // Output has the same shape as X; resize if the runtime created it
-        // with a placeholder (e.g. dynamic -1 -> 1 at load).
+        // with a placeholder (e.g. dynamic -1 -> 1 at load). A component read
+        // is the one case where the output layout is NOT X's, and its element
+        // count alone cannot tell the two apart ([1,S,H,D] and [S,H,D] hold
+        // the same number), so the shape has to be compared too — the same
+        // guard Attention's seq_major resize uses.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
-            if (output->num_elements() != total) {
+            if (output->num_elements() != total ||
+                (input_component_ >= 0 && output->getShape() != out_shape)) {
                 output->resize(out_shape);
             }
             bind_ssbo<T>(outputs[0], /*is_output=*/true);
@@ -157,6 +212,8 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         // X's. The vision tower folds away the fp16->fp32 Cast that used to
         // feed this op, leaving fp16 X next to the exporter's fp32 cos/sin.
         pc.cs_fp32 = (inputs[1]->dtype() == typeid(uint16_t)) ? 0 : 1;
+        pc.comp = input_component_;
+        pc.in_seq_stride = comp_count * num_heads * head_dim;
 
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);
@@ -173,6 +230,10 @@ class RotaryEmbeddingBuffer : public BufferFactory {
     int fp16_;
     bool input_untransposed_ =
         false; // X laid out as [B, seq, num_heads, head_dim]
+    // Read component `input_component_` of a [seq, C, heads, dim] input;
+    // -1 (default) reads the whole [seq, heads, dim] tensor. Set by the
+    // converter's fuse_qkv_components.
+    int input_component_ = -1;
 };
 
 // PIMPL façade. Buffer-only (per the runtime-op authorization); the image

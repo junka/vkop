@@ -1053,6 +1053,83 @@ TEST(BufferRankTest, RotaryEmbeddingUntransposed) {
     EXPECT_TRUE(brt_rotary_untransposed_case<float>({2, 16, 9, 128}, false));
 }
 
+// Component read: with input_component set, X is the vision tower's rank-4 qkv
+// tensor [seq, C, heads, head_dim] and only component `comp` is rotated; Y is
+// the rank-3 [seq, heads, head_dim] the Split+Squeeze chain used to hand over.
+// The converter's fuse_qkv_components deletes that chain (a Transpose, a
+// Split and C Squeezes per block) by moving this op's read point inside the
+// pre-Transpose tensor, so the whole content of the change is one stride term
+// — and what this case pins is that it is the RIGHT term: the result has to
+// equal RE run on X[:, comp, :, :] alone, for every comp, and Y has to come
+// back rank-3 whatever rank the placeholder was declared at.
+template <typename T>
+bool brt_rotary_component_case(int S, int C, int heads, int head_dim, int comp,
+                               bool fp16) {
+    using torch::indexing::Slice;
+    Dev d;
+    auto torch_x = torch::randn({S, C, heads, head_dim}, brt_torch_opt<T>());
+    // cos/sin have `seq` rows and no heads axis; the exporter hands them over
+    // full-width (cos[d] == cos[d + half], the half-repeat the kernel indexes
+    // by bare d).
+    auto cos_half = torch::randn({S, head_dim / 2}, brt_torch_opt<T>());
+    auto sin_half = torch::randn({S, head_dim / 2}, brt_torch_opt<T>());
+    auto torch_cos = torch::cat({cos_half, cos_half}, -1);
+    auto torch_sin = torch::cat({sin_half, sin_half}, -1);
+
+    // Reference: the rotation of that one component, on the rank-3 form.
+    auto slab = torch_x.index({Slice(), comp, Slice(), Slice()}); // [S,heads,D]
+    const int half = head_dim / 2;
+    auto x1 = slab.index({Slice(), Slice(), Slice(0, half)});
+    auto x2 = slab.index({Slice(), Slice(), Slice(half, head_dim)});
+    auto rot = torch::cat({-x2, x1}, -1);
+    auto torch_out = slab * torch_cos.unsqueeze(1) + rot * torch_sin.unsqueeze(1);
+
+    auto input =
+        std::make_shared<Tensor<T>>(std::vector<int>{S, C, heads, head_dim});
+    brt_fill(input, torch_x);
+    brt_upload(input, d);
+    auto cos_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_cos));
+    brt_fill(cos_t, torch_cos);
+    brt_upload(cos_t, d);
+    auto sin_t = std::make_shared<Tensor<T>>(brt_to_int_shape(torch_sin));
+    brt_fill(sin_t, torch_sin);
+    brt_upload(sin_t, d);
+
+    // Rank-4 placeholder with the right element count: without the op's shape
+    // resize the tensor would stay rank 4, and the [seq, heads, dim] dims
+    // metadata is what the attention op downstream reads.
+    auto output = brt_make_out<T>(std::vector<int>{1, S, heads, head_dim}, d);
+    auto op = brt_make_op(vkop::ops::OpType::ROTARY_EMBEDDING, fp16,
+                          {{"input_component", std::to_string(comp)}}, d);
+    if (!op)
+        return false;
+    op->onExecute({input, cos_t, sin_t}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    const auto got = output->getShape();
+    if (got != std::vector<int>{S, heads, head_dim}) {
+        LOG_ERROR("input_component: Y is rank %d, expected rank 3 [%d,%d,%d]",
+                  static_cast<int>(got.size()), S, heads, head_dim);
+        return false;
+    }
+    float rtol = fp16 ? 0.02f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, rtol);
+}
+
+TEST(BufferRankTest, RotaryEmbeddingComponent) {
+    // The real tower: 196 tokens, 3 components (q/k/v), 16 heads, head_dim 64.
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_TRUE(brt_rotary_component_case<uint16_t>(196, 3, 16, 64, c, true));
+        EXPECT_TRUE(brt_rotary_component_case<float>(196, 3, 16, 64, c, false));
+    }
+    // 8 kv heads (GQA's K side) and a different component count, so nothing
+    // can accidentally depend on C == 3.
+    EXPECT_TRUE(brt_rotary_component_case<uint16_t>(49, 3, 8, 128, 1, true));
+    EXPECT_TRUE(brt_rotary_component_case<float>(49, 3, 8, 128, 1, false));
+    EXPECT_TRUE(brt_rotary_component_case<uint16_t>(5, 2, 4, 32, 1, true));
+    EXPECT_TRUE(brt_rotary_component_case<float>(1, 3, 16, 64, 2, false));
+}
+
 // =========================================================================
 // RMSNorm — fuses the 9-op Cast->Pow->ReduceMean->Add->Sqrt->Div->Mul->Cast->
 // Mul decomposition into one dispatch. Ref: out = x * rsqrt(mean(x^2)+eps) * w
@@ -2063,6 +2140,158 @@ TEST(BufferRankTest, AttentionSeqMajorRejectsCacheForm) {
                           d);
     ASSERT_TRUE(op);
     EXPECT_THROW(op->onExecute({qi, ki, vi}, {out}, 0), std::runtime_error);
+}
+
+// V read as a component of the rank-4 qkv tensor. Q/K stay the rank-3
+// seq-major operands (they come from their RotaryEmbeddings' output); only V is
+// the pre-Transpose [seq, C, Hkv, D] the converter's fuse_qkv_components leaves
+// behind, read at component `comp`. The shader adds comp*Hkv*D to V's row base
+// and (C-1)*Hkv*D to its step, so this pins that V is the slice the Split used
+// to hand over — a wrong C or comp would read another component's bytes as V
+// with no other symptom (the scores come from K, which is untouched).
+template <typename T>
+bool brt_attention_v_component_case(int S, int H, int D, int C, int comp,
+                                    bool fp16) {
+    using torch::indexing::Slice;
+    Dev d;
+    const int Hkv = H; // no GQA here: the vision tower repeats nothing
+    const float scale = 1.0f / std::sqrt(static_cast<float>(D));
+    auto opt = brt_torch_opt<T>();
+
+    auto q = torch::randn({S, H, D}, opt);
+    auto k = torch::randn({S, Hkv, D}, opt);
+    auto v = torch::randn({S, C, Hkv, D}, opt);
+
+    // Reference: softmax(Q·Kᵀ*scale) · V[:, comp], per head, written in the
+    // [1, S, H, D] order seq_major produces.
+    auto qq = q.transpose(0, 1);                 // [H,S,D]
+    auto kk = k.transpose(0, 1);                 // [Hkv,S,D]
+    auto vv = v.select(1, comp).transpose(0, 1); // [Hkv,S,D]
+    std::vector<torch::Tensor> heads;
+    for (int h = 0; h < H; ++h) {
+        auto sc = torch::matmul(qq.index({h}), kk.index({h}).transpose(0, 1)) *
+                  scale;
+        auto p = torch::softmax(sc, -1);
+        heads.push_back(torch::matmul(p, vv.index({h})));
+    }
+    auto ref = torch::stack(heads, 0).transpose(0, 1).unsqueeze(0).contiguous();
+
+    auto Qi = std::make_shared<Tensor<T>>(std::vector<int>{S, H, D});
+    brt_fill(Qi, q);
+    brt_upload(Qi, d);
+    auto Ki = std::make_shared<Tensor<T>>(std::vector<int>{S, Hkv, D});
+    brt_fill(Ki, k);
+    brt_upload(Ki, d);
+    auto Vi = std::make_shared<Tensor<T>>(std::vector<int>{S, C, Hkv, D});
+    brt_fill(Vi, v);
+    brt_upload(Vi, d);
+
+    auto output = brt_make_out<T>(brt_to_int_shape(ref), d);
+    auto op = brt_make_op(vkop::ops::OpType::ATTENTION,
+                          std::is_same_v<T, uint16_t>,
+                          {{"scale", std::to_string(scale)},
+                           {"num_heads", std::to_string(H)},
+                           {"num_kv_heads", std::to_string(Hkv)},
+                           {"causal", "0"},
+                           {"seq_major", "1"},
+                           {"v_component", std::to_string(comp)}},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute({Qi, Ki, Vi}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    float rtol = std::is_same_v<T, uint16_t> ? 0.03f : 0.002f;
+    return brt_close_to_torch(output, ref, rtol, rtol);
+}
+
+TEST(BufferRankTest, AttentionVComponent) {
+    // The real tower's shape: 196 tokens, 16 heads, head_dim 64, V is the third
+    // of three components.
+    for (int c = 0; c < 3; ++c) {
+        EXPECT_TRUE(brt_attention_v_component_case<float>(196, 16, 64, 3, c, false));
+        EXPECT_TRUE(brt_attention_v_component_case<uint16_t>(196, 16, 64, 3, c, true));
+    }
+    // Other component counts and head counts, so nothing can depend on C == 3
+    // or on the heads axis coinciding with the component count.
+    EXPECT_TRUE(brt_attention_v_component_case<float>(49, 8, 128, 3, 2, false));
+    EXPECT_TRUE(brt_attention_v_component_case<uint16_t>(49, 8, 128, 3, 2, true));
+    EXPECT_TRUE(brt_attention_v_component_case<float>(5, 4, 32, 2, 1, false));
+    EXPECT_TRUE(brt_attention_v_component_case<uint16_t>(1, 16, 64, 3, 2, true));
+}
+
+// The component form is only addressable in the seq_major, no-cache shape the
+// converter's fold produces: seq_major is what places V's rows, and with a
+// cache the fresh rows are also read at the native pitch by the copy half of
+// the dispatch, which v_component does not touch. Accepting either would read
+// the wrong rows with no other symptom.
+TEST(BufferRankTest, AttentionVComponentRejectsCacheForm) {
+    Dev d;
+    // Q/K in the native rank-4 [B,H,S,D] form so that the pre-existing
+    // seq_major/has_cache pair check is not what fires: the second case carries
+    // has_cache and the first carries neither, and in both it is the
+    // component-form guard that has to stop the op.
+    auto qh = torch::randn({1, 2, 4, 8}, brt_torch_opt<float>());
+    auto kh = torch::randn({1, 2, 4, 8}, brt_torch_opt<float>());
+    auto vh = torch::randn({4, 3, 2, 8}, brt_torch_opt<float>());
+    auto qi = std::make_shared<Tensor<float>>(brt_to_int_shape(qh));
+    auto ki = std::make_shared<Tensor<float>>(brt_to_int_shape(kh));
+    auto vi = std::make_shared<Tensor<float>>(brt_to_int_shape(vh));
+    brt_fill(qi, qh);
+    brt_fill(ki, kh);
+    brt_fill(vi, vh);
+    brt_upload(qi, d);
+    brt_upload(ki, d);
+    brt_upload(vi, d);
+    auto out = brt_make_out<float>({1, 2, 4, 8}, d);
+    for (const char *cache : {"0", "1"}) {
+        auto op = brt_make_op(vkop::ops::OpType::ATTENTION, false,
+                              {{"scale", "0.35355339"},
+                               {"num_heads", "2"},
+                               {"num_kv_heads", "2"},
+                               {"has_cache", cache},
+                               {"v_component", "2"}},
+                              d);
+        ASSERT_TRUE(op);
+        EXPECT_THROW(op->onExecute({qi, ki, vi}, {out}, 0), std::runtime_error);
+    }
+}
+
+// ... and it is only addressable when the components are actually there: a V
+// that is not rank-4, or whose C/head/dim axes disagree with K, is a wiring bug
+// the op reports rather than silently reading some other slice.
+TEST(BufferRankTest, AttentionVComponentRejectsShapeMismatch) {
+    Dev d;
+    auto qh = torch::randn({4, 2, 8}, brt_torch_opt<float>());
+    auto kh = torch::randn({4, 2, 8}, brt_torch_opt<float>());
+    auto qi = std::make_shared<Tensor<float>>(brt_to_int_shape(qh));
+    auto ki = std::make_shared<Tensor<float>>(brt_to_int_shape(kh));
+    brt_fill(qi, qh);
+    brt_fill(ki, kh);
+    brt_upload(qi, d);
+    brt_upload(ki, d);
+    auto out = brt_make_out<float>({1, 4, 2, 8}, d);
+    // V is the plain rank-3 form: no component axis to read.
+    auto vh3 = torch::randn({4, 2, 8}, brt_torch_opt<float>());
+    auto v3 = std::make_shared<Tensor<float>>(brt_to_int_shape(vh3));
+    brt_fill(v3, vh3);
+    brt_upload(v3, d);
+    // ... and a rank-4 one with only 2 components, asked for the third.
+    auto vh2 = torch::randn({4, 2, 2, 8}, brt_torch_opt<float>());
+    auto v2 = std::make_shared<Tensor<float>>(brt_to_int_shape(vh2));
+    brt_fill(v2, vh2);
+    brt_upload(v2, d);
+    for (const auto &v : {v3, v2}) {
+        auto op = brt_make_op(vkop::ops::OpType::ATTENTION, false,
+                              {{"scale", "0.35355339"},
+                               {"num_heads", "2"},
+                               {"num_kv_heads", "2"},
+                               {"seq_major", "1"},
+                               {"v_component", "2"}},
+                              d);
+        ASSERT_TRUE(op);
+        EXPECT_THROW(op->onExecute({qi, ki, v}, {out}, 0), std::runtime_error);
+    }
 }
 
 } // namespace

@@ -95,7 +95,13 @@ layout(push_constant) uniform PC_ATTN {
     float cache_scale; // fp8 cache scale (dequant multiplies, quant divides)
     int cache_fp8;    // 0/1: the cache holds E4M3 bytes, not compute-dtype elems
     int seq_major;    // 0/1: Q/K/V are [B,S,H,D] and Y is written the same way
-    int _pad1;
+    int v_base_extra; // elements added to V's row base: comp*Hkv*D for a
+                      // component read of the vision tower's [S,C,Hkv,D] qkv
+                      // tensor, 0 otherwise
+    int v_step_extra; // elements added to the step between two consecutive V
+                      // positions: (C-1)*Hkv*D for that component read, 0
+                      // otherwise. K keeps the plain kv_step — only V is read
+                      // as a component (see fuse_qkv_components).
 } uA;
 
 #define TILE_KV 256
@@ -465,10 +471,14 @@ void main() {
     int k_base = (uA.seq_major != 0)
                      ? (b * kv_new * uA.kv_heads + h_kv) * D
                      : ((b * uA.kv_heads + h_kv) * kv_new) * D;
-    int v_base = k_base;
+    int v_base = k_base + uA.v_base_extra;
     // Elements between two consecutive kv positions of one head. D in the
     // native [.., S, D] order, a whole head stride when the seq axis leads.
     int kv_step = (uA.seq_major != 0) ? uA.kv_heads * D : D;
+    // V's own step. Identical to K's unless V is read as a component of the
+    // vision tower's [S,C,Hkv,D] qkv tensor, where consecutive positions are
+    // C*Hkv*D apart instead of Hkv*D. (v_step_extra is 0 when not.)
+    int v_step = kv_step + uA.v_step_extra;
     int c_base = (h_kv * uA.src_stride) * D; // c = 0 (K); V adds nkv rows
     int c_v_base = c_base + (uA.kv_heads * uA.src_stride) * D;
     int past = kv - S; // absolute position of query row s is past + s
@@ -587,7 +597,7 @@ void main() {
             }
             int lo = max(jlo, kv_past);
             for (int j = lo; j < jhi; ++j) {
-                ACC_PAIR(uV, v_base + (j - kv_past) * kv_step, d0, sS[j - t0], p0, p1);
+                ACC_PAIR(uV, v_base + (j - kv_past) * v_step, d0, sS[j - t0], p0, p1);
             }
             sAcc[sub][d0] = p0;
             sAcc[sub][d0 + 1] = p1;

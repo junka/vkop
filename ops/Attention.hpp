@@ -43,7 +43,8 @@ struct alignas(16) AttentionPC {
     float cache_scale; // fp8 cache dequant/quant scale (1.0 for an fp16 cache)
     int cache_fp8;     // 0/1: the cache holds E4M3 bytes, not Q-dtype elements
     int seq_major;     // 0/1: Q/K/V are [B,S,H,D] and Y is written likewise
-    int _pad1;
+    int v_base_extra;  // elements added to V's row base (see ops/Attention.hpp)
+    int v_step_extra;  // elements added to V's kv step (see ops/Attention.hpp)
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 
@@ -128,6 +129,16 @@ class AttentionBuffer : public BufferFactory {
         if (attributes.find("seq_major") != attributes.end()) {
             seq_major_ =
                 static_cast<int>(std::stol(attributes.at("seq_major")));
+        }
+        // v_component: V is the vision tower's rank-4 qkv tensor
+        // [S, C, Hkv, D] and this op reads component `v_component`, which is
+        // the V half of the Split the converter folded away (see
+        // fuse_qkv_components). Purely an addressing change on V's row base and
+        // kv step — K is untouched, so the score pass is unaffected. Only ever
+        // set together with seq_major and without a cache.
+        if (attributes.find("v_component") != attributes.end()) {
+            v_component_ =
+                static_cast<int>(std::stol(attributes.at("v_component")));
         }
         // fp8 cache: the cache SSBO holds E4M3 bytes and the op does the
         // decode/encode itself, which is what lets an fp8 cache be written in
@@ -226,6 +237,46 @@ class AttentionBuffer : public BufferFactory {
         if (head_dim <= 0 || head_dim > 256 || (head_dim % 2) != 0) {
             throw std::runtime_error(
                 "Attention: head_dim must be even and <= 256");
+        }
+
+        // V read as one component of the vision tower's rank-4 qkv tensor
+        // [S, C, Hkv, D] — the V third of the Split the converter's
+        // fuse_qkv_components folded into this op (it also folds the Transpose
+        // and the three Squeezes, which existed only to make that Split a
+        // contiguous axis-0 view). Inside a component the rows are Hkv*D apart,
+        // so V's row base moves by c*Hkv*D and its step between consecutive
+        // positions by (C-1)*Hkv*D: exactly the two PC fields the shader adds.
+        // K is NOT a component (it arrives from its RotaryEmbedding's rank-3
+        // output), so the score pass keeps the plain kv_step.
+        //
+        // Only the seq_major, cache-less form is addressable: with a cache the
+        // fresh rows are also read at the native pitch by the copy half of the
+        // dispatch, and seq_major is the only layout the fold produces. Shapes
+        // are checked, not assumed — a wrong C or head count would silently
+        // read another component's bytes as V.
+        int v_comp_count = 0;
+        if (v_component_ >= 0) {
+            if (!seq_major || has_cache) {
+                throw std::runtime_error(
+                    "Attention: v_component requires the seq_major, no-cache "
+                    "form");
+            }
+            const auto v_shape = inputs[2]->getShape();
+            if (v_shape.size() != 4) {
+                throw std::runtime_error(
+                    "Attention: v_component needs a rank-4 [S,C,Hkv,D] V");
+            }
+            v_comp_count = dim(v_shape, 1);
+            if (v_comp_count <= 0 || v_component_ >= v_comp_count ||
+                dim(v_shape, 2) != kv_heads || dim(v_shape, 3) != head_dim) {
+                throw std::runtime_error(
+                    "Attention: the [S,C,Hkv,D] V does not match the component "
+                    "attribute and K's head/dim axes");
+            }
+            if (dim(v_shape, 0) > 0 && dim(v_shape, 0) != kv_new) {
+                throw std::runtime_error(
+                    "Attention: the [S,C,Hkv,D] V's seq axis disagrees with K");
+            }
         }
 
         int kv_past = 0;
@@ -404,6 +455,12 @@ class AttentionBuffer : public BufferFactory {
         pc.cache_scale = cache_fp8 ? cache_scale_ : 1.0f;
         pc.cache_fp8 = cache_fp8 ? 1 : 0;
         pc.seq_major = seq_major ? 1 : 0;
+        // V's component addressing (0/0 when v_component is off, which leaves
+        // the shader's V base and step exactly as they were).
+        pc.v_base_extra =
+            v_comp_count > 0 ? v_component_ * head_dim * kv_heads : 0;
+        pc.v_step_extra =
+            v_comp_count > 0 ? (v_comp_count - 1) * head_dim * kv_heads : 0;
 
         int grid = batch * heads * seq;
         // Y is written in the [B,S,H,D] order under seq_major whatever rank Q
@@ -542,6 +599,11 @@ class AttentionBuffer : public BufferFactory {
     // head-reorder feeding this op; 0 keeps the native [B,H,S,D] addressing
     // every existing graph relies on.
     int seq_major_ = 0;
+    // Read V as component `v_component_` of a rank-4 [S,C,Hkv,D] qkv tensor;
+    // -1 (default) keeps the native V addressing. Set by the converter's
+    // fuse_qkv_components, always together with seq_major_ and never with a
+    // cache.
+    int v_component_ = -1;
     // Sliding-window ring (see execute()). Off unless the converter declares
     // it, so a graph without the ring is byte-identical to before.
     int ring_ = 0;
