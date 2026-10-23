@@ -121,8 +121,8 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) UnifiedMeta FLATBUFFERS_FINAL_CLASS {
  private:
   int32_t dtype_;
   int32_t name_len_;
-  int32_t offset_;
-  int32_t size_;
+  uint32_t offset_;
+  uint32_t size_;
   int32_t dims_[4];
 
  public:
@@ -136,14 +136,14 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) UnifiedMeta FLATBUFFERS_FINAL_CLASS {
         size_(0),
         dims_() {
   }
-  UnifiedMeta(int32_t _dtype, int32_t _name_len, int32_t _offset, int32_t _size)
+  UnifiedMeta(int32_t _dtype, int32_t _name_len, uint32_t _offset, uint32_t _size)
       : dtype_(::flatbuffers::EndianScalar(_dtype)),
         name_len_(::flatbuffers::EndianScalar(_name_len)),
         offset_(::flatbuffers::EndianScalar(_offset)),
         size_(::flatbuffers::EndianScalar(_size)),
         dims_() {
   }
-  UnifiedMeta(int32_t _dtype, int32_t _name_len, int32_t _offset, int32_t _size, ::flatbuffers::span<const int32_t, 4> _dims)
+  UnifiedMeta(int32_t _dtype, int32_t _name_len, uint32_t _offset, uint32_t _size, ::flatbuffers::span<const int32_t, 4> _dims)
       : dtype_(::flatbuffers::EndianScalar(_dtype)),
         name_len_(::flatbuffers::EndianScalar(_name_len)),
         offset_(::flatbuffers::EndianScalar(_offset)),
@@ -162,16 +162,16 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) UnifiedMeta FLATBUFFERS_FINAL_CLASS {
   void mutate_name_len(int32_t _name_len) {
     ::flatbuffers::WriteScalar(&name_len_, _name_len);
   }
-  int32_t offset() const {
+  uint32_t offset() const {
     return ::flatbuffers::EndianScalar(offset_);
   }
-  void mutate_offset(int32_t _offset) {
+  void mutate_offset(uint32_t _offset) {
     ::flatbuffers::WriteScalar(&offset_, _offset);
   }
-  int32_t size() const {
+  uint32_t size() const {
     return ::flatbuffers::EndianScalar(size_);
   }
-  void mutate_size(int32_t _size) {
+  void mutate_size(uint32_t _size) {
     ::flatbuffers::WriteScalar(&size_, _size);
   }
   const ::flatbuffers::Array<int32_t, 4> *dims() const {
@@ -187,8 +187,8 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) RGBAConversionMeta FLATBUFFERS_FINAL_CLAS
  private:
   int32_t dtype_;
   int32_t name_len_;
-  int32_t offset_;
-  int32_t size_;
+  uint32_t offset_;
+  uint32_t size_;
   int32_t dims_[4];
 
  public:
@@ -202,14 +202,14 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) RGBAConversionMeta FLATBUFFERS_FINAL_CLAS
         size_(0),
         dims_() {
   }
-  RGBAConversionMeta(int32_t _dtype, int32_t _name_len, int32_t _offset, int32_t _size)
+  RGBAConversionMeta(int32_t _dtype, int32_t _name_len, uint32_t _offset, uint32_t _size)
       : dtype_(::flatbuffers::EndianScalar(_dtype)),
         name_len_(::flatbuffers::EndianScalar(_name_len)),
         offset_(::flatbuffers::EndianScalar(_offset)),
         size_(::flatbuffers::EndianScalar(_size)),
         dims_() {
   }
-  RGBAConversionMeta(int32_t _dtype, int32_t _name_len, int32_t _offset, int32_t _size, ::flatbuffers::span<const int32_t, 4> _dims)
+  RGBAConversionMeta(int32_t _dtype, int32_t _name_len, uint32_t _offset, uint32_t _size, ::flatbuffers::span<const int32_t, 4> _dims)
       : dtype_(::flatbuffers::EndianScalar(_dtype)),
         name_len_(::flatbuffers::EndianScalar(_name_len)),
         offset_(::flatbuffers::EndianScalar(_offset)),
@@ -228,16 +228,16 @@ FLATBUFFERS_MANUALLY_ALIGNED_STRUCT(4) RGBAConversionMeta FLATBUFFERS_FINAL_CLAS
   void mutate_name_len(int32_t _name_len) {
     ::flatbuffers::WriteScalar(&name_len_, _name_len);
   }
-  int32_t offset() const {
+  uint32_t offset() const {
     return ::flatbuffers::EndianScalar(offset_);
   }
-  void mutate_offset(int32_t _offset) {
+  void mutate_offset(uint32_t _offset) {
     ::flatbuffers::WriteScalar(&offset_, _offset);
   }
-  int32_t size() const {
+  uint32_t size() const {
     return ::flatbuffers::EndianScalar(size_);
   }
-  void mutate_size(int32_t _size) {
+  void mutate_size(uint32_t _size) {
     ::flatbuffers::WriteScalar(&size_, _size);
   }
   const ::flatbuffers::Array<int32_t, 4> *dims() const {
@@ -2082,8 +2082,8 @@ inline const ::flatbuffers::TypeTable *UnifiedMetaTypeTable() {
   static const ::flatbuffers::TypeCode type_codes[] = {
     { ::flatbuffers::ET_INT, 0, -1 },
     { ::flatbuffers::ET_INT, 0, -1 },
-    { ::flatbuffers::ET_INT, 0, -1 },
-    { ::flatbuffers::ET_INT, 0, -1 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
     { ::flatbuffers::ET_INT, 1, -1 }
   };
   static const int16_t array_sizes[] = { 4,  };
@@ -2105,8 +2105,8 @@ inline const ::flatbuffers::TypeTable *RGBAConversionMetaTypeTable() {
   static const ::flatbuffers::TypeCode type_codes[] = {
     { ::flatbuffers::ET_INT, 0, -1 },
     { ::flatbuffers::ET_INT, 0, -1 },
-    { ::flatbuffers::ET_INT, 0, -1 },
-    { ::flatbuffers::ET_INT, 0, -1 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
+    { ::flatbuffers::ET_UINT, 0, -1 },
     { ::flatbuffers::ET_INT, 1, -1 }
   };
   static const int16_t array_sizes[] = { 4,  };

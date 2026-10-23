@@ -168,6 +168,15 @@ def _init_dtype_name(arr) -> str:
 # C++ two-pass scan (load.cpp alignment constant).
 _BLOB_ALIGNMENT = 64
 
+# The unified region's members are addressed by a uint32 field in the on-disk
+# UnifiedMeta (model/vkop_model.fbs), so a member whose distance from the region
+# start reaches 2^32 has no representation at all. `dims` is int32 in the same
+# struct, which is a tighter line for a single tensor and is checked alongside
+# this one -- a negative dim is decoded into size_t by the runtime and turns
+# into a fail-closed payload/shape mismatch, but the message names nothing the
+# user can act on, so it is worth catching at the writer.
+_UNIFIED_MAX_BYTES = 1 << 32
+
 
 class Node:
     """Represents a node in the computation graph."""
@@ -437,6 +446,11 @@ class DAGBasedModel:
         their bytes already live in the shared region, dropping one would mean
         repacking every offset in it, and they cost a BufferView each (0.18 us),
         not an upload.
+
+        That keep rule is also why this sweep is where the region is checked
+        against its reader: nothing between here and write time can change the
+        member list, so the count checked here is the count written. See
+        _check_unified_region.
         """
         producer = {}
         for node in self.nodes.values():
@@ -473,6 +487,70 @@ class DAGBasedModel:
                   f"({freed} bytes)")
         if dead_nodes:
             self.build_dependencies()
+
+        # The unified region is never repacked above, so this is the last point
+        # at which the member list can still be compared against what the region
+        # actually holds. A name added to unified_meta without bytes appended to
+        # _unified_bytes (a pass that ran after Unifier.unify) produces a region
+        # the runtime would sub-allocate past its end.
+        self._check_unified_region()
+
+    def _check_unified_region(self) -> None:
+        """Check the laid-out unified region against what it claims to hold.
+
+        Runs at the end of terminal_liveness_prune on the FINAL model, not only
+        on the writing path, because that is the last sweep before save: every
+        check below is a claim about the member list, and this is the last point
+        where the member list is still the one that gets written.
+
+        Two ceilings on the on-disk UnifiedMeta (model/vkop_model.fbs), both in
+        its fixed 32-byte layout:
+
+        - a member's region-relative offset and its size are uint32. Only the
+          member's distance from the region start has to fit, so the real limit
+          is the region's end at 4 GiB, not the file size (the base rides in the
+          64-bit unified_blob_offset).
+        - dims is int32, the tighter line for a single weight.
+
+        The checks are deliberately here rather than earlier or later: earlier
+        is not allowed (a fusion pass can still append new initializers, so the
+        member list is not settled), and later is too late -- the error the
+        layout itself produces is flatbuffers' "bad number <n> for type uint32"
+        from UnifiedMeta.CreateUnifiedMeta, which names neither the field, the
+        tensor, nor a way out. This raises instead, and says to drop --unify:
+        the ordinary initializer path stores offsets the loader widens into
+        size_t and dims as a variable-length vector, so it has neither ceiling.
+        """
+        laid_out = len(getattr(self, "_unified_bytes", b""))
+        # A member with no bytes appended is not merely large -- it is absent
+        # from the region, so the runtime would read whatever the next member
+        # put there. Name the member list and the region so the mismatch is
+        # visible; the count is the member list's, not the region's.
+        widest = max((m["offset"] + m["size"] for m in self.unified_meta),
+                     default=0)
+        if self.unified_meta and widest > laid_out:
+            raise ValueError(
+                f"unified_meta describes {widest:,} bytes across "
+                f"{len(self.unified_meta)} member(s), but only {laid_out:,} "
+                f"bytes were laid out in the region. Something added a member "
+                f"after Unifier.unify without appending its bytes.")
+
+        region_end = getattr(self, "_unified_blob_offset", 0) + laid_out
+        if region_end > _UNIFIED_MAX_BYTES:
+            raise ValueError(
+                f"the unified region would end at byte {region_end:,} of the "
+                f"blob, past the {_UNIFIED_MAX_BYTES:,}-byte (4 GiB) ceiling "
+                f"UnifiedMeta's 32-bit offset can describe "
+                f"({len(self.unified_meta)} members share it). Drop --unify: "
+                f"the ordinary initializer path has no such limit.")
+        for m in self.unified_meta:
+            dims = [int(d) for d in m.get("dims", [])]
+            if any(d > 0x7FFFFFFF for d in dims):
+                raise ValueError(
+                    f"unified member '{m['_name']}' has dims {dims}, which do "
+                    f"not fit UnifiedMeta's int32 dims field (max 2^31-1 per "
+                    f"axis). Drop --unify: the ordinary initializer path stores "
+                    f"dims as a variable-length vector.")
 
     def save_to_binary(self, file_path: str, shader_archive: bytes = None):
         """Save model to a FlatBuffers binary file.
@@ -531,7 +609,7 @@ class DAGBasedModel:
         # Members of the unified sub-region: their bytes live in _unified_bytes
         # rather than the regular blob, but they still need an InitializerEntry
         # row -- the runtime looks each one up by name for dtype/dims before
-        # sub-allocating it (core/runtime.cpp:419).
+        # sub-allocating it (the unified loop in core/runtime.cpp).
         unified_names = {m["_name"] for m in self.unified_meta}
 
         external = False
@@ -630,10 +708,13 @@ class DAGBasedModel:
             self.unified_blob_offset = unified_base
             # UnifiedMeta offsets stay relative to the region: LoadModel bases the
             # region's source pointer at unified_blob_offset and then indexes the
-            # shared buffer by meta.offset() (core/runtime.cpp:384-394), and a
-            # relative offset is the only thing that fits UnifiedMeta's int32 for
-            # a multi-GB blob. The side-table rows keep the schema's rule of
-            # absolute-into-blob, so add the base back for those.
+            # shared buffer by meta.offset(), so the field only ever holds a
+            # member's distance from the region start. That is what makes 'uint'
+            # in the schema enough for a region of multi-GiB weights -- an
+            # absolute offset would overflow the field, a relative one does not
+            # (check_unified_region holds the 4 GiB line). The side-table rows
+            # keep the schema's rule of absolute-into-blob, so add the base back
+            # for those.
             for m in self.unified_meta:
                 name = m["_name"]
                 abs_offset = m["offset"] + unified_base

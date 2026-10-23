@@ -106,13 +106,18 @@ def probe_unified(b, root, blob, init_names):
     """Walk the `-u` unified region, which is where the weights actually live once
     Unifier has merged them.
 
-    `unified_meta` is a vector of inline 32-byte `struct UnifiedMeta` (8 x int32:
-    dtype, name_len, offset, size, dims[4]) and `unified_names` is ONE concatenated
-    byte string consumed sequentially by name_len in meta order -- the same two
-    facts core/runtime.cpp:379-420 reads. `offset` is RELATIVE to the region: the
-    runtime basing its pointer at unified_blob_offset is what makes it absolute,
-    and that is also the only way it fits the int32 field for a multi-GB blob.
-    The InitializerEntry rows for the same names carry the absolute offset.
+    `unified_meta` is a vector of inline 32-byte `struct UnifiedMeta` (8 x 4-byte
+    words: dtype, name_len, offset, size, dims[4]) and `unified_names` is ONE
+    concatenated byte string consumed sequentially by name_len in meta order --
+    the same two facts the unified loop in core/runtime.cpp reads. `offset` is
+    RELATIVE to the region: the runtime basing its pointer at
+    unified_blob_offset is what makes it absolute, and that is also the only way
+    a multi-GiB weight region fits a 32-bit field at all. The InitializerEntry
+    rows for the same names carry the absolute offset.
+
+    offset/size are UNSIGNED (model/vkop_model.fbs): an fp16 LLM's region runs
+    past 2^31, so reading them as signed would report the tail members as huge
+    negative numbers.
     """
     mpos = field_pos(b, root, F_UNIFIED_META)
     if mpos is None:
@@ -131,7 +136,8 @@ def probe_unified(b, root, blob, init_names):
     cur = missing = 0
     for i in range(n):
         ep = p + 4 + i * 32
-        dtype_i, name_len, off, size = struct.unpack_from("<4i", b, ep)
+        dtype_i, name_len = struct.unpack_from("<2i", b, ep)
+        off, size = struct.unpack_from("<2I", b, ep + 8)
         dims = list(struct.unpack_from("<4i", b, ep + 16))
         while dims and dims[-1] == 0:  # fixed-4 slot, zero padded
             dims.pop()

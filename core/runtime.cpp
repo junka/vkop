@@ -695,6 +695,12 @@ void Runtime::LoadModel() {
         // (matches legacy behaviour where unified_tensors was a single blob).
         // The shared buffer's element count is the total unified byte size /
         // sizeof(float); runtime only uses it as a backing store.
+        //
+        // meta.offset()/size() are unsigned (model/vkop_model.fbs) because the
+        // region is a multi-GiB weight store -- 3.2 GiB for an fp16 LLM, whose
+        // later members sit past 2^31. The 32-bit field is not the binding
+        // limit any more; 4 GiB is, and the converter fails closed before it
+        // gets there.
         size_t unified_total_bytes = 0;
         for (const auto &meta : model.unified_meta) {
             size_t end = static_cast<size_t>(meta.offset()) +
@@ -718,6 +724,33 @@ void Runtime::LoadModel() {
 
         size_t name_idx_offset = 0;
         for (const auto &meta : model.unified_meta) {
+            // name_len/offset/size are independent fields, so a corrupt or
+            // hand-edited file can name a range outside either buffer. Check
+            // before dereferencing: this is the check_initializer_payload
+            // analogue for the unified path, which has no per-tensor offset to
+            // validate against the blob.
+            if (static_cast<size_t>(meta.name_len()) >
+                    model.unified_names.size() ||
+                name_idx_offset >
+                    model.unified_names.size() - meta.name_len()) {
+                throw std::runtime_error(
+                    "vkop: unified_meta entry names " +
+                    std::to_string(meta.name_len()) + " bytes at name offset " +
+                    std::to_string(name_idx_offset) +
+                    ", past the end of unified_names (" +
+                    std::to_string(model.unified_names.size()) + " bytes)");
+            }
+            size_t member_end = static_cast<size_t>(meta.offset()) +
+                                static_cast<size_t>(meta.size());
+            if (member_end > unified_total_bytes) {
+                throw std::runtime_error(
+                    "vkop: unified_meta entry at offset " +
+                    std::to_string(meta.offset()) + " with size " +
+                    std::to_string(meta.size()) + " runs " +
+                    std::to_string(member_end - unified_total_bytes) +
+                    " bytes past the end of the unified region (" +
+                    std::to_string(unified_total_bytes) + " bytes)");
+            }
             auto name =
                 std::string(name_ptr + name_idx_offset,
                             name_ptr + name_idx_offset + meta.name_len());
@@ -748,8 +781,9 @@ void Runtime::LoadModel() {
                 // noise). The per-buffer mass is elsewhere and mergeable only
                 // in principle: 3847 int64 shape constants per LLM graph, 8-40
                 // bytes each. Two harder limits sit on this path regardless of
-                // dtype -- UnifiedMeta's offset/size are int32, so a region
-                // over 2 GiB (any fp16 LLM) cannot be expressed at all, and the
+                // dtype -- UnifiedMeta's offset/size now carry the region past
+                // 2 GiB (they are unsigned, see vkop_model.fbs) but still cap
+                // it at 4 GiB, which the converter refuses to cross, and the
                 // shared buffer's element count above comes from dividing the
                 // region by sizeof(float), which a byte or sub-byte payload
                 // would not survive.

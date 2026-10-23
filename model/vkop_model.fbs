@@ -11,7 +11,7 @@
 //    computes offsets — it memmaps the file and points `initializer_memory`
 //    directly at the blob (zero-copy).
 //  - `UnifiedMeta` / `RGBAConversionMeta` are FlatBuffers structs (inline,
-//    fixed 32-byte layout: 8x int32) matching the legacy
+//    fixed 32-byte layout: 8x 4-byte words) matching the legacy
 //    load::UnifiedMetadata / RGBAConversion C++ structs, so they can be read
 //    field-by-field via direct indexing (no memcpy into a temp vector).
 
@@ -30,19 +30,37 @@ enum AttrType : byte {
   Bool = 6,
 }
 
+// Shared by UnifiedMeta and RGBAConversionMeta. `offset` and `size` are the
+// two fields that describe a multi-GiB weight, so they are unsigned: a 3.2 GiB
+// unified region (any fp16 LLM) puts members past 2^31, and an int32 offset
+// cannot express them. Doubling the ceiling costs nothing — the struct stays
+// 32 bytes, so an int32-era file still reads correctly (0..2^31-1 has the same
+// bit pattern in both widths).
+//
+// What `offset` is relative TO differs between the two users, and only one of
+// them is documented here:
+//  - UnifiedMeta: RELATIVE to the region at Model.unified_blob_offset. The
+//    runtime bases its source pointer there and indexes by meta.offset()
+//    (core/runtime.cpp), which is what keeps the number small enough for 32
+//    bits at all. An absolute offset into a multi-GiB blob would not fit even
+//    unsigned. The InitializerEntry row for the same name carries the absolute
+//    one.
+//  - RGBAConversionMeta: ABSOLUTE into Model.initializer_blob, like every other
+//    offset in this file (see the layout note above).
+// Both are written by the Python writer (model/pypi/onnx2vkop/dag.py).
 struct UnifiedMeta {
   dtype: int;
   name_len: int;
-  offset: int;
-  size: int;
+  offset: uint;
+  size: uint;
   dims: [int: 4];
 }
 
 struct RGBAConversionMeta {
   dtype: int;
   name_len: int;
-  offset: int;
-  size: int;
+  offset: uint;
+  size: uint;
   dims: [int: 4];
 }
 

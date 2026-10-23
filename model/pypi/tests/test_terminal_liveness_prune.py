@@ -84,6 +84,9 @@ def test_unified_member_survives_without_any_consumer():
     m.initializers["unif"] = init("unif", [4.0])
     m.unified_meta = [{"_name": "unif", "offset": 0, "size": 4, "dims": [1],
                        "name_len": 4, "dtype": 1}]
+    # The sweep also holds the region to what it holds (see _check_unified_region),
+    # so a hand-built member list needs its bytes.
+    m._unified_bytes = b"\0" * 4
     m.terminal_liveness_prune()
     assert "unif" in m.initializers
 

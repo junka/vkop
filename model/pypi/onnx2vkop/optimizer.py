@@ -8906,7 +8906,35 @@ class Unifier:
     Eligible: float32 / float16 / int8 initializers consumed as <=2-D tensors
     (weights, biases, BN params) — i.e. the ones the runtime uploads as uniform
     buffer views. 4-D image weights stay in the regular blob path.
+
+    The rank test alone is not enough, and the consumer is what says so. The
+    runtime only reaches the unified sub-allocation for a tensor whose consumer
+    op reads it through a uniform buffer view (core/runtime.cpp:632-634 gates on
+    Conv/BatchNormalization; the 2-D case is the MatMul/Gemm weight), while a
+    rank<=2 initializer read by a Shape / Gather / arithmetic op is data, not a
+    weight, and does not want to be in the region. Every admitted member is
+    therefore required to also have a consumer in _WEIGHT_CONSUMERS.
     """
+
+    # Consumers whose operand is a weight. This is what makes "<=2-D" mean
+    # "weight" rather than "small": the runtime's uniform-view gate
+    # (core/runtime.cpp:632-634) covers Conv/BatchNormalization for the image
+    # side, and Gemm/MatMul/ConvTranspose are the same shape of consumer on the
+    # 2-D side. Deliberately a small, explicit set: a rank<=2 Shape/Gather/Add
+    # operand is graph data, and putting it in the region would only spend
+    # region bytes and move a tensor the runtime would have read from the
+    # ordinary path anyway. Kept in the same order the runtime's own gate does
+    # so the two lists can be compared at a glance.
+    _WEIGHT_CONSUMERS = frozenset(
+        {
+            "Conv",
+            "Conv2d",
+            "ConvTranspose",
+            "BatchNormalization",
+            "Gemm",
+            "MatMul",
+        }
+    )
 
     _DTYPE_TO_ONNX = {
         "float32": 1,
@@ -8915,18 +8943,35 @@ class Unifier:
     }
 
     @staticmethod
-    def _is_eligible(name, init, dag_model):
+    def _is_eligible(init, consumers_by_name):
+        """Eligible iff the dtype is one the region carries, the rank fits the
+        runtime's <=2-D uniform view, and at least one consumer reads it as a
+        weight.
+
+        The consumer list is passed in rather than derived per tensor because
+        building it is a whole-graph walk; ``unify`` builds it once. A missing
+        entry (a weight no node consumes) is ineligible: its bytes would be
+        appended to the region and never read, and — worse — the region's member
+        list would then grow with tensors the runtime's own gate would refuse.
+        """
         if init.data_type not in (1, 10, 3):
             return False
         if len(init.dims) > 2:
             return False
-        return True
+        for consumer, idx in consumers_by_name:
+            # idx 0 is the data operand for every consumer in _WEIGHT_CONSUMERS;
+            # an initializer in the weight slot of Conv/BatchNormalization is
+            # no longer a weight.
+            if consumer.op_type in Unifier._WEIGHT_CONSUMERS and idx > 0:
+                return True
+        return False
 
     @staticmethod
     def unify(dag_model: "DAGBasedModel"):
+        _, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
         eligible = []
         for name, init in list(dag_model.initializers.items()):
-            if Unifier._is_eligible(name, init, dag_model):
+            if Unifier._is_eligible(init, consumers.get(name, ())):
                 eligible.append(name)
         if not eligible:
             return 0

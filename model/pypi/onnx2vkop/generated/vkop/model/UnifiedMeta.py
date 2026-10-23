@@ -22,9 +22,9 @@ class UnifiedMeta(object):
     # UnifiedMeta
     def NameLen(self): return self._tab.Get(flatbuffers.number_types.Int32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(4))
     # UnifiedMeta
-    def Offset(self): return self._tab.Get(flatbuffers.number_types.Int32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(8))
+    def Offset(self): return self._tab.Get(flatbuffers.number_types.Uint32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(8))
     # UnifiedMeta
-    def Size(self): return self._tab.Get(flatbuffers.number_types.Int32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(12))
+    def Size(self): return self._tab.Get(flatbuffers.number_types.Uint32Flags, self._tab.Pos + flatbuffers.number_types.UOffsetTFlags.py_type(12))
     # UnifiedMeta
     def Dims(self, j = None):
         if j is None:
@@ -51,8 +51,8 @@ def CreateUnifiedMeta(builder, dtype, nameLen, offset, size, dims):
     builder.Prep(4, 32)
     for _idx0 in range(4 , 0, -1):
         builder.PrependInt32(dims[_idx0-1])
-    builder.PrependInt32(size)
-    builder.PrependInt32(offset)
+    builder.PrependUint32(size)
+    builder.PrependUint32(offset)
     builder.PrependInt32(nameLen)
     builder.PrependInt32(dtype)
     return builder.Offset()
