@@ -210,7 +210,7 @@ N=16384 下 q=32/64/128 三个 pin 得到同一个数，就是这个原因。
 ## 性能开关要点（Apple M5 Max，resnet50 fp16）
 
 - `VKOP_GRAPH_SUBMIT=0` 是最大项（2.2x），已默认开。提交/屏障路径总共只值 ~4%：`VKOP_MERGE_LEVELS=8`（转换期 level 合并，−3.9%）和 `VKOP_GRAPH_NO_BARRIER=1`（−2.8%）花同一份预算、不叠加。基线剩下的优化空间在 kernel，不在提交路径。
-- `VKOP_CONV_WEIGHT_FOLD` 已默认且净收益（关掉 +0.97%）；省的是 VkImage array pitch 而非 payload 字节（r18 fp32 −38%、r50 fp16 −15%），且依赖 kx innermost 循环序。
+- Conv 权重 image 的 fold 布局（`weight_pack`）现在由转换器写在节点上、默认开启，运行时的 `VKOP_CONV_WEIGHT_FOLD` A/B 开关已删除。原开关的收益是省 VkImage array pitch 而非 payload 字节（r18 fp32 −38%、r50 fp16 −15%），且依赖 kx innermost 循环序。
 - `VKOP_REPLAY` 在 graph 模式被显式关闭（CNN 无从生效）；`VKOP_NO_ALIAS_BARRIER` 在 CNN 上 ±0（收益在 LLM decode 的 buffer 回收路径）。
 - 方法：**配对轮换**（A,B,A,B...）按 rep 配对看逐对胜负，min-of-N 不可靠；跨批次绝对值会漂 ~4%，只有同批次相对值可信；`VKOP_OPPROF` 只是 host record 开销（resnet50 全图 0.23ms），GPU 时间看 `VKOP_RUN_PROFILE=1`。
 

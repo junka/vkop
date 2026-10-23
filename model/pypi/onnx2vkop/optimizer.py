@@ -925,6 +925,81 @@ class PatternBasedFusionPass(OptimizationPass):
         return fused
 
 
+class ConvWeightLayoutPass(OptimizationPass):
+    """Annotate every Conv with the weight-image layout its consumer reads.
+
+    A Conv weight is uploaded as an image, and the image conv shader addresses
+    it through two push-constant fields, `transpose` and `pack`
+    (ops/Conv2d.hpp GPUConv2dParam, shaders/image/conv2d.comp). The runtime used
+    to decide both at load time from a name -> op_type map plus the weight's
+    geometry (core/runtime.cpp:313-319 and the two initializer loaders). That
+    map is a plain unordered_map assigned last-writer-wins, so a weight shared
+    by two consumers took whichever node was walked last, and the transpose flag
+    was applied without a rank guard -- a rank-5 Conv3d weight got transpose=1
+    and Tensor::getGPUShape then invented a batch/chan for it.
+
+    This pass decides the same layout where the rest of them are decided (the
+    converter), and writes it on the node as `weight_transpose` / `weight_pack`,
+    so the runtime only reads it. The rule matches what the runtime computed for
+    a 4-D weight, and stops claiming a layout for a rank the image path cannot
+    address at all (Conv2dImage::execute indexes weight_shape[0..3] and throws
+    below rank 4).
+
+    Inert on the buffer backend: Conv2dBufferPC has no transpose/pack field, so
+    a model that runs its Convs as SSBOs is unaffected by either value.
+    """
+
+    _OPS = ("Conv", "Conv2d")
+
+    def __init__(self, priority: int = 71):
+        super().__init__("annotate_conv_weight_layout", priority)
+
+    @staticmethod
+    def _weight_rank(dag_model, producer, weight_name):
+        """Rank of a Conv weight, or None if it is not (yet) a constant.
+
+        A weight may still be a Constant *node* when this runs: the pass sits at
+        priority 71 and prune_and_materialize, which folds a live Constant into
+        an initializer, runs at 0. Reading the rank off the node keeps the
+        annotation independent of the round count -- otherwise
+        VKOP_MAX_FUSE_ROUNDS=1 would leave the Conv unannotated and the
+        converter's fail-closed check would reject an otherwise fine model.
+        """
+        init = dag_model.initializers.get(weight_name)
+        if init is not None:
+            return len(init.dims)
+        node = producer.get(weight_name)
+        if node is not None and node.op_type == "Constant":
+            value = node.attributes.get("value")
+            # Scalar Constant forms materialize as shape [1]; a scalar Conv
+            # weight is meaningless but must not slip past the rank rule.
+            return value.ndim if isinstance(value, np.ndarray) else 1
+        return None
+
+    def apply(self, dag_model) -> int:
+        producer, _ = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
+        changed = 0
+        for node in list(dag_model.nodes.values()):
+            if node.op_type not in self._OPS or len(node.inputs) < 2:
+                continue
+            rank = self._weight_rank(dag_model, producer, node.inputs[1]["name"])
+            if rank is None:
+                # A non-constant weight carries no image (the runtime's flags
+                # only ever landed on initializer tensors). Leave it alone.
+                continue
+            # 4-D weights pack their channel group into the image width; any
+            # other rank has no folded addressing and no correct transpose, so
+            # claim neither.
+            want = {"weight_transpose": 1 if rank == 4 else 0,
+                    "weight_pack": 1 if rank == 4 else 0}
+            if node.attributes is None:
+                node.attributes = {}
+            if any(node.attributes.get(k) != v for k, v in want.items()):
+                node.attributes.update(want)
+                changed += 1
+        return changed
+
+
 class MultiRoundOptimizer:
     def __init__(self, max_rounds: int = None):
         self.passes: List[OptimizationPass] = []
@@ -1249,6 +1324,14 @@ class FusionOptimizer:
                 priority=73,
             )
         )
+
+        # Sits below every pass that rewrites a Conv or turns one into a MatMul
+        # (fuse_conv_bn / fuse_gated_conv 90, fuse_add_bias_into_conv 88,
+        # fuse_conv_activation 85, replace_globalaveragepool_conv_with_gemm 75,
+        # fold_single_patch_conv 73) so the survivors are final, and well above
+        # prune_and_materialize (0). Idempotent: it returns 0 once each Conv
+        # carries the right values, so the fixpoint converges immediately.
+        optimizer.register_pass(ConvWeightLayoutPass(priority=71))
 
         # 常量索引 Gather：单位轴 + 标量索引 → Squeeze（下一轮被别名成 view，
         # 0 dispatch），索引恰是 [0..n-1] → Identity，常量表切片 → 转换期物化成

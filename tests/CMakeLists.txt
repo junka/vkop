@@ -83,6 +83,7 @@ set(TEST_SOURCES
     SqueezeUnsqueezeTest.cpp
     RobustnessTest.cpp
     BackendCoverageTest.cpp
+    ConvWeightLayoutTest.cpp
 )
 
 # Option: compile all tests into a single translation unit for faster builds.
@@ -409,3 +410,33 @@ target_link_libraries(MinMaxProbe PRIVATE vkop vload)
 # Builds its ops directly, so it needs the same archive seed as all_tests.
 add_dependencies(MinMaxProbe shader_archive)
 target_compile_definitions(MinMaxProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+
+# ConvWeightLayoutTest fixture: one rank-4 and one rank-5 Conv, converted twice
+# from the same tracked .onnx -- once with the converter's layout pass and once
+# with it ablated by name, so the test can compare the weight_transpose /
+# weight_pack attribute path against the runtime's rank-gated geometry
+# fallback. The .vkopbin is a build artifact like the ModelTest ones.
+set(CONV_WL_DIR ${CMAKE_CURRENT_BINARY_DIR}/model)
+set(CONV_WL_ONNX ${CMAKE_SOURCE_DIR}/model/conv_weight_layout.onnx)
+set(CONV_WL_VKOPBIN ${CONV_WL_DIR}/conv_weight_layout.vkopbin)
+set(CONV_WL_VKOPBIN_FALLBACK ${CONV_WL_DIR}/conv_weight_layout_fallback.vkopbin)
+add_custom_command(
+    OUTPUT ${CONV_WL_VKOPBIN} ${CONV_WL_VKOPBIN_FALLBACK}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CONV_WL_DIR}
+    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+            -i ${CONV_WL_ONNX} -o ${CONV_WL_VKOPBIN}
+            --master-archive ${VKOP_SHADER_ARCHIVE_FILE}
+    COMMAND ${Python3_EXECUTABLE} -m onnx2vkop.cli
+            -i ${CONV_WL_ONNX} -o ${CONV_WL_VKOPBIN_FALLBACK}
+            --master-archive ${VKOP_SHADER_ARCHIVE_FILE}
+            --no-fusions annotate_conv_weight_layout
+    DEPENDS ${CONV_WL_ONNX} ${ONNX2VKOP_PY} ${VKOP_SHADER_ARCHIVE_FILE}
+    COMMENT "Converting conv_weight_layout.onnx -> vkopbin (annotated + fallback)"
+    VERBATIM
+)
+# Listing the outputs as sources is what orders their generation before the
+# test binary links (same trick ModelTest uses).
+target_sources(all_tests PRIVATE ${CONV_WL_VKOPBIN} ${CONV_WL_VKOPBIN_FALLBACK})
+target_compile_definitions(all_tests PRIVATE
+    CONV_WEIGHT_LAYOUT_DATA="${CONV_WL_DIR}")
+add_dependencies(all_tests shader_archive)

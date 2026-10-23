@@ -319,6 +319,33 @@ void Runtime::LoadModel() {
     }
     printf("Total nodes %zu\n", model.nodes.size());
 
+    // Conv weight-image layout, decided by the converter and written on the
+    // node as weight_transpose / weight_pack (ConvWeightLayoutPass in
+    // onnx2vkop/optimizer.py). This used to be inferred here from
+    // inputs_for_node_type plus the weight's geometry, which had two faults:
+    // the name -> op_type map is last-writer-wins, so a weight shared by two
+    // consumers took whichever node was walked last, and the transpose flag was
+    // applied without a rank guard, so a 5-D Conv3d weight got transpose=1 and
+    // Tensor::getGPUShape invented a batch/chan for it. A file written before
+    // the attributes falls back to the rank-gated geometry rule, so no on-disk
+    // model is orphaned. Two Convs sharing a weight is not a hazard any more:
+    // the converter writes the same values on both, so either entry agrees.
+    std::unordered_map<std::string, std::pair<bool, bool>> conv_weight_layout;
+    for (const auto &n : model.nodes) {
+        if ((n.op_type != "Conv" && n.op_type != "Conv2d") ||
+            n.inputs.size() < 2)
+            continue;
+        const bool rank4 = n.inputs[1].dims.size() == 4;
+        bool transpose = rank4, pack = rank4;
+        if (auto it = n.attributes.find("weight_transpose");
+            it != n.attributes.end())
+            transpose = std::stol(it->second) != 0;
+        if (auto it = n.attributes.find("weight_pack");
+            it != n.attributes.end())
+            pack = std::stol(it->second) != 0;
+        conv_weight_layout[n.inputs[1].name] = {transpose, pack};
+    }
+
     // Batched initializer upload. Every initializer otherwise gets its own
     // staging copy plus a submit and a fence wait, which measures 271 us
     // whatever the buffer holds: llm.vkopbin's 2846 entries are therefore
@@ -577,24 +604,16 @@ void Runtime::LoadModel() {
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
         tensor->set_ref_cnt_forever();
-        if (inputs_for_node_type.find(init.name) !=
-                inputs_for_node_type.end() &&
-            inputs_for_node_type[init.name] == "Conv") {
-            tensor->set_transpose();
-            // 1x1 weights have always been folded into a single-layer image;
-            // kxk is folded the same way, since that is where the array pitch
-            // padding actually is (a [3, K_H*Cin, C4] weight image pays ~78%
-            // waste on its 3-texel rows). conv2d.comp reads the same flag to
-            // pick its weight addressing, so both layouts share one binary, and
-            // VKOP_CONV_WEIGHT_FOLD=0 keeps the array layout for A/B runs.
-            const char *fold_env = std::getenv("VKOP_CONV_WEIGHT_FOLD");
-            bool fold_kxk = fold_env == nullptr || fold_env[0] != '0';
-            // Only 4-D (image) conv weights; a 5-D Conv3d weight has no folded
-            // addressing in conv2d.comp and must stay an array image.
-            if (init.dims.size() == 4 &&
-                ((init.dims[2] == 1 && init.dims[3] == 1) || fold_kxk)) {
+        // Weight-image layout, as the converter decided it: transpose swaps the
+        // image's batch/chan addressing, pack folds the channel group into the
+        // width. Both are inert on the buffer backend (Conv2dBufferPC has no
+        // such fields).
+        if (auto it = conv_weight_layout.find(init.name);
+            it != conv_weight_layout.end()) {
+            if (it->second.first)
+                tensor->set_transpose();
+            if (it->second.second)
                 tensor->set_pack();
-            }
         }
 
         if (backend_buffer_) {
@@ -643,18 +662,14 @@ void Runtime::LoadModel() {
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
         tensor->set_ref_cnt_forever();
-        if (inputs_for_node_type.find(init.name) !=
-                inputs_for_node_type.end() &&
-            inputs_for_node_type[init.name] == "Conv") {
-            tensor->set_transpose();
-            const char *fold_env = std::getenv("VKOP_CONV_WEIGHT_FOLD");
-            bool fold_kxk = fold_env == nullptr || fold_env[0] != '0';
-            // See handle_floating_point_tensor for why the folded layout keeps
-            // an env override: VKOP_CONV_WEIGHT_FOLD=0 is only an A/B switch.
-            if (init.dims.size() == 4 &&
-                ((init.dims[2] == 1 && init.dims[3] == 1) || fold_kxk)) {
+        // See handle_floating_point_tensor: the layout is the converter's,
+        // read from the node, not inferred from the consumer's op_type.
+        if (auto it = conv_weight_layout.find(init.name);
+            it != conv_weight_layout.end()) {
+            if (it->second.first)
+                tensor->set_transpose();
+            if (it->second.second)
                 tensor->set_pack();
-            }
         }
 
         if (tensor->num_dims() <= 2) {

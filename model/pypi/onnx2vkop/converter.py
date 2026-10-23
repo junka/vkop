@@ -25,6 +25,7 @@ try:
         Quantizer,
         RGBAConverter,
         Unifier,
+        _disabled_passes,
     )
 except ImportError:
     from dag import (
@@ -43,6 +44,7 @@ except ImportError:
         Quantizer,
         RGBAConverter,
         Unifier,
+        _disabled_passes,
     )
 
 
@@ -734,6 +736,10 @@ class ModelConverter:
 
         self.fusion_optimizer.optimize(dag_model)
 
+        # The Conv weight-image layout is a converter decision now, so assert it
+        # here rather than reading it back off the runtime's guess.
+        self._validate_conv_weight_layout(dag_model)
+
         # Post-fusion orphan cleanup: some fusion passes delete nodes but miss
         # updating all consumers (e.g. Unsqueeze eliminated by pass A but still
         # consumed by Concat which pass B forgot). Walk all inputs, find orphans,
@@ -793,6 +799,56 @@ class ModelConverter:
         # here (see validate_supported_ops) instead of being skipped at load.
         # Runs last so it sees the post-fusion, post-prune graph.
         self.validate_supported_ops(dag_model)
+
+    @staticmethod
+    def _validate_conv_weight_layout(dag_model):
+        """Assert the Conv weight-image layout the converter decided.
+
+        ConvWeightLayoutPass writes weight_transpose / weight_pack on every Conv
+        whose weight is a constant; the runtime only reads them (core/runtime.cpp
+        builds a name -> (transpose, pack) map at load). Two ways that contract
+        can break, both of which the runtime would trust blindly:
+
+          - a Conv with a constant weight that carries neither attribute: the
+            pass was skipped, or a future pass created the Conv after it. The
+            runtime still has the old rank-gated geometry fallback, so this is
+            recoverable, but it means the file's layout was not decided by the
+            converter and the invariant is no longer testable.
+          - an attribute that contradicts the weight's rank: a non-4-D weight has
+            no folded addressing and no correct batch/chan transpose, and
+            transpose=1 there makes Tensor::getGPUShape invent a batch/chan.
+
+        Both fail the conversion. A 5th-dimensional Conv weight is also
+        unaddressable by Conv2dImage::execute, which indexes weight_shape[0..3].
+
+        Skipped entirely when the pass was ablated (VKOP_NO_FUSIONS): then no
+        Conv carries an attribute and the runtime's fallback is the only layout.
+        """
+        if "annotate_conv_weight_layout" in _disabled_passes("VKOP_NO_FUSIONS"):
+            return
+        for node in dag_model.nodes.values():
+            if node.op_type not in ("Conv", "Conv2d") or len(node.inputs) < 2:
+                continue
+            init = dag_model.initializers.get(node.inputs[1]["name"])
+            if init is None:
+                continue  # non-constant weight: no image, no attribute
+            rank = len(init.dims)
+            expected = 1 if rank == 4 else 0
+            attrs = node.attributes or {}
+            for key in ("weight_transpose", "weight_pack"):
+                if key not in attrs:
+                    raise UnsupportedOpError(
+                        f"Conv '{node.name}' has a constant {rank}-D weight but "
+                        f"no '{key}' attribute -- ConvWeightLayoutPass did not "
+                        f"annotate it (was it ablated, or did a pass create this "
+                        f"Conv after the annotate step?)"
+                    )
+                if int(attrs[key]) != expected:
+                    raise UnsupportedOpError(
+                        f"Conv '{node.name}': {key}={attrs[key]} contradicts its "
+                        f"{rank}-D weight (expected {expected}); the image conv "
+                        f"cannot address that layout"
+                    )
 
     @staticmethod
     def _cleanup_orphan_inputs(dag_model, pre_producer):
