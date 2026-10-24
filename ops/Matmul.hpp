@@ -943,7 +943,13 @@ class MatMulBuffer : public BufferFactory {
         para_.fp8 = weight_fp8 ? 1 : 0;
         para_.fp8_e5m2 = bkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
         para_.w8_quad = (w8_quad && !ksplit && !tiled) ? 1 : 0;
-        para_.ksplit = ksplit ? 1 : 0;
+        // matmul.comp's main() tests uPC.ksplit before uPC.tile, so raising
+        // both flags makes the host's tile dispatch (y = UP_DIV(m,64) = 1)
+        // run the split-K GEMV, which takes its output row from
+        // gl_WorkGroupID.y and so writes only row 0 -- rows 1..m-1 keep
+        // whatever the buffer held. The two gates overlap only for
+        // 3 <= batch*m <= 8, and the tile is also the faster kernel there.
+        para_.ksplit = (ksplit && !tiled) ? 1 : 0;
         para_.wide = 0;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;

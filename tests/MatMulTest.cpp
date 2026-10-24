@@ -110,6 +110,32 @@ TEST(MatMulTest, MatMulComprehensiveTest) {
     }
 }
 
+// The 3 <= batch*m <= 8 band is the only place where the split-K GEMV gate
+// (batch*m <= 8) and the shared-memory tile gate (m >= tiled_min_m = 3 for fp16)
+// are simultaneously true. matmul.comp's main() tests uPC.ksplit BEFORE uPC.tile,
+// so with both flags raised the host dispatched the tile's grid
+// (y = UP_DIV(m,64) = 1) into the split-K GEMV, which takes its output row from
+// gl_WorkGroupID.y and therefore wrote only row 0; rows 1..m-1 kept whatever the
+// output buffer held. Measured at HEAD on ARL (m=3..8) and on a RTX 4000 Ada
+// (m=3..7 -- there coop claims m >= 8). The cases in MatMulComprehensiveTest
+// cannot see this: their K < 256 keeps ksplit off, and they run the image
+// backend. fp16 only, because both gates require fused_fp16.
+TEST(MatMulTest, MatMulTileGemvRowOverlap) {
+    vkop::tests::ScopedBufferBackend buffer;
+    const std::vector<std::tuple<std::vector<int>, std::vector<int>>> cases = {
+        {{3, 256}, {256, 64}},   // m below one TILE_M, ksplit-eligible K
+        {{5, 256}, {256, 64}},
+        {{8, 512}, {512, 96}},
+        {{4, 1024}, {1024, 32}},
+    };
+    for (const auto &test_case : cases) {
+        auto [t1, t2] = test_case;
+        MatMulTest<uint16_t> mmtest(t1, t2);
+        EXPECT_TRUE(mmtest.run_test({mmtest.inputa, mmtest.inputb},
+                                    {mmtest.output}));
+    }
+}
+
 // ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
 // [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
 // dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.
