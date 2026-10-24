@@ -1264,47 +1264,62 @@ int tile_tid() {
 
 // A tile: 64 rows x 8 k-pair words, packed along K. Identical for both B
 // layouts, and always coalesced (consecutive threads walk one row).
+//
+// 64 rows x 8 words = 512 words to stage with 256 threads, so every thread
+// takes TWO words: `l = tid` covers rows 0..31, `l = tid + 256` rows 32..63.
+// Both iterations are unconditional -- an unrolled `for (t = 0; t < 2)` with a
+// tid-derived index is not, because the compiler cannot prove the guard is
+// false for half the threads and the two-iteration form is exactly what let
+// this read as a 512-thread loop next to a 256-thread module.
 void tile_load_a(int b, int row0, int kw, int halfK) {
-    int tid = tile_tid();
-    for (int t = 0; t < 2; ++t) {
-        int l = tid + t * 256;
-        int row = l >> 3;
-        int kt = l & 7;
-        sA[row * SROW + kt] = (row0 + row < uPC.M)
-                                  ? uInputA.data[(b * uPC.M + row0 + row) *
-                                                     halfK + kw + kt]
-                                  : 0u;
-    }
+    int l = tile_tid();
+    int row = l >> 3;
+    int kt = l & 7;
+    sA[row * SROW + kt] = (row0 + row < uPC.M)
+                              ? uInputA.data[(b * uPC.M + row0 + row) *
+                                                 halfK + kw + kt]
+                              : 0u;
+    int row2 = row + 32;
+    sA[row2 * SROW + kt] = (row0 + row2 < uPC.M)
+                               ? uInputA.data[(b * uPC.M + row0 + row2) *
+                                                  halfK + kw + kt]
+                               : 0u;
 }
 
 // transB: B is [batch, N, K], so a weight column is a contiguous row and the
-// tile keeps the same [row][k-pair] packing as A.
+// tile keeps the same [row][k-pair] packing as A. Same 64x8 staging as A.
 void tile_load_b_t(int b, int col0, int kw, int halfK) {
-    int tid = tile_tid();
-    for (int t = 0; t < 2; ++t) {
-        int l = tid + t * 256;
-        int row = l >> 3;
-        int kt = l & 7;
-        sB[row * SROW + kt] = (col0 + row < uPC.N)
-                                  ? uInputB.data[(b * uPC.N + col0 + row) *
-                                                     halfK + kw + kt]
-                                  : 0u;
-    }
+    int l = tile_tid();
+    int row = l >> 3;
+    int kt = l & 7;
+    sB[row * SROW + kt] = (col0 + row < uPC.N)
+                              ? uInputB.data[(b * uPC.N + col0 + row) *
+                                                 halfK + kw + kt]
+                              : 0u;
+    int row2 = row + 32;
+    sB[row2 * SROW + kt] = (col0 + row2 < uPC.N)
+                               ? uInputB.data[(b * uPC.N + col0 + row2) *
+                                                  halfK + kw + kt]
+                               : 0u;
 }
 
 // B is [batch, K, N]: keep global's [k][column-pair] packing so the copy is a
 // straight word-for-word transfer (N even => every column pair is one word).
+// 16 k-rows x 32 column-pairs = 512 words with 256 threads: `l = tid` takes
+// k-rows 0..7, and k-rows 8..15 come from the same `cp` at l + 256.
 void tile_load_b_n(int b, int col0, int kk, int halfN) {
-    int tid = tile_tid();
-    for (int t = 0; t < 2; ++t) {
-        int l = tid + t * 256;
-        int kr = l >> 5;
-        int cp = l & 31;
-        sB[kr * SBROW + cp] =
-            (col0 + cp * 2 + 1 < uPC.N)
-                ? uInputB.data[(b * uPC.K + kk + kr) * halfN + (col0 >> 1) + cp]
-                : 0u;
-    }
+    int l = tile_tid();
+    int kr = l >> 5;
+    int cp = l & 31;
+    sB[kr * SBROW + cp] =
+        (col0 + cp * 2 + 1 < uPC.N)
+            ? uInputB.data[(b * uPC.K + kk + kr) * halfN + (col0 >> 1) + cp]
+            : 0u;
+    int kr2 = kr + 8;
+    sB[kr2 * SBROW + cp] =
+        (col0 + cp * 2 + 1 < uPC.N)
+            ? uInputB.data[(b * uPC.K + kk + kr2) * halfN + (col0 >> 1) + cp]
+            : 0u;
 }
 
 // Byte-quantized weight, B is [batch, K, N] (the only layout a quantizer can

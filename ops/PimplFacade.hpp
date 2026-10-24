@@ -89,6 +89,16 @@ class PimplFacade : public Operator {
         const std::shared_ptr<VulkanCommandBuffer> &cmd) override {
         impl_->repoint_graph_cmd(cmd);
     }
+    // The façade's own fp_passes_/replay_state_ are always empty: every
+    // dispatch happens inside impl_, so anything that wants to observe what
+    // ran (a harness dumping the fingerprint, a test asserting the recorded
+    // passes) has to read the impl's state. Without these two forwardings
+    // dump_fingerprint() on a façade op prints "0 submit(s)" no matter how
+    // many dispatches went into the command buffer.
+    void dump_fingerprint() const override { impl_->dump_fingerprint(); }
+    std::vector<PassInfo> recorded_passes() const override {
+        return impl_->recorded_passes();
+    }
 
   protected:
     std::unique_ptr<Operator> impl_;

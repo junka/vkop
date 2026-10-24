@@ -238,6 +238,25 @@ class Operator {
         prof_query_base_ = base;
     }
 
+    // Print the recorded replay fingerprint to stdout (one line per
+    // submit()). The fingerprint is exactly what the cache compares to decide
+    // CACHED -- pc bytes, dispatch dims, bound handles -- so it is a direct,
+    // Vulkan-layer-free readout of WHICH KERNEL RAN and with what geometry.
+    // Two passes at dispatch (n/32, m) are the coopmat MMA + pack; one pass at
+    // (n/4, m) is the 4-column ksplit GEMV; (n/64, ceil(m/64)) is tiled. Call
+    // it right after onExecute (the list is cleared at the top of the next
+    // one) or after a CACHED round (the list is empty then, by design).
+    // Virtual so a PIMPL façade op forwards these to its impl_ -- the façade
+    // never dispatches, so its own fp_passes_ stays permanently empty.
+    virtual void dump_fingerprint() const {
+        printf("fingerprint: %zu submit(s)\n", fp_passes_.size());
+        for (size_t i = 0; i < fp_passes_.size(); ++i) {
+            const auto &p = fp_passes_[i];
+            printf("  [%zu] w=%d h=%d z=%d pc=%zuB\n", i, p.w, p.h, p.layers,
+                   p.pc.size());
+        }
+    }
+
     // These members are the public API the runtime/tests drive. They are
     // virtual so a PIMPL façade op can forward each to its image/buffer
     // impl (which owns the real pipeline/command-buffer state).
@@ -267,143 +286,10 @@ class Operator {
     virtual void
     onExecute(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
               const std::vector<std::shared_ptr<core::ITensor>> &outputs,
-              int id) {
-        if (!m_cmd_ && !graph_cmd_) {
-            m_cmd_ = std::make_shared<VulkanCommandBuffer>(m_cmdpool_, id);
-        }
-        m_id_ = id;
+              int id); // defined below the class: its body is long enough that
+                       // gcc declines to emit a weak copy for every TU that
+                       // includes this header (see the definition for why)
 
-        // Graph-submit mode: record into the Runtime-owned shared command
-        // buffer. m_cmd_ is temporarily repointed at it so the op's own
-        // helper methods and m_cmd_->get() calls (barriers, copies, binds,
-        // dispatches) land there too; begin()/end()/submit() belong to the
-        // Runtime in this mode. The replay cache is skipped: a recording shared
-        // with other ops cannot be replayed per op. The op's own buffer (if it
-        // has one from an earlier non-graph round) is restored afterwards so no
-        // per-op buffer is ever allocated while the mode is on.
-        if (graph_cmd_) {
-            auto saved_cmd = m_cmd_;
-            m_cmd_ = graph_cmd_;
-            // objs_ is rebuilt by execute()'s bind helpers and read back by
-            // fillWriteDescriptorSets, which indexes it from 0. It MUST start
-            // empty for every recording, exactly as the per-op path guarantees
-            // via the objs_.clear() further down. Without this reset the second
-            // and later rounds kept the FIRST round's entries at [0, n) and
-            // bound descriptors for stale resources — on the LLM decode path
-            // that silently produced all-zero logits (prefill round 0 is
-            // correct because objs_ is still empty at that point).
-            objs_.clear();
-            fp_passes_.clear();
-            if (prof_query_pool_ != VK_NULL_HANDLE) {
-                m_cmd_->writeTimestampBegin(prof_query_pool_, prof_query_base_);
-            }
-            execute(inputs, outputs);
-            if (prof_query_pool_ != VK_NULL_HANDLE) {
-                m_cmd_->writeTimestampEnd(prof_query_pool_,
-                                          prof_query_base_ + 1);
-            }
-            m_cmd_ = saved_cmd;
-            return;
-        }
-
-        // Record-once-replay (cuda-graph-style). The LLM decode loop re-runs
-        // Run() every round; for INVARIANT ops (weight Gemms, RMSNorm,
-        // elementwise on fixed-shape tensors) the recorded command buffer is
-        // byte-identical every round. We skip re-recording those:
-        //   - Every recording pass builds a fingerprint (push-constant bytes,
-        //     dispatch dims, bound resource handles) in fp_passes_.
-        //   - After recording, if the new fingerprint matches the stored one
-        //     from the previous round, the just-recorded cmd is identical to
-        //     last round's; we mark the op CACHED and KEEP its cmd buffer (not
-        //     reset) so the NEXT round can replay it verbatim.
-        //   - If the fingerprint differs (dynamic op: KV Concat, attention
-        //     MatMul whose kv_len grew), keep re-recording every round and
-        //     update the stored fingerprint — the op never enters CACHED.
-        // Warmup: round 0 records + stores fp (FRESH). Round 1 records +比对;
-        //         match → CACHED (cmd kept). Round 2+ replays (no recording).
-        //         A CACHED op whose fp later changes (Runtime forced refresh)
-        //         drops to FRESH and re-warms.
-        if (replay_enabled_ && replay_state_ == ReplayState::CACHED) {
-            // Reuse the kept cmd buffer. No begin/execute/end, no descriptor
-            // rewrites, no dispatch reissue. m_cmd_ holds the recording from
-            // the round that earned CACHED; Run() re-submits it
-            // (SIMULTANEOUS_USE).
-            replay_hits_++;
-            replay_total_hits_.fetch_add(1);
-            return;
-        }
-
-        objs_.clear();
-        fp_passes_.clear();
-        // When replay is enabled, record with SIMULTANEOUS_USE so that if this
-        // recording is later kept (CACHED), it can be re-submitted verbatim on
-        // following rounds. (The first two rounds still record; round 2+
-        // replay the CACHED recording.)
-        if (replay_enabled_) {
-            m_cmd_->set_replayable(true);
-        }
-        m_cmd_->begin();
-        // GPU timestamp: TOP_OF_PIPE = the moment this cmd reaches the front
-        // of the queue (before its work starts). Written inside begin/end so
-        // CACHED-replay recordings carry it forward.
-        if (prof_query_pool_ != VK_NULL_HANDLE) {
-            m_cmd_->writeTimestampBegin(prof_query_pool_, prof_query_base_);
-        }
-        execute(inputs, outputs);
-        if (prof_query_pool_ != VK_NULL_HANDLE) {
-            // BOTTOM_OF_PIPE = after all prior work in this cmd completes.
-            m_cmd_->writeTimestampEnd(prof_query_pool_, prof_query_base_ + 1);
-        }
-        m_cmd_->end();
-
-        if (replay_enabled_) {
-            if (fp_stored_.empty()) {
-                // Round 0: store canonical fingerprint. Not yet CACHED — round
-                // 1 must still record to confirm the fingerprint is stable.
-                fp_stored_ = fp_passes_;
-            } else if (fingerprint_matches()) {
-                // Round 1+ and the recording matches last round's: the op is
-                // invariant. Keep this cmd buffer (Runtime skips reset) and
-                // become CACHED so the NEXT round replays it.
-                fp_stored_ = fp_passes_;
-                replay_state_ = ReplayState::CACHED;
-            } else {
-                // Dynamic for this round: refresh the stored fingerprint so
-                // the next round compares against this round's recording.
-                fp_stored_ = fp_passes_;
-            }
-        }
-
-        if (trace_) {
-            m_cmd_->wait();
-            m_dev_->wait_all_done();
-            printf("%s: %s\n", convert_optype_to_string(type_).c_str(),
-                   name_.c_str());
-            int i = 0;
-            for (auto input : inputs) {
-                printf("input %d:\n", i);
-                if (input->dtype() == typeid(int64_t)) {
-                    continue;
-                }
-                dispatch_by_dtype(input->dtype(), [&](auto dummy) {
-                    using T = decltype(dummy);
-                    auto in = core::as_tensor<T>(input);
-                    in->copyToCPU(m_cmdpool_);
-                    in->print_tensor();
-                    in->toGPU();
-                });
-                i++;
-            }
-            printf("output 0:\n");
-            dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
-                using T = decltype(dummy);
-                auto output = core::as_tensor<T>(outputs[0]);
-                output->copyToCPU(m_cmdpool_);
-                output->print_tensor();
-                output->toGPU();
-            });
-        }
-    }
     virtual void enable_trace() { trace_ = true; }
     virtual void disable_trace() { trace_ = false; }
 
@@ -438,6 +324,26 @@ class Operator {
     static std::atomic<int> instance_count_;
     static std::atomic<long>
         replay_total_hits_; // onExecute CACHED-return count
+
+  public:
+    // Read-only view of the passes recorded by the last onExecute: one entry
+    // per submit() call, carrying the pc bytes, the dispatch dims and the bound
+    // resource handles. The replay cache compares these to decide CACHED, so
+    // they are exactly "what ran" for a recording -- which makes them the only
+    // reliable way for a harness to identify the kernel without a Vulkan debug
+    // layer or a per-shader marker (/tmp/bench_tc.cpp).
+    struct PassInfo {
+        std::vector<uint8_t> pc;
+        int w = 0, h = 0, layers = 0;
+    };
+    virtual std::vector<PassInfo> recorded_passes() const {
+        std::vector<PassInfo> out;
+        out.reserve(fp_passes_.size());
+        for (const auto &p : fp_passes_) {
+            out.push_back(PassInfo{p.pc, p.w, p.h, p.layers});
+        }
+        return out;
+    }
 
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
@@ -534,9 +440,23 @@ class Operator {
     // (set_prof_query); null when profiling is off (no overhead).
     VkQueryPool prof_query_pool_ = VK_NULL_HANDLE;
     uint32_t prof_query_base_ = 0;
-    // Accumulate the fingerprint of one submit() call. Called from submit()/
-    // submit_per_ds() when replay_enabled_. Cheap: one small alloc + handle
-    // reads (handles are already materialized in objs_).
+    // Accumulate the fingerprint of ONE DISPATCH -- not of one submit() call.
+    // Called from every dispatch site (submit / submit_per_ds / dispatch_on /
+    // the branches that bind a secondary pipeline and dispatch directly) when
+    // replay_enabled_. That distinction is the whole point: a fingerprint with
+    // one entry per submit() misses every dispatch issued outside submit(), and
+    // then two recordings of DIFFERENT pipelines look identical. The concrete
+    // case: fp16 MatMul at M=3..8 takes the ksplit path here while M=9 goes
+    // through coopmat, and the coopmat branch's MMA dispatch is a direct
+    // m_cmd_->dispatch, so submit()'s fingerprint saw only the pack pass --
+    // making an M=3 ksplit recording and an M=9 coopmat recording compare
+    // EQUAL. A dynamic op whose dispatch geometry grows (attention's kv_len)
+    // would then be told it is invariant and would replay a stale recording at
+    // the wrong size. Nothing ever DECLARED replay to be per-submit; the cache
+    // just observed one entry per submit on the paths anyone had exercised.
+    //
+    // Cheap: one small alloc + handle reads (handles are already materialized
+    // in objs_).
     void record_fingerprint(void *ptr, int width, int height, int layers) {
         PassFingerprint p;
         p.w = width;
@@ -615,10 +535,7 @@ class Operator {
             m_cmd_->push_constants(*pipeline_, static_cast<uint32_t>(pc_size_),
                                    ptr);
         }
-        m_cmd_->dispatch(width, height, layers);
-        if (replay_enabled_) {
-            record_fingerprint(ptr, width, height, layers);
-        }
+        dispatch_and_record(width, height, layers, ptr);
     }
 
     // Variant of submit() where the dispatch dimensions come from a GPU buffer
@@ -663,10 +580,7 @@ class Operator {
             m_cmd_->push_constants(*pipeline_, static_cast<uint32_t>(pc_size_),
                                    ptr);
         }
-        m_cmd_->dispatch(width, height, layers);
-        if (replay_enabled_) {
-            record_fingerprint(ptr, width, height, layers);
-        }
+        dispatch_and_record(width, height, layers, ptr);
     }
 
     // Allocate a fresh descriptor set from the pipeline's pool.
@@ -677,6 +591,20 @@ class Operator {
     // Return a per-pass descriptor set to the pool.
     void freePassDescriptorSet(VkDescriptorSet ds) {
         pipeline_->freeDescriptorSets(ds);
+    }
+
+  protected:
+    // The single place every dispatch goes through, so that the replay
+    // fingerprint covers what actually went into the command buffer rather
+    // than only the dispatches that came from submit(). Call it immediately
+    // before m_cmd_->dispatch(...); it reads the current push constants from
+    // pc_ptr_/pc_size_ and the resource handles from objs_, both of which are
+    // materialized by the bind/push that precedes every dispatch.
+    void dispatch_and_record(int w, int h, int z, const void *pc) {
+        m_cmd_->dispatch(w, h, z);
+        if (replay_enabled_) {
+            record_fingerprint(const_cast<void *>(pc), w, h, z);
+        }
     }
 
   protected:
