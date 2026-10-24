@@ -405,18 +405,27 @@ void copy_cache_f8(int cwg) {
         // fp16 rows of D/2 words; this lane owns elements [4w, 4w+4), i.e. half2
         // words 2w and 2w+1.
         int krow = (h * uA.seq + (j - uA.kv_past)) * (D >> 1) + (w << 1);
-        vec2 p0;
-        vec2 p1;
+        // Two packed half2 words unpacked into scalars rather than vec2: the
+        // branch-assigned vec2 form makes MoltenVK's MSL compile fail with an
+        // ICE on GCN (VK_ERROR_INITIALIZATION_FAILED, "Compiler encountered an
+        // internal error"), and it takes the whole attention pipeline down with
+        // it. Scalars compile clean on the same path.
+        float a0, a1, b0, b1;
         if (c == 0) {
-            p0 = unpackHalf2x16(uK.data[krow]);
-            p1 = unpackHalf2x16(uK.data[krow + 1]);
+            a0 = unpackHalf2x16(uK.data[krow]).x;
+            a1 = unpackHalf2x16(uK.data[krow]).y;
+            b0 = unpackHalf2x16(uK.data[krow + 1]).x;
+            b1 = unpackHalf2x16(uK.data[krow + 1]).y;
         } else {
-            p0 = unpackHalf2x16(uV.data[krow]);
-            p1 = unpackHalf2x16(uV.data[krow + 1]);
+            a0 = unpackHalf2x16(uV.data[krow]).x;
+            a1 = unpackHalf2x16(uV.data[krow]).y;
+            b0 = unpackHalf2x16(uV.data[krow + 1]).x;
+            b1 = unpackHalf2x16(uV.data[krow + 1]).y;
         }
         float inv = 1.0 / uA.cache_scale;
-        word = e4m3_encode(p0.x * inv) | (e4m3_encode(p0.y * inv) << 8u) |
-               (e4m3_encode(p1.x * inv) << 16u) | (e4m3_encode(p1.y * inv) << 24u);
+        word = e4m3_encode(a0 * inv) | (e4m3_encode(a1 * inv) << 8u) |
+               (e4m3_encode(b0 * inv) << 16u) |
+               (e4m3_encode(b1 * inv) << 24u);
     }
     uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
 }
@@ -428,9 +437,14 @@ void main() {
     int H = uA.heads;
     int D = uA.head_dim;
     int kv = uA.kv_len;
-    if (D <= 0 || D > MAX_HD || (D & 1) != 0 || kv <= 0) {
-        return; // host gates these; a stray dispatch must not corrupt memory
-    }
+    // No in-kernel early return guards these: the host gates head_dim (even,
+    // <= MAX_HD) and kv_len > 0 and throws on a violation, so a stray dispatch
+    // cannot reach here. On this stack (AMD Polaris + MoltenVK) a
+    // data-dependent `if (cond) { return; }` at the top of the kernel compiles
+    // to an UNCONDITIONAL return however the condition is written: a per-lane
+    // dump showed every sub-term of the test false at runtime, the dumped MSL
+    // carried the exact predicate, and merely deleting the return made the
+    // kernel produce its output. Do not reintroduce one.
     int kv_past = (uA.has_cache != 0) ? uA.kv_past : 0;
 
     // extra workgroups, if any, are the cache copy
