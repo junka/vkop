@@ -1,12 +1,17 @@
 #version 450 core
 
 // SSBO cooperative-matrix MatMul for an int8 quantized weight with a
-// RUNTIME-quantized int8 activation (W8A8). Intel ARL exposes exactly one
-// SINT8 combo:
-//   coopmat<int8_t, gl_ScopeSubgroup, 8, 32, A>
-//   coopmat<int8_t, gl_ScopeSubgroup, 32, 8, B>
-//   coopmat<int,    gl_ScopeSubgroup, 8,  8, Acc>   (int8 in -> int32 acc)
-// subgroupSize=32, K=32. One MMA does C[8x8] += A[8x32]*B[32x8].
+// RUNTIME-quantized int8 activation (W8A8). The SINT8 tile is a build
+// parameter (-DCM/-DCN/-DCK) because the two devices that expose SINT8
+// cooperative matrices list different shapes:
+//   Intel ARL:   8x8x32   (the default build, buffer_matmul_coop_i8)
+//   NVIDIA Ada:  16x16x32 (buffer_matmul_coop_i8_16x16x32), 4x the outputs
+//                per MMA
+// subgroupSize=32, K=32 on both. One MMA does C[CMxCN] += A[CMx32]*B[32xCN].
+// A shape the driver does not list must never be dispatched: on Ada the
+// 8x8x32 declarations still create a pipeline but coopMatMulAdd returns zeros.
+// The host therefore picks the largest listed shape and falls back only to
+// another listed shape, never to an unlisted module.
 //
 // This is the int8 sibling of buffer/matmul_coop.comp (fp16 8x8x16). It exists
 // because the fp16 kernel's K is 16 and its A/B are fp16: routing an int8
@@ -77,12 +82,46 @@ layout(push_constant) uniform PC {
     int transB; // unused (the gate requires transB == 0); kept for PC compat
 } uPC;
 
-const int M_BLOCK = 8;
-const int N_BLOCK = 8;
-const int K_BLOCK = 32; // the device's SINT8 coopmat K
+// Cooperative-matrix tile and subgroup grid. -DCM/-DCN/-DCK let one source
+// serve both SINT8 shapes devices list: 8x8x32 (Intel ARL, the default build)
+// and 16x16x32 (NVIDIA Ada, four times the outputs per MMA). The host picks
+// the largest shape the device reports and then this module's BM/BN, so a
+// shape the driver does not list is never dispatched.
+#ifndef CM
+#define CM 8
+#endif
+#ifndef CN
+#define CN 8
+#endif
+#ifndef CK
+#define CK 32
+#endif
+#ifndef SG_M
+#define SG_M 2
+#endif
+#ifndef SG_N
+#define SG_N 4
+#endif
 
-const int BM = 16; // = 2 * M_BLOCK  (workgroup M footprint)
-const int BN = 32; // = 4 * N_BLOCK  (workgroup N footprint)
+const int M_BLOCK = CM;
+const int N_BLOCK = CN;
+const int K_BLOCK = CK; // the device's SINT8 coopmat K
+
+const int NTHREADS = SG_M * SG_N * 32;
+const int BM = SG_M * M_BLOCK; // workgroup M footprint (one accumulator tile)
+const int BN = SG_N * N_BLOCK; // workgroup N footprint
+const int AMAX_LANES = NTHREADS / BM;
+#if ((SG_M * SG_N) != 8)
+#error "matmul_coop_i8: SG_M * SG_N must be 8 subgroups (256 threads)"
+#endif
+#if ((((SG_M * CM) * CK) % (SG_M * SG_N * 32)) != 0) || \
+    (((CK * SG_N * CN) % (SG_M * SG_N * 32)) != 0) || \
+    (((CM * CN) % 32) != 0)
+#error "matmul_coop_i8: staging does not divide evenly over 256 threads"
+#endif
+const int A_ELEMS = (BM * K_BLOCK) / NTHREADS; // quantized A per thread
+const int B_ELEMS = (K_BLOCK * BN) / NTHREADS; // weight bytes per thread
+const int C_ELEMS = (M_BLOCK * N_BLOCK) / 32;  // results per lane in epilogue
 
 // One signed byte out of a 32-bit word. No reliance on an arithmetic shift of
 // a signed int or on uint->int conversion above INT_MAX: mask to 0..255, then
@@ -107,8 +146,9 @@ shared float shSa[BM];
 // Per-row |A| max, accumulated as float bits (abs of a finite float is
 // non-negative, so the uint ordering matches the float ordering).
 shared uint shAmaxU[BM];
-// Each subgroup parks its 8x8 int32 accumulator here before scaling.
-shared int shC[8][M_BLOCK * N_BLOCK];
+// Each subgroup parks its M_BLOCK x N_BLOCK int32 accumulator here before
+// scaling.
+shared int shC[SG_M * SG_N][M_BLOCK * N_BLOCK];
 
 void main() {
     int b = int(gl_WorkGroupID.z);
@@ -117,8 +157,8 @@ void main() {
     uint sg = gl_SubgroupID;
     uint lane = gl_SubgroupInvocationID;
     uint tid = gl_LocalInvocationIndex;
-    int sgx = int(sg % 4);
-    int sgy = int(sg / 4);
+    int sgx = int(sg % SG_N);
+    int sgy = int(sg / SG_N);
 
     int M = uPC.M;
     int N = uPC.N;
@@ -133,13 +173,14 @@ void main() {
     }
     barrier();
     {
-        // 16 threads cooperate on each of the BM rows; each walks K/16 taps.
+        // AMAX_LANES threads cooperate on each of the BM rows; each walks
+        // every AMAX_LANES-th tap of K.
         int h = int(tid) % BM;
-        int klane = int(tid) / BM; // 0..15
+        int klane = int(tid) / BM; // 0..AMAX_LANES-1
         int hg = m0 + h;
         if (hg < M) {
             float mx = 0.0;
-            for (int kk = klane; kk < K; kk += 16) {
+            for (int kk = klane; kk < K; kk += AMAX_LANES) {
                 mx = max(mx, abs(loadA_f16(a_base + hg * K + kk)));
             }
             atomicMax(shAmaxU[h], floatBitsToUint(mx));
@@ -164,9 +205,9 @@ void main() {
     for (int t = 0; t < k_tiles; t++) {
         int k_base = t * K_BLOCK;
 
-        // 256 threads quantize A[BM x K_BLOCK] => 2/thread.
-        for (int e = 0; e < 2; e++) {
-            int idx = int(tid) * 2 + e; // 0..511
+        // 256 threads quantize A[BM x K_BLOCK] => A_ELEMS/thread.
+        for (int e = 0; e < A_ELEMS; e++) {
+            int idx = int(tid) * A_ELEMS + e; // 0..BM*K_BLOCK-1
             int row = idx / K_BLOCK;
             int kk = k_base + (idx % K_BLOCK);
             int hg = m0 + row;
@@ -177,11 +218,11 @@ void main() {
             }
             shAq[idx] = int8_t(q);
         }
-        // 256 threads stage B[K_BLOCK x BN] bytes => 4/thread.
-        for (int e = 0; e < 4; e++) {
-            int idx = int(tid) * 4 + e; // 0..1023
-            int row = idx / BN;         // K dim
-            int col = idx % BN;         // N dim
+        // 256 threads stage B[K_BLOCK x BN] bytes => B_ELEMS/thread.
+        for (int e = 0; e < B_ELEMS; e++) {
+            int idx = int(tid) * B_ELEMS + e; // 0..K_BLOCK*BN-1
+            int row = idx / BN;               // K dim
+            int col = idx % BN;               // N dim
             int kk = k_base + row;
             int w = n0 + col;
             // B is [batch, K, N] row-major; the gate rejects transB.
@@ -215,8 +256,8 @@ void main() {
     barrier();
 
     int c_base = b * M * N;
-    for (int e = 0; e < 2; e++) {
-        int idx = int(lane) * 2 + e; // 0..63
+    for (int e = 0; e < C_ELEMS; e++) {
+        int idx = int(lane) * C_ELEMS + e; // 0..M_BLOCK*N_BLOCK-1
         int row = idx / N_BLOCK;
         int col = idx % N_BLOCK;
         int hg = m0 + sgy * M_BLOCK + row;

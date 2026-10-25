@@ -1,17 +1,36 @@
 #version 450 core
 
-// SSBO cooperative-matrix MatMul, 16x16x16 fp16 tile variant.
-// Sister shader of matmul_coop.comp (which uses the 8x8x16 combo -- the only
-// fp16 coopmat shape Intel ARL exposes). NVIDIA (RTX 4000 Ada / Ada Lovelace)
-// does NOT support 8x8x16: it lists 16x16x16, 16x8x16, 16x8x8. Using the
-// 8x8x16 combo on NVIDIA silently miscomputes (pipeline validates but
-// coopMatMulAdd produces garbage -> all-zero logits). This shader uses the
-// 16x16x16 combo (A[16x16]·B[16x16] -> C[16x16], fp16 in / fp32 accumulate),
-// which is 4x the single-MMA throughput of 8x8x16 (256 output elements vs 64).
+// SSBO cooperative-matrix MatMul, fp16 in / fp32 accumulate. The cooperative
+// matrix tile is a build parameter (-DCM/-DCN/-DCK), so this one source covers
+// the fp16 f32-accumulate shapes a device can list:
+//   NVIDIA Ada:  16x16x16 / 16x8x16 / 16x8x8  (16x16x16 is the default build)
+// Intel ARL lists 8x8x16, but that tile stays on matmul_coop.comp: with a
+// single 8x8 MMA per K tile there is nothing for the double-buffered loads
+// below to hide behind, and this source measured 10-36% slower there
+// (m=16..63, k=2048, min-of-3, interleaved).
+//
+// The host probes VkCooperativeMatrixPropertiesKHR and builds the module for the
+// largest M*N*K the device lists; a shape the driver does not list must never
+// be dispatched (on Ada an unlisted shape still creates a pipeline but
+// coopMatMulAdd produces garbage -> all-zero logits, seen with 8x8x16).
 //
 // Workgroup = 16x16 = 256 threads = 8 subgroups (sg size 32). Subgroup grid
-// 2(M) x 4(N) => workgroup output footprint BM=32, BN=64. Each K-tile's
-// shared A/B feeds 8 MMAs (2 M-subgroups x 4 N-subgroups), amortizing loads.
+// SG_M x SG_N (default 2 x 4) and ACC_M x ACC_N accumulator tiles per subgroup,
+// so the workgroup output footprint is BM = SG_M*ACC_M*CM by
+// BN = SG_N*ACC_N*CN. Each K-tile's shared A/B feeds SG_M*SG_N*ACC_M*ACC_N
+// MMAs, amortizing the SSBO loads. The default 16x16x16 1x1 build is the
+// original 32x64 footprint; -DACC_M=2 -DACC_N=2 covers 64x128 with the same 256
+// threads, which is what makes the traffic per FLOP competitive:
+//   traffic per FLOP = (1/BM + 1/BN)  ->  0.0469 (32x64) vs 0.0234 (64x128)
+// and gives each subgroup four MMAs per K tile instead of one, which is the
+// window the next tile's global loads hide behind.
+//
+// K loop: the shared tiles are double buffered and the global loads for tile
+// t+1 are issued into registers *before* tile t's fragments load and MMAs run,
+// then stored after them. The read/write rotation of two buffers needs one
+// workgroup barrier per K tile. Storing straight from a load instead -- what
+// this shader did before -- leaves the memory pipe idle until every warp's own
+// load returns, with a barrier on both sides of it.
 //
 // Semantics (scratch + pack) are identical to matmul_coop.comp: fp32 results
 // go to the flat scratch buffer (binding 3), then buffer_matmul_pack.comp
@@ -23,6 +42,35 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_AMD_gpu_shader_half_float : enable
 #extension GL_EXT_shader_16bit_storage : enable
+
+// Workgroup shape. The host's footprint constants for a variant must match the
+// ACC_* values its SPIR-V was built with.
+#ifndef ACC_M
+#define ACC_M 1
+#endif
+#ifndef ACC_N
+#define ACC_N 1
+#endif
+#ifndef SG_M
+#define SG_M 2
+#endif
+#ifndef SG_N
+#define SG_N 4
+#endif
+// Cooperative-matrix tile. -DCM/-DCN/-DCK let one source serve every fp16
+// f32-accumulate shape a device may list (16x16x16, 16x8x16, 16x8x8, 8x8x16):
+// the kernel body below is written in terms of the tile, so the only per-shape
+// host-side constants are BM/BN. The device's K is fixed per shape, so CK is
+// the same as the properties' KSize.
+#ifndef CM
+#define CM 16
+#endif
+#ifndef CN
+#define CN 16
+#endif
+#ifndef CK
+#define CK 16
+#endif
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -54,13 +102,27 @@ layout(push_constant) uniform PC {
     int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
 } uPC;
 
-// 16x16x16 coopmat tile.
-const int M_BLOCK = 16;
-const int N_BLOCK = 16;
-const int K_BLOCK = 16;
+// Cooperative-matrix tile, as selected by the host from the device properties.
+const int M_BLOCK = CM;
+const int N_BLOCK = CN;
+const int K_BLOCK = CK;
 
-const int BM = 32; // = 2 * M_BLOCK  (workgroup M footprint)
-const int BN = 64; // = 4 * N_BLOCK  (workgroup N footprint)
+const int NTHREADS = SG_M * SG_N * 32;
+const int BM = SG_M * ACC_M * M_BLOCK; // workgroup M footprint
+const int BN = SG_N * ACC_N * N_BLOCK; // workgroup N footprint
+
+// Per-thread staging: the whole workgroup's A[BM x K_BLOCK] and B[K_BLOCK x BN]
+// split evenly. Every shape the host builds divides exactly, and a shape that
+// did not would silently leave part of a tile unloaded, so it is a build error.
+#if ((SG_M * SG_N) != 8)
+#error "matmul_coop16: SG_M * SG_N must be 8 subgroups (256 threads)"
+#endif
+#if ((((SG_M * ACC_M * CM) * CK) % (SG_M * SG_N * 32)) != 0) || \
+    (((CK * SG_N * ACC_N * CN) % (SG_M * SG_N * 32)) != 0)
+#error "matmul_coop16: staging does not divide evenly over 256 threads"
+#endif
+const int A_ELEMS = (BM * K_BLOCK) / NTHREADS;
+const int B_ELEMS = (K_BLOCK * BN) / NTHREADS;
 
 // Load a fp16 element from a packed-half2 uint SSBO.
 float16_t loadA(int elem) {
@@ -70,22 +132,137 @@ float16_t loadB(int elem) {
     return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
 }
 
-// Shared tiles laid out as float16_t, row-major.
-shared float16_t shA[BM * K_BLOCK];  // [32 x 16] = 512
-shared float16_t shB[K_BLOCK * BN];  // [16 x 64] = 1024
+// Shared tiles laid out as float16_t, row-major, two buffers.
+shared float16_t shA[2][BM * K_BLOCK]; // [BM x 16]
+shared float16_t shB[2][K_BLOCK * BN]; // [16 x BN]
 // Each subgroup stores its 16x16 fp32 result tile here before scattering.
-// [sg][256] -- one private 256-fp32 region per subgroup (no races).
-shared float shC[8][M_BLOCK * N_BLOCK];
+// [sg][256] — one private 256-fp32 region per subgroup (no races). Reused by
+// every accumulator tile in turn, so it does not scale with ACC_M*ACC_N.
+shared float shC[SG_M * SG_N][M_BLOCK * N_BLOCK];
+
+// Stage the workgroup's A slice for K tile t into registers. The flat
+// thread-major walk keeps each thread's elements contiguous, so a warp reads
+// contiguous 32-byte runs of a row instead of one strided element per lane.
+void fetch_a(int a_base, int m0, int k_base, int M, int K,
+             out float16_t va[A_ELEMS]) {
+    int e0 = int(gl_LocalInvocationIndex) * A_ELEMS;
+    for (int i = 0; i < A_ELEMS; ++i) {
+        int e = e0 + i;
+        int h = m0 + e / K_BLOCK;
+        int kk = k_base + e % K_BLOCK;
+        va[i] = (h < M && kk < K) ? loadA(a_base + h * K + kk) : float16_t(0.0);
+    }
+}
+
+void fetch_b(int b_base, int n0, int k_base, int N, int K,
+             out float16_t vb[B_ELEMS]) {
+    int e0 = int(gl_LocalInvocationIndex) * B_ELEMS;
+    for (int i = 0; i < B_ELEMS; ++i) {
+        int e = e0 + i;
+        int kk = k_base + e / BN;
+        int w = n0 + e % BN;
+        float16_t v = float16_t(0.0);
+        if (kk < K && w < N) {
+            if (uPC.transB != 0) {
+                // B is [batch, N, K]: element (b, w, kk) at b_base + w*K + kk
+                v = loadB(b_base + w * K + kk);
+            } else {
+                // B is [batch, K, N]: element (b, kk, w) at b_base + kk*N + w
+                v = loadB(b_base + kk * N + w);
+            }
+        }
+        vb[i] = v;
+    }
+}
+
+void store_a(in float16_t va[A_ELEMS], int buf) {
+    int e0 = int(gl_LocalInvocationIndex) * A_ELEMS;
+    for (int i = 0; i < A_ELEMS; ++i) {
+        shA[buf][e0 + i] = va[i];
+    }
+}
+
+void store_b(in float16_t vb[B_ELEMS], int buf) {
+    int e0 = int(gl_LocalInvocationIndex) * B_ELEMS;
+    for (int i = 0; i < B_ELEMS; ++i) {
+        shB[buf][e0 + i] = vb[i];
+    }
+}
+
+// Scatter one accumulator tile from the subgroup's private shC slot to the flat
+// fp32 scratch buffer. Global element index:
+//   C[batch, m0 + (sgy*ACC_M+ai)*16 + row, n0 + (sgx*ACC_N+aj)*16 + col]
+void scatter_tile(uint sg, uint lane, int sgy, int sgx, int ai, int aj, int m0,
+                  int n0, int M, int N, int c_base) {
+    const int ELEMS = (M_BLOCK * N_BLOCK) / 32;
+    for (int e = 0; e < ELEMS; ++e) {
+        int idx = int(lane) * ELEMS + e;
+        int row = idx / N_BLOCK;
+        int col = idx % N_BLOCK;
+        int hg = m0 + (sgy * ACC_M + ai) * M_BLOCK + row;
+        int wg = n0 + (sgx * ACC_N + aj) * N_BLOCK + col;
+        if (hg < M && wg < N) {
+            int out_elem = c_base + hg * N + wg;
+            uScratch.data[out_elem] = floatBitsToUint(shC[sg][idx]);
+        }
+    }
+}
+
+// Accumulator tiles are written out by the preprocessor rather than held in an
+// array: a GLSL array of cooperative matrices lowers to an OpTypeArray in
+// Function storage, and a dynamic index keeps the value there (the driver
+// cannot SROA an index it does not know), so the accumulator would round-trip
+// through private memory once per K tile. One named tile per (ai, aj) keeps
+// every cooperative matrix an SSA value.
+#if ACC_M == 1 && ACC_N == 1
+#define ACC_TILES(F) F(0, 0)
+#elif ACC_M == 2 && ACC_N == 1
+#define ACC_TILES(F) F(0, 0) F(1, 0)
+#elif ACC_M == 1 && ACC_N == 2
+#define ACC_TILES(F) F(0, 0) F(0, 1)
+#elif ACC_M == 2 && ACC_N == 2
+#define ACC_TILES(F) F(0, 0) F(0, 1) F(1, 0) F(1, 1)
+#else
+#error "matmul_coop16: unsupported ACC_M/ACC_N"
+#endif
+
+#define DECL_C(ai, aj)                                                      \
+    coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,                      \
+             gl_MatrixUseAccumulator>                                       \
+        matC##ai##aj =                                                      \
+            coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,              \
+                    gl_MatrixUseAccumulator>(0.0);
+
+#define DECL_A(ai)                                                          \
+    coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>   \
+        matA##ai;
+#define LOAD_A(ai)                                                          \
+    coopMatLoad(matA##ai, shA[buf],                                         \
+                (sgy * ACC_M + ai) * M_BLOCK * K_BLOCK, K_BLOCK,            \
+                gl_CooperativeMatrixLayoutRowMajor);
+#define DECL_B(aj)                                                          \
+    coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>   \
+        matB##aj;
+#define LOAD_B(aj)                                                          \
+    coopMatLoad(matB##aj, shB[buf], (sgx * ACC_N + aj) * N_BLOCK, BN,       \
+                gl_CooperativeMatrixLayoutRowMajor);
+#define MMA(ai, aj)                                                         \
+    matC##ai##aj = coopMatMulAdd(matA##ai, matB##aj, matC##ai##aj);
+#define STORE_C(ai, aj)                                                     \
+    coopMatStore(matC##ai##aj, shC[sg], 0, N_BLOCK,                         \
+                 gl_CooperativeMatrixLayoutRowMajor);                        \
+    barrier();                                                              \
+    scatter_tile(sg, lane, sgy, sgx, ai, aj, m0, n0, M, N, c_base);         \
+    barrier();
 
 void main() {
     int  b    = int(gl_WorkGroupID.z);     // batch index
     int  m0   = int(gl_WorkGroupID.y) * BM;
     int  n0   = int(gl_WorkGroupID.x) * BN;
-    uint sg   = gl_SubgroupID;             // 0..7
+    uint sg   = gl_SubgroupID;             // 0..SG_M*SG_N-1
     uint lane = gl_SubgroupInvocationID;   // 0..31
-    uint tid  = gl_LocalInvocationIndex;   // 0..255
-    int  sgx  = int(sg % 4);               // subgroup col (N) in 2x4 grid
-    int  sgy  = int(sg / 4);               // subgroup row (M) in 2x4 grid
+    int  sgx  = int(sg % SG_N);            // subgroup col (N)
+    int  sgy  = int(sg / SG_N);            // subgroup row (M)
 
     int M = uPC.M;
     int N = uPC.N;
@@ -93,84 +270,59 @@ void main() {
 
     int a_base = b * M * K; // A[batch, :, :]
     int b_base = b * K * N; // B[batch, :, :] (row-major K x N)
+    int c_base = b * M * N;
 
-    coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
-             gl_MatrixUseAccumulator>
-        matC;
-    matC = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
-                   gl_MatrixUseAccumulator>(0.0);
+    ACC_TILES(DECL_C)
 
     int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
 
-    for (int t = 0; t < k_tiles; t++) {
-        int k_base = t * K_BLOCK;
+    float16_t va[A_ELEMS];
+    float16_t vb[B_ELEMS];
 
-        // 256 threads load A[BM x K_BLOCK] = 32*16 = 512 fp16 => 2/thread.
-        for (int e = 0; e < 2; e++) {
-            int idx = int(tid) * 2 + e;            // 0..511
-            int row = idx / K_BLOCK;                // M dim (0..31)
-            int col = idx % K_BLOCK;                // K dim (0..15)
-            int h = m0 + row;
-            int kk = k_base + col;
-            float16_t v = (h < M && kk < K) ? loadA(a_base + h * K + kk)
-                                            : float16_t(0.0);
-            shA[idx] = v;
-        }
-        // 256 threads load B[K_BLOCK x BN] = 16*64 = 1024 fp16 => 4/thread.
-        for (int e = 0; e < 4; e++) {
-            int idx = int(tid) * 4 + e;            // 0..1023
-            int row = idx / BN;                     // K dim (0..15)
-            int col = idx % BN;                     // N dim (0..63)
-            int kk = k_base + row;
-            int w = n0 + col;
-            float16_t v;
-            if (kk < K && w < N) {
-                if (uPC.transB != 0) {
-                    v = loadB(b_base + w * K + kk);
-                } else {
-                    v = loadB(b_base + kk * N + w);
-                }
-            } else {
-                v = float16_t(0.0);
-            }
-            shB[idx] = v;
-        }
-
-        barrier();
-
-        coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
-            matA;
-        coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
-            matB;
-        // Each subgroup loads its 16x16 / 16x16 slice from shared tiles.
-        coopMatLoad(matA, shA, sgy * M_BLOCK * K_BLOCK, K_BLOCK,
-                    gl_CooperativeMatrixLayoutRowMajor);
-        coopMatLoad(matB, shB, sgx * N_BLOCK, BN,
-                    gl_CooperativeMatrixLayoutRowMajor);
-
-        matC = coopMatMulAdd(matA, matB, matC);
-
-        barrier();
-    }
-
-    // Store matC (16x16 fp32) to the per-subgroup private region of shC.
-    coopMatStore(matC, shC[sg], 0, N_BLOCK,
-                 gl_CooperativeMatrixLayoutRowMajor);
+    // Prologue: tile 0 straight into buffer 0, then start rotating.
+    fetch_a(a_base, m0, 0, M, K, va);
+    fetch_b(b_base, n0, 0, N, K, vb);
+    store_a(va, 0);
+    store_b(vb, 0);
     barrier();
 
-    // 32 threads scatter 256 fp32 results to the flat scratch SSBO.
-    // Global element index: C[batch, m0+sgy*16+row, n0+sgx*16+col].
-    int c_base = b * M * N;
-    for (int e = 0; e < 8; e++) {
-        int idx = int(lane) * 8 + e;            // 0..255
-        int row = idx / N_BLOCK;                // 0..15 (within 16x16 tile)
-        int col = idx % N_BLOCK;
-        int hg = m0 + sgy * M_BLOCK + row;
-        int wg = n0 + sgx * N_BLOCK + col;
-        if (hg < M && wg < N) {
-            float v = shC[sg][idx];
-            int out_elem = c_base + hg * N + wg;
-            uScratch.data[out_elem] = floatBitsToUint(v);
+    int buf = 0;
+    for (int t = 0; t < k_tiles; t++) {
+        if (t + 1 < k_tiles) {
+            // In flight while this tile's fragments load and MMAs run.
+            fetch_a(a_base, m0, (t + 1) * K_BLOCK, M, K, va);
+            fetch_b(b_base, n0, (t + 1) * K_BLOCK, N, K, vb);
         }
+
+#if ACC_M == 1
+        DECL_A(0) LOAD_A(0)
+#else
+        DECL_A(0) LOAD_A(0) DECL_A(1) LOAD_A(1)
+#endif
+#if ACC_N == 1
+        DECL_B(0) LOAD_B(0)
+#else
+        DECL_B(0) LOAD_B(0) DECL_B(1) LOAD_B(1)
+#endif
+        ACC_TILES(MMA)
+
+        if (t + 1 < k_tiles) {
+            store_a(va, buf ^ 1);
+            store_b(vb, buf ^ 1);
+        }
+        // Separates this tile's reads of shX[buf] and its writes to
+        // shX[buf^1] from the next iteration's swap of both roles.
+        barrier();
+        buf ^= 1;
     }
+
+    // fp32 results land in the flat scratch buffer; the pack pass
+    // (buffer_matmul_pack.comp) reinterprets them as adjacent element pairs and
+    // packs half2 words — correct for odd N, where a single output word can
+    // straddle two rows (element 2w+1 of word w may belong to the next row's
+    // col 0). In-shader packing would zero-fill the straddling half and clobber
+    // the next row's first element; the flat scratch + dedicated
+    // word-per-thread pack avoids that race and the cross-subgroup read it
+    // would otherwise require.
+    ACC_TILES(STORE_C)
 }

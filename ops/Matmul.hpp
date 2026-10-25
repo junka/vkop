@@ -248,10 +248,7 @@ class MatMulBuffer : public BufferFactory {
         // pipeline creation ("MSL cooperative matrices only support 8x8
         // dimensions"). VKOP_NO_COOP=1 skips the coop paths entirely and keeps
         // the reduce fallback usable on such portability drivers.
-        static const bool coop_disabled = [] {
-            const char *v = std::getenv("VKOP_NO_COOP");
-            return v != nullptr && v[0] != '\0' && v[0] != '0';
-        }();
+        const bool coop_disabled = coop_env_off();
         if (fp16_ != 0 && !coop_pipeline_ && !coop_disabled &&
             // Skip the eager build on devices whose coopmat support is
             // nominal only: MoltenVK advertises the feature bool but reports
@@ -273,65 +270,50 @@ class MatMulBuffer : public BufferFactory {
             // bound-but-unused (filled from the same objs_ vector as every
             // other MatMul pipeline).
             //
-            // Two shader variants, picked by the device's supported combo:
-            //  · 8x8x16  (matmul_coop.comp)     — the only fp16 shape on Intel
-            //    ARL. Workgroup BM=16, BN=32.
-            //  · 16x16x16 (matmul_coop16.comp)  — NVIDIA Ada Lovelace, which
-            //    does NOT list 8x8x16 (the 8x8x16 pipeline validates but
-            //    coopMatMulAdd silently miscomputes -> all-zero logits). 4x the
-            //    single-MMA throughput. Workgroup BM=32, BN=64.
-            bool use_uab = update_after_bind_ &&
-                           dev->is_support_descriptor_update_after_bind();
-            const uint32_t *spv;
-            int spv_len;
-            if (dev->supports_coopmat_fp16_tile(16, 16, 16)) {
-                auto r = resolve_spv("buffer_matmul_coop16");
-                spv = r.first;
-                spv_len = static_cast<int>(r.second);
-                coop_bm_ = 32;
-                coop_bn_ = 64;
-            } else {
-                auto r = resolve_spv("buffer_matmul_coop");
-                spv = r.first;
-                spv_len = static_cast<int>(r.second);
-                coop_bm_ = 16;
-                coop_bn_ = 32;
-            }
-            coop_pipeline_ = std::make_unique<VulkanPipeline>(
-                dev->getLogicalDevice(),
-                std::vector<VkDescriptorType>{
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE},
-                sizeof(matmul::GpuMatMulParam), spv, spv_len, use_uab, 0,
-                cache);
-            for (auto &ds : coop_ds_) {
-                ds = coop_pipeline_->allocDescriptorSets();
+            // Which tile the kernel declares is probed, not assumed: the KHR
+            // property list is the only source of truth for whether an MMA
+            // shape works, and a shape the device does not list is NOT a safe
+            // fallback -- NVIDIA Ada validates the 8x8x16 pipeline and then
+            // makes coopMatMulAdd return zeros (all-zero logits, no error).
+            // build_coop_pipeline() walks kFp16Modules largest-tile first,
+            // keeps only shapes the device lists, and skips a module whose
+            // bytes this archive lacks or whose pipeline the driver rejects.
+            // No listed shape -> no coopmat path, and the tiled/ksplit
+            // kernels below take over.
+            int bm = 0;
+            int bn = 0;
+            bool tile16 = false;
+            if (auto pipe = build_coop_pipeline(kFp16Modules, false, cache, bm,
+                                                bn, tile16)) {
+                coop_pipeline_ = std::move(pipe);
+                coop_bm_ = bm;
+                coop_bn_ = bn;
+                coop_acc_geo_ = tile16;
+                for (auto &ds : coop_ds_) {
+                    ds = coop_pipeline_->allocDescriptorSets();
+                }
             }
         }
         if (fp16_ != 0 && !coop_i8_pipeline_ &&
-            dev->is_support_cooperate_matrix() &&
-            dev->supports_coopmat_sint8()) {
+            dev->is_support_cooperate_matrix()) {
             // W8A8 cooperative-matrix kernel: int8 weight bytes x an int8
             // activation the kernel quantizes itself (per output row, see the
-            // shader header), accumulated in int32 by the 8x8x32 subgroup MMA.
-            // Built only when the device actually lists the SINT8 combo — the
-            // KHR property list is the only feature query for integer MMA.
-            bool use_uab = update_after_bind_ &&
-                           dev->is_support_descriptor_update_after_bind();
-            auto coop_i8 = resolve_spv("buffer_matmul_coop_i8");
-            coop_i8_pipeline_ = std::make_unique<VulkanPipeline>(
-                dev->getLogicalDevice(),
-                std::vector<VkDescriptorType>{
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
-                    DESCRIPTOR_TYPE_STORAGE},
-                sizeof(matmul::GpuMatMulParam), coop_i8.first,
-                static_cast<int>(coop_i8.second), use_uab, 0, cache);
-            for (auto &ds : coop_i8_ds_) {
-                ds = coop_i8_pipeline_->allocDescriptorSets();
+            // shader header), accumulated in int32 by the SINT8 subgroup MMA.
+            // Same probe as the fp16 side, against kI8Modules: only a tile the
+            // device lists is built. That distinction is load-bearing -- Ada
+            // lists 16x16x32 and not 8x8x32, and the ARL 8x8x32 kernel it
+            // used to get compiles there and returns zeros.
+            int bm = 0;
+            int bn = 0;
+            bool tile16 = false;
+            if (auto pipe = build_coop_pipeline(kI8Modules, true, cache, bm, bn,
+                                                tile16)) {
+                coop_i8_pipeline_ = std::move(pipe);
+                coop_i8_bm_ = bm;
+                coop_i8_bn_ = bn;
+                for (auto &ds : coop_i8_ds_) {
+                    ds = coop_i8_pipeline_->allocDescriptorSets();
+                }
             }
         }
         if (fp16_ != 0 && !pack_pipeline_) {
@@ -1052,13 +1034,16 @@ class MatMulBuffer : public BufferFactory {
         // non-coopmat hardware.
         if (coopmat_i8) {
             // int8 weight x runtime-quantized int8 activation (SINT8 MMA).
-            // Same scratch + pack tail as the fp16 coopmat path.
+            // Same scratch + pack tail as the fp16 coopmat path. The grid uses
+            // the footprint of whichever SINT8 tile was probed (32x64 on Ada's
+            // 16x16x32, 16x32 on ARL's 8x8x32).
             fillDescriptorWrites(coop_i8_ds_[m_id_]);
             coop_i8_pipeline_->updateDescriptorSets(ds_writes_);
             m_cmd_->bind(*coop_i8_pipeline_, coop_i8_ds_[m_id_]);
             m_cmd_->push_constants(*coop_i8_pipeline_,
                                    sizeof(matmul::GpuMatMulParam), &para_);
-            dispatch_and_record(UP_DIV(n, 32), UP_DIV(m, 16), batch, &para_);
+            dispatch_and_record(UP_DIV(n, coop_i8_bn_), UP_DIV(m, coop_i8_bm_),
+                                batch, &para_);
 
             scratch_->shaderWriteBarrier(m_cmd_->get());
 
@@ -1075,13 +1060,41 @@ class MatMulBuffer : public BufferFactory {
         }
 
         if (coopmat) {
-            fillDescriptorWrites(coop_ds_[m_id_]);
-            coop_pipeline_->updateDescriptorSets(ds_writes_);
-            m_cmd_->bind(*coop_pipeline_, coop_ds_[m_id_]);
-            m_cmd_->push_constants(*coop_pipeline_,
-                                   sizeof(matmul::GpuMatMulParam), &para_);
-            dispatch_and_record(UP_DIV(n, coop_bn_), UP_DIV(m, coop_bm_), batch,
-                                &para_);
+            // The tile this shape measures best on, or one of the larger builds
+            // of the same 16x16x16 module when the shape calls for it. A bigger
+            // block halves the traffic per FLOP but divides the grid by the
+            // same factor, so pick_coop_geo gates each on the shape. Only the
+            // 16x16x16 tile has ACC builds, hence the tile16 guard.
+            CoopPick pick = pick_coop_tile(m, n);
+            VulkanPipeline *pipe = pick.pipe;
+            VkDescriptorSet *ds = pick.ds;
+            int bm = pick.bm;
+            int bn = pick.bn;
+            if (pick.tile16) {
+                const int acc_mode = coop_acc_mode();
+                CoopGeo *geo = nullptr;
+                if (acc_mode == 0) {
+                    geo = pick_coop_geo(m, n, batch);
+                } else if (acc_mode != 11) {
+                    for (auto &g : coop_geos_) {
+                        if (g.acc == acc_mode) {
+                            geo = &g;
+                        }
+                    }
+                }
+                if (geo != nullptr && coop_geo_pipeline(*geo) != nullptr) {
+                    pipe = geo->pipe;
+                    ds = geo->ds;
+                    bm = geo->bm;
+                    bn = geo->bn;
+                }
+            }
+            fillDescriptorWrites(ds[m_id_]);
+            pipe->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pipe, ds[m_id_]);
+            m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam),
+                                   &para_);
+            dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
 
             // Barrier: flush coopmat's scratch writes for pack's reads.
             scratch_->shaderWriteBarrier(m_cmd_->get());
@@ -1358,6 +1371,327 @@ class MatMulBuffer : public BufferFactory {
         }
     }
 
+    // One build of a coopmat kernel source: the tile it declares with
+    // coopmat<...>, and the workgroup M/N footprint that tile produces with
+    // the 2x4 subgroup grid every module here uses (bm = 2*cm, bn = 4*cn).
+    // The 16x16x16 module also has the wider ACC builds in coop_geos_; those
+    // are geometry variants of one listed tile, not extra tiles.
+    struct CoopModule {
+        uint32_t cm, cn, ck;
+        const char *key;
+        int bm, bn;
+    };
+    // fp16 -> fp32 modules, largest output tile first. Which ones a device can
+    // run is a property-list query, not something to infer from the vendor:
+    // Intel ARL lists 8x8x16 only, Ada lists 16x16x16 / 16x8x16 / 16x8x8 and
+    // NOT 8x8x16. The 8x8x16 tile keeps matmul_coop.comp, the single-buffered
+    // dedicated source: the pipelined matmul_coop16.comp build of the same
+    // tile is 10-36% slower on ARL (m=16..63, k=2048), because one 8x8 MMA
+    // per K tile leaves nothing for the prefetch to hide behind.
+    static constexpr CoopModule kFp16Modules[] = {
+        {16, 16, 16, "buffer_matmul_coop16", 32, 64},
+        {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32},
+        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32},
+        {8, 8, 16, "buffer_matmul_coop", 16, 32},
+    };
+    // SINT8 -> SINT32 builds of shaders/buffer/matmul_coop_i8.comp. ARL
+    // lists 8x8x32, Ada 16x16x32, and each device rejects the other's tile at
+    // the hardware level (validates, computes zeros), so both are needed.
+    static constexpr CoopModule kI8Modules[] = {
+        {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64},
+        {8, 8, 32, "buffer_matmul_coop_i8", 16, 32},
+    };
+
+    // First module whose tile the device lists and whose SPIR-V this op's
+    // archive resolves and the driver accepts. A missing key (older archive)
+    // or a rejected pipeline moves on to the next LISTED tile, never to an
+    // unlisted one. nullptr means no coopmat kernel is available at all.
+    template <size_t N>
+    std::unique_ptr<VulkanPipeline>
+    build_coop_pipeline(const CoopModule (&mods)[N], bool sint8,
+                        VkPipelineCache cache, int &bm, int &bn, bool &tile16) {
+        for (const CoopModule &m : mods) {
+            const bool listed =
+                sint8 ? m_dev_->supports_coopmat_sint8_tile(m.cm, m.cn, m.ck)
+                      : m_dev_->supports_coopmat_fp16_tile(m.cm, m.cn, m.ck);
+            if (!listed) {
+                continue;
+            }
+            std::pair<const uint32_t *, uint32_t> spv;
+            try {
+                spv = resolve_spv(m.key);
+            } catch (const std::exception &e) {
+                // Names the key: this model's archive predates it.
+                std::fprintf(stderr, "[vkop] %s\n", e.what());
+                continue;
+            }
+            try {
+                bool use_uab =
+                    update_after_bind_ &&
+                    m_dev_->is_support_descriptor_update_after_bind();
+                auto pipe = std::make_unique<VulkanPipeline>(
+                    m_dev_->getLogicalDevice(),
+                    std::vector<VkDescriptorType>{
+                        DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                        DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                        DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                        DESCRIPTOR_TYPE_STORAGE},
+                    sizeof(matmul::GpuMatMulParam), spv.first,
+                    static_cast<int>(spv.second), use_uab, 0, cache);
+                bm = m.bm;
+                bn = m.bn;
+                tile16 = m.cm == 16 && m.cn == 16 && m.ck == 16;
+                return pipe;
+            } catch (const std::exception &e) {
+                std::fprintf(stderr,
+                             "[vkop] coopmat %ux%ux%u MatMul module %s "
+                             "rejected (%s); trying the next listed shape\n",
+                             m.cm, m.cn, m.ck, m.key, e.what());
+            }
+        }
+        return nullptr;
+    }
+
+    // VKOP_NO_COOP=1 drops every coopmat path (MoltenVK cannot lower the A/B
+    // tile dims; see set_runtime_device).
+    static bool coop_env_off() {
+        static const bool off = [] {
+            const char *v = std::getenv("VKOP_NO_COOP");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        return off;
+    }
+
+    // VKOP_COOP_ACC=1x1|2x1|2x2 pins the coopmat geometry for an A/B;
+    // unset (0) picks it from the shape. Diagnostic only, like VKOP_NO_COOP:
+    // every geometry computes the same output.
+    static int coop_acc_mode() {
+        static const int mode = [] {
+            const char *v = std::getenv("VKOP_COOP_ACC");
+            if (v == nullptr) {
+                return 0;
+            }
+            const std::string s(v);
+            if (s == "1x1") {
+                return 11;
+            }
+            if (s == "2x1") {
+                return 21;
+            }
+            if (s == "2x2") {
+                return 22;
+            }
+            return 0;
+        }();
+        return mode;
+    }
+
+    // Large-footprint builds of the 16x16x16 module (-DACC_M/-DACC_N over
+    // shaders/buffer/matmul_coop16.comp): one workgroup covers more of the
+    // output with the same 256 threads, which cuts the traffic per FLOP
+    // (1/BM + 1/BN) and gives each subgroup more MMAs per K tile to hide the
+    // next tile's loads behind -- at the cost of a proportionally coarser
+    // dispatch grid. The default 1x1 geometry is the coop_pipeline_ built in
+    // set_runtime_device; these are probed on first use because only archives
+    // built after a key was added carry its bytes, and an older model must keep
+    // running (on the 32x64 tile) rather than fail to load.
+    struct CoopGeo {
+        const char *key;
+        int bm;
+        int bn;
+        int acc; // VKOP_COOP_ACC value that pins this geometry
+        VulkanPipeline *pipe = nullptr;
+        VkDescriptorSet ds[vkop::kInflight] = {nullptr};
+        bool no_bytes = false; // this op's archive lacks the key
+        bool refused = false;  // driver rejected the module
+    };
+    CoopGeo coop_geos_[2] = {
+        {"buffer_matmul_coop16_2x2", 64, 128, 22},
+        {"buffer_matmul_coop16_2x1", 64, 64, 21},
+    };
+    std::vector<std::unique_ptr<VulkanPipeline>> coop_geo_pipes_;
+
+    VulkanPipeline *coop_geo_pipeline(CoopGeo &g) {
+        if (g.pipe != nullptr) {
+            return g.pipe;
+        }
+        if (m_dev_ == nullptr || g.no_bytes || g.refused ||
+            !m_dev_->supports_coopmat_fp16_tile(16, 16, 16)) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(g.key);
+        } catch (const std::exception &e) {
+            g.no_bytes = true;
+            std::fprintf(stderr,
+                         "[vkop] %s\n[vkop] coopmat MatMul stays on the "
+                         "geometries this archive carries\n",
+                         e.what());
+            return nullptr;
+        }
+        try {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
+            auto pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0);
+            for (auto &ds : g.ds) {
+                ds = pipe->allocDescriptorSets();
+            }
+            g.pipe = pipe.get();
+            coop_geo_pipes_.push_back(std::move(pipe));
+        } catch (const std::exception &e) {
+            g.refused = true;
+            std::fprintf(stderr,
+                         "[vkop] coopmat %dx%d MatMul pipeline rejected "
+                         "(%s); smaller geometries stay\n",
+                         g.bm, g.bn, e.what());
+            return nullptr;
+        }
+        return g.pipe;
+    }
+
+    // The half-width fp16 tile (16x8x16 -> 32x32 workgroup footprint): the same
+    // MMA depth as the 32x64 default but half the N, so a short prompt keeps
+    // twice as many workgroups busy. Measured on RTX 4000 Ada, k=2048,
+    // interleaved min-of-N against 32x64: 1.27-1.31x faster for m <= 128 and
+    // n <= 2048 (.083 vs .109 ms at m=8, .096 vs .122 at m=32, .145 vs .158 at
+    // m=128), and slower outside that band (.208 vs .173 at m=64/n=6144, .346
+    // vs .260 at m=128/n=6144, .462 vs .385 at n=8192); with k=6144 it still
+    // wins 1.10-1.34x at m <= 128/n=2048. The win is occupancy, not the MMA
+    // shape -- the same 256 threads cover half the output, and 16x8x16 is the
+    // only half-N tile the device lists. The 16x8x8 build was measured too and
+    // never won, so it is not routed.
+    struct CoopAlt {
+        VulkanPipeline *pipe = nullptr;
+        VkDescriptorSet ds[vkop::kInflight] = {nullptr};
+        int bm = 32;
+        int bn = 32;
+        bool no_bytes = false; // this op's archive lacks the key
+        bool refused = false;  // driver rejected the module
+    };
+    CoopAlt coop_alt_;
+    std::unique_ptr<VulkanPipeline> coop_alt_owner_;
+
+    // Built on first use: a graph whose shapes all stay outside the band must
+    // never pay to compile it. nullptr means the shape keeps the 32x64 tile --
+    // the device does not list 16x8x16, this archive lacks its bytes, or the
+    // driver refused it.
+    CoopAlt *coop_alt_pipeline() {
+        if (coop_alt_.pipe != nullptr) {
+            return &coop_alt_;
+        }
+        if (coop_alt_.no_bytes || coop_alt_.refused || m_dev_ == nullptr ||
+            // Only an alternative to the 16x16x16 module: a device whose probed
+            // tile already is 16x8x16 has nothing narrower to switch to.
+            !coop_acc_geo_ || !m_dev_->supports_coopmat_fp16_tile(16, 8, 16)) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv("buffer_matmul_coop16_16x8x16");
+        } catch (const std::exception &e) {
+            coop_alt_.no_bytes = true;
+            // Once per process: a model converted before the key shipped has a
+            // dozen-plus MatMul nodes, all with the same answer.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(
+                    stderr,
+                    "[vkop] %s\n[vkop] MatMul keeps the 32x64 coopmat tile "
+                    "for short prompts\n",
+                    e.what());
+            }
+            return nullptr;
+        }
+        try {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
+            auto pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0);
+            for (auto &ds : coop_alt_.ds) {
+                ds = pipe->allocDescriptorSets();
+            }
+            coop_alt_.pipe = pipe.get();
+            coop_alt_owner_ = std::move(pipe);
+        } catch (const std::exception &e) {
+            coop_alt_.refused = true;
+            std::fprintf(stderr,
+                         "[vkop] coopmat 16x8x16 MatMul module rejected (%s); "
+                         "the 32x64 tile keeps every shape\n",
+                         e.what());
+            return nullptr;
+        }
+        return &coop_alt_;
+    }
+
+    // The one place the fp16 tile is chosen. Everything else in the coopmat
+    // path (gate, scratch, pack pass) is tile-agnostic.
+    struct CoopPick {
+        VulkanPipeline *pipe;
+        VkDescriptorSet *ds;
+        int bm;
+        int bn;
+        bool tile16;
+    };
+    CoopPick pick_coop_tile(int m, int n) {
+        CoopPick pick{coop_pipeline_.get(), coop_ds_, coop_bm_, coop_bn_,
+                      coop_acc_geo_};
+        if (m <= kCoopAltMaxM && n <= kCoopAltMaxN) {
+            if (CoopAlt *alt = coop_alt_pipeline()) {
+                pick = {alt->pipe, alt->ds, alt->bm, alt->bn, false};
+            }
+        }
+        return pick;
+    }
+
+    // Geometry for a shape. Both larger tiles are 64 rows tall, so a shape
+    // that does not fill one row block keeps the 32x64 geometry rather than
+    // masking most of the workgroup. 64x64 is the default above that because
+    // it halves the traffic per FLOP of 32x64. 64x128 only widens N: it needs
+    // 48 N-tiles of work to amortize the A reads and 128 workgroups to keep
+    // both dimensions busy, and outside that it loses to 64x64 -- RTX 4000 Ada,
+    // k=2048, m=128: .288 vs .259 ms at n=6144 (96 waves), .378 vs .400 at
+    // n=8192, 6.22 vs 6.68 at n=151936; m=701: .946 vs .896 at n=4096 (352
+    // waves, N too narrow), 1.363 vs 1.407 at n=6144, 33.1 vs 35.5 at n=151936.
+    // 64x64 is in turn gated on two workgroups per SM: at 32 waves (m=64,
+    // n=2048) it loses .148 to .141 and wins from 128 up (m=64, n=8192:
+    // .210 vs .239).
+    CoopGeo *pick_coop_geo(int m, int n, int batch) {
+        if (m < 64) {
+            return nullptr;
+        }
+        auto waves = [&](const CoopGeo &g) {
+            return UP_DIV(m, g.bm) * UP_DIV(n, g.bn) * batch;
+        };
+        CoopGeo &wide = coop_geos_[0];
+        CoopGeo &square = coop_geos_[1];
+        if (m >= 128 && n >= kWideN && waves(wide) >= kWideMinWaves &&
+            coop_geo_pipeline(wide) != nullptr) {
+            return &wide;
+        }
+        if (waves(square) >= kCoopMinWaves &&
+            coop_geo_pipeline(square) != nullptr) {
+            return &square;
+        }
+        return nullptr;
+    }
+
     // The int8/fp8 weight-only WIDE GEMV, which lives in a module of its own
     // (matmul16_w8_ksplit_wide is not in the general fp16 module -- MoltenVK
     // cannot compile it there, and as part of that module its failed pipeline
@@ -1555,16 +1889,34 @@ class MatMulBuffer : public BufferFactory {
     // from the same objs_ vector.
     std::unique_ptr<VulkanPipeline> coop_pipeline_;
     VkDescriptorSet coop_ds_[vkop::kInflight] = {nullptr};
-    // Workgroup output footprint of the selected coopmat shader variant:
-    // 16x32 (8x8x16 combo, ARL) or 32x64 (16x16x16 combo, NVIDIA). Set when
-    // coop_pipeline_ is built; the dispatch grid divides M/N by these.
+    // Workgroup output footprint of the probed coopmat tile (bm = 2*cm,
+    // bn = 4*cn): 16x32 for ARL's 8x8x16, 32x64 for Ada's 16x16x16, 32x32 for
+    // the 16x8 tiles. Set when coop_pipeline_ is built; the dispatch grid
+    // divides M/N by these.
     int coop_bm_ = 16;
     int coop_bn_ = 32;
+    // The probed tile is 16x16x16, the only one with the wider ACC builds in
+    // coop_geos_ (they are extra accumulators over one tile, not extra tiles).
+    bool coop_acc_geo_ = false;
+    // Large 16x16x16 geometries, see coop_geo_pipeline. kCoopMinWaves and
+    // kWideMinWaves are the workgroup counts below which a bigger footprint
+    // loses more to the idle tail than it gains in traffic; kWideN is the
+    // width below which 64x128 has too few N-tiles to amortize its A reads.
+    static constexpr int kCoopMinWaves = 96;
+    static constexpr int kWideMinWaves = 128;
+    static constexpr int kWideN = 6144;
+    // Shape band where the half-width 16x8x16 tile beats the 32x64 one, see
+    // coop_alt_pipeline. Above either bound the 32x64 tile's lower traffic per
+    // FLOP takes over.
+    static constexpr int kCoopAltMaxM = 128;
+    static constexpr int kCoopAltMaxN = 2048;
     // coop_i8_pipeline_ runs the W8A8 SINT8 cooperative-matrix kernel (int8
     // weight x runtime-quantized int8 activation -> flat fp32 scratch). Built
-    // only when the device lists the SINT8 coopmat combo.
+    // only for a tile the device lists; the grid divides M/N by its footprint.
     std::unique_ptr<VulkanPipeline> coop_i8_pipeline_;
     VkDescriptorSet coop_i8_ds_[vkop::kInflight] = {nullptr};
+    int coop_i8_bm_ = 16;
+    int coop_i8_bn_ = 32;
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     // The int8/fp8 weight-only WIDE GEMV module (buffer_matmul_w8_wide_fp16,

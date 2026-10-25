@@ -346,6 +346,54 @@ add_custom_command(
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS512_W8WIDE})
 
+# Extra SPIR-V builds of one shader source under explicit archive keys. The
+# host resolves these by the same key it sees in the executable (MatMul's
+# coopmat shapes and geometries, see MatMulBuffer::build_coop_pipeline and
+# coop_geo_pipeline); the keys cannot be folder-derived because several modules
+# come from the same .comp. A macro, not a function, so the SPIRV_OUTPUTS and
+# VARIANT_* appends land in this directory's scope and reach the archive below.
+macro(vkop_shader_variant KEY SOURCE)
+    set(SPIRV_FILE_VARIANT ${SPIRV_DIR}/${KEY}.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_VARIANT}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${SOURCE}.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_VARIANT} ${ARGN}
+        DEPENDS ${SHADER_DIR}/${SOURCE}.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling ${SOURCE} (${KEY}) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_VARIANT})
+    list(APPEND VARIANT_SPV_KEYS ${KEY})
+    list(APPEND VARIANT_SPV_FILES ${SPIRV_FILE_VARIANT})
+endmacro()
+
+# Larger 16x16x16 coopmat workgroups (MatMulBuffer::coop_geo_pipeline): the same
+# matmul_coop16.comp with more accumulator tiles per subgroup, so one 256-thread
+# workgroup covers 64x64 or 64x128 instead of 32x64. The host picks one from the
+# shape, the base build stays the 32x64 module, and an archive converted before
+# a key existed just keeps the base (resolve_spv throws by name, the op records
+# the miss and falls back).
+vkop_shader_variant(buffer_matmul_coop16_2x1 buffer/matmul_coop16
+                    -DACC_M=2 -DACC_N=1)
+vkop_shader_variant(buffer_matmul_coop16_2x2 buffer/matmul_coop16
+                    -DACC_M=2 -DACC_N=2)
+
+# The cooperative-matrix tile shapes the runtime can probe for. matmul_coop16
+# carries the fp16 f32-accumulate shapes (16x16x16 is the default build above),
+# matmul_coop_i8 the SINT8 ones (8x8x32 is its default build). The host picks
+# the largest listed shape, so the smaller ones only matter on a device that
+# lists no larger one -- but an unlisted module is never dispatched, and a
+# missing key just drops to the next shape, so every listed shape needs bytes.
+# ARL's 8x8x16 tile is NOT built from this source: matmul_coop.comp already
+# implements it and measured 10-36% faster (one 8x8 MMA per K tile gives the
+# pipelined staging nothing to hide behind).
+vkop_shader_variant(buffer_matmul_coop16_16x8x16 buffer/matmul_coop16
+                    -DCM=16 -DCN=8 -DCK=16)
+vkop_shader_variant(buffer_matmul_coop16_16x8x8 buffer/matmul_coop16
+                    -DCM=16 -DCN=8 -DCK=8)
+vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
+                    -DCM=16 -DCN=16 -DCK=32)
+
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #
@@ -384,6 +432,18 @@ list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_ksplit512_fp16:${SPIRV_FILE_KS512}
      --spv buffer_matmul_ksplit512_w8_wide_fp16:${SPIRV_FILE_KS512_W8WIDE})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
+# And for every vkop_shader_variant build: the macro paired each key with its
+# .spv, so no per-key line is needed here.
+list(LENGTH VARIANT_SPV_KEYS VARIANT_COUNT)
+if(VARIANT_COUNT GREATER 0)
+    math(EXPR VARIANT_LAST "${VARIANT_COUNT} - 1")
+    foreach(VARIANT_INDEX RANGE ${VARIANT_LAST})
+        list(GET VARIANT_SPV_KEYS ${VARIANT_INDEX} VARIANT_KEY)
+        list(GET VARIANT_SPV_FILES ${VARIANT_INDEX} VARIANT_FILE)
+        list(APPEND ARCHIVE_ARGS --spv ${VARIANT_KEY}:${VARIANT_FILE})
+        list(APPEND ARCHIVE_DEPS ${VARIANT_FILE})
+    endforeach()
+endif()
 
 set(VKOP_SHADER_ARCHIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.bin)
 add_custom_command(

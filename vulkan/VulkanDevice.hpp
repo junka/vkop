@@ -176,17 +176,20 @@ class VulkanDevice {
     getCooperativeMatrixProperties() const {
         return coopmatProps_;
     }
-    // SINT8 -> SINT32 subgroup-scope cooperative matrix (W8A8). There is no
-    // boolean feature for "this device does integer MMA"; the KHR properties
-    // list is the only source of truth, so scan it for the exact combination
-    // the int8 MatMul kernel declares. Intel ARL reports 8x8x32 A=SINT8
-    // B=SINT8 C=SINT32 R=SINT32 at subgroup scope.
-    bool supports_coopmat_sint8() const {
+    // SINT8 -> SINT32 subgroup-scope cooperative matrix (W8A8) with an
+    // explicit tile shape. There is no boolean feature for "this device does
+    // integer MMA"; the KHR properties list is the only source of truth, so
+    // scan it for the exact combination the int8 MatMul kernel declares.
+    // Intel ARL reports 8x8x32 A=SINT8 B=SINT8 C=SINT32 R=SINT32; NVIDIA Ada
+    // lists 16x16x32 instead and silently produces zeros for 8x8x32, so the
+    // kernel shape has to be matched, not just the component types.
+    bool supports_coopmat_sint8_tile(uint32_t M, uint32_t N, uint32_t K) const {
         for (const auto &p : coopmatProps_) {
             if (p.AType == VK_COMPONENT_TYPE_SINT8_KHR &&
                 p.BType == VK_COMPONENT_TYPE_SINT8_KHR &&
                 p.ResultType == VK_COMPONENT_TYPE_SINT32_KHR &&
-                p.scope == VK_SCOPE_SUBGROUP_KHR) {
+                p.scope == VK_SCOPE_SUBGROUP_KHR && p.MSize == M &&
+                p.NSize == N && p.KSize == K) {
                 return true;
             }
         }
@@ -212,7 +215,9 @@ class VulkanDevice {
         return false;
     }
 #else
-    bool supports_coopmat_sint8() const { return false; }
+    bool supports_coopmat_sint8_tile(uint32_t, uint32_t, uint32_t) const {
+        return false;
+    }
     bool supports_coopmat_fp16_tile(uint32_t, uint32_t, uint32_t) const {
         return false;
     }

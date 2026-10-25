@@ -127,7 +127,26 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("MatMul", "buffer"): [
         "buffer_matmul_coop",
         "buffer_matmul_coop16",
+        # Larger 16x16x16 workgroups of the same coop16 source (-DACC_M/-DACC_N):
+        # 64x64 and 64x128 output footprints. Which one a MatMul dispatches is a
+        # host-side shape decision, so like the coop split itself every MatMul
+        # must carry both.
+        "buffer_matmul_coop16_2x1",
+        "buffer_matmul_coop16_2x2",
+        # The other fp16 tiles the same source can declare (-DCM/-DCN/-DCK).
+        # The runtime probes the device's cooperative-matrix table and only a
+        # listed shape is ever dispatched, but which shapes are listed is
+        # decided at load time, so every MatMul carries the ones it may need:
+        # 16x8x16 / 16x8x8 are the Ada second-tier tiles (Ada does not list
+        # 8x8x16, and the ARL 8x8x16 tile stays on buffer_matmul_coop, which is
+        # faster there). A missing key makes the host drop to the next listed
+        # shape.
+        "buffer_matmul_coop16_16x8x16",
+        "buffer_matmul_coop16_16x8x8",
         "buffer_matmul_coop_i8",
+        # 16x16x32 SINT8 tile (Ada). 4x the per-MMA output area of the 8x8x32
+        # default build, and the only int8 shape Ada lists.
+        "buffer_matmul_coop_i8_16x16x32",
         "buffer_matmul_pack",
         # The int8/fp8 weight-only WIDE GEMV: a second fp16 build of
         # buffer/matmul.comp (-DW8_WIDE), not its own .comp, so nothing derives

@@ -1303,23 +1303,53 @@ void tile_load_b_t(int b, int col0, int kw, int halfK) {
                                : 0u;
 }
 
+// Register-staged form of the A and [batch,K,N] B staging. The global words
+// land in registers, the FMA nest on the tile already in shared runs while
+// they are in flight, and only then are they written out. Storing straight
+// from the load makes every warp stall on its own load before it can reach
+// the FMA, so the memory pipe sits idle for most of a K tile.
+//
+// A is still staged by tile_load_a in the other two B layouts, where the word
+// count per thread differs and the fetch/store split measured no gain.
+void fetch_a(int b, int row0, int kw, int halfK, out uint va0, out uint va1) {
+    int l = tile_tid();
+    int row = l >> 3;
+    int kt = l & 7;
+    va0 = (row0 + row < uPC.M)
+              ? uInputA.data[(b * uPC.M + row0 + row) * halfK + kw + kt] : 0u;
+    int row2 = row + 32;
+    va1 = (row0 + row2 < uPC.M)
+              ? uInputA.data[(b * uPC.M + row0 + row2) * halfK + kw + kt] : 0u;
+}
+
+void store_a(uint va0, uint va1) {
+    int l = tile_tid();
+    int row = l >> 3;
+    int kt = l & 7;
+    sA[row * SROW + kt] = va0;
+    sA[(row + 32) * SROW + kt] = va1;
+}
+
 // B is [batch, K, N]: keep global's [k][column-pair] packing so the copy is a
 // straight word-for-word transfer (N even => every column pair is one word).
 // 16 k-rows x 32 column-pairs = 512 words with 256 threads: `l = tid` takes
 // k-rows 0..7, and k-rows 8..15 come from the same `cp` at l + 256.
-void tile_load_b_n(int b, int col0, int kk, int halfN) {
+void fetch_b_n(int b, int col0, int kk, int halfN, out uint vb0, out uint vb1) {
     int l = tile_tid();
     int kr = l >> 5;
     int cp = l & 31;
-    sB[kr * SBROW + cp] =
-        (col0 + cp * 2 + 1 < uPC.N)
-            ? uInputB.data[(b * uPC.K + kk + kr) * halfN + (col0 >> 1) + cp]
-            : 0u;
-    int kr2 = kr + 8;
-    sB[kr2 * SBROW + cp] =
-        (col0 + cp * 2 + 1 < uPC.N)
-            ? uInputB.data[(b * uPC.K + kk + kr2) * halfN + (col0 >> 1) + cp]
-            : 0u;
+    bool ok = (col0 + cp * 2 + 1 < uPC.N);
+    vb0 = ok ? uInputB.data[(b * uPC.K + kk + kr) * halfN + (col0 >> 1) + cp] : 0u;
+    vb1 = ok ? uInputB.data[(b * uPC.K + kk + kr + 8) * halfN + (col0 >> 1) + cp]
+             : 0u;
+}
+
+void store_b_n(uint vb0, uint vb1) {
+    int l = tile_tid();
+    int kr = l >> 5;
+    int cp = l & 31;
+    sB[kr * SBROW + cp] = vb0;
+    sB[(kr + 8) * SBROW + cp] = vb1;
 }
 
 // Byte-quantized weight, B is [batch, K, N] (the only layout a quantizer can
@@ -1440,11 +1470,27 @@ void matmul16_tiled() {
             barrier();
         }
     } else {
-        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
-            tile_load_a(b, row0, kk >> 1, halfK);
-            tile_load_b_n(bb, col0, kk, halfN);
-            barrier();
+        // Two-deep split: the fetch for tile t+1 is issued before tile t is
+        // computed, so its loads are in flight for the whole FMA nest. The
+        // store then runs after the barrier that retires tile t's readers.
+        int ntile = uPC.K / TILE_K;
+        uint va0, va1, vb0, vb1;
+        fetch_a(b, row0, 0, halfK, va0, va1);
+        fetch_b_n(bb, col0, 0, halfN, vb0, vb1);
+        store_a(va0, va1);
+        store_b_n(vb0, vb1);
+        barrier();
+        for (int t = 0; t < ntile; ++t) {
+            if (t + 1 < ntile) {
+                fetch_a(b, row0, (t + 1) * (TILE_K / 2), halfK, va0, va1);
+                fetch_b_n(bb, col0, (t + 1) * TILE_K, halfN, vb0, vb1);
+            }
             tile_fma_n(acc, lr, lc);
+            barrier();
+            if (t + 1 < ntile) {
+                store_a(va0, va1);
+                store_b_n(vb0, vb1);
+            }
             barrier();
         }
     }
