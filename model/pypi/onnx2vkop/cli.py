@@ -301,8 +301,8 @@ Examples:
     parser.add_argument(
         "--no-fusions", metavar="A,B,C", default=None,
         help="Comma-separated FusionOptimizer pass names to skip "
-             "(equivalent to VKOP_NO_FUSIONS=A,B,C). Common pair for "
-             "attention A/B: --no-fusions fuse_into_attention.",
+             "(equivalent to VKOP_NO_FUSIONS=A,B,C). fuse_into_attention is "
+             "always on: listing it is reported and ignored.",
     )
     parser.add_argument(
         "--stream-weights", choices=["on", "off"], default=None,

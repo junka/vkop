@@ -567,6 +567,15 @@ ONNXOPTIMIZER_PASSES = [
 ]
 
 
+# Fusions the converter is not allowed to skip. Attention is one of them: the
+# fold is what turns the MatMul/Softmax/MatMul chain into the single Attention
+# op the runtime schedules, so an "ablated attention" build is not a slower
+# baseline but a different graph with an untracked numerics path (the old
+# llm_noattn control was exactly that). A VKOP_NO_FUSIONS entry naming one of
+# these is reported and ignored.
+ALWAYS_ON_FUSIONS = frozenset({"fuse_into_attention"})
+
+
 def _disabled_passes(env_var):
     """Names subtracted from a pass list by an env var (comma separated)."""
     return {p.strip() for p in os.environ.get(env_var, "").split(",") if p.strip()}
@@ -1023,8 +1032,12 @@ class MultiRoundOptimizer:
         # dead weight on a CNN), so ablation is done by env rather than by
         # editing this list -- see tools/ablate.py.
         if pass_instance.name in _disabled_passes("VKOP_NO_FUSIONS"):
-            print(f"[ablate] fusion pass disabled by VKOP_NO_FUSIONS: {pass_instance.name}")
-            return
+            if pass_instance.name in ALWAYS_ON_FUSIONS:
+                print(f"[ablate] {pass_instance.name} is always on (fused "
+                      f"attention); ignoring the VKOP_NO_FUSIONS entry")
+            else:
+                print(f"[ablate] fusion pass disabled by VKOP_NO_FUSIONS: {pass_instance.name}")
+                return
         self.passes.append(pass_instance)
         self.passes.sort(key=lambda p: p.priority, reverse=True)
 

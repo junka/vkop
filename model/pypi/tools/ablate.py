@@ -54,7 +54,9 @@ def convert(input_model, out_path, env_extra):
 
 def fusion_pass_names():
     reg = _opt.FusionOptimizer.create_default_optimizer()
-    return [p.name for p in reg.passes]
+    # An always-on fusion (attention) cannot be ablated; listing it would print
+    # a variant identical to the baseline and call it a measurement.
+    return [p.name for p in reg.passes if p.name not in _opt.ALWAYS_ON_FUSIONS]
 
 
 def print_row(label, st, base=None):

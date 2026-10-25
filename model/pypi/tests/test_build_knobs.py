@@ -239,13 +239,23 @@ def test_no_passes_typo_is_named_on_the_real_path(monkeypatch, capsys):
 
 def test_no_fusions_typo_is_caught_once_the_registry_is_complete(monkeypatch,
                                                                   capsys):
-    monkeypatch.setenv("VKOP_NO_FUSIONS", "fuse_into_attention,eliminate_identty")
+    monkeypatch.setenv("VKOP_NO_FUSIONS", "fuse_rotary_embedding,eliminate_identty")
     opt = FusionOptimizer.create_default_optimizer(max_rounds=1)
     printed = capsys.readouterr().out
     assert opt.warn_unknown_disabled() == ["eliminate_identty"]
     assert "names no registered pass" in printed
     # A pass that really was disabled is known, absent from the run list, and
     # never reported as a typo -- known_passes exists to keep those two straight.
+    assert "fuse_rotary_embedding" in opt.known_passes
+    assert "fuse_rotary_embedding" not in {p.name for p in opt.passes}
+    assert "fuse_rotary_embedding" not in printed.split("names no registered pass")[1]
+
+
+def test_attention_fusion_cannot_be_ablated(monkeypatch, capsys):
+    """The attention fold is part of the graph contract, not a knob: a build
+    with it disabled is a different graph, not a slower baseline."""
+    monkeypatch.setenv("VKOP_NO_FUSIONS", "fuse_into_attention")
+    opt = FusionOptimizer.create_default_optimizer(max_rounds=1)
     assert "fuse_into_attention" in opt.known_passes
-    assert "fuse_into_attention" not in {p.name for p in opt.passes}
-    assert "fuse_into_attention" not in printed.split("names no registered pass")[1]
+    assert "fuse_into_attention" in {p.name for p in opt.passes}
+    assert "always on" in capsys.readouterr().out

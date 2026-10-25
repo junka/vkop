@@ -409,7 +409,7 @@ printf '请先记住：我的名字叫小明，我喜欢打篮球。只需要回
 | `--max-fold-rounds N` | 写死 `ConstantFolder.fold(max_rounds=25)` | 25 |
 | `--max-fuse-rounds N` | 写死 `MultiRoundOptimizer(max_rounds=10)` | 10 |
 | `--no-passes=A,B,C` | `VKOP_NO_PASSES` | 关 |
-| `--no-fusions=A,B,C` | `VKOP_NO_FUSIONS` | 关 |
+| `--no-fusions=A,B,C` | `VKOP_NO_FUSIONS` | 关（`fuse_into_attention` 除外：attention 融合恒开，列了会被忽略并告警） |
 | `--stream-weights=on\|off` | 无（所有外部权重一律读进内存） | on |
 | `--stream-min-mib N` | 无 | 1 MiB |
 
