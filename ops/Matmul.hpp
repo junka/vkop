@@ -776,12 +776,20 @@ class MatMulBuffer : public BufferFactory {
         //   UHD630  byte   2048  151936  ~14.8 ms  500 ms   > 8
         //   UHD630  fp16   2048  6144    ~1.1 ms   15 ms    > 8
         //   UHD630  fp16   2048  151936  ~22.7 ms  360 ms   > 8
+        //   1070    byte   2048  2048    ~0.11 ms  0.42 ms  ~12
+        //   1070    fp16   2048  2048    ~0.09 ms  ==       3 (wash 3..8)
         // The split-K GEMV only runs while batch*m <= 8, so a crossover past
         // that is never reached: the 560X byte and both UHD630 profiles keep
-        // the GEMV for the whole window and start the tile at 9. 2 (byte) / 3
-        // (fp16) remain the defaults for ARL/Ada; the others are device
-        // profiles (VulkanDevice::MatmulTileProfile, keyed on vendor ID behind
-        // the MoltenVK driver ID). That only touches batch*m <= 8 decode and
+        // the GEMV for the whole window and start the tile at 9. The 1070
+        // (discrete, native driver) sits between the two: the tile's
+        // 64-byte-per-row B staging never takes off from VRAM at small m
+        // (byte m=2..8: GEMV 23-74 GB/s vs tile 9-17, crossover at m=12,
+        // past which the GEMV's M-fold re-read collapses to 4-6 GB/s while
+        // the tile stays flat), so its profile starts the byte tile at 12.
+        // 2 (byte) / 3 (fp16) remain the defaults for ARL/Ada; the others are
+        // device profiles (VulkanDevice::MatmulTileProfile, keyed on vendor ID
+        // behind the MoltenVK driver ID, or on !is_unified_memory() for
+        // native-driver dGPUs). That only touches batch*m <= 8 decode and
         // short prompts: the shipped Qwen prompt path runs m >= 8 (m = 9 at
         // K=2048 N=6144: tile 3.75 ms vs the column-parallel 6.5 ms on the
         // 560X) and stays tiled.
@@ -809,8 +817,17 @@ class MatMulBuffer : public BufferFactory {
         // to the column-parallel kernel: 5.8-6.0x slower prefill on any device
         // without coopmat, and 3.4-9.8x for an int8 weight (which coop excludes
         // outright).
-        const bool tiled = fused_fp16 && !weight_4bit && (k % 16 == 0) &&
-                           (m >= tiled_min_m) && !epi_bias_ && tiled_ok_n &&
+        // A/B knob (bench_matmul): force the tile off so every shape it would
+        // take falls to ksplit / fused / reduce. Same style as VKOP_NO_COOP;
+        // also the escape hatch for a tile regression on an uncalibrated
+        // device.
+        static const bool tile_disabled = [] {
+            const char *v = std::getenv("VKOP_NO_TILE");
+            return v != nullptr && v[0] != '\0' && v[0] != '0';
+        }();
+        const bool tiled = fused_fp16 && !tile_disabled && !weight_4bit &&
+                           (k % 16 == 0) && (m >= tiled_min_m) && !epi_bias_ &&
+                           tiled_ok_n &&
                            (!weight_byte || (!transB_ && (n % 4 == 0)));
         // Cooperative-matrix GEMM (Intel ARL fp16 8x8x16 subgroup MMA). A
         // device-specific fast path: when the GPU exposes

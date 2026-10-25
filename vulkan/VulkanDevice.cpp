@@ -24,12 +24,13 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
         throw std::runtime_error("Compute queue already created.");
     }
     checkImageFormatSupport();
+    // Before getProperties(): the MatMul tile profile below keys on it.
+    m_is_unified_memory_ = checkDeviceUnifiedMemoryAccess();
     auto props = getProperties();
     if (!createLogicalDevice(props)) {
         LOG_ERROR("Failed to create logical device!");
         return;
     }
-    checkDeviceUnifiedMemoryAccess();
 #ifdef USE_VMA
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
 #endif
@@ -170,6 +171,21 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d",
                  matmul_tile_profile_.byte_min_m,
                  matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n);
+    }
+    if (driver_properties.driverID != VK_DRIVER_ID_MOLTENVK &&
+        !is_unified_memory()) { // discrete GPU on a native driver
+        // VRAM-backed dGPU: the tile's 64-byte-per-row B staging never takes
+        // off from VRAM at small m. Measured GTX 1070, interleaved A/B: byte
+        // q/k/v/o m=2..8 GEMV 23-74 GB/s vs tile 9-17, crossover at m=12
+        // (8.8 vs 7.9 GB/s), and past that the GEMV's M-fold re-read collapses
+        // to 4-6 GB/s while the tile stays flat. fp16 is a wash at m=3..8
+        // there, so only the byte threshold moves. Other dGPUs (e.g. the RTX
+        // 4000 Ada) share the memory mechanism but were not re-measured for
+        // byte weights; VKOP_NO_TILE is the escape hatch if one regresses.
+        matmul_tile_profile_.byte_min_m = 12;
+        matmul_tile_profile_.byte_wide_min_m = 12;
+        LOG_INFO("MatMul tile profile: byte_min_m=%d (discrete)",
+                 matmul_tile_profile_.byte_min_m);
     }
     LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
     LOG_INFO("Max image dimension 2D %d", this->maxImageDimension2D_);
@@ -1428,15 +1444,19 @@ bool VulkanDevice::checkDeviceUnifiedMemoryAccess() {
     VkPhysicalDeviceMemoryProperties memory_properties;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memory_properties);
 
-    bool is_unified_memory = false;
+    // A HOST_VISIBLE|DEVICE_LOCAL memory type is NOT sufficient: discrete
+    // NVIDIA/AMD expose their BAR as exactly that combination (a 256 MB window
+    // of VRAM mapped to the host), which would tag every dGPU as UMA. The
+    // reliable discriminator is the heap layout: an iGPU exposes a single
+    // DEVICE_LOCAL heap, a dGPU always has a separate non-local system heap.
+    bool is_unified_memory = memory_properties.memoryHeapCount == 1;
 
     for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
         const VkMemoryType &mem_type = memory_properties.memoryTypes[i];
 
         if ((mem_type.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
             (mem_type.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            is_unified_memory = true;
-            LOG_INFO("Unified memory type found at index: %d", i);
+            LOG_INFO("Host-visible device-local memory type at index: %d", i);
         }
     }
 

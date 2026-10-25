@@ -153,6 +153,10 @@ class VulkanDevice {
     bool is_support_host_image_copy() const {
         return m_support_host_image_copy_;
     }
+    // UMA: a memory type that is both HOST_VISIBLE and DEVICE_LOCAL. iGPU
+    // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick
+    // routing thresholds measured on the matching device class.
+    bool is_unified_memory() const { return m_is_unified_memory_; }
     bool is_support_buffer_device_address() const {
         return m_support_buffer_device_address_;
     }
@@ -268,6 +272,7 @@ class VulkanDevice {
     std::vector<std::shared_ptr<VulkanQueue>> graphicsQueues_;
 
     bool m_support_host_image_copy_ = false;
+    bool m_is_unified_memory_ = false;
     bool m_support_buffer_device_address_ = false;
     bool m_support_timeline_semaphore_ = false;
     bool m_support_cuda_kernel_launch_ = false;
