@@ -3,14 +3,18 @@
 // Sibling of bench_matmul.cpp, which is fp16-GEMV only. This one drives the
 // real MatMul op with an int8 weight and a parametrizable M, so the two int8
 // decode/prefill kernels can be A/B'd directly:
-//   - M small (<= 8): the host routes a byte weight to the split-K / byte-WIDE
-//     GEMV (weight-bandwidth-bound).
-//   - M >= 12: the host routes it to the shared-memory tiled kernel (compute).
+//   - Below tiled_min_m the host routes a byte weight to the split-K /
+//     byte-WIDE GEMV (weight-bandwidth-bound): m < 2, or m < 12 when the
+//     weight row stride is a power of two >= 64 KiB.
+//   - At or above it the shared-memory tiled kernel takes the shape. The
+//     crossover is device-dependent; benchmark/README.md has the 560X profile
+//     where byte m = 2..8 is still GEMV territory and the tile starts at 9.
 //   - VKOP_COOP_I8=1 forces the W8A8 SINT8 cooperative-matrix path, which is
 //     otherwise gated off (ops/Matmul.hpp).
 //
 // Env: VKOP_COOP_I8=1 to enable the W8A8 coopmat arm. All other VKOP_* knobs
 // (VKOP_KSPLIT_Q, VKOP_KSPLIT_WIDE[_N]) apply as in the real op.
+// BENCH_DEV=<n> picks the physical device (default 0).
 //
 // Build (mirrors bench_matmul.cpp; libvkop carries no SPIR-V, so
 // -DVKOP_DEV_SHADER_ARCHIVE must point at build/vkop_shaders.bin):
@@ -67,7 +71,15 @@ int main(int argc, char **argv) {
         printf("no vulkan device\n");
         return 1;
     }
-    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    // BENCH_DEV picks the physical device (0 = first enumerated). This machine
+    // lists the AMD dGPU first and the Intel iGPU second.
+    const char *dev_env = std::getenv("BENCH_DEV");
+    const int dev_idx = dev_env ? std::atoi(dev_env) : 0;
+    if (dev_idx < 0 || dev_idx >= static_cast<int>(phydevs.size())) {
+        printf("no vulkan device %d\n", dev_idx);
+        return 1;
+    }
+    auto dev = std::make_shared<VulkanDevice>(phydevs[dev_idx]);
     printf("GPU: %s\n", dev->getDeviceName().c_str());
     auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
     auto queue = dev->getComputeQueue(0);

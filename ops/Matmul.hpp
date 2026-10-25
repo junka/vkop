@@ -742,16 +742,6 @@ class MatMulBuffer : public BufferFactory {
         // fallback instead: the tile stores half2 pairs, which an odd N cannot
         // express (see the odd-N note below).
         const bool tiled_ok_n = (n % 64 == 0) || (n % 8 == 0);
-        // The tile only takes shapes with at least one full TILE_M block, and
-        // that is a CORRECTNESS gate, not a perf one: a dispatch whose y extent
-        // is 1 (m <= 64, batch == 1) returns rows 1..m-1 as zero. Measured on
-        // ARL at K=6144 N=2048 for m=3/4/8 -- m-1 zero rows each, row 0 always
-        // correct -- with the geometry proven to be this kernel from the replay
-        // fingerprint (w=64 h=1, i.e. UP_DIV(m,64)=1), and it reproduces on
-        // both the coopmat-gated and the VKOP_NO_COOP arm. m >= 64 is what
-        // 27641fef actually exercised; everything under it now lands on the
-        // ksplit/fused path, which was the routing before that commit.
-        //
         // One shape class defeats the relaxed threshold: a weight row stride
         // that is a power of two of 64 KiB or more. The tile stages B at
         // TILE_N = 64 columns per row -- 64 bytes for a byte weight, 128 for
@@ -769,11 +759,46 @@ class MatMulBuffer : public BufferFactory {
         // construction; the one thing it gives up is fp16 at m = 8..11, where
         // the tile still wins (1.3x-1.8x) despite the stride penalty -- judged
         // not worth a second, dtype-specific threshold.
+        //
+        // Tile-vs-GEMV crossover, the calibration behind tiled_min_m. The
+        // tile computes a fixed 64-row block, so its time is flat in m while
+        // the split-K GEMV pays one extra weight pass per row. 560X and UHD630
+        // are bench_matmul / bench_matmul_i8 timings (min of 3, batch = 1);
+        // ARL values are the calibration those defaults came from.
+        //   device  dtype  K     N       GEMV/row  tile     crossover
+        //   ARL     byte   2048  6144    --        --       <= 2
+        //   ARL     fp16   2048  6144    --        --       <= 3
+        //   560X    byte   2048  6144    ~0.30 ms  2.46 ms  ~8
+        //   560X    byte   2048  151936  ~4.4 ms   64 ms    ~14
+        //   560X    fp16   2048  6144    ~0.65 ms  2.26 ms  ~4
+        //   560X    fp16   2048  151936  ~8.3 ms   48.3 ms  ~6
+        //   UHD630  byte   2048  6144    ~1.4 ms   21 ms    > 8
+        //   UHD630  byte   2048  151936  ~14.8 ms  500 ms   > 8
+        //   UHD630  fp16   2048  6144    ~1.1 ms   15 ms    > 8
+        //   UHD630  fp16   2048  151936  ~22.7 ms  360 ms   > 8
+        // The split-K GEMV only runs while batch*m <= 8, so a crossover past
+        // that is never reached: the 560X byte and both UHD630 profiles keep
+        // the GEMV for the whole window and start the tile at 9. 2 (byte) / 3
+        // (fp16) remain the defaults for ARL/Ada; the others are device
+        // profiles (VulkanDevice::MatmulTileProfile, keyed on vendor ID behind
+        // the MoltenVK driver ID). That only touches batch*m <= 8 decode and
+        // short prompts: the shipped Qwen prompt path runs m >= 8 (m = 9 at
+        // K=2048 N=6144: tile 3.75 ms vs the column-parallel 6.5 ms on the
+        // 560X) and stays tiled.
         const long long b_row_bytes =
             static_cast<long long>(n) * (weight_byte ? 1 : 2);
         const bool b_stride_pow2_big =
             b_row_bytes >= 65536 && (b_row_bytes & (b_row_bytes - 1)) == 0;
-        const int tiled_min_m = b_stride_pow2_big ? 12 : (weight_byte ? 2 : 3);
+        const VulkanDevice::MatmulTileProfile &tile_profile =
+            m_dev_->matmul_tile_profile();
+        const bool wide_band =
+            tile_profile.wide_n > 0 && n >= tile_profile.wide_n;
+        const int dtype_min_m = weight_byte
+                                    ? (wide_band ? tile_profile.byte_wide_min_m
+                                                 : tile_profile.byte_min_m)
+                                    : (wide_band ? tile_profile.fp16_wide_min_m
+                                                 : tile_profile.fp16_min_m);
+        const int tiled_min_m = b_stride_pow2_big ? 12 : dtype_min_m;
         // `m % 64 == 0` is NOT required: the zero-rows failure the previous
         // revision gated around came from the ksplit flag leaking into the tile
         // dispatch (see para_.ksplit below), not from partial M. The tile

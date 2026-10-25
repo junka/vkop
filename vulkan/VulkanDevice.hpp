@@ -171,6 +171,25 @@ class VulkanDevice {
     uint32_t coopmat_supported_stages() const {
         return m_coopmat_supported_stages_;
     }
+    // MatMul tile-vs-GEMV crossover, per device. The shared-memory tile runs a
+    // fixed TILE_M = 64 row block, so its cost is flat in m while the split-K
+    // GEMV pays one full weight pass per output row; the m at which they cross
+    // depends on the shader compiler and memory system, not on the shape.
+    // byte_min_m / fp16_min_m default to the ARL iGPU / RTX 4000 Ada
+    // calibration. wide_n selects a second band for weights whose row pass is
+    // DRAM-bound (large N), where the GEMV's per-row re-read degrades and the
+    // tile wins at a larger m; 0 disables the band. The power-of-two >= 64 KiB
+    // row-stride override in Matmul still takes precedence over both.
+    struct MatmulTileProfile {
+        int byte_min_m = 2;
+        int fp16_min_m = 3;
+        int wide_n = 0;
+        int byte_wide_min_m = 2;
+        int fp16_wide_min_m = 3;
+    };
+    const MatmulTileProfile &matmul_tile_profile() const {
+        return matmul_tile_profile_;
+    }
 #ifdef VK_KHR_cooperative_matrix
     const std::vector<VkCooperativeMatrixPropertiesKHR> &
     getCooperativeMatrixProperties() const {
@@ -253,6 +272,8 @@ class VulkanDevice {
     bool m_support_nv_tensor_core_ = false;
     bool m_support_cooperate_matrix_ = false;
     uint32_t m_coopmat_supported_stages_ = 0;
+    // Filled by getProperties() from driverID/vendorID; see MatmulTileProfile.
+    MatmulTileProfile matmul_tile_profile_;
     bool m_support_descriptor_update_after_bind_ = false;
 
 #ifdef VK_EXT_subgroup_size_control

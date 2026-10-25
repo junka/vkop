@@ -154,6 +154,72 @@ N=16384 下 q=32/64/128 三个 pin 得到同一个数，就是这个原因。
 实机验证（12 token）：输出逐 token 一致；`MatMul` 单测 18 项全过。fp16 WIDE 分支的下限
 仍是 32（未动，实测 N=16384 已到 72.7 GB/s，不受此问题影响）。
 
+### tile vs GEMV 交叉点（`tiled_min_m` profile 标定）
+
+2026-10-25 实测（本机双卡：AMD Radeon Pro 560X `BENCH_DEV=0`、Intel UHD
+Graphics 630 `BENCH_DEV=1`，均 MoltenVK x86_64，`VKOP_NO_COOP=1`；
+`bench_matmul` / `bench_matmul_i8`，每个点 3 轮取最小，单轮仍是平均值，
+本机 run-to-run 抖动可达 30–50%，改阈值前应按同一口径复测）。tile 一次固定
+算满 `TILE_M=64` 行，所以 m 方向耗时平坦；split-K GEMV 每多一行多流一遍权重。
+split-K 只在 `batch*m <= 8` 时启用，这条窗口决定了阈值的上限：
+
+| 设备 | 权重 | K | N | GEMV 每行 | tile | 交叉点 |
+|---|---|---|---|---|---|---|
+| 560X | int8 | 2048 | 6144 | ~0.30 ms | 2.46 ms | ≈8 |
+| 560X | int8 | 2048 | 151936 | ~4.4 ms | 64 ms | ≈14（超出窗口） |
+| 560X | fp16 | 2048 | 6144 | ~0.65 ms | 2.26 ms | ≈4 |
+| 560X | fp16 | 2048 | 151936 | ~8.3 ms | 48.3 ms | ≈6 |
+| UHD630 | int8 | 2048 | 6144 | ~1.4 ms | 21 ms | > 8 |
+| UHD630 | int8 | 2048 | 151936 | ~14.8 ms | 500 ms | > 8 |
+| UHD630 | fp16 | 2048 | 6144 | ~1.1 ms | 15 ms | > 8 |
+| UHD630 | fp16 | 2048 | 151936 | ~22.7 ms | 360 ms | > 8 |
+
+- 560X int8 在窗口内一直是 GEMV 更快：m=8、N=6144 时 2.43 vs tile 2.46（持平），
+  N=151936 时 36 vs 64 ms（1.8x）；交叉点 ≈14 已越过窗口，取不到。所以
+  `byte_min_m = byte_wide_min_m = 9`——GEMV 吃满 `batch*m <= 8`，tile 从 9 开始。
+- 560X fp16 每行权重是双倍字节，交叉点落在窗口内：m=4、N=6144 时 GEMV 2.99 vs
+  tile 2.26；m=6、N=151936 时 49.7 vs 48.4。`wide_n=65536` 切出 lm_head 这一档。
+- UHD630 的 MSL tile 更差，两个 dtype 的交叉点都在窗口外：int8 m=8 时 GEMV
+  10.3 ms vs tile 21.2 ms（N=6144，2x）、119 vs 508（N=151936，4.3x）；
+  fp16 m=8 时 7.95 vs 15（2x）、173 vs 366（2.1x）。所以
+  `byte_min_m = fp16_min_m = 9`、`wide_n=0`（不需要分档）。
+- 窗口外（m ≥ 9）GEMV 不再可用，退化为 column-parallel：560X int8 N=6144
+  6.8 ms、N=151936 135 ms，fp16 5.7 / 134 ms，都明显慢于 tile，所以 tile
+  必须从 9 接上。UHD630 上 fp16 同样是 tile 更快（26/645 vs 15/360），int8
+  N=6144 两者相当（22 vs 21），N=151936 column-parallel 略快（393 vs 500，
+  m=9..11 段）——按 dtype 统一取 9，不做第二档。
+- 阈值来自 `VulkanDevice::MatmulTileProfile`：`driverID == MOLTENVK` 且
+  `vendorID == 0x1002`（AMD）套用上表 560X 值 `byte_min_m=9`、`fp16_min_m=4`、
+  `wide_n=65536`（`byte_wide_min_m=9`、`fp16_wide_min_m=6`）；`vendorID ==
+  0x8086`（Intel）套用 `byte_min_m=9`、`fp16_min_m=9`、`wide_n=0`。ARL/Ada
+  保持默认 `2`/`3`、`wide_n=0`。power-of-two ≥ 64 KiB 行 stride
+  （fp16 N=32768/65536/131072、byte N=65536/131072）仍优先走 12，profile
+  不覆盖该分支。
+- e2e 不受影响：int8、prompt m≈9 时 N=6144 的 tile 3.75 ms 对 column-parallel
+  6.5 ms，lm_head 走 tile；变的是 `batch*m <= 8` 的 decode 与极短 prompt。
+- 同机 coop 不可用：M=16 时加不加 `VKOP_NO_COOP=1` 都是 2.597 ms（走 tile），
+  因此 `8aea65f` 的 coop 几何选择在本机不派发；`matmul_coop16` /
+  `matmul_coop_i8` 只是随包占字节。
+- 复现（已按 HEAD 重编 libvkop + archive + 两个 bench）。`BENCH_DEV` 选卡，
+  窗口内 GEMV 与窗口外 tile 各一条，N=151936 用 reps=8 控制耗时：
+
+```bash
+export DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib \
+  VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json VKOP_NO_COOP=1
+
+# 560X：GEMV ~2.33 ms / tile ~2.3 ms
+BENCH_M=3 BENCH_DEV=0 ./build/bench_matmul 2048 6144 30
+BENCH_M=4 BENCH_DEV=0 ./build/bench_matmul 2048 6144 30
+
+# UHD630：同一形状，GEMV ~7.9 ms / tile ~15 ms
+BENCH_M=8 BENCH_DEV=1 ./build/bench_matmul 2048 6144 20
+BENCH_M=9 BENCH_DEV=1 ./build/bench_matmul 2048 6144 20
+
+# int8 lm_head：560X m=8 GEMV ~35 ms，UHD630 m=8 GEMV ~119 ms
+./build/bench_matmul_i8 8 2048 151936 8
+BENCH_DEV=1 ./build/bench_matmul_i8 8 2048 151936 5
+```
+
 ## 跨 GPU 参考数据（resnet，100 轮平均）
 
 | GPU | Model | Operators |Precision | latency (ms) |

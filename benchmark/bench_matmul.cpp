@@ -23,6 +23,7 @@
 //   VKOP_NO_COOP=1 ./build/bench_matmul
 //
 // Env: VKOP_NO_COOP=1 on MoltenVK (16x16 coopmat tiles cannot compile to MSL).
+//      BENCH_DEV=<n> picks the physical device (default 0).
 //      BENCH_INT8=1 swaps B for a byte int8 weight + a per-column fp32 scale,
 //      which is the only way to exercise the byte WIDE (16 cols/lane) GEMV
 //      without a whole quantized model on disk.
@@ -85,7 +86,15 @@ int main(int argc, char **argv) {
         printf("no vulkan device\n");
         return 1;
     }
-    auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
+    // BENCH_DEV picks the physical device (0 = first enumerated). This machine
+    // lists the AMD dGPU first and the Intel iGPU second.
+    const char *dev_env = std::getenv("BENCH_DEV");
+    const int dev_idx = dev_env ? std::atoi(dev_env) : 0;
+    if (dev_idx < 0 || dev_idx >= static_cast<int>(phydevs.size())) {
+        printf("no vulkan device %d\n", dev_idx);
+        return 1;
+    }
+    auto dev = std::make_shared<VulkanDevice>(phydevs[dev_idx]);
     printf("GPU: %s\n", dev->getDeviceName().c_str());
     auto cmdpool = std::make_shared<VulkanCommandPool>(dev);
     auto queue = dev->getComputeQueue(0);
