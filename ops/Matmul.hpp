@@ -806,7 +806,25 @@ class MatMulBuffer : public BufferFactory {
                                                  : tile_profile.byte_min_m)
                                     : (wide_band ? tile_profile.fp16_wide_min_m
                                                  : tile_profile.fp16_min_m);
-        const int tiled_min_m = b_stride_pow2_big ? 12 : dtype_min_m;
+        // L2-resident fp16 weights (<= ~32 MB on the RTX 4000 Ada class): the
+        // ksplit GEMV's per-row weight read never leaves L2, so it beats both
+        // the flat-cost tile (down K=6144 N=2048 m=3: 0.068 vs 0.334 ms;
+        // gate/up m=3: 0.062 vs 0.211) and the coopmat tile (0.068 vs 0.212)
+        // across the whole batch*m <= 8 window. Raise the fp16 floor there so
+        // the tile does not intercept that window; DRAM-bound weights keep the
+        // calibrated floor (the tile's single weight pass wins from m=3:
+        // lm_head m=3 tiled 4.38 vs ksplit 4.52). 16x16x16 devices only: ARL's
+        // calibrated fp16 floor of 3 is measured against its own cache and
+        // must not move.
+        const bool coop16_dev = coop_bm_ >= 32;
+        const bool l2_resident =
+            static_cast<long long>(k) * b_row_bytes <= (32LL << 20);
+        const int tiled_min_m =
+            b_stride_pow2_big
+                ? 12
+                : (weight_byte
+                       ? dtype_min_m
+                       : ((coop16_dev && l2_resident) ? 12 : dtype_min_m));
         // `m % 64 == 0` is NOT required: the zero-rows failure the previous
         // revision gated around came from the ksplit flag leaking into the tile
         // dispatch (see para_.ksplit below), not from partial M. The tile
@@ -878,7 +896,27 @@ class MatMulBuffer : public BufferFactory {
             // anything the tile refuses (odd N, k%16!=0, N%8!=0). On a 16x16x16
             // device (coop_bm_ == 32: RTX 4000 Ada) coop wins 1.04-1.13x at
             // every M and the gate is deliberately left untouched.
-            (coop_bm_ < 32 ? (batch * m > 8 && (m < 64 || !tiled)) : (m >= 8));
+            // Ada/16x16x16 arm, measured on a RTX 4000 Ada across all four
+            // Qwen GEMM shapes at m=1..8 (ms, min of 15):
+            //   shape                bytes   tiled      coopmat    ksplit
+            //   qkv    2048->2048       8M  0.12-0.13  0.080-0.081  0.030-0.066
+            //   gate/up 2048->6144     25M  0.211      0.117-0.120  0.046-0.138
+            //   down   6144->2048      25M  0.334-0.337 0.203-0.213 0.054-0.164
+            //   lm_head 2048->151936  622M  4.38-4.41  1.94-2.01    3.26-12.5
+            // L2-resident weights: ksplit wins the window (its per-row weight
+            // read stays in cache) except where the coopmat grid fills >=
+            // kCoopMinWaves workgroups (gate/up m=8: 96 wgs, coopmat 0.118 vs
+            // ksplit 0.138; down/qkv sit at 32 wgs and keep ksplit).
+            // DRAM-bound weights: coopmat's single weight pass wins from m=2
+            // (the 32-row workgroup pads m=2..7 for free). Past the ksplit
+            // window (batch*m > 8) coopmat always wins on this device class
+            // (1.04-1.13x over the tile at every M), so take it
+            // unconditionally.
+            (coop_bm_ < 32 ? (batch * m > 8 && (m < 64 || !tiled))
+                           : (batch * m > 8 || (m >= 2 && !l2_resident) ||
+                              (m >= 8 && UP_DIV(n, coop_bn_) *
+                                                 UP_DIV(m, coop_bm_) * batch >=
+                                             kCoopMinWaves)));
         // W8A8 sibling of the path above: an int8 weight with an int8
         // activation the kernel quantizes itself (per output row), accumulated
         // by the 8x8x32 SINT8 subgroup MMA. Unlike coopmat it does not exclude
