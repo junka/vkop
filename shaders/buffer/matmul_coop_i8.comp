@@ -80,6 +80,32 @@ layout(push_constant) uniform PC {
     int batch;
     int fp32;   // unused (this kernel is fp16-out); kept for PC compat
     int transB; // unused (the gate requires transB == 0); kept for PC compat
+    // Tail of the host's GpuMatMulParam, declared so the offsets below match
+    // it exactly and only b_shared is read; see matmul.comp / ops/Matmul.hpp
+    // for what each field means.
+    int tile;
+    int weight_int8;
+    int w8_quad;
+    int ksplit;
+    int ksplit_q;
+    int w4;
+    int nf4;
+    int group;
+    int fp8;
+    int fp8_e5m2;
+    int nvfp4;
+    int uint4;
+    int wide;
+    int rep;
+    int rep_stride;
+    int a_dim;
+    int b_dim;
+    float epi_scale;
+    int epi_bias;
+    int epi_bias_batch;
+    int attn_softmax;
+    int b_shared; // 1 = B is broadcast over the batch axes: B's slice index
+                  // folds to 0 (a [K, N] weight shared by every output slice)
 } uPC;
 
 // Cooperative-matrix tile and subgroup grid. -DCM/-DCN/-DCK let one source
@@ -165,7 +191,7 @@ void main() {
     int K = uPC.K;
 
     int a_base = b * M * K; // A[batch] in elements
-    int b_base = b * K * N; // B[batch] in bytes
+    int b_base = (uPC.b_shared != 0) ? 0 : b * K * N; // B[batch] in bytes
 
     // ---- Phase 1: per-row amax of A over the full K -----------------------
     if (tid < uint(BM)) {

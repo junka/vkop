@@ -120,6 +120,15 @@ struct alignas(16) GpuMatMulParam {
     // only raises this on attention QK^T (small M, even N, single-consumer).
     // Buffer path only; requires the softmax workgroup to cover a full row.
     int attn_softmax = 0;
+    // 1 = B is broadcast over the batch axes: a [K, N] weight (or one whose
+    // leading dims are all 1) shared by every output slice, so B's slice index
+    // folds to 0 regardless of the flat batch. The buffer kernels fold it in
+    // bmap()'s early-out and the coop shaders at their B base; without it they
+    // would index b * K * N past the weight for every batch >= 1 workgroup.
+    // Sits at the struct tail (offset 108): sizeof stays 112 after the
+    // alignas(16) rounding, so the pushed range is unchanged for archives
+    // whose shaders do not read it. Buffer path only.
+    int b_shared = 0;
 };
 
 } // namespace matmul
@@ -539,6 +548,7 @@ class MatMulBuffer : public BufferFactory {
         int rep_stride = 1;
         int a_dim = 0;
         int b_dim = 0;
+        int b_shared = 0;
         int grouped_axis = -1;
         bool grouped_ok = !weight_byte && !weight_4bit;
         for (int i = 0; i < lead; ++i) {
@@ -565,30 +575,24 @@ class MatMulBuffer : public BufferFactory {
         } else if (batch > 1) {
             // Broadcast B (every leading dim of B is 1, or B has no leading
             // dims at all -- the plain 2-D weight): all `batch` output slices
-            // read the SAME weight, but the buffer kernels map B's slice as
-            // bmap(flat_batch) * K * N, which for batch index >= 1 walks off
-            // the [K, N] weight into whatever follows it (a fresh buffer
-            // reads zeros; in the unified weight region it reads the next
-            // tensor's bytes) and every batch >= 1 output row comes out
-            // wrong. Express the shared weight as the degenerate grouped
-            // axis of this same machinery -- one leading axis where A
-            // carries `batch` consecutive "copies" of B's single slice -- so
-            // bmap() folds every flat batch index to slice 0. No kernel
-            // change: with rep_stride = 1 and b_dim = 1 the decomposition
-            // collapses to 0 for any n < batch, and rep <= 1 (the only form
-            // every existing graph sees) stays the identity. rep > 1 also
-            // excludes the coop shaders (they have no bmap), which for this
-            // case only moves a wrong coopmat answer to the correct
-            // ksplit/tiled one.
+            // read the SAME weight, but the kernels map B's slice as
+            // bmap(flat_batch) * K * N (buffer) / b * K * N (coop), which for
+            // batch index >= 1 walks off the [K, N] weight into whatever
+            // follows it (a fresh buffer reads zeros; in the unified weight
+            // region it reads the next tensor's bytes) and every batch >= 1
+            // output row comes out wrong. b_shared folds B's slice index to 0
+            // in every kernel -- bmap()'s early-out on the buffer path, the B
+            // base check in the coop shaders. Unlike the grouped axis above
+            // it moves no addressing but B's slice base, so the rep fields
+            // stay at their defaults and the coopmat gates (rep == 1) stay
+            // open: a shared weight takes the same route a per-batch 3-D B
+            // would, instead of being pushed off coopmat.
             long long b_flat_batch = 1;
             for (int i = 0; i < lead_b; ++i) {
                 b_flat_batch *= b_eff[i];
             }
             if (b_flat_batch == 1) {
-                rep = batch;
-                rep_stride = 1;
-                a_dim = batch;
-                b_dim = 1;
+                b_shared = 1;
             }
         }
 
@@ -1094,6 +1098,7 @@ class MatMulBuffer : public BufferFactory {
         para_.rep_stride = rep_stride;
         para_.a_dim = a_dim;
         para_.b_dim = b_dim;
+        para_.b_shared = b_shared;
         para_.epi_scale = epi_scale_;
         para_.epi_bias = epi_bias_ ? 1 : 0;
         // The bias is [B,1,q,kv] broadcast over the head axis, so its element

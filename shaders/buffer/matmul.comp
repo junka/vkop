@@ -164,14 +164,17 @@ layout(push_constant) uniform PC {
                       // and store exp(x-max)/sum directly. The host gates this
                       // on epi_bias && M small (decode) and routes a dedicated
                       // one-workgroup-per-row kernel.
+    int b_shared; // 1 = B is broadcast over the batch axes (a [K, N] weight
+                  // shared by every output slice): bmap() folds B's slice
+                  // index to 0. See GpuMatMulParam.
 } uPC;
 
 // A flat batch index -> B's slice, when the host detected a grouped leading
 // axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
 // consecutively (repeat_kv interleave), and any outer leading axes are shared.
-// The degenerate form (rep_stride = 1, b_dim = 1, a_dim = rep = batch) is the
-// fully broadcast B -- a 2-D weight shared by every output slice -- where the
-// fold below collapses to 0 for every n.
+// A fully broadcast B (a [K, N] weight shared by every output slice) is not a
+// grouped axis at all -- the host raises uPC.b_shared instead, and the
+// early-out below folds B's slice index to 0 for every n.
 // Decomposing n over A's leading dims gives n = prefix*(rep*rep_stride*b_dim)
 // + h*rep_stride + tail, and B's slice is prefix*(rep_stride*b_dim) +
 // (h/rep)*rep_stride + tail; the two divisions below fold that out of (n, the
@@ -179,6 +182,9 @@ layout(push_constant) uniform PC {
 // the early return is what keeps a_span = 0 out of the div/mod when the host
 // leaves the grouped fields unset.
 int bmap(int n) {
+    if (uPC.b_shared != 0) {
+        return 0;
+    }
     if (uPC.rep <= 1) {
         return n;
     }

@@ -68,6 +68,32 @@ layout(push_constant) uniform PC {
     int batch;
     int fp32;   // unused here (this shader is fp16-in only); kept for PC compat
     int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
+    // Tail of the host's GpuMatMulParam, declared so the offsets below match
+    // it exactly and only b_shared is read; see matmul.comp / ops/Matmul.hpp
+    // for what each field means.
+    int tile;
+    int weight_int8;
+    int w8_quad;
+    int ksplit;
+    int ksplit_q;
+    int w4;
+    int nf4;
+    int group;
+    int fp8;
+    int fp8_e5m2;
+    int nvfp4;
+    int uint4;
+    int wide;
+    int rep;
+    int rep_stride;
+    int a_dim;
+    int b_dim;
+    float epi_scale;
+    int epi_bias;
+    int epi_bias_batch;
+    int attn_softmax;
+    int b_shared; // 1 = B is broadcast over the batch axes: B's slice index
+                  // folds to 0 (a [K, N] weight shared by every output slice)
 } uPC;
 
 const int M_BLOCK = 8;
@@ -107,7 +133,7 @@ void main() {
     int K = uPC.K;
 
     int a_base = b * M * K; // A[batch, :, :]
-    int b_base = b * K * N; // B[batch, :, :] (row-major K x N)
+    int b_base = (uPC.b_shared != 0) ? 0 : b * K * N; // B[batch, :, :] (row-major K x N)
 
     coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
              gl_MatrixUseAccumulator>
