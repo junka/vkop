@@ -83,7 +83,7 @@ private:
 #ifdef _WIN32
         localtime_s(&time_local, &time_now);
 #else
-        localtime_r(&time_local, &time_now);
+        localtime_r(&time_now, &time_local);
 #endif
         std::strftime(time_str, sizeof(time_str), "%Y-%m-%d %H:%M:%S", &time_local);
 

@@ -279,8 +279,6 @@ uint32_t VulkanDevice::findComputeQueueFamily() {
         physicalDevice_, &queue_family_count, queue_families.data());
 
     const VkQueueFlags first = VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
-    const VkQueueFlags video = VK_QUEUE_VIDEO_DECODE_BIT_KHR |
-                               VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
     const VkQueueFlags second =
         VK_QUEUE_GRAPHICS_BIT | VK_QUEUE_COMPUTE_BIT | VK_QUEUE_TRANSFER_BIT;
 
@@ -448,7 +446,6 @@ void VulkanDevice::checkImageFormatSupport() {
     formatProperties2.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2;
     formatProperties2.pNext = &formatProperties3;
 
-    VkFormatProperties fmprops;
     vkGetPhysicalDeviceFormatProperties2(
         physicalDevice_, VK_FORMAT_R32G32B32A32_SFLOAT, &formatProperties2);
     assert(formatProperties2.formatProperties.bufferFeatures &
@@ -1212,7 +1209,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     if (deviceProperties.apiVersion < VK_API_VERSION_1_4 &&
         supportedExtensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) > 0) {
         descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES,
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR,
             .extensionName = VK_KHR_MAINTENANCE_5_EXTENSION_NAME,
             .corePromotedVersion = VK_API_VERSION_1_4,
             .makeQueryStruct = [this]() -> std::shared_ptr<void> {
@@ -1220,7 +1218,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
                 *q = makeFeatureStruct<
                     VkPhysicalDeviceMaintenance5FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES>();
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR>();
                 return std::shared_ptr<void>(std::move(q));
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
@@ -1232,7 +1230,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     std::make_unique<VkPhysicalDeviceMaintenance5FeaturesKHR>();
                 *e = makeFeatureStruct<
                     VkPhysicalDeviceMaintenance5FeaturesKHR,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES>();
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR>();
                 e->maintenance5 = feat->maintenance5;
                 return std::shared_ptr<void>(std::move(e));
             }});
@@ -1355,7 +1353,7 @@ bool VulkanDevice::createLogicalDevice(
         probe_info.tiling = VK_IMAGE_TILING_OPTIMAL;
         probe_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT |
                            VK_IMAGE_USAGE_STORAGE_BIT |
-                           VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+                           VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         probe_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VkImage probe_image = VK_NULL_HANDLE;

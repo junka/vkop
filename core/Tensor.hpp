@@ -1103,7 +1103,7 @@ template <typename T> class Tensor : public ITensor {
                    bool unorm = false, bool readonly = false) {
         uint32_t flags = VK_IMAGE_USAGE_SAMPLED_BIT;
         if (vd->is_support_host_image_copy()) {
-            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         } else {
             flags |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
         }
@@ -1141,7 +1141,7 @@ template <typename T> class Tensor : public ITensor {
         auto flags = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
 
         if (vd->is_support_host_image_copy()) {
-            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT;
+            flags |= VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT;
         } else {
             flags |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                      VK_IMAGE_USAGE_TRANSFER_DST_BIT;
