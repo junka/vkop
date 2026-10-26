@@ -562,6 +562,34 @@ class MatMulBuffer : public BufferFactory {
             for (int i = grouped_axis + 1; i < lead; ++i) {
                 rep_stride *= lead_shape[i];
             }
+        } else if (batch > 1) {
+            // Broadcast B (every leading dim of B is 1, or B has no leading
+            // dims at all -- the plain 2-D weight): all `batch` output slices
+            // read the SAME weight, but the buffer kernels map B's slice as
+            // bmap(flat_batch) * K * N, which for batch index >= 1 walks off
+            // the [K, N] weight into whatever follows it (a fresh buffer
+            // reads zeros; in the unified weight region it reads the next
+            // tensor's bytes) and every batch >= 1 output row comes out
+            // wrong. Express the shared weight as the degenerate grouped
+            // axis of this same machinery -- one leading axis where A
+            // carries `batch` consecutive "copies" of B's single slice -- so
+            // bmap() folds every flat batch index to slice 0. No kernel
+            // change: with rep_stride = 1 and b_dim = 1 the decomposition
+            // collapses to 0 for any n < batch, and rep <= 1 (the only form
+            // every existing graph sees) stays the identity. rep > 1 also
+            // excludes the coop shaders (they have no bmap), which for this
+            // case only moves a wrong coopmat answer to the correct
+            // ksplit/tiled one.
+            long long b_flat_batch = 1;
+            for (int i = 0; i < lead_b; ++i) {
+                b_flat_batch *= b_eff[i];
+            }
+            if (b_flat_batch == 1) {
+                rep = batch;
+                rep_stride = 1;
+                a_dim = batch;
+                b_dim = 1;
+            }
         }
 
         // ONNX drops the output dim contributed by a rank-1 operand; when both
@@ -936,7 +964,11 @@ class MatMulBuffer : public BufferFactory {
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
         const bool coopmat_i8 = coop_i8_enabled && fp16_ != 0 && weight_int8 &&
-                                !transB_ && (n % 8 == 0) &&
+                                // matmul_coop_i8.comp has no bmap (same as
+                                // the fp16 coop shaders), so a grouped or
+                                // broadcast-B batch mapping would be read as
+                                // a per-batch B: exclude like the fp16 gate.
+                                rep == 1 && !transB_ && (n % 8 == 0) &&
                                 m_dev_->is_support_cooperate_matrix() &&
                                 coop_i8_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on

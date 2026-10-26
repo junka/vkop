@@ -169,6 +169,9 @@ layout(push_constant) uniform PC {
 // A flat batch index -> B's slice, when the host detected a grouped leading
 // axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
 // consecutively (repeat_kv interleave), and any outer leading axes are shared.
+// The degenerate form (rep_stride = 1, b_dim = 1, a_dim = rep = batch) is the
+// fully broadcast B -- a 2-D weight shared by every output slice -- where the
+// fold below collapses to 0 for every n.
 // Decomposing n over A's leading dims gives n = prefix*(rep*rep_stride*b_dim)
 // + h*rep_stride + tail, and B's slice is prefix*(rep_stride*b_dim) +
 // (h/rep)*rep_stride + tail; the two divisions below fold that out of (n, the
@@ -411,7 +414,7 @@ void matmul16_w8_quad() {
     int a_off = (n * uPC.M + i) * uPC.K;
     // N % 4 == 0 makes every row start 4-aligned, so (k*N + ja) is 4-aligned for
     // every k: the quad needs no per-tap alignment test.
-    int b_row = n * uPC.K * uPC.N + ja;
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
 
     vec4 wsc = vec4(uintBitsToFloat(uScale.data[ja]),
                     uintBitsToFloat(uScale.data[ja + 1]),
@@ -461,7 +464,7 @@ void matmul16_w4_quad() {
     if (n >= uPC.batch) return;
 
     int a_off = (n * uPC.M + i) * uPC.K;
-    int b_row = n * uPC.K * uPC.N + ja;
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
     int nib = ja & 7; // 0 or 4, fixed along K
 
     vec4 s = vec4(0.0);
@@ -582,7 +585,7 @@ void matmul16_w8_ksplit() {
     int ja = (int(gl_WorkGroupID.x) * q + quad) * 4;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
-    int b_row = n * uPC.K * uPC.N + ja;
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
 
     int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
     int slice = lane / q;
@@ -642,7 +645,7 @@ void matmul16_w4_ksplit() {
     int ja = (int(gl_WorkGroupID.x) * 16 + int(gl_LocalInvocationID.x)) * 4;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
-    int b_row = n * uPC.K * uPC.N + ja;
+    int b_row = bmap(n) * uPC.K * uPC.N + ja;
     int nib = ja & 7;
 
     int ngroups = uPC.K / uPC.group;
@@ -924,7 +927,7 @@ void matmul16_w8_ksplit_wide() {
     int ja = (int(gl_WorkGroupID.x) * q + oct) * 16;
     int n = row / uPC.M;
     int a_off = row * uPC.K;
-    int b_base = n * uPC.K * uPC.N + ja;
+    int b_base = bmap(n) * uPC.K * uPC.N + ja;
 
     int chunk = ((uPC.K + n_slice - 1) / n_slice + 1) & ~1;
     int slice = lane / q;
@@ -1003,7 +1006,7 @@ void matmul16_w8_even_n() {
 
     int a_off = (n * uPC.M + i) * uPC.K;
     int jb = ja + 1;
-    int b_base = n * uPC.K * uPC.N;
+    int b_base = bmap(n) * uPC.K * uPC.N;
     int b_step = (uPC.transB != 0) ? 1 : uPC.N;
     int b0 = (uPC.transB != 0) ? (b_base + ja * uPC.K) : (b_base + ja);
     int b1 = (uPC.transB != 0) ? (b_base + jb * uPC.K) : (b_base + jb);
@@ -1580,7 +1583,7 @@ void matmul_w8() {
 
     float wsc = uintBitsToFloat(uScale.data[j]);
     int a_base = n * uPC.M * uPC.K;
-    int b_base = n * uPC.K * uPC.N;
+    int b_base = bmap(n) * uPC.K * uPC.N;
 
     float sum = 0.0;
     for (int k = 0; k < uPC.K; ++k) {
@@ -1605,7 +1608,7 @@ void matmul_w4() {
     if (n >= uPC.batch) return;
 
     int a_base = n * uPC.M * uPC.K;
-    int b_base = n * uPC.K * uPC.N;
+    int b_base = bmap(n) * uPC.K * uPC.N;
     int ngroups = uPC.K / uPC.group;
 
     float total = 0.0;
