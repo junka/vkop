@@ -81,6 +81,12 @@ class PimplFacade : public Operator {
     void set_prof_query(VkQueryPool pool, uint32_t base) override {
         impl_->set_prof_query(pool, base);
     }
+    // Same forwarding trap as dump_fingerprint: the hook is read by the
+    // impl_ that actually dispatches, so installing it on the façade would
+    // leave the impl's copy null and silently profile nothing.
+    void set_bind_prof_hook(BindProfHook hook) override {
+        impl_->set_bind_prof_hook(std::move(hook));
+    }
     void
     set_graph_cmd(const std::shared_ptr<VulkanCommandBuffer> &cmd) override {
         impl_->set_graph_cmd(cmd);

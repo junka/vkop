@@ -38,6 +38,13 @@ Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
       cache_dir_(std::move(cache_dir)) {}
 
 Runtime::~Runtime() {
+    // The per-round weight-residency report is emitted here, on destruction,
+    // rather than inside Run(): a real driver (llm_chat) re-enters Run() once
+    // per token, and printing 2800 rows after every round would drown the
+    // output. The counts themselves are folded per round
+    // (weight_prof_finish_round), so by the time the Runtime goes away the
+    // totals cover the whole session.
+    weight_prof_report();
     if (pipeline_cache_ != VK_NULL_HANDLE) {
         auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
         vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
@@ -1524,6 +1531,119 @@ void Runtime::LoadModel() {
     // Persist a name->tensor view of every named tensor for post-Run
     // inspection (driver dumps intermediates to diagnose NaN propagation).
     tensor_map_ = tensor_map;
+
+    // Weight-residency hit-rate profiling (VKOP_WEIGHT_PROF=1). Observation
+    // only — no behaviour change, no extra GPU work. Snapshot the resident
+    // initializer table, then install a bind hook on every MatMul so the
+    // weight operand is resolved back to its initializer by pointer identity
+    // each time it is bound. Every MatMul's B (or, for a transposed weight,
+    // still B) is the weight; A is an activation and can never match an
+    // initializer, so the comparison is safe and miss-biased (a weight that
+    // went through a wrapper object simply isn't counted).
+    weight_prof_ = std::getenv("VKOP_WEIGHT_PROF") != nullptr;
+    if (weight_prof_) {
+        weight_prof_resident_.clear();
+        weight_prof_consumers_ = consumers;
+        for (const auto &kv : initializers_) {
+            const auto &t = kv.second;
+            if (!t || !t->gpu_resource()) {
+                continue;
+            }
+            weight_prof_resident_.push_back(
+                {kv.first, static_cast<size_t>(t->size())});
+        }
+        std::sort(
+            weight_prof_resident_.begin(), weight_prof_resident_.end(),
+            [](const auto &a, const auto &b) { return a.second > b.second; });
+        if (weight_prof_resident_.empty()) {
+            // GetTensor already merged the initializer and tensor-map paths, so
+            // an empty resident table here means profiling cannot attribute
+            // anything; say so rather than print a misleading all-NEVER table.
+            fprintf(stderr, "[weightprof] no resident initializers found; "
+                            "profiling disabled\n");
+            weight_prof_ = false;
+        }
+    }
+    if (weight_prof_) {
+        // Map every initializer's GPU buffer to its name once, so the hook (an
+        // op binding the weight operand) can resolve a bound buffer back to the
+        // initializer that owns it.
+        //
+        // The key is the underlying VkBuffer HANDLE, not the VulkanResource
+        // pointer: bind_ssbo() goes through Tensor::as_storage_buffer(), which
+        // hands back the tensor's own vkobj_ — but a tensor whose buffer the
+        // shape pool recycled for another node can be holding a buffer object
+        // created later than load time, while the handle stays the same. A
+        // VulkanResource* key silently misses those (that is exactly what made
+        // an early run report 100% NEVER). A resource may legitimately back two
+        // initializers (alias_storage_buffer shares one VkBuffer), and then
+        // either name counts — the bytes are read regardless, which is the
+        // question being asked.
+        auto name_by_buffer =
+            std::make_shared<std::unordered_map<VkBuffer, std::string>>();
+        auto name_by_resource = std::make_shared<
+            std::unordered_map<const VulkanResource *, std::string>>();
+        for (const auto &kv : initializers_) {
+            const auto &t = kv.second;
+            if (!t) {
+                continue;
+            }
+            auto *r = t->gpu_resource();
+            if (!r) {
+                continue;
+            }
+            name_by_resource->emplace(r, kv.first);
+            if (r->getResourceType() == ResourceType::VK_BUFFER) {
+                auto *b = static_cast<const VulkanBuffer *>(r);
+                if (b->getBuffer() != VK_NULL_HANDLE) {
+                    name_by_buffer->emplace(b->getBuffer(), kv.first);
+                }
+            }
+        }
+        for (size_t i = 0; i < node_ops_.size(); ++i) {
+            auto *op = node_ops_[i].get();
+            if (!op || op->get_type() != vkop::ops::OpType::MATMUL) {
+                continue;
+            }
+            // MatMul binds, in order: output[0], A[1] (the activation), B[2]
+            // (the weight), then the scratch/dummy/dequant-scaling operands
+            // appended below. The hook fires once positions 0..2 are bound and
+            // before anything else is, so objs_ is exactly [output, A, B] and
+            // index 2 is unambiguously the weight. A null or absent entry
+            // contributes nothing.
+            auto *self = this;
+            op->set_bind_prof_hook(
+                [self, name_by_buffer, name_by_resource](
+                    const std::vector<std::shared_ptr<VulkanResource>> &objs) {
+                    if (objs.size() <= 2 || !objs[2]) {
+                        return;
+                    }
+                    const auto *r = objs[2].get();
+                    // Prefer the buffer handle (stable across object churn);
+                    // fall back to resource identity for a non-buffer resource.
+                    std::string name;
+                    if (r->getResourceType() == ResourceType::VK_BUFFER) {
+                        auto *b = static_cast<const VulkanBuffer *>(r);
+                        if (b->getBuffer() != VK_NULL_HANDLE) {
+                            auto it = name_by_buffer->find(b->getBuffer());
+                            if (it != name_by_buffer->end()) {
+                                name = it->second;
+                            }
+                        }
+                    }
+                    if (name.empty()) {
+                        auto it = name_by_resource->find(r);
+                        if (it != name_by_resource->end()) {
+                            name = it->second;
+                        }
+                    }
+                    if (name.empty()) {
+                        return;
+                    }
+                    ++self->weight_prof_round_hits_[name];
+                });
+        }
+    }
 
     SavePipelineCache();
 }
@@ -3352,6 +3472,13 @@ double Runtime::Run() {
         }
     }
 
+    // Weight-residency hit-rate profiling (VKOP_WEIGHT_PROF=1). Fold this
+    // round's bind counts into the cross-round totals and report. Placed after
+    // the GPU timings so the profiling block sits with the other reports.
+    if (weight_prof_) {
+        weight_prof_finish_round();
+    }
+
     auto end = std::chrono::steady_clock::now();
     std::chrono::duration<double> elapsed = end - start;
     return elapsed.count() * 1000.0F;
@@ -3527,6 +3654,112 @@ void Runtime::eval_host_target_shape(size_t node_idx) {
         dims.push_back(s[static_cast<size_t>(t.dim_idx)]);
     }
     node_ops_[node_idx]->set_host_target_shape(dims);
+}
+
+// Fold this round's per-initializer bind counts into the cross-round totals
+// and reset the per-round map. Called at the end of each Run() while
+// weight_prof_ is on. Counting is per ROUND, not per dispatch: with
+// record-once-replay active a CACHED op replays its recorded command buffers
+// without re-entering the bind path, so its weight is counted once for the
+// round rather than once per replay. That is the quantity the residency
+// decision wants ("is this weight read every round?"), not a dispatch census.
+void Runtime::weight_prof_finish_round() {
+    ++weight_prof_rounds_;
+    weight_prof_round_distinct_.push_back(
+        static_cast<int>(weight_prof_round_hits_.size()));
+    for (const auto &kv : weight_prof_round_hits_) {
+        weight_prof_total_hits_[kv.first] += kv.second;
+    }
+    weight_prof_round_hits_.clear();
+}
+
+// Print the two tables the weight-tiering decision needs: what is resident,
+// and how often each resident byte was actually bound by a MatMul. Hottest
+// first. NEVER = never bound in any round, the bytes that could live on the
+// host; OCCASIONAL = bound in fewer rounds than were observed, which needs a
+// prefetch policy rather than permanent demotion.
+void Runtime::weight_prof_report() {
+    if (!weight_prof_ || weight_prof_rounds_ == 0) {
+        return;
+    }
+    size_t resident_bytes = 0;
+    for (const auto &p : weight_prof_resident_) {
+        resident_bytes += p.second;
+    }
+    // "shared" counts initializers with more than one consumer NODE, from the
+    // same map the load-time pooling uses (consumers[]). ref_cnt_ is not that
+    // number: every initializer is stamped set_ref_cnt_forever() so pool
+    // recycling never frees it, so reading it here would report a flat 100%.
+    size_t shared_count = 0;
+    for (const auto &kv : weight_prof_resident_) {
+        auto c = weight_prof_consumers_.find(kv.first);
+        if (c != weight_prof_consumers_.end() && c->second > 1) {
+            ++shared_count;
+        }
+    }
+    const double mib = 1024.0 * 1024.0;
+    const double rounds = static_cast<double>(weight_prof_rounds_);
+    fprintf(stderr,
+            "[weightprof] resident: %zu initializers, %.2f MiB device-local, "
+            "%zu shared (>1 consumer node)\n",
+            weight_prof_resident_.size(), resident_bytes / mib, shared_count);
+    fprintf(stderr, "[weightprof] rounds observed: %ld\n", weight_prof_rounds_);
+    fprintf(stderr, "[weightprof] %10s %13s  %s\n", "bytes", "hits/round",
+            "name");
+    for (const auto &p : weight_prof_resident_) {
+        auto it = weight_prof_total_hits_.find(p.first);
+        double hits = it == weight_prof_total_hits_.end()
+                          ? 0.0
+                          : static_cast<double>(it->second);
+        fprintf(stderr, "[weightprof] %8.2fMiB %13.3f  %s\n", p.second / mib,
+                hits / rounds, p.first.c_str());
+    }
+    // The two decision buckets, listed individually with their byte sizes so
+    // the total that could be dropped is on the last line of each block.
+    size_t never_bytes = 0;
+    size_t never_n = 0;
+    size_t occ_bytes = 0;
+    size_t occ_n = 0;
+    fprintf(stderr,
+            "[weightprof] --- NEVER (bound by no MatMul this run) ---\n");
+    for (const auto &p : weight_prof_resident_) {
+        if (weight_prof_total_hits_.count(p.first)) {
+            continue;
+        }
+        ++never_n;
+        never_bytes += p.second;
+        fprintf(stderr, "[weightprof] %8.2fMiB  %s\n", p.second / mib,
+                p.first.c_str());
+    }
+    fprintf(stderr, "[weightprof] NEVER: %zu initializers, %.2f MiB\n", never_n,
+            never_bytes / mib);
+    fprintf(stderr,
+            "[weightprof] --- OCCASIONAL (bound in < %ld of %ld rounds) ---\n",
+            weight_prof_rounds_, weight_prof_rounds_);
+    for (const auto &p : weight_prof_resident_) {
+        auto it = weight_prof_total_hits_.find(p.first);
+        if (it == weight_prof_total_hits_.end()) {
+            continue;
+        }
+        double hits = static_cast<double>(it->second);
+        if (hits >= rounds) {
+            continue; // bound at least once every round: hot, keep it resident
+        }
+        ++occ_n;
+        occ_bytes += p.second;
+        fprintf(stderr, "[weightprof] %8.2fMiB  %13.3f  %s\n", p.second / mib,
+                hits / rounds, p.first.c_str());
+    }
+    fprintf(stderr, "[weightprof] OCCASIONAL: %zu initializers, %.2f MiB\n",
+            occ_n, occ_bytes / mib);
+    fprintf(stderr,
+            "[weightprof] droppable (NEVER + OCCASIONAL): %.2f MiB of %.2f MiB "
+            "(%.1f%%)\n",
+            (never_bytes + occ_bytes) / mib, resident_bytes / mib,
+            resident_bytes
+                ? 100.0 * static_cast<double>(never_bytes + occ_bytes) /
+                      static_cast<double>(resident_bytes)
+                : 0.0);
 }
 
 void Runtime::TraceNode(const std::string &name) {

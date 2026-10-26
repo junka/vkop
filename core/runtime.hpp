@@ -134,6 +134,42 @@ class Runtime {
     };
     std::vector<NodeTiming> last_run_timings_;
 
+    // Weight-residency hit-rate profiling (VKOP_WEIGHT_PROF=1). Purely
+    // observational: it answers "which resident initializers does a round
+    // actually read?", which is the premise the weight-tiering idea rests on.
+    // Every initializer is eagerly uploaded device-local today; if a large
+    // fraction is never bound by any MatMul, host-residency + on-demand paging
+    // is worth building. Hooks are installed on MatMul ops only (see
+    // LoadModel): the weight operand is bound at a known index there, and
+    // intermediate tensors — whose VulkanResource objects get recycled — are
+    // never mistaken for weights. Off by default; when off, no hook is
+    // installed and nothing is accumulated.
+    bool weight_prof_ = false;
+    // Initializer name -> bytes, snapshot of the resident table (for the
+    // residency table and for sizing the NEVER/OCCASIONAL buckets).
+    std::vector<std::pair<std::string, size_t>> weight_prof_resident_;
+    // Initializer name -> how many nodes consume it, copied out of LoadModel's
+    // consumers[] map. That is the load-time graph fact behind "is this weight
+    // shared?", and it is the only one available after LoadModel returns: the
+    // tensors themselves carry ref_cnt_ == forever, so their use_count is a
+    // constant and says nothing.
+    std::unordered_map<std::string, int> weight_prof_consumers_;
+    // Per-round hit counts (initializer name -> times bound this round) and the
+    // cross-round accumulation (name -> total bindings over all rounds seen).
+    std::unordered_map<std::string, int> weight_prof_round_hits_;
+    std::unordered_map<std::string, long> weight_prof_total_hits_;
+    // Round index -> how many distinct initializers were hit that round (for
+    // the OCCASIONAL "seen in k of N rounds" statistic).
+    std::vector<int> weight_prof_round_distinct_;
+    // Number of rounds whose hits have been folded into
+    // weight_prof_total_hits_. Purely observational: what the profile measures
+    // is "how many times a round binds this weight", not code path coverage.
+    long weight_prof_rounds_ = 0;
+    // Emit the profiling report (called at the end of Run(); also the point
+    // where the current round's counters are folded into the cross-round ones).
+    void weight_prof_finish_round();
+    void weight_prof_report();
+
     // Vulkan pipeline cache (VK_PIPELINE_CACHE=1). Serialises compiled
     // VkPipeline binaries to disk so a subsequent LoadModel on the same device
     // can skip per-shader driver compilation. The cache is device-specific:

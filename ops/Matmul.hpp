@@ -392,6 +392,19 @@ class MatMulBuffer : public BufferFactory {
         // Everything else fails here instead of being handed to a float loader,
         // which would read a quantized payload's bytes as exponents and return
         // a plausible wrong answer.
+
+        // Weight-residency hit-rate profiling (VKOP_WEIGHT_PROF). Signalled
+        // here, at the top of the launcher, rather than at the bind site: under
+        // graph submit (the default) Operator::onExecute runs this via its
+        // graph_cmd_ branch, which clears objs_ and never repopulates it with a
+        // weight we could read back. inputs[1] is the B operand on every path
+        // (fp32/fp16 weights and quantized payloads alike; the dequant scales
+        // follow it), so it is the one place a weight is visible to both modes.
+        if (bind_prof_enabled_ && bind_prof_hook_ && inputs.size() > 1 &&
+            inputs[1]) {
+            bind_prof_hook_({nullptr, nullptr, inputs[1]->gpu_buffer()});
+        }
+
         const core::ElemKind bkind = inputs.size() > 1
                                          ? inputs[1]->elem_kind()
                                          : core::ElemKind::kInvalid;
@@ -1007,11 +1020,11 @@ class MatMulBuffer : public BufferFactory {
         // path also needs it (it writes flat fp32 results that the pack pass
         // repacks to half2, regardless of N parity). Even-N fused/reduce paths
         // pack in-shader and bind the dummy for the 4th slot.
+        // total may be 0 for a dynamic-shape output that resolved empty (a 0
+        // dim). vkCreateBuffer rejects size 0 with
+        // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
+        // 16-byte dummy — the dispatch is 0 threads anyway.
         if (fp16_ != 0 && (!fused_fp16 || coopmat || coopmat_i8)) {
-            // total may be 0 for a dynamic-shape output that resolved empty
-            // (a 0 dim). vkCreateBuffer rejects size 0 with
-            // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
-            // 16-byte dummy — the dispatch is 0 threads anyway.
             size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
             if (scratch_bytes == 0) {
                 scratch_bytes = 16;

@@ -29,7 +29,7 @@
 #include <immintrin.h>
 #endif
 
-#define UP_DIV(x, y) (((x) + (y)-1) / (y))
+#define UP_DIV(x, y) (((x) + (y) - 1) / (y))
 
 using ivec4 = int[4];
 using ivec2 = int[2];
@@ -90,6 +90,16 @@ class ITensor {
 
     int size() const { return size_; }
     bool is_on_GPU() const { return converted_; }
+    // The attached GPU resource if there is one, by pointer identity, for
+    // callers outside Tensor<T> that must ask "is this the buffer I think it
+    // is?" — weight-residency profiling compares a MatMul's bound weight
+    // buffer against its initializers' buffers. Null when the tensor has no
+    // GPU buffer (see gpu_resource_id below for the uintptr form).
+    virtual const VulkanResource *gpu_resource() const = 0;
+    // The owning handle to that same resource. Weight-residency profiling needs
+    // to hand the buffer to a hook that outlives the call (the hook folds it
+    // into a per-round counter), so it wants a shared_ptr, not a bare pointer.
+    virtual std::shared_ptr<VulkanResource> gpu_buffer() = 0;
     void toGPU() { converted_ = true; }
     void toCPU() { converted_ = false; }
     void ref_inc() { ref_cnt_++; }
@@ -547,6 +557,9 @@ template <typename T> class Tensor : public ITensor {
     }
 
     const std::type_info &dtype() const override { return typeid(T); }
+
+    const VulkanResource *gpu_resource() const override { return vkobj_.get(); }
+    std::shared_ptr<VulkanResource> gpu_buffer() override { return vkobj_; }
 
     // The storage type's meaning, unless the model file said otherwise
     // (set_elem_kind). uint16_t storage means fp16 here, and int8_t means a

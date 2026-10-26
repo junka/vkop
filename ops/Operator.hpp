@@ -442,6 +442,23 @@ class Operator {
     // (set_prof_query); null when profiling is off (no overhead).
     VkQueryPool prof_query_pool_ = VK_NULL_HANDLE;
     uint32_t prof_query_base_ = 0;
+    // Weight-residency hit-rate profiling (VKOP_WEIGHT_PROF). An op that opts
+    // in (set by Runtime on MatMul) fires this ONCE per recording with the
+    // resource list it just bound, so the Runtime can ask "which initializers
+    // did this op actually read this round?". Rides the per-dispatch site
+    // record_fingerprint already pays for and is a no-op when the flag is off,
+    // so it never perturbs the replay fingerprint or the CACHED path.
+  public:
+    using BindProfHook = std::function<void(
+        const std::vector<std::shared_ptr<VulkanResource>> &)>;
+    virtual void set_bind_prof_hook(BindProfHook hook) {
+        bind_prof_hook_ = std::move(hook);
+        bind_prof_enabled_ = bind_prof_hook_ != nullptr;
+    }
+    bool bind_prof_enabled_ = false;
+    BindProfHook bind_prof_hook_;
+
+  protected:
     // Accumulate the fingerprint of ONE DISPATCH -- not of one submit() call.
     // Called from every dispatch site (submit / submit_per_ds / dispatch_on /
     // the branches that bind a secondary pipeline and dispatch directly) when
