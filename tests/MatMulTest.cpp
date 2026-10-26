@@ -136,6 +136,61 @@ TEST(MatMulTest, MatMulTileGemvRowOverlap) {
     }
 }
 
+// A batched activation times a shared rank-2 weight used to index B by flat
+// batch, as if every batch had its own slice: batch >= 1 read past the weight
+// (zeros in a fresh SSBO, or the next tensor in the unified weight region).
+// b_shared folds every batch index to slice 0. Covers the decode/split-K path,
+// the tile/coop path, and a folded-transpose ([N,K]) weight.
+namespace {
+template <typename T>
+class MatMulBroadcastWeightTest : public TestCase<T> {
+public:
+    std::shared_ptr<Tensor<T>> inputa, inputb, output;
+
+    MatMulBroadcastWeightTest(int batch, int m, int k, int n, bool trans_b)
+        : TestCase<T>("MatMul") {
+        inputa = std::make_shared<Tensor<T>>(std::vector<int>{batch, m, k});
+        inputb = std::make_shared<Tensor<T>>(
+            trans_b ? std::vector<int>{n, k} : std::vector<int>{k, n});
+        output = std::make_shared<Tensor<T>>(std::vector<int>{batch, m, n});
+
+        auto ta = torch::randn({batch, m, k}, this->getTorchConf());
+        auto weight = torch::randn({k, n}, this->getTorchConf());
+        auto ref = torch::matmul(ta, weight);
+        auto stored_weight =
+            trans_b ? weight.transpose(-1, -2).contiguous() : weight;
+        this->fillTensorFromTorch(inputa, ta);
+        this->fillTensorFromTorch(inputb, stored_weight);
+        this->fillTensorFromTorch(output, ref);
+    }
+};
+} // namespace
+
+TEST(MatMulTest, MatMulBatchBroadcastWeight) {
+    vkop::tests::ScopedBufferBackend buffer;
+    struct Case {
+        int batch, m, k, n;
+        bool trans_b;
+    };
+    const std::vector<Case> cases = {
+        {2, 1, 256, 64, false},  // decode; batch*m <= 8 -> split-K GEMV
+        {2, 16, 512, 96, false}, // batch*m > 8 -> coop, or the tile on non-coop
+        {2, 3, 256, 64, true},   // transposed [N,K] weight
+    };
+    for (const auto &c : cases) {
+        MatMulBroadcastWeightTest<uint16_t> t(c.batch, c.m, c.k, c.n,
+                                              c.trans_b);
+        std::unordered_map<std::string, std::string> attrs;
+        if (c.trans_b) attrs["transB"] = "1";
+        EXPECT_TRUE(t.run_test({t.inputa, t.inputb}, {t.output},
+            [attrs](std::unique_ptr<vkop::ops::Operator> &op) {
+                if (!attrs.empty()) op->setAttribute(attrs);
+            }))
+            << "batch=" << c.batch << " m=" << c.m << " k=" << c.k
+            << " n=" << c.n << " transB=" << c.trans_b;
+    }
+}
+
 // ONNX MatMul with a 1-D operand: a rank-1 A is a single row [K] (promoted to
 // [1,K]), a rank-1 B a single column [K] (promoted to [K,1]), and the promoted
 // dim is dropped from the output again — {K}x{K,N} -> {N}, {M,K}x{K} -> {M}.
