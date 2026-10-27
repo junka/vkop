@@ -70,6 +70,16 @@ layout(set = 0, binding = 2) readonly buffer InB4 {
 layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
+
+// Scratch header: [0] debug flag, [1] ks_n, [2] k0, [3] kstop, [4 .. 4+2*ks_n)
+// the K-slice table (lo, hi pairs tiling [0, K)), then the tile-split-K
+// partials. See the deposit/fold pair below.
+#define KS_HDR 4
+
+// One output column's per-column group scale, for the fp32 per-element path and
+// the byte-weight epilogue. The fold pass below calls it and sits above the
+// definition, so the prototype comes first.
+float scale1(int sw);
 // Per-output-column dequant scale for a quantized weight-only B (binding 4),
 // inert otherwise. int8 and fp8 store scale = absmax / the format's largest
 // finite value (127, 448, 57344) per column as fp32; the 4-bit formats store one
@@ -168,6 +178,161 @@ layout(push_constant) uniform PC {
                   // shared by every output slice): bmap() folds B's slice
                   // index to 0. See GpuMatMulParam.
 } uPC;
+
+// ---------------------------------------------------------------------------
+// Tile-split-K: the tiled GEMM's K dimension, split across workgroups.
+//
+// The tiled kernel's grid is (N/64, M/64, batch): every K tile of a block runs
+// inside that one workgroup. When M is small -- decode, or a short prefill --
+// there are barely any blocks, so most of the device idles while each one walks
+// the whole K. Splitting K multiplies the grid by ks_n and leaves the reduction
+// to a second pass.
+//
+// The two passes are two ENTRY POINTS over this one source (-DTILED_KS_SPLIT
+// deposits, -DTILED_KS_FOLD reduces), because a pipeline binds exactly one
+// entry point: a single kernel would need a grid-wide barrier between deposit
+// and reduce, and a barrier() that orders storage across workgroups is
+// undefined -- it measured 1-in-8 wrong at ks_n=2 and 3-of-3 at ks_n=4.
+//
+// The range rides in the scratch header (KS_HDR above), not in push constants:
+// the constant block sits at the 128-byte device floor and everything past ~108
+// reads as zero on this driver (sizeof(GpuMatMulParam) == 128 zeroed every field
+// from offset 108 on). The host writes ks_n/k0/kstop once per dispatch and both
+// passes read them back, so the two cannot disagree about the split.
+// ---------------------------------------------------------------------------
+
+// Tile geometry of the shared-memory GEMM in matmul16_tiled, and of the fold
+// pass that reads the partials it deposits. Declared here, outside the fp16
+// kernel set, because the fold pass is a separate entry point over the same
+// source and needs the identical layout.
+#define TILE_M 64
+#define TILE_N 64
+#define TILE_K 16
+// Words per [tile-row][k-pair] shared row: TILE_K/2 packed halves + 1 pad. The
+// pad breaks the 32-bank aliasing a power-of-2 stride causes across the 16 lane
+// threads (each thread's 4 columns start 4 words apart).
+#define SROW (TILE_K / 2 + 1)
+// Words per [k][column-pair] shared row, used when B is [batch, K, N].
+#define SBROW (TILE_N / 2)
+// The grid is (ceil(N/64), ceil(M/64), ...), so the tile->partial index has to
+// count tiles the same way the host sized the dispatch.
+#define TILES_N ((uPC.N + TILE_N - 1) / TILE_N)
+#define TILES_M ((uPC.M + TILE_M - 1) / TILE_M)
+// 1 when this module's tiled kernel is the deposit half of a tile-split-K pair.
+// Constant, so the other builds compile the K-range code away entirely and the
+// general tiled kernel stays the per-tile nest it was.
+#ifdef TILED_KS_SPLIT
+#define KSPLIT_BY 1
+#else
+#define KSPLIT_BY 0
+#endif
+
+struct KRange {
+    int n;    // number of K slices (1 = unsplit)
+    int k0;   // this slice's first K, a multiple of TILE_K
+    int stop; // one past this slice's last K
+};
+
+KRange load_krange() {
+    KRange kr;
+    kr.n = int(uScratch.data[1]);
+    kr.k0 = int(uScratch.data[2]);
+    kr.stop = int(uScratch.data[3]);
+    return kr;
+}
+
+// The slice table entry `s`: where the partials begin in words, and slice s's
+// [lo, hi) in K. The deposit pass looks its own slice up from gid.z and the
+// fold pass reads the same entries, so the range one writes under is the range
+// the other reduces -- no per-dispatch state can make them disagree.
+#define KS_TABLE(s) (KS_HDR + 2 * (s))
+int ks_part_off() { return KS_HDR + 2 * max(load_krange().n, 1); }
+int ks_lo(int s) { return int(uScratch.data[KS_TABLE(s)]); }
+int ks_hi(int s) { return int(uScratch.data[KS_TABLE(s) + 1]); }
+
+// Partial index of output tile (b, ty, tx), slice s. The host sizes the
+// deposit grid as z = b*ks_n + s, so the inverse of that is the layout both
+// passes must agree on.
+int ks_tile_slot(int b, int ty, int tx, int s, int ks) {
+    int tile = b * (TILES_N * TILES_M) + ty * TILES_N + tx;
+    // The slot must hold the whole 64x64 fp32 partial tile the deposit
+    // writes (word = (lc + r)*TILE_M + lr + c covers exactly TILE_M*TILE_N
+    // words); a smaller stride makes slices overlap and race.
+    return ks_part_off() + (tile * ks + s) * (TILE_M * TILE_N);
+}
+
+// Deposit-only tail of the tiled kernel: this block owns K slice rk of its
+// 64x64 output tile, so its accumulator is a PARTIAL C, not C. The fold pass
+// stores.
+void ks_deposit(int rk, in float acc[4][4], int lr, int lc) {
+    int ks = max(load_krange().n, 1);
+    int b = int(gl_WorkGroupID.z) / ks;
+    int base = ks_tile_slot(b, int(gl_WorkGroupID.y), int(gl_WorkGroupID.x),
+                            rk, ks) +
+               (lr + lc * TILE_M);
+    for (int r = 0; r < 4; ++r) {
+        uScratch.data[base + r * TILE_M] = floatBitsToUint(acc[r][0]);
+        uScratch.data[base + r * TILE_M + 1] = floatBitsToUint(acc[r][1]);
+        uScratch.data[base + r * TILE_M + 2] = floatBitsToUint(acc[r][2]);
+        uScratch.data[base + r * TILE_M + 3] = floatBitsToUint(acc[r][3]);
+    }
+}
+
+// Fold pass (-DTILED_KS_FOLD): one block per output tile, summing the ks_n
+// partials the deposit pass left. Same grid as the unsplit tiled kernel and the
+// same epilogue, so the two agree on every element.
+void ks_fold_tiles() {
+    int b = int(gl_WorkGroupID.z);
+    int ty = int(gl_WorkGroupID.y);
+    int tx = int(gl_WorkGroupID.x);
+    int row0 = ty * TILE_M;
+    int col0 = tx * TILE_N;
+    if (row0 >= uPC.M || col0 >= uPC.N) return;
+    int lr = int(gl_LocalInvocationID.y) * 4;
+    int lc = int(gl_LocalInvocationID.x) * 4;
+
+    // Refuse a cut that does not tile [0, K) in order: the host builds it, so
+    // a mismatch means the header was not staged for this dispatch, and a
+    // partial sum over the wrong ranges is worse than no store at all.
+    int ks = max(load_krange().n, 1);
+    int at = 0;
+    for (int s = 0; s < ks; ++s) {
+        if (ks_lo(s) != at || ks_hi(s) <= at) return;
+        at = ks_hi(s);
+    }
+    if (at != uPC.K) return;
+
+    float acc[4][4];
+    for (int r = 0; r < 4; ++r)
+        for (int c = 0; c < 4; ++c)
+            acc[r][c] = 0.0;
+    for (int s = 0; s < ks; ++s) {
+        int base = ks_tile_slot(b, ty, tx, s, ks) + (lr + lc * TILE_M);
+#pragma unroll
+        for (int r = 0; r < 4; ++r) {
+            acc[r][0] += uintBitsToFloat(uScratch.data[base + r * TILE_M]);
+            acc[r][1] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 1]);
+            acc[r][2] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 2]);
+            acc[r][3] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 3]);
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        int grow = row0 + lr + r;
+        if (grow >= uPC.M) break;
+        int base = (b * uPC.M + grow) * uPC.N + col0 + lc;
+        vec2 v0 = vec2(acc[r][0], acc[r][1]);
+        vec2 v1 = vec2(acc[r][2], acc[r][3]);
+        if (uPC.weight_int8 != 0) {
+            int c = col0 + lc;
+            v0 *= vec2(scale1(c), scale1(c + 1));
+            v1 *= vec2(scale1(c + 2), scale1(c + 3));
+        }
+        if (col0 + lc + 1 < uPC.N)
+            uOutput.data[base >> 1] = packHalf2x16(v0);
+        if (col0 + lc + 3 < uPC.N)
+            uOutput.data[(base + 2) >> 1] = packHalf2x16(v1);
+    }
+}
 
 // A flat batch index -> B's slice, when the host detected a grouped leading
 // axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
@@ -385,7 +550,8 @@ vec4 scale4(int sw) {
                 uintBitsToFloat(uScale.data[sw + 3]));
 }
 
-// One column's group scale, for the fp32 build's per-element path.
+// One column's group scale. The fp32 build's per-element path and the
+// tile-split-K fold epilogue both read it.
 float scale1(int sw) {
     if (uPC.nvfp4 != 0) {
         return e4m3_val((uScale.data[sw >> 2] >> ((sw & 3) * 8)) & 0xFFu) *
@@ -1441,7 +1607,28 @@ void tile_fma_n(inout float acc[4][4], int lr, int lc) {
 void matmul16_tiled() {
     // Workgroup (not invocation) ids: each block owns one 64x64 tile, so the
     // local offset must not be folded into the tile origin.
+    //
+    // Under the tile-split-K dispatch this kernel is launched with
+    // z = b*ks_n + rk, so the batch index and this block's K slice both come
+    // out of z. In every other build KSPLIT_BY is 0, the range is the whole K,
+    // and the prologue folds away.
+    const bool KSPLIT = KSPLIT_BY != 0;
+    int rk = 0;
     int b = int(gl_WorkGroupID.z);
+    int k0 = 0;
+    int kstop = uPC.K;
+    if (KSPLIT) {
+        // z is b*ks_n + rk, and the K cut is a function of the shape alone --
+        // it rides in the slice table, not in per-dispatch state, so every
+        // block of a dispatch and the fold pass that follows read the same
+        // cut. This block takes slice rk; the fold pass reduces them all.
+        const int ks = max(load_krange().n, 1);
+        rk = b % ks;
+        b = b / ks;
+        k0 = ks_lo(rk);
+        kstop = ks_hi(rk);
+        if (kstop <= k0 || kstop > uPC.K) return;
+    }
     int row0 = int(gl_WorkGroupID.y) * TILE_M;
     int col0 = int(gl_WorkGroupID.x) * TILE_N;
     if (row0 >= uPC.M || col0 >= uPC.N) return;
@@ -1462,8 +1649,12 @@ void matmul16_tiled() {
     // The two layouts differ only in how B is staged and read, so each gets
     // its own loop nest instead of a branch per k-step. transB is
     // workgroup-uniform, so the barriers stay convergent.
+    // Every nest walks the block's K range [k0, kstop), which under the unsplit
+    // dispatch is the whole [0, K). Under the tile-split-K dispatch it is one
+    // slice, and a nest that walked [0, K) instead would deposit a partial over
+    // the wrong K for every block above rk = 0.
     if (uPC.transB != 0) {
-        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
+        for (int kk = k0; kk < kstop; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
             tile_load_b_t(bb, col0, kk >> 1, halfK);
             barrier();
@@ -1471,7 +1662,7 @@ void matmul16_tiled() {
             barrier();
         }
     } else if (uPC.weight_int8 != 0) {
-        for (int kk = 0; kk < uPC.K; kk += TILE_K) {
+        for (int kk = k0; kk < kstop; kk += TILE_K) {
             tile_load_a(b, row0, kk >> 1, halfK);
             tile_load_b_w8(bb, col0, kk);
             barrier();
@@ -1482,17 +1673,22 @@ void matmul16_tiled() {
         // Two-deep split: the fetch for tile t+1 is issued before tile t is
         // computed, so its loads are in flight for the whole FMA nest. The
         // store then runs after the barrier that retires tile t's readers.
-        int ntile = uPC.K / TILE_K;
+        // The K walk is [k0, kstop); the fetch offsets stay the original
+        // expressions.
+        const int klo = k0;
+        int ntile = (kstop - k0) / TILE_K;
         uint va0, va1, vb0, vb1;
-        fetch_a(b, row0, 0, halfK, va0, va1);
-        fetch_b_n(bb, col0, 0, halfN, vb0, vb1);
-        store_a(va0, va1);
-        store_b_n(vb0, vb1);
+        if (ntile > 0) {
+            fetch_a(b, row0, klo >> 1, halfK, va0, va1);
+            fetch_b_n(bb, col0, klo, halfN, vb0, vb1);
+            store_a(va0, va1);
+            store_b_n(vb0, vb1);
+        }
         barrier();
         for (int t = 0; t < ntile; ++t) {
             if (t + 1 < ntile) {
-                fetch_a(b, row0, (t + 1) * (TILE_K / 2), halfK, va0, va1);
-                fetch_b_n(bb, col0, (t + 1) * TILE_K, halfN, vb0, vb1);
+                fetch_a(b, row0, (klo + (t + 1) * TILE_K) >> 1, halfK, va0, va1);
+                fetch_b_n(bb, col0, klo + (t + 1) * TILE_K, halfN, vb0, vb1);
             }
             tile_fma_n(acc, lr, lc);
             barrier();
@@ -1502,6 +1698,13 @@ void matmul16_tiled() {
             }
             barrier();
         }
+    }
+
+    // This block holds one K slice of the tile, so what it accumulated is a
+    // partial. The fold pass stores it; every other build falls through.
+    if (KSPLIT) {
+        ks_deposit(rk, acc, lr, lc);
+        return;
     }
 
     // N even => col0 + lc is even, so each column pair is one word; the pair
@@ -1691,6 +1894,29 @@ void main() {
         matmul16_ksplit();
     }
 }
+#elif defined(TILED_KS_SPLIT)
+#if !defined(FP16)
+#error "the tile-split-K deposit module needs -DFP16"
+#endif
+// The -DTILED_KS_SPLIT build: the deposit half of the pair. Same selection as
+// the general module but with the K range taken from the scratch header, and
+// with everything the deposit does not need (ksplit, w4, byte weights) left
+// out: the host only enters the pair for a plain fp16 [A, B] tiled shape.
+void main() {
+    if (uPC.tile != 0) {
+        matmul16_tiled();
+    }
+}
+#elif defined(TILED_KS_FOLD)
+// The -DTILED_KS_FOLD build: one block per output tile, summing the ks_n
+// partials the -DTILED_KS_SPLIT dispatch deposited. The host only enters the
+// pair for shapes the tiled kernel takes without a byte weight, so this module
+// carries the epilogue that shape needs and nothing else.
+void main() {
+#ifdef FP16
+    ks_fold_tiles();
+#endif
+}
 #else
 void main() {
 #ifdef FP16
@@ -1753,7 +1979,13 @@ void main() {
         return;
     }
     if (uPC.tile != 0) {
-        matmul16_tiled();
+        // This build has no fold pass behind it -- the pair is its own two
+        // modules -- so a split range must not reach here. KSPLIT_BY is 0 in
+        // this module so the kernel would ignore the range anyway; the guard
+        // keeps a misrouted grid from depositing partials nobody reduces.
+        if (load_krange().n <= 1 || KSPLIT_BY == 0) {
+            matmul16_tiled();
+        }
     } else if ((uPC.N & 1) == 0) {
         matmul16_even_n();
     } else {

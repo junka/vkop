@@ -248,6 +248,10 @@ class MatMulBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // Kernel-route readout for VKOP_MATMUL_ROUTE. Set at each dispatch site in
+    // execute(); the tags are the shader family, not the SPIR-V entry name.
+    std::string route_tag() const override { return route_tag_; }
+    std::string route_info() const override { return route_info_; }
     void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                             const std::shared_ptr<VulkanCommandPool> &cmdpool,
                             VkPipelineCache cache = VK_NULL_HANDLE) override {
@@ -555,8 +559,10 @@ class MatMulBuffer : public BufferFactory {
         // every other axis exactly equal; anything else keeps the plain
         // broadcast behavior (the db > 1 guard also keeps a 2-D weight's
         // virtual leading axes — db reads as 1 past B's rank — from posing as
-        // rep copies, and a quantized weight never qualifies at all). The coop
-        // shaders have no bmap, so the coopmat gates below exclude rep > 1.
+        // rep copies, and a quantized weight never qualifies at all). Every
+        // buffer kernel that can take rep > 1 maps the flat batch through
+        // bmap() -- matmul.comp and the three coop shaders; matmul_coop_i8
+        // additionally requires transB == 0.
         int rep = 1;
         int rep_stride = 1;
         int a_dim = 0;
@@ -597,9 +603,8 @@ class MatMulBuffer : public BufferFactory {
             // in every kernel -- bmap()'s early-out on the buffer path, the B
             // base check in the coop shaders. Unlike the grouped axis above
             // it moves no addressing but B's slice base, so the rep fields
-            // stay at their defaults and the coopmat gates (rep == 1) stay
-            // open: a shared weight takes the same route a per-batch 3-D B
-            // would, instead of being pushed off coopmat.
+            // stay at their defaults and every kernel's bmap() early-out
+            // handles it like a per-batch 3-D B would.
             long long b_flat_batch = 1;
             for (int i = 0; i < lead_b; ++i) {
                 b_flat_batch *= b_eff[i];
@@ -892,6 +897,34 @@ class MatMulBuffer : public BufferFactory {
                            (k % 16 == 0) && (m >= tiled_min_m) && !epi_bias_ &&
                            tiled_ok_n &&
                            (!weight_byte || (!transB_ && (n % 4 == 0)));
+        // Tile-split-K ("stream-K", para_.ks_tiles): cut K across ks_n blocks
+        // when the tiled grid is too shallow in z to fill the device, i.e.
+        // batch * (N/64) * (M/64) blocks is small next to the device's
+        // workgroup capacity. Only the generic two-deep nest in matmul16_tiled
+        // takes a K range; the weight_int8 and transB staging paths read whole
+        // K rows with a column guard rather than a per-k one, so they are left
+        // on the legacy single-block form.
+        int ks_n = 0;
+        // The loop dispatch needs batch*ks_n entries in z. A grouped weight
+        // (rep > 1) reads bmap(b) from the SHADER's unscaled b, and the
+        // tile-split-K kernel derives b = gid.z / ks_n -- so it needs the
+        // unscaled batch. bmap's intra-rep term is already carried by a_dim/
+        // b_dim, and rep_stride is the product of the leading dims AFTER the
+        // grouped axis, so folding rep_stride in rescales z's split ring by
+        // exactly that stride. Without it, any grouped shape whose grouped axis
+        // is not the last leading axis (kv-prefill attention) maps every rep
+        // group past the first onto B's wrong slices.
+        if (rep > 1)
+            para_.rep_stride *= rep;
+        if (tiled && !weight_byte && !transB_ && k >= 256) {
+            long blocks =
+                static_cast<long>(batch) * UP_DIV(n, 64) * UP_DIV(m, 64);
+            long want = ks_target_n(blocks);
+            if (want > 1) {
+                ks_n = static_cast<int>(
+                    std::min<long>(want, static_cast<long>(k) / 16));
+            }
+        }
         // Cooperative-matrix GEMM (Intel ARL fp16 8x8x16 subgroup MMA). A
         // device-specific fast path: when the GPU exposes
         // KHR_cooperative_matrix with the fp16->fp32 combo, a single
@@ -908,7 +941,7 @@ class MatMulBuffer : public BufferFactory {
         }();
         const bool coopmat =
             fp16_ != 0 && !weight_byte && !weight_4bit && !coop_disabled &&
-            rep == 1 && m_dev_->is_support_cooperate_matrix() &&
+            m_dev_->is_support_cooperate_matrix() &&
             coop_pipeline_ != nullptr &&
             // The coopmat shaders (matmul_coop*.comp) do NOT implement the
             // attention QK^T epilogue (epi_scale/epi_bias at binding 6); only
@@ -981,11 +1014,11 @@ class MatMulBuffer : public BufferFactory {
             return v != nullptr && v[0] != '\0' && v[0] != '0';
         }();
         const bool coopmat_i8 = coop_i8_enabled && fp16_ != 0 && weight_int8 &&
-                                // matmul_coop_i8.comp has no bmap (same as
-                                // the fp16 coop shaders), so a grouped or
-                                // broadcast-B batch mapping would be read as
-                                // a per-batch B: exclude like the fp16 gate.
-                                rep == 1 && !transB_ && (n % 8 == 0) &&
+                                // matmul_coop_i8.comp's bmap() covers rep and
+                                // b_shared but not transB (B is pre-packed
+                                // [K, N]), so a transposed grouped weight
+                                // still falls back to matmul.comp.
+                                !transB_ && (n % 8 == 0) &&
                                 m_dev_->is_support_cooperate_matrix() &&
                                 coop_i8_pipeline_ != nullptr;
         // Split-K GEMV: the column-parallel kernels above put output rows on
@@ -1016,6 +1049,33 @@ class MatMulBuffer : public BufferFactory {
         // above already proved transB == 0 and N % 8 == 0, which is what makes
         // a thread's four columns exactly half of one packed weight word.
         const bool w4_quad = fused_fp16 && weight_4bit;
+        // The tile-split-K cut: an even, ordered tiling of [0, K) into ks_n
+        // slices. It is derived from the shape alone and lives in no
+        // per-dispatch state, because THREE consumers must agree on it -- the
+        // deposit blocks (which look their own slice up from gid.z), the fold
+        // pass that reduces them, and this host staging that publishes the
+        // table. A cut keyed on the replay lane would silently change between
+        // an execute round and a cached replay round (m_id_ is not stable),
+        // and the fold would then reduce a different partition than the
+        // deposit wrote. Allocate the scratch size from the same numbers, so
+        // the cut must be computed before the buffer sizing below.
+        ks_n_ = ks_n;
+        ks_k0_ = 0;
+        ks_kstop_ = 0;
+        ks_slices_.clear();
+        if (ks_n > 1) {
+            const int base = k / ks_n;
+            const int rem = k - base * ks_n;
+            int at = 0;
+            for (int z = 0; z < ks_n; ++z) {
+                const int lo = at;
+                at += base + (z < rem ? 1 : 0);
+                ks_slices_.push_back(lo);
+                ks_slices_.push_back(at);
+            }
+            ks_k0_ = ks_slices_[0];
+            ks_kstop_ = ks_slices_[1];
+        }
         // The odd-N reduce->pack fallback needs scratch; the cooperative-matrix
         // path also needs it (it writes flat fp32 results that the pack pass
         // repacks to half2, regardless of N parity). Even-N fused/reduce paths
@@ -1024,7 +1084,7 @@ class MatMulBuffer : public BufferFactory {
         // dim). vkCreateBuffer rejects size 0 with
         // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
         // 16-byte dummy — the dispatch is 0 threads anyway.
-        if (fp16_ != 0 && (!fused_fp16 || coopmat || coopmat_i8)) {
+        if (fp16_ != 0 && (!fused_fp16 || coopmat || coopmat_i8) && ks_n <= 1) {
             size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
             if (scratch_bytes == 0) {
                 scratch_bytes = 16;
@@ -1035,8 +1095,67 @@ class MatMulBuffer : public BufferFactory {
                 scratch_ = std::make_shared<VulkanBuffer>(
                     m_dev_, scratch_bytes,
                     STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                 scratch_bytes_ = scratch_bytes;
+            }
+            objs_.emplace_back(scratch_);
+        } else if (ks_n > 1) {
+            // Tile-split-K: the deposit pass writes one fp32 64x64 tile per K
+            // range, for every output tile and batch, and the fold pass walks
+            // them as ks_n contiguous 4096-float slots per output tile.
+            // Words 0..3 are the per-op control header: the debug flag
+            // register, then ks_n and the first slice's bounds (the fold pass's
+            // own read). The slice table follows at KS_TABLE_OFF, then the
+            // partials at KS_PART_OFF -- both word addresses, so the header,
+            // the table and the tile data can never alias.
+            const size_t ks_table_words = 2 * static_cast<size_t>(ks_n);
+            const size_t ks_part_off = ks_table_off_ + ks_table_words;
+            size_t ks_bytes =
+                (ks_part_off + static_cast<size_t>(batch) * UP_DIV(n, 64) *
+                                   UP_DIV(m, 64) * ks_n * 64 * 64) *
+                sizeof(float);
+            if (!scratch_ || scratch_bytes_ < ks_bytes) {
+                scratch_ = std::make_shared<VulkanBuffer>(
+                    m_dev_, ks_bytes,
+                    STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                scratch_bytes_ = ks_bytes;
+                ks_words_.clear();
+            }
+            // Stage the control header. HOST_COHERENT host writes are visible
+            // to the device at the next submit without an explicit flush, and
+            // the dispatch reads them after any queued writes from earlier ops.
+            //
+            // The header and the slice table are staged HERE, at record time,
+            // not at the dispatch: a cached replay round re-runs the recorded
+            // commands but skips this function entirely, so a table written at
+            // the dispatch site would still be the recording round's cut. The
+            // cut is a function of the shape, so the two rounds agree -- but
+            // the buffer must already hold it when the replayed dispatch runs.
+            // Writing only on a real change keeps the cached path free.
+            if (auto *words =
+                    static_cast<uint32_t *>(scratch_->getMappedMemory())) {
+                std::vector<uint32_t> hdr;
+                hdr.reserve(ks_part_off);
+                hdr.push_back(0);
+                hdr.push_back(static_cast<uint32_t>(ks_n));
+                hdr.push_back(static_cast<uint32_t>(ks_k0_));
+                hdr.push_back(static_cast<uint32_t>(ks_kstop_));
+                // The whole cut, so the deposit can find its slice from gid.z
+                // and the fold can reject a set of K ranges that do not tile
+                // [0, K) exactly. KS_HDR words precede it; the partials follow.
+                for (int v : ks_slices_) {
+                    hdr.push_back(static_cast<uint32_t>(v));
+                }
+                hdr.resize(ks_part_off, 0);
+                if (hdr != ks_words_) {
+                    ks_words_ = hdr;
+                    for (size_t t = 0; t < hdr.size(); ++t) {
+                        words[t] = hdr[t];
+                    }
+                }
             }
             objs_.emplace_back(scratch_);
         } else {
@@ -1112,7 +1231,13 @@ class MatMulBuffer : public BufferFactory {
         para_.a_dim = a_dim;
         para_.b_dim = b_dim;
         para_.b_shared = b_shared;
-        para_.epi_scale = epi_scale_;
+        // Plan C: tile-split-K hands the block its own K range through the
+        // SCRATCH buffer (word 1 = ks_n, words 2/3 = the first slice, then the
+        // slice table). Push constants cannot carry it: four ints at the struct
+        // tail push sizeof(GpuMatMulParam) past the 128-byte limit, which
+        // collapses the push_constant block to a 4-byte range and zeroes EVERY
+        // constant after it -- including K, on which the tiled K window
+        // depends.
         para_.epi_bias = epi_bias_ ? 1 : 0;
         // The bias is [B,1,q,kv] broadcast over the head axis, so its element
         // count is B*M*N while the output's is batch*M*N (batch = B*heads).
@@ -1149,6 +1274,7 @@ class MatMulBuffer : public BufferFactory {
         // do the row reduction). Gating on attn_softmax already excludes quant
         // and odd-N; this only fires on attention QK^T decode (small M).
         if (para_.attn_softmax) {
+            set_route("attn_softmax", batch, m, n, k, rep);
             submit(&para_, batch * m, 1, 1);
             return;
         }
@@ -1167,6 +1293,7 @@ class MatMulBuffer : public BufferFactory {
             // Same scratch + pack tail as the fp16 coopmat path. The grid uses
             // the footprint of whichever SINT8 tile was probed (32x64 on Ada's
             // 16x16x32, 16x32 on ARL's 8x8x32).
+            set_route("coopmat_i8", batch, m, n, k, rep);
             fillDescriptorWrites(coop_i8_ds_[m_id_]);
             coop_i8_pipeline_->updateDescriptorSets(ds_writes_);
             m_cmd_->bind(*coop_i8_pipeline_, coop_i8_ds_[m_id_]);
@@ -1219,6 +1346,7 @@ class MatMulBuffer : public BufferFactory {
                     bn = geo->bn;
                 }
             }
+            set_route("coopmat", batch, m, n, k, rep);
             fillDescriptorWrites(ds[m_id_]);
             pipe->updateDescriptorSets(ds_writes_);
             m_cmd_->bind(*pipe, ds[m_id_]);
@@ -1247,7 +1375,34 @@ class MatMulBuffer : public BufferFactory {
             // x = 64-column tiles, y = 64-row tiles, z = batch: a block never
             // straddles a batch boundary, so no per-row batch fixups in the
             // shader.
-            submit(&para_, UP_DIV(n, 64), UP_DIV(m, 64), batch);
+            //
+            // Tile-split-K (ks_n > 1) is a TWO-DISPATCH pair over one shader
+            // source: a deposit pass launched with z = batch*ks_n, each block
+            // accumulating only its K slice into the scratch partials, then a
+            // storage barrier, then a fold pass over the same (x, y, batch)
+            // grid summing them through the shared epilogue. The two halves are
+            // separate modules (-DTILED_KS_SPLIT / -DTILED_KS_FOLD) because a
+            // pipeline binds a single entry point, and a barrier() that ordered
+            // storage across workgroups is undefined -- it measured 1-in-8
+            // wrong at ks_n=2. Both read the same K range from the scratch
+            // header, so they cannot disagree about the split. If either module
+            // is unavailable, fall back to the unsplit tiled kernel: the range
+            // header is ignored by a build whose KSPLIT_BY is 0.
+            VulkanPipeline *ks_split = ks_n > 1 ? ks_split_pipeline() : nullptr;
+            VulkanPipeline *ks_fold = ks_split ? ks_fold_pipeline() : nullptr;
+            if (ks_split && ks_fold) {
+                set_route("tiled_ks", batch, m, n, k, rep);
+                ks_submit(ks_split, ks_split_ds_[m_id_], UP_DIV(n, 64),
+                          UP_DIV(m, 64), batch * ks_n);
+                // The fold reads the deposit's SSBO stores, so the pair needs
+                // an explicit memory dependency between the two dispatches.
+                scratch_->shaderWriteBarrier(m_cmd_->get());
+                ks_submit(ks_fold, ks_fold_ds_[m_id_], UP_DIV(n, 64),
+                          UP_DIV(m, 64), batch);
+            } else {
+                set_route("tiled", batch, m, n, k, rep);
+                submit(&para_, UP_DIV(n, 64), UP_DIV(m, 64), batch);
+            }
             return;
         }
         if (ksplit_ok) {
@@ -1402,6 +1557,10 @@ class MatMulBuffer : public BufferFactory {
                 // independently.
                 para_.wide = 1;
                 para_.ksplit_q = q;
+                set_route(wide_pipe == w8_wide512_pipeline_.get()
+                              ? "ksplit_w8wide512"
+                              : "ksplit_w8wide",
+                          batch, m, n, k, rep);
                 dispatch_on(wide_pipe,
                             wide_pipe == w8_wide512_pipeline_.get()
                                 ? w8_wide512_ds_[m_id_]
@@ -1439,11 +1598,13 @@ class MatMulBuffer : public BufferFactory {
                     if (VulkanPipeline *p = secondary_pipeline(
                             0, "buffer_matmul_ksplit512_fp16",
                             ksplit512_pipeline_, ksplit512_ds_)) {
+                        set_route("ksplit_wide512", batch, m, n, k, rep);
                         dispatch_on(p, ksplit512_ds_[m_id_], UP_DIV(n / 8, q),
                                     batch * m);
                         return;
                     }
                 }
+                set_route("ksplit_wide", batch, m, n, k, rep);
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             }
@@ -1461,11 +1622,13 @@ class MatMulBuffer : public BufferFactory {
                 if (VulkanPipeline *p = secondary_pipeline(
                         0, "buffer_matmul_ksplit512_fp16", ksplit512_pipeline_,
                         ksplit512_ds_)) {
+                    set_route("ksplit512", batch, m, n, k, rep);
                     dispatch_on(p, ksplit512_ds_[m_id_], UP_DIV(n / 4, q),
                                 batch * m);
                     return;
                 }
             }
+            set_route("ksplit", batch, m, n, k, rep);
             submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
             return;
         }
@@ -1473,6 +1636,8 @@ class MatMulBuffer : public BufferFactory {
         if (fused_fp16) {
             // Single pass: x covers output WORDS (column pairs), or DWORDs for
             // the four-column quantized kernels.
+            set_route((w8_quad || w4_quad) ? "quad4" : "fused_fp16", batch, m,
+                      n, k, rep);
             submit(&para_, UP_DIV(n / ((w8_quad || w4_quad) ? 4 : 2), 16),
                    UP_DIV(batch * m, 16), 1);
             return;
@@ -1481,6 +1646,7 @@ class MatMulBuffer : public BufferFactory {
         // For fp16 inputs without coopmat this is the fp16-in reduce shader;
         // for fp32 inputs this is the naive fp32 reduce (batch*m collapsed into
         // y).
+        set_route(fp16_ != 0 ? "reduce_pack" : "reduce", batch, m, n, k, rep);
         submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
 
         if (fp16_ != 0) {
@@ -1922,9 +2088,9 @@ class MatMulBuffer : public BufferFactory {
     VulkanPipeline *secondary_pipeline(int id, const char *key,
                                        std::unique_ptr<VulkanPipeline> &slot,
                                        VkDescriptorSet *ds_slot) {
-        static bool no_bytes[2] = {false, false};
-        static bool refused[2] = {false, false};
-        static bool warned_missing[2] = {false, false};
+        static bool no_bytes[4] = {false, false, false, false};
+        static bool refused[4] = {false, false, false, false};
+        static bool warned_missing[4] = {false, false, false, false};
         if (slot) {
             return slot.get();
         }
@@ -1941,9 +2107,9 @@ class MatMulBuffer : public BufferFactory {
             if (!warned_missing[id]) {
                 warned_missing[id] = true;
                 std::fprintf(stderr,
-                             "[vkop] %s\n[vkop] ksplit512 stays on the 256-"
-                             "lane kernels until that key is shipped\n",
-                             e.what());
+                             "[vkop] %s\n[vkop] %s is unavailable until that "
+                             "key is shipped; using its fallback\n",
+                             e.what(), key);
             }
             return nullptr;
         }
@@ -1964,8 +2130,8 @@ class MatMulBuffer : public BufferFactory {
             refused[id] = true;
             slot.reset();
             std::fprintf(stderr,
-                         "[vkop] %s pipeline rejected (%s); ksplit512 stays "
-                         "on the 256-lane kernels\n",
+                         "[vkop] %s pipeline rejected (%s); using its "
+                         "fallback\n",
                          key, e.what());
             return nullptr;
         }
@@ -1973,6 +2139,83 @@ class MatMulBuffer : public BufferFactory {
     }
 
     // Bind + push + dispatch on a secondary ksplit pipeline (same 7-binding
+    // Record which kernel route the current execute() took. Cheap either way --
+    // the tag is a literal and the info line is one snprintf per recording, not
+    // per round: on a CACHED replay round execute() is skipped and the member
+    // still holds the recording round's value for Runtime to read back.
+    // How many K ranges tile-split-K should cut a tiled grid into so the z
+    // extent reaches the device's workgroup capacity. `blocks` is the grid
+    // depth the single-block form would launch (batch * N/64 * M/64). Returns
+    // 1 -- meaning "do not split" -- when the grid already fills the device,
+    // when the geometry has no room to cut (fewer than 16 k per range), or when
+    // the user pinned the count with VKOP_KS_N. The pick is rounded down to a
+    // power of two so the range width stays a whole number of TILE_K where the
+    // geometry allows it, which is the staging path with no tail masking.
+    static long ks_target_n(long blocks) {
+        static const int pinned = [] {
+            const char *v = std::getenv("VKOP_KS_N");
+            return v ? std::atoi(v) : 0;
+        }();
+        if (pinned > 0) {
+            return pinned;
+        }
+        if (blocks >= 128) {
+            return 1;
+        }
+        long want = (128 + blocks - 1) / blocks;
+        long p = 1;
+        while (p * 2 <= want) {
+            p *= 2;
+        }
+        return p < 2 ? 2 : p;
+    }
+
+    // per round: on a CACHED replay round execute() is skipped and the member
+    // still holds the recording round's value for Runtime to read back.
+    void set_route(const char *tag, int batch, int m, int n, int k, int rep) {
+        route_tag_ = tag;
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "%s batch=%d m=%d n=%d k=%d transB=%d rep=%d mid=%d", tag,
+                 batch, m, n, k, transB_ ? 1 : 0, rep, m_id_);
+        route_info_ = buf;
+    }
+
+    // The two tile-split-K modules (buffer_matmul_tiled_ks_split_fp16,
+    // buffer_matmul_tiled_ks_fold_fp16: the same source as the general fp16
+    // module, built with a different define so each carries exactly one entry
+    // point). A pipeline holds one entry point, and the split form is
+    // barrier-free by construction -- each block returns after depositing its
+    // partial -- so the deposit and the fold cannot share a dispatch. Probed
+    // through secondary_pipeline() like the 512-lane pair: a driver refusal or
+    // a model archive without the keys leaves ks_n_ at 1, i.e. the unsplit
+    // tiled kernel, which is the same kernel without the K cut.
+    VulkanPipeline *ks_split_pipeline() {
+        return secondary_pipeline(2, "buffer_matmul_tiled_ks_split_fp16",
+                                  ks_split_pipeline_, ks_split_ds_);
+    }
+    VulkanPipeline *ks_fold_pipeline() {
+        return secondary_pipeline(3, "buffer_matmul_tiled_ks_fold_fp16",
+                                  ks_fold_pipeline_, ks_fold_ds_);
+    }
+
+    // Bind, push and dispatch one half of the tile-split-K pair. Same body as
+    // dispatch_on above; separate only because the two dispatches in that pair
+    // each need their own descriptor set (a set is written once per dispatch
+    // through fillDescriptorWrites, so the deposit and the fold cannot share
+    // one). The writes live in this call's own vector: the base dispatch's
+    // writes_ is still waiting behind a not-yet-existing replay entry, and
+    // refilling the shared vector would leave that entry describing the fold's
+    // set.
+    void ks_submit(VulkanPipeline *pipe, VkDescriptorSet ds, int gx, int gy,
+                   int gz) {
+        fillDescriptorWrites(ds);
+        pipe->updateDescriptorSets(ds_writes_);
+        m_cmd_->bind(*pipe, ds);
+        m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam), &para_);
+        dispatch_and_record(gx, gy, gz, &para_);
+    }
+
     // layout and push constants as the wide path above).
     void dispatch_on(VulkanPipeline *pipe, VkDescriptorSet ds, int gx, int gy) {
         fillDescriptorWrites(ds);
@@ -2013,6 +2256,24 @@ class MatMulBuffer : public BufferFactory {
     matmul::GpuMatMulParam para_;
     std::shared_ptr<VulkanBuffer> scratch_;
     size_t scratch_bytes_ = 0;
+    // Tile-split-K's own K range for THIS dispatch, staged into the scratch
+    // header (words 1..3) instead of a push constant: four more ints at the PC
+    // tail push sizeof past 128 bytes and collapse the push range (see the
+    // assignment site). ks_n <= 1 is the unsplit form.
+    int ks_n_ = 0;
+    int ks_k0_ = 0;
+    int ks_kstop_ = 0;
+    // The cut: 2*ks_n_ even-odd pairs (lo, hi) tiling [0, K), written to the
+    // scratch header at ks_table_off_ so the deposit pass can find its slice
+    // from gid.z. Shape-derived, so a replay round stages the same table an
+    // execute round did.
+    std::vector<int> ks_slices_;
+    size_t ks_table_off_ = 4;
+    // The scratch words 0..ks_table_off_ as last staged. A cached replay round
+    // re-runs the recorded dispatches without re-entering the record path, so
+    // the header must survive in the buffer; comparing against this shadow
+    // keeps the rewrite off the steady-state path.
+    std::vector<uint32_t> ks_words_;
     // coop_pipeline_ runs the fp16 cooperative-matrix kernel (fp16-in, fp32
     // accumulate -> flat scratch). pack_pipeline_ runs the half2 pack pass.
     // ds_writes_/fillDescriptorWrites fill either pipeline's descriptor set
@@ -2062,6 +2323,11 @@ class MatMulBuffer : public BufferFactory {
     VkDescriptorSet ksplit512_ds_[vkop::kInflight] = {nullptr};
     std::unique_ptr<VulkanPipeline> w8_wide512_pipeline_;
     VkDescriptorSet w8_wide512_ds_[vkop::kInflight] = {nullptr};
+    // The tile-split-K pair (ks_split_pipeline / ks_fold_pipeline above).
+    std::unique_ptr<VulkanPipeline> ks_split_pipeline_;
+    VkDescriptorSet ks_split_ds_[vkop::kInflight] = {nullptr};
+    std::unique_ptr<VulkanPipeline> ks_fold_pipeline_;
+    VkDescriptorSet ks_fold_ds_[vkop::kInflight] = {nullptr};
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
     // 4-column kernel; another MatMul from a reconverted model still tries.
     bool w8_wide_no_bytes_ = false;
@@ -2075,6 +2341,14 @@ class MatMulBuffer : public BufferFactory {
     // Plan B: fuse the trailing Softmax into this MatMul (online softmax in the
     // kernel). Set by the converter via the "attn_softmax" attribute.
     bool attn_softmax_ = false;
+    // Which kernel route the last execute() actually dispatched, and the shape
+    // contract it was picked from. Filled at every dispatch site below (the
+    // ksplit sub-routes are decided mid-branch, so a top-level flag cannot name
+    // them). Cached as a member, not printed, because execute() is skipped on a
+    // CACHED replay round: Runtime reads these back per round behind
+    // VKOP_MATMUL_ROUTE. See Operator::route_tag.
+    std::string route_tag_;
+    std::string route_info_;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
@@ -2088,6 +2362,8 @@ class MatMul : public PimplFacade {
             impl_ = std::make_unique<MatMulImage>(use_tensorcore);
         }
     }
+    std::string route_tag() const override { return impl_->route_tag(); }
+    std::string route_info() const override { return impl_->route_info(); }
 };
 
 } // namespace ops

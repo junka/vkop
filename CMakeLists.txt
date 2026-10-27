@@ -349,6 +349,34 @@ add_custom_command(
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS512_W8WIDE})
 
+# The tile-split-K pair for matmul16_tiled: one source, two modules. A K-range
+# carried across workgroups needs a fold pass, and a pipeline binds exactly one
+# entry point, so the same .comp is built twice - the deposit pass
+# (-DTILED_KS_SPLIT) and the fold pass (-DTILED_KS_FOLD). The host dispatches
+# split then fold with a storage barrier between them (MatMulBuffer::
+# ks_split_pipeline / ks_fold_pipeline); either module missing leaves the plain
+# per-tile kernel in charge.
+set(SPIRV_FILE_KS_SPLIT ${SPIRV_DIR}/buffer_matmul_tiled_ks_split_fp16.spv)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_KS_SPLIT}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_KS_SPLIT} -DFP16 -DTILED_KS_SPLIT
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (tiled tile-split-K deposit, fp16) to SPIR-V"
+)
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS_SPLIT})
+set(SPIRV_FILE_KS_FOLD ${SPIRV_DIR}/buffer_matmul_tiled_ks_fold_fp16.spv)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_KS_FOLD}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_KS_FOLD} -DFP16 -DTILED_KS_FOLD
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (tiled tile-split-K fold, fp16) to SPIR-V"
+)
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS_FOLD})
+
 # Extra SPIR-V builds of one shader source under explicit archive keys. The
 # host resolves these by the same key it sees in the executable (MatMul's
 # coopmat shapes and geometries, see MatMulBuffer::build_coop_pipeline and
@@ -435,6 +463,12 @@ list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_ksplit512_fp16:${SPIRV_FILE_KS512}
      --spv buffer_matmul_ksplit512_w8_wide_fp16:${SPIRV_FILE_KS512_W8WIDE})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
+# And the two tile-split-K modules above: same .comp, two defines, so the
+# SHADER_FILES loop cannot name them either.
+list(APPEND ARCHIVE_ARGS
+     --spv buffer_matmul_tiled_ks_split_fp16:${SPIRV_FILE_KS_SPLIT}
+     --spv buffer_matmul_tiled_ks_fold_fp16:${SPIRV_FILE_KS_FOLD})
+list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS_SPLIT} ${SPIRV_FILE_KS_FOLD})
 # And for every vkop_shader_variant build: the macro paired each key with its
 # .spv, so no per-key line is needed here.
 list(LENGTH VARIANT_SPV_KEYS VARIANT_COUNT)
