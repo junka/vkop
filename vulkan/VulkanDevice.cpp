@@ -155,9 +155,14 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         matmul_tile_profile_.fp16_min_m = 4;
         matmul_tile_profile_.wide_n = 65536;
         matmul_tile_profile_.fp16_wide_min_m = 6;
-        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d",
+        // 16 CUs saturate the tiled GEMM at ~32 resident blocks; the old
+        // fixed 128 over-split and paid scratch traffic for no extra speed.
+        matmul_tile_profile_.ks_target_blocks = 32;
+        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d "
+                 "ks_target=%d",
                  matmul_tile_profile_.byte_min_m,
-                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n);
+                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n,
+                 matmul_tile_profile_.ks_target_blocks);
     }
     if (driver_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
         properties2.properties.vendorID == 0x8086) { // Intel iGPU behind MVK
@@ -168,9 +173,13 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
         // (batch*m <= 8) and the tile starts at 9; no wide-N band is needed.
         matmul_tile_profile_.byte_min_m = 9;
         matmul_tile_profile_.fp16_min_m = 9;
-        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d",
+        // 24 EUs also saturate near 32 resident blocks; see the 560X note.
+        matmul_tile_profile_.ks_target_blocks = 32;
+        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d "
+                 "ks_target=%d",
                  matmul_tile_profile_.byte_min_m,
-                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n);
+                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n,
+                 matmul_tile_profile_.ks_target_blocks);
     }
     if (driver_properties.driverID != VK_DRIVER_ID_MOLTENVK &&
         !is_unified_memory()) { // discrete GPU on a native driver

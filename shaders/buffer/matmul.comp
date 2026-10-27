@@ -252,29 +252,33 @@ int ks_hi(int s) { return int(uScratch.data[KS_TABLE(s) + 1]); }
 
 // Partial index of output tile (b, ty, tx), slice s. The host sizes the
 // deposit grid as z = b*ks_n + s, so the inverse of that is the layout both
-// passes must agree on.
+// passes must agree on. Every slice stores only its tile's VALID rows and
+// columns, packed at the output's own M*N stride: (row, col) lives at
+// row*N + col. Padding rows (M < 64) and columns (N % 64 != 0) are never
+// touched -- a padded 64x64 slot moved 16x the real output at M=4, and that
+// scratch traffic cancelled the extra parallelism split-K bought.
 int ks_tile_slot(int b, int ty, int tx, int s, int ks) {
-    int tile = b * (TILES_N * TILES_M) + ty * TILES_N + tx;
-    // The slot must hold the whole 64x64 fp32 partial tile the deposit
-    // writes (word = (lc + r)*TILE_M + lr + c covers exactly TILE_M*TILE_N
-    // words); a smaller stride makes slices overlap and race.
-    return ks_part_off() + (tile * ks + s) * (TILE_M * TILE_N);
+    return ks_part_off() + (b * ks + s) * (uPC.M * uPC.N) +
+           (ty * TILE_M) * uPC.N + tx * TILE_N;
 }
 
 // Deposit-only tail of the tiled kernel: this block owns K slice rk of its
 // 64x64 output tile, so its accumulator is a PARTIAL C, not C. The fold pass
-// stores.
+// stores. Only rows/columns inside the real MxN output are written.
 void ks_deposit(int rk, in float acc[4][4], int lr, int lc) {
     int ks = max(load_krange().n, 1);
     int b = int(gl_WorkGroupID.z) / ks;
+    int row0 = int(gl_WorkGroupID.y) * TILE_M;
+    int col0 = int(gl_WorkGroupID.x) * TILE_N;
     int base = ks_tile_slot(b, int(gl_WorkGroupID.y), int(gl_WorkGroupID.x),
-                            rk, ks) +
-               (lr + lc * TILE_M);
+                            rk, ks);
     for (int r = 0; r < 4; ++r) {
-        uScratch.data[base + r * TILE_M] = floatBitsToUint(acc[r][0]);
-        uScratch.data[base + r * TILE_M + 1] = floatBitsToUint(acc[r][1]);
-        uScratch.data[base + r * TILE_M + 2] = floatBitsToUint(acc[r][2]);
-        uScratch.data[base + r * TILE_M + 3] = floatBitsToUint(acc[r][3]);
+        if (row0 + lr + r >= uPC.M) break;
+        int at = base + (lr + r) * uPC.N + lc;
+        for (int c = 0; c < 4; ++c) {
+            if (col0 + lc + c >= uPC.N) break;
+            uScratch.data[at + c] = floatBitsToUint(acc[r][c]);
+        }
     }
 }
 
@@ -306,14 +310,22 @@ void ks_fold_tiles() {
     for (int r = 0; r < 4; ++r)
         for (int c = 0; c < 4; ++c)
             acc[r][c] = 0.0;
-    for (int s = 0; s < ks; ++s) {
-        int base = ks_tile_slot(b, ty, tx, s, ks) + (lr + lc * TILE_M);
-#pragma unroll
-        for (int r = 0; r < 4; ++r) {
-            acc[r][0] += uintBitsToFloat(uScratch.data[base + r * TILE_M]);
-            acc[r][1] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 1]);
-            acc[r][2] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 2]);
-            acc[r][3] += uintBitsToFloat(uScratch.data[base + r * TILE_M + 3]);
+    // Compact partial layout: slice s of this tile starts at the same offset
+    // the output would have, and each slice is one M*N fp32 plane. Only the
+    // tile's valid rows/columns exist, so a small-M tile never pays for the
+    // padding the deposit no longer writes.
+    int slot0 = ks_tile_slot(b, ty, tx, 0, ks);
+    int stride = uPC.M * uPC.N;
+    for (int r = 0; r < 4; ++r) {
+        int grow = row0 + lr + r;
+        if (grow >= uPC.M) break;
+        int at = slot0 + (lr + r) * uPC.N + lc;
+        for (int c = 0; c < 4; ++c) {
+            if (col0 + lc + c >= uPC.N) break;
+            float v = 0.0;
+            for (int s = 0; s < ks; ++s)
+                v += uintBitsToFloat(uScratch.data[at + c + s * stride]);
+            acc[r][c] = v;
         }
     }
     for (int r = 0; r < 4; ++r) {

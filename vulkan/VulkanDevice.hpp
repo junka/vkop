@@ -192,6 +192,11 @@ class VulkanDevice {
         int wide_n = 0;
         int byte_wide_min_m = 2;
         int fp16_wide_min_m = 3;
+        // Workgroups at which the tiled fp16 GEMM saturates this device; the
+        // tile-split-K route targets this many blocks. Measured, not the
+        // theoretical resident-workgroup limit: a bandwidth-bound part
+        // saturates early, and splitting past that only adds scratch traffic.
+        int ks_target_blocks = 128;
     };
     const MatmulTileProfile &matmul_tile_profile() const {
         return matmul_tile_profile_;

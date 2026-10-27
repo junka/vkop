@@ -1101,9 +1101,11 @@ class MatMulBuffer : public BufferFactory {
             }
             objs_.emplace_back(scratch_);
         } else if (ks_n > 1) {
-            // Tile-split-K: the deposit pass writes one fp32 64x64 tile per K
-            // range, for every output tile and batch, and the fold pass walks
-            // them as ks_n contiguous 4096-float slots per output tile.
+            // Tile-split-K: the deposit pass writes one fp32 MxN plane per K
+            // range, for every batch, and the fold pass walks them as ks_n
+            // contiguous M*N planes per batch. Only valid rows/columns are
+            // stored -- a padded 64x64 slot per output tile made the scratch
+            // traffic equal the weight at M=4 and erased the parallelism win.
             // Words 0..3 are the per-op control header: the debug flag
             // register, then ks_n and the first slice's bounds (the fold pass's
             // own read). The slice table follows at KS_TABLE_OFF, then the
@@ -1112,8 +1114,10 @@ class MatMulBuffer : public BufferFactory {
             const size_t ks_table_words = 2 * static_cast<size_t>(ks_n);
             const size_t ks_part_off = ks_table_off_ + ks_table_words;
             size_t ks_bytes =
-                (ks_part_off + static_cast<size_t>(batch) * UP_DIV(n, 64) *
-                                   UP_DIV(m, 64) * ks_n * 64 * 64) *
+                (ks_part_off + static_cast<size_t>(batch) *
+                                   static_cast<size_t>(ks_n) *
+                                   static_cast<size_t>(m) *
+                                   static_cast<size_t>(n)) *
                 sizeof(float);
             if (!scratch_ || scratch_bytes_ < ks_bytes) {
                 scratch_ = std::make_shared<VulkanBuffer>(
@@ -2143,15 +2147,21 @@ class MatMulBuffer : public BufferFactory {
     // the tag is a literal and the info line is one snprintf per recording, not
     // per round: on a CACHED replay round execute() is skipped and the member
     // still holds the recording round's value for Runtime to read back.
-    // How many K ranges tile-split-K should cut a tiled grid into so the z
-    // extent reaches the device's workgroup capacity. `blocks` is the grid
-    // depth the single-block form would launch (batch * N/64 * M/64). Returns
-    // 1 -- meaning "do not split" -- when the grid already fills the device,
-    // when the geometry has no room to cut (fewer than 16 k per range), or when
-    // the user pinned the count with VKOP_KS_N. The pick is rounded down to a
+    // How many K ranges tile-split-K should cut a tiled grid into so the grid
+    // reaches the device's saturation point. `blocks` is the grid depth the
+    // single-block form would launch (batch * N/64 * M/64). Returns 1 --
+    // meaning "do not split" -- when the grid already fills the device, when
+    // the geometry has no room to cut (fewer than 16 k per range), or when the
+    // user pinned the count with VKOP_KS_N. The pick is rounded down to a
     // power of two so the range width stays a whole number of TILE_K where the
     // geometry allows it, which is the staging path with no tail masking.
-    static long ks_target_n(long blocks) {
+    //
+    // The target is measured saturation, not theoretical occupancy: the tiled
+    // GEMM is bandwidth-bound well before its resident-workgroup limit, so
+    // splitting past saturation only adds scratch traffic. The MVK profiles
+    // set it to 32 (560X and UHD630 measurements); unknown devices keep 128,
+    // the ARL/Ada calibration. VKOP_KS_TARGET overrides for tuning.
+    long ks_target_n(long blocks) const {
         static const int pinned = [] {
             const char *v = std::getenv("VKOP_KS_N");
             return v ? std::atoi(v) : 0;
@@ -2159,10 +2169,18 @@ class MatMulBuffer : public BufferFactory {
         if (pinned > 0) {
             return pinned;
         }
-        if (blocks >= 128) {
+        static const int pinned_target = [] {
+            const char *v = std::getenv("VKOP_KS_TARGET");
+            return v ? std::atoi(v) : 0;
+        }();
+        const int target =
+            pinned_target > 0
+                ? pinned_target
+                : m_dev_->matmul_tile_profile().ks_target_blocks;
+        if (blocks >= target) {
             return 1;
         }
-        long want = (128 + blocks - 1) / blocks;
+        long want = (target + blocks - 1) / blocks;
         long p = 1;
         while (p * 2 <= want) {
             p *= 2;
