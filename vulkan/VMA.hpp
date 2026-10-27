@@ -37,7 +37,7 @@ class VMA {
 
     // Allocate a Vulkan buffer with memory
     VkResult createBuffer(VkBufferCreateInfo *bufferInfo, struct VmaBuffer *buf,
-                          bool local);
+                          bool local, VkMemoryPropertyFlags requiredFlags = 0);
 
     // Allocate a Vulkan image with memory
     VkResult createImage(VkImageCreateInfo *imageInfo, struct VmaImage *img);

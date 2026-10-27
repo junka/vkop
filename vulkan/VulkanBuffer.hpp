@@ -215,7 +215,8 @@ class VulkanBuffer : public VulkanResource {
                           VkPipelineStageFlags dst_stage,
                           VkDeviceSize size = VK_WHOLE_SIZE,
                           VkDeviceSize offset = 0);
-    void createBuffer(VkBufferUsageFlags usage, bool device_local);
+    void createBuffer(VkBufferUsageFlags usage,
+                      VkMemoryPropertyFlags requireProperties);
     void createBufferView(VkFormat format, VkDeviceSize offset);
 };
 } // namespace vkop

@@ -127,8 +127,14 @@ void VMA::createPools() {
 }
 
 VkResult VMA::createBuffer(VkBufferCreateInfo *bufferInfo,
-                           struct VmaBuffer *buf, bool local) {
+                           struct VmaBuffer *buf, bool local,
+                           VkMemoryPropertyFlags requiredFlags) {
     VmaAllocationCreateInfo alloc_info = {};
+    // The caller's memory properties are a REQUIREMENT, not a preference:
+    // HOST_VISIBLE|HOST_COHERENT buffers are read and written directly
+    // through the mapped pointer (scratch headers, staging), so a type
+    // without coherence silently loses host<->device stores.
+    alloc_info.requiredFlags = requiredFlags;
     if (local) {
         alloc_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
         // alloc_info.pool = storage_pool_;
