@@ -81,8 +81,8 @@ layout(push_constant) uniform PC {
     int fp32;   // unused (this kernel is fp16-out); kept for PC compat
     int transB; // unused (the gate requires transB == 0); kept for PC compat
     // Tail of the host's GpuMatMulParam, declared so the offsets below match
-    // it exactly and only b_shared is read; see matmul.comp / ops/Matmul.hpp
-    // for what each field means.
+    // it exactly and only b_shared + the grouped fields (via bmap) are read;
+    // see matmul.comp / ops/Matmul.hpp for what each field means.
     int tile;
     int weight_int8;
     int w8_quad;
@@ -163,6 +163,30 @@ float loadA_f16(int elem) {
 int loadA_i8(int elem) { return s8(uInputA.data[elem >> 2], elem); }
 int loadB_i8(int elem) { return s8(uInputB.data[elem >> 2], elem); }
 
+// A flat batch index -> B's slice, when the host detected a grouped leading
+// axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
+// consecutively (repeat_kv interleave), and any outer leading axes are shared.
+// A fully broadcast B (a [K, N] weight shared by every output slice) is not a
+// grouped axis at all -- the host raises uPC.b_shared instead, and the
+// early-out below folds B's slice index to 0 for every n.
+// Identical to the bmap() in matmul.comp (which see for the decomposition);
+// the coop kernel maps the workgroup's z index through it once per tile.
+int bmap(int n) {
+    if (uPC.b_shared != 0) {
+        return 0;
+    }
+    if (uPC.rep <= 1) {
+        return n;
+    }
+    int a_span = uPC.rep_stride * uPC.a_dim;
+    int rest = n % a_span;
+    int prefix = n / a_span;
+    int b_span = uPC.rep_stride * uPC.b_dim;
+    return prefix * b_span +
+           (rest / (uPC.rep * uPC.rep_stride)) * uPC.rep_stride +
+           (rest % uPC.rep_stride);
+}
+
 // A tile, quantized to int8, row-major [BM x K_BLOCK].
 shared int8_t shAq[BM * K_BLOCK];
 // B tile as raw bytes, row-major [K_BLOCK x BN].
@@ -191,7 +215,7 @@ void main() {
     int K = uPC.K;
 
     int a_base = b * M * K; // A[batch] in elements
-    int b_base = (uPC.b_shared != 0) ? 0 : b * K * N; // B[batch] in bytes
+    int b_base = bmap(b) * K * N; // B[batch] in bytes
 
     // ---- Phase 1: per-row amax of A over the full K -----------------------
     if (tid < uint(BM)) {

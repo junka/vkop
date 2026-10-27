@@ -257,6 +257,11 @@ public:
     int B, heads, M, K, N;
     float scale;
     std::shared_ptr<Tensor<T>> inputa, inputb, bias, output;
+    // The fp32 torch reference for (A@B)*scale+bias; the epilogue case differs
+    // by low bits that are past the suite's 2% fp16 band there and shifts each
+    // row by the same amount into the softmax, so it compares against logits in
+    // the native fp16 instead.
+    std::shared_ptr<Tensor<T>> logits;
 
     MatMulEpiTest(int B, int heads, int M, int K, int N, float scale)
         : TestCase<T>("MatMul"), B(B), heads(heads), M(M), K(K), N(N),
@@ -280,6 +285,36 @@ public:
         this->fillTensorFromTorch(inputb, tb);
         this->fillTensorFromTorch(bias, tbias);
         this->fillTensorFromTorch(output, ref);
+        logits = std::make_shared<Tensor<T>>(true);
+        logits->resize(std::vector<int>{batch, M, N});
+        this->fillTensorFromTorch(
+            logits, (mm * scale + bias_rep).to(torch::kFloat16));
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &out_t,
+                       const std::shared_ptr<vkop::core::ITensor> &exp_t)
+        override {
+        auto out = vkop::core::as_tensor<T>(out_t);
+        auto lg = vkop::core::as_tensor<T>(logits);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = vkop::core::ITensor::fp16_to_fp32((*out)[i]);
+            float lv = vkop::core::ITensor::fp16_to_fp32((*lg)[i]);
+            // The only slack allowed is the one fp16 rounding of the final
+            // multiply; a missing bias or a wrong head moves a value by an
+            // O(1) amount, far outside this band.
+            if (std::isnan(ov)) {
+                LOG_ERROR("epi MatMul NaN at %d, expected %f", i, lv);
+                return false;
+            }
+            float band = 0.005F + 0.01F * std::abs(lv);
+            if (std::abs(ov - lv) > band) {
+                LOG_ERROR("epi MatMul Fail (%d): %f vs fp16 ref %f (band %f)",
+                          i, ov, lv, band);
+                return false;
+            }
+        }
+        return true;
     }
 };
 } // namespace
@@ -309,7 +344,9 @@ TEST(MatMulTest, MatMulEpilogueScaleBias) {
         EXPECT_TRUE(t.run_test({t.inputa, t.inputb, t.bias}, {t.output},
             [&attr](std::unique_ptr<vkop::ops::Operator> &op) {
                 op->setAttribute(attr);
-            })) << "B=" << B << " heads=" << heads << " M=" << M
+            })) << "pattern=" << B << "/" << heads << "/" << M << "/" << K
+                << "/" << N
+                << " | B=" << B << " heads=" << heads << " M=" << M
                 << " K=" << K << " N=" << N;
     }
 }
@@ -348,6 +385,32 @@ public:
         this->fillTensorFromTorch(inputb, tb);
         this->fillTensorFromTorch(bias, tbias);
         this->fillTensorFromTorch(output, ref);
+    }
+
+    bool verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                       const std::shared_ptr<vkop::core::ITensor> &out_t,
+                       const std::shared_ptr<vkop::core::ITensor> &exp_t)
+        override {
+        auto out = vkop::core::as_tensor<T>(out_t);
+        auto exp = vkop::core::as_tensor<T>(exp_t);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = vkop::core::ITensor::fp16_to_fp32((*out)[i]);
+            float ev = vkop::core::ITensor::fp16_to_fp32((*exp)[i]);
+            // The reference divides in fp32, so the default band (2% of |e|)
+            // is what separates a real error from rounding.
+            if (std::isnan(ov)) {
+                LOG_ERROR("softmax MatMul NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            float threshold =
+                (std::abs(ev) > 1.0F) ? (std::abs(ev) * 0.02F) : 0.02F;
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("softmax MatMul Fail (%d): %f vs %f (thr %f)", i, ov,
+                          ev, threshold);
+                return false;
+            }
+        }
+        return true;
     }
 };
 } // namespace
@@ -1830,6 +1893,14 @@ TEST(MatMulTest, MatMulGroupedBatchBuffer) {
             {1, 8, 2, 1, 64, 7, false, 0},   // odd N: reduce->pack
             {1, 4, 2, 3, 16, 8, false, 3},   // grouped axis mid-rank: rep_stride 3
             {1, 4, 2, 3, 16, 8, true, 3},    // same, transB
+            // m >= 8: the coopmat gate (8x8x16 on ARL, 16x16x16 on Ada) reads
+            // B through bmap() too, so a wrong mapping must fail here and on
+            // a tiled-only device alike.
+            {2, 4, 2, 16, 32, 32, false, 0}, // coopmat tile, rep 2
+            {2, 4, 2, 16, 32, 32, true, 0},  // coopmat tile over transB
+            {1, 8, 2, 16, 64, 64, false, 0}, // coopmat, b0 1, rep 4
+            {2, 4, 2, 16, 32, 32, false, 3}, // coopmat, grouped axis mid-rank
+            {1, 8, 2, 16, 64, 63, false, 0}, // coopmat, odd N
         };
     LOG_INFO("grouped-batch MatMul, FP32");
     for (const auto &tc : cases) {

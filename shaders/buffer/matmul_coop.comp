@@ -69,8 +69,8 @@ layout(push_constant) uniform PC {
     int fp32;   // unused here (this shader is fp16-in only); kept for PC compat
     int transB; // 1 = B is [batch, N, K] (transposed); read B[j*K+k]
     // Tail of the host's GpuMatMulParam, declared so the offsets below match
-    // it exactly and only b_shared is read; see matmul.comp / ops/Matmul.hpp
-    // for what each field means.
+    // it exactly and only b_shared + the grouped fields (via bmap) are read;
+    // see matmul.comp / ops/Matmul.hpp for what each field means.
     int tile;
     int weight_int8;
     int w8_quad;
@@ -103,6 +103,30 @@ const int K_BLOCK = 16;
 const int BM = 16; // = 2 * M_BLOCK  (workgroup M footprint)
 const int BN = 32; // = 4 * N_BLOCK  (workgroup N footprint)
 
+// A flat batch index -> B's slice, when the host detected a grouped leading
+// axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
+// consecutively (repeat_kv interleave), and any outer leading axes are shared.
+// A fully broadcast B (a [K, N] weight shared by every output slice) is not a
+// grouped axis at all -- the host raises uPC.b_shared instead, and the
+// early-out below folds B's slice index to 0 for every n.
+// Identical to the bmap() in matmul.comp (which see for the decomposition);
+// the coop kernel maps the workgroup's z index through it once per tile.
+int bmap(int n) {
+    if (uPC.b_shared != 0) {
+        return 0;
+    }
+    if (uPC.rep <= 1) {
+        return n;
+    }
+    int a_span = uPC.rep_stride * uPC.a_dim;
+    int rest = n % a_span;
+    int prefix = n / a_span;
+    int b_span = uPC.rep_stride * uPC.b_dim;
+    return prefix * b_span +
+           (rest / (uPC.rep * uPC.rep_stride)) * uPC.rep_stride +
+           (rest % uPC.rep_stride);
+}
+
 // Load a fp16 element from a packed-half2 uint SSBO.
 float16_t loadA(int elem) {
     return float16_t(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
@@ -133,7 +157,7 @@ void main() {
     int K = uPC.K;
 
     int a_base = b * M * K; // A[batch, :, :]
-    int b_base = (uPC.b_shared != 0) ? 0 : b * K * N; // B[batch, :, :] (row-major K x N)
+    int b_base = bmap(b) * K * N; // B[batch, :, :] (row-major K x N)
 
     coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
              gl_MatrixUseAccumulator>
