@@ -42,6 +42,7 @@ from typing import Dict, List, Optional, Tuple
 
 import onnx
 from onnx import TensorProto, numpy_helper
+import numpy as np
 from onnx.external_data_helper import (
     load_external_data_for_tensor,
     uses_external_data,
@@ -51,10 +52,15 @@ from onnx.external_data_helper import (
 _CHUNK_BYTES = 1 << 23
 
 # Element types whose bytes are already what the blob stores under -q fp16.
-# bfloat16 is absent on purpose: _downcast_bfloat16 rewrites it, which needs
-# the bytes.
-_PASS_THROUGH_DATA_TYPES = frozenset({TensorProto.FLOAT16})
-_PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2}
+# bfloat16 IS pass-through: the runtime has no bf16 storage, so a bf16
+# initializer's bytes cannot ride as-is -- but write_payload() converts them
+# chunk-wise to fp16 on the way into the trailer (MoE expert pool: 23.2 GB of
+# per-expert checkpoint tensors; hydrating them all to convert would be the
+# OOM this module exists to prevent). prepare() flips the recorded dtype to
+# FLOAT16 at deferral time so _downcast_bfloat16 leaves the file bytes alone.
+_PASS_THROUGH_DATA_TYPES = frozenset(
+    {TensorProto.FLOAT16, TensorProto.BFLOAT16})
+_PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2}
 
 # Ops that take a weight as an operand and are never evaluated during
 # conversion, because one of their inputs is an activation.
@@ -206,7 +212,7 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
             and length == payload_bytes(init)
             and _only_weight_consumers(consumers.get(init.name)))
         if keep_in_file:
-            deferred[init.name] = {
+            entry = {
                 "name": init.name,
                 "location": location,
                 "offset": offset,
@@ -215,6 +221,16 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
                 "dims": tuple(int(d) for d in init.dims),
                 "consumers": sum(consumers.get(init.name, Counter()).values()),
             }
+            if init.data_type == TensorProto.BFLOAT16:
+                # Bytes stay in the source file; the recorded dtype flips to
+                # fp16 NOW so _downcast_bfloat16 (which runs after prepare)
+                # does not "convert" the empty raw_data of an external tensor
+                # and leave bf16 bytes labeled fp16 in the trailer. The real
+                # conversion happens chunk-wise in write_payload.
+                entry["src_dtype"] = TensorProto.BFLOAT16
+                entry["data_type"] = TensorProto.FLOAT16
+                init.data_type = TensorProto.FLOAT16
+            deferred[init.name] = entry
 
     # Everything else that points at an external file gets its bytes, with the
     # same state transition onnx's own whole-model loader applies, so no
@@ -271,12 +287,16 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
 
     Returns the bytes written. A short read is a hard error: the side table
     already promised `length` bytes at that offset, and a trailer that is short
-    would make the runtime read the neighbouring tensor.
+    would make the runtime read the neighbouring tensor. A bf16 source is
+    converted chunk-wise to fp16 (the runtime's only 16-bit float storage);
+    bf16 -> fp16 is the fp32 value rounded once, the same recipe as
+    converter._bf16_bytes_to_fp16, so both paths agree bit-for-bit.
     """
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(base_dir, path)
     remaining = entry["length"]
+    to_fp16 = entry.get("src_dtype") == TensorProto.BFLOAT16
     with open(path, "rb") as src:
         src.seek(entry["offset"])
         while remaining:
@@ -286,6 +306,15 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
                     f"deferred weight '{entry['name']}' asks for {entry['length']} "
                     f"bytes at offset {entry['offset']} of {path}, but the file "
                     f"runs out {remaining} byte(s) early")
+            if to_fp16:
+                u16 = np.frombuffer(block, dtype=np.uint16)
+                f32 = (u16.astype(np.uint32) << 16).view(np.float32)
+                with np.errstate(over="ignore"):
+                    # Past-fp16-range magnitudes saturate to inf; that is the
+                    # defined outcome, matching the converter's own upfront
+                    # bf16 normalization.
+                    block = np.ascontiguousarray(
+                        f32.astype(np.float16)).tobytes()
             out_f.write(block)
             remaining -= len(block)
     return entry["length"] - remaining

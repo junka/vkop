@@ -202,6 +202,29 @@ class ModelConverter:
         if bf16_count:
             print(f"[bf16] downcast {bf16_count} bfloat16 tensor(s) to float16")
 
+        # MoE paging slots: vkop_moe_group / vkop_moe_expert_id on the
+        # graph.input declarations of slot initializers (make_moe_variant.py).
+        # Read BEFORE optimize_model — onnxoptimizer rebuilds the graph and
+        # drops ValueInfoProto metadata_props (the same reason the causal
+        # mask rides on model-level metadata), so this is the last point the
+        # declaration is readable. The names feed the liveness prune's
+        # keep-alive set (a slot's bytes exist so the runtime can page any
+        # expert into it, not because a live node reads it); the (group,
+        # expert_id) mapping rides along for the runtime's slot table.
+        moe_slots = {}
+        for inp in model.graph.input:
+            grp = eid = None
+            for e in inp.metadata_props:
+                if e.key == "vkop_moe_group":
+                    grp = e.value
+                elif e.key == "vkop_moe_expert_id":
+                    eid = e.value
+            if grp is not None:
+                moe_slots[inp.name] = (grp, eid)
+        if moe_slots:
+            print(f"[moe] {len(moe_slots)} paging slot(s) declared "
+                  f"({len({g for g, _ in moe_slots.values()})} group(s))")
+
         print("Optimizing ONNX model...")
         model = self.optimizer.optimize_model(model, batch_size)
 
@@ -209,6 +232,8 @@ class ModelConverter:
         # single-file limit. The DAG converter reads model.graph directly
         # from the in-memory object.
         dag_model = DAGBasedModel()
+        dag_model.moe_keep_alive = set(moe_slots)
+        dag_model.moe_slots = moe_slots
         # The streaming contract the parse step negotiated: names whose payload
         # never entered RAM, and where to read them from when the blob is
         # written. save_to_binary verifies it before writing anything.

@@ -405,6 +405,34 @@ add_test(NAME ShaderArchiveTest
 add_executable(ImageLayoutProbe ImageLayoutProbe.cpp)
 target_link_libraries(ImageLayoutProbe PRIVATE vkop vload)
 
+# Readback-cost probe for MoE expert routing (direction B0). Runs a TopK over
+# router-shaped logits and times the expert-id copyToCPU, which is the op
+# sequence a CPU-dispatched expert cache depends on and which no current decode
+# round contains (measured 0 readbacks/round). Not a gtest: it prints a
+# distribution and a projection rather than asserting a value.
+# Run:  ./readback_probe [n_experts] [k] [reps]
+add_executable(readback_probe readback_probe.cpp setup_env.cpp)
+target_link_libraries(readback_probe PRIVATE vkop vload)
+add_dependencies(readback_probe shader_archive)
+target_compile_definitions(readback_probe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+# setup.cpp pulls torch for its tensor helpers; the probe only needs Vulkan,
+# but linking the helper drags torch's headers in, and torch's own headers do
+# not survive the project's -Werror. Silence the same warnings all_tests does.
+target_include_directories(readback_probe PRIVATE
+    ${TORCH_INCLUDE_DIR} ${TORCH_API_INCLUDE_DIR})
+if(MSVC)
+    target_compile_options(readback_probe PRIVATE /wd4100)
+else()
+    target_compile_options(readback_probe PRIVATE
+        -Wno-unused-parameter
+        -Wno-unused-variable
+        -Wno-unused-function
+    )
+    if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        target_compile_options(readback_probe PRIVATE -Wno-dangling-reference)
+    endif()
+endif()
+
 # Min/Max large-shape scalar-broadcast repro probe (full-DiT decode
 # DEVICE_LOST at /Min_24+/Max_24). Usage: MinMaxProbe [full|tiny]
 add_executable(MinMaxProbe MinMaxProbe.cpp)

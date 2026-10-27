@@ -470,6 +470,13 @@ class DAGBasedModel:
 
         live = {o["name"] for o in self.outputs}
         live.update(i["name"] for i in self.inputs)
+        # MoE paging slots (vkop_moe_group on their graph.input declarations)
+        # are keep-alive by declaration: a slot's bytes exist so the runtime
+        # can page ANY expert into it, not because a live node reads it. The
+        # wiring points the 4 resident slots at real consumers; the other 56
+        # survive only through this set. See make_moe_variant.py's
+        # declare_slots and the vkop_moe_* contract.
+        live.update(getattr(self, "moe_keep_alive", ()))
         for m in self.unified_meta:
             live.add(m["_name"])
         for m in self.rgba_meta:
