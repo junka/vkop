@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <string>
 #include <unordered_map>
@@ -19,6 +20,7 @@ namespace vkop {
 namespace core {
 class ShaderArchive;
 }
+class VulkanBuffer;
 namespace ops {
 
 // VKOP_HOST_SHAPE evaluates the int64 shape/metadata chain entirely on the
@@ -346,6 +348,17 @@ class Operator {
         }
         return out;
     }
+
+    // Which kernel route the op took on the last RECORDING round, as a short
+    // tag ("coopmat", "ksplit_wide512", "tiled", ...), plus the shape contract
+    // it was chosen from. Only Matmul fills this in; everything else stays
+    // empty. It is a member rather than a printf at the dispatch site because
+    // execute() is not called on a CACHED replay round (Operator.cpp), so a
+    // print there would go silent after warmup -- exactly when a profiling run
+    // wants the readout. Runtime prints it once per op per round behind
+    // VKOP_MATMUL_ROUTE.
+    virtual std::string route_tag() const { return std::string(); }
+    virtual std::string route_info() const { return std::string(); }
 
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;

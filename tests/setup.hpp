@@ -372,6 +372,19 @@ public:
             }
         }
         op->onExecute(inputs, outputs, 0);
+        // [route] the kernel family the op just dispatched (MatMul fills it;
+        // other ops leave it empty). Printed here rather than read back from a
+        // graph because a single-op test never reaches Runtime's mmroute
+        // print -- without this, a test cannot tell which kernel it exercised.
+        if (const char *rt = std::getenv("VKOP_TEST_ROUTE")) {
+            (void)rt;
+            const std::string tag = op->route_tag();
+            const std::string info = op->route_info();
+            if (!tag.empty()) {
+                fprintf(stderr, "[route] %s | %s\n", tag.c_str(),
+                        info.c_str());
+            }
+        }
         auto cmd = op->get_record();
         std::vector<VkSubmitInfo> info;
         info.push_back(cmd->buildSubmitInfo());

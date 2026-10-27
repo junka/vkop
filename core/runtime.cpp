@@ -1596,6 +1596,7 @@ void Runtime::LoadModel() {
     if (weight_prof_) {
         weight_prof_resident_.clear();
         weight_prof_consumers_ = consumers;
+        weight_prof_bytes_.clear();
         for (const auto &kv : initializers_) {
             const auto &t = kv.second;
             if (!t || !t->gpu_resource()) {
@@ -1603,6 +1604,7 @@ void Runtime::LoadModel() {
             }
             weight_prof_resident_.push_back(
                 {kv.first, static_cast<size_t>(t->size())});
+            weight_prof_bytes_[kv.first] = static_cast<size_t>(t->size());
         }
         std::sort(
             weight_prof_resident_.begin(), weight_prof_resident_.end(),
@@ -1693,6 +1695,14 @@ void Runtime::LoadModel() {
                         return;
                     }
                     ++self->weight_prof_round_hits_[name];
+                    // Byte accounting for the paging-bandwidth estimate: sum
+                    // every binding, so a weight read by N consumers costs N
+                    // reads. That is what a host-residency policy would have
+                    // to move over the bus each round.
+                    auto b = self->weight_prof_bytes_.find(name);
+                    if (b != self->weight_prof_bytes_.end()) {
+                        self->weight_prof_round_read_bytes_ += b->second;
+                    }
                 });
         }
     }
@@ -1829,6 +1839,14 @@ Runtime::ListTensors() const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
+
+    // [mmroute] per-op MatMul kernel-route readout: one stderr line per MatMul
+    // per round, naming the kernel family the op dispatched and the shape
+    // contract it was picked from (Matmul.hpp set_route). The route is stored
+    // on the op, so it survives a CACHED replay round where execute() is
+    // skipped -- the print sits after onExecute in the per-op loop and reads
+    // the op's last recording either way. Off unless set.
+    const bool mmroute = std::getenv("VKOP_MATMUL_ROUTE") != nullptr;
 
     // Record-once-replay: VKOP_REPLAY=1 caches each op's recorded command
     // buffer after round 0 and replays it verbatim on later rounds, skipping
@@ -3160,6 +3178,17 @@ double Runtime::Run() {
                                 .c_str());
                 }
             }
+            // [mmroute] per-op MatMul kernel-route 打点. The route is recorded
+            // as a member on the op (Matmul.hpp set_route), so it survives a
+            // CACHED replay round where execute() is skipped -- this print runs
+            // in both graph and replay modes and always reads the op's last
+            // recording. Env-gated; off, this costs one getenv.
+            if (mmroute &&
+                node_ops_[node_idx]->get_type() == ops::OpType::MATMUL) {
+                fprintf(stderr, "[mmroute] %s | %s\n",
+                        node_ops_[node_idx]->get_name().c_str(),
+                        node_ops_[node_idx]->route_info().c_str());
+            }
             auto aw_t0 = run_profile ? std::chrono::steady_clock::now()
                                      : std::chrono::steady_clock::time_point{};
             // In graph mode the op recorded straight into the shared segment,
@@ -3719,6 +3748,8 @@ void Runtime::weight_prof_finish_round() {
     ++weight_prof_rounds_;
     weight_prof_round_distinct_.push_back(
         static_cast<int>(weight_prof_round_hits_.size()));
+    weight_prof_total_read_bytes_ += weight_prof_round_read_bytes_;
+    weight_prof_round_read_bytes_ = 0;
     for (const auto &kv : weight_prof_round_hits_) {
         weight_prof_total_hits_[kv.first] += kv.second;
     }
@@ -3812,6 +3843,20 @@ void Runtime::weight_prof_report() {
                 ? 100.0 * static_cast<double>(never_bytes + occ_bytes) /
                       static_cast<double>(resident_bytes)
                 : 0.0);
+    // Read-bytes per round: what a host-residency policy would have to move
+    // over the bus each token if every weight lived in host memory. Compare it
+    // with the device's measured PCIe bandwidth to get the paging floor. On a
+    // dense decoder it converges on the resident total (every byte is read
+    // every round, several of them twice); a routed model would read a
+    // fraction, and that fraction is the whole point of tiering.
+    const double read_mib =
+        static_cast<double>(weight_prof_total_read_bytes_) / (mib * rounds);
+    fprintf(stderr,
+            "[weightprof] read bytes/round: %.2f MiB (%.1f%% of resident) "
+            "= %.3f GiB/s at 60 fps\n",
+            read_mib,
+            resident_bytes ? 100.0 * read_mib / (resident_bytes / mib) : 0.0,
+            read_mib * 60.0 / 1024.0);
 }
 
 void Runtime::TraceNode(const std::string &name) {

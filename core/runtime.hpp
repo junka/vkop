@@ -158,6 +158,19 @@ class Runtime {
     // cross-round accumulation (name -> total bindings over all rounds seen).
     std::unordered_map<std::string, int> weight_prof_round_hits_;
     std::unordered_map<std::string, long> weight_prof_total_hits_;
+    // Initializer name -> bytes, for the hook's O(1) byte accounting. The
+    // resident table is already sorted and would need a search on every bind;
+    // this is the same data keyed for lookup.
+    std::unordered_map<std::string, size_t> weight_prof_bytes_;
+    // Bytes any MatMul read this round (summed over every binding, so a weight
+    // bound by N consumers counts N times) and the cross-round total. This is
+    // the number the host-residency decision actually turns on: resident bytes
+    // say what *could* be paged out, but the bandwidth a paging policy would
+    // have to pay is read-bytes-per-round, and it is what a dense model pins
+    // at (nearly) every resident byte every round while a routed model does
+    // not.
+    size_t weight_prof_round_read_bytes_ = 0;
+    size_t weight_prof_total_read_bytes_ = 0;
     // Round index -> how many distinct initializers were hit that round (for
     // the OCCASIONAL "seen in k of N rounds" statistic).
     std::vector<int> weight_prof_round_distinct_;

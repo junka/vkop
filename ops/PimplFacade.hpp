@@ -105,6 +105,10 @@ class PimplFacade : public Operator {
     std::vector<PassInfo> recorded_passes() const override {
         return impl_->recorded_passes();
     }
+    // Same reason as the two above: the route tag is set inside impl_'s
+    // execute(), so the façade must read it there.
+    std::string route_tag() const override { return impl_->route_tag(); }
+    std::string route_info() const override { return impl_->route_info(); }
 
   protected:
     std::unique_ptr<Operator> impl_;
