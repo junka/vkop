@@ -1787,6 +1787,20 @@ template <typename T> class Tensor : public ITensor {
                                         copy_bytes, offset);
         cmd.end();
         cmd.submit(dev->getComputeQueue());
+        // cmd.wait() is the wait this readback has always used, and it is not
+        // enough: it waits on THIS copy's own binary semaphore, which bounds
+        // this command buffer and says nothing about what the host may read.
+        // The submit above is ordered w.r.t. earlier submits by per-queue FIFO,
+        // but nothing fences the host memcpy at the end of this function
+        // against work the GPU is still executing -- on a single-queue device
+        // the drain above is skipped, so a small readback (a 64x64 fp16 tile,
+        // tens of microseconds of GPU) can finish on the host side before the
+        // copy lands, and read the staging bytes as they were. That is
+        // data-dependent: a wide fp16 row gives the copy time to land before
+        // the host thread gets there, which is why this only bit the small
+        // shapes. Drain the queue, then the existing semaphore wait is
+        // redundant but harmless (it is already signalled).
+        dev->wait_all_done();
         cmd.wait();
         // Device->host visibility: the copy wrote through non-coherent cached
         // memory (when the pool landed there); drop stale cache lines before
