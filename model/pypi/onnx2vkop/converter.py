@@ -434,6 +434,38 @@ class ModelConverter:
         for node in graph.node:
             print("Processing node:", node.name, "of type:", node.op_type)
             attributes = {}
+            if node.op_type == "TopK" and len(node.input) >= 2:
+                # ONNX TopK carries k as a scalar int64 INPUT (node.input[1]),
+                # not an attribute. ops/Topk.hpp reads it from the "K"
+                # attribute via setAttribute(); without this fold the op runs
+                # on its ctor default (k=1, fp16-rounded to 2) and writes a
+                # [rows, 2] result over the [rows, k] outputs -- the router
+                # weights then carry only the first two slots (measured on
+                # qwen2_moe: TopK_output_0 ne=64 instead of 128, logits
+                # correlated with the reference but wrong).
+                # Fail closed when the constant cannot be resolved: a wrong K
+                # silently reads the wrong bytes, which is worse than a
+                # conversion that refuses.
+                k_name = node.input[1]
+                k_arr = None
+                for init in graph.initializer:
+                    if init.name == k_name:
+                        k_arr = numpy_helper.to_array(init)
+                        break
+                if k_arr is None:
+                    for n2 in graph.node:
+                        if n2.op_type == "Constant" and n2.output and \
+                                n2.output[0] == k_name:
+                            for a in n2.attribute:
+                                if a.name == "value":
+                                    k_arr = numpy_helper.to_array(a.t)
+                            break
+                if k_arr is None or k_arr.size != 1:
+                    raise UnsupportedOpError(
+                        f"vkop: TopK node '{node.name}': k input '{k_name}' "
+                        f"is not a resolvable scalar constant (the runtime "
+                        f"reads K from an attribute, not an input)")
+                attributes["K"] = int(k_arr.reshape(-1)[0])
             for attr in node.attribute:
                 # https://github.com/onnx/onnx/blob/main/onnx/onnx.proto
                 # message AttributeProto

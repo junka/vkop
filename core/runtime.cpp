@@ -589,6 +589,29 @@ void Runtime::LoadModel() {
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
+        } else if (okind == ElemKind::kInt32) {
+            // A TopK indices graph output (the MoE router's top-k ids): the
+            // kernel writes int32 and ops/Topk.hpp refuses anything else at
+            // execute time. Pre-binding an fp16 tensor under this name makes
+            // the node-output walk take it verbatim (the tensor_map hit in
+            // the "model output" branch) and the op throws on first run, so
+            // the file's dtype must be honored here, like the fp8 branches
+            // above. Dims are sanitized (the fp16/fp32 branches keep raw
+            // dims on purpose — established behavior the dense model's
+            // dynamic outputs rely on): a raw -1 in an int32 [bs, k] output
+            // makes size_ negative and vkCreateBuffer rejects the huge
+            // unsigned result, while the TopK kernel resize()s the shape at
+            // execute anyway.
+            std::vector<uint32_t> sane;
+            sane.reserve(o.dims.size());
+            for (int d : o.dims) {
+                sane.push_back(d < 0 ? 1u : static_cast<uint32_t>(d));
+            }
+            auto t = std::make_shared<Tensor<int32_t>>(sane, true);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
         } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
@@ -1094,6 +1117,26 @@ void Runtime::LoadModel() {
                         } else {
                             dtype_marker = "_f32_";
                         }
+                    } else if (type == vkop::ops::OpType::TOPK) {
+                        // TopK has two outputs with different dtypes: the
+                        // values follow the data input, but the indices are
+                        // int32 — topk.comp writes core::Tensor<int> and
+                        // ops/Topk.hpp's execute() refuses anything else. The
+                        // generic branches below would hand the indices output
+                        // the data dtype (fp16/fp32) and the op would throw at
+                        // execute time. The graph's recorded dtype is the only
+                        // per-output channel (qwen2_moe_export_onnx.py declares
+                        // both TopK outputs in graph.output for exactly this).
+                        const std::string &rdt = out_shape.dtype;
+                        if (rdt == "int32") {
+                            dtype_marker = "_i32_";
+                        } else if (rdt == "int64") {
+                            dtype_marker = "_i64_";
+                        } else if (rdt == "float32") {
+                            dtype_marker = "_f32_";
+                        } else {
+                            dtype_marker = "_f16_";
+                        }
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int64_t)) {
@@ -1178,6 +1221,15 @@ void Runtime::LoadModel() {
                             // create off-GPU so copyToCPU doesn't deref null.
                             auto t = std::make_shared<Tensor<int8_t>>(
                                 alloc_dims, false);
+                            t->set_ref_cnt(consumers[out_shape.name]);
+                            tensor_map[out_shape.name] = t;
+                            node_outputs.push_back(t);
+                        } else if (dtype_marker == "_i32_") {
+                            // TopK's indices output: topk.comp writes it on
+                            // GPU, so unlike the host-computed int64 chain it
+                            // must be backed by a device buffer.
+                            auto t = std::make_shared<Tensor<int32_t>>(
+                                alloc_dims, true);
                             t->set_ref_cnt(consumers[out_shape.name]);
                             tensor_map[out_shape.name] = t;
                             node_outputs.push_back(t);

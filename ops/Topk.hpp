@@ -134,18 +134,28 @@ class Topk : public Operator {
         auto outshape = inshape;
         outshape[axis] = para_.k;
 
+        size_t want_elems = 1;
+        for (int d : outshape) {
+            want_elems *= static_cast<size_t>(d);
+        }
+        // A pre-allocated graph output (the MoE router's top-k ids/values
+        // are declared graph outputs for the M1 readback) arrives with the
+        // file's sanitized placeholder dims ([1, K]) — size 4, not 0. The
+        // old size()==0 check skipped the resize and the kernel wrote the
+        // real [rows, K] over a K-element buffer: heap corruption, and every
+        // token after the first read garbage routing weights.
         std::shared_ptr<VulkanBuffer> output_value = nullptr;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
             using T = decltype(t);
             auto outputvalue = core::as_tensor<T>(outputs[0]);
-            if (outputvalue->size() == 0) {
+            if (static_cast<size_t>(outputvalue->size()) != want_elems) {
                 outputvalue->resize(outshape);
             }
             output_value = outputvalue->as_storage_buffer(m_dev_);
         });
 
         auto outputindex = core::as_tensor<int>(outputs[1]);
-        if (outputindex->size() == 0) {
+        if (static_cast<size_t>(outputindex->size()) != want_elems) {
             outputindex->resize(outshape);
         }
         auto output_index = outputindex->as_storage_buffer(m_dev_);
