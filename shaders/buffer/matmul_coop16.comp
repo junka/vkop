@@ -122,6 +122,11 @@ layout(push_constant) uniform PC {
     int b_dim;
     float epi_scale;
     int epi_bias;
+    int K_act;      // see GpuMatMulParam: the SwiGLU down fold's x-column
+                    // count. The coop kernel never reads it, but the host
+                    // pushes one struct, so the fields after it must land on
+                    // the same offsets here as in matmul.comp.
+    int mind_k;     // ditto -- the fold's strip depth, unread here.
     int epi_bias_batch;
     int attn_softmax;
     int b_shared; // 1 = B is broadcast over the batch axes: B's slice index

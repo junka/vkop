@@ -106,6 +106,34 @@ layout(set = 0, binding = 6) readonly buffer EpiBias {
     uint data[];
 } uEpiBias;
 
+// SwiGLU down-projection fusion. The converter folded
+//
+//     down = MatMul(Mul(Mul(gate, Sigmoid(gate)), up), Wd)
+//
+// into one MatMul whose A input (binding 1) is the shared MLP input x and whose
+// B input (binding 2) is the down weight Wd [K=N_up, N=hidden]. The two
+// projections the fold swallowed ride in here:
+//
+//   binding 7  uInputB2:  Wg, the gate weight [K_out, N_up], same layout and
+//                         dtype rules as binding 2 (transB == 0, [batch, K, N]).
+//   binding 8  uInputAct: Wu, the up weight, likewise.
+//
+// Both are declared in every build on purpose: a descriptor a pipeline never
+// reads is harmless and unbound, and the pre-existing fp16 module already
+// advertises these two numbers, so every shared pipeline stays at seven
+// bound descriptors.
+//
+// The contractions are silu(x . Wg) * (x . Wu) over the whole K_out, i.e. one
+// contraction, because silu is not linear and cannot be folded per k. What the
+// down kernel saves either way is the M*N_up activation tensor -- its write,
+// its read-out and its allocation -- plus the two standalone up dispatches.
+layout(set = 0, binding = 7) readonly buffer InB2 {
+    uint data[];
+} uInputB2;
+layout(set = 0, binding = 8) readonly buffer InAct {
+    uint data[];
+} uInputAct;
+
 layout(push_constant) uniform PC {
     int M;
     int N;
@@ -166,6 +194,13 @@ layout(push_constant) uniform PC {
     float epi_scale; // attention epilogue: multiply every output by this (the
                      // 1/sqrt(head_dim) scale) before adding epi_bias.
     int epi_bias;   // 1 = apply uEpiBias[out_idx] after the scale. 0 = off.
+    int K_act;      // x's column count (K_out) in the SwiGLU down fold (see
+                    // GpuMatMulParam): K counts the weight rows (the up width
+                    // N_up), K_act x's columns. Set only by that route, 0
+                    // elsewhere.
+    int mind_k;     // the down fold's deposit grid-x extent GX = ceil(K / 512);
+                    // the fold pass sums GX partials. Set only by that route,
+                    // 0 elsewhere.
     int epi_bias_batch; // when epi_bias: the bias tensor's flat batch count
                         // (== total batch / broadcast ratio over the head axis).
                         // bias_idx = (n / (batch / epi_bias_batch)) * M * N + ...
@@ -178,6 +213,10 @@ layout(push_constant) uniform PC {
     int b_shared; // 1 = B is broadcast over the batch axes (a [K, N] weight
                   // shared by every output slice): bmap() folds B's slice
                   // index to 0. See GpuMatMulParam.
+    int ks_part; // The split-K GEMV's fold pass -- see GpuMatMulParam. In the
+                 // -DDOWN_ACT module this is also the entry-point selector:
+                 // its two passes (deposit, fold) share one build, so the
+                 // host's flag picks which one runs.
 } uPC;
 
 // ---------------------------------------------------------------------------
@@ -673,6 +712,7 @@ void matmul16_w4_quad() {
     uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(s.zw);
 }
 
+#ifndef DOWN_ACT
 // ---- split-K GEMV -------------------------------------------------------
 // At decode time A has a single row, so the column-parallel kernels launch a
 // 16x16 workgroup in which only the yi == 0 lane survives: 15/16 of every
@@ -1784,6 +1824,220 @@ void matmul16_odd_n() {
     }
     uScratch.data[c_base + i * uPC.N + j] = floatBitsToUint(sum);
 }
+
+#endif  // !DOWN_ACT
+
+// ---------------------------------------------------------------------------
+// SwiGLU down-projection fusion (-DDOWN_ACT module).
+//
+// One MatMul carries two GEMMs and the elementwise glue between them:
+//
+//   out = (silu(x . Wg) * (x . Wu)) . Wd
+//
+// with Wd the down weight [N_up, N] (this MatMul's ordinary B) and the fold
+// adding x (the shared MLP input, K_out wide) plus the up-projection weights
+// at bindings 7 (Wg) and 8 (Wu). The readout walks the down weight's N as
+// usual, while the up axis never reaches memory: the gate and up contractions
+// run inside the same workgroup and their product feeds the down accumulator
+// directly.
+//
+// Cost against the three standalone GEMMs: each block walks all of K_out over
+// both up streams for its slice of the up axis, so the up-weight read traffic
+// per block is its own share of the standalone pair -- and what disappears is
+// the whole M*N_up activation write plus its readout, the mid-tensor
+// allocation, and the two extra dispatches.
+// ---------------------------------------------------------------------------
+// Split-K-style GEMV fold (-DKSPLIT512 build: 512-lane blocks). Grid:
+// x = the up-axis block count GX = ceil(K / 512), y = batch * ceil(M / 16).
+// Bindings: 1 = x, 2 = Wd, 7 = Wg, 8 = Wu, 3 = the fp32 scratch.
+//
+// One block owns 512 up columns (j = gx*512 + lane) for every row of a
+// 16-row tile. Stage 1 gives each (row, up column) pair its whole-K_out gate
+// and up sums: the lane owns one up column, the row loops in registers, and
+// x's row start is even whenever K_out is, so the trips run eight k's deep
+// like the plain GEMV's. Stage 2 applies the single silu and walks the
+// block's j slice against Wd -- the lane owns four output columns, reads
+// Wd[j][c] once per j, and feeds all 16 tile rows from shared. The per-block
+// partials land in scratch as fp32 words; the fold pass (ks_part == 1) sums
+// them and packs the fp16 output.
+//
+// The activation never reaches memory: h lives in this block's shared memory
+// for the handful of instructions the down walk needs it, and the only global
+// traffic beyond the weights is the fp32 partials. uPC.mind_k carries GX so
+// the fold's loop bound is the deposit grid's x extent by construction.
+#define DA_MT 16
+shared float da_h[512 * DA_MT];
+
+// One element of Wg (binding 7) / Wu (binding 8). Both are [K_out, N_up] --
+// the gate/up contraction length is x's K, and their column count is N_up =
+// uPC.K here (the down weight's row count) -- so element [k][j] sits at
+// (b * K_out + k) * N_up + j and the lane picks its half of the word.
+float down_act_gj(int b, int j, int k) {
+    int e = (b * uPC.K_act + k) * uPC.K + j;
+    vec2 v = unpackHalf2x16(uInputB2.data[e >> 1]);
+    return (e & 1) != 0 ? v.y : v.x;
+}
+
+float down_act_uj(int b, int j, int k) {
+    int e = (b * uPC.K_act + k) * uPC.K + j;
+    vec2 v = unpackHalf2x16(uInputAct.data[e >> 1]);
+    return (e & 1) != 0 ? v.y : v.x;
+}
+
+// Four Wd columns at up row j: Wd is [batch, N_up, N] fp16, so the batch
+// slice stride is K * N and the lane's quad starts at word
+// ((b_row + j*N) + c) >> 1 (N % 4 == 0 => never straddles).
+vec4 down_act_w(int b, int j, int c) {
+    int w = ((bmap(b) * uPC.K + j) * uPC.N + c) >> 1;
+    return vec4(unpackHalf2x16(uInputB.data[w]),
+                unpackHalf2x16(uInputB.data[w + 1]));
+}
+
+// x is [batch, M, K_out] fp16: one half per k, so a scalar read keeps the
+// tail loop uniform whatever the row start's parity.
+float down_act_xi(int a_off, int k) {
+    int idx = a_off + k;
+    vec2 v = unpackHalf2x16(uInputA.data[idx >> 1]);
+    return (idx & 1) != 0 ? v.y : v.x;
+}
+
+// The deposit pass: stage 1 (gate/up sums per row x up column) and stage 2
+// (the down walk over the block's j slice), then the fp32 partial store.
+void matmul16_ksplit_down_act() {
+    int rty = int(gl_WorkGroupID.y);
+    int rt = (uPC.M + DA_MT - 1) / DA_MT;
+    int b_n = rty / rt;
+    int tile = rty - b_n * rt;
+    if (b_n >= uPC.batch) return;
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    int gx = int(gl_WorkGroupID.x);
+    int j0 = gx * 512;
+    int kw = uPC.K;     // N_up: the up width = the down contraction
+    int kx = uPC.K_act; // K_out: x's columns
+    int mt = min(DA_MT, uPC.M - tile * DA_MT);
+    int bb = bmap(b_n);
+    int j = j0 + lane;
+
+    // Stage 1. The lane's up column is fixed; each tile row re-reads its own
+    // x words and the lane's two weight words per k (the Wg/Wu column slice
+    // stays L1-resident across the row loop).
+    for (int r = 0; r < DA_MT; ++r) {
+        float gr = 0.0;
+        float ur = 0.0;
+        int grow = b_n * uPC.M + tile * DA_MT + r;
+        if (r < mt && j < kw) {
+            int a_off = grow * kx;
+            int k = 0;
+            if ((kx & 1) == 0) {
+                // Eight k's per trip: 8 Wg words + 8 Wu words + the trip's 4
+                // x words all issued before any is consumed (the plain
+                // GEMV's memory-level-parallelism rule). x pairs (k, k+1)
+                // into one word because a_off is even on this path.
+                for (; k + 7 < kx; k += 8) {
+                    vec2 x0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+                    vec2 x1 =
+                        unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+                    vec2 x2 =
+                        unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
+                    vec2 x3 =
+                        unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+                    vec4 xs = vec4(x0.x, x0.y, x1.x, x1.y);
+                    vec4 xt = vec4(x2.x, x2.y, x3.x, x3.y);
+                    gr += xs.x * down_act_gj(bb, j, k) +
+                          xs.y * down_act_gj(bb, j, k + 1) +
+                          xs.z * down_act_gj(bb, j, k + 2) +
+                          xs.w * down_act_gj(bb, j, k + 3) +
+                          xt.x * down_act_gj(bb, j, k + 4) +
+                          xt.y * down_act_gj(bb, j, k + 5) +
+                          xt.z * down_act_gj(bb, j, k + 6) +
+                          xt.w * down_act_gj(bb, j, k + 7);
+                    ur += xs.x * down_act_uj(bb, j, k) +
+                          xs.y * down_act_uj(bb, j, k + 1) +
+                          xs.z * down_act_uj(bb, j, k + 2) +
+                          xs.w * down_act_uj(bb, j, k + 3) +
+                          xt.x * down_act_uj(bb, j, k + 4) +
+                          xt.y * down_act_uj(bb, j, k + 5) +
+                          xt.z * down_act_uj(bb, j, k + 6) +
+                          xt.w * down_act_uj(bb, j, k + 7);
+                }
+            }
+            for (; k < kx; ++k) {
+                float xv = down_act_xi(a_off, k);
+                gr += xv * down_act_gj(bb, j, k);
+                ur += xv * down_act_uj(bb, j, k);
+            }
+        }
+        // One silu per reassembled gate; a dead lane's silu(0) * 0 is exactly
+        // zero, so past-the-end rows and columns stage zeros for free.
+        da_h[lane * DA_MT + r] = gr / (1.0 + exp(-gr)) * ur;
+    }
+    barrier();
+
+    // Stage 2: the down partial. The lane owns output columns c0..c0+3 and
+    // walks the block's whole j slice; Wd[j][c] loads once per j and feeds
+    // every tile row from shared. Consecutive r share the Wd load, so the
+    // row axis is free here.
+    for (int c0 = lane * 4; c0 < uPC.N; c0 += 2048) {
+        float acc[DA_MT][4];
+        for (int r = 0; r < DA_MT; ++r) {
+            acc[r][0] = 0.0;
+            acc[r][1] = 0.0;
+            acc[r][2] = 0.0;
+            acc[r][3] = 0.0;
+        }
+        int jend = min(j0 + 512, kw);
+        for (int jj = j0; jj < jend; ++jj) {
+            vec4 w = down_act_w(b_n, jj, c0);
+            int hb = (jj - j0) * DA_MT;
+            for (int r = 0; r < DA_MT; ++r) {
+                float h = da_h[hb + r];
+                acc[r][0] += h * w.x;
+                acc[r][1] += h * w.y;
+                acc[r][2] += h * w.z;
+                acc[r][3] += h * w.w;
+            }
+        }
+        int stride = uPC.mind_k * uPC.N; // per-row scratch stride
+        int base = (b_n * uPC.M + tile * DA_MT) * stride + gx * uPC.N + c0;
+        for (int r = 0; r < DA_MT; ++r) {
+            if (r >= mt) continue;
+            int w = base + r * stride;
+            uScratch.data[w] = floatBitsToUint(acc[r][0]);
+            uScratch.data[w + 1] = floatBitsToUint(acc[r][1]);
+            uScratch.data[w + 2] = floatBitsToUint(acc[r][2]);
+            uScratch.data[w + 3] = floatBitsToUint(acc[r][3]);
+        }
+    }
+}
+
+// The fold pass: sum the deposit's grid-x partials for one output row and
+// pack the fp16 result. Grid: x = ceil(N / 2048), y = batch * M. The layout
+// it reads is the deposit's ((row * GX + gx) * N + c); GX rides in mind_k,
+// so the two passes cannot disagree about the partial count.
+void matmul16_ksplit_fold_down_act() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int lane = int(gl_LocalInvocationID.y) * KSG + int(gl_LocalInvocationID.x);
+    int c0 = (int(gl_WorkGroupID.x) * 512 + lane) * 4;
+    if (c0 >= uPC.N) return;
+    int gx = uPC.mind_k;
+    int base = row * gx * uPC.N + c0;
+    float a0 = 0.0;
+    float a1 = 0.0;
+    float a2 = 0.0;
+    float a3 = 0.0;
+    for (int s = 0; s < gx; ++s) {
+        int w = base + s * uPC.N;
+        a0 += uintBitsToFloat(uScratch.data[w]);
+        a1 += uintBitsToFloat(uScratch.data[w + 1]);
+        a2 += uintBitsToFloat(uScratch.data[w + 2]);
+        a3 += uintBitsToFloat(uScratch.data[w + 3]);
+    }
+    int out_i = row * uPC.N + c0;
+    uOutput.data[out_i >> 1] = packHalf2x16(vec2(a0, a1));
+    uOutput.data[(out_i + 2) >> 1] = packHalf2x16(vec2(a2, a3));
+}
+
 #endif
 
 #ifndef FP16
@@ -1899,6 +2153,23 @@ void matmul32() {
 // in ops/Matmul.hpp. Same bindings, push constants and workgroup as the general
 // module, so only the pipeline it is bound to differs.
 void main() { matmul16_w8_ksplit_wide(); }
+#elif defined(DOWN_ACT)
+#if !defined(FP16)
+#error "the SwiGLU down-projection module needs -DFP16"
+#endif
+// The -DDOWN_ACT build: the SwiGLU-folded down projection. Bindings 7/8 are
+// declared in this source for every build, but only this module's host
+// pipeline has nine descriptors, so a dispatch on any other MatMul pipeline
+// must never reach a kernel here. The module is built with -DKSPLIT512: its
+// two passes (deposit, fold) share this one entry, selected by uPC.ks_part
+// (see GpuMatMulParam), and both take their geometry from it.
+void main() {
+    if (uPC.ks_part != 0) {
+        matmul16_ksplit_fold_down_act();
+    } else {
+        matmul16_ksplit_down_act();
+    }
+}
 #elif defined(KSPLIT512)
 // The -DKSPLIT512 build: a ksplit-only 512-lane module (local_size 32x16,
 // KS_LANES above). Its host selects it with VKOP_KSPLIT512=1 only for

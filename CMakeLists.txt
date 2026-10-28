@@ -377,6 +377,24 @@ add_custom_command(
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS_FOLD})
 
+# The SwiGLU down-projection fold (-DDOWN_ACT): one MatMul that absorbs the
+# gate and up projections and their elementwise glue, so the M*N_up activation
+# never reaches memory. A module of its own for the same reason W8_WIDE is --
+# the fold needs two descriptors no other build declares, and a separate module
+# keeps the shared fp16 pipeline untouched if a driver refuses it. Missing key
+# => MatMulBuffer::down_act_pipeline yields nothing and the op falls back to the
+# three standalone GEMMs.
+set(SPIRV_FILE_DOWN_ACT ${SPIRV_DIR}/buffer_matmul_down_act_fp16.spv)
+add_custom_command(
+    OUTPUT ${SPIRV_FILE_DOWN_ACT}
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+            -fshader-stage=compute -g --target-spv=spv1.3
+            -o ${SPIRV_FILE_DOWN_ACT} -DFP16 -DDOWN_ACT -DKSPLIT512
+    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul (SwiGLU down fold, fp16) to SPIR-V"
+)
+list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_DOWN_ACT})
+
 # Extra SPIR-V builds of one shader source under explicit archive keys. The
 # host resolves these by the same key it sees in the executable (MatMul's
 # coopmat shapes and geometries, see MatMulBuffer::build_coop_pipeline and
@@ -493,6 +511,10 @@ list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_tiled_ks_split_fp16:${SPIRV_FILE_KS_SPLIT}
      --spv buffer_matmul_tiled_ks_fold_fp16:${SPIRV_FILE_KS_FOLD})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS_SPLIT} ${SPIRV_FILE_KS_FOLD})
+# And the SwiGLU down fold.
+list(APPEND ARCHIVE_ARGS
+     --spv buffer_matmul_down_act_fp16:${SPIRV_FILE_DOWN_ACT})
+list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_DOWN_ACT})
 # And for every vkop_shader_variant build: the macro paired each key with its
 # .spv, so no per-key line is needed here.
 list(LENGTH VARIANT_SPV_KEYS VARIANT_COUNT)
@@ -540,18 +562,19 @@ target_link_libraries(vkop PRIVATE ${CMAKE_DL_LIBS})
 
 add_subdirectory(model)
 
+# Formatting is a manual `make format-code`, never a build dependency. The
+# target has no OUTPUT, so as a vkop dependency it re-ran on every build and
+# -i rewrote files in place, bumping mtimes and forcing needless recompiles.
 find_program(CLANG_FORMAT "clang-format")
 if(NOT CLANG_FORMAT)
-  message(WARNING "clang-format not found, formatting step will be skipped.")
+    message(WARNING "clang-format not found, formatting step will be skipped.")
 else()
-  add_custom_target(
-    format-code
-    COMMAND ${CLANG_FORMAT} -style=file -i ${ALL_SOURCE_FILES}
-    WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
-    COMMENT "Formatting all C++ source and header files..."
-  )
-
-  add_dependencies(vkop format-code)
+    add_custom_target(
+        format-code
+        COMMAND ${CLANG_FORMAT} -style=file -i ${ALL_SOURCE_FILES}
+        WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
+        COMMENT "Formatting all C++ source and header files..."
+    )
 endif()
 
 find_program(CPPLINT "cpplint")
@@ -715,6 +738,18 @@ if (ENABLE_LLM_CHAT)
     # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.
     add_executable(visual_probe llm/exporter/driver/visual_probe.cpp)
     target_link_libraries(visual_probe PRIVATE vkop vload)
+
+    # MoE prefill GEMM M-sweep: is MatMul time linear in M, or is a fixed
+    # per-dispatch / occupancy cost dominating?  Grouped (per-expert) GEMM can
+    # only pay in the first case.  Standalone so it can be cross-compiled and
+    # shipped to a benchmark host that has no compiler.
+    add_executable(matmul_m_sweep llm/exporter/driver/matmul_m_sweep.cpp)
+    target_link_libraries(matmul_m_sweep PRIVATE vkop vload)
+    # libvkop ships no SPIR-V, so a binary that builds operators without a model
+    # has to be handed the build tree's archive; see include/dev_shaders.hpp.
+    add_dependencies(matmul_m_sweep shader_archive)
+    target_compile_definitions(matmul_m_sweep PRIVATE
+        "VKOP_DEV_SHADER_ARCHIVE=\"${VKOP_SHADER_ARCHIVE_FILE}\"")
 
     # KV-cache probe: runs a minimal attention+cache graph (see
     # /tmp/gen_cache_graph.py) for several rounds so the Attention op's cache

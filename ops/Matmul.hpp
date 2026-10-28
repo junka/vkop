@@ -111,6 +111,23 @@ struct alignas(16) GpuMatMulParam {
     // non-attention MatMul is untouched. Buffer path only.
     float epi_scale = 1.0f;
     int epi_bias = 0;
+    // K as the converter delivered it. In the SwiGLU down fold the kernel's
+    // two operands disagree on K: uPC.K counts the weight rows (the up width
+    // N_up, the down GEMM's contraction), K_act counts x's columns (K_out).
+    // The fold kernels bound each stream with its own number; every other
+    // kernel keeps reading uPC.K (the two agree for them). Buffer path only.
+    //
+    // K_act and mind_k live here, in the padding hole that follows epi_bias
+    // (epi_scale's 4 bytes align the next int), rather than at the struct tail:
+    // a 136-byte struct rounds to 144 under alignas(16) and the push_constant
+    // block would collapse to a 4-byte range, zeroing every constant after it.
+    int K_act = 0;
+    // The SwiGLU down fold's deposit grid-x extent GX = ceil(K / 512): each
+    // deposit block owns 512 up columns and parks fp32 partials for all N
+    // output columns, and the fold pass sums GX of them. Also the fold's loop
+    // bound, so the two passes cannot disagree about the partial count.
+    // Buffer path only.
+    int mind_k = 0;
     // The bias tensor's flat batch count (== total batch / head-broadcast
     // ratio). 0 when epi_bias is off.
     int epi_bias_batch = 0;
@@ -129,6 +146,25 @@ struct alignas(16) GpuMatMulParam {
     // alignas(16) rounding, so the pushed range is unchanged for archives
     // whose shaders do not read it. Buffer path only.
     int b_shared = 0;
+    // The plain split-K GEMV's fold pass, when the host routes through the
+    // standalone fold module. Its lane math (quad = lane % ksplit_q) is
+    // identical to a deposit lane's -- every lane publishes a partial at
+    // slot (slice * q + quad) -- so the shaders tell the two passes apart only
+    // because the host says so. Raising it for a deposit dispatch would make
+    // every lane read slot 0..n_slice-1 of its own quad and write an
+    // unsplit-K result.
+    //
+    // The SwiGLU down fold's split-K pair carries a second meaning: the two
+    // passes run on ONE module (buffer_matmul_down_act_fp16), so this flag is
+    // also the entry-point selector there --
+    // matmul16_ksplit_fold_down_act when set, the whole-GEMV
+    // matmul16_ksplit_down_act otherwise. A shape that reaches the same module
+    // with ksplit=1 and a stale ks_part would run the fold kernel in place of
+    // the deposit; the host keeps the two in step.
+    //
+    // Sits at the struct tail (offset 112): sizeof stays 128 after the
+    // alignas(16) rounding, so the pushed range is unchanged.
+    int ks_part = 0;
 };
 
 } // namespace matmul
@@ -367,6 +403,17 @@ class MatMulBuffer : public BufferFactory {
         }
         if (attributes.find("attn_softmax") != attributes.end()) {
             attn_softmax_ = std::stol(attributes.at("attn_softmax")) != 0;
+        }
+        auto da = attributes.find("down_act");
+        if (da != attributes.end() && !da->second.empty()) {
+            // The converter writes this attribute as a bare integer rather
+            // than the bracketed list parse_attr_list wants: a 1-element ints
+            // list stores as the scalar "1", and a bare list parses to empty
+            // instead of throwing. Accept both spellings so an exporter node
+            // and a hand-built test node agree.
+            const std::string &raw = da->second;
+            auto list = parse_attr_list<int>(raw);
+            down_act_ = !list.empty() ? list[0] != 0 : std::stol(raw) != 0;
         }
     }
 
@@ -1223,6 +1270,12 @@ class MatMulBuffer : public BufferFactory {
         // re-reading the weight per row). ksplit_ok below already refuses to
         // dispatch the GEMV here; the flag must agree with it.
         para_.ksplit = (ksplit && !tiled) ? 1 : 0;
+        // para_ persists across executes and the down fold raises ks_part for
+        // its fold pass without lowering it again, so a later plain split-K
+        // dispatch on this module would run the fold entry in place of its
+        // deposit. Clear it with every other per-dispatch constant; the fold
+        // block sets its own 0/1 pair just below.
+        para_.ks_part = 0;
         para_.wide = 0;
         para_.w4 = weight_4bit ? 1 : 0;
         para_.nf4 = weight_nf4 ? 1 : 0;
@@ -1381,6 +1434,112 @@ class MatMulBuffer : public BufferFactory {
                                    &pack_pc);
             dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
             return;
+        }
+
+        // -------------------------------------------------------------------
+        // SwiGLU down-projection fold (down_act). The converter matched
+        //     down = MatMul(Mul(Mul(gate, Sigmoid(gate)), up), Wd)
+        //     gate = MatMul(x, Wg),  up = MatMul(x, Wu)
+        // and rewrote down's inputs to [x, Wd, Wg, Wu] (bound 1, 2, 7, 8
+        // below), deleting the gate and up nodes -- so there is no "fall back
+        // to the three plain GEMMs" here: by the time this op runs they no
+        // longer exist. If the module cannot run, [x, Wd] is dispatched as the
+        // plain down GEMM and the output is only right for the part of the
+        // graph that the folded operator was not doing; the converter's only
+        // job is to not emit this tag on an archive without the key.
+        //
+        // The four shapes:
+        //   A  = inputs[0] = x        [batch, M, K_out]  fp16
+        //   B  = inputs[1] = Wd       [N_up, N] = [K, N], transB == 0
+        //   B2 = inputs[2] = Wg       [K_out, N_up]   = x's K, this K
+        //   B3 = inputs[3] = Wu       [K_out, N_up]   likewise
+        // so this MatMul's own (m, n, k) are the FOLD's (M, N, N_up): the
+        // kernel's K is the up width (the down GEMM's contraction), while x's
+        // own width K_out rides in K_act and Wg/Wu are read with their true
+        // [K_out, N_up] layout.
+        if (down_act_ && down_act_pipeline() != nullptr && fp16_ != 0 &&
+            !transB_ && inputs.size() == 4 && rank_a >= 2 && rank_b >= 2) {
+            const auto gated_rank = inputs[2]->getShape().size();
+            const int k_out =
+                static_cast<int>(inputs[2]->getShape()[gated_rank - 2]);
+            // The kernel's K is Wd's row count (N_up), which is also its
+            // contraction length; the operator's own k is N_up for the fold.
+            const int n_up = k;
+            // The fold GEMV's geometry (-DKSPLIT512: 512-lane blocks). Each
+            // deposit block owns 512 up columns (gx = grid.x) for a 16-row
+            // tile (grid.y = batch * ceil(M / 16)) and parks fp32 partials
+            // for ALL N output columns in scratch; the fold pass sums the
+            // grid-x blocks. GX rides to the shader in mind_k.
+            const int da_gx = UP_DIV(n_up, 512);
+            // N % 4 == 0 lets the fold lane own four columns and pack fp16
+            // pairs; N <= 2048 covers the output with the block's 512 lanes
+            // (2048 = 512 * 4); N_up % 4 == 0 keeps Wg/Wu's RowAlign row
+            // stride equal to N_up so the [K_out, N_up] indexing is dense.
+            const bool da_ok =
+                (n % 4 == 0) && (n <= 2048) && (n_up % 4 == 0) && k_out >= 1;
+            if (da_ok) {
+                // bind_ssbo APPENDS to objs_, so binding Wg/Wu here would land
+                // them at slots 3 and 4 and leave the pipeline's 9-slot set
+                // half unbound. The block below assigns every slot by index.
+                para_.M = m;
+                para_.N = n;
+                para_.K = n_up;  // the down GEMM's contraction = the up width
+                // x's TRUE column count. The kernels read x with this row
+                // stride and stop the gate/up loop at it; Wg/Wu's RowAlign
+                // pad rows past it are zero and simply never loaded.
+                para_.K_act = k_out;
+                para_.ksplit = 1;     // the DOWN_ACT module's route selector
+                para_.ksplit_q = 0;   // unused by the fold kernels
+                para_.mind_k = da_gx; // the deposit grid's x extent = the
+                                      // fold pass's partial count
+                para_.tile = 0;
+                para_.ks_part = 0; // the module's deposit entry
+                set_route("down_act_gemv", batch, m, n, n_up, rep);
+                const size_t da_words =
+                    static_cast<size_t>(batch) * m * da_gx * n;
+                if (!scratch_da_ || scratch_da_bytes_ != da_words) {
+                    scratch_da_ = std::make_shared<VulkanBuffer>(
+                        m_dev_, da_words * sizeof(float),
+                        STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    scratch_da_bytes_ = da_words;
+                    // Requires TRANSFER_DST; the fill runs on the device at
+                    // the next submit, before either pass. Every word is
+                    // rewritten by the deposit each round, so this only
+                    // guards the first round against a scheduler surprise.
+                    scratch_da_->fillBuffer(m_cmd_->get(), 0,
+                                            da_words * sizeof(float));
+                }
+                objs_.resize(9, nullptr);
+                // Binding 0 is the fold pass's output; binding 3 is the
+                // deposit pass's scratch. The two passes share the module, so
+                // both bindings are always live and neither may double as the
+                // other.
+                objs_[0] = std::static_pointer_cast<VulkanResource>(
+                    outputs[0]->gpu_buffer());
+                objs_[1] = std::static_pointer_cast<VulkanResource>(
+                    inputs[0]->gpu_buffer());
+                objs_[2] = std::static_pointer_cast<VulkanResource>(
+                    inputs[1]->gpu_buffer());
+                objs_[3] =
+                    std::static_pointer_cast<VulkanResource>(scratch_da_);
+                objs_[7] = std::static_pointer_cast<VulkanResource>(
+                    inputs[2]->gpu_buffer());
+                objs_[8] = std::static_pointer_cast<VulkanResource>(
+                    inputs[3]->gpu_buffer());
+                // Deposit: grid-x over the up-axis blocks, grid-y over the
+                // 16-row tiles of every batch slice.
+                dispatch_on(down_act_pipeline_.get(), down_act_ds_[m_id_],
+                            da_gx, batch * ((m + 15) / 16));
+                // Fold: sums the deposit's partials. Reading what another
+                // dispatch wrote needs an execution dependency between the
+                // two.
+                scratch_da_->shaderWriteBarrier(m_cmd_->get());
+                para_.ks_part = 1; // the module's fold entry
+                dispatch_on(down_act_pipeline_.get(), down_act_ds_[m_id_],
+                            UP_DIV(n, 2048), batch * m);
+                return;
+            }
         }
 
         if (tiled) {
@@ -2076,6 +2235,65 @@ class MatMulBuffer : public BufferFactory {
         return w8_wide_pipeline_.get();
     }
 
+    // The SwiGLU down-projection fold (buffer_matmul_down_act_fp16). Nine
+    // descriptors, because this module is the only MatMul build that reads the
+    // gate and up weights: 7/8 are beyond every other module's count, so a
+    // pipeline that declares them cannot be shared. Probed per process like the
+    // 512-lane pair, and for a stronger reason -- the whole point of the fold
+    // is an allocation the host has already skipped, so a refusal must be
+    // visible and must fall back to routing the plain GEMMs.
+    VulkanPipeline *down_act_pipeline() {
+        static bool refused_by_driver = false;
+        static bool warned_missing_bytes = false;
+        if (down_act_pipeline_) {
+            return down_act_pipeline_.get();
+        }
+        if (refused_by_driver || down_act_no_bytes_) {
+            return nullptr;
+        }
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv("buffer_matmul_down_act_fp16");
+        } catch (const std::exception &e) {
+            down_act_no_bytes_ = true;
+            if (!warned_missing_bytes) {
+                warned_missing_bytes = true;
+                std::fprintf(
+                    stderr,
+                    "[vkop] %s\n[vkop] SwiGLU down_proj folds stay off "
+                    "until that key is shipped\n",
+                    e.what());
+            }
+            return nullptr;
+        }
+        try {
+            down_act_pipeline_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                    DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), use_uab, 0);
+            for (int i = 0; i < vkop::kInflight; ++i) {
+                down_act_ds_[i] = down_act_pipeline_->allocDescriptorSets();
+            }
+        } catch (const std::exception &e) {
+            refused_by_driver = true;
+            down_act_pipeline_.reset();
+            std::fprintf(stderr,
+                         "[vkop] SwiGLU down fold pipeline rejected (%s); "
+                         "down_proj runs as three standalone GEMMs\n",
+                         e.what());
+            return nullptr;
+        }
+        return down_act_pipeline_.get();
+    }
+
     // VKOP_KSPLIT512=1: route split-K GEMV dispatches through the 512-lane
     // builds of the ksplit kernels (local_size 32x16, KS_LANES = 512: the same
     // ksplit_q column coverage, twice the K-slice depth per block). This is
@@ -2280,6 +2498,10 @@ class MatMulBuffer : public BufferFactory {
 
     matmul::GpuMatMulParam para_;
     std::shared_ptr<VulkanBuffer> scratch_;
+    // SwiGLU-fold scratch: the split-K GEMV's fp32 partials. One 64x64-word
+    // slot per (batch, output tile, K slice).
+    std::shared_ptr<VulkanBuffer> scratch_da_;
+    size_t scratch_da_bytes_ = 0;
     size_t scratch_bytes_ = 0;
     // Tile-split-K's own K range for THIS dispatch, staged into the scratch
     // header (words 1..3) instead of a push constant: four more ints at the PC
@@ -2356,6 +2578,14 @@ class MatMulBuffer : public BufferFactory {
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
     // 4-column kernel; another MatMul from a reconverted model still tries.
     bool w8_wide_no_bytes_ = false;
+    // The SwiGLU down-projection fold module (see down_act_pipeline). The
+    // converter's "down_act" attribute (an ints list, [1]) marks a MatMul whose
+    // inputs are [x, Wd, Wg, Wu] and whose result is
+    // silu(x . Wg) * (x . Wu) . Wd; down_act_ holds that flag.
+    std::unique_ptr<VulkanPipeline> down_act_pipeline_;
+    VkDescriptorSet down_act_ds_[vkop::kInflight] = {nullptr};
+    bool down_act_no_bytes_ = false;
+    bool down_act_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)
     // Attention QK^T epilogue (folded from a FusedElemwise by the converter):

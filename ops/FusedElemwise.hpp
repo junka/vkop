@@ -30,8 +30,8 @@ namespace ops {
 // limit for long chains.
 //
 // Op-code set (mirrors shaders/buffer/fused_elemwise.comp):
-//   ADD, SUB, MUL, DIV, POW (binary); SQRT, SIGMOID, NEG, EXP, TANH, ERF,
-//   CAST (unary). Operand encoding: 0..MAX_REGS-1 = register;
+//   ADD, SUB, MUL, DIV, POW (binary); SQRT, SIGMOID, SILU, NEG, EXP, TANH,
+//   ERF, CAST (unary). Operand encoding: 0..MAX_REGS-1 = register;
 //   100..100+nScalars-1 = scalar constant. Inputs are preloaded into
 //   reg[0..nInputs-1].
 //
@@ -61,6 +61,9 @@ enum class FusedOp {
     // TANH, already opcode 10). Without ERF those chains break at the erf and
     // the einsum around it stays unfolded — visual.onnx carries 4 such nodes.
     ERF = 13,
+    // x*sigmoid(x). Emitted by the converter only when a SIGMOID's output is
+    // consumed solely by MUL(same_input, sigmoid) — the SwiGLU gate pattern.
+    SILU = 14,
 };
 
 struct alignas(16) FusedElemwisePC {
