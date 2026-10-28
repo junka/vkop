@@ -26,7 +26,6 @@
 #include "ops/Ops.hpp"
 
 #include <gtest/gtest.h>
-#include <torch/torch.h>
 
 using vkop::core::Tensor;
 

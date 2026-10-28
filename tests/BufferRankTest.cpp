@@ -15,6 +15,10 @@
 // skipped for them.
 
 #include <algorithm>
+#include <regex>
+#include <fstream>
+#include <iterator>
+#include <filesystem>
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -27,7 +31,6 @@
 #include "ops/Ops.hpp"
 
 #include <gtest/gtest.h>
-#include <torch/torch.h>
 
 using vkop::core::Tensor;
 
@@ -35,9 +38,18 @@ namespace {
 
 // ---- generic brt_fill / compare (fp32 + fp16) -------------------------------
 
+// `tt` must already be at the element dtype T (a raw Half* is read when T is
+// uint16_t); brt_torch_opt<T>() produces the matching tag. Convert before the
+// call and the T==uint16_t branch works on either an fp16 or an fp32 source.
 template <typename T>
 void brt_fill(std::shared_ptr<Tensor<T>> &t, const torch::Tensor &tt) {
     auto flat = tt.cpu().contiguous().flatten();
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        if (flat.scalar_type() != at::kHalf)
+            flat = flat.to(at::kHalf);
+    } else if (flat.scalar_type() != at::kFloat) {
+        throw std::invalid_argument("brt_fill: fp32 element torch tensor required");
+    }
     std::vector<T> v;
     if constexpr (std::is_same_v<T, uint16_t>) {
         const auto *p =
@@ -55,6 +67,14 @@ bool brt_close_to_torch(const std::shared_ptr<Tensor<T>> &out,
                     const torch::Tensor &ref, float rtol = 0.02f,
                     float atol = 0.02f) {
     auto flat = ref.cpu().contiguous().flatten();
+    // fp16 reads the reference through data_ptr<at::Half>(); an fp32 reference
+    // would fail libtorch's check_type here (see brt_fused_ref_tensor), and
+    // rounding the fp32 reference into fp16 up front is what makes the
+    // tolerance meaningful: both sides then carry the same single rounding.
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        if (flat.scalar_type() != at::kHalf)
+            flat = flat.to(at::kHalf);
+    }
     int n = out->num_elements();
     if (n != flat.numel()) {
         LOG_ERROR("size mismatch: out=%d ref=%lld", n,
@@ -1284,6 +1304,120 @@ TEST(BufferRankTest, MatMulCoop) {
 }
 
 // =========================================================================
+// MatMul down_act — the SwiGLU down_proj fold.
+// One MatMul computes silu(x @ Wg) * (x @ Wu) @ Wd, so the M x N_up activation
+// tensor is never materialized and the gate/up GEMMs and the elementwise glue
+// all disappear. Verified against the four-tensor decomposition — the runtime
+// kernels recompute the activations, so the fused form is an exact (not
+// approximate) rewrite, and any accumulation-order difference stays inside the
+// fp16 tolerance.
+// =========================================================================
+
+// ONNX MatMul convention: out = in @ W (W stored [in_features, out_features],
+// contraction over W's axis 0), matching the exporter's layout. The matmuls
+// run in fp32: the fp16 tensors are exact (the pattern below is a multiple of
+// 2^-3), but an fp16 torch matmul rounds each partial sum to fp16, and those
+// partial sums are exactly what the pattern is sized to keep small -- the
+// final cast to the test's dtype happens in brt_close_to_torch.
+torch::Tensor brt_ref_down_act(const torch::Tensor &x, const torch::Tensor &wg,
+                               const torch::Tensor &wu, const torch::Tensor &wd) {
+    auto f = [](const torch::Tensor &t) { return t.to(torch::kFloat); };
+    auto gate = torch::matmul(f(x), f(wg));
+    auto up = torch::matmul(f(x), f(wu));
+    auto act = gate * torch::sigmoid(gate) * up;
+    return torch::matmul(act, f(wd));
+}
+
+template <typename T>
+bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
+    // Deterministic operands. x is identically 1 (each output is then a pure
+    // sum over N_up, so any misindexing shows up as a bias). The weights come
+    // from the pattern (i*37) % 29 - 14 scaled to +-1.75: 37 and 29 are
+    // coprime, so the residues sweep [-14, 14] in a pseudo-random order whose
+    // 29-term cycles sum to zero -- every partial sum (gate, up, and their
+    // N_up-wide recombination) is then a few residuals wide, far inside fp16
+    // range. A raw arange ramp is NOT: its `up` row sums (133120 at
+    // k_out=n_up=64) overflow fp16 to inf, and the mode-0 zero gate turns
+    // that into 0 * inf = nan in the reference itself.
+    const char *mode = std::getenv("DA_MODE");
+    auto pat = [](int rows, int cols) {
+        auto t = torch::arange(rows * cols,
+                               torch::TensorOptions().dtype(torch::kInt));
+        return (((t * 37) % 29 - 14).to(torch::kFloat) * 0.125f)
+            .to(brt_torch_opt<T>())
+            .reshape({rows, cols});
+    };
+    auto torch_x = torch::ones({m, k_out}, brt_torch_opt<T>());
+    auto torch_wg = torch::zeros({k_out, n_up}, brt_torch_opt<T>());
+    auto torch_wu = pat(k_out, n_up);
+    auto torch_wd = torch::ones({n_up, n}, brt_torch_opt<T>());
+    if (mode && mode[0] == '1') {
+        torch_wg = pat(k_out, n_up);
+    } else if (mode && mode[0] == '2') {
+        torch_wg = pat(k_out, n_up);
+        torch_wd = pat(n_up, n);
+    }
+    auto torch_out = brt_ref_down_act(torch_x, torch_wg, torch_wu, torch_wd);
+    Dev d;
+
+    auto in_x = std::make_shared<Tensor<T>>(std::vector<int>{m, k_out});
+    auto in_wd = std::make_shared<Tensor<T>>(std::vector<int>{n_up, n});
+    auto in_wg = std::make_shared<Tensor<T>>(std::vector<int>{k_out, n_up});
+    auto in_wu = std::make_shared<Tensor<T>>(std::vector<int>{k_out, n_up});
+    brt_fill(in_x, torch_x);
+    brt_fill(in_wd, torch_wd);
+    brt_fill(in_wg, torch_wg);
+    brt_fill(in_wu, torch_wu);
+    brt_upload(in_x, d);
+    brt_upload(in_wd, d);
+    brt_upload(in_wg, d);
+    brt_upload(in_wu, d);
+
+    auto output = brt_make_out<T>(std::vector<int>{m, n}, d);
+    // down_act's operand order is the fused node's: [x, Wd, Wg, Wu].
+    auto op = brt_make_op(vkop::ops::OpType::MATMUL, fp16,
+                          {{"down_act", "1"}}, d);
+    if (!op)
+        return false;
+    op->onExecute({in_x, in_wd, in_wg, in_wu}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    auto ref_h = torch_out.to(at::kHalf).cpu().flatten();
+    {
+        std::vector<float> got;
+        for (int i = 0; i < output->num_elements(); ++i) {
+            if constexpr (std::is_same_v<T, uint16_t>)
+                got.push_back(vkop::core::ITensor::fp16_to_fp32((*output)[i]));
+            else
+                got.push_back(float((*output)[i]));
+        }
+        for (int i = 0; i < output->num_elements() && i < 12; ++i) {
+            std::fprintf(stderr, "[da]   i=%d got=%.5f ref=%.5f\n", i,
+                         got[i],
+                         float(ref_h[i].template item<at::Half>()));
+        }
+    }
+    float rtol = fp16 ? 0.03f : 0.001f;
+    float atol = fp16 ? 0.05f : 0.001f;
+    return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+TEST(BufferRankTest, MatMulDownAct) {
+    // fp32: no fold kernel ships for it, so the op must route the plain GEMMs
+    // and still land on the reference.
+    EXPECT_TRUE(brt_down_act_case<float>(1, 64, 64, 32, false));
+    // GEMV form (M=1 is the decode shape): split-K deposit + fold over scratch.
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 32, 64, 32, true));
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 64, 64, 64, true));
+    // M > 1 through the GEMV form (batch*m rows, one block per row).
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(4, 32, 64, 32, true));
+    // Tiled form: the 64x64 nest, m and n both multiples of 64.
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 64, 64, true));
+    // Tiled form at the smallest nest with two K tiles for the fold.
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 128, 64, true));
+}
+
+// =========================================================================
 // FusedElemwise — register-machine chain in ONE dispatch.
 // Tests Add -> Sqrt -> Mul: out = sqrt(A + B) * A.
 // Program (op codes: ADD=1, SQRT=6, MUL=3; 4 ints/op {op,dst,a,b}):
@@ -1504,8 +1638,349 @@ TEST(BufferRankTest, FusedElemwiseBroadcastInput0LowRank) {
 }
 
 // =========================================================================
-// Resize (buffer port: nearest + asymmetric/floor only)
+// SILU opcode (14): the SwiGLU gate collapse. The converter rewrites a
+// SIGMOID whose only consumer is MUL(same_input, sigmoid) into ONE word:
+//   [7,2,0,0, 3,0,0,2]  (SIGMOID x -> r2; MUL(x, r2) -> r0)
+// becomes
+//   [14,0,0,0]          (r0 = x*sigmoid(x))
+// The whole point is that the emitted CHAIN is unchanged for every other
+// input — here a second Mul by a gate tensor (the down-projection operand),
+// exactly as the SwiGLU block composes it: out = silu(gate) * up.
+// Reference: torch.nn.functional.silu(gate) * up. The two programs must agree
+// to the same tolerance as any other fp16 chain (the collapse drops an
+// intermediate register round), so this test both pins the opcode decode and
+// catches a collapse that folded the WRONG mul (e.g. consumed the up operand).
 // =========================================================================
+template <typename T>
+bool brt_fused_silu_case(const std::vector<int> &shape, bool fp16,
+                         bool collapsed) {
+    Dev d;
+    auto torch_gate = torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>())
+        * 3.0f; // widen: sigmoid saturates at both ends
+    auto torch_up = torch::randn(
+        std::vector<int64_t>(shape.begin(), shape.end()), brt_torch_opt<T>());
+    auto torch_out = torch::tests::silu(torch_gate) * torch_up;
+
+    auto gate = std::make_shared<Tensor<T>>(shape);
+    auto up = std::make_shared<Tensor<T>>(shape);
+    brt_fill(gate, torch_gate);
+    brt_fill(up, torch_up);
+    brt_upload(gate, d);
+    brt_upload(up, d);
+
+    auto output = brt_make_out<T>(shape, d);
+    // collapsed: SILU{14,2,0,0} MUL{3,0,2,1}  — silu(gate) * up
+    // reference: SIGMOID{7,2,0,0} MUL{3,3,0,2} MUL{3,0,3,1}
+    std::string ops_str = collapsed ? "[14,2,0,0, 3,0,2,1]"
+                                    : "[7,2,0,0, 3,3,0,2, 3,0,3,1]";
+    int n = vkop::ops::total_elems(shape);
+    std::string shp = "[" + std::to_string(n) + "," + std::to_string(n) + "]";
+    std::string out_shp = "[" + std::to_string(n) + "]";
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                          {{"ops", ops_str},
+                           {"input_shapes", shp},
+                           {"out_shape", out_shp},
+                           {"rank", "1"},
+                           {"scalars", "[]"}},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute({gate, up}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out);
+}
+
+TEST(BufferRankTest, FusedElemwiseSiluGate) {
+    EXPECT_TRUE(brt_fused_silu_case<float>({2, 3, 4, 5}, false, /*collapsed=*/true));
+    EXPECT_TRUE(brt_fused_silu_case<uint16_t>({2, 3, 4, 5}, true, true));
+    // Odd count exercises the fp16 tail word.
+    EXPECT_TRUE(brt_fused_silu_case<float>({17}, false, true));
+    EXPECT_TRUE(brt_fused_silu_case<uint16_t>({17}, true, true));
+    // The uncollapsed 3-word form must land in the same place — any drift
+    // between the two is the collapse's error budget, not the interpreter's.
+    EXPECT_TRUE(brt_fused_silu_case<float>({2, 3, 4, 5}, false, false));
+    EXPECT_TRUE(brt_fused_silu_case<uint16_t>({2, 3, 4, 5}, true, false));
+    // Saturation: |x| ~ 20 puts exp(-x) near the fp32 overflow limit, where a
+    // naive x*sigmoid(x) written as x/(1+exp(-x)) still has to give 0 / x.
+    {
+        Dev d;
+        auto g = torch::full({8}, -40.0f, brt_torch_opt<float>());
+        auto u = torch::full({8}, 2.0f, brt_torch_opt<float>());
+        auto ref = torch::tests::silu(g) * u;
+        auto gate = std::make_shared<Tensor<float>>(std::vector<int>{8});
+        auto up = std::make_shared<Tensor<float>>(std::vector<int>{8});
+        brt_fill(gate, g);
+        brt_fill(up, u);
+        brt_upload(gate, d);
+        brt_upload(up, d);
+        auto output = brt_make_out<float>(std::vector<int>{8}, d);
+        auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, false,
+                              {{"ops", "[14,2,0,0, 3,0,2,1]"},
+                               {"input_shapes", "[8,8]"},
+                               {"out_shape", "[8]"},
+                               {"rank", "1"},
+                               {"scalars", "[]"}},
+                              d);
+        if (op) {
+            op->onExecute({gate, up}, {output}, 0);
+            brt_run_op(op.get(), d);
+            output->copyToCPU(d.cmdpool);
+            EXPECT_TRUE(brt_close_to_torch(output, ref));
+        }
+    }
+}
+
+// =========================================================================
+// The converter's register program, executed on the CPU.
+//
+// Every fused chain in the real model is generated by the same interpreter in
+// onnx2vkop (fuse_elemwise_chain -> fold_fuse_elemwise_chain), so the thing
+// worth testing end-to-end is not one hand-written program but the shape of
+// the code that emits them. This mirrors the SHADER's semantics exactly (see
+// shaders/buffer/fused_elemwise.comp): operand < 100 = register, >= 100 =
+// scalars[a-100]; dst 0 is the stored output; the chain's own broadcast is
+// handled by the host, so here every input is already the same shape.
+//
+// It is deliberately not shared with the Python: the two emitters agreeing is
+// the property under test, and a shared helper would make the agreement
+// vacuous.
+// =========================================================================
+float brt_fused_eval_op(int oc, float av, float bv) {
+    switch (oc) {
+    case 1:  return av + bv;
+    case 2:  return av - bv;
+    case 3:  return av * bv;
+    case 4:  return av / bv;
+    case 5:  return std::pow(av, bv);
+    case 6:  return std::sqrt(av);
+    case 7:  return 1.0f / (1.0f + std::exp(-av));
+    case 8:  return -av;
+    case 9:  return std::exp(av);
+    case 10: return std::tanh(av);
+    case 11: return av; // CAST, same-dtype no-op
+    case 12: return (bv != 0.0f) ? av : 0.0f; // WHERE fallback
+    case 13: return std::erf(av);
+    case 14: return av / (1.0f + std::exp(-av)); // SILU == av * sigmoid(av)
+    default: LOG_ERROR("unknown fused opcode %d", oc); return 0.0f;
+    }
+}
+
+// Same regex recover_ops() uses in onnx2vkop/optimizer.py: every integer,
+// walked four at a time. A regex rather than a split so a formatting change
+// in `ops_str` (the attr is a string of a Python list) cannot silently shift
+// the operand columns.
+std::vector<int> brt_recover_fused_ops(const std::string &ops_str) {
+    std::vector<int> v;
+    static const std::regex re(R"(-?\d+)");
+    for (auto it = std::sregex_iterator(ops_str.begin(), ops_str.end(), re);
+         it != std::sregex_iterator(); ++it) {
+        v.push_back(std::stoi(it->str()));
+    }
+    return v;
+}
+
+std::vector<float> brt_recover_fused_scalars(const std::string &sc_str) {
+    std::vector<float> v;
+    static const std::regex re(R"(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)");
+    for (auto it = std::sregex_iterator(sc_str.begin(), sc_str.end(), re);
+         it != std::sregex_iterator(); ++it) {
+        v.push_back(std::stof(it->str()));
+    }
+    return v;
+}
+
+// Interpret an emitted ops string over one element's input values.
+void brt_fused_ref_element(const std::vector<int> &ops,
+                           const std::vector<float> &scalars,
+                           const std::vector<float> &input_vals,
+                           std::vector<float> &regs_out) {
+    std::vector<float> reg(vkop::ops::kFusedMaxRegs, 0.0f);
+    for (size_t k = 0; k < input_vals.size() && k < reg.size(); ++k) {
+        reg[k] = input_vals[k];
+    }
+    auto operand = [&](int x) {
+        if (x >= 100) {
+            int si = x - 100;
+            return (si >= 0 && si < (int)scalars.size()) ? scalars[si] : 0.0f;
+        }
+        return (x >= 0 && x < (int)reg.size()) ? reg[x] : 0.0f;
+    };
+    for (size_t o = 0; o + 3 < ops.size(); o += 4) {
+        float av = operand(ops[o + 2]);
+        float bv = operand(ops[o + 3]);
+        float r = brt_fused_eval_op(ops[o], av, bv);
+        if (ops[o + 1] >= 0 && ops[o + 1] < (int)reg.size()) {
+            reg[ops[o + 1]] = r;
+        }
+    }
+    regs_out = reg;
+}
+
+// Full-tensor reference: apply the emitted program to every element. Every
+// input is the same shape (the chains under test are pointwise), so the
+// broadcast machinery is out of the picture and the program is the only thing
+// being checked.
+template <typename T>
+torch::Tensor
+brt_fused_ref_tensor(const std::string &ops_str, const std::string &scalars_str,
+                     const std::vector<torch::Tensor> &in_vals) {
+    auto ops = brt_recover_fused_ops(ops_str);
+    auto scalars = brt_recover_fused_scalars(scalars_str);
+    std::vector<torch::Tensor> flats;
+    for (auto &t : in_vals) {
+        flats.push_back(t.cpu().contiguous().flatten().to(torch::kFloat32));
+    }
+    int64_t n = flats[0].numel();
+    // The interpreter above always runs in fp32 and the reference is built in
+    // fp32, so build the tensor fp32 too. brt_close_to_torch is what has to
+    // accept the dtype crossing: rounding `regs[0]` into a `T` slot here would
+    // round a SECOND time (once out of the interpreter, once out of the
+    // kernel's fp16 store) and the two roundings do not agree to any useful
+    // tolerance.
+    auto out = torch::empty({n}, torch::TensorOptions().dtype(torch::kFloat32));
+    auto *op = out.data_ptr<float>();
+    std::vector<float> vals(flats.size());
+    std::vector<float> regs;
+    for (int64_t i = 0; i < n; ++i) {
+        for (size_t k = 0; k < flats.size(); ++k) {
+            vals[k] = flats[k].data_ptr<float>()[i];
+        }
+        brt_fused_ref_element(ops, scalars, vals, regs);
+        op[i] = regs[0];
+    }
+    return out;
+}
+
+// Run one emitted program on the GPU over `inputs` and compare with the CPU
+// reference above; `fp16` toggles the storage dtype of both.
+template <typename T>
+bool brt_fused_program_case(const std::string &ops_str,
+                            const std::vector<torch::Tensor> &torch_ins,
+                            const std::vector<int> &shape, bool fp16,
+                            const std::string &scalars_str = "[]",
+                            float rtol = 0.02f) {
+    Dev d;
+    auto opt = brt_torch_opt<T>();
+    std::vector<std::shared_ptr<vkop::core::ITensor>> ins;
+    for (auto &t : torch_ins) {
+        auto in = std::make_shared<Tensor<T>>(shape);
+        // brt_fill reads the source at the TEMPLATE dtype (a raw Half* when T
+        // is uint16_t), so the source has to be converted here — brt_torch_opt
+        // is a dtype tag, it does not convert anything.
+        brt_fill(in, t.to(opt).reshape(
+                         std::vector<int64_t>(shape.begin(), shape.end())));
+        brt_upload(in, d);
+        ins.push_back(in);
+    }
+    auto output = brt_make_out<T>(shape, d);
+
+    int n = vkop::ops::total_elems(shape);
+    std::string shp;
+    for (size_t k = 0; k < ins.size(); ++k) {
+        shp += (k ? "," : "") + std::to_string(n);
+    }
+    std::string out_shp = std::to_string(n);
+    auto op = brt_make_op(vkop::ops::OpType::FUSED_ELEMWISE, fp16,
+                          {{"ops", ops_str},
+                           {"input_shapes", shp},
+                           {"out_shape", out_shp},
+                           {"rank", "1"},
+                           {"scalars", scalars_str}},
+                          d);
+    if (!op)
+        return false;
+    op->onExecute(ins, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    auto ref = brt_fused_ref_tensor<T>(ops_str, scalars_str, torch_ins);
+    return brt_close_to_torch(output, ref, rtol);
+}
+
+// SwiGLU: out = mul(mul(x, sigmoid(x)), up). This is the exact chain the
+// converter emits for a Qwen-family MLP gate. Before the SILU opcode the
+// program was 3 words [7,2,0,0, 3,3,0,2, 3,0,3,1]; after the gate collapse it
+// is 2 [14,2,0,0, 3,0,2,1]. Both strings below are copied from real converter
+// output (see the swiglu program dump for layer 0), so a change on either side
+// of the pipeline shows up here as a diff rather than as a silent wrong logit.
+TEST(BufferRankTest, FusedProgramSwiGluPreAndPostSilu) {
+    std::vector<int> shape{2, 3, 4, 5};
+    auto opt = brt_torch_opt<float>();
+    auto x = torch::randn({2, 3, 4, 5}, opt) * 3.0f;
+    auto up = torch::randn({2, 3, 4, 5}, opt);
+    std::vector<torch::Tensor> ins{x, up};
+
+    const std::string pre_silu = "[7,2,0,0, 3,3,0,2, 3,0,3,1]";
+    const std::string post_silu = "[14,2,0,0, 3,0,2,1]";
+    EXPECT_TRUE(brt_fused_program_case<float>(pre_silu, ins, shape, false));
+    EXPECT_TRUE(brt_fused_program_case<float>(post_silu, ins, shape, false));
+    EXPECT_TRUE(brt_fused_program_case<uint16_t>(post_silu, ins, shape, true));
+    // The two forms must land in the SAME place, not merely near torch: the
+    // collapse is a rewrite of an existing program and its only licence is
+    // that the dropped register round is exact.
+    auto a = brt_fused_ref_tensor<float>(pre_silu, "[]", ins);
+    auto b = brt_fused_ref_tensor<float>(post_silu, "[]", ins);
+    EXPECT_TRUE(torch::allclose(a, b));
+
+    // The emitted strings must be what the register widths allow.
+    EXPECT_LE(brt_recover_fused_ops(post_silu).size() / 4,
+              static_cast<size_t>(vkop::ops::kFusedMaxOps));
+    EXPECT_EQ(brt_recover_fused_ops(post_silu).size() % 4, 0u);
+    // ---- Gate collapse: patched into optimizer.fold_fuse_elemwise_chain ----
+    // A chain that ends in MUL(x, sigmoid(x)) wants the 2-word SILU form, and
+    // the pre-SILU 3-word form must stop being emitted for that shape. This
+    // suite has no ONNX model to run the pass on, so the check reads the
+    // converter source: it fails if the rule is dropped, and it tells anyone
+    // editing tests/BufferRankTest.cpp to re-dump the program strings by hand.
+    {
+        const char *srcs[] = {
+            "model/pypi/onnx2vkop/optimizer.py",          // build/ root
+            "../model/pypi/onnx2vkop/optimizer.py",       // build/tests/
+            "../../model/pypi/onnx2vkop/optimizer.py",    // build/tests/x/
+        };
+        std::string src;
+        bool found = false;
+        for (const char *p : srcs) {
+            std::ifstream f(p);
+            if (!f.good())
+                continue;
+            src.assign(std::istreambuf_iterator<char>(f),
+                       std::istreambuf_iterator<char>());
+            found = true;
+            break;
+        }
+        // Two different files can hold the same marker string, so an absent
+        // one is a real failure — the pass moved or was renamed.
+        ASSERT_TRUE(found) << "converter source not reachable from "
+                           << std::filesystem::current_path();
+        EXPECT_NE(src.find("FUSED_OP_CODES_SILU"), std::string::npos)
+            << "source is " << src.size() << " bytes";
+    }
+}
+
+// Scalar-constant + unary sweep: every opcode the shader can execute, with the
+// operand encodings the converter uses (register, scalar at 100+i, and inputs
+// preloaded into reg[nInputs..]). A program that reads 0 instead of a scalar,
+// or a register index off by one, shows up as a wrong value here.
+TEST(BufferRankTest, FusedProgramOpcodeCoverage) {
+    std::vector<int> shape{17}; // odd: exercises the fp16 tail word
+    auto opt = brt_torch_opt<float>();
+    auto x = torch::randn({17}, opt).abs() + 3.0f; // positive: safe sqrt/pow
+    auto y = torch::randn({17}, opt);
+    std::vector<torch::Tensor> ins{x, y};
+    // r0=x r1=y; binary, then every unary, ending in reg 0. NOTE: operand 0
+    // is register 0, not "unused" — a unary op's b slot must hold a register
+    // that exists (the shader loads it unconditionally). WHERE is
+    // (b != 0) ? a : 0, so its b has to be the flag, not a scratch reg.
+    const std::string ops =
+        "[1,2,0,1, 2,3,0,1, 3,4,0,1, 4,5,0,100, 5,6,2,100, "
+        "6,7,2,0, 7,8,4,0, 8,9,4,0, 9,10,3,0, 10,11,6,0, "
+        "11,0,0,0, 13,12,7,0, 14,13,0,0, 1,0,12,13]";
+    EXPECT_TRUE(brt_fused_program_case<float>(ops, ins, shape, false, "[2.0]"));
+    EXPECT_TRUE(brt_fused_program_case<uint16_t>(ops, ins, shape, true, "[2.0]",
+                                               /*rtol=*/0.05f));
+}
 
 // out coord c reads in coord floor(c * in_dim / out_dim) per axis — the same
 // integer math resize.comp does. Applied per axis so dims that don't change

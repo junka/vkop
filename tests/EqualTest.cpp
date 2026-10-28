@@ -2,7 +2,6 @@
 #include "setup.hpp"
 #include "core/Tensor.hpp"
 #include <gtest/gtest.h>
-#include <torch/torch.h>
 
 using vkop::core::Tensor;
 using vkop::tests::TestCase;

@@ -1,3 +1,4 @@
+#include <cmath>
 #include <memory>
 #include <string>
 #include <utility>
@@ -103,35 +104,35 @@ private:
             has_scale_factor = !scale_factors.empty();
         }
 
-        std::string mode = attributes.count("mode") ? attributes.at("mode") : "nearest";
-
-        std::optional<std::vector<int64_t>> opt_size = std::nullopt;
+        std::vector<int64_t> out_size;
         if (has_size) {
-            opt_size = sizes;
-        }
-
-        std::optional<std::vector<double>> opt_scale_factor = std::nullopt;
-        if (has_scale_factor) {
-            opt_scale_factor = scale_factors;
-        }
-
-        auto options = torch::nn::functional::InterpolateFuncOptions()
-            .size(opt_size)
-            .scale_factor(opt_scale_factor);
-
-        if (mode == "bilinear") {
-            options = options.mode(torch::kBilinear).align_corners(align_corners_);
-        } else if (mode == "bicubic") {
-            options = options.mode(torch::kBicubic).align_corners(align_corners_);
-        } else if (mode == "trilinear") {
-            options = options.mode(torch::kTrilinear).align_corners(align_corners_);
-        } else if (mode == "linear") {
-            options = options.mode(torch::kLinear).align_corners(align_corners_);
+            out_size = sizes;
         } else {
-            options = options.mode(torch::kNearest);
+            // The ONNX export carries scale_factor only; turn it into the
+            // output size the same way the (removed) interpolate options did.
+            TORCH_CHECK(has_scale_factor, "resize has neither size nor scale_factor");
+            TORCH_CHECK(static_cast<int64_t>(scale_factors.size()) ==
+                            torch_input.dim() - 2,
+                        "scale_factor rank mismatch");
+            for (int64_t i = 0; i < torch_input.dim() - 2; ++i) {
+                out_size.push_back(static_cast<int64_t>(
+                    std::floor(static_cast<double>(torch_input.size(i + 2)) *
+                               scale_factors[i])));
+            }
         }
 
-        auto torch_output = torch::nn::functional::interpolate(torch_input, options);
+        // 0 = bilinear, 1 = bicubic, 2 = trilinear, 3 = nearest, 4 = linear;
+        // see torch_subset.cpp for the mapping onto ATen's upsample_*.
+        const std::string mode = attributes.count("mode") ? attributes.at("mode")
+                                                         : "nearest";
+        const int64_t interp_mode = mode == "bilinear"    ? 0
+                                    : mode == "bicubic"   ? 1
+                                    : mode == "trilinear" ? 2
+                                    : mode == "nearest"   ? 3
+                                                          : 4;
+
+        auto torch_output =
+            torch::tests::interpolate(torch_input, out_size, interp_mode, align_corners_);
 
         std::vector<int> output_shape = {};
         output_shape.reserve(torch_output.dim());

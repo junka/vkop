@@ -33,6 +33,9 @@ include_directories(${CMAKE_SOURCE_DIR}/model)
 
 set(TEST_SOURCES
     setup.cpp
+    # The one test TU that includes <torch/torch.h>, defining the subset the
+    # rest of the suite uses through torch_subset.hpp.
+    torch_subset.cpp
     DTypeTest.cpp
     GridSampleTest.cpp
     Conv2dTest.cpp
@@ -86,10 +89,15 @@ set(TEST_SOURCES
     ConvWeightLayoutTest.cpp
 )
 
-# Option: compile all tests into a single translation unit for faster builds.
-# This avoids re-parsing <torch/torch.h> in each test file (~7s per file).
-# When enabled, TEST_SOURCES is replaced by a single combined source.
-option(MERGE_TEST_SOURCES "Merge all test sources into one TU for faster compilation" ON)
+# Test sources are compiled one TU per file. That used to be a bad deal: every
+# test pulled in <torch/torch.h> (~6s, ~1.1 GB RSS), and 16 of those in
+# parallel exhausted RAM. Tests now take their torch surface from
+# torch_subset.hpp instead, so a cold one costs ~3.4s and the suite builds at a
+# job count set by memory, not by the header. Build with -j6: 16 concurrent
+# compiles OOM 30 GB. N > 1 merges the sources back into N buckets (amortises
+# any leftover per-TU cost); 1 = a single combined TU. 0 = one TU per file.
+set(MERGE_TEST_SOURCES 0 CACHE STRING
+    "Number of test TUs to split the suite into (0 = one per file, 1 = merged)")
 
 # ---- GCC version guard for macOS --------------------------------------------
 # The actual libc++ ABI bridge lives in the top-level CMakeLists.txt.  We
@@ -226,10 +234,43 @@ find_library(C10_LIBRARY
 )
 message(STATUS "Using Torch libraries: ${TORCH_LIBRARIES}")
 
-if(MERGE_TEST_SOURCES)
+if(MERGE_TEST_SOURCES GREATER 1)
+    # Generate N combined sources, round-robin over the test files. Round-robin
+    # rather than contiguous chunks so the big suites (BufferRankTest,
+    # RobustnessTest) land in different buckets.
+    list(FILTER TEST_SOURCES EXCLUDE REGEX "setup\\.cpp$")
+    list(LENGTH TEST_SOURCES TEST_SOURCE_COUNT)
+
+    set(TEST_TU_SOURCES)
+    math(EXPR LAST_BUCKET "${MERGE_TEST_SOURCES} - 1")
+    foreach(BUCKET RANGE ${LAST_BUCKET})
+        set(TEST_TU_BUCKET_${BUCKET})
+    endforeach()
+
+    set(IDX 0)
+    foreach(SRC ${TEST_SOURCES})
+        math(EXPR BUCKET "${IDX} % ${MERGE_TEST_SOURCES}")
+        list(APPEND TEST_TU_BUCKET_${BUCKET}
+             "${CMAKE_CURRENT_SOURCE_DIR}/${SRC}")
+        math(EXPR IDX "${IDX} + 1")
+    endforeach()
+
+    foreach(BUCKET RANGE ${LAST_BUCKET})
+        set(TU ${CMAKE_CURRENT_BINARY_DIR}/all_tests_tu${BUCKET}.cpp)
+        file(WRITE ${TU}
+            "// Auto-generated - do not edit\n"
+            "// Test sources for this bucket, merged into one translation unit.\n"
+        )
+        foreach(SRC ${TEST_TU_BUCKET_${BUCKET}})
+            file(APPEND ${TU} "#include \"${SRC}\"\n")
+        endforeach()
+        list(APPEND TEST_TU_SOURCES ${TU})
+    endforeach()
+
+    add_executable(all_tests setup.cpp ${TEST_TU_SOURCES})
+    set_source_files_properties(${TEST_TU_SOURCES} PROPERTIES GENERATED TRUE)
+elseif(MERGE_TEST_SOURCES EQUAL 1)
     # Generate a single combined source that includes all test files.
-    # This way <torch/torch.h> is parsed only once, cutting build time
-    # from ~7s * N_test_files down to ~7s * 1.
     set(ALL_TESTS_COMBINED ${CMAKE_CURRENT_BINARY_DIR}/all_tests_combined.cpp)
     file(WRITE ${ALL_TESTS_COMBINED}
         "// Auto-generated - do not edit\n"

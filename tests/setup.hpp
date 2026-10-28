@@ -18,7 +18,9 @@
 #include "ops/Ops.hpp"
 
 #include <gtest/gtest.h>
-#include <torch/torch.h>
+// The torch subset, not <torch/torch.h>: this header is included by every test
+// file, and the full header costs ~6s and ~1 GB of RSS per TU.
+#include "torch_subset.hpp"
 
 #ifdef _WIN32
 // The suite is written against POSIX setenv/unsetenv; MSVC only has
