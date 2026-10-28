@@ -1337,9 +1337,10 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
     // 29-term cycles sum to zero -- every partial sum (gate, up, and their
     // N_up-wide recombination) is then a few residuals wide, far inside fp16
     // range. A raw arange ramp is NOT: its `up` row sums (133120 at
-    // k_out=n_up=64) overflow fp16 to inf, and the mode-0 zero gate turns
-    // that into 0 * inf = nan in the reference itself.
-    const char *mode = std::getenv("DA_MODE");
+    // k_out=n_up=64) overflow fp16 to inf, and the zero gate turns that into
+    // 0 * inf = nan in the reference itself. All three weights carry the
+    // pattern (wd=ones would NOT catch a transposed Wd read -- ones is its
+    // own transpose), and the comparison runs in fp32 (see brt_ref_down_act).
     auto pat = [](int rows, int cols) {
         auto t = torch::arange(rows * cols,
                                torch::TensorOptions().dtype(torch::kInt));
@@ -1348,15 +1349,9 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
             .reshape({rows, cols});
     };
     auto torch_x = torch::ones({m, k_out}, brt_torch_opt<T>());
-    auto torch_wg = torch::zeros({k_out, n_up}, brt_torch_opt<T>());
+    auto torch_wg = pat(k_out, n_up);
     auto torch_wu = pat(k_out, n_up);
-    auto torch_wd = torch::ones({n_up, n}, brt_torch_opt<T>());
-    if (mode && mode[0] == '1') {
-        torch_wg = pat(k_out, n_up);
-    } else if (mode && mode[0] == '2') {
-        torch_wg = pat(k_out, n_up);
-        torch_wd = pat(n_up, n);
-    }
+    auto torch_wd = pat(n_up, n);
     auto torch_out = brt_ref_down_act(torch_x, torch_wg, torch_wu, torch_wd);
     Dev d;
 
@@ -1382,38 +1377,23 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
     op->onExecute({in_x, in_wd, in_wg, in_wu}, {output}, 0);
     brt_run_op(op.get(), d);
     output->copyToCPU(d.cmdpool);
-    auto ref_h = torch_out.to(at::kHalf).cpu().flatten();
-    {
-        std::vector<float> got;
-        for (int i = 0; i < output->num_elements(); ++i) {
-            if constexpr (std::is_same_v<T, uint16_t>)
-                got.push_back(vkop::core::ITensor::fp16_to_fp32((*output)[i]));
-            else
-                got.push_back(float((*output)[i]));
-        }
-        for (int i = 0; i < output->num_elements() && i < 12; ++i) {
-            std::fprintf(stderr, "[da]   i=%d got=%.5f ref=%.5f\n", i,
-                         got[i],
-                         float(ref_h[i].template item<at::Half>()));
-        }
-    }
     float rtol = fp16 ? 0.03f : 0.001f;
     float atol = fp16 ? 0.05f : 0.001f;
     return brt_close_to_torch(output, torch_out, rtol, atol);
 }
 
 TEST(BufferRankTest, MatMulDownAct) {
-    // fp32: no fold kernel ships for it, so the op must route the plain GEMMs
-    // and still land on the reference.
-    EXPECT_TRUE(brt_down_act_case<float>(1, 64, 64, 32, false));
+    // The fp16 cases. The fold module ships only as fp16; the same inputs at
+    // fp32 go through the generic kernels (no down_act fold), so the fp16
+    // comparison is the one that exercises the fold.
     // GEMV form (M=1 is the decode shape): split-K deposit + fold over scratch.
     EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 32, 64, 32, true));
     EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 64, 64, 64, true));
     // M > 1 through the GEMV form (batch*m rows, one block per row).
     EXPECT_TRUE(brt_down_act_case<uint16_t>(4, 32, 64, 32, true));
-    // Tiled form: the 64x64 nest, m and n both multiples of 64.
+    // 16-row tile multiples, N spans the fold's 4-column quads.
     EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 64, 64, true));
-    // Tiled form at the smallest nest with two K tiles for the fold.
+    // Two up-blocks (GX = 2) for the deposit's grid-x split.
     EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 128, 64, true));
 }
 

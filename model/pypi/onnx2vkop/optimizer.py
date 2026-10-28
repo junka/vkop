@@ -5517,17 +5517,14 @@ class FusionOptimizer:
                 "wg": wg["name"],
                 "wu": wu["name"],
             })
-        if True:
+        if os.environ.get("VKOP_SWIGLU_DEBUG"):
             print(f"SWIGLU-DEBUG matches={len(matches)}")
-        else:
-            import os
-            if os.environ.get("VKOP_SWIGLU_DEBUG"):
-                for down in dag_model.nodes.values():
-                    if down.op_type == "MatMul" and len(down.inputs) == 2:
-                        wd = down.inputs[1]["name"]
-                        print("  cand", down.name, "wd_init", wd in inits,
-                              "transB", down.attributes.get("transB", 0),
-                              "wd_dims", list(inits[wd].dims) if wd in inits else None)
+            for down in dag_model.nodes.values():
+                if down.op_type == "MatMul" and len(down.inputs) == 2:
+                    wd = down.inputs[1]["name"]
+                    print("  cand", down.name, "wd_init", wd in inits,
+                          "transB", down.attributes.get("transB", 0),
+                          "wd_dims", list(inits[wd].dims) if wd in inits else None)
         return matches
 
     @staticmethod

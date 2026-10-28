@@ -113,9 +113,12 @@ struct alignas(16) GpuMatMulParam {
     int epi_bias = 0;
     // K as the converter delivered it. In the SwiGLU down fold the kernel's
     // two operands disagree on K: uPC.K counts the weight rows (the up width
-    // N_up, the down GEMM's contraction), K_act counts x's columns (K_out).
-    // The fold kernels bound each stream with its own number; every other
-    // kernel keeps reading uPC.K (the two agree for them). Buffer path only.
+    // N_up, the down GEMM's contraction), and K_act counts x's columns
+    // (K_out). Unlike every other kernel, the generic paths of the DOWN_ACT
+    // module need BOTH -- their output size is the down GEMM's (M x N), while
+    // the x row they read is K_out wide -- so the host leaves K at K_out (the
+    // converter's value) and the fold route alone overwrites it with N_up.
+    // Buffer path only.
     //
     // K_act and mind_k live here, in the padding hole that follows epi_bias
     // (epi_scale's 4 bytes align the next int), rather than at the struct tail:
@@ -1269,6 +1272,11 @@ class MatMulBuffer : public BufferFactory {
         // kernel (m=8, K=2048 N=6144: 1.54 ms tiled vs ~3.0 ms of GEMV
         // re-reading the weight per row). ksplit_ok below already refuses to
         // dispatch the GEMV here; the flag must agree with it.
+        // SwiGLU down fold: x's true column count (see K_act above). Set for
+        // every route of a down_act op; the non-fold routes read it with the
+        // plain kernels' x stride, the fold route overwrites K with the up
+        // width and reads it directly.
+        para_.K_act = k;
         para_.ksplit = (ksplit && !tiled) ? 1 : 0;
         // para_ persists across executes and the down fold raises ks_part for
         // its fold pass without lowering it again, so a later plain split-K
@@ -1453,18 +1461,24 @@ class MatMulBuffer : public BufferFactory {
         //   B  = inputs[1] = Wd       [N_up, N] = [K, N], transB == 0
         //   B2 = inputs[2] = Wg       [K_out, N_up]   = x's K, this K
         //   B3 = inputs[3] = Wu       [K_out, N_up]   likewise
-        // so this MatMul's own (m, n, k) are the FOLD's (M, N, N_up): the
-        // kernel's K is the up width (the down GEMM's contraction), while x's
-        // own width K_out rides in K_act and Wg/Wu are read with their true
-        // [K_out, N_up] layout.
+        // NOTE the shape mapping is NOT the plain MatMul's: this node's `k`
+        // (computed above from x's contraction) is K_out, the UP GEMM's
+        // contraction -- x is the up projection's A operand, not the down
+        // GEMM's. The down GEMM's own contraction (the kernel's K) is Wd's
+        // ROW count N_up, read from Wd's shape below. So of this MatMul's own
+        // (m, n, k) only (m, n) carry over to the fold's (M, N); N_up comes
+        // from B, and K_out rides in K_act while Wg/Wu are read with their
+        // true [K_out, N_up] layout.
         if (down_act_ && down_act_pipeline() != nullptr && fp16_ != 0 &&
             !transB_ && inputs.size() == 4 && rank_a >= 2 && rank_b >= 2) {
             const auto gated_rank = inputs[2]->getShape().size();
             const int k_out =
                 static_cast<int>(inputs[2]->getShape()[gated_rank - 2]);
             // The kernel's K is Wd's row count (N_up), which is also its
-            // contraction length; the operator's own k is N_up for the fold.
-            const int n_up = k;
+            // contraction length; this node's k is x's K_out (see above), so
+            // N_up cannot come from it.
+            const int n_up =
+                static_cast<int>(inputs[1]->getShape()[rank_b - 2]);
             // The fold GEMV's geometry (-DKSPLIT512: 512-lane blocks). Each
             // deposit block owns 512 up columns (gx = grid.x) for a 16-row
             // tile (grid.y = batch * ceil(M / 16)) and parks fp32 partials
