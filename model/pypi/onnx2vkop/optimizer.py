@@ -6370,6 +6370,15 @@ class FusionOptimizer:
         program = []  # flat int list, 4 per op
         collapsible = None  # (sigmoid_op_name, dst) or None
         chain_sigmoid_input = {}  # sigmoid op name -> its input tensor name
+        # sigmoid op name -> its OUTPUT TENSOR name. The collapse below must
+        # find the MUL operand that carries the sigmoid's RESULT; that operand
+        # is named by the tensor, not by the node. Node and tensor names only
+        # coincided in older exports -- a graph whose node names differ from
+        # its output names (Qwen3-VL's qwen3vl_export_onnx.py) made the old
+        # node-name match find nothing, and the SIGMOID word had already been
+        # dropped by the deferred-drop below, so the MUL kept reading the
+        # freed register and the chain evaluated silu as 0.
+        chain_sigmoid_out = {}  # sigmoid op name -> its output tensor name
         for op in chain:
             oc = FusionOptimizer._FUSED_OP_CODES[op.op_type]
             # silu(x) = x*sigmoid(x): a SIGMOID read only by MUL(x, sigmoid) --
@@ -6382,7 +6391,8 @@ class FusionOptimizer:
                 sig_name = collapsible
                 collapsible = None
                 idx = next((i for i, t in enumerate(op.inputs)
-                            if t["name"] == sig_name), None)
+                            if t["name"] == chain_sigmoid_out.get(sig_name)),
+                           None)
                 if idx is not None and \
                         op.inputs[1 - idx]["name"] == chain_sigmoid_input[sig_name]:
                     sig_op = next(n for n in chain if n.name == sig_name)
@@ -6394,6 +6404,19 @@ class FusionOptimizer:
                     sig_operand = operand_code(sig_op, sig_op.inputs[0],
                                               chain_name=sig_name)
                     if sig_operand is not None and sig_operand < 100:
+                        # Drop the SIGMOID word only now that the SILU word
+                        # is actually replacing it. For the adjacent pair the
+                        # SIGMOID word is the immediately preceding program
+                        # word; freeing its dst before the alloc lets the
+                        # SILU word reuse the same register. When any collapse
+                        # condition fails the SIGMOID word must STAY -- the
+                        # MUL below then reads its live output register, and
+                        # dropping the word here would leave that read on a
+                        # freed (zero-initialized) register, i.e. silu == 0.
+                        if (program[-4] == FusionOptimizer._FUSED_OP_CODES["Sigmoid"]
+                                and program[-3] == op_out_reg[sig_name]):
+                            program = program[:-4]
+                            free_regs.append(op_out_reg[sig_name])
                         dst = alloc_reg()
                         op_out_reg[op.name] = dst
                         program.extend([FusionOptimizer._FUSED_OP_CODES_SILU, dst,
@@ -6433,16 +6456,7 @@ class FusionOptimizer:
             if op.op_type == "Sigmoid":
                 collapsible = op.name
                 chain_sigmoid_input[op.name] = op.inputs[0]["name"]
-            # A SIGMOID whose ONLY consumer is the very next chain op is the
-            # back half of a silu pair -- the next iteration turns the pair
-            # into one SILU word, so the SIGMOID word emitted above is
-            # dropped. Dropping it frees its dst for immediate reuse by the
-            # SILU word (the value it held is dead at that point).
-            if (collapsible == op.name and chain_index[op.name] + 1 < len(chain)
-                    and use_count[op.name] == 1
-                    and chain[chain_index[op.name] + 1].op_type == "Mul"):
-                program = program[:-4]
-                free_regs.append(op_out_reg[op.name])
+                chain_sigmoid_out[op.name] = op.outputs[0]["name"]
 
         if max(next_reg, max(free_regs, default=0) + 1) > MAX_REG:
             return False
