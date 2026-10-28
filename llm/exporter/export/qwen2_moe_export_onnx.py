@@ -737,6 +737,15 @@ removed = 0
 for f_ in sorted(os.listdir(".")):
     if f_ in _pre or f_ in (EXPORT_PATH, LINWEIGHTS_NAME):
         continue
+    # `norm.weight` 在上面已被重写进侧文件，是真正的残留。但 layers.*.bias 不是：
+    # 阶段 1 的硬校验要求所有 external 都指向侧文件，所以那份布局里的每个散文件
+    # 都会**先**被下面的 save_model 合并进 LINWEIGHTS_NAME，之后再清才安全 ——
+    # 而下面那条路径会 SystemExit（只允许 LINWEIGHTS_NAME 这一处 external）。
+    # torch.onnx.export 只在单张量 >2 GiB 时写散文件，一次也没有触发过，所以
+    # 这一批本身就是死后代码；先给次级产物留条命，别删掉将来那份合并布局要读的
+    # 东西。删掉本循环（以及它依赖的 _pre 快照）是安全的。
+    if f_.endswith(".bias"):
+        continue
     if f_.endswith(".weight") or f_.startswith("onnx__") or \
        f_.endswith(".bin") or f_.endswith(".data"):
         os.remove(f_)
