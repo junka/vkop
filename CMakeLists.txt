@@ -425,6 +425,22 @@ vkop_shader_variant(buffer_matmul_coop16_16x8x8 buffer/matmul_coop16
 vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
                     -DCM=16 -DCN=16 -DCK=32)
 
+# Subgroup-arithmetic reductions (_sg) for the ops whose workgroup reduce sits
+# in a hot loop or on every transformer block: attention's per-tile max/sum,
+# the norm passes and softmax. -DSUBGROUP swaps the 256-slot shared-memory
+# tree for subgroupAdd/subgroupMax plus one fold of the per-subgroup partials
+# (see shaders/common/subgroup_reduce.comp). The base builds keep the tree and
+# stay the fallback; the host prefers <key>_sg only when the device advertises
+# VK_SUBGROUP_FEATURE_ARITHMETIC_BIT and the archive carries the key.
+vkop_shader_variant(buffer_attention_sg buffer/attention -DSUBGROUP)
+vkop_shader_variant(buffer_attention_fp16_sg buffer/attention -DFP16 -DSUBGROUP)
+vkop_shader_variant(buffer_layernorm_sg buffer/layernorm -DSUBGROUP)
+vkop_shader_variant(buffer_layernorm_fp16_sg buffer/layernorm -DFP16 -DSUBGROUP)
+vkop_shader_variant(buffer_rmsnorm_sg buffer/rmsnorm -DSUBGROUP)
+vkop_shader_variant(buffer_rmsnorm_fp16_sg buffer/rmsnorm -DFP16 -DSUBGROUP)
+vkop_shader_variant(buffer_softmax_sg buffer/softmax -DSUBGROUP)
+vkop_shader_variant(buffer_softmax_fp16_sg buffer/softmax -DFP16 -DSUBGROUP)
+
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).
 #

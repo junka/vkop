@@ -1,9 +1,11 @@
 #version 450 core
+#include "../common/subgroup_reduce.comp"
 
 // RMSNorm SSBO op. Normalizes over the last `inner_size` elements (the
-// trailing dims, e.g. head_dim). One workgroup per outer slice. Two-pass
-// shared-memory tree reduce of sum(x^2) (no mean subtraction — that's the
-// difference from LayerNorm). Weight is 1-D over inner_size.
+// trailing dims, e.g. head_dim). One workgroup per outer slice. Reduce of
+// sum(x^2): a two-pass shared-memory tree in the base build, a subgroupAdd
+// plus a per-subgroup fold in the -DSUBGROUP build (no mean subtraction —
+// that's the difference from LayerNorm). Weight is 1-D over inner_size.
 //
 //   rms = mean(x^2);  inv_rms = rsqrt(rms + eps);  out = x * inv_rms * weight
 //
@@ -73,6 +75,9 @@ void main() {
         lsq += x * x;
     }
 #endif
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM(s_sumsq, lsq);
+#else
     s_sumsq[lid] = lsq;
     barrier();
 
@@ -82,6 +87,7 @@ void main() {
         }
         barrier();
     }
+#endif // SUBGROUP
     float rms = s_sumsq[0] / float(uRMSN.inner_size);
     float inv_rms = inversesqrt(rms + uRMSN.eps);
 

@@ -40,14 +40,26 @@ effective_archive(const vkop::core::ShaderArchive *own) {
 } // namespace
 
 void Operator::resolve_primary_spv() {
-    const std::string key =
-        core::shader_key_for(type_, uses_buffer_backend(), fp16_);
+    std::string key = core::shader_key_for(type_, uses_buffer_backend(), fp16_);
     if (key.empty()) {
         // Host-only op (Shape, SqueezeUnsqueeze): no pipeline to build.
         return;
     }
     const auto *archive = effective_archive(shader_archive_);
     if (archive) {
+        // The norm/softmax/attention modules ship a -DSUBGROUP build under
+        // <key>_sg (workgroup reduce via subgroupAdd/Max instead of the
+        // 256-slot tree). Runtime swaps the key in for models it loads; this is
+        // the path for ops built straight through create_from_type() (test
+        // fixtures, example drivers). Both the missing feature and the missing
+        // key (an older archive) mean the base module, so nothing here can
+        // fail.
+        if (m_dev_ && m_dev_->supportsSubgroupArithmetic()) {
+            const std::string sg_key = key + "_sg";
+            if (archive->lookup(sg_key).first != nullptr) {
+                key = sg_key;
+            }
+        }
         auto [spv, len] = archive->lookup(key);
         if (spv) {
             override_spv(spv, len);

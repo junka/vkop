@@ -31,7 +31,7 @@ class Renderdoc {
         if (rdoc_api_)
             return rdoc_api_;
 
-            // Based on https://renderdoc.org/docs/in_application_api.html.
+        // Based on https://renderdoc.org/docs/in_application_api.html.
 #ifdef __linux__
         void *mod = dlopen("librenderdoc.so", RTLD_NOW | RTLD_NOLOAD);
         if (!mod && getenv("DYLD_FALLBACK_LIBRARY_PATH") == nullptr) {

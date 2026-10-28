@@ -212,6 +212,23 @@ const char *onnx_type_name(int t) {
 }
 } // namespace
 
+// The *_sg build of a primary key. Norm/softmax/attention compile a second
+// module of the same source with -DSUBGROUP, which folds the workgroup reduce
+// with subgroupAdd/Max instead of the 256-slot shared tree; it is only legal
+// where the device advertises VK_SUBGROUP_FEATURE_ARITHMETIC_BIT. A missing
+// key (an older .vkopbin subset, or an op with no _sg module) or a missing
+// feature keeps the base key -- the variant is an optimization, never a
+// requirement, so this cannot fail a load.
+static std::string
+subgroup_variant_key(const vkop::core::ShaderArchive &archive,
+                     const vkop::VulkanDevice &dev, const std::string &key) {
+    if (key.empty() || !dev.supportsSubgroupArithmetic()) {
+        return key;
+    }
+    const std::string sg = key + "_sg";
+    return archive.lookup(sg).first != nullptr ? sg : key;
+}
+
 // Which archive key this node's op should be looked up under. The .vkopbin
 // records the converter's answer (Model.kernel_plans, Node.plan) and that is
 // what we read: the embedded archive was built from the same rows by
@@ -1414,6 +1431,7 @@ void Runtime::LoadModel() {
                 const vkop::core::KernelPlan *plan = nullptr;
                 auto key = kernel_key_for_node(n, type, op_fp16, &plan);
                 if (!key.empty()) {
+                    key = subgroup_variant_key(*shader_archive_, *dev, key);
                     auto [spv, len] = shader_archive_->lookup(key);
                     if (spv) {
                         op->override_spv(spv, len);
@@ -3641,6 +3659,7 @@ void Runtime::RegisterPostProcess(
         op->set_shader_archive(shader_archive_.get());
         auto key = shader_key_for(ops, use_buffer, pp_precision);
         if (!key.empty()) {
+            key = subgroup_variant_key(*shader_archive_, *dev, key);
             auto [spv, len] = shader_archive_->lookup(key);
             if (spv) {
                 op->override_spv(spv, len);

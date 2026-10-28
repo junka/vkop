@@ -1,9 +1,12 @@
 #version 450 core
+#include "../common/subgroup_reduce.comp"
 
 // LayerNorm SSBO op. Normalizes over the last `inner_size` elements (the
 // normalized shape is the trailing dims). One workgroup per outer slice.
-// Two-pass shared-memory tree reduce (no subgroup ops — those don't reduce
-// reliably on all drivers). Mirrors the image layernorm.comp reduce pattern.
+// Workgroup reduce: the base build is a two-pass shared-memory tree; the
+// subgroup build (-DSUBGROUP, picked by the host when the device advertises
+// subgroup arithmetic) folds the per-lane partials with one vec2 subgroupAdd
+// and only the per-subgroup results meet in shared.
 // Weight/bias are 1-D over the normalized shape (inner_size elements), same
 // dtype as x. An optional 4th input (binding 4, has_skip == 1) is the skip
 // residual of a post-norm transformer block: the op then computes
@@ -46,8 +49,10 @@ layout(push_constant) uniform PC_uLN {
     int has_skip;     // 1 = add uSkip to x before the reduce (fused residual)
 } uLN;
 
-shared float s_sum[256];
-shared float s_sumsq[256];
+// Pass 1 partials, (sum, sum_sq) packed so the subgroup build folds both with
+// one vec2 op; the tree build adds the two components in place, in the same
+// order the two separate float arrays used.
+shared vec2 s_red[256];
 
 #ifdef FP16
 // Element e of a packed half2 word: low half is even, high half odd.
@@ -83,19 +88,21 @@ void main() {
         lsq += x * x;
     }
 #endif
-    s_sum[lid] = lsum;
-    s_sumsq[lid] = lsq;
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM2(s_red, lsum, lsq);
+#else
+    s_red[lid] = vec2(lsum, lsq);
     barrier();
 
     for (uint s = 128; s > 0; s >>= 1) {
         if (lid < s) {
-            s_sum[lid] += s_sum[lid + s];
-            s_sumsq[lid] += s_sumsq[lid + s];
+            s_red[lid] += s_red[lid + s];
         }
         barrier();
     }
-    float mean = s_sum[0] / float(uLN.inner_size);
-    float var = max(s_sumsq[0] / float(uLN.inner_size) - mean * mean, 0.0f);
+#endif // SUBGROUP
+    float mean = s_red[0].x / float(uLN.inner_size);
+    float var = max(s_red[0].y / float(uLN.inner_size) - mean * mean, 0.0f);
     float inv_std = inversesqrt(var + uLN.eps);
 
     // ---- pass 2: write back ----

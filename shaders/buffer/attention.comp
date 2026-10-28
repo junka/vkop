@@ -1,4 +1,5 @@
 #version 450 core
+#include "../common/subgroup_reduce.comp"
 
 // Fused Attention (SSBO/fp16+fp32), tiled / online-softmax form. One workgroup
 // per query row (b, h, s): grid = (B*H*S, 1, 1). Computes
@@ -305,8 +306,19 @@ shared float sAcc[4][MAX_HD];
 // stale value (or -1e30/0) into the reduction. The P1 form lacked it and read a
 // wrong row max, which makes `exp(x - m)` overflow and scales the whole output
 // row to ~1e-31, on ~1 row in 20 and only for workgroups that lose the race.
-#define REDUCE_MAX()                                                           \
+#ifdef SUBGROUP
+// Subgroup build: fold the lane value with subgroupMax/subgroupAdd and let one
+// lane per subgroup stage its partial in s_red, so the result is in s_red[0]
+// after two barriers instead of nine. s_red is scratch owned by the macro here
+// -- no call site may store a per-lane value into it, or that store would race
+// with the per-subgroup partials (the base build's 256-slot layout needs the
+// per-lane store, this one must not have it).
+#define REDUCE_MAX(V) VKOP_WG_REDUCE_MAX(s_red, V)
+#define REDUCE_SUM(V) VKOP_WG_REDUCE_SUM(s_red, V)
+#else
+#define REDUCE_MAX(V)                                                          \
     do {                                                                       \
+        s_red[lid] = (V);                                                      \
         barrier();                                                             \
         for (uint t = 128; t > 0; t >>= 1) {                                   \
             if (lid < int(t)) {                                                \
@@ -316,8 +328,9 @@ shared float sAcc[4][MAX_HD];
         }                                                                      \
     } while (false)
 
-#define REDUCE_SUM()                                                           \
+#define REDUCE_SUM(V)                                                          \
     do {                                                                       \
+        s_red[lid] = (V);                                                      \
         barrier();                                                             \
         for (uint t = 128; t > 0; t >>= 1) {                                   \
             if (lid < int(t)) {                                                \
@@ -326,6 +339,7 @@ shared float sAcc[4][MAX_HD];
             barrier();                                                         \
         }                                                                      \
     } while (false)
+#endif // SUBGROUP
 
 // The cache workgroups: write `present` (binding 6) for every position in
 // [0, kv_len). Positions [0, kv_past) are copied from cache_in, the rest come
@@ -565,8 +579,7 @@ void main() {
         barrier();
 
         // ---- running max ----
-        s_red[lid] = (lid < tn) ? sS[lid] : -1e30;
-        REDUCE_MAX();
+        REDUCE_MAX((lid < tn) ? sS[lid] : -1e30);
         float tile_max = s_red[0];
         // Latch tile_max before s_red is reused as the sum accumulator: lane 0
         // overwrites s_red[0], and a warp that read it late would take a
@@ -582,8 +595,7 @@ void main() {
             lp = exp(sS[lid] - m_new);
             sS[lid] = lp; // reuse the tile as P, for the AV pass below
         }
-        s_red[lid] = lp;
-        REDUCE_SUM();
+        REDUCE_SUM(lp);
         l = l * alpha + s_red[0];
         barrier();
 

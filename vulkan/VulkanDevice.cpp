@@ -206,8 +206,11 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     LOG_INFO("Subgroup size control min %u max %u",
              ssc_properties.minSubgroupSize, ssc_properties.maxSubgroupSize);
 #endif
-    if (subgroup_properties.supportedOperations &
-        VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) {
+    // Cached for the *_sg shader variant decision (Runtime::LoadModel and
+    // Operator::resolve_primary_spv), so it must be set on every query.
+    m_support_subgroup_arithmetic_ = (subgroup_properties.supportedOperations &
+                                      VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+    if (m_support_subgroup_arithmetic_) {
         LOG_INFO("Device support subgroup arithmetic");
         LOG_INFO("Subgroup size %d", subgroup_properties.subgroupSize);
     }

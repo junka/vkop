@@ -179,6 +179,24 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("Gather", "buffer"): ["buffer_gather_int64"],
     ("Equal", "buffer"): ["buffer_equal_int64"],
     ("Where", "buffer"): ["buffer_where_int64"],
+    # The subgroup-arithmetic builds of the hot workgroup reductions
+    # (-DSUBGROUP: attention's per-tile max/sum, the norm passes, softmax).
+    # Which module runs is a device-feature query at load time
+    # (VK_SUBGROUP_FEATURE_ARITHMETIC_BIT), which the converter cannot make; the
+    # runtime swaps the primary key for <key>_sg and falls back to the base
+    # module when this archive lacks it. Both must therefore ship whenever the
+    # op does.
+    ("Attention", "buffer"): [
+        "buffer_attention_sg",
+        "buffer_attention_fp16_sg",
+    ],
+    ("LayerNorm", "buffer"): ["buffer_layernorm_sg", "buffer_layernorm_fp16_sg"],
+    ("LayerNormalization", "buffer"): [
+        "buffer_layernorm_sg",
+        "buffer_layernorm_fp16_sg",
+    ],
+    ("RMSNorm", "buffer"): ["buffer_rmsnorm_sg", "buffer_rmsnorm_fp16_sg"],
+    ("Softmax", "buffer"): ["buffer_softmax_sg", "buffer_softmax_fp16_sg"],
 }
 
 

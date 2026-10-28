@@ -1,0 +1,80 @@
+// Workgroup reductions for the subgroup builds (-DSUBGROUP).
+//
+// The base builds fold one partial per lane through a 256-slot shared array:
+// log2(256) = 8 rounds, each ending in a barrier(). A subgroup op replaces that
+// whole tree with log2(subgroupSize) register shuffles, and only the
+// per-subgroup partials (workgroupSize/subgroupSize of them) still meet in
+// shared -- two barriers regardless of the workgroup size.
+//
+// These macros are the *only* thing the SG builds of softmax/rmsnorm/layernorm/
+// attention change; the host picks that module when the device advertises
+// VK_SUBGROUP_FEATURE_ARITHMETIC_BIT (see Runtime::kernel_key_for_node and
+// Operator::resolve_primary_spv), so the base module stays the fallback for
+// drivers that do not.
+//
+// Contract:
+//  - Every lane of the workgroup executes the macro. Subgroup ops are only
+//    defined while the subgroup is fully active, and the caller's local
+//    accumulation must not be skipped by a lane-varying early return.
+//  - S is a shared array with at least 32 slots (a subgroup size can be as
+//    small as 8, so the per-subgroup partials fit). The macro uses S[0..nsub)
+//    as scratch and leaves the workgroup result in S[0].
+//  - The macro ends with a barrier, so every lane may read S[0] afterwards and
+//    S may be reused by the next reduction.
+#ifndef VKOP_SUBGROUP_REDUCE_COMP
+#define VKOP_SUBGROUP_REDUCE_COMP
+
+#ifdef SUBGROUP
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_arithmetic : require
+
+#define VKOP_WG_REDUCE_SUM(S, V)                                              \
+    do {                                                                      \
+        float vkop_part = subgroupAdd(V);                                     \
+        if (gl_SubgroupInvocationID == 0u) S[gl_SubgroupID] = vkop_part;      \
+        barrier();                                                            \
+        if (gl_LocalInvocationIndex == 0u) {                                  \
+            float vkop_all = S[0];                                            \
+            for (uint vkop_i = 1u; vkop_i < gl_NumSubgroups; ++vkop_i) {      \
+                vkop_all += S[vkop_i];                                        \
+            }                                                                 \
+            S[0] = vkop_all;                                                  \
+        }                                                                     \
+        barrier();                                                            \
+    } while (false)
+
+#define VKOP_WG_REDUCE_MAX(S, V)                                              \
+    do {                                                                      \
+        float vkop_part = subgroupMax(V);                                     \
+        if (gl_SubgroupInvocationID == 0u) S[gl_SubgroupID] = vkop_part;      \
+        barrier();                                                            \
+        if (gl_LocalInvocationIndex == 0u) {                                  \
+            float vkop_all = S[0];                                            \
+            for (uint vkop_i = 1u; vkop_i < gl_NumSubgroups; ++vkop_i) {      \
+                vkop_all = max(vkop_all, S[vkop_i]);                          \
+            }                                                                 \
+            S[0] = vkop_all;                                                  \
+        }                                                                     \
+        barrier();                                                            \
+    } while (false)
+
+// Two sums folded in one pass (LayerNorm's sum and sum-of-squares). S is a
+// shared vec2 array; the vec2 subgroup op does both in the same shuffles, so
+// this costs two barriers where two VKOP_WG_REDUCE_SUM calls cost four.
+#define VKOP_WG_REDUCE_SUM2(S, V0, V1)                                        \
+    do {                                                                      \
+        vec2 vkop_part = vec2(subgroupAdd(V0), subgroupAdd(V1));              \
+        if (gl_SubgroupInvocationID == 0u) S[gl_SubgroupID] = vkop_part;      \
+        barrier();                                                            \
+        if (gl_LocalInvocationIndex == 0u) {                                  \
+            vec2 vkop_all = S[0];                                             \
+            for (uint vkop_i = 1u; vkop_i < gl_NumSubgroups; ++vkop_i) {      \
+                vkop_all += S[vkop_i];                                        \
+            }                                                                 \
+            S[0] = vkop_all;                                                  \
+        }                                                                     \
+        barrier();                                                            \
+    } while (false)
+#endif // SUBGROUP
+
+#endif // VKOP_SUBGROUP_REDUCE_COMP

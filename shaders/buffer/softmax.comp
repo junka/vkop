@@ -1,7 +1,10 @@
 #version 450 core
+#include "../common/subgroup_reduce.comp"
 
 // Softmax SSBO op over an arbitrary axis. One workgroup reduces one
-// non-axis slice along the full axis_size. Shared-memory tree reduce.
+// non-axis slice along the full axis_size. Workgroup reduce: shared-memory
+// tree in the base build, subgroupMax/subgroupAdd plus a per-subgroup fold in
+// the -DSUBGROUP build (each pass then costs two barriers instead of nine).
 //
 // Built twice:
 //  - base (fp32): the reduce reads/writes uint words directly (one element
@@ -102,6 +105,9 @@ void main() {
         int idx = slice_base + a * uSoft.inner_size;
         localMax = max(localMax, load_elem(idx));
     }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_MAX(s_max, localMax);
+#else
     s_max[lid] = localMax;
     barrier();
 
@@ -111,6 +117,7 @@ void main() {
         }
         barrier();
     }
+#endif // SUBGROUP
     float globalMax = s_max[0];
 
     // ---- pass 2: sum of exp(x - globalMax) ----
@@ -119,6 +126,9 @@ void main() {
         int idx = slice_base + a * uSoft.inner_size;
         localSum += exp(load_elem(idx) - globalMax);
     }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM(s_sum, localSum);
+#else
     s_sum[lid] = localSum;
     barrier();
     for (uint s = 128; s > 0; s >>= 1) {
@@ -127,6 +137,7 @@ void main() {
         }
         barrier();
     }
+#endif // SUBGROUP
     float globalSum = s_sum[0];
 
     // ---- write back ----

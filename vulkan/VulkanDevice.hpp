@@ -264,6 +264,13 @@ class VulkanDevice {
     uint32_t getMinSubgroupSize() const { return 0; }
     uint32_t getMaxSubgroupSize() const { return 0; }
 #endif
+    // True when the physical device advertises
+    // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT, i.e. subgroupAdd/subgroupMax/... are
+    // usable (Vulkan 1.1 core). The *_sg shader builds need it; see
+    // shaders/common/subgroup_reduce.comp.
+    bool supportsSubgroupArithmetic() const {
+        return m_support_subgroup_arithmetic_;
+    }
 #ifdef USE_VMA
     vkop::VMA *getVMA() const { return m_vma_.get(); }
 #endif
@@ -287,6 +294,7 @@ class VulkanDevice {
     // Filled by getProperties() from driverID/vendorID; see MatmulTileProfile.
     MatmulTileProfile matmul_tile_profile_;
     bool m_support_descriptor_update_after_bind_ = false;
+    bool m_support_subgroup_arithmetic_ = false;
 
 #ifdef VK_EXT_subgroup_size_control
     uint32_t minSubgroupSize_ = 0;
