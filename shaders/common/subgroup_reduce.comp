@@ -10,7 +10,8 @@
 // attention change; the host picks that module when the device advertises
 // VK_SUBGROUP_FEATURE_ARITHMETIC_BIT (see Runtime::kernel_key_for_node and
 // Operator::resolve_primary_spv), so the base module stays the fallback for
-// drivers that do not.
+// drivers that do not. MatMul's fused row softmax (matmul16_softmax) and the
+// image LayerNorm use them the same way.
 //
 // Contract:
 //  - Every lane of the workgroup executes the macro. Subgroup ops are only
@@ -75,6 +76,31 @@
         }                                                                     \
         barrier();                                                            \
     } while (false)
+// Two vec4 sums folded in one pass (the image LayerNorm's per-RGBA-lane sum
+// and sum-of-squares). Same two barriers as VKOP_WG_REDUCE_SUM2; S0/S1 are
+// shared vec4 arrays.
+#define VKOP_WG_REDUCE_SUM4_2(S0, S1, V0, V1)                                 \
+    do {                                                                      \
+        vec4 vkop_part0 = subgroupAdd(V0);                                    \
+        vec4 vkop_part1 = subgroupAdd(V1);                                    \
+        if (gl_SubgroupInvocationID == 0u) {                                  \
+            S0[gl_SubgroupID] = vkop_part0;                                   \
+            S1[gl_SubgroupID] = vkop_part1;                                   \
+        }                                                                     \
+        barrier();                                                            \
+        if (gl_LocalInvocationIndex == 0u) {                                  \
+            vec4 vkop_all0 = S0[0];                                           \
+            vec4 vkop_all1 = S1[0];                                           \
+            for (uint vkop_i = 1u; vkop_i < gl_NumSubgroups; ++vkop_i) {      \
+                vkop_all0 += S0[vkop_i];                                      \
+                vkop_all1 += S1[vkop_i];                                      \
+            }                                                                 \
+            S0[0] = vkop_all0;                                                \
+            S1[0] = vkop_all1;                                                \
+        }                                                                     \
+        barrier();                                                            \
+    } while (false)
+
 #endif // SUBGROUP
 
 #endif // VKOP_SUBGROUP_REDUCE_COMP

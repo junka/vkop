@@ -1,4 +1,5 @@
 #version 450 core
+#include "../common/subgroup_reduce.comp"
 
 // MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B.
 // fp32: one thread per output element, fp32 store to uOutput.
@@ -1376,6 +1377,9 @@ void matmul16_softmax() {
     for (int t = 0; t < n_owned; ++t) {
         local_max = max(local_max, owned[t]);
     }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_MAX(s_red, local_max);
+#else
     s_red[lid] = local_max;
     barrier();
     for (uint s = SOFTMAX_WG / 2; s > 0; s >>= 1) {
@@ -1384,6 +1388,7 @@ void matmul16_softmax() {
         }
         barrier();
     }
+#endif // SUBGROUP
     float row_max = s_red[0];
 
     // ---- pass 2: sum of exp(x - row_max) ----
@@ -1391,6 +1396,9 @@ void matmul16_softmax() {
     for (int t = 0; t < n_owned; ++t) {
         local_sum += exp(owned[t] - row_max);
     }
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM(s_red, local_sum);
+#else
     s_red[lid] = local_sum;
     barrier();
     for (uint s = SOFTMAX_WG / 2; s > 0; s >>= 1) {
@@ -1399,6 +1407,7 @@ void matmul16_softmax() {
         }
         barrier();
     }
+#endif // SUBGROUP
     float row_sum = s_red[0] + 1e-30f;
 
     // ---- pass 3: store normalized ----

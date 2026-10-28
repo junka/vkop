@@ -1,5 +1,7 @@
 #version 450
 
+#include "../common/subgroup_reduce.comp"
+
 layout(local_size_x = 16, local_size_y = 16) in;
 
 layout(set=0, binding = 0) writeonly uniform image2DArray outputImage;
@@ -64,6 +66,9 @@ void norm_for_w() {
     sum_sq[lid] = local_sum_sq;
     barrier();
 
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM4_2(sum, sum_sq, local_sum, local_sum_sq);
+#else
     // Parallel reduction
     for (int s = 128; s > 0; s >>= 1) {
         if (lid < s) {
@@ -72,6 +77,7 @@ void norm_for_w() {
         }
         barrier();
     }
+#endif // SUBGROUP
 
     if (lid == 0) {
         vec4 mean = sum[0] / float(W);
@@ -134,6 +140,9 @@ void norm_for_hw() {
     sum_sq[lid] = local_sum_sq;
     barrier();
 
+#ifdef SUBGROUP
+    VKOP_WG_REDUCE_SUM4_2(sum, sum_sq, local_sum, local_sum_sq);
+#else
     // --- Step 2: Parallel reduction ---
     for (int s = 128; s > 0; s >>= 1) {
         if (lid < s) {
@@ -142,6 +151,7 @@ void norm_for_hw() {
         }
         barrier();
     }
+#endif // SUBGROUP
 
     // --- Step 3: Compute stats ---
     if (lid == 0) {
@@ -218,6 +228,11 @@ void norm_for_chw () {
     sum_sq[lid].x = local_sum_sq;
     barrier();
 
+#ifdef SUBGROUP
+    // Only the .x component carries the scalar partials here, but the vec4 fold
+    // keeps one macro for all three normalize shapes; .yzw stay zero.
+    VKOP_WG_REDUCE_SUM4_2(sum, sum_sq, vec4(local_sum), vec4(local_sum_sq));
+#else
     // === Stage 2: Scalar tree reduction ===
     for (int stride = 128; stride > 0; stride >>= 1) {
         if (lid < stride) {
@@ -226,6 +241,7 @@ void norm_for_chw () {
         }
         barrier();
     }
+#endif // SUBGROUP
 
     // === Stage 3: Compute mean and inv_std (scalar) ===
     float global_mean, global_inv_std;

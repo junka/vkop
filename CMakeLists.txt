@@ -440,6 +440,14 @@ vkop_shader_variant(buffer_rmsnorm_sg buffer/rmsnorm -DSUBGROUP)
 vkop_shader_variant(buffer_rmsnorm_fp16_sg buffer/rmsnorm -DFP16 -DSUBGROUP)
 vkop_shader_variant(buffer_softmax_sg buffer/softmax -DSUBGROUP)
 vkop_shader_variant(buffer_softmax_fp16_sg buffer/softmax -DFP16 -DSUBGROUP)
+# MatMul's fused attention row softmax (matmul16_softmax) reduces each row with
+# the same two trees; the -DSUBGROUP build is the base module with only that
+# function's reduce swapped, so the host may prefer it for every MatMul.
+vkop_shader_variant(buffer_matmul_sg buffer/matmul -DSUBGROUP)
+vkop_shader_variant(buffer_matmul_fp16_sg buffer/matmul -DFP16 -DSUBGROUP)
+# Image LayerNorm's three normalize shapes (W / HW / CHW) all fold sum and
+# sum-of-squares through the vec4 tree; the fp32 module is the only build.
+vkop_shader_variant(image_layernorm_sg image/layernorm -DSUBGROUP)
 
 # ---------------------------------------------------------------------------
 # SPIR-V external archive (vkop_shaders.bin).

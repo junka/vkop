@@ -160,6 +160,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # to the 256-lane kernel where the driver or this archive refuses.
         "buffer_matmul_ksplit512_fp16",
         "buffer_matmul_ksplit512_w8_wide_fp16",
+        # The -DSUBGROUP build of the base module: only matmul16_softmax's row
+        # reduce differs (subgroupMax/subgroupAdd instead of the two 8-round
+        # shared trees). The host swaps the primary key for this one when the
+        # device advertises subgroup arithmetic, so both must ship.
+        "buffer_matmul_sg",
+        "buffer_matmul_fp16_sg",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",
@@ -197,6 +203,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ],
     ("RMSNorm", "buffer"): ["buffer_rmsnorm_sg", "buffer_rmsnorm_fp16_sg"],
     ("Softmax", "buffer"): ["buffer_softmax_sg", "buffer_softmax_fp16_sg"],
+    # The image backend's LayerNorm has no fp16 build, so there is a single
+    # subgroup module to carry (its three shapes -- W / HW / CHW -- all fold
+    # through the vec4 reduce).
+    ("LayerNorm", "image"): ["image_layernorm_sg"],
+    ("LayerNormalization", "image"): ["image_layernorm_sg"],
 }
 
 
