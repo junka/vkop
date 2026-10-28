@@ -1278,6 +1278,14 @@ class MatMulBuffer : public BufferFactory {
         // do the row reduction). Gating on attn_softmax already excludes quant
         // and odd-N; this only fires on attention QK^T decode (small M).
         if (para_.attn_softmax) {
+            // matmul.comp tests uPC.ksplit *before* uPC.attn_softmax, and the
+            // split-K gate above is true for a wide-K attention head (K >= 256
+            // with batch*M <= 8). Left raised, this grid (one workgroup per
+            // output row) would run the split-K GEMV instead, which takes its
+            // output row from WorkGroupID.y -- so only row 0 was written and
+            // without the epilogue or the softmax. The fused path owns the
+            // dispatch, so clear the flags it pre-empts.
+            para_.ksplit = 0;
             set_route("attn_softmax", batch, m, n, k, rep);
             submit(&para_, batch * m, 1, 1);
             return;

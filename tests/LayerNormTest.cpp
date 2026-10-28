@@ -83,30 +83,39 @@ std::vector<float> layer_norm(std::shared_ptr<Tensor<float>> &input, std::vector
 template <typename T>
 class LayerNormTest : public TestCase<T> {
 public:
-    std::vector<int> input_shape_ = {
-        2, 5, 4, 4
-    };
-    std::vector<int> normalized_shape_ = {4, 4};
-    const std::unordered_map<std::string, std::string> param = {
-        {"eps", "1e-5"}, {"normalized_shape", "[4, 4]"}
-    };
+    std::vector<int> input_shape_;
+    std::vector<int> normalized_shape_;
+    std::unordered_map<std::string, std::string> param;
     std::shared_ptr<Tensor<T>> input;
     std::shared_ptr<Tensor<T>> weight;
     std::shared_ptr<Tensor<T>> bias;
     std::shared_ptr<Tensor<T>> output;
 
-    LayerNormTest():TestCase<T>("LayerNorm") {
+    LayerNormTest(const std::vector<int> &input_shape,
+                  const std::vector<int> &normalized_shape)
+        : TestCase<T>("LayerNorm"), input_shape_(input_shape),
+          normalized_shape_(normalized_shape) {
+        std::string ns = "[";
+        for (size_t i = 0; i < normalized_shape_.size(); ++i) {
+            if (i != 0) ns += ", ";
+            ns += std::to_string(normalized_shape_[i]);
+        }
+        ns += "]";
+        param = {{"eps", "1e-5"}, {"normalized_shape", ns}};
         initTestdata();
     }
 private:
     void initTestdata()
     {
         torch::manual_seed(42);
-        auto torch_input = torch::randn({input_shape_[0], input_shape_[1], input_shape_[2], input_shape_[3]});
-        auto torch_weight = torch::randn({normalized_shape_[0], normalized_shape_[1]});
-        auto torch_bias = torch::randn({normalized_shape_[0], normalized_shape_[1]});
+        std::vector<int64_t> ishape(input_shape_.begin(), input_shape_.end());
+        std::vector<int64_t> nshape(normalized_shape_.begin(),
+                                    normalized_shape_.end());
+        auto torch_input = torch::randn(ishape);
+        auto torch_weight = torch::randn(nshape);
+        auto torch_bias = torch::randn(nshape);
 
-        auto torch_output = torch::layer_norm(torch_input, torch::IntArrayRef({normalized_shape_[0], normalized_shape_[1]}), torch_weight, torch_bias, 1e-5);
+        auto torch_output = torch::layer_norm(torch_input, nshape, torch_weight, torch_bias, 1e-5);
 
         std::vector<int> output_shape = {};
         output_shape.reserve(torch_output.dim());
@@ -114,71 +123,64 @@ private:
             output_shape.push_back(torch_output.size(i));
         }
 
-        printf("torch output size: [%d, %d, %d, %d]\n", output_shape[0], output_shape[1], output_shape[2], output_shape[3]);
-        printf("=======weight ============\n");
-        std::cout << torch_weight << std::endl;
-        printf("\n=======bias ============\n");
-        std::cout << torch_bias << std::endl;
-        printf("\n===Input==============\n");
-        std::cout << torch_input << std::endl;
+        printf("torch output size: [");
+        for (size_t i = 0; i < output_shape.size(); ++i) {
+            printf("%d%s", output_shape[i], i + 1 == output_shape.size() ? "]\n" : ", ");
+        }
 
-        printf("\n===Output==============\n");
-        std::cout << torch_output << std::endl;
-
-        input = std::make_shared<Tensor<float>>(input_shape_);
+        input = std::make_shared<Tensor<T>>(input_shape_);
         this->fillTensorFromTorch(input, torch_input);
 
-        weight = std::make_shared<Tensor<float>>(normalized_shape_);
+        weight = std::make_shared<Tensor<T>>(normalized_shape_);
         this->fillTensorFromTorch(weight, torch_weight);
 
-        bias = std::make_shared<Tensor<float>>(normalized_shape_);
+        bias = std::make_shared<Tensor<T>>(normalized_shape_);
         this->fillTensorFromTorch(bias, torch_bias);
 
-        output = std::make_shared<Tensor<float>>(output_shape);
+        output = std::make_shared<Tensor<T>>(output_shape);
         this->fillTensorFromTorch(output, torch_output);
     }
 };
 }
 
 TEST(LayerNormTest, LayerNormComprehensiveTest) {
-
-    LayerNormTest<float> lntest;
-
+    // The image backend picks its normalize kernel from normalizedDim: 1 -> W,
+    // 2 -> HW, 3 -> CHW. Only the HW shape used to be covered, which left the
+    // other two reduce sites (and their subgroup variants) unexercised.
+    //
+    // normalizedDim 3 is left out on purpose: the CHW kernel runs and writes
+    // normalized values, but the tensor read back from it does not line up with
+    // the torch reference's NCHW order (first element 1.9269, the raw input,
+    // vs 5.2607). It fails identically with the base and the -DSUBGROUP build,
+    // so it is a pre-existing image-path bug this suite never reached, not a
+    // regression from the subgroup work.
+    struct Case {
+        std::vector<int> input;
+        std::vector<int> norm;
+    };
+    const std::vector<Case> cases = {
+        {{2, 5, 4, 4}, {4}},    // normalizedDim 1: norm_for_w
+        {{2, 5, 4, 4}, {4, 4}}, // normalizedDim 2: norm_for_hw
+    };
+    for (const auto &c : cases) {
+        LayerNormTest<float> lntest(c.input, c.norm);
 #if USE_CPP_REFER
-    printf("\n===verify C++ refer ==========\n");
-    auto bout = layer_norm(lntest.input, lntest.input_shape_, lntest.normalized_shape_, lntest.weight, lntest.bias,
-                1e-5);
-    for (int i = 0; i < lntest.input_shape_[0]; i++) {
-        printf("[\n");
-        for (int j = 0; j < lntest.input_shape_[1]; j++) {
-            printf("[\n");
-            for (int k = 0; k < lntest.input_shape_[2]; k++) {
-                printf("[");
-                for (int l = 0; l < lntest.input_shape_[3]; l++) {
-                    int idx = (i * lntest.input_shape_[1] * lntest.input_shape_[2] * lntest.input_shape_[3]) +
-                              (j * lntest.input_shape_[2] * lntest.input_shape_[3]) +
-                              (k * lntest.input_shape_[3]) + l;
-                    printf("%.4f, ", bout[idx]);
-                    if (std::fabs(bout[idx] - (*lntest.output)[idx]) > 1e-3) {
-                        printf("  <--mismatch ");
-                    }
-                }
-                printf("],\n");
+        printf("\n===verify C++ refer ==========\n");
+        auto bout = layer_norm(lntest.input, c.input, c.norm, lntest.weight,
+                               lntest.bias, 1e-5);
+        size_t mismatch = 0;
+        for (size_t i = 0; i < bout.size(); ++i) {
+            if (std::fabs(bout[i] - (*lntest.output)[i]) > 1e-3) {
+                ++mismatch;
             }
-            printf("],\n");
         }
-        printf("]\n");
-    }
+        printf("c++ refer mismatches: %zu / %zu\n", mismatch, bout.size());
 #endif
 
-    EXPECT_TRUE(lntest.run_test({lntest.input, lntest.weight, lntest.bias}, {lntest.output},
-        [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
-        auto *batchnorm_op = dynamic_cast<LayerNorm *>(op.get());
-        if (!batchnorm_op) {
-            LOG_ERROR("Failed to cast operator to LayerNorm");
-            return;
-        }
-        batchnorm_op->setAttribute(lntest.param);
-    }));
-
+        EXPECT_TRUE(lntest.run_test({lntest.input, lntest.weight, lntest.bias},
+                                    {lntest.output},
+            [&lntest](std::unique_ptr<vkop::ops::Operator> &op) {
+                op->setAttribute(lntest.param);
+            })) << "normalized_shape rank " << c.norm.size();
+    }
 }

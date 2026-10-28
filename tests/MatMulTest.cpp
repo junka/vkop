@@ -424,6 +424,13 @@ TEST(MatMulTest, MatMulSoftmaxFusion) {
         {2, 4, 1, 16, 64, 0.0884f},
         {1, 8, 1, 32, 128, 0.5f},
         {2, 2, 2, 16, 64, 1.0f},
+        // Boundaries of the kernel's own limits: n_owned = ceil(N/256) columns
+        // per lane means N=2 (one live lane) and N=512 (two per lane) are the
+        // ends of the row-reduce, and K=1024 is the sA_row staging capacity the
+        // host gate (k <= 1024) mirrors.
+        {2, 4, 1, 16, 2, 0.0884f},
+        {2, 2, 1, 16, 512, 0.5f},
+        {1, 4, 1, 1024, 64, 0.0884f},
     };
     for (const auto &c : cases) {
         auto [B, heads, M, K, N, scale] = c;
@@ -481,6 +488,8 @@ TEST(MatMulTest, MatMulSoftmaxFusionTransB) {
     const std::vector<std::tuple<int, int, int, int, int, float>> cases = {
         {2, 4, 1, 16, 64, 0.0884f},
         {1, 8, 1, 128, 256, 0.0884f},  // real head_dim=128, decode kv slice
+        // K at the staging bound, with the transposed column walk.
+        {1, 4, 1, 1024, 64, 0.0884f},
     };
     for (const auto &c : cases) {
         auto [B, heads, M, K, N, scale] = c;
