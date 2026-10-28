@@ -190,8 +190,40 @@ class ModelConverter:
         # are streamed into the .vkopbin trailer at save time.
         base_dir = os.path.dirname(os.path.abspath(onnx_path))
         weight_stream.install_guard()
+
+        # MoE paging slots: vkop_moe_group / vkop_moe_expert_id on the
+        # graph.input / graph.value_info declarations of slot initializers
+        # (make_moe_variant.py). Both are scanned: a slot wired to a MatMul is
+        # a graph *input* (initializer twin), while an unwired slot is only a
+        # value_info declaration. Reading just graph.input converted a model
+        # whose slots all live in value_info into a slot-less dense one -- the
+        # 4320 expert matrices then load as ordinary weights, no error.
+        # Read BEFORE optimize_model — onnxoptimizer rebuilds the graph and
+        # drops ValueInfoProto metadata_props (the same reason the causal
+        # mask rides on model-level metadata), so this is the last point the
+        # declaration is readable. Also read before `prepare`, which has to be
+        # told which names not to read: the pool is 23 GiB and hydration is not
+        # undoable at that scale. The names feed the liveness prune's keep-alive
+        # set (a slot's bytes exist so the runtime can page any expert into it,
+        # not because a live node reads it); the (group, expert_id) mapping
+        # rides along for the runtime's slot table.
+        moe_slots = {}
+        for source in (list(model.graph.input) + list(model.graph.value_info)):
+            grp = eid = None
+            for e in source.metadata_props:
+                if e.key == "vkop_moe_group":
+                    grp = e.value
+                elif e.key == "vkop_moe_expert_id":
+                    eid = e.value
+            if grp is not None:
+                moe_slots[source.name] = (grp, eid)
+        if moe_slots:
+            print(f"[moe] {len(moe_slots)} paging slot(s) declared "
+                  f"({len({g for g, _ in moe_slots.values()})} group(s))")
+
         deferred_weights = weight_stream.prepare(
-            model, base_dir, quant=quant, unify=unify, rgba=rgba)
+            model, base_dir, quant=quant, unify=unify, rgba=rgba,
+            keep_in_file=moe_slots)
 
         # Normalize bf16 away before anything reads a dtype: the runtime has no
         # bf16 kernel and no bf16 storage type, so a model that spells it has to
@@ -202,31 +234,9 @@ class ModelConverter:
         if bf16_count:
             print(f"[bf16] downcast {bf16_count} bfloat16 tensor(s) to float16")
 
-        # MoE paging slots: vkop_moe_group / vkop_moe_expert_id on the
-        # graph.input declarations of slot initializers (make_moe_variant.py).
-        # Read BEFORE optimize_model — onnxoptimizer rebuilds the graph and
-        # drops ValueInfoProto metadata_props (the same reason the causal
-        # mask rides on model-level metadata), so this is the last point the
-        # declaration is readable. The names feed the liveness prune's
-        # keep-alive set (a slot's bytes exist so the runtime can page any
-        # expert into it, not because a live node reads it); the (group,
-        # expert_id) mapping rides along for the runtime's slot table.
-        moe_slots = {}
-        for inp in model.graph.input:
-            grp = eid = None
-            for e in inp.metadata_props:
-                if e.key == "vkop_moe_group":
-                    grp = e.value
-                elif e.key == "vkop_moe_expert_id":
-                    eid = e.value
-            if grp is not None:
-                moe_slots[inp.name] = (grp, eid)
-        if moe_slots:
-            print(f"[moe] {len(moe_slots)} paging slot(s) declared "
-                  f"({len({g for g, _ in moe_slots.values()})} group(s))")
-
         print("Optimizing ONNX model...")
-        model = self.optimizer.optimize_model(model, batch_size)
+        model = self.optimizer.optimize_model(model, batch_size,
+                                              keep_alive=moe_slots)
 
         # Do NOT onnx.save here — llm.onnx weights exceed protobuf's 2GB
         # single-file limit. The DAG converter reads model.graph directly
@@ -234,6 +244,17 @@ class ModelConverter:
         dag_model = DAGBasedModel()
         dag_model.moe_keep_alive = set(moe_slots)
         dag_model.moe_slots = moe_slots
+        # The slot bytes were kept out of RAM by `prepare`; this validates what
+        # it recorded and drops the external_data pointer the optimizer may have
+        # re-attached, so no later walk hydrates the pool.
+        if moe_slots:
+            added, cleared = weight_stream.restore_paging_slots(
+                model, base_dir, deferred_weights, moe_slots)
+            held = sum(e["length"] for n, e in deferred_weights.items()
+                       if n in moe_slots)
+            print(f"[moe] {len(moe_slots) - added} slot(s) streamed by prepare, "
+                  f"{added} built here, {cleared} external_data pointer(s) "
+                  f"cleared; {held >> 20} MiB of experts stays on disk")
         # The streaming contract the parse step negotiated: names whose payload
         # never entered RAM, and where to read them from when the blob is
         # written. save_to_binary verifies it before writing anything.

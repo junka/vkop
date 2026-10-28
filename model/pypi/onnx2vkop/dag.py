@@ -325,7 +325,9 @@ class DAGBasedModel:
         两件事：
           1. 后向 liveness 剪枝：从 graph outputs 出发，把到不了输出端的节点
              整棵删掉（大模型跳过 onnxoptimizer 死代码清除时的悬空 Constant，
-             以及 ConvertToDAG 阶段才暴露的 Identity 等）。
+             以及 ConvertToDAG 阶段才暴露的 Identity 等）。一个输出没人读的
+             算子就是纯开销：它跑一次完整的 dispatch，结果被丢掉。
+             注意 initializer 是**叶子**，不是这里的种子 —— 见下方 seed。
           2. 物化活着的 Constant：凡带 value 张量属性的 Constant 节点，值整体
              搬进 initializers（C++ 加载器原生支持 int64/int32/fp32/fp16/int8），
              删节点。这样 runtime 端只需实现 Shape/Unsqueeze/Cast/Squeeze/
@@ -342,25 +344,30 @@ class DAGBasedModel:
 
     def _prune_dead_and_materialize_constants_impl(self):
         # All vkop ops are pure (inputs -> outputs, no side effects / control
-        # flow), so ANY node whose output can't reach a graph output or a live
-        # initializer is dead and can be pruned — not just shape-meta ops.
-        # (Previously only {Constant,Identity,Shape,Unsqueeze,Squeeze,Cast,
-        # ScatterND} were pruned, which left dead Gather/Div/Mul/etc. orphaned
-        # when their pruneable shape-meta producers got deleted — e.g. the
-        # rotary half-boundary chain /Shape_2 -> /Gather_2 -> /Div -> /Cast ->
-        # /Unsqueeze_8 becomes dead after fuse_rotary_embedding removes the
-        # Slice consumers, but /Gather_2 and /Div were non-pruneable and stayed
-        # as orphans referencing now-missing tensors -> runtime lookup crash.)
+        # flow), so ANY node whose output can't reach a graph output is dead,
+        # not just shape-meta ops. (Previously only {Constant,Identity,Shape,
+        # Unsqueeze,Squeeze,Cast,ScatterND} were pruned, which left dead
+        # Gather/Div/Mul/etc. orphaned when their pruneable shape-meta
+        # producers got deleted — e.g. the rotary half-boundary chain /Shape_2
+        # -> /Gather_2 -> /Div -> /Cast -> /Unsqueeze_8 becomes dead after
+        # fuse_rotary_embedding removes the Slice consumers, but /Gather_2 and
+        # /Div were non-pruneable and stayed as orphans referencing now-missing
+        # tensors -> runtime lookup crash.)
         nodes = list(self.nodes.values())
         tensor_producer = {}
         for n in nodes:
             for out in n.outputs:
                 tensor_producer[out["name"]] = n
 
-        # 1) 后向 liveness：graph outputs 及 initializer 名视为 live 种子。
+        # 1) 后向 liveness：graph outputs 是种子。
+        #
+        # initializer 名**不能**当种子：它是叶子，不生产节点。当种子会把
+        # 「生产该 initializer 的节点」整条链拉活，而 Constant 节点的输出就叫
+        # 它物化后的 initializer 名 —— 每个 Constant 都成了自己的种子，这一步
+        # 于是从不剪任何东西（实测 5898 节点只掉 1 个）。MoE 分页槽位的字节
+        # 靠写盘前的 terminal_liveness_prune 按 moe_keep_alive 保留，不靠这里。
         seed = set()
         seed.update(o["name"] for o in self.outputs)
-        seed.update(self.initializers.keys())
         live_tensors = set()  # tensor name
         live_nodes = set()    # node name
         stack = list(seed)
@@ -665,7 +672,7 @@ class DAGBasedModel:
         # external-only: ordered (name, arr) list to replay at write time.
         external_init_order = [] if external else None
 
-        def add_entry(name, arr, offset, size):
+        def add_entry(name, arr, offset, size, moe_group=None, moe_expert_id=-1):
             """One InitializerEntry side-table row for `name` at blob `offset`."""
             name_off = builder.CreateString(name)
             dtype_off = builder.CreateString(_init_dtype_name(arr))
@@ -675,13 +682,40 @@ class DAGBasedModel:
                 builder.PrependUint32(int(d))
             dims_off = builder.EndVector()
 
+            # MoE fields are written only for a paging slot. Both sit at the end
+            # of the table, so an ordinary weight's row is what it was before
+            # the fields existed and an older reader sees "" / -1
+            # (vkop_model.fbs).
+            group_off = builder.CreateString(moe_group) if moe_group else 0
+
             InitializerEntry.Start(builder)
             InitializerEntry.AddName(builder, name_off)
             InitializerEntry.AddDtype(builder, dtype_off)
             InitializerEntry.AddDims(builder, dims_off)
             InitializerEntry.AddOffset(builder, offset)
             InitializerEntry.AddSize(builder, size)
+            if group_off:
+                InitializerEntry.AddMoeGroup(builder, group_off)
+                InitializerEntry.AddMoeExpertId(builder, int(moe_expert_id))
             init_entries.append(InitializerEntry.End(builder))
+
+        # MoE paging slots. `self.initializers` is the *surviving* set after
+        # every prune pass, so this loop is where a slot is lost: a slot whose
+        # keep-alive node got deleted is gone from self.initializers entirely,
+        # and the model then loads "successfully" with a slot table pointing
+        # at nothing -- all-zero expert weights, wrong logits, no error.
+        # Two independent prunes can do it: _prune_dead_and_materialize_
+        # constants_impl (optimizer-pass time) and terminal_liveness_prune
+        # (write time; it honors moe_keep_alive for the initializer but the
+        # bytes only survive if weight_stream actually deferred them).
+        moe_keep_alive = set(getattr(self, "moe_keep_alive", ()))
+        # name -> (group, expert_id); ends up in the InitializerEntry row so the
+        # loader can build the slot table without parsing names.
+        moe_slots = getattr(self, "moe_slots", {})
+        init_names = set(self.initializers)
+
+        entries = set()
+        slot_rows = {}
 
         for name, arr in self.initializers.items():
             if name in unified_names:
@@ -697,7 +731,14 @@ class DAGBasedModel:
                 blob.extend(_init_bytes(arr))
             cur_blob_len = aligned_offset + data_size
             blob_offsets[name] = (aligned_offset, data_size)
-            add_entry(name, arr, aligned_offset, data_size)
+            if name in moe_slots:
+                grp, eid = moe_slots[name]
+                slot_rows[name] = (grp, eid, aligned_offset, data_size)
+                add_entry(name, arr, aligned_offset, data_size,
+                          moe_group=grp, moe_expert_id=int(eid))
+            else:
+                add_entry(name, arr, aligned_offset, data_size)
+            entries.add(name)
 
         # --- Append the unified sub-region (if any) and record its base. ---
         unified_bytes = getattr(self, "_unified_bytes", b"")
@@ -727,8 +768,68 @@ class DAGBasedModel:
                 abs_offset = m["offset"] + unified_base
                 blob_offsets[name] = (abs_offset, m["size"])
                 add_entry(name, self.initializers[name], abs_offset, m["size"])
+                entries.add(name)
         else:
             self.unified_blob_offset = 0
+
+        # Fail closed on MoE paging slots. This runs AFTER the emission loop,
+        # so it sees the bytes that actually made it, not an empty map.
+        #
+        # The distinction matters: an entry row without bytes means the
+        # runtime's slot arithmetic (blob offset = base + expert_id * slot
+        # size) silently reads a neighbour expert, and a slot missing from
+        # self.initializers entirely means the runtime reads whatever the
+        # alignment padding happens to be. Both are "loads fine, wrong
+        # numbers". See make_moe_variant.py's keep-alive nodes.
+        if moe_keep_alive:
+            lost = moe_keep_alive - entries
+            if lost:
+                gone = moe_keep_alive - init_names
+                raise weight_stream.DeferredWeightError(
+                    f"{len(lost)} MoE paging slot(s) are declared but have no "
+                    f"InitializerEntry row (e.g. {sorted(lost)[:3]}). "
+                    f"{len(gone)} of them are absent from the model's "
+                    f"initializers altogether -- a prune deleted the bytes. "
+                    f"Check that _prune_dead_and_materialize_constants_impl and "
+                    f"terminal_liveness_prune both keep moe_keep_alive, and "
+                    f"that the exporter's keep-alive nodes survived.")
+            # Slots must stay a uniform, hole-free, ascending byte run: the
+            # runtime fills a slot by seeking to `offset + expert_id * size`, so
+            # a hole or a changed size means a swap lands in the wrong expert's
+            # bytes -- silently. Checked against the rows actually emitted.
+            slots_by_group = {}
+            for name, (grp, eid, _off, _size) in slot_rows.items():
+                slots_by_group.setdefault(grp, []).append((int(eid), name))
+            lost_rows = moe_keep_alive - set(slot_rows)
+            if lost_rows:
+                raise weight_stream.DeferredWeightError(
+                    f"{len(lost_rows)} MoE slot(s) got an InitializerEntry row "
+                    f"without moe_group (e.g. {sorted(lost_rows)[:3]}); the "
+                    f"runtime would never find them in the slot table.")
+            for grp, members in slots_by_group.items():
+                members.sort()
+                if [e for e, _ in members] != list(range(len(members))):
+                    raise weight_stream.DeferredWeightError(
+                        f"MoE group {grp} has expert ids "
+                        f"{[e for e, _ in members][:8]}..., expected 0.."
+                        f"{len(members) - 1}: the runtime indexes a group by "
+                        f"expert id, so a gap silently shifts every later "
+                        f"expert (see make_moe_variant.py).")
+                for i in range(1, len(members)):
+                    prev_off, prev_size = blob_offsets[members[i - 1][1]]
+                    off, size = blob_offsets[members[i][1]]
+                    if size != prev_size or off != prev_off + prev_size:
+                        raise weight_stream.DeferredWeightError(
+                            f"MoE slot {members[i][1]} (expert {members[i][0]}) "
+                            f"is not contiguous after {members[i - 1][1]} "
+                            f"(offset {off}, expected {prev_off + prev_size}; "
+                            f"size {size} vs {prev_size}). Group {grp} must be "
+                            f"a uniform, hole-free, ascending byte run -- see "
+                            f"make_moe_variant.py's insertion-order contract.")
+            if slots_by_group:
+                print(f"[moe] {len(slot_rows)} slot row(s) in "
+                      f"{len(slots_by_group)} group(s), "
+                      f"{sum(s for _, _, _, s in slot_rows.values()) >> 20} MiB")
 
         Model.StartInitializersVector(builder, len(init_entries))
         for off in reversed(init_entries):
@@ -1090,6 +1191,26 @@ class DAGBasedModel:
                 pad = (align - (f.tell() % align)) % align
                 if pad:
                     f.write(b"\x00" * pad)
+                # Before asking for the side table's only addressing unit: a
+                # paging slot is later refilled from this file by offset alone,
+                # so it is worth saying which slots are only *transcribed* into
+                # it rather than already living there. A slot's `location`
+                # resolves against the ONNX's directory (`weight_base_dir`),
+                # not the output's.
+                transcribed = weight_stream.verify_not_sidebar_located(
+                    {n: self.deferred_weights[n] for n in slot_rows
+                     if n in self.deferred_weights},
+                    file_path)
+                if transcribed:
+                    # Not fatal: write_payload below puts the bytes in the
+                    # trailer, and that copy is what the runtime pages. It is
+                    # worth one line, though, because it is the only case in
+                    # which a slot's bytes are a transcription from another
+                    # file rather than already being the trailer's own.
+                    print(f"[moe] {len(transcribed)} slot(s) transcribed into "
+                          f"the trailer from a side file (e.g. "
+                          f"{sorted(transcribed)[:2]})")
+
                 blob_offset = f.tell()
                 written = 0
                 for _name, arr, aligned_offset, data_size, ipad in external_init_order:

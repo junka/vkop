@@ -69,6 +69,13 @@ struct Initializer {
     // byte, so the runtime must take the byte count from the file and check it
     // against dims rather than derive one from the other.
     size_t size = 0;
+    // MoE expert paging (vkop_model.fbs InitializerEntry). `moe_group` names
+    // the slot ("3.gate_proj"), empty for an ordinary weight; `moe_expert_id`
+    // is the expert whose bytes are stored there, -1 for an ordinary weight.
+    // Both default to "no paging", so a vkopbin written before the fields
+    // existed loads unchanged.
+    std::string moe_group;
+    int32_t moe_expert_id = -1;
 };
 
 // RAII handle over a memory-mapped file. Owned by VkModel so that the

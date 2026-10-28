@@ -83,8 +83,22 @@ class InitializerEntry(object):
             return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
         return 0
 
+    # InitializerEntry
+    def MoeGroup(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(14))
+        if o != 0:
+            return self._tab.String(o + self._tab.Pos)
+        return None
+
+    # InitializerEntry
+    def MoeExpertId(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(16))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
+        return -1
+
 def InitializerEntryStart(builder):
-    builder.StartObject(5)
+    builder.StartObject(7)
 
 def Start(builder):
     InitializerEntryStart(builder)
@@ -124,6 +138,18 @@ def InitializerEntryAddSize(builder, size):
 
 def AddSize(builder, size):
     InitializerEntryAddSize(builder, size)
+
+def InitializerEntryAddMoeGroup(builder, moeGroup):
+    builder.PrependUOffsetTRelativeSlot(5, flatbuffers.number_types.UOffsetTFlags.py_type(moeGroup), 0)
+
+def AddMoeGroup(builder, moeGroup):
+    InitializerEntryAddMoeGroup(builder, moeGroup)
+
+def InitializerEntryAddMoeExpertId(builder, moeExpertId):
+    builder.PrependInt32Slot(6, moeExpertId, -1)
+
+def AddMoeExpertId(builder, moeExpertId):
+    InitializerEntryAddMoeExpertId(builder, moeExpertId)
 
 def InitializerEntryEnd(builder):
     return builder.EndObject()

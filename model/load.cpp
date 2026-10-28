@@ -222,6 +222,10 @@ void VkModel::loadFromFlatbuffer(const uint8_t* buf, size_t size) {
             init.name = e->name() ? e->name()->str() : "";
             init.dtype = e->dtype() ? e->dtype()->str() : "";
             init.size = static_cast<size_t>(e->size());
+            // Absent in a pre-paging file; the accessors then return "" / -1,
+            // which is precisely the no-paging case.
+            init.moe_group = e->moe_group() ? e->moe_group()->str() : "";
+            init.moe_expert_id = e->moe_expert_id();
             if (e->dims()) {
                 init.dims.reserve(e->dims()->size());
                 for (uint32_t d = 0; d < e->dims()->size(); ++d) {

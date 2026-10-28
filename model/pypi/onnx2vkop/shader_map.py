@@ -166,6 +166,13 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # device advertises subgroup arithmetic, so both must ship.
         "buffer_matmul_sg",
         "buffer_matmul_fp16_sg",
+        # The SwiGLU down-projection fold (-DDOWN_ACT, a third build of the
+        # same file): one module holding both the tiled and the split-K GEMV
+        # entry points, and the only MatMul build that reads Wg/Wu (bindings
+        # 7/8). MatMulBuffer::down_act_pipeline probes it lazily, so like the
+        # WIDE and 512 keys it has to ship with every MatMul -- the operator
+        # that needs it is a plain MatMul, not a distinct op_type.
+        "buffer_matmul_down_act_fp16",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",

@@ -113,6 +113,20 @@ table InitializerEntry {
   dims: [uint];
   offset: ulong;
   size: ulong;
+  // MoE expert paging slot. A slot is a *place*, not a weight: the exporter
+  // emits one InitializerEntry per (layer, projection, expert) and the runtime
+  // loads only a resident subset, later filling the others by rewriting that
+  // slot's buffer in place. `moe_group` names the place ("3.gate_proj") and is
+  // empty for an ordinary weight; `moe_expert_id` says whose bytes are here at
+  // load time, -1 for an ordinary weight. Appended at the end of the table
+  // because FlatBuffers addresses fields by declaration order -- an older
+  // vkopbin simply reads as "" / -1, which is exactly "no paging".
+  //
+  // Within one group the entries must be a uniform, hole-free, ascending byte
+  // run: the runtime computes a slot's offset arithmetically from the expert
+  // id rather than remembering it (dag.py asserts this at write time).
+  moe_group: string;
+  moe_expert_id: int = -1;
 }
 
 table Node {

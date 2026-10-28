@@ -116,3 +116,22 @@ def test_chain_output_rejected():
     m.outputs = [m.nodes["Reshape_0"].outputs[0]]
     assert len(matches_of(m)) == 0, "R as graph output must NOT match"
     print("  PASS (R as graph output rejected)")
+
+
+def test_input_without_shape_is_not_a_match():
+    """An input with no `shape` metadata must be rejected, not raise.
+
+    A input without metadata is ordinary here: a streamed (deferred) weight is
+    never read, so it never gets a shape, and a pass that produces a tensor
+    without metadata leaves the same hole. The matcher used to index
+    `a_dict["shape"]` directly, so one such MatMul raised KeyError inside the
+    optimizer -- caught and logged by the pass harness, which silently cost
+    the whole graph this fold.
+    """
+    m, mm, _ = repeat_kv_dag()
+    a = tdict("a")  # no dims -> no "shape" key
+    a["dtype"], a["shape"] = F32, [2, 16, -1, 128]
+    del a["shape"]
+    m.inputs = [a] + [i for i in m.inputs if i["name"] != "a"]
+    mm.inputs[0] = a
+    assert matches_of(m) == []
