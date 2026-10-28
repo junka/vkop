@@ -1114,10 +1114,9 @@ class MatMulBuffer : public BufferFactory {
             const size_t ks_table_words = 2 * static_cast<size_t>(ks_n);
             const size_t ks_part_off = ks_table_off_ + ks_table_words;
             size_t ks_bytes =
-                (ks_part_off + static_cast<size_t>(batch) *
-                                   static_cast<size_t>(ks_n) *
-                                   static_cast<size_t>(m) *
-                                   static_cast<size_t>(n)) *
+                (ks_part_off +
+                 static_cast<size_t>(batch) * static_cast<size_t>(ks_n) *
+                     static_cast<size_t>(m) * static_cast<size_t>(n)) *
                 sizeof(float);
             if (!scratch_ || scratch_bytes_ < ks_bytes) {
                 scratch_ = std::make_shared<VulkanBuffer>(
@@ -1242,6 +1241,7 @@ class MatMulBuffer : public BufferFactory {
         // collapses the push_constant block to a 4-byte range and zeroes EVERY
         // constant after it -- including K, on which the tiled K window
         // depends.
+        para_.epi_scale = epi_scale_;
         para_.epi_bias = epi_bias_ ? 1 : 0;
         // The bias is [B,1,q,kv] broadcast over the head axis, so its element
         // count is B*M*N while the output's is batch*M*N (batch = B*heads).
@@ -2173,10 +2173,9 @@ class MatMulBuffer : public BufferFactory {
             const char *v = std::getenv("VKOP_KS_TARGET");
             return v ? std::atoi(v) : 0;
         }();
-        const int target =
-            pinned_target > 0
-                ? pinned_target
-                : m_dev_->matmul_tile_profile().ks_target_blocks;
+        const int target = pinned_target > 0
+                               ? pinned_target
+                               : m_dev_->matmul_tile_profile().ks_target_blocks;
         if (blocks >= target) {
             return 1;
         }

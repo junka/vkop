@@ -267,6 +267,22 @@ class Topk : public Operator {
         }
 
         if (row_pad > 0 && axis == 1) {
+            // The kernel wrote rows of para_.k (k rounded up to even) so the
+            // last half2 store lands inside the row. copyBufferToCPU's contract
+            // is the opposite: dims_[1] is the LOGICAL column count and the
+            // device stride is dims_[1] + gpu_row_pad. Leaving the tensor at
+            // the padded shape made it copy rows * (k+1+pad) elements (one past
+            // the buffer on the last row) and kept the padding column as a
+            // k+1th output value. Shrink the dims back to the ONNX k; the
+            // allocation stays padded and the readback now copies k+pad and
+            // drops the pad.
+            auto logical = inshape;
+            logical[axis] = original_k;
+            dispatch_by_dtype(outputs[0]->dtype(), [&](auto t) {
+                using T = decltype(t);
+                core::as_tensor<T>(outputs[0])->resize(logical);
+            });
+            core::as_tensor<int>(outputs[1])->resize(logical);
             outputs[0]->set_gpu_row_pad(row_pad);
             outputs[1]->set_gpu_row_pad(row_pad);
         }
