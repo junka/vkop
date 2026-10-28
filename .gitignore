@@ -1,112 +1,12 @@
-# Ignore build directories
-/build/
-/bin/
-/obj/
-/out/
-/model/onnx_models/
-/.cache/
-
-# Ignore CMake generated files
-CMakeFiles/
-CMakeCache.txt
-cmake_install.cmake
-Makefile
-*.onnx
-*.vkopbin
-
-# Ignore compiled object files
-*.o
-*.obj
-*.lo
-*.slo
-
-# Ignore compiled dynamic libraries
-*.so
-*.dylib
-*.dll
-
-# Ignore compiled static libraries
-*.lib
-*.a
-
-# Ignore executables
-*.exe
-*.out
-*.app
-
-# Ignore logs and temporary files
-*.log
-*.tmp
-*.swp
-*.bak
-*.old
-
-# Ignore IDE specific files
-.idea/
-.vscode/
-*.code-workspace
-
-# Ignore Git-specific files
-*.orig
-
-# Ignore Claude Code session/agent state
-.claude/
-
-# Ignore ad-hoc testing scratch
-/Testing/
-
-# Python bytecode + build dirs
+# Export artifacts: multi-GB weight blobs, graphs, and the scattered per-tensor
+# files torch.onnx.export leaves behind. The exporters themselves are tracked
+# (qwen2_moe_export_onnx.py, moe_ckpt.py, make_moe_variant.py); what they write
+# is not.
+llm/exporter/export/*.onnx
+llm/exporter/export/*.bin
+llm/exporter/export/*.weight
+llm/exporter/export/*.bias
+llm/exporter/export/*.data
+llm/exporter/export/onnx__*
+llm/exporter/export/moe_ckpt
 __pycache__/
-*.pyc
-llm/tokenizer/build/
-
-# LLM model artifacts (multi-GB weights, converted binaries, runtime dumps) —
-# never commit; regenerate via onnx2vkop / dump_llm_inputs.py
-*.weights.bin
-# Per-model SPIR-V archive onnx2vkop writes next to the .vkopbin; regenerated
-# with the model, never hand-edited.
-*.vkopbin.shaders.bin
-*.onx
-llm/exporter/inputs_dump/
-llm/exporter/decode_dump/
-llm/exporter/chat_prefill_dump/
-llm/exporter/raw13_dump/
-# Qwen2 e2e QDQ validation scratch dir: large generated ONNX/weights + throwaway
-# validation scripts (the working injector is qwen2_inject_weight_qdq.py).
-llm/exporter/qwen2_work/
-# 无路径前缀：按名匹配任意层级。写成 llm/exporter/embed_tokens.bin 时漏掉了
-# text_qwen3/ 等子目录，742MB 产物因此被提交进历史、撞 GitHub 100MB 单文件上限。
-embed_tokens.bin
-llm/exporter/synth224.png
-llm/exporter/p.py
-llm/tokenizer/*.bin
-
-# Image-gen artifacts (ORT reference tensors, node dumps, vkop readbacks, the
-# 1.2 GB embedding table) — never commit; regenerate with
-# gen_dit_ref.py / encode_prompt_real.py / dump_text_embeds.py / image_gen.
-# ref*/ 覆盖 ref、ref_full、ref_static64、ref_text、ref_te、ref_out 等所有代次；
-# 枚举式写法每加一次对拍目录就会漏一次（embed_tokens.bin 那条就是教训）。
-image/exporter/ref*/
-/ref_out*/
-/node_dump/
-text_encoder_embeds.bin
-image/exporter/*.raw
-image/exporter/*.npz
-image/exporter/*.png
-image/exporter/vae_decoder_512_probe.onnx.data
-image/exporter/reference/*.npz
-image/exporter/output_*.npy
-/latent_out_*.raw
-/output_*.png
-/log
-
-# ASan build directory
-/build-asan/
-
-# Alternate CMake build directory (kept ignored for existing checkouts)
-/build-strip/
-
-# Vulkan pipeline cache (per-model, written by VK_PIPELINE_CACHE=1). Device-
-# specific (VkPipelineCache header embeds driver UUID), so a stale file is
-# silently discarded by the driver anyway; never commit.
-*.pcache
