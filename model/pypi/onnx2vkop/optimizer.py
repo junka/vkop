@@ -495,7 +495,7 @@ def _demote_external_initializers(model):
     return demoted, added
 
 
-def _reattach_external_initializers(model, demoted, added_inputs):
+def _reattach_external_initializers(model, demoted, added_inputs, keep_alive=()):
     """Undo _demote_external_initializers, with the payload still in its file.
 
     Which tensors come back follows `_reattach_initializers`: only what a
@@ -503,12 +503,20 @@ def _reattach_external_initializers(model, demoted, added_inputs):
     here (a fusion that stopped needing a weight is a byte saving) -- the check
     that a *live* node still names a tensor the writer promised to stream is
     `weight_stream.verify_deferred`, which sees the finished DAG.
+
+    `keep_alive` names tensors nothing reads that must still come back: MoE
+    paging slots, whose bytes exist for the runtime to page into rather than for
+    any node to consume. Returns how many of them were restored, so the caller
+    can fail closed if a pass dropped one.
     """
     graph = model.graph
+    keep_alive = {name for name in keep_alive}
     used = {inp for node in graph.node for inp in node.input}
     have = {init.name for init in graph.initializer}
+    restored_kept = 0
     for name, dtype, dims, entries in demoted:
-        if name in have or name not in used:
+        held = name in keep_alive
+        if name in have or (name not in used and not held):
             continue
         init = graph.initializer.add()
         init.name = name
@@ -519,11 +527,14 @@ def _reattach_external_initializers(model, demoted, added_inputs):
             entry = init.external_data.add()
             entry.key, entry.value = key, value
         init.data_location = TensorProto.EXTERNAL
+        if held:
+            restored_kept += 1
 
     if added_inputs:
         keep = [inp for inp in graph.input if inp.name not in added_inputs]
         del graph.input[:]
         graph.input.extend(keep)
+    return restored_kept
 
 
 # onnxoptimizer pass list. A module constant so tools/ablate.py can enumerate
@@ -598,7 +609,7 @@ class ONNXOptimizer:
     """Class for optimizing ONNX models."""
 
     @staticmethod
-    def optimize_model(onnx_model, batch_size: int = 1):
+    def optimize_model(onnx_model, batch_size: int = 1, keep_alive=()):
         """Optimize the ONNX model using ONNX's built-in optimizer.
 
         先跑 onnxoptimizer 的结构化 pass，再做常量折叠：
@@ -644,6 +655,13 @@ class ONNXOptimizer:
         # no bytes here for any pass to compare, so they come out of the graph for
         # the duration of the passes and go back (still as references) at the end.
         ext_demoted, ext_added = _demote_external_initializers(onnx_model)
+        # Tensors that must come back even though no node reads them: MoE paging
+        # slots. An unwired slot is a legal graph state (its bytes exist so the
+        # runtime can page any expert into it), and `eliminate_unused_initializer`
+        # -- which runs because a slot that IS wired leaves a name no other node
+        # uses -- would drop it. Verified at reattach, not before, because the
+        # demoted names are the only ones that pass through the passes.
+        keep_alive = {name for name in keep_alive}
         if ext_demoted:
             print(f"[optimize] external-payload view: {len(ext_demoted)} "
                   f"initializer(s) whose bytes are still in the data file "
@@ -759,7 +777,14 @@ class ONNXOptimizer:
         # those never entered this process) is what makes the caller's graph
         # contract identical to the non-streamed one.
         if ext_demoted:
-            _reattach_external_initializers(optimized_model, ext_demoted, ext_added)
+            restored = _reattach_external_initializers(optimized_model, ext_demoted,
+                                                       ext_added, keep_alive)
+            if keep_alive and restored < len(keep_alive):
+                raise MoEKeepAliveError(
+                    f"{len(keep_alive) - restored} MoE paging slot(s) did not "
+                    f"survive the optimizer's passes; they name tensors the "
+                    f"optimized graph no longer initializes, so the runtime "
+                    f"would find no bytes to page into those slots")
 
         return optimized_model
 
@@ -845,6 +870,17 @@ RUNTIME_OPS = frozenset({
     "Sin", "Slice", "Softmax", "Softplus", "Split", "Sqrt", "Squeeze", "Sub",
     "Tanh", "TopK", "Transpose", "Unsqueeze", "Where",
 })
+
+
+class MoEKeepAliveError(RuntimeError):
+    """A MoE paging slot did not survive the optimization passes.
+
+    Fatal for the same reason UnknownFusedOpError is: the slot declarations are
+    the only record that a weight's bytes exist to be paged, so a model that
+    lost the slot is a model whose runtime slot table names nothing -- and the
+    failure would otherwise surface on the target box, as experts that read
+    zero bytes.
+    """
 
 
 class UnknownFusedOpError(RuntimeError):
@@ -1546,6 +1582,33 @@ class FusionOptimizer:
                 FusionOptimizer.match_qkv_components,
                 FusionOptimizer.fold_qkv_components,
                 priority=72,
+            )
+        )
+
+        # SwiGLU down-projection fold. A Qwen3-MLP tail is
+        #     gate = MatMul(x, Wg)
+        #     up   = MatMul(x, Wu)
+        #     down = MatMul(Mul(Mul(gate, Sigmoid(gate)), up), Wd)
+        # and the two up projections materialize TWO [M, N_up] activation
+        # tensors (N_up = 2..3x hidden) plus two dispatches and the elementwise
+        # glue, only for the result to be contracted away by Wd in the very next
+        # op. Folding them into the down MatMul means neither tensor is ever
+        # written: the runtime's -DDOWN_ACT kernel accumulates
+        #     s += silu(x . Wg) * (x . Wu)
+        # over its K slice and stores that straight into the epilogue of the
+        # down GEMM.
+        #
+        # Wd is [N_up, hidden], so Wd's own contract dim is exactly the N of
+        # the gate/up GEMMs. The runtime takes Wd as the folded MatMul's B, the
+        # two up weights as bindings 7/8, and x as A. Runs well before
+        # fuse_elemwise_chain (60) so the Sigmoid/Mul chain is still visible;
+        # afterwards the four nodes are gone.
+        optimizer.register_pass(
+            PatternBasedFusionPass(
+                "fuse_swiglu_down_proj",
+                FusionOptimizer.match_swiglu_down_proj,
+                FusionOptimizer.fold_swiglu_down_proj,
+                priority=62,
             )
         )
 
@@ -2442,7 +2505,13 @@ class FusionOptimizer:
             if node.op_type != "MatMul" or len(node.inputs) < 2:
                 continue
             a_dict, b_dict = node.inputs[0], node.inputs[1]
-            ashape, rshape = a_dict["shape"], b_dict["shape"]
+            ashape = a_dict.get("shape")
+            rshape = b_dict.get("shape")
+            # An input whose rank is not known yet (a deferred weight, a tensor
+            # a previous pass produced without metadata) simply cannot be this
+            # pattern; `[]` mirrors how the other rank-4 guards read an absent
+            # shape and falls out at the same `continue`.
+            ashape, rshape = ashape or [], rshape or []
             if len(ashape) != 4 or len(rshape) != 4:
                 continue
             # B 侧链：R(Reshape) ← E(Expand) ← U(Unsqueeze) ← X，逐环单消费者
@@ -2464,10 +2533,10 @@ class FusionOptimizer:
             if u_out in graph_outputs or not sole_consumer(u_out, e_node):
                 continue
             x_dict = u_node.inputs[0]
-            xshape = x_dict["shape"]
-            ushape = u_node.outputs[0]["shape"]
-            eshape = e_node.outputs[0]["shape"]
-            if len(xshape) != 4 or len(ushape) != 5 or len(eshape) != 5:
+            xshape = x_dict.get("shape")
+            ushape = u_node.outputs[0].get("shape")
+            eshape = e_node.outputs[0].get("shape")
+            if len(xshape or ()) != 4 or len(ushape or ()) != 5 or len(eshape or ()) != 5:
                 continue
             hkv = xshape[1]
             if hkv in (-1, 0):
@@ -5317,6 +5386,174 @@ class FusionOptimizer:
         dag_model.nodes[fused.name] = fused
         return True
 
+    # ---- SwiGLU down-projection fold (MatMul(Mul(Mul(g,S),u), Wd)) ----
+    # Matches the Qwen3-MLP tail
+    #     gate = MatMul(x, Wg)         one consumer
+    #     up   = MatMul(x, Wu)         one consumer
+    #     s    = Sigmoid(gate)         one consumer
+    #     m1   = Mul(gate, s)          one consumer
+    #     m2   = Mul(m1, up)           one consumer
+    #     down = MatMul(m2, Wd)        [N_up, hidden]
+    # and folds the whole thing into `down` with inputs [x, Wd, Wg, Wu] and
+    # down_act=1. Everything in the chain has to be single-consumer: the fold
+    # deletes gate/up/Sigmoid/Mul, and any other reader of gate or up would be
+    # reading a tensor that no longer exists.
+    #
+    # The rates are the runtime's: A and both up weights fp16, Wd non-transposed
+    # (Wd's rows are the contraction, which is the plain [K, N] layout), and
+    # the gate's two up weights not constants of a different author -- a
+    # weight-only int8 model keeps Wg/Wu as f16 after the QDQ fold (priority
+    # 86), so this matches on op structure only and leaves precision to the
+    # dtype the converter assigns.
+    # ---- SwiGLU down-projection fold (MatMul(Mul(Mul(g,S),u), Wd)) ----
+    # Matches the Qwen3-MLP tail
+    #     gate = MatMul(x, Wg)         one consumer
+    #     up   = MatMul(x, Wu)         one consumer
+    #     s    = Sigmoid(gate)         one consumer
+    #     m1   = Mul(gate, s)          one consumer
+    #     m2   = Mul(m1, up)           one consumer
+    #     down = MatMul(m2, Wd)        Wd [N_up, hidden]
+    # and folds the whole thing into `down` with inputs [x, Wd, Wg, Wu] and
+    # down_act=1 (see ops/Matmul.hpp: MatMulBuffer::execute). Everything in the
+    # chain has to be single-consumer: the fold deletes gate/up/Sigmoid/Mul, so
+    # any other reader would be reading a tensor that no longer exists.
+    #
+    # The rates are the runtime's: A and both up weights fp16, Wd non-transposed
+    # (its ROWS are the contraction, which is exactly the plain [K, N] layout
+    # the MatMul kernel already reads, so the fold needs no new B form).
+    @staticmethod
+    def match_swiglu_down_proj(dag_model):
+        producer = {}
+        consumers = defaultdict(list)
+        for n in dag_model.nodes.values():
+            for o in n.outputs:
+                producer[o["name"]] = n
+            for i in n.inputs:
+                consumers[i["name"]].append(n)
+        inits = dag_model.initializers
+
+        def _single(name):
+            cs = consumers.get(name, [])
+            return cs[0] if len(cs) == 1 else None
+
+        def _other(node, keep):
+            # The input of `node` that is not `keep` (None if ambiguous).
+            rest = [i for i in node.inputs if i["name"] != keep]
+            return rest[0] if len(rest) == 1 else None
+
+        matches = []
+        for down in dag_model.nodes.values():
+            if down.op_type != "MatMul" or len(down.inputs) != 2:
+                continue
+            wd = down.inputs[1]["name"]
+            if wd not in inits or down.attributes.get("transB", 0):
+                continue
+            m2 = producer.get(down.inputs[0]["name"])
+            if m2 is None or m2.op_type != "Mul" or len(m2.inputs) != 2:
+                continue
+            # m2 = Mul(m1, up): one operand is the silu product, the other the
+            # up projection.
+            m1 = None
+            up = None
+            for a, b in ((m2.inputs[0], m2.inputs[1]), (m2.inputs[1], m2.inputs[0])):
+                p = producer.get(b["name"])
+                if p is not None and p.op_type == "Mul":
+                    m1, up = p, producer.get(a["name"])
+            if m1 is None or up is None or up.op_type != "MatMul":
+                continue
+            if len(m1.inputs) != 2 or len(up.inputs) != 2:
+                continue
+            # m1 = Mul(gate, Sigmoid(gate)).
+            gate = None
+            mul_self = None
+            for a, b in ((m1.inputs[0], m1.inputs[1]), (m1.inputs[1], m1.inputs[0])):
+                p = producer.get(b["name"])
+                if p is not None and p.op_type == "Sigmoid":
+                    cand = producer.get(a["name"])
+                    if cand is not None and cand.op_type == "MatMul":
+                        gate, mul_self = cand, p
+                        break
+            if gate is None or len(gate.inputs) != 2:
+                continue
+            x, wg = gate.inputs
+            if wg["name"] not in inits:
+                x, wg = wg, x
+            if wg["name"] not in inits:
+                continue
+            wx, wu = up.inputs
+            if wu["name"] not in inits:
+                wx, wu = wu, wx
+            if wu["name"] not in inits or wx["name"] != x["name"]:
+                continue
+            # Every tensor in the chain is read exactly once: the fold deletes
+            # the four nodes, and the down MatMul is the chain's only exit.
+            # gate feeds both m1 and the Sigmoid, which is part of the pattern,
+            # so it is allowed one reader on each side and nothing else.
+            chain = (up.outputs[0]["name"], mul_self.outputs[0]["name"],
+                     m1.outputs[0]["name"], m2.outputs[0]["name"])
+            if any(_single(t) is None for t in chain):
+                continue
+            gname = gate.outputs[0]["name"]
+            greaders = consumers.get(gname, [])
+            if not (len(greaders) == 2 and mul_self in greaders and m1 in greaders):
+                continue
+            # Shapes: Wd [N_up, hidden], Wg/Wu [K_out, N_up].
+            wdt = inits[wd]
+            wgt = inits[wg["name"]]
+            wut = inits[wu["name"]]
+            if min(len(wdt.dims), len(wgt.dims), len(wut.dims)) != 2:
+                continue
+            if wgt.dims != wut.dims or wgt.dims[1] != wdt.dims[0]:
+                continue
+            matches.append({
+                "down": down,
+                "gate": gate,
+                "up": up,
+                "sigmoid": mul_self,
+                "m1": m1,
+                "m2": m2,
+                "x": x,
+                "wd": wd,
+                "wg": wg["name"],
+                "wu": wu["name"],
+            })
+        if True:
+            print(f"SWIGLU-DEBUG matches={len(matches)}")
+        else:
+            import os
+            if os.environ.get("VKOP_SWIGLU_DEBUG"):
+                for down in dag_model.nodes.values():
+                    if down.op_type == "MatMul" and len(down.inputs) == 2:
+                        wd = down.inputs[1]["name"]
+                        print("  cand", down.name, "wd_init", wd in inits,
+                              "transB", down.attributes.get("transB", 0),
+                              "wd_dims", list(inits[wd].dims) if wd in inits else None)
+        return matches
+
+    @staticmethod
+    def fold_swiglu_down_proj(dag_model, match) -> bool:
+        down = match["down"]
+        fused = Node(
+            op_type="MatMul",
+            name=down.name,
+            attributes=dict(down.attributes),
+            inputs=[
+                match["x"],
+                {"name": match["wd"]},
+                {"name": match["wg"]},
+                {"name": match["wu"]},
+            ],
+            outputs=down.outputs[:],
+        )
+        fused.attributes["down_act"] = [1]
+        del dag_model.nodes[down.name]
+        for k in ("gate", "up", "sigmoid", "m1", "m2"):
+            n = match.get(k)
+            if n is not None and n.name in dag_model.nodes:
+                del dag_model.nodes[n.name]
+        dag_model.nodes[fused.name] = fused
+        return True
+
     # ---- QDQ weight-into-MatMul (weight-only int8) fusion ----
     # An externally-quantized model carries its weights as a QDQ triple:
     #     DequantizeLinear(u8_const, scalar_fp32_scale, scalar_u8_zero_point)
@@ -5851,6 +6088,10 @@ class FusionOptimizer:
     _FUSED_MAX_REGS = 16
     _FUSED_MAX_OPS = 32
     _FUSED_MIN_CHAIN = 2  # don't fuse trivial 1-op chains (no dispatch saving)
+    # OP_SILU: x*sigmoid(x), emitted only by the Sigmoid+MUL(x, sigmoid)
+    # collapse inside fold_fuse_elemwise_chain below -- it is never a mapping
+    # of an ONNX op_type, so it lives outside _FUSED_OP_CODES.
+    _FUSED_OP_CODES_SILU = 14
 
     @staticmethod
     def match_fuse_elemwise_chain(dag_model):
@@ -6105,6 +6346,7 @@ class FusionOptimizer:
         next_reg = n_leaf_regs
         free_regs = []
         consumed_so_far = {n.name: 0 for n in chain}
+        chain_index = {n.name: i for i, n in enumerate(chain)}
 
         def alloc_reg():
             nonlocal next_reg
@@ -6117,7 +6359,7 @@ class FusionOptimizer:
         # Operand resolution: given an input tensor of `op`, return its value
         # source — either a register index (int < MAX_REG) or a scalar code
         # (>= 100), or None if it's a leaf register.
-        def operand_code(op, inp):
+        def operand_code(op, inp, chain_name=None):
             tname = inp["name"]
             if tname in leaf_scalar_idx:
                 return 100 + leaf_scalar_idx[tname]
@@ -6125,12 +6367,49 @@ class FusionOptimizer:
                 return leaf_reg[tname]
             pred = producer.get(tname)
             if pred is not None and pred.name in chain_names:
-                return op_out_reg[pred.name]
+                return op_out_reg[chain_name or pred.name]
             return None
 
         program = []  # flat int list, 4 per op
+        collapsible = None  # (sigmoid_op_name, dst) or None
+        chain_sigmoid_input = {}  # sigmoid op name -> its input tensor name
         for op in chain:
             oc = FusionOptimizer._FUSED_OP_CODES[op.op_type]
+            # silu(x) = x*sigmoid(x): a SIGMOID read only by MUL(x, sigmoid) --
+            # x being the very tensor the SIGMOID read -- collapses the pair
+            # into ONE OP_SILU word (one fewer program word and register, and
+            # the shared operand is read once). Deferred by one iteration: the
+            # MUL's dst is the word that carries the fused result.
+            if (collapsible is not None and op.op_type == "Mul"
+                    and len(op.inputs) == 2):
+                sig_name = collapsible
+                collapsible = None
+                idx = next((i for i, t in enumerate(op.inputs)
+                            if t["name"] == sig_name), None)
+                if idx is not None and \
+                        op.inputs[1 - idx]["name"] == chain_sigmoid_input[sig_name]:
+                    sig_op = next(n for n in chain if n.name == sig_name)
+                    # The SIGMOID's operand must resolve to a register (a leaf
+                    # input or an upstream chain op) -- the collapse emits
+                    # SILU(a=<that register>, ...) and never re-derives a
+                    # scalar constant. It is also the SILU operand itself, so
+                    # op_out_reg[sig_name] (the SIGMOID word's dst) is NOT it.
+                    sig_operand = operand_code(sig_op, sig_op.inputs[0],
+                                              chain_name=sig_name)
+                    if sig_operand is not None and sig_operand < 100:
+                        dst = alloc_reg()
+                        op_out_reg[op.name] = dst
+                        program.extend([FusionOptimizer._FUSED_OP_CODES_SILU, dst,
+                                        sig_operand, 0])
+                        for inp in op.inputs:
+                            pred = producer.get(inp["name"])
+                            if pred is not None and pred.name in chain_names:
+                                consumed_so_far[pred.name] += 1
+                                if consumed_so_far[pred.name] >= use_count[pred.name]:
+                                    r = op_out_reg.get(pred.name)
+                                    if r is not None and r >= n_leaf_regs:
+                                        free_regs.append(r)
+                        continue
             dst = alloc_reg()
             op_out_reg[op.name] = dst
             # Resolve operands.
@@ -6154,8 +6433,21 @@ class FusionOptimizer:
                         r = op_out_reg.get(pred.name)
                         if r is not None and r >= n_leaf_regs:
                             free_regs.append(r)
+            if op.op_type == "Sigmoid":
+                collapsible = op.name
+                chain_sigmoid_input[op.name] = op.inputs[0]["name"]
+            # A SIGMOID whose ONLY consumer is the very next chain op is the
+            # back half of a silu pair -- the next iteration turns the pair
+            # into one SILU word, so the SIGMOID word emitted above is
+            # dropped. Dropping it frees its dst for immediate reuse by the
+            # SILU word (the value it held is dead at that point).
+            if (collapsible == op.name and chain_index[op.name] + 1 < len(chain)
+                    and use_count[op.name] == 1
+                    and chain[chain_index[op.name] + 1].op_type == "Mul"):
+                program = program[:-4]
+                free_regs.append(op_out_reg[op.name])
 
-        if next_reg > MAX_REG:
+        if max(next_reg, max(free_regs, default=0) + 1) > MAX_REG:
             return False
 
         # --- Rewrite the terminal op's dst to register 0 (the output reg). ---
