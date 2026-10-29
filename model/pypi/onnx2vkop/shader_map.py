@@ -190,8 +190,28 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("Expand", "buffer"): ["buffer_expand_int64"],
     ("Concat", "buffer"): ["buffer_concat_int64"],
     ("Gather", "buffer"): ["buffer_gather_int64"],
-    ("Equal", "buffer"): ["buffer_equal_int64"],
+    ("Equal", "buffer"): [
+        "buffer_equal_int64",
+        "buffer_dispatch_from_shape",
+    ],
     ("Where", "buffer"): ["buffer_where_int64"],
+    # The GPU-shape indirect dispatch pre-pass (VKOP_GPU_SHAPE):
+    # dispatch_from_shape.comp turns the out shape SSBO into a
+    # VkDispatchIndirectCommand so BufferBinaryFactory's broadcast==2 path can
+    # dispatch via vkCmdDispatchIndirect. Built lazily inside
+    # execute_gpu_shape's ensure_indirect_prepass(); whether the env flag is
+    # on is unknowable at conversion time, so it ships with every op whose
+    # class routes through execute_gpu_shape.
+    # NOTE: Equal's entry is merged with its int64 entry above — a second
+    # ("Equal", "buffer") dict-literal key would silently overwrite it.
+    ("Add", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Sub", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Mul", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Div", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Pow", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Min", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Max", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Mod", "buffer"): ["buffer_dispatch_from_shape"],
     # The subgroup-arithmetic builds of the hot workgroup reductions
     # (-DSUBGROUP: attention's per-tile max/sum, the norm passes, softmax).
     # Which module runs is a device-feature query at load time

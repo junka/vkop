@@ -2749,4 +2749,100 @@ TEST(BufferRankTest, AttentionVComponentRejectsShapeMismatch) {
     }
 }
 
+// ---- Binary op under VKOP_GPU_SHAPE: SSBO dims + indirect dispatch ---------
+//
+// The Phase-3 execute_gpu_shape path (broadcast==2: dims read from bound
+// shape SSBOs, grid computed on the GPU by the dispatch_from_shape pre-pass
+// and consumed via vkCmdDispatchIndirect). This is the only vehicle that runs
+// the path end-to-end: the LLM graph never hands a fp16-data binary op a
+// shape_ssbo_ input (the int64 shape chain ops take the CPU path first), so
+// an LLM A/B with the env flag set cannot reach it.
+//
+// One input is shape_ssbo_-only: its dims_ is a PLACEHOLDER (same element
+// count as the real shape, different rank/layout — exactly what a Phase-4
+// readback-retiring producer leaves behind) and the authoritative dims ride
+// the SSBO. The other input keeps a CPU-known shape, which sizes the output
+// buffer (the a_cpu/b_cpu branch heuristic; the real dims of the ssbo-only
+// side must therefore fit inside the CPU side's shape, as scalar/row
+// broadcasters do).
+template <typename T>
+bool brt_gpu_shape_indirect_case(const std::vector<int> &cpu_shape,
+                                 bool ssbo_on_in0,
+                                 const std::vector<int> &ssbo_real_shape,
+                                 const std::vector<int> &ssbo_placeholder_shape,
+                                 bool fp16) {
+    Dev d;
+    setenv("VKOP_GPU_SHAPE", "1", 1); // execute()'s gate reads it each run
+    struct Unset {
+        ~Unset() { unsetenv("VKOP_GPU_SHAPE"); }
+    } unset;
+
+    int total_ssbo = 1;
+    for (int v : ssbo_real_shape)
+        total_ssbo *= v;
+
+    auto torch_cpu = torch::randn(
+        std::vector<int64_t>(cpu_shape.begin(), cpu_shape.end()),
+        brt_torch_opt<T>());
+    auto torch_ssbo =
+        torch::randn(std::vector<int64_t>{total_ssbo}, brt_torch_opt<T>());
+    // Reference: the ssbo-only side broadcasts (right-aligned) inside the CPU
+    // side's shape — the same constraint the a_cpu/b_cpu branch heuristic
+    // assumes, since the output buffer is sized from the CPU side's shape.
+    auto torch_out =
+        torch_cpu +
+        torch_ssbo.reshape(std::vector<int64_t>(ssbo_real_shape.begin(),
+                                                ssbo_real_shape.end()));
+
+    auto in0 = std::make_shared<Tensor<T>>(ssbo_on_in0
+                                               ? ssbo_placeholder_shape
+                                               : cpu_shape);
+    brt_fill(in0, ssbo_on_in0 ? torch_ssbo : torch_cpu);
+    brt_upload(in0, d);
+
+    auto in1 = std::make_shared<Tensor<T>>(ssbo_on_in0 ? cpu_shape
+                                                       : ssbo_placeholder_shape);
+    brt_fill(in1, ssbo_on_in0 ? torch_cpu : torch_ssbo);
+    brt_upload(in1, d);
+
+    // Tag the ssbo-only side with its REAL dims as an int64 SSBO.
+    auto &ssbo_side = ssbo_on_in0 ? in0 : in1;
+    auto real_ssbo =
+        brt_make_i64(std::vector<int64_t>(ssbo_real_shape.begin(),
+                                          ssbo_real_shape.end()),
+                     {static_cast<int>(ssbo_real_shape.size())});
+    brt_upload_i64(real_ssbo, d);
+    ssbo_side->set_shape_ssbo(
+        std::dynamic_pointer_cast<vkop::VulkanBuffer>(
+            real_ssbo->as_storage_buffer(d.dev)),
+        static_cast<int>(ssbo_real_shape.size()));
+
+    auto out = brt_make_out<T>(brt_to_int_shape(torch_out), d);
+    auto op = brt_make_op(vkop::ops::OpType::ADD, fp16, {}, d);
+    if (!op)
+        return false;
+    op->onExecute({in0, in1}, {out}, 0);
+    brt_run_op(op.get(), d);
+    out->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(out, torch_out);
+}
+
+TEST(BufferRankTest, BufferBinaryGpuShapeIndirect) {
+    // in1 a shape_ssbo_-only scalar broadcaster whose placeholder rank
+    // differs from the real rank. fp32 and fp16 (the fp16 run exercises the
+    // pre-pass's divisor=2 word grid: 8 halves → 4 words → 1 group).
+    EXPECT_TRUE(brt_gpu_shape_indirect_case<float>(
+        {1, 4}, /*ssbo_on_in0=*/false, {1, 1}, {1}, false));
+    EXPECT_TRUE(brt_gpu_shape_indirect_case<uint16_t>(
+        {1, 8}, false, {1, 1}, {1}, true));
+    // SSBO on in0 instead (a_cpu=false → the b_cpu branch sizes the output
+        // from in1's CPU shape); the placeholder [1] lies about the rank
+    // (1 vs the real rank 2, same element count).
+    EXPECT_TRUE(brt_gpu_shape_indirect_case<float>(
+        {1, 4}, /*ssbo_on_in0=*/true, {1, 1}, {1}, false));
+    // Rank-4: the shape SSBO loaders read exactly out-rank entries.
+    EXPECT_TRUE(brt_gpu_shape_indirect_case<float>(
+        {1, 1, 1, 4}, false, {1, 1, 1, 1}, {1}, false));
+}
+
 } // namespace

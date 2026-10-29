@@ -578,8 +578,14 @@ class Operator {
     // VkDispatchIndirectCommand{w,h,z} at `dispatch_off`, written and
     // barriered to INDIRECT_READ by a prior shader in the same cmd buffer.
     // The fingerprint stores 0,0,0 for dims (the indirect buffer's contents
-    // aren't visible to the host at record time; replay of a dynamic op must
-    // re-run the shape->dispatch shader, so it never reaches CACHED anyway).
+    // aren't visible to the host at record time). fingerprint_matches() has no
+    // zero-dims special case, so (0,0,0) trivially self-matches: a stable
+    // shape op reaching here DOES reach CACHED and replays, re-running the
+    // recorded pre-pass + indirect dispatch against the same bound buffers —
+    // safe because everything the grid depends on (the shape SSBO bytes, at
+    // record time) is baked into the recording. A shape-changing round alters
+    // the shape-derived pc bytes instead, so the fingerprint mismatches and
+    // the op re-records normally.
     void submit_indirect(void *ptr, VkBuffer dispatch_buf,
                          VkDeviceSize dispatch_off) {
         if (!m_ds_[m_id_]) {

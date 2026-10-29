@@ -4,6 +4,7 @@
 
 #include "ops/BufferBase.hpp"
 #include <array>
+#include <cstdio>
 #include <cstdlib>
 #include <string>
 
@@ -17,6 +18,19 @@
 
 namespace vkop {
 namespace ops {
+
+// Push constants for the dispatch_from_shape pre-pass (mode 0 = BINARY): the
+// shader multiplies the bound shape SSBO's `rank` int64 dims, optionally
+// UP_DIVides by `divisor` (fp16 packs 2 halves per uint word), and writes
+// uvec3(UP_DIV(total, block), 1, 1) — a VkDispatchIndirectCommand — into the
+// indirect buffer. 4×int = 16 B, matching the shader's push-constant block.
+struct DispatchFromShapePC {
+    int rank;
+    int mode;    // 0 = BINARY (product → 1D grid)
+    int block;   // consumer's threads-per-group (256)
+    int divisor; // elements per thread-word (fp16: 2, else 1)
+};
+static_assert(sizeof(DispatchFromShapePC) == 16);
 
 class BufferBinaryFactory : public BufferFactory {
   public:
@@ -115,6 +129,82 @@ class BufferBinaryFactory : public BufferFactory {
     // Holds per-round built shape-SSBO source tensors (build_shape_ssbo) so
     // their deferred uploads resolve before the level submits.
     std::vector<std::shared_ptr<core::Tensor<int64_t>>> shape_ssbo_tensors_;
+
+    // --- indirect dispatch pre-pass (VKOP_GPU_SHAPE) ---
+    // Builds the op's SECOND VulkanPipeline — buffer_dispatch_from_shape, the
+    // 1-thread pre-pass that turns the out shape SSBO into a
+    // VkDispatchIndirectCommand — plus the dedicated 12→16 B indirect buffer
+    // it writes. Created once per op instance: the indirect buffer's handle
+    // must stay stable (the fingerprint keys on resource identity), so it is
+    // a member, not a per-round shape-pool object. The buffer needs STORAGE
+    // usage (the pre-pass binds it writeonly) AND INDIRECT usage
+    // (vkCmdDispatchIndirect reads it) — the only INDIRECT usage site in the
+    // tree. DEVICE_LOCAL + explicit requireProperties (VMA contract: an
+    // unspecified property set silently lands host-staged).
+    void ensure_indirect_prepass() {
+        if (prepass_pipeline_)
+            return;
+        prepass_types_ = {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE};
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        auto spv = resolve_spv("buffer_dispatch_from_shape");
+        prepass_pipeline_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), prepass_types_,
+            sizeof(DispatchFromShapePC), spv.first, spv.second, use_uab,
+            required_subgroup_size_);
+        for (auto &ds : m_ds_prepass_) {
+            ds = prepass_pipeline_->allocDescriptorSets();
+        }
+        indirect_buf_ = std::make_shared<VulkanBuffer>(
+            m_dev_, 16,
+            VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        assert(indirect_buf_);
+        prepass_writes_.resize(2);
+    }
+
+    // Record the pre-pass: binding0 = out shape SSBO (the authoritative dim
+    // source), binding1 = indirect buffer; one thread computes the grid. The
+    // shape SSBO's deferred vkCmdUpdateBuffer was already recorded into
+    // m_cmd_ by build_shape_ssbo, so the read is ordered after the upload.
+    void submit_prepass(const std::shared_ptr<VulkanBuffer> &out_shape_ssbo,
+                        int rank) {
+        DispatchFromShapePC ppc{rank, /*mode=*/0, /*block=*/256,
+                                /*divisor=*/(fp16_ != 0) ? 2 : 1};
+        VkDescriptorBufferInfo *shape_info = std::get<VkDescriptorBufferInfo *>(
+            out_shape_ssbo->getDescriptorInfo());
+        VkDescriptorBufferInfo *indirect_info =
+            std::get<VkDescriptorBufferInfo *>(
+                indirect_buf_->getDescriptorInfo());
+        for (int i = 0; i < 2; ++i) {
+            prepass_writes_[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            prepass_writes_[i].pNext = nullptr;
+            prepass_writes_[i].dstSet = m_ds_prepass_[m_id_];
+            prepass_writes_[i].dstBinding = static_cast<uint32_t>(i);
+            prepass_writes_[i].dstArrayElement = 0;
+            prepass_writes_[i].descriptorCount = 1;
+            prepass_writes_[i].descriptorType = DESCRIPTOR_TYPE_STORAGE;
+        }
+        prepass_writes_[0].pBufferInfo = shape_info;
+        prepass_writes_[1].pBufferInfo = indirect_info;
+        prepass_pipeline_->updateDescriptorSets(prepass_writes_);
+        m_cmd_->bind(*prepass_pipeline_, m_ds_prepass_[m_id_]);
+        m_cmd_->push_constants(*prepass_pipeline_,
+                               static_cast<uint32_t>(sizeof(DispatchFromShapePC)),
+                               &ppc);
+        m_cmd_->dispatch(1, 1, 1);
+    }
+
+    // The pre-pass pipeline's own descriptor state — separate from pipeline_'s
+    // types_/writes_/m_ds_ because the pre-pass layout has 2 bindings, not the
+    // main kernel's 6 (they cannot share fillWriteDescriptorSets, which is
+    // positional over objs_).
+    std::unique_ptr<VulkanPipeline> prepass_pipeline_;
+    VkDescriptorSet m_ds_prepass_[vkop::kInflight] = {nullptr};
+    std::vector<VkDescriptorType> prepass_types_;
+    std::vector<VkWriteDescriptorSet> prepass_writes_;
+    std::shared_ptr<VulkanBuffer> indirect_buf_;
 
   private:
     // Host-compute an int64 elementwise binary op with right-aligned
@@ -273,6 +363,13 @@ class BufferBinaryFactory : public BufferFactory {
     void execute_gpu_shape(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) {
+        if (std::getenv("VKOP_SHADER_DEBUG")) {
+            std::fprintf(stderr,
+                         "[gpu-shape] %s took the SSBO dispatch path\n",
+                         name_.empty()
+                             ? convert_optype_to_string(type_).c_str()
+                             : name_.c_str());
+        }
         // Drop last round's built shape-SSBO source tensors. Their deferred
         // uploads already resolved at the prior level submit; the VulkanBuffers
         // themselves live in objs_ (cleared by onExecute). This op re-records
@@ -350,8 +447,20 @@ class BufferBinaryFactory : public BufferFactory {
         pc.activation = activation_;
         pc.broadcast = 2; // load out/in0/in1 dims from bound shape SSBOs
         pc.total = total;
-        int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        // GPU-derived dispatch grid: the pre-pass multiplies the out shape
+        // SSBO's dims into a VkDispatchIndirectCommand and the main kernel is
+        // dispatched via vkCmdDispatchIndirect — the CPU no longer decides the
+        // grid. The grid math mirrors the CPU form it replaces:
+        // UP_DIV(UP_DIV(total, fp16?2:1), 256). pc.total stays CPU-filled for
+        // the shader's element bound (correct whenever any input shape is
+        // CPU-known, i.e. every reachable case; the both-shape_ssbo-only
+        // branch above still computes from placeholder dims and is the Phase 4
+        // target).
+        ensure_indirect_prepass();
+        submit_prepass(out_shape_ssbo, static_cast<int>(out_shape.size()));
+        // pre-pass shader-write → indirect-command-read, then consume.
+        indirect_buf_->indirectReadBarrier(m_cmd_->get());
+        submit_indirect(&pc, indirect_buf_->getBuffer(), 0);
 
         // Tag the output with its producing shape SSBO so downstream
         // GPU-driven consumers can read the broadcast dims without readback.
