@@ -215,6 +215,8 @@ Examples:
   onnx2vkop -i model.onnx -q int4 --group-size 64
   onnx2vkop -i model.onnx -q nf4
   onnx2vkop -i model.onnx -q nvfp4
+  onnx2vkop -i model.onnx -q awq --awq-format int4 --group-size 64
+  onnx2vkop -i model.onnx -q awq --awq-format nf4 --awq-stats stats.npz
 
   # With all optimizations
   onnx2vkop -i model.onnx -u -r -b 4
@@ -227,18 +229,43 @@ Examples:
     )
     parser.add_argument(
         "-q", "--quant", choices=["fp16", "int8", "fp8e4m3", "fp8e5m2",
-                                  "int4", "nf4", "nvfp4"],
+                                  "int4", "nf4", "nvfp4", "awq"],
         help="Quantization type: fp16, int8 (per-column scale), an fp8 "
              "weight-only MatMul payload with a per-column scale (e4m3 or e5m2, "
-             "one byte per value), or a 4-bit weight-only MatMul payload with a "
+             "one byte per value), a 4-bit weight-only MatMul payload with a "
              "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index, "
              "nvfp4 = E2M1 nibble with an fp8 e4m3 scale per 16 values plus a "
-             "per-tensor fp32 factor)",
+             "per-tensor fp32 factor), or awq (activation-aware rescaling in "
+             "front of the format named by --awq-format)",
     )
     parser.add_argument(
         "--group-size", type=int, default=64,
-        help="Values of K sharing one fp32 scale for -q int4/nf4 (default: 64). "
-             "-q nvfp4 ignores it: its block is fixed at 16 values.",
+        help="Values of K sharing one fp32 scale for -q int4/nf4 and for "
+             "-q awq when --awq-format is int4/nf4 (default: 64). nvfp4 ignores "
+             "it: its block is fixed at 16 values.",
+    )
+    parser.add_argument(
+        "--awq-format", choices=["int8", "fp8e4m3", "fp8e5m2", "int4", "nf4",
+                                 "nvfp4"], default="int4",
+        help="The low-bit grid -q awq scales for (default: int4). AWQ's own "
+             "transform is a real weight rescale, so it does not depend on the "
+             "grid; what the grid decides is which weights are eligible.",
+    )
+    parser.add_argument(
+        "--awq-stats", metavar="NPZ",
+        help="-q awq: a .npz of activation magnitudes keyed by tensor name, "
+             "used to pick each channel's scale. Without it the scale comes "
+             "from the weights alone (AWQ's w_only variant).",
+    )
+    parser.add_argument(
+        "--awq-alpha", type=float, default=0.5,
+        help="-q awq: the weight-only exponent, or the fallback when a MatMul "
+             "has no stats entry (default: 0.5).",
+    )
+    parser.add_argument(
+        "--awq-grid", type=int, default=20,
+        help="-q awq: how many alphas the per-MatMul search tries when stats "
+             "are available (default: 20).",
     )
     parser.add_argument(
         "-u", "--unify", action="store_true", help="Convert initializers to a single memory block"
@@ -398,14 +425,21 @@ def main():
 
         # Create a simple args object for apply_optimizations
         class Args:
-            def __init__(self, quant, unify, rgba, group_size):
+            def __init__(self, quant, unify, rgba, group_size, awq_format,
+                         awq_stats, awq_alpha, awq_grid):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
                 self.group_size = group_size
+                self.awq_format = awq_format
+                self.awq_stats = awq_stats
+                self.awq_alpha = awq_alpha
+                self.awq_grid = awq_grid
 
         converter.apply_optimizations(
-            dag_model, Args(args.quant, args.unify, args.rgba, args.group_size))
+            dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
+                            args.awq_format, args.awq_stats, args.awq_alpha,
+                            args.awq_grid))
 
         # Print statistics (before binary save — dag_model may be huge for LLMs)
         op_stats = {}

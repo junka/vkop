@@ -3,7 +3,7 @@
 import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List
+from typing import Callable, Dict, List, Tuple
 
 import numpy as np
 import onnx
@@ -451,7 +451,15 @@ def _reattach_initializers(model, demoted, added_inputs, raw_map):
         graph.input.extend(keep)
 
 
-def _demote_external_initializers(model):
+def _find_initializer(graph, name):
+    """The graph's initializer called `name`, or None."""
+    for init in graph.initializer:
+        if init.name == name:
+            return init
+    return None
+
+
+def _demote_external_initializers(model, keep_alive=()):
     """Move every initializer whose payload lives in an external file out of the graph.
 
     weight_stream leaves a large pass-through weight as an external reference,
@@ -463,6 +471,12 @@ def _demote_external_initializers(model):
     graph inputs for the duration of the passes they cannot be merged, and the
     dedup of the genuinely inline constants keeps working exactly as before --
     which is why this is a demotion and not a switch that turns the pass off.
+
+    `keep_alive` names tensors nothing reads that must come back regardless --
+    MoE paging slots, whose bytes exist for the runtime to page into rather than
+    for any node to consume. They are recorded even when they never became
+    inputs (see below), so the reattach can tell "a pass dropped it" from "this
+    walk was never its carrier"; the caller fails closed on the former only.
 
     Returns `([(name, data_type, dims, [(key, value)])], added_input_names)`,
     enough for `_reattach_external_initializers` to restore the reference
@@ -481,10 +495,37 @@ def _demote_external_initializers(model):
                          if uses_external_data(init)]):
         del graph.initializer[idx]
 
+    demoted_names = {name for name, _dt, _dims, _e in demoted}
+    for name in keep_alive:
+        if name in demoted_names:
+            continue
+        init = _find_initializer(graph, name)
+        if init is None:
+            # `eliminate_unused_initializer` and friends were enticed by a slot
+            # with no reader. The reattach then leaves it restored, so the
+            # caller's `restored < len(keep_alive)` check fails closed.
+            continue
+        if init.data_type == TensorProto.BFLOAT16:
+            # This payload will not be demoted out of the graph, so weight_stream
+            # never rewrites its dtype. The graph the passes see has to agree with
+            # the graph the writer finalizes (see `_downcast_bfloat16`), and the
+            # entry has to name the dtype the bytes on disk are in.
+            init.data_type = TensorProto.FLOAT16
+        if uses_external_data(init):
+            entries = [(e.key, e.value) for e in init.external_data]
+            del init.external_data[:]
+            init.data_location = TensorProto.DEFAULT
+        else:
+            entries = None
+        demoted.append((init.name, init.data_type, tuple(init.dims), entries))
+        demoted_names.add(name)
+
     existing = {inp.name for inp in graph.input}
     added = []
-    for name, dtype, dims, _entries in demoted:
-        if name in existing:
+    for name, dtype, dims, entries in demoted:
+        if name in existing or (name in keep_alive and not entries):
+            # A keep-alive slot with no external reference has no bytes to page
+            # from, so it is not an input the passes could drop.
             continue
         vi = graph.input.add()
         vi.name = name
@@ -493,6 +534,76 @@ def _demote_external_initializers(model):
             vi.type.tensor_type.shape.dim.add().dim_value = d
         added.append(name)
     return demoted, added
+
+
+def _position_paging_slots(model, moe_metadata):
+    """Reorder `graph.initializer` so the MoE paging slots come first.
+
+    The runtime fills a slot by seeking to `slot_base + expert_id * expert_size`
+    and reading `expert_size` bytes, so a group's 60 experts have to sit
+    contiguously and in ascending expert id -- that is what `dag.save_to_binary`
+    asserts before writing. The bytes are deferred in that order by
+    `weight_stream.prepare` (it walks the initializers as they are declared),
+    but the *declaration* order also has to survive the onnxoptimizer passes,
+    and it does not: `eliminate_unused_initializer` rebuilds
+    `graph.initializer` in graph-input order, which interleaves the slots with
+    the dense weights (measured on llm_moe_paged.onnx: the writer saw offsets
+    off by 12 GiB). Reordering here, after the deferral and before the passes,
+    makes the write order ascending by construction.
+
+    `moe_metadata` maps slot name -> (group, expert_id). Groups are emitted in
+    the order the model already lists them, so this only ever *moves* slots; it
+    never decides which group comes first. Returns how many initializers moved.
+    """
+    initializers = list(model.graph.initializer)
+    groups: Dict[str, List[Tuple[int, str]]] = {}
+    for name, (grp, eid) in moe_metadata.items():
+        groups.setdefault(grp, []).append((int(eid), name))
+    for grp, members in groups.items():
+        members.sort()
+        eids = [e for e, _ in members]
+        if eids != list(range(len(members))):
+            raise ValueError(
+                f"MoE paging group {grp} declares expert ids {eids[:8]}..., "
+                f"expected 0..{len(members) - 1}; the runtime indexes a group "
+                f"by expert id, so a gap would shift every later expert")
+    order = [grp for grp in dict.fromkeys(g for g, _ in moe_metadata.values())]
+    slots = [name for grp in order for _eid, name in groups[grp]]
+    if not slots:
+        return 0
+    slot_set = set(slots)
+    by_name = {}
+    for init in initializers:
+        if init.name in slot_set and init.name not in by_name:
+            by_name[init.name] = init
+    missing = [name for name in slots if name not in by_name]
+    if missing:
+        raise ValueError(
+            f"MoE paging slot(s) {missing[:3]} are declared in the graph but "
+            f"are not initializers, so there are no bytes to page")
+    # A duplicated name would make the position below ambiguous rather than
+    # wrong, and `prepare` refuses such a slot for the same reason.
+    declared = sum(1 for init in initializers if init.name in slot_set)
+    if declared != len(slots):
+        raise ValueError(
+            f"MoE paging slot name(s) appear {declared} time(s) as "
+            f"initializers but {len(slots)} slot(s) are declared; the runtime "
+            f"identifies a slot by name and cannot tell the copies apart")
+
+    moved = 0
+    head = [by_name[name] for name in slots]
+    rest = []
+    for init in initializers:
+        if init.name in slot_set:
+            continue
+        rest.append(init)
+    if [init.name for init in initializers[:len(slots)]] != slots:
+        moved = sum(1 for init in initializers[:len(slots)]
+                    if init.name not in slot_set)
+    del model.graph.initializer[:]
+    model.graph.initializer.extend(head)
+    model.graph.initializer.extend(rest)
+    return moved
 
 
 def _reattach_external_initializers(model, demoted, added_inputs, keep_alive=()):
@@ -506,8 +617,10 @@ def _reattach_external_initializers(model, demoted, added_inputs, keep_alive=())
 
     `keep_alive` names tensors nothing reads that must still come back: MoE
     paging slots, whose bytes exist for the runtime to page into rather than for
-    any node to consume. Returns how many of them were restored, so the caller
-    can fail closed if a pass dropped one.
+    any node to consume. They may or may not have been external (a slot whose
+    bytes were already resident is recorded with `entries is None` and stays in
+    the graph for the whole run). Returns how many of them were restored, so the
+    caller can fail closed if a pass dropped one.
     """
     graph = model.graph
     keep_alive = {name for name in keep_alive}
@@ -516,6 +629,20 @@ def _reattach_external_initializers(model, demoted, added_inputs, keep_alive=())
     restored_kept = 0
     for name, dtype, dims, entries in demoted:
         held = name in keep_alive
+        if entries is None:
+            # Recorded keep-alive, never external: reattach only has to make sure
+            # a pass did not drop it.
+            if held and name in have:
+                restored_kept += 1
+                continue
+            if held:
+                init = graph.initializer.add()
+                init.name = name
+                init.data_type = dtype
+                for d in dims:
+                    init.dims.append(d)
+                restored_kept += 1
+            continue
         if name in have or (name not in used and not held):
             continue
         init = graph.initializer.add()
@@ -654,14 +781,14 @@ class ONNXOptimizer:
         # Tensors whose payload weight_stream left in the external data file have
         # no bytes here for any pass to compare, so they come out of the graph for
         # the duration of the passes and go back (still as references) at the end.
-        ext_demoted, ext_added = _demote_external_initializers(onnx_model)
+        keep_alive = {name for name in keep_alive}
         # Tensors that must come back even though no node reads them: MoE paging
         # slots. An unwired slot is a legal graph state (its bytes exist so the
         # runtime can page any expert into it), and `eliminate_unused_initializer`
         # -- which runs because a slot that IS wired leaves a name no other node
-        # uses -- would drop it. Verified at reattach, not before, because the
-        # demoted names are the only ones that pass through the passes.
-        keep_alive = {name for name in keep_alive}
+        # uses -- would drop it. The demoted names are the only ones that pass
+        # through the passes, so recording a slot there is what lets it come back.
+        ext_demoted, ext_added = _demote_external_initializers(onnx_model, keep_alive)
         if ext_demoted:
             print(f"[optimize] external-payload view: {len(ext_demoted)} "
                   f"initializer(s) whose bytes are still in the data file "
@@ -7557,7 +7684,19 @@ class Quantizer:
                     return True
             return False
 
+        deferred_names = getattr(dag_model, 'deferred_weights', {})
         for name, initializer in dag_model.initializers.items():
+            if name in deferred_names:
+                # Left in its source file. weight_stream rewrites its bytes
+                # on the way into the trailer (an fp16 downcast, or a byte
+                # format's payload) and announces the payload dtype in the
+                # side table; retyping it here would demand bytes it does
+                # not have and turn a byte payload's FLOAT placeholder
+                # into fp16.
+                print(f"[fp16] '{name}' is streamed; its payload dtype is "
+                      f"decided at write time")
+                skipped_count += 1
+                continue
             # Skip non-FP32 tensors
             if initializer.data_type != onnx.TensorProto.FLOAT:
                 if initializer.data_type in preserve_types:
@@ -7681,7 +7820,7 @@ class Quantizer:
         print(f"Preserved {skipped_count} tensors")
 
     @staticmethod
-    def quantize_to_int8_weight_only(dag_model):
+    def quantize_to_int8_weight_only(dag_model, only=None):
         """
         Quantize model weights to INT8 using weight-only quantization.
         This function converts appropriate FP32 initializers to INT8, preserving scale information.
@@ -7721,23 +7860,22 @@ class Quantizer:
         }
 
         # Operators whose weights are usually safe to quantize to INT8
-        safe_weight_operators = {
-            "Conv",
-            "MatMul",
-            "Gemm",
-            "ConvTranspose",
-            "LSTM",
-            "GRU",
-            "RNN",
-        }
+        safe_weight_operators = set(Quantizer._WEIGHT_OPS["int8"])
 
         # Parameters that are usually sensitive to INT8 quantization
-        sensitive_parameters = {"BatchNormalization", "LayerNormalization", "GroupNormalization"}
+        sensitive_parameters = set(Quantizer._SENSITIVE_WEIGHT_CONSUMERS)
 
         # Get a list of keys to iterate over, to avoid modifying the dict during iteration
         initializers_keys = list(dag_model.initializers.keys())
 
         for name in initializers_keys:
+            if only is not None and name not in only:
+                continue
+            if name in getattr(dag_model, "deferred_weights", {}):
+                # Left in its source file: the scale and the payload are built
+                # by weight_stream on the way into the trailer, so there is
+                # nothing here to decode and nothing here to rewrite.
+                continue
             initializer = dag_model.initializers[name]
 
             # A half weight is a quantization source, not something to skip:
@@ -7788,19 +7926,12 @@ class Quantizer:
                 if node.op_type in ("Gemm", "MatMul")
             ]
             if mm_consumers:
-                is_b_operand = all(
-                    len(node.inputs) > 1 and node.inputs[1]["name"] == name
-                    for node in mm_consumers
-                )
-                transb_flags = {
-                    int(node.attributes.get("transB", 0) or 0)
-                    for node in mm_consumers
-                }
-                if not is_b_operand or len(initializer.dims) != 2 or len(transb_flags) != 1:
+                mm_gate = Quantizer._match_weight_only(
+                    name, initializer, consumers, "int8")
+                if not mm_gate["eligible"]:
                     print(
-                        f"Preserving '{name}' as FP32: not a plain 2-D B operand of one "
-                        f"agreed-transB Gemm/MatMul (dims={list(initializer.dims)}, "
-                        f"transB={sorted(transb_flags)}, B_operand={is_b_operand})"
+                        f"Preserving '{name}' as FP32: "
+                        f"{', '.join(mm_gate['reasons'])}"
                     )
                     skipped_count += 1
                     continue
@@ -7853,53 +7984,14 @@ class Quantizer:
                 original_fp32 = arr.copy()
 
                 # Determine quantization axis based on operator type and tensor shape
-                axis = None
                 if len(arr.shape) >= 2:
-                    # For multi-dimensional weights, use operator-specific quantization axis
-                    for node in consumers:
-                        op_type = node.op_type
-                        if op_type == "Conv":
-                            # Conv weights: [C_out, C_in, K, K] - quantize per output channel
-                            # Reduce along (C_in, K, K) dimensions -> axis=(1, 2, 3)
-                            if len(arr.shape) == 4:
-                                axis = (1, 2, 3)
-                            elif len(arr.shape) == 3:
-                                axis = (1, 2)
-                            else:
-                                axis = 0
-                            break
-                        elif op_type == "ConvTranspose":
-                            # ConvTranspose weights: [C_in, C_out, K, K] - quantize per output channel
-                            # Reduce along (C_in, K, K) dimensions -> axis=(0, 2, 3)
-                            if len(arr.shape) == 4:
-                                axis = (0, 2, 3)
-                            else:
-                                # For other shapes, default to axis=1
-                                axis = 1
-                            break
-                        elif op_type in ("Gemm", "MatMul"):
-                            # The dequant scale indexes Y's output columns (dim
-                            # N) — both kernels read exactly one scale per
-                            # column. Which physical axis those columns sit on
-                            # is decided by transB: transB=0 stores B as [K, N]
-                            # (reduce axis 0), transB=1 stores it as [N, K]
-                            # (reduce axis 1). The gate above guaranteed a plain
-                            # 2-D B operand with one agreed transB across all its
-                            # consumers, so the choice here is unambiguous.
-                            axis = 1 if int(node.attributes.get("transB", 0) or 0) else 0
-                            break
-                        elif op_type in ["LSTM", "GRU"]:
-                            # LSTM/GRU weights: [D, 4H, I] or [D, 4H, H] - quantize per output dimension
-                            # Reduce along I or H dimension -> axis=2
-                            if len(arr.shape) == 3:
-                                axis = 2
-                            else:
-                                # For other shapes, default to axis=0
-                                axis = 0
-                            break
-                        else:
-                            # Default to axis=0 for other operators
-                            axis = 0
+                    # The same axis the shared gate resolved, so the scale this
+                    # pass stores and the scale AWQ assumes it can scale by 1/s
+                    # can never disagree.
+                    axis = mm_gate["axis"] if mm_consumers else \
+                        Quantizer._int8_conv_axis(consumers, list(arr.shape))
+                    if axis is None:
+                        axis = 0
                 else:
                     # For 1D or smaller tensors, use per-tensor quantization
                     axis = None
@@ -7924,20 +8016,16 @@ class Quantizer:
                         # Avoid division by zero
                         scale = np.where(scale == 0, 1.0, scale)
 
-                        # For different operator types, ensure correct shape
+                        # For different operator types, ensure correct shape.
+                        # One entry per output channel, from the shared helper so
+                        # the stored table is the one the gate promised.
                         if "Conv" in consumer_ops and len(arr.shape) == 4:
-                            # Conv: [C_out, C_in, K, K], axis=(1,2,3) -> scale should be [C_out]
                             scale = scale.reshape(arr.shape[0])
                         elif "ConvTranspose" in consumer_ops and len(arr.shape) == 4:
-                            # ConvTranspose: [C_in, C_out, K, K], axis=(0,2,3) -> scale should be [C_out]
                             scale = scale.reshape(arr.shape[1])
                         elif ("Gemm" in consumer_ops or "MatMul" in consumer_ops) and len(arr.shape) == 2:
-                            # One scale per output column, whatever the layout:
-                            # the axis above reduced K away, so N is the axis
-                            # that survived — take it from the layout instead of
-                            # trusting the reduce.
-                            n = arr.shape[1] if axis == 0 else arr.shape[0]
-                            scale = scale.reshape(n)
+                            scale = scale.reshape(Quantizer._int8_scale_shape(
+                                consumers, list(arr.shape), axis))
                         else:
                             # For other cases, flatten to 1D
                             scale = scale.flatten()
@@ -8017,6 +8105,188 @@ class Quantizer:
         print(f"Preserved {skipped_count} tensors")
         print(f"Total initializers after quantization: {len(dag_model.initializers)}")
 
+    # ------------------------------------------------------------------
+    # Weight-only eligibility: ONE gate per format, shared by the -q
+    # quantizers and by AWQ.
+    #
+    # Every weight-only kernel binds a scale table whose *length* is what the
+    # host reads the grouping back from (ops/Matmul.hpp checks scale bytes ==
+    # rows * N for the blocked formats, == N for the byte ones), and every
+    # kernel indexes that table by output column. So "may this weight be
+    # quantized to format F" is a property of the weight + its consumers
+    # alone — not of who is asking. Keeping one copy here is what stops AWQ
+    # from scaling a weight the quantizer will then refuse (an unscaled-1/s
+    # model, which is a silently wrong one) or refusing a weight the
+    # quantizer would have taken (a needless precision loss).
+    # ------------------------------------------------------------------
+
+    # The ops each format has a kernel for. gemm.comp and conv2d.comp decode
+    # int8 and nothing else; the nibble and fp8 kernels are MatMul-only.
+    _WEIGHT_OPS = {
+        "int8": ("MatMul", "Gemm", "Conv", "ConvTranspose", "LSTM", "GRU",
+                 "RNN"),
+        "fp8": ("MatMul",),
+        "4bit": ("MatMul",),
+    }
+
+    # Ops whose weights must stay float whatever format is asked for.
+    _SENSITIVE_WEIGHT_CONSUMERS = frozenset(
+        {"BatchNormalization", "LayerNormalization", "LayerNorm",
+         "GroupNormalization"})
+
+    @staticmethod
+    def _gate_family(fmt: str) -> str:
+        if fmt == "int8":
+            return "int8"
+        if fmt in ("fp8e4m3", "fp8e5m2"):
+            return "fp8"
+        if fmt in ("int4", "nf4", "nvfp4"):
+            return "4bit"
+        raise ValueError(f"unknown weight-only format: {fmt!r}")
+
+    @staticmethod
+    def _match_weight_only(name, initializer, consumers, fmt, group_size=0):
+        """Can this initializer be quantized to `fmt`? The one gate.
+
+        Returns a dict:
+          eligible  bool
+          reasons   list[str], empty iff eligible
+          family    "int8" | "fp8" | "4bit"
+          dims      list[int]   (as declared on the initializer)
+          k, n      int         (only when the weight is a 2-D B operand)
+          n_groups  int         (blocked families only; K / group)
+          group     int         (blocked families only)
+          axis      int|tuple|None  (per-column families: the output-column
+                     axis the scale reduces along; None for a per-tensor 1-D
+                     weight)
+          transb    int|None
+        """
+        family = Quantizer._gate_family(fmt)
+        dims = list(initializer.dims)
+        out = {
+            "eligible": False, "reasons": [], "family": family, "dims": dims,
+            "k": 0, "n": 0, "n_groups": 0, "group": group_size, "axis": None,
+            "transb": None,
+        }
+        reasons = out["reasons"]
+
+        if initializer.data_type not in (onnx.TensorProto.FLOAT,
+                                         onnx.TensorProto.FLOAT16):
+            reasons.append("not a float weight")
+            return out
+        if not consumers:
+            reasons.append("no consumers")
+            return out
+
+        op_types = {node.op_type for node in consumers}
+        allowed = Quantizer._WEIGHT_OPS[family]
+        if not op_types <= set(allowed):
+            reasons.append(
+                f"consumed by {sorted(op_types)} — only {sorted(allowed)} "
+                f"have a {fmt} kernel")
+            return out
+        if op_types & Quantizer._SENSITIVE_WEIGHT_CONSUMERS:
+            reasons.append(
+                f"consumed by sensitive operators "
+                f"{sorted(op_types & Quantizer._SENSITIVE_WEIGHT_CONSUMERS)}")
+            return out
+
+        per_column = [node for node in consumers
+                      if node.op_type in ("MatMul", "Gemm")]
+        if not per_column:
+            # int8 alone reaches Conv/RNN weights. Those have their own
+            # per-output-channel axis and no transB, and the kernels index the
+            # scale by output channel.
+            if family != "int8":
+                reasons.append("no Gemm/MatMul consumer")
+                return out
+            out["axis"] = Quantizer._int8_conv_axis(consumers, dims)
+            if out["axis"] is None and len(dims) > 1:
+                reasons.append(f"dims={dims} has no output-channel axis")
+                return out
+            out["eligible"] = True
+            return out
+
+        if len(per_column) != len(consumers):
+            reasons.append(
+                f"consumed by both Gemm/MatMul and "
+                f"{sorted(op_types - {'MatMul', 'Gemm'})}")
+            return out
+
+        is_b_operand = all(
+            len(node.inputs) > 1 and node.inputs[1]["name"] == name
+            for node in per_column)
+        transb_flags = {int(node.attributes.get("transB", 0) or 0)
+                        for node in per_column}
+        if not is_b_operand:
+            reasons.append("not the B operand")
+        if len(dims) != 2:
+            reasons.append(f"dims={dims} is not a plain 2-D matrix")
+        if len(transb_flags) != 1:
+            reasons.append(f"consumers disagree on transB={sorted(transb_flags)}")
+        if reasons:
+            return out
+
+        if family == "4bit":
+            # Only the [K, N] layout unpacks: the nibble walk and the
+            # four-columns-per-word addressing both fall apart when N is not
+            # the row's minor axis.
+            if transb_flags != {0}:
+                reasons.append("transB != 0 (only the [K, N] layout unpacks)")
+            k, n = dims
+            if n % 8 != 0:
+                reasons.append(f"N={n} is not a multiple of 8 (a packed row "
+                               f"must start on a 32-bit word)")
+            if group_size <= 0 or group_size % 2 != 0:
+                reasons.append(f"group_size={group_size} must be a positive "
+                               f"even number of K values")
+            elif k % group_size != 0:
+                reasons.append(f"K={k} is not a multiple of "
+                               f"group_size={group_size}")
+            if reasons:
+                return out
+            out.update(k=k, n=n, n_groups=k // group_size, group=group_size,
+                       transb=0)
+            out["eligible"] = True
+            return out
+
+        # Byte formats: one scale per output column, whatever transB says.
+        out["transb"] = next(iter(transb_flags))
+        out["axis"] = 1 if out["transb"] == 1 else 0
+        out["k"], out["n"] = dims
+        out["eligible"] = True
+        return out
+
+    @staticmethod
+    def _int8_conv_axis(consumers, dims):
+        """The output-channel axis an int8 Conv/ConvTranspose weight reduces
+        along, or None when the shape has no such axis."""
+        rank = len(dims)
+        for node in consumers:
+            if node.op_type == "Conv":
+                return (1, 2, 3) if rank == 4 else ((1, 2) if rank == 3 else 0)
+            if node.op_type == "ConvTranspose":
+                return (0, 2, 3) if rank == 4 else 1
+            if node.op_type in ("LSTM", "GRU", "RNN"):
+                return 2 if rank == 3 else 0
+        return None
+
+    @staticmethod
+    def _int8_scale_shape(consumers, dims, axis):
+        """The 1-D shape an int8 scale is stored with: one entry per output
+        channel, which is the axis the reduce kept."""
+        op_types = {node.op_type for node in consumers}
+        if "Conv" in op_types and len(dims) == 4:
+            return dims[0]
+        if "ConvTranspose" in op_types and len(dims) == 4:
+            return dims[1]
+        if ("Gemm" in op_types or "MatMul" in op_types) and len(dims) == 2:
+            return dims[1] if axis == 0 else dims[0]
+        if axis is None:
+            return 1
+        survived = [d for i, d in enumerate(dims) if i not in np.atleast_1d(axis)]
+        return int(np.prod(survived)) if survived else 1
+
     # The 16 NF4 quantiles of a unit-normal distribution, normalized so the
     # extreme codes are exactly -1 and +1. matmul.comp holds the same table:
     # a weight is codebook[q] * group_absmax, so the fp32 scale the shader binds
@@ -8031,6 +8301,127 @@ class Quantizer:
         ],
         dtype=np.float32,
     )
+
+    def _quantize_w3(w3, fmt: str):
+        """Symmetric per-(group, column) 4-bit grid: the grouped weight
+        [n_groups, group_size, N] -> (codes, scale_keepdims [n_groups, 1, N]).
+
+        int4 is a signed nibble scaled by the group absmax / 7; nf4 is an index
+        into _NF4_CODEBOOK scaled by the group absmax itself. Everything after
+        this (the half-step error check, the packing) is format-independent, so
+        the -q int4/nf4 path, the AWQ path and the streamed-payload path share
+        it and write identical bytes for identical input. `float16` is the one
+        dtype difference: a half weight's scale table is half precision, which
+        is what the blocked kernels validate against and what `_pack_4bit_weight`
+        writes into the graph."""
+        signed = fmt == "int4"
+        half = getattr(w3, "dtype", None) == np.float16
+        out_dtype = np.float16 if half else np.float32
+        amax = np.max(np.abs(w3.astype(np.float32)), axis=1, keepdims=True)
+        if signed:
+            scale_keepdims = np.where(amax == 0, 1.0, amax / 7.0)
+            codes = np.clip(
+                np.round(w3.astype(np.float32) / scale_keepdims), -8, 7
+            ).astype(np.int8)
+            return codes, scale_keepdims.astype(out_dtype)
+
+        scale_keepdims = np.where(amax == 0, 1.0, amax)
+        normalized = w3.astype(np.float32) / scale_keepdims
+        # NF4 nearest-codebook lookup. The codebook is a sorted 16-point
+        # grid, so np.searchsorted finds each value's insertion index in
+        # O(log 16) with no broadcast temp — the naive
+        #   np.abs(normalized[..., None] - CODEBOOK[None,None,None,:])
+        #   .argmin(-1)
+        # materializes a [n_groups, group_size, N, 16] fp32 array (~8.7GB
+        # for the 151936x896 lm_head) and OOMs the converter. This path
+        # uses O(1) extra memory and is bit-identical to it.
+        codebook = Quantizer._NF4_CODEBOOK  # ascending, length 16
+        # Clip into [codebook[0], codebook[-1]] so searchsorted is
+        # stable. NaN (a degenerate group that is all-zero except a
+        # NaN, which shouldn't happen for real weights but guard it)
+        # maps to index 0, matching what the broadcast argmin path did.
+        clipped = np.clip(np.nan_to_num(normalized, nan=codebook[0]),
+                          codebook[0], codebook[-1])
+        hi = np.searchsorted(codebook, clipped, side="left")
+        # hi is in [1, 16]; the nearest code is either hi-1 or hi (clipped
+        # to [0, 15]). Compare the two candidates.
+        lo = hi - 1
+        hi = np.minimum(hi, 15)
+        d_lo = np.abs(clipped - codebook[lo])
+        d_hi = np.abs(clipped - codebook[hi])
+        # Tie-break toward the smaller index (matches argmin, which picks
+        # the first minimum): when d_lo <= d_hi take lo.
+        codes = np.where(d_lo <= d_hi, lo, hi).astype(np.int8)
+        return codes, scale_keepdims.astype(out_dtype)
+
+    @staticmethod
+    def _dequantize_w3(codes, scale_keepdims, fmt: str):
+        """The float each code stands for, shaped like the w3 it quantized."""
+        scale = scale_keepdims.astype(np.float32)
+        if fmt == "int4":
+            return codes.astype(np.float32) * scale
+        return Quantizer._NF4_CODEBOOK[codes.astype(np.int64)] * scale
+
+    @staticmethod
+    def _report_qerror(name, w3, codes, scale_keepdims, fmt, k, n, n_groups,
+                       group_size):
+        """MSE / MAE / relative error of a grouped 4-bit encode, printed once
+        per weight. Compared in the grouped view: dequantized carries the
+        [n_groups, group_size, N] shape the scale broadcasts over."""
+        dequantized = Quantizer._dequantize_w3(codes, scale_keepdims, fmt)
+        diff = dequantized - w3
+        mse = np.mean(diff**2)
+        mae = np.mean(np.abs(diff))
+        rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
+        print(f"Quantized '{name}':")
+        print(f"  Shape: [{k}, {n}], groups: {n_groups} x {group_size}")
+        print(f"  Scale shape: [{n_groups}, {n}]")
+        print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
+        print(
+            f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
+            f"Max Rel Error: {np.max(rel_error):.2%}"
+        )
+
+    @staticmethod
+    def _pack_4bit_weight(dag_model, name, consumers, dims, codes, scale, fmt):
+        """Write a 4-bit payload + its [K/group, N] scale table into the graph.
+
+        Replaces the float initializer `name` with the packed nibbles, adds
+        `{name}_scale`, and appends the scale as the consumer's third input —
+        the [A, W, scale] list the buffer MatMul decodes. Both -q int4/nf4 and
+        AWQ land here, so their bytes are the same contract. Returns the scale
+        initializer's name.
+        """
+        signed = fmt == "int4"
+        # Pack row-major: element i in byte i/2, low nibble for even i. An
+        # int4 -8 is the nibble 0x8, so masking the byte keeps two's
+        # complement; nf4's index is already 0..15.
+        nib = codes.reshape(-1).astype(np.uint8) & 0xF
+        packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
+        packed_init = helper.make_tensor(
+            name,
+            TensorProto.INT4 if signed else TensorProto.UINT4,
+            dims,
+            packed.tobytes(),
+            raw=True,
+        )
+        if not signed:
+            # UINT4 is the nibble's *storage*; NF4 is what it means. ONNX
+            # has no NF4 element type, so the name rides in the tensor's
+            # metadata and the writer emits it as the initializer dtype.
+            packed_init.metadata_props.add(key="vkop_dtype", value="nf4")
+
+        scale_name = f"{name}_scale"
+        scale_init = numpy_helper.from_array(
+            np.ascontiguousarray(scale, dtype=np.float32), scale_name)
+        scale_init.data_type = onnx.TensorProto.FLOAT
+
+        dag_model.initializers[name] = packed_init
+        dag_model.initializers[scale_name] = scale_init
+
+        for node in consumers:
+            node.inputs.append({"name": scale_name, "shape": list(scale.shape)})
+        return scale_name
 
     @staticmethod
     def quantize_to_4bit_weight_only(dag_model, group_size: int = 64,
@@ -8074,157 +8465,38 @@ class Quantizer:
             for inp in node.inputs:
                 initializer_consumers[inp["name"]].append(node)
 
-        signed = fmt == "int4"
-
         for name in list(dag_model.initializers.keys()):
             initializer = dag_model.initializers[name]
-
-            if initializer.data_type not in (
-                onnx.TensorProto.FLOAT,
-                onnx.TensorProto.FLOAT16,
-            ):
-                print(f"Preserving '{name}': not a float weight")
-                skipped_count += 1
-                continue
-
             consumers = initializer_consumers.get(name, [])
-            op_types = {node.op_type for node in consumers}
-            if not consumers:
-                print(f"Preserving '{name}': no consumers")
-                skipped_count += 1
-                continue
-            if op_types != {"MatMul"}:
-                # A 4-bit payload is only readable by the buffer MatMul kernel.
-                # Conv/Gemm weight-only int8 exists; the nibble kernels do not,
-                # so anything else keeps its float weight.
-                print(
-                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
-                    f"MatMul has a {fmt} kernel"
-                )
+
+            gate = Quantizer._match_weight_only(
+                name, initializer, consumers, fmt, group_size)
+            if not gate["eligible"]:
+                print(f"Preserving '{name}': {', '.join(gate['reasons'])}")
                 skipped_count += 1
                 continue
 
-            is_b_operand = all(
-                len(node.inputs) > 1 and node.inputs[1]["name"] == name
-                for node in consumers
-            )
-            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
-            dims = list(initializer.dims)
-            reasons = []
-            if not is_b_operand:
-                reasons.append("not the B operand")
-            if len(dims) != 2:
-                reasons.append(f"dims={dims} is not a plain 2-D matrix")
-            if transb != {0}:
-                reasons.append(f"transB={sorted(transb)} (only the [K, N] layout unpacks)")
-            if reasons:
-                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
-                skipped_count += 1
-                continue
-
-            k, n = dims
-            reasons = []
-            if n % 8 != 0:
-                reasons.append(f"N={n} is not a multiple of 8 (a packed row must "
-                               f"start on a 32-bit word)")
-            if k % group_size != 0:
-                reasons.append(f"K={k} is not a multiple of group_size={group_size}")
-            if reasons:
-                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
-                skipped_count += 1
-                continue
+            dims = gate["dims"]
+            k, n = gate["k"], gate["n"]
 
             arr = numpy_helper.to_array(initializer).astype(np.float32)
             n_groups = k // group_size
             w3 = arr.reshape(n_groups, group_size, n)
 
-            amax = np.max(np.abs(w3), axis=1, keepdims=True)
-            if signed:
-                scale_keepdims = np.where(amax == 0, 1.0, amax / 7.0)
-                codes = np.clip(
-                    np.round(w3 / scale_keepdims), -8, 7
-                ).astype(np.int8)
-                dequantized = codes.astype(np.float32) * scale_keepdims
-            else:
-                scale_keepdims = np.where(amax == 0, 1.0, amax)
-                normalized = w3 / scale_keepdims
-                # NF4 nearest-codebook lookup. The codebook is a sorted 16-point
-                # grid, so np.searchsorted finds each value's insertion index in
-                # O(log 16) with no broadcast temp — the naive
-                #   np.abs(normalized[..., None] - CODEBOOK[None,None,None,:])
-                #   .argmin(-1)
-                # materializes a [n_groups, group_size, N, 16] fp32 array (~8.7GB
-                # for the 151936x896 lm_head) and OOMs the converter. This path
-                # uses O(1) extra memory and is bit-identical to it.
-                codebook = Quantizer._NF4_CODEBOOK  # ascending, length 16
-                # Clip into [codebook[0], codebook[-1]] so searchsorted is
-                # stable. NaN (a degenerate group that is all-zero except a
-                # NaN, which shouldn't happen for real weights but guard it)
-                # maps to index 0, matching what the broadcast argmin path did.
-                clipped = np.clip(np.nan_to_num(normalized, nan=codebook[0]),
-                                  codebook[0], codebook[-1])
-                hi = np.searchsorted(codebook, clipped, side="left")
-                # hi is in [1, 16]; the nearest code is either hi-1 or hi (clipped
-                # to [0, 15]). Compare the two candidates.
-                lo = hi - 1
-                hi = np.minimum(hi, 15)
-                d_lo = np.abs(clipped - codebook[lo])
-                d_hi = np.abs(clipped - codebook[hi])
-                # Tie-break toward the smaller index (matches argmin, which picks
-                # the first minimum): when d_lo <= d_hi take lo.
-                codes = np.where(d_lo <= d_hi, lo, hi).astype(np.int8)
-                del clipped, hi, lo, d_lo, d_hi
-                dequantized = (
-                    Quantizer._NF4_CODEBOOK[codes.astype(np.int64)] * scale_keepdims
-                )
-
+            codes, scale_keepdims = Quantizer._quantize_w3(w3, fmt)
             scale = scale_keepdims.reshape(n_groups, n).astype(np.float32)
 
             # Compare in the grouped view: dequantized carries the
             # [n_groups, group_size, N] shape the scale broadcasts over.
-            diff = dequantized - w3
-            mse = np.mean(diff**2)
-            mae = np.mean(np.abs(diff))
-            rel_error = np.abs(diff) / (np.abs(w3) + 1e-8)
-            print(f"Quantized '{name}':")
-            print(f"  Shape: [{k}, {n}], groups: {n_groups} x {group_size}")
-            print(f"  Scale shape: {list(scale.shape)}")
-            print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
-            print(
-                f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
-                f"Max Rel Error: {np.max(rel_error):.2%}"
+            Quantizer._report_qerror(name, w3, codes, scale_keepdims, fmt,
+                                     k, n, n_groups, group_size)
+
+            source_dt = initializer.data_type
+            scale_name = Quantizer._pack_4bit_weight(
+                dag_model, name, consumers, dims, codes, scale, fmt
             )
-
-            # Pack row-major: element i in byte i/2, low nibble for even i. An
-            # int4 -8 is the nibble 0x8, so masking the byte keeps two's
-            # complement; nf4's index is already 0..15.
-            nib = codes.reshape(-1).astype(np.uint8) & 0xF
-            packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
-            packed_init = helper.make_tensor(
-                name,
-                TensorProto.INT4 if signed else TensorProto.UINT4,
-                dims,
-                packed.tobytes(),
-                raw=True,
-            )
-            if not signed:
-                # UINT4 is the nibble's *storage*; NF4 is what it means. ONNX
-                # has no NF4 element type, so the name rides in the tensor's
-                # metadata and the writer emits it as the initializer dtype.
-                packed_init.metadata_props.add(key="vkop_dtype", value="nf4")
-
-            scale_name = f"{name}_scale"
-            scale_init = numpy_helper.from_array(scale, scale_name)
-            scale_init.data_type = onnx.TensorProto.FLOAT
-
-            dag_model.initializers[name] = packed_init
-            dag_model.initializers[scale_name] = scale_init
-
-            for node in consumers:
-                node.inputs.append({"name": scale_name, "shape": list(scale.shape)})
-
             print(
-                f"Converted {onnx.TensorProto.DataType.Name(initializer.data_type)} "
+                f"Converted {onnx.TensorProto.DataType.Name(source_dt)} "
                 f"tensor '{name}' to {fmt} with group scale '{scale_name}'"
             )
             converted_count += 1
@@ -8327,7 +8599,7 @@ class Quantizer:
         )
 
     @staticmethod
-    def quantize_to_fp8_weight_only(dag_model, fmt: str = "fp8e4m3"):
+    def quantize_to_fp8_weight_only(dag_model, fmt: str = "fp8e4m3", only=None):
         """
         Quantize MatMul weights to an fp8 weight-only payload with a
         per-output-column fp32 scale.
@@ -8369,51 +8641,21 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if only is not None and name not in only:
+                continue
             initializer = dag_model.initializers[name]
-
-            if initializer.data_type not in (
-                onnx.TensorProto.FLOAT,
-                onnx.TensorProto.FLOAT16,
-            ):
-                print(f"Preserving '{name}': not a float weight")
-                skipped_count += 1
-                continue
-
             consumers = initializer_consumers.get(name, [])
-            op_types = {node.op_type for node in consumers}
-            if not consumers:
-                print(f"Preserving '{name}': no consumers")
-                skipped_count += 1
-                continue
-            if op_types != {"MatMul"}:
-                print(
-                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
-                    f"MatMul has a {fmt} kernel"
-                )
+
+            gate = Quantizer._match_weight_only(name, initializer, consumers, fmt)
+            if not gate["eligible"]:
+                print(f"Preserving '{name}': {', '.join(gate['reasons'])}")
                 skipped_count += 1
                 continue
 
-            is_b_operand = all(
-                len(node.inputs) > 1 and node.inputs[1]["name"] == name
-                for node in consumers
-            )
-            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
-            dims = list(initializer.dims)
-            reasons = []
-            if not is_b_operand:
-                reasons.append("not the B operand")
-            if len(dims) != 2:
-                reasons.append(f"dims={dims} is not a plain 2-D matrix")
-            if len(transb) != 1:
-                reasons.append(f"consumers disagree on transB={sorted(transb)}")
-            if reasons:
-                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
-                skipped_count += 1
-                continue
-
+            dims = gate["dims"]
             # The scale indexes output columns; which physical axis those sit on
             # is transB's answer, the same one INT8 takes.
-            axis = 1 if transb == {1} else 0
+            axis = gate["axis"]
 
             arr = numpy_helper.to_array(initializer).astype(np.float32)
             amax = np.amax(np.abs(arr), axis=axis, keepdims=False)
@@ -8537,8 +8779,89 @@ class Quantizer:
         mag = Quantizer._E2M1_GRID[m]
         return np.where(np.asarray(nibbles, dtype=np.uint8) & 0x08, -mag, mag)
 
+    # ------------------------------------------------------------------
+    # AWQ: a real-valued weight transform, so it pairs with every low-bit
+    # format. The transform (W·diag(s), 1/s folded upstream) is
+    # format-independent; only the eligibility gate differs, and that gate is
+    # _match_weight_only -- the same one the -q passes use.
+    # ------------------------------------------------------------------
+
     @staticmethod
-    def quantize_to_nvfp4_weight_only(dag_model, group_size: int = _NVFP4_BLOCK):
+    def quantize_to_awq_weight_only(dag_model, group_size: int = 64,
+                                    fmt: str = "int4", stats_path=None,
+                                    alpha: float = 0.5, n_grid: int = 20):
+        """AWQ-scale the weights, then quantize each to `fmt`.
+
+        `fmt` is any of -q's weight-only values (int8, fp8e4m3, fp8e5m2,
+        int4, nf4, nvfp4). The steps are:
+
+          1. awq.apply -- solve s per weight, multiply W by s, and fold 1/s
+             into the producing norm (or a constant Mul on a graph input).
+             A weight whose 1/s has nowhere to go is left untouched and
+             reported: scaling it without the matching 1/s would be wrong.
+          2. The plain -q quantizer for `fmt`, restricted to the weights step 1
+             actually scaled. Those already carry s, so the quantizer's own
+             per-column / per-group absmax comes out of the scaled weight and
+             the AWQ benefit rides through untouched; every other weight takes
+             the ordinary path.
+        """
+        from . import awq as awq_mod
+
+        stats = awq_mod.load_stats(stats_path) if stats_path else None
+        scaled = awq_mod.apply(dag_model, group_size, fmt=fmt, stats=stats,
+                               alpha=alpha, n_grid=n_grid)
+        print(f"AWQ: {len(scaled)} weight(s) carry an AWQ scale; quantizing "
+              f"them to {fmt}...")
+
+        if fmt in ("int4", "nf4"):
+            Quantizer._quantize_selected(dag_model, group_size, fmt, scaled)
+        elif fmt in ("fp8e4m3", "fp8e5m2"):
+            Quantizer.quantize_to_fp8_weight_only(dag_model, fmt, only=scaled)
+        elif fmt == "int8":
+            Quantizer.quantize_to_int8_weight_only(dag_model, only=scaled)
+        elif fmt == "nvfp4":
+            Quantizer.quantize_to_nvfp4_weight_only(dag_model, only=scaled)
+        else:
+            raise ValueError(f"unquantizable AWQ target: {fmt!r}")
+        return scaled
+
+    @staticmethod
+    def _quantize_selected(dag_model, group_size, fmt, only):
+        """The 4-bit encode, restricted to `only`.
+
+        Same gate, same math, same packer as quantize_to_4bit_weight_only. The
+        AWQ path needs a restricted pass because one format's weights get
+        split in two: those it scaled (encoded here) and those it could not
+        fold 1/s for (encoded by the ordinary call). Encoding one twice would
+        reject the second time -- the initializer is already packed nibbles,
+        not a float weight. Writes no summary; the ordinary quantizer prints
+        the model-wide counts.
+        """
+        initializer_consumers = defaultdict(list)
+        for node in dag_model.nodes.values():
+            for inp in node.inputs:
+                initializer_consumers[inp["name"]].append(node)
+        for name in list(dag_model.initializers.keys()):
+            if name not in only:
+                continue
+            initializer = dag_model.initializers[name]
+            consumers = initializer_consumers.get(name, [])
+            gate = Quantizer._match_weight_only(
+                name, initializer, consumers, fmt, group_size)
+            if not gate["eligible"]:
+                continue
+            dims, k, n = gate["dims"], gate["k"], gate["n"]
+            n_groups = gate["n_groups"]
+            arr = numpy_helper.to_array(initializer).astype(np.float32)
+            w3 = arr.reshape(n_groups, group_size, n)
+            codes, scale_keepdims = Quantizer._quantize_w3(w3, fmt)
+            scale = scale_keepdims.reshape(n_groups, n).astype(np.float32)
+            Quantizer._pack_4bit_weight(
+                dag_model, name, consumers, dims, codes, scale, fmt)
+
+    @staticmethod
+    def quantize_to_nvfp4_weight_only(dag_model, group_size: int = _NVFP4_BLOCK,
+                                       only=None):
         """
         Quantize MatMul weights to NVFP4: an E2M1 nibble per value, an fp8 E4M3
         block scale per 16 contiguous values of K, and one fp32 scale per tensor.
@@ -8586,60 +8909,20 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if only is not None and name not in only:
+                continue
             initializer = dag_model.initializers[name]
-
-            if initializer.data_type not in (
-                onnx.TensorProto.FLOAT,
-                onnx.TensorProto.FLOAT16,
-            ):
-                print(f"Preserving '{name}': not a float weight")
-                skipped_count += 1
-                continue
-
             consumers = initializer_consumers.get(name, [])
-            op_types = {node.op_type for node in consumers}
-            if not consumers:
-                print(f"Preserving '{name}': no consumers")
-                skipped_count += 1
-                continue
-            if op_types != {"MatMul"}:
-                print(
-                    f"Preserving '{name}': consumed by {sorted(op_types)} — only "
-                    f"MatMul has an nvfp4 kernel"
-                )
+
+            gate = Quantizer._match_weight_only(
+                name, initializer, consumers, "nvfp4", block)
+            if not gate["eligible"]:
+                print(f"Preserving '{name}': {', '.join(gate['reasons'])}")
                 skipped_count += 1
                 continue
 
-            is_b_operand = all(
-                len(node.inputs) > 1 and node.inputs[1]["name"] == name
-                for node in consumers
-            )
-            transb = {int(node.attributes.get("transB", 0) or 0) for node in consumers}
-            dims = list(initializer.dims)
-            reasons = []
-            if not is_b_operand:
-                reasons.append("not the B operand")
-            if len(dims) != 2:
-                reasons.append(f"dims={dims} is not a plain 2-D matrix")
-            if transb != {0}:
-                reasons.append("transB != 0 (only the [K, N] layout unpacks)")
-            if reasons:
-                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
-                skipped_count += 1
-                continue
-
-            k, n = dims
-            reasons = []
-            if n % 8 != 0:
-                reasons.append(f"N={n} is not a multiple of 8 (a packed row must "
-                               f"start on a 32-bit word)")
-            if k % block != 0:
-                reasons.append(f"K={k} is not a multiple of the {block}-value "
-                               f"nvfp4 block")
-            if reasons:
-                print(f"Preserving '{name}' as float: {', '.join(reasons)}")
-                skipped_count += 1
-                continue
+            dims = gate["dims"]
+            k, n = gate["k"], gate["n"]
 
             arr = numpy_helper.to_array(initializer).astype(np.float32)
             n_blocks = k // block

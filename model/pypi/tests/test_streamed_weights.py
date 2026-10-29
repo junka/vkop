@@ -68,15 +68,16 @@ def _model_with_external_weights(tmp_path, location="w.bin"):
     return tmp_path / "m.onnx"
 
 
-def _convert(tmp_path, out_name, *, stream, monkeypatch, min_mib=0):
+def _convert(tmp_path, out_name, *, stream, monkeypatch, min_mib=0,
+             quant="fp16"):
     """Run the pipeline the CLI runs, and return the written bytes."""
     src = _model_with_external_weights(tmp_path)
     monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "1")
     monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1" if stream else "0")
     monkeypatch.setenv("VKOP_STREAM_MIN_MIB", str(min_mib))
     converter = ModelConverter()
-    dag = converter.parse_onnx_model(str(src), 1, quant="fp16")
-    converter.apply_optimizations(dag, _opts())
+    dag = converter.parse_onnx_model(str(src), 1, quant=quant)
+    converter.apply_optimizations(dag, _opts(quant=quant))
     out = tmp_path / out_name
     dag.save_to_binary(str(out))
     return out.read_bytes(), dag
@@ -174,13 +175,116 @@ def test_weight_a_pass_could_read_is_hydrated_not_streamed(tmp_path, capsys):
 
 def test_deferral_is_refused_when_a_payload_would_be_rewritten(monkeypatch):
     monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
-    assert ws.deferral_refusal("int8", False, False) is not None
-    assert ws.deferral_refusal("fp8e4m3", False, False) is not None
+    # 4-bit and AWQ need the weight's magnitudes in hand to pick their scale
+    # (a group and a channel both span K), so their payloads cannot be built
+    # from a streamed band and the deferral stays refused.
+    for rewritten in ("int4", "nf4", "nvfp4", "awq"):
+        assert ws.deferral_refusal(rewritten, False, False) is not None, rewritten
     assert ws.deferral_refusal("fp16", True, False) is not None
     assert ws.deferral_refusal("fp16", False, True) is not None
     assert ws.deferral_refusal("fp16", False, False) is None
     monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "0")
     assert "VKOP_STREAM_WEIGHTS=0" in ws.deferral_refusal("fp16", False, False)
+
+
+def test_a_byte_format_may_stream_and_quantize_on_the_way_out(monkeypatch):
+    """int8 / fp8 keep their scale in one pass over the file.
+
+    Their scale is the weight's per-column absmax and their payload overwrites
+    the values, so a deferred float32 weight can be quantized as it is copied
+    into the trailer instead of being inflated into an array first. That is why
+    these three are the only quantizations deferral still allows.
+    """
+    monkeypatch.delenv("VKOP_STREAM_WEIGHTS", raising=False)
+    for value_free in ("int8", "fp8e4m3", "fp8e5m2"):
+        assert ws.deferral_refusal(value_free, False, False) is None
+        assert ws.exports_weight_values(value_free, False, False) is False
+    assert ws.exports_weight_values("int8", True, False) is True
+    assert ws.exports_weight_values("int8", False, True) is True
+    for needs_values in ("int4", "nf4", "nvfp4", "awq", "fp16", None):
+        assert ws.exports_weight_values(needs_values, False, False) is True
+
+
+def _float32_weights(seed=0):
+    rng = numpy.random.RandomState(seed)
+    return [rng.randn(64, ELEMS // 64).astype(numpy.float32) for _ in range(N_WEIGHTS)]
+
+
+def _model_with_external_float32_weights(tmp_path):
+    """Same chain, but float32 weights -- the dtype a byte format may defer."""
+    x = helper.make_tensor_value_info("X", TensorProto.FLOAT, [1, 64])
+    y = helper.make_tensor_value_info("Y", TensorProto.FLOAT, [1, 64])
+    nodes, inits, prev = [], [], "X"
+    for i, w in enumerate(_float32_weights()):
+        name = "W%d" % i
+        inits.append(helper.make_tensor(name, TensorProto.FLOAT,
+                                        list(w.shape), w.tobytes(), raw=True))
+        out = "M%d" % i if i < N_WEIGHTS - 1 else "Y"
+        nodes.append(helper.make_node("MatMul", [prev, name], [out], name="mm%d" % i))
+        prev = out
+    graph = helper.make_graph(nodes, "g", [x], [y], inits)
+    model = helper.make_model(graph, producer_name="test")
+    model.opset_import[0].version = 17
+    model.ir_version = 8
+    external_data_helper.convert_model_to_external_data(
+        model, all_tensors_to_one_file=True, location="w32.bin", size_threshold=0)
+    onnx.save_model(model, str(tmp_path / "m32.onnx"))
+    return tmp_path / "m32.onnx", _float32_weights()
+
+
+def test_int8_streams_a_float32_weight_and_writes_the_scale(tmp_path, monkeypatch):
+    """A float32 weight under int8 is quantized on its way into the trailer.
+
+    The bytes must be exactly what the in-memory quantizer would write (per
+    column amax / 127, two's-complement byte), the side table must call them
+    INT8 with one byte per element, and the MatMul must carry the scale as its
+    third input -- all without the weight ever becoming an array in RAM.
+    """
+    from onnx2vkop.inspect import ModelView
+
+    src, weights = _model_with_external_float32_weights(tmp_path)
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "1")
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+    converter = ModelConverter()
+    dag = converter.parse_onnx_model(str(src), 1, quant="int8")
+    converter.apply_optimizations(dag, _opts(quant="int8"))
+    out = tmp_path / "s8.vkopbin"
+    dag.save_to_binary(str(out))
+
+    streamed = {n: e for n, e in dag.deferred_weights.items() if e.get("quant")}
+    assert sorted(streamed) == ["W0", "W1", "W2"], sorted(dag.deferred_weights)
+    for name, entry in streamed.items():
+        assert entry["data_type"] == TensorProto.INT8, name
+        assert entry["length"] == 64 * (ELEMS // 64) * 4, name
+        assert entry["scale"] == name + "_scale", name
+
+    view = ModelView(str(out))
+    rows = {i["name"]: i for i in view.initializers()}
+    blob = view.external_blob_trailer
+    wanted = {n: w for n, w in zip(("W0", "W1", "W2"), weights)}
+    with open(out, "rb") as f:
+        for name, entry in streamed.items():
+            w = wanted[name]
+            scale = numpy.where(numpy.max(numpy.abs(w), axis=0) == 0, 1.0,
+                                numpy.max(numpy.abs(w), axis=0) / 127.0)
+            q = numpy.round(w / scale[None, :]).astype(numpy.int8)
+            row = rows[name]
+            # The side table spells the payload's own names ("int8"), not the
+            # ONNX enum: the C++ reader keys on these strings, and vkop's
+            # neutral spelling is what every other quantized row carries.
+            assert row["name"] == name, row
+            assert row["size"] == q.size, row
+            assert tuple(entry["dims"]) == tuple(row["dims"]), row
+            f.seek(blob + row["offset"])
+            assert f.read(row["size"]) == q.tobytes(), name
+
+            scale_row = rows[name + "_scale"]
+            assert scale_row["name"] == name + "_scale", scale_row
+            f.seek(blob + scale_row["offset"])
+            got = numpy.frombuffer(f.read(scale_row["size"]), dtype=numpy.float32)
+            numpy.testing.assert_allclose(got, scale.astype(numpy.float32),
+                                          rtol=1e-6)
 
 
 # --------------------------------------------------------------------------
