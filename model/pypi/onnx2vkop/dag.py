@@ -120,19 +120,23 @@ _DTYPE_BYTES = {
 }
 
 
-def _init_byte_len(arr) -> int:
+def _init_byte_len(arr, dtype=None) -> int:
     """The bytes this initializer occupies in the blob.
 
     Computed from the dtype and dims instead of by decoding the payload: a
     prescan that ran to_array() + tobytes() on every initializer would allocate
     several GB of temporaries for a 3.4GB LLM weight set, on top of the blob it
-    is only measuring."""
+    is only measuring.
+
+    `dtype` overrides the element type, for a deferred weight a byte format
+    rewrites on the way out: its blob extent is numel * 1, not numel * 4."""
     n = 1
     for d in arr.dims:
         n *= int(d)
-    if arr.data_type in _PACKED_DATA_TYPES:
+    kind = arr.data_type if dtype is None else dtype
+    if kind in _PACKED_DATA_TYPES:
         return (n * _PACKED_BITS + 7) // 8
-    nbytes = _DTYPE_BYTES.get(arr.data_type, 0)
+    nbytes = _DTYPE_BYTES.get(kind, 0)
     return n * nbytes
 
 
@@ -155,13 +159,19 @@ def _init_bytes(arr) -> bytes:
     return np.ascontiguousarray(numpy_helper.to_array(arr)).tobytes()
 
 
-def _init_dtype_name(arr) -> str:
+def _init_dtype_name(arr, dtype=None) -> str:
     """The dtype string the C++ loader reads: vkop's own name when the tensor
-    carries one (nf4), else the ONNX element type's spelling."""
+    carries one (nf4), else the ONNX element type's spelling.
+
+    `dtype` overrides the tensor's element type, for a weight whose bytes a
+    deferred entry is about to replace with a byte-format payload: the tensor
+    stays FLOAT (nothing may read its values) while the blob and the loader
+    both have to see INT8 / FLOAT8E4M3FN / FLOAT8E5M2."""
     for entry in arr.metadata_props:
         if entry.key == _VKOP_DTYPE_META_KEY:
             return entry.value
-    return _DATA_TYPE_MAP.get(arr.data_type, "UNDEFINED")
+    return _DATA_TYPE_MAP.get(arr.data_type if dtype is None else dtype,
+                              "UNDEFINED")
 
 
 # 64-byte alignment for the compact initializer blob, matching the legacy
@@ -631,6 +641,19 @@ class DAGBasedModel:
             total_blob = 0
             for _name, arr in self.initializers.items():
                 if _name in unified_names:
+                    continue
+                if _name in self.deferred_weights:
+                    # A deferred weight has no bytes here, so the question this
+                    # threshold answers -- "would holding all this in memory be
+                    # too much?" -- has to be asked about the bytes the SOURCE
+                    # would occupy, not the payload that replaces them. The
+                    # payload size would let a heavily quantized model look
+                    # small enough to inline, and the inline layout has no way
+                    # to carry a weight that is still on disk.
+                    _src = self.deferred_weights[_name].get("src_dtype")
+                    total_blob += weight_stream.payload_bytes(
+                        arr, _src if _src is not None
+                        else weight_stream.TensorProto.FLOAT)
                     continue
                 total_blob += _init_byte_len(arr)
             if getattr(self, "_unified_bytes", b""):

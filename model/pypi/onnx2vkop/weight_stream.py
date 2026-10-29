@@ -57,7 +57,44 @@ _CHUNK_BYTES = 1 << 23
 # FLOAT16 at deferral time so _downcast_bfloat16 leaves the file bytes alone.
 _PASS_THROUGH_DATA_TYPES = frozenset(
     {TensorProto.FLOAT16, TensorProto.BFLOAT16})
-_PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2}
+_PASS_THROUGH_ITEMSIZE = {TensorProto.FLOAT16: 2, TensorProto.BFLOAT16: 2,
+                          TensorProto.FLOAT: 4,
+                          TensorProto.INT8: 1,
+                          TensorProto.FLOAT8E4M3FN: 1,
+                          TensorProto.FLOAT8E5M2: 1}
+
+# Formats whose converter never reads the weight's stored value: their scale is
+# re-derived from the weight's own magnitudes and the value is fully overwritten
+# by the new payload. Gates that a byte format can carry but a 4-bit payload
+# cannot are the same gates `Quantizer._match_weight_only` applies, so the two
+# stay one set by construction (a drift here is an unscaled s with nowhere to
+# fold its 1/s -- a silently wrong model).
+_VALUE_FREE_FORMATS = ("int8", "fp8e4m3", "fp8e5m2")
+
+# The payload element type each of those produces. The deferred row
+# records it, which is what lets the extent checks and the writer treat
+# a 1-byte payload as the same number of elements as the 4-byte source.
+_BYTE_PAYLOAD_DTYPES = {
+    "int8": TensorProto.INT8,
+    "fp8e4m3": TensorProto.FLOAT8E4M3FN,
+    "fp8e5m2": TensorProto.FLOAT8E5M2,
+}
+
+
+def exports_weight_values(quant: Optional[str], unify: bool,
+                          rgba: bool) -> bool:
+    """Does any pass read a weight's *values*, not just its byte count?
+
+    4-bit and AWQ derive their scale from the weight's own magnitudes; --unify
+    and --rgba concatenate or repack the payloads; a plain float export copies
+    what is there. The byte formats (int8, fp8) only need the count, so a model
+    under those can keep a 9 GB fp16 weight in its file instead of inflating it
+    to 18 GB first.
+    """
+    if unify or rgba:
+        return True
+    return quant not in _VALUE_FREE_FORMATS
+
 
 # Ops that take a weight as an operand and are never evaluated during
 # conversion, because one of their inputs is an activation.
@@ -91,10 +128,17 @@ def stream_min_bytes() -> int:
 
 def deferral_refusal(quant: Optional[str], unify: bool,
                      rgba: bool) -> Optional[str]:
-    """Why deferral must not run, or None when it may."""
+    """Why deferral must not run, or None when it may.
+
+    A byte format (int8, fp8) is allowed: its scale is the weight's per-column
+    absmax and its payload overwrites the values, so the bytes can be quantized
+    on the way into the trailer (`quant_payload`) instead of being inflated into
+    an array first. 4-bit and AWQ need the whole matrix in hand (their scales
+    span K), so they still refuse.
+    """
     if not _env_flag(_ENV_ENABLE, True):
         return f"{_ENV_ENABLE}=0"
-    if quant not in (None, "fp16"):
+    if quant is not None and quant not in ("fp16",) + _VALUE_FREE_FORMATS:
         return f"-q {quant} rewrites weight payloads and needs their bytes"
     if unify:
         return "--unify concatenates weight payloads and needs their bytes"
@@ -103,12 +147,18 @@ def deferral_refusal(quant: Optional[str], unify: bool,
     return None
 
 
-def payload_bytes(tensor) -> int:
-    """Bytes this initializer occupies, from dtype and dims only."""
+def payload_bytes(tensor, dtype=None) -> int:
+    """Bytes this initializer occupies, from dtype and dims only.
+
+    `dtype` overrides the tensor's own element type: a deferred weight under a
+    byte format is about to become a 1-byte payload with the same element
+    count, and every extent check has to ask for that length, not the source's.
+    """
     n = 1
     for d in tensor.dims:
         n *= int(d)
-    size = _PASS_THROUGH_ITEMSIZE.get(tensor.data_type)
+    size = _PASS_THROUGH_ITEMSIZE.get(
+        tensor.data_type if dtype is None else dtype)
     if size is None:
         return -1
     return n * size
@@ -443,8 +493,8 @@ def restore_paging_slots(model, base_dir: str, deferred: Dict[str, dict],
             raise DeferredWeightError(
                 f"MoE paging slot '{name}' declares {length} byte(s) at offset "
                 f"{offset} but its dtype and dims describe {want}; the runtime "
-                f"derives each expert's stride from dtype and dims, so the "
-                f"offset table would point past or short of the slot")
+                f"which the runtime preads straight into the slot's buffer, so the "
+                f"slice would point past or short of the slot")
         if tensor.data_type == TensorProto.BFLOAT16:
             # Same state transition prepare() applies: the file keeps bf16 bytes
             # and write_payload converts chunk-wise, so the recorded dtype has
@@ -474,7 +524,15 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
     converted chunk-wise to fp16 (the runtime's only 16-bit float storage);
     bf16 -> fp16 is the fp32 value rounded once, the same recipe as
     converter._bf16_bytes_to_fp16, so both paths agree bit-for-bit.
+
+    An entry carrying `quant` is the same idea for a byte format: its scale is
+    the source's per-column absmax, computed and stashed by quant_payload at
+    prepare time, and every band is quantized as it goes past. The output is
+    one byte per element where the source had four, which is why the entry --
+    not the tensor -- is what says how many bytes this writes.
     """
+    if entry.get("quant") is not None:
+        return _write_quantized(entry, out_f, base_dir)
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(base_dir, path)
@@ -501,6 +559,32 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
             out_f.write(block)
             remaining -= len(block)
     return entry["length"] - remaining
+
+
+def _write_quantized(entry: dict, out_f, base_dir: str) -> int:
+    """Stream a quantizing entry's source, write one byte per element.
+
+    The scale was computed at prepare time and lives on the entry, so this is a
+    straight pass: read a band, quantize it, write it. The band length is
+    quant_payload.ROW_BLOCK rows, so a wide weight never materializes more than
+    a few hundred MiB.
+    """
+    from . import quant_payload
+
+    reader = quant_payload.WeightReader(entry, entry["name"])
+    # `entry["scale"]` is the initializer's NAME. The values are what the
+    # encoder needs, and finalize stashed them when it built that initializer;
+    # recomputing here would mean a second full pass over the source.
+    scale = entry.get("scale_values")
+    if scale is None:
+        scale = quant_payload.scale_for(entry["quant"], reader)
+    codes = quant_payload.code_byte(entry["quant"], reader, scale)
+    written = 0
+    for _, band in reader.bands():
+        blob = codes(band)
+        out_f.write(blob.tobytes())
+        written += blob.size
+    return written
 
 
 def verify_not_sidebar_located(slots, trailer_path: str) -> List[str]:
@@ -574,8 +658,16 @@ def verify_deferred(deferred: Dict[str, dict], dag_model) -> None:
                     f"{len(init.raw_data)} byte(s)); nothing was going to "
                     f"stream it")
                 continue
-        got = payload_bytes(init)
-        if (init.data_type != e["data_type"] or tuple(int(d) for d in init.dims) != e["dims"]
+        # `length` is the extent in the SOURCE file, in source bytes -- that is
+        # what write_payload and WeightReader.bands seek and read by. A byte
+        # format writes one byte per element out of a four-byte source, so its
+        # payload is a quarter the size and the two must never be compared.
+        # What is checked here is that the source extent still matches what the
+        # entry promised; the payload size is derived at write time, not stored.
+        quantized = e.get("quant") is not None
+        got = payload_bytes(init, e.get("src_dtype") if quantized else None)
+        if ((not quantized and init.data_type != e["data_type"])
+                or tuple(int(d) for d in init.dims) != e["dims"]
                 or got != e["length"]):
             problems.append(
                 f"'{name}' changed while deferred: dtype {e['data_type']}->{init.data_type}, "

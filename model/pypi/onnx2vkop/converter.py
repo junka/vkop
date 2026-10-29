@@ -19,6 +19,7 @@ try:
     from . import shader_map
     from . import weight_stream
     from . import layout_audit
+    from . import quant_payload
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -40,6 +41,7 @@ except ImportError:
     import shader_map
     import weight_stream
     import layout_audit
+    import quant_payload
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -225,6 +227,14 @@ class ModelConverter:
             model, base_dir, quant=quant, unify=unify, rgba=rgba,
             keep_in_file=moe_slots)
 
+        # A float32 weight left in its file under a byte format is quantized on
+        # the way into the trailer, so its scale has to exist in the graph: this
+        # computes it from the source, adds it as an initializer and appends it
+        # to each consumer, exactly the three-input shape -q int8 builds for an
+        # in-memory weight. Runs on the proto because no DAG exists yet.
+        if deferred_weights:
+            quant_payload.finalize(model, deferred_weights)
+
         # Normalize bf16 away before anything reads a dtype: the runtime has no
         # bf16 kernel and no bf16 storage type, so a model that spells it has to
         # become fp16 here or the loader rejects it at the format gate. Runs
@@ -334,6 +344,15 @@ class ModelConverter:
         # Add initializers
         for initializer in graph.initializer:
             dag_model.initializers[initializer.name] = initializer
+        # Deferred weights have no bytes but they do have a payload dtype; the
+        # proto still spells the *source* type, and every later check reads the
+        # DAG. Repaired here rather than at the earlier spot because the fills
+        # above replace the dict wholesale.
+        for _name, _entry in deferred_weights.items():
+            _qe = _entry.get("data_type")
+            _init = dag_model.initializers.get(_name)
+            if _qe is not None and _init is not None:
+                _init.data_type = _qe
 
         initializer_names = {init.name for init in graph.initializer}
 
@@ -867,6 +886,19 @@ class ModelConverter:
             self.quantizer.quantize_to_fp8_weight_only(dag_model, args.quant)
         elif args.quant == "nvfp4":
             self.quantizer.quantize_to_nvfp4_weight_only(dag_model)
+        elif args.quant == "awq":
+            # AWQ is a real-valued weight transform that pairs with any low-bit
+            # format; --awq-format picks which. The pass itself is in
+            # quantize_to_awq_weight_only, which runs the plain quantizer for
+            # that format restricted to the weights it scaled.
+            self.quantizer.quantize_to_awq_weight_only(
+                dag_model,
+                getattr(args, "group_size", 64),
+                getattr(args, "awq_format", "int4"),
+                getattr(args, "awq_stats", None),
+                getattr(args, "awq_alpha", 0.5),
+                getattr(args, "awq_grid", 20),
+            )
 
         # Every consumer-driven weight layout is settled by now: the fusion
         # passes that fold a Transpose or a Q/DQ pair have re-pointed each
