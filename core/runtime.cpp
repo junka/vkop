@@ -2870,8 +2870,16 @@ double Runtime::Run() {
     // VkSubmitInfo may not wait on the semaphore it signals.
     auto graph_open = [&](size_t level_idx) {
         if (graph_next_seg >= graph_cmds.size()) {
+            // id 0, not the segment ordinal: the id picks a command pool and
+            // VulkanCommandPool keeps one pool per compute QUEUE FAMILY. Every
+            // segment is submitted on queue0, so every buffer must come from
+            // queue0's family. A device with a dedicated compute family (NVIDIA
+            // exposes family 0 = G+C+T and family 2 = C+T) otherwise records
+            // odd segments into family 2's pool and submits them on a family 0
+            // queue -- a VUID-vkQueueSubmit-pCommandBuffers-00074 violation that
+            // takes the driver down in vkQueueSubmit.
             graph_cmds.push_back(std::make_shared<VulkanCommandBuffer>(
-                m_cmdpool_, static_cast<int>(graph_next_seg)));
+                m_cmdpool_, 0));
         }
         graph_seg = graph_cmds[graph_next_seg++];
         graph_seg->clearWaits();
