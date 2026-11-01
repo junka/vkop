@@ -10,3 +10,27 @@ llm/exporter/export/*.data
 llm/exporter/export/onnx__*
 llm/exporter/export/moe_ckpt
 __pycache__/
+
+# Model-scope exports written next to the exporters instead of under export/.
+llm/exporter/*.onnx
+llm/exporter/*.vkopbin
+llm/exporter/*.weights.bin
+llm/exporter/embed_tokens.bin
+# Tokenizer blobs serialized by tokenizer_to_bin.py from a local checkpoint.
+llm/tokenizer/*.bin
+
+# Build trees, including CMake's in-source leftovers (CMakeFiles/,
+# CMakeCache.txt) when a build directory is accidentally configured in-tree.
+/build/
+/build_*/
+/CMakeFiles/
+/CMakeCache.txt
+/.cache/
+# ONNX models and scratch inputs pulled down for one-off conversions; the
+# committed fixtures live under model/ (add_conv_model.onnx etc.).
+/onnx_models/
+/optimized_resnet18.onnx
+/dog.jpg
+# Run logs and compiler leftovers.
+/log
+*.obj
