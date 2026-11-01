@@ -150,8 +150,14 @@ class VulkanDevice {
                            [layout](VkImageLayout i) { return i == layout; });
     }
     void wait_all_done();
+    // VKOP_NO_HOST_IMAGE_COPY=1 forces the regular staging-buffer paths:
+    // vkCopyMemoryToImageEXT's host pointer points into arbitrary host RAM
+    // with no VkDeviceMemory behind it, so a RenderDoc capture cannot
+    // snapshot the transferred pixels.
     bool is_support_host_image_copy() const {
-        return m_support_host_image_copy_;
+        static const bool disabled =
+            std::getenv("VKOP_NO_HOST_IMAGE_COPY") != nullptr;
+        return m_support_host_image_copy_ && !disabled;
     }
     // UMA: a memory type that is both HOST_VISIBLE and DEVICE_LOCAL. iGPU
     // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick

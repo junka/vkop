@@ -139,11 +139,14 @@ void VulkanInstance::getRequiredExtensions(
         return false;
     };
     // Add instance extensions
-#ifdef USE_DEBUG_LAYERS
+    // Debug_utils object names and command-buffer labels are what make a
+    // RenderDoc capture navigable, so this extension is enabled whenever the
+    // loader has it — independent of USE_DEBUG_LAYERS/validation.
 #if VK_EXT_debug_utils
     if (is_ext_supported(VK_EXT_DEBUG_UTILS_EXTENSION_NAME))
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
 #endif
+#ifdef USE_DEBUG_LAYERS
 #if VK_EXT_debug_report
     if (extensions.empty() &&
         is_ext_supported(VK_EXT_DEBUG_REPORT_EXTENSION_NAME)) {

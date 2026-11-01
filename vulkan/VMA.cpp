@@ -16,9 +16,23 @@
 
 #include "vulkan/VMA.hpp"
 
+#include <atomic>
 #include <stdexcept>
 
 namespace vkop {
+
+namespace {
+// RenderDoc reconstructs mapped-memory contents only from map/unmap/flush
+// events. VMA's own flush/invalidate are no-ops on HOST_COHERENT types, so
+// under a capture session (VKOP_RDOC) or VKOP_STRICT_FLUSH the explicit
+// range calls below are what make direct host writes visible to replay.
+bool strict_flush_enabled() {
+    static const bool on = std::getenv("VKOP_RDOC") != nullptr ||
+                           std::getenv("VKOP_STRICT_FLUSH") != nullptr;
+    return on;
+}
+std::atomic<VkDevice> s_vma_device{VK_NULL_HANDLE};
+} // namespace
 
 VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
     VmaVulkanFunctions vulkan_functions = {};
@@ -40,6 +54,7 @@ VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
     if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS) {
         throw std::runtime_error("Failed to create VMA allocator");
     }
+    s_vma_device.store(device);
     // createPools();
 }
 
@@ -184,11 +199,35 @@ void VMA::flushAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
     // vmaFlushAllocation is a no-op on HOST_COHERENT memory types; the
     // explicit call only costs a branch there.
     vmaFlushAllocation(buf->allocator, buf->allocation, offset, size);
+    if (!strict_flush_enabled())
+        return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);
+    if (info.memory == VK_NULL_HANDLE)
+        return;
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = info.memory;
+    range.offset = info.offset + offset;
+    range.size = size;
+    vkFlushMappedMemoryRanges(s_vma_device.load(), 1, &range);
 }
 
 void VMA::invalidateAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
                                VkDeviceSize size) {
     vmaInvalidateAllocation(buf->allocator, buf->allocation, offset, size);
+    if (!strict_flush_enabled())
+        return;
+    VmaAllocationInfo info{};
+    vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);
+    if (info.memory == VK_NULL_HANDLE)
+        return;
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = info.memory;
+    range.offset = info.offset + offset;
+    range.size = size;
+    vkInvalidateMappedMemoryRanges(s_vma_device.load(), 1, &range);
 }
 
 void VMA::destroyBuffer(struct VmaBuffer *buf) {

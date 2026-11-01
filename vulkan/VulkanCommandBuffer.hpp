@@ -3,6 +3,7 @@
 #define SRC_VULKANCOMMANDBUFFER_HPP_
 
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanDebug.hpp"
 #include "vulkan/VulkanGraphicsPipeline.hpp"
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanSemaphore.hpp"
@@ -104,6 +105,11 @@ class VulkanCommandBuffer {
                         const void *ptr);
     void dispatch(int w = 1, int h = 1, int z = 1);
 
+    // Debug_utils label attached to the next dispatch/dispatch_indirect
+    // recorded here. Set once per op by Operator::onExecute so every Event
+    // Browser entry carries the graph node's name; empty string disables.
+    void set_debug_label(std::string name) { debug_label_ = std::move(name); }
+
     // Full memory barrier covering every prior write in this recording. Used
     // by graph-submit mode (VKOP_GRAPH_SUBMIT), which packs many levels into
     // ONE command buffer: the timeline-semaphore ordering that normally sits
@@ -158,6 +164,7 @@ class VulkanCommandBuffer {
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;
     bool m_support_timeline_ = true;
     uint64_t m_signalValue_ = 0;
+    std::string debug_label_;
 
     VkCommandBuffer m_primaryBuffer_ = VK_NULL_HANDLE;
     VkCommandBuffer m_commandBuffer_ = VK_NULL_HANDLE;

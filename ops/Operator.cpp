@@ -109,6 +109,17 @@ void Operator::onExecute(
     }
     m_id_ = id;
 
+    // Tag every dispatch this op records with its graph node name, so a
+    // RenderDoc capture reads "level 437 / Matmul /q_proj" instead of
+    // anonymous vkCmdDispatch entries.
+    if (VulkanDebug::enabled()) {
+        std::string label =
+            name_.empty() ? convert_optype_to_string(type_) : name_;
+        auto &dst = graph_cmd_ ? graph_cmd_ : m_cmd_;
+        if (dst)
+            dst->set_debug_label(std::move(label));
+    }
+
     // Graph-submit mode: record into the Runtime-owned shared command
     // buffer. m_cmd_ is temporarily repointed at it so the op's own
     // helper methods and m_cmd_->get() calls (barriers, copies, binds,

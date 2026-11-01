@@ -1,5 +1,6 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanDevice.hpp"
+#include "vulkan/VulkanDebug.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <algorithm>
 #include <cstdint>
@@ -1348,6 +1349,7 @@ bool VulkanDevice::createLogicalDevice(
         LOG_ERROR("Failed to create logical device! ret=%d", ret);
         return false;
     }
+    VulkanDebug::set_device(logicalDevice_);
 
     // Some drivers advertise host image copy yet report an empty memory-type
     // mask for OPTIMAL-tiling images created with HOST_TRANSFER usage (seen on

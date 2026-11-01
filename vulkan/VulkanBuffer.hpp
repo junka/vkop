@@ -153,6 +153,15 @@ class VulkanBuffer : public VulkanResource {
     void updateBuffer(VkCommandBuffer commandBuffer, const void *data,
                       VkDeviceSize size, VkDeviceSize offset = 0);
 
+    // Emit a real vkFlushMappedMemoryRanges for a host-written range. Not
+    // needed for GPU visibility on HOST_COHERENT memory, but RenderDoc
+    // reconstructs buffer contents only from map/unmap/flush events, so a
+    // capture session requires the call to exist for buffers the CPU writes
+    // directly through the mapped pointer (e.g. the Matmul split-K control
+    // header). No-op semantics on the device; cheap enough to call
+    // unconditionally.
+    void flushMappedRange(VkDeviceSize offset, VkDeviceSize size);
+
     void *getMappedMemory() {
         if (parent_)
             return parent_->getMappedMemory();

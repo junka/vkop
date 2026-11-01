@@ -361,4 +361,21 @@ void VulkanBuffer::updateBuffer(VkCommandBuffer commandBuffer, const void *data,
     vkCmdUpdateBuffer(commandBuffer, buffer, offset, size, data);
     transferBarrier(commandBuffer, old_access, size, offset);
 }
+
+void VulkanBuffer::flushMappedRange(VkDeviceSize offset, VkDeviceSize size) {
+    if (parent_) {
+        parent_->flushMappedRange(offset + range_offset_, size);
+        return;
+    }
+#ifdef USE_VMA
+    VMA::flushAllocation(getVmaBuffer(), offset, size);
+#else
+    VkMappedMemoryRange range = {};
+    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    range.memory = getMemory();
+    range.offset = getOffset() + offset;
+    range.size = size;
+    vkFlushMappedMemoryRanges(m_vdev_->getLogicalDevice(), 1, &range);
+#endif
+}
 } // namespace vkop

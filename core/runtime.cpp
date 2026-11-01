@@ -19,6 +19,7 @@
 #include "ops/OperatorFactory.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"
+#include "vulkan/Renderdoc.hpp"
 
 namespace vkop {
 std::shared_ptr<VulkanBuffer> ops::Operator::dummy_buffer_ = nullptr;
@@ -1857,6 +1858,13 @@ Runtime::ListTensors() const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
+
+    // RenderDoc capture window: with VKOP_RDOC=1 the n-th Run() round
+    // (VKOP_RDOC_RUN, default 1) is captured whole; other rounds are a
+    // counter bump. See vulkan/Renderdoc.hpp.
+    RenderdocRunCapture rdoc_capture(
+        VulkanInstance::getVulkanInstance().getInstance(),
+        dev->getLogicalDevice());
 
     // [mmroute] per-op MatMul kernel-route readout: one stderr line per MatMul
     // per round, naming the kernel family the op dispatched and the shape

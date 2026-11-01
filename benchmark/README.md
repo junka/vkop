@@ -47,6 +47,25 @@ build/benchmark/vkop-bench <model.vkopbin> [options]
 | `VKOP_SHADER_DEBUG=1` | 逐 op 打 shader 来源 hit/miss |
 | `VKOP_SUBMIT_PROF=1` | 逐 op GPU 时间到 stderr |
 
+### RenderDoc 捕获
+
+推理路径是纯 headless compute（无 swapchain、无 present），RenderDoc 的 F12 / 按帧号捕获都没有"帧"可抓；唯一可靠入口是 in-app API（`vulkan/Renderdoc.hpp`），在 `Runtime::Run()` 边界开合。相关环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `VKOP_RDOC=1` | 打开捕获机制（未在 RenderDoc 下启动时打一条 warning 并静默跳过）；同时隐式打开 debug 标注 |
+| `VKOP_RDOC_RUN=<n>` | 只捕获第 n 次 `Runtime::Run()`（1 起；默认 1。bench 有 warmup，要抓计时轮就设成 warmup+1） |
+| `VKOP_DEBUG_LABELS=1` | 单独开 debug_utils 标注（不开捕获）：每次 dispatch 前插节点名 label，Event Browser 里能看到 `Matmul /q_proj` 而不是 `vkCmdDispatch #512` |
+| `VKOP_NO_HOST_IMAGE_COPY=1` | 关掉 `vkCopyMemoryToImageEXT` 直拷路径（其宿主指针没有 VkDeviceMemory，capture 无法快照），退回 staging 拷贝 |
+| `VKOP_STRICT_FLUSH=1` | VMA 构建下把 coherent 内存的 flush/invalidate 变成显式 `vkFlushMappedMemoryRanges`（RenderDoc 只能从 map/unmap/flush 事件重建宿主写入；`build/` 非 VMA 构建本来就会发，不需要它） |
+
+标准流程（Windows，`build/` 为 USE_VMA=OFF）：
+
+1. RenderDoc 启动 `build\bin\Release\vkop_bench.exe`（或 bench_matmul 微基准，dispatch 少、无 GB 级权重，是首选调试目标）。
+2. 进程环境设 `VKOP_RDOC=1` `VKOP_RDOC_RUN=4`（warmup 3 轮后抓第 4 轮 = 首个计时轮）。
+3. capture 落盘后在 RenderDoc 的 Event Browser 里按 label 找到目标 op，Shader 窗口可源码级单步（SPIR-V 全部带 `-g` 且无优化，`OpSource` 内联了完整 GLSL）。
+4. coop/sg 变体单步支持弱；`VKOP_NO_COOP=1` 可退回非 coop 路径对照。
+
 Shader 只从模型内嵌归档来，**运行期没有替换 shader 的开关**：profile 跑的就是部署跑的 kernel，换 shader 必须重转。`Model.kernel_plans` 把 per-op kernel 选择写进文件，Python 筛归档、C++ 查 key 共用一张表，漂移即硬失败。
 
 ## bench_matmul — MatMul GEMV 微基准

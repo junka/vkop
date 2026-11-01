@@ -249,11 +249,13 @@ void VulkanCommandBuffer::push_constants(VulkanPipeline &pipeline,
 }
 
 void VulkanCommandBuffer::dispatch(int w, int h, int z) {
+    VulkanDebug::insert_label(m_commandBuffer_, debug_label_.c_str());
     vkCmdDispatch(m_commandBuffer_, w, h, z);
 }
 
 void VulkanCommandBuffer::dispatch_indirect(VkBuffer buffer,
                                             VkDeviceSize offset) {
+    VulkanDebug::insert_label(m_commandBuffer_, debug_label_.c_str());
     vkCmdDispatchIndirect(m_commandBuffer_, buffer, offset);
 }
 
