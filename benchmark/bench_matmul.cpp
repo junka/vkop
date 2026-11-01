@@ -38,7 +38,9 @@
 #include "vulkan/VulkanInstance.hpp"
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
+#include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanBuffer.hpp"
+#include "vulkan/VulkanQueryPool.hpp"
 #include "core/Tensor.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "include/dev_shaders.hpp"
@@ -253,6 +255,12 @@ int main(int argc, char **argv) {
             printf("%-9s K=%-6d N=%-6d : no recorded cmd\n", s.name, s.K, s.N);
             continue;
         }
+        // VKOP_MATMUL_ROUTE=1 prints the route the op picked for this shape,
+        // the same readout matmul_m_sweep prints.
+        if (std::getenv("VKOP_MATMUL_ROUTE") != nullptr &&
+            !op->route_info().empty()) {
+            printf("[route] %-9s %s\n", s.name, op->route_info().c_str());
+        }
 
         // warmup submit + sync
         cmd->submit(queue);
@@ -300,6 +308,45 @@ int main(int argc, char **argv) {
                        (int8_mode ? 1 : 2); // weight bytes
         printf("%-9s K=%-6d N=%-6d : %8.3f ms  %7.1f GB/s\n", s.name, s.K, s.N,
                ms, bytes / ms / 1e6);
+
+        // GPU-side attribution (BENCH_GPU_TS=1): one timestamp pair around the
+        // whole replay loop, on the same queue. The wall number above also
+        // contains the host's vkQueueSubmit calls; the span below is what the
+        // GPU held the queue from first to last replay, so wall - span is
+        // host-side submit and span covers kernel time plus any queue bubble
+        // between rounds. A single-rep run (reps=1) shows the bubble-free
+        // kernel time.
+        if (std::getenv("BENCH_GPU_TS") != nullptr) {
+            VulkanQueryPool ts(dev->getLogicalDevice(), 2);
+            auto ts_begin = std::make_shared<VulkanCommandBuffer>(cmdpool, 0);
+            auto ts_end = std::make_shared<VulkanCommandBuffer>(cmdpool, 0);
+            // VulkanQueryPool::begin() resets both queries and writes index 0;
+            // end() writes index 1. Both buffers are resubmitted once only, so
+            // they can stay ONE_TIME_SUBMIT.
+            ts_begin->begin();
+            ts.begin(ts_begin->get());
+            ts_begin->end();
+            ts_end->begin();
+            ts.end(ts_end->get());
+            ts_end->end();
+
+            ts_begin->submit(queue);
+            for (int r = 0; r < reps; ++r) {
+                cmd->submit(queue);
+            }
+            ts_end->submit(queue);
+            dev->wait_all_done();
+            auto ticks = ts.getResults();
+            double gpu_ms =
+                static_cast<double>(ticks[1] - ticks[0]) *
+                static_cast<double>(dev->getTimestampPeriod()) * 1e-6 / reps;
+            if (gpu_ms > 0.0) {
+                printf("%-9s gpu       : %8.3f ms  %7.1f GB/s  (host %.3f ms)\n",
+                       s.name, gpu_ms, bytes / gpu_ms / 1e6, ms - gpu_ms);
+            } else {
+                printf("%-9s gpu       : timestamps unsupported\n", s.name);
+            }
+        }
 
         // Staging D2H readback probe: the same copyToCPU path the runtime
         // uses (GPU->staging copy, submit+wait, then a host memcpy out of the

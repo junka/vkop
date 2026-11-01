@@ -173,6 +173,16 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # WIDE and 512 keys it has to ship with every MatMul -- the operator
         # that needs it is a plain MatMul, not a distinct op_type.
         "buffer_matmul_down_act_fp16",
+        # The tile-split-K pair for the tiled fp16 kernel (-DTILED_KS_SPLIT
+        # deposit pass, -DTILED_KS_FOLD fold pass; one source, two modules,
+        # because a pipeline binds a single entry point and the split half is
+        # barrier-free). MatMulBuffer::ks_split_pipeline/ks_fold_pipeline probe
+        # them lazily and only the host's per-device routing knows whether the
+        # K cut is used, so both ship with every MatMul. With either key
+        # absent the archive cannot answer and the op falls back to the plain
+        # tiled kernel.
+        "buffer_matmul_tiled_ks_split_fp16",
+        "buffer_matmul_tiled_ks_fold_fp16",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",

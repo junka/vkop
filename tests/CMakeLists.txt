@@ -439,6 +439,14 @@ add_dependencies(ShaderArchiveTest shader_archive)
 add_test(NAME ShaderArchiveTest
          COMMAND ShaderArchiveTest ${VKOP_SHADER_ARCHIVE_FILE})
 
+# Table-driven kernel selection (not a gtest): pins the device profile table and
+# the MatMul rule table, including the routes ops/Matmul.hpp dispatches for the
+# calibration shapes. Pure (no GPU, no torch), so it runs everywhere and cheaply.
+# Run:  ./KernelSelectTest
+add_executable(KernelSelectTest KernelSelectTest.cpp)
+target_link_libraries(KernelSelectTest PRIVATE vkop vload)
+add_test(NAME KernelSelectTest COMMAND KernelSelectTest)
+
 # Image layout accounting probe (not a gtest): reports driver rowPitch /
 # arrayPitch padding for the image2DArray (NCHW->RGBA) layout vs a folded
 # single image2D, plus the real per-tensor gap for a given .vkopbin.

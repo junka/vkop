@@ -25,13 +25,23 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
         throw std::runtime_error("Compute queue already created.");
     }
     checkImageFormatSupport();
-    // Before getProperties(): the MatMul tile profile below keys on it.
+    // Before getProperties(): the UMA bit is part of the property pass.
     m_is_unified_memory_ = checkDeviceUnifiedMemoryAccess();
     auto props = getProperties();
     if (!createLogicalDevice(props)) {
         LOG_ERROR("Failed to create logical device!");
         return;
     }
+    // Everything the table-driven selector keys on is final now: the coopmat
+    // feature bool comes from createLogicalDevice()'s feature chain, and the
+    // property list / UMA probe are already cached. One query per device.
+    device_traits_ = core::device_traits_from(*this);
+    const core::DeviceProfile &profile =
+        core::device_profile_for(device_traits_);
+    LOG_INFO("MatMul profile: %s (byte_min_m=%d fp16_min_m=%d wide_n=%d "
+             "ks_target=%d)",
+             profile.name, profile.byte_min_m, profile.fp16_min_m,
+             profile.wide_n, profile.ks_target_blocks);
 #ifdef USE_VMA
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
 #endif
@@ -133,70 +143,11 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     this->deviceName_ = properties2.properties.deviceName;
     LOG_INFO("GPU %s", this->deviceName_.c_str());
 
-    // MoltenVK's MSL backend cannot compile the cooperative matrix load/store
-    // on this stack and scalarizes the int8 tile, so on the 560X the shared-
-    // memory tile only wins later than on ARL/Ada: the crossover is ~8 rows for
-    // a byte weight and ~4 (N = 6144) / ~6 (N = 151936) for fp16, against 2/3
-    // on the native drivers. The measurement table lives in ops/Matmul.hpp.
-    // Keyed on driverID, not vendorID alone, so a native AMD driver keeps the
-    // default calibration.
     LOG_INFO("Driver ID %d (vendor 0x%x)", driver_properties.driverID,
              properties2.properties.vendorID);
-    if (driver_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
-        properties2.properties.vendorID == 0x1002) { // AMD dGPU behind MVK
-        // The split-K GEMV wins every byte-weight row its gate admits (batch*m
-        // <= 8): even at m = 8 it ties the tile (2.43 vs 2.46 ms at N = 6144)
-        // and beats it 1.8x at N = 151936 (36 vs 64 ms), so take the GEMV
-        // through the whole window and let the tile start at 9.
-        matmul_tile_profile_.byte_min_m = 9;
-        matmul_tile_profile_.byte_wide_min_m = 9;
-        // fp16 pays twice the bytes per row, so the GEMV loses sooner. Both
-        // crossovers sit inside the split-K window: m = 4 (2.99 GEMV vs 2.26
-        // tile at N = 6144) and m = 6 (49.7 vs 48.4 at N = 151936).
-        matmul_tile_profile_.fp16_min_m = 4;
-        matmul_tile_profile_.wide_n = 65536;
-        matmul_tile_profile_.fp16_wide_min_m = 6;
-        // 16 CUs saturate the tiled GEMM at ~32 resident blocks; the old
-        // fixed 128 over-split and paid scratch traffic for no extra speed.
-        matmul_tile_profile_.ks_target_blocks = 32;
-        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d "
-                 "ks_target=%d",
-                 matmul_tile_profile_.byte_min_m,
-                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n,
-                 matmul_tile_profile_.ks_target_blocks);
-    }
-    if (driver_properties.driverID == VK_DRIVER_ID_MOLTENVK &&
-        properties2.properties.vendorID == 0x8086) { // Intel iGPU behind MVK
-        // Same MSL backend, but the tile is far worse here relative to the
-        // GEMV: int8 m = 8 costs 10.3 ms of GEMV against a 21.2 ms tile
-        // (N = 6144), fp16 m = 8 costs 7.95 against 14.9. Both crossovers land
-        // past the split-K window, so the GEMV keeps every row its gate admits
-        // (batch*m <= 8) and the tile starts at 9; no wide-N band is needed.
-        matmul_tile_profile_.byte_min_m = 9;
-        matmul_tile_profile_.fp16_min_m = 9;
-        // 24 EUs also saturate near 32 resident blocks; see the 560X note.
-        matmul_tile_profile_.ks_target_blocks = 32;
-        LOG_INFO("MatMul tile profile: byte_min_m=%d fp16_min_m=%d wide_n=%d "
-                 "ks_target=%d",
-                 matmul_tile_profile_.byte_min_m,
-                 matmul_tile_profile_.fp16_min_m, matmul_tile_profile_.wide_n,
-                 matmul_tile_profile_.ks_target_blocks);
-    }
-    if (driver_properties.driverID != VK_DRIVER_ID_MOLTENVK &&
-        !is_unified_memory()) { // discrete GPU on a native driver
-        // VRAM-backed dGPU: the tile's 64-byte-per-row B staging never takes
-        // off from VRAM at small m. Measured GTX 1070, interleaved A/B: byte
-        // q/k/v/o m=2..8 GEMV 23-74 GB/s vs tile 9-17, crossover at m=12
-        // (8.8 vs 7.9 GB/s), and past that the GEMV's M-fold re-read collapses
-        // to 4-6 GB/s while the tile stays flat. fp16 is a wash at m=3..8
-        // there, so only the byte threshold moves. Other dGPUs (e.g. the RTX
-        // 4000 Ada) share the memory mechanism but were not re-measured for
-        // byte weights; VKOP_NO_TILE is the escape hatch if one regresses.
-        matmul_tile_profile_.byte_min_m = 12;
-        matmul_tile_profile_.byte_wide_min_m = 12;
-        LOG_INFO("MatMul tile profile: byte_min_m=%d (discrete)",
-                 matmul_tile_profile_.byte_min_m);
-    }
+    // The tile/GEMV crossovers this used to compute per driver now live in the
+    // ordered table in core/KernelSelect.cpp; the resolved profile is logged
+    // from the constructor once device_traits_ exists.
     LOG_INFO("Max image array layers %d", this->maxImageArrayLayers_);
     LOG_INFO("Max image dimension 2D %d", this->maxImageDimension2D_);
     LOG_INFO("Min TexelBuffer Alignment %llu",

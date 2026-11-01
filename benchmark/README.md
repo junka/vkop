@@ -175,10 +175,11 @@ N=16384 下 q=32/64/128 三个 pin 得到同一个数，就是这个原因。
 
 ### tile vs GEMV 交叉点（`tiled_min_m` profile 标定）
 
-2026-10-25 实测（本机双卡：AMD Radeon Pro 560X `BENCH_DEV=0`、Intel UHD
-Graphics 630 `BENCH_DEV=1`，均 MoltenVK x86_64，`VKOP_NO_COOP=1`；
+2026-10-25 实测（Mac 双卡：AMD Radeon Pro 560X `BENCH_DEV=0`、Intel UHD
+Graphics 630 `BENCH_DEV=1`，均 MoltenVK x86_64，`VKOP_NO_COOP=1`；Windows
+GTX 1070 为原生 NVIDIA 驱动，见表下 1070 条目；
 `bench_matmul` / `bench_matmul_i8`，每个点 3 轮取最小，单轮仍是平均值，
-本机 run-to-run 抖动可达 30–50%，改阈值前应按同一口径复测）。tile 一次固定
+Mac run-to-run 抖动可达 30–50%，改阈值前应按同一口径复测）。tile 一次固定
 算满 `TILE_M=64` 行，所以 m 方向耗时平坦；split-K GEMV 每多一行多流一遍权重。
 split-K 只在 `batch*m <= 8` 时启用，这条窗口决定了阈值的上限：
 
@@ -188,6 +189,11 @@ split-K 只在 `batch*m <= 8` 时启用，这条窗口决定了阈值的上限�
 | 560X | int8 | 2048 | 151936 | ~4.4 ms | 64 ms | ≈14（超出窗口） |
 | 560X | fp16 | 2048 | 6144 | ~0.65 ms | 2.26 ms | ≈4 |
 | 560X | fp16 | 2048 | 151936 | ~8.3 ms | 48.3 ms | ≈6 |
+| 1070 | int8 | 2048 | 6144 | 2.43 ms @m=8 | ~0.97 ms | ≈9（窗口边界） |
+| 1070 | int8 | 2048 | 151936 | 11.1 ms @m=8 | ~18.1 ms | ≈9（窗口边界） |
+| 1070 | fp16 | 2048 | 2048 | 0.29 ms @m=8 | 0.36 ms | ≈9（窗口边界） |
+| 1070 | fp16 | 2048 | 6144 | 0.93 ms @m=8 | 0.82 ms | ≈7 |
+| 1070 | fp16 | 2048 | 151936 | 21.9 ms @m=8 | 16.4 ms | ≈7 |
 | UHD630 | int8 | 2048 | 6144 | ~1.4 ms | 21 ms | > 8 |
 | UHD630 | int8 | 2048 | 151936 | ~14.8 ms | 500 ms | > 8 |
 | UHD630 | fp16 | 2048 | 6144 | ~1.1 ms | 15 ms | > 8 |
@@ -196,6 +202,13 @@ split-K 只在 `batch*m <= 8` 时启用，这条窗口决定了阈值的上限�
 - 560X int8 在窗口内一直是 GEMV 更快：m=8、N=6144 时 2.43 vs tile 2.46（持平），
   N=151936 时 36 vs 64 ms（1.8x）；交叉点 ≈14 已越过窗口，取不到。所以
   `byte_min_m = byte_wide_min_m = 9`——GEMV 吃满 `batch*m <= 8`，tile 从 9 开始。
+- 1070（上表 1070 行）同样在窗口边界交接：int8 m=8 GEMV 0.35（N=6144）/ 11.1
+  （N=151936）ms，tile 分别 0.97 / 18.1，GEMV 赢满窗口；m=9 起 GEMV 门关闭、
+  形状落到 column-parallel（0.52 / 25.8 ms），tile（0.39 / 18.0）全面接手，所以
+  `byte_min_m = byte_wide_min_m = 9`。fp16 在小 N 也是 GEMV 赢到 m=8（0.29 vs
+  0.36 ms），但大 N 上每行多流一倍字节，提前翻车：lm_head m=7 起 tile 16.7 vs
+  GEMV 19.2、gate/up m=8 起 0.82 vs 0.93，所以 `fp16_min_m = 9` 且
+  `wide_n = 6144`、`fp16_wide_min_m = 7`。
 - 560X fp16 每行权重是双倍字节，交叉点落在窗口内：m=4、N=6144 时 GEMV 2.99 vs
   tile 2.26；m=6、N=151936 时 49.7 vs 48.4。`wide_n=65536` 切出 lm_head 这一档。
 - UHD630 的 MSL tile 更差，两个 dtype 的交叉点都在窗口外：int8 m=8 时 GEMV
@@ -207,13 +220,18 @@ split-K 只在 `batch*m <= 8` 时启用，这条窗口决定了阈值的上限�
   必须从 9 接上。UHD630 上 fp16 同样是 tile 更快（26/645 vs 15/360），int8
   N=6144 两者相当（22 vs 21），N=151936 column-parallel 略快（393 vs 500，
   m=9..11 段）——按 dtype 统一取 9，不做第二档。
-- 阈值来自 `VulkanDevice::MatmulTileProfile`：`driverID == MOLTENVK` 且
+- 阈值来自 `core/KernelSelect.cpp` 的 `kProfiles[]`（先由 `kClassRules` 把
+  `DeviceTraits` 归到一个 `DeviceClass`，再取该类的那一行）：`driverID ==
+  MOLTENVK` 且
   `vendorID == 0x1002`（AMD）套用上表 560X 值 `byte_min_m=9`、`fp16_min_m=4`、
   `wide_n=65536`（`byte_wide_min_m=9`、`fp16_wide_min_m=6`）；`vendorID ==
-  0x8086`（Intel）套用 `byte_min_m=9`、`fp16_min_m=9`、`wide_n=0`。ARL/Ada
-  保持默认 `2`/`3`、`wide_n=0`。power-of-two ≥ 64 KiB 行 stride
-  （fp16 N=32768/65536/131072、byte N=65536/131072）仍优先走 12，profile
-  不覆盖该分支。
+  0x8086`（Intel）套用 `byte_min_m=9`、`fp16_min_m=9`、`wide_n=0`。非 MoltenVK
+  且非 UMA（原生驱动独显，判据 `memoryHeapCount > 1`）套用 1070 值
+  `byte_min_m=byte_wide_min_m=9`、`fp16_min_m=9`、`wide_n=6144`、
+  `fp16_wide_min_m=7`。ARL/Ada 保持默认 `2`/`3`、`wide_n=0`（Ada 的 byte
+  交叉点未实测，同属 VRAM 机制，如需重标定改这一处 profile 即可）。power-of-two
+  ≥ 64 KiB 行 stride（fp16 N=32768/65536/131072、byte N=65536/131072）仍优先
+  走 12，profile 不覆盖该分支。
 - e2e 不受影响：int8、prompt m≈9 时 N=6144 的 tile 3.75 ms 对 column-parallel
   6.5 ms，lm_head 走 tile；变的是 `batch*m <= 8` 的 decode 与极短 prompt。
 - 同机 coop 不可用：M=16 时加不加 `VKOP_NO_COOP=1` 都是 2.597 ms（走 tile），
@@ -237,6 +255,38 @@ BENCH_M=9 BENCH_DEV=1 ./build/bench_matmul 2048 6144 20
 # int8 lm_head：560X m=8 GEMV ~35 ms，UHD630 m=8 GEMV ~119 ms
 ./build/bench_matmul_i8 8 2048 151936 8
 BENCH_DEV=1 ./build/bench_matmul_i8 8 2048 151936 5
+```
+
+2026-10-25 实测（GTX 1070，Windows 10，NVIDIA 582.28，无 coopmat，
+`bench_matmul` MSVC Release 静态链 vkop.lib，reps=30，correctness probe 全过）：
+
+| 项 | 耗时 | 带宽 |
+|---|---|---|
+| memcpy 256MB（读+写） | 2.71 ms | 198.3 GB/s |
+| 空提交开销 | 0.062 ms | — |
+| q/k/v/o K=2048 N=2048 | 0.085 ms | 98.7 GB/s |
+| gate/up K=2048 N=6144 | 0.179 ms | 140.6 GB/s |
+| down K=6144 N=2048 | 0.160 ms | 157.1 GB/s |
+| lm_head K=2048 N=151936 | 2.83 ms | 220.0 GB/s |
+
+（M=1 全部走 ksplit/WIDE GEMV；lm_head 220 GB/s 说明 WIDE 的 16 列/lane
+在 1070 上已把显存读满。）
+
+Windows 注意：**`BENCH_SKIP_MEMPROBE=1` 必开**。memprobe 的 256MB×reps 拷贝
+紧跟在测量窗口前，会让后续 GEMV 数字整体偏慢且抖动变大（A/B 相对值受影响
+小于绝对值）。Windows 侧构建用 `build/bench_matmul_build.cmd`（MSVC cl.exe
++ `/WHOLEARCHIVE:vkop.lib`，dash 风格参数避免 MSYS 路径改写），交叉点复现：
+
+```bash
+export BENCH_SKIP_MEMPROBE=1
+# fp16：窗口内 GEMV 赢（M=3 0.14 vs tile 0.36 ms），窄 N 到 m=8 仍是 GEMV
+BENCH_M=3 ./build/bench_matmul.exe            # vs VKOP_NO_TILE=1 同形状
+BENCH_M=8 ./build/bench_matmul.exe 2048 2048  # GEMV 0.28 / tile 0.36 ms
+# fp16 宽档（N>=6144）m=7 起交 tile：gate/up 0.82-0.85 / lm_head 16.4-16.7 ms
+BENCH_M=7 ./build/bench_matmul.exe
+# int8：m<=8 GEMV（0.18/0.35/11.1 ms），m>=9 tile（0.39/0.97/18.0 ms）
+BENCH_M=8 BENCH_INT8=1 ./build/bench_matmul.exe
+BENCH_M=9 BENCH_INT8=1 ./build/bench_matmul.exe
 ```
 
 ## 跨 GPU 参考数据（resnet，100 轮平均）
