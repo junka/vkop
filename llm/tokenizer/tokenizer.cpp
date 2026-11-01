@@ -7,10 +7,15 @@
 #include <iostream>
 #include <unordered_map>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#endif
 
 namespace qwen {
 
@@ -405,10 +410,61 @@ void pre_tokenize_phi(const std::string& s, std::vector<std::string>& out) {
 
 } // namespace
 
-Tokenizer::~Tokenizer() {
-    if (mmap_data_ && mmap_data_ != MAP_FAILED) {
-        munmap(mmap_data_, mmap_size_);
+namespace {
+
+struct FileMap {
+    void* data;
+    size_t size;
+};
+
+#ifdef _WIN32
+FileMap map_file_readonly(const std::string& path) {
+    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE)
+        throw std::runtime_error("Failed to open bin file: " + path);
+    LARGE_INTEGER length;
+    if (!GetFileSizeEx(file, &length)) {
+        CloseHandle(file);
+        throw std::runtime_error("Failed to stat bin file: " + path);
     }
+    HANDLE mapping = CreateFileMappingA(file, nullptr, PAGE_READONLY, 0, 0, nullptr);
+    CloseHandle(file);
+    if (!mapping) throw std::runtime_error("CreateFileMapping failed: " + path);
+    void* view = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CloseHandle(mapping);
+    if (!view) throw std::runtime_error("MapViewOfFile failed: " + path);
+    return {view, static_cast<size_t>(length.QuadPart)};
+}
+#else
+FileMap map_file_readonly(const std::string& path) {
+    int fd = open(path.c_str(), O_RDONLY);
+    if (fd == -1) throw std::runtime_error("Failed to open bin file: " + path);
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        close(fd);
+        throw std::runtime_error("Failed to stat bin file: " + path);
+    }
+    void* data = mmap(nullptr, static_cast<size_t>(st.st_size), PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (data == MAP_FAILED) throw std::runtime_error("mmap failed: " + path);
+    return {data, static_cast<size_t>(st.st_size)};
+}
+#endif
+
+void unmap_file(void* data, size_t size) {
+#ifdef _WIN32
+    (void)size;
+    UnmapViewOfFile(data);
+#else
+    munmap(data, size);
+#endif
+}
+
+} // namespace
+
+Tokenizer::~Tokenizer() {
+    if (mmap_data_) unmap_file(mmap_data_, mmap_size_);
 }
 
 namespace {
@@ -435,16 +491,9 @@ std::string read_len_str(const uint8_t*& ptr, const uint8_t* end, const char* ct
 } // namespace
 
 void Tokenizer::load(const std::string& bin_path) {
-    int fd = open(bin_path.c_str(), O_RDONLY);
-    if (fd == -1) throw std::runtime_error("Failed to open bin file: " + bin_path);
-
-    struct stat st;
-    fstat(fd, &st);
-    mmap_size_ = st.st_size;
-
-    mmap_data_ = mmap(nullptr, mmap_size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    close(fd);
-    if (mmap_data_ == MAP_FAILED) throw std::runtime_error("mmap failed");
+    const FileMap mapped = map_file_readonly(bin_path);
+    mmap_data_ = mapped.data;
+    mmap_size_ = mapped.size;
 
     const uint8_t* ptr = static_cast<const uint8_t*>(mmap_data_);
     const uint8_t* end = ptr + mmap_size_;

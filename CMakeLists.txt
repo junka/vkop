@@ -97,6 +97,9 @@ if(MSVC)
 # a trailing multibyte comment byte can swallow the newline and shift the
 # parser, which surfaces as bogus "missing type specifier" errors.
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /Od /Zi /W3 /fp:fast /utf-8 /bigobj")
+# /FS: /MP spawns several cl.exe per project that all write the same .pdb;
+# without it every incremental rebuild loses the race (error C1041).
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /FS")
 else()
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O0 -g -Wall -Wextra -Werror -fno-omit-frame-pointer ${FP16_CXX_FLAGS}")
 if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
@@ -732,7 +735,11 @@ if (ENABLE_LLM_CHAT)
             target_include_directories(llm_chat PRIVATE /opt/homebrew/include)
         endif()
     endif()
-    target_link_libraries(llm_chat PRIVATE utf8proc)
+    # MSVC 下 tokenizer 目标已经把 utf8proc.lib 的绝对路径 PUBLIC 传下来，再链一次
+    # 裸名字只会在链接期报 LNK1181（Windows 没有系统 utf8proc 搜索路径）。
+    if(NOT MSVC)
+        target_link_libraries(llm_chat PRIVATE utf8proc)
+    endif()
 
     # Visual encoder probe: runs visual.vkopbin standalone to verify the visual
     # graph (incl. the patch_embed Conv3D) produces ORT-aligned outputs.
