@@ -196,6 +196,31 @@ class BufferBinaryFactory : public BufferFactory {
         m_cmd_->dispatch(1, 1, 1);
     }
 
+    // Debug observation (VKOP_INDIRECT_DEBUG): read back the 16 B
+    // VkDispatchIndirectCommand the pre-pass wrote, so a test/driver can
+    // verify the grid actually came from the GPU (dispatch_from_shape) rather
+    // than a CPU fallback. Caller must have already submitted AND completed
+    // the commands that ran the pre-pass (queue order makes the copy below
+    // observe the barriered shader write). An explicit synchronous readback —
+    // the hot path never touches the host.
+    std::vector<uint32_t> debug_indirect_grid() override {
+        if (!indirect_buf_)
+            return {};
+        auto stage = std::make_shared<VulkanBuffer>(
+            m_dev_, 16, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        VulkanCommandBuffer cmd(m_cmdpool_);
+        indirect_buf_->copyBufferToStageBuffer(cmd.get(), stage->getBuffer(),
+                                               /*dstoffset=*/0, /*size=*/16,
+                                               /*offset=*/0);
+        std::vector<VkSubmitInfo> info{cmd.buildSubmitInfo()};
+        VulkanCommandBuffer::submit(m_dev_->getComputeQueue(), info);
+        cmd.wait();
+        auto *p = static_cast<uint32_t *>(stage->getMappedMemory());
+        return {p[0], p[1], p[2]};
+    }
+
     // The pre-pass pipeline's own descriptor state — separate from pipeline_'s
     // types_/writes_/m_ds_ because the pre-pass layout has 2 bindings, not the
     // main kernel's 6 (they cannot share fillWriteDescriptorSets, which is

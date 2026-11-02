@@ -360,6 +360,15 @@ class Operator {
     virtual std::string route_tag() const { return std::string(); }
     virtual std::string route_info() const { return std::string(); }
 
+    // Debug observation for the indirect-dispatch pre-pass (VKOP_INDIRECT_
+    // DEBUG): read back the 16 B VkDispatchIndirectCommand the op's
+    // dispatch_from_shape pre-pass wrote into its dedicated indirect buffer,
+    // so a test/driver can verify the dispatch grid really came from the GPU.
+    // Must be called after the recorded commands were submitted AND completed
+    // (it records its own one-shot copy+submit). Empty for ops without a
+    // pre-pass. Explicit synchronous readback — the hot path never does this.
+    virtual std::vector<uint32_t> debug_indirect_grid() { return {}; }
+
   protected:
     std::shared_ptr<VulkanDevice> m_dev_;
     std::shared_ptr<VulkanCommandPool> m_cmdpool_;

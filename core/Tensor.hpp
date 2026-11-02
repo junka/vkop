@@ -219,6 +219,46 @@ class ITensor {
         return on;
     }
 
+    // --- readback accounting ------------------------------------------------
+    // copyToCPU has three exits and only one of them is a real GPU->CPU copy;
+    // the pre_readback_hook (rbprof) only sees that one, so the cached exits
+    // are invisible to it. VKOP_RB_AUDIT=1 makes the split observable: the
+    // two early-return buckets are readback SITES that stay free only while
+    // the host copy happens to be current (host_authoritative_ initializers /
+    // host_copy_valid_ driver-filled inputs) — the cache-masked population
+    // Phase 4 wants to retire structurally.
+    struct ReadbackAudit {
+        uint64_t early_authoritative = 0; // host_authoritative_ short-circuit
+        uint64_t early_copy_valid = 0;    // host_copy_valid_ short-circuit
+        uint64_t no_vkobj = 0;            // never uploaded; nothing to copy
+        uint64_t real_copies = 0;         // reached the sync copy (rbprof sees)
+    };
+
+    static ReadbackAudit &readback_audit() {
+        static ReadbackAudit audit;
+        static const bool report = [] {
+            if (std::getenv("VKOP_RB_AUDIT") == nullptr)
+                return false;
+            static bool registered = false;
+            if (!registered) {
+                registered = true;
+                std::atexit([] {
+                    const auto &a = readback_audit();
+                    std::printf(
+                        "[rbaudit] early_authoritative=%llu "
+                        "early_copy_valid=%llu no_vkobj=%llu real_copies=%llu\n",
+                        (unsigned long long)a.early_authoritative,
+                        (unsigned long long)a.early_copy_valid,
+                        (unsigned long long)a.no_vkobj,
+                        (unsigned long long)a.real_copies);
+                });
+            }
+            return true;
+        }();
+        (void)report;
+        return audit;
+    }
+
     // Pure-logical reshape: reset dims_/n_dims_ to `shape` WITHOUT touching the
     // underlying storage (vkobj_ GPU buffer or CPU data_). Safe only when
     // product(shape) == num_elements() — i.e. the new view has the same element
@@ -1276,6 +1316,11 @@ template <typename T> class Tensor : public ITensor {
         // force (~0.3ms submit) plus the copy's own submit+wait
         // (~1ms) — the dominant prefill cost (219 of 581 readbacks/round).
         if (host_authoritative_ || host_copy_valid_) {
+            auto &a = readback_audit();
+            if (host_authoritative_)
+                a.early_authoritative++;
+            else
+                a.early_copy_valid++;
             reserveOnCPU();
             return;
         }
@@ -1287,6 +1332,7 @@ template <typename T> class Tensor : public ITensor {
             if (!is_on_GPU()) {
                 printf("not on GPU\n");
             }
+            readback_audit().no_vkobj++;
             reserveOnCPU();
             return;
         }
@@ -1300,6 +1346,7 @@ template <typename T> class Tensor : public ITensor {
         if (VulkanCommandBuffer::pre_readback_hook)
             VulkanCommandBuffer::pre_readback_hook(
                 static_cast<core::ITensor &>(*this));
+        readback_audit().real_copies++;
         reserveOnCPU();
         if (vkobj_->getResourceType() == ResourceType::VK_IMAGE) {
             copyImageToCPU(cmdpool);

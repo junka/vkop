@@ -109,6 +109,11 @@ class PimplFacade : public Operator {
     // execute(), so the façade must read it there.
     std::string route_tag() const override { return impl_->route_tag(); }
     std::string route_info() const override { return impl_->route_info(); }
+    // Same forwarding trap as dump_fingerprint: the indirect buffer lives in
+    // impl_, so a façade-level call without this would silently read nothing.
+    std::vector<uint32_t> debug_indirect_grid() override {
+        return impl_->debug_indirect_grid();
+    }
 
   protected:
     std::unique_ptr<Operator> impl_;
