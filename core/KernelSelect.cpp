@@ -375,11 +375,18 @@ const MatmulRule kMatmulRules[] = {
     // 2. W8A8 SINT8 MMA, opt-in: the MMA saves no weight bandwidth and loses
     //    to the weight-only GEMV at decode.
     {MatmulRoute::kCoopmatI8, "coopmat_i8", coopmat_i8_applies, nullptr},
-    // 3. fp16 cooperative matrix. Pre-empts tiled/ksplit, but the epilogue
+    // 3. SwiGLU down fold: a different module and a different shape mapping,
+    //    so it must pre-empt coopmat. A folded node's MatMul carries Wg/Wu as
+    //    bindings 7/8 and its result is silu(x.Wg)*(x.Wu) . Wd -- the coopmat
+    //    descriptor layout has neither the bindings nor the epilogue, so
+    //    letting it win here computes a plain down GEMM at a folded node and
+    //    returns silently wrong logits. That only bites once the shape is
+    //    large enough for coopmat to apply (M >= the tile minimum) -- at
+    //    M <= 8 the table fell through to here by accident and was right.
+    {MatmulRoute::kDownActFold, "down_act_gemv", down_act_applies, nullptr},
+    // 4. fp16 cooperative matrix. Pre-empts tiled/ksplit, but the epilogue
     //    bias has no binding in its descriptor layout.
     {MatmulRoute::kCoopmat, "coopmat", coopmat_applies, nullptr},
-    // 4. SwiGLU down fold: a different module and a different shape mapping.
-    {MatmulRoute::kDownActFold, "down_act_gemv", down_act_applies, nullptr},
     // 5. The shared-memory tile, split across K when the grid is too shallow.
     {MatmulRoute::kTiledKs, "tiled_ks", tiled_ks_applies, nullptr},
     {MatmulRoute::kTiled, "tiled", tiled_applies, nullptr},

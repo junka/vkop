@@ -1,0 +1,606 @@
+// Copyright 2025 @junka
+//
+// SwiGLU down-projection fold, K-split form (3-pass).
+//
+//   out = (silu(x . Wg) * (x . Wu)) . Wd
+//
+// fuse_swiglu_down_proj rewrites
+//     down = MatMul(Mul(Mul(gate, Sigmoid(gate)), up), Wd)
+//     gate = MatMul(x, Wg),  up = MatMul(x, Wu)
+// into one MatMul with inputs [x, Wd, Wg, Wu] and the down_act flag, deleting
+// the gate and up nodes.
+//
+// WHAT THE FOLD IS FOR: the M x N_up activation never reaches memory. gate and
+// up are contracted by the workgroup that consumes them, so the two up GEMMs'
+// output traffic and their elementwise glue disappear.
+//
+// WHY THREE PASSES: the up half is K-split (96 blocks at M=1 where the
+// column-partitioned form had 12 -- its problem was never bandwidth, the
+// blocks' column slices are disjoint, it was occupancy). The down half walks
+// Wd with the finished silu(g)*u in shared, one block per 512-j slice and
+// 16-row tile -- the old form's proven stage-2 shape, which reads every Wd
+// byte once per LAYER (16 rows share the block's Wd slice) instead of once per
+// row. A one-block-per-row fold would re-read Wd M times: 378 MB per layer at
+// M=15, and 25 MB through a single block at M=1. Both are unacceptable.
+//
+//   deposit  grid(x = GX = ceil(N_up/512), y = batch*ceil(M/16), z = ks_n)
+//            A lane owns up column j for K slice k0..stop, accumulates gate and
+//            up in registers over its slice only, and parks BOTH as raw fp32
+//            partials -- silu is nonlinear in the contraction, so folding a
+//            per-slice silu(g_s)*u_s would drop every cross term g_s*u_t.
+//   down     grid(x = GX, y = batch*ceil(M/16), z = ds)
+//            Sums the ks_n gate/up partials per (row, j), applies ONE silu to
+//            the reassembled gate, stages h in shared, walks the sub-block's
+//            Wd j-slice for all N columns and 16 rows, and stores fp32 down
+//            partials keyed by (row, gx*ds+z, column). The j contraction is
+//            split into ds sub-blocks (uPC.tile): 512 serial FMAs per lane is
+//            latency, not bandwidth -- at M=1 the unsplit form ran Wd at half
+//            the plain ksplit GEMV's rate.
+//   reduce   grid(x = ceil(N/2048), y = batch*M)
+//            Sums the GX down partials per (row, column), stores fp16.
+//
+// Scratch layout (fp32 words): header [0..KS_HDR + 2*ks_n), gate partials
+// [row][gx][slice][j&511] (512 words per slot group), the up partials in a
+// second identical region, then the down partials [row][gx][column]. Slice
+// bounds come from the scratch header the host stages (the tiled_ks
+// convention), so the deposit's range and the down pass's range cannot
+// disagree.
+//
+// Shape mapping is NOT the plain MatMul's: this node's k is K_out, the UP
+// GEMM's contraction. uPC.K carries N_up (the down GEMM's contraction),
+// uPC.K_act carries K_out (x's columns). Wg/Wu are row-major [K_out, N_up]
+// fp16, Wd is row-major [N_up, N] fp16, uPC.mind_k carries GX.
+//
+// Bindings: 0 output, 1 x, 2 Wd, 3 scratch, 7 Wg, 8 Wu.
+
+#version 450
+#extension GL_EXT_shader_16bit_storage : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+
+#define DA_MT 16
+
+layout(local_size_x = 32, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InB {
+    uint data[];
+} uInputB;
+layout(set = 0, binding = 2) readonly buffer InB4 {
+    uvec4 data4[];
+} uWd4;
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+layout(set = 0, binding = 7) readonly buffer InB2 {
+    uint data[];
+} uInputB2;
+layout(set = 0, binding = 7) readonly buffer InB2W {
+    uvec4 data4[];
+} uWg4;
+layout(set = 0, binding = 8) readonly buffer InAct {
+    uint data[];
+} uInputAct;
+layout(set = 0, binding = 8) readonly buffer InActW {
+    uvec4 data4[];
+} uWu4;
+
+// Field-for-field copy of matmul::GpuMatMulParam (ops/Matmul.hpp). The order
+// must match exactly -- a shifted field silently reinterprets every constant
+// after it, which is how the coop modules once misread b_shared.
+layout(push_constant) uniform PC {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int fp32;
+    int transB;
+    int tile;
+    int weight_int8;
+    int w8_quad;
+    int ksplit;
+    int ksplit_q;
+    int w4;
+    int nf4;
+    int group;
+    int fp8;
+    int e5m2;
+    int nvfp4;
+    int uint4;
+    int wide;
+    int rep;
+    int rep_stride;
+    int a_dim;
+    int b_dim;
+    float epi_scale;
+    int epi_bias;
+    int K_act;
+    int mind_k;
+    int epi_bias_batch;
+    int attn_softmax;
+    int b_shared;
+    int ks_part;
+} uPC;
+
+// Scratch header: [0] debug, [1] ks_n, [2] k0, [3] kstop, [4 .. 4+2*ks_n) the
+// (lo, hi) table tiling [0, K_act), then the h partials, then the down
+// partials.
+#define KS_HDR 4
+
+int ks_n() { return max(int(uScratch.data[1]), 1); }
+int ks_lo(int s) { return int(uScratch.data[KS_HDR + 2 * s]); }
+int ks_hi(int s) { return int(uScratch.data[KS_HDR + 2 * s + 1]); }
+
+// Up-half partials are indexed [row][gx][slice][j & 511], one fp32 for the
+// gate and one for the up accumulator, with GX column blocks interleaved
+// between them. The last axis is the block-local up column (j - gx*512), so
+// the stride is 512 words -- NOT uPC.N: the stored value is keyed by the UP
+// axis, whose length N_up exceeds N whenever the down GEMM narrows. (A uPC.N
+// stride here let j run to 6143 over a 2048-word slot, overwriting every
+// later row's partials.) Both stores are RAW slice sums: silu is nonlinear
+// in the full contraction, so a per-slice silu(g_s)*u_s would drop every
+// cross term g_s*u_t (s != t); the down pass sums the slices first and
+// applies silu to the reassembled gate only.
+int da_gp_off() { return KS_HDR + 2 * ks_n(); }
+int da_gp(int row, int gx, int s, int jb) {
+    return da_gp_off() + ((row * uPC.mind_k + gx) * ks_n() + s) * 512 + jb;
+}
+int da_up_off() { return da_gp_off() + uPC.batch * uPC.M * uPC.mind_k * ks_n() * 512; }
+int da_up(int row, int gx, int s, int jb) {
+    return da_up_off() + ((row * uPC.mind_k + gx) * ks_n() + s) * 512 + jb;
+}
+// Down partials follow the up-half partials: [row][gx*ds + z][column]. The
+// down pass subdivides its j contraction into ds sub-blocks (the ksplit GEMV's
+// chain-shortening trick: 512 serial FMAs per lane is latency, not bandwidth) --
+// ds rides the otherwise-unused uPC.tile field, and the reduce sums
+// mind_k * ds slots.
+int da_ds() { return max(uPC.tile, 1); }
+int da_dp_off() { return da_up_off() + uPC.batch * uPC.M * uPC.mind_k * ks_n() * 512; }
+int da_dp(int row, int gxs, int c) {
+    return da_dp_off() + (row * (uPC.mind_k * da_ds()) + gxs) * uPC.N + c;
+}
+
+float da_x(int a_off, int k) {
+    int idx = a_off + k;
+    vec2 v = unpackHalf2x16(uInputA.data[idx >> 1]);
+    return (idx & 1) != 0 ? v.y : v.x;
+}
+
+// Wg/Wu are row-major [K_out][N_up] fp16: two columns share one uint.
+float da_wg(int b, int j, int k) {
+    uint w = uInputB2.data[(b * uPC.K_act + k) * (uPC.K >> 1) + (j >> 1)];
+    vec2 v = unpackHalf2x16(w);
+    return (j & 1) != 0 ? v.y : v.x;
+}
+
+float da_wu(int b, int j, int k) {
+    uint w = uInputAct.data[(b * uPC.K_act + k) * (uPC.K >> 1) + (j >> 1)];
+    vec2 v = unpackHalf2x16(w);
+    return (j & 1) != 0 ? v.y : v.x;
+}
+
+// Wd is row-major [N_up][N] fp16: four columns per two words.
+vec4 da_wd(int b, int j, int c) {
+    int w = ((b * uPC.K + j) * uPC.N + c) >> 1;
+    return vec4(unpackHalf2x16(uInputB.data[w]),
+                unpackHalf2x16(uInputB.data[w + 1]));
+}
+
+// Wide deposit (M==1): the scalar form's one-word-per-matrix loads are the
+// non-wide ksplit GEMV disease -- it measured 13.5-19.7 GB/s where the wide
+// form reaches the DRAM roof, and the deposit held ~44 GB/s in the paired
+// pass-split probe while the plain GEMVs ran 66-68. Same coverage, same
+// scratch contract: the block's 512 lanes split as ks_n K slices (lane/64)
+// x 64 octets, each lane owning 8 contiguous up columns; one uvec4 weight
+// load per k per matrix, eight k's issued per trip before any is consumed.
+// Requires ks_n <= 8 (lane budget) and N_up % 8 == 0 (octet alignment);
+// anything else keeps the scalar form.
+void da_deposit_wide(int b_n, int tile, int gx, int lane) {
+    int s = lane / 64;
+    if (s >= ks_n()) return;
+    int jb0 = (lane % 64) * 8; // block-local up column, octet aligned
+    int kw = uPC.K;            // N_up
+    int kx = uPC.K_act;        // K_out
+    int row = b_n * uPC.M + tile * DA_MT;
+    int j = gx * 512 + jb0;
+    int a_off = row * kx;
+    vec4 g0 = vec4(0.0);
+    vec4 g1 = vec4(0.0);
+    vec4 u0 = vec4(0.0);
+    vec4 u1 = vec4(0.0);
+    if (j < kw) {
+        int wrow = b_n * kx; // Wg/Wu row base for this batch slice
+        int k = ks_lo(s);
+        int hi = ks_hi(s);
+        for (; k + 7 < hi; k += 8) {
+            uvec4 n0 = uWg4.data4[(wrow * kw + (k + 0) * kw + j) >> 3];
+            uvec4 n1 = uWg4.data4[(wrow * kw + (k + 1) * kw + j) >> 3];
+            uvec4 n2 = uWg4.data4[(wrow * kw + (k + 2) * kw + j) >> 3];
+            uvec4 n3 = uWg4.data4[(wrow * kw + (k + 3) * kw + j) >> 3];
+            uvec4 n4 = uWg4.data4[(wrow * kw + (k + 4) * kw + j) >> 3];
+            uvec4 n5 = uWg4.data4[(wrow * kw + (k + 5) * kw + j) >> 3];
+            uvec4 n6 = uWg4.data4[(wrow * kw + (k + 6) * kw + j) >> 3];
+            uvec4 n7 = uWg4.data4[(wrow * kw + (k + 7) * kw + j) >> 3];
+            uvec4 m0 = uWu4.data4[(wrow * kw + (k + 0) * kw + j) >> 3];
+            uvec4 m1 = uWu4.data4[(wrow * kw + (k + 1) * kw + j) >> 3];
+            uvec4 m2 = uWu4.data4[(wrow * kw + (k + 2) * kw + j) >> 3];
+            uvec4 m3 = uWu4.data4[(wrow * kw + (k + 3) * kw + j) >> 3];
+            uvec4 m4 = uWu4.data4[(wrow * kw + (k + 4) * kw + j) >> 3];
+            uvec4 m5 = uWu4.data4[(wrow * kw + (k + 5) * kw + j) >> 3];
+            uvec4 m6 = uWu4.data4[(wrow * kw + (k + 6) * kw + j) >> 3];
+            uvec4 m7 = uWu4.data4[(wrow * kw + (k + 7) * kw + j) >> 3];
+            vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
+            vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+            g0 += a0.x * vec4(unpackHalf2x16(n0.x), unpackHalf2x16(n0.y)) +
+                  a0.y * vec4(unpackHalf2x16(n1.x), unpackHalf2x16(n1.y)) +
+                  a1.x * vec4(unpackHalf2x16(n2.x), unpackHalf2x16(n2.y)) +
+                  a1.y * vec4(unpackHalf2x16(n3.x), unpackHalf2x16(n3.y)) +
+                  a2.x * vec4(unpackHalf2x16(n4.x), unpackHalf2x16(n4.y)) +
+                  a2.y * vec4(unpackHalf2x16(n5.x), unpackHalf2x16(n5.y)) +
+                  a3.x * vec4(unpackHalf2x16(n6.x), unpackHalf2x16(n6.y)) +
+                  a3.y * vec4(unpackHalf2x16(n7.x), unpackHalf2x16(n7.y));
+            g1 += a0.x * vec4(unpackHalf2x16(n0.z), unpackHalf2x16(n0.w)) +
+                  a0.y * vec4(unpackHalf2x16(n1.z), unpackHalf2x16(n1.w)) +
+                  a1.x * vec4(unpackHalf2x16(n2.z), unpackHalf2x16(n2.w)) +
+                  a1.y * vec4(unpackHalf2x16(n3.z), unpackHalf2x16(n3.w)) +
+                  a2.x * vec4(unpackHalf2x16(n4.z), unpackHalf2x16(n4.w)) +
+                  a2.y * vec4(unpackHalf2x16(n5.z), unpackHalf2x16(n5.w)) +
+                  a3.x * vec4(unpackHalf2x16(n6.z), unpackHalf2x16(n6.w)) +
+                  a3.y * vec4(unpackHalf2x16(n7.z), unpackHalf2x16(n7.w));
+            u0 += a0.x * vec4(unpackHalf2x16(m0.x), unpackHalf2x16(m0.y)) +
+                  a0.y * vec4(unpackHalf2x16(m1.x), unpackHalf2x16(m1.y)) +
+                  a1.x * vec4(unpackHalf2x16(m2.x), unpackHalf2x16(m2.y)) +
+                  a1.y * vec4(unpackHalf2x16(m3.x), unpackHalf2x16(m3.y)) +
+                  a2.x * vec4(unpackHalf2x16(m4.x), unpackHalf2x16(m4.y)) +
+                  a2.y * vec4(unpackHalf2x16(m5.x), unpackHalf2x16(m5.y)) +
+                  a3.x * vec4(unpackHalf2x16(m6.x), unpackHalf2x16(m6.y)) +
+                  a3.y * vec4(unpackHalf2x16(m7.x), unpackHalf2x16(m7.y));
+            u1 += a0.x * vec4(unpackHalf2x16(m0.z), unpackHalf2x16(m0.w)) +
+                  a0.y * vec4(unpackHalf2x16(m1.z), unpackHalf2x16(m1.w)) +
+                  a1.x * vec4(unpackHalf2x16(m2.z), unpackHalf2x16(m2.w)) +
+                  a1.y * vec4(unpackHalf2x16(m3.z), unpackHalf2x16(m3.w)) +
+                  a2.x * vec4(unpackHalf2x16(m4.z), unpackHalf2x16(m4.w)) +
+                  a2.y * vec4(unpackHalf2x16(m5.z), unpackHalf2x16(m5.w)) +
+                  a3.x * vec4(unpackHalf2x16(m6.z), unpackHalf2x16(m6.w)) +
+                  a3.y * vec4(unpackHalf2x16(m7.z), unpackHalf2x16(m7.w));
+        }
+        for (; k < hi; ++k) {
+            uvec4 n = uWg4.data4[(wrow * kw + k * kw + j) >> 3];
+            uvec4 m = uWu4.data4[(wrow * kw + k * kw + j) >> 3];
+            float xv = da_x(a_off, k);
+            vec4 wgv = vec4(unpackHalf2x16(n.x), unpackHalf2x16(n.y));
+            vec4 wgw = vec4(unpackHalf2x16(n.z), unpackHalf2x16(n.w));
+            vec4 wuv = vec4(unpackHalf2x16(m.x), unpackHalf2x16(m.y));
+            vec4 wuw = vec4(unpackHalf2x16(m.z), unpackHalf2x16(m.w));
+            g0 += xv * wgv;
+            g1 += xv * wgw;
+            u0 += xv * wuv;
+            u1 += xv * wuw;
+        }
+    }
+    int base = da_gp(row, gx, s, jb0);
+    uScratch.data[base + 0] = floatBitsToUint(j < kw ? g0.x : 0.0);
+    uScratch.data[base + 1] = floatBitsToUint(j < kw ? g0.y : 0.0);
+    uScratch.data[base + 2] = floatBitsToUint(j < kw ? g0.z : 0.0);
+    uScratch.data[base + 3] = floatBitsToUint(j < kw ? g0.w : 0.0);
+    uScratch.data[base + 4] = floatBitsToUint(j < kw ? g1.x : 0.0);
+    uScratch.data[base + 5] = floatBitsToUint(j < kw ? g1.y : 0.0);
+    uScratch.data[base + 6] = floatBitsToUint(j < kw ? g1.z : 0.0);
+    uScratch.data[base + 7] = floatBitsToUint(j < kw ? g1.w : 0.0);
+    int ubase = da_up(row, gx, s, jb0);
+    uScratch.data[ubase + 0] = floatBitsToUint(j < kw ? u0.x : 0.0);
+    uScratch.data[ubase + 1] = floatBitsToUint(j < kw ? u0.y : 0.0);
+    uScratch.data[ubase + 2] = floatBitsToUint(j < kw ? u0.z : 0.0);
+    uScratch.data[ubase + 3] = floatBitsToUint(j < kw ? u0.w : 0.0);
+    uScratch.data[ubase + 4] = floatBitsToUint(j < kw ? u1.x : 0.0);
+    uScratch.data[ubase + 5] = floatBitsToUint(j < kw ? u1.y : 0.0);
+    uScratch.data[ubase + 6] = floatBitsToUint(j < kw ? u1.z : 0.0);
+    uScratch.data[ubase + 7] = floatBitsToUint(j < kw ? u1.w : 0.0);
+}
+
+// Deposit: this block owns K slice s of its 512 up columns and its 16-row tile.
+// It walks only its slice, so every Wg/Wu byte is read once across the grid:
+// the (gx, s) grid covers [N_up] x [K_out] exactly once per row.
+//
+// Grid: x = gx, y = b_n*rt + tile, z = s. The three axes are not
+// interchangeable -- swapping y/z silently reads another batch slice's rows
+// whenever batch > 1.
+void da_deposit() {
+    int z = int(gl_WorkGroupID.y);
+    int rt = (uPC.M + DA_MT - 1) / DA_MT;
+    int b_n = z / rt;
+    int tile = z - b_n * rt;
+    if (b_n >= uPC.batch) return;
+    int gx = int(gl_WorkGroupID.x);
+    int lane = int(gl_LocalInvocationID.y) * 32 + int(gl_LocalInvocationID.x);
+    // Wide deposit at M==1: the ks_n slices map into the block's lanes
+    // (lane/64), each lane owning an octet of up columns. Falls back to the
+    // scalar multi-slice form whenever the lane budget or octet alignment
+    // does not hold.
+    if (uPC.M == 1 && (uPC.K & 7) == 0 && ks_n() <= 8 && 512 % ks_n() == 0) {
+        da_deposit_wide(b_n, tile, gx, lane);
+        return;
+    }
+    int s = int(gl_WorkGroupID.z);
+    int j = gx * 512 + lane;
+    int kw = uPC.K;     // N_up
+    int kx = uPC.K_act; // K_out
+    int mt = min(DA_MT, uPC.M - tile * DA_MT);
+    int lo = ks_lo(s);
+    int hi = ks_hi(s);
+    for (int r = 0; r < DA_MT; ++r) {
+        if (r >= mt) break;
+        float gr = 0.0;
+        float ur = 0.0;
+        if (j < kw) {
+            int a_off = (b_n * uPC.M + tile * DA_MT + r) * kx;
+            int k = lo;
+            for (; k + 7 < hi; k += 8) {
+                float x0 = da_x(a_off, k + 0);
+                float x1 = da_x(a_off, k + 1);
+                float x2 = da_x(a_off, k + 2);
+                float x3 = da_x(a_off, k + 3);
+                float x4 = da_x(a_off, k + 4);
+                float x5 = da_x(a_off, k + 5);
+                float x6 = da_x(a_off, k + 6);
+                float x7 = da_x(a_off, k + 7);
+                gr += x0 * da_wg(b_n, j, k + 0) + x1 * da_wg(b_n, j, k + 1) +
+                      x2 * da_wg(b_n, j, k + 2) + x3 * da_wg(b_n, j, k + 3) +
+                      x4 * da_wg(b_n, j, k + 4) + x5 * da_wg(b_n, j, k + 5) +
+                      x6 * da_wg(b_n, j, k + 6) + x7 * da_wg(b_n, j, k + 7);
+                ur += x0 * da_wu(b_n, j, k + 0) + x1 * da_wu(b_n, j, k + 1) +
+                      x2 * da_wu(b_n, j, k + 2) + x3 * da_wu(b_n, j, k + 3) +
+                      x4 * da_wu(b_n, j, k + 4) + x5 * da_wu(b_n, j, k + 5) +
+                      x6 * da_wu(b_n, j, k + 6) + x7 * da_wu(b_n, j, k + 7);
+            }
+            for (; k < hi; ++k) {
+                float xv = da_x(a_off, k);
+                gr += xv * da_wg(b_n, j, k);
+                ur += xv * da_wu(b_n, j, k);
+            }
+        }
+        // Every (row, gx, slice, lane) slot the down pass reads is written:
+        // dead lanes (j >= kw) stage zeros so the tail block's h is exact.
+        // RAW partials -- the silu waits for the reassembled gate.
+        int row = b_n * uPC.M + tile * DA_MT + r;
+        uScratch.data[da_gp(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? gr : 0.0);
+        uScratch.data[da_up(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? ur : 0.0);
+    }
+}
+
+// Down pass: the old stage-2 shape. The block (gx, row tile) reassembles
+// silu(g)*u for its 512 up columns from the ks_n gate/up partials, then
+// walks its Wd j-slice across ALL N columns; the 16 rows share each Wd load.
+// Wd is read once per layer across the grid.
+shared float da_h[DA_MT * 512];
+
+void da_down() {
+    int zy = int(gl_WorkGroupID.y);
+    int rt = (uPC.M + DA_MT - 1) / DA_MT;
+    int b_n = zy / rt;
+    int tile = zy - b_n * rt;
+    if (b_n >= uPC.batch) return;
+    int gx = int(gl_WorkGroupID.x);
+    int sub = int(gl_WorkGroupID.z);
+    int ds = da_ds();
+    int lane = int(gl_LocalInvocationID.y) * 32 + int(gl_LocalInvocationID.x);
+    int sw = 512 / ds;                  // sub-block width on the up axis
+    int hb0 = sub * sw;                 // this sub's base in block-local j
+    int j0 = gx * 512 + hb0;
+    int kw = uPC.K; // N_up
+    int mt = min(DA_MT, uPC.M - tile * DA_MT);
+    int ns = ks_n();
+    // Assemble this sub-block's h slice: lanes < sw sum the ks_n gate and up
+    // partials of block-local column hb0+lane, then apply silu to the
+    // reassembled gate -- one silu per contraction, exactly like the unfused
+    // path. Lanes past sw stage nothing (the walk reads only this slice) but
+    // still reach the barrier. Rows past the tile's live count stage zeros.
+    for (int r = 0; r < DA_MT; ++r) {
+        float g = 0.0;
+        float u = 0.0;
+        if (r < mt && lane < sw) {
+            int row = b_n * uPC.M + tile * DA_MT + r;
+            for (int s = 0; s < ns; ++s) {
+                g += uintBitsToFloat(uScratch.data[da_gp(row, gx, s, hb0 + lane)]);
+                u += uintBitsToFloat(uScratch.data[da_up(row, gx, s, hb0 + lane)]);
+            }
+            da_h[r * 512 + hb0 + lane] = g / (1.0 + exp(-g)) * u;
+        }
+    }
+    barrier();
+    // The down walk over this sub's sw j's; the lane owns output columns
+    // c0..c0+3 (2048-strided); Wd[jj][c] loads once and feeds all 16 rows from
+    // shared, so the row axis rides free on each load. An empty j range (a
+    // sub-block past kw) leaves acc at zero and the stores still land, so
+    // every dp slot the reduce reads is written.
+    int jend = min(j0 + sw, kw);
+    int gxs = gx * ds + sub;
+    // Single-live-row fast path (decode m=1, or a tile's lone tail row). The
+    // generic walk below always runs all DA_MT rows because its acc[r][4]
+    // array needs the constant trip count to stay in registers -- but at
+    // mt==1 the assembly wrote only row 0, so 15/16 of those FMAs and shared
+    // reads multiply garbage into accumulators that are never stored. This
+    // path keeps the walk's exact shape (same Wd loads, same coalescing,
+    // same dp slots) with 4 accumulators and one shared read per jj. It
+    // reads only the [hb0, hb0+sw) h range its sub-block assembled, so it
+    // is ds-general: with the j sub-split live, each sub still finds its
+    // own slice staged.
+    if (mt == 1) {
+        if ((uPC.N & 7) == 0) {
+            // WIDE down walk (N % 8 == 0, ds == 1): N/8 column octets; the
+            // block's lane pair per octet splits it into low/high 4-column
+            // halves. Both lanes of a pair issue the same uvec4 Wd load per
+            // j (coalesces to one 16B transaction) and each keeps 4
+            // own-column accumulators, so no cross-lane combine is needed
+            // and the dp layout stays ds=1. Eight j's are issued per trip
+            // before any is consumed -- the shape that took the deposit
+            // from 44 to 62 GB/s; the scalar-4 walk below (two 4B loads
+            // per j, load-FMA dependency per iteration) held the walk at
+            // 36.
+            const int hsel = lane & 1;
+            for (int cbase = 0; cbase < uPC.N; cbase += 2048) {
+                const int c0 = cbase + (lane >> 1) * 8;
+                if (c0 >= uPC.N) break;
+                float a0 = 0.0;
+                float a1 = 0.0;
+                float a2 = 0.0;
+                float a3 = 0.0;
+                int j8 = j0 + (((jend - j0) >> 3) << 3);
+                int jj = j0;
+                for (; jj < j8; jj += 8) {
+                    int rbase = ((b_n * kw + jj) * uPC.N + c0) >> 3;
+                    int step = uPC.N >> 3;
+                    uvec4 n0 = uWd4.data4[rbase];
+                    uvec4 n1 = uWd4.data4[rbase + step];
+                    uvec4 n2 = uWd4.data4[rbase + 2 * step];
+                    uvec4 n3 = uWd4.data4[rbase + 3 * step];
+                    uvec4 n4 = uWd4.data4[rbase + 4 * step];
+                    uvec4 n5 = uWd4.data4[rbase + 5 * step];
+                    uvec4 n6 = uWd4.data4[rbase + 6 * step];
+                    uvec4 n7 = uWd4.data4[rbase + 7 * step];
+                    float h0 = da_h[jj - gx * 512];
+                    float h1 = da_h[jj + 1 - gx * 512];
+                    float h2 = da_h[jj + 2 - gx * 512];
+                    float h3 = da_h[jj + 3 - gx * 512];
+                    float h4 = da_h[jj + 4 - gx * 512];
+                    float h5 = da_h[jj + 5 - gx * 512];
+                    float h6 = da_h[jj + 6 - gx * 512];
+                    float h7 = da_h[jj + 7 - gx * 512];
+                    vec4 w0 = hsel == 0 ? vec4(unpackHalf2x16(n0.x), unpackHalf2x16(n0.y))
+                                        : vec4(unpackHalf2x16(n0.z), unpackHalf2x16(n0.w));
+                    vec4 w1 = hsel == 0 ? vec4(unpackHalf2x16(n1.x), unpackHalf2x16(n1.y))
+                                        : vec4(unpackHalf2x16(n1.z), unpackHalf2x16(n1.w));
+                    vec4 w2 = hsel == 0 ? vec4(unpackHalf2x16(n2.x), unpackHalf2x16(n2.y))
+                                        : vec4(unpackHalf2x16(n2.z), unpackHalf2x16(n2.w));
+                    vec4 w3 = hsel == 0 ? vec4(unpackHalf2x16(n3.x), unpackHalf2x16(n3.y))
+                                        : vec4(unpackHalf2x16(n3.z), unpackHalf2x16(n3.w));
+                    vec4 w4 = hsel == 0 ? vec4(unpackHalf2x16(n4.x), unpackHalf2x16(n4.y))
+                                        : vec4(unpackHalf2x16(n4.z), unpackHalf2x16(n4.w));
+                    vec4 w5 = hsel == 0 ? vec4(unpackHalf2x16(n5.x), unpackHalf2x16(n5.y))
+                                        : vec4(unpackHalf2x16(n5.z), unpackHalf2x16(n5.w));
+                    vec4 w6 = hsel == 0 ? vec4(unpackHalf2x16(n6.x), unpackHalf2x16(n6.y))
+                                        : vec4(unpackHalf2x16(n6.z), unpackHalf2x16(n6.w));
+                    vec4 w7 = hsel == 0 ? vec4(unpackHalf2x16(n7.x), unpackHalf2x16(n7.y))
+                                        : vec4(unpackHalf2x16(n7.z), unpackHalf2x16(n7.w));
+                    a0 += h0 * w0.x + h1 * w1.x + h2 * w2.x + h3 * w3.x +
+                          h4 * w4.x + h5 * w5.x + h6 * w6.x + h7 * w7.x;
+                    a1 += h0 * w0.y + h1 * w1.y + h2 * w2.y + h3 * w3.y +
+                          h4 * w4.y + h5 * w5.y + h6 * w6.y + h7 * w7.y;
+                    a2 += h0 * w0.z + h1 * w1.z + h2 * w2.z + h3 * w3.z +
+                          h4 * w4.z + h5 * w5.z + h6 * w6.z + h7 * w7.z;
+                    a3 += h0 * w0.w + h1 * w1.w + h2 * w2.w + h3 * w3.w +
+                          h4 * w4.w + h5 * w5.w + h6 * w6.w + h7 * w7.w;
+                }
+                for (; jj < jend; ++jj) {
+                    vec4 w = da_wd(b_n, jj, c0);
+                    float h = da_h[jj - gx * 512];
+                    a0 += h * w.x;
+                    a1 += h * w.y;
+                    a2 += h * w.z;
+                    a3 += h * w.w;
+                }
+                int row = b_n * uPC.M + tile * DA_MT;
+                int w = da_dp(row, gxs, c0 + hsel * 4);
+                uScratch.data[w] = floatBitsToUint(a0);
+                uScratch.data[w + 1] = floatBitsToUint(a1);
+                uScratch.data[w + 2] = floatBitsToUint(a2);
+                uScratch.data[w + 3] = floatBitsToUint(a3);
+            }
+            return;
+        }
+        for (int c0 = lane * 4; c0 < uPC.N; c0 += 2048) {
+            float a0 = 0.0;
+            float a1 = 0.0;
+            float a2 = 0.0;
+            float a3 = 0.0;
+            for (int jj = j0; jj < jend; ++jj) {
+                vec4 w = da_wd(b_n, jj, c0);
+                float h = da_h[jj - gx * 512];
+                a0 += h * w.x;
+                a1 += h * w.y;
+                a2 += h * w.z;
+                a3 += h * w.w;
+            }
+            int row = b_n * uPC.M + tile * DA_MT;
+            int w = da_dp(row, gxs, c0);
+            uScratch.data[w] = floatBitsToUint(a0);
+            uScratch.data[w + 1] = floatBitsToUint(a1);
+            uScratch.data[w + 2] = floatBitsToUint(a2);
+            uScratch.data[w + 3] = floatBitsToUint(a3);
+        }
+        return;
+    }
+    for (int c0 = lane * 4; c0 < uPC.N; c0 += 2048) {
+        float acc[DA_MT][4];
+        for (int r = 0; r < DA_MT; ++r) {
+            acc[r][0] = 0.0;
+            acc[r][1] = 0.0;
+            acc[r][2] = 0.0;
+            acc[r][3] = 0.0;
+        }
+        for (int jj = j0; jj < jend; ++jj) {
+            vec4 w = da_wd(b_n, jj, c0);
+            int hb = jj - gx * 512;
+            for (int r = 0; r < DA_MT; ++r) {
+                float h = da_h[r * 512 + hb];
+                acc[r][0] += h * w.x;
+                acc[r][1] += h * w.y;
+                acc[r][2] += h * w.z;
+                acc[r][3] += h * w.w;
+            }
+        }
+        for (int r = 0; r < mt; ++r) {
+            int row = b_n * uPC.M + tile * DA_MT + r;
+            int w = da_dp(row, gxs, c0);
+            uScratch.data[w] = floatBitsToUint(acc[r][0]);
+            uScratch.data[w + 1] = floatBitsToUint(acc[r][1]);
+            uScratch.data[w + 2] = floatBitsToUint(acc[r][2]);
+            uScratch.data[w + 3] = floatBitsToUint(acc[r][3]);
+        }
+    }
+}
+
+// Reduce: one output row per block-y, four output columns per lane. Sums the
+// GX * ds down partials -- every up-column sub-block contributes to the same
+// output row, so the accumulator lives OUTSIDE the gx walk.
+void da_reduce() {
+    int row = int(gl_WorkGroupID.y);
+    if (row >= uPC.batch * uPC.M) return;
+    int lane = int(gl_LocalInvocationID.y) * 32 + int(gl_LocalInvocationID.x);
+    int gx_count = uPC.mind_k * da_ds();
+    for (int c0 = int(gl_WorkGroupID.x) * 2048 + lane * 4; c0 < uPC.N;
+         c0 += 2048) {
+        float a0 = 0.0;
+        float a1 = 0.0;
+        float a2 = 0.0;
+        float a3 = 0.0;
+        for (int gxs = 0; gxs < gx_count; ++gxs) {
+            int w = da_dp(row, gxs, c0);
+            a0 += uintBitsToFloat(uScratch.data[w]);
+            a1 += uintBitsToFloat(uScratch.data[w + 1]);
+            a2 += uintBitsToFloat(uScratch.data[w + 2]);
+            a3 += uintBitsToFloat(uScratch.data[w + 3]);
+        }
+        int out_idx = row * uPC.N + c0;
+        uOutput.data[out_idx >> 1] = packHalf2x16(vec2(a0, a1));
+        uOutput.data[(out_idx + 2) >> 1] = packHalf2x16(vec2(a2, a3));
+    }
+}
+
+void main() {
+    if (uPC.ks_part == 2) {
+        da_reduce();
+    } else if (uPC.ks_part == 1) {
+        da_down();
+    } else {
+        da_deposit();
+    }
+}

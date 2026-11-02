@@ -133,7 +133,16 @@ struct alignas(16) GpuMatMulParam {
     int mind_k = 0;
     // The bias tensor's flat batch count (== total batch / head-broadcast
     // ratio). 0 when epi_bias is off.
-    int epi_bias_batch = 0;
+    //
+    // The SwiGLU down fold reuses this slot for `ks`: the padded group width
+    // of its lane-major Wg/Wu, i.e. ceil(N_up/8)*8. The fold never raises
+    // epi_bias (its converter pass deletes the scale/bias chain), so the two
+    // meanings can never be live at once, and a separate field would push the
+    // struct past the 136-byte boundary the comment above records.
+    union {
+        int epi_bias_batch;
+        int ks;
+    };
     // Plan B: fuse the trailing Softmax into this MatMul. When set, the kernel
     // reduces each output row across all N columns (online max→sum→normalize)
     // and stores exp(x-max)/sum, so the fp16 2-dispatch Softmax vanishes. Host
@@ -157,13 +166,12 @@ struct alignas(16) GpuMatMulParam {
     // every lane read slot 0..n_slice-1 of its own quad and write an
     // unsplit-K result.
     //
-    // The SwiGLU down fold's split-K pair carries a second meaning: the two
-    // passes run on ONE module (buffer_matmul_down_act_fp16), so this flag is
-    // also the entry-point selector there --
-    // matmul16_ksplit_fold_down_act when set, the whole-GEMV
-    // matmul16_ksplit_down_act otherwise. A shape that reaches the same module
-    // with ksplit=1 and a stale ks_part would run the fold kernel in place of
-    // the deposit; the host keeps the two in step.
+    // The SwiGLU down fold's three passes run on ONE module
+    // (buffer_matmul_down_act_fp16), so this flag is also the entry-point
+    // selector there: 0 = deposit (K-split up GEMV), 1 = down (Wd walk), 2 =
+    // reduce (partial sum + fp16 pack). A shape that reaches the same module
+    // with ksplit=1 and a stale ks_part would run a later pass in place of
+    // the deposit; the host keeps them in step.
     //
     // Sits at the struct tail (offset 112): sizeof stays 128 after the
     // alignas(16) rounding, so the pushed range is unchanged.
@@ -1385,33 +1393,99 @@ class MatMulBuffer : public BufferFactory {
                 // stride and stop the gate/up loop at it; Wg/Wu's RowAlign
                 // pad rows past it are zero and simply never loaded.
                 para_.K_act = k_out;
-                para_.ksplit = 1;     // the DOWN_ACT module's route selector
-                para_.ksplit_q = 0;   // unused by the fold kernels
+                para_.ks = 0;      // the K-split module reads no group width
+                para_.ksplit = 1;  // the DOWN_ACT module's route selector
+                para_.ksplit_q = 0;
                 para_.mind_k = da_gx; // the deposit grid's x extent = the
                                       // fold pass's partial count
                 para_.tile = 0;
                 para_.ks_part = 0; // the module's deposit entry
                 set_route(plan.tag, batch, m, n, n_up, rep);
+                // The K cut. K-split is what makes Wg/Wu read once per layer:
+                // a deposit block walks only its slice, so the grid covers K_out
+                // exactly instead of having every block re-walk it. The cut is
+                // a pure function of k_out -- a cut keyed on anything that moves
+                // between a record round and a replay round would have the fold
+                // reduce a different partition than the deposit wrote.
+                const int da_ks_n = down_act_ks_n(k_out);
+                da_ks_n_ = da_ks_n;
+                // The down pass's j sub-split (grid z, uPC.tile) was first
+                // measured monotonically WORSE at M=1 (ds=8: 224-250 ms/step)
+                // -- but that was the old shader's 16-row walk burning 15/16
+                // of its FMAs on dead rows. With da_down's mt==1 fast path a
+                // same-run layer%2 A/B (both arms full nodes) still favors
+                // ds=1: full-node medians 1.536 (ds=1) vs 1.654 ms (ds=8).
+                // 12 blocks already keep enough Wd loads in flight; the
+                // sub-split only adds h-assembly barriers and 8x dp slots.
+                // A WIDE-2 retry (the j split on the lane axis, 8 accs, no
+                // duplicate loads) measured dead even with the tile=1 WIDE
+                // walk (1.159 vs 1.164 ms median) -- the walk is at the
+                // memory system's limit for this shape. ds stays 1.
+                const int da_ds = 1;
+                const int da_hdr = 4 + 2 * da_ks_n; // KS_HDR + the slice table
+                // Each partial slot group is 512 words: the deposit parks TWO
+                // fp32 per (row, gx block, slice, block-local up column) --
+                // the raw gate and up slice sums -- and the block-local axis
+                // is 512 wide by construction (the grid-x block size) -- not
+                // N, and not N_up. The silu is nonlinear in the gate, so the
+                // slices must sum BEFORE it applies: the down pass reassembles
+                // h = silu(sum g_s) * sum u_s and then appends its own
+                // [row][gx][column] fp32 partials, keeping the fold's Wd walk
+                // at a single float per (j, column) instead of re-summing ns
+                // words for every output column.
+                const size_t da_up_words =
+                    2 * static_cast<size_t>(batch) * m * da_gx * da_ks_n * 512;
+                const size_t da_dp_words =
+                    static_cast<size_t>(batch) * m * da_gx * da_ds * n;
                 const size_t da_words =
-                    static_cast<size_t>(batch) * m * da_gx * n;
+                    static_cast<size_t>(da_hdr) + da_up_words + da_dp_words;
                 if (!scratch_da_ || scratch_da_bytes_ != da_words) {
+                    // HOST_COHERENT, not DEVICE_LOCAL: the slice table is
+                    // written through the mapping below at RECORD time (a cached
+                    // replay round re-runs the recorded dispatches without
+                    // re-entering this function, so a table written at dispatch
+                    // time would still be the recording round's). The partials
+                    // live past the header in the same buffer.
                     scratch_da_ = std::make_shared<VulkanBuffer>(
                         m_dev_, da_words * sizeof(float),
                         STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                            VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
                     scratch_da_bytes_ = da_words;
-                    // Requires TRANSFER_DST; the fill runs on the device at
-                    // the next submit, before either pass. Every word is
-                    // rewritten by the deposit each round, so this only
-                    // guards the first round against a scheduler surprise.
-                    scratch_da_->fillBuffer(m_cmd_->get(), 0,
-                                            da_words * sizeof(float));
+                    da_words_hdr_.clear();
+                }
+                // Stage the header + slice table. Byte-identical every round
+                // for a given shape, so the compare against da_words_hdr_
+                // keeps the steady state to one vector comparison.
+                {
+                    std::vector<uint32_t> hdr(da_hdr, 0);
+                    const int base = k_out / da_ks_n;
+                    const int rem = k_out - base * da_ks_n;
+                    int at = 0;
+                    for (int z = 0; z < da_ks_n; ++z) {
+                        const int lo = at;
+                        const int hi = lo + base + (z < rem ? 1 : 0);
+                        hdr[4 + 2 * z] = static_cast<uint32_t>(lo);
+                        hdr[5 + 2 * z] = static_cast<uint32_t>(hi);
+                        at = hi;
+                    }
+                    hdr[1] = static_cast<uint32_t>(da_ks_n);
+                    hdr[2] = 0;
+                    hdr[3] = static_cast<uint32_t>(k_out);
+                    if (hdr != da_words_hdr_) {
+                        if (auto *words = static_cast<uint32_t *>(
+                                scratch_da_->getMappedMemory())) {
+                            for (size_t t = 0; t < hdr.size(); ++t)
+                                words[t] = hdr[t];
+                            da_words_hdr_ = hdr;
+                        }
+                    }
                 }
                 objs_.resize(9, nullptr);
-                // Binding 0 is the fold pass's output; binding 3 is the
-                // deposit pass's scratch. The two passes share the module, so
-                // both bindings are always live and neither may double as the
-                // other.
+                // Binding 0 is the reduce pass's output; binding 3 is the
+                // scratch the three passes share. The passes share the module,
+                // so both bindings are always live and neither may double as
+                // the other.
                 objs_[0] = std::static_pointer_cast<VulkanResource>(
                     outputs[0]->gpu_buffer());
                 objs_[1] = std::static_pointer_cast<VulkanResource>(
@@ -1425,14 +1499,27 @@ class MatMulBuffer : public BufferFactory {
                 objs_[8] = std::static_pointer_cast<VulkanResource>(
                     inputs[3]->gpu_buffer());
                 // Deposit: grid-x over the up-axis blocks, grid-y over the
-                // 16-row tiles of every batch slice.
-                dispatch_on(sel_down_act, down_act_ds_[m_id_], da_gx,
-                            batch * ((m + 15) / 16));
-                // Fold: sums the deposit's partials. Reading what another
-                // dispatch wrote needs an execution dependency between the
-                // two.
+                // 16-row tiles of every batch slice, grid-z over the K
+                // slices -- except at M==1, where the wide deposit maps the
+                // slices into the block's lanes (lane/64) and grid-z is 1.
+                ks_submit(sel_down_act, down_act_ds_[m_id_], da_gx,
+                          batch * ((m + 15) / 16), m == 1 ? 1 : da_ks_n);
+                // Down: sums the deposit's slice partials per (row, j) into
+                // shared, walks the sub-block's Wd j-slice for every output
+                // column, parks fp32 down partials keyed (row, gx*ds+z, c).
+                // Grid z splits the j contraction into da_ds sub-blocks.
+                // Reading another dispatch's SSBO stores needs an execution
+                // dependency between the two.
                 scratch_da_->shaderWriteBarrier(m_cmd_->get());
-                para_.ks_part = 1; // the module's fold entry
+                para_.ks_part = 1; // the module's down entry
+                para_.tile = da_ds;
+                ks_submit(sel_down_act, down_act_ds_[m_id_], da_gx,
+                          batch * ((m + 15) / 16), da_ds);
+                // Reduce: sums the GX * da_ds down partials and packs fp16.
+                // tile still carries da_ds for the dp stride. Reading what
+                // the down pass wrote needs another dependency.
+                scratch_da_->shaderWriteBarrier(m_cmd_->get());
+                para_.ks_part = 2; // the module's reduce entry
                 dispatch_on(sel_down_act, down_act_ds_[m_id_],
                             UP_DIV(n, 2048), batch * m);
                 return;
@@ -2085,6 +2172,26 @@ class MatMulBuffer : public BufferFactory {
                                   ks_fold_pipeline_, ks_fold_ds_);
     }
 
+    // The SwiGLU down fold's K-split factor. A deposit block walks only its
+    // slice, so the M=1 grid is GX*ks_n workgroups instead of the GX=12 the
+    // column-partitioned form had -- the fold's decode problem was never
+    // weight traffic (the column slices are disjoint, every byte was already
+    // read once) but occupancy: 12 blocks cannot fill the device. The cost is
+    // one fp32 partial per (row, gx block, slice, block-local column):
+    // batch*m*GX*ks_n*512 words, ~196 KiB at M=1/ks_n=8.
+    //
+    // Shape-derived on purpose. Both the deposit (which looks its slice up from
+    // gid.z) and the fold (which reduces all ks_n of them) read the table the
+    // host stages, so a cut that moved between a record round and a replay
+    // round would have the fold reduce a partition the deposit never wrote.
+    static int down_act_ks_n(int k_out) {
+        // Aim for ~256 K per slice: deep enough that the partial traffic stays
+        // rounding error, shallow enough to keep the grid wide at M=1.
+        const int want = 256;
+        const int n = (k_out + want - 1) / want;
+        return n < 1 ? 1 : n;
+    }
+
     // Bind, push and dispatch one half of the tile-split-K pair. Same body as
     // dispatch_on above; separate only because the two dispatches in that pair
     // each need their own descriptor set (a set is written once per dispatch
@@ -2145,6 +2252,15 @@ class MatMulBuffer : public BufferFactory {
     // slot per (batch, output tile, K slice).
     std::shared_ptr<VulkanBuffer> scratch_da_;
     size_t scratch_da_bytes_ = 0;
+    // The down fold's K cut: 2*da_ks_n_ (lo, hi) pairs tiling [0, K_out). The
+    // deposit blocks find their own slice from gid.z and the fold pass reduces
+    // exactly those slices, so both take the cut from one host-built table.
+    // It is a pure function of K_out, which is what lets the record path
+    // compare against da_words_hdr_ and skip the rewrite on every later round
+    // (a replay round re-runs the recorded dispatches without re-entering this
+    // path, so the header has to survive in the buffer).
+    int da_ks_n_ = 0;
+    std::vector<uint32_t> da_words_hdr_;
     size_t scratch_bytes_ = 0;
     // Tile-split-K's own K range for THIS dispatch, staged into the scratch
     // header (words 1..3) instead of a push constant: four more ints at the PC

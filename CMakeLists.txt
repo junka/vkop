@@ -188,6 +188,10 @@ file(GLOB_RECURSE SHADER_FILES ${SHADER_DIR}/*.comp ${SHADER_DIR}/*.vert)
 # Exclude shared #include-only headers in shaders/common/ from standalone
 # compilation (they are pulled in by image/ and buffer/ shaders).
 list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
+# The SwiGLU fold is built by its own rule below (a named key, no folder
+# prefix); leaving it in the generic loop would register a second, unused
+# module under the same key.
+list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_down_act\\.comp$")
 
 # glslc resolves #include but cmake does not track it, so editing a shared
 # header would silently rebuild nothing. Track them explicitly.
@@ -390,11 +394,11 @@ list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS_FOLD})
 set(SPIRV_FILE_DOWN_ACT ${SPIRV_DIR}/buffer_matmul_down_act_fp16.spv)
 add_custom_command(
     OUTPUT ${SPIRV_FILE_DOWN_ACT}
-    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+    COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul_down_act.comp
             -fshader-stage=compute -g --target-spv=spv1.3
-            -o ${SPIRV_FILE_DOWN_ACT} -DFP16 -DDOWN_ACT -DKSPLIT512
-    DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
-    COMMENT "Compiling buffer/matmul (SwiGLU down fold, fp16) to SPIR-V"
+            -o ${SPIRV_FILE_DOWN_ACT}
+    DEPENDS ${SHADER_DIR}/buffer/matmul_down_act.comp ${SHADER_INCLUDES}
+    COMMENT "Compiling buffer/matmul_down_act (SwiGLU fold, fp16) to SPIR-V"
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_DOWN_ACT})
 
