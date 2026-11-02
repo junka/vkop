@@ -203,11 +203,11 @@ void VMA::flushAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
         return;
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);
-    if (info.memory == VK_NULL_HANDLE)
+    if (info.deviceMemory == VK_NULL_HANDLE)
         return;
     VkMappedMemoryRange range = {};
     range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = info.memory;
+    range.memory = info.deviceMemory;
     range.offset = info.offset + offset;
     range.size = size;
     vkFlushMappedMemoryRanges(s_vma_device.load(), 1, &range);
@@ -220,11 +220,11 @@ void VMA::invalidateAllocation(struct VmaBuffer *buf, VkDeviceSize offset,
         return;
     VmaAllocationInfo info{};
     vmaGetAllocationInfo(buf->allocator, buf->allocation, &info);
-    if (info.memory == VK_NULL_HANDLE)
+    if (info.deviceMemory == VK_NULL_HANDLE)
         return;
     VkMappedMemoryRange range = {};
     range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    range.memory = info.memory;
+    range.memory = info.deviceMemory;
     range.offset = info.offset + offset;
     range.size = size;
     vkInvalidateMappedMemoryRanges(s_vma_device.load(), 1, &range);

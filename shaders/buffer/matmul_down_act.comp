@@ -51,7 +51,16 @@
 // uPC.K_act carries K_out (x's columns). Wg/Wu are row-major [K_out, N_up]
 // fp16, Wd is row-major [N_up, N] fp16, uPC.mind_k carries GX.
 //
-// Bindings: 0 output, 1 x, 2 Wd, 3 scratch, 7 Wg, 8 Wu.
+// Bindings: 0 output, 1 x, 2 Wd, 3 scratch, 4 the byte weights' concatenated
+// per-column scale table [Sd (N) | Sg (N_up) | Su (N_up)] (dummy for fp16),
+// 7 Wg, 8 Wu.
+//
+// Byte weights (uPC.weight_int8, fp8 when uPC.fp8): the three payloads keep
+// their [K_out, N_up] / [N_up, N] layouts at one byte per value, and the
+// dequant scale is constant along K, so the deposit multiplies Sg/Su into its
+// slice sum once and the down walk multiplies Sd per output column before it
+// parks the partial -- the same math the standalone byte GEMMs do, with the
+// fold's memory savings intact.
 
 #version 450
 #extension GL_EXT_shader_16bit_storage : enable
@@ -73,6 +82,12 @@ layout(set = 0, binding = 2) readonly buffer InB {
 layout(set = 0, binding = 2) readonly buffer InB4 {
     uvec4 data4[];
 } uWd4;
+// Byte view of the same Wd: one uvec2 = eight quantized columns (8 bytes).
+// Valid whenever the byte walks are legal -- N_up % 8 == 0 for Wg/Wu and
+// N % 8 == 0 for Wd's octets -- so the 8-byte element index is exact.
+layout(set = 0, binding = 2) readonly buffer InB8 {
+    uvec2 data2[];
+} uWd8;
 layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
@@ -82,12 +97,21 @@ layout(set = 0, binding = 7) readonly buffer InB2 {
 layout(set = 0, binding = 7) readonly buffer InB2W {
     uvec4 data4[];
 } uWg4;
+layout(set = 0, binding = 7) readonly buffer InB2W8 {
+    uvec2 data2[];
+} uWg8;
 layout(set = 0, binding = 8) readonly buffer InAct {
     uint data[];
 } uInputAct;
 layout(set = 0, binding = 8) readonly buffer InActW {
     uvec4 data4[];
 } uWu4;
+layout(set = 0, binding = 8) readonly buffer InActW8 {
+    uvec2 data2[];
+} uWu8;
+layout(set = 0, binding = 4) readonly buffer InScale {
+    uint data[];
+} uScale;
 
 // Field-for-field copy of matmul::GpuMatMulParam (ops/Matmul.hpp). The order
 // must match exactly -- a shifted field silently reinterprets every constant
@@ -188,6 +212,88 @@ vec4 da_wd(int b, int j, int c) {
     int w = ((b * uPC.K + j) * uPC.N + c) >> 1;
     return vec4(unpackHalf2x16(uInputB.data[w]),
                 unpackHalf2x16(uInputB.data[w + 1]));
+}
+
+// ---- byte-quantized fold weights (uPC.weight_int8) -----------------------
+// All three weights are dense one-byte-per-value payloads with their existing
+// [K_out, N_up] / [N_up, N] layouts, and each carries one fp32 dequant scale
+// per output column. The three tables travel concatenated in ONE fp32 tensor
+// at binding 4:
+//
+//     [ Sd (N) | Sg (N_up) | Su (N_up) ]        length N + 2*N_up
+//
+// Sd is Wd's per-output-column scale, Sg/Su are Wg's/Wu's (indexed by the up
+// column j). This is an ABI shared with MatMulBuffer::execute (the length
+// check) and the converter that builds the initializer -- all three must
+// agree. The scale is constant along K, so the deposit multiplies it in once
+// after its slice sum (equivalent to applying it to the reassembled gate/up),
+// and the down pass applies Sd before parking its partial.
+float da_scale(int i) { return uintBitsToFloat(uScale.data[i]); }
+
+// One int8 weight byte as a float (sign bit XOR-ed out: no signed shifts).
+float da_w8i(uint b) { return float(b ^ 0x80u) - 128.0; }
+
+// One fp8 byte as a float, e4m3 (default) or e5m2 (uPC.e5m2): the normal
+// bytes' [exp|mant] reassemble exactly into an fp32 once the biases agree,
+// and exponent 0 is the subnormal step (2^-9 / 2^-16).
+float da_e4m3(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+float da_e5m2(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 3u ? uintBitsToFloat((m + 448u) << 21u) : float(m) * 1.52587890625e-05;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+float da_w8(uint b) {
+    if (uPC.fp8 != 0) return uPC.e5m2 != 0 ? da_e5m2(b) : da_e4m3(b);
+    return da_w8i(b);
+}
+
+// Four adjacent bytes of one 32-bit word, low byte first.
+vec4 da_w8x4(uint w) {
+    return vec4(da_w8(w & 0xFFu), da_w8((w >> 8) & 0xFFu),
+                da_w8((w >> 16) & 0xFFu), da_w8(w >> 24));
+}
+
+float da_b2_byte(int idx) {
+    return da_w8((uInputB2.data[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu);
+}
+float da_ba_byte(int idx) {
+    return da_w8((uInputAct.data[idx >> 2] >> ((idx & 3) * 8)) & 0xFFu);
+}
+
+// Wg/Wu byte element [b][k][j], with the [K_out, N_up] stride in bytes.
+float da_wg_any(int b, int j, int k) {
+    if (uPC.weight_int8 != 0)
+        return da_b2_byte((b * uPC.K_act + k) * uPC.K + j);
+    return da_wg(b, j, k);
+}
+float da_wu_any(int b, int j, int k) {
+    if (uPC.weight_int8 != 0)
+        return da_ba_byte((b * uPC.K_act + k) * uPC.K + j);
+    return da_wu(b, j, k);
+}
+
+// Wd byte element [b][j][c]: four columns from one 32-bit word (c % 4 == 0).
+vec4 da_wd_byte(int b, int j, int c) {
+    return da_w8x4(uInputB.data[((b * uPC.K + j) * uPC.N + c) >> 2]);
+}
+
+// Four adjacent per-column scales starting at i.
+vec4 da_scale4(int i) {
+    return vec4(da_scale(i), da_scale(i + 1), da_scale(i + 2),
+                da_scale(i + 3));
+}
+
+// The fold is dtype-agnostic above the weight read: the same walks feed a
+// half or a byte payload, only the four-column fetch differs.
+vec4 da_wd_any(int b, int j, int c) {
+    if (uPC.weight_int8 != 0) return da_wd_byte(b, j, c);
+    return da_wd(b, j, c);
 }
 
 // Wide deposit (M==1): the scalar form's one-word-per-matrix loads are the
@@ -304,6 +410,102 @@ void da_deposit_wide(int b_n, int tile, int gx, int lane) {
     uScratch.data[ubase + 7] = floatBitsToUint(j < kw ? u1.w : 0.0);
 }
 
+// Byte variant of the wide deposit: eight up columns are EIGHT bytes, so the
+// lane's octet is one uvec2 and its two words decode to the low/high four
+// columns -- same one 8-byte load per (k, lane) that the half form gets from
+// its 16-byte uvec4. The two per-column tables are constant along K, so they
+// multiply the slice sum once, after the loop; summing the scaled slice
+// partials later is the same value as scaling their sum.
+void da_deposit_wide_byte(int b_n, int tile, int gx, int lane) {
+    int s = lane / 64;
+    if (s >= ks_n()) return;
+    int jb0 = (lane % 64) * 8; // block-local up column, octet aligned
+    int kw = uPC.K;            // N_up
+    int kx = uPC.K_act;        // K_out
+    int row = b_n * uPC.M + tile * DA_MT;
+    int j = gx * 512 + jb0;
+    int a_off = row * kx;
+    vec4 g0 = vec4(0.0);
+    vec4 g1 = vec4(0.0);
+    vec4 u0 = vec4(0.0);
+    vec4 u1 = vec4(0.0);
+    if (j < kw) {
+        int wrow = b_n * kx; // Wg/Wu row base for this batch slice
+        int k = ks_lo(s);
+        int hi = ks_hi(s);
+        for (; k + 7 < hi; k += 8) {
+            uvec2 n0 = uWg8.data2[(wrow * kw + (k + 0) * kw + j) >> 3];
+            uvec2 n1 = uWg8.data2[(wrow * kw + (k + 1) * kw + j) >> 3];
+            uvec2 n2 = uWg8.data2[(wrow * kw + (k + 2) * kw + j) >> 3];
+            uvec2 n3 = uWg8.data2[(wrow * kw + (k + 3) * kw + j) >> 3];
+            uvec2 n4 = uWg8.data2[(wrow * kw + (k + 4) * kw + j) >> 3];
+            uvec2 n5 = uWg8.data2[(wrow * kw + (k + 5) * kw + j) >> 3];
+            uvec2 n6 = uWg8.data2[(wrow * kw + (k + 6) * kw + j) >> 3];
+            uvec2 n7 = uWg8.data2[(wrow * kw + (k + 7) * kw + j) >> 3];
+            uvec2 m0 = uWu8.data2[(wrow * kw + (k + 0) * kw + j) >> 3];
+            uvec2 m1 = uWu8.data2[(wrow * kw + (k + 1) * kw + j) >> 3];
+            uvec2 m2 = uWu8.data2[(wrow * kw + (k + 2) * kw + j) >> 3];
+            uvec2 m3 = uWu8.data2[(wrow * kw + (k + 3) * kw + j) >> 3];
+            uvec2 m4 = uWu8.data2[(wrow * kw + (k + 4) * kw + j) >> 3];
+            uvec2 m5 = uWu8.data2[(wrow * kw + (k + 5) * kw + j) >> 3];
+            uvec2 m6 = uWu8.data2[(wrow * kw + (k + 6) * kw + j) >> 3];
+            uvec2 m7 = uWu8.data2[(wrow * kw + (k + 7) * kw + j) >> 3];
+            vec2 a0 = unpackHalf2x16(uInputA.data[(a_off + k) >> 1]);
+            vec2 a1 = unpackHalf2x16(uInputA.data[(a_off + k + 2) >> 1]);
+            vec2 a2 = unpackHalf2x16(uInputA.data[(a_off + k + 4) >> 1]);
+            vec2 a3 = unpackHalf2x16(uInputA.data[(a_off + k + 6) >> 1]);
+            g0 += a0.x * da_w8x4(n0.x) + a0.y * da_w8x4(n1.x) +
+                  a1.x * da_w8x4(n2.x) + a1.y * da_w8x4(n3.x) +
+                  a2.x * da_w8x4(n4.x) + a2.y * da_w8x4(n5.x) +
+                  a3.x * da_w8x4(n6.x) + a3.y * da_w8x4(n7.x);
+            g1 += a0.x * da_w8x4(n0.y) + a0.y * da_w8x4(n1.y) +
+                  a1.x * da_w8x4(n2.y) + a1.y * da_w8x4(n3.y) +
+                  a2.x * da_w8x4(n4.y) + a2.y * da_w8x4(n5.y) +
+                  a3.x * da_w8x4(n6.y) + a3.y * da_w8x4(n7.y);
+            u0 += a0.x * da_w8x4(m0.x) + a0.y * da_w8x4(m1.x) +
+                  a1.x * da_w8x4(m2.x) + a1.y * da_w8x4(m3.x) +
+                  a2.x * da_w8x4(m4.x) + a2.y * da_w8x4(m5.x) +
+                  a3.x * da_w8x4(m6.x) + a3.y * da_w8x4(m7.x);
+            u1 += a0.x * da_w8x4(m0.y) + a0.y * da_w8x4(m1.y) +
+                  a1.x * da_w8x4(m2.y) + a1.y * da_w8x4(m3.y) +
+                  a2.x * da_w8x4(m4.y) + a2.y * da_w8x4(m5.y) +
+                  a3.x * da_w8x4(m6.y) + a3.y * da_w8x4(m7.y);
+        }
+        for (; k < hi; ++k) {
+            uvec2 n = uWg8.data2[(wrow * kw + k * kw + j) >> 3];
+            uvec2 m = uWu8.data2[(wrow * kw + k * kw + j) >> 3];
+            float xv = da_x(a_off, k);
+            g0 += xv * da_w8x4(n.x);
+            g1 += xv * da_w8x4(n.y);
+            u0 += xv * da_w8x4(m.x);
+            u1 += xv * da_w8x4(m.y);
+        }
+        // Sg/Su sit past the Sd prefix at [N, N + N_up) and [N + N_up, ...).
+        g0 *= da_scale4(uPC.N + j);
+        g1 *= da_scale4(uPC.N + j + 4);
+        u0 *= da_scale4(uPC.N + uPC.K + j);
+        u1 *= da_scale4(uPC.N + uPC.K + j + 4);
+    }
+    int base = da_gp(row, gx, s, jb0);
+    uScratch.data[base + 0] = floatBitsToUint(j < kw ? g0.x : 0.0);
+    uScratch.data[base + 1] = floatBitsToUint(j < kw ? g0.y : 0.0);
+    uScratch.data[base + 2] = floatBitsToUint(j < kw ? g0.z : 0.0);
+    uScratch.data[base + 3] = floatBitsToUint(j < kw ? g0.w : 0.0);
+    uScratch.data[base + 4] = floatBitsToUint(j < kw ? g1.x : 0.0);
+    uScratch.data[base + 5] = floatBitsToUint(j < kw ? g1.y : 0.0);
+    uScratch.data[base + 6] = floatBitsToUint(j < kw ? g1.z : 0.0);
+    uScratch.data[base + 7] = floatBitsToUint(j < kw ? g1.w : 0.0);
+    int ubase = da_up(row, gx, s, jb0);
+    uScratch.data[ubase + 0] = floatBitsToUint(j < kw ? u0.x : 0.0);
+    uScratch.data[ubase + 1] = floatBitsToUint(j < kw ? u0.y : 0.0);
+    uScratch.data[ubase + 2] = floatBitsToUint(j < kw ? u0.z : 0.0);
+    uScratch.data[ubase + 3] = floatBitsToUint(j < kw ? u0.w : 0.0);
+    uScratch.data[ubase + 4] = floatBitsToUint(j < kw ? u1.x : 0.0);
+    uScratch.data[ubase + 5] = floatBitsToUint(j < kw ? u1.y : 0.0);
+    uScratch.data[ubase + 6] = floatBitsToUint(j < kw ? u1.z : 0.0);
+    uScratch.data[ubase + 7] = floatBitsToUint(j < kw ? u1.w : 0.0);
+}
+
 // Deposit: this block owns K slice s of its 512 up columns and its 16-row tile.
 // It walks only its slice, so every Wg/Wu byte is read once across the grid:
 // the (gx, s) grid covers [N_up] x [K_out] exactly once per row.
@@ -324,7 +526,11 @@ void da_deposit() {
     // scalar multi-slice form whenever the lane budget or octet alignment
     // does not hold.
     if (uPC.M == 1 && (uPC.K & 7) == 0 && ks_n() <= 8 && 512 % ks_n() == 0) {
-        da_deposit_wide(b_n, tile, gx, lane);
+        if (uPC.weight_int8 != 0) {
+            da_deposit_wide_byte(b_n, tile, gx, lane);
+        } else {
+            da_deposit_wide(b_n, tile, gx, lane);
+        }
         return;
     }
     int s = int(gl_WorkGroupID.z);
@@ -350,19 +556,34 @@ void da_deposit() {
                 float x5 = da_x(a_off, k + 5);
                 float x6 = da_x(a_off, k + 6);
                 float x7 = da_x(a_off, k + 7);
-                gr += x0 * da_wg(b_n, j, k + 0) + x1 * da_wg(b_n, j, k + 1) +
-                      x2 * da_wg(b_n, j, k + 2) + x3 * da_wg(b_n, j, k + 3) +
-                      x4 * da_wg(b_n, j, k + 4) + x5 * da_wg(b_n, j, k + 5) +
-                      x6 * da_wg(b_n, j, k + 6) + x7 * da_wg(b_n, j, k + 7);
-                ur += x0 * da_wu(b_n, j, k + 0) + x1 * da_wu(b_n, j, k + 1) +
-                      x2 * da_wu(b_n, j, k + 2) + x3 * da_wu(b_n, j, k + 3) +
-                      x4 * da_wu(b_n, j, k + 4) + x5 * da_wu(b_n, j, k + 5) +
-                      x6 * da_wu(b_n, j, k + 6) + x7 * da_wu(b_n, j, k + 7);
+                gr += x0 * da_wg_any(b_n, j, k + 0) +
+                      x1 * da_wg_any(b_n, j, k + 1) +
+                      x2 * da_wg_any(b_n, j, k + 2) +
+                      x3 * da_wg_any(b_n, j, k + 3) +
+                      x4 * da_wg_any(b_n, j, k + 4) +
+                      x5 * da_wg_any(b_n, j, k + 5) +
+                      x6 * da_wg_any(b_n, j, k + 6) +
+                      x7 * da_wg_any(b_n, j, k + 7);
+                ur += x0 * da_wu_any(b_n, j, k + 0) +
+                      x1 * da_wu_any(b_n, j, k + 1) +
+                      x2 * da_wu_any(b_n, j, k + 2) +
+                      x3 * da_wu_any(b_n, j, k + 3) +
+                      x4 * da_wu_any(b_n, j, k + 4) +
+                      x5 * da_wu_any(b_n, j, k + 5) +
+                      x6 * da_wu_any(b_n, j, k + 6) +
+                      x7 * da_wu_any(b_n, j, k + 7);
             }
             for (; k < hi; ++k) {
                 float xv = da_x(a_off, k);
-                gr += xv * da_wg(b_n, j, k);
-                ur += xv * da_wu(b_n, j, k);
+                gr += xv * da_wg_any(b_n, j, k);
+                ur += xv * da_wu_any(b_n, j, k);
+            }
+            // Dequantize after the whole slice: the per-column scale is
+            // constant along K, so one multiply per column replaces one per
+            // product. Dead lanes skip it entirely (j >= kw never gets here).
+            if (uPC.weight_int8 != 0) {
+                gr *= da_scale(uPC.N + j);
+                ur *= da_scale(uPC.N + uPC.K + j);
             }
         }
         // Every (row, gx, slice, lane) slot the down pass reads is written:
@@ -458,14 +679,83 @@ void da_down() {
                 for (; jj < j8; jj += 8) {
                     int rbase = ((b_n * kw + jj) * uPC.N + c0) >> 3;
                     int step = uPC.N >> 3;
-                    uvec4 n0 = uWd4.data4[rbase];
-                    uvec4 n1 = uWd4.data4[rbase + step];
-                    uvec4 n2 = uWd4.data4[rbase + 2 * step];
-                    uvec4 n3 = uWd4.data4[rbase + 3 * step];
-                    uvec4 n4 = uWd4.data4[rbase + 4 * step];
-                    uvec4 n5 = uWd4.data4[rbase + 5 * step];
-                    uvec4 n6 = uWd4.data4[rbase + 6 * step];
-                    uvec4 n7 = uWd4.data4[rbase + 7 * step];
+                    vec4 w0;
+                    vec4 w1;
+                    vec4 w2;
+                    vec4 w3;
+                    vec4 w4;
+                    vec4 w5;
+                    vec4 w6;
+                    vec4 w7;
+                    if (uPC.weight_int8 != 0) {
+                        // Byte Wd: the octet is one uvec2 (8 bytes), its two
+                        // words are the lane pair's low/high four columns.
+                        uvec2 n0 = uWd8.data2[rbase];
+                        uvec2 n1 = uWd8.data2[rbase + step];
+                        uvec2 n2 = uWd8.data2[rbase + 2 * step];
+                        uvec2 n3 = uWd8.data2[rbase + 3 * step];
+                        uvec2 n4 = uWd8.data2[rbase + 4 * step];
+                        uvec2 n5 = uWd8.data2[rbase + 5 * step];
+                        uvec2 n6 = uWd8.data2[rbase + 6 * step];
+                        uvec2 n7 = uWd8.data2[rbase + 7 * step];
+                        w0 = da_w8x4(hsel == 0 ? n0.x : n0.y);
+                        w1 = da_w8x4(hsel == 0 ? n1.x : n1.y);
+                        w2 = da_w8x4(hsel == 0 ? n2.x : n2.y);
+                        w3 = da_w8x4(hsel == 0 ? n3.x : n3.y);
+                        w4 = da_w8x4(hsel == 0 ? n4.x : n4.y);
+                        w5 = da_w8x4(hsel == 0 ? n5.x : n5.y);
+                        w6 = da_w8x4(hsel == 0 ? n6.x : n6.y);
+                        w7 = da_w8x4(hsel == 0 ? n7.x : n7.y);
+                    } else {
+                        uvec4 n0 = uWd4.data4[rbase];
+                        uvec4 n1 = uWd4.data4[rbase + step];
+                        uvec4 n2 = uWd4.data4[rbase + 2 * step];
+                        uvec4 n3 = uWd4.data4[rbase + 3 * step];
+                        uvec4 n4 = uWd4.data4[rbase + 4 * step];
+                        uvec4 n5 = uWd4.data4[rbase + 5 * step];
+                        uvec4 n6 = uWd4.data4[rbase + 6 * step];
+                        uvec4 n7 = uWd4.data4[rbase + 7 * step];
+                        w0 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n0.x),
+                                        unpackHalf2x16(n0.y))
+                                 : vec4(unpackHalf2x16(n0.z),
+                                        unpackHalf2x16(n0.w));
+                        w1 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n1.x),
+                                        unpackHalf2x16(n1.y))
+                                 : vec4(unpackHalf2x16(n1.z),
+                                        unpackHalf2x16(n1.w));
+                        w2 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n2.x),
+                                        unpackHalf2x16(n2.y))
+                                 : vec4(unpackHalf2x16(n2.z),
+                                        unpackHalf2x16(n2.w));
+                        w3 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n3.x),
+                                        unpackHalf2x16(n3.y))
+                                 : vec4(unpackHalf2x16(n3.z),
+                                        unpackHalf2x16(n3.w));
+                        w4 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n4.x),
+                                        unpackHalf2x16(n4.y))
+                                 : vec4(unpackHalf2x16(n4.z),
+                                        unpackHalf2x16(n4.w));
+                        w5 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n5.x),
+                                        unpackHalf2x16(n5.y))
+                                 : vec4(unpackHalf2x16(n5.z),
+                                        unpackHalf2x16(n5.w));
+                        w6 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n6.x),
+                                        unpackHalf2x16(n6.y))
+                                 : vec4(unpackHalf2x16(n6.z),
+                                        unpackHalf2x16(n6.w));
+                        w7 = hsel == 0
+                                 ? vec4(unpackHalf2x16(n7.x),
+                                        unpackHalf2x16(n7.y))
+                                 : vec4(unpackHalf2x16(n7.z),
+                                        unpackHalf2x16(n7.w));
+                    }
                     float h0 = da_h[jj - gx * 512];
                     float h1 = da_h[jj + 1 - gx * 512];
                     float h2 = da_h[jj + 2 - gx * 512];
@@ -474,22 +764,6 @@ void da_down() {
                     float h5 = da_h[jj + 5 - gx * 512];
                     float h6 = da_h[jj + 6 - gx * 512];
                     float h7 = da_h[jj + 7 - gx * 512];
-                    vec4 w0 = hsel == 0 ? vec4(unpackHalf2x16(n0.x), unpackHalf2x16(n0.y))
-                                        : vec4(unpackHalf2x16(n0.z), unpackHalf2x16(n0.w));
-                    vec4 w1 = hsel == 0 ? vec4(unpackHalf2x16(n1.x), unpackHalf2x16(n1.y))
-                                        : vec4(unpackHalf2x16(n1.z), unpackHalf2x16(n1.w));
-                    vec4 w2 = hsel == 0 ? vec4(unpackHalf2x16(n2.x), unpackHalf2x16(n2.y))
-                                        : vec4(unpackHalf2x16(n2.z), unpackHalf2x16(n2.w));
-                    vec4 w3 = hsel == 0 ? vec4(unpackHalf2x16(n3.x), unpackHalf2x16(n3.y))
-                                        : vec4(unpackHalf2x16(n3.z), unpackHalf2x16(n3.w));
-                    vec4 w4 = hsel == 0 ? vec4(unpackHalf2x16(n4.x), unpackHalf2x16(n4.y))
-                                        : vec4(unpackHalf2x16(n4.z), unpackHalf2x16(n4.w));
-                    vec4 w5 = hsel == 0 ? vec4(unpackHalf2x16(n5.x), unpackHalf2x16(n5.y))
-                                        : vec4(unpackHalf2x16(n5.z), unpackHalf2x16(n5.w));
-                    vec4 w6 = hsel == 0 ? vec4(unpackHalf2x16(n6.x), unpackHalf2x16(n6.y))
-                                        : vec4(unpackHalf2x16(n6.z), unpackHalf2x16(n6.w));
-                    vec4 w7 = hsel == 0 ? vec4(unpackHalf2x16(n7.x), unpackHalf2x16(n7.y))
-                                        : vec4(unpackHalf2x16(n7.z), unpackHalf2x16(n7.w));
                     a0 += h0 * w0.x + h1 * w1.x + h2 * w2.x + h3 * w3.x +
                           h4 * w4.x + h5 * w5.x + h6 * w6.x + h7 * w7.x;
                     a1 += h0 * w0.y + h1 * w1.y + h2 * w2.y + h3 * w3.y +
@@ -500,15 +774,26 @@ void da_down() {
                           h4 * w4.w + h5 * w5.w + h6 * w6.w + h7 * w7.w;
                 }
                 for (; jj < jend; ++jj) {
-                    vec4 w = da_wd(b_n, jj, c0);
+                    int cc = c0 + (uPC.weight_int8 != 0 ? hsel * 4 : 0);
+                    vec4 w = da_wd_any(b_n, jj, cc);
                     float h = da_h[jj - gx * 512];
                     a0 += h * w.x;
                     a1 += h * w.y;
                     a2 += h * w.z;
                     a3 += h * w.w;
                 }
+                int cst = c0 + hsel * 4;
+                if (uPC.weight_int8 != 0) {
+                    // Wd's per-column scale, applied once per column before the
+                    // partial is parked (the reduce then just sums).
+                    vec4 sd = da_scale4(cst);
+                    a0 *= sd.x;
+                    a1 *= sd.y;
+                    a2 *= sd.z;
+                    a3 *= sd.w;
+                }
                 int row = b_n * uPC.M + tile * DA_MT;
-                int w = da_dp(row, gxs, c0 + hsel * 4);
+                int w = da_dp(row, gxs, cst);
                 uScratch.data[w] = floatBitsToUint(a0);
                 uScratch.data[w + 1] = floatBitsToUint(a1);
                 uScratch.data[w + 2] = floatBitsToUint(a2);
@@ -522,12 +807,19 @@ void da_down() {
             float a2 = 0.0;
             float a3 = 0.0;
             for (int jj = j0; jj < jend; ++jj) {
-                vec4 w = da_wd(b_n, jj, c0);
+                vec4 w = da_wd_any(b_n, jj, c0);
                 float h = da_h[jj - gx * 512];
                 a0 += h * w.x;
                 a1 += h * w.y;
                 a2 += h * w.z;
                 a3 += h * w.w;
+            }
+            if (uPC.weight_int8 != 0) {
+                vec4 sd = da_scale4(c0);
+                a0 *= sd.x;
+                a1 *= sd.y;
+                a2 *= sd.z;
+                a3 *= sd.w;
             }
             int row = b_n * uPC.M + tile * DA_MT;
             int w = da_dp(row, gxs, c0);
@@ -547,7 +839,7 @@ void da_down() {
             acc[r][3] = 0.0;
         }
         for (int jj = j0; jj < jend; ++jj) {
-            vec4 w = da_wd(b_n, jj, c0);
+            vec4 w = da_wd_any(b_n, jj, c0);
             int hb = jj - gx * 512;
             for (int r = 0; r < DA_MT; ++r) {
                 float h = da_h[r * 512 + hb];
@@ -557,13 +849,15 @@ void da_down() {
                 acc[r][3] += h * w.w;
             }
         }
+        vec4 sd = vec4(1.0);
+        if (uPC.weight_int8 != 0) sd = da_scale4(c0);
         for (int r = 0; r < mt; ++r) {
             int row = b_n * uPC.M + tile * DA_MT + r;
             int w = da_dp(row, gxs, c0);
-            uScratch.data[w] = floatBitsToUint(acc[r][0]);
-            uScratch.data[w + 1] = floatBitsToUint(acc[r][1]);
-            uScratch.data[w + 2] = floatBitsToUint(acc[r][2]);
-            uScratch.data[w + 3] = floatBitsToUint(acc[r][3]);
+            uScratch.data[w] = floatBitsToUint(acc[r][0] * sd.x);
+            uScratch.data[w + 1] = floatBitsToUint(acc[r][1] * sd.y);
+            uScratch.data[w + 2] = floatBitsToUint(acc[r][2] * sd.z);
+            uScratch.data[w + 3] = floatBitsToUint(acc[r][3] * sd.w);
         }
     }
 }

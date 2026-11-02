@@ -504,9 +504,25 @@ class MatMulBuffer : public BufferFactory {
                                                         : "fp16";
         size_t scale_index = 0;
         size_t global_index = 0;
+        // The SwiGLU fold carries THREE weights in one MatMul, so a quantized
+        // fold is [x, Wd, Wg, Wu, scale] -- five inputs, with one fp32 table
+        // holding all three per-column scales (the [Sd | Sg | Su] layout is
+        // documented in the DOWN_ACT module header of shaders/buffer/matmul.comp
+        // and built by the converter). That shape is accepted here so the
+        // plain quantized gate below (exactly [A, B, scale]) stays strict; the
+        // table's LENGTH is checked in the fold block, where n / n_up are known.
+        const bool down_act_byte = down_act_ && weight_byte && inputs.size() == 5;
         if (weight_byte || weight_4bit) {
             const size_t want = weight_nvfp4 ? 4 : 3;
-            if (inputs.size() != want) {
+            if (down_act_byte) {
+                if (inputs[4]->elem_kind() != core::ElemKind::kFloat32) {
+                    throw std::runtime_error(
+                        std::string("vkop: MatMul down_act ") + weight_label +
+                        " scale must be float32, got " +
+                        core::elem_name(inputs[4]->elem_kind()));
+                }
+                scale_index = 4;
+            } else if (inputs.size() != want) {
                 throw std::runtime_error(
                     std::string("vkop: MatMul with a ") + weight_label +
                     " weight needs exactly " +
@@ -514,7 +530,9 @@ class MatMulBuffer : public BufferFactory {
                                   : "[A, B, scale]") +
                     ", got " + std::to_string(inputs.size()) + " inputs");
             }
-            if (weight_nvfp4) {
+            if (down_act_byte) {
+                // Validated above; nothing else to check until the shapes are.
+            } else if (weight_nvfp4) {
                 // A block scale that is not an e4m3 byte is not NVFP4: the
                 // format's whole point is that 16-value groups cost one byte
                 // instead of four.
@@ -544,7 +562,9 @@ class MatMulBuffer : public BufferFactory {
                     " dequant scale must be float32, got " +
                     core::elem_name(inputs[2]->elem_kind()));
             }
-            scale_index = 2;
+            if (!down_act_byte) {
+                scale_index = 2;
+            }
         }
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
@@ -685,7 +705,7 @@ class MatMulBuffer : public BufferFactory {
 
         int total = batch * m * n;
 
-        if (weight_byte) {
+        if (weight_byte && !down_act_byte) {
             // The scale indexes output columns, so its length IS N. A mismatch
             // means the weight was quantized along the wrong axis (a [N, K]
             // weight treated as [K, N], which is what a folded Transpose
@@ -830,8 +850,13 @@ class MatMulBuffer : public BufferFactory {
         // and the dispatch below reuses them.
         int down_k_out = 0;
         int down_n_up = -1;
-        const bool down_inputs_ok =
-            down_act_ && inputs.size() == 4 && rank_a >= 2 && rank_b >= 2;
+        // Two weight flavours reach the fold: fp16 [x, Wd, Wg, Wu] (four inputs)
+        // and a byte-quantized [x, Wd, Wg, Wu, scale] (five inputs, the single
+        // concatenated per-column table at binding 4). Anything else is not a
+        // folded node at all.
+        const bool down_inputs_ok = down_act_ &&
+                                    (inputs.size() == 4 || down_act_byte) &&
+                                    rank_a >= 2 && rank_b >= 2;
         if (down_inputs_ok) {
             const auto gated_rank = inputs[2]->getShape().size();
             down_k_out =
@@ -1352,6 +1377,9 @@ class MatMulBuffer : public BufferFactory {
         //   B  = inputs[1] = Wd       [N_up, N] = [K, N], transB == 0
         //   B2 = inputs[2] = Wg       [K_out, N_up]   = x's K, this K
         //   B3 = inputs[3] = Wu       [K_out, N_up]   likewise
+        //   S  = inputs[4] = scale    [N + 2*N_up]    fp32, byte weights only:
+        //        the three per-column tables concatenated (Sd | Sg | Su), see
+        //        the DOWN_ACT module header in shaders/buffer/matmul_down_act.comp.
         // NOTE the shape mapping is NOT the plain MatMul's: this node's `k`
         // (computed above from x's contraction) is K_out, the UP GEMM's
         // contraction -- x is the up projection's A operand, not the down
@@ -1360,28 +1388,46 @@ class MatMulBuffer : public BufferFactory {
         // (m, n, k) only (m, n) carry over to the fold's (M, N); N_up comes
         // from B, and K_out rides in K_act while Wg/Wu are read with their
         // true [K_out, N_up] layout.
-        // The selector's down_act row already proved the 4-input rewrite, the
+        // The selector's down_act row already proved the 4/5-input rewrite, the
         // da_ok geometry and that the module is available: a refused pipeline
         // re-ran the table, so this route implies a live module.
         if (plan.route == core::MatmulRoute::kDownActFold) {
+            const bool da_byte = down_act_byte;
             const int k_out = down_k_out;
             // The kernel's K is Wd's row count (N_up), which is also its
             // contraction length; this node's k is x's K_out (see above), so
             // N_up cannot come from it.
             const int n_up = down_n_up;
             // The fold GEMV's geometry (-DKSPLIT512: 512-lane blocks). Each
-            // deposit block owns 512 up columns (gx = grid.x) for a 16-row
-            // tile (grid.y = batch * ceil(M / 16)) and parks fp32 partials
-            // for ALL N output columns in scratch; the fold pass sums the
-            // grid-x blocks. GX rides to the shader in mind_k.
+            // deposit block owns a contiguous run of up columns (gx = grid.x)
+            // for a 16-row tile (grid.y = batch * ceil(M / 16)); the deposit
+            // parks its slice partials per (row, gx, slice) and the down pass
+            // sums them. GX rides to the shader in mind_k. Decode (M == 1) does
+            // not halve the grid: the wide deposit maps the ks_n K slices onto
+            // the block's lanes (lane/64) and gives each lane an octet of up
+            // columns, so the block still covers 512 columns.
             const int da_gx = UP_DIV(n_up, 512);
             // N % 4 == 0 lets the fold lane own four columns and pack fp16
             // pairs; N <= 2048 covers the output with the block's 512 lanes
             // (2048 = 512 * 4); N_up % 4 == 0 keeps Wg/Wu's RowAlign row
             // stride equal to N_up so the [K_out, N_up] indexing is dense.
             // The da_ok gate (N % 4, N <= 2048, N_up % 4, K_out >= 1) lives in
-            // the selector's down_act row now; keep a scope for the dispatch
-            // pair's locals.
+            // the selector's down_act row now; the byte flavour owes it one more
+            // check the selector cannot make -- the concatenated [Sd | Sg | Su]
+            // table's length, since the kernel indexes Sg/Su at [N, N + N_up).
+            if (da_byte &&
+                static_cast<size_t>(inputs[4]->size()) !=
+                    static_cast<size_t>(n + 2 * n_up) * sizeof(float)) {
+                // A conversion-time bug, not a user-data problem: the kernel
+                // indexes Sd at [0, N), Sg at [N, N + N_up) and Su at
+                // [N + N_up, N + 2*N_up), so a short table would read past it.
+                throw std::runtime_error(
+                    "vkop: MatMul down_act int8 scale is " +
+                    std::to_string(inputs[4]->size()) + " bytes, expected " +
+                    std::to_string(static_cast<size_t>(n + 2 * n_up) *
+                                   sizeof(float)) +
+                    " (N + 2*N_up fp32)");
+            }
             {
                 // bind_ssbo APPENDS to objs_, so binding Wg/Wu here would land
                 // them at slots 3 and 4 and leave the pipeline's 9-slot set
@@ -1400,6 +1446,13 @@ class MatMulBuffer : public BufferFactory {
                                       // fold pass's partial count
                 para_.tile = 0;
                 para_.ks_part = 0; // the module's deposit entry
+                // Byte vs half weights. Already derived from inputs[1] above,
+                // restated here because it is what selects the module's
+                // deposit entry (main() tests weight_int8 after ks_part).
+                para_.weight_int8 = (da_byte && weight_int8) ? 1 : 0;
+                para_.fp8 = (da_byte && weight_fp8) ? 1 : 0;
+                para_.fp8_e5m2 =
+                    (da_byte && bkind == core::ElemKind::kFloat8E5M2) ? 1 : 0;
                 set_route(plan.tag, batch, m, n, n_up, rep);
                 // The K cut. K-split is what makes Wg/Wu read once per layer:
                 // a deposit block walks only its slice, so the grid covers K_out
@@ -1498,6 +1551,13 @@ class MatMulBuffer : public BufferFactory {
                     inputs[2]->gpu_buffer());
                 objs_[8] = std::static_pointer_cast<VulkanResource>(
                     inputs[3]->gpu_buffer());
+                // Binding 4 already holds the byte weight's concatenated
+                // [Sd | Sg | Su] table -- or the dummy the general binding
+                // pass put there for fp16 -- so the fold leaves it untouched.
+                // Bindings 5/6 keep their dummies too (this module reads
+                // neither the NVFP4 global factor nor the attention bias).
+                // (objs_ was sized by the general binding pass; resize(9)
+                // only adds the Wg/Wu slots when they are not there yet.)
                 // Deposit: grid-x over the up-axis blocks, grid-y over the
                 // 16-row tiles of every batch slice, grid-z over the K
                 // slices -- except at M==1, where the wide deposit maps the

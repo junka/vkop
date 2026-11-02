@@ -1386,6 +1386,13 @@ void Runtime::LoadModel() {
                 case vkop::ops::OpType::MAX:
                 case vkop::ops::OpType::MAXPOOL2D:
                 case vkop::ops::OpType::MOD:
+                case vkop::ops::OpType::TOPK:
+                    // TopK's k-even padding, unpacking and value packing are
+                    // keyed on true fp16 data (para_.fp16), while the MoE
+                    // router runs fp32 softmax probabilities through it. The
+                    // op must therefore be built from the DATA input's dtype
+                    // too; precision_ would make topk16() read fp32 logits as
+                    // packed half2 and corrupt the routing weights/ids.
                     op_fp16 =
                         (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
                     break;

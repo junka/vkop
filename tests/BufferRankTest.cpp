@@ -44,18 +44,24 @@ namespace {
 template <typename T>
 void brt_fill(std::shared_ptr<Tensor<T>> &t, const torch::Tensor &tt) {
     auto flat = tt.cpu().contiguous().flatten();
+    std::vector<T> v;
     if constexpr (std::is_same_v<T, uint16_t>) {
         if (flat.scalar_type() != at::kHalf)
             flat = flat.to(at::kHalf);
-    } else if (flat.scalar_type() != at::kFloat) {
-        throw std::invalid_argument("brt_fill: fp32 element torch tensor required");
-    }
-    std::vector<T> v;
-    if constexpr (std::is_same_v<T, uint16_t>) {
         const auto *p =
             reinterpret_cast<const uint16_t *>(flat.data_ptr<at::Half>());
         v.assign(p, p + flat.numel());
+    } else if constexpr (std::is_same_v<T, int8_t>) {
+        // A weight-only quantized B: the tensor's storage is one signed byte
+        // per element (core::ElemKind::kInt8), never a float.
+        if (flat.scalar_type() != at::kChar)
+            flat = flat.to(at::kChar);
+        auto a = flat.accessor<int8_t, 1>();
+        v.assign(a.data(), a.data() + flat.numel());
     } else {
+        if (flat.scalar_type() != at::kFloat)
+            throw std::invalid_argument(
+                "brt_fill: fp32 element torch tensor required");
         auto a = flat.accessor<T, 1>();
         v.assign(a.data(), a.data() + flat.numel());
     }
@@ -1380,6 +1386,79 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
     float rtol = fp16 ? 0.03f : 0.001f;
     float atol = fp16 ? 0.05f : 0.001f;
     return brt_close_to_torch(output, torch_out, rtol, atol);
+}
+
+// The int8-weight fold: all three weights byte-quantized, and the three
+// per-column scales concatenated into ONE fp32 table as [Sd (n) | Sg (n_up) |
+// Su (n_up)] (binding 4). The comparison uses the DEQUANTIZED weights, so the
+// only difference left vs the reference is accumulation order and the fp16
+// output rounding -- the same tolerance the fp16 cases use. m == 1 exercises
+// the dedicated single-row deposit entry; larger m the 16-row tile.
+template <typename T>
+bool brt_down_act_w8_case(int m, int k_out, int n_up, int n) {
+    auto pat = [](int rows, int cols) {
+        auto t = torch::arange(rows * cols,
+                               torch::TensorOptions().dtype(torch::kInt));
+        return (((t * 37) % 29 - 14).to(torch::kFloat) * 0.125f)
+            .reshape({rows, cols});
+    };
+    auto torch_x = torch::ones({m, k_out}, brt_torch_opt<T>());
+    auto wg = pat(k_out, n_up);
+    auto wu = pat(k_out, n_up);
+    auto wd = pat(n_up, n);
+    // Per-output-column absmax / 127, the converter's weight-only scheme.
+    auto quant = [](const torch::Tensor &w) {
+        auto amax = w.abs().amax(0);
+        auto s = torch::where(amax == 0, torch::ones_like(amax), amax / 127.0);
+        auto q = torch::round(w / s).clamp(-127, 127).to(torch::kChar);
+        return std::make_pair(q.contiguous(), s.to(torch::kFloat));
+    };
+    auto qg = quant(wg), qu = quant(wu), qd = quant(wd);
+    auto dq = [](const std::pair<torch::Tensor, torch::Tensor> &p) {
+        return p.first.to(torch::kFloat) * p.second;
+    };
+    auto torch_out = brt_ref_down_act(torch_x, dq(qg), dq(qu), dq(qd));
+    auto scale = torch::cat({qd.second, qg.second, qu.second});
+    Dev d;
+
+    auto in_x = std::make_shared<Tensor<T>>(std::vector<int>{m, k_out});
+    auto in_wd = std::make_shared<Tensor<int8_t>>(
+        std::vector<int>{n_up, n});
+    auto in_wg = std::make_shared<Tensor<int8_t>>(
+        std::vector<int>{k_out, n_up});
+    auto in_wu = std::make_shared<Tensor<int8_t>>(
+        std::vector<int>{k_out, n_up});
+    auto in_s = std::make_shared<Tensor<float>>(
+        std::vector<int>{n + 2 * n_up});
+    brt_fill(in_x, torch_x);
+    brt_fill(in_wd, qd.first);
+    brt_fill(in_wg, qg.first);
+    brt_fill(in_wu, qu.first);
+    brt_fill(in_s, scale);
+    brt_upload(in_x, d);
+    brt_upload(in_wd, d);
+    brt_upload(in_wg, d);
+    brt_upload(in_wu, d);
+    brt_upload(in_s, d);
+
+    auto output = brt_make_out<T>(std::vector<int>{m, n}, d);
+    auto op = brt_make_op(vkop::ops::OpType::MATMUL, true,
+                          {{"down_act", "1"}}, d);
+    if (!op)
+        return false;
+    op->onExecute({in_x, in_wd, in_wg, in_wu, in_s}, {output}, 0);
+    brt_run_op(op.get(), d);
+    output->copyToCPU(d.cmdpool);
+    return brt_close_to_torch(output, torch_out, 0.03f, 0.05f);
+}
+
+TEST(BufferRankTest, MatMulDownActInt8) {
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 32, 64, 32));
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 64, 64, 64));
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(4, 32, 64, 32));
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(64, 32, 64, 64));
+    // Two up-blocks (GX = 2): the concatenated table's Sg/Su offsets move.
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 32, 128, 64));
 }
 
 TEST(BufferRankTest, MatMulDownAct) {

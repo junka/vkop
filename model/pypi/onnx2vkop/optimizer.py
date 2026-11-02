@@ -7868,8 +7868,24 @@ class Quantizer:
         # Get a list of keys to iterate over, to avoid modifying the dict during iteration
         initializers_keys = list(dag_model.initializers.keys())
 
+        # SwiGLU-down-fold weights quantize as a SET, not one at a time. A
+        # folded MatMul is [x, Wd, Wg, Wu] (fold_swiglu_down_proj) and the
+        # runtime's byte path wants [x, Wd, Wg, Wu, scale] with ONE fp32 table
+        # for all three per-column scales. The per-initializer path below only
+        # ever sees Wd as a B operand: it would quantize Wd, append Wd's own
+        # scale, and leave Wg/Wu fp16 -- a node the runtime rejects outright.
+        # Every fold weight is therefore skipped here and converted as a unit
+        # at the end of this pass (_quantize_down_act_weights).
+        down_act_weight_names = set()
+        for node in dag_model.nodes.values():
+            if node.attributes.get("down_act") and len(node.inputs) >= 4:
+                down_act_weight_names.update(
+                    inp["name"] for inp in node.inputs[1:4])
+
         for name in initializers_keys:
             if only is not None and name not in only:
+                continue
+            if name in down_act_weight_names:
                 continue
             if name in getattr(dag_model, "deferred_weights", {}):
                 # Left in its source file: the scale and the payload are built
@@ -8099,6 +8115,8 @@ class Quantizer:
             else:
                 skipped_count += 1
 
+        converted_count += Quantizer._quantize_down_act_weights(dag_model, only)
+
         print(
             f"Converted {converted_count} FP32/FP16 tensors to INT8 with scale information"
         )
@@ -8256,6 +8274,124 @@ class Quantizer:
         out["k"], out["n"] = dims
         out["eligible"] = True
         return out
+
+    @staticmethod
+    def _quantize_down_act_weights(dag_model, only=None):
+        """Convert the three weights of every SwiGLU-fold node as one set.
+
+        A folded down_proj MatMul is [x, Wd, Wg, Wu] (fold_swiglu_down_proj) and
+        the runtime's byte path reads all three per-output-column dequant scales
+        from ONE concatenated fp32 table:
+
+            [ Sd (N) | Sg (N_up) | Su (N_up) ]
+
+        (the DOWN_ACT module header in shaders/buffer/matmul.comp and
+        MatMulBuffer::execute's length check are the other two halves of that
+        ABI). All three weights are quantized here or none is: a partially
+        converted node -- only Wd became int8 and got its own appended scale,
+        which was the behaviour before this pass existed -- is a five-input
+        MatMul with two fp16 weights, and the operator rejects it.
+
+        Returns the number of nodes converted; 0 means every fold stayed fp16,
+        which the fp16 fold kernel still runs correctly.
+        """
+        converted = 0
+        for node in dag_model.nodes.values():
+            if not node.attributes.get("down_act"):
+                continue
+            if len(node.inputs) != 4:
+                continue  # already converted (5 inputs), or not the fold shape
+            names = [inp["name"] for inp in node.inputs[1:4]]
+            if only is not None and any(n not in only for n in names):
+                continue
+            if int(node.attributes.get("transB", 0) or 0) != 0:
+                continue
+            inits = [dag_model.initializers.get(n) for n in names]
+            if any(
+                init is None
+                or init.data_type
+                not in (onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16)
+                for init in inits
+            ):
+                continue
+            arrays = [numpy_helper.to_array(init).astype(np.float32)
+                      for init in inits]
+            if any(a.ndim != 2 for a in arrays):
+                continue
+            # Wd is [N_up, N]; Wg and Wu are [K_out, N_up]. The kernel reads all
+            # three with that dense row-major layout, so a transpose or a shape
+            # mismatch leaves the node fp16 instead of producing a wrong answer.
+            n_up, n = arrays[0].shape
+            if arrays[1].shape != arrays[2].shape or arrays[1].shape[1] != n_up:
+                continue
+            # A byte payload is read four elements at a time (one 32-bit word),
+            # so the last word must be fully populated.
+            if arrays[0].size % 4 or arrays[1].size % 4:
+                continue
+            payloads = []
+            scales = []
+            for arr in arrays:
+                amax = np.amax(np.abs(arr), axis=0)
+                scale = amax / 127.0
+                scale = np.where(scale == 0, 1.0, scale)
+                payloads.append(np.round(arr / scale).astype(np.int8))
+                scales.append(scale.astype(np.float32))
+            for name, payload in zip(names, payloads):
+                init = numpy_helper.from_array(payload, name)
+                init.data_type = onnx.TensorProto.INT8
+                dag_model.initializers[name] = init
+            scale_name = f"{names[0]}_down_act_scale"
+            scale = np.concatenate(scales).astype(np.float32)
+            scale_init = numpy_helper.from_array(scale, scale_name)
+            scale_init.data_type = onnx.TensorProto.FLOAT
+            dag_model.initializers[scale_name] = scale_init
+            node.inputs.append(
+                {"name": scale_name, "shape": [int(scale.size)]})
+            print(
+                f"Converted SwiGLU fold '{names[0]}' to int8 "
+                f"(Wd {list(arrays[0].shape)}, Wg/Wu {list(arrays[1].shape)}, "
+                f"merged scale {int(scale.size)})"
+            )
+            converted += 1
+        Quantizer._validate_down_act_nodes(dag_model)
+        return converted
+
+    @staticmethod
+    def _validate_down_act_nodes(dag_model):
+        """Refuse to emit a SwiGLU fold whose three weights disagree.
+
+        The runtime has exactly two folded shapes: three float weights, or
+        three byte weights plus one concatenated fp32 scale table. Any other
+        combination converts into a model that cannot run -- and, before this
+        check existed, into one that crashed at the first down_proj.
+        """
+        float_kinds = (onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16)
+        for node in dag_model.nodes.values():
+            if not node.attributes.get("down_act"):
+                continue
+            kinds = []
+            for inp in node.inputs[1:4]:
+                init = dag_model.initializers.get(inp["name"])
+                kinds.append(None if init is None else init.data_type)
+            if len(node.inputs) == 5:
+                scale_init = dag_model.initializers.get(node.inputs[4]["name"])
+                ok = (
+                    all(k == onnx.TensorProto.INT8 for k in kinds)
+                    and scale_init is not None
+                    and scale_init.data_type == onnx.TensorProto.FLOAT
+                )
+                want = "three int8 weights plus one fp32 scale table"
+            else:
+                ok = all(k in float_kinds for k in kinds)
+                want = "three float weights"
+            if not ok:
+                out_name = node.outputs[0]["name"] if node.outputs else "?"
+                raise ValueError(
+                    f"vkop: SwiGLU-fold MatMul '{out_name}' has weight types "
+                    f"{[onnx.TensorProto.DataType.Name(k) if k is not None else '?' for k in kinds]}"
+                    f" but the runtime expects {want} (see ops/Matmul.hpp's "
+                    f"down_act gate)"
+                )
 
     @staticmethod
     def _int8_conv_axis(consumers, dims):
