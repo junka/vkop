@@ -38,6 +38,10 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     device_traits_ = core::device_traits_from(*this);
     const core::DeviceProfile &profile =
         core::device_profile_for(device_traits_);
+    // NDEBUG compiles LOG_INFO away to nothing, which leaves `profile` unused
+    // in a release build; the cast keeps the -Werror build clean without
+    // changing the debug path.
+    (void)profile;
     LOG_INFO("MatMul profile: %s (byte_min_m=%d fp16_min_m=%d wide_n=%d "
              "ks_target=%d)",
              profile.name, profile.byte_min_m, profile.fp16_min_m,

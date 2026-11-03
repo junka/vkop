@@ -140,7 +140,8 @@ def test_auto_backend_embeds_both_sides(tmp_path):
     master, _ = fake_master(tmp_path, [
         "buffer_add", "buffer_add_fp16", "image_add", "image_add_fp16",
         "buffer_mul", "buffer_mul_fp16", "image_mul", "image_mul_fp16",
-        "buffer_gather", "buffer_gather_fp16", "buffer_gather_int64"])
+        "buffer_gather", "buffer_gather_fp16", "buffer_gather_int64",
+        "buffer_dispatch_from_shape"])
     m = tiny_dag()
     m.nodes["g"] = Node("Gather", "g", {"axis": 0},
                         [td("x"), td("i", (1,), 7)], [td("gout")])
@@ -149,7 +150,7 @@ def test_auto_backend_embeds_both_sides(tmp_path):
 
     subset, missing, count = build_shader_subset(m, master, backend="auto")
     assert "buffer_add" in subset and "image_add" in subset
-    assert count == 11
+    assert count == 12
     # Gather has no image variant: shader_map emits the phantom "image_gather"
     # (meaning "fall back to buffer_gather"), which must not be reported as a
     # missing shader -- the spelling the runtime would actually ask for is
