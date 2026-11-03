@@ -119,6 +119,7 @@ class Expand : public Operator {
             record_fingerprint(ptr, width, height, layers);
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

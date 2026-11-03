@@ -133,6 +133,7 @@ class TransposeBuffer : public BufferFactory {
             perm_ = parse_attr_list<int>(attributes.at("perm"));
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

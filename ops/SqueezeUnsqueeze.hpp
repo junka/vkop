@@ -64,6 +64,7 @@ class SqueezeUnsqueeze : public Operator {
     void invalidate_shape_cache() override {
         axes_cache_state_ = AxesLearnState::LEARNING;
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

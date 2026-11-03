@@ -223,6 +223,48 @@ class Operator {
         fp_stored_.clear();
     }
 
+    // PassFingerprint 需要在 public, 因为 Runtime 侧的 segment replay 要
+    // 引用它 (segment_fp_stored_ 存的就是 vector<PassFingerprint>). 原本在
+    // protected 里只有 Operator 内部能用, 移到 public 不影响现有 protected
+    // 成员的访问 (class 默认 public 已经可以访问 protected).
+    struct PassFingerprint {
+        std::vector<uint8_t> pc;
+        int w = 0, h = 0, layers = 0;
+        std::vector<uint64_t>
+            handles; // VkBuffer/VkImage handles, in binding order
+        bool operator==(const PassFingerprint &o) const {
+            return pc == o.pc && w == o.w && h == o.h && layers == o.layers &&
+                   handles == o.handles;
+        }
+    };
+
+    // Segment replay 用: 取回本轮 onExecute 收集到的 fp_passes_ 聚合.
+    // graph_cmd_ 路径下 record_fingerprint 依然会填充 fp_passes_ (在 submit /
+    // dispatch 调用点无条件触发), 所以调用此方法取到的就是段 replay
+    // 比对所需的数据. graph_mode 关 / replay 关 / 非 graph 路径时也安全.
+    virtual const std::vector<PassFingerprint> &current_fingerprint() const {
+        return fp_passes_;
+    }
+
+    // --- Segment replay: 结构门控 ----------------------------------------
+    //
+    // 段 replay 会跳过该段所有 op 的 onExecute/execute, 而有些 op 的副作用
+    // 发生在**宿主侧**——不录制在 command buffer 里, 一旦跳过就会让 GPU
+    // 读到旧内容. 典型例子:
+    //   - MatMul down_act 路径: scratch_da_->getMappedMemory() 直接写
+    //     HOST_VISIBLE|HOST_COHERENT buffer 里的 KS_HDR + slice table, 不
+    //     走 vkCmdXxx.
+    //   - Range/Reshape/Squeeze/Expand/Gather/Equal/Where/Cast/Concat/
+    //     NonZero/Transpose/Slice/Split/Shape: host-shape 模式下
+    //     copyToCPU + fillToCPU + copyToGPUDeferred.
+    //   - Attention: copyToCPU 回读 kv_cache ring_head.
+    //   - Expand: 同步 copyToGPU(m_cmdpool_) 直接 staging 上传.
+    //
+    // 这类 op 所在的 segment **一律不可 replay**. 默认 false (无副作用),
+    // 只在真正有宿主侧写操作的 op override 返回 true. 判定只看节点类型,
+    // 不看内容.
+    virtual bool has_host_side_effects() const { return false; }
+
     // Drop any cached shape-input readback (option C: converter static
     // annotation). Called by Runtime across a phase boundary (prefill→decode)
     // where, even for value_dynamic=false shape tensors, the resolved dim[]
@@ -446,13 +488,8 @@ class Operator {
     // (handle, not contents — preallocated KV buffers keep a stable handle
     // across rounds even as their contents change). Buffer *contents* changing
     // is fine (the shader reads whatever is in the buffer at submit time); only
-    // a handle/shape/dispatch change forces a re-record.
-    struct PassFingerprint {
-        std::vector<uint8_t> pc;
-        int w = 0, h = 0, layers = 0;
-        std::vector<uint64_t>
-            handles; // VkBuffer/VkImage handles, in binding order
-    };
+    // a handle/shape/dispatch change forces a re-record. PassFingerprint
+    // struct 已移至 public 区域 (Runtime 侧 segment replay 需引用).
     std::vector<PassFingerprint> fp_passes_; // accumulated during one onExecute
     std::vector<PassFingerprint>
         fp_stored_; // from the round that earned CACHED

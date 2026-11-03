@@ -299,6 +299,7 @@ class MatMulBuffer : public BufferFactory {
     // execute(); the tags are the shader family, not the SPIR-V entry name.
     std::string route_tag() const override { return route_tag_; }
     std::string route_info() const override { return route_info_; }
+    bool has_host_side_effects() const override { return true; }
     void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                             const std::shared_ptr<VulkanCommandPool> &cmdpool,
                             VkPipelineCache cache = VK_NULL_HANDLE) override {

@@ -63,6 +63,7 @@ class Range : public Operator {
         cached_out_shape_.clear();
         stable_rounds_ = 0;
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

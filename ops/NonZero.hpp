@@ -74,6 +74,7 @@ class NonZero : public BufferFactory {
         cached_out_shape_.clear();
         cached_out_.clear();
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

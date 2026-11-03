@@ -28,6 +28,7 @@ class Shape : public Operator {
     bool uses_buffer_backend() const override { return true; }
 
     explicit Shape() : Operator(OpType::SHAPE, {}) {}
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

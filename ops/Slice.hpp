@@ -182,6 +182,7 @@ class SliceBuffer : public BufferFactory {
         cached_out_size_.clear();
         stable_rounds_ = 0;
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

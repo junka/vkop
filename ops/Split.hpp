@@ -144,6 +144,7 @@ class SplitBuffer : public BufferFactory {
             num_outputs_ = std::stoi(attributes.at("num_outputs"));
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

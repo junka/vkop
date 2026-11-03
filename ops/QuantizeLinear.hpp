@@ -92,6 +92,7 @@ class QuantizeLinear : public BufferFactory {
         // from input/output dtypes at execute() time.
         (void)attributes;
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

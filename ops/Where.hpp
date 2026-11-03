@@ -98,6 +98,7 @@ class Where : public Operator {
     // GPU-driven and reads no host data, so there is no readback cache to
     // reset). The runtime calls this at phase boundaries unconditionally.
     void invalidate_shape_cache() override {}
+    bool has_host_side_effects() const override { return true; }
 
   private:
     // Host-shape mode: broadcast-select cond/X/Y on the host. cond (Equal) and

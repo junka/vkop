@@ -114,6 +114,13 @@ void VulkanCommandBuffer::begin() {
                            ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
                            : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
 
+    // replayable_ 的 buffer 可能已经处于 Executable 状态 (上轮 end + submit
+    // 过, reset 循环不再主动 reset), 必须先 vkResetCommandBuffer 让它回到
+    // Initial 再 begin. 非 replayable buffer 依赖外部 reset 循环, 不做隐式 reset.
+    if (replayable_) {
+        vkResetCommandBuffer(m_commandBuffer_, 0);
+    }
+
     // Defensive: a NULL handle means the buffer was never allocated (or was
     // lost); re-allocate rather than crashing inside vkBeginCommandBuffer.
     if (m_commandBuffer_ == VK_NULL_HANDLE) {

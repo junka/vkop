@@ -149,6 +149,7 @@ class AttentionBuffer : public BufferFactory {
             cache_scale_ = std::stof(attributes.at("cache_scale"));
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     // (B, H, S, D) -> a 4-element shape check helper.

@@ -2841,15 +2841,28 @@ double Runtime::Run() {
     }
     // Levels per segment (VKOP_GRAPH_SEGMENT=N). The default 64 splits the
     // 981-level decode graph into 16 segments, which measured fastest: one
-    // segment for the whole round (N=0) is slower because the single Metal
-    // command buffer serializes the tail of the round, and N=1 degenerates to
-    // the per-level submit path. Readback levels still force a boundary
-    // regardless of this cap.
+    // segment for the whole round is slower because the single command buffer
+    // serializes the tail of the round, and N=1 degenerates to the per-level
+    // submit path. Readback levels still force a boundary regardless of this
+    // cap. Any non-positive value (0 or negative) is clamped to 64, because
+    // graph_segment=0 would collapse every level into one segment AND break
+    // the est_seg ceiling division ((N + 0 - 1) / 0), and negative values are
+    // nonsensical. A one-shot warning is emitted so the operator knows their
+    // setting was overridden, rather than silently doing something unexpected.
+    static bool gs_warned = false;
     int graph_segment = 64;
     if (const char *gse = std::getenv("VKOP_GRAPH_SEGMENT")) {
         graph_segment = std::atoi(gse);
-        if (graph_segment < 0)
-            graph_segment = 0;
+        if (graph_segment <= 0) {
+            graph_segment = 64;
+            if (!gs_warned) {
+                fprintf(stderr,
+                        "[graph] VKOP_GRAPH_SEGMENT must be positive, got %d; "
+                        "clamped to default 64\n",
+                        std::atoi(gse));
+                gs_warned = true;
+            }
+        }
     }
     // Skip all intra-segment vkCmdPipelineBarrier calls. On MoltenVK / Apple
     // GPUs, dispatches within one compute encoder are strictly ordered by
@@ -2864,9 +2877,31 @@ double Runtime::Run() {
     bool graph_no_barrier = false;
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';
-    std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds;
+
+    // Segment-level replay (VKOP_SEGMENT_REPLAY=1). Off by default.
+    // 仅当 graph_mode 开时有效. 与 Operator 级 replay_mode_ 互不干扰.
+    bool seg_replay = false;
+    if (graph_mode) {
+        if (const char *sr = std::getenv("VKOP_SEGMENT_REPLAY")) {
+            seg_replay = sr[0] == '1';
+            if (const char *sw = std::getenv("VKOP_SEGMENT_REPLAY_WARMUP")) {
+                int w = std::atoi(sw);
+                if (w > 0) segment_replay_warmup_ = w;
+            }
+        }
+    }
+    segment_replay_enabled_ = seg_replay;
+
+    // graph_cmds_ 是 Runtime 成员变量 (runtime.hpp), 跨轮持久化.
+    // Run() 开头根据 replay 开关决定是否 clear:
+    //   - replay 关闭: clear (保持旧的局部变量语义, 每轮重建)
+    //   - replay 开启 & 稳定: 保留, 跨轮复用 buffer 内容
+    //   - replay 开启 & 不稳定/miss: 预判分支里 clear (见 segment 预判)
+    if (!seg_replay) {
+        graph_cmds_.clear();
+    }
     std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
-    size_t graph_next_seg = 0;  // next free slot in graph_cmds
+    size_t graph_next_seg = 0;  // next free slot in graph_cmds_
     size_t graph_seg_start = 0; // level_idx the open segment started at
     uint64_t graph_prev_val = 0;
     VkSemaphore graph_prev_sem = VK_NULL_HANDLE;
@@ -2876,7 +2911,7 @@ double Runtime::Run() {
     // pool slots, and so the readback hook always opens a *distinct* buffer: a
     // VkSubmitInfo may not wait on the semaphore it signals.
     auto graph_open = [&](size_t level_idx) {
-        if (graph_next_seg >= graph_cmds.size()) {
+        if (graph_next_seg >= graph_cmds_.size()) {
             // id 0, not the segment ordinal: the id picks a command pool and
             // VulkanCommandPool keeps one pool per compute QUEUE FAMILY. Every
             // segment is submitted on queue0, so every buffer must come from
@@ -2885,30 +2920,56 @@ double Runtime::Run() {
             // odd segments into family 2's pool and submits them on a family 0
             // queue -- a VUID-vkQueueSubmit-pCommandBuffers-00074 violation that
             // takes the driver down in vkQueueSubmit.
-            graph_cmds.push_back(std::make_shared<VulkanCommandBuffer>(
+            graph_cmds_.push_back(std::make_shared<VulkanCommandBuffer>(
                 m_cmdpool_, 0));
         }
-        graph_seg = graph_cmds[graph_next_seg++];
+        graph_seg = graph_cmds_[graph_next_seg++];
+        graph_seg->set_replayable(true);  // SIMULTANEOUS_USE, 允许跨轮持久化
         graph_seg->clearWaits();
         graph_seg->begin();
         graph_seg_start = level_idx;
     };
+    // segment replay 用: 每 segment 覆盖的 op indices, graph_submit 时聚合 fp.
+    // 必须在 graph_submit lambda 之前声明, 让 [&] 能捕获到.
+    std::vector<std::vector<int>> seg_op_indices_curr;
+    seg_op_indices_curr.push_back({});  // 第 0 段
+
     // Close + submit the open segment, chaining it onto the previous segment's
     // timeline signal so the two are ordered on the queue.
+    // 自动判断 skip_record: 如果当前 segment 在 segment_replay_hit_this_round_
+    // 里标记为 hit, 就不再 end() (buffer 上轮已经 end 过了), 直接重建 timeline
+    // 链并 submit 上轮录好的内容.
     auto graph_submit = [&]() {
         if (!graph_seg)
             return;
-        graph_seg->end();
+        size_t ord = graph_next_seg - 1;
+        bool skip_record = seg_replay &&
+                           ord < segment_replay_hit_this_round_.size() &&
+                           segment_replay_hit_this_round_[ord];
+        // 只有非 hit 段才更新 stored fp. hit 段的 fp 是上轮存好的.
+        if (seg_replay && !skip_record) {
+            auto &seg_ops = seg_op_indices_curr[ord];
+            std::vector<vkop::ops::Operator::PassFingerprint> agg;
+            agg.reserve(seg_ops.size() * 2);
+            for (int op_idx : seg_ops) {
+                auto &fp = node_ops_[op_idx]->current_fingerprint();
+                agg.insert(agg.end(), fp.begin(), fp.end());
+            }
+            if (segment_fp_stored_.size() <= ord)
+                segment_fp_stored_.resize(ord + 1);
+            segment_fp_stored_[ord] = std::move(agg);
+        }
+        if (!skip_record) {
+            graph_seg->end();
+        }
         if (graph_prev_sem != VK_NULL_HANDLE)
             graph_seg->addWait(graph_prev_sem, graph_prev_val);
-        // Time the submit itself: MoltenVK encodes the whole command buffer
-        // into a Metal command buffer synchronously inside vkQueueSubmit, so a
-        // big segment's encoding cost lands here rather than in the GPU wait.
         auto gs_t0 = run_profile ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
         graph_prev_val = graph_seg->submit(queue0);
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
+        seg_op_indices_curr.push_back({});  // 开下一段的空集合
         if (run_profile) {
             auto gs_t1 = std::chrono::steady_clock::now();
             prof_submit_ms +=
@@ -2938,26 +2999,201 @@ double Runtime::Run() {
     }
     int graph_readbacks_lvl = 0; // readback count at the current level's start
 
+    // --- Segment replay 预判 ---
+    if (graph_mode && seg_replay) {
+        segment_replay_round_++;
+        bool stable = (segment_replay_last_readbacks_ == 0) &&
+                      !segment_fp_stored_.empty() &&
+                      segment_replay_round_ > segment_replay_warmup_;
+        size_t est_seg = (level_node_indices_.size() + graph_segment - 1) /
+                         graph_segment;
+        if (stable && segment_fp_stored_.size() == est_seg) {
+            // 段级 fingerprint 预比对: segment 数对得上只是第一步,
+            // 还要逐段把当前轮所有 op 的 fp 聚合起来和上轮存的比对.
+            // 任何一段不匹配 → 该段 hit=false → 重录 (形状变了 / reshape 了).
+            //
+            // 注意: graph_cmd_ 路径里 Operator::fp_passes_ 只 clear 不填
+            // (onExecute 里 objs_.clear() + fp_passes_.clear() 但 execute()
+            // 不会主动 push PassFingerprint), 所以我们不依赖它 —— 直接
+            // 把每个 op 的 input/output tensor device() handles 收进
+            // PassFingerprint.handles 字段. ResizeInput 每轮重建 VkBuffer,
+            // handle 变化 → fingerprint 自然比对失败 → hit=false.
+            segment_replay_hit_this_round_.assign(est_seg, true);
+            // 可选日志: 段为什么不可 replay (段号 + 触发它的 op 类型).
+            const bool seg_log =
+                std::getenv("VKOP_SEGMENT_REPLAY_LOG") != nullptr;
+            for (size_t ord = 0; ord < est_seg; ord++) {
+                size_t seg_start = ord * graph_segment;
+                size_t seg_end = std::min(seg_start + graph_segment,
+                                          level_node_indices_.size());
+                // --- 结构门控: 段内任一 op 有宿主侧副作用 → 段不可 replay ---
+                // 判定只看节点类型, 不看内容. 一旦命中直接 hit=false,
+                // 跳过后续 fingerprint 比对 (省时间且结果不变).
+                bool seg_host_side_effects = false;
+                int trigger_op_idx = -1;
+                for (size_t li = seg_start; li < seg_end; li++) {
+                    for (int op_idx : level_node_indices_[li]) {
+                        auto &op = node_ops_[op_idx];
+                        if (op->has_host_side_effects()) {
+                            seg_host_side_effects = true;
+                            trigger_op_idx = op_idx;
+                            goto seg_effects_found;  // 跳出双层循环
+                        }
+                    }
+                }
+seg_effects_found:
+                if (seg_host_side_effects) {
+                    segment_replay_hit_this_round_[ord] = false;
+                    if (seg_log) {
+                        auto *op = (trigger_op_idx >= 0 &&
+                                    trigger_op_idx <
+                                        static_cast<int>(node_ops_.size()))
+                                       ? node_ops_[trigger_op_idx].get()
+                                       : nullptr;
+                        fprintf(stderr,
+                                "[seg-replay] seg %zu: skip (host-side "
+                                "effects: op[%d] %s)\n",
+                                ord, trigger_op_idx,
+                                op ? op->get_name().c_str() : "?");
+                    }
+                    continue;  // 跳过该段 fingerprint 聚合
+                }
+                // 段内所有 op 都无宿主侧副作用: 继续 fingerprint 比对.
+                std::vector<vkop::ops::Operator::PassFingerprint> curr_fp;
+                curr_fp.reserve((seg_end - seg_start) * 2);
+                for (size_t li = seg_start; li < seg_end; li++) {
+                    for (int op_idx : level_node_indices_[li]) {
+                        auto &op = node_ops_[op_idx];
+                        // 先取 Operator 内部可能有的 fp_passes_ (per-op
+                        // replay 路径里会填), graph_cmd_ 路径里为空.
+                        auto &op_fp = op->current_fingerprint();
+                        curr_fp.insert(curr_fp.end(), op_fp.begin(),
+                                       op_fp.end());
+                        // Runtime 侧补: 收集 input tensor 的
+                        // VulkanBuffer handles. ResizeInput 每轮重建
+                        // VkBuffer → handle 变化 → fingerprint 自然比对
+                        // 失败 → hit=false. output handles 每轮都变,
+                        // 不收集.
+                        auto gather_handles = [&](const auto &tensors) {
+                            for (auto &t : tensors) {
+                                if (!t) continue;
+                                auto res = t->gpu_buffer();
+                                if (!res) continue;
+                                auto type = res->getResourceType();
+                                curr_fp.push_back({});
+                                auto &pf = curr_fp.back();
+                                if (type == ResourceType::VK_BUFFER) {
+                                    auto vb =
+                                        std::dynamic_pointer_cast<VulkanBuffer>(
+                                            res);
+                                    if (vb)
+                                        pf.handles.push_back(
+                                            reinterpret_cast<uint64_t>(
+                                                vb->getBuffer()));
+                                }
+                            }
+                        };
+                        gather_handles(node_input_tensors_[op_idx]);
+                    }
+                }
+                if (curr_fp != segment_fp_stored_[ord]) {
+                    segment_replay_hit_this_round_[ord] = false;
+                }
+            }
+            // 如果全 miss, 清空 graph_cmds_ 让 graph_open 重新分配 + 重录.
+            bool any_hit = false;
+            for (bool b : segment_replay_hit_this_round_)
+                if (b) { any_hit = true; break; }
+            if (!any_hit) {
+                segment_fp_stored_.clear();
+                graph_cmds_.clear();
+            }
+        } else {
+            segment_fp_stored_.clear();
+            graph_cmds_.clear();  // segment 数/划分变了, 旧 buffer 也作废
+            segment_replay_hit_this_round_.assign(est_seg, false);
+        }
+    }
+
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
          level_idx++) {
-        // Graph mode: keep a segment open and put a memory barrier between the
-        // previous level's ops and this level's (the per-op timeline waits do
-        // not exist inside a single recording). VKOP_GRAPH_SEGMENT=N
-        // additionally forces a submit every N levels.
+        // --- Host-side reshape_view pre-pass ---
+        // This block used to sit deep inside the per-op loop, and the
+        // segment-replay hit path skipped it entirely — which broke decode:
+        // input tensors (past_key_values, input_ids…) share a single
+        // VkBuffer allocation across rounds and only their dims/strides
+        // need updating on the host side. Skipping reshape_view on a hit
+        // segment meant the GPU kept reading last round's view, producing
+        // stale logits forever. Running this before the hit check makes
+        // reshape_view unconditional for every level; reshape_view is
+        // shape-idempotent (same shape → no-op) so a second occurrence
+        // further down the per-op loop is harmless.
+        for (int node_idx : level_node_indices_[level_idx]) {
+            const auto &shapes = node_input_shapes_[node_idx];
+            const auto &ins = node_input_tensors_[node_idx];
+            for (size_t k = 0; k < ins.size() && k < shapes.size(); ++k) {
+                if (!ins[k])
+                    continue;
+                if (shapes[k].empty()) {
+                    if (init_ptrs.count(ins[k].get()))
+                        ins[k]->reshape_view(shapes[k]);
+                } else {
+                    bool has_dyn = false;
+                    for (int d : shapes[k]) {
+                        if (d == -1) { has_dyn = true; break; }
+                    }
+                    if (!has_dyn)
+                        ins[k]->reshape_view(shapes[k]);
+                }
+            }
+        }
+
         if (graph_mode) {
             graph_readbacks_lvl = graph_readbacks;
-            bool boundary = graph_seg && level_idx != graph_seg_start;
-            if (boundary && graph_segment > 0 &&
-                static_cast<int>(level_idx - graph_seg_start) >=
-                    graph_segment) {
+            // 计算当前 segment 是否 replay hit
+            bool seg_hit = graph_seg && graph_next_seg > 0 &&
+                           graph_next_seg - 1 < segment_replay_hit_this_round_.size() &&
+                           segment_replay_hit_this_round_[graph_next_seg - 1];
+            bool boundary = graph_seg && !seg_hit && level_idx != graph_seg_start;
+            if (boundary && static_cast<int>(level_idx - graph_seg_start) >=
+                                graph_segment) {
                 graph_submit();
                 boundary = false;
             }
-            if (!graph_seg)
+            // 预判下一段是否 hit → pre_hit: 跳过 graph_open 的 begin(), 保留上轮录制内容
+            bool pre_hit = !graph_seg && seg_replay &&
+                           segment_replay_round_ > segment_replay_warmup_ &&
+                           graph_next_seg < segment_replay_hit_this_round_.size() &&
+                           segment_replay_hit_this_round_[graph_next_seg];
+            if (pre_hit) {
+                if (graph_next_seg >= graph_cmds_.size())
+                    graph_cmds_.push_back(std::make_shared<VulkanCommandBuffer>(
+                        m_cmdpool_, 0));
+                graph_seg = graph_cmds_[graph_next_seg++];
+                graph_seg->set_replayable(true);
+                graph_seg->clearWaits();
+                // 不调 begin(): 保留上轮 Executable 状态, 直接 re-submit.
+                graph_seg_start = level_idx;
+            } else if (!graph_seg) {
                 graph_open(level_idx);
-            else if (boundary) {
+            } else if (boundary && !seg_hit) {
                 if (!graph_no_barrier)
                     graph_seg->pipelineBarrier();
+            }
+            // replay hit 段: 跳过 per-level 所有 op 的 record, 等段尾 graph_submit
+            // 自动用 skip_record=true re-submit 上轮 buffer.
+            if (seg_replay && segment_replay_round_ > segment_replay_warmup_ &&
+                graph_seg && graph_next_seg > 0 &&
+                graph_next_seg - 1 < segment_replay_hit_this_round_.size() &&
+                segment_replay_hit_this_round_[graph_next_seg - 1]) {
+                // runprof 计数器在下面的 per-level 循环里累加; hit 段
+                // continue 跳过了那部分, 所以在这里补上. 不改任何耗时统计
+                // (hit 段确实零 record 开销).
+                if (run_profile) {
+                    prof_nlevels++;
+                    prof_nops += static_cast<int>(level_node_indices_[level_idx].size());
+                }
+                continue;
             }
         }
         const auto &level_nodes = level_node_indices_[level_idx];
@@ -3073,6 +3309,15 @@ double Runtime::Run() {
                 }
             }
             graph_op_idx = -1;
+            // segment replay: 记录本 op 属于当前 segment. replay hit 段被 continue
+            // 跳过不会走到这里; 只有正常 record 的 miss 段才收集.
+            if (graph_mode && seg_replay && graph_next_seg > 0 &&
+                !segment_replay_hit_this_round_.empty() &&
+                graph_next_seg - 1 < segment_replay_hit_this_round_.size() &&
+                !segment_replay_hit_this_round_[graph_next_seg - 1]) {
+                seg_op_indices_curr[graph_next_seg - 1].push_back(
+                    static_cast<int>(node_idx));
+            }
             // [probe] report-only per-node live shape trace
             if (std::getenv("VKOP_SHAPE_TRACE")) {
                 printf("[shape] lvl=%zu node=%zu %s", level_idx, node_idx,
@@ -3362,8 +3607,8 @@ double Runtime::Run() {
         // are waited and reset further down, alongside the per-op path's tail.
         graph_submit();
         VulkanCommandBuffer::pre_readback_hook = nullptr;
-        if (!graph_cmds.empty())
-            last_commands[0] = graph_cmds.back();
+        if (!graph_cmds_.empty())
+            last_commands[0] = graph_cmds_.back();
     } else {
         // Flush the tail: any remaining levels that didn't trigger a forced
         // flush above (the last batch, or the tail of a non-readback run).
@@ -3377,13 +3622,13 @@ double Runtime::Run() {
         }
     }
     if (graph_mode) {
-        // Every segment buffer must be returned to the initial state before the
-        // next round reuses its pool slot; waiting on the last one is not
-        // enough (see the reset note below).
-        for (auto &c : graph_cmds) {
+        // 只 wait + clearWaits, **不 reset**: 让 segment buffer 保持
+        // Executable 状态, 下轮 replay hit 时可以直接 submit. miss 段的
+        // graph_open 里会先 reset 再 begin (见 graph_open 的 replayable_
+        // 分支). 这对非 replay 场景也安全 — 仅多一次无条件 reset.
+        for (auto &c : graph_cmds_) {
             c->wait();
             c->clearWaits();
-            c->reset();
         }
     }
     // The final-level wait (timeline semaphore above) guarantees the GPU has
@@ -3438,7 +3683,19 @@ double Runtime::Run() {
     }
     if (graph_mode) {
         fprintf(stderr, "[graph] %zu segments, %d readback boundaries\n",
-                graph_cmds.size(), graph_readbacks);
+                graph_cmds_.size(), graph_readbacks);
+        if (segment_replay_enabled_) {
+            int hits = 0, miss = 0;
+            for (auto b : segment_replay_hit_this_round_)
+                b ? hits++ : miss++;
+            fprintf(stderr,
+                    "[seg-replay] %d/%d hit, %d miss (warmup=%d round=%d "
+                    "readbacks=%d)\n",
+                    hits, hits + miss, miss, segment_replay_warmup_,
+                    segment_replay_round_, graph_readbacks);
+            segment_replay_last_readbacks_ = graph_readbacks;
+            segment_replay_last_segment_count_ = graph_cmds_.size();
+        }
     }
 
     if (replay_mode_) {
@@ -3580,11 +3837,19 @@ double Runtime::Run() {
             fprintf(stderr, "[submitprof] %-14s %6d %8.2f\n", "TOTAL",
                     static_cast<int>(node_ops_.size()), total_gpu_ms);
             // Top-N slowest individual ops (reveals which MatMuls dominate).
+            // VKOP_SUBMITPROF_TOPN raises the list for per-node studies: the
+            // default 15 truncates a graph whose interesting family (e.g. the
+            // 28 down_proj nodes) is larger than that, and a truncated sum
+            // silently under-reports. 0 means "every op".
             std::sort(per_op_ms.begin(), per_op_ms.end(),
                       [](const auto &a, const auto &b) { return a.ms > b.ms; });
-            const int topn = 15;
-            fprintf(stderr, "[submitprof] --- top %d slowest ops ---\n", topn);
-            for (int i = 0; i < topn && i < (int)per_op_ms.size(); ++i) {
+            const char *topn_env = std::getenv("VKOP_SUBMITPROF_TOPN");
+            const int topn = topn_env ? std::atoi(topn_env) : 15;
+            const int topn_clamped =
+                (topn <= 0) ? static_cast<int>(per_op_ms.size()) : topn;
+            fprintf(stderr, "[submitprof] --- top %d slowest ops ---\n",
+                    topn_clamped);
+            for (int i = 0; i < topn_clamped && i < (int)per_op_ms.size(); ++i) {
                 const auto &e = per_op_ms[i];
                 fprintf(stderr, "[submitprof] %8.3fms  %-12s %s\n", e.ms,
                         e.type.c_str(), e.name.c_str());

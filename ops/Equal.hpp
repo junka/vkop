@@ -54,6 +54,7 @@ class Equal : public BufferBinaryFactory {
             record_fingerprint(ptr, width, height, layers);
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     // Host-shape mode: compare the int64 inputs on the host. The inputs are

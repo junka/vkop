@@ -109,6 +109,17 @@ class PimplFacade : public Operator {
     // execute(), so the façade must read it there.
     std::string route_tag() const override { return impl_->route_tag(); }
     std::string route_info() const override { return impl_->route_info(); }
+    // Segment replay 结构门控: has_host_side_effects() 在 impl_ 上判定.
+    // Façade 默认返回 false 会让 Runtime 误以为该 op 无副作用, 错误地
+    // 允许 replay.
+    bool has_host_side_effects() const override {
+        return impl_->has_host_side_effects();
+    }
+    // 同 route_tag 的转发陷阱: current_fingerprint() 在 impl_ 上填充.
+    const std::vector<PassFingerprint> &current_fingerprint()
+        const override {
+        return impl_->current_fingerprint();
+    }
     // Same forwarding trap as dump_fingerprint: the indirect buffer lives in
     // impl_, so a façade-level call without this would silently read nothing.
     std::vector<uint32_t> debug_indirect_grid() override {

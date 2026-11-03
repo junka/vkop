@@ -50,6 +50,7 @@ class BufferBinaryFactory : public BufferFactory {
                DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
               sizeof(BinaryElemPC), fp16),
           activation_(static_cast<int>(activation)) {}
+    bool has_host_side_effects() const override { return true; }
 
   protected:
     static std::vector<int>

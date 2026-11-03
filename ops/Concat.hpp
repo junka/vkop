@@ -172,6 +172,7 @@ class ConcatBuffer : public BufferFactory {
             axis_ = std::stol(attributes.at("axis"));
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     // Build the int64-data pipeline lazily on first int64 execute. The int64

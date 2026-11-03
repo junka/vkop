@@ -252,6 +252,7 @@ class ReshapeBuffer : public BufferFactory {
         linear_rounds_ = 0;
         re_stable_prev_.clear();
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     void execute(

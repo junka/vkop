@@ -148,6 +148,7 @@ class Gather : public Operator {
             record_fingerprint(ptr, width, height, layers);
         }
     }
+    bool has_host_side_effects() const override { return true; }
 
   private:
     static std::vector<int>
