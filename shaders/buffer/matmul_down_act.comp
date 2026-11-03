@@ -508,7 +508,12 @@ void da_deposit_wide_byte(int b_n, int tile, int gx, int lane) {
 
 // Deposit: this block owns K slice s of its 512 up columns and its 16-row tile.
 // It walks only its slice, so every Wg/Wu byte is read once across the grid:
-// the (gx, s) grid covers [N_up] x [K_out] exactly once per row.
+// the (gx, s) grid covers [N_up] x [K_out] exactly once per ROW-TILE -- the
+// k-outer/r-inner walk below loads each k's weight pair once and feeds the
+// whole 16-row tile from registers ("row axis rides free", same trick as the
+// down walk's shared h). The previous r-outer form re-walked the K slice per
+// row, so the weight stream scaled with M: at m=15 that re-read was ~5.5 of
+// the 5.9 ms fold (n-shrink differential, docs/down-act-fold-report.md).
 //
 // Grid: x = gx, y = b_n*rt + tile, z = s. The three axes are not
 // interchangeable -- swapping y/z silently reads another batch slice's rows
@@ -540,40 +545,16 @@ void da_deposit() {
     int mt = min(DA_MT, uPC.M - tile * DA_MT);
     int lo = ks_lo(s);
     int hi = ks_hi(s);
-    for (int r = 0; r < DA_MT; ++r) {
-        if (r >= mt) break;
+    if (mt == 1) {
+        // Lone live row (a tail tile, or a shape the wide gate rejected):
+        // the k-outer walk below runs 16 rows of FMAs and x loads for one
+        // accumulator, so a tail tile would cost as much as a full one.
+        // Walk the slice directly instead.
         float gr = 0.0;
         float ur = 0.0;
         if (j < kw) {
-            int a_off = (b_n * uPC.M + tile * DA_MT + r) * kx;
-            int k = lo;
-            for (; k + 7 < hi; k += 8) {
-                float x0 = da_x(a_off, k + 0);
-                float x1 = da_x(a_off, k + 1);
-                float x2 = da_x(a_off, k + 2);
-                float x3 = da_x(a_off, k + 3);
-                float x4 = da_x(a_off, k + 4);
-                float x5 = da_x(a_off, k + 5);
-                float x6 = da_x(a_off, k + 6);
-                float x7 = da_x(a_off, k + 7);
-                gr += x0 * da_wg_any(b_n, j, k + 0) +
-                      x1 * da_wg_any(b_n, j, k + 1) +
-                      x2 * da_wg_any(b_n, j, k + 2) +
-                      x3 * da_wg_any(b_n, j, k + 3) +
-                      x4 * da_wg_any(b_n, j, k + 4) +
-                      x5 * da_wg_any(b_n, j, k + 5) +
-                      x6 * da_wg_any(b_n, j, k + 6) +
-                      x7 * da_wg_any(b_n, j, k + 7);
-                ur += x0 * da_wu_any(b_n, j, k + 0) +
-                      x1 * da_wu_any(b_n, j, k + 1) +
-                      x2 * da_wu_any(b_n, j, k + 2) +
-                      x3 * da_wu_any(b_n, j, k + 3) +
-                      x4 * da_wu_any(b_n, j, k + 4) +
-                      x5 * da_wu_any(b_n, j, k + 5) +
-                      x6 * da_wu_any(b_n, j, k + 6) +
-                      x7 * da_wu_any(b_n, j, k + 7);
-            }
-            for (; k < hi; ++k) {
+            int a_off = (b_n * uPC.M + tile * DA_MT) * kx;
+            for (int k = lo; k < hi; ++k) {
                 float xv = da_x(a_off, k);
                 gr += xv * da_wg_any(b_n, j, k);
                 ur += xv * da_wu_any(b_n, j, k);
@@ -586,14 +567,46 @@ void da_deposit() {
                 ur *= da_scale(uPC.N + uPC.K + j);
             }
         }
-        // Every (row, gx, slice, lane) slot the down pass reads is written:
-        // dead lanes (j >= kw) stage zeros so the tail block's h is exact.
-        // RAW partials -- the silu waits for the reassembled gate.
-        int row = b_n * uPC.M + tile * DA_MT + r;
+        int row = b_n * uPC.M + tile * DA_MT;
         uScratch.data[da_gp(row, gx, s, lane)] =
             floatBitsToUint(j < kw ? gr : 0.0);
         uScratch.data[da_up(row, gx, s, lane)] =
             floatBitsToUint(j < kw ? ur : 0.0);
+        return;
+    }
+    // k-outer / r-inner. gr/ur/aoff stay in registers because the r trip
+    // count is the compile-time DA_MT (same contract as the down walk's
+    // acc[DA_MT][4]); the store loop's dynamic mt bound only reads what the
+    // accumulation loop wrote. Rows past mt clamp their x read to a live row
+    // (never OOB) and their junk accumulators are never stored.
+    float gr[DA_MT];
+    float ur[DA_MT];
+    int aoff[DA_MT];
+    for (int r = 0; r < DA_MT; ++r) {
+        gr[r] = 0.0;
+        ur[r] = 0.0;
+        int rrow = min(tile * DA_MT + r, uPC.M - 1);
+        aoff[r] = (b_n * uPC.M + rrow) * kx;
+    }
+    if (j < kw) {
+        for (int k = lo; k < hi; ++k) {
+            float wgv = da_wg(b_n, j, k);
+            float wuv = da_wu(b_n, j, k);
+            for (int r = 0; r < DA_MT; ++r) {
+                float xv = da_x(aoff[r], k);
+                gr[r] += xv * wgv;
+                ur[r] += xv * wuv;
+            }
+        }
+    }
+    // Every (row, gx, slice, lane) slot the down pass reads is written:
+    // dead lanes (j >= kw) stage zeros so the tail block's h is exact.
+    for (int r = 0; r < mt; ++r) {
+        int row = b_n * uPC.M + tile * DA_MT + r;
+        uScratch.data[da_gp(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? gr[r] : 0.0);
+        uScratch.data[da_up(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? ur[r] : 0.0);
     }
 }
 

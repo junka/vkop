@@ -1560,10 +1560,18 @@ class MatMulBuffer : public BufferFactory {
                 // only adds the Wg/Wu slots when they are not there yet.)
                 // Deposit: grid-x over the up-axis blocks, grid-y over the
                 // 16-row tiles of every batch slice, grid-z over the K
-                // slices -- except at M==1, where the wide deposit maps the
-                // slices into the block's lanes (lane/64) and grid-z is 1.
+                // slices -- except when the shader will take the wide
+                // deposit at M==1 (it maps the slices into the block's
+                // lanes, lane/64, and needs grid-z = 1). The host mirrors
+                // the shader's wide gate exactly (uPC.M == 1, K % 8 == 0,
+                // ks_n <= 8, 512 % ks_n == 0, byte and half forms alike): a
+                // shape that fails it must dispatch all ks_n slices, or the
+                // scalar form writes only slice 0 and the down pass sums
+                // stale slots into h.
+                const bool da_wide_ok = (m == 1) && ((n_up % 8) == 0) &&
+                                        da_ks_n <= 8 && (512 % da_ks_n) == 0;
                 ks_submit(sel_down_act, down_act_ds_[m_id_], da_gx,
-                          batch * ((m + 15) / 16), m == 1 ? 1 : da_ks_n);
+                          batch * ((m + 15) / 16), da_wide_ok ? 1 : da_ks_n);
                 // Down: sums the deposit's slice partials per (row, j) into
                 // shared, walks the sub-block's Wd j-slice for every output
                 // column, parks fp32 down partials keyed (row, gx*ds+z, c).

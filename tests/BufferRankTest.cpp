@@ -1335,7 +1335,8 @@ torch::Tensor brt_ref_down_act(const torch::Tensor &x, const torch::Tensor &wg,
 }
 
 template <typename T>
-bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
+bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16,
+                       float scale = 0.125f) {
     // Deterministic operands. x is identically 1 (each output is then a pure
     // sum over N_up, so any misindexing shows up as a bias). The weights come
     // from the pattern (i*37) % 29 - 14 scaled to +-1.75: 37 and 29 are
@@ -1347,10 +1348,14 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
     // 0 * inf = nan in the reference itself. All three weights carry the
     // pattern (wd=ones would NOT catch a transposed Wd read -- ones is its
     // own transpose), and the comparison runs in fp32 (see brt_ref_down_act).
-    auto pat = [](int rows, int cols) {
+    // The scale argument drops for the full-width cases: at N_up=6144 the
+    // N_up-wide recombination of +-1.75 taps overflows the fp16 output store
+    // (the reference's own value would exceed 65504), so the tap height shrinks
+    // rather than the shape.
+    auto pat = [&](int rows, int cols) {
         auto t = torch::arange(rows * cols,
                                torch::TensorOptions().dtype(torch::kInt));
-        return (((t * 37) % 29 - 14).to(torch::kFloat) * 0.125f)
+        return (((t * 37) % 29 - 14).to(torch::kFloat) * scale)
             .to(brt_torch_opt<T>())
             .reshape({rows, cols});
     };
@@ -1378,14 +1383,74 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16) {
     // down_act's operand order is the fused node's: [x, Wd, Wg, Wu].
     auto op = brt_make_op(vkop::ops::OpType::MATMUL, fp16,
                           {{"down_act", "1"}}, d);
-    if (!op)
+    if (!op) {
+        std::printf("[down_act m=%d k_out=%d n_up=%d n=%d] op creation "
+                    "returned null\n",
+                    m, k_out, n_up, n);
         return false;
+    }
     op->onExecute({in_x, in_wd, in_wg, in_wu}, {output}, 0);
     brt_run_op(op.get(), d);
     output->copyToCPU(d.cmdpool);
     float rtol = fp16 ? 0.03f : 0.001f;
     float atol = fp16 ? 0.05f : 0.001f;
-    return brt_close_to_torch(output, torch_out, rtol, atol);
+    auto flat = torch_out.cpu().contiguous().flatten();
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        if (flat.scalar_type() != at::kHalf)
+            flat = flat.to(at::kHalf);
+    }
+    bool ok = true;
+    int bad = 0;
+    float maxdiff = 0.0f;
+    int bad_rows = 0;
+    for (int i = 0; i < output->num_elements(); ++i) {
+        float got, exp;
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            got = vkop::core::ITensor::fp16_to_fp32((*output)[i]);
+            exp = vkop::core::ITensor::fp16_to_fp32(
+                reinterpret_cast<const uint16_t *>(
+                    flat.template data_ptr<at::Half>())[i]);
+        } else {
+            got = float((*output)[i]);
+            exp = float(flat[i].template item<T>());
+        }
+        float thr = std::max(std::abs(exp) * rtol, atol);
+        float d = std::abs(got - exp);
+        maxdiff = std::max(maxdiff, d);
+        if (d > thr) {
+            if (bad < 10)
+                std::printf("[down_act m=%d n=%d] mismatch %d (r=%d c=%d): "
+                            "got=%f exp=%f\n",
+                            m, n, i, i / n, i % n, got, exp);
+            ++bad;
+            ok = false;
+        }
+    }
+    if (!ok) {
+        for (int r = 0; r < m; ++r) {
+            for (int c = 0; c < n; ++c) {
+                float got, exp;
+                if constexpr (std::is_same_v<T, uint16_t>) {
+                    got = vkop::core::ITensor::fp16_to_fp32((*output)[r * n + c]);
+                    exp = vkop::core::ITensor::fp16_to_fp32(reinterpret_cast<
+                        const uint16_t *>(
+                        flat.template data_ptr<at::Half>())[r * n + c]);
+                } else {
+                    got = float((*output)[r * n + c]);
+                    exp = float(flat[r * n + c].template item<T>());
+                }
+                if (std::abs(got - exp) > std::max(std::abs(exp) * rtol, atol)) {
+                    ++bad_rows;
+                    break;
+                }
+            }
+        }
+        std::printf("[down_act m=%d k_out=%d n_up=%d n=%d] FAIL: %d/%d "
+                    "elements in %d/%d rows, maxdiff=%f\n",
+                    m, k_out, n_up, n, bad, output->num_elements(), bad_rows, m,
+                    maxdiff);
+    }
+    return ok;
 }
 
 // The int8-weight fold: all three weights byte-quantized, and the three
@@ -1474,6 +1539,16 @@ TEST(BufferRankTest, MatMulDownAct) {
     EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 64, 64, true));
     // Two up-blocks (GX = 2) for the deposit's grid-x split.
     EXPECT_TRUE(brt_down_act_case<uint16_t>(64, 32, 128, 64, true));
+    // The Qwen3-VL decoder's real down_proj shape: K_out=2048 (ks_n = 8 K
+    // slices), N_up=6144 (GX = 12 up blocks), N=2048. M=15 is the prefill row
+    // count (one partial 16-row tile), M=1 the decode GEMV. This is the only
+    // case that exercises ks_n > 1 -- several K slices per (row, gx) slot
+    // group and the fold's slice-sum refill.
+    // Isolate ks_n>1 vs GX>1: the two real-shape failures must split.
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 2048, 512, 64, true, 0.02f));
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 32, 1024, 64, true, 0.02f));
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(15, 2048, 6144, 2048, true, 0.02f));
+    EXPECT_TRUE(brt_down_act_case<uint16_t>(1, 2048, 6144, 2048, true, 0.02f));
 }
 
 // =========================================================================
