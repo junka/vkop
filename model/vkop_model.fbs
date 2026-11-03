@@ -122,11 +122,28 @@ table InitializerEntry {
   // because FlatBuffers addresses fields by declaration order -- an older
   // vkopbin simply reads as "" / -1, which is exactly "no paging".
   //
-  // Within one group the entries must be a uniform, hole-free, ascending byte
-  // run: the runtime computes a slot's offset arithmetically from the expert
-  // id rather than remembering it (dag.py asserts this at write time).
+  // A group's experts are addressed by a lookup table, not by arithmetic: the
+  // checkpoint that provides them stores each expert's three projections in
+  // name order (down, gate, up) inside each shard, so expert e is not at
+  // `first + e * size` -- measured, the stride between expert 0 and expert 1 of
+  // layer 0's gate_proj is 5939680 bytes for a 5767168-byte tensor. Each slot
+  // therefore carries where its own bytes live: `moe_source` names the file
+  // (relative to the vkopbin) and `moe_offset`/`moe_size` the slice of it, all
+  // three meaningful only when `moe_group` is non-empty. The runtime builds
+  // (group, expert_id) -> (source, offset, size) at load time from these.
+  // Within a group the entries must still be uniform in size and cover expert
+  // ids 0..n-1 with no gaps (dag.py asserts both at write time); ascending byte
+  // order is *not* required.
   moe_group: string;
   moe_expert_id: int = -1;
+  moe_source: string;
+  moe_offset: ulong;
+  moe_size: ulong;
+  // Dtype of the bytes at moe_source, when it differs from `dtype` above. The
+  // Qwen1.5-MoE checkpoint is bfloat16 while the vkopbin is fp16, so `dtype` is
+  // what the slot's buffer holds and this is what the source file holds; the
+  // runtime converts between them on the way in. Empty means "same as dtype".
+  moe_source_dtype: string;
 }
 
 table Node {

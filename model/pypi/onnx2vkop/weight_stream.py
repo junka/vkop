@@ -290,7 +290,8 @@ def _stream_entry(tensor, base_dir, location, offset, length,
 
 def prepare(model, base_dir: str, *, quant: Optional[str] = None,
             unify: bool = False, rgba: bool = False,
-            keep_in_file=(), verbose: bool = True) -> Dict[str, dict]:
+            keep_in_file=(), transcribe_slots: bool = False,
+            verbose: bool = True) -> Dict[str, dict]:
     """Hydrate what the pipeline may read; return the deferred-weight table.
 
     Called right after `onnx.load(..., load_external_data=False)`: the whole
@@ -304,10 +305,21 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
     scale -- a 4320-slot expert pool is 23 GiB, and reading it once is the OOM
     this whole path exists to prevent. Slots fail the dtype gate for a reason
     that says nothing about whether their bytes may be streamed (a producer may
-    leave the pool float32; the runtime derives each expert's stride from dtype
-    and dims, so the extent is checked instead), and they fail the consumer gate
-    by design (an unwired slot is read by nobody). See `restore_paging_slots`
-    for the contract each named slot is then held to.
+    leave the pool float32, and `moe_source_dtype` on the row records that the
+    source is bf16 while the buffer is fp16 -- the runtime notes it and converts
+    on the way in, and the slice's extent is taken from the source file rather
+    than derived), and they fail the consumer gate by design (an unwired slot is
+    read by nobody). See `restore_paging_slots` for the contract each named slot
+    is then held to.
+
+    A declared slot is *not* transcribed into the trailer by default: it gets no
+    deferred entry, so the writer lays no bytes down for it, and its extent is
+    recorded as 0. The runtime pages every expert -- resident ones included --
+    from the file the exporter named (`moe_source`/`moe_offset`/`moe_size`,
+    vkop_model.fbs InitializerEntry), so a second copy in the trailer would be
+    23 GiB of dead weight that also hid a missing source slice behind plausible
+    bytes. Pass `transcribe_slots=True` to get that second copy anyway, which is
+    what a model whose checkpoint has been deleted needs.
     """
     declared = {name for name in keep_in_file}
     graph = model.graph
@@ -324,35 +336,59 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
     # be tracked by `deferred` alone -- those tensors are hydrated instead of
     # deferred, unless they are declared slots (see below).
     seen_names = Counter(init.name for init in graph.initializer)
-    by_name = {}
     for init in graph.initializer:
         if not uses_external_data(init):
             continue  # inline already: the bytes are in the proto
-        by_name.setdefault(init.name, init)
         location, offset, length = _external_fields(init)
+        is_slot = init.name in declared
+        if is_slot and not transcribe_slots:
+            # A slot is paged from the file the exporter named, never from the
+            # trailer, so it gets no bytes here. Recording it in `deferred`
+            # would make the writer copy 23 GiB into the vkopbin only for the
+            # runtime to read a different file anyway (see `_slot_entries`).
+            continue
         keep_in_file_gates = (refusal is None
                               and seen_names[init.name] == 1
                               and length >= cap)
-        if keep_in_file_gates and init.name not in declared:
+        if keep_in_file_gates and not is_slot:
             keep_in_file_gates = (
-                init.data_type in _PASS_THROUGH_DATA_TYPES
+                (init.data_type in _PASS_THROUGH_DATA_TYPES
+                 or (init.data_type == TensorProto.FLOAT
+                     and not exports_weight_values(quant, unify, rgba)))
                 and length == payload_bytes(init)
                 and _only_weight_consumers(consumers.get(init.name)))
         if keep_in_file_gates:
-            deferred[init.name] = _stream_entry(
+            entry = _stream_entry(
                 init, base_dir, location, offset, length,
                 sum(consumers.get(init.name, Counter()).values()))
+            if (init.data_type == TensorProto.FLOAT
+                    and not exports_weight_values(quant, unify, rgba)):
+                # A byte format quantizes this weight's bytes on the way into
+                # the trailer, so the row says both what the file holds and
+                # what the payload will be: the writer, verify_deferred and the
+                # length checks key on the recorded dtype, and the tensor keeps
+                # FLOAT so no pass believes 4-byte values sit in a 1-byte
+                # payload. quant_payload fills in the scale.
+                entry["src_dtype"] = TensorProto.FLOAT
+                entry["data_type"] = _BYTE_PAYLOAD_DTYPES[quant]
+                entry["quant"] = quant
+            deferred[init.name] = entry
 
     # A declared slot the gates above turned down anyway -- a name the graph
     # repeats is the one case left -- must still not be hydrated: its bytes are
     # the expert pool. It is streamed as a slot instead, and
-    # `restore_paging_slots` holds it to the slot contract.
-    for name in sorted(declared - set(deferred)):
-        init = by_name.get(name)
-        if init is None or refusal is not None:
-            continue
-        location, offset, length = _external_fields(init)
-        deferred[name] = _stream_entry(init, base_dir, location, offset, length, 1)
+    # `restore_paging_slots` holds it to the slot contract. Walked in graph
+    # order, not sorted, so the order the slot entries come out in is the order
+    # the exporter declared them in.
+    if transcribe_slots:
+        for init in graph.initializer:
+            if init.name in deferred or init.name not in declared:
+                continue
+            if refusal is not None:
+                continue
+            location, offset, length = _external_fields(init)
+            deferred[init.name] = _stream_entry(
+                init, base_dir, location, offset, length, 1)
 
     # Everything else that points at an external file gets its bytes, with the
     # same state transition onnx's own whole-model loader applies, so no
@@ -360,25 +396,27 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
     streams = set(deferred) | declared
     hydrated = 0
     for tensor in _all_tensors(model):
-        if tensor.name in streams or not uses_external_data(tensor):
+        if not uses_external_data(tensor) or tensor.name in streams:
             continue
         _hydrate(tensor, base_dir)
         hydrated += 1
 
     # Fail closed on anything this walk did not reach: an external reference
-    # nobody loaded becomes a silently missing weight, and the count is the
-    # name-independent check that only the planned tensors stayed in the file.
-    still_external = [t.name for t in _all_tensors(model) if uses_external_data(t)]
-    streamed_external = [n for n in still_external if n in deferred]
-    unexpected = [n for n in still_external if n not in deferred]
-    seen_declared = sum(1 for n in declared if n in deferred)
-    if unexpected or len(streamed_external) + len(declared) - seen_declared != len(streams):
+    # nobody loaded becomes a silently missing weight. Compared by name, not by
+    # object: `_all_tensors` builds fresh TensorProto wrappers on every scan (it
+    # reads 6382 objects for 6308 distinct tensors on llm_moe_paged.onnx), so
+    # object identity does not survive from one scan to the next, while the
+    # name set is exactly what the writer keys payloads on.
+    still_external = {t.name for t in _all_tensors(model) if uses_external_data(t)}
+    # A declared slot is *meant* to stay external -- prepare skips it and
+    # restore_paging_slots clears its pointer later -- so it is not a leak.
+    unexpected = sorted(still_external - streams)
+    if unexpected:
         raise DeferredWeightError(
-            f"{len(still_external)} tensor(s) still point at external data "
-            f"after hydration but only {len(deferred)} were left there "
-            f"(unexpected: {unexpected[:5]}); _all_tensors does not reach where "
-            f"they live, so streaming would lose them, or reaches a second copy "
-            f"of a name that streaming can only carry once")
+            f"{len(still_external)} name(s) still point at external data after "
+            f"hydration, and {len(unexpected)} of them were not meant to stay "
+            f"there (unexpected: {unexpected[:5]}); _all_tensors does not reach "
+            f"where they live, so streaming would lose them")
 
     if verbose:
         if refusal is not None:
@@ -407,6 +445,48 @@ def _only_weight_consumers(ops: Optional[Counter]) -> bool:
     if not ops:
         return False
     return set(ops) <= _WEIGHT_ONLY_CONSUMERS
+
+
+def slot_sources(model, base_dir: str, slot_names) -> Dict[str, tuple]:
+    """Locate each paging slot's bytes in the file the exporter streamed it from.
+
+    Returns name -> (location, offset, length, data_type) where `location` is
+    the file relative to `base_dir` and data_type is the dtype *of the bytes
+    there* (bfloat16 stays bfloat16: the runtime converts a paged expert on the
+    way in, exactly as the loader converts any bf16 initializer).
+
+    The extent is taken from `external_data` rather than derived from dtype and
+    dims, which is why it is read here, before `restore_paging_slots` clears the
+    pointer. The two agree for every slot the exporter emits (checked, not
+    assumed) -- but only the file knows how many bytes the expert actually has,
+    and a mismatch is a runtime pread of the wrong length.
+
+    This is the addressing unit the runtime pages by anyway: a slot's
+    (location, offset, length) *is* its entry in the source file. vkopbin has no
+    way to keep it that way (the trailer is one file, the checkpoint's shards
+    are not), so the slice is recorded in the slot's InitializerEntry instead.
+    """
+    by_name = {t.name: t for t in _all_tensors(model)}
+    sources: Dict[str, tuple] = {}
+    for name in slot_names:
+        tensor = by_name.get(name)
+        if tensor is None:
+            raise DeferredWeightError(
+                f"MoE paging slot '{name}' is not a tensor of this graph; the "
+                f"exporter's slot declarations name something the model does "
+                f"not have (see make_moe_variant.py).")
+        if not uses_external_data(tensor):
+            # A slot whose declaration lost its external pointer is one
+            # `restore_paging_slots` already handled; its extent is known from
+            # the deferred entry it built, but the *location* is gone. Nothing
+            # can page from a file name that is no longer written down.
+            raise DeferredWeightError(
+                f"MoE paging slot '{name}' has no external_data: its source "
+                f"file is unknown, so the runtime has nothing to page from. "
+                f"slot_sources() must run before restore_paging_slots().")
+        location, offset, length = _external_fields(tensor)
+        sources[name] = (location, int(offset), int(length), tensor.data_type)
+    return sources
 
 
 def restore_paging_slots(model, base_dir: str, deferred: Dict[str, dict],

@@ -29,6 +29,7 @@ try:
         RGBAConverter,
         Unifier,
         _disabled_passes,
+        _position_paging_slots,
     )
 except ImportError:
     from dag import (
@@ -51,6 +52,7 @@ except ImportError:
         RGBAConverter,
         Unifier,
         _disabled_passes,
+        _position_paging_slots,
     )
 
 
@@ -192,6 +194,8 @@ class ModelConverter:
         # are streamed into the .vkopbin trailer at save time.
         base_dir = os.path.dirname(os.path.abspath(onnx_path))
         weight_stream.install_guard()
+        # Called on both sides of optimize_model, so bind it once here.
+        restore_paging_slots = weight_stream.restore_paging_slots
 
         # MoE paging slots: vkop_moe_group / vkop_moe_expert_id on the
         # graph.input / graph.value_info declarations of slot initializers
@@ -244,6 +248,36 @@ class ModelConverter:
         if bf16_count:
             print(f"[bf16] downcast {bf16_count} bfloat16 tensor(s) to float16")
 
+        # Slots have to be declared in expert order *before* the passes run, and
+        # the passes are not order-preserving: onnxoptimizer's
+        # eliminate_unused_initializer rebuilds `graph.initializer`, and the
+        # order it keeps is that of the surviving graph inputs. Measured: the
+        # 4320 slots came out fully interleaved with the dense weights, so the
+        # row order stopped matching the exporter's and every diagnostic that
+        # compares "expert e of layer l" against a sorted list went wrong.
+        # Addressing no longer depends on it (each slot carries its own
+        # moe_source/moe_offset/moe_size), but sorted output is still what makes
+        # a dump readable.
+        if moe_slots:
+            moved = _position_paging_slots(model, moe_slots)
+            print(f"[moe] slot declaration order: {moved} initializer(s) "
+                  f"moved ahead of the dense weights")
+
+        # Where each slot's bytes are in the checkpoint. Read before the
+        # pointer is cleared, and kept because the writer records it: a paged
+        # expert is pread from this slice at run time, and the trailer does not
+        # hold a copy (weight_stream.prepare's `transcribe_slots`).
+        #
+        # `restore_paging_slots` then drops the external_data pointer so every
+        # later walk of the graph skips hydrating the pool (the bytes were kept
+        # out of RAM by `prepare`), and checks each slot's (dtype, dims, length)
+        # extent. With transcription off, a slot gets no deferred entry, so that
+        # extent check is the only signal left that a pass ate a payload -- the
+        # two states otherwise look identical (no pointer, no bytes).
+        moe_sources = {}
+        if moe_slots:
+            moe_sources = weight_stream.slot_sources(model, base_dir, moe_slots)
+            restore_paging_slots(model, base_dir, deferred_weights, moe_slots)
         print("Optimizing ONNX model...")
         model = self.optimizer.optimize_model(model, batch_size,
                                               keep_alive=moe_slots)
@@ -254,17 +288,27 @@ class ModelConverter:
         dag_model = DAGBasedModel()
         dag_model.moe_keep_alive = set(moe_slots)
         dag_model.moe_slots = moe_slots
-        # The slot bytes were kept out of RAM by `prepare`; this validates what
-        # it recorded and drops the external_data pointer the optimizer may have
-        # re-attached, so no later walk hydrates the pool.
+        dag_model.moe_sources = moe_sources
+        # Slots dropped out of the model entirely while the passes ran (a
+        # keep-alive node the optimizer removed takes its slot with it). Caught
+        # here, while the declaration is still in hand; the write-time
+        # keep-alive check in dag.save_to_binary is the backstop.
         if moe_slots:
-            added, cleared = weight_stream.restore_paging_slots(
+            added, cleared = restore_paging_slots(
                 model, base_dir, deferred_weights, moe_slots)
             held = sum(e["length"] for n, e in deferred_weights.items()
                        if n in moe_slots)
-            print(f"[moe] {len(moe_slots) - added} slot(s) streamed by prepare, "
-                  f"{added} built here, {cleared} external_data pointer(s) "
-                  f"cleared; {held >> 20} MiB of experts stays on disk")
+            if held:
+                print(f"[moe] {len(moe_slots) - added} slot(s) streamed by "
+                      f"prepare, {added} built here, {cleared} external_data "
+                      f"pointer(s) cleared; {held >> 20} MiB of experts stays "
+                      f"on disk")
+            else:
+                # The normal case now: slots are not transcribed into the
+                # trailer, so the only copy of the pool is the checkpoint.
+                print(f"[moe] {len(moe_slots)} slot(s) declared, {cleared} "
+                      f"external_data pointer(s) cleared, 0 slot bytes in the "
+                      f"trailer; the pool stays in the checkpoint")
         # The streaming contract the parse step negotiated: names whose payload
         # never entered RAM, and where to read them from when the blob is
         # written. save_to_binary verifies it before writing anything.

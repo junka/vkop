@@ -427,6 +427,33 @@ target_link_libraries(KernelPlanTest PRIVATE vkop vload)
 add_dependencies(KernelPlanTest ModelTest shader_archive)
 add_test(NAME KernelPlanTest COMMAND KernelPlanTest ${MODEL_VKOPBIN})
 
+# MoE paging slot rows as the C++ loader reads them. Two fixtures are written by
+# the Python writer at configure/build time (the same code path the real
+# llm_moe_paged.vkopbin takes): one paged model, one pre-paging model. This is a
+# loader-level test, not a runtime one -- it needs no Vulkan device -- because
+# the failure it guards is a misread row, not a misread pixel: a slot declares
+# size=0 and pages its bytes from moe_source, and a load of a file written
+# before those fields existed must be indistinguishable from "no paging".
+set(MOE_SLOTS_PAGED ${CMAKE_CURRENT_BINARY_DIR}/model/moe_paged_slots.vkopbin)
+set(MOE_SLOTS_ABSENT ${CMAKE_CURRENT_BINARY_DIR}/model/moe_slots_absent.vkopbin)
+add_custom_command(
+    OUTPUT ${MOE_SLOTS_PAGED} ${MOE_SLOTS_ABSENT}
+    COMMAND ${Python3_EXECUTABLE} -X utf8
+            ${CMAKE_CURRENT_SOURCE_DIR}/make_moe_slots_fixture.py
+            ${CMAKE_CURRENT_BINARY_DIR}/model
+    DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/make_moe_slots_fixture.py
+            ${ONNX2VKOP_PY}
+    COMMENT "Writing the MoE paging slot fixtures"
+    VERBATIM
+)
+add_executable(MoeSlotLoadTest MoeSlotLoadTest.cpp
+               ${MOE_SLOTS_PAGED} ${MOE_SLOTS_ABSENT})
+target_link_libraries(MoeSlotLoadTest PRIVATE vkop vload)
+target_compile_definitions(MoeSlotLoadTest PRIVATE
+    TEST_DATA_PATH="${CMAKE_CURRENT_BINARY_DIR}/model"
+)
+add_test(NAME MoeSlotLoadTest COMMAND MoeSlotLoadTest)
+
 # VKSP reader unit test (not a gtest: no torch, so it stays cheap to rebuild).
 # Covers the parse() validation branches -- bad magic/version/count, truncated
 # header, damaged or non-SPIR-V entries, and that open_from_memory owns its

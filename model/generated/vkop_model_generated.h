@@ -692,6 +692,10 @@ struct InitializerEntryT : public ::flatbuffers::NativeTable {
   uint64_t size = 0;
   std::string moe_group{};
   int32_t moe_expert_id = -1;
+  std::string moe_source{};
+  uint64_t moe_offset = 0;
+  uint64_t moe_size = 0;
+  std::string moe_source_dtype{};
 };
 
 struct InitializerEntry FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
@@ -707,7 +711,11 @@ struct InitializerEntry FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
     VT_OFFSET = 10,
     VT_SIZE = 12,
     VT_MOE_GROUP = 14,
-    VT_MOE_EXPERT_ID = 16
+    VT_MOE_EXPERT_ID = 16,
+    VT_MOE_SOURCE = 18,
+    VT_MOE_OFFSET = 20,
+    VT_MOE_SIZE = 22,
+    VT_MOE_SOURCE_DTYPE = 24
   };
   const ::flatbuffers::String *name() const {
     return GetPointer<const ::flatbuffers::String *>(VT_NAME);
@@ -751,6 +759,30 @@ struct InitializerEntry FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
   bool mutate_moe_expert_id(int32_t _moe_expert_id = -1) {
     return SetField<int32_t>(VT_MOE_EXPERT_ID, _moe_expert_id, -1);
   }
+  const ::flatbuffers::String *moe_source() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_MOE_SOURCE);
+  }
+  ::flatbuffers::String *mutable_moe_source() {
+    return GetPointer<::flatbuffers::String *>(VT_MOE_SOURCE);
+  }
+  uint64_t moe_offset() const {
+    return GetField<uint64_t>(VT_MOE_OFFSET, 0);
+  }
+  bool mutate_moe_offset(uint64_t _moe_offset = 0) {
+    return SetField<uint64_t>(VT_MOE_OFFSET, _moe_offset, 0);
+  }
+  uint64_t moe_size() const {
+    return GetField<uint64_t>(VT_MOE_SIZE, 0);
+  }
+  bool mutate_moe_size(uint64_t _moe_size = 0) {
+    return SetField<uint64_t>(VT_MOE_SIZE, _moe_size, 0);
+  }
+  const ::flatbuffers::String *moe_source_dtype() const {
+    return GetPointer<const ::flatbuffers::String *>(VT_MOE_SOURCE_DTYPE);
+  }
+  ::flatbuffers::String *mutable_moe_source_dtype() {
+    return GetPointer<::flatbuffers::String *>(VT_MOE_SOURCE_DTYPE);
+  }
   template <bool B = false>
   bool Verify(::flatbuffers::VerifierTemplate<B> &verifier) const {
     return VerifyTableStart(verifier) &&
@@ -765,6 +797,12 @@ struct InitializerEntry FLATBUFFERS_FINAL_CLASS : private ::flatbuffers::Table {
            VerifyOffset(verifier, VT_MOE_GROUP) &&
            verifier.VerifyString(moe_group()) &&
            VerifyField<int32_t>(verifier, VT_MOE_EXPERT_ID, 4) &&
+           VerifyOffset(verifier, VT_MOE_SOURCE) &&
+           verifier.VerifyString(moe_source()) &&
+           VerifyField<uint64_t>(verifier, VT_MOE_OFFSET, 8) &&
+           VerifyField<uint64_t>(verifier, VT_MOE_SIZE, 8) &&
+           VerifyOffset(verifier, VT_MOE_SOURCE_DTYPE) &&
+           verifier.VerifyString(moe_source_dtype()) &&
            verifier.EndTable();
   }
   InitializerEntryT *UnPack(const ::flatbuffers::resolver_function_t *_resolver = nullptr) const;
@@ -797,6 +835,18 @@ struct InitializerEntryBuilder {
   void add_moe_expert_id(int32_t moe_expert_id) {
     fbb_.AddElement<int32_t>(InitializerEntry::VT_MOE_EXPERT_ID, moe_expert_id, -1);
   }
+  void add_moe_source(::flatbuffers::Offset<::flatbuffers::String> moe_source) {
+    fbb_.AddOffset(InitializerEntry::VT_MOE_SOURCE, moe_source);
+  }
+  void add_moe_offset(uint64_t moe_offset) {
+    fbb_.AddElement<uint64_t>(InitializerEntry::VT_MOE_OFFSET, moe_offset, 0);
+  }
+  void add_moe_size(uint64_t moe_size) {
+    fbb_.AddElement<uint64_t>(InitializerEntry::VT_MOE_SIZE, moe_size, 0);
+  }
+  void add_moe_source_dtype(::flatbuffers::Offset<::flatbuffers::String> moe_source_dtype) {
+    fbb_.AddOffset(InitializerEntry::VT_MOE_SOURCE_DTYPE, moe_source_dtype);
+  }
   explicit InitializerEntryBuilder(::flatbuffers::FlatBufferBuilder &_fbb)
         : fbb_(_fbb) {
     start_ = fbb_.StartTable();
@@ -816,10 +866,18 @@ inline ::flatbuffers::Offset<InitializerEntry> CreateInitializerEntry(
     uint64_t offset = 0,
     uint64_t size = 0,
     ::flatbuffers::Offset<::flatbuffers::String> moe_group = 0,
-    int32_t moe_expert_id = -1) {
+    int32_t moe_expert_id = -1,
+    ::flatbuffers::Offset<::flatbuffers::String> moe_source = 0,
+    uint64_t moe_offset = 0,
+    uint64_t moe_size = 0,
+    ::flatbuffers::Offset<::flatbuffers::String> moe_source_dtype = 0) {
   InitializerEntryBuilder builder_(_fbb);
+  builder_.add_moe_size(moe_size);
+  builder_.add_moe_offset(moe_offset);
   builder_.add_size(size);
   builder_.add_offset(offset);
+  builder_.add_moe_source_dtype(moe_source_dtype);
+  builder_.add_moe_source(moe_source);
   builder_.add_moe_expert_id(moe_expert_id);
   builder_.add_moe_group(moe_group);
   builder_.add_dims(dims);
@@ -836,11 +894,17 @@ inline ::flatbuffers::Offset<InitializerEntry> CreateInitializerEntryDirect(
     uint64_t offset = 0,
     uint64_t size = 0,
     const char *moe_group = nullptr,
-    int32_t moe_expert_id = -1) {
+    int32_t moe_expert_id = -1,
+    const char *moe_source = nullptr,
+    uint64_t moe_offset = 0,
+    uint64_t moe_size = 0,
+    const char *moe_source_dtype = nullptr) {
   auto name__ = name ? _fbb.CreateString(name) : 0;
   auto dtype__ = dtype ? _fbb.CreateString(dtype) : 0;
   auto dims__ = dims ? _fbb.CreateVector<uint32_t>(*dims) : 0;
   auto moe_group__ = moe_group ? _fbb.CreateString(moe_group) : 0;
+  auto moe_source__ = moe_source ? _fbb.CreateString(moe_source) : 0;
+  auto moe_source_dtype__ = moe_source_dtype ? _fbb.CreateString(moe_source_dtype) : 0;
   return vkop::model::CreateInitializerEntry(
       _fbb,
       name__,
@@ -849,7 +913,11 @@ inline ::flatbuffers::Offset<InitializerEntry> CreateInitializerEntryDirect(
       offset,
       size,
       moe_group__,
-      moe_expert_id);
+      moe_expert_id,
+      moe_source__,
+      moe_offset,
+      moe_size,
+      moe_source_dtype__);
 }
 
 ::flatbuffers::Offset<InitializerEntry> CreateInitializerEntry(::flatbuffers::FlatBufferBuilder &_fbb, const InitializerEntryT *_o, const ::flatbuffers::rehasher_function_t *_rehasher = nullptr);
@@ -1801,6 +1869,10 @@ inline void InitializerEntry::UnPackTo(InitializerEntryT *_o, const ::flatbuffer
   { auto _e = size(); _o->size = _e; }
   { auto _e = moe_group(); if (_e) _o->moe_group = _e->str(); }
   { auto _e = moe_expert_id(); _o->moe_expert_id = _e; }
+  { auto _e = moe_source(); if (_e) _o->moe_source = _e->str(); }
+  { auto _e = moe_offset(); _o->moe_offset = _e; }
+  { auto _e = moe_size(); _o->moe_size = _e; }
+  { auto _e = moe_source_dtype(); if (_e) _o->moe_source_dtype = _e->str(); }
 }
 
 inline ::flatbuffers::Offset<InitializerEntry> CreateInitializerEntry(::flatbuffers::FlatBufferBuilder &_fbb, const InitializerEntryT *_o, const ::flatbuffers::rehasher_function_t *_rehasher) {
@@ -1818,6 +1890,10 @@ inline ::flatbuffers::Offset<InitializerEntry> InitializerEntry::Pack(::flatbuff
   auto _size = _o->size;
   auto _moe_group = _o->moe_group.empty() ? 0 : _fbb.CreateString(_o->moe_group);
   auto _moe_expert_id = _o->moe_expert_id;
+  auto _moe_source = _o->moe_source.empty() ? 0 : _fbb.CreateString(_o->moe_source);
+  auto _moe_offset = _o->moe_offset;
+  auto _moe_size = _o->moe_size;
+  auto _moe_source_dtype = _o->moe_source_dtype.empty() ? 0 : _fbb.CreateString(_o->moe_source_dtype);
   return vkop::model::CreateInitializerEntry(
       _fbb,
       _name,
@@ -1826,7 +1902,11 @@ inline ::flatbuffers::Offset<InitializerEntry> InitializerEntry::Pack(::flatbuff
       _offset,
       _size,
       _moe_group,
-      _moe_expert_id);
+      _moe_expert_id,
+      _moe_source,
+      _moe_offset,
+      _moe_size,
+      _moe_source_dtype);
 }
 
 inline NodeT::NodeT(const NodeT &o)
@@ -2241,7 +2321,11 @@ inline const ::flatbuffers::TypeTable *InitializerEntryTypeTable() {
     { ::flatbuffers::ET_ULONG, 0, -1 },
     { ::flatbuffers::ET_ULONG, 0, -1 },
     { ::flatbuffers::ET_STRING, 0, -1 },
-    { ::flatbuffers::ET_INT, 0, -1 }
+    { ::flatbuffers::ET_INT, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 },
+    { ::flatbuffers::ET_ULONG, 0, -1 },
+    { ::flatbuffers::ET_ULONG, 0, -1 },
+    { ::flatbuffers::ET_STRING, 0, -1 }
   };
   static const char * const names[] = {
     "name",
@@ -2250,10 +2334,14 @@ inline const ::flatbuffers::TypeTable *InitializerEntryTypeTable() {
     "offset",
     "size",
     "moe_group",
-    "moe_expert_id"
+    "moe_expert_id",
+    "moe_source",
+    "moe_offset",
+    "moe_size",
+    "moe_source_dtype"
   };
   static const ::flatbuffers::TypeTable tt = {
-    ::flatbuffers::ST_TABLE, 7, type_codes, nullptr, nullptr, nullptr, names
+    ::flatbuffers::ST_TABLE, 11, type_codes, nullptr, nullptr, nullptr, names
   };
   return &tt;
 }

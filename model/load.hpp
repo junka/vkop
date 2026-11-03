@@ -76,6 +76,20 @@ struct Initializer {
     // existed loads unchanged.
     std::string moe_group;
     int32_t moe_expert_id = -1;
+    // Where this slot's bytes are in the file it pages from: `moe_source` is
+    // that path as the exporter recorded it (relative to the vkopbin), and
+    // `moe_source_offset`/`moe_source_size` slice it. Empty `moe_source` means
+    // the bytes are in this file's own blob, at `offset`. A group is *not* one
+    // contiguous run -- the checkpoint stores each expert's projections in
+    // name order -- so the runtime builds a per-(group, expert) lookup from
+    // these instead of computing `first + expert_id * size`.
+    std::string moe_source;
+    uint64_t moe_source_offset = 0;
+    uint64_t moe_source_size = 0;
+    // Dtype of the bytes at `moe_source` when they differ from `dtype` (the
+    // buffer's type): an fp16 vkopbin paging a bfloat16 checkpoint. Empty means
+    // the two agree.
+    std::string moe_source_dtype;
 };
 
 // RAII handle over a memory-mapped file. Owned by VkModel so that the

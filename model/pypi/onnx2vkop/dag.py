@@ -695,10 +695,16 @@ class DAGBasedModel:
         # external-only: ordered (name, arr) list to replay at write time.
         external_init_order = [] if external else None
 
-        def add_entry(name, arr, offset, size, moe_group=None, moe_expert_id=-1):
-            """One InitializerEntry side-table row for `name` at blob `offset`."""
+        def add_entry(name, arr, offset, size, moe_group=None, moe_expert_id=-1,
+                      moe_source=None, moe_source_offset=0, moe_source_size=0,
+                      moe_source_dtype=None, dtype=None):
+            """One InitializerEntry side-table row for `name` at blob `offset`.
+
+            `dtype` overrides the element type the loader is told to expect
+            (see _init_dtype_name): a byte-format deferred weight keeps its
+            FLOAT tensor but its blob bytes are a 1-byte-per-value payload."""
             name_off = builder.CreateString(name)
-            dtype_off = builder.CreateString(_init_dtype_name(arr))
+            dtype_off = builder.CreateString(_init_dtype_name(arr, dtype))
             dims = list(arr.dims)
             InitializerEntry.StartDimsVector(builder, len(dims))
             for d in reversed(dims):
@@ -710,6 +716,9 @@ class DAGBasedModel:
             # the fields existed and an older reader sees "" / -1
             # (vkop_model.fbs).
             group_off = builder.CreateString(moe_group) if moe_group else 0
+            source_off = builder.CreateString(moe_source) if moe_group else 0
+            source_dtype_off = (builder.CreateString(moe_source_dtype)
+                                if moe_group and moe_source_dtype else 0)
 
             InitializerEntry.Start(builder)
             InitializerEntry.AddName(builder, name_off)
@@ -720,6 +729,20 @@ class DAGBasedModel:
             if group_off:
                 InitializerEntry.AddMoeGroup(builder, group_off)
                 InitializerEntry.AddMoeExpertId(builder, int(moe_expert_id))
+            if source_off:
+                # Where this expert's bytes are in the file being paged from.
+                # Not derivable from `offset`/`size`: the checkpoint's shards
+                # store each expert's projections in name order, so the byte
+                # stride between consecutive experts is not the tensor size.
+                InitializerEntry.AddMoeSource(builder, source_off)
+                InitializerEntry.AddMoeOffset(builder, int(moe_source_offset))
+                InitializerEntry.AddMoeSize(builder, int(moe_source_size))
+            if source_dtype_off:
+                # The bytes at moe_source are in this dtype (bfloat16 in the
+                # checkpoint), not necessarily in `dtype` above. The runtime
+                # converts on the way in; the loader refuses a slot whose
+                # declared dtype disagrees with this and this is empty.
+                InitializerEntry.AddMoeSourceDtype(builder, source_dtype_off)
             init_entries.append(InitializerEntry.End(builder))
 
         # MoE paging slots. `self.initializers` is the *surviving* set after
@@ -734,8 +757,26 @@ class DAGBasedModel:
         moe_keep_alive = set(getattr(self, "moe_keep_alive", ()))
         # name -> (group, expert_id); ends up in the InitializerEntry row so the
         # loader can build the slot table without parsing names.
+        deferred_weights = self.deferred_weights
         moe_slots = getattr(self, "moe_slots", {})
         init_names = set(self.initializers)
+
+        moe_sources = getattr(self, "moe_sources", {})
+
+        def slot_source(name):
+            """(location, offset, length, dtype) of a slot's bytes in the file
+            it pages from, or None when there is no such slice.
+
+            The exporter streams every expert from the checkpoint, so a slot
+            normally has one: that slice -- not the trailer copy, which is no
+            longer written -- is what the runtime preads. A slot with no source
+            is a dense expert whose bytes the runtime can read from the blob
+            like any other weight.
+            """
+            src = moe_sources.get(name)
+            if src is None:
+                return None
+            return (src[0], int(src[1]), int(src[2]), src[3])
 
         entries = set()
         slot_rows = {}
@@ -743,7 +784,20 @@ class DAGBasedModel:
         for name, arr in self.initializers.items():
             if name in unified_names:
                 continue
-            data_size = _init_byte_len(arr)
+            # A paging slot lays down no bytes: the runtime preads every expert
+            # -- the resident ones included -- from the file recorded in its
+            # moe_source slice. Zeroing the extent here rather than skipping the
+            # entry keeps the entry's job intact: it declares the dtype/dims
+            # this slot's buffer is allocated with, and it is what the
+            # keep-alive checks below count.
+            slot = name in moe_slots
+            # A deferred weight under a byte format lands as a 1-byte payload,
+            # so its blob extent is numel bytes, not the source's numel * 4.
+            # A lane-major entry keeps its element count but pads each 8-column
+            # group out to a whole 16-byte word.
+            _qe = self.deferred_weights.get(name)
+            _qdtype = _qe.get("data_type") if _qe and _qe.get("quant") else None
+            data_size = 0 if slot else _init_byte_len(arr, _qdtype)
             aligned_offset = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
             pad = aligned_offset - cur_blob_len
             if external:
@@ -754,13 +808,21 @@ class DAGBasedModel:
                 blob.extend(_init_bytes(arr))
             cur_blob_len = aligned_offset + data_size
             blob_offsets[name] = (aligned_offset, data_size)
-            if name in moe_slots:
+            if slot:
+                # No payload, so no offset: the entry's `offset` is meaningless
+                # for a slot and the loader must never read the blob for one.
+                aligned_offset = 0
                 grp, eid = moe_slots[name]
-                slot_rows[name] = (grp, eid, aligned_offset, data_size)
+                src = slot_source(name)
+                slot_rows[name] = (grp, eid)
                 add_entry(name, arr, aligned_offset, data_size,
-                          moe_group=grp, moe_expert_id=int(eid))
+                          moe_group=grp, moe_expert_id=int(eid),
+                          moe_source=src[0] if src else None,
+                          moe_source_offset=src[1] if src else 0,
+                          moe_source_size=src[2] if src else 0,
+                          moe_source_dtype=_DATA_TYPE_MAP.get(src[3]) if src else None)
             else:
-                add_entry(name, arr, aligned_offset, data_size)
+                add_entry(name, arr, aligned_offset, data_size, dtype=_qdtype)
             entries.add(name)
 
         # --- Append the unified sub-region (if any) and record its base. ---
@@ -816,12 +878,24 @@ class DAGBasedModel:
                     f"Check that _prune_dead_and_materialize_constants_impl and "
                     f"terminal_liveness_prune both keep moe_keep_alive, and "
                     f"that the exporter's keep-alive nodes survived.")
-            # Slots must stay a uniform, hole-free, ascending byte run: the
-            # runtime fills a slot by seeking to `offset + expert_id * size`, so
-            # a hole or a changed size means a swap lands in the wrong expert's
-            # bytes -- silently. Checked against the rows actually emitted.
+            # A group's experts have to be *addressable*: the runtime looks each
+            # expert up by (group, expert_id), so a missing row means the swap
+            # lands nowhere and a non-uniform size means the buffer it swaps
+            # into is the wrong size for the slot. Both are "loads fine, wrong
+            # numbers".
+            #
+            # What is explicitly NOT required is a hole-free ascending byte run
+            # in the source file. It was, until the real checkpoint disproved
+            # it: safetensors shards store each expert's three projections in
+            # name order (down, gate, up), so within one projection the stride
+            # between experts is 5939680 bytes for a 5767168-byte tensor, with a
+            # break at every digit-width change. Every slot therefore carries its
+            # own (moe_source, moe_offset, moe_size).
+            # The blob offset a slot holds is always 0 (see the initializer
+            # loop), so what this checks is that a group's members agree on
+            # their shape: that is the buffer size the swap moves.
             slots_by_group = {}
-            for name, (grp, eid, _off, _size) in slot_rows.items():
+            for name, (grp, eid) in slot_rows.items():
                 slots_by_group.setdefault(grp, []).append((int(eid), name))
             lost_rows = moe_keep_alive - set(slot_rows)
             if lost_rows:
@@ -829,6 +903,23 @@ class DAGBasedModel:
                     f"{len(lost_rows)} MoE slot(s) got an InitializerEntry row "
                     f"without moe_group (e.g. {sorted(lost_rows)[:3]}); the "
                     f"runtime would never find them in the slot table.")
+            moe_source_sizes = {}
+            for name in slot_rows:
+                src = slot_source(name)
+                if src is None:
+                    continue
+                moe_source_sizes[name] = src[2]
+                # The slice has to be exactly the slot's tensor, and the check
+                # reads the declaration rather than the blob extent because a
+                # slot now lays down no trailer bytes (extent 0).
+                declared = _init_byte_len(self.initializers[name])
+                if src[2] != declared:
+                    raise weight_stream.DeferredWeightError(
+                        f"MoE slot {name}: the source slice is {src[2]} byte(s) "
+                        f"but the tensor is {declared} byte(s); the "
+                        f"runtime preads `moe_size` bytes into the slot's buffer, "
+                        f"so a short slice reads whatever follows it in "
+                        f"{src[0]}.")
             for grp, members in slots_by_group.items():
                 members.sort()
                 if [e for e, _ in members] != list(range(len(members))):
@@ -839,20 +930,26 @@ class DAGBasedModel:
                         f"expert id, so a gap silently shifts every later "
                         f"expert (see make_moe_variant.py).")
                 for i in range(1, len(members)):
-                    prev_off, prev_size = blob_offsets[members[i - 1][1]]
-                    off, size = blob_offsets[members[i][1]]
-                    if size != prev_size or off != prev_off + prev_size:
+                    # Compared off the declarations, not the blob extents: a
+                    # slot lays down no trailer bytes, so every extent is 0 and
+                    # comparing those would pass unconditionally.
+                    prev_size = _init_byte_len(
+                        self.initializers[members[i - 1][1]])
+                    size = _init_byte_len(self.initializers[members[i][1]])
+                    if size != prev_size:
                         raise weight_stream.DeferredWeightError(
                             f"MoE slot {members[i][1]} (expert {members[i][0]}) "
-                            f"is not contiguous after {members[i - 1][1]} "
-                            f"(offset {off}, expected {prev_off + prev_size}; "
-                            f"size {size} vs {prev_size}). Group {grp} must be "
-                            f"a uniform, hole-free, ascending byte run -- see "
-                            f"make_moe_variant.py's insertion-order contract.")
+                            f"is {size} byte(s) but its predecessor "
+                            f"{members[i - 1][1]} is {prev_size}; a slot's "
+                            f"buffer and its swap size come from its own "
+                            f"declared dims, so a member that disagrees with "
+                            f"its group is a buffer of the wrong size and "
+                            f"the swap pages the wrong bytes")
             if slots_by_group:
+                paged = sum(moe_source_sizes.values()) >> 20
                 print(f"[moe] {len(slot_rows)} slot row(s) in "
-                      f"{len(slots_by_group)} group(s), "
-                      f"{sum(s for _, _, _, s in slot_rows.values()) >> 20} MiB")
+                      f"{len(slots_by_group)} group(s), {paged} MiB paged "
+                      f"from the checkpoint, 0 in the trailer")
 
         Model.StartInitializersVector(builder, len(init_entries))
         for off in reversed(init_entries):
@@ -1214,49 +1311,50 @@ class DAGBasedModel:
                 pad = (align - (f.tell() % align)) % align
                 if pad:
                     f.write(b"\x00" * pad)
-                # Before asking for the side table's only addressing unit: a
-                # paging slot is later refilled from this file by offset alone,
-                # so it is worth saying which slots are only *transcribed* into
-                # it rather than already living there. A slot's `location`
-                # resolves against the ONNX's directory (`weight_base_dir`),
-                # not the output's.
-                transcribed = weight_stream.verify_not_sidebar_located(
-                    {n: self.deferred_weights[n] for n in slot_rows
-                     if n in self.deferred_weights},
-                    file_path)
-                if transcribed:
-                    # Not fatal: write_payload below puts the bytes in the
-                    # trailer, and that copy is what the runtime pages. It is
-                    # worth one line, though, because it is the only case in
-                    # which a slot's bytes are a transcription from another
-                    # file rather than already being the trailer's own.
-                    print(f"[moe] {len(transcribed)} slot(s) transcribed into "
-                          f"the trailer from a side file (e.g. "
-                          f"{sorted(transcribed)[:2]})")
-
                 blob_offset = f.tell()
-                written = 0
                 for _name, arr, aligned_offset, data_size, ipad in external_init_order:
+                    if not data_size and not ipad:
+                        # A zero-extent entry is a paging slot: it declares a
+                        # buffer, it does not carry bytes. Writing it here would
+                        # put the *declared* tensor in the trailer -- a stray
+                        # copy of the expert pool, and the very thing the slot
+                        # row's size=0/offset=0 promises is not there. `streamed`
+                        # rather than `written` because a skipped entry must not
+                        # move the cursor the blob offsets were computed against.
+                        continue
                     if ipad:
                         f.write(b"\x00" * ipad)
                     entry = self.deferred_weights.get(_name)
                     if entry is not None:
-                        # Never held in RAM: copy it from the source file, at
-                        # the offset the side table already promised.
-                        if entry["length"] != data_size:
+                        # Never held in RAM: the writer produces the payload
+                        # from the source file, at the offset the side table
+                        # already promised. `data_size` is the payload's extent
+                        # (what the side table declares, numel * payload
+                        # itemsize); `entry["length"]` is the SOURCE's extent,
+                        # which is what write_payload seeks and reads by -- a
+                        # byte format turns four source bytes into one. A
+                        # cut-down copy is exactly what this check exists to
+                        # catch; a quantizing entry is expected to differ.
+                        if (entry.get("quant") is None
+                                and entry["length"] != data_size):
                             raise weight_stream.DeferredWeightError(
                                 f"deferred weight '{_name}': side table says "
                                 f"{data_size} bytes, the source says "
                                 f"{entry['length']}")
-                        weight_stream.write_payload(entry, f, self.weight_base_dir)
+                        written = weight_stream.write_payload(
+                            entry, f, self.weight_base_dir)
+                        if written != data_size:
+                            raise weight_stream.DeferredWeightError(
+                                f"deferred weight '{_name}': wrote {written} "
+                                f"payload bytes, the side table promises "
+                                f"{data_size}")
                     else:
                         f.write(_init_bytes(arr))
-                    written = aligned_offset + data_size
                 # unified sub-region (if any)
                 unified_bytes = getattr(self, "_unified_bytes", b"")
                 if unified_bytes:
                     unified_base = self.unified_blob_offset
-                    upad = unified_base - written
+                    upad = unified_base - f.tell() + blob_offset
                     if upad:
                         f.write(b"\x00" * upad)
                     f.write(unified_bytes)

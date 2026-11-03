@@ -97,8 +97,36 @@ class InitializerEntry(object):
             return self._tab.Get(flatbuffers.number_types.Int32Flags, o + self._tab.Pos)
         return -1
 
+    # InitializerEntry
+    def MoeSource(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(18))
+        if o != 0:
+            return self._tab.String(o + self._tab.Pos)
+        return None
+
+    # InitializerEntry
+    def MoeOffset(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(20))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
+        return 0
+
+    # InitializerEntry
+    def MoeSize(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(22))
+        if o != 0:
+            return self._tab.Get(flatbuffers.number_types.Uint64Flags, o + self._tab.Pos)
+        return 0
+
+    # InitializerEntry
+    def MoeSourceDtype(self):
+        o = flatbuffers.number_types.UOffsetTFlags.py_type(self._tab.Offset(24))
+        if o != 0:
+            return self._tab.String(o + self._tab.Pos)
+        return None
+
 def InitializerEntryStart(builder):
-    builder.StartObject(7)
+    builder.StartObject(11)
 
 def Start(builder):
     InitializerEntryStart(builder)
@@ -150,6 +178,30 @@ def InitializerEntryAddMoeExpertId(builder, moeExpertId):
 
 def AddMoeExpertId(builder, moeExpertId):
     InitializerEntryAddMoeExpertId(builder, moeExpertId)
+
+def InitializerEntryAddMoeSource(builder, moeSource):
+    builder.PrependUOffsetTRelativeSlot(7, flatbuffers.number_types.UOffsetTFlags.py_type(moeSource), 0)
+
+def AddMoeSource(builder, moeSource):
+    InitializerEntryAddMoeSource(builder, moeSource)
+
+def InitializerEntryAddMoeOffset(builder, moeOffset):
+    builder.PrependUint64Slot(8, moeOffset, 0)
+
+def AddMoeOffset(builder, moeOffset):
+    InitializerEntryAddMoeOffset(builder, moeOffset)
+
+def InitializerEntryAddMoeSize(builder, moeSize):
+    builder.PrependUint64Slot(9, moeSize, 0)
+
+def AddMoeSize(builder, moeSize):
+    InitializerEntryAddMoeSize(builder, moeSize)
+
+def InitializerEntryAddMoeSourceDtype(builder, moeSourceDtype):
+    builder.PrependUOffsetTRelativeSlot(10, flatbuffers.number_types.UOffsetTFlags.py_type(moeSourceDtype), 0)
+
+def AddMoeSourceDtype(builder, moeSourceDtype):
+    InitializerEntryAddMoeSourceDtype(builder, moeSourceDtype)
 
 def InitializerEntryEnd(builder):
     return builder.EndObject()
