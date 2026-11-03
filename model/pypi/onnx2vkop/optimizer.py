@@ -5643,6 +5643,7 @@ class FusionOptimizer:
                 "wd": wd,
                 "wg": wg["name"],
                 "wu": wu["name"],
+                "wd_dims": wdt.dims,
             })
         if os.environ.get("VKOP_SWIGLU_DEBUG"):
             print(f"SWIGLU-DEBUG matches={len(matches)}")
@@ -5670,6 +5671,27 @@ class FusionOptimizer:
             outputs=down.outputs[:],
         )
         fused.attributes["down_act"] = [1]
+        # The fold's stage 1 walks one lane per up column, so in the source's
+        # [K_out, N_up] layout every load is a 2-byte access a whole row apart.
+        # Reorder Wg/Wu to [K_out][ceil(N_up/8)][8] so a lane reads its eight
+        # columns as one 16-byte word -- the same density the plain GEMV gets,
+        # for free, and the same numel. A deferred (streamed) weight is
+        # reordered on the way into the trailer instead of in RAM here.
+        n_up = int(match["wd_dims"][0])
+        pad = (n_up + 7) // 8 * 8
+        for key in ("wg", "wu"):
+            src = match[key]
+            entry = getattr(dag_model, "deferred_weights", {}).get(src)
+            if entry is not None:
+                entry["lane_major"] = (int(entry["dims"][0]), n_up, pad)
+            elif src in dag_model.initializers:
+                arr = numpy_helper.to_array(dag_model.initializers[src])
+                k_dim = int(arr.shape[0])
+                flat = np.zeros((k_dim, pad), dtype=arr.dtype)
+                flat[:, :n_up] = arr
+                grouped = flat.reshape(k_dim, pad // 8, 8)
+                dag_model.initializers[src] = numpy_helper.from_array(
+                    np.ascontiguousarray(grouped), src)
         del dag_model.nodes[down.name]
         for k in ("gate", "up", "sigmoid", "m1", "m2"):
             n = match.get(k)

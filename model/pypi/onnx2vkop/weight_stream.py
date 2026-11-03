@@ -613,6 +613,8 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
     """
     if entry.get("quant") is not None:
         return _write_quantized(entry, out_f, base_dir)
+    if entry.get("lane_major") is not None:
+        return _write_lane_major(entry, out_f, base_dir)
     path = entry["location"]
     if not os.path.isabs(path):
         path = os.path.join(base_dir, path)
@@ -639,6 +641,53 @@ def write_payload(entry: dict, out_f, base_dir: str) -> int:
             out_f.write(block)
             remaining -= len(block)
     return entry["length"] - remaining
+
+
+def _write_lane_major(entry: dict, out_f, base_dir: str) -> int:
+    """Stream a lane-major entry's source, writing the row-major reorder.
+
+    The SwiGLU fold's gate/up weights are read by ONE lane per output column for
+    every k, so in the source's [K, N] layout a lane's consecutive k's sit N
+    elements apart: every load is a 2-byte access into a fresh 128-byte line.
+    The fold wants eight consecutive columns of a fixed k, i.e. [K][N] read in
+    16-byte groups, so the payload is reordered to
+
+        [K][ceil(N/8)][8]        (rows straight from the source, columns grouped)
+
+    which is a pure permutation of the same numel elements: no value changes, no
+    precision is touched. A trailing group whose column count is not 8 is
+    zero-padded to keep every group a whole 16-byte word (the kernel's row stride
+    is then the padded width, which the host passes as K_pad).
+
+    The source is read in row bands so a wide weight never materializes more
+    than a few hundred MiB.
+    """
+    path = entry["location"]
+    if not os.path.isabs(path):
+        path = os.path.join(base_dir, path)
+    k_dim, n_dim, padded = entry["lane_major"]
+    rows = entry["length"] // max(1, n_dim * 2)   # fp16 source: 2 bytes/element
+    written = 0
+    with open(path, "rb") as src:
+        src.seek(entry["offset"])
+        band = max(1, _CHUNK_BYTES // max(1, n_dim * 2))
+        left = rows
+        while left:
+            take = min(band, left)
+            block = src.read(take * n_dim * 2)
+            if len(block) != take * n_dim * 2:
+                raise DeferredWeightError(
+                    f"deferred weight '{entry['name']}' runs out of source "
+                    f"bytes while reordering to lane-major")
+            a = np.frombuffer(block, dtype=np.uint16).reshape(take, n_dim)
+            pad = np.zeros((take, padded - n_dim), dtype=np.uint16)
+            out_f.write(
+                np.ascontiguousarray(np.concatenate([a, pad], axis=1)).tobytes())
+            written += take * padded * 2
+            left -= take
+    # K is implied by the payload size; keep the entry honest about it.
+    del k_dim
+    return written
 
 
 def _write_quantized(entry: dict, out_f, base_dir: str) -> int:

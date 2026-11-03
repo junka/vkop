@@ -797,7 +797,11 @@ class DAGBasedModel:
             # group out to a whole 16-byte word.
             _qe = self.deferred_weights.get(name)
             _qdtype = _qe.get("data_type") if _qe and _qe.get("quant") else None
+            _lm = _qe.get("lane_major") if _qe else None
             data_size = 0 if slot else _init_byte_len(arr, _qdtype)
+            if _lm is not None and not slot:
+                _k, _n, _pad = _lm
+                data_size = int(_k) * int(_pad) * 2
             aligned_offset = (cur_blob_len + _BLOB_ALIGNMENT - 1) & ~(_BLOB_ALIGNMENT - 1)
             pad = aligned_offset - cur_blob_len
             if external:
@@ -1336,6 +1340,7 @@ class DAGBasedModel:
                         # cut-down copy is exactly what this check exists to
                         # catch; a quantizing entry is expected to differ.
                         if (entry.get("quant") is None
+                                and entry.get("lane_major") is None
                                 and entry["length"] != data_size):
                             raise weight_stream.DeferredWeightError(
                                 f"deferred weight '{_name}': side table says "
