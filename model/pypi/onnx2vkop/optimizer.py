@@ -8338,13 +8338,29 @@ class Quantizer:
                 continue
             arrays = [numpy_helper.to_array(init).astype(np.float32)
                       for init in inits]
-            if any(a.ndim != 2 for a in arrays):
+            # Wd is [N_up, N]. Wg and Wu are [K_out, N_up] in the plain layout,
+            # or the lane-major [K_out, ceil(N_up/8), 8] that
+            # fold_swiglu_down_proj emits for the byte path. Both layouts keep
+            # K_out first and the per-column axis last, so only the middle axes
+            # differ and a rank check must not reject the 3-D form.
+            if arrays[0].ndim != 2:
                 continue
-            # Wd is [N_up, N]; Wg and Wu are [K_out, N_up]. The kernel reads all
-            # three with that dense row-major layout, so a transpose or a shape
-            # mismatch leaves the node fp16 instead of producing a wrong answer.
+            # A transpose or a shape mismatch leaves the node fp16 instead of
+            # producing a wrong answer; the kernel reads all three weights
+            # densely, with the leading dim as the contraction length.
             n_up, n = arrays[0].shape
-            if arrays[1].shape != arrays[2].shape or arrays[1].shape[1] != n_up:
+            gate, up = arrays[1], arrays[2]
+            if gate.shape != up.shape:
+                continue
+            if gate.ndim == 2:
+                if gate.shape[1] != n_up:
+                    continue
+            elif gate.ndim == 3 and gate.shape[2] == 8:
+                # The lane-major column order is n = band * 8 + lane, so the
+                # scale reduce over axis 0 must flatten in that same order.
+                if gate.shape[1] * 8 != n_up:
+                    continue
+            else:
                 continue
             # A byte payload is read four elements at a time (one 32-bit word),
             # so the last word must be fully populated.
@@ -8357,7 +8373,8 @@ class Quantizer:
                 scale = amax / 127.0
                 scale = np.where(scale == 0, 1.0, scale)
                 payloads.append(np.round(arr / scale).astype(np.int8))
-                scales.append(scale.astype(np.float32))
+                # (bands, 8) -> one entry per up column, in n order.
+                scales.append(scale.reshape(-1).astype(np.float32))
             for name, payload in zip(names, payloads):
                 init = numpy_helper.from_array(payload, name)
                 init.data_type = onnx.TensorProto.INT8
