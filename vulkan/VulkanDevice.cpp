@@ -177,7 +177,31 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
              coopmat_properties.cooperativeMatrixSupportedStages);
 
     // Enumerate every (M, N, K, type, scope) combination the device supports.
-    if (coopmat_properties.cooperativeMatrixSupportedStages != 0) {
+    // RenderDoc's capture layer (up to and including 1.47) never installs a
+    // device entry point for this query: the loader trampoline tail-jumps
+    // into an empty dispatch-table slot and the process SIGSEGVs (#0 0x0,
+    // call *%r13 with r13 == NULL). The list only feeds the coopmat
+    // tile-shape selectors (supports_coopmat_*_tile), so skipping it under
+    // capture degrades routing exactly like a non-coopmat device. The env
+    // check keys on the same variable the layer's manifest enables; define
+    // VKOP_DISABLE_COOPMAT_RDOC_GUARD to compile the guard out, or set
+    // VKOP_RDOC_COOPMAT_ENUM=1 to force the enumeration at runtime (for
+    // testing a renderer build where the entry point actually works).
+#ifndef VKOP_DISABLE_COOPMAT_RDOC_GUARD
+    static const bool coopmat_enum_skipped =
+        std::getenv("ENABLE_VULKAN_RENDERDOC_CAPTURE") != nullptr &&
+        std::getenv("VKOP_RDOC_COOPMAT_ENUM") == nullptr;
+#else
+    static constexpr bool coopmat_enum_skipped = false;
+#endif
+    if (coopmat_enum_skipped) {
+        LOG_WARN("RenderDoc capture layer active: skipping "
+                 "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR "
+                 "(layer <= 1.47 lacks its device entry point); coopmat "
+                 "tile probing disabled");
+    }
+    if (coopmat_properties.cooperativeMatrixSupportedStages != 0 &&
+        !coopmat_enum_skipped) {
         uint32_t propCount = 0;
         auto vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR =
             reinterpret_cast<
