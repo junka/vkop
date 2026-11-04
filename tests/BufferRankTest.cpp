@@ -1460,7 +1460,8 @@ bool brt_down_act_case(int m, int k_out, int n_up, int n, bool fp16,
 // output rounding -- the same tolerance the fp16 cases use. m == 1 exercises
 // the dedicated single-row deposit entry; larger m the 16-row tile.
 template <typename T>
-bool brt_down_act_w8_case(int m, int k_out, int n_up, int n) {
+bool brt_down_act_w8_case(int m, int k_out, int n_up, int n,
+                          bool lane_major = false) {
     auto pat = [](int rows, int cols) {
         auto t = torch::arange(rows * cols,
                                torch::TensorOptions().dtype(torch::kInt));
@@ -1490,9 +1491,11 @@ bool brt_down_act_w8_case(int m, int k_out, int n_up, int n) {
     auto in_wd = std::make_shared<Tensor<int8_t>>(
         std::vector<int>{n_up, n});
     auto in_wg = std::make_shared<Tensor<int8_t>>(
-        std::vector<int>{k_out, n_up});
+        lane_major ? std::vector<int>{k_out, n_up / 8, 8}
+                   : std::vector<int>{k_out, n_up});
     auto in_wu = std::make_shared<Tensor<int8_t>>(
-        std::vector<int>{k_out, n_up});
+        lane_major ? std::vector<int>{k_out, n_up / 8, 8}
+                   : std::vector<int>{k_out, n_up});
     auto in_s = std::make_shared<Tensor<float>>(
         std::vector<int>{n + 2 * n_up});
     brt_fill(in_x, torch_x);
@@ -1524,6 +1527,56 @@ TEST(BufferRankTest, MatMulDownActInt8) {
     EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(64, 32, 64, 64));
     // Two up-blocks (GX = 2): the concatenated table's Sg/Su offsets move.
     EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 32, 128, 64));
+    // Lane-major rank-3 weights [K_out, N_up/8, 8], the layout the converter
+    // emits for the byte path. Flattened, a lane's 8 columns follow the same
+    // n = band*8 + lane order as the rank-2 row, so the payload is identical
+    // and only the declared rank differs. The host must take K_out from the
+    // LEADING dim: reading shape[rank-2] returns the band count (N_up/8) and
+    // truncates the contraction, which these cases catch (the host also
+    // refuses that mismatch outright rather than emitting a short down_proj).
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 32, 64, 32, true));
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(1, 64, 128, 64, true));
+    EXPECT_TRUE(brt_down_act_w8_case<uint16_t>(64, 32, 128, 64, true));
+}
+
+// The fold's shader strides Wg/Wu rows by the up width (uPC.K = n_up), while
+// the converter's lane-major layout pads each 8-column group to a whole
+// 16-byte word. At n_up % 8 != 0 the declared row width is
+// ceil(n_up/8)*8, so host and shader disagree about the stride; the host
+// must refuse the fold instead of running it and reading the wrong columns.
+TEST(BufferRankTest, MatMulDownActRejectsNUpNotMultipleOf8) {
+    Dev d;
+    const int m = 1, k_out = 32, n_up = 12, n = 32;  // n_up % 8 == 4
+    const int bands = (n_up + 7) / 8;                // padded lane-major rows
+    auto x = torch::ones({m, k_out}, brt_torch_opt<uint16_t>());
+    auto wd = torch::zeros({n_up, n}, torch::TensorOptions().dtype(torch::kChar));
+    auto wgt = torch::zeros({k_out, bands, 8},
+                            torch::TensorOptions().dtype(torch::kChar));
+    auto scale = torch::zeros({n + 2 * n_up}, brt_torch_opt<float>());
+    auto in_x = std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, k_out});
+    auto in_wd = std::make_shared<Tensor<int8_t>>(std::vector<int>{n_up, n});
+    auto in_wg = std::make_shared<Tensor<int8_t>>(
+        std::vector<int>{k_out, bands, 8});
+    auto in_wu = std::make_shared<Tensor<int8_t>>(
+        std::vector<int>{k_out, bands, 8});
+    auto in_s = std::make_shared<Tensor<float>>(
+        std::vector<int>{n + 2 * n_up});
+    brt_fill(in_x, x);
+    brt_fill(in_wd, wd);
+    brt_fill(in_wg, wgt);
+    brt_fill(in_wu, wgt);
+    brt_fill(in_s, scale);
+    brt_upload(in_x, d);
+    brt_upload(in_wd, d);
+    brt_upload(in_wg, d);
+    brt_upload(in_wu, d);
+    brt_upload(in_s, d);
+    auto output = brt_make_out<uint16_t>(std::vector<int>{m, n}, d);
+    auto op = brt_make_op(vkop::ops::OpType::MATMUL, true,
+                          {{"down_act", "1"}}, d);
+    ASSERT_TRUE(op);
+    EXPECT_THROW(op->onExecute({in_x, in_wd, in_wg, in_wu, in_s}, {output}, 0),
+                 std::runtime_error);
 }
 
 TEST(BufferRankTest, MatMulDownAct) {

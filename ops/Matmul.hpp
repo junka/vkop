@@ -859,10 +859,46 @@ class MatMulBuffer : public BufferFactory {
                                     (inputs.size() == 4 || down_act_byte) &&
                                     rank_a >= 2 && rank_b >= 2;
         if (down_inputs_ok) {
-            const auto gated_rank = inputs[2]->getShape().size();
-            down_k_out =
-                static_cast<int>(inputs[2]->getShape()[gated_rank - 2]);
-            down_n_up = static_cast<int>(inputs[1]->getShape()[rank_b - 2]);
+            // Wg/Wu are [K_out, N_up] (plain row-major) or lane-major
+            // [K_out, ceil(N_up/8), 8], which optimizer.py's
+            // fold_swiglu_down_proj emits so a lane's eight columns are one
+            // 16-byte word. K_out is the LEADING dim in both layouts: reading
+            // shape[rank - 2] returns the band count (N_up/8, i.e. 768) for the
+            // 3-D form and silently shrank the fold's contraction to the first
+            // 768 K. Wd is [N_up, N] either way, so its row count is N_up.
+            const auto &gated_shape = inputs[2]->getShape();
+            const auto &wd_shape = inputs[1]->getShape();
+            down_k_out = gated_shape.size() >= 2
+                             ? static_cast<int>(gated_shape[0])
+                             : 0;
+            down_n_up = wd_shape.size() >= 2
+                            ? static_cast<int>(wd_shape[0])
+                            : -1;
+            // x's last dim IS the fold's K_out (see the shape mapping above).
+            // A gate/up weight that disagrees means the layout read here and
+            // the operator's shape mapping have diverged, so refuse the fold
+            // rather than emit a silently truncated down_proj.
+            if (gated_shape.size() >= 2 && down_k_out != k) {
+                throw std::runtime_error(
+                    "vkop: MatMul down_act gate/up weight of rank " +
+                    std::to_string(gated_shape.size()) + " reports K_out " +
+                    std::to_string(down_k_out) + " but x contracts " +
+                    std::to_string(k) + " (unexpected weight layout)");
+            }
+            // The fold kernels address Wg/Wu with the up width as their row
+            // stride: uPC.K = n_up and matmul_down_act.comp's da_b2/da_ba read
+            // (row * n_up + column). The converter's lane-major layout rounds
+            // each 8-column group up to a whole 16-byte word, so with
+            // n_up % 8 != 0 the declared row width is pad = ceil(n_up/8)*8, not
+            // n_up -- host and shader would disagree about the stride and read
+            // the wrong columns. No layout reconciles that today, so refuse the
+            // fold instead of emitting a silently wrong down_proj.
+            if (down_n_up >= 1 && (down_n_up % 8) != 0) {
+                throw std::runtime_error(
+                    "vkop: MatMul down_act fold needs N_up % 8 == 0, got N_up = " +
+                    std::to_string(down_n_up) +
+                    " (lane-major rows would be padded past n_up)");
+            }
         }
 
         core::MatmulShape sel_shape;
