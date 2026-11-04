@@ -246,6 +246,8 @@ bool coopmat_i8_applies(const Ctx &c) {
 }
 
 bool coopmat_gate(const Ctx &c) {
+    // Opt-in bypass for PoC — forces coopmat regardless of shape thresholds.
+    if (c.kn->force_coop) return true;
     const MatmulShape &s = *c.s;
     if (c.av->coop_bm < 32) {
         // 8x8x16: a 16x32 workgroup tile. Below one full TILE_M of rows the
@@ -566,6 +568,7 @@ MatmulKnobs matmul_knobs_from_env() {
     k.tile_disabled = flag("VKOP_NO_TILE");
     k.coop_disabled = flag("VKOP_NO_COOP");
     k.coop_i8_enabled = flag("VKOP_COOP_I8");
+    k.force_coop = flag("VKOP_FORCE_COOP");
     return k;
 }
 

@@ -216,6 +216,10 @@ struct MatmulKnobs {
     bool tile_disabled = false;
     bool coop_disabled = false;
     bool coop_i8_enabled = false;
+    // VKOP_FORCE_COOP: opt-in bypass of the coopmat_gate M threshold. Forces
+    // coopmat even for M=1 shapes where it would otherwise be excluded as a
+    // "waste of MMA lanes." Intended for PoC — DO NOT set in production.
+    bool force_coop = false;
 };
 
 MatmulKnobs matmul_knobs_from_env();
