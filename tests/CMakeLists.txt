@@ -318,6 +318,20 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
+
+# Precompile the heaviest test header (~350k preprocessed lines). All test
+# TUs include setup.hpp which transitively pulls core/Tensor.hpp (305k),
+# vulkan/VulkanDevice.hpp (250k), torch_subset.hpp (280k), and gtest.
+# This costs one PCH build (writes a single .gch per compile flag set) and
+# saves every subsequent TU from reparsing those headers.  GCC silently
+# falls back when the PCH flag differs from the build flags —
+# -Winvalid-pch on at least one TU proves the PCH actually loads.
+target_precompile_headers(all_tests PRIVATE
+    <tests/setup.hpp>
+)
+target_compile_options(all_tests PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Winvalid-pch>)
+
 # Force-load the whole vkop static archive so the OperatorFactory's static
 # self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
 if(MSVC)
