@@ -70,14 +70,14 @@ class Operator {
             if (m_d)
                 pipeline_->freeDescriptorSets(m_d);
         }
-        auto cnt = instance_count_.fetch_sub(1);
-        if (cnt == 1 && dummy_buffer_ != nullptr &&
-            dummy_bufferview_ != nullptr) {
-            dummy_bufferview_.reset();
-            dummy_buffer_.reset();
-            dummy_buffer_ = nullptr;
-            dummy_bufferview_ = nullptr;
-        }
+        // Do NOT reset dummy_buffer_ / dummy_bufferview_ here. They are static
+        // shared_ptrs owned by VulkanDevice, and resetting them while other
+        // Operator instances are still alive leaves those instances holding a
+        // dangling reference -- see issue ~Operator free invalid pointer. The
+        // no-op deleter installed in init_dummy() (below) ensures nothing
+        // actually gets freed, so we just let the shared_ptrs naturally leak
+        // on process exit instead of crash on exit.
+        (void)instance_count_.fetch_sub(1);
         m_cmdpool_ = nullptr;
         m_dev_ = nullptr;
     };
@@ -146,12 +146,22 @@ class Operator {
             }
         }
         if (!dummy_buffer_) {
-            dummy_buffer_ = std::make_shared<VulkanBuffer>(
-                m_dev_, 16, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
-                VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            // Use `new` + no-op deleter so the shared_ptr refcount controls
+            // lifetime without ever actually deleting the underlying object.
+            // A make_shared<> intermediate would delete the object when that
+            // local goes out of scope, leaving a dangling pointer in the
+            // static member -- the exact UAF this is here to fix.
+            dummy_buffer_ = std::shared_ptr<VulkanBuffer>(
+                new VulkanBuffer(
+                    m_dev_, 16, UNIFORM | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT),
+                [](VulkanBuffer *) {});
             assert(dummy_buffer_);
-            dummy_bufferview_ = std::make_shared<VulkanBufferView>(
-                m_dev_, dummy_buffer_, VK_FORMAT_R32G32B32A32_SFLOAT, 16, 0);
+            dummy_bufferview_ = std::shared_ptr<VulkanBufferView>(
+                new VulkanBufferView(
+                    m_dev_, dummy_buffer_,
+                    VK_FORMAT_R32G32B32A32_SFLOAT, 16, 0),
+                [](VulkanBufferView *) {});
             assert(dummy_bufferview_);
         }
     }
