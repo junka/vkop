@@ -274,6 +274,182 @@ bool coopmat_applies(const Ctx &c) {
            c.av->coopmat && !f.epi_bias && coopmat_gate(c);
 }
 
+// coopmat + split-K hybrid: only when explicitly opted in via VKOP_COOP_SPLITK
+// or VKOP_COOP_SPLITK_FORCE. Reuses the same coopmat eligibility as kCoopmat
+// (fp16, no epi_bias, gate passes) but additionally requires K deep enough to
+// split across (K >= 32, so each of 2+ slices still gets >= 1 MMA tile).
+// Returns true only if EITHER forced depth >=2 AND valid for K, OR auto-split
+// computes depth >=2.
+bool coopmat_splitk_applies(const Ctx &c) {
+    const MatmulFeatures &f = *c.f;
+    const MatmulShape &s = *c.s;
+    // coop_split 语义: 0 = off, -1 = auto (env opt-in), >= 2 = forced depth.
+    if (c.kn->coop_split == 0) return false;
+    if (c.kn->coop_split == 1) return false;
+    if (!f.fp16 || f.weight != WeightKind::kFp16) return false;
+    if (c.kn->coop_disabled || !c.av->coopmat) return false;
+    if (f.epi_bias) return false;
+    if (s.k < 32) return false;
+    if (!coopmat_gate(c)) return false;
+
+    // Forced depth: must be valid for K.
+    if (c.kn->coop_split >= 2) {
+        int n = c.kn->coop_split;
+        // Each slice needs >= BK (=16) to do at least one MMA.
+        return n >= 2 && n <= s.k / 16;
+    }
+
+    // Auto: compute depth the same way coop_splitk_configure would, and reject
+    // if it came out <2 (grid already saturated on plain coopmat).
+    const int bm = c.av->coop_bm > 0 ? c.av->coop_bm : 16;
+    const int bn = c.av->coop_bn > 0 ? c.av->coop_bn : 32;
+    long coop_blocks = static_cast<long>(s.batch) * up_div(s.n, bn) *
+                       up_div(s.m, bm);
+    int want = ks_depth_for(c, coop_blocks);
+    int max_by_k = s.k / 16;
+    int depth = std::min<int>(want, max_by_k);
+    return depth >= 2;
+}
+
+// Configure coopmat_splitk: resolve the split-K depth. Same occupancy logic
+// as ks_depth_for (tiled_ks) but gated by coop_split knob.
+void coop_splitk_configure(Ctx &c) {
+    const MatmulShape &s = *c.s;
+    // Forced from env.
+    if (c.kn->coop_split >= 2) {
+        c.ks_n = c.kn->coop_split;
+        return;
+    }
+    // Auto: same heuristic as ks_depth_for, but the coopmat grid counts the
+    // coop workgroups (one tile per BMxBN output block) rather than tiled's
+    // 64x64 tiles.
+    const int bm = c.av->coop_bm > 0 ? c.av->coop_bm : 16;
+    const int bn = c.av->coop_bn > 0 ? c.av->coop_bn : 32;
+    long coop_blocks = static_cast<long>(s.batch) * up_div(s.n, bn) *
+                       up_div(s.m, bm);
+    const int want = ks_depth_for(c, coop_blocks);
+    // But also constrained by K / BK (each slice needs >= BK). BK=16 for all
+    // listed coop tiles (8x8x16 CK=16, 16x16x16 CK=16).
+    const int max_by_k = s.k / 16;
+    c.ks_n = std::min<int>(want, max_by_k);
+    if (c.ks_n < 2) c.ks_n = 0; // 退化为不分
+}
+
+// coopmat + split-K in-workgroup (opt-in via VKOP_COOP_INWG / VKOP_COOP_INWG_K).
+// Single dispatch, no global scratch — coop_split serial passes of the K loop
+// inside one workgroup, cross-pass fp32 accumulate in shared memory. Shared
+// coop_split knob with splitk (same env-driven cs value), but applies is
+// stricter: ACC_M==ACC_N==1 only (Ada 2x2/2x1 variants have no INWG build,
+// and the cross-pass accumulator assumes a single fp32 tile per subgroup
+// matching CM=CN), N even (scatter_tile_half2 guard), and K/cs >= 2*K_BLOCK
+// (each slice must have >= 2 MMA tiles or serial-pass overhead swallows gain).
+bool coopmat_inwg_applies(const Ctx &c) {
+    // DISABLED while shader + host dispatch branch land together. Re-enable
+    // after (a) Ada & ARL both ship -DSPLITK_INWG SPIR-V, (b) Matmul.hpp
+    // has the kCoopmatInwg dispatch branch: single dispatch,
+    // grid = (⌈N/BN⌉, ⌈M/BM⌉, batch), uPC.ksplit = cs, half2 epilogue
+    // directly to uOutput, no scratch / barrier / pack.
+    (void)c;
+    return false;
+}
+#if 0
+{
+    // Full applies body — re-enable below by removing #if 0 once dispatch lands
+    ...(existing full logic)...
+}
+#endif
+
+void coop_inwg_configure(Ctx &c) {
+    const MatmulShape &s = *c.s;
+    if (c.kn->coop_split >= 2) {
+        // Forced cs, clamp to [2, 8] and verify K/cs >= 2*K_BLOCK (= 32).
+        int n = std::min<int>(c.kn->coop_split, 8);
+        n = std::max<int>(n, 2);
+        if (n > s.k / 32) n = std::max<int>(s.k / 32, 0);
+        c.ks_n = n;
+    } else {
+        // Auto: reuse splitk occupancy heuristic, clamp [2, 8], verify K.
+        const int bm = c.av->coop_bm > 0 ? c.av->coop_bm : 16;
+        const int bn = c.av->coop_bn > 0 ? c.av->coop_bn : 32;
+        long coop_blocks = static_cast<long>(s.batch) * up_div(s.n, bn) *
+                           up_div(s.m, bm);
+        int want = std::min<int>(ks_depth_for(c, coop_blocks), 8);
+        want = std::max<int>(want, 2);
+        int max_by_k = s.k / 32; // K / (2 * K_BLOCK) — each slice needs >= 2 tiles
+        c.ks_n = std::min<int>(want, max_by_k);
+    }
+}
+
+// coopmat + split-K "last block reduce" — true parallel K split via
+// grid.z = batch * SK, each slice writes fp32 partials to a global buffer,
+// one designated tail block in the tile reduces and writes half2 directly.
+//
+// Host-side guards mirror INWG but for grid parallelism:
+//   * SK ∈ [2, 8] capped (8 subgroups is arbitrary; shader clamp matches)
+//   * K/SK >= 2*K_BLOCK (= 32) so every slice does >= 2 MMA tiles
+//   * N even (scatter_tile_half2 requires it)
+//   * ACC_M = ACC_N = 1 only (larger geometries have no SK_LAST build)
+//   * fp16, no epi_bias, coopmat_gate passes — same as INWG / splitK
+//   * coop_split knob must be valid — user opted in via VKOP_COOP_SK or
+//     VKOP_COOP_SK_LAST (sets coop_split = forced value or -1 for auto).
+// SPIR-V key availability is checked in dispatch (Matmul.hpp), not here:
+// the selector must produce a plan even on devices without the key, so the
+// caller can fall through to splitK / plain coopmat without re-running.
+bool sk_last_applies(const Ctx &c) {
+    const MatmulFeatures &f = *c.f;
+    const MatmulShape &s = *c.s;
+    if (c.kn->coop_split == 0) return false;
+    if (c.kn->coop_split == 1) return false;
+    if (!f.fp16 || f.weight != WeightKind::kFp16) return false;
+    if (c.kn->coop_disabled || !c.av->coopmat) return false;
+    if (f.epi_bias) return false;
+    if (!coopmat_gate(c)) return false;
+    // N even — scatter_tile_half2 requires it for the HALF2_EPI variant;
+    // the fp32 fallback also writes flat fp32 to binding 3 regardless.
+    // Keep N-even as guard because half2 direct is the primary performance
+    // path for this route (otherwise splitK DEPOSIT/FOLD is always faster).
+    if ((s.n & 1) != 0) return false;
+    // K deep enough to split into SK pieces each with >= 2 MMA tiles.
+    if (c.kn->coop_split >= 2) {
+        int n = std::min<int>(c.kn->coop_split, 8);
+        if (n > s.k / 32) return false;
+        return true;
+    }
+    // Auto: compute SK the same way splitk does, clamp [2, 8], verify K.
+    const int bm = c.av->coop_bm > 0 ? c.av->coop_bm : 16;
+    const int bn = c.av->coop_bn > 0 ? c.av->coop_bn : 32;
+    long coop_blocks = static_cast<long>(s.batch) * up_div(s.n, bn) *
+                       up_div(s.m, bm);
+    int depth = std::min<int>(ks_depth_for(c, coop_blocks), 8);
+    depth = std::max<int>(depth, 2);
+    if (depth > s.k / 32) return false;
+    return true;
+}
+
+void sk_last_configure(Ctx &c) {
+    const MatmulShape &s = *c.s;
+    if (c.kn->coop_split == 1) {
+        c.ks_n = 1; // user explicitly opted for no split — sklast dispatched
+                    // with cs=1, useful for comparing MMA against DEFAULT
+        return;
+    }
+    if (c.kn->coop_split >= 2) {
+        int n = std::min<int>(c.kn->coop_split, 8);
+        n = std::max<int>(n, 2);
+        if (n > s.k / 32) n = std::max<int>(s.k / 32, 0);
+        c.ks_n = n;
+    } else {
+        const int bm = c.av->coop_bm > 0 ? c.av->coop_bm : 16;
+        const int bn = c.av->coop_bn > 0 ? c.av->coop_bn : 32;
+        long coop_blocks = static_cast<long>(s.batch) * up_div(s.n, bn) *
+                           up_div(s.m, bm);
+        int want = std::min<int>(ks_depth_for(c, coop_blocks), 8);
+        want = std::max<int>(want, 2);
+        int max_by_k = s.k / 32;
+        c.ks_n = std::min<int>(want, max_by_k);
+    }
+}
+
 bool down_act_applies(const Ctx &c) {
     const MatmulShape &s = *c.s;
     const MatmulFeatures &f = *c.f;
@@ -386,8 +562,23 @@ const MatmulRule kMatmulRules[] = {
     //    large enough for coopmat to apply (M >= the tile minimum) -- at
     //    M <= 8 the table fell through to here by accident and was right.
     {MatmulRoute::kDownActFold, "down_act_gemv", down_act_applies, nullptr},
-    // 4. fp16 cooperative matrix. Pre-empts tiled/ksplit, but the epilogue
-    //    bias has no binding in its descriptor layout.
+    // 4. fp16 cooperative-matrix routes. Priority order (first match wins):
+    //    SK_LASTBLOCK (parallel grid.z) > INWG (workgroup serial) > splitK
+    //    (DEPOSIT/FOLD two dispatch) > plain coopmat (catch-all).
+    //    SK_LAST currently disabled (applies returns false) while the shader
+    //    lands; when enabled, it takes priority over INWG.
+    // 4a. coopmat + split-K grid-parallel "last block reduce" (opt-in via
+    //     VKOP_COOP_SK_LAST / VKOP_COOP_SK).
+    {MatmulRoute::kCoopmatSkLast, "coopmat_sklast", sk_last_applies,
+     sk_last_configure},
+    // 4b. coopmat + split-K in-workgroup (opt-in via VKOP_COOP_INWG / _K).
+    {MatmulRoute::kCoopmatInwg, "coopmat_inwg", coopmat_inwg_applies,
+     coop_inwg_configure},
+    // 4c. coopmat + split-K DEPOSIT/FOLD hybrid (opt-in via VKOP_COOP_SPLITK
+    //     / _FORCE). Split across grid.z + global scratch round-trip.
+    {MatmulRoute::kCoopmatSplitK, "coopmat_splitk", coopmat_splitk_applies,
+     coop_splitk_configure},
+    // 4d. Plain coopmat, no K split.
     {MatmulRoute::kCoopmat, "coopmat", coopmat_applies, nullptr},
     // 5. The shared-memory tile, split across K when the grid is too shallow.
     {MatmulRoute::kTiledKs, "tiled_ks", tiled_ks_applies, nullptr},
@@ -423,6 +614,14 @@ MatmulPlan apply_rule(Ctx &c, const MatmulRule &rule) {
     p.tiled_min_m = c.tiled_min_m;
     p.device = c.prof;
     p.ks_n = (rule.route == MatmulRoute::kTiledKs) ? c.ks_n : 0;
+    // coopmat-split-K and coopmat-inwg both carry their depth in coop_split,
+    // not ks_n (configure wrote it to c.ks_n, we move it here).
+    p.coop_split =
+        (rule.route == MatmulRoute::kCoopmatSplitK ||
+         rule.route == MatmulRoute::kCoopmatInwg ||
+         rule.route == MatmulRoute::kCoopmatSkLast)
+            ? c.ks_n
+            : 0;
     return p;
 }
 
@@ -520,6 +719,12 @@ const char *matmul_route_tag(MatmulRoute route) {
         return "tiled_ks";
     case MatmulRoute::kCoopmat:
         return "coopmat";
+    case MatmulRoute::kCoopmatSplitK:
+        return "coopmat_splitk";
+    case MatmulRoute::kCoopmatInwg:
+        return "coopmat_inwg";
+    case MatmulRoute::kCoopmatSkLast:
+        return "coopmat_sklast";
     case MatmulRoute::kCoopmatI8:
         return "coopmat_i8";
     case MatmulRoute::kDownActFold:
@@ -583,6 +788,49 @@ MatmulKnobs matmul_knobs_from_env() {
     k.coop_disabled = flag("VKOP_NO_COOP");
     k.coop_i8_enabled = flag("VKOP_COOP_I8");
     k.force_coop = flag("VKOP_FORCE_COOP");
+    if (const char *e = std::getenv("VKOP_COOP_SPLITK_FORCE")) {
+        const int v = std::atoi(e);
+        if (v >= 0) {
+            // >= 2 means "force K-split to this depth"; 0 or 1 means "off but
+            // the generic opt-in flag can still enable auto-split".
+            k.coop_split = v;
+        }
+    }
+    if (k.coop_split == 0 && flag("VKOP_COOP_SPLITK")) {
+        // Bare opt-in: selector picks the K depth from occupancy.
+        k.coop_split = -1; // sentinel: "auto-split allowed, actual depth decided by selector"
+    }
+    // VKOP_COOP_INWG takes priority over VKOP_COOP_SPLITK because INWG has
+    // stricter guards and is a single-dispatch variant. When both are set,
+    // the route table entry for kCoopmatInwg wins (listed first), and we
+    // write coop_split here so the selector uses that depth for both routes'
+    // configure phases — splitK's configure ignores INWG-only guards, so
+    // shapes that fail INWG's N-even guard will still fall through to splitK.
+    if (const char *e = std::getenv("VKOP_COOP_INWG_K")) {
+        const int v = std::atoi(e);
+        if (v >= 2 && v <= 8) {
+            k.coop_split = v; // force cs ∈ [2, 8]
+        }
+    }
+    if (flag("VKOP_COOP_INWG") && k.coop_split == 0) {
+        k.coop_split = -1; // auto depth
+    }
+    // VKOP_COOP_SK_LAST takes highest priority. Parsed last so it overwrites
+    // coop_split set by SPLITK or INWG; the route table orders SkLast first,
+    // so applies/configure resolve the correct depth here. When both SK_LAST
+    // and INWG are set, SkLast wins the route and coop_split carries the SK
+    // value; INWG's applies will see coop_split > 1 but fall through because
+    // SkLast wins first — but if SK_LAST is disabled (applies false), INWG's
+    // own applies will pick up that coop_split and route correctly.
+    if (const char *e = std::getenv("VKOP_COOP_SK")) {
+        const int v = std::atoi(e);
+        if (v >= 1 && v <= 8) {
+            k.coop_split = v;
+        }
+    }
+    if (flag("VKOP_COOP_SK_LAST") && k.coop_split == 0) {
+        k.coop_split = -1; // auto depth
+    }
     return k;
 }
 
@@ -597,9 +845,18 @@ MatmulPlan select_matmul(const DeviceTraits &traits, const MatmulShape &shape,
                          const MatmulKnobs &knobs) {
     const DeviceProfile &profile = device_profile_for(traits);
     Ctx c = make_ctx(traits, profile, shape, features, availability, knobs);
+    std::fprintf(stderr, "[ksel] m=%d n=%d k=%d fp16=%d weight_fp16=%d coop_split=%d force_coop=%d coopmat_av=%d\n",
+                 shape.m, shape.n, shape.k, features.fp16,
+                 features.weight == WeightKind::kFp16, knobs.coop_split,
+                 knobs.force_coop, availability.coopmat);
     for (const MatmulRule &rule : kMatmulRules) {
-        if (rule.applies(c)) {
-            return apply_rule(c, rule);
+        bool a = rule.applies(c);
+        std::fprintf(stderr, "[ksel] rule %s -> %d\n", rule.tag, a);
+        if (a) {
+            MatmulPlan p = apply_rule(c, rule);
+            std::fprintf(stderr, "[ksel] CHOSE %s coop_split=%d ks_n=%d\n",
+                         rule.tag, p.coop_split, p.ks_n);
+            return p;
         }
     }
     // The last row is unconditional; reaching this is a table bug.

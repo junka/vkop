@@ -1,0 +1,826 @@
+#version 450 core
+
+// SSBO cooperative-matrix MatMul, fp16 in / fp32 accumulate. The cooperative
+// matrix tile is a build parameter (-DCM/-DCN/-DCK), so this one source covers
+// the fp16 f32-accumulate shapes a device can list:
+//   NVIDIA Ada:  16x16x16 / 16x8x16 / 16x8x8  (16x16x16 is the default build)
+//
+// THREE mutually-exclusive build variants (compile-time -D macros):
+//
+//   DEFAULT (no -D)                 — one workgroup runs all of K (optional
+//                                    runtime split-K via scratch header).
+//   -DSPLITK_INWG                   — split-K inside one workgroup: serial
+//                                    passes over K slices, cross-pass
+//                                    shared-memory reduction, single dispatch,
+//                                    NO global scratch round-trip. Grid =
+//                                    DEFAULT (x,y,z=batch).
+//   -DSPLITK_INWG -DENABLE_HALF2_EPI — same as SPLITK_INWG but epilogue packs
+//                                    half2 directly to uOutput instead of the
+//                                    conservative fp32-scratch path. HALF2 EPI
+//                                    IS EXPERIMENTAL — default-off until b3
+//                                    validation resolves the lane-1-zero bug.
+//
+// Workgroup = 16x16 = 256 threads = 8 subgroups (sg size 32). Subgroup grid
+// SG_M x SG_N (default 2 x 4) and ACC_M x ACC_N accumulator tiles per subgroup,
+// so the workgroup output footprint is BM = SG_M*ACC_M*CM by
+// BN = SG_N*ACC_N*CN. Each K-tile's shared A/B feeds SG_M*SG_N*ACC_M*ACC_N
+// MMAs, amortizing the SSBO loads. The default 16x16x16 1x1 build is the
+// original 32x64 footprint; -DACC_M=2 -DACC_N=2 covers 64x128 with the same 256
+// threads, which is what makes the traffic per FLOP competitive:
+//   traffic per FLOP = (1/BM + 1/BN)  ->  0.0469 (32x64) vs 0.0234 (64x128)
+// and gives each subgroup four MMAs per K tile instead of one, which is the
+// window the next tile's global loads hide behind.
+//
+// K loop: the shared tiles are double buffered and the global loads for tile
+// t+1 are issued into registers *before* tile t's fragments load and MMAs run,
+// then stored after them. The read/write rotation of two buffers needs one
+// workgroup barrier per K tile. Storing straight from a load instead -- what
+// this shader did before -- leaves the memory pipe idle until every warp's own
+// load returns, with a barrier on both sides of it.
+//
+// IMPORTANT: half2 epilogue (both DEFAULT runtime path and SPLITK_INWG) is
+// compiled OFF by default via the ENABLE_HALF2_EPI guard below. The default
+// path therefore always writes fp32 scratch and expects the host to dispatch
+// matmul_pack.comp afterward. This is the conservative fallback while the
+// Ada-side lane-1-zero bug is being root-caused on b3 hardware.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_AMD_gpu_shader_half_float : enable
+#extension GL_EXT_shader_16bit_storage : enable
+
+// Workgroup shape. The host's footprint constants for a variant must match the
+// ACC_* values its SPIR-V was built with.
+#ifndef ACC_M
+#define ACC_M 1
+#endif
+#ifndef ACC_N
+#define ACC_N 1
+#endif
+#ifndef SG_M
+#define SG_M 2
+#endif
+#ifndef SG_N
+#define SG_N 4
+#endif
+// Cooperative-matrix tile. -DCM/-DCN/-DCK let one source serve every fp16
+// f32-accumulate shape a device may list (16x16x16, 16x8x16, 16x8x8).
+#ifndef CM
+#define CM 16
+#endif
+#ifndef CN
+#define CN 16
+#endif
+#ifndef CK
+#define CK 16
+#endif
+
+// half2 epilogue compile-time guard. Set -DENABLE_HALF2_EPI at build time ON
+// B3 hardware ONLY after the lane-1-zero bug is fully root-caused and fixed.
+// Without this flag, ALL variants (DEFAULT and SPLITK_INWG) use the proven
+// fp32-scratch + matmul_pack.comp path, guaranteeing correctness.
+#if defined(ENABLE_HALF2_EPI) && ACC_M == 1 && ACC_N == 1
+#define HALF2_EPI_OK 1
+#else
+#define HALF2_EPI_OK 0
+#endif
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InB {
+    uint data[];
+} uInputB;
+layout(set = 0, binding = 3) buffer Scratch {
+    uint data[];
+} uScratch;
+
+// SK_LASTBLOCK uses binding 4/5 as fp32 partial buffer + per-tile arrival
+// counter. Default/INWG paths don't touch these slots (ScaleTab/GlobalFac
+// placeholders are unused).
+#if defined(SK_LASTBLOCK)
+layout(set = 0, binding = 4) coherent buffer PartialBuf {
+    uint data[];
+} uPartial;
+layout(set = 0, binding = 5) coherent buffer CounterBuf {
+    uint data[];
+} uCounter;
+#else
+layout(set = 0, binding = 4) readonly buffer ScaleTab {
+    uint data[];
+} uScaleTab;
+layout(set = 0, binding = 5) readonly buffer GlobalFac {
+    uint data[];
+} uGlobalFac;
+#endif
+
+layout(push_constant) uniform PC {
+    int M;
+    int N;
+    int K;
+    int batch;
+    int fp32;
+    int transB;
+    int tile;
+    int weight_int8;
+    int w8_quad;
+    int ksplit;
+    int ksplit_q;
+    int w4;
+    int nf4;
+    int group;
+    int fp8;
+    int fp8_e5m2;
+    int nvfp4;
+    int uint4;
+    int wide;
+    int rep;
+    int rep_stride;
+    int a_dim;
+    int b_dim;
+    float epi_scale;
+    int epi_bias;
+    int K_act;
+    int mind_k;
+    int epi_bias_batch;
+    int attn_softmax;
+    int b_shared;
+} uPC;
+
+const int M_BLOCK = CM;
+const int N_BLOCK = CN;
+const int K_BLOCK = CK;
+
+const int NTHREADS = SG_M * SG_N * 32;
+const int BM = SG_M * ACC_M * M_BLOCK;
+const int BN = SG_N * ACC_N * N_BLOCK;
+
+#if ((SG_M * SG_N) != 8)
+#error "matmul_coop16: SG_M * SG_N must be 8 subgroups (256 threads)"
+#endif
+#if ((((SG_M * ACC_M * CM) * CK) % (SG_M * SG_N * 32)) != 0) || \
+    (((CK * SG_N * ACC_N * CN) % (SG_M * SG_N * 32)) != 0)
+#error "matmul_coop16: staging does not divide evenly over 256 threads"
+#endif
+const int A_ELEMS = (BM * K_BLOCK) / NTHREADS;
+const int B_ELEMS = (K_BLOCK * BN) / NTHREADS;
+
+int bmap(int n) {
+    if (uPC.b_shared != 0) return 0;
+    if (uPC.rep <= 1) return n;
+    int a_span = uPC.rep_stride * uPC.a_dim;
+    int rest = n % a_span;
+    int prefix = n / a_span;
+    int b_span = uPC.rep_stride * uPC.b_dim;
+    return prefix * b_span +
+           (rest / (uPC.rep * uPC.rep_stride)) * uPC.rep_stride +
+           (rest % uPC.rep_stride);
+}
+
+float16_t loadA(int elem) {
+    return float16_t(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
+}
+float16_t loadB(int elem) {
+    return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
+}
+
+// Double-buffered shared A/B. Both variants share these.
+shared float16_t shA[2][BM * K_BLOCK];
+shared float16_t shB[2][K_BLOCK * BN];
+
+// Per-subgroup private fp32 staging slot. DEFAULT path uses this as the
+// scatter source (coopMatStore → barrier → scatter_tile).
+shared float shC[SG_M * SG_N][M_BLOCK * N_BLOCK];
+
+// SPLITK_INWG-only: cross-pass accumulator + per-pass partial. These live in
+// shared memory because cross-pass serialisation happens in serial passes
+// inside one workgroup — between pass p and pass p+1 every subgroup needs
+// everyone's partial fp32 contribution before it starts the next K slice.
+// DEFAULT path does not touch these.
+#if defined(SPLITK_INWG)
+shared float shC_acc[SG_M * SG_N][M_BLOCK * N_BLOCK];
+shared float shC_tmp[SG_M * SG_N][M_BLOCK * N_BLOCK];
+#endif
+
+// ---------------------------------------------------------------------------
+// DEFAULT-path runtime split-K helpers. Grid-z = batch * coop_split, one
+// workgroup per K slice. Scratch header written by host before dispatch.
+// ---------------------------------------------------------------------------
+
+#define COOP_KS_HDR 4
+struct CoopKRange {
+    int n;      // coop_split (number of slices)
+    int k0;
+    int kstop;
+};
+
+CoopKRange coop_load_krange(int K) {
+    CoopKRange r;
+    r.n = int(uScratch.data[1]);
+    r.k0 = int(uScratch.data[2]);
+    r.kstop = int(uScratch.data[3]);
+    if (r.n <= 1 || r.kstop <= r.k0) { r.n = 1; r.k0 = 0; r.kstop = K; }
+    if (r.kstop > K) r.kstop = K;
+    if (r.k0 < 0) r.k0 = 0;
+    return r;
+}
+
+// fp32 partial offset in scratch for split_k=true + HAS_HALF2_EPI=false. Each
+// slice owns an independent flat [M, N] fp32 plane at the front of scratch
+// after the COOP_KS_HDR header. This lets the DEFAULT path reduce into
+// scratch without requiring half2-compatible reducer code while keeping
+// global-scope split-K.
+int coop_partial_fp32(int batch, int row, int col, int slice, int coop_split,
+                      int M, int N) {
+    return COOP_KS_HDR +
+           (batch * max(coop_split, 1) + slice) * (M * N) +
+           row * N + col;
+}
+
+// ---------------------------------------------------------------------------
+// SPLITK_INWG K-slicing helper. coop_split = min(max(ksplit, 1), SG_M*SG_N).
+// Pass p owns K range [p*k_per, min((p+1)*k_per, K)). No scratch header.
+// ---------------------------------------------------------------------------
+struct KRange { int k0; int k_end; };
+KRange krange_for(int p, int coop_split) {
+    KRange r;
+    r.k0 = 0; r.k_end = uPC.K;
+    if (coop_split > 1) {
+        int k_per = (uPC.K + coop_split - 1) / coop_split;
+        r.k0 = p * k_per;
+        r.k_end = min(r.k0 + k_per, uPC.K);
+    }
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Double-buffered A/B stage — shared by all paths including INWG. Slice-aware
+// in that out-of-slice elements are zero-filled by fetch_a/b below; we just
+// copy them into shared memory here.
+// ---------------------------------------------------------------------------
+void fetch_a(int a_base, int m0, int k_base, int M, int K,
+             out float16_t va[A_ELEMS]) {
+    int e0 = int(gl_LocalInvocationIndex) * A_ELEMS;
+    for (int i = 0; i < A_ELEMS; ++i) {
+        int e = e0 + i;
+        int h = m0 + e / K_BLOCK;
+        int kk = k_base + e % K_BLOCK;
+        va[i] = (h < M && kk < K) ? loadA(a_base + h * K + kk) : float16_t(0.0);
+    }
+}
+
+void fetch_b(int b_base, int n0, int k_base, int N, int K,
+             out float16_t vb[B_ELEMS]) {
+    int e0 = int(gl_LocalInvocationIndex) * B_ELEMS;
+    for (int i = 0; i < B_ELEMS; ++i) {
+        int e = e0 + i;
+        int kk = k_base + e / BN;
+        int w = n0 + e % BN;
+        float16_t v = float16_t(0.0);
+        if (kk < K && w < N) {
+            if (uPC.transB != 0) v = loadB(b_base + w * K + kk);
+            else v = loadB(b_base + kk * N + w);
+        }
+        vb[i] = v;
+    }
+}
+
+void store_a(in float16_t va[A_ELEMS], int buf) {
+    int e0 = int(gl_LocalInvocationIndex) * A_ELEMS;
+    for (int i = 0; i < A_ELEMS; ++i) shA[buf][e0 + i] = va[i];
+}
+void store_b(in float16_t vb[B_ELEMS], int buf) {
+    int e0 = int(gl_LocalInvocationIndex) * B_ELEMS;
+    for (int i = 0; i < B_ELEMS; ++i) shB[buf][e0 + i] = vb[i];
+}
+
+// ---------------------------------------------------------------------------
+// fp32 scatter — reads shC[sg][idx] the way every variant's proven-correct
+// epilogue does (continuous idx = lane * 8 + e). Output address:
+//   split_k=false : c_base (= b*M*N) + hg*N + wg (flat [M,N] fp32)
+//   split_k=true  : coop_partial_fp32 offset  (slice-private plane after HDR)
+// ---------------------------------------------------------------------------
+void scatter_tile(uint sg, uint lane, int sgy, int sgx, int ai, int aj, int m0,
+                  int n0, int M, int N, bool split_k, int coop_split,
+                  int ks_slice, int b) {
+    const int ELEMS = (M_BLOCK * N_BLOCK) / 32;
+    for (int e = 0; e < ELEMS; ++e) {
+        int idx = int(lane) * ELEMS + e;
+        int row = idx / N_BLOCK;
+        int col = idx % N_BLOCK;
+        int hg = m0 + (sgy * ACC_M + ai) * M_BLOCK + row;
+        int wg = n0 + (sgx * ACC_N + aj) * N_BLOCK + col;
+        if (hg < M && wg < N) {
+            int out_elem;
+            if (split_k) {
+                out_elem = coop_partial_fp32(b, hg, wg, ks_slice, coop_split,
+                                             M, N);
+            } else {
+                out_elem = b * M * N + hg * N + wg;
+            }
+            uScratch.data[out_elem] = floatBitsToUint(shC[sg][idx]);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// half2 direct-store epilogue (EXPERIMENTAL — guarded by ENABLE_HALF2_EPI).
+// Reads shC[sg][idx] the same proven way scatter_tile does before packing.
+// Writes uOutput DIRECTLY — NO scratch round-trip, NO split_k branching.
+// Split-K fp32 partial reduce requires fp32 scratch (scatter_tile handles
+// that path); half2 split-k partial would need a separate reducer pass and
+// is not supported here.
+// ---------------------------------------------------------------------------
+void scatter_tile_half2(uint sg, uint lane, int sgy, int sgx, int m0, int n0,
+                        int M, int N, int b) {
+    const int ELEMS = (M_BLOCK * N_BLOCK) / 32;
+    float v[8];
+    for (int e = 0; e < ELEMS; ++e) {
+        int idx = int(lane) * ELEMS + e;
+        v[e] = shC[sg][idx];
+    }
+
+    const int row_local = int(lane) >> 1;
+    const int col_local_start = (int(lane) & 1) * 8;
+    const int row_global = m0 + sgy * M_BLOCK + row_local;
+    if (row_global >= M) return;
+
+    const int col_base_global = n0 + sgx * N_BLOCK + col_local_start;
+    for (int j = 0; j < 4; ++j) {
+        const int col0 = col_base_global + 2 * j;
+        if (col0 >= N) break;
+        float v0 = v[2 * j];
+        float v1 = (col0 + 1 < N) ? v[2 * j + 1] : 0.0;
+        uint word = packHalf2x16(vec2(v0, v1));
+        uOutput.data[b * M * (N / 2) + row_global * (N / 2) + (col0 >> 1)] =
+            word;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// run_mma_slice — coop16 double-buffered MMA loop over a sub-K-slice. Used by
+// SPLITK_INWG for each serial pass p. k_range [k0, k_end) aligned to K_BLOCK;
+// tiles fully outside the slice are SKIPPED (zero-fill + MMA still costs the
+// instruction; we want NOTHING for tiles that don't overlap).
+// ---------------------------------------------------------------------------
+#if defined(SPLITK_INWG)
+void run_mma_slice(int m0, int n0, int a_base, int b_base, KRange kr,
+                   out coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                                gl_MatrixUseAccumulator> matC) {
+    const int M = uPC.M, N = uPC.N, K = uPC.K;
+    const uint sg = gl_SubgroupID;
+    const uint lane = gl_SubgroupInvocationID;
+    const int sgx = int(sg % SG_N);
+    const int sgy = int(sg / SG_N);
+
+    // Align tile iteration to K_BLOCK boundaries. Tile i is fully inside iff
+    // k0 + i*K_BLOCK < k_end (ceil division handles the partial last tile).
+    int k0_aligned = (kr.k0 / K_BLOCK) * K_BLOCK;
+    int k_end_aligned = ((kr.k_end + K_BLOCK - 1) / K_BLOCK) * K_BLOCK;
+    int k_tiles = max((k_end_aligned - k0_aligned) / K_BLOCK, 0);
+
+    matC = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                    gl_MatrixUseAccumulator>(0.0);
+
+    if (k_tiles == 0) return;
+
+    float16_t va[A_ELEMS], vb[B_ELEMS];
+    // Prologue: tile 0 of THIS slice into buffer 0 (same pattern as DEFAULT).
+    fetch_a(a_base, m0, k0_aligned, M, K, va);
+    fetch_b(b_base, n0, k0_aligned, N, K, vb);
+    store_a(va, 0); store_b(vb, 0);
+    barrier();
+
+    int buf = 0;
+    for (int t = 0; t < k_tiles; t++) {
+        if (t + 1 < k_tiles) {
+            fetch_a(a_base, m0, k0_aligned + (t + 1) * K_BLOCK, M, K, va);
+            fetch_b(b_base, n0, k0_aligned + (t + 1) * K_BLOCK, N, K, vb);
+        }
+
+#if ACC_M == 1
+        coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA> matA;
+        coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB> matB;
+        coopMatLoad(matA, shA[buf], sgy * ACC_M * M_BLOCK * K_BLOCK, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        coopMatLoad(matB, shB[buf], sgx * ACC_N * N_BLOCK, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+        matC = coopMatMulAdd(matA, matB, matC);
+#else
+        // 2x2 / 2x1 variant — macro-expand per-ai/aj (same as DEFAULT main).
+        coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
+            matA0, matA1;
+        coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
+            matB0, matB1;
+        coopMatLoad(matA0, shA[buf], 0, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#if ACC_M > 1
+        coopMatLoad(matA1, shA[buf], M_BLOCK * K_BLOCK, K_BLOCK,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        coopMatLoad(matB0, shB[buf], 0, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#if ACC_N > 1
+        coopMatLoad(matB1, shB[buf], N_BLOCK, BN,
+                    gl_CooperativeMatrixLayoutRowMajor);
+#endif
+        // MMA pairs — just ACC_M*ACC_N iterations, matC accumulator lives
+        // as per-subgroup private (we can't easily macro-expand here, so
+        // hard-code 2x2 which is the only multi-tile variant in practice).
+        // For a generic fix, host avoids SPLITK_INWG for non-1x1 builds.
+        matC = coopMatMulAdd(matA0, matB0, matC);
+#if ACC_M > 1
+        coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
+            matC10 = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                               gl_MatrixUseAccumulator>(0.0);
+        matC10 = coopMatMulAdd(matA1, matB0, matC10);
+#endif
+#if ACC_N > 1
+        coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
+            matC01 = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                               gl_MatrixUseAccumulator>(0.0);
+        matC01 = coopMatMulAdd(matA0, matB1, matC01);
+#endif
+#if ACC_M > 1 && ACC_N > 1
+        coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
+            matC11 = coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                               gl_MatrixUseAccumulator>(0.0);
+        matC11 = coopMatMulAdd(matA1, matB1, matC11);
+#endif
+#endif
+
+        if (t + 1 < k_tiles) {
+            store_a(va, buf ^ 1); store_b(vb, buf ^ 1);
+        }
+        barrier();
+        buf ^= 1;
+    }
+}
+#endif // defined(SPLITK_INWG)
+
+// ---------------------------------------------------------------------------
+// Preprocessor-driven accumulator expansion — one named tile per (ai, aj).
+// ---------------------------------------------------------------------------
+#if ACC_M == 1 && ACC_N == 1
+#define ACC_TILES(F) F(0, 0)
+#elif ACC_M == 2 && ACC_N == 1
+#define ACC_TILES(F) F(0, 0) F(1, 0)
+#elif ACC_M == 1 && ACC_N == 2
+#define ACC_TILES(F) F(0, 0) F(0, 1)
+#elif ACC_M == 2 && ACC_N == 2
+#define ACC_TILES(F) F(0, 0) F(0, 1) F(1, 0) F(1, 1)
+#else
+#error "matmul_coop16: unsupported ACC_M/ACC_N"
+#endif
+
+#define DECL_C(ai, aj)                                                      \
+    coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,                      \
+             gl_MatrixUseAccumulator>                                       \
+        matC##ai##aj =                                                      \
+            coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,              \
+                    gl_MatrixUseAccumulator>(0.0);
+
+#define DECL_A(ai)                                                          \
+    coopmat<float16_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>   \
+        matA##ai;
+#define LOAD_A(ai)                                                          \
+    coopMatLoad(matA##ai, shA[buf],                                         \
+                (sgy * ACC_M + ai) * M_BLOCK * K_BLOCK, K_BLOCK,            \
+                gl_CooperativeMatrixLayoutRowMajor);
+#define DECL_B(aj)                                                          \
+    coopmat<float16_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>   \
+        matB##aj;
+#define LOAD_B(aj)                                                          \
+    coopMatLoad(matB##aj, shB[buf], (sgx * ACC_N + aj) * N_BLOCK, BN,       \
+                gl_CooperativeMatrixLayoutRowMajor);
+#define MMA(ai, aj)                                                         \
+    matC##ai##aj = coopMatMulAdd(matA##ai, matB##aj, matC##ai##aj);
+
+// STORE_C — coopMatStore + barrier into shC, then scatter branches.
+// HAS_HALF2_EPI: compile-time 0/1 OR runtime bool (glslc accepts both in an
+// 'if' condition via implicit promotion to bool).
+#define STORE_C(ai, aj, HAS_HALF2_EPI, SPLIT_K, KS_SLICE, COOP_SPLIT, B_VAR) \
+    coopMatStore(matC##ai##aj, shC[sg], 0, N_BLOCK,                         \
+                 gl_CooperativeMatrixLayoutRowMajor);                        \
+    barrier();                                                              \
+    if (HAS_HALF2_EPI) {                                                    \
+        scatter_tile_half2(sg, lane, sgy, sgx, m0, n0, M, N, B_VAR);        \
+    } else {                                                                \
+        scatter_tile(sg, lane, sgy, sgx, ai, aj, m0, n0, M, N,             \
+                     SPLIT_K, COOP_SPLIT, KS_SLICE, B_VAR);                \
+    }                                                                       \
+    barrier();
+
+// ===========================================================================
+// SK_LASTBLOCK: true grid.z parallel split-K. Each workgroup owns one K
+// slice (grid.z = batch * SK), runs coopmat MMA over [k0, k_end), writes
+// fp32 partial into a coherent global buffer, atomicAdds a per-tile arrival
+// counter. The workgroup that sees atomicAdd return SK-1 is the LASTBLOCK:
+// after one memoryBarrierBuffer it reads all SK partials, sums them, packs
+// half2, writes uOutput — single dispatch, NO scratch round-trip, NO
+// separate pack pass. Non-lastblock workgroups return immediately after
+// writing their partial.
+//
+// Memory ordering (per GLSL 4.50 core spec):
+//   1. Writes to uPartial (coherent buffer) + memoryBarrierBuffer() — makes
+//      our writes visible to any other invocation performing a buffer memory
+//      operation on the same device queue (coherent writes are made globally
+//      visible by the barrier before any subsequent buffer read by another
+//      invocation).
+//   2. atomicAdd(uCounter[tile_id]) — atomic memory operations have both
+//      acquire and release semantics (GLSL 4.50 §17.2.3). This release makes
+//      our prior coherent writes (held by step 1's buffer barrier) visible
+//      to any other invocation that subsequently acquires the same counter.
+//   3. When some workgroup's atomicAdd returns SK-1, IT IS THE LASTBLOCK.
+//      We then issue a SECOND memoryBarrierBuffer() before reading uPartial.
+//      This second barrier is the acquire half paired with every other
+//      workgroup's step-1 buffer barrier + atomicAdd release. Together with
+//      coherent buffer semantics, this guarantees we see the final values
+//      of every partial write.
+//
+// Partial buffer layout: flat per-(batch, slice, row, col) fp32 plane, no
+// tile boundary padding. Each SK gives one full [M, N] fp32 plane in partial
+// buffer space; lastblock sums across SK planes and writes half2 to uOutput.
+//
+// Counter buffer layout: one uint grid cell per (batch, tile_y, tile_x).
+// Host must vkCmdFillBuffer(0) the counter before every dispatch — shader
+// only does atomicAdd, never clears.
+//
+// K-slice alignment: slice_k0 is aligned DOWN to K_BLOCK; slice_k_end is
+// aligned UP. Tile straddling the slice boundary enters the loop but zeros
+// its out-of-slice elements in fetch_a/b, so the partial contribution from
+// that tile is mathematically consistent (sum across slices = full K).
+// ===========================================================================
+#if defined(SK_LASTBLOCK)
+// TEMP DEBUG: SK_LASTBLOCK uses DEFAULT's proven-correct main() verbatim.
+// Binding 4/5 are also unified to DEFAULT (readonly ScaleTab/GlobalFac above).
+// If this works, the root cause is in the original SK_LASTBLOCK-specific code.
+void main() {
+    CoopKRange kr = coop_load_krange(int(uPC.K));
+    int coop_split = kr.n;
+    bool split_k = (coop_split > 1);
+
+    int b, ks_slice;
+    if (split_k) {
+        b = int(gl_WorkGroupID.z) / coop_split;
+        ks_slice = int(gl_WorkGroupID.z) % coop_split;
+    } else {
+        b = int(gl_WorkGroupID.z);
+        ks_slice = 0;
+    }
+
+    int  m0   = int(gl_WorkGroupID.y) * BM;
+    int  n0   = int(gl_WorkGroupID.x) * BN;
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    int  sgx  = int(sg % SG_N);
+    int  sgy  = int(sg / SG_N);
+
+    int M = uPC.M, N = uPC.N, K = uPC.K;
+    int a_base = b * M * K;
+    int b_base = bmap(b) * K * N;
+
+    #if HALF2_EPI_OK
+    bool has_half2_epi = ((N & 1) == 0);
+    #else
+    bool has_half2_epi = false;
+    #endif
+
+    ACC_TILES(DECL_C)
+
+    int k0 = kr.k0;
+    int kstop = kr.kstop;
+    int k_tiles_slice = (kstop - k0 + K_BLOCK - 1) / K_BLOCK;
+
+    float16_t va[A_ELEMS], vb[B_ELEMS];
+    fetch_a(a_base, m0, k0, M, K, va);
+    fetch_b(b_base, n0, k0, N, K, vb);
+    store_a(va, 0); store_b(vb, 0);
+    barrier();
+
+    int buf = 0;
+    for (int t = 0; t < k_tiles_slice; t++) {
+        if (t + 1 < k_tiles_slice) {
+            fetch_a(a_base, m0, k0 + (t + 1) * K_BLOCK, M, K, va);
+            fetch_b(b_base, n0, k0 + (t + 1) * K_BLOCK, N, K, vb);
+        }
+#if ACC_M == 1
+        DECL_A(0) LOAD_A(0)
+#else
+        DECL_A(0) LOAD_A(0) DECL_A(1) LOAD_A(1)
+#endif
+#if ACC_N == 1
+        DECL_B(0) LOAD_B(0)
+#else
+        DECL_B(0) LOAD_B(0) DECL_B(1) LOAD_B(1)
+#endif
+        ACC_TILES(MMA)
+        if (t + 1 < k_tiles_slice) { store_a(va, buf ^ 1); store_b(vb, buf ^ 1); }
+        barrier(); buf ^= 1;
+    }
+
+    #define STORE_C_APPLY(ai, aj) \
+        STORE_C(ai, aj, has_half2_epi, split_k, ks_slice, coop_split, b)
+    ACC_TILES(STORE_C_APPLY)
+    #undef STORE_C_APPLY
+}
+// ===========================================================================
+// SPLITK_INWG: split-K inside one workgroup, serial passes, cross-pass
+// shared-memory reduction. Single dispatch (grid = DEFAULT), NO global
+// scratch round-trip, host skips matmul_pack.comp (or forces it through if
+// ENABLE_HALF2_EPI is off).
+// ===========================================================================
+#elif defined(SPLITK_INWG)
+void main() {
+    // Non-1x1 accumulator tiles: cross-pass INWG reduce only supports 1x1
+    // subgroup tile layout today. Host must not dispatch -DSPLITK_INWG for
+    // ACC_M>1 or ACC_N>1 builds — they get undefined behaviour below.
+#if !(ACC_M == 1 && ACC_N == 1)
+    // Fall through to a serial-pass single-tile fallback (no cross-pass).
+#endif
+
+    int  b    = int(gl_WorkGroupID.z);
+    int  m0   = int(gl_WorkGroupID.y) * BM;
+    int  n0   = int(gl_WorkGroupID.x) * BN;
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    int  sgy  = int(sg / SG_N);
+    int  sgx  = int(sg % SG_N);
+
+    int M = uPC.M, N = uPC.N, K = uPC.K;
+    int coop = min(max(uPC.ksplit, 1), SG_M * SG_N);
+    int a_base = b * M * K;
+    int b_base = bmap(b) * K * N;
+
+    const int ELEMS = (M_BLOCK * N_BLOCK) / 32;
+
+#if ACC_M == 1 && ACC_N == 1
+    // Per-subgroup cross-pass accumulator init (fp32 zeros).
+    for (int e = 0; e < ELEMS; ++e) {
+        int idx = int(lane) * ELEMS + e;
+        shC_acc[sg][idx] = 0.0;
+    }
+
+    for (int p = 0; p < coop; p++) {
+        KRange kr = krange_for(p, coop);
+        if (kr.k0 >= kr.k_end) continue;
+
+        coopmat<float, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                gl_MatrixUseAccumulator> matC;
+        run_mma_slice(m0, n0, a_base, b_base, kr, matC);
+
+        coopMatStore(matC, shC_tmp[sg], 0, N_BLOCK,
+                     gl_CooperativeMatrixLayoutRowMajor);
+        barrier();
+        for (int e = 0; e < ELEMS; ++e) {
+            int idx = int(lane) * ELEMS + e;
+            shC_acc[sg][idx] += shC_tmp[sg][idx];
+        }
+        barrier();
+    }
+
+    // Final shC_acc → shC copy (flat fp32 lane layout, proven correct on Ada).
+    barrier();
+    for (int e = 0; e < ELEMS; ++e) {
+        int idx = int(lane) * ELEMS + e;
+        shC[sg][idx] = shC_acc[sg][idx];
+    }
+    barrier();
+
+    // Epilogue: half2 (if enabled) or fp32 scratch (conservative).
+    #if HALF2_EPI_OK
+    if ((N & 1) == 0) {
+        scatter_tile_half2(sg, lane, sgy, sgx, m0, n0, M, N, b);
+    } else {
+        scatter_tile(sg, lane, sgy, sgx, 0, 0, m0, n0, M, N, false, 0, 0, b);
+    }
+    #else
+    scatter_tile(sg, lane, sgy, sgx, 0, 0, m0, n0, M, N, false, 0, 0, b);
+    #endif
+
+#else
+    // Non-1x1 INWG: run coop=1 single pass (no cross-pass reduce). This
+    // keeps the shared shC path intact so scatter_tile works correctly.
+    coop = 1;
+    ACC_TILES(DECL_C)
+
+    // Use the same K loop as DEFAULT main.
+    int k0 = 0;
+    int kstop = K;
+    int k_tiles_slice = (kstop - k0 + K_BLOCK - 1) / K_BLOCK;
+    float16_t va[A_ELEMS], vb[B_ELEMS];
+    fetch_a(a_base, m0, k0, M, K, va);
+    fetch_b(b_base, n0, k0, N, K, vb);
+    store_a(va, 0); store_b(vb, 0);
+    barrier();
+    int buf = 0;
+    for (int t = 0; t < k_tiles_slice; t++) {
+        if (t + 1 < k_tiles_slice) {
+            fetch_a(a_base, m0, k0 + (t + 1) * K_BLOCK, M, K, va);
+            fetch_b(b_base, n0, k0 + (t + 1) * K_BLOCK, N, K, vb);
+        }
+#if ACC_M == 1
+        DECL_A(0) LOAD_A(0)
+#else
+        DECL_A(0) LOAD_A(0) DECL_A(1) LOAD_A(1)
+#endif
+#if ACC_N == 1
+        DECL_B(0) LOAD_B(0)
+#else
+        DECL_B(0) LOAD_B(0) DECL_B(1) LOAD_B(1)
+#endif
+        ACC_TILES(MMA)
+        if (t + 1 < k_tiles_slice) { store_a(va, buf ^ 1); store_b(vb, buf ^ 1); }
+        barrier(); buf ^= 1;
+    }
+
+    #define STORE_C_APPLY(ai, aj) STORE_C(ai, aj, false, false, 0, 0, b)
+    ACC_TILES(STORE_C_APPLY)
+    #undef STORE_C_APPLY
+#endif
+}
+
+// ===========================================================================
+// DEFAULT: single-pass (with optional runtime split-K via scratch header).
+// half2 epilogue guarded by HALF2_EPI_OK — default-off on Ada until
+// lane-1-zero bug is root-caused.
+// ===========================================================================
+#else
+void main() {
+    CoopKRange kr = coop_load_krange(int(uPC.K));
+    int coop_split = kr.n;
+    bool split_k = (coop_split > 1);
+
+    int b, ks_slice;
+    if (split_k) {
+        b = int(gl_WorkGroupID.z) / coop_split;
+        ks_slice = int(gl_WorkGroupID.z) % coop_split;
+    } else {
+        b = int(gl_WorkGroupID.z);
+        ks_slice = 0;
+    }
+
+    int  m0   = int(gl_WorkGroupID.y) * BM;
+    int  n0   = int(gl_WorkGroupID.x) * BN;
+    uint sg   = gl_SubgroupID;
+    uint lane = gl_SubgroupInvocationID;
+    int  sgx  = int(sg % SG_N);
+    int  sgy  = int(sg / SG_N);
+
+    int M = uPC.M, N = uPC.N, K = uPC.K;
+    int a_base = b * M * K;
+    int b_base = bmap(b) * K * N;
+
+    // half2 epilogue: compile-time guard + runtime N-even. Default-off.
+    #if HALF2_EPI_OK
+    bool has_half2_epi = ((N & 1) == 0);
+    #else
+    bool has_half2_epi = false;
+    #endif
+
+    ACC_TILES(DECL_C)
+
+    int k0 = kr.k0;
+    int kstop = kr.kstop;
+    int k_tiles_slice = (kstop - k0 + K_BLOCK - 1) / K_BLOCK;
+
+    float16_t va[A_ELEMS], vb[B_ELEMS];
+    fetch_a(a_base, m0, k0, M, K, va);
+    fetch_b(b_base, n0, k0, N, K, vb);
+    store_a(va, 0); store_b(vb, 0);
+    barrier();
+
+    int buf = 0;
+    for (int t = 0; t < k_tiles_slice; t++) {
+        if (t + 1 < k_tiles_slice) {
+            fetch_a(a_base, m0, k0 + (t + 1) * K_BLOCK, M, K, va);
+            fetch_b(b_base, n0, k0 + (t + 1) * K_BLOCK, N, K, vb);
+        }
+#if ACC_M == 1
+        DECL_A(0) LOAD_A(0)
+#else
+        DECL_A(0) LOAD_A(0) DECL_A(1) LOAD_A(1)
+#endif
+#if ACC_N == 1
+        DECL_B(0) LOAD_B(0)
+#else
+        DECL_B(0) LOAD_B(0) DECL_B(1) LOAD_B(1)
+#endif
+        ACC_TILES(MMA)
+        if (t + 1 < k_tiles_slice) { store_a(va, buf ^ 1); store_b(vb, buf ^ 1); }
+        barrier(); buf ^= 1;
+    }
+
+    #define STORE_C_APPLY(ai, aj) \
+        STORE_C(ai, aj, has_half2_epi, split_k, ks_slice, coop_split, b)
+    ACC_TILES(STORE_C_APPLY)
+    #undef STORE_C_APPLY
+}
+#endif // SK_LASTBLOCK vs SPLITK_INWG vs DEFAULT

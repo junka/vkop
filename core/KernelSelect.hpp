@@ -159,6 +159,16 @@ enum class MatmulRoute {
     kTiled,
     kTiledKs,
     kCoopmat,
+    kCoopmatSplitK,
+    kCoopmatInwg,
+    // coopmat + split-K with grid.z = batch*SK (true parallel K split, not
+    // workgroup-internal serial passes). One dispatch, each slice writes fp32
+    // partials to a global buffer; the tail block reduces and writes half2
+    // directly. Boundary conditions on the partial buffer / atomic counter
+    // are resolved by the shader (matmul_coop*.comp -DSK_LASTBLOCK).
+    // Host-side guard (not yet active while shader lands): SK ∈ [2, 8],
+    // K/SK >= 2*K_BLOCK (= 32), N even, ACC_M=ACC_N=1 only.
+    kCoopmatSkLast,
     kCoopmatI8,
     kDownActFold,
     kAttnSoftmax,
@@ -243,6 +253,13 @@ struct MatmulKnobs {
     // coopmat even for M=1 shapes where it would otherwise be excluded as a
     // "waste of MMA lanes." Intended for PoC — DO NOT set in production.
     bool force_coop = false;
+    // VKOP_COOP_SPLITK=1: opt-in coopmat + split-K hybrid kernel. When set,
+    // the selector may route fp16 coopmat shapes through kCoopmatSplitK,
+    // which dispatches multiple K slices of the coopmat main pass + one
+    // reduce pass — no standalone pack pass.
+    // VKOP_COOP_SPLITK_FORCE=<ks_n>: pin the split-K depth (>=2). 0 = auto
+    // (selector picks based on occupancy, like ks_depth_for for tiled_ks).
+    int coop_split = 0;
 };
 
 MatmulKnobs matmul_knobs_from_env();
@@ -258,6 +275,9 @@ struct MatmulPlan {
     const char *tag = "reduce";
     // Tile-split-K depth. 0/1 means "no K split".
     int ks_n = 0;
+    // coopmat-split-K depth (opt-in via VKOP_COOP_SPLITK*). 0/1 means
+    // "coopmat main pass only, no K split".
+    int coop_split = 0;
     // Split-K GEMV columns per block (quads, 8-column groups or 16-column
     // groups depending on the route).
     int ksplit_q = 16;
