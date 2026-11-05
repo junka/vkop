@@ -529,6 +529,15 @@ void da_deposit_wide_byte(int b_n, int tile, int gx, int lane) {
 // whenever batch > 1.
 
 
+// DA_M1_ONLY: the m==1 variant of this module. The multi-row tile walk below
+// is dead for every M==1 dispatch (the wide gate above catches the shipped
+// shapes, and a lone row takes the mt==1 scalar walk), but merely carrying it
+// in the same entry point grew the SPIR-V by 48 KB and cost the decode fold
+// 4.2 ms/step (2026-11-05 attribution: the m==1 module and the m>1 module
+// execute identical code, yet the bigger module ran 18% slower -- register
+// pressure / code size, not the algorithm). The m==1 build therefore compiles
+// without this block; the host routes M>1 to buffer_matmul_down_act_multi_fp16.
+#ifndef DA_M1_ONLY
 // One unrolled trip of the fp16 multi-row deposit: consume one hoisted
 // weight pair-word per matrix (8 issued before any is consumed), extract the
 // lane's half of the fp16 pair, and FMA the 16 staged x rows (4 vec4 shared
@@ -557,6 +566,7 @@ void da_deposit_wide_byte(int b_n, int tile, int gx, int lane) {
         ur4[2] += da_x2 * da_wu;                                    \
         ur4[3] += da_x3 * da_wu;                                    \
     }
+#endif // DA_M1_ONLY
 
 void da_deposit() {
     int z = int(gl_WorkGroupID.y);
@@ -614,6 +624,7 @@ void da_deposit() {
             floatBitsToUint(j < kw ? ur : 0.0);
         return;
     }
+#ifndef DA_M1_ONLY
     // k-outer / r-inner over the tile's 16 rows. aoff stays an array because
     // the r trip count is the compile-time DA_MT (same contract as the down
     // walk's acc[DA_MT][4]); the store loop's dynamic mt bound only reads
@@ -753,6 +764,36 @@ void da_deposit() {
         uScratch.data[da_up(row, gx, s, lane)] =
             floatBitsToUint(j < kw ? ur4[r >> 2][r & 3] : 0.0);
     }
+#else // DA_M1_ONLY
+    // M==1 module reaching a multi-row tile: only a model converted against an
+    // archive that has no buffer_matmul_down_act_multi_fp16 key can get here
+    // (the host falls back to this module for every M when the multi key is
+    // missing). Keep the pre-4a99ed9 per-row walk -- correct for any mt, re-reads
+    // the K slice once per row -- so such a model still prefills correctly
+    // instead of writing one row's partials and leaving the rest stale. The
+    // shipped M==1 path never enters it: the wide gate above returns first.
+    for (int r = 0; r < mt; ++r) {
+        int row = b_n * uPC.M + tile * DA_MT + r;
+        float gr = 0.0;
+        float ur = 0.0;
+        if (j < kw) {
+            int a_off = row * kx;
+            for (int k = lo; k < hi; ++k) {
+                float xv = da_x(a_off, k);
+                gr += xv * da_wg_any(b_n, j, k);
+                ur += xv * da_wu_any(b_n, j, k);
+            }
+            if (uPC.weight_int8 != 0) {
+                gr *= da_scale(uPC.N + j);
+                ur *= da_scale(uPC.N + uPC.K + j);
+            }
+        }
+        uScratch.data[da_gp(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? gr : 0.0);
+        uScratch.data[da_up(row, gx, s, lane)] =
+            floatBitsToUint(j < kw ? ur : 0.0);
+    }
+#endif // DA_M1_ONLY
 }
 
 #undef DA_TRIP

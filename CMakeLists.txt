@@ -401,14 +401,18 @@ list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_KS_FOLD})
 # keeps the shared fp16 pipeline untouched if a driver refuses it. Missing key
 # => MatMulBuffer::down_act_pipeline yields nothing and the op falls back to the
 # three standalone GEMMs.
+# Two keys from one source. DA_M1_ONLY trims the multi-row tile walk, which
+# every M==1 dispatch skips anyway; carrying it in the module the decode fold
+# runs measured 4.2 ms/step slower (2026-11-05), so the decode key is built
+# without it and the host routes M>1 to the _multi key.
 set(SPIRV_FILE_DOWN_ACT ${SPIRV_DIR}/buffer_matmul_down_act_fp16.spv)
 add_custom_command(
     OUTPUT ${SPIRV_FILE_DOWN_ACT}
     COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul_down_act.comp
-            -fshader-stage=compute -g --target-spv=spv1.3
+            -fshader-stage=compute -g --target-spv=spv1.3 -DDA_M1_ONLY
             -o ${SPIRV_FILE_DOWN_ACT}
     DEPENDS ${SHADER_DIR}/buffer/matmul_down_act.comp ${SHADER_INCLUDES}
-    COMMENT "Compiling buffer/matmul_down_act (SwiGLU fold, fp16) to SPIR-V"
+    COMMENT "Compiling buffer/matmul_down_act (SwiGLU fold, M==1) to SPIR-V"
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_DOWN_ACT})
 
@@ -432,6 +436,10 @@ macro(vkop_shader_variant KEY SOURCE)
     list(APPEND VARIANT_SPV_KEYS ${KEY})
     list(APPEND VARIANT_SPV_FILES ${SPIRV_FILE_VARIANT})
 endmacro()
+
+# The M>1 build of the SwiGLU fold source (no DA_M1_ONLY): keeps the multi-row
+# deposit walk that the M==1 module above compiles out.
+vkop_shader_variant(buffer_matmul_down_act_multi_fp16 buffer/matmul_down_act)
 
 # Larger 16x16x16 coopmat workgroups (MatMulBuffer::coop_geo_pipeline): the same
 # matmul_coop16.comp with more accumulator tiles per subgroup, so one 256-thread

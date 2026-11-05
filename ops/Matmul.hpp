@@ -1075,6 +1075,10 @@ class MatMulBuffer : public BufferFactory {
                 if (sel_down_act == nullptr) {
                     sel_av.down_act = false;
                     retry = true;
+                } else {
+                    // Build the M>1 module now, while we are still outside a
+                    // command buffer. A miss only costs the fallback walk.
+                    down_act_pipeline(true);
                 }
                 break;
             case core::MatmulRoute::kCoopmatSkLast:
@@ -1749,7 +1753,18 @@ class MatMulBuffer : public BufferFactory {
                 // stale slots into h.
                 const bool da_wide_ok = (m == 1) && ((n_up % 8) == 0) &&
                                         da_ks_n <= 8 && (512 % da_ks_n) == 0;
-                ks_submit(sel_down_act, down_act_ds_[m_id_], da_gx,
+                // M==1 runs the trimmed module; M>1 the one that keeps the
+                // multi-row deposit. An archive without the _multi key leaves
+                // da_pipe on the M==1 module, whose per-row walk covers M>1.
+                VulkanPipeline *da_pipe = sel_down_act;
+                VkDescriptorSet *da_dset = down_act_ds_;
+                if (m > 1) {
+                    if (VulkanPipeline *p = down_act_pipeline(true)) {
+                        da_pipe = p;
+                        da_dset = down_act_multi_ds_;
+                    }
+                }
+                ks_submit(da_pipe, da_dset[m_id_], da_gx,
                           batch * ((m + 15) / 16), da_wide_ok ? 1 : da_ks_n);
                 // Down: sums the deposit's slice partials per (row, j) into
                 // shared, walks the sub-block's Wd j-slice for every output
@@ -1760,14 +1775,14 @@ class MatMulBuffer : public BufferFactory {
                 scratch_da_->shaderWriteBarrier(m_cmd_->get());
                 para_.ks_part = 1; // the module's down entry
                 para_.tile = da_ds;
-                ks_submit(sel_down_act, down_act_ds_[m_id_], da_gx,
+                ks_submit(da_pipe, da_dset[m_id_], da_gx,
                           batch * ((m + 15) / 16), da_ds);
                 // Reduce: sums the GX * da_ds down partials and packs fp16.
                 // tile still carries da_ds for the dp stride. Reading what
                 // the down pass wrote needs another dependency.
                 scratch_da_->shaderWriteBarrier(m_cmd_->get());
                 para_.ks_part = 2; // the module's reduce entry
-                dispatch_on(sel_down_act, down_act_ds_[m_id_],
+                dispatch_on(da_pipe, da_dset[m_id_],
                             UP_DIV(n, 2048), batch * m);
                 return;
             }
@@ -2277,34 +2292,49 @@ class MatMulBuffer : public BufferFactory {
     // 512-lane pair, and for a stronger reason -- the whole point of the fold
     // is an allocation the host has already skipped, so a refusal must be
     // visible and must fall back to routing the plain GEMMs.
-    VulkanPipeline *down_act_pipeline() {
-        static bool refused_by_driver = false;
-        static bool warned_missing_bytes = false;
-        if (down_act_pipeline_) {
-            return down_act_pipeline_.get();
+    // Builds one of the two fold modules. The M==1 key is compiled with
+    // DA_M1_ONLY: the multi-row tile walk is gone from it, which is what made
+    // the decode fold regress 4.2 ms/step when both walks shared one module
+    // (2026-11-05: same executed code, bigger SPIR-V, slower). M>1 dispatches
+    // use _multi, which keeps the unrolled walk. An archive converted before
+    // the split has only the M==1 key; M>1 then falls back to it, whose
+    // per-row walk is still correct -- just the pre-split speed -- so an old
+    // model keeps folding instead of silently writing one row per tile.
+    VulkanPipeline *down_act_pipeline(bool multi = false) {
+        const int id = multi ? 1 : 0;
+        static bool refused_by_driver[2] = {false, false};
+        static bool warned_missing_bytes[2] = {false, false};
+        std::unique_ptr<VulkanPipeline> &cached =
+            multi ? down_act_multi_pipeline_ : down_act_pipeline_;
+        bool &no_bytes = multi ? down_act_multi_no_bytes_ : down_act_no_bytes_;
+        VkDescriptorSet *ds = multi ? down_act_multi_ds_ : down_act_ds_;
+        if (cached) {
+            return cached.get();
         }
-        if (refused_by_driver || down_act_no_bytes_) {
+        if (refused_by_driver[id] || no_bytes) {
             return nullptr;
         }
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
         std::pair<const uint32_t *, uint32_t> spv;
         try {
-            spv = resolve_spv("buffer_matmul_down_act_fp16");
+            spv = resolve_spv(multi ? "buffer_matmul_down_act_multi_fp16"
+                                    : "buffer_matmul_down_act_fp16");
         } catch (const std::exception &e) {
-            down_act_no_bytes_ = true;
-            if (!warned_missing_bytes) {
-                warned_missing_bytes = true;
+            no_bytes = true;
+            if (!warned_missing_bytes[id]) {
+                warned_missing_bytes[id] = true;
                 std::fprintf(
                     stderr,
-                    "[vkop] %s\n[vkop] SwiGLU down_proj folds stay off "
-                    "until that key is shipped\n",
-                    e.what());
+                    "[vkop] %s\n[vkop] %s\n", e.what(),
+                    multi ? "M>1 keeps the M==1 module's per-row deposit walk"
+                          : "SwiGLU down_proj folds stay off until that key "
+                            "is shipped");
             }
             return nullptr;
         }
         try {
-            down_act_pipeline_ = std::make_unique<VulkanPipeline>(
+            cached = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
@@ -2315,18 +2345,20 @@ class MatMulBuffer : public BufferFactory {
                 sizeof(matmul::GpuMatMulParam), spv.first,
                 static_cast<int>(spv.second), use_uab, 0);
             for (int i = 0; i < vkop::kInflight; ++i) {
-                down_act_ds_[i] = down_act_pipeline_->allocDescriptorSets();
+                ds[i] = cached->allocDescriptorSets();
             }
         } catch (const std::exception &e) {
-            refused_by_driver = true;
-            down_act_pipeline_.reset();
+            refused_by_driver[id] = true;
+            cached.reset();
             std::fprintf(stderr,
-                         "[vkop] SwiGLU down fold pipeline rejected (%s); "
-                         "down_proj runs as three standalone GEMMs\n",
-                         e.what());
+                         "[vkop] SwiGLU down fold %s pipeline rejected (%s); "
+                         "%s\n",
+                         multi ? "M>1" : "M==1", e.what(),
+                         multi ? "M>1 uses the M==1 module's per-row walk"
+                               : "down_proj runs as three standalone GEMMs");
             return nullptr;
         }
-        return down_act_pipeline_.get();
+        return cached.get();
     }
 
     // Shared probe/build for the two 512-lane keys. id pins the process-wide
@@ -2598,6 +2630,10 @@ class MatMulBuffer : public BufferFactory {
     std::unique_ptr<VulkanPipeline> down_act_pipeline_;
     VkDescriptorSet down_act_ds_[vkop::kInflight] = {nullptr};
     bool down_act_no_bytes_ = false;
+    // M>1 fold module (keeps the multi-row tile walk; see down_act_pipeline).
+    std::unique_ptr<VulkanPipeline> down_act_multi_pipeline_;
+    VkDescriptorSet down_act_multi_ds_[vkop::kInflight] = {nullptr};
+    bool down_act_multi_no_bytes_ = false;
     bool down_act_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)

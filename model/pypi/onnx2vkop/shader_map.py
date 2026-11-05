@@ -173,6 +173,10 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # WIDE and 512 keys it has to ship with every MatMul -- the operator
         # that needs it is a plain MatMul, not a distinct op_type.
         "buffer_matmul_down_act_fp16",
+        # The M>1 build of the same source (no DA_M1_ONLY): keeps the
+        # multi-row deposit walk that the M==1 module drops. MatMul routes
+        # M==1 to _fp16 and M>1 to this key, so both must ship.
+        "buffer_matmul_down_act_multi_fp16",
         # The tile-split-K pair for the tiled fp16 kernel (-DTILED_KS_SPLIT
         # deposit pass, -DTILED_KS_FOLD fold pass; one source, two modules,
         # because a pipeline binds a single entry point and the split half is
