@@ -4,6 +4,8 @@
 #include <stdexcept>
 #include <vector>
 
+#include "vulkan/DescriptorWriteProf.hpp"
+
 namespace vkop {
 
 VulkanBasePipeline::VulkanBasePipeline(VkDevice device,
@@ -151,8 +153,10 @@ VkDescriptorSet VulkanBasePipeline::allocDescriptorSets() {
     descriptor_set_allocate_info.descriptorSetCount = 1;
     descriptor_set_allocate_info.pSetLayouts = &m_descriptorSetLayout_;
 
+    const uint64_t t_prof0 = ds_prof_now();
     auto ret = vkAllocateDescriptorSets(
         m_device_, &descriptor_set_allocate_info, &descriptor_set);
+    ds_prof_record("alloc", ds_prof_now() - t_prof0, 1);
     if (ret != VK_SUCCESS) {
         printf("allocate descriptor set fail %d\n", ret);
         throw std::runtime_error("Failed to allocate descriptor set!");
@@ -162,14 +166,19 @@ VkDescriptorSet VulkanBasePipeline::allocDescriptorSets() {
 
 void VulkanBasePipeline::freeDescriptorSets(VkDescriptorSet ds) {
     if (ds != VK_NULL_HANDLE) {
+        const uint64_t t_prof0 = ds_prof_now();
         vkFreeDescriptorSets(m_device_, m_descriptorPool_, 1, &ds);
+        ds_prof_record("free", ds_prof_now() - t_prof0, 1);
     }
 }
 
 void VulkanBasePipeline::updateDescriptorSets(
     const std::vector<VkWriteDescriptorSet> &writes) {
+    const uint64_t t_prof0 = ds_prof_now();
     vkUpdateDescriptorSets(m_device_, static_cast<uint32_t>(writes.size()),
                            writes.data(), 0, nullptr);
+    ds_prof_record("update", ds_prof_now() - t_prof0,
+                   static_cast<uint32_t>(writes.size()));
 }
 
 } // namespace vkop

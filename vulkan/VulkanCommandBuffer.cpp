@@ -2,6 +2,7 @@
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanSemaphore.hpp"
 
+#include "vulkan/DescriptorWriteProf.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <memory>
 
@@ -47,11 +48,18 @@ VulkanCommandBuffer::VulkanCommandBuffer(
 
 void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
                                VkDescriptorSet descriptor_set) {
+    // Split-timed per command: under VK_KHR_push_descriptor
+    // vkCmdBindDescriptorSets goes away (the bindings are pushed instead) while
+    // vkCmdBindPipeline stays, so only the "bind_ds" column is in play.
+    const uint64_t t_prof0 = ds_prof_now();
     vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline.getPipeline());
+    const uint64_t t_prof1 = ds_prof_now();
     vkCmdBindDescriptorSets(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                             pipeline.getPipelineLayout(), 0, 1, &descriptor_set,
                             0, nullptr);
+    ds_prof_record("bind_pipeline", t_prof1 - t_prof0, 1);
+    ds_prof_record("bind_ds", ds_prof_now() - t_prof1, 1);
 }
 
 void VulkanCommandBuffer::bindGraphics(VulkanGraphicsPipeline &pipeline,
@@ -251,8 +259,13 @@ void VulkanCommandBuffer::reset() {
 
 void VulkanCommandBuffer::push_constants(VulkanPipeline &pipeline,
                                          uint32_t size, const void *ptr) {
+    // Timed as the anchor for what an inline recorded command costs on this
+    // driver: vkCmdPushDescriptorSetKHR, which is what VK_KHR_push_descriptor
+    // would swap in for vkUpdateDescriptorSets, is the same kind of call.
+    const uint64_t t_prof0 = ds_prof_now();
     vkCmdPushConstants(m_commandBuffer_, pipeline.getPipelineLayout(),
                        VK_SHADER_STAGE_COMPUTE_BIT, 0, size, ptr);
+    ds_prof_record("push_const", ds_prof_now() - t_prof0, 1);
 }
 
 void VulkanCommandBuffer::dispatch(int w, int h, int z) {

@@ -17,6 +17,7 @@
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "vulkan/DescriptorWriteProf.hpp"
 #include "vulkan/PipelineCreateProf.hpp"
 #include "vulkan/Renderdoc.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
@@ -52,6 +53,7 @@ Runtime::~Runtime() {
         // lazily built pipelines land here instead.
         pipeline_prof_report("session");
     }
+    ds_prof_report("session"); // per-round lines reset it; this is the residue
     if (pipeline_cache_ != VK_NULL_HANDLE) {
         auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
         vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
@@ -281,6 +283,7 @@ void Runtime::LoadModel() {
     const bool pprof = pipeline_prof_enabled();
     const auto load_t0 = std::chrono::steady_clock::now();
     pipeline_prof_set_phase("load");
+    ds_prof_set_phase("load");
     LoadPipelineCache();
 
     auto model = load::VkModel(model_path_);
@@ -1772,6 +1775,9 @@ void Runtime::LoadModel() {
             g_pcache_initial_bytes, load_ms);
         pipeline_prof_report("load", load_ms);
     }
+    ds_prof_report("load", std::chrono::duration<double, std::milli>(
+                               std::chrono::steady_clock::now() - load_t0)
+                               .count());
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
@@ -1907,6 +1913,18 @@ double Runtime::Run() {
     // decode-shape re-create after a prefill, Matmul's coop/pack variants), so
     // that compilation has to stay separable from the load-phase one.
     pipeline_prof_set_phase("run");
+    ds_prof_set_phase("run");
+    // One [dswrite] line per dispatch round, on whichever path Run() returns
+    // through: the guard spans the whole round, so its percentages line up with
+    // the round time the driver reports. Prints nothing when the gate is off.
+    struct DsRound {
+        std::chrono::steady_clock::time_point t0;
+        ~DsRound() {
+            ds_prof_round(std::chrono::duration<double, std::milli>(
+                              std::chrono::steady_clock::now() - t0)
+                              .count());
+        }
+    } ds_round{start};
 
     // RenderDoc capture window: with VKOP_RDOC=1 the n-th Run() round
     // (VKOP_RDOC_RUN, default 1) is captured whole; other rounds are a
