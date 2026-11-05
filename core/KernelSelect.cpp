@@ -526,6 +526,10 @@ const char *matmul_route_tag(MatmulRoute route) {
         return "down_act_gemv";
     case MatmulRoute::kAttnSoftmax:
         return "attn_softmax";
+    case MatmulRoute::kCoopmatSkLast:
+        return "coopmat_sklast";
+    case MatmulRoute::kCoopmatInwg:
+        return "coopmat_inwg";
     }
     return "reduce";
 }

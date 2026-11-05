@@ -479,14 +479,11 @@ vkop_shader_variant(buffer_matmul_coop16_splitk_fold buffer/matmul_coop16
 
 # SPLITK_INWG: split-K inside one workgroup, no global scratch, single
 # dispatch. coop_split (uPC.ksplit, 1..8) serial passes over K-range slices,
-# cross-pass reduction in shared memory. coop.comp's INWG stays in the base
-# source; coop16's INWG lives in its own file (matmul_coop16_inwg.comp, b3
-# snapshot extraction) so the DEFAULT build of matmul_coop16.comp stays
-# bit-for-bit identical to baseline. Host guard: ACC_M==ACC_N==1 + N even
-# + K/cs >= 2*K_BLOCK.
+# cross-pass reduction in shared memory. Only coop.comp's INWG is built: the
+# coop16 INWG variant was never shipped as its own source, and the host treats
+# that route as unavailable (KernelSelect's kCoopmatInwg retry). Host guard:
+# ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK.
 vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
-                    -DSPLITK_INWG)
-vkop_shader_variant(buffer_matmul_coop16_inwg buffer/matmul_coop16_inwg
                     -DSPLITK_INWG)
 
 # SK_LASTBLOCK: serial in-workgroup split-K (single dispatch, grid.z = batch).

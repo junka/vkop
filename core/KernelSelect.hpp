@@ -162,6 +162,12 @@ enum class MatmulRoute {
     kCoopmatI8,
     kDownActFold,
     kAttnSoftmax,
+    // coopmat + grid.z split-K (SK_LASTBLOCK). Declared so MatMul.hpp's
+    // per-route availability switch keeps compiling; the selector does not
+    // produce them yet (the host dispatches kCoopmat only).
+    kCoopmatSkLast,
+    // In-workgroup split-K variant. Same status: declared, never selected.
+    kCoopmatInwg,
 };
 
 const char *matmul_route_tag(MatmulRoute route);
@@ -261,6 +267,8 @@ struct MatmulPlan {
     // re-running the selector.
     bool tiled = false;
     int tiled_min_m = 0;
+    // SK_LASTBLOCK split-K depth. 1 = a single K pass.
+    int coop_split = 1;
     const DeviceProfile *device = nullptr;
 };
 
