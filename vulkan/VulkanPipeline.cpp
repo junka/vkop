@@ -1,15 +1,24 @@
 // Copyright 2025 @junka
 #include "VulkanLib.hpp"
 
+#include <atomic>
 #include <map>
 #include <stdexcept>
 #include <vector>
 
+#include "vulkan/PipelineCreateProf.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanPipeline.hpp"
 #include "vulkan/VulkanShader.hpp"
 
 namespace vkop {
+namespace {
+// The create duration is measured inside createComputePipeline and consumed by
+// the constructor, which records both it and the whole-construction time.
+// Atomic so a concurrent second create cannot overwrite the other's delta.
+std::atomic<uint64_t> s_last_create_ns_{0};
+} // namespace
+
 VulkanPipeline::VulkanPipeline(VkDevice device,
                                std::vector<VkDescriptorType> types,
                                size_t pushconstant_size, const uint32_t *spirv,
@@ -19,6 +28,7 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
     : VulkanBasePipeline(device, std::move(types)),
       m_pushconstant_size_(pushconstant_size),
       required_subgroup_size_(required_subgroup_size) {
+    const uint64_t t_ctor0 = pipeline_prof_now();
     VulkanShader shader(device, spirv, codesize);
     createDescriptorSetLayout(VK_SHADER_STAGE_COMPUTE_BIT, update_after_bind);
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
@@ -26,6 +36,9 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
 
     createComputePipeline(m_pipelineLayout_, shader.getShaderModule(), cache,
                           codesize);
+    pipeline_prof_record(
+        s_last_create_ns_.exchange(0), pipeline_prof_now() - t_ctor0,
+        static_cast<uint32_t>(codesize), required_subgroup_size);
     // could destroy shader here
 }
 
@@ -64,8 +77,10 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     pipeline_info.stage = shader_stage_create_info;
     pipeline_info.layout = pipelineLayout;
 
+    const uint64_t t_create0 = pipeline_prof_now();
     auto ret = vkCreateComputePipelines(m_device_, cache, 1, &pipeline_info,
                                         nullptr, &m_pipeline_);
+    s_last_create_ns_.store(pipeline_prof_now() - t_create0);
     if (ret != VK_SUCCESS) {
         throw std::runtime_error(
             "Failed to create compute pipeline!" + std::to_string(ret) +

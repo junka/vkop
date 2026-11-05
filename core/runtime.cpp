@@ -17,9 +17,10 @@
 #include "core/runtime.hpp"
 #include "model/load.hpp"
 #include "ops/OperatorFactory.hpp"
+#include "vulkan/PipelineCreateProf.hpp"
+#include "vulkan/Renderdoc.hpp"
 #include "vulkan/VulkanCommandBuffer.hpp"
 #include "vulkan/VulkanDevice.hpp"
-#include "vulkan/Renderdoc.hpp"
 
 namespace vkop {
 std::shared_ptr<VulkanBuffer> ops::Operator::dummy_buffer_ = nullptr;
@@ -46,6 +47,11 @@ Runtime::~Runtime() {
     // (weight_prof_finish_round), so by the time the Runtime goes away the
     // totals cover the whole session.
     weight_prof_report();
+    if (pipeline_prof_enabled()) {
+        // Whole-session view: the LoadModel report only covers the load, and
+        // lazily built pipelines land here instead.
+        pipeline_prof_report("session");
+    }
     if (pipeline_cache_ != VK_NULL_HANDLE) {
         auto device = m_cmdpool_->getVulkanDevice()->getLogicalDevice();
         vkDestroyPipelineCache(device, pipeline_cache_, nullptr);
@@ -60,6 +66,16 @@ Runtime::~Runtime() {
 // skip per-shader driver compilation (vkCreateComputePipelines consults the
 // cache automatically when a non-null VkPipelineCache is passed).
 
+// What the pipeline-create probe needs to label a run: whether a .pcache was
+// on disk when the cache was opened, and how many bytes it contributed. These
+// are process-level because the probe report is process-level; a second
+// Runtime in the same process overwrites them, which only ever happens in
+// unit fixtures that do not read the report.
+namespace {
+bool g_pcache_file_present = false;
+size_t g_pcache_initial_bytes = 0;
+} // namespace
+
 void Runtime::LoadPipelineCache() {
     const char *env = std::getenv("VK_PIPELINE_CACHE");
     if (!env || env[0] != '1') {
@@ -73,6 +89,7 @@ void Runtime::LoadPipelineCache() {
     std::vector<char> data;
     {
         std::ifstream f(pipeline_cache_path_, std::ios::binary);
+        g_pcache_file_present = static_cast<bool>(f);
         if (f) {
             f.seekg(0, std::ios::end);
             auto sz = f.tellg();
@@ -83,6 +100,8 @@ void Runtime::LoadPipelineCache() {
             }
         }
     }
+
+    g_pcache_initial_bytes = data.size();
 
     VkPipelineCacheCreateInfo ci{};
     ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
@@ -259,6 +278,9 @@ Runtime::kernel_key_for_node(const load::Node &n, vkop::ops::OpType type,
 }
 
 void Runtime::LoadModel() {
+    const bool pprof = pipeline_prof_enabled();
+    const auto load_t0 = std::chrono::steady_clock::now();
+    pipeline_prof_set_phase("load");
     LoadPipelineCache();
 
     auto model = load::VkModel(model_path_);
@@ -1479,6 +1501,7 @@ void Runtime::LoadModel() {
                         n.name.c_str());
                 }
             }
+            pipeline_prof_set_context(n.name.c_str());
             op->set_runtime_device(dev, m_cmdpool_, pipeline_cache_);
             op->setAttribute(n.attributes);
 
@@ -1734,6 +1757,21 @@ void Runtime::LoadModel() {
     }
 
     SavePipelineCache();
+
+    if (pprof) {
+        const double load_ms = std::chrono::duration<double, std::milli>(
+                                   std::chrono::steady_clock::now() - load_t0)
+                                   .count();
+        std::fprintf(
+            stderr,
+            "[pcreate] model=%s cache=%s initial=%zuB LoadModel=%.1fms\n",
+            model_path_.c_str(),
+            pipeline_cache_enabled_
+                ? (g_pcache_file_present ? "hot" : "cold(no .pcache)")
+                : "off (VK_PIPELINE_CACHE not set)",
+            g_pcache_initial_bytes, load_ms);
+        pipeline_prof_report("load", load_ms);
+    }
 }
 
 std::shared_ptr<ITensor> Runtime::GetInput(const std::string &name) const {
@@ -1865,6 +1903,10 @@ Runtime::ListTensors() const {
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
+    // Ops build some pipelines lazily on the first dispatch of a shape (the
+    // decode-shape re-create after a prefill, Matmul's coop/pack variants), so
+    // that compilation has to stay separable from the load-phase one.
+    pipeline_prof_set_phase("run");
 
     // RenderDoc capture window: with VKOP_RDOC=1 the n-th Run() round
     // (VKOP_RDOC_RUN, default 1) is captured whole; other rounds are a
@@ -3943,6 +3985,7 @@ void Runtime::RegisterPostProcess(
     auto op = ops::create_from_type(
         ops, pp_precision, dev->is_support_nv_tensor_core(), use_buffer);
     op->set_name("post_" + convert_optype_to_string(ops));
+    pipeline_prof_set_context(op->get_name().c_str());
     if (shader_archive_) {
         op->set_shader_archive(shader_archive_.get());
         auto key = shader_key_for(ops, use_buffer, pp_precision);
