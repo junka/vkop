@@ -4,6 +4,9 @@
 #include "vulkan/VulkanLib.hpp"
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -12,6 +15,20 @@
 #include "include/logger.hpp"
 
 namespace vkop {
+
+namespace {
+
+// The enable lambdas below copy only the bits the driver reported, so a
+// capability that reaches vkCreateDevice is enabled exactly when it was
+// supported. Recording both from the queried value keeps that invariant in one
+// place; `available` is set where the descriptor is pushed, because that is the
+// spot that knows whether the extension enumerated at all.
+void recordCap(DeviceCap &cap, VkBool32 reported) {
+    cap.supported = reported != VK_FALSE;
+    cap.enabled = cap.supported;
+}
+
+} // namespace
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     physicalDevice_ = physicalDevice;
@@ -46,6 +63,9 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
              "ks_target=%d)",
              profile.name, profile.byte_min_m, profile.fp16_min_m,
              profile.wide_n, profile.ks_target_blocks);
+    // After device_traits_: the dump wants the resolved facts next to the
+    // enabled feature bits. No-op unless VKOP_DEVCAPS=1.
+    dumpShaderCapabilities();
 #ifdef USE_VMA
     m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
 #endif
@@ -510,6 +530,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     std::vector<FeatureDescriptor> descs;
 #ifdef VK_VERSION_1_1
     if (deviceProperties.apiVersion >= VK_API_VERSION_1_1) {
+        shader_caps_.storage_buffer_16bit.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
             .extensionName = nullptr,
@@ -523,6 +544,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan11Features *>(q);
+                recordCap(shader_caps_.storage_buffer_16bit,
+                          feat->storageBuffer16BitAccess);
                 if (!feat->storageBuffer16BitAccess &&
                     !feat->storageInputOutput16 &&
                     !feat->uniformAndStorageBuffer16BitAccess) {
@@ -542,6 +565,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 #ifdef VK_VERSION_1_2
     if (deviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+        shader_caps_.shader_float16.available = true;
+        shader_caps_.shader_int8.available = true;
+        shader_caps_.storage_buffer_8bit.available = true;
+        shader_caps_.uniform_storage_8bit.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             .extensionName = nullptr,
@@ -555,9 +582,17 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan12Features *>(q);
+                recordCap(shader_caps_.shader_float16, feat->shaderFloat16);
+                recordCap(shader_caps_.shader_int8, feat->shaderInt8);
+                recordCap(shader_caps_.storage_buffer_8bit,
+                          feat->storageBuffer8BitAccess);
+                recordCap(shader_caps_.uniform_storage_8bit,
+                          feat->uniformAndStorageBuffer8BitAccess);
                 if (!feat->shaderFloat16 && !feat->shaderInt8 &&
                     !feat->timelineSemaphore && !feat->bufferDeviceAddress &&
-                    !feat->descriptorBindingStorageBufferUpdateAfterBind) {
+                    !feat->descriptorBindingStorageBufferUpdateAfterBind &&
+                    !feat->storageBuffer8BitAccess &&
+                    !feat->uniformAndStorageBuffer8BitAccess) {
                     return nullptr;
                 }
                 auto e = std::make_unique<VkPhysicalDeviceVulkan12Features>();
@@ -567,6 +602,12 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 
                 e->shaderFloat16 = feat->shaderFloat16;
                 e->shaderInt8 = feat->shaderInt8;
+                // 8-bit loads for int8 weights/activations. Only the storage
+                // buffer forms: storagePushConstant8 would widen the push
+                // constant range nothing uses.
+                e->storageBuffer8BitAccess = feat->storageBuffer8BitAccess;
+                e->uniformAndStorageBuffer8BitAccess =
+                    feat->uniformAndStorageBuffer8BitAccess;
                 e->timelineSemaphore = feat->timelineSemaphore;
                 e->bufferDeviceAddress = feat->bufferDeviceAddress;
                 e->descriptorBindingStorageBufferUpdateAfterBind =
@@ -581,6 +622,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #ifdef VK_KHR_16bit_storage
     if (supportedExtensions.count(VK_KHR_16BIT_STORAGE_EXTENSION_NAME) > 0 &&
         deviceProperties.apiVersion < VK_API_VERSION_1_1) {
+        shader_caps_.storage_buffer_16bit.available = true;
         descs.push_back(FeatureDescriptor{
             .sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES_KHR,
@@ -597,6 +639,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat =
                     static_cast<VkPhysicalDevice16BitStorageFeaturesKHR *>(q);
+                recordCap(shader_caps_.storage_buffer_16bit,
+                          feat->storageBuffer16BitAccess);
                 if (!feat->storageBuffer16BitAccess &&
                     !feat->storageInputOutput16 &&
                     !feat->uniformAndStorageBuffer16BitAccess) {
@@ -615,10 +659,55 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             }});
     }
 #endif
+#ifdef VK_KHR_8bit_storage
+    // Same promoted/legacy split as 16bit_storage: below 1.2 the bits come from
+    // the extension struct instead of VkPhysicalDeviceVulkan12Features.
+    if (supportedExtensions.count(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) > 0 &&
+        deviceProperties.apiVersion < VK_API_VERSION_1_2) {
+        shader_caps_.storage_buffer_8bit.available = true;
+        shader_caps_.uniform_storage_8bit.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR,
+            .extensionName = VK_KHR_8BIT_STORAGE_EXTENSION_NAME,
+            .corePromotedVersion = VK_API_VERSION_1_2,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto queried =
+                    std::make_unique<VkPhysicalDevice8BitStorageFeaturesKHR>();
+                *queried = makeFeatureStruct<
+                    VkPhysicalDevice8BitStorageFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR>();
+                return std::shared_ptr<void>(std::move(queried));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat =
+                    static_cast<VkPhysicalDevice8BitStorageFeaturesKHR *>(q);
+                recordCap(shader_caps_.storage_buffer_8bit,
+                          feat->storageBuffer8BitAccess);
+                recordCap(shader_caps_.uniform_storage_8bit,
+                          feat->uniformAndStorageBuffer8BitAccess);
+                if (!feat->storageBuffer8BitAccess &&
+                    !feat->uniformAndStorageBuffer8BitAccess) {
+                    return nullptr;
+                }
+                auto e =
+                    std::make_unique<VkPhysicalDevice8BitStorageFeaturesKHR>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDevice8BitStorageFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES_KHR>();
+                e->storageBuffer8BitAccess = feat->storageBuffer8BitAccess;
+                e->uniformAndStorageBuffer8BitAccess =
+                    feat->uniformAndStorageBuffer8BitAccess;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
 #ifdef VK_KHR_shader_float16_int8
     if (supportedExtensions.count(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) >
             0 &&
         deviceProperties.apiVersion < VK_API_VERSION_1_3) {
+        shader_caps_.shader_float16.available = true;
+        shader_caps_.shader_int8.available = true;
         descs.push_back(FeatureDescriptor{
             .sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES_KHR,
@@ -636,6 +725,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 auto *queried =
                     static_cast<VkPhysicalDeviceShaderFloat16Int8FeaturesKHR *>(
                         q);
+                recordCap(shader_caps_.shader_float16, queried->shaderFloat16);
+                recordCap(shader_caps_.shader_int8, queried->shaderInt8);
                 if (!queried->shaderFloat16 && !queried->shaderInt8)
                     return nullptr;
 
@@ -685,8 +776,238 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 
+    // ---- shader-level capability probes -------------------------------------
+    // Probed and enabled so the kernel selector has a truthful answer to ask
+    // about later; nothing routes on them yet. Each entry is the same
+    // query-then-copy-only-reported-bits shape as the ones above, so a driver
+    // that lacks a bit costs nothing and one that has it cannot fail
+    // vkCreateDevice.
+#ifdef VK_EXT_shader_atomic_float
+    // Never promoted to core. fp32 atomic add on a storage buffer is what would
+    // collapse the two-pass split-K (deposit partials + fold) into one pass.
+    if (supportedExtensions.count(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME) >
+        0) {
+        shader_caps_.f32_global_atomic_add.available = true;
+        shader_caps_.f32_shared_atomic_add.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT,
+            .extensionName = VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat =
+                    static_cast<VkPhysicalDeviceShaderAtomicFloatFeaturesEXT *>(
+                        q);
+                recordCap(shader_caps_.f32_global_atomic_add,
+                          feat->shaderBufferFloat32AtomicAdd);
+                recordCap(shader_caps_.f32_shared_atomic_add,
+                          feat->shaderSharedFloat32AtomicAdd);
+                // The float64 and image/sparse variants stay off: a bit the
+                // engine never uses is a bit the driver can still refuse.
+                if (!feat->shaderBufferFloat32AtomicAdd &&
+                    !feat->shaderSharedFloat32AtomicAdd)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT>();
+                e->shaderBufferFloat32AtomicAdd =
+                    feat->shaderBufferFloat32AtomicAdd;
+                e->shaderSharedFloat32AtomicAdd =
+                    feat->shaderSharedFloat32AtomicAdd;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+#ifdef VK_NV_shader_atomic_float16_vector
+    // Half2 global atomic add. The bit is reported on hardware that also has
+    // shaderFloat16 clear (Pascal does), so the [devcaps] pair has to be read
+    // together before a kernel assumes f16x2 atomics are usable.
+    if (supportedExtensions.count(
+            VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME) > 0) {
+        shader_caps_.f16x2_global_atomic_add.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV,
+            .extensionName = VK_NV_SHADER_ATOMIC_FLOAT16_VECTOR_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV *>(q);
+                recordCap(shader_caps_.f16x2_global_atomic_add,
+                          feat->shaderFloat16VectorAtomics);
+                if (!feat->shaderFloat16VectorAtomics)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceShaderAtomicFloat16VectorFeaturesNV,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT16_VECTOR_FEATURES_NV>();
+                e->shaderFloat16VectorAtomics =
+                    feat->shaderFloat16VectorAtomics;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+#ifdef VK_KHR_workgroup_memory_explicit_layout
+    // Lets one shared block be declared with an explicit layout, so the tile
+    // buffers and the split-K accumulator can alias the same bytes and buy a
+    // bigger tile. The 8/16-bit sub-features only mean something on top of the
+    // matching storage features, which is why they are recorded separately.
+    if (supportedExtensions.count(
+            VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME) > 0) {
+        shader_caps_.wmem_explicit_layout.available = true;
+        shader_caps_.wmem_explicit_scalar_block.available = true;
+        shader_caps_.wmem_explicit_8bit_access.available = true;
+        shader_caps_.wmem_explicit_16bit_access.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR,
+            .extensionName =
+                VK_KHR_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR *>(
+                    q);
+                recordCap(shader_caps_.wmem_explicit_layout,
+                          feat->workgroupMemoryExplicitLayout);
+                recordCap(shader_caps_.wmem_explicit_scalar_block,
+                          feat->workgroupMemoryExplicitLayoutScalarBlockLayout);
+                recordCap(shader_caps_.wmem_explicit_8bit_access,
+                          feat->workgroupMemoryExplicitLayout8BitAccess);
+                recordCap(shader_caps_.wmem_explicit_16bit_access,
+                          feat->workgroupMemoryExplicitLayout16BitAccess);
+                if (!feat->workgroupMemoryExplicitLayout)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_WORKGROUP_MEMORY_EXPLICIT_LAYOUT_FEATURES_KHR>();
+                e->workgroupMemoryExplicitLayout =
+                    feat->workgroupMemoryExplicitLayout;
+                e->workgroupMemoryExplicitLayoutScalarBlockLayout =
+                    feat->workgroupMemoryExplicitLayoutScalarBlockLayout;
+                e->workgroupMemoryExplicitLayout8BitAccess =
+                    feat->workgroupMemoryExplicitLayout8BitAccess;
+                e->workgroupMemoryExplicitLayout16BitAccess =
+                    feat->workgroupMemoryExplicitLayout16BitAccess;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+#ifdef VK_KHR_zero_initialize_workgroup_memory
+    if (deviceProperties.apiVersion < VK_API_VERSION_1_3 &&
+        supportedExtensions.count(
+            VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) > 0) {
+        shader_caps_.zero_init_wmem.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR,
+            .extensionName =
+                VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME,
+            .corePromotedVersion = VK_API_VERSION_1_3,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR *>(
+                    q);
+                recordCap(shader_caps_.zero_init_wmem,
+                          feat->shaderZeroInitializeWorkgroupMemory);
+                if (!feat->shaderZeroInitializeWorkgroupMemory)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceZeroInitializeWorkgroupMemoryFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ZERO_INITIALIZE_WORKGROUP_MEMORY_FEATURES_KHR>();
+                e->shaderZeroInitializeWorkgroupMemory =
+                    feat->shaderZeroInitializeWorkgroupMemory;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+#ifdef VK_KHR_shader_subgroup_rotate
+    // VK_MAKE_API_VERSION instead of VK_API_VERSION_1_4: the promoted macro is
+    // not defined by pre-1.4 headers, and this block sits above the host_image
+    // copy block that patches it in.
+    if (deviceProperties.apiVersion < VK_MAKE_API_VERSION(0, 1, 4, 0) &&
+        supportedExtensions.count(
+            VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME) > 0) {
+        shader_caps_.subgroup_rotate.available = true;
+        shader_caps_.subgroup_rotate_clustered.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR,
+            .extensionName = VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME,
+            .corePromotedVersion = VK_MAKE_API_VERSION(0, 1, 4, 0),
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q = std::make_unique<
+                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat = static_cast<
+                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR *>(q);
+                recordCap(shader_caps_.subgroup_rotate,
+                          feat->shaderSubgroupRotate);
+                recordCap(shader_caps_.subgroup_rotate_clustered,
+                          feat->shaderSubgroupRotateClustered);
+                if (!feat->shaderSubgroupRotate)
+                    return nullptr;
+                auto e = std::make_unique<
+                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceShaderSubgroupRotateFeaturesKHR,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SUBGROUP_ROTATE_FEATURES_KHR>();
+                e->shaderSubgroupRotate = feat->shaderSubgroupRotate;
+                e->shaderSubgroupRotateClustered =
+                    feat->shaderSubgroupRotateClustered;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+    // ---- end shader-level capability probes ---------------------------------
+
 #if VK_VERSION_1_3
     if (deviceProperties.apiVersion >= VK_API_VERSION_1_3) {
+        shader_caps_.zero_init_wmem.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
             .extensionName = nullptr, // Core
@@ -700,8 +1021,11 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan13Features *>(q);
+                recordCap(shader_caps_.zero_init_wmem,
+                          feat->shaderZeroInitializeWorkgroupMemory);
                 if (!feat->robustImageAccess && !feat->maintenance4 &&
-                    !feat->subgroupSizeControl)
+                    !feat->subgroupSizeControl &&
+                    !feat->shaderZeroInitializeWorkgroupMemory)
                     return nullptr;
                 auto e = std::make_unique<VkPhysicalDeviceVulkan13Features>();
                 *e = makeFeatureStruct<
@@ -710,12 +1034,19 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->robustImageAccess = feat->robustImageAccess;
                 e->subgroupSizeControl = feat->subgroupSizeControl;
                 e->maintenance4 = feat->maintenance4;
+                // Lets a workgroup's shared accumulator start at zero without
+                // the kernel clearing it first (VK_KHR_zero_initialize_
+                // workgroup_memory, 1.3 core).
+                e->shaderZeroInitializeWorkgroupMemory =
+                    feat->shaderZeroInitializeWorkgroupMemory;
                 return std::shared_ptr<void>(std::move(e));
             }});
     }
 #endif
 #ifdef VK_VERSION_1_4
     if (deviceProperties.apiVersion >= VK_API_VERSION_1_4) {
+        shader_caps_.subgroup_rotate.available = true;
+        shader_caps_.subgroup_rotate_clustered.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
             .extensionName = nullptr,
@@ -729,7 +1060,12 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             },
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<VkPhysicalDeviceVulkan14Features *>(q);
-                if (!feat->hostImageCopy && !feat->maintenance5)
+                recordCap(shader_caps_.subgroup_rotate,
+                          feat->shaderSubgroupRotate);
+                recordCap(shader_caps_.subgroup_rotate_clustered,
+                          feat->shaderSubgroupRotateClustered);
+                if (!feat->hostImageCopy && !feat->maintenance5 &&
+                    !feat->shaderSubgroupRotate)
                     return nullptr;
                 auto e = std::make_unique<VkPhysicalDeviceVulkan14Features>();
                 *e = makeFeatureStruct<
@@ -738,6 +1074,10 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->hostImageCopy = feat->hostImageCopy;
                 m_support_host_image_copy_ = feat->hostImageCopy;
                 e->maintenance5 = feat->maintenance5;
+                // subgroupRotate for in-workgroup reduction/scan (the split-K
+                // last-block fold). Deliberately NOT enabling pushDescriptor
+                // here: measured host-side only, see the [dswrite] probe notes.
+                e->shaderSubgroupRotate = feat->shaderSubgroupRotate;
                 return std::shared_ptr<void>(std::move(e));
             }});
     }
@@ -1237,6 +1577,54 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 
     return descs;
+}
+
+void VulkanDevice::dumpShaderCapabilities() const {
+    const char *env = std::getenv("VKOP_DEVCAPS");
+    if (!env || std::strcmp(env, "1") != 0) {
+        return;
+    }
+    auto yes_no = [](bool b) { return b ? "yes" : "no"; };
+    auto pr = [&](const char *name, const DeviceCap &c) {
+        if (!c.available) {
+            // Nothing was queried, so "no" would be a lie: this says the
+            // extension did not enumerate (and the feature is not core here).
+            std::fprintf(stderr, "[devcaps] %-30s %s\n", name, "not queried");
+            return;
+        }
+        std::fprintf(stderr, "[devcaps] %-30s driver=%-4s device=%-4s\n", name,
+                     yes_no(c.supported), yes_no(c.enabled));
+    };
+    const ShaderCapabilities &c = shader_caps_;
+    std::fprintf(stderr, "[devcaps] device=%s\n", deviceName_.c_str());
+    std::fprintf(stderr, "[devcaps] vendor=0x%x device=0x%x driver_id=%u\n",
+                 device_traits_.vendor_id, device_traits_.device_id,
+                 device_traits_.driver_id);
+    std::fprintf(stderr,
+                 "[devcaps] coopmat=%s fp16_8x8x16=%s fp16_16x16x16=%s "
+                 "sint8_8x8x32=%s subgroup_arith=%s subgroup_size=%u\n",
+                 yes_no(device_traits_.coopmat),
+                 yes_no(device_traits_.coopmat_fp16_8x8x16),
+                 yes_no(device_traits_.coopmat_fp16_16x16x16),
+                 yes_no(device_traits_.coopmat_sint8_8x8x32),
+                 yes_no(device_traits_.subgroup_arithmetic),
+                 device_traits_.subgroup_size);
+    pr("shader_float16", c.shader_float16);
+    pr("shader_int8", c.shader_int8);
+    pr("storage_buffer_16bit", c.storage_buffer_16bit);
+    pr("storage_buffer_8bit", c.storage_buffer_8bit);
+    pr("uniform_storage_buffer_8bit", c.uniform_storage_8bit);
+    pr("f32_global_atomic_add", c.f32_global_atomic_add);
+    pr("f32_shared_atomic_add", c.f32_shared_atomic_add);
+    pr("f16x2_global_atomic_add", c.f16x2_global_atomic_add);
+    pr("subgroup_rotate", c.subgroup_rotate);
+    pr("subgroup_rotate_clustered", c.subgroup_rotate_clustered);
+    pr("wmem_explicit_layout", c.wmem_explicit_layout);
+    pr("wmem_explicit_scalar_block", c.wmem_explicit_scalar_block);
+    pr("wmem_explicit_8bit_access", c.wmem_explicit_8bit_access);
+    pr("wmem_explicit_16bit_access", c.wmem_explicit_16bit_access);
+    pr("zero_init_wmem", c.zero_init_wmem);
+    std::fflush(stderr);
 }
 
 bool VulkanDevice::createLogicalDevice(

@@ -479,6 +479,16 @@ DeviceTraits device_traits_from(VulkanDevice &dev) {
     t.subgroup_arithmetic = dev.supportsSubgroupArithmetic();
     t.subgroup_size = subgroup.subgroupSize;
     t.max_storage_buffer_range = props.properties.limits.maxStorageBufferRange;
+    // Enabled-on-the-device view of the shader-level probes; see DeviceTraits.
+    const ShaderCapabilities &sc = dev.shader_caps();
+    t.f32_global_atomic_add = sc.f32_global_atomic_add.enabled;
+    t.f32_shared_atomic_add = sc.f32_shared_atomic_add.enabled;
+    t.f16x2_global_atomic_add = sc.f16x2_global_atomic_add.enabled;
+    t.shader_float16 = sc.shader_float16.enabled;
+    t.storage_buffer_8bit = sc.storage_buffer_8bit.enabled;
+    t.subgroup_rotate = sc.subgroup_rotate.enabled;
+    t.wmem_explicit_layout = sc.wmem_explicit_layout.enabled;
+    t.zero_init_wmem = sc.zero_init_wmem.enabled;
     return t;
 }
 

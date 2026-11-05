@@ -45,6 +45,46 @@ struct FeatureDescriptor {
 
     std::function<std::shared_ptr<void>(void *queried)> makeEnableStruct;
 };
+// One probed shader capability, split into the three questions that actually
+// differ: `available` = the extension enumerated (or the feature is core in
+// this apiVersion), `supported` = the driver reported the bit, `enabled` = the
+// bit was handed to vkCreateDevice and the device came up with it. A kernel
+// gate must read `enabled`; the [devcaps] dump prints all three so a bit the
+// driver offers but this engine does not ask for yet shows up as "supported,
+// off" instead of a flat false.
+struct DeviceCap {
+    bool available = false;
+    bool supported = false;
+    bool enabled = false;
+};
+
+// Shader-level features the compute kernels could use. The names map 1:1 onto
+// VK_KHR_shader_float16_int8, VK_KHR_16bit_storage, VK_KHR_8bit_storage,
+// VK_EXT_shader_atomic_float (fp32 add, buffer and workgroup scope),
+// VK_NV_shader_atomic_float16_vector, VK_KHR_shader_subgroup_rotate,
+// VK_KHR_workgroup_memory_explicit_layout (plus its scalar-block and 8/16-bit
+// sub-features) and VK_KHR_zero_initialize_workgroup_memory. Nothing routes on
+// these yet (core::DeviceTraits carries the enabled subset for the table-driven
+// selector); this exists so the probe can be verified per box before a kernel
+// depends on it.
+struct ShaderCapabilities {
+    DeviceCap shader_float16;
+    DeviceCap shader_int8;
+    DeviceCap storage_buffer_16bit;
+    DeviceCap storage_buffer_8bit;
+    DeviceCap uniform_storage_8bit;
+    DeviceCap f32_global_atomic_add;
+    DeviceCap f32_shared_atomic_add;
+    DeviceCap f16x2_global_atomic_add;
+    DeviceCap subgroup_rotate;
+    DeviceCap subgroup_rotate_clustered;
+    DeviceCap wmem_explicit_layout;
+    DeviceCap wmem_explicit_scalar_block;
+    DeviceCap wmem_explicit_8bit_access;
+    DeviceCap wmem_explicit_16bit_access;
+    DeviceCap zero_init_wmem;
+};
+
 struct QueryChainResult {
     VkPhysicalDeviceFeatures2 features2{};
     // shared_ptr<void> (not unique_ptr<VkBaseOutStructure>): the type-erased
@@ -189,6 +229,16 @@ class VulkanDevice {
     // buffer limits. Filled once in the constructor, after the logical device
     // has settled every capability flag — do not query this per dispatch.
     const core::DeviceTraits &device_traits() const { return device_traits_; }
+    // Shader-level capability probe results, final once the logical device
+    // exists. VKOP_DEVCAPS=1 prints the whole matrix (see
+    // dumpShaderCapabilities).
+    const ShaderCapabilities &shader_caps() const { return shader_caps_; }
+    // Prints "[devcaps]" lines to stderr: one per probed capability, with the
+    // extension-available / driver-reported / device-enabled answers. Env-gated
+    // like the other probes because Release compiles LOG_INFO away, and the
+    // point is to read the matrix on a machine that has no debugger attached.
+    void dumpShaderCapabilities() const;
+
 #ifdef VK_KHR_cooperative_matrix
     const std::vector<VkCooperativeMatrixPropertiesKHR> &
     getCooperativeMatrixProperties() const {
@@ -282,6 +332,7 @@ class VulkanDevice {
     // Cached DeviceTraits for core/KernelSelect (filled after the logical
     // device exists, see the constructor).
     core::DeviceTraits device_traits_;
+    ShaderCapabilities shader_caps_;
     bool m_support_descriptor_update_after_bind_ = false;
     bool m_support_subgroup_arithmetic_ = false;
 

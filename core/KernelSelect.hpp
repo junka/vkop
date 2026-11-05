@@ -65,6 +65,23 @@ struct DeviceTraits {
     bool subgroup_arithmetic = false;
     uint32_t subgroup_size = 32;
     uint64_t max_storage_buffer_range = 0;
+    // Shader-level features that are live on the logical device (enabled, not
+    // merely advertised): fp32 atomic add on a storage buffer / in shared
+    // memory (VK_EXT_shader_atomic_float), half2 atomic add
+    // (VK_NV_shader_atomic_float16_vector, only meaningful with
+    // shader_float16), 8-bit storage loads (VK_KHR_8bit_storage),
+    // subgroupRotate, explicit workgroup-memory layout, zero-initialized
+    // workgroup memory. Nothing in kMatmulRules keys on these yet — the
+    // VKOP_DEVCAPS=1 dump in vulkan/VulkanDevice.cpp exists to verify the probe
+    // on hardware this box cannot represent before a kernel depends on it.
+    bool f32_global_atomic_add = false;
+    bool f32_shared_atomic_add = false;
+    bool f16x2_global_atomic_add = false;
+    bool shader_float16 = false;
+    bool storage_buffer_8bit = false;
+    bool subgroup_rotate = false;
+    bool wmem_explicit_layout = false;
+    bool zero_init_wmem = false;
 };
 
 // Coarse device classes the tables key on. Keep this list about *behaviour*,
