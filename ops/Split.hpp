@@ -66,8 +66,10 @@ class SplitImage : public Operator {
             }
         } else {
             split_vec.resize(num_outputs_);
-            for (int i = 1; i < num_outputs_; i++) {
-                split_vec[i] = tosplit / num_outputs_;
+            int base = tosplit / num_outputs_;
+            int rem  = tosplit % num_outputs_;
+            for (int i = 0; i < num_outputs_; i++) {
+                split_vec[i] = base + (i < rem ? 1 : 0);
             }
         }
         for (int i = 0; i < num_outputs_; i++) {
@@ -168,8 +170,10 @@ class SplitBuffer : public BufferFactory {
             }
         } else {
             split_vec.resize(num_outputs_);
-            for (int i = 1; i < num_outputs_; ++i) {
-                split_vec[i] = tosplit / num_outputs_;
+            int base = tosplit / num_outputs_;
+            int rem  = tosplit % num_outputs_;
+            for (int i = 0; i < num_outputs_; ++i) {
+                split_vec[i] = base + (i < rem ? 1 : 0);
             }
         }
 

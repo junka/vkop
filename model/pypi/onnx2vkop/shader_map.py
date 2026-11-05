@@ -73,9 +73,9 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "LayerNormalization": ("layernorm", "layernorm", False, True),
     "MatMul": ("matmul", "matmul", False, True),
     "Max": (None, "max", False, True),
-    "MaxPool": ("maxpool2d", None, True, False),
-    "MaxPool2d": ("maxpool2d", None, True, False),
-    "Maxpool2d": ("maxpool2d", None, True, False),
+    "MaxPool": ("maxpool2d", "maxpool2d", True, True),
+    "MaxPool2d": ("maxpool2d", "maxpool2d", True, True),
+    "Maxpool2d": ("maxpool2d", "maxpool2d", True, True),
     "Min": (None, "min", False, True),
     "Mod": (None, "mod", False, True),
     "Mul": ("mul", "mul", False, True),
@@ -183,6 +183,29 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # tiled kernel.
         "buffer_matmul_tiled_ks_split_fp16",
         "buffer_matmul_tiled_ks_fold_fp16",
+        # coopmat + split-K hybrid: SPLITK_DEPOSIT main pass (fp32 partial to
+        # scratch) and SPLITK_FOLD reduce pass (fp32-sum partials, pack half2
+        # to binding 0). ARL's 8x8x16 source (matmul_coop.comp) and Ada's
+        # 16x16x16 source (matmul_coop16.comp) each ship both builds; runtime
+        # picks coop vs coop16 the same way it always did, then resolves the
+        # matching *splitk_{deposit,fold} key.
+        "buffer_matmul_coop_splitk_deposit",
+        "buffer_matmul_coop_splitk_fold",
+        "buffer_matmul_coop16_splitk_deposit",
+        "buffer_matmul_coop16_splitk_fold",
+        # coopmat + split-K in-workgroup: SPLITK_INWG runs cs serial K-slice
+        # passes inside one workgroup, cross-pass fp32 accumulate in shared
+        # memory, single dispatch, no global scratch. coop_split (uPC.ksplit)
+        # clamped to 1..8 on the host. Guard: ACC_M==ACC_N==1 + N even + K/cs
+        # >= 2*K_BLOCK.
+        "buffer_matmul_coop_inwg",
+        "buffer_matmul_coop16_inwg",
+        # coopmat + split-K grid-parallel "last block reduce": grid.z = batch
+        # * SK, single dispatch, fp32 partials in binding 4, per-tile arrival
+        # counter in binding 5 (host vkCmdFillBuffer 0 before dispatch). Host
+        # guard: SK ∈ [2, 8], K/SK >= 2*K_BLOCK, N even, ACC_M==ACC_N==1.
+        "buffer_matmul_coop16_sklast_fp32",
+        "buffer_matmul_coop16_sklast",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",

@@ -1,0 +1,81 @@
+#version 450 core
+#extension GL_EXT_scalar_block_layout : enable
+
+// MaxPool2d (SSBO) — generic rank-4 NCHW layout.
+// Each thread produces one output element.
+//
+// fp16 packs two halfs per uint word like resize.comp — each thread writes
+// one packed word (two adjacent fp16 elements), so the work count is ceil(N/2).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) buffer outputBuffer {
+    uint data[];
+} uOutput;
+
+layout(set = 0, binding = 1) readonly buffer inputBuffer {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform paraBuffer {
+    int fp16;
+    int N, C, H_in, W_in;
+    int H_out, W_out;
+    int pad_h, pad_w;
+    int kernel_h, kernel_w;
+    int stride_h, stride_w;
+} uParam;
+
+// Linear index for NCHW element
+int nchw_idx(int n, int c, int h, int w, int C, int H, int W) {
+    return ((n * C + c) * H + h) * W + w;
+}
+
+float maxpool_elem(int gid) {
+    // gid is linear output element index
+    int n = gid / (uParam.C * uParam.H_out * uParam.W_out);
+    int rem = gid % (uParam.C * uParam.H_out * uParam.W_out);
+    int c = rem / (uParam.H_out * uParam.W_out);
+    rem = rem % (uParam.H_out * uParam.W_out);
+    int oh = rem / uParam.W_out;
+    int ow = rem % uParam.W_out;
+
+    // Initialize with very small value
+    float max_val = -100000.0;
+
+    for (int kh = 0; kh < uParam.kernel_h; ++kh) {
+        for (int kw = 0; kw < uParam.kernel_w; ++kw) {
+            int ih = oh * uParam.stride_h - uParam.pad_h + kh;
+            int iw = ow * uParam.stride_w - uParam.pad_w + kw;
+            if (ih < 0 || ih >= uParam.H_in || iw < 0 || iw >= uParam.W_in) continue;
+            int idx = nchw_idx(n, c, ih, iw, uParam.C, uParam.H_in, uParam.W_in);
+            float val = BUF_LOAD(uInput.data, idx);
+            if (val > max_val) max_val = val;
+        }
+    }
+    return max_val;
+}
+
+void main() {
+    int out_total = uParam.N * uParam.C * uParam.H_out * uParam.W_out;
+    int gid = int(gl_GlobalInvocationID.x);
+
+#ifdef FP16
+    int nwords = (out_total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = 2 * gid + 1;
+    float v0 = maxpool_elem(e0);
+    if (e1 >= out_total) {
+        uOutput.data[gid] = packHalf2x16(vec2(v0, 0.0));
+    } else {
+        float v1 = maxpool_elem(e1);
+        uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+    }
+#else
+    if (gid >= out_total) return;
+    BUF_STORE(uOutput.data, gid, maxpool_elem(gid));
+#endif
+}

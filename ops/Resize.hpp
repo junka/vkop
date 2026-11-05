@@ -230,31 +230,40 @@ class ResizeImage : public Operator {
             }
         }
 
-        if (inputs[1]) {
-            // doube, float, fp16
+        auto shape_product = [](const std::vector<int>& s) {
+            int p = 1; for (int d : s) p *= d; return p;
+        };
+        if (inputs[1] && shape_product(inputs[1]->getShape()) > 0) {
+            // double, float, fp16
             dispatch_by_dtype(inputs[1]->dtype(), [&](auto t) {
                 using T = decltype(t);
                 auto roi = core::as_tensor<T>(inputs[1]);
+                roi->copyToCPU(m_cmdpool_);
+                int ne = roi->num_elements();
                 roi_.resize(rank * 2);
-                for (int i = 0; i < rank; i++) {
+                for (int i = 0; i < rank && (i * 2 + 1) < ne; i++) {
                     roi_[i * 2] = static_cast<float>((*roi)[i * 2]);
                     roi_[(i * 2) + 1] = static_cast<float>((*roi)[(i * 2) + 1]);
                 }
             });
         }
-        if (inputs.size() > 3 && inputs[3]) {
-            sizes = core::as_tensor<int64_t>(inputs[3]);
+        if (inputs.size() > 3 && inputs[3] && shape_product(inputs[3]->getShape()) > 0) {
+            auto sizes_t = core::as_tensor<int64_t>(inputs[3]);
+            sizes_t->copyToCPU(m_cmdpool_);
+            int ne = sizes_t->num_elements();
             sizes_.resize(rank);
-            for (int i = 0; i < sizes->num_elements(); i++) {
-                sizes_[i] = static_cast<int>((*sizes)[i]);
+            for (int i = 0; i < ne && i < rank; i++) {
+                sizes_[i] = static_cast<int>((*sizes_t)[i]);
             }
             size_valid_ = true;
         }
-        if (inputs.size() > 2 && inputs[2]) {
-            scales = core::as_tensor<float>(inputs[2]);
+        if (inputs.size() > 2 && inputs[2] && shape_product(inputs[2]->getShape()) > 0) {
+            auto scales_t = core::as_tensor<float>(inputs[2]);
+            scales_t->copyToCPU(m_cmdpool_);
+            int ne = scales_t->num_elements();
             scales_.resize(rank);
-            for (int i = 0; i < scales->num_elements(); i++) {
-                scales_[i] = (*scales)[i];
+            for (int i = 0; i < ne && i < rank; i++) {
+                scales_[i] = (*scales_t)[i];
             }
             scale_valid_ = true;
         }

@@ -408,6 +408,13 @@ EnableResult VulkanDevice::buildFeatureEnableChain(
             VK_KHR_SHADER_NON_SEMANTIC_INFO_EXTENSION_NAME);
     }
 #endif
+#ifdef VK_KHR_swapchain
+    if (supportedExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) > 0) {
+        // swapchain has no feature struct — old FeatureDescriptor path
+        // incorrectly gated on geometryShader, excluding Intel ARL.
+        result.enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    }
+#endif
     return result;
 }
 
@@ -1103,30 +1110,6 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                     VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_CUDA_KERNEL_LAUNCH_FEATURES_NV>();
                 e->cudaKernelLaunchFeatures = VK_TRUE;
                 m_support_cuda_kernel_launch_ = true;
-                return std::shared_ptr<void>(std::move(e));
-            }});
-    }
-#endif
-#ifdef VK_KHR_swapchain
-    if (supportedExtensions.count(VK_KHR_SWAPCHAIN_EXTENSION_NAME) > 0) {
-        descs.push_back(FeatureDescriptor{
-            .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-            .extensionName = VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-            .corePromotedVersion = 0,
-            .makeQueryStruct = []() -> std::shared_ptr<void> {
-                auto q = std::make_unique<VkPhysicalDeviceFeatures2>();
-                q->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-                q->pNext = nullptr;
-                return std::shared_ptr<void>(std::move(q));
-            },
-            .makeEnableStruct = [](void *q) -> std::shared_ptr<void> {
-                auto *feat = static_cast<VkPhysicalDeviceFeatures2 *>(q);
-                if (!feat->features.geometryShader)
-                    return nullptr;
-                auto e = std::make_unique<VkPhysicalDeviceFeatures2>();
-                e->sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
-                e->pNext = nullptr;
-                e->features = feat->features;
                 return std::shared_ptr<void>(std::move(e));
             }});
     }

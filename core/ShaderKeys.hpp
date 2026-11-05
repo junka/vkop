@@ -78,7 +78,7 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::MATMUL:
             return {"matmul", "matmul", false, true};
         case T::MAXPOOL2D:
-            return {"maxpool2d", nullptr, true, false};
+            return {"maxpool2d", "maxpool2d", true, true};
         case T::MAX:
             return {nullptr, "max", false, true};
         case T::MIN:
