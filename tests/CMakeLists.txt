@@ -319,11 +319,6 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
 
-# extern template for Tensor<T>: cut Tensor-related symbol duplicates from
-# every test TU at the cost of runtime inline expansion. Only the tests
-# target defines this -- the main library (ops/, runtime/) keeps inline.
-target_compile_definitions(all_tests PRIVATE VKOP_TENSOR_EXTERN_TEMPLATE)
-
 # Force-load the whole vkop static archive so the OperatorFactory's static
 # self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
 if(MSVC)
