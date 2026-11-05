@@ -319,36 +319,10 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
 
-# Precompile the heaviest test header (~350k preprocessed lines). All test
-# TUs include setup.hpp which transitively pulls core/Tensor.hpp (305k),
-# vulkan/VulkanDevice.hpp (250k), torch_subset.hpp (280k), and gtest.
-# This costs one PCH build (writes a single .gch per compile flag set) and
-# saves every subsequent TU from reparsing those headers.  GCC silently
-# falls back when the PCH flag differs from the build flags —
-# -Winvalid-pch on at least one TU proves the PCH actually loads.
-#
-# target_precompile_headers and SKIP_PRECOMPILE_HEADERS are CMake 3.16
-# features while the project still declares 3.10 (see CMakeLists.txt:1), so an
-# older CMake must configure without PCH rather than fail on an unknown
-# command. CMAKE_DISABLE_PRECOMPILE_HEADERS=ON keeps the same escape hatch on
-# newer CMake. Merged modes are excluded too: they #include torch_subset.cpp
-# inside one generated TU, where a per-source PCH opt-out cannot apply and the
-# full torch headers would collide with the PCH's subset declarations.
-if(CMAKE_VERSION VERSION_GREATER_EQUAL 3.16 AND MERGE_TEST_SOURCES EQUAL 0)
-    target_precompile_headers(all_tests PRIVATE
-        <tests/setup.hpp>
-    )
-    target_compile_options(all_tests PRIVATE
-        $<$<COMPILE_LANGUAGE:CXX>:-Winvalid-pch>)
-    # torch_subset.cpp is the ONLY TU that includes <torch/torch.h>, so it must
-    # not consume setup.hpp's PCH: the PCH was built with torch_subset.hpp's
-    # narrow declarations, and re-including the full torch headers afterwards
-    # collides (torch::floor(const Tensor&) vs torch/upsampling.h's
-    # floor(double), etc.). Every other TU includes torch_subset.hpp only,
-    # which is PCH-safe. Per-source PCH opt-out exists from 3.16 onward.
-    set_source_files_properties(torch_subset.cpp PROPERTIES
-        SKIP_PRECOMPILE_HEADERS ON)
-endif()
+# extern template for Tensor<T>: cut Tensor-related symbol duplicates from
+# every test TU at the cost of runtime inline expansion. Only the tests
+# target defines this -- the main library (ops/, runtime/) keeps inline.
+target_compile_definitions(all_tests PRIVATE VKOP_TENSOR_EXTERN_TEMPLATE)
 
 # Force-load the whole vkop static archive so the OperatorFactory's static
 # self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
