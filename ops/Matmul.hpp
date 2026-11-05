@@ -8,6 +8,7 @@
 
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
 #include <vector>
 namespace vkop {
 namespace ops {
@@ -398,6 +399,75 @@ class MatMulBuffer : public BufferFactory {
                 use_uab, 0, cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
+            }
+        }
+        // SK_LASTBLOCK pipelines: per-cs precompiled variants (SK_CS baked in)
+        // avoid glslc's register-allocator bug. Try cs=2,4,8 first, then the
+        // default (SK_CS=1, full-K path) as fallback. Each variant has both
+        // fp32 and half2 epilogue builds; half2 only used when N is even.
+        if (fp16_ != 0 && !coop_disabled && dev->is_support_cooperate_matrix() &&
+            sklast_fp32_pipes_.empty()) {
+            bool use_uab = update_after_bind_ &&
+                           dev->is_support_descriptor_update_after_bind();
+            std::vector<VkDescriptorType> sklast_types{
+                DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                DESCRIPTOR_TYPE_STORAGE};
+            // List of (cs, fp32_key, half2_key) to try. cs=0 means default.
+            struct SkLastKey { int cs; const char *fp32; const char *half2; };
+            SkLastKey keys[] = {
+                { 2, "buffer_matmul_coop16_sklast_fp32_cs2",
+                    "buffer_matmul_coop16_sklast_cs2" },
+                { 4, "buffer_matmul_coop16_sklast_fp32_cs4",
+                    "buffer_matmul_coop16_sklast_cs4" },
+                { 8, "buffer_matmul_coop16_sklast_fp32_cs8",
+                    "buffer_matmul_coop16_sklast_cs8" },
+                { 1, "buffer_matmul_coop16_sklast_fp32",
+                    "buffer_matmul_coop16_sklast" },
+            };
+            for (auto &k : keys) {
+                // Try fp32 first (always usable)
+                try {
+                    auto spv = resolve_spv(k.fp32);
+                    sklast_fp32_pipes_[k.cs] = std::make_unique<VulkanPipeline>(
+                        dev->getLogicalDevice(), sklast_types,
+                        sizeof(matmul::GpuMatMulParam), spv.first,
+                        static_cast<int>(spv.second), use_uab, 0, cache);
+                    std::fprintf(stderr, "[vkop] sklast_fp32 cs=%d pipeline init OK\n", k.cs);
+                } catch (const std::exception &e) {
+                    // fp32 variant unavailable — that cs value won't be usable
+                    std::fprintf(stderr, "[vkop] sklast_fp32 cs=%d not found (%s)\n",
+                                 k.cs, e.what());
+                    continue;
+                }
+                // Try half2 variant (bonus)
+                try {
+                    auto spv = resolve_spv(k.half2);
+                    sklast_half2_pipes_[k.cs] = std::make_unique<VulkanPipeline>(
+                        dev->getLogicalDevice(), sklast_types,
+                        sizeof(matmul::GpuMatMulParam), spv.first,
+                        static_cast<int>(spv.second), use_uab, 0, cache);
+                    std::fprintf(stderr, "[vkop] sklast_half2 cs=%d pipeline init OK\n", k.cs);
+                } catch (...) {
+                    // half2 optional — only fp32 needed
+                }
+            }
+            // Alloc descriptor sets from the first available fp32 pipeline
+            // (all share the same 7-binding layout).
+            for (auto &ds : sklast_fp32_ds_) ds = nullptr;
+            for (auto &ds : sklast_half2_ds_) ds = nullptr;
+            if (!sklast_fp32_pipes_.empty()) {
+                auto &first_fp32 = sklast_fp32_pipes_.begin()->second;
+                for (auto &ds : sklast_fp32_ds_) {
+                    ds = first_fp32->allocDescriptorSets();
+                }
+            }
+            if (!sklast_half2_pipes_.empty()) {
+                auto &first_h2 = sklast_half2_pipes_.begin()->second;
+                for (auto &ds : sklast_half2_ds_) {
+                    ds = first_h2->allocDescriptorSets();
+                }
             }
         }
     }
@@ -1007,6 +1077,17 @@ class MatMulBuffer : public BufferFactory {
                     retry = true;
                 }
                 break;
+            case core::MatmulRoute::kCoopmatSkLast:
+                if (sklast_fp32_pipes_.empty()) {
+                    sel_av.coopmat = false;
+                    retry = true;
+                }
+                break;
+            case core::MatmulRoute::kCoopmatInwg:
+                // INWG not yet dispatched on the host; treat like unavailable.
+                sel_av.coopmat = false;
+                retry = true;
+                break;
             default:
                 break;
             }
@@ -1030,6 +1111,8 @@ class MatMulBuffer : public BufferFactory {
             plan.route == core::MatmulRoute::kKsplitW8Wide512;
         const bool coopmat = plan.route == core::MatmulRoute::kCoopmat;
         const bool coopmat_i8 = plan.route == core::MatmulRoute::kCoopmatI8;
+        const bool coopmat_sklast =
+            plan.route == core::MatmulRoute::kCoopmatSkLast;
         const bool w8_quad =
             plan.route == core::MatmulRoute::kQuad4 && weight_byte;
         const bool w4_quad =
@@ -1084,7 +1167,9 @@ class MatMulBuffer : public BufferFactory {
         // dim). vkCreateBuffer rejects size 0 with
         // VK_ERROR_INITIALIZATION_FAILED on Intel, so clamp to a minimal
         // 16-byte dummy — the dispatch is 0 threads anyway.
-        if (fp16_ != 0 && (!fused_fp16 || coopmat || coopmat_i8) && ks_n <= 1) {
+        if (fp16_ != 0 &&
+            (!fused_fp16 || coopmat || coopmat_i8 || coopmat_sklast) &&
+            ks_n <= 1) {
             size_t scratch_bytes = static_cast<size_t>(total) * sizeof(float);
             if (scratch_bytes == 0) {
                 scratch_bytes = 16;
@@ -1396,6 +1481,63 @@ class MatMulBuffer : public BufferFactory {
             dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
             return;
         }
+
+        // -------------------------------------------------------------------
+        // SK_LASTBLOCK dispatch: coopmat + grid.z parallel split-K.
+        // Select pipeline by cs value — per-cs variants are precompiled with
+        // SK_CS baked in to avoid glslc's register-allocator bug.
+        if (coopmat_sklast && !sklast_fp32_pipes_.empty()) {
+            const int cs = plan.coop_split;
+            const int bm = coop_bm_;
+            const int bn = coop_bn_;
+            // Select the pipeline for this cs — fall back to default (key 1).
+            int cs_key = cs;
+            if (sklast_fp32_pipes_.find(cs_key) == sklast_fp32_pipes_.end()) {
+                cs_key = 1; // default / fallback
+            }
+            VkDescriptorSet *ds = sklast_fp32_ds_;
+            VulkanPipeline *pipe = nullptr;
+            // Try half2 first (faster, direct uOutput write, if N even and available)
+            if ((n & 1) == 0) {
+                auto it = sklast_half2_pipes_.find(cs_key);
+                if (it != sklast_half2_pipes_.end() && it->second) {
+                    pipe = it->second.get();
+                    ds = sklast_half2_ds_;
+                }
+            }
+            // Fall back to fp32
+            if (!pipe) {
+                auto it = sklast_fp32_pipes_.find(cs_key);
+                if (it != sklast_fp32_pipes_.end()) pipe = it->second.get();
+            }
+            if (!pipe) {
+                // No usable pipeline — skip sklast dispatch
+                std::fprintf(stderr, "[sklast] no pipeline for cs=%d (cs_key=%d)\n", cs, cs_key);
+                pipe = nullptr;
+            } else {
+            set_route(plan.tag, batch, m, n, k, rep);
+            para_.ksplit = cs;
+            // uPartial (objs_[4]) and uCounter (objs_[5]) are now UNUSED —
+            // serial in-workgroup split-K (grid.z=batch) accumulates fully
+            // inside each workgroup and writes directly to scratch.
+            if (objs_.size() < 7) objs_.resize(7, nullptr);
+            fillDescriptorWrites(ds[m_id_]);
+            pipe->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pipe, ds[m_id_]);
+            m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam), &para_);
+            dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
+            scratch_->shaderWriteBarrier(m_cmd_->get());
+            int nwords = (total + 1) / 2;
+            MatMulPackPC pack_pc{};
+            pack_pc.total = total;
+            fillDescriptorWrites(pack_ds_[m_id_]);
+            pack_pipeline_->updateDescriptorSets(ds_writes_);
+            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC), &pack_pc);
+            dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+            return;
+            } // end else (pipe valid)
+        } // end outer coopmat_sklast if
 
         // -------------------------------------------------------------------
         // SwiGLU down-projection fold (down_act). The converter matched
@@ -2439,6 +2581,13 @@ class MatMulBuffer : public BufferFactory {
     VkDescriptorSet ks_split_ds_[vkop::kInflight] = {nullptr};
     std::unique_ptr<VulkanPipeline> ks_fold_pipeline_;
     VkDescriptorSet ks_fold_ds_[vkop::kInflight] = {nullptr};
+    // SK_LASTBLOCK: coopmat + parallel grid.z split-K. Per-cs precompiled
+    // variants (SK_CS baked in) avoid glslc's register-allocator bug with
+    // runtime ints near coopMat accumulators. Map key = coop_split value.
+    std::unordered_map<int, std::unique_ptr<VulkanPipeline>> sklast_fp32_pipes_;
+    std::unordered_map<int, std::unique_ptr<VulkanPipeline>> sklast_half2_pipes_;
+    VkDescriptorSet sklast_fp32_ds_[vkop::kInflight] = {nullptr};
+    VkDescriptorSet sklast_half2_ds_[vkop::kInflight] = {nullptr};
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
     // 4-column kernel; another MatMul from a reconverted model still tries.
     bool w8_wide_no_bytes_ = false;

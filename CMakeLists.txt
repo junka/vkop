@@ -192,6 +192,16 @@ list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
 # prefix); leaving it in the generic loop would register a second, unused
 # module under the same key.
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_down_act\\.comp$")
+# matmul_coop16_inwg.comp (b3 SPLITK_INWG variant) lives outside the generic
+# foreach loop — the vkop_shader_variant macro below compiles it explicitly
+# with -DSPLITK_INWG and the generic loop would otherwise claim the same
+# OUTPUT with a wrong -D flag (no -DSPLITK_INWG at all, i.e. unused junk).
+list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_inwg\\.comp$")
+# matmul_coop16_sklast.comp carries the SK_LASTBLOCK (+ optional ENABLE_HALF2_EPI)
+# implementation as a complete separate source -- it has its own STORE_C macro,
+# scatter_tile helpers, and a three-way main() split. Generic loop exclusion
+# lets sklast variants compile with -DSK_LASTBLOCK (and optionally -DENABLE_HALF2_EPI).
+list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_sklast\\.comp$")
 
 # glslc resolves #include but cmake does not track it, so editing a shared
 # header would silently rebuild nothing. Track them explicitly.
@@ -450,6 +460,50 @@ vkop_shader_variant(buffer_matmul_coop16_16x8x8 buffer/matmul_coop16
 vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
                     -DCM=16 -DCN=16 -DCK=32)
 
+# coopmat + split-K hybrid: three -D entry points per source (DEFAULT = no
+# -D, SPLITK_DEPOSIT, SPLITK_FOLD). Runtime picks SPLITK_DEPOSIT for the
+# main pass (fp32 partials to scratch) and SPLITK_FOLD for the reduce pass
+# (fp32-sums partials, packs half2 directly to binding 0). SPLITK_DEPOSIT
+# reads uPC.ksplit as coop_split; SPLITK_FOLD reads it the same way. ARL's
+# matmul_coop.comp (8x8x16) and Ada's matmul_coop16.comp (16x16x16 + ACC
+# variants) carry identical -D paths. Host guards keep 2x2/2x1/CN=8 variants,
+# odd N, and K-too-shallow shapes on the DEFAULT path regardless.
+vkop_shader_variant(buffer_matmul_coop_splitk_deposit buffer/matmul_coop
+                    -DSPLITK_DEPOSIT)
+vkop_shader_variant(buffer_matmul_coop_splitk_fold buffer/matmul_coop
+                    -DSPLITK_FOLD)
+vkop_shader_variant(buffer_matmul_coop16_splitk_deposit buffer/matmul_coop16
+                    -DSPLITK_DEPOSIT)
+vkop_shader_variant(buffer_matmul_coop16_splitk_fold buffer/matmul_coop16
+                    -DSPLITK_FOLD)
+
+# SPLITK_INWG: split-K inside one workgroup, no global scratch, single
+# dispatch. coop_split (uPC.ksplit, 1..8) serial passes over K-range slices,
+# cross-pass reduction in shared memory. coop.comp's INWG stays in the base
+# source; coop16's INWG lives in its own file (matmul_coop16_inwg.comp, b3
+# snapshot extraction) so the DEFAULT build of matmul_coop16.comp stays
+# bit-for-bit identical to baseline. Host guard: ACC_M==ACC_N==1 + N even
+# + K/cs >= 2*K_BLOCK.
+vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
+                    -DSPLITK_INWG)
+vkop_shader_variant(buffer_matmul_coop16_inwg buffer/matmul_coop16_inwg
+                    -DSPLITK_INWG)
+
+# SK_LASTBLOCK: serial in-workgroup split-K (single dispatch, grid.z = batch).
+# Per-cs precompiled variants: SK_CS baked in at compile-time avoids glslc's
+# register-allocator bug with runtime ints near coopMat accumulators.
+# SK_CS=2,4,8 with SK_KFLOOR=256; runtime selects by cs. Half2 variants are
+# byte-identical to fp32 (ENABLE_HALF2_EPI is dead for this path) so only
+# fp32 registrations kept.
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32 buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs2 buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=2 -DSK_KFLOOR=256)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs4 buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=4 -DSK_KFLOOR=256)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs8 buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=8 -DSK_KFLOOR=256)
+
 # Subgroup-arithmetic reductions (_sg) for the ops whose workgroup reduce sits
 # in a hot loop or on every transformer block: attention's per-tile max/sum,
 # the norm passes and softmax. -DSUBGROUP swaps the 256-slot shared-memory
@@ -609,8 +663,16 @@ option(ENABLE_BENCHMARK "Enable benchmark" ON)
 option(ENABLE_TESTS "Enable testing" ON)
 option(ENABLE_CUDA_LAUNCH "Enable cuda kernel launch" OFF)
 option(USE_PLATFORM_WAYLAND "Enable Wayland" OFF)
-option(USE_PLATFORM_XCB "Enable XCB" OFF)
-option(USE_PLATFORM_XLIB "Enable XLIB" OFF)
+# Auto-enable XCB and XLIB on Linux — virtually all desktop systems have X11
+# and Vulkan loader enumerates VK_KHR_xcb_surface / VK_KHR_xlib_surface.
+# GLFW on Linux picks XCB (see glfwGetRequiredInstanceExtensions output).
+if(UNIX AND NOT APPLE)
+    option(USE_PLATFORM_XCB "Enable XCB" ON)
+    option(USE_PLATFORM_XLIB "Enable XLIB" ON)
+else()
+    option(USE_PLATFORM_XCB "Enable XCB" OFF)
+    option(USE_PLATFORM_XLIB "Enable XLIB" OFF)
+endif()
 option(USE_PLATFORM_WIN32 "Enable WIN32" OFF)
 option(USE_PLATFORM_ANDROID "Enable ANDROID" OFF)
 option(USE_PLATFORM_METAL "Enable Metal" OFF)
