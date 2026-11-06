@@ -2014,9 +2014,11 @@ class MatMulBuffer : public BufferFactory {
         {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64, true, false},
         {8, 8, 32, "buffer_matmul_coop_i8", 16, 32, true, false},
         // UINT8 → UINT32: ARL lists 8x8x32 alongside SINT8. Ada's coopmatProps
-        // enumerate UINT8 at 16x16x32 / 16x8x32 — those tiles probe as listed
-        // on Ada and this 8x8x32 entry stays filtered out there.
+        // enumerate UINT8 at 16x16x32 / 16x8x32 — those probe as listed on Ada
+        // and the 8x8x32 entry stays filtered out there.
         {8, 8, 32, "buffer_matmul_coop_u8", 16, 32, true, true},
+        {16, 16, 32, "buffer_matmul_coop_u8_16x16x32", 32, 64, true, true},
+        {16, 8, 32, "buffer_matmul_coop_u8_16x8x32", 32, 32, true, true},
     };
 
     // First module whose tile the device lists and whose SPIR-V this op's

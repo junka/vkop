@@ -485,6 +485,12 @@ vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
 # and the runtime quantize clamp (±127→0..255).
 vkop_shader_variant(buffer_matmul_coop_u8 buffer/matmul_coop_i8
                     -DIS_SIGNED=0)
+# Ada enumerates UINT8→UINT32 at 16x16x32 and 16x8x32 (ARL has neither).
+# ARL's probe naturally filters them; Ada picks them up when available.
+vkop_shader_variant(buffer_matmul_coop_u8_16x16x32 buffer/matmul_coop_i8
+                    -DIS_SIGNED=0 -DCM=16 -DCN=16 -DCK=32)
+vkop_shader_variant(buffer_matmul_coop_u8_16x8x32 buffer/matmul_coop_i8
+                    -DIS_SIGNED=0 -DCM=16 -DCN=8 -DCK=32)
 
 # coopmat + split-K hybrid: three -D entry points per source (DEFAULT = no
 # -D, SPLITK_DEPOSIT, SPLITK_FOLD). Runtime picks SPLITK_DEPOSIT for the
