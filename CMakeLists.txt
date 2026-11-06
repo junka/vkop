@@ -476,6 +476,8 @@ vkop_shader_variant(buffer_matmul_coop16_16x8x16 buffer/matmul_coop16
 # archive.
 vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
                     -DCM=16 -DCN=16 -DCK=32)
+vkop_shader_variant(buffer_matmul_coop_i8_16x8x32 buffer/matmul_coop_i8
+                    -DCM=16 -DCN=8 -DCK=32)
 
 # UINT8→UINT32 variant of matmul_coop_i8.comp. ARL lists 8x8x32 UINT8 alongside
 # SINT8 at the same tile. Ada's coopmatProps enumerate UINT8 at 16x16x32 /

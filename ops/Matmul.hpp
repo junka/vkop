@@ -2094,8 +2094,9 @@ class MatMulBuffer : public BufferFactory {
     // lists 8x8x32, Ada 16x16x32, and each device rejects the other's tile at
     // the hardware level (validates, computes zeros), so both are needed.
     static constexpr CoopModule kI8Modules[] = {
-        // SINT8 → SINT32: default 8x8x32 (ARL), plus Ada's 16x16x32.
+        // SINT8 → SINT32: default 8x8x32 (ARL), plus Ada's 16x16x32 and 16x8x32.
         {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64, true, false},
+        {16, 8, 32, "buffer_matmul_coop_i8_16x8x32", 32, 32, true, false},
         {8, 8, 32, "buffer_matmul_coop_i8", 16, 32, true, false},
         // UINT8 → UINT32: ARL lists 8x8x32 alongside SINT8. Ada's coopmatProps
         // enumerate UINT8 at 16x16x32 / 16x8x32 — those probe as listed on Ada
