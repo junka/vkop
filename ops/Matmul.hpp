@@ -345,14 +345,39 @@ class MatMulBuffer : public BufferFactory {
             int bm = 0;
             int bn = 0;
             bool tile16 = false;
+            bool writes_scratch = true;  // default: coop16 writes scratch
+            std::vector<ProbedModule> extra;
+            coop_fp16_alts_.clear();
+            coop_fp16_alts_owner_.clear();
             if (auto pipe = build_coop_pipeline(kFp16Modules, false, cache, bm,
-                                                bn, tile16)) {
+                                                bn, tile16, writes_scratch,
+                                                &extra)) {
                 coop_pipeline_ = std::move(pipe);
                 coop_bm_ = bm;
                 coop_bn_ = bn;
                 coop_acc_geo_ = tile16;
+                coop_no_pack_pass_ = !writes_scratch;
                 for (auto &ds : coop_ds_) {
                     ds = coop_pipeline_->allocDescriptorSets();
+                }
+                // Store every additional fp16 variant the probe found —
+                // dispatch-time tile selection (MatmulPlan::bm/bn from
+                // KernelSelect's smart selector) picks among them. Each
+                // needs its own descriptor sets because VulkanPipeline owns
+                // its pipeline layout, even though the layouts are byte-
+                // compatible across variants.
+                for (auto &e : extra) {
+                    CoopAltVariant alt;
+                    alt.pipe = e.pipe.release();
+                    alt.bm = e.bm;
+                    alt.bn = e.bn;
+                    alt.writes_scratch = e.writes_scratch;
+                    for (auto &ds : alt.ds) {
+                        ds = alt.pipe->allocDescriptorSets();
+                    }
+                    coop_fp16_alts_owner_.push_back(
+                        std::unique_ptr<VulkanPipeline>(alt.pipe));
+                    coop_fp16_alts_.push_back(alt);
                 }
             }
         }
@@ -368,8 +393,9 @@ class MatMulBuffer : public BufferFactory {
             int bm = 0;
             int bn = 0;
             bool tile16 = false;
+            bool writes_scratch = true;
             if (auto pipe = build_coop_pipeline(kI8Modules, true, cache, bm, bn,
-                                                tile16)) {
+                                                tile16, writes_scratch)) {
                 coop_i8_pipeline_ = std::move(pipe);
                 coop_i8_bm_ = bm;
                 coop_i8_bn_ = bn;
@@ -1469,20 +1495,22 @@ class MatMulBuffer : public BufferFactory {
                                    &para_);
             dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
 
-            // Barrier: flush coopmat's scratch writes for pack's reads.
-            scratch_->shaderWriteBarrier(m_cmd_->get());
+            if (!no_pack) {
+                // Barrier: flush coopmat's scratch writes for pack's reads.
+                scratch_->shaderWriteBarrier(m_cmd_->get());
 
-            // Pack pass: separate pipeline (no PC interference). One thread per
-            // output word; reads flat fp32 from scratch, packs half2 to output.
-            int nwords = (total + 1) / 2;
-            MatMulPackPC pack_pc{};
-            pack_pc.total = total;
-            fillDescriptorWrites(pack_ds_[m_id_]);
-            pack_pipeline_->updateDescriptorSets(ds_writes_);
-            m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
-            m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
-                                   &pack_pc);
-            dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+                // Pack pass: separate pipeline (no PC interference). One thread per
+                // output word; reads flat fp32 from scratch, packs half2 to output.
+                int nwords = (total + 1) / 2;
+                MatMulPackPC pack_pc{};
+                pack_pc.total = total;
+                fillDescriptorWrites(pack_ds_[m_id_]);
+                pack_pipeline_->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+                m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                       &pack_pc);
+                dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+            }
             return;
         }
 
@@ -1899,6 +1927,12 @@ class MatMulBuffer : public BufferFactory {
         uint32_t cm, cn, ck;
         const char *key;
         int bm, bn;
+        // If true, the kernel writes FLAT fp32 to binding 3 (scratch) and
+        // a separate pack pass must convert to half2 output. If false, the
+        // kernel packs half2 into binding 0 (output) itself — no pack pass.
+        // matmul_coop.comp's DEFAULT and SPLITK_INWG builds are self-pack;
+        // coop16.comp and SPLITK_DEPOSIT/FOLD are scratch+pack.
+        bool writes_scratch;
     };
     // fp16 -> fp32 modules, largest output tile first. Which ones a device can
     // run is a property-list query, not something to infer from the vendor:
@@ -1908,27 +1942,45 @@ class MatMulBuffer : public BufferFactory {
     // tile is 10-36% slower on ARL (m=16..63, k=2048), because one 8x8 MMA
     // per K tile leaves nothing for the prefetch to hide behind.
     static constexpr CoopModule kFp16Modules[] = {
-        {16, 16, 16, "buffer_matmul_coop16", 32, 64},
-        {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32},
-        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32},
-        {8, 8, 16, "buffer_matmul_coop", 16, 32},
+        {16, 16, 16, "buffer_matmul_coop16", 32, 64, true},
+        {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32, true},
+        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32, true},
+        {8, 8, 16, "buffer_matmul_coop", 16, 32, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm8bn64", 8, 64, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm32bn16", 32, 16, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm64bn8", 64, 8, false},
     };
     // SINT8 -> SINT32 builds of shaders/buffer/matmul_coop_i8.comp. ARL
     // lists 8x8x32, Ada 16x16x32, and each device rejects the other's tile at
     // the hardware level (validates, computes zeros), so both are needed.
     static constexpr CoopModule kI8Modules[] = {
-        {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64},
-        {8, 8, 32, "buffer_matmul_coop_i8", 16, 32},
+        {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64, true},
+        {8, 8, 32, "buffer_matmul_coop_i8", 16, 32, true},
     };
 
     // First module whose tile the device lists and whose SPIR-V this op's
     // archive resolves and the driver accepts. A missing key (older archive)
     // or a rejected pipeline moves on to the next LISTED tile, never to an
     // unlisted one. nullptr means no coopmat kernel is available at all.
+    // Probe every module the device lists, SPIR-V this archive carries, and
+    // the driver accepts. Keeps the FIRST probed pipeline as the return value
+    // (callers that only want one keep working), and stores every other
+    // success in `extra` when non-null so dispatch-time variant selection
+    // (MatmulPlan::bm/bn) can pick among them without re-querying the driver.
+    struct ProbedModule {
+        std::unique_ptr<VulkanPipeline> pipe;
+        int bm, bn;
+        bool tile16;
+        bool writes_scratch;
+        const char *key;
+    };
     template <size_t N>
     std::unique_ptr<VulkanPipeline>
     build_coop_pipeline(const CoopModule (&mods)[N], bool sint8,
-                        VkPipelineCache cache, int &bm, int &bn, bool &tile16) {
+                        VkPipelineCache cache, int &bm, int &bn, bool &tile16,
+                        bool &writes_scratch_out,
+                        std::vector<ProbedModule> *extra = nullptr) {
+        std::unique_ptr<VulkanPipeline> first;
         for (const CoopModule &m : mods) {
             const bool listed =
                 sint8 ? m_dev_->supports_coopmat_sint8_tile(m.cm, m.cn, m.ck)
@@ -1940,7 +1992,6 @@ class MatMulBuffer : public BufferFactory {
             try {
                 spv = resolve_spv(m.key);
             } catch (const std::exception &e) {
-                // Names the key: this model's archive predates it.
                 std::fprintf(stderr, "[vkop] %s\n", e.what());
                 continue;
             }
@@ -1957,10 +2008,17 @@ class MatMulBuffer : public BufferFactory {
                         DESCRIPTOR_TYPE_STORAGE},
                     sizeof(matmul::GpuMatMulParam), spv.first,
                     static_cast<int>(spv.second), use_uab, 0, cache);
-                bm = m.bm;
-                bn = m.bn;
-                tile16 = m.cm == 16 && m.cn == 16 && m.ck == 16;
-                return pipe;
+                if (!first) {
+                    first = std::move(pipe);
+                    bm = m.bm;
+                    bn = m.bn;
+                    tile16 = m.cm == 16 && m.cn == 16 && m.ck == 16;
+                    writes_scratch_out = m.writes_scratch;
+                } else if (extra) {
+                    extra->push_back({std::move(pipe), m.bm, m.bn,
+                                      m.cm == 16 && m.cn == 16 && m.ck == 16,
+                                      m.writes_scratch, m.key});
+                }
             } catch (const std::exception &e) {
                 std::fprintf(stderr,
                              "[vkop] coopmat %ux%ux%u MatMul module %s "
@@ -1968,7 +2026,7 @@ class MatMulBuffer : public BufferFactory {
                              m.cm, m.cn, m.ck, m.key, e.what());
             }
         }
-        return nullptr;
+        return first;
     }
 
     // VKOP_NO_COOP=1 drops every coopmat path (MoltenVK cannot lower the A/B
