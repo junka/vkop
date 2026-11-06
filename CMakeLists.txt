@@ -469,8 +469,11 @@ vkop_shader_variant(buffer_matmul_coop16_2x2 buffer/matmul_coop16
 # pipelined staging nothing to hide behind).
 vkop_shader_variant(buffer_matmul_coop16_16x8x16 buffer/matmul_coop16
                     -DCM=16 -DCN=8 -DCK=16)
-vkop_shader_variant(buffer_matmul_coop16_16x8x8 buffer/matmul_coop16
-                    -DCM=16 -DCN=8 -DCK=8)
+# The 16x8x8 variant (CK=8) was also registered but it is dead: 16x8x16
+# already maps to BM=32/BN=32 and the host's alt-geo lookup keys on bm/bn
+# only, so CK=16 always wins. Measured on Ada and it never outperformed
+# CK=16 either, so drop it entirely instead of leaving a ghost entry in the
+# archive.
 vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
                     -DCM=16 -DCN=16 -DCK=32)
 

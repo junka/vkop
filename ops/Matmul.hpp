@@ -1997,7 +1997,10 @@ class MatMulBuffer : public BufferFactory {
     static constexpr CoopModule kFp16Modules[] = {
         {16, 16, 16, "buffer_matmul_coop16", 32, 64, true, false},
         {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32, true, false},
-        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32, true, false},
+        // NOTE: {16, 8, 8, ...} intentionally absent. Its CK=8 collides with
+        // 16x8x16's BM=32/BN=32, the host's alt-geo/find-coop path keys only
+        // on bm/bn, so 16x8x16 always wins on Ada. Measured there, CK=8 also
+        // never outperformed CK=16 — drop instead of leaving a ghost entry.
         {8, 8, 16, "buffer_matmul_coop", 16, 32, false, false},
         {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm8bn64", 8, 64, false, false},
         {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm32bn16", 32, 16, false, false},

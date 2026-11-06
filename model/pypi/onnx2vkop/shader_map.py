@@ -137,12 +137,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # The runtime probes the device's cooperative-matrix table and only a
         # listed shape is ever dispatched, but which shapes are listed is
         # decided at load time, so every MatMul carries the ones it may need:
-        # 16x8x16 / 16x8x8 are the Ada second-tier tiles (Ada does not list
-        # 8x8x16, and the ARL 8x8x16 tile stays on buffer_matmul_coop, which is
-        # faster there). A missing key makes the host drop to the next listed
-        # shape.
+        # 16x8x16 is the Ada half-width tile (Ada does not list 8x8x16, and
+        # the ARL 8x8x16 tile stays on buffer_matmul_coop which is faster
+        # there). 16x8x8 is NOT listed — it has the same BM=32/BN=32 footprint
+        # and CK=16 (16x8x16) always wins the alt-geo lookup on both hardware
+        # and perf; we removed it from the archive entirely.
         "buffer_matmul_coop16_16x8x16",
-        "buffer_matmul_coop16_16x8x8",
         "buffer_matmul_coop_i8",
         # 16x16x32 SINT8 tile (Ada). 4x the per-MMA output area of the 8x8x32
         # default build, and the only int8 shape Ada lists.
