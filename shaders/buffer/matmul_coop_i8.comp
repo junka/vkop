@@ -118,6 +118,12 @@ layout(push_constant) uniform PC {
 // and 16x16x32 (NVIDIA Ada, four times the outputs per MMA). The host picks
 // the largest shape the device reports and then this module's BM/BN, so a
 // shape the driver does not list is never dispatched.
+//
+// ---- dtype macros (IS_SIGNED=1 → SINT8/SINT32, IS_SIGNED=0 → UINT8/UINT32) ----
+// Default IS_SIGNED=1 keeps the SINT8 build byte-identical to HEAD. Setting
+// IS_SIGNED=0 (UINT8) changes: A/B buffer types (int8_t→uint8_t), quantize
+// clamp (±127 → 0..255), the byte unpack helper, and the accumulator type.
+// CMAKE uses this to generate the u8 variant (buffer_matmul_coop_u8).
 #ifndef CM
 #define CM 8
 #endif
@@ -132,6 +138,9 @@ layout(push_constant) uniform PC {
 #endif
 #ifndef SG_N
 #define SG_N 4
+#endif
+#ifndef IS_SIGNED
+#define IS_SIGNED 1
 #endif
 
 const int M_BLOCK = CM;
@@ -154,6 +163,7 @@ const int A_ELEMS = (BM * K_BLOCK) / NTHREADS; // quantized A per thread
 const int B_ELEMS = (K_BLOCK * BN) / NTHREADS; // weight bytes per thread
 const int C_ELEMS = (M_BLOCK * N_BLOCK) / 32;  // results per lane in epilogue
 
+#if IS_SIGNED
 // One signed byte out of a 32-bit word. No reliance on an arithmetic shift of
 // a signed int or on uint->int conversion above INT_MAX: mask to 0..255, then
 // subtract 256 above 127.
@@ -161,12 +171,23 @@ int s8(uint word, int elem) {
     int b = int((word >> uint((elem & 3) * 8)) & 0xFFu);
     return b < 128 ? b : b - 256;
 }
+#else
+// One unsigned byte out of a 32-bit word (0..255).
+int u8(uint word, int elem) {
+    return int((word >> uint((elem & 3) * 8)) & 0xFFu);
+}
+#endif
 // A's fp16 element `elem` (packed half2, element 0 in the low half).
 float loadA_f16(int elem) {
     return float(unpackHalf2x16(uInputA.data[elem >> 1])[elem & 1]);
 }
+#if IS_SIGNED
 int loadA_i8(int elem) { return s8(uInputA.data[elem >> 2], elem); }
-int loadB_i8(int elem) { return s8(uInputB.data[elem >> 2], elem); }
+int loadB_byte(int elem) { return s8(uInputB.data[elem >> 2], elem); }
+#else
+int loadA_i8(int elem) { return u8(uInputA.data[elem >> 2], elem); }
+int loadB_byte(int elem) { return u8(uInputB.data[elem >> 2], elem); }
+#endif
 
 // A flat batch index -> B's slice, when the host detected a grouped leading
 // axis (uPC.rep > 1): the grouped axis repeats each B slice rep times
@@ -193,9 +214,14 @@ int bmap(int n) {
 }
 
 // A tile, quantized to int8, row-major [BM x K_BLOCK].
+#if IS_SIGNED
 shared int8_t shAq[BM * K_BLOCK];
 // B tile as raw bytes, row-major [K_BLOCK x BN].
 shared int8_t shB[K_BLOCK * BN];
+#else
+shared uint8_t shAq[BM * K_BLOCK];
+shared uint8_t shB[K_BLOCK * BN];
+#endif
 // Per-row activation scale for the workgroup's BM rows (1 when amax == 0).
 shared float shSa[BM];
 // Per-row |A| max, accumulated as float bits (abs of a finite float is
@@ -203,7 +229,11 @@ shared float shSa[BM];
 shared uint shAmaxU[BM];
 // Each subgroup parks its M_BLOCK x N_BLOCK int32 accumulator here before
 // scaling.
+#if IS_SIGNED
 shared int shC[SG_M * SG_N][M_BLOCK * N_BLOCK];
+#else
+shared uint shC[SG_M * SG_N][M_BLOCK * N_BLOCK];
+#endif
 
 void main() {
     int b = int(gl_WorkGroupID.z);
@@ -246,14 +276,25 @@ void main() {
         float amax = uintBitsToFloat(shAmaxU[tid]);
         // A row of all zeros quantizes to all zeros under any scale; 1.0 keeps
         // the reciprocal finite and the output 0.
+#if IS_SIGNED
         shSa[tid] = (amax > 0.0) ? (amax / 127.0) : 1.0;
+#else
+        shSa[tid] = (amax > 0.0) ? (amax / 255.0) : 1.0;
+#endif
     }
     barrier();
 
+#if IS_SIGNED
     coopmat<int, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
         matC;
     matC = coopmat<int, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
                    gl_MatrixUseAccumulator>(0);
+#else
+    coopmat<uint, gl_ScopeSubgroup, M_BLOCK, N_BLOCK, gl_MatrixUseAccumulator>
+        matC;
+    matC = coopmat<uint, gl_ScopeSubgroup, M_BLOCK, N_BLOCK,
+                   gl_MatrixUseAccumulator>(0);
+#endif
 
     int k_tiles = (K + K_BLOCK - 1) / K_BLOCK;
 
@@ -269,9 +310,14 @@ void main() {
             int q = 0;
             if (hg < M && kk < K) {
                 float v = loadA_f16(a_base + hg * K + kk) / shSa[row];
+#if IS_SIGNED
                 q = int(round(clamp(v, -127.0, 127.0)));
+                shAq[idx] = int8_t(q);
+#else
+                q = int(round(clamp(v, 0.0, 255.0)));
+                shAq[idx] = uint8_t(q);
+#endif
             }
-            shAq[idx] = int8_t(q);
         }
         // 256 threads stage B[K_BLOCK x BN] bytes => B_ELEMS/thread.
         for (int e = 0; e < B_ELEMS; e++) {
@@ -281,17 +327,30 @@ void main() {
             int kk = k_base + row;
             int w = n0 + col;
             // B is [batch, K, N] row-major; the gate rejects transB.
+#if IS_SIGNED
             shB[idx] = (kk < K && w < N)
-                           ? int8_t(loadB_i8(b_base + kk * N + w))
+                           ? int8_t(loadB_byte(b_base + kk * N + w))
                            : int8_t(0);
+#else
+            shB[idx] = (kk < K && w < N)
+                           ? uint8_t(loadB_byte(b_base + kk * N + w))
+                           : uint8_t(0);
+#endif
         }
 
         barrier();
 
+#if IS_SIGNED
         coopmat<int8_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
             matA;
         coopmat<int8_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
             matB;
+#else
+        coopmat<uint8_t, gl_ScopeSubgroup, M_BLOCK, K_BLOCK, gl_MatrixUseA>
+            matA;
+        coopmat<uint8_t, gl_ScopeSubgroup, K_BLOCK, N_BLOCK, gl_MatrixUseB>
+            matB;
+#endif
         coopMatLoad(matA, shAq, sgy * M_BLOCK * K_BLOCK, K_BLOCK,
                     gl_CooperativeMatrixLayoutRowMajor);
         coopMatLoad(matB, shB, sgx * N_BLOCK, BN,

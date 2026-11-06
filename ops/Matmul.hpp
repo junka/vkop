@@ -1983,6 +1983,9 @@ class MatMulBuffer : public BufferFactory {
         // matmul_coop.comp's DEFAULT and SPLITK_INWG builds are self-pack;
         // coop16.comp and SPLITK_DEPOSIT/FOLD are scratch+pack.
         bool writes_scratch;
+        // For int8-family modules: true = UINT8→UINT32 path, false = SINT8→SINT32.
+        // Matmul_coop_i8.comp is templated with IS_SIGNED on this flag.
+        bool uint8;
     };
     // fp16 -> fp32 modules, largest output tile first. Which ones a device can
     // run is a property-list query, not something to infer from the vendor:
@@ -1992,20 +1995,25 @@ class MatMulBuffer : public BufferFactory {
     // tile is 10-36% slower on ARL (m=16..63, k=2048), because one 8x8 MMA
     // per K tile leaves nothing for the prefetch to hide behind.
     static constexpr CoopModule kFp16Modules[] = {
-        {16, 16, 16, "buffer_matmul_coop16", 32, 64, true},
-        {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32, true},
-        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32, true},
-        {8, 8, 16, "buffer_matmul_coop", 16, 32, false},
-        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm8bn64", 8, 64, false},
-        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm32bn16", 32, 16, false},
-        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm64bn8", 64, 8, false},
+        {16, 16, 16, "buffer_matmul_coop16", 32, 64, true, false},
+        {16, 8, 16, "buffer_matmul_coop16_16x8x16", 32, 32, true, false},
+        {16, 8, 8, "buffer_matmul_coop16_16x8x8", 32, 32, true, false},
+        {8, 8, 16, "buffer_matmul_coop", 16, 32, false, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm8bn64", 8, 64, false, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm32bn16", 32, 16, false, false},
+        {8, 8, 16, "buffer_matmul_coop_fp16_8x8x16_bm64bn8", 64, 8, false, false},
     };
     // SINT8 -> SINT32 builds of shaders/buffer/matmul_coop_i8.comp. ARL
     // lists 8x8x32, Ada 16x16x32, and each device rejects the other's tile at
     // the hardware level (validates, computes zeros), so both are needed.
     static constexpr CoopModule kI8Modules[] = {
-        {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64, true},
-        {8, 8, 32, "buffer_matmul_coop_i8", 16, 32, true},
+        // SINT8 → SINT32: default 8x8x32 (ARL), plus Ada's 16x16x32.
+        {16, 16, 32, "buffer_matmul_coop_i8_16x16x32", 32, 64, true, false},
+        {8, 8, 32, "buffer_matmul_coop_i8", 16, 32, true, false},
+        // UINT8 → UINT32: ARL lists 8x8x32 alongside SINT8. Ada's coopmatProps
+        // enumerate UINT8 at 16x16x32 / 16x8x32 — those tiles probe as listed
+        // on Ada and this 8x8x32 entry stays filtered out there.
+        {8, 8, 32, "buffer_matmul_coop_u8", 16, 32, true, true},
     };
 
     // First module whose tile the device lists and whose SPIR-V this op's
@@ -2032,10 +2040,35 @@ class MatMulBuffer : public BufferFactory {
                         std::vector<ProbedModule> *extra = nullptr) {
         std::unique_ptr<VulkanPipeline> first;
         for (const CoopModule &m : mods) {
-            const bool listed =
-                sint8 ? m_dev_->supports_coopmat_sint8_tile(m.cm, m.cn, m.ck)
-                      : m_dev_->supports_coopmat_fp16_tile(m.cm, m.cn, m.ck);
+            // When forcing UINT8 (VKOP_FORCE_I8_UINT8=1) skip SINT8 modules;
+            // when forcing SINT8 skip UINT8 modules. Only relevant inside the
+            // SINT8→SINT32/UINT8→UINT32 probe loop — the fp16 loop below has
+            // its own shape gating and should not see this env var at all.
+            const char *force_i8 = sint8 ? std::getenv("VKOP_FORCE_I8_UINT8") : nullptr;
+            if (force_i8 && force_i8[0] == '1' && !m.uint8) continue;
+            if (force_i8 && force_i8[0] != '1' && m.uint8) continue;
+            bool listed = false;
+            if (sint8) {
+                listed = m.uint8
+                    ? m_dev_->supports_coopmat_uint8_tile(m.cm, m.cn, m.ck)
+                    : m_dev_->supports_coopmat_sint8_tile(m.cm, m.cn, m.ck);
+            } else {
+                listed = m_dev_->supports_coopmat_fp16_tile(m.cm, m.cn, m.ck);
+            }
+            // Force-selected module whose tile driver does NOT advertise —
+            // warn explicitly so future readers don't mistake a coerced path
+            // for a verified one. Without force env we just fall through.
+            const bool forcing = force_i8 != nullptr;
             if (!listed) {
+                if (forcing) {
+                    std::fprintf(
+                        stderr,
+                        "[coopmat] WARNING: VKOP_FORCE_I8_UINT8=%s coerces "
+                        "dtype/shape NOT advertised by driver: %s (%d x %d x %d "
+                        "%s)\n",
+                        force_i8, m.key, m.cm, m.cn, m.ck,
+                        m.uint8 ? "UINT8→UINT32" : "SINT8→SINT32");
+                }
                 continue;
             }
             std::pair<const uint32_t *, uint32_t> spv;

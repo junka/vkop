@@ -474,6 +474,15 @@ vkop_shader_variant(buffer_matmul_coop16_16x8x8 buffer/matmul_coop16
 vkop_shader_variant(buffer_matmul_coop_i8_16x16x32 buffer/matmul_coop_i8
                     -DCM=16 -DCN=16 -DCK=32)
 
+# UINT8→UINT32 variant of matmul_coop_i8.comp. ARL lists 8x8x32 UINT8 alongside
+# SINT8 at the same tile. Ada's coopmatProps enumerate UINT8 at 16x16x32 /
+# 16x8x32 — probe path (supports_coopmat_uint8_tile) picks them on Ada and the
+# 8x8x32 entry stays filtered out there. Not measured on Ada yet.
+# IS_SIGNED=0 flips both cooperative-matrix types (int8_t→uint8_t, int→uint)
+# and the runtime quantize clamp (±127→0..255).
+vkop_shader_variant(buffer_matmul_coop_u8 buffer/matmul_coop_i8
+                    -DIS_SIGNED=0)
+
 # coopmat + split-K hybrid: three -D entry points per source (DEFAULT = no
 # -D, SPLITK_DEPOSIT, SPLITK_FOLD). Runtime picks SPLITK_DEPOSIT for the
 # main pass (fp32 partials to scratch) and SPLITK_FOLD for the reduce pass

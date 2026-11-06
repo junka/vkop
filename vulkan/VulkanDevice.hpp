@@ -269,6 +269,23 @@ class VulkanDevice {
         }
         return false;
     }
+    // UINT8 -> UINT32 cooperative-matrix tile (same A/B types as SINT8 but
+    // unsigned accumulator). Intel ARL lists this alongside SINT8 at the
+    // same 8x8x32 shape (see coopmatProps probe). Ada's coopmatProps enumerate
+    // UINT8 at 16x16x32 / 16x8x32 — those tiles probe listed on Ada and the
+    // 8x8x32 entry below stays filtered out there.
+    bool supports_coopmat_uint8_tile(uint32_t M, uint32_t N, uint32_t K) const {
+        for (const auto &p : coopmatProps_) {
+            if (p.AType == VK_COMPONENT_TYPE_UINT8_KHR &&
+                p.BType == VK_COMPONENT_TYPE_UINT8_KHR &&
+                p.ResultType == VK_COMPONENT_TYPE_UINT32_KHR &&
+                p.scope == VK_SCOPE_SUBGROUP_KHR && p.MSize == M &&
+                p.NSize == N && p.KSize == K) {
+                return true;
+            }
+        }
+        return false;
+    }
     // fp16 -> fp32 subgroup-scope cooperative matrix with an explicit tile
     // shape. The 8x8x16 combo is the only fp16 shape Intel ARL exposes; it
     // is what matmul_coop.comp declares. NVIDIA (Ada Lovelace) does NOT list
@@ -290,6 +307,9 @@ class VulkanDevice {
     }
 #else
     bool supports_coopmat_sint8_tile(uint32_t, uint32_t, uint32_t) const {
+        return false;
+    }
+    bool supports_coopmat_uint8_tile(uint32_t, uint32_t, uint32_t) const {
         return false;
     }
     bool supports_coopmat_fp16_tile(uint32_t, uint32_t, uint32_t) const {
