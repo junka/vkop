@@ -18,10 +18,10 @@
 //
 // Build (mirrors bench_matmul.cpp; libvkop carries no SPIR-V, so
 // -DVKOP_DEV_SHADER_ARCHIVE must point at build/vkop_shaders.bin):
-//   g++ -O2 -std=gnu++17 -mf16c -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS \
-//     -DVKOP_DEV_SHADER_ARCHIVE='"/home/gwm/code/github/vkop/build/vkop_shaders.bin"' \
-//     -I. -Imodel -Imodel/SYSTEM -Imodel/generated \
-//     benchmark/bench_matmul_i8.cpp -o build/bench_matmul_i8 \
+//   g++ -O2 -std=gnu++17 -mf16c -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS
+//     -DVKOP_DEV_SHADER_ARCHIVE='"/home/gwm/code/github/vkop/build/vkop_shaders.bin"'
+//     -I. -Imodel -Imodel/SYSTEM -Imodel/generated
+//     benchmark/bench_matmul_i8.cpp -o build/bench_matmul_i8
 //     build/libvkop.a build/model/libvload.a -lpthread
 //
 // Run:
