@@ -7,11 +7,16 @@
 #include "ops/PimplFacade.hpp"
 
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <unordered_map>
 #include <vector>
 namespace vkop {
 namespace ops {
+
+// Dummy static reference target so build_coop_pipeline's out parameter can
+// have a default argument for calls that don't need the key.
+static const char *g_dummy_first_key = nullptr;
 
 namespace matmul {
 
@@ -351,7 +356,7 @@ class MatMulBuffer : public BufferFactory {
             coop_fp16_alts_owner_.clear();
             if (auto pipe = build_coop_pipeline(kFp16Modules, false, cache, bm,
                                                 bn, tile16, writes_scratch,
-                                                &extra)) {
+                                                &extra, primary_coop_key_)) {
                 coop_pipeline_ = std::move(pipe);
                 coop_bm_ = bm;
                 coop_bn_ = bn;
@@ -372,6 +377,7 @@ class MatMulBuffer : public BufferFactory {
                     alt.bm = e.bm;
                     alt.bn = e.bn;
                     alt.writes_scratch = e.writes_scratch;
+                    alt.key = e.key;
                     for (auto &ds : alt.ds) {
                         ds = alt.pipe->allocDescriptorSets();
                     }
@@ -1490,7 +1496,53 @@ class MatMulBuffer : public BufferFactory {
             int want_bm = force_bm > 0 ? force_bm : plan.bm;
             int want_bn = force_bn > 0 ? force_bn : plan.bn;
             bool no_pack = coop_no_pack_pass_;
-            if (want_bm > 0 && want_bn > 0 &&
+            // -----------------------------------------------------------
+            // HIGHEST PRIORITY: force by archive key (VKOP_FORCE_SPVKEY).
+            // Searches first the primary fp16 coopmat pipeline, then the
+            // alt variants. When hit, bm/bn/tile16 cover paths all skip
+            // so the chosen pipeline stays consistent with its geometry.
+            // -----------------------------------------------------------
+            bool force_key_hit = false;
+            const char *force_key = std::getenv("VKOP_FORCE_SPVKEY");
+            if (force_key && force_key[0] != 0) {
+                // primary pipeline
+                if (coop_pipeline_ &&
+                    strcmp(force_key, primary_coop_key_) == 0) {
+                    pipe = coop_pipeline_.get();
+                    ds = coop_ds_;
+                    bm = coop_bm_;
+                    bn = coop_bn_;
+                    force_key_hit = true;
+                } else {
+                    for (auto &alt : coop_fp16_alts_) {
+                        if (alt.key && strcmp(alt.key, force_key) == 0 &&
+                            alt.pipe) {
+                            pipe = alt.pipe;
+                            ds = alt.ds;
+                            bm = alt.bm;
+                            bn = alt.bn;
+                            no_pack = !alt.writes_scratch;
+                            force_key_hit = true;
+                            break;
+                        }
+                    }
+                }
+                if (force_key_hit) {
+                    std::fprintf(stderr,
+                                 "[coopmat] FORCED key=%s pipe=%p bm=%d bn=%d\n",
+                                 force_key, (void *)pipe, bm, bn);
+                } else {
+                    std::fprintf(stderr,
+                                 "[coopmat] WARNING: VKOP_FORCE_SPVKEY=%s not "
+                                 "found (probe/archive missing?); falling back\n",
+                                 force_key);
+                }
+            }
+            // BM/BN override — only applies when key-force did NOT already land
+            // (key-force wins absolutely; BM/BN kept for backward compat but
+            // warned when it would otherwise be superseded by pick.tile16).
+            bool force_bm_bn_hit = false;
+            if (!force_key_hit && want_bm > 0 && want_bn > 0 &&
                 (want_bm != bm || want_bn != bn)) {
                 for (auto &alt : coop_fp16_alts_) {
                     if (alt.bm == want_bm && alt.bn == want_bn && alt.pipe) {
@@ -1499,10 +1551,24 @@ class MatMulBuffer : public BufferFactory {
                         bm = alt.bm;
                         bn = alt.bn;
                         no_pack = !alt.writes_scratch;
+                        force_bm_bn_hit = true;
                         break;
                     }
                 }
+                if (!force_bm_bn_hit) {
+                    std::fprintf(stderr,
+                                 "[coopmat] WARNING: VKOP_FORCE_BM/BN=%d/%d "
+                                 "not in probed fp16 alt variants; ignored\n",
+                                 want_bm, want_bn);
+                }
             }
+            // pick.tile16 ACC geometry path — MUST NOT clobber any forced
+            // (key or BM/BN) pipe. Covering it is what segfaulted on Ada
+            // 16x8x16: user forced bm=32/bn=32, alt picked correctly, then
+            // tile16 unconditionally overwrote to bm=64/bn=64 → pipe/bm/bn
+            // mismatch → segfault. We only let this branch run on the
+            // default pick (no force) and record a WARNING when a force
+            // landed but tile16 would have otherwise overwritten it.
             if (pick.tile16) {
                 const int acc_mode = coop_acc_mode();
                 CoopGeo *geo = nullptr;
@@ -1516,11 +1582,29 @@ class MatMulBuffer : public BufferFactory {
                     }
                 }
                 if (geo != nullptr && coop_geo_pipeline(*geo) != nullptr) {
-                    pipe = geo->pipe;
-                    ds = geo->ds;
-                    bm = geo->bm;
-                    bn = geo->bn;
+                    if (force_key_hit || force_bm_bn_hit) {
+                        std::fprintf(stderr,
+                                     "[coopmat] WARNING: pick.tile16 ACC "
+                                     "path would overwrite forced pipe; "
+                                     "keeping forced pipe (bm=%d, bn=%d)\n",
+                                     bm, bn);
+                    } else {
+                        pipe = geo->pipe;
+                        ds = geo->ds;
+                        bm = geo->bm;
+                        bn = geo->bn;
+                    }
                 }
+            }
+            // Defensive: pipe vs bm/bn consistency check before dispatch.
+            // Without this a silent mismatch segfaults deep in Vulkan; now
+            // we abort with a clear reason.
+            if (pipe == nullptr) {
+                std::fprintf(stderr,
+                             "[coopmat] FATAL: no pipeline selected for "
+                             "route=%s m=%d n=%d k=%d bm=%d bn=%d — abort\n",
+                             plan.tag, m, n, k, bm, bn);
+                std::abort();
             }
             set_route(plan.tag, batch, m, n, k, rep);
             // Override route_info with the full coopmat dispatch context:
@@ -2042,7 +2126,9 @@ class MatMulBuffer : public BufferFactory {
     build_coop_pipeline(const CoopModule (&mods)[N], bool sint8,
                         VkPipelineCache cache, int &bm, int &bn, bool &tile16,
                         bool &writes_scratch_out,
-                        std::vector<ProbedModule> *extra = nullptr) {
+                        std::vector<ProbedModule> *extra = nullptr,
+                        const char *&first_key_out = g_dummy_first_key) {
+        first_key_out = nullptr;
         std::unique_ptr<VulkanPipeline> first;
         for (const CoopModule &m : mods) {
             // When forcing UINT8 (VKOP_FORCE_I8_UINT8=1) skip SINT8 modules;
@@ -2098,6 +2184,7 @@ class MatMulBuffer : public BufferFactory {
                     static_cast<int>(spv.second), use_uab, 0, cache);
                 if (!first) {
                     first = std::move(pipe);
+                    first_key_out = m.key;
                     bm = m.bm;
                     bn = m.bn;
                     tile16 = m.cm == 16 && m.cn == 16 && m.ck == 16;
@@ -2717,6 +2804,10 @@ class MatMulBuffer : public BufferFactory {
     // divides M/N by these.
     int coop_bm_ = 16;
     int coop_bn_ = 32;
+    // Archive key of the primary fp16 coopmat pipeline (e.g.
+    // "buffer_matmul_coop" or "buffer_matmul_coop16"). Populated by
+    // build_coop_pipeline so VKOP_FORCE_SPVKEY can match it.
+    const char *primary_coop_key_ = nullptr;
     // Additional fp16 coopmat probed variants beyond the default held by
     // coop_pipeline_. Each entry maps a (bm, bn) workgroup tile to a pipeline
     // + its descriptor sets; dispatch-time tile selection (from
@@ -2729,6 +2820,7 @@ class MatMulBuffer : public BufferFactory {
         int bm = 0;
         int bn = 0;
         bool writes_scratch = true;
+        const char *key = nullptr;  // archive key (e.g. "buffer_matmul_coop16_16x8x16")
     };
     std::vector<CoopAltVariant> coop_fp16_alts_;
     std::vector<std::unique_ptr<VulkanPipeline>> coop_fp16_alts_owner_;
