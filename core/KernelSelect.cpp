@@ -601,6 +601,211 @@ const MatmulRule kMatmulRules[] = {
     {MatmulRoute::kReduce, "reduce", reduce_applies, nullptr},
 };
 
+// --------------------------------------------------------------------------
+// Cooperative-matrix smart selector. Replaces the old fixed-order rule-table
+// walk for the four coopmat variants with a two-stage heuristic:
+//   1. Tile/BM/BN selection — pure shape heuristic, no hardware order
+//      assumptions. "Floor by divides, then waste."
+//   2. K-split (cs) decision — parallelism-driven, min viable cs rather
+//      than max cs. cs==1 short-circuits to plain coopmat.
+//   3.形态选择 — cs>1 时才进 SkLast / SplitK / INWG 顺序。INWG
+//      硬禁用（host 未 wiring）自动跳过。
+//
+// If this function returns an empty plan (route == kReduce), the caller
+// falls back to the original rule-table walk below. That preserves every
+// non-coopmat route (attn_softmax, down_act_fold, i8 coopmat, tiled, etc.)
+// exactly as before.
+// --------------------------------------------------------------------------
+
+static int sm_estimate(const DeviceTraits &t) {
+    // Env override wins.
+    if (const char *e = std::getenv("VKOP_SM_ESTIMATE")) {
+        int v = std::atoi(e);
+        if (v > 0) return v;
+    }
+    // Vendor_id-based table. Intel ARL ~8, NVIDIA Ada ~48.
+    switch (t.vendor_id) {
+    case 0x8086: return 8;   // Intel Arc / UHD / Iris Xe
+    case 0x10DE: return 48;  // NVIDIA Ada Lovelace
+    case 0x1002: return 32;  // AMD RDNA (conservative)
+    default:     return 16;  // Generic conservative default
+    }
+}
+
+// Tile candidate — BM/BN pair + shape metrics used by the selector.
+struct TileCandidate {
+    int bm;
+    int bn;
+    long work;
+    double waste_m;
+    double waste_n;
+};
+
+static TileCandidate make_tc(int m, int n, int batch, int bm, int bn) {
+    long wm = up_div(m, bm);
+    long wn = up_div(n, bn);
+    double wm_frac = (double)(wm * bm - m) / (double)m;
+    double wn_frac = (double)(wn * bn - n) / (double)n;
+    return TileCandidate{bm, bn, wm * wn * batch, wm_frac, wn_frac};
+}
+
+static const char *kReasonPlain =
+    "plain coopmat: cs=1 (parallelism saturated or K too shallow for K-split)";
+static const char *kReasonSkLast =
+    "coopmat SkLast: cs>1, N even, parallelism-driven K-split, grid.z parallel";
+
+// Main entry point. Returns an empty plan (route=kReduce) if coopmat should
+// fall through to the original rule table.
+static MatmulPlan coopmat_select_smart(Ctx &c) {
+    // Gate 0: basic coopmat applicability — same as the existing rule.
+    if (!coopmat_applies(c)) {
+        return {};  // fall through
+    }
+    const MatmulShape &s = *c.s;
+    const DeviceTraits &t = *c.dev;
+
+    // --- Stage 1: SM estimate + parallelism target ---
+    const int sm = sm_estimate(t);
+    const int target = sm * 2;
+
+    // --- Stage 2: BM/BN tile selection ---
+    // The hardware-listed fp16 shape drives the candidate set. ARL has
+    // 8x8x16; Ada has 16x16x16 + 16x8x16 + 16x8x8. The BM/BN workgroup tile
+    // depends on which shape we'll dispatch — but since we always probe
+    // kFp16Modules (largest-shape-first, archive+driver must have it), we
+    // use coop_bm/coop_bn from availability as the "actual BM/BN this op
+    // has modules for". Fall back to per-shape static pairs if zero.
+    std::vector<TileCandidate> candidates;
+    const bool have_16 = t.coopmat_fp16_16x16x16;
+    const bool have_arl = t.coopmat_fp16_8x8x16;
+
+    if (have_16) {
+        // Ada: BM/BN = {32x64 (SG2xSG4 ACC1x1), 32x32 (SG2xSG4 half-width),
+        //                64x128 (SG2xSG4 ACC2x2), 32x64 16x8x16 variant}
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 32, 64));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 32, 32));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 64, 128));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 32, 32));  // 16x8x16 same footprint
+    }
+    if (have_arl) {
+        // ARL: BM/BN = {16x32 (default), 8x64 (SG1xSG8), 32x16 (SG4xSG2),
+        //                64x8 (SG8xSG1)}
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 16, 32));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 8, 64));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 32, 16));
+        candidates.push_back(make_tc(s.m, s.n, s.batch, 64, 8));
+    }
+    if (candidates.empty()) {
+        return {};
+    }
+
+    // Pick tile by strict priority order (from Step C spec):
+    //   1. Divide-first: candidates with N%BN==0 preferred, among those
+    //      choose lowest (waste_m + waste_n).
+    //   2. M≈N: pick more square (BM≈BN) if shapes are near-square.
+    //   3. Degenerate M==1: lock BM=8/BN=64 (SG1xSG8).
+    //   4. Tiebreak: largest BN for wide-N benefit.
+    TileCandidate best = candidates.front();
+    if (s.m == 1 && have_arl) {
+        // Degenerate M==1: force SG1xSG8 (BM8xBN64) from ARL set.
+        for (auto &tc : candidates) {
+            if (tc.bm == 8 && tc.bn == 64) { best = tc; break; }
+        }
+    } else {
+        // Filter: candidates where N%BN==0 (no N-waste from row masking).
+        std::vector<TileCandidate> div_candidates;
+        for (auto &tc : candidates) {
+            if (s.n % tc.bn == 0) div_candidates.push_back(tc);
+        }
+        std::vector<TileCandidate> &pool =
+            div_candidates.empty() ? candidates : div_candidates;
+
+        // Minimize total waste (waste_m + waste_n).
+        double best_waste = 1e9;
+        for (auto &tc : pool) {
+            double w = tc.waste_m + tc.waste_n;
+            if (w < best_waste - 1e-6 ||
+                (std::abs(w - best_waste) < 1e-6 && tc.work < best.work - 1)) {
+                best_waste = w;
+                best = tc;
+            } else if (std::abs(w - best_waste) < 1e-6 &&
+                       std::abs(tc.work - best.work) < 2 && tc.bn > best.bn) {
+                best = tc;  // tiebreak: wider BN
+            }
+        }
+    }
+
+    // --- Stage 3: cs decision (split-K depth) ---
+    long w = best.work;
+    int cs = 1;
+    if (w < target) {
+        // Need K-split. cs must satisfy (a) W*cs >= target, (b) K/cs >= 2*K_BLOCK
+        // (min 2 MMA tiles per slice — K_BLOCK depends on the shape we'll use;
+        // use max(16, device-listed K) as floor).
+        int k_block_min = have_16 ? 16 : 16;  // both ARL & Ada fp16 K=16
+        int min_k_per_slice = 2 * k_block_min;  // 32
+        for (int try_cs : {2, 4, 8}) {
+            if (try_cs * w >= target && s.k >= min_k_per_slice * try_cs &&
+                (s.k % (try_cs * k_block_min) == 0 ||
+                 s.k - (s.k / (try_cs * k_block_min)) * try_cs * k_block_min >= 32)) {
+                // K/cs divides cleanly OR remainder still >= 32 (one MMA row
+                // beyond the last aligned tile). Pick smallest viable cs.
+                cs = try_cs;
+                break;
+            }
+        }
+    }
+
+    // --- Stage 4: route + coop_split + reason + BM/BN tile ---
+    MatmulPlan p;
+    p.tiled = c.tiled;
+    p.tiled_min_m = c.tiled_min_m;
+    p.device = c.prof;
+    p.coop_split = cs;
+    // ks_n stays 0 — only kCoopmatSplitK / kCoopmatSkLast paths use it,
+    // and we carry cs in coop_split (same as existing convention).
+    p.ksplit_q = c.q;
+    p.wide = c.wide;
+    // Tile chosen by Stage 2. ops/MatMul dispatches coopmat routes with
+    // these dimensions when set.
+    p.bm = best.bm;
+    p.bn = best.bn;
+
+    if (cs == 1) {
+        p.route = MatmulRoute::kCoopmat;
+        p.tag = "coopmat";
+        p.route_reason = kReasonPlain;
+        return p;
+    }
+
+    // cs > 1 but SplitK dispatch path in ops/Matmul.hpp is not wired
+    // (kCoopmatSplitK has no dispatch branch + no pipeline init). The rule
+    // table's applies() check would let it win and then dispatch would run
+    // plain coopmat underneath a route tag that lies. Guard here: only emit
+    // SkLast (has full dispatch wiring), or fall back to plain coopmat.
+    const bool sklast_ok =
+        (s.n & 1) == 0 &&   // N even (SK_LASTBLOCK half2 epilogue needs it)
+        s.k >= 32 * cs &&   // K/cs >= 32 min per-slice K for SkLast fp32 path
+        !c.f->epi_bias;     // no epilogue bias (both split-K routes need this)
+
+    if (sklast_ok) {
+        p.route = MatmulRoute::kCoopmatSkLast;
+        p.tag = "coopmat_sklast";
+        p.route_reason = kReasonSkLast;
+    } else {
+        // cs>1, not SkLast-eligible, and SplitK dispatch unavailable →
+        // fall back to plain coopmat. coop_split reset to 1 so dispatch
+        // treats it as plain. Route reason explains the gap.
+        p.coop_split = 1;
+        p.route = MatmulRoute::kCoopmat;
+        p.tag = "coopmat";
+        p.route_reason =
+            "plain coopmat (SplitK dispatch path not wired in ops/Matmul.hpp)";
+    }
+
+    return p;
+}
+
 MatmulPlan apply_rule(Ctx &c, const MatmulRule &rule) {
     if (rule.configure != nullptr) {
         rule.configure(c);
@@ -845,6 +1050,16 @@ MatmulPlan select_matmul(const DeviceTraits &traits, const MatmulShape &shape,
                  shape.m, shape.n, shape.k, features.fp16,
                  features.weight == WeightKind::kFp16, knobs.coop_split,
                  knobs.force_coop, availability.coopmat);
+    // --- Coopmat smart selector runs before the fixed-order rule table ---
+    // If it produces a plan, return it directly; otherwise fall through to
+    // the original walk which handles every non-coopmat route unchanged.
+    MatmulPlan smart = coopmat_select_smart(c);
+    if (smart.route != MatmulRoute::kReduce) {
+        std::fprintf(stderr, "[ksel] SMART CHOSE %s coop_split=%d reason=%s\n",
+                     smart.tag, smart.coop_split,
+                     smart.route_reason ? smart.route_reason : "(none)");
+        return smart;
+    }
     for (const MatmulRule &rule : kMatmulRules) {
         bool a = rule.applies(c);
         std::fprintf(stderr, "[ksel] rule %s -> %d\n", rule.tag, a);

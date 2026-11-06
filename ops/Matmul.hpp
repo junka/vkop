@@ -428,10 +428,16 @@ class MatMulBuffer : public BufferFactory {
             }
         }
         // SK_LASTBLOCK pipelines: per-cs precompiled variants (SK_CS baked in)
-        // avoid glslc's register-allocator bug. Try cs=2,4,8 first, then the
-        // default (SK_CS=1, full-K path) as fallback. Each variant has both
-        // fp32 and half2 epilogue builds; half2 only used when N is even.
-        if (fp16_ != 0 && !coop_disabled && dev->is_support_cooperate_matrix() &&
+        // avoid glslc's register-allocator bug. Only probed on devices that
+        // list a >= 16x16x16 MMA shape (Ada) — Intel ARL only lists 8x8x16 and
+        // its ANV driver SIGSEGVs on every SkLast SPIR-V variant at pipeline
+        // create time, inside the driver (not C++ exceptions try-catch can
+        // recover from). SkLast dispatch also requires the coop16 pipeline
+        // (matmul_coop16.comp) which ARL does not build, so ARL would never
+        // reach this path anyway.
+        if (fp16_ != 0 && !coop_disabled &&
+            dev->is_support_cooperate_matrix() &&
+            m_dev_->supports_coopmat_fp16_tile(16, 16, 16) &&
             sklast_fp32_pipes_.empty()) {
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
@@ -441,14 +447,14 @@ class MatMulBuffer : public BufferFactory {
                 DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                 DESCRIPTOR_TYPE_STORAGE};
             // List of (cs, fp32_key, half2_key) to try. cs=0 means default.
+            // NOTE: cs=2/4/8 precompiled variants currently crash Intel ARL's
+            // ANV driver at pipeline-create time (SIGSEGV inside the driver,
+            // not a C++ exception try-catch can recover from). Keep cs=1
+            // (the default, SK_CS baked in as 1 — full-K path) so SkLast
+            // dispatches still run; the deeper splits are gated off at the
+            // selector anyway (SplitK dispatch path not wired).
             struct SkLastKey { int cs; const char *fp32; const char *half2; };
             SkLastKey keys[] = {
-                { 2, "buffer_matmul_coop16_sklast_fp32_cs2",
-                    "buffer_matmul_coop16_sklast_cs2" },
-                { 4, "buffer_matmul_coop16_sklast_fp32_cs4",
-                    "buffer_matmul_coop16_sklast_cs4" },
-                { 8, "buffer_matmul_coop16_sklast_fp32_cs8",
-                    "buffer_matmul_coop16_sklast_cs8" },
                 { 1, "buffer_matmul_coop16_sklast_fp32",
                     "buffer_matmul_coop16_sklast" },
             };
@@ -1468,6 +1474,35 @@ class MatMulBuffer : public BufferFactory {
             VkDescriptorSet *ds = pick.ds;
             int bm = pick.bm;
             int bn = pick.bn;
+            // Dispatch-time variant selection: MatmulPlan::bm/bn (set by
+            // KernelSelect's smart tile selector) overrides the default
+            // pick when it names a specific workgroup tile that we probed
+            // at set_runtime_device time. Falls back to the default if the
+            // requested variant was not probed (archive lacks the key, or
+            // the driver rejected it). Only applies to fp16 coopmat plain
+            // path — coop16 ACC geometries and SkLast keep their own routes.
+            // VKOP_FORCE_BM / VKOP_FORCE_BN override for isolated variant
+            // validation — takes priority over both the default pick and
+            // MatmulPlan::bm/bn.
+            int force_bm = 0, force_bn = 0;
+            if (const char *env = std::getenv("VKOP_FORCE_BM")) force_bm = std::atoi(env);
+            if (const char *env = std::getenv("VKOP_FORCE_BN")) force_bn = std::atoi(env);
+            int want_bm = force_bm > 0 ? force_bm : plan.bm;
+            int want_bn = force_bn > 0 ? force_bn : plan.bn;
+            bool no_pack = coop_no_pack_pass_;
+            if (want_bm > 0 && want_bn > 0 &&
+                (want_bm != bm || want_bn != bn)) {
+                for (auto &alt : coop_fp16_alts_) {
+                    if (alt.bm == want_bm && alt.bn == want_bn && alt.pipe) {
+                        pipe = alt.pipe;
+                        ds = alt.ds;
+                        bm = alt.bm;
+                        bn = alt.bn;
+                        no_pack = !alt.writes_scratch;
+                        break;
+                    }
+                }
+            }
             if (pick.tile16) {
                 const int acc_mode = coop_acc_mode();
                 CoopGeo *geo = nullptr;
@@ -1488,6 +1523,21 @@ class MatMulBuffer : public BufferFactory {
                 }
             }
             set_route(plan.tag, batch, m, n, k, rep);
+            // Override route_info with the full coopmat dispatch context:
+            // which variant, workgroup tile, grid, and key push-constants.
+            {
+                char buf[256];
+                snprintf(buf, sizeof(buf),
+                    "%s bm=%d bn=%d grid=(%d,%d,%d) "
+                    "batch=%d m=%d n=%d k=%d transB=%d rep=%d "
+                    "ksplit=%d epi_bias=%d weight_int8=%d wide=%d",
+                    plan.tag, bm, bn,
+                    UP_DIV(n, bn), UP_DIV(m, bm), batch,
+                    batch, m, n, k, transB_ ? 1 : 0, rep,
+                    para_.ksplit, para_.epi_bias,
+                    para_.weight_int8, para_.wide);
+                route_info_ = buf;
+            }
             fillDescriptorWrites(ds[m_id_]);
             pipe->updateDescriptorSets(ds_writes_);
             m_cmd_->bind(*pipe, ds[m_id_]);
@@ -2629,6 +2679,25 @@ class MatMulBuffer : public BufferFactory {
     // divides M/N by these.
     int coop_bm_ = 16;
     int coop_bn_ = 32;
+    // Additional fp16 coopmat probed variants beyond the default held by
+    // coop_pipeline_. Each entry maps a (bm, bn) workgroup tile to a pipeline
+    // + its descriptor sets; dispatch-time tile selection (from
+    // MatmulPlan::bm/bn, set by KernelSelect's smart selector) picks among
+    // them. ARL ships three: bm8bn64, bm32bn16, bm64bn8. Empty if the archive
+    // lacks those keys or the driver rejected any of them.
+    struct CoopAltVariant {
+        VulkanPipeline *pipe = nullptr;
+        VkDescriptorSet ds[vkop::kInflight] = {nullptr};
+        int bm = 0;
+        int bn = 0;
+        bool writes_scratch = true;
+    };
+    std::vector<CoopAltVariant> coop_fp16_alts_;
+    std::vector<std::unique_ptr<VulkanPipeline>> coop_fp16_alts_owner_;
+    // The probed coopmat kernel writes half2 directly to output (no scratch).
+    // Matmul_coop.comp's DEFAULT and SPLITK_INWG builds do this; coop16.comp
+    // and SPLITK_DEPOSIT/FOLD write fp32 to scratch and need a pack pass.
+    bool coop_no_pack_pass_ = false;
     // The probed tile is 16x16x16, the only one with the wider ACC builds in
     // coop_geos_ (they are extra accumulators over one tile, not extra tiles).
     bool coop_acc_geo_ = false;

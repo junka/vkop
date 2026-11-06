@@ -12,9 +12,12 @@
 // => workgroup output footprint BM=16, BN=32. Each K-tile's shared A/B feeds
 // 8 MMAs (2 M-subgroups x 4 N-subgroups), amortizing the SSBO loads.
 //
-// A is [batch, M, K] (row-major; M=rows). B is [batch, K, N] (row-major) OR
-// [batch, N, K] when transB=1 (the transB fusion folds a Transpose(last-2-swap)
-// into the matmul; B is read transposed inline). Output C is [batch, M, N].
+// Macroized build:
+//   CM / CN / CK  — MMA tile M/N/K  (ARL fp16 always 8/8/16)
+//   SG_M / SG_N   — subgroup grid   (SG_M*SG_N == 8, fixed)
+//   BM = SG_M * CM,  BN = SG_N * CN — workgroup output footprint
+// ShA / ShB loads are uniformized via a thread-loop so any CM/CN/SG_M/SG_N
+// combo that keeps local_size_x*y=256 (fixed) compiles.
 //
 // Build variants (compile-time, one entry per pipeline):
 //
@@ -47,6 +50,28 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #extension GL_AMD_gpu_shader_half_float : enable
 #extension GL_EXT_shader_16bit_storage : enable
+
+// --- Macroized build parameters (host supplies -D; defaults match original).
+#ifndef CM
+#define CM 8
+#endif
+#ifndef CN
+#define CN 8
+#endif
+#ifndef CK
+#define CK 16
+#endif
+#ifndef SG_M
+#define SG_M 2
+#endif
+#ifndef SG_N
+#define SG_N 4
+#endif
+#define M_BLOCK CM
+#define N_BLOCK CN
+#define K_BLOCK CK
+#define BM (SG_M * CM)
+#define BN (SG_N * CN)
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
@@ -104,13 +129,6 @@ layout(push_constant) uniform PC {
     int b_shared;
 } uPC;
 
-const int M_BLOCK = 8;
-const int N_BLOCK = 8;
-const int K_BLOCK = 16;
-
-const int BM = 16; // = 2 * M_BLOCK
-const int BN = 32; // = 4 * N_BLOCK
-
 int bmap(int n) {
     if (uPC.b_shared != 0) {
         return 0;
@@ -134,13 +152,13 @@ float16_t loadB(int elem) {
     return float16_t(unpackHalf2x16(uInputB.data[elem >> 1])[elem & 1]);
 }
 
-shared float16_t shA[BM * K_BLOCK];  // [16 x 16]
-shared float16_t shB[K_BLOCK * BN];  // [16 x 32]
-shared float     shC[8][M_BLOCK * N_BLOCK]; // [sg][64] fp32 staging
+shared float16_t shA[BM * K_BLOCK];  // [BM x K_BLOCK]
+shared float16_t shB[K_BLOCK * BN];  // [K_BLOCK x BN]
+shared float     shC[SG_M * SG_N][M_BLOCK * N_BLOCK]; // [sg][64] fp32 staging
 // SPLITK_INWG-only: cross-pass K-slice accumulator + per-pass partial tmp.
 // [sg][64] × 2 × 4B = 4096B. DEPOSIT/FOLD/DEFAULT don't touch these.
-shared float     shC_acc[8][M_BLOCK * N_BLOCK]; // cross-pass sum
-shared float     shC_tmp[8][M_BLOCK * N_BLOCK]; // per-pass partial
+shared float     shC_acc[SG_M * SG_N][M_BLOCK * N_BLOCK]; // cross-pass sum
+shared float     shC_tmp[SG_M * SG_N][M_BLOCK * N_BLOCK]; // per-pass partial
 
 // --------------------------------------------------------------------------
 // K split helpers. Shared by DEPOSIT and FOLD builds.
@@ -173,8 +191,8 @@ void run_mma_slice(int m0, int n0, int a_base, int b_base,
                                  gl_MatrixUseAccumulator> matC) {
     uint sg  = gl_SubgroupID;
     uint tid = gl_LocalInvocationIndex;
-    int  sgx = int(sg % 4);
-    int  sgy = int(sg / 4);
+    int  sgx = int(sg % SG_N);
+    int  sgy = int(sg / SG_N);
 
     int M = uPC.M, N = uPC.N, K = uPC.K;
     // Slice-local tile iteration. Align kr.k0 DOWN and kr.k_end UP to K_BLOCK
@@ -190,11 +208,17 @@ void run_mma_slice(int m0, int n0, int a_base, int b_base,
     int k_end_tile_aligned = ((kr.k_end + K_BLOCK - 1) / K_BLOCK) * K_BLOCK;
     int k_tiles_local = max((k_end_tile_aligned - k0_tile_aligned) / K_BLOCK, 0);
 
+    const int A_SZ = BM * K_BLOCK;
+    const int B_SZ = K_BLOCK * BN;
+
     for (int i = 0; i < k_tiles_local; i++) {
         int k_base = k0_tile_aligned + i * K_BLOCK;
 
         // A[BM x K_BLOCK]
         {
+#if BM == 16 && BN == 32 && SG_M == 2 && SG_N == 4
+            // Fast path for the DEFAULT workgroup (identical to original):
+            // 256 threads cover 256 fp16s exactly, no loop needed.
             int row = int(tid) / K_BLOCK;
             int col = int(tid) % K_BLOCK;
             int h  = m0 + row;
@@ -203,8 +227,26 @@ void run_mma_slice(int m0, int n0, int a_base, int b_base,
             float16_t v = (h < M && kk < K && in_slice) ? loadA(a_base + h * K + kk)
                                                         : float16_t(0.0);
             shA[int(tid)] = v;
+#else
+            int A_SZ = BM * K_BLOCK;
+            for (int e = 0; e < (A_SZ + 255) / 256; e++) {
+                int idx = int(tid) + e * 256;
+                if (idx < A_SZ) {
+                    int row = idx / K_BLOCK;
+                    int col = idx % K_BLOCK;
+                    int h  = m0 + row;
+                    int kk = k_base + col;
+                    bool in_slice = (kk >= kr.k0 && kk < kr.k_end);
+                    float16_t v = (h < M && kk < K && in_slice) ?
+                        loadA(a_base + h * K + kk) : float16_t(0.0);
+                    shA[idx] = v;
+                }
+            }
+#endif
         }
         // B[K_BLOCK x BN]
+#if BM == 16 && BN == 32 && SG_M == 2 && SG_N == 4
+        // Fast path for DEFAULT: 256 threads × 2 = 512 fp16s.
         for (int e = 0; e < 2; e++) {
             int idx = int(tid) * 2 + e;
             int row = idx / BN;
@@ -224,6 +266,32 @@ void run_mma_slice(int m0, int n0, int a_base, int b_base,
             }
             shB[idx] = v;
         }
+#else
+        {
+            int B_SZ = K_BLOCK * BN;
+            for (int e = 0; e < (B_SZ + 255) / 256; e++) {
+                int idx = int(tid) + e * 256;
+                if (idx < B_SZ) {
+                    int row = idx / BN;
+                    int col = idx % BN;
+                    int kk = k_base + row;
+                    int w = n0 + col;
+                    bool in_slice = (kk >= kr.k0 && kk < kr.k_end);
+                    float16_t v;
+                    if (kk < K && w < N && in_slice) {
+                        if (uPC.transB != 0) {
+                            v = loadB(b_base + w * K + kk);
+                        } else {
+                            v = loadB(b_base + kk * N + w);
+                        }
+                    } else {
+                        v = float16_t(0.0);
+                    }
+                    shB[idx] = v;
+                }
+            }
+        }
+#endif
 
         barrier();
 
@@ -290,8 +358,8 @@ void main() {
     int coop = min(max(uPC.ksplit, 1), 8);   // in-workgroup max 8 passes
     int a_base = b * M * K;
     int b_base = bmap(b) * K * N;
-    int sgy = int(sg) / 4;
-    int sgx = int(sg) % 4;
+    int sgy = int(sg) / SG_N;
+    int sgx = int(sg) % SG_N;
 
     // Cross-pass accumulator init: 2 fp32 per lane (lane owns idx=2l, 2l+1).
     for (int e = 0; e < 2; e++) {
@@ -369,8 +437,8 @@ void main() {
     barrier();
 
     int slot = splitk_plane_slot(b, s, uPC.ksplit);
-    int sgy  = int(sg) / 4;
-    int sgx  = int(sg) % 4;
+    int sgy  = int(sg) / SG_N;
+    int sgx  = int(sg) % SG_N;
     for (int e = 0; e < 2; e++) {
         int idx = int(lane) * 2 + e;
         int row = idx / N_BLOCK;
@@ -393,8 +461,8 @@ void main() {
 
     int M = uPC.M, N = uPC.N;
     int coop = max(uPC.ksplit, 1);
-    int sgy  = int(sg) / 4;
-    int sgx  = int(sg) % 4;
+    int sgy  = int(sg) / SG_N;
+    int sgx  = int(sg) % SG_N;
 
     // Accumulate fp32 per 8x8 position in shC[sg], across split planes.
     // coopmat accumulator values are opaque after store; we operate on
@@ -464,8 +532,8 @@ void main() {
     barrier();
 
     int c_base = b * M * N;
-    int sgy = int(sg) / 4;
-    int sgx = int(sg) % 4;
+    int sgy = int(sg) / SG_N;
+    int sgx = int(sg) % SG_N;
     for (int e = 0; e < 2; e++) {
         int idx = int(lane) * 2 + e;            // 0..63
         int row = idx / N_BLOCK;                // 0..7

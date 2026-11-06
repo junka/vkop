@@ -500,6 +500,19 @@ vkop_shader_variant(buffer_matmul_coop16_splitk_fold buffer/matmul_coop16
 vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
                     -DSPLITK_INWG)
 
+# ARL fp16 workgroup BM/BN variants over macroized matmul_coop.comp.
+# All share the same MMA tile (CM=CN=CK=8/8/16); only SG_M/SG_N/BM/BN
+# change, giving 4 ways to pack 8 subgroups x 32 threads = 256 into
+# local_size_x=16, local_size_y=16. Host picks via MatmulPlan::bm/bn from
+# the smart tile selector. Default BM=16/BN=32 (SG_M=2/SG_N=4) is the
+# no -D build keyed as buffer_matmul_coop above.
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm8bn64 buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=1 -DSG_N=8)
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm32bn16 buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=4 -DSG_N=2)
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm64bn8 buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=8 -DSG_N=1)
+
 # SK_LASTBLOCK: serial in-workgroup split-K (single dispatch, grid.z = batch).
 # Per-cs precompiled variants: SK_CS baked in at compile-time avoids glslc's
 # register-allocator bug with runtime ints near coopMat accumulators.

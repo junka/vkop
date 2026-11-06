@@ -270,7 +270,8 @@ struct MatmulPlan {
     // Tile-split-K depth. 0/1 means "no K split".
     int ks_n = 0;
     // coopmat-split-K depth (opt-in via VKOP_COOP_SPLITK*). 0/1 means
-    // "coopmat main pass only, no K split".
+    // "coopmat main pass only, no K split". Also used for coopmat_sklast
+    // (grid.z parallel K split) — same field, same dispatch path.
     int coop_split = 0;
     // Split-K GEMV columns per block (quads, 8-column groups or 16-column
     // groups depending on the route).
@@ -282,6 +283,14 @@ struct MatmulPlan {
     bool tiled = false;
     int tiled_min_m = 0;
     const DeviceProfile *device = nullptr;
+    // Why this route/BM/BN/cs was chosen. Points to a static string literal
+    // produced by coopmat_select_smart() — pure function, no allocation.
+    const char *route_reason = nullptr;
+    // Workgroup tile chosen by the smart selector. 0 means "use the probed
+    // default from coopmat availability". ops/MatMul dispatches coopmat
+    // routes with these dimensions when set.
+    int bm = 0;
+    int bn = 0;
 };
 
 // Pure: the same inputs always produce the same plan. Pipeline availability and
