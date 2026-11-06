@@ -130,6 +130,8 @@ like-for-like 正确性探针（gate/up 用不同零和模式，maxdiff 0.0156�
   干净的修法是 fold op 在大 m 时内部退化为 unfused 三发（它自己
   就有这些 kernel），或 converter 侧按声明形状决定是否折。
 
+> **更正（2026-11-06）**：本节结论已被 `754e839c` 推翻（deposit 循环改为 k 外 r 内），m≥12 不再慢于 trio。见下方 11-06 微基准。
+
 ## Prefill 大 m 回退的归因（/tmp/bench2/da_msweep，2026-11-03）
 
 问题:m≥12 起 fold 比 trio-coopmat 慢 2.3×。两个候选:并发(块数)不足,
@@ -156,3 +158,63 @@ like-for-like 正确性探针（gate/up 用不同零和模式，maxdiff 0.0156�
 wg/wu 载入一次、对 mt 行 FMA),或把 WIDE deposit 推广到 m>1。
 预期 m=15 ≈ deposit 0.85-1.3 + down 0.4 ≈ 1.3-1.7 ms,低于 trio
 coopmat 的 2.5 ms——折叠在 prefill 也能赢。
+
+> **已落地**：`754e839c` 已按此重排，无需再改。
+
+## 2026-11-06 b3 复测：折叠 / 不折叠 / M==1 精简三档对照
+
+### 硬件与口径
+
+- **b3**：RTX 4000 Ada（独显，20 GB GDDR6，NVIDIA driver 595.99.02，clocks.max.sm 3105 MHz 锁频）
+- **本机**：Intel ARL（Xe iGPU，统一内存，ANV 驱动）
+- 模型 `llm.vkopbin` 3.4 GB（≈2.6 B 参数），`decode_dump`，M=1 单 token decode
+- 口径：3 轮 × 6 step = 18 样本；跳过每轮第一个 warmup step，取 15 个 steady 值；报 min / median / max / IQR / std
+- 本机无热机，step-to-step std 7.7 ms（远大于 3 ms 级信号，无法用于 A/B 对照）
+
+### 三档对照表
+
+| 组 | 配置 | b3 med | b3 std | 本机 med | 本机 std |
+|---|---|---|---|---|---|
+| A | pre-split `7bd14bd0`（融合 + 通用 shader，无 DA_M1_ONLY） | 26.10 | 0.336 | —† | — |
+| B | `a1132de3`（融合 + `DA_M1_ONLY` 精简 shader） | 23.26 | 1.389 | 123.53 | 7.7 |
+| C | NOSWIGLU（converter 禁用 `fuse_swiglu_down_proj`，完全不融合） | 28.09 | 1.699 | — | — |
+
+† 本机 pre-split 那次 A/B 因 shader key 重定义陷阱（`buffer_matmul_down_act_fp16` 在 a1132de3 前后指向不同 shader）而无效，该组数据不可用于对照。
+
+b3 每组数值：
+
+- **A**：15 steady step，med=26.10，mean=26.24，min=25.93，max=26.97，IQR=0.40，std=0.336
+- **B**：15 steady step，med=23.26，mean=24.16，min=22.89，max=26.84，IQR=2.51，std=1.389
+- **C**：15 steady step，med=28.09，mean=27.76，min=25.46，max=31.71，IQR=2.67，std=1.699
+
+三组在 b3 上 6/6 rounds argmax MATCH（与 REF token 一致，max_abs_diff < 0.02）。
+
+### 结论（按实测写，不要拔高）
+
+- 融合本身的收益：**A vs C ≈ -7.1%**（-1.99 ms/step）——同样走 down_act_gemv 路由，融合 op 比 gate+up+down 三件套快
+- `a1132de3` 的 M==1 精简收益：**A → B ≈ -10.9%**（-2.84 ms/step）——同一个折叠 op，DA_M1_ONLY shader 比通用 shader 快
+- 两层叠加（完整折叠 vs 完全不融合）：**B vs C ≈ -17.2%**（-4.83 ms/step）
+- 与 `a1132de3` commit message 里 arm 板的 -3.13 ms / -7.7% 方向一致、量级相近（arm 板测的是模块级 micro-benchmark，b3 是端到端 decode）
+- **本机 ARL 无法复现**：step-to-step std 7.7 ms，远大于 3 ms 级信号；这是硬件噪声特性，不是优化无效
+
+### 必须澄清的两点（避免后续误读）
+
+1. **`a1132de3` 的收益机制是寄存器压力下降，不是算法变化**。作者在 arm 板观测到"执行同一份代码，模块更大就慢 18%"——DA_M1_ONLY 宏让 shader 裁掉 M>1 的死分支，Vulkan driver 可以分配更少寄存器、更高 occupancy。Intel ANV 驱动会 trim dead branch，因此该收益在 ARL 上不成立，本机测不到 A→B 的差异是预期行为。
+2. **NOSWIGLU 只能在 converter 阶段关**：`VKOP_NO_FUSIONS=fuse_swiglu_down_proj`。运行期没有开关；`down_act_applies`（`core/KernelSelect.cpp:453`）只读 model binary 里的 `down_act` attribute，该 attribute 是 converter 在 `fold_swiglu_down_proj` pass 里写进去的（`optimizer.py:5673`），不折就是普通 MatMul + Silu + Mul 三件套，runtime 看到的是独立节点。
+
+### 历史遗留：m≥12 的 deposit 回归（已修复）
+
+11-02/11-03 观测到的"m≥12 时 fold 比 trio 慢 2.3×"已由 `754e839c`（2026-11-03）修复——`matmul_down_act.comp:688` 的 deposit 循环由"r 外 k 内"改为"k 外 r 内"，消除了逐行重读 Wg/Wu 整段 K 切片的病态。
+
+2026-11-06 本机 ARL 微基准复核（k_out=2048 / n_up=6144 / n=2048，fold 与 trio 交替取 min；trio 经 `VKOP_NO_COOP=1` 走 tiled 路由）：
+
+| m | fold (ms) | trio (ms) | fold/trio |
+|---|---|---|---|
+| 1 | 2.34 | 4.85 | 0.48× |
+| 2 | 2.00 | 3.63 | 0.55× |
+| 4 | 2.11 | 3.65 | 0.58× |
+| 8 | 2.26 | 3.69 | 0.61× |
+| 15 | 2.33 | 3.62 | 0.64× |
+| 32 | 3.61 | 3.28 | 1.10× |
+
+结论：m=1..15 区间 fold 全面领先（0.48×–0.64×），无需给 `down_act_applies` 加 M 上限。仅 m=32 出现 1.10× 的轻微反转（绝对差 0.33 ms），长 prompt 真实 m 值未测，暂不作为加门槛的依据。
