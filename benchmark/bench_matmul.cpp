@@ -7,19 +7,19 @@
 //
 // Build (mirrors the tests link line: libvkop + libvload; libvkop carries no
 // SPIR-V, so -DVKOP_DEV_SHADER_ARCHIVE must point at build/vkop_shaders.bin):
-//   /usr/local/bin/g++-14 -nostdinc++ \
-//     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1 \
-//     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include \
-//     -O2 -std=gnu++17 -mf16c -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS \
-//     -DVKOP_DEV_SHADER_ARCHIVE=\"/Users/uqland/github/vkop/build/vkop_shaders.bin\" \
-//     -I/usr/local/include -I/Users/uqland/github/vkop -I/Users/uqland/github/vkop/model \
-//     -I/Users/uqland/github/vkop/model/SYSTEM -I/Users/uqland/github/vkop/model/generated \
-//     benchmark/bench_matmul.cpp -o build/bench_matmul \
+//   /usr/local/bin/g++-14 -nostdinc++
+//     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/c++/v1
+//     -isystem /Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include
+//     -O2 -std=gnu++17 -mf16c -DUSE_VMA -DVK_ENABLE_BETA_EXTENSIONS
+//     -DVKOP_DEV_SHADER_ARCHIVE=\"/Users/uqland/github/vkop/build/vkop_shaders.bin\"
+//     -I/usr/local/include -I/Users/uqland/github/vkop -I/Users/uqland/github/vkop/model
+//     -I/Users/uqland/github/vkop/model/SYSTEM -I/Users/uqland/github/vkop/model/generated
+//     benchmark/bench_matmul.cpp -o build/bench_matmul
 //     build/libvkop.a build/model/libvload.a -lc++
 //
 // Run (x86_64 binary -> the /usr/local Vulkan SDK stack, not /opt/homebrew):
-//   DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib \
-//   VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json \
+//   DYLD_FALLBACK_LIBRARY_PATH=/usr/local/lib
+//   VK_ICD_FILENAMES=/usr/local/etc/vulkan/icd.d/MoltenVK_icd.json
 //   VKOP_NO_COOP=1 ./build/bench_matmul
 //
 // Env: VKOP_NO_COOP=1 on MoltenVK (16x16 coopmat tiles cannot compile to MSL).
