@@ -76,6 +76,24 @@ if(YOLO_USE_GLFW)
     endif()
 endif()
 
+# FreeType for real glyph rendering of COCO labels.
+# -DYOLO_USE_FREETYPE=ON (default)  → requires find_package(Freetype);
+#   if libfreetype-dev is not installed, build fails with a clear message
+#   telling the user either to install it or to pass -DYOLO_USE_FREETYPE=OFF.
+# -DYOLO_USE_FREETYPE=OFF → FreeType is not linked and label drawing is
+#   compiled out; the binary still builds (you get a window without tags).
+option(YOLO_USE_FREETYPE "Render COCO labels with FreeType" ON)
+if(YOLO_USE_FREETYPE)
+    find_package(Freetype REQUIRED
+        "libfreetype not found — install libfreetype-dev (apt), or pass -DYOLO_USE_FREETYPE=OFF
+         to build vkyolo without label rendering (no tags drawn on boxes).")
+    target_link_libraries(vkyolo PRIVATE Freetype::Freetype)
+    message(STATUS "[yolo] FreeType found — real glyph labels enabled")
+else()
+    message(STATUS "[yolo] YOLO_USE_FREETYPE=OFF — label rendering compiled out")
+    target_compile_definitions(vkyolo PRIVATE YOLO_NO_LABELS)
+endif()
+
 # V4L2 needs libv4l2 optionally; plain ioctls work without it.
 target_link_libraries(vkyolo PRIVATE dl)   # for dlsym fallback if needed
 target_link_libraries(vkyolo PRIVATE pthread)

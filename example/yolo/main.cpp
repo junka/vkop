@@ -25,8 +25,11 @@
 #include "vulkan/VulkanCommandPool.hpp"
 #include "include/logger.hpp"
 #include "include/dev_shaders.hpp"
-#include "font8x8.hpp"
 #include "coco_labels.hpp"
+
+#ifndef YOLO_NO_LABELS
+#include "font_freetype.hpp"  // FreeType atlas-based label renderer
+#endif
 #include "core/function.hpp"
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
@@ -78,6 +81,47 @@ extern unsigned int  image_spv_len;
 
 std::atomic<bool> g_running{true};
 static void on_signal(int) { g_running = false; }
+
+// FreeType font singleton — initialized once on first drawLabel call.
+#ifndef YOLO_NO_LABELS
+namespace {
+    yolo_font::FontRenderer g_font;
+    bool g_font_inited = false;
+
+    const char* kFontCandidates[] = {
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/ubuntu/Ubuntu-R.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    };
+
+    // Initialize FreeType. Returns true on success. On failure prints a
+    // comprehensive error listing the paths tried so the user can fix it
+    // (libfreetype-dev missing, or font missing).
+    bool init_font(int pixel_height = 24) {
+        if (g_font_inited) return g_font.valid();
+        for (auto p : kFontCandidates) {
+            if (fs::exists(p)) {
+                if (g_font.init(p, pixel_height)) {
+                    g_font_inited = true;
+                    return true;
+                }
+            }
+        }
+        fprintf(stderr,
+            "[font] ERROR: could not load any usable TTF/OTF font.\n"
+            "  Tried in order:\n");
+        for (auto p : kFontCandidates)
+            fprintf(stderr, "    %s  %s\n", p, fs::exists(p) ? "(load failed)" : "(not present)");
+        fprintf(stderr,
+            "  Install fonts (apt install fonts-noto-core or fonts-dejavu-core),\n"
+            "  or pass -DYOLO_USE_FREETYPE=OFF to build without labels.\n");
+        return false;
+    }
+}
+#endif // !YOLO_NO_LABELS
 
 inline uint64_t now_us() {
     using clock = steady_clock;
@@ -316,25 +360,39 @@ static inline void fillRect(uint8_t* rgba, int W, int H,
 }
 
 // Draw "<class> <conf>" label above a box, with a color-matched background bar.
-// fg color auto-switches for contrast (light bg → black text, dark bg → white).
+// Uses FreeType glyph atlas. Font init failure is fatal — the process exits
+// with a clear error listing all font paths tried, so the user can fix it.
 static void drawLabel(uint8_t* rgba, int W, int H,
                       int bx1, int by1, int bx2, int by2,
                       int class_id, float conf,
                       uint8_t bg_r, uint8_t bg_g, uint8_t bg_b) {
+#ifdef YOLO_NO_LABELS
+    (void)rgba; (void)W; (void)H;
+    (void)bx1; (void)by1; (void)bx2; (void)by2;
+    (void)class_id; (void)conf;
+    (void)bg_r; (void)bg_g; (void)bg_b;
+    return;
+#else
     (void)bx2;
+    if (!init_font()) {
+        std::fprintf(stderr, "[yolo] FATAL: font init failed — see stderr above. Aborting.\n");
+        std::exit(1);
+    }
+
     // Build label string: "<coco name> <conf.XX>"
     char conf_buf[32];
     snprintf(conf_buf, sizeof(conf_buf), " %.2f", (double)conf);
     std::string label = std::string(yolo_coco::label(class_id)) + conf_buf;
 
-    // Scale rule: based on box height; 1 if <32px, clamp 1..3 (glyph 8/16/24px).
+    // Font size rule: box_h → pixel_height 12/20/28/36 px.
     int box_h = std::max(1, by2 - by1);
-    int scale = std::max(1, std::min(3, box_h / 32));
+    int pixel_h = 12 + 8 * std::clamp(box_h / 32, 0, 3);
+    g_font.setPixelHeight(pixel_h);
 
-    // Measure. 1-px padding around background bar.
-    int pad = 1;
-    int tw = yolo_font::textWidth(label, scale);
-    int th = yolo_font::textHeight(scale);
+    // Measure with a dummy 1-pixel buffer (we only need the advance sum).
+    int pad = 2;  // extra so antialiasing bleeds have room
+    int tw = g_font.drawText(nullptr, 0, 0, label, 0, 0, 0, 0, 0);
+    int th = g_font.lineHeight();
     int bar_w = tw + pad * 2;
     int bar_h = th + pad * 2;
 
@@ -347,35 +405,25 @@ static void drawLabel(uint8_t* rgba, int W, int H,
         bar_y1 = by1;
         bar_y2 = bar_y1 + bar_h - 1;
     }
-    // Keep label within image.
     bar_x1 = std::clamp(bar_x1, 0, W-1);
     bar_x2 = std::clamp(bar_x2, 0, W-1);
-    // If wider than image, truncate label.
-    if (bar_x2 - bar_x1 + 1 < bar_w) {
-        int avail = bar_x2 - bar_x1 + 1 - pad * 2;
-        int max_chars = std::max(1, avail / (8 * scale));
-        if ((int)label.size() > max_chars) label = label.substr(0, max_chars);
-        tw = yolo_font::textWidth(label, scale);
-        bar_w = tw + pad * 2;
-    }
 
     // Draw background bar (same color as box border).
     fillRect(rgba, W, H, bar_x1, bar_y1, bar_x1 + bar_w - 1, bar_y2,
              bg_r, bg_g, bg_b);
 
     // Contrast color: bg luminance → black or white text.
-    // ITU-R 601 luma: Y = 0.299*R + 0.587*G + 0.114*B
     float luma = 0.299f * bg_r + 0.587f * bg_g + 0.114f * bg_b;
     uint8_t tr = (luma > 140.0f) ? 0   : 255;
     uint8_t tg = (luma > 140.0f) ? 0   : 255;
     uint8_t tb = (luma > 140.0f) ? 0   : 255;
 
-    // Draw text glyph by glyph.
-    int tx = bar_x1 + pad;
-    int ty = bar_y1 + pad;
-    for (char ch : label) {
-        tx += yolo_font::drawGlyph(rgba, W, H, ch, tx, ty, scale, tr, tg, tb);
-    }
+    // FreeType draws relative to baseline. baseline_y sits at bar_y1 + pad + ascent.
+    // The exact ascent metric is 0.75 * lineHeight which matches typical fonts.
+    int ascent = (int)(g_font.lineHeight() * 0.75);
+    int baseline_y = bar_y1 + pad + ascent;
+    g_font.drawText(rgba, W, H, label, bar_x1 + pad, baseline_y, tr, tg, tb);
+#endif
 }
 
 // =========================================================================
