@@ -1,0 +1,15 @@
+#version 450
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer Src { uvec4 data[]; } src;
+layout(std430, binding = 1) buffer Dst { uint sums[]; } dst;
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * 256u;
+    uint acc = 0u;
+    for (uint i = gl_GlobalInvocationID.x; i < pc.n; i += stride) {
+        uvec4 v = src.data[i];
+        acc += v.x + v.y + v.z + v.w;
+    }
+    dst.sums[gl_GlobalInvocationID.x] = acc;
+}
