@@ -122,7 +122,17 @@ options:
 ```
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
-支持将postproc 手动注册到gpu 处理，比如softmax，topk减少CPU与GPU间的内存吞吐
+支持将postproc 手动注册到gpu 处理，比如softmax，topk减少CPU与GPU间的内存吞吐。
+注册的后处理算子不在图节点里，转换器的 archive 裁剪（按图 op 普查）不会带上
+它们的 kernel，需要在转换时用 `--extra-shaders` 显式声明（逗号分隔，ONNX 拼写），
+否则 LoadModel 建 pipeline 时 archive 缺 key 直接失败：
+
+```bash
+# LLM 驱动的 GPU argmax（RegisterPostProcess TopK k=1）
+python3 -m onnx2vkop.cli -i llm.onnx -q int8 --extra-shaders TopK
+# resnet 式分类器（softmax + topk 都手动注册时）
+python3 -m onnx2vkop.cli -i resnet18.onnx --extra-shaders Softmax,TopK
+```
 
 #### 5. LLM 推理（llm/exporter/driver/llm_chat.cpp）
 
@@ -320,7 +330,7 @@ options:
 ```bash
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
-Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU.
+Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU. Registered post-process ops are not graph nodes, so the converter's archive pruning (per-graph op census) will not carry their kernels — declare them explicitly at convert time with `--extra-shaders` (comma-separated, ONNX spelling), e.g. `--extra-shaders TopK` for the LLM driver's GPU argmax, `--extra-shaders Softmax,TopK` for resnet-style classifiers. An archive missing the key fails hard at pipeline creation during LoadModel.
 
 #### 6. LLM inference (llm/exporter/driver/llm_chat.cpp)
 

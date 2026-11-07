@@ -15,6 +15,28 @@ class VulkanBuffer : public VulkanResource {
                  VkBufferUsageFlags usage, VkMemoryPropertyFlags properties,
                  int ext_fd = -1);
 
+    // Host-import ctor (VK_EXT_external_memory_host): bind this buffer to
+    // host memory the CALLER owns — `host_ptr` must be aligned to
+    // VulkanDevice::host_import_alignment() (minImportedHostPointerAlignment,
+    // 4096 on MoltenVK) and `host_size` bytes long. No device allocation
+    // happens: vkAllocateMemory imports the host pointer
+    // (HOST_ALLOCATION handle type), so a shader reading the SSBO reads the
+    // host bytes directly. The CPU keeps writing the same mapping per step
+    // (HOST_VISIBLE|HOST_COHERENT type is required by the import memory-type
+    // scan), so per-round inputs never traverse a staging submit.
+    //
+    // The import path bypasses VMA (VMA cannot import foreign memory) and
+    // the regular m_buffer_/m_memory_ pair: ext_buffer_/ext_memory_ below
+    // exist in BOTH builds for it, and host_imported_ selects which pair
+    // every getter and the destructor read. vkFreeMemory releases the
+    // VkDeviceMemory wrapper — it never frees the host block itself, which
+    // stays with the caller.
+    //
+    // Throws on: import not enabled, no suitable memory type, or
+    // vkAllocateMemory/vkBindBufferMemory failure (e.g. misaligned pointer).
+    VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev, VkDeviceSize size,
+                 VkBufferUsageFlags usage, void *host_ptr, size_t host_size);
+
     // Borrowed sub-range ctor: this object OWNS NOTHING — it shares `parent`'s
     // VkBuffer and exposes only the byte window [offset, offset+range). The
     // descriptor it produces is bound at that offset (VkDescriptorBufferInfo
@@ -37,6 +59,9 @@ class VulkanBuffer : public VulkanResource {
     // True for a borrowed sub-range view (see the ctor above). Not the owner of
     // the VkBuffer; never map/free it.
     bool is_view_range() const { return parent_ != nullptr; }
+    // True for a host-imported buffer (host-import ctor): m_buffer_/m_memory_
+    // (and the VMA slot) are unused; ext_buffer_/ext_memory_ carry the buffer.
+    bool is_host_imported() const { return host_imported_; }
     std::shared_ptr<VulkanBuffer> parent() const { return parent_; }
     // Byte offset of this view's window within its immediate parent (the
     // parent-relative offset). Forwarding the byte movers adds this up the
@@ -165,6 +190,13 @@ class VulkanBuffer : public VulkanResource {
     void *getMappedMemory() {
         if (parent_)
             return parent_->getMappedMemory();
+        if (host_imported_) {
+            if (!ext_map_) {
+                vkMapMemory(m_vdev_->getLogicalDevice(), ext_memory_, 0,
+                            m_size_, 0, &ext_map_);
+            }
+            return ext_map_;
+        }
 #ifdef USE_VMA
         return VMA::getMappedMemory(&m_vma_buffer_);
 
@@ -191,6 +223,11 @@ class VulkanBuffer : public VulkanResource {
             parent_->unmapMemory();
             return;
         }
+        // Imported buffers stay mapped for their lifetime: getMappedMemory()
+        // caches ext_map_, so an unmap here would leave it dangling.
+        if (host_imported_) {
+            return;
+        }
         // VMA_ALLOCATION_CREATE_MAPPED_BIT already keeps the memory mapped, so
         // we don't need to unmap it.
 #ifndef USE_VMA
@@ -215,6 +252,13 @@ class VulkanBuffer : public VulkanResource {
     // Borrowed sub-range state (null parent_ = this object owns its VkBuffer).
     std::shared_ptr<VulkanBuffer> parent_;
     VkDeviceSize range_offset_ = 0;
+
+    // Host-import state (host-import ctor). Present in BOTH builds because
+    // the import path bypasses VMA as well as the raw allocation pair.
+    bool host_imported_ = false;
+    VkBuffer ext_buffer_ = VK_NULL_HANDLE;
+    VkDeviceMemory ext_memory_ = VK_NULL_HANDLE;
+    void *ext_map_ = nullptr;
 
     VkDescriptorBufferInfo buffer_info_;
 

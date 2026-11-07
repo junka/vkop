@@ -435,6 +435,16 @@ EnableResult VulkanDevice::buildFeatureEnableChain(
         result.enabledExtensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     }
 #endif
+#ifdef VK_EXT_external_memory_host
+    // No feature struct either — just the properties struct we query
+    // separately in createLogicalDevice for the alignment. Enabled so
+    // VulkanBuffer's host-import ctor is legal on this device.
+    if (supportedExtensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) >
+        0) {
+        result.enabledExtensions.push_back(
+            VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME);
+    }
+#endif
     return result;
 }
 
@@ -1664,6 +1674,24 @@ bool VulkanDevice::createLogicalDevice(
              (m_support_host_image_copy_ ? "is" : "not"));
     LOG_INFO("update after bind %s supported",
              (m_support_descriptor_update_after_bind_ ? "is" : "not"));
+#ifdef VK_EXT_external_memory_host
+    if (supported_extensions.count(VK_EXT_EXTERNAL_MEMORY_HOST_EXTENSION_NAME) >
+        0) {
+        m_support_host_import_ = true;
+        VkPhysicalDeviceExternalMemoryHostPropertiesEXT host_props = {};
+        host_props.sType =
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT;
+        VkPhysicalDeviceProperties2 props2 = {};
+        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        props2.pNext = &host_props;
+        vkGetPhysicalDeviceProperties2(physicalDevice_, &props2);
+        if (host_props.minImportedHostPointerAlignment > 0) {
+            m_host_import_alignment_ =
+                host_props.minImportedHostPointerAlignment;
+        }
+        LOG_INFO("host import alignment %u", m_host_import_alignment_);
+    }
+#endif
 
     std::vector<std::vector<float>> queue_priority(computeQueueIdxs_.size());
     auto queue_create_info = setupQueueCreateInfo(queue_priority);

@@ -202,6 +202,10 @@ list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_inwg\\.comp$")
 # scatter_tile helpers, and a three-way main() split. Generic loop exclusion
 # lets sklast variants compile with -DSK_LASTBLOCK (and optionally -DENABLE_HALF2_EPI).
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_sklast\\.comp$")
+# argmax_f16.comp is a driver-owned kernel: llm_chat compiles and embeds it
+# itself (glslc + xxd -i, see the llm_chat target below). It backs no engine
+# op, so the generic loop must not claim it into vkop_shaders.bin.
+list(FILTER SHADER_FILES EXCLUDE REGEX "/argmax_f16\\.comp$")
 
 # glslc resolves #include but cmake does not track it, so editing a shared
 # header would silently rebuild nothing. Track them explicitly.
@@ -792,6 +796,12 @@ if (ENABLE_LLM_CHAT)
     target_link_libraries(llm_chat PRIVATE vkop vload tokenizer)
     target_include_directories(llm_chat PRIVATE
         ${CMAKE_SOURCE_DIR}/llm/tokenizer)
+    # GPU argmax rides the engine: llm_chat registers a TopK(k=1) post-process
+    # op over the logits output (Runtime::RegisterPostProcess), so the kernel
+    # ships in the model's own archive (onnx2vkop --extra-shaders TopK) and
+    # there is nothing to embed in the driver. The reference two-stage reduce
+    # shader stays at shaders/buffer/argmax_f16.comp, excluded from the engine
+    # archive glob — resurrect it only if TopK k=1 ever loses to it.
     find_package(Threads REQUIRED)
     target_link_libraries(llm_chat PRIVATE Threads::Threads)
     # Ensure utf8proc is linked (tokenizer's PUBLIC dependency may not propagate in some configs).

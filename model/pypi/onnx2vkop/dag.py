@@ -211,6 +211,14 @@ class DAGBasedModel:
         self.inputs: List[Dict] = []
         self.outputs: List[Dict] = []
         self.initializers: Dict[str, Any] = {}
+        # Op types with no node in this graph whose kernels still belong in
+        # the embedded archive and kernel_plans (--extra-shaders): the driver
+        # registers them post-hoc via Runtime::RegisterPostProcess, which
+        # builds the op at run time and looks its SPIR-V up by the same
+        # archive key the graph census would have produced. Without the extra
+        # census entries the post-op misses at pipeline creation -- libvkop
+        # carries no built-in SPIR-V to fall back on.
+        self.extra_shader_ops: List[str] = []
         # Unified-tensor / RGBA sub-allocation metadata. Populated by the
         # optimizer when --unify / --rgba are wired (Phase 3b/3c); the writer
         # emits them as first-class FlatBuffers tables/structs so the C++
@@ -1051,7 +1059,7 @@ class DAGBasedModel:
         # decision instead of two. Rows are emitted in first-appearance order
         # so reconverting an unchanged graph yields an identical table.
         plan_rows, plan_index = shader_map.kernel_plans_for_model(
-            [n.op_type for n in self.nodes.values()])
+            [n.op_type for n in self.nodes.values()] + self.extra_shader_ops)
         plan_offs = []
         for row in plan_rows:
             op_type_off = builder.CreateString(row["op_type"])

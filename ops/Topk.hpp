@@ -98,6 +98,23 @@ class Topk : public Operator {
 
         auto inshape = inputs[0]->getShape();
         int rank = inputs[0]->num_dims();
+        // RegisterPostProcess callers hand the op a rank-N tensor whose
+        // semantic axis is the last one (the LLM's terminal (1, q, vocab)
+        // logits). Flatten the leading dims into rows so the rank-2 kernel
+        // contract holds; reshape_view preserves the element count, and a
+        // terminal output has no other consumer that would observe the
+        // flattened view.
+        if (rank > 2) {
+            int64_t rows = 1;
+            for (int i = 0; i < rank - 1; ++i) {
+                rows *= inshape[i];
+            }
+            std::vector<int> flat = {static_cast<int>(rows),
+                                     inshape[rank - 1]};
+            inputs[0]->reshape_view(flat);
+            inshape = inputs[0]->getShape();
+            rank = inputs[0]->num_dims();
+        }
         int axis = para_.axis < 0 ? para_.axis + rank : para_.axis;
         // The indices output is written as int32 (tempindex*_ are
         // core::Tensor<int>) and the runtime's output-dtype inference has no

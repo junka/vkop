@@ -200,6 +200,12 @@ class VulkanDevice {
             std::getenv("VKOP_NO_HOST_IMAGE_COPY") != nullptr;
         return m_support_host_image_copy_ && !disabled;
     }
+    // Host-pointer import (VK_EXT_external_memory_host) enabled at device
+    // creation. Buffer ctor imports caller-provided aligned host memory as
+    // device memory; see VulkanBuffer's host-import ctor and
+    // Tensor::as_host_imported_buffer.
+    bool is_support_host_import() const { return m_support_host_import_; }
+    uint32_t host_import_alignment() const { return m_host_import_alignment_; }
     // UMA: a memory type that is both HOST_VISIBLE and DEVICE_LOCAL. iGPU
     // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick
     // routing thresholds measured on the matching device class.
@@ -323,6 +329,11 @@ class VulkanDevice {
 
     bool m_support_host_image_copy_ = false;
     bool m_is_unified_memory_ = false;
+    // VK_EXT_external_memory_host: host-pointer import supported (extension
+    // enabled). alignment = minImportedHostPointerAlignment (4096 on
+    // MoltenVK); imported host blocks must start at a multiple of it.
+    bool m_support_host_import_ = false;
+    uint32_t m_host_import_alignment_ = 4096;
     bool m_support_buffer_device_address_ = false;
     bool m_support_timeline_semaphore_ = false;
     bool m_support_cuda_kernel_launch_ = false;

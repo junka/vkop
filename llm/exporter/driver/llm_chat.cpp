@@ -81,6 +81,11 @@ struct PerfMetrics {
     int decode_steps = 0;
     double total_decode_ms = 0;
     std::vector<double> per_token_ms;  // per-step latency for percentile calc
+    // Per-step WALL time (fill + upload + Run + argmax), not just rt->Run():
+    // P0/P1 host-side wins live outside Run(), so run_ms alone is blind to
+    // them.
+    double total_decode_wall_ms = 0;
+    std::vector<double> per_token_wall_ms;
 
     // Session-wide accumulators
     int total_prompt_tokens = 0;
@@ -287,12 +292,129 @@ void fill_i32_input(const std::shared_ptr<Runtime>& rt,
 
 // Upload whatever dtype input to GPU.
 void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
-                  const std::shared_ptr<ITensor>& t) {
-    if (t->dtype() == typeid(int64_t)) as_tensor<int64_t>(t)->copyToGPU(cmdpool);
-    else if (t->dtype() == typeid(int)) as_tensor<int>(t)->copyToGPU(cmdpool);
-    else if (t->dtype() == typeid(int8_t)) as_tensor<int8_t>(t)->copyToGPU(cmdpool);
-    else if (t->dtype() == typeid(float)) as_tensor<float>(t)->copyToGPU(cmdpool);
-    else as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
+                  const std::shared_ptr<ITensor>& t,
+                  const std::shared_ptr<vkop::VulkanCommandBuffer>& batch = nullptr) {
+    if (t->dtype() == typeid(int64_t)) as_tensor<int64_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
+    else if (t->dtype() == typeid(int)) as_tensor<int>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
+    else if (t->dtype() == typeid(int8_t)) as_tensor<int8_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
+    else if (t->dtype() == typeid(float)) as_tensor<float>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
+    else as_tensor<uint16_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
+}
+
+// P1 收益组件计时（VKOP_P1_TIMER=1）。端到端 wall 在本机热噪（±15%）下
+// 分辨不出 ~1ms 的收益，改为直接量被 P1 消掉的三块工作：CPU argmax
+// （logits readback + 扫描）、GPU argmax（dispatch + wait + winners 读）、
+// decode 上传 batch（record + submit + wait）。
+static bool p1_timer_on() {
+    static const bool on = [] {
+        const char *e = std::getenv("VKOP_P1_TIMER");
+        return e && e[0] == '1';
+    }();
+    return on;
+}
+
+// ---- P1-4: decode-step inputs as host-imported SSBOs ----
+// Install host-imported storage on the five per-step decode inputs, sized to
+// their DECODE shapes. After this the CPU writes per-step values straight
+// into device-visible host memory (zero staging submits); the zero-valued
+// inputs (attention_bias, deepstack, image_pad_mask) are memset once here —
+// only their logical SHAPE moves per step.
+//
+// Per decode round, not per session: the next prefill ResizeInput's these
+// tensors to larger shapes, which (per Tensor::as_host_imported_buffer)
+// drops the import and reverts to the normal device-local + copyToGPU path.
+// VKOP_DECODE_ZEROCOPY=0 disables; any import failure returns false and the
+// driver keeps the batched-upload path.
+bool install_decode_host_imports(
+    const std::shared_ptr<Runtime> &rt, std::shared_ptr<vkop::VulkanDevice> vd,
+    const ModelArch &arch, const std::vector<uint32_t> &ds_shape, int max_kv) {
+    if (const char *env = std::getenv("VKOP_DECODE_ZEROCOPY");
+        env && std::strcmp(env, "0") == 0) return false;
+    if (!vd->is_support_host_import()) {
+        static bool reported = false;
+        if (!reported) {
+            reported = true;
+            std::printf("[p1] host import unavailable, decode keeps batched "
+                        "uploads\n");
+        }
+        return false;
+    }
+    // Bisection knobs (temporary): VKOP_ZC_ONLY=a,b installs imports on only
+    // those inputs; VKOP_ZC_UPLOAD=1 keeps the normal upload running on top
+    // (allocation-only test — the upload overwrites the mapping's bytes).
+    const char *only_env = std::getenv("VKOP_ZC_ONLY");
+    std::string only = only_env ? only_env : "";
+    auto want = [&](const char *name) {
+        return only.empty() || only.find(name) != std::string::npos;
+    };
+    static bool reported_ok = false;
+    auto report_ok = [&] {
+        if (!reported_ok) {
+            reported_ok = true;
+            std::printf("[p1] decode inputs host-imported: per-step upload "
+                        "submits eliminated\n");
+        }
+    };
+    auto zero_import = [&](const std::string &name, std::size_t max_elems) {
+        auto t = rt->GetInput(name);
+        if (!t || t->dtype() != typeid(uint16_t)) return;
+        auto g = as_tensor<uint16_t>(t);
+        g->as_host_imported_buffer(vd, max_elems);
+        std::memset(g->host_import_ptr(), 0, g->host_import_bytes());
+    };
+    try {
+        if (want("inputs_embeds"))
+            zero_import("inputs_embeds", static_cast<std::size_t>(arch.hidden));
+        if (want("attention_bias"))
+            zero_import("attention_bias", static_cast<std::size_t>(max_kv));
+        if (arch.has_deepstack && want("deepstack")) {
+            std::size_t ne = 1;
+            for (auto d : ds_shape) ne *= d;
+            for (int d = 0; d < 3; ++d)
+                zero_import("deepstack_embeds_" + std::to_string(d), ne);
+        }
+        if (arch.has_image_pad_mask) {
+            auto t = rt->GetInput("image_pad_mask");
+            if (t && t->dtype() == typeid(int8_t))
+                as_tensor<int8_t>(t)->as_host_imported_buffer(vd, 1);
+        }
+        if (want("position_ids")) {
+            auto pid = rt->GetInput("position_ids");
+            if (pid && pid->dtype() == typeid(int64_t))
+                as_tensor<int64_t>(pid)->as_host_imported_buffer(vd, 3);
+        }
+        report_ok();
+        return true;
+    } catch (const std::exception &) {
+        return false;
+    }
+}
+
+// ---- GPU argmax: Runtime::RegisterPostProcess(TopK, k=1) ----
+// 把 argmax 交给引擎的 Topk 算子，作为图末尾注册的后处理：bitonic 多 pass
+// 全部 record 进 Run 自己的 command buffer（submit_per_ds），每步因此**不新增
+// submit**，且 VKOP_SEGMENT_REPLAY 录段时自然把它折进去。要求模型 archive
+// 携带 TopK kernel（onnx2vkop --extra-shaders TopK 重转；图里没有该节点时
+// census 不会自动带上）。注册发生在 LoadModel 之后、任何 Run 之前：prefill/
+// decode 的 logits 行数变化由 Topk 自行 resize 输出消化，注册时定格的输入
+// 形状则被 reshape_view 的元素数守卫拒绝（live 形状始终作准）。
+// VKOP_GPU_ARGMAX=0 不注册，argmax_last_token 落回 CPU 扫描（对照臂）。
+static bool register_gpu_argmax(const std::shared_ptr<Runtime>& rt) {
+    if (const char *env = std::getenv("VKOP_GPU_ARGMAX");
+        env && env[0] == '0') {
+        return false;
+    }
+    auto logits = rt->GetOutput("logits");
+    if (!logits) {
+        return false;
+    }
+    auto tk_values = std::make_shared<vkop::core::Tensor<uint16_t>>();
+    auto tk_indexs = std::make_shared<vkop::core::Tensor<int>>();
+    rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "1"}},
+                            {logits}, {tk_values, tk_indexs});
+    std::printf("[p1] argmax = RegisterPostProcess(TopK k=1); "
+                "VKOP_GPU_ARGMAX=0 falls back to CPU scan\n");
+    return true;
 }
 
 // Argmax over the last-position logits: logits is (1, q, vocab) fp16, take
@@ -305,6 +427,20 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
     auto logits = rt->GetOutput("logits");
     if (!logits) throw std::runtime_error("no 'logits' output");
     auto lg = as_tensor<uint16_t>(logits);
+    // GPU 路径：post-op TopK 的 indices 输出（本轮 Run 末尾已算好，Q 行各
+    // 一个 top-1 索引），读回取最后一行。indexs ≤ q*4B，prefill 也不过 ~100B。
+    if (auto idx_out = rt->GetOutput("post_TopK1")) {
+        auto tg0 = std::chrono::steady_clock::now();
+        auto ti = as_tensor<int>(idx_out);
+        ti->copyToCPU(cmdpool);
+        int best = ti->at(static_cast<int>(ti->num_elements()) - 1);
+        if (p1_timer_on())
+            std::printf("[p1t] argmax_gpu %.3fms\n",
+                        std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - tg0).count());
+        return best;
+    }
+    auto tc0 = std::chrono::steady_clock::now();
     lg->copyToCPU(cmdpool);
     const uint16_t* p = reinterpret_cast<const uint16_t*>(lg->data().data());
     // logits shape (1, q, vocab): the converter records it; num_elements =
@@ -327,6 +463,10 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         float v = fp16_to_f32(row[i]);
         if (v > bestv) { bestv = v; best = i; }
     }
+    if (p1_timer_on())
+        std::printf("[p1t] argmax_cpu %.3fms\n",
+                    std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - tc0).count());
     if (const char* dbg = std::getenv("VKOP_CHATDBG"); dbg && dbg[0] == '1') {
         // top5 for sanity vs ORT.
         std::vector<std::pair<float,int>> tp;
@@ -602,6 +742,8 @@ int main(int argc, char** argv) {
     rt->set_backend_buffer(true);
     std::printf("=== LoadModel ===\n");
     rt->LoadModel();
+    // GPU argmax：图末尾注册 TopK k=1 后处理（VKOP_GPU_ARGMAX=0 跳过）。
+    register_gpu_argmax(rt);
     std::printf("=== LoadModel done ===\n");
 
     // 从 runtime inputs 动态推断架构参数（纯文本 vs 多模态 自动识别）。
@@ -1286,8 +1428,14 @@ int main(int argc, char** argv) {
         }
         int dec_base = kv_base;   // 本轮 decode 期间逻辑行 0 的绝对位置
 
+        // ---- P1-4: install host-imported decode inputs for this round ----
+        // (each round reinstalls; the next prefill's larger shapes drop the
+        // imports and revert to the batched-upload path automatically)
+        bool zerocopy = install_decode_host_imports(rt, dev, arch, ds_shape, max_kv);
+
         // ---- Decode loop (q_len = 1) ----
         for (int step = 1; step < max_new; ++step) {
+            auto t_wall = std::chrono::steady_clock::now();
             if (conv.isStop(static_cast<uint32_t>(next_id))) {
                 std::printf("[done] 本轮结束\n");
                 break;
@@ -1298,8 +1446,28 @@ int main(int argc, char** argv) {
                                         vocab, arch.hidden);
             // 这个 token 马上要被模型吃进 KV，记下来（下一轮判断能否复用前缀）。
             consumed_gen.push_back(static_cast<uint32_t>(next_id));
-            fill_fp16_input(rt, "inputs_embeds", {1u, 1u, static_cast<uint32_t>(arch.hidden)},
-                          cur_emb.data());
+            // P1-4 dual path: an input whose storage is host-imported gets
+            // resize+memcpy (no upload); everything else takes the original
+            // fill+batch-upload path. VKOP_ZC_UPLOAD=1 (bisection) uploads on
+            // top of the imports too: the staging copy overwrites the
+            // mapping's bytes, isolating buffer-binding bugs from content
+            // bugs.
+            const bool upload_too =
+                zerocopy && std::getenv("VKOP_ZC_UPLOAD") != nullptr;
+            bool ie_imp = false, pid_imp = false, ab_imp = false;
+            bool ds_imp[3] = {false, false, false}, pm_imp = false;
+            {
+                rt->ResizeInput(
+                    "inputs_embeds",
+                    {1u, 1u, static_cast<uint32_t>(arch.hidden)});
+                auto ie = as_tensor<uint16_t>(rt->GetInput("inputs_embeds"));
+                ie_imp = ie->is_host_imported();
+                if (ie_imp)
+                    std::memcpy(ie->host_import_ptr(), cur_emb.data(),
+                                cur_emb.size() * sizeof(uint16_t));
+                else
+                    ie->fillToCPU(cur_emb.data());
+            }
 
             // 环：新的一行要进去，就得先给最旧的一行腾槽。丢的是 cache 第 0
             // 行（kv_base 那一行），头上那一格挪一格、行数减一，绝对位置前移
@@ -1323,40 +1491,104 @@ int main(int argc, char** argv) {
                 int64_t p = static_cast<int64_t>(dec_base + past_len) + rope_delta;
                 if (arch.position_ids_dims == 3) {
                     int64_t pos[3] = {p, p, p};
-                    fill_i64_input(rt, "position_ids", {3u, 1u, 1u}, pos);
+                    rt->ResizeInput("position_ids", {3u, 1u, 1u});
+                    auto t = as_tensor<int64_t>(rt->GetInput("position_ids"));
+                    pid_imp = t->is_host_imported();
+                    // position_ids 还被 Gather 当索引走 has_cpu_data() 的 CPU
+                    // 快路径（ops/Gather.hpp readHostIndices 读的是 data_ 而非
+                    // 绑定的 buffer），所以映射写完还得同步 data_，缺一不可。
+                    if (pid_imp) {
+                        std::memcpy(t->host_import_ptr(), pos, sizeof(pos));
+                        t->fillToCPU(pos);
+                    } else
+                        t->fillToCPU(pos);
                 } else {
-                    fill_i64_input(rt, "position_ids", {1u, 1u}, &p);
+                    rt->ResizeInput("position_ids", {1u, 1u});
+                    auto t = as_tensor<int64_t>(rt->GetInput("position_ids"));
+                    pid_imp = t->is_host_imported();
+                    if (pid_imp) {
+                        std::memcpy(t->host_import_ptr(), &p, sizeof(p));
+                        t->fillToCPU(&p);
+                    } else
+                        t->fillToCPU(&p);
                 }
             }
-            // attention_bias (1, 1, 1, past_len+1) all zero (full history).
+            // attention_bias (1, 1, 1, past_len+1) all zero (full history):
+            // imported storage was zero-filled to capacity at install — only
+            // the shape moves.
             {
-                std::vector<uint16_t> ab(static_cast<size_t>(past_len + 1), 0);
-                fill_fp16_input(rt, "attention_bias", {1u, 1u, 1u,
-                              static_cast<uint32_t>(past_len + 1)}, ab.data());
+                auto ab = as_tensor<uint16_t>(rt->GetInput("attention_bias"));
+                rt->ResizeInput("attention_bias", {1u, 1u, 1u,
+                                static_cast<uint32_t>(past_len + 1)});
+                ab_imp = ab->is_host_imported();
+                if (!ab_imp) {
+                    std::vector<uint16_t> zeros(static_cast<size_t>(past_len + 1), 0);
+                    ab->fillToCPU(zeros.data());
+                }
             }
             // deepstack zeros / image_pad_mask false（仅模型有这些输入时才写）。
             if (arch.has_deepstack) {
-                for (int d = 0; d < 3; ++d)
-                    fill_fp16_input(rt, "deepstack_embeds_" + std::to_string(d),
-                                    ds_shape, ds_zero.data());
+                for (int d = 0; d < 3; ++d) {
+                    auto t = as_tensor<uint16_t>(
+                        rt->GetInput("deepstack_embeds_" + std::to_string(d)));
+                    rt->ResizeInput("deepstack_embeds_" + std::to_string(d),
+                                    ds_shape);
+                    ds_imp[d] = t->is_host_imported();
+                    if (!ds_imp[d]) t->fillToCPU(ds_zero.data());
+                }
             }
             if (arch.has_image_pad_mask) {
-                std::vector<int8_t> mask(1, 0);
                 rt->ResizeInput("image_pad_mask", {1u, 1u});
-                auto t = rt->GetInput("image_pad_mask");
-                as_tensor<int8_t>(t)->fillToCPU(mask.data());
+                auto t = as_tensor<int8_t>(rt->GetInput("image_pad_mask"));
+                pm_imp = t->is_host_imported();
+                if (!pm_imp) {
+                    int8_t zero = 0;
+                    t->fillToCPU(&zero);
+                }
             }
 
-            // Upload.
-            upload_input(cmdpool, rt->GetInput("inputs_embeds"));
-            upload_input(cmdpool, rt->GetInput("position_ids"));
-            upload_input(cmdpool, rt->GetInput("attention_bias"));
-            if (arch.has_deepstack) {
-                for (int d = 0; d < 3; ++d)
-                    upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)));
-            }
+            // Upload. 一次 submit 打包全部输入：copyToGPUBuffer 独立 submit+wait
+            // 时每条在 MoltenVK 上各付 ~0.5ms 固定开销。batch 模式只 record，
+            // 由这里统一 end/submit/wait，再复位 staging 池（同 runtime 的
+            // batch_flush 约定）。host-imported 的输入不进 batch（零拷贝）；
+            // upload_too 时全部上传（覆盖映射字节，分配隔离用）。
+            // pm_imp/ds_imp 只在对应输入存在时才有意义：文本模型没有
+            // image_pad_mask/deepstack，pm_imp 恒为 false，若无条件把它并进
+            // 判据就会每步都提交一个空 batch，正好把零拷贝省下的那笔 submit
+            // 又送回去。
+            bool need_upload =
+                !ie_imp || !pid_imp || !ab_imp;
+            if (arch.has_deepstack)
+                need_upload = need_upload ||
+                    (!ds_imp[0] || !ds_imp[1] || !ds_imp[2]);
             if (arch.has_image_pad_mask)
-                upload_input(cmdpool, rt->GetInput("image_pad_mask"));
+                need_upload = need_upload || !pm_imp;
+            if (upload_too || need_upload) {
+                auto tu0 = std::chrono::steady_clock::now();
+                auto batch = std::make_shared<vkop::VulkanCommandBuffer>(cmdpool);
+                batch->begin();
+                if (upload_too || !ie_imp)
+                    upload_input(cmdpool, rt->GetInput("inputs_embeds"), batch);
+                if (upload_too || !pid_imp)
+                    upload_input(cmdpool, rt->GetInput("position_ids"), batch);
+                if (upload_too || !ab_imp)
+                    upload_input(cmdpool, rt->GetInput("attention_bias"), batch);
+                if (arch.has_deepstack) {
+                    for (int d = 0; d < 3; ++d)
+                        if (upload_too || !ds_imp[d])
+                            upload_input(cmdpool, rt->GetInput("deepstack_embeds_" + std::to_string(d)), batch);
+                }
+                if (arch.has_image_pad_mask && (upload_too || !pm_imp))
+                    upload_input(cmdpool, rt->GetInput("image_pad_mask"), batch);
+                batch->end();
+                batch->submit(cmdpool->getVulkanDevice()->getComputeQueue());
+                batch->wait();
+                cmdpool->getStagingBufferPool()->reset();
+                if (p1_timer_on())
+                    std::printf("[p1t] upload %.3fms\n",
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - tu0).count());
+            }
 
             auto t0 = std::chrono::steady_clock::now();
             ms = rt->Run();
@@ -1364,13 +1596,17 @@ int main(int argc, char** argv) {
             next_id = argmax_last_token(rt, cmdpool, vocab);
             out_ids.push_back(static_cast<uint32_t>(next_id));
             double run_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double wall_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t_wall).count();
             if (profile_mode) {
                 session_metrics.decode_steps++;
                 session_metrics.total_decode_ms += run_ms;
                 session_metrics.per_token_ms.push_back(run_ms);
+                session_metrics.total_decode_wall_ms += wall_ms;
+                session_metrics.per_token_wall_ms.push_back(wall_ms);
             }
-            std::printf("[r%d] %.1fms  past_len=%d pos=%lld%s  → %d  %s\n", step,
-                        run_ms, past_len,
+            std::printf("[r%d] %.1fms (wall %.1f)  past_len=%d pos=%lld%s  → %d  %s\n",
+                        step, run_ms, wall_ms, past_len,
                         (long long)(dec_base + past_len + rope_delta),
                         ring ? " ring" : "",
                         next_id,
@@ -1405,6 +1641,16 @@ int main(int argc, char** argv) {
             std::printf("  decode:  %d tokens in %.1fms (%.1f tok/s, avg %.1fms/token)\n",
                         session_metrics.decode_steps, session_metrics.total_decode_ms,
                         session_metrics.decode_tok_per_sec(), session_metrics.avg_decode_ms());
+            std::printf("  decode wall: %d tokens in %.1fms (%.1f tok/s, avg %.1fms/token)\n",
+                        session_metrics.decode_steps, session_metrics.total_decode_wall_ms,
+                        session_metrics.decode_steps > 0
+                            ? session_metrics.decode_steps /
+                                  (session_metrics.total_decode_wall_ms / 1000.0)
+                            : 0.0,
+                        session_metrics.decode_steps > 0
+                            ? session_metrics.total_decode_wall_ms /
+                                  session_metrics.decode_steps
+                            : 0.0);
             std::printf("  kv cache: %d/%d (%.1f%%)\n",
                         static_cast<int>(ids.size()) + session_metrics.decode_steps,
                         max_kv,

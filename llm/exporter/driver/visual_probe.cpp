@@ -245,10 +245,20 @@ int main(int argc, char** argv) {
     tg->copyToGPU(cmdpool);
     std::printf("[pv] uploaded (pixel_values + grid_thw)\n");
 
-    // Run.
-    double ms = rt->Run();
+    // Run. VKOP_PROBE_REPS>1 repeats Run() in-process so the reported times are
+    // warm (the first dispatch pays pipeline creation, which would otherwise
+    // dominate a one-shot probe).
+    int reps = 1;
+    if (const char* r = std::getenv("VKOP_PROBE_REPS")) {
+        int v = std::atoi(r);
+        if (v >= 1) reps = v;
+    }
+    double ms = 0;
+    for (int i = 0; i < reps; ++i) {
+        ms = rt->Run();
+        std::printf("[run %d/%d] %.1fms\n", i + 1, reps, ms);
+    }
     rt->ReadResult();
-    std::printf("[run] %.1fms\n", ms);
 
     // Optional named-intermediate dump (VKOP_DUMP_TENSORS='*' or 'name1,name2').
     // Mirrors llm_chat's dump for topo diff vs ORT (/tmp/ort_visual_all.txt).

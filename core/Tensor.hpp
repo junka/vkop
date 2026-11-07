@@ -1088,6 +1088,75 @@ template <typename T> class Tensor : public ITensor {
         prealloc_keep_ = true;
     }
 
+    // Host-imported SSBO (VK_EXT_external_memory_host): allocate an aligned
+    // host block, bind it as this tensor's storage buffer, and return the
+    // buffer. The caller then writes per-step values straight into
+    // host_import_ptr() — the shaders read those bytes directly, with no
+    // staging buffer and no upload submit.
+    //
+    // `n_elements` is the CAPACITY (e.g. max_kv_len for a bias that grows one
+    // element per decode step): the buffer is created at that size and
+    // prealloc_keep_ is set, so later ResizeInput calls to smaller-or-equal
+    // shapes keep this buffer (make_vkbuff's >= path) instead of silently
+    // replacing it with a device-local one. A LARGER shape (the next round's
+    // prefill) drops it and reverts to the normal device-local allocation +
+    // copyToGPU path, so the caller re-installs per decode round.
+    //
+    // Sets converted_ = true (the mapping IS the device data — the tensor
+    // starts "on-GPU" and copyToGPU must never run on it afterwards; resize()
+    // through ResizeInput only re-marks converted_=false, which nothing reads
+    // because the driver no longer uploads this tensor).
+    //
+    // Throws when the device lacks VK_EXT_external_memory_host or the import
+    // fails; callers should gate on VulkanDevice::is_support_host_import().
+    std::shared_ptr<VulkanBuffer>
+    as_host_imported_buffer(std::shared_ptr<VulkanDevice> &vd,
+                            std::size_t n_elements) {
+        if (!vd->is_support_host_import()) {
+            throw std::runtime_error(
+                "vkop: as_host_imported_buffer needs VK_EXT_external_memory_"
+                "host enabled on the device");
+        }
+        size_t bytes = sizeof(T) * UP_DIV(n_elements, 4) * 4;
+        if (bytes == 0)
+            bytes = 16;
+        // Drop any previous buffer (device-local from the last prefill, or a
+        // previous round's import) and install the fresh import.
+        vkobj_.reset();
+        view_range_.reset();
+        prealloc_keep_ = true;
+        converted_ = true;
+        auto align = vd->host_import_alignment();
+        // The driver pads memory requirements to the import alignment; keep
+        // one alignment's worth of headroom above the logical size for it.
+        size_t host_bytes = ((bytes + align - 1) / align) * align + align;
+        void *p = nullptr;
+        if (posix_memalign(&p, align, host_bytes) != 0) {
+            throw std::runtime_error(
+                "vkop: posix_memalign failed for a host-imported tensor");
+        }
+        host_import_ptr_ = HostBlock(p, ::free);
+        host_import_bytes_ = host_bytes;
+        vkobj_ = std::make_shared<VulkanBuffer>(
+            vd, bytes,
+            STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+                VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            p, host_bytes);
+        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+    }
+
+    // The aligned host block backing a host-imported tensor (null until
+    // as_host_imported_buffer runs). The CPU writes per-step bytes here;
+    // shaders bound to this tensor's SSBO read them.
+    void *host_import_ptr() const { return host_import_ptr_.get(); }
+    size_t host_import_bytes() const { return host_import_bytes_; }
+    // True when this tensor's current storage is a host-imported buffer and
+    // the CPU should write host_import_ptr() instead of calling copyToGPU().
+    bool is_host_imported() const {
+        auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
+        return buff && buff->is_host_imported();
+    }
+
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {
         if (vkobj_) {
@@ -1537,6 +1606,14 @@ template <typename T> class Tensor : public ITensor {
     // the same view object — hence the same descriptor binding and objs_
     // pointer identity — is reused across rounds rather than re-created.
     std::shared_ptr<VulkanBuffer> view_range_;
+
+    // Host-imported storage (see as_host_imported_buffer): the aligned block
+    // the VkBuffer is imported from. posix_memalign'd here, freed by the
+    // deleter when the tensor dies — the VulkanBuffer shares the bytes but
+    // never frees them.
+    using HostBlock = std::unique_ptr<void, void (*)(void *)>;
+    HostBlock host_import_ptr_{nullptr, ::free};
+    size_t host_import_bytes_ = 0;
 
     void make_vkbuff(std::shared_ptr<VulkanDevice> &vd, uint32_t flags) {
         auto aligned = sizeof(T) * UP_DIV(num_elements(), 4) * 4;

@@ -1,0 +1,76 @@
+// GPU argmax over one fp16 logits row (llm_chat P1-3). The driver runs this
+// as its own single-kernel pipeline after Runtime::Run(), so the 300KB
+// logits readback collapses to an 8KB winner buffer the CPU scans from its
+// mapping.
+//
+// Layout: 256 threads per group, G groups (G = ceil(vocab/256), capped at
+// 1024 by the driver). Each thread grid-strides the row, keeps its best
+// (value, index) pair, and a shared-memory tree reduces to the group winner,
+// written as uvec2(floatBitsToUint(value), index).
+//
+// The logits buffer is bound as uint32 words holding two packed fp16 values,
+// so no 16-bit-storage feature is needed. Thread t handles elements
+// base + t, base + t + 2*G*256, ...: reading word (i>>1) is a benign double
+// read across the even/odd pair, and the (i&1) lane selects the half.
+//
+// Tie-break: (v > best) || (v == best && i < best) — strictly-first-index,
+// identical to the host fp16_to_f32 + strict-greater scan, so a tie across
+// threads/groups (lower group = lower index range) resolves to the same
+// token id the CPU path returns. NaN compares false in both paths and is
+// never selected. Empty threads/groups (vocab not a multiple) carry
+// -inf/0xFFFFFFFF sentinels the host scan skips.
+
+#version 450
+layout(local_size_x = 256) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer LogitsBuf {
+    uint logits_u32[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer WinnersBuf {
+    uvec2 winners[];
+};
+
+layout(push_constant) uniform PC {
+    uint base_offset; // first element of the last row ((q-1)*vocab; decode q=1 -> 0)
+    uint vocab;
+}
+pc;
+
+shared uvec2 s_best[256];
+
+void main() {
+    uint stride = gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+    uint lo = pc.base_offset;
+    uint hi = pc.base_offset + pc.vocab;
+    float best_v = uintBitsToFloat(0xFF800000u); // -inf
+    uint best_i = 0xFFFFFFFFu;
+    for (uint i = lo + gl_GlobalInvocationID.x; i < hi; i += stride) {
+        uint w = logits_u32[i >> 1u];
+        uint bits = ((i & 1u) == 0u) ? (w & 0xFFFFu) : (w >> 16u);
+        float v = unpackHalf2x16(bits).x;
+        uint idx = i - lo;
+        if (v > best_v || (v == best_v && idx < best_i)) {
+            best_v = v;
+            best_i = idx;
+        }
+    }
+
+    uint lane = gl_LocalInvocationID.x;
+    s_best[lane] = uvec2(floatBitsToUint(best_v), best_i);
+    barrier();
+    for (uint s = gl_WorkGroupSize.x / 2u; s > 0u; s >>= 1u) {
+        if (lane < s) {
+            uvec2 mine = s_best[lane];
+            uvec2 other = s_best[lane + s];
+            bool take_other =
+                uintBitsToFloat(other.x) > uintBitsToFloat(mine.x) ||
+                (uintBitsToFloat(other.x) == uintBitsToFloat(mine.x) &&
+                 other.y < mine.y);
+            s_best[lane] = take_other ? other : mine;
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        winners[gl_WorkGroupID.x] = s_best[0];
+    }
+}

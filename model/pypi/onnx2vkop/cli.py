@@ -54,7 +54,8 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     unused half costs bytes in the file but never faults in, since the op
     never asks for it. Pin "buffer"/"image" for the tight set.
     """
-    op_types = {node.op_type for node in dag_model.nodes.values()}
+    op_types = ({node.op_type for node in dag_model.nodes.values()} |
+                set(getattr(dag_model, "extra_shader_ops", None) or []))
     keys = shader_map.shader_keys_for_model(op_types, backend=backend)
     master = filter_shaders.read_master(master_path)
     subset = {k: master[k] for k in keys if k in master}
@@ -299,6 +300,16 @@ Examples:
              "fall back on. Unused entries never fault in, so pinning "
              "buffer/image only shrinks the file.",
     )
+    parser.add_argument(
+        "--extra-shaders", metavar="A,B,C", default=None,
+        help="Comma-separated op types whose kernels belong in the embedded "
+             "archive and kernel_plans even though the graph has no such node "
+             "(e.g. --extra-shaders TopK for a model whose driver registers a "
+             "GPU post-process TopK over the logits via "
+             "Runtime::RegisterPostProcess). Names use the same spelling as "
+             "ONNX op types; a name the shader map does not know is reported "
+             "as a missing archive key and embedded as far as possible.",
+    )
     # Build-time knobs that mirror env vars the code already reads. Setting
     # these on the CLI overrides the env for the current invocation only.
     parser.add_argument(
@@ -440,6 +451,13 @@ def main():
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
                             args.awq_format, args.awq_stats, args.awq_alpha,
                             args.awq_grid))
+
+        # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
+        # neither create nor remove them: the extra census is set after the
+        # passes and survives to both the archive filter and kernel_plans.
+        if args.extra_shaders:
+            dag_model.extra_shader_ops = [
+                s.strip() for s in args.extra_shaders.split(",") if s.strip()]
 
         # Print statistics (before binary save — dag_model may be huge for LLMs)
         op_stats = {}
