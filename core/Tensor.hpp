@@ -988,6 +988,15 @@ template <typename T> class Tensor : public ITensor {
     // the point: the logical shape changed so the host data must be
     // re-uploaded.
     void recreate_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
+        // Host-imported buffers (VK_EXT_external_memory_host) must NOT be kept
+        // across shape changes: their host block is sized to the decode shape
+        // that as_host_imported_buffer installed, and a later ResizeInput to a
+        // larger prefill shape would leave the tensor pointing at a too-small
+        // imported block. Always rebuild on any resize when imported.
+        auto buff = vkobj_ ? std::dynamic_pointer_cast<VulkanBuffer>(vkobj_) : nullptr;
+        if (buff && buff->is_host_imported()) {
+            prealloc_keep_ = false;
+        }
         if (prealloc_keep_ && vkobj_) {
             converted_ = false;
             return;
