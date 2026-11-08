@@ -82,8 +82,8 @@ struct PerfMetrics {
     double total_decode_ms = 0;
     std::vector<double> per_token_ms;  // per-step latency for percentile calc
     // Per-step WALL time (fill + upload + Run + argmax), not just rt->Run():
-    // P0/P1 host-side wins live outside Run(), so run_ms alone is blind to
-    // them.
+    // the host-side wins (GPU argmax, host-imported decode inputs) live
+    // outside Run(), so run_ms alone is blind to them.
     double total_decode_wall_ms = 0;
     std::vector<double> per_token_wall_ms;
 
@@ -301,19 +301,19 @@ void upload_input(const std::shared_ptr<vkop::VulkanCommandPool>& cmdpool,
     else as_tensor<uint16_t>(t)->copyToGPU(cmdpool, nullptr, nullptr, batch);
 }
 
-// P1 收益组件计时（VKOP_P1_TIMER=1）。端到端 wall 在本机热噪（±15%）下
-// 分辨不出 ~1ms 的收益，改为直接量被 P1 消掉的三块工作：CPU argmax
+// 收益组件计时（VKOP_COMPONENT_TIMER=1）。端到端 wall 在本机热噪（±15%）下
+// 分辨不出 ~1ms 的优化收益，改为直接量被消掉的三块工作：CPU argmax
 // （logits readback + 扫描）、GPU argmax（dispatch + wait + winners 读）、
 // decode 上传 batch（record + submit + wait）。
-static bool p1_timer_on() {
+static bool component_timer_on() {
     static const bool on = [] {
-        const char *e = std::getenv("VKOP_P1_TIMER");
+        const char *e = std::getenv("VKOP_COMPONENT_TIMER");
         return e && e[0] == '1';
     }();
     return on;
 }
 
-// ---- P1-4: decode-step inputs as host-imported SSBOs ----
+// ---- decode-step inputs as host-imported SSBOs ----
 // Install host-imported storage on the five per-step decode inputs, sized to
 // their DECODE shapes. After this the CPU writes per-step values straight
 // into device-visible host memory (zero staging submits); the zero-valued
@@ -334,7 +334,7 @@ bool install_decode_host_imports(
         static bool reported = false;
         if (!reported) {
             reported = true;
-            std::printf("[p1] host import unavailable, decode keeps batched "
+            std::printf("[perf] host import unavailable, decode keeps batched "
                         "uploads\n");
         }
         return false;
@@ -351,7 +351,7 @@ bool install_decode_host_imports(
     auto report_ok = [&] {
         if (!reported_ok) {
             reported_ok = true;
-            std::printf("[p1] decode inputs host-imported: per-step upload "
+            std::printf("[perf] decode inputs host-imported: per-step upload "
                         "submits eliminated\n");
         }
     };
@@ -412,7 +412,7 @@ static bool register_gpu_argmax(const std::shared_ptr<Runtime>& rt) {
     auto tk_indexs = std::make_shared<vkop::core::Tensor<int>>();
     rt->RegisterPostProcess(vkop::ops::OpType::TOPK, {{"k", "1"}},
                             {logits}, {tk_values, tk_indexs});
-    std::printf("[p1] argmax = RegisterPostProcess(TopK k=1); "
+    std::printf("[perf] argmax = RegisterPostProcess(TopK k=1); "
                 "VKOP_GPU_ARGMAX=0 falls back to CPU scan\n");
     return true;
 }
@@ -434,7 +434,7 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         auto ti = as_tensor<int>(idx_out);
         ti->copyToCPU(cmdpool);
         int best = ti->at(static_cast<int>(ti->num_elements()) - 1);
-        if (p1_timer_on())
+        if (component_timer_on())
             std::printf("[p1t] argmax_gpu %.3fms\n",
                         std::chrono::duration<double, std::milli>(
                             std::chrono::steady_clock::now() - tg0).count());
@@ -463,7 +463,7 @@ int argmax_last_token(const std::shared_ptr<Runtime>& rt,
         float v = fp16_to_f32(row[i]);
         if (v > bestv) { bestv = v; best = i; }
     }
-    if (p1_timer_on())
+    if (component_timer_on())
         std::printf("[p1t] argmax_cpu %.3fms\n",
                     std::chrono::duration<double, std::milli>(
                         std::chrono::steady_clock::now() - tc0).count());
@@ -1428,7 +1428,7 @@ int main(int argc, char** argv) {
         }
         int dec_base = kv_base;   // 本轮 decode 期间逻辑行 0 的绝对位置
 
-        // ---- P1-4: install host-imported decode inputs for this round ----
+        // ---- install host-imported decode inputs for this round ----
         // (each round reinstalls; the next prefill's larger shapes drop the
         // imports and revert to the batched-upload path automatically)
         bool zerocopy = install_decode_host_imports(rt, dev, arch, ds_shape, max_kv);
@@ -1446,7 +1446,7 @@ int main(int argc, char** argv) {
                                         vocab, arch.hidden);
             // 这个 token 马上要被模型吃进 KV，记下来（下一轮判断能否复用前缀）。
             consumed_gen.push_back(static_cast<uint32_t>(next_id));
-            // P1-4 dual path: an input whose storage is host-imported gets
+            // Dual path: an input whose storage is host-imported gets
             // resize+memcpy (no upload); everything else takes the original
             // fill+batch-upload path. VKOP_ZC_UPLOAD=1 (bisection) uploads on
             // top of the imports too: the staging copy overwrites the
@@ -1584,7 +1584,7 @@ int main(int argc, char** argv) {
                 batch->submit(cmdpool->getVulkanDevice()->getComputeQueue());
                 batch->wait();
                 cmdpool->getStagingBufferPool()->reset();
-                if (p1_timer_on())
+                if (component_timer_on())
                     std::printf("[p1t] upload %.3fms\n",
                                 std::chrono::duration<double, std::milli>(
                                     std::chrono::steady_clock::now() - tu0).count());

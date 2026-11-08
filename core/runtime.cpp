@@ -1,6 +1,7 @@
 // junka @ 2025
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -2941,6 +2942,7 @@ double Runtime::Run() {
     // Segment-level replay (VKOP_SEGMENT_REPLAY=1). Off by default.
     // 仅当 graph_mode 开时有效. 与 Operator 级 replay_mode_ 互不干扰.
     bool seg_replay = false;
+    const bool seg_trace = std::getenv("VKOP_SEG_TRACE") != nullptr;
     if (graph_mode) {
         if (const char *sr = std::getenv("VKOP_SEGMENT_REPLAY")) {
             seg_replay = sr[0] == '1';
@@ -3030,6 +3032,9 @@ double Runtime::Run() {
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
         seg_op_indices_curr.push_back({});  // 开下一段的空集合
+        if (seg_trace)
+            std::fprintf(stderr, "[seg-sub] ord=%zu val=%llu\n", ord,
+                         (unsigned long long)graph_prev_val);
         if (run_profile) {
             auto gs_t1 = std::chrono::steady_clock::now();
             prof_submit_ms +=
@@ -3653,8 +3658,12 @@ seg_effects_found:
                     .count();
         }
         if (per_level_wait) {
-            for (auto &c : cur_level_cmds)
+            for (auto &c : cur_level_cmds) {
                 c->wait();
+                if (seg_trace)
+                    std::fprintf(stderr, "[lvl-wait] lvl=%zu ok\n",
+                                 level_idx);
+            }
             for (auto &c : cur_level_cmds) {
                 c->clearWaits();
                 c->reset();
@@ -3676,8 +3685,26 @@ seg_effects_found:
     }
 
     // Wait for the final level, then reset all command buffers.
+    if (seg_trace && graph_mode) {
+        auto dev = m_cmdpool_->getVulkanDevice();
+        for (int poll = 0; poll < 10; ++poll) {
+            std::string line = "[frontier] poll" + std::to_string(poll) + ":";
+            for (auto &c : graph_cmds_) {
+                uint64_t cv = 0;
+                VkSemaphore s = c->getSignalSemaphore();
+                if (s) {
+                    vkGetSemaphoreCounterValue(dev->getLogicalDevice(), s, &cv);
+                }
+                line += " " + std::to_string(cv);
+            }
+            std::fprintf(stderr, "%s\n", line.c_str());
+            std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        }
+    }
     for (int ci = 0; ci < vkop::kInflight; ci++) {
         if (last_commands[ci]) {
+            if (seg_trace)
+                std::fprintf(stderr, "[tail-wait] ci=%d\n", ci);
             last_commands[ci]->wait();
         }
     }

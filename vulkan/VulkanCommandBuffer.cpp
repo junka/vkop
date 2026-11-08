@@ -230,8 +230,8 @@ int VulkanCommandBuffer::wait() {
     wait_info.semaphoreCount = 1;
     wait_info.pSemaphores = &signalsem;
 
+    uint64_t cur_time = 0;
     if (m_support_timeline_) {
-        uint64_t cur_time;
         vkGetSemaphoreCounterValue(device->getLogicalDevice(), signalsem,
                                    &cur_time);
         if (cur_time > m_signalValue_) {
@@ -243,8 +243,17 @@ int VulkanCommandBuffer::wait() {
         wait_info.pValues = nullptr;
     }
 
-    if (VK_SUCCESS !=
-        vkWaitSemaphores(device->getLogicalDevice(), &wait_info, UINT64_MAX)) {
+    VkResult wres = vkWaitSemaphores(device->getLogicalDevice(), &wait_info,
+                                     UINT64_MAX);
+    if (VK_SUCCESS != wres) {
+        std::fprintf(stderr,
+                     "[sem-wait] res=%d timeline=%d want=%llu cur=%llu "
+                     "this=%p\n",
+                     static_cast<int>(wres),
+                     static_cast<int>(m_support_timeline_),
+                     static_cast<unsigned long long>(m_signalValue_),
+                     static_cast<unsigned long long>(cur_time),
+                     static_cast<void *>(this));
         throw std::runtime_error("Failed to wait for binary semaphore!");
     }
 

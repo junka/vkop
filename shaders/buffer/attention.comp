@@ -14,7 +14,7 @@
 // The KV row is swept in TILE_KV-wide chunks with a running max/sum: per tile
 // the raw scores live in shared `sS`, the tile max folds into the running max
 // as `alpha = exp(m_old - m_new)`, and the output accumulator rescales by
-// alpha before folding that tile's contribution. The P1 form staged the whole
+// alpha before folding that tile's contribution. The previous form staged the whole
 // row (shared `sS[MAX_KV]`), which capped kv at 2048 and made shared memory
 // scale with the context; this form keeps ~7 KB of shared regardless of kv, so
 // kv is unbounded (the host only enforces the shape-level invariants).
@@ -303,7 +303,7 @@ shared float sAcc[4][MAX_HD];
 // clobbered by a lane that has already moved on. The leading barrier is
 // load-bearing: `s_red[lid]` is written by every lane and the first step reads
 // `s_red[lid + 128]`, i.e. another *warp's* slot — without it a warp can fold a
-// stale value (or -1e30/0) into the reduction. The P1 form lacked it and read a
+// stale value (or -1e30/0) into the reduction. The previous form lacked it and read a
 // wrong row max, which makes `exp(x - m)` overflow and scales the whole output
 // row to ~1e-31, on ~1 row in 20 and only for workgroups that lose the race.
 #ifdef SUBGROUP
@@ -583,7 +583,7 @@ void main() {
         float tile_max = s_red[0];
         // Latch tile_max before s_red is reused as the sum accumulator: lane 0
         // overwrites s_red[0], and a warp that read it late would take a
-        // partial sum as its max. (This is not hypothetical — the P1
+        // partial sum as its max. (This is not hypothetical — the previous
         // whole-row kernel shipped without it and failed nondeterministically.)
         barrier();
         float m_new = max(m, tile_max);

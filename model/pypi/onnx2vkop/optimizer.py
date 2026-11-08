@@ -2055,7 +2055,7 @@ class FusionOptimizer:
 
         return False
 
-    # ---- P1: nop Cast chains (Cast A→B 紧接 Cast B→A，中间无其他消费者）----
+    # ---- nop Cast chains (Cast A→B 紧接 Cast B→A，中间无其他消费者）----
     # HF eager attention/layernorm 常产出 f16→f32→f16 的空转 Cast 对。ONNX optimizer
     # 的 eliminate_nop_cast 只处理单 Cast 输入输出同型；这里是「两 Cast 互抵」链，
     # 需把第二个 Cast 的所有消费者重定向到第一个 Cast 的输入，删两个节点。
@@ -2112,7 +2112,7 @@ class FusionOptimizer:
             del dag_model.nodes[c2.name]
         return True
 
-    # ---- P1: Cast↔Cast 包裹 Softmax / LayerNormalization 吸收 ----
+    # ---- Softmax / LayerNormalization 后置 upcast 吸收 ----
     # 实测模式（Qwen3-VL visual）：Softmax 的输入是 Mul 的 fp16 输出（无前置 Cast），
     # 但 Softmax 输出 fp16 后接 Cast(f16→f32)，再走后续 fp32 运算，最后再 Cast 回 f16。
     # VKOP 的 Softmax shader 内部按 fp32 计算且 fp16 进出，所以紧跟 Softmax 的
@@ -2186,7 +2186,7 @@ class FusionOptimizer:
             return True
         return got <= 0 or want <= 0 or got == want
 
-    # ---- P2: Squeeze/Unsqueeze 在转换期 fuse 掉（纯 view，不进 GPU）----
+    # ---- Squeeze/Unsqueeze 在转换期 fuse 掉（纯 view，不进 GPU）----
     # Squeeze/Unsqueeze 是 view 算子：只改逻辑 shape，不搬数据。在 VKOP 的 4D
     # image 抽象下硬实现会踩 dims_ 残留 / 2D 崩溃 / 空转 kernel 等坑，故应在
     # onnx2vkop 阶段 fuse：把输出名别名到输入名，并把「压缩后 shape」传播给所有
@@ -4091,9 +4091,9 @@ class FusionOptimizer:
           envelope), and consistent head counts. Everything else — batch, seq,
           kv_len — is read from the bound tensors at execute() time, so the
           decoder graph's symbolic ``[-1,16,-1,128]`` Q is fine and its 28
-          attention blocks route through this op. (The P1 kernel staged the
-          whole KV row in shared memory and so declined anything symbolic; the
-          tiled/online-softmax kernel lifted that.)
+          attention blocks route through this op. (The previous kernel staged
+          the whole KV row in shared memory and so declined anything symbolic;
+          the tiled/online-softmax kernel lifted that.)
         """
         producer, consumers = FusionOptimizer.get_producer_consumer_from_dag(dag_model)
 
