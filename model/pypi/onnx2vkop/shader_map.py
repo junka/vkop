@@ -201,15 +201,23 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # passes inside one workgroup, cross-pass fp32 accumulate in shared
         # memory, single dispatch, no global scratch. coop_split (uPC.ksplit)
         # clamped to 1..8 on the host. Guard: ACC_M==ACC_N==1 + N even + K/cs
-        # >= 2*K_BLOCK.
+        # >= 2*K_BLOCK. Only the coop build exists -- the coop16 INWG variant
+        # was never shipped (CMakeLists builds coop only) and KernelSelect's
+        # kCoopmatInwg route treats it as unavailable, so no coop16 key ships.
         "buffer_matmul_coop_inwg",
-        "buffer_matmul_coop16_inwg",
         # coopmat + split-K grid-parallel "last block reduce": grid.z = batch
         # * SK, single dispatch, fp32 partials in binding 4, per-tile arrival
         # counter in binding 5 (host vkCmdFillBuffer 0 before dispatch). Host
         # guard: SK ∈ [2, 8], K/SK >= 2*K_BLOCK, N even, ACC_M==ACC_N==1.
+        # Only fp32 builds exist (the half2 builds were byte-identical and
+        # dropped from CMake; MatMul.hpp still probes the half2 keys but they
+        # are optional). Per-cs modules bake SK_CS in at compile time; the
+        # runtime picks by cs and falls back to the default (cs=1) module, so
+        # all four must ship.
         "buffer_matmul_coop16_sklast_fp32",
-        "buffer_matmul_coop16_sklast",
+        "buffer_matmul_coop16_sklast_fp32_cs2",
+        "buffer_matmul_coop16_sklast_fp32_cs4",
+        "buffer_matmul_coop16_sklast_fp32_cs8",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",
