@@ -18,6 +18,10 @@ llm/exporter/*.weights.bin
 llm/exporter/embed_tokens.bin
 # Tokenizer blobs serialized by tokenizer_to_bin.py from a local checkpoint.
 llm/tokenizer/*.bin
+# Qwen2-MoE export blobs that landed at llm/ root (same policy: the exporter
+# scripts are tracked, the multi-GB weights/graphs they write are not).
+llm/*.onnx
+llm/*.weights.bin
 
 # Build trees, including CMake's in-source leftovers (CMakeFiles/,
 # CMakeCache.txt) when a build directory is accidentally configured in-tree.
@@ -26,11 +30,26 @@ llm/tokenizer/*.bin
 /CMakeFiles/
 /CMakeCache.txt
 /.cache/
+/model/build/
+/llm/tokenizer/build/
 # ONNX models and scratch inputs pulled down for one-off conversions; the
 # committed fixtures live under model/ (add_conv_model.onnx etc.).
 /onnx_models/
 /optimized_resnet18.onnx
+/model/pypi/optimized_resnet18.onnx
+/model/pypi/py_input_*.npy
 /dog.jpg
 # Run logs and compiler leftovers.
 /log
 *.obj
+# Zero-copy bandwidth probe: run logs and compiled outputs. Sources
+# (probe.cpp, read_sum.comp) are tracked; the compiled probe binary, the
+# compiled SPIR-V, and the embedded header regenerated from it are not.
+/tools/perf/logs/
+/tools/perf/zero_copy_bw_probe/probe
+/tools/perf/zero_copy_bw_probe/read_sum.spv
+/tools/perf/zero_copy_bw_probe/read_sum.spv.h
+
+# macOS / tooling junk.
+.DS_Store
+.coverage
