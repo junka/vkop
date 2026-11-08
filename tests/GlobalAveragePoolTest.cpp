@@ -78,6 +78,9 @@ TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
         {{1, 3, 4, 8}},
         {{1, 4, 6, 1}},
         {{1, 4, 6}},
+        // Rank 5 has no image representation; the buffer row folds the whole
+        // spatial tail (2*4*5) into one mean, the image row is skipped.
+        {{1, 3, 2, 4, 5}},
     };
 
     for (const auto &t : testcases) {
@@ -91,11 +94,19 @@ TEST(GlobalAveragePoolTest, GlobalAveragePoolComprehensiveTest) {
         LOG_INFO("Testing fp32");
 
         GlobalAveragePoolTest<float> gaptest(shape);
-        EXPECT_TRUE(gaptest.run_test({gaptest.input}, {gaptest.output}));
+        EXPECT_TRUE(gaptest.run_test_on_both_backends(
+            [shape]() -> GlobalAveragePoolTest<float>::DualCase {
+                GlobalAveragePoolTest<float> t(shape);
+                return {{t.input}, {t.output}, nullptr};
+            }));
 
         LOG_INFO("Testing fp16");
 
         GlobalAveragePoolTest<uint16_t> gaptest2(shape);
-        EXPECT_TRUE(gaptest2.run_test({gaptest2.input}, {gaptest2.output}));
+        EXPECT_TRUE(gaptest2.run_test_on_both_backends(
+            [shape]() -> GlobalAveragePoolTest<uint16_t>::DualCase {
+                GlobalAveragePoolTest<uint16_t> t(shape);
+                return {{t.input}, {t.output}, nullptr};
+            }));
     }
 }

@@ -1,0 +1,56 @@
+#version 450 core
+
+// GlobalAveragePool (SSBO) — compact row-major NCHW input of rank >= 3.
+// The host folds every trailing spatial dim into one `spatial` count, so
+// input element (n, c, s) sits at linear (n*C + c)*spatial + s and the
+// output is the compact (N, C) mean plane. One thread per output element
+// accumulates its spatial run in fp32 (same pattern as reduce.comp).
+//
+// fp16 packs two halfs per uint word: one thread per word computes both
+// channel means and writes a single packed half2, avoiding the
+// read-modify-write race two threads sharing one word would cause. An odd
+// tail lane is zero-filled (tensor allocation rounds up to whole words).
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#include "../common/buffer_common.comp"
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+
+layout(push_constant) uniform PC_uGap {
+    int batch;
+    int channels;
+    int spatial;
+    int _pad;
+} uGap;
+
+float gap_one(int oc) {
+    float acc = 0.0f;
+    int base = oc * uGap.spatial;
+    for (int s = 0; s < uGap.spatial; ++s) {
+        acc += BUF_LOAD(uInput.data, base + s);
+    }
+    return acc / float(uGap.spatial);
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int out_total = uGap.batch * uGap.channels;
+#ifdef FP16
+    int nwords = (out_total + 1) / 2;
+    if (gid >= nwords) return;
+    int e0 = 2 * gid;
+    int e1 = 2 * gid + 1;
+    float v0 = gap_one(e0);
+    float v1 = (e1 < out_total) ? gap_one(e1) : 0.0f;
+    uOutput.data[gid] = packHalf2x16(vec2(v0, v1));
+#else
+    if (gid >= out_total) return;
+    uOutput.data[gid] = floatBitsToUint(gap_one(gid));
+#endif
+}

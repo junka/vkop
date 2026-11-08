@@ -2,6 +2,7 @@
 #ifndef OPS_GLOBALAVERAGEPOOL_HPP_
 #define OPS_GLOBALAVERAGEPOOL_HPP_
 
+#include "ops/BufferBase.hpp"
 #include "ops/Operator.hpp"
 #include "ops/PimplFacade.hpp"
 namespace vkop {
@@ -10,6 +11,17 @@ namespace globalaveragepool {
 struct alignas(16) GpuGAPParam {
     ivec4 inShape; // NCHW
     int accuracy;
+};
+
+// Buffer PC (mirrors shaders/buffer/globalaveragepool.comp). GAP reduces
+// every dim past the first two, so the host folds the spatial tail into one
+// count and the shader needs no rank/dims: input (n, c, s) is at linear
+// (n*C + c)*spatial + s, output is the compact (N, C) plane.
+struct alignas(16) GapBufferPC {
+    int batch;
+    int channels;
+    int spatial;
+    int _pad;
 };
 } // namespace globalaveragepool
 
@@ -64,14 +76,65 @@ class GlobalAveragePoolImage : public Operator {
         submit(&para, UP_DIV(batch, 16), 1, UP_DIV(depth, 4));
     }
 };
+// Buffer factory — SSBO-backed global average pool, fp32 and fp16. Unlike
+// the image path's NCHW->RGBA packing (rank 3/4 only), the compact layout
+// carries any rank >= 3; the spatial tail folds into one push-constant count.
+class GlobalAveragePoolBuffer : public BufferFactory {
+  public:
+    explicit GlobalAveragePoolBuffer(int fp16)
+        : BufferFactory(OpType::GLOBALAVERAGEPOOL,
+                        {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
+                        sizeof(globalaveragepool::GapBufferPC), fp16) {}
+
+  private:
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        auto input_shape = inputs[0]->getShape();
+        if (input_shape.size() < 3) {
+            throw std::invalid_argument(
+                "GlobalAveragePool input must have at least 3 dimensions");
+        }
+        int batch = input_shape[0];
+        int channels = input_shape[1];
+        int spatial = 1;
+        for (size_t i = 2; i < input_shape.size(); ++i) {
+            spatial *= input_shape[i];
+        }
+
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->num_elements() != batch * channels) {
+                output->resize(std::vector<int>{batch, channels});
+            }
+            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
+
+        globalaveragepool::GapBufferPC pc{};
+        pc.batch = batch;
+        pc.channels = channels;
+        pc.spatial = spatial;
+        int out_total = batch * channels;
+        int nthreads = (fp16_ != 0) ? (out_total + 1) / 2 : out_total;
+        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+    }
+};
+
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.
 class GlobalAveragePool : public PimplFacade {
   public:
-    GlobalAveragePool(int /*fp16*/, bool backend_buffer)
+    GlobalAveragePool(int fp16, bool backend_buffer)
         : PimplFacade(OpType::GLOBALAVERAGEPOOL) {
-        (void)backend_buffer;
-        // buffer port not yet available; using image impl.
-        impl_ = std::make_unique<GlobalAveragePoolImage>();
+        if (backend_buffer) {
+            impl_ = std::make_unique<GlobalAveragePoolBuffer>(fp16);
+        } else {
+            impl_ = std::make_unique<GlobalAveragePoolImage>();
+        }
     }
 };
 

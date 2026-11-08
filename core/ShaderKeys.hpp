@@ -70,7 +70,7 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::GEMM:
             return {nullptr, "gemm", false, false};
         case T::GLOBALAVERAGEPOOL:
-            return {"globalaveragepool", nullptr, false, false};
+            return {"globalaveragepool", "globalaveragepool", false, true};
         case T::GRIDSAMPLE:
             return {"gridsample", nullptr, false, false};
         case T::LAYERNORM:

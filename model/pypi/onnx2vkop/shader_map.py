@@ -67,7 +67,7 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "FusedElemwise": (None, "fused_elemwise", False, True),
     "Gather": (None, "gather", False, True),
     "Gemm": (None, "gemm", False, False),
-    "GlobalAveragePool": ("globalaveragepool", None, False, False),
+    "GlobalAveragePool": ("globalaveragepool", "globalaveragepool", False, True),
     "GridSample": ("gridsample", None, False, False),
     "LayerNorm": ("layernorm", "layernorm", False, True),
     "LayerNormalization": ("layernorm", "layernorm", False, True),

@@ -281,6 +281,7 @@ set(DUAL_FP16_SHADERS
     buffer/pow
     buffer/sqrt
     buffer/reduce
+    buffer/globalaveragepool
     buffer/prelu
     buffer/reshape
     buffer/expand
