@@ -9199,11 +9199,12 @@ class PreQuantizedWeights:
     A third-party quantized graph spells a Linear weight as
     `MatMul(X, DequantizeLinear(W_q, s[, zp]))`: the payload and the scale are
     initializers and the node is the only thing that makes them readable. vkop's
-    buffer MatMul/Gemm kernels ARE that dequantizer, fed from the same two
+    buffer MatMul/Gemm/Conv kernels ARE that dequantizer, fed from the same two
     initializers with the scale appended last — the exact input shape Quantizer
     emits — so importing means deleting the node and re-pointing its consumers:
 
       INT8     + 1-D fp32 per-column scale  -> [A, W, s]   (MatMul, Gemm)
+      INT8     + 1-D per-output-channel scale -> [X, W, (b), s]   (Conv)
       fp8 e4m3/e5m2 + the same              -> [A, W, s]   (MatMul)
       int4/nf4 + fp32 [K/g, N] group table  -> [A, W, s]   (MatMul)
 
@@ -9213,12 +9214,28 @@ class PreQuantizedWeights:
     transB for 4-bit), and a [N, K] export with a folded Transpose is what a
     third-party Linear actually looks like by the time this pass runs.
 
+    A DequantizeLinear whose payload a QuantizeLinear in the same graph produces
+    is the exporter's ACTIVATION quantization, not a weight. That pair is left
+    exactly as written: ops/QuantizeLinear.hpp runs both halves on the buffer
+    backend, so such a graph converts and executes without this pass touching it.
+    A per-axis activation scale or zero_point is the form refused here, because
+    the kernel applies one value to every element and would otherwise fail on the
+    first inference instead of at conversion.
+
+    A payload of an integer width no vkop kernel decodes -- ORT's QDQ exporter
+    writes the Conv/Gemm bias as QInt32 with a per-channel scale, into a slot that
+    takes a float -- is a value, not storage, so the fold evaluates the node's own
+    formula on the host and re-points its consumers at the result. That is the one
+    case where dequantizing here costs nothing: no kernel loses a byte path.
+
     Everything the spec leaves undetermined is an error, not a guess:
-      * a non-zero zero_point — every vkop weight format is symmetric
-        (value = code * scale), so an offset payload belongs to the a8w8 family
-        of operators, not to a fold;
-      * a payload that is a graph value — that is the activation side of a QDQ
-        pair, and there is no activation quantization here;
+      * a non-zero zero_point on a weight — every vkop weight format is
+        symmetric (value = code * scale), so an offset payload belongs to the
+        a8w8 family of operators, not to a fold (the offset of an integer
+        CONSTANT is evaluated, because there is no kernel to misread it);
+      * a payload that is a graph value with no QuantizeLinear producing it — a
+        DQ over a bare value has no quantized bytes behind it, and no kernel can
+        invent them;
       * a per-tensor or blocked scale for the byte formats, and a per-column
         scale for 4-bit — a kernel binds exactly the table its shader walks;
       * FLOAT4E2M1 — NVFP4's second scale level is one fp32 per tensor and
@@ -9236,24 +9253,44 @@ class PreQuantizedWeights:
     """
 
     # ONNX element type -> (name for messages, the ops whose kernels dequantize
-    # it). int8 is the only byte format Gemm reads: gemm.comp/conv2d.comp decode
-    # int8 and nothing else.
+    # it). int8 is the only byte format Gemm reads, and the only one with a Conv
+    # kernel: gemm.comp/conv2d.comp decode int8 and nothing else.
     _BYTE_WEIGHTS = {
-        TensorProto.INT8: ("int8", ("MatMul", "Gemm")),
+        TensorProto.INT8: ("int8", ("MatMul", "Gemm", "Conv")),
         TensorProto.FLOAT8E4M3FN: ("float8e4m3fn", ("MatMul",)),
         TensorProto.FLOAT8E5M2: ("float8e5m2", ("MatMul",)),
     }
     _4BIT_WEIGHTS = (TensorProto.INT4, TensorProto.UINT4)
 
+    # Integer widths ONNX permits as a DequantizeLinear payload that no vkop
+    # weight kernel decodes -- so a constant on one of them is a value to
+    # evaluate, not a payload to bind. ORT's QDQ exporter puts the Conv/Gemm bias
+    # here (QInt32), in a slot that takes a float anyway.
+    _CONSTANT_INT_TYPES = (TensorProto.INT32, TensorProto.UINT32,
+                           TensorProto.INT16, TensorProto.UINT16)
+
+    @staticmethod
+    def _readers_for(data_type):
+        """The op types whose kernel can read a payload of this element type."""
+        readers = {"MatMul", "Gemm"}
+        if data_type == TensorProto.INT8:
+            readers.add("Conv")
+        return readers
+
     @staticmethod
     def fold(dag_model) -> int:
-        """Fold every DequantizeLinear(weight initializer) into its consumers.
+        """Import every DequantizeLinear that describes a weight, leave the ones
+        that describe an activation.
 
         Runs after fusion (so a DQ -> Transpose -> MatMul has already become a
         transB=1 operand) and before the -q dispatch, which is what keeps a graph
         that is already on a quantization grid from being re-quantized from the
         float its DQ node would have produced. Auto-detected: a graph with no
-        DequantizeLinear is untouched."""
+        DequantizeLinear is untouched.
+
+        Returns the number of weights imported. An activation QDQ pair is not a
+        weight and is not counted: it stays in the graph, and the runtime executes
+        both halves (ops/QuantizeLinear.hpp)."""
         dq_nodes = [
             node for node in dag_model.nodes.values()
             if node.op_type == "DequantizeLinear"
@@ -9261,13 +9298,33 @@ class PreQuantizedWeights:
         if not dq_nodes:
             return 0
 
-        print(f"Importing {len(dq_nodes)} externally-quantized weight(s)...")
+        producers = {}
+        for node in dag_model.nodes.values():
+            for out in node.outputs:
+                producers[out["name"]] = node
+
         consumers = defaultdict(list)
         for node in dag_model.nodes.values():
             for inp in node.inputs:
                 consumers[inp["name"]].append(node)
 
-        for node in dq_nodes:
+        pairs = [
+            node for node in dq_nodes
+            if PreQuantizedWeights._is_activation_pair(node, producers)
+        ]
+        for node in pairs:
+            PreQuantizedWeights._check_activation_pair(node, dag_model, producers)
+        pair_names = {node.name for node in pairs}
+        weights = [node for node in dq_nodes if node.name not in pair_names]
+        if pair_names:
+            print(
+                f"Kept {len(pair_names)} activation QuantizeLinear/"
+                f"DequantizeLinear pair(s) in the graph for the runtime"
+            )
+        if not weights:
+            return 0
+
+        for node in weights:
             PreQuantizedWeights._fold_one(dag_model, node, consumers)
             del dag_model.nodes[node.name]
             if len(node.inputs) > 2:
@@ -9281,10 +9338,52 @@ class PreQuantizedWeights:
         # this pass.
         dag_model.build_dependencies()
         print(
-            f"Imported {len(dq_nodes)} quantized weight(s) as weight-only "
-            f"MatMul/Gemm inputs"
+            f"Imported {len(weights)} quantized weight(s) as weight-only "
+            f"MatMul/Gemm/Conv inputs"
         )
-        return len(dq_nodes)
+        return len(weights)
+
+    @staticmethod
+    def _is_activation_pair(node, producers) -> bool:
+        """Is this DequantizeLinear the float side of a QuantizeLinear in THIS
+        graph? That is what an exporter's activation quantization looks like --
+        `producer -> QuantizeLinear -> DequantizeLinear -> consumer` -- and it is
+        a different thing from a quantized weight, whose payload is an initializer
+        and whose DQ node the fold deletes. Only a pair with its Q in the graph
+        counts, because a DQ over a bare graph value has no quantized producer to
+        execute and no meaning; that one stays the error it was."""
+        if len(node.inputs) < 2:
+            return False
+        q = producers.get(node.inputs[0]["name"])
+        return q is not None and q.op_type == "QuantizeLinear"
+
+    @staticmethod
+    def _check_activation_pair(node, dag_model, producers):
+        """Reject a pair the runtime op refuses, at conversion instead of at the
+        first execute().
+
+        ops/QuantizeLinear.hpp applies inputs[1][0] to every element and throws
+        when that table has more than one entry, so a per-axis activation scale is
+        a model that loads and then fails on its first inference. Say which node
+        is the problem."""
+        q = producers[node.inputs[0]["name"]]
+        for pair in (q, node):
+            for side, index in (("scale", 1), ("zero_point", 2)):
+                if len(pair.inputs) <= index:
+                    continue
+                name = pair.inputs[index]["name"]
+                init = dag_model.initializers.get(name)
+                if init is None:
+                    continue
+                entries = 1
+                for d in init.dims:
+                    entries *= int(d)
+                if entries > 1:
+                    raise ValueError(
+                        f"'{pair.name}': per-axis activation {side} '{name}' has "
+                        f"{entries} entries, and the QuantizeLinear kernel applies "
+                        f"one per-tensor value to every element."
+                    )
 
     @staticmethod
     def _fold_one(dag_model, node, consumers):
@@ -9300,10 +9399,10 @@ class PreQuantizedWeights:
         payload = dag_model.initializers.get(x_name)
         if payload is None:
             raise ValueError(
-                f"DequantizeLinear '{node.name}': '{x_name}' is a graph value, not "
-                f"a weight initializer. vkop dequantizes weights only, so this is "
-                f"the activation side of a QDQ pair, which needs the a8w8 "
-                f"operators rather than a fold."
+                f"DequantizeLinear '{node.name}': '{x_name}' is a graph value with "
+                f"no QuantizeLinear producing it. A QDQ pair on an activation is "
+                f"left for ops/QuantizeLinear.hpp to run; a bare value has no "
+                f"quantized bytes behind it, so there is nothing to import."
             )
         scale_init = dag_model.initializers.get(s_name)
         if scale_init is None:
@@ -9311,6 +9410,18 @@ class PreQuantizedWeights:
                 f"DequantizeLinear '{node.name}': scale '{s_name}' is computed at "
                 f"run time, and a weight-only kernel binds a constant scale table."
             )
+
+        # An integer constant no vkop kernel decodes. ORT's QDQ exporter writes a
+        # quantized Conv/Gemm BIAS this way (QInt32 payload, per-channel scale),
+        # and the slot it feeds takes a float, not a weight -- so the only honest
+        # import is the node's own definition, evaluated on the host. This cannot
+        # cost bandwidth or change a kernel's contract, which is why it is not a
+        # judgement call the way an int8 weight is.
+        if payload.data_type in PreQuantizedWeights._CONSTANT_INT_TYPES:
+            PreQuantizedWeights._fold_dequantized_constant(
+                dag_model, node, payload, scale_init, consumers
+            )
+            return
 
         if len(node.inputs) > 2:
             zp_name = node.inputs[2]["name"]
@@ -9363,10 +9474,12 @@ class PreQuantizedWeights:
                 f"there is no weight to import"
             )
         ops = {c.op_type for c in cs}
-        if not ops <= {"MatMul", "Gemm"}:
+        readers = PreQuantizedWeights._readers_for(payload.data_type)
+        if not ops <= readers:
             raise ValueError(
                 f"DequantizeLinear '{node.name}' feeds {sorted(ops)}; a quantized "
-                f"payload is only readable by MatMul/Gemm weight-only kernels."
+                f"payload is only readable by MatMul/Gemm weight-only kernels"
+                f"{'' if 'Conv' in readers else ' (only int8 has a Conv kernel)'}."
             )
         for c in cs:
             uses = [i for i, inp in enumerate(c.inputs) if inp["name"] == out_name]
@@ -9385,7 +9498,17 @@ class PreQuantizedWeights:
             )
         tb = transb.pop()
         dims = [int(d) for d in payload.dims]
-        if len(dims) != 2:
+        # A Conv weight is the kernel itself, [OC, IC/group, KH, KW], so it has
+        # no transB and its scale is per output channel rather than per output
+        # column -- a different enough contract that it gets its own branch.
+        conv_weight = "Conv" in ops
+        if conv_weight and ops != {"Conv"}:
+            raise ValueError(
+                f"'{x_name}': the payload is read by {sorted(ops)}. A Conv weight "
+                f"is a 4-D kernel and cannot be shared with a GEMM-family reader, "
+                f"which indexes the same table by output column."
+            )
+        if not conv_weight and len(dims) != 2:
             raise ValueError(
                 f"DequantizeLinear '{node.name}': payload '{x_name}' has rank "
                 f"{len(dims)} ({dims}); a batched weight would need one scale "
@@ -9400,9 +9523,14 @@ class PreQuantizedWeights:
                     f"{'/'.join(kernels)} only, but its consumers are "
                     f"{sorted(ops)}"
                 )
-            PreQuantizedWeights._fold_per_axis(
-                dag_model, node, cs, payload, scale_init, dims, tb, label
-            )
+            if conv_weight:
+                PreQuantizedWeights._fold_conv_int8(
+                    dag_model, node, cs, payload, scale_init, dims, label
+                )
+            else:
+                PreQuantizedWeights._fold_per_axis(
+                    dag_model, node, cs, payload, scale_init, dims, tb, label
+                )
         elif payload.data_type in PreQuantizedWeights._4BIT_WEIGHTS:
             label = PreQuantizedWeights._nibble_name(payload, node)
             if ops != {"MatMul"}:
@@ -9457,6 +9585,150 @@ class PreQuantizedWeights:
                 np.ascontiguousarray(scale, dtype=np.float32), scale_init.name
             )
         PreQuantizedWeights._rewire(cs, node, payload, dims, scale_init.name, [n])
+
+    @staticmethod
+    def _fold_dequantized_constant(dag_model, node, payload, scale_init,
+                                   consumers):
+        """Evaluate `DequantizeLinear(int_constant, scale[, zero_point])` here.
+
+        The node's own definition in numpy: `(q - zero_point) * scale`, with the
+        tables broadcast along the `axis` attribute (ONNX defaults it to 1). The
+        answer goes into a fresh float initializer named in the slot the DQ fed,
+        so the graph the fold emits is one an exporter could have written without
+        quantizing the constant at all -- which is what a Conv/Gemm bias slot
+        reads.
+
+        Deliberately narrower than it could be: an int8 weight is never evaluated
+        even though it could. There the choice is a byte in VRAM against a kernel
+        that reads it, and the fold's job is to hand the weight to the kernel.
+        """
+        out_name = node.outputs[0]["name"]
+        q = numpy_helper.to_array(payload).astype(np.float32)
+        rank = len(q.shape)
+        if rank == 0:
+            raise ValueError(
+                f"'{payload.name}': a rank-0 integer constant has no axis for the "
+                f"DequantizeLinear scale to index."
+            )
+
+        zp_name = node.inputs[2]["name"] if len(node.inputs) > 2 else None
+        zp_init = dag_model.initializers.get(zp_name) if zp_name else None
+        if zp_name and zp_init is None:
+            raise ValueError(
+                f"DequantizeLinear '{node.name}': zero_point '{zp_name}' is "
+                f"computed at run time, and a host-side dequantization needs the "
+                f"constant to subtract."
+            )
+
+        axis = int(node.attributes.get("axis", 1))
+        axis = axis + rank if axis < 0 else axis
+        out_dtype = PreQuantizedWeights._constant_output_type(node, scale_init)
+        # Offset first, then scale: that is the ONNX formula, and the other order
+        # would leave a per-channel zero point multiplied by the wrong column.
+        deq = q
+        for label, table_init in (("zero_point", zp_init), ("scale", scale_init)):
+            if table_init is None:
+                continue
+            if label == "scale" and table_init.data_type not in (
+                    TensorProto.FLOAT, TensorProto.FLOAT16):
+                raise ValueError(
+                    f"'{payload.name}': the constant's scale '{table_init.name}' "
+                    f"is {PreQuantizedWeights._dt_name(table_init.data_type)}; a "
+                    f"DequantizeLinear scale is float or half."
+                )
+            view = PreQuantizedWeights._broadcast_view(
+                numpy_helper.to_array(table_init).astype(np.float32), q.shape,
+                axis, label, payload.name)
+            deq = deq - view if label == "zero_point" else deq * view
+
+        name = f"{payload.name}_dequant"
+        dag_model.initializers[name] = numpy_helper.from_array(
+            deq.astype(np.float32 if out_dtype == TensorProto.FLOAT
+                       else np.float16), name)
+
+        for c in consumers.get(out_name, []):
+            for i, inp in enumerate(c.inputs):
+                if inp["name"] == out_name:
+                    c.inputs[i] = {"name": name, "shape": list(q.shape),
+                                   "dtype": out_dtype, "value_dynamic": False}
+
+        # The quantized payload, its scale and its zero point were this node's
+        # inputs alone; a host-evaluated constant leaves nothing that reads them.
+        for dead in (payload.name, scale_init.name, *( (zp_name,) if zp_name else () )):
+            if all(c is node for c in consumers.get(dead, [])):
+                dag_model.initializers.pop(dead, None)
+
+    @staticmethod
+    def _broadcast_view(table, shape, axis, label, payload_name):
+        """ONNX's per-axis broadcast: a 1-D table of length shape[axis] laid out
+        against the payload's rank. A scalar table needs no view."""
+        if table.ndim == 0 or table.size == 1:
+            return table
+        if table.ndim != 1:
+            raise ValueError(
+                f"'{payload_name}': the {label} table has rank {table.ndim}; a "
+                f"DequantizeLinear broadcasts a 1-D table along one axis."
+            )
+        if not 0 <= axis < len(shape) or table.shape[0] != shape[axis]:
+            raise ValueError(
+                f"'{payload_name}': the {label} table is {table.shape[0]} long but "
+                f"indexes dim {axis} of a {list(shape)} constant."
+            )
+        view = [1] * len(shape)
+        view[axis] = table.shape[0]
+        return table.reshape(view)
+
+    @staticmethod
+    def _constant_output_type(node, scale_init):
+        """What the dequantized constant is declared to be: ONNX says the output
+        type is the scale's, unless `output_dtype` overrides it."""
+        out = int(node.attributes.get("output_dtype", 0) or 0)
+        if out in (0, TensorProto.FLOAT, TensorProto.FLOAT16):
+            return out or scale_init.data_type
+        raise ValueError(
+            f"DequantizeLinear '{node.name}' declares output_dtype "
+            f"{PreQuantizedWeights._dt_name(out)}; a host-evaluated constant is "
+            f"float or half."
+        )
+
+    @staticmethod
+    def _fold_conv_int8(dag_model, node, cs, payload, scale_init, dims, label):
+        """One fp32 scale per output channel — the INT8 Conv contract.
+
+        conv2d.comp reads the weight as a 4-D kernel and indexes the table by
+        output channel (ops/Conv2d.hpp:557-566), so the ONNX axis has to be dim 0
+        and the table has to be OC long. The scale rides last, after the optional
+        bias, which is the slot order `quantize_to_int8_weight_only` emits for a
+        Conv: [X, W, scale] and [X, W, bias, scale]. An imported graph therefore
+        lands on the same bytes the converter could have produced itself.
+        """
+        if len(dims) != 4:
+            raise ValueError(
+                f"'{payload.name}': a Conv weight is {dims}; conv2d.comp reads a "
+                f"4-D [OC, IC/group, KH, KW] kernel and nothing else."
+            )
+        scale = PreQuantizedWeights._scale_array(scale_init, payload.name, label)
+        if scale.ndim != 1:
+            raise ValueError(
+                f"'{payload.name}': {label} Conv scale has rank {scale.ndim}; the "
+                f"Conv kernel walks one fp32 scale per output channel, so a "
+                f"per-tensor scalar has no kernel here."
+            )
+        axis = PreQuantizedWeights._axis(node, 0, len(dims))
+        if axis != 0 or scale.shape[0] != dims[0]:
+            raise ValueError(
+                f"'{payload.name}': per-axis {label} Conv scale indexes dim {axis} "
+                f"(length {scale.shape[0]}), but the kernel's scale is per output "
+                f"channel — dim 0 (length {dims[0]}) of a {dims} kernel."
+            )
+        PreQuantizedWeights._require_finite(scale, payload.name, label)
+
+        if scale_init.data_type != TensorProto.FLOAT:
+            dag_model.initializers[scale_init.name] = numpy_helper.from_array(
+                np.ascontiguousarray(scale, dtype=np.float32), scale_init.name
+            )
+        PreQuantizedWeights._rewire(cs, node, payload, dims, scale_init.name,
+                                    [dims[0]])
 
     @staticmethod
     def _fold_blocked_4bit(dag_model, node, cs, payload, scale_init, dims, tb, label):
