@@ -353,6 +353,17 @@ bool Function::preprocess_npy(const std::string &npy_path,
     std::cout << std::endl;
     const int chan4 = (C + 3) / 4;
     if (input->dtype() == typeid(float)) {
+        auto t = as_tensor<float>(input);
+        if (t->is_buffer_backed()) {
+            // Buffer-backend graphs keep the input as a plain NCHW SSBO —
+            // the RGBA pack + copyToGPUImage below is image-model only
+            // (copyToGPUImage casts vkobj_ to VulkanImage unchecked). Same
+            // fill recipe as vkop-bench: fillToCPU reserves the CPU mirror,
+            // copyToGPU stages it into the SSBO.
+            t->fillToCPU(fp32_data);
+            t->copyToGPU(cmdpool);
+            return true;
+        }
         std::vector<float> rgba(static_cast<size_t>(N) * H * W * chan4 * 4,
                                 0.0f);
         for (int n = 0; n < N; ++n) {
@@ -376,9 +387,18 @@ bool Function::preprocess_npy(const std::string &npy_path,
                 }
             }
         }
-        auto t = as_tensor<float>(input);
         t->copyToGPUImage(cmdpool, rgba.data(), true);
     } else if (input->dtype() == typeid(uint16_t)) {
+        auto t = as_tensor<uint16_t>(input);
+        if (t->is_buffer_backed()) {
+            std::vector<uint16_t> plain(fp32_data.size());
+            for (size_t i = 0; i < fp32_data.size(); ++i) {
+                plain[i] = ITensor::fp32_to_fp16(fp32_data[i]);
+            }
+            t->fillToCPU(plain);
+            t->copyToGPU(cmdpool);
+            return true;
+        }
         std::vector<uint16_t> rgba(static_cast<size_t>(N) * H * W * chan4 * 4,
                                    0);
         for (int n = 0; n < N; ++n) {
@@ -403,7 +423,6 @@ bool Function::preprocess_npy(const std::string &npy_path,
                 }
             }
         }
-        auto t = as_tensor<uint16_t>(input);
         t->copyToGPUImage(cmdpool, rgba.data(), true);
     } else {
         std::cerr << "preprocess_npy: unsupported input dtype" << std::endl;

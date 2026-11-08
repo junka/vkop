@@ -50,6 +50,36 @@ class BufferBinaryFactory : public BufferFactory {
                DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
               sizeof(BinaryElemPC), fp16),
           activation_(static_cast<int>(activation)) {}
+
+    // The converter fuses a post-op activation into binary nodes ("activation"
+    // attribute, e.g. resnet's Add+Relu). The shader applies pc.activation
+    // (codes shared with shaders/common/activation.comp) — without this parse
+    // the attribute is silently dropped and every fused-activation Add runs
+    // bare, which corrupted the whole resnet18 buffer trunk downstream.
+    void setAttribute(const std::unordered_map<std::string, std::string>
+                          &attributes) override {
+        if (attributes.count("activation") == 0) {
+            return;
+        }
+        const std::string &a = attributes.at("activation");
+        if (a == "Relu") {
+            activation_ = static_cast<int>(BufferActivation::RELU);
+        } else if (a == "Sigmoid") {
+            activation_ = static_cast<int>(BufferActivation::SIGMOID);
+        } else if (a == "Tanh") {
+            activation_ = static_cast<int>(BufferActivation::TANH);
+        } else if (a == "HardSwish") {
+            activation_ = static_cast<int>(BufferActivation::HSWISH);
+        } else if (a == "Mish") {
+            activation_ = static_cast<int>(BufferActivation::MISH);
+        } else if (a == "Relu6") {
+            activation_ = static_cast<int>(BufferActivation::RELU6);
+        } else {
+            throw std::invalid_argument(
+                "Unsupported buffer binary activation: " + a);
+        }
+    }
+
     bool has_host_side_effects() const override { return true; }
 
   protected:

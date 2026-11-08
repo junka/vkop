@@ -1156,6 +1156,12 @@ template <typename T> class Tensor : public ITensor {
         auto buff = std::dynamic_pointer_cast<VulkanBuffer>(vkobj_);
         return buff && buff->is_host_imported();
     }
+    // True when the current storage is any VulkanBuffer (device-local or
+    // host-imported): the plain copyToGPU() upload is the right path. False
+    // (image-backed or no GPU storage yet) means copyToGPUImage() territory.
+    bool is_buffer_backed() const {
+        return std::dynamic_pointer_cast<VulkanBuffer>(vkobj_) != nullptr;
+    }
 
     std::shared_ptr<VulkanBuffer>
     as_uniform_buffer(std::shared_ptr<VulkanDevice> &vd) {

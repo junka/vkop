@@ -14,6 +14,7 @@
 #include <cmath>
 #include <string>
 #include <iomanip>
+#include <fstream>
 #include <algorithm>
 #include <chrono>
 #include <vector>
@@ -101,6 +102,9 @@ std::vector<std::string> load_labels(const std::string& label_path) {
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
+    // Declared outside try: the CNN profile summary below the catch block
+    // can't see try-scope locals like values_half.
+    const char *post_dtype_tag = "?";
     try {
     auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
     auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
@@ -124,6 +128,12 @@ int main(int argc, char *argv[]) {
 
     int precision = 0;
     auto rt = std::make_shared<Runtime>(cmdpool, binary_file_path, precision);
+    // Buffer backend for the whole graph: without this the per-op device
+    // profile free-runs (Conv/MatMul pick image variants on this GPU) and a
+    // buffer-produced tensor (e.g. GlobalAveragePool) feeds MatMulImage,
+    // which throws at as_input_image. vkop-bench and llm_chat both pin the
+    // buffer backend; npy inputs are buffer-native as well.
+    rt->set_backend_buffer(true);
     rt->LoadModel();
     /* example for debug one node */
     // rt->TraceNode("node_Conv_291");
@@ -199,8 +209,10 @@ int main(int argc, char *argv[]) {
     const auto graph_out = rt->GetOutput();
     if (graph_out->dtype() == typeid(uint16_t)) {
         register_pipeline(uint16_t{});
+        post_dtype_tag = "fp16";
     } else if (graph_out->dtype() == typeid(float)) {
         register_pipeline(float{});
+        post_dtype_tag = "fp32";
     } else {
         std::cerr << "unsupported graph output dtype" << std::endl;
         return 1;
@@ -227,12 +239,14 @@ int main(int argc, char *argv[]) {
     std::vector<float> logits;
     if (out->dtype() == typeid(float)) {
         auto t = vkop::core::as_tensor<float>(out);
+        post_dtype_tag = "fp32";
         logits.resize(t->num_elements());
         for (int i = 0; i < t->num_elements(); ++i) {
             logits[i] = (*t)[i];
         }
     } else if (out->dtype() == typeid(uint16_t)) {
         auto t = vkop::core::as_tensor<uint16_t>(out);
+        post_dtype_tag = "fp16";
         logits.resize(t->num_elements());
         for (int i = 0; i < t->num_elements(); ++i) {
             logits[i] = vkop::core::ITensor::fp16_to_fp32((*t)[i]);
@@ -276,30 +290,26 @@ int main(int argc, char *argv[]) {
 
         std::cout << (i + 1) << ": " << label << " (" << value << ")\n";
     }
-} catch (const std::exception &e) {
-        LOG_ERROR("%s", e.what());
-        return EXIT_FAILURE;
-    }
 
-    // CNN profiling summary.
+    // CNN profiling summary (inside try: it reads try-scope locals).
     if (profile_mode && !cnn_profile.run_times_ms.empty()) {
         std::printf("\n[cnn profile] %s (%s, %d runs):\n",
                     binary_file_path.c_str(),
-                    values_half ? "fp16" : "fp32",
+                    post_dtype_tag,
                     static_cast<int>(cnn_profile.run_times_ms.size()));
         std::printf("  inference: avg=%.1fms  p50=%.1fms  p90=%.1fms  p99=%.1fms\n",
                     cnn_profile.avg_ms(),
                     cnn_profile.percentile(50),
                     cnn_profile.percentile(90),
                     cnn_profile.percentile(99));
-        
+
         if (cnn_profile.preprocess_total_ms > 0) {
             std::printf("  preprocess:  %.1fms (jpeg decode + normalize)\n",
                         cnn_profile.preprocess_total_ms);
         }
-        
+
         std::printf("  postprocess: GPU softmax+topk enabled\n");
-        
+
         // Layout waste stats (will be populated when ImageLayoutProbe is integrated).
         if (cnn_profile.total_allocated_bytes > 0) {
             double waste_pct = (cnn_profile.total_allocated_bytes - cnn_profile.total_packed_bytes) /
@@ -309,9 +319,13 @@ int main(int argc, char *argv[]) {
                         static_cast<unsigned long long>(cnn_profile.total_allocated_bytes / (1024 * 1024)),
                         waste_pct);
         }
-        
+
         std::printf("\n");
         std::fflush(stdout);
+    }
+} catch (const std::exception &e) {
+        LOG_ERROR("%s", e.what());
+        return EXIT_FAILURE;
     }
 
     return EXIT_SUCCESS;
