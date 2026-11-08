@@ -59,9 +59,6 @@ class Function {
     preprocess_npy(const std::string &npy_path,
                    const std::shared_ptr<VulkanCommandPool> &cmdpool,
                    const std::shared_ptr<core::ITensor> &input);
-
-    static std::vector<std::pair<int, float>>
-    get_top_k_predictions(const std::vector<float> &probs, int k);
 };
 
 } // namespace core

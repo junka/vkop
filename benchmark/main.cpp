@@ -7,7 +7,6 @@
 #include "core/Tensor.hpp"
 #include "core/runtime.hpp"
 #include "core/function.hpp"
-#include "core/cpu_postprocess.hpp"
 
 #include <cstdint>
 #include <memory>
@@ -22,7 +21,6 @@
 using vkop::VulkanInstance;
 using vkop::VulkanDevice;
 using vkop::core::Runtime;
-#define USE_GPU_POSTPROCESS
 
 namespace {
 
@@ -142,7 +140,7 @@ int main(int argc, char *argv[]) {
     const char* cnn_prof_env = std::getenv("VKOP_CNN_PROFILE");
     const bool profile_mode = cnn_prof_env != nullptr && cnn_prof_env[0] == '1';
     CnnProfile cnn_profile;
-    cnn_profile.gpu_postprocess = true;  // USE_GPU_POSTPROCESS is defined
+    cnn_profile.gpu_postprocess = true;
 
     vkop::core::NormMethod method = vkop::core::NormMethod::IMAGENET;
     if (binary_file_path.find("inception") != std::string::npos) {
@@ -176,9 +174,6 @@ int main(int argc, char *argv[]) {
                 t_preproc_end - t_preproc_start).count();
         }
     }
-#ifdef USE_GPU_POSTPROCESS
-    // Note: preprocess_jpg is called again above for GPU postprocess path.
-    // This is a bug in the original code but we preserve it for now.
     std::vector<int> shape;
 
     std::shared_ptr<vkop::core::Tensor<int>> indexs;
@@ -217,7 +212,6 @@ int main(int argc, char *argv[]) {
         std::cerr << "unsupported graph output dtype" << std::endl;
         return 1;
     }
-#endif
 
     double tot_lat = 0.0F;
     int count = 100;
@@ -233,35 +227,6 @@ int main(int argc, char *argv[]) {
     std::cout << "avg time:" << tot_lat / count << " ms" << std::endl;
 
     rt->ReadResult();
-#ifndef USE_GPU_POSTPROCESS
-    auto out = rt->GetOutput();
-    auto out_shape = out->getShape();
-    std::vector<float> logits;
-    if (out->dtype() == typeid(float)) {
-        auto t = vkop::core::as_tensor<float>(out);
-        post_dtype_tag = "fp32";
-        logits.resize(t->num_elements());
-        for (int i = 0; i < t->num_elements(); ++i) {
-            logits[i] = (*t)[i];
-        }
-    } else if (out->dtype() == typeid(uint16_t)) {
-        auto t = vkop::core::as_tensor<uint16_t>(out);
-        post_dtype_tag = "fp16";
-        logits.resize(t->num_elements());
-        for (int i = 0; i < t->num_elements(); ++i) {
-            logits[i] = vkop::core::ITensor::fp16_to_fp32((*t)[i]);
-        }
-    } else {
-        std::cerr << "unsupported output dtype" << std::endl;
-        return 1;
-    }
-
-    // CPU softmax(axis=-1) + top10
-    auto probs = vkop::core::cpu::softmax(logits, out_shape, -1);
-    auto topk_result = vkop::core::cpu::topk(probs, out_shape, 10, true, true);
-    const auto &top_vals = topk_result.first;
-    const auto &top_idx = topk_result.second;
-#else
     const auto &top_idx = *indexs;
     std::vector<float> top_vals;
     if (values_half) {
@@ -273,7 +238,6 @@ int main(int argc, char *argv[]) {
     } else {
         top_vals = values_float->data();
     }
-#endif
     std::cout << "\nPredictions:\n";
     std::cout << std::fixed << std::setprecision(3);
 
