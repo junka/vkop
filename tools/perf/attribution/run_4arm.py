@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""P0-1/P0-2 四臂 decode A/B：base/replay/batch/batch+replay × 3 轮交错。
+"""四臂 decode A/B：base/replay/batch/batch+replay × 3 轮交错。
 
 臂（二进制 × VKOP_SEGMENT_REPLAY）：
   A = base  binary, replay off     B = base  binary, replay on
@@ -50,7 +50,7 @@ def run_arm(name, binary, replay, cycle):
     }
     if replay:
         env["VKOP_SEGMENT_REPLAY"] = "1"
-    log_path = LOGDIR / f"p0_{name}_c{cycle}.log"
+    log_path = LOGDIR / f"{name}_c{cycle}.log"
     t0 = time.perf_counter()
     with open(log_path, "w") as log:
         proc = subprocess.run(
