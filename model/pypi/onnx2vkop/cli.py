@@ -221,6 +221,11 @@ Examples:
 
   # With all optimizations
   onnx2vkop -i model.onnx -u -r -b 4
+
+  # Mixed precision: hold one layer's weights wide to localize an accuracy loss
+  onnx2vkop -i model.onnx -q int4 --exclude-scope model.layers.0
+  onnx2vkop -i model.onnx -q awq --awq-format nf4 \\
+      --exclude-node '*/layers.1/attn/*' --exclude-downstream-of /embed
         """,
     )
 
@@ -237,7 +242,10 @@ Examples:
              "per-K-group scale (int4 = signed nibble, nf4 = NF4 codebook index, "
              "nvfp4 = E2M1 nibble with an fp8 e4m3 scale per 16 values plus a "
              "per-tensor fp32 factor), or awq (activation-aware rescaling in "
-             "front of the format named by --awq-format)",
+             "front of the format named by --awq-format). Every byte format "
+             "here, awq included, skips the weights named by --exclude-node / "
+             "--exclude-scope / --exclude-downstream-of; fp16 does not, see "
+             "onnx2vkop/exclusion.py.",
     )
     parser.add_argument(
         "--group-size", type=int, default=64,
@@ -309,6 +317,40 @@ Examples:
              "Runtime::RegisterPostProcess). Names use the same spelling as "
              "ONNX op types; a name the shader map does not know is reported "
              "as a missing archive key and embedded as far as possible.",
+    )
+    # Node/scope-level precision exclusion. Repeatable, and each value may also
+    # be a comma-separated list. These are deliberately NOT env knobs: a
+    # precision A/B is a per-invocation experiment, and a second config source
+    # would let a leftover shell export silently change a run measured without
+    # it.
+    parser.add_argument(
+        "--exclude-node", action="append", default=None, metavar="GLOB",
+        dest="exclude_nodes",
+        help="Node name glob whose weights stay at the dtype they arrived "
+             "with (fnmatch: '*', '?', '[0-9]'). Repeatable, or "
+             "comma-separated. Only -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/awq "
+             "honour it: the named node runs its wide kernel while the rest of "
+             "the model is byte-quantized, which is how a lost percentage "
+             "point gets localized to a layer. A pattern that matches no node "
+             "fails the conversion -- a flag that selected nothing would "
+             "report a clean run and produce the un-excluded model.",
+    )
+    parser.add_argument(
+        "--exclude-scope", action="append", default=None, metavar="PATH",
+        dest="exclude_scopes",
+        help="Module path prefix: every node whose name starts with it on a "
+             "'/' or '.' token boundary, so --exclude-scope model.layers.0 "
+             "covers that block's whole subtree and not layer 01. Same rules "
+             "as --exclude-node.",
+    )
+    parser.add_argument(
+        "--exclude-downstream-of", action="append", default=None,
+        metavar="GLOB", dest="exclude_downstream_of",
+        help="Every node that transitively reads the matched node's output, "
+             "the node itself included: --exclude-downstream-of /embed keeps "
+             "the embedding and everything it feeds wide. Use it when the "
+             "suspect is the error a layer passes on rather than one weight "
+             "table.",
     )
     # Build-time knobs that mirror env vars the code already reads. Setting
     # these on the CLI overrides the env for the current invocation only.
@@ -400,9 +442,49 @@ def _apply_build_knobs(args) -> None:
             print(f"[config] {env_name}={val}")
 
 
+def _any_exclusion(args) -> bool:
+    return bool(args.exclude_nodes or args.exclude_scopes
+                or args.exclude_downstream_of)
+
+
+def _force_payloads_for_exclusion(args) -> None:
+    """Make --stream-weights and the exclusion flags agree, or refuse.
+
+    A weight left in its ONNX data file under -q int8/fp8 is quantized on the
+    way into the trailer (weight_stream/quant_payload), and that code has no
+    notion of a node exclusion -- it would produce the byte weight this run is
+    asking not to produce, and report a clean conversion doing it. The payloads
+    have to be in memory for the exclusion to have anything to skip.
+
+    Only -q int8/fp8e4m3/fp8e5m2 reach that path: 4-bit, nvfp4 and AWQ already
+    refuse deferral because their scales span K, so for those this changes
+    nothing. It is still the memory of the whole model, so the switch is
+    announced rather than silent, and an explicit --stream-weights on is an
+    error rather than a contradiction the run resolves on its own.
+    """
+    if not _any_exclusion(args):
+        return
+    if args.stream_weights == "on":
+        sys.exit(
+            "Error: --stream-weights on cannot be combined with --exclude-*: "
+            "a streamed weight under -q int8/fp8 is quantized at trailer time, "
+            "where the exclusion has no say, so the flag would be ignored. "
+            "Drop --stream-weights (the exclusion forces it off) or drop the "
+            "exclusion.")
+    if args.quant in ("int8", "fp8e4m3", "fp8e5m2"):
+        args.stream_weights = "off"
+        print(
+            "[exclude] --stream-weights off: the excluded payloads must be in "
+            "memory for -q "
+            f"{args.quant} to skip them (a streamed weight is quantized at "
+            "trailer time, which ignores the exclusion). This conversion holds "
+            "the weights in RAM.", file=sys.stderr)
+
+
 def main():
     """Main entry point for the CLI."""
     args = parse_args()
+    _force_payloads_for_exclusion(args)
     _apply_build_knobs(args)
 
     # Validate input file
@@ -437,7 +519,8 @@ def main():
         # Create a simple args object for apply_optimizations
         class Args:
             def __init__(self, quant, unify, rgba, group_size, awq_format,
-                         awq_stats, awq_alpha, awq_grid):
+                         awq_stats, awq_alpha, awq_grid, exclude_nodes,
+                         exclude_scopes, exclude_downstream_of):
                 self.quant = quant
                 self.unify = unify
                 self.rgba = rgba
@@ -446,11 +529,16 @@ def main():
                 self.awq_stats = awq_stats
                 self.awq_alpha = awq_alpha
                 self.awq_grid = awq_grid
+                self.exclude_nodes = exclude_nodes
+                self.exclude_scopes = exclude_scopes
+                self.exclude_downstream_of = exclude_downstream_of
 
         converter.apply_optimizations(
             dag_model, Args(args.quant, args.unify, args.rgba, args.group_size,
                             args.awq_format, args.awq_stats, args.awq_alpha,
-                            args.awq_grid))
+                            args.awq_grid, args.exclude_nodes,
+                            args.exclude_scopes,
+                            args.exclude_downstream_of))
 
         # Post-hoc RegisterPostProcess ops are not graph nodes, so fusion can
         # neither create nor remove them: the extra census is set after the

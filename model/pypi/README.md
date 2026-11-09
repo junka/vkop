@@ -24,3 +24,12 @@ quantize with fp16
 ```
 onnx2vkop -i model.onnx -q fp16
 ```
+
+Hold one layer's weights at their source precision, to localize the accuracy a
+byte format cost (`onnx2vkop/exclusion.py`):
+
+```
+onnx2vkop -i model.onnx -q int4 --exclude-scope model.layers.0
+onnx2vkop -i model.onnx -q int8 --exclude-node '*/attn/v_proj/MatMul' \
+    --exclude-downstream-of /embed
+```

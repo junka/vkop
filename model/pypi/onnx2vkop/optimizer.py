@@ -7842,7 +7842,22 @@ class Quantizer:
         print(f"Preserved {skipped_count} tensors")
 
     @staticmethod
-    def quantize_to_int8_weight_only(dag_model, only=None):
+    def _is_excluded(name, exclude):
+        """True, with the reason printed, when --exclude-* named this weight.
+
+        An excluded weight is PRESERVED, so the caller counts it with the gate
+        rejections: converted + preserved is the weight census, and a separate
+        tally would read as a third category of failure. The name is what makes
+        the A/B arithmetic checkable -- this line, plus the layer the flag
+        quoted, is the whole record of the mixed-precision decision.
+        """
+        if exclude is None or name not in exclude:
+            return False
+        print(f"Excluded '{name}': --exclude-* holds it at its source dtype")
+        return True
+
+    @staticmethod
+    def quantize_to_int8_weight_only(dag_model, only=None, exclude=None):
         """
         Quantize model weights to INT8 using weight-only quantization.
         This function converts appropriate FP32 initializers to INT8, preserving scale information.
@@ -7856,6 +7871,11 @@ class Quantizer:
         - Convolution weights
         - Gemm/Linear weights
         - Recurrent weights
+
+        `exclude` is the weight set the --exclude-* flags resolved to: those
+        names stay exactly as they are, with no scale appended, so their node
+        keeps the wide kernel. See exclusion.py for why the flags are per node
+        and not per op type.
         """
         print("Applying weight-only INT8 quantization...")
 
@@ -7905,6 +7925,9 @@ class Quantizer:
                     inp["name"] for inp in node.inputs[1:4])
 
         for name in initializers_keys:
+            if Quantizer._is_excluded(name, exclude):
+                skipped_count += 1
+                continue
             if only is not None and name not in only:
                 continue
             if name in down_act_weight_names:
@@ -8137,7 +8160,8 @@ class Quantizer:
             else:
                 skipped_count += 1
 
-        converted_count += Quantizer._quantize_down_act_weights(dag_model, only)
+        converted_count += Quantizer._quantize_down_act_weights(
+            dag_model, only, exclude)
 
         print(
             f"Converted {converted_count} FP32/FP16 tensors to INT8 with scale information"
@@ -8298,7 +8322,7 @@ class Quantizer:
         return out
 
     @staticmethod
-    def _quantize_down_act_weights(dag_model, only=None):
+    def _quantize_down_act_weights(dag_model, only=None, exclude=None):
         """Convert the three weights of every SwiGLU-fold node as one set.
 
         A folded down_proj MatMul is [x, Wd, Wg, Wu] (fold_swiglu_down_proj) and
@@ -8325,6 +8349,16 @@ class Quantizer:
                 continue  # already converted (5 inputs), or not the fold shape
             names = [inp["name"] for inp in node.inputs[1:4]]
             if only is not None and any(n not in only for n in names):
+                continue
+            if exclude is not None and any(n in exclude for n in names):
+                # One of the three is excluded, so all three stay wide: the
+                # runtime reads one concatenated scale table for the whole
+                # node, and a two-of-three conversion is a five-input MatMul it
+                # rejects. The pre-fusion graph has a MatMul per member, so a
+                # scope that names the layer excludes all three names at once
+                # and this branch is the belt for a pattern that names only one.
+                print(f"Excluded {names}: --exclude-* holds the whole "
+                      "SwiGLU down fold at its source dtype")
                 continue
             if int(node.attributes.get("transB", 0) or 0) != 0:
                 continue
@@ -8600,7 +8634,7 @@ class Quantizer:
 
     @staticmethod
     def quantize_to_4bit_weight_only(dag_model, group_size: int = 64,
-                                     fmt: str = "int4"):
+                                     fmt: str = "int4", exclude=None):
         """
         Quantize MatMul weights to a 4-bit weight-only payload with a
         per-(K group, output column) fp32 scale.
@@ -8622,6 +8656,10 @@ class Quantizer:
         of rows. Every one of those is a gate below rather than a kernel
         fallback — a graph the runtime cannot read correctly has to fail here,
         where the reason is nameable, instead of computing plausible numbers.
+
+        `exclude` is the --exclude-* weight set: a name in it is neither gated
+        nor encoded, so it keeps the dtype it arrived with and its MatMul runs
+        the wide kernel.
         """
         if fmt not in ("int4", "nf4"):
             raise ValueError(f"unknown 4-bit weight-only format: {fmt!r}")
@@ -8641,6 +8679,9 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if Quantizer._is_excluded(name, exclude):
+                skipped_count += 1
+                continue
             initializer = dag_model.initializers[name]
             consumers = initializer_consumers.get(name, [])
 
@@ -8774,7 +8815,8 @@ class Quantizer:
         )
 
     @staticmethod
-    def quantize_to_fp8_weight_only(dag_model, fmt: str = "fp8e4m3", only=None):
+    def quantize_to_fp8_weight_only(dag_model, fmt: str = "fp8e4m3", only=None,
+                                    exclude=None):
         """
         Quantize MatMul weights to an fp8 weight-only payload with a
         per-output-column fp32 scale.
@@ -8797,6 +8839,10 @@ class Quantizer:
         but only MatMul: conv2d.comp and gemm.comp dequantize int8 and nothing
         else, and the ops refuse a non-int8 quantized weight rather than reading
         exponent bits as a two's-complement value.
+
+        `exclude` is the --exclude-* weight set, honoured here exactly as in the
+        other byte passes: the name keeps its dtype and no scale input is
+        appended, so the node runs the wide MatMul kernel it ran before.
         """
         if fmt not in Quantizer._FP8_FORMATS:
             raise ValueError(
@@ -8816,6 +8862,9 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if Quantizer._is_excluded(name, exclude):
+                skipped_count += 1
+                continue
             if only is not None and name not in only:
                 continue
             initializer = dag_model.initializers[name]
@@ -8964,7 +9013,8 @@ class Quantizer:
     @staticmethod
     def quantize_to_awq_weight_only(dag_model, group_size: int = 64,
                                     fmt: str = "int4", stats_path=None,
-                                    alpha: float = 0.5, n_grid: int = 20):
+                                    alpha: float = 0.5, n_grid: int = 20,
+                                    exclude=None):
         """AWQ-scale the weights, then quantize each to `fmt`.
 
         `fmt` is any of -q's weight-only values (int8, fp8e4m3, fp8e5m2,
@@ -8979,12 +9029,18 @@ class Quantizer:
              per-column / per-group absmax comes out of the scaled weight and
              the AWQ benefit rides through untouched; every other weight takes
              the ordinary path.
+
+        `exclude` is the --exclude-* weight set, and it belongs on step 1, not
+        step 2: filtering the returned set would leave a weight that already
+        carries s and lost its 1/s, which is the wrong model. A name in it is
+        never multiplied, never folded, and therefore never in `scaled` -- so it
+        stays at its source dtype and runs the wide kernel, AWQ included.
         """
         from . import awq as awq_mod
 
         stats = awq_mod.load_stats(stats_path) if stats_path else None
         scaled = awq_mod.apply(dag_model, group_size, fmt=fmt, stats=stats,
-                               alpha=alpha, n_grid=n_grid)
+                               alpha=alpha, n_grid=n_grid, exclude=exclude)
         print(f"AWQ: {len(scaled)} weight(s) carry an AWQ scale; quantizing "
               f"them to {fmt}...")
 
@@ -9036,7 +9092,7 @@ class Quantizer:
 
     @staticmethod
     def quantize_to_nvfp4_weight_only(dag_model, group_size: int = _NVFP4_BLOCK,
-                                       only=None):
+                                      only=None, exclude=None):
         """
         Quantize MatMul weights to NVFP4: an E2M1 nibble per value, an fp8 E4M3
         block scale per 16 contiguous values of K, and one fp32 scale per tensor.
@@ -9063,6 +9119,9 @@ class Quantizer:
         has to read a value back to the host to build a push constant. Gates are
         the 4-bit ones -- MatMul only, plain 2-D B operand, transB == 0, N % 8 --
         plus the block length, which this format fixes at 16.
+
+        `exclude` is the --exclude-* weight set, honoured as in the other byte
+        passes: the name keeps its dtype and no scale input is appended.
         """
         if group_size != Quantizer._NVFP4_BLOCK:
             raise ValueError(
@@ -9084,6 +9143,9 @@ class Quantizer:
                 initializer_consumers[inp["name"]].append(node)
 
         for name in list(dag_model.initializers.keys()):
+            if Quantizer._is_excluded(name, exclude):
+                skipped_count += 1
+                continue
             if only is not None and name not in only:
                 continue
             initializer = dag_model.initializers[name]

@@ -117,6 +117,20 @@ options:
 
 ```
 
+按节点/作用域排除量化（定位精度损失用）：`--exclude-node`（节点名 glob）、
+`--exclude-scope`（模块路径前缀，按 `/` 和 `.` 切 token，故 `layers.0` 不会命中
+`layers.01`）、`--exclude-downstream-of`（命中节点及其全部下游）。被点名的权重保持
+原始 dtype、不追加 scale，其余照常量化，因此两次转换之间只有那一层的精度不同。
+只对 byte 格式（`-q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/awq`）生效：`-q fp16` 下
+单个 fp32 权重需要一个 Cast 节点，不是精度开关，会显式告警。匹配不到任何节点的
+pattern 直接失败——悄悄选空的 flag 会交出未排除的模型却报告成功。详见
+`model/pypi/onnx2vkop/exclusion.py`。
+
+```bash
+python3 -m onnx2vkop.cli -i llm.onnx -q int4 --exclude-scope model.layers.0
+python3 -m onnx2vkop.cli -i llm.onnx -q awq --awq-format nf4 \
+    --exclude-node '*/layers.1/attn/*' --exclude-downstream-of /embed
+```
 
 #### 4. 运行程序
 ```
@@ -324,6 +338,25 @@ options:
     -b, --batch BATCH  batch size for inference
     -r, --rgba         nchw to rgba conversion for initializers
 
+```
+
+Per-node / per-scope precision exclusion (for localizing an accuracy loss):
+`--exclude-node` (a glob on the node name), `--exclude-scope` (a module-path
+prefix, tokenized on both `/` and `.`, so `layers.0` covers `layers.0.attn` and
+not `layers.01`) and `--exclude-downstream-of` (the matched node plus everything
+that reads its output). A named weight keeps the dtype it arrived with and gets
+no scale input, while the rest of the model quantizes as usual -- so the two
+conversions differ in exactly that layer. Only the byte formats honor it
+(`-q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/awq`): under `-q fp16` a lone fp32
+weight needs a Cast node rather than being a precision knob, and the run says
+so. A pattern that matches no node fails the conversion, because a silently
+empty exclusion list would report success on the un-excluded model. See
+`model/pypi/onnx2vkop/exclusion.py`.
+
+```bash
+python3 -m onnx2vkop.cli -i llm.onnx -q int4 --exclude-scope model.layers.0
+python3 -m onnx2vkop.cli -i llm.onnx -q awq --awq-format nf4 \
+    --exclude-node '*/layers.1/attn/*' --exclude-downstream-of /embed
 ```
 
 #### 5. Running the Program

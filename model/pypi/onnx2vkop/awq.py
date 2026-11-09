@@ -356,7 +356,7 @@ def _eligible(dag_model, name, consumers, fmt, group_size):
 
 def apply(dag_model, group_size: int, fmt: str = "int4",
           stats=None, alpha: float = 0.5, n_grid: int = 20,
-          calib_ratio: float = 0.0, names=None):
+          calib_ratio: float = 0.0, names=None, exclude=None):
     """Scale MatMul weights by s and fold 1/s into each one's input.
 
     Returns the set of weight initializer names that now carry an s factor.
@@ -371,6 +371,11 @@ def apply(dag_model, group_size: int, fmt: str = "int4",
     `stats` maps a MatMul *input tensor name* to its per-channel absmax; a
     MatMul whose A name is not in it falls back to the weight-only proxy.
     `names`, when given, restricts the pass to those initializers.
+
+    `exclude` drops initializers from the pass entirely. It has to be honoured
+    here and not by filtering the return value: a weight already multiplied by
+    s and missing the 1/s that went into its input is a wrong model, not a
+    smaller one.
     """
     stats = stats or {}
     initializer_consumers = defaultdict(list)
@@ -383,6 +388,9 @@ def apply(dag_model, group_size: int, fmt: str = "int4",
     scaled = 0
 
     for name in list(dag_model.initializers.keys()):
+        if exclude is not None and name in exclude:
+            print(f"AWQ: leaving '{name}' alone -- --exclude-* names it")
+            continue
         if names is not None and name not in names:
             continue
         init = dag_model.initializers[name]

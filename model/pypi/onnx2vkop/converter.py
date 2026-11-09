@@ -2,6 +2,7 @@
 
 from collections import defaultdict
 import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -19,6 +20,7 @@ try:
     from . import shader_map
     from . import weight_stream
     from . import layout_audit
+    from . import exclusion
     from . import quant_payload
     from .optimizer import (
         FusionOptimizer,
@@ -42,6 +44,7 @@ except ImportError:
     import shader_map
     import weight_stream
     import layout_audit
+    import exclusion
     import quant_payload
     from optimizer import (
         FusionOptimizer,
@@ -890,6 +893,20 @@ class ModelConverter:
             out_name = n.outputs[0]["name"] if isinstance(n.outputs[0], dict) else n.outputs[0]
             pre_producer[out_name] = n
 
+        # The --exclude-* patterns are the exporter's node names, and fusion
+        # rewrites those (fuse_into_attention replaces several MatMuls with one
+        # synthesized node), so the resolution has to happen while the names a
+        # user can actually read still exist. The weights it returns keep those
+        # names through fusion -- a fused node re-points at the same
+        # initializers -- which is what lets the set be computed here and used
+        # at the -q dispatch below.
+        excluded_weights = exclusion.resolve(
+            dag_model,
+            getattr(args, "exclude_nodes", None),
+            getattr(args, "exclude_scopes", None),
+            getattr(args, "exclude_downstream_of", None),
+        )
+
         self.fusion_optimizer.optimize(dag_model)
 
         # The Conv weight-image layout is a converter decision now, so assert it
@@ -914,6 +931,13 @@ class ModelConverter:
         PreQuantizedWeights.fold(dag_model)
 
         if args.quant == "fp16":
+            if excluded_weights:
+                print("[exclude] WARNING: -q fp16 ignores the exclusion "
+                      "flags. A per-node 'stay fp32' verdict needs the same "
+                      "fp32-domain propagation quantize_to_fp16_selective runs "
+                      "for the ops that can only be right at full width -- one "
+                      "wide weight beside fp16 activations is a Cast node, not "
+                      "a precision knob.", file=sys.stderr)
             # The fp16 weight pass needs the target backend: only the buffer
             # backend creates tensors with the dtype the file declares, so only
             # there can a "this op runs fp32" verdict be read off the graph.
@@ -921,15 +945,22 @@ class ModelConverter:
                 dag_model, getattr(args, "target_backend", "buffer")
             )
         elif args.quant == "int8":
-            self.quantizer.quantize_to_int8_weight_only(dag_model)
+            self.quantizer.quantize_to_int8_weight_only(
+                dag_model, exclude=excluded_weights
+            )
         elif args.quant in ("int4", "nf4"):
             self.quantizer.quantize_to_4bit_weight_only(
-                dag_model, getattr(args, "group_size", 64), args.quant
+                dag_model, getattr(args, "group_size", 64), args.quant,
+                exclude=excluded_weights,
             )
         elif args.quant in ("fp8e4m3", "fp8e5m2"):
-            self.quantizer.quantize_to_fp8_weight_only(dag_model, args.quant)
+            self.quantizer.quantize_to_fp8_weight_only(
+                dag_model, args.quant, exclude=excluded_weights
+            )
         elif args.quant == "nvfp4":
-            self.quantizer.quantize_to_nvfp4_weight_only(dag_model)
+            self.quantizer.quantize_to_nvfp4_weight_only(
+                dag_model, exclude=excluded_weights
+            )
         elif args.quant == "awq":
             # AWQ is a real-valued weight transform that pairs with any low-bit
             # format; --awq-format picks which. The pass itself is in
@@ -942,7 +973,18 @@ class ModelConverter:
                 getattr(args, "awq_stats", None),
                 getattr(args, "awq_alpha", 0.5),
                 getattr(args, "awq_grid", 20),
+                exclude=excluded_weights,
             )
+        elif excluded_weights:
+            # No -q at all (or a value the byte passes do not answer to): the
+            # exclusion resolved to weights that no quantizer was going to
+            # touch, so the flags changed nothing about this model.
+            print(
+                f"[exclude] WARNING: -q {args.quant!r} runs no weight "
+                f"quantizer, so the {len(excluded_weights)} excluded weight(s) "
+                "were already staying at their source dtype. The flags only "
+                "select anything for -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/"
+                "awq.", file=sys.stderr)
 
         # Every consumer-driven weight layout is settled by now: the fusion
         # passes that fold a Transpose or a Q/DQ pair have re-pointed each
