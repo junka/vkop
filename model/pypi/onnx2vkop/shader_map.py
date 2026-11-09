@@ -267,11 +267,13 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # loud test failure here rather than a silent miss at load time.
     ("Conv2d", "buffer"): [
         "buffer_matmul_pack",
+        "buffer_matmul_pack_bda",
         "buffer_conv2d_bda",
         "buffer_conv2d_bda_fp16",
     ],
     ("Conv", "buffer"): [
         "buffer_matmul_pack",
+        "buffer_matmul_pack_bda",
         "buffer_conv2d_bda",
         "buffer_conv2d_bda_fp16",
     ],

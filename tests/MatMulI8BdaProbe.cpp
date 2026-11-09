@@ -32,6 +32,12 @@ using vkop::VulkanInstance;
 int main() {
     const bool desc_only =
         std::getenv("MATMUL_I8_BDA_DESC_ONLY") != nullptr;
+    // Force the UINT8→UINT32 MMA module (it is the same kernel templated on
+    // the signedness; a device may list one and not the other).
+    const bool uint8_mode = [] {
+        const char *e = std::getenv("VKOP_FORCE_I8_UINT8");
+        return e != nullptr && e[0] == '1';
+    }();
     if (desc_only) {
         unsetenv("VKOP_BDA");
     } else {
@@ -109,6 +115,14 @@ int main() {
 
     out->copyToCPU(pool);
     int failures = 0;
+    if (uint8_mode &&
+        op->route_info().find("coopmat_i8") == std::string::npos) {
+        // The device lists no UINT8 cooperative-matrix tile, so the forced
+        // module was never built and the selector fell back. Skip rather than
+        // claim coverage that did not happen.
+        std::printf("SKIP: device lists no UINT8 coopmat tile\n");
+        return 0;
+    }
     if (!desc_only) {
         if (!op->bda_pipeline_ready()) {
             std::printf("FAIL: MatMul i8 BDA pipeline\n");
@@ -123,8 +137,11 @@ int main() {
         for (int j = 0; j < n; ++j) {
             float want = 0.0F;
             for (int t = 0; t < k; ++t) {
-                want += af[r * k + t] *
-                        (static_cast<float>(bv[t * n + j]) * sv[j]);
+                const float w = uint8_mode
+                                    ? static_cast<float>(
+                                          static_cast<uint8_t>(bv[t * n + j]))
+                                    : static_cast<float>(bv[t * n + j]);
+                want += af[r * k + t] * (w * sv[j]);
             }
             const float got = ITensor::fp16_to_fp32((*out)[r * n + j]);
             // A is quantized to int8 per row inside the kernel.

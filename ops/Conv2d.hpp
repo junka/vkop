@@ -362,6 +362,21 @@ class Conv2dBuffer : public BufferFactory {
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
             }
+            // Optional BDA pack: two direct addresses in a 32 B PC, no
+            // descriptor set. Missing key (an older model subset) or a driver
+            // refusal leaves the descriptor pack in charge.
+            if (bda_ready()) {
+                try {
+                    auto spv = resolve_spv("buffer_matmul_pack_bda");
+                    pack_bda_pipeline_ = std::make_unique<VulkanPipeline>(
+                        dev->getLogicalDevice(),
+                        std::vector<VkDescriptorType>{},
+                        sizeof(MatMulPackBdaPC), spv.first,
+                        static_cast<int>(spv.second), /*uab=*/false, 0, cache);
+                } catch (const std::exception &) {
+                    pack_bda_pipeline_.reset();
+                }
+            }
         }
     }
 
@@ -452,6 +467,14 @@ class Conv2dBuffer : public BufferFactory {
         int _pad1;
         int _pad2;
     };
+    // Mirrors matmul_pack.comp's -DBDA push block (16 B scalars + out/scratch
+    // addresses) and ops::MatMulBuffer's MatMulPackBdaPC.
+    struct alignas(16) MatMulPackBdaPC {
+        MatMulPackPC base;
+        VkDeviceAddress out_addr;
+        VkDeviceAddress scratch_addr;
+    };
+    static_assert(sizeof(MatMulPackBdaPC) == 32, "Conv2d pack BDA PC drift");
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -664,6 +687,31 @@ class Conv2dBuffer : public BufferFactory {
             scratch_->shaderWriteBarrier(m_cmd_->get());
 
             int nwords = (total + 1) / 2;
+            if (pack_bda_pipeline_) {
+                auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+                auto scratch_buf =
+                    std::dynamic_pointer_cast<VulkanBuffer>(objs_[3]);
+                if (out_buf && scratch_buf && out_buf->hasDeviceAddress() &&
+                    scratch_buf->hasDeviceAddress()) {
+                    MatMulPackBdaPC bpc{};
+                    bpc.base.total = total;
+                    bpc.out_addr = out_buf->getDeviceAddress();
+                    bpc.scratch_addr = scratch_buf->getDeviceAddress();
+                    if ((bpc.out_addr % 4) == 0 && (bpc.scratch_addr % 4) == 0) {
+                        if (std::getenv("VKOP_BDA_DEBUG")) {
+                            std::fprintf(stderr,
+                                         "[bda] conv pack key="
+                                         "buffer_matmul_pack_bda\n");
+                        }
+                        m_cmd_->bind_pipeline(*pack_bda_pipeline_);
+                        m_cmd_->push_constants(*pack_bda_pipeline_, sizeof(bpc),
+                                               &bpc);
+                        dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &bpc,
+                                            sizeof(bpc));
+                        return;
+                    }
+                }
+            }
             MatMulPackPC pack_pc{};
             pack_pc.total = total;
 
@@ -699,6 +747,7 @@ class Conv2dBuffer : public BufferFactory {
 
     std::shared_ptr<VulkanBuffer> scratch_;
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
+    std::unique_ptr<VulkanPipeline> pack_bda_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> pack_writes_;
 

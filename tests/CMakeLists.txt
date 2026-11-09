@@ -671,6 +671,26 @@ add_test(NAME MatMulBdaProbe COMMAND MatMulBdaProbe)
 add_test(NAME MatMulBdaProbeDesc COMMAND MatMulBdaProbe)
 set_tests_properties(MatMulBdaProbeDesc PROPERTIES ENVIRONMENT
     "MATMUL_BDA_DESC_ONLY=1")
+# 512-lane W8-WIDE GEMV: VKOP_KSPLIT512 is a process-wide knob, so it needs its
+# own invocation; the probe's byte-weight case asserts the route tag.
+add_test(NAME MatMulBdaProbeKsplit512 COMMAND MatMulBdaProbe)
+set_tests_properties(MatMulBdaProbeKsplit512 PROPERTIES ENVIRONMENT
+    "MATMUL_BDA_KSPLIT512=1")
+add_test(NAME MatMulBdaProbeKsplit512Desc COMMAND MatMulBdaProbe)
+set_tests_properties(MatMulBdaProbeKsplit512Desc PROPERTIES ENVIRONMENT
+    "MATMUL_BDA_KSPLIT512=1;MATMUL_BDA_DESC_ONLY=1")
+# ARL fp16 alternate coop geometries (VKOP_FORCE_BM/BN); the probe pins the
+# expected workgroup tile from MATMUL_BDA_COOP_ROUTE.
+foreach(alt 8:64 32:16 64:8)
+    string(REPLACE ":" ";" alt_pair "${alt}")
+    list(GET alt_pair 0 alt_bm)
+    list(GET alt_pair 1 alt_bn)
+    add_test(NAME MatMulBdaProbeCoopAlt_${alt_bm}x${alt_bn}
+             COMMAND MatMulBdaProbe)
+    set_tests_properties(MatMulBdaProbeCoopAlt_${alt_bm}x${alt_bn} PROPERTIES
+        ENVIRONMENT
+        "MATMUL_BDA_ALLOW_COOP=1;VKOP_FORCE_COOP=1;VKOP_FORCE_BM=${alt_bm};VKOP_FORCE_BN=${alt_bn};MATMUL_BDA_COOP_ROUTE=bm=${alt_bm} bn=${alt_bn}")
+endforeach()
 
 # Reduce / Transpose: two direct addresses, no table.
 add_executable(ReduceTransposeBdaProbe ReduceTransposeBdaProbe.cpp)
@@ -751,6 +771,14 @@ add_test(NAME MatMulI8BdaProbe COMMAND MatMulI8BdaProbe)
 add_test(NAME MatMulI8BdaProbeDesc COMMAND MatMulI8BdaProbe)
 set_tests_properties(MatMulI8BdaProbeDesc PROPERTIES ENVIRONMENT
     "MATMUL_I8_BDA_DESC_ONLY=1")
+# UINT8→UINT32 MMA module (same source, templated signedness). The probe skips
+# when the device lists no UINT8 coopmat tile.
+add_test(NAME MatMulI8BdaProbeU8 COMMAND MatMulI8BdaProbe)
+set_tests_properties(MatMulI8BdaProbeU8 PROPERTIES ENVIRONMENT
+    "VKOP_FORCE_I8_UINT8=1")
+add_test(NAME MatMulI8BdaProbeU8Desc COMMAND MatMulI8BdaProbe)
+set_tests_properties(MatMulI8BdaProbeU8Desc PROPERTIES ENVIRONMENT
+    "VKOP_FORCE_I8_UINT8=1;MATMUL_I8_BDA_DESC_ONLY=1")
 
 # SwiGLU down-projection fold (MatMul down_act=1): the widest address table
 # (nine buffers, typed uvec4/uvec2 aliases). M==1 and M>1 take different

@@ -40,7 +40,8 @@ int failures = 0;
 
 void run_case(std::shared_ptr<VulkanDevice> &dev,
               std::shared_ptr<VulkanCommandPool> &pool, int m, int n, int k,
-              bool expect_bda, bool desc_only) {
+              bool expect_bda, bool desc_only,
+              const char *expect_route = nullptr) {
     auto a = std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, k});
     auto b = std::make_shared<Tensor<uint16_t>>(std::vector<int>{k, n});
     auto out = std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, n});
@@ -77,6 +78,11 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
                 m, n, k, op->route_info().c_str(),
                 op->bda_pipeline_ready() ? 1 : 0, op->bda_dispatched() ? 1 : 0);
 
+    if (expect_route && op->route_info().find(expect_route) ==
+                            std::string::npos) {
+        std::printf("FAIL: route does not contain '%s'\n", expect_route);
+        failures++;
+    }
     if (!desc_only && expect_bda && !op->bda_pipeline_ready()) {
         std::printf("FAIL: MatMul did not build its BDA pipeline\n");
         failures++;
@@ -114,6 +120,82 @@ void run_case(std::shared_ptr<VulkanDevice> &dev,
     std::printf("PASS: MatMul %dx%dx%d\n", m, n, k);
 }
 
+// Byte weight + large N at M=1: the W8-WIDE GEMV routes. With
+// VKOP_KSPLIT512=1 the selector takes the 512-lane build instead; both have
+// their own BDA variant, and the route tag proves which one ran.
+void run_i8_wide_case(std::shared_ptr<VulkanDevice> &dev,
+                      std::shared_ptr<VulkanCommandPool> &pool, int m, int n,
+                      int k, const char *expect_tag, bool desc_only) {
+    auto a = std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, k});
+    auto b = std::make_shared<Tensor<int8_t>>(std::vector<int>{k, n});
+    auto scale = std::make_shared<Tensor<float>>(std::vector<int>{n});
+    auto out = std::make_shared<Tensor<uint16_t>>(std::vector<int>{m, n});
+    std::vector<uint16_t> av(m * k);
+    std::vector<int8_t> bv(k * n);
+    std::vector<float> sv(n), af(m * k);
+    for (int i = 0; i < m * k; ++i) {
+        af[i] = 0.05F + 0.01F * static_cast<float>(i % 5);
+        av[i] = ITensor::fp32_to_fp16(af[i]);
+    }
+    for (int i = 0; i < k * n; ++i) {
+        bv[i] = static_cast<int8_t>((i % 13) - 6);
+    }
+    for (int j = 0; j < n; ++j) {
+        sv[j] = 0.01F + 0.001F * static_cast<float>(j % 7);
+    }
+    a->fillToCPU(av);
+    b->fillToCPU(bv);
+    scale->fillToCPU(sv);
+    a->as_storage_buffer(dev);
+    a->copyToGPU(pool);
+    b->as_storage_buffer(dev);
+    b->copyToGPU(pool);
+    scale->as_storage_buffer(dev);
+    scale->copyToGPU(pool);
+    out->as_storage_buffer(dev);
+    out->toGPU();
+    auto op = vkop::ops::create_from_type(vkop::ops::OpType::MATMUL, 1, 0,
+                                          /*backend_buffer=*/true);
+    op->set_runtime_device(dev, pool);
+    op->onExecute({a, b, scale}, {out}, 0);
+    auto cmd = op->get_record();
+    std::vector<VkSubmitInfo> info{cmd->buildSubmitInfo()};
+    VulkanCommandBuffer::submit(dev->getComputeQueue(), info);
+    cmd->wait();
+    dev->wait_all_done();
+    std::printf("i8 M=%d N=%d K=%d route=%s bda_pipeline=%d "
+                "bda_dispatched=%d\n",
+                m, n, k, op->route_info().c_str(),
+                op->bda_pipeline_ready() ? 1 : 0,
+                op->bda_dispatched() ? 1 : 0);
+    if (op->route_info().find(expect_tag) == std::string::npos) {
+        std::printf("FAIL: i8 route does not contain '%s'\n", expect_tag);
+        failures++;
+    }
+    if (!desc_only && !op->bda_dispatched()) {
+        std::printf("FAIL: i8 WIDE did not dispatch through BDA\n");
+        failures++;
+    }
+    out->copyToCPU(pool);
+    for (int r = 0; r < m; ++r) {
+        for (int j = 0; j < n; ++j) {
+            float want = 0.0F;
+            for (int t = 0; t < k; ++t) {
+                want += af[r * k + t] *
+                        (static_cast<float>(bv[t * n + j]) * sv[j]);
+            }
+            const float got = ITensor::fp16_to_fp32((*out)[r * n + j]);
+            if (std::fabs(got - want) >
+                0.05F * std::max(1.0F, std::fabs(want))) {
+                std::printf("FAIL: i8 out[%d,%d] got %f want %f\n", r, j, got,
+                            want);
+                failures++;
+                return;
+            }
+        }
+    }
+}
+
 } // namespace
 
 int main() {
@@ -127,6 +209,12 @@ int main() {
     // kernel (whose pack pass is also BDA).
     if (std::getenv("MATMUL_BDA_ALLOW_COOP") == nullptr) {
         setenv("VKOP_NO_COOP", "1", 1);
+    }
+    // KernelSelect resolves this once per process, so it has to be set before
+    // the first op exists.
+    const bool ks512 = std::getenv("MATMUL_BDA_KSPLIT512") != nullptr;
+    if (ks512) {
+        setenv("VKOP_KSPLIT512", "1", 1);
     }
     Logger::getInstance().setLevel(LOG_ERROR);
     vkop::dev::seed_shader_archive_from_build_tree();
@@ -152,8 +240,14 @@ int main() {
     run_case(dev, pool, 1, 255, 256, /*expect_bda=*/true, desc_only);
     // M=16: coopmat when allowed (its pack pass is BDA), tiled_ks otherwise.
     run_case(dev, pool, 16, 256, 256, /*expect_bda=*/true, desc_only);
-    // Coop-sized shape (forced primary coop in the test harness).
-    run_case(dev, pool, 64, 1024, 1024, /*expect_bda=*/true, desc_only);
+    // Coop-sized shape (forced primary coop in the test harness). Its route is
+    // pinned only when the caller wants to validate a specific coop geometry
+    // (VKOP_FORCE_BM/BN + MATMUL_BDA_COOP_ROUTE).
+    run_case(dev, pool, 64, 1024, 1024, /*expect_bda=*/true, desc_only,
+             std::getenv("MATMUL_BDA_COOP_ROUTE"));
+    // Byte weight, large N, M=1: W8-WIDE GEMV and its 512-lane build.
+    run_i8_wide_case(dev, pool, 1, 2048, 256,
+                     ks512 ? "ksplit_w8wide512" : "ksplit_w8wide", desc_only);
 
     std::printf(failures ? "RESULT: %d FAILURE(S)\n" : "RESULT: all pass\n",
                 failures);
