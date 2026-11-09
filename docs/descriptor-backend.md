@@ -98,3 +98,36 @@ descriptor set 分配，host 端 update 略降、bind 略升，基本抵消。
 `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` 下，上述测试（含 Conv2d 图像
 路径、Softmax 双 pass、ScatterND 双 pass）没有 descriptor buffer / descriptor
 indexing 相关的 VUID。llvmpipe 也通过。
+
+## Qwen3-VL-2B decode A/B（Intel ARL，2026-11-09）
+
+模型：`llm/exporter/llm.onnx` 用当前 `build/vkop_shaders.bin` 重转
+（`--target-backend buffer --extra-shaders TopK`，内嵌 137 条 shader）。
+旧 `llm/exporter/llm.vkopbin`（10-29）的内嵌归档缺当前 kernel plan 的
+`buffer_matmul_coop_*` / `buffer_topk`，默认配置跑不起来，必须先重转。
+
+提示词 `What is the capital of France?`（`VKOP_RAW_PROMPT=1`），
+`VKOP_GPU_ARGMAX=1`，`max_new=8 --max-kv 128`。每臂 6 次进程，A/B 按
+A B B A 交替；A = 默认（descriptor buffer），B = `VKOP_NO_DESCRIPTOR_BUFFER=1`。
+
+| | A: descriptor buffer | B: descriptor set |
+|---|---|---|
+| 7 步 per-step min 之和 / 7 | 66.47 ms/token | 63.31 ms/token |
+| per-step 中位（全部 42 步） | 70.75 ms/token | 69.05 ms/token |
+| `[submitprof]` decode TOTAL 中位 | 58.6 ms | 59.3 ms |
+| `[submitprof]` MatMul 中位 | 54.3 ms | 55.0 ms |
+| 稳态 `update` 中位 | 0.23 ms/步 | 0.31 ms/步 |
+| 稳态 `bind_ds` 中位 | 0.17 ms/步 | 0.14 ms/步 |
+| 加载期 set 分配 | 0 | 2040 次，~0.9 ms |
+
+结论：
+
+- 两臂 GPU 执行时间（submitprof TOTAL / MatMul）在噪声内相同，说明
+  descriptor buffer 没有改变 kernel 执行；host 端 per-step 净变化约
+  −0.05 ms（update −0.08，bind +0.03），远小于 iGPU 单轮 2–3x 噪声。
+- 加速收益仍是**加载期 2040 次 descriptor set 分配归零**；decode 是 GPU-bound，
+  拿不到 round 级收益。
+- 与 `docs/down-act-fold-report.md` 记录的 ARL Qwen3-VL 基线对照：该文 fused
+  67.56 ms/token / MatMul 54.96（凉机），unfused 62.09 / 50.90。本次重转日志为
+  `fuse_swiglu_down_proj match (28 fused)`，即 fused 形态；A 臂 66.47 / 54.3、
+  B 臂 63.31 / 55.0，与记录中的 fused 基线一致，没有回归。
