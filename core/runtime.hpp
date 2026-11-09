@@ -14,6 +14,23 @@
 namespace vkop {
 namespace core {
 
+// Which shader build (0 = fp32, 1 = fp16) an op must use for one node.
+//
+// Most ops must follow the DATA tensor's actual dtype rather than the model's
+// precision_: the image backend runs an fp32 model's activation chain in fp16,
+// and the LLM runs fp16 tensors through a runtime whose precision_ is only the
+// fallback for ops whose inputs say nothing (a Cast crosses the domains on
+// purpose). Building such an op from precision_ makes it read the other
+// packing -- a packed half2 word read as one float, or vice versa -- which is
+// silent corruption rather than an error, so the decision lives in one place
+// that a unit test can pin without a GPU or a converted model.
+//
+// `data_input` is the node's first input (nullptr when it has none);
+// `output` is its first output (only FUSED_ELEMWISE reads it). Ops not listed
+// in the table keep `precision`.
+int op_shader_fp16(ops::OpType type, const ITensor *data_input,
+                   const ITensor *output, int precision);
+
 class Runtime {
   private:
     // Graph precision for the tensors this Runtime allocates (outputs at load

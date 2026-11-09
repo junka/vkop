@@ -1,7 +1,6 @@
 // junka @ 2025
 #include <algorithm>
 #include <chrono>
-#include <thread>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -11,6 +10,7 @@
 #include <map>
 #include <numeric>
 #include <queue>
+#include <thread>
 #include <unordered_set>
 
 #include "core/DType.hpp"
@@ -30,6 +30,78 @@ std::shared_ptr<VulkanBufferView> ops::Operator::dummy_bufferview_ = nullptr;
 std::atomic<int> ops::Operator::instance_count_{0};
 std::atomic<long> ops::Operator::replay_total_hits_{0};
 namespace core {
+
+int op_shader_fp16(ops::OpType type, const ITensor *data_input,
+                   const ITensor *output, int precision) {
+    if (data_input == nullptr) {
+        return precision;
+    }
+    switch (type) {
+    case ops::OpType::ADD:
+    case ops::OpType::SUB:
+    case ops::OpType::MUL:
+    case ops::OpType::DIV:
+    case ops::OpType::POW:
+    case ops::OpType::SQRT:
+    case ops::OpType::REDUCE:
+    case ops::OpType::SIGMOID:
+    case ops::OpType::TANH:
+    case ops::OpType::ATAN:
+    case ops::OpType::SOFTPLUS:
+    case ops::OpType::PRELU:
+    case ops::OpType::SOFTMAX:
+    case ops::OpType::SIN:
+    case ops::OpType::COS:
+    case ops::OpType::NEG:
+    case ops::OpType::ERF:
+    case ops::OpType::FLOOR:
+    case ops::OpType::RELU:
+    case ops::OpType::MATMUL:
+    case ops::OpType::TRANSPOSE:
+    case ops::OpType::CONCAT:
+    case ops::OpType::CONV2D:
+    case ops::OpType::ROTARY_EMBEDDING:
+    case ops::OpType::GATHER:
+    case ops::OpType::EXPAND:
+    case ops::OpType::RESHAPE:
+    case ops::OpType::SLICE:
+    case ops::OpType::SPLIT:
+    case ops::OpType::RESIZE:
+    case ops::OpType::SCATTER_ELEMENTS:
+    case ops::OpType::RMSNORM:
+    case ops::OpType::LAYERNORM:
+    case ops::OpType::REDUCEMEAN:
+    case ops::OpType::MIN:
+    case ops::OpType::MAX:
+    case ops::OpType::MAXPOOL2D:
+    case ops::OpType::MOD:
+    case ops::OpType::TOPK:
+    case ops::OpType::GLOBALAVERAGEPOOL:
+        // TopK's k-even padding, unpacking and value packing are keyed on true
+        // fp16 data (para_.fp16), while the MoE router runs fp32 softmax
+        // probabilities through it. GlobalAveragePool packs two halfs per word
+        // in its fp16 build and one word per element in fp32, and its push
+        // constant's thread count follows the same choice, so a precision_ that
+        // disagrees with the tensor is an out-of-bounds write, not just bad
+        // numbers.
+        return (data_input->dtype() == typeid(uint16_t)) ? 1 : 0;
+    case ops::OpType::ATTENTION:
+        // Q/K/V share one dtype (fp16 on the LLM path, fp32 in tests); the
+        // build follows input[0] (Q) like RMSNorm.
+        return (data_input->dtype() == typeid(uint16_t)) ? 1 : 0;
+    case ops::OpType::FUSED_ELEMWISE:
+        // Fusion across Cast: the chain's leaf inputs may be mixed fp16/fp32
+        // (a Cast crosses dtype inside the chain). The build dtype follows the
+        // OUTPUT (terminal) dtype, not input[0], so the output packing matches
+        // the terminal.
+        if (output != nullptr && output->dtype() == typeid(uint16_t)) {
+            return 1;
+        }
+        return 0;
+    default:
+        return precision;
+    }
+}
 
 Runtime::Runtime(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                  std::string model_path, int precision, std::string cache_dir)
@@ -1367,82 +1439,13 @@ void Runtime::LoadModel() {
             }
             // For elementwise / unary / reduce / activation ops the fp16 flag
             // must track the DATA input's actual dtype, not the global
-            // precision_. The RMSNorm chain runs Pow/ReduceMean/Sqrt/Div in an
-            // fp32 domain (wrapped by Cast to=1 ... to=10) so x^2 for |x|~200
-            // doesn't overflow fp16. If we force fp16 shaders here, the fp32
-            // Cast output gets read as packed half2 garbage and Pow overflows.
-            int op_fp16 = precision_;
-            if (!node_inputs.empty() && node_inputs[0] != nullptr) {
-                switch (type) {
-                case vkop::ops::OpType::ADD:
-                case vkop::ops::OpType::SUB:
-                case vkop::ops::OpType::MUL:
-                case vkop::ops::OpType::DIV:
-                case vkop::ops::OpType::POW:
-                case vkop::ops::OpType::SQRT:
-                case vkop::ops::OpType::REDUCE:
-                case vkop::ops::OpType::SIGMOID:
-                case vkop::ops::OpType::TANH:
-                case vkop::ops::OpType::ATAN:
-                case vkop::ops::OpType::SOFTPLUS:
-                case vkop::ops::OpType::PRELU:
-                case vkop::ops::OpType::SOFTMAX:
-                case vkop::ops::OpType::SIN:
-                case vkop::ops::OpType::COS:
-                case vkop::ops::OpType::NEG:
-                case vkop::ops::OpType::ERF:
-                case vkop::ops::OpType::FLOOR:
-                case vkop::ops::OpType::RELU:
-                case vkop::ops::OpType::MATMUL:
-                case vkop::ops::OpType::TRANSPOSE:
-                case vkop::ops::OpType::CONCAT:
-                case vkop::ops::OpType::CONV2D:
-                case vkop::ops::OpType::ROTARY_EMBEDDING:
-                case vkop::ops::OpType::GATHER:
-                case vkop::ops::OpType::EXPAND:
-                case vkop::ops::OpType::RESHAPE:
-                case vkop::ops::OpType::SLICE:
-                case vkop::ops::OpType::SPLIT:
-                case vkop::ops::OpType::RESIZE:
-                case vkop::ops::OpType::SCATTER_ELEMENTS:
-                case vkop::ops::OpType::RMSNORM:
-                case vkop::ops::OpType::LAYERNORM:
-                case vkop::ops::OpType::REDUCEMEAN:
-                case vkop::ops::OpType::MIN:
-                case vkop::ops::OpType::MAX:
-                case vkop::ops::OpType::MAXPOOL2D:
-                case vkop::ops::OpType::MOD:
-                case vkop::ops::OpType::TOPK:
-                    // TopK's k-even padding, unpacking and value packing are
-                    // keyed on true fp16 data (para_.fp16), while the MoE
-                    // router runs fp32 softmax probabilities through it. The
-                    // op must therefore be built from the DATA input's dtype
-                    // too; precision_ would make topk16() read fp32 logits as
-                    // packed half2 and corrupt the routing weights/ids.
-                    op_fp16 =
-                        (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
-                    break;
-                case vkop::ops::OpType::ATTENTION:
-                    // Q/K/V share one dtype (fp16 on the LLM path, fp32 in
-                    // tests); the build follows input[0] (Q) like RMSNorm.
-                    op_fp16 =
-                        (node_inputs[0]->dtype() == typeid(uint16_t)) ? 1 : 0;
-                    break;
-                case vkop::ops::OpType::FUSED_ELEMWISE:
-                    // Fusion across Cast: the chain's leaf inputs may be mixed
-                    // fp16/fp32 (a Cast crosses dtype inside the chain). The
-                    // build dtype follows the OUTPUT (terminal) dtype, not
-                    // input[0], so the output packing matches the terminal.
-                    op_fp16 =
-                        (!node_outputs.empty() && node_outputs[0] != nullptr &&
-                         node_outputs[0]->dtype() == typeid(uint16_t))
-                            ? 1
-                            : 0;
-                    break;
-                default:
-                    break;
-                }
-            }
+            // precision_; op_shader_fp16 is the single table for that decision
+            // (and what its unit test pins).
+            const ITensor *data_in =
+                node_inputs.empty() ? nullptr : node_inputs[0].get();
+            const ITensor *data_out =
+                node_outputs.empty() ? nullptr : node_outputs[0].get();
+            int op_fp16 = op_shader_fp16(type, data_in, data_out, precision_);
             auto op = ops::create_from_type(type, op_fp16,
                                             dev->is_support_nv_tensor_core(),
                                             backend_buffer_);

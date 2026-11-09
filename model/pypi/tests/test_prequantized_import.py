@@ -565,6 +565,21 @@ def test_int8_conv_scale_arriving_as_fp16_is_widened():
                                      arr(scale16).astype(numpy.float32))
 
 
+def test_int8_conv_scale_without_axis_uses_the_onnx_default():
+    """ONNX DequantizeLinear.axis defaults to 1, the input-channel axis for a
+    Conv weight, while the kernel's table is per output channel (dim 0). When
+    the exporter omits axis and OC == IC the lengths match, so a default of 0
+    would silently apply each scale to the wrong axis; the fold must reject
+    the graph instead, which means using the spec default here."""
+    oc = ic = 8
+    twin = quantize_int8(float_weight_graph(
+        conv_weights(oc, ic, 3, 3, 28), [("Conv", "c", {}, ["x", "W"])]))
+    payload, scale = twin.initializers["W"], twin.initializers["W_scale"]
+    m = dq_graph(payload, scale, [("Conv", "c", {}, ["x", DQ_OUT])])
+    with pytest.raises(ValueError, match="must spell out axis=0"):
+        run(PreQuantizedWeights.fold, m)
+
+
 # --------------------------------------------------------------------------
 # positive: an integer constant no kernel decodes is evaluated, not bound
 # --------------------------------------------------------------------------

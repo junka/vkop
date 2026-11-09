@@ -9714,12 +9714,20 @@ class PreQuantizedWeights:
                 f"Conv kernel walks one fp32 scale per output channel, so a "
                 f"per-tensor scalar has no kernel here."
             )
-        axis = PreQuantizedWeights._axis(node, 0, len(dims))
+        # ONNX defaults DequantizeLinear's axis to 1, not 0, and the default
+        # matters here: a Conv weight's per-output-channel table indexes dim 0,
+        # so a graph that omits axis is saying "per input channel" (which the
+        # kernel cannot read). Keep the spec default so the axis check below
+        # rejects it instead of silently reinterpreting the table when
+        # OC happens to equal IC.
+        axis = PreQuantizedWeights._axis(node, 1, len(dims))
         if axis != 0 or scale.shape[0] != dims[0]:
             raise ValueError(
                 f"'{payload.name}': per-axis {label} Conv scale indexes dim {axis} "
                 f"(length {scale.shape[0]}), but the kernel's scale is per output "
-                f"channel — dim 0 (length {dims[0]}) of a {dims} kernel."
+                f"channel — dim 0 (length {dims[0]}) of a {dims} kernel. A Conv "
+                f"weight must spell out axis=0; ONNX defaults DequantizeLinear's "
+                f"axis to 1, which is the input-channel axis here."
             )
         PreQuantizedWeights._require_finite(scale, payload.name, label)
 

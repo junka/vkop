@@ -547,3 +547,18 @@ target_sources(all_tests PRIVATE ${CONV_WL_VKOPBIN} ${CONV_WL_VKOPBIN_FALLBACK})
 target_compile_definitions(all_tests PRIVATE
     CONV_WEIGHT_LAYOUT_DATA="${CONV_WL_DIR}")
 add_dependencies(all_tests shader_archive)
+
+# Runtime's per-op shader dtype decision (core::op_shader_fp16). Plain main: it
+# reads dtype() only, so it needs neither a Vulkan device nor a converted
+# model. Guards the GlobalAveragePool regression where the buffer kernel's
+# fp16/fp32 build followed precision_ instead of the data dtype.
+add_executable(OpPrecisionTest OpPrecisionTest.cpp)
+target_link_libraries(OpPrecisionTest PRIVATE vkop vload)
+add_test(NAME OpPrecisionTest COMMAND OpPrecisionTest)
+
+# preprocess_jpg on an SSBO-backed input (the backend_buffer path vkbench now
+# forces). Reproduces the null-VulkanImage segfault when the buffer branch is
+# missing, and checks the packed NCHW values against a solid-color PPM.
+add_executable(PreprocessJpgTest PreprocessJpgTest.cpp)
+target_link_libraries(PreprocessJpgTest PRIVATE vkop vload)
+add_test(NAME PreprocessJpgTest COMMAND PreprocessJpgTest)

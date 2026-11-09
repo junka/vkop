@@ -51,8 +51,9 @@ class Function {
      *        for debugging use
      *
      * npy format as NCHW float32 normalized, shape [1,C,H,W] or [C,H,W]
-     * input 张量的 dtype 重新打包成 RGBA（fp16 输入会转 fp16），
-     * 复用 preprocess_jpg 的 copyToGPUImage(rgba=true) 上传路径。
+     * A buffer-backed input (backend_buffer) is filled as plain NCHW SSBO;
+     * an image-backed one is repacked into RGBA in its own dtype and uploaded
+     * through copyToGPUImage(rgba=true).
      *
      */
     static bool

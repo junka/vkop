@@ -100,10 +100,10 @@ std::vector<std::string> load_labels(const std::string& label_path) {
 int main(int argc, char *argv[]) {
     Logger::getInstance().setLevel(LOG_INFO);
     Logger::getInstance().enableFileOutput("log", true);
-    // Declared outside try: the CNN profile summary below the catch block
-    // can't see try-scope locals like values_half.
-    const char *post_dtype_tag = "?";
     try {
+    // The shown dtype, for the CNN profile summary below (the graph output's
+    // own dtype, not `precision`: see register_pipeline).
+    const char *post_dtype_tag = "?";
     auto phydevs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
     auto dev = std::make_shared<VulkanDevice>(phydevs[0]);
     if (dev->getDeviceName().find("llvmpipe") != std::string::npos) {

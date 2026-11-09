@@ -2,6 +2,7 @@
 #include "function.hpp"
 #include "core/runtime.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -9,6 +10,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 extern "C" {
@@ -130,28 +132,73 @@ Function::preprocess_jpg(const char *input_file,
         }
     };
 
+    // Buffer backend: the graph input is a compact NCHW SSBO, not an
+    // image2DArray. copyToGPUImage casts vkobj_ to VulkanImage unchecked and
+    // would dereference null here, so pack plain NCHW and use the ordinary
+    // fillToCPU + copyToGPU upload -- the same recipe preprocess_npy uses for
+    // buffer-native inputs. A single image is replicated across the batch,
+    // which is the only sensible reading of one file for an N>1 input (the
+    // image path never supported N>1 at all).
+    auto buffer_pack = [&](auto tensor_type) -> bool {
+        using T = decltype(tensor_type);
+        auto t = vkop::core::as_tensor<T>(input);
+        if (!t->is_buffer_backed()) {
+            return false;
+        }
+        const auto shape = input->getShape();
+        const int n_batch = shape.size() > 0 ? shape[0] : 1;
+        const int n_chan = shape.size() > 1 ? shape[1] : 3;
+        const size_t plane = static_cast<size_t>(resize_h) * resize_w;
+        std::vector<T> nchw(static_cast<size_t>(n_batch) * n_chan * plane);
+        for (int n = 0; n < n_batch; ++n) {
+            for (int c = 0; c < std::min(n_chan, 3); ++c) {
+                for (size_t i = 0; i < plane; ++i) {
+                    const float v = normalize(
+                        static_cast<float>(processed_image[(i * 3) + c]), c);
+                    const size_t dst =
+                        (static_cast<size_t>(n) * n_chan + c) * plane + i;
+                    if constexpr (std::is_same_v<T, uint16_t>) {
+                        nchw[dst] = vkop::core::ITensor::fp32_to_fp16(v);
+                    } else {
+                        nchw[dst] = v;
+                    }
+                }
+            }
+        }
+        t->fillToCPU(nchw);
+        t->copyToGPU(cmdpool);
+        return true;
+    };
+
     // 1, 3, h, w, RGBA copy directly
+    bool handled = false;
     if (input->dtype() == typeid(float)) {
-        std::vector<float> normalized_data(resize_h * resize_w * 4);
-        for (int c = 0; c < 3; c++) {
-            for (int i = 0; i < resize_h * resize_w; i++) {
-                normalized_data[(i * 4) + c] = normalize(
-                    static_cast<float>(processed_image[(i * 3) + c]), c);
+        handled = buffer_pack(float{});
+        if (!handled) {
+            std::vector<float> normalized_data(resize_h * resize_w * 4);
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < resize_h * resize_w; i++) {
+                    normalized_data[(i * 4) + c] = normalize(
+                        static_cast<float>(processed_image[(i * 3) + c]), c);
+                }
             }
+            auto t = vkop::core::as_tensor<float>(input);
+            t->copyToGPUImage(cmdpool, normalized_data.data(), true);
         }
-        auto t = vkop::core::as_tensor<float>(input);
-        t->copyToGPUImage(cmdpool, normalized_data.data(), true);
     } else if (input->dtype() == typeid(uint16_t)) {
-        std::vector<uint16_t> normalized_data(resize_h * resize_w * 4);
-        for (int c = 0; c < 3; c++) {
-            for (int i = 0; i < resize_h * resize_w; i++) {
-                normalized_data[(i * 4) + c] =
-                    vkop::core::ITensor::fp32_to_fp16(normalize(
-                        static_cast<float>(processed_image[(i * 3) + c]), c));
+        handled = buffer_pack(uint16_t{});
+        if (!handled) {
+            std::vector<uint16_t> normalized_data(resize_h * resize_w * 4);
+            for (int c = 0; c < 3; c++) {
+                for (int i = 0; i < resize_h * resize_w; i++) {
+                    normalized_data[(i * 4) + c] =
+                        vkop::core::ITensor::fp32_to_fp16(normalize(
+                            static_cast<float>(processed_image[(i * 3) + c]), c));
+                }
             }
+            auto t = vkop::core::as_tensor<uint16_t>(input);
+            t->copyToGPUImage(cmdpool, normalized_data.data(), true);
         }
-        auto t = vkop::core::as_tensor<uint16_t>(input);
-        t->copyToGPUImage(cmdpool, normalized_data.data(), true);
     }
     free(processed_image);
     return {image_h, image_w};
