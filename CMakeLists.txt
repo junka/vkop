@@ -193,9 +193,9 @@ list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
 # module under the same key.
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_down_act\\.comp$")
 # matmul_coop16_inwg.comp (a b3 SPLITK_INWG experiment) is dead: the host
-# route is disabled (coopmat_inwg_applies returns false) and no variant ever
-# shipped as its own source. Keep it out of the generic loop; if the route is
-# ever revived it needs an explicit vkop_shader_variant entry.
+# route is disabled (coopmat_inwg_applies returns false). Keep it out of the
+# generic loop -- the explicit vkop_shader_variant entry below builds it with
+# -DSPLITK_INWG, which the loop would otherwise compile without the flag.
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_inwg\\.comp$")
 # matmul_coop16_sklast.comp carries the SK_LASTBLOCK (+ optional ENABLE_HALF2_EPI)
 # implementation as a complete separate source -- it has its own STORE_C macro,
@@ -669,14 +669,16 @@ vkop_shader_variant(buffer_matmul_coop_splitk_fold_bda buffer/matmul_coop
 
 # SPLITK_INWG: split-K inside one workgroup, no global scratch, single
 # dispatch. coop_split (uPC.ksplit, 1..8) serial passes over K-range slices,
-# cross-pass reduction in shared memory. Only coop.comp's INWG is built: the
-# coop16 INWG variant was never shipped as its own source, and the host treats
-# that route as unavailable (KernelSelect's kCoopmatInwg retry). Host guard:
-# ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK.
+# cross-pass reduction in shared memory. Both tile sizes ship a key; the host
+# still treats the route as unavailable (KernelSelect's kCoopmatInwg retry),
+# so the bytes are probe/bench-only until the dispatch branch lands. Host
+# guard: ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK.
 vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
                     -DSPLITK_INWG)
 vkop_shader_variant(buffer_matmul_coop_inwg_bda buffer/matmul_coop
                     -DSPLITK_INWG -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_inwg buffer/matmul_coop16_inwg
+                    -DSPLITK_INWG)
 
 # ARL fp16 workgroup BM/BN variants over macroized matmul_coop.comp.
 # All share the same MMA tile (CM=CN=CK=8/8/16); only SG_M/SG_N/BM/BN
