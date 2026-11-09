@@ -22,7 +22,9 @@
 //       [--shape name:d1xd2x...]      (may repeat; required for dynamic dims)
 //       [--seed N]
 //       [--load-inputs DIR]           (per-input <DIR>/<name>.npy, random for misses)
-//       [--save-outputs DIR]          (raw bytes to <DIR>/<name>.bin after the last run)
+//       [--save-outputs DIR]          (raw bytes to <DIR>/<name>.bin plus a
+//                                     <DIR>/manifest.tsv of name/bytes-as/dims/
+//                                     nbytes, taken after the last run)
 //
 // Dynamic-shape inputs: LoadModel turns every -1 sentinel into a
 // placeholder dim of 1 (see core/runtime.cpp:186ff), so a raw run without
@@ -109,7 +111,8 @@ void usage(const char *argv0) {
                  "  --shape name:d1xd2x...   resize an input; may repeat\n"
                  "  --seed N                fill RNG seed (default 0xc0ffee)\n"
                  "  --load-inputs DIR     fill inputs from DIR/<name>.npy; misses fall back to random\n"
-                 "  --save-outputs DIR    write each output to DIR/<name>.bin after the last run\n"
+                 "  --save-outputs DIR    write each output to DIR/<name>.bin plus DIR/manifest.tsv\n"
+                 "                        (name, bytes-as, dims, nbytes) after the last run\n"
                  "  --profile-out FILE    dump per-node GPU timings as JSON (enables submit profiling)\n"
                  "  --device N            pick physical device N (sorted discrete>iGPU>cpu; default 0)\n"
                  "  --list-devices        enumerate physical devices and exit\n"
@@ -478,12 +481,67 @@ void upload_by_dtype(const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
         as_tensor<uint16_t>(t)->copyToGPU(cmdpool);
 }
 
-// Write every graph output's bytes to <dir>/<name>.bin. Shape and dtype
-// stay implicit (from the .vkopbin + inspect); a consumer reconstructs
-// via np.frombuffer(open(...,'rb').read(), dtype).reshape(shape).
+// What the bytes in a saved .bin ARE, named the way a numpy reader needs: the
+// storage type the dump below writes, not the element kind the graph declares.
+// The two differ for every opaque-byte format (an fp8 or int4 payload is
+// storage uint8 either way), and the declared kind stays readable from the
+// .vkopbin -- here only the first one can be wrong in a way that decodes to a
+// plausible-looking array.
+const char *bytes_label(const std::type_info &dt) {
+    if (dt == typeid(float))
+        return "float32";
+    if (dt == typeid(int64_t))
+        return "int64";
+    if (dt == typeid(int))
+        return "int32";
+    if (dt == typeid(int8_t))
+        return "int8";
+    return "float16";  // the uint16_t branch everything else lands in
+}
+
+std::string dims_label(const std::vector<int> &shape) {
+    std::ostringstream s;
+    for (size_t i = 0; i < shape.size(); ++i)
+        s << (i ? "x" : "") << shape[i];
+    return s.str();
+}
+
+// One output dumped through its Tensor<T>: bytes to `f`, element count to
+// `elems`. False when the tensor is not a Tensor<T> at all, i.e. a storage
+// type this dispatch does not cover -- then nothing was written, and the
+// caller must not record a row for it.
+template <typename T>
+bool dump_as(const std::shared_ptr<ITensor> &t,
+             const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
+             std::ofstream &f, int64_t &elems) {
+    auto tt = as_tensor<T>(t);
+    if (!tt)
+        return false;
+    tt->copyToCPU(cmdpool);
+    const auto &d = tt->data();
+    elems = static_cast<int64_t>(d.size());
+    f.write(reinterpret_cast<const char *>(d.data()), d.size() * sizeof(T));
+    return static_cast<bool>(f);
+}
+
+// Write every graph output's bytes to <dir>/<name>.bin, and one row per output
+// to <dir>/manifest.tsv: name, bytes-as, dims, nbytes -- the shape the runtime
+// actually ran with, which for a dynamic graph is not the -1 sentinel the
+// .vkopbin records. A consumer without those four has to re-derive them from
+// the model file and its own guess about the run, and a wrong guess decodes a
+// mis-shaped or reinterpreted array that then shows up as a small numerical
+// difference instead of as the misread it is.
 void save_outputs(const std::shared_ptr<Runtime> &rt,
                   const std::shared_ptr<vkop::VulkanCommandPool> &cmdpool,
                   const std::string &dir) {
+    std::ofstream mf(dir + "/manifest.tsv");
+    if (!mf)
+        std::fprintf(stderr,
+                     "save: cannot write %s/manifest.tsv -- the .bin files "
+                     "below are unreadable without it\n",
+                     dir.c_str());
+    else
+        mf << "# vkop-bench outputs: name\tbytes-as\tdims\tnbytes\n";
     auto names = rt->ListOutputNames();
     for (const auto &name : names) {
         auto t = rt->GetOutput(name);
@@ -498,39 +556,37 @@ void save_outputs(const std::shared_ptr<Runtime> &rt,
             std::fprintf(stderr, "save: cannot write %s\n", path.c_str());
             continue;
         }
-        // Read GPU buffer back to CPU before writing.
-        if (dt == typeid(int64_t)) {
-            auto tt = as_tensor<int64_t>(t);
-            tt->copyToCPU(cmdpool);
-            const auto &d = tt->data();
-            f.write(reinterpret_cast<const char *>(d.data()),
-                    d.size() * sizeof(int64_t));
-        } else if (dt == typeid(int)) {
-            auto tt = as_tensor<int>(t);
-            tt->copyToCPU(cmdpool);
-            const auto &d = tt->data();
-            f.write(reinterpret_cast<const char *>(d.data()),
-                    d.size() * sizeof(int));
-        } else if (dt == typeid(int8_t)) {
-            auto tt = as_tensor<int8_t>(t);
-            tt->copyToCPU(cmdpool);
-            const auto &d = tt->data();
-            f.write(reinterpret_cast<const char *>(d.data()),
-                    d.size() * sizeof(int8_t));
-        } else if (dt == typeid(float)) {
-            auto tt = as_tensor<float>(t);
-            tt->copyToCPU(cmdpool);
-            const auto &d = tt->data();
-            f.write(reinterpret_cast<const char *>(d.data()),
-                    d.size() * sizeof(float));
-        } else {
-            auto tt = as_tensor<uint16_t>(t);
-            tt->copyToCPU(cmdpool);
-            const auto &d = tt->data();
-            f.write(reinterpret_cast<const char *>(d.data()),
-                    d.size() * sizeof(uint16_t));
+        // Read GPU buffer back to CPU before writing. A storage type this
+        // dispatch has no branch for used to reach the uint16_t cast and crash
+        // inside it; now it names the tensor and dumps nothing, because a
+        // manifest row for bytes that were never written is worse than no row.
+        int64_t elems = 0;
+        bool wrote = false;
+        if (dt == typeid(int64_t))
+            wrote = dump_as<int64_t>(t, cmdpool, f, elems);
+        else if (dt == typeid(int))
+            wrote = dump_as<int>(t, cmdpool, f, elems);
+        else if (dt == typeid(int8_t))
+            wrote = dump_as<int8_t>(t, cmdpool, f, elems);
+        else if (dt == typeid(float))
+            wrote = dump_as<float>(t, cmdpool, f, elems);
+        else
+            wrote = dump_as<uint16_t>(t, cmdpool, f, elems);
+        if (!wrote) {
+            std::fprintf(stderr, "save: %s: no tensor view for its storage type\n",
+                         name.c_str());
+            continue;
         }
-        std::printf("  saved %s -> %s\n", name.c_str(), path.c_str());
+        if (mf) {
+            // nbytes is the stream position, i.e. what is actually on disk --
+            // so dims x bytes-as x nbytes is a check the consumer can run, not
+            // a claim about the tensor.
+            mf << name << '\t' << bytes_label(dt) << '\t'
+               << dims_label(t->getShape()) << '\t'
+               << static_cast<int64_t>(f.tellp()) << '\n';
+        }
+        std::printf("  saved %s -> %s (%lld elements)\n", name.c_str(),
+                    path.c_str(), (long long)elems);
     }
 }
 
