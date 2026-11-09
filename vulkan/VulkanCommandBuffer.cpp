@@ -55,9 +55,21 @@ void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
     vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
                       pipeline.getPipeline());
     const uint64_t t_prof1 = ds_prof_now();
-    vkCmdBindDescriptorSets(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
-                            pipeline.getPipelineLayout(), 0, 1, &descriptor_set,
-                            0, nullptr);
+    if (pipeline.usesDescriptorBuffer()) {
+        // The descriptor bytes live in the pipeline's own buffer; only the
+        // buffer binding is stateful. Re-bind it when switching pipelines and
+        // always set this dispatch's set offset (the token encodes the slot).
+        const VkBuffer buffer = pipeline.getDescriptorBuffer();
+        if (buffer != m_descriptor_buffer_bound_) {
+            pipeline.bindDescriptorBuffer(m_commandBuffer_);
+            m_descriptor_buffer_bound_ = buffer;
+        }
+        pipeline.setDescriptorBufferOffsets(m_commandBuffer_, descriptor_set);
+    } else {
+        vkCmdBindDescriptorSets(
+            m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+            pipeline.getPipelineLayout(), 0, 1, &descriptor_set, 0, nullptr);
+    }
     ds_prof_record("bind_pipeline", t_prof1 - t_prof0, 1);
     ds_prof_record("bind_ds", ds_prof_now() - t_prof1, 1);
 }
@@ -135,6 +147,9 @@ void VulkanCommandBuffer::begin() {
     if (replayable_) {
         vkResetCommandBuffer(m_commandBuffer_, 0);
     }
+    // begin() always starts a fresh recording (non-replayable buffers were
+    // reset externally); descriptor-buffer binding is recording state.
+    m_descriptor_buffer_bound_ = VK_NULL_HANDLE;
 
     // Defensive: a NULL handle means the buffer was never allocated (or was
     // lost); re-allocate rather than crashing inside vkBeginCommandBuffer.
@@ -271,6 +286,7 @@ void VulkanCommandBuffer::reset() {
     if (vkResetCommandBuffer(m_commandBuffer_, 0) != VK_SUCCESS) {
         throw std::runtime_error("Failed to reset command buffer!");
     }
+    m_descriptor_buffer_bound_ = VK_NULL_HANDLE;
 }
 
 void VulkanCommandBuffer::push_constants(VulkanPipeline &pipeline,

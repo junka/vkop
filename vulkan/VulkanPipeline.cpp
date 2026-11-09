@@ -30,6 +30,10 @@ VulkanPipeline::VulkanPipeline(VkDevice device,
       required_subgroup_size_(required_subgroup_size) {
     const uint64_t t_ctor0 = pipeline_prof_now();
     VulkanShader shader(device, spirv, codesize);
+    // Optional VK_EXT_descriptor_buffer backend. This only changes host-side
+    // plumbing (no pool/set, no vkUpdateDescriptorSets); the SPIR-V declares
+    // the same set/bindings either way. Must run before the layout is built.
+    enable_descriptor_buffer();
     createDescriptorSetLayout(VK_SHADER_STAGE_COMPUTE_BIT, update_after_bind);
     createPipelineLayout(VK_SHADER_STAGE_COMPUTE_BIT, pushconstant_size);
     createDescriptorPool(update_after_bind);
@@ -76,6 +80,14 @@ void VulkanPipeline::createComputePipeline(VkPipelineLayout pipelineLayout,
     pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipeline_info.stage = shader_stage_create_info;
     pipeline_info.layout = pipelineLayout;
+#ifdef VK_EXT_descriptor_buffer
+    if (usesDescriptorBuffer()) {
+        // Required for any dispatch that sources descriptors from a buffer
+        // bound with vkCmdBindDescriptorBuffersEXT
+        // (VUID-vkCmdDispatch-None-08117).
+        pipeline_info.flags |= VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT;
+    }
+#endif
 
     const uint64_t t_create0 = pipeline_prof_now();
     auto ret = vkCreateComputePipelines(m_device_, cache, 1, &pipeline_info,

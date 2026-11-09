@@ -84,6 +84,46 @@ struct ShaderCapabilities {
     DeviceCap wmem_explicit_8bit_access;
     DeviceCap wmem_explicit_16bit_access;
     DeviceCap zero_init_wmem;
+    // VK_EXT_descriptor_indexing (core in Vulkan 1.2) bits the descriptor
+    // backend actually asks to have enabled, not just reported. `supported`
+    // tracks descriptorBindingStorageBufferUpdateAfterBind; the individual
+    // per-type UAB bits are in VulkanDevice::supports_update_after_bind().
+    DeviceCap descriptor_indexing;
+    // descriptorBindingPartiallyBound: lets a layout leave bindings the op
+    // never populates undefined (the buffer shaders declare optional SSBOs).
+    DeviceCap descriptor_partially_bound;
+    // VK_EXT_descriptor_buffer: the whole descriptor backend runs out of a
+    // host-visible descriptor buffer instead of pools/sets when this is
+    // enabled.
+    DeviceCap descriptor_buffer;
+};
+
+// Device-scoped VK_EXT_descriptor_buffer state, resolved once in the
+// VulkanDevice constructor. Returned by descriptor_buffer_info() only when the
+// feature is enabled, every entry point resolved, and BDA is usable (the
+// extension addresses the descriptor buffer through a device address).
+struct DescriptorBufferInfo {
+#ifdef VK_EXT_descriptor_buffer
+    PFN_vkGetDescriptorSetLayoutSizeEXT getLayoutSize = nullptr;
+    PFN_vkGetDescriptorSetLayoutBindingOffsetEXT getBindingOffset = nullptr;
+    PFN_vkGetDescriptorEXT getDescriptor = nullptr;
+    PFN_vkCmdBindDescriptorBuffersEXT cmdBindBuffers = nullptr;
+    PFN_vkCmdSetDescriptorBufferOffsetsEXT cmdSetOffsets = nullptr;
+#endif
+    // Turns each VkDescriptorBufferInfo into a VkDescriptorAddressInfoEXT.
+    PFN_vkGetBufferDeviceAddress getBufferAddress = nullptr;
+
+    VkDeviceSize offsetAlignment = 1;
+    VkDeviceSize storageBufferSize = 0;
+    VkDeviceSize uniformBufferSize = 0;
+    VkDeviceSize storageImageSize = 0;
+    VkDeviceSize sampledImageSize = 0;
+    VkDeviceSize combinedImageSamplerSize = 0;
+    VkDeviceSize storageTexelBufferSize = 0;
+    VkDeviceSize uniformTexelBufferSize = 0;
+
+    bool valid() const;
+    VkDeviceSize sizeFor(VkDescriptorType type) const;
 };
 
 struct QueryChainResult {
@@ -147,6 +187,11 @@ class VulkanDevice {
     // descriptor path.
     void initBufferDeviceAddress();
     bool probeBufferDeviceAddress();
+    // Resolve the VK_EXT_descriptor_buffer entry points and validate the
+    // per-type descriptor sizes. Called after initBufferDeviceAddress(), since
+    // a descriptor buffer is addressed by VkDeviceAddress. Any failure
+    // downgrades the feature so pipelines keep using descriptor sets.
+    void initDescriptorBuffer();
 
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);
@@ -337,6 +382,30 @@ class VulkanDevice {
     bool is_support_descriptor_update_after_bind() const {
         return m_support_descriptor_update_after_bind_;
     }
+    // True only when a descriptor set binding of `type` may carry
+    // VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT: the per-type feature bit
+    // was reported by the driver AND enabled on the logical device. The old
+    // gate only asked about storage buffers, but SplitImage and friends put
+    // image bindings behind the same UAB layout flag.
+    bool supports_update_after_bind(VkDescriptorType type) const;
+    bool is_support_descriptor_partially_bound() const {
+        return m_support_descriptor_partially_bound_;
+    }
+    // VK_EXT_descriptor_buffer, enabled (and cross-checked against BDA) at
+    // device creation. Null when unsupported or killed with
+    // VKOP_NO_DESCRIPTOR_BUFFER. See DescriptorBufferInfo.
+    bool is_support_descriptor_buffer() const {
+        return m_support_descriptor_buffer_;
+    }
+    const DescriptorBufferInfo *descriptor_buffer_info() const {
+        return m_support_descriptor_buffer_ ? &m_descriptor_buffer_info_
+                                            : nullptr;
+    }
+    // Resolve a logical device handle back to the owning VulkanDevice. Used by
+    // VulkanBasePipeline, which is constructed with only the VkDevice handle,
+    // to reach the descriptor-buffer entry points without changing every
+    // pipeline construction site. Null for an unregistered handle.
+    static VulkanDevice *fromLogicalDevice(VkDevice device);
 #ifdef VK_EXT_subgroup_size_control
     // Range of subgroup sizes the driver will allow a compute pipeline to
     // pin via requiredSubgroupSize. 0 when the extension/feature is absent.
@@ -387,6 +456,18 @@ class VulkanDevice {
     core::DeviceTraits device_traits_;
     ShaderCapabilities shader_caps_;
     bool m_support_descriptor_update_after_bind_ = false;
+    // Per-type UPDATE_AFTER_BIND capability, gated so a layout only sets the
+    // binding flag for descriptor types the device actually enabled.
+    bool m_uab_storage_buffer_ = false;
+    bool m_uab_storage_image_ = false;
+    bool m_uab_sampled_image_ = false;
+    bool m_uab_uniform_buffer_ = false;
+    bool m_support_descriptor_partially_bound_ = false;
+    bool m_support_descriptor_buffer_ = false;
+    DescriptorBufferInfo m_descriptor_buffer_info_;
+#ifdef VK_EXT_descriptor_buffer
+    VkPhysicalDeviceDescriptorBufferPropertiesEXT m_descriptor_buffer_props_{};
+#endif
     bool m_support_subgroup_arithmetic_ = false;
 
 #ifdef VK_EXT_subgroup_size_control

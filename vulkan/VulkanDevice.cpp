@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <set>
 #include <stdexcept>
 #include <unordered_map>
@@ -38,7 +39,93 @@ bool buffer_device_address_disabled() {
     return disabled;
 }
 
+// VKOP_NO_DESCRIPTOR_BUFFER is read once, before the feature chain is built.
+// The descriptor-buffer feature must never reach vkCreateDevice when this is
+// set, because every descriptor buffer usage bit downstream is invalid then.
+bool descriptor_buffer_disabled() {
+    static const bool disabled =
+        std::getenv("VKOP_NO_DESCRIPTOR_BUFFER") != nullptr;
+    return disabled;
+}
+
+// VkDevice -> VulkanDevice registry. VulkanBasePipeline is constructed with a
+// bare VkDevice handle (26 call sites); this lets it reach the device-scoped
+// descriptor-buffer entry points without threading the owner through every
+// constructor. Multiple devices can coexist in tests.
+//
+// Deliberately leaked (process lifetime): a VulkanDevice may itself be a
+// function-local static destroyed after this registry in another TU, and
+// ~VulkanDevice dereferences the map to unregister. Never destroyed => no
+// static-destruction-order UB.
+std::mutex &device_registry_mutex() {
+    static std::mutex *m = new std::mutex();
+    return *m;
+}
+
+std::unordered_map<VkDevice, VulkanDevice *> &device_registry() {
+    static auto *r = new std::unordered_map<VkDevice, VulkanDevice *>();
+    return *r;
+}
+
 } // namespace
+
+bool DescriptorBufferInfo::valid() const {
+#ifdef VK_EXT_descriptor_buffer
+    return getLayoutSize != nullptr && getBindingOffset != nullptr &&
+           getDescriptor != nullptr && cmdBindBuffers != nullptr &&
+           cmdSetOffsets != nullptr && getBufferAddress != nullptr &&
+           storageBufferSize > 0 && storageImageSize > 0 &&
+           sampledImageSize > 0 && combinedImageSamplerSize > 0;
+#else
+    return false;
+#endif
+}
+
+VkDeviceSize DescriptorBufferInfo::sizeFor(VkDescriptorType type) const {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+        return storageBufferSize;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        return uniformBufferSize;
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return storageImageSize;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+        return sampledImageSize;
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        return combinedImageSamplerSize;
+    case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
+        return storageTexelBufferSize;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
+        return uniformTexelBufferSize;
+    default:
+        return 0;
+    }
+}
+
+VulkanDevice *VulkanDevice::fromLogicalDevice(VkDevice device) {
+    std::lock_guard<std::mutex> lock(device_registry_mutex());
+    auto it = device_registry().find(device);
+    return it == device_registry().end() ? nullptr : it->second;
+}
+
+bool VulkanDevice::supports_update_after_bind(VkDescriptorType type) const {
+    switch (type) {
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
+    case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
+        return m_uab_storage_buffer_;
+    case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
+        return m_uab_storage_image_;
+    case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
+    case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
+        return m_uab_sampled_image_;
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+    case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+        return m_uab_uniform_buffer_;
+    default:
+        return false;
+    }
+}
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     physicalDevice_ = physicalDevice;
@@ -83,6 +170,11 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     initBufferDeviceAddress();
     LOG_INFO("buffer device address %s supported",
              (is_support_buffer_device_address() ? "is" : "not"));
+    // After BDA: a descriptor buffer is bound by VkDeviceAddress, so the
+    // extension is only usable once the address path proved itself.
+    initDescriptorBuffer();
+    LOG_INFO("descriptor buffer %s supported",
+             (is_support_descriptor_buffer() ? "is" : "not"));
 #ifdef USE_VMA
     // Conditional on purpose: VMA's BDA allocator flag makes every allocation
     // carry VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, which is invalid when the
@@ -100,6 +192,10 @@ VulkanDevice::~VulkanDevice() {
     m_vma_.reset();
 #endif
     if (logicalDevice_ != VK_NULL_HANDLE) {
+        {
+            std::lock_guard<std::mutex> lock(device_registry_mutex());
+            device_registry().erase(logicalDevice_);
+        }
         vkDestroyDevice(logicalDevice_, nullptr);
         logicalDevice_ = VK_NULL_HANDLE;
     }
@@ -164,8 +260,23 @@ VkPhysicalDeviceProperties VulkanDevice::getProperties() {
     head = reinterpret_cast<VkBaseOutStructure *>(&ssc_properties);
 #endif
 
+#ifdef VK_EXT_descriptor_buffer
+    // Descriptor sizes and the set-offset alignment the descriptor-buffer
+    // backend must honour. Opening the chain even when the extension did not
+    // enumerate is harmless: unknown sTypes are ignored by the driver.
+    VkPhysicalDeviceDescriptorBufferPropertiesEXT db_properties = {};
+    db_properties.sType =
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_PROPERTIES_EXT;
+    db_properties.pNext = head;
+    head = reinterpret_cast<VkBaseOutStructure *>(&db_properties);
+#endif
+
     properties2.pNext = head;
     vkGetPhysicalDeviceProperties2(physicalDevice_, &properties2);
+
+#ifdef VK_EXT_descriptor_buffer
+    m_descriptor_buffer_props_ = db_properties;
+#endif
 
 #ifdef VK_EXT_host_image_copy
     // Layout arrays are queried in two passes: the driver reports counts
@@ -600,6 +711,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
         shader_caps_.shader_int8.available = true;
         shader_caps_.storage_buffer_8bit.available = true;
         shader_caps_.uniform_storage_8bit.available = true;
+        shader_caps_.descriptor_indexing.available = true;
+        shader_caps_.descriptor_partially_bound.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
             .extensionName = nullptr,
@@ -619,9 +732,32 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                           feat->storageBuffer8BitAccess);
                 recordCap(shader_caps_.uniform_storage_8bit,
                           feat->uniformAndStorageBuffer8BitAccess);
+                // Descriptor indexing (core 1.2). The engine's UAB layouts put
+                // the binding flag on every descriptor in the set, including
+                // the image bindings SplitImage/Conv2dImage use, so enable the
+                // bit for each type the driver reports; flagging a type whose
+                // feature was not enabled is invalid usage.
+                recordCap(shader_caps_.descriptor_indexing,
+                          feat->descriptorBindingStorageBufferUpdateAfterBind);
+                recordCap(shader_caps_.descriptor_partially_bound,
+                          feat->descriptorBindingPartiallyBound);
+                m_uab_storage_buffer_ =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
+                m_uab_storage_image_ =
+                    feat->descriptorBindingStorageImageUpdateAfterBind;
+                m_uab_sampled_image_ =
+                    feat->descriptorBindingSampledImageUpdateAfterBind;
+                m_uab_uniform_buffer_ =
+                    feat->descriptorBindingUniformBufferUpdateAfterBind;
+                m_support_descriptor_partially_bound_ =
+                    feat->descriptorBindingPartiallyBound;
                 if (!feat->shaderFloat16 && !feat->shaderInt8 &&
                     !feat->timelineSemaphore && !feat->bufferDeviceAddress &&
                     !feat->descriptorBindingStorageBufferUpdateAfterBind &&
+                    !feat->descriptorBindingStorageImageUpdateAfterBind &&
+                    !feat->descriptorBindingSampledImageUpdateAfterBind &&
+                    !feat->descriptorBindingUniformBufferUpdateAfterBind &&
+                    !feat->descriptorBindingPartiallyBound &&
                     !feat->storageBuffer8BitAccess &&
                     !feat->uniformAndStorageBuffer8BitAccess) {
                     return nullptr;
@@ -649,6 +785,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->bufferDeviceAddress = want_bda;
                 e->descriptorBindingStorageBufferUpdateAfterBind =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
+                e->descriptorBindingStorageImageUpdateAfterBind =
+                    feat->descriptorBindingStorageImageUpdateAfterBind;
+                e->descriptorBindingSampledImageUpdateAfterBind =
+                    feat->descriptorBindingSampledImageUpdateAfterBind;
+                e->descriptorBindingUniformBufferUpdateAfterBind =
+                    feat->descriptorBindingUniformBufferUpdateAfterBind;
+                e->descriptorBindingPartiallyBound =
+                    feat->descriptorBindingPartiallyBound;
                 m_support_timeline_semaphore_ = feat->timelineSemaphore;
                 m_support_buffer_device_address_ = want_bda;
                 m_support_descriptor_update_after_bind_ =
@@ -1529,6 +1673,8 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #ifdef VK_EXT_descriptor_indexing
     if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
         supportedExtensions.count(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
+        shader_caps_.descriptor_indexing.available = true;
+        shader_caps_.descriptor_partially_bound.available = true;
         descs.push_back(FeatureDescriptor{
             .sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_INDEXING_FEATURES,
@@ -1545,7 +1691,25 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
             .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
                 auto *feat = static_cast<
                     VkPhysicalDeviceDescriptorIndexingFeaturesEXT *>(q);
-                if (!feat->descriptorBindingStorageBufferUpdateAfterBind)
+                recordCap(shader_caps_.descriptor_indexing,
+                          feat->descriptorBindingStorageBufferUpdateAfterBind);
+                recordCap(shader_caps_.descriptor_partially_bound,
+                          feat->descriptorBindingPartiallyBound);
+                m_uab_storage_buffer_ =
+                    feat->descriptorBindingStorageBufferUpdateAfterBind;
+                m_uab_storage_image_ =
+                    feat->descriptorBindingStorageImageUpdateAfterBind;
+                m_uab_sampled_image_ =
+                    feat->descriptorBindingSampledImageUpdateAfterBind;
+                m_uab_uniform_buffer_ =
+                    feat->descriptorBindingUniformBufferUpdateAfterBind;
+                m_support_descriptor_partially_bound_ =
+                    feat->descriptorBindingPartiallyBound;
+                if (!feat->descriptorBindingStorageBufferUpdateAfterBind &&
+                    !feat->descriptorBindingStorageImageUpdateAfterBind &&
+                    !feat->descriptorBindingSampledImageUpdateAfterBind &&
+                    !feat->descriptorBindingUniformBufferUpdateAfterBind &&
+                    !feat->descriptorBindingPartiallyBound)
                     return nullptr;
                 auto e = std::make_unique<
                     VkPhysicalDeviceDescriptorIndexingFeaturesEXT>();
@@ -1554,6 +1718,14 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->pNext = nullptr;
                 e->descriptorBindingStorageBufferUpdateAfterBind =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
+                e->descriptorBindingStorageImageUpdateAfterBind =
+                    feat->descriptorBindingStorageImageUpdateAfterBind;
+                e->descriptorBindingSampledImageUpdateAfterBind =
+                    feat->descriptorBindingSampledImageUpdateAfterBind;
+                e->descriptorBindingUniformBufferUpdateAfterBind =
+                    feat->descriptorBindingUniformBufferUpdateAfterBind;
+                e->descriptorBindingPartiallyBound =
+                    feat->descriptorBindingPartiallyBound;
                 m_support_descriptor_update_after_bind_ =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
                 return std::shared_ptr<void>(std::move(e));
@@ -1590,6 +1762,53 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->maintenance5 = feat->maintenance5;
                 return std::shared_ptr<void>(std::move(e));
             }});
+    }
+#endif
+
+#ifdef VK_EXT_descriptor_buffer
+    // Descriptor buffers remove descriptor pools, vkAllocateDescriptorSets and
+    // vkUpdateDescriptorSets from the per-dispatch path: each pipeline owns a
+    // host-visible, device-addressable buffer and a dispatch only records
+    // vkCmdSetDescriptorBufferOffsetsEXT. Gated on BDA because the binding info
+    // addresses the buffer by VkDeviceAddress. VKOP_NO_DESCRIPTOR_BUFFER keeps
+    // the feature out of vkCreateDevice entirely.
+    if (supportedExtensions.count(VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME) >
+        0) {
+        shader_caps_.descriptor_buffer.available = true;
+        if (!descriptor_buffer_disabled()) {
+            descs.push_back(FeatureDescriptor{
+                .sType =
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT,
+                .extensionName = VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
+                .corePromotedVersion = 0,
+                .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                    auto q = std::make_unique<
+                        VkPhysicalDeviceDescriptorBufferFeaturesEXT>();
+                    *q = makeFeatureStruct<
+                        VkPhysicalDeviceDescriptorBufferFeaturesEXT,
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT>();
+                    return std::shared_ptr<void>(std::move(q));
+                },
+                .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                    auto *feat = static_cast<
+                        VkPhysicalDeviceDescriptorBufferFeaturesEXT *>(q);
+                    shader_caps_.descriptor_buffer.supported =
+                        feat->descriptorBuffer != VK_FALSE;
+                    const bool enable = feat->descriptorBuffer != VK_FALSE &&
+                                        m_support_buffer_device_address_;
+                    shader_caps_.descriptor_buffer.enabled = enable;
+                    if (!enable)
+                        return nullptr;
+                    auto e = std::make_unique<
+                        VkPhysicalDeviceDescriptorBufferFeaturesEXT>();
+                    *e = makeFeatureStruct<
+                        VkPhysicalDeviceDescriptorBufferFeaturesEXT,
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT>();
+                    e->descriptorBuffer = VK_TRUE;
+                    m_support_descriptor_buffer_ = true;
+                    return std::shared_ptr<void>(std::move(e));
+                }});
+        }
     }
 #endif
 
@@ -1665,6 +1884,9 @@ void VulkanDevice::dumpShaderCapabilities() const {
     pr("wmem_explicit_8bit_access", c.wmem_explicit_8bit_access);
     pr("wmem_explicit_16bit_access", c.wmem_explicit_16bit_access);
     pr("zero_init_wmem", c.zero_init_wmem);
+    pr("descriptor_indexing", c.descriptor_indexing);
+    pr("descriptor_partially_bound", c.descriptor_partially_bound);
+    pr("descriptor_buffer", c.descriptor_buffer);
     std::fflush(stderr);
 }
 
@@ -1824,6 +2046,10 @@ bool VulkanDevice::createLogicalDevice(
                 std::make_shared<VulkanQueue>(qidx, queue));
         }
     }
+    {
+        std::lock_guard<std::mutex> lock(device_registry_mutex());
+        device_registry()[logicalDevice_] = this;
+    }
     return true;
 }
 
@@ -1855,6 +2081,68 @@ void VulkanDevice::initBufferDeviceAddress() {
         LOG_WARN("buffer device address probe failed; falling back to "
                  "descriptors");
     }
+}
+
+void VulkanDevice::initDescriptorBuffer() {
+#ifdef VK_EXT_descriptor_buffer
+    if (!m_support_descriptor_buffer_) {
+        return;
+    }
+    if (descriptor_buffer_disabled() || !is_support_buffer_device_address()) {
+        m_support_descriptor_buffer_ = false;
+        shader_caps_.descriptor_buffer.enabled = false;
+        LOG_WARN("VK_EXT_descriptor_buffer enabled but BDA is unusable; "
+                 "falling back to descriptor pools");
+        return;
+    }
+    auto load = [this](const char *name) -> PFN_vkVoidFunction {
+        return vkGetDeviceProcAddr(logicalDevice_, name);
+    };
+    auto &info = m_descriptor_buffer_info_;
+    info.getLayoutSize = reinterpret_cast<PFN_vkGetDescriptorSetLayoutSizeEXT>(
+        load("vkGetDescriptorSetLayoutSizeEXT"));
+    info.getBindingOffset =
+        reinterpret_cast<PFN_vkGetDescriptorSetLayoutBindingOffsetEXT>(
+            load("vkGetDescriptorSetLayoutBindingOffsetEXT"));
+    info.getDescriptor =
+        reinterpret_cast<PFN_vkGetDescriptorEXT>(load("vkGetDescriptorEXT"));
+    info.cmdBindBuffers = reinterpret_cast<PFN_vkCmdBindDescriptorBuffersEXT>(
+        load("vkCmdBindDescriptorBuffersEXT"));
+    info.cmdSetOffsets =
+        reinterpret_cast<PFN_vkCmdSetDescriptorBufferOffsetsEXT>(
+            load("vkCmdSetDescriptorBufferOffsetsEXT"));
+    info.getBufferAddress = get_buffer_device_address_fn_;
+
+    const auto &props = m_descriptor_buffer_props_;
+    info.offsetAlignment =
+        std::max<VkDeviceSize>(1, props.descriptorBufferOffsetAlignment);
+    info.storageBufferSize = props.storageBufferDescriptorSize;
+    info.uniformBufferSize = props.uniformBufferDescriptorSize;
+    info.storageImageSize = props.storageImageDescriptorSize;
+    info.sampledImageSize = props.sampledImageDescriptorSize;
+    info.combinedImageSamplerSize = props.combinedImageSamplerDescriptorSize;
+    info.storageTexelBufferSize = props.storageTexelBufferDescriptorSize;
+    info.uniformTexelBufferSize = props.uniformTexelBufferDescriptorSize;
+
+    if (!info.valid()) {
+        m_support_descriptor_buffer_ = false;
+        shader_caps_.descriptor_buffer.enabled = false;
+        LOG_WARN("VK_EXT_descriptor_buffer entry points or descriptor sizes "
+                 "missing; falling back to descriptor pools");
+        return;
+    }
+    LOG_INFO("descriptor buffer: offsetAlign %llu sb %llu ubo %llu img %llu "
+             "sampled %llu cimg %llu",
+             static_cast<unsigned long long>(info.offsetAlignment),
+             static_cast<unsigned long long>(info.storageBufferSize),
+             static_cast<unsigned long long>(info.uniformBufferSize),
+             static_cast<unsigned long long>(info.storageImageSize),
+             static_cast<unsigned long long>(info.sampledImageSize),
+             static_cast<unsigned long long>(info.combinedImageSamplerSize));
+    shader_caps_.descriptor_buffer.enabled = m_support_descriptor_buffer_;
+#else
+    m_support_descriptor_buffer_ = false;
+#endif
 }
 
 bool VulkanDevice::probeBufferDeviceAddress() {

@@ -183,6 +183,11 @@ class VulkanCommandBuffer {
     std::vector<VkPipelineStageFlags> m_waitstages_;
     VkTimelineSemaphoreSubmitInfo m_timeline_submit_info_ = {};
     bool replayable_ = false;
+    // Last VK_EXT_descriptor_buffer bound in this recording. Binding is
+    // command-buffer state, so a dispatch only re-binds when the pipeline
+    // switches; VK_NULL_HANDLE means nothing is bound yet. Reset with the
+    // command buffer (begin/reset), since both return state to initial.
+    VkBuffer m_descriptor_buffer_bound_ = VK_NULL_HANDLE;
 
     // Allocate command buffers
     void allocate();
