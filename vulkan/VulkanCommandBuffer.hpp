@@ -41,6 +41,12 @@ class VulkanCommandBuffer {
     void end();
 
     void bind(VulkanPipeline &pipeline, VkDescriptorSet descriptor_set);
+
+    // Bind only the pipeline, no descriptor set. Used by the buffer-device-
+    // address kernels, whose pipeline layout declares zero descriptor sets
+    // and whose data addresses travel in the push constants.
+    void bind_pipeline(VulkanPipeline &pipeline);
+
     void bindGraphics(VulkanGraphicsPipeline &pipeline,
                       VkDescriptorSet descriptor_set, VkBuffer vertex_buffer,
                       VkBuffer indexbuffer);

@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // QuantizeLinear / DequantizeLinear SSBO op.
 //
 // Two use sites share this shader:
@@ -39,8 +44,16 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) buffer OutBuf { uint data[]; } uOut;
 layout(set = 0, binding = 1) readonly buffer InBuf { uint data[]; } uIn;
+#endif
 
 layout(push_constant) uniform PC {
     int mode;     // 0 = quantize, 1 = dequantize
@@ -51,7 +64,17 @@ layout(push_constant) uniform PC {
     int out_fp32; // dequant: 1 = fp32 output
     int in_fp32;  // quant:   1 = fp32 input
     int _pad;
+#ifdef BDA
+    // Matches ops::quant::QuantBdaPC: 32-byte scalar prefix, then out/in.
+    DataBuf uOut;
+    DataBuf uIn;
+#endif
 } uPC;
+
+#ifdef BDA
+#define uOut uPC.uOut
+#define uIn uPC.uIn
+#endif
 
 // ---- fp8 E4M3 decode (mirrors matmul.comp e4m3_val) ----------------------
 float e4m3_decode(uint b) {

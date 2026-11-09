@@ -22,6 +22,23 @@
 
 #include "../common/buffer_common.comp"
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+// The shape-SSBO slots (3-5) stay out of the table: the shader body never
+// reads them (Equal has CPU-known shapes).
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIVec2Buf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaIVec2Buf b0;
+    BdaIVec2Buf b1;
+    BdaIVec2Buf b2;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInputA (uBdaTable.b1)
+#define uInputB (uBdaTable.b2)
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     ivec2 data[];
 } uOutput;
@@ -35,7 +52,10 @@ layout(set = 0, binding = 2) readonly buffer InputB {
 // Phase 3 GPU-driven shape-meta: optional shape-SSBO bindings (out/in0/in1).
 // Declared to match the shared 6-binding descriptor layout; bound only when an
 // input carries shape_ssbo_ (Equal int64 currently uses CPU-known shapes, so
-// these stay unbound — legal under UPDATE_AFTER_BIND).
+// these stay unbound — legal under UPDATE_AFTER_BIND). They must stay INSIDE
+// this descriptor branch: the BDA build binds one table descriptor at
+// binding 0 and this shader never reads them, so declaring them there would
+// add unused interface bindings the BDA layout does not provide.
 layout(set = 0, binding = 3) readonly buffer ShapeOut {
     ivec2 data[];
 } uShapeOut;
@@ -45,6 +65,7 @@ layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
 layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
     ivec2 data[];
 } uShapeIn1;
+#endif
 
 layout(push_constant) uniform PC_EqualInt64 {
     int rank;      // common rank for nd<->linear (== out rank)

@@ -224,6 +224,9 @@ class ReshapeBuffer : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ReshapePC), fp16) {}
 
+    // output + input.
+    size_t bda_address_table_slots() const override { return 2; }
+
     // Receive the converter's per-input value_dynamic annotation (option C).
     // Used as a HINT only — the runtime auto-learning cache below is the
     // authority. value_dynamic=true means "likely changes per round" so we

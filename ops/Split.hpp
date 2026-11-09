@@ -137,6 +137,9 @@ class SplitBuffer : public BufferFactory {
         fp16_ = fp16;
     }
 
+    // output + input (one pass per output).
+    size_t bda_address_table_slots() const override { return 2; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {

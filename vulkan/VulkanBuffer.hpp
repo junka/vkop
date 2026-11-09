@@ -81,6 +81,20 @@ class VulkanBuffer : public VulkanResource {
 
     VkDeviceSize getSize() const { return m_size_; }
 
+    // Per-buffer capability: true only for an OWNING buffer created with
+    // VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (i.e. while the device BDA
+    // feature was enabled). Host-imported buffers are deliberately false for
+    // now; views forward to the root. Callers that can run on a non-BDA
+    // device, or on a host-imported tensor, must keep the descriptor path.
+    bool hasDeviceAddress() const {
+        return parent_ ? parent_->hasDeviceAddress() : bda_capable_;
+    }
+    // Raw address of this buffer's window. For a borrowed sub-range view this
+    // is root_address + abs_offset(), so it must satisfy the shader's
+    // buffer_reference_align; callers that cannot guarantee the alignment
+    // keep using the descriptor offset path. Throws when BDA is unsupported.
+    VkDeviceAddress getDeviceAddress() const;
+
     // True once some tensor handed this buffer's bytes to ANOTHER tensor object
     // as a view alias (Tensor::alias_storage_buffer, the Reshape/Squeeze/
     // Unsqueeze fast path). From then on at least two tensor objects address
@@ -245,6 +259,13 @@ class VulkanBuffer : public VulkanResource {
     VMA::VmaBuffer m_vma_buffer_;
 #endif
     VkDeviceSize m_size_;
+    // Cached once per owning buffer. VMA/allocations never move, and a
+    // texture-like reallocation replaces the VulkanBuffer object, so no
+    // invalidation hook is needed. Views derive from their root instead.
+    mutable VkDeviceAddress device_address_ = 0;
+    // True when this owning buffer was created with the device-address usage
+    // bit. False for host-imported buffers (see the ctor comment).
+    bool bda_capable_ = false;
     VkAccessFlags m_access_ = 0;
     bool view_aliased_ = false;
     int32_t view_writer_ = -1;

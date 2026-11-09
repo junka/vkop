@@ -131,8 +131,16 @@ void VulkanBasePipeline::createPipelineLayout(VkShaderStageFlags flags,
     VkPipelineLayoutCreateInfo pipeline_layout_create_info = {};
     pipeline_layout_create_info.sType =
         VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipeline_layout_create_info.setLayoutCount = 1;
-    pipeline_layout_create_info.pSetLayouts = &m_descriptorSetLayout_;
+    // A BDA pipeline has no descriptor bindings at all; give it zero set
+    // layouts rather than one empty set, so dispatching without a
+    // vkCmdBindDescriptorSets is unambiguously valid.
+    if (m_types_.empty()) {
+        pipeline_layout_create_info.setLayoutCount = 0;
+        pipeline_layout_create_info.pSetLayouts = nullptr;
+    } else {
+        pipeline_layout_create_info.setLayoutCount = 1;
+        pipeline_layout_create_info.pSetLayouts = &m_descriptorSetLayout_;
+    }
     pipeline_layout_create_info.pushConstantRangeCount =
         static_cast<uint32_t>(push_constant_ranges.size());
     pipeline_layout_create_info.pPushConstantRanges =

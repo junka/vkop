@@ -1,4 +1,9 @@
 #version 450 core
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
 #extension GL_EXT_scalar_block_layout : enable
 
 // Resize (SSBO) — nearest neighbour only, coordinate_transformation_mode
@@ -15,6 +20,13 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #include "../common/buffer_common.comp"
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) buffer outputBuffer {
     uint data[];
 } uOutput;
@@ -22,6 +34,7 @@ layout(set = 0, binding = 0) buffer outputBuffer {
 layout(set = 0, binding = 1) readonly buffer inputBuffer {
     uint data[];
 } uInput;
+#endif
 
 layout(push_constant) uniform paraBuffer {
     int rank;
@@ -30,7 +43,17 @@ layout(push_constant) uniform paraBuffer {
     IArr8 outDims;
     int _pad0;
     int _pad1;
+#ifdef BDA
+    // Matches ops::ResizeBdaPC: 80-byte scalar prefix + out/in.
+    DataBuf uOutput;
+    DataBuf uInput;
+#endif
 } uParam;
+
+#ifdef BDA
+#define uOutput uParam.uOutput
+#define uInput uParam.uInput
+#endif
 
 int resize_elem(int gid) {
     IArr8 out_coord = linear_to_nd8(gid, uParam.outDims, uParam.rank);

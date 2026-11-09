@@ -26,12 +26,29 @@
 #version 450
 layout(local_size_x = 256) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaWinBuf {
+    uvec2 winners[];
+};
+layout(std430, set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaWinBuf b1;
+} uBdaTable;
+#define logits_u32 (uBdaTable.b0.data)
+#define winners (uBdaTable.b1.winners)
+#else
 layout(std430, set = 0, binding = 0) readonly buffer LogitsBuf {
     uint logits_u32[];
 };
 layout(std430, set = 0, binding = 1) writeonly buffer WinnersBuf {
     uvec2 winners[];
 };
+#endif
 
 layout(push_constant) uniform PC {
     uint base_offset; // first element of the last row ((q-1)*vocab; decode q=1 -> 0)

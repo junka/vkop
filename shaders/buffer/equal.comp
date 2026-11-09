@@ -9,6 +9,25 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+// Only the three data bindings have a table entry: the shape-SSBO bindings
+// (3-5) exist for the Phase-3 GPU-shape path, which Equal never takes (its
+// inputs always carry CPU-known shapes), and the shader body never
+// dereferences them.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaUintBuf b1;
+    BdaUintBuf b2;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInputA (uBdaTable.b1)
+#define uInputB (uBdaTable.b2)
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
@@ -32,6 +51,7 @@ layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
 layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
     ivec2 data[];
 } uShapeIn1;
+#endif
 
 layout(push_constant) uniform PC {
     int rank;

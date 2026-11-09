@@ -1,4 +1,10 @@
 #version 450 core
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #include "../common/subgroup_reduce.comp"
 
 // Softmax SSBO op over an arbitrary axis. One workgroup reduces one
@@ -32,6 +38,13 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) buffer Output {
     uint data[];
 } uOutput;
@@ -44,13 +57,26 @@ layout(set = 0, binding = 1) readonly buffer Input {
 layout(set = 0, binding = 2) buffer Scratch {
     uint data[];
 } uScratch;
+#endif
 
 layout(push_constant) uniform PC_uSoft {
     int axis;       // reduction axis (unused in pack pass)
     int axis_size;  // 0 => pack-only pass (fp16); >0 => reduce pass
     int outer_size; // reduce: slice count; pack: total element count
     int inner_size; // reduce: stride between axis elements
+#ifdef BDA
+    // Matches ops::SoftmaxBdaPC: 16-byte scalar prefix, then out/in/scratch.
+    DataBuf uOutput;
+    DataBuf uInput;
+    DataBuf uScratch;
+#endif
 } uSoft;
+
+#ifdef BDA
+#define uOutput uSoft.uOutput
+#define uInput uSoft.uInput
+#define uScratch uSoft.uScratch
+#endif
 
 shared float s_max[256];
 shared float s_sum[256];

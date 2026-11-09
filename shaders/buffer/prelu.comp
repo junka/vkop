@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // PReLU SSBO op: f(x) = max(0, x) + slope * min(0, x). Slope is broadcast
 // (right-aligned) against the input/output shape.
 //
@@ -9,6 +14,13 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
@@ -18,17 +30,28 @@ layout(set = 0, binding = 1) readonly buffer Input {
 layout(set = 0, binding = 2) readonly buffer Slope {
     uint data[];
 } uSlope;
+#endif
 
 layout(push_constant) uniform PC_uPC {
+    // Compact shared layout: in0Dims/activation are unused. The descriptor
+    // build's block is 76 B; the BDA build appends three pointers (104 B).
     int rank;
     IArr8 outDims;
-    IArr8 in0Dims;   // unused (input shape == output shape)
     IArr8 in1Dims;   // slope shape (broadcast target)
-    int activation;   // unused (kept for layout parity with BinaryElemPC)
-    int broadcast;    // 1 if slope needs broadcasting
+    int broadcast;
     int total;
-    int _pad;
+#ifdef BDA
+    DataBuf uOutput;
+    DataBuf uInput;
+    DataBuf uSlope;
+#endif
 } uPC;
+
+#ifdef BDA
+#define uOutput uPC.uOutput
+#define uInput uPC.uInput
+#define uSlope uPC.uSlope
+#endif
 
 float load_in(int linear) {
 #ifdef FP16

@@ -153,6 +153,9 @@ class SliceBuffer : public BufferFactory {
                         sizeof(SlicePC), fp16),
           fp16_(fp16) {}
 
+    // output + input.
+    size_t bda_address_table_slots() const override { return 2; }
+
     // The 8 Slice instances in the decode graph read back starts/ends/axes/
     // steps (int64 shape-meta) every round. For the fp32/fp16 paths these
     // scalars are STABLE across decode rounds (deepstack/visual fixed shapes),
@@ -352,7 +355,7 @@ class SliceBuffer : public BufferFactory {
         }
 
         // fp16 data falls through to the GPU shader below
-        // (buffer_slice_fp16_spv): it extracts and stores raw packed half bits,
+        // (buffer_slice_fp16): it extracts and stores raw packed half bits,
         // so the rotary cos/sin slice that used to be host-sliced now stays on
         // the GPU.
 

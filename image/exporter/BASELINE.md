@@ -545,7 +545,7 @@ Profiling that 15 min run (`VKOP_OPPROF=1 VKOP_SUBMIT_PROF=1 VKOP_RUN_PROFILE=1`
 on) attributed 22.30 s of a 22.31 s step to host-side `onExecute`, with `[graph] 350 segments,
 323 readback boundaries`: 128 readbacks from the fp16 host-slice branch of `SliceBuffer` and 195
 from `LayerNormBuffer::upcast_fp16()` (3 per call × 65 LNs). Both ops now have their own
-`-DFP16` shader build (`buffer_slice_fp16_spv`, `buffer_layernorm_fp16_spv`), so the fp16 route
+`-DFP16` shader build (`buffer_slice_fp16`, `buffer_layernorm_fp16`), so the fp16 route
 never touches the host:
 
 | Phase (same command, short prompt, seed 7) | before | after |

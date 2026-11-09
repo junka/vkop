@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 namespace vkop {
 namespace ops {
 
@@ -119,13 +120,16 @@ class TransposeImage : public Operator {
     std::vector<int> perm_ = {3, 2, 1, 0};
 };
 // Transpose buffer op. Arbitrary perm up to 8-D. fp16 path uses the
-// buffer_transpose_fp16_spv shader (word-per-thread, packed-half reads).
+// buffer_transpose_fp16 shader (word-per-thread, packed-half reads).
 class TransposeBuffer : public BufferFactory {
   public:
     explicit TransposeBuffer(int fp16)
         : BufferFactory(OpType::TRANSPOSE,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(TransposePC), fp16) {}
+
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(TransposeBdaPC); }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -225,17 +229,19 @@ class TransposeBuffer : public BufferFactory {
             }
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(outshape)) {
                 output->resize(outshape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         TransposePC pc{};
@@ -250,6 +256,19 @@ class TransposeBuffer : public BufferFactory {
         int total = total_elems(outshape);
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
         int total_groups = UP_DIV(nthreads, 256);
+        if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                TransposeBdaPC bpc{};
+                std::memcpy(&bpc, &pc, offsetof(TransposeBdaPC, out_addr));
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), total_groups, 1, 1);
+                return;
+            }
+        }
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }

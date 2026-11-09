@@ -47,6 +47,9 @@ class Gather : public Operator {
                    // already picked the array).
                    sizeof(gather::GpuGatherParam), fp16) {}
 
+    // out, data, int64 indices.
+    size_t bda_address_table_slots() const override { return 3; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
@@ -72,6 +75,8 @@ class Gather : public Operator {
         for (auto &ds : m_ds_int64_) {
             ds = pipeline_int64_->allocDescriptorSets();
         }
+        build_bda_table_module("buffer_gather_int64_bda", pc_size_, 3,
+                               bda_i64_);
     }
 
     // Route the int64-data path through the int64 GPU shader instead of the
@@ -131,6 +136,9 @@ class Gather : public Operator {
     void submit(void *ptr, int width, int height, int layers) override {
         if (!int64_mode_) {
             Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
             return;
         }
         if (!m_ds_int64_[m_id_]) {
@@ -471,6 +479,7 @@ class Gather : public Operator {
 
     // int64-data GPU path state. Lazily built on first int64 execute.
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
 };

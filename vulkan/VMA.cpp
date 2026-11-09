@@ -34,7 +34,8 @@ bool strict_flush_enabled() {
 std::atomic<VkDevice> s_vma_device{VK_NULL_HANDLE};
 } // namespace
 
-VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
+VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device,
+         bool useBufferDeviceAddress) {
     VmaVulkanFunctions vulkan_functions = {};
     vulkan_functions.vkGetInstanceProcAddr = vkGetInstanceProcAddr;
     vulkan_functions.vkGetDeviceProcAddr = vkGetDeviceProcAddr;
@@ -47,8 +48,10 @@ VMA::VMA(VkPhysicalDevice physicalDevice, VkDevice device) {
     allocator_info.flags = VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT |
                            VMA_ALLOCATOR_CREATE_KHR_BIND_MEMORY2_BIT |
                            VMA_ALLOCATOR_CREATE_KHR_DEDICATED_ALLOCATION_BIT |
-                           VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
                            VMA_ALLOCATOR_CREATE_AMD_DEVICE_COHERENT_MEMORY_BIT;
+    if (useBufferDeviceAddress) {
+        allocator_info.flags |= VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
+    }
     allocator_info.pVulkanFunctions = &vulkan_functions;
 
     if (vmaCreateAllocator(&allocator_info, &allocator_) != VK_SUCCESS) {

@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // Transpose SSBO op (fp32). Arbitrary perm up to 8-D. For each output
 // element, out_nd -> in_nd via in_nd[perm[i]] = out_nd[i], then copy.
 // perm is a permutation of [0..rank-1].
@@ -8,19 +13,38 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
 layout(set = 0, binding = 1) readonly buffer Input {
     uint data[];
 } uInput;
+#endif
 
 layout(push_constant) uniform PC_uTrans {
     int rank;
     IArr8 inDims;
     IArr8 outDims;
     IArr8 perm;
+#ifdef BDA
+    // Matches ops::TransposeBdaPC: 100-byte scalar prefix, pointers at 104/112
+    // (120 B total; the 4-byte pad keeps the first pointer 8-aligned).
+    DataBuf uOutput;
+    DataBuf uInput;
+#endif
 } uTrans;
+
+#ifdef BDA
+#define uOutput uTrans.uOutput
+#define uInput uTrans.uInput
+#endif
 
 // Map an output element index to the input element index via the perm:
 // out_coord -> in_coord[perm[i]] = out_coord[i].

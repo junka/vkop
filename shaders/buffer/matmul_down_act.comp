@@ -63,6 +63,12 @@
 // fold's memory savings intact.
 
 #version 450
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #extension GL_EXT_shader_16bit_storage : enable
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 
@@ -79,6 +85,9 @@ shared float da_sh[DA_MT * 512];
 
 layout(local_size_x = 32, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef BDA
+#include "../common/matmul_down_act_bda_table.comp"
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
@@ -121,6 +130,7 @@ layout(set = 0, binding = 8) readonly buffer InActW8 {
 layout(set = 0, binding = 4) readonly buffer InScale {
     uint data[];
 } uScale;
+#endif
 
 // Field-for-field copy of matmul::GpuMatMulParam (ops/Matmul.hpp). The order
 // must match exactly -- a shifted field silently reinterprets every constant

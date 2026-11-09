@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // SSBO cooperative-matrix MatMul (fp16 A/B, fp32 accumulate -> half2 output).
 // Replaces the naive 1-thread-per-output reduce (matmul.comp) for the fp16
 // LLM path. Intel ARL supports exactly one fp16 coopmat combo:
@@ -75,6 +80,9 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef BDA
+#include "../common/matmul_coop_bda_table.comp"
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
@@ -95,6 +103,7 @@ layout(set = 0, binding = 4) readonly buffer ScaleTab {
 layout(set = 0, binding = 5) readonly buffer GlobalFac {
     uint data[];
 } uGlobalFac;
+#endif
 
 layout(push_constant) uniform PC {
     int M;
@@ -453,57 +462,51 @@ void main() {
 
 #elif defined(SPLITK_FOLD)
 void main() {
-    int  b    = int(gl_WorkGroupID.z);
-    int  m0   = int(gl_WorkGroupID.y) * BM;
-    int  n0   = int(gl_WorkGroupID.x) * BN;
-    uint sg   = gl_SubgroupID;
-    uint lane = gl_SubgroupInvocationID;
+    // This pass issues no coopMatMulAdd, so the driver's subgroup geometry is
+    // not tied to the MMA (Intel compiles a 256-thread workgroup with no
+    // coopmat as subgroup 16). Map the SG_M*SG_N tiles onto the workgroup's
+    // threads explicitly instead: tile t owns threads [32t, 32t+32), and lane
+    // l owns the even/odd column pair (2l, 2l+1). That is independent of the
+    // hardware subgroup size, and one lane owns both members of its pair, so
+    // no cross-lane barrier is needed.
+#if (M_BLOCK * N_BLOCK) != 64
+#error "SPLITK_FOLD assumes one 32-lane pair per 8x8 tile"
+#endif
+#if (SG_M * SG_N) != 8
+#error "SPLITK_FOLD maps exactly 8 tiles onto the 256-thread workgroup"
+#endif
+    int t    = int(gl_LocalInvocationIndex) / 32;
+    int lane = int(gl_LocalInvocationIndex) % 32;
+    if (t >= SG_M * SG_N) return;
 
-    int M = uPC.M, N = uPC.N;
+    int b    = int(gl_WorkGroupID.z);
+    int m0   = int(gl_WorkGroupID.y) * BM;
+    int n0   = int(gl_WorkGroupID.x) * BN;
+    int M    = uPC.M, N = uPC.N;
     int coop = max(uPC.ksplit, 1);
-    int sgy  = int(sg) / SG_N;
-    int sgx  = int(sg) % SG_N;
+    int sgy  = t / SG_N;
+    int sgx  = t % SG_N;
 
-    // Accumulate fp32 per 8x8 position in shC[sg], across split planes.
-    // coopmat accumulator values are opaque after store; we operate on
-    // plain fp32 — one shC slot per (subgroup, idx).
-    for (int e = 0; e < 2; e++) {
-        int idx = int(lane) * 2 + e;
-        shC[sg][idx] = 0.0;
-    }
-
-    for (int s = 0; s < coop; s++) {
-        int slot = splitk_plane_slot(b, s, coop);
-        for (int e = 0; e < 2; e++) {
-            int idx = int(lane) * 2 + e;
-            int row = idx / N_BLOCK;
-            int col = idx % N_BLOCK;
-            int hg  = m0 + sgy * M_BLOCK + row;
-            int wg  = n0 + sgx * N_BLOCK + col;
-            if (hg < M && wg < N) {
-                shC[sg][idx] += uintBitsToFloat(
-                    uScratch.data[slot + hg * N + wg]);
-            }
-        }
-        barrier();
-    }
-
-    barrier();
+    int idx = 2 * lane;
+    int row = idx / N_BLOCK;
+    int col = idx % N_BLOCK;
+    int hg  = m0 + sgy * M_BLOCK + row;
+    int wg  = n0 + sgx * N_BLOCK + col;
     int c_base = b * M * N;
-    for (int e = 0; e < 2; e++) {
-        int idx = int(lane) * 2 + e;
-        int row = idx / N_BLOCK;
-        int col = idx % N_BLOCK;
-        if ((col & 1) != 0) continue;
-        int hg        = m0 + sgy * M_BLOCK + row;
-        int wg_even   = n0 + sgx * N_BLOCK + col;
-        int wg_odd    = wg_even + 1;
-        if (hg < M && wg_even < N) {
-            float v0 = shC[sg][idx];
-            float v1 = (wg_odd < N) ? shC[sg][idx + 1] : 0.0;
-            int out_word = (c_base + hg * N + wg_even) >> 1;
-            uOutput.data[out_word] = packHalf2x16(vec2(v0, v1));
+
+    float v0 = 0.0;
+    float v1 = 0.0;
+    for (int s = 0; s < coop; ++s) {
+        int slot = splitk_plane_slot(b, s, coop);
+        if (hg < M && wg < N) {
+            v0 += uintBitsToFloat(uScratch.data[slot + hg * N + wg]);
         }
+        if (hg < M && wg + 1 < N) {
+            v1 += uintBitsToFloat(uScratch.data[slot + hg * N + wg + 1]);
+        }
+    }
+    if (hg < M && wg < N) {
+        uOutput.data[(c_base + hg * N + wg) >> 1] = packHalf2x16(vec2(v0, v1));
     }
 }
 

@@ -11,6 +11,7 @@
 
 #include "core/ShaderArchive.hpp"
 #include "core/ShaderKeys.hpp"
+#include "vulkan/VulkanBuffer.hpp"
 
 namespace vkop {
 namespace ops {
@@ -38,6 +39,18 @@ effective_archive(const vkop::core::ShaderArchive *own) {
         "(--master-archive).");
 }
 } // namespace
+
+// VKOP_BDA gates every shader-side variant (the allocation flag and buffer
+// usage are automatic). Resolved once: a driver that reports BDA but
+// miscompiles PhysicalStorageBuffer cannot change model behaviour until it has
+// been validated, and VKOP_NO_BDA remains the global kill switch.
+static bool bda_shaders_enabled() {
+    static const bool enabled = []() {
+        const char *e = std::getenv("VKOP_BDA");
+        return e != nullptr && e[0] == '1';
+    }();
+    return enabled;
+}
 
 void Operator::resolve_primary_spv() {
     std::string key = core::shader_key_for(type_, uses_buffer_backend(), fp16_);
@@ -94,6 +107,287 @@ Operator::resolve_spv(const std::string &key) const {
     missing_shader(name_.empty() ? std::string(convert_optype_to_string(type_))
                                  : name_,
                    key, "variant");
+}
+
+void Operator::try_build_bda_pipeline(VkPipelineCache cache) {
+    // Step 2 rollout gate: the host-side capability (allocation flag, buffer
+    // usage) is automatic, but a shader variant is only selected when the
+    // caller opts in. A driver that reports BDA yet miscompiles
+    // PhysicalStorageBuffer therefore cannot change model behaviour until
+    // that driver has been validated; VKOP_NO_BDA remains the global kill
+    // switch.
+    if (!bda_shaders_enabled() || bda_pipeline_ || !supports_bda_variant() ||
+        !m_dev_ || !m_dev_->is_support_buffer_device_address()) {
+        return;
+    }
+    // Packed fp16 kernels load uint words. Descriptor offsets (the only way a
+    // zero-copy view is exposed) are multiples of
+    // minStorageBufferOffsetAlignment, so require that to be word-aligned;
+    // otherwise a 2-byte view offset would become an unaligned 32-bit load.
+    // Devices that fail this simply keep the descriptor variant.
+    if (m_dev_->minStorageBufferOffsetAlignment() % 4 != 0) {
+        return;
+    }
+    const size_t bpc = bda_pc_size();
+    // Where's fp32 shader has no push constants; a table op with pc_size_ 0 is
+    // legitimate (submit pushes nothing). Direct-address ops still need > 0.
+    if ((bpc == 0 && bda_address_table_slots() == 0) || bpc > 128) {
+        return;
+    }
+    const auto *archive = effective_archive(shader_archive_);
+    if (!archive) {
+        return;
+    }
+    // "<base>_bda" (fp32) / "<base>_bda_fp16" (dual builds), matching the
+    // archive keys CMake produces for the -DBDA build of buffer/<op>.comp.
+    const std::string base = core::shader_key_for(type_, true, 0);
+    if (base.empty()) {
+        return;
+    }
+    std::string key = base + "_bda";
+    if (fp16_ != 0) {
+        const std::string fp16_base = core::shader_key_for(type_, true, 1);
+        if (fp16_base.empty() || fp16_base == base) {
+            // An op with no dual fp16 build normally has no distinct fp16
+            // kernel to derive a variant from; running the fp32 BDA module on
+            // packed half data would misread every word. Cast/QDQ are the
+            // exception: one module handles both dtypes (the PC's mode/fmt
+            // selects the layout), so they opt in to the single BDA key.
+            if (!bda_variant_ignores_fp16()) {
+                return;
+            }
+        } else {
+            key += "_fp16";
+        }
+    }
+    // The runtime prefers <base>[_fp16]_sg when the device advertises subgroup
+    // arithmetic. Offer the matching BDA module so enabling BDA does not
+    // silently drop the subgroup reduction (attention/norm/softmax/matmul).
+    if (m_dev_->supportsSubgroupArithmetic()) {
+        const std::string sg_base =
+            fp16_ != 0 ? base + "_fp16_sg" : base + "_sg";
+        const std::string sg_bda =
+            fp16_ != 0 ? base + "_fp16_sg_bda" : base + "_sg_bda";
+        if (archive->lookup(sg_bda).first != nullptr) {
+            key = sg_bda;
+        } else if (std::getenv("VKOP_BDA_DEBUG") &&
+                   archive->lookup(sg_base).first != nullptr) {
+            // Only worth warning about when the descriptor path DOES take the
+            // subgroup module: that is a real (perf) downgrade, not an op with
+            // no _sg build at all.
+            std::fprintf(stderr,
+                         "[bda] WARNING: %s exists but %s does not; using %s\n",
+                         sg_base.c_str(), sg_bda.c_str(), key.c_str());
+        }
+    }
+    auto [spv, len] = archive->lookup(key);
+    if (!spv) {
+        return;
+    }
+    const std::string label =
+        name_.empty() ? convert_optype_to_string(type_) : name_;
+    try {
+        const size_t table_slots = bda_address_table_slots();
+        std::vector<VkDescriptorType> bda_types = bda_descriptor_types();
+        if (table_slots > 0 && bda_types.empty()) {
+            bda_types.push_back(VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+        }
+        const bool bind_table = !bda_types.empty();
+        bda_pipeline_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), std::move(bda_types), bpc,
+            reinterpret_cast<const uint32_t *>(spv), static_cast<int>(len),
+            /*update_after_bind=*/false, required_subgroup_size_, cache);
+        bda_pc_size_ = bpc;
+        if (bind_table) {
+            bda_ds_ = bda_pipeline_->allocDescriptorSets();
+            if (table_slots > 0) {
+                // One uint64 per data binding, DEVICE_LOCAL + TRANSFER_DST:
+                // fill_bda_table rewrites it before every dispatch.
+                bda_table_buf_ = std::make_shared<VulkanBuffer>(
+                    m_dev_, table_slots * sizeof(VkDeviceAddress),
+                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                auto *info = std::get<VkDescriptorBufferInfo *>(
+                    bda_table_buf_->getDescriptorInfo());
+                VkWriteDescriptorSet write{};
+                write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                write.dstSet = bda_ds_;
+                write.dstBinding = 0;
+                write.dstArrayElement = 0;
+                write.descriptorCount = 1;
+                write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                write.pBufferInfo = info;
+                bda_pipeline_->updateDescriptorSets({write});
+            }
+        }
+        if (std::getenv("VKOP_BDA_DEBUG")) {
+            std::fprintf(stderr, "[bda] op=%s key=%s pc=%zu table_ds=%d\n",
+                         label.c_str(), key.c_str(), bpc, bind_table ? 1 : 0);
+        }
+    } catch (const std::exception &e) {
+        // A driver that advertises BDA but rejects this module (e.g. an
+        // unimplemented PhysicalStorageBuffer path in the shader compiler)
+        // must not take the op down: the descriptor pipeline still works.
+        bda_pipeline_.reset();
+        bda_pc_size_ = 0;
+        // Drop any table the failed attempt allocated: bda_ready() is false so
+        // nothing would use it, but leaving it bound to a dead set only leaks
+        // pool memory on a retry-less op.
+        bda_ds_ = VK_NULL_HANDLE;
+        bda_table_buf_.reset();
+        std::fprintf(
+            stderr,
+            "[bda] pipeline for %s (%s) failed: %s; using descriptors\n",
+            label.c_str(), key.c_str(), e.what());
+    }
+}
+
+// Rewrite the generic address table from the first N objs_ entries. Returns
+// false when any slot is missing or belongs to a host-imported buffer (no
+// device address), in which case the caller keeps the descriptor pipeline.
+bool Operator::fill_bda_table() {
+    const size_t n = bda_address_table_slots();
+    if (n == 0 || !bda_table_buf_ || !m_cmd_) {
+        return false;
+    }
+    std::vector<VkDeviceAddress> addrs(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        if (i >= objs_.size() || !objs_[i]) {
+            return false;
+        }
+        auto buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[i]);
+        if (!buf || !buf->hasDeviceAddress()) {
+            return false;
+        }
+        addrs[i] = buf->getDeviceAddress();
+    }
+    // Set the tracked access to SHADER_READ *before* the update so
+    // updateBuffer's post-update barrier is TRANSFER_WRITE -> SHADER_READ.
+    // On a fresh table m_access_ is 0, which would restore dstAccess=0 and
+    // leave the vkCmdUpdateBuffer write without a visibility edge to the
+    // dispatch's read.
+    const VkDeviceSize bytes = n * sizeof(VkDeviceAddress);
+    bda_table_buf_->readBarrier(m_cmd_->get(), bytes, 0);
+    bda_table_buf_->updateBuffer(m_cmd_->get(), addrs.data(), bytes);
+    return true;
+}
+
+bool Operator::build_bda_table_module(const std::string &key, size_t pc_bytes,
+                                      size_t slots, BdaTableModule &m,
+                                      VkPipelineCache cache) {
+    m.pipeline.reset();
+    m.ds = VK_NULL_HANDLE;
+    m.table.reset();
+    m.pc_bytes = 0;
+    m.slots = 0;
+    if (!bda_shaders_enabled() || !m_dev_ ||
+        !m_dev_->is_support_buffer_device_address() ||
+        m_dev_->minStorageBufferOffsetAlignment() % 4 != 0 || pc_bytes == 0 ||
+        pc_bytes > 128 || slots == 0) {
+        return false;
+    }
+    const auto *archive = effective_archive(shader_archive_);
+    if (!archive) {
+        return false;
+    }
+    auto [spv, len] = archive->lookup(key);
+    if (!spv) {
+        return false;
+    }
+    try {
+        m.pipeline = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(),
+            std::vector<VkDescriptorType>{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
+            pc_bytes, reinterpret_cast<const uint32_t *>(spv),
+            static_cast<int>(len), /*update_after_bind=*/false,
+            required_subgroup_size_, cache);
+        m.ds = m.pipeline->allocDescriptorSets();
+        m.table = std::make_shared<VulkanBuffer>(
+            m_dev_, slots * sizeof(VkDeviceAddress),
+            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        auto *info =
+            std::get<VkDescriptorBufferInfo *>(m.table->getDescriptorInfo());
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = m.ds;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        write.pBufferInfo = info;
+        m.pipeline->updateDescriptorSets({write});
+        m.pc_bytes = pc_bytes;
+        m.slots = slots;
+        if (std::getenv("VKOP_BDA_DEBUG")) {
+            std::fprintf(stderr, "[bda] module key=%s pc=%zu slots=%zu\n",
+                         key.c_str(), pc_bytes, slots);
+        }
+        return true;
+    } catch (const std::exception &e) {
+        std::fprintf(stderr,
+                     "[bda] secondary module %s failed: %s; using "
+                     "descriptors\n",
+                     key.c_str(), e.what());
+        m.pipeline.reset();
+        m.ds = VK_NULL_HANDLE;
+        m.table.reset();
+        return false;
+    }
+}
+
+bool Operator::fill_bda_table_module(BdaTableModule &m) {
+    return fill_bda_table_module(m, objs_);
+}
+
+bool Operator::fill_bda_table_module(
+    BdaTableModule &m,
+    const std::vector<std::shared_ptr<VulkanResource>> &bufs) {
+    if (!m.table || m.ds == VK_NULL_HANDLE || m.slots == 0 || !m_cmd_) {
+        return false;
+    }
+    std::vector<VkDeviceAddress> addrs(m.slots, 0);
+    for (size_t i = 0; i < m.slots; ++i) {
+        if (i >= bufs.size() || !bufs[i]) {
+            return false;
+        }
+        auto buf = std::dynamic_pointer_cast<VulkanBuffer>(bufs[i]);
+        if (!buf || !buf->hasDeviceAddress()) {
+            return false;
+        }
+        addrs[i] = buf->getDeviceAddress();
+    }
+    const VkDeviceSize bytes = m.slots * sizeof(VkDeviceAddress);
+    // Pre-set SHADER_READ so updateBuffer's restore barrier is a real
+    // TRANSFER_WRITE -> SHADER_READ visibility edge (see fill_bda_table).
+    m.table->readBarrier(m_cmd_->get(), bytes, 0);
+    m.table->updateBuffer(m_cmd_->get(), addrs.data(), bytes);
+    return true;
+}
+
+bool Operator::submit_bda_table_module(BdaTableModule &m, const void *pc,
+                                       int width, int height, int layers) {
+    return submit_bda_table_module(m, objs_, pc, width, height, layers);
+}
+
+bool Operator::submit_bda_table_module(
+    BdaTableModule &m,
+    const std::vector<std::shared_ptr<VulkanResource>> &bufs, const void *pc,
+    int width, int height, int layers) {
+    if (!m.pipeline || m.ds == VK_NULL_HANDLE ||
+        !fill_bda_table_module(m, bufs)) {
+        return false;
+    }
+    m_cmd_->bind(*m.pipeline, m.ds);
+    if (pc) {
+        m_cmd_->push_constants(*m.pipeline,
+                               static_cast<uint32_t>(m.pc_bytes), pc);
+    }
+    bda_dispatched_ = true;
+    dispatch_and_record(width, height, layers, pc, m.pc_bytes);
+    return true;
 }
 
 // Defined out of line on purpose: gcc will not emit a weak copy of a large

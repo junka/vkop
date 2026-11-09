@@ -53,6 +53,10 @@ class Where : public Operator {
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
                    0) {}
 
+    // out, condition, X, Y (the fp32/fp16 path; the int64 path keeps its own
+    // descriptor pipeline).
+    size_t bda_address_table_slots() const override { return 4; }
+
     // Build the int64-data pipeline lazily on first int64 execute. The int64
     // shader (where_int64.comp) has the same descriptor layout (4× STORAGE)
     // as the fp32 where, but a different (non-zero) PC layout (WhereInt64PC),
@@ -69,12 +73,17 @@ class Where : public Operator {
         for (auto &ds : m_ds_int64_) {
             ds = pipeline_int64_->allocDescriptorSets();
         }
+        build_bda_table_module("buffer_where_int64_bda", sizeof(WhereInt64PC),
+                               4, bda_i64_);
     }
 
     // When in int64 mode, bind the int64 pipeline + its descriptor sets.
     void submit(void *ptr, int width, int height, int layers) override {
         if (!int64_mode_) {
             Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
             return;
         }
         if (!m_ds_int64_[m_id_]) {
@@ -260,6 +269,7 @@ class Where : public Operator {
     }
 
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
 };

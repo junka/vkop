@@ -158,6 +158,27 @@ def test_secondary_keys_exist_in_master_archive():
             )
 
 
+def test_fp16_buffer_ops_list_both_bda_variants():
+    """An op whose buffer shader has a dual fp16 build asks the archive for
+    <base>_bda_fp16 when the tensor is fp16 (Operator::try_build_bda_pipeline
+    appends _fp16). If that key is not also listed as a secondary variant,
+    onnx2vkop never embeds it and the op silently falls back to descriptors.
+    The master-archive test cannot see this: the key exists in the master,
+    it just never reaches the model. MaxPool was exactly this gap."""
+    missing = []
+    for op, (_img, buf, _img16, buf16) in shader_map._PRIMARY.items():
+        if not buf or not buf16:
+            continue
+        row = set(shader_map._SECONDARY.get((op, "buffer"), []))
+        base = f"buffer_{buf}_bda"
+        if base in row and f"{base}_fp16" not in row:
+            missing.append((op, f"{base}_fp16"))
+    assert not missing, (
+        "these fp16 buffer ops ship the fp32 BDA key but not its fp16 twin: "
+        f"{missing}; add <base>_bda_fp16 to shader_map._SECONDARY"
+    )
+
+
 def test_every_literal_resolve_spv_key_is_declared():
     """The other direction: every key an op hard-codes into
     Operator::resolve_spv() must appear in shader_map._SECONDARY.
@@ -250,8 +271,10 @@ def test_plan_cells_are_post_fallback():
     assert maxpool["buffer_fp16"] == "buffer_maxpool2d_fp16"
     # dual: Conv has both an fp32 and an fp16 shader per backend
     assert shader_map.plan_for_op("Conv")["buffer_fp16"] == "buffer_conv2d_fp16"
-    # not dual: Relu's fp16 request resolves to the same shader
-    assert shader_map.plan_for_op("Relu")["buffer_fp16"] == "buffer_relu"
+    # not dual: Gemm's fp16 request resolves to the same shader
+    assert shader_map.plan_for_op("Gemm")["buffer_fp16"] == "buffer_gemm"
+    # Relu gained an fp16 buffer build; its image path is still single-build
+    assert shader_map.plan_for_op("Relu")["buffer_fp16"] == "buffer_relu_fp16"
     assert shader_map.plan_for_op("Relu")["image_fp16"] == "image_relu"
     # host-only ops have no key under any spelling, hence no row
     for host_only in ("Shape", "Squeeze", "Unsqueeze", "Identity", "NotAnOp"):

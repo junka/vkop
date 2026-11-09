@@ -28,6 +28,15 @@ struct GpuExpandParam {
     int _pad1;
 };
 
+// Device-address variant: 80-byte scalar prefix + out/in (96 B).
+struct alignas(16) ExpandBdaPC {
+    GpuExpandParam base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(ExpandBdaPC, out_addr) == 80, "ExpandBdaPC drift");
+static_assert(sizeof(ExpandBdaPC) == 96, "ExpandBdaPC drift");
+
 // Read the ONNX Expand target-shape buffer (inputs[1]) as a vector<int>.
 // The shape input is conceptually int64, but callers (tests, older graphs)
 // may supply int32 — as_tensor<int64_t> on a Tensor<int> returns null and
@@ -77,6 +86,9 @@ class Expand : public Operator {
         param_.fp16 = fp16 ? 1 : 0;
     }
 
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(expand::ExpandBdaPC); }
+
     // Build the int64-data pipeline lazily on first int64 execute. The int64
     // shader (expand_int64.comp) has the same descriptor layout (2× STORAGE:
     // output, input) and PC layout as the fp32 expand, so it builds from the
@@ -94,6 +106,8 @@ class Expand : public Operator {
         for (auto &ds : m_ds_int64_) {
             ds = pipeline_int64_->allocDescriptorSets();
         }
+        build_bda_table_module("buffer_expand_int64_bda", pc_size_, 2,
+                               bda_i64_);
     }
 
     // When in int64 mode, bind the int64 pipeline + its descriptor sets
@@ -102,6 +116,9 @@ class Expand : public Operator {
     void submit(void *ptr, int width, int height, int layers) override {
         if (!int64_mode_) {
             Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
             return;
         }
         if (!m_ds_int64_[m_id_]) {
@@ -276,12 +293,15 @@ class Expand : public Operator {
             out_shape[maxd - 1 - i] = v;
         }
         // Resize the output tensor to the correct broadcasted shape.
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             output->resize(out_shape);
             auto output_buffer = output->as_storage_buffer(m_dev_, m_cmd_);
             objs_.emplace_back(output_buffer);
+            out_buf = output_buffer;
             if (typeid(uint16_t) == typeid(T)) {
                 param_.fp16 = 1;
             }
@@ -292,6 +312,7 @@ class Expand : public Operator {
             auto input = core::as_tensor<T>(inputs[0]);
             auto input_buffer = input->as_storage_buffer(m_dev_, m_cmd_);
             objs_.emplace_back(input_buffer);
+            in_buf = input_buffer;
         });
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
@@ -316,7 +337,21 @@ class Expand : public Operator {
         // fp16 packs two elements per uint word; dispatch one thread per word
         // (the shader writes each word once — no read-modify-write race).
         int nthreads = (fp16_ != 0) ? (total_size + 1) / 2 : total_size;
-        submit(&param_, UP_DIV(nthreads, 256), 1, 1);
+        const int groups = UP_DIV(nthreads, 256);
+        if (!int64_mode_ && bda_ready() && out_buf && in_buf &&
+            out_buf->hasDeviceAddress() && in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                expand::ExpandBdaPC bpc{};
+                bpc.base = param_;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&param_, groups, 1, 1);
     }
 
   public:
@@ -450,6 +485,7 @@ class Expand : public Operator {
 
     expand::GpuExpandParam param_{};
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
 };

@@ -16,12 +16,26 @@
 // readers (Reshape/Slice/Range) call copyToCPU themselves to read this op's
 // GPU output (valid: this op's level already submitted by the time they run).
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIVec2Buf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaIVec2Buf b0;
+    BdaIVec2Buf b1;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInput (uBdaTable.b1)
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     ivec2 data[];
 } uOutput;
 layout(set = 0, binding = 1) readonly buffer Input {
     ivec2 data[];
 } uInput;
+#endif
 
 struct IArr8 { int v[8]; };
 

@@ -1,0 +1,29 @@
+#ifndef MATMUL_COOP_BDA_TABLE_COMP
+#define MATMUL_COOP_BDA_TABLE_COMP
+
+// Address table for the -DBDA coopmat builds. GpuMatMulParam is already 128 B,
+// so the table is bound as ONE storage descriptor at binding 0 and every data
+// buffer is a 64-bit pointer read from it. Must match
+// matmul::MatMulCoopBdaArgs (six 8-byte entries).
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer CoopUintBuf {
+    uint data[];
+};
+
+layout(set = 0, binding = 0) readonly buffer CoopTable {
+    CoopUintBuf uOutput;
+    CoopUintBuf uInputA;
+    CoopUintBuf uInputB;
+    CoopUintBuf uScratch;
+    CoopUintBuf uScaleTab;
+    CoopUintBuf uGlobalFac;
+} uTable;
+
+#define uOutput (uTable.uOutput)
+#define uInputA (uTable.uInputA)
+#define uInputB (uTable.uInputB)
+#define uScratch (uTable.uScratch)
+#define uScaleTab (uTable.uScaleTab)
+#define uGlobalFac (uTable.uGlobalFac)
+
+#endif // MATMUL_COOP_BDA_TABLE_COMP

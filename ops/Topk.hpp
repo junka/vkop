@@ -54,6 +54,9 @@ class Topk : public Operator {
         tempindex2_ = std::make_unique<core::Tensor<int>>(true);
     }
 
+    // indices, values, index operand, input.
+    size_t bda_address_table_slots() const override { return 4; }
+
     ~Topk() override {
         tempvalue1_.reset();
         tempvalue2_.reset();

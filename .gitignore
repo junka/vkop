@@ -16,6 +16,11 @@ llm/exporter/*.onnx
 llm/exporter/*.vkopbin
 llm/exporter/*.weights.bin
 llm/exporter/embed_tokens.bin
+# AWQ/plain graph blobs land as *.onnx.bin (double extension, not covered above).
+llm/exporter/*.onnx.bin
+# Probe dumps and work dirs written by the AWQ/routing A/B scripts.
+llm/exporter/*_dump/
+llm/exporter/qwen2_work/
 # Tokenizer blobs serialized by tokenizer_to_bin.py from a local checkpoint.
 llm/tokenizer/*.bin
 # Qwen2-MoE export blobs that landed at llm/ root (same policy: the exporter
@@ -53,3 +58,21 @@ llm/*.weights.bin
 # macOS / tooling junk.
 .DS_Store
 .coverage
+
+# Image-side (DiT) exporter outputs: tiny test graphs, weights, converted
+# vkopbins, latent dumps, and reference-output trees. Exporter scripts stay
+# tracked; what they write does not (same policy as llm/exporter above).
+image/exporter/*.onnx
+image/exporter/*.weights.bin
+image/exporter/*.vkopbin
+image/exporter/*.raw
+image/exporter/ref_out*/
+image/exporter/ref_tiny/
+
+# CTest binary tree, ablation run logs (FUSED/NOSWIGLU .out/.err), agent
+# worktrees/settings, and captured vulkaninfo device dumps.
+/Testing/
+/WARM/
+/.claude/
+/.trae/
+/VP_VULKANINFO_*.json

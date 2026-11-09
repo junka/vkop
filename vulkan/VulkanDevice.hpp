@@ -2,6 +2,7 @@
 #ifndef SRC_VULKANDEVICE_HPP_
 #define SRC_VULKANDEVICE_HPP_
 
+#include <cstdlib>
 #include <functional>
 #include <memory>
 #include <set>
@@ -140,6 +141,13 @@ class VulkanDevice {
     createFeatureDescriptors(const VkPhysicalDeviceProperties &deviceProperties,
                              const std::set<std::string> &supportedExtensions);
 
+    // Resolve vkGetBufferDeviceAddress (or its KHR alias on pre-1.2 devices)
+    // and run a one-shot create/allocate/get-address probe. Any failure
+    // downgrades the feature to unsupported so every consumer takes the
+    // descriptor path.
+    void initBufferDeviceAddress();
+    bool probeBufferDeviceAddress();
+
   public:
     explicit VulkanDevice(VkPhysicalDevice physicalDevice_);
     ~VulkanDevice();
@@ -210,9 +218,19 @@ class VulkanDevice {
     // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick
     // routing thresholds measured on the matching device class.
     bool is_unified_memory() const { return m_is_unified_memory_; }
+    // VK_KHR_buffer_device_address / Vulkan 1.2 core. True only when the
+    // feature was handed to vkCreateDevice, the entry point resolved, and the
+    // one-shot allocation probe at device init succeeded. VKOP_NO_BDA keeps
+    // the feature out of vkCreateDevice entirely; the extra check makes the
+    // getter a hard gate even if a caller reads it before/after init.
     bool is_support_buffer_device_address() const {
-        return m_support_buffer_device_address_;
+        static const bool disabled = std::getenv("VKOP_NO_BDA") != nullptr;
+        return m_support_buffer_device_address_ && !disabled;
     }
+    // Raw address for a buffer. Throws when BDA is not supported: every
+    // caller that can run on a non-BDA device must gate on
+    // is_support_buffer_device_address() and keep the descriptor path.
+    VkDeviceAddress getBufferDeviceAddress(VkBuffer buffer) const;
     bool is_support_timeline_semaphore() const {
         return m_support_timeline_semaphore_;
     }
@@ -355,6 +373,10 @@ class VulkanDevice {
     bool m_support_host_import_ = false;
     uint32_t m_host_import_alignment_ = 4096;
     bool m_support_buffer_device_address_ = false;
+    // Resolved in initBufferDeviceAddress(); null unless the feature is
+    // usable. Kept out of VulkanLib's assert-all function list because that
+    // list would abort on a Vulkan 1.1 loader that only exports the KHR alias.
+    PFN_vkGetBufferDeviceAddress get_buffer_device_address_fn_ = nullptr;
     bool m_support_timeline_semaphore_ = false;
     bool m_support_cuda_kernel_launch_ = false;
     bool m_support_nv_tensor_core_ = false;

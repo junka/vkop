@@ -193,6 +193,10 @@ class BufferBinaryFactory : public BufferFactory {
             VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
         assert(indirect_buf_);
         prepass_writes_.resize(2);
+        // BDA counterpart. The pre-pass has its own two-buffer list (shape
+        // SSBO + indirect buffer), not the main kernel's objs_.
+        build_bda_table_module("buffer_dispatch_from_shape_bda",
+                               sizeof(DispatchFromShapePC), 2, bda_prepass_);
     }
 
     // Record the pre-pass: binding0 = out shape SSBO (the authoritative dim
@@ -203,6 +207,14 @@ class BufferBinaryFactory : public BufferFactory {
                         int rank) {
         DispatchFromShapePC ppc{rank, /*mode=*/0, /*block=*/256,
                                 /*divisor=*/(fp16_ != 0) ? 2 : 1};
+        {
+            std::vector<std::shared_ptr<VulkanResource>> bufs{
+                std::static_pointer_cast<VulkanResource>(out_shape_ssbo),
+                std::static_pointer_cast<VulkanResource>(indirect_buf_)};
+            if (submit_bda_table_module(bda_prepass_, bufs, &ppc, 1, 1, 1)) {
+                return;
+            }
+        }
         VkDescriptorBufferInfo *shape_info = std::get<VkDescriptorBufferInfo *>(
             out_shape_ssbo->getDescriptorInfo());
         VkDescriptorBufferInfo *indirect_info =
@@ -257,10 +269,26 @@ class BufferBinaryFactory : public BufferFactory {
     // main kernel's 6 (they cannot share fillWriteDescriptorSets, which is
     // positional over objs_).
     std::unique_ptr<VulkanPipeline> prepass_pipeline_;
+    BdaTableModule bda_prepass_;
     VkDescriptorSet m_ds_prepass_[vkop::kInflight] = {nullptr};
     std::vector<VkDescriptorType> prepass_types_;
     std::vector<VkWriteDescriptorSet> prepass_writes_;
     std::shared_ptr<VulkanBuffer> indirect_buf_;
+    // Per-op args buffer for the -DBDA binary kernel (dims + three data
+    // addresses). Device-local + TRANSFER_DST so updateBuffer rewrites it at
+    // recording time; its VkDeviceAddress is stable, so the recorded PC stays
+    // valid across replay rounds.
+    std::shared_ptr<VulkanBuffer> bda_args_buf_;
+
+    void ensure_bda_args() {
+        if (bda_args_buf_) {
+            return;
+        }
+        bda_args_buf_ = std::make_shared<VulkanBuffer>(
+            m_dev_, sizeof(BinaryBdaArgs),
+            STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
 
   private:
     // Host-compute an int64 elementwise binary op with right-aligned
@@ -348,6 +376,9 @@ class BufferBinaryFactory : public BufferFactory {
         }
     }
 
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(BinaryBdaPC); }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -379,21 +410,24 @@ class BufferBinaryFactory : public BufferFactory {
         auto out_shape = computeBroadcastShape(shape_a, shape_b);
         int total = total_elems(out_shape);
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in0_buf;
+        std::shared_ptr<VulkanBuffer> in1_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in0_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[1], /*is_output=*/false);
+            in1_buf = bind_ssbo<T>(inputs[1], /*is_output=*/false);
         });
 
         BinaryElemPC pc{};
@@ -405,7 +439,47 @@ class BufferBinaryFactory : public BufferFactory {
         pc.broadcast = (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
         pc.total = total;
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        const int groups = UP_DIV(nthreads, 256);
+
+        // BDA variant: the descriptor PC is already 128 B, so the addresses and
+        // dims travel in a small args buffer and the PC only names it. The
+        // broadcast==2 GPU-shape path above stays on descriptors.
+        if (bda_ready() && out_buf && in0_buf && in1_buf &&
+            out_buf->hasDeviceAddress() && in0_buf->hasDeviceAddress() &&
+            in1_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in0_addr = in0_buf->getDeviceAddress();
+            const VkDeviceAddress in1_addr = in1_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in0_addr % 4) == 0 &&
+                (in1_addr % 4) == 0) {
+                ensure_bda_args();
+                const VkDeviceAddress args_addr =
+                    bda_args_buf_->getDeviceAddress();
+                if ((args_addr % 8) == 0) {
+                    BinaryBdaArgs args{};
+                    for (int i = 0; i < 8; ++i) {
+                        args.outDims[i] = pc.outDims[i];
+                        args.in0Dims[i] = pc.in0Dims[i];
+                        args.in1Dims[i] = pc.in1Dims[i];
+                    }
+                    args.out_addr = out_addr;
+                    args.in0_addr = in0_addr;
+                    args.in1_addr = in1_addr;
+                    bda_args_buf_->readBarrier(m_cmd_->get(), sizeof(args), 0);
+                    bda_args_buf_->updateBuffer(m_cmd_->get(), &args,
+                                                sizeof(args));
+                    BinaryBdaPC bpc{};
+                    bpc.rank = pc.rank;
+                    bpc.activation = pc.activation;
+                    bpc.broadcast = pc.broadcast;
+                    bpc.total = pc.total;
+                    bpc.args_addr = args_addr;
+                    submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                    return;
+                }
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 
     // Phase 3+4 GPU-shape path. Binds out/in0/in1 data SSBOs (bindings 0/1/2)

@@ -17,6 +17,33 @@
 #include "ops/OperatorFactory.hpp"
 #include "ops/Ops.hpp"
 
+// Xlib.h / X11/X.h (pulled in transitively by Vulkan's XCB/XLIB platform
+// headers) define common identifiers as macros -- None, Bool, Complex, Status,
+// True, False, Success -- that collide with gtest's `struct None`/`Bool()` and
+// torch's ScalarType/DynamicType enums. The Vulkan headers are already parsed
+// above, so dropping the macros here is safe.
+#ifdef None
+#undef None
+#endif
+#ifdef Bool
+#undef Bool
+#endif
+#ifdef Complex
+#undef Complex
+#endif
+#ifdef Status
+#undef Status
+#endif
+#ifdef True
+#undef True
+#endif
+#ifdef False
+#undef False
+#endif
+#ifdef Success
+#undef Success
+#endif
+
 #include <gtest/gtest.h>
 // The torch subset, not <torch/torch.h>: this header is included by every test
 // file, and the full header costs ~6s and ~1 GB of RSS per TU.

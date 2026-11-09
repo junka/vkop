@@ -14,6 +14,12 @@ class Equal : public BufferBinaryFactory {
   public:
     explicit Equal() : BufferBinaryFactory(OpType::EQUAL, /*fp16=*/0) {}
 
+    // Equal does not use the shared binary body: its own shader declares three
+    // data bindings (the shape-SSBO slots 3-5 are never read), and its PC is
+    // BinaryElemPC, not the 24 B BinaryBdaPC the binary factory defaults to.
+    size_t bda_address_table_slots() const override { return 3; }
+    size_t bda_pc_size() const override { return pc_size_; }
+
     // Build the int64-data pipeline lazily on first int64 execute. The int64
     // shader (equal_int64.comp) has the same descriptor layout (3× STORAGE:
     // output, A, B) and PC layout (BinaryElemPC) as the fp32 equal, so it
@@ -30,6 +36,7 @@ class Equal : public BufferBinaryFactory {
         for (auto &ds : m_ds_int64_) {
             ds = pipeline_int64_->allocDescriptorSets();
         }
+        build_bda_table_module("buffer_equal_int64_bda", pc_size_, 3, bda_i64_);
     }
 
     // When in int64 mode, bind the int64 pipeline + its descriptor sets
@@ -37,6 +44,9 @@ class Equal : public BufferBinaryFactory {
     void submit(void *ptr, int width, int height, int layers) override {
         if (!int64_mode_) {
             Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
             return;
         }
         if (!m_ds_int64_[m_id_]) {
@@ -173,6 +183,7 @@ class Equal : public BufferBinaryFactory {
     }
 
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
 };

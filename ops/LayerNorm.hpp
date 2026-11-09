@@ -138,6 +138,11 @@ class LayerNormBuffer : public BufferFactory {
                         sizeof(LayerNormPC), fp16),
           fp16_(fp16) {}
 
+    // BDA variant: same kernel with the five data buffers addressed by
+    // VkDeviceAddress instead of descriptor bindings.
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(LayerNormBdaPC); }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("eps") != attributes.end()) {
@@ -216,30 +221,38 @@ class LayerNormBuffer : public BufferFactory {
                 "LayerNorm: skip dtype differs from the input");
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
+        std::shared_ptr<VulkanBuffer> weight_buf;
+        std::shared_ptr<VulkanBuffer> bias_buf;
+        std::shared_ptr<VulkanBuffer> skip_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(shape)) {
                 output->resize(shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
-        for (size_t i = 1; i <= 2; ++i) {
-            dispatch_by_dtype(inputs[i]->dtype(), [&](auto dummy) {
-                using T = decltype(dummy);
-                bind_ssbo<T>(inputs[i], /*is_output=*/false);
-            });
-        }
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            weight_buf = bind_ssbo<T>(inputs[1], /*is_output=*/false);
+        });
+        dispatch_by_dtype(inputs[2]->dtype(), [&](auto dummy) {
+            using T = decltype(dummy);
+            bias_buf = bind_ssbo<T>(inputs[2], /*is_output=*/false);
+        });
         // Binding 4 is declared unconditionally; without a skip, bind x itself
         // so the descriptor is valid and the shader's has_skip==0 branch never
         // reads it.
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(has_skip ? inputs[3] : inputs[0], /*is_output=*/false);
+            skip_buf = bind_ssbo<T>(has_skip ? inputs[3] : inputs[0],
+                                    /*is_output=*/false);
         });
 
         LayerNormPC pc{};
@@ -247,6 +260,29 @@ class LayerNormBuffer : public BufferFactory {
         pc.inner_size = inner_size;
         pc.outer_size = outer_size;
         pc.has_skip = has_skip ? 1 : 0;
+        if (bda_ready() && out_buf && in_buf && weight_buf && bias_buf &&
+            skip_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress() && weight_buf->hasDeviceAddress() &&
+            bias_buf->hasDeviceAddress() && skip_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            const VkDeviceAddress weight_addr = weight_buf->getDeviceAddress();
+            const VkDeviceAddress bias_addr = bias_buf->getDeviceAddress();
+            const VkDeviceAddress skip_addr = skip_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0 &&
+                (weight_addr % 4) == 0 && (bias_addr % 4) == 0 &&
+                (skip_addr % 4) == 0) {
+                LayerNormBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                bpc.weight_addr = weight_addr;
+                bpc.bias_addr = bias_addr;
+                bpc.skip_addr = skip_addr;
+                submit_bda(&bpc, sizeof(bpc), outer_size, 1, 1);
+                return;
+            }
+        }
         submit(&pc, outer_size, 1, 1);
     }
 

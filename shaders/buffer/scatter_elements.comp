@@ -25,6 +25,24 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIndexBuf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaIndexBuf b1;
+    BdaUintBuf b2;
+} uBdaTable;
+#define uData (uBdaTable.b0)
+#define uIndices (uBdaTable.b1)
+#define uUpdates (uBdaTable.b2)
+#else
 layout(set = 0, binding = 0) buffer Data {
     uint data[];
 } uData;
@@ -34,6 +52,7 @@ layout(set = 0, binding = 1) readonly buffer Indices {
 layout(set = 0, binding = 2) readonly buffer Updates {
     uint data[];
 } uUpdates;
+#endif
 
 layout(push_constant) uniform PC {
     int n_threads; // n_idx = indices.numel() == updates.numel()

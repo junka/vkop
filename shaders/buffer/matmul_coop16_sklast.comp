@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // SSBO cooperative-matrix MatMul, fp16 in / fp32 accumulate. The cooperative
 // matrix tile is a build parameter (-DCM/-DCN/-DCK), so this one source covers
 // the fp16 f32-accumulate shapes a device can list:
@@ -89,6 +94,11 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef BDA
+// Same six-entry address table as the other coop modules; this kernel only
+// dereferences out/A/B/scratch (the scale/global slots stay unused).
+#include "../common/matmul_coop_bda_table.comp"
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
@@ -101,6 +111,7 @@ layout(set = 0, binding = 2) readonly buffer InB {
 layout(set = 0, binding = 3) buffer Scratch {
     uint data[];
 } uScratch;
+#endif
 
 
 

@@ -26,5 +26,8 @@ TEST(FloorTest, FloorComprehensiveTest) {
         auto [shape] = test_case;
         FloorTest<float> floortest(shape);
         EXPECT_TRUE(floortest.run_test());
+
+        FloorTest<uint16_t> floortest16(shape);
+        EXPECT_TRUE(floortest16.run_test());
     }
 }

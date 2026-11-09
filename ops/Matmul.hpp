@@ -160,7 +160,7 @@ struct alignas(16) GpuMatMulParam {
     // folds to 0 regardless of the flat batch. The buffer kernels fold it in
     // bmap()'s early-out and the coop shaders at their B base; without it they
     // would index b * K * N past the weight for every batch >= 1 workgroup.
-    // Sits at the struct tail (offset 108): sizeof stays 112 after the
+    // Sits at the struct tail (offset 116): sizeof stays 128 after the
     // alignas(16) rounding, so the pushed range is unchanged for archives
     // whose shaders do not read it. Buffer path only.
     int b_shared = 0;
@@ -179,10 +179,84 @@ struct alignas(16) GpuMatMulParam {
     // with ksplit=1 and a stale ks_part would run a later pass in place of
     // the deposit; the host keeps them in step.
     //
-    // Sits at the struct tail (offset 112): sizeof stays 128 after the
+    // Sits at the struct tail (offset 120): sizeof stays 128 after the
     // alignas(16) rounding, so the pushed range is unchanged.
     int ks_part = 0;
 };
+
+// Address table for the -DBDA MatMul builds. The push constant is already
+// 128 B, so the table is bound as ONE storage descriptor and holds every data
+// buffer's VkDeviceAddress. Must match shaders/buffer/matmul.comp's Table
+// block (ten 8-byte entries: out, inA, inB, inB4 alias, scratch, scale,
+// global, epiBias, inB2, inAct).
+struct alignas(8) MatMulBdaArgs {
+    VkDeviceAddress out;
+    VkDeviceAddress in_a;
+    VkDeviceAddress in_b;
+    VkDeviceAddress in_b4; // aliases in_b
+    VkDeviceAddress scratch;
+    VkDeviceAddress scale;
+    VkDeviceAddress global;
+    VkDeviceAddress epi_bias;
+    VkDeviceAddress in_b2;
+    VkDeviceAddress in_act;
+};
+static_assert(sizeof(MatMulBdaArgs) == 80, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, in_a) == 8, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, in_b) == 16, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, in_b4) == 24, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, scratch) == 32, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, scale) == 40, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, global) == 48, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, epi_bias) == 56, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, in_b2) == 64, "MatMulBdaArgs drift");
+static_assert(offsetof(MatMulBdaArgs, in_act) == 72, "MatMulBdaArgs drift");
+
+// Address table for the -DBDA coopmat builds. Must match
+// shaders/common/matmul_coop_bda_table.comp.
+struct alignas(8) MatMulCoopBdaArgs {
+    VkDeviceAddress out;
+    VkDeviceAddress in_a;
+    VkDeviceAddress in_b;
+    VkDeviceAddress scratch;
+    VkDeviceAddress scale;
+    VkDeviceAddress global;
+};
+static_assert(sizeof(MatMulCoopBdaArgs) == 48, "MatMulCoopBdaArgs drift");
+static_assert(offsetof(MatMulCoopBdaArgs, in_a) == 8,
+              "MatMulCoopBdaArgs drift");
+static_assert(offsetof(MatMulCoopBdaArgs, in_b) == 16,
+              "MatMulCoopBdaArgs drift");
+static_assert(offsetof(MatMulCoopBdaArgs, scratch) == 24,
+              "MatMulCoopBdaArgs drift");
+static_assert(offsetof(MatMulCoopBdaArgs, scale) == 32,
+              "MatMulCoopBdaArgs drift");
+static_assert(offsetof(MatMulCoopBdaArgs, global) == 40,
+              "MatMulCoopBdaArgs drift");
+
+// Down-act fold table: 7 base addresses + 1 pad (to 16-align the Vec4
+// aliases) + 6 typed aliases. Must match
+// shaders/common/matmul_down_act_bda_table.comp.
+struct alignas(8) MatMulDownActBdaArgs {
+    VkDeviceAddress out;
+    VkDeviceAddress in_a;
+    VkDeviceAddress in_b;
+    VkDeviceAddress scratch;
+    VkDeviceAddress scale;
+    VkDeviceAddress in_b2;
+    VkDeviceAddress in_act;
+    uint64_t _pad0 = 0;
+    VkDeviceAddress wd4;
+    VkDeviceAddress wd8;
+    VkDeviceAddress wg4;
+    VkDeviceAddress wg8;
+    VkDeviceAddress wu4;
+    VkDeviceAddress wu8;
+};
+static_assert(offsetof(MatMulDownActBdaArgs, wd4) == 64,
+              "MatMulDownActBdaArgs drift");
+static_assert(sizeof(MatMulDownActBdaArgs) == 112,
+              "MatMulDownActBdaArgs drift");
 
 } // namespace matmul
 
@@ -286,7 +360,7 @@ class MatMulImage : public Operator {
 // half2 word (two adjacent columns, A load shared), packed straight into
 // the output. fp16 with odd N: the half2 words straddle row boundaries, so
 // fall back to 2-pass (reduce to fp32 scratch + pack pass) with the pack
-// pass on a SEPARATE pipeline (buffer_matmul_pack_spv) to avoid Intel ANV
+// pass on a SEPARATE pipeline (buffer_matmul_pack) to avoid Intel ANV
 // push-constant interference between dispatches of the same pipeline.
 class MatMulBuffer : public BufferFactory {
   public:
@@ -299,6 +373,16 @@ class MatMulBuffer : public BufferFactory {
                             DESCRIPTOR_TYPE_STORAGE},
                         sizeof(matmul::GpuMatMulParam), fp16) {
         update_after_bind_ = true;
+    }
+
+    // BDA variant: the push constant is already 128 B, so the addresses live
+    // in a single table descriptor (see MatMulBdaArgs).
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override {
+        return sizeof(matmul::GpuMatMulParam);
+    }
+    std::vector<VkDescriptorType> bda_descriptor_types() const override {
+        return {DESCRIPTOR_TYPE_STORAGE};
     }
 
     // Kernel-route readout for VKOP_MATMUL_ROUTE. Set at each dispatch site in
@@ -378,14 +462,25 @@ class MatMulBuffer : public BufferFactory {
                     alt.bn = e.bn;
                     alt.writes_scratch = e.writes_scratch;
                     alt.key = e.key;
+                    alt.bda_owner = std::move(e.bda_pipe);
+                    alt.bda_pipe = alt.bda_owner.get();
+                    alt.bda_ds = e.bda_ds;
                     for (auto &ds : alt.ds) {
                         ds = alt.pipe->allocDescriptorSets();
                     }
                     coop_fp16_alts_owner_.push_back(
                         std::unique_ptr<VulkanPipeline>(alt.pipe));
-                    coop_fp16_alts_.push_back(alt);
+                    coop_fp16_alts_.push_back(std::move(alt));
                 }
             }
+        }
+        // BDA counterpart of the PRIMARY coop pipeline (same module key + _bda,
+        // same geometry). Alternative tile geometries get their own BDA pipes
+        // in build_coop_pipeline; all of them share one table buffer.
+        if (coop_pipeline_ && bda_ready() && primary_coop_key_ &&
+            !coop_bda_pipeline_) {
+            coop_bda_pipeline_ = make_coop_bda_pipe(
+                std::string(primary_coop_key_) + "_bda", coop_bda_ds_);
         }
         if (fp16_ != 0 && !coop_i8_pipeline_ &&
             dev->is_support_cooperate_matrix()) {
@@ -400,13 +495,19 @@ class MatMulBuffer : public BufferFactory {
             int bn = 0;
             bool tile16 = false;
             bool writes_scratch = true;
+            const char *i8_key = nullptr;
             if (auto pipe = build_coop_pipeline(kI8Modules, true, cache, bm, bn,
-                                                tile16, writes_scratch)) {
+                                                tile16, writes_scratch, nullptr,
+                                                i8_key)) {
                 coop_i8_pipeline_ = std::move(pipe);
                 coop_i8_bm_ = bm;
                 coop_i8_bn_ = bn;
                 for (auto &ds : coop_i8_ds_) {
                     ds = coop_i8_pipeline_->allocDescriptorSets();
+                }
+                if (bda_ready() && i8_key) {
+                    coop_i8_bda_pipeline_ = make_coop_bda_pipe(
+                        std::string(i8_key) + "_bda", coop_i8_bda_ds_);
                 }
             }
         }
@@ -431,6 +532,18 @@ class MatMulBuffer : public BufferFactory {
                 use_uab, 0, cache);
             for (auto &ds : pack_ds_) {
                 ds = pack_pipeline_->allocDescriptorSets();
+            }
+        }
+        if (fp16_ != 0 && bda_ready() && !pack_bda_pipeline_) {
+            try {
+                auto spv = resolve_spv("buffer_matmul_pack_bda");
+                pack_bda_pipeline_ = std::make_unique<VulkanPipeline>(
+                    dev->getLogicalDevice(), std::vector<VkDescriptorType>{},
+                    sizeof(MatMulPackBdaPC), spv.first,
+                    static_cast<int>(spv.second), /*update_after_bind=*/false,
+                    0, cache);
+            } catch (const std::exception &) {
+                pack_bda_pipeline_.reset();
             }
         }
         // SK_LASTBLOCK pipelines: per-cs precompiled variants (SK_CS baked in)
@@ -479,6 +592,14 @@ class MatMulBuffer : public BufferFactory {
                                  k.cs, e.what());
                     continue;
                 }
+                // BDA counterpart of this cs variant. Only the fp32 modules
+                // ship BDA bytes (the half2 builds were dropped from CMake),
+                // so a half2 dispatch always stays descriptor-backed.
+                if (bda_ready()) {
+                    auto &b = sklast_fp32_bda_[k.cs];
+                    b.owner = make_coop_bda_pipe(
+                        std::string(k.fp32) + "_bda", b.ds);
+                }
                 // Try half2 variant (bonus)
                 try {
                     auto spv = resolve_spv(k.half2);
@@ -508,6 +629,9 @@ class MatMulBuffer : public BufferFactory {
                 }
             }
         }
+        // Build the one-descriptor address table once; its binding is stable
+        // across recordings.
+        ensure_bda_table();
     }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
@@ -544,6 +668,14 @@ class MatMulBuffer : public BufferFactory {
         int _pad1;
         int _pad2;
     };
+
+    // BDA pack: two direct addresses fit in the PC (16 B scalars + 16 B).
+    struct alignas(16) MatMulPackBdaPC {
+        MatMulPackPC base;
+        VkDeviceAddress out_addr;
+        VkDeviceAddress scratch_addr;
+    };
+    static_assert(sizeof(MatMulPackBdaPC) == 32, "MatMulPackBdaPC drift");
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -1428,6 +1560,9 @@ class MatMulBuffer : public BufferFactory {
             // dispatch, so clear the flags it pre-empts.
             para_.ksplit = 0;
             set_route(plan.tag, batch, m, n, k, rep);
+            if (try_submit_bda(batch * m, 1, 1)) {
+                return;
+            }
             submit(&para_, batch * m, 1, 1);
             return;
         }
@@ -1447,15 +1582,34 @@ class MatMulBuffer : public BufferFactory {
             // the footprint of whichever SINT8 tile was probed (32x64 on Ada's
             // 16x16x32, 16x32 on ARL's 8x8x32).
             set_route(plan.tag, batch, m, n, k, rep);
-            fillDescriptorWrites(coop_i8_ds_[m_id_]);
-            coop_i8_pipeline_->updateDescriptorSets(ds_writes_);
-            m_cmd_->bind(*coop_i8_pipeline_, coop_i8_ds_[m_id_]);
-            m_cmd_->push_constants(*coop_i8_pipeline_,
-                                   sizeof(matmul::GpuMatMulParam), &para_);
-            dispatch_and_record(UP_DIV(n, coop_i8_bn_), UP_DIV(m, coop_i8_bm_),
-                                batch, &para_);
+            bool i8_bda_used = false;
+            VkDescriptorSet *i8_bda_ds = nullptr;
+            VulkanPipeline *i8_bda_pipe =
+                coop_bda_for(coop_i8_pipeline_.get(), &i8_bda_ds);
+            if (i8_bda_pipe && i8_bda_ds && fill_coop_table()) {
+                m_cmd_->bind(*i8_bda_pipe, *i8_bda_ds);
+                m_cmd_->push_constants(*i8_bda_pipe,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                dispatch_and_record(UP_DIV(n, coop_i8_bn_),
+                                    UP_DIV(m, coop_i8_bm_), batch, &para_,
+                                    sizeof(para_));
+                bda_dispatched_ = true;
+                i8_bda_used = true;
+            }
+            if (!i8_bda_used) {
+                fillDescriptorWrites(coop_i8_ds_[m_id_]);
+                coop_i8_pipeline_->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*coop_i8_pipeline_, coop_i8_ds_[m_id_]);
+                m_cmd_->push_constants(*coop_i8_pipeline_,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                dispatch_and_record(UP_DIV(n, coop_i8_bn_),
+                                    UP_DIV(m, coop_i8_bm_), batch, &para_);
+            }
 
             scratch_->shaderWriteBarrier(m_cmd_->get());
+            if (submit_pack_bda(total)) {
+                return;
+            }
 
             int nwords = (total + 1) / 2;
             MatMulPackPC pack_pc{};
@@ -1622,28 +1776,44 @@ class MatMulBuffer : public BufferFactory {
                     para_.weight_int8, para_.wide);
                 route_info_ = buf;
             }
-            fillDescriptorWrites(ds[m_id_]);
-            pipe->updateDescriptorSets(ds_writes_);
-            m_cmd_->bind(*pipe, ds[m_id_]);
-            m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam),
-                                   &para_);
-            dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
+            bool coop_bda_used = false;
+            VkDescriptorSet *bda_ds = nullptr;
+            VulkanPipeline *bda_pipe = coop_bda_for(pipe, &bda_ds);
+            if (bda_pipe && bda_ds && fill_coop_table()) {
+                m_cmd_->bind(*bda_pipe, *bda_ds);
+                m_cmd_->push_constants(*bda_pipe,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_,
+                                    sizeof(para_));
+                bda_dispatched_ = true;
+                coop_bda_used = true;
+            }
+            if (!coop_bda_used) {
+                fillDescriptorWrites(ds[m_id_]);
+                pipe->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*pipe, ds[m_id_]);
+                m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam),
+                                       &para_);
+                dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
+            }
 
             if (!no_pack) {
                 // Barrier: flush coopmat's scratch writes for pack's reads.
                 scratch_->shaderWriteBarrier(m_cmd_->get());
-
-                // Pack pass: separate pipeline (no PC interference). One thread per
-                // output word; reads flat fp32 from scratch, packs half2 to output.
-                int nwords = (total + 1) / 2;
-                MatMulPackPC pack_pc{};
-                pack_pc.total = total;
-                fillDescriptorWrites(pack_ds_[m_id_]);
-                pack_pipeline_->updateDescriptorSets(ds_writes_);
-                m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
-                m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
-                                       &pack_pc);
-                dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+                if (!submit_pack_bda(total)) {
+                    // Pack pass: separate pipeline (no PC interference). One
+                    // thread per output word; reads flat fp32 from scratch,
+                    // packs half2 to output.
+                    int nwords = (total + 1) / 2;
+                    MatMulPackPC pack_pc{};
+                    pack_pc.total = total;
+                    fillDescriptorWrites(pack_ds_[m_id_]);
+                    pack_pipeline_->updateDescriptorSets(ds_writes_);
+                    m_cmd_->bind(*pack_pipeline_, pack_ds_[m_id_]);
+                    m_cmd_->push_constants(*pack_pipeline_, sizeof(MatMulPackPC),
+                                           &pack_pc);
+                    dispatch_and_record(UP_DIV(nwords, 256), 1, 1, &pack_pc);
+                }
             }
             return;
         }
@@ -1687,12 +1857,38 @@ class MatMulBuffer : public BufferFactory {
             // serial in-workgroup split-K (grid.z=batch) accumulates fully
             // inside each workgroup and writes directly to scratch.
             if (objs_.size() < 7) objs_.resize(7, nullptr);
-            fillDescriptorWrites(ds[m_id_]);
-            pipe->updateDescriptorSets(ds_writes_);
-            m_cmd_->bind(*pipe, ds[m_id_]);
-            m_cmd_->push_constants(*pipe, sizeof(matmul::GpuMatMulParam), &para_);
-            dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch, &para_);
+            // BDA dispatch only for the fp32 module: the dropped half2 builds
+            // have no _bda key, and the table addresses are the same either
+            // way. fill_coop_table() falls back to the descriptor module when
+            // an address is unavailable.
+            bool sklast_bda_used = false;
+            auto f32it = sklast_fp32_pipes_.find(cs_key);
+            auto bda_it = sklast_fp32_bda_.find(cs_key);
+            if (f32it != sklast_fp32_pipes_.end() && f32it->second &&
+                pipe == f32it->second.get() &&
+                bda_it != sklast_fp32_bda_.end() && bda_it->second.owner &&
+                bda_it->second.ds != VK_NULL_HANDLE && fill_coop_table()) {
+                m_cmd_->bind(*bda_it->second.owner, bda_it->second.ds);
+                m_cmd_->push_constants(*bda_it->second.owner,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch,
+                                    &para_);
+                bda_dispatched_ = true;
+                sklast_bda_used = true;
+            }
+            if (!sklast_bda_used) {
+                fillDescriptorWrites(ds[m_id_]);
+                pipe->updateDescriptorSets(ds_writes_);
+                m_cmd_->bind(*pipe, ds[m_id_]);
+                m_cmd_->push_constants(*pipe,
+                                       sizeof(matmul::GpuMatMulParam), &para_);
+                dispatch_and_record(UP_DIV(n, bn), UP_DIV(m, bm), batch,
+                                    &para_);
+            }
             scratch_->shaderWriteBarrier(m_cmd_->get());
+            if (submit_pack_bda(total)) {
+                return;
+            }
             int nwords = (total + 1) / 2;
             MatMulPackPC pack_pc{};
             pack_pc.total = total;
@@ -1926,8 +2122,34 @@ class MatMulBuffer : public BufferFactory {
                         da_dset = down_act_multi_ds_;
                     }
                 }
-                ks_submit(da_pipe, da_dset[m_id_], da_gx,
-                          batch * ((m + 15) / 16), da_wide_ok ? 1 : da_ks_n);
+                // BDA counterpart of whichever descriptor module was chosen.
+                // The table carries all nine buffers' addresses (including the
+                // typed uvec4/uvec2 aliases of Wd/Wg/Wu), so a BDA dispatch
+                // skips the descriptor fill entirely. fill_down_act_table()
+                // stages the table with vkCmdUpdateBuffer before the first
+                // dispatch; the three passes share it, exactly like they share
+                // the descriptor set.
+                VkDescriptorSet *da_bda_dset = nullptr;
+                VulkanPipeline *da_bda_pipe =
+                    down_act_bda_for(da_pipe, &da_bda_dset);
+                const bool da_bda =
+                    da_bda_pipe && da_bda_dset && fill_down_act_table();
+                if (da_bda) {
+                    bda_dispatched_ = true;
+                }
+                auto da_dispatch = [&](int gx, int gy, int gz) {
+                    if (!da_bda) {
+                        ks_submit(da_pipe, da_dset[m_id_], gx, gy, gz);
+                        return;
+                    }
+                    m_cmd_->bind(*da_bda_pipe, *da_bda_dset);
+                    m_cmd_->push_constants(*da_bda_pipe,
+                                           sizeof(matmul::GpuMatMulParam),
+                                           &para_);
+                    dispatch_and_record(gx, gy, gz, &para_);
+                };
+                da_dispatch(da_gx, batch * ((m + 15) / 16),
+                            da_wide_ok ? 1 : da_ks_n);
                 // Down: sums the deposit's slice partials per (row, j) into
                 // shared, walks the sub-block's Wd j-slice for every output
                 // column, parks fp32 down partials keyed (row, gx*ds+z, c).
@@ -1937,15 +2159,13 @@ class MatMulBuffer : public BufferFactory {
                 scratch_da_->shaderWriteBarrier(m_cmd_->get());
                 para_.ks_part = 1; // the module's down entry
                 para_.tile = da_ds;
-                ks_submit(da_pipe, da_dset[m_id_], da_gx,
-                          batch * ((m + 15) / 16), da_ds);
+                da_dispatch(da_gx, batch * ((m + 15) / 16), da_ds);
                 // Reduce: sums the GX * da_ds down partials and packs fp16.
                 // tile still carries da_ds for the dp stride. Reading what
                 // the down pass wrote needs another dependency.
                 scratch_da_->shaderWriteBarrier(m_cmd_->get());
                 para_.ks_part = 2; // the module's reduce entry
-                dispatch_on(da_pipe, da_dset[m_id_],
-                            UP_DIV(n, 2048), batch * m);
+                da_dispatch(UP_DIV(n, 2048), batch * m, 1);
                 return;
             }
         }
@@ -1961,6 +2181,27 @@ class MatMulBuffer : public BufferFactory {
             // wrong at ks_n=2. Both read the same slice table from the scratch
             // header, so they cannot disagree about the split.
             set_route(plan.tag, batch, m, n, k, rep);
+            if (ensure_bda_variant(
+                    ks_split_bda_,
+                    "buffer_matmul_tiled_ks_split_bda_fp16") &&
+                ensure_bda_variant(
+                    ks_fold_bda_,
+                    "buffer_matmul_tiled_ks_fold_bda_fp16") &&
+                fill_bda_table()) {
+                m_cmd_->bind(*ks_split_bda_.pipe, ks_split_bda_.ds);
+                m_cmd_->push_constants(*ks_split_bda_.pipe,
+                                       sizeof(para_), &para_);
+                dispatch_and_record(UP_DIV(n, 64), UP_DIV(m, 64),
+                                    batch * ks_n, &para_, sizeof(para_));
+                scratch_->shaderWriteBarrier(m_cmd_->get());
+                m_cmd_->bind(*ks_fold_bda_.pipe, ks_fold_bda_.ds);
+                m_cmd_->push_constants(*ks_fold_bda_.pipe,
+                                       sizeof(para_), &para_);
+                dispatch_and_record(UP_DIV(n, 64), UP_DIV(m, 64), batch,
+                                    &para_, sizeof(para_));
+                bda_dispatched_ = true;
+                return;
+            }
             ks_submit(sel_ks_split, ks_split_ds_[m_id_], UP_DIV(n, 64),
                       UP_DIV(m, 64), batch * ks_n);
             // The fold reads the deposit's SSBO stores, so the pair needs an
@@ -1975,6 +2216,9 @@ class MatMulBuffer : public BufferFactory {
             // straddles a batch boundary, so no per-row batch fixups in the
             // shader.
             set_route(plan.tag, batch, m, n, k, rep);
+            if (try_submit_bda(UP_DIV(n, 64), UP_DIV(m, 64), batch)) {
+                return;
+            }
             submit(&para_, UP_DIV(n, 64), UP_DIV(m, 64), batch);
             return;
         }
@@ -1990,31 +2234,67 @@ class MatMulBuffer : public BufferFactory {
             case core::MatmulRoute::kKsplitW8Wide512:
                 // Byte WIDE (16 columns/lane) in the 512-lane build.
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (ensure_bda_variant(
+                        ks512_w8_bda_,
+                        "buffer_matmul_ksplit512_w8_wide_bda_fp16") &&
+                    bda_b4_aligned() &&
+                    submit_bda_variant(ks512_w8_bda_, UP_DIV(n / 16, q),
+                                       batch * m, 1)) {
+                    return;
+                }
                 dispatch_on(sel_wide, w8_wide512_ds_[m_id_],
                             UP_DIV(n / 16, q), batch * m);
                 return;
             case core::MatmulRoute::kKsplitW8Wide:
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (ensure_bda_variant(
+                        w8_wide_bda_,
+                        "buffer_matmul_w8_wide_bda_fp16") &&
+                    bda_b4_aligned() &&
+                    submit_bda_variant(w8_wide_bda_, UP_DIV(n / 16, q),
+                                       batch * m, 1)) {
+                    return;
+                }
                 dispatch_on(sel_wide, w8_wide_ds_[m_id_], UP_DIV(n / 16, q),
                             batch * m);
                 return;
             case core::MatmulRoute::kKsplitWide512:
                 // fp16 WIDE (8 columns/lane) in the 512-lane build.
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (ensure_bda_variant(ks512_bda_,
+                                       "buffer_matmul_ksplit512_bda_fp16") &&
+                    bda_b4_aligned() &&
+                    submit_bda_variant(ks512_bda_, UP_DIV(n / 8, q),
+                                       batch * m, 1)) {
+                    return;
+                }
                 dispatch_on(sel_ks512, ksplit512_ds_[m_id_],
                             UP_DIV(n / 8, q), batch * m);
                 return;
             case core::MatmulRoute::kKsplit512:
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (ensure_bda_variant(ks512_bda_,
+                                       "buffer_matmul_ksplit512_bda_fp16") &&
+                    submit_bda_variant(ks512_bda_, UP_DIV(n / 4, q),
+                                       batch * m, 1)) {
+                    return;
+                }
                 dispatch_on(sel_ks512, ksplit512_ds_[m_id_],
                             UP_DIV(n / 4, q), batch * m);
                 return;
             case core::MatmulRoute::kKsplitWide:
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (bda_b4_aligned() &&
+                    try_submit_bda(UP_DIV(n / 8, q), batch * m, 1)) {
+                    return;
+                }
                 submit(&para_, UP_DIV(n / 8, q), batch * m, 1);
                 return;
             default:
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (try_submit_bda(UP_DIV(n / 4, q), batch * m, 1)) {
+                    return;
+                }
                 submit(&para_, UP_DIV(n / 4, q), batch * m, 1);
                 return;
             }
@@ -2023,8 +2303,12 @@ class MatMulBuffer : public BufferFactory {
             // Single pass: x covers output WORDS (column pairs), or DWORDs for
             // the four-column quantized kernels.
             set_route(plan.tag, batch, m, n, k, rep);
-            submit(&para_, UP_DIV(n / ((w8_quad || w4_quad) ? 4 : 2), 16),
-                   UP_DIV(batch * m, 16), 1);
+            const int gx = UP_DIV(n / ((w8_quad || w4_quad) ? 4 : 2), 16);
+            const int gy = UP_DIV(batch * m, 16);
+            if (try_submit_bda(gx, gy, 1)) {
+                return;
+            }
+            submit(&para_, gx, gy, 1);
             return;
         }
         // Reduce pass: one thread per output element. Uses the main pipeline.
@@ -2032,13 +2316,20 @@ class MatMulBuffer : public BufferFactory {
         // for fp32 inputs this is the naive fp32 reduce (batch*m collapsed into
         // y).
         set_route(plan.tag, batch, m, n, k, rep);
-        submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
+        const bool reduce_bda =
+            try_submit_bda(UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
+        if (!reduce_bda) {
+            submit(&para_, UP_DIV(n, 16), UP_DIV(batch * m, 16), 1);
+        }
 
         if (fp16_ != 0) {
             // Reaching here with fp16_ means odd N (even N returned above) and
             // not coopmat (it dispatches its own pack and returns), so the
             // reduce wrote flat fp32 scratch that nothing has repacked.
             scratch_->shaderWriteBarrier(m_cmd_->get());
+            if (submit_pack_bda(total)) {
+                return;
+            }
 
             int nwords = (total + 1) / 2;
             MatMulPackPC pack_pc{};
@@ -2121,6 +2412,8 @@ class MatMulBuffer : public BufferFactory {
         bool tile16;
         bool writes_scratch;
         const char *key;
+        std::unique_ptr<VulkanPipeline> bda_pipe;
+        VkDescriptorSet bda_ds = VK_NULL_HANDLE;
     };
     template <size_t N>
     std::unique_ptr<VulkanPipeline>
@@ -2191,9 +2484,16 @@ class MatMulBuffer : public BufferFactory {
                     tile16 = m.cm == 16 && m.cn == 16 && m.ck == 16;
                     writes_scratch_out = m.writes_scratch;
                 } else if (extra) {
+                    std::unique_ptr<VulkanPipeline> bda_pipe;
+                    VkDescriptorSet bda_ds = VK_NULL_HANDLE;
+                    if (bda_ready()) {
+                        bda_pipe = make_coop_bda_pipe(
+                            std::string(m.key) + "_bda", bda_ds);
+                    }
                     extra->push_back({std::move(pipe), m.bm, m.bn,
                                       m.cm == 16 && m.cn == 16 && m.ck == 16,
-                                      m.writes_scratch, m.key});
+                                      m.writes_scratch, m.key,
+                                      std::move(bda_pipe), bda_ds});
                 }
             } catch (const std::exception &e) {
                 std::fprintf(stderr,
@@ -2253,6 +2553,9 @@ class MatMulBuffer : public BufferFactory {
         int acc; // VKOP_COOP_ACC value that pins this geometry
         VulkanPipeline *pipe = nullptr;
         VkDescriptorSet ds[vkop::kInflight] = {nullptr};
+        std::unique_ptr<VulkanPipeline> bda_owner{};
+        VulkanPipeline *bda_pipe = nullptr;
+        VkDescriptorSet bda_ds = VK_NULL_HANDLE;
         bool no_bytes = false; // this op's archive lacks the key
         bool refused = false;  // driver rejected the module
     };
@@ -2306,6 +2609,14 @@ class MatMulBuffer : public BufferFactory {
                          g.bm, g.bn, e.what());
             return nullptr;
         }
+        // BDA counterpart of this ACC geometry (same 6-entry table as the
+        // base coop modules). Missing bytes or a driver refusal leave bda_pipe
+        // null and the descriptor module stays in charge.
+        if (bda_ready()) {
+            g.bda_owner = make_coop_bda_pipe(std::string(g.key) + "_bda",
+                                             g.bda_ds);
+            g.bda_pipe = g.bda_owner.get();
+        }
         return g.pipe;
     }
 
@@ -2327,6 +2638,9 @@ class MatMulBuffer : public BufferFactory {
         int bn = 32;
         bool no_bytes = false; // this op's archive lacks the key
         bool refused = false;  // driver rejected the module
+        std::unique_ptr<VulkanPipeline> bda_owner;
+        VulkanPipeline *bda_pipe = nullptr;
+        VkDescriptorSet bda_ds = VK_NULL_HANDLE;
     };
     CoopAlt coop_alt_;
     std::unique_ptr<VulkanPipeline> coop_alt_owner_;
@@ -2380,6 +2694,11 @@ class MatMulBuffer : public BufferFactory {
             }
             coop_alt_.pipe = pipe.get();
             coop_alt_owner_ = std::move(pipe);
+            if (bda_ready()) {
+                coop_alt_.bda_owner = make_coop_bda_pipe(
+                    "buffer_matmul_coop16_16x8x16_bda", coop_alt_.bda_ds);
+                coop_alt_.bda_pipe = coop_alt_.bda_owner.get();
+            }
         } catch (const std::exception &e) {
             coop_alt_.refused = true;
             std::fprintf(stderr,
@@ -2591,6 +2910,17 @@ class MatMulBuffer : public BufferFactory {
                          multi ? "M>1 uses the M==1 module's per-row walk"
                                : "down_proj runs as three standalone GEMMs");
             return nullptr;
+        }
+        if (bda_ready()) {
+            auto &bda = multi ? down_act_multi_bda_pipeline_
+                              : down_act_bda_pipeline_;
+            auto &bda_ds = multi ? down_act_multi_bda_ds_ : down_act_bda_ds_;
+            if (!bda) {
+                bda = make_down_act_bda_pipe(
+                    multi ? "buffer_matmul_down_act_multi_bda_fp16"
+                          : "buffer_matmul_down_act_bda_fp16",
+                    bda_ds);
+            }
         }
         return cached.get();
     }
@@ -2822,6 +3152,9 @@ class MatMulBuffer : public BufferFactory {
         int bn = 0;
         bool writes_scratch = true;
         const char *key = nullptr;  // archive key (e.g. "buffer_matmul_coop16_16x8x16")
+        std::unique_ptr<VulkanPipeline> bda_owner;
+        VulkanPipeline *bda_pipe = nullptr;
+        VkDescriptorSet bda_ds = VK_NULL_HANDLE;
     };
     std::vector<CoopAltVariant> coop_fp16_alts_;
     std::vector<std::unique_ptr<VulkanPipeline>> coop_fp16_alts_owner_;
@@ -2852,6 +3185,7 @@ class MatMulBuffer : public BufferFactory {
     int coop_i8_bm_ = 16;
     int coop_i8_bn_ = 32;
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
+    std::unique_ptr<VulkanPipeline> pack_bda_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     // The int8/fp8 weight-only WIDE GEMV module (buffer_matmul_w8_wide_fp16,
     // a second build of buffer/matmul.comp whose entry reaches only that
@@ -2876,6 +3210,13 @@ class MatMulBuffer : public BufferFactory {
     // runtime ints near coopMat accumulators. Map key = coop_split value.
     std::unordered_map<int, std::unique_ptr<VulkanPipeline>> sklast_fp32_pipes_;
     std::unordered_map<int, std::unique_ptr<VulkanPipeline>> sklast_half2_pipes_;
+    // BDA counterparts of the fp32 cs variants, keyed by cs_key. Each keeps
+    // its own table descriptor (the table buffer itself is shared).
+    struct SkLastBda {
+        std::unique_ptr<VulkanPipeline> owner;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+    };
+    std::unordered_map<int, SkLastBda> sklast_fp32_bda_;
     VkDescriptorSet sklast_fp32_ds_[vkop::kInflight] = {nullptr};
     VkDescriptorSet sklast_half2_ds_[vkop::kInflight] = {nullptr};
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
@@ -2911,6 +3252,419 @@ class MatMulBuffer : public BufferFactory {
     // VKOP_MATMUL_ROUTE. See Operator::route_tag.
     std::string route_tag_;
     std::string route_info_;
+
+    // BDA address table (one storage descriptor). Stable across rounds; its
+    // 80 bytes are rewritten per recording with the data buffers' addresses.
+    // The base ksplit/tiled/fused routes use Operator's bda_pipeline_/bda_ds_;
+    // the secondary routes below get their own pipeline + set sharing the same
+    // table buffer.
+    std::shared_ptr<VulkanBuffer> bda_table_buf_;
+    // Coop primary table (out/inA/inB/scratch/scale/global).
+    std::shared_ptr<VulkanBuffer> coop_bda_table_buf_;
+    std::unique_ptr<VulkanPipeline> coop_bda_pipeline_;
+    VkDescriptorSet coop_bda_ds_ = VK_NULL_HANDLE;
+    std::unique_ptr<VulkanPipeline> coop_i8_bda_pipeline_;
+    VkDescriptorSet coop_i8_bda_ds_ = VK_NULL_HANDLE;
+    // Down-act fold: 3-pass module, 7 addresses + 6 typed aliases.
+    std::shared_ptr<VulkanBuffer> down_act_bda_table_buf_;
+    std::unique_ptr<VulkanPipeline> down_act_bda_pipeline_;
+    std::unique_ptr<VulkanPipeline> down_act_multi_bda_pipeline_;
+    VkDescriptorSet down_act_bda_ds_ = VK_NULL_HANDLE;
+    VkDescriptorSet down_act_multi_bda_ds_ = VK_NULL_HANDLE;
+
+    struct BdaVariant {
+        std::unique_ptr<VulkanPipeline> pipe;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+        bool tried = false;
+    };
+    BdaVariant w8_wide_bda_;
+    BdaVariant ks512_bda_;
+    BdaVariant ks512_w8_bda_;
+    BdaVariant ks_split_bda_;
+    BdaVariant ks_fold_bda_;
+
+    void ensure_bda_table_buf() {
+        if (bda_table_buf_) {
+            return;
+        }
+        bda_table_buf_ = std::make_shared<VulkanBuffer>(
+            m_dev_, sizeof(matmul::MatMulBdaArgs),
+            STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+
+    void bind_table_descriptor(VulkanPipeline *pipe, VkDescriptorSet ds) {
+        auto *info = std::get<VkDescriptorBufferInfo *>(
+            bda_table_buf_->getDescriptorInfo());
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = ds;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = DESCRIPTOR_TYPE_STORAGE;
+        write.pBufferInfo = info;
+        pipe->updateDescriptorSets({write});
+    }
+
+    void ensure_bda_table() {
+        if (!bda_ready() || bda_ds_ == VK_NULL_HANDLE) {
+            return;
+        }
+        ensure_bda_table_buf();
+        bind_table_descriptor(bda_pipeline_.get(), bda_ds_);
+    }
+
+    // Collect the seven bound data buffers (objs_ order 0..6) into the shared
+    // table. Bindings 7/8 belong to the down_act route and are dummied here.
+    VkDeviceAddress bda_addr(size_t i) const {
+        if (i >= objs_.size() || !objs_[i]) {
+            return 0;
+        }
+        auto b = std::dynamic_pointer_cast<VulkanBuffer>(objs_[i]);
+        if (!b || !b->hasDeviceAddress()) {
+            return 0;
+        }
+        return b->getDeviceAddress();
+    }
+
+    // The WIDE kernels alias B as uvec4 (buffer_reference_align=16). A
+    // sub-range view may be only 4/8-aligned; those routes fall back to the
+    // descriptor pipeline when the B address is not 16-aligned.
+    bool bda_b4_aligned() const {
+        const VkDeviceAddress a = bda_addr(2);
+        return a != 0 && (a % 16) == 0;
+    }
+
+    bool fill_bda_table() {
+        matmul::MatMulBdaArgs args{};
+        args.out = bda_addr(0);
+        args.in_a = bda_addr(1);
+        args.in_b = bda_addr(2);
+        args.in_b4 = args.in_b; // aliased uvec4 view of the same buffer
+        args.scratch = bda_addr(3);
+        args.scale = bda_addr(4);
+        args.global = bda_addr(5);
+        args.epi_bias = bda_addr(6);
+        if (args.out == 0 || args.in_a == 0 || args.in_b == 0 ||
+            args.scratch == 0 || args.scale == 0 || args.global == 0 ||
+            args.epi_bias == 0) {
+            return false;
+        }
+        const VkDeviceAddress dummy = dummy_buffer_->getDeviceAddress();
+        args.in_b2 = dummy;
+        args.in_act = dummy;
+        ensure_bda_table_buf();
+        // Pre-set SHADER_READ so updateBuffer's restore barrier makes the
+        // transfer write visible to the dispatch (a fresh table starts at 0).
+        bda_table_buf_->readBarrier(m_cmd_->get(), sizeof(args), 0);
+        bda_table_buf_->updateBuffer(m_cmd_->get(), &args, sizeof(args));
+        return true;
+    }
+
+    bool ensure_bda_variant(BdaVariant &v, const char *key) {
+        // VKOP_BDA / base-key gate: bda_pipeline_ is null when the shader
+        // variants are disabled or the archive lacks the base BDA key.
+        if (!bda_ready()) {
+            return false;
+        }
+        if (v.tried) {
+            return v.pipe != nullptr;
+        }
+        v.tried = true;
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(key);
+        } catch (const std::exception &) {
+            return false;
+        }
+        try {
+            v.pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam),
+                reinterpret_cast<const uint32_t *>(spv.first),
+                static_cast<int>(spv.second), /*update_after_bind=*/false,
+                required_subgroup_size_, VK_NULL_HANDLE);
+            v.ds = v.pipe->allocDescriptorSets();
+            ensure_bda_table_buf();
+            bind_table_descriptor(v.pipe.get(), v.ds);
+            return true;
+        } catch (const std::exception &) {
+            v.pipe.reset();
+            v.ds = VK_NULL_HANDLE;
+            return false;
+        }
+    }
+
+    bool submit_bda_variant(BdaVariant &v, int gx, int gy, int gz) {
+        if (!bda_ready() || !v.pipe || !fill_bda_table()) {
+            return false;
+        }
+        m_cmd_->bind(*v.pipe, v.ds);
+        m_cmd_->push_constants(*v.pipe, sizeof(para_), &para_);
+        dispatch_and_record(gx, gy, gz, &para_, sizeof(para_));
+        bda_dispatched_ = true;
+        return true;
+    }
+
+    bool try_submit_bda(int gx, int gy, int gz) {
+        if (!bda_ready() || !bda_table_buf_ || bda_ds_ == VK_NULL_HANDLE) {
+            return false;
+        }
+        if (!fill_bda_table()) {
+            return false;
+        }
+        submit_bda(&para_, sizeof(para_), gx, gy, gz);
+        return true;
+    }
+
+    // Pack pass through direct push-constant addresses (no table needed).
+    bool submit_pack_bda(int total) {
+        if (!pack_bda_pipeline_ || !bda_ready()) {
+            return false;
+        }
+        const VkDeviceAddress out = bda_addr(0);
+        const VkDeviceAddress scratch = bda_addr(3);
+        if (out == 0 || scratch == 0) {
+            return false;
+        }
+        MatMulPackBdaPC pc{};
+        pc.base.total = total;
+        pc.out_addr = out;
+        pc.scratch_addr = scratch;
+        m_cmd_->bind_pipeline(*pack_bda_pipeline_);
+        m_cmd_->push_constants(*pack_bda_pipeline_, sizeof(pc), &pc);
+        dispatch_and_record(UP_DIV((total + 1) / 2, 256), 1, 1, &pc,
+                            sizeof(pc));
+        bda_dispatched_ = true;
+        return true;
+    }
+
+    bool fill_coop_table() {
+        if (!coop_bda_table_buf_) {
+            return false;
+        }
+        matmul::MatMulCoopBdaArgs args{};
+        args.out = bda_addr(0);
+        args.in_a = bda_addr(1);
+        args.in_b = bda_addr(2);
+        args.scratch = bda_addr(3);
+        // i8/sklast kernels have fewer bindings; the unused slots stay valid
+        // via the dummy (they are never dereferenced when the flag is off).
+        auto or_dummy = [&](size_t i) -> VkDeviceAddress {
+            const VkDeviceAddress a = bda_addr(i);
+            return a != 0 ? a : dummy_buffer_->getDeviceAddress();
+        };
+        args.scale = or_dummy(4);
+        args.global = or_dummy(5);
+        if (args.out == 0 || args.in_a == 0 || args.in_b == 0 ||
+            args.scratch == 0 || args.scale == 0 || args.global == 0) {
+            return false;
+        }
+        coop_bda_table_buf_->readBarrier(m_cmd_->get(), sizeof(args), 0);
+        coop_bda_table_buf_->updateBuffer(m_cmd_->get(), &args, sizeof(args));
+        return true;
+    }
+
+    void ensure_coop_bda_table_buf() {
+        if (coop_bda_table_buf_) {
+            return;
+        }
+        coop_bda_table_buf_ = std::make_shared<VulkanBuffer>(
+            m_dev_, sizeof(matmul::MatMulCoopBdaArgs),
+            STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    }
+
+    void bind_coop_table_descriptor(VulkanPipeline *pipe, VkDescriptorSet ds) {
+        auto *info = std::get<VkDescriptorBufferInfo *>(
+            coop_bda_table_buf_->getDescriptorInfo());
+        VkWriteDescriptorSet write{};
+        write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        write.dstSet = ds;
+        write.dstBinding = 0;
+        write.dstArrayElement = 0;
+        write.descriptorCount = 1;
+        write.descriptorType = DESCRIPTOR_TYPE_STORAGE;
+        write.pBufferInfo = info;
+        pipe->updateDescriptorSets({write});
+    }
+
+    // Build the BDA counterpart of one coop module. Missing key / rejected
+    // pipeline yields nullptr and the descriptor module stays in charge.
+    std::unique_ptr<VulkanPipeline>
+    make_coop_bda_pipe(const std::string &key, VkDescriptorSet &ds_out) {
+        ds_out = VK_NULL_HANDLE;
+        if (!bda_ready()) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(key);
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        try {
+            auto pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), /*update_after_bind=*/false,
+                required_subgroup_size_, VK_NULL_HANDLE);
+            ds_out = pipe->allocDescriptorSets();
+            ensure_coop_bda_table_buf();
+            bind_coop_table_descriptor(pipe.get(), ds_out);
+            return pipe;
+        } catch (const std::exception &) {
+            ds_out = VK_NULL_HANDLE;
+            return nullptr;
+        }
+    }
+
+    // Map a selected coop descriptor pipeline to its BDA counterpart.
+    VulkanPipeline *coop_bda_for(VulkanPipeline *pipe, VkDescriptorSet **ds) {
+        *ds = nullptr;
+        if (!pipe || !bda_ready()) {
+            return nullptr;
+        }
+        if (pipe == coop_pipeline_.get()) {
+            if (coop_bda_pipeline_ && coop_bda_ds_ != VK_NULL_HANDLE) {
+                *ds = &coop_bda_ds_;
+                return coop_bda_pipeline_.get();
+            }
+            return nullptr;
+        }
+        if (pipe == coop_i8_pipeline_.get()) {
+            if (coop_i8_bda_pipeline_ && coop_i8_bda_ds_ != VK_NULL_HANDLE) {
+                *ds = &coop_i8_bda_ds_;
+                return coop_i8_bda_pipeline_.get();
+            }
+            return nullptr;
+        }
+        if (coop_alt_.pipe == pipe) {
+            if (coop_alt_.bda_pipe && coop_alt_.bda_ds != VK_NULL_HANDLE) {
+                *ds = &coop_alt_.bda_ds;
+                return coop_alt_.bda_pipe;
+            }
+            return nullptr;
+        }
+        for (auto &alt : coop_fp16_alts_) {
+            if (alt.pipe == pipe && alt.bda_pipe &&
+                alt.bda_ds != VK_NULL_HANDLE) {
+                *ds = &alt.bda_ds;
+                return alt.bda_pipe;
+            }
+        }
+        // The 16x16x16 ACC geometries (64x64 / 64x128) are separate pipelines
+        // of matmul_coop16.comp with their own BDA counterparts.
+        for (auto &g : coop_geos_) {
+            if (g.pipe == pipe && g.bda_pipe &&
+                g.bda_ds != VK_NULL_HANDLE) {
+                *ds = &g.bda_ds;
+                return g.bda_pipe;
+            }
+        }
+        return nullptr;
+    }
+
+    std::unique_ptr<VulkanPipeline>
+    make_down_act_bda_pipe(const char *key, VkDescriptorSet &ds_out) {
+        ds_out = VK_NULL_HANDLE;
+        if (!bda_ready()) {
+            return nullptr;
+        }
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(key);
+        } catch (const std::exception &) {
+            return nullptr;
+        }
+        try {
+            auto pipe = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(),
+                std::vector<VkDescriptorType>{DESCRIPTOR_TYPE_STORAGE},
+                sizeof(matmul::GpuMatMulParam), spv.first,
+                static_cast<int>(spv.second), /*update_after_bind=*/false, 0);
+            ds_out = pipe->allocDescriptorSets();
+            if (!down_act_bda_table_buf_) {
+                down_act_bda_table_buf_ = std::make_shared<VulkanBuffer>(
+                    m_dev_, sizeof(matmul::MatMulDownActBdaArgs),
+                    STORAGE | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                    VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            }
+            auto *info = std::get<VkDescriptorBufferInfo *>(
+                down_act_bda_table_buf_->getDescriptorInfo());
+            VkWriteDescriptorSet write{};
+            write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            write.dstSet = ds_out;
+            write.dstBinding = 0;
+            write.dstArrayElement = 0;
+            write.descriptorCount = 1;
+            write.descriptorType = DESCRIPTOR_TYPE_STORAGE;
+            write.pBufferInfo = info;
+            pipe->updateDescriptorSets({write});
+            return pipe;
+        } catch (const std::exception &) {
+            ds_out = VK_NULL_HANDLE;
+            return nullptr;
+        }
+    }
+
+    bool fill_down_act_table() {
+        if (!down_act_bda_table_buf_) {
+            return false;
+        }
+        matmul::MatMulDownActBdaArgs args{};
+        args.out = bda_addr(0);
+        args.in_a = bda_addr(1);
+        args.in_b = bda_addr(2);
+        args.scratch = bda_addr(3);
+        args.scale = bda_addr(4);
+        if (args.scale == 0) {
+            args.scale = dummy_buffer_->getDeviceAddress();
+        }
+        args.in_b2 = bda_addr(7);
+        args.in_act = bda_addr(8);
+        if (args.out == 0 || args.in_a == 0 || args.in_b == 0 ||
+            args.scratch == 0 || args.in_b2 == 0 || args.in_act == 0) {
+            return false;
+        }
+        args.wd4 = args.in_b;
+        args.wd8 = args.in_b;
+        args.wg4 = args.in_b2;
+        args.wg8 = args.in_b2;
+        args.wu4 = args.in_act;
+        args.wu8 = args.in_act;
+        down_act_bda_table_buf_->readBarrier(m_cmd_->get(), sizeof(args), 0);
+        down_act_bda_table_buf_->updateBuffer(m_cmd_->get(), &args,
+                                              sizeof(args));
+        return true;
+    }
+
+    VulkanPipeline *down_act_bda_for(VulkanPipeline *pipe,
+                                     VkDescriptorSet **ds) {
+        *ds = nullptr;
+        if (!pipe || !bda_ready()) {
+            return nullptr;
+        }
+        if (pipe == down_act_pipeline_.get()) {
+            if (down_act_bda_pipeline_ && down_act_bda_ds_ != VK_NULL_HANDLE) {
+                *ds = &down_act_bda_ds_;
+                return down_act_bda_pipeline_.get();
+            }
+            return nullptr;
+        }
+        if (pipe == down_act_multi_pipeline_.get()) {
+            if (down_act_multi_bda_pipeline_ &&
+                down_act_multi_bda_ds_ != VK_NULL_HANDLE) {
+                *ds = &down_act_multi_bda_ds_;
+                return down_act_multi_bda_pipeline_.get();
+            }
+            return nullptr;
+        }
+        return nullptr;
+    }
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

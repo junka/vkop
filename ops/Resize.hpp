@@ -399,12 +399,23 @@ struct ResizeBufferPC {
     int _pad1;
 };
 
+struct alignas(16) ResizeBdaPC {
+    ResizeBufferPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(ResizeBdaPC, out_addr) == 80, "ResizeBdaPC drift");
+static_assert(sizeof(ResizeBdaPC) == 96, "ResizeBdaPC drift");
+
 class ResizeBuffer : public BufferFactory {
   public:
     explicit ResizeBuffer(int fp16)
         : BufferFactory(OpType::RESIZE,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ResizeBufferPC), fp16) {}
+
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(ResizeBdaPC); }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -490,17 +501,19 @@ class ResizeBuffer : public BufferFactory {
             outshape = recorded;
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(outshape)) {
                 output->resize(outshape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         ResizeBufferPC pc{};
@@ -512,7 +525,21 @@ class ResizeBuffer : public BufferFactory {
         // (the fp16 shader writes each word once — no RMW race).
         int total = total_elems(outshape);
         int nthreads = (fp16_ != 0) ? (total + 1) / 2 : total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        const int groups = UP_DIV(nthreads, 256);
+        if (bda_ready() && out_buf && in_buf &&
+            out_buf->hasDeviceAddress() && in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                ResizeBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 
     int mode_ = 0;

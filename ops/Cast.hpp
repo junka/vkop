@@ -16,6 +16,17 @@ struct alignas(16) CastPC {
     int _pad0;
     int _pad1;
 };
+
+// Device-address variant (buffer/cast.comp built with -DBDA). The single
+// module handles both conversion directions, so there is no _fp16 key.
+struct alignas(16) CastBdaPC {
+    CastPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(CastBdaPC, out_addr) == 16, "CastBdaPC drift");
+static_assert(offsetof(CastBdaPC, in_addr) == 24, "CastBdaPC drift");
+static_assert(sizeof(CastBdaPC) <= 128, "CastBdaPC PC overflow");
 } // namespace cast
 
 // SSBO-only op: ONNX Cast (fp32 <-> fp16). The model has 227 Cast nodes
@@ -66,6 +77,10 @@ class Cast : public BufferFactory {
     bool has_host_side_effects() const override { return true; }
 
   private:
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(cast::CastBdaPC); }
+    bool bda_variant_ignores_fp16() const override { return true; }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -188,17 +203,19 @@ class Cast : public BufferFactory {
             return;
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(shape)) {
                 output->resize(shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         cast::CastPC pc{};
@@ -226,7 +243,21 @@ class Cast : public BufferFactory {
             pc.mode = (idt == typeid(uint16_t)) ? 1 : 0;
         }
         pc.total = total;
-        submit(&pc, UP_DIV((total + 1) / 2, 256), 1, 1);
+        const int groups = UP_DIV((total + 1) / 2, 256);
+        if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                cast::CastBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 
     int to_ = 0;

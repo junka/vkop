@@ -24,6 +24,23 @@
 // and keeps the PC at 80B (well under the 128B limit). A separate pipeline with
 // its own pc_size_ (Where's base pipeline has pc_size 0).
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIVec2Buf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaIVec2Buf b0;
+    BdaIVec2Buf b1;
+    BdaIVec2Buf b2;
+    BdaIVec2Buf b3;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uCond (uBdaTable.b1)
+#define uInputX (uBdaTable.b2)
+#define uInputY (uBdaTable.b3)
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     ivec2 data[];
 } uOutput;
@@ -36,6 +53,7 @@ layout(set = 0, binding = 2) readonly buffer InputX {
 layout(set = 0, binding = 3) readonly buffer InputY {
     ivec2 data[];
 } uInputY;
+#endif
 
 layout(push_constant) uniform PC_WhereInt64 {
     int rank;       // common rank for nd<->linear (== out rank, ≤ 4)

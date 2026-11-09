@@ -62,7 +62,7 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::EXPAND:
             return {nullptr, "expand", false, true};
         case T::FLOOR:
-            return {"floor", "floor", false, false};
+            return {"floor", "floor", false, true};
         case T::FUSED_ELEMWISE:
             return {nullptr, "fused_elemwise", false, true};
         case T::GATHER:
@@ -106,7 +106,7 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
         case T::REDUCEMEAN:
             return {"reduce", "reduce", false, true};
         case T::RELU:
-            return {"relu", "relu", false, false};
+            return {"relu", "relu", false, true};
         case T::RESHAPE:
             return {"reshape", "reshape", false, true};
         case T::RESIZE:

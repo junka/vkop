@@ -19,7 +19,7 @@ struct GpuSoftMaxParam {
 
 } // namespace softmax
 
-// Image (image2DArray NCHW->RGBA) implementation. The old softmax2_spv
+// Image (image2DArray NCHW->RGBA) implementation. The old softmax2 shader
 // (2-D SSBO auto-path) was folded into the buffer backend's BufferSoftmax
 // façade; the image path is image-only now.
 class SoftmaxImage : public Operator {
@@ -132,6 +132,10 @@ class SoftmaxBuffer : public BufferFactory {
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(SoftmaxPC), fp16) {}
 
+    // BDA variant: same two-pass kernel with addresses instead of bindings.
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(SoftmaxBdaPC); }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
@@ -165,17 +169,19 @@ class SoftmaxBuffer : public BufferFactory {
         // inner = wg % inner_size.
         int outer_size = total / axis_size;
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(shape)) {
                 output->resize(shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         // fp16 needs a scratch fp32 buffer (binding 2) for the decoupled
@@ -207,6 +213,55 @@ class SoftmaxBuffer : public BufferFactory {
         pc.axis_size = axis_size;
         pc.outer_size = outer_size;
         pc.inner_size = inner_size;
+
+        bool bda_ok = bda_ready() && out_buf && in_buf &&
+                      out_buf->hasDeviceAddress() && in_buf->hasDeviceAddress();
+        if (bda_ok && fp16_ != 0) {
+            bda_ok = scratch_ && scratch_->hasDeviceAddress();
+        }
+        if (bda_ok) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            const VkDeviceAddress scratch_addr =
+                (fp16_ != 0) ? scratch_->getDeviceAddress() : 0;
+            bda_ok = (out_addr % 4) == 0 && (in_addr % 4) == 0 &&
+                     (fp16_ == 0 || (scratch_addr % 4) == 0);
+        }
+        if (bda_ok) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            const VkDeviceAddress scratch_addr =
+                (fp16_ != 0) ? scratch_->getDeviceAddress() : 0;
+            if (fp16_ != 0) {
+                // Reduce writes fp32 to scratch; pack reads scratch and
+                // writes packed half2 to output. Same pipeline, two PCs.
+                SoftmaxBdaPC rpc{};
+                rpc.base = pc;
+                rpc.out_addr = out_addr; // unused by the fp16 reduce
+                rpc.in_addr = in_addr;
+                rpc.scratch_addr = scratch_addr;
+                submit_bda(&rpc, sizeof(rpc), outer_size, 1, 1);
+
+                scratch_->shaderWriteBarrier(m_cmd_->get());
+                SoftmaxBdaPC ppc{};
+                ppc.base.axis = 0;
+                ppc.base.axis_size = 0; // pack-only marker
+                ppc.base.outer_size = total;
+                ppc.base.inner_size = 0;
+                ppc.out_addr = out_addr;
+                ppc.in_addr = in_addr; // unused by the pack pass
+                ppc.scratch_addr = scratch_addr;
+                submit_bda(&ppc, sizeof(ppc), UP_DIV(total, 512), 1, 1);
+            } else {
+                SoftmaxBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                bpc.scratch_addr = 0;
+                submit_bda(&bpc, sizeof(bpc), outer_size, 1, 1);
+            }
+            return;
+        }
 
         if (fp16_ != 0) {
             // fp16 2-pass: use separate descriptor sets to avoid Intel ANV's

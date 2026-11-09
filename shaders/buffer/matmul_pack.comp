@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // MatMul SSBO pack pass (fp16 only). Reads fp32 results from scratch,
 // packs as half2, writes to output. One thread per output WORD.
 // Separate shader to avoid Intel ANV push-constant interference between
@@ -7,19 +12,36 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
 layout(set = 0, binding = 3) readonly buffer Scratch {
     uint data[];
 } uScratch;
+#endif
 
 layout(push_constant) uniform PC {
     int total; // total output element count
     int _pad0;
     int _pad1;
     int _pad2;
+#ifdef BDA
+    DataBuf uOutput;
+    DataBuf uScratch;
+#endif
 } uPC;
+
+#ifdef BDA
+#define uOutput uPC.uOutput
+#define uScratch uPC.uScratch
+#endif
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);

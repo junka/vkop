@@ -9,12 +9,34 @@
 #define DTYPE float
 #endif
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+// The data buffer is float16_t under -DFP16 and float otherwise; 4 covers the
+// stricter fp32 case and is still satisfied by the 16-byte-aligned addresses
+// the host hands out.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaDataBuf {
+    DTYPE data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIndexBuf {
+    ivec2 data[];
+};
+layout(set=0, binding=0) readonly buffer BdaTable {
+    BdaDataBuf b0;
+    BdaDataBuf b1;
+    BdaIndexBuf b2;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInput (uBdaTable.b1)
+#define uIndex (uBdaTable.b2)
+#else
 layout(set=0, binding=0) writeonly buffer outputBuffer { DTYPE data[]; } uOutput;
 layout(set=0, binding=1) readonly buffer inputBuffer { DTYPE data[]; } uInput;
 // int64 indices: each element is 8 bytes; bound as ivec2[] and only the low
 // 32 bits (.x) are read — correct for the model's small non-negative index
 // values (reading as int[] would stride by 4 bytes and misread every element).
 layout(set=0, binding=2) readonly buffer indexBuffer { ivec2 data[]; } uIndex;
+#endif
 
 // 8-int struct for shapes/coords (matches buffer_common.comp's IArr8 layout).
 // Defined locally (not via #include) so this shader keeps its own DTYPE

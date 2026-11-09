@@ -63,7 +63,7 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "Erf": ("erf", "erf", False, True),
     "Equal": (None, "equal", False, False),
     "Expand": (None, "expand", False, True),
-    "Floor": ("floor", "floor", False, False),
+    "Floor": ("floor", "floor", False, True),
     "FusedElemwise": (None, "fused_elemwise", False, True),
     "Gather": (None, "gather", False, True),
     "Gemm": (None, "gemm", False, False),
@@ -89,7 +89,7 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "Range": (None, "range", False, False),
     "Reduce": ("reduce", "reduce", False, True),
     "ReduceMean": ("reduce", "reduce", False, True),
-    "Relu": ("relu", "relu", False, False),
+    "Relu": ("relu", "relu", False, True),
     "Reshape": ("reshape", "reshape", False, True),
     "Resize": ("resize", "resize", False, True),
     "RMSNorm": (None, "rmsnorm", False, True),
@@ -133,6 +133,9 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # must carry both.
         "buffer_matmul_coop16_2x1",
         "buffer_matmul_coop16_2x2",
+        # BDA table builds of the two ACC geometries.
+        "buffer_matmul_coop16_2x1_bda",
+        "buffer_matmul_coop16_2x2_bda",
         # The other fp16 tiles the same source can declare (-DCM/-DCN/-DCK).
         # The runtime probes the device's cooperative-matrix table and only a
         # listed shape is ever dispatched, but which shapes are listed is
@@ -166,6 +169,8 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # device advertises subgroup arithmetic, so both must ship.
         "buffer_matmul_sg",
         "buffer_matmul_fp16_sg",
+        "buffer_matmul_sg_bda",
+        "buffer_matmul_fp16_sg_bda",
         # The SwiGLU down-projection fold (-DDOWN_ACT, a third build of the
         # same file): one module holding both the tiled and the split-K GEMV
         # entry points, and the only MatMul build that reads Wg/Wu (bindings
@@ -177,6 +182,37 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # multi-row deposit walk that the M==1 module drops. MatMul routes
         # M==1 to _fp16 and M>1 to this key, so both must ship.
         "buffer_matmul_down_act_multi_fp16",
+        # BDA table builds of the same two fold modules.
+        "buffer_matmul_down_act_bda_fp16",
+        "buffer_matmul_down_act_multi_bda_fp16",
+        # Device-address table builds (one table descriptor + data pointers in
+        # the table). The host only uses these for the base submit() routes.
+        "buffer_matmul_bda",
+        "buffer_matmul_bda_fp16",
+        # Table builds of the secondary same-source variants: WIDE GEMV,
+        # 512-lane split-K, and the tiled split/fold pair.
+        "buffer_matmul_w8_wide_bda_fp16",
+        "buffer_matmul_ksplit512_bda_fp16",
+        "buffer_matmul_ksplit512_w8_wide_bda_fp16",
+        "buffer_matmul_tiled_ks_split_bda_fp16",
+        "buffer_matmul_tiled_ks_fold_bda_fp16",
+        # Pack pass (direct addresses in the push constant).
+        "buffer_matmul_pack_bda",
+        # Coop pipelines: primary + alternative tile geometries.
+        "buffer_matmul_coop_bda",
+        "buffer_matmul_coop16_bda",
+        # Alternative coop tile geometries.
+        "buffer_matmul_coop16_16x8x16_bda",
+        "buffer_matmul_coop_fp16_8x8x16_bm8bn64_bda",
+        "buffer_matmul_coop_fp16_8x8x16_bm32bn16_bda",
+        "buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda",
+        # SINT8/UINT8 coop modules.
+        "buffer_matmul_coop_i8_bda",
+        "buffer_matmul_coop_i8_16x16x32_bda",
+        "buffer_matmul_coop_i8_16x8x32_bda",
+        "buffer_matmul_coop_u8_bda",
+        "buffer_matmul_coop_u8_16x16x32_bda",
+        "buffer_matmul_coop_u8_16x8x32_bda",
         # The tile-split-K pair for the tiled fp16 kernel (-DTILED_KS_SPLIT
         # deposit pass, -DTILED_KS_FOLD fold pass; one source, two modules,
         # because a pipeline binds a single entry point and the split half is
@@ -195,8 +231,6 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # matching *splitk_{deposit,fold} key.
         "buffer_matmul_coop_splitk_deposit",
         "buffer_matmul_coop_splitk_fold",
-        "buffer_matmul_coop16_splitk_deposit",
-        "buffer_matmul_coop16_splitk_fold",
         # coopmat + split-K in-workgroup: SPLITK_INWG runs cs serial K-slice
         # passes inside one workgroup, cross-pass fp32 accumulate in shared
         # memory, single dispatch, no global scratch. coop_split (uPC.ksplit)
@@ -218,6 +252,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_matmul_coop16_sklast_fp32_cs2",
         "buffer_matmul_coop16_sklast_fp32_cs4",
         "buffer_matmul_coop16_sklast_fp32_cs8",
+        # BDA table builds of the four cs variants (Ada-only route).
+        "buffer_matmul_coop16_sklast_fp32_bda",
+        "buffer_matmul_coop16_sklast_fp32_cs2_bda",
+        "buffer_matmul_coop16_sklast_fp32_cs4_bda",
+        "buffer_matmul_coop16_sklast_fp32_cs8_bda",
     ],
     ("MatMul", "image"): [
         "image_matmul_nv",
@@ -226,20 +265,52 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # Conv2d's fp16 pack pass reuses buffer_matmul_pack (same shader), but
     # ship it explicitly so removing that shader from MatMul would trip a
     # loud test failure here rather than a silent miss at load time.
-    ("Conv2d", "buffer"): ["buffer_matmul_pack"],
-    ("Conv", "buffer"): ["buffer_matmul_pack"],
+    ("Conv2d", "buffer"): [
+        "buffer_matmul_pack",
+        "buffer_conv2d_bda",
+        "buffer_conv2d_bda_fp16",
+    ],
+    ("Conv", "buffer"): [
+        "buffer_matmul_pack",
+        "buffer_conv2d_bda",
+        "buffer_conv2d_bda_fp16",
+    ],
     # int64 shape-meta chains built by Expand/Concat/Gather/Equal/Where on
     # an int64 input; their set_runtime_device() creates a second pipeline
     # keyed by *_int64. Only present on the buffer backend -- the image
     # backend has no int64 path.
-    ("Expand", "buffer"): ["buffer_expand_int64"],
-    ("Concat", "buffer"): ["buffer_concat_int64"],
-    ("Gather", "buffer"): ["buffer_gather_int64"],
+    # NOTE: the int64 key and the BDA builds share this row -- a second
+    # ("Expand", "buffer") dict-literal key would silently overwrite it.
+    ("Expand", "buffer"): [
+        "buffer_expand_int64",
+        "buffer_expand_int64_bda",
+        "buffer_expand_bda",
+        "buffer_expand_bda_fp16",
+    ],
+    ("Concat", "buffer"): [
+        "buffer_concat_int64",
+        "buffer_concat_int64_bda",
+        "buffer_concat_bda",
+        "buffer_concat_bda_fp16",
+    ],
+    ("Gather", "buffer"): [
+        "buffer_gather_int64",
+        "buffer_gather_int64_bda",
+        "buffer_gather_bda",
+        "buffer_gather_bda_fp16",
+    ],
     ("Equal", "buffer"): [
         "buffer_equal_int64",
+        "buffer_equal_int64_bda",
         "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_equal_bda",
     ],
-    ("Where", "buffer"): ["buffer_where_int64"],
+    ("Where", "buffer"): [
+        "buffer_where_int64",
+        "buffer_where_int64_bda",
+        "buffer_where_bda",
+    ],
     # The GPU-shape indirect dispatch pre-pass (VKOP_GPU_SHAPE):
     # dispatch_from_shape.comp turns the out shape SSBO into a
     # VkDispatchIndirectCommand so BufferBinaryFactory's broadcast==2 path can
@@ -249,14 +320,54 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # class routes through execute_gpu_shape.
     # NOTE: Equal's entry is merged with its int64 entry above — a second
     # ("Equal", "buffer") dict-literal key would silently overwrite it.
-    ("Add", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Sub", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Mul", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Div", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Pow", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Min", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Max", "buffer"): ["buffer_dispatch_from_shape"],
-    ("Mod", "buffer"): ["buffer_dispatch_from_shape"],
+    ("Add", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_add_bda",
+        "buffer_add_bda_fp16",
+    ],
+    ("Sub", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_sub_bda",
+        "buffer_sub_bda_fp16",
+    ],
+    ("Mul", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_mul_bda",
+        "buffer_mul_bda_fp16",
+    ],
+    ("Div", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_div_bda",
+        "buffer_div_bda_fp16",
+    ],
+    ("Pow", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_pow_bda",
+        "buffer_pow_bda_fp16",
+    ],
+    ("Min", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_min_bda",
+        "buffer_min_bda_fp16",
+    ],
+    ("Max", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_max_bda",
+        "buffer_max_bda_fp16",
+    ],
+    ("Mod", "buffer"): [
+        "buffer_dispatch_from_shape",
+        "buffer_dispatch_from_shape_bda",
+        "buffer_mod_bda",
+        "buffer_mod_bda_fp16",
+    ],
     # The subgroup-arithmetic builds of the hot workgroup reductions
     # (-DSUBGROUP: attention's per-tile max/sum, the norm passes, softmax).
     # Which module runs is a device-feature query at load time
@@ -267,19 +378,120 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("Attention", "buffer"): [
         "buffer_attention_sg",
         "buffer_attention_fp16_sg",
+        "buffer_attention_bda",
+        "buffer_attention_bda_fp16",
+        "buffer_attention_sg_bda",
+        "buffer_attention_fp16_sg_bda",
     ],
-    ("LayerNorm", "buffer"): ["buffer_layernorm_sg", "buffer_layernorm_fp16_sg"],
+    ("FusedElemwise", "buffer"): [
+        "buffer_fused_elemwise_bda",
+        "buffer_fused_elemwise_bda_fp16",
+    ],
+    ("Gemm", "buffer"): ["buffer_gemm_bda"],
+    ("MaxPool", "buffer"): [
+        "buffer_maxpool2d_bda",
+        "buffer_maxpool2d_bda_fp16",
+    ],
+    ("MaxPool2d", "buffer"): [
+        "buffer_maxpool2d_bda",
+        "buffer_maxpool2d_bda_fp16",
+    ],
+    ("Maxpool2d", "buffer"): [
+        "buffer_maxpool2d_bda",
+        "buffer_maxpool2d_bda_fp16",
+    ],
+    ("Reshape", "buffer"): ["buffer_reshape_bda", "buffer_reshape_bda_fp16"],
+    ("ScatterElements", "buffer"): [
+        "buffer_scatter_elements_bda",
+        "buffer_scatter_elements_bda_fp16",
+    ],
+    ("ScatterND", "buffer"): ["buffer_scatternd_bda"],
+    ("Slice", "buffer"): ["buffer_slice_bda", "buffer_slice_bda_fp16"],
+    ("Split", "buffer"): ["buffer_split_bda", "buffer_split_bda_fp16"],
+    ("TopK", "buffer"): ["buffer_topk_bda"],
+    ("Topk", "buffer"): ["buffer_topk_bda"],
+    ("LayerNorm", "buffer"): [
+        "buffer_layernorm_sg",
+        "buffer_layernorm_fp16_sg",
+        "buffer_layernorm_bda",
+        "buffer_layernorm_bda_fp16",
+        "buffer_layernorm_sg_bda",
+        "buffer_layernorm_fp16_sg_bda",
+    ],
     ("LayerNormalization", "buffer"): [
         "buffer_layernorm_sg",
         "buffer_layernorm_fp16_sg",
+        "buffer_layernorm_bda",
+        "buffer_layernorm_bda_fp16",
+        "buffer_layernorm_sg_bda",
+        "buffer_layernorm_fp16_sg_bda",
     ],
-    ("RMSNorm", "buffer"): ["buffer_rmsnorm_sg", "buffer_rmsnorm_fp16_sg"],
-    ("Softmax", "buffer"): ["buffer_softmax_sg", "buffer_softmax_fp16_sg"],
+    ("RMSNorm", "buffer"): [
+        "buffer_rmsnorm_sg",
+        "buffer_rmsnorm_fp16_sg",
+        "buffer_rmsnorm_bda",
+        "buffer_rmsnorm_bda_fp16",
+        "buffer_rmsnorm_sg_bda",
+        "buffer_rmsnorm_fp16_sg_bda",
+    ],
+    ("Reduce", "buffer"): ["buffer_reduce_bda", "buffer_reduce_bda_fp16"],
+    ("ReduceMean", "buffer"): [
+        "buffer_reduce_bda",
+        "buffer_reduce_bda_fp16",
+    ],
+    ("Transpose", "buffer"): [
+        "buffer_transpose_bda",
+        "buffer_transpose_bda_fp16",
+    ],
+    ("GlobalAveragePool", "buffer"): [
+        "buffer_globalaveragepool_bda",
+        "buffer_globalaveragepool_bda_fp16",
+    ],
+    ("RotaryEmbedding", "buffer"): [
+        "buffer_rotary_bda",
+        "buffer_rotary_bda_fp16",
+    ],
+    ("EmbeddingForward", "buffer"): ["buffer_embedding_forward_bda"],
+    ("PRelu", "buffer"): ["buffer_prelu_bda", "buffer_prelu_bda_fp16"],
+    ("Resize", "buffer"): ["buffer_resize_bda", "buffer_resize_bda_fp16"],
+    ("Softmax", "buffer"): [
+        "buffer_softmax_sg",
+        "buffer_softmax_fp16_sg",
+        "buffer_softmax_bda",
+        "buffer_softmax_bda_fp16",
+        "buffer_softmax_sg_bda",
+        "buffer_softmax_fp16_sg_bda",
+    ],
     # The image backend's LayerNorm has no fp16 build, so there is a single
     # subgroup module to carry (its three shapes -- W / HW / CHW -- all fold
     # through the vec4 reduce).
     ("LayerNorm", "image"): ["image_layernorm_sg"],
     ("LayerNormalization", "image"): ["image_layernorm_sg"],
+    # Buffer-device-address variants. The runtime builds this pipeline only
+    # when the device advertises BDA and the key is present, and always keeps
+    # the descriptor pipeline as the per-dispatch fallback; shipping both
+    # therefore cannot break a non-BDA target. The unary ops below all share
+    # shaders/common/unary_elementwise_body.comp; add each new one here so a converted
+    # model actually embeds it instead of silently falling back.
+    ("Neg", "buffer"): ["buffer_neg_bda", "buffer_neg_bda_fp16"],
+    ("Sigmoid", "buffer"): ["buffer_sigmoid_bda", "buffer_sigmoid_bda_fp16"],
+    ("Tanh", "buffer"): ["buffer_tanh_bda", "buffer_tanh_bda_fp16"],
+    ("Erf", "buffer"): ["buffer_erf_bda", "buffer_erf_bda_fp16"],
+    ("Sqrt", "buffer"): ["buffer_sqrt_bda", "buffer_sqrt_bda_fp16"],
+    ("Atan", "buffer"): ["buffer_atan_bda", "buffer_atan_bda_fp16"],
+    ("Cos", "buffer"): ["buffer_cos_bda", "buffer_cos_bda_fp16"],
+    ("Sin", "buffer"): ["buffer_sin_bda", "buffer_sin_bda_fp16"],
+    ("Softplus", "buffer"): [
+        "buffer_softplus_bda",
+        "buffer_softplus_bda_fp16",
+    ],
+    ("Relu", "buffer"): ["buffer_relu_bda", "buffer_relu_bda_fp16"],
+    ("Floor", "buffer"): ["buffer_floor_bda", "buffer_floor_bda_fp16"],
+    # Cast's single module handles both directions, so only the fp32 key.
+    ("Cast", "buffer"): ["buffer_cast_bda"],
+    # QuantizeLinear/DequantizeLinear share one format-polymorphic module.
+    ("QuantizeLinear", "buffer"): ["buffer_quantize_linear_bda"],
+    ("DequantizeLinear", "buffer"): ["buffer_quantize_linear_bda"],
 }
 
 

@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // Embedding forward lookup (SSBO, fp32). Port of cuEmbed's forward path.
 // One thread per output element: dispatch (ceil(batch,16), ceil(ew,16), 1).
 //
@@ -15,6 +20,16 @@
 
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer IntBuf {
+    int data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) buffer Out {
     uint data[];
 } uOutput;
@@ -30,6 +45,7 @@ layout(set = 0, binding = 3) readonly buffer Off {
 layout(set = 0, binding = 4) readonly buffer Wt {
     uint data[];
 } uWeights;
+#endif
 
 layout(push_constant) uniform PC {
     int embed_width;
@@ -40,7 +56,23 @@ layout(push_constant) uniform PC {
     int is_weighted;   // 1=weighted, 0=unweighted
     int _pad0;
     int _pad1;
+#ifdef BDA
+    // Matches ops::EmbeddingBdaPC: 32-byte scalar prefix + five pointers.
+    DataBuf uOutput;
+    DataBuf uEmbed;
+    IntBuf uIndices;
+    IntBuf uOffsets;
+    DataBuf uWeights;
+#endif
 } uPC;
+
+#ifdef BDA
+#define uOutput uPC.uOutput
+#define uEmbed uPC.uEmbed
+#define uIndices uPC.uIndices
+#define uOffsets uPC.uOffsets
+#define uWeights uPC.uWeights
+#endif
 
 void main() {
     int b = int(gl_GlobalInvocationID.x);  // batch sample

@@ -6,6 +6,7 @@
 #include "ops/Operator.hpp"
 
 #include <algorithm>
+#include <cstddef>
 #include <numeric>
 
 // Shared base + helpers + push-constant structs for the buffer (SSBO)
@@ -35,6 +36,27 @@ struct alignas(16) UnaryElemPC {
 };
 static_assert(sizeof(UnaryElemPC) <= 128, "UnaryElemPC PC overflow");
 
+// Device-address variant of UnaryElemPC. The shader is buffer/<op>.comp built
+// with -DBDA (shared body: shaders/common/unary_elementwise_body.comp); the
+// same source carries the descriptor path too.
+struct alignas(16) UnaryBdaPC {
+    // Explicit fields, not `UnaryElemPC base`: its alignas(16) sizeof is 80
+    // while the last scalar field ends at 76, which happens to match the
+    // next 8-aligned offset today. Spelling the fields out keeps the layout
+    // independent of that coincidence.
+    int rank;
+    int outDims[8];
+    int in0Dims[8];
+    int total;
+    int _pad;
+    VkDeviceAddress in_addr;
+    VkDeviceAddress out_addr;
+};
+static_assert(offsetof(UnaryBdaPC, in_addr) == 80, "UnaryBdaPC layout drift");
+static_assert(offsetof(UnaryBdaPC, out_addr) == 88, "UnaryBdaPC layout drift");
+static_assert(sizeof(UnaryBdaPC) == 96, "UnaryBdaPC layout drift");
+static_assert(sizeof(UnaryBdaPC) <= 128, "UnaryBdaPC PC overflow");
+
 // Elementwise binary push constant (mirrors shaders/buffer/<op>.comp) with
 // ONNX right-aligned broadcasting + optional post-fuse activation. No op
 // code (per-op shader inlines the math).
@@ -49,6 +71,36 @@ struct alignas(16) BinaryElemPC {
     int _pad;
 };
 static_assert(sizeof(BinaryElemPC) <= 128, "BinaryElemPC PC overflow");
+
+// Device-address args for binary ops (buffer/<op>.comp built with -DBDA).
+// BinaryElemPC is already 128 B, so the BDA push constant instead carries only
+// the scalar fields + the address of this args buffer. Must match
+// shaders/common/binary_bda_body.comp's ArgsBuf.
+struct alignas(8) BinaryBdaArgs {
+    int outDims[8];
+    int in0Dims[8];
+    int in1Dims[8];
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in0_addr;
+    VkDeviceAddress in1_addr;
+};
+static_assert(offsetof(BinaryBdaArgs, in0Dims) == 32, "BinaryBdaArgs drift");
+static_assert(offsetof(BinaryBdaArgs, in1Dims) == 64, "BinaryBdaArgs drift");
+static_assert(offsetof(BinaryBdaArgs, out_addr) == 96, "BinaryBdaArgs drift");
+static_assert(offsetof(BinaryBdaArgs, in0_addr) == 104, "BinaryBdaArgs drift");
+static_assert(offsetof(BinaryBdaArgs, in1_addr) == 112, "BinaryBdaArgs drift");
+static_assert(sizeof(BinaryBdaArgs) == 120, "BinaryBdaArgs drift");
+
+struct alignas(8) BinaryBdaPC {
+    int rank;
+    int activation;
+    int broadcast;
+    int total;
+    VkDeviceAddress args_addr;
+};
+static_assert(offsetof(BinaryBdaPC, args_addr) == 16, "BinaryBdaPC drift");
+static_assert(sizeof(BinaryBdaPC) == 24, "BinaryBdaPC drift");
+static_assert(sizeof(BinaryBdaPC) <= 128, "BinaryBdaPC PC overflow");
 
 struct alignas(16) ReshapePC {
     int rank_in;
@@ -104,6 +156,21 @@ struct alignas(16) SoftmaxPC {
     int inner_size;
 };
 
+// Device-address variant (buffer/softmax.comp built with -DBDA). out/in/scratch
+// addresses; the fp16 two-pass path reuses the same pipeline with a different
+// PC (reduce writes scratch, pack reads scratch). The GLSL block is 40 bytes;
+// the struct is 48 because alignas(16) pads the tail.
+struct alignas(16) SoftmaxBdaPC {
+    SoftmaxPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+    VkDeviceAddress scratch_addr;
+};
+static_assert(offsetof(SoftmaxBdaPC, out_addr) == 16, "SoftmaxBdaPC drift");
+static_assert(offsetof(SoftmaxBdaPC, in_addr) == 24, "SoftmaxBdaPC drift");
+static_assert(offsetof(SoftmaxBdaPC, scratch_addr) == 32, "SoftmaxBdaPC drift");
+static_assert(sizeof(SoftmaxBdaPC) <= 128, "SoftmaxBdaPC PC overflow");
+
 struct alignas(16) LayerNormPC {
     float eps;
     int inner_size;
@@ -115,6 +182,27 @@ struct alignas(16) LayerNormPC {
     int has_skip;
 };
 
+// Device-address variant (buffer/layernorm.comp built with -DBDA). out/x/w/b
+// addresses, then the skip slot (aliases x when has_skip == 0). The GLSL block
+// is 56 bytes; the struct is 64 because alignas(16) pads the tail.
+struct alignas(16) LayerNormBdaPC {
+    LayerNormPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+    VkDeviceAddress weight_addr;
+    VkDeviceAddress bias_addr;
+    VkDeviceAddress skip_addr;
+};
+static_assert(offsetof(LayerNormBdaPC, out_addr) == 16, "LayerNormBdaPC drift");
+static_assert(offsetof(LayerNormBdaPC, in_addr) == 24, "LayerNormBdaPC drift");
+static_assert(offsetof(LayerNormBdaPC, weight_addr) == 32,
+              "LayerNormBdaPC drift");
+static_assert(offsetof(LayerNormBdaPC, bias_addr) == 40,
+              "LayerNormBdaPC drift");
+static_assert(offsetof(LayerNormBdaPC, skip_addr) == 48,
+              "LayerNormBdaPC drift");
+static_assert(sizeof(LayerNormBdaPC) <= 128, "LayerNormBdaPC PC overflow");
+
 struct alignas(16) ReducePC {
     int rank;
     int inDims[8];
@@ -125,6 +213,37 @@ struct alignas(16) ReducePC {
     int _pad0;
     int _pad1;
 };
+
+// Device-address variants: two direct pointers fit in the remaining push
+// constant space. The base struct's alignas(16) tail padding must NOT be
+// copied here: std430 places the 8-byte pointers immediately after the last
+// field (offset 88/104), not after the padded sizeof (96/112).
+struct alignas(8) ReduceBdaPC {
+    int rank;
+    int inDims[8];
+    int outDims[8];
+    int axes_mask;
+    int reduce_op;
+    int keepdims;
+    int _pad0;
+    int _pad1;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(ReduceBdaPC, out_addr) == 88, "ReduceBdaPC drift");
+static_assert(sizeof(ReduceBdaPC) == 104, "ReduceBdaPC drift");
+
+struct alignas(8) TransposeBdaPC {
+    int rank;
+    int inDims[8];
+    int outDims[8];
+    int perm[8];
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(TransposeBdaPC, out_addr) == 104,
+              "TransposeBdaPC drift");
+static_assert(sizeof(TransposeBdaPC) == 120, "TransposeBdaPC drift");
 
 // Activation codes shared with shaders/common/activation.comp
 enum class BufferActivation {

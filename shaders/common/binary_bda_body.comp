@@ -1,0 +1,128 @@
+#ifndef BINARY_BDA_BODY_COMP
+#define BINARY_BDA_BODY_COMP
+
+// Shared body for the elementwise binary shaders built with -DBDA.
+//
+// The descriptor PC is already 128 bytes, so the BDA build cannot append three
+// 64-bit addresses. Instead the push constant carries only the scalar fields
+// and the address of a small args buffer holding the three broadcast shapes
+// and the three data pointers:
+//
+//   BinaryBdaPC   { rank, activation, broadcast, total, args_addr }  (24 B)
+//   BinaryBdaArgs { outDims[8], in0Dims[8], in1Dims[8],
+//                   out_addr, in0_addr, in1_addr }                   (120 B)
+//
+// The args buffer is device-local and written with vkCmdUpdateBuffer before
+// the dispatch. broadcast==2 (GPU shape-meta SSBOs) is NOT supported here;
+// the host gates it to the descriptor pipeline.
+//
+// The including shader must define `float bin_op(float a, float b)` and may
+// define BINARY_HAS_ACTIVATION to apply uPC.activation (add/sub/mul/div/pow;
+// min/max/mod ignore the activation code in their descriptor builds too, so
+// they leave it undefined).
+
+#include "activation.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer ArgsBuf {
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    DataBuf uOutput;
+    DataBuf uInputA;
+    DataBuf uInputB;
+};
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    int activation;
+    int broadcast;
+    int total;
+    ArgsBuf args;
+} uPC;
+
+#define uOutput (uPC.args.uOutput)
+#define uInputA (uPC.args.uInputA)
+#define uInputB (uPC.args.uInputB)
+
+float bda_activation(float v) {
+#ifdef BINARY_HAS_ACTIVATION
+    return activation(FLOAT(v), uPC.activation);
+#else
+    return v;
+#endif
+}
+
+float load_elem(int linear, IArr8 out_d, IArr8 in0_d) {
+    if (uPC.broadcast == 0) {
+#ifdef FP16
+        return unpackHalf2x16(uInputA.data[linear >> 1])[linear & 1];
+#else
+        return uintBitsToFloat(uInputA.data[linear]);
+#endif
+    }
+    int ia = broadcast_index(linear, out_d, in0_d, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(uInputA.data[ia >> 1])[ia & 1];
+#else
+    return uintBitsToFloat(uInputA.data[ia]);
+#endif
+}
+
+float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
+    int ib = (uPC.broadcast == 0)
+                 ? linear
+                 : broadcast_index(linear, out_d, in1_d, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(uInputB.data[ib >> 1])[ib & 1];
+#else
+    return uintBitsToFloat(uInputB.data[ib]);
+#endif
+}
+
+void store_elem(int linear, float v) {
+#ifdef FP16
+    uint w = uint(linear) >> 1;
+    vec2 p = unpackHalf2x16(uOutput.data[w]);
+    p[uint(linear) & 1u] = v;
+    uOutput.data[w] = packHalf2x16(p);
+#else
+    uOutput.data[linear] = floatBitsToUint(v);
+#endif
+}
+
+void main() {
+    // Resolve the broadcast dims once; the args buffer is L2-resident and the
+    // compiler keeps these in registers.
+    IArr8 out_d = uPC.args.outDims;
+    IArr8 in0_d = uPC.args.in0Dims;
+    IArr8 in1_d = uPC.args.in1Dims;
+
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = 2 * gid + 1;
+    float a0 = load_elem(i0, out_d, in0_d);
+    float b0 = load_elem_b(i0, out_d, in1_d);
+    store_elem(i0, bda_activation(bin_op(a0, b0)));
+    if (i1 < uPC.total) {
+        float a1 = load_elem(i1, out_d, in0_d);
+        float b1 = load_elem_b(i1, out_d, in1_d);
+        store_elem(i1, bda_activation(bin_op(a1, b1)));
+    }
+#else
+    if (gid >= uPC.total) return;
+    float a = load_elem(gid, out_d, in0_d);
+    float b = load_elem_b(gid, out_d, in1_d);
+    uOutput.data[gid] = floatBitsToUint(bda_activation(bin_op(a, b)));
+#endif
+}
+
+#endif // BINARY_BDA_BODY_COMP

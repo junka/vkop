@@ -23,6 +23,20 @@ struct alignas(16) EmbeddingPC {
     int _pad1;
 };
 
+// Device-address variant: 32 B scalar prefix + five pointers. The shader block
+// is 72 B; alignas(16) pads the host struct to 80, which is a legal extra push
+// range.
+struct alignas(16) EmbeddingBdaPC {
+    EmbeddingPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress embed_addr;
+    VkDeviceAddress indices_addr;
+    VkDeviceAddress offsets_addr;
+    VkDeviceAddress weights_addr;
+};
+static_assert(offsetof(EmbeddingBdaPC, out_addr) == 32, "EmbeddingBdaPC drift");
+static_assert(sizeof(EmbeddingBdaPC) == 80, "EmbeddingBdaPC drift");
+
 // combine_mode codes (shared with the shader).
 enum class EmbedCombineMode { kSum = 0, kMean = 1, kConcat = 2 };
 
@@ -34,6 +48,9 @@ class EmbeddingForwardBuffer : public BufferFactory {
                          DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                          DESCRIPTOR_TYPE_STORAGE},
                         sizeof(EmbeddingPC)) {}
+
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(EmbeddingBdaPC); }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -83,22 +100,28 @@ class EmbeddingForwardBuffer : public BufferFactory {
             out_elems = batch_size * ew;
         }
         std::vector<int> out_shape{out_elems}; // 1-D flat
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> embed_buf;
+        std::shared_ptr<VulkanBuffer> indices_buf;
+        std::shared_ptr<VulkanBuffer> offsets_buf;
+        std::shared_ptr<VulkanBuffer> weights_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
-        bind_ssbo<float>(inputs[0], /*is_output=*/false); // embedding
-        bind_ssbo<int>(inputs[1], /*is_output=*/false);   // indices
+        embed_buf = bind_ssbo<float>(inputs[0], /*is_output=*/false);
+        indices_buf = bind_ssbo<int>(inputs[1], /*is_output=*/false);
         // offsets: bind real buffer if CSR, else dummy
         bool has_offsets = (is_csr_ != 0 && inputs.size() > 2 && inputs[2]);
         if (has_offsets) {
-            bind_ssbo<int>(inputs[2], /*is_output=*/false);
+            offsets_buf = bind_ssbo<int>(inputs[2], /*is_output=*/false);
         } else {
             objs_.emplace_back(dummy_buffer_);
+            offsets_buf = dummy_buffer_;
         }
         // weights: bind real buffer if weighted, else dummy. When offsets
         // are absent the weights slot is inputs[2] (if present), since the
@@ -109,9 +132,11 @@ class EmbeddingForwardBuffer : public BufferFactory {
             (is_weighted_ != 0 && static_cast<int>(inputs.size()) > wt_slot &&
              inputs[wt_slot]);
         if (has_weights) {
-            bind_ssbo<float>(inputs[wt_slot], /*is_output=*/false);
+            weights_buf =
+                bind_ssbo<float>(inputs[wt_slot], /*is_output=*/false);
         } else {
             objs_.emplace_back(dummy_buffer_);
+            weights_buf = dummy_buffer_;
         }
 
         EmbeddingPC pc{};
@@ -121,7 +146,36 @@ class EmbeddingForwardBuffer : public BufferFactory {
         pc.combine_mode = combine_mode_;
         pc.is_csr = is_csr_;
         pc.is_weighted = is_weighted_;
-        submit(&pc, UP_DIV(batch_size, 16), UP_DIV(ew, 16), 1);
+        const int gx = UP_DIV(batch_size, 16);
+        const int gy = UP_DIV(ew, 16);
+        if (bda_ready() && out_buf && embed_buf && indices_buf && offsets_buf &&
+            weights_buf && out_buf->hasDeviceAddress() &&
+            embed_buf->hasDeviceAddress() && indices_buf->hasDeviceAddress() &&
+            offsets_buf->hasDeviceAddress() &&
+            weights_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress embed_addr = embed_buf->getDeviceAddress();
+            const VkDeviceAddress indices_addr =
+                indices_buf->getDeviceAddress();
+            const VkDeviceAddress offsets_addr =
+                offsets_buf->getDeviceAddress();
+            const VkDeviceAddress weights_addr =
+                weights_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (embed_addr % 4) == 0 &&
+                (indices_addr % 4) == 0 && (offsets_addr % 4) == 0 &&
+                (weights_addr % 4) == 0) {
+                EmbeddingBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.embed_addr = embed_addr;
+                bpc.indices_addr = indices_addr;
+                bpc.offsets_addr = offsets_addr;
+                bpc.weights_addr = weights_addr;
+                submit_bda(&bpc, sizeof(bpc), gx, gy, 1);
+                return;
+            }
+        }
+        submit(&pc, gx, gy, 1);
     }
 
     int embed_width_ = 0;

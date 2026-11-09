@@ -15,7 +15,7 @@
 // pass stays a pure repack.
 //
 // Bindings match MatMul (out=0, A=1, B=2, scratch=3) plus bias=4. The pack
-// pass reuses buffer_matmul_pack_spv which uses bindings 0 (out) and 3
+// pass reuses buffer_matmul_pack which uses bindings 0 (out) and 3
 // (scratch); the extra bias binding is inert there.
 
 #ifdef FP16
@@ -40,6 +40,27 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaUintBuf b1;
+    BdaUintBuf b2;
+    BdaUintBuf b3;
+    BdaUintBuf b4;
+    BdaUintBuf b5;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInputX (uBdaTable.b1)
+#define uInputW (uBdaTable.b2)
+#define uScratch (uBdaTable.b3)
+#define uBias (uBdaTable.b4)
+#define uScale (uBdaTable.b5)
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOutput;
@@ -62,6 +83,7 @@ layout(set = 0, binding = 4) readonly buffer Bias {
 layout(set = 0, binding = 5) readonly buffer Scale {
     uint data[];
 } uScale;
+#endif
 
 layout(push_constant) uniform PC {
     int N, IC, ID, IH, IW;

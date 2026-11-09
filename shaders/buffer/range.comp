@@ -8,6 +8,26 @@
 // 0x3F800000), so a float arange came out as 1.065e9 + i. Do not revive it for
 // fp params without fixing the bindings.
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaIntBuf {
+    int data[];
+};
+layout(set=0, binding=0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaIntBuf b1;
+    BdaIntBuf b2;
+    BdaIntBuf b3;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uStart (uBdaTable.b1)
+#define uLimit (uBdaTable.b2)
+#define uDelta (uBdaTable.b3)
+#else
 layout(set=0, binding=0) writeonly buffer outputBuffer {
     uint data[];
 } uOutput;
@@ -23,6 +43,7 @@ layout(set=0, binding=2) readonly buffer limitBuffer {
 layout(set=0, binding=3) readonly buffer deltaBuffer {
     int data[];
 } uDelta;
+#endif
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 

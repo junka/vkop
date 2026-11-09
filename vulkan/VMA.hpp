@@ -32,7 +32,12 @@ class VMA {
         VmaAllocator allocator;
     };
 
-    VMA(VkPhysicalDevice physicalDevice, VkDevice device);
+    // useBufferDeviceAddress must mirror the device's enabled
+    // bufferDeviceAddress feature. VMA attaches
+    // VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT to every allocation when this is
+    // true, which is invalid on a device that did not enable the feature.
+    VMA(VkPhysicalDevice physicalDevice, VkDevice device,
+        bool useBufferDeviceAddress = false);
     ~VMA();
 
     // Allocate a Vulkan buffer with memory

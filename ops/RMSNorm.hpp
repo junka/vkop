@@ -18,6 +18,21 @@ struct alignas(16) RMSNormPC {
 };
 static_assert(sizeof(RMSNormPC) <= 128, "RMSNormPC PC overflow");
 
+// Device-address variant (buffer/rmsnorm.comp built with -DBDA). Same scalar
+// prefix, then out/x/weight addresses. The GLSL block is 40 bytes; this
+// struct is 48 because alignas(16) pads the tail, which is legal as a push
+// constant range as long as the shader's block is fully covered.
+struct alignas(16) RMSNormBdaPC {
+    RMSNormPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+    VkDeviceAddress weight_addr;
+};
+static_assert(offsetof(RMSNormBdaPC, out_addr) == 16, "RMSNormBdaPC drift");
+static_assert(offsetof(RMSNormBdaPC, in_addr) == 24, "RMSNormBdaPC drift");
+static_assert(offsetof(RMSNormBdaPC, weight_addr) == 32, "RMSNormBdaPC drift");
+static_assert(sizeof(RMSNormBdaPC) <= 128, "RMSNormBdaPC PC overflow");
+
 // Buffer-backend (SSBO) RMSNorm. Replaces the 9-op ONNX decomposition
 //   Cast(fp16->fp32) -> Pow(2) -> ReduceMean -> Add(eps) -> Sqrt -> Div(1,.)
 //   -> Mul(x,.) -> Cast(->fp16) -> Mul(weight)
@@ -54,6 +69,9 @@ class RMSNormBuffer : public BufferFactory {
     }
 
   private:
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(RMSNormBdaPC); }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -97,23 +115,26 @@ class RMSNormBuffer : public BufferFactory {
 
         // Output has the same shape as x; resize if the runtime created it
         // with a placeholder (dynamic -1 -> 1 at load).
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
+        std::shared_ptr<VulkanBuffer> weight_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total) {
                 output->resize(shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         // x
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
         // weight (1-D over inner_size, same dtype as x)
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            bind_ssbo<T>(inputs[1], /*is_output=*/false);
+            weight_buf = bind_ssbo<T>(inputs[1], /*is_output=*/false);
         });
 
         RMSNormPC pc{};
@@ -122,6 +143,23 @@ class RMSNormBuffer : public BufferFactory {
         pc.outer_size = outer_size;
         pc._pad = 0;
         // One workgroup per outer slice (the reduce is intra-slice shared mem).
+        if (bda_ready() && out_buf && in_buf && weight_buf &&
+            out_buf->hasDeviceAddress() && in_buf->hasDeviceAddress() &&
+            weight_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            const VkDeviceAddress weight_addr = weight_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0 &&
+                (weight_addr % 4) == 0) {
+                RMSNormBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                bpc.weight_addr = weight_addr;
+                submit_bda(&bpc, sizeof(bpc), outer_size, 1, 1);
+                return;
+            }
+        }
         submit(&pc, outer_size, 1, 1);
     }
 

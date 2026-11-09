@@ -131,7 +131,7 @@ TEST(ScatterElementsTest, AddReduction) {
 }
 
 // fp16 variant of the AddReduction test. Exercises the word-level CAS shader
-// path (buffer_scatter_elements_fp16_spv). cols=3 is ODD, so update-slot
+// path (buffer_scatter_elements_fp16). cols=3 is ODD, so update-slot
 // (gid&1) and target-slot (target&1) DIVERGE for some threads — this is the
 // case that breaks a naive "same slot" assumption.
 static void run_scatter_fp16(

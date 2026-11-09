@@ -1,0 +1,50 @@
+#ifndef MATMUL_DOWN_ACT_BDA_TABLE_COMP
+#define MATMUL_DOWN_ACT_BDA_TABLE_COMP
+
+// Address table for the -DBDA SwiGLU down-projection fold. The shader reads
+// the same buffers through several element types (uint / uvec4 / uvec2), so
+// the table carries one address per (buffer, view). Must match
+// matmul::MatMulDownActBdaArgs (112 bytes: 7 base + 1 pad + 6 alias entries).
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DaUintBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 16) buffer DaVec4Buf {
+    uvec4 data4[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer DaVec2Buf {
+    uvec2 data2[];
+};
+
+layout(set = 0, binding = 0) readonly buffer DaTable {
+    DaUintBuf uOutput;
+    DaUintBuf uInputA;
+    DaUintBuf uInputB;
+    DaUintBuf uScratch;
+    DaUintBuf uScale;
+    DaUintBuf uInputB2;
+    DaUintBuf uInputAct;
+    uvec2 _pad0; // keeps the Vec4 entries 16-byte aligned (offset 64)
+    DaVec4Buf uWd4;
+    DaVec2Buf uWd8;
+    DaVec4Buf uWg4;
+    DaVec2Buf uWg8;
+    DaVec4Buf uWu4;
+    DaVec2Buf uWu8;
+} uTable;
+
+#define uOutput (uTable.uOutput)
+#define uInputA (uTable.uInputA)
+#define uInputB (uTable.uInputB)
+#define uScratch (uTable.uScratch)
+#define uScale (uTable.uScale)
+#define uInputB2 (uTable.uInputB2)
+#define uInputAct (uTable.uInputAct)
+#define uWd4 (uTable.uWd4)
+#define uWd8 (uTable.uWd8)
+#define uWg4 (uTable.uWg4)
+#define uWg8 (uTable.uWg8)
+#define uWu4 (uTable.uWu4)
+#define uWu8 (uTable.uWu8)
+
+#endif // MATMUL_DOWN_ACT_BDA_TABLE_COMP

@@ -1,4 +1,9 @@
 #version 450 core
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
 #extension GL_EXT_scalar_block_layout : enable
 
 // Expand (SSBO): broadcast the input tensor to the output shape using ONNX
@@ -18,6 +23,11 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #include "../common/buffer_common.comp"
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#else
 layout(set = 0, binding = 0) buffer outputBuffer {
     uint data[];
 } uOutput;
@@ -31,6 +41,7 @@ layout(set = 0, binding = 1) readonly buffer inputBuffer {
 layout(set = 0, binding = 2) readonly buffer shapeBuffer {
     uint data[];
 } uShape;
+#endif
 
 layout(push_constant) uniform paraBuffer {
     int rank;          // number of valid dims (1..8)
@@ -39,7 +50,18 @@ layout(push_constant) uniform paraBuffer {
     IArr8 outDims;     // output dims (left-aligned, padded with 1)
     int _pad0;
     int _pad1;
+#ifdef BDA
+    // Matches ops::expand::ExpandBdaPC: 80-byte scalar prefix + out/in. The
+    // shape binding is descriptor-path only.
+    DataBuf uOutput;
+    DataBuf uInput;
+#endif
 } uParam;
+
+#ifdef BDA
+#define uOutput uParam.uOutput
+#define uInput uParam.uInput
+#endif
 
 // Broadcast a linear output element index to a linear input index.
 int expand_elem(int gid) {

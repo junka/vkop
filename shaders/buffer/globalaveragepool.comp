@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // GlobalAveragePool (SSBO) — compact row-major NCHW input of rank >= 3.
 // The host folds every trailing spatial dim into one `spatial` count, so
 // input element (n, c, s) sits at linear (n*C + c)*spatial + s and the
@@ -15,19 +20,37 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #include "../common/buffer_common.comp"
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
 layout(set = 0, binding = 1) readonly buffer Input {
     uint data[];
 } uInput;
+#endif
 
 layout(push_constant) uniform PC_uGap {
     int batch;
     int channels;
     int spatial;
     int _pad;
+#ifdef BDA
+    // Matches ops::globalaveragepool::GapBdaPC: 16-byte prefix + out/in.
+    DataBuf uOutput;
+    DataBuf uInput;
+#endif
 } uGap;
+
+#ifdef BDA
+#define uOutput uGap.uOutput
+#define uInput uGap.uInput
+#endif
 
 float gap_one(int oc) {
     float acc = 0.0f;

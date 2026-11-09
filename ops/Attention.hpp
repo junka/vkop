@@ -90,6 +90,9 @@ class AttentionBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // Y, Q, K, V, mask, cache_in, cache_out.
+    size_t bda_address_table_slots() const override { return 7; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("scale") != attributes.end()) {

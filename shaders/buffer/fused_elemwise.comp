@@ -75,6 +75,38 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 #define OP_ERF     13  // unary, erf(a) — the GELU primitive (see FusedElemwise.hpp)
 #define OP_SILU    14  // unary, a * sigmoid(a) — silu/gelu-swish in ONE word
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaIntBuf {
+    int data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaUintBuf b1;
+    BdaUintBuf b2;
+    BdaUintBuf b3;
+    BdaUintBuf b4;
+    BdaUintBuf b5;
+    BdaUintBuf b6;
+    BdaUintBuf b7;
+    BdaUintBuf b8;
+    BdaIntBuf b9;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uIn0 (uBdaTable.b1)
+#define uIn1 (uBdaTable.b2)
+#define uIn2 (uBdaTable.b3)
+#define uIn3 (uBdaTable.b4)
+#define uIn4 (uBdaTable.b5)
+#define uIn5 (uBdaTable.b6)
+#define uIn6 (uBdaTable.b7)
+#define uIn7 (uBdaTable.b8)
+#define uProg (uBdaTable.b9)
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
@@ -94,6 +126,7 @@ layout(set = 0, binding = 8) readonly buffer In7 { uint data[]; } uIn7;
 layout(set = 0, binding = 9) readonly buffer Prog {
     int data[];
 } uProg;
+#endif
 
 layout(push_constant) uniform PC_uPC {
     int total;     // output element count

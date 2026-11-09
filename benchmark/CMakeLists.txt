@@ -13,3 +13,17 @@ target_link_libraries(vkbench vkop vload)
 add_executable(vkop_bench vkop_bench.cpp)
 target_link_libraries(vkop_bench PRIVATE vkop vload)
 set_target_properties(vkop_bench PROPERTIES OUTPUT_NAME vkop-bench)
+
+# Standalone MatMul microbenchmark — decode-shape fp16, buffer backend.
+# Carries a per-shape correctness check (fp32 CPU reference).
+add_executable(bench_matmul bench_matmul.cpp)
+target_link_libraries(bench_matmul PRIVATE vkop vload)
+target_compile_definitions(bench_matmul PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
+
+# Same microbenchmark against the int8 weight-only MatMul routes.
+add_executable(bench_matmul_i8 bench_matmul_i8.cpp)
+target_link_libraries(bench_matmul_i8 PRIVATE vkop vload)
+target_compile_definitions(bench_matmul_i8 PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
+

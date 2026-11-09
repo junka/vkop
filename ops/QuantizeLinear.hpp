@@ -43,6 +43,17 @@ struct alignas(16) QuantPC {
     int _pad;
 };
 
+// Device-address variant (buffer/quantize_linear.comp built with -DBDA). One
+// module covers quantize/dequantize and every format, so there is no fp16 key.
+struct alignas(16) QuantBdaPC {
+    QuantPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(QuantBdaPC, out_addr) == 32, "QuantBdaPC drift");
+static_assert(offsetof(QuantBdaPC, in_addr) == 40, "QuantBdaPC drift");
+static_assert(sizeof(QuantBdaPC) <= 128, "QuantBdaPC PC overflow");
+
 } // namespace quant
 
 // SSBO op: ONNX QuantizeLinear / DequantizeLinear.
@@ -95,6 +106,10 @@ class QuantizeLinear : public BufferFactory {
     bool has_host_side_effects() const override { return true; }
 
   private:
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(quant::QuantBdaPC); }
+    bool bda_variant_ignores_fp16() const override { return true; }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
@@ -232,19 +247,21 @@ class QuantizeLinear : public BufferFactory {
         // Resize + bind. The quantized side is always int8_t storage (fp8 and
         // uint8 ride it the same way int8 does); the float side is uint16_t
         // (fp16) or float (fp32).
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         if (dequant) {
             if (float_fp32) {
                 auto out = core::as_tensor<float>(outputs[0]);
                 if (out->num_elements() != total)
                     out->resize(shape);
-                bind_ssbo<float>(outputs[0], /*is_output=*/true);
+                out_buf = bind_ssbo<float>(outputs[0], /*is_output=*/true);
             } else {
                 auto out = core::as_tensor<uint16_t>(outputs[0]);
                 if (out->num_elements() != total)
                     out->resize(shape);
-                bind_ssbo<uint16_t>(outputs[0], /*is_output=*/true);
+                out_buf = bind_ssbo<uint16_t>(outputs[0], /*is_output=*/true);
             }
-            bind_ssbo<int8_t>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<int8_t>(inputs[0], /*is_output=*/false);
         } else {
             // Quantize. The packed 4-bit formats hold two values per container
             // byte, so num_elements() (container slots) is total/2 for them —
@@ -256,11 +273,11 @@ class QuantizeLinear : public BufferFactory {
                 core::elem_kind_packed(q_kind) ? (total + 1) / 2 : total;
             if (out->num_elements() != want)
                 out->resize(shape);
-            bind_ssbo<int8_t>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<int8_t>(outputs[0], /*is_output=*/true);
             if (float_fp32) {
-                bind_ssbo<float>(inputs[0], /*is_output=*/false);
+                in_buf = bind_ssbo<float>(inputs[0], /*is_output=*/false);
             } else {
-                bind_ssbo<uint16_t>(inputs[0], /*is_output=*/false);
+                in_buf = bind_ssbo<uint16_t>(inputs[0], /*is_output=*/false);
             }
         }
 
@@ -278,7 +295,21 @@ class QuantizeLinear : public BufferFactory {
         // (2 vals/word) or fp32 (1 val/word); the shader works out the
         // float-word mapping per fmt.
         const int group = (fmt >= 4) ? 8 : 4;
-        submit(&pc, UP_DIV((total + group - 1) / group, 256), 1, 1);
+        const int groups = UP_DIV((total + group - 1) / group, 256);
+        if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                quant::QuantBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 };
 

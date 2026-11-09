@@ -192,10 +192,10 @@ list(FILTER SHADER_FILES EXCLUDE REGEX "/common/")
 # prefix); leaving it in the generic loop would register a second, unused
 # module under the same key.
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_down_act\\.comp$")
-# matmul_coop16_inwg.comp (b3 SPLITK_INWG variant) lives outside the generic
-# foreach loop — the vkop_shader_variant macro below compiles it explicitly
-# with -DSPLITK_INWG and the generic loop would otherwise claim the same
-# OUTPUT with a wrong -D flag (no -DSPLITK_INWG at all, i.e. unused junk).
+# matmul_coop16_inwg.comp (a b3 SPLITK_INWG experiment) is dead: the host
+# route is disabled (coopmat_inwg_applies returns false) and no variant ever
+# shipped as its own source. Keep it out of the generic loop; if the route is
+# ever revived it needs an explicit vkop_shader_variant entry.
 list(FILTER SHADER_FILES EXCLUDE REGEX "/matmul_coop16_inwg\\.comp$")
 # matmul_coop16_sklast.comp carries the SK_LASTBLOCK (+ optional ENABLE_HALF2_EPI)
 # implementation as a complete separate source -- it has its own STORE_C macro,
@@ -295,6 +295,8 @@ set(DUAL_FP16_SHADERS
     buffer/sin
     buffer/neg
     buffer/erf
+    buffer/relu
+    buffer/floor
     buffer/conv2d
     buffer/rotary
     buffer/fused_elemwise
@@ -306,6 +308,10 @@ set(DUAL_FP16_SHADERS
     buffer/min
     buffer/max
     buffer/mod
+    # maxpool2d.comp has the FP16 packing path and ShaderKeys/shader_map
+    # already declare the buffer fp16 variant; without this entry an fp16
+    # buffer MaxPool2d (VKOP_BUFFER_BACKEND=1) had no key to resolve.
+    buffer/maxpool2d
     # Image kernels accumulate in fp32 (ACC types in the .comp), so the fp16
     # variant only changes the load/store width. The op picks the module from
     # the tensor dtype; a fp32 graph must never land on the fp16 module.
@@ -322,7 +328,7 @@ foreach(DUAL_NAME ${DUAL_FP16_SHADERS})
         COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/${DUAL_NAME}.comp
                 -fshader-stage=compute -g --target-spv=spv1.3
                 -o ${SPIRV_FILE_FP16} -DFP16
-        DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp
+        DEPENDS ${SHADER_DIR}/${DUAL_NAME}.comp ${SHADER_INCLUDES}
         COMMENT "Compiling ${DUAL_NAME} (fp16) to SPIR-V"
     )
     list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_FP16})
@@ -443,9 +449,135 @@ macro(vkop_shader_variant KEY SOURCE)
     list(APPEND VARIANT_SPV_FILES ${SPIRV_FILE_VARIANT})
 endmacro()
 
+# Device-address builds of the shared sources listed here. Each is compiled
+# with -DBDA (and -DFP16 -DBDA when it also has a dual fp16 base), producing
+# <base>_bda / <base>_bda_fp16 -- exactly what
+# Operator::try_build_bda_pipeline probes. The operator always keeps the
+# descriptor pipeline as the per-dispatch fallback, so a model converted
+# without these keys simply stays on descriptors.
+set(BDA_SHADERS
+    buffer/neg
+    buffer/sigmoid
+    buffer/tanh
+    buffer/erf
+    buffer/sqrt
+    buffer/atan
+    buffer/cos
+    buffer/sin
+    buffer/softplus
+    buffer/relu
+    buffer/floor
+    buffer/rmsnorm
+    buffer/layernorm
+    buffer/cast
+    buffer/quantize_linear
+    buffer/softmax
+    buffer/reduce
+    buffer/transpose
+    buffer/globalaveragepool
+    buffer/rotary
+    buffer/embedding_forward
+    buffer/prelu
+    buffer/resize
+    buffer/expand
+    buffer/add
+    buffer/sub
+    buffer/mul
+    buffer/div
+    buffer/pow
+    buffer/min
+    buffer/max
+    buffer/mod
+    buffer/matmul
+    # Generic address-table ops: the -DBDA build declares ONE table at binding
+    # 0 (see Operator::bda_address_table_slots) and keeps the descriptor PC.
+    buffer/attention
+    buffer/concat
+    buffer/conv2d
+    buffer/equal
+    buffer/fused_elemwise
+    buffer/gather
+    buffer/gemm
+    buffer/maxpool2d
+    buffer/reshape
+    buffer/scatter_elements
+    buffer/scatternd
+    buffer/slice
+    buffer/split
+    buffer/topk
+    buffer/where
+)
+foreach(BDA_NAME ${BDA_SHADERS})
+    string(REPLACE "/" "_" BDA_BASE "${BDA_NAME}")
+    vkop_shader_variant(${BDA_BASE}_bda ${BDA_NAME} -DBDA)
+    if(BDA_NAME IN_LIST DUAL_FP16_SHADERS)
+        vkop_shader_variant(${BDA_BASE}_bda_fp16 ${BDA_NAME} -DFP16 -DBDA)
+    endif()
+endforeach()
+
+# int64 shape-meta twins: separate keys the ops resolve by name, so they need
+# their own -DBDA builds (no fp16 form). The host keeps the descriptor module
+# as the fallback when the key is absent.
+vkop_shader_variant(buffer_concat_int64_bda buffer/concat_int64 -DBDA)
+vkop_shader_variant(buffer_equal_int64_bda buffer/equal_int64 -DBDA)
+vkop_shader_variant(buffer_gather_int64_bda buffer/gather_int64 -DBDA)
+vkop_shader_variant(buffer_where_int64_bda buffer/where_int64 -DBDA)
+vkop_shader_variant(buffer_expand_int64_bda buffer/expand_int64 -DBDA)
+# The GPU-shape indirect pre-pass (BufferBinaryFactory::submit_prepass), whose
+# two bindings are the out-shape SSBO and the VkDispatchIndirectCommand buffer
+# -- neither comes from the main kernel's objs_ list.
+vkop_shader_variant(buffer_dispatch_from_shape_bda
+                    buffer/dispatch_from_shape -DBDA)
+
+# Host-only ops (NonZero/Range) and the reference argmax kernel back no engine
+# dispatch, but their -DBDA builds are exercised directly by
+# tests/DeadShaderBdaProbe.cpp so every shader in the tree has a BDA path.
+vkop_shader_variant(buffer_nonzero_bda buffer/nonzero -DBDA)
+vkop_shader_variant(buffer_range_bda buffer/range -DBDA)
+vkop_shader_variant(buffer_argmax buffer/argmax)
+vkop_shader_variant(buffer_argmax_bda buffer/argmax -DBDA)
+
 # The M>1 build of the SwiGLU fold source (no DA_M1_ONLY): keeps the multi-row
 # deposit walk that the M==1 module above compiles out.
 vkop_shader_variant(buffer_matmul_down_act_multi_fp16 buffer/matmul_down_act)
+
+# BDA address-table builds of the fold. The fold reads its nine data buffers
+# through several element types (uint / uvec4 / uvec2), so its table carries
+# one address per (buffer, view) at 16/8-byte-aligned slots; one 112 B table
+# descriptor replaces all nine. Same -DDA_M1_ONLY split as the descriptor
+# builds, and the host keeps both descriptor modules as the fallback.
+vkop_shader_variant(buffer_matmul_down_act_bda_fp16 buffer/matmul_down_act
+                    -DDA_M1_ONLY -DBDA)
+vkop_shader_variant(buffer_matmul_down_act_multi_bda_fp16 buffer/matmul_down_act
+                    -DBDA)
+
+# BDA address-table builds of the same-source MatMul variants. Every one
+# replaces the seven data descriptors with the single table descriptor; the
+# host probes each key lazily and keeps the descriptor module as the fallback.
+vkop_shader_variant(buffer_matmul_w8_wide_bda_fp16 buffer/matmul
+                    -DFP16 -DW8_WIDE -DBDA)
+vkop_shader_variant(buffer_matmul_ksplit512_bda_fp16 buffer/matmul
+                    -DFP16 -DKSPLIT512 -DBDA)
+vkop_shader_variant(buffer_matmul_ksplit512_w8_wide_bda_fp16 buffer/matmul
+                    -DFP16 -DW8_WIDE -DKSPLIT512 -DBDA)
+vkop_shader_variant(buffer_matmul_tiled_ks_split_bda_fp16 buffer/matmul
+                    -DFP16 -DTILED_KS_SPLIT -DBDA)
+vkop_shader_variant(buffer_matmul_tiled_ks_fold_bda_fp16 buffer/matmul
+                    -DFP16 -DTILED_KS_FOLD -DBDA)
+# Pack pass: two direct addresses fit in the PC, so no table is needed.
+vkop_shader_variant(buffer_matmul_pack_bda buffer/matmul_pack -DBDA)
+# Primary coop pipelines: one table descriptor, same 128 B PC.
+vkop_shader_variant(buffer_matmul_coop_bda buffer/matmul_coop -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_bda buffer/matmul_coop16 -DBDA)
+# Alternative coop tile geometries (same table layout).
+vkop_shader_variant(buffer_matmul_coop16_16x8x16_bda buffer/matmul_coop16
+                    -DCM=16 -DCN=8 -DCK=16 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm8bn64_bda buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=1 -DSG_N=8 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm32bn16_bda buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=4 -DSG_N=2 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda buffer/matmul_coop
+                    -DCM=8 -DCN=8 -DCK=16 -DSG_M=8 -DSG_N=1 -DBDA)
 
 # Larger 16x16x16 coopmat workgroups (MatMulBuffer::coop_geo_pipeline): the same
 # matmul_coop16.comp with more accumulator tiles per subgroup, so one 256-thread
@@ -457,6 +589,11 @@ vkop_shader_variant(buffer_matmul_coop16_2x1 buffer/matmul_coop16
                     -DACC_M=2 -DACC_N=1)
 vkop_shader_variant(buffer_matmul_coop16_2x2 buffer/matmul_coop16
                     -DACC_M=2 -DACC_N=2)
+# BDA table builds of the two ACC geometries.
+vkop_shader_variant(buffer_matmul_coop16_2x1_bda buffer/matmul_coop16
+                    -DACC_M=2 -DACC_N=1 -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_2x2_bda buffer/matmul_coop16
+                    -DACC_M=2 -DACC_N=2 -DBDA)
 
 # The cooperative-matrix tile shapes the runtime can probe for. matmul_coop16
 # carries the fp16 f32-accumulate shapes (16x16x16 is the default build above),
@@ -494,22 +631,41 @@ vkop_shader_variant(buffer_matmul_coop_u8_16x16x32 buffer/matmul_coop_i8
 vkop_shader_variant(buffer_matmul_coop_u8_16x8x32 buffer/matmul_coop_i8
                     -DIS_SIGNED=0 -DCM=16 -DCN=8 -DCK=32)
 
+# BDA address-table builds of every SINT8/UINT8 coop module.
+vkop_shader_variant(buffer_matmul_coop_i8_bda buffer/matmul_coop_i8 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_i8_16x16x32_bda buffer/matmul_coop_i8
+                    -DCM=16 -DCN=16 -DCK=32 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_i8_16x8x32_bda buffer/matmul_coop_i8
+                    -DCM=16 -DCN=8 -DCK=32 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_u8_bda buffer/matmul_coop_i8
+                    -DIS_SIGNED=0 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_u8_16x16x32_bda buffer/matmul_coop_i8
+                    -DIS_SIGNED=0 -DCM=16 -DCN=16 -DCK=32 -DBDA)
+vkop_shader_variant(buffer_matmul_coop_u8_16x8x32_bda buffer/matmul_coop_i8
+                    -DIS_SIGNED=0 -DCM=16 -DCN=8 -DCK=32 -DBDA)
+
 # coopmat + split-K hybrid: three -D entry points per source (DEFAULT = no
 # -D, SPLITK_DEPOSIT, SPLITK_FOLD). Runtime picks SPLITK_DEPOSIT for the
 # main pass (fp32 partials to scratch) and SPLITK_FOLD for the reduce pass
 # (fp32-sums partials, packs half2 directly to binding 0). SPLITK_DEPOSIT
-# reads uPC.ksplit as coop_split; SPLITK_FOLD reads it the same way. ARL's
-# matmul_coop.comp (8x8x16) and Ada's matmul_coop16.comp (16x16x16 + ACC
-# variants) carry identical -D paths. Host guards keep 2x2/2x1/CN=8 variants,
-# odd N, and K-too-shallow shapes on the DEFAULT path regardless.
+# reads uPC.ksplit as coop_split; SPLITK_FOLD reads it the same way.
+# matmul_coop16.comp never implemented the SPLITK_* paths, so the old
+# buffer_matmul_coop16_splitk_{deposit,fold} entries were byte-identical
+# duplicates of the default 16x16x16 module; they were removed rather than
+# kept as a misleading alias. Host guards keep 2x2/2x1/CN=8 variants, odd N,
+# and K-too-shallow shapes on the DEFAULT path regardless.
 vkop_shader_variant(buffer_matmul_coop_splitk_deposit buffer/matmul_coop
                     -DSPLITK_DEPOSIT)
 vkop_shader_variant(buffer_matmul_coop_splitk_fold buffer/matmul_coop
                     -DSPLITK_FOLD)
-vkop_shader_variant(buffer_matmul_coop16_splitk_deposit buffer/matmul_coop16
-                    -DSPLITK_DEPOSIT)
-vkop_shader_variant(buffer_matmul_coop16_splitk_fold buffer/matmul_coop16
-                    -DSPLITK_FOLD)
+
+# BDA builds of the dead-but-shipped routes. No host path dispatches them
+# today (the routes are disabled), so they are validated by
+# tests/DeadShaderBdaProbe.cpp with a raw table dispatch.
+vkop_shader_variant(buffer_matmul_coop_splitk_deposit_bda buffer/matmul_coop
+                    -DSPLITK_DEPOSIT -DBDA)
+vkop_shader_variant(buffer_matmul_coop_splitk_fold_bda buffer/matmul_coop
+                    -DSPLITK_FOLD -DBDA)
 
 # SPLITK_INWG: split-K inside one workgroup, no global scratch, single
 # dispatch. coop_split (uPC.ksplit, 1..8) serial passes over K-range slices,
@@ -519,6 +675,8 @@ vkop_shader_variant(buffer_matmul_coop16_splitk_fold buffer/matmul_coop16
 # ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK.
 vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
                     -DSPLITK_INWG)
+vkop_shader_variant(buffer_matmul_coop_inwg_bda buffer/matmul_coop
+                    -DSPLITK_INWG -DBDA)
 
 # ARL fp16 workgroup BM/BN variants over macroized matmul_coop.comp.
 # All share the same MMA tile (CM=CN=CK=8/8/16); only SG_M/SG_N/BM/BN
@@ -547,6 +705,16 @@ vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs4 buffer/matmul_coop16_sk
                     -DSK_LASTBLOCK -DSK_CS=4 -DSK_KFLOOR=256)
 vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs8 buffer/matmul_coop16_sklast
                     -DSK_LASTBLOCK -DSK_CS=8 -DSK_KFLOOR=256)
+# BDA table builds of every cs variant (Ada-only route; the host keeps the
+# descriptor modules as the per-dispatch fallback).
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_bda buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs2_bda buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=2 -DSK_KFLOOR=256 -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs4_bda buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=4 -DSK_KFLOOR=256 -DBDA)
+vkop_shader_variant(buffer_matmul_coop16_sklast_fp32_cs8_bda buffer/matmul_coop16_sklast
+                    -DSK_LASTBLOCK -DSK_CS=8 -DSK_KFLOOR=256 -DBDA)
 
 # Subgroup-arithmetic reductions (_sg) for the ops whose workgroup reduce sits
 # in a hot loop or on every transformer block: attention's per-tile max/sum,
@@ -568,6 +736,25 @@ vkop_shader_variant(buffer_softmax_fp16_sg buffer/softmax -DFP16 -DSUBGROUP)
 # function's reduce swapped, so the host may prefer it for every MatMul.
 vkop_shader_variant(buffer_matmul_sg buffer/matmul -DSUBGROUP)
 vkop_shader_variant(buffer_matmul_fp16_sg buffer/matmul -DFP16 -DSUBGROUP)
+# BDA builds of every subgroup variant. The runtime picks <key>_sg whenever
+# the device advertises subgroup arithmetic and the archive has it, so the BDA
+# path must offer the same reduction -- otherwise VKOP_BDA silently downgrades
+# attention/norm/softmax/matmul to the shared-memory tree.
+vkop_shader_variant(buffer_attention_sg_bda buffer/attention -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_attention_fp16_sg_bda buffer/attention
+                    -DFP16 -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_layernorm_sg_bda buffer/layernorm -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_layernorm_fp16_sg_bda buffer/layernorm
+                    -DFP16 -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_rmsnorm_sg_bda buffer/rmsnorm -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_rmsnorm_fp16_sg_bda buffer/rmsnorm
+                    -DFP16 -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_softmax_sg_bda buffer/softmax -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_softmax_fp16_sg_bda buffer/softmax
+                    -DFP16 -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_matmul_sg_bda buffer/matmul -DSUBGROUP -DBDA)
+vkop_shader_variant(buffer_matmul_fp16_sg_bda buffer/matmul
+                    -DFP16 -DSUBGROUP -DBDA)
 # Image LayerNorm's three normalize shapes (W / HW / CHW) all fold sum and
 # sum-of-squares through the vec4 tree; the fp32 module is the only build.
 vkop_shader_variant(image_layernorm_sg image/layernorm -DSUBGROUP)

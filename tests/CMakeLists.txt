@@ -318,6 +318,12 @@ target_link_libraries(all_tests PRIVATE vkop vload ${TORCH_LIBRARY}
     ${TORCH_CPU_LIBRARY}
     ${C10_LIBRARY}
     GTest::gtest GTest::gtest_main)
+if(UNIX AND NOT APPLE)
+    # VulkanSurface's inline detectDisplayType() calls XCloseDisplay; the test
+    # TU emits that inline, but vkop's static archive does not carry the X11
+    # dependency. VulkanSurface.cpp also calls into xcb.
+    target_link_libraries(all_tests PRIVATE X11 xcb)
+endif()
 
 # Force-load the whole vkop static archive so the OperatorFactory's static
 # self-registration pulls in every op (Apple: -force_load; Linux: whole-archive).
@@ -562,3 +568,238 @@ add_test(NAME OpPrecisionTest COMMAND OpPrecisionTest)
 add_executable(PreprocessJpgTest PreprocessJpgTest.cpp)
 target_link_libraries(PreprocessJpgTest PRIVATE vkop vload)
 add_test(NAME PreprocessJpgTest COMMAND PreprocessJpgTest)
+
+# Buffer-device-address plumbing probe: capability gate, address caching and
+# sub-range view arithmetic. Skips cleanly on a device without BDA (the
+# compatibility contract) and asserts host-imported buffers stay
+# descriptor-only. Not a gtest: the skip path is a normal device capability,
+# not a test failure.
+add_executable(BufferDeviceAddressTest BufferDeviceAddressTest.cpp)
+target_link_libraries(BufferDeviceAddressTest PRIVATE vkop vload)
+add_test(NAME BufferDeviceAddressTest COMMAND BufferDeviceAddressTest)
+
+# End-to-end BDA-kernel probe: every unary op with a _bda variant (fp32/fp16)
+# plus the per-dispatch descriptor fallback for host-imported buffers. Skips
+# cleanly on a non-BDA device.
+add_executable(UnaryBdaProbe UnaryBdaProbe.cpp)
+target_link_libraries(UnaryBdaProbe PRIVATE vkop vload)
+add_dependencies(UnaryBdaProbe shader_archive)
+target_compile_definitions(UnaryBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME UnaryBdaProbe COMMAND UnaryBdaProbe)
+# Same values, VKOP_BDA unset: must take the descriptor pipeline and produce
+# identical output (the per-op rollout gate).
+add_test(NAME UnaryBdaProbeDesc COMMAND UnaryBdaProbe)
+set_tests_properties(UnaryBdaProbeDesc PROPERTIES ENVIRONMENT
+    "UNARY_BDA_DESC_ONLY=1")
+
+# First non-unary BDA variant: three data buffers instead of two.
+add_executable(RMSNormBdaProbe RMSNormBdaProbe.cpp)
+target_link_libraries(RMSNormBdaProbe PRIVATE vkop vload)
+add_dependencies(RMSNormBdaProbe shader_archive)
+target_compile_definitions(RMSNormBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME RMSNormBdaProbe COMMAND RMSNormBdaProbe)
+add_test(NAME RMSNormBdaProbeDesc COMMAND RMSNormBdaProbe)
+set_tests_properties(RMSNormBdaProbeDesc PROPERTIES ENVIRONMENT
+    "RMSNORM_BDA_DESC_ONLY=1")
+
+# LayerNorm adds the optional skip binding (5 addresses).
+add_executable(LayerNormBdaProbe LayerNormBdaProbe.cpp)
+target_link_libraries(LayerNormBdaProbe PRIVATE vkop vload)
+add_dependencies(LayerNormBdaProbe shader_archive)
+target_compile_definitions(LayerNormBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME LayerNormBdaProbe COMMAND LayerNormBdaProbe)
+add_test(NAME LayerNormBdaProbeDesc COMMAND LayerNormBdaProbe)
+set_tests_properties(LayerNormBdaProbeDesc PROPERTIES ENVIRONMENT
+    "LAYERNORM_BDA_DESC_ONLY=1")
+
+# Cast: one module for both directions, BDA key buffer_cast_bda.
+add_executable(CastBdaProbe CastBdaProbe.cpp)
+target_link_libraries(CastBdaProbe PRIVATE vkop vload)
+add_dependencies(CastBdaProbe shader_archive)
+target_compile_definitions(CastBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME CastBdaProbe COMMAND CastBdaProbe)
+add_test(NAME CastBdaProbeDesc COMMAND CastBdaProbe)
+set_tests_properties(CastBdaProbeDesc PROPERTIES ENVIRONMENT
+    "CAST_BDA_DESC_ONLY=1")
+
+# QuantizeLinear/DequantizeLinear: one format-polymorphic module.
+add_executable(QdqBdaProbe QdqBdaProbe.cpp)
+target_link_libraries(QdqBdaProbe PRIVATE vkop vload)
+add_dependencies(QdqBdaProbe shader_archive)
+target_compile_definitions(QdqBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME QdqBdaProbe COMMAND QdqBdaProbe)
+add_test(NAME QdqBdaProbeDesc COMMAND QdqBdaProbe)
+set_tests_properties(QdqBdaProbeDesc PROPERTIES ENVIRONMENT
+    "QDQ_BDA_DESC_ONLY=1")
+
+# Softmax: fp16 two-pass reduce+pack through one BDA pipeline.
+add_executable(SoftmaxBdaProbe SoftmaxBdaProbe.cpp)
+target_link_libraries(SoftmaxBdaProbe PRIVATE vkop vload)
+add_dependencies(SoftmaxBdaProbe shader_archive)
+target_compile_definitions(SoftmaxBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME SoftmaxBdaProbe COMMAND SoftmaxBdaProbe)
+add_test(NAME SoftmaxBdaProbeDesc COMMAND SoftmaxBdaProbe)
+set_tests_properties(SoftmaxBdaProbeDesc PROPERTIES ENVIRONMENT
+    "SOFTMAX_BDA_DESC_ONLY=1")
+
+# Binary: 24 B PC + a 120 B args buffer (dims + three addresses), because
+# BinaryElemPC is already at the 128 B push-constant limit.
+add_executable(BinaryBdaProbe BinaryBdaProbe.cpp)
+target_link_libraries(BinaryBdaProbe PRIVATE vkop vload)
+add_dependencies(BinaryBdaProbe shader_archive)
+target_compile_definitions(BinaryBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME BinaryBdaProbe COMMAND BinaryBdaProbe)
+add_test(NAME BinaryBdaProbeDesc COMMAND BinaryBdaProbe)
+set_tests_properties(BinaryBdaProbeDesc PROPERTIES ENVIRONMENT
+    "BINARY_BDA_DESC_ONLY=1")
+
+# Route readout for MatMul BDA/table experiments.
+add_executable(MatmulRouteProbe MatmulRouteProbe.cpp)
+target_link_libraries(MatmulRouteProbe PRIVATE vkop vload)
+add_dependencies(MatmulRouteProbe shader_archive)
+target_compile_definitions(MatmulRouteProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+# Print-only diagnostic (exits 0); registered so a route change shows up in
+# the ctest log even though it asserts nothing.
+add_test(NAME MatmulRouteProbe COMMAND MatmulRouteProbe)
+
+# MatMul: 128 B PC -> one address-table descriptor instead of 7 data bindings.
+add_executable(MatMulBdaProbe MatMulBdaProbe.cpp)
+target_link_libraries(MatMulBdaProbe PRIVATE vkop vload)
+add_dependencies(MatMulBdaProbe shader_archive)
+target_compile_definitions(MatMulBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME MatMulBdaProbe COMMAND MatMulBdaProbe)
+add_test(NAME MatMulBdaProbeDesc COMMAND MatMulBdaProbe)
+set_tests_properties(MatMulBdaProbeDesc PROPERTIES ENVIRONMENT
+    "MATMUL_BDA_DESC_ONLY=1")
+
+# Reduce / Transpose: two direct addresses, no table.
+add_executable(ReduceTransposeBdaProbe ReduceTransposeBdaProbe.cpp)
+target_link_libraries(ReduceTransposeBdaProbe PRIVATE vkop vload)
+add_dependencies(ReduceTransposeBdaProbe shader_archive)
+target_compile_definitions(ReduceTransposeBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME ReduceTransposeBdaProbe COMMAND ReduceTransposeBdaProbe)
+add_test(NAME ReduceTransposeBdaProbeDesc COMMAND ReduceTransposeBdaProbe)
+set_tests_properties(ReduceTransposeBdaProbeDesc PROPERTIES ENVIRONMENT
+    "MISC_BDA_DESC_ONLY=1")
+
+# GlobalAveragePool: two direct addresses, 16->32 B PC.
+add_executable(GapBdaProbe GapBdaProbe.cpp)
+target_link_libraries(GapBdaProbe PRIVATE vkop vload)
+add_dependencies(GapBdaProbe shader_archive)
+target_compile_definitions(GapBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME GapBdaProbe COMMAND GapBdaProbe)
+add_test(NAME GapBdaProbeDesc COMMAND GapBdaProbe)
+set_tests_properties(GapBdaProbeDesc PROPERTIES ENVIRONMENT
+    "GAP_BDA_DESC_ONLY=1")
+
+# RotaryEmbedding: four direct addresses, 40->72 B PC.
+add_executable(RotaryBdaProbe RotaryBdaProbe.cpp)
+target_link_libraries(RotaryBdaProbe PRIVATE vkop vload)
+add_dependencies(RotaryBdaProbe shader_archive)
+target_compile_definitions(RotaryBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME RotaryBdaProbe COMMAND RotaryBdaProbe)
+add_test(NAME RotaryBdaProbeDesc COMMAND RotaryBdaProbe)
+set_tests_properties(RotaryBdaProbeDesc PROPERTIES ENVIRONMENT
+    "ROTARY_BDA_DESC_ONLY=1")
+
+# EmbeddingForward: five direct addresses, 32->72 B PC.
+add_executable(EmbeddingBdaProbe EmbeddingBdaProbe.cpp)
+target_link_libraries(EmbeddingBdaProbe PRIVATE vkop vload)
+add_dependencies(EmbeddingBdaProbe shader_archive)
+target_compile_definitions(EmbeddingBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME EmbeddingBdaProbe COMMAND EmbeddingBdaProbe)
+add_test(NAME EmbeddingBdaProbeDesc COMMAND EmbeddingBdaProbe)
+set_tests_properties(EmbeddingBdaProbeDesc PROPERTIES ENVIRONMENT
+    "EMBEDDING_BDA_DESC_ONLY=1")
+
+# PReLU: X + slope, 3 direct addresses (compact 104 B PC).
+add_executable(PreluBdaProbe PreluBdaProbe.cpp)
+target_link_libraries(PreluBdaProbe PRIVATE vkop vload)
+add_dependencies(PreluBdaProbe shader_archive)
+target_compile_definitions(PreluBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME PreluBdaProbe COMMAND PreluBdaProbe)
+add_test(NAME PreluBdaProbeDesc COMMAND PreluBdaProbe)
+set_tests_properties(PreluBdaProbeDesc PROPERTIES ENVIRONMENT
+    "PRELU_BDA_DESC_ONLY=1")
+
+# Resize: two direct addresses, 80->96 B PC.
+add_executable(ResizeBdaProbe ResizeBdaProbe.cpp)
+target_link_libraries(ResizeBdaProbe PRIVATE vkop vload)
+add_dependencies(ResizeBdaProbe shader_archive)
+target_compile_definitions(ResizeBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME ResizeBdaProbe COMMAND ResizeBdaProbe)
+add_test(NAME ResizeBdaProbeDesc COMMAND ResizeBdaProbe)
+set_tests_properties(ResizeBdaProbeDesc PROPERTIES ENVIRONMENT
+    "RESIZE_BDA_DESC_ONLY=1")
+
+# Expand: 2 direct addresses, 80->96 B PC.
+add_executable(ExpandBdaProbe ExpandBdaProbe.cpp)
+target_link_libraries(ExpandBdaProbe PRIVATE vkop vload)
+add_dependencies(ExpandBdaProbe shader_archive)
+target_compile_definitions(ExpandBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME ExpandBdaProbe COMMAND ExpandBdaProbe)
+add_test(NAME ExpandBdaProbeDesc COMMAND ExpandBdaProbe)
+set_tests_properties(ExpandBdaProbeDesc PROPERTIES ENVIRONMENT
+    "EXPAND_BDA_DESC_ONLY=1")
+
+# int8-weight coopmat route (VKOP_COOP_I8=1).
+add_executable(MatMulI8BdaProbe MatMulI8BdaProbe.cpp)
+target_link_libraries(MatMulI8BdaProbe PRIVATE vkop vload)
+add_dependencies(MatMulI8BdaProbe shader_archive)
+target_compile_definitions(MatMulI8BdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME MatMulI8BdaProbe COMMAND MatMulI8BdaProbe)
+add_test(NAME MatMulI8BdaProbeDesc COMMAND MatMulI8BdaProbe)
+set_tests_properties(MatMulI8BdaProbeDesc PROPERTIES ENVIRONMENT
+    "MATMUL_I8_BDA_DESC_ONLY=1")
+
+# SwiGLU down-projection fold (MatMul down_act=1): the widest address table
+# (nine buffers, typed uvec4/uvec2 aliases). M==1 and M>1 take different
+# modules, so both are probed.
+add_executable(DownActBdaProbe DownActBdaProbe.cpp)
+target_link_libraries(DownActBdaProbe PRIVATE vkop vload)
+add_dependencies(DownActBdaProbe shader_archive)
+target_compile_definitions(DownActBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME DownActBdaProbe COMMAND DownActBdaProbe)
+add_test(NAME DownActBdaProbeDesc COMMAND DownActBdaProbe)
+set_tests_properties(DownActBdaProbeDesc PROPERTIES ENVIRONMENT
+    "DOWNACT_BDA_DESC_ONLY=1")
+
+# int64 shape-meta twins (VKOP_HOST_SHAPE=0 forces their GPU paths).
+add_executable(Int64BdaProbe Int64BdaProbe.cpp)
+target_link_libraries(Int64BdaProbe PRIVATE vkop vload)
+add_dependencies(Int64BdaProbe shader_archive)
+target_compile_definitions(Int64BdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME Int64BdaProbe COMMAND Int64BdaProbe)
+add_test(NAME Int64BdaProbeDesc COMMAND Int64BdaProbe)
+set_tests_properties(Int64BdaProbeDesc PROPERTIES ENVIRONMENT
+    "INT64_BDA_DESC_ONLY=1")
+
+# Shaders no model reaches: NonZero/Range (host-only ops), the reference
+# argmax kernel, and the disabled coopmat split-K / in-workgroup routes. The
+# probe drives them with a raw table dispatch (or N descriptors in the A/B
+# variant).
+add_executable(DeadShaderBdaProbe DeadShaderBdaProbe.cpp)
+target_link_libraries(DeadShaderBdaProbe PRIVATE vkop vload)
+add_dependencies(DeadShaderBdaProbe shader_archive)
+target_compile_definitions(DeadShaderBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME DeadShaderBdaProbe COMMAND DeadShaderBdaProbe)
+add_test(NAME DeadShaderBdaProbeDesc COMMAND DeadShaderBdaProbe)
+set_tests_properties(DeadShaderBdaProbeDesc PROPERTIES ENVIRONMENT
+    "DEAD_BDA_DESC_ONLY=1")
+
+# Ada-only routes (coopmat_sklast + the 16x16x16 ACC geometries). The probe
+# SKIPs when the device lists no 16x16x16 MMA tile, so on ARL these are
+# no-ops; run them on the b3 (RTX 4000 Ada) host.
+add_executable(MatmulAdaBdaProbe MatmulAdaBdaProbe.cpp)
+target_link_libraries(MatmulAdaBdaProbe PRIVATE vkop vload)
+add_dependencies(MatmulAdaBdaProbe shader_archive)
+target_compile_definitions(MatmulAdaBdaProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+foreach(ada_case sklast acc2x1 acc2x2)
+    add_test(NAME MatmulAdaBdaProbe_${ada_case} COMMAND MatmulAdaBdaProbe)
+    set_tests_properties(MatmulAdaBdaProbe_${ada_case} PROPERTIES ENVIRONMENT
+        "MATMUL_ADA_CASE=${ada_case}")
+    add_test(NAME MatmulAdaBdaProbe_${ada_case}_desc COMMAND MatmulAdaBdaProbe)
+    set_tests_properties(MatmulAdaBdaProbe_${ada_case}_desc PROPERTIES
+        ENVIRONMENT
+        "MATMUL_ADA_CASE=${ada_case};MATMUL_ADA_BDA_DESC_ONLY=1")
+endforeach()

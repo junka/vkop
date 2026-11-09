@@ -23,6 +23,16 @@ struct alignas(16) GapBufferPC {
     int spatial;
     int _pad;
 };
+
+// Device-address variant: 16 B scalar prefix + out/in pointers.
+struct alignas(16) GapBdaPC {
+    GapBufferPC base;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(GapBdaPC, out_addr) == 16, "GapBdaPC drift");
+static_assert(offsetof(GapBdaPC, in_addr) == 24, "GapBdaPC drift");
+static_assert(sizeof(GapBdaPC) == 32, "GapBdaPC drift");
 } // namespace globalaveragepool
 
 class GlobalAveragePoolImage : public Operator {
@@ -86,6 +96,11 @@ class GlobalAveragePoolBuffer : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(globalaveragepool::GapBufferPC), fp16) {}
 
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override {
+        return sizeof(globalaveragepool::GapBdaPC);
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -102,17 +117,19 @@ class GlobalAveragePoolBuffer : public BufferFactory {
             spatial *= input_shape[i];
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != batch * channels) {
                 output->resize(std::vector<int>{batch, channels});
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         globalaveragepool::GapBufferPC pc{};
@@ -121,7 +138,21 @@ class GlobalAveragePoolBuffer : public BufferFactory {
         pc.spatial = spatial;
         int out_total = batch * channels;
         int nthreads = (fp16_ != 0) ? (out_total + 1) / 2 : out_total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        const int groups = UP_DIV(nthreads, 256);
+        if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                globalaveragepool::GapBdaPC bpc{};
+                bpc.base = pc;
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 };
 

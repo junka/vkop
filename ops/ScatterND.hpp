@@ -44,6 +44,9 @@ class ScatterND : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // out, data, int64 indices, updates.
+    size_t bda_address_table_slots() const override { return 4; }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,

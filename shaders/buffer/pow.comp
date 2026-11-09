@@ -6,9 +6,42 @@
 
 // activation.comp expects FLOAT/FLOAT4/FLOAT2 to be pre-defined, so it
 // must come AFTER buffer_common.comp (which defines them for both builds).
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #include "../common/buffer_common.comp"
 #include "../common/activation.comp"
 
+#define BINARY_HAS_ACTIVATION 1
+
+float bin_op(float a, float b) {
+    // ONNX Pow semantics: a negative base raised to an *integer* exponent
+    // yields a real result (e.g. (-2)^2 = 4). GLSL pow is defined as
+    // exp(b*log(a)), which returns NaN for a<0 because log(negative) is
+    // undefined. The LLM's RMSNorm computes Pow(x, 2) over hidden states
+    // that are roughly half negative, so without this guard ~half the
+    // elements become NaN and poison every layer.
+    if (a < 0.0) {
+        float r = pow(-a, b);          // |a|^b, always real
+        float fl = floor(b);
+        if (abs(b - fl) < 1e-5) {
+            // b is integral: flip sign iff odd.
+            int ie = int(fl);
+            if ((ie & 1) != 0) r = -r;
+            return r;
+        }
+        // Non-integer exponent on a negative base: ONNX yields NaN too.
+        return pow(a, b);
+    }
+    return pow(a, b);
+}
+
+#ifdef BDA
+#include "../common/binary_bda_body.comp"
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) writeonly buffer Output {
@@ -50,27 +83,7 @@ layout(push_constant) uniform PC_uPC {
     int _pad;
 } uPC;
 
-float bin_op(float a, float b) {
-    // ONNX Pow semantics: a negative base raised to an *integer* exponent
-    // yields a real result (e.g. (-2)^2 = 4). GLSL pow is defined as
-    // exp(b*log(a)), which returns NaN for a<0 because log(negative) is
-    // undefined. The LLM's RMSNorm computes Pow(x, 2) over hidden states
-    // that are roughly half negative, so without this guard ~half the
-    // elements become NaN and poison every layer.
-    if (a < 0.0) {
-        float r = pow(-a, b);          // |a|^b, always real
-        float fl = floor(b);
-        if (abs(b - fl) < 1e-5) {
-            // b is integral: flip sign iff odd.
-            int ie = int(fl);
-            if ((ie & 1) != 0) r = -r;
-            return r;
-        }
-        // Non-integer exponent on a negative base: ONNX yields NaN too.
-        return pow(a, b);
-    }
-    return pow(a, b);
-}
+
 
 // Dims are threaded in so broadcast==2 reads the shape SSBOs ONCE (in main)
 // rather than per element. For broadcast==0/1 the PC dims are used directly.
@@ -158,3 +171,4 @@ void main() {
     uOutput.data[gid] = floatBitsToUint(r);
 #endif
 }
+#endif

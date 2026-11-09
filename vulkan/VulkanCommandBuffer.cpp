@@ -62,6 +62,13 @@ void VulkanCommandBuffer::bind(VulkanPipeline &pipeline,
     ds_prof_record("bind_ds", ds_prof_now() - t_prof1, 1);
 }
 
+void VulkanCommandBuffer::bind_pipeline(VulkanPipeline &pipeline) {
+    const uint64_t t_prof0 = ds_prof_now();
+    vkCmdBindPipeline(m_commandBuffer_, VK_PIPELINE_BIND_POINT_COMPUTE,
+                      pipeline.getPipeline());
+    ds_prof_record("bind_pipeline", ds_prof_now() - t_prof0, 1);
+}
+
 void VulkanCommandBuffer::bindGraphics(VulkanGraphicsPipeline &pipeline,
                                        VkDescriptorSet descriptor_set,
                                        VkBuffer vertex_buffer,

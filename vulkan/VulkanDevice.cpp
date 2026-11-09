@@ -28,6 +28,16 @@ void recordCap(DeviceCap &cap, VkBool32 reported) {
     cap.enabled = cap.supported;
 }
 
+// VKOP_NO_BDA is read once, before the feature chain is built, so the feature
+// never reaches vkCreateDevice. That matters beyond the shader path: VMA's
+// allocator flag and every buffer's SHADER_DEVICE_ADDRESS usage bit are gated
+// on the same support flag, and both are invalid when the device feature is
+// off.
+bool buffer_device_address_disabled() {
+    static const bool disabled = std::getenv("VKOP_NO_BDA") != nullptr;
+    return disabled;
+}
+
 } // namespace
 
 VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
@@ -66,8 +76,19 @@ VulkanDevice::VulkanDevice(VkPhysicalDevice physicalDevice) {
     // After device_traits_: the dump wants the resolved facts next to the
     // enabled feature bits. No-op unless VKOP_DEVCAPS=1.
     dumpShaderCapabilities();
+    // Resolve the entry point and prove the whole host-side path works before
+    // anything (VMA especially) keys on the capability. A driver that reports
+    // the feature but cannot allocate an addressable buffer is downgraded
+    // here, so no caller ever needs its own deny list.
+    initBufferDeviceAddress();
+    LOG_INFO("buffer device address %s supported",
+             (is_support_buffer_device_address() ? "is" : "not"));
 #ifdef USE_VMA
-    m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_);
+    // Conditional on purpose: VMA's BDA allocator flag makes every allocation
+    // carry VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT, which is invalid when the
+    // device feature was not enabled.
+    m_vma_ = std::make_unique<VMA>(physicalDevice_, logicalDevice_,
+                                   is_support_buffer_device_address());
 #endif
 }
 
@@ -619,10 +640,17 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 e->uniformAndStorageBuffer8BitAccess =
                     feat->uniformAndStorageBuffer8BitAccess;
                 e->timelineSemaphore = feat->timelineSemaphore;
-                e->bufferDeviceAddress = feat->bufferDeviceAddress;
+                // Buffer device address: opt-out via VKOP_NO_BDA. Everything
+                // downstream (VMA allocator flag, per-buffer usage bit, BDA
+                // shader variants) keys on this enabled bit, so a driver that
+                // reports the feature but is known-broken has one switch.
+                const bool want_bda = feat->bufferDeviceAddress &&
+                                      !buffer_device_address_disabled();
+                e->bufferDeviceAddress = want_bda;
                 e->descriptorBindingStorageBufferUpdateAfterBind =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
                 m_support_timeline_semaphore_ = feat->timelineSemaphore;
+                m_support_buffer_device_address_ = want_bda;
                 m_support_descriptor_update_after_bind_ =
                     feat->descriptorBindingStorageBufferUpdateAfterBind;
                 return std::shared_ptr<void>(std::move(e));
@@ -1217,14 +1245,17 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
                 auto *feat =
                     static_cast<VkPhysicalDeviceBufferDeviceAddressFeatures *>(
                         q);
-                if (!feat->bufferDeviceAddress)
+                if (!feat->bufferDeviceAddress ||
+                    buffer_device_address_disabled()) {
                     return nullptr;
+                }
                 auto e = std::make_unique<
                     VkPhysicalDeviceBufferDeviceAddressFeatures>();
                 *e = makeFeatureStruct<
                     VkPhysicalDeviceBufferDeviceAddressFeatures,
-                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TIMELINE_SEMAPHORE_FEATURES>();
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES>();
                 e->bufferDeviceAddress = VK_TRUE;
+                m_support_buffer_device_address_ = true;
                 return std::shared_ptr<void>(std::move(e));
             }});
     }
@@ -1794,6 +1825,122 @@ bool VulkanDevice::createLogicalDevice(
         }
     }
     return true;
+}
+
+void VulkanDevice::initBufferDeviceAddress() {
+    if (!m_support_buffer_device_address_) {
+        return;
+    }
+    // The core symbol is the 1.2 entry point; a 1.1 driver with only
+    // VK_KHR_buffer_device_address exports the KHR alias instead. Neither is
+    // in VulkanLib's assert-all list, so a missing one is a normal fallback,
+    // not a startup abort.
+    auto &lib = VulkanLib::getVulkanLib();
+    auto fn = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+        lib.get_proc_address("vkGetBufferDeviceAddress"));
+    if (!fn) {
+        fn = reinterpret_cast<PFN_vkGetBufferDeviceAddress>(
+            lib.get_proc_address("vkGetBufferDeviceAddressKHR"));
+    }
+    if (!fn) {
+        m_support_buffer_device_address_ = false;
+        LOG_WARN("buffer device address enabled but no entry point resolved; "
+                 "falling back to descriptors");
+        return;
+    }
+    get_buffer_device_address_fn_ = fn;
+    if (!probeBufferDeviceAddress()) {
+        get_buffer_device_address_fn_ = nullptr;
+        m_support_buffer_device_address_ = false;
+        LOG_WARN("buffer device address probe failed; falling back to "
+                 "descriptors");
+    }
+}
+
+bool VulkanDevice::probeBufferDeviceAddress() {
+    VkBufferCreateInfo buffer_info{};
+    buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    buffer_info.size = 64;
+    buffer_info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkBuffer buffer = VK_NULL_HANDLE;
+    if (vkCreateBuffer(logicalDevice_, &buffer_info, nullptr, &buffer) !=
+        VK_SUCCESS) {
+        return false;
+    }
+
+    VkMemoryRequirements requirements{};
+    vkGetBufferMemoryRequirements(logicalDevice_, buffer, &requirements);
+    VkPhysicalDeviceMemoryProperties memory_properties{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &memory_properties);
+
+    // Prefer DEVICE_LOCAL, but any type that accepts the allocation proves the
+    // flag/usage combination is valid on this driver.
+    int32_t type = -1;
+    for (int pass = 0; pass < 2 && type < 0; ++pass) {
+        for (uint32_t i = 0; i < memory_properties.memoryTypeCount; ++i) {
+            if (!(requirements.memoryTypeBits & (1u << i))) {
+                continue;
+            }
+            const bool device_local =
+                (memory_properties.memoryTypes[i].propertyFlags &
+                 VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0;
+            if (pass == 0 && !device_local) {
+                continue;
+            }
+            type = static_cast<int32_t>(i);
+            break;
+        }
+    }
+    if (type < 0) {
+        vkDestroyBuffer(logicalDevice_, buffer, nullptr);
+        return false;
+    }
+
+    VkMemoryAllocateFlagsInfo flags_info{};
+    flags_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO;
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo allocate_info{};
+    allocate_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    allocate_info.pNext = &flags_info;
+    allocate_info.allocationSize = requirements.size;
+    allocate_info.memoryTypeIndex = static_cast<uint32_t>(type);
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    bool ok = vkAllocateMemory(logicalDevice_, &allocate_info, nullptr,
+                               &memory) == VK_SUCCESS;
+    if (ok) {
+        ok =
+            vkBindBufferMemory(logicalDevice_, buffer, memory, 0) == VK_SUCCESS;
+    }
+    if (ok) {
+        VkBufferDeviceAddressInfo address_info{};
+        address_info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+        address_info.buffer = buffer;
+        // Nonzero is the compatibility gate. Concrete alignment is a
+        // per-shader buffer_reference_align contract, checked where a BDA
+        // variant is selected.
+        ok = get_buffer_device_address_fn_(logicalDevice_, &address_info) != 0;
+    }
+    if (memory != VK_NULL_HANDLE) {
+        vkFreeMemory(logicalDevice_, memory, nullptr);
+    }
+    vkDestroyBuffer(logicalDevice_, buffer, nullptr);
+    return ok;
+}
+
+VkDeviceAddress VulkanDevice::getBufferDeviceAddress(VkBuffer buffer) const {
+    if (!m_support_buffer_device_address_ ||
+        get_buffer_device_address_fn_ == nullptr) {
+        throw std::runtime_error(
+            "vkop: buffer device address requested but the device does not "
+            "support it (feature disabled, probe failed, or VKOP_NO_BDA)");
+    }
+    VkBufferDeviceAddressInfo info{};
+    info.sType = VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO;
+    info.buffer = buffer;
+    return get_buffer_device_address_fn_(logicalDevice_, &info);
 }
 
 std::vector<VkDeviceQueueCreateInfo> VulkanDevice::setupQueueCreateInfo(

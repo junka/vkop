@@ -26,5 +26,8 @@ TEST(ReluTest, ReluComprehensiveTest) {
         auto [shape] = test_case;
         ReluTest<float> relutest(shape);
         EXPECT_TRUE(relutest.run_test());
+
+        ReluTest<uint16_t> relutest16(shape);
+        EXPECT_TRUE(relutest16.run_test());
     }
 }

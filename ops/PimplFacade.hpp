@@ -58,6 +58,10 @@ class PimplFacade : public Operator {
         return impl_->get_record();
     }
     OpType get_type() override { return impl_->get_type(); }
+    bool bda_pipeline_ready() const override {
+        return impl_->bda_pipeline_ready();
+    }
+    bool bda_dispatched() const override { return impl_->bda_dispatched(); }
     bool uses_buffer_backend() const override {
         return impl_->uses_buffer_backend();
     }

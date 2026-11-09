@@ -70,6 +70,10 @@ class Operator {
             if (m_d)
                 pipeline_->freeDescriptorSets(m_d);
         }
+        if (bda_ds_ != VK_NULL_HANDLE && bda_pipeline_) {
+            bda_pipeline_->freeDescriptorSets(bda_ds_);
+            bda_ds_ = VK_NULL_HANDLE;
+        }
         // Do NOT reset dummy_buffer_ / dummy_bufferview_ here. They are static
         // shared_ptrs owned by VulkanDevice, and resetting them while other
         // Operator instances are still alive leaves those instances holding a
@@ -144,6 +148,10 @@ class Operator {
             for (auto &ds : m_ds_) {
                 ds = pipeline_->allocDescriptorSets();
             }
+            // Optional second pipeline: the same op dispatched through
+            // VkDeviceAddress values. Failure is non-fatal by design — the
+            // descriptor pipeline above is the fallback.
+            try_build_bda_pipeline(cache);
         }
         if (!dummy_buffer_) {
             // Use `new` + no-op deleter so the shared_ptr refcount controls
@@ -211,6 +219,15 @@ class Operator {
     }
 
     virtual OpType get_type() { return type_; }
+
+    // Diagnostics only: true when this op built its device-address pipeline.
+    // Dispatch still chooses per call (buffer capability/alignment), so this
+    // says "the variant is available", not "the last call used it".
+    virtual bool bda_pipeline_ready() const {
+        return bda_pipeline_ != nullptr;
+    }
+    // True once a dispatch actually went through submit_bda (diagnostics).
+    virtual bool bda_dispatched() const { return bda_dispatched_; }
 
     // Which backend this instance actually implements. The PIMPL façades pick
     // image/buffer at construction and a request for a missing backend falls
@@ -528,6 +545,129 @@ class Operator {
     BindProfHook bind_prof_hook_;
 
   protected:
+    // --- Buffer device address variant --------------------------------
+    // Ops that can dispatch through VkDeviceAddress values instead of
+    // descriptor bindings opt in here. The base builds a SECOND pipeline
+    // (bda_pipeline_) from the archive's "<primary>_bda" key and leaves the
+    // descriptor pipeline in place, so every dispatch can choose at runtime:
+    // host-imported or misaligned buffers simply take the descriptor path.
+    //
+    // Most ops opt in by overriding bda_address_table_slots(): the BDA build
+    // declares ONE storage buffer at binding 0 holding the first N data
+    // buffers' addresses in descriptor-binding order, the base owns that
+    // table, and submit()/submit_per_ds() switch automatically. That keeps
+    // the descriptor push-constant layout unchanged and needs no per-op
+    // dispatch branch.
+    virtual bool supports_bda_variant() const {
+        return bda_address_table_slots() > 0;
+    }
+    // Push-constant size of the BDA kernel; table ops keep the descriptor
+    // layout, direct-address ops override this.
+    virtual size_t bda_pc_size() const {
+        return bda_address_table_slots() > 0 ? pc_size_ : 0;
+    }
+    // Number of leading objs_ entries exposed to the BDA shader as an address
+    // table (0 = no generic table).
+    virtual size_t bda_address_table_slots() const { return 0; }
+    // True for ops whose ONE shader module handles both dtypes (Cast, QDQ):
+    // there is no "_fp16" descriptor key, and the BDA key should likewise stay
+    // "<base>_bda" even when the op's fp16_ flag is set.
+    virtual bool bda_variant_ignores_fp16() const { return false; }
+    // Descriptor types for the BDA pipeline. Most variants are descriptor-free
+    // ({}), but an op whose push constant is already full (MatMul) can bind a
+    // SINGLE address-table buffer here and keep the data addresses in it.
+    virtual std::vector<VkDescriptorType> bda_descriptor_types() const {
+        return {};
+    }
+    bool bda_ready() const { return bda_pipeline_ != nullptr; }
+
+    std::unique_ptr<VulkanPipeline> bda_pipeline_;
+    size_t bda_pc_size_ = 0;
+    // Non-null only when bda_descriptor_types() is non-empty (the table slot).
+    VkDescriptorSet bda_ds_ = VK_NULL_HANDLE;
+    bool bda_dispatched_ = false;
+    // Generic per-op address table (see bda_address_table_slots()). Created
+    // and bound by try_build_bda_pipeline; rewritten with vkCmdUpdateBuffer at
+    // each dispatch by fill_bda_table().
+    std::shared_ptr<VulkanBuffer> bda_table_buf_;
+    bool bda_table_ready() const {
+        return bda_address_table_slots() > 0 && bda_table_buf_ != nullptr &&
+               bda_ds_ != VK_NULL_HANDLE;
+    }
+    bool fill_bda_table();
+    // Dispatch through the BDA pipeline + address table when everything is
+    // available. Returns false (and the caller stays on descriptors) when the
+    // archive lacks the key, a buffer is host-imported (no device address), or
+    // BDA is off.
+    bool bda_submit_table(void *ptr, size_t pc_bytes, int width, int height,
+                          int layers) {
+        if (!bda_ready() || !bda_table_ready()) {
+            return false;
+        }
+        if (!fill_bda_table()) {
+            return false;
+        }
+        submit_bda(ptr, pc_bytes, width, height, layers);
+        return true;
+    }
+
+    // Same address-table mechanism for a module the op resolves by name
+    // instead of through shader_key_for -- today only the int64 data twins
+    // (buffer_*_int64). The -DBDA build keeps the descriptor PC and reads the
+    // data pointers from one table at binding 0.
+    struct BdaTableModule {
+        std::unique_ptr<VulkanPipeline> pipeline;
+        VkDescriptorSet ds = VK_NULL_HANDLE;
+        std::shared_ptr<VulkanBuffer> table;
+        size_t pc_bytes = 0;
+        size_t slots = 0;
+    };
+    bool build_bda_table_module(const std::string &key, size_t pc_bytes,
+                                size_t slots, BdaTableModule &m,
+                                VkPipelineCache cache = VK_NULL_HANDLE);
+    bool fill_bda_table_module(BdaTableModule &m);
+    bool fill_bda_table_module(
+        BdaTableModule &m,
+        const std::vector<std::shared_ptr<VulkanResource>> &bufs);
+    bool submit_bda_table_module(BdaTableModule &m, const void *pc, int width,
+                                 int height, int layers);
+    bool submit_bda_table_module(
+        BdaTableModule &m,
+        const std::vector<std::shared_ptr<VulkanResource>> &bufs,
+        const void *pc, int width, int height, int layers);
+
+    // Look up "<primary>_bda"[_fp16] in this op's archive and build the
+    // second pipeline. Missing key, disabled device feature, or a driver
+    // that rejects the module all leave bda_pipeline_ null, which is the
+    // descriptor-only behaviour every existing model expects.
+    void try_build_bda_pipeline(VkPipelineCache cache);
+
+    // Descriptor-free dispatch: push the BDA push constants and dispatch.
+    // objs_ still holds the buffers (bind_ssbo appended them) for lifetime
+    // and for the replay fingerprint.
+    void submit_bda(const void *ptr, size_t pc_size, int width, int height,
+                    int layers) {
+        if (!bda_pipeline_) {
+            throw std::runtime_error(
+                "vkop: submit_bda called without a BDA pipeline");
+        }
+        if (pc_size != bda_pc_size_) {
+            throw std::runtime_error(
+                "vkop: BDA push-constant size does not match the pipeline");
+        }
+        if (bda_ds_ != VK_NULL_HANDLE) {
+            m_cmd_->bind(*bda_pipeline_, bda_ds_);
+        } else {
+            m_cmd_->bind_pipeline(*bda_pipeline_);
+        }
+        bda_dispatched_ = true;
+        if (ptr) {
+            m_cmd_->push_constants(*bda_pipeline_,
+                                   static_cast<uint32_t>(pc_size), ptr);
+        }
+        dispatch_and_record(width, height, layers, ptr, pc_size);
+    }
+
     // Accumulate the fingerprint of ONE DISPATCH -- not of one submit() call.
     // Called from every dispatch site (submit / submit_per_ds / dispatch_on /
     // the branches that bind a secondary pipeline and dispatch directly) when
@@ -545,14 +685,21 @@ class Operator {
     //
     // Cheap: one small alloc + handle reads (handles are already materialized
     // in objs_).
-    void record_fingerprint(void *ptr, int width, int height, int layers) {
+    // pc_bytes overrides the push-constant span copied into the fingerprint.
+    // The BDA variant pushes a LARGER block (addresses included) while
+    // pc_size_ still holds the descriptor kernel's size; without the override
+    // the addresses would be missing from the fingerprint and a buffer change
+    // could replay a stale recording.
+    void record_fingerprint(void *ptr, int width, int height, int layers,
+                            size_t pc_bytes = 0) {
         PassFingerprint p;
         p.w = width;
         p.h = height;
         p.layers = layers;
-        if (ptr && pc_size_ > 0) {
+        const size_t n = pc_bytes != 0 ? pc_bytes : pc_size_;
+        if (ptr && n > 0) {
             p.pc.assign(static_cast<uint8_t *>(ptr),
-                        static_cast<uint8_t *>(ptr) + pc_size_);
+                        static_cast<uint8_t *>(ptr) + n);
         }
         p.handles.reserve(objs_.size());
         for (const auto &r : objs_) {
@@ -612,6 +759,10 @@ class Operator {
     }
 
     virtual void submit(void *ptr, int width, int height, int layers) {
+        // Generic table path: same PC as the descriptor build.
+        if (bda_submit_table(ptr, pc_size_, width, height, layers)) {
+            return;
+        }
         if (!m_ds_[m_id_]) {
             m_ds_[m_id_] = pipeline_->allocDescriptorSets();
         }
@@ -666,6 +817,11 @@ class Operator {
     // buffers on some drivers (e.g. Intel ANV).
     void submit_per_ds(VkDescriptorSet ds, void *ptr, int width, int height,
                        int layers) {
+        // The table is per-op, not per-pass: multi-pass kernels refill objs_
+        // before each call, so the table reflects the pass being recorded.
+        if (bda_submit_table(ptr, pc_size_, width, height, layers)) {
+            return;
+        }
         fillWriteDescriptorSets(ds);
         pipeline_->updateDescriptorSets(writes_);
 
@@ -694,10 +850,11 @@ class Operator {
     // before m_cmd_->dispatch(...); it reads the current push constants from
     // pc_ptr_/pc_size_ and the resource handles from objs_, both of which are
     // materialized by the bind/push that precedes every dispatch.
-    void dispatch_and_record(int w, int h, int z, const void *pc) {
+    void dispatch_and_record(int w, int h, int z, const void *pc,
+                             size_t pc_bytes = 0) {
         m_cmd_->dispatch(w, h, z);
         if (replay_enabled_) {
-            record_fingerprint(const_cast<void *>(pc), w, h, z);
+            record_fingerprint(const_cast<void *>(pc), w, h, z, pc_bytes);
         }
     }
 

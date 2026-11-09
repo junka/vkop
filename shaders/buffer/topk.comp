@@ -14,6 +14,23 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(set=0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaUintBuf b1;
+    BdaUintBuf b2;
+    BdaUintBuf b3;
+} uBdaTable;
+#define uIndice (uBdaTable.b0)
+#define uValue (uBdaTable.b1)
+#define uIndex (uBdaTable.b2)
+#define uInput (uBdaTable.b3)
+#else
 layout(set=0, binding = 0) writeonly buffer indiceBuffer {
     uint data[];
 } uIndice;
@@ -26,6 +43,7 @@ layout(set=0, binding = 2) readonly buffer indexBuffer {
 layout(set=0, binding = 3) readonly buffer inputBuffer {
     uint data[];
 } uInput;
+#endif
 
 layout(push_constant) uniform parameter {
     ivec4 inShape;

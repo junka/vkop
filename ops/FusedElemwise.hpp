@@ -95,6 +95,11 @@ class FusedElemwise : public BufferFactory {
               }(),
               sizeof(FusedElemwisePC), fp16) {}
 
+    // output + kFusedMaxInputs inputs + program.
+    size_t bda_address_table_slots() const override {
+        return 1 + kFusedMaxInputs + 1;
+    }
+
     // Attributes (from the converter):
     //   "ops"        flat int list, 4 per op: {op, dst, a, b}
     //   "input_shapes" flat int list, rank*nInputs dims (left-aligned, padded
@@ -320,8 +325,13 @@ class FusedElemwise : public BufferFactory {
                 prog_built_ = true;
             }
             // Upload (data may have grown if the dims changed across rounds).
+            // Pre-set SHADER_READ so updateBuffer's restore barrier is a real
+            // TRANSFER_WRITE -> SHADER_READ visibility edge.
+            const VkDeviceSize prog_bytes =
+                prog_data_.size() * sizeof(int32_t);
+            prog_buf_->readBarrier(m_cmd_->get(), prog_bytes, 0);
             prog_buf_->updateBuffer(m_cmd_->get(), prog_data_.data(),
-                                    prog_data_.size() * sizeof(int32_t));
+                                    prog_bytes);
             objs_.emplace_back(prog_buf_);
 
             FusedElemwisePC pc{};

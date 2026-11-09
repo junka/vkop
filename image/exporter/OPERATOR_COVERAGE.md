@@ -15,7 +15,7 @@ See [NEW_OPERATORS_SUMMARY.md](./NEW_OPERATORS_SUMMARY.md) for complete implemen
 - **Implementation**: Specialization of the existing Reduce shader with `reduce_op=MEAN (5)`
 - **Files Created**:
   - `ops/ReduceMean.hpp` - C++ operator class using Buffer SSBO backend
-  - Uses existing `buffer_reduce_fp16_spv` shader (shared with Reduce)
+  - Uses existing `buffer_reduce_fp16` shader (shared with Reduce)
 - **Pattern**: Reuses the general Reduce infrastructure, just hardcodes the MEAN operation
 
 ### 2. Min (Element-wise Minimum)

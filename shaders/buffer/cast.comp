@@ -1,5 +1,10 @@
 #version 450 core
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 // Cast SSBO op: fp32 <-> fp16 elementwise conversion.
 //
 // The two directions use different word layouts, so the dispatch size differs:
@@ -17,15 +22,33 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer OutBuf { uint data[]; } uOut;
 layout(set = 0, binding = 1) readonly buffer InBuf { uint data[]; } uIn;
+#endif
 
 layout(push_constant) uniform PC {
     int mode;  // 0 = fp32->fp16, 1 = fp16->fp32
     int total; // input element count
     int _pad0;
     int _pad1;
+#ifdef BDA
+    // Matches ops::cast::CastBdaPC: 16-byte scalar prefix, then out/in.
+    DataBuf uOut;
+    DataBuf uIn;
+#endif
 } uPC;
+
+#ifdef BDA
+#define uOut uPC.uOut
+#define uIn uPC.uIn
+#endif
 
 void main() {
     int gid = int(gl_GlobalInvocationID.x);

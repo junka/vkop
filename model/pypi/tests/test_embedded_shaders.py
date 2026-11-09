@@ -139,9 +139,13 @@ def test_auto_backend_embeds_both_sides(tmp_path):
     # in here -- but shader_map still emits it, as a fallback marker.
     master, _ = fake_master(tmp_path, [
         "buffer_add", "buffer_add_fp16", "image_add", "image_add_fp16",
+        "buffer_add_bda", "buffer_add_bda_fp16",
         "buffer_mul", "buffer_mul_fp16", "image_mul", "image_mul_fp16",
+        "buffer_mul_bda", "buffer_mul_bda_fp16",
         "buffer_gather", "buffer_gather_fp16", "buffer_gather_int64",
-        "buffer_dispatch_from_shape"])
+        "buffer_gather_bda", "buffer_gather_bda_fp16",
+        "buffer_gather_int64_bda",
+        "buffer_dispatch_from_shape", "buffer_dispatch_from_shape_bda"])
     m = tiny_dag()
     m.nodes["g"] = Node("Gather", "g", {"axis": 0},
                         [td("x"), td("i", (1,), 7)], [td("gout")])
@@ -150,7 +154,7 @@ def test_auto_backend_embeds_both_sides(tmp_path):
 
     subset, missing, count = build_shader_subset(m, master, backend="auto")
     assert "buffer_add" in subset and "image_add" in subset
-    assert count == 12
+    assert count == 20
     # Gather has no image variant: shader_map emits the phantom "image_gather"
     # (meaning "fall back to buffer_gather"), which must not be reported as a
     # missing shader -- the spelling the runtime would actually ask for is
@@ -196,11 +200,14 @@ def test_resolve_master_archive_precedence(tmp_path, monkeypatch):
 
 def test_embed_returns_bytes_and_reports_subset(tmp_path, capsys):
     master, _ = fake_master(tmp_path, ["buffer_add", "buffer_mul",
-                                       "buffer_add_fp16", "buffer_mul_fp16"])
+                                       "buffer_add_fp16", "buffer_mul_fp16",
+                                       "buffer_add_bda", "buffer_mul_bda",
+                                       "buffer_add_bda_fp16",
+                                       "buffer_mul_bda_fp16"])
     blob = cli.embed_shader_archive(tiny_dag(), master, backend="auto")
     assert read_master_names(blob) >= {"buffer_add", "buffer_mul"}
     out = capsys.readouterr().out
-    assert "embedded 4 of 4 shader(s)" in out
+    assert "embedded 8 of 8 shader(s)" in out
 
 
 def read_master_names(blob):

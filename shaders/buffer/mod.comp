@@ -4,8 +4,18 @@
 // One thread per output element (fp32) or per uint word (fp16 packed half2).
 // Uses fmod for floating-point modulo (C-style remainder with same sign as dividend).
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #include "../common/buffer_common.comp"
 
+float bin_op(float a, float b) { return a - b * floor(a / b); }
+
+#ifdef BDA
+#include "../common/binary_bda_body.comp"
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) writeonly buffer Output {
@@ -43,7 +53,7 @@ layout(push_constant) uniform PC_uPC {
     int _pad;
 } uPC;
 
-float bin_op(float a, float b) { return a - b * floor(a / b); }
+
 
 float loadelem(int linear, IArr8 out_d, IArr8 in0_d) {
     if (uPC.broadcast == 0) {
@@ -115,3 +125,4 @@ void main() {
     uOutput.data[gid] = floatBitsToUint(r);
 #endif
 }
+#endif

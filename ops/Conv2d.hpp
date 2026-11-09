@@ -336,6 +336,9 @@ class Conv2dBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // out, X, W, scratch, bias, per-channel scale.
+    size_t bda_address_table_slots() const override { return 6; }
+
     void set_runtime_device(const std::shared_ptr<VulkanDevice> &dev,
                             const std::shared_ptr<VulkanCommandPool> &cmdpool,
                             VkPipelineCache cache = VK_NULL_HANDLE) override {
@@ -343,7 +346,7 @@ class Conv2dBuffer : public BufferFactory {
         if (fp16_ != 0 && !pack_pipeline_) {
             bool use_uab = update_after_bind_ &&
                            dev->is_support_descriptor_update_after_bind();
-            // The pack shader (buffer_matmul_pack_spv) declares 4 bindings
+            // The pack shader (buffer_matmul_pack) declares 4 bindings
             // (Out=0, Scratch=3); we bind 6 (matching the reduce pipeline) so
             // the same objs_ vector feeds both passes — the extra bias/scale
             // slots are inert in the pack shader.

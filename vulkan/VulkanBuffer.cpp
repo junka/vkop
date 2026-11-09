@@ -27,7 +27,8 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
     vkGetBufferMemoryRequirements(m_vdev_->getLogicalDevice(), m_buffer_,
                                   &mem_requirements);
 #endif
-    allocMemory(mem_requirements, requireProperties, ext_fd);
+    allocMemory(mem_requirements, requireProperties, ext_fd,
+                /*allow_buffer_device_address=*/true);
     vkBindBufferMemory(m_vdev_->getLogicalDevice(), m_buffer_, getMemory(), 0);
 #else
     (void)ext_fd;
@@ -84,8 +85,24 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = size;
+    // Deliberately NOT adding VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT here.
+    // VK_EXT_external_memory_host imports foreign memory, and whether the
+    // driver accepts VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT on it is not
+    // covered by the device-init probe (which allocates ordinary memory). A
+    // rejected flag would fail the whole import and take the per-step input
+    // path down with it, so host-imported buffers stay descriptor-only until
+    // that combination is measured on every target.
     buffer_info.usage = usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    // A buffer bound to imported host memory must declare that external handle
+    // type at creation; vkBindBufferMemory otherwise violates
+    // VUID-vkBindBufferMemory-memory-02985.
+    VkExternalMemoryBufferCreateInfo external_info{};
+    external_info.sType =
+        VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
+    external_info.handleTypes =
+        VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT;
+    buffer_info.pNext = &external_info;
     auto ret = vkCreateBuffer(m_vdev_->getLogicalDevice(), &buffer_info,
                               nullptr, &ext_buffer_);
     if (ret != VK_SUCCESS) {
@@ -198,12 +215,43 @@ VkBuffer VulkanBuffer::getBuffer() const {
 #endif
 }
 
+VkDeviceAddress VulkanBuffer::getDeviceAddress() const {
+    if (!hasDeviceAddress()) {
+        throw std::runtime_error(
+            "vkop: VulkanBuffer::getDeviceAddress on a buffer without "
+            "VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT (device BDA "
+            "unsupported, or a host-imported buffer)");
+    }
+    if (parent_) {
+        // A view addresses the same allocation at its window offset. The
+        // caller must have chosen a shader whose buffer_reference_align
+        // divides this offset (the descriptor path has no such constraint).
+        return parent_->getDeviceAddress() + range_offset_;
+    }
+    if (device_address_ == 0) {
+        device_address_ = m_vdev_->getBufferDeviceAddress(getBuffer());
+        if (device_address_ == 0) {
+            throw std::runtime_error(
+                "vkop: vkGetBufferDeviceAddress returned 0 for a buffer "
+                "created without VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT");
+        }
+    }
+    return device_address_;
+}
+
 void VulkanBuffer::createBuffer(VkBufferUsageFlags usage,
                                 VkMemoryPropertyFlags requireProperties) {
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = m_size_;
+    // One choke point for every device buffer (tensors, scratch, indirect
+    // args): make it addressable only when the device actually enabled BDA.
+    // On a non-BDA device the usage flags are byte-for-byte what they were.
     buffer_info.usage = usage;
+    if (m_vdev_->is_support_buffer_device_address()) {
+        buffer_info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        bda_capable_ = true;
+    }
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     buffer_info.queueFamilyIndexCount = 0;
     buffer_info.pQueueFamilyIndices = nullptr;

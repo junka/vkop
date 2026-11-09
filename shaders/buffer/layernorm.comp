@@ -1,4 +1,10 @@
 #version 450 core
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #include "../common/subgroup_reduce.comp"
 
 // LayerNorm SSBO op. Normalizes over the last `inner_size` elements (the
@@ -23,6 +29,13 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
@@ -41,13 +54,33 @@ layout(set = 0, binding = 3) readonly buffer Bias {
 layout(set = 0, binding = 4) readonly buffer Skip {
     uint data[];
 } uSkip;
+#endif
 
 layout(push_constant) uniform PC_uLN {
     float eps;
     int inner_size;   // number of elements normalized together
     int outer_size;   // number of independent normalization slices
     int has_skip;     // 1 = add uSkip to x before the reduce (fused residual)
+#ifdef BDA
+    // Matches ops::LayerNormBdaPC: 16-byte scalar prefix, then out/x/w/b/skip
+    // addresses (skip aliases x when has_skip == 0).
+    DataBuf uOutput;
+    DataBuf uInput;
+    DataBuf uWeight;
+    DataBuf uBias;
+    DataBuf uSkip;
+#endif
 } uLN;
+
+#ifdef BDA
+// Alias the SSBO names to the address block members so the math below is one
+// source for both builds.
+#define uOutput uLN.uOutput
+#define uInput uLN.uInput
+#define uWeight uLN.uWeight
+#define uBias uLN.uBias
+#define uSkip uLN.uSkip
+#endif
 
 // Pass 1 partials, (sum, sum_sq) packed so the subgroup build folds both with
 // one vec2 op; the tree build adds the two components in place, in the same

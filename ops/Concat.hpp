@@ -166,6 +166,9 @@ class ConcatBuffer : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // out + the current pass's input.
+    size_t bda_address_table_slots() const override { return 2; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {
@@ -188,6 +191,8 @@ class ConcatBuffer : public BufferFactory {
         pipeline_int64_ = std::make_unique<VulkanPipeline>(
             m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
             use_uab, required_subgroup_size_);
+        build_bda_table_module("buffer_concat_int64_bda", pc_size_, 2,
+                               bda_i64_);
     }
 
     // Route the int64 path through the int64 GPU shader (concat_int64.comp).
@@ -235,14 +240,17 @@ class ConcatBuffer : public BufferFactory {
             fill_dims(pc.outDims, out_shape);
             pc.offset = offset;
 
-            fillWriteDescriptorSets(pass_ds[i]);
-            pipeline_int64_->updateDescriptorSets(writes_);
-            m_cmd_->bind(*pipeline_int64_, pass_ds[i]);
-            m_cmd_->push_constants(*pipeline_int64_,
-                                   static_cast<uint32_t>(pc_size_), &pc);
-            m_cmd_->dispatch(UP_DIV(in_total, 256), 1, 1);
-            if (replay_enabled_) {
-                record_fingerprint(&pc, UP_DIV(in_total, 256), 1, 1);
+            if (!submit_bda_table_module(bda_i64_, &pc, UP_DIV(in_total, 256),
+                                         1, 1)) {
+                fillWriteDescriptorSets(pass_ds[i]);
+                pipeline_int64_->updateDescriptorSets(writes_);
+                m_cmd_->bind(*pipeline_int64_, pass_ds[i]);
+                m_cmd_->push_constants(*pipeline_int64_,
+                                       static_cast<uint32_t>(pc_size_), &pc);
+                m_cmd_->dispatch(UP_DIV(in_total, 256), 1, 1);
+                if (replay_enabled_) {
+                    record_fingerprint(&pc, UP_DIV(in_total, 256), 1, 1);
+                }
             }
             offset += in_shape[axis_];
         }
@@ -460,6 +468,7 @@ class ConcatBuffer : public BufferFactory {
 
     // int64-data GPU path state. Lazily built on first int64 execute.
     std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    BdaTableModule bda_i64_;
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

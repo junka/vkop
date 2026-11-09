@@ -23,6 +23,25 @@ layout(local_size_x = 16, local_size_y = 16) in;
 
 #include "../common/activation.comp"
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaUintBuf {
+    uint data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaUintBuf b0;
+    BdaUintBuf b1;
+    BdaUintBuf b2;
+    BdaUintBuf b3;
+    BdaUintBuf b4;
+} uBdaTable;
+#define bufferY (uBdaTable.b0)
+#define bufferA (uBdaTable.b1)
+#define bufferB (uBdaTable.b2)
+#define bufferC (uBdaTable.b3)
+#define bufferS (uBdaTable.b4)
+#else
 layout(set=0, binding = 0) writeonly buffer BufferY {
     uint data[];
 } bufferY;
@@ -46,6 +65,7 @@ layout(set=0, binding = 3) readonly buffer BufferC {
 layout(set=0, binding = 4) readonly buffer BufferScale {
     uint data[];
 } bufferS;
+#endif
 
 layout(push_constant) uniform paraBuffer {
     int M; // 行数

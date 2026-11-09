@@ -1,0 +1,74 @@
+#ifndef UNARY_ELEMENTWISE_BODY_COMP
+#define UNARY_ELEMENTWISE_BODY_COMP
+
+// Shared body for the elementwise unary shaders (shaders/buffer/<op>.comp).
+//
+// The including shader provides:
+//   - `#version 450 core`,
+//   - for the -DBDA build, the GL_EXT_buffer_reference(+2) extensions,
+//   - #include "../common/buffer_common.comp",
+//   - `float apply(float x)`.
+//
+// The single source then compiles four ways, exactly like the DUAL_FP16
+// pattern:
+//   (base)        -> <base>
+//   -DFP16        -> <base>_fp16
+//   -DBDA         -> <base>_bda
+//   -DFP16 -DBDA  -> <base>_bda_fp16
+// The BDA build replaces the two SSBO bindings with addresses appended to the
+// push constant (ops::UnaryBdaPC), so the math and the loop stay single-source.
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    int total;
+    int _pad;
+#ifdef BDA
+    // Matches ops::UnaryBdaPC: the shape prefix above is 80 bytes, then the
+    // two 64-bit addresses.
+    DataBuf uInput;
+    DataBuf uOutput;
+#endif
+} uPC;
+
+#ifdef BDA
+#define U_INPUT(gid) uPC.uInput.data[gid]
+#define U_OUTPUT(gid) uPC.uOutput.data[gid]
+#else
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+#define U_INPUT(gid) uInput.data[gid]
+#define U_OUTPUT(gid) uOutput.data[gid]
+#endif
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    vec2 p = unpackHalf2x16(U_INPUT(gid));
+    p.x = apply(p.x);
+    if (2 * gid + 1 < uPC.total) {
+        p.y = apply(p.y);
+    }
+    U_OUTPUT(gid) = packHalf2x16(p);
+#else
+    if (gid >= uPC.total) return;
+    U_OUTPUT(gid) = floatBitsToUint(apply(uintBitsToFloat(U_INPUT(gid))));
+#endif
+}
+
+#endif // UNARY_ELEMENTWISE_BODY_COMP

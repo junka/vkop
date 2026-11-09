@@ -2,7 +2,7 @@
 // Where op tests. Where is SSBO-only (no image path), so every case drives
 // create_from_type(..., backend_buffer=true) like BufferRankTest — no env var
 // needed for the backend. Two shader/data paths are covered:
-//   - fp32 GPU path (buffer_where_spv / where.comp): per-index select, no
+//   - fp32 GPU path (buffer_where / where.comp): per-index select, no
 //     broadcast in the shader → same-shape cond/X/Y only.
 //   - int64 path (the shape-meta chain added in 67e6b10): host-evaluated
 //     cpuWhereInt64 by default (VKOP_HOST_SHAPE on), GPU where_int64.comp

@@ -52,6 +52,31 @@
 
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+// One address table at binding 0 (same PC as the descriptor build), filled by
+// Operator::fill_bda_table() in binding order.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer AttnBuf {
+    uint data[];
+};
+layout(set = 0, binding = 0) readonly buffer AttnTable {
+    AttnBuf b0;
+    AttnBuf b1;
+    AttnBuf b2;
+    AttnBuf b3;
+    AttnBuf b4;
+    AttnBuf b5;
+    AttnBuf b6;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uQ (uBdaTable.b1)
+#define uK (uBdaTable.b2)
+#define uV (uBdaTable.b3)
+#define uMask (uBdaTable.b4)
+#define uCacheIn (uBdaTable.b5)
+#define uCacheOut (uBdaTable.b6)
+#else
 layout(set = 0, binding = 0) buffer Output {
     uint data[];
 } uOutput;
@@ -73,6 +98,7 @@ layout(set = 0, binding = 5) readonly buffer CacheIn {
 layout(set = 0, binding = 6) buffer CacheOut {
     uint data[];
 } uCacheOut;
+#endif
 
 layout(push_constant) uniform PC_ATTN {
     float scale;      // 1/sqrt(head_dim), folded by the converter

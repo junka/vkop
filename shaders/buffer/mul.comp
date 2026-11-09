@@ -6,9 +6,22 @@
 
 // activation.comp expects FLOAT/FLOAT4/FLOAT2 to be pre-defined, so it
 // must come AFTER buffer_common.comp (which defines them for both builds).
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
 #include "../common/buffer_common.comp"
 #include "../common/activation.comp"
 
+#define BINARY_HAS_ACTIVATION 1
+
+float bin_op(float a, float b) { return a * b; }
+
+#ifdef BDA
+#include "../common/binary_bda_body.comp"
+#else
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 layout(set = 0, binding = 0) writeonly buffer Output {
@@ -50,7 +63,7 @@ layout(push_constant) uniform PC_uPC {
     int _pad;
 } uPC;
 
-float bin_op(float a, float b) { return a * b; }
+
 
 // Dims are threaded in so broadcast==2 reads the shape SSBOs ONCE (in main)
 // rather than per element. For broadcast==0/1 the PC dims are used directly.
@@ -127,3 +140,4 @@ void main() {
     uOutput.data[gid] = floatBitsToUint(r);
 #endif
 }
+#endif

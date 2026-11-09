@@ -3,6 +3,7 @@
 #define OPS_ROTARY_EMBEDDING_HPP_
 
 #include "ops/PimplFacade.hpp"
+#include <cstring>
 #include <memory>
 
 #include "Operator.hpp"
@@ -52,6 +53,28 @@ struct alignas(16) RotaryPC {
 };
 static_assert(sizeof(RotaryPC) <= 128, "RotaryPC PC overflow");
 
+// Device-address variant. The base struct's alignas(16) tail padding (48 vs the
+// last field ending at 40) is NOT part of the std430 layout, so the pointers
+// are listed explicitly at offset 40.
+struct alignas(8) RotaryBdaPC {
+    int total;
+    int head_dim;
+    int num_heads;
+    int seq;
+    int input_untransposed;
+    int seq_major;
+    int rotary_dim;
+    int cs_fp32;
+    int comp;
+    int in_seq_stride;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress x_addr;
+    VkDeviceAddress cos_addr;
+    VkDeviceAddress sin_addr;
+};
+static_assert(offsetof(RotaryBdaPC, out_addr) == 40, "RotaryBdaPC drift");
+static_assert(sizeof(RotaryBdaPC) == 72, "RotaryBdaPC drift");
+
 // Buffer-backend (SSBO) RotaryEmbedding. Half-split (non-interleaved); 整维旋转
 // (rotary_dim == head_dim) 或 partial rotary（cos/sin
 // 行宽更窄时，超出的一段直通）。The shader runs ONE THREAD PER OUTPUT WORD (two
@@ -73,6 +96,9 @@ class RotaryEmbeddingBuffer : public BufferFactory {
           fp16_(fp16) {
         update_after_bind_ = true;
     }
+
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(RotaryBdaPC); }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -178,6 +204,10 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         // count alone cannot tell the two apart ([1,S,H,D] and [S,H,D] hold
         // the same number), so the shape has to be compared too — the same
         // guard Attention's seq_major resize uses.
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> x_buf;
+        std::shared_ptr<VulkanBuffer> cos_buf;
+        std::shared_ptr<VulkanBuffer> sin_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
             auto output = core::as_tensor<T>(outputs[0]);
@@ -185,19 +215,19 @@ class RotaryEmbeddingBuffer : public BufferFactory {
                 (input_component_ >= 0 && output->getShape() != out_shape)) {
                 output->resize(out_shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false); // X
+            x_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false); // X
         });
         dispatch_by_dtype(inputs[1]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            bind_ssbo<T>(inputs[1], /*is_output=*/false); // cos
+            cos_buf = bind_ssbo<T>(inputs[1], /*is_output=*/false); // cos
         });
         dispatch_by_dtype(inputs[2]->dtype(), [&](auto type_tag) {
             using T = decltype(type_tag);
-            bind_ssbo<T>(inputs[2], /*is_output=*/false); // sin
+            sin_buf = bind_ssbo<T>(inputs[2], /*is_output=*/false); // sin
         });
 
         RotaryPC pc{};
@@ -218,12 +248,28 @@ class RotaryEmbeddingBuffer : public BufferFactory {
         // Dispatch: fp16 packs 2 elements/word and the shader runs one thread
         // per output word (race-free whole-word write, [[expand-fp16-race]]);
         // fp32 is 1 element/word so one thread per element.
-        if (fp16_) {
-            int words = (total + 1) / 2;
-            submit(&pc, UP_DIV(words, 256), 1, 1);
-        } else {
-            submit(&pc, UP_DIV(total, 256), 1, 1);
+        const int nthreads = fp16_ ? (total + 1) / 2 : total;
+        const int groups = UP_DIV(nthreads, 256);
+        if (bda_ready() && out_buf && x_buf && cos_buf && sin_buf &&
+            out_buf->hasDeviceAddress() && x_buf->hasDeviceAddress() &&
+            cos_buf->hasDeviceAddress() && sin_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress x_addr = x_buf->getDeviceAddress();
+            const VkDeviceAddress cos_addr = cos_buf->getDeviceAddress();
+            const VkDeviceAddress sin_addr = sin_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (x_addr % 4) == 0 &&
+                (cos_addr % 4) == 0 && (sin_addr % 4) == 0) {
+                RotaryBdaPC bpc{};
+                std::memcpy(&bpc, &pc, offsetof(RotaryBdaPC, out_addr));
+                bpc.out_addr = out_addr;
+                bpc.x_addr = x_addr;
+                bpc.cos_addr = cos_addr;
+                bpc.sin_addr = sin_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
         }
+        submit(&pc, groups, 1, 1);
     }
 
   private:

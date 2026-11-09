@@ -42,6 +42,9 @@ class ScatterElements : public BufferFactory {
         update_after_bind_ = true;
     }
 
+    // data, int64 indices, updates.
+    size_t bda_address_table_slots() const override { return 3; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("axis") != attributes.end()) {

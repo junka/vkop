@@ -6,6 +6,7 @@
 #include "ops/BufferBase.hpp"
 #include "ops/PimplFacade.hpp"
 #include "ops/ReduceTypes.hpp"
+#include <cstring>
 namespace vkop {
 namespace ops {
 
@@ -143,6 +144,9 @@ class ReduceBuffer : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(ReducePC), fp16) {}
 
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(ReduceBdaPC); }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("reduce_op") != attributes.end()) {
@@ -199,17 +203,19 @@ class ReduceBuffer : public BufferFactory {
             }
         }
 
+        std::shared_ptr<VulkanBuffer> out_buf;
+        std::shared_ptr<VulkanBuffer> in_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);
             if (output->num_elements() != total_elems(out_shape)) {
                 output->resize(out_shape);
             }
-            bind_ssbo<T>(outputs[0], /*is_output=*/true);
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
         });
         dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
-            bind_ssbo<T>(inputs[0], /*is_output=*/false);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
         });
 
         ReducePC pc{};
@@ -241,7 +247,21 @@ class ReduceBuffer : public BufferFactory {
         // fp16 packs two output elements per uint word; dispatch one thread
         // per output word. fp32 dispatches one thread per output element.
         int nthreads = (fp16_ != 0) ? (out_total + 1) / 2 : out_total;
-        submit(&pc, UP_DIV(nthreads, 256), 1, 1);
+        const int groups = UP_DIV(nthreads, 256);
+        if (bda_ready() && out_buf && in_buf && out_buf->hasDeviceAddress() &&
+            in_buf->hasDeviceAddress()) {
+            const VkDeviceAddress out_addr = out_buf->getDeviceAddress();
+            const VkDeviceAddress in_addr = in_buf->getDeviceAddress();
+            if ((out_addr % 4) == 0 && (in_addr % 4) == 0) {
+                ReduceBdaPC bpc{};
+                std::memcpy(&bpc, &pc, offsetof(ReduceBdaPC, out_addr));
+                bpc.out_addr = out_addr;
+                bpc.in_addr = in_addr;
+                submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+                return;
+            }
+        }
+        submit(&pc, groups, 1, 1);
     }
 
     int reduce_op_ = static_cast<int>(reduce::ReduceType::SUM);

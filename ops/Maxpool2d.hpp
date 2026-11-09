@@ -216,6 +216,9 @@ class Maxpool2dBuffer : public BufferFactory {
         pads_.reserve(2);
     }
 
+    // output + input.
+    size_t bda_address_table_slots() const override { return 2; }
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("auto_pad") != attributes.end()) {
