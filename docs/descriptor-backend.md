@@ -131,3 +131,40 @@ A B B A 交替；A = 默认（descriptor buffer），B = `VKOP_NO_DESCRIPTOR_BUF
   67.56 ms/token / MatMul 54.96（凉机），unfused 62.09 / 50.90。本次重转日志为
   `fuse_swiglu_down_proj match (28 fused)`，即 fused 形态；A 臂 66.47 / 54.3、
   B 臂 63.31 / 55.0，与记录中的 fused 基线一致，没有回归。
+
+## b3（RTX 4000 Ada）decode A/B（2026-11-09）
+
+代码用 `git ls-files` 同步到 `b3:~/vkop_b6a23352`（b3 无 git），新建
+`build_llm`：`g++-13`、`-O0 -g`（与仓库硬编码一致）、
+`-DENABLE_TESTS=OFF -DENABLE_LLM_CHAT=ON -DENABLE_EXAMPLE=OFF
+-DENABLE_BENCHMARK=OFF -DUSE_PLATFORM_XCB=OFF -DUSE_PLATFORM_XLIB=OFF`，
+glslc 用 `/tmp/shaderc_b3/bin/glslc`（需 `LD_LIBRARY_PATH=/tmp/shaderc_b3/lib`）。
+b3 没有 libutf8proc-dev，从开发机拷 `utf8proc.h` + `libutf8proc.a`，
+`-DUTF8PROC_ROOT=~/vkop_run/utf8proc -DCMAKE_EXE_LINKER_FLAGS=-L.../utf8proc/lib`。
+
+同一份重转模型、同一 prompt/参数（`max_new=14 --max-kv 128`，RAW prompt，
+GPU argmax），每臂 6 次进程 A B B A 交替。A = 默认（独显策略：descriptor
+set），B = `VKOP_DESCRIPTOR_BUFFER=1`。b3 的 NVIDIA EGL atexit 会在 main
+返回后 SIGSEGV，按输出判读。
+
+| | A: descriptor set（默认） | B: descriptor buffer（强制） |
+|---|---|---|
+| 稳态 per-step 中位（r≥6） | **27.95 ms** | 30.35 ms（+8.6%） |
+| 稳态 per-step min / mean | 26.90 / 28.61 | 29.20 / 31.22 |
+| `[submitprof]` decode TOTAL 中位 | 13.32 ms | 13.32 ms |
+| `[submitprof]` MatMul 中位 | 11.89 ms | 11.88 ms |
+| 稳态 `update` 中位 | 0.150 ms/步 | 0.170 ms/步 |
+| 稳态 `bind_ds` 中位 | 0.150 ms/步 | 0.170 ms/步 |
+| 加载期 set 分配 | 2040 次 | 0 |
+
+结论：
+
+- GPU kernel 时间完全相同（TOTAL/MatMul 到 0.01 ms），但 b3 上强制
+  descriptor buffer 的 per-step wall 稳定慢 ~2.4 ms（8.6%）。这是独显 +
+  host-visible descriptor 内存的额外取描述符/命令处理开销，且
+  `vkGetDescriptorEXT` 在 NVIDIA 驱动上比 Mesa 贵；这就是默认只在 UMA
+  启用、独显要 `VKOP_DESCRIPTOR_BUFFER=1` 才开的原因。b3 默认臂不受影响。
+- 跨机器对照（同代码、同 -O0、同模型）：ARL 稳态 ~70.75 ms/token、
+  GPU TOTAL 58.6 ms、MatMul 54.3 ms；b3 默认臂 27.95 / 13.32 / 11.89，
+  即 wall ~2.5x、GPU ~4.4x、MatMul ~4.6x。b3 上 wall 与 GPU 的差距来自
+  600 个 op 的 CPU 录制开销（GPU 太快，CPU 不再被隐藏）。
