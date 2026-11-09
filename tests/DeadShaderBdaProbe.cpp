@@ -430,6 +430,62 @@ void test_coop_inwg(int M, int N, int K, int bm, int bn) {
     }
 }
 
+// ---- coop16 in-workgroup split-K (single dispatch, fp32 scratch out) -----
+// The 16x16x16 twin above: BM=32/BN=64 from the default SG_M=2/SG_N=4 split,
+// and with ENABLE_HALF2_EPI off the epilogue stores fp32 [M,N] to binding 3,
+// not half2 to binding 0. Slot 0 therefore stays a dummy.
+void test_coop16_inwg(int M, int N, int K) {
+    auto a = std::make_shared<Tensor<uint16_t>>(std::vector<int>{M, K});
+    auto b = std::make_shared<Tensor<uint16_t>>(std::vector<int>{K, N});
+    auto out = std::make_shared<Tensor<float>>(std::vector<int>{M, N});
+    std::vector<uint16_t> av(M * K), bv(K * N);
+    std::vector<float> af(M * K), bf(K * N);
+    for (int i = 0; i < M * K; ++i) {
+        af[i] = 0.25F * static_cast<float>((i * 7) % 11 - 5);
+        av[i] = ITensor::fp32_to_fp16(af[i]);
+    }
+    for (int i = 0; i < K * N; ++i) {
+        bf[i] = 0.25F * static_cast<float>((i * 5) % 13 - 6);
+        bv[i] = ITensor::fp32_to_fp16(bf[i]);
+    }
+    auto ab = upload(a, av);
+    auto bb = upload(b, bv);
+    auto ob = new_output(out);
+    vkop::ops::matmul::GpuMatMulParam pc{};
+    pc.M = M;
+    pc.N = N;
+    pc.K = K;
+    pc.C = 1;
+    pc.ksplit = 2;
+    Step s{"buffer_matmul_coop16_inwg_bda", "buffer_matmul_coop16_inwg",
+           {ab, ab, bb, ob, ab, ab}, &pc, sizeof(pc), (N + 63) / 64,
+           (M + 31) / 32, 1, nullptr};
+    if (!run_steps("coop16_inwg", {s})) {
+        return;
+    }
+    out->copyToCPU(g_pool);
+    int bad = 0;
+    for (int m = 0; m < M; ++m) {
+        for (int n = 0; n < N; ++n) {
+            float want = 0.0F;
+            for (int k = 0; k < K; ++k) {
+                want += af[m * K + k] * bf[k * N + n];
+            }
+            const float got = (*out)[m * N + n];
+            if (std::fabs(got - want) >
+                std::max(std::fabs(want) * 0.02F, 0.05F)) {
+                ++bad;
+            }
+        }
+    }
+    if (bad) {
+        std::printf("FAIL: coop16 inwg (%d bad)\n", bad);
+        failures++;
+    } else {
+        std::printf("PASS: coop16 inwg %dx%dx%d\n", M, N, K);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -477,6 +533,14 @@ int main() {
         test_coop_inwg(16, 32, 64, 16, 32);
     } else {
         std::printf("SKIP: 8x8x16 coopmat not listed\n");
+    }
+
+    // coop16.comp's INWG build is the 16x16x16 tile: Ada only, and K >= 4
+    // K_BLOCK so the cs=2 slices keep >= 2 MMAs each (the route's host guard).
+    if (g_dev->supports_coopmat_fp16_tile(16, 16, 16)) {
+        test_coop16_inwg(32, 64, 128);
+    } else {
+        std::printf("SKIP: 16x16x16 coopmat not listed\n");
     }
 
     std::printf(failures ? "RESULT: %d FAILURE(S)\n" : "RESULT: all pass\n",

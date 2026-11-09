@@ -672,13 +672,17 @@ vkop_shader_variant(buffer_matmul_coop_splitk_fold_bda buffer/matmul_coop
 # cross-pass reduction in shared memory. Both tile sizes ship a key; the host
 # still treats the route as unavailable (KernelSelect's kCoopmatInwg retry),
 # so the bytes are probe/bench-only until the dispatch branch lands. Host
-# guard: ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK.
+# guard: ACC_M==ACC_N==1 + N even + K/cs >= 2*K_BLOCK. BDA twins match the
+# descriptor keys one-for-one so the dead-route table dispatch in
+# tests/DeadShaderBdaProbe.cpp can A/B them.
 vkop_shader_variant(buffer_matmul_coop_inwg buffer/matmul_coop
                     -DSPLITK_INWG)
 vkop_shader_variant(buffer_matmul_coop_inwg_bda buffer/matmul_coop
                     -DSPLITK_INWG -DBDA)
 vkop_shader_variant(buffer_matmul_coop16_inwg buffer/matmul_coop16_inwg
                     -DSPLITK_INWG)
+vkop_shader_variant(buffer_matmul_coop16_inwg_bda buffer/matmul_coop16_inwg
+                    -DSPLITK_INWG -DBDA)
 
 # ARL fp16 workgroup BM/BN variants over macroized matmul_coop.comp.
 # All share the same MMA tile (CM=CN=CK=8/8/16); only SG_M/SG_N/BM/BN
