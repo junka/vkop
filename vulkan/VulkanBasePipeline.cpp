@@ -186,11 +186,30 @@ void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags,
             if (descriptor_buffer_stride_ == 0) {
                 throw std::runtime_error("empty descriptor set layout");
             }
+            // Descriptor memory is host-written, but the GPU also fetches from
+            // it at dispatch time. A device-local+host-visible type (BAR on a
+            // discrete GPU, the one UMA type on an iGPU) keeps that fetch
+            // local; without it the driver reads descriptors from system RAM
+            // over PCIe, which on b3 costs ~2.4 ms per Qwen3-VL round (same
+            // GPU timestamps, slower wall). Fall back to plain host-visible
+            // when the device exposes no such type (or the BAR is too small).
+            VkMemoryPropertyFlags db_mem = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+            const VkMemoryPropertyFlags db_want =
+                db_mem | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+            VkPhysicalDeviceMemoryProperties db_mem_props{};
+            vkGetPhysicalDeviceMemoryProperties(vdev_->getPhysicalDevice(),
+                                                &db_mem_props);
+            for (uint32_t i = 0; i < db_mem_props.memoryTypeCount; ++i) {
+                if ((db_mem_props.memoryTypes[i].propertyFlags & db_want) ==
+                    db_want) {
+                    db_mem = db_want;
+                    break;
+                }
+            }
             descriptor_buffer_storage_ = std::make_unique<VulkanBuffer>(
                 vdev_keep_, descriptor_buffer_stride_ * kDescriptorBufferSlots,
-                VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT, db_mem);
             descriptor_buffer_map_ =
                 descriptor_buffer_storage_->getMappedMemory();
             descriptor_buffer_address_ =

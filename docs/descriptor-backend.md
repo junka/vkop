@@ -132,7 +132,7 @@ A B B A 交替；A = 默认（descriptor buffer），B = `VKOP_NO_DESCRIPTOR_BUF
   `fuse_swiglu_down_proj match (28 fused)`，即 fused 形态；A 臂 66.47 / 54.3、
   B 臂 63.31 / 55.0，与记录中的 fused 基线一致，没有回归。
 
-## b3（RTX 4000 Ada）decode A/B（2026-11-09）
+## b3（RTX 4000 Ada）decode A/B（2026-11-09，修复前）
 
 代码用 `git ls-files` 同步到 `b3:~/vkop_b6a23352`（b3 无 git），新建
 `build_llm`：`g++-13`、`-O0 -g`（与仓库硬编码一致）、
@@ -168,3 +168,67 @@ set），B = `VKOP_DESCRIPTOR_BUFFER=1`。b3 的 NVIDIA EGL atexit 会在 main
   GPU TOTAL 58.6 ms、MatMul 54.3 ms；b3 默认臂 27.95 / 13.32 / 11.89，
   即 wall ~2.5x、GPU ~4.4x、MatMul ~4.6x。b3 上 wall 与 GPU 的差距来自
   600 个 op 的 CPU 录制开销（GPU 太快，CPU 不再被隐藏）。
+
+### 修复前那一版说明
+
+上面 b3 表的 A 臂是默认 descriptor set，B 臂是强制 descriptor buffer；B 慢
+~2.4 ms/步。下面追查这 2.4 ms 从哪来。
+
+## b3 追查：不是 `vkGetDescriptorEXT`，是 descriptor 内存位置
+
+新增 `tests/DescriptorBufferProbe`（独立探针，非 gtest；无扩展时 SKIP），
+直接测 host 侧 API：
+
+| 项目 | ARL (Mesa) | b3 (NVIDIA 595.99) |
+|---|---|---|
+| `vkGetDescriptorEXT` | 17.7 ns/call | **4.0 ns/call** |
+| `vkUpdateDescriptorSets`（7 writes） | 115–131 ns/call | 49.7 ns/call |
+| `vkCmdBindDescriptorSets`（录制） | 5.4 ns/cmd | 46.5 ns/cmd |
+| `vkCmdSetDescriptorBufferOffsetsEXT`（buffer 已绑） | 5.1 ns/cmd | 10.9 ns/cmd |
+| bind buffer + set offsets（录制） | 5.2 ns/cmd | 13.7 ns/cmd |
+
+结论：**`vkGetDescriptorEXT` 在 b3 上不但没有额外开销，反而比
+`vkUpdateDescriptorSets` 还便宜**；descriptor-buffer 命令的录制也比
+`vkCmdBindDescriptorSets` 便宜。host 侧不是那 2.4 ms 的来源。
+
+真正的原因：descriptor buffer 原来分配在 `HOST_VISIBLE|HOST_COHERENT`
+（b3 上是 system RAM，heap 1），GPU 每次 dispatch 都要通过 PCIe 取描述符。
+`[submitprof]` 是 shader 内的时间戳，看不到命令处理器取 descriptor 的开销，
+所以表现为「GPU 时间相同、wall 变慢」。
+
+b3 的内存类型里有：
+
+```
+[4] heap=2 246 MiB flags=0x7 DEVICE_LOCAL HOST_VISIBLE HOST_COHERENT  (BAR1)
+```
+
+## 规避 / 修复
+
+`VulkanBasePipeline` 分配 descriptor buffer 时优先选
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（iGPU 的 UMA 类型、独显的 BAR），
+没有这种类型（或 BAR 太小分配失败）时回落到原来的
+`HOST_VISIBLE|HOST_COHERENT`。ARL 的 type 0 本来就是
+`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`，行为不变。
+
+修复后重跑同一组 b3 A/B（A B B A × 3，r≥6 稳态）：
+
+| | A: descriptor set（默认） | B: descriptor buffer（强制） |
+|---|---|---|
+| per-step 中位 | 27.10 ms | 27.65 ms（+2.0%） |
+| per-step mean / min | 27.32 / 26.80 | 27.90 / 27.20 |
+| GPU decode TOTAL 中位 | 13.31 ms | 13.03 ms |
+| MatMul 中位 | 11.89 ms | 11.77 ms |
+| 稳态 update / bind_ds | 0.140 / 0.140 ms | 0.150 / 0.150 ms |
+
+2.4 ms（8.6%）的额外开销降到 ~0.55 ms（2.0%），GPU 时间两臂一致（B 甚至
+略低，属噪声）。剩余 ~0.55 ms 来自每个 op 多一条
+`vkCmdBindDescriptorBuffersEXT`（默认是每 op 一个 command buffer，describe
+buffer 绑定不能跨 command buffer 复用），host 侧录制只差 ~8 ns/op，剩下是
+命令处理开销。这已经进入 iGPU/dGPU 噪声带；结论仍是：
+
+- 默认策略保持：UMA 开、独显关（`VKOP_DESCRIPTOR_BUFFER=1` 可强制）。
+- 独显上有 BAR 时强制开启已接近中性；没有 BAR 的回落到 system RAM 仍会亏，
+  所以不做「有扩展就默认开」。
+- 如果以后把多个 op 合到一个 command buffer（`VKOP_GRAPH_SUBMIT`），共享
+  一个 descriptor buffer 可以把每 op 的 bind 降到整段一次，剩余差距会进一步
+  消失；当前默认 per-op command buffer 下做不到。

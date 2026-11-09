@@ -578,6 +578,14 @@ add_executable(BufferDeviceAddressTest BufferDeviceAddressTest.cpp)
 target_link_libraries(BufferDeviceAddressTest PRIVATE vkop vload)
 add_test(NAME BufferDeviceAddressTest COMMAND BufferDeviceAddressTest)
 
+# Host-side cost probe for VK_EXT_descriptor_buffer: vkGetDescriptorEXT vs
+# vkUpdateDescriptorSets, and per-dispatch offset commands vs descriptor-set
+# binds (with and without a descriptor-buffer re-bind). Skips without the
+# extension. Not a gtest: a capability skip is a normal outcome.
+add_executable(DescriptorBufferProbe DescriptorBufferProbe.cpp)
+target_link_libraries(DescriptorBufferProbe PRIVATE vkop)
+add_test(NAME DescriptorBufferProbe COMMAND DescriptorBufferProbe)
+
 # End-to-end BDA-kernel probe: every unary op with a _bda variant (fp32/fp16)
 # plus the per-dispatch descriptor fallback for host-imported buffers. Skips
 # cleanly on a non-BDA device.
