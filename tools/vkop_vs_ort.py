@@ -324,33 +324,66 @@ def compare(ref, got, rtol, atol, cos_min, bad_frac_max):
 
     a, b = ref.astype(np.float64), got.astype(np.float64)
     m["nan"] = int(np.isnan(b).sum())
-    m["inf"] = int(np.isinf(b).sum()) - int(np.isinf(a).sum())
-    d = np.abs(a - b)
+    # Positional, not a count difference: an Inf the reference has in the same
+    # element is the model's own overflow (a -Inf attention mask), an Inf in a
+    # different element is not.
+    m["inf"] = int((np.isinf(a) ^ np.isinf(b)).sum())
+    # Same-signed Inf on both sides is agreement. |inf - inf| is NaN, and one
+    # NaN would make maxabs/meanabs/rel_l2 NaN for the whole tensor, hiding the
+    # error in every element that could actually be compared.
+    agree = np.isinf(a) & np.isinf(b) & (np.sign(a) == np.sign(b))
+    # Subtracted with a mask rather than as `np.where(agree, 0.0, a - b)`: the
+    # eager form computes inf - inf first and raises an invalid-value warning
+    # for the pairs this line exists to ignore.
+    diff = np.subtract(a, b, out=np.zeros_like(a), where=~agree)
+    d = np.abs(diff)
     if not d.size:
         # A 0-element output (a kv_len=0 cache slice) has no error to report;
         # it passes on the shape equality already checked above.
-        m["cos"], m["rel_l2"], m["bad_frac"] = 1.0, 0.0, 0.0
+        m["maxabs"] = m["meanabs"] = m["rel_l2"] = m["bad_frac"] = 0.0
+        m["cos"] = 1.0
         m["ok"] = True
         return m
     m["maxabs"] = float(d.max())
     m["meanabs"] = float(d.mean())
     na, nb = float(np.linalg.norm(a)), float(np.linalg.norm(b))
-    m["cos"] = float(a.ravel() @ b.ravel() / (na * nb)) if na and nb else 0.0
-    m["rel_l2"] = float(np.linalg.norm(a - b) / na) if na else 0.0
+    if na == 0.0 and nb == 0.0:
+        # Both exactly zero (a padding mask, a disabled branch): cosine would be
+        # 0/0, and there is nothing to disagree about -- maxabs and the outlier
+        # fraction already report the absent error.
+        m["cos"], m["rel_l2"] = 1.0, 0.0
+    else:
+        # A norm that is Inf (a tensor that overflows) cannot ground a cosine
+        # or a relative error; report neither and let the Inf gate decide.
+        if np.isfinite(na) and np.isfinite(nb):
+            m["cos"] = float(a.ravel() @ b.ravel() / (na * nb))
+        if np.isfinite(na) and na > 0.0:
+            m["rel_l2"] = float(np.linalg.norm(diff) / na)
+        elif na == 0.0 and nb > 0.0:
+            # A zero reference with a nonzero output is an infinite relative
+            # error, not a zero one.
+            m["rel_l2"] = float("inf")
     # The outlier band scales with the tensor, not with each element: an
     # fp16-storage run on the Add+Conv fixture puts 11.1% of elements outside
     # atol + rtol*|ref| while its cosine is 0.999995, because the flagged ones
     # are the small-magnitude elements (median |ref| 0.16 against 0.73 overall)
     # carrying ordinary accumulation error from the large intermediates they
     # were computed from. Against max|ref| the same run is 0.0000%.
-    scale = float(np.abs(a).max())
+    # The scale is the largest FINITE element: with an Inf in the reference the
+    # band would otherwise be Inf, which flags nothing and turns the row green
+    # no matter how far the rest of the tensor drifted.
+    finite = np.abs(a)[np.isfinite(np.abs(a))]
+    scale = float(finite.max()) if finite.size else 0.0
     band = atol + rtol * scale
     m["bad_frac"] = float((d > band).mean())
     if m["nan"]:
         m["reasons"].append(f"{m['nan']} NaN(s) in the runtime output")
     if m["inf"] > 0:
-        m["reasons"].append(f"{m['inf']} more Inf(s) than the reference")
-    if not m["cos"] >= cos_min:
+        m["reasons"].append(f"{m['inf']} element(s) where one side is Inf and "
+                            "the other is not")
+    # Only a computable cosine can fail this gate. A NaN one means an Inf or
+    # NaN above already said what is wrong, and "cos nan < 0.999" would bury it.
+    if np.isfinite(m["cos"]) and m["cos"] < cos_min:
         m["reasons"].append(f"cos {m['cos']:.6f} < {cos_min}")
     if not m["bad_frac"] <= bad_frac_max:
         m["reasons"].append(
@@ -375,9 +408,16 @@ def topk(ref, got, k):
 
 
 def find_bench(explicit):
-    cands = [explicit] if explicit else []
-    cands += [str(_REPO / "build" / "benchmark" / "vkop-bench"),
-              "build/benchmark/vkop-bench"]
+    if explicit:
+        p = Path(explicit)
+        # A --bench that is not runnable has to stop the run rather than fall
+        # through to the build tree's binary: the whole point of naming one is
+        # to measure THAT build.
+        if not (p.is_file() and os.access(p, os.X_OK)):
+            raise LoopError(f"--bench {explicit} is not an executable file")
+        return p
+    cands = [str(_REPO / "build" / "benchmark" / "vkop-bench"),
+             "build/benchmark/vkop-bench"]
     for c in cands:
         p = Path(c)
         if p.is_file() and os.access(p, os.X_OK):
@@ -393,13 +433,26 @@ def find_bench(explicit):
 # ---------------------------------------------------------------------------
 
 
+def _cell(value, width, spec):
+    """One table cell, with '-' where a metric does not apply.
+
+    An integer output has no cosine and no fp16-style meanabs to report --
+    printing NaN there reads as a broken measurement rather than as "this
+    output is compared exactly".
+    """
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return " " * (width - 1) + "-"
+    return format(value, f">{width}{spec}")
+
+
 def report_row(name, note, m, t):
     shape = "x".join(str(d) for d in m["shape"]) or "scalar"
     if note:
         shape += f" ({note})"
-    tk = f"{t['top1']:6.3f}" if t else "     -"
-    print(f"{name:<30} {shape:<18} {m['maxabs']:>9.3e} {m['meanabs']:>9.3e} "
-          f"{m['rel_l2']:>9.3e} {m['cos']:>10.6f} {100 * m['bad_frac']:>8.4f} "
+    tk = _cell(t["top1"] if t else None, 6, ".3f")
+    print(f"{name:<30} {shape:<18} {_cell(m['maxabs'], 9, '.3e')} "
+          f"{_cell(m['meanabs'], 9, '.3e')} {_cell(m['rel_l2'], 9, '.3e')} "
+          f"{_cell(m['cos'], 10, '.6f')} {_cell(100 * m['bad_frac'], 8, '.4f')} "
           f"{tk} {'OK' if m['ok'] else 'FAIL'}")
     for reason in m["reasons"]:
         print(f"{'':<30} ! {reason}")
@@ -504,9 +557,10 @@ def run(args):
             got = read_output(out_dir, row)
             ref = refs.get(row["name"])
             if ref is None:
-                print(f"{row['name']:<30} {row['dims']!s:<18} "
-                      f"{'':>9} {'':>9} {'':>9} {'':>10} {'':>8} {'-':>6} "
-                      f"FAIL")
+                print(f"{row['name']:<30} {'x'.join(map(str, row['dims'])):<18} "
+                      f"{_cell(None, 9, '')} {_cell(None, 9, '')} "
+                      f"{_cell(None, 9, '')} {_cell(None, 10, '')} "
+                      f"{_cell(None, 8, '')} {_cell(None, 6, '')} FAIL")
                 print(f"{'':<30} ! UNMATCHED: onnxruntime has no output "
                       f"{row['name']!r} (it has {sorted(refs)[:4]}"
                       f"{'...' if len(refs) > 4 else ''})")
