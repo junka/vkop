@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "include/logger.hpp"
+#include "vulkan/DescriptorBufferPool.hpp"
 #include "vulkan/DescriptorWriteProf.hpp"
 #include "vulkan/VulkanBuffer.hpp"
 #include "vulkan/VulkanLib.hpp"
@@ -34,10 +35,13 @@ VulkanBasePipeline::VulkanBasePipeline(VkDevice device,
 }
 
 VulkanBasePipeline::~VulkanBasePipeline() {
-    // Descriptor-buffer memory first: it references the device that the
-    // VulkanBuffer keeps a non-owning alias to, and the VkBuffer must be gone
-    // before the device itself is destroyed by its owner.
-    descriptor_buffer_storage_.reset();
+    // Return this pipeline's region to the device-wide pool. The pool owns the
+    // VkBuffer; the last pipeline to die before the device does releases it.
+    if (descriptor_buffer_pool_ && descriptor_buffer_region_size_ != 0) {
+        descriptor_buffer_pool_->free(descriptor_buffer_region_,
+                                      descriptor_buffer_region_size_);
+        descriptor_buffer_pool_.reset();
+    }
     if (m_pipeline_ != VK_NULL_HANDLE) {
         vkDestroyPipeline(m_device_, m_pipeline_, nullptr);
         m_pipeline_ = VK_NULL_HANDLE;
@@ -86,17 +90,24 @@ void VulkanBasePipeline::enable_descriptor_buffer() {
         }
     }
     // Descriptor memory must be host-writable (updates are plain memcpys via
-    // vkGetDescriptorEXT), so it lives in HOST_VISIBLE|HOST_COHERENT memory.
-    // On a discrete GPU that memory sits behind PCIe and the GPU's descriptor
-    // fetch may cost more than the descriptor-set path it replaces; default
-    // that case to sets unless VKOP_DESCRIPTOR_BUFFER=1 opts in. UMA (iGPU,
-    // llvmpipe) reads the same memory the CPU wrote.
+    // vkGetDescriptorEXT), so the pool lives in host-visible memory. On a
+    // discrete GPU with BAR, VulkanDevice prefers the device-local
+    // host-visible type; without one the GPU fetches descriptors over PCIe,
+    // which measured ~8.6% slower on b3. Enable by default on UMA or whenever
+    // device-local host-visible memory exists; VKOP_DESCRIPTOR_BUFFER=1 forces
+    // it, VKOP_NO_DESCRIPTOR_BUFFER disables the feature entirely.
     const char *force = std::getenv("VKOP_DESCRIPTOR_BUFFER");
     const bool forced = force != nullptr && force[0] == '1';
-    if (!vdev_->is_unified_memory() && !forced) {
+    if (!vdev_->is_unified_memory() && !forced &&
+        !vdev_->descriptor_buffer_has_device_local_memory()) {
         return;
     }
-    vdev_keep_ = std::shared_ptr<VulkanDevice>(vdev_, [](VulkanDevice *) {});
+    const std::shared_ptr<DescriptorBufferPool> pool =
+        vdev_->descriptor_buffer_pool();
+    if (!pool) {
+        return;
+    }
+    descriptor_buffer_pool_ = pool;
     descriptor_buffer_ = info;
     if (std::getenv("VKOP_DESCRIPTOR_BUFFER_DEBUG")) {
         std::fprintf(stderr,
@@ -186,35 +197,20 @@ void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags,
             if (descriptor_buffer_stride_ == 0) {
                 throw std::runtime_error("empty descriptor set layout");
             }
-            // Descriptor memory is host-written, but the GPU also fetches from
-            // it at dispatch time. A device-local+host-visible type (BAR on a
-            // discrete GPU, the one UMA type on an iGPU) keeps that fetch
-            // local; without it the driver reads descriptors from system RAM
-            // over PCIe, which on b3 costs ~2.4 ms per Qwen3-VL round (same
-            // GPU timestamps, slower wall). Fall back to plain host-visible
-            // when the device exposes no such type (or the BAR is too small).
-            VkMemoryPropertyFlags db_mem = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                           VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
-            const VkMemoryPropertyFlags db_want =
-                db_mem | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
-            VkPhysicalDeviceMemoryProperties db_mem_props{};
-            vkGetPhysicalDeviceMemoryProperties(vdev_->getPhysicalDevice(),
-                                                &db_mem_props);
-            for (uint32_t i = 0; i < db_mem_props.memoryTypeCount; ++i) {
-                if ((db_mem_props.memoryTypes[i].propertyFlags & db_want) ==
-                    db_want) {
-                    db_mem = db_want;
-                    break;
-                }
+            const VkDeviceSize region_size =
+                descriptor_buffer_stride_ * kDescriptorBufferSlots;
+            if (!descriptor_buffer_pool_->alloc(
+                    region_size, descriptor_buffer_->offsetAlignment,
+                    descriptor_buffer_region_)) {
+                throw std::runtime_error("descriptor buffer pool exhausted");
             }
-            descriptor_buffer_storage_ = std::make_unique<VulkanBuffer>(
-                vdev_keep_, descriptor_buffer_stride_ * kDescriptorBufferSlots,
-                VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT, db_mem);
+            // Only mark the region as owned after a successful allocation, so
+            // the fallback path never frees a block it did not get.
+            descriptor_buffer_region_size_ = region_size;
             descriptor_buffer_map_ =
-                descriptor_buffer_storage_->getMappedMemory();
-            descriptor_buffer_address_ =
-                descriptor_buffer_storage_->getDeviceAddress();
-            if (!descriptor_buffer_map_ || descriptor_buffer_address_ == 0) {
+                static_cast<uint8_t *>(descriptor_buffer_pool_->map()) +
+                descriptor_buffer_region_;
+            if (!descriptor_buffer_map_) {
                 throw std::runtime_error("descriptor buffer is not mappable");
             }
             descriptor_buffer_slot_used_.assign(kDescriptorBufferSlots, 0);
@@ -230,9 +226,15 @@ void VulkanBasePipeline::createDescriptorSetLayout(VkShaderStageFlags flags,
                      "rebuilding the layout for descriptor sets",
                      e.what());
             descriptor_buffer_ = nullptr;
-            descriptor_buffer_storage_.reset();
+            if (descriptor_buffer_pool_ &&
+                descriptor_buffer_region_size_ != 0) {
+                descriptor_buffer_pool_->free(descriptor_buffer_region_,
+                                              descriptor_buffer_region_size_);
+            }
+            descriptor_buffer_pool_.reset();
+            descriptor_buffer_region_ = 0;
+            descriptor_buffer_region_size_ = 0;
             descriptor_buffer_map_ = nullptr;
-            descriptor_buffer_address_ = 0;
             descriptor_buffer_stride_ = 0;
             descriptor_buffer_binding_offsets_.clear();
             descriptor_buffer_slot_used_.clear();
@@ -508,18 +510,18 @@ void VulkanBasePipeline::writeDescriptorBuffer(
 }
 
 VkBuffer VulkanBasePipeline::getDescriptorBuffer() const {
-    return descriptor_buffer_storage_ ? descriptor_buffer_storage_->getBuffer()
-                                      : VK_NULL_HANDLE;
+    return descriptor_buffer_pool_ ? descriptor_buffer_pool_->buffer()
+                                   : VK_NULL_HANDLE;
 }
 
 void VulkanBasePipeline::bindDescriptorBuffer(VkCommandBuffer cmd) const {
 #ifdef VK_EXT_descriptor_buffer
-    if (!descriptor_buffer_ || !descriptor_buffer_storage_) {
+    if (!descriptor_buffer_ || !descriptor_buffer_pool_) {
         return;
     }
     VkDescriptorBufferBindingInfoEXT binding{};
     binding.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_BUFFER_BINDING_INFO_EXT;
-    binding.address = descriptor_buffer_address_;
+    binding.address = descriptor_buffer_pool_->address();
     binding.usage = VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT;
     descriptor_buffer_->cmdBindBuffers(cmd, 1, &binding);
 #else
@@ -534,7 +536,10 @@ void VulkanBasePipeline::setDescriptorBufferOffsets(
         return;
     }
     const uint32_t buffer_index = 0;
-    const VkDeviceSize offset = descriptorBufferSlotOffset(token);
+    // Offsets are relative to the bound buffer, so they include this
+    // pipeline's region base inside the shared pool.
+    const VkDeviceSize offset =
+        descriptor_buffer_region_ + descriptorBufferSlotOffset(token);
     descriptor_buffer_->cmdSetOffsets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
                                       m_pipelineLayout_, 0, 1, &buffer_index,
                                       &offset);

@@ -9,6 +9,7 @@
 namespace vkop {
 
 class VulkanBuffer;
+class DescriptorBufferPool;
 
 class VulkanBasePipeline {
   public:
@@ -67,17 +68,18 @@ class VulkanBasePipeline {
 
   protected:
     VulkanDevice *vdev_ = nullptr;
-    // Non-owning alias used only to satisfy VulkanBuffer's shared_ptr ctor;
-    // the caller owns the device for the pipeline's lifetime.
-    std::shared_ptr<VulkanDevice> vdev_keep_;
     const DescriptorBufferInfo *descriptor_buffer_ = nullptr;
     // One slot per concurrent descriptor set, matching the old descriptor
     // pool's maxSets (kInflight * 16). Slots are allocated lazily and reused
     // after freeDescriptorSets().
     static constexpr size_t kDescriptorBufferSlots = kInflight * 16;
-    std::unique_ptr<VulkanBuffer> descriptor_buffer_storage_;
+    // Region of the device-wide descriptor buffer owned by this pipeline. The
+    // pool keeps its VkBuffer shared by every pipeline, so a recording binds
+    // the buffer once and only changes offsets per dispatch.
+    std::shared_ptr<DescriptorBufferPool> descriptor_buffer_pool_;
+    VkDeviceSize descriptor_buffer_region_ = 0;
+    VkDeviceSize descriptor_buffer_region_size_ = 0;
     void *descriptor_buffer_map_ = nullptr;
-    VkDeviceAddress descriptor_buffer_address_ = 0;
     VkDeviceSize descriptor_buffer_stride_ = 0;
     std::vector<VkDeviceSize> descriptor_buffer_binding_offsets_;
     std::vector<uint8_t> descriptor_buffer_slot_used_;

@@ -47,15 +47,23 @@ SSBO（例如 Binary 的 shape-meta 通道），这样这些没写的 binding �
 
 - descriptor set layout 加 `VK_DESCRIPTOR_SET_LAYOUT_CREATE_DESCRIPTOR_BUFFER_BIT_EXT`，
   compute pipeline 加 `VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT`；
-- 不再创建 descriptor pool / set。每个管线拥有一块
-  `HOST_VISIBLE|HOST_COHERENT` 的 `VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT`
-  缓冲区，按 `kInflight * 16` 个槽位划分，槽位步长是
+- 不再创建 descriptor pool / set。整台设备共享**一块**
+  `VK_BUFFER_USAGE_RESOURCE_DESCRIPTOR_BUFFER_BIT_EXT` 缓冲区
+  （`DescriptorBufferPool`，默认 32 MiB），每个管线从里面切一块
+  `kInflight * 16` 槽位的 region，槽位步长是
   `align_up(layoutSize, descriptorBufferOffsetAlignment)`；
 - `allocDescriptorSets()` 返回槽位 token（`index + 1`），不再调用
   `vkAllocateDescriptorSets`；`updateDescriptorSets()` 变成对每个 binding 调
   `vkGetDescriptorEXT` 写入映射内存，不再调用 `vkUpdateDescriptorSets`；
-- 记录命令时只在切换管线时 `vkCmdBindDescriptorBuffersEXT` 一次，随后每个
-  dispatch 记录 `vkCmdSetDescriptorBufferOffsetsEXT`。
+- 记录命令时 `vkCmdBindDescriptorBuffersEXT` 每条 command buffer 只需一次，
+  随后每个 dispatch 只记录 `vkCmdSetDescriptorBufferOffsetsEXT`（offset =
+  region 基址 + 槽位偏移）。共享一块缓冲区是 b3 上消除每 op 重新绑定的关键。
+
+descriptor 缓冲区优先放在 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`
+（iGPU 的 UMA 类型、独显的 BAR）：CPU 写、GPU 读同一块本地内存。没有这种
+内存类型时退回 `HOST_VISIBLE|HOST_COHERENT`（system RAM），此时独显默认
+不启用 descriptor buffer（GPU 走 PCIe 取 descriptor 会明显变慢，见下文 b3
+实测）。
 
 SPIR-V 不需要任何改动：set/binding 声明不变，只是 descriptor 的来源换了。
 
@@ -73,12 +81,13 @@ descriptor-buffer flag 的 layout 并重建，回落到原来的 descriptor set 
 | 变量 | 作用 |
 |---|---|
 | `VKOP_NO_DESCRIPTOR_BUFFER=1` | 特性完全不出现在 `vkCreateDevice` 里，强制 descriptor set |
-| `VKOP_DESCRIPTOR_BUFFER=1` | 非 UMA（独显）也启用 descriptor buffer；默认只在 UMA 启用 |
+| `VKOP_DESCRIPTOR_BUFFER=1` | 强制启用（即使没有 device-local host-visible 内存） |
+| `VKOP_DESCRIPTOR_BUFFER_POOL_MB=<n>` | 共享 descriptor buffer 大小，默认 32 MiB |
 | `VKOP_DESCRIPTOR_BUFFER_DEBUG=1` | 每建一条 descriptor-buffer 管线打一行 `[descbuf]` |
 
-默认只在 UMA 设备启用，是因为 descriptor 缓冲区是 host-visible 内存：iGPU /
-llvmpipe 上 CPU 写的就是 GPU 读的那块；独显上它位于 PCIe 后面，GPU 取
-descriptor 可能比原来的 set 更慢。独显要用需显式 `VKOP_DESCRIPTOR_BUFFER=1`。
+默认策略：UMA 设备，或存在 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`
+（独显 BAR）时默认启用；只有 system RAM 可用的独显默认走 descriptor set
+（`VKOP_DESCRIPTOR_BUFFER=1` 可强制）。
 
 ## 本机实测（Intel ARL / Mesa 25.2.8 / Qwen2.5-0.5B decode dump）
 
@@ -204,31 +213,32 @@ b3 的内存类型里有：
 
 ## 规避 / 修复
 
-`VulkanBasePipeline` 分配 descriptor buffer 时优先选
-`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（iGPU 的 UMA 类型、独显的 BAR），
-没有这种类型（或 BAR 太小分配失败）时回落到原来的
-`HOST_VISIBLE|HOST_COHERENT`。ARL 的 type 0 本来就是
-`DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`，行为不变。
+分两步：
 
-修复后重跑同一组 b3 A/B（A B B A × 3，r≥6 稳态）：
+1. **bar 内存**：descriptor buffer 优先选
+   `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（iGPU 的 UMA 类型、独显的 BAR），
+   没有这种类型时回落到 `HOST_VISIBLE|HOST_COHERENT`。ARL 的 type 0 本来
+   就是前者，行为不变。b3 上从 30.35 → 27.65 ms（相对 set 臂 27.10，
+   +2.0%；修复前 +8.6%）。
+2. **共享 descriptor buffer**：新增 `DescriptorBufferPool`，整台设备一块
+   32 MiB 缓冲区，所有管线切 region。默认 `VKOP_GRAPH_SUBMIT` 是开的，
+   一段的 op 在同一条 command buffer 里，所以原来「每 op 重新
+   `vkCmdBindDescriptorBuffersEXT`」变成「每段一次」，每个 dispatch 只剩
+   `vkCmdSetDescriptorBufferOffsetsEXT`。
 
-| | A: descriptor set（默认） | B: descriptor buffer（强制） |
+最终 b3 A/B（新默认 = descriptor buffer，对比 `VKOP_NO_DESCRIPTOR_BUFFER=1`，
+A B B A × 2，r≥6 稳态）：
+
+| | A: descriptor buffer（默认） | B: descriptor set |
 |---|---|---|
-| per-step 中位 | 27.10 ms | 27.65 ms（+2.0%） |
-| per-step mean / min | 27.32 / 26.80 | 27.90 / 27.20 |
-| GPU decode TOTAL 中位 | 13.31 ms | 13.03 ms |
-| MatMul 中位 | 11.89 ms | 11.77 ms |
-| 稳态 update / bind_ds | 0.140 / 0.140 ms | 0.150 / 0.150 ms |
+| per-step 中位 | **26.90 ms** | 27.10 ms |
+| per-step mean / min | 27.07 / 26.60 | 27.25 / 26.80 |
+| GPU decode TOTAL 中位 | 13.05 ms | 13.34 ms |
+| MatMul 中位 | 11.80 ms | 11.91 ms |
 
-2.4 ms（8.6%）的额外开销降到 ~0.55 ms（2.0%），GPU 时间两臂一致（B 甚至
-略低，属噪声）。剩余 ~0.55 ms 来自每个 op 多一条
-`vkCmdBindDescriptorBuffersEXT`（默认是每 op 一个 command buffer，describe
-buffer 绑定不能跨 command buffer 复用），host 侧录制只差 ~8 ns/op，剩下是
-命令处理开销。这已经进入 iGPU/dGPU 噪声带；结论仍是：
+两臂已在噪声内，descriptor buffer 略快。默认策略相应改为：
 
-- 默认策略保持：UMA 开、独显关（`VKOP_DESCRIPTOR_BUFFER=1` 可强制）。
-- 独显上有 BAR 时强制开启已接近中性；没有 BAR 的回落到 system RAM 仍会亏，
-  所以不做「有扩展就默认开」。
-- 如果以后把多个 op 合到一个 command buffer（`VKOP_GRAPH_SUBMIT`），共享
-  一个 descriptor buffer 可以把每 op 的 bind 降到整段一次，剩余差距会进一步
-  消失；当前默认 per-op command buffer 下做不到。
+- UMA，或存在 `DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT`（BAR）→ 默认开；
+- 只有 system RAM 的独显 → 默认关（GPU 走 PCIe 取 descriptor，仍会亏；
+  `VKOP_DESCRIPTOR_BUFFER=1` 可强制）；
+- `VKOP_NO_DESCRIPTOR_BUFFER=1` 全局关闭。

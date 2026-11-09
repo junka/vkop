@@ -1,5 +1,6 @@
 // Copyright 2025 @junka
 #include "vulkan/VulkanDevice.hpp"
+#include "vulkan/DescriptorBufferPool.hpp"
 #include "vulkan/VulkanDebug.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <algorithm>
@@ -188,6 +189,10 @@ VulkanDevice::~VulkanDevice() {
     for (auto &queue : computeQueues_) {
         queue.reset();
     }
+    // Destroy the shared descriptor buffer while the device is still alive.
+    // Pipelines normally hold the last reference; they are gone by now, so
+    // this reset is what actually releases the VkBuffer.
+    descriptor_buffer_pool_.reset();
 #ifdef USE_VMA
     m_vma_.reset();
 #endif
@@ -2131,6 +2136,21 @@ void VulkanDevice::initDescriptorBuffer() {
                  "missing; falling back to descriptor pools");
         return;
     }
+    // Whether the shared descriptor buffer can live in device-local memory
+    // (UMA on an iGPU, BAR on a discrete GPU). This decides both the memory
+    // flags and whether discrete devices enable the backend by default.
+    VkPhysicalDeviceMemoryProperties mem_props{};
+    vkGetPhysicalDeviceMemoryProperties(physicalDevice_, &mem_props);
+    const VkMemoryPropertyFlags want = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    m_descriptor_buffer_device_local_memory_ = false;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; ++i) {
+        if ((mem_props.memoryTypes[i].propertyFlags & want) == want) {
+            m_descriptor_buffer_device_local_memory_ = true;
+            break;
+        }
+    }
     LOG_INFO("descriptor buffer: offsetAlign %llu sb %llu ubo %llu img %llu "
              "sampled %llu cimg %llu",
              static_cast<unsigned long long>(info.offsetAlignment),
@@ -2143,6 +2163,54 @@ void VulkanDevice::initDescriptorBuffer() {
 #else
     m_support_descriptor_buffer_ = false;
 #endif
+}
+
+std::shared_ptr<DescriptorBufferPool> VulkanDevice::descriptor_buffer_pool() {
+    if (!m_support_descriptor_buffer_) {
+        return nullptr;
+    }
+    std::lock_guard<std::mutex> lock(descriptor_buffer_pool_mutex_);
+    if (descriptor_buffer_pool_) {
+        return descriptor_buffer_pool_;
+    }
+
+    // Descriptor memory is host-written but GPU-fetched. Prefer a
+    // DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT type (the UMA memory type on an
+    // iGPU, BAR on a discrete GPU); b3's decode lost ~2.4 ms/round (~8.6%)
+    // when the descriptors lived in system RAM and were fetched over PCIe.
+    // Fall back to plain host-visible where no such type exists.
+    VkMemoryPropertyFlags memory_flags = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                         VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (m_descriptor_buffer_device_local_memory_) {
+        memory_flags |= VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+    }
+
+    size_t pool_mb = 32;
+    if (const char *env = std::getenv("VKOP_DESCRIPTOR_BUFFER_POOL_MB")) {
+        const int v = std::atoi(env);
+        if (v > 0) {
+            pool_mb = static_cast<size_t>(v);
+        }
+    }
+    // VulkanBuffer needs a shared_ptr to the device; the real owner (Runtime /
+    // the test fixture) outlives every pipeline, exactly like the raw VkDevice
+    // handle VulkanBasePipeline already holds.
+    std::shared_ptr<VulkanDevice> self(this, [](VulkanDevice *) {});
+    auto pool = DescriptorBufferPool::create(
+        self, &m_descriptor_buffer_info_, memory_flags,
+        static_cast<VkDeviceSize>(pool_mb) << 20);
+    if (!pool) {
+        LOG_WARN("descriptor buffer pool allocation failed (%zu MiB, flags "
+                 "0x%x); pipelines keep descriptor sets",
+                 pool_mb, static_cast<unsigned>(memory_flags));
+        return nullptr;
+    }
+    LOG_INFO("descriptor buffer pool: %zu MiB, memory flags 0x%x%s", pool_mb,
+             static_cast<unsigned>(memory_flags),
+             m_descriptor_buffer_device_local_memory_ ? " (device-local)"
+                                                      : " (system)");
+    descriptor_buffer_pool_ = std::move(pool);
+    return descriptor_buffer_pool_;
 }
 
 bool VulkanDevice::probeBufferDeviceAddress() {

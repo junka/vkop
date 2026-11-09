@@ -93,19 +93,19 @@ int main() {
     std::printf("memory types (heap MiB, flags):\n");
     for (uint32_t i = 0; i < mp.memoryTypeCount; ++i) {
         const auto &t = mp.memoryTypes[i];
-        std::printf("  [%u] heap=%u %llu MiB flags=0x%x%s%s%s\n", i,
-                    t.heapIndex,
-                    (unsigned long long)(mp.memoryHeaps[t.heapIndex].size >> 20),
-                    (unsigned)t.propertyFlags,
-                    (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
-                        ? " DEVICE_LOCAL"
-                        : "",
-                    (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
-                        ? " HOST_VISIBLE"
-                        : "",
-                    (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
-                        ? " HOST_COHERENT"
-                        : "");
+        std::printf(
+            "  [%u] heap=%u %llu MiB flags=0x%x%s%s%s\n", i, t.heapIndex,
+            (unsigned long long)(mp.memoryHeaps[t.heapIndex].size >> 20),
+            (unsigned)t.propertyFlags,
+            (t.propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+                ? " DEVICE_LOCAL"
+                : "",
+            (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT)
+                ? " HOST_VISIBLE"
+                : "",
+            (t.propertyFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+                ? " HOST_COHERENT"
+                : "");
     }
 
     // One real storage buffer all bindings point at.
@@ -142,10 +142,12 @@ int main() {
     VkPipelineLayout db_pl = VK_NULL_HANDLE, set_pl = VK_NULL_HANDLE;
     plc.setLayoutCount = 1;
     plc.pSetLayouts = &db_layout;
-    check(vkop::vkCreatePipelineLayout(vkdev, &plc, nullptr, &db_pl) == VK_SUCCESS,
+    check(vkop::vkCreatePipelineLayout(vkdev, &plc, nullptr, &db_pl) ==
+              VK_SUCCESS,
           "create db pipeline layout");
     plc.pSetLayouts = &set_layout;
-    check(vkop::vkCreatePipelineLayout(vkdev, &plc, nullptr, &set_pl) == VK_SUCCESS,
+    check(vkop::vkCreatePipelineLayout(vkdev, &plc, nullptr, &set_pl) ==
+              VK_SUCCESS,
           "create set pipeline layout");
 
     VkDeviceSize layout_size = 0;
@@ -160,7 +162,8 @@ int main() {
     }
     std::printf("\n");
 
-    // 256 slots of descriptor memory so the writes are not all the same address.
+    // 256 slots of descriptor memory so the writes are not all the same
+    // address.
     constexpr uint32_t kSlots = 256;
     const uint32_t stride =
         static_cast<uint32_t>((layout_size + dbi->offsetAlignment - 1) /
@@ -222,7 +225,8 @@ int main() {
     pci.poolSizeCount = 1;
     pci.pPoolSizes = &ps;
     VkDescriptorPool pool = VK_NULL_HANDLE;
-    check(vkop::vkCreateDescriptorPool(vkdev, &pci, nullptr, &pool) == VK_SUCCESS,
+    check(vkop::vkCreateDescriptorPool(vkdev, &pci, nullptr, &pool) ==
+              VK_SUCCESS,
           "pool");
     VkDescriptorSetAllocateInfo ai{};
     ai.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
@@ -230,19 +234,20 @@ int main() {
     ai.descriptorSetCount = 1;
     ai.pSetLayouts = &set_layout;
     VkDescriptorSet set = VK_NULL_HANDLE;
-    check(vkop::vkAllocateDescriptorSets(vkdev, &ai, &set) == VK_SUCCESS, "set");
+    check(vkop::vkAllocateDescriptorSets(vkdev, &ai, &set) == VK_SUCCESS,
+          "set");
     for (auto &w : writes) {
         w.dstSet = set;
     }
     t0 = now_ns();
     for (uint32_t i = 0; i < kIter; ++i) {
-        vkop::vkUpdateDescriptorSets(vkdev, kBindings, writes.data(), 0, nullptr);
+        vkop::vkUpdateDescriptorSets(vkdev, kBindings, writes.data(), 0,
+                                     nullptr);
     }
     uint64_t upd_ns = now_ns() - t0;
 
-    std::printf(
-        "vkGetDescriptorEXT      : %8.1f ns/call (%u calls/iter)\n",
-        double(get_ns) / (double(kIter) * kBindings), kBindings);
+    std::printf("vkGetDescriptorEXT      : %8.1f ns/call (%u calls/iter)\n",
+                double(get_ns) / (double(kIter) * kBindings), kBindings);
     std::printf("vkUpdateDescriptorSets  : %8.1f ns/call (%u writes/call)\n",
                 double(upd_ns) / double(kIter), kBindings);
 
@@ -262,7 +267,8 @@ int main() {
     cpi.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     cpi.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
     VkCommandPool cmdpool = VK_NULL_HANDLE;
-    check(vkop::vkCreateCommandPool(vkdev, &cpi, nullptr, &cmdpool) == VK_SUCCESS,
+    check(vkop::vkCreateCommandPool(vkdev, &cpi, nullptr, &cmdpool) ==
+              VK_SUCCESS,
           "cmd pool");
     VkCommandBufferAllocateInfo cai{};
     cai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -270,7 +276,8 @@ int main() {
     cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     cai.commandBufferCount = 1;
     VkCommandBuffer cmd = VK_NULL_HANDLE;
-    check(vkop::vkAllocateCommandBuffers(vkdev, &cai, &cmd) == VK_SUCCESS, "cmd");
+    check(vkop::vkAllocateCommandBuffers(vkdev, &cai, &cmd) == VK_SUCCESS,
+          "cmd");
 
     constexpr uint32_t kCmdIter = 20000;
     VkCommandBufferBeginInfo bi{};
@@ -283,8 +290,8 @@ int main() {
     vkop::vkBeginCommandBuffer(cmd, &bi);
     t0 = now_ns();
     for (uint32_t i = 0; i < kCmdIter; ++i) {
-        vkop::vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, set_pl, 0,
-                                1, &set, 0, nullptr);
+        vkop::vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      set_pl, 0, 1, &set, 0, nullptr);
     }
     uint64_t bind_set_ns = now_ns() - t0;
     vkop::vkEndCommandBuffer(cmd);

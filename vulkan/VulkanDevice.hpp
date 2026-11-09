@@ -5,12 +5,15 @@
 #include <cstdlib>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <set>
 
 #include "core/KernelSelect.hpp"
 #include "vulkan/VMA.hpp"
 
 namespace vkop {
+
+class DescriptorBufferPool;
 
 constexpr int kInflight = 2;
 class VulkanQueue {
@@ -401,6 +404,20 @@ class VulkanDevice {
         return m_support_descriptor_buffer_ ? &m_descriptor_buffer_info_
                                             : nullptr;
     }
+    // Device-wide descriptor buffer shared by every descriptor-buffer
+    // pipeline. Created lazily on first use; null when unsupported or when the
+    // backing buffer could not be allocated. Keeping one buffer (instead of
+    // one per pipeline) lets a recording bind it once and then only change set
+    // offsets per dispatch.
+    std::shared_ptr<DescriptorBufferPool> descriptor_buffer_pool();
+    // True when a DEVICE_LOCAL|HOST_VISIBLE|HOST_COHERENT memory type exists,
+    // i.e. the shared descriptor buffer can live in BAR/device-local memory.
+    // Only then is the descriptor-buffer backend enabled by default on a
+    // discrete GPU; without it the GPU fetches descriptors over PCIe (the b3
+    // 8.6% regression) and pipelines keep descriptor sets.
+    bool descriptor_buffer_has_device_local_memory() const {
+        return m_descriptor_buffer_device_local_memory_;
+    }
     // Resolve a logical device handle back to the owning VulkanDevice. Used by
     // VulkanBasePipeline, which is constructed with only the VkDevice handle,
     // to reach the descriptor-buffer entry points without changing every
@@ -464,7 +481,11 @@ class VulkanDevice {
     bool m_uab_uniform_buffer_ = false;
     bool m_support_descriptor_partially_bound_ = false;
     bool m_support_descriptor_buffer_ = false;
+    bool m_descriptor_buffer_device_local_memory_ = false;
     DescriptorBufferInfo m_descriptor_buffer_info_;
+    // Lazily created; guarded by descriptor_buffer_pool_mutex_.
+    std::shared_ptr<DescriptorBufferPool> descriptor_buffer_pool_;
+    std::mutex descriptor_buffer_pool_mutex_;
 #ifdef VK_EXT_descriptor_buffer
     VkPhysicalDeviceDescriptorBufferPropertiesEXT m_descriptor_buffer_props_{};
 #endif
