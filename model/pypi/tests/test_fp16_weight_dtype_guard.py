@@ -288,3 +288,63 @@ def test_constant_scalar_stays_fp32_in_the_visual_pos_embed_chain():
         # Stored fp16 here is what turned /Sub into an fp16 op and made the
         # pos_embed interpolation weights garbage.
         assert dag.initializers[scalar].data_type == TensorProto.FLOAT
+
+
+# ------------------------------------------- what the census has to say out loud
+
+def quantize_capturing(m, target_backend="buffer"):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        Quantizer.quantize_to_fp16_selective(m, target_backend)
+    return out.getvalue()
+
+
+def test_a_refused_weight_names_the_gate_that_refused_it():
+    """`Preserved 42 tensors` was the whole report on resnet18.
+
+    Every refusal already computes its reason and used to throw it away, so a
+    graph that keeps all its weights because its activations are declared FLOAT
+    looked identical to a graph whose weights were judged too sensitive.
+    """
+    m = build("W", None, [("Conv", "c", [tref("x", TensorProto.FLOAT), tref("W")])])
+    out = quantize_capturing(m)
+    assert not is_fp16(m)
+    assert "Preserving FP32 tensor 'W': fp32 data input to {'Conv'} (fp32 shader)" in out
+
+
+def test_an_all_fp32_graph_says_the_artifact_stayed_fp32():
+    """-q fp16 on an FP32 export converts nothing; the run has to say so.
+
+    This is the whole `-q fp16` result on a convnet: the file comes out FP32 at
+    FP32 size, and a reader who assumes otherwise reports an FP16 accuracy
+    number for a run that never left FP32.
+    """
+    m = build("W", None, [("Conv", "c", [tref("x", TensorProto.FLOAT), tref("W")])])
+    out = quantize_capturing(m)
+    assert "Converted 0 FP32 tensors to FP16" in out
+    assert "[fp16] WARNING: no weight became FP16" in out
+
+
+def test_the_warning_is_quiet_when_a_weight_did_convert():
+    """One eligible weight is enough to make the graph mixed, not fp32."""
+    m = build("W32", None, [("Conv", "c", [tref("x", TensorProto.FLOAT), tref("W32")])])
+    m.initializers["W16"] = numpy_helper.from_array(
+        numpy.ones((4, 4), dtype=numpy.float32), "W16"
+    )
+    m.nodes["mm"] = Node(
+        "MatMul", "mm", {},
+        [tref("y", TensorProto.FLOAT16), tref("W16")], [tref("mm_out")],
+    )
+    out = quantize_capturing(m)
+    assert m.initializers["W16"].data_type == TensorProto.FLOAT16
+    assert m.initializers["W32"].data_type == TensorProto.FLOAT
+    assert "Converted 1 FP32 tensors to FP16" in out
+    assert "[fp16] WARNING" not in out
+
+
+def test_the_warning_is_quiet_when_no_refusal_was_a_dtype_gate():
+    """'no consumers' is a conservative skip, not a graph that cannot be fp16."""
+    out = quantize_capturing(build("W", None, []))
+    assert "Converted 0 FP32 tensors to FP16" in out
+    assert "no consumers" in out
+    assert "[fp16] WARNING" not in out

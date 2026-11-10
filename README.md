@@ -101,6 +101,8 @@ python3 -m onnx2vkop.cli -i resnet18-v2-7.onnx
 `struct.pack` 格式不再生成；已有的旧 `.vkopbin` 需用本命令重新转换。
 
 - 支持量化：fp16, int8 对称量化
+  （`-q fp16` 只降低**已经以 fp16 运行**的那些 op 的权重：运行时按数据输入选 shader，
+  所以 fp32 导出的图上一个权重都不会转，转换日志会显式告警，产物仍是 fp32）
 - 支持指定batch size
 - 支持针对3D,4D NCHW to RGBA转换到模型
 - 支持tensor合并，以便节约内存
@@ -324,6 +326,9 @@ legacy `struct.pack` format is no longer produced; existing old `.vkopbin`
 files must be reconverted with this command.
 
 - Supports quantization: fp16, int8 symmetric quantization
+  (`-q fp16` downcasts only the weights of ops that ALREADY run fp16: the
+  runtime picks each op's shader from its data input, so on an fp32 export it
+  converts nothing, warns, and leaves an fp32 artifact)
 - Supports specifying batch size
 - Supports 3D/4D NCHW to RGBA model conversion
 - Supports tensor merging to save memory

@@ -7573,6 +7573,12 @@ class Quantizer:
 
         converted_count = 0
         skipped_count = 0
+        # True when at least one FLOAT weight was refused because the op that
+        # reads it runs an fp32 shader. Only that verdict makes a zero-conversion
+        # run mean "this graph is fp32 through and through"; the other reasons
+        # (bn params, small tensors) refuse selectively and leave a real fp16
+        # model behind.
+        saw_fp32_shader_refusal = False
         fp32_cast_outputs = set()  # lazily filled (see precision_tracking branch)
 
         # Build mapping from initializer names to their consumers
@@ -7759,6 +7765,7 @@ class Quantizer:
                 ):
                     should_quantize = False
                     reason = f"fp32 data input to {consumer_ops} (fp32 shader)"
+                    saw_fp32_shader_refusal = True
                 else:
                     should_quantize = True
                     reason = f"consumed by safe operators {consumer_ops}"
@@ -7812,6 +7819,7 @@ class Quantizer:
                         if all_fp32_domain
                         else f"fp32 data input to {consumer_ops} (fp32 shader)"
                     )
+                    saw_fp32_shader_refusal = saw_fp32_shader_refusal or runs_fp32
                 else:
                     should_quantize = True
                     reason = f"precision-tracking scalar/vector for {consumer_ops}"
@@ -7836,10 +7844,28 @@ class Quantizer:
                 print(f"New shape: {fp16_initializer.dims}")
                 converted_count += 1
             else:
+                # The reason is computed on every path above and used to be
+                # dropped: `-q fp16` on a convnet printed "Preserved 42 tensors"
+                # and gave no way to see that every Conv was refused because its
+                # data input is declared FLOAT -- which is exactly the decision
+                # the word "selectively" promises to report.
+                print(f"Preserving FP32 tensor '{name}': {reason}")
                 skipped_count += 1
 
         print(f"Converted {converted_count} FP32 tensors to FP16")
         print(f"Preserved {skipped_count} tensors")
+        if converted_count == 0 and saw_fp32_shader_refusal:
+            # Without this the run reads as a selective decision on a model that
+            # was never eligible: the runtime takes each op's shader from its
+            # DATA input, so a graph that declares FLOAT activations keeps every
+            # weight in fp32 no matter what -q fp16 was asked for.
+            print("[fp16] WARNING: no weight became FP16, so this artifact is "
+                  "the FP32 model under a different name (-q fp16 downcasts the "
+                  "weights of a graph that ALREADY runs FP16, e.g. an FP16 "
+                  "export; it does not convert an FP32 graph into an FP16 one). "
+                  "Every float weight here feeds an op whose data input the "
+                  "graph declares FLOAT, and an FP16 weight behind an FP32 "
+                  "shader is a wrong model, not a smaller one.")
 
     @staticmethod
     def _is_excluded(name, exclude):
