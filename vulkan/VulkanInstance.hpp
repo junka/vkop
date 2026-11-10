@@ -29,6 +29,13 @@ class VulkanInstance {
     const std::vector<VkPhysicalDevice> &getPhysicalDevices() const {
         return m_physical_devices_;
     }
+    // The apiVersion the VkInstance was created with. This is the ceiling on
+    // the core Vulkan version an application may use, independent of what the
+    // physical device reports: a driver may advertise a newer apiVersion than
+    // the instance asked for (NVIDIA 595 reports 1.4.329 through an instance
+    // created at 1.3.275), and using a 1.4-core feature struct in that state
+    // is invalid. Feature selection must compare min(instance, device).
+    uint32_t apiVersion() const { return m_api_version_; }
 
   private:
     // Initialize the Vulkan instance
@@ -97,6 +104,7 @@ class VulkanInstance {
 #endif
 
     VkInstance m_instance_ = VK_NULL_HANDLE;
+    uint32_t m_api_version_ = VK_API_VERSION_1_0;
     std::vector<VkPhysicalDevice> m_physical_devices_;
 
 #ifdef USE_VALIDATION_LAYERS

@@ -32,6 +32,19 @@ void VulkanInstance::createInstance(const std::string &app_name,
 
     uint32_t version = VK_API_VERSION_1_0;
     vkEnumerateInstanceVersion(&version);
+    // Never ask for more than the headers this build was made against: every
+    // 1.4-core struct sits behind `#ifdef VK_VERSION_1_4` here, so an instance
+    // created at a newer version would advertise a contract the code cannot
+    // honour. It also skews VulkanDevice's min(instance, device) feature
+    // gating, which reads this value. Both operands carry variant 0, so the
+    // packed integers compare in version order.
+    const uint32_t header_version =
+        VK_MAKE_API_VERSION(0, VK_VERSION_MAJOR(VK_HEADER_VERSION_COMPLETE),
+                            VK_VERSION_MINOR(VK_HEADER_VERSION_COMPLETE), 0);
+    if (version > header_version) {
+        version = header_version;
+    }
+    m_api_version_ = version;
     printf("Vulkan API version: %d.%d.%d\n", VK_VERSION_MAJOR(version),
            VK_VERSION_MINOR(version), VK_VERSION_PATCH(version));
     // Application info

@@ -675,8 +675,22 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     const VkPhysicalDeviceProperties &deviceProperties,
     const std::set<std::string> &supportedExtensions) {
     std::vector<FeatureDescriptor> descs;
+    // The version every gate below must compare against is the one the
+    // application may legally use, i.e. min(instance apiVersion, device
+    // apiVersion) — NOT the device value alone. A driver can advertise a newer
+    // apiVersion than the VkInstance was created with (NVIDIA 595 reports
+    // 1.4.329 through an instance created at 1.3.275). Gating on the device
+    // value there is wrong in both directions: `>= VK_API_VERSION_1_4` selects
+    // a core struct the promoted-in-1.4 features cannot legally be queried
+    // with (and this tree's headers do not even compile it), while
+    // `< VK_API_VERSION_1_4` silently drops the EXT path that IS valid. Using
+    // the clamped value keeps exactly one branch reachable: the EXT struct for
+    // anything the instance did not promote.
+    const uint32_t api_version =
+        std::min(deviceProperties.apiVersion,
+                 VulkanInstance::getVulkanInstance().apiVersion());
 #ifdef VK_VERSION_1_1
-    if (deviceProperties.apiVersion >= VK_API_VERSION_1_1) {
+    if (api_version >= VK_API_VERSION_1_1) {
         shader_caps_.storage_buffer_16bit.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES,
@@ -711,7 +725,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_VERSION_1_2
-    if (deviceProperties.apiVersion >= VK_API_VERSION_1_2) {
+    if (api_version >= VK_API_VERSION_1_2) {
         shader_caps_.shader_float16.available = true;
         shader_caps_.shader_int8.available = true;
         shader_caps_.storage_buffer_8bit.available = true;
@@ -808,7 +822,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 #ifdef VK_KHR_16bit_storage
     if (supportedExtensions.count(VK_KHR_16BIT_STORAGE_EXTENSION_NAME) > 0 &&
-        deviceProperties.apiVersion < VK_API_VERSION_1_1) {
+        api_version < VK_API_VERSION_1_1) {
         shader_caps_.storage_buffer_16bit.available = true;
         descs.push_back(FeatureDescriptor{
             .sType =
@@ -850,7 +864,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     // Same promoted/legacy split as 16bit_storage: below 1.2 the bits come from
     // the extension struct instead of VkPhysicalDeviceVulkan12Features.
     if (supportedExtensions.count(VK_KHR_8BIT_STORAGE_EXTENSION_NAME) > 0 &&
-        deviceProperties.apiVersion < VK_API_VERSION_1_2) {
+        api_version < VK_API_VERSION_1_2) {
         shader_caps_.storage_buffer_8bit.available = true;
         shader_caps_.uniform_storage_8bit.available = true;
         descs.push_back(FeatureDescriptor{
@@ -892,7 +906,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #ifdef VK_KHR_shader_float16_int8
     if (supportedExtensions.count(VK_KHR_SHADER_FLOAT16_INT8_EXTENSION_NAME) >
             0 &&
-        deviceProperties.apiVersion < VK_API_VERSION_1_3) {
+        api_version < VK_API_VERSION_1_3) {
         shader_caps_.shader_float16.available = true;
         shader_caps_.shader_int8.available = true;
         descs.push_back(FeatureDescriptor{
@@ -931,7 +945,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #ifdef VK_KHR_shader_integer_dot_product
     if (supportedExtensions.count(
             VK_KHR_SHADER_INTEGER_DOT_PRODUCT_EXTENSION_NAME) > 0 &&
-        deviceProperties.apiVersion < VK_API_VERSION_1_3) {
+        api_version < VK_API_VERSION_1_3) {
         descs.push_back(FeatureDescriptor{
             .sType =
                 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_DOT_PRODUCT_FEATURES_KHR,
@@ -1110,7 +1124,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_KHR_zero_initialize_workgroup_memory
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_3 &&
+    if (api_version < VK_API_VERSION_1_3 &&
         supportedExtensions.count(
             VK_KHR_ZERO_INITIALIZE_WORKGROUP_MEMORY_EXTENSION_NAME) > 0) {
         shader_caps_.zero_init_wmem.available = true;
@@ -1151,7 +1165,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     // VK_MAKE_API_VERSION instead of VK_API_VERSION_1_4: the promoted macro is
     // not defined by pre-1.4 headers, and this block sits above the host_image
     // copy block that patches it in.
-    if (deviceProperties.apiVersion < VK_MAKE_API_VERSION(0, 1, 4, 0) &&
+    if (api_version < VK_MAKE_API_VERSION(0, 1, 4, 0) &&
         supportedExtensions.count(
             VK_KHR_SHADER_SUBGROUP_ROTATE_EXTENSION_NAME) > 0) {
         shader_caps_.subgroup_rotate.available = true;
@@ -1193,7 +1207,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     // ---- end shader-level capability probes ---------------------------------
 
 #if VK_VERSION_1_3
-    if (deviceProperties.apiVersion >= VK_API_VERSION_1_3) {
+    if (api_version >= VK_API_VERSION_1_3) {
         shader_caps_.zero_init_wmem.available = true;
         descs.push_back(FeatureDescriptor{
             .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
@@ -1231,7 +1245,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_VERSION_1_4
-    if (deviceProperties.apiVersion >= VK_API_VERSION_1_4) {
+    if (api_version >= VK_API_VERSION_1_4) {
         shader_caps_.subgroup_rotate.available = true;
         shader_caps_.subgroup_rotate_clustered.available = true;
         descs.push_back(FeatureDescriptor{
@@ -1274,7 +1288,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #ifndef VK_VERSION_1_4
 #define VK_API_VERSION_1_4 VK_MAKE_API_VERSION(0, 1, 4, 0)
 #endif
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_4 &&
+    if (api_version < VK_API_VERSION_1_4 &&
         supportedExtensions.count(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME) > 0) {
         descs.push_back(FeatureDescriptor{
             .sType =
@@ -1307,7 +1321,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 
 #ifdef VK_EXT_image_robustness
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_3 &&
+    if (api_version < VK_API_VERSION_1_3 &&
         supportedExtensions.count(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) > 0) {
         descs.push_back(FeatureDescriptor{
             .sType =
@@ -1340,7 +1354,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 
 #ifdef VK_KHR_timeline_semaphore
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
+    if (api_version < VK_API_VERSION_1_2 &&
         supportedExtensions.count(VK_KHR_TIMELINE_SEMAPHORE_EXTENSION_NAME) >
             0) {
         descs.push_back(FeatureDescriptor{
@@ -1374,7 +1388,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 
 #ifdef VK_KHR_buffer_device_address
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
+    if (api_version < VK_API_VERSION_1_2 &&
         supportedExtensions.count(VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME) >
             0) {
         descs.push_back(FeatureDescriptor{
@@ -1476,7 +1490,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
 #endif
 
 #ifdef VK_EXT_subgroup_size_control
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_3 &&
+    if (api_version < VK_API_VERSION_1_3 &&
         supportedExtensions.count(VK_EXT_SUBGROUP_SIZE_CONTROL_EXTENSION_NAME) >
             0) {
         descs.push_back(FeatureDescriptor{
@@ -1676,7 +1690,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_EXT_descriptor_indexing
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_2 &&
+    if (api_version < VK_API_VERSION_1_2 &&
         supportedExtensions.count(VK_EXT_DESCRIPTOR_INDEXING_EXTENSION_NAME)) {
         shader_caps_.descriptor_indexing.available = true;
         shader_caps_.descriptor_partially_bound.available = true;
@@ -1739,7 +1753,7 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 #ifdef VK_KHR_maintenance5
-    if (deviceProperties.apiVersion < VK_API_VERSION_1_4 &&
+    if (api_version < VK_API_VERSION_1_4 &&
         supportedExtensions.count(VK_KHR_MAINTENANCE_5_EXTENSION_NAME) > 0) {
         descs.push_back(FeatureDescriptor{
             .sType =
