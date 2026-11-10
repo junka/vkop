@@ -7568,6 +7568,13 @@ class Quantizer:
         on the buffer (SSBO) backend. The legacy image backend forces fp16
         input images regardless of the declaration, so there the declared dtype
         says nothing and the guard below is skipped.
+
+        On the -q path this runs AFTER fp16_graph.GraphFp16.apply, which is the
+        pass that turns an FP32 export into an FP16 artifact by rewriting the
+        activations' declarations together with their weights' bytes. What is
+        left for this pass is the export that already declares FP16 activations
+        and ships its weights FP32, and the weights of any FP32 island the
+        domain pass had to leave wide.
         """
         print("Selectively quantizing model to FP16...")
 
@@ -7579,6 +7586,12 @@ class Quantizer:
         # (bn params, small tensors) refuse selectively and leave a real fp16
         # model behind.
         saw_fp32_shader_refusal = False
+        # Weights the FP16 domain pass already stored as halves, counted before
+        # the loop below can add more. A zero-conversion census next to a pile of
+        # FP16 payloads is not "the FP32 model under a different name" -- it is a
+        # graph that is already FP16 apart from an island that has to stay wide.
+        already_fp16 = sum(1 for init in dag_model.initializers.values()
+                           if init.data_type == onnx.TensorProto.FLOAT16)
         fp32_cast_outputs = set()  # lazily filled (see precision_tracking branch)
 
         # Build mapping from initializer names to their consumers
@@ -7854,18 +7867,21 @@ class Quantizer:
 
         print(f"Converted {converted_count} FP32 tensors to FP16")
         print(f"Preserved {skipped_count} tensors")
-        if converted_count == 0 and saw_fp32_shader_refusal:
+        if converted_count == 0 and saw_fp32_shader_refusal and not already_fp16:
             # Without this the run reads as a selective decision on a model that
             # was never eligible: the runtime takes each op's shader from its
-            # DATA input, so a graph that declares FLOAT activations keeps every
-            # weight in fp32 no matter what -q fp16 was asked for.
+            # DATA input, so an op whose data input is declared FLOAT keeps its
+            # weight in fp32 no matter what -q fp16 was asked for. The FP16
+            # domain pass exists to change that declaration along with the
+            # bytes; when it could not (an op that cannot follow the declared
+            # dtype, or a graph that mixes the two widths without a Cast between
+            # them) this is the message that says the artifact stayed FP32.
             print("[fp16] WARNING: no weight became FP16, so this artifact is "
-                  "the FP32 model under a different name (-q fp16 downcasts the "
-                  "weights of a graph that ALREADY runs FP16, e.g. an FP16 "
-                  "export; it does not convert an FP32 graph into an FP16 one). "
-                  "Every float weight here feeds an op whose data input the "
-                  "graph declares FLOAT, and an FP16 weight behind an FP32 "
-                  "shader is a wrong model, not a smaller one.")
+                  "the FP32 model under a different name. Every float weight "
+                  "here feeds an op the FP16 domain pass left at FP32 -- see "
+                  "the [fp16-domain] lines above for the op and why. An FP16 "
+                  "weight behind an FP32 shader is a wrong model, not a "
+                  "smaller one.")
 
     @staticmethod
     def _is_excluded(name, exclude):

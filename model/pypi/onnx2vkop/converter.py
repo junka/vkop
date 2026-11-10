@@ -22,6 +22,7 @@ try:
     from . import layout_audit
     from . import exclusion
     from . import quant_payload
+    from .fp16_graph import GraphFp16
     from .optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -46,6 +47,7 @@ except ImportError:
     import layout_audit
     import exclusion
     import quant_payload
+    from fp16_graph import GraphFp16
     from optimizer import (
         FusionOptimizer,
         InitializerMerger,
@@ -937,10 +939,21 @@ class ModelConverter:
                       "fp32-domain propagation quantize_to_fp16_selective runs "
                       "for the ops that can only be right at full width -- one "
                       "wide weight beside fp16 activations is a Cast node, not "
-                      "a precision knob.", file=sys.stderr)
-            # The fp16 weight pass needs the target backend: only the buffer
-            # backend creates tensors with the dtype the file declares, so only
-            # there can a "this op runs fp32" verdict be read off the graph.
+                      "a precision knob, and fp16_graph.py refuses the rewrite "
+                      "rather than shipping one.", file=sys.stderr)
+            # An FP32 export becomes an FP16 ARTIFACT here: the domain pass
+            # rewrites the declarations and the weight bytes together, because
+            # the runtime picks each op's shader from the dtype of the tensors
+            # it is handed and a weight flipped on its own would leave the op
+            # reading half-typed storage with the FP32 kernel.
+            GraphFp16.apply(dag_model, getattr(args, "target_backend", "buffer"))
+            # Then the weight pass, for what the domain pass cannot own: an
+            # export that already declares FP16 activations but ships its
+            # weights FP32. On a graph the domain pass just flipped it finds
+            # every weight FP16 already and says so. The fp16 weight pass needs
+            # the target backend too: only the buffer backend creates tensors
+            # with the dtype the file declares, so only there can a "this op
+            # runs fp32" verdict be read off the graph.
             self.quantizer.quantize_to_fp16_selective(
                 dag_model, getattr(args, "target_backend", "buffer")
             )

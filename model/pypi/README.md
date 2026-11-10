@@ -25,12 +25,17 @@ quantize with fp16
 onnx2vkop -i model.onnx -q fp16
 ```
 
-`-q fp16` downcasts the weights of ops that ALREADY run fp16 -- an fp16 export,
-where a few leftovers are still fp32. It does not turn an fp32 graph into an
-fp16 one: the runtime picks each op's shader from its data input, so behind an
-fp32 activation an fp16 weight is read as fp32 bytes (a wrong model, not a
-smaller one). On a convnet exported in fp32 that means it converts nothing, and
-the run now says so instead of printing a bare `Preserved 42 tensors`.
+`-q fp16` produces an FP16 artifact. `onnx2vkop/fp16_graph.py` computes the
+graph's FP16 domain and rewrites the activation declarations and the weight
+bytes together, because the runtime picks each op's shader from the dtype of
+the tensors it is handed -- an FP16 weight behind an FP32 Conv reads a 384-byte
+table as a 768-byte operand, which is a wrong model, not a smaller one. Only an
+op whose build follows the tensor dtype AND that has a real dual FP16 buffer
+build can enter the domain; an op that cannot keeps itself and every tensor it
+touches at FP32 (that verdict propagates through the graph, and Cast is the only
+node allowed to sit between the two widths), and the run names the op and the
+reason. An export that already declares FP16 activations but ships FP32 weights
+is handled by the older per-weight pass afterwards.
 
 Hold one layer's weights at their source precision, to localize the accuracy a
 byte format cost (`onnx2vkop/exclusion.py`):

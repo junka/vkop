@@ -101,8 +101,11 @@ python3 -m onnx2vkop.cli -i resnet18-v2-7.onnx
 `struct.pack` 格式不再生成；已有的旧 `.vkopbin` 需用本命令重新转换。
 
 - 支持量化：fp16, int8 对称量化
-  （`-q fp16` 只降低**已经以 fp16 运行**的那些 op 的权重：运行时按数据输入选 shader，
-  所以 fp32 导出的图上一个权重都不会转，转换日志会显式告警，产物仍是 fp32）
+  （`-q fp16` 产出真正的 fp16 模型：`fp16_graph.py` 算出整图的 FP16 域，把激活声明和
+  权重字节一起改成 fp16。只有「shader 按张量 dtype 选择」且「确实有 fp16 构建」的 op
+  能进这个域；进不了的 op 连同它读写的张量整体留在 fp32（这个判定会沿数据流传播，
+  Cast 是唯一允许横跨两种宽度的节点），日志按节点名给出原因。运行时按数据输入选
+  shader，半宽权重配 fp32 shader 是错模型，不是省空间）
 - 支持指定batch size
 - 支持针对3D,4D NCHW to RGBA转换到模型
 - 支持tensor合并，以便节约内存
@@ -326,9 +329,14 @@ legacy `struct.pack` format is no longer produced; existing old `.vkopbin`
 files must be reconverted with this command.
 
 - Supports quantization: fp16, int8 symmetric quantization
-  (`-q fp16` downcasts only the weights of ops that ALREADY run fp16: the
-  runtime picks each op's shader from its data input, so on an fp32 export it
-  converts nothing, warns, and leaves an fp32 artifact)
+  (`-q fp16` produces a real FP16 artifact: `fp16_graph.py` computes the graph's
+  FP16 domain and rewrites the activation declarations together with the weight
+  bytes. Only an op whose shader build follows the tensor dtype, and that has a
+  real dual FP16 build, may enter it; an op that cannot keeps itself and every
+  tensor it touches at FP32 -- that verdict propagates along the data flow, and
+  Cast is the only node allowed between the two widths -- and the run names the
+  op and the reason. The runtime picks each op's shader from its data input, so
+  an FP16 weight behind an FP32 shader is a wrong model, not a smaller one)
 - Supports specifying batch size
 - Supports 3D/4D NCHW to RGBA model conversion
 - Supports tensor merging to save memory

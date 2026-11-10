@@ -640,6 +640,57 @@ def known_ops() -> Set[str]:
     return set(_PRIMARY.keys())
 
 
+# The ops whose buffer shader build follows the DTYPE OF THE TENSORS they are
+# handed, rather than the --precision flag: exactly the case list of
+# core/runtime.cpp's `op_shader_fp16`, spelled with the ONNX op_type strings
+# this table is keyed by (all aliases of an enum, e.g. Conv and Conv2d, are
+# listed). Every name here returns
+# `data_input->dtype() == typeid(uint16_t) ? 1 : 0` for its fp16 choice; an op
+# NOT here falls through to `default: return precision;`, so its build is
+# picked from the flag while its buffers are allocated 2-bytes-per-element from
+# the declaration -- an fp32 kernel over half-typed storage is garbage, not an
+# error. That asymmetry is why an fp16 artifact can only be built out of ops
+# on this list (see fp16_graph.py).
+#
+# The shipped converter cannot read C++, so this is a copy, guarded in both
+# directions by test_shader_map_agrees.py, which parses the switch out of
+# core/runtime.cpp and the enum→string map out of ops/Ops.hpp.
+# The list is the switch's case labels translated verbatim, including TopK. It
+# is the necessary half only: `fp16_dtype_driven` below adds the build half,
+# which is where TopK -- in the switch, but with a single buffer shader -- is
+# put back outside the domain.
+_FP16_DTYPE_DRIVEN: Set[str] = {
+    "Add", "Atan", "Attention", "Concat", "Conv", "Conv2d", "Cos", "Div",
+    "Erf", "Expand", "Floor", "FusedElemwise", "Gather", "GlobalAveragePool",
+    "LayerNorm", "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d",
+    "Maxpool2d", "Min", "Mod", "Mul", "Neg", "PRelu", "Pow", "Reduce",
+    "ReduceMean", "Relu", "Reshape", "Resize", "RMSNorm", "RotaryEmbedding",
+    "ScatterElements", "Sigmoid", "Sin", "Slice", "Softmax", "Softplus",
+    "Split", "Sqrt", "Sub", "Tanh", "TopK", "Topk", "Transpose",
+}
+
+
+def fp16_dtype_driven(op_type: str) -> bool:
+    """Can an fp16 artifact put this op inside its FP16 domain?
+
+    True needs both halves: the runtime must choose this op's build from the
+    tensor dtype (the list above), and the op must actually HAVE a distinct
+    fp16 buffer build. Either one missing means the graph stays in the FP32
+    domain at this node.
+
+    TopK is the case the second half exists for: it IS in the dispatch switch,
+    so declaring its tensors fp16 sends the runtime looking for a build the
+    archive never carried -- `plan_for_op` returns the fp32 key in its
+    `buffer_fp16` cell when the op has no dual build, and an op that reads
+    half-typed storage through the fp32 kernel is the failure this whole
+    question is trying to avoid.
+    """
+    spec = _PRIMARY.get(op_type)
+    if spec is None:
+        return False
+    return op_type in _FP16_DTYPE_DRIVEN and bool(spec[3])
+
+
 # Spellings `_PRIMARY` accepts for the archive filter but that the runtime's
 # convert_opstring_to_enum does NOT resolve (it wants TopK / MaxPool2d). A
 # graph node written with one of these maps to OpType::UNKNOWN at load time, so

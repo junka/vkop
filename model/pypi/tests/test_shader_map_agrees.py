@@ -52,7 +52,7 @@ def _parse_enum_to_shader_spec(path: str) -> Dict[str, Tuple[str, str, bool, boo
     pending_cases: list = []
     for line in body.splitlines():
         line = line.strip()
-        cm = re.match(r"^case T::([A-Z_]+):$", line)
+        cm = re.match(r"^case T::([A-Z][A-Z0-9_]*):$", line)
         if cm:
             pending_cases.append(cm.group(1))
             continue
@@ -82,7 +82,13 @@ def _parse_str_or_null(raw: str):
 
 
 def _parse_opstring_to_enum(path: str) -> Dict[str, str]:
-    """{ONNX-style op_type string: OpType enum member name}."""
+    """{ONNX-style op_type string: OpType enum member name}.
+
+    A clause may accept several spellings for one enum (`Conv2d` and `Conv`
+    both return CONV2D), and enum members contain digits, so this walks the
+    body collecting `name == "…"` conditions until the `return` that consumes
+    them rather than pairing one string with one enum.
+    """
     with open(path) as f:
         text = f.read()
     m = re.search(
@@ -91,12 +97,16 @@ def _parse_opstring_to_enum(path: str) -> Dict[str, str]:
         re.DOTALL,
     )
     assert m, "could not locate convert_opstring_to_enum in Ops.hpp"
-    body = m.group(1)
     result: Dict[str, str] = {}
-    for name, enum in re.findall(
-        r'name == "([^"]+)"[^"]*return vkop::ops::OpType::([A-Z_]+)', body
-    ):
-        result[name] = enum
+    pending: list = []
+    for raw in m.group(1).splitlines():
+        line = raw.strip()
+        pending.extend(re.findall(r'name == "([^"]+)"', line))
+        rm = re.search(r"return vkop::ops::OpType::([A-Z][A-Z0-9_]*);", line)
+        if rm:
+            for name in pending:
+                result[name] = rm.group(1)
+            pending = []
     return result
 
 
@@ -279,3 +289,113 @@ def test_plan_cells_are_post_fallback():
     # host-only ops have no key under any spelling, hence no row
     for host_only in ("Shape", "Squeeze", "Unsqueeze", "Identity", "NotAnOp"):
         assert shader_map.plan_for_op(host_only) is None
+
+
+RUNTIME_CPP = os.path.join(REPO_ROOT, "core", "runtime.cpp")
+
+
+def _parse_fp16_dispatch_switch(path: str) -> set:
+    """{OpType enum} whose fp16 build is chosen from the tensor dtype.
+
+    The switch's fall-through groups each end in a return; a group is
+    dtype-driven when the statement that produced it reads
+    `typeid(uint16_t)` off a tensor and not when it hands back `precision`.
+    Comment lines are skipped because the explanations in that switch talk
+    about fp16 without deciding anything.
+    """
+    with open(path) as f:
+        text = f.read()
+    m = re.search(r"int op_shader_fp16\([^)]*\)\s*\{(.*?)\n\}", text, re.DOTALL)
+    assert m, "could not locate op_shader_fp16 in core/runtime.cpp"
+    driven, pending, chunk = set(), [], []
+
+    def flush():
+        if pending and any("typeid(uint16_t)" in line for line in chunk):
+            driven.update(pending)
+        del pending[:]
+        del chunk[:]
+
+    for raw in m.group(1).splitlines():
+        line = raw.strip()
+        if not line or line.startswith("//"):
+            continue
+        # Enum members carry digits (CONV2D, MAXPOOL2D); a label that does not
+        # match one is a statement, not a case.
+        cm = re.match(r"^case ops::OpType::([A-Z][A-Z0-9_]*):$", line)
+        if cm:
+            if chunk:
+                flush()
+            pending.append(cm.group(1))
+            continue
+        if line.startswith("default:"):
+            flush()
+            continue
+        # Statements before the first case (the `data_input == nullptr` guard,
+        # the `switch` line) also read a dtype-adjacent expression, but they
+        # belong to no group; ignoring them while `pending` is empty keeps the
+        # prologue from being mistaken for a fall-through body.
+        if pending:
+            chunk.append(line)
+    flush()
+    return driven
+
+
+@pytest.mark.skipif(not (os.path.exists(RUNTIME_CPP) and os.path.exists(OPS_HPP)),
+                    reason="core/runtime.cpp or ops/Ops.hpp not present")
+def test_fp16_dispatch_table_matches_the_runtime_switch():
+    """shader_map._FP16_DTYPE_DRIVEN is the converter's copy of the runtime's
+    `op_shader_fp16` case list, in ONNX op_type spellings.
+
+    The domain pass (onnx2vkop/fp16_graph.py) decides an op's precision from
+    this list, and the shipped converter cannot read C++ -- so a name that
+    entered the switch on one side only would hand an FP16 artifact a node
+    whose build comes from --precision instead of from its tensors. That is
+    not a slow model, it is a wrong one, and nothing at run time reports it.
+    """
+    driven_enums = _parse_fp16_dispatch_switch(RUNTIME_CPP)
+    name_to_enum = _parse_opstring_to_enum(OPS_HPP)
+    by_enum: Dict[str, set] = {}
+    for name, enum in name_to_enum.items():
+        by_enum.setdefault(enum, set()).add(name)
+    expected = {n for e in driven_enums for n in by_enum.get(e, ())}
+    # A vkop-internal spelling C++ never accepts joins the group through the
+    # shader it shares with an accepted alias ("Maxpool2d" vs "MaxPool2d").
+    for name, spec in shader_map._PRIMARY.items():
+        if name in name_to_enum or name in expected:
+            continue
+        if any(o in expected and shader_map._PRIMARY[o][1] == spec[1]
+               for o in shader_map._PRIMARY):
+            expected.add(name)
+    assert expected == shader_map._FP16_DTYPE_DRIVEN, (
+        f"runtime switch says {sorted(expected - shader_map._FP16_DTYPE_DRIVEN)} "
+        f"are dtype-driven and the table misses them; "
+        f"{sorted(shader_map._FP16_DTYPE_DRIVEN - expected)} are in the table "
+        "but the switch dispatches them from precision_"
+    )
+
+
+def test_dtype_driven_also_requires_a_real_fp16_build():
+    """An op in the switch with no dual build asks for a key that resolves to
+    the fp32 shader, so `fp16_dtype_driven` has to say no anyway.
+
+    TopK is exactly that: in the switch, keyed on para_.fp16 internally, but
+    with a single buffer build. It must not be able to pull a graph into the
+    FP16 domain.
+    """
+    assert "TopK" in shader_map._FP16_DTYPE_DRIVEN
+    assert not shader_map.fp16_dtype_driven("TopK")
+    assert shader_map.plan_for_op("TopK")["buffer_fp16"] == \
+        shader_map.plan_for_op("TopK")["buffer"]
+    for op in ("Conv", "MatMul", "GlobalAveragePool", "MaxPool", "Add"):
+        assert shader_map.fp16_dtype_driven(op), op
+    # An op the switch does not even list cannot be in the domain either.
+    for op in ("Gemm", "BatchNormalization", "AveragePool", "Where", "NotAnOp"):
+        assert not shader_map.fp16_dtype_driven(op), op
+
+
+def test_host_only_ops_have_no_shader_at_all():
+    """fp16_graph treats them as dtype-neutral, which is only safe because
+    they copy data without computing on it -- no key, no build, no choice."""
+    for op in shader_map.HOST_ONLY_OPS:
+        assert shader_map.plan_for_op(op) is None, op
+        assert not shader_map.fp16_dtype_driven(op), op

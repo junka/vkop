@@ -236,9 +236,11 @@ Examples:
     parser.add_argument(
         "-q", "--quant", choices=["fp16", "int8", "fp8e4m3", "fp8e5m2",
                                   "int4", "nf4", "nvfp4", "awq"],
-        help="Quantization type: fp16 (downcasts the weights of ops that "
-             "already run fp16; on a graph whose activations are all declared "
-             "FLOAT it converts nothing, and the run warns), int8 (per-column "
+        help="Quantization type: fp16 (an FP16 artifact: the FP16 domain "
+             "pass rewrites the activations' declarations and the weights' "
+             "bytes together, and an op whose shader build does not follow "
+             "the tensor dtype stays FP32 along with every tensor it "
+             "touches; see onnx2vkop/fp16_graph.py), int8 (per-column "
              "scale), an fp8 "
              "weight-only MatMul payload with a per-column scale (e4m3 or e5m2, "
              "one byte per value), a 4-bit weight-only MatMul payload with a "

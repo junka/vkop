@@ -23,12 +23,13 @@ Two things this deliberately is not, and both are the same reason: a lone wide
 weight in an otherwise byte model is not a no-op, it is a decision with
 consequences the pass below cannot own.
 
-  * It does not apply to `-q fp16`. `quantize_to_fp16_selective` propagates the
-    fp32 domain through the ops that can only be right at full width
-    (`_FP32_PROPAGATING`) precisely because a single fp32 weight next to fp16
-    activations needs a Cast node -- an island is a correctness problem, not a
-    size saving. A per-node "stay fp32" verdict there would have to run the same
-    propagation, and that is a different feature.
+  * It does not apply to `-q fp16`. Precision there is a property of a whole
+    node, and `fp16_graph.py` computes which nodes can share the FP16 width;
+    `quantize_to_fp16_selective` propagates the fp32 domain through the ops that
+    can only be right at full width (`_FP32_PROPAGATING`) for the same reason. A
+    single fp32 weight next to fp16 activations is not an island, it is a Cast
+    node the exporter did not emit, so a per-node "stay fp32" verdict here would
+    have to rewrite the graph, not skip a tensor.
   * It does not apply to a weight that arrives already on somebody else's
     quantization grid. `PreQuantizedWeights.fold` imports those; it is not
     quantizing them, and excluding its node would leave a live DequantizeLinear
