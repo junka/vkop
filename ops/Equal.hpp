@@ -101,6 +101,10 @@ class Equal : public BufferBinaryFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the host_shape-mode int64 compare
+        // (cpuEqualInt64); the GPU shader path records a dispatch only.
+        set_did_host_work_last_round(
+            inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled());
         auto shape_a = inputs[0]->getShape();
         auto shape_b = inputs[1]->getShape();
         auto out_shape = computeBroadcastShape(shape_a, shape_b);

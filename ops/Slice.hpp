@@ -191,6 +191,13 @@ class SliceBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here: the int64 data slice walks the bytes on the host
+        // (below), and a non-STABLE meta readback stalls. A STABLE fp32/fp16
+        // slice is a pure GPU dispatch. Reported up front so every path
+        // states its answer.
+        set_did_host_work_last_round(
+            inputs[0]->dtype() == typeid(int64_t) ||
+            slice_state_ != LearnState::STABLE);
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 

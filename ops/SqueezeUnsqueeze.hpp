@@ -70,6 +70,14 @@ class SqueezeUnsqueeze : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here: the axes-input readback (a non-STABLE learner) and
+        // the host-only fallback copy below. The GPU-alias path — every LLM
+        // instance — reads no bytes and dispatches nothing; it is a pure
+        // metadata view. Reported before the early returns so every path
+        // states its answer.
+        set_did_host_work_last_round(
+            inputs.size() > 1 && inputs[1] &&
+            axes_cache_state_ != AxesLearnState::STABLE);
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 

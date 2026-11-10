@@ -84,6 +84,13 @@ class Cast : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the int64->fp32 host cast's readback (the rotary
+        // position-id chain; the LINEAR_GROW fast path skips it, everything
+        // else pays it). The fp32<->fp16 paths are pure GPU dispatches.
+        set_did_host_work_last_round(
+            inputs[0]->dtype() == typeid(int64_t) &&
+            outputs[0]->dtype() == typeid(float) &&
+            cast_state_ != LearnState::LINEAR_GROW);
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
 

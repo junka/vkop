@@ -1910,6 +1910,71 @@ Runtime::ListTensors() const {
     return out;
 }
 
+std::vector<Runtime::NodeOutInfo>
+Runtime::node_outputs_checksum(int node_idx) const {
+    std::vector<NodeOutInfo> out;
+    if (node_idx < 0 ||
+        node_idx >= static_cast<int>(node_output_tensors_.size())) {
+        return out;
+    }
+    (void)node_ops_;
+    auto op_name =
+        (node_idx < static_cast<int>(node_ops_.size()) && node_ops_[node_idx])
+            ? node_ops_[node_idx]->get_name()
+            : std::string("?");
+    for (const auto &t : node_output_tensors_[node_idx]) {
+        if (!t) {
+            out.push_back({op_name, "null", 0, 0});
+            continue;
+        }
+        NodeOutInfo info;
+        info.bytes = 0;
+        info.cksum = 1469598103934665603ull;
+        const auto &dt = t->dtype();
+        if (dt == typeid(uint16_t)) {
+            auto g = std::dynamic_pointer_cast<Tensor<uint16_t>>(t);
+            info.dtype = "fp16";
+            if (g) {
+                g->copyToCPU(m_cmdpool_);
+                info.bytes = g->data().size() * sizeof(uint16_t);
+                for (auto x : g->data())
+                    info.cksum = (info.cksum ^ x) * 1099511628211ull;
+            }
+        } else if (dt == typeid(float)) {
+            auto g = std::dynamic_pointer_cast<Tensor<float>>(t);
+            info.dtype = "fp32";
+            if (g) {
+                g->copyToCPU(m_cmdpool_);
+                info.bytes = g->data().size() * sizeof(float);
+                union {
+                    float f;
+                    uint32_t u;
+                } cvt;
+                for (auto x : g->data()) {
+                    cvt.f = x;
+                    info.cksum = (info.cksum ^ cvt.u) * 1099511628211ull;
+                }
+            }
+        } else if (dt == typeid(int64_t)) {
+            auto g = std::dynamic_pointer_cast<Tensor<int64_t>>(t);
+            info.dtype = "i64";
+            if (g) {
+                g->copyToCPU(m_cmdpool_);
+                info.bytes = g->data().size() * sizeof(int64_t);
+                for (auto x : g->data())
+                    info.cksum =
+                        (info.cksum ^ static_cast<uint64_t>(x)) *
+                        1099511628211ull;
+            }
+        } else {
+            info.dtype = "?";
+        }
+        info.op = op_name;
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
 double Runtime::Run() {
     auto dev = m_cmdpool_->getVulkanDevice();
     auto start = std::chrono::steady_clock::now();
@@ -2954,6 +3019,25 @@ double Runtime::Run() {
                 if (w > 0) segment_replay_warmup_ = w;
             }
         }
+        if (const char *sn = std::getenv("VKOP_SEG_NO_REPLAY")) {
+            if (sn[0] != '\0') {
+                seg_no_replay_substrs_ =
+                    std::make_unique<std::vector<std::string>>();
+                const char *p = sn;
+                while (*p != '\0') {
+                    const char *q = std::strchr(p, ',');
+                    size_t len =
+                        q ? static_cast<size_t>(q - p) : std::strlen(p);
+                    if (len > 0)
+                        seg_no_replay_substrs_->emplace_back(p, len);
+                    if (!q)
+                        break;
+                    p = q + 1;
+                }
+                if (seg_no_replay_substrs_->empty())
+                    seg_no_replay_substrs_.reset();
+            }
+        }
     }
     segment_replay_enabled_ = seg_replay;
 
@@ -3014,25 +3098,42 @@ double Runtime::Run() {
     std::vector<std::vector<int>> seg_op_indices_curr;
     seg_op_indices_curr.push_back({});  // 第 0 段
 
-    // The input buffers a segment's recording binds, collected while it
-    // records. Replay is valid only while every one of them is still the same
-    // VkBuffer: the descriptor-buffer offset and the BDA address table both bake
-    // the handle into the recording, so a moved buffer means a stale command
-    // buffer. Collected here (during recording) rather than in a pre-pass,
-    // because the tensors are only guaranteed to hold their round's buffers
-    // once the producing levels have run.
-    auto note_segment_buffers = [&](std::set<uint64_t> &ids,
+    // The bindings a segment's recording baked in, collected while it records.
+    // An identity is (root VkBuffer, window offset, window size) — the exact
+    // bytes the recorded descriptor offset / BDA address point at:
+    //    buffer_info_.offset = abs_offset(), BDA addr = parent + range_offset_,
+    // so a sub-range view that slides inside an unchanged parent allocation
+    // (KV cache growing one row per round) invalidates the recording while the
+    // root handle stays put.
+    //
+    // INPUTS AND OUTPUTS both: a recorded write bakes its destination exactly
+    // like a read bakes its source (Transpose's BDA fast path puts out_addr in
+    // its PC; every op's descriptor set names its output buffer). A recycled
+    // output buffer means the replay writes into a dead allocation while the
+    // live output tensor never advances — measured as /Transpose_4's output
+    // freezing at the previous round's value while its input stayed fresh.
+    //
+    // Shapes are NOT part of the identity; see the header for why getShape()
+    // here only produced false positives.
+    //
+    // Collected here (during recording) rather than in a pre-pass, because the
+    // tensors are only guaranteed to hold their round's buffers once the
+    // producing levels have run.
+    auto note_one_buffer = [&](std::set<SegmentBinding> &ids,
+                               const std::shared_ptr<core::ITensor> &t) {
+        if (!t) return;
+        auto res = t->gpu_buffer();
+        if (!res || res->getResourceType() != ResourceType::VK_BUFFER) return;
+        auto vb = std::dynamic_pointer_cast<VulkanBuffer>(res);
+        if (!vb) return;
+        ids.insert({reinterpret_cast<uint64_t>(vb->getBuffer()),
+                    (uint64_t)vb->abs_offset(), (uint64_t)vb->getSize()});
+    };
+    auto note_segment_buffers = [&](std::set<SegmentBinding> &ids,
                                     const std::vector<int> &op_indices) {
         for (int op_idx : op_indices) {
-            for (auto &t : node_input_tensors_[op_idx]) {
-                if (!t) continue;
-                auto res = t->gpu_buffer();
-                if (!res || res->getResourceType() != ResourceType::VK_BUFFER) {
-                    continue;
-                }
-                auto vb = std::dynamic_pointer_cast<VulkanBuffer>(res);
-                if (vb) ids.insert(reinterpret_cast<uint64_t>(vb->getBuffer()));
-            }
+            for (auto &t : node_input_tensors_[op_idx]) note_one_buffer(ids, t);
+            for (auto &t : node_output_tensors_[op_idx]) note_one_buffer(ids, t);
         }
     };
 
@@ -3050,10 +3151,10 @@ double Runtime::Run() {
                            segment_replay_hit_this_round_[ord];
         // 只有非 hit 段才更新 buffer 身份. hit 段的身份是上轮记下的.
         if (seg_replay && !skip_record) {
-            if (segment_buf_ids_.size() <= ord)
-                segment_buf_ids_.resize(ord + 1);
-            segment_buf_ids_[ord].clear();
-            note_segment_buffers(segment_buf_ids_[ord],
+            if (segment_buf_ranges_.size() <= ord)
+                segment_buf_ranges_.resize(ord + 1);
+            segment_buf_ranges_[ord].clear();
+            note_segment_buffers(segment_buf_ranges_[ord],
                                  seg_op_indices_curr[ord]);
         }
         if (!skip_record) {
@@ -3123,44 +3224,107 @@ double Runtime::Run() {
     // their import across ResizeInput (Tensor::recreate_storage_buffer) and
     // pooled intermediates keep their per-node tensor objects.
     //
-    // Buffer identity still has to hold, so a node whose input buffers moved
-    // since the last recording invalidates its segment. That check is one
-    // VkBuffer comparison per input, done while the segment is being recorded
-    // (see seg_buf_ids below) rather than as a pre-pass over the whole graph.
+    // Buffer identity still has to hold, so a node whose bindings moved since
+    // the last recording invalidates its segment.
     if (graph_mode && seg_replay) {
         segment_replay_round_++;
         const bool seg_log =
             std::getenv("VKOP_SEGMENT_REPLAY_LOG") != nullptr;
-        // Segments are the graph's fixed level split. Keeping this stable is
-        // what lets a segment's recording be re-submitted: the ordinal ->
-        // level-range mapping is identical every round, so ordinal N always
-        // describes the same commands.
+        // Segments follow the OP GRAPH's levels, one level each.
         //
-        // (An attempt to give each dynamic level its own segment so the static
-        // neighbours could replay was reverted: with one level per segment the
-        // hit path never reaches graph_submit, segments stop being retired, and
-        // the replayed commands never execute -- measured past_len frozen at 8
-        // and one token repeated forever.)
-        const size_t est_seg = (level_node_indices_.size() + graph_segment - 1) /
-                               graph_segment;
+        // A segment is replayable only while every op inside it is, and the
+        // per-op answer is CONSTRUCTION-TIME STATIC in steady state (option B):
+        // Attention's recording bakes kv_len (recording_changes_per_round),
+        // Reshape's shape-target learner and MatMul's shape-derived split-K /
+        // down-act control header report via did_host_work_last_round. Those
+        // instance predicates FLIP during the learning rounds and across a
+        // phase boundary, so the split is compared against the previous
+        // round's and any difference discards every cached recording and
+        // restarts the warm-up -- otherwise the ordinal->level mapping drifts
+        // and graph_cmds_[N] is re-submitted over the wrong levels (measured:
+        // segments 328->300, garbage tokens).
+        //
+        // The split itself is one level per segment; see the corruption note
+        // below for why packing is off. This is only safe because the level
+        // loop retires a HIT segment too: while the retirement test carried
+        // `!seg_hit`, a hit segment was never submitted and the split silently
+        // froze the KV cache.
+        seg_level_ranges_.clear();
+        {
+            const size_t nlev = level_node_indices_.size();
+            // ONE LEVEL PER SEGMENT. Packing several static levels into one
+            // segment corrupts decode: with graph_segment >= 2 the model emits
+            // "The capital capital of France is Paris Paris", with
+            // graph_segment == 1 it emits "The capital of France is Paris."
+            // (measured 3/3 each, warmup=2). The replayed commands of a packed
+            // segment are individually buffer-correct -- the (dims, buffer,
+            // offset, size) identity check passes for every one of them -- so
+            // the defect is in what the pack SKIPS between the levels, not in
+            // what it re-submits. Ruled out along the way: barriers
+            // (VKOP_LEVEL_SYNC / VKOP_NO_ALIAS_BARRIER change nothing), BDA and
+            // descriptor buffers (both off: same corruption), and the per-op
+            // host-work predicates (excluding any single op type leaves the
+            // corruption; excluding all six types that appear inside hit
+            // segments fixes it only because that empties the static segments).
+            //
+            // One level per segment is also what the hit rate wants: 266/384
+            // hit vs 90/241 + 29/61 for packing, because a pack is only
+            // replayable while EVERY level in it is. Decode round timings are
+            // equal within noise. Revisit packing once the remaining decode
+            // optimisations land -- the workaround costs nothing today.
+            for (size_t li = 0; li < nlev; li++) {
+                seg_level_ranges_.push_back({li, li + 1});
+            }
+        }
+        // Split changed since last round -> the cached recordings describe
+        // different level ranges than this round's ordinals. Drop them all
+        // and re-warm: correctness first, the re-record is one round.
+        if (seg_replay_rounds_valid_ &&
+            seg_level_ranges_ != seg_level_ranges_prev_) {
+            graph_cmds_.clear();
+            segment_buf_ranges_.clear();
+            segment_replay_round_ = 0;
+            if (seg_log) {
+                fprintf(stderr,
+                        "[seg-replay] split changed (%zu -> %zu segments); "
+                        "re-recording everything\n",
+                        seg_level_ranges_prev_.size(),
+                        seg_level_ranges_.size());
+            }
+        }
+        seg_level_ranges_prev_ = seg_level_ranges_;
+        seg_replay_rounds_valid_ = true;
+        const size_t est_seg = seg_level_ranges_.size();
         // Warm-up: the first rounds establish each segment's recording and its
         // buffer identity. Before that nothing may be replayed.
         const bool warm = segment_replay_round_ > segment_replay_warmup_;
         segment_replay_hit_this_round_.assign(est_seg, warm);
         if (!warm) {
-            segment_buf_ids_.clear();
+            segment_buf_ranges_.clear();
         }
         for (size_t ord = 0; warm && ord < est_seg; ord++) {
-            const size_t seg_start = ord * graph_segment;
-            const size_t seg_end = std::min(seg_start + graph_segment,
-                                            level_node_indices_.size());
+            const size_t seg_start = seg_level_ranges_[ord].first;
+            const size_t seg_end = seg_level_ranges_[ord].second;
             int trigger_op_idx = -1;
             for (size_t li = seg_start; li < seg_end && trigger_op_idx < 0;
                  li++) {
                 for (int op_idx : level_node_indices_[li]) {
                     auto &op = node_ops_[op_idx];
-                    if (op->recording_changes_per_round() ||
-                        op->has_host_side_effects()) {
+                    bool forced = false;
+                    if (seg_no_replay_substrs_) {
+                        // VKOP_SEG_NO_REPLAY: diagnostic bisect knob. Force a
+                        // type dynamic regardless of its own predicate.
+                        std::string tn =
+                            convert_optype_to_string(op->get_type());
+                        for (auto &s : *seg_no_replay_substrs_) {
+                            if (!s.empty() && tn.find(s) != std::string::npos) {
+                                forced = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (forced || op->recording_changes_per_round() ||
+                        op->did_host_work_last_round()) {
                         trigger_op_idx = op_idx;
                         break;
                     }
@@ -3179,40 +3343,18 @@ double Runtime::Run() {
                 }
                 continue;
             }
-            // Static segment: replayable unless one of the buffers it binds
-            // moved since the recording that produced the cached commands.
-            if (ord < segment_buf_ids_.size()) {
-                bool moved = false;
-                for (size_t li = seg_start; li < seg_end && !moved; li++) {
-                    for (int op_idx : level_node_indices_[li]) {
-                        for (auto &t : node_input_tensors_[op_idx]) {
-                            if (!t) continue;
-                            auto res = t->gpu_buffer();
-                            if (!res ||
-                                res->getResourceType() !=
-                                    ResourceType::VK_BUFFER) {
-                                continue;
-                            }
-                            auto vb =
-                                std::dynamic_pointer_cast<VulkanBuffer>(res);
-                            if (!vb) continue;
-                            if (segment_buf_ids_[ord].count(
-                                    reinterpret_cast<uint64_t>(
-                                        vb->getBuffer())) == 0) {
-                                moved = true;
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (moved) {
-                    segment_replay_hit_this_round_[ord] = false;
-                    if (seg_log)
-                        fprintf(stderr,
-                                "[seg-replay] seg %zu: record (buffer moved)\n",
-                                ord);
-                }
-            } else {
+            // Static segment: replayable in principle, but only if every
+            // binding still has the identity its recording baked in. That
+            // check CANNOT be done here: at the top of Run() no producer of
+            // this round has run, so every tensor still holds LAST round's
+            // buffer. The check passes spuriously and the replay then reads
+            // buffers that this round's producers replaced further down the
+            // level loop (measured: /Transpose_4's input handle is a fresh
+            // allocation every round, while its output is stable). The
+            // identity test therefore runs at the segment's first level, once
+            // everything it reads from outside the segment has been produced —
+            // see the pre_hit branch in the level loop.
+            if (ord >= segment_buf_ranges_.size()) {
                 segment_replay_hit_this_round_[ord] = false;
             }
         }
@@ -3257,9 +3399,29 @@ double Runtime::Run() {
             bool seg_hit = graph_seg && graph_next_seg > 0 &&
                            graph_next_seg - 1 < segment_replay_hit_this_round_.size() &&
                            segment_replay_hit_this_round_[graph_next_seg - 1];
-            bool boundary = graph_seg && !seg_hit && level_idx != graph_seg_start;
-            if (boundary && static_cast<int>(level_idx - graph_seg_start) >=
-                                graph_segment) {
+            // Retirement must NOT test `!seg_hit`. A hit segment still has to be
+            // closed and submitted when its level range ends; with `!seg_hit`
+            // in this condition a hit segment was never retired, graph_seg
+            // stayed open for the rest of the round, and every later level was
+            // skipped as though it belonged to that one segment -- so the
+            // replayed commands never ran (measured: past_len frozen, one token
+            // repeated forever). graph_submit() already skips end() and keeps
+            // the previous recording when the segment is a hit, so retiring it
+            // is exactly the right thing to do.
+            bool boundary = graph_seg && level_idx != graph_seg_start;
+            bool close_segment = false;
+            if (boundary) {
+                if (seg_replay && graph_next_seg > 0 &&
+                    graph_next_seg - 1 < seg_level_ranges_.size()) {
+                    close_segment =
+                        level_idx >= seg_level_ranges_[graph_next_seg - 1].second;
+                } else {
+                    close_segment =
+                        static_cast<int>(level_idx - graph_seg_start) >=
+                        graph_segment;
+                }
+            }
+            if (close_segment) {
                 graph_submit();
                 boundary = false;
             }
@@ -3268,6 +3430,79 @@ double Runtime::Run() {
                            segment_replay_round_ > segment_replay_warmup_ &&
                            graph_next_seg < segment_replay_hit_this_round_.size() &&
                            segment_replay_hit_this_round_[graph_next_seg];
+            // Bindings verified AT REPLAY TIME, not at the top of Run().
+            //
+            // The top-of-Run() pass can only compare against tensors that still
+            // hold the PREVIOUS round's buffers (no producer has run yet), so it
+            // verifies nothing: it reports every static segment as unchanged and
+            // then replays commands whose baked (buffer, offset) no longer
+            // matches what this round's producers actually allocated. Measured
+            // on the canonical decode repro: /Transpose_4's input is a fresh
+            // 4 KiB allocation every round while the cached command still names
+            // the previous one, so the replayed attention block read stale K/V
+            // and the model emitted "capital capital".
+            //
+            // Here, at the segment's first level, everything produced OUTSIDE
+            // the segment has run this round, and everything produced INSIDE it
+            // still holds the buffer the recording used (the in-segment
+            // producers are exactly the commands being skipped). So a bound
+            // identity that differs now can only be an external input that this
+            // round reallocated -- the segment must re-record.
+            if (pre_hit) {
+                const size_t hord = graph_next_seg;
+                bool bindings_ok = hord < segment_buf_ranges_.size();
+                if (bindings_ok) {
+                    const auto &bound = segment_buf_ranges_[hord];
+                    bindings_ok = false;
+                    const size_t s0 = seg_level_ranges_[hord].first;
+                    const size_t s1 = seg_level_ranges_[hord].second;
+                    for (size_t li = s0; li < s1 && !bindings_ok; li++) {
+                        bindings_ok = true;
+                        for (int op_idx : level_node_indices_[li]) {
+                            auto chk = [&](const std::shared_ptr<core::ITensor> &t,
+                                           int port, bool is_out) {
+                                if (!bindings_ok || !t) return;
+                                auto r = t->gpu_buffer();
+                                if (!r || r->getResourceType() !=
+                                              ResourceType::VK_BUFFER)
+                                    return;
+                                auto v = std::dynamic_pointer_cast<VulkanBuffer>(r);
+                                if (!v) return;
+                                const SegmentBinding key(
+                                    (uint64_t)reinterpret_cast<uint64_t>(
+                                        v->getBuffer()),
+                                    (uint64_t)v->abs_offset(),
+                                    (uint64_t)v->getSize());
+                                if (bound.count(key) == 0) {
+                                    bindings_ok = false;
+                                    if (std::getenv("VKOP_SEGMENT_REPLAY_LOG"))
+                                        fprintf(stderr,
+                                                "[seg-replay] seg %zu: record "
+                                                "(binding moved: %s %s%d)\n",
+                                                hord,
+                                                node_ops_[op_idx]
+                                                    ->get_name()
+                                                    .c_str(),
+                                                is_out ? "out" : "in", port);
+                                }
+                            };
+                            for (size_t k = 0;
+                                 k < node_input_tensors_[op_idx].size(); k++)
+                                chk(node_input_tensors_[op_idx][k], (int)k,
+                                    false);
+                            for (size_t k = 0;
+                                 k < node_output_tensors_[op_idx].size(); k++)
+                                chk(node_output_tensors_[op_idx][k], (int)k,
+                                    true);
+                            if (!bindings_ok) break;
+                        }
+                    }
+                }
+                if (!bindings_ok) {
+                    segment_replay_hit_this_round_[hord] = false;
+                    pre_hit = false;
+                }
+            }
             if (pre_hit) {
                 if (graph_next_seg >= graph_cmds_.size())
                     graph_cmds_.push_back(std::make_shared<VulkanCommandBuffer>(
@@ -3376,23 +3611,41 @@ double Runtime::Run() {
             if (std::getenv("VKOP_SHAPE_TRACE"))
                 fprintf(stderr, "[exec] lvl=%zu node=%zu %s\n", level_idx,
                         node_idx, node_ops_[node_idx]->get_name().c_str());
-            // A pure-view op (Reshape/Squeeze/Unsqueeze) hands its output the
-            // producer's VkBuffer instead of copying, so two tensor objects
-            // address the same bytes. The shape pool recycles tensor objects by
-            // shape and cannot see that sharing, so a recycled object can be
-            // handed to an unrelated node that then writes through the buffer a
-            // live view still reads. Guard it at the write site: if this node's
-            // output buffer was aliased out AND was last written by a different
-            // node, this node is that recycle — give it a buffer of its own.
+            // A pure-view op hands its output the producer's VkBuffer instead
+            // of copying, so two tensor objects address the same bytes. The
+            // shape pool recycles tensor objects by shape and cannot see that
+            // sharing, so a recycled object can be handed to an unrelated node
+            // that then writes through the buffer a live view still reads.
+            // Guard it at the write site: if this node's output buffer was
+            // aliased out AND was last written by a different node, this node
+            // is that recycle — give it a buffer of its own.
             // (Same node writing again is the round loop re-producing the same
-            // tensor, where a fresh buffer would be pure churn; and the view
-            // ops themselves are excluded because they re-alias rather than
-            // write.)
-            const auto view_op_type = node_ops_[node_idx]->get_type();
-            const bool is_view_op =
-                view_op_type == vkop::ops::OpType::RESHAPE ||
-                view_op_type == vkop::ops::OpType::SQUEEZE ||
-                view_op_type == vkop::ops::OpType::UNSQUEEZE;
+            // tensor, where a fresh buffer would be pure churn; and a view op
+            // is excluded because it re-aliases rather than writes.)
+            //
+            // "Is a view" is the INSTANCE answer, not the type: Reshape/
+            // Squeeze/Unsqueeze always alias, but Transpose aliases only when
+            // its perm is a flat identity and gathers for real otherwise. The
+            // type-level test used to miss that, so on an aliasing round
+            // Transpose was stamped as the writer of a buffer it merely
+            // borrowed; the real producer then saw "aliased out, written by
+            // someone else" and dropped its own output buffer every round. One
+            // chain per layer (Transpose → Reshape → o_proj) missed replay on
+            // the resulting moved input: 266/384 → 350/384 once fixed.
+            auto op_writes_output = [&]() {
+                switch (node_ops_[node_idx]->get_type()) {
+                case vkop::ops::OpType::RESHAPE:
+                case vkop::ops::OpType::SQUEEZE:
+                case vkop::ops::OpType::UNSQUEEZE:
+                    // Pure view builders: they re-alias, they never write.
+                    return false;
+                default:
+                    // Everything else may write; Transpose states its answer
+                    // per round from inside execute().
+                    return !node_ops_[node_idx]->did_alias_output_last_round();
+                }
+            };
+            const bool is_view_op = !op_writes_output();
             if (!is_view_op) {
                 for (const auto &o : node_output_tensors_[node_idx]) {
                     if (o && !o->get_prealloc_keep() &&
@@ -3404,7 +3657,8 @@ double Runtime::Run() {
             }
             node_ops_[node_idx]->onExecute(node_input_tensors_[node_idx],
                                            node_output_tensors_[node_idx], id);
-            if (!is_view_op) {
+            // Re-ask AFTER execute: an op like Transpose decides per round.
+            if (op_writes_output()) {
                 for (const auto &o : node_output_tensors_[node_idx]) {
                     if (o) {
                         o->set_gpu_buffer_view_writer((int)node_idx);

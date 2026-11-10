@@ -382,6 +382,11 @@ class BufferBinaryFactory : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is only the int64 CPU path (cpuComputeInt64, the
+        // shape-meta chain) and its int64 readback cache misses. The float
+        // path below is a pure GPU dispatch with CPU-known shapes. Reported
+        // before the early returns so every path states its answer.
+        set_did_host_work_last_round(inputs[0]->dtype() == typeid(int64_t));
         // int64 data flows through a synchronous CPU path (see
         // cpuComputeInt64). In the LLM every binary node's inputs are either
         // all-int64 or all-float, so gating on the data input's dtype is safe.

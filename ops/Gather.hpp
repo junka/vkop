@@ -338,6 +338,12 @@ class Gather : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
+        // The int64 host path (cpuComputeInt64, host_shape mode) reads back
+        // and re-computes on the host every round — host work a replay would
+        // skip. Every other path (the fp32/fp16 gather, the int64 GPU shader,
+        // the zero-copy alias) records a dispatch and touches no host state.
+        set_did_host_work_last_round(
+            inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled());
         auto inshape = inputs[0]->getShape();
         auto indshape = inputs[1]->getShape();
         auto rank = inputs[0]->num_dims();

@@ -292,6 +292,56 @@ class Operator {
     // 不看内容.
     virtual bool has_host_side_effects() const { return false; }
 
+    // True when the op's LAST execute() made its output a pure ALIAS of an
+    // existing buffer instead of writing to it (Reshape/Squeeze/Unsqueeze
+    // always do; Transpose does only when its perm is a flat identity, and
+    // gathers for real otherwise).
+    //
+    // Runtime::Run uses this at the write site: an output that was aliased out
+    // needs its ";last writer" tracked, because the shape pool recycles tensor
+    // objects by shape and can hand a still-read buffer to an unrelated node.
+    // A TYPE-level answer is wrong for Transpose — calling it a view
+    // unconditionally would skip the guard on the rounds it genuinely writes.
+    //
+    // Why it matters for replay (measured): Transpose's aliasing round used to
+    // be misclassified as a write, so the runtime stamped it as the buffer's
+    // writer, stealing the producer's identity. The producer then dropped and
+    // reallocated its own output every round (the guard saw "aliased out and
+    // written by someone else"), and every consumer downstream — Transpose,
+    // Reshape, o_proj, one chain per layer — missed replay on a moved input.
+    // Reporting the alias correctly took replay from 266/384 to 350/384.
+    virtual bool did_alias_output_last_round() const {
+        return alias_output_last_round_;
+    }
+    virtual void set_did_alias_output_last_round(bool v) {
+        alias_output_last_round_ = v;
+    }
+
+    // True when the op's LAST execute() actually did host-side work that a
+    // replay would skip -- the INSTANCE answer, not the type answer.
+    //
+    // Segment replay needs this distinction. `has_host_side_effects()` says a
+    // type CAN touch the host; for Transpose that is only an int64 payload (the
+    // CPU permute), for Reshape only a non-STABLE shape channel, for MatMul
+    // only a split-K control header that actually changed. Gating on the type
+    // marked every segment dynamic: measured 296 of 384 segments re-recording,
+    // with submit rising 0.1 -> 3.3 ms/round and the round going 20.1 -> 34.7
+    // ms. Ops that can skip their host work set this to false on the rounds
+    // they do; the runtime then treats the segment as replayable.
+    //
+    // Defaults to the type answer so an op that has not been taught the
+    // distinction keeps the conservative behaviour.
+    virtual bool did_host_work_last_round() const {
+        // Start conservative: an op that never reports anything keeps the type
+        // answer, so nothing silently becomes replayable.
+        return host_work_observed_ ? host_work_last_round_
+                                   : has_host_side_effects();
+    }
+    void set_did_host_work_last_round(bool v) {
+        host_work_last_round_ = v;
+        host_work_observed_ = true;
+    }
+
     // True when this op's RECORDED COMMAND BUFFER changes between rounds even
     // though its input buffers do not move -- i.e. something it bakes into the
     // recording is derived from a per-round host value.
@@ -541,6 +591,14 @@ class Operator {
     enum class ReplayState { FRESH, CACHED };
     ReplayState replay_state_ = ReplayState::FRESH;
     bool replay_enabled_ = false; // set true by Runtime when cache mode on
+    // Whether the last execute() actually touched the host (see
+    // did_host_work_last_round). `observed` keeps an op that never reports
+    // anything on the conservative type-answer path.
+    bool host_work_last_round_ = true;
+    bool host_work_observed_ = false;
+    // Whether the last execute() handed its output an ALIAS of an existing
+    // buffer instead of writing to it (see did_alias_output_last_round).
+    bool alias_output_last_round_ = false;
     long replay_hits_ = 0;        // times onExecute took the CACHED return
     // GPU timestamp profiling (VKOP_SUBMIT_PROF). Assigned once by Runtime
     // (set_prof_query); null when profiling is off (no overhead).

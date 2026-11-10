@@ -291,9 +291,65 @@ class ReshapeBuffer : public BufferFactory {
         // readbacks/round.
         std::vector<int> dim;
         if (host_target_valid_) {
+            // Host-shape mode: the runtime evaluates the target from live
+            // tensor metadata each round — there is no GPU readback to cache,
+            // but the SAME stability question decides replayability: the
+            // recording was built from the round that recorded it, so a
+            // replay is valid only while the target repeats. Mirror
+            // resolve_dim's machine without readbacks: two consecutive equal
+            // targets promote to STABLE (replayable), anything else stays
+            // dynamic. LINEAR_GROW is deliberately NOT promoted here — a
+            // target that grows every round would replay last round's shape
+            // (the measured failure of the legacy path). invalidate_shape_
+            // cache() (phase boundary) resets cache_state_ to LEARNING, so
+            // the new phase re-learns.
             dim = host_target_;
+            if (cache_state_ == LearnState::LEARNING) {
+                learned_dim_ = dim;
+                cache_state_ = LearnState::CONFIRMING;
+                set_did_host_work_last_round(true);
+            } else if (cache_state_ == LearnState::CONFIRMING) {
+                if (dim == learned_dim_) {
+                    cache_state_ = LearnState::STABLE;
+                    cached_dim_ = dim;
+                } else {
+                    cache_state_ = LearnState::DYNAMIC;
+                    re_stable_prev_ = dim;
+                }
+                set_did_host_work_last_round(true);
+            } else if (cache_state_ == LearnState::STABLE) {
+                if (dim != cached_dim_) {
+                    // Defensive: a STABLE target that changed without a phase
+                    // boundary must not replay stale dims — re-learn.
+                    cache_state_ = LearnState::DYNAMIC;
+                    re_stable_prev_ = dim;
+                    set_did_host_work_last_round(true);
+                } else {
+                    set_did_host_work_last_round(false);
+                }
+            } else { // DYNAMIC
+                // RE_STABLE: two consecutive equal targets re-promote (the
+                // route a kv-derived target takes if the growth ever stops
+                // within a phase).
+                if (dim == re_stable_prev_) {
+                    cache_state_ = LearnState::STABLE;
+                    cached_dim_ = dim;
+                } else {
+                    re_stable_prev_ = dim;
+                }
+                set_did_host_work_last_round(true);
+            }
         } else {
             auto shape = core::as_tensor<int64_t>(inputs[1]);
+            // Only STABLE is replayable: it means two consecutive readbacks
+            // produced the SAME dim, so the recorded dispatch is valid again
+            // next round. LINEAR_GROW is the opposite -- it grows by one every
+            // round, so replaying it re-runs last round's shape (measured:
+            // marking it replayable emitted "capital capital of of ..." with
+            // past_len advancing while the reshaped tensors stayed stale).
+            // LEARNING / CONFIRMING / DYNAMIC all re-read, which a replay would
+            // skip, so they stay dynamic too.
+            set_did_host_work_last_round(cache_state_ != LearnState::STABLE);
             dim = resolve_dim(shape);
         }
         int n = static_cast<int>(dim.size());
@@ -375,6 +431,7 @@ class ReshapeBuffer : public BufferFactory {
             std::vector<int64_t> out(static_cast<size_t>(total));
             // Unconditional readback: a cross-round-recycled GPU input may
             // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
+            set_did_host_work_last_round(true);
             src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[static_cast<size_t>(i)] = (*src)[i];
@@ -435,6 +492,7 @@ class ReshapeBuffer : public BufferFactory {
             }
 
             std::vector<int8_t> out(static_cast<size_t>(total));
+            set_did_host_work_last_round(true);
             src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[static_cast<size_t>(i)] = (*src)[i];
@@ -472,6 +530,7 @@ class ReshapeBuffer : public BufferFactory {
             }
             // CPU fallback: host-only input (tests / rare non-GPU path).
             std::vector<T> out(static_cast<size_t>(total));
+            set_did_host_work_last_round(true);
             src->copyToCPU(m_cmdpool_);
             for (int i = 0; i < total; ++i) {
                 out[static_cast<size_t>(i)] = (*src)[i];

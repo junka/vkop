@@ -143,6 +143,13 @@ class TransposeBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Only the int64 payload takes the CPU permute below; every float path
+        // (including the flat-identity view) is a GPU dispatch with no host
+        // work to skip, so such a segment may replay. Reported before the early
+        // returns so every path states its answer.
+        set_did_host_work_last_round(
+            !inputs.empty() && inputs[0] &&
+            inputs[0]->dtype() == typeid(int64_t));
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
         std::vector<int> outshape(rank);
@@ -225,9 +232,15 @@ class TransposeBuffer : public BufferFactory {
                 aliased = true;
             });
             if (aliased) {
+                // Pure view this round: report it so Runtime does not stamp this
+                // node as the buffer's writer (see
+                // Operator::did_alias_output_last_round).
+                set_did_alias_output_last_round(true);
                 return;
             }
         }
+        // Real gather dispatch below: this node WRITES its output.
+        set_did_alias_output_last_round(false);
 
         std::shared_ptr<VulkanBuffer> out_buf;
         std::shared_ptr<VulkanBuffer> in_buf;

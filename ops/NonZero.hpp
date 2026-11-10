@@ -80,6 +80,11 @@ class NonZero : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the mask readback + host coordinate scan below;
+        // the STABLE fast path re-fills the cached output on the host instead
+        // (still host work, still skipped by a replay — so NonZero stays
+        // dynamic either way).
+        set_did_host_work_last_round(true);
         auto shape = inputs[0]->getShape();
         int rank = static_cast<int>(shape.size());
         if (rank == 0) {

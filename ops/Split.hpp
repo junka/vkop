@@ -155,6 +155,10 @@ class SplitBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the split-size vector readback (inputs[1] is a
+        // tiny int64 tensor read through copyToCPU every round); the piece
+        // copies themselves are GPU dispatches (zero-copy alias or split.comp).
+        set_did_host_work_last_round(inputs.size() > 1);
         int rank = static_cast<int>(inputs[0]->num_dims());
         if (axis_ < 0) {
             axis_ += rank;

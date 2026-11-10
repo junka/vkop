@@ -149,6 +149,10 @@ class Where : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
+        // Host work here is the host_shape-mode int64 broadcast-select
+        // (cpuWhereInt64); the GPU shader path records a dispatch only.
+        set_did_host_work_last_round(
+            inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled());
         std::vector<int> out_shape = outputs[0]->getShape();
         // The graph's recorded output shape is often stale for the int64
         // shape-meta chain (symbolic dims resolved to a max, not the runtime

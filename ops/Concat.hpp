@@ -402,6 +402,12 @@ class ConcatBuffer : public BufferFactory {
                     break;
                 }
             }
+            // The CPU concat path re-reads and re-concatenates on the host
+            // every round (its inputs are host-authoritative, so the copyToCPU
+            // is free, but the strided copy itself is host work a replay
+            // skips). The GPU shader path records a dispatch only.
+            set_did_host_work_last_round(host_shape_enabled() &&
+                                         all_host_auth);
             if (host_shape_enabled() && all_host_auth) {
                 cpuConcatInt64(inputs, outputs, out_shape);
                 return;

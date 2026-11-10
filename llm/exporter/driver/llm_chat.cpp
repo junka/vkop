@@ -1595,6 +1595,38 @@ int main(int argc, char** argv) {
             auto t1 = std::chrono::steady_clock::now();
             next_id = argmax_last_token(rt, cmdpool, vocab);
             out_ids.push_back(static_cast<uint32_t>(next_id));
+            // [seg-replay debug] checksum the raw logits row (NOT the TopK
+            // output): if the logits checksum is fresh but argmax disagrees,
+            // the TopK post-process read a stale row; if the checksum itself
+            // repeats, lm_head never recomputed this round.
+            if (std::getenv("VKOP_LOGITS_CKSUM")) {
+                auto lg = as_tensor<uint16_t>(rt->GetOutput("logits"));
+                auto shape = lg->getShape();
+                int64_t v = shape.back();
+                lg->copyToCPU(cmdpool);
+                const uint16_t* row =
+                    reinterpret_cast<const uint16_t*>(lg->data().data()) +
+                    (lg->num_elements() - v);
+                uint64_t ck = 1469598103934665603ull;
+                for (int64_t i = 0; i < v; ++i) {
+                    ck = (ck ^ row[i]) * 1099511628211ull;
+                }
+                std::printf("[cksum] row %llx arg=%d\n",
+                            (unsigned long long)ck, next_id);
+                std::fflush(stdout);
+                // Keep the last row's bytes for a cross-round diff (the dup
+                // question: does a replayed round re-emit the PREVIOUS
+                // round's logits verbatim, or compute fresh-but-wrong?).
+                static std::vector<uint16_t> prev_row;
+                if (std::getenv("VKOP_LOGITS_CMP") && !prev_row.empty()) {
+                    int same = (prev_row.size() ==
+                                static_cast<size_t>(v)) &&
+                               std::equal(prev_row.begin(), prev_row.end(),
+                                          row);
+                    std::printf("[cksum] same_as_prev=%d\n", same);
+                }
+                prev_row.assign(row, row + v);
+            }
             double run_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
             double wall_ms = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - t_wall).count();
@@ -1604,6 +1636,72 @@ int main(int argc, char** argv) {
                 session_metrics.per_token_ms.push_back(run_ms);
                 session_metrics.total_decode_wall_ms += wall_ms;
                 session_metrics.per_token_wall_ms.push_back(wall_ms);
+            }
+            // [seg-replay debug] probe intermediate node outputs AFTER Run()
+            // (all segments have been waited by then; the copyToCPU here does
+            // not perturb the round). VKOP_PROBE_TENSORS="past_key_values_0,
+            // present_key_values_0,..." — fp16/int64 tensors only.
+            if (const char *pe = std::getenv("VKOP_PROBE_TENSORS")) {
+                std::string body(pe);
+                size_t pos = 0;
+                while (pos <= body.size()) {
+                    size_t comma = body.find(',', pos);
+                    if (comma == std::string::npos) comma = body.size();
+                    std::string nm = body.substr(pos, comma - pos);
+                    pos = comma + 1;
+                    if (nm.empty()) continue;
+                    auto t = rt->GetOutput(nm);
+                    if (!t) t = rt->GetInput(nm);
+                    if (!t) { std::printf("[probe] %s: MISSING\n", nm.c_str()); continue; }
+                    uint64_t ck = 1469598103934665603ull;
+                    size_t nb = 0;
+                    if (t->dtype() == typeid(uint16_t)) {
+                        auto g = as_tensor<uint16_t>(t);
+                        g->copyToCPU(cmdpool);
+                        const auto &d = g->data();
+                        nb = d.size() * sizeof(uint16_t);
+                        for (auto x : d) ck = (ck ^ x) * 1099511628211ull;
+                    } else if (t->dtype() == typeid(int64_t)) {
+                        auto g = as_tensor<int64_t>(t);
+                        g->copyToCPU(cmdpool);
+                        const auto &d = g->data();
+                        nb = d.size() * sizeof(int64_t);
+                        for (auto x : d) ck = (ck ^ (uint64_t)x) * 1099511628211ull;
+                    }
+                    std::string sh;
+                    for (int d : t->getShape()) sh += std::to_string(d) + ",";
+                    std::printf("[probe] %s shape=%s bytes=%zu ck=%llx\n",
+                                nm.c_str(), sh.c_str(), nb,
+                                (unsigned long long)ck);
+                }
+                std::fflush(stdout);
+            }
+            // [seg-replay debug] probe intermediate NODE outputs by index
+            // (VKOP_NODE_PROBE="i,j,k"): FNV-1a over the post-Run host bytes
+            // of each listed node's output(s). Post-Run copyToCPU cannot
+            // perturb the round (all segments waited); unlike VKOP_NODE_DUMP
+            // it does not fire inside onExecute, so it does not serialize the
+            // recording. The node indices are the graph's static numbering.
+            if (const char *npe = std::getenv("VKOP_NODE_PROBE")) {
+                std::string body(npe);
+                size_t pos = 0;
+                while (pos <= body.size()) {
+                    size_t comma = body.find(',', pos);
+                    if (comma == std::string::npos) comma = body.size();
+                    std::string nm = body.substr(pos, comma - pos);
+                    pos = comma + 1;
+                    if (nm.empty()) continue;
+                    int idx = std::atoi(nm.c_str());
+                    auto infos = rt->node_outputs_checksum(idx);
+                    std::printf("[nprobe] node=%d", idx);
+                    for (const auto &ni : infos) {
+                        std::printf(" %s %s/%zu/%llx", ni.op.c_str(),
+                                    ni.dtype.c_str(),
+                                    ni.bytes, (unsigned long long)ni.cksum);
+                    }
+                    std::printf("\n");
+                }
+                std::fflush(stdout);
             }
             std::printf("[r%d] %.1fms (wall %.1f)  past_len=%d pos=%lld%s  → %d  %s\n",
                         step, run_ms, wall_ms, past_len,

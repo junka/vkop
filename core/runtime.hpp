@@ -140,11 +140,42 @@ class Runtime {
     bool segment_replay_enabled_ = false;
     int segment_replay_warmup_ = 2;
     int segment_replay_round_ = 0;
-    // segment ordinal -> the set of input VkBuffer handles its recording bound.
-    // A segment is replayable only while every buffer it reads is still one of
-    // these; a moved buffer means the recorded descriptor/address is stale.
-    // Filled while the segment records (see graph_submit), not by a pre-pass.
-    std::vector<std::set<uint64_t>> segment_buf_ids_;
+    // [seg-replay debug] VKOP_SEG_NO_REPLAY=<names>: comma-separated list of
+    // OpTypeName substrings; any level whose op type name contains one of them
+    // is forced dynamic (never replayed). Bisects which op class poisons a
+    // replayed segment. Null = off.
+    std::unique_ptr<std::vector<std::string>> seg_no_replay_substrs_;
+    // segment ordinal -> the set of bound input/output identities its
+    // recording baked in. An identity is
+    //   (root VkBuffer, window offset, window size).
+    // All three matter: the descriptor offset and the BDA address bake the byte
+    // window into the recording, so a sub-range view that slides inside an
+    // unchanged parent allocation (the KV cache growing one row per decode
+    // round) leaves the root handle untouched while the recorded offset moves.
+    //
+    // Shapes are deliberately NOT part of the identity. Every op's input shape
+    // is pinned by the per-level reshape_view pre-pass from node_input_shapes_
+    // (concrete dims only; a -1 sentinel leaves the live shape in place, and
+    // those tensors belong to ops whose predicates already report per-round
+    // change). Carrying getShape() here instead produced pure false positives:
+    // the SAME tensor is re-viewed between levels by that very pre-pass, so
+    // /lm_head/MatMul's output is recorded as [1,151936] and checked as
+    // [1,1,151936] — one segment per round re-recorded for a rank change that
+    // never reaches any shader.
+    using SegmentBinding = std::tuple<uint64_t, uint64_t, uint64_t>;
+    std::vector<std::set<SegmentBinding>> segment_buf_ranges_;
+    // Segment ordinal -> [first level, one-past-last level). One level per
+    // segment: packing several levels into one replayable segment corrupts
+    // decode (see the corruption note in Run()). The level loop closes a
+    // segment when level_idx reaches its end -- including HIT segments, which
+    // is what makes this split safe.
+    std::vector<std::pair<size_t, size_t>> seg_level_ranges_;
+    // Last round's seg_level_ranges_. The split must be identical across
+    // rounds for the cached recordings to describe the right levels; a
+    // difference (learning-state convergence, phase boundary) discards every
+    // cached recording and restarts the warm-up.
+    std::vector<std::pair<size_t, size_t>> seg_level_ranges_prev_;
+    bool seg_replay_rounds_valid_ = false;
     // 本轮每 segment 是 hit (true) 还是 miss/重录 (false). Run() 开头填,
     // 末尾 reset 循环据此决定是保留 buffer 内容还是 reset.
     std::vector<bool> segment_replay_hit_this_round_;
@@ -292,9 +323,14 @@ class Runtime {
         level_readback_.clear();
         // graph segment replay 也需要在 phase 边界清掉: prefill→decode 的
         // segment 划分 (graph_readbacks>0 vs =0) 可能不同, 硬比对会误命中.
-        segment_buf_ids_.clear();
+        segment_buf_ranges_.clear();
         segment_replay_hit_this_round_.clear();
         segment_op_indices_.clear();
+        // The per-round split comparison is phase-specific too: the
+        // instance predicates flip at the boundary (learners reset to
+        // LEARNING), so forget the previous split instead of treating the
+        // new phase's split as a drift and logging a re-record.
+        seg_replay_rounds_valid_ = false;
         if (!replay_mode_)
             return;
         for (auto &op : node_ops_)
@@ -350,6 +386,18 @@ class Runtime {
 
     // Get initializer tensor by name, for test only
     std::shared_ptr<ITensor> GetInitializer(const std::string &name) const;
+
+    // Segment-replay debug: checksum a node's output(s) by NODE INDEX after a
+    // Run(). Returns a list of (dtype_name, byte_checksum, nbytes) per output
+    // of the node, or an empty vector when the index is out of range. The
+    // checksum runs a copyToCPU (post-Run: every segment is already waited).
+    struct NodeOutInfo {
+        std::string op;   // producing op's node name
+        std::string dtype;
+        uint64_t cksum = 0;
+        size_t bytes = 0;
+    };
+    std::vector<NodeOutInfo> node_outputs_checksum(int node_idx) const;
 
     // should be called before loading model
     void TraceNode(const std::string &name);

@@ -454,6 +454,9 @@ class ResizeBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the roi/sizes/scales tensor readback (the image
+        // path reads all three when the graph supplies them).
+        set_did_host_work_last_round(inputs.size() > 1);
         if (mode_ != 0 ||
             coordinate_transformation_mode_ !=
                 static_cast<int>(

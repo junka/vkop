@@ -113,6 +113,11 @@ class QuantizeLinear : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is the scale/zero-point scalar readback (the LLM's
+        // fp8 KV DQ reads cache_scale every round); the payload copy itself
+        // is a GPU dispatch. Conservative: report true whenever a scalar is
+        // present, regardless of dtype.
+        set_did_host_work_last_round(inputs.size() >= 2);
         if (inputs.empty() || outputs.empty())
             return;
 

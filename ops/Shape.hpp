@@ -34,6 +34,10 @@ class Shape : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Shape recomputes the dims from getShape() and re-fills/uploads on
+        // the host every round (kv_len grows → the values change), so host
+        // work is unconditional — this op can never replay.
+        set_did_host_work_last_round(true);
         auto shape = inputs[0]->getShape();
         std::vector<int64_t> dims(shape.begin(), shape.end());
 

@@ -70,6 +70,14 @@ class Range : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
+        // Range generates its values on the host for EVERY dtype (there is no
+        // integer/fp kernel to call): the params readback, the arange loop and
+        // the deferred upload are all host work a replay would skip. The one
+        // exception is the int64 STABLE fast path, which re-fills the cached
+        // output without recomputing — but it still fills/uploads on the host,
+        // so Range stays dynamic in every state.
+        set_did_host_work_last_round(true);
+
         // Read start/limit/delta once per round: as int64 for an int32/int64
         // Range, as double for an fp16/fp32 one. The value generation below
         // is on the host for every dtype (there is no integer kernel to call),

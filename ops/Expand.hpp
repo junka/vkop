@@ -143,6 +143,12 @@ class Expand : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
+        // Host work here is the target-shape readback (a non-STABLE learner
+        // or a STABLE verify round). The fp and int64 GPU dispatches
+        // themselves touch no host state. Reported up front so every path
+        // states its answer.
+        set_did_host_work_last_round(
+            target_cache_state_ != TargetLearnState::STABLE);
         std::vector<int> inshape = inputs[0]->getShape();
         std::vector<int> out_shape = outputs[0]->getShape();
         // Fail closed on a <= 1-byte data payload: no byte build in this mover.

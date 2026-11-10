@@ -124,6 +124,20 @@ class PimplFacade : public Operator {
     bool recording_changes_per_round() const override {
         return impl_->recording_changes_per_round();
     }
+    // The instance answer lives on impl_, which runs execute(); a façade-level
+    // default would keep every façade op on the conservative type answer.
+    bool did_host_work_last_round() const override {
+        return impl_->did_host_work_last_round();
+    }
+    // Same forwarding trap: the alias answer is recorded inside impl_'s
+    // execute(), so a façade-level default would report "wrote" forever and
+    // keep the write-site guard misfiring on the producer.
+    bool did_alias_output_last_round() const override {
+        return impl_->did_alias_output_last_round();
+    }
+    void set_did_alias_output_last_round(bool v) {
+        impl_->set_did_alias_output_last_round(v);
+    }
     // 同 route_tag 的转发陷阱: current_fingerprint() 在 impl_ 上填充.
     const std::vector<PassFingerprint> &current_fingerprint()
         const override {

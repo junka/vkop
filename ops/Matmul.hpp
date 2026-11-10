@@ -680,6 +680,12 @@ class MatMulBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // Host work here is only the split-K / down-act control header written
+        // through a HOST_COHERENT mapping, and even that is suppressed unless
+        // the cut actually changed. Default to "no host work" and flip it at
+        // the two sites that really write; a segment holding a plain MatMul is
+        // then replayable.
+        set_did_host_work_last_round(false);
         // Element formats. A and the output must be float or half; B may also
         // be a quantized weight, in which case the graph carries its dequant
         // scale as the last input — the same appended-scale convention the
@@ -1414,6 +1420,7 @@ class MatMulBuffer : public BufferFactory {
                 hdr.resize(ks_part_off, 0);
                 if (hdr != ks_words_) {
                     ks_words_ = hdr;
+                    set_did_host_work_last_round(true);
                     for (size_t t = 0; t < hdr.size(); ++t) {
                         words[t] = hdr[t];
                     }
@@ -2072,6 +2079,7 @@ class MatMulBuffer : public BufferFactory {
                             for (size_t t = 0; t < hdr.size(); ++t)
                                 words[t] = hdr[t];
                             da_words_hdr_ = hdr;
+                            set_did_host_work_last_round(true);
                         }
                     }
                 }
