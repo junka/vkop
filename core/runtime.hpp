@@ -3,8 +3,10 @@
 #define CORE_RUNTIME_HPP_
 
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "core/ShaderArchive.hpp"
@@ -132,15 +134,17 @@ class Runtime {
     bool replay_dbg_ = false;     // set by VKOP_REPLAY=2 (log dynamic ops)
 
     // graph segment 级 replay (VKOP_SEGMENT_REPLAY=1): 复用持久化的 graph segment
-    // command buffer, 每轮只比对段指纹, 命中的段直接 re-submit 上轮录好的 buffer.
+    // command buffer, 每轮只按 op 类型 / buffer 身份判定该段能否直接 re-submit.
     // 与 Operator 级 replay (replay_mode_) 互斥关系相同: graph_mode 开时
     // replay_mode_ 会被关, 但 segment replay 是 Runtime 侧独立的一层.
     bool segment_replay_enabled_ = false;
     int segment_replay_warmup_ = 2;
     int segment_replay_round_ = 0;
-    // segment ordinal -> aggregated fingerprint (段内所有 op 的 fp_passes_ 串联).
-    // 由 warmup 轮填充, 后续 Run() 开始时比对.
-    std::vector<std::vector<vkop::ops::Operator::PassFingerprint>> segment_fp_stored_;
+    // segment ordinal -> the set of input VkBuffer handles its recording bound.
+    // A segment is replayable only while every buffer it reads is still one of
+    // these; a moved buffer means the recorded descriptor/address is stale.
+    // Filled while the segment records (see graph_submit), not by a pre-pass.
+    std::vector<std::set<uint64_t>> segment_buf_ids_;
     // 本轮每 segment 是 hit (true) 还是 miss/重录 (false). Run() 开头填,
     // 末尾 reset 循环据此决定是保留 buffer 内容还是 reset.
     std::vector<bool> segment_replay_hit_this_round_;
@@ -148,7 +152,7 @@ class Runtime {
     std::vector<std::vector<int>> segment_op_indices_;
     // 上一轮 Run() 里 graph_readbacks 的值. Run() 开头读来判断 segment
     // 划分是否稳定 (readback>0 表示 pre-readback_hook 中途切了 segment,
-    // 本轮 segment 数量与存储的 segment_fp_stored_ 对不上, 不能 replay).
+    // 本轮 segment 数量与存储的 segment_buf_ids_ 对不上, 不能 replay).
     int segment_replay_last_readbacks_ = -1;
     // 上一轮 Run() 的 segment 总数. 用来判断本轮 segment 数量是否一致.
     size_t segment_replay_last_segment_count_ = 0;
@@ -288,7 +292,7 @@ class Runtime {
         level_readback_.clear();
         // graph segment replay 也需要在 phase 边界清掉: prefill→decode 的
         // segment 划分 (graph_readbacks>0 vs =0) 可能不同, 硬比对会误命中.
-        segment_fp_stored_.clear();
+        segment_buf_ids_.clear();
         segment_replay_hit_this_round_.clear();
         segment_op_indices_.clear();
         if (!replay_mode_)

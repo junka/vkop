@@ -119,6 +119,11 @@ class PimplFacade : public Operator {
     bool has_host_side_effects() const override {
         return impl_->has_host_side_effects();
     }
+    // Same forwarding trap: a façade-level default false would let Runtime
+    // replay an Attention segment whose push constants carry per-round kv_len.
+    bool recording_changes_per_round() const override {
+        return impl_->recording_changes_per_round();
+    }
     // 同 route_tag 的转发陷阱: current_fingerprint() 在 impl_ 上填充.
     const std::vector<PassFingerprint> &current_fingerprint()
         const override {

@@ -988,13 +988,34 @@ template <typename T> class Tensor : public ITensor {
     // the point: the logical shape changed so the host data must be
     // re-uploaded.
     void recreate_storage_buffer(std::shared_ptr<VulkanDevice> &vd) {
-        // Host-imported buffers (VK_EXT_external_memory_host) must NOT be kept
-        // across shape changes: their host block is sized to the decode shape
-        // that as_host_imported_buffer installed, and a later ResizeInput to a
-        // larger prefill shape would leave the tensor pointing at a too-small
-        // imported block. Always rebuild on any resize when imported.
-        auto buff = vkobj_ ? std::dynamic_pointer_cast<VulkanBuffer>(vkobj_) : nullptr;
+        // Host-imported buffers (VK_EXT_external_memory_host): keep the import
+        // when the already-imported block is large enough for the tensor's new
+        // logical size, and only re-mark it off-GPU so the caller uploads into
+        // the existing bytes. Dropping it unconditionally (the old behaviour)
+        // re-ran posix_memalign + vkCreateBuffer on EVERY ResizeInput, which
+        // the decode loop does per round for attention_bias / position_ids /
+        // inputs_embeds -- so those VkBuffer addresses moved every round and
+        // no command buffer that had bound them could ever be re-submitted
+        // (segment replay's whole premise). The block installed by
+        // as_host_imported_buffer is already sized for the decode capacity, so
+        // the growth path is the rare exception, not the rule.
+        //
+        // A buffer that is too small must still be rebuilt: pointing at a
+        // short import while the shader writes to the logical size would run
+        // past the end of the imported memory.
+        auto buff =
+            vkobj_ ? std::dynamic_pointer_cast<VulkanBuffer>(vkobj_) : nullptr;
         if (buff && buff->is_host_imported()) {
+            // Same alignment make_vkbuff applies: kernels address the buffer in
+            // whole uint words, so the capacity test must allow for the padded
+            // tail or a resize to a non-multiple-of-4 element count would be
+            // judged too small and churn anyway.
+            const size_t need =
+                sizeof(T) * UP_DIV(num_elements(), 4) * 4;
+            if (buff->getSize() >= need) {
+                converted_ = false;
+                return;
+            }
             prealloc_keep_ = false;
         }
         if (prealloc_keep_ && vkobj_) {
@@ -1129,8 +1150,24 @@ template <typename T> class Tensor : public ITensor {
         size_t bytes = sizeof(T) * UP_DIV(n_elements, 4) * 4;
         if (bytes == 0)
             bytes = 16;
+        // Already imported at a sufficient size: keep the existing block. The
+        // decode loop re-installs these inputs every round, and tearing the
+        // import down (vkobj_.reset() + posix_memalign + vkCreateBuffer) moved
+        // the VkBuffer address each time, which invalidated every command
+        // buffer that had bound it. The host pointer and the mapping are still
+        // valid, so only the caller's memsets need to run again.
+        if (auto cur = vkobj_
+                           ? std::dynamic_pointer_cast<VulkanBuffer>(vkobj_)
+                           : nullptr) {
+            if (cur->is_host_imported() && cur->getSize() >= bytes) {
+                prealloc_keep_ = true;
+                converted_ = true;
+                return cur;
+            }
+        }
         // Drop any previous buffer (device-local from the last prefill, or a
-        // previous round's import) and install the fresh import.
+        // previous round's import that is now too small) and install a fresh
+        // import.
         vkobj_.reset();
         view_range_.reset();
         prealloc_keep_ = true;

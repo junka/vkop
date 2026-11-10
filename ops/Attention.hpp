@@ -153,6 +153,15 @@ class AttentionBuffer : public BufferFactory {
         }
     }
     bool has_host_side_effects() const override { return true; }
+    // The push constant carries kv_len / kv_past, and both grow by one every
+    // decode step. The dispatch geometry and the pc are therefore stale for
+    // the next round even when every bound buffer address is unchanged, so a
+    // recorded Attention dispatch can never be re-submitted verbatim. This is
+    // separate from the host-side-effect flag above (which is about the
+    // ring_head readback): measured with that flag bypassed, replaying
+    // Attention froze the KV cache and the decode loop repeated the same
+    // token forever.
+    bool recording_changes_per_round() const override { return true; }
 
   private:
     // (B, H, S, D) -> a 4-element shape check helper.

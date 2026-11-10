@@ -292,6 +292,24 @@ class Operator {
     // 不看内容.
     virtual bool has_host_side_effects() const { return false; }
 
+    // True when this op's RECORDED COMMAND BUFFER changes between rounds even
+    // though its input buffers do not move -- i.e. something it bakes into the
+    // recording is derived from a per-round host value.
+    //
+    // This is the only reason a segment cannot be replayed once buffer identity
+    // is stable. Attention is the canonical case: its push constant carries
+    // kv_len / kv_past, which grow by one every decode step, so the recorded
+    // dispatch and its pc are wrong for the next round. Replaying it silently
+    // freezes the KV cache (measured: with the gate bypassed the decode loop
+    // emitted "capital capital capital ..." and past_len stopped growing).
+    //
+    // Distinct from has_host_side_effects(), which is about host-side work
+    // skipped by the replay; this one is about the recording itself going
+    // stale. Both make a segment unreplayable, but they are answered by
+    // different op types and only this one is a correctness hazard that no
+    // fingerprint over buffer handles can catch.
+    virtual bool recording_changes_per_round() const { return false; }
+
     // Drop any cached shape-input readback (option C: converter static
     // annotation). Called by Runtime across a phase boundary (prefill→decode)
     // where, even for value_dynamic=false shape tensors, the resolved dim[]

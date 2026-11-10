@@ -2957,6 +2957,21 @@ double Runtime::Run() {
     }
     segment_replay_enabled_ = seg_replay;
 
+    // Segment replay needs each op's pass fingerprint, and that is only
+    // recorded when the op's replay flag is on (Operator::record_fingerprint
+    // is gated on replay_enabled_). graph_mode turns the OP-level cache off
+    // (see above: a recording shared with other ops cannot be replayed per
+    // op), and that was also silently starving the SEGMENT fingerprint: its
+    // stored side read current_fingerprint() and got an empty vector every
+    // round, so every segment compared 0 entries against N and could never
+    // hit. Enable the flag for recording only -- the graph_cmd_ branch of
+    // onExecute returns before the CACHED check, so this cannot turn on the
+    // per-op cache.
+    if (seg_replay) {
+        for (auto &op : node_ops_)
+            op->enable_replay(true);
+    }
+
     // graph_cmds_ 是 Runtime 成员变量 (runtime.hpp), 跨轮持久化.
     // Run() 开头根据 replay 开关决定是否 clear:
     //   - replay 关闭: clear (保持旧的局部变量语义, 每轮重建)
@@ -2999,6 +3014,28 @@ double Runtime::Run() {
     std::vector<std::vector<int>> seg_op_indices_curr;
     seg_op_indices_curr.push_back({});  // 第 0 段
 
+    // The input buffers a segment's recording binds, collected while it
+    // records. Replay is valid only while every one of them is still the same
+    // VkBuffer: the descriptor-buffer offset and the BDA address table both bake
+    // the handle into the recording, so a moved buffer means a stale command
+    // buffer. Collected here (during recording) rather than in a pre-pass,
+    // because the tensors are only guaranteed to hold their round's buffers
+    // once the producing levels have run.
+    auto note_segment_buffers = [&](std::set<uint64_t> &ids,
+                                    const std::vector<int> &op_indices) {
+        for (int op_idx : op_indices) {
+            for (auto &t : node_input_tensors_[op_idx]) {
+                if (!t) continue;
+                auto res = t->gpu_buffer();
+                if (!res || res->getResourceType() != ResourceType::VK_BUFFER) {
+                    continue;
+                }
+                auto vb = std::dynamic_pointer_cast<VulkanBuffer>(res);
+                if (vb) ids.insert(reinterpret_cast<uint64_t>(vb->getBuffer()));
+            }
+        }
+    };
+
     // Close + submit the open segment, chaining it onto the previous segment's
     // timeline signal so the two are ordered on the queue.
     // 自动判断 skip_record: 如果当前 segment 在 segment_replay_hit_this_round_
@@ -3011,18 +3048,13 @@ double Runtime::Run() {
         bool skip_record = seg_replay &&
                            ord < segment_replay_hit_this_round_.size() &&
                            segment_replay_hit_this_round_[ord];
-        // 只有非 hit 段才更新 stored fp. hit 段的 fp 是上轮存好的.
+        // 只有非 hit 段才更新 buffer 身份. hit 段的身份是上轮记下的.
         if (seg_replay && !skip_record) {
-            auto &seg_ops = seg_op_indices_curr[ord];
-            std::vector<vkop::ops::Operator::PassFingerprint> agg;
-            agg.reserve(seg_ops.size() * 2);
-            for (int op_idx : seg_ops) {
-                auto &fp = node_ops_[op_idx]->current_fingerprint();
-                agg.insert(agg.end(), fp.begin(), fp.end());
-            }
-            if (segment_fp_stored_.size() <= ord)
-                segment_fp_stored_.resize(ord + 1);
-            segment_fp_stored_[ord] = std::move(agg);
+            if (segment_buf_ids_.size() <= ord)
+                segment_buf_ids_.resize(ord + 1);
+            segment_buf_ids_[ord].clear();
+            note_segment_buffers(segment_buf_ids_[ord],
+                                 seg_op_indices_curr[ord]);
         }
         if (!skip_record) {
             graph_seg->end();
@@ -3068,118 +3100,121 @@ double Runtime::Run() {
     int graph_readbacks_lvl = 0; // readback count at the current level's start
 
     // --- Segment replay 预判 ---
+    //
+    // Replay is decided PER LEVEL by op type alone -- there is no fingerprint.
+    //
+    // An earlier design compared a per-segment fingerprint of push constants
+    // and buffer handles across rounds. It could never work: the comparison
+    // runs at the top of Run(), before any onExecute, while fp_passes_ is
+    // cleared and refilled inside execute(). Both sides therefore read the SAME
+    // previous round's leftovers, so pc differences were structurally
+    // unreportable (measured: pc_diff==0 for every segment, including
+    // Attention, whose kv_len grows every step). It also cost ~4 ms/round to
+    // compare and another ~1-2 ms to record.
+    //
+    // What actually determines replayability is a property of the op, not of
+    // the round's data:
+    //   - recording_changes_per_round(): the recording bakes a per-round host
+    //     value (Attention's kv_len/kv_past). Must re-record -- verified by
+    //     bypassing it: the KV cache froze and decode repeated one token.
+    //   - has_host_side_effects(): the op does host work the replay skips.
+    // Everything else records identically every round once its buffer
+    // addresses are stable, and they are: host-imported decode inputs keep
+    // their import across ResizeInput (Tensor::recreate_storage_buffer) and
+    // pooled intermediates keep their per-node tensor objects.
+    //
+    // Buffer identity still has to hold, so a node whose input buffers moved
+    // since the last recording invalidates its segment. That check is one
+    // VkBuffer comparison per input, done while the segment is being recorded
+    // (see seg_buf_ids below) rather than as a pre-pass over the whole graph.
     if (graph_mode && seg_replay) {
         segment_replay_round_++;
-        bool stable = (segment_replay_last_readbacks_ == 0) &&
-                      !segment_fp_stored_.empty() &&
-                      segment_replay_round_ > segment_replay_warmup_;
-        size_t est_seg = (level_node_indices_.size() + graph_segment - 1) /
-                         graph_segment;
-        if (stable && segment_fp_stored_.size() == est_seg) {
-            // 段级 fingerprint 预比对: segment 数对得上只是第一步,
-            // 还要逐段把当前轮所有 op 的 fp 聚合起来和上轮存的比对.
-            // 任何一段不匹配 → 该段 hit=false → 重录 (形状变了 / reshape 了).
-            //
-            // 注意: graph_cmd_ 路径里 Operator::fp_passes_ 只 clear 不填
-            // (onExecute 里 objs_.clear() + fp_passes_.clear() 但 execute()
-            // 不会主动 push PassFingerprint), 所以我们不依赖它 —— 直接
-            // 把每个 op 的 input/output tensor device() handles 收进
-            // PassFingerprint.handles 字段. ResizeInput 每轮重建 VkBuffer,
-            // handle 变化 → fingerprint 自然比对失败 → hit=false.
-            segment_replay_hit_this_round_.assign(est_seg, true);
-            // 可选日志: 段为什么不可 replay (段号 + 触发它的 op 类型).
-            const bool seg_log =
-                std::getenv("VKOP_SEGMENT_REPLAY_LOG") != nullptr;
-            for (size_t ord = 0; ord < est_seg; ord++) {
-                size_t seg_start = ord * graph_segment;
-                size_t seg_end = std::min(seg_start + graph_segment,
-                                          level_node_indices_.size());
-                // --- 结构门控: 段内任一 op 有宿主侧副作用 → 段不可 replay ---
-                // 判定只看节点类型, 不看内容. 一旦命中直接 hit=false,
-                // 跳过后续 fingerprint 比对 (省时间且结果不变).
-                bool seg_host_side_effects = false;
-                int trigger_op_idx = -1;
-                for (size_t li = seg_start; li < seg_end; li++) {
+        const bool seg_log =
+            std::getenv("VKOP_SEGMENT_REPLAY_LOG") != nullptr;
+        // Segments are the graph's fixed level split. Keeping this stable is
+        // what lets a segment's recording be re-submitted: the ordinal ->
+        // level-range mapping is identical every round, so ordinal N always
+        // describes the same commands.
+        //
+        // (An attempt to give each dynamic level its own segment so the static
+        // neighbours could replay was reverted: with one level per segment the
+        // hit path never reaches graph_submit, segments stop being retired, and
+        // the replayed commands never execute -- measured past_len frozen at 8
+        // and one token repeated forever.)
+        const size_t est_seg = (level_node_indices_.size() + graph_segment - 1) /
+                               graph_segment;
+        // Warm-up: the first rounds establish each segment's recording and its
+        // buffer identity. Before that nothing may be replayed.
+        const bool warm = segment_replay_round_ > segment_replay_warmup_;
+        segment_replay_hit_this_round_.assign(est_seg, warm);
+        if (!warm) {
+            segment_buf_ids_.clear();
+        }
+        for (size_t ord = 0; warm && ord < est_seg; ord++) {
+            const size_t seg_start = ord * graph_segment;
+            const size_t seg_end = std::min(seg_start + graph_segment,
+                                            level_node_indices_.size());
+            int trigger_op_idx = -1;
+            for (size_t li = seg_start; li < seg_end && trigger_op_idx < 0;
+                 li++) {
+                for (int op_idx : level_node_indices_[li]) {
+                    auto &op = node_ops_[op_idx];
+                    if (op->recording_changes_per_round() ||
+                        op->has_host_side_effects()) {
+                        trigger_op_idx = op_idx;
+                        break;
+                    }
+                }
+            }
+            if (trigger_op_idx >= 0) {
+                segment_replay_hit_this_round_[ord] = false;
+                if (seg_log) {
+                    auto *op = trigger_op_idx < static_cast<int>(node_ops_.size())
+                                   ? node_ops_[trigger_op_idx].get()
+                                   : nullptr;
+                    fprintf(stderr,
+                            "[seg-replay] seg %zu: record (op[%d] %s)\n", ord,
+                            trigger_op_idx,
+                            op ? op->get_name().c_str() : "?");
+                }
+                continue;
+            }
+            // Static segment: replayable unless one of the buffers it binds
+            // moved since the recording that produced the cached commands.
+            if (ord < segment_buf_ids_.size()) {
+                bool moved = false;
+                for (size_t li = seg_start; li < seg_end && !moved; li++) {
                     for (int op_idx : level_node_indices_[li]) {
-                        auto &op = node_ops_[op_idx];
-                        if (op->has_host_side_effects()) {
-                            seg_host_side_effects = true;
-                            trigger_op_idx = op_idx;
-                            goto seg_effects_found;  // 跳出双层循环
+                        for (auto &t : node_input_tensors_[op_idx]) {
+                            if (!t) continue;
+                            auto res = t->gpu_buffer();
+                            if (!res ||
+                                res->getResourceType() !=
+                                    ResourceType::VK_BUFFER) {
+                                continue;
+                            }
+                            auto vb =
+                                std::dynamic_pointer_cast<VulkanBuffer>(res);
+                            if (!vb) continue;
+                            if (segment_buf_ids_[ord].count(
+                                    reinterpret_cast<uint64_t>(
+                                        vb->getBuffer())) == 0) {
+                                moved = true;
+                                break;
+                            }
                         }
                     }
                 }
-seg_effects_found:
-                if (seg_host_side_effects) {
+                if (moved) {
                     segment_replay_hit_this_round_[ord] = false;
-                    if (seg_log) {
-                        auto *op = (trigger_op_idx >= 0 &&
-                                    trigger_op_idx <
-                                        static_cast<int>(node_ops_.size()))
-                                       ? node_ops_[trigger_op_idx].get()
-                                       : nullptr;
+                    if (seg_log)
                         fprintf(stderr,
-                                "[seg-replay] seg %zu: skip (host-side "
-                                "effects: op[%d] %s)\n",
-                                ord, trigger_op_idx,
-                                op ? op->get_name().c_str() : "?");
-                    }
-                    continue;  // 跳过该段 fingerprint 聚合
+                                "[seg-replay] seg %zu: record (buffer moved)\n",
+                                ord);
                 }
-                // 段内所有 op 都无宿主侧副作用: 继续 fingerprint 比对.
-                std::vector<vkop::ops::Operator::PassFingerprint> curr_fp;
-                curr_fp.reserve((seg_end - seg_start) * 2);
-                for (size_t li = seg_start; li < seg_end; li++) {
-                    for (int op_idx : level_node_indices_[li]) {
-                        auto &op = node_ops_[op_idx];
-                        // 先取 Operator 内部可能有的 fp_passes_ (per-op
-                        // replay 路径里会填), graph_cmd_ 路径里为空.
-                        auto &op_fp = op->current_fingerprint();
-                        curr_fp.insert(curr_fp.end(), op_fp.begin(),
-                                       op_fp.end());
-                        // Runtime 侧补: 收集 input tensor 的
-                        // VulkanBuffer handles. ResizeInput 每轮重建
-                        // VkBuffer → handle 变化 → fingerprint 自然比对
-                        // 失败 → hit=false. output handles 每轮都变,
-                        // 不收集.
-                        auto gather_handles = [&](const auto &tensors) {
-                            for (auto &t : tensors) {
-                                if (!t) continue;
-                                auto res = t->gpu_buffer();
-                                if (!res) continue;
-                                auto type = res->getResourceType();
-                                curr_fp.push_back({});
-                                auto &pf = curr_fp.back();
-                                if (type == ResourceType::VK_BUFFER) {
-                                    auto vb =
-                                        std::dynamic_pointer_cast<VulkanBuffer>(
-                                            res);
-                                    if (vb)
-                                        pf.handles.push_back(
-                                            reinterpret_cast<uint64_t>(
-                                                vb->getBuffer()));
-                                }
-                            }
-                        };
-                        gather_handles(node_input_tensors_[op_idx]);
-                    }
-                }
-                if (curr_fp != segment_fp_stored_[ord]) {
-                    segment_replay_hit_this_round_[ord] = false;
-                }
+            } else {
+                segment_replay_hit_this_round_[ord] = false;
             }
-            // 如果全 miss, 清空 graph_cmds_ 让 graph_open 重新分配 + 重录.
-            bool any_hit = false;
-            for (bool b : segment_replay_hit_this_round_)
-                if (b) { any_hit = true; break; }
-            if (!any_hit) {
-                segment_fp_stored_.clear();
-                graph_cmds_.clear();
-            }
-        } else {
-            segment_fp_stored_.clear();
-            graph_cmds_.clear();  // segment 数/划分变了, 旧 buffer 也作废
-            segment_replay_hit_this_round_.assign(est_seg, false);
         }
     }
 
