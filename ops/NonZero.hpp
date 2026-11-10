@@ -76,6 +76,40 @@ class NonZero : public BufferFactory {
     }
     bool has_host_side_effects() const override { return true; }
 
+    // Replay answers. In STABLE this op re-fills and re-uploads the SAME cached
+    // bytes every round, so the recording it produces is identical round to
+    // round — a replay re-runs that recorded upload and reproduces exactly the
+    // right buffer contents. What a replay skips is the host-side half (data_ +
+    // host_authoritative), which refresh_dynamic_params() redoes.
+    //
+    // LEARNING/CONFIRMING/DYNAMIC do a real readback whose result can differ;
+    // those keep the conservative answer.
+    bool recording_changes_per_round() const override {
+        return nz_state_ != LearnState::STABLE;
+    }
+    bool did_host_work_last_round() const override {
+        // Not `host_work_observed_ ? host_work_last_round_ : ...`: execute()
+        // sets that flag unconditionally at its top, so it is always observed
+        // and always true, which would mask this answer.
+        return nz_state_ != LearnState::STABLE;
+    }
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (nz_state_ != LearnState::STABLE || cached_out_.empty() ||
+            outputs.empty() || !outputs[0]) {
+            return false;
+        }
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (!output) return false;
+        if (output->getShape() != cached_out_shape_) {
+            output->resize(cached_out_shape_);
+        }
+        output->fillToCPU(cached_out_);
+        if (host_shape_enabled()) output->set_host_authoritative();
+        return true;
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
