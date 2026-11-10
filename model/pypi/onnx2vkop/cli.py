@@ -419,6 +419,18 @@ Examples:
              "See onnx2vkop/layout_audit.py for the three checks.",
     )
 
+    parser.add_argument(
+        "--numeric-audit", choices=["off", "summary", "full"], default=None,
+        help="Report what the chosen -q format costs each weight, measured at "
+             "convert time instead of by running the model (equivalent to "
+             "VKOP_NUMERIC_AUDIT). summary (default) prints a per-format tally "
+             "plus any weight whose relative L2 error is above its format's "
+             "usual cost or whose FP16 downcast overflows; full lists every "
+             "weight; off is silent. Report-only -- there is no strict mode: a "
+             "weight the format is bad at still computes, and the choice of "
+             "accuracy budget is the user's. See onnx2vkop/numeric_audit.py.",
+    )
+
     return parser.parse_args()
 
 
@@ -440,6 +452,7 @@ def _apply_build_knobs(args) -> None:
         "VKOP_STREAM_WEIGHTS": args.stream_weights,
         "VKOP_STREAM_MIN_MIB": args.stream_min_mib,
         "VKOP_LAYOUT_AUDIT": args.layout_audit,
+        "VKOP_NUMERIC_AUDIT": args.numeric_audit,
     }
     for env_name, val in mapping.items():
         if val is not None:

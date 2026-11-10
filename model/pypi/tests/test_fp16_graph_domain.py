@@ -23,6 +23,7 @@ import onnx
 from onnx import TensorProto, helper, numpy_helper
 from onnx.helper import make_tensor_value_info as vi
 
+from onnx2vkop import numeric_audit
 from onnx2vkop.converter import ModelConverter
 from onnx2vkop.dag import DAGBasedModel, Node
 from onnx2vkop.fp16_graph import GraphFp16
@@ -321,6 +322,21 @@ def test_a_magnitude_past_fp16_is_reported_not_silently_inf():
     assert summary["out_of_range"] == [("W", 70000.0)]
     halves = numpy.frombuffer(m.initializers["W"].raw_data, dtype=numpy.float16)
     assert numpy.isinf(halves[0]) and halves[1] == 1.0
+
+
+def test_the_overflowing_weight_also_reaches_the_numeric_audit():
+    """The domain pass owns the downcast, so it owns the hand-off: the same
+    weight the summary reports as out_of_range is the row the convert-time
+    numeric gate counts as overflow (numeric_audit.py)."""
+    big = numpy.array([[70000.0, 1.0]], dtype=numpy.float32)
+    m = build([node("Conv", "conv", ["x", "W"], ["c"])], inputs=["x"],
+              outputs=["c"], initializers={"W": big})
+    with contextlib.redirect_stdout(io.StringIO()), \
+            numeric_audit.collecting() as audit:
+        apply(m)
+    row, = [r for r in audit.rows if r.tensor == "W"]
+    assert (row.fmt, row.overflow) == ("fp16", 1)
+    assert row.flagged
 
 
 def test_a_declared_input_the_parser_could_not_type_is_transparent():

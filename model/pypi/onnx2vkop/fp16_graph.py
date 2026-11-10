@@ -55,8 +55,10 @@ from onnx import numpy_helper
 
 try:
     from . import shader_map
+    from . import numeric_audit
 except ImportError:  # run as a flat script from inside onnx2vkop/, as converter.py supports
     import shader_map
+    import numeric_audit
 
 _FLOAT = onnx.TensorProto.FLOAT
 _FLOAT16 = onnx.TensorProto.FLOAT16
@@ -328,6 +330,11 @@ class GraphFp16:
             dag_model.initializers[name] = fp16
             summary["bytes_after"] += len(fp16.raw_data)
             summary["converted"] += 1
+            # The kernel reads `halves` widened back to fp32, so that is the
+            # pair the numeric audit compares (numeric_audit.py). A weight the
+            # pass left FP32 has no row: nothing was costed against a format.
+            numeric_audit.record_roundtrip(name, "fp16", arr,
+                                           halves.astype(np.float32))
 
         if verbose:
             print(f"[fp16-domain] {len(plan['domain'])} tensor(s) in the FP16 "

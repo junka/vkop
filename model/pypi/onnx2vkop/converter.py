@@ -20,6 +20,7 @@ try:
     from . import shader_map
     from . import weight_stream
     from . import layout_audit
+    from . import numeric_audit
     from . import exclusion
     from . import quant_payload
     from .fp16_graph import GraphFp16
@@ -45,6 +46,7 @@ except ImportError:
     import shader_map
     import weight_stream
     import layout_audit
+    import numeric_audit
     import exclusion
     import quant_payload
     from fp16_graph import GraphFp16
@@ -932,6 +934,12 @@ class ModelConverter:
         # fails on an operator the runtime does not have.
         PreQuantizedWeights.fold(dag_model)
 
+        # What each -q format costs the weights it is applied to, gathered while
+        # the quantizers hold both sides of the round trip and printed once when
+        # they are done (numeric_audit.py). Report-only: a weight the format is
+        # bad at still computes, and refusing the conversion would set the
+        # model's accuracy budget without being asked to.
+        numeric_audit.begin()
         if args.quant == "fp16":
             if excluded_weights:
                 print("[exclude] WARNING: -q fp16 ignores the exclusion "
@@ -998,6 +1006,8 @@ class ModelConverter:
                 "were already staying at their source dtype. The flags only "
                 "select anything for -q int8/fp8e4m3/fp8e5m2/int4/nf4/nvfp4/"
                 "awq.", file=sys.stderr)
+
+        numeric_audit.finish()
 
         # Every consumer-driven weight layout is settled by now: the fusion
         # passes that fold a Transpose or a Q/DQ pair have re-pointed each

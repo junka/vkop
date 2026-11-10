@@ -17,6 +17,7 @@ except ImportError:  # onnxsim 可选；缺失则退回 ConstantFolder
     _onnxsim_simplify = None
 
 from .dag import Node
+from . import numeric_audit
 
 
 def _env_int(name: str, default: int) -> int:
@@ -7853,6 +7854,9 @@ class Quantizer:
 
                 # Update the initializer in the model
                 dag_model.initializers[name] = fp16_initializer
+                numeric_audit.record_roundtrip(
+                    name, "fp16", arr, arr_fp16.astype(np.float32),
+                    via=numeric_audit.consumer_tag(consumers))
                 print(f"Converted FP32 tensor '{name}' to FP16 ({reason})")
                 print(f"New shape: {fp16_initializer.dims}")
                 converted_count += 1
@@ -8167,6 +8171,10 @@ class Quantizer:
                 print(f"  MSE: {mse:.6e}, MAE: {mae:.6e}")
                 print(f"  Max Abs Error: {max_abs_error:.6e}")
                 print(f"  Mean Rel Error: {mean_rel_error:.2%}, Max Rel Error: {max_rel_error:.2%}")
+                numeric_audit.record_roundtrip(
+                    name, "int8", original_fp32, dequantized,
+                    dead_slices=int(np.count_nonzero(np.asarray(amax) == 0)),
+                    via=numeric_audit.consumer_tag(consumers))
 
                 # Create INT8 initializer for quantized weights
                 int8_initializer = numpy_helper.from_array(arr_int8.astype(np.int8), name)
@@ -8615,7 +8623,7 @@ class Quantizer:
 
     @staticmethod
     def _report_qerror(name, w3, codes, scale_keepdims, fmt, k, n, n_groups,
-                       group_size):
+                       group_size, via=""):
         """MSE / MAE / relative error of a grouped 4-bit encode, printed once
         per weight. Compared in the grouped view: dequantized carries the
         [n_groups, group_size, N] shape the scale broadcasts over."""
@@ -8632,6 +8640,9 @@ class Quantizer:
             f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
             f"Max Rel Error: {np.max(rel_error):.2%}"
         )
+        numeric_audit.record_roundtrip(
+            name, fmt, w3, dequantized,
+            dead_slices=int(np.count_nonzero(scale_keepdims == 0)), via=via)
 
     @staticmethod
     def _pack_4bit_weight(dag_model, name, consumers, dims, codes, scale, fmt):
@@ -8747,7 +8758,8 @@ class Quantizer:
             # Compare in the grouped view: dequantized carries the
             # [n_groups, group_size, N] shape the scale broadcasts over.
             Quantizer._report_qerror(name, w3, codes, scale_keepdims, fmt,
-                                     k, n, n_groups, group_size)
+                                     k, n, n_groups, group_size,
+                                     via=numeric_audit.consumer_tag(consumers))
 
             source_dt = initializer.data_type
             scale_name = Quantizer._pack_4bit_weight(
@@ -8955,6 +8967,10 @@ class Quantizer:
                 f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
                 f"Max Rel Error: {np.max(rel_error):.2%}"
             )
+            numeric_audit.record_roundtrip(
+                name, fmt, arr, dequantized,
+                dead_slices=int(np.count_nonzero(scale == 0)),
+                via=numeric_audit.consumer_tag(consumers))
 
             payload = helper.make_tensor(
                 name,
@@ -9253,6 +9269,10 @@ class Quantizer:
                 f"  Mean Rel Error: {np.mean(rel_error):.2%}, "
                 f"Max Rel Error: {np.max(rel_error):.2%}"
             )
+            numeric_audit.record_roundtrip(name, "nvfp4", w3, dequantized,
+                                           dead_slices=int(dead),
+                                           via=numeric_audit.consumer_tag(
+                                               consumers))
 
             nib = codes.reshape(-1)
             packed = (nib[0::2] | (nib[1::2] << 4)).astype(np.uint8)
