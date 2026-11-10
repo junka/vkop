@@ -45,6 +45,14 @@ struct alignas(16) AttentionPC {
     int seq_major;     // 0/1: Q/K/V are [B,S,H,D] and Y is written likewise
     int v_base_extra;  // elements added to V's row base (see ops/Attention.hpp)
     int v_step_extra;  // elements added to V's kv step (see ops/Attention.hpp)
+    // 1 = kv_len / kv_past / ring_head come from the per-round parameter SSBO
+    // (binding 7) instead of this push constant. That is what makes the
+    // recorded dispatch survive into the next round: those three grow every
+    // decode step, so baking them here invalidated the recording immediately.
+    // 0 keeps the old behaviour for graphs converted before the field existed
+    // (the shader reads this slot as 0 when the PC is shorter, which is why it
+    // is LAST).
+    int dyn_ssbo;
 };
 static_assert(sizeof(AttentionPC) <= 128, "AttentionPC PC overflow");
 
@@ -85,6 +93,12 @@ class AttentionBuffer : public BufferFactory {
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
                             DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
+                            DESCRIPTOR_TYPE_STORAGE,
+                            // binding 7: this round's kv_len / kv_past / grid.
+                            // Declared unconditionally because the descriptor
+                            // set layout is built from this list — the kernel
+                            // reads it only when pc.dyn_ssbo != 0, and the
+                            // no-cache form binds a dummy there.
                             DESCRIPTOR_TYPE_STORAGE},
                         sizeof(AttentionPC), fp16) {
         update_after_bind_ = true;
@@ -92,6 +106,17 @@ class AttentionBuffer : public BufferFactory {
 
     // Y, Q, K, V, mask, cache_in, cache_out.
     size_t bda_address_table_slots() const override { return 7; }
+
+    // Declines the BDA variant entirely.
+    //
+    // The dynamic form keeps this round's kv_len / kv_past / grid in a
+    // binding-7 SSBO, which the BDA build has no slot for (its table carries
+    // buffer addresses only), and the decision to take the dynamic form is
+    // made on the first execute() — after the BDA pipeline would already have
+    // been built with a different push-constant size. Rather than carry two
+    // incompatible paths, this op stays on descriptors: VKOP_BDA is opt-in and
+    // was never measured to pay off here.
+    bool supports_bda_variant() const override { return false; }
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -153,15 +178,126 @@ class AttentionBuffer : public BufferFactory {
         }
     }
     bool has_host_side_effects() const override { return true; }
-    // The push constant carries kv_len / kv_past, and both grow by one every
-    // decode step. The dispatch geometry and the pc are therefore stale for
-    // the next round even when every bound buffer address is unchanged, so a
-    // recorded Attention dispatch can never be re-submitted verbatim. This is
-    // separate from the host-side-effect flag above (which is about the
-    // ring_head readback): measured with that flag bypassed, replaying
-    // Attention froze the KV cache and the decode loop repeated the same
-    // token forever.
-    bool recording_changes_per_round() const override { return true; }
+    // The INSTANCE answer. The only host work execute() does is the ring head
+    // readback (a 1-element int32) — and once the dynamic form is live that
+    // readback has moved to refresh_dynamic_params(), which the runtime calls
+    // on every round INCLUDING replayed ones. So a replay skips nothing.
+    bool did_host_work_last_round() const override {
+        return host_work_observed_ ? host_work_last_round_ : !dyn_live_;
+    }
+    // Replayability. The PC used to carry kv_len / kv_past, both of which grow
+    // by one every decode step, so a recorded dispatch was stale the moment it
+    // was recorded — measured: replaying it froze the KV cache and the decode
+    // loop repeated one token forever.
+    //
+    // Those values now travel in a per-round parameter SSBO (binding 7) that
+    // the host rewrites into the SAME buffer each round, and the dispatch
+    // width moves to vkCmdDispatchIndirect over a command in that buffer. A
+    // recorded dispatch then names only stable things: constant handles, a
+    // constant PC, and a live buffer whose contents this round rewrote. So the
+    // answer becomes "no" once the dynamic form has actually run once (which
+    // is what proves this op's shader has the binding-7 code path; an older
+    // .vkopbin's kernel ignores the field and must keep re-recording).
+    bool recording_changes_per_round() const override { return !dyn_live_; }
+
+    // The per-round half of the above: refresh the parameter SSBO and the
+    // indirect grid for THIS round. Runs on every level of every round,
+    // including replayed ones, because a hit segment skips execute().
+    //
+    // Everything is re-derived from the LIVE input shapes, which the per-level
+    // reshape_view pre-pass has already updated for this round: kv_past is the
+    // cache's kv axis and kv_new is K's row count. The grid is a pure function
+    // of those plus the op attributes, so no host readback is involved (except
+    // the ring head, which is a 1-element int32 the driver rewrites).
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (!dyn_live_ || !has_cache_) {
+            return false;
+        }
+        // inputs: 0=Q, 1=K, 2=V, 3=cache, [4=mask], [5=ring_head]
+        if (inputs.size() < 4 || !inputs[1] || !inputs[3]) {
+            return false;
+        }
+        const auto k_shape = inputs[1]->getShape();
+        const auto c_shape = inputs[3]->getShape();
+        if (c_shape.size() != 5) {
+            return false;
+        }
+        const bool rank3 = k_shape.size() == 3;
+        const int kv_new =
+            rank3 ? dim(k_shape, 0) : (seq_major_ ? dim(k_shape, 1)
+                                                  : dim(k_shape, 2));
+        const int kv_past = dim(c_shape, 3);
+        const int kv_len = kv_past + kv_new;
+        if (kv_new <= 0 || kv_past < 0 || kv_len <= 0) {
+            return false;
+        }
+        const int heads =
+            rank3 ? dim(inputs[0]->getShape(), 1)
+                  : (seq_major_ ? dim(inputs[0]->getShape(), 2)
+                                : dim(inputs[0]->getShape(), 1));
+        const int seq =
+            rank3 ? dim(inputs[0]->getShape(), 0)
+                  : (seq_major_ ? dim(inputs[0]->getShape(), 1)
+                                : dim(inputs[0]->getShape(), 2));
+        const int head_dim = dim(k_shape, k_shape.size() - 1);
+        const int kv_heads =
+            rank3 ? dim(k_shape, 1) : (seq_major_ ? dim(k_shape, 2)
+                                                  : dim(k_shape, 1));
+        if (heads <= 0 || seq <= 0 || kv_heads <= 0 || head_dim <= 0) {
+            return false;
+        }
+        int ring_head = 0;
+        if (ring_ != 0) {
+            for (size_t k = 4; k < inputs.size(); ++k) {
+                if (inputs[k] && inputs[k]->dtype() == typeid(int)) {
+                    auto ht = core::as_tensor<int>(inputs[k]);
+                    if (!ht || ht->num_elements() < 1) return false;
+                    if (ht->has_cpu_data()) {
+                        ring_head = ht->data()[0];
+                    } else {
+                        ht->copyToCPU(m_cmdpool_);
+                        ring_head = ht->at(0);
+                    }
+                    break;
+                }
+            }
+        }
+        // The dispatch width: one workgroup per query row, plus the cache-copy
+        // workgroups. Must mirror execute()'s arithmetic exactly.
+        const int attn_wgs = 1 * heads * seq; // batch is 1 with a cache
+        const int row_elems = 2 * kv_heads * head_dim;
+        const auto &cache_dtype = inputs[3]->dtype();
+        const int elem_bytes =
+            cache_dtype == typeid(int8_t)
+                ? 1
+                : (cache_dtype == typeid(uint16_t) ? 2 : 4);
+        const int elems_per_word = 4 / elem_bytes;
+        const int64_t copy_rows = (ring_ != 0) ? kv_new : kv_len;
+        const int64_t words = static_cast<int64_t>(row_elems) * copy_rows /
+                              elems_per_word;
+        const int grid = attn_wgs + static_cast<int>((words + 255) / 256);
+        // Publish `present`'s logical shape too. execute() does that
+        // (pres->resize(p_shape)) and a replayed segment skips it — without
+        // this the driver's feedback() reads the PREVIOUS round's kv_len out of
+        // the output shape, so past_len never advances and decode repeats one
+        // token forever (measured: "the capital of the capital of ...").
+        if (outputs.size() > 1 && outputs[1]) {
+            const std::vector<int> p_shape{1, 2, kv_heads, kv_len, head_dim};
+            dispatch_by_dtype(outputs[1]->dtype(), [&](auto tag) {
+                using TT = decltype(tag);
+                auto pres = core::as_tensor<TT>(outputs[1]);
+                if (!pres) return;
+                if (pres->num_elements() != total_elems(p_shape)) {
+                    pres->resize(p_shape);
+                } else if (pres->getShape() != p_shape) {
+                    pres->reshape_view(p_shape);
+                }
+            });
+        }
+        return publish_dyn(kv_len, kv_past, ring_head, grid);
+    }
 
   private:
     // (B, H, S, D) -> a 4-element shape check helper.
@@ -506,6 +642,7 @@ class AttentionBuffer : public BufferFactory {
             if (!has_cache) {
                 objs_.emplace_back(dummy_buffer_); // binding 5
                 objs_.emplace_back(dummy_buffer_); // binding 6
+                objs_.emplace_back(dummy_buffer_); // binding 7 (dyn params)
                 return;
             }
             // The cache is bound as its OWN element type, not the compute
@@ -596,10 +733,92 @@ class AttentionBuffer : public BufferFactory {
                 const int64_t words = static_cast<int64_t>(row_elems) *
                                       copy_rows / elems_per_word;
                 grid += static_cast<int>((words + 255) / 256);
+
+                // Dynamic form: publish this round's numbers and dispatch
+                // indirectly, so the recorded command survives the next round.
+                // publish_dyn() has to run BEFORE the dispatch is recorded --
+                // its buffer is the dispatch's indirect source and the kernel's
+                // parameter source.
+                dyn_this_round_ =
+                    has_cache && publish_dyn(kv_len, kv_past, ring_head, grid);
+                if (dyn_this_round_) {
+                    // binding 7: the parameter SSBO. The write above went
+                    // through a HOST_COHERENT mapping; readBarrier sets the
+                    // access state the dispatch reads under.
+                    dyn_buf_->readBarrier(m_cmd_->get(), kDynBytes);
+                    objs_.emplace_back(
+                        std::static_pointer_cast<VulkanResource>(dyn_buf_));
+                    pc.dyn_ssbo = 1;
+                } else {
+                    // The layout always declares binding 7; keep it bound.
+                    objs_.emplace_back(dummy_buffer_);
+                }
             });
         });
 
-        submit(&pc, grid, 1, 1);
+        if (dyn_this_round_) {
+            pc.kv_len = kv_len;
+            pc.kv_past = kv_past;
+            pc.ring_head = ring_head;
+            // The grid lives in the buffer, so the CPU-side widths are moot;
+            // submit_indirect only records the vkCmdDispatchIndirect.
+            submit_indirect(&pc, dyn_buf_->getBuffer(), 16);
+            // From here on the recording is round-invariant, so replay may hit
+            // this op's segment. Set AFTER the dispatch: the first recording
+            // must not be considered replayable before it exists.
+            dyn_live_ = true;
+        } else {
+            submit(&pc, grid, 1, 1);
+        }
+    }
+
+    // Publish this round's kv_len / kv_past / ring_head and the dispatch grid
+    // into the parameter SSBO, and (on the recording round) issue the first
+    // write. Called from execute() while recording and from the runtime on
+    // EVERY level of EVERY round, hit or not — a replayed segment skips
+    // execute() entirely, so this is the only thing that keeps the recorded
+    // vkCmdDispatchIndirect pointing at this round's problem.
+    //
+    // The buffer is HOST_VISIBLE | HOST_COHERENT and mapped for the op's
+    // lifetime, so the write is a host memcpy + flush: it needs no command
+    // buffer, which is exactly what makes it usable on a hit path that cannot
+    // append to an already-recorded segment. Run() waits for the last segment
+    // at the end of every round, so the previous round's indirect read has
+    // completed before this round's write.
+    bool publish_dyn(int kv_len, int kv_past, int ring_head, int grid) {
+        if (!dyn_buf_) {
+            dyn_buf_ = std::make_shared<VulkanBuffer>(
+                m_dev_, kDynBytes,
+                STORAGE | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT |
+                    VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            if (!dyn_buf_ || !dyn_buf_->getMappedMemory()) {
+                dyn_buf_.reset();
+                return false;
+            }
+            dyn_ready_ = true;
+        }
+        auto *mem = static_cast<uint32_t *>(dyn_buf_->getMappedMemory());
+        if (!mem) return false;
+        // [0] kv_len, [1] kv_past, [2] ring_head, [3] pad, then
+        // VkDispatchIndirectCommand { x, y, z } + pad.
+        mem[0] = static_cast<uint32_t>(kv_len);
+        mem[1] = static_cast<uint32_t>(kv_past);
+        mem[2] = static_cast<uint32_t>(ring_head);
+        mem[3] = 0;
+        mem[4] = static_cast<uint32_t>(grid);
+        mem[5] = 1;
+        mem[6] = 1;
+        mem[7] = 0;
+        dyn_buf_->flushMappedRange(0, kDynBytes);
+        // Remember them: a replayed round skips execute() and re-publishes
+        // these from here.
+        last_kv_len_ = kv_len;
+        last_kv_past_ = kv_past;
+        last_ring_head_ = ring_head;
+        last_grid_ = grid;
+        return true;
     }
 
     float scale_ = 1.0F;
@@ -632,6 +851,30 @@ class AttentionBuffer : public BufferFactory {
     // party that knows, so it has to say so. Set from the op attribute, with
     // an env override for A/B without a reconversion.
     int mask_causal_ = 0;
+    // Per-round parameter SSBO (binding 7) + the indirect dispatch command in
+    // it. Created lazily the first time this op executes with a cache, because
+    // only the cached form has per-round numbers. `dyn_live_` — set once the
+    // dynamic path has really dispatched — is what
+    // recording_changes_per_round() reports.
+    std::shared_ptr<VulkanBuffer> dyn_buf_;
+    bool dyn_ready_ = false;
+    // True once the dynamic path has actually dispatched once. Reporting the
+    // predicate off this (rather than off dyn_ready_) keeps a graph whose
+    // embedded shader predates binding 7 on the old conservative answer: its
+    // kernel would ignore the parameter SSBO, so its recording really does
+    // change per round.
+    bool dyn_live_ = false;
+    // Whether THIS execute() took the dynamic path.
+    bool dyn_this_round_ = false;
+    // Last published values, so refresh_dynamic_params() can re-publish them
+    // on a replayed round (execute() is skipped there and cannot recompute).
+    int last_kv_len_ = 0;
+    int last_kv_past_ = 0;
+    int last_ring_head_ = 0;
+    int last_grid_ = 0;
+    // The buffer is 32 bytes: ivec4 p (kv_len, kv_past, ring_head, pad) then
+    // the VkDispatchIndirectCommand {x,y,z} + pad.
+    static constexpr size_t kDynBytes = 32;
 };
 
 // PIMPL façade. Buffer-only (no image impl), like RMSNorm.

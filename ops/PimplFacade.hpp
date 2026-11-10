@@ -138,7 +138,14 @@ class PimplFacade : public Operator {
     void set_did_alias_output_last_round(bool v) {
         impl_->set_did_alias_output_last_round(v);
     }
-    // 同 route_tag 的转发陷阱: current_fingerprint() 在 impl_ 上填充.
+    // Same forwarding trap as recording_changes_per_round: the parameter SSBO
+    // lives on impl_, so a façade-level default would silently never refresh
+    // it on a replayed segment.
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        return impl_->refresh_dynamic_params(inputs, outputs);
+    }    // 同 route_tag 的转发陷阱: current_fingerprint() 在 impl_ 上填充.
     const std::vector<PassFingerprint> &current_fingerprint()
         const override {
         return impl_->current_fingerprint();

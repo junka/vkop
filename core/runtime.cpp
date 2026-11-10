@@ -3524,6 +3524,17 @@ double Runtime::Run() {
                 graph_seg && graph_next_seg > 0 &&
                 graph_next_seg - 1 < segment_replay_hit_this_round_.size() &&
                 segment_replay_hit_this_round_[graph_next_seg - 1]) {
+                // Per-round device parameters still have to be published: the
+                // replay re-submits a recording whose dispatch reads them from
+                // a host-mapped buffer, and that buffer must say THIS round's
+                // numbers. Without this a replayed Attention would sweep the
+                // previous round's kv range. (Host-side only — no command is
+                // appended to the recorded segment.)
+                for (int node_idx : level_node_indices_[level_idx]) {
+                    node_ops_[node_idx]->refresh_dynamic_params(
+                        node_input_tensors_[node_idx],
+                        node_output_tensors_[node_idx]);
+                }
                 // runprof 计数器在下面的 per-level 循环里累加; hit 段
                 // continue 跳过了那部分, 所以在这里补上. 不改任何耗时统计
                 // (hit 段确实零 record 开销).

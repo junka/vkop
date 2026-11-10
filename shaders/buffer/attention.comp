@@ -100,6 +100,37 @@ layout(set = 0, binding = 6) buffer CacheOut {
 } uCacheOut;
 #endif
 
+// The per-round parameters that used to make this dispatch unreplayable.
+//
+// kv_len and kv_past grow by one every decode step, and they feed BOTH the
+// push constant and the dispatch width. A recorded command buffer therefore
+// went stale the moment it was recorded, which is why segment replay had to
+// re-record all 28 attention segments every round.
+//
+// When `dyn_ssbo != 0` those three values come from this SSBO instead, which
+// the host rewrites each round (a plain write through its HOST_COHERENT
+// mapping, so no command is needed and the recorded dispatch still names the
+// same address), and the dispatch becomes a vkCmdDispatchIndirect over a
+// command in that buffer whose grid is rewritten the same way.
+// The push-constant copies stay as the fallback for the no-cache form and for
+// graphs converted before this existed.
+struct DynParams {
+    // [0] kv_len, [1] kv_past, [2] ring_head, [3] unused
+    ivec4 p;
+    // VkDispatchIndirectCommand { x, y, z } — written by the host, read by
+    // vkCmdDispatchIndirect. Kept in the same buffer so one update carries
+    // both and the barrier covers both.
+    uvec3 dispatch;
+    uint _pad;
+};
+#ifndef BDA
+layout(set = 0, binding = 7) readonly buffer DynParamsBuf {
+    ivec4 p;
+    uvec3 dispatch;
+    uint _pad;
+} uDyn;
+#endif
+
 layout(push_constant) uniform PC_ATTN {
     float scale;      // 1/sqrt(head_dim), folded by the converter
     int batch;        // B
@@ -129,8 +160,34 @@ layout(push_constant) uniform PC_ATTN {
                       // positions: (C-1)*Hkv*D for that component read, 0
                       // otherwise. K keeps the plain kv_step — only V is read
                       // as a component (see fuse_qkv_components).
+    int dyn_ssbo;     // 1 = kv_len/kv_past/ring_head come from binding 7
 } uA;
 
+// The three per-round numbers. With dyn_ssbo == 0 they come from the push
+// constant (the form every pre-existing .vkopbin was converted with); with it
+// set they come from the parameter SSBO the host rewrites each round, which is
+// what lets a recorded dispatch outlive the round that recorded it.
+int dyn_kv_len() {
+#ifdef BDA
+    return uA.kv_len;
+#else
+    return (uA.dyn_ssbo != 0) ? uDyn.p.x : uA.kv_len;
+#endif
+}
+int dyn_kv_past() {
+#ifdef BDA
+    return uA.kv_past;
+#else
+    return (uA.dyn_ssbo != 0) ? uDyn.p.y : uA.kv_past;
+#endif
+}
+int dyn_ring_head() {
+#ifdef BDA
+    return uA.ring_head;
+#else
+    return (uA.dyn_ssbo != 0) ? uDyn.p.z : uA.ring_head;
+#endif
+}
 #define TILE_KV 256
 #define MAX_HD 256
 
@@ -145,7 +202,7 @@ int kv_slot(int j) {
     if (uA.ring == 0) {
         return j;
     }
-    return (uA.ring_head + j) % uA.src_stride;
+    return (dyn_ring_head() + j) % uA.src_stride;
 }
 
 // Cache row stride in uint words (a fp16 row is D/2 packed words, fp32 D).
@@ -384,8 +441,8 @@ void copy_cache(int cwg) {
     // on the host), so only the fresh rows [kv_past, kv_len) are written and the
     // dispatch is sized to them — otherwise every history lane would be a
     // wasted early-return.
-    int nrows = (uA.ring != 0) ? (uA.kv_len - uA.kv_past) : uA.kv_len;
-    int j0 = (uA.ring != 0) ? uA.kv_past : 0;
+    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
     int total_words = 2 * nkv * nrows * R;
     int gid = cwg * 256 + int(gl_LocalInvocationID.x);
     if (gid >= total_words) {
@@ -398,7 +455,7 @@ void copy_cache(int cwg) {
     int c = row / (nrows * nkv); // 0 = K, 1 = V
 
     uint word;
-    if (j < uA.kv_past) {
+    if (j < dyn_kv_past()) {
         if (uA.inplace != 0) {
             return; // cache_out IS cache_in: the history is already in place
         }
@@ -406,7 +463,7 @@ void copy_cache(int cwg) {
                    .data[((c * nkv + h) * uA.src_stride + kv_slot(j)) * R + w];
     } else {
         // Fresh rows, batch 0 (the host requires B == 1 with a cache).
-        int off = (h * uA.seq + (j - uA.kv_past)) * R + w;
+        int off = (h * uA.seq + (j - dyn_kv_past())) * R + w;
         word = (c == 0) ? uK.data[off] : uV.data[off];
     }
     uCacheOut.data[((c * nkv + h) * uA.dst_stride + kv_slot(j)) * R + w] = word;
@@ -420,8 +477,8 @@ void copy_cache_f8(int cwg) {
     int D = uA.head_dim;
     int nkv = uA.kv_heads;
     int R = D >> 2; // fp8: 4 bytes per uint word
-    int nrows = (uA.ring != 0) ? (uA.kv_len - uA.kv_past) : uA.kv_len;
-    int j0 = (uA.ring != 0) ? uA.kv_past : 0;
+    int nrows = (uA.ring != 0) ? (dyn_kv_len() - dyn_kv_past()) : dyn_kv_len();
+    int j0 = (uA.ring != 0) ? dyn_kv_past() : 0;
     int total_words = 2 * nkv * nrows * R;
     int gid = cwg * 256 + int(gl_LocalInvocationID.x);
     if (gid >= total_words) {
@@ -434,7 +491,7 @@ void copy_cache_f8(int cwg) {
     int c = row / (nrows * nkv); // 0 = K, 1 = V
 
     uint word;
-    if (j < uA.kv_past) {
+    if (j < dyn_kv_past()) {
         if (uA.inplace != 0) {
             return; // cache_out IS cache_in: the history is already in place
         }
@@ -444,7 +501,7 @@ void copy_cache_f8(int cwg) {
         // Fresh rows, batch 0 (the host requires B == 1 with a cache). They are
         // fp16 rows of D/2 words; this lane owns elements [4w, 4w+4), i.e. half2
         // words 2w and 2w+1.
-        int krow = (h * uA.seq + (j - uA.kv_past)) * (D >> 1) + (w << 1);
+        int krow = (h * uA.seq + (j - dyn_kv_past())) * (D >> 1) + (w << 1);
         // Two packed half2 words unpacked into scalars rather than vec2: the
         // branch-assigned vec2 form makes MoltenVK's MSL compile fail with an
         // ICE on GCN (VK_ERROR_INITIALIZATION_FAILED, "Compiler encountered an
@@ -476,7 +533,7 @@ void main() {
     int S = uA.seq;
     int H = uA.heads;
     int D = uA.head_dim;
-    int kv = uA.kv_len;
+    int kv = dyn_kv_len();
     // No in-kernel early return guards these: the host gates head_dim (even,
     // <= MAX_HD) and kv_len > 0 and throws on a violation, so a stray dispatch
     // cannot reach here. On this stack (AMD Polaris + MoltenVK) a
@@ -485,7 +542,7 @@ void main() {
     // dump showed every sub-term of the test false at runtime, the dumped MSL
     // carried the exact predicate, and merely deleting the return made the
     // kernel produce its output. Do not reintroduce one.
-    int kv_past = (uA.has_cache != 0) ? uA.kv_past : 0;
+    int kv_past = (uA.has_cache != 0) ? dyn_kv_past() : 0;
 
     // extra workgroups, if any, are the cache copy
     int attn_wgs = uA.batch * H * S;

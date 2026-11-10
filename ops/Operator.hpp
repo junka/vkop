@@ -360,6 +360,31 @@ class Operator {
     // fingerprint over buffer handles can catch.
     virtual bool recording_changes_per_round() const { return false; }
 
+    // Per-round values that must reach the DEVICE even on a replayed segment.
+    //
+    // A hit segment skips onExecute entirely, so anything an op used to write
+    // from inside execute() (Attention's kv_len / kv_past parameter SSBO and
+    // the indirect dispatch command in it) would stop being refreshed the
+    // moment its segment started replaying — the replay would re-run a
+    // dispatch whose grid and parameters describe an older round. The runtime
+    // calls this on every op of every level, hit or not, right before the
+    // level is submitted.
+    //
+    // It receives the node's live tensors because that is where a hit path can
+    // recover this round's values from: the inputs' SHAPES are already updated
+    // by the per-level reshape_view pre-pass, so e.g. Attention can re-derive
+    // kv_past from the cache's shape without any host readback.
+    //
+    // The buffer it writes is host-mapped, so this needs no command buffer:
+    // the recorded segment is re-submitted as-is and the only thing that
+    // changes between rounds is the buffer's contents. Returning true means
+    // "I refreshed something".
+    virtual bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
+        const std::vector<std::shared_ptr<core::ITensor>> & /*outputs*/) {
+        return false;
+    }
+
     // Drop any cached shape-input readback (option C: converter static
     // annotation). Called by Runtime across a phase boundary (prefill→decode)
     // where, even for value_dynamic=false shape tensors, the resolved dim[]
