@@ -137,7 +137,7 @@ python3 -m onnx2vkop.cli -i llm.onnx -q awq --awq-format nf4 \
     --exclude-node '*/layers.1/attn/*' --exclude-downstream-of /embed
 ```
 
-#### 4. 运行程序
+#### 5. 运行程序
 ```
 ./benchmark/vkbench ../resnet18-v2-7.vkopbin dog.jpeg
 ```
@@ -153,7 +153,66 @@ python3 -m onnx2vkop.cli -i llm.onnx -q int8 --extra-shaders TopK
 python3 -m onnx2vkop.cli -i resnet18.onnx --extra-shaders Softmax,TopK
 ```
 
-#### 5. LLM 推理（llm/exporter/driver/llm_chat.cpp）
+#### 6. 精度回环（tools/vkop_vs_ort.py）
+
+转换「能跑」不等于「算对」：每个 op 都有 kernel、图能 load、run 能结束，输出仍然可能
+是错的数字。回环把 GPU 写出的张量和 onnxruntime 对同一输入的参考逐输出对比：
+
+```bash
+python3 benchmark/resnet.py resnet18.onnx dog.jpg --dump-input   # dump 真实输入
+python3 -m onnx2vkop.cli -i resnet18.onnx -q int8                # 转换
+python3 tools/vkop_vs_ort.py resnet18.vkopbin --inputs DIR --topk 5
+```
+
+结论可信靠三个前提：
+
+- **同一个输入数组，不是两个长得像的。** 数组在这里造一次（`--inputs DIR/<name>.npy`，
+  float 输入可 `--random-fill` + `--seed`），原样喂给 ORT，同时写进 vkop-bench 用
+  `--load-inputs` 读的目录；两边都不再 resize/归一化，差异才只属于 kernel。跑 JPEG 必须
+  先 `--dump-input`：PIL 的 bilinear 和运行时的 stb triangle 不是同一个 resize，跨它们
+  比较测的是 resize。`--dump-input` 会把三种布局写在模型同目录，所以给回环的 `DIR` 里
+  只放 `py_input_nchw.npy`（单输入模型 + 目录里只有一个 .npy 时不必和输入同名）。
+  `.vkopbin` 的 dtype/shape 优先，不符会打印 cast/reshape。
+- **对 GPU 写出的字节没有歧义读法。** `vkop-bench --save-outputs DIR` 写 raw bytes 加
+  `DIR/manifest.tsv`（name / bytes-as / dims / nbytes，取最后一次 run 之后的真实形状），
+  回环断言 `prod(dims) × itemsize == nbytes`，不符该输出直接判失败。从 `.vkopbin` 反推
+  形状会让错形状或错 reinterpret 解码成「看起来像舍入误差」的数；输出名是配对契约，
+  ORT 侧没有同名输出报 UNMATCHED 而不是猜。整数输出（token id、位置、cache index）精确
+  比较——错的 index 没有容差带，`--topk` 对它也无意义。
+- **阈值按格式说明白。** gate 全是 flag（`--cos-min` `--rtol` `--atol` `--bad-frac-max`），
+  每次 run 把自己的标准打在表头，不继承魔法数。`--rtol` 拿参考的最大元素带宽，不是逐元素
+  相对误差：后者在近零值上测的是存储格式的舍入下限，不是 op 的正确性。fp32-vs-fp32 该过
+  cos≥0.999 且几乎无越带元素；权重-only int8 合理过不了，测出它漂多远正是目的。
+
+实测（resnet18-v2-7，224×224 单图，`--backend buffer`，默认 gate
+cos≥0.999 / atol 1e-3 / rtol 1e-2 / 越带 ≤0.1%）：
+
+| 产物 | maxabs | relL2 | cos | 越带元素 | top-1 | top-5 重合 |
+|---|---|---|---|---|---|---|
+| `-q fp16`（整图 FP16 域） | 8.811e-03 | 7.449e-04 | 1.000000 | 0.0000% | 1.000 | 1.0000 |
+| `-q int8`（权重-only） | 3.678e-01 | 3.923e-02 | 0.999329 | 33.80% | 0.000 | 0.8000 |
+| `-q int8 --exclude-scope /layer4/` | 3.766e-01 | 3.785e-02 | 0.999394 | 31.70% | 1.000 | 0.8000 |
+
+第一行过 gate；第二行在默认 gate 下 FAIL 是回环给出的结论，不是回环坏了——maxabs 3.7e-01
+已经大到换掉 top-1，把 gate 放宽去「通过」等于放弃这次测量。第三行是它的使用方法：把
+layer4 整层留在原 dtype，relL2 只从 3.923e-02 走到 3.785e-02（越带 33.8%→31.7%），说明损失
+主要不在这一层；两次转换同输入、同 shader，只差 flag 点名的那层，因此差值可归因。逐层做
+同样的比较，就是 `model/pypi/onnx2vkop/exclusion.py` 存在的理由。
+
+退出码 0 全部通过 / 1 至少一个输出没过 gate / 2 回环本身跑不起来（缺 binary、模型、ORT 或
+崩溃）。onnxruntime 不是转换器依赖（不在 wheel 的 requires 里），GPU 也不是这里的；两者都
+在开始前检查，并给出修复方式而不是 traceback。`--onnx` 默认取 `.vkopbin` 的同名 `.onnx`，
+`--bench` 默认 `build/benchmark/vkop-bench`（再退到 `$PATH`）；LLM 那种几十个输出的 KV dump
+用 `--limit N` 只看前 N 行，`--keep` 或 `--work-dir` 把 dump 留在盘上。
+
+和它对得上的是转换期的 `--numeric-audit` / `VKOP_NUMERIC_AUDIT`（只报警，见
+`model/pypi/onnx2vkop/numeric_audit.py`）：权重-only 格式下 kernel 读的是
+`decode(encode(W))`，所以每个权重自己的 relL2 不用 GPU 就能算。resnet18 的 21 个真实权重
+（按 GEMM 视图）中位数是 fp16 2.07e-04、int8 1.27e-02，本回环端到端是 7.449e-04 与
+3.923e-02，即 3.6× 与 3.1×——若 21 层各把自己的权重误差全额传到输出，平方和的上限是
+√21 ≈ 4.6×，实测在其之下。两边明显偏离时先查转换期那个数：端到端的差里可能混进了 kernel。
+
+#### 7. LLM 推理（llm/exporter/driver/llm_chat.cpp）
 
 - KV cache 已 GPU 化，而且**不再有任何拷贝**：converter 把每层的 past/present
   合成同一个 buffer（`fuse_kv_cache_append`，`Attention` 带 `has_cache`），
@@ -195,7 +254,7 @@ host 选路按 `attn_softmax → coopmat_i8(默认关) → coopmat → tiled →
 | `VKOP_SUBMIT_PROF=1` | 每个 op 的 GPU 时间戳查询（权威） |
 | `VKOP_OPPROF=1` | record 侧 wall time |
 
-#### 6. 文生图（image/exporter/image_gen）
+#### 8. 文生图（image/exporter/image_gen）
 
 一条 prompt 直接出 PNG，**运行期不读任何 python/ORT 中间产物**：C++ 分词 + 原始 ChatML
 模板 + `drop_idx` 截取 + padding 屏蔽，以及 DiT 的 joint rope 频率表和 FlowMatch σ 调度
@@ -378,7 +437,90 @@ python3 -m onnx2vkop.cli -i llm.onnx -q awq --awq-format nf4 \
 ```
 Supports manually registering post-processing operations like softmax and top-k on the GPU to reduce memory throughput between CPU and GPU. Registered post-process ops are not graph nodes, so the converter's archive pruning (per-graph op census) will not carry their kernels — declare them explicitly at convert time with `--extra-shaders` (comma-separated, ONNX spelling), e.g. `--extra-shaders TopK` for the LLM driver's GPU argmax, `--extra-shaders Softmax,TopK` for resnet-style classifiers. An archive missing the key fails hard at pipeline creation during LoadModel.
 
-#### 6. LLM inference (llm/exporter/driver/llm_chat.cpp)
+#### 6. Accuracy loop (tools/vkop_vs_ort.py)
+
+A conversion can be mechanically fine -- every op has a kernel, the graph loads,
+the run finishes -- and still compute wrong numbers. The loop compares what the
+GPU wrote against what ONNX Runtime gives for the same input, output by output:
+
+```bash
+python3 benchmark/resnet.py resnet18.onnx dog.jpg --dump-input   # the real input
+python3 -m onnx2vkop.cli -i resnet18.onnx -q int8                # convert
+python3 tools/vkop_vs_ort.py resnet18.vkopbin --inputs DIR --topk 5
+```
+
+Three things make the verdict worth reading:
+
+- **ONE input tensor, not two look-alikes.** The array is built here once (from
+  `DIR/<input name>.npy`, or a seeded `--random-fill` for float inputs), fed to
+  onnxruntime as-is, and written to the directory vkop-bench reads with
+  `--load-inputs`. Neither side resizes or renormalizes afterwards, so a
+  divergence belongs to the kernels. For a JPEG dump the tensor first: PIL's
+  bilinear and the runtime's stb triangle filter are not the same resize, and a
+  comparison across them would measure the resize. `--dump-input` writes its
+  three layouts next to the model, so point `DIR` at a directory holding only
+  `py_input_nchw.npy` -- with exactly one input and exactly one `.npy`, the file
+  name need not match (that is what `--dump-input` leaves behind). The
+  `.vkopbin`'s dtype and dims win; a cast or reshape is printed.
+- **An unambiguous reading of what the GPU wrote.** `vkop-bench --save-outputs DIR`
+  dumps raw bytes plus `DIR/manifest.tsv` (name, bytes-as, dims, nbytes --
+  the shape the run actually had), and the loop asserts
+  `prod(dims) x itemsize == nbytes`, failing that output if it disagrees.
+  Re-deriving the layout from the `.vkopbin` lets a mis-shaped or reinterpreted
+  array decode into plausible numbers, which reads as a rounding error rather
+  than as the misread it is. Output names are the pairing contract: an output
+  with no same-named ORT result is reported UNMATCHED, not guessed. Integer
+  outputs (token ids, positions, cache indices) compare exactly -- a wrong index
+  has no tolerance band, and `--topk` over one is meaningless.
+- **A threshold that means something per format.** The gates are flags
+  (`--cos-min`, `--rtol`, `--atol`, `--bad-frac-max`) so every run states the bar
+  it was judged against instead of inheriting a magic number. `--rtol` bands the
+  outlier count against the reference's largest element, not per element,
+  because per-element relative error on near-zero values measures the storage
+  format's rounding floor rather than the op's correctness. fp32-vs-fp32 should
+  clear cos>=0.999 with almost no outliers; an int8 weight-only model legitimately
+  will not, and measuring how far it drifts is the point.
+
+Measured (resnet18-v2-7, one 224x224 image, `--backend buffer`, default gates
+cos>=0.999 / atol 1e-3 / rtol 1e-2 / out<=0.1%):
+
+| artifact | maxabs | relL2 | cos | elements beyond band | top-1 | top-5 overlap |
+|---|---|---|---|---|---|---|
+| `-q fp16` (whole graph in the FP16 domain) | 8.811e-03 | 7.449e-04 | 1.000000 | 0.0000% | 1.000 | 1.0000 |
+| `-q int8` (weight-only) | 3.678e-01 | 3.923e-02 | 0.999329 | 33.80% | 0.000 | 0.8000 |
+| `-q int8 --exclude-scope /layer4/` | 3.766e-01 | 3.785e-02 | 0.999394 | 31.70% | 1.000 | 0.8000 |
+
+The first row passes; the second failing its gates is the loop's conclusion, not
+a broken loop -- a maxabs of 3.7e-01 is already large enough to flip top-1, and
+loosening the gate to make it "pass" would give up the measurement. The third row
+is how the loop is used: keeping layer4 at its source dtype moves relL2 only from
+3.923e-02 to 3.785e-02 (beyond-band 33.8% to 31.7%), so that layer is not where
+the loss mainly sits. The two conversions share the input and the shaders and
+differ in exactly the layer the flag named, which is what makes the delta
+attributable -- repeating it layer by layer is the reason
+`model/pypi/onnx2vkop/exclusion.py` exists.
+
+Exit codes: 0 every output passed, 1 at least one failed its gates, 2 the loop
+itself could not run (missing binary/model/ORT, crash). onnxruntime is
+deliberately not a converter dependency (it is not in the wheel's requires) and
+neither is a GPU here; both are checked up front and reported with the fix
+rather than as a traceback. `--onnx` defaults to the `.vkopbin`'s own stem with
+`.onnx`, `--bench` to `build/benchmark/vkop-bench` (then `$PATH`); an LLM's
+dozens of KV outputs are readable with `--limit N`, and `--keep` or `--work-dir`
+leaves the dump on disk.
+
+Its convert-time counterpart is `--numeric-audit` / `VKOP_NUMERIC_AUDIT`
+(report-only, see `model/pypi/onnx2vkop/numeric_audit.py`): for a weight-only
+format the kernel reads `decode(encode(W))`, so each weight's own round-trip
+rel-L2 needs no GPU. On resnet18's 21 real weights (in their GEMM view) the
+median is 2.07e-04 for fp16 and 1.27e-02 for int8, against 7.449e-04 and 3.923e-02
+here at the model output -- 3.6x and 3.1x, under the sqrt(21) ~= 4.6x the sum
+would reach if every layer passed its own weight error through in full. When the
+two disagree, start with the convert-time number: a GPU run's difference may
+contain a kernel, not only a
+format.
+
+#### 7. LLM inference (llm/exporter/driver/llm_chat.cpp)
 
 - KV cache is GPU-resident and, since `fuse_kv_cache_append`, **not copied at
   all**: each layer's past and present are one buffer (`Attention` carries
@@ -432,7 +574,7 @@ Tuning/diagnostic switches:
 | `VKOP_SUBMIT_PROF=1` | per-op GPU timestamp queries (authoritative) |
 | `VKOP_OPPROF=1` | record-side wall time |
 
-#### 7. Text-to-image (image/exporter/image_gen)
+#### 8. Text-to-image (image/exporter/image_gen)
 
 One prompt in, one PNG out, and the driver reads **no python/ORT intermediate
 artifacts at runtime**: tokenization, the raw ChatML template, `drop_idx`

@@ -45,3 +45,8 @@ onnx2vkop -i model.onnx -q int4 --exclude-scope model.layers.0
 onnx2vkop -i model.onnx -q int8 --exclude-node '*/attn/v_proj/MatMul' \
     --exclude-downstream-of /embed
 ```
+
+Convert twice -- once with the flag, once without -- and run
+`tools/vkop_vs_ort.py` on both artifacts to read which number moved; the two
+runs share the input tensor and the shaders, so the delta belongs to the layer
+the flag named. See the accuracy-loop section of the repository README.
