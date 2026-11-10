@@ -2032,6 +2032,48 @@ bool VulkanDevice::createLogicalDevice(
             req.sType = VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2;
             vkGetImageMemoryRequirements2(logicalDevice_, &req_info, &req);
             host_copy_usable = req.memoryRequirements.memoryTypeBits != 0;
+
+            // A non-empty memory-type mask is necessary but not sufficient:
+            // the entry point itself can still refuse the call. NVIDIA 595 on
+            // Ada answers VK_ERROR_EXTENSION_NOT_PRESENT to
+            // vkTransitionImageLayout when the device was created through this
+            // engine, even though the extension and feature are both enabled
+            // and a standalone program on the same host succeeds. VulkanImage
+            // had no handling for a failing transition (it only asserted), so
+            // a device that advertises the feature but rejects the call
+            // aborted the process. Probe the real call once here and downgrade
+            // rather than trusting the advertised bit.
+            if (host_copy_usable) {
+#ifdef VK_EXT_host_image_copy
+                auto instance =
+                    VulkanInstance::getVulkanInstance().getInstance();
+                auto transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+                    vkGetInstanceProcAddr(instance, "vkTransitionImageLayout"));
+                if (!transition) {
+                    transition = reinterpret_cast<PFN_vkTransitionImageLayoutEXT>(
+                        vkGetInstanceProcAddr(instance,
+                                              "vkTransitionImageLayoutEXT"));
+                }
+                if (!transition) {
+                    host_copy_usable = false;
+                } else {
+                    VkHostImageLayoutTransitionInfoEXT probe_transition = {};
+                    probe_transition.sType =
+                        VK_STRUCTURE_TYPE_HOST_IMAGE_LAYOUT_TRANSITION_INFO_EXT;
+                    probe_transition.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+                    probe_transition.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    probe_transition.image = probe_image;
+                    probe_transition.subresourceRange.aspectMask =
+                        VK_IMAGE_ASPECT_COLOR_BIT;
+                    probe_transition.subresourceRange.levelCount = 1;
+                    probe_transition.subresourceRange.layerCount = 2;
+                    if (transition(logicalDevice_, 1, &probe_transition) !=
+                        VK_SUCCESS) {
+                        host_copy_usable = false;
+                    }
+                }
+#endif
+            }
             vkDestroyImage(logicalDevice_, probe_image, nullptr);
         }
         if (!host_copy_usable) {

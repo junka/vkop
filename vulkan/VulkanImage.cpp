@@ -608,7 +608,20 @@ void VulkanImage::hostImaggeTransition(VkImageLayout newLayout) {
     if (vkTransitionImageLayoutEXT) {
         ret = vkTransitionImageLayoutEXT(m_vdev_->getLogicalDevice(), 1,
                                          &transinfo);
-        assert(ret == VK_SUCCESS);
+        // An assert here is only valid in a build where the device was proved
+        // to accept the call (VulkanDevice's host-image-copy probe does that
+        // once at device creation and downgrades the feature otherwise). Do
+        // not abort on a driver that advertised the extension but refuses the
+        // call -- report it, leave the layout untouched, and let the caller
+        // fall back to a staged copy.
+        if (ret != VK_SUCCESS) {
+            fprintf(stderr,
+                    "[vulkan] vkTransitionImageLayout failed (VkResult %d); "
+                    "leaving the image at its previous layout. Set "
+                    "VKOP_NO_HOST_IMAGE_COPY=1 to use staged copies.\n",
+                    static_cast<int>(ret));
+            return;
+        }
         m_layout_ = newLayout;
     }
     if (m_access_ == VK_ACCESS_SHADER_READ_BIT) {
