@@ -55,6 +55,11 @@ llm/*.weights.bin
 /tools/perf/zero_copy_bw_probe/read_sum.spv
 /tools/perf/zero_copy_bw_probe/read_sum.spv.h
 
+# Command-buffer submit-cost probe: same convention, sources (cmd_probe.cpp,
+# nop.comp) tracked, compiled binary and SPIR-V not.
+/tools/perf/replay_submit_probe/cmd_probe
+/tools/perf/replay_submit_probe/nop.spv
+
 # macOS / tooling junk.
 .DS_Store
 .coverage
