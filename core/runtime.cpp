@@ -3137,6 +3137,52 @@ double Runtime::Run() {
         }
     };
 
+    // ------------------------------------------------------------------
+    // Segment submit batching (VKOP_SEG_BATCH=N, default on for N=32).
+    //
+    // Every segment used to cost its own vkQueueSubmit — 384 of them per
+    // decode round, 3.2 ms of driver call overhead for ~13 ms of GPU work.
+    // The segments are already ordered by a timeline-semaphore chain (each
+    // waits on the previous one's signal), and Vulkan guarantees that N
+    // VkSubmitInfos passed to ONE vkQueueSubmit execute in array order with
+    // their cross-item timeline waits honoured. So batching them does not
+    // change the ordering contract at all: it is the same chain, submitted
+    // fewer times.
+    //
+    // This is deliberately NOT the same thing as packing several levels into
+    // one command buffer (which corrupts decode — see the segment-split note
+    // above). Each segment keeps its own VkCommandBuffer and its own waits;
+    // only the submit CALL is shared.
+    //
+    // A batch must be flushed before its command buffers can be touched
+    // again, so the flush points are the readback hook (a copyToCPU issues its
+    // own submit and must see its producers submitted first), and the end of
+    // the round. VKOP_SEG_BATCH=1 restores one submit per segment (the
+    // historical path) for bisecting.
+    int seg_batch = 32;
+    if (const char *sb = std::getenv("VKOP_SEG_BATCH")) {
+        seg_batch = std::atoi(sb);
+        if (seg_batch < 1) seg_batch = 1;
+    }
+    std::vector<VkSubmitInfo> seg_batch_sis;
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> seg_batch_cmds;
+    seg_batch_sis.reserve(static_cast<size_t>(seg_batch));
+    seg_batch_cmds.reserve(static_cast<size_t>(seg_batch));
+    // Flush the accumulated batch: one vkQueueSubmit for all of it.
+    auto flush_seg_batch = [&]() {
+        if (seg_batch_sis.empty()) return;
+        VulkanCommandBuffer::submit(queue0, seg_batch_sis);
+        // Mirror what the per-segment submit() did after its call: the wait
+        // lists are per-submission, so they must not leak into the next round.
+        // Safe here because the batch is flushed before any of these buffers
+        // is recorded into again.
+        for (auto &c : seg_batch_cmds) {
+            c->clearWaits();
+        }
+        seg_batch_sis.clear();
+        seg_batch_cmds.clear();
+    };
+
     // Close + submit the open segment, chaining it onto the previous segment's
     // timeline signal so the two are ordered on the queue.
     // 自动判断 skip_record: 如果当前 segment 在 segment_replay_hit_this_round_
@@ -3164,15 +3210,26 @@ double Runtime::Run() {
             graph_seg->addWait(graph_prev_sem, graph_prev_val);
         auto gs_t0 = run_profile ? std::chrono::steady_clock::now()
                                  : std::chrono::steady_clock::time_point{};
-        graph_prev_val = graph_seg->submit(queue0);
+        // buildSubmitInfo() reserves this segment's signal value and returns a
+        // struct pointing into the command buffer's own vectors, so it has to
+        // be flushed before that buffer is touched again — which the batch
+        // bookkeeping below guarantees (a batch holds at most seg_batch
+        // buffers, all of which stay untouched until the flush).
+        seg_batch_sis.push_back(graph_seg->buildSubmitInfo());
+        seg_batch_cmds.push_back(graph_seg);
+        graph_prev_val = graph_seg->getSignalValue();
         graph_prev_sem = graph_seg->getSignalSemaphore();
         graph_seg = nullptr;
         seg_op_indices_curr.push_back({});  // 开下一段的空集合
+        if (static_cast<int>(seg_batch_sis.size()) >= seg_batch) {
+            flush_seg_batch();
+        }
         if (seg_trace)
             std::fprintf(stderr, "[seg-sub] ord=%zu val=%llu\n", ord,
                          (unsigned long long)graph_prev_val);
         if (run_profile) {
-            auto gs_t1 = std::chrono::steady_clock::now();
+            auto gs_t1 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
             prof_submit_ms +=
                 std::chrono::duration<double, std::milli>(gs_t1 - gs_t0)
                     .count();
@@ -3193,6 +3250,10 @@ double Runtime::Run() {
             // its own pre-readback commands), then reopen a segment and repoint
             // the op at it so the remainder of its recording has a live target.
             graph_submit();
+            // The readback issues its own submit+wait and must observe its
+            // producers already on the queue, so the batch cannot stay pending
+            // across this point.
+            flush_seg_batch();
             graph_open(graph_seg_start);
             if (graph_op_idx >= 0)
                 node_ops_[graph_op_idx]->repoint_graph_cmd(graph_seg);
@@ -3978,6 +4039,9 @@ double Runtime::Run() {
         // Submit the tail segment and tear the hook down. The segment buffers
         // are waited and reset further down, alongside the per-op path's tail.
         graph_submit();
+        // Whatever is still batched has to reach the queue before the tail wait
+        // below (the round is not over until every segment has been submitted).
+        flush_seg_batch();
         VulkanCommandBuffer::pre_readback_hook = nullptr;
         if (!graph_cmds_.empty())
             last_commands[0] = graph_cmds_.back();
