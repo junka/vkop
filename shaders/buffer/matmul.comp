@@ -513,70 +513,14 @@ float load_b(int idx) {
 // so the four byte-shaped paths (quad, split-K, even-N and the fp32 build's
 // per-element one) stay single implementations.
 
-// One int8 weight byte as a float. The sign bit is XOR-ed out first so every
-// lane is a plain unsigned byte-to-float convert plus a constant subtract: a
-// uint-to-int conversion of a value above INT_MAX is implementation-defined, and
-// an arithmetic right shift of a signed int is not something to bet a kernel on
-// across drivers either.
-float w8_val(uint b) { return float(b ^ 0x80u) - 128.0; }
+// The int8/fp8 byte-to-float step lives in shaders/common/fp8_decode.comp,
+// shared with buffer/conv2d.comp: both kernels carry one byte per weight and
+// one fp32 scale per output column, so the decode is identical and only the
+// surrounding index math differs. Keep it shared -- a second copy is how the
+// two drift into decoding slightly different grids.
+#include "../common/fp8_decode.comp"
 
-// One fp8 byte as a float. There is no hardware path on this stack -- MoltenVK's
-// device extensions stop at VK_KHR_shader_float16_int8, so VK_EXT_shader_float8
-// is absent -- which leaves reassembling the fields by hand. With the sign
-// stripped, a normal fp8 byte's [exp|mant] is already the top of an fp32's
-// [exp|mantissa] once the two biases agree:
-//   E4M3 (bias 7, mantissa lsb 2^-3): bits = (m + (120 << 3)) << 20
-//   E5M2 (bias 15, mantissa lsb 2^-2): bits = (m + (112 << 2)) << 21
-// Both are exact for every normal byte (checked against all 128 magnitudes).
-// Only exponent == 0 needs its own term, because a subnormal there is an integer
-// multiple of the smallest step, 2^-9 for E4M3 and 2^-16 for E5M2. The encodings
-// past the largest finite value (E4M3 0x7f, E5M2 0x7c..0x7f) are NaN/Inf and are
-// deliberately not decoded: a quantized weight cannot reach them, since the
-// converter divides by the column absmax over that largest finite value and
-// clips to it.
-//
-// e4m3 is also what NVFP4's block scale is stored as (see scale4), so it stands
-// on its own rather than living inside the fp8-weight branch.
-float e4m3_val(uint b) {
-    uint m = b & 0x7Fu;
-    float v =
-        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
-    return (b & 0x80u) != 0u ? -v : v;
-}
-
-float e5m2_val(uint b) {
-    uint m = b & 0x7Fu;
-    float v =
-        m > 3u ? uintBitsToFloat((m + 448u) << 21u) : float(m) * 1.52587890625e-05;
-    return (b & 0x80u) != 0u ? -v : v;
-}
-
-// The byte-to-float step. Two builds of this file differ only here.
-//
-// Software (default): reassemble the fields by hand. There is no hardware path
-// on the stacks this kernel ships to by default -- MoltenVK's device extensions
-// stop at VK_KHR_shader_float16_int8, and the 1.3.275 loader on the Intel box
-// never exposes VK_EXT_shader_float8 -- so this form is the portable one.
-//
-// Hardware (-DFP8_HW): a bit cast into the fp8 type, which the driver lowers to
-// the format's conversion instruction. Measured on Ada at 896x4864 (one byte
-// per weight, min-of-3): software decode 38 GB/s, int8 87 GB/s, this 111 GB/s
-// (E4M3) / 128 GB/s (E5M2). It cannot be a runtime branch:
-// OpCapability Float8EXT is module-wide, and a device without the extension
-// rejects the entire module.
-#ifdef FP8_HW
-float f8_val(uint b) {
-    // uPC.e5m2 is uniform across a dispatch, so this is one branch, not one per
-    // element; both formats are compiled in because GLSL selects the grid by
-    // type, not by a runtime value.
-    if (uPC.e5m2 != 0) {
-        return float(uintBitsToFloate5m2EXT(int8_t(b)));
-    }
-    return float(uintBitsToFloate4m3EXT(int8_t(b)));
-}
-#else
-float f8_val(uint b) { return uPC.e5m2 != 0 ? e5m2_val(b) : e4m3_val(b); }
-#endif
+float f8_val(uint b) { return f8_byte(b, uPC.e5m2 != 0); }
 
 float w_val(uint b) { return uPC.fp8 != 0 ? f8_val(b) : w8_val(b); }
 
@@ -588,29 +532,16 @@ float load_w8(int idx) {
 // The four weights of one word, low byte first.
 vec4 unpack_w8(uint word) {
 #ifdef FP8_HW
-    // Convert the whole word at once. A fe4m3vec4 built from the four bytes
-    // followed by one vec4() conversion compiles to a single
-    // OpFConvert %v4float over the 32-bit load; converting each byte into a
-    // separate float leaves four scalar conversions in the inner loop, which
-    // measured no faster than the software form.
+    // One vector conversion over the 32-bit load (see f8_vec4).
     if (uPC.fp8 != 0) {
-        if (uPC.e5m2 != 0) {
-            return vec4(fe5m2vec4(
-                uintBitsToFloate5m2EXT(int8_t(word)),
-                uintBitsToFloate5m2EXT(int8_t(word >> 8)),
-                uintBitsToFloate5m2EXT(int8_t(word >> 16)),
-                uintBitsToFloate5m2EXT(int8_t(word >> 24))));
-        }
-        return vec4(fe4m3vec4(uintBitsToFloate4m3EXT(int8_t(word)),
-                              uintBitsToFloate4m3EXT(int8_t(word >> 8)),
-                              uintBitsToFloate4m3EXT(int8_t(word >> 16)),
-                              uintBitsToFloate4m3EXT(int8_t(word >> 24))));
+        return f8_vec4(word, uPC.e5m2 != 0);
     }
-#endif
+#else
     if (uPC.fp8 != 0) {
         return vec4(f8_val(word & 0xFFu), f8_val((word >> 8) & 0xFFu),
                     f8_val((word >> 16) & 0xFFu), f8_val(word >> 24));
     }
+#endif
     return vec4(w8_val(word & 0xFFu), w8_val((word >> 8) & 0xFFu),
                 w8_val((word >> 16) & 0xFFu), w8_val(word >> 24));
 }

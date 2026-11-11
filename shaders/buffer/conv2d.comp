@@ -24,6 +24,22 @@
 #extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
 #endif
 
+// Hardware fp8 weight decode (VK_EXT_shader_float8), the -DFP8_HW build only.
+// OpCapability Float8EXT is a MODULE-wide capability, so this can never be a
+// runtime branch in the portable module: a device without the extension
+// rejects the whole module at pipeline creation. The host therefore builds a
+// separate _fp8_hw module (Conv2dBuffer::fp8_hw_pipeline) and keeps the
+// software decode as the fallback.
+//
+// The directives have to sit here, before any declaration: #extension is only
+// legal at the top of the shader, and shaders/common/fp8_decode.comp (which
+// defines the decode functions) is included further down.
+#ifdef FP8_HW
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_float_e5m2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+
 #include "../common/buffer_common.comp"
 
 // Conv accumulates in fp32 (sum) and fuses activation in the fp32 domain too,
@@ -96,7 +112,14 @@ layout(push_constant) uniform PC {
     int has_bias;
     int fp32; // 1 = fp32 single-pass (write uOutput); 0 = fp16 reduce (write uScratch)
     int activation; // ACTIVATION_* from activation.comp (0 = NONE)
-    int weight_int8; // 1 = weights are packed int8 bytes (dequant via uScale); 0 = fp32/fp16
+    int weight_int8; // 1 = weights are byte-per-value (int8, or fp8 when fp8=1),
+                     // dequantized via uScale; 0 = fp32/fp16
+    int fp8;         // 1 = the byte payload is fp8 rather than two's complement
+                     // int8. Rides on weight_int8 being set, exactly like
+                     // GpuMatMulParam::fp8 -- same kernels, same scale table,
+                     // only the byte-to-float step differs.
+    int fp8_e5m2;    // 1 = the fp8 grid is E5M2 (5 exp, 2 mantissa) instead of
+                     // E4M3. Only meaningful with fp8.
     int ow_blk; // output columns per thread: 1 = conv_fp element path,
                  // RW = conv_row3 register-blocked path (host gates the shape)
 } uPC;
@@ -170,6 +193,28 @@ int w8_at(int widx) {
     return b >= 128 ? b - 256 : b;
 }
 
+// The byte-to-float decode for whichever quantized format the weight uses,
+// shared with buffer/matmul.comp. Included here rather than copied: both
+// kernels carry one byte per weight and one fp32 scale per output channel, so
+// a second copy is how the two drift into decoding slightly different grids.
+#include "../common/fp8_decode.comp"
+
+// One quantized weight byte at a byte index, as a float BEFORE the per-channel
+// scale. int8 weights come back as the sign-extended value (scale applied by
+// the caller, matching matmul's convention); fp8 weights are decoded by f8_byte.
+//
+// uPC.weight_int8 is 1 for both int8 and fp8 payloads -- they share every gate
+// and every kernel -- and uPC.fp8_e5m2 picks the fp8 grid. That mirrors
+// GpuMatMulParam's fp8/fp8_e5m2 pair, so the two weight-only paths are driven
+// by the same two flags.
+float w_byte_at(int widx) {
+    uint b = (uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFFu;
+    if (uPC.fp8 != 0) {
+        return f8_byte(b, uPC.fp8_e5m2 != 0);
+    }
+    return float(w8_at(widx));
+}
+
 // Columns per thread in the register-blocked 3x3 path.
 #define RW 8
 
@@ -230,14 +275,16 @@ void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
                 float x8 = (bw + 8 >= 0 && bw + 8 < IW) ? BUF_LOAD(uInputX.data, xrow + 8) : 0.0;
                 float x9 = (bw + 9 >= 0 && bw + 9 < IW) ? BUF_LOAD(uInputX.data, xrow + 9) : 0.0;
                 // Three taps of one kernel row. Float weights come through
-                // BUF_LOAD (which is dtype-aware); int8 weights are three
-                // consecutive BYTES, so they decode with w8_at and the scale
-                // stays out of the loop.
+                // BUF_LOAD (which is dtype-aware); byte weights (int8 or fp8)
+                // are three consecutive BYTES, so they decode with w_byte_at
+                // and the scale stays out of the loop.
                 float w0, w1, w2;
                 if (w8) {
-                    w0 = float(w8_at(wrow));
-                    w1 = float(w8_at(wrow + 1));
-                    w2 = float(w8_at(wrow + 2));
+                    // w_byte_at handles int8 and both fp8 grids; the scale
+                    // stays out of the loop and is applied once below.
+                    w0 = w_byte_at(wrow);
+                    w1 = w_byte_at(wrow + 1);
+                    w2 = w_byte_at(wrow + 2);
                 } else {
                     w0 = BUF_LOAD(uInputW.data, wrow);
                     w1 = BUF_LOAD(uInputW.data, wrow + 1);
@@ -344,9 +391,8 @@ void main() {
                         int widx = w_base +
                                    ((kic * uPC.KD + kd) * uPC.KH + ky) * uPC.KW +
                                    kx;
-                        int b = w8_at(widx);
-                        sum += BUF_LOAD(uInputX.data, xidx) *
-                               (float(b) * w_scale);
+                        float wb = w_byte_at(widx);
+                        sum += BUF_LOAD(uInputX.data, xidx) * (wb * w_scale);
                     }
                 }
             }

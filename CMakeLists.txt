@@ -419,6 +419,31 @@ if(VKOP_GLSLC_HAS_FLOAT8)
         COMMENT "Compiling buffer/matmul (fp8 hardware decode, WIDE, fp16) to SPIR-V"
     )
     list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_F8_WIDE})
+
+    # The Conv2d fp8 hardware-decode module, in the two builds the op selects
+    # between (fp32 and fp16 output). Same -DFP8_HW treatment as matmul: a
+    # separate module because OpCapability Float8EXT is module-wide.
+    set(SPIRV_FILE_CONV_F8 ${SPIRV_DIR}/buffer_conv2d_fp8_hw.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_CONV_F8}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/conv2d.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_CONV_F8} -DFP8_HW
+        DEPENDS ${SHADER_DIR}/buffer/conv2d.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling buffer/conv2d (fp8 hardware decode) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_CONV_F8})
+
+    set(SPIRV_FILE_CONV_F8_FP16 ${SPIRV_DIR}/buffer_conv2d_fp8_hw_fp16.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_CONV_F8_FP16}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/conv2d.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_CONV_F8_FP16} -DFP16 -DFP8_HW
+        DEPENDS ${SHADER_DIR}/buffer/conv2d.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling buffer/conv2d (fp8 hardware decode, fp16) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_CONV_F8_FP16})
 endif()
 
 # Two 512-lane split-K builds of buffer/matmul.comp (VKOP_KSPLIT512=1 host
@@ -901,8 +926,11 @@ list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
 if(VKOP_GLSLC_HAS_FLOAT8)
     list(APPEND ARCHIVE_ARGS
          --spv buffer_matmul_fp8_hw_fp16:${SPIRV_FILE_F8}
-         --spv buffer_matmul_w8_wide_fp8_hw_fp16:${SPIRV_FILE_F8_WIDE})
-    list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_F8} ${SPIRV_FILE_F8_WIDE})
+         --spv buffer_matmul_w8_wide_fp8_hw_fp16:${SPIRV_FILE_F8_WIDE}
+         --spv buffer_conv2d_fp8_hw:${SPIRV_FILE_CONV_F8}
+         --spv buffer_conv2d_fp8_hw_fp16:${SPIRV_FILE_CONV_F8_FP16})
+    list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_F8} ${SPIRV_FILE_F8_WIDE}
+         ${SPIRV_FILE_CONV_F8} ${SPIRV_FILE_CONV_F8_FP16})
 endif()
 # And the two tile-split-K modules above: same .comp, two defines, so the
 # SHADER_FILES loop cannot name them either.

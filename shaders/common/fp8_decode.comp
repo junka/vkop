@@ -1,0 +1,100 @@
+// fp8 (E4M3 / E5M2) byte-to-float decode, shared by the weight-only kernels.
+//
+// Included by buffer/matmul.comp and buffer/conv2d.comp. Both carry one byte
+// per weight and one fp32 scale per output channel/column, so the decode step
+// is identical and only the surrounding index math differs.
+//
+// The caller picks the grid by passing `e5m2`. That flag is uniform across a
+// dispatch (it comes from the weight tensor's elem_kind, i.e. from the model),
+// so a branch on it costs one predicate, not one per element.
+//
+// Two builds, selected by -DFP8_HW:
+//
+//   software (default) -- reassemble the fields by hand. This is what runs on
+//     every stack without VK_EXT_shader_float8: MoltenVK's device extensions
+//     stop at VK_KHR_shader_float16_int8, and the 1.3.275 headers this tree
+//     builds against by default do not declare the extension at all.
+//   hardware -- a bit cast into the fp8 type, which the driver lowers to the
+//     format's conversion instruction. VK_EXT_shader_float8 is a MODULE-wide
+//     capability (OpCapability Float8EXT), so this can never be a runtime
+//     branch inside the portable module: a device without the extension
+//     rejects the whole module at pipeline creation. The host therefore builds
+//     a separate <key>_fp8_hw module and keeps the software one as fallback.
+//
+// Measured on Ada at 896x4864 (one byte per weight, min-of-3): software 38
+// GB/s, int8 87, hardware 111 (E4M3) / 128 (E5M2).
+
+// One int8 weight byte as a float. The sign bit is XOR-ed out first so every
+// lane is a plain unsigned byte-to-float convert plus a constant subtract: a
+// uint-to-int conversion of a value above INT_MAX is implementation-defined, and
+// an arithmetic right shift of a signed int is not something to bet a kernel on
+// across drivers either.
+float w8_val(uint b) { return float(b ^ 0x80u) - 128.0; }
+
+// One fp8 byte as a float, fields reassembled by hand. With the sign stripped,
+// a normal fp8 byte's [exp|mant] is already the top of an fp32's [exp|mantissa]
+// once the two biases agree:
+//   E4M3 (bias 7, mantissa lsb 2^-3): bits = (m + (120 << 3)) << 20
+//   E5M2 (bias 15, mantissa lsb 2^-2): bits = (m + (112 << 2)) << 21
+// Both are exact for every normal byte (checked against all 128 magnitudes).
+// Only exponent == 0 needs its own term, because a subnormal there is an integer
+// multiple of the smallest step, 2^-9 for E4M3 and 2^-16 for E5M2. The encodings
+// past the largest finite value (E4M3 0x7f, E5M2 0x7c..0x7f) are NaN/Inf and are
+// deliberately not decoded: a quantized weight cannot reach them, since the
+// converter divides by the column absmax over that largest finite value and
+// clips to it.
+//
+// e4m3 is also what NVFP4's block scale is stored as (see matmul.comp's scale4),
+// so it stands on its own rather than living inside the fp8-weight branch.
+float e4m3_val(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 7u ? uintBitsToFloat((m + 960u) << 20u) : float(m) * 0.001953125;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+float e5m2_val(uint b) {
+    uint m = b & 0x7Fu;
+    float v =
+        m > 3u ? uintBitsToFloat((m + 448u) << 21u) : float(m) * 1.52587890625e-05;
+    return (b & 0x80u) != 0u ? -v : v;
+}
+
+// One fp8 weight byte, either grid. This is the function the kernels call.
+//
+// The GL_EXT_float_e4m3 / GL_EXT_float_e5m2 / explicit-arithmetic-types-int8
+// extensions that the -DFP8_HW form needs must be required by the including
+// .comp file itself, at the top: a #extension directive is only legal before
+// any declaration, and this header is included after the kernel's other
+// functions. See the FP8_HW guard at the head of buffer/matmul.comp and
+// buffer/conv2d.comp.
+#ifdef FP8_HW
+float f8_byte(uint b, bool e5m2) {
+    if (e5m2) {
+        return float(uintBitsToFloate5m2EXT(int8_t(b)));
+    }
+    return float(uintBitsToFloate4m3EXT(int8_t(b)));
+}
+
+// Four weights of one 32-bit word at once, low byte first. Converting the whole
+// word through an fp8 vec4 makes the driver emit ONE OpFConvert %v4float over
+// the 32-bit load; converting each byte separately leaves four scalar
+// conversions in the inner loop, which measured no faster than the software
+// form.
+vec4 f8_vec4(uint word, bool e5m2) {
+    if (e5m2) {
+        return vec4(fe5m2vec4(uintBitsToFloate5m2EXT(int8_t(word)),
+                              uintBitsToFloate5m2EXT(int8_t(word >> 8)),
+                              uintBitsToFloate5m2EXT(int8_t(word >> 16)),
+                              uintBitsToFloate5m2EXT(int8_t(word >> 24))));
+    }
+    return vec4(fe4m3vec4(uintBitsToFloate4m3EXT(int8_t(word)),
+                          uintBitsToFloate4m3EXT(int8_t(word >> 8)),
+                          uintBitsToFloate4m3EXT(int8_t(word >> 16)),
+                          uintBitsToFloate4m3EXT(int8_t(word >> 24))));
+}
+#else
+float f8_byte(uint b, bool e5m2) {
+    return e5m2 ? e5m2_val(b) : e4m3_val(b);
+}
+#endif

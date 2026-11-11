@@ -466,6 +466,151 @@ class Conv2dInt8Test : public TestCase<float> {
     }
 };
 
+// fp8 weight-only Conv2d (buffer backend). Same convention as fp8 MatMul: one
+// byte per weight holding an E4M3/E5M2 code, plus one fp32 scale per output
+// channel computed as amax / max_finite (448 for E4M3, 57344 for E5M2) so the
+// channel's largest weight lands on the format's largest finite code.
+//
+// The reference uses the DEQUANTIZED bytes, not the original fp32 weights, so
+// the comparison isolates the shader's decode+conv math from quantization
+// noise. That is what catches a grid mistake: if the kernel decoded E4M3 bytes
+// as E5M2 (or read them as two's-complement int8), every value would be wrong
+// and the tolerance below would fail immediately.
+//
+// Runs on whatever route the shape selects, so the 3x3 stride-1 cases exercise
+// the register-blocked path's fp8 decode and the others the element path's.
+class Conv2dFp8Test : public TestCase<float> {
+  public:
+    std::unordered_map<std::string, std::string> attributes;
+    std::shared_ptr<Tensor<float>> input;
+    std::shared_ptr<Tensor<float>> bias_data_;
+    std::shared_ptr<Tensor<float>> scale_data_;
+    std::shared_ptr<Tensor<int8_t>> weight_data_;
+    std::shared_ptr<Tensor<float>> output;
+
+    Conv2dFp8Test(const std::vector<int> &input_shape, int kernel_size,
+                  int stride, int pad, int group, int dilation,
+                  int feature_size, bool e5m2)
+        : TestCase<float>("Conv2d"), input_shape_(input_shape),
+          kernel_size_(kernel_size), stride_(stride), pad_(pad), group_(group),
+          dilation_(dilation), feature_size_(feature_size), e5m2_(e5m2) {
+        attributes = {{"strides", std::to_string(stride_)},
+                      {"pads", std::to_string(pad_)},
+                      {"dilations", std::to_string(dilation_)},
+                      {"group", std::to_string(group_)},
+                      {"kernel_shape", std::to_string(kernel_size_)}};
+        initTestData();
+    }
+
+    bool
+    verify_output(const std::unique_ptr<vkop::ops::Operator> &op, int idx,
+                  const std::shared_ptr<vkop::core::ITensor> &output,
+                  const std::shared_ptr<vkop::core::ITensor> &expect) override {
+        auto out = vkop::core::as_tensor<float>(output);
+        auto exp = vkop::core::as_tensor<float>(expect);
+        for (int i = 0; i < out->num_elements(); i++) {
+            float ov = (*out)[i];
+            float ev = (*exp)[i];
+            if (std::isnan(ov)) {
+                LOG_ERROR("fp8 Conv NaN at %d, expected %f", i, ev);
+                return false;
+            }
+            // E4M3 keeps ~2 decimal digits, E5M2 fewer; both are far looser
+            // than the fp32 path, so this bound only catches a wrong grid or a
+            // wrong scale placement, which is what it is for.
+            float threshold = std::max(0.05F, std::abs(ev) * 0.05F);
+            if (std::abs(ov - ev) > threshold) {
+                LOG_ERROR("fp8 Conv Fail (%d): %f vs %f (thr %f)", i, ov, ev,
+                          threshold);
+                return false;
+            }
+        }
+        return true;
+    }
+
+  private:
+    std::vector<int> input_shape_;
+    int kernel_size_, stride_, pad_, group_, dilation_, feature_size_;
+    bool e5m2_;
+
+    void initTestData() {
+        torch::manual_seed(42);
+        auto opts = getTorchConf();
+        auto torch_input = torch::randn({input_shape_[0], input_shape_[1],
+                                         input_shape_[2], input_shape_[3]},
+                                        opts);
+        auto torch_weight =
+            torch::randn({feature_size_, input_shape_[1] / group_, kernel_size_,
+                          kernel_size_},
+                         opts);
+        auto torch_bias = torch::randn({feature_size_}, opts);
+
+        input = std::make_shared<Tensor<float>>(input_shape_);
+        fillTensorFromTorch(input, torch_input);
+        bias_data_ =
+            std::make_shared<Tensor<float>>(std::vector<int>{feature_size_});
+        fillTensorFromTorch(bias_data_, torch_bias);
+
+        // Per-output-channel fp8 quantization: scale = amax / max_finite.
+        const float max_finite = e5m2_ ? 57344.0F : 448.0F;
+        auto weight_abs = torch_weight.abs().reshape({feature_size_, -1});
+        auto amax = std::get<0>(weight_abs.max(1));
+        auto scale = amax / max_finite;
+        scale = torch::where(scale == 0, torch::ones_like(scale), scale);
+        auto scale_b = scale.reshape({-1, 1});
+        auto q =
+            torch::round(torch_weight.reshape({feature_size_, -1}) / scale_b)
+                .clamp(-max_finite, max_finite);
+        auto fp8 = (e5m2_ ? q.to(c10::ScalarType::Float8_e5m2)
+                          : q.to(c10::ScalarType::Float8_e4m3fn));
+
+        // Reference from the quantized bytes, so the check is on the decode.
+        auto dequant_weight =
+            fp8.to(torch::kFloat32) * scale_b.to(torch::kFloat32);
+        dequant_weight = dequant_weight.reshape(torch_weight.sizes());
+        auto torch_output =
+            torch::conv2d(torch_input, dequant_weight, torch_bias,
+                          torch::IntArrayRef({stride_, stride_}),
+                          torch::IntArrayRef({pad_, pad_}),
+                          torch::IntArrayRef({dilation_, dilation_}), group_);
+
+        std::vector<int> output_shape;
+        for (int i = 0; i < torch_output.dim(); i++) {
+            output_shape.push_back(torch_output.size(i));
+        }
+        output = std::make_shared<Tensor<float>>(output_shape);
+        fillTensorFromTorch(output, torch_output);
+
+        // The bytes ride an int8_t container (see DType.cpp): elem_kind below
+        // is what tells the op the payload is fp8, not two's complement.
+        weight_data_ = std::make_shared<Tensor<int8_t>>(
+            std::vector<int>{feature_size_, input_shape_[1] / group_,
+                             kernel_size_, kernel_size_});
+        auto cpu_fp8 = fp8.reshape(torch_weight.sizes())
+                           .cpu()
+                           .contiguous()
+                           .view(c10::ScalarType::Char)
+                           .flatten();
+        auto *ptr = cpu_fp8.data_ptr<int8_t>();
+        std::vector<int8_t> wvec(ptr, ptr + cpu_fp8.numel());
+        weight_data_->fillToCPU(wvec);
+        weight_data_->set_elem_kind(e5m2_
+                                        ? vkop::core::ElemKind::kFloat8E5M2
+                                        : vkop::core::ElemKind::kFloat8E4M3FN);
+
+        scale_data_ =
+            std::make_shared<Tensor<float>>(std::vector<int>{feature_size_});
+        auto cpu_scale = scale.cpu().contiguous().flatten();
+        auto sacc = cpu_scale.accessor<float, 1>();
+        std::vector<float> svec;
+        svec.reserve(cpu_scale.numel());
+        for (int64_t i = 0; i < cpu_scale.numel(); i++) {
+            svec.push_back(sacc[i]);
+        }
+        scale_data_->fillToCPU(svec);
+    }
+};
+
 TEST(Conv2dTest, Conv2dInt8WeightOnlyBuffer) {
     // Buffer-backend int8 weight-only Conv2d. Requires VKOP_BUFFER_BACKEND=1.
     const char *env = std::getenv("VKOP_BUFFER_BACKEND");
@@ -501,5 +646,45 @@ TEST(Conv2dTest, Conv2dInt8WeightOnlyBuffer) {
                 ASSERT_NE(conv_op, nullptr);
                 conv_op->setAttribute(t.attributes);
             }));
+    }
+}
+
+TEST(Conv2dTest, Conv2dFp8WeightOnlyBuffer) {
+    // Buffer-backend fp8 weight-only Conv2d, both grids. Requires
+    // VKOP_BUFFER_BACKEND=1.
+    //
+    // Shapes cover both kernels: the 3x3 stride-1 cases with OW >= 8 take the
+    // register-blocked path, the rest the element path, and each has its own
+    // fp8 decode site.
+    const char *env = std::getenv("VKOP_BUFFER_BACKEND");
+    if (!env || env[0] != '1') {
+        GTEST_SKIP() << "fp8 weight-only Conv2d is buffer-backend only; set "
+                        "VKOP_BUFFER_BACKEND=1";
+    }
+    std::vector<std::tuple<std::vector<int>, int, int, int, int, int, int>>
+        cases = {
+            {{1, 10, 7, 7}, 2, 1, 0, 5, 1, 5},    // element path
+            {{1, 32, 20, 20}, 3, 1, 1, 1, 1, 32}, // blocked, 2 chunks + tail
+            {{1, 8, 12, 32}, 3, 1, 1, 1, 1, 8},   // blocked, 4 even chunks
+            {{2, 4, 10, 10}, 3, 2, 1, 1, 1, 8},   // stride 2 -> element path
+        };
+    for (const auto &tc : cases) {
+        auto [input_shape, kernel_size, stride, pad, group, dilation,
+              feature_size] = tc;
+        for (const bool e5m2 : {false, true}) {
+            Conv2dFp8Test t(input_shape, kernel_size, stride, pad, group,
+                            dilation, feature_size, e5m2);
+            EXPECT_TRUE(t.run_test(
+                {t.input, t.weight_data_, t.bias_data_, t.scale_data_},
+                {t.output},
+                [&t](std::unique_ptr<vkop::ops::Operator> &op) {
+                    auto *conv_op = dynamic_cast<Conv2d *>(op.get());
+                    ASSERT_NE(conv_op, nullptr);
+                    conv_op->setAttribute(t.attributes);
+                }))
+                << "shape " << input_shape[0] << "x" << input_shape[1] << "x"
+                << input_shape[2] << "x" << input_shape[3] << " k"
+                << kernel_size << " " << (e5m2 ? "e5m2" : "e4m3");
+        }
     }
 }

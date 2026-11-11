@@ -65,8 +65,15 @@ struct alignas(16) Conv2dBufferPC {
     int fp32; // 1 = fp32 single-pass (write output); 0 = fp16 reduce (write
               // scratch)
     int activation;  // conv2d::ActivationMode (0 = NONE)
-    int weight_int8; // 1 = weights are packed int8 bytes (dequant via scale);
-                     // 0 = fp32/fp16 weights
+    int weight_int8; // 1 = weights are byte-per-value (int8, or fp8 when
+                     // fp8=1), dequantized via scale; 0 = fp32/fp16 weights
+    // 1 = the byte payload is fp8 rather than two's complement int8. Rides on
+    // weight_int8 being set: same kernels, same per-output-channel scale, only
+    // the byte-to-float step differs. Same role as GpuMatMulParam::fp8.
+    int fp8;
+    // 1 = the fp8 grid is E5M2 (5 exponent, 2 mantissa bits) instead of E4M3.
+    // Only meaningful with fp8.
+    int fp8_e5m2;
     // Output columns per shader thread: 1 = one output element per thread,
     // CONV_OW_BLOCK = the register-blocked 3x3 path in buffer/conv2d.comp. The
     // shader switches on this being > 1 and chunks by its own #define RW, so
@@ -486,15 +493,17 @@ class Conv2dBuffer : public BufferFactory {
         // convolution. A 2-D conv is the 3-D path with depth dims = 1, so the
         // host always fills the D fields and the shader's KD loop runs once.
         //
-        // conv2d.comp dequantizes an int8 weight and nothing else, so any other
-        // non-float kind reaching here would be read as exponents. The 4-bit
-        // weight-only payload exists for the buffer MatMul kernel only; a model
-        // that put one on a Conv has to say so rather than compute plausibly
-        // wrong numbers.
-        const bool weight_int8 =
-            inputs[1]->elem_kind() == core::ElemKind::kInt8;
+        // conv2d.comp dequantizes a byte-per-value weight (int8 or fp8) and
+        // nothing else, so any other non-float kind reaching here would be read
+        // as exponents. The 4-bit weight-only payload exists for the buffer
+        // MatMul kernel only; a model that put one on a Conv has to say so
+        // rather than compute plausibly wrong numbers.
+        const core::ElemKind wkind = inputs[1]->elem_kind();
+        const bool weight_fp8 = wkind == core::ElemKind::kFloat8E4M3FN ||
+                                wkind == core::ElemKind::kFloat8E5M2;
+        const bool weight_int8 = wkind == core::ElemKind::kInt8 || weight_fp8;
         if (!weight_int8) {
-            core::require_float_elem(inputs[1]->elem_kind(), "Conv", "input 1");
+            core::require_float_elem(wkind, "Conv", "input 1");
         }
         int rank = static_cast<int>(input_shape.size());
         bool is_3d = (rank >= 5);
@@ -584,8 +593,7 @@ class Conv2dBuffer : public BufferFactory {
         //
         // VKOP_CONV_ELEM_ONLY=1 pins the element path so the two can be A/B'd
         // on one shape (benchmark/bench_conv_int8.cpp drives it).
-        const bool row_blocked = kernel_w == 3 && stride_w == 1 &&
-                                 dil_w == 1 &&
+        const bool row_blocked = kernel_w == 3 && stride_w == 1 && dil_w == 1 &&
                                  out_width >= conv2d::CONV_OW_BLOCK &&
                                  !std::getenv("VKOP_CONV_ELEM_ONLY");
         const int ow_blk = row_blocked ? conv2d::CONV_OW_BLOCK : 1;
@@ -683,6 +691,11 @@ class Conv2dBuffer : public BufferFactory {
         pc.fp32 = (fp16_ != 0) ? 0 : 1;
         pc.activation = static_cast<int>(activation_);
         pc.weight_int8 = weight_int8 ? 1 : 0;
+        // fp8 rides on weight_int8 (same kernels, same per-channel scale); only
+        // the byte-to-float step differs, and fp8_e5m2 picks the grid. Same
+        // pair as GpuMatMulParam's fp8 / fp8_e5m2.
+        pc.fp8 = weight_fp8 ? 1 : 0;
+        pc.fp8_e5m2 = wkind == core::ElemKind::kFloat8E5M2 ? 1 : 0;
         pc.ow_blk = ow_blk;
 
         // gid space: output elements for the element path, (row, chunk) pairs
@@ -690,6 +703,9 @@ class Conv2dBuffer : public BufferFactory {
         const int items = ow_blk > 1 ? batch * out_depth * out_d * out_height *
                                            ((out_width + ow_blk - 1) / ow_blk)
                                      : total;
+        if (weight_fp8) {
+            ensure_fp8_hw_pipeline();
+        }
         submit(&pc, UP_DIV(items, 256), 1, 1);
 
         if (fp16_ != 0) {
@@ -755,11 +771,114 @@ class Conv2dBuffer : public BufferFactory {
         }
     }
 
+    // Resolve the fp8 hardware-decode module once per op. Three gates, and any
+    // one missing leaves fp8_hw_pipeline_ null so the software decode in the
+    // portable module stays in charge:
+    //   1. the device enabled shader_float8 (a build against headers carrying
+    //      VkPhysicalDeviceShaderFloat8FeaturesEXT),
+    //   2. the archive carries the key (CMake emits it only when this glslc
+    //      understood GL_EXT_float_e4m3),
+    //   3. the driver accepts the pipeline.
+    // A driver refusal is latched; a missing key is per-model (the op's own
+    // archive), so it is not.
+    void ensure_fp8_hw_pipeline() {
+        if (fp8_hw_pipeline_ || fp8_hw_tried_) {
+            return;
+        }
+        if (!m_dev_ || !m_dev_->device_traits().shader_float8) {
+            if (std::getenv("VKOP_SHADER_DEBUG")) {
+                const bool have_dev = m_dev_ != nullptr;
+                const bool f8 =
+                    have_dev && m_dev_->device_traits().shader_float8;
+                std::fprintf(stderr,
+                             "[shaders] conv fp8 skipped: device=%d f8=%d\n",
+                             have_dev ? 1 : 0, f8 ? 1 : 0);
+            }
+            return;
+        }
+        fp8_hw_tried_ = true;
+        // Two builds: the fp16 one shares the reduce/pack two-pass structure of
+        // the portable module, so the op must pick the same dtype variant it
+        // would have resolved for the primary.
+        const char *key =
+            fp16_ != 0 ? "buffer_conv2d_fp8_hw_fp16" : "buffer_conv2d_fp8_hw";
+        std::pair<const uint32_t *, uint32_t> spv;
+        try {
+            spv = resolve_spv(key);
+        } catch (const std::exception &e) {
+            // Absent is the ordinary state on a build whose glslc predates
+            // GL_EXT_float_e4m3, so this is silent by design.
+            if (std::getenv("VKOP_SHADER_DEBUG")) {
+                std::fprintf(stderr, "[shaders] conv fp8 key %s missing: %s\n",
+                             key, e.what());
+            }
+            return;
+        }
+        try {
+            bool use_uab = update_after_bind_ &&
+                           m_dev_->is_support_descriptor_update_after_bind();
+            fp8_hw_pipeline_ = std::make_unique<VulkanPipeline>(
+                m_dev_->getLogicalDevice(), types_, pc_size_, spv.first,
+                static_cast<int>(spv.second), use_uab, required_subgroup_size_,
+                VK_NULL_HANDLE);
+            for (auto &ds : fp8_hw_ds_) {
+                ds = fp8_hw_pipeline_->allocDescriptorSets();
+            }
+            if (std::getenv("VKOP_SHADER_DEBUG")) {
+                std::fprintf(stderr, "[shaders] conv fp8 hw key=%s\n", key);
+            }
+        } catch (const std::exception &e) {
+            fp8_hw_pipeline_.reset();
+            std::fprintf(stderr,
+                         "[vkop] conv fp8 hardware-decode pipeline rejected "
+                         "(%s); fp8 weights keep the software decode\n",
+                         e.what());
+        }
+    }
+
+    // Same body as Operator::submit, but binds the fp8 module when one was
+    // built. Kept as an override rather than a branch inside the base class so
+    // ops that have no second module pay nothing.
+    //
+    // Deliberately skips bda_submit_table() on the fp8 branch. There is no
+    // -DBDA -DFP8_HW conv module, so the BDA table would bind the portable
+    // module's software decode -- correct, but it gives up the hardware
+    // conversion this branch exists for, and the measurement says the decode
+    // (111 vs 38 GB/s on matmul) outweighs the descriptor-write saving BDA
+    // buys. A model with an fp8 weight therefore runs the fp8 module on the
+    // descriptor path even under VKOP_BDA=1.
+    void submit(void *ptr, int width, int height, int layers) override {
+        if (!fp8_hw_pipeline_) {
+            Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (!fp8_hw_ds_[m_id_]) {
+            fp8_hw_ds_[m_id_] = fp8_hw_pipeline_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(fp8_hw_ds_[m_id_]);
+        fp8_hw_pipeline_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*fp8_hw_pipeline_, fp8_hw_ds_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(*fp8_hw_pipeline_,
+                                   static_cast<uint32_t>(pc_size_), ptr);
+        }
+        dispatch_and_record(width, height, layers, ptr);
+    }
+
     std::shared_ptr<VulkanBuffer> scratch_;
     std::unique_ptr<VulkanPipeline> pack_pipeline_;
     std::unique_ptr<VulkanPipeline> pack_bda_pipeline_;
     VkDescriptorSet pack_ds_[vkop::kInflight] = {nullptr};
     std::vector<VkWriteDescriptorSet> pack_writes_;
+    // The fp8 hardware-decode build (-DFP8_HW), resolved lazily on the first
+    // dispatch whose weight is fp8. A separate module because OpCapability
+    // Float8EXT is module-wide: the portable module cannot carry a runtime
+    // branch to it. nullptr (no key in the archive, or the driver refused it)
+    // leaves the software decode in charge, which is a slowdown, not a wrong
+    // answer.
+    std::unique_ptr<VulkanPipeline> fp8_hw_pipeline_;
+    VkDescriptorSet fp8_hw_ds_[vkop::kInflight] = {nullptr};
+    bool fp8_hw_tried_ = false;
 
     std::vector<int> kernel_shape_ = {0, 0};
     std::vector<int> strides_ = {1, 1};
