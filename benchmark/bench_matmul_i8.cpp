@@ -39,6 +39,7 @@
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanCommandPool.hpp"
 #include "vulkan/VulkanBuffer.hpp"
+#include "core/ShaderArchive.hpp"
 #include "core/Tensor.hpp"
 #include "ops/OperatorFactory.hpp"
 #include "include/dev_shaders.hpp"
@@ -64,7 +65,15 @@ void fill_fp16_ones(const std::shared_ptr<core::Tensor<uint16_t>> &t) {
 
 int main(int argc, char **argv) {
     Logger::getInstance().setLevel(LOG_ERROR);
-    vkop::dev::seed_shader_archive_from_build_tree();
+    // The CMake-baked path is absolute and local to the build machine, so it
+    // does not exist when this binary is copied to another host.
+    // bench_matmul_fp8 takes the same override, which is what keeps the two
+    // A/B-able on one machine.
+    if (const char *archive = std::getenv("VKOP_ADA_ARCHIVE")) {
+        vkop::core::ShaderArchive::set_process_default(archive);
+    } else {
+        vkop::dev::seed_shader_archive_from_build_tree();
+    }
     const auto &phydevs =
         VulkanInstance::getVulkanInstance().getPhysicalDevices();
     if (phydevs.empty()) {

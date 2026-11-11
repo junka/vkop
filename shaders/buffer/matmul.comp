@@ -560,8 +560,8 @@ float e5m2_val(uint b) {
 //
 // Hardware (-DFP8_HW): a bit cast into the fp8 type, which the driver lowers to
 // the format's conversion instruction. Measured on Ada at 896x4864 (one byte
-// per weight): software decode 7.7 GB/s, int8 91 GB/s, this 115 GB/s. The field
-// reassembly was the whole deficit. It cannot be a runtime branch:
+// per weight, min-of-3): software decode 38 GB/s, int8 87 GB/s, this 111 GB/s
+// (E4M3) / 128 GB/s (E5M2). It cannot be a runtime branch:
 // OpCapability Float8EXT is module-wide, and a device without the extension
 // rejects the entire module.
 #ifdef FP8_HW

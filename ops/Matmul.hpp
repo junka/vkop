@@ -2852,12 +2852,14 @@ class MatMulBuffer : public BufferFactory {
     // push constants, same descriptors -- the only difference is -DFP8_HW in
     // the module, which replaces the byte-to-float field reassembly with the
     // VK_EXT_shader_float8 conversion. Measured on Ada at 896x4864, the
-    // software decode runs 7.7 GB/s against int8's 91 GB/s and this one
-    // recovers it; see tools/float8_probe and docs/vulkan-1.4-side-by-side.md.
+    // software decode runs 38 GB/s against int8's 87 GB/s and this one
+    // reaches 111 (E4M3) / 128 (E5M2); see benchmark/README.md and
+    // docs/vulkan-1.4-side-by-side.md.
     //
     // Two gates, and both must hold:
-    //   - the device enabled shader_float8 (a 1.4 loader with the extension --
-    //     see VulkanDevice::createFeatureDescriptors), and
+    //   - the device enabled shader_float8 (a build against headers that carry
+    //     VkPhysicalDeviceShaderFloat8FeaturesEXT -- the extension itself also
+    //     enables under a 1.3 loader, see VulkanDevice::createFeatureDescriptors), and
     //   - the archive carries the key, which CMake emits only when the build's
     //     glslc understood GL_EXT_float_e4m3.
     // Either missing returns nullptr and fp8 weights keep the software decode

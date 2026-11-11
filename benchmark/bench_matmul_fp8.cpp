@@ -13,19 +13,23 @@
 // route picks the hardware module; without either it silently keeps the
 // software decode, which is what makes the A/B a one-variable comparison.
 //
-// Measured on Ada (896x4864, one byte per weight): int8 91 GB/s, fp8 software
-// 7.7 GB/s, fp8 hardware 115 GB/s. See docs/vulkan-1.4-side-by-side.md.
+// Measured on Ada (896x4864, one byte per weight, min-of-3): int8 87 GB/s,
+// fp8 software 38 GB/s, fp8 hardware 111 GB/s (E4M3) / 128 GB/s (E5M2). See
+// benchmark/README.md and docs/vulkan-1.4-side-by-side.md.
 //
 // Env: all the usual VKOP_* knobs apply. VKOP_KSPLIT512=1 selects the 512-lane
 // route, VKOP_BDA=1 the descriptor-buffer addressing; each has its own fp8
-// module, so both matter for this benchmark. VKOP_ADA_ARCHIVE overrides the
-// baked archive path (needed on a host where the build tree is unreadable).
-// BENCH_DEV=<n> picks the physical device (default 0).
+// module, so both matter for this benchmark. VKOP_FP8_E5M2=1 exercises the
+// E5M2 grid instead of E4M3 (the format, like a real model's, comes from the
+// weight tensor's elem_kind). VKOP_ADA_ARCHIVE overrides the baked archive path
+// (needed on a host where the build tree is unreadable). BENCH_DEV=<n> picks
+// the physical device (default 0).
 //
 // Run:
-//   bench_matmul_fp8                 # default sweep at M=1
+//   bench_matmul_fp8                 # default sweep at M=1, E4M3
 //   bench_matmul_fp8 M K N [reps]
 //   VKOP_BDA=1 bench_matmul_fp8 1 896 4864
+//   VKOP_FP8_E5M2=1 bench_matmul_fp8 1 896 4864
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -104,33 +108,50 @@ int main(int argc, char **argv) {
         shapes.push_back({std::atoi(argv[2]), std::atoi(argv[3]), "custom"});
     }
     const int reps = (argc > 4) ? std::atoi(argv[4]) : 30;
-    printf("M=%d  coop_i8=%s\n", M, std::getenv("VKOP_COOP_I8") ? "ON" : "off");
+    // VKOP_FP8_E5M2=1 benchmarks the E5M2 grid instead of E4M3. The op picks
+    // the format from the weight tensor's elem_kind alone, so this is the same
+    // switch a model carries in its .vkopbin -- nothing about the route or the
+    // kernel changes, and both grids run through the same module.
+    const bool e5m2 = std::getenv("VKOP_FP8_E5M2") != nullptr;
+    printf("M=%d  coop_i8=%s  fp8=%s\n", M,
+           std::getenv("VKOP_COOP_I8") ? "ON" : "off", e5m2 ? "E5M2" : "E4M3");
 
     for (const auto &s : shapes) {
         auto A =
             std::make_shared<core::Tensor<uint16_t>>(std::vector<int>{M, s.K});
         auto B =
             std::make_shared<core::Tensor<int8_t>>(std::vector<int>{s.K, s.N});
-        // The bytes are an E4M3 payload, not two's complement: elem_kind is
-        // what routes the op to the fp8 decode (see DType.cpp on why an fp8
-        // value rides an int8_t container).
-        B->set_elem_kind(core::ElemKind::kFloat8E4M3FN);
+        // The bytes are an fp8 payload, not two's complement: elem_kind is what
+        // routes the op to the fp8 decode and which of the two grids it reads
+        // (see DType.cpp on why an fp8 value rides an int8_t container).
+        B->set_elem_kind(e5m2 ? core::ElemKind::kFloat8E5M2
+                              : core::ElemKind::kFloat8E4M3FN);
         auto S = std::make_shared<core::Tensor<float>>(std::vector<int>{s.N});
         auto O =
             std::make_shared<core::Tensor<uint16_t>>(std::vector<int>{M, s.N});
 
         fill_fp16_ones(A);
-        // B[k][j] = E4M3 encoding of (k % 7) (independent of j): with A all
-        // ones the result is sum_k (k%7) in EVERY column. The E4M3 codes for
-        // the integers 0..6 are 0x00,0x38,0x40,0x44,0x48,0x4a,0x4c -- built
-        // here rather than computed so the bench does not depend on a host-side
-        // fp8 encoder.
+        // B[k][j] = the fp8 encoding of (k % 7) (independent of j): with A all
+        // ones the result is sum_k (k%7) in EVERY column. The codes for the
+        // integers 0..6 are built here rather than computed, so the bench does
+        // not depend on a host-side fp8 encoder.
+        //
+        //   E4M3 (bias 7, 3 mantissa bits): 1.0 = 0x38, then +0x04 per unit
+        //      (up to 2.0), so 1..6 = 38 40 44 48 4A 4C
+        //   E5M2 (bias 15, 2 mantissa bits): 1.0 = 0x3C, +0x04 to 2.0 then
+        //      +0x02 per unit, so 1..6 = 3C 40 42 44 45 46
+        //
+        // Both are exactly representable, which is what lets the reference sum
+        // be the integer (k % 7) with no rounding anywhere.
         static const uint8_t e4m3_code[7] = {0x00, 0x38, 0x40, 0x44,
-                                             0x48, 0x4a, 0x4c};
+                                             0x48, 0x4A, 0x4C};
+        static const uint8_t e5m2_code[7] = {0x00, 0x3C, 0x40, 0x42,
+                                             0x44, 0x45, 0x46};
+        const uint8_t *code = e5m2 ? e5m2_code : e4m3_code;
         B->reserveOnCPU();
         for (int k = 0; k < s.K; ++k) {
             for (int j = 0; j < s.N; ++j) {
-                B->data()[k * s.N + j] = static_cast<int8_t>(e4m3_code[k % 7]);
+                B->data()[k * s.N + j] = static_cast<int8_t>(code[k % 7]);
             }
         }
         const int64_t expect_k = [&] {

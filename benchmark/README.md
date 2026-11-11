@@ -93,6 +93,87 @@ VKOP_NO_COOP=1 ./build/bench_matmul          # 或 ./build/bench_matmul K N [rep
 | down K=6144 N=2048 | 0.940 ms | 26.8 GB/s |
 | lm_head K=2048 N=151936 | 19.50 ms | 31.9 GB/s |
 
+## bench_matmul_fp8 — fp8 weight-only 解码 A/B
+
+`bench_matmul_i8` 的 fp8 版本：形状、op、路由完全相同，只有权重张量的
+`elem_kind` 从 int8 换成 `float8e4m3fn`。两个二进制在同一台机器上跑，差异就
+只剩「字节→float」这一步。
+
+```bash
+# b3（Ada）。VKOP_ADA_ARCHIVE 是必需的：CMake 烧进去的归档路径是构建机的
+# 绝对路径，拷到 b3 上不存在（/home/gwm 对 wjj 不可读）。
+export VKOP_ADA_ARCHIVE=/tmp/vkop_shaders.bin
+bench_matmul_fp8 1 896 4864 40                     # E4M3
+VKOP_FP8_E5M2=1 bench_matmul_fp8 1 896 4864 40     # E5M2
+VKOP_BDA=1      bench_matmul_fp8 1 896 4864 40     # BDA 寻址
+VKOP_KSPLIT512=1 bench_matmul_fp8 1 896 4864 40    # 512-lane
+```
+
+**格式由模型决定，不由 bench 决定**。`VKOP_FP8_E5M2` 只是把 bench 构造的权重
+张量标成 `kFloat8E5M2`，走的是和真实模型完全不动的同一条链：
+
+```
+.vkopbin tensor 类型  float8e4m3fn / float8e5m2
+  → core/runtime.cpp      set_elem_kind(kind)
+  → ops/Matmul.hpp        weight_fp8 = E4M3 || E5M2; para_.fp8_e5m2 = (== E5M2)
+  → matmul.comp           uPC.e5m2 → fe4m3vec4 / fe5m2vec4
+```
+
+两条 fp8 网格共用一个 kernel、一条路由、一个 push-constant 分叉，没有硬编码。
+
+2026-11-11 实测（RTX 4000 Ada，M=1，K=896 N=4864，reps=40，min-of-3，
+correctness probe 全过）。「软件解码」那一行用同一个二进制、同一份 archive
+去掉 5 个 `_fp8_hw_` key 后跑，所以两行只差解码指令：
+
+| 变体 | 吞吐 |
+|---|---|
+| fp8 软件解码（无 fp8 key） | 38.0 GB/s |
+| fp8 E4M3 硬件 | 111.0 GB/s |
+| fp8 E5M2 硬件 | **127.9 GB/s** |
+| fp8 E4M3 硬件 + BDA | 107.8 GB/s |
+| fp8 E5M2 硬件 + BDA | 114.2 GB/s |
+| fp8 E4M3 硬件 + 512-lane | 138.5 GB/s |
+| fp8 E5M2 硬件 + 512-lane | **144.4 GB/s** |
+| int8 对照 | 87.4 GB/s |
+
+硬件解码约为软件解码的 3 倍（111 vs 38），512-lane 上到 144。int8 在同一
+shape 只有 87，所以 fp8 硬件路径已经比 int8 更快——一次向量 `OpFConvert`
+比 int8 的逐元素 XOR+convert 更省。
+
+**数值波动**：同一配置在不同会话间会漂 ±10%（512-lane 一档见过 131–147），
+是 GPU 时钟而非 kernel 差异。上表是一次 min-of-3 会话内的数据，跨表比较
+请以「同一行内」的相对关系为准。
+
+交错 A/B（同一进程各跑 5 轮，E4M3 / E5M2 交替）：
+
+| run | E4M3 | E5M2 |
+|---|---|---|
+| 1 | 117.0 | 123.7 |
+| 2 | 115.8 | 130.5 |
+| 3 | 116.9 | 122.6 |
+| 4 | 116.5 | 128.9 |
+| 5 | 110.4 | 128.2 |
+
+E5M2 稳定快 6–12%。两者的解码指令数相同（每权重 1 字节、一次 32 位加载 +
+一条 `OpFConvert %v4float`），所以差距不在解码本身，而在两条网格把同一份
+权重字节解释成不同的数值之后，后续 fp16 累加的取值范围和舍入不同。
+**没有进一步归因**——要断言是哪一段，得单独做 profile，这里不猜。
+
+**prefill（M≥16）没有收益，也不需要补**：那时路由切到 `tiled`，用通用
+`buffer_matmul_fp16` 模块（软件解码），但 tiled 已经是 shared-memory /
+计算受限，实测 fp8 与 int8 持平：
+
+| M | fp8 E4M3 | int8 |
+|---|---|---|
+| 16 | 38.6 | 41.6 |
+| 32 | 38.4 | 41.1 |
+| 64 | 39.9 | 40.6 |
+| 128 | 21.8 | 22.8 |
+
+所以 `buffer_matmul_fp8_hw_fp16`（通用 fp8 模块）目前在 archive 里是冗余的：
+只有 WIDE 系列真正被 host 用到。留着它是因为 tiled kernel 的 `unpack_w8` 在
+`-DFP8_HW` 下同样会走硬件解码，将来若 tiled 变成解码受限可以直接接上。
+
 ### ksplit 512-lane 变体（已证伪，勿重试）
 
 问的是：ksplit 的 shared-memory fold（`ks_flat` + barrier）若真有可榨的尾巴，

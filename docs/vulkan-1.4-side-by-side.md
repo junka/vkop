@@ -99,6 +99,17 @@ the loader supports it, and the existing `min(instance, device)` gating in
 descriptor. On `b3` that moves `subgroup_rotate` from "not queried" (1.3
 build) to `driver=yes device=yes`.
 
+**This table does not apply to float8.** `VK_EXT_shader_float8` is an
+extension, not one of the features promoted into the 1.4 core struct, so it is
+enabled whenever the driver advertises it — the instance apiVersion is
+irrelevant. Verified on `b3`: a 1.4-header build reports
+`shader_float8 driver=yes device=yes` under both the system 1.3.275 loader and
+the SDK's 1.4.363 one, and the fp8 hardware decode runs at the same speed in
+both. What gates float8 is the *header* version at build time (the
+`#ifdef VK_EXT_shader_float8` block compiles out against 1.3.275 headers) and
+the glslc version, not the loader.
+
+
 ## float8 probe
 
 ```bash
@@ -161,8 +172,8 @@ Two things were true before this work and are worth keeping straight:
   reassembling the exponent and mantissa. That is why fp8 works on 1.3.275 and
   on MoltenVK, neither of which has the extension.
 - The **decode** is the expensive half. Measured on Ada at 896x4864, one byte
-  per weight: int8 91 GB/s, fp8 with software decode **7.7 GB/s**. The field
-  reassembly, not the memory traffic, is the whole deficit.
+  per weight: int8 87 GB/s, fp8 with the software decode 38 GB/s. The field
+  reassembly is most of the deficit.
 
 ### The hardware decode (implemented)
 
@@ -188,28 +199,38 @@ weight can take:
 | `buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16` | 512-lane WIDE (opt-in) |
 | `buffer_matmul_ksplit512_w8_wide_bda_fp8_hw_fp16` | 512-lane WIDE + BDA |
 
-Measured on Ada, 896x4864, all with the correctness check passing:
+Measured on Ada, 896x4864, min-of-3, all with the correctness check passing.
+The software row is the same binary and archive with the five `_fp8_hw_` keys
+stripped, so the two differ only in the decode instructions:
 
 | route | GB/s |
 |---|---|
-| fp8 software decode | 7.7 |
-| fp8 hardware, WIDE | 115.5 |
-| fp8 hardware, WIDE + BDA | 108.8 |
-| fp8 hardware, 512-lane WIDE | 139.8 |
-| int8 (reference) | 91.4 |
+| fp8 software decode | 38.0 |
+| fp8 hardware, WIDE (E4M3) | 111.0 |
+| fp8 hardware, WIDE (E5M2) | 127.9 |
+| fp8 hardware, WIDE + BDA | 107.8 |
+| fp8 hardware, 512-lane WIDE | 138.5 |
+| int8 (reference) | 87.4 |
 
-The hardware decode is ~15x the software one and ahead of int8: one vector
-conversion beats int8's per-element XOR+convert.
+The hardware decode is ~3x the software one and ahead of int8: one vector
+conversion beats int8's per-element XOR+convert. E5M2 runs ~8-12% ahead of
+E4M3 on the same kernel; both grids compile into the same module and are
+selected by `uPC.e5m2`, which the host sets from the weight tensor's
+`elem_kind` — i.e. from the `.vkopbin`, exactly like the format a model was
+quantized with.
 
 ### The three gates, and what each one costs
 
 Both must hold, or the op keeps the software decode — a slowdown, never a wrong
 answer.
 
-1. **Device**: `shader_float8` enabled on the logical device. Requires the
-   1.4 loader on `LD_LIBRARY_PATH` (`VK_EXT_shader_float8` is enabled through a
-   `FeatureDescriptor` gated on `#ifdef VK_EXT_shader_float8`; the extension is
-   NOT core in 1.4, so there is no apiVersion branch).
+1. **Device**: `shader_float8` enabled on the logical device. What this needs is
+   a build against headers that carry `VkPhysicalDeviceShaderFloat8FeaturesEXT`
+   — measured on b3, the extension enables fine under the **system 1.3.275
+   loader** as well as the SDK's 1.4.363 one, because it is an extension and not
+   gated on the instance's apiVersion. The `FeatureDescriptor` is behind
+   `#ifdef VK_EXT_shader_float8`, which is the real gate: with 1.3.275 headers
+   the whole block compiles out and the software decode stays.
 2. **Build**: the archive carries the key. CMake probes this glslc for
    `GL_EXT_float_e4m3` at configure time (`VKOP_GLSLC_HAS_FLOAT8`) and skips the
    modules when the compiler is too old. `VKOP_ENABLE_FLOAT8=OFF` disables them
