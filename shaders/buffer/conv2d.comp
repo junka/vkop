@@ -156,6 +156,20 @@ float conv_fp(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
     return sum;
 }
 
+// One packed int8 weight byte, sign-extended. Byte-per-value payload: the
+// container is a uint word holding four consecutive taps, low byte first, so
+// the index math is widx>>2 / (widx&3)*8 and never goes through BUF_LOAD (which
+// in the fp16 build strides two values per word -- the wrong layout here).
+//
+// Kept as its own function so the element path and the register-blocked path
+// decode identically; a difference between them would show up as a tiny
+// numeric drift that only the int8 3x3 case would ever hit.
+int w8_at(int widx) {
+    int b = int((uInputW.data[widx >> 2] >> ((widx & 3) * 8)) & 0xFF);
+    // Sign-extend 8-bit to int (reinterpret as signed).
+    return b >= 128 ? b - 256 : b;
+}
+
 // Columns per thread in the register-blocked 3x3 path.
 #define RW 8
 
@@ -181,6 +195,15 @@ void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
     const int IW = uPC.IW;
     // Column of tap (r, kx) is ow0 + r + kx - pad_w, i.e. x slot index r + kx.
     const int bw = ow0 - uPC.pad_w;
+    // int8 weight: decode the three taps as signed bytes and apply the single
+    // per-output-channel scale ONCE to the finished row sum, instead of once
+    // per tap. The element path folds w_scale into every product; multiplying
+    // a linear sum by a constant is the same value with one rounding instead
+    // of 24, so this is both cheaper and slightly more accurate. Everything
+    // else (tap order, staged x slots, masked-out taps multiplying 0.0) is
+    // shared with the float path, so the two stay comparable.
+    const bool w8 = uPC.weight_int8 != 0;
+    const float w_scale = w8 ? BUF_LOAD(uScale.data, oc) : 1.0;
 
     float s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
     float s4 = 0.0, s5 = 0.0, s6 = 0.0, s7 = 0.0;
@@ -206,9 +229,20 @@ void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
                 float x7 = (bw + 7 >= 0 && bw + 7 < IW) ? BUF_LOAD(uInputX.data, xrow + 7) : 0.0;
                 float x8 = (bw + 8 >= 0 && bw + 8 < IW) ? BUF_LOAD(uInputX.data, xrow + 8) : 0.0;
                 float x9 = (bw + 9 >= 0 && bw + 9 < IW) ? BUF_LOAD(uInputX.data, xrow + 9) : 0.0;
-                const float w0 = BUF_LOAD(uInputW.data, wrow);
-                const float w1 = BUF_LOAD(uInputW.data, wrow + 1);
-                const float w2 = BUF_LOAD(uInputW.data, wrow + 2);
+                // Three taps of one kernel row. Float weights come through
+                // BUF_LOAD (which is dtype-aware); int8 weights are three
+                // consecutive BYTES, so they decode with w8_at and the scale
+                // stays out of the loop.
+                float w0, w1, w2;
+                if (w8) {
+                    w0 = float(w8_at(wrow));
+                    w1 = float(w8_at(wrow + 1));
+                    w2 = float(w8_at(wrow + 2));
+                } else {
+                    w0 = BUF_LOAD(uInputW.data, wrow);
+                    w1 = BUF_LOAD(uInputW.data, wrow + 1);
+                    w2 = BUF_LOAD(uInputW.data, wrow + 2);
+                }
                 s0 += x0 * w0; s0 += x1 * w1; s0 += x2 * w2;
                 s1 += x1 * w0; s1 += x2 * w1; s1 += x3 * w2;
                 s2 += x2 * w0; s2 += x3 * w1; s2 += x4 * w2;
@@ -227,7 +261,9 @@ void conv_row3(int x_base_n, int w_base, int ic_base, int icg, int od, int oh,
     for (int r = 0; r < cnt; ++r) {
         float v = (r == 0 ? s0 : (r == 1 ? s1 : (r == 2 ? s2 : (r == 3 ? s3
                     : (r == 4 ? s4 : (r == 5 ? s5 : (r == 6 ? s6 : s7)))))));
-        v += bias;
+        // The int8 scale applies to the accumulated sum, before the bias (bias
+        // is fp32 in the model, not scaled) -- same order as the element path.
+        v = v * w_scale + bias;
         v = activation(v, uPC.activation);
         // fp32 single pass writes the output; the fp16 reduce pass writes fp32
         // scratch for the separate pack dispatch.
@@ -308,10 +344,7 @@ void main() {
                         int widx = w_base +
                                    ((kic * uPC.KD + kd) * uPC.KH + ky) * uPC.KW +
                                    kx;
-                        int b = int((uInputW.data[widx >> 2] >>
-                                     ((widx & 3) * 8)) & 0xFF);
-                        // Sign-extend 8-bit to int (reinterpret as signed).
-                        if (b >= 128) b -= 256;
+                        int b = w8_at(widx);
                         sum += BUF_LOAD(uInputX.data, xidx) *
                                (float(b) * w_scale);
                     }

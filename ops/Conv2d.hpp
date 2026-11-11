@@ -575,9 +575,19 @@ class Conv2dBuffer : public BufferFactory {
         // exactly KW == 3 weights, so everything else stays on the element
         // path. OW >= CONV_OW_BLOCK keeps a chunk from being mostly masked-off
         // tail; the tail chunk itself is handled in the shader.
-        const bool row_blocked = !weight_int8 && kernel_w == 3 &&
-                                 stride_w == 1 && dil_w == 1 &&
-                                 out_width >= conv2d::CONV_OW_BLOCK;
+        //
+        // int8 weights take this path too: conv_row3 decodes the three taps as
+        // signed bytes and applies the per-output-channel scale to the finished
+        // row sum (see w8_at / the w8 branch there). That matters for real QDQ
+        // models, whose quantized convs are overwhelmingly 3x3 stride-1 -- the
+        // element path this used to fall back to is several times slower.
+        //
+        // VKOP_CONV_ELEM_ONLY=1 pins the element path so the two can be A/B'd
+        // on one shape (benchmark/bench_conv_int8.cpp drives it).
+        const bool row_blocked = kernel_w == 3 && stride_w == 1 &&
+                                 dil_w == 1 &&
+                                 out_width >= conv2d::CONV_OW_BLOCK &&
+                                 !std::getenv("VKOP_CONV_ELEM_ONLY");
         const int ow_blk = row_blocked ? conv2d::CONV_OW_BLOCK : 1;
 
         // int8 weight-only quantization: weight (inputs[1]) is int8 and a

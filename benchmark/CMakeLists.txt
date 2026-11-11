@@ -38,3 +38,11 @@ target_link_libraries(bench_matmul_fp8 PRIVATE vkop vload)
 target_compile_definitions(bench_matmul_fp8 PRIVATE
     VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
 
+# int8 3x3 stride-1 Conv2d: element path vs the register-blocked path, with a
+# CPU-reference correctness check per shape. VKOP_CONV_ELEM_ONLY=1 pins the
+# element path so both arms run on the same data.
+add_executable(bench_conv_int8 bench_conv_int8.cpp)
+target_link_libraries(bench_conv_int8 PRIVATE vkop vload)
+target_compile_definitions(bench_conv_int8 PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
+

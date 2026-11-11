@@ -479,6 +479,15 @@ TEST(Conv2dTest, Conv2dInt8WeightOnlyBuffer) {
             {{1, 6, 8, 8}, 3, 1, 1, 2, 1, 4},
             {{2, 4, 10, 10}, 3, 2, 1, 1, 1, 8},
             {{1, 16, 5, 5}, 1, 1, 0, 1, 1, 32},
+            // 3x3 stride-1 with OW well past CONV_OW_BLOCK: these take the
+            // register-blocked path in conv2d.comp (conv_row3), which now
+            // decodes int8 weights too. The cases above either miss it
+            // (OW < 8) or sit exactly on the threshold with one chunk per row;
+            // these exercise several full chunks per row, a tail chunk, and
+            // enough channels that the per-thread staging matters.
+            {{1, 32, 20, 20}, 3, 1, 1, 1, 1, 32}, // OW=20 -> 2 chunks + tail
+            {{2, 16, 24, 17}, 3, 1, 1, 1, 1, 16}, // OW=17 -> 2 chunks + tail
+            {{1, 8, 12, 32}, 3, 1, 1, 1, 1, 8},   // OW=32 -> 4 even chunks
         };
     for (const auto &tc : cases) {
         auto [input_shape, kernel_size, stride, pad, group, dilation,
