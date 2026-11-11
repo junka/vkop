@@ -152,6 +152,12 @@ def test_secondary_keys_exist_in_master_archive():
     a filtered per-model archive will silently drop it. A filtered archive
     miss at LoadModel time means the op resolves no shader and the whole model
     becomes unrunnable — this catches it at build/CI time instead.
+
+    The fp8 hardware-decode group is the one exception, and only as a group:
+    CMake builds those modules only when the configure-time glslc accepts
+    GL_EXT_float_e4m3, so a master built with the system 1.3.275 shaderc has
+    none of them. All present or all absent — a partial group is an
+    inconsistent archive (partial rebuild, hand-edited file) and fails here.
     """
     from filter_shaders import read_master  # tools/ on sys.path in the CLI
 
@@ -159,8 +165,18 @@ def test_secondary_keys_exist_in_master_archive():
     if not os.path.exists(master_path):
         pytest.skip("master archive not built yet (no build/vkop_shaders.bin)")
     master = read_master(master_path)
+    f8_present = [k for k in shader_map.FP8_HW_KEYS if k in master]
+    assert len(f8_present) in (0, len(shader_map.FP8_HW_KEYS)), (
+        "the fp8 hardware-decode group is partly present in "
+        f"{master_path}: found {f8_present}. CMake emits those keys "
+        "under one VKOP_GLSLC_HAS_FLOAT8 gate, so a partial group means a "
+        "stale or hand-edited archive — rebuild it."
+    )
+    f8_absent_ok = not f8_present
     for (op, backend), keys in shader_map._SECONDARY.items():
         for k in keys:
+            if f8_absent_ok and k in shader_map.FP8_HW_KEYS:
+                continue
             assert k in master, (
                 f"secondary key {k!r} declared for ({op}, {backend}) is not "
                 "in the master archive -- either the shader was never "

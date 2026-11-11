@@ -584,7 +584,8 @@ class DAGBasedModel:
                     f"axis). Drop --unify: the ordinary initializer path stores "
                     f"dims as a variable-length vector.")
 
-    def save_to_binary(self, file_path: str, shader_archive: bytes = None):
+    def save_to_binary(self, file_path: str, shader_archive: bytes = None,
+                       available_keys: Set[str] = None):
         """Save model to a FlatBuffers binary file.
 
         The initializer data is laid out as a single contiguous, 64-byte-aligned
@@ -604,6 +605,15 @@ class DAGBasedModel:
         The kernel selection that archive was filtered by is written into the
         same file (Model.kernel_plans, indexed by Node.plan), so the runtime
         reads the converter's answer instead of re-deriving it.
+
+        `available_keys` is that archive's key set (what the caller actually
+        embedded). It prunes each row's `variants` to keys the file carries,
+        which the plan's contract requires: tests/KernelPlanTest.cpp asserts
+        every planned key resolves in the model's own archive, so a row may
+        not name one the master lacked. The only declared-but-conditional keys
+        are the fp8 hardware-decode group (shader_map.FP8_HW_KEYS), built only
+        by a glslc that understands GL_EXT_float_e4m3. None means "no target
+        set to prune against" and keeps every declared key.
         """
         # 写盘前先清理运行时图：剪死代码 + 物化 Constant（见上）。幂等。
         self.prune_dead_and_materialize_constants()
@@ -1059,7 +1069,8 @@ class DAGBasedModel:
         # decision instead of two. Rows are emitted in first-appearance order
         # so reconverting an unchanged graph yields an identical table.
         plan_rows, plan_index = shader_map.kernel_plans_for_model(
-            [n.op_type for n in self.nodes.values()] + self.extra_shader_ops)
+            [n.op_type for n in self.nodes.values()] + self.extra_shader_ops,
+            available_keys)
         plan_offs = []
         for row in plan_rows:
             op_type_off = builder.CreateString(row["op_type"])

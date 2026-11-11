@@ -59,6 +59,15 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     keys = shader_map.shader_keys_for_model(op_types, backend=backend)
     master = filter_shaders.read_master(master_path)
     subset = {k: master[k] for k in keys if k in master}
+    # The fp8 hardware-decode group is present in the master only when it was
+    # built by a glslc that understands GL_EXT_float_e4m3 (see
+    # shader_map.FP8_HW_KEYS). Their absence is a configuration, not a gap:
+    # the runtime's device gate never asks for them on a machine whose driver
+    # lacks the extension, and an fp8 weight keeps the software decode
+    # otherwise -- a slowdown, never a wrong answer. Report the group when it
+    # is partly present only, since that IS an inconsistency.
+    absent_f8 = [k for k in shader_map.FP8_HW_KEYS if k not in master]
+    f8_group_absent = len(absent_f8) == len(shader_map.FP8_HW_KEYS)
     # The keys above come from the graph's kernel plan, which records the
     # post-fallback spelling per (backend, precision) -- the exact string the
     # runtime will look up. So an absent one is a genuine gap, not a phantom:
@@ -66,8 +75,20 @@ def build_shader_subset(dag_model, master_path, backend="auto"):
     # no image variant already resolves to the buffer spelling. Report them
     # all: each one is a hard failure at
     # pipeline creation, and this is the only place that can say so before the
-    # model is deployed.
-    missing = sorted(k for k in keys if k not in master)
+    # model is deployed. The conditionally-built fp8 group is the one
+    # exception, and only when the whole group is absent.
+    missing = sorted(k for k in keys
+                     if k not in master
+                     and not (f8_group_absent and k in shader_map.FP8_HW_KEYS))
+    if absent_f8 and not f8_group_absent:
+        print(
+            f"[shaders] {master_path} carries only part of the fp8 "
+            f"hardware-decode group (missing {', '.join(absent_f8)}); a "
+            "partial group means the archive is inconsistent, and the model "
+            "will use the software fp8 decode for those routes. Rebuild the "
+            "archive.",
+            file=sys.stderr,
+        )
     return subset, missing, len(master)
 
 
@@ -138,17 +159,23 @@ def newest_shader_source(root):
     return best
 
 
-def embed_shader_archive(dag_model, master_path, backend="auto"):
+def embed_shader_archive(dag_model, master_path, backend="auto", keys_out=None):
     """Build the per-model VKSP subset and return it as bytes to embed.
 
     The .vkopbin then carries its own shaders: Runtime::LoadModel takes them
     from the file -- there is no other source, since libvkop carries no
     built-in SPIR-V -- and the same rows decide which keys the runtime looks up
     (Model.kernel_plans).
+
+    `keys_out`, when a mutable set/list is passed, receives the keys that were
+    actually embedded. The caller needs them for save_to_binary: the plan must
+    not name a variant the file does not carry (see shader_map.plan_for_op).
     """
     subset, missing, master_count = build_shader_subset(
         dag_model, master_path, backend)
     report_missing_keys(missing, master_path)
+    if keys_out is not None:
+        keys_out.update(subset)
     if not subset:
         return None
     # The embedded archive becomes authoritative at load time, so an archive
@@ -171,13 +198,17 @@ def embed_shader_archive(dag_model, master_path, backend="auto"):
     return blob
 
 
-def build_embedded_archive(args, dag_model, backend):
+def build_embedded_archive(args, dag_model, backend, keys_out=None):
     """Resolve the master archive and return the subset to embed, or None.
 
     Every failure path here is a warning plus a None return, never an abort:
     conversion always produces a model file. The no-archive case is still worth
     printing loudly: libvkop carries no built-in SPIR-V, so a model whose
     .vkopbin lacks the archive fails at op build time with the op and key named.
+
+    `keys_out` is forwarded to embed_shader_archive: the caller hands the
+    resulting set to save_to_binary so the kernel plan cannot name a variant
+    the embedded archive does not carry.
     """
     if filter_shaders is None:
         print(f"[shaders] no filter_shaders.py under {_TOOLS}; converting "
@@ -196,7 +227,8 @@ def build_embedded_archive(args, dag_model, backend):
         )
         return None
     print(f"[shaders] master archive: {master} (via {how})")
-    return embed_shader_archive(dag_model, master, backend=backend)
+    return embed_shader_archive(dag_model, master, backend=backend,
+                                keys_out=keys_out)
 
 
 def parse_args():
@@ -581,10 +613,16 @@ def main():
         # from the final op set, and FusionOptimizer already ran inside
         # apply_optimizations.
         backend = args.target_backend
-        shader_blob = build_embedded_archive(args, dag_model, backend)
+        embedded_keys = set()
+        shader_blob = build_embedded_archive(args, dag_model, backend,
+                                             keys_out=embedded_keys)
 
-        # Save the converted model
-        dag_model.save_to_binary(str(output_path), shader_archive=shader_blob)
+        # Save the converted model. The key set goes with it so the kernel plan
+        # lists exactly what the file carries -- a row naming an absent key
+        # would break the "planned keys resolve in the model's own archive"
+        # invariant (tests/KernelPlanTest.cpp).
+        dag_model.save_to_binary(str(output_path), shader_archive=shader_blob,
+                                 available_keys=embedded_keys or None)
 
         if shader_blob is None:
             print(

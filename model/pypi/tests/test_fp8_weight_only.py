@@ -346,9 +346,11 @@ def test_gates_preserve_the_float_weight():
         ("Gemm has no fp8 kernel",
          build("W", numpy.random.randn(8, 4).astype(numpy.float32),
                [("Gemm", "g", {"transB": 1}, ["x", "W"])])),
-        ("Conv has no fp8 kernel",
+        # Conv2d has an fp8 kernel (buffer/conv2d.comp decodes both grids); the
+        # ops that still dequantize int8 only are ConvTranspose and the RNNs.
+        ("ConvTranspose has no fp8 kernel",
          build("W", numpy.random.randn(4, 4, 8, 8).astype(numpy.float32),
-               [("Conv", "c", {}, ["x", "W"])])),
+               [("ConvTranspose", "c", {}, ["x", "W"])])),
         ("rank-3 batched weight",
          build("W", numpy.random.randn(2, 8, 8).astype(numpy.float32),
                [("MatMul", "mm", {"transB": 0}, ["x", "W"])])),
@@ -389,6 +391,53 @@ def test_odd_shapes_still_quantize():
         m = matmul_case(w, 0, "fp8e5m2")
         check_payload(m, w, "fp8e5m2")
     print("  PASS (odd K/N shapes quantize; nothing about fp8 needs alignment)")
+
+
+def test_conv_weight_quantizes_on_the_output_channel_axis():
+    """Conv2d has an fp8 kernel, so its weight takes the same per-output-channel
+    scale int8 gives it.
+
+    The weight is [OC, IC, KH, KW]; the scale is one entry per OC, and the shader
+    reads it indexed by output channel. `_int8_conv_axis` already answers "which
+    axis is that" for int8, and fp8 shares the answer -- so this both proves the
+    gate lets Conv through and pins that the two formats agree on the axis.
+    """
+    numpy.random.seed(11)
+    for fmt in ("fp8e4m3", "fp8e5m2"):
+        max_finite, exp_bits, mant_bits, lut, first_bad = fmt_params(fmt)
+        w = numpy.random.randn(6, 4, 3, 3).astype(numpy.float32)
+        m = build("W", w, [("Conv", "c", {"group": 1}, ["x", "W"])])
+        quantize(m, fmt)
+
+        assert m.initializers["W"].data_type == (
+            TensorProto.FLOAT8E4M3FN if fmt == "fp8e4m3"
+            else TensorProto.FLOAT8E5M2), f"{fmt}: Conv weight stayed float"
+
+        scale = numpy_helper.to_array(m.initializers["W_scale"])
+        assert scale.shape == (6,), f"{fmt}: scale is {scale.shape}, wants (6,)"
+        amax = numpy.amax(numpy.abs(w), axis=(1, 2, 3))
+        numpy.testing.assert_allclose(
+            scale, numpy.where(amax == 0, 1.0, amax / max_finite).astype(numpy.float32),
+            rtol=1e-6)
+
+        raw = numpy.frombuffer(m.initializers["W"].raw_data, dtype=numpy.uint8)
+        assert raw.size == w.size
+        assert numpy.all((raw & 0x7F) < first_bad)
+
+        # Decode the way conv2d.comp does: byte -> float, times that channel's
+        # scale. The error must sit inside the round-to-nearest bound, which it
+        # only can if the scale was applied along the output-channel axis.
+        bcast = numpy.reshape(scale, (6, 1, 1, 1))
+        deq = signed_codes(raw.reshape(w.shape), lut, first_bad) * bcast
+        bound = half_step_bound(w / bcast, exp_bits, mant_bits) * bcast
+        err = numpy.abs(deq - w)
+        bad = int(numpy.count_nonzero(err > bound * 1.001 + 1e-7))
+        assert bad == 0, f"{fmt}: {bad} value(s) outside the round-to-nearest bound"
+
+        # The third input is appended so the shader receives [X, W, bias?, scale].
+        ins = [i["name"] for i in m.nodes["c"].inputs]
+        assert ins == ["x", "W", "W_scale"], ins
+    print("  PASS (Conv weight: per-output-channel scale, both grids)")
 
 
 def test_unknown_format_raises_before_any_work():

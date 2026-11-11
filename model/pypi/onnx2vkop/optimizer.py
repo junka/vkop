@@ -8239,7 +8239,12 @@ class Quantizer:
     _WEIGHT_OPS = {
         "int8": ("MatMul", "Gemm", "Conv", "ConvTranspose", "LSTM", "GRU",
                  "RNN"),
-        "fp8": ("MatMul",),
+        # fp8 reaches Conv but not ConvTranspose/LSTM/GRU: buffer/conv2d.comp
+        # decodes both grids (the same per-output-channel scale as int8), while
+        # the other three still only have the int8 kernel. Listing only the ops
+        # that have one keeps the gate honest -- a fp8 payload on a ConvTranspose
+        # would be refused here rather than read as exponents.
+        "fp8": ("MatMul", "Conv"),
         "4bit": ("MatMul",),
     }
 
@@ -8308,10 +8313,13 @@ class Quantizer:
         per_column = [node for node in consumers
                       if node.op_type in ("MatMul", "Gemm")]
         if not per_column:
-            # int8 alone reaches Conv/RNN weights. Those have their own
-            # per-output-channel axis and no transB, and the kernels index the
-            # scale by output channel.
-            if family != "int8":
+            # int8 and fp8 reach Conv weights. Those have their own
+            # per-output-channel axis and no transB, and both kernels index the
+            # scale by output channel -- buffer/conv2d.comp decodes either byte
+            # grid. The other non-MatMul consumers (ConvTranspose/LSTM/GRU) have
+            # no fp8 kernel, and _WEIGHT_OPS["fp8"] excludes them before this
+            # point.
+            if family not in ("int8", "fp8"):
                 reasons.append("no Gemm/MatMul consumer")
                 return out
             out["axis"] = Quantizer._int8_conv_axis(consumers, dims)
@@ -8889,10 +8897,14 @@ class Quantizer:
         several orders of magnitude wants. The encoding is the same cost, and the
         byte count is the same, so this buys accuracy and not volume.
 
-        Same input contract as INT8 (one scale per column, whatever transB says),
-        but only MatMul: conv2d.comp and gemm.comp dequantize int8 and nothing
-        else, and the ops refuse a non-int8 quantized weight rather than reading
-        exponent bits as a two's-complement value.
+        Same input contract as INT8 (one scale per output channel, whatever
+        transB says), and the same consumer set for the ops that have a kernel:
+        MatMul and Conv. Conv weights are 4-D [OC, IC, KH, KW] and take the
+        per-output-channel axis INT8 already uses (``_int8_conv_axis``), so both
+        formats quantize along the same axis and the runtime indexes the scale by
+        output channel either way. ConvTranspose/LSTM/GRU still dequantize int8
+        only and are excluded by ``_WEIGHT_OPS["fp8"]`` rather than being handed
+        a payload whose bytes they would read as two's complement.
 
         `exclude` is the --exclude-* weight set, honoured here exactly as in the
         other byte passes: the name keeps its dtype and no scale input is

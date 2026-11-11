@@ -163,6 +163,27 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # to the 256-lane kernel where the driver or this archive refuses.
         "buffer_matmul_ksplit512_fp16",
         "buffer_matmul_ksplit512_w8_wide_fp16",
+        # The VK_EXT_shader_float8 builds of the same file (-DFP8_HW): the
+        # fp8 weight decode becomes one hardware conversion per 32-bit word
+        # instead of a field reassembly. Five routes, because OpCapability
+        # Float8EXT is module-wide -- a device without the extension rejects
+        # the module at pipeline creation, so this cannot be a runtime branch
+        # inside the software module. Listed here for the same reason as the
+        # WIDE key above: MatMulBuffer builds each lazily behind a device gate
+        # (`device_traits().shader_float8`), which the converter cannot query,
+        # so every MatMul carries them and a non-supporting device simply
+        # never resolves them.
+        #
+        # These are CONDITIONAL in the master archive: CMake emits them only
+        # when the build's glslc understands GL_EXT_float_e4m3 (shaderc
+        # < 2024 rejects the source outright), so a master built with an old
+        # shaderc has none of them. That is the expected state on a 1.3.275
+        # box and is handled as a group -- see FP8_HW_KEYS.
+        "buffer_matmul_fp8_hw_fp16",
+        "buffer_matmul_w8_wide_fp8_hw_fp16",
+        "buffer_matmul_w8_wide_bda_fp8_hw_fp16",
+        "buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16",
+        "buffer_matmul_ksplit512_w8_wide_bda_fp8_hw_fp16",
         # The -DSUBGROUP build of the base module: only matmul16_softmax's row
         # reduce differs (subgroupMax/subgroupAdd instead of the two 8-round
         # shared trees). The host swaps the primary key for this one when the
@@ -265,17 +286,26 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # Conv2d's fp16 pack pass reuses buffer_matmul_pack (same shader), but
     # ship it explicitly so removing that shader from MatMul would trip a
     # loud test failure here rather than a silent miss at load time.
+    #
+    # The two fp8 keys are the -DFP8_HW builds of buffer/conv2d.comp, selected
+    # by Conv2dBuffer::ensure_fp8_hw_pipeline behind the same device gate as
+    # MatMul's (device_traits().shader_float8), which the converter cannot
+    # query. They are CONDITIONAL in the master -- see FP8_HW_KEYS.
     ("Conv2d", "buffer"): [
         "buffer_matmul_pack",
         "buffer_matmul_pack_bda",
         "buffer_conv2d_bda",
         "buffer_conv2d_bda_fp16",
+        "buffer_conv2d_fp8_hw",
+        "buffer_conv2d_fp8_hw_fp16",
     ],
     ("Conv", "buffer"): [
         "buffer_matmul_pack",
         "buffer_matmul_pack_bda",
         "buffer_conv2d_bda",
         "buffer_conv2d_bda_fp16",
+        "buffer_conv2d_fp8_hw",
+        "buffer_conv2d_fp8_hw_fp16",
     ],
     # int64 shape-meta chains built by Expand/Concat/Gather/Equal/Where on
     # an int64 input; their set_runtime_device() creates a second pipeline
@@ -502,6 +532,27 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("DequantizeLinear", "buffer"): ["buffer_quantize_linear_bda"],
 }
 
+# Keys the master archive may legitimately lack, as a group.
+#
+# CMake builds the -DFP8_HW modules only when the configure-time glslc accepts
+# GL_EXT_float_e4m3 (VKOP_GLSLC_HAS_FLOAT8); shaderc before 2024 rejects the
+# source, so a master built on the system 1.3.275 SDK has none of them. Every
+# other _SECONDARY key is unconditional, which is why
+# test_secondary_keys_exist_in_master_archive treats a miss as a build error.
+#
+# All of them are emitted or none are: they are every route of one build gate,
+# so a master that has some of them is a genuine inconsistency (a partial
+# rebuild, or a hand-edited archive) and the test still fails on it.
+FP8_HW_KEYS: tuple = (
+    "buffer_matmul_fp8_hw_fp16",
+    "buffer_matmul_w8_wide_fp8_hw_fp16",
+    "buffer_matmul_w8_wide_bda_fp8_hw_fp16",
+    "buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16",
+    "buffer_matmul_ksplit512_w8_wide_bda_fp8_hw_fp16",
+    "buffer_conv2d_fp8_hw",
+    "buffer_conv2d_fp8_hw_fp16",
+)
+
 
 def _primary_keys(op: str, backend: str, emit_fp16: bool) -> Iterable[str]:
     spec = _PRIMARY.get(op)
@@ -589,13 +640,24 @@ def _column(op: str, backend: str) -> tuple:
     return keys[0], (keys[1] if len(keys) > 1 else keys[0])
 
 
-def plan_for_op(op: str):
+def plan_for_op(op: str, available: Set[str] = None):
     """The kernel plan for one op_type, or None when it has no GPU shader.
 
     None covers the host-only ops (Shape / Squeeze / Unsqueeze / Identity) and
     any name the tables do not know; both mean "no key for this op", which is
     also what the C++ fallback table returns for them, so a planless node
     behaves exactly as it did before plans existed.
+
+    `available` is the key set of the master archive the model's embedded
+    subset is filtered from. When given, a declared variant the master does
+    not carry is dropped from the row, because the plan's contract (see
+    core/KernelPlan.hpp and tests/KernelPlanTest.cpp) is "what the embedded
+    archive was built from": a planned-but-absent key would be a lie about
+    the file. This is what the fp8 hardware-decode group needs -- those keys
+    exist only in a master built by a glslc that knows
+    GL_EXT_float_e4m3, so on a 1.3.275 build machine they are declared here
+    but not shipped, and the plan must say so. None keeps every declared key
+    (a bare .vkopbin with no archive has no target set to prune against).
 
     The returned dict mirrors the KernelPlan flatbuffer table field for field.
     """
@@ -605,32 +667,39 @@ def plan_for_op(op: str):
     buf, buf16 = _column(op, "buffer")
     if not (img or buf):
         return None
-    variants = sorted(set(_SECONDARY.get((op, "image"), ())) |
-                      set(_SECONDARY.get((op, "buffer"), ())))
+    variants = set(_SECONDARY.get((op, "image"), ())) | set(
+        _SECONDARY.get((op, "buffer"), ())
+    )
+    if available is not None:
+        variants = {v for v in variants if v in available}
     return {
         "op_type": op,
         "image": img,
         "image_fp16": img16,
         "buffer": buf,
         "buffer_fp16": buf16,
-        "variants": variants,
+        "variants": sorted(variants),
     }
 
 
-def kernel_plans_for_model(op_types: Iterable[str]):
+def kernel_plans_for_model(op_types: Iterable[str], available: Set[str] = None):
     """Return (rows, index) for a graph's op census.
 
     `rows` is the deduplicated KernelPlan list to write into Model.kernel_plans
     (first-appearance order, so two conversions of the same graph produce the
     same table) and `index` maps op_type -> row index for Node.plan. An
     op_type with no plan is absent from `index`, i.e. its nodes carry -1.
+
+    `available` (the master archive's key set) prunes variant rows to what the
+    embedded subset actually carries -- see plan_for_op. Callers that convert
+    against a master pass it so the plan cannot promise a key the file lacks.
     """
     rows: List[dict] = []
     index: Dict[str, int] = {}
     for op in op_types:
         if op in index:
             continue
-        plan = plan_for_op(op)
+        plan = plan_for_op(op, available)
         if plan is None:
             continue
         index[op] = len(rows)
