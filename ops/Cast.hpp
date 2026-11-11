@@ -172,7 +172,12 @@ class Cast : public BufferFactory {
         //    Cast output stuck at round 3 while position_ids kept advancing).
         if (inputs[0]->dtype() == typeid(int64_t) &&
             outputs[0]->dtype() == typeid(float)) {
-            if (m_dev_ && m_dev_->is_support_shader_int64()) {
+            // The int64 twin is a capability of the ARCHIVE, not just the
+            // device: a model exported before buffer_cast_int64 existed has no
+            // such module, and resolve_spv() would throw. Fall back to the CPU
+            // path below in that case.
+            if (m_dev_ && m_dev_->is_support_shader_int64() &&
+                (pipeline_int64_ || archive_has_spv("buffer_cast_int64"))) {
                 ensure_int64_pipeline();
                 int64_mode_ = true;
                 cast::CastInt64PC pc{};

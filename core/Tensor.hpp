@@ -1177,11 +1177,21 @@ template <typename T> class Tensor : public ITensor {
         // one alignment's worth of headroom above the logical size for it.
         size_t host_bytes = ((bytes + align - 1) / align) * align + align;
         void *p = nullptr;
+#if defined(_MSC_VER)
+        // MSVC has no posix_memalign; _aligned_malloc pairs with _aligned_free.
+        p = _aligned_malloc(host_bytes, align);
+        if (!p) {
+            throw std::runtime_error(
+                "vkop: _aligned_malloc failed for a host-imported tensor");
+        }
+        host_import_ptr_ = HostBlock(p, _aligned_free);
+#else
         if (posix_memalign(&p, align, host_bytes) != 0) {
             throw std::runtime_error(
                 "vkop: posix_memalign failed for a host-imported tensor");
         }
         host_import_ptr_ = HostBlock(p, ::free);
+#endif
         host_import_bytes_ = host_bytes;
         vkobj_ = std::make_shared<VulkanBuffer>(
             vd, bytes,

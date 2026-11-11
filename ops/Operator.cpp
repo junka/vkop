@@ -109,6 +109,14 @@ Operator::resolve_spv(const std::string &key) const {
                    key, "variant");
 }
 
+bool Operator::archive_has_spv(const std::string &key) const {
+    const auto *archive = effective_archive(shader_archive_);
+    if (!archive) {
+        return false;
+    }
+    return archive->lookup(key).first != nullptr;
+}
+
 void Operator::try_build_bda_pipeline(VkPipelineCache cache) {
     // Step 2 rollout gate: the host-side capability (allocation flag, buffer
     // usage) is automatic, but a shader variant is only selected when the

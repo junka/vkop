@@ -478,6 +478,12 @@ if os.environ.get("VKOP_KV_FP8") == "1":
 # 都不动；变体不会碰到 llm.weights.bin（那是 3.4GB 的原始权重，只能由默认运行
 # 重建）。
 print(f"[consolidate] saving as single {LLM_STEM}.weights.bin ...")
+# onnx>=1.20 refuses to write external data over an existing file
+# (FileExistsError in convert_model_to_external_data), so drop the previous
+# consolidation first; this run rebuilds it from the same checkpoint anyway.
+_prev_weights = f"{LLM_STEM}.weights.bin"
+if os.path.exists(_prev_weights):
+    os.remove(_prev_weights)
 onnx.save_model(
     m, f"{LLM_STEM}.onnx",
     save_as_external_data=True,

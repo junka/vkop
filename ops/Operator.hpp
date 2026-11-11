@@ -568,6 +568,12 @@ class Operator {
     std::pair<const uint32_t *, uint32_t>
     resolve_spv(const std::string &key) const;
 
+    // Non-throwing probe for the same lookup: does the reachable archive carry
+    // `key`? Capability-like secondary paths (Cast's int64 twin) consult this
+    // BEFORE building, so an archive exported before the twin existed falls
+    // back to the op's host path instead of dying on a missing variant.
+    bool archive_has_spv(const std::string &key) const;
+
     // Recovery of this op's PRIMARY shader when nothing supplied one: looks up
     // shader_key_for(type_, uses_buffer_backend(), fp16_) on the op's own
     // archive pointer, or on ShaderArchive::process_default() when Runtime

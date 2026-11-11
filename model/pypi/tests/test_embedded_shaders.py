@@ -211,11 +211,16 @@ def test_embed_returns_bytes_and_reports_subset(tmp_path, capsys):
 
 
 def read_master_names(blob):
+    import os
     import tempfile
-    with tempfile.NamedTemporaryFile(suffix=".bin") as f:
-        f.write(blob)
-        f.flush()
-        return set(filter_shaders.read_master(f.name))
+    # Windows cannot reopen a live NamedTemporaryFile by name, so use mkstemp.
+    fd, path = tempfile.mkstemp(suffix=".bin")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(blob)
+        return set(filter_shaders.read_master(path))
+    finally:
+        os.unlink(path)
 
 
 # ------------------------------------------------------------ end to end
