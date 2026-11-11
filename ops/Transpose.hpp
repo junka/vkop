@@ -131,6 +131,52 @@ class TransposeBuffer : public BufferFactory {
     bool supports_bda_variant() const override { return true; }
     size_t bda_pc_size() const override { return sizeof(TransposeBdaPC); }
 
+    // int64-data pipeline (buffer/transpose_int64). Same 2× STORAGE layout and
+    // the same 100-byte TransposePC as the base module, so it reuses types_
+    // and pc_size_; only the SPIR-V differs.
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_) return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        auto i64 = resolve_spv("buffer_transpose_int64");
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, sizeof(TransposePC),
+            i64.first, i64.second, use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+        build_bda_table_module("buffer_transpose_int64_bda",
+                               sizeof(TransposePC), 2, bda_i64_);
+    }
+    void submit(void *ptr, int width, int height, int layers) override {
+        if (!int64_mode_) {
+            Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
+            return;
+        }
+        if (!m_ds_int64_[m_id_]) {
+            m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+        pipeline_int64_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(
+                *pipeline_int64_,
+                static_cast<uint32_t>(sizeof(TransposePC)), ptr);
+        }
+        m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
+        }
+    }
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    std::array<VkDescriptorSet, vkop::kInflight> m_ds_int64_{};
+    BdaTableModule bda_i64_;
+    bool int64_mode_ = false;
+
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
         if (attributes.find("perm") != attributes.end()) {
@@ -162,13 +208,12 @@ class TransposeBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Only the int64 payload takes the CPU permute below; every float path
-        // (including the flat-identity view) is a GPU dispatch with no host
-        // work to skip, so such a segment may replay. Reported before the early
-        // returns so every path states its answer.
-        set_did_host_work_last_round(
-            !inputs.empty() && inputs[0] &&
-            inputs[0]->dtype() == typeid(int64_t));
+        // Every path is now a GPU dispatch — the fp16/fp32 gather, the
+        // flat-identity alias, and (since buffer/transpose_int64.comp) the
+        // int64 move. No host work, so a segment may replay. The one thing a
+        // replay must still watch is the output SHAPE, reported separately by
+        // recording_changes_per_round().
+        set_did_host_work_last_round(false);
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
         std::vector<int> outshape(rank);
@@ -187,44 +232,45 @@ class TransposeBuffer : public BufferFactory {
         // CPU permute below.
         core::require_word_movable_elem(inputs[0]->elem_kind(), "Transpose");
 
-        // int64 transpose: CPU permute (the single instance feeds NonZero,
-        // part of the shape meta-chain).
+        // int64 transpose: a GPU ivec2 move (buffer/transpose_int64.comp).
+        //
+        // This used to be a host permute — read the int64 tensor back, permute
+        // it in a C++ loop, re-upload. That made the level unreplayable: a
+        // replay skips execute(), so the permute stopped and the output kept
+        // the previous round's bytes. The kernel needs no 64-bit arithmetic
+        // (it moves two 32-bit words per element), so unlike the int64 Cast it
+        // does not require the shaderInt64 feature.
         if (inputs[0]->dtype() == typeid(int64_t)) {
             int total = total_elems(outshape);
-            std::vector<int64_t> out(static_cast<size_t>(total));
-            auto src = core::as_tensor<int64_t>(inputs[0]);
-            // The input may be GPU-resident only (e.g. NonZero's output is
-            // computed by a shader, leaving data_ empty) OR a cross-round-
-            // recycled GPU input with stale CPU data_ (see SqueezeUnsqueeze/
-            // ScatterElements fix). Pull it back to the host either way.
-            src->copyToCPU(m_cmdpool_);
-            std::vector<int> in_stride(rank, 1);
-            for (int d = rank - 2; d >= 0; --d) {
-                in_stride[d] = in_stride[d + 1] * inshape[d + 1];
-            }
-            std::vector<int> out_stride(rank, 1);
-            for (int d = rank - 2; d >= 0; --d) {
-                out_stride[d] = out_stride[d + 1] * outshape[d + 1];
-            }
-            for (int o = 0; o < total; ++o) {
-                int r = o;
-                int in_lin = 0;
-                for (int d = 0; d < rank; ++d) {
-                    int coord = (r / out_stride[d]) % outshape[d];
-                    in_lin += coord * in_stride[perm_[d]];
-                }
-                out[static_cast<size_t>(o)] = (*src)[in_lin];
-            }
             auto output = core::as_tensor<int64_t>(outputs[0]);
-            output->resize(outshape);
-            output->fillToCPU(out);
+            if (output->num_elements() != total) {
+                output->resize(outshape);
+            }
             objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-            // Deferred upload keeps data_ populated (no sync submit+wait) for
-            // downstream host readers. Host-shape mode: also mark the bytes
-            // authoritative so those readers skip their GPU->CPU readback.
-            output->copyToGPUDeferred(m_cmd_);
-            if (host_shape_enabled()) {
-                output->set_host_authoritative();
+            auto src = core::as_tensor<int64_t>(inputs[0]);
+            // nullptr cmd: the producer's level already ordered this buffer;
+            // the same convention the other int64 twins use for inputs.
+            objs_.emplace_back(src->as_storage_buffer(m_dev_, nullptr));
+
+            TransposePC pc{};
+            pc.rank = rank;
+            for (int i = 0; i < 8 && i < rank; ++i) {
+                pc.inDims[i] = inshape[i];
+                pc.outDims[i] = outshape[i];
+                pc.perm[i] = perm_[i];
+            }
+            ensure_int64_pipeline();
+            int64_mode_ = true;
+            // An empty tensor (this instance is (1,0) in decode) has nothing to
+            // move; UP_DIV(0,256) is 0, which vkCmdDispatch rejects.
+            if (total > 0) {
+                submit(&pc, UP_DIV(total, 256), 1, 1);
+                auto out_buf =
+                    std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+                if (out_buf) {
+                    out_buf->shaderWriteBarrier(m_cmd_->get(),
+                                                (VkDeviceSize)total * 8);
+                }
             }
             return;
         }

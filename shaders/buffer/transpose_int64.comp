@@ -1,0 +1,88 @@
+#version 450 core
+
+// int64 Transpose: same index math as transpose.comp, but the payload is
+// int64 and the buffers are viewed as ivec2[]. No 64-bit ARITHMETIC is
+// involved — this is a pure byte move of two 32-bit words per element — so it
+// does NOT need the shaderInt64 feature (contrast cast_int64.comp, which does).
+//
+// Why this exists: the int64 Transpose was the last CPU permute in the
+// shape-meta chain (NonZero's output feeds it). The host path read the int64
+// tensor back, permuted it in a C++ loop and re-uploaded it, which made its
+// level unreplayable — a replay skips execute(), so the permute stopped
+// happening and the output kept the previous round's bytes. On the device the
+// whole thing is one dispatch, and the level replays like any other.
+//
+// Bindings: 0 = output (int64 as ivec2), 1 = input (int64 as ivec2).
+// PC: rank + inDims/outDims/perm, identical to the fp32/fp16 kernel.
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIVec2Buf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaIVec2Buf b0;
+    BdaIVec2Buf b1;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInput (uBdaTable.b1)
+#else
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    ivec2 data[];
+} uInput;
+#endif
+
+struct IArr8 { int v[8]; };
+
+layout(push_constant) uniform PC_uTrans64 {
+    int rank;
+    IArr8 inDims;
+    IArr8 outDims;
+    IArr8 perm;
+} uTrans;
+
+// 256 lanes per workgroup (the host dispatches UP_DIV(total, 256) groups).
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+IArr8 linear_to_nd8(int lin, IArr8 dims, int rank) {
+    IArr8 c;
+    for (int i = 0; i < 8; ++i) c.v[i] = 0;
+    for (int d = rank - 1; d >= 0; --d) {
+        int n = dims.v[d];
+        c.v[d] = (n > 0) ? (lin % n) : 0;
+        if (n > 0) lin /= n;
+    }
+    return c;
+}
+
+int nd_to_linear8(IArr8 c, IArr8 dims, int rank) {
+    int lin = 0;
+    for (int d = 0; d < rank; ++d) lin = lin * dims.v[d] + c.v[d];
+    return lin;
+}
+
+// out element index -> in element index, out_coord -> in_coord[perm[i]].
+int transpose_elem(int gid) {
+    IArr8 out_coord = linear_to_nd8(gid, uTrans.outDims, uTrans.rank);
+    IArr8 in_coord;
+    for (int i = 0; i < 8; ++i) in_coord.v[i] = 0;
+    for (int i = 0; i < uTrans.rank; ++i) {
+        in_coord.v[uTrans.perm.v[i]] = out_coord.v[i];
+    }
+    return nd_to_linear8(in_coord, uTrans.inDims, uTrans.rank);
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    int out_total = 1;
+    for (int i = 0; i < uTrans.rank; ++i) out_total *= uTrans.outDims.v[i];
+    if (gid >= out_total) {
+        return;
+    }
+    // One ivec2 per element: K and V words move together, never split.
+    uOutput.data[gid] = uInput.data[transpose_elem(gid)];
+}

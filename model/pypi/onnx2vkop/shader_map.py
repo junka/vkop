@@ -442,6 +442,8 @@ _SECONDARY: Dict[tuple, List[str]] = {
         "buffer_reduce_bda_fp16",
     ],
     ("Transpose", "buffer"): [
+        "buffer_transpose_int64",
+        "buffer_transpose_int64_bda",
         "buffer_transpose_bda",
         "buffer_transpose_bda_fp16",
     ],

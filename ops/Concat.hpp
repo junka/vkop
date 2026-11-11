@@ -355,6 +355,12 @@ class ConcatBuffer : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // The float paths record a dispatch only: no host work to skip, so a
+        // segment may replay them. The int64 branch below states its own
+        // answer (its CPU form does a host strided copy). Leaving this at the
+        // conservative type answer made every float Concat — including the
+        // per-round mrope_static one — force its level to re-record.
+        set_did_host_work_last_round(false);
         int rank = static_cast<int>(inputs[0]->num_dims());
         if (axis_ < 0) {
             axis_ += rank;

@@ -526,6 +526,9 @@ vkop_shader_variant(buffer_expand_int64_bda buffer/expand_int64 -DBDA)
 # int64 -> fp32 Cast (position ids). Needs shaderInt64 for the ARITHMETIC, not
 # the ivec2 view: this is the one int64 op that changes the element type.
 vkop_shader_variant(buffer_cast_int64_bda buffer/cast_int64 -DBDA)
+# int64 Transpose (the NonZero output). A pure ivec2 move, so unlike the Cast
+# twin it does NOT need shaderInt64.
+vkop_shader_variant(buffer_transpose_int64_bda buffer/transpose_int64 -DBDA)
 # The GPU-shape indirect pre-pass (BufferBinaryFactory::submit_prepass), whose
 # two bindings are the out-shape SSBO and the VkDispatchIndirectCommand buffer
 # -- neither comes from the main kernel's objs_ list.
