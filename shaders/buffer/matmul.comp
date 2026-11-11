@@ -5,6 +5,22 @@
 #extension GL_EXT_buffer_reference2 : require
 #endif
 
+// Hardware fp8 decode (VK_EXT_shader_float8), the -DFP8_HW build only. This is
+// a MODULE-level capability: OpCapability Float8EXT makes a device without the
+// extension reject the whole module at vkCreateShaderModule, so it can never be
+// a runtime branch inside the general module. The host builds this variant only
+// when the device reports shader_float8 enabled (see MatMulBuffer::
+// w8_wide_f8_pipeline) and otherwise keeps the software decode below.
+//
+// GL_EXT_float_e4m3 / GL_EXT_float_e5m2 are the GLSL spellings; the type is
+// `floate4m3_t` and the vector is `fe4m3vec4`. They are separate extensions for
+// the two formats, unlike the Vulkan-side single VK_EXT_shader_float8.
+#ifdef FP8_HW
+#extension GL_EXT_float_e4m3 : require
+#extension GL_EXT_float_e5m2 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#endif
+
 #include "../common/subgroup_reduce.comp"
 
 // MatMul SSBO reduce pass (fp32 + fp16). Computes C = A @ B.
@@ -535,7 +551,32 @@ float e5m2_val(uint b) {
     return (b & 0x80u) != 0u ? -v : v;
 }
 
+// The byte-to-float step. Two builds of this file differ only here.
+//
+// Software (default): reassemble the fields by hand. There is no hardware path
+// on the stacks this kernel ships to by default -- MoltenVK's device extensions
+// stop at VK_KHR_shader_float16_int8, and the 1.3.275 loader on the Intel box
+// never exposes VK_EXT_shader_float8 -- so this form is the portable one.
+//
+// Hardware (-DFP8_HW): a bit cast into the fp8 type, which the driver lowers to
+// the format's conversion instruction. Measured on Ada at 896x4864 (one byte
+// per weight): software decode 7.7 GB/s, int8 91 GB/s, this 115 GB/s. The field
+// reassembly was the whole deficit. It cannot be a runtime branch:
+// OpCapability Float8EXT is module-wide, and a device without the extension
+// rejects the entire module.
+#ifdef FP8_HW
+float f8_val(uint b) {
+    // uPC.e5m2 is uniform across a dispatch, so this is one branch, not one per
+    // element; both formats are compiled in because GLSL selects the grid by
+    // type, not by a runtime value.
+    if (uPC.e5m2 != 0) {
+        return float(uintBitsToFloate5m2EXT(int8_t(b)));
+    }
+    return float(uintBitsToFloate4m3EXT(int8_t(b)));
+}
+#else
 float f8_val(uint b) { return uPC.e5m2 != 0 ? e5m2_val(b) : e4m3_val(b); }
+#endif
 
 float w_val(uint b) { return uPC.fp8 != 0 ? f8_val(b) : w8_val(b); }
 
@@ -546,6 +587,26 @@ float load_w8(int idx) {
 
 // The four weights of one word, low byte first.
 vec4 unpack_w8(uint word) {
+#ifdef FP8_HW
+    // Convert the whole word at once. A fe4m3vec4 built from the four bytes
+    // followed by one vec4() conversion compiles to a single
+    // OpFConvert %v4float over the 32-bit load; converting each byte into a
+    // separate float leaves four scalar conversions in the inner loop, which
+    // measured no faster than the software form.
+    if (uPC.fp8 != 0) {
+        if (uPC.e5m2 != 0) {
+            return vec4(fe5m2vec4(
+                uintBitsToFloate5m2EXT(int8_t(word)),
+                uintBitsToFloate5m2EXT(int8_t(word >> 8)),
+                uintBitsToFloate5m2EXT(int8_t(word >> 16)),
+                uintBitsToFloate5m2EXT(int8_t(word >> 24))));
+        }
+        return vec4(fe4m3vec4(uintBitsToFloate4m3EXT(int8_t(word)),
+                              uintBitsToFloate4m3EXT(int8_t(word >> 8)),
+                              uintBitsToFloate4m3EXT(int8_t(word >> 16)),
+                              uintBitsToFloate4m3EXT(int8_t(word >> 24))));
+    }
+#endif
     if (uPC.fp8 != 0) {
         return vec4(f8_val(word & 0xFFu), f8_val((word >> 8) & 0xFFu),
                     f8_val((word >> 16) & 0xFFu), f8_val(word >> 24));

@@ -28,3 +28,13 @@ target_link_libraries(bench_matmul_i8 PRIVATE vkop vload)
 target_compile_definitions(bench_matmul_i8 PRIVATE
     VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
 
+# The fp8 arm of the same benchmark. Same shapes and routes; the weight tensor
+# is float8e4m3fn instead of int8, so the difference against bench_matmul_i8 is
+# exactly the byte-to-float step. Run it against an archive with the -DFP8_HW
+# keys on a VK_EXT_shader_float8 device to see the hardware decode; on any
+# other configuration it falls back to the software decode in the same module.
+add_executable(bench_matmul_fp8 bench_matmul_fp8.cpp)
+target_link_libraries(bench_matmul_fp8 PRIVATE vkop vload)
+target_compile_definitions(bench_matmul_fp8 PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
+

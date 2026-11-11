@@ -893,6 +893,8 @@ DeviceTraits device_traits_from(VulkanDevice &dev) {
     t.subgroup_rotate = sc.subgroup_rotate.enabled;
     t.wmem_explicit_layout = sc.wmem_explicit_layout.enabled;
     t.zero_init_wmem = sc.zero_init_wmem.enabled;
+    t.shader_float8 = sc.shader_float8.enabled;
+    t.shader_float8_coopmat = sc.shader_float8_coopmat.enabled;
     return t;
 }
 

@@ -1209,6 +1209,17 @@ class MatMulBuffer : public BufferFactory {
                 if (VulkanPipeline *p = secondary_pipeline(
                         1, "buffer_matmul_ksplit512_w8_wide_fp16",
                         w8_wide512_pipeline_, w8_wide512_ds_)) {
+                    // The 512-lane module is a separate archive entry from the
+                    // 256-lane one, so it needs its own fp8 build as well;
+                    // without it an fp8 weight on this opt-in route would fall
+                    // back to the software decode while the 256-lane route got
+                    // the hardware one.
+                    if (weight_fp8 &&
+                        m_dev_->device_traits().shader_float8) {
+                        if (VulkanPipeline *f8 = w8_wide512_f8_pipeline()) {
+                            p = f8;
+                        }
+                    }
                     sel_wide = p;
                 } else {
                     sel_av.w8_wide512 = false;
@@ -1216,10 +1227,22 @@ class MatMulBuffer : public BufferFactory {
                 }
                 break;
             case core::MatmulRoute::kKsplitW8Wide:
-                sel_wide = w8_wide_pipeline();
+                sel_wide = weight_fp8 ? w8_wide_f8_pipeline()
+                                      : w8_wide_pipeline();
                 if (sel_wide == nullptr) {
-                    sel_av.w8_wide = false;
-                    retry = true;
+                    // The fp8 hardware module can be absent for two harmless
+                    // reasons (old glslc, or a device without
+                    // VK_EXT_shader_float8) while the software one is fine.
+                    // Fall back to the software module rather than dropping
+                    // to the 4-column kernel: the fp8 payload decodes in
+                    // both, only the instruction sequence differs.
+                    if (weight_fp8) {
+                        sel_wide = w8_wide_pipeline();
+                    }
+                    if (sel_wide == nullptr) {
+                        sel_av.w8_wide = false;
+                        retry = true;
+                    }
                 }
                 break;
             case core::MatmulRoute::kKsplitWide512:
@@ -2250,11 +2273,24 @@ class MatMulBuffer : public BufferFactory {
                                        batch * m, 1)) {
                     return;
                 }
-                dispatch_on(sel_wide, w8_wide512_ds_[m_id_],
+                dispatch_on(sel_wide,
+                            sel_wide != nullptr &&
+                                    sel_wide == w8_wide512_f8_pipeline_.get()
+                                ? w8_wide512_f8_ds_[m_id_]
+                                : w8_wide512_ds_[m_id_],
                             UP_DIV(n / 16, q), batch * m);
                 return;
             case core::MatmulRoute::kKsplitW8Wide:
                 set_route(plan.tag, batch, m, n, k, rep);
+                if (weight_fp8 && m_dev_->device_traits().shader_float8 &&
+                    ensure_bda_variant(
+                        w8_wide_bda_f8_,
+                        "buffer_matmul_w8_wide_bda_fp8_hw_fp16") &&
+                    bda_b4_aligned() &&
+                    submit_bda_variant(w8_wide_bda_f8_, UP_DIV(n / 16, q),
+                                       batch * m, 1)) {
+                    return;
+                }
                 if (ensure_bda_variant(
                         w8_wide_bda_,
                         "buffer_matmul_w8_wide_bda_fp16") &&
@@ -2263,8 +2299,17 @@ class MatMulBuffer : public BufferFactory {
                                        batch * m, 1)) {
                     return;
                 }
-                dispatch_on(sel_wide, w8_wide_ds_[m_id_], UP_DIV(n / 16, q),
-                            batch * m);
+                // sel_wide may be the fp8 hardware module (a different
+                // pipeline object with its own descriptor sets), so the set
+                // array has to follow it, not be assumed. Compare against the
+                // member, not a fresh w8_wide_f8_pipeline() call: that call
+                // builds the pipeline.
+                dispatch_on(sel_wide,
+                            sel_wide != nullptr &&
+                                    sel_wide == w8_wide_f8_pipeline_.get()
+                                ? w8_wide_f8_ds_[m_id_]
+                                : w8_wide_ds_[m_id_],
+                            UP_DIV(n / 16, q), batch * m);
                 return;
             case core::MatmulRoute::kKsplitWide512:
                 // fp16 WIDE (8 columns/lane) in the 512-lane build.
@@ -2791,26 +2836,74 @@ class MatMulBuffer : public BufferFactory {
     // buffer_matmul_w8_wide_fp16 loses the path while a reconverted one keeps
     // it, in the same process.
     VulkanPipeline *w8_wide_pipeline() {
-        static bool refused_by_driver = false;
-        static bool warned_missing_bytes = false;
-        if (w8_wide_pipeline_) {
-            return w8_wide_pipeline_.get();
+        return w8_wide_pipeline_impl("buffer_matmul_w8_wide_fp16", false);
+    }
+
+    // 512-lane sibling of the fp8 hardware WIDE GEMV. Opt-in route
+    // (VKOP_KSPLIT512=1) with its own archive key; nullptr leaves the caller
+    // on the 256-lane fp8 module.
+    VulkanPipeline *w8_wide512_f8_pipeline() {
+        return secondary_pipeline(4, "buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16",
+                                  w8_wide512_f8_pipeline_,
+                                  w8_wide512_f8_ds_);
+    }
+
+    // The fp8 hardware-decode sibling of the WIDE GEMV: same kernel, same
+    // push constants, same descriptors -- the only difference is -DFP8_HW in
+    // the module, which replaces the byte-to-float field reassembly with the
+    // VK_EXT_shader_float8 conversion. Measured on Ada at 896x4864, the
+    // software decode runs 7.7 GB/s against int8's 91 GB/s and this one
+    // recovers it; see tools/float8_probe and docs/vulkan-1.4-side-by-side.md.
+    //
+    // Two gates, and both must hold:
+    //   - the device enabled shader_float8 (a 1.4 loader with the extension --
+    //     see VulkanDevice::createFeatureDescriptors), and
+    //   - the archive carries the key, which CMake emits only when the build's
+    //     glslc understood GL_EXT_float_e4m3.
+    // Either missing returns nullptr and fp8 weights keep the software decode
+    // in the general module. That is a slowdown, never a wrong answer.
+    VulkanPipeline *w8_wide_f8_pipeline() {
+        if (!m_dev_->device_traits().shader_float8) {
+            return nullptr;
         }
-        if (refused_by_driver || w8_wide_no_bytes_) {
+        return w8_wide_pipeline_impl("buffer_matmul_w8_wide_fp8_hw_fp16", true);
+    }
+
+    // Shared body. `f8` selects which module slot and which "no bytes" flag to
+    // use; everything else -- descriptor layout, push constants, the driver
+    // refusal latch -- is identical, and keeping it one function is what stops
+    // the two modules from drifting apart.
+    VulkanPipeline *w8_wide_pipeline_impl(const char *key, bool f8) {
+        // Per-module latches: a driver that refuses the fp8 module must not
+        // also drop the software one, which is the whole fallback.
+        static bool refused_soft = false;
+        static bool refused_f8 = false;
+        static bool warned_missing_bytes = false;
+        bool &refused_by_driver = f8 ? refused_f8 : refused_soft;
+        std::unique_ptr<VulkanPipeline> &slot =
+            f8 ? w8_wide_f8_pipeline_ : w8_wide_pipeline_;
+        VkDescriptorSet *ds = f8 ? w8_wide_f8_ds_ : w8_wide_ds_;
+        bool &no_bytes = f8 ? w8_wide_f8_no_bytes_ : w8_wide_no_bytes_;
+        if (slot) {
+            return slot.get();
+        }
+        if (refused_by_driver || no_bytes) {
             return nullptr;
         }
         bool use_uab = update_after_bind_ &&
                        m_dev_->is_support_descriptor_update_after_bind();
         std::pair<const uint32_t *, uint32_t> wide;
         try {
-            wide = resolve_spv("buffer_matmul_w8_wide_fp16");
+            wide = resolve_spv(key);
         } catch (const std::exception &e) {
             // Thrown, not returned: resolve_spv treats a secondary it cannot
             // name as a broken model. Stay per-op and say it once -- the
             // fallback is still the right answer, and a silent 15% is the
-            // failure mode this whole probe exists to avoid.
-            w8_wide_no_bytes_ = true;
-            if (!warned_missing_bytes) {
+            // failure mode this whole probe exists to avoid. For the fp8 key
+            // "not in the archive" is the ordinary case on any build whose
+            // glslc predates GL_EXT_float_e4m3, so it must not be loud.
+            no_bytes = true;
+            if (!warned_missing_bytes && !f8) {
                 warned_missing_bytes = true;
                 std::fprintf(stderr,
                              "[vkop] %s\n[vkop] byte-weight decode GEMVs use "
@@ -2820,7 +2913,7 @@ class MatMulBuffer : public BufferFactory {
             return nullptr;
         }
         try {
-            w8_wide_pipeline_ = std::make_unique<VulkanPipeline>(
+            slot = std::make_unique<VulkanPipeline>(
                 m_dev_->getLogicalDevice(),
                 std::vector<VkDescriptorType>{
                     DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE,
@@ -2829,21 +2922,21 @@ class MatMulBuffer : public BufferFactory {
                     DESCRIPTOR_TYPE_STORAGE},
                 sizeof(matmul::GpuMatMulParam), wide.first,
                 static_cast<int>(wide.second), use_uab, 0);
-            for (auto &ds : w8_wide_ds_) {
-                ds = w8_wide_pipeline_->allocDescriptorSets();
+            for (int i = 0; i < vkop::kInflight; i++) {
+                ds[i] = slot->allocDescriptorSets();
             }
         } catch (const std::exception &e) {
             // Loud: the fallback computes the right answer more slowly, so
             // nothing else would ever report that this device lost the path.
             refused_by_driver = true;
-            w8_wide_pipeline_.reset();
+            slot.reset();
             std::fprintf(stderr,
-                         "[vkop] int8/fp8 WIDE GEMV pipeline rejected (%s); "
-                         "byte-weight decode GEMVs use the 4-column kernel\n",
-                         e.what());
+                         "[vkop] %s pipeline rejected (%s); byte-weight decode "
+                         "GEMVs use the 4-column kernel\n",
+                         key, e.what());
             return nullptr;
         }
-        return w8_wide_pipeline_.get();
+        return slot.get();
     }
 
     // The SwiGLU down-projection fold (buffer_matmul_down_act_fp16). Nine
@@ -2940,9 +3033,11 @@ class MatMulBuffer : public BufferFactory {
     VulkanPipeline *secondary_pipeline(int id, const char *key,
                                        std::unique_ptr<VulkanPipeline> &slot,
                                        VkDescriptorSet *ds_slot) {
-        static bool no_bytes[4] = {false, false, false, false};
-        static bool refused[4] = {false, false, false, false};
-        static bool warned_missing[4] = {false, false, false, false};
+        // Slots: 0 ksplit512, 1 ksplit512+W8_WIDE, 2 tiled_ks_split,
+        // 3 tiled_ks_fold, 4 ksplit512+W8_WIDE+FP8_HW.
+        static bool no_bytes[5] = {false, false, false, false, false};
+        static bool refused[5] = {false, false, false, false, false};
+        static bool warned_missing[5] = {false, false, false, false, false};
         if (slot) {
             return slot.get();
         }
@@ -3201,6 +3296,15 @@ class MatMulBuffer : public BufferFactory {
     // w8_wide_pipeline.
     std::unique_ptr<VulkanPipeline> w8_wide_pipeline_;
     VkDescriptorSet w8_wide_ds_[vkop::kInflight] = {nullptr};
+    // The fp8 hardware-decode WIDE GEMV (-DFP8_HW + VK_EXT_shader_float8).
+    // Separate module, separate descriptors, separate "no bytes" latch: a
+    // model converted before the key existed keeps the software decode while a
+    // reconverted one gets the hardware path, in the same process.
+    std::unique_ptr<VulkanPipeline> w8_wide_f8_pipeline_;
+    VkDescriptorSet w8_wide_f8_ds_[vkop::kInflight] = {nullptr};
+    // 512-lane fp8 hardware WIDE GEMV (opt-in VKOP_KSPLIT512 route).
+    std::unique_ptr<VulkanPipeline> w8_wide512_f8_pipeline_;
+    VkDescriptorSet w8_wide512_f8_ds_[vkop::kInflight] = {nullptr};
     // The 512-lane split-K modules (VKOP_KSPLIT512=1), probed through
     // secondary_pipeline(): the ksplit-only general module and the int8 WIDE
     // module, both -DKSPLIT512 builds of shaders/buffer/matmul.comp.
@@ -3230,6 +3334,9 @@ class MatMulBuffer : public BufferFactory {
     // This op's archive supplies no bytes for the WIDE key, so it stays on the
     // 4-column kernel; another MatMul from a reconverted model still tries.
     bool w8_wide_no_bytes_ = false;
+    // Same latch for the fp8 hardware WIDE key. Absent is the expected state
+    // on any build whose glslc predates GL_EXT_float_e4m3, so it never warns.
+    bool w8_wide_f8_no_bytes_ = false;
     // The SwiGLU down-projection fold module (see down_act_pipeline). The
     // converter's "down_act" attribute (an ints list, [1]) marks a MatMul whose
     // inputs are [x, Wd, Wg, Wu] and whose result is
@@ -3286,6 +3393,10 @@ class MatMulBuffer : public BufferFactory {
         bool tried = false;
     };
     BdaVariant w8_wide_bda_;
+    // BDA + hardware fp8 decode. Separate variant because the pipeline is a
+    // distinct module; without it the BDA path would silently run the software
+    // decode while the descriptor path used the hardware conversion.
+    BdaVariant w8_wide_bda_f8_;
     BdaVariant ks512_bda_;
     BdaVariant ks512_w8_bda_;
     BdaVariant ks_split_bda_;

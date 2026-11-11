@@ -106,6 +106,14 @@ struct ShaderCapabilities {
     // host-visible descriptor buffer instead of pools/sets when this is
     // enabled.
     DeviceCap descriptor_buffer;
+    // VK_EXT_shader_float8 (NOT core in 1.4 -- it stays an extension, so a 1.4
+    // core feature struct never carries it and the header guard has to stay).
+    // shader_float8 enables OpTypeFloat 8 plus the float<->fp8 conversion
+    // instructions; shader_float8_coopmat additionally allows E4M3/E5M2
+    // operands in a cooperative matrix. They are separate bits because a
+    // device can decode fp8 without an fp8 MMA.
+    DeviceCap shader_float8;
+    DeviceCap shader_float8_coopmat;
 };
 
 // Device-scoped VK_EXT_descriptor_buffer state, resolved once in the

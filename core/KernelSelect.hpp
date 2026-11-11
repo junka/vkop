@@ -82,6 +82,14 @@ struct DeviceTraits {
     bool subgroup_rotate = false;
     bool wmem_explicit_layout = false;
     bool zero_init_wmem = false;
+    // VK_EXT_shader_float8: `shader_float8` turns the fp8 weight decode in
+    // matmul.comp from a bits reassembly into one hardware conversion, which
+    // needs its own module (OpCapability Float8EXT is module-wide, so a device
+    // without the extension rejects the whole module at pipeline creation).
+    // `shader_float8_coopmat` is the fp8 MMA half and is tracked separately --
+    // a device may decode fp8 without an fp8 cooperative matrix.
+    bool shader_float8 = false;
+    bool shader_float8_coopmat = false;
 };
 
 // Coarse device classes the tables key on. Keep this list about *behaviour*,

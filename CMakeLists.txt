@@ -119,6 +119,13 @@ if(APPLE AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
 endif()
 endif()
 
+# VK_EXT_shader_float8 support: the fp8 weight kernels can decode bytes with
+# the hardware conversion instead of reassembling the fields by hand, but only
+# on a device that exposes the extension AND with a shader compiler that knows
+# GL_EXT_float_e4m3. ON builds the modules whenever this glslc can; the runtime
+# gate still decides per device. See docs/vulkan-1.4-side-by-side.md.
+option(VKOP_ENABLE_FLOAT8 "Build the VK_EXT_shader_float8 fp8 decode modules" ON)
+
 if(DEFINED ENV{VULKAN_SDK})
     set(VULKAN_SDK_PATH $ENV{VULKAN_SDK})
     message(STATUS "VULKAN_SDK env var found: ${VULKAN_SDK_PATH}")
@@ -352,6 +359,68 @@ add_custom_command(
 )
 list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_W8WIDE})
 
+# The fp8 hardware-decode module (-DFP8_HW on buffer/matmul.comp). Compiled
+# ONLY when this glslc can emit GL_EXT_float_e4m3, because the shader requires
+# that extension and an older shaderc rejects the source outright. This is the
+# shader-compiler half of the VK_EXT_shader_float8 story; the device half is a
+# separate runtime gate in VulkanDevice::createFeatureDescriptors, and the two
+# must agree -- the host builds the pipeline only when both are present.
+#
+# The probe writes an empty .comp that requires the extension and checks
+# whether a .spv came out: glslc exits 0 even on a compile error (measured on
+# shaderc 2023.8), so the exit code cannot be the signal.
+set(VKOP_GLSLC_HAS_FLOAT8 FALSE)
+if(VKOP_ENABLE_FLOAT8)
+    set(_f8_probe_src ${CMAKE_CURRENT_BINARY_DIR}/glslc_float8_probe.comp)
+    set(_f8_probe_out ${CMAKE_CURRENT_BINARY_DIR}/glslc_float8_probe.spv)
+    file(WRITE ${_f8_probe_src}
+        "#version 460\n"
+        "#extension GL_EXT_float_e4m3 : require\n"
+        "layout(local_size_x = 32) in;\n"
+        "void main() {}\n")
+    file(REMOVE ${_f8_probe_out})
+    execute_process(
+        COMMAND ${GLSLC_EXECUTABLE} -c ${_f8_probe_src}
+                -fshader-stage=compute -o ${_f8_probe_out}
+        OUTPUT_QUIET ERROR_QUIET)
+    if(EXISTS ${_f8_probe_out})
+        set(VKOP_GLSLC_HAS_FLOAT8 TRUE)
+        message(STATUS "glslc accepts GL_EXT_float_e4m3: building the fp8 hardware-decode module")
+    else()
+        message(STATUS "glslc rejects GL_EXT_float_e4m3 (shaderc too old): "
+                       "the fp8 hardware-decode module is NOT built; fp8 weights "
+                       "keep the software decode. Use a Vulkan SDK >= 1.4.321.")
+    endif()
+endif()
+
+if(VKOP_GLSLC_HAS_FLOAT8)
+    # Two builds, one per entry point the host can select: the general fp16
+    # module and the WIDE GEMV one. Same -DW8_WIDE split as the software
+    # modules above, so the hardware decode reaches the path that actually runs
+    # at decode time (ksplit_w8wide) and not just the fallback.
+    set(SPIRV_FILE_F8 ${SPIRV_DIR}/buffer_matmul_fp8_hw_fp16.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_F8}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_F8} -DFP16 -DFP8_HW
+        DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling buffer/matmul (fp8 hardware decode, fp16) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_F8})
+
+    set(SPIRV_FILE_F8_WIDE ${SPIRV_DIR}/buffer_matmul_w8_wide_fp8_hw_fp16.spv)
+    add_custom_command(
+        OUTPUT ${SPIRV_FILE_F8_WIDE}
+        COMMAND ${GLSLC_EXECUTABLE} -c ${SHADER_DIR}/buffer/matmul.comp
+                -fshader-stage=compute -g --target-spv=spv1.3
+                -o ${SPIRV_FILE_F8_WIDE} -DFP16 -DW8_WIDE -DFP8_HW
+        DEPENDS ${SHADER_DIR}/buffer/matmul.comp ${SHADER_INCLUDES}
+        COMMENT "Compiling buffer/matmul (fp8 hardware decode, WIDE, fp16) to SPIR-V"
+    )
+    list(APPEND SPIRV_OUTPUTS ${SPIRV_FILE_F8_WIDE})
+endif()
+
 # Two 512-lane split-K builds of buffer/matmul.comp (VKOP_KSPLIT512=1 host
 # switch): the ksplit-only general module and the int8 WIDE module. Same source
 # and push constants as the 256-lane builds; only local_size (32x16), the
@@ -570,6 +639,23 @@ vkop_shader_variant(buffer_matmul_tiled_ks_split_bda_fp16 buffer/matmul
                     -DFP16 -DTILED_KS_SPLIT -DBDA)
 vkop_shader_variant(buffer_matmul_tiled_ks_fold_bda_fp16 buffer/matmul
                     -DFP16 -DTILED_KS_FOLD -DBDA)
+# The fp8 hardware-decode WIDE GEMV with BDA addressing. Without this key the
+# BDA path keeps the software decode: the descriptor-buffer module is a
+# different archive entry, so enabling BDA alone would silently drop the
+# hardware conversion (measured: 113.8 -> 35.6 GB/s on Ada). Only defined when
+# this glslc can compile the fp8 source at all.
+if(VKOP_GLSLC_HAS_FLOAT8)
+    vkop_shader_variant(buffer_matmul_w8_wide_bda_fp8_hw_fp16 buffer/matmul
+                        -DFP16 -DW8_WIDE -DBDA -DFP8_HW)
+    # 512-lane WIDE, with and without BDA. Same reasoning: these routes are
+    # opt-in (VKOP_KSPLIT512=1) but must not silently fall back to the software
+    # decode once enabled.
+    vkop_shader_variant(buffer_matmul_ksplit512_w8_wide_fp8_hw_fp16
+                        buffer/matmul -DFP16 -DW8_WIDE -DKSPLIT512 -DFP8_HW)
+    vkop_shader_variant(buffer_matmul_ksplit512_w8_wide_bda_fp8_hw_fp16
+                        buffer/matmul
+                        -DFP16 -DW8_WIDE -DKSPLIT512 -DBDA -DFP8_HW)
+endif()
 # Pack pass: two direct addresses fit in the PC, so no table is needed.
 vkop_shader_variant(buffer_matmul_pack_bda buffer/matmul_pack -DBDA)
 # Primary coop pipelines: one table descriptor, same 128 B PC.
@@ -809,6 +895,15 @@ list(APPEND ARCHIVE_ARGS
      --spv buffer_matmul_ksplit512_fp16:${SPIRV_FILE_KS512}
      --spv buffer_matmul_ksplit512_w8_wide_fp16:${SPIRV_FILE_KS512_W8WIDE})
 list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_KS512} ${SPIRV_FILE_KS512_W8WIDE})
+# The fp8 hardware-decode modules, when this glslc could build them. Absent
+# keys are the normal state on an old shaderc, and the host falls back to the
+# software decode (MatMulBuffer::f8_hw_pipeline resolves to nullptr).
+if(VKOP_GLSLC_HAS_FLOAT8)
+    list(APPEND ARCHIVE_ARGS
+         --spv buffer_matmul_fp8_hw_fp16:${SPIRV_FILE_F8}
+         --spv buffer_matmul_w8_wide_fp8_hw_fp16:${SPIRV_FILE_F8_WIDE})
+    list(APPEND ARCHIVE_DEPS ${SPIRV_FILE_F8} ${SPIRV_FILE_F8_WIDE})
+endif()
 # And the two tile-split-K modules above: same .comp, two defines, so the
 # SHADER_FILES loop cannot name them either.
 list(APPEND ARCHIVE_ARGS

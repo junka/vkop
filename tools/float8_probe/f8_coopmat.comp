@@ -1,0 +1,32 @@
+// VK_EXT_shader_float8 + VK_KHR_cooperative_matrix: one E4M3 x E4M3 -> FP32
+// MMA. This is the path that actually needs Float8CooperativeMatrixEXT; a
+// device can expose Float8EXT (storage) and still reject this one, so the
+// probe tests the two separately.
+//
+// Fixed geometry: A is 16x32, B is 32x16, C is 16x16, all row-major and
+// subgroup-scope. 16x16x32 E4M3 is the shape Ada's
+// VkCooperativeMatrixPropertiesKHR lists.
+#version 460
+#extension GL_KHR_cooperative_matrix : require
+#extension GL_KHR_memory_scope_semantics : require
+#extension GL_EXT_float_e4m3 : require
+
+layout(local_size_x = 32) in;
+
+layout(std430, binding = 0) buffer A { floate4m3_t a[]; };
+layout(std430, binding = 1) buffer B { floate4m3_t b[]; };
+layout(std430, binding = 2) buffer C { float c[]; };
+
+void main() {
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 16, 32, gl_MatrixUseA> matA;
+    coopmat<floate4m3_t, gl_ScopeSubgroup, 32, 16, gl_MatrixUseB> matB;
+    // The K extent is inferred from matA/matB by coopMatMulAdd; the
+    // declaration only carries rows/cols/use (5 type parameters).
+    coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator> matC =
+        coopmat<float, gl_ScopeSubgroup, 16, 16, gl_MatrixUseAccumulator>(0.0);
+
+    coopMatLoad(matA, a, 0, 32, gl_CooperativeMatrixLayoutRowMajor);
+    coopMatLoad(matB, b, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+    matC = coopMatMulAdd(matA, matB, matC);
+    coopMatStore(matC, c, 0, 16, gl_CooperativeMatrixLayoutRowMajor);
+}

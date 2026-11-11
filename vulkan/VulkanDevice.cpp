@@ -1320,6 +1320,62 @@ std::vector<FeatureDescriptor> VulkanDevice::createFeatureDescriptors(
     }
 #endif
 
+#ifdef VK_EXT_shader_float8
+    // VK_EXT_shader_float8 stays an EXTENSION in Vulkan 1.4: it is not one of
+    // the features promoted into VkPhysicalDeviceVulkan14Features, so there is
+    // no core branch to prefer and no api_version test to make. It is gated on
+    // the header (the 1.3.275 headers this tree used to build against have no
+    // VkPhysicalDeviceShaderFloat8FeaturesEXT at all) and on the extension
+    // being advertised by the driver.
+    //
+    // Enabling it lets an fp8 weight kernel use OpTypeFloat 8 and the hardware
+    // float<->fp8 conversions instead of reassembling the exponent/mantissa by
+    // hand. The kernel that does so is a SEPARATE module (-DFP8_HW on
+    // buffer/matmul.comp): Float8EXT is a module-wide capability, so a device
+    // without the extension rejects the entire module rather than falling back
+    // to the software decode.
+    if (supportedExtensions.count(VK_EXT_SHADER_FLOAT8_EXTENSION_NAME) > 0) {
+        shader_caps_.shader_float8.available = true;
+        shader_caps_.shader_float8_coopmat.available = true;
+        descs.push_back(FeatureDescriptor{
+            .sType =
+                VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT,
+            .extensionName = VK_EXT_SHADER_FLOAT8_EXTENSION_NAME,
+            .corePromotedVersion = 0,
+            .makeQueryStruct = [this]() -> std::shared_ptr<void> {
+                auto q =
+                    std::make_unique<VkPhysicalDeviceShaderFloat8FeaturesEXT>();
+                *q = makeFeatureStruct<
+                    VkPhysicalDeviceShaderFloat8FeaturesEXT,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT>();
+                return std::shared_ptr<void>(std::move(q));
+            },
+            .makeEnableStruct = [this](void *q) -> std::shared_ptr<void> {
+                auto *feat =
+                    static_cast<VkPhysicalDeviceShaderFloat8FeaturesEXT *>(q);
+                recordCap(shader_caps_.shader_float8, feat->shaderFloat8);
+                recordCap(shader_caps_.shader_float8_coopmat,
+                          feat->shaderFloat8CooperativeMatrix);
+                if (!feat->shaderFloat8 &&
+                    !feat->shaderFloat8CooperativeMatrix) {
+                    return nullptr;
+                }
+                auto e =
+                    std::make_unique<VkPhysicalDeviceShaderFloat8FeaturesEXT>();
+                *e = makeFeatureStruct<
+                    VkPhysicalDeviceShaderFloat8FeaturesEXT,
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT8_FEATURES_EXT>();
+                e->shaderFloat8 = feat->shaderFloat8;
+                // Only ask for the MMA half when the device reports it: it is
+                // invalid to enable a cooperative-matrix fp8 bit whose feature
+                // is false, and no kernel uses it yet.
+                e->shaderFloat8CooperativeMatrix =
+                    feat->shaderFloat8CooperativeMatrix;
+                return std::shared_ptr<void>(std::move(e));
+            }});
+    }
+#endif
+
 #ifdef VK_EXT_image_robustness
     if (api_version < VK_API_VERSION_1_3 &&
         supportedExtensions.count(VK_EXT_IMAGE_ROBUSTNESS_EXTENSION_NAME) > 0) {
@@ -1906,6 +1962,8 @@ void VulkanDevice::dumpShaderCapabilities() const {
     pr("descriptor_indexing", c.descriptor_indexing);
     pr("descriptor_partially_bound", c.descriptor_partially_bound);
     pr("descriptor_buffer", c.descriptor_buffer);
+    pr("shader_float8", c.shader_float8);
+    pr("shader_float8_coopmat", c.shader_float8_coopmat);
     std::fflush(stderr);
 }
 
