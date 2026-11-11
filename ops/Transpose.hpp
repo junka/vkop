@@ -139,6 +139,25 @@ class TransposeBuffer : public BufferFactory {
     }
     bool has_host_side_effects() const override { return true; }
 
+    // The output SHAPE is recomputed every round from the input's, and
+    // execute() applies it with output->resize(outshape). A replay skips that,
+    // so the output would keep the previous round's dims while the recorded
+    // dispatch writes the new ones — measured on the Qwen3-VL shape-meta chain:
+    // /mrope_static/Transpose goes (3,1,7) -> (3,1,1) at prefill->decode, and
+    // without this report its level looked static and replayed, leaving the
+    // downstream Where/Expand reading a stale rank.
+    //
+    // This is orthogonal to has_host_side_effects(): the fp16/int8 paths do
+    // their work on the GPU, but the SHAPE they publish is host metadata.
+    bool recording_changes_per_round() const override {
+        return transpose_shape_changed_;
+    }
+    // Kept conservative for the type question: the fp16 paths do no host data
+    // work, so a segment may replay them once the shape is stable.
+    bool did_host_work_last_round() const override {
+        return host_work_last_round_;
+    }
+
   private:
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
@@ -156,6 +175,12 @@ class TransposeBuffer : public BufferFactory {
         for (int i = 0; i < rank; ++i) {
             outshape[i] = inshape[perm_[i]];
         }
+        // Does this round publish a different output shape than the previous
+        // one? That is what makes a recorded dispatch unsafe to reuse (see the
+        // declaration above); it does not mean the op did host DATA work.
+        transpose_shape_changed_ =
+            outshape != last_outshape_ || rank != (int)last_outshape_.size();
+        last_outshape_ = outshape;
 
         // Fail closed on a <= 1-byte payload: no byte build in this mover (an
         // fp8/int8/bool transpose would mis-gather 4-per-word). int64 takes the
@@ -289,6 +314,14 @@ class TransposeBuffer : public BufferFactory {
     }
 
     std::vector<int> perm_ = {3, 2, 1, 0};
+    // The previous round's output shape. recording_changes_per_round() reports
+    // whether it moved, which is what makes a recorded dispatch reusable.
+    std::vector<int> last_outshape_;
+    bool transpose_shape_changed_ = true;
+    void invalidate_shape_cache() override {
+        last_outshape_.clear();
+        transpose_shape_changed_ = true;
+    }
 };
 
 // PIMPL façade: buffer SSBO impl when backend_buffer is set, else image.

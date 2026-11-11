@@ -490,7 +490,11 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("Relu", "buffer"): ["buffer_relu_bda", "buffer_relu_bda_fp16"],
     ("Floor", "buffer"): ["buffer_floor_bda", "buffer_floor_bda_fp16"],
     # Cast's single module handles both directions, so only the fp32 key.
-    ("Cast", "buffer"): ["buffer_cast_bda"],
+    ("Cast", "buffer"): [
+        "buffer_cast_int64",
+        "buffer_cast_int64_bda",
+        "buffer_cast_bda",
+    ],
     # QuantizeLinear/DequantizeLinear share one format-polymorphic module.
     ("QuantizeLinear", "buffer"): ["buffer_quantize_linear_bda"],
     ("DequantizeLinear", "buffer"): ["buffer_quantize_linear_bda"],

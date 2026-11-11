@@ -103,10 +103,7 @@ class Where : public Operator {
         }
     }
 
-    // Phase-boundary reset: kept as a no-op override (the int64 path is now
-    // GPU-driven and reads no host data, so there is no readback cache to
-    // reset). The runtime calls this at phase boundaries unconditionally.
-    void invalidate_shape_cache() override {}
+    // Phase-boundary reset (defined below, with the replay cache it clears).
     bool has_host_side_effects() const override { return true; }
 
   private:
@@ -143,6 +140,52 @@ class Where : public Operator {
         objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
         output->copyToGPUDeferred(m_cmd_);
         output->set_host_authoritative();
+        where_result_changed_ =
+            (out != cached_w_out_) || (out_shape != cached_w_shape_);
+        cached_w_out_ = out;
+        cached_w_shape_ = out_shape;
+    }
+
+    // Replay answers: the host select is real work, but its result repeats
+    // (probed round by round: identical checksum on every decode round). The
+    // recording is self-contained, so a repeat makes it still exactly right;
+    // refresh_dynamic_params() redoes the host-visible half a replay skips.
+    bool where_result_changed_ = true;
+    std::vector<int64_t> cached_w_out_;
+    std::vector<int> cached_w_shape_;
+    void invalidate_shape_cache() override {
+        cached_w_out_.clear();
+        cached_w_shape_.clear();
+        where_result_changed_ = true;
+    }
+    bool recording_changes_per_round() const override {
+        return where_result_changed_;
+    }
+    bool did_host_work_last_round() const override {
+        return where_result_changed_;
+    }
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (cached_w_out_.empty() || outputs.empty() || !outputs[0]) {
+            return false;
+        }
+        if (outputs[0]->dtype() != typeid(int64_t)) return false;
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (!output) return false;
+        if (output->getShape() != cached_w_shape_) {
+            output->resize(cached_w_shape_);
+        }
+        output->fillToCPU(cached_w_out_);
+        output->toGPU(); // mirror copyToGPUDeferred's converted_ = true
+        output->set_host_authoritative();
+        if (std::getenv("VKOP_REF_CMP")) {
+            fprintf(stderr,
+                    "[ref-cmp] Where refresh: auth=%d n=%zu shape0=%d\n",
+                    (int)output->get_host_authoritative(), cached_w_out_.size(),
+                    cached_w_shape_.empty() ? -1 : cached_w_shape_[0]);
+        }
+        return true;
     }
 
     void execute(

@@ -106,7 +106,27 @@ class NonZero : public BufferFactory {
             output->resize(cached_out_shape_);
         }
         output->fillToCPU(cached_out_);
+        // Mirror execute()'s tail exactly: it ends with copyToGPUDeferred(),
+        // which marks the tensor device-resident. Skipping that here leaves
+        // converted_ false on a replayed segment while the buffer genuinely
+        // holds the bytes, and a downstream op that consults is_on_GPU() then
+        // takes the CPU path.
+        output->toGPU();
         if (host_shape_enabled()) output->set_host_authoritative();
+        if (std::getenv("VKOP_REF_CMP")) {
+            auto r = output->gpu_buffer();
+            fprintf(stderr,
+                    "[ref-cmp] op=%s refresh: shape=%zu/%zu data=%zu gpu=%d "
+                    "auth=%d conv=%d hostcopy=%d\n",
+                    get_name().c_str(), output->getShape().size(),
+                    cached_out_shape_.size(),
+                    output->getShape().empty()
+                        ? 0
+                        : (size_t)output->getShape().back(),
+                    r ? 1 : 0, (int)output->get_host_authoritative(),
+                    (int)output->is_on_GPU(),
+                    (int)output->get_host_copy_valid());
+        }
         return true;
     }
 

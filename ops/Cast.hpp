@@ -27,6 +27,18 @@ struct alignas(16) CastBdaPC {
 static_assert(offsetof(CastBdaPC, out_addr) == 16, "CastBdaPC drift");
 static_assert(offsetof(CastBdaPC, in_addr) == 24, "CastBdaPC drift");
 static_assert(sizeof(CastBdaPC) <= 128, "CastBdaPC PC overflow");
+
+// int64 -> fp32 (buffer/cast_int64.comp). Same 16-byte scalar prefix as
+// CastPC; the two buffers are out (float) then in (int64 as ivec2). Needs the
+// shaderInt64 device feature — this is the only int64 kernel that does 64-bit
+// ARITHMETIC rather than moving the bytes.
+struct alignas(16) CastInt64PC {
+    int total;
+    int _pad0;
+    int _pad1;
+    int _pad2;
+};
+static_assert(sizeof(CastInt64PC) == 16, "CastInt64PC drift");
 } // namespace cast
 
 // SSBO-only op: ONNX Cast (fp32 <-> fp16). The model has 227 Cast nodes
@@ -42,31 +54,13 @@ class Cast : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(cast::CastPC)) {}
 
-    // The int64->fp32 Cast reads back position-id data every round. In decode,
-    // position_ids = [v,v,v] where v = past_len + rope_delta, growing by +1
-    // each round (past_len increments exactly one KV slot per decode step).
-    // LINEAR_GROW predicts v+1 and skips the readback permanently — there is
-    // NO periodic verify. Rationale: the +1 growth is a structural property
-    // of the decode loop (the driver sets position_ids = past_len+rope_delta
-    // and past_len grows by exactly 1/round), so a verify would never observe
-    // drift. The only point where the pattern legitimately changes is a phase
-    // boundary, which resets the state via invalidate_shape_cache() (called by
-    // Runtime::invalidate_replay at prefill->decode and at every new prompt).
-    // STABLE handles the case where the value is constant.
-    enum class LearnState {
-        LEARNING,
-        CONFIRMING,
-        STABLE,
-        DYNAMIC,
-        LINEAR_GROW
-    };
-    LearnState cast_state_ = LearnState::LEARNING;
-    std::vector<int64_t> cached_in_;
-
-    void invalidate_shape_cache() override {
-        cast_state_ = LearnState::LEARNING;
-        cached_in_.clear();
-    }
+    // The int64->fp32 Cast used to read position-id data back to the host every
+    // round and convert it in a C++ loop, with a "+1 prediction" shortcut
+    // (LINEAR_GROW) that guessed next round's value instead of reading it.
+    // Both are gone: with shaderInt64 enabled the conversion runs in
+    // buffer/cast_int64.comp, so it is a plain dispatch and the level replays.
+    // The CPU fallback below remains for a device without the feature, and it
+    // no longer predicts anything — a prediction cannot survive a replay.
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -75,22 +69,73 @@ class Cast : public BufferFactory {
         }
     }
     bool has_host_side_effects() const override { return true; }
+    // The only host work left on this path is the CPU fallback's readback, and
+    // that path is taken only when the device lacks shaderInt64 (or for the
+    // fp32<->fp16 dispatches, which do none). Reported per instance so a
+    // replayable GPU round does not look dynamic.
+    bool did_host_work_last_round() const override {
+        return host_work_observed_ ? host_work_last_round_ : false;
+    }
 
   private:
     bool supports_bda_variant() const override { return true; }
     size_t bda_pc_size() const override { return sizeof(cast::CastBdaPC); }
     bool bda_variant_ignores_fp16() const override { return true; }
 
+    // int64-data pipeline (buffer/cast_int64). Built lazily on the first int64
+    // execute; same 2× STORAGE layout as the base module, so it reuses types_.
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_) return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        auto i64 = resolve_spv("buffer_cast_int64");
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, sizeof(cast::CastInt64PC),
+            i64.first, i64.second, use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+        build_bda_table_module("buffer_cast_int64_bda",
+                               sizeof(cast::CastInt64PC), 2, bda_i64_);
+    }
+    // Route the dispatch through the int64 pipeline while int64_mode_ is set.
+    void submit(void *ptr, int width, int height, int layers) override {
+        if (!int64_mode_) {
+            Operator::submit(ptr, width, height, layers);
+            return;
+        }
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
+            return;
+        }
+        if (!m_ds_int64_[m_id_]) {
+            m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+        pipeline_int64_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(
+                *pipeline_int64_,
+                static_cast<uint32_t>(sizeof(cast::CastInt64PC)), ptr);
+        }
+        m_cmd_->dispatch(width, height, layers);
+        if (replay_enabled_) {
+            record_fingerprint(ptr, width, height, layers);
+        }
+    }
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    std::array<VkDescriptorSet, vkop::kInflight> m_ds_int64_{};
+    BdaTableModule bda_i64_;
+    bool int64_mode_ = false;
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Host work here is the int64->fp32 host cast's readback (the rotary
-        // position-id chain; the LINEAR_GROW fast path skips it, everything
-        // else pays it). The fp32<->fp16 paths are pure GPU dispatches.
-        set_did_host_work_last_round(
-            inputs[0]->dtype() == typeid(int64_t) &&
-            outputs[0]->dtype() == typeid(float) &&
-            cast_state_ != LearnState::LINEAR_GROW);
+        // Host work here is the int64->fp32 CPU fallback's readback, taken only
+        // on a device without shaderInt64; every other path (including the
+        // shaderInt64 int64 cast) is a pure dispatch. The instance answer is
+        // refined further down by the branch that actually runs.
+        set_did_host_work_last_round(false);
         auto shape = inputs[0]->getShape();
         int total = total_elems(shape);
 
@@ -113,91 +158,57 @@ class Cast : public BufferFactory {
                 "); only FLOAT and FLOAT16 are supported");
         }
 
-        // int64 -> fp32 cast (the rotary position-id Cast). int64 tensors are
-        // CPU-resident during recording (shape-meta domain), so cast on the
-        // host: read the int64 input, write fp32 values, resize + re-upload.
-        // The buffer_cast shader only handles fp32<->fp16, not int64.
+        // int64 -> fp32 cast (the rotary position-id Cast).
+        //
+        // Two implementations, and the choice is a DEVICE capability:
+        //  - shaderInt64 enabled: the shader recombines each ivec2 into a real
+        //    64-bit value and converts. Pure dispatch, no host work, so the
+        //    level replays like any other.
+        //  - otherwise: the CPU path below (readback, convert, re-upload).
+        //    It is real host work every round, and there is no way to make a
+        //    replay reproduce it — the +1 "prediction" this branch used to
+        //    carry was exactly that mistake: it skipped the readback, so a
+        //    replay froze the value at the last recorded round (measured: the
+        //    Cast output stuck at round 3 while position_ids kept advancing).
         if (inputs[0]->dtype() == typeid(int64_t) &&
             outputs[0]->dtype() == typeid(float)) {
-            // LINEAR_GROW fast path: predict each element +1, skip readback.
-            // Trusted unconditionally within a phase: the +1 growth is a
-            // structural property of the decode loop, and a phase boundary
-            // (where the pattern changes) resets cast_state_ via
-            // invalidate_shape_cache(). No periodic verify readback.
-            if (cast_state_ == LearnState::LINEAR_GROW) {
-                std::vector<int64_t> predicted = cached_in_;
-                for (auto &v : predicted)
-                    v += 1;
-                cached_in_ = predicted;
-                std::vector<float> out(total);
-                for (int i = 0; i < total && i < (int)predicted.size(); ++i)
-                    out[i] = static_cast<float>(predicted[i]);
-                auto output = core::as_tensor<float>(outputs[0]);
-                output->resize(shape);
-                output->fillToCPU(out);
-                objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
-                output->copyToGPUDeferred(m_cmd_);
+            if (m_dev_ && m_dev_->is_support_shader_int64()) {
+                ensure_int64_pipeline();
+                int64_mode_ = true;
+                cast::CastInt64PC pc{};
+                pc.total = total;
+                // out (fp32) then in (int64 as ivec2) — same binding order as
+                // every other int64 twin.
+                dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
+                    using T = decltype(dummy);
+                    auto output = core::as_tensor<T>(outputs[0]);
+                    if (output->num_elements() != total_elems(shape)) {
+                        output->resize(shape);
+                    }
+                    objs_.emplace_back(
+                        output->as_storage_buffer(m_dev_, m_cmd_));
+                });
+                auto src = core::as_tensor<int64_t>(inputs[0]);
+                objs_.emplace_back(src->as_storage_buffer(m_dev_, nullptr));
+                submit(&pc, UP_DIV(total, 256), 1, 1);
+                // The shader writes the output; flush it so the next level's
+                // reader sees the values (same pattern as Equal's int64 path).
+                auto out_buf =
+                    std::dynamic_pointer_cast<VulkanBuffer>(objs_[0]);
+                if (out_buf) {
+                    out_buf->shaderWriteBarrier(m_cmd_->get(),
+                                                (VkDeviceSize)total_elems(shape) *
+                                                    sizeof(float));
+                }
                 return;
             }
-
+            // CPU fallback: read back, convert on the host, re-upload.
+            // No +1 prediction here — it cannot survive a replay.
             auto src = core::as_tensor<int64_t>(inputs[0]);
             // Unconditional readback: a cross-round-recycled GPU input may
             // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
             src->copyToCPU(m_cmdpool_);
             int src_avail = src->num_elements();
-            std::vector<int64_t> in_vec(src_avail); // capture for state machine
-            for (int i = 0; i < src_avail; ++i)
-                in_vec[i] = (*src)[i];
-
-            // Advance the learn state machine. Detect uniform +1 growth across
-            // all elements (the position-id pattern).
-            auto all_plus_one = [](const std::vector<int64_t> &prev,
-                                   const std::vector<int64_t> &cur) {
-                if (prev.size() != cur.size() || prev.empty())
-                    return false;
-                for (size_t i = 0; i < prev.size(); ++i)
-                    if (cur[i] != prev[i] + 1)
-                        return false;
-                return true;
-            };
-            if (cast_state_ == LearnState::LEARNING) {
-                cached_in_ = in_vec;
-                cast_state_ = LearnState::CONFIRMING;
-            } else if (cast_state_ == LearnState::CONFIRMING) {
-                if (in_vec == cached_in_) {
-                    cast_state_ = LearnState::STABLE;
-                } else if (all_plus_one(cached_in_, in_vec)) {
-                    cast_state_ = LearnState::LINEAR_GROW;
-                    cached_in_ = in_vec;
-                } else {
-                    cast_state_ = LearnState::DYNAMIC;
-                    cached_in_ = in_vec;
-                }
-            } else if (cast_state_ == LearnState::LINEAR_GROW) {
-                // Unreachable in steady state: the LINEAR_GROW fast path
-                // returns before the readback. A phase boundary resets via
-                // invalidate_shape_cache(); there is no verify round to land
-                // here. If reached, re-evaluate the pattern defensively.
-                if (all_plus_one(cached_in_, in_vec)) {
-                    cached_in_ = in_vec;
-                } else {
-                    cast_state_ = LearnState::DYNAMIC;
-                    cached_in_ = in_vec;
-                }
-            } else if (cast_state_ == LearnState::STABLE) {
-                if (in_vec != cached_in_) {
-                    if (all_plus_one(cached_in_, in_vec)) {
-                        cast_state_ = LearnState::LINEAR_GROW;
-                        cached_in_ = in_vec;
-                    } else {
-                        cast_state_ = LearnState::DYNAMIC;
-                        cached_in_ = in_vec;
-                    }
-                }
-            } else { // DYNAMIC
-                cached_in_ = in_vec;
-            }
-
             std::vector<float> out(total);
             for (int i = 0; i < total && i < src_avail; ++i) {
                 out[i] = static_cast<float>((*src)[i]);

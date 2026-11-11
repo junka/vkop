@@ -1933,6 +1933,19 @@ bool VulkanDevice::createLogicalDevice(
     VkPhysicalDeviceFeatures device_features = {};
     vkGetPhysicalDeviceFeatures(physicalDevice_, &device_features);
 
+    // shaderInt64 lives in the Vulkan 1.0 core feature set, not in any of the
+    // feature2 structs the descriptor chain below covers, so it has to be
+    // enabled through pEnabledFeatures. Only features that were actually
+    // reported are requested (the same invariant the chain keeps).
+    VkPhysicalDeviceFeatures enabled_core_features = {};
+    shader_caps_.shader_int64.available = true;
+    if (device_features.shaderInt64) {
+        enabled_core_features.shaderInt64 = VK_TRUE;
+        recordCap(shader_caps_.shader_int64, VK_TRUE);
+    } else {
+        recordCap(shader_caps_.shader_int64, VK_FALSE);
+    }
+
     auto feature_descs =
         createFeatureDescriptors(deviceProperties, supported_extensions);
 
@@ -1969,6 +1982,7 @@ bool VulkanDevice::createLogicalDevice(
     auto queue_create_info = setupQueueCreateInfo(queue_priority);
     VkDeviceCreateInfo create_info = {};
     create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
+    create_info.pEnabledFeatures = &enabled_core_features;
     create_info.queueCreateInfoCount =
         static_cast<uint32_t>(queue_create_info.size());
     create_info.pQueueCreateInfos = queue_create_info.data();

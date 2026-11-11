@@ -1,0 +1,80 @@
+#version 450 core
+
+// 64-bit integer arithmetic in a Vulkan shader. Requires the device feature
+// shaderInt64; the host gates on VulkanDevice::is_support_shader_int64() and
+// keeps a CPU fallback otherwise, so a device without it still runs the model.
+#extension GL_ARB_gpu_shader_int64 : require
+
+// int64 -> fp32 Cast, the rotary position-id conversion.
+//
+// Why this exists: Cast's int64 input is the ONLY op in the decode loop that
+// needs real 64-bit integer ARITHMETIC (not a byte move) — position_ids is an
+// int64 vector and the graph consumes it as fp32. Without this kernel the op
+// read the int64 tensor back to the host, converted in a C++ loop, and
+// uploaded the result, which made the whole level unreplayable: a replay skips
+// execute(), so the conversion stopped happening and the values froze at the
+// last recorded round (measured: the Cast output stuck at round 3 while the
+// driver kept advancing position_ids every step).
+//
+// The host also carried a "+1 prediction" shortcut (LINEAR_GROW) that guessed
+// next round's value instead of reading it. That shortcut is gone with this
+// kernel: the shader reads the actual tensor, so the value is always the one
+// this round's driver wrote.
+//
+// Layout: the int64 input is bound as ivec2[] (8 bytes/element, the established
+// convention — see concat_int64.comp), two 32-bit words per element. With
+// shaderInt64 enabled the words are recombined into a real 64-bit value and
+// converted; the two-word view keeps the binding layout identical to every
+// other int64 twin, so the same host-side bind path works.
+//
+// Requires VkPhysicalDeviceFeatures::shaderInt64. The host gates on
+// VulkanDevice::is_support_shader_int64() and keeps the CPU path otherwise.
+
+// 256 lanes per workgroup: the host dispatches UP_DIV(total, 256) groups, so a
+// missing declaration (which defaults to 1) would run a single thread and
+// convert only element 0 — measured as an output of [8,0,0] instead of [8,8,8].
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaIVec2Buf {
+    ivec2 data[];
+};
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer BdaFloatBuf {
+    float data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaFloatBuf b0;  // out (fp32)
+    BdaIVec2Buf b1;  // in  (int64 as ivec2)
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#define uInput (uBdaTable.b1)
+#else
+layout(set = 0, binding = 0) writeonly buffer Output {
+    float data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    ivec2 data[];
+} uInput;
+#endif
+
+layout(push_constant) uniform PC {
+    int total;  // element count (int64 in, fp32 out — 1:1)
+    int _pad0;
+    int _pad1;
+    int _pad2;
+} uPC;
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) {
+        return;
+    }
+    ivec2 w = uInput.data[gid];
+    // Recombine the two 32-bit halves into the int64 the tensor holds, then
+    // convert. The low word is x, the high word is y (little-endian ivec2
+    // view of one 64-bit element, same convention as concat_int64.comp).
+    int64_t v = (int64_t(w.y) << 32) | int64_t(uint64_t(uint(w.x)));
+    uOutput.data[gid] = float(v);
+}

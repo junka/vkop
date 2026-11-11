@@ -74,6 +74,13 @@ struct DeviceCap {
 struct ShaderCapabilities {
     DeviceCap shader_float16;
     DeviceCap shader_int8;
+    // shaderInt64 (a Vulkan 1.0 core feature, so it lives in
+    // VkPhysicalDeviceFeatures rather than any feature2 chain). Needed by the
+    // int64 data kernels: without it a shader cannot do 64-bit integer
+    // ARITHMETIC, which is what turns an int64 tensor into another type. Ops
+    // that only move int64 bytes as opaque ivec2 words (concat/gather/expand)
+    // do not need it and keep working either way.
+    DeviceCap shader_int64;
     DeviceCap storage_buffer_16bit;
     DeviceCap storage_buffer_8bit;
     DeviceCap uniform_storage_8bit;
@@ -261,6 +268,14 @@ class VulkanDevice {
     // device memory; see VulkanBuffer's host-import ctor and
     // Tensor::as_host_imported_buffer.
     bool is_support_host_import() const { return m_support_host_import_; }
+    // shaderInt64 enabled at device creation. Kernels that do 64-bit integer
+    // ARITHMETIC gate on this; byte movers over ivec2 do not.
+    // VKOP_NO_SHADER_INT64=1 forces the CPU fallback paths, for A/B.
+    bool is_support_shader_int64() const {
+        static const bool disabled =
+            std::getenv("VKOP_NO_SHADER_INT64") != nullptr;
+        return shader_caps_.shader_int64.enabled && !disabled;
+    }
     uint32_t host_import_alignment() const { return m_host_import_alignment_; }
     // UMA: a memory type that is both HOST_VISIBLE and DEVICE_LOCAL. iGPU
     // (Intel/AMD APU) report it; discrete cards do not. Ops use this to pick
