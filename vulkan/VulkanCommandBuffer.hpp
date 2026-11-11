@@ -20,7 +20,7 @@ class VulkanCommandBuffer {
 
   public:
     explicit VulkanCommandBuffer(std::shared_ptr<VulkanCommandPool> cmdpool,
-                                 int id = 0);
+                                 int id = 0, bool secondary = false);
     ~VulkanCommandBuffer();
 
     // Graph-submit readback hook. Set by Runtime::Run() while VKOP_GRAPH_SUBMIT
@@ -126,6 +126,16 @@ class VulkanCommandBuffer {
     // vkCmdUpdateBuffer, indirect dispatch reads).
     void pipelineBarrier();
 
+    // Append secondary command buffers to this (primary) recording, in array
+    // order. A secondary stays EXECUTABLE after vkEndCommandBuffer AND after
+    // being executed, so the same recording can be re-executed from a fresh
+    // primary every round: one vkCmdExecuteCommands + one vkQueueSubmit per
+    // round instead of one submit per segment. The driver charges MoltenVK per
+    // submitted command buffer (~0.16ms each), which is what made fine-grained
+    // segment replay 3x slower than graph mode; nesting the segments removes
+    // that cost without giving up the per-segment recording granularity.
+    void execute_commands(const std::vector<VkCommandBuffer> &secondaries);
+
     // Dispatch with dimensions read from a GPU buffer (vkCmdDispatchIndirect).
     // `buffer` holds a VkDispatchIndirectCommand{uint32 x,y,z} at `offset`.
     // Enables data-driven dispatch where the thread count depends on a shape
@@ -183,6 +193,10 @@ class VulkanCommandBuffer {
     std::vector<VkPipelineStageFlags> m_waitstages_;
     VkTimelineSemaphoreSubmitInfo m_timeline_submit_info_ = {};
     bool replayable_ = false;
+    // Allocated at SECONDARY level: executed by a primary via
+    // vkCmdExecuteCommands instead of submitted on its own.
+    bool secondary_ = false;
+    VkCommandBufferInheritanceInfo m_inheritance_{};
     // Last VK_EXT_descriptor_buffer bound in this recording. Binding is
     // command-buffer state, so a dispatch only re-binds when the pipeline
     // switches; VK_NULL_HANDLE means nothing is bound yet. Reset with the

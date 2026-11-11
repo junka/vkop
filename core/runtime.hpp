@@ -191,6 +191,9 @@ class Runtime {
     // segment replay 开启时跨轮复用 (Run 结束后不析构, 保持 Executable 状态),
     // replay 关闭或 segment 数变化时 clear 重建.
     std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_cmds_;
+    // VKOP_SEC_CMD: the primaries that execute graph_cmds_ (then secondaries).
+    // Indexed by readback boundary within the round, reused across rounds.
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> graph_prims_;
 
     // GPU submit-side profiling (VKOP_SUBMIT_PROF=1). A timestamp query pool
     // with 2 queries per op (begin/end); results read back at Run() end and

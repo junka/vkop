@@ -35,9 +35,23 @@ void VulkanCommandBuffer::pipelineBarrier() {
         0, 1, &barrier, 0, nullptr, 0, nullptr);
 }
 
+void VulkanCommandBuffer::execute_commands(
+    const std::vector<VkCommandBuffer> &secondaries) {
+    if (secondaries.empty())
+        return;
+    // ONE call for the whole round; the memory dependency between the chained
+    // secondaries is the barrier each one records as its last command (see
+    // Runtime's VKOP_SEC_CMD branch of graph_submit).
+    vkCmdExecuteCommands(m_commandBuffer_,
+                         static_cast<uint32_t>(secondaries.size()),
+                         secondaries.data());
+}
+
 VulkanCommandBuffer::VulkanCommandBuffer(
-    std::shared_ptr<VulkanCommandPool> cmdpool, int id)
+    std::shared_ptr<VulkanCommandPool> cmdpool, int id, bool secondary)
     : id_(id), m_cmdpool_(std::move(cmdpool)) {
+    secondary_ = secondary;
+    m_inheritance_.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO;
     allocate();
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
     m_support_timeline_ = device->is_support_timeline_semaphore();
@@ -119,7 +133,8 @@ void VulkanCommandBuffer::allocate() {
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.commandPool = m_cmdpool_->getCommandPool(id_);
-    alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    alloc_info.level = secondary_ ? VK_COMMAND_BUFFER_LEVEL_SECONDARY
+                                  : VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandBufferCount = 1;
 
     std::shared_ptr<VulkanDevice> device = m_cmdpool_->getVulkanDevice();
@@ -140,6 +155,10 @@ void VulkanCommandBuffer::begin() {
     begin_info.flags = replayable_
                            ? VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT
                            : VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    // A compute-only secondary inherits nothing (no render pass), but the
+    // inheritance info struct itself is required at SECONDARY level.
+    if (secondary_)
+        begin_info.pInheritanceInfo = &m_inheritance_;
 
     // replayable_ 的 buffer 可能已经处于 Executable 状态 (上轮 end + submit
     // 过, reset 循环不再主动 reset), 必须先 vkResetCommandBuffer 让它回到

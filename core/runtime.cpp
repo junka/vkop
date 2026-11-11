@@ -3007,6 +3007,24 @@ double Runtime::Run() {
     if (const char *gnb = std::getenv("VKOP_GRAPH_NO_BARRIER"))
         graph_no_barrier = gnb[0] == '1';
 
+    // Secondary-command-buffer submit shape (VKOP_SEC_CMD=1).
+    //
+    // MoltenVK charges ~0.16ms per SUBMITTED command buffer, so the per-segment
+    // submit cost scales with how many segments a round has, not with whether
+    // their recordings were reused: 375 segments ~60ms, 6 ~0.07ms. A secondary
+    // command buffer is never submitted on its own -- a primary executes it via
+    // vkCmdExecuteCommands and stays EXECUTABLE after doing so, so the same
+    // recording can be re-executed from a fresh primary every round. That keeps
+    // segment replay's one-level-per-segment granularity (the only split that
+    // is correct today, see the corruption note below) while the round costs
+    // ONE vkQueueSubmit, which is what graph mode's coarse segments were only
+    // achieving by packing levels.
+    bool sec_cmd = false;
+    if (graph_mode) {
+        if (const char *sc = std::getenv("VKOP_SEC_CMD"))
+            sec_cmd = sc[0] == '1';
+    }
+
     // Segment-level replay (VKOP_SEGMENT_REPLAY=1). Off by default.
     // 仅当 graph_mode 开时有效. 与 Operator 级 replay_mode_ 互不干扰.
     bool seg_replay = false;
@@ -3085,7 +3103,7 @@ double Runtime::Run() {
             // queue -- a VUID-vkQueueSubmit-pCommandBuffers-00074 violation that
             // takes the driver down in vkQueueSubmit.
             graph_cmds_.push_back(std::make_shared<VulkanCommandBuffer>(
-                m_cmdpool_, 0));
+                m_cmdpool_, 0, sec_cmd));
         }
         graph_seg = graph_cmds_[graph_next_seg++];
         graph_seg->set_replayable(true);  // SIMULTANEOUS_USE, 允许跨轮持久化
@@ -3168,6 +3186,41 @@ double Runtime::Run() {
     std::vector<std::shared_ptr<VulkanCommandBuffer>> seg_batch_cmds;
     seg_batch_sis.reserve(static_cast<size_t>(seg_batch));
     seg_batch_cmds.reserve(static_cast<size_t>(seg_batch));
+    // --- VKOP_SEC_CMD state --------------------------------------------------
+    // Secondaries closed this round but not yet attached to a primary, and the
+    // primaries recorded+submitted so far this round (one per readback
+    // boundary, because a mid-round readback needs its producers already on the
+    // queue and a secondary only reaches the queue through a primary).
+    std::vector<VkCommandBuffer> sec_pending;
+    std::vector<std::shared_ptr<VulkanCommandBuffer>> prims_this_round;
+    // Close the accumulated secondaries into one primary and submit it. Cheap
+    // per round: the primary's recording is just vkCmdExecuteCommands (the
+    // memory dependency between segments was recorded as a trailing barrier
+    // inside each secondary, so one call covers the whole round).
+    auto commit_primaries = [&]() {
+        if (sec_pending.empty())
+            return;
+        if (graph_prims_.size() <= prims_this_round.size()) {
+            graph_prims_.push_back(
+                std::make_shared<VulkanCommandBuffer>(m_cmdpool_, 0));
+        }
+        auto prim = graph_prims_[prims_this_round.size()];
+        prim->set_replayable(true);  // implicit reset + SIMULTANEOUS_USE
+        prim->clearWaits();
+        prim->begin();
+        prim->execute_commands(sec_pending);
+        prim->end();
+        auto cp_t0 = run_profile ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        prim->submit(queue0);
+        if (run_profile) {
+            auto cp_t1 = std::chrono::steady_clock::now();
+            prof_submit_ms +=
+                std::chrono::duration<double, std::milli>(cp_t1 - cp_t0).count();
+        }
+        prims_this_round.push_back(prim);
+        sec_pending.clear();
+    };
     // Flush the accumulated batch: one vkQueueSubmit for all of it.
     auto flush_seg_batch = [&]() {
         if (seg_batch_sis.empty()) return;
@@ -3204,7 +3257,24 @@ double Runtime::Run() {
                                  seg_op_indices_curr[ord]);
         }
         if (!skip_record) {
+            // A secondary's recording must end with the barrier that orders it
+            // against the NEXT secondary in the primary: vkCmdExecuteCommands
+            // gives no memory dependency between the buffers it chains, and the
+            // primary records a single call for the whole round. Recording it
+            // inside the segment costs nothing per round -- a replayed segment
+            // already carries last round's trailing barrier.
+            if (sec_cmd && !graph_no_barrier)
+                graph_seg->pipelineBarrier();
             graph_seg->end();
+        }
+        if (sec_cmd) {
+            sec_pending.push_back(graph_seg->get());
+            graph_seg = nullptr;
+            seg_op_indices_curr.push_back({});
+            if (seg_trace)
+                std::fprintf(stderr, "[sec-seg] pending=%zu\n",
+                             sec_pending.size());
+            return;
         }
         if (graph_prev_sem != VK_NULL_HANDLE)
             graph_seg->addWait(graph_prev_sem, graph_prev_val);
@@ -3253,7 +3323,10 @@ double Runtime::Run() {
             // The readback issues its own submit+wait and must observe its
             // producers already on the queue, so the batch cannot stay pending
             // across this point.
-            flush_seg_batch();
+            if (sec_cmd)
+                commit_primaries();
+            else
+                flush_seg_batch();
             graph_open(graph_seg_start);
             if (graph_op_idx >= 0)
                 node_ops_[graph_op_idx]->repoint_graph_cmd(graph_seg);
@@ -3567,7 +3640,7 @@ double Runtime::Run() {
             if (pre_hit) {
                 if (graph_next_seg >= graph_cmds_.size())
                     graph_cmds_.push_back(std::make_shared<VulkanCommandBuffer>(
-                        m_cmdpool_, 0));
+                        m_cmdpool_, 0, sec_cmd));
                 graph_seg = graph_cmds_[graph_next_seg++];
                 graph_seg->set_replayable(true);
                 graph_seg->clearWaits();
@@ -4041,9 +4114,15 @@ double Runtime::Run() {
         graph_submit();
         // Whatever is still batched has to reach the queue before the tail wait
         // below (the round is not over until every segment has been submitted).
-        flush_seg_batch();
+        if (sec_cmd)
+            commit_primaries();
+        else
+            flush_seg_batch();
         VulkanCommandBuffer::pre_readback_hook = nullptr;
-        if (!graph_cmds_.empty())
+        if (sec_cmd) {
+            if (!prims_this_round.empty())
+                last_commands[0] = prims_this_round.back();
+        } else if (!graph_cmds_.empty())
             last_commands[0] = graph_cmds_.back();
     } else {
         // Flush the tail: any remaining levels that didn't trigger a forced
@@ -4080,9 +4159,20 @@ double Runtime::Run() {
         // Executable 状态, 下轮 replay hit 时可以直接 submit. miss 段的
         // graph_open 里会先 reset 再 begin (见 graph_open 的 replayable_
         // 分支). 这对非 replay 场景也安全 — 仅多一次无条件 reset.
-        for (auto &c : graph_cmds_) {
-            c->wait();
-            c->clearWaits();
+        //
+        // VKOP_SEC_CMD: the secondaries were never submitted, so their signal
+        // values mean nothing — the primaries that executed them are what has
+        // to be CPU-waited before next round's vkBeginCommandBuffer.
+        if (sec_cmd) {
+            for (auto &p : prims_this_round) {
+                p->wait();
+                p->clearWaits();
+            }
+        } else {
+            for (auto &c : graph_cmds_) {
+                c->wait();
+                c->clearWaits();
+            }
         }
     }
     // The final-level wait (timeline semaphore above) guarantees the GPU has
@@ -4136,8 +4226,9 @@ double Runtime::Run() {
                 n_readback_levels, n_total_levels);
     }
     if (graph_mode) {
-        fprintf(stderr, "[graph] %zu segments, %d readback boundaries\n",
-                graph_cmds_.size(), graph_readbacks);
+        fprintf(stderr, "[graph] %zu segments, %d readback boundaries%s\n",
+                graph_cmds_.size(), graph_readbacks,
+                sec_cmd ? " [secondary cmds]" : "");
         if (segment_replay_enabled_) {
             int hits = 0, miss = 0;
             for (auto b : segment_replay_hit_this_round_)
