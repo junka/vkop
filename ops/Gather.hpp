@@ -167,38 +167,31 @@ class Gather : public Operator {
     // (an initializer or a Shape output) and the indices are constants, so the
     // gathered bytes are identical round to round.
     //
-    // Same LEARNING -> CONFIRMING -> STABLE machine Reshape/Range/NonZero use.
-    // In STABLE the op re-fills the cached output and re-uploads the SAME bytes,
-    // so the recording it produces is identical every round and a replay
-    // reproduces it exactly; refresh_dynamic_params() redoes the host-side half
-    // (data_ + host_authoritative) that a replay skips.
-    enum class GatherLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
-    GatherLearnState g_state_ = GatherLearnState::LEARNING;
-
+    // The reuse decision is a comparison: the gathered bytes are identical
+    // when the indices (and their shape) are, since the data is a fixed table
+    // in this chain. No learning, no promotion, nothing that can get stuck.
     void invalidate_shape_cache() override {
-        g_state_ = GatherLearnState::LEARNING;
         cached_idx_.clear();
         cached_idx_shape_.clear();
         cached_out_.clear();
         cached_out_shape_.clear();
+        idx_reusable_ = false;
+        idx_dirty_ = true;
     }
     bool recording_changes_per_round() const override {
-        // Gated on the int64 host path being the one in use: a non-int64
-        // Gather never advances this state machine (it has no host side to
-        // learn), so without the gate every fp16 Gather would report "changes
-        // every round" and lose the replay it used to have.
-        return int64_host_path_taken_ && g_state_ != GatherLearnState::STABLE;
+        // Gated on the int64 host path being the one in use: an fp16 Gather
+        // has no host side to work with.
+        return int64_host_path_taken_ && !idx_reusable_;
     }
     // Not the base's host_work_observed_ answer: execute() sets that flag on
     // every path, so it would mask this one (same reasoning as NonZero).
     bool did_host_work_last_round() const override {
-        return int64_host_path_taken_ &&
-               g_state_ != GatherLearnState::STABLE;
+        return int64_host_path_taken_ && !idx_reusable_;
     }
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (g_state_ != GatherLearnState::STABLE || cached_out_.empty() ||
+        if (!idx_reusable_ || cached_out_.empty() ||
             outputs.empty() || !outputs[0]) {
             return false;
         }
@@ -299,28 +292,28 @@ class Gather : public Operator {
 
         auto data = core::as_tensor<int64_t>(inputs[0]);
         auto indices = core::as_tensor<int64_t>(inputs[1]);
-        // STABLE fast path: the indices fingerprint matched for two
-        // consecutive rounds, so the gathered bytes are what we cached. Refill
-        // and re-upload them without touching the gather loop or the inputs.
-        // Checking the fingerprint costs one tiny copyToCPU of the INDICES
-        // (host-resident in the shape-meta chain, so free) while skipping the
-        // DATA readback, which is the large one.
-        if (g_state_ == GatherLearnState::STABLE) {
-            indices->copyToCPU(m_cmdpool_);
+        // Compare the INDICES with last round's. They are the cheap half of
+        // the invariant and the half that can change without the shape
+        // changing; the data is a fixed table here. Equal indices (and shape)
+        // mean the gathered bytes repeat, so re-fill the cached output and skip
+        // both the data readback and the gather loop.
+        indices->copyToCPU(m_cmdpool_);
+        {
             std::vector<int64_t> cur_idx;
             cur_idx.assign(indices->data().begin(), indices->data().end());
-            if (cur_idx == cached_idx_ && idx_shape == cached_idx_shape_) {
-                auto output = core::as_tensor<int64_t>(outputs[0]);
-                output->resize(cached_out_shape_);
-                output->fillToCPU(cached_out_);
-                objs_.emplace_back(
-                    output->as_storage_buffer(m_dev_, m_cmd_));
-                output->copyToGPUDeferred(m_cmd_);
-                if (host_shape_enabled()) output->set_host_authoritative();
-                return;
-            }
-            // Indices moved: fall through, re-learn.
-            g_state_ = GatherLearnState::LEARNING;
+            idx_reusable_ = !cached_out_.empty() && !idx_dirty_ &&
+                            cur_idx == cached_idx_ &&
+                            idx_shape == cached_idx_shape_;
+            idx_dirty_ = false;
+        }
+        if (idx_reusable_) {
+            auto output = core::as_tensor<int64_t>(outputs[0]);
+            output->resize(cached_out_shape_);
+            output->fillToCPU(cached_out_);
+            objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+            output->copyToGPUDeferred(m_cmd_);
+            if (host_shape_enabled()) output->set_host_authoritative();
+            return;
         }
         // Unconditional readback: a cross-round-recycled GPU input may have
         // stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
@@ -423,11 +416,6 @@ class Gather : public Operator {
         cached_idx_shape_ = idx_shape;
         cached_out_ = out;
         cached_out_shape_ = out_shape;
-        if (g_state_ == GatherLearnState::LEARNING) {
-            g_state_ = GatherLearnState::CONFIRMING;
-        } else if (g_state_ == GatherLearnState::CONFIRMING) {
-            g_state_ = GatherLearnState::STABLE;
-        }
     }
 
     void execute(
@@ -591,11 +579,14 @@ class Gather : public Operator {
     // Whether the last execute() took the CPU int64 path. did_host_work_last_round
     // keys on it so the GPU int64 path and the fp paths stay replayable.
     bool int64_host_path_taken_ = false;
-    // Learned-cache state for the CPU int64 path (see the public declarations).
+    // Comparison state for the CPU int64 path: last round's indices (the
+    // cheap half of the invariant) and the output they produced.
     std::vector<int64_t> cached_idx_;
     std::vector<int> cached_idx_shape_;
     std::vector<int64_t> cached_out_;
     std::vector<int> cached_out_shape_;
+    bool idx_reusable_ = false;
+    bool idx_dirty_ = true;
 };
 
 } // namespace ops

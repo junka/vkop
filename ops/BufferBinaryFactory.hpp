@@ -122,15 +122,10 @@ class BufferBinaryFactory : public BufferFactory {
         return result;
     }
 
-    // Phase-boundary reset: re-learn int64-input stability. The int64 binary
-    // ops (Mul/Add/Sub/Div in the shape-meta chain) read shape values that are
-    // almost always round-invariant across decode (only kv_len-derived inputs
-    // change). After two matching readbacks per input, skip its copyToCPU and
-    // reuse the cached host vector. Mirrors ReshapeBuffer's auto-learning
-    // cache.
     void invalidate_shape_cache() override {
-        for (auto &s : in_cache_state_)
-            s = InLearnState::LEARNING;
+        // Nothing to reset: int64 operands are read and compared every round
+        // (a read-only leaf is read once), so a phase boundary needs no state
+        // change. Kept as an explicit no-op for the virtual contract.
     }
 
     // Phase 3+4 (VKOP_GPU_SHAPE): build a tiny int64 SSBO holding `shape`'s
@@ -789,45 +784,28 @@ class BufferBinaryFactory : public BufferFactory {
             leaf_in_valid_[idx] = true;
             return;
         }
-        if (in_cache_state_[idx] == InLearnState::STABLE) {
-            if (cached_in_[idx] && !cached_in_[idx]->empty()) {
-                t->fillToCPU(*cached_in_[idx]);
-            }
-            return;
-        }
+        // GPU-produced operand: read it and compare with last round's values.
+        // A repeat means the cached copy is still current, so the readback it
+        // would need is already in data_.
+        //
+        // A comparison, not a learner: this used to promote to STABLE after
+        // two matching rounds and then stop reading, on the assumption the
+        // value would never change again. Comparing costs one tiny readback of
+        // an int64 vector per round and cannot be wrong.
+        //
         // Unconditional readback: int64 inputs may be GPU-resident only (e.g.
         // NonZero's shader-computed output leaves data_ empty), OR a cross-
         // round-recycled GPU input with stale CPU data_. copyToCPU is the
         // authority check (reads when vkobj_ exists).
         t->copyToCPU(m_cmdpool_);
-        const std::vector<int64_t> &cur = t->data();
-        if (in_cache_state_[idx] == InLearnState::LEARNING) {
-            *learned_in_[idx] = cur;
-            in_cache_state_[idx] = InLearnState::CONFIRMING;
-        } else if (in_cache_state_[idx] == InLearnState::CONFIRMING) {
-            if (cur == *learned_in_[idx]) {
-                in_cache_state_[idx] = InLearnState::STABLE;
-                *cached_in_[idx] = cur;
-            } else {
-                in_cache_state_[idx] = InLearnState::DYNAMIC;
-            }
-        }
     }
 
-    // --- per-input readback cache (runtime auto-learning) ---
-    enum class InLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
-    std::array<InLearnState, 2> in_cache_state_ = {
-        {InLearnState::LEARNING, InLearnState::LEARNING}};
-    std::array<std::shared_ptr<std::vector<int64_t>>, 2> learned_in_ = {
-        {std::make_shared<std::vector<int64_t>>(),
-         std::make_shared<std::vector<int64_t>>()}};
+    // Last round's int64 operand values, compared against this round's.
     // int64 inputs read once because they are read-only leaves (constants of
     // the node). See read_int64_cached.
     std::array<std::vector<int64_t>, 2> leaf_in_;
     std::array<bool, 2> leaf_in_valid_ = {{false, false}};
-    std::array<std::shared_ptr<std::vector<int64_t>>, 2> cached_in_ = {
-        {std::make_shared<std::vector<int64_t>>(),
-         std::make_shared<std::vector<int64_t>>()}};
+
 };
 
 } // namespace ops
