@@ -110,18 +110,19 @@ class ITensor {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
     // True for a tensor the LOADER created and no graph node writes: an
-    // initializer or a graph input. Both get set_ref_cnt_forever(), while
-    // every node output gets its consumer count, so this is a structural
-    // property rather than an observation — the bytes of such a tensor cannot
-    // change for the model's lifetime.
+    // initializer or a graph input. Ops use it in place of the
+    // LEARNING/CONFIRMING/STABLE machinery — such a tensor's bytes cannot
+    // change for the model's lifetime, so reading it once is a structural
+    // fact rather than an observation, and it cannot get stuck when a
+    // replayed segment skips execute().
     //
-    // Ops use it in place of the LEARNING/CONFIRMING/STABLE machinery: a
-    // read-only input makes an op's host work a one-time cost instead of a
-    // per-round one, and — unlike a learned answer — that cannot be wrong, and
-    // cannot get stuck if a replayed segment skips execute().
-    bool is_read_only_leaf() const {
-        return ref_cnt_ == std::numeric_limits<uint16_t>::max();
-    }
+    // A separate flag, not `ref_cnt() == forever`: the ref count is a
+    // retention optimisation, and tying a correctness decision to it means a
+    // future change to retention silently changes what ops may skip. The
+    // loader sets both (see Runtime::LoadModel), and read-only-ness also has
+    // to survive a view: a byte-preserving alias of a leaf is still a leaf.
+    bool is_read_only_leaf() const { return read_only_leaf_; }
+    void set_read_only_leaf() { read_only_leaf_ = true; }
     void set_transpose() { transpose_ = true; }
     bool get_transpose() const { return transpose_; }
     void set_pack() { pack_ = true; }
@@ -491,6 +492,9 @@ class ITensor {
     int dims_[16] = {};
     int size_ = 0;
     uint16_t ref_cnt_ = 0;
+    // Set by the loader for an initializer / graph input; see
+    // is_read_only_leaf().
+    bool read_only_leaf_ = false;
     uint8_t n_dims_ = 0;
     bool transpose_ = false;
     bool pack_ = false;

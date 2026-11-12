@@ -554,6 +554,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<int64_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -562,6 +563,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<int>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -577,6 +579,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -585,6 +588,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<float>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -593,6 +597,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<uint16_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -607,6 +612,7 @@ void Runtime::LoadModel() {
                 auto typed = std::make_shared<Tensor<int8_t>>(in_dims);
                 typed->set_elem_kind(kind);
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -630,6 +636,7 @@ void Runtime::LoadModel() {
                 typed->set_payload_bytes(
                     static_cast<int>(elem_bytes(kind, elements)));
                 typed->set_ref_cnt_forever();
+                typed->set_read_only_leaf();
                 typed->as_storage_buffer(dev);
                 t = typed;
                 break;
@@ -673,6 +680,7 @@ void Runtime::LoadModel() {
             // legacy image backend: fp16 inputs as images (original path).
             auto t16 = std::make_shared<Tensor<uint16_t>>(in_dims);
             t16->set_ref_cnt_forever();
+            t16->set_read_only_leaf();
             t16->as_input_image(dev, nullptr);
             t = t16;
         }
@@ -692,6 +700,7 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<int8_t>>(o.dims, true);
             t->set_elem_kind(okind);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
@@ -702,6 +711,7 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<int8_t>>(o.dims, true);
             t->set_elem_kind(okind);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
@@ -725,6 +735,7 @@ void Runtime::LoadModel() {
             }
             auto t = std::make_shared<Tensor<int32_t>>(sane, true);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
@@ -750,18 +761,21 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<int64_t>>(sane, true);
             t->set_elem_kind(ElemKind::kInt64);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
         } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
         } else {
             auto t = std::make_shared<Tensor<float>>(o.dims, true);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
@@ -775,6 +789,7 @@ void Runtime::LoadModel() {
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
         tensor->set_ref_cnt_forever();
+        tensor->set_read_only_leaf();
         // Weight-image layout, as the converter decided it: transpose swaps the
         // image's batch/chan addressing, pack folds the channel group into the
         // width. Both are inert on the buffer backend (Conv2dBufferPC has no
@@ -833,6 +848,7 @@ void Runtime::LoadModel() {
             typename std::remove_reference_t<decltype(*tensor)>::value_type;
         auto *src = const_cast<T *>(reinterpret_cast<const T *>(src_base));
         tensor->set_ref_cnt_forever();
+        tensor->set_read_only_leaf();
         // See handle_floating_point_tensor: the layout is the converter's,
         // read from the node, not inferred from the consumer's op_type.
         if (auto it = conv_weight_layout.find(init.name);
@@ -883,6 +899,7 @@ void Runtime::LoadModel() {
             static_cast<uint32_t>(unified_total_bytes / sizeof(float))};
         auto unified_tensor = std::make_shared<Tensor<float>>(unified_dims);
         unified_tensor->set_ref_cnt_forever();
+        unified_tensor->set_read_only_leaf();
         auto buffer = unified_tensor->as_uniform_buffer(dev);
         if (stream_blob) {
             unified_tensor->copyToGPU(m_cmdpool_, nullptr,
@@ -997,6 +1014,7 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<int64_t>>(init.dims);
             t->set_elem_kind(kind);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             t->fillToCPU(const_cast<int64_t *>(
                 reinterpret_cast<const int64_t *>(src_ptr)));
             // Upload to GPU as an SSBO. Explicit src keeps the CPU copy alive
@@ -1017,6 +1035,7 @@ void Runtime::LoadModel() {
             auto t = std::make_shared<Tensor<int>>(init.dims);
             t->set_elem_kind(kind);
             t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
             t->fillToCPU(
                 const_cast<int *>(reinterpret_cast<const int *>(src_ptr)));
             t->as_storage_buffer(dev);
@@ -1653,6 +1672,7 @@ void Runtime::LoadModel() {
                 nt = std::make_shared<Tensor<float>>(dims, true);
             }
             nt->set_ref_cnt_forever();
+            nt->set_read_only_leaf();
             node_output_tensors_[i][k] = nt;
             tensor_map[name] = nt;
             outputs_[name] = nt;

@@ -422,6 +422,11 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // A byte-preserving view of a read-only leaf is still a leaf:
+                // the bytes are the same object, so a consumer may
+                // treat the output as a constant too.
+                if (src->is_read_only_leaf())
+                    output->set_read_only_leaf();
                 // Host-shape mode: reshape is a pure view (element count is
                 // unchanged), so propagate the input's authoritative host
                 // bytes to the output — downstream host readers then skip
@@ -497,6 +502,11 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // A byte-preserving view of a read-only leaf is still a leaf:
+                // the bytes are the same object, so a consumer may
+                // treat the output as a constant too.
+                if (src->is_read_only_leaf())
+                    output->set_read_only_leaf();
                 // A byte-preserving view of a tensor whose host copy is valid
                 // (a driver-filled graph input, e.g. image_pad_mask) has that
                 // same valid copy — the bytes are identical and only the shape
@@ -550,6 +560,11 @@ class ReshapeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // A byte-preserving view of a read-only leaf is still a leaf:
+                // the bytes are the same object, so a consumer may
+                // treat the output as a constant too.
+                if (src->is_read_only_leaf())
+                    output->set_read_only_leaf();
                 return;
             }
             // CPU fallback: host-only input (tests / rare non-GPU path).

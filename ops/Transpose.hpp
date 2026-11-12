@@ -300,6 +300,11 @@ class TransposeBuffer : public BufferFactory {
                     src->as_storage_buffer(m_dev_, m_cmd_));
                 objs_.emplace_back(
                     output->alias_storage_buffer(src_buff, m_cmd_));
+                // A byte-preserving view of a read-only leaf is still a leaf:
+                // the bytes are the same object, so a consumer may
+                // treat the output as a constant too.
+                if (src->is_read_only_leaf())
+                    output->set_read_only_leaf();
                 aliased = true;
             });
             if (aliased) {
