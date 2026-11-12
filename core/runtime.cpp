@@ -3237,28 +3237,72 @@ double Runtime::Run() {
     // per round: the primary's recording is just vkCmdExecuteCommands (the
     // memory dependency between segments was recorded as a trailing barrier
     // inside each secondary, so one call covers the whole round).
+    // How many secondaries one vkCmdExecuteCommands may carry.
+    //
+    // Not the same knob as seg_batch (below), even though both are "how many
+    // segments per submit": seg_batch tunes the DESCRIPTOR path, where N
+    // segments are N VkSubmitInfos in one vkQueueSubmit; here N secondaries
+    // ride in one vkCmdExecuteCommands inside one primary, and the whole point
+    // of the secondary path is to keep that at ONE call. A small default here
+    // would silently give that back (measured: 383 ViT segments at chunk=32
+    // cost ~6 submits/round against 1).
+    //
+    // There is no limit worth respecting in the spec itself
+    // (maxCommandBufferCount is enormous on every device seen), but the count
+    // arrives as a uint32_t and a driver is free to reject an oversized array
+    // -- and a whole 384-level decode round goes through ONE primary when
+    // VKOP_SEC_CMD=1, so a driver with a lower internal ceiling would fail the
+    // entire round on the first submit. Chunking keeps that from being a
+    // cliff: each primary carries at most this many secondaries and the
+    // primaries are submitted in order on the same queue, so the ordering the
+    // round depends on is unchanged.
+    //
+    // The chunks are submitted back to back on queue0, which is what the
+    // timeline chain already assumed; the barrier each secondary ends with
+    // still orders it against the next one, across a chunk boundary too.
+    //
+    // Default 512: comfortably above any real round (a 384-level decode graph
+    // packs to a handful of segments, and 383 unpacked ViT levels fit with
+    // room to spare), so chunking costs nothing in the common case while still
+    // bounding what one call carries. Chunking is NOT free -- each primary is
+    // its own vkQueueSubmit, measured ~345ms vs ~270ms per ViT round at
+    // chunk=1 -- so this must stay well above the segment count, not merely
+    // above some spec minimum.
+    size_t sec_cmd_chunk = 512;
+    if (const char *sc_chunk = std::getenv("VKOP_SEC_CHUNK")) {
+        const long v = std::strtol(sc_chunk, nullptr, 10);
+        if (v > 0) sec_cmd_chunk = static_cast<size_t>(v);
+    }
     auto commit_primaries = [&]() {
         if (sec_pending.empty())
             return;
-        if (graph_prims_.size() <= prims_this_round.size()) {
-            graph_prims_.push_back(
-                std::make_shared<VulkanCommandBuffer>(m_cmdpool_, 0));
+        for (size_t off = 0; off < sec_pending.size();
+             off += sec_cmd_chunk) {
+            const size_t n =
+                std::min(sec_cmd_chunk, sec_pending.size() - off);
+            if (graph_prims_.size() <= prims_this_round.size()) {
+                graph_prims_.push_back(
+                    std::make_shared<VulkanCommandBuffer>(m_cmdpool_, 0));
+            }
+            auto prim = graph_prims_[prims_this_round.size()];
+            prim->set_replayable(true);  // implicit reset + SIMULTANEOUS_USE
+            prim->clearWaits();
+            prim->begin();
+            prim->execute_commands(
+                std::vector<VkCommandBuffer>(sec_pending.begin() + off,
+                                             sec_pending.begin() + off + n));
+            prim->end();
+            auto cp_t0 = run_profile ? std::chrono::steady_clock::now()
+                                     : std::chrono::steady_clock::time_point{};
+            prim->submit(queue0);
+            if (run_profile) {
+                auto cp_t1 = std::chrono::steady_clock::now();
+                prof_submit_ms += std::chrono::duration<double, std::milli>(
+                                      cp_t1 - cp_t0)
+                                      .count();
+            }
+            prims_this_round.push_back(prim);
         }
-        auto prim = graph_prims_[prims_this_round.size()];
-        prim->set_replayable(true);  // implicit reset + SIMULTANEOUS_USE
-        prim->clearWaits();
-        prim->begin();
-        prim->execute_commands(sec_pending);
-        prim->end();
-        auto cp_t0 = run_profile ? std::chrono::steady_clock::now()
-                                 : std::chrono::steady_clock::time_point{};
-        prim->submit(queue0);
-        if (run_profile) {
-            auto cp_t1 = std::chrono::steady_clock::now();
-            prof_submit_ms +=
-                std::chrono::duration<double, std::milli>(cp_t1 - cp_t0).count();
-        }
-        prims_this_round.push_back(prim);
         sec_pending.clear();
     };
     // Flush the accumulated batch: one vkQueueSubmit for all of it.
