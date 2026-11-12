@@ -772,6 +772,23 @@ class BufferBinaryFactory : public BufferFactory {
     // skipped, so downstream correctness is unaffected.
   protected:
     void read_int64_cached(std::shared_ptr<core::Tensor<int64_t>> &t, int idx) {
+        // Structural fast path: a read-only leaf input (an initializer or a
+        // graph input) cannot change, so its bytes are a constant of the node.
+        // Read once and replay them into data_ on later rounds.
+        //
+        // The same reasoning as SqueezeUnsqueeze/Reshape: a learned answer
+        // only advances inside execute(), which a re-recorded segment may
+        // skip; a structural one cannot get stuck.
+        if (t && t->is_read_only_leaf()) {
+            if (leaf_in_valid_[idx]) {
+                t->fillToCPU(leaf_in_[idx]);
+                return;
+            }
+            t->copyToCPU(m_cmdpool_);  // free: host bytes are current
+            leaf_in_[idx] = t->data();
+            leaf_in_valid_[idx] = true;
+            return;
+        }
         if (in_cache_state_[idx] == InLearnState::STABLE) {
             if (cached_in_[idx] && !cached_in_[idx]->empty()) {
                 t->fillToCPU(*cached_in_[idx]);
@@ -804,6 +821,10 @@ class BufferBinaryFactory : public BufferFactory {
     std::array<std::shared_ptr<std::vector<int64_t>>, 2> learned_in_ = {
         {std::make_shared<std::vector<int64_t>>(),
          std::make_shared<std::vector<int64_t>>()}};
+    // int64 inputs read once because they are read-only leaves (constants of
+    // the node). See read_int64_cached.
+    std::array<std::vector<int64_t>, 2> leaf_in_;
+    std::array<bool, 2> leaf_in_valid_ = {{false, false}};
     std::array<std::shared_ptr<std::vector<int64_t>>, 2> cached_in_ = {
         {std::make_shared<std::vector<int64_t>>(),
          std::make_shared<std::vector<int64_t>>()}};
