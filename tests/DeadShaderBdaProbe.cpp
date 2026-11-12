@@ -233,28 +233,28 @@ void test_nonzero() {
 
 // ---- Range: start/limit/delta as integer buffers, fp32 output --------------
 void test_range() {
-    auto start = std::make_shared<Tensor<int>>(std::vector<int>{1});
-    auto limit = std::make_shared<Tensor<int>>(std::vector<int>{1});
-    auto delta = std::make_shared<Tensor<int>>(std::vector<int>{1});
-    auto out = std::make_shared<Tensor<float>>(std::vector<int>{5});
-    auto sb = upload(start, {1});
-    auto lb = upload(limit, {10});
-    auto db = upload(delta, {2});
+    // int64 Range: out[i] = start + i * delta. The params ride in the push
+    // constant as little-endian word pairs (a 64-bit scalar cannot travel in a
+    // PC portably), and the only bound buffer is the output. See
+    // shaders/buffer/range_int64.comp and ops::range::GpuRangeParam.
+    auto out = std::make_shared<Tensor<int64_t>>(std::vector<int>{5});
     auto ob = new_output(out);
     struct PC {
-        int fp16;
-    } pc{0};
-    Step s{"buffer_range_bda", "buffer_range", {ob, sb, lb, db}, &pc,
-           sizeof(pc), 1, 1, 1, nullptr};
+        int total, _pad0, start_lo, start_hi, delta_lo, delta_hi;
+    } pc{5, 0, 1, 0, 2, 0}; // start=1, delta=2 -> 1,3,5,7,9
+    Step s{"buffer_range_int64_bda", "buffer_range_int64", {ob}, &pc,
+           sizeof(pc), 1, 1, 1,
+           nullptr};
     bool ok = run_steps("Range", {s});
     out->copyToCPU(g_pool);
     if (!ok) {
         return;
     }
-    std::vector<float> want{1, 3, 5, 7, 9};
+    const std::vector<int64_t> want{1, 3, 5, 7, 9};
     for (int i = 0; i < 5; ++i) {
         if ((*out)[i] != want[i]) {
-            std::printf("Range [%d] got %f want %f\n", i, (*out)[i], want[i]);
+            std::printf("Range [%d] got %lld want %lld\n", i,
+                        (long long)(*out)[i], (long long)want[i]);
             failures++;
             return;
         }

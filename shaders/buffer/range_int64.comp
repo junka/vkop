@@ -1,0 +1,72 @@
+#version 450 core
+
+// Range: out[i] = start + i * delta, i in [0, total).
+//
+// This kernel serves the int64 form only, which is what the shape-meta and RoPE
+// chains in this tree actually use (both the ViT position chain and the LLM's
+// deepstack chains are int64 -> int64). Every other combination — int32 params,
+// float params, fp16 output — keeps the host generator in ops/Range.hpp, which
+// is also the fallback for a device without shaderInt64.
+//
+// The old build bound the three params as `int data[]` and reinterpreted an
+// fp32/fp16 operand's BIT PATTERN as an integer (1.0f is 0x3F800000, so a float
+// arange came out as 1.065e9 + i). That is what made this kernel unusable and
+// left Range generating everything on the host. The params now travel in the
+// push constant as word pairs, so no binding can be misread.
+//
+// Why this exists: Range was the last host-side generator in the chain — it
+// read start/limit/delta back, ran an arange loop in C++ and re-uploaded the
+// result. That is host work a segment replay skips, so every segment holding a
+// Range had to re-record every round no matter how stable its inputs were.
+// Computing it on the device makes the recording self-contained instead: the
+// level replays like any other dispatch, with no learned-cache state machine
+// deciding whether it is safe to.
+
+#extension GL_ARB_gpu_shader_int64 : require
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer BdaOutBuf {
+    ivec2 data[];
+};
+layout(set = 0, binding = 0) readonly buffer BdaTable {
+    BdaOutBuf b0;
+} uBdaTable;
+#define uOutput (uBdaTable.b0)
+#else
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Mirrors ops::range::GpuRangeParam. The int64 values are carried as
+// little-endian word pairs: a push constant cannot hold a 64-bit scalar
+// portably, and this is the same (lo, hi) convention every int64 twin in the
+// tree uses for its SSBO payloads.
+layout(push_constant) uniform PC_uPC {
+    int total; // element count; the host dispatches UP_DIV(total, 256)
+    int _pad0;
+    int start_lo;
+    int start_hi;
+    int delta_lo;
+    int delta_hi;
+} uPC;
+
+int64_t uncombine(int lo, int hi) {
+    return (int64_t(hi) << 32) | int64_t(uint64_t(uint(lo)));
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) return;
+
+    const int64_t start = uncombine(uPC.start_lo, uPC.start_hi);
+    const int64_t delta = uncombine(uPC.delta_lo, uPC.delta_hi);
+    const int64_t v = start + int64_t(gid) * delta;
+    // One element per ivec2 slot, low word first (the convention
+    // concat_int64/gather_int64/equal_int64 already use).
+    uOutput.data[gid] = ivec2(int(uint64_t(v) & 0xFFFFFFFFu), int(v >> 32));
+}

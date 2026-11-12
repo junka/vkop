@@ -13,9 +13,19 @@ namespace vkop {
 namespace ops {
 
 namespace range {
+// Mirrors shaders/buffer/range.comp's push constant. The two int64 params are
+// carried as little-endian word pairs: a push constant cannot hold a 64-bit
+// scalar portably, and the word-pair convention is what every int64 twin in
+// this tree already uses.
 struct GpuRangeParam {
-    bool fp16;
+    int total;
+    int _pad0;
+    int start_lo;
+    int start_hi;
+    int delta_lo;
+    int delta_hi;
 };
+static_assert(sizeof(GpuRangeParam) == 24, "GpuRangeParam layout drift");
 } // namespace range
 
 // SSBO-only op: generates a 1-D sequence [start, start+delta, ...].
@@ -23,6 +33,9 @@ class Range : public Operator {
   public:
     // Single-impl op: always the SSBO path (no image twin).
     bool uses_buffer_backend() const override { return true; }
+    // The int64 kernel binds one buffer (the output); its params ride in the
+    // push constant.
+    size_t bda_address_table_slots() const override { return 1; }
 
     explicit Range()
         : Operator(OpType::RANGE,
@@ -30,9 +43,7 @@ class Range : public Operator {
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
                     VK_DESCRIPTOR_TYPE_STORAGE_BUFFER},
-                   sizeof(range::GpuRangeParam)) {
-        param_.fp16 = false;
-    }
+                   sizeof(range::GpuRangeParam)) {}
 
     // The 6 Range instances in the LLM decode graph (position-index /
     // deepstack shape-meta chains) read back start/limit/delta every round,
@@ -65,17 +76,76 @@ class Range : public Operator {
     }
     bool has_host_side_effects() const override { return true; }
 
+    // --- replay answers ---
+    //
+    // Range generates its values on the host for every dtype (there is no
+    // kernel to call), so the arange loop and its upload are host work a
+    // replay would skip. That used to make the op unconditionally dynamic and
+    // blocked any segment containing it.
+    //
+    // In STABLE the situation is the same as NonZero's: the op re-fills the
+    // cached output and re-uploads the SAME bytes, so the recording it
+    // produces is identical round to round and a replay reproduces it exactly.
+    // refresh_dynamic_params() redoes the host-side half (data_ +
+    // host_authoritative) that a replay skips.
+    //
+    // One exception has to stay dynamic: the periodic verify round
+    // (stable_rounds_ reaching STABLE_VERIFY_INTERVAL) really does a readback
+    // and can leave STABLE, so the recording of THAT round is not the shape of
+    // the next one. It reports dynamic for exactly the round it happens on.
+    bool recording_changes_per_round() const override {
+        return !range_replayable();
+    }
+    bool did_host_work_last_round() const override {
+        // Not the base's host_work_observed_ answer: execute() sets that flag
+        // on every path (including the STABLE re-fill), which would mask this.
+        return !range_replayable();
+    }
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (!range_replayable() || cached_out_.empty() || outputs.empty() ||
+            !outputs[0] || outputs[0]->dtype() != typeid(int64_t)) {
+            return false;
+        }
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (!output) return false;
+        if (output->getShape() != cached_out_shape_) {
+            output->resize(cached_out_shape_);
+        }
+        output->fillToCPU(cached_out_);
+        // Mirror the STABLE fast path's tail: it ends with copyToGPUDeferred(),
+        // which marks the tensor device-resident. Skipping that leaves
+        // converted_ false on a replayed segment while the buffer genuinely
+        // holds the bytes.
+        output->toGPU();
+        if (host_shape_enabled()) output->set_host_authoritative();
+        return true;
+    }
+
   private:
+    // True when the STABLE fast path is what this round takes AND that path
+    // reproduces the previous recording byte for byte. The verify round is
+    // excluded because it deliberately falls through to a real readback.
+    // A device-computed Range bypasses the machine entirely: it has no host
+    // work to reason about, so it is replayable whenever the device path is
+    // what ran.
+    bool range_replayable() const {
+        if (range_device_path_taken_) return true;
+        return range_state_ == LearnState::STABLE &&
+               stable_rounds_ < STABLE_VERIFY_INTERVAL;
+    }
+
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         // Range generates its values on the host for EVERY dtype (there is no
         // integer/fp kernel to call): the params readback, the arange loop and
-        // the deferred upload are all host work a replay would skip. The one
-        // exception is the int64 STABLE fast path, which re-fills the cached
-        // output without recomputing — but it still fills/uploads on the host,
-        // so Range stays dynamic in every state.
+        // the deferred upload are all host work a replay would skip. The
+        // instance answer is in did_host_work_last_round() above -- it says
+        // "no" while the STABLE re-fill is running, because that path
+        // reproduces the previous recording byte for byte.
         set_did_host_work_last_round(true);
 
         // Read start/limit/delta once per round: as int64 for an int32/int64
@@ -199,6 +269,28 @@ class Range : public Operator {
             }
         }
         out_shape = {inums};
+
+        // Device path: one dispatch, no host loop, nothing a replay could skip.
+        // Every value the kernel needs is already in hand, and `total` had to
+        // be computed here anyway to size the output. Taken before the learn
+        // state machine on purpose — the machine exists only to decide when the
+        // HOST path's result is safe to reuse, and there is nothing to learn
+        // when the device computes it.
+        //
+        // An empty range has nothing to dispatch; the output still has to be
+        // resized so a downstream consumer sees [0].
+        if (range_gpu_eligible(inputs, outputs) && build_int64_pipeline()) {
+            if (inums <= 0) {
+                auto output = core::as_tensor<int64_t>(outputs[0]);
+                if (output->num_elements() != 0) output->resize(out_shape);
+            } else {
+                gpuComputeInt64(outputs, start, delta, inums, out_shape);
+            }
+            range_device_path_taken_ = true;
+            set_did_host_work_last_round(false);
+            return;
+        }
+        range_device_path_taken_ = false;
 
         // Advance the learn state machine for int64 (the cached-output reuse
         // only applies there: the cache holds int64 values, so it cannot serve
@@ -339,7 +431,113 @@ class Range : public Operator {
         }
     }
 
-    range::GpuRangeParam param_;
+    // --- device path (int64 only) ---
+    //
+    // The int64 form of Range is a pure function of (start, delta, total), so
+    // it needs nothing from the host beyond those three numbers — which the
+    // host already has, because it must compute `total` to size the output.
+    // Computing the values on the device therefore removes the op's only host
+    // work and makes its recording self-contained, which is what lets a
+    // segment containing it replay. See the replay-answers section above: with
+    // the device path taken there is no state machine to consult at all.
+    //
+    // Gated on shaderInt64 (the kernel does real 64-bit arithmetic) and on the
+    // archive carrying the key. Every other combination — int32 params, float
+    // params, fp16/fp32 output, no shaderInt64 — keeps the host generator
+    // below, unchanged.
+    bool range_gpu_ok() const { return m_dev_ && m_dev_->is_support_shader_int64(); }
+
+    // The int64 kernel lives under its own key (buffer_range_int64), NOT under
+    // buffer_range: the latter is the old host-era stub with four bound param
+    // buffers, and a model carries the archive it was converted against.
+    // Dispatching the new PC layout at the old module, or the reverse, yields
+    // all-zero output with no error. An old .vkopbin has no
+    // buffer_range_int64 at all, so resolve_int64() reports "no pipeline" and
+    // execute() keeps its host generator.
+    bool build_int64_pipeline() {
+        if (pipeline_int64_) return true;
+        if (!range_gpu_ok()) return false;
+        // Optional key: an old .vkopbin predates it, and that is a fallback to
+        // the host generator, not an error. archive_has_spv() is the
+        // non-throwing probe (resolve_spv() throws by design for a key the op
+        // MUST have), and the literal is written at the call site so
+        // tests/test_shader_map_agrees.py can see it.
+        if (!archive_has_spv("buffer_range_int64")) return false;
+        auto i64 = resolve_spv("buffer_range_int64");
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
+            use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+        build_bda_table_module("buffer_range_int64_bda", pc_size_, 1, bda_i64_);
+        return true;
+    }
+
+    bool range_gpu_eligible(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                            const std::vector<std::shared_ptr<core::ITensor>> &outputs) const {
+        if (!range_gpu_ok() || inputs.size() < 3 || outputs.empty() ||
+            !outputs[0]) {
+            return false;
+        }
+        return inputs[0]->dtype() == typeid(int64_t) &&
+               inputs[1]->dtype() == typeid(int64_t) &&
+               inputs[2]->dtype() == typeid(int64_t) &&
+               outputs[0]->dtype() == typeid(int64_t);
+    }
+
+    // Bind the output and record one dispatch.
+    void gpuComputeInt64(const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                         int64_t start, int64_t delta, int count,
+                         const std::vector<int> &out_shape) {
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (output->num_elements() != count) {
+            output->resize(out_shape);
+        }
+        objs_.clear();
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+
+        param_.total = count;
+        param_._pad0 = 0;
+        param_.start_lo = static_cast<int>(uint64_t(start) & 0xFFFFFFFFu);
+        param_.start_hi = static_cast<int>(start >> 32);
+        param_.delta_lo = static_cast<int>(uint64_t(delta) & 0xFFFFFFFFu);
+        param_.delta_hi = static_cast<int>(delta >> 32);
+
+        // The int64 module, not the op's primary ones: it has its own key and
+        // its own (1-binding) pipeline. submit-like path, but bound explicitly
+        // so the descriptor set comes from pipeline_int64_.
+        if (submit_bda_table_module(bda_i64_, &param_, UP_DIV(count, 256), 1,
+                                    1)) {
+            // barrier below
+        } else {
+            if (!m_ds_int64_[m_id_]) {
+                m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+            }
+            fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+            pipeline_int64_->updateDescriptorSets(writes_);
+            m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+            m_cmd_->push_constants(*pipeline_int64_,
+                                   static_cast<uint32_t>(pc_size_), &param_);
+            dispatch_and_record(UP_DIV(count, 256), 1, 1, &param_);
+        }
+        if (auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0])) {
+            out_buf->shaderWriteBarrier(
+                m_cmd_->get(),
+                (VkDeviceSize)count * static_cast<VkDeviceSize>(sizeof(int64_t)));
+        }
+    }
+
+    range::GpuRangeParam param_{};
+    BdaTableModule bda_i64_;
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    std::array<VkDescriptorSet, 8> m_ds_int64_{};
+    // Whether the last execute() took the device path. The replay answers key
+    // on it: a device-computed Range has no host work and no state machine.
+    bool range_device_path_taken_ = false;
+
 };
 
 } // namespace ops
