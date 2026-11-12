@@ -1,0 +1,182 @@
+#ifndef BINARY_ELEMENTWISE_BODY_COMP
+#define BINARY_ELEMENTWISE_BODY_COMP
+
+// Shared body for the elementwise binary shaders (shaders/buffer/<op>.comp).
+// Only the math is per-op; the binding shape, ONNX right-aligned broadcast,
+// fp16 half2 packing and BDA indirection are identical across all of them.
+//
+// The including shader provides `#version 450 core`, the -DBDA extensions,
+// `#include "../common/buffer_common.comp"`, `float bin_op(float, float)`, and
+// `#define BINARY_HAS_ACTIVATION 1` if uPC.activation applies to it. The file
+// then builds four ways like the unary body: base / -DFP16 / -DBDA /
+// -DFP16 -DBDA.
+//
+// BINARY_HAS_ACTIVATION is per-op, not per-build: add/sub/mul/div/pow
+// post-fuse an activation, min/max/mod never have.
+//
+// The descriptor PC is already 128 B, so -DBDA instead carries the address of
+// an args buffer with the three dim sets and three data pointers
+// (ops::BinaryBdaPC / BinaryBdaArgs). broadcast==2 (GPU shape-meta SSBOs) has
+// no equivalent there and stays on the descriptor pipeline.
+
+#ifdef BINARY_HAS_ACTIVATION
+#include "activation.comp"
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+#ifdef BDA
+
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer ArgsBuf {
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    DataBuf uOutput;
+    DataBuf uInputA;
+    DataBuf uInputB;
+};
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    int activation;
+    int broadcast;
+    int total;
+    ArgsBuf args;
+} uPC;
+
+#define B_OUTDIMS (uPC.args.outDims)
+#define B_IN0DIMS (uPC.args.in0Dims)
+#define B_IN1DIMS (uPC.args.in1Dims)
+#define B_OUT(linear) (uPC.args.uOutput.data[linear])
+#define B_INA(linear) (uPC.args.uInputA.data[linear])
+#define B_INB(linear) (uPC.args.uInputB.data[linear])
+
+#else
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InputA {
+    uint data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InputB {
+    uint data[];
+} uInputB;
+
+// broadcast==2 reads the real dims from int64 shape SSBOs instead of the PC.
+// Optional bindings: present only when an input carries shape_ssbo_.
+layout(set = 0, binding = 3) readonly buffer ShapeOut {
+    ivec2 data[];
+} uShapeOut;
+layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
+    ivec2 data[];
+} uShapeIn0;
+layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
+    ivec2 data[];
+} uShapeIn1;
+
+LOAD_DIMS_INIT(load_out_dims, uShapeOut.data)
+LOAD_DIMS_INIT(load_in0_dims, uShapeIn0.data)
+LOAD_DIMS_INIT(load_in1_dims, uShapeIn1.data)
+
+// Mirrors ops::BinaryElemPC field for field.
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    int activation;
+    int broadcast;
+    int total;
+    int _pad;
+} uPC;
+
+#define B_OUTDIMS (uPC.outDims)
+#define B_IN0DIMS (uPC.in0Dims)
+#define B_IN1DIMS (uPC.in1Dims)
+#define B_OUT(linear) (uOutput.data[linear])
+#define B_INA(linear) (uInputA.data[linear])
+#define B_INB(linear) (uInputB.data[linear])
+
+#endif
+
+// Dims are threaded in so broadcast==2 loads the shape SSBOs ONCE (in main)
+// rather than per element. broadcast==0/1 use the PC dims directly.
+float load_elem(int linear, IArr8 out_d, IArr8 in0_d) {
+    if (uPC.broadcast == 0) {
+#ifdef FP16
+        return unpackHalf2x16(B_INA(linear >> 1))[linear & 1];
+#else
+        return uintBitsToFloat(B_INA(linear));
+#endif
+    }
+    int ia = broadcast_index(linear, out_d, in0_d, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(B_INA(ia >> 1))[ia & 1];
+#else
+    return uintBitsToFloat(B_INA(ia));
+#endif
+}
+
+float load_elem_b(int linear, IArr8 out_d, IArr8 in1_d) {
+    int ib = (uPC.broadcast == 0)
+                 ? linear
+                 : broadcast_index(linear, out_d, in1_d, uPC.rank);
+#ifdef FP16
+    return unpackHalf2x16(B_INB(ib >> 1))[ib & 1];
+#else
+    return uintBitsToFloat(B_INB(ib));
+#endif
+}
+
+// A macro, not a function: glslc keeps a function as an OpFunctionCall
+// instead of inlining it, which cost ~7 instructions on every fp32 module.
+#ifdef BINARY_HAS_ACTIVATION
+#define BIN_APPLY(a, b) activation(FLOAT(bin_op((a), (b))), uPC.activation)
+#else
+#define BIN_APPLY(a, b) bin_op((a), (b))
+#endif
+
+void main() {
+    IArr8 out_d = B_OUTDIMS;
+    IArr8 in0_d = B_IN0DIMS;
+    IArr8 in1_d = B_IN1DIMS;
+#ifndef BDA
+    if (uPC.broadcast == 2) {
+        out_d = load_out_dims(uPC.rank);
+        in0_d = load_in0_dims(uPC.rank);
+        in1_d = load_in1_dims(uPC.rank);
+    }
+#endif
+    int gid = int(gl_GlobalInvocationID.x);
+#ifdef FP16
+    int nwords = (uPC.total + 1) / 2;
+    if (gid >= nwords) return;
+    int i0 = 2 * gid;
+    int i1 = 2 * gid + 1;
+    // Compute both elements before writing: a store of i0 followed by a load
+    // of i1 corrupts the shared word's high half when the output is recycled
+    // onto input A (in-place). One packed store at the end avoids the
+    // read-modify-write dependency.
+    vec2 out_pair;
+    out_pair[0] = BIN_APPLY(load_elem(i0, out_d, in0_d),
+                            load_elem_b(i0, out_d, in1_d));
+    if (i1 < uPC.total) {
+        out_pair[1] = BIN_APPLY(load_elem(i1, out_d, in0_d),
+                                load_elem_b(i1, out_d, in1_d));
+    } else {
+        out_pair[1] = unpackHalf2x16(B_OUT(gid))[1];  // keep the high half
+    }
+    B_OUT(gid) = packHalf2x16(out_pair);
+#else
+    if (gid >= uPC.total) return;
+    B_OUT(gid) = floatBitsToUint(BIN_APPLY(load_elem(gid, out_d, in0_d),
+                                           load_elem_b(gid, out_d, in1_d)));
+#endif
+}
+
+#endif // BINARY_ELEMENTWISE_BODY_COMP
