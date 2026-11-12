@@ -73,6 +73,11 @@ class NonZero : public BufferFactory {
     // Whether the last round's fingerprint matched (drives the replay and
     // host-work answers).
     bool nz_reusable_ = false;
+    // Whether cached_out_ holds a result AT ALL. An all-zero mask legitimately
+    // produces an EMPTY output (count == 0), so "the cache is empty" cannot
+    // double as "nothing has been computed" -- doing so made a text-only
+    // prompt rescan its mask on every round forever.
+    bool nz_cached_ = false;
     bool invalidate_pending_ = false;
     // Mask values read once because the mask is a read-only leaf.
     std::vector<double> leaf_mask_values_;
@@ -107,7 +112,7 @@ class NonZero : public BufferFactory {
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (!nz_reusable_ || cached_out_.empty() ||
+        if (!nz_reusable_ ||
             outputs.empty() || !outputs[0]) {
             return false;
         }
@@ -193,7 +198,7 @@ class NonZero : public BufferFactory {
                 leaf_mask_valid_ = true;
             }
         }
-        nz_reusable_ = !cached_out_.empty() && !invalidate_pending_ &&
+        nz_reusable_ = nz_cached_ && !invalidate_pending_ &&
                        shape == cached_shape_ && input_fp == cached_input_;
         invalidate_pending_ = false;
         if (nz_reusable_) {
@@ -250,6 +255,7 @@ class NonZero : public BufferFactory {
         cached_input_ = input_fp;
         cached_out_shape_ = out_shape;
         cached_out_ = out;
+        nz_cached_ = true;
 
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(out_shape);
