@@ -1,0 +1,35 @@
+#version 450 core
+
+// int64-data Div. Needs real 64-bit integer arithmetic, so the device feature
+// shaderInt64 is required; the host gates on
+// VulkanDevice::is_support_shader_int64() and keeps the CPU path otherwise.
+#extension GL_ARB_gpu_shader_int64 : require
+
+// C = A / B over int64 tensors bound as ivec2[], C-style truncation toward
+// zero — the same operator the CPU path used. See add_int64.comp for why this
+// replaces that path.
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
+#include "../common/buffer_common.comp"
+
+int64_t bin_op_i64(int64_t a, int64_t b) {
+    // The two cases where C integer division is undefined. On the host they
+    // were a SIGFPE / silent UB; a shader must not rely on either, so pin them
+    // to a defined value instead of whatever the driver emits.
+    if (b == 0) return int64_t(0);
+    // INT64_MIN / -1 overflows (the negation is not representable). The
+    // constant is built by shifting rather than written as one literal: glslc
+    // rejects a bare 0x7FFFFFFFFFFFFFFF as "hexadecimal literal too big", and
+    // i64_max + 1 would itself overflow.
+    const int64_t i64_min = int64_t(-0x7FFFFFFF - 1) << 32;
+    if (b == int64_t(-1) && a == i64_min) {
+        return a;
+    }
+    return a / b;
+}
+
+#include "../common/binary_int64_body.comp"

@@ -623,6 +623,24 @@ vkop_shader_variant(buffer_cast_int64_bda buffer/cast_int64 -DBDA)
 # int64 Transpose (the NonZero output). A pure ivec2 move, so unlike the Cast
 # twin it does NOT need shaderInt64.
 vkop_shader_variant(buffer_transpose_int64_bda buffer/transpose_int64 -DBDA)
+# int64 elementwise binary (add/sub/mul/div). Unlike concat/where/gather/
+# expand/transpose these are NOT byte moves: the result of two int64 operands
+# is an int64, which needs real 64-bit arithmetic, so they require shaderInt64
+# like the Cast twin. The host keeps its CPU path for devices without the
+# feature (BufferBinaryFactory::cpuComputeInt64).
+vkop_shader_variant(buffer_add_int64_bda buffer/add_int64 -DBDA)
+vkop_shader_variant(buffer_sub_int64_bda buffer/sub_int64 -DBDA)
+vkop_shader_variant(buffer_mul_int64_bda buffer/mul_int64 -DBDA)
+vkop_shader_variant(buffer_div_int64_bda buffer/div_int64 -DBDA)
+# int64 Range. A SEPARATE KEY from buffer_range on purpose: that module is the
+# old host-era stub (four bound param buffers, 4-byte PC), and the archive a
+# model carries was built against whichever version existed when it was
+# converted. Host code that dispatches one and binds for the other produces
+# all-zero output with no error — exactly the failure the old shader's header
+# warns about. A distinct key means an old .vkopbin simply has no
+# buffer_range_int64 and Range keeps its host generator, which is correct for
+# both.
+vkop_shader_variant(buffer_range_int64_bda buffer/range_int64 -DBDA)
 # The GPU-shape indirect pre-pass (BufferBinaryFactory::submit_prepass), whose
 # two bindings are the out-shape SSBO and the VkDispatchIndirectCommand buffer
 # -- neither comes from the main kernel's objs_ list.

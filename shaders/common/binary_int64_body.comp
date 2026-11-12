@@ -1,0 +1,145 @@
+#ifndef BINARY_INT64_BODY_COMP
+#define BINARY_INT64_BODY_COMP
+
+// Shared body for the int64-data elementwise binary shaders
+// (shaders/buffer/<op>_int64.comp).
+//
+// Unlike the fp bodies, these need REAL 64-bit arithmetic for add/sub/mul/div
+// (the result of two int64 operands is an int64; recombining the words and
+// re-splitting afterwards is the arithmetic). That is a device feature:
+//
+//   #extension GL_ARB_gpu_shader_int64 : require
+//
+// is declared by the including shader, which also means the host must gate
+// pipeline creation on VulkanDevice::is_support_shader_int64() and keep the
+// CPU path when the device lacks it. That matches cast_int64.comp, the one
+// existing consumer of the feature.
+//
+// Layout notes:
+//  - int64 tensors are bound as ivec2[] (8 B/element, two 32-bit words, low
+//    word .x) — the convention every int64 twin in this tree uses
+//    (concat_int64/equal_int64/gather_int64/transpose_int64/cast_int64), so
+//    the host bind path and the descriptor layout are the same as the fp ops'.
+//  - The PC is BinaryElemPC unchanged (rank, out/in0/in1 dims, activation,
+//    broadcast, total), so the int64 pipeline builds from the op's existing
+//    pc_size_/types_ and only the SPIR-V differs.
+//  - No fp16 form: int64 has no packed representation, so the host compiles
+//    the base and -DBDA builds only.
+//
+// The including shader provides `#version 450 core`, the extension, the
+// -DBDA buffer-reference extensions, `#include "../common/buffer_common.comp"`,
+// and `int64_t bin_op_i64(int64_t a, int64_t b)`.
+
+#ifdef BDA
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer DataBuf {
+    ivec2 data[];
+};
+
+layout(buffer_reference, std430, buffer_reference_align = 8) buffer ArgsBuf {
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    DataBuf uOutput;
+    DataBuf uInputA;
+    DataBuf uInputB;
+};
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    int activation;
+    int broadcast;
+    int total;
+    ArgsBuf args;
+} uPC;
+
+#define B_OUTDIMS (uPC.args.outDims)
+#define B_IN0DIMS (uPC.args.in0Dims)
+#define B_IN1DIMS (uPC.args.in1Dims)
+#define B_OUT(linear) (uPC.args.uOutput.data[linear])
+#define B_INA(linear) (uPC.args.uInputA.data[linear])
+#define B_INB(linear) (uPC.args.uInputB.data[linear])
+
+#else
+
+layout(set = 0, binding = 0) writeonly buffer Output {
+    ivec2 data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer InputA {
+    ivec2 data[];
+} uInputA;
+layout(set = 0, binding = 2) readonly buffer InputB {
+    ivec2 data[];
+} uInputB;
+
+// The shared 6-binding descriptor layout declares shape SSBOs at 3/4/5. The
+// int64 path never reads them (its shapes are CPU-known), but the bindings
+// must exist so the descriptor set the host writes matches this module's
+// interface. They stay inside the descriptor branch: the BDA build binds one
+// table descriptor and provides no such bindings.
+layout(set = 0, binding = 3) readonly buffer ShapeOut {
+    ivec2 data[];
+} uShapeOut;
+layout(set = 0, binding = 4) readonly buffer ShapeIn0 {
+    ivec2 data[];
+} uShapeIn0;
+layout(set = 0, binding = 5) readonly buffer ShapeIn1 {
+    ivec2 data[];
+} uShapeIn1;
+
+layout(push_constant) uniform PC_uPC {
+    int rank;
+    IArr8 outDims;
+    IArr8 in0Dims;
+    IArr8 in1Dims;
+    int activation;
+    int broadcast;
+    int total;
+    int _pad;
+} uPC;
+
+#define B_OUTDIMS (uPC.outDims)
+#define B_IN0DIMS (uPC.in0Dims)
+#define B_IN1DIMS (uPC.in1Dims)
+#define B_OUT(linear) (uOutput.data[linear])
+#define B_INA(linear) (uInputA.data[linear])
+#define B_INB(linear) (uInputB.data[linear])
+
+#endif
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// Reassemble one 64-bit element from its word pair. The low word is .x; the
+// high word's sign has to be carried through, so the shift is done in signed
+// arithmetic on an already-sign-extended high word.
+int64_t load_i64(ivec2 w) {
+    return (int64_t(w.y) << 32) | int64_t(uint64_t(uint(w.x)));
+}
+
+// Split a result back into the ivec2 view. Both words are written so the
+// value is well formed for any reader of either word.
+ivec2 store_i64(int64_t v) {
+    return ivec2(int(uint64_t(v) & 0xFFFFFFFFu), int(v >> 32));
+}
+
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uPC.total) return;
+
+    int a_linear, b_linear;
+    if (uPC.broadcast == 0) {
+        a_linear = gid;
+        b_linear = gid;
+    } else {
+        a_linear =
+            broadcast_index(gid, B_OUTDIMS, B_IN0DIMS, uPC.rank);
+        b_linear =
+            broadcast_index(gid, B_OUTDIMS, B_IN1DIMS, uPC.rank);
+    }
+
+    B_OUT(gid) =
+        store_i64(bin_op_i64(load_i64(B_INA(a_linear)),
+                             load_i64(B_INB(b_linear))));
+}
+
+#endif // BINARY_INT64_BODY_COMP

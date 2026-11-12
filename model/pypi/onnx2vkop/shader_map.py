@@ -352,25 +352,44 @@ _SECONDARY: Dict[tuple, List[str]] = {
     # class routes through execute_gpu_shape.
     # NOTE: Equal's entry is merged with its int64 entry above — a second
     # ("Equal", "buffer") dict-literal key would silently overwrite it.
+    # Range's int64 kernel. A SEPARATE KEY from buffer_range on purpose: that
+    # module is the old host-era stub (four bound param buffers, 4-byte PC),
+    # and a model carries the archive it was converted against. Host code that
+    # dispatches one layout at the other's module produces all-zero output with
+    # no error. A distinct key means an old .vkopbin simply has no
+    # buffer_range_int64 and Range keeps its host generator, correct for both.
+    # Resolved by name (Range::build_int64_pipeline), not through _PRIMARY.
+    ("Range", "buffer"): [
+        "buffer_range_int64",
+        "buffer_range_int64_bda",
+    ],
     ("Add", "buffer"): [
+        "buffer_add_int64",
+        "buffer_add_int64_bda",
         "buffer_dispatch_from_shape",
         "buffer_dispatch_from_shape_bda",
         "buffer_add_bda",
         "buffer_add_bda_fp16",
     ],
     ("Sub", "buffer"): [
+        "buffer_sub_int64",
+        "buffer_sub_int64_bda",
         "buffer_dispatch_from_shape",
         "buffer_dispatch_from_shape_bda",
         "buffer_sub_bda",
         "buffer_sub_bda_fp16",
     ],
     ("Mul", "buffer"): [
+        "buffer_mul_int64",
+        "buffer_mul_int64_bda",
         "buffer_dispatch_from_shape",
         "buffer_dispatch_from_shape_bda",
         "buffer_mul_bda",
         "buffer_mul_bda_fp16",
     ],
     ("Div", "buffer"): [
+        "buffer_div_int64",
+        "buffer_div_int64_bda",
         "buffer_dispatch_from_shape",
         "buffer_dispatch_from_shape_bda",
         "buffer_div_bda",

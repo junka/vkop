@@ -1,0 +1,20 @@
+#version 450 core
+
+// int64-data Sub. Needs real 64-bit integer arithmetic, so the device feature
+// shaderInt64 is required; the host gates on
+// VulkanDevice::is_support_shader_int64() and keeps the CPU path otherwise.
+#extension GL_ARB_gpu_shader_int64 : require
+
+// C = A - B over int64 tensors bound as ivec2[] (8 B/element). See
+// add_int64.comp for why this replaces the CPU path.
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
+#include "../common/buffer_common.comp"
+
+int64_t bin_op_i64(int64_t a, int64_t b) { return a - b; }
+
+#include "../common/binary_int64_body.comp"

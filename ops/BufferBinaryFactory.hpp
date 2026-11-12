@@ -382,15 +382,34 @@ class BufferBinaryFactory : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Host work here is only the int64 CPU path (cpuComputeInt64, the
-        // shape-meta chain) and its int64 readback cache misses. The float
-        // path below is a pure GPU dispatch with CPU-known shapes. Reported
-        // before the early returns so every path states its answer.
-        set_did_host_work_last_round(inputs[0]->dtype() == typeid(int64_t));
-        // int64 data flows through a synchronous CPU path (see
-        // cpuComputeInt64). In the LLM every binary node's inputs are either
-        // all-int64 or all-float, so gating on the data input's dtype is safe.
-        if (inputs[0]->dtype() == typeid(int64_t)) {
+        // Host work here is the int64 CPU path (cpuComputeInt64) and its
+        // readback cache misses. The float path below is a pure GPU dispatch,
+        // and so is the int64 path once the device has shaderInt64 and the
+        // archive carries this op's int64 kernel.
+        const bool i64 = inputs[0]->dtype() == typeid(int64_t);
+        const bool i64_gpu = i64 && int64_gpu_ok() && !int64_shader_key().empty();
+        // Reported before the early returns so every path states its answer.
+        // A device-computed int64 result is not host work: the recording is
+        // self-contained and replays like any other dispatch. The first
+        // attempt still has to prove the pipeline builds (a key gap or a
+        // driver that rejects the module falls through to the CPU path), so
+        // the gate is evaluated on the path actually taken below.
+        set_did_host_work_last_round(i64 && !int64_gpu_path_taken_);
+
+        // int64 data: device kernel when available, CPU otherwise. In the LLM
+        // every binary node's inputs are either all-int64 or all-float, so
+        // gating on the data input's dtype is safe.
+        if (i64) {
+            auto shape_a = inputs[0]->getShape();
+            auto shape_b = inputs[1]->getShape();
+            auto out_shape = computeBroadcastShape(shape_a, shape_b);
+            if (i64_gpu) {
+                gpuComputeInt64(inputs, outputs, out_shape, shape_a, shape_b);
+                int64_gpu_path_taken_ = true;
+                set_did_host_work_last_round(false);
+                return;
+            }
+            int64_gpu_path_taken_ = false;
             cpuComputeInt64(inputs, outputs);
             return;
         }
@@ -604,6 +623,147 @@ class BufferBinaryFactory : public BufferFactory {
     }
 
     int activation_;
+
+    // --- int64-data GPU path ---
+    //
+    // add/sub/mul/div over int64 used to run entirely on the CPU
+    // (cpuComputeInt64): read both inputs back, compute in a loop, re-upload.
+    // That is host work a segment replay skips, so every binary level in an
+    // int64 shape chain was unreplayable. The <op>_int64.comp kernels compute
+    // it on the device instead, but they need real 64-bit arithmetic and hence
+    // the shaderInt64 feature -- which the device may not have. Those two facts
+    // decide the shape of the code below:
+    //
+    //   * int64_gpu_ok() is the device gate. False means the CPU path stays
+    //     exactly as it was, so nothing regresses on a device without the
+    //     feature.
+    //   * The kernels have no fp16 form (int64 has no packed representation),
+    //     so they are built as one fp32-layout pipeline plus a BDA table
+    //     module, mirroring Equal/Concat's int64 twins.
+    //
+    // The host-authoritative question is separate and is answered where the
+    // output is published -- see publish_int64_gpu_result().
+    bool int64_gpu_ok() const {
+        return m_dev_ && m_dev_->is_support_shader_int64();
+    }
+
+    // The key this op's int64 kernel lives under, or empty when the op has no
+    // int64 kernel at all (min/max/mod/pow keep the CPU path: they are not on
+    // any shape-meta chain in practice, and each extra kernel is another
+    // shaderInt64 module to build and carry).
+    std::string int64_shader_key() const {
+        switch (type_) {
+        case OpType::ADD:
+            return "buffer_add_int64";
+        case OpType::SUB:
+            return "buffer_sub_int64";
+        case OpType::MUL:
+            return "buffer_mul_int64";
+        case OpType::DIV:
+            return "buffer_div_int64";
+        default:
+            return std::string();
+        }
+    }
+
+    // Build the int64 pipeline lazily on the first int64 execute. Same
+    // descriptor layout (6x STORAGE) and PC (BinaryElemPC) as the fp path, so
+    // it builds from the inherited types_/pc_size_; only the SPIR-V differs.
+    void ensure_int64_pipeline() {
+        if (pipeline_int64_)
+            return;
+        bool use_uab = update_after_bind_ &&
+                       m_dev_->is_support_descriptor_update_after_bind();
+        const std::string key = int64_shader_key();
+        auto i64 = resolve_spv(key);
+        pipeline_int64_ = std::make_unique<VulkanPipeline>(
+            m_dev_->getLogicalDevice(), types_, pc_size_, i64.first, i64.second,
+            use_uab, required_subgroup_size_);
+        for (auto &ds : m_ds_int64_) {
+            ds = pipeline_int64_->allocDescriptorSets();
+        }
+        build_bda_table_module(key + "_bda", pc_size_, 6, bda_i64_);
+    }
+
+    // Bind the int64 pipeline instead of the fp one for this dispatch. Mirrors
+    // Equal's override: the BDA table wins when it built, otherwise the
+    // descriptor pipeline's own set.
+    void submit_int64(void *ptr, int width, int height, int layers) {
+        if (submit_bda_table_module(bda_i64_, ptr, width, height, layers)) {
+            return;
+        }
+        if (!m_ds_int64_[m_id_]) {
+            m_ds_int64_[m_id_] = pipeline_int64_->allocDescriptorSets();
+        }
+        fillWriteDescriptorSets(m_ds_int64_[m_id_]);
+        pipeline_int64_->updateDescriptorSets(writes_);
+        m_cmd_->bind(*pipeline_int64_, m_ds_int64_[m_id_]);
+        if (ptr) {
+            m_cmd_->push_constants(*pipeline_int64_,
+                                   static_cast<uint32_t>(pc_size_), ptr);
+        }
+        dispatch_and_record(width, height, layers, ptr);
+    }
+
+    // Dispatch one int64 elementwise binary on the device. `objs_` is filled
+    // with output / A / B, in that order.
+    void gpuComputeInt64(const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+                         const std::vector<std::shared_ptr<core::ITensor>> &outputs,
+                         const std::vector<int> &out_shape,
+                         const std::vector<int> &shape_a,
+                         const std::vector<int> &shape_b) {
+        ensure_int64_pipeline();
+        int total = total_elems(out_shape);
+
+        BinaryElemPC pc{};
+        pc.rank = static_cast<int>(out_shape.size());
+        fill_dims(pc.outDims, out_shape);
+        fill_dims_broadcast(pc.in0Dims, shape_a, pc.rank);
+        fill_dims_broadcast(pc.in1Dims, shape_b, pc.rank);
+        pc.activation = activation_;
+        pc.broadcast = (shape_a == out_shape && shape_b == out_shape) ? 0 : 1;
+        pc.total = total;
+
+        objs_.clear();
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (output->num_elements() != total) {
+            output->resize(out_shape);
+        }
+        objs_.emplace_back(output->as_storage_buffer(m_dev_, m_cmd_));
+        auto a = core::as_tensor<int64_t>(inputs[0]);
+        objs_.emplace_back(a->as_storage_buffer(m_dev_, nullptr));
+        auto b = core::as_tensor<int64_t>(inputs[1]);
+        objs_.emplace_back(b->as_storage_buffer(m_dev_, nullptr));
+
+        submit_int64(&pc, UP_DIV(total, 256), 1, 1);
+
+        // Flush the shader's writes so the next level's GPU reader sees them
+        // (same barrier Equal's int64 path emits).
+        //
+        // Deliberately NOT mirrored into the tensor's host bytes. The CPU path
+        // could mark the result host-authoritative because it had just computed
+        // it; a device dispatch has not, and a per-round mirror would trade
+        // "this level re-records" for "this level synchronises" -- a worse
+        // deal, and the very cost the shape-meta chain was built to avoid.
+        // What actually keeps downstream host readers cheap is their own
+        // learned caches: Reshape's resolve_dim() stops reading once its state
+        // reaches STABLE, and the shape-meta binaries downstream of here are
+        // themselves on this same GPU path. So the readback a consumer does is
+        // a warm-up cost, not a per-round one.
+        if (auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0])) {
+            out_buf->shaderWriteBarrier(
+                m_cmd_->get(),
+                (VkDeviceSize)total_elems(out_shape) * sizeof(int64_t));
+        }
+    }
+
+    std::unique_ptr<VulkanPipeline> pipeline_int64_;
+    std::array<VkDescriptorSet, 8> m_ds_int64_{};
+    BdaTableModule bda_i64_;
+    // Whether the last execute() took the device path. Feeds
+    // did_host_work_last_round so a segment containing this op is replayable
+    // only when the recording really is self-contained.
+    bool int64_gpu_path_taken_ = false;
 
     // Read an int64 input into its host data_ with a per-input auto-learning
     // cache. STABLE inputs skip copyToCPU (the ~3.2ms submit+wait) and reuse
