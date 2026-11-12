@@ -322,8 +322,9 @@ class Operator {
     //
     // Segment replay needs this distinction. `has_host_side_effects()` says a
     // type CAN touch the host; for Transpose that is only an int64 payload (the
-    // CPU permute), for Reshape only a non-STABLE shape channel, for MatMul
-    // only a split-K control header that actually changed. Gating on the type
+    // CPU permute), for Reshape only a readback that changed the target, for
+    // MatMul only a split-K control header that actually changed. Gating on
+    // the type
     // marked every segment dynamic: measured 296 of 384 segments re-recording,
     // with submit rising 0.1 -> 3.3 ms/round and the round going 20.1 -> 34.7
     // ms. Ops that can skip their host work set this to false on the rounds

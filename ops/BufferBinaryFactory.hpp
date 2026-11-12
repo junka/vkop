@@ -304,14 +304,10 @@ class BufferBinaryFactory : public BufferFactory {
 
         auto a = core::as_tensor<int64_t>(inputs[0]);
         auto b = core::as_tensor<int64_t>(inputs[1]);
-        // Auto-learning per-input readback cache: each of a/b is a tiny int64
-        // tensor whose values are almost always round-invariant across decode
-        // (only the rare kv_len-derived one changes). After two matching
-        // readbacks, skip copyToCPU and reuse the cached host vector. The op
-        // still recomputes its output on CPU every round (its output feeds
-        // downstream shape-meta ops on CPU), so downstream correctness is
-        // unaffected — only the readback is skipped.
-        // invalidate_shape_cache() (phase boundary) resets to LEARNING.
+        // Each of a/b is a tiny int64 tensor. A read-only leaf is read once;
+        // anything else is read every round (see read_int64_cached). The op
+        // still recomputes its output on the host either way, since its
+        // result feeds downstream shape-meta ops on the CPU.
         read_int64_cached(a, 0);
         read_int64_cached(b, 1);
 
@@ -740,11 +736,10 @@ class BufferBinaryFactory : public BufferFactory {
         // it; a device dispatch has not, and a per-round mirror would trade
         // "this level re-records" for "this level synchronises" -- a worse
         // deal, and the very cost the shape-meta chain was built to avoid.
-        // What actually keeps downstream host readers cheap is their own
-        // learned caches: Reshape's resolve_dim() stops reading once its state
-        // reaches STABLE, and the shape-meta binaries downstream of here are
-        // themselves on this same GPU path. So the readback a consumer does is
-        // a warm-up cost, not a per-round one.
+        // What keeps downstream host readers cheap is that their inputs are
+        // read-only leaves (read once) and the shape-meta binaries downstream
+        // of here are themselves on this same GPU path. So the readback a
+        // consumer does is a warm-up cost, not a per-round one.
         if (auto out_buf = std::dynamic_pointer_cast<VulkanBuffer>(objs_[0])) {
             out_buf->shaderWriteBarrier(
                 m_cmd_->get(),
@@ -760,20 +755,18 @@ class BufferBinaryFactory : public BufferFactory {
     // only when the recording really is self-contained.
     bool int64_gpu_path_taken_ = false;
 
-    // Read an int64 input into its host data_ with a per-input auto-learning
-    // cache. STABLE inputs skip copyToCPU (the ~3.2ms submit+wait) and reuse
-    // the cached host vector. The op still recomputes its output on CPU every
-    // round from the (cached or freshly-read) host data — only the readback is
-    // skipped, so downstream correctness is unaffected.
+    // Read an int64 input into its host data_. A read-only leaf is read once
+    // and replayed from the cache; every other input is read every round. The
+    // op recomputes its output on the host either way, so only the readback
+    // differs.
   protected:
     void read_int64_cached(std::shared_ptr<core::Tensor<int64_t>> &t, int idx) {
         // Structural fast path: a read-only leaf input (an initializer or a
         // graph input) cannot change, so its bytes are a constant of the node.
         // Read once and replay them into data_ on later rounds.
         //
-        // The same reasoning as SqueezeUnsqueeze/Reshape: a learned answer
-        // only advances inside execute(), which a re-recorded segment may
-        // skip; a structural one cannot get stuck.
+        // Structural, not learned: a re-recorded segment may skip execute(),
+        // and a learned answer only advances inside it.
         if (t && t->is_read_only_leaf()) {
             if (leaf_in_valid_[idx]) {
                 t->fillToCPU(leaf_in_[idx]);

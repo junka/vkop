@@ -228,11 +228,8 @@ class ReshapeBuffer : public BufferFactory {
     size_t bda_address_table_slots() const override { return 2; }
 
     // Receive the converter's per-input value_dynamic annotation (option C).
-    // Used as a HINT only — the runtime auto-learning cache below is the
-    // authority. value_dynamic=true means "likely changes per round" so we
-    // skip the 2-round learning warmup and readback every round; false means
-    // "likely stable" so we still learn to confirm. Either way, the learned
-    // state (STABLE) is what actually skips readback.
+    // Recorded as a hint; it does not change this op's behaviour — a read-only
+    // leaf is read once, anything else is read and compared every round.
     void set_input_value_dynamic(const std::vector<bool> &vd) override {
         shape_value_dynamic_ = (vd.size() > 1) ? vd[1] : true;
     }
@@ -268,26 +265,9 @@ class ReshapeBuffer : public BufferFactory {
         // target right before onExecute — no shape input exists, so no
         // readback and no learning cache.
         //
-        // Legacy two-input mode: the int64 shape input (inputs[1]) via the
-        // runtime auto-learning + linear-growth cache (resolve_dim). Across
-        // decode rounds, most Reshape shape inputs are round-invariant
-        // (125/181 — only 56 kv_len-derived ones grow). Rather than trust
-        // the converter's value_dynamic hint, we LEARN by comparing two
-        // consecutive rounds' readback results:
-        //   LEARNING  (round 0): readback, store as learned_dim_.
-        //   CONFIRMING(round 1): readback, compare to learned_dim_.
-        //               match  -> STABLE: skip readback on round 2+ (reuse).
-        //               differ -> DYNAMIC: readback every round.
-        //   STABLE    (round 2+): reuse cached dim[], no copyToCPU stall.
-        //   DYNAMIC   (round 2+): readback every round (value changes).
-        // invalidate_shape_cache() (prefill->decode boundary) resets to
-        // LEARNING so the new phase re-learns. The 3.2ms submit+wait per
-        // Reshape is the dominant decode cost (181 × 3.2ms = 586ms); STABLE
-        // reshapes skip it entirely. STABLE skips the readback; LINEAR_GROW
-        // predicts kv_len+1 growth; RE_STABLE re-promotes a changed-once-
-        // then-constant shape. The 56 kv_len Reshapes were the dominant
-        // readback cost after Expand; this cuts them to ~7 verification
-        // readbacks/round.
+        // Legacy two-input mode: the int64 shape input (inputs[1]), resolved
+        // by resolve_dim — read once if it is a read-only leaf, read and
+        // compared with last round's otherwise.
         std::vector<int> dim;
         if (host_target_valid_) {
             // Host-shape mode: the runtime evaluated the target from live
@@ -375,10 +355,9 @@ class ReshapeBuffer : public BufferFactory {
         // shape. No readback, no re-upload. The view op preserves element count
         // (total from inputs[0] == output total), so the input's buffer is
         // exactly large enough. `dim` (the new shape) is still resolved above
-        // — via the auto-learning cache for stable reshapes (no readback) or a
-        // shape-input readback for dynamic ones — because downstream needs the
-        // CPU-known dims_ for getShape()/dispatch. But the DATA no longer
-        // crosses GPU->CPU.
+        // — read once for a leaf shape input, read and compared otherwise —
+        // because downstream needs the CPU-known dims_ for getShape()/dispatch.
+        // But the DATA no longer crosses GPU->CPU.
         //
         // CPU fallback: when the input is host-only, copy bytes through CPU.
         if (inputs[0]->dtype() == typeid(int64_t)) {
@@ -515,8 +494,8 @@ class ReshapeBuffer : public BufferFactory {
         // paths above) eliminates a redundant dispatch per Reshape — 181
         // dispatches/decode round on the LLM. vkop ops use separate output
         // buffers (no in-place writes), so sharing the input buffer is safe.
-        // The `dim` is already resolved above (auto-learning cache) for
-        // downstream getShape(); only the DATA copy is skipped.
+        // The `dim` is already resolved above for downstream getShape(); only
+        // the DATA copy is skipped.
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto dummy) {
             using T = decltype(dummy);
             auto output = core::as_tensor<T>(outputs[0]);

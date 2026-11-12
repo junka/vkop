@@ -156,12 +156,9 @@ class SliceBuffer : public BufferFactory {
     // output + input.
     size_t bda_address_table_slots() const override { return 2; }
 
-    // The 8 Slice instances in the decode graph read back starts/ends/axes/
-    // steps (int64 shape-meta) every round. For the fp32/fp16 paths these
-    // scalars are STABLE across decode rounds (deepstack/visual fixed shapes),
-    // and neither reads back data anymore (data goes through the GPU shader).
-    // So STABLE lets them skip ALL readback. The i64 path still reads back data
-    // (CPU slice), but STABLE still skips the starts/ends meta readback for it.
+    // The 8 Slice instances in the decode graph read starts/ends/axes/steps
+    // (int64 shape-meta). The fp32/fp16 paths read no data (it goes through the
+    // GPU shader); the i64 path still walks the bytes on the host.
     // The slicing parameters and the data shape from the round the recording
     // was built with. Comparing against them answers "would a replay produce
     // this round's output size?" directly, with no learned state.
@@ -195,9 +192,9 @@ class SliceBuffer : public BufferFactory {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
         // Host work here: the int64 data slice walks the bytes on the host
-        // (below), and a non-STABLE meta readback stalls. A STABLE fp32/fp16
-        // slice is a pure GPU dispatch. Reported up front so every path
-        // states its answer.
+        // (below), and a meta readback stalls when the parameters changed. An
+        // unchanged fp32/fp16 slice is a pure GPU dispatch. Reported up front
+        // so every path states its answer.
         set_did_host_work_last_round(
             inputs[0]->dtype() == typeid(int64_t) ||
             (meta_dirty_ || meta_changed_last_round_));
@@ -230,11 +227,10 @@ class SliceBuffer : public BufferFactory {
                 "Slice: input dtype disagrees with the built fp16 variant");
         }
 
-        // STABLE fast path: if the meta inputs (inshape + starts/ends/axes/
-        // steps) matched last round, reuse the cached out_size and skip the
-        // starts/ends/axes/steps readback entirely. The data input is still
-        // read back below for the i64 CPU-slice path; the fp32/fp16 GPU paths
-        // read no data, so this is a complete readback skip for them.
+        // Reuse path: when the meta inputs (inshape + starts/ends/axes/steps)
+        // match last round's, the cached out_size still holds. The data input
+        // is still read below for the i64 CPU-slice path; the fp32/fp16 GPU
+        // paths read no data, so for them this skips every readback.
         std::vector<std::vector<int>> out_size;
         bool meta_reused = false;
         // Structural fast path: every slicing parameter (starts/ends/axes/

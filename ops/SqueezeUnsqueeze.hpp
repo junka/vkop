@@ -55,12 +55,6 @@ class SqueezeUnsqueeze : public Operator {
         }
     }
 
-    // Phase-boundary reset (prefill->decode): re-learn axis stability. The
-    // axes that are stable in prefill may differ in decode (seq collapses), so
-    // we can't carry STABLE across. Mirrors the ReshapeBuffer auto-learning
-    // cache: the axes input is a tiny int64 tensor whose values are almost
-    // always round-invariant (only the rare kv_len-derived one changes), so
-    // after two matching readbacks we skip copyToCPU and reuse cached axes.
     void invalidate_shape_cache() override {
         // Nothing to reset: the axes are read once when they are a
         // read-only leaf and re-read every round otherwise. Kept as an
@@ -76,23 +70,17 @@ class SqueezeUnsqueeze : public Operator {
         // copy below. The GPU-alias path — every LLM instance — reads no bytes
         // and dispatches nothing; it is a pure metadata view.
         //
-        // Conservative default (the type answer), refined below once the axes
-        // source is known: a host-authoritative axes tensor makes this a
-        // constant of the node (see that branch), and a STABLE learner means
-        // the readback is skipped. Stated here rather than at the early
-        // returns so every path has an answer.
+        // A read-only leaf axes tensor makes this a one-time read (see the
+        // branch below); anything else is read every round. Stated here rather
+        // than at the early returns so every path has an answer.
         set_did_host_work_last_round(inputs.size() > 1 && inputs[1] &&
                                      !inputs[1]->is_read_only_leaf());
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 
-        // Resolve axes: input[1] (int64) if present, else the attribute.
-        // The axes input (when present) is a tiny int64 tensor that is almost
-        // always round-invariant across decode (e.g. [-1], [0,2] fixed by the
-        // graph). Auto-learning cache: readback round0+round1; if equal, mark
-        // STABLE and skip copyToCPU on round 2+ (reuses cached axes). Same
-        // state-machine pattern as ReshapeBuffer. invalidate_shape_cache()
-        // (phase boundary) resets to LEARNING.
+        // Resolve axes: input[1] (int64) if present, else the attribute. The
+        // axes input is a tiny int64 tensor that is a read-only leaf in
+        // practice (e.g. [-1], [0,2] fixed by the graph).
         std::vector<int> axes;
         if (inputs.size() > 1 && inputs[1]) {
             // Structural fast path: a host-authoritative axes tensor (an
@@ -275,12 +263,8 @@ class SqueezeUnsqueeze : public Operator {
     bool unsqueeze_;
     std::vector<int> axes_attr_;
 
-    // --- axes-input value cache (runtime auto-learning) ---
-    // The axes input is round-invariant across decode (only the rare
-    // kv_len-derived one changes). We learn stability by comparing two
-    // consecutive readbacks, then STABLE ops skip copyToCPU (the ~3.2ms
-    // submit+wait that dominates decode). See execute() for the state machine.
-    // invalidate_shape_cache() resets to LEARNING at phase boundaries.
+    // Axes are read once when the input is a read-only leaf, and every round
+    // otherwise. See execute().
 };
 
 } // namespace ops

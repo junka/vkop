@@ -143,10 +143,9 @@ class Expand : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
-        // Host work here is the target-shape readback (a non-STABLE learner
-        // or a STABLE verify round). The fp and int64 GPU dispatches
-        // themselves touch no host state. Reported up front so every path
-        // states its answer.
+        // Host work here is the target-shape readback. The fp and int64 GPU
+        // dispatches themselves touch no host state. Reported up front so
+        // every path states its answer.
         // A leaf target makes this a one-time read; otherwise it is read every
         // round, and the report follows whether it CHANGED (see
         // resolve_target_shape, which sets target_changed_).
@@ -176,16 +175,14 @@ class Expand : public Operator {
         // writes the broadcast output as ivec2[] — verbatim 8-byte copies, no
         // 64-bit math needed (Expand is a broadcast indexed copy).
         //
-        // The target shape (out dims) is passed via push_constant (outDims) —
-        // the runtime resolves it from the target-shape input via the
-        // auto-learning cache (decode-stable for most Expands) or a readback
-        // (dynamic ones). Either way the CPU knows outDims at dispatch time, so
-        // dispatch is exact (UP_DIV(total,256), no over-dispatch).
+        // The target shape (out dims) is passed via push_constant (outDims).
+        // The CPU knows it at dispatch time — read once for a leaf target, read
+        // per round otherwise — so the dispatch is exact
+        // (UP_DIV(total,256), no over-dispatch).
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            // Resolve the target shape from inputs[1] with the auto-learning +
-            // linear-growth cache (see resolve_target_shape). STABLE skips the
-            // readback; LINEAR_GROW predicts kv_len+1 growth and verifies
-            // periodically. invalidate_shape_cache() (phase boundary) resets.
+            // Resolve the target shape from inputs[1] (see
+            // resolve_target_shape): read once for a read-only leaf, read and
+            // compared per round otherwise.
             bool did_readback = false;
             std::vector<int> target_shape =
                 resolve_target_shape(inputs[1], did_readback);
@@ -269,11 +266,8 @@ class Expand : public Operator {
         // graph shape inference) can be stale/wrong, so recompute it here from
         // the authoritative target buffer + the input shape.
         //
-        // Target-shape cache (resolve_target_shape): STABLE skips the readback;
-        // LINEAR_GROW predicts the kv_len+1 growth pattern ([1,8,2,seq,128]
-        // where only seq increments) and verifies every 8 rounds. The 56
-        // kv_len-derived fp Expands were the dominant Expand cost (~57ms/round,
-        // 56 readbacks); LINEAR_GROW cuts them to ~7 readbacks/round.
+        // The target comes from resolve_target_shape: read once for a
+        // read-only leaf, read and compared per round otherwise.
         bool did_readback = false;
         std::vector<int> target_shape =
             resolve_target_shape(inputs[1], did_readback);

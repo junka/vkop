@@ -36,20 +36,20 @@ struct alignas(16) NonZeroPC {
 // have an all-False mask -> count=0 -> empty [1,0] output -> empty scatter,
 // which is the correct no-op.)
 //
-// STABLE cache: the mask is phase-invariant (fixed for the whole decode
-// phase — the image doesn't change between tokens), so two consecutive
-// matching readbacks promote to STABLE and skip the copyToCPU entirely,
-// reusing the cached [rank, count] output. invalidate_shape_cache() resets
-// at the prefill->decode boundary (and on every new prompt via
-// Runtime::invalidate_replay). STABLE trusts the phase contract and reuses
-// the cached output unconditionally — there is NO periodic verify readback.
-// Rationale: within a decode phase the image_pad_mask is byte-identical every
-// round (the driver writes [1,1] all-zero on every decode step), so a verify
-// would never observe drift; the only point where the mask legitimately
-// changes is a phase boundary, which already resets the state via
-// invalidate_shape_cache(). A verify readback here would only pay a sync stall
-// (it splits the graph into an extra segment) to confirm something the phase
-// contract already guarantees.
+// Reuse: the mask is read and compared with last round's. When it is
+// byte-identical the [rank, count] output is too, so it is re-filled from the
+// cache instead of rescanned; when it differs the op rescans. A read-only leaf
+// mask (the image_pad_mask chain) is read exactly once.
+//
+// This used to be a LEARN/CONFIRMING/STABLE machine that promoted after two
+// matching rounds and then trusted the mask never to change for the rest of
+// the phase, with no verify. Its justification was the phase contract — "the
+// image doesn't change between tokens" — which is an assumption about the
+// driver, not a property of this op, and the state it relied on only advanced
+// inside execute(), which a re-recorded segment may skip.
+//
+// The output stays GPU-mirrored and host-authoritative in host-shape mode so a
+// downstream ScatterElements can read it without a readback.
 class NonZero : public BufferFactory {
   public:
     explicit NonZero()
@@ -87,14 +87,14 @@ class NonZero : public BufferFactory {
     }
     bool has_host_side_effects() const override { return true; }
 
-    // Replay answers. In STABLE this op re-fills and re-uploads the SAME cached
-    // bytes every round, so the recording it produces is identical round to
-    // round — a replay re-runs that recorded upload and reproduces exactly the
-    // right buffer contents. What a replay skips is the host-side half (data_ +
-    // host_authoritative), which refresh_dynamic_params() redoes.
+    // Replay answers. When the mask compared equal, this op re-fills and
+    // re-uploads the SAME cached bytes, so the recording it produces is
+    // identical round to round — a replay re-runs that recorded upload and
+    // reproduces exactly the right buffer contents. What a replay skips is the
+    // host-side half (data_ + host_authoritative), which
+    // refresh_dynamic_params() redoes.
     //
-    // LEARNING/CONFIRMING/DYNAMIC do a real readback whose result can differ;
-    // those keep the conservative answer.
+    // A round whose mask changed keeps the conservative answer.
     bool recording_changes_per_round() const override {
         return !nz_reusable_;
     }
@@ -145,11 +145,10 @@ class NonZero : public BufferFactory {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Host work here is the mask readback + host coordinate scan below;
-        // the STABLE fast path re-fills the cached output on the host instead
-        // (still host work, still skipped by a replay — so NonZero stays
-        // dynamic either way).
-        set_did_host_work_last_round(true);
+        // Host work here is the mask readback and, when the mask changed, the
+        // host coordinate scan below. The reuse path re-fills the cached output
+        // instead and reports no host work (see did_host_work_last_round,
+        // which overrides this flag for that reason).
         auto shape = inputs[0]->getShape();
         int rank = static_cast<int>(shape.size());
         if (rank == 0) {

@@ -406,12 +406,11 @@ class Gather : public Operator {
         if (host_shape_enabled()) {
             output->set_host_authoritative();
         }
-        // Advance the learning machine on the INDEX fingerprint. The indices
-        // decide which rows come out; the data contributes its bytes but in
-        // the shape-meta chain it is a fixed table. Comparing the (tiny)
-        // indices is the cheap half of the invariant and the half that can
-        // change without the shape changing (a Gather whose index tensor is
-        // recomputed from a growing dim).
+        // Remember the INDEX fingerprint. The indices decide which rows come
+        // out; the data contributes its bytes but in the shape-meta chain it is
+        // a fixed table. Comparing the (tiny) indices is the cheap half of the
+        // invariant and the half that can change without the shape changing (a
+        // Gather whose index tensor is recomputed from a growing dim).
         cached_idx_.assign(indices->data().begin(), indices->data().end());
         cached_idx_shape_ = idx_shape;
         cached_out_ = out;
@@ -423,12 +422,12 @@ class Gather : public Operator {
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
         // The int64 host path (cpuComputeInt64) does host work a replay would
-        // skip, but only while it is still learning: once the cache reaches
-        // STABLE the recording reproduces the same bytes every round, and
-        // did_host_work_last_round() (which overrides this flag for exactly
-        // that reason) reports the instance answer. Every other path (the
-        // fp32/fp16 gather, the int64 GPU shader, the zero-copy alias) records
-        // a dispatch and touches no host state.
+        // skip — but when this round's indices match the recording's, the
+        // gathered bytes reproduce exactly, and did_host_work_last_round()
+        // (which overrides this flag for that reason) reports the instance
+        // answer. Every other path (the fp32/fp16 gather, the int64 GPU
+        // shader, the zero-copy alias) records a dispatch and touches no host
+        // state.
         int64_host_path_taken_ =
             inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled();
         set_did_host_work_last_round(int64_host_path_taken_);
