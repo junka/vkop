@@ -247,13 +247,12 @@ class ReshapeBuffer : public BufferFactory {
         host_target_valid_ = true;
     }
     void invalidate_shape_cache() override {
-        // Phase boundary (prefill->decode): reset learning state so the new
-        // phase re-learns stability. The dims that were stable in prefill may
-        // differ in decode (seq collapses), so we can't carry STABLE across.
-        cache_state_ = LearnState::LEARNING;
-        grow_dim_idx_ = -1;
-        linear_rounds_ = 0;
-        re_stable_prev_.clear();
+        // Kept as an explicit no-op: cross-round state is a comparison against
+        // last round's target, so a phase boundary needs no reset — the first
+        // round of the new phase simply differs from the last round of the old
+        // one and is reported as such. (This used to reset a learning machine;
+        // see resolve_dim.)
+        host_target_dirty_ = true;
     }
     bool has_host_side_effects() const override { return true; }
 
@@ -291,53 +290,31 @@ class ReshapeBuffer : public BufferFactory {
         // readbacks/round.
         std::vector<int> dim;
         if (host_target_valid_) {
-            // Host-shape mode: the runtime evaluates the target from live
-            // tensor metadata each round — there is no GPU readback to cache,
-            // but the SAME stability question decides replayability: the
-            // recording was built from the round that recorded it, so a
-            // replay is valid only while the target repeats. Mirror
-            // resolve_dim's machine without readbacks: two consecutive equal
-            // targets promote to STABLE (replayable), anything else stays
-            // dynamic. LINEAR_GROW is deliberately NOT promoted here — a
-            // target that grows every round would replay last round's shape
-            // (the measured failure of the legacy path). invalidate_shape_
-            // cache() (phase boundary) resets cache_state_ to LEARNING, so
-            // the new phase re-learns.
+            // Host-shape mode: the runtime evaluated the target from live
+            // tensor metadata, so this op no longer reads anything back. The
+            // remaining question is whether a recorded segment still describes
+            // this round, and it is answered by comparing with the previous
+            // round — no learning, no state, no phase contract.
+            //
+            // A changed target must force a re-record because a replay
+            // re-submits the recording and skips execute(), so the output's
+            // logical shape is not updated on the host. A repeated target need
+            // not: the recorded dispatch carries the same PC, and the
+            // replay-time binding check compares buffer identity, which a
+            // same-element-count reshape preserves.
+            //
+            // This also retires invalidate_shape_cache()'s correctness role:
+            // prefill->decode changes nearly every shape, which now shows up
+            // here as "changed" for exactly the round it happens on.
             dim = host_target_;
-            if (cache_state_ == LearnState::LEARNING) {
-                learned_dim_ = dim;
-                cache_state_ = LearnState::CONFIRMING;
+            if (host_target_dirty_ || dim != last_host_target_) {
+                host_target_dirty_ = false;
+                last_host_target_ = dim;
+                // The target moved: the host-side output shape this round
+                // differs from the one the recording was built with.
                 set_did_host_work_last_round(true);
-            } else if (cache_state_ == LearnState::CONFIRMING) {
-                if (dim == learned_dim_) {
-                    cache_state_ = LearnState::STABLE;
-                    cached_dim_ = dim;
-                } else {
-                    cache_state_ = LearnState::DYNAMIC;
-                    re_stable_prev_ = dim;
-                }
-                set_did_host_work_last_round(true);
-            } else if (cache_state_ == LearnState::STABLE) {
-                if (dim != cached_dim_) {
-                    // Defensive: a STABLE target that changed without a phase
-                    // boundary must not replay stale dims — re-learn.
-                    cache_state_ = LearnState::DYNAMIC;
-                    re_stable_prev_ = dim;
-                    set_did_host_work_last_round(true);
-                } else {
-                    set_did_host_work_last_round(false);
-                }
-            } else { // DYNAMIC
-                // RE_STABLE: two consecutive equal targets re-promote (the
-                // route a kv-derived target takes if the growth ever stops
-                // within a phase).
-                if (dim == re_stable_prev_) {
-                    cache_state_ = LearnState::STABLE;
-                    cached_dim_ = dim;
-                } else {
-                    re_stable_prev_ = dim;
-                }
-                set_did_host_work_last_round(true);
+            } else {
+                set_did_host_work_last_round(false);
             }
         } else {
             auto shape = core::as_tensor<int64_t>(inputs[1]);
@@ -364,15 +341,8 @@ class ReshapeBuffer : public BufferFactory {
                 dim = leaf_dim_;
                 set_did_host_work_last_round(false);
             } else {
-                // Only STABLE is replayable: it means two consecutive readbacks
-                // produced the SAME dim, so the recorded dispatch is valid again
-                // next round. LINEAR_GROW is the opposite -- it grows by one
-                // every round, so replaying it re-runs last round's shape
-                // (measured: marking it replayable emitted "capital capital of
-                // of ..." with past_len advancing while the reshaped tensors
-                // stayed stale). LEARNING / CONFIRMING / DYNAMIC all re-read,
-                // which a replay would skip, so they stay dynamic too.
-                set_did_host_work_last_round(cache_state_ != LearnState::STABLE);
+                // GPU-produced target: read it and compare with last round.
+                // resolve_dim decides "changed" itself (see its comment).
                 dim = resolve_dim(shape);
             }
         }
@@ -580,29 +550,7 @@ class ReshapeBuffer : public BufferFactory {
         });
     }
 
-    // --- shape-input value cache (runtime auto-learning) ---
-    // Most Reshape shape inputs are round-invariant across decode rounds
-    // (125/181; only 56 kv_len-derived grow). We learn stability by comparing
-    // two consecutive readbacks, then STABLE reshapes skip copyToCPU (the
-    // ~3.2ms submit+wait that dominates decode). See execute() for the state
-    // machine. invalidate_shape_cache() resets to LEARNING at phase boundaries.
-    //
-    // LINEAR_GROW: the 56 kv_len-derived Reshapes have a shape like
-    // [1,16,seq,128] where only seq grows by +1 each round. After DYNAMIC is
-    // detected, subsequent readbacks check for single-dim +1 growth →
-    // LINEAR_GROW predicts and skips readback (verifying every 8 rounds).
-    // RE_STABLE: a shape that changed once (prefill→decode) but is then
-    // constant is wrongly stuck DYNAMIC by the round-0-vs-1 comparison; after
-    // DYNAMIC, two consecutive matching readbacks re-promote to STABLE.
-    enum class LearnState {
-        LEARNING,
-        CONFIRMING,
-        STABLE,
-        DYNAMIC,
-        LINEAR_GROW
-    };
-    LearnState cache_state_ = LearnState::LEARNING;
-    bool shape_value_dynamic_ = true; // converter hint (unused by the learner)
+    bool shape_value_dynamic_ = true; // converter hint
     // Host-evaluated target shape (Phase 4-r2). Valid only when the
     // converter attached vkop_host_shape — the node then has a single input.
     std::vector<int> host_target_;
@@ -611,129 +559,37 @@ class ReshapeBuffer : public BufferFactory {
     // change, so this is a constant of the node — no learning, no re-read.
     std::vector<int> leaf_dim_;
     bool leaf_dim_valid_ = false;
-    std::vector<int> learned_dim_; // round-0 dim[] (compared against round-1)
-    std::vector<int> cached_dim_;  // STABLE dim[] reused on round 2+
-    // LINEAR_GROW / RE_STABLE state.
-    std::vector<int> grow_dim_;       // last predicted/verified dim[]
-    int grow_dim_idx_ = -1;           // which dim grows by +1 each round
-    int linear_rounds_ = 0;           // rounds since last verify (LINEAR_GROW)
-    std::vector<int> re_stable_prev_; // prev round's dim (RE_STABLE confirm)
-    static constexpr int LINEAR_VERIFY_INTERVAL = 8;
+    // Last round's resolved target, compared against this round's. Replaces
+    // the LearnState machine (see resolve_dim).
+    std::vector<int> last_shape_target_;
+    std::vector<int> last_host_target_;
+    bool host_target_dirty_ = true;
 
-    // Resolve the shape-input dim[] with the auto-learning + linear-growth
-    // cache. `shape` is the int64 shape tensor (inputs[1]).
+    // Read the GPU-produced shape tensor and compare it with last round's.
+    //
+    // This replaced a LEARN/LINEAR_GROW machine that (a) guessed the next
+    // shape as last-round-plus-one and only re-read every 8th round, and
+    // (b) advanced its state only inside execute() — so a segment that was
+    // re-recorded every round without re-running its ops could leave the
+    // answer stuck at "dynamic" forever.
+    //
+    // The comparison is not a prediction: it says exactly one thing, "this
+    // round's target differs from the one the recording was built from", and
+    // it is re-evaluated whenever the op runs. A target that repeats costs one
+    // cheap readback of a few int64s per round -- the same readback the
+    // learning machine was trying to avoid, and which it paid for most rounds
+    // anyway.
     std::vector<int>
     resolve_dim(const std::shared_ptr<core::Tensor<int64_t>> &shape) {
-        if (cache_state_ == LearnState::STABLE) {
-            return cached_dim_;
-        }
-        if (cache_state_ == LearnState::LINEAR_GROW) {
-            if (linear_rounds_ < LINEAR_VERIFY_INTERVAL) {
-                std::vector<int> predicted = grow_dim_;
-                if (grow_dim_idx_ >= 0 &&
-                    grow_dim_idx_ < static_cast<int>(predicted.size())) {
-                    predicted[grow_dim_idx_] += 1;
-                }
-                grow_dim_ = predicted;
-                linear_rounds_++;
-                return predicted;
-            }
-            // Verify.
-            shape->copyToCPU(m_cmdpool_);
-            int n = shape->num_elements();
-            std::vector<int> actual(n);
-            for (int i = 0; i < n; ++i)
-                actual[i] = static_cast<int>((*shape)[i]);
-            std::vector<int> expected = grow_dim_;
-            if (grow_dim_idx_ >= 0 &&
-                grow_dim_idx_ < static_cast<int>(expected.size())) {
-                expected[grow_dim_idx_] += 1;
-            }
-            if (actual == expected) {
-                grow_dim_ = actual;
-                linear_rounds_ = 0;
-                return actual;
-            }
-            // Drift → DYNAMIC.
-            cache_state_ = LearnState::DYNAMIC;
-            re_stable_prev_ = actual;
-            return actual;
-        }
-        // LEARNING / CONFIRMING / DYNAMIC: readback + advance.
         shape->copyToCPU(m_cmdpool_);
-        int n = shape->num_elements();
+        const int n = shape->num_elements();
         std::vector<int> dim(n);
-        for (int i = 0; i < n; ++i) {
-            dim[i] = static_cast<int>((*shape)[i]);
-        }
-        if (cache_state_ == LearnState::LEARNING) {
-            learned_dim_ = dim;
-            cache_state_ = LearnState::CONFIRMING;
-        } else if (cache_state_ == LearnState::CONFIRMING) {
-            if (dim == learned_dim_) {
-                cache_state_ = LearnState::STABLE;
-                cached_dim_ = dim;
-            } else {
-                // Check for single-dim +1 linear growth (kv_len pattern).
-                int gidx = -1;
-                bool linear = (dim.size() == learned_dim_.size());
-                if (linear) {
-                    for (size_t i = 0; i < dim.size(); ++i) {
-                        int delta = dim[i] - learned_dim_[i];
-                        if (delta == 0)
-                            continue;
-                        else if (delta == 1 && gidx < 0)
-                            gidx = static_cast<int>(i);
-                        else {
-                            linear = false;
-                            break;
-                        }
-                    }
-                    linear = linear && gidx >= 0;
-                }
-                if (linear) {
-                    cache_state_ = LearnState::LINEAR_GROW;
-                    grow_dim_idx_ = gidx;
-                    grow_dim_ = dim;
-                    linear_rounds_ = 0;
-                } else {
-                    cache_state_ = LearnState::DYNAMIC;
-                    re_stable_prev_ = dim;
-                }
-            }
-        } else if (cache_state_ == LearnState::DYNAMIC) {
-            // RE_STABLE: if this round matches last round, the shape became
-            // constant after the prefill→decode transition → promote.
-            if (dim == re_stable_prev_) {
-                cache_state_ = LearnState::STABLE;
-                cached_dim_ = dim;
-            } else {
-                // Check for single-dim +1 linear growth.
-                int gidx = -1;
-                bool linear = (dim.size() == re_stable_prev_.size());
-                if (linear) {
-                    for (size_t i = 0; i < dim.size(); ++i) {
-                        int delta = dim[i] - re_stable_prev_[i];
-                        if (delta == 0)
-                            continue;
-                        else if (delta == 1 && gidx < 0)
-                            gidx = static_cast<int>(i);
-                        else {
-                            linear = false;
-                            break;
-                        }
-                    }
-                    linear = linear && gidx >= 0;
-                }
-                if (linear) {
-                    cache_state_ = LearnState::LINEAR_GROW;
-                    grow_dim_idx_ = gidx;
-                    grow_dim_ = dim;
-                    linear_rounds_ = 0;
-                } else {
-                    re_stable_prev_ = dim;
-                }
-            }
+        for (int i = 0; i < n; ++i) dim[i] = static_cast<int>((*shape)[i]);
+        if (dim != last_shape_target_) {
+            last_shape_target_ = dim;
+            set_did_host_work_last_round(true);
+        } else {
+            set_did_host_work_last_round(false);
         }
         return dim;
     }
