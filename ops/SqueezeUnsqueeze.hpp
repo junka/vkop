@@ -70,14 +70,18 @@ class SqueezeUnsqueeze : public Operator {
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        // Host work here: the axes-input readback (a non-STABLE learner) and
-        // the host-only fallback copy below. The GPU-alias path — every LLM
-        // instance — reads no bytes and dispatches nothing; it is a pure
-        // metadata view. Reported before the early returns so every path
-        // states its answer.
-        set_did_host_work_last_round(
-            inputs.size() > 1 && inputs[1] &&
-            axes_cache_state_ != AxesLearnState::STABLE);
+        // Host work here: the axes-input readback and the host-only fallback
+        // copy below. The GPU-alias path — every LLM instance — reads no bytes
+        // and dispatches nothing; it is a pure metadata view.
+        //
+        // Conservative default (the type answer), refined below once the axes
+        // source is known: a host-authoritative axes tensor makes this a
+        // constant of the node (see that branch), and a STABLE learner means
+        // the readback is skipped. Stated here rather than at the early
+        // returns so every path has an answer.
+        set_did_host_work_last_round(inputs.size() > 1 && inputs[1] &&
+                                     !inputs[1]->get_host_authoritative() &&
+                                     axes_cache_state_ != AxesLearnState::STABLE);
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 
@@ -90,33 +94,61 @@ class SqueezeUnsqueeze : public Operator {
         // (phase boundary) resets to LEARNING.
         std::vector<int> axes;
         if (inputs.size() > 1 && inputs[1]) {
-            bool need_readback = true;
-            if (axes_cache_state_ == AxesLearnState::STABLE) {
-                axes = cached_axes_;
-                need_readback = false;
-            }
-            if (need_readback) {
-                auto ax = core::as_tensor<int64_t>(inputs[1]);
-                // Unconditional readback: a cross-round-recycled GPU input may
-                // have stale CPU data_ (see the data-input fix below / the
-                // ScatterElements fix — same stale-data_ class).
-                ax->copyToCPU(m_cmdpool_);
-                axes.reserve(ax->num_elements());
-                for (int i = 0; i < ax->num_elements(); ++i)
-                    axes.push_back(static_cast<int>((*ax)[i]));
-                // Advance the learning state machine.
-                if (axes_cache_state_ == AxesLearnState::LEARNING) {
-                    learned_axes_ = axes;
-                    axes_cache_state_ = AxesLearnState::CONFIRMING;
-                } else if (axes_cache_state_ == AxesLearnState::CONFIRMING) {
-                    if (axes == learned_axes_) {
-                        axes_cache_state_ = AxesLearnState::STABLE;
-                        cached_axes_ = axes;
-                    } else {
-                        axes_cache_state_ = AxesLearnState::DYNAMIC;
-                    }
+            // Structural fast path: a host-authoritative axes tensor (an
+            // initializer, or a graph input the driver filled once) cannot
+            // change for its lifetime — the loader only sets that flag for
+            // tensors no node writes. So the axes are a CONSTANT of this node,
+            // not something to learn: read once, cache, and report no host
+            // work forever after.
+            //
+            // This is the same answer the LEARNING/CONFIRMING/STABLE machine
+            // below eventually reaches, but by construction rather than by
+            // observation. That distinction matters: the machine only advances
+            // when execute() runs, and a segment that is already being
+            // re-recorded every round may not reach it (a miss segment
+            // re-submits the previous recording instead of re-running its
+            // ops), so a predicate that depends on the machine can stay
+            // "dynamic" forever. A structural answer cannot deadlock.
+            if (inputs[1]->get_host_authoritative()) {
+                if (!axes_from_constant_) {
+                    auto ax = core::as_tensor<int64_t>(inputs[1]);
+                    ax->copyToCPU(m_cmdpool_);  // free: host bytes are current
+                    constant_axes_.reserve(ax->num_elements());
+                    for (int i = 0; i < ax->num_elements(); ++i)
+                        constant_axes_.push_back(static_cast<int>((*ax)[i]));
+                    axes_from_constant_ = true;
                 }
-                // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+                axes = constant_axes_;
+            } else {
+                bool need_readback = true;
+                if (axes_cache_state_ == AxesLearnState::STABLE) {
+                    axes = cached_axes_;
+                    need_readback = false;
+                }
+                if (need_readback) {
+                    auto ax = core::as_tensor<int64_t>(inputs[1]);
+                    // Unconditional readback: a cross-round-recycled GPU input
+                    // may have stale CPU data_ (see the data-input fix below /
+                    // the ScatterElements fix — same stale-data_ class).
+                    ax->copyToCPU(m_cmdpool_);
+                    axes.reserve(ax->num_elements());
+                    for (int i = 0; i < ax->num_elements(); ++i)
+                        axes.push_back(static_cast<int>((*ax)[i]));
+                    // Advance the learning state machine.
+                    if (axes_cache_state_ == AxesLearnState::LEARNING) {
+                        learned_axes_ = axes;
+                        axes_cache_state_ = AxesLearnState::CONFIRMING;
+                    } else if (axes_cache_state_ ==
+                               AxesLearnState::CONFIRMING) {
+                        if (axes == learned_axes_) {
+                            axes_cache_state_ = AxesLearnState::STABLE;
+                            cached_axes_ = axes;
+                        } else {
+                            axes_cache_state_ = AxesLearnState::DYNAMIC;
+                        }
+                    }
+                    // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+                }
             }
         } else {
             axes = axes_attr_;
@@ -245,6 +277,11 @@ class SqueezeUnsqueeze : public Operator {
             }
         });
     }
+
+    // Axes read once from a host-authoritative input. The bytes cannot change,
+    // so this is a constant of the node — no learning, no per-round readback.
+    std::vector<int> constant_axes_;
+    bool axes_from_constant_ = false;
 
     bool unsqueeze_;
     std::vector<int> axes_attr_;
