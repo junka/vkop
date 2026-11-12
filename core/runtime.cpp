@@ -728,6 +728,31 @@ void Runtime::LoadModel() {
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
+        } else if (okind == ElemKind::kInt64) {
+            // An int64 graph output (a model that exposes shape metadata as an
+            // output, e.g. a shape or index vector). Without this branch the
+            // output falls through to the precision_ default and is created as
+            // an fp16/fp32 tensor; the node-output walk then takes that
+            // tensor verbatim (the tensor_map hit in the "model output"
+            // branch), so `as_tensor<int64_t>(outputs[0])` returns null inside
+            // the producing op and dereferences it. Dims are sanitized for the
+            // same reason as the int32 branch: a raw -1 makes size_ negative
+            // and the resulting unsigned buffer size is rejected, while the
+            // op resize()s to the concrete shape at execute time anyway.
+            // Created ON the GPU, unlike the per-node int64 intermediates: a
+            // graph output goes through the "model output" branch of the node
+            // walk, which asserts the pre-bound tensor is already on the GPU.
+            std::vector<uint32_t> sane;
+            sane.reserve(o.dims.size());
+            for (int d : o.dims) {
+                sane.push_back(d < 0 ? 1u : static_cast<uint32_t>(d));
+            }
+            auto t = std::make_shared<Tensor<int64_t>>(sane, true);
+            t->set_elem_kind(ElemKind::kInt64);
+            t->set_ref_cnt_forever();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
         } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
@@ -3059,20 +3084,15 @@ double Runtime::Run() {
     }
     segment_replay_enabled_ = seg_replay;
 
-    // Segment replay needs each op's pass fingerprint, and that is only
-    // recorded when the op's replay flag is on (Operator::record_fingerprint
-    // is gated on replay_enabled_). graph_mode turns the OP-level cache off
-    // (see above: a recording shared with other ops cannot be replayed per
-    // op), and that was also silently starving the SEGMENT fingerprint: its
-    // stored side read current_fingerprint() and got an empty vector every
-    // round, so every segment compared 0 entries against N and could never
-    // hit. Enable the flag for recording only -- the graph_cmd_ branch of
-    // onExecute returns before the CACHED check, so this cannot turn on the
-    // per-op cache.
-    if (seg_replay) {
-        for (auto &op : node_ops_)
-            op->enable_replay(true);
-    }
+    // Per-op fingerprint collection stays OFF under segment replay. An
+    // earlier design enabled replay_enabled_ here so each op would fill
+    // fp_passes_ for a segment-level fingerprint comparison; that comparison
+    // is gone (replay is classified per level by op type -- see the segment
+    // replay 预判 comment below) and current_fingerprint()/recorded_passes()
+    // have no caller on this path, so the flag only paid for a per-dispatch
+    // pc copy + handle walk with zero readers. The flag still exists for the
+    // opt-in per-op cache (VKOP_REPLAY=1 with VKOP_GRAPH_SUBMIT=0), whose
+    // onExecute state machine is the only remaining fingerprint consumer.
 
     // graph_cmds_ 是 Runtime 成员变量 (runtime.hpp), 跨轮持久化.
     // Run() 开头根据 replay 开关决定是否 clear:
