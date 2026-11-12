@@ -158,6 +158,64 @@ class Gather : public Operator {
     }
     bool has_host_side_effects() const override { return true; }
 
+    // --- replay answers for the int64 host path ---
+    //
+    // cpuComputeInt64() reads both inputs back, gathers on the host and
+    // re-uploads. That is host work a segment replay skips, which is why this
+    // op used to report "dynamic" unconditionally and blocked its level. But
+    // in the shape-meta chain the answer repeats: the data is a fixed table
+    // (an initializer or a Shape output) and the indices are constants, so the
+    // gathered bytes are identical round to round.
+    //
+    // Same LEARNING -> CONFIRMING -> STABLE machine Reshape/Range/NonZero use.
+    // In STABLE the op re-fills the cached output and re-uploads the SAME bytes,
+    // so the recording it produces is identical every round and a replay
+    // reproduces it exactly; refresh_dynamic_params() redoes the host-side half
+    // (data_ + host_authoritative) that a replay skips.
+    enum class GatherLearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
+    GatherLearnState g_state_ = GatherLearnState::LEARNING;
+
+    void invalidate_shape_cache() override {
+        g_state_ = GatherLearnState::LEARNING;
+        cached_idx_.clear();
+        cached_idx_shape_.clear();
+        cached_out_.clear();
+        cached_out_shape_.clear();
+    }
+    bool recording_changes_per_round() const override {
+        // Gated on the int64 host path being the one in use: a non-int64
+        // Gather never advances this state machine (it has no host side to
+        // learn), so without the gate every fp16 Gather would report "changes
+        // every round" and lose the replay it used to have.
+        return int64_host_path_taken_ && g_state_ != GatherLearnState::STABLE;
+    }
+    // Not the base's host_work_observed_ answer: execute() sets that flag on
+    // every path, so it would mask this one (same reasoning as NonZero).
+    bool did_host_work_last_round() const override {
+        return int64_host_path_taken_ &&
+               g_state_ != GatherLearnState::STABLE;
+    }
+    bool refresh_dynamic_params(
+        const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (g_state_ != GatherLearnState::STABLE || cached_out_.empty() ||
+            outputs.empty() || !outputs[0]) {
+            return false;
+        }
+        auto output = core::as_tensor<int64_t>(outputs[0]);
+        if (!output || output->dtype() != typeid(int64_t)) return false;
+        if (output->getShape() != cached_out_shape_) {
+            output->resize(cached_out_shape_);
+        }
+        output->fillToCPU(cached_out_);
+        // Mirror execute()'s tail: it ends with copyToGPUDeferred(), and
+        // skipping converted_ here would leave a replayed segment's output
+        // looking host-only to a consumer that consults is_on_GPU().
+        output->toGPU();
+        if (host_shape_enabled()) output->set_host_authoritative();
+        return true;
+    }
+
   private:
     static std::vector<int>
     calculateGatherOutputShape(const std::vector<int> &data_shape,
@@ -241,6 +299,29 @@ class Gather : public Operator {
 
         auto data = core::as_tensor<int64_t>(inputs[0]);
         auto indices = core::as_tensor<int64_t>(inputs[1]);
+        // STABLE fast path: the indices fingerprint matched for two
+        // consecutive rounds, so the gathered bytes are what we cached. Refill
+        // and re-upload them without touching the gather loop or the inputs.
+        // Checking the fingerprint costs one tiny copyToCPU of the INDICES
+        // (host-resident in the shape-meta chain, so free) while skipping the
+        // DATA readback, which is the large one.
+        if (g_state_ == GatherLearnState::STABLE) {
+            indices->copyToCPU(m_cmdpool_);
+            std::vector<int64_t> cur_idx;
+            cur_idx.assign(indices->data().begin(), indices->data().end());
+            if (cur_idx == cached_idx_ && idx_shape == cached_idx_shape_) {
+                auto output = core::as_tensor<int64_t>(outputs[0]);
+                output->resize(cached_out_shape_);
+                output->fillToCPU(cached_out_);
+                objs_.emplace_back(
+                    output->as_storage_buffer(m_dev_, m_cmd_));
+                output->copyToGPUDeferred(m_cmd_);
+                if (host_shape_enabled()) output->set_host_authoritative();
+                return;
+            }
+            // Indices moved: fall through, re-learn.
+            g_state_ = GatherLearnState::LEARNING;
+        }
         // Unconditional readback: a cross-round-recycled GPU input may have
         // stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
         data->copyToCPU(m_cmdpool_);
@@ -332,18 +413,37 @@ class Gather : public Operator {
         if (host_shape_enabled()) {
             output->set_host_authoritative();
         }
+        // Advance the learning machine on the INDEX fingerprint. The indices
+        // decide which rows come out; the data contributes its bytes but in
+        // the shape-meta chain it is a fixed table. Comparing the (tiny)
+        // indices is the cheap half of the invariant and the half that can
+        // change without the shape changing (a Gather whose index tensor is
+        // recomputed from a growing dim).
+        cached_idx_.assign(indices->data().begin(), indices->data().end());
+        cached_idx_shape_ = idx_shape;
+        cached_out_ = out;
+        cached_out_shape_ = out_shape;
+        if (g_state_ == GatherLearnState::LEARNING) {
+            g_state_ = GatherLearnState::CONFIRMING;
+        } else if (g_state_ == GatherLearnState::CONFIRMING) {
+            g_state_ = GatherLearnState::STABLE;
+        }
     }
 
     void execute(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
 
-        // The int64 host path (cpuComputeInt64, host_shape mode) reads back
-        // and re-computes on the host every round — host work a replay would
-        // skip. Every other path (the fp32/fp16 gather, the int64 GPU shader,
-        // the zero-copy alias) records a dispatch and touches no host state.
-        set_did_host_work_last_round(
-            inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled());
+        // The int64 host path (cpuComputeInt64) does host work a replay would
+        // skip, but only while it is still learning: once the cache reaches
+        // STABLE the recording reproduces the same bytes every round, and
+        // did_host_work_last_round() (which overrides this flag for exactly
+        // that reason) reports the instance answer. Every other path (the
+        // fp32/fp16 gather, the int64 GPU shader, the zero-copy alias) records
+        // a dispatch and touches no host state.
+        int64_host_path_taken_ =
+            inputs[0]->dtype() == typeid(int64_t) && host_shape_enabled();
+        set_did_host_work_last_round(int64_host_path_taken_);
         auto inshape = inputs[0]->getShape();
         auto indshape = inputs[1]->getShape();
         auto rank = inputs[0]->num_dims();
@@ -488,6 +588,14 @@ class Gather : public Operator {
     BdaTableModule bda_i64_;
     VkDescriptorSet m_ds_int64_[vkop::kInflight] = {nullptr};
     bool int64_mode_ = false;
+    // Whether the last execute() took the CPU int64 path. did_host_work_last_round
+    // keys on it so the GPU int64 path and the fp paths stay replayable.
+    bool int64_host_path_taken_ = false;
+    // Learned-cache state for the CPU int64 path (see the public declarations).
+    std::vector<int64_t> cached_idx_;
+    std::vector<int> cached_idx_shape_;
+    std::vector<int64_t> cached_out_;
+    std::vector<int> cached_out_shape_;
 };
 
 } // namespace ops
