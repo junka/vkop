@@ -3466,8 +3466,21 @@ double Runtime::Run() {
             // replayable while EVERY level in it is. Decode round timings are
             // equal within noise. Revisit packing once the remaining decode
             // optimisations land -- the workaround costs nothing today.
-            for (size_t li = 0; li < nlev; li++) {
-                seg_level_ranges_.push_back({li, li + 1});
+            //
+            // VKOP_SEG_PACK=N groups N levels per segment (default 1). The
+            // corruption above was measured when six op types did host work
+            // that a replayed pack skipped; every one of them now either
+            // reports its answer structurally or computes on the device, so
+            // packing is re-measured rather than assumed broken.
+            int seg_pack = 1;
+            if (const char *sp = std::getenv("VKOP_SEG_PACK")) {
+                const int v = std::atoi(sp);
+                if (v > 0) seg_pack = v;
+            }
+            for (size_t li = 0; li < nlev; li += static_cast<size_t>(seg_pack)) {
+                const size_t hi =
+                    std::min(nlev, li + static_cast<size_t>(seg_pack));
+                seg_level_ranges_.push_back({li, hi});
             }
         }
         // Split changed since last round -> the cached recordings describe
