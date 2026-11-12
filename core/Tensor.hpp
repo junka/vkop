@@ -2265,7 +2265,20 @@ template <typename T> class Tensor : public ITensor {
                 }
             }
         } else {
-            memcpy(new_data->data(), data_->data(), size_);
+            // Rank changed (or the old rank was unrecorded): the layout is not
+            // comparable, so the flat prefix is all that can be carried over.
+            //
+            // Clamp to what the SOURCE actually holds. `size_` is this
+            // tensor's element count and may have grown past data_->size()
+            // (resize() updates size_ before data_ is reallocated), and an
+            // unclamped copy then reads past the source vector — a heap
+            // over-read whose corrupted neighbour surfaces much later, far
+            // from here. Measured: multi-turn LLM decode (each prompt resizes
+            // the recycled KV tensors) segfaulted inside MatMulBuffer's
+            // output resize, and the same class of overflow is what
+            // reserveOnCPU/fillToCPU were already hardened against.
+            memcpy(new_data->data(), data_->data(),
+                   std::min<size_t>(size_, data_->size() * sizeof(T)));
         }
         data_.reset();
         data_ = std::move(new_data);

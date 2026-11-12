@@ -329,10 +329,21 @@ class Runtime {
         segment_buf_ranges_.clear();
         segment_replay_hit_this_round_.clear();
         segment_op_indices_.clear();
-        // The per-round split comparison is phase-specific too: the
-        // instance predicates flip at the boundary (learners reset to
-        // LEARNING), so forget the previous split instead of treating the
-        // new phase's split as a drift and logging a re-record.
+        // The cached RECORDINGS themselves must go: they were recorded against
+        // the previous phase's shapes, and a hit segment re-submits them
+        // verbatim without running any op. Leaving them here is what made a
+        // multi-turn conversation crash under replay: the hit bookkeeping was
+        // cleared but the command buffers it refers to were not, so the first
+        // round of the new prompt replayed the old prompt's graph (measured:
+        // single-turn decode fine, second prompt SIGSEGV).
+        graph_cmds_.clear();
+        // ...and the warm-up has to restart with them, or the very next round
+        // computes `warm` from the previous phase's round counter and treats
+        // those empty slots as replayable.
+        segment_replay_round_ = 0;
+        // The per-round split comparison is phase-specific too: the instance
+        // predicates flip at the boundary, so forget the previous split
+        // instead of treating the new phase's split as a drift.
         seg_replay_rounds_valid_ = false;
         if (!replay_mode_)
             return;
