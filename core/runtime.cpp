@@ -3273,8 +3273,28 @@ double Runtime::Run() {
             if (segment_buf_ranges_.size() <= ord)
                 segment_buf_ranges_.resize(ord + 1);
             segment_buf_ranges_[ord].clear();
-            note_segment_buffers(segment_buf_ranges_[ord],
-                                 seg_op_indices_curr[ord]);
+            // Enumerate the segment's ops from its LEVEL RANGE, which is the
+            // same source the replay-time identity check uses. Collecting them
+            // as they execute (the previous approach) saw only the ops that
+            // actually ran this round: a level that was already closed for the
+            // segment boundary, or an op the recorder skipped, was missing from
+            // the recorded set while still being checked at replay time -- so
+            // the check reported a phantom "binding moved" every round and the
+            // segment could never replay. Measured on the ViT tower: segment 2
+            // recorded one op (/Mul) but was verified over its whole level,
+            // which made /Range_2's input look like it had moved when its
+            // buffer handle was byte-for-byte identical every round.
+            std::vector<int> seg_ops;
+            if (ord < seg_level_ranges_.size()) {
+                for (size_t li = seg_level_ranges_[ord].first;
+                     li < seg_level_ranges_[ord].second; ++li) {
+                    for (int op_idx : level_node_indices_[li]) {
+                        seg_ops.push_back(op_idx);
+                    }
+                }
+            }
+            if (seg_ops.empty()) seg_ops = seg_op_indices_curr[ord];
+            note_segment_buffers(segment_buf_ranges_[ord], seg_ops);
         }
         if (!skip_record) {
             // A secondary's recording must end with the barrier that orders it
