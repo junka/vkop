@@ -162,34 +162,31 @@ class SliceBuffer : public BufferFactory {
     // and neither reads back data anymore (data goes through the GPU shader).
     // So STABLE lets them skip ALL readback. The i64 path still reads back data
     // (CPU slice), but STABLE still skips the starts/ends meta readback for it.
-    // Same LEARNING/CONFIRMING/STABLE machine as Reshape/Range.
-    // invalidate_shape_cache() resets at phase boundaries.
-    enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
-    LearnState slice_state_ = LearnState::LEARNING;
-    // Fingerprint of the meta inputs (inshape + starts/ends/axes/steps). When
-    // two consecutive rounds match, promote to STABLE.
-    std::vector<int> meta_inshape_;
-    std::vector<int64_t> meta_starts_, meta_ends_, meta_axes_, meta_steps_;
-    // Cached output-shape computation (out_size[0..3]).
-    std::vector<std::vector<int>> cached_out_size_;
+    // The slicing parameters and the data shape from the round the recording
+    // was built with. Comparing against them answers "would a replay produce
+    // this round's output size?" directly, with no learned state.
+    //
+    // (This used to be a LEARNING/CONFIRMING/STABLE machine with a periodic
+    // verify. It compared the same vectors; the state added a way to get stuck
+    // — it only advanced inside execute(), which a re-recorded segment may
+    // skip — and a phase-boundary reset contract.)
+    std::vector<int> last_inshape_;
+    std::vector<int64_t> last_starts_, last_ends_, last_axes_, last_steps_;
+    std::vector<std::vector<int>> last_out_size_;
+    bool last_meta_valid_ = false;
+    bool meta_dirty_ = true;
+    // Whether this round's parameters differ from the last round's (set in
+    // execute()). Drives both the replay answer and the host-work report.
+    bool meta_changed_last_round_ = true;
     // Output size computed from read-only leaf slicing parameters, keyed on
     // the data input's shape (the only thing that can change). See the
     // structural fast path in execute().
     std::vector<std::vector<int>> leaf_out_size_;
     std::vector<int> leaf_inshape_;
     bool leaf_meta_valid_ = false;
-    static constexpr int STABLE_VERIFY_INTERVAL = 8;
-    int stable_rounds_ = 0;
 
     void invalidate_shape_cache() override {
-        slice_state_ = LearnState::LEARNING;
-        meta_inshape_.clear();
-        meta_starts_.clear();
-        meta_ends_.clear();
-        meta_axes_.clear();
-        meta_steps_.clear();
-        cached_out_size_.clear();
-        stable_rounds_ = 0;
+        meta_dirty_ = true;
     }
     bool has_host_side_effects() const override { return true; }
 
@@ -203,7 +200,7 @@ class SliceBuffer : public BufferFactory {
         // states its answer.
         set_did_host_work_last_round(
             inputs[0]->dtype() == typeid(int64_t) ||
-            slice_state_ != LearnState::STABLE);
+            (meta_dirty_ || meta_changed_last_round_));
         auto inshape = inputs[0]->getShape();
         int rank = static_cast<int>(inshape.size());
 
@@ -259,13 +256,8 @@ class SliceBuffer : public BufferFactory {
         if (meta_is_leaf && leaf_meta_valid_ && inshape == leaf_inshape_) {
             out_size = leaf_out_size_;
             meta_reused = true;
-        } else if (!meta_is_leaf && slice_state_ == LearnState::STABLE &&
-                   stable_rounds_ < STABLE_VERIFY_INTERVAL) {
-            stable_rounds_++;
-            out_size = cached_out_size_;
-            meta_reused = true;
         } else {
-            // Readback path (LEARNING/CONFIRMING/DYNAMIC, or STABLE verify).
+            // Read the slicing parameters.
             auto starts_t = core::as_tensor<int64_t>(inputs[1]);
             starts_t->copyToCPU(m_cmdpool_);
             auto ends_t = core::as_tensor<int64_t>(inputs[2]);
@@ -292,55 +284,23 @@ class SliceBuffer : public BufferFactory {
                 leaf_meta_valid_ = true;
             }
 
-            // Advance the learn state machine. Fingerprint = inshape + the
-            // four meta vectors. STABLE when two consecutive rounds match.
+            // Compare with the round the recording was built from. Equal
+            // means a replay reproduces this output size; different means the
+            // segment must re-record. No state to advance, nothing to promote.
             std::vector<int64_t> s = starts_t->data();
             std::vector<int64_t> e = ends_t->data();
-            bool match = (inshape == meta_inshape_ && s == meta_starts_ &&
-                          e == meta_ends_ && axes_vec == meta_axes_ &&
-                          steps_vec == meta_steps_);
-            if (slice_state_ == LearnState::LEARNING) {
-                meta_inshape_ = inshape;
-                meta_starts_ = s;
-                meta_ends_ = e;
-                meta_axes_ = axes_vec;
-                meta_steps_ = steps_vec;
-                cached_out_size_ = out_size;
-                slice_state_ = LearnState::CONFIRMING;
-            } else if (slice_state_ == LearnState::CONFIRMING) {
-                if (match) {
-                    slice_state_ = LearnState::STABLE;
-                    stable_rounds_ = 0;
-                } else {
-                    slice_state_ = LearnState::DYNAMIC;
-                    meta_inshape_ = inshape;
-                    meta_starts_ = s;
-                    meta_ends_ = e;
-                    meta_axes_ = axes_vec;
-                    meta_steps_ = steps_vec;
-                    cached_out_size_ = out_size;
-                }
-            } else if (slice_state_ == LearnState::STABLE) {
-                // Verify round: drift -> DYNAMIC.
-                if (!match) {
-                    slice_state_ = LearnState::DYNAMIC;
-                    meta_inshape_ = inshape;
-                    meta_starts_ = s;
-                    meta_ends_ = e;
-                    meta_axes_ = axes_vec;
-                    meta_steps_ = steps_vec;
-                    cached_out_size_ = out_size;
-                } else {
-                    stable_rounds_ = 0;
-                }
-            } else { // DYNAMIC
-                meta_inshape_ = inshape;
-                meta_starts_ = s;
-                meta_ends_ = e;
-                meta_axes_ = axes_vec;
-                meta_steps_ = steps_vec;
-                cached_out_size_ = out_size;
-            }
+            meta_changed_last_round_ =
+                meta_dirty_ || !last_meta_valid_ || inshape != last_inshape_ ||
+                s != last_starts_ || e != last_ends_ ||
+                axes_vec != last_axes_ || steps_vec != last_steps_;
+            meta_dirty_ = false;
+            last_meta_valid_ = true;
+            last_inshape_ = inshape;
+            last_starts_ = s;
+            last_ends_ = e;
+            last_axes_ = axes_vec;
+            last_steps_ = steps_vec;
+            last_out_size_ = out_size;
         }
         (void)meta_reused;
 

@@ -147,8 +147,10 @@ class Expand : public Operator {
         // or a STABLE verify round). The fp and int64 GPU dispatches
         // themselves touch no host state. Reported up front so every path
         // states its answer.
-        set_did_host_work_last_round(
-            target_cache_state_ != TargetLearnState::STABLE);
+        // A leaf target makes this a one-time read; otherwise it is read every
+        // round, and the report follows whether it CHANGED (see
+        // resolve_target_shape, which sets target_changed_).
+        set_did_host_work_last_round(target_changed_);
         std::vector<int> inshape = inputs[0]->getShape();
         std::vector<int> out_shape = outputs[0]->getShape();
         // Fail closed on a <= 1-byte data payload: no byte build in this mover.
@@ -361,161 +363,62 @@ class Expand : public Operator {
     }
 
   public:
-    // Phase boundary (prefill->decode): reset the target-shape learning state
-    // so the new phase re-learns stability. A target shape stable in prefill
-    // may differ in decode (seq collapses), so STABLE can't carry across.
     void invalidate_shape_cache() override {
-        target_cache_state_ = TargetLearnState::LEARNING;
-        grow_dim_ = -1;
-        linear_rounds_ = 0;
+        // Kept as an explicit no-op: cross-round state is now a comparison
+        // against last round's target, so a phase boundary needs no reset — the
+        // first round of the new phase simply differs from the last round of
+        // the old one. (This used to reset a learning machine.)
+        target_dirty_ = true;
     }
 
   private:
-    // --- target-shape (inputs[1]) value cache (runtime auto-learning) ---
-    // Across decode rounds, most Expand target shapes are round-invariant
-    // (only the kv_len-derived ones grow). Learn stability by comparing two
-    // consecutive readbacks, then STABLE skips copyToCPU. See execute() for
-    // the state machine.
-    //
-    // LINEAR_GROW: the 56 kv_len-derived Expands have a target like
-    // [1,8,2,seq,128] where only the seq dim grows by exactly +1 each round.
-    // After DYNAMIC is detected, the next readback checks for a single-dim
-    // +1 growth; if found, transition to LINEAR_GROW and predict the target
-    // (skip readback), verifying every LINEAR_VERIFY_INTERVAL rounds to catch
-    // drift (e.g. a non-unit growth or a phase boundary the invalidation
-    // missed). Cuts 56 readbacks/round → ~7/round.
-    enum class TargetLearnState {
-        LEARNING,
-        CONFIRMING,
-        STABLE,
-        DYNAMIC,
-        LINEAR_GROW
-    };
-    TargetLearnState target_cache_state_ = TargetLearnState::LEARNING;
-    std::vector<int> learned_target_; // round-0 target (compared vs round-1)
-    std::vector<int> cached_target_;  // STABLE target reused on round 2+
-    // LINEAR_GROW prediction state.
-    std::vector<int> grow_target_; // last verified/predicted target
-    int grow_dim_ = -1;            // which dim grows by +1 each round
     // Target read once from a read-only leaf input (constant of the node).
     std::vector<int> leaf_target_;
     bool leaf_target_valid_ = false;
-    int linear_rounds_ = 0;        // consecutive rounds since last verify
-    static constexpr int LINEAR_VERIFY_INTERVAL = 8;
+    // Last round's target, compared against this round's.
+    std::vector<int> last_target_;
+    bool last_target_valid_ = false;
+    bool target_dirty_ = true;
+    // Whether this round's target differs from the last round's (set here).
+    bool target_changed_ = true;
 
-    // Resolve the target shape with the auto-learning + linear-growth cache.
-    // Returns the target shape and whether a readback was performed (for
-    // rbprof attribution). inputs[1] is the target-shape tensor.
+    // Resolve the target shape. A read-only leaf is a constant of the node
+    // (read once); anything else is read and compared with last round, which
+    // is exactly the question replay cares about.
+    //
+    // `did_readback` stays for rbprof attribution. It reports true only when a
+    // host readback actually happened.
+    //
+    // This replaced a LEARN/LINEAR_GROW machine that predicted the next target
+    // as last-round-plus-one: a guess that cannot be audited, and whose state
+    // advanced only inside execute() — so a re-recorded segment that skips its
+    // ops could leave the answer stuck at "dynamic" forever.
     std::vector<int>
     resolve_target_shape(const std::shared_ptr<core::ITensor> &target_tensor,
                          bool &did_readback) {
         did_readback = false;
-        // Structural fast path: a read-only leaf target tensor (an
-        // initializer or a graph input) cannot change, so the target is a
-        // constant of the node. Read once, then never again.
-        //
-        // Takes precedence over the learner below for the same reason it does
-        // in SqueezeUnsqueeze/Reshape: a learned answer only advances inside
-        // execute(), which a re-recorded segment may skip, and a structural
-        // answer cannot be wrong.
         if (target_tensor && target_tensor->is_read_only_leaf()) {
             if (!leaf_target_valid_) {
-                auto read = [&](auto dummy) -> bool {
-                    using T = decltype(dummy);
-                    auto t = core::as_tensor<T>(target_tensor);
-                    if (!t) return false;
-                    t->copyToCPU(m_cmdpool_);
-                    leaf_target_.clear();
-                    leaf_target_.reserve(t->num_elements());
-                    for (int i = 0; i < t->num_elements(); ++i)
-                        leaf_target_.push_back(static_cast<int>((*t)[i]));
-                    return true;
-                };
-                const bool ok = read(int64_t{}) || read(int{}) ||
-                                read(int32_t{});
-                if (ok) leaf_target_valid_ = true;
-            }
-            if (leaf_target_valid_) return leaf_target_;
-        }
-        // STABLE: reuse cached, no readback.
-        if (target_cache_state_ == TargetLearnState::STABLE) {
-            return cached_target_;
-        }
-        // LINEAR_GROW: predict by incrementing the grow dim. Verify
-        // periodically to catch drift.
-        if (target_cache_state_ == TargetLearnState::LINEAR_GROW) {
-            if (linear_rounds_ < LINEAR_VERIFY_INTERVAL) {
-                // Trust the prediction: increment the grow dim.
-                std::vector<int> predicted = grow_target_;
-                if (grow_dim_ >= 0 &&
-                    grow_dim_ < static_cast<int>(predicted.size())) {
-                    predicted[grow_dim_] += 1;
-                }
-                grow_target_ = predicted;
-                linear_rounds_++;
-                return predicted;
-            }
-            // Verification round: readback and check.
-            std::vector<int> actual =
-                expand::read_target_shape(target_tensor, m_cmdpool_);
-            std::vector<int> expected = grow_target_;
-            if (grow_dim_ >= 0 &&
-                grow_dim_ < static_cast<int>(expected.size())) {
-                expected[grow_dim_] += 1;
-            }
-            if (actual == expected) {
-                grow_target_ = actual;
-                linear_rounds_ = 0;
+                leaf_target_ =
+                    expand::read_target_shape(target_tensor, m_cmdpool_);
+                leaf_target_valid_ = !leaf_target_.empty();
                 did_readback = true;
-                return actual;
             }
-            // Drift: fall back to DYNAMIC (readback every round).
-            target_cache_state_ = TargetLearnState::DYNAMIC;
-            learned_target_ = actual;
-            did_readback = true;
-            return actual;
+            target_changed_ = target_dirty_ || !last_target_valid_ ||
+                              leaf_target_ != last_target_;
+            target_dirty_ = false;
+            last_target_valid_ = true;
+            last_target_ = leaf_target_;
+            return leaf_target_;
         }
-        // LEARNING / CONFIRMING / DYNAMIC: readback + advance state machine.
-        did_readback = true;
         std::vector<int> target =
             expand::read_target_shape(target_tensor, m_cmdpool_);
-        if (target_cache_state_ == TargetLearnState::LEARNING) {
-            learned_target_ = target;
-            target_cache_state_ = TargetLearnState::CONFIRMING;
-        } else if (target_cache_state_ == TargetLearnState::CONFIRMING) {
-            if (target == learned_target_) {
-                target_cache_state_ = TargetLearnState::STABLE;
-                cached_target_ = target;
-            } else {
-                // Check for single-dim +1 linear growth (kv_len pattern).
-                int grow_dim = -1;
-                bool linear = (target.size() == learned_target_.size());
-                if (linear) {
-                    for (size_t i = 0; i < target.size(); ++i) {
-                        int delta = target[i] - learned_target_[i];
-                        if (delta == 0) {
-                            continue;
-                        } else if (delta == 1 && grow_dim < 0) {
-                            grow_dim = static_cast<int>(i);
-                        } else {
-                            linear = false;
-                            break;
-                        }
-                    }
-                    // require exactly one growing dim (grow_dim >= 0)
-                    linear = linear && grow_dim >= 0;
-                }
-                if (linear) {
-                    target_cache_state_ = TargetLearnState::LINEAR_GROW;
-                    grow_dim_ = grow_dim;
-                    grow_target_ = target;
-                    linear_rounds_ = 0;
-                } else {
-                    target_cache_state_ = TargetLearnState::DYNAMIC;
-                }
-            }
-        }
-        // DYNAMIC: stay DYNAMIC (readback every round, no caching).
+        did_readback = true;
+        target_changed_ = target_dirty_ || !last_target_valid_ ||
+                          target != last_target_;
+        target_dirty_ = false;
+        last_target_valid_ = true;
+        last_target_ = target;
         return target;
     }
 
