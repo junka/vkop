@@ -212,8 +212,11 @@ class AttentionBuffer : public BufferFactory {
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> &inputs,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (!dyn_live_ || !has_cache_) {
+        if (!dyn_live_) {
             return false;
+        }
+        if (!has_cache_) {
+            return refresh_dynamic_params_no_cache(inputs);
         }
         // inputs: 0=Q, 1=K, 2=V, 3=cache, [4=mask], [5=ring_head]
         if (inputs.size() < 4 || !inputs[1] || !inputs[3]) {
@@ -303,6 +306,39 @@ class AttentionBuffer : public BufferFactory {
     // (B, H, S, D) -> a 4-element shape check helper.
     static int dim(const std::vector<int> &s, int i) {
         return (i >= 0 && i < static_cast<int>(s.size())) ? s[i] : 1;
+    }
+
+    // The cache-less half of refresh_dynamic_params(): re-derive this round's
+    // kv_len and dispatch grid and republish them into the parameter SSBO.
+    //
+    // Without a cache there is nothing to append to, so the recorded dispatch
+    // is stable exactly when the SHAPES are: kv_len is K's row count, kv_past
+    // is 0, there is no ring, and the grid is a pure function of
+    // (batch, heads, seq). All of those come from the live shapes the per-level
+    // reshape_view pre-pass has already updated, so no readback is involved.
+    bool refresh_dynamic_params_no_cache(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs) {
+        if (inputs.size() < 3 || !inputs[0] || !inputs[1]) return false;
+        const auto q_shape = inputs[0]->getShape();
+        const auto k_shape = inputs[1]->getShape();
+        const bool rank3 = q_shape.size() == 3;
+        if (rank3 ? !seq_major_ : q_shape.size() != 4) return false;
+        if (k_shape.size() != q_shape.size()) return false;
+        const int heads = rank3 ? dim(q_shape, 1)
+                                : (seq_major_ ? dim(q_shape, 2)
+                                              : dim(q_shape, 1));
+        const int seq = rank3 ? dim(q_shape, 0)
+                              : (seq_major_ ? dim(q_shape, 1)
+                                            : dim(q_shape, 2));
+        const int batch = rank3 ? 1 : dim(q_shape, 0);
+        const int kv_len = rank3 ? dim(k_shape, 0)
+                                 : (seq_major_ ? dim(k_shape, 1)
+                                               : dim(k_shape, 2));
+        if (heads <= 0 || seq <= 0 || batch <= 0 || kv_len <= 0) return false;
+        // Mirrors execute()'s cache-less grid exactly: one workgroup per query
+        // row and nothing else (the copy half only exists with a cache).
+        return publish_dyn(kv_len, /*kv_past=*/0, /*ring_head=*/0,
+                           batch * heads * seq);
     }
 
     // Rows a KV SSBO can hold at the packed layout: the buffer is preallocated
@@ -642,7 +678,21 @@ class AttentionBuffer : public BufferFactory {
             if (!has_cache) {
                 objs_.emplace_back(dummy_buffer_); // binding 5
                 objs_.emplace_back(dummy_buffer_); // binding 6
-                objs_.emplace_back(dummy_buffer_); // binding 7 (dyn params)
+                // binding 7: the per-round parameter SSBO. The cache-less form
+                // has no cache-driven numbers, but it does have a grid and a
+                // kv_len, and routing them through the same buffer is what lets
+                // its recording be replayed (see recording_changes_per_round).
+                // publish_dyn() must run BEFORE the dispatch is recorded — its
+                // buffer is the indirect source.
+                dyn_this_round_ = publish_dyn(kv_len, kv_past, ring_head, grid);
+                if (dyn_this_round_) {
+                    dyn_buf_->readBarrier(m_cmd_->get(), kDynBytes);
+                    objs_.emplace_back(
+                        std::static_pointer_cast<VulkanResource>(dyn_buf_));
+                    pc.dyn_ssbo = 1;
+                } else {
+                    objs_.emplace_back(dummy_buffer_);
+                }
                 return;
             }
             // The cache is bound as its OWN element type, not the compute
