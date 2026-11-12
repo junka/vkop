@@ -57,22 +57,33 @@ class NonZero : public BufferFactory {
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
                         sizeof(nonzero::NonZeroPC)) {}
 
-    enum class LearnState { LEARNING, CONFIRMING, STABLE, DYNAMIC };
-    LearnState nz_state_ = LearnState::LEARNING;
-    // Fingerprint of the input: shape + flattened data (as double for
-    // dtype-agnostic comparison). Small (mask is tiny).
+    // Fingerprint of the REUSABLE result: the mask's shape and values, plus
+    // the output they produced. A round whose fingerprint matches the previous
+    // one can reuse that output verbatim.
+    //
+    // A comparison, not a learning machine. The machine here promoted to
+    // STABLE after two matching rounds and then trusted the mask never to
+    // change, with no verify. Comparison gets the same steady-state win (one
+    // cheap readback of a tiny mask per round) without depending on the phase
+    // contract, and without state that can only advance inside execute().
     std::vector<int> cached_shape_;
     std::vector<double> cached_input_;
-    // Cached output data + shape.
     std::vector<int> cached_out_shape_;
     std::vector<int64_t> cached_out_;
+    // Whether the last round's fingerprint matched (drives the replay and
+    // host-work answers).
+    bool nz_reusable_ = false;
+    bool invalidate_pending_ = false;
+    // Mask values read once because the mask is a read-only leaf.
+    std::vector<double> leaf_mask_values_;
+    bool leaf_mask_valid_ = false;
 
     void invalidate_shape_cache() override {
-        nz_state_ = LearnState::LEARNING;
-        cached_shape_.clear();
-        cached_input_.clear();
-        cached_out_shape_.clear();
-        cached_out_.clear();
+        // Reuse is decided by comparing the mask with last round's, so a phase
+        // boundary needs no reset for correctness -- but the cached OUTPUT was
+        // produced by the previous phase, so refuse one reuse to be safe.
+        invalidate_pending_ = true;
+        nz_reusable_ = false;
     }
     bool has_host_side_effects() const override { return true; }
 
@@ -85,18 +96,18 @@ class NonZero : public BufferFactory {
     // LEARNING/CONFIRMING/DYNAMIC do a real readback whose result can differ;
     // those keep the conservative answer.
     bool recording_changes_per_round() const override {
-        return nz_state_ != LearnState::STABLE;
+        return !nz_reusable_;
     }
     bool did_host_work_last_round() const override {
         // Not `host_work_observed_ ? host_work_last_round_ : ...`: execute()
         // sets that flag unconditionally at its top, so it is always observed
         // and always true, which would mask this answer.
-        return nz_state_ != LearnState::STABLE;
+        return !nz_reusable_;
     }
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
-        if (nz_state_ != LearnState::STABLE || cached_out_.empty() ||
+        if (!nz_reusable_ || cached_out_.empty() ||
             outputs.empty() || !outputs[0]) {
             return false;
         }
@@ -147,14 +158,47 @@ class NonZero : public BufferFactory {
         }
         int total = total_elems(shape);
 
-        // STABLE fast path: reuse cached output, skip readback entirely.
-        // The mask is phase-invariant (image fixed for the whole decode
-        // phase), so the [rank, count] output is byte-identical every round.
-        // No periodic verify: the phase contract guarantees the input cannot
-        // change within a phase, and invalidate_shape_cache() (called at every
-        // phase boundary by Runtime::invalidate_replay) resets to LEARNING so
-        // a genuinely new mask is re-learned, not blindly reused.
-        if (nz_state_ == LearnState::STABLE) {
+        // Read the mask's values and compare with last round's. Equal means the
+        // [rank, count] output is byte-identical, so it can be re-filled from
+        // the cache instead of scanned again.
+        //
+        // The mask is tiny, and the readback is free whenever the producer
+        // left the bytes on the host (a leaf mask, or one produced by another
+        // cpu-path shape op) -- which is every case this chain actually hits.
+        // Comparing is what the removed learning machine asserted instead: it
+        // promoted to "stable" after two matching rounds and then trusted the
+        // mask never to change, with no verify, keyed on a phase contract
+        // every driver had to honour.
+        // A read-only leaf mask cannot change, so its values (and therefore
+        // this op's output) are a constant of the node: read once, then reuse
+        // forever with no readback at all.
+        const bool leaf_mask = inputs[0]->is_read_only_leaf();
+        std::vector<double> input_fp;
+        if (leaf_mask && leaf_mask_valid_) {
+            input_fp = leaf_mask_values_;
+        } else {
+            input_fp.resize(total);
+            dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto input = core::as_tensor<T>(inputs[0]);
+                // Unconditional readback: a cross-round-recycled GPU input may
+                // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements
+                // fix).
+                input->copyToCPU(m_cmdpool_);
+                for (int i = 0; i < total; ++i) {
+                    input_fp[i] = static_cast<double>((*input)[i]);
+                }
+            });
+            if (leaf_mask) {
+                leaf_mask_values_ = input_fp;
+                leaf_mask_valid_ = true;
+            }
+        }
+        nz_reusable_ = !cached_out_.empty() && !invalidate_pending_ &&
+                       shape == cached_shape_ && input_fp == cached_input_;
+        invalidate_pending_ = false;
+        if (nz_reusable_) {
+            set_did_host_work_last_round(false);
             auto output = core::as_tensor<int64_t>(outputs[0]);
             output->resize(cached_out_shape_);
             output->fillToCPU(cached_out_);
@@ -165,38 +209,29 @@ class NonZero : public BufferFactory {
             return;
         }
 
-        // Readback path (LEARNING/CONFIRMING/DYNAMIC).
-        // Pull the input to the host and collect the multi-dim coordinates of
-        // every non-zero element. bool/int8 share the int8_t storage repr in
-        // the runtime; float/int64 are also supported by dispatch_by_dtype.
+        // Different mask: rescan.
+        // Collect the multi-dim coordinates of every non-zero element.
+        // bool/int8 share the int8_t storage repr in the runtime; float/int64
+        // are also supported by dispatch_by_dtype.
         std::vector<std::vector<int64_t>>
             coords; // coords[k] = coord of k-th nz
-        std::vector<double> input_fp(total);
-        dispatch_by_dtype(inputs[0]->dtype(), [&](auto dummy) {
-            using T = decltype(dummy);
-            auto input = core::as_tensor<T>(inputs[0]);
-            // Unconditional readback: a cross-round-recycled GPU input may
-            // have stale CPU data_ (see SqueezeUnsqueeze/ScatterElements fix).
-            input->copyToCPU(m_cmdpool_);
+        {
             // Precompute per-axis strides (row-major) for coordinate decode.
             std::vector<int64_t> stride(rank, 1);
             for (int d = rank - 2; d >= 0; --d) {
                 stride[d] = stride[d + 1] * shape[d + 1];
             }
             for (int i = 0; i < total; ++i) {
-                double v = static_cast<double>((*input)[i]);
-                input_fp[i] = v;
-                if (v != 0.0) {
-                    std::vector<int64_t> c(rank);
-                    int rem = i;
-                    for (int d = 0; d < rank; ++d) {
-                        c[d] = rem / static_cast<int>(stride[d]);
-                        rem = rem % static_cast<int>(stride[d]);
-                    }
-                    coords.push_back(std::move(c));
+                if (input_fp[i] == 0.0) continue;
+                std::vector<int64_t> c(rank);
+                int rem = i;
+                for (int d = 0; d < rank; ++d) {
+                    c[d] = rem / static_cast<int>(stride[d]);
+                    rem = rem % static_cast<int>(stride[d]);
                 }
+                coords.push_back(std::move(c));
             }
-        });
+        }
 
         int count = static_cast<int>(coords.size());
         // ONNX NonZero output: [rank, count], column-major. For rank==1 this
@@ -209,43 +244,13 @@ class NonZero : public BufferFactory {
             }
         }
 
-        // Advance the learn state machine. Fingerprint = shape + input data.
-        bool match = (shape == cached_shape_ && input_fp == cached_input_);
-        if (nz_state_ == LearnState::LEARNING) {
-            cached_shape_ = shape;
-            cached_input_ = input_fp;
-            cached_out_shape_ = out_shape;
-            cached_out_ = out;
-            nz_state_ = LearnState::CONFIRMING;
-        } else if (nz_state_ == LearnState::CONFIRMING) {
-            if (match) {
-                nz_state_ = LearnState::STABLE;
-            } else {
-                nz_state_ = LearnState::DYNAMIC;
-                cached_shape_ = shape;
-                cached_input_ = input_fp;
-                cached_out_shape_ = out_shape;
-                cached_out_ = out;
-            }
-        } else if (nz_state_ == LearnState::STABLE) {
-            // Unreachable in steady state: the STABLE fast path returns before
-            // reaching here. The phase contract guarantees no mid-phase drift,
-            // so there is no verify readback to land here. If a future caller
-            // somehow re-enters execute() under STABLE without the fast path,
-            // treat any mismatch as DYNAMIC and re-cache.
-            if (!match) {
-                nz_state_ = LearnState::DYNAMIC;
-                cached_shape_ = shape;
-                cached_input_ = input_fp;
-                cached_out_shape_ = out_shape;
-                cached_out_ = out;
-            }
-        } else { // DYNAMIC
-            cached_shape_ = shape;
-            cached_input_ = input_fp;
-            cached_out_shape_ = out_shape;
-            cached_out_ = out;
-        }
+        // Remember this round's fingerprint and result. The next round
+        // reuses the output if the mask is byte-identical, which the fast path
+        // at the top of execute() checks; nothing is promoted or predicted.
+        cached_shape_ = shape;
+        cached_input_ = input_fp;
+        cached_out_shape_ = out_shape;
+        cached_out_ = out;
 
         auto output = core::as_tensor<int64_t>(outputs[0]);
         output->resize(out_shape);
