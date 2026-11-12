@@ -397,6 +397,9 @@ class Expand : public Operator {
     // LINEAR_GROW prediction state.
     std::vector<int> grow_target_; // last verified/predicted target
     int grow_dim_ = -1;            // which dim grows by +1 each round
+    // Target read once from a read-only leaf input (constant of the node).
+    std::vector<int> leaf_target_;
+    bool leaf_target_valid_ = false;
     int linear_rounds_ = 0;        // consecutive rounds since last verify
     static constexpr int LINEAR_VERIFY_INTERVAL = 8;
 
@@ -407,6 +410,33 @@ class Expand : public Operator {
     resolve_target_shape(const std::shared_ptr<core::ITensor> &target_tensor,
                          bool &did_readback) {
         did_readback = false;
+        // Structural fast path: a read-only leaf target tensor (an
+        // initializer or a graph input) cannot change, so the target is a
+        // constant of the node. Read once, then never again.
+        //
+        // Takes precedence over the learner below for the same reason it does
+        // in SqueezeUnsqueeze/Reshape: a learned answer only advances inside
+        // execute(), which a re-recorded segment may skip, and a structural
+        // answer cannot be wrong.
+        if (target_tensor && target_tensor->is_read_only_leaf()) {
+            if (!leaf_target_valid_) {
+                auto read = [&](auto dummy) -> bool {
+                    using T = decltype(dummy);
+                    auto t = core::as_tensor<T>(target_tensor);
+                    if (!t) return false;
+                    t->copyToCPU(m_cmdpool_);
+                    leaf_target_.clear();
+                    leaf_target_.reserve(t->num_elements());
+                    for (int i = 0; i < t->num_elements(); ++i)
+                        leaf_target_.push_back(static_cast<int>((*t)[i]));
+                    return true;
+                };
+                const bool ok = read(int64_t{}) || read(int{}) ||
+                                read(int32_t{});
+                if (ok) leaf_target_valid_ = true;
+            }
+            if (leaf_target_valid_) return leaf_target_;
+        }
         // STABLE: reuse cached, no readback.
         if (target_cache_state_ == TargetLearnState::STABLE) {
             return cached_target_;

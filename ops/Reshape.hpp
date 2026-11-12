@@ -341,16 +341,40 @@ class ReshapeBuffer : public BufferFactory {
             }
         } else {
             auto shape = core::as_tensor<int64_t>(inputs[1]);
-            // Only STABLE is replayable: it means two consecutive readbacks
-            // produced the SAME dim, so the recorded dispatch is valid again
-            // next round. LINEAR_GROW is the opposite -- it grows by one every
-            // round, so replaying it re-runs last round's shape (measured:
-            // marking it replayable emitted "capital capital of of ..." with
-            // past_len advancing while the reshaped tensors stayed stale).
-            // LEARNING / CONFIRMING / DYNAMIC all re-read, which a replay would
-            // skip, so they stay dynamic too.
-            set_did_host_work_last_round(cache_state_ != LearnState::STABLE);
-            dim = resolve_dim(shape);
+            // Structural fast path: a read-only leaf shape input (an
+            // initializer or a graph input) cannot change, so its dim[] is a
+            // constant of the node. Read it once and report no host work for
+            // the rest of the session.
+            //
+            // This replaces the learned answer for the common case, and it is
+            // the safe direction: the machine below only advances inside
+            // execute(), so a segment that is being re-recorded every round
+            // (which re-submits the previous recording rather than re-running
+            // its ops) can leave a learner stuck in CONFIRMING forever --
+            // measured on the ViT's Unsqueeze before it was converted. A
+            // structural answer has no such state to get stuck in.
+            if (inputs[1]->is_read_only_leaf()) {
+                if (!leaf_dim_valid_) {
+                    shape->copyToCPU(m_cmdpool_);  // free: host bytes current
+                    leaf_dim_.reserve(shape->num_elements());
+                    for (int i = 0; i < shape->num_elements(); ++i)
+                        leaf_dim_.push_back(static_cast<int>((*shape)[i]));
+                    leaf_dim_valid_ = true;
+                }
+                dim = leaf_dim_;
+                set_did_host_work_last_round(false);
+            } else {
+                // Only STABLE is replayable: it means two consecutive readbacks
+                // produced the SAME dim, so the recorded dispatch is valid again
+                // next round. LINEAR_GROW is the opposite -- it grows by one
+                // every round, so replaying it re-runs last round's shape
+                // (measured: marking it replayable emitted "capital capital of
+                // of ..." with past_len advancing while the reshaped tensors
+                // stayed stale). LEARNING / CONFIRMING / DYNAMIC all re-read,
+                // which a replay would skip, so they stay dynamic too.
+                set_did_host_work_last_round(cache_state_ != LearnState::STABLE);
+                dim = resolve_dim(shape);
+            }
         }
         int n = static_cast<int>(dim.size());
         int total = total_elems(in_shape);
@@ -568,6 +592,10 @@ class ReshapeBuffer : public BufferFactory {
     // converter attached vkop_host_shape — the node then has a single input.
     std::vector<int> host_target_;
     bool host_target_valid_ = false;
+    // dim[] read once from a read-only leaf shape input. The bytes cannot
+    // change, so this is a constant of the node — no learning, no re-read.
+    std::vector<int> leaf_dim_;
+    bool leaf_dim_valid_ = false;
     std::vector<int> learned_dim_; // round-0 dim[] (compared against round-1)
     std::vector<int> cached_dim_;  // STABLE dim[] reused on round 2+
     // LINEAR_GROW / RE_STABLE state.

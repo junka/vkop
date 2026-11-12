@@ -172,6 +172,12 @@ class SliceBuffer : public BufferFactory {
     std::vector<int64_t> meta_starts_, meta_ends_, meta_axes_, meta_steps_;
     // Cached output-shape computation (out_size[0..3]).
     std::vector<std::vector<int>> cached_out_size_;
+    // Output size computed from read-only leaf slicing parameters, keyed on
+    // the data input's shape (the only thing that can change). See the
+    // structural fast path in execute().
+    std::vector<std::vector<int>> leaf_out_size_;
+    std::vector<int> leaf_inshape_;
+    bool leaf_meta_valid_ = false;
     static constexpr int STABLE_VERIFY_INTERVAL = 8;
     int stable_rounds_ = 0;
 
@@ -234,8 +240,27 @@ class SliceBuffer : public BufferFactory {
         // read no data, so this is a complete readback skip for them.
         std::vector<std::vector<int>> out_size;
         bool meta_reused = false;
-        if (slice_state_ == LearnState::STABLE &&
-            stable_rounds_ < STABLE_VERIFY_INTERVAL) {
+        // Structural fast path: every slicing parameter (starts/ends/axes/
+        // steps) is a read-only leaf, so the ONLY thing that can change the
+        // output size is the data input's shape. Cache against that shape
+        // instead of learning whether the parameters repeat.
+        //
+        // Different from the machine below in the way that matters: a leaf
+        // cannot change, so this cannot be wrong; and it is evaluated on the
+        // shape we already have, so it cannot get stuck when a replayed
+        // segment skips execute().
+        const bool meta_is_leaf =
+            inputs.size() > 2 && inputs[1] && inputs[1]->is_read_only_leaf() &&
+            inputs[2] && inputs[2]->is_read_only_leaf() &&
+            (inputs.size() <= 3 || !inputs[3] ||
+             inputs[3]->is_read_only_leaf()) &&
+            (inputs.size() <= 4 || !inputs[4] ||
+             inputs[4]->is_read_only_leaf());
+        if (meta_is_leaf && leaf_meta_valid_ && inshape == leaf_inshape_) {
+            out_size = leaf_out_size_;
+            meta_reused = true;
+        } else if (!meta_is_leaf && slice_state_ == LearnState::STABLE &&
+                   stable_rounds_ < STABLE_VERIFY_INTERVAL) {
             stable_rounds_++;
             out_size = cached_out_size_;
             meta_reused = true;
@@ -259,6 +284,13 @@ class SliceBuffer : public BufferFactory {
             }
             out_size = slice_calc::calculate_output_shape<int64_t>(
                 inshape, starts_t->data(), ends_t->data(), axes_vec, steps_vec);
+            if (meta_is_leaf) {
+                // The parameters are constants; remember the answer against the
+                // data shape that produced it.
+                leaf_out_size_ = out_size;
+                leaf_inshape_ = inshape;
+                leaf_meta_valid_ = true;
+            }
 
             // Advance the learn state machine. Fingerprint = inshape + the
             // four meta vectors. STABLE when two consecutive rounds match.

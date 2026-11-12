@@ -109,6 +109,19 @@ class ITensor {
     void set_ref_cnt_forever() {
         ref_cnt_ = std::numeric_limits<uint16_t>::max();
     }
+    // True for a tensor the LOADER created and no graph node writes: an
+    // initializer or a graph input. Both get set_ref_cnt_forever(), while
+    // every node output gets its consumer count, so this is a structural
+    // property rather than an observation — the bytes of such a tensor cannot
+    // change for the model's lifetime.
+    //
+    // Ops use it in place of the LEARNING/CONFIRMING/STABLE machinery: a
+    // read-only input makes an op's host work a one-time cost instead of a
+    // per-round one, and — unlike a learned answer — that cannot be wrong, and
+    // cannot get stuck if a replayed segment skips execute().
+    bool is_read_only_leaf() const {
+        return ref_cnt_ == std::numeric_limits<uint16_t>::max();
+    }
     void set_transpose() { transpose_ = true; }
     bool get_transpose() const { return transpose_; }
     void set_pack() { pack_ = true; }
