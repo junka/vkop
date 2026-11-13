@@ -988,10 +988,12 @@ class ONNXOptimizer:
 # cannot rot silently.
 RUNTIME_OPS = frozenset({
     "Add", "Atan", "Attention", "AveragePool", "BatchNorm", "BatchNormalization", "Cast",
-    "Col2Im", "Concat", "Conv", "Conv2d", "Cos", "DequantizeLinear", "Div",
+    "Col2Im", "Concat", "Conv", "Conv1D", "Conv1d", "Conv2d", "Cos",
+    "CumSum", "Cumsum", "DequantizeLinear", "Div",
     "EmbeddingForward", "Equal", "Erf", "Expand", "Floor", "FusedElemwise",
-    "Gather", "Gemm", "GlobalAveragePool", "GridSample", "LayerNorm",
-    "LayerNormalization", "MatMul", "Max", "MaxPool", "MaxPool2d", "Min", "Mod",
+    "Gather", "GatedDeltaNet", "Gemm", "GlobalAveragePool", "GridSample",
+    "LayerNorm", "LayerNormalization", "LinearAttention", "MatMul", "Max",
+    "MaxPool", "MaxPool2d", "Min", "Mod",
     "Mul", "Neg", "Nms", "NonZero", "Pow", "PRelu", "QuantizeLinear", "RMSNorm",
     "Range", "Reduce", "ReduceMean", "Relu", "Reshape", "Resize",
     "RotaryEmbedding", "ScatterElements", "ScatterND", "Shape", "Sigmoid",

@@ -143,6 +143,12 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"transpose", "transpose", false, true};
         case T::ATTENTION:
             return {nullptr, "attention", false, true};
+        case T::CUMSUM:
+            return {nullptr, "cumsum", false, false};
+        case T::CONV1D:
+            return {nullptr, "conv1d", false, false};
+        case T::LINEAR_ATTENTION:
+            return {nullptr, "linear_attention", false, false};
         case T::CAST:
             return {nullptr, "cast", false, false};
         case T::WHERE:

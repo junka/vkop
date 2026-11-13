@@ -7,6 +7,7 @@
 #include "Erf.hpp"
 #include "Floor.hpp"
 #include "LayerNorm.hpp"
+#include "LinearAttention.hpp"
 #include "Relu.hpp"
 #include "Sigmoid.hpp"
 #include "Softplus.hpp"
@@ -20,7 +21,9 @@
 #include "Sub.hpp"
 
 #include "Col2Im.hpp"
+#include "Conv1d.hpp"
 #include "Conv2d.hpp"
+#include "Cumsum.hpp"
 #include "Gemm.hpp"
 #include "GridSample.hpp"
 #include "Matmul.hpp"
@@ -95,6 +98,12 @@ create_from_type(OpType type, int fp16 = 0, int use_tensorcore = 0,
         return std::make_unique<Concat>(fp16, backend_buffer);
     case OpType::CONV2D:
         return std::make_unique<Conv2d>(fp16, backend_buffer);
+    case OpType::CONV1D:
+        return std::make_unique<Conv1d>(fp16, backend_buffer);
+    case OpType::CUMSUM:
+        return std::make_unique<Cumsum>(fp16, backend_buffer);
+    case OpType::LINEAR_ATTENTION:
+        return std::make_unique<LinearAttention>(fp16, backend_buffer);
     case OpType::DIV:
         return std::make_unique<Div>(fp16, backend_buffer);
     case OpType::EMBEDDING_FORWARD:

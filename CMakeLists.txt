@@ -550,6 +550,9 @@ endmacro()
 # descriptor pipeline as the per-dispatch fallback, so a model converted
 # without these keys simply stays on descriptors.
 set(BDA_SHADERS
+    buffer/cumsum
+    buffer/conv1d
+    buffer/linear_attention
     buffer/neg
     buffer/sigmoid
     buffer/tanh
@@ -1196,6 +1199,20 @@ if (ENABLE_LLM_CHAT)
     # 裸名字只会在链接期报 LNK1181（Windows 没有系统 utf8proc 搜索路径）。
     if(NOT MSVC)
         target_link_libraries(llm_chat PRIVATE utf8proc)
+    endif()
+
+    # Line-protocol inference server: the HTTP/Anthropic/SSE layer lives in
+    # Python (llm/server), which spawns this binary and talks role/text pairs
+    # over two inherited fds. Same numerical path as llm_chat, minus the
+    # performance layers (ring KV, chunked prefill, zero-copy decode inputs,
+    # GPU argmax) that a correctness-first server does not need yet.
+    add_executable(llm_serve llm/exporter/driver/llm_serve.cpp)
+    target_link_libraries(llm_serve PRIVATE vkop vload tokenizer)
+    target_include_directories(llm_serve PRIVATE
+        ${CMAKE_SOURCE_DIR}/llm/tokenizer)
+    target_link_libraries(llm_serve PRIVATE Threads::Threads)
+    if(NOT MSVC)
+        target_link_libraries(llm_serve PRIVATE utf8proc)
     endif()
 
     # Visual encoder probe: runs visual.vkopbin standalone to verify the visual

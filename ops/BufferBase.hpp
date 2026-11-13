@@ -233,6 +233,121 @@ struct alignas(8) ReduceBdaPC {
 static_assert(offsetof(ReduceBdaPC, out_addr) == 88, "ReduceBdaPC drift");
 static_assert(sizeof(ReduceBdaPC) == 104, "ReduceBdaPC drift");
 
+// Cumulative sum along one axis (shaders/buffer/cumsum.comp). One workgroup
+// per "line" (every lane group fixed by the non-axis dims); within a line the
+// elements sit `axis_stride` apart in linear index space and are walked in
+// order by that workgroup, carrying a running total. The shape is not in the
+// PC: the resolved (axis_len, axis_stride, outer) triple is everything the
+// shader needs, and dropping the dims array keeps the BDA pointer offsets
+// simple.
+struct alignas(16) CumsumPC {
+    int axis;        // resolved, >= 0 (diagnostic only)
+    int axis_len;    // dims[axis]
+    int axis_stride; // product of dims after the axis
+    int lines;       // outer * axis_stride == workgroup count
+    int exclusive;   // 1 = exclusive prefix sum
+    int reverse;     // 1 = walk the line backwards
+    int _pad0;
+    int _pad1;
+};
+static_assert(sizeof(CumsumPC) == 32, "CumsumPC layout drift");
+
+// Device-address variant: the two pointers follow the 32-byte scalar prefix.
+struct alignas(8) CumsumBdaPC {
+    int axis;
+    int axis_len;
+    int axis_stride;
+    int lines;
+    int exclusive;
+    int reverse;
+    int _pad0;
+    int _pad1;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress in_addr;
+};
+static_assert(offsetof(CumsumBdaPC, out_addr) == 32, "CumsumBdaPC drift");
+static_assert(offsetof(CumsumBdaPC, in_addr) == 40, "CumsumBdaPC drift");
+static_assert(sizeof(CumsumBdaPC) == 48, "CumsumBdaPC drift");
+
+// Causal depthwise Conv1d (shaders/buffer/conv1d.comp). One thread per output
+// element of a [C, S] channel-major tensor; each lane runs its channel's
+// length-K filter over a causal window, taking the samples before t=0 from
+// the conv state (a [C, K-1] graph I/O tensor) instead of zero padding. The
+// same pipeline runs a second time with mode=1 to write the new state tail,
+// which is what makes present-aliases-past race-free.
+struct alignas(16) Conv1dPC {
+    int channels;  // C
+    int seq;       // S, new tokens this round
+    int kernel;    // K
+    int state_len; // K-1
+    int total;     // C*S for mode 0, C for mode 1
+    int mode;      // 0 = convolution, 1 = state update
+    int _pad0;
+    int _pad1;
+};
+static_assert(sizeof(Conv1dPC) == 32, "Conv1dPC layout drift");
+
+struct alignas(8) Conv1dBdaPC {
+    int channels;
+    int seq;
+    int kernel;
+    int state_len;
+    int total;
+    int mode;
+    int _pad0;
+    int _pad1;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress x_addr;
+    VkDeviceAddress w_addr;
+    VkDeviceAddress state_in_addr;
+    VkDeviceAddress state_out_addr;
+};
+static_assert(offsetof(Conv1dBdaPC, out_addr) == 32, "Conv1dBdaPC drift");
+static_assert(offsetof(Conv1dBdaPC, state_out_addr) == 64,
+              "Conv1dBdaPC drift");
+static_assert(sizeof(Conv1dBdaPC) == 72, "Conv1dBdaPC drift");
+
+// Gated delta rule (shaders/buffer/linear_attention.comp). One workgroup per
+// value head; lane t owns value-column t of that head's [Dk, Dv] state matrix,
+// so the recurrence needs no cross-lane reduction and the state store rewrites
+// only what the lane read.
+struct alignas(16) LinearAttentionPC {
+    int heads;    // Hv (q/k already expanded to Hv)
+    int seq;      // tokens this round
+    int dk;       // key head dim
+    int dv;       // value head dim
+    int eps_bits; // l2norm epsilon as float bits
+    int _pad0;
+    int _pad1;
+    int _pad2;
+};
+static_assert(sizeof(LinearAttentionPC) == 32, "LinearAttentionPC drift");
+
+struct alignas(8) LinearAttentionBdaPC {
+    int heads;
+    int seq;
+    int dk;
+    int dv;
+    int eps_bits;
+    int _pad0;
+    int _pad1;
+    int _pad2;
+    VkDeviceAddress out_addr;
+    VkDeviceAddress q_addr;
+    VkDeviceAddress k_addr;
+    VkDeviceAddress v_addr;
+    VkDeviceAddress g_addr;
+    VkDeviceAddress beta_addr;
+    VkDeviceAddress state_in_addr;
+    VkDeviceAddress state_out_addr;
+};
+static_assert(offsetof(LinearAttentionBdaPC, out_addr) == 32,
+              "LinearAttentionBdaPC drift");
+static_assert(offsetof(LinearAttentionBdaPC, state_out_addr) == 88,
+              "LinearAttentionBdaPC drift");
+static_assert(sizeof(LinearAttentionBdaPC) == 96,
+              "LinearAttentionBdaPC drift");
+
 struct alignas(8) TransposeBdaPC {
     int rank;
     int inDims[8];

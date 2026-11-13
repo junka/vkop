@@ -1,0 +1,203 @@
+// Copyright 2025 @junka
+#ifndef OPS_LINEAR_ATTENTION_HPP_
+#define OPS_LINEAR_ATTENTION_HPP_
+
+#include "Operator.hpp"
+#include "ops/BufferBase.hpp"
+#include "ops/PimplFacade.hpp"
+#include <cstring>
+
+namespace vkop {
+namespace ops {
+
+// Gated delta rule (linear attention), recurrent form. This is the core of
+// Qwen3.5's `Qwen3_5GatedDeltaNet`, matching HF's
+// `torch_recurrent_gated_delta_rule` for a single sequence:
+//
+//     qn = l2norm(q) / sqrt(Dk)        kn = l2norm(k)
+//     S  = S * exp(g)                  (g <= 0; the decay)
+//     kv = (S * kn).sum(dk)            [Dv]
+//     delta = (v - kv) * beta
+//     S  = S + kn (x) delta            (rank-1, the delta rule)
+//     out = (S * qn).sum(dk)           [Dv]
+//
+// The projections, the causal conv, the A/dt_bias decay and the gated RMSNorm
+// stay ordinary graph ops; this op is only the recurrence, because that is the
+// part no existing kernel expresses.
+//
+// Interface:
+//   inputs[0] q        [H, S, Dk] fp32 (already repeated to Hv heads)
+//   inputs[1] k        [H, S, Dk] fp32
+//   inputs[2] v        [H, S, Dv] fp32
+//   inputs[3] g        [H, S]     fp32, log-space decay (<= 0)
+//   inputs[4] beta     [H, S]     fp32
+//   inputs[5] state_in [H, Dk, Dv] fp32 - the recurrent state, a graph input
+//   outputs[0] out        [H, S, Dv] fp32
+//   outputs[1] state_out  [H, Dk, Dv] fp32 - may alias state_in; each lane
+//                          rewrites only the column it read.
+//
+// Buffer-only and fp32-only: the recurrence is sequential over tokens and HF
+// normalizes and accumulates in fp32 whatever the model dtype, so the fp16
+// packed-word layout cannot express it. The converter keeps this op's inputs
+// fp32 and inserts the casts at the boundaries.
+class LinearAttentionBuffer : public BufferFactory {
+  public:
+    LinearAttentionBuffer()
+        : BufferFactory(OpType::LINEAR_ATTENTION,
+                        std::vector<VkDescriptorType>{
+                            DESCRIPTOR_TYPE_STORAGE, // out
+                            DESCRIPTOR_TYPE_STORAGE, // q
+                            DESCRIPTOR_TYPE_STORAGE, // k
+                            DESCRIPTOR_TYPE_STORAGE, // v
+                            DESCRIPTOR_TYPE_STORAGE, // g
+                            DESCRIPTOR_TYPE_STORAGE, // beta
+                            DESCRIPTOR_TYPE_STORAGE, // state in
+                            DESCRIPTOR_TYPE_STORAGE, // state out
+                        },
+                        sizeof(LinearAttentionPC)) {}
+
+  private:
+    bool supports_bda_variant() const override { return true; }
+    size_t bda_pc_size() const override { return sizeof(LinearAttentionBdaPC); }
+
+    void execute(
+        const std::vector<std::shared_ptr<core::ITensor>> &inputs,
+        const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        if (inputs.size() < 6 || outputs.empty()) {
+            throw std::runtime_error(
+                "LinearAttention: needs q, k, v, g, beta, state");
+        }
+        for (int i = 0; i < 6; i++) {
+            if (!inputs[i]) {
+                throw std::runtime_error("LinearAttention: a required input is "
+                                         "unbound");
+            }
+        }
+        if (inputs[0]->elem_kind() != core::ElemKind::kFloat32) {
+            throw std::runtime_error(
+                "LinearAttention: fp32-only (the recurrence normalizes and "
+                "accumulates in fp32); declare its inputs fp32");
+        }
+        const auto q_shape = inputs[0]->getShape();
+        if (q_shape.size() != 3) {
+            throw std::runtime_error("LinearAttention: q must be [H, S, Dk]");
+        }
+        const int heads = q_shape[0];
+        const int seq = q_shape[1];
+        const int dk = q_shape[2];
+        const auto v_shape = inputs[2]->getShape();
+        if (v_shape.size() != 3 || v_shape[0] != heads || v_shape[1] != seq) {
+            throw std::runtime_error(
+                "LinearAttention: v must be [H, S, Dv] matching q's H and S");
+        }
+        const int dv = v_shape[2];
+        if (dk <= 0 || dv <= 0 || heads <= 0 || seq <= 0) {
+            throw std::runtime_error("LinearAttention: empty extent");
+        }
+        if (dk > 128 || dv > 128) {
+            throw std::runtime_error(
+                "LinearAttention: head dims above 128 are not supported (the "
+                "workgroup is 128 lanes and the state column lives in "
+                "registers)");
+        }
+
+        auto out = core::as_tensor<float>(outputs[0]);
+        if (!out) {
+            throw std::runtime_error(
+                "LinearAttention: output is not an fp32 tensor");
+        }
+        const std::vector<int> o_shape{heads, seq, dv};
+        if (out->num_elements() != heads * seq * dv) {
+            out->resize(o_shape);
+        } else if (out->getShape() != o_shape) {
+            out->reshape_view(o_shape);
+        }
+        auto out_buf = bind_ssbo<float>(outputs[0], /*is_output=*/true);
+        auto q_buf = bind_ssbo<float>(inputs[0], false);
+        auto k_buf = bind_ssbo<float>(inputs[1], false);
+        auto v_buf = bind_ssbo<float>(inputs[2], false);
+        auto g_buf = bind_ssbo<float>(inputs[3], false);
+        auto b_buf = bind_ssbo<float>(inputs[4], false);
+
+        const std::vector<int> s_shape{heads, dk, dv};
+        auto st_in = core::as_tensor<float>(inputs[5]);
+        if (!st_in) {
+            throw std::runtime_error(
+                "LinearAttention: state_in is not an fp32 tensor");
+        }
+        if (st_in->num_elements() != heads * dk * dv) {
+            st_in->resize(s_shape);
+        }
+        auto state_in_buf = bind_ssbo<float>(inputs[5], /*is_output=*/false);
+        // state_out may BE state_in (present aliases past). Bound as an output
+        // so the storage helper marks it written; the kernel's lane writes
+        // only the column it has already read.
+        std::shared_ptr<VulkanBuffer> state_out_buf;
+        if (outputs.size() > 1 && outputs[1]) {
+            auto so = core::as_tensor<float>(outputs[1]);
+            if (!so) {
+                throw std::runtime_error(
+                    "LinearAttention: state_out is not an fp32 tensor");
+            }
+            if (so->num_elements() != heads * dk * dv) {
+                so->resize(s_shape);
+            }
+            state_out_buf = bind_ssbo<float>(outputs[1], /*is_output=*/true);
+        } else {
+            state_out_buf = state_in_buf;
+        }
+
+        LinearAttentionPC pc{};
+        pc.heads = heads;
+        pc.seq = seq;
+        pc.dk = dk;
+        pc.dv = dv;
+        pc.eps_bits = eps_bits();
+
+        // One workgroup per head; the lanes are its value columns.
+        const int groups = heads;
+        if (bda_ready() && out_buf && q_buf && k_buf && v_buf && g_buf &&
+            b_buf && state_in_buf && state_out_buf &&
+            out_buf->hasDeviceAddress() && q_buf->hasDeviceAddress() &&
+            k_buf->hasDeviceAddress() && v_buf->hasDeviceAddress() &&
+            g_buf->hasDeviceAddress() && b_buf->hasDeviceAddress() &&
+            state_in_buf->hasDeviceAddress() &&
+            state_out_buf->hasDeviceAddress()) {
+            LinearAttentionBdaPC bpc{};
+            std::memcpy(&bpc, &pc, offsetof(LinearAttentionBdaPC, out_addr));
+            bpc.out_addr = out_buf->getDeviceAddress();
+            bpc.q_addr = q_buf->getDeviceAddress();
+            bpc.k_addr = k_buf->getDeviceAddress();
+            bpc.v_addr = v_buf->getDeviceAddress();
+            bpc.g_addr = g_buf->getDeviceAddress();
+            bpc.beta_addr = b_buf->getDeviceAddress();
+            bpc.state_in_addr = state_in_buf->getDeviceAddress();
+            bpc.state_out_addr = state_out_buf->getDeviceAddress();
+            submit_bda(&bpc, sizeof(bpc), groups, 1, 1);
+            return;
+        }
+        submit(&pc, groups, 1, 1);
+    }
+
+    // l2norm epsilon, the value HF's `l2norm(x, eps=1e-6)` uses, carried as
+    // float bits so the push constant stays all-int.
+    static int eps_bits() {
+        const float eps = 1e-6F;
+        int bits;
+        std::memcpy(&bits, &eps, sizeof(bits));
+        return bits;
+    }
+};
+
+// PIMPL façade: buffer-only, so both branches build the buffer leaf.
+class LinearAttention : public PimplFacade {
+  public:
+    LinearAttention(int /*fp16*/, bool /*backend_buffer*/)
+        : PimplFacade(OpType::LINEAR_ATTENTION) {
+        impl_ = std::make_unique<LinearAttentionBuffer>();
+    }
+};
+
+} // namespace ops
+} // namespace vkop
+#endif // OPS_LINEAR_ATTENTION_HPP_

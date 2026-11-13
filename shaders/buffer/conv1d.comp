@@ -1,0 +1,153 @@
+#version 450 core
+
+// Causal depthwise Conv1d (the Qwen3.5 gated-delta-net convolution), two
+// dispatches from one pipeline:
+//
+//   mode 0 (conv):  y[c,t] = sum_k w[c,k] * x[c, t-(K-1)+k], with the samples
+//                   before t=0 read from the conv STATE rather than a zero pad.
+//   mode 1 (state): state_out[c, :] = the last (K-1) inputs of channel c,
+//                   i.e. (state_in ++ x)[c, -state_len:].
+//
+// Why two dispatches rather than one kernel: the state update both reads the
+// old state and writes the new one, and a Vulkan compute dispatch gives no
+// ordering between workgroups. Split this way, mode 0 only reads the state and
+// mode 1 is a per-channel copy whose single thread loads the old tail into
+// registers before storing, so the aliased (present == past) case is race-free
+// with any number of channels.
+//
+// HF builds the convolution as nn.Conv1d(groups=conv_dim, kernel_size=K,
+// padding=K-1) followed by a slice to the first seq samples; groups == channels
+// means every channel has its own filter and nothing mixes across channels.
+//
+// Layout: [C, S] channel-major (the tensor the exporter produces after
+// transpose(1,2)). fp32 only: the window reads neighbours, which the fp16
+// half2 packing (two elements per word) cannot serve without two threads
+// racing on one word.
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+// The state tail is at most this long; Qwen3.5 uses K=4 (state_len 3).
+#define MAX_STATE 32
+
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
+layout(set = 0, binding = 0) writeonly buffer Output {
+    uint data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    uint data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Weight {
+    uint data[];
+} uWeight;
+layout(set = 0, binding = 3) readonly buffer StateIn {
+    uint data[];
+} uStateIn;
+layout(set = 0, binding = 4) writeonly buffer StateOut {
+    uint data[];
+} uStateOut;
+#endif
+
+layout(push_constant) uniform PC_uConv1d {
+    int channels;  // C
+    int seq;       // S, new tokens this round
+    int kernel;    // K
+    int state_len; // K-1
+    int total;     // C*S for mode 0, C for mode 1
+    int mode;      // 0 = convolution, 1 = state update
+    int _pad0;
+    int _pad1;
+#ifdef BDA
+    DataBuf uOutput;
+    DataBuf uInput;
+    DataBuf uWeight;
+    DataBuf uStateIn;
+    DataBuf uStateOut;
+#endif
+} uConv1d;
+#ifdef BDA
+#define uOutput uConv1d.uOutput
+#define uInput uConv1d.uInput
+#define uWeight uConv1d.uWeight
+#define uStateIn uConv1d.uStateIn
+#define uStateOut uConv1d.uStateOut
+#endif
+
+void conv_mode(const int gid) {
+    const int c = gid / uConv1d.seq;
+    const int t = gid % uConv1d.seq;
+    const int K = uConv1d.kernel;
+    const int pad = uConv1d.state_len;
+    const uint wbase = uint(c) * uint(K);
+
+    float acc = 0.0;
+    for (int k = 0; k < K; k++) {
+        const int pos = t - (K - 1) + k; // absolute position this tap reads
+        float x;
+        if (pos >= 0) {
+            x = uintBitsToFloat(
+                uInput.data[uint(c) * uint(uConv1d.seq) + uint(pos)]);
+        } else {
+            const int si = pad + pos; // 0..pad-1 into the old tail
+            x = (si >= 0)
+                    ? uintBitsToFloat(uStateIn.data[uint(c) * uint(pad) +
+                                                   uint(si)])
+                    : 0.0;
+        }
+        acc += x * uintBitsToFloat(uWeight.data[wbase + uint(k)]);
+    }
+    uOutput.data[uint(c) * uint(uConv1d.seq) + uint(t)] = floatBitsToUint(acc);
+}
+
+void state_mode(const int c) {
+    const int pad = uConv1d.state_len;
+    const int S = uConv1d.seq;
+    if (pad <= 0 || pad > MAX_STATE) {
+        return;
+    }
+    // The new tail is the last `pad` samples of (old_state ++ x).
+    //   history index i (0 <= i < pad + S) is old_state[i]      when i < pad
+    //                                     is x[i - pad]        otherwise
+    // so the tail starts at `S`.
+    float old[MAX_STATE];
+    for (int i = 0; i < pad; i++) {
+        old[i] = uintBitsToFloat(uStateIn.data[uint(c) * uint(pad) + uint(i)]);
+    }
+    float merged[MAX_STATE];
+    for (int j = 0; j < pad; j++) {
+        const int hist = S + j;
+        merged[j] = (hist < pad)
+                        ? old[hist]
+                        : uintBitsToFloat(uInput.data[uint(c) * uint(S) +
+                                                     uint(hist - pad)]);
+    }
+    // Written after every read above, so present-aliases-past is race-free.
+    for (int j = 0; j < pad; j++) {
+        uStateOut.data[uint(c) * uint(pad) + uint(j)] =
+            floatBitsToUint(merged[j]);
+    }
+}
+
+void main() {
+    const int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= uConv1d.total) {
+        return;
+    }
+    if (uConv1d.mode == 0) {
+        conv_mode(gid);
+    } else {
+        state_mode(gid);
+    }
+}

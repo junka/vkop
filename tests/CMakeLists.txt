@@ -600,6 +600,18 @@ add_test(NAME UnaryBdaProbeDesc COMMAND UnaryBdaProbe)
 set_tests_properties(UnaryBdaProbeDesc PROPERTIES ENVIRONMENT
     "UNARY_BDA_DESC_ONLY=1")
 
+# The three qwen3_5 linear-attention ops (CumSum / Conv1d / LinearAttention),
+# each checked against a CPU reference of the same math. Both builds run the
+# same cases so the BDA and descriptor paths are covered.
+add_executable(LinearAttnOpsProbe LinearAttnOpsProbe.cpp)
+target_link_libraries(LinearAttnOpsProbe PRIVATE vkop vload)
+add_dependencies(LinearAttnOpsProbe shader_archive)
+target_compile_definitions(LinearAttnOpsProbe PRIVATE ${VKOP_DEV_ARCHIVE_DEF})
+add_test(NAME LinearAttnOpsProbe COMMAND LinearAttnOpsProbe)
+add_test(NAME LinearAttnOpsProbeDesc COMMAND LinearAttnOpsProbe)
+set_tests_properties(LinearAttnOpsProbeDesc PROPERTIES ENVIRONMENT
+    "VKOP_BDA=0")
+
 # First non-unary BDA variant: three data buffers instead of two.
 add_executable(RMSNormBdaProbe RMSNormBdaProbe.cpp)
 target_link_libraries(RMSNormBdaProbe PRIVATE vkop vload)

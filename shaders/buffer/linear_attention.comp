@@ -1,0 +1,214 @@
+#version 450 core
+
+// Gated delta rule (linear attention), the recurrent form. One workgroup per
+// value head; lane t owns value-column t of that head's state matrix.
+//
+// Per token the recurrence is (HF `torch_recurrent_gated_delta_rule`):
+//     qn = l2norm(q) / sqrt(Dk)          kn = l2norm(k)
+//     S  = S * exp(g)                    (g <= 0, the decay)
+//     kv = (S * kn).sum(dk)              [Dv]
+//     delta = (v - kv) * beta           [Dv]
+//     S  = S + kn (x) delta             (a rank-1 update)
+//     out = (S * qn).sum(dk)            [Dv]
+//
+// S is [Dk, Dv]. Column dv of S depends only on kn[:], qn[:], v[dv], g, beta
+// and itself, so a lane that owns one column needs no cross-lane reduction:
+// it walks dk twice (once for kv, once for out) over its own column. That is
+// what makes the state update race-free per lane and lets present alias past
+// (the store at the end rewrites exactly the lane's own column).
+//
+// The l2 norms are shared by every column, so the workgroup computes them once
+// into LDS (qn[Dk], kn[Dk]); lane 0..Dk-1 fills them with a two-pass sum of
+// squares, then a barrier releases the column lanes.
+//
+// Sequence: the lanes walk `seq` tokens in order, because the state carries
+// from token to token. For decode (seq == 1) this is one iteration.
+//
+// fp32 only and dense: the recurrence is sequential and numerically delicate
+// (HF normalizes and accumulates in fp32 regardless of the model dtype), which
+// the fp16 packed-word layout cannot express.
+
+#ifdef BDA
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_buffer_reference2 : require
+#endif
+
+#include "../common/buffer_common.comp"
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+#define MAX_HEAD_DIM 128
+
+#ifdef BDA
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+    uint data[];
+};
+#endif
+
+#ifndef BDA
+layout(set = 0, binding = 0) writeonly buffer Out {
+    uint data[];
+} uOut;
+layout(set = 0, binding = 1) readonly buffer Q {
+    uint data[];
+} uQ;
+layout(set = 0, binding = 2) readonly buffer K {
+    uint data[];
+} uK;
+layout(set = 0, binding = 3) readonly buffer V {
+    uint data[];
+} uV;
+layout(set = 0, binding = 4) readonly buffer G {
+    uint data[];
+} uG;
+layout(set = 0, binding = 5) readonly buffer Beta {
+    uint data[];
+} uBeta;
+layout(set = 0, binding = 6) readonly buffer StateIn {
+    uint data[];
+} uStateIn;
+layout(set = 0, binding = 7) writeonly buffer StateOut {
+    uint data[];
+} uStateOut;
+#endif
+
+layout(push_constant) uniform PC_uLinAttn {
+    int heads;    // Hv == Hq (q/k are already expanded)
+    int seq;      // tokens this round
+    int dk;       // key head dim
+    int dv;       // value head dim
+    int eps_bits; // l2norm epsilon, as float bits
+    int _pad0;
+    int _pad1;
+    int _pad2;
+#ifdef BDA
+    DataBuf uOut;
+    DataBuf uQ;
+    DataBuf uK;
+    DataBuf uV;
+    DataBuf uG;
+    DataBuf uBeta;
+    DataBuf uStateIn;
+    DataBuf uStateOut;
+#endif
+} uLinAttn;
+
+#ifdef BDA
+#define uOut uLinAttn.uOut
+#define uQ uLinAttn.uQ
+#define uK uLinAttn.uK
+#define uV uLinAttn.uV
+#define uG uLinAttn.uG
+#define uBeta uLinAttn.uBeta
+#define uStateIn uLinAttn.uStateIn
+#define uStateOut uLinAttn.uStateOut
+#endif
+
+shared float s_qn[MAX_HEAD_DIM];
+shared float s_kn[MAX_HEAD_DIM];
+shared float s_qscale;
+
+void main() {
+    const int h = int(gl_WorkGroupID.x);
+    const int lane = int(gl_LocalInvocationID.x);
+    const int dk = uLinAttn.dk;
+    const int dv = uLinAttn.dv;
+    const int seq = uLinAttn.seq;
+
+    if (h >= uLinAttn.heads) {
+        return;
+    }
+    // This lane's value column. With local_size 128 and dv typically 128, one
+    // workgroup covers the head exactly; a narrow head leaves lanes idle.
+    const int col = lane;
+    const bool col_ok = col < dv;
+
+    const float eps = uintBitsToFloat(uLinAttn.eps_bits);
+    // q is normalized then scaled by 1/sqrt(dk); fold both into one factor.
+    if (lane == 0) {
+        s_qscale = inversesqrt(float(dk));
+    }
+    barrier();
+
+    // Running state column, private to this lane.
+    float s_col[MAX_HEAD_DIM];
+    if (col_ok) {
+        const uint sbase = uint(h) * uint(dk) * uint(dv);
+        for (int i = 0; i < dk; i++) {
+            s_col[i] = uintBitsToFloat(uStateIn.data[sbase + uint(i) * uint(dv) +
+                                                    uint(col)]);
+        }
+    }
+
+    for (int t = 0; t < seq; t++) {
+        const uint qbase = (uint(h) * uint(seq) + uint(t)) * uint(dk);
+        // --- shared l2 norms for this token -----------------------------
+        if (lane < dk) {
+            const float qv = uintBitsToFloat(uQ.data[qbase + uint(lane)]);
+            const float kv = uintBitsToFloat(uK.data[qbase + uint(lane)]);
+            s_qn[lane] = qv;
+            s_kn[lane] = kv;
+        }
+        barrier();
+        if (lane == 0) {
+            float qss = 0.0, kss = 0.0;
+            for (int i = 0; i < dk; i++) {
+                qss += s_qn[i] * s_qn[i];
+                kss += s_kn[i] * s_kn[i];
+            }
+            const float qinv = inversesqrt(qss + eps) * s_qscale;
+            const float kinv = inversesqrt(kss + eps);
+            for (int i = 0; i < dk; i++) {
+                s_qn[i] *= qinv;
+                s_kn[i] *= kinv;
+            }
+        }
+        barrier();
+
+        // Every lane reaches every barrier in every iteration: the column
+        // work below is skipped with a branch, never a `continue` (a divergent
+        // barrier operand is undefined).
+        if (col_ok) {
+            const int gh = h * seq + t;
+            const float decay = exp(uintBitsToFloat(uG.data[uint(gh)]));
+            const float beta = uintBitsToFloat(uBeta.data[uint(gh)]);
+
+            // Decay the column.
+            for (int i = 0; i < dk; i++) {
+                s_col[i] *= decay;
+            }
+
+            // kv = (S * kn).sum(dk)
+            float kv = 0.0;
+            for (int i = 0; i < dk; i++) {
+                kv += s_col[i] * s_kn[i];
+            }
+            const float v = uintBitsToFloat(
+                uV.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) +
+                        uint(col)]);
+            const float delta = (v - kv) * beta;
+
+            // Rank-1 update and the read-out, sharing the new column.
+            float acc = 0.0;
+            for (int i = 0; i < dk; i++) {
+                s_col[i] += s_kn[i] * delta;
+                acc += s_col[i] * s_qn[i];
+            }
+            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
+                floatBitsToUint(acc);
+        }
+        // The next iteration overwrites s_qn/s_kn, so this barrier keeps the
+        // l2 pass from racing the column lanes that are still reading them.
+        barrier();
+    }
+
+    // Write the final state column back (present may alias past; this lane
+    // rewrites only its own column, which it has already read).
+    if (col_ok) {
+        const uint sbase = uint(h) * uint(dk) * uint(dv);
+        for (int i = 0; i < dk; i++) {
+            uStateOut.data[sbase + uint(i) * uint(dv) + uint(col)] =
+                floatBitsToUint(s_col[i]);
+        }
+    }
+}
