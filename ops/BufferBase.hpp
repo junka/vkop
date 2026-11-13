@@ -317,8 +317,8 @@ struct alignas(16) LinearAttentionPC {
     int seq;      // tokens this round
     int dk;       // key head dim
     int dv;       // value head dim
-    int eps_bits; // l2norm epsilon as float bits
-    int _pad0;
+    int eps_bits;  // l2norm epsilon as float bits
+    int seq_major; // 1 = data is [S,H,D] in memory (exporter's [1,S,H,D])
     int _pad1;
 };
 static_assert(sizeof(LinearAttentionPC) == 32, "LinearAttentionPC drift");
@@ -330,7 +330,7 @@ struct alignas(8) LinearAttentionBdaPC {
     int dk;
     int dv;
     int eps_bits;
-    int _pad0;
+    int seq_major;
     int _pad1;
     VkDeviceAddress out_addr;
     VkDeviceAddress q_addr;

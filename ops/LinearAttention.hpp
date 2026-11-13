@@ -75,20 +75,32 @@ class LinearAttentionBuffer : public BufferFactory {
                                          "unbound");
             }
         }
+        // Accept the exporter's layout: [B, S, H, D] with B == 1. HF keeps a
+        // batch axis through the recurrence, and the graph is batch-1 (the
+        // Conv1d custom op assumes it too), so the op accepts rank 4 and
+        // treats the leading axis as 1 rather than making the exporter drip a
+        // Squeeze/Unsqueeze pair around every layer.
         const auto q_shape = inputs[0]->getShape();
-        if (q_shape.size() != 3) {
-            throw std::runtime_error("LinearAttention: q must be [Hk, S, Dk]");
-        }
-        const int kv_heads = q_shape[0];
-        const int seq = q_shape[1];
-        const int dk = q_shape[2];
-        const auto v_shape = inputs[2]->getShape();
-        if (v_shape.size() != 3 || v_shape[1] != seq) {
+        const bool rank4 = q_shape.size() == 4;
+        if (!rank4 && q_shape.size() != 3) {
             throw std::runtime_error(
-                "LinearAttention: v must be [Hv, S, Dv] matching q's S");
+                "LinearAttention: q must be [B,S,H,D] (B==1) or [S,H,D]");
         }
-        const int heads = v_shape[0];
-        const int dv = v_shape[2];
+        if (rank4 && q_shape[0] != 1) {
+            throw std::runtime_error(
+                "LinearAttention: batch must be 1 (got " +
+                std::to_string(q_shape[0]) + ")");
+        }
+        const int kv_heads = q_shape[rank4 ? 2 : 0];
+        const int seq = q_shape[rank4 ? 1 : 0];
+        const int dk = q_shape[rank4 ? 3 : 2];
+        const auto v_shape = inputs[2]->getShape();
+        if (v_shape.size() != q_shape.size() || v_shape[rank4 ? 1 : 0] != seq) {
+            throw std::runtime_error(
+                "LinearAttention: v must be [B,S,Hv,Dv] matching q's S");
+        }
+        const int heads = v_shape[rank4 ? 2 : 1];
+        const int dv = v_shape[rank4 ? 3 : 2];
         if (dk <= 0 || dv <= 0 || heads <= 0 || kv_heads <= 0 || seq <= 0) {
             throw std::runtime_error("LinearAttention: empty extent");
         }
@@ -108,7 +120,9 @@ class LinearAttentionBuffer : public BufferFactory {
         }
 
         // Data buffers follow each tensor's dtype; the state stays fp32.
-        const std::vector<int> o_shape{heads, seq, dv};
+        const std::vector<int> o_shape =
+            rank4 ? std::vector<int>{1, seq, heads, dv}
+                  : std::vector<int>{heads, seq, dv};
         std::shared_ptr<VulkanBuffer> out_buf, q_buf, k_buf, v_buf, g_buf,
             b_buf;
         dispatch_by_dtype(outputs[0]->dtype(), [&](auto tag) {
@@ -177,6 +191,9 @@ class LinearAttentionBuffer : public BufferFactory {
         pc.dk = dk;
         pc.dv = dv;
         pc.eps_bits = eps_bits();
+        // Rank 4 is the exporter's [1, S, H, D]: a token's heads are adjacent
+        // in memory. Rank 3 is the hand-built [H, S, D] the tests use.
+        pc.seq_major = rank4 ? 1 : 0;
 
         // One workgroup per head; the lanes are its value columns.
         const int groups = heads;

@@ -768,6 +768,25 @@ void Runtime::LoadModel() {
             outputs_[o.name] = t;
             tensor_map[o.name] = t;
             real_outputs_[o.name] = t;
+        } else if (okind == ElemKind::kFloat32) {
+            // The file says fp32, and fp32 has to win over precision_. A model
+            // can carry a mixed-precision output: the qwen3_5 linear-attention
+            // state (`conv_state_out_*`, `recurrent_state_out_*`) is fp32 in an
+            // otherwise-fp16 artifact, because its recurrence accumulates in
+            // fp32 (see ops/LinearAttention.hpp). Creating it as fp16 here
+            // makes the producing op's as_tensor<float>(outputs[1]) return null
+            // and it throws "state_out is not an fp32 tensor".
+            //
+            // Before this branch existed every float output took precision_,
+            // which was right for the historical graphs because their
+            // declarations agreed with it.
+            auto t = std::make_shared<Tensor<float>>(o.dims, true);
+            t->set_elem_kind(ElemKind::kFloat32);
+            t->set_ref_cnt_forever();
+            t->set_read_only_leaf();
+            outputs_[o.name] = t;
+            tensor_map[o.name] = t;
+            real_outputs_[o.name] = t;
         } else if (precision_ == 1) {
             auto t = std::make_shared<Tensor<uint16_t>>(o.dims, true);
             t->set_ref_cnt_forever();
@@ -1300,6 +1319,23 @@ void Runtime::LoadModel() {
                         } else {
                             dtype_marker = "_f16_";
                         }
+                    } else if (type == vkop::ops::OpType::CONV1D ||
+                               type == vkop::ops::OpType::LINEAR_ATTENTION) {
+                        // Two outputs of different widths: the DATA output
+                        // follows the data input, the STATE output is fp32 in
+                        // every build (see ops/Conv1d.hpp / LinearAttention.hpp
+                        // -- a half-precision recurrent state drifts). The
+                        // generic branch below would give BOTH the data dtype,
+                        // so the state output would be born fp16 and the op's
+                        // as_tensor<float>(outputs[1]) would return null.
+                        //
+                        // The converter records the state type in the file
+                        // (the same per-output channel TopK uses for its int32
+                        // indices), which is the only place the two can be
+                        // told apart.
+                        dtype_marker = (out_shape.dtype == "float32")
+                                           ? "_f32_"
+                                           : "_f16_";
                     } else if (!node_inputs.empty() &&
                                node_inputs[0] != nullptr &&
                                node_inputs[0]->dtype() == typeid(int64_t)) {

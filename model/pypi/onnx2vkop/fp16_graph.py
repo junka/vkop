@@ -65,6 +65,27 @@ _FLOAT16 = onnx.TensorProto.FLOAT16
 _DOUBLE = onnx.TensorProto.DOUBLE
 _FLOAT_FAMILY = (_FLOAT, _FLOAT16, _DOUBLE)
 
+# The qwen3_5 linear-attention ops take mixed widths by design: their DATA
+# tensors follow the artifact's dtype while their recurrent state is fp32
+# (HF runs the whole gated-delta recurrence in fp32, and a half state drifts
+# over a long decode). Their kernels bind each tensor at its own dtype, so a
+# mixed operand set is the intended form rather than the corruption the dtype
+# guard exists for -- hence the exemption in _audit below.
+#
+# op_type -> (state input indices, state output indices)
+_STATE_SLOTS = {
+    "Conv1d": ((2,), (1,)),
+    "Conv1D": ((2,), (1,)),
+    "LinearAttention": ((5,), (1,)),
+    "GatedDeltaNet": ((5,), (1,)),
+}
+
+# Name prefixes of the state tensors those ops carry. Matching by NAME as well
+# as by slot is what covers the view nodes the exporter puts around a state (a
+# batch-dim Unsqueeze, a Reshape): the op-level slots stop at the custom node,
+# but the view's output is still a state and must stay FP32.
+_STATE_NAME_PREFIXES = ("conv_state", "recurrent_state")
+
 # Largest finite half. Past this a value rounds to Inf, and the fp16 kernels
 # have no saturation path -- the reference exporter does the same and calls it
 # a lossy conversion.
@@ -147,6 +168,28 @@ class GraphFp16:
         """
         decls = GraphFp16._decls(dag_model)
         candidates = {n for n, d in decls.items() if d["elem"] == _FLOAT}
+        # The qwen3_5 linear-attention ops follow the dtype for their DATA
+        # tensors but keep their recurrent STATE in fp32: HF runs the whole
+        # gated-delta recurrence in fp32, and a half state drifts over a long
+        # decode (see ops/LinearAttention.hpp and ops/Conv1d.hpp). Their state
+        # slots are therefore never candidates, so the propagation below cannot
+        # pull them into the domain -- and because a group is one shader over
+        # all its tensors, dropping the state from the group is what lets the
+        # rest of the node be fp16.
+        for n in [n for n in candidates if n.startswith(_STATE_NAME_PREFIXES)]:
+            candidates.discard(n)
+        for node in dag_model.nodes.values():
+            slots = _STATE_SLOTS.get(node.op_type)
+            if slots is None:
+                continue
+            in_idx, out_idx = slots
+            for i in in_idx:
+                if i < len(node.inputs):
+                    candidates.discard(node.inputs[i].get("name"))
+            for i in out_idx:
+                if i < len(node.outputs):
+                    candidates.discard(node.outputs[i].get("name"))
+
         # Propagation unit: the FLOAT-declared names of one node. An op runs a
         # single shader over all of them, so one that must stay FP32 keeps them
         # all FP32.
@@ -237,12 +280,37 @@ class GraphFp16:
         for node in dag_model.nodes.values():
             if node.op_type == "Cast":
                 continue
+            # The state slots of the qwen3_5 linear-attention ops are SUPPOSED
+            # to be the other width from their data tensors; see _STATE_SLOTS.
+            slots = _STATE_SLOTS.get(node.op_type)
+            exempt = set()
+            if slots is not None:
+                in_idx, out_idx = slots
+                for i in in_idx:
+                    if i < len(node.inputs):
+                        exempt.add(node.inputs[i].get("name"))
+                for i in out_idx:
+                    if i < len(node.outputs):
+                        exempt.add(node.outputs[i].get("name"))
             wide, narrow = [], []
             for entry in list(node.inputs) + list(node.outputs):
+                name = entry.get("name")
+                if name in exempt or (name or "").startswith(
+                        _STATE_NAME_PREFIXES):
+                    continue
                 d = decls.get(entry.get("name"))
                 if d is None or not d["float"]:
                     continue
                 if d["elem"] == _FLOAT16 or entry["name"] in domain:
+                    narrow.append(entry["name"])
+                elif slots is not None:
+                    # A linear-attention op's DATA slots have no usable
+                    # declaration: the exporter emits the custom node with the
+                    # graph's declared (FLOAT) output type, while the runtime
+                    # decides the width from the data INPUT at execute time. So
+                    # for these nodes the declaration says nothing about the
+                    # data path -- count it as following the domain instead of
+                    # dragging the node back to FP32.
                     narrow.append(entry["name"])
                 else:
                     wide.append(entry["name"])

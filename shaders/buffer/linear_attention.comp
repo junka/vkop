@@ -126,7 +126,7 @@ layout(push_constant) uniform PC_uLinAttn {
     int dk;       // key head dim
     int dv;       // value head dim
     int eps_bits; // l2norm epsilon, as float bits
-    int _pad0;
+    int seq_major; // 1 = q/k/v are [S,H,D] in memory (the exporter's [B=1,S,H,D])
     int _pad1;
 #ifdef BDA
     DataBuf uOutBda;
@@ -200,7 +200,14 @@ void main() {
                        : h;
 
     for (int t = 0; t < seq; t++) {
-        const uint qbase = (uint(kh) * uint(seq) + uint(t)) * uint(dk);
+        // The exporter hands over HF's [B, S, H, D] with B == 1, so in memory a
+        // token's heads are contiguous: index = (t*H + h)*D. The tests build
+        // [H, S, D] instead (index = (h*S + t)*D). `seq_major` picks between
+        // them; the arithmetic is identical either way.
+        const uint qbase = uLinAttn.seq_major != 0
+                               ? (uint(t) * uint(uLinAttn.kv_heads) + uint(kh)) *
+                                     uint(dk)
+                               : (uint(kh) * uint(seq) + uint(t)) * uint(dk);
         // --- shared l2 input for this token -----------------------------
         if (lane < dk) {
             s_qn[lane] = ACC_LOAD(uQ.data, qbase + uint(lane));
@@ -222,6 +229,12 @@ void main() {
         }
         barrier();
 
+        // This token's output row base, in the same layout as the inputs.
+        const uint obase = uLinAttn.seq_major != 0
+                               ? (uint(t) * uint(uLinAttn.heads) + uint(h)) *
+                                     uint(dv)
+                               : (uint(h) * uint(seq) + uint(t)) * uint(dv);
+
         // Every lane reaches every barrier in every iteration: the column work
         // is skipped with a branch, never a `continue` (a divergent barrier
         // operand is undefined).
@@ -237,9 +250,11 @@ void main() {
             for (int i = 0; i < dk; i++) {
                 kv += s_col[i] * s_kn[i];
             }
-            const float v =
-                ACC_LOAD(uV.data, (uint(h) * uint(seq) + uint(t)) * uint(dv) +
-                                      uint(col));
+            const uint vbase = uLinAttn.seq_major != 0
+                                   ? (uint(t) * uint(uLinAttn.heads) + uint(h)) *
+                                         uint(dv)
+                                   : (uint(h) * uint(seq) + uint(t)) * uint(dv);
+            const float v = ACC_LOAD(uV.data, vbase + uint(col));
             const float delta = (v - kv) * beta;
 
             float acc = 0.0;
@@ -253,8 +268,7 @@ void main() {
 
 #if defined(FP16) && !defined(PACKED_FP16)
         if (col_ok) {
-            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
-                float16_t(s_out[col]);
+            uOut.data[obase + uint(col)] = float16_t(s_out[col]);
         }
 #elif defined(FP16)
         // One writer per uint word: lane w packs columns 2w and 2w+1. dv is
@@ -263,13 +277,11 @@ void main() {
             const int c0 = 2 * lane;
             const int c1 = c0 + 1;
             vec2 p = vec2(s_out[c0], c1 < dv ? s_out[c1] : 0.0);
-            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) / 2u +
-                      uint(lane)] = packHalf2x16(p);
+            uOut.data[obase / 2u + uint(lane)] = packHalf2x16(p);
         }
 #else
         if (col_ok) {
-            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
-                floatBitsToUint(s_out[col]);
+            uOut.data[obase + uint(col)] = floatBitsToUint(s_out[col]);
         }
 #endif
         // The next iteration overwrites s_qn/s_kn/s_out, so this barrier keeps

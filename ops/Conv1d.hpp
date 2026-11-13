@@ -134,7 +134,12 @@ class Conv1dBuffer : public BufferFactory {
                 auto so = core::as_tensor<float>(outputs[1]);
                 if (!so) {
                     throw std::runtime_error(
-                        "Conv1d: state_out is not an fp32 tensor");
+                        std::string("Conv1d: state_out is not an fp32 tensor "
+                                    "(got dtype ") +
+                        outputs[1]->dtype().name() + ", kind " +
+                        std::to_string(static_cast<int>(
+                            outputs[1]->elem_kind())) +
+                        "); the graph must declare the state output FLOAT");
                 }
                 if (so->num_elements() != channels * state_len) {
                     so->resize(s_shape);
