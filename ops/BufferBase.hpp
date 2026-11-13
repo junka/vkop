@@ -244,7 +244,7 @@ struct alignas(16) CumsumPC {
     int axis;        // resolved, >= 0 (diagnostic only)
     int axis_len;    // dims[axis]
     int axis_stride; // product of dims after the axis
-    int lines;       // outer * axis_stride == workgroup count
+    int outer;       // product of dims before the axis
     int exclusive;   // 1 = exclusive prefix sum
     int reverse;     // 1 = walk the line backwards
     int _pad0;
@@ -257,7 +257,7 @@ struct alignas(8) CumsumBdaPC {
     int axis;
     int axis_len;
     int axis_stride;
-    int lines;
+    int outer;
     int exclusive;
     int reverse;
     int _pad0;
@@ -312,26 +312,26 @@ static_assert(sizeof(Conv1dBdaPC) == 72, "Conv1dBdaPC drift");
 // so the recurrence needs no cross-lane reduction and the state store rewrites
 // only what the lane read.
 struct alignas(16) LinearAttentionPC {
-    int heads;    // Hv (q/k already expanded to Hv)
+    int heads;    // Hv, value heads == workgroup count
+    int kv_heads; // Hk; value head h reads q/k head (h / (Hv/Hk))
     int seq;      // tokens this round
     int dk;       // key head dim
     int dv;       // value head dim
     int eps_bits; // l2norm epsilon as float bits
     int _pad0;
     int _pad1;
-    int _pad2;
 };
 static_assert(sizeof(LinearAttentionPC) == 32, "LinearAttentionPC drift");
 
 struct alignas(8) LinearAttentionBdaPC {
     int heads;
+    int kv_heads;
     int seq;
     int dk;
     int dv;
     int eps_bits;
     int _pad0;
     int _pad1;
-    int _pad2;
     VkDeviceAddress out_addr;
     VkDeviceAddress q_addr;
     VkDeviceAddress k_addr;

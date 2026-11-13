@@ -591,6 +591,37 @@ class Operator {
     std::vector<VkDescriptorType> types_;
     int fp16_ = 0; // 0: fp32, 1: fp16
 
+    // Which fp16 STORAGE layout the shader build indexes, for the ops that ship
+    // both (<key>_fp16 native half arrays vs <key>_fp16_packed two-halves-per-
+    // word). Read from VKOP_FP16_PACKED, a comma-separated op list, so the two
+    // can be measured against each other without a rebuild. Default is native:
+    // one element per array slot, no pack/unpack pair per access.
+    bool fp16_packed_ = false;
+    void resolve_fp16_layout() {
+        fp16_packed_ = false;
+        const char *env = std::getenv("VKOP_FP16_PACKED");
+        if (!env || !*env) {
+            return;
+        }
+        const std::string me = convert_optype_to_string(type_);
+        std::string list(env);
+        size_t pos = 0;
+        while (pos <= list.size()) {
+            const size_t comma = list.find(',', pos);
+            const std::string tok = list.substr(
+                pos, comma == std::string::npos ? std::string::npos
+                                                : comma - pos);
+            if (!tok.empty() && tok == me) {
+                fp16_packed_ = true;
+                return;
+            }
+            if (comma == std::string::npos) {
+                break;
+            }
+            pos = comma + 1;
+        }
+    }
+
     // --- Record-once-replay (cuda-graph-style) ---------------------------
     // The LLM decode loop calls Run() every round with q_len=1; past_kv grows
     // by one token per round but, for INVARIANT ops (weight Gemms, RMSNorm,

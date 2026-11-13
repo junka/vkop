@@ -21,15 +21,19 @@ namespace ops {
 // outer*axis_stride (one per line); each workgroup walks its line serially
 // because a prefix sum carries a running total.
 //
-// fp32 only, deliberately. The fp16 packed-word convention puts two elements
-// per uint word and the two lanes of a word would race here; a caller with an
-// fp16 CumSum input gets a clear error instead of a silently wrong prefix.
+// fp32 and fp16. Three shader builds share one source (see
+// docs/fp16-storage-layouts.md):
+//   <key>          fp32
+//   <key>_fp16     float16_t storage -- native half loads/stores
+//   <key>_fp16_packed  two halves per uint word, unpack/pack per access
+// The kernel runs ONE thread per line, which is what makes both fp16 layouts
+// safe: with the packed one, two lanes of a single word would race.
 class CumsumBuffer : public BufferFactory {
   public:
-    CumsumBuffer()
+    explicit CumsumBuffer(int fp16)
         : BufferFactory(OpType::CUMSUM,
                         {DESCRIPTOR_TYPE_STORAGE, DESCRIPTOR_TYPE_STORAGE},
-                        sizeof(CumsumPC)) {}
+                        sizeof(CumsumPC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -60,15 +64,7 @@ class CumsumBuffer : public BufferFactory {
         if (outputs.empty() || !outputs[0]) {
             throw std::runtime_error("CumSum: no output bound");
         }
-        // The state dict declaration: this op is fp32-only. A 16-bit input
-        // would need a half2-aware carry; refuse rather than race.
-        if (inputs[0]->elem_kind() != core::ElemKind::kFloat32) {
-            throw std::runtime_error(
-                "CumSum: the buffer implementation is fp32-only (the fp16 "
-                "packed-word layout cannot carry a prefix sum); declare its "
-                "input fp32 in the converter");
-        }
-
+    
         const auto shape = inputs[0]->getShape();
         const int rank = static_cast<int>(shape.size());
         if (rank == 0 || rank > 8) {
@@ -90,29 +86,39 @@ class CumsumBuffer : public BufferFactory {
         int axis_stride = 1;
         for (int i = axis + 1; i < rank; i++) axis_stride *= shape[i];
 
-        auto output = core::as_tensor<float>(outputs[0]);
-        if (!output) {
-            throw std::runtime_error("CumSum: output is not an fp32 tensor");
-        }
-        if (output->num_elements() != total) {
-            output->resize(shape);
-        } else if (output->getShape() != shape) {
-            output->reshape_view(shape);
-        }
-        auto out_buf = bind_ssbo<float>(outputs[0], /*is_output=*/true);
-        auto in_buf = bind_ssbo<float>(inputs[0], /*is_output=*/false);
+        // The shader build is chosen from the tensor dtype (the runtime's
+        // op_shader_fp16), so this only has to bind the storage the way the
+        // matching build indexes it: one element per uint for fp32, a real
+        // half array for native fp16, or the packed word pair.
+        std::shared_ptr<VulkanBuffer> out_buf, in_buf;
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->num_elements() != total) {
+                output->resize(shape);
+            } else if (output->getShape() != shape) {
+                output->reshape_view(shape);
+            }
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            in_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false);
+        });
 
         CumsumPC pc{};
         pc.axis = axis;
         pc.axis_len = axis_len;
         pc.axis_stride = axis_stride;
-        pc.lines = outer * axis_stride;
+        pc.outer = outer;
         pc.exclusive = exclusive_ ? 1 : 0;
         pc.reverse = reverse_ ? 1 : 0;
 
-        // One workgroup per line (outer * axis_stride of them); the line
-        // itself is walked serially.
-        int groups = outer * axis_stride;
+        // One thread per PAIR of adjacent lines: in fp16 the two elements at
+        // lanes s and s+1 of a slice share a 32-bit word, so a thread that owns
+        // both keeps its writes word-disjoint from every other thread's.
+        const int lane_pairs = (axis_stride + 1) / 2;
+        int groups = UP_DIV(outer * lane_pairs, 256);
 
         if (bda_ready() && in_buf && out_buf && in_buf->hasDeviceAddress() &&
             out_buf->hasDeviceAddress()) {
@@ -139,8 +145,8 @@ class CumsumBuffer : public BufferFactory {
 // buffer leaf; `backend_buffer` is accepted for the factory signature only.
 class Cumsum : public PimplFacade {
   public:
-    Cumsum(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::CUMSUM) {
-        impl_ = std::make_unique<CumsumBuffer>();
+    Cumsum(int fp16, bool /*backend_buffer*/) : PimplFacade(OpType::CUMSUM) {
+        impl_ = std::make_unique<CumsumBuffer>(fp16);
     }
 };
 

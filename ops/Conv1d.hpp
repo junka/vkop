@@ -29,13 +29,14 @@ namespace ops {
 //                        dispatch loads the old tail before storing, so the
 //                        aliased case is race-free.
 //
-// Buffer-only and fp32-only: the window reads neighbours, so the fp16 packed
-// word (two elements per uint) would put two threads on one word. The one
-// consumer, the delta rule, runs its convolution in fp32 anyway (the gated
-// delta rule normalizes and accumulates in fp32).
+// Buffer-only. Data (x, weight, y) follows the tensor dtype: the fp16 builds
+// read and write half storage -- either natively (float16_t) or as unpacked
+// half2 words -- and the window is evaluated in fp32 either way. The conv STATE
+// stays fp32 in every build: it is carried across rounds and rounding it to
+// half each step would drift.
 class Conv1dBuffer : public BufferFactory {
   public:
-    Conv1dBuffer()
+    explicit Conv1dBuffer(int fp16)
         : BufferFactory(OpType::CONV1D,
                         std::vector<VkDescriptorType>{
                             DESCRIPTOR_TYPE_STORAGE, // output
@@ -44,7 +45,7 @@ class Conv1dBuffer : public BufferFactory {
                             DESCRIPTOR_TYPE_STORAGE, // state in
                             DESCRIPTOR_TYPE_STORAGE, // state out
                         },
-                        sizeof(Conv1dPC)) {}
+                        sizeof(Conv1dPC), fp16) {}
 
     void setAttribute(const std::unordered_map<std::string, std::string>
                           &attributes) override {
@@ -65,12 +66,6 @@ class Conv1dBuffer : public BufferFactory {
         }
         if (outputs.empty() || !outputs[0]) {
             throw std::runtime_error("Conv1d: no output bound");
-        }
-        if (inputs[0]->elem_kind() != core::ElemKind::kFloat32) {
-            throw std::runtime_error(
-                "Conv1d: the buffer implementation is fp32-only (its window "
-                "reads neighbours, which the fp16 half2 packing cannot serve "
-                "races-free)");
         }
         const auto x_shape = inputs[0]->getShape();
         if (x_shape.size() != 2) {
@@ -94,19 +89,28 @@ class Conv1dBuffer : public BufferFactory {
         }
         const int state_len = kernel - 1;
 
-        auto output = core::as_tensor<float>(outputs[0]);
-        if (!output) {
-            throw std::runtime_error("Conv1d: output is not an fp32 tensor");
-        }
+        // Data buffers follow each tensor's own dtype; the state is always
+        // fp32 (see the class comment), so it binds as float unconditionally.
         const std::vector<int> y_shape{channels, seq};
-        if (output->num_elements() != channels * seq) {
-            output->resize(y_shape);
-        } else if (output->getShape() != y_shape) {
-            output->reshape_view(y_shape);
-        }
-        auto y_buf = bind_ssbo<float>(outputs[0], /*is_output=*/true); // 0
-        auto x_buf = bind_ssbo<float>(inputs[0], false);               // 1
-        auto w_buf = bind_ssbo<float>(inputs[1], false);               // 2
+        std::shared_ptr<VulkanBuffer> y_buf, x_buf, w_buf;
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            auto output = core::as_tensor<T>(outputs[0]);
+            if (output->num_elements() != channels * seq) {
+                output->resize(y_shape);
+            } else if (output->getShape() != y_shape) {
+                output->reshape_view(y_shape);
+            }
+            y_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true); // 0
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            x_buf = bind_ssbo<T>(inputs[0], /*is_output=*/false); // 1
+        });
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            w_buf = bind_ssbo<T>(inputs[1], /*is_output=*/false); // 2
+        });
 
         // The state is optional: a graph with no cached form binds the dummy
         // to all three state slots and the shader reads zeros past t=0.
@@ -150,10 +154,17 @@ class Conv1dBuffer : public BufferFactory {
         pc.kernel = kernel;
         pc.state_len = state_len;
 
-        // Dispatch 1: the convolution over every (channel, position).
+        // Dispatch 1: the convolution over every (channel, position). The
+        // packed fp16 build handles two elements per thread, so its thread
+        // count is half the element count; the native and fp32 builds are one
+        // element per thread.
         pc.mode = 0;
         pc.total = channels * seq;
-        const int conv_groups = UP_DIV(pc.total, 256);
+        const bool fp16_data = outputs[0]->dtype() == typeid(uint16_t);
+        const int conv_threads = (fp16_data && fp16_packed_)
+                                     ? (pc.total + 1) / 2
+                                     : pc.total;
+        const int conv_groups = UP_DIV(conv_threads, 256);
         dispatch(pc, conv_groups, y_buf, x_buf, w_buf, state_in_buf,
                  state_out_buf);
 
@@ -204,8 +215,8 @@ class Conv1dBuffer : public BufferFactory {
 // PIMPL façade: buffer-only, so both branches build the buffer leaf.
 class Conv1d : public PimplFacade {
   public:
-    Conv1d(int /*fp16*/, bool /*backend_buffer*/) : PimplFacade(OpType::CONV1D) {
-        impl_ = std::make_unique<Conv1dBuffer>();
+    Conv1d(int fp16, bool /*backend_buffer*/) : PimplFacade(OpType::CONV1D) {
+        impl_ = std::make_unique<Conv1dBuffer>(fp16);
     }
 };
 

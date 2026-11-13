@@ -77,6 +77,9 @@ int op_shader_fp16(ops::OpType type, const ITensor *data_input,
     case ops::OpType::MOD:
     case ops::OpType::TOPK:
     case ops::OpType::GLOBALAVERAGEPOOL:
+    case ops::OpType::CUMSUM:
+    case ops::OpType::CONV1D:
+    case ops::OpType::LINEAR_ATTENTION:
         // TopK's k-even padding, unpacking and value packing are keyed on true
         // fp16 data (para_.fp16), while the MoE router runs fp32 softmax
         // probabilities through it. GlobalAveragePool packs two halfs per word

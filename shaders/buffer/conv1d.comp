@@ -15,14 +15,22 @@
 // registers before storing, so the aliased (present == past) case is race-free
 // with any number of channels.
 //
+// DTYPES. `x`, `weight` and `y` follow the tensor dtype. Three builds:
+//   (base)                 fp32
+//   -DFP16                 float16_t data[]  -- NATIVE half storage
+//   -DFP16 -DPACKED_FP16   two halves per uint word, unpack/pack per access
+// The native build lets one thread own one output ELEMENT. The packed build
+// needs one thread per WORD, because two threads sharing a word would race on
+// the read-modify-write; its thread computes both elements (they may straddle
+// a channel boundary, which is fine -- each is derived from read-only inputs).
+//
+// The conv STATE is fp32 in every build: it is carried across rounds, and
+// rounding it to half each step would drift. Accumulation is fp32 too.
+//
 // HF builds the convolution as nn.Conv1d(groups=conv_dim, kernel_size=K,
 // padding=K-1) followed by a slice to the first seq samples; groups == channels
 // means every channel has its own filter and nothing mixes across channels.
-//
-// Layout: [C, S] channel-major (the tensor the exporter produces after
-// transpose(1,2)). fp32 only: the window reads neighbours, which the fp16
-// half2 packing (two elements per word) cannot serve without two threads
-// racing on one word.
+// The activation (silu) is applied by the caller, not here.
 
 #ifdef BDA
 #extension GL_EXT_buffer_reference : require
@@ -36,13 +44,40 @@ layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 // The state tail is at most this long; Qwen3.5 uses K=4 (state_len 3).
 #define MAX_STATE 32
 
+// One accessor pair for all three builds.
+#if defined(FP16) && !defined(PACKED_FP16)
+#define ACC_LOAD(data, idx) float((data)[(idx)])
+#else
+#define ACC_LOAD(data, idx) BUF_LOAD((data), (idx))
+#endif
+
 #ifdef BDA
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+#if defined(FP16) && !defined(PACKED_FP16)
+    float16_t data[];
+#else
+    uint data[];
+#endif
+};
+// The conv state is fp32 in every build, so it needs its own reference type:
+// DataBuf's element type follows the data dtype and would be half here.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer StateBuf {
     uint data[];
 };
 #endif
 
 #ifndef BDA
+#if defined(FP16) && !defined(PACKED_FP16)
+layout(set = 0, binding = 0) writeonly buffer Output {
+    float16_t data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    float16_t data[];
+} uInput;
+layout(set = 0, binding = 2) readonly buffer Weight {
+    float16_t data[];
+} uWeight;
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
@@ -52,6 +87,7 @@ layout(set = 0, binding = 1) readonly buffer Input {
 layout(set = 0, binding = 2) readonly buffer Weight {
     uint data[];
 } uWeight;
+#endif
 layout(set = 0, binding = 3) readonly buffer StateIn {
     uint data[];
 } uStateIn;
@@ -70,24 +106,37 @@ layout(push_constant) uniform PC_uConv1d {
     int _pad0;
     int _pad1;
 #ifdef BDA
-    DataBuf uOutput;
-    DataBuf uInput;
-    DataBuf uWeight;
-    DataBuf uStateIn;
-    DataBuf uStateOut;
+    DataBuf uOutputBda;
+    DataBuf uInputBda;
+    DataBuf uWeightBda;
+    StateBuf uStateInBda;
+    StateBuf uStateOutBda;
 #endif
 } uConv1d;
+
 #ifdef BDA
-#define uOutput uConv1d.uOutput
-#define uInput uConv1d.uInput
-#define uWeight uConv1d.uWeight
-#define uStateIn uConv1d.uStateIn
-#define uStateOut uConv1d.uStateOut
+#define uOutput uConv1d.uOutputBda
+#define uInput uConv1d.uInputBda
+#define uWeight uConv1d.uWeightBda
+#define uStateIn uConv1d.uStateInBda
+#define uStateOut uConv1d.uStateOutBda
+#else
+#define uOutput uOutput
+#define uInput uInput
+#define uWeight uWeight
+#define uStateIn uStateIn
+#define uStateOut uStateOut
 #endif
 
-void conv_mode(const int gid) {
-    const int c = gid / uConv1d.seq;
-    const int t = gid % uConv1d.seq;
+// The state words are fp32 in EVERY build (see the header note), so they are
+// read and written raw rather than through BUF_LOAD/BUF_STORE.
+#define STATE_LOAD(idx) uintBitsToFloat(uStateIn.data[(idx)])
+#define STATE_STORE(idx, v) (uStateOut.data[(idx)] = floatBitsToUint(float(v)))
+
+// Output element `e` of the convolution. `e = c * seq + t`.
+float conv_element(const int e) {
+    const int c = e / uConv1d.seq;
+    const int t = e % uConv1d.seq;
     const int K = uConv1d.kernel;
     const int pad = uConv1d.state_len;
     const uint wbase = uint(c) * uint(K);
@@ -97,18 +146,29 @@ void conv_mode(const int gid) {
         const int pos = t - (K - 1) + k; // absolute position this tap reads
         float x;
         if (pos >= 0) {
-            x = uintBitsToFloat(
-                uInput.data[uint(c) * uint(uConv1d.seq) + uint(pos)]);
+            x = ACC_LOAD(uInput.data, uint(c) * uint(uConv1d.seq) + uint(pos));
         } else {
             const int si = pad + pos; // 0..pad-1 into the old tail
-            x = (si >= 0)
-                    ? uintBitsToFloat(uStateIn.data[uint(c) * uint(pad) +
-                                                   uint(si)])
-                    : 0.0;
+            x = (si >= 0) ? STATE_LOAD(uint(c) * uint(pad) + uint(si)) : 0.0;
         }
-        acc += x * uintBitsToFloat(uWeight.data[wbase + uint(k)]);
+        acc += x * ACC_LOAD(uWeight.data, wbase + uint(k));
     }
-    uOutput.data[uint(c) * uint(uConv1d.seq) + uint(t)] = floatBitsToUint(acc);
+    return acc;
+}
+
+void conv_mode(const int gid) {
+#if defined(FP16) && !defined(PACKED_FP16)
+    // Native half store: one 16-bit write, no read-modify-write of a word.
+    uOutput.data[gid] = float16_t(conv_element(gid));
+#elif defined(FP16)
+    // One thread per uint word = two output elements.
+    vec2 p;
+    p.x = conv_element(2 * gid);
+    p.y = (2 * gid + 1 < uConv1d.total) ? conv_element(2 * gid + 1) : 0.0;
+    uOutput.data[gid] = packHalf2x16(p);
+#else
+    uOutput.data[gid] = floatBitsToUint(conv_element(gid));
+#endif
 }
 
 void state_mode(const int c) {
@@ -117,37 +177,43 @@ void state_mode(const int c) {
     if (pad <= 0 || pad > MAX_STATE) {
         return;
     }
-    // The new tail is the last `pad` samples of (old_state ++ x).
-    //   history index i (0 <= i < pad + S) is old_state[i]      when i < pad
-    //                                     is x[i - pad]        otherwise
+    // The new tail is the last `pad` samples of (old_state ++ x):
+    //   history index i (0 <= i < pad + S) is old_state[i]  when i < pad
+    //                                     is x[i - pad]    otherwise
     // so the tail starts at `S`.
     float old[MAX_STATE];
     for (int i = 0; i < pad; i++) {
-        old[i] = uintBitsToFloat(uStateIn.data[uint(c) * uint(pad) + uint(i)]);
+        old[i] = STATE_LOAD(uint(c) * uint(pad) + uint(i));
     }
     float merged[MAX_STATE];
     for (int j = 0; j < pad; j++) {
         const int hist = S + j;
         merged[j] = (hist < pad)
                         ? old[hist]
-                        : uintBitsToFloat(uInput.data[uint(c) * uint(S) +
-                                                     uint(hist - pad)]);
+                        : ACC_LOAD(uInput.data,
+                                   uint(c) * uint(S) + uint(hist - pad));
     }
     // Written after every read above, so present-aliases-past is race-free.
     for (int j = 0; j < pad; j++) {
-        uStateOut.data[uint(c) * uint(pad) + uint(j)] =
-            floatBitsToUint(merged[j]);
+        STATE_STORE(uint(c) * uint(pad) + uint(j), merged[j]);
     }
 }
 
 void main() {
     const int gid = int(gl_GlobalInvocationID.x);
-    if (gid >= uConv1d.total) {
-        return;
-    }
     if (uConv1d.mode == 0) {
+        int limit = uConv1d.total;
+#if defined(FP16) && defined(PACKED_FP16)
+        limit = (limit + 1) / 2;
+#endif
+        if (gid >= limit) {
+            return;
+        }
         conv_mode(gid);
     } else {
+        if (gid >= uConv1d.total) {
+            return;
+        }
         state_mode(gid);
     }
 }

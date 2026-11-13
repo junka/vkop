@@ -58,10 +58,10 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "Conv": ("conv2d", "conv2d", True, True),
     "Conv2d": ("conv2d", "conv2d", True, True),
     "Cos": ("cos", "cos", False, True),
-    "CumSum": (None, "cumsum", False, False),
-    "Cumsum": (None, "cumsum", False, False),
-    "Conv1d": (None, "conv1d", False, False),
-    "Conv1D": (None, "conv1d", False, False),
+    "CumSum": (None, "cumsum", False, True),
+    "Cumsum": (None, "cumsum", False, True),
+    "Conv1d": (None, "conv1d", False, True),
+    "Conv1D": (None, "conv1d", False, True),
     "Div": ("div", "div", False, True),
     "EmbeddingForward": (None, "embedding_forward", False, False),
     "Erf": ("erf", "erf", False, True),
@@ -75,8 +75,8 @@ _PRIMARY: Dict[str, Dict[str, object]] = {
     "GridSample": ("gridsample", None, False, False),
     "LayerNorm": ("layernorm", "layernorm", False, True),
     "LayerNormalization": ("layernorm", "layernorm", False, True),
-    "LinearAttention": (None, "linear_attention", False, False),
-    "GatedDeltaNet": (None, "linear_attention", False, False),
+    "LinearAttention": (None, "linear_attention", False, True),
+    "GatedDeltaNet": (None, "linear_attention", False, True),
     "MatMul": ("matmul", "matmul", False, True),
     "Max": (None, "max", False, True),
     "MaxPool": ("maxpool2d", "maxpool2d", True, True),
@@ -785,6 +785,13 @@ _FP16_DTYPE_DRIVEN: Set[str] = {
     "ReduceMean", "Relu", "Reshape", "Resize", "RMSNorm", "RotaryEmbedding",
     "ScatterElements", "Sigmoid", "Sin", "Slice", "Softmax", "Softplus",
     "Split", "Sqrt", "Sub", "Tanh", "TopK", "Topk", "Transpose",
+    # The qwen3_5 linear-attention ops: their data tensors follow the dtype
+    # (three builds: fp32, native fp16, packed half2), while their recurrent
+    # state stays fp32. Without these entries an fp16 artifact would be forced
+    # back to FP32 around every one of them, which on a hybrid model is 3 of
+    # every 4 layers.
+    "CumSum", "Cumsum", "Conv1d", "Conv1D", "LinearAttention",
+    "GatedDeltaNet",
 }
 
 

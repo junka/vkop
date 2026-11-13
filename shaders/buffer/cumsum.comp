@@ -1,19 +1,34 @@
 #version 450 core
 
-// Cumulative sum along one axis (ONNX CumSum). One workgroup owns one
-// "line": every lane group fixed by the non-axis dims. Within a line the
-// elements are strided by `axis_stride` in linear index space, and the
-// workgroup walks them in order, carrying a running sum.
+// Cumulative sum along one axis (ONNX CumSum). One thread owns one "line":
+// every element sharing the non-axis coordinates. Within a line the elements
+// sit `axis_stride` apart in linear index space and are walked in order,
+// carrying a running sum.
 //
 // Layout: the tensor is [outer, axis_len, axis_stride] -- the product of the
 // dims before the axis, the axis itself, and the product after it. There are
-// outer*axis_stride lines, which is exactly the workgroup count; line L is
-// outer slice (L / axis_stride) at lane (L % axis_stride).
+// outer*axis_stride lines, which is exactly the thread count; line L is outer
+// slice (L / axis_stride) at lane (L % axis_stride).
 //
-// fp32 only: the accumulation is order-dependent across lanes, and the fp16
-// packed-word convention (two elements per uint) cannot carry a half2 sum
-// without a cross-lane reduction. An fp16 tensor therefore runs this shader
-// on its fp32 container (the converter keeps CumSum's input fp32).
+// A prefix sum is serial by nature, so ONE thread carries a line: an earlier
+// version that let all 256 lanes run the same loop did 256x the work, and was
+// only accidentally correct for fp32 (identical redundant writes).
+//
+// In fp16 the elements of adjacent lines are adjacent in memory -- line s and
+// line s+1 write indices (s + j*stride) and (s+1 + j*stride), two halves of the
+// SAME 32-bit word. One thread therefore owns a PAIR of lines (s = 2w, 2w+1),
+// which makes its writes word-disjoint from every other thread's. Measured:
+// giving each line its own thread in fp16 loses updates (the correctness probe
+// caught output element 5 holding the raw input instead of a prefix sum).
+//
+// STORAGE. Three builds from this one source:
+//   (base)                 fp32, uint words holding one float each
+//   -DFP16                 float16_t data[]  -- NATIVE half storage
+//   -DFP16 -DPACKED_FP16   uint words holding two halves, unpack/pack per
+//                          access (the convention most of this repo uses)
+// The native build exists because the packed one pays a pack/unpack pair per
+// access and forces the writer discipline that pair implies; see
+// docs/fp16-storage-layouts.md for the measurement.
 
 #ifdef BDA
 #extension GL_EXT_buffer_reference : require
@@ -22,15 +37,38 @@
 
 #include "../common/buffer_common.comp"
 
+// One accessor pair for all three builds. The accumulation stays fp32 even for
+// a half payload: a running sum carried in half loses the low bits of a long
+// line.
+#if defined(FP16) && !defined(PACKED_FP16)
+#define ACC_LOAD(data, idx) float((data)[(idx)])
+#define ACC_STORE(data, idx, v) ((data)[(idx)] = float16_t(v))
+#else
+#define ACC_LOAD(data, idx) BUF_LOAD((data), (idx))
+#define ACC_STORE(data, idx, v) BUF_STORE((data), (idx), (v))
+#endif
+
 layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
 
 #ifdef BDA
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+#if defined(FP16) && !defined(PACKED_FP16)
+    float16_t data[];
+#else
     uint data[];
+#endif
 };
 #endif
 
 #ifndef BDA
+#if defined(FP16) && !defined(PACKED_FP16)
+layout(set = 0, binding = 0) writeonly buffer Output {
+    float16_t data[];
+} uOutput;
+layout(set = 0, binding = 1) readonly buffer Input {
+    float16_t data[];
+} uInput;
+#else
 layout(set = 0, binding = 0) writeonly buffer Output {
     uint data[];
 } uOutput;
@@ -38,57 +76,74 @@ layout(set = 0, binding = 1) readonly buffer Input {
     uint data[];
 } uInput;
 #endif
+#endif
 
 layout(push_constant) uniform PC_uCumsum {
     int axis;        // diagnostic only
     int axis_len;    // dims[axis]
     int axis_stride; // product of dims after the axis
-    int lines;       // outer * axis_stride == workgroup count
+    int outer;       // product of dims before the axis
     int exclusive;   // 1 = exclusive prefix
     int reverse;     // 1 = walk the line backwards
     int _pad0;
     int _pad1;
 #ifdef BDA
-    DataBuf uOutput;
-    DataBuf uInput;
+    DataBuf uOutputBda;
+    DataBuf uInputBda;
 #endif
 } uCumsum;
 
+// One name for "the input/output buffer" across the descriptor and BDA
+// builds; the BDA members are spelled differently so the preprocessor does
+// not produce a self-referential `uCumsum.uCumsum`.
 #ifdef BDA
-#define uOutput uCumsum.uOutput
-#define uInput uCumsum.uInput
+#define IN_BUF uCumsum.uInputBda
+#define OUT_BUF uCumsum.uOutputBda
+#else
+#define IN_BUF uInput
+#define OUT_BUF uOutput
 #endif
 
-void main() {
-    // One workgroup per LINE. The tensor is [outer, len, stride] in the order
-    // (dims before the axis, the axis, dims after it), so there are
-    // outer*stride lines and line L belongs to outer slice (L / stride) at
-    // lane (L % stride) within each axis step.
-    const int line = int(gl_WorkGroupID.x);
-    if (line >= uCumsum.lines) {
-        return;
-    }
-    const int stride = uCumsum.axis_stride;
-    const int len = uCumsum.axis_len;
-    const int o = line / stride;
-    const int s = line % stride;
-    const uint base = uint(o) * uint(len) * uint(stride) + uint(s);
-
-    // One workgroup walks the line sequentially. `len` is the sequence axis of
-    // a decoder (thousands of tokens in prefill), so the loop is workgroup-
-    // serial rather than lane-parallel: a prefix sum needs the running total,
-    // and the extra parallelism would buy nothing on a memory-bound line.
+// One line, from its own accumulator. `idx` is the linear element index.
+float walk_line(const uint base, const int stride, const int len,
+                const bool exclusive) {
     float acc = 0.0;
     for (int i = 0; i < len; i++) {
         const int j = uCumsum.reverse != 0 ? (len - 1 - i) : i;
         const uint idx = base + uint(j) * uint(stride);
-        const float x = uintBitsToFloat(uInput.data[idx]);
-        if (uCumsum.exclusive != 0) {
-            uOutput.data[idx] = floatBitsToUint(acc);
+        const float x = ACC_LOAD(IN_BUF.data, idx);
+        if (exclusive) {
+            ACC_STORE(OUT_BUF.data, idx, acc);
             acc += x;
         } else {
             acc += x;
-            uOutput.data[idx] = floatBitsToUint(acc);
+            ACC_STORE(OUT_BUF.data, idx, acc);
         }
+    }
+    return acc;
+}
+
+void main() {
+    const int stride = uCumsum.axis_stride;
+    const int len = uCumsum.axis_len;
+    const int outer = uCumsum.outer;
+    // Threads are indexed as (outer slice, lane PAIR) rather than per line:
+    // lanes s and s+1 of one slice sit in the same 32-bit word in fp16, so one
+    // thread must own both to keep its writes word-disjoint. Pairing by line
+    // number would break for an odd stride (line L and L+1 could land in
+    // different slices, at lanes 0 and stride-1).
+    const int pairs = (stride + 1) / 2;
+    const int thread = int(gl_GlobalInvocationID.x);
+    if (thread >= outer * pairs) {
+        return;
+    }
+    const int o = thread / pairs;
+    const int s0 = (thread % pairs) * 2;
+    const uint row = uint(o) * uint(len) * uint(stride);
+
+    const bool exclusive = uCumsum.exclusive != 0;
+    walk_line(row + uint(s0), stride, len, exclusive);
+    if (s0 + 1 < stride) {
+        walk_line(row + uint(s0) + 1u, stride, len, exclusive);
     }
 }

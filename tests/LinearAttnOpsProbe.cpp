@@ -59,6 +59,24 @@ void expect_close(const char *what, size_t i, float got, float want,
     }
 }
 
+// float -> storage element. uint16_t is vkop's fp16 storage, so a plain
+// static_cast would truncate the value to an integer.
+template <typename T> T to_storage(float v) {
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        return vkop::core::ITensor::fp32_to_fp16(v);
+    } else {
+        return static_cast<T>(v);
+    }
+}
+
+template <typename T> float from_storage(T v) {
+    if constexpr (std::is_same_v<T, uint16_t>) {
+        return vkop::core::ITensor::fp16_to_fp32(v);
+    } else {
+        return static_cast<float>(v);
+    }
+}
+
 template <typename T>
 std::shared_ptr<Tensor<T>> make(std::shared_ptr<VulkanDevice> &dev,
                                 std::shared_ptr<VulkanCommandPool> &pool,
@@ -67,7 +85,7 @@ std::shared_ptr<Tensor<T>> make(std::shared_ptr<VulkanDevice> &dev,
     auto t = std::make_shared<Tensor<T>>(shape);
     std::vector<T> bytes(vals.size());
     for (size_t i = 0; i < vals.size(); i++) {
-        bytes[i] = static_cast<T>(vals[i]);
+        bytes[i] = to_storage<T>(vals[i]);
     }
     t->fillToCPU(bytes);
     t->as_storage_buffer(dev);
@@ -99,11 +117,46 @@ void run(std::shared_ptr<VulkanDevice> &dev,
     dev->wait_all_done();
 }
 
+template <typename T>
 std::vector<float> readback(std::shared_ptr<VulkanCommandPool> &pool,
-                            const std::shared_ptr<Tensor<float>> &t) {
+                            const std::shared_ptr<Tensor<T>> &t) {
     t->copyToCPU(pool);
     const auto &d = t->data();
-    return std::vector<float>(d.begin(), d.end());
+    std::vector<float> out(d.size());
+    for (size_t i = 0; i < d.size(); i++) {
+        out[i] = from_storage<T>(d[i]);
+    }
+    return out;
+}
+
+// One CumSum run at a given storage dtype.
+template <typename T>
+void cumsum_case(std::shared_ptr<VulkanDevice> &dev,
+                 std::shared_ptr<VulkanCommandPool> &pool,
+                 const std::vector<int> &shape, const std::vector<float> &x,
+                 int axis, const std::vector<float> &want, const char *tag,
+                 int fp16) {
+    auto in = make<T>(dev, pool, shape, x);
+    auto out = make_out<T>(dev, shape, x.size());
+    auto op = vkop::ops::create_from_type(OpType::CUMSUM, fp16, 0, true);
+    check(op != nullptr, "CumSum constructed");
+    if (!op) return;
+    op->setAttribute({{"axis", std::to_string(axis)}});
+    op->set_runtime_device(dev, pool);
+    run(dev, op.get(), {in}, {out});
+    const auto got = readback<T>(pool, out);
+    if (std::getenv("CUM_DEBUG")) {
+        for (size_t i = 0; i < got.size() && i < 12; i++)
+            std::printf("  [%s axis=%d] i=%zu got=%f want=%f\n", tag, axis, i,
+                        got[i], want[i]);
+    }
+    for (size_t i = 0; i < got.size(); i++) {
+        // fp16 storage costs one rounding of the result, so the tolerance is
+        // per-element relative rather than the fp32 default.
+        expect_close(tag, i, got[i], want[i], fp16 ? 2e-3F : 2e-4F, 1e-3F);
+    }
+    std::printf("PASS: CumSum %s [2,3,4] axis=%d (bda=%d)\n", tag, axis,
+                op->bda_pipeline_ready() ? 1 : 0);
 }
 
 // ---------------------------------------------------------------- CumSum ---
@@ -130,20 +183,10 @@ void test_cumsum(std::shared_ptr<VulkanDevice> &dev,
         }
     }
 
-    auto in = make<float>(dev, pool, shape, x);
-    auto out = make_out<float>(dev, shape, x.size());
-    auto op = vkop::ops::create_from_type(OpType::CUMSUM, 0, 0, true);
-    check(op != nullptr, "CumSum constructed");
-    if (!op) return;
-    op->setAttribute({{"axis", std::to_string(axis)}});
-    op->set_runtime_device(dev, pool);
-    run(dev, op.get(), {in}, {out});
-    const auto got = readback(pool, out);
-    for (size_t i = 0; i < got.size(); i++) {
-        expect_close("CumSum", i, got[i], want[i]);
-    }
-    std::printf("PASS: CumSum [2,3,4] axis=1 (bda=%d)\n",
-                op->bda_pipeline_ready() ? 1 : 0);
+    // fp32 and fp16 share the same reference: the kernel accumulates in fp32
+    // either way, so the only difference is the storage round-trip.
+    cumsum_case<float>(dev, pool, shape, x, axis, want, "fp32", 0);
+    cumsum_case<uint16_t>(dev, pool, shape, x, axis, want, "fp16", 1);
 
     // A second axis (last) to catch a stride-1 assumption.
     std::vector<float> want_m2(24, 0.0F);
@@ -156,17 +199,8 @@ void test_cumsum(std::shared_ptr<VulkanDevice> &dev,
             want_m2[o * len2 + i] = acc;
         }
     }
-    auto in2 = make<float>(dev, pool, shape, x);
-    auto out2 = make_out<float>(dev, shape, x.size());
-    auto op2 = vkop::ops::create_from_type(OpType::CUMSUM, 0, 0, true);
-    op2->setAttribute({{"axis", std::to_string(axis2)}});
-    op2->set_runtime_device(dev, pool);
-    run(dev, op2.get(), {in2}, {out2});
-    const auto got2 = readback(pool, out2);
-    for (size_t i = 0; i < got2.size(); i++) {
-        expect_close("CumSum-axis2", i, got2[i], want_m2[i]);
-    }
-    std::printf("PASS: CumSum [2,3,4] axis=2\n");
+    cumsum_case<float>(dev, pool, shape, x, axis2, want_m2, "fp32", 0);
+    cumsum_case<uint16_t>(dev, pool, shape, x, axis2, want_m2, "fp16", 1);
 }
 
 // ---------------------------------------------------------------- Conv1d ---
@@ -206,8 +240,12 @@ void conv1d_ref(const std::vector<float> &x, const std::vector<float> &w,
     }
 }
 
-void test_conv1d(std::shared_ptr<VulkanDevice> &dev,
-                 std::shared_ptr<VulkanCommandPool> &pool) {
+// One Conv1d run at a given DATA dtype. The state stays fp32 in every build,
+// which is the contract ops/Conv1d.hpp implements.
+template <typename T>
+void conv1d_case(std::shared_ptr<VulkanDevice> &dev,
+                 std::shared_ptr<VulkanCommandPool> &pool, const char *tag,
+                 int fp16) {
     const int C = 6, S = 5, K = 4;
     const int pad = K - 1;
     std::vector<float> w(C * K), x(C * S), state(C * pad, 0.0F);
@@ -215,13 +253,12 @@ void test_conv1d(std::shared_ptr<VulkanDevice> &dev,
     for (size_t i = 0; i < x.size(); i++) x[i] = std::cos(i * 0.4F);
     auto state_ref = state;
 
-    auto w_t = make<float>(dev, pool, {C, K}, w);
-    auto x_t = make<float>(dev, pool, {C, S}, x);
-    auto st_t = make<float>(dev, pool, {C, pad}, state);
-    auto y_t = make_out<float>(dev, {C, S}, C * S);
-    auto so_t = make_out<float>(dev, {C, pad}, C * pad);
+    auto w_t = make<T>(dev, pool, {C, K}, w);
+    auto x_t = make<T>(dev, pool, {C, S}, x);
+    auto st_t = make<float>(dev, pool, {C, pad}, state); // state is always fp32
+    auto y_t = make_out<T>(dev, {C, S}, C * S);
 
-    auto op = vkop::ops::create_from_type(OpType::CONV1D, 0, 0, true);
+    auto op = vkop::ops::create_from_type(OpType::CONV1D, fp16, 0, true);
     check(op != nullptr, "Conv1d constructed");
     if (!op) return;
     op->setAttribute({{"kernel", std::to_string(K)}});
@@ -234,17 +271,28 @@ void test_conv1d(std::shared_ptr<VulkanDevice> &dev,
         conv1d_ref(x, w, C, S, K, state_ref, want);
         // state_out aliases state_in, like the driver's present==past.
         run(dev, op.get(), {x_t, w_t, st_t}, {y_t, st_t});
-        const auto got = readback(pool, y_t);
+        const auto got = readback<T>(pool, y_t);
         for (size_t i = 0; i < got.size(); i++) {
-            expect_close("Conv1d.y", i, got[i], want[i]);
+            expect_close(tag, i, got[i], want[i], fp16 ? 2e-3F : 2e-4F, 2e-3F);
         }
-        const auto got_state = readback(pool, st_t);
+        const auto got_state = readback<float>(pool, st_t);
+        // The state holds the last K-1 INPUTS, so with fp16 data it carries the
+        // rounded inputs while the reference used the fp32 ones. That is the
+        // storage's own precision, not an error in the roll-over.
         for (size_t i = 0; i < got_state.size(); i++) {
-            expect_close("Conv1d.state", i, got_state[i], state_ref[i]);
+            expect_close("Conv1d.state", i, got_state[i], state_ref[i],
+                         2e-4F, fp16 ? 5e-3F : 1e-5F);
         }
     }
-    std::printf("PASS: Conv1d [C=%d,S=%d,K=%d] x2 rounds in-place state "
-                "(bda=%d)\n", C, S, K, op->bda_pipeline_ready() ? 1 : 0);
+    std::printf("PASS: Conv1d %s [C=%d,S=%d,K=%d] x2 rounds in-place state "
+                "(bda=%d)\n", tag, C, S, K,
+                op->bda_pipeline_ready() ? 1 : 0);
+}
+
+void test_conv1d(std::shared_ptr<VulkanDevice> &dev,
+                 std::shared_ptr<VulkanCommandPool> &pool) {
+    conv1d_case<float>(dev, pool, "fp32", 0);
+    conv1d_case<uint16_t>(dev, pool, "fp16", 1);
 }
 
 // ------------------------------------------------------- LinearAttention ---
@@ -254,14 +302,17 @@ void linear_attention_ref(const std::vector<float> &q,
                           const std::vector<float> &k,
                           const std::vector<float> &v,
                           const std::vector<float> &g,
-                          const std::vector<float> &beta, int H, int S, int Dk,
-                          int Dv, std::vector<float> &state,
+                          const std::vector<float> &beta, int Hk, int Hv,
+                          int S, int Dk, int Dv, std::vector<float> &state,
                           std::vector<float> &out) {
     const float eps = 1e-6F;
-    for (int h = 0; h < H; h++) {
+    const int rep = Hv / Hk;
+    for (int h = 0; h < Hv; h++) {
+        const int kh = h / rep;  // repeat_interleave's layout
         const size_t sb = static_cast<size_t>(h) * Dk * Dv;
+        const size_t kqb = static_cast<size_t>(kh) * S * Dk;
         for (int t = 0; t < S; t++) {
-            const size_t qb = (static_cast<size_t>(h) * S + t) * Dk;
+            const size_t qb = kqb + static_cast<size_t>(t) * Dk;
             const size_t vb = (static_cast<size_t>(h) * S + t) * Dv;
             // l2 norms
             float qss = 0.0F, kss = 0.0F;
@@ -305,16 +356,20 @@ void linear_attention_ref(const std::vector<float> &q,
     }
 }
 
-void test_linear_attention(std::shared_ptr<VulkanDevice> &dev,
-                           std::shared_ptr<VulkanCommandPool> &pool) {
+template <typename T>
+void linear_attention_shapes(std::shared_ptr<VulkanDevice> &dev,
+                             std::shared_ptr<VulkanCommandPool> &pool,
+                             const char *tag, int fp16) {
     // Two shapes: a small non-trivial one (fast CPU reference), then the real
     // Qwen3.5-27B geometry (Hv=48, Dk=Dv=128, several tokens in prefill).
-    struct Shape { int H, S, Dk, Dv; };
-    const Shape shapes[] = {{2, 3, 8, 8}, {48, 4, 128, 128}};
+    // Hk is the key head count; Hv may be larger and is what the op's output
+    // uses (the kernel re-derives the key head as h / (Hv/Hk)).
+    struct Shape { int Hk, Hv, S, Dk, Dv; };
+    const Shape shapes[] = {{2, 2, 3, 8, 8}, {16, 48, 4, 128, 128}};
     for (const auto &sh : shapes) {
-        const int H = sh.H, S = sh.S, Dk = sh.Dk, Dv = sh.Dv;
-        std::vector<float> q(H * S * Dk), k(H * S * Dk), v(H * S * Dv),
-            g(H * S), beta(H * S), state(H * Dk * Dv, 0.0F);
+        const int Hk = sh.Hk, Hv = sh.Hv, S = sh.S, Dk = sh.Dk, Dv = sh.Dv;
+        std::vector<float> q(Hk * S * Dk), k(Hk * S * Dk), v(Hv * S * Dv),
+            g(Hv * S), beta(Hv * S), state(Hv * Dk * Dv, 0.0F);
         for (size_t i = 0; i < q.size(); i++)
             q[i] = std::sin(i * 0.31F) * 0.7F;
         for (size_t i = 0; i < k.size(); i++)
@@ -327,38 +382,50 @@ void test_linear_attention(std::shared_ptr<VulkanDevice> &dev,
             beta[i] = 0.5F + 0.1F * static_cast<float>(i % 4);
 
         auto state_ref = state;
-        std::vector<float> want(H * S * Dv, 0.0F);
-        linear_attention_ref(q, k, v, g, beta, H, S, Dk, Dv, state_ref, want);
+        std::vector<float> want(Hv * S * Dv, 0.0F);
+        linear_attention_ref(q, k, v, g, beta, Hk, Hv, S, Dk, Dv, state_ref,
+                             want);
 
-        auto q_t = make<float>(dev, pool, {H, S, Dk}, q);
-        auto k_t = make<float>(dev, pool, {H, S, Dk}, k);
-        auto v_t = make<float>(dev, pool, {H, S, Dv}, v);
-        auto g_t = make<float>(dev, pool, {H, S}, g);
-        auto b_t = make<float>(dev, pool, {H, S}, beta);
-        auto st_t = make<float>(dev, pool, {H, Dk, Dv}, state);
-        auto o_t = make_out<float>(dev, {H, S, Dv}, H * S * Dv);
+        // Data follows the dtype under test; the recurrent state is always
+        // fp32 (ops/LinearAttention.hpp's contract).
+        auto q_t = make<T>(dev, pool, {Hk, S, Dk}, q);
+        auto k_t = make<T>(dev, pool, {Hk, S, Dk}, k);
+        auto v_t = make<T>(dev, pool, {Hv, S, Dv}, v);
+        auto g_t = make<T>(dev, pool, {Hv, S}, g);
+        auto b_t = make<T>(dev, pool, {Hv, S}, beta);
+        auto st_t = make<float>(dev, pool, {Hv, Dk, Dv}, state);
+        auto o_t = make_out<T>(dev, {Hv, S, Dv}, Hv * S * Dv);
 
-        auto op =
-            vkop::ops::create_from_type(OpType::LINEAR_ATTENTION, 0, 0, true);
+        auto op = vkop::ops::create_from_type(OpType::LINEAR_ATTENTION, fp16, 0,
+                                             true);
         check(op != nullptr, "LinearAttention constructed");
         if (!op) return;
         op->set_runtime_device(dev, pool);
 
         run(dev, op.get(), {q_t, k_t, v_t, g_t, b_t, st_t}, {o_t, st_t});
-        const auto got = readback(pool, o_t);
+        const auto got = readback<T>(pool, o_t);
         for (size_t i = 0; i < got.size(); i++) {
-            expect_close("LinearAttention.out", i, got[i], want[i], 2e-3F,
-                         1e-5F);
+            // The fp16 build reads half-rounded q/k/v, and the recurrence
+            // amplifies that through the state, so its bound is looser.
+            expect_close(tag, i, got[i], want[i], fp16 ? 2e-2F : 2e-3F,
+                         fp16 ? 5e-3F : 1e-5F);
         }
-        const auto got_state = readback(pool, st_t);
+        const auto got_state = readback<float>(pool, st_t);
         for (size_t i = 0; i < got_state.size(); i++) {
             expect_close("LinearAttention.state", i, got_state[i],
-                         state_ref[i], 2e-3F, 1e-5F);
+                         state_ref[i], fp16 ? 2e-2F : 2e-3F,
+                         fp16 ? 5e-3F : 1e-5F);
         }
-        std::printf("PASS: LinearAttention H=%d S=%d Dk=%d Dv=%d in-place "
-                    "state (bda=%d)\n", H, S, Dk, Dv,
+        std::printf("PASS: LinearAttention %s Hk=%d Hv=%d S=%d Dk=%d Dv=%d "
+                    "in-place state (bda=%d)\n", tag, Hk, Hv, S, Dk, Dv,
                     op->bda_pipeline_ready() ? 1 : 0);
     }
+}
+
+void test_linear_attention(std::shared_ptr<VulkanDevice> &dev,
+                           std::shared_ptr<VulkanCommandPool> &pool) {
+    linear_attention_shapes<float>(dev, pool, "fp32", 0);
+    linear_attention_shapes<uint16_t>(dev, pool, "fp16", 1);
 }
 
 } // namespace

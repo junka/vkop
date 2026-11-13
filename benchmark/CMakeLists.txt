@@ -15,6 +15,15 @@ add_executable(vkop_bench vkop_bench.cpp)
 target_link_libraries(vkop_bench PRIVATE vkop vload)
 set_target_properties(vkop_bench PROPERTIES OUTPUT_NAME vkop-bench)
 
+# Native fp16 storage vs packed half2 storage, on the three qwen3_5 ops that
+# ship both builds. Reports the ratio, not a verdict: see
+# docs/fp16-storage-layouts.md for the measurement and its interpretation.
+add_executable(fp16_layout_bench fp16_layout_bench.cpp)
+target_link_libraries(fp16_layout_bench PRIVATE vkop vload)
+target_compile_definitions(fp16_layout_bench PRIVATE
+    VKOP_DEV_SHADER_ARCHIVE="${CMAKE_BINARY_DIR}/vkop_shaders.bin")
+add_dependencies(fp16_layout_bench shader_archive)
+
 # Standalone MatMul microbenchmark — decode-shape fp16, buffer backend.
 # Carries a per-shape correctness check (fp32 CPU reference).
 add_executable(bench_matmul bench_matmul.cpp)

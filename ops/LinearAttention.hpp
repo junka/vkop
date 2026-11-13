@@ -26,8 +26,10 @@ namespace ops {
 // part no existing kernel expresses.
 //
 // Interface:
-//   inputs[0] q        [H, S, Dk] fp32 (already repeated to Hv heads)
-//   inputs[1] k        [H, S, Dk] fp32
+//   inputs[0] q        [Hk, S, Dk] fp32 (NOT expanded: the kernel indexes
+//                       value head h to key head h / (Hv/Hk), which is
+//                       repeat_interleave's layout without the copy)
+//   inputs[1] k        [Hk, S, Dk] fp32
 //   inputs[2] v        [H, S, Dv] fp32
 //   inputs[3] g        [H, S]     fp32, log-space decay (<= 0)
 //   inputs[4] beta     [H, S]     fp32
@@ -36,13 +38,13 @@ namespace ops {
 //   outputs[1] state_out  [H, Dk, Dv] fp32 - may alias state_in; each lane
 //                          rewrites only the column it read.
 //
-// Buffer-only and fp32-only: the recurrence is sequential over tokens and HF
-// normalizes and accumulates in fp32 whatever the model dtype, so the fp16
-// packed-word layout cannot express it. The converter keeps this op's inputs
-// fp32 and inserts the casts at the boundaries.
+// Buffer-only. q/k/v/g/beta and `out` follow the tensor dtype (three builds:
+// fp32, native fp16, packed half2); the recurrent STATE stays fp32 in every
+// build, because HF converts the whole recurrence to fp32 and a half state
+// would drift over a long decode.
 class LinearAttentionBuffer : public BufferFactory {
   public:
-    LinearAttentionBuffer()
+    explicit LinearAttentionBuffer(int fp16)
         : BufferFactory(OpType::LINEAR_ATTENTION,
                         std::vector<VkDescriptorType>{
                             DESCRIPTOR_TYPE_STORAGE, // out
@@ -54,7 +56,7 @@ class LinearAttentionBuffer : public BufferFactory {
                             DESCRIPTOR_TYPE_STORAGE, // state in
                             DESCRIPTOR_TYPE_STORAGE, // state out
                         },
-                        sizeof(LinearAttentionPC)) {}
+                        sizeof(LinearAttentionPC), fp16) {}
 
   private:
     bool supports_bda_variant() const override { return true; }
@@ -73,26 +75,30 @@ class LinearAttentionBuffer : public BufferFactory {
                                          "unbound");
             }
         }
-        if (inputs[0]->elem_kind() != core::ElemKind::kFloat32) {
-            throw std::runtime_error(
-                "LinearAttention: fp32-only (the recurrence normalizes and "
-                "accumulates in fp32); declare its inputs fp32");
-        }
         const auto q_shape = inputs[0]->getShape();
         if (q_shape.size() != 3) {
-            throw std::runtime_error("LinearAttention: q must be [H, S, Dk]");
+            throw std::runtime_error("LinearAttention: q must be [Hk, S, Dk]");
         }
-        const int heads = q_shape[0];
+        const int kv_heads = q_shape[0];
         const int seq = q_shape[1];
         const int dk = q_shape[2];
         const auto v_shape = inputs[2]->getShape();
-        if (v_shape.size() != 3 || v_shape[0] != heads || v_shape[1] != seq) {
+        if (v_shape.size() != 3 || v_shape[1] != seq) {
             throw std::runtime_error(
-                "LinearAttention: v must be [H, S, Dv] matching q's H and S");
+                "LinearAttention: v must be [Hv, S, Dv] matching q's S");
         }
+        const int heads = v_shape[0];
         const int dv = v_shape[2];
-        if (dk <= 0 || dv <= 0 || heads <= 0 || seq <= 0) {
+        if (dk <= 0 || dv <= 0 || heads <= 0 || kv_heads <= 0 || seq <= 0) {
             throw std::runtime_error("LinearAttention: empty extent");
+        }
+        // Validity of the head ratio, checked on the host so the shader's
+        // integer divide cannot pick a key head out of range.
+        if (heads % kv_heads != 0) {
+            throw std::runtime_error(
+                "LinearAttention: Hv must be a multiple of Hk (got " +
+                std::to_string(heads) + " and " + std::to_string(kv_heads) +
+                ")");
         }
         if (dk > 128 || dv > 128) {
             throw std::runtime_error(
@@ -101,23 +107,40 @@ class LinearAttentionBuffer : public BufferFactory {
                 "registers)");
         }
 
-        auto out = core::as_tensor<float>(outputs[0]);
-        if (!out) {
-            throw std::runtime_error(
-                "LinearAttention: output is not an fp32 tensor");
-        }
+        // Data buffers follow each tensor's dtype; the state stays fp32.
         const std::vector<int> o_shape{heads, seq, dv};
-        if (out->num_elements() != heads * seq * dv) {
-            out->resize(o_shape);
-        } else if (out->getShape() != o_shape) {
-            out->reshape_view(o_shape);
-        }
-        auto out_buf = bind_ssbo<float>(outputs[0], /*is_output=*/true);
-        auto q_buf = bind_ssbo<float>(inputs[0], false);
-        auto k_buf = bind_ssbo<float>(inputs[1], false);
-        auto v_buf = bind_ssbo<float>(inputs[2], false);
-        auto g_buf = bind_ssbo<float>(inputs[3], false);
-        auto b_buf = bind_ssbo<float>(inputs[4], false);
+        std::shared_ptr<VulkanBuffer> out_buf, q_buf, k_buf, v_buf, g_buf,
+            b_buf;
+        dispatch_by_dtype(outputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            auto out = core::as_tensor<T>(outputs[0]);
+            if (out->num_elements() != heads * seq * dv) {
+                out->resize(o_shape);
+            } else if (out->getShape() != o_shape) {
+                out->reshape_view(o_shape);
+            }
+            out_buf = bind_ssbo<T>(outputs[0], /*is_output=*/true);
+        });
+        dispatch_by_dtype(inputs[0]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            q_buf = bind_ssbo<T>(inputs[0], false);
+        });
+        dispatch_by_dtype(inputs[1]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            k_buf = bind_ssbo<T>(inputs[1], false);
+        });
+        dispatch_by_dtype(inputs[2]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            v_buf = bind_ssbo<T>(inputs[2], false);
+        });
+        dispatch_by_dtype(inputs[3]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            g_buf = bind_ssbo<T>(inputs[3], false);
+        });
+        dispatch_by_dtype(inputs[4]->dtype(), [&](auto tag) {
+            using T = decltype(tag);
+            b_buf = bind_ssbo<T>(inputs[4], false);
+        });
 
         const std::vector<int> s_shape{heads, dk, dv};
         auto st_in = core::as_tensor<float>(inputs[5]);
@@ -149,6 +172,7 @@ class LinearAttentionBuffer : public BufferFactory {
 
         LinearAttentionPC pc{};
         pc.heads = heads;
+        pc.kv_heads = kv_heads;
         pc.seq = seq;
         pc.dk = dk;
         pc.dv = dv;
@@ -192,9 +216,9 @@ class LinearAttentionBuffer : public BufferFactory {
 // PIMPL façade: buffer-only, so both branches build the buffer leaf.
 class LinearAttention : public PimplFacade {
   public:
-    LinearAttention(int /*fp16*/, bool /*backend_buffer*/)
+    LinearAttention(int fp16, bool /*backend_buffer*/)
         : PimplFacade(OpType::LINEAR_ATTENTION) {
-        impl_ = std::make_unique<LinearAttentionBuffer>();
+        impl_ = std::make_unique<LinearAttentionBuffer>(fp16);
     }
 };
 

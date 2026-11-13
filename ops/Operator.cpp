@@ -53,7 +53,21 @@ static bool bda_shaders_enabled() {
 }
 
 void Operator::resolve_primary_spv() {
+    resolve_fp16_layout();
     std::string key = core::shader_key_for(type_, uses_buffer_backend(), fp16_);
+    // The three qwen3_5 ops ship a second fp16 layout (packed half2 words).
+    // Only those keys exist as <key>_fp16_packed, so the suffix is harmless for
+    // every other op -- it would miss and fall back. The test is on the SUFFIX:
+    // shader_key_for already returns e.g. "buffer_cumsum_fp16", and appending
+    // unconditionally would build "buffer_cumsum_fp16_packed" for the fp32 key
+    // too.
+    const std::string fp16_suffix = "_fp16";
+    if (fp16_ && fp16_packed_ && !key.empty() &&
+        key.size() > fp16_suffix.size() &&
+        key.compare(key.size() - fp16_suffix.size(), fp16_suffix.size(),
+                    fp16_suffix) == 0) {
+        key += "_packed";
+    }
     if (key.empty()) {
         // Host-only op (Shape, SqueezeUnsqueeze): no pipeline to build.
         return;

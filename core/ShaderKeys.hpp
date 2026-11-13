@@ -143,12 +143,14 @@ inline std::string shader_key_for(vkop::ops::OpType type, bool backend_buffer,
             return {"transpose", "transpose", false, true};
         case T::ATTENTION:
             return {nullptr, "attention", false, true};
+        // Three builds each: fp32, native fp16 (float16_t storage) and the
+        // packed-half2 variant reachable as <key>_fp16_packed.
         case T::CUMSUM:
-            return {nullptr, "cumsum", false, false};
+            return {nullptr, "cumsum", false, true};
         case T::CONV1D:
-            return {nullptr, "conv1d", false, false};
+            return {nullptr, "conv1d", false, true};
         case T::LINEAR_ATTENTION:
-            return {nullptr, "linear_attention", false, false};
+            return {nullptr, "linear_attention", false, true};
         case T::CAST:
             return {nullptr, "cast", false, false};
         case T::WHERE:

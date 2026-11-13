@@ -276,6 +276,13 @@ endforeach()
 # Transpose is non-contiguous (permuted) so its fp16 path reads each output
 # element via the packed-half BUF_LOAD and packs two results per output word.
 set(DUAL_FP16_SHADERS
+    # The three qwen3_5 linear-attention ops. Their _fp16 build uses
+    # float16_t storage; the extra _fp16_packed variant (built below) is the
+    # two-halves-per-word convention the rest of this repo uses, kept so the
+    # two can be measured against each other.
+    buffer/cumsum
+    buffer/conv1d
+    buffer/linear_attention
     buffer/gather
     buffer/sigmoid
     buffer/tanh
@@ -542,6 +549,20 @@ macro(vkop_shader_variant KEY SOURCE)
     list(APPEND VARIANT_SPV_KEYS ${KEY})
     list(APPEND VARIANT_SPV_FILES ${SPIRV_FILE_VARIANT})
 endmacro()
+
+# The three qwen3_5 linear-attention ops ship TWO fp16 layouts so their cost can
+# be compared on a real device:
+#   <base>_fp16         float16_t storage (native half loads/stores)
+#   <base>_fp16_packed  two halves per uint word, unpack/pack per access
+# The dual-fp16 loop above already produces the native one; the packed build is
+# an extra variant, reachable through VKOP_FP16_PACKED=<op,..> at run time (see
+# ops/Operator.cpp's shader-key override). Same source, same bytes on disk --
+# only the indexing and the thread-per-word discipline differ.
+foreach(PACKED_NAME buffer/cumsum buffer/conv1d buffer/linear_attention)
+    string(REPLACE "/" "_" PACKED_BASE "${PACKED_NAME}")
+    vkop_shader_variant(${PACKED_BASE}_fp16_packed ${PACKED_NAME} -DFP16 -DPACKED_FP16)
+    vkop_shader_variant(${PACKED_BASE}_bda_fp16_packed ${PACKED_NAME} -DFP16 -DBDA -DPACKED_FP16)
+endforeach()
 
 # Device-address builds of the shared sources listed here. Each is compiled
 # with -DBDA (and -DFP16 -DBDA when it also has a dual fp16 base), producing
@@ -1231,6 +1252,13 @@ if (ENABLE_LLM_CHAT)
     add_dependencies(matmul_m_sweep shader_archive)
     target_compile_definitions(matmul_m_sweep PRIVATE
         "VKOP_DEV_SHADER_ARCHIVE=\"${VKOP_SHADER_ARCHIVE_FILE}\"")
+
+    # qwen3_5 graph probe: loads an exported hybrid graph and checks that
+    # every op resolves a kernel and no output goes non-finite. llm_chat's
+    # consecutive-KV-name assumption does not hold for a model where only the
+    # full_attention layers carry a cache, so this is the load-and-run check.
+    add_executable(qwen35_probe llm/exporter/driver/qwen35_probe.cpp)
+    target_link_libraries(qwen35_probe PRIVATE vkop vload)
 
     # KV-cache probe: runs a minimal attention+cache graph (see
     # /tmp/gen_cache_graph.py) for several rounds so the Attention op's cache

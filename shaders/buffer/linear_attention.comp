@@ -18,15 +18,24 @@
 // (the store at the end rewrites exactly the lane's own column).
 //
 // The l2 norms are shared by every column, so the workgroup computes them once
-// into LDS (qn[Dk], kn[Dk]); lane 0..Dk-1 fills them with a two-pass sum of
-// squares, then a barrier releases the column lanes.
+// into LDS (qn[Dk], kn[Dk]); lane 0..Dk-1 fills them, then a barrier releases
+// the column lanes.
+//
+// DTYPES. q/k/v/g/beta and `out` follow the tensor dtype. Three builds:
+//   (base)                 fp32
+//   -DFP16                 float16_t data[]  -- NATIVE half storage
+//   -DFP16 -DPACKED_FP16   two halves per uint word, unpack/pack per access
+// The recurrent STATE is fp32 in every build: HF converts the whole recurrence
+// to fp32 and keeps it there, and a half state would drift over a long decode.
+// All arithmetic is fp32.
+//
+// The native build lets each lane write its own column directly. The packed
+// build cannot: two lanes' columns share a uint word, so the lanes deposit
+// their fp32 results in LDS and a barrier-separated step packs pairs -- one
+// writer per word, no race.
 //
 // Sequence: the lanes walk `seq` tokens in order, because the state carries
 // from token to token. For decode (seq == 1) this is one iteration.
-//
-// fp32 only and dense: the recurrence is sequential and numerically delicate
-// (HF normalizes and accumulates in fp32 regardless of the model dtype), which
-// the fp16 packed-word layout cannot express.
 
 #ifdef BDA
 #extension GL_EXT_buffer_reference : require
@@ -39,13 +48,50 @@ layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
 #define MAX_HEAD_DIM 128
 
+// Reading q/k/v/g/beta: identical in both fp16 layouts (BUF_LOAD handles the
+// packed one, a plain array read serves the native one).
+#if defined(FP16) && !defined(PACKED_FP16)
+#define ACC_LOAD(data, idx) float((data)[(idx)])
+#else
+#define ACC_LOAD(data, idx) BUF_LOAD((data), (idx))
+#endif
+
 #ifdef BDA
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer DataBuf {
+#if defined(FP16) && !defined(PACKED_FP16)
+    float16_t data[];
+#else
+    uint data[];
+#endif
+};
+// The recurrent state is fp32 in every build, so it needs its own reference
+// type: DataBuf's element type follows the data dtype and would be half here.
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer StateBuf {
     uint data[];
 };
 #endif
 
 #ifndef BDA
+#if defined(FP16) && !defined(PACKED_FP16)
+layout(set = 0, binding = 0) writeonly buffer Out {
+    float16_t data[];
+} uOut;
+layout(set = 0, binding = 1) readonly buffer Q {
+    float16_t data[];
+} uQ;
+layout(set = 0, binding = 2) readonly buffer K {
+    float16_t data[];
+} uK;
+layout(set = 0, binding = 3) readonly buffer V {
+    float16_t data[];
+} uV;
+layout(set = 0, binding = 4) readonly buffer G {
+    float16_t data[];
+} uG;
+layout(set = 0, binding = 5) readonly buffer Beta {
+    float16_t data[];
+} uBeta;
+#else
 layout(set = 0, binding = 0) writeonly buffer Out {
     uint data[];
 } uOut;
@@ -64,6 +110,7 @@ layout(set = 0, binding = 4) readonly buffer G {
 layout(set = 0, binding = 5) readonly buffer Beta {
     uint data[];
 } uBeta;
+#endif
 layout(set = 0, binding = 6) readonly buffer StateIn {
     uint data[];
 } uStateIn;
@@ -73,39 +120,46 @@ layout(set = 0, binding = 7) writeonly buffer StateOut {
 #endif
 
 layout(push_constant) uniform PC_uLinAttn {
-    int heads;    // Hv == Hq (q/k are already expanded)
+    int heads;    // Hv, value heads (== workgroup count)
+    int kv_heads; // Hk, key/query heads; value head h reads q/k head h/rep
     int seq;      // tokens this round
     int dk;       // key head dim
     int dv;       // value head dim
     int eps_bits; // l2norm epsilon, as float bits
     int _pad0;
     int _pad1;
-    int _pad2;
 #ifdef BDA
-    DataBuf uOut;
-    DataBuf uQ;
-    DataBuf uK;
-    DataBuf uV;
-    DataBuf uG;
-    DataBuf uBeta;
-    DataBuf uStateIn;
-    DataBuf uStateOut;
+    DataBuf uOutBda;
+    DataBuf uQBda;
+    DataBuf uKBda;
+    DataBuf uVBda;
+    DataBuf uGBda;
+    DataBuf uBetaBda;
+    StateBuf uStateInBda;
+    StateBuf uStateOutBda;
 #endif
 } uLinAttn;
 
 #ifdef BDA
-#define uOut uLinAttn.uOut
-#define uQ uLinAttn.uQ
-#define uK uLinAttn.uK
-#define uV uLinAttn.uV
-#define uG uLinAttn.uG
-#define uBeta uLinAttn.uBeta
-#define uStateIn uLinAttn.uStateIn
-#define uStateOut uLinAttn.uStateOut
+#define uOut uLinAttn.uOutBda
+#define uQ uLinAttn.uQBda
+#define uK uLinAttn.uKBda
+#define uV uLinAttn.uVBda
+#define uG uLinAttn.uGBda
+#define uBeta uLinAttn.uBetaBda
+#define uStateIn uLinAttn.uStateInBda
+#define uStateOut uLinAttn.uStateOutBda
 #endif
+
+// The recurrent state is fp32 in every build (see the header note).
+#define STATE_LOAD(idx) uintBitsToFloat(uStateIn.data[(idx)])
+#define STATE_STORE(idx, v) (uStateOut.data[(idx)] = floatBitsToUint(float(v)))
 
 shared float s_qn[MAX_HEAD_DIM];
 shared float s_kn[MAX_HEAD_DIM];
+// fp32 output of this token, deposited by the column lanes so one writer can
+// pack a whole half2 word in the fp16 build.
+shared float s_out[MAX_HEAD_DIM];
 shared float s_qscale;
 
 void main() {
@@ -118,8 +172,6 @@ void main() {
     if (h >= uLinAttn.heads) {
         return;
     }
-    // This lane's value column. With local_size 128 and dv typically 128, one
-    // workgroup covers the head exactly; a narrow head leaves lanes idle.
     const int col = lane;
     const bool col_ok = col < dv;
 
@@ -130,24 +182,29 @@ void main() {
     }
     barrier();
 
-    // Running state column, private to this lane.
+    // Running state column, private to this lane (fp32).
     float s_col[MAX_HEAD_DIM];
     if (col_ok) {
         const uint sbase = uint(h) * uint(dk) * uint(dv);
         for (int i = 0; i < dk; i++) {
-            s_col[i] = uintBitsToFloat(uStateIn.data[sbase + uint(i) * uint(dv) +
-                                                    uint(col)]);
+            s_col[i] = STATE_LOAD(sbase + uint(i) * uint(dv) + uint(col));
         }
     }
 
+    // HF expands q/k to Hv heads with repeat_interleave, which the exporter
+    // would have to spell as a Tile -- a per-token copy of the whole key tensor
+    // (96 x ~50 MB at prefill). Folding the expansion into the index costs one
+    // divide and no memory: value head h reads q/k head (h / rep).
+    const int kh = (uLinAttn.kv_heads > 0 && uLinAttn.heads >= uLinAttn.kv_heads)
+                       ? h / (uLinAttn.heads / uLinAttn.kv_heads)
+                       : h;
+
     for (int t = 0; t < seq; t++) {
-        const uint qbase = (uint(h) * uint(seq) + uint(t)) * uint(dk);
-        // --- shared l2 norms for this token -----------------------------
+        const uint qbase = (uint(kh) * uint(seq) + uint(t)) * uint(dk);
+        // --- shared l2 input for this token -----------------------------
         if (lane < dk) {
-            const float qv = uintBitsToFloat(uQ.data[qbase + uint(lane)]);
-            const float kv = uintBitsToFloat(uK.data[qbase + uint(lane)]);
-            s_qn[lane] = qv;
-            s_kn[lane] = kv;
+            s_qn[lane] = ACC_LOAD(uQ.data, qbase + uint(lane));
+            s_kn[lane] = ACC_LOAD(uK.data, qbase + uint(lane));
         }
         barrier();
         if (lane == 0) {
@@ -165,40 +222,58 @@ void main() {
         }
         barrier();
 
-        // Every lane reaches every barrier in every iteration: the column
-        // work below is skipped with a branch, never a `continue` (a divergent
-        // barrier operand is undefined).
+        // Every lane reaches every barrier in every iteration: the column work
+        // is skipped with a branch, never a `continue` (a divergent barrier
+        // operand is undefined).
         if (col_ok) {
-            const int gh = h * seq + t;
-            const float decay = exp(uintBitsToFloat(uG.data[uint(gh)]));
-            const float beta = uintBitsToFloat(uBeta.data[uint(gh)]);
+            const uint gt = uint(h) * uint(seq) + uint(t);
+            const float decay = exp(ACC_LOAD(uG.data, gt));
+            const float beta = ACC_LOAD(uBeta.data, gt);
 
-            // Decay the column.
             for (int i = 0; i < dk; i++) {
                 s_col[i] *= decay;
             }
-
-            // kv = (S * kn).sum(dk)
             float kv = 0.0;
             for (int i = 0; i < dk; i++) {
                 kv += s_col[i] * s_kn[i];
             }
-            const float v = uintBitsToFloat(
-                uV.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) +
-                        uint(col)]);
+            const float v =
+                ACC_LOAD(uV.data, (uint(h) * uint(seq) + uint(t)) * uint(dv) +
+                                      uint(col));
             const float delta = (v - kv) * beta;
 
-            // Rank-1 update and the read-out, sharing the new column.
             float acc = 0.0;
             for (int i = 0; i < dk; i++) {
                 s_col[i] += s_kn[i] * delta;
                 acc += s_col[i] * s_qn[i];
             }
-            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
-                floatBitsToUint(acc);
+            s_out[col] = acc;
         }
-        // The next iteration overwrites s_qn/s_kn, so this barrier keeps the
-        // l2 pass from racing the column lanes that are still reading them.
+        barrier();
+
+#if defined(FP16) && !defined(PACKED_FP16)
+        if (col_ok) {
+            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
+                float16_t(s_out[col]);
+        }
+#elif defined(FP16)
+        // One writer per uint word: lane w packs columns 2w and 2w+1. dv is
+        // even for every real head dim, so a word never straddles heads.
+        if (lane < (dv + 1) / 2) {
+            const int c0 = 2 * lane;
+            const int c1 = c0 + 1;
+            vec2 p = vec2(s_out[c0], c1 < dv ? s_out[c1] : 0.0);
+            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) / 2u +
+                      uint(lane)] = packHalf2x16(p);
+        }
+#else
+        if (col_ok) {
+            uOut.data[(uint(h) * uint(seq) + uint(t)) * uint(dv) + uint(col)] =
+                floatBitsToUint(s_out[col]);
+        }
+#endif
+        // The next iteration overwrites s_qn/s_kn/s_out, so this barrier keeps
+        // the writers above from racing the next token's l2 pass.
         barrier();
     }
 
@@ -207,8 +282,7 @@ void main() {
     if (col_ok) {
         const uint sbase = uint(h) * uint(dk) * uint(dv);
         for (int i = 0; i < dk; i++) {
-            uStateOut.data[sbase + uint(i) * uint(dv) + uint(col)] =
-                floatBitsToUint(s_col[i]);
+            STATE_STORE(sbase + uint(i) * uint(dv) + uint(col), s_col[i]);
         }
     }
 }
