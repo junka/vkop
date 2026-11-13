@@ -88,7 +88,13 @@ class ITensor {
 
     uint8_t num_dims() const { return n_dims_; }
 
-    int size() const { return size_; }
+    // Payload size in BYTES. Deliberately 64-bit: a long-context LLM's logits
+    // plane is q*vocab*2 bytes, which passes 2 GiB at q≈7k and overflowed the
+    // previous `int` into a negative size — VulkanBuffer then rejected the
+    // "huge" buffer, and the fold/readback saw a garbage length. Both the
+    // storage and the accessor are wide; callers that need an int must cast
+    // (and are the ones that must reason about the limit).
+    size_t size() const { return size_; }
     bool is_on_GPU() const { return converted_; }
     // The attached GPU resource if there is one, by pointer identity, for
     // callers outside Tensor<T> that must ask "is this the buffer I think it
@@ -490,7 +496,7 @@ class ITensor {
     // (image packing is NCHW/NCW/etc.); the SSBO buffer path may use up to
     // 8 (push-constant dims[8] convention). 16 slots keep headroom.
     int dims_[16] = {};
-    int size_ = 0;
+    size_t size_ = 0;
     uint16_t ref_cnt_ = 0;
     // Set by the loader for an initializer / graph input; see
     // is_read_only_leaf().
@@ -812,7 +818,8 @@ template <typename T> class Tensor : public ITensor {
                     "vkop: set_payload_bytes on a non-packed tensor (") +
                 elem_name(elem_kind()) + " has no sub-byte packing)");
         }
-        if (sizeof(T) != 1 || bytes <= 0 || bytes > size_) {
+        if (sizeof(T) != 1 || bytes <= 0 ||
+            static_cast<size_t>(bytes) > size_) {
             throw std::runtime_error(
                 "vkop: packed payload of " + std::to_string(bytes) +
                 " bytes does not fit " + std::to_string(size_) +
@@ -869,7 +876,7 @@ template <typename T> class Tensor : public ITensor {
             shape_view_stats().buffer_aliases++;
             if (shape_debug_enabled()) {
                 std::fprintf(stderr,
-                             "[shapeview] aliased %s (%d bytes) onto the "
+                             "[shapeview] aliased %s (%zu bytes) onto the "
                              "producer's VkBuffer\n",
                              shape_to_string(dims_, n_dims_).c_str(), size_);
             }
@@ -919,7 +926,7 @@ template <typename T> class Tensor : public ITensor {
         shape_view_stats().buffer_aliases++;
         if (shape_debug_enabled()) {
             std::fprintf(stderr,
-                         "[shapeview] range-aliased %s (%d bytes) onto "
+                         "[shapeview] range-aliased %s (%zu bytes) onto "
                          "producer +%llu\n",
                          shape_to_string(dims_, n_dims_).c_str(), size_,
                          static_cast<unsigned long long>(byte_offset));
@@ -1794,11 +1801,13 @@ template <typename T> class Tensor : public ITensor {
         }
         auto b = stpool->allocate(aligned);
         if (!b) {
-            // 张量比 staging pool 的上限（1GB）还大：Phi-4 这类
-            // tie_word_embeddings 模型，lm_head 就是那张 [vocab, hidden] 权重，
-            // 200064x3072 fp16 = 1.23GB，一次分配必定失败。原来这里打一行就
-            // return，SSBO 保持全 0 —— 于是整条链最后一级静默输出 0（症状是
-            // logits 全 0、argmax 恒等于 id 0，没有任何报错）。改为分块上传。
+            // The tensor is larger than one staging range: Phi-4-style
+            // tie_word_embeddings models make lm_head the [vocab, hidden]
+            // weight table itself (200064x3072 fp16 = 1.23GB), which can never
+            // fit a single allocation. Returning here used to leave the SSBO
+            // all zeroes — the chain's last stage then produced zero logits and
+            // argmax was permanently id 0, with no error reported. Chunk it
+            // instead.
             upload_buffer_chunked(cmdpool, aligned, src, fill);
             return;
         }
@@ -1855,15 +1864,20 @@ template <typename T> class Tensor : public ITensor {
         toGPU();
     }
 
-    // 超过 staging pool 单次分配上限的大张量：按固定 64MB 一块，分配→拷贝→提交→
-    // 等待→复位，峰值只占一个块。常规尺寸仍走 copyToGPUBuffer 的单次快速路径。
+    // 超过 staging pool 单次分配上限的大张量：按 pool 的上限分块，分配→拷贝→
+    // 提交→等待→复位，峰值只占一个块。常规尺寸仍走 copyToGPUBuffer 的单次快速路径。
     void
     upload_buffer_chunked(const std::shared_ptr<VulkanCommandPool> &cmdpool,
                           size_t aligned, T *src,
                           const StagingFillFn &fill = nullptr) {
         auto dev = cmdpool->getVulkanDevice();
         auto stpool = cmdpool->getStagingBufferPool();
-        constexpr size_t kChunkBytes = static_cast<size_t>(64) << 20;
+        // One chunk per staging allocation the pool will actually hand out, so
+        // the two limits cannot disagree. The chunks that will not fit are
+        // streamed through the same buffer one at a time, so peak staging is
+        // one chunk regardless of the tensor's size.
+        const size_t kChunkBytes =
+            VulkanStagingBufferPool::maxAllocationSize();
 
         std::shared_ptr<VulkanBuffer> buffer;
         size_t base_offset = 0;
@@ -1887,8 +1901,13 @@ template <typename T> class Tensor : public ITensor {
             VulkanCommandBuffer cmd(cmdpool);
             auto part = stpool->allocate(n);
             if (!part) {
-                printf("copyToGPUBuffer chunked alloc failed %zu\n", n);
-                return;
+                // Cannot happen for n <= the pool's own cap; if it does, fail
+                // loudly instead of leaving the tail of the buffer unset.
+                throw std::runtime_error(
+                    "copyToGPUBuffer: staging allocation of " +
+                    std::to_string(n) + " bytes failed (chunk " +
+                    std::to_string(done) + " of " + std::to_string(aligned) +
+                    ")");
             }
             size_t payload = done < have ? std::min(n, have - done) : 0;
             if (fill) {
@@ -1911,7 +1930,10 @@ template <typename T> class Tensor : public ITensor {
             cmd.end();
             cmd.submit(dev->getComputeQueue());
             cmd.wait();
-            stpool->reset();
+            // Same reason as the readback path: every chunk asks for the same
+            // size, so keep the grown buffer instead of shrinking and
+            // re-growing it per chunk.
+            stpool->reset_keep_size();
         }
         toGPU();
     }
@@ -1949,15 +1971,6 @@ template <typename T> class Tensor : public ITensor {
             // temporarily silent during LLM numerics debug
         }
 
-        auto b = stpool->allocate(copy_bytes);
-        if (!b) {
-            printf("copyBufferToCPU stpool alloc failed %d\n",
-                   static_cast<int>(copy_bytes));
-            return;
-        }
-        if constexpr (std::is_same_v<T, uint16_t>) {
-            // diagnostic print silenced during LLM numerics debug
-        }
         std::shared_ptr<VulkanBuffer> buffer;
         size_t offset = 0;
         if (vkobj_->getResourceType() == ResourceType::VK_BUFFER) {
@@ -1982,56 +1995,111 @@ template <typename T> class Tensor : public ITensor {
         // first restores the ordering that a single-queue device gets for free
         // from per-queue FIFO. Costs nothing beyond the wait the copy already
         // needed: at readback time the only outstanding work is earlier levels.
+        //
+        // Draining once before the loop below is enough: every chunk's submit
+        // is ordered after it by per-queue FIFO, so none of them can overtake
+        // the producer either.
         if (dev->getNumComputeQueues() > 1) {
             dev->wait_all_done();
         }
-        cmd.begin();
-        buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset,
-                                        copy_bytes, offset);
-        cmd.end();
-        cmd.submit(dev->getComputeQueue());
-        // cmd.wait() is the wait this readback has always used, and it is not
-        // enough: it waits on THIS copy's own binary semaphore, which bounds
-        // this command buffer and says nothing about what the host may read.
-        // The submit above is ordered w.r.t. earlier submits by per-queue FIFO,
-        // but nothing fences the host memcpy at the end of this function
-        // against work the GPU is still executing -- on a single-queue device
-        // the drain above is skipped, so a small readback (a 64x64 fp16 tile,
-        // tens of microseconds of GPU) can finish on the host side before the
-        // copy lands, and read the staging bytes as they were. That is
-        // data-dependent: a wide fp16 row gives the copy time to land before
-        // the host thread gets there, which is why this only bit the small
-        // shapes. Drain the queue, then the existing semaphore wait is
-        // redundant but harmless (it is already signalled).
-        dev->wait_all_done();
-        cmd.wait();
-        // Device->host visibility: the copy wrote through non-coherent cached
-        // memory (when the pool landed there); drop stale cache lines before
-        // the host reads.
-        stpool->invalidate(*b);
-        if constexpr (std::is_same_v<T, uint16_t>) {
-            // diagnostic print silenced during LLM numerics debug
-        }
+
+        // Readback is chunked for the same reason upload is (see
+        // upload_buffer_chunked): the staging pool refuses a single allocation
+        // past its per-transfer cap, and a wide logits plane (q * vocab * 2
+        // bytes: 1.22 GB at q=4001 / vocab=151936) is past it. The old code
+        // printed "alloc failed" and returned, leaving data_ holding whatever
+        // the previous copy wrote — a silent wrong answer at exactly the
+        // context lengths where the caller least expects one.
+        //
+        // Chunk boundaries are row-aligned when the buffer carries per-row
+        // padding, because the compaction below rewrites whole rows. Otherwise
+        // one chunk is exactly what the pool will hand out in one allocation.
+        const size_t max_chunk = VulkanStagingBufferPool::maxAllocationSize();
+        const size_t packed_stride_bytes =
+            need_compact
+                ? static_cast<size_t>(logical_cols + row_pad) * sizeof(T)
+                : 0;
+        size_t step = max_chunk;
         if (need_compact) {
-            size_t packed_stride_bytes =
-                static_cast<size_t>(logical_cols + row_pad) * sizeof(T);
-            for (int r = 0; r < rows; r++) {
-                std::memcpy(data_->data() +
-                                static_cast<size_t>(r) * logical_cols,
-                            static_cast<char *>(b->ptr) +
-                                static_cast<size_t>(r) * packed_stride_bytes,
-                            static_cast<size_t>(logical_cols) * sizeof(T));
+            if (packed_stride_bytes > max_chunk) {
+                // One padded row is already past the pool's per-transfer cap,
+                // and the compaction rewrites whole rows, so a chunk boundary
+                // cannot fall inside one. Refuse rather than silently returning
+                // stale data (which is what the pre-chunking code did).
+                throw std::runtime_error(
+                    "copyBufferToCPU: a " + std::to_string(packed_stride_bytes) +
+                    "-byte padded row exceeds the " +
+                    std::to_string(max_chunk) +
+                    "-byte staging limit; readback cannot be chunked on whole "
+                    "rows");
             }
-            // Padding is consumed; drop the marker so subsequent copies use
-            // the plain contiguous path.
+            const size_t rows_per_chunk =
+                std::max<size_t>(1, max_chunk / packed_stride_bytes);
+            step = rows_per_chunk * packed_stride_bytes;
+        }
+
+        for (size_t done = 0; done < copy_bytes; done += step) {
+            const size_t n = std::min(step, copy_bytes - done);
+            auto b = stpool->allocate(n);
+            if (!b) {
+                stpool->reset();
+                throw std::runtime_error(
+                    "copyBufferToCPU: staging allocation of " +
+                    std::to_string(n) + " bytes failed (chunk " +
+                    std::to_string(done) + " of " +
+                    std::to_string(copy_bytes) + ")");
+            }
+            cmd.begin();
+            buffer->copyBufferToStageBuffer(cmd.get(), b->buffer, b->offset,
+                                            n, offset + done);
+            cmd.end();
+            cmd.submit(dev->getComputeQueue());
+            // cmd.wait() is the wait this readback has always used, and it is
+            // not enough: it waits on THIS copy's own binary semaphore, which
+            // bounds this command buffer and says nothing about what the host
+            // may read. The submit above is ordered w.r.t. earlier submits by
+            // per-queue FIFO, but nothing fences the host memcpy at the end of
+            // this function against work the GPU is still executing -- on a
+            // single-queue device the drain above is skipped, so a small
+            // readback (a 64x64 fp16 tile, tens of microseconds of GPU) can
+            // finish on the host side before the copy lands, and read the
+            // staging bytes as they were. That is data-dependent: a wide fp16
+            // row gives the copy time to land before the host thread gets
+            // there, which is why this only bit the small shapes. Drain the
+            // queue, then the existing semaphore wait is redundant but
+            // harmless (it is already signalled).
+            dev->wait_all_done();
+            cmd.wait();
+            // Device->host visibility: the copy wrote through non-coherent
+            // cached memory (when the pool landed there); drop stale cache
+            // lines before the host reads.
+            stpool->invalidate(*b);
+            if (need_compact) {
+                const int first_row =
+                    static_cast<int>(done / packed_stride_bytes);
+                const int n_rows = static_cast<int>(n / packed_stride_bytes);
+                for (int r = 0; r < n_rows; ++r) {
+                    std::memcpy(
+                        data_->data() +
+                            static_cast<size_t>(first_row + r) * logical_cols,
+                        static_cast<char *>(b->ptr) +
+                            static_cast<size_t>(r) * packed_stride_bytes,
+                        static_cast<size_t>(logical_cols) * sizeof(T));
+                }
+            } else {
+                std::memcpy(reinterpret_cast<char *>(data_->data()) + done,
+                            b->ptr, n);
+            }
+            // Rewind the allocator WITHOUT shrinking the pool: the next chunk
+            // wants the same size again, and reset() would drop the buffer back
+            // to 16 MB and then re-grow (and rezero) it for every chunk.
+            stpool->reset_keep_size();
+        }
+        // Padding is consumed; drop the marker so subsequent copies use the
+        // plain contiguous path.
+        if (need_compact) {
             gpu_row_pad_ = 0;
-        } else {
-            std::memcpy(data_->data(), b->ptr, size_);
         }
-        if constexpr (std::is_same_v<T, uint16_t>) {
-            // diagnostic print silenced during LLM numerics debug
-        }
-        stpool->reset();
         toCPU();
     }
     void copyImageToCPU(const std::shared_ptr<VulkanCommandPool> &cmdpool) {

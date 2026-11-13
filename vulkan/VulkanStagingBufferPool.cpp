@@ -9,9 +9,6 @@ namespace vkop {
 
 namespace {
 constexpr int kInitialStagingBufferSize = 1024 * 1024 * 16; // 16MB initial
-// Large LLM weights (e.g. lm_head [151936,2048] fp16 = 594MB) are uploaded as
-// a single staging copy, so the cap must exceed the biggest initializer.
-constexpr int kMaxStagingBufferSize = 1024 * 1024 * 1024; // 1GB max
 constexpr int kGrowthFactor = 2;                          // Double when needed
 } // namespace
 
@@ -97,13 +94,18 @@ VulkanStagingBufferPool::allocate(size_t size, size_t alignment) {
     assert(size != 0);
 
     if (size > m_poolSize_) {
+        if (size > kMaxAllocation) {
+            // Too big for one staging range by contract: the caller has to
+            // chunk. Checked before the growth loop so an enormous request
+            // cannot overflow the doubling either.
+            LOG_ERROR("staging request %zu exceeds the %zu-byte per-transfer "
+                      "limit; caller must chunk\n",
+                      size, kMaxAllocation);
+            return std::nullopt;
+        }
         size_t new_size = kInitialStagingBufferSize;
         while (new_size < size) {
             new_size *= kGrowthFactor;
-        }
-        if (new_size > kMaxStagingBufferSize) {
-            LOG_ERROR("size too large %lu\n", size);
-            return std::nullopt;
         }
 
         if (!resizeBuffer(new_size)) {

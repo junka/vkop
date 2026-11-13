@@ -2300,7 +2300,8 @@ double Runtime::Run() {
                     bool is_fp32 = (t->dtype() == typeid(float));
                     if (!is_fp16 && !is_fp32)
                         continue;
-                    int ne = t->size() / (is_fp16 ? 2 : 4);
+                    int ne = static_cast<int>(t->size() /
+                                              (is_fp16 ? 2 : 4));
                     if (ne <= 0)
                         continue;
                     int nan_cnt = 0, inf_cnt = 0;
@@ -2347,11 +2348,12 @@ double Runtime::Run() {
                             bool ifp16 = (it->dtype() == typeid(uint16_t));
                             bool ifp32 = (it->dtype() == typeid(float));
                             if (!ifp16 && !ifp32) {
-                                std::printf("  in[%zu] ne=%d (non-fp)\n", ii,
+                                std::printf("  in[%zu] ne=%zu (non-fp)\n", ii,
                                             it->size());
                                 continue;
                             }
-                            int ine = it->size() / (ifp16 ? 2 : 4);
+                            int ine = static_cast<int>(it->size() /
+                                                       (ifp16 ? 2 : 4));
                             if (ine <= 0) {
                                 std::printf("  in[%zu] ne=0\n", ii);
                                 continue;
@@ -2600,7 +2602,7 @@ double Runtime::Run() {
                 bool f32 = (tt->dtype() == typeid(float));
                 if (!f16 && !f32)
                     return 0;
-                int ne = tt->size() / (f16 ? 2 : 4);
+                int ne = static_cast<int>(tt->size() / (f16 ? 2 : 4));
                 if (ne <= 0)
                     return 0;
                 if (f16) {
@@ -2666,7 +2668,8 @@ double Runtime::Run() {
                     bool is_fp32 = (t->dtype() == typeid(float));
                     if (!is_fp16 && !is_fp32)
                         continue;
-                    int ne = t->size() / (is_fp16 ? 2 : 4);
+                    int ne = static_cast<int>(t->size() /
+                                              (is_fp16 ? 2 : 4));
                     if (ne <= 0)
                         continue;
                     int nan_cnt = 0, inf_cnt = 0, zero_cnt = 0;
@@ -2773,7 +2776,8 @@ double Runtime::Run() {
                                             nm.c_str(), ii);
                                 continue;
                             }
-                            int ine = it->size() / (ifp16 ? 2 : 4);
+                            int ine = static_cast<int>(it->size() /
+                                                       (ifp16 ? 2 : 4));
                             std::printf(
                                 "[LTR] %s in[%zu] dtype=%s ne=%d: ", nm.c_str(),
                                 ii, ifp16 ? "f16" : "f32", ine);
@@ -2817,7 +2821,7 @@ double Runtime::Run() {
                             bool f16 = (tt->dtype() == typeid(uint16_t));
                             bool f32 = (tt->dtype() == typeid(float));
                             auto sh = tt->getShape();
-                            std::printf("[ROT]   %s dtype=%s size=%d shape=[",
+                            std::printf("[ROT]   %s dtype=%s size=%zu shape=[",
                                         tag,
                                         f16 ? "f16" : (f32 ? "f32" : "other"),
                                         tt->size());

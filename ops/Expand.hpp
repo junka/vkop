@@ -161,7 +161,7 @@ class Expand : public Operator {
                 using T = decltype(dummy);
                 auto shape_input = core::as_tensor<T>(inputs[1]);
                 shape_input->copyToCPU(m_cmdpool_);
-                auto num = shape_input->size();
+                auto num = static_cast<int>(shape_input->size());
                 out_shape.resize(num);
                 for (int i = 0; i < num; ++i) {
                     out_shape[i] = static_cast<int>(shape_input->data()[i]);

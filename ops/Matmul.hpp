@@ -2057,13 +2057,53 @@ class MatMulBuffer : public BufferFactory {
                 // [row][gx][column] fp32 partials, keeping the fold's Wd walk
                 // at a single float per (j, column) instead of re-summing ns
                 // words for every output column.
-                const size_t da_up_words =
-                    2 * static_cast<size_t>(batch) * m * da_gx * da_ks_n * 512;
-                const size_t da_dp_words =
-                    static_cast<size_t>(batch) * m * da_gx * da_ds * n;
+                // SwiGLU fold scratch. The size is linear in the row count,
+                // because both halves park one fp32 partial per (row, gx,
+                // slice) / (row, gx, column). At prefill lengths that linear
+                // term is enormous: 1250 rows, n_up=6144 (gx=12), ks_n=8 is
+                // 614 MB for ONE layer, and all 28 layers hold theirs at once
+                // -> 17 GB of a 20.8 GB UMA budget, on top of the weights.
+                // The allocation then fails inside VulkanBuffer and the
+                // failure used to be swallowed, leaving an unbound buffer and
+                // silently zero logits (argmax 0, "!" output, no error).
+                //
+                // Rows are therefore processed in bounded chunks below. Each
+                // chunk's A rows are bound as a view at the chunk's byte
+                // offset and M is set to the chunk length, so the shader's row
+                // addressing is unchanged; only the scratch shrinks to a
+                // chunk's worth. Chunks run back to back in one command buffer
+                // with an execution barrier between them (they share the
+                // scratch), so a round still submits once.
+                // Row chunk size. VKOP_DA_MAX_ROWS raises it for an A/B
+                // against the unchunked path (the two must agree bit for bit,
+                // since a chunk only changes which rows share one scratch
+                // pass); a very large value restores the old single pass.
+                //
+                // Each chunk needs its own descriptor set (see
+                // down_act_chunk_ds_), and the descriptor-buffer build has
+                // only kInflight*16 slots per pipeline, so the chunk count is
+                // capped: the size is grown until the count fits. Measured
+                // exactly: 1250 rows at n_up=6144 needs 10 chunks of 128, and
+                // 1250/32 = 40 chunks exhausted the pool.
+                int da_rows = 128; // 128 rows -> ~63 MB at n_up=6144
+                if (const char *e = std::getenv("VKOP_DA_MAX_ROWS")) {
+                    const int v = std::atoi(e);
+                    if (v > 0) da_rows = v;
+                }
+                const int total_rows = batch * m;
+                constexpr int kDaMaxChunks = 16;
+                while (da_rows < total_rows &&
+                       (total_rows + da_rows - 1) / da_rows > kDaMaxChunks) {
+                    da_rows *= 2;
+                }
+                const int m_chunk = std::min(total_rows, da_rows);
+                const size_t da_up_words = 2 * static_cast<size_t>(m_chunk) *
+                                           da_gx * da_ks_n * 512;
+                const size_t da_dp_words = static_cast<size_t>(m_chunk) *
+                                           da_gx * da_ds * n;
                 const size_t da_words =
                     static_cast<size_t>(da_hdr) + da_up_words + da_dp_words;
-                if (!scratch_da_ || scratch_da_bytes_ != da_words) {
+                if (!scratch_da_ || scratch_da_bytes_ < da_words) {
                     // HOST_COHERENT, not DEVICE_LOCAL: the slice table is
                     // written through the mapping below at RECORD time (a cached
                     // replay round re-runs the recorded dispatches without
@@ -2110,7 +2150,8 @@ class MatMulBuffer : public BufferFactory {
                 // Binding 0 is the reduce pass's output; binding 3 is the
                 // scratch the three passes share. The passes share the module,
                 // so both bindings are always live and neither may double as
-                // the other.
+                // the other. Bindings 1 (x) and 0 (output) are re-pointed per
+                // row chunk inside the loop below.
                 objs_[0] = std::static_pointer_cast<VulkanResource>(
                     outputs[0]->gpu_buffer());
                 objs_[1] = std::static_pointer_cast<VulkanResource>(
@@ -2160,17 +2201,46 @@ class MatMulBuffer : public BufferFactory {
                 // stages the table with vkCmdUpdateBuffer before the first
                 // dispatch; the three passes share it, exactly like they share
                 // the descriptor set.
+                //
+                // The BDA table stores whole-buffer device addresses, which
+                // cannot express a row-chunk offset. Chunking therefore runs on
+                // the descriptor path only; a shape that needs chunks keeps
+                // descriptors (VKOP_BDA is opt-in, and a chunked prefill pays
+                // one descriptor fill per chunk either way).
+                const bool da_chunked = total_rows > m_chunk;
+                // Element size of the activation and of the output: the fold
+                // runs fp16 only (the selector's down_act row requires it),
+                // so a chunk's byte offset is elems * 2.
+                const size_t da_elem = sizeof(uint16_t);
+                // Roots for the per-chunk sub-range views. Both are flat
+                // [batch*M, cols] buffers; a chunk's view starts at row0.
+                auto as_root = [](const std::shared_ptr<VulkanResource> &r)
+                    -> std::shared_ptr<VulkanBuffer> {
+                    if (!r) return nullptr;
+                    if (auto v = std::dynamic_pointer_cast<VulkanBufferView>(r))
+                        return v->getBuffer();
+                    return std::dynamic_pointer_cast<VulkanBuffer>(r);
+                };
+                auto a_root = as_root(objs_[1]);
+                auto o_root = as_root(objs_[0]);
+                // Restored after the loop: objs_ holds the op's bound buffers
+                // for lifetime/fingerprint purposes, and leaving a chunk's
+                // sub-range view there would outlive the dispatch it was made
+                // for.
+                const std::shared_ptr<VulkanResource> a_orig = objs_[1];
+                const std::shared_ptr<VulkanResource> o_orig = objs_[0];
                 VkDescriptorSet *da_bda_dset = nullptr;
                 VulkanPipeline *da_bda_pipe =
-                    down_act_bda_for(da_pipe, &da_bda_dset);
+                    da_chunked ? nullptr : down_act_bda_for(da_pipe, &da_bda_dset);
                 const bool da_bda =
                     da_bda_pipe && da_bda_dset && fill_down_act_table();
                 if (da_bda) {
                     bda_dispatched_ = true;
                 }
-                auto da_dispatch = [&](int gx, int gy, int gz) {
+                auto da_dispatch = [&](VkDescriptorSet chunk_set, int gx,
+                                       int gy, int gz) {
                     if (!da_bda) {
-                        ks_submit(da_pipe, da_dset[m_id_], gx, gy, gz);
+                        ks_submit(da_pipe, chunk_set, gx, gy, gz);
                         return;
                     }
                     m_cmd_->bind(*da_bda_pipe, *da_bda_dset);
@@ -2179,24 +2249,119 @@ class MatMulBuffer : public BufferFactory {
                                            &para_);
                     dispatch_and_record(gx, gy, gz, &para_);
                 };
-                da_dispatch(da_gx, batch * ((m + 15) / 16),
-                            da_wide_ok ? 1 : da_ks_n);
-                // Down: sums the deposit's slice partials per (row, j) into
-                // shared, walks the sub-block's Wd j-slice for every output
-                // column, parks fp32 down partials keyed (row, gx*ds+z, c).
-                // Grid z splits the j contraction into da_ds sub-blocks.
-                // Reading another dispatch's SSBO stores needs an execution
-                // dependency between the two.
-                scratch_da_->shaderWriteBarrier(m_cmd_->get());
-                para_.ks_part = 1; // the module's down entry
-                para_.tile = da_ds;
-                da_dispatch(da_gx, batch * ((m + 15) / 16), da_ds);
-                // Reduce: sums the GX * da_ds down partials and packs fp16.
-                // tile still carries da_ds for the dp stride. Reading what
-                // the down pass wrote needs another dependency.
-                scratch_da_->shaderWriteBarrier(m_cmd_->get());
-                para_.ks_part = 2; // the module's reduce entry
-                da_dispatch(UP_DIV(n, 2048), batch * m, 1);
+                // Rows are processed in chunks so the three passes' scratch
+                // stays bounded (see the sizing comment above). A chunk is a
+                // contiguous run of the flattened [batch*M, K_out] activation
+                // and of the flattened [batch*M, N] output, so binding each as
+                // a sub-range view at the chunk's byte offset and dispatching
+                // with batch=1 leaves every index expression in the shader
+                // correct: with batch==1 b_n is always 0, and the in-view row
+                // is the global row's offset from the chunk start.
+                const int real_batch = batch;
+                int chunk_idx = 0;
+                for (int row0 = 0; row0 < total_rows; row0 += da_rows, ++chunk_idx) {
+                    const int chunk_m = std::min(da_rows, total_rows - row0);
+                    para_.C = 1;
+                    para_.M = chunk_m;
+                    const bool chunk_wide = (chunk_m == 1) && da_wide_ok;
+                    // The set this chunk dispatches through. Unchunked runs
+                    // keep the op's per-inflight set, which is what the replay
+                    // fingerprint expects; chunked runs give every chunk its
+                    // own set so the recorded dispatches do not all end up
+                    // reading the last chunk's bindings.
+                    VkDescriptorSet chunk_set = da_dset[m_id_];
+                    if (da_chunked && !da_bda) {
+                        // Borrowed sub-range views of the root buffers: the
+                        // descriptor binds the parent's VkBuffer at this byte
+                        // offset, so the shader's element 0 is the chunk's
+                        // first row with no push-constant change.
+                        const VkDeviceSize k_bytes =
+                            static_cast<VkDeviceSize>(chunk_m) *
+                            static_cast<VkDeviceSize>(k_out) * da_elem;
+                        const VkDeviceSize k_off =
+                            static_cast<VkDeviceSize>(row0) *
+                            static_cast<VkDeviceSize>(k_out) * da_elem;
+                        const VkDeviceSize o_bytes =
+                            static_cast<VkDeviceSize>(chunk_m) *
+                            static_cast<VkDeviceSize>(n) * da_elem;
+                        const VkDeviceSize o_off =
+                            static_cast<VkDeviceSize>(row0) *
+                            static_cast<VkDeviceSize>(n) * da_elem;
+                        objs_[1] = std::make_shared<VulkanBuffer>(
+                            a_root, k_off, k_bytes);
+                        objs_[0] = std::make_shared<VulkanBuffer>(
+                            o_root, o_off, o_bytes);
+                        // Keep both views alive: the descriptors must stay
+                        // valid until the command buffer is submitted.
+                        if (down_act_chunk_views_.size() <=
+                            static_cast<size_t>(2 * chunk_idx + 1)) {
+                            down_act_chunk_views_.resize(2 * chunk_idx + 2);
+                        }
+                        down_act_chunk_views_[2 * chunk_idx] = objs_[1];
+                        down_act_chunk_views_[2 * chunk_idx + 1] = objs_[0];
+                        // One set per chunk, allocated once and then reused
+                        // across rounds (the shapes and therefore the chunk
+                        // count are stable within a phase). Chunking only
+                        // happens for total_rows > 128, i.e. m > 1, so this is
+                        // always the multi-row module; re-allocate if the pool
+                        // was built for a different pipeline (a phase change
+                        // between the M==1 and M>1 modules).
+                        if (down_act_chunk_ds_pipe_ != da_pipe) {
+                            down_act_chunk_ds_.clear();
+                            down_act_chunk_ds_pipe_ = da_pipe;
+                        }
+                        while (down_act_chunk_ds_.size() <=
+                               static_cast<size_t>(chunk_idx)) {
+                            down_act_chunk_ds_.push_back(
+                                da_pipe->allocDescriptorSets());
+                        }
+                        chunk_set = down_act_chunk_ds_[chunk_idx];
+                    }
+                    const int chunk_tiles = (chunk_m + 15) / 16;
+                    // Deposit: grid-x over the up-axis blocks, grid-y over the
+                    // 16-row tiles, grid-z over the K slices -- except when
+                    // the shader takes the wide deposit at M==1 (it maps the
+                    // slices into the block's lanes, lane/64, and needs
+                    // grid-z = 1). The host mirrors the shader's wide gate
+                    // exactly (uPC.M == 1, K % 8 == 0, ks_n <= 8,
+                    // 512 % ks_n == 0, byte and half forms alike): a shape
+                    // that fails it must dispatch all ks_n slices, or the
+                    // scalar form writes only slice 0 and the down pass sums
+                    // stale slots into h.
+                    para_.ks_part = 0;
+                    para_.tile = 0;
+                    da_dispatch(chunk_set, da_gx, chunk_tiles,
+                                chunk_wide ? 1 : da_ks_n);
+                    // Down: sums the deposit's slice partials per (row, j)
+                    // into shared, walks the sub-block's Wd j-slice for every
+                    // output column, parks fp32 down partials keyed
+                    // (row, gx*ds+z, c). Grid z splits the j contraction into
+                    // da_ds sub-blocks. Reading another dispatch's SSBO stores
+                    // needs an execution dependency between the two.
+                    scratch_da_->shaderWriteBarrier(m_cmd_->get());
+                    para_.ks_part = 1; // the module's down entry
+                    para_.tile = da_ds;
+                    da_dispatch(chunk_set, da_gx, chunk_tiles, da_ds);
+                    // Reduce: sums the GX * da_ds down partials and packs fp16.
+                    // tile still carries da_ds for the dp stride. Reading what
+                    // the down pass wrote needs another dependency.
+                    scratch_da_->shaderWriteBarrier(m_cmd_->get());
+                    para_.ks_part = 2; // the module's reduce entry
+                    da_dispatch(chunk_set, UP_DIV(n, 2048), chunk_m, 1);
+                    if (row0 + chunk_m < total_rows) {
+                        // The next chunk reuses the same scratch, so its first
+                        // pass must not start before this chunk's reads of it
+                        // finished.
+                        scratch_da_->shaderWriteBarrier(m_cmd_->get());
+                    }
+                }
+                // Restore the real shape and the op's own bindings for
+                // anything recorded after this node (the replay fingerprint,
+                // and the next execute of this op).
+                objs_[0] = o_orig;
+                objs_[1] = a_orig;
+                para_.M = m;
+                para_.C = real_batch;
                 return;
             }
         }
@@ -3350,6 +3515,18 @@ class MatMulBuffer : public BufferFactory {
     std::unique_ptr<VulkanPipeline> down_act_multi_pipeline_;
     VkDescriptorSet down_act_multi_ds_[vkop::kInflight] = {nullptr};
     bool down_act_multi_no_bytes_ = false;
+    // One descriptor set per row chunk of the M>1 fold. A chunk binds a
+    // DIFFERENT sub-range view of x and of the output, and a descriptor set is
+    // read by the GPU at submit time, not at record time — updating one set
+    // between chunks would make every recorded dispatch read the LAST chunk's
+    // bindings. (Measured: results changed with the chunk size, which is the
+    // signature of exactly that.) Grow-only, indexed by chunk number.
+    std::vector<VkDescriptorSet> down_act_chunk_ds_;
+    // Keeps each chunk's borrowed views alive until the command buffer that
+    // references them is submitted.
+    std::vector<std::shared_ptr<VulkanResource>> down_act_chunk_views_;
+    // The pipeline the chunk sets were allocated from (see above).
+    VulkanPipeline *down_act_chunk_ds_pipe_ = nullptr;
     bool down_act_ = false;
     std::vector<VkWriteDescriptorSet> ds_writes_;
     bool transB_ = false; // B laid out as [batch, N, K] (folded Transpose)

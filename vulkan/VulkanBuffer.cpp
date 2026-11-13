@@ -27,9 +27,27 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDevice> &vdev,
     vkGetBufferMemoryRequirements(m_vdev_->getLogicalDevice(), m_buffer_,
                                   &mem_requirements);
 #endif
-    allocMemory(mem_requirements, requireProperties, ext_fd,
-                /*allow_buffer_device_address=*/true);
-    vkBindBufferMemory(m_vdev_->getLogicalDevice(), m_buffer_, getMemory(), 0);
+    // Both of these can fail -- most commonly VK_ERROR_OUT_OF_DEVICE_MEMORY on
+    // a UMA device once the resident set approaches the shared heap. Ignoring
+    // the result leaves a bound-less VkBuffer behind: every later access reads
+    // undefined bytes, which shows up as silently zeroed outputs rather than as
+    // an error. Fail loudly instead, with the size that did not fit.
+    if (!allocMemory(mem_requirements, requireProperties, ext_fd,
+                     /*allow_buffer_device_address=*/true)) {
+        throw std::runtime_error(
+            "vkop: vkAllocateMemory failed for a " +
+            std::to_string(mem_requirements.size) + "-byte buffer (usage=" +
+            std::to_string(usage) + ", requiredFlags=" +
+            std::to_string(requireProperties) + ")");
+    }
+    const VkResult bind_ret = vkBindBufferMemory(
+        m_vdev_->getLogicalDevice(), m_buffer_, getMemory(), 0);
+    if (bind_ret != VK_SUCCESS) {
+        throw std::runtime_error(
+            "vkop: vkBindBufferMemory failed (vkret=" +
+            std::to_string(bind_ret) + ") for a " +
+            std::to_string(mem_requirements.size) + "-byte buffer");
+    }
 #else
     (void)ext_fd;
 #endif
