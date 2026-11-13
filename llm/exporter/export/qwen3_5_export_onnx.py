@@ -133,11 +133,19 @@ def fold_zero_centered_norms(module):
         eps = m.eps
 
         def fwd(self, x):
+            # ORDER MATTERS for the converter. `fuse_rms_norm` matches
+            #   Cast -> Pow -> ReduceMean -> Add -> Sqrt -> Div -> Mul
+            #        -> Cast -> Mul(weight)
+            # i.e. the normalization casts back to the activation dtype BEFORE
+            # the weight multiply (HF Qwen3RMSNorm's
+            # `self.weight * hidden_states.to(input_dtype)`). HF's Qwen3_5
+            # multiply-then-cast order produces `Mul -> Cast` and the pattern
+            # never matches -- measured: 0 of 14 fused, which left every
+            # RMSNorm as a 9-op fp32 island and starved the fp16 domain.
             xf = x.float()
             var = xf.pow(2).mean(-1, keepdim=True)
             xf = xf * torch.rsqrt(var + eps)
-            xf = xf * self.weight.float()      # 权重里已经是 1 + w
-            return xf.type_as(x)
+            return self.weight * xf.to(x.dtype)  # weight already holds 1 + w
 
         return types.MethodType(fwd, m)
 

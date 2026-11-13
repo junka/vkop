@@ -86,6 +86,13 @@ _STATE_SLOTS = {
 # but the view's output is still a state and must stay FP32.
 _STATE_NAME_PREFIXES = ("conv_state", "recurrent_state")
 
+# Ops whose SHADER reads each operand at that operand's own width, so a mixed
+# operand set is supported rather than a corruption. FusedElemwise exists
+# precisely to straddle a Cast: its program carries a per-input fp16 flag
+# (shaders/buffer/fused_elemwise.comp's load helpers) and the build dtype
+# follows the terminal OUTPUT, not input[0] (core/runtime.cpp's op_shader_fp16).
+_MIXED_WIDTH_OPS = {"FusedElemwise"}
+
 # Largest finite half. Past this a value rounds to Inf, and the fp16 kernels
 # have no saturation path -- the reference exporter does the same and calls it
 # a lossy conversion.
@@ -197,6 +204,20 @@ class GraphFp16:
             node.name: {e["name"] for e in list(node.inputs) + list(node.outputs)
                         if e.get("name") in candidates}
             for node in dag_model.nodes.values()}
+        # A linear-attention op's state tensors are fp32 by design, so they must
+        # not be in any propagation group: a group is "one shader over all of
+        # these", and a state in it would drag the data tensors to FP32 (or the
+        # state to FP16) whichever way the queue went.
+        for node in dag_model.nodes.values():
+            slots = _STATE_SLOTS.get(node.op_type)
+            if slots is None:
+                continue
+            in_idx, out_idx = slots
+            names = {node.inputs[i].get("name") for i in in_idx
+                     if i < len(node.inputs)}
+            names |= {node.outputs[i].get("name") for i in out_idx
+                      if i < len(node.outputs)}
+            group_of[node.name] -= names
         touched: Dict[str, List[str]] = {}
         for node_name, group in group_of.items():
             for name in group:
@@ -248,6 +269,16 @@ class GraphFp16:
                     else f"{node.op_type}: no dual FP16 buffer build")
                 force(group, blockers[node.name])
 
+        # Ops whose operands are independent widths: a forced input says
+        # nothing about the others, so it must not propagate.
+        #   FusedElemwise  -- exists to straddle a Cast; the shader reads each
+        #                     operand at that operand's own width and the build
+        #                     follows the terminal output.
+        #   the two qwen3_5 ops -- data follows the dtype, state is always fp32.
+        # Without this, one fp32 Cast anywhere upstream swept the whole
+        # downstream chain to FP32 and the fp16 domain collapsed (measured:
+        # 10 of 66 tensors, 0 Cast-to-fp16 in the graph).
+        independent = _MIXED_WIDTH_OPS | set(_STATE_SLOTS)
         while queue:
             name = queue.pop()
             for node_name in touched.get(name, ()):
@@ -255,6 +286,23 @@ class GraphFp16:
                 if node.op_type == "Cast":
                     # The boundary node: it may read either domain, and its
                     # output was already decided by `to` above.
+                    continue
+                if node.op_type in independent:
+                    blockers.setdefault(
+                        node_name,
+                        f"{node.op_type}: operands are independent widths")
+                    # ...but the state slots of the qwen3_5 ops are fp32 by
+                    # contract, so they are held there explicitly rather than
+                    # left to the (now stopped) propagation.
+                    slots = _STATE_SLOTS.get(node.op_type)
+                    if slots is not None:
+                        in_idx, out_idx = slots
+                        force({node.inputs[i].get("name") for i in in_idx
+                               if i < len(node.inputs)},
+                              f"{node.op_type}: state is fp32 by design")
+                        force({node.outputs[i].get("name") for i in out_idx
+                               if i < len(node.outputs)},
+                              f"{node.op_type}: state is fp32 by design")
                     continue
                 blockers.setdefault(
                     node_name, f"{node.op_type} runs FP32: it touches '{name}'")
@@ -278,7 +326,7 @@ class GraphFp16:
         """
         out = []
         for node in dag_model.nodes.values():
-            if node.op_type == "Cast":
+            if node.op_type == "Cast" or node.op_type in _MIXED_WIDTH_OPS:
                 continue
             # The state slots of the qwen3_5 linear-attention ops are SUPPOSED
             # to be the other width from their data tensors; see _STATE_SLOTS.

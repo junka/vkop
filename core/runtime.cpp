@@ -1687,6 +1687,18 @@ void Runtime::LoadModel() {
                 type == vkop::ops::OpType::DEQUANTIZE_LINEAR) {
                 continue;
             }
+            // The qwen3_5 ops take TWO widths on purpose: their data output
+            // follows the data input while the state output is fp32 in every
+            // build (the recurrence accumulates in fp32; a half state drifts).
+            // This fixup exists for ops with ONE float output whose width the
+            // graph cannot state, and applying it here rewrote the fp32 state
+            // to fp16 -- which is why the op then threw "state_out is not an
+            // fp32 tensor" even though the .vkopbin declared float32.
+            // The file's own declaration is authoritative for these.
+            if (type == vkop::ops::OpType::CONV1D ||
+                type == vkop::ops::OpType::LINEAR_ATTENTION) {
+                continue;
+            }
             if (i >= node_input_tensors_.size() ||
                 node_input_tensors_[i].empty() ||
                 node_input_tensors_[i][0] == nullptr) {

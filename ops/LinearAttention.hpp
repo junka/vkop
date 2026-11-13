@@ -91,15 +91,17 @@ class LinearAttentionBuffer : public BufferFactory {
                 "LinearAttention: batch must be 1 (got " +
                 std::to_string(q_shape[0]) + ")");
         }
+        // rank 4 is [B,S,H,D]; rank 3 is [H,S,D] -- the layouts differ in the
+        // ORDER of the first two axes, not just in a missing leading one.
         const int kv_heads = q_shape[rank4 ? 2 : 0];
-        const int seq = q_shape[rank4 ? 1 : 0];
+        const int seq = q_shape[rank4 ? 1 : 1];
         const int dk = q_shape[rank4 ? 3 : 2];
         const auto v_shape = inputs[2]->getShape();
-        if (v_shape.size() != q_shape.size() || v_shape[rank4 ? 1 : 0] != seq) {
+        if (v_shape.size() != q_shape.size() || v_shape[1] != seq) {
             throw std::runtime_error(
                 "LinearAttention: v must be [B,S,Hv,Dv] matching q's S");
         }
-        const int heads = v_shape[rank4 ? 2 : 1];
+        const int heads = v_shape[rank4 ? 2 : 0];
         const int dv = v_shape[rank4 ? 3 : 2];
         if (dk <= 0 || dv <= 0 || heads <= 0 || kv_heads <= 0 || seq <= 0) {
             throw std::runtime_error("LinearAttention: empty extent");
@@ -174,7 +176,13 @@ class LinearAttentionBuffer : public BufferFactory {
             auto so = core::as_tensor<float>(outputs[1]);
             if (!so) {
                 throw std::runtime_error(
-                    "LinearAttention: state_out is not an fp32 tensor");
+                    std::string("LinearAttention: state_out is not an fp32 "
+                                "tensor (got ") +
+                    outputs[1]->dtype().name() + ", kind " +
+                    std::to_string(static_cast<int>(outputs[1]->elem_kind())) +
+                    ", file said conv_state_out/recurrent_state_out fp32, "
+                    "rank=" + std::to_string(outputs[1]->getShape().size()) +
+                    ")");
             }
             if (so->num_elements() != heads * dk * dv) {
                 so->resize(s_shape);
