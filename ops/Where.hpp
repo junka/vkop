@@ -151,6 +151,10 @@ class Where : public Operator {
     // recording is self-contained, so a repeat makes it still exactly right;
     // refresh_dynamic_params() redoes the host-visible half a replay skips.
     bool where_result_changed_ = true;
+    // Whether the last int64 execute() took the GPU dispatch; the replay
+    // predicates and refresh_dynamic_params key on it (the CPU path has host
+    // state a replay would skip, the GPU path has none).
+    bool int64_gpu_taken_ = false;
     std::vector<int64_t> cached_w_out_;
     std::vector<int> cached_w_shape_;
     void invalidate_shape_cache() override {
@@ -159,14 +163,23 @@ class Where : public Operator {
         where_result_changed_ = true;
     }
     bool recording_changes_per_round() const override {
-        return where_result_changed_;
+        // The GPU path is a plain dispatch over stable buffer handles, so its
+        // recording is round-invariant by construction. where_result_changed_
+        // is written ONLY by cpuWhereInt64, so on the GPU path it keeps its
+        // initial `true` and would pin the segment forever.
+        return !int64_gpu_taken_ && where_result_changed_;
     }
     bool did_host_work_last_round() const override {
-        return where_result_changed_;
+        return !int64_gpu_taken_ && where_result_changed_;
     }
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // GPU path: the replayed dispatch rewrites the output buffer itself, so
+        // there is no host copy to restore -- and cached_w_out_ is only ever
+        // filled by cpuWhereInt64, so restoring from it would publish stale or
+        // empty bytes.
+        if (int64_gpu_taken_) return false;
         if (cached_w_out_.empty() || outputs.empty() || !outputs[0]) {
             return false;
         }
@@ -240,11 +253,13 @@ class Where : public Operator {
         // Expand chain never crosses GPU->CPU.
         if (inputs[0]->dtype() == typeid(int64_t)) {
             if (host_shape_enabled()) {
+                int64_gpu_taken_ = false;
                 cpuWhereInt64(inputs, outputs, out_shape);
                 return;
             }
             ensure_int64_pipeline();
             int64_mode_ = true;
+            int64_gpu_taken_ = true;
 
             // Output SSBO (int64 as ivec2 — 8 bytes/elem, same stride).
             auto output = core::as_tensor<int64_t>(outputs[0]);

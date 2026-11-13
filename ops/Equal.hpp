@@ -71,14 +71,26 @@ class Equal : public BufferBinaryFactory {
     // recording is self-contained, so a repeat makes it still exactly right;
     // refresh_dynamic_params() redoes the host-visible half a replay skips.
     bool recording_changes_per_round() const override {
-        return equal_result_changed_;
+        // The GPU path is a plain dispatch: its recording bakes only buffer
+        // handles and the broadcast dims, both stable, so it is replayable by
+        // construction. `equal_result_changed_` is written ONLY by
+        // cpuEqualInt64, so on the GPU path it keeps its initial `true` and
+        // would pin the segment forever.
+        return !int64_gpu_taken_ && equal_result_changed_;
     }
     bool did_host_work_last_round() const override {
-        return equal_result_changed_;
+        return !int64_gpu_taken_ && equal_result_changed_;
     }
     bool refresh_dynamic_params(
         const std::vector<std::shared_ptr<core::ITensor>> & /*inputs*/,
         const std::vector<std::shared_ptr<core::ITensor>> &outputs) override {
+        // GPU path: the replayed dispatch re-runs the shader, which rewrites
+        // the output buffer itself. There is no host copy to restore — and
+        // restoring one would be actively wrong: cached_out_ is only ever
+        // filled by cpuEqualInt64, so on this path it is stale or empty, and
+        // filling from it publishes garbage (measured: the decode loop froze
+        // on one token).
+        if (int64_gpu_taken_) return false;
         if (cached_out_.empty() || outputs.empty() || !outputs[0]) return false;
         if (outputs[0]->dtype() != typeid(int64_t)) return false;
         auto output = core::as_tensor<int64_t>(outputs[0]);
@@ -126,6 +138,10 @@ class Equal : public BufferBinaryFactory {
         cached_shape_ = out_shape;
     }
     bool equal_result_changed_ = true;
+    // Whether the last int64 execute() took the GPU dispatch. The two replay
+    // predicates and refresh_dynamic_params all key on it: the GPU path has no
+    // host state to reason about, while the CPU path does.
+    bool int64_gpu_taken_ = false;
     std::vector<int64_t> cached_out_;
     std::vector<int> cached_shape_;
     void invalidate_shape_cache() override {
@@ -157,11 +173,13 @@ class Equal : public BufferBinaryFactory {
         // optimization aims to remove by also GPU-ifying Where.)
         if (inputs[0]->dtype() == typeid(int64_t)) {
             if (host_shape_enabled()) {
+                int64_gpu_taken_ = false;
                 cpuEqualInt64(inputs, outputs);
                 return;
             }
             ensure_int64_pipeline();
             int64_mode_ = true;
+            int64_gpu_taken_ = true;
 
             // Output SSBO (int64 as ivec2 — 8 bytes/elem, same stride).
             auto output = core::as_tensor<int64_t>(outputs[0]);
