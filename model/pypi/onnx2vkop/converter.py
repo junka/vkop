@@ -1030,8 +1030,10 @@ class ModelConverter:
         from .host_shape import extract_host_shape_expressions
         hs = extract_host_shape_expressions(dag_model)
         if hs["converted"]:
-            print(f"[host_shape] {hs['converted']}/{hs['reshapes']} Reshape "
-                  f"target shapes extracted to host expressions")
+            detail = " ".join(f"{k}={v}" for k, v in
+                              sorted(hs.get("per_op", {}).items()))
+            print(f"[host_shape] {hs['converted']}/{hs['candidates']} target "
+                  f"shapes extracted to host expressions ({detail})")
             # 重跑本次提取前 optimizer 循环已消耗过一次 prune
             # （_prune_materialize_done 守卫会把 save_to_binary 里的再调用
             # 变成空操作）——重置守卫，让孤儿化的形状链在写盘前被剪掉。

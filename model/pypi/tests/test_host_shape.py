@@ -93,7 +93,7 @@ def build_model():
 def test_extracts_and_rewrites():
     m = build_model()
     stats = extract_host_shape_expressions(m)
-    assert stats["reshapes"] == 4, stats
+    assert stats["candidates"] == 4, stats
     assert stats["converted"] == 3, stats
 
     r0 = m.nodes["R0"]
@@ -270,3 +270,140 @@ def test_real_llm_pipeline_conversion_count():
     # majority to still convert (the whole point is orphaning the chain).
     assert n_conv >= n_rs * 0.9, (n_conv, n_rs)
     return True
+
+
+def test_expand_target_is_extracted():
+    """Expand's target is the same kind of dimension-only vector as Reshape's,
+    and extracting it is what removes the decode graph's last mid-round GPU
+    readback (a readback splits a packed replay segment and desynchronises the
+    segment-ordinal -> level mapping)."""
+    m = DAGBasedModel()
+    m.inputs = [tdict("x", [1, -1, 2048], dtype=1)]
+    init(m, "c2048", [2048])
+    init(m, "i0", [0])
+
+    sx = add_node(m, Node("Shape", "Sx", {}, [tdict("x", None)],
+                          [tdict("sx", [3])]))
+    # Gather(Shape(x), 0) -> [1]; Unsqueeze -> [1,1]; Concat with c2048
+    g = add_node(m, Node("Gather", "G", {"axis": 0},
+                         [tdict("sx", None), tdict("i0", None)],
+                         [tdict("g", [1])]))
+    u = add_node(m, Node("Unsqueeze", "U", {"axes": [0]},
+                         [tdict("g", None)], [tdict("u", [1, 1])]))
+    c = add_node(m, Node("Concat", "C", {"axis": 0},
+                         [tdict("u", None), tdict("c2048", None)],
+                         [tdict("t", [2])]))
+    e = add_node(m, Node("Expand", "E", {},
+                         [tdict("dx", None), tdict("t", None)],
+                         [tdict("e_out", None, dtype=1)]))
+
+    stats = extract_host_shape_expressions(m)
+    assert stats["converted"] == 1, stats
+    assert stats["per_op"].get("Expand") == 1, stats
+    # Reshape-style single-input form, target encoded as constants.
+    assert len(e.inputs) == 1, e.inputs
+    # Gather(Shape(x), 0) is x's seq dim at run time, not a constant.
+    assert e.attributes[HOST_SHAPE_ATTR] == "i0:x,c2048", e.attributes
+
+
+def test_where_negone_guard_folds_to_the_dim():
+    """The LM head builds its target as Where(x == -1, 1, x) where x is
+    [d0, dim]: the -1 sentinel is replaced by 1 so a dim cannot be mistaken
+    for "infer me". A tensor dim is never negative, so `dim == -1` is
+    statically FALSE and the select must fold to the plain dim vector --
+    with no Where, Equal, ConstantOfShape or Mul left in the chain."""
+    import numpy as np
+
+    m = DAGBasedModel()
+    m.inputs = [tdict("x", [1, -1, 2048], dtype=1)]
+    # r = [ref, -1] as an int64 initializer-driven Concat over Shape.
+    init(m, "m1", [-1])
+    init(m, "i0", [0])
+    init(m, "i2", [2])
+
+    sx = add_node(m, Node("Shape", "Sx", {}, [tdict("x", None)],
+                          [tdict("sx", [3])]))
+    g = add_node(m, Node("Gather", "G", {"axis": 0},
+                         [tdict("sx", None), tdict("i2", None)],
+                         [tdict("g", [1])]))
+    u = add_node(m, Node("Unsqueeze", "U", {"axes": [0]},
+                         [tdict("g", None)], [tdict("u", [1, 1])]))
+    r = add_node(m, Node("Concat", "R", {"axis": 0},
+                         [tdict("m1", None), tdict("u", None)],
+                         [tdict("rv", [2])]))
+    # ConstantOfShape(Shape(rv)) with fill 1 -> [1, 1]
+    sr = add_node(m, Node("Shape", "Sr", {}, [tdict("rv", None)],
+                          [tdict("srv", [2])]))
+    cos = add_node(m, Node("ConstantOfShape", "COS", {"value": np.array([1], dtype=np.int64)},
+                           [tdict("srv", None)], [tdict("cos", [2])]))
+    mul = add_node(m, Node("Mul", "M", {},
+                           [tdict("cos", None), tdict("m1", None)],
+                           [tdict("mul", [2])]))
+    eq = add_node(m, Node("Equal", "EQ", {},
+                          [tdict("rv", None), tdict("mul", None)],
+                          [tdict("eq", [2])]))
+    wh = add_node(m, Node("Where", "W", {},
+                          [tdict("eq", None), tdict("cos", None),
+                           tdict("rv", None)],
+                          [tdict("w", [2])]))
+    rs = add_node(m, Node("Reshape", "RS", {},
+                          [tdict("dx", None), tdict("w", None)],
+                          [tdict("rs_out", None, dtype=1)]))
+
+    stats = extract_host_shape_expressions(m)
+    assert stats["converted"] == 1, stats
+    # rv is [-1, dim2]. Equal(rv, [-1, -1]) is [True, False] -- the first
+    # element really is -1, the second is a live dim (never negative) -- so
+    # Where picks the guard's 1 and the dim. The whole Equal/Where/
+    # ConstantOfShape/Mul select collapses to that pair; no chain op survives.
+    assert rs.attributes[HOST_SHAPE_ATTR] == "c1,i2:x", rs.attributes
+
+
+def test_where_with_runtime_condition_bails():
+    """A Where whose condition is a live dim cannot be decided on the host, so
+    the node must keep its two-input form (fail closed) rather than pick a
+    branch."""
+    m = DAGBasedModel()
+    m.inputs = [tdict("x", [1, -1, 2048], dtype=1)]
+    init(m, "i1", [1])
+    init(m, "i2", [2])
+
+    sx = add_node(m, Node("Shape", "Sx", {}, [tdict("x", None)],
+                          [tdict("sx", [3])]))
+    wh = add_node(m, Node("Where", "W", {},
+                          [tdict("sx", None), tdict("i1", None),
+                           tdict("i2", None)],
+                          [tdict("w", [3])]))
+    rs = add_node(m, Node("Reshape", "RS", {},
+                          [tdict("dx", None), tdict("w", None)],
+                          [tdict("rs_out", None, dtype=1)]))
+
+    stats = extract_host_shape_expressions(m)
+    assert stats["converted"] == 0, stats
+    assert len(rs.inputs) == 2, rs.inputs
+
+
+def test_mul_by_live_dim_bails():
+    """`dim * 2` is not expressible as (constant | dim-of-tensor), so the
+    chain must fail closed instead of silently emitting the bare dim."""
+    m = DAGBasedModel()
+    m.inputs = [tdict("x", [1, -1, 2048], dtype=1)]
+    init(m, "i0", [0])
+    init(m, "two", [-1])
+    init(m, "m1", [-1])
+
+    sx = add_node(m, Node("Shape", "Sx", {}, [tdict("x", None)],
+                          [tdict("sx", [3])]))
+    g = add_node(m, Node("Gather", "G", {"axis": 0},
+                         [tdict("sx", None), tdict("i0", None)],
+                         [tdict("g", [1])]))
+    mul = add_node(m, Node("Mul", "M", {},
+                           [tdict("g", None), tdict("two", None)],
+                           [tdict("mul", [1])]))
+    rs = add_node(m, Node("Reshape", "RS", {},
+                          [tdict("dx", None), tdict("mul", None)],
+                          [tdict("rs_out", None, dtype=1)]))
+
+    stats = extract_host_shape_expressions(m)
+    assert stats["converted"] == 0, stats
+    assert len(rs.inputs) == 2, rs.inputs

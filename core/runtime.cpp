@@ -1575,7 +1575,13 @@ void Runtime::LoadModel() {
             // eval_host_target_shape) because a REF tensor's dims are only
             // final once its producer has executed.
             std::vector<HostShapeTerm> host_terms;
-            if (type == vkop::ops::OpType::RESHAPE) {
+            // Ops whose runtime implementation consumes set_host_target_shape.
+            // Reshape was the original (and only) consumer; Expand joined when
+            // its own target chain turned out to be dimension-only too, which
+            // is what removes the last mid-round readback from the decode
+            // graph (see the converter's host_shape pass).
+            if (type == vkop::ops::OpType::RESHAPE ||
+                type == vkop::ops::OpType::EXPAND) {
                 auto hs = n.attributes.find("vkop_host_shape");
                 if (hs != n.attributes.end() && !hs->second.empty()) {
                     size_t pos = 0;
@@ -3125,6 +3131,14 @@ double Runtime::Run() {
     std::shared_ptr<VulkanCommandBuffer> graph_seg; // the open segment, or null
     size_t graph_next_seg = 0;  // next free slot in graph_cmds_
     size_t graph_seg_start = 0; // level_idx the open segment started at
+    // level_idx the Runtime is currently executing. The readback hook needs it
+    // because a readback SPLITS a segment mid-level: the piece after the split
+    // belongs to the same level, and if it were opened at graph_seg_start the
+    // next round's planned range for that ordinal would not describe what the
+    // recording actually covers (measured: with VKOP_SEG_PACK>1 the split made
+    // every later ordinal's recording lag its plan, the replay round replayed
+    // the wrong levels, and decode froze at one token).
+    size_t graph_cur_level = 0;
     uint64_t graph_prev_val = 0;
     VkSemaphore graph_prev_sem = VK_NULL_HANDLE;
     int graph_op_idx = -1;   // node currently inside onExecute
@@ -3150,6 +3164,9 @@ double Runtime::Run() {
         graph_seg->clearWaits();
         graph_seg->begin();
         graph_seg_start = level_idx;
+        if (std::getenv("VKOP_SEG_TRACE"))
+            std::fprintf(stderr, "[seg-open] ord=%zu lvl=%zu\n",
+                         graph_next_seg - 1, level_idx);
     };
     // segment replay 用: 每 segment 覆盖的 op indices, graph_submit 时聚合 fp.
     // 必须在 graph_submit lambda 之前声明, 让 [&] 能捕获到.
@@ -3376,8 +3393,15 @@ double Runtime::Run() {
             graph_seg = nullptr;
             seg_op_indices_curr.push_back({});
             if (seg_trace)
-                std::fprintf(stderr, "[sec-seg] pending=%zu\n",
-                             sec_pending.size());
+                std::fprintf(
+                    stderr, "[sec-seg] pending=%zu ord=%zu lvl=[%zu,%zu)\n",
+                    sec_pending.size(), ord,
+                    ord < seg_level_ranges_.size()
+                        ? seg_level_ranges_[ord].first
+                        : size_t(0),
+                    ord < seg_level_ranges_.size()
+                        ? seg_level_ranges_[ord].second
+                        : size_t(0));
             return;
         }
         if (graph_prev_sem != VK_NULL_HANDLE)
@@ -3399,7 +3423,16 @@ double Runtime::Run() {
             flush_seg_batch();
         }
         if (seg_trace)
-            std::fprintf(stderr, "[seg-sub] ord=%zu val=%llu\n", ord,
+            std::fprintf(stderr,
+                         "[seg-sub] ord=%zu lvl=[%zu,%zu) skip_record=%d "
+                         "val=%llu\n",
+                         ord, seg_level_ranges_.empty() || ord >= seg_level_ranges_.size()
+                                  ? size_t(0)
+                                  : seg_level_ranges_[ord].first,
+                         seg_level_ranges_.empty() || ord >= seg_level_ranges_.size()
+                             ? size_t(0)
+                             : seg_level_ranges_[ord].second,
+                         (int)skip_record,
                          (unsigned long long)graph_prev_val);
         if (run_profile) {
             auto gs_t1 = run_profile ? std::chrono::steady_clock::now()
@@ -3431,7 +3464,10 @@ double Runtime::Run() {
                 commit_primaries();
             else
                 flush_seg_batch();
-            graph_open(graph_seg_start);
+            // Reopen at the CURRENT level, not at the split segment's start:
+            // the remainder of this level's ops are recorded into the new
+            // segment, so that is the level its recording begins at.
+            graph_open(graph_cur_level);
             if (graph_op_idx >= 0)
                 node_ops_[graph_op_idx]->repoint_graph_cmd(graph_seg);
         };
@@ -3613,6 +3649,7 @@ double Runtime::Run() {
 
     for (size_t level_idx = 0; level_idx < level_node_indices_.size();
          level_idx++) {
+        graph_cur_level = level_idx;
         // --- Host-side reshape_view pre-pass ---
         // This block used to sit deep inside the per-op loop, and the
         // segment-replay hit path skipped it entirely — which broke decode:

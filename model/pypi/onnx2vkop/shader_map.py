@@ -222,12 +222,26 @@ _SECONDARY: Dict[tuple, List[str]] = {
         # Coop pipelines: primary + alternative tile geometries.
         "buffer_matmul_coop_bda",
         "buffer_matmul_coop16_bda",
-        # Alternative coop tile geometries.
-        "buffer_matmul_coop16_16x8x16_bda",
+        # Alternative coop tile geometries. The descriptor (non-BDA) forms are
+        # what MatMulBuffer's coop probe actually asks for on a device that
+        # runs without VKOP_BDA -- the _bda twins below are a separate set and
+        # do not substitute for them. Both spellings must ship: a missing
+        # descriptor key makes every MatMul fail at pipeline creation with
+        # "needs the shader variant ... and nothing supplied it", which is how
+        # this gap was found (the master archive had all six; the model did
+        # not, because only the _bda ones were listed here).
+        "buffer_matmul_coop_fp16_8x8x16_bm8bn64",
+        "buffer_matmul_coop_fp16_8x8x16_bm32bn16",
+        "buffer_matmul_coop_fp16_8x8x16_bm64bn8",
         "buffer_matmul_coop_fp16_8x8x16_bm8bn64_bda",
         "buffer_matmul_coop_fp16_8x8x16_bm32bn16_bda",
         "buffer_matmul_coop_fp16_8x8x16_bm64bn8_bda",
-        # SINT8/UINT8 coop modules.
+        "buffer_matmul_coop16_16x8x16_bda",
+        # SINT8/UINT8 coop modules. As above, the descriptor spellings are the
+        # ones a non-BDA device probes; the _bda twins are additional.
+        "buffer_matmul_coop_u8",
+        "buffer_matmul_coop_u8_16x16x32",
+        "buffer_matmul_coop_u8_16x8x32",
         "buffer_matmul_coop_i8_bda",
         "buffer_matmul_coop_i8_16x16x32_bda",
         "buffer_matmul_coop_i8_16x8x32_bda",
@@ -459,8 +473,12 @@ _SECONDARY: Dict[tuple, List[str]] = {
     ("ScatterND", "buffer"): ["buffer_scatternd_bda"],
     ("Slice", "buffer"): ["buffer_slice_bda", "buffer_slice_bda_fp16"],
     ("Split", "buffer"): ["buffer_split_bda", "buffer_split_bda_fp16"],
-    ("TopK", "buffer"): ["buffer_topk_bda"],
-    ("Topk", "buffer"): ["buffer_topk_bda"],
+    # Both spellings: the descriptor form is what a non-BDA device resolves,
+    # and the runtime's post-process TopK registers through the same key
+    # lookup. Listing only _bda left a model converted with this table with no
+    # buffer_topk at all, which fails at LoadModel rather than at dispatch.
+    ("TopK", "buffer"): ["buffer_topk", "buffer_topk_bda"],
+    ("Topk", "buffer"): ["buffer_topk", "buffer_topk_bda"],
     ("LayerNorm", "buffer"): [
         "buffer_layernorm_sg",
         "buffer_layernorm_fp16_sg",

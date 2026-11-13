@@ -149,12 +149,14 @@ class Expand : public Operator {
         // A leaf target makes this a one-time read; otherwise it is read every
         // round, and the report follows whether it CHANGED (see
         // resolve_target_shape, which sets target_changed_).
-        set_did_host_work_last_round(target_changed_);
+        // A host-evaluated target (converter's `vkop_host_shape`) needs no read
+        // at all: the runtime already pushed this round's dims.
+        set_did_host_work_last_round(!host_target_valid_ && target_changed_);
         std::vector<int> inshape = inputs[0]->getShape();
         std::vector<int> out_shape = outputs[0]->getShape();
         // Fail closed on a <= 1-byte data payload: no byte build in this mover.
         core::require_word_movable_elem(inputs[0]->elem_kind(), "Expand");
-        if (out_shape.size() == 0) {
+        if (out_shape.size() == 0 && !host_target_valid_ && inputs.size() > 1) {
             dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
                 using T = decltype(dummy);
                 auto shape_input = core::as_tensor<T>(inputs[1]);
@@ -180,12 +182,14 @@ class Expand : public Operator {
         // per round otherwise — so the dispatch is exact
         // (UP_DIV(total,256), no over-dispatch).
         if (inputs[0]->dtype() == typeid(int64_t)) {
-            // Resolve the target shape from inputs[1] (see
-            // resolve_target_shape): read once for a read-only leaf, read and
-            // compared per round otherwise.
+            // Resolve the target shape: host-evaluated when the converter
+            // extracted it, else read from inputs[1] (once for a read-only
+            // leaf, compared per round otherwise).
             bool did_readback = false;
-            std::vector<int> target_shape =
-                resolve_target_shape(inputs[1], did_readback);
+            std::vector<int> target_shape = host_target_valid_
+                                                ? host_target_
+                                                : resolve_target_shape(
+                                                      inputs[1], did_readback);
             (void)did_readback;
             // ONNX Expand output shape = right-aligned broadcast of input vs
             // target: dim is the input dim when it is neither 1 nor -1 (a
@@ -211,7 +215,6 @@ class Expand : public Operator {
                 out_shape[maxd - 1 - i] = v;
             }
             int total = total_elems(out_shape);
-
             ensure_int64_pipeline();
             int64_mode_ = true;
 
@@ -230,11 +233,17 @@ class Expand : public Operator {
             // valid SSBO to keep fillWriteDescriptorSets in bounds. Bind the
             // target tensor's SSBO whatever its dtype (int64 in the LLM; int32
             // in some tests) — dispatch_by_dtype resolves the right as_tensor.
-            dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
-                using T = decltype(dummy);
-                auto target = core::as_tensor<T>(inputs[1]);
-                objs_.emplace_back(target->as_storage_buffer(m_dev_, nullptr));
-            });
+            // In host-target form there is no such input: use the dummy.
+            if (inputs.size() > 1 && inputs[1]) {
+                dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+                    using T = decltype(dummy);
+                    auto target = core::as_tensor<T>(inputs[1]);
+                    objs_.emplace_back(
+                        target->as_storage_buffer(m_dev_, nullptr));
+                });
+            } else {
+                objs_.emplace_back(dummy_buffer_);
+            }
 
             param_.rank = static_cast<int>(out_shape.size());
             param_.fp16 = total; // fp16 field repurposed as total on int64 path
@@ -266,11 +275,13 @@ class Expand : public Operator {
         // graph shape inference) can be stale/wrong, so recompute it here from
         // the authoritative target buffer + the input shape.
         //
-        // The target comes from resolve_target_shape: read once for a
-        // read-only leaf, read and compared per round otherwise.
+        // The target: host-evaluated when the converter extracted the chain,
+        // else read from inputs[1] (once for a read-only leaf, compared per
+        // round otherwise).
         bool did_readback = false;
         std::vector<int> target_shape =
-            resolve_target_shape(inputs[1], did_readback);
+            host_target_valid_ ? host_target_
+                               : resolve_target_shape(inputs[1], did_readback);
         (void)did_readback;
         size_t maxd = std::max(inshape.size(), target_shape.size());
         out_shape.assign(maxd, 1);
@@ -316,12 +327,22 @@ class Expand : public Operator {
             objs_.emplace_back(input_buffer);
             in_buf = input_buffer;
         });
-        dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
-            using T = decltype(dummy);
-            auto shapeinput = core::as_tensor<T>(inputs[1]);
-            auto input_buffer = shapeinput->as_storage_buffer(m_dev_, m_cmd_);
-            objs_.emplace_back(input_buffer);
-        });
+        // Binding 2 is the fp shader's target-shape buffer. In host-target
+        // form the converter deleted that input, so bind the op's shared dummy
+        // buffer to keep the descriptor set fully written (the fp shader never
+        // reads it — outDims come from the push constant — but a partially
+        // written set is a Vulkan validity error).
+        if (inputs.size() > 1 && inputs[1]) {
+            dispatch_by_dtype(inputs[1]->dtype(), [&](auto dummy) {
+                using T = decltype(dummy);
+                auto shapeinput = core::as_tensor<T>(inputs[1]);
+                auto input_buffer =
+                    shapeinput->as_storage_buffer(m_dev_, m_cmd_);
+                objs_.emplace_back(input_buffer);
+            });
+        } else {
+            objs_.emplace_back(dummy_buffer_);
+        }
 
         auto total_size = std::accumulate(out_shape.begin(), out_shape.end(), 1,
                                           std::multiplies<>());
@@ -357,6 +378,21 @@ class Expand : public Operator {
     }
 
   public:
+    // Phase 4-r2 shape-chain host-ification, Expand's half. When the converter
+    // extracted this node's target-shape chain into `vkop_host_shape`, the
+    // node arrives with ONE input (the data tensor) and the runtime pushes the
+    // evaluated dims here each round, right before onExecute.
+    //
+    // This is what removes the LAST real GPU->CPU readback in the decode graph:
+    // without it Expand must read the target vector's VALUES to size its output,
+    // and a readback mid-level forces a graph-segment split (see
+    // Runtime::Run's readback hook). A split consumes an extra segment ordinal,
+    // which is exactly what made VKOP_SEG_PACK>1 replay the wrong levels.
+    void set_host_target_shape(const std::vector<int> &dims) override {
+        host_target_ = dims;
+        host_target_valid_ = true;
+    }
+
     void invalidate_shape_cache() override {
         // Kept as an explicit no-op: cross-round state is now a comparison
         // against last round's target, so a phase boundary needs no reset — the
@@ -366,6 +402,10 @@ class Expand : public Operator {
     }
 
   private:
+    // Host-evaluated target shape (single-input form). Set by the runtime from
+    // the converter's `vkop_host_shape` term list before every execute.
+    std::vector<int> host_target_;
+    bool host_target_valid_ = false;
     // Target read once from a read-only leaf input (constant of the node).
     std::vector<int> leaf_target_;
     bool leaf_target_valid_ = false;
