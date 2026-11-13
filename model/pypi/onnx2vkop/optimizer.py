@@ -8430,6 +8430,21 @@ class Quantizer:
                 for init in inits
             ):
                 continue
+            deferred_names = getattr(dag_model, "deferred_weights", {})
+            if any(n in deferred_names for n in names):
+                # Streamed weights have no bytes in this process. Under a byte
+                # format they are already quantized on the way into the trailer
+                # (weight_stream + quant_payload), each with its own appended
+                # per-column scale -- which is not the single concatenated
+                # table the fold kernel reads, so this node must stay on the
+                # three-separate-weights form instead of being folded.
+                #
+                # Leaving it unfolded is correct, not a degradation: the fold
+                # only exists to save a dispatch, and the pre-fusion graph has
+                # one ordinary int8 MatMul per member.
+                print(f"[down_act] fold {names} stays unfolded: its weights "
+                      f"are streamed (quantized at write time)")
+                continue
             arrays = [numpy_helper.to_array(init).astype(np.float32)
                       for init in inits]
             # Wd is [N_up, N]. Wg and Wu are [K_out, N_up] in the plain layout,

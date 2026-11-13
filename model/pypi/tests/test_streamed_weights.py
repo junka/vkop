@@ -287,6 +287,56 @@ def test_int8_streams_a_float32_weight_and_writes_the_scale(tmp_path, monkeypatc
                                           rtol=1e-6)
 
 
+def test_int8_streams_a_float16_weight_too(tmp_path, monkeypatch):
+    """The dtype every LLM export actually ships.**
+
+    A float16 source used to take the pass-through branch even under `-q int8`:
+    the payload rode into the trailer unchanged (silently unquantized, while
+    the console said the model was int8), and any pass that reads the weight --
+    the SwiGLU down-act fold reads all three of its weights as one tensor --
+    died on a deferred tensor with no bytes. The row must instead carry
+    `src_dtype=FLOAT16` and `data_type=INT8`, two source bytes per element in
+    `length`, and one payload byte per element on disk.
+    """
+    src = _model_with_external_weights(tmp_path)
+    monkeypatch.setenv("VKOP_EXTERNAL_BLOB_MB", "1")
+    monkeypatch.setenv("VKOP_STREAM_WEIGHTS", "1")
+    monkeypatch.setenv("VKOP_STREAM_MIN_MIB", "0")
+    converter = ModelConverter()
+    dag = converter.parse_onnx_model(str(src), 1, quant="int8")
+    converter.apply_optimizations(dag, _opts(quant="int8"))
+    out = tmp_path / "s8h.vkopbin"
+    dag.save_to_binary(str(out))
+
+    streamed = {n: e for n, e in dag.deferred_weights.items() if e.get("quant")}
+    assert sorted(streamed) == ["W0", "W1", "W2"], sorted(dag.deferred_weights)
+    n_elems = 64 * (ELEMS // 64)
+    for name, entry in streamed.items():
+        assert entry["src_dtype"] == TensorProto.FLOAT16, name
+        assert entry["data_type"] == TensorProto.INT8, name
+        # length is the SOURCE extent (2 bytes/elem); the payload is 1/elem.
+        assert entry["length"] == n_elems * 2, name
+        assert entry["scale"] == name + "_scale", name
+
+    # And the bytes on disk must be the quantized payload, not the fp16 source.
+    from onnx2vkop.inspect import ModelView
+    view = ModelView(str(out))
+    rows = {i["name"]: i for i in view.initializers()}
+    blob = view.external_blob_trailer
+    src_model = onnx.load(str(src), load_external_data=True)
+    wanted = {i.name: numpy_helper.to_array(i) for i in src_model.graph.initializer}
+    with open(out, "rb") as f:
+        for name, entry in streamed.items():
+            w = wanted[name].astype(numpy.float32)
+            amax = numpy.max(numpy.abs(w), axis=0)
+            scale = numpy.where(amax == 0, 1.0, amax / 127.0)
+            q = numpy.round(w / scale[None, :]).astype(numpy.int8)
+            row = rows[name]
+            assert row["size"] == q.size, (name, row["size"], q.size)
+            f.seek(blob + row["offset"])
+            assert f.read(row["size"]) == q.tobytes(), name
+
+
 # --------------------------------------------------------------------------
 # the failure modes, each of which has to be loud
 # --------------------------------------------------------------------------

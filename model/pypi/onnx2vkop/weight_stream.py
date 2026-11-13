@@ -350,26 +350,36 @@ def prepare(model, base_dir: str, *, quant: Optional[str] = None,
         keep_in_file_gates = (refusal is None
                               and seen_names[init.name] == 1
                               and length >= cap)
+        # A byte format quantizes every float weight it can see, whether the
+        # source is fp32 or fp16. The fp16 case is the common one for an LLM
+        # export and used to fall through as a plain pass-through, which was
+        # wrong twice over: the payload shipped as fp16 (silently unquantized)
+        # and the down_act fold, which reads its three weights as one
+        # concatenated tensor, died demanding bytes a deferred row does not
+        # have. Both are fixed by recording such a weight as a *quantizing*
+        # deferred entry, exactly like the fp32 case below.
+        byte_quantizes = (init.data_type in (TensorProto.FLOAT,
+                                             TensorProto.FLOAT16)
+                          and not exports_weight_values(quant, unify, rgba))
         if keep_in_file_gates and not is_slot:
             keep_in_file_gates = (
                 (init.data_type in _PASS_THROUGH_DATA_TYPES
-                 or (init.data_type == TensorProto.FLOAT
-                     and not exports_weight_values(quant, unify, rgba)))
+                 or byte_quantizes)
                 and length == payload_bytes(init)
                 and _only_weight_consumers(consumers.get(init.name)))
         if keep_in_file_gates:
             entry = _stream_entry(
                 init, base_dir, location, offset, length,
                 sum(consumers.get(init.name, Counter()).values()))
-            if (init.data_type == TensorProto.FLOAT
-                    and not exports_weight_values(quant, unify, rgba)):
+            if byte_quantizes:
                 # A byte format quantizes this weight's bytes on the way into
-                # the trailer, so the row says both what the file holds and
-                # what the payload will be: the writer, verify_deferred and the
-                # length checks key on the recorded dtype, and the tensor keeps
-                # FLOAT so no pass believes 4-byte values sit in a 1-byte
-                # payload. quant_payload fills in the scale.
-                entry["src_dtype"] = TensorProto.FLOAT
+                # the trailer, so the row says both what the file holds
+                # (`src_dtype`) and what the payload will be (`data_type`):
+                # the writer, verify_deferred and the length checks key on the
+                # latter, while the tensor keeps the float type so no pass
+                # believes 1-byte values sit in a 2- or 4-byte payload.
+                # quant_payload fills in the scale.
+                entry["src_dtype"] = init.data_type
                 entry["data_type"] = _BYTE_PAYLOAD_DTYPES[quant]
                 entry["quant"] = quant
             deferred[init.name] = entry
