@@ -6,9 +6,13 @@ import os
 import subprocess
 import sys
 
+if os.name == "nt":
+    import msvcrt
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-BIN = os.path.join(ROOT, "build", "llm_serve")
+BIN = os.path.join(ROOT, "build",
+                   "llm_serve.exe" if os.name == "nt" else "llm_serve")
 MODEL = os.path.join(ROOT, "llm", "exporter", "llm.vkopbin")
 EMBED = os.path.join(ROOT, "llm", "exporter", "embed_tokens.bin")
 TOK = os.path.join(ROOT, "llm", "tokenizer", "qwen3_vl.bin")
@@ -19,6 +23,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--max-new", type=int, default=16)
     ap.add_argument("--max-kv", type=int, default=1024)
+    ap.add_argument("--bin", default=BIN)
+    ap.add_argument("--model", default=MODEL)
     ap.add_argument("--prompt", default="What is the capital of France?")
     ap.add_argument("--verbose", action="store_true",
                     help="pass the backend's own log through to stderr")
@@ -26,12 +32,22 @@ def main():
 
     r_in, w_in = os.pipe()
     r_out, w_out = os.pipe()
+    if os.name == "nt":
+        # pass_fds is POSIX-only; llm_serve wraps these HANDLEs with
+        # _open_osfhandle, and close_fds=False is what inherits them.
+        os.set_inheritable(r_in, True)
+        os.set_inheritable(w_out, True)
+        rpc = ["--rpc-in", str(msvcrt.get_osfhandle(r_in)),
+               "--rpc-out", str(msvcrt.get_osfhandle(w_out))]
+        extra = {"close_fds": False}
+    else:
+        rpc = ["--rpc-in", str(r_in), "--rpc-out", str(w_out)]
+        extra = {"pass_fds": (r_in, w_out)}
     p = subprocess.Popen(
-        [BIN, MODEL, EMBED, TOK, "--max-kv", str(a.max_kv),
-         "--rpc-in", str(r_in), "--rpc-out", str(w_out)],
-        pass_fds=(r_in, w_out),
+        [a.bin, a.model, EMBED, TOK, "--max-kv", str(a.max_kv)] + rpc,
         stdout=sys.stderr if a.verbose else subprocess.DEVNULL,
         stderr=subprocess.STDOUT,
+        **extra,
     )
     os.close(r_in)
     os.close(w_out)

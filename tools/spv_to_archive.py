@@ -51,7 +51,7 @@ def _align_up(n, a):
 
 
 def parse_args(argv):
-    p = argparse.ArgumentParser(prog="spv_to_archive.py")
+    p = argparse.ArgumentParser(prog="spv_to_archive.py", fromfile_prefix_chars="@")
     p.add_argument("--output", required=True, help="path to the .bin to write")
     p.add_argument(
         "--spv",

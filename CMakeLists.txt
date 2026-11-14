@@ -998,12 +998,22 @@ if(VARIANT_COUNT GREATER 0)
 endif()
 
 set(VKOP_SHADER_ARCHIVE_FILE ${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.bin)
+# The --spv list outgrows CreateProcess's 32767-char command line, so on Windows
+# the packer reads the same arguments from a response file, one per line.
+if(WIN32)
+    set(ARCHIVE_RSP "${CMAKE_CURRENT_BINARY_DIR}/vkop_shaders.rsp")
+    string(REPLACE ";" "\n" ARCHIVE_RSP_ARGS "${ARCHIVE_ARGS}")
+    file(WRITE "${ARCHIVE_RSP}"
+         "--output\n${VKOP_SHADER_ARCHIVE_FILE}\n${ARCHIVE_RSP_ARGS}\n")
+    set(ARCHIVE_CLI_ARGS "@${ARCHIVE_RSP}")
+else()
+    set(ARCHIVE_CLI_ARGS --output "${VKOP_SHADER_ARCHIVE_FILE}" ${ARCHIVE_ARGS})
+endif()
 add_custom_command(
     OUTPUT ${VKOP_SHADER_ARCHIVE_FILE}
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_SOURCE_DIR}/tools/spv_to_archive.py
-        --output ${VKOP_SHADER_ARCHIVE_FILE}
-        ${ARCHIVE_ARGS}
+        ${ARCHIVE_CLI_ARGS}
     DEPENDS ${ARCHIVE_DEPS} ${CMAKE_SOURCE_DIR}/tools/spv_to_archive.py
     COMMENT "Packing SPIR-V shaders into vkop_shaders.bin archive"
 )

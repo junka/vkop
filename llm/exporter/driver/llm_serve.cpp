@@ -13,7 +13,8 @@
 //     <role>\n<text-b64>\n  × nmsg
 //   GEN <id> <max_new> <nmsg>            → TOKENS_IN <id> <n>
 //     <role>\n<text-b64>\n  × nmsg       → DELTA <id> <text-b64>   (0..N 次)
-//                                        → DONE <id> <stop_reason> <n_out>
+//     [temperature top_k top_p]          → DONE <id> <stop_reason> <n_out>
+//       三个采样参数可省略；负值＝客户端没传，用后端默认（贪心）。
 //   出错                                 → ERROR <id> <msg-b64>
 //   RESET                              → OK
 //   BYE                                → BYE
@@ -46,12 +47,21 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <io.h>
+#else
 #include <unistd.h>
+#endif
 
 #include <fcntl.h>
 
@@ -74,6 +84,28 @@ using vkop::export_::KVCache;
 using qwen::Tokenizer;
 
 namespace {
+
+// ---------------------------------------------------------- platform I/O ----
+// ucrt supplies read/write/open/close but neither fsync nor a rename that
+// replaces an existing file, and the KV dump publishes through both.
+// ucrt's _read/_write also take an unsigned count where POSIX takes size_t;
+// keep each platform's own type so a transfer is never narrowed.
+#ifdef _WIN32
+using io_count_t = unsigned;
+inline int os_fsync(int fd) { return _commit(fd); }
+// FlushFileBuffers needs write access, unlike fsync on a read-only fd.
+inline int os_open_for_fsync(const char *p) { return _open(p, _O_WRONLY); }
+inline int os_replace(const char *from, const char *to) {
+    return MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
+}
+#else
+using io_count_t = std::size_t;
+inline int os_fsync(int fd) { return ::fsync(fd); }
+inline int os_open_for_fsync(const char *p) { return ::open(p, O_RDONLY); }
+inline int os_replace(const char *from, const char *to) {
+    return std::rename(from, to);
+}
+#endif
 
 // ---------------------------------------------------------------- base64 ----
 const char kB64[] =
@@ -157,7 +189,7 @@ class LineReader {
                 pos_ = 0;
             }
             char tmp[65536];
-            const ssize_t n = ::read(fd_, tmp, sizeof(tmp));
+            const auto n = ::read(fd_, tmp, static_cast<io_count_t>(sizeof(tmp)));
             if (n <= 0) return false;
             buf_.append(tmp, static_cast<std::size_t>(n));
         }
@@ -292,9 +324,109 @@ std::vector<uint16_t> embed_lookup(const std::vector<uint16_t> &table,
     return out;
 }
 
-int argmax_last_token(const std::shared_ptr<Runtime> &rt,
+// ------------------------------------------------------------- sampling ----
+// Everything here runs on the host because the logits row is already copied
+// back for the greedy scan -- no shader, no extra GPU work, and no new
+// numerical path to validate. temperature <= 0 keeps the original argmax
+// bit-for-bit, so the default behaviour of every existing caller is unchanged.
+struct SampleParams {
+    float temperature = 0.0f;        // <= 0: greedy
+    int top_k = 0;                   // <= 0: keep the whole vocabulary
+    float top_p = 1.0f;              // >= 1: no nucleus cut
+    float repetition_penalty = 1.0f; // 1: off
+};
+
+class Sampler {
+  public:
+    explicit Sampler(uint64_t seed = 0) : rng_(seed) {}
+
+    // `history` is the set of ids this round has already generated. Prompt
+    // tokens are deliberately excluded: penalising them would suppress the
+    // tool names and JSON punctuation an agent's system prompt legitimately
+    // repeats every turn.
+    int pick(const uint16_t *row, int vocab, const std::vector<uint32_t> &history,
+             const SampleParams &sp) {
+        if (sp.temperature <= 0.0f && sp.repetition_penalty == 1.0f) {
+            int best = 0;
+            float bestv = -1e30f;
+            for (int i = 0; i < vocab; ++i) {
+                const float v = fp16_to_f32(row[i]);
+                if (v > bestv) { bestv = v; best = i; }
+            }
+            return best;
+        }
+
+        logits_.resize(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) logits_[i] = fp16_to_f32(row[i]);
+        if (sp.repetition_penalty != 1.0f) {
+            for (const uint32_t id : history) {
+                if (id >= static_cast<uint32_t>(vocab)) continue;
+                float &v = logits_[id];
+                v = v > 0.0f ? v / sp.repetition_penalty : v * sp.repetition_penalty;
+            }
+        }
+        // Still deterministic: max_element takes the first maximum, the same
+        // tie rule as the strict `>` scan above.
+        if (sp.temperature <= 0.0f)
+            return static_cast<int>(std::max_element(logits_.begin(), logits_.end()) -
+                                    logits_.begin());
+
+        const float inv_t = 1.0f / sp.temperature;
+        for (float &v : logits_) v *= inv_t;
+
+        idx_.resize(static_cast<size_t>(vocab));
+        for (int i = 0; i < vocab; ++i) idx_[i] = i;
+        const auto better = [this](int a, int b) { return logits_[a] > logits_[b]; };
+        int k = vocab;
+        if (sp.top_k > 0 && sp.top_k < vocab) {
+            k = sp.top_k;
+            std::nth_element(idx_.begin(), idx_.begin() + k, idx_.end(), better);
+        }
+        // Nucleus needs descending order; plain top-k does not, and sorting
+        // 152k entries per token is not free.
+        const bool nucleus = sp.top_p > 0.0f && sp.top_p < 1.0f;
+        if (nucleus) std::sort(idx_.begin(), idx_.begin() + k, better);
+
+        float maxv = -std::numeric_limits<float>::infinity();
+        for (int i = 0; i < k; ++i) maxv = std::max(maxv, logits_[idx_[i]]);
+        probs_.resize(static_cast<size_t>(k));
+        float sum = 0.0f;
+        for (int i = 0; i < k; ++i) {
+            const float e = std::exp(logits_[idx_[i]] - maxv);
+            probs_[i] = e;
+            sum += e;
+        }
+        int n = k;
+        if (nucleus) {
+            float cum = 0.0f;
+            for (int i = 0; i < k; ++i) {
+                cum += probs_[i] / sum;
+                if (cum >= sp.top_p) { n = i + 1; break; }
+            }
+            sum = 0.0f;
+            for (int i = 0; i < n; ++i) sum += probs_[i];
+        }
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        float r = u(rng_) * sum;
+        for (int i = 0; i < n; ++i) {
+            r -= probs_[i];
+            if (r <= 0.0f) return idx_[i];
+        }
+        return idx_[n - 1];
+    }
+
+  private:
+    std::mt19937_64 rng_;
+    std::vector<float> logits_;
+    std::vector<int> idx_;
+    std::vector<float> probs_;
+};
+
+int sample_last_token(const std::shared_ptr<Runtime> &rt,
                       const std::shared_ptr<vkop::VulkanCommandPool> &cp,
-                      int fallback_vocab) {
+                      int fallback_vocab, Sampler &sampler,
+                      const std::vector<uint32_t> &history,
+                      const SampleParams &sp) {
     auto logits = rt->GetOutput("logits");
     if (!logits) throw std::runtime_error("no 'logits' output");
     auto lg = as_tensor<uint16_t>(logits);
@@ -309,13 +441,7 @@ int argmax_last_token(const std::shared_ptr<Runtime> &rt,
         q = vocab > 0 ? total / vocab : 1;
     }
     const uint16_t *row = p + static_cast<std::ptrdiff_t>(q - 1) * vocab;
-    int best = 0;
-    float bestv = -1e30f;
-    for (int i = 0; i < vocab; ++i) {
-        const float v = fp16_to_f32(row[i]);
-        if (v > bestv) { bestv = v; best = i; }
-    }
-    return best;
+    return sampler.pick(row, vocab, history, sp);
 }
 
 // ------------------------------------------------------------- the server ----
@@ -324,9 +450,13 @@ class InferenceServer {
     InferenceServer(const std::string &model, const std::string &embed,
                     const std::string &tok_path, int max_kv,
                     const std::string &kv_kind, int prefill_chunk,
-                    const std::string &kv_warm = "")
+                    const std::string &kv_warm = "",
+                    float repetition_penalty = 1.0f, uint64_t seed = 0)
         : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)),
           model_path_(model) {
+        sampler_ = Sampler(seed);
+        seed_ = seed;
+        defaults_.repetition_penalty = repetition_penalty;
         Logger::getInstance().setLevel(LOG_INFO);
         const auto &devs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         if (devs.empty()) throw std::runtime_error("no vulkan device");
@@ -737,15 +867,15 @@ class InferenceServer {
         // Rename only publishes bytes the OS already has: without the fsync a
         // crash could leave a complete-looking, partly zero-filled file that a
         // later start trusts. `path` keeps the previous good cache either way.
-        const int fd = ::open(tmp.c_str(), O_RDONLY);
-        if (fd < 0 || ::fsync(fd) != 0) {
+        const int fd = os_open_for_fsync(tmp.c_str());
+        if (fd < 0 || os_fsync(fd) != 0) {
             const int saved = errno;
             if (fd >= 0) ::close(fd);
             throw std::runtime_error(std::string("--kv-dump: fsync failed for ") +
                                      tmp + ": " + std::strerror(saved));
         }
         ::close(fd);
-        if (std::rename(tmp.c_str(), path.c_str()) != 0)
+        if (os_replace(tmp.c_str(), path.c_str()) != 0)
             throw std::runtime_error("--kv-dump: cannot move " + tmp + " onto " +
                                      path);
         guard.keep = true;
@@ -879,6 +1009,10 @@ class InferenceServer {
     // not live on a ramdisk and should have rows * 28 layers * row bytes free.
     void set_kv_dump_path(const std::string &path) { kv_dump_path_ = path; }
 
+    // Backend-wide defaults; a request overrides temperature/top_k/top_p only
+    // when the client actually sent them.
+    const SampleParams &default_params() const { return defaults_; }
+
     // Generate from an already rendered prompt. `out_ids` receives every
     // generated token (the ones actually fed back included). Returns
     // "stop" / "length".
@@ -892,7 +1026,12 @@ class InferenceServer {
     // would report as prose instead of a tool call.
     std::string generate(const std::vector<uint32_t> &ids, int max_new,
                          std::vector<uint32_t> &out_ids,
-                         const std::function<void(uint32_t)> &on_token) {
+                         const std::function<void(uint32_t)> &on_token,
+                         const SampleParams &sp) {
+        // Rewind the RNG every round: with a fixed --seed the same prompt and
+        // the same parameters must give the same reply, which a process-wide
+        // stream advancing across requests would not.
+        sampler_ = Sampler(seed_);
         // The window is a hard bound on prompt + generation together. A client
         // asking for max_tokens=32000 against an 8k window is not an error —
         // clamp to what actually fits and report "length" if we hit the wall,
@@ -1034,8 +1173,22 @@ class InferenceServer {
         }
 
         out_ids.clear();
-        int next_id = argmax_last_token(rt_, cmdpool_, vocab_);
+        // Unique generated ids, in first-seen order, for the repetition
+        // penalty. The marker array is only allocated when the penalty is on.
+        std::vector<uint32_t> penalised;
+        std::vector<uint8_t> seen;
+        if (sp.repetition_penalty != 1.0f && vocab_ > 0)
+            seen.assign(static_cast<size_t>(vocab_), 0);
+        const auto note = [&](uint32_t id) {
+            if (!seen.empty() && id < seen.size() && !seen[id]) {
+                seen[id] = 1;
+                penalised.push_back(id);
+            }
+        };
+        int next_id = sample_last_token(rt_, cmdpool_, vocab_, sampler_,
+                                        penalised, sp);
         out_ids.push_back(static_cast<uint32_t>(next_id));
+        note(static_cast<uint32_t>(next_id));
         if (!is_stop(static_cast<uint32_t>(next_id)))
             on_token(static_cast<uint32_t>(next_id));
 
@@ -1096,8 +1249,10 @@ class InferenceServer {
                     upload_input(cmdpool_, rt_->GetInput("image_pad_mask"));
 
                 const double ms = rt_->Run();
-                next_id = argmax_last_token(rt_, cmdpool_, vocab_);
+                next_id = sample_last_token(rt_, cmdpool_, vocab_, sampler_,
+                                            penalised, sp);
                 out_ids.push_back(static_cast<uint32_t>(next_id));
+                note(static_cast<uint32_t>(next_id));
                 past_len = kv_->feedback();
                 if (std::getenv("VKOP_SERVE_VERBOSE")) {
                     std::printf("[serve] r%d %.0fms past=%d -> %d\n", step, ms,
@@ -1200,6 +1355,9 @@ class InferenceServer {
     ModelArch arch_;
     std::vector<uint16_t> embed_table_;
     int vocab_ = 0;
+    Sampler sampler_;
+    uint64_t seed_ = 0;
+    SampleParams defaults_;
     std::unique_ptr<KVCache> kv_;
     std::vector<uint32_t> stop_ids_;
     std::vector<uint32_t> covered_ids_;
@@ -1228,7 +1386,7 @@ void emit(int fd, const std::string &line) {
     const char *p = s.data();
     size_t left = s.size();
     while (left > 0) {
-        const ssize_t n = ::write(fd, p, left);
+        const auto n = ::write(fd, p, static_cast<io_count_t>(left));
         if (n <= 0) return;
         p += n;
         left -= static_cast<size_t>(n);
@@ -1239,6 +1397,7 @@ const char *kUsage =
     "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
     "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
     "[--prefill-chunk N] [--kv-warm FILE] [--kv-dump FILE] "
+    "[--repetition-penalty F] [--seed N] "
     "[--rpc-in FD] [--rpc-out FD]\n";
 
 }  // namespace
@@ -1256,6 +1415,8 @@ int main(int argc, char **argv) {
     int rpc_in = 3, rpc_out = 4;
     std::string kv_kind = "auto";
     std::string kv_warm, kv_dump;
+    float repetition_penalty = 1.0f;
+    uint64_t seed = 0;
     for (int i = 4; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--max-kv" && i + 1 < argc) max_kv = std::atoi(argv[++i]);
@@ -1263,6 +1424,10 @@ int main(int argc, char **argv) {
         else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
         else if (a == "--kv-warm" && i + 1 < argc) kv_warm = argv[++i];
         else if (a == "--kv-dump" && i + 1 < argc) kv_dump = argv[++i];
+        else if (a == "--repetition-penalty" && i + 1 < argc)
+            repetition_penalty = static_cast<float>(std::atof(argv[++i]));
+        else if (a == "--seed" && i + 1 < argc)
+            seed = std::strtoull(argv[++i], nullptr, 10);
         else if (a == "--rpc-in" && i + 1 < argc) rpc_in = std::atoi(argv[++i]);
         else if (a == "--rpc-out" && i + 1 < argc) rpc_out = std::atoi(argv[++i]);
         else {
@@ -1276,20 +1441,31 @@ int main(int argc, char **argv) {
         return 1;
     }
 
+#ifdef _WIN32
+    // The parent passes HANDLE values here, not CRT fds: Windows has no
+    // pass_fds, so it marks the pipe ends inheritable and sends the handles.
+    rpc_in = _open_osfhandle(static_cast<intptr_t>(rpc_in), _O_RDONLY);
+    rpc_out = _open_osfhandle(static_cast<intptr_t>(rpc_out), _O_WRONLY);
+    if (rpc_in < 0 || rpc_out < 0) {
+        std::fprintf(stderr, "[serve] cannot wrap the inherited RPC handles\n");
+        return 1;
+    }
+#endif
+
     // The fds may be anything the parent handed us; the loop is synchronous,
     // so a single request at a time is the contract.
     std::unique_ptr<InferenceServer> srv;
     try {
         srv = std::make_unique<InferenceServer>(model_path, embed_path, tok_path,
                                                 max_kv, kv_kind, prefill_chunk,
-                                                kv_warm);
+                                                kv_warm, repetition_penalty, seed);
         srv->set_kv_dump_path(kv_dump);
     } catch (const std::exception &e) {
         emit(rpc_out, std::string("FATAL ") + b64_encode(e.what()));
         std::fprintf(stderr, "[serve] startup failed: %s\n", e.what());
         return 1;
     }
-    emit(rpc_out, "READY 1");
+    emit(rpc_out, "READY 2");
 
     LineReader in(rpc_in);
     std::string line;
@@ -1323,7 +1499,7 @@ int main(int argc, char **argv) {
             emit(rpc_out, "BYE");
             break;
         }
-        if (cmd == "HELLO") { emit(rpc_out, "READY 1"); continue; }
+        if (cmd == "HELLO") { emit(rpc_out, "READY 2"); continue; }
         if (cmd == "RESET") {
             try { srv->reset(); emit(rpc_out, "OK"); }
             catch (const std::exception &e) {
@@ -1335,10 +1511,14 @@ int main(int argc, char **argv) {
             emit(rpc_out, "ERROR 0 " + b64_encode("unknown command: " + cmd));
             continue;
         }
-        // args: <id> [max_new] <nmsg>
+        // args: <id> [max_new] <nmsg> [temperature top_k top_p]
         const std::string id = args.empty() ? "0" : args[0];
         int max_new = 64;
         size_t nmsg = 0;
+        // Negative means the client never sent the parameter, so the backend
+        // default stands -- which is greedy.
+        float req_temp = -1.0f, req_top_p = -1.0f;
+        int req_top_k = -1;
         if (cmd == "GEN") {
             if (args.size() < 3) {
                 emit(rpc_out, "ERROR " + id + " " +
@@ -1347,6 +1527,11 @@ int main(int argc, char **argv) {
             }
             max_new = std::atoi(args[1].c_str());
             nmsg = static_cast<size_t>(std::atoi(args[2].c_str()));
+            if (args.size() > 3)
+                req_temp = static_cast<float>(std::atof(args[3].c_str()));
+            if (args.size() > 4) req_top_k = std::atoi(args[4].c_str());
+            if (args.size() > 5)
+                req_top_p = static_cast<float>(std::atof(args[5].c_str()));
         } else {
             if (args.size() < 2) {
                 emit(rpc_out, "ERROR " + id + " " +
@@ -1405,7 +1590,12 @@ int main(int argc, char **argv) {
                     emit(rpc_out, "DELTA " + id + " " + b64_encode(d));
                 }
             };
-            const std::string reason = srv->generate(ids, max_new, out_ids, cb);
+            SampleParams sp = srv->default_params();
+            if (req_temp >= 0.0f) sp.temperature = req_temp;
+            if (req_top_k >= 0) sp.top_k = req_top_k;
+            if (req_top_p >= 0.0f) sp.top_p = req_top_p;
+            const std::string reason =
+                srv->generate(ids, max_new, out_ids, cb, sp);
             const std::string tail = srv->tok().emit_delta_flush(st);
             if (!tail.empty()) {
                 streamed += tail;

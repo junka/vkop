@@ -41,6 +41,9 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+if os.name == "nt":
+    import msvcrt
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
 
@@ -65,12 +68,24 @@ class Backend:
         child_env = dict(os.environ)
         if self.env:
             child_env.update(self.env)
+        if os.name == "nt":
+            # pass_fds is POSIX-only. Hand over the HANDLE values instead and
+            # let llm_serve wrap them with _open_osfhandle; close_fds=False is
+            # what makes Windows inherit the handles marked below at all.
+            os.set_inheritable(r_in, True)
+            os.set_inheritable(w_out, True)
+            rpc = ["--rpc-in", str(msvcrt.get_osfhandle(r_in)),
+                   "--rpc-out", str(msvcrt.get_osfhandle(w_out))]
+            extra = {"close_fds": False}
+        else:
+            rpc = ["--rpc-in", str(r_in), "--rpc-out", str(w_out)]
+            extra = {"pass_fds": (r_in, w_out)}
         self.proc = subprocess.Popen(
-            self.argv + ["--rpc-in", str(r_in), "--rpc-out", str(w_out)],
-            pass_fds=(r_in, w_out),
+            self.argv + rpc,
             env=child_env,
             stdout=sys.stderr,
             stderr=sys.stderr,
+            **extra,
         )
         os.close(r_in)
         os.close(w_out)
@@ -140,11 +155,14 @@ class Backend:
                 if kind == "ERROR":
                     raise RuntimeError(_decode_err(rest))
 
-    def generate(self, messages, max_new, rid="0"):
+    def generate(self, messages, max_new, rid="0", sample=None):
         """Yield ('tokens_in', n), ('delta', text), ('done', reason, n_out)."""
         with self._lock:
             self._ensure_alive()
-            self._send(f"GEN {rid} {max_new} {len(messages)}")
+            head = f"GEN {rid} {max_new} {len(messages)}"
+            if sample is not None:
+                head += " %g %d %g" % sample
+            self._send(head)
             self._write_msgs(self._send, messages)
             while True:
                 line = self._recv()
@@ -274,6 +292,23 @@ def _tools_preamble(tools):
     )
 
 
+def _sampling(req):
+    """Anthropic sampling params -> the GEN line's three trailing fields.
+
+    -1 means the client never sent the parameter, so the backend default
+    (greedy) stands. An absent temperature must not silently enable sampling.
+    """
+    def num(key, cast):
+        v = req.get(key)
+        if v is None:
+            return -1
+        try:
+            return cast(v)
+        except (TypeError, ValueError):
+            return -1
+    return (num("temperature", float), num("top_k", int), num("top_p", float))
+
+
 def to_backend_messages(req):
     """Anthropic request -> [(role, text)] with the tool markup folded in.
 
@@ -388,23 +423,63 @@ def parse_output(text):
     return blocks
 
 
+def _loads_dict(text):
+    if not text:
+        return None
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _close_json(text):
+    """Append the closing delimiters a structurally truncated JSON value lacks.
+
+    Qwen3-VL drops the final brace on some tool calls deterministically, and the
+    raw fallback below then hands the client an argument object no tool schema
+    accepts -- which the client retries forever. Braces inside strings do not
+    count, and a value cut mid-string is left alone: closing it would invent
+    content the model never wrote.
+    """
+    stack = []
+    in_str = esc = False
+    for ch in text:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack and stack[-1] == ch:
+                stack.pop()
+    if in_str or not stack:
+        return None
+    return text + "".join(reversed(stack))
+
+
 def _parse_tool_call(inner):
     inner = inner.strip()
-    try:
-        obj = json.loads(inner)
-        if isinstance(obj, dict):
-            name = obj.get("name", "")
-            args = obj.get("arguments", {})
-            if isinstance(args, str):
-                try:
-                    args = json.loads(args)
-                except json.JSONDecodeError:
-                    args = {"raw": args}
-            if not isinstance(args, dict):
-                args = {"value": args}
-            return name, args
-    except json.JSONDecodeError:
-        pass
+    obj = _loads_dict(inner)
+    if obj is None:
+        obj = _loads_dict(_close_json(inner))
+    if obj is not None:
+        name = obj.get("name", "")
+        args = obj.get("arguments", {})
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except json.JSONDecodeError:
+                args = {"raw": args}
+        if not isinstance(args, dict):
+            args = {"value": args}
+        return name, args
     # Tolerate the tool name sitting outside the JSON, e.g. when the model
     # emits `{"name": "Bash", "arguments": {...}}` badly or a bare function
     # call. Recover the name if we can, and keep the rest as a raw argument so
@@ -769,7 +844,8 @@ class Handler(BaseHTTPRequestHandler):
         started = False
         done_reason = "stop"
         try:
-            gen = self.backend.generate(msgs, max_tokens, rid=msg_id)
+            gen = self.backend.generate(msgs, max_tokens, rid=msg_id,
+                                        sample=_sampling(req))
             for frame in gen:
                 if frame[0] == "tokens_in":
                     # message_start carries the prompt's token count, so it
@@ -809,7 +885,8 @@ class Handler(BaseHTTPRequestHandler):
         out_tokens = 0
         input_tokens = 0
         try:
-            for frame in self.backend.generate(msgs, max_tokens, rid=msg_id):
+            for frame in self.backend.generate(msgs, max_tokens, rid=msg_id,
+                                               sample=_sampling(req)):
                 if frame[0] == "tokens_in":
                     input_tokens = frame[1]
                 elif frame[0] == "delta":
@@ -870,6 +947,10 @@ def build_backend(args):
         # without a shell, so a ~/... the user typed would stay literal.
         cache = os.path.abspath(os.path.expanduser(args.kv_cache))
         argv += ["--kv-warm", cache, "--kv-dump", cache]
+    if args.repetition_penalty != 1.0:
+        argv += ["--repetition-penalty", repr(args.repetition_penalty)]
+    if args.seed != 0:
+        argv += ["--seed", str(args.seed)]
     env = {}
     # The coopmat routes compute wrong values on this GPU in the current
     # build (MatMulTest/MatMulGroupedBatchBuffer fail without any model, and
@@ -888,7 +969,9 @@ def main():
     ap.add_argument("--port", type=int,
                     default=int(os.environ.get("VKOP_SERVE_PORT", "8787")))
     ap.add_argument("--bin", default=os.environ.get(
-        "VKOP_SERVE_BIN", os.path.join(ROOT, "build", "llm_serve")))
+        "VKOP_SERVE_BIN", os.path.join(ROOT, "build",
+                                       "llm_serve.exe" if os.name == "nt"
+                                       else "llm_serve")))
     ap.add_argument("--model", default=os.environ.get(
         "VKOP_MODEL", os.path.join(ROOT, "llm", "exporter", "llm.vkopbin")))
     ap.add_argument("--embed", default=os.environ.get(
@@ -928,6 +1011,18 @@ def main():
                          "server runs cold. Empty disables both.")
     ap.add_argument("--coop", action="store_true",
                     help="leave the coopmat routes enabled (default: pinned off)")
+    ap.add_argument("--repetition-penalty", type=float,
+                    default=float(os.environ.get("VKOP_REPETITION_PENALTY", "1.0")),
+                    help="HF-style penalty on tokens this reply has already "
+                         "generated (1.0 = off). Prompt tokens are never "
+                         "penalised: an agent's system prompt legitimately "
+                         "repeats tool names and JSON punctuation every turn. "
+                         "1.05-1.1 is the usual range for breaking a "
+                         "repetition loop; decoding stays deterministic")
+    ap.add_argument("--seed", type=int,
+                    default=int(os.environ.get("VKOP_SEED", "0")),
+                    help="RNG seed for sampling, so a run is reproducible. "
+                         "Ignored while decoding is greedy")
     ap.add_argument("--max-output", type=int,
                     default=int(os.environ.get("VKOP_MAX_OUTPUT", "1024")),
                     help="ceiling on generated tokens per reply (the model "

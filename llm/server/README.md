@@ -68,6 +68,8 @@ Claude Code 会提示 `doesn't recognize the model`，并假设 1m 上下文窗�
 | `--kv-kind` | auto | **只做校验，不选精度**。缓存的数据类型是制品的属性（转换器按图里的 past/present 声明选 attention kernel），所以这个参数改不了它。请求值和制品声明不一致时 `llm_serve` 直接报错退出 —— 以前它会把错尺寸的缓冲交给 kernel，静默读错缓存，4 bit 值配 fp16 图还会在建立 plan 时段错误。要 fp8 KV 就导出 fp8 制品（见下） |
 | `--kv-cache` | 空 | 把 KV 前缀落到文件里，跨进程复用：新进程启动读它，首轮跑完写它。见「KV 前缀落盘」 |
 | `--coop` | 关 | 打开 coopmat 选路（当前构建下它有已知的数值错误，见「已知问题」） |
+| `--repetition-penalty` | 1.0 | 对本轮**已生成**的 token 做 HF 式重复惩罚（1.0＝关）。不碰提示 token。结构化输出别超过 1.1，见「协议细节」 |
+| `--seed` | 0 | 采样 RNG 种子，每轮请求重置，保证同 prompt+同参数可复现。贪心时无作用 |
 
 客户端的输出上限要和 `--max-output` 对齐，否则它会把「被截断」当成错误：
 
@@ -190,8 +192,17 @@ python3 llm/server/anthropic_server.py --model llm/exporter/llm_fp8_kv.vkopbin \
   合并进同一个 user 轮 —— 和 Qwen 的 chat template 一致。
 - **工具定义**：转成 Qwen 的 `# Tools` 系统前缀，schema 按 OpenAI function 形式重排
   （Anthropic 发的是 `{name, description, input_schema}`）。
-- **采样参数**：`temperature` / `top_p` / `top_k` 被忽略，解码是纯 argmax。要采样得先在
-  `llm_serve` 里实现。
+- **采样参数**：默认仍是纯 argmax，且与实现采样前逐位相同。客户端**显式**传了
+  `temperature` / `top_k` / `top_p` 才生效（没传＝负值 sentinel＝用后端默认）；
+  `temperature: 0` 等同贪心。全部在主机侧算：`argmax_last_token` 本来就把整行
+  logits `copyToCPU` 回来扫描，所以不需要新 shader、不碰 GPU 路径。
+  `top_k=1` 或 `top_p→0` 在任何 temperature 下都逐 token 等于贪心（最强的正确性判据）。
+  RNG 每轮请求按 `--seed` 重置，所以同 prompt + 同参数必定同输出。
+- **重复惩罚**：`--repetition-penalty`（默认 1.0＝关），HF 约定（logit>0 除以它，
+  否则乘）。**只作用于本轮已生成的 token，绝不碰提示**——agent 的系统提示每轮都
+  合法地重复工具名和 JSON 标点，惩罚它们会把工具调用压坏。开着它解码仍然是确定性的。
+  实测边界：1.1 下工具调用的路径仍然正确；**1.5 会把 JSON 里反复出现的 `"` `:` `/`
+  压歪，路径被幻觉成别的字符串**。结构化输出场景不要超过 1.1。
 - **图片**：不接受（视觉塔是另一张图）。图片 block 会被替换成一行说明文字。
 - **KV 前缀复用**：每轮请求都把整段历史重发。`llm_serve` 记住上一轮渲染出的 turn 列表和
   **真实 id 流**（prompt + 生成并喂回的 token + 模板的轮末串），下一轮只要这些 turn 原样
