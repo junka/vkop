@@ -54,13 +54,19 @@ TOOL_CLOSE = "</tool_call>"
 class Backend:
     def __init__(self, argv, env=None, max_kv=8192):
         self.max_kv = max_kv
+        self.argv = argv
+        self.env = env
+        self._lock = threading.Lock()
+        self._spawn()
+
+    def _spawn(self):
         r_in, w_in = os.pipe()
         r_out, w_out = os.pipe()
         child_env = dict(os.environ)
-        if env:
-            child_env.update(env)
+        if self.env:
+            child_env.update(self.env)
         self.proc = subprocess.Popen(
-            argv + ["--rpc-in", str(r_in), "--rpc-out", str(w_out)],
+            self.argv + ["--rpc-in", str(r_in), "--rpc-out", str(w_out)],
             pass_fds=(r_in, w_out),
             env=child_env,
             stdout=sys.stderr,
@@ -70,7 +76,27 @@ class Backend:
         os.close(w_out)
         self._w = os.fdopen(w_in, "wb", buffering=0)
         self._r = os.fdopen(r_out, "rb")
-        self._lock = threading.Lock()
+
+    def _ensure_alive(self):
+        """Relaunch a backend that exited on its own.
+
+        llm_serve quits when the driver kills the GPU mid-request
+        (VK_ERROR_DEVICE_LOST): that VkDevice cannot be reused, so a dead
+        child is the honest outcome -- but the server must not stay dead.
+        Called under the lock, so exactly one request pays the reload.
+        """
+        if self.proc.poll() is None:
+            return
+        code = self.proc.returncode
+        for stream in (self._w, self._r):
+            try:
+                stream.close()
+            except OSError:
+                pass
+        print(f"[serve] backend exited with {code}; relaunching and "
+              "reloading the model", file=sys.stderr)
+        self._spawn()
+        self.wait_ready()
 
     def _send(self, line):
         self._w.write((line + "\n").encode())
@@ -102,6 +128,7 @@ class Backend:
 
     def count(self, messages, rid="0"):
         with self._lock:
+            self._ensure_alive()
             self._send(f"COUNT {rid} {len(messages)}")
             self._write_msgs(self._send, messages)
             while True:
@@ -116,6 +143,7 @@ class Backend:
     def generate(self, messages, max_new, rid="0"):
         """Yield ('tokens_in', n), ('delta', text), ('done', reason, n_out)."""
         with self._lock:
+            self._ensure_alive()
             self._send(f"GEN {rid} {max_new} {len(messages)}")
             self._write_msgs(self._send, messages)
             while True:
@@ -868,11 +896,15 @@ def main():
                          "costs 2*nkv*hd*2 bytes per layer.")
     ap.add_argument("--kv-kind", default=os.environ.get("VKOP_KV_KIND", "auto"))
     ap.add_argument("--prefill-chunk", type=int,
-                    default=int(os.environ.get("VKOP_SERVE_CHUNK", "8192")),
-                    help="prompt tokens per prefill dispatch; bounds the "
-                         "graph's (1, q, vocab) logits buffer (~2.5 GB at 8192 "
-                         "and a 152k vocab). Smaller is safer on tight memory, "
-                         "larger is faster because every chunk re-runs lm_head")
+                    default=int(os.environ.get("VKOP_SERVE_CHUNK", "256")),
+                    help="prompt tokens per prefill dispatch. Two walls bound "
+                         "it: the graph's (1, q, vocab) logits buffer (~2.5 GB "
+                         "at 8192 with a 152k vocab) and, on this driver, the "
+                         "work one dispatch keeps the GPU busy with -- a wide q "
+                         "over a long context ends in VK_ERROR_DEVICE_LOST "
+                         "measured at q=1024 above ~6k covered rows. 256 is the "
+                         "value that serves Claude Code's ~11k token prompt; "
+                         "larger is ~2x faster but only for shorter prompts")
     ap.add_argument("--coop", action="store_true",
                     help="leave the coopmat routes enabled (default: pinned off)")
     ap.add_argument("--max-output", type=int,

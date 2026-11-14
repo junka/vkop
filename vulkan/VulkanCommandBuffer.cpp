@@ -5,10 +5,24 @@
 #include "vulkan/DescriptorWriteProf.hpp"
 #include "vulkan/VulkanLib.hpp"
 #include <memory>
+#include <string>
 
 namespace vkop {
 
 #define UP_DIV(x, y) (((x) + (y) - 1) / (y))
+
+namespace {
+// A negative VkResult out of a submit or a wait is usually
+// VK_ERROR_DEVICE_LOST (-4): the driver killed the GPU mid-submission and
+// every later submit from this process fails too. The bare number reads like
+// a timeout, so name it -- the recovery is a process restart, not a retry,
+// and llm_serve keys off the "VK_ERROR_DEVICE_LOST" text.
+std::string vk_result_label(VkResult r) {
+    if (r == VK_ERROR_DEVICE_LOST)
+        return "[VK_ERROR_DEVICE_LOST: GPU is gone, restart required]";
+    return "[VkResult=" + std::to_string(static_cast<int>(r)) + "]";
+}
+}  // namespace
 
 std::function<void(core::ITensor &)> VulkanCommandBuffer::pre_readback_hook =
     nullptr;
@@ -201,7 +215,8 @@ VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue) {
         vkQueueSubmit(queue->getQueue(), 1, &submit_info, VK_NULL_HANDLE);
     if (ret != VK_SUCCESS) {
         fprintf(stderr, "ret %d\n", ret);
-        throw std::runtime_error("Failed to submit sem command buffer!");
+        throw std::runtime_error("Failed to submit sem command buffer! " +
+                                 vk_result_label(ret));
     }
     queue->bumpSubmitCount();
     clearWaits();
@@ -215,7 +230,8 @@ void VulkanCommandBuffer::submit(const std::shared_ptr<VulkanQueue> &queue,
                              submit_infos.data(), VK_NULL_HANDLE);
     if (ret != VK_SUCCESS) {
         fprintf(stderr, "ret %d\n", ret);
-        throw std::runtime_error("Failed to submit sem command buffer!");
+        throw std::runtime_error("Failed to submit sem command buffer! " +
+                                 vk_result_label(ret));
     }
     queue->bumpSubmitCount();
 }
@@ -295,7 +311,8 @@ int VulkanCommandBuffer::wait() {
                      static_cast<unsigned long long>(m_signalValue_),
                      static_cast<unsigned long long>(cur_time),
                      static_cast<void *>(this));
-        throw std::runtime_error("Failed to wait for binary semaphore!");
+        throw std::runtime_error("Failed to wait for binary semaphore! " +
+                                 vk_result_label(wres));
     }
 
     return 0;

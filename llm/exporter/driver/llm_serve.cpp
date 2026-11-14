@@ -334,7 +334,29 @@ class InferenceServer {
         rt_->LoadModel();
         std::printf("[serve] === LoadModel done ===\n");
         arch_ = infer_arch(rt_);
-        if (kv_kind != "auto") arch_.cache_kind = parse_kind(kv_kind, arch_.cache_kind);
+        if (kv_kind != "auto") {
+            // The cache dtype belongs to the artifact: the converter wires
+            // QuantizeLinear/DequantizeLinear around past/present and the
+            // attention shader is picked from that declaration, so overriding
+            // the kind here cannot change what gets decoded -- it only hands the
+            // kernel a differently-sized buffer. llm_chat warns and continues;
+            // a server silently answering from a misread cache is worse, and a
+            // 4-bit override on an fp16 graph died building the plan.
+            const ElemKind want = parse_kind(kv_kind, arch_.cache_kind);
+            if (want != arch_.cache_kind) {
+                std::string msg = "--kv-kind " + kv_kind + " but " + model +
+                                  " declares a " + elem_name(arch_.cache_kind) +
+                                  " cache";
+                // make_kv_variant.py only knows how to build the fp8 arm, so
+                // name it only for the request it can actually serve.
+                if (want == ElemKind::kFloat8E4M3FN &&
+                    arch_.cache_kind == ElemKind::kFloat16)
+                    msg += "; export one with llm/exporter/make_kv_variant.py --fp8";
+                else
+                    msg += " (the cache dtype comes from the artifact, not this flag)";
+                throw std::runtime_error(msg);
+            }
+        }
         std::printf("[serve] arch hidden=%d nlayers=%d nkv=%d hd=%d pos=%dD "
                     "deepstack=%d image_mask=%d kv=%s\n",
                     arch_.hidden, arch_.nlayers, arch_.nkv, arch_.hd,
@@ -934,6 +956,18 @@ int main(int argc, char **argv) {
                               std::to_string(out_ids.size()));
         } catch (const std::exception &e) {
             emit(rpc_out, "ERROR " + id + " " + b64_encode(e.what()));
+            // A lost GPU is terminal for this VkDevice: every later request
+            // fails the same way while the parent still believes it owns a
+            // live backend. Exit instead of answering 500 forever -- the
+            // front end then sees a dead child it can report or respawn.
+            if (std::strstr(e.what(), "VK_ERROR_DEVICE_LOST") != nullptr) {
+                std::fprintf(stderr,
+                             "[serve] GPU device lost mid-request; exiting. "
+                             "Restart to recover (a wide --prefill-chunk is "
+                             "the known trigger on this driver).\n");
+                std::fflush(stdout);
+                return 4;
+            }
         }
         std::fflush(stdout);
     }
