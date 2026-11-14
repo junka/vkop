@@ -62,10 +62,10 @@ Claude Code 会提示 `doesn't recognize the model`，并假设 1m 上下文窗�
 | 开关 | 默认 | 说明 |
 |---|---|---|
 | `--host` / `--port` | `127.0.0.1` / `8787` | |
-| `--max-kv` | 16384 | KV 窗口行数。prompt + 生成长度必须装得下。Claude Code 的系统提示约 11k token，`llm_chat` 的 8192 不够。每行的显存代价是 `2*nkv*hd*2` 字节/层 |
-| `--prefill-chunk` | 2048 | prefill 每次派发的 token 数。图里的 logits 是 `(1,q,vocab)`，不分块的话 11k prompt 在 152k 词表上要分配 3.3 GB 只为读最后一行 |
+| `--max-kv` | 16384 | KV 窗口行数。prompt + 生成长度必须装得下。Claude Code 的系统提示约 11k token，`llm_chat` 的 8192 不够。每行的显存代价是 `2*nkv*hd*2` 字节/层（fp16 缓存），fp8 缓存是它的一半，见「KV cache 精度」 |
+| `--prefill-chunk` | 256 | prefill 每次派发的 token 数。两道墙：图里的 logits 是 `(1,q,vocab)`，8192 在 152k 词表上要 2.5 GB；以及这台驱动上单次派发占用 GPU 的工作量 —— `q=1024` 在覆盖行数超过约 6k 后会把 GPU 打掉（`VK_ERROR_DEVICE_LOST`，见「已知问题」）。256 是能跑完 Claude Code 那 11k token 提示的值；更大更快（q=1024 实测 46 tok/s vs 256 的 28），但只适合短 prompt |
 | `--max-output` | 1024 | 单次回复的生成上限。客户端要的 `max_tokens` 更小时按客户端的来；更大时按这个截断 —— Claude Code 要 32000，在这块 GPU 上是 1.8 小时 |
-| `--kv-kind` | auto | `fp16` / `fp8e4m3` / `fp8e5m2` / `int4` / `nf4` |
+| `--kv-kind` | auto | **只做校验，不选精度**。缓存的数据类型是制品的属性（转换器按图里的 past/present 声明选 attention kernel），所以这个参数改不了它。请求值和制品声明不一致时 `llm_serve` 直接报错退出 —— 以前它会把错尺寸的缓冲交给 kernel，静默读错缓存，4 bit 值配 fp16 图还会在建立 plan 时段错误。要 fp8 KV 就导出 fp8 制品（见下） |
 | `--coop` | 关 | 打开 coopmat 选路（当前构建下它有已知的数值错误，见「已知问题」） |
 
 客户端的输出上限要和 `--max-output` 对齐，否则它会把「被截断」当成错误：
@@ -76,6 +76,35 @@ CLAUDE_CODE_MAX_OUTPUT_TOKENS=256 CLAUDE_CONFIG_DIR=/tmp/cccfg claude
 
 窗口不够时服务端会先把 `max_tokens` 截到剩余空间，再按轮次从最旧的历史开始裁剪；
 真正装不下的 prompt 才报 `context_overflow`。
+
+## KV cache 精度（fp8 e4m3）
+
+权重已经是 int8（1.72 GB），能再压的只有缓存：fp16 缓存每行
+`2*nkv*hd*2*nlayers = 114688` 字节，16384 行就是 1.75 GiB；e4m3 每元素 1 字节，
+同样的窗口只要 0.875 GiB。
+
+```bash
+# 1. 图改写：在 past/present 两侧插入 Quantize/DequantizeLinear，纯图操作，不碰权重
+python3 llm/exporter/make_kv_variant.py -i llm/llm.onnx -o llm/llm_fp8.onnx --fp8
+# 2. 照常转换（权重仍是 -q int8）
+PYTHONPATH=model/pypi python3 -m onnx2vkop.cli -i llm/llm_fp8.onnx \
+  -o llm/exporter/llm_fp8_kv.vkopbin -q int8 --extra-shaders TopK \
+  --target-backend buffer --master-archive build/vkop_shaders.bin
+# 3. 跑起来（--kv-kind 留 auto，制品自己声明 float8e4m3fn）
+python3 llm/server/anthropic_server.py --model llm/exporter/llm_fp8_kv.vkopbin \
+  --max-kv 16384 --prefill-chunk 256
+```
+
+不需要 `VK_EXT_shader_float8`：`shaders/buffer/attention.comp` 里的 `e4m3_encode` /
+`e4m3_decode` 是手写位运算，本机（MoltenVK / Radeon Pro 560X，没有 fp8 硬件）就能跑。
+代价是整个缓存共用**一个** per-tensor scale（`make_kv_variant.py --scale`，默认 0.1），
+28 层 × K,V 都是它，可表示范围约 ±44.8，超出会被夹住。
+
+实测（4 GB 卡，同一批探针）：fp16 制品在 `--max-kv 24576` 下每个请求立刻
+`Failed to submit sem command buffer!`（缓存要 2.62 GiB），fp8 制品同一个窗口正常服务；
+4k token 的长文检索、3 轮前缀复用会话、真实 11335 token 的 Claude Code 请求，
+两边输出等价（后者都是 17 token、`end_turn`）。它不改变宽 prefill 的那堵墙 ——
+墙是每派发的工作量，见「已知问题」。
 
 ## 协议细节
 
@@ -103,10 +132,23 @@ CLAUDE_CODE_MAX_OUTPUT_TOKENS=256 CLAUDE_CONFIG_DIR=/tmp/cccfg claude
 
 ## 已知问题
 
+- **宽 prefill 会把 GPU 打掉**（`VK_ERROR_DEVICE_LOST`）。同一个 fp8 制品、同一个
+  16384 行窗口、同一个 11335 token 的 prompt：`--prefill-chunk 256` 用 407 秒跑完，
+  `1024` 在第 113 秒让 `vkWaitSemaphores` 返回 -4。长度阶梯（q=1024、窗口 24576）
+  把边界卡了出来：631 / 2395 / 5927 token 都正常（46–69 tok/s），约 9000 token 在
+  第 115 秒挂掉。所以决定因素是**单次派发压在 GPU 上的工作量**（约 `q × 已覆盖行数`，
+  实测 6.1M 通过、9.2M 失败），不是缓存字节数 —— fp8 把 KV 省掉一半，这堵墙一毫米
+  也没挪。具体是哪个分配越界/过大还没查：`34fdca2` 修过同一形状的**静默**变体
+  （SwiGLU down-proj fold 的 scratch 按行数线性增长、28 层同时持有 = 17 GB，加上
+  分配失败被丢弃 → 读出全零 logits），这次驱动直接终止了 GPU。
+  现在的行为：`llm_serve` 认出 -4 就带退出码 4 退出（一条错误比之后每个请求都 500
+  诚实），`anthropic_server` 在下一次请求发现子进程已死会重新拉起并重载模型
+  （热缓存约 15 秒，冷启动约 90 秒），不需要人工 `pkill`。
 - **coopmat 在当前构建里算错**（`MatMulTest.MatMulGroupedBatchBuffer` 不经过模型也失败，
   prefill 一旦宽到会选中 coopmat 路由，模型输出就退化）。服务端因此默认设
   `VKOP_NO_COOP=1`；根因不在本服务里，修好后再用 `--coop` 打开。
-- 每 token 约 200ms（ARL iGPU，2B fp16），长回复会很慢。用 `--max-kv` 调窗口时注意：
+- 速度（本机 Radeon Pro 560X、int8 权重）：decode 约 1 s/token，prefill 约 28 tok/s
+  （chunk 256）。此前记的 200 ms/token 是 ARL iGPU 上的数。用 `--max-kv` 调窗口时注意：
   更大的窗口让 attention_bias 和 KV 都更长，decode 会更慢。
 
 ## 验证
