@@ -858,9 +858,18 @@ class Handler(BaseHTTPRequestHandler):
 # main
 # --------------------------------------------------------------------------
 def build_backend(args):
-    argv = [args.bin, args.model, args.embed, args.tokenizer,
+    # The model path is part of the KV cache fingerprint, so normalise it here:
+    # a relative --model would make the file record (and later demand) a path
+    # that only resolves from whatever cwd the server happened to start in.
+    model = os.path.abspath(os.path.expanduser(args.model))
+    argv = [args.bin, model, args.embed, args.tokenizer,
             "--max-kv", str(args.max_kv), "--kv-kind", args.kv_kind,
             "--prefill-chunk", str(args.prefill_chunk)]
+    if args.kv_cache:
+        # One path, both directions. Expand it here: the backend is exec'd
+        # without a shell, so a ~/... the user typed would stay literal.
+        cache = os.path.abspath(os.path.expanduser(args.kv_cache))
+        argv += ["--kv-warm", cache, "--kv-dump", cache]
     env = {}
     # The coopmat routes compute wrong values on this GPU in the current
     # build (MatMulTest/MatMulGroupedBatchBuffer fail without any model, and
@@ -905,6 +914,18 @@ def main():
                          "measured at q=1024 above ~6k covered rows. 256 is the "
                          "value that serves Claude Code's ~11k token prompt; "
                          "larger is ~2x faster but only for shorter prompts")
+    ap.add_argument("--kv-cache", default=os.environ.get("VKOP_KV_CACHE", ""),
+                    metavar="FILE",
+                    help="persist the KV prefix across processes in this file. "
+                         "One path is both the load (--kv-warm) and the write "
+                         "(--kv-dump): the first finished round dumps the "
+                         "agent's stable system prompt + tool schemas, and a "
+                         "later process resumes there instead of prefilling it "
+                         "(~630 MB of fp8 rows read in seconds, against ~400 s "
+                         "of prefill). Needs the same disk footprint free as "
+                         "the model, and a restart after the artifact changes "
+                         "-- the file's fingerprint then refuses it and the "
+                         "server runs cold. Empty disables both.")
     ap.add_argument("--coop", action="store_true",
                     help="leave the coopmat routes enabled (default: pinned off)")
     ap.add_argument("--max-output", type=int,

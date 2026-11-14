@@ -22,15 +22,22 @@
 //
 // 与 llm_chat 的关系：prefill/decode 的数值路径与它逐位同构（同样的
 // embed 查表、causal bias、KVCache 语义、present→past 只改逻辑长度），但**故意
-// 不带**滑窗环、分块 prefill、host-imported 零拷贝输入、GPU argmax 后处理。
+// 不带**滑窗环、host-imported 零拷贝输入、GPU argmax 后处理。
 // 那些是性能层，任何一个出问题都会静默错答案；服务端先要正确，快的那部分等
 // 行为被验证过再接。跨请求的 KV 前缀复用保留：下一段的 ids 以上一段覆盖的序列
 // 为前缀时只算新增的 token —— Claude Code 每轮都把整段历史重发，省下的正是
 // 「整个上下文重新 prefill」。
 //
+// Chunked prefill (--prefill-chunk) and the on-disk prefix cache (--kv-warm /
+// --kv-dump, see dump_kv()) are the two performance layers that did get wired
+// up here, because without them an agent's ~11k token prompt is unusable: the
+// chunk keeps one dispatch's logits buffer inside VRAM, the file keeps the
+// prefix it produced across processes.
+//
 // Build: `make llm_serve`（ENABLE_LLM_CHAT 打开时一起构建）。
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -45,6 +52,8 @@
 #include <vector>
 
 #include <unistd.h>
+
+#include <fcntl.h>
 
 #include "vulkan/VulkanDevice.hpp"
 #include "vulkan/VulkanInstance.hpp"
@@ -314,8 +323,10 @@ class InferenceServer {
   public:
     InferenceServer(const std::string &model, const std::string &embed,
                     const std::string &tok_path, int max_kv,
-                    const std::string &kv_kind, int prefill_chunk)
-        : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)) {
+                    const std::string &kv_kind, int prefill_chunk,
+                    const std::string &kv_warm = "")
+        : max_kv_(max_kv), prefill_chunk_(std::max(1, prefill_chunk)),
+          model_path_(model) {
         Logger::getInstance().setLevel(LOG_INFO);
         const auto &devs = VulkanInstance::getVulkanInstance().getPhysicalDevices();
         if (devs.empty()) throw std::runtime_error("no vulkan device");
@@ -378,6 +389,19 @@ class InferenceServer {
             std::printf("[serve] chat template loaded\n");
         else
             std::printf("[serve] WARNING: tokenizer has no chat template\n");
+
+        if (!kv_warm.empty()) {
+            try {
+                load_kv(kv_warm);
+            } catch (const std::exception &e) {
+                // A cache file is only a shortcut, so an unusable one must not
+                // stop the server: say it loudly and prefill from scratch. The
+                // answers are the same either way -- refusing to start over a
+                // reconverted model would be worse than a slow first round.
+                std::fprintf(stderr, "[serve] %s -- serving cold\n", e.what());
+                std::fflush(stderr);
+            }
+        }
     }
 
     const ModelArch &arch() const { return arch_; }
@@ -490,6 +514,371 @@ class InferenceServer {
                                 tail.end());
     }
 
+    // ---- the prefix cache on disk ------------------------------------------
+    // What a finished round leaves in the KV buffer, written out so a *new*
+    // process can start a conversation in the middle of it. The engine half
+    // already exists and is unchanged: covered_ids_ + KVCache::resume_from()
+    // skip the rows that are already computed, and they cannot tell whether
+    // those rows came from this process's prefill or from a file.
+    //
+    // Worth doing only because an agent's stable prefix is enormous: Claude
+    // Code sends ~11k tokens of system prompt and tool schemas before any user
+    // text, which is ~400 s of prefill here against the seconds it takes to
+    // read 630 MB of fp8 rows back off disk.
+    //
+    // The file carries (model path, model bytes) as a fingerprint. The stored
+    // ids prove the *text* matched; only the artifact identity proves the cache
+    // bytes came from this graph, so a reconverted or swapped model is refused
+    // at startup -- a slow first round instead of answers read out of another
+    // model's cache.
+    static constexpr char kKVMagic[8] = {'V', 'K', 'O', 'P', 'K', 'V', 'C', '1'};
+
+    // Values in one cache row: K and V stacked on dim 1, then the kv heads.
+    size_t kv_row_vals() const { return 2ull * arch_.nkv * arch_.hd; }
+
+    size_t kv_elem_bytes() const {
+        return arch_.cache_kind == ElemKind::kFloat16 ? 2 : 1;
+    }
+
+    // Bytes one cache row occupies in the file for one layer. Zero means "no
+    // layout": a 4-bit container packs two values per byte, so its rows are not
+    // `values * 1 byte` (kv_cache.hpp), and the server has never served one.
+    size_t kv_row_bytes() const {
+        if (arch_.cache_kind == ElemKind::kFloat16 ||
+            arch_.cache_kind == ElemKind::kFloat8E4M3FN ||
+            arch_.cache_kind == ElemKind::kFloat8E5M2)
+            return kv_row_vals() * kv_elem_bytes();
+        return 0;
+    }
+
+    // ---- the row pitch ------------------------------------------------------
+    // The kernel does not address cache rows by the tensor's logical length.
+    // Attention::row_capacity() takes the stride from the bound buffer's SIZE,
+    // so row j of a K/V block lives at j * cap * hd with cap = the allocated
+    // rows (--max-kv), and the rows a round leaves behind are scattered with
+    // that stride. That is what makes appending O(S) -- growing kv_len never
+    // moves a row already written -- and it is also why the file cannot be the
+    // tensor's first rows * row_bytes bytes: read that way the cache would be
+    // head 0's first rows and nothing else, i.e. noise. pack_rows_ /
+    // unpack_rows_ walk the 2 * nkv blocks against the real pitch.
+    int kv_pitch_(int layer) {
+        const std::string name = "past_key_values_" + std::to_string(layer);
+        auto t = rt_->GetInput(name);
+        if (!t) throw std::runtime_error("--kv-cache: no " + name);
+        size_t bytes = 0;
+        if (arch_.cache_kind == ElemKind::kFloat16)
+            bytes = as_tensor<uint16_t>(t)->as_storage_buffer(dev_)->getSize();
+        else
+            bytes = as_tensor<int8_t>(t)->as_storage_buffer(dev_)->getSize();
+        const int pitch = static_cast<int>(bytes / (kv_row_vals() * kv_elem_bytes()));
+        if (pitch < 1)
+            throw std::runtime_error("--kv-cache: " + name + " has no cache buffer");
+        return pitch;
+    }
+
+    // The resize below has to actually land, or the readback copies a shorter
+    // buffer than assumed and the file is quietly wrong.
+    void check_layer_size_(int layer, int got_values, size_t want_values) const {
+        if (static_cast<size_t>(got_values) == want_values) return;
+        throw std::runtime_error(
+            "--kv-cache: past_key_values_" + std::to_string(layer) + " holds " +
+            std::to_string(got_values) + " values, expected " +
+            std::to_string(want_values));
+    }
+
+    // Layer `layer`'s live rows, gathered from the pitched buffer into `out`
+    // (rows * row_bytes, block-major like the file). Leaves the tensor sized to
+    // the full pitch; the caller restores the logical length with
+    // kv_->resume_from().
+    template <typename C>
+    void pack_layer_(int layer, uint32_t rows, int pitch, char *out) {
+        const std::string name = "past_key_values_" + std::to_string(layer);
+        rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
+                                static_cast<uint32_t>(pitch),
+                                static_cast<uint32_t>(arch_.hd)});
+        auto tg = as_tensor<C>(rt_->GetInput(name));
+        // A real GPU->CPU readback, not the bytes we last uploaded: the cache
+        // inputs are deliberately left out of host_copy_valid_ in
+        // core/runtime.cpp because the fused Attention writes them in place, so
+        // the driver's copy goes stale on the first round.
+        tg->copyToCPU(cmdpool_);
+        check_layer_size_(layer, tg->num_elements(),
+                          static_cast<size_t>(pitch) * kv_row_vals());
+        // num_elements() is the shape; the staging container is what the copy
+        // below actually reads. They disagree if the readback kept a shorter
+        // host copy than the shape asks for, and the pitch walk would then run
+        // off the end of the allocation.
+        if (tg->data().size() < static_cast<size_t>(pitch) * kv_row_vals())
+            throw std::runtime_error(
+                "--kv-dump: past_key_values_" + std::to_string(layer) +
+                " read back " + std::to_string(tg->data().size()) +
+                " values, needs " +
+                std::to_string(static_cast<size_t>(pitch) * kv_row_vals()) +
+                " for a pitch of " + std::to_string(pitch));
+        const C *src = tg->data().data();
+        // Offsets in and out are element counts here, not bytes: `src` steps by
+        // the pitch in elements, `out` by the packed row count. Scaling either
+        // side by sizeof(C) as well doubles the block stride, which for the
+        // 2-byte fp16 cache read past the staging container (segfault in the
+        // first dump) and would have written garbage even if it had not.
+        const size_t dev_blk = static_cast<size_t>(pitch) * arch_.hd;
+        const size_t file_blk = static_cast<size_t>(rows) * arch_.hd;
+        for (int b = 0; b < 2 * arch_.nkv; ++b) {
+            std::memcpy(out + static_cast<size_t>(b) * file_blk * sizeof(C),
+                        src + static_cast<size_t>(b) * dev_blk,
+                        file_blk * sizeof(C));
+        }
+        // The pitched image is staging for this one write -- 32 MB per layer at
+        // max_kv 16384 -- so hand it back instead of leaving 28 of them held.
+        tg->data().clear();
+        tg->data().shrink_to_fit();
+    }
+
+    // The inverse of pack_layer_: put `rows` contiguous rows back into the
+    // buffer at the pitch the kernel will read them from. Rows at or beyond
+    // `rows` stay zero, which is what an uncomputed row already is.
+    template <typename C>
+    void unpack_layer_(int layer, uint32_t rows, int pitch, const char *in,
+                       std::vector<C> &scratch) {
+        const std::string name = "past_key_values_" + std::to_string(layer);
+        rt_->ResizeInput(name, {1u, 2u, static_cast<uint32_t>(arch_.nkv),
+                                static_cast<uint32_t>(pitch),
+                                static_cast<uint32_t>(arch_.hd)});
+        auto tg = as_tensor<C>(rt_->GetInput(name));
+        check_layer_size_(layer, tg->num_elements(),
+                          static_cast<size_t>(pitch) * kv_row_vals());
+        const size_t total = static_cast<size_t>(pitch) * kv_row_vals();
+        scratch.assign(total, C{0});
+        const size_t dev_blk = static_cast<size_t>(pitch) * arch_.hd;
+        const size_t file_blk = static_cast<size_t>(rows) * arch_.hd;
+        for (int b = 0; b < 2 * arch_.nkv; ++b) {
+            std::memcpy(scratch.data() + static_cast<size_t>(b) * dev_blk,
+                        in + static_cast<size_t>(b) * file_blk * sizeof(C),
+                        file_blk * sizeof(C));
+        }
+        // The same fill + upload a prefill round does for its inputs; the
+        // buffer itself is the one KVCache preallocated at max_kv rows.
+        tg->fillToCPU(scratch.data());
+        tg->copyToGPU(cmdpool_);
+    }
+
+    size_t artifact_bytes() const {
+        std::ifstream f(model_path_, std::ios::ate | std::ios::binary);
+        return f ? static_cast<size_t>(f.tellg()) : 0;
+    }
+
+    // Deletes `path` when the scope that owns it ends, unless `keep` was set
+    // once the file is complete. A throw anywhere inside dump_kv -- the pitch
+    // guard, a readback failure -- otherwise leaves a .tmp that a later `ls`
+    // would mistake for a cache.
+    struct TmpFile {
+        std::string path;
+        bool keep = false;
+        ~TmpFile() {
+            if (keep) return;
+            // ENOENT is fine: `out` may have failed to create the file at all.
+            if (::remove(path.c_str()) != 0 && errno != ENOENT)
+                std::fprintf(stderr, "[serve] could not remove %s\n",
+                             path.c_str());
+            std::fflush(stderr);
+        }
+    };
+
+    // Write the covered rows to `path` (via .tmp + rename, so a crash halfway
+    // cannot leave a short file that a later start would trust).
+    void dump_kv(const std::string &path) {
+        const size_t row_bytes = kv_row_bytes();
+        if (row_bytes == 0)
+            throw std::runtime_error(
+                "--kv-dump: no file layout for a " +
+                std::string(elem_name(arch_.cache_kind)) + " cache");
+        const uint32_t rows = static_cast<uint32_t>(covered_ids_.size());
+        if (rows == 0)
+            throw std::runtime_error("--kv-dump: the KV window holds nothing yet");
+
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string tmp = path + ".tmp";
+        TmpFile guard{tmp};
+        std::ofstream out(tmp, std::ios::binary);
+        if (!out) throw std::runtime_error("--kv-dump: cannot open " + tmp);
+        out.write(kKVMagic, sizeof(kKVMagic));
+        const uint32_t hdr[5] = {rows, static_cast<uint32_t>(arch_.nlayers),
+                                static_cast<uint32_t>(arch_.nkv),
+                                static_cast<uint32_t>(arch_.hd),
+                                static_cast<uint32_t>(arch_.cache_kind)};
+        const uint64_t model_bytes = static_cast<uint64_t>(artifact_bytes());
+        out.write(reinterpret_cast<const char *>(hdr), sizeof(hdr));
+        out.write(reinterpret_cast<const char *>(&model_bytes),
+                  sizeof(model_bytes));
+        const uint32_t plen = static_cast<uint32_t>(model_path_.size());
+        out.write(reinterpret_cast<const char *>(&plen), sizeof(plen));
+        out.write(model_path_.data(), plen);
+        out.write(reinterpret_cast<const char *>(covered_ids_.data()),
+                  static_cast<std::streamsize>(rows) * 4);
+
+        const size_t layer_bytes = static_cast<size_t>(rows) * row_bytes;
+        std::vector<char> buf(layer_bytes);
+        for (int i = 0; i < arch_.nlayers; ++i) {
+            const int pitch = kv_pitch_(i);
+            if (static_cast<uint32_t>(pitch) < rows)
+                throw std::runtime_error(
+                    "--kv-dump: layer " + std::to_string(i) + " holds " +
+                    std::to_string(pitch) + " rows but the conversation covered " +
+                    std::to_string(rows));
+            if (arch_.cache_kind == ElemKind::kFloat16)
+                pack_layer_<uint16_t>(i, rows, pitch, buf.data());
+            else
+                pack_layer_<int8_t>(i, rows, pitch, buf.data());
+            out.write(buf.data(), static_cast<std::streamsize>(layer_bytes));
+        }
+        out.flush();
+        if (!out) throw std::runtime_error("--kv-dump: write failed: " + tmp);
+        out.close();
+        // Rename only publishes bytes the OS already has: without the fsync a
+        // crash could leave a complete-looking, partly zero-filled file that a
+        // later start trusts. `path` keeps the previous good cache either way.
+        const int fd = ::open(tmp.c_str(), O_RDONLY);
+        if (fd < 0 || ::fsync(fd) != 0) {
+            const int saved = errno;
+            if (fd >= 0) ::close(fd);
+            throw std::runtime_error(std::string("--kv-dump: fsync failed for ") +
+                                     tmp + ": " + std::strerror(saved));
+        }
+        ::close(fd);
+        if (std::rename(tmp.c_str(), path.c_str()) != 0)
+            throw std::runtime_error("--kv-dump: cannot move " + tmp + " onto " +
+                                     path);
+        guard.keep = true;
+        // The readbacks flipped each past tensor to host residency; say again
+        // what is still true -- the rows are on the GPU, untouched.
+        kv_->resume_from(static_cast<int>(rows));
+        kv_file_rows_ = rows;
+        const double ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        std::printf("[serve] --kv-dump %s: %u rows, %.0f MB in %.0f ms\n",
+                    path.c_str(), rows,
+                    static_cast<double>(layer_bytes) * arch_.nlayers / 1048576.0,
+                    ms);
+        std::fflush(stdout);
+    }
+
+    // Load rows written by dump_kv and present them as this round's history.
+    // A missing file is the normal cold start and returns quietly; anything
+    // else that is wrong with the cache throws.
+    void load_kv(const std::string &path) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            std::printf("[serve] --kv-warm: no %s, starting cold\n", path.c_str());
+            std::fflush(stdout);
+            return;
+        }
+        const auto fail = [&path](const std::string &why) {
+            return std::runtime_error("--kv-warm " + path + ": " + why);
+        };
+        char magic[sizeof(kKVMagic)];
+        in.read(magic, sizeof(magic));
+        if (!in || std::memcmp(magic, kKVMagic, sizeof(magic)) != 0)
+            throw fail("not a KV cache file");
+        uint32_t hdr[5] = {};
+        in.read(reinterpret_cast<char *>(hdr), sizeof(hdr));
+        uint64_t model_bytes = 0;
+        in.read(reinterpret_cast<char *>(&model_bytes), sizeof(model_bytes));
+        uint32_t plen = 0;
+        in.read(reinterpret_cast<char *>(&plen), sizeof(plen));
+        // Never size a container from an unchecked field: a corrupt header with
+        // a 4 GB plen would throw bad_alloc out of a path whose contract is
+        // "refuse the cache, serve cold".
+        if (plen > 4096) throw fail("corrupt header: model path length " +
+                                    std::to_string(plen));
+        std::string mpath(plen, '\0');
+        if (plen) in.read(&mpath[0], plen);
+        const uint32_t rows = hdr[0];
+        const int nlayers = static_cast<int>(hdr[1]);
+        if (!in) throw fail("truncated header");
+        if (rows == 0) throw fail("the file holds no rows");
+        if (rows > static_cast<uint32_t>(max_kv_))
+            throw fail(std::to_string(rows) + " rows exceed this --max-kv " +
+                       std::to_string(max_kv_));
+        if (nlayers != arch_.nlayers || hdr[2] != static_cast<uint32_t>(arch_.nkv) ||
+            hdr[3] != static_cast<uint32_t>(arch_.hd) ||
+            hdr[4] != static_cast<uint32_t>(arch_.cache_kind))
+            throw fail("was written for " + std::to_string(nlayers) + " layers / " +
+                       std::to_string(hdr[2]) + " kv heads / head " +
+                       std::to_string(hdr[3]) + " / cache " +
+                       elem_name(static_cast<ElemKind>(hdr[4])) +
+                       ", this graph is different");
+        if (mpath != model_path_ || model_bytes != artifact_bytes())
+            throw fail("belongs to " + mpath + " (" +
+                       std::to_string(model_bytes) +
+                       " bytes); re-dump it, this artifact has changed");
+
+        const size_t row_bytes = kv_row_bytes();
+        if (row_bytes == 0)
+            throw fail("no file layout for a " +
+                       std::string(elem_name(arch_.cache_kind)) + " cache");
+
+        std::vector<uint32_t> ids(rows);
+        in.read(reinterpret_cast<char *>(ids.data()),
+                static_cast<std::streamsize>(rows) * 4);
+        if (!in) throw fail("truncated id stream");
+        const size_t layer_bytes = static_cast<size_t>(rows) * row_bytes;
+        std::vector<char> buf(layer_bytes);
+        std::vector<uint16_t> scratch16;
+        std::vector<int8_t> scratch8;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < nlayers; ++i) {
+            in.read(buf.data(), static_cast<std::streamsize>(layer_bytes));
+            if (!in) throw fail("truncated cache payload");
+            const int pitch = kv_pitch_(i);
+            if (static_cast<uint32_t>(pitch) < rows)
+                throw fail("wants " + std::to_string(rows) +
+                           " rows but layer " + std::to_string(i) +
+                           " has room for " + std::to_string(pitch) +
+                           " (--max-kv)");
+            if (arch_.cache_kind == ElemKind::kFloat16)
+                unpack_layer_<uint16_t>(i, rows, pitch, buf.data(), scratch16);
+            else
+                unpack_layer_<int8_t>(i, rows, pitch, buf.data(), scratch8);
+        }
+        covered_ids_ = std::move(ids);
+        kv_->resume_from(static_cast<int>(rows));
+        kv_file_rows_ = rows;
+        const double ms =
+            std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+        std::printf("[serve] --kv-warm: %u rows (%.0f MB) resumed in %.0f ms\n",
+                    rows, static_cast<double>(layer_bytes) * nlayers / 1048576.0,
+                    ms);
+        std::fflush(stdout);
+    }
+
+    // ---- when the file gets written ----------------------------------------
+    // The dump only pays for its I/O when it captures work a *future* process
+    // would redo, so it fires twice: after the first completed round (that is
+    // the agent's ~11k token stable prefix) and once more at shutdown if this
+    // conversation reached further than the file does. Rewriting after every
+    // round would move the whole 630 MB cache to save the few hundred tokens a
+    // turn adds -- the in-process covered_ids_ prefix reuse already covers
+    // those, and needs no disk.
+    //
+    // Neither trigger may fail a request: the answer is already streamed, and
+    // a cache file is a convenience. So the caller catches, and a failed write
+    // just leaves the previous file in place (dump_kv writes .tmp and renames).
+    void dump_after_first_round() {
+        if (!kv_dump_pending_) return;
+        // A completed dump retires the trigger. If it throws -- disk full, a
+        // failed readback -- the flag stays up so the next round, and the exit
+        // dump below, get another chance.
+        dump_if_longer_();
+        kv_dump_pending_ = false;
+    }
+    void dump_on_exit() { dump_if_longer_(); }
+
+    // Turns the on-disk cache on. `path` is rewritten in place, so it should
+    // not live on a ramdisk and should have rows * 28 layers * row bytes free.
+    void set_kv_dump_path(const std::string &path) { kv_dump_path_ = path; }
+
     // Generate from an already rendered prompt. `out_ids` receives every
     // generated token (the ones actually fed back included). Returns
     // "stop" / "length".
@@ -536,19 +925,32 @@ class InferenceServer {
 
         // ---- prefix reuse ----
         // covered_ids_ is the sequence the KV buffer actually holds (prompt +
-        // the tokens decode fed back). Only a strict prefix is reusable; the
-        // position of every reused row must be identical, and it is, because
-        // the render is a pure concatenation of the same messages.
-        int P = 0;
-        // Strict prefix AND strictly shorter. A prompt that is exactly what the
-        // KV already covers would leave no token to compute, so there would be
-        // no Run() to produce a logits row at all; equal-length is therefore
-        // excluded here and takes the full-prefill path below.
-        if (!covered_ids_.empty() && covered_ids_.size() < ids.size() &&
-            std::equal(covered_ids_.begin(), covered_ids_.end(), ids.begin())) {
-            P = static_cast<int>(covered_ids_.size());
+        // the tokens decode fed back, or the rows --kv-warm loaded). The
+        // reusable part is the *longest common prefix*, not "is the whole
+        // covered stream a prefix": a warm file or a new conversation usually
+        // shares only the agent's stable opening -- system prompt, then tool
+        // schemas -- and diverges at the first user turn. Causality makes any
+        // shared run reusable (row i's KV depends only on ids[0..i], and the
+        // graph is fed absolute positions A+i, so a reused row sits at the same
+        // position it was computed at), and the divergence point is simply
+        // where the recompute starts. Rows past it are stale bytes from
+        // something else; this round overwrites them and attention never reads
+        // beyond past_len.
+        //
+        // At least one token must stay outside the prefix: with nothing left to
+        // compute there would be no Run() to produce the first logits row.
+        size_t match = 0;
+        if (!covered_ids_.empty()) {
+            const size_t limit = std::min(covered_ids_.size(),
+                                          ids.size() ? ids.size() - 1 : 0);
+            while (match < limit && covered_ids_[match] == ids[match]) ++match;
         }
+        const int P = static_cast<int>(match);
         const int S = L - P;
+        // Reusing less than the whole covered stream means this round's
+        // prefill writes over rows covered_ids_ still claims. Until the round
+        // finishes, that claim is not trustworthy (see invalidate_prefix_state).
+        prefix_trusted_ = match >= covered_ids_.size();
 
         // ---- prefill ----
         // Chunked, because the graph's logits output is (1, q, vocab) and
@@ -717,17 +1119,47 @@ class InferenceServer {
         const size_t fed = out_ids.size() > 0 ? out_ids.size() - 1 : 0;
         covered_ids_.insert(covered_ids_.end(), out_ids.begin(),
                             out_ids.begin() + static_cast<std::ptrdiff_t>(fed));
+        prefix_trusted_ = true;
         return reason;
     }
 
     void reset() {
-        covered_ids_.clear();
+        invalidate_prefix_state();
         rt_->invalidate_replay();
     }
+
+    // A round that threw after its prefill started leaves cache rows that
+    // belong to neither the old stream nor the new one: longest-common-prefix
+    // reuse means the prefill had already overwritten [P, covered) when the
+    // failure happened. Keeping covered_ids_ would let the next round splice
+    // onto bytes that are no longer there, so the whole conversation claim goes
+    // with it and the following round re-prefills from row 0. The cache FILE is
+    // not touched -- its rows still are what its own id stream produced.
+    void invalidate_prefix_state() {
+        covered_ids_.clear();
+        prev_turns_.clear();
+        prev_prefix_ids_.clear();
+        last_render_turns_.clear();
+        prefix_trusted_ = true;
+    }
+
+    // False between "this round may have overwritten the rows covered_ids_
+    // claims" and "the round finished and restated them". See the catch in
+    // main(): a failed round must not leave a prefix claim behind.
+    bool prefix_trusted() const { return prefix_trusted_; }
 
     Tokenizer &tok() { return tok_; }
 
   private:
+    // Skip the write when the KV really does not cover more than the file
+    // already does: a round served entirely from --kv-warm leaves both lengths
+    // equal, and re-serialising the same rows would be pure disk traffic.
+    void dump_if_longer_() {
+        if (kv_dump_path_.empty()) return;
+        if (covered_ids_.size() <= kv_file_rows_) return;
+        dump_kv(kv_dump_path_);
+    }
+
     static ElemKind parse_kind(const std::string &s, ElemKind fallback) {
         if (s == "fp16") return ElemKind::kFloat16;
         if (s == "fp8e4m3") return ElemKind::kFloat8E4M3FN;
@@ -751,6 +1183,16 @@ class InferenceServer {
     // buffer has to actually fit; VKOP_SERVE_CHUNK / --prefill-chunk override.
     // 8192 splits an 11k agent prompt into two dispatches instead of six.
     int prefill_chunk_ = 8192;
+    // The artifact this server loaded, kept because a cache file is only valid
+    // for it: a .vkopbin reconverted with different shader keys, or with a
+    // different --kv-kind, holds KV bytes that mean something else.
+    std::string model_path_;
+    // On-disk prefix cache (--kv-dump); empty means the feature is off.
+    std::string kv_dump_path_;
+    // Rows the cache file currently holds, and whether the first round has
+    // been written yet (see dump_after_first_round()).
+    size_t kv_file_rows_ = 0;
+    bool kv_dump_pending_ = true;
     std::shared_ptr<VulkanDevice> dev_;
     std::shared_ptr<vkop::VulkanCommandPool> cmdpool_;
     std::shared_ptr<Runtime> rt_;
@@ -761,6 +1203,8 @@ class InferenceServer {
     std::unique_ptr<KVCache> kv_;
     std::vector<uint32_t> stop_ids_;
     std::vector<uint32_t> covered_ids_;
+    // False while a round is overwriting rows covered_ids_ still claims.
+    bool prefix_trusted_ = true;
     // The turn list of the last request and the exact id stream its KV holds
     // (prompt + the tokens decode fed back + the assistant turn's terminator).
     // The next request splices onto this instead of re-tokenizing, because
@@ -794,7 +1238,8 @@ void emit(int fd, const std::string &line) {
 const char *kUsage =
     "usage: %s <llm.vkopbin> <embed_tokens.bin> <tokenizer.bin> "
     "[--max-kv N] [--kv-kind {auto,fp16,fp8e4m3,fp8e5m2,int4,nf4}] "
-    "[--prefill-chunk N] [--rpc-in FD] [--rpc-out FD]\n";
+    "[--prefill-chunk N] [--kv-warm FILE] [--kv-dump FILE] "
+    "[--rpc-in FD] [--rpc-out FD]\n";
 
 }  // namespace
 
@@ -810,11 +1255,14 @@ int main(int argc, char **argv) {
     int prefill_chunk = 8192;
     int rpc_in = 3, rpc_out = 4;
     std::string kv_kind = "auto";
+    std::string kv_warm, kv_dump;
     for (int i = 4; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--max-kv" && i + 1 < argc) max_kv = std::atoi(argv[++i]);
         else if (a == "--kv-kind" && i + 1 < argc) kv_kind = argv[++i];
         else if (a == "--prefill-chunk" && i + 1 < argc) prefill_chunk = std::atoi(argv[++i]);
+        else if (a == "--kv-warm" && i + 1 < argc) kv_warm = argv[++i];
+        else if (a == "--kv-dump" && i + 1 < argc) kv_dump = argv[++i];
         else if (a == "--rpc-in" && i + 1 < argc) rpc_in = std::atoi(argv[++i]);
         else if (a == "--rpc-out" && i + 1 < argc) rpc_out = std::atoi(argv[++i]);
         else {
@@ -833,7 +1281,9 @@ int main(int argc, char **argv) {
     std::unique_ptr<InferenceServer> srv;
     try {
         srv = std::make_unique<InferenceServer>(model_path, embed_path, tok_path,
-                                                max_kv, kv_kind, prefill_chunk);
+                                                max_kv, kv_kind, prefill_chunk,
+                                                kv_warm);
+        srv->set_kv_dump_path(kv_dump);
     } catch (const std::exception &e) {
         emit(rpc_out, std::string("FATAL ") + b64_encode(e.what()));
         std::fprintf(stderr, "[serve] startup failed: %s\n", e.what());
@@ -860,7 +1310,19 @@ int main(int argc, char **argv) {
                 pos = nx + 1;
             }
         }
-        if (cmd == "BYE") { emit(rpc_out, "BYE"); break; }
+        if (cmd == "BYE") {
+            // One last write if this conversation got further than the file:
+            // cheap here, and the next session starts that much deeper into its
+            // own prefix.
+            try {
+                srv->dump_on_exit();
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "[serve] %s\n", e.what());
+                std::fflush(stderr);
+            }
+            emit(rpc_out, "BYE");
+            break;
+        }
         if (cmd == "HELLO") { emit(rpc_out, "READY 1"); continue; }
         if (cmd == "RESET") {
             try { srv->reset(); emit(rpc_out, "OK"); }
@@ -954,8 +1416,25 @@ int main(int argc, char **argv) {
             srv->record_turn(streamed);
             emit(rpc_out, "DONE " + id + " " + reason + " " +
                               std::to_string(out_ids.size()));
+            // The expensive stable prefix is now in the KV buffer, so this is
+            // the round worth writing out (no-op after the first one). Done
+            // after DONE: the reply is delivered, and a cache write that fails
+            // -- disk full, wrong path -- must not be reported as a generation
+            // error.
+            try {
+                srv->dump_after_first_round();
+            } catch (const std::exception &e) {
+                std::fprintf(stderr, "[serve] %s\n", e.what());
+                std::fflush(stderr);
+            }
         } catch (const std::exception &e) {
             emit(rpc_out, "ERROR " + id + " " + b64_encode(e.what()));
+            // A round that threw midway may already have rewritten cache rows
+            // that covered_ids_ still claims to hold (the divergence point cut
+            // the reuse short, and the new ids were not recorded yet). Forgetting
+            // the prefix costs the next round a re-prefill; trusting it would
+            // answer from rows the model overwrote.
+            if (!srv->prefix_trusted()) srv->invalidate_prefix_state();
             // A lost GPU is terminal for this VkDevice: every later request
             // fails the same way while the parent still believes it owns a
             // live backend. Exit instead of answering 500 forever -- the
